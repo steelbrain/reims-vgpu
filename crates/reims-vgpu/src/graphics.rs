@@ -38,9 +38,9 @@ use reims_graphics::wire::{
     RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
     RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
-    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT,
-    RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
+    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
+    RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
     RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_HEAP_OVER_PAGES,
     RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
     RGFX_FEATURE_MANAGED_BUFFER_SLABS, RGFX_FEATURE_MANAGED_TEXTURE_SLABS,
@@ -835,6 +835,25 @@ impl<P: Platform> Drop for DrawnPresents<P> {
 }
 
 impl<P: ApiPlatform> GraphicsControl<P> {
+    /// The device made the command queue `poster` posts for, before its create is answered
+    /// ([`Host::queue_made`]): what its ring publishes bounds what a present waits for of it, and
+    /// what a buffer of another queue waits for of it (`surface_order`, `commit_order`), from
+    /// before the guest can name its buffers, however late its service thread has the decoder make
+    /// its handle. Nothing of a queue the device's reset ended.
+    fn queue_made(&self, poster: &CompletionPoster) {
+        let Some(queue) = poster.queue_obj_id() else {
+            return;
+        };
+        let _carried = self.reset_gate.read();
+        if poster.stale() {
+            return;
+        }
+        self.presents.queue_made(queue, poster.clone());
+        let ring = poster.clone();
+        self.decoder()
+            .surface_order_queue_made(queue, Arc::new(move || ring.published_seqno()));
+    }
+
     /// Takes every object of context `context` (its process closed the device or died) out of
     /// the decoder's tables, with the surfaces' entries whose objects went with them, and lets go
     /// of them on the decoder's close worker, so the context's lane is done with the close, and
@@ -1122,18 +1141,6 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     self.pending.cancel(obj_id);
                     // A queue's destroy: nothing more of it finishes for a present to wait for.
                     self.presents.queue_gone(obj_id);
-                }
-                // A queue's create, handed with its own poster: what its ring publishes bounds
-                // what a present waits for of it.
-                if r#type == RGFX_CMD_QUEUE_CREATE
-                    && let Some(queue) = poster.queue_obj_id()
-                    && queue == message_identity(message).2
-                {
-                    self.presents.queue_made(queue, poster.clone());
-                    // ... and what a buffer of another queue waits for of it (`surface_order`).
-                    let ring = poster.clone();
-                    decoder
-                        .surface_order_queue_made(queue, Arc::new(move || ring.published_seqno()));
                 }
                 let foreign = foreign_queue(poster, message);
                 // An ICB_WRITE's records and an ICB_SLOTS's slots run on the control ring, ahead
@@ -1955,6 +1962,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         self.control
             .handle_stage3(completion, Cow::Borrowed(message));
+    }
+
+    fn queue_made(&self, completion: &CompletionPoster) {
+        self.control.queue_made(completion);
     }
 
     fn command_buffer(&self, completion: &CompletionPoster, message: Vec<u8>) {

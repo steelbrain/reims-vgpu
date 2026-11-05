@@ -2168,6 +2168,9 @@ committed in. The bundle names the order instead, as it posts each buffer:
   buffer waits for of it. A buffer the host has taken that holds no
   `SURFACE_ORDER` signals where another queue's buffer waits past what the
   queue has signalled.
+- A queue is known to the order from its create's answer on: the device tells
+  the host of it before it answers, so a buffer of another queue that names one
+  of its buffers waits for it though the host has yet to make the queue's handle.
 
 Measured on the lane's RTX 5080 laptop host with a macOS 26.6.1 guest, one boot
 each of the effort's tip before the order (18fd065e5) and with it: the sweep's

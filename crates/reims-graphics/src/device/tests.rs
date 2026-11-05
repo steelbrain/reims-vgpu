@@ -1137,6 +1137,9 @@ fn a_post_waiting_for_room_looks_again_at_its_poll_and_stops_at_a_reset() {
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
 }
 
+/// Each queue a [`QueueTestHost`] was told is made, with what its ring had published then.
+type Made = Arc<Mutex<Vec<(u64, Option<u64>)>>>;
+
 /// A host that records the vectors it raises and the types of the stage-3 messages it is handed,
 /// and posts what a decoder would: a command buffer's completion through the queue's poster, and a
 /// render pipeline's reflection through ring 0's. A buffer create waits while `gate` is shut: a
@@ -1146,6 +1149,7 @@ struct QueueTestHost {
     handed: Arc<Mutex<Vec<u32>>>,
     buffers: Arc<Mutex<Vec<Vec<u8>>>>,
     closed: Arc<Mutex<Vec<u32>>>,
+    made: Made,
     gate: Arc<AtomicBool>,
 }
 
@@ -1157,6 +1161,7 @@ struct QueueTestSeen {
     handed: Arc<Mutex<Vec<u32>>>,
     buffers: Arc<Mutex<Vec<Vec<u8>>>>,
     closed: Arc<Mutex<Vec<u32>>>,
+    made: Made,
     gate: Arc<AtomicBool>,
 }
 
@@ -1173,6 +1178,7 @@ impl QueueTestSeen {
             handed: Arc::clone(&self.handed),
             buffers: Arc::clone(&self.buffers),
             closed: Arc::clone(&self.closed),
+            made: Arc::clone(&self.made),
             gate: Arc::clone(&self.gate),
         })
     }
@@ -1199,6 +1205,10 @@ impl Host for QueueTestHost {
     fn context_closed(&self, context: u32, answer: crate::device::CompleteAnswer) {
         self.closed.lock().push(context);
         answer.answer(RGFX_STATUS_OK);
+    }
+    fn queue_made(&self, completion: &crate::device::CompletionPoster) {
+        let queue = completion.queue_obj_id().expect("a queue's poster");
+        self.made.lock().push((queue, completion.published_seqno()));
     }
     fn surface_download(&self, _block_offset: u64, answer: crate::device::CompleteAnswer) {
         self.handed.lock().push(RGFX_CMD_SURFACE_DOWNLOAD);
@@ -1445,6 +1455,40 @@ fn a_command_buffer_published_before_its_queue_create_completes() {
         *seen.handed.lock(),
         vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_COMMAND_BUFFER]
     );
+}
+
+/// The host is told of a queue the device makes before its create is answered, so a buffer of
+/// another queue that names the queue's buffers from the answer on finds it known, however late
+/// the queue's thread hands the host the queue's create: with its ring's poster, which reads what
+/// the ring has published, a command buffer published before the create among it. A create the
+/// device refuses tells the host of nothing
+#[test]
+fn the_host_is_told_of_a_queue_before_its_create_is_answered() {
+    let seen = QueueTestSeen::new();
+    let mut rig = Rig::with_host(seen.host());
+    rig.start();
+    const QUEUE: u64 = (6 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+
+    // Refused: no block holds the rings.
+    let seqno = rig.send(queue_create(QUEUE));
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
+    assert!(
+        seen.made.lock().is_empty(),
+        "a refused create told the host"
+    );
+
+    // The guest's first buffer, published with no doorbell before the create.
+    publish_command_buffer(&rig, QUEUE, 100, 1, false);
+    let seqno = send_queue_create(&mut rig, QUEUE);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+    assert_eq!(
+        *seen.made.lock(),
+        [(QUEUE, Some(1))],
+        "the host was not told of the queue, and its ring's buffer, by the answer"
+    );
+    let done = first_queue_completion(&rig).expect("the buffer's CB_COMPLETE");
+    assert_eq!(done.cb_obj_id, 100);
+    assert_eq!(seen.made.lock().len(), 1, "told twice");
 }
 
 /// A `QUEUE_CREATE` is refused, making no rings, where either ring lies whole in no block its

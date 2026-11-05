@@ -3293,6 +3293,111 @@ fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
     );
 }
 
+/// A queue is known to the order of IOSurface accesses from its create's answer, before its
+/// service thread hands the create to the host and has the decoder make its handle
+/// (`surface_order`): with the service thread of a new queue of process 1 held there, as a
+/// no-copy buffer of the process being made holds it (`pages_buffers`), process 2's buffer that
+/// names the new queue's first buffer, published on its ring, waits on the GPU for that buffer,
+/// which signals what it waits for once the service thread goes on and the buffer is taken
+#[test]
+fn a_queue_s_buffers_are_waited_for_before_its_handle_is_made() {
+    use reims_graphics::ops::{
+        RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RGFX_OP_SURFACE_ORDER,
+        RgfxSurfaceOrderWait,
+    };
+
+    const WAIT: &str = "encodeWaitForEvent:value:";
+    const SIGNAL: &str = "encodeSignalEvent:value:";
+    const RING_DATA: u32 = 0x1_0000;
+    let at = |mut message: Vec<u8>, seqno: u64| {
+        message[8..16].copy_from_slice(&seqno.to_le_bytes());
+        message
+    };
+    let events = |calls: &[reims_vgpu_core::testkit::calllog::Call], sel: &str| {
+        (calls.iter())
+            .filter(|c| c.sel == sel)
+            .map(|c| (c.args[0].as_obj(), c.args[1].as_u64()))
+            .collect::<Vec<_>>()
+    };
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, mut guest, [_, _, mut reader]) = two_processes(&raised);
+
+    // Process 1's third queue, answered while its service thread waits for the process's no-copy
+    // buffer before it hands the create to the host.
+    let made = platform.call_log().mark();
+    let pages = &device.control.pages_buffers;
+    let held = pages.begin(pages_context(1), 0, device.control.pool.now());
+    let (submit, complete) = {
+        let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 3 * 0x4_0000;
+        (at, at + 0x2_0000)
+    };
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 3, (submit, complete), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    // Its first buffer, which writes a shared surface, on its ring.
+    let mut fresh = QueueRing::new(&device, submit, complete, u64::from(RING_DATA));
+    let write = command_buffer_of(
+        obj(1, 3),
+        300,
+        &[
+            (RGFX_OP_SURFACE_ORDER, &[]),
+            (RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            (RGFX_OP_ENCODER_END, &[]),
+        ],
+    );
+    fresh.send(&device, at(write, 1));
+
+    // Process 2's reader names it, and is committed with a GPU wait for it.
+    let mark = platform.call_log().mark();
+    let wait = RgfxSurfaceOrderWait {
+        queue_obj_id: obj(1, 3),
+        seqno: 1,
+    };
+    let read = command_buffer_of(
+        obj(2, 1),
+        200,
+        &[
+            (RGFX_OP_SURFACE_ORDER, wait.as_bytes()),
+            (RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+            (RGFX_OP_ENCODER_END, &[]),
+        ],
+    );
+    reader.send(&device, at(read, 1));
+    assert_eq!(
+        ring_events(&platform, &mut reader, 1),
+        [(RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK))]
+    );
+    let waits = events(&platform.call_log().since(mark), WAIT);
+    assert_eq!(
+        waits.len(),
+        1,
+        "the reader does not wait for the new queue's buffer: {waits:?}"
+    );
+    assert_eq!(waits[0].1, Some(1), "the reader waits for another seqno");
+
+    let sels = platform.call_log().sels_since(made);
+    assert!(
+        !sels.contains(&"newCommandQueue"),
+        "the new queue's handle was made: {sels:?}"
+    );
+
+    // The service thread goes on: the new queue's handle is made, its buffer taken, and its
+    // commit signals what the reader waits for.
+    let mark = platform.call_log().mark();
+    drop(held);
+    assert_eq!(
+        ring_events(&platform, &mut fresh, 1),
+        [(RGFX_EVT_CB_COMPLETE, 300, u64::from(RGFX_CB_OK))]
+    );
+    let signals = events(&platform.call_log().since(mark), SIGNAL);
+    assert!(
+        signals.contains(&waits[0]),
+        "the new queue's buffer does not signal what the reader waits for: {signals:?} against \
+         {waits:?}"
+    );
+}
+
 /// A command buffer with the ops `ops`, each a tag and its body, on queue `queue_obj_id`.
 fn command_buffer_of(queue_obj_id: u64, cb_obj_id: u64, ops: &[(u16, &[u8])]) -> Vec<u8> {
     use reims_graphics::ops::RgfxOpHeader;

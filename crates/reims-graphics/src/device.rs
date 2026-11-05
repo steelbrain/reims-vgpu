@@ -35,8 +35,11 @@
 //! ring whole in one block its process holds, among them), makes the
 //! queue's own submission+completion ring pair at the guest-given region offsets and starts a
 //! service thread of its own (`reims-vgpu.graphics-queue-*`) before it is answered, so the process
-//! may write the ring once the create returns. The thread first has the host make the queue's
-//! handle (the `QUEUE_CREATE` handed to [`Host::stage3_message`]), then takes the queue's
+//! may write the ring once the create returns. The host is told of the queue then too, before the
+//! answer ([`Host::queue_made`]): a buffer of another queue may name the queue's buffers from the
+//! answer on, before the queue's thread has had the host make its handle. The thread first has
+//! the host make the queue's handle (the `QUEUE_CREATE` handed to [`Host::stage3_message`]), then
+//! takes the queue's
 //! submission ring with the same `consumer_idle` handshake the control thread uses, hands each
 //! `COMMAND_BUFFER` to the host with a [`CompletionPoster`] onto the queue's completion ring (a
 //! `COMMAND_BUFFER_IN_REGION`'s message is taken from the process's block it names, with the
@@ -436,6 +439,18 @@ pub trait Host: Send + Sync + 'static {
     /// default does nothing, for a host with no stage-3 decoder.
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let _ = (completion, message);
+    }
+
+    /// A `QUEUE_CREATE` made the command queue `completion` posts for: its rings and its service
+    /// thread are the device's. Called on the context's lane with no lock held, before the create
+    /// is answered, so before the guest's processes know the queue, whose buffers a buffer of
+    /// another queue may name from the answer on. The queue's service thread may hand the host the
+    /// queue's create, and the buffers published before it, before or after this
+    /// ([`Host::stage3_message`]). [`CompletionPoster::published_seqno`] reads what the queue's
+    /// submission ring has published, until the queue ends. Not called for a create the device
+    /// refuses. The default does nothing.
+    fn queue_made(&self, completion: &CompletionPoster) {
+        let _ = completion;
     }
 
     /// Hands a `COMMAND_BUFFER` from a command queue's own submission ring, or from the block a
@@ -1774,8 +1789,9 @@ impl Shared {
     /// `QUEUE_CREATE` (the module doc), taken at reset count `epoch` with its tail's `flags` (0
     /// where it has none): makes a command queue's own submission+completion ring pair and starts
     /// its service thread, where the flags are ones the host carries out for the features the
-    /// driver took and the ring parameters are valid; the status its `COMPLETE` carries. Waits for no thread of the device's and
-    /// nothing of the host's.
+    /// driver took and the ring parameters are valid; the status its `COMPLETE` carries. A queue
+    /// made is told to the host before this returns ([`Host::queue_made`]), which is all of the
+    /// host's it waits for; it waits for no thread of the device's.
     pub(crate) fn create_queue(&self, q: &RgfxQueueCreate, flags: u32, epoch: u64) -> u32 {
         let refused_flags = flags & !self.queue_flags_allowed();
         if refused_flags != 0 {
@@ -1873,6 +1889,8 @@ impl Shared {
             );
             return RGFX_STATUS_INVALID_ARGUMENT;
         }
+        // Before the answer: a buffer of another queue may name this one's from then on.
+        self.host.queue_made(&self.queue_poster(&queue));
         RGFX_STATUS_OK
     }
 
