@@ -2143,6 +2143,154 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
     assert!(device.control.presented.color().1.is_identity());
 }
 
+/// A `DISPLAY_COLOR` of display 0's transaction 1 carrying all of `stage`'s entries, each red,
+/// green and blue with a fourth word of 0.
+fn display_color_entries(stage: u32, entries: &[[f32; 3]]) -> Vec<u8> {
+    let count = u32::try_from(entries.len()).unwrap();
+    let mut bytes = RgfxDisplayColor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_DISPLAY_COLOR,
+            size: 40 + 16 * count,
+            seqno: 0,
+        },
+        display: 0,
+        transaction_id: 1,
+        stage,
+        entry_count: count,
+        first_entry: 0,
+        part_entries: count,
+    }
+    .as_bytes()
+    .to_vec();
+    for [x, y, z] in entries {
+        bytes.extend_from_slice(
+            RgfxColorEntry {
+                x: x.to_bits(),
+                y: y.to_bits(),
+                z: z.to_bits(),
+                w: 0,
+            }
+            .as_bytes(),
+        );
+    }
+    bytes
+}
+
+/// A fade's last steps, each a transaction that sets only the pipe's gamma table after its matrix
+/// (`DISPLAY_COLOR` and a kept present, as the kext sends a colour-only transaction): the window's
+/// next draw after each kept present puts the display through that step's table, and the last
+/// step's table, with no present after it, is what every later draw shows, as the display holds
+/// the black a fade ends on
+#[test]
+fn a_kept_present_s_table_reaches_the_next_drawn_frame() {
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    use reims_vgpu_core::testkit::objects::kind;
+    const FRAGMENT_BUFFER: &str = "setFragmentBuffer:offset:atIndex:";
+    /// `displayPipeColorScanoutFragment`'s buffer of the post-gamma table.
+    const POST_TABLE: u64 = 3;
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let shown = Arc::new(Shown::default());
+    *shown.scanout.lock() = Some(Scanout {
+        width: 64,
+        height: 32,
+        stride: 256,
+        offset: RGFX_ALLOCATIONS_OFFSET,
+    });
+    let draw = sink::ScanoutDraw::new(
+        Arc::clone(&platform),
+        &device.control.region,
+        &shown,
+        &device.control.presented,
+    )
+    .unwrap();
+    let drawable = platform.texture_descriptor(&TextureDesc {
+        pixel_format: 80,
+        width: 64,
+        height: 32,
+        usage: 4,
+        ..TextureDesc::default()
+    });
+    let drawable = platform
+        .metal_device(None)
+        .unwrap()
+        .new_texture(OnFault::Return, &drawable)
+        .unwrap()
+        .unwrap();
+    let made: Arc<Mutex<Vec<<FakePlatform as Platform>::Buffer>>> = Arc::default();
+    for _ in 0..64 {
+        let made = Arc::clone(&made);
+        platform
+            .world()
+            .on_new::<kind::Buffer>(move |b| made.lock().push(b.clone_ref()));
+    }
+    let rect = reims_vgpu_window::PixelRect {
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 32,
+    };
+    // The post-gamma table the window's next draw binds, as its floats.
+    let drawn_table = || -> Vec<f32> {
+        let log = platform.call_log();
+        let mark = log.mark();
+        let _drawn = draw.encode(&drawable, rect).expect("a draw");
+        let bound = log
+            .since(mark)
+            .into_iter()
+            .filter(|c| c.sel == FRAGMENT_BUFFER && c.args[2].as_u64() == Some(POST_TABLE))
+            .map(|c| c.args[0].as_obj().unwrap())
+            .next_back()
+            .expect("a draw through the colour");
+        let made = made.lock();
+        let buffer = made.iter().find(|b| b.id() == bound).expect("the table");
+        let length = usize::try_from(buffer.length()).unwrap();
+        let contents: *const u8 = buffer.contents().as_ptr();
+        // SAFETY: the fake buffer's contents are `length` bytes it holds while it lives.
+        let bytes = unsafe { std::slice::from_raw_parts(contents, length) };
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| f32::from_le_bytes(*w))
+            .collect()
+    };
+
+    for step in [0.75f32, 0.5, 0.25, 0.0] {
+        guest.send(
+            &device,
+            display_color_entries(RGFX_COLOR_POST_GAMMA, &[[0.0; 3], [step; 3]]),
+        );
+        let keep = RgfxPresentSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_PRESENT_SURFACE,
+                size: 32,
+                seqno: 0,
+            },
+            display: 0,
+            iosurface_id: 0,
+            transaction_id: 1,
+            flags: RGFX_PRESENT_KEEP,
+        };
+        assert_eq!(
+            answered(&device, &mut guest, keep.as_bytes().to_vec()),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            drawn_table(),
+            [0.0, 0.0, 0.0, 0.0, step, step, step, 0.0],
+            "the draw after step {step}"
+        );
+    }
+    // Nothing presented after the last step: the window's later draws still show it.
+    for _ in 0..2 {
+        assert_eq!(drawn_table(), [0.0; 8], "a later draw");
+    }
+}
+
 /// A `LIBRARY_CREATE` of library `obj_id`, whose bytes the fake platform takes as a library.
 fn library_create(obj_id: u64) -> Vec<u8> {
     keyed_library_create(obj_id, &[1, 2, 3, 4], None)
