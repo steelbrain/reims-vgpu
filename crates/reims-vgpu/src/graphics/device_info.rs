@@ -26,8 +26,19 @@ use reims_vgpu_core::platform::caps::{
 };
 use reims_vgpu_core::raise::RaiseResult;
 
+/// `MTLGPUFamilyMetal3`.
+const MTL_GPU_FAMILY_METAL3: i64 = 5001;
 /// `MTLGPUFamilyMetal4`.
 const MTL_GPU_FAMILY_METAL4: i64 = 5002;
+
+/// Whether the device makes mesh render pipelines and draws them (`RGFX_FEATURE_MESH_PIPELINES`):
+/// where the platform answers `supportsFamily:` of Metal3, whose rows of Apple's Metal Feature Set
+/// Tables hold mesh shading, yes. Every Mac GPU that answers Metal3 makes them, the x86 Macs' AMD
+/// and Intel GPUs too (measured: `guest/bundle/tools/oracle/oracle_mesh` on the AMD Radeon Pro
+/// 5300M and the Intel UHD Graphics 630, macOS 26.7.1, and the M3 Max, macOS 27.0.1).
+pub(crate) fn makes_mesh_pipelines(identity: &IdentityCaps) -> bool {
+    identity.families[at(MTL_GPU_FAMILY_METAL3)] == Some(true)
+}
 
 /// 1 when the query answered a present `true`; 0 for a present `false` or a host
 /// gap (an `Err`). A gap is never reported as support.
@@ -212,7 +223,10 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// (after its colour records, `RGFX_PASS_FLAG_SAMPLE_POSITIONS`) with
 /// `SET_DEPTH_STORE_ACTION_OPTIONS`, and two the bundle does in the guest with no wire message:
 /// binary archives (`RgfxBinaryArchive`: no compiled code crosses) and IO queues (Metal's own IO
-/// queue and file handles over the bundle's device, `RgfxMetalDevice+IO.h`).
+/// queue and file handles over the bundle's device, `RgfxMetalDevice+IO.h`), and mesh shading
+/// (`MESH_RENDER_PIPELINE_CREATE` and the object and mesh stages' render ops, where the platform
+/// makes mesh pipelines: [`makes_mesh_pipelines`]). Mesh draws in an indirect command buffer are
+/// not: no mesh pipeline the bundle makes supports them, as on the x86 Macs.
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
 /// the Apple families it holds back rise with it once every piece up to Apple7's is here
 /// ([`cap_apple_families`]).
@@ -223,6 +237,7 @@ const WIRED: &[Piece] = &[
     Piece::TextureViews,
     Piece::BinaryArchives,
     Piece::IoCommandQueues,
+    Piece::MeshShading,
 ];
 
 /// `MTLGPUFamilyApple7`, the M1's: the first Apple family a Mac's GPU answers. A Mac's GPU
@@ -626,6 +641,19 @@ mod tests {
             assert_eq!(family(&info, no), Some(0), "family {no}");
         }
         assert_eq!(family(&info, 7), None);
+    }
+
+    /// The device makes mesh pipelines where the platform answers Metal3 (the fake, as an M3
+    /// Max), and not where it answers no, or has no answer
+    #[test]
+    fn mesh_pipelines_follow_metal3() {
+        let p = Arc::new(FakePlatform::new());
+        let mut identity = p.device().identity_caps();
+        assert!(makes_mesh_pipelines(&identity));
+        identity.families[at(MTL_GPU_FAMILY_METAL3)] = Some(false);
+        assert!(!makes_mesh_pipelines(&identity));
+        identity.families[at(MTL_GPU_FAMILY_METAL3)] = None;
+        assert!(!makes_mesh_pipelines(&identity));
     }
 
     /// Every feature set is answered as the platform answers it, the fake's (an M3 Max's) every

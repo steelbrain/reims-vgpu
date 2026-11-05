@@ -6793,6 +6793,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_MANAGED_BUFFER_SLABS
             | RGFX_FEATURE_SMALL_ID_CHUNKS
             | RGFX_FEATURE_DISPLAY_COLOR
+            | RGFX_FEATURE_MESH_PIPELINES
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
     // The fake's GPU shares the CPU's memory: no caches, so no deferred blocks and no budget.
@@ -6814,6 +6815,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_MANAGED_BUFFER_SLABS
             | RGFX_FEATURE_SMALL_ID_CHUNKS
             | RGFX_FEATURE_DISPLAY_COLOR
+            | RGFX_FEATURE_MESH_PIPELINES
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);

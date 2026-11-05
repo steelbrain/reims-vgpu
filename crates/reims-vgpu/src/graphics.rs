@@ -47,15 +47,15 @@ use reims_graphics::wire::{
     RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_HEAP_OVER_PAGES,
     RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
-    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_SMALL_ID_CHUNKS,
-    RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_DEFERRED,
-    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
-    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
-    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
-    RgfxDisplayColor, RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
-    RgfxPageRun, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
+    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_PAGES_BUFFERS,
+    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
+    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
+    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
+    RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup,
+    RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -241,6 +241,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // CPU's memory, else two, which hold Metal's contract on any GPU: the guest's device
             // answers `hasUnifiedMemory` alike, from the blob.
             let unified_memory = identity.flags.has_unified_memory.unwrap_or(false);
+            let meshes = device_info::makes_mesh_pipelines(&identity);
             let mut info = device_info(&gpu_device.caps(), identity, pool.threads().to_u64());
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             decoder.set_unified_memory(unified_memory);
@@ -268,7 +269,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // A host that maps the guest's pages maps a process's own pages too, for its no-copy
             // buffers (`BUFFER_OVER_PAGES`) and the heaps of its buffers' slabs
             // (`HEAP_OVER_PAGES`). Every host carries the display pipe's colour out
-            // (`DISPLAY_COLOR`), its window drawing through it.
+            // (`DISPLAY_COLOR`), its window drawing through it. A host whose GPU answers Metal3
+            // makes mesh render pipelines and draws them (`MESH_PIPELINES`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);
@@ -284,6 +286,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_MANAGED_BUFFER_SLABS)
                 | u64::from(RGFX_FEATURE_SMALL_ID_CHUNKS)
                 | u64::from(RGFX_FEATURE_DISPLAY_COLOR)
+                | if meshes {
+                    u64::from(RGFX_FEATURE_MESH_PIPELINES)
+                } else {
+                    0
+                }
                 | if unified_memory {
                     0
                 } else {
