@@ -155,7 +155,7 @@ public:
 	// showed a surface (thread context only).
 	// The scanout as it is now (setScanout): its shape, bytes per row and offset in the region.
 	// False before a mode is set.
-	bool currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowBytes, UInt64 *offset);
+	bool currentScanout(UInt32 *width, UInt32 *height, UInt32 *bytesPerRow, UInt64 *offset);
 	// Whether `task` owns the scanout: it holds the framebuffer's server connection, or its open
 	// of one is in flight (RgfxScanoutOwner.hpp). Only the owner reaches the display's pixels.
 	bool ownsScanout(task_t task);
@@ -445,7 +445,7 @@ private:
 	IOSimpleLock *interruptLock;
 	Interrupt vblank;
 	Interrupt connect;
-	RgfxConnectChange connectChange;
+	RgfxConnectChange displayChange;
 	bool vblankWanted;
 	// The display pipe's clients (each retained), which want VBLANK, and the surface shown; the
 	// hooks every client takes.

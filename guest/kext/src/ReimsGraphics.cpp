@@ -539,7 +539,7 @@ void ReimsGraphics::service()
 
 	IOSimpleLockLock(interruptLock);
 	Interrupt late = {};
-	if (connectChange.armed(connect.enabled && connect.proc))
+	if (displayChange.armed(connect.enabled && connect.proc))
 		late = connect;
 	bool want = vblankWanted || pipes.anyVblank();
 	IOSimpleLockUnlock(interruptLock);
@@ -650,7 +650,7 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// registered and on (RgfxDisplayModes.hpp, RgfxConnectChange).
 		refreshSeqno = 0;
 		IOSimpleLockLock(interruptLock);
-		if (connectChange.changed(connect.enabled && connect.proc))
+		if (displayChange.changed(connect.enabled && connect.proc))
 			fire = connect;
 		IOSimpleLockUnlock(interruptLock);
 		break;
@@ -906,7 +906,7 @@ bool ReimsGraphics::ownsScanout(task_t task)
 	return owns;
 }
 
-bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowBytes,
+bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *bytesPerRow,
                                    UInt64 *offset)
 {
 	if (!stateLock)
@@ -919,7 +919,7 @@ bool ReimsGraphics::currentScanout(UInt32 *width, UInt32 *height, UInt32 *rowByt
 		return false;
 	*width = m.width;
 	*height = m.height;
-	*rowBytes = strideFor(m.width);
+	*bytesPerRow = strideFor(m.width);
 	*offset = RGFX_ALLOCATIONS_OFFSET;
 	return true;
 }

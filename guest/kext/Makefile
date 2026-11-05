@@ -43,7 +43,7 @@ ARCH = -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=26.0
 
 FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-graphics/include \
 	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' -DRGFX_FB_TRACE=$(TRACE) \
-	-Os -Wall -Wextra -Werror -Wno-unused-parameter \
+	-Os -Wall -Wextra -Wshadow-all -Werror -Wno-unused-parameter \
 	-Wno-deprecated-declarations
 
 CXXFLAGS = $(FLAGS) -std=c++17 -fapple-kext -fno-rtti -fno-exceptions
