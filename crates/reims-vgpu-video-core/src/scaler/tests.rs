@@ -785,7 +785,8 @@ fn a_write_past_the_deadline_is_told_of_once_the_device_is_done() {
     let surfaces = Arc::new(HostSurfaces::default());
     let picture = reference::test_picture(64, 32);
     surfaces.add(7, ScalerFormat::Nv12VideoRange, 64, 32, &picture);
-    surfaces.add(9, ScalerFormat::Bgra, 32, 16, &picture);
+    let grey = reference::flat_picture(32, 16, [0.5, 0.5, 0.5, 1.0]);
+    surfaces.add(9, ScalerFormat::Bgra, 32, 16, &grey);
     let still_writing = Arc::new(Mutex::new(Vec::new()));
     let d = ScalerDevice::new(
         Arc::clone(&surfaces) as Arc<dyn Surfaces>,
