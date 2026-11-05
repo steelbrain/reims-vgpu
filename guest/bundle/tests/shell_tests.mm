@@ -7421,7 +7421,9 @@ void test_managed_texture_cpu_copy()
 // two copies there (any shape but one level, one sample, 2D, of a linear format) answers getBytes:
 // from its GPU copy, copied on the device, and not from its CPU copy; its replaceRegion: still
 // writes the CPU copy and posts the region, with no device copy. One the host lays over its CPU
-// copy, and any on a GPU of its own memory, reads its CPU copy.
+// copy, and any on a GPU of its own memory, reads its CPU copy, and answers it as its
+// virtualAddress: a CPU write there is what getBytes: answers next, and posts nothing, as on both
+// x86 Macs (oracle_bundle texmem); the one reading its GPU copy answers NULL.
 void test_managed_texture_reads_on_unified_memory()
 {
 	Fixture fx;
@@ -7486,6 +7488,21 @@ void test_managed_texture_reads_on_unified_memory()
 			} else {
 				CHECK(device.queuesAsked == 0);
 				CHECK(std::memcmp(back, pixel, 4) == 0);
+			}
+			uint8_t *va = static_cast<uint8_t *>([(id<RgfxMetalTextureInternals>)tex virtualAddress]);
+			if (c.readsGpuCopy) {
+				CHECK(va == nullptr);
+			} else {
+				// The CPU copy, where replaceRegion: wrote, and where getBytes: reads a CPU write.
+				CHECK(va == copy);
+				const uint8_t written[4] = {9, 8, 7, 6};
+				std::memcpy(va + 4, written, 4); // texel 1, 0 of level 0
+				uint8_t seen[4] = {};
+				[tex getBytes:seen
+				    bytesPerRow:4
+				     fromRegion:MTLRegionMake2D(1, 0, 1, 1)
+				    mipmapLevel:0];
+				CHECK(std::memcmp(seen, written, 4) == 0);
 			}
 			RgfxMsgHeader extra = {};
 			std::vector<uint8_t> extraBytes;

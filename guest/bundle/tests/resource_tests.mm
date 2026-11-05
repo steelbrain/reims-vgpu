@@ -601,6 +601,10 @@ void test_texture_answers()
 		CHECK([internals(managed) unfilteredResourceOptions] == 0x10);
 		CHECK([internals(managed) gpuAddress] != 0 &&
 		      [internals(managed) gpuAddress] != [internals(priv) gpuAddress]);
+		// A Managed texture's CPU address is its CPU copy, which a GPU of its own memory keeps.
+		CHECK([internals(managed) virtualAddress] != nullptr &&
+		      static_cast<uint8_t *>([internals(managed) virtualAddress]) >= mem.data() &&
+		      static_cast<uint8_t *>([internals(managed) virtualAddress]) < mem.data() + mem.size());
 		const uint64_t first = [internals(priv) uniqueIdentifier];
 		CHECK(first != 0 && [internals(shared) uniqueIdentifier] == first + 1);
 		CHECK([internals(untracked) uniqueIdentifier] == first + 2);

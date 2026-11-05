@@ -2049,13 +2049,24 @@ RGFX_RESOURCE_SPI
 // The CPU's address of the texture's memory: its texture's for a view, its buffer's plus its
 // offset for one over a buffer (the offset itself, over a Private buffer), its heap's plus its
 // offset there for a heap's texture (the offset itself, in a Private heap), else NULL, as Metal's
-// answers for a Private or IOSurface texture. Metal's Shared and Managed textures in no heap have
-// a CPU address, laid out as its GPU lays them out; the device lays out no such texture's memory
-// where the CPU reaches it, so NULL.
+// answers for a Private or IOSurface texture. Both x86 Macs' Shared and Managed textures in no
+// heap answer a CPU address, the memory getBytes: reads, in their GPU's tiled layout
+// (oracle_bundle texmem: the AMD 5300M and the Intel 630 under macOS 26.7.1; a CPU write there is
+// what getBytes: answers next). So a Managed one answers its CPU copy, laid out as
+// RgfxManagedLayout lays it, where getBytes: reads that copy and replaceRegion: writes it; a CPU
+// write there reaches the GPU's copy only where the host's texture lies over the copy itself (a
+// one-level 2D texture of a linear format on a GPU that shares the CPU's memory), and elsewhere
+// not, as nothing tells the host, the AMD's two copies' rule. One the host keeps in two copies on
+// a GPU that shares the CPU's memory reads its GPU copy at getBytes: (rgfxManagedGetBytes:), so a
+// write at its CPU copy would not be what getBytes: answers: NULL. A Shared one is NULL: the device
+// keeps none of its memory where the CPU reaches it.
 - (void *)virtualAddress
 {
 	if (_parent != nil) {
 		return [_parent virtualAddress];
+	}
+	if (_managedBytes != nullptr) {
+		return _managedReadsGpuCopy ? nullptr : _managedBytes;
 	}
 	uintptr_t base = 0, offset = 0;
 	if (_buffer != nil) {
