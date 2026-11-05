@@ -1376,6 +1376,137 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
     }
 }
 
+/// What a command buffer that asks for its `CB_SUBMITTED` costs from its doorbell write to the
+/// record on its queue's completion ring, as for a guest's `commitAndWaitUntilSubmitted` of a
+/// tiny buffer, rung for through `mmio_write_taking` as QEMU rings: on an idle queue, and just
+/// behind a short buffer (a sampler bind, walked on the queue's service thread where its commit
+/// waits for nothing) that does not ask, rung for `GAP` µs before it with the queue's thread
+/// asleep, whose walk is made to take `WALK` µs by a spin after its first op, standing for a GPU
+/// driver's record and submit of a few fills. The buffer behind is split by where it was
+/// answered: inside its write, or after it (by the queue's thread, which had to wake), and the
+/// answers that came only once the walk before it had ended are counted. Beside
+/// them, round by round so each sees the same load on the host, the idle buffer rung through
+/// `mmio_write`, which only wakes the queue's thread: what that wake costs here. Prints the mean,
+/// median, 90th and 99th percentiles and the most, in microseconds: a measurement, run by hand
+/// (`--run-ignored only --no-capture`, in a release build).
+#[test]
+#[ignore = "a measurement, run by hand"]
+#[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+fn an_asking_buffer_s_doorbell_to_its_cb_submitted_behind_a_walk() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    const ROUNDS: usize = 2000;
+    /// The behind buffer's walk, in µs.
+    const WALK: u64 = 100;
+    /// From the doorbell write of the buffer before to the asking one's, in µs: the guest's make,
+    /// encode and commit of its next buffer.
+    const GAP: u64 = 20;
+    let spin_for = |us: u64| {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_micros(us) {
+            std::hint::spin_loop();
+        }
+    };
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let (walking, walked) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (slow, ended) = (Arc::clone(&walking), Arc::clone(&walked));
+    device
+        .control
+        .decoder()
+        .set_walk_hook(Some(Arc::new(move |index: usize| {
+            if index == 0 && slow.swap(false, Ordering::SeqCst) {
+                spin_for(WALK);
+                ended.store(true, Ordering::SeqCst);
+            }
+        })));
+    let submit_off = ring.submit_off;
+    let taking = || device.mmio_write_taking(RGFX_REG_DOORBELL.into(), submit_off as u32);
+    // (idle, answered in the write), (idle, the queue's thread woken), (behind, in the write),
+    // (behind, after it).
+    let mut us: [Vec<f64>; 4] = Default::default();
+    let (mut cb, mut after_the_walk) = (1000, 0);
+    for round in 0..3 * ROUNDS {
+        let (behind, plain) = (round % 3 == 2, round % 3 == 1);
+        wait_idle(&device, submit_off);
+        // A pause as the guest's, so the queue's thread sleeps as it does between frames.
+        std::thread::sleep(Duration::from_micros(200));
+        ring.arm();
+        let first = cb;
+        if behind {
+            walked.store(false, Ordering::SeqCst);
+            walking.store(true, Ordering::SeqCst);
+            ring.publish(sampler_command_buffer(obj(1, 1), cb, obj(1, 4)));
+            taking();
+            spin_for(GAP);
+            cb += 1;
+        }
+        ring.publish(asking(obj(1, 1), cb));
+        let start = Instant::now();
+        if plain {
+            device.mmio_write(RGFX_REG_DOORBELL.into(), submit_off as u32);
+        } else {
+            taking();
+        }
+        let in_write = !plain && ring.has_event();
+        while !ring.has_event() {
+            assert!(start.elapsed() < Duration::from_secs(2), "no CB_SUBMITTED");
+            std::hint::spin_loop();
+        }
+        let took = start.elapsed().as_secs_f64() * 1e6;
+        if behind && walked.load(Ordering::SeqCst) {
+            after_the_walk += 1;
+        }
+        us[match (behind, plain, in_write) {
+            (false, false, _) => 0,
+            (false, true, _) => 1,
+            (true, _, true) => 2,
+            (true, _, false) => 3,
+        }]
+        .push(took);
+        let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!(
+            (posted.header.r#type, posted.cb_obj_id),
+            (RGFX_EVT_CB_SUBMITTED, cb)
+        );
+        for done in first..=cb {
+            assert!(complete_until_event(&platform, &mut ring), "no completion");
+            let complete = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+            assert_eq!((complete.cb_obj_id, complete.status), (done, RGFX_CB_OK));
+        }
+        ring.scheduled.clear();
+        cb += 1;
+    }
+    let stats = |name: &str, us: &[f64]| {
+        let mut us = us.to_vec();
+        us.sort_by(f64::total_cmp);
+        let n = us.len();
+        if n == 0 {
+            println!("{name}: none");
+            return;
+        }
+        let mean = us.iter().sum::<f64>() / n as f64;
+        println!(
+            "{name}: mean {mean:.2} p50 {:.2} p90 {:.2} p99 {:.2} max {:.2} us (n {n})",
+            us[n / 2],
+            us[n * 9 / 10],
+            us[n * 99 / 100],
+            us[n - 1]
+        );
+    };
+    stats("idle, answered in the write", &us[0]);
+    stats("idle, rung plainly: the queue's thread's wake", &us[1]);
+    let behind = format!("behind a {WALK} us walk rung for {GAP} us before");
+    stats(&behind, &[us[2].as_slice(), us[3].as_slice()].concat());
+    stats(&format!("{behind}, answered in the write"), &us[2]);
+    stats(&format!("{behind}, answered after it"), &us[3]);
+    println!("{behind}: {after_the_walk} of {ROUNDS} answered once the walk had ended");
+}
+
 /// Waits about 2 s at most for the service thread of the queue whose submission ring is at region
 /// offset `submit_off` to sleep with its ring idle (its `consumer_idle` 1), as the guest finds it
 /// when it rings for a buffer.
