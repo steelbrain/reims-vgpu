@@ -14,7 +14,7 @@ BOOTDIR is rgk-boot2.sh's (qmp.sock). It writes into OUTDIR:
   registers-N.txt HMP `info registers -a` over QMP, 3 times 1 s apart (N = 1, 2, 3)
   stack-cpuK.txt  HMP `x/32gx RSP` in vCPU K's address space (QMP human-monitor-command's
                   cpu-index), RSP from registers-1.txt
-  scanout.raw.zst the scanout (HMP `pmemsave` of the first CAPTURE_MODE rows of the
+  scanout.raw.zst the scanout (QMP `pmemsave` of the first CAPTURE_MODE rows of the
                   reims-graphics-pci allocations, where the kext sets it, at the guest-physical
                   address "info mtree" gives), BGRA8, zstd; scanout.png the same as an image, for
                   any panic text the guest drew there
@@ -170,12 +170,12 @@ def take_scanout():
         raise RuntimeError("no reims-graphics-pci.allocations in info mtree")
     w, h = (int(x) for x in os.environ.get("CAPTURE_MODE", "3840x2400").split("x"))
     stride = (w * 4 + 255) & ~255
-    raw = os.path.join(O, "scanout.raw")
-    hmp(f"pmemsave {base:#x} {stride * h} {raw}")
-    for _ in range(100):  # QEMU writes the file itself
-        if os.path.exists(raw) and os.path.getsize(raw) == stride * h:
-            break
-        time.sleep(0.1)
+    raw = os.path.abspath(os.path.join(O, "scanout.raw"))
+    # QMP's pmemsave, not HMP's: HMP reads "SIZE /path" as one expression, SIZE divided by the
+    # path, and answers "invalid char" with no file written. QEMU writes the file before answering.
+    r = qmp({"execute": "pmemsave", "arguments": {"val": base, "size": stride * h, "filename": raw}})[0]
+    if "error" in r:
+        raise RuntimeError(r["error"].get("desc", r["error"]))
     buf = open(raw, "rb").read()
     log(f"scanout: {len(buf)} bytes at guest-physical {base:#x}, {w}x{h} stride {stride}")
     with open(os.path.join(O, "scanout.png"), "wb") as f:

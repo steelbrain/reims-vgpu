@@ -632,7 +632,10 @@ def main():
         if state["ssh_ok"]:
             m = re.search(rb"^(\S+) .*the device was reset", new_text(args.log), re.M)
             b = re.search(rb"BdsDxe: loading|HANDOFF TO XNU", new_text(serial))
-            if (m or b) and t - state["reboot_at"] > 120:  # one restart resets and banners again
+            # One restart's markers come within 10 s: the host's three device resets (at T, T+1 and
+            # T+7 s) and the console's two banners. Restarts come 80 s apart or more (four
+            # system_resets in car 12's round B: 120 s here counted two of them).
+            if (m or b) and t - state["reboot_at"] > 30:
                 state["reboots"] += 1
                 state["reboot_at"] = t
                 state["fetch"] = True
