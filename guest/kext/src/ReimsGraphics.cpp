@@ -1811,6 +1811,12 @@ void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
 	t->vFront = t->vBlank - t->vSync - 6;
 	UInt64 total = static_cast<UInt64>(t->hActive + t->hBlank) * (t->vActive + t->vBlank);
 	UInt64 clock = total * mode.refreshMhz / 1000;
+	// macOS takes the display's rate from this timing: CVDisplayLink's nominal period is
+	// IOFBCurrentPixelCount / IOFBCurrentPixelClock (measured on an x86 Mac's 60 Hz panel:
+	// 6225200 / 373510000 s, a nominal period of 16666755 ns), and WebKit rounds that
+	// period's inverse to whole frames a second to pick its pages' rate. Rounding the clock
+	// to 10 kHz moves the rate by at most 5 kHz over the frame's pixels, far below the
+	// half hertz that would change WebKit's whole number.
 	t->pixelClock = (clock + 5000) / 10000 * 10000;
 }
 
