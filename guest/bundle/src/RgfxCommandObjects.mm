@@ -597,10 +597,10 @@ struct RgfxBarrierSlot {
 /// Takes a committed message's `bytes` into rgfxMessageReserve.
 - (void)rgfxNoteMessageBytes:(uint64_t)bytes;
 /// At the take of the completion of a buffer whose writes are named to the kext: whether its
-/// writes retire there, `now` (all in place and named) and no buffer before it retiring at its
-/// delivery; else it is one of those until rgfxRetiredLate.
+/// writes retire there, `now` (all in place and named) and no buffer before it retiring later;
+/// else it is one of those until rgfxRetiredLate.
 - (BOOL)rgfxRetiresAtTake:(BOOL)now;
-/// A buffer rgfxRetiresAtTake: left to retire at its delivery has retired.
+/// A buffer rgfxRetiresAtTake: left to retire later has retired.
 - (void)rgfxRetiredLate;
 /// How many of its posted buffers are held: posted with their surface accesses not yet named,
 /// until they are scheduled (RgfxCmdBuffer's rgfxPost). Read and raised by its posts, one at a
@@ -608,6 +608,10 @@ struct RgfxBarrierSlot {
 - (uint32_t)rgfxHeldBuffers;
 - (void)rgfxNoteHeld;
 - (void)rgfxNoteHeldGone;
+/// Where the queue's buffers whose writes do not retire at the take write their copies back and
+/// retire, one at a time in the ring's order (rgfxHostDone:): a serial queue of the queue's own,
+/// made with its first such buffer, which runs no handler.
+- (dispatch_queue_t)rgfxWriteBackQueue;
 /// The next encoder's barrier fence, of the fences the queue made with itself.
 - (RgfxBarrierSlot)rgfxTakeBarrierSlot;
 /// Runs `record` on the queue's completion queue, behind the records before it, or here.
@@ -642,12 +646,15 @@ struct RgfxBarrierSlot {
 	// The records handed to a dispatch queue and not yet run: while there are any, a record the
 	// taker of the ring could run itself goes behind them instead.
 	std::atomic<uint32_t> _deliveriesInFlight;
-	// Its buffers taken whose writes retire at their delivery, not yet retired: while there are
-	// any, a later buffer's retire goes behind them too, as the kext retires a queue's writes up
-	// to a seqno (rgfxRetiresAtTake:).
+	// Its buffers taken whose writes retire on the write-back queue, not yet retired: while there
+	// are any, a later buffer's retire goes behind them too, as the kext retires a queue's writes
+	// up to a seqno (rgfxRetiresAtTake:).
 	std::atomic<uint32_t> _lateRetires;
 	// rgfxHeldBuffers.
 	std::atomic<uint32_t> _heldBuffers;
+	// rgfxWriteBackQueue's queue, made once.
+	std::once_flag _writeBackOnce;
+	dispatch_queue_t _writeBackQueue;
 	NSUInteger _gpuPriority;           // kept for -GPUPriority (setGPUPriority: SPI)
 	unsigned short _gpuPriorityOffset; // and the offsets and background priority with it
 	NSUInteger _backgroundGpuPriority;
@@ -794,7 +801,7 @@ struct RgfxBarrierSlot {
 	                      std::memory_order_relaxed);
 }
 
-// The takes come in the ring's order, one at a time; a delivery lets one go only after its
+// The takes come in the ring's order, one at a time; a write-back lets one go only after its
 // retire, so a take that finds none pending finds every earlier buffer's copies written back.
 - (BOOL)rgfxRetiresAtTake:(BOOL)now
 {
@@ -822,6 +829,17 @@ struct RgfxBarrierSlot {
 - (void)rgfxNoteHeldGone
 {
 	_heldBuffers.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+- (dispatch_queue_t)rgfxWriteBackQueue
+{
+	std::call_once(_writeBackOnce, [self] {
+		self->_writeBackQueue = dispatch_queue_create(
+		    "com.reims.rgfx.surface-write-back",
+		    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE,
+		                                            0));
+	});
+	return _writeBackQueue;
 }
 
 // Takes one of the queue's slots, blocking while every one is held, as Metal's -commandBuffer
@@ -1173,6 +1191,7 @@ struct RgfxBarrierSlot {
 @interface RgfxCmdBuffer ()
 - (void)rgfxHostDone:(const RgfxCbComplete *)msg;
 - (void)rgfxDeliverCompletion:(const RgfxCbComplete *)msg;
+- (void)rgfxWriteBackAndRetire:(uint64_t)seqno;
 - (void)rgfxReachScheduled;
 - (void)rgfxReachSubmitted;
 - (void)rgfxWaitFor:(dispatch_group_t)group reached:(const std::atomic<bool> *)reached;
@@ -1343,8 +1362,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// both posted and scheduled (kRgfxSlotsHeld, kRgfxSlotsScheduled: rgfxNameAccesses).
 	std::atomic<uint32_t> _surfaceSlots;
 	// What its accesses name (rgfxNameAccesses): the views it writes and those it only reads,
-	// and where its writes go to the kext; set by its post, emptied by its delivery
-	// (`_namedGone`), all under `_namedLock`, so a delivery that comes first leaves nothing to
+	// and where its writes go to the kext; set by its post, emptied by its write-back or its
+	// delivery (`_namedGone`), all under `_namedLock`, so one that comes first leaves nothing to
 	// name: no write is named to the kext after its retire.
 	std::mutex _namedLock;
 	std::vector<std::shared_ptr<void>> _namedWrites;
@@ -1356,6 +1375,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// finish of the buffer raises each plain event's value as this process knows it.
 	std::vector<std::pair<id, uint64_t>> _eventWaits;
 	std::vector<std::pair<RgfxEvent *, uint64_t>> _plainSignals;
+	// Signalled once the queue's write-back queue has written its copies back and retired its
+	// writes, where its take left them to it (rgfxHostDone:); nil otherwise.
+	dispatch_semaphore_t _writtenBack;
 	// The copies of app memory (no-copy buffers') this buffer may write, written back to the
 	// memory when it completes (RgfxMemoryShadow.hpp).
 	std::vector<std::shared_ptr<RgfxMemoryShadow>> _shadowWrites;
@@ -1959,17 +1981,52 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// A buffer that writes only surfaces in place has its results in their pages now that the
 	// device has completed it: its writes retire here, so a CPU lock waiting for them goes on
 	// at once, not behind the queue's earlier handlers. One with a copy to write back, behind
-	// one, or not yet named (its post's naming still to come) retires at its delivery. The
-	// record's seqno is the buffer's: _seqno is written after the post, which the host may
-	// complete first.
-	if (_surfaceWritesRegion != nullptr &&
-	    [_queue rgfxRetiresAtTake:_writesInPlace &&
-	                              _writesNamed.load(std::memory_order_acquire)]) {
-		rgfxIOSurfaceRetire(_surfaceWritesRegion, [_queue rgfxObjId], msg->header.seqno);
-		_surfaceWritesRegion = nullptr;
+	// one, or not yet named (its post's naming still to come) writes its copies back and retires
+	// on the queue's write-back queue, in the ring's order, and its delivery waits for that: not
+	// behind the queue's earlier handlers either, so a handler that locks a surface a later
+	// buffer of its queue writes waits for that buffer's write-back alone, as Metal's lock waits
+	// for the GPU alone. The record's seqno is the buffer's: _seqno is written after the post,
+	// which the host may complete first.
+	if (_surfaceWritesRegion != nullptr) {
+		const uint64_t seqno = msg->header.seqno;
+		if ([_queue rgfxRetiresAtTake:_writesInPlace &&
+		                              _writesNamed.load(std::memory_order_acquire)]) {
+			rgfxIOSurfaceRetire(_surfaceWritesRegion, [_queue rgfxObjId], seqno);
+			_surfaceWritesRegion = nullptr;
+		} else {
+			_writtenBack = dispatch_semaphore_create(0);
+			RgfxCmdBuffer *strongSelf = self;
+			dispatch_async([_queue rgfxWriteBackQueue], ^{
+				[strongSelf rgfxWriteBackAndRetire:seqno];
+			});
+		}
 	}
 	[self rgfxGiveSlotBack];
 	[self rgfxNoteGPUTimes:msg];
+}
+
+// On the queue's write-back queue, behind the buffers taken before it there: writes back the
+// copies this buffer wrote, then retires the queue's writes up to its `seqno`, so the CPU locks
+// waiting for them go on, and lets its delivery go on. Its accesses not yet named by then (a
+// held buffer whose CB_SCHEDULED did not come, named at its delivery's rgfxReachScheduled; one
+// whose post's naming is still to come) are named to no one: a naming already under way holds
+// `_namedLock`, which this waits for.
+- (void)rgfxWriteBackAndRetire:(uint64_t)seqno
+{
+	// Its accesses named from here would reach the kext after its retire: none are.
+	{
+		std::lock_guard<std::mutex> g(_namedLock);
+		_namedWrites.clear();
+		_namedReads.clear();
+		_namedRegion = nullptr;
+		_namedGone = true;
+	}
+	rgfxIOSurfaceWriteBack(_surfaceWrites);
+	_surfaceWrites.clear();
+	rgfxIOSurfaceRetire(_surfaceWritesRegion, [_queue rgfxObjId], seqno);
+	_surfaceWritesRegion = nullptr;
+	[_queue rgfxRetiredLate];
+	dispatch_semaphore_signal(_writtenBack);
 }
 
 // Delivers the host's completion for this command buffer, on its queue's completion queue (or on
@@ -1983,7 +2040,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// could not carry it out), it is scheduled here, its scheduled handlers run before anything
 	// of its completion.
 	[self rgfxReachScheduled];
-	// The surfaces this buffer wrote hold its results before anyone sees it complete.
+	// The surfaces this buffer wrote hold its results before anyone sees it complete: written
+	// back here, or on the queue's write-back queue where its take left its retire to it.
+	if (_writtenBack != nil)
+		dispatch_semaphore_wait(_writtenBack, DISPATCH_TIME_FOREVER);
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
 	_surfaceWrites.clear();
 	_surfaceReads.clear();
@@ -1993,13 +2053,6 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		_namedReads.clear();
 		_namedRegion = nullptr;
 		_namedGone = true;
-	}
-	// Its results are in the surfaces' pages: the CPU locks waiting for them go on, where its
-	// writes did not retire at the take (rgfxHostDone:), which left it to retire here.
-	if (_surfaceWritesRegion != nullptr) {
-		rgfxIOSurfaceRetire(_surfaceWritesRegion, [_queue rgfxObjId], _seqno);
-		_surfaceWritesRegion = nullptr;
-		[_queue rgfxRetiredLate];
 	}
 	// So does the app memory it may have written under no-copy buffers.
 	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)

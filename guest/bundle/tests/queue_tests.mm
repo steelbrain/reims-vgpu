@@ -10,6 +10,7 @@
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -864,9 +865,17 @@ bool oneIdChunk(void *context, uint64_t *first)
 // A buffer that writes only surfaces in place retires its writes as the completion thread takes
 // its completion, before its handlers, which run behind the queue's earlier ones: a CPU lock
 // waiting for its writes goes on there, as Metal's waits only for the GPU. Its delivery retires
-// nothing more. A buffer that writes a copy retires once its delivery has written the copy back,
-// and so does a later buffer of its queue that writes only surfaces in place, as the kext retires
-// a queue's writes up to a seqno: the copy's would otherwise retire before its write-back.
+// nothing more. A buffer that writes a copy retires once the queue's write-back queue has written
+// the copy back, and so does a later buffer of its queue that writes only surfaces in place,
+// behind it, as the kext retires a queue's writes up to a seqno: the copy's would otherwise
+// retire before its write-back. Neither waits for the handlers before them, so a handler that
+// locks a surface a later buffer of its queue writes waits only for that buffer's write-back;
+// their deliveries wait for it. (They used to retire at their deliveries, behind the handlers:
+// such a lock waited out the kext's 2 s, then went on without the results.) A held buffer (one
+// that waits on an event below its value) that writes the copy and completes with no
+// CB_SCHEDULED, its accesses not yet named, retires there too, and its scheduling at its
+// delivery names none of its writes to the kext: one named after its retire would hold the
+// surface's CPU locks for good.
 void test_in_place_writes_retire_at_the_take()
 {
 	struct Source {
@@ -876,6 +885,10 @@ void test_in_place_writes_retire_at_the_take()
 		std::atomic<int> given{0};
 		std::mutex lock;
 		std::vector<uint64_t> retired; // the seqnos, in the calls' order
+		std::vector<uint64_t> named;   // the seqnos whose writes are named to the kext
+		// The copied surface, once set, and its first byte at each retire after that.
+		IOSurfaceRef copied = nullptr;
+		std::vector<uint8_t> copiedAtRetire;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t,
 		                                     uint32_t surfaceId, bool, uint64_t *offset,
 		                                     uint64_t *serial, bool *fresh, bool *cached)
@@ -899,12 +912,30 @@ void test_in_place_writes_retire_at_the_take()
 			return true;
 		}
 		static void release(void *, uint64_t) {}
-		static void writes(void *, uint64_t, uint64_t, const uint64_t *, uint32_t) {}
+		static void writes(void *c, uint64_t, uint64_t seqno, const uint64_t *, uint32_t)
+		{
+			Source *src = static_cast<Source *>(c);
+			std::lock_guard<std::mutex> hold(src->lock);
+			src->named.push_back(seqno);
+		}
+		bool namedAt(uint64_t seqno)
+		{
+			std::lock_guard<std::mutex> hold(lock);
+			return std::find(named.begin(), named.end(), seqno) != named.end();
+		}
 		static void retire(void *c, uint64_t, uint64_t seqno)
 		{
 			Source *src = static_cast<Source *>(c);
 			std::lock_guard<std::mutex> hold(src->lock);
 			src->retired.push_back(seqno);
+			if (src->copied != nullptr)
+				src->copiedAtRetire.push_back(
+				    *static_cast<const uint8_t *>(IOSurfaceGetBaseAddress(src->copied)));
+		}
+		std::vector<uint8_t> seenCopied()
+		{
+			std::lock_guard<std::mutex> hold(lock);
+			return copiedAtRetire;
 		}
 		std::vector<uint64_t> seen()
 		{
@@ -997,7 +1028,8 @@ void test_in_place_writes_retire_at_the_take()
 		CHECK(a.status == MTLCommandBufferStatusCompleted);
 		CHECK(src.seen() == std::vector<uint64_t>({sa}));
 
-		// A copy, then in place: neither retires until the copy's delivery, then both in order.
+		// A copy, then in place: both retire in order once the copy is written back, while the
+		// handler before them holds their deliveries.
 		hold = holding();
 		[hold commit];
 		const uint64_t sh2 = nextSeqno(q);
@@ -1007,19 +1039,67 @@ void test_in_place_writes_retire_at_the_take()
 		id<MTLCommandBuffer> c = draw(tp);
 		[c commit];
 		const uint64_t sc = nextSeqno(q);
+		{
+			std::lock_guard<std::mutex> g(src.lock);
+			src.copied = copied;
+		}
+		// What the GPU drew into the copy: its first row.
+		std::memset(&mem[src.copy], 0x5a, 16 * 4);
 		hostComplete(q, *driven.kext, sh2, hold);
 		CHECK(waitFor(held, 5) == 0);
 		hostComplete(q, *driven.kext, sb, b);
 		hostComplete(q, *driven.kext, sc, c);
-		// All three taken: their slots are back.
-		NSMutableArray<id<MTLCommandBuffer>> *spare = [NSMutableArray array];
-		for (int i = 0; i < 3; i++)
-			[spare addObject:[q.queue commandBuffer]];
-		CHECK(src.seen() == std::vector<uint64_t>({sa}));
+		CHECK(retiredBecomes({sa, sb, sc}));
+		CHECK(src.seenCopied() == std::vector<uint8_t>({0x5a, 0x5a}));
+		CHECK(b.status != MTLCommandBufferStatusCompleted &&
+		      c.status != MTLCommandBufferStatusCompleted);
 		dispatch_semaphore_signal(letGo);
 		[c waitUntilCompleted];
+		CHECK(b.status == MTLCommandBufferStatusCompleted &&
+		      c.status == MTLCommandBufferStatusCompleted);
 		CHECK(src.seen() == std::vector<uint64_t>({sa, sb, sc}));
-		(void)spare;
+
+		// Held, writing the copy: not named at its post; its completion, with no CB_SCHEDULED,
+		// written back and retired while the handler before it holds its delivery; scheduled at
+		// its delivery, naming nothing; and the queue holds no buffer after it, whose writes are
+		// named at its post.
+		RgfxSharedEvent *gate = [RgfxSharedEvent sharedEventWithInitialValue:0
+		                                                              device:nil
+		                                                          serializer:&q.ser];
+		CHECK(gate != nil);
+		hold = holding();
+		[hold commit];
+		const uint64_t sh3 = nextSeqno(q);
+		id<MTLCommandBuffer> d = [q.queue commandBuffer];
+		[d encodeWaitForEvent:gate value:1];
+		{
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = tc;
+			rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+			rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+			[[d renderCommandEncoderWithDescriptor:rp] endEncoding];
+		}
+		[d commit];
+		const uint64_t sd = nextSeqno(q);
+		CHECK(src.namedAt(sb) && !src.namedAt(sd));
+		std::memset(&mem[src.copy], 0x6b, 16 * 4);
+		hostComplete(q, *driven.kext, sh3, hold);
+		CHECK(waitFor(held, 5) == 0);
+		hostComplete(q, *driven.kext, sd, d);
+		CHECK(retiredBecomes({sa, sb, sc, sd}));
+		CHECK(src.seenCopied() == std::vector<uint8_t>({0x5a, 0x5a, 0x6b}));
+		CHECK(d.status != MTLCommandBufferStatusCompleted);
+		dispatch_semaphore_signal(letGo);
+		[d waitUntilCompleted];
+		CHECK(d.status == MTLCommandBufferStatusCompleted);
+		CHECK(!src.namedAt(sd));
+		id<MTLCommandBuffer> e = draw(tp);
+		[e commit];
+		const uint64_t se = nextSeqno(q);
+		CHECK(src.namedAt(se));
+		hostComplete(q, *driven.kext, se, e);
+		[e waitUntilCompleted];
+		CHECK(e.status == MTLCommandBufferStatusCompleted && !src.namedAt(sd));
 	}
 }
 
