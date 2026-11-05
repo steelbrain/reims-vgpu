@@ -35,17 +35,27 @@
 //! `RGK_BENCH_TAKES` superpages an order (default 256, 512 MiB), `RGK_BENCH_RAM_MIB` the RAM
 //! (at least twice the takes'), `RGK_BENCH_TAKE_GAP_US` a pause before each take (default 0, a
 //! burst), and `RGK_BENCH_ORDERS` a comma list of the orders' names to run.
+//!
+//! **A large pages slab's take** (`large_take_costs_*`, `test(/large_take_costs/)`): what a large
+//! Shared buffer of the process's own superpages costs, as the bundle sends it: the pages block's
+//! `SURFACE_PAGES` of its superpages' runs, then a `BUFFER_OVER_PAGES` over the whole block, which
+//! makes the block's view (a mapping of each run) and the import of it, and the buffer's destroy
+//! and the block's release. The superpages are taken in the three orders above, so a slab's runs
+//! are one run (upwards, each superpage right after the one before, which the kext lists as one),
+//! or one a superpage (downwards, scattered). `RGK_BENCH_LARGE_MIB` MiB a slab (default 64),
+//! `RGK_BENCH_LARGE_TAKES` slabs an order (default 8), and `RGK_BENCH_ORDERS` as above.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
-    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_HEAP_OVER_PAGES,
-    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
-    RGFX_CURSOR_SPAN, RGFX_STATUS_OK, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_PRIVATE,
-    RgfxBufferAtOffset, RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxMsgHeader,
-    RgfxObjectDestroy, RgfxPageRun, RgfxSurfacePages,
+    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
+    RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SURFACE_PAGES,
+    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_STATUS_OK, RGFX_SURFACE_PAGES_CACHED,
+    RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset, RgfxBufferOverPages,
+    RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun,
+    RgfxSurfacePages,
 };
 use reims_vgpu_core::host::PhysRange;
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
@@ -607,6 +617,131 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
     }
 }
 
+/// The runs of the superpages at `slots` of the RAM's 2 MiB slots, in that order, as the kext
+/// lists a block's pages: a superpage right after the one before continues its run.
+fn superpage_runs(slots: &[u64]) -> Vec<RgfxPageRun> {
+    let mut runs: Vec<RgfxPageRun> = Vec::new();
+    for &slot in slots {
+        let address = RAM + slot * SUPERPAGE;
+        match runs.last_mut() {
+            Some(last) if last.address + last.length == address => last.length += SUPERPAGE,
+            _ => runs.push(RgfxPageRun {
+                address,
+                length: SUPERPAGE,
+            }),
+        }
+    }
+    runs
+}
+
+/// Measures large pages slabs' takes on `platform` in each order (module docs), printing a line
+/// per step.
+fn measure_large_takes<P: ApiPlatform>(label: &str) {
+    let platform = P::process();
+    let device = platform.metal_device(None).expect("a GPU device");
+    let slab = env_u64("RGK_BENCH_LARGE_MIB", 64) * MIB;
+    let takes = env_u64("RGK_BENCH_LARGE_TAKES", 8);
+    let per = slab / SUPERPAGE;
+    let ram_bytes = (env_u64("RGK_BENCH_RAM_MIB", 1024) * MIB).max(2 * takes * slab);
+    let only = std::env::var("RGK_BENCH_ORDERS").ok();
+    let mut rng = XorShift(0xbb67_ae85_84ca_a73b);
+    let orders = take_orders(ram_bytes / SUPERPAGE, takes * per, &mut rng);
+    eprintln!(
+        "{label}: {} MiB of fresh guest RAM, {takes} slabs of {} MiB an order",
+        ram_bytes >> 20,
+        slab >> 20
+    );
+    let block_size = 0x4000u64;
+    for (name, slots) in orders {
+        if only
+            .as_ref()
+            .is_some_and(|o| !o.split(',').any(|n| n == name))
+        {
+            continue;
+        }
+        let ram = guest_ram(ram_bytes, false);
+        let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
+        let core =
+            CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
+        let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
+        let region = Arc::new(Region::new(size.to_usize()).expect("a region"));
+        let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), region);
+        dec.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
+        let mut steps: [Step; 6] = Default::default();
+        let mut run_counts = Vec::new();
+        for (i, slab_slots) in slots.chunks(per.to_usize()).enumerate() {
+            let block = BLOCK + i.to_u64() * block_size;
+            steps[0].time(|| {
+                for &slot in slab_slots {
+                    let offset = (slot * SUPERPAGE).to_usize();
+                    // SAFETY: the superpage's bytes, in the RAM's mapping, which nothing else uses.
+                    unsafe { std::ptr::write_bytes(ram.at.add(offset), 0, SUPERPAGE.to_usize()) };
+                }
+            });
+            let runs = superpage_runs(slab_slots);
+            run_counts.push(runs.len());
+            let pages = RgfxSurfacePages {
+                header: header(RGFX_CMD_SURFACE_PAGES),
+                context: 0,
+                run_count: u32::try_from(runs.len()).expect("a slab's runs"),
+                block_offset: block,
+                block_size,
+                runs_offset: block + 0x1000,
+                length: slab,
+            };
+            let over = RgfxBufferOverPages {
+                header: header(RGFX_CMD_BUFFER_OVER_PAGES),
+                obj_id: 0x1000 + i.to_u64(),
+                gpu_address: 0,
+                block_offset: block,
+                block_size,
+                offset: 0,
+                length: slab,
+                options: 0,
+                reserved_44: 0,
+            };
+            let status = steps[1]
+                .time(|| dec.surface_pages(&device, &pages, &runs, RGFX_SURFACE_PAGES_PRIVATE));
+            assert_eq!(status, RGFX_STATUS_OK, "{name}: slab {i}'s SURFACE_PAGES");
+            let made = steps[2].time(|| dec.decode(&device, over.as_bytes()));
+            assert_eq!(made.ok(), Some(Ok(())), "{name}: slab {i}'s buffer");
+            let take = steps[1].0[i] + steps[2].0[i];
+            steps[3].0.push(take);
+            let destroy = RgfxObjectDestroy {
+                header: header(RGFX_CMD_OBJECT_DESTROY),
+                obj_id: over.obj_id,
+            };
+            let gone = steps[4].time(|| dec.decode(&device, destroy.as_bytes()));
+            assert_eq!(gone.ok(), Some(Ok(())));
+            steps[5].time(|| {
+                dec.block_released(&device, block, false, Box::new(|| ()), no_raise());
+            });
+        }
+        for (step, step_name) in steps.iter().zip([
+            "guest's zero fill",
+            "SURFACE_PAGES (pages block)",
+            "BUFFER_OVER_PAGES",
+            "take (the two)",
+            "OBJECT_DESTROY",
+            "BLOCK_RELEASE",
+        ]) {
+            eprintln!("{label}: {}", step.line(name, step_name));
+        }
+        eprintln!(
+            "{label}: {name:<11} runs a slab: {:?}",
+            run_counts
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        dec.views_of_surfaces().reset();
+        drop(dec);
+        drop(core);
+        drop(lease);
+        drop(ram);
+    }
+}
+
 /// The range mappings alone, with no GPU device made: what a profiler of the views' own code
 /// runs, outside the GPU's locks (`RGK_BENCH_MAP_ONLY=1` with the Vulkan test).
 #[cfg(feature = "vulkan")]
@@ -798,4 +933,20 @@ fn pages_take_costs_vulkan() {
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn pages_take_costs_metal() {
     measure_takes::<reims_vgpu_metal::MetalPlatform>("metal");
+}
+
+/// The Vulkan platform's takes of large pages slabs (module docs).
+#[cfg(feature = "vulkan")]
+#[test]
+#[ignore = "a measurement: run it alone, under the GPU locks"]
+fn large_take_costs_vulkan() {
+    measure_large_takes::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
+}
+
+/// The Metal platform's takes of large pages slabs, for comparison (module docs).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "a measurement: run it alone, under the GPU locks"]
+fn large_take_costs_metal() {
+    measure_large_takes::<reims_vgpu_metal::MetalPlatform>("metal");
 }
