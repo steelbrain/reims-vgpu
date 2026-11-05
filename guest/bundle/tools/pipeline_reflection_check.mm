@@ -14,9 +14,26 @@
 //                r_more's
 //   r_more       v_more (more built-ins and outputs) and f_more, a vertex descriptor of buffers 1, 4
 //                and 30, buffer 30 holding only an attribute the function declares and does not read
+//   c_nested     an argument buffer of a struct of members, arrays of them, of samplers, buffers,
+//                constants and textures, and a pointer to another argument buffer
+//   c_tables     a visible function table, an intersection function table and acceleration
+//                structures of both kinds
+//   c_more_textures  textures of further shapes, sample types and access
+//   c_imageblock an imageblock
+//   c_atomic_texture  a texture of 64-bit atomics (its library, LIB, is
+//                tools/oracle/oracle_reflection_31.metal's)
+//   r_fetch      v_buffers and f_fetch, which reads its colour attachments (framebuffer fetch)
+//   r_tables     v_buffers and f_tables, an acceleration structure and a function table in a
+//                fragment function
+//   c_specialised_on, c_specialised_off
+//                k_specialised with kOn true, kOff false, kIndex 5 and kMode 1, kOpt undefined;
+//                and with both false, kIndex 7, kMode 2 and kOpt true
+//   r_specialised_one, r_specialised_two
+//                v_specialised and f_plain, a vertex descriptor as r_stage_in's, kMode 1 and 2
 // Prints each difference (with -v, every line both walks agree on), a case ours makes no reflection
-// of with its reason and Metal's getters' answers (to measure them), and
-//   pipeline_reflection_check: C cases, V values, D differ, N not made
+// of with its reason and Metal's getters' answers (with -v its instance variables' too, to measure
+// them), a case Metal makes no pipeline of with its error, and
+//   pipeline_reflection_check: C cases, V values, D differ, N not made, U Metal made none
 // Exits 1 where any differs. Metal's own answers are the contract the bundle's must equal; a case
 // ours does not make answers nil, as the device did before it had any.
 // Build: make pipeline-reflection-check (build/pipeline_reflection_check-x86_64; ARCH=arm64 for an
@@ -38,7 +55,7 @@ id<MTLDevice> D;
 id<MTLLibrary> L;
 std::vector<uint8_t> Bytes; // LIB's bytes
 bool Verbose;
-unsigned Cases, Values, Differ, NotMade;
+unsigned Cases, Values, Differ, NotMade, Unmade;
 
 // The nodes of LIB's entry point `name`.
 bool entryOf(const std::string &name, RgfxAirEntries &module)
@@ -126,11 +143,12 @@ void compare(const char *name, unsigned opts, id metal, id ours, NSString *why)
 		if (metal != nil && ours == nil && why != nil) {
 			NotMade++;
 			printf("%s/%u: ours not made (%s)\n", name, opts, why.UTF8String);
-			// Metal's own answers, to measure what ours lacks: its getters, not its instance variables.
+			// Metal's own answers, to measure what ours lacks: its getters, and with -v its instance
+			// variables.
 			std::vector<std::string> order;
 			auto m = linesOf(metal, order);
 			for (const std::string &k : order)
-				if (k.find(" ivar ") == std::string::npos)
+				if (Verbose || k.find(" ivar ") == std::string::npos)
 					printf("  metal %s = %s\n", k.c_str(), m[k].c_str());
 			return;
 		}
@@ -176,13 +194,19 @@ void computeCase(const char *name, const Fn &kernel, MTLStageInputOutputDescript
 	for (unsigned opts = 0; opts < 4; opts++) {
 		MTLAutoreleasedComputePipelineReflection metal = nil;
 		NSError *error = nil;
+		id state = nil;
 		if (byDescriptor || stageIn != nil) {
 			MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
 			d.computeFunction = f;
 			d.stageInputDescriptor = stageIn;
-			[D newComputePipelineStateWithDescriptor:d options:opts reflection:&metal error:&error];
+			state = [D newComputePipelineStateWithDescriptor:d options:opts reflection:&metal error:&error];
 		} else {
-			[D newComputePipelineStateWithFunction:f options:opts reflection:&metal error:&error];
+			state = [D newComputePipelineStateWithFunction:f options:opts reflection:&metal error:&error];
+		}
+		if (state == nil) {
+			printf("%s/%u: metal made no pipeline: %s\n", name, opts, error.localizedDescription.UTF8String);
+			Unmade++;
+			return;
 		}
 		id ours = nil;
 		NSString *why = nil;
@@ -213,7 +237,7 @@ void renderCase(const char *name, const Fn &vertex, const Fn *fragment, MTLVerte
 		id state = [D newRenderPipelineStateWithDescriptor:d options:opts reflection:&metal error:&error];
 		if (state == nil) {
 			printf("%s/%u: metal made no pipeline: %s\n", name, opts, error.localizedDescription.UTF8String);
-			Differ++;
+			Unmade++;
 			return;
 		}
 		id ours = nil;
@@ -345,7 +369,9 @@ int main(int argc, char **argv)
 		                {"c_types", "k_types"},         {"c_more", "k_more"},
 		                {"c_builtins_only", "k_builtins_only"}, {"c_nothing", "k_nothing"},
 		                {"c_argument_buffer", "k_argument_buffer"}, {"k_arrays", "k_arrays"},
-		                {"k_builtins", "k_builtins"}};
+		                {"k_builtins", "k_builtins"}, {"c_nested", "k_nested"},
+		                {"c_tables", "k_tables"}, {"c_more_textures", "k_more_textures"},
+		                {"c_imageblock", "k_imageblock"}};
 		for (const auto &k : kKernels)
 			if (CASE(k.name))
 				computeCase(k.name, Fn{k.kernel, {}}, nil, false);
@@ -354,6 +380,17 @@ int main(int argc, char **argv)
 		                                                  constant(2, MTLDataTypeInt, 5)};
 		if (CASE("c_constants"))
 			computeCase("c_constants", Fn{"k_constants", values}, nil, false);
+		if (only != nullptr && strcmp(only, "c_atomic_texture") == 0)
+			computeCase("c_atomic_texture", Fn{"k_atomic_texture", {}}, nil, false);
+		const std::vector<RgfxFunctionConstant> on = {constant(0, MTLDataTypeBool, 1), constant(1, MTLDataTypeBool, 0),
+		                                              constant(2, MTLDataTypeInt, 5), constant(3, MTLDataTypeInt, 1)};
+		const std::vector<RgfxFunctionConstant> off = {constant(0, MTLDataTypeBool, 0), constant(1, MTLDataTypeBool, 0),
+		                                               constant(2, MTLDataTypeInt, 7), constant(3, MTLDataTypeInt, 2),
+		                                               constant(4, MTLDataTypeBool, 1)};
+		if (CASE("c_specialised_on"))
+			computeCase("c_specialised_on", Fn{"k_specialised", on}, nil, false);
+		if (CASE("c_specialised_off"))
+			computeCase("c_specialised_off", Fn{"k_specialised", off}, nil, false);
 		if (CASE("k_predicates"))
 			computeCase("k_predicates", Fn{"k_predicates", {values[0], values[1]}}, nil, false);
 		if (CASE("d_basic"))
@@ -376,10 +413,21 @@ int main(int argc, char **argv)
 		if (CASE("r_more"))
 			renderCase("r_more", Fn{"v_more", {}}, &more, vertexDescriptor(true), MTLPixelFormatBGRA8Unorm,
 			           MTLPixelFormatInvalid);
+		const Fn fetch{"f_fetch", {}}, tables{"f_tables", {}};
+		if (CASE("r_fetch"))
+			renderCase("r_fetch", Fn{"v_buffers", {}}, &fetch, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatRGBA16Float);
+		if (CASE("r_tables"))
+			renderCase("r_tables", Fn{"v_buffers", {}}, &tables, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);
+		if (CASE("r_specialised_one"))
+			renderCase("r_specialised_one", Fn{"v_specialised", on}, &plain, vertexDescriptor(false),
+			           MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);
+		if (CASE("r_specialised_two"))
+			renderCase("r_specialised_two", Fn{"v_specialised", off}, &plain, vertexDescriptor(false),
+			           MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);
 		if (CASE("r_mesh"))
 			meshCase("r_mesh", Fn{"o_payload", {}}, Fn{"m_payload", {}}, Fn{"f_mesh", {}});
-		printf("pipeline_reflection_check: %u cases, %u values, %u differ, %u not made\n", Cases, Values, Differ,
-		       NotMade);
+		printf("pipeline_reflection_check: %u cases, %u values, %u differ, %u not made, %u Metal made none\n", Cases,
+		       Values, Differ, NotMade, Unmade);
 		return Differ != 0 ? 1 : 0;
 	}
 }

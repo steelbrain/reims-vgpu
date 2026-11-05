@@ -3,9 +3,13 @@
 // vectors, matrices, structs, atomics and argument buffers; textures of each type and access,
 // arrays of them; samplers; threadgroup memory), arguments the function never references,
 // arguments under function constants, a vertex function's and a kernel's stage input, and an
-// object and a mesh function that share a payload.
+// object and a mesh function that share a payload; and the kinds tools/pipeline_reflection_check.mm
+// adds (nested argument buffers and their arrays, function and intersection tables, acceleration
+// structures, imageblocks, framebuffer fetch, and functions function constants specialise).
 #include <metal_stdlib>
+#include <metal_raytracing>
 using namespace metal;
+using namespace metal::raytracing;
 
 struct Inner {
 	float a;
@@ -376,4 +380,143 @@ vertex MoreOut v_more(VertexIn in [[stage_in]], uint vid [[vertex_id]], uint bas
 fragment float4 f_more(MoreOut in [[stage_in]], bool front [[front_facing]], uint sid [[sample_id]])
 {
 	return float4(in.normal, float(in.h.x)) + float4(float(in.i + int(in.u.x) + int(front) + int(sid)));
+}
+
+// An argument buffer of members of every other kind: a struct of members, an array of them, arrays
+// of samplers, buffers, constants and textures, and a pointer to an argument buffer of its own.
+struct Leaf {
+	texture2d<float> t [[id(0)]];
+	sampler s [[id(1)]];
+};
+
+struct Child {
+	device float *data [[id(0)]];
+	float v [[id(1)]];
+};
+
+struct Nested {
+	Leaf leaf [[id(0)]];
+	device float *data [[id(2)]];
+	Leaf leaves [[id(3)]] [2];
+	array<sampler, 2> samplers [[id(7)]];
+	device float *buffers [[id(9)]] [2];
+	float4 values [[id(11)]] [2];
+	device Child *child [[id(13)]];
+	constant Inner *inners [[id(14)]] [2];
+	texture2d<float> textures [[id(16)]] [2];
+};
+
+kernel void k_nested(device Nested &n [[buffer(0)]], device float *out [[buffer(1)]],
+                     uint gid [[thread_position_in_grid]])
+{
+	float4 c = n.leaf.t.sample(n.leaf.s, float2(0)) + n.leaves[1].t.sample(n.samplers[1], float2(0)) +
+	           n.textures[1].sample(n.leaves[0].s, float2(0));
+	out[gid] = c.x + n.data[gid] + n.buffers[1][gid] + n.values[1].y + n.child->data[gid] + n.child->v +
+	           n.inners[1]->a;
+}
+
+[[visible]] float twice(float x)
+{
+	return 2 * x;
+}
+
+kernel void k_tables(visible_function_table<float(float)> table [[buffer(0)]],
+                     intersection_function_table<triangle_data> intersections [[buffer(1)]],
+                     primitive_acceleration_structure primitives [[buffer(2)]],
+                     instance_acceleration_structure instances [[buffer(3)]],
+                     device float *out [[buffer(4)]], uint gid [[thread_position_in_grid]])
+{
+	ray r(float3(0), float3(0, 0, 1));
+	intersector<triangle_data> i;
+	auto hit = i.intersect(r, primitives, intersections);
+	intersector<instancing, triangle_data> j;
+	auto hit2 = j.intersect(r, instances, 1);
+	out[gid] = table[0](float(gid)) + hit.distance + hit2.distance;
+}
+
+kernel void k_more_textures(texture2d<ushort> shorts [[texture(0)]],
+                            depth2d_ms_array<float> depths [[texture(1)]],
+                            texture_buffer<int, access::read_write> texels [[texture(2)]],
+                            texture1d_array<uint, access::read> lines [[texture(3)]],
+                            device float *out [[buffer(0)]], uint gid [[thread_position_in_grid]])
+{
+	out[gid] = float(shorts.read(uint2(gid)).x) + depths.read(uint2(0), 0, 0) + float(texels.read(gid).x) +
+	           float(lines.read(gid, 0).x);
+}
+
+struct Block {
+	float4 c [[color(0)]];
+};
+
+kernel void k_imageblock(imageblock<Block, imageblock_layout_implicit> block, device float *out [[buffer(0)]],
+                         ushort2 lid [[thread_position_in_threadgroup]])
+{
+	out[0] = block.read(lid).c.x;
+}
+
+struct Fetched {
+	float4 color [[color(0)]];
+	half4 extra [[color(1)]];
+};
+
+fragment Fetched f_fetch(VertexOut in [[stage_in]], float4 last [[color(0)]], half4 other [[color(1)]])
+{
+	Fetched f;
+	f.color = last * 0.5 + float4(other);
+	f.extra = other;
+	return f;
+}
+
+fragment float4 f_tables(VertexOut in [[stage_in]], primitive_acceleration_structure primitives [[buffer(0)]],
+                         visible_function_table<float(float)> table [[buffer(1)]])
+{
+	ray r(float3(in.uv, 0), float3(0, 0, 1));
+	intersector<triangle_data> i;
+	auto hit = i.intersect(r, primitives);
+	return float4(hit.distance + table[0](in.uv.x));
+}
+
+// Functions function constants specialise: a binding index and a predicate that are expressions of
+// constants, a switch and a select on one, and an optional constant.
+constant int kPlus = kIndex + 1;
+constant bool kEither = kOn || kOff;
+constant int kMode [[function_constant(3)]];
+constant bool kOpt [[function_constant(4)]];
+constant bool kOptDefined = is_function_constant_defined(kOpt);
+
+kernel void k_specialised(device float *out [[buffer(0)]], device float *plus [[buffer(kPlus)]],
+                          device float *either [[buffer(9), function_constant(kEither)]],
+                          device float *modeOne [[buffer(10)]], device float *optional [[buffer(11)]],
+                          texture2d<float> modeTwo [[texture(0)]], sampler smp [[sampler(0)]],
+                          uint gid [[thread_position_in_grid]])
+{
+	float v = plus[gid];
+	if (kEither)
+		v += either[gid];
+	switch (kMode) {
+	case 1:
+		v += modeOne[gid];
+		break;
+	default:
+		break;
+	}
+	if (kOptDefined && kOpt)
+		v += optional[gid];
+	float4 x = modeTwo.sample(smp, float2(0));
+	v = kMode == 2 ? v + x.x : v;
+	out[gid] = v;
+}
+
+struct SpecialisedOut {
+	float4 position [[position]];
+	float2 uv;
+};
+
+vertex SpecialisedOut v_specialised(VertexIn in [[stage_in]], constant float4x4 &mvp [[buffer(3)]],
+                                    device const float2 *uvs [[buffer(4)]], uint vid [[vertex_id]])
+{
+	SpecialisedOut o;
+	o.position = mvp * in.position;
+	o.uv = kMode == 1 ? in.uv : (kMode == 2 ? uvs[vid] : float2(0));
+	return o;
 }

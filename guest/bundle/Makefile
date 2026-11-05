@@ -51,7 +51,8 @@
 #   make pipeline-reflection-check
 #                   pipelines' reflection the bundle builds against Metal's own,
 #                   build/pipeline_reflection_check-x86_64 (ARCH=arm64 likewise) over
-#                   build/oracle_reflection.metallib.
+#                   build/oracle_reflection.metallib (and its c_atomic_texture case over
+#                   build/oracle_reflection_31.metallib).
 #   make peer-test-build, make peer-test
 #                   the wire round trip of the bundle's ring code against the host's library
 #                   (tests/peer_tests.mm; native arch, this Mac's GPU, never in `make test`):
@@ -255,6 +256,16 @@ $(ORACLE_REFLECTION_LIB): tools/oracle/oracle_reflection.metal Makefile
 	xcrun -sdk macosx metal -c -std=metal3.0 -mmacosx-version-min=26.0 tools/oracle/oracle_reflection.metal \
 		-o $(BUILD)/oracle_reflection.air
 	xcrun -sdk macosx metallib $(BUILD)/oracle_reflection.air -o $@
+
+# The library of pipeline_reflection_check's c_atomic_texture case, of a language Metal 3.0 has not
+# (tools/oracle/oracle_reflection_31.metal); never committed.
+ORACLE_REFLECTION_31_LIB = $(BUILD)/oracle_reflection_31.metallib
+
+$(ORACLE_REFLECTION_31_LIB): tools/oracle/oracle_reflection_31.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=26.0 tools/oracle/oracle_reflection_31.metal \
+		-o $(BUILD)/oracle_reflection_31.air
+	xcrun -sdk macosx metallib $(BUILD)/oracle_reflection_31.air -o $@
 
 # The same reader over modules built for macOS 10.12, of LLVM 3.5's metadata nodes
 # (tests/air_arguments_old.metal).
@@ -544,7 +555,7 @@ $(REFLECTBIN): tools/reflection_check.mm src/RgfxReflection.mm src/RgfxAirArgume
 # bundle's are of), never in `make test`. Its library is ORACLE_REFLECTION_LIB.
 PIPEREFLECTBIN = $(BUILD)/pipeline_reflection_check-$(ARCH)
 
-pipeline-reflection-check: $(PIPEREFLECTBIN) $(ORACLE_REFLECTION_LIB)
+pipeline-reflection-check: $(PIPEREFLECTBIN) $(ORACLE_REFLECTION_LIB) $(ORACLE_REFLECTION_31_LIB)
 
 $(PIPEREFLECTBIN): tools/pipeline_reflection_check.mm tools/oracle/oracle_walk.h src/RgfxPipelineReflection.mm \
 	src/RgfxAirArguments.cpp $(HEADERS) Makefile
