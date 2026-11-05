@@ -99,6 +99,12 @@ impl Threads for LinuxThreads {
         );
     }
 
+    /// The FIFO thread's hints ([`super::hints::hint_fifo_thread`]), for a thread the platform
+    /// did not start.
+    fn give_fifo_hints(&self) {
+        super::hints::hint_fifo_thread();
+    }
+
     fn handle(&self) -> Arc<dyn Threads> {
         Arc::new(*self)
     }

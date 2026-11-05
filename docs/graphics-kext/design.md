@@ -2461,7 +2461,9 @@ commit. Each outcome the new design allows is one of those two:
   each and the budget's at most. A job goes to the thread that went idle last,
   and a thread goes after a second with no job, the budget's before the lane's
   own: the threads a burst made go a second after it, while jobs that come one
-  at a time stay on one thread. Tested through the device by
+  at a time stay on one thread. Each lane thread gives itself the FIFO thread's
+  scheduler hints as it starts (on Linux, a utilization floor; no thread is
+  bound to a CPU). Tested through the device by
   `a_queue_s_buffers_are_walked_at_once_and_committed_in_order`,
   `a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling`
   `a_video_buffer_is_walked_in_its_turn` and
@@ -2472,8 +2474,9 @@ commit. Each outcome the new design allows is one of those two:
   `a_lane_runs_its_jobs_at_once_on_the_budget_s_threads`,
   `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order`,
   `busy_lanes_hold_one_thread_each_and_the_budget_s`,
-  `a_burst_s_threads_go_while_jobs_come_one_at_a_time` and
-  `a_burst_after_the_threads_went_grows_the_lane_to_its_limit_again`.
+  `a_burst_s_threads_go_while_jobs_come_one_at_a_time`,
+  `a_burst_after_the_threads_went_grows_the_lane_to_its_limit_again` and
+  `each_thread_gives_itself_the_fifo_hints_before_its_first_job`.
 - **A command buffer in parts.** Where the platform starts a command buffer's
   GPU work only at its commit (the Vulkan platform's runtime records it and
   submits it then), a long buffer's walk and its GPU work run in series:

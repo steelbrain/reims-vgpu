@@ -2,7 +2,9 @@
 //! places it, on any CPU it may run on.
 //!
 //! A FIFO thread runs the guest's commands one after another, so wherever the GPU keeps up its
-//! speed is the frame rate. Linux offers an unprivileged thread hints about itself, none of which
+//! speed is the frame rate. So does a walk thread of the graphics device's lanes, which walks a
+//! command buffer's ops one after another and gives itself the same hints as it starts
+//! (`Threads::give_fifo_hints`). Linux offers an unprivileged thread hints about itself, none of which
 //! binds it to a CPU:
 //! - **A utilization floor** (`sched_setattr`'s `SCHED_FLAG_UTIL_CLAMP_MIN`, kernel docs
 //!   "Utilization Clamping"): the thread asks to be treated as needing the CPU's full capacity,

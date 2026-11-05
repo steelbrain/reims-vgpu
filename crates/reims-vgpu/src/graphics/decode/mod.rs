@@ -844,6 +844,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     pub fn new(platform: Arc<P>, region: Arc<Region>) -> Self {
         work::start(&platform);
         let made_at = platform.clock().now_mono();
+        let lanes = lane::Budget::of_host(platform.threads().handle());
         let shared = Arc::new(Shared {
             waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
@@ -871,7 +872,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
             commit_cancel: commit_order::Cancel::default(),
             release_queue: OnceLock::new(),
-            lanes: lane::Budget::of_host(),
+            lanes,
             #[cfg(test)]
             walk_hook: Mutex::new(None),
             #[cfg(test)]

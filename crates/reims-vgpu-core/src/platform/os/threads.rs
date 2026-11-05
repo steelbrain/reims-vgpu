@@ -19,6 +19,12 @@ pub trait Threads: Send + Sync {
     /// [`Threads::spawn`] starts one.
     fn spawn_worker(&self, label: &'static str, body: Box<dyn FnOnce() + Send>);
 
+    /// Gives the calling thread, one this service did not start, the hints the FIFO thread
+    /// [`Threads::spawn`] starts gives the scheduler: for a thread whose speed is the frame rate
+    /// as the FIFO thread's is, a walk thread of the graphics device's lanes. None where the
+    /// platform gives the FIFO thread none.
+    fn give_fifo_hints(&self) {}
+
     /// An owned handle to this service: a queue keeps one to restart its worker.
     fn handle(&self) -> Arc<dyn Threads>;
 

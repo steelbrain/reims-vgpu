@@ -24,6 +24,15 @@
 //!   cores alone, and its walks took 13.4 ms of CPU a frame where two threads took 10.4 ms
 //!   (game_6000 at 92.7 against 105.6 fps, on a Core Ultra 9 275HX host with an RTX 5080 Laptop
 //!   GPU; measured).
+//! - **Hints.** Each thread gives the scheduler the FIFO thread's hints as it starts
+//!   ([`Threads::give_fifo_hints`]): a walk's speed is the frame rate, as a FIFO thread's is. On
+//!   Linux that is a utilization floor of the CPU's full capacity, which the kernel's
+//!   capacity-aware scheduling reads on a hybrid processor without SMT (the Vulkan platform's
+//!   `os/linux/hints.rs`). Started with nothing but its creator's settings, one walk thread of
+//!   game_6000's queue ran on the efficiency cores alone in 5 of 19 runs, the second of car 13's
+//!   base's two among them, whose walks then ran 45% of their instructions on those cores where
+//!   car 11's two threads ran 37% (Core Ultra 9 275HX, the guest's eight vCPU threads busy on
+//!   about four cores; measured). No thread is bound to a CPU.
 //! - **Turns.** Each command buffer is given a turn as it is begun, in the order they are taken
 //!   ([`Lane::turn`]). Its commit (or its stand-in's, or the failure posted at once for it) waits
 //!   for its turn ([`Turn::wait`]), which comes once every turn before it has passed, and its turn
@@ -42,6 +51,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use reims_vgpu_core::platform::os::Threads;
 use reims_vgpu_core::sync::{Condvar, Mutex};
 
 /// The most threads a lane runs its jobs on at once: its own and the budget's.
@@ -55,24 +65,44 @@ pub(crate) type Job = Box<dyn FnOnce() + Send>;
 
 /// The device's budget of lanes' extra threads (the module doc): at most `limit` at once, across
 /// every lane.
-#[derive(Debug)]
 pub(crate) struct Budget {
     limit: usize,
     taken: AtomicUsize,
+    /// The platform's threads, whose FIFO hints each lane thread gives itself as it starts
+    /// ([`Threads::give_fifo_hints`]); none in the tests that make no platform.
+    hints: Option<Arc<dyn Threads>>,
+}
+
+impl std::fmt::Debug for Budget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Budget")
+            .field("limit", &self.limit)
+            .field("taken", &self.taken)
+            .field("hints", &self.hints.is_some())
+            .finish()
+    }
 }
 
 impl Budget {
-    /// A budget of twice the host's cores, as many as can run a walk each with as many waiting.
-    pub(crate) fn of_host() -> Arc<Budget> {
+    /// A budget of twice the host's cores, as many as can run a walk each with as many waiting,
+    /// whose lanes' threads give themselves `threads`' FIFO hints.
+    pub(crate) fn of_host(threads: Arc<dyn Threads>) -> Arc<Budget> {
         let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        Budget::new(2 * cores)
+        Budget::with_hints(2 * cores, Some(threads))
     }
 
-    /// A budget of `limit` threads.
+    /// A budget of `limit` threads, whose lanes' threads give themselves no hints (for the tests).
+    #[cfg(test)]
     pub(crate) fn new(limit: usize) -> Arc<Budget> {
+        Budget::with_hints(limit, None)
+    }
+
+    /// A budget of `limit` threads, whose lanes' threads give themselves `hints`' FIFO hints.
+    fn with_hints(limit: usize, hints: Option<Arc<dyn Threads>>) -> Arc<Budget> {
         Arc::new(Budget {
             limit,
             taken: AtomicUsize::new(0),
+            hints,
         })
     }
 
@@ -250,10 +280,14 @@ impl Lane {
         }
     }
 
-    /// A lane thread: the jobs, in the order they came, until the lane closes with none left or
-    /// none comes for the lane's `idle_for`. It goes as one of the budget's where the lane has any,
-    /// else as the lane's own, so the lane's own thread is the last to go.
+    /// A lane thread: the FIFO thread's hints, then the jobs, in the order they came, until the
+    /// lane closes with none left or none comes for the lane's `idle_for`. It goes as one of the
+    /// budget's where the lane has any, else as the lane's own, so the lane's own thread is the
+    /// last to go.
     fn serve(&self) {
+        if let Some(threads) = &self.budget.hints {
+            threads.give_fifo_hints();
+        }
         let me = Arc::new(Idler::default());
         let mut state = self.state.lock();
         loop {
@@ -535,6 +569,89 @@ mod tests {
         }
         assert!(until(|| lanes.iter().all(|lane| lane.threads() == 0)));
         assert_eq!(running.load(Ordering::Acquire), 3 * QUEUES as usize);
+    }
+
+    /// What the threads of [`each_thread_gives_itself_the_fifo_hints_before_its_first_job`] did,
+    /// in order: a hint, or a job, with the thread it ran on.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Did {
+        Hint(std::thread::ThreadId),
+        Job(std::thread::ThreadId),
+    }
+
+    /// Threads that only note each [`Threads::give_fifo_hints`]: the lane starts its own.
+    struct HintLog(Arc<Mutex<Vec<Did>>>);
+
+    impl Threads for HintLog {
+        fn spawn(&self, _: &'static str, _: usize, _: Box<dyn FnOnce() + Send>) {
+            unreachable!("a lane starts its own threads")
+        }
+
+        fn spawn_worker(&self, _: &'static str, _: Box<dyn FnOnce() + Send>) {
+            unreachable!("a lane starts no worker")
+        }
+
+        fn give_fifo_hints(&self) {
+            self.0.lock().push(Did::Hint(std::thread::current().id()));
+        }
+
+        fn handle(&self) -> Arc<dyn Threads> {
+            Arc::new(HintLog(Arc::clone(&self.0)))
+        }
+
+        fn timer_clock(&self) -> Option<Arc<dyn reims_vgpu_core::platform::os::TimerClock>> {
+            None
+        }
+    }
+
+    /// Each of a lane's threads, its own and the budget's, gives itself the FIFO thread's hints
+    /// before it runs its first job; a lane of a budget with no platform gives none.
+    #[test]
+    fn each_thread_gives_itself_the_fifo_hints_before_its_first_job() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let threads: Arc<dyn Threads> = Arc::new(HintLog(Arc::clone(&log)));
+        let lane = Lane::new(6, Budget::with_hints(LANE_THREADS, Some(threads)));
+        let gate = Arc::new(Gate::default());
+        let running = Arc::new(AtomicUsize::new(0));
+        for _ in 0..3 {
+            let (gate, running, log) = (Arc::clone(&gate), Arc::clone(&running), Arc::clone(&log));
+            lane.run(Box::new(move || {
+                log.lock().push(Did::Job(std::thread::current().id()));
+                running.fetch_add(1, Ordering::AcqRel);
+                gate.pass();
+            }));
+        }
+        assert!(until(|| running.load(Ordering::Acquire) == 3));
+        gate.open();
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+        let did = log.lock().clone();
+        let hinted: Vec<_> = (did.iter())
+            .filter_map(|d| match d {
+                Did::Hint(id) => Some(*id),
+                Did::Job(_) => None,
+            })
+            .collect();
+        assert_eq!(hinted.len(), 3, "a hint a thread: {did:?}");
+        for (at, d) in did.iter().enumerate() {
+            if let Did::Job(id) = d {
+                assert!(
+                    did[..at].contains(&Did::Hint(*id)),
+                    "a job ran on a thread that gave no hint first: {did:?}"
+                );
+            }
+        }
+
+        // A budget with no platform: the jobs run, and nothing is hinted.
+        let quiet = Lane::new(7, Budget::new(LANE_THREADS));
+        let done = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::clone(&done);
+        quiet.run(Box::new(move || {
+            ran.fetch_add(1, Ordering::AcqRel);
+        }));
+        assert!(until(|| done.load(Ordering::Acquire) == 1));
+        quiet.close();
+        assert!(until(|| quiet.threads() == 0));
     }
 
     /// How long the lanes of the tests below keep a thread with no job.
