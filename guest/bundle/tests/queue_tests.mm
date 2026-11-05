@@ -536,6 +536,80 @@ void test_buffers_without_handlers_complete_where_seen()
 	}
 }
 
+// A buffer with a completed handler and no scheduled handler is scheduled on the thread that takes
+// its CB_SCHEDULED off the ring: Scheduled, and its waitUntilScheduled returned, while the queue's
+// completion queue runs nothing, its completed handler still to run there. Behind a record of its
+// queue still to run, a later one's scheduling waits its turn, Committed until that record ran.
+void test_scheduling_without_a_scheduled_handler_runs_where_seen()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		dispatch_queue_t given = dispatch_queue_create("test.completion", DISPATCH_QUEUE_SERIAL);
+		[(id<QueueTestCompletionQueueSPI>)q.queue setCompletionQueue:given];
+		dispatch_suspend(given);
+		bool resumed = false;
+		auto within = [](const std::function<bool()> &pred) {
+			for (int i = 0; i < 5000 && !pred(); i++)
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			return pred();
+		};
+
+		__block int firstRan = 0;
+		__block MTLCommandBufferStatus laterAtFirst = MTLCommandBufferStatusNotEnqueued;
+		id<MTLCommandBuffer> first = [q.queue commandBuffer];
+		id<MTLCommandBuffer> later = [q.queue commandBuffer];
+		__unsafe_unretained id<MTLCommandBuffer> laterRaw = later; // alive through the test
+		[first addCompletedHandler:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			laterAtFirst = laterRaw.status;
+			firstRan = 1;
+		}];
+		[later addCompletedHandler:^(id<MTLCommandBuffer> x) {
+			(void)x;
+		}];
+		[first commit];
+		const uint64_t s0 = nextSeqno(q);
+		[later commit];
+		const uint64_t s1 = nextSeqno(q);
+		std::atomic<bool> waited{false};
+		std::atomic<bool> *waitedp = &waited;
+		MTLCommandBufferStatus atReturn = MTLCommandBufferStatusNotEnqueued;
+		std::thread waiter([first, waitedp, &atReturn] {
+			[first waitUntilScheduled];
+			atReturn = first.status;
+			waitedp->store(true);
+		});
+		hostScheduled(q, *driven.kext, s0, first);
+		const bool seen = within([&] { return waited.load(); });
+		CHECK(seen);
+		if (!seen) {
+			dispatch_resume(given);
+			resumed = true;
+		}
+		waiter.join();
+		CHECK(atReturn == MTLCommandBufferStatusScheduled);
+		CHECK(resumed || firstRan == 0);
+
+		// The first's completion goes to the queue, still suspended; the later one's scheduling,
+		// behind it, waits there too.
+		hostComplete(q, *driven.kext, s0, first);
+		hostScheduled(q, *driven.kext, s1, later);
+		CHECK(within([&] { return q.completion.consumerCount() == q.completion.produced; }));
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		CHECK(resumed || later.status == MTLCommandBufferStatusCommitted);
+		if (!resumed)
+			dispatch_resume(given);
+		[later waitUntilScheduled];
+		CHECK(firstRan == 1);
+		CHECK(laterAtFirst == MTLCommandBufferStatusCommitted);
+		CHECK(later.status == MTLCommandBufferStatusScheduled);
+		hostComplete(q, *driven.kext, s1, later);
+		[later waitUntilCompleted];
+		CHECK(later.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
 // One queue's records run one at a time, in the ring's order, the status flips among them: while
 // an earlier buffer's completed handler runs, a later buffer whose CB_SCHEDULED came first is
 // Scheduled, and one whose CB_SCHEDULED came after is still Committed, its scheduled handler
@@ -1446,6 +1520,7 @@ void rgfxQueueTests(const char *self)
 	test_handlers_of_queues_wait_for_each_other();
 	test_handlers_run_on_the_completion_queue();
 	test_buffers_without_handlers_complete_where_seen();
+	test_scheduling_without_a_scheduled_handler_runs_where_seen();
 	test_one_queues_handlers_run_in_order();
 	test_slots_and_submission_do_not_wait_for_handlers();
 	test_buffers_run_in_enqueue_order();

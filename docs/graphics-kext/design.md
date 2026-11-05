@@ -2149,7 +2149,11 @@ handler and nothing to write back (every surface it writes in place, no copy of
 app memory) behind none of its queue's records still to run has its records run
 by the completion thread itself, which wakes its waiters: one wake where the
 queue's would be two, as Metal's waiter for a buffer with no completed handler
-is woken by the thread that saw it complete. A wait for a buffer of a queue
+is woken by the thread that saw it complete. So does the scheduling of a buffer
+with no scheduled handler, behind none of its queue's records still to run,
+whatever its completion runs: it flips the status and lets
+`waitUntilScheduled` go there, so a buffer with only a completed handler pays
+the completion queue's wake once, for its completion. A wait for a buffer of a queue
 from that queue's completion queue, a handler's for its own buffer or a later
 buffer of its queue, waits for good, as Metal's does on all three GPUs; a wait
 for another queue's buffer is released. `commitAndWaitUntilSubmitted` returns at
