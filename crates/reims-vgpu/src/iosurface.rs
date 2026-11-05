@@ -40,7 +40,7 @@ impl std::fmt::Debug for IoSurfaceDeviceConfig {
 }
 
 /// One reference to an IOSurface device: the last drop is its teardown, which waits for its
-/// worker. Each call, and the last drop, runs as an entry ([`crate::entry`]).
+/// worker. Each call, and the last drop, runs as an entry (the crate's `entry` module).
 pub struct IoSurfaceDevice<P: Platform = DefaultPlatform> {
     inner: Ours<HostDeviceHandle<P>>,
 }
