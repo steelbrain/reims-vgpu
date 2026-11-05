@@ -692,7 +692,7 @@ RGFX_RESOURCE_SPI
 {
 	// Where Metal's descriptor validation ends the process, so does the bundle: a depth texture
 	// over the buffer's bytes, as the x86 Macs end it (rgfxEndAtInvalidTextureDescriptor).
-	rgfxEndAtInvalidTextureDescriptor(descriptor);
+	rgfxEndAtInvalidTextureDescriptor(descriptor, self.device);
 	if (descriptor != nil && descriptor.mipmapLevelCount > 1) {
 		RgfxMetalAssertionFailed(
 		    "_mtlValidateStrideTextureParameters",
@@ -751,6 +751,8 @@ RGFX_RESOURCE_SPI
 	if (descriptor == nil) {
 		return nil;
 	}
+	// The descriptor's validation first, as by every form (Q11).
+	rgfxEndAtInvalidTextureDescriptor(descriptor, self.device);
 	if (descriptor.storageMode != MTLStorageModeManaged) {
 		static std::atomic<bool> logged{false};
 		if (!logged.exchange(true)) {
@@ -842,6 +844,8 @@ RGFX_RESOURCE_SPI
 	if (descriptor == nil) {
 		return nil;
 	}
+	// The descriptor's validation first, as by every form (Q11).
+	rgfxEndAtInvalidTextureDescriptor(descriptor, self.device);
 	const MTLTextureType type = descriptor.textureType;
 	const bool made = type == MTLTextureType2D || type == MTLTextureType2DArray ||
 	                  type == MTLTextureTypeTextureBuffer;

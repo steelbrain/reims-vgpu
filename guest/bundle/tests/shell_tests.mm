@@ -1384,6 +1384,295 @@ static const SurfaceCase kSurfaceCases[] = {
     {"surface-ycbcr-flat", kFlat, 0, static_cast<MTLPixelFormat>(500), k2D, 64, 64, 1, 1, 1, 1,
      kManaged, RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (500).\n'"},
 };
+// Texture descriptors as oracle_texdesc asked them of the device's newTextureWithDescriptor: on
+// the AMD 5300M and the Intel 630 under macOS 26.7.1, each starting as a 64 x 64 2D BGRA8Unorm
+// texture of one level and sample, usage ShaderRead and Private storage: what each changes, with
+// the Intel 630's words where it ended the process (the AMD's too, but at Depth24Unorm_Stencil8
+// and X24_Stencil8, which the AMD makes and the lane lacks, as the Intel does), null where both
+// made the texture, and "" where both ended it with no words. A Private heap's creator answers
+// alike (docs/graphics-kext/dgpu-oracle.md, Q23).
+struct DescriptorCase {
+	const char *name;
+	uint64_t format, type, width, height, depth, arrayLength, levels, samples, usage, storage;
+	const char *words;
+};
+static const DescriptorCase kDescriptorCases[] = {
+    {"base", 80, 2, 64, 64, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"w0", 80, 2, 0, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\n'"},
+    {"h0", 80, 2, 64, 0, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has height of zero.\n'"},
+    {"d0", 80, 2, 64, 64, 0, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has depth of zero.\nMTLTextureDescriptor requests a "
+                   "depth of 0 but the texture type MTLTextureType2D requires that depth is 1\n'"},
+    {"a0", 80, 2, 64, 64, 1, 0, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has arrayLength of zero.\nMTLTextureDescriptor requests "
+                   "an arrayLength of 0, but MTLTextureType2D requires that arrayLength is 1\n'"},
+    {"m0", 80, 2, 64, 64, 1, 1, 0, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor requests 0 mipmap levels, but the dimensions (64, 64, "
+                   "1) can only support a maxiumum of 7 levels\n'"},
+    {"s0", 80, 2, 64, 64, 1, 1, 1, 0, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has sampleCount set but is using a type that does not "
+                   "allow sampleCount.\n'"},
+    {"w16384", 80, 2, 16384, 1, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"w16385", 80, 2, 16385, 1, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (16385) greater than the maximum allowed size "
+                   "of 16384.\n'"},
+    {"h16385", 80, 2, 1, 16385, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has height (16385) greater than the maximum allowed "
+                   "size of 16384.\n'"},
+    {"w32768.h32768", 80, 2, 32768, 32768, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (32768) greater than the maximum allowed size "
+                   "of 16384.\nMTLTextureDescriptor has height (32768) greater than the maximum "
+                   "allowed size of 16384.\n'"},
+    {"1d.w16385", 80, 0, 16385, 1, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (16385) greater than the maximum allowed size "
+                   "of 16384.\n'"},
+    {"1d.h2", 80, 0, 64, 2, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has height (2) greater than the maximum allowed size of "
+                   "1.\nMTLTextureDescriptor requests a height of 2 but the texture type "
+                   "MTLTextureType1D requires that height is 1\n'"},
+    {"3d.w2048", 80, 7, 2048, 1, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"3d.w2049", 80, 7, 2049, 1, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (2049) greater than the maximum allowed size "
+                   "of 2048.\n'"},
+    {"3d.d2049", 80, 7, 1, 1, 2049, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has depth (2049) greater than the maximum allowed size "
+                   "of 2048.\n'"},
+    {"2darray.a2048", 80, 3, 1, 1, 1, 2048, 1, 1, 0x1, 2, nullptr},
+    {"2darray.a2049", 80, 3, 1, 1, 1, 2049, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has arrayLength (2049) greater than the maximum allowed "
+                   "size of 2048.\nMTLTextureDescriptor arrayLength (2049) is set to zero or "
+                   "greater than the max allowed size (2048).\n'"},
+    {"cube.64x32", 80, 5, 64, 32, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor width must equal height for cube textures.\n'"},
+    {"cube.a2", 80, 5, 64, 64, 1, 2, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has arrayLength (2) greater than the maximum allowed "
+                   "size of 1.\nMTLTextureDescriptor requests an arrayLength of 2, but "
+                   "MTLTextureTypeCube requires that arrayLength is 1\n'"},
+    {"cubearray.a342", 80, 6, 1, 1, 1, 342, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor arrayLength (342) is set to zero or greater than the "
+                   "max allowed size (341).\n'"},
+    {"cubearray.a341", 80, 6, 1, 1, 1, 341, 1, 1, 0x1, 2, nullptr},
+    {"2d.d2", 80, 2, 64, 64, 2, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has depth (2) greater than the maximum allowed size of "
+                   "1.\nMTLTextureDescriptor requests a depth of 2 but the texture type "
+                   "MTLTextureType2D requires that depth is 1\n'"},
+    {"2d.a2", 80, 2, 64, 64, 1, 2, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has arrayLength (2) greater than the maximum allowed "
+                   "size of 1.\nMTLTextureDescriptor requests an arrayLength of 2, but "
+                   "MTLTextureType2D requires that arrayLength is 1\n'"},
+    {"2d.s4", 80, 2, 64, 64, 1, 1, 1, 4, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has sampleCount set but is using a type that does not "
+                   "allow sampleCount.\n'"},
+    {"2d.m7", 80, 2, 64, 64, 1, 1, 7, 1, 0x1, 2, nullptr},
+    {"2d.m8", 80, 2, 64, 64, 1, 1, 8, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor requests 8 mipmap levels, but the dimensions (64, 64, "
+                   "1) can only support a maxiumum of 7 levels\n'"},
+    {"2d.m2.w1", 80, 2, 1, 1, 1, 1, 2, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor requests 2 mipmap levels, but the dimensions (1, 1, 1) "
+                   "can only support a maxiumum of 1 levels\n'"},
+    {"3d.m8", 80, 7, 64, 64, 64, 1, 8, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor requests 8 mipmap levels, but the dimensions (64, 64, "
+                   "64) can only support a maxiumum of 7 levels\n'"},
+    {"1d.m2", 80, 0, 64, 1, 1, 1, 2, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor requests a mipmapLevelCount of 2 but the texture type "
+                   "MTLTextureType1D requires that mipmapLevelCount is 1\n'"},
+    {"2darray.d2", 80, 3, 64, 64, 2, 2, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has depth (2) greater than the maximum allowed size of "
+                   "1.\nMTLTextureDescriptor requests a depth of 2 but the texture type "
+                   "MTLTextureType2DArray requires that depth is 1\n'"},
+    {"cube.d2", 80, 5, 64, 64, 2, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has depth (2) greater than the maximum allowed size of "
+                   "1.\nMTLTextureDescriptor requests a depth of 2 but the texture type "
+                   "MTLTextureTypeCube requires that depth is 1\n'"},
+    {"ms.s1", 80, 4, 64, 64, 1, 1, 1, 1, 0x4, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor sampleCount must be > 1 for multisample textures.\n'"},
+    {"ms.s2", 80, 4, 64, 64, 1, 1, 1, 2, 0x4, 2, nullptr},
+    {"ms.s3", 80, 4, 64, 64, 1, 1, 1, 3, 0x4, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor sampleCount (3) is not supported by device.\n'"},
+    {"ms.s4", 80, 4, 64, 64, 1, 1, 1, 4, 0x4, 2, nullptr},
+    {"ms.s8", 80, 4, 64, 64, 1, 1, 1, 8, 0x4, 2, nullptr},
+    {"ms.s16", 80, 4, 64, 64, 1, 1, 1, 16, 0x4, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor sampleCount (16) is not supported by device.\n'"},
+    {"ms.m2", 80, 4, 64, 64, 1, 1, 2, 4, 0x4, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor mipmapLevelCount must equal 1 for multisample "
+                   "textures.\n'"},
+    {"ms.d2", 80, 4, 64, 64, 2, 1, 1, 4, 0x4, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has depth (2) greater than the maximum allowed size of "
+                   "1.\nMTLTextureDescriptor requests a depth of 2 but the texture type "
+                   "MTLTextureType2DMultisample requires that depth is 1\n'"},
+    {"ms.a2", 80, 4, 64, 64, 1, 2, 1, 4, 0x4, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has arrayLength (2) greater than the maximum allowed "
+                   "size of 1.\nMTLTextureDescriptor requests an arrayLength of 2, but "
+                   "MTLTextureType2DMultisample requires that arrayLength is 1\n'"},
+    {"ms.shared", 80, 4, 64, 64, 1, 1, 1, 4, 0x4, 0,
+     RGFX_VALIDATE "MTLTextureDescriptor: Multisample textures cannot be allocated with "
+                   "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
+    {"ms.managed", 80, 4, 64, 64, 1, 1, 1, 4, 0x4, 1,
+     RGFX_VALIDATE "MTLTextureDescriptor: Multisample textures cannot be allocated with "
+                   "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
+    {"msarray.a2", 80, 8, 64, 64, 1, 2, 1, 4, 0x4, 2, nullptr},
+    {"ms.bgr5a1", 43, 4, 64, 64, 1, 1, 1, 4, 0x4, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor pixelFormat (MTLPixelFormatBGR5A1Unorm) does not "
+                   "support multisample textures.\n'"},
+    {"ms.rgb9e5", 93, 4, 64, 64, 1, 1, 1, 4, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor pixelFormat (MTLPixelFormatRGB9E5Float) does not "
+                   "support multisample textures.\n'"},
+    {"ms.rgba32f", 125, 4, 64, 64, 1, 1, 1, 4, 0x4, 2, nullptr},
+    {"ms.r32u", 53, 4, 64, 64, 1, 1, 1, 4, 0x4, 2, nullptr},
+    {"ms.depth32f", 252, 4, 64, 64, 1, 1, 1, 4, 0x4, 2, nullptr},
+    {"shared", 80, 2, 64, 64, 1, 1, 1, 1, 0x1, 0, nullptr},
+    {"managed", 80, 2, 64, 64, 1, 1, 1, 1, 0x1, 1, nullptr},
+    {"memoryless", 80, 2, 64, 64, 1, 1, 1, 1, 0x4, 3,
+     RGFX_VALIDATE "MTLTextureDescriptor: MTLResourceStorageModeMemoryless is not a supported "
+                   "storage mode on this device.\n'"},
+    {"storage5", 80, 2, 64, 64, 1, 1, 1, 1, 0x1, 5,
+     RGFX_VALIDATE "invalid storageMode (5). Must be one of MTLStorageModeShared(0) "
+                   "MTLStorageModeManaged(1) MTLStorageModeMemoryless(3) "
+                   "MTLStorageModePrivate(2)\ninvalid storageMode (5). Must be one of "
+                   "MTLStorageModeShared(0) MTLStorageModeManaged(1) MTLStorageModeMemoryless(3) "
+                   "MTLStorageModePrivate(2)\n'"},
+    {"depth32f.shared", 252, 2, 64, 64, 1, 1, 1, 1, 0x4, 0,
+     RGFX_VALIDATE "MTLTextureDescriptor: Depth, Stencil, DepthStencil textures cannot be "
+                   "allocated with MTLStorageModeShared or MTLStorageModeManaged on this "
+                   "device.\n'"},
+    {"usage0", 80, 2, 64, 64, 1, 1, 1, 1, 0x0, 2, nullptr},
+    {"usage.write", 80, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
+    {"usage.bit7", 80, 2, 64, 64, 1, 1, 1, 1, 0x81, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x80.\n'"},
+    {"srgb.write", 81, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
+    {"bc1.rt", 130, 2, 64, 64, 1, 1, 1, 1, 0x4, 2, nullptr},
+    {"bc1.write", 130, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
+    {"depth32f.write", 252, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
+    {"rgb9e5.rt", 93, 2, 64, 64, 1, 1, 1, 1, 0x4, 2, nullptr},
+    {"gbgr422.rt", 240, 2, 64, 64, 1, 1, 1, 1, 0x4, 2, nullptr},
+    {"fmt.invalid", 0, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (0).\n'"},
+    {"fmt.b5g6r5", 40, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (40).\n'"},
+    {"fmt.a1bgr5", 41, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (41).\n'"},
+    {"fmt.abgr4", 42, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (42).\n'"},
+    {"fmt.bgr5a1", 43, 2, 64, 64, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"fmt.r8srgb", 11, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (11).\n'"},
+    {"fmt.rg8srgb", 31, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (31).\n'"},
+    {"fmt.bgra10xr", 552, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (552).\n'"},
+    {"fmt.bgr10xr", 554, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (554).\n'"},
+    {"fmt.astc4x4", 204, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (204).\n'"},
+    {"fmt.etc2", 180, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (180).\n'"},
+    {"fmt.eac", 170, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (170).\n'"},
+    {"fmt.pvrtc", 166, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (166).\n'"},
+    {"fmt.ycbcr500", 500, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (500).\n'"},
+    {"fmt.d24s8", 255, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (255).\n'"},
+    {"fmt.x24s8", 262, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (262).\n'"},
+    {"fmt.unspecialized", 263, 2, 64, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has invalid pixelFormat (263).\n'"},
+    {"fmt.gbgr422", 240, 2, 64, 64, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"gbgr422.63", 240, 2, 63, 64, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor: MTLPixelFormat422 requires even width.\n'"},
+    {"gbgr422.h63", 240, 2, 64, 63, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"gbgr422.2darray", 240, 3, 64, 64, 1, 2, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor: MTLPixelFormat422 requires MTLTextureType2D.\n'"},
+    {"gbgr422.m2", 240, 2, 64, 64, 1, 1, 2, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor requests 2 mipmap levels, but the MTLPixelFormat422 "
+                   "pixel format does not support mipmaps.\n'"},
+    {"bc1.62x64", 130, 2, 62, 64, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"bc1.2x2", 130, 2, 2, 2, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"bc1.1d", 130, 0, 64, 1, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor: compressed pixel formats require texture type of "
+                   "MTLTextureType2D[Array], MTLTextureType3D or MTLTextureTypeCube[Array].\n'"},
+    {"bc1.3d", 130, 7, 64, 64, 4, 1, 1, 1, 0x1, 2, nullptr},
+    {"bc1.cube", 130, 5, 64, 64, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"bc1.m7", 130, 2, 64, 64, 1, 1, 7, 1, 0x1, 2, nullptr},
+    {"depth32f.3d", 252, 7, 64, 64, 4, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor: depth/stencil pixel formats require texture type of "
+                   "MTLTextureType2D[Array] or MTLTextureTypeCube[Array].\n'"},
+    {"depth32f.1d", 252, 0, 64, 1, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor: depth/stencil pixel formats require texture type of "
+                   "MTLTextureType2D[Array] or MTLTextureTypeCube[Array].\n'"},
+    {"depth32f.cube", 252, 5, 64, 64, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"depth32f.2darray", 252, 3, 64, 64, 1, 2, 1, 1, 0x1, 2, nullptr},
+    {"depth32f.m7", 252, 2, 64, 64, 1, 1, 7, 1, 0x1, 2, nullptr},
+    {"stencil8.3d", 253, 7, 64, 64, 4, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor: depth/stencil pixel formats require texture type of "
+                   "MTLTextureType2D[Array] or MTLTextureTypeCube[Array].\n'"},
+    {"texbuf", 80, 9, 64, 1, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"texbuf.h4", 80, 9, 64, 4, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has height (4) greater than the maximum allowed size of "
+                   "1.\n'"},
+    {"1darray.h2", 80, 1, 64, 2, 1, 2, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has height (2) greater than the maximum allowed size of "
+                   "1.\nMTLTextureDescriptor requests a height of 2 but the texture type "
+                   "MTLTextureType1DArray requires that height is 1\n'"},
+    {"w16384.h16384", 80, 2, 16384, 16384, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"type10", 80, 10, 64, 64, 1, 1, 1, 1, 0x1, 2, ""},
+    {"w0.ms.shared.s1", 80, 4, 0, 64, 1, 1, 1, 1, 0x4, 0,
+     RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\nMTLTextureDescriptor sampleCount "
+                   "must be > 1 for multisample textures.\nMTLTextureDescriptor: Multisample "
+                   "textures cannot be allocated with MTLStorageModeShared or "
+                   "MTLStorageModeManaged on this device.\n'"},
+    {"bc1.ms.shared", 130, 4, 64, 64, 1, 1, 1, 4, 0x1, 0,
+     RGFX_VALIDATE "MTLTextureDescriptor pixelFormat (MTLPixelFormatBC1_RGBA) does not support "
+                   "multisample textures.\nMTLTextureDescriptor has a compressed pixel format "
+                   "set with a sample count greater than one.\nMTLTextureDescriptor: compressed "
+                   "pixel formats require texture type of MTLTextureType2D[Array], "
+                   "MTLTextureType3D or MTLTextureTypeCube[Array].\nMTLTextureDescriptor: "
+                   "Multisample textures cannot be allocated with MTLStorageModeShared or "
+                   "MTLStorageModeManaged on this device.\n'"},
+    {"b5g6r5.w0.d2", 40, 2, 0, 64, 2, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\nMTLTextureDescriptor has depth (2) "
+                   "greater than the maximum allowed size of 1.\nMTLTextureDescriptor has "
+                   "invalid pixelFormat (40).\nMTLTextureDescriptor requests a depth of 2 but "
+                   "the texture type MTLTextureType2D requires that depth is 1\n'"},
+    {"w16385.d2", 80, 2, 16385, 1, 2, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (16385) greater than the maximum allowed size "
+                   "of 16384.\nMTLTextureDescriptor has depth (2) greater than the maximum "
+                   "allowed size of 1.\nMTLTextureDescriptor requests a depth of 2 but the "
+                   "texture type MTLTextureType2D requires that depth is 1\n'"},
+    {"depth32f.shared.ms", 252, 4, 64, 64, 1, 1, 1, 4, 0x4, 0,
+     RGFX_VALIDATE "MTLTextureDescriptor: Depth, Stencil, DepthStencil textures cannot be "
+                   "allocated with MTLStorageModeShared or MTLStorageModeManaged on this "
+                   "device.\nMTLTextureDescriptor: Multisample textures cannot be allocated with "
+                   "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
+};
+#define RGFX_HEAP_MISMATCH(MODE)                                                                   \
+	"-[MTLIOAccelHeap newSubResourceWithLength:alignment:options:offset:]: failed assertion `The " \
+	"requested storage mode (" MODE ") is not compatible with the heap's mode "                    \
+	"(MTLStorageModePrivate)'"
+// What a creator other than the device's does with a descriptor: the same validation first, by
+// each form, then its own rules (oracle_texdesc heap and buffer).
+static const struct {
+	const char *name;
+	const char *words;
+} kCreatorCases[] = {
+    {"texdesc-heap-width-0", RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\n'"},
+    {"texdesc-heap-auto-width-0", RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\n'"},
+    {"texdesc-heap-shared", RGFX_HEAP_MISMATCH("MTLStorageModeShared")},
+    {"texdesc-heap-auto-managed", RGFX_HEAP_MISMATCH("MTLStorageModeManaged")},
+    {"texdesc-heap-multisample-shared",
+     RGFX_VALIDATE "MTLTextureDescriptor: Multisample textures cannot be allocated with "
+                   "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
+    {"texdesc-buffer-width-0", RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\n'"},
+    {"texdesc-linear-width-0", RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\n'"},
+    {"texdesc-tiled-width-0", RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\n'"},
+    {"texdesc-buffer-multisample",
+     RGFX_VALIDATE "MTLTextureDescriptor: Multisample textures cannot be allocated with "
+                   "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
+};
+#undef RGFX_HEAP_MISMATCH
 #undef RGFX_VALIDATE
 #undef RGFX_STRIDE
 #undef RGFX_INIT
@@ -1429,6 +1718,22 @@ static MTLTextureDescriptor *descriptorOf(const SurfaceCase &c)
 	td.usage = MTLTextureUsageShaderRead |
 	           (c.format == MTLPixelFormatDepth32Float ? MTLTextureUsageRenderTarget : 0);
 	td.storageMode = c.storage;
+	return td;
+}
+
+static MTLTextureDescriptor *descriptorOf(const DescriptorCase &c)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+	td.textureType = static_cast<MTLTextureType>(c.type);
+	td.pixelFormat = static_cast<MTLPixelFormat>(c.format);
+	td.width = c.width;
+	td.height = c.height;
+	td.depth = c.depth;
+	td.arrayLength = c.arrayLength;
+	td.mipmapLevelCount = c.levels;
+	td.sampleCount = c.samples;
+	td.usage = c.usage;
+	td.storageMode = static_cast<MTLStorageMode>(c.storage);
 	return td;
 }
 
@@ -1527,6 +1832,73 @@ static int dies_case(const char *name)
 		IOSurfaceRef surface = surfaceOf(c);
 		rgfxEndAtInvalidSurfaceTexture(descriptorOf(c), surface, c.plane);
 		CFRelease(surface);
+	}
+	if (std::strncmp(name, "texdesc-", 8) == 0) {
+		for (const DescriptorCase &c : kDescriptorCases)
+			if (std::strcmp(name + 8, c.name) == 0)
+				rgfxEndAtInvalidTextureDescriptor(descriptorOf(c));
+	}
+	// kCreatorCases: a 64 x 64 BGRA8Unorm texture (of 4 samples where the case says), by the
+	// creator the case names.
+	if (std::strncmp(name, "texdesc-", 8) == 0) {
+		const bool widthZero = std::strstr(name, "width-0") != nullptr;
+		const bool multisample = std::strstr(name, "multisample") != nullptr;
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:widthZero ? 0 : 64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		if (multisample) {
+			td.textureType = MTLTextureType2DMultisample;
+			td.sampleCount = 4;
+			td.usage = MTLTextureUsageRenderTarget;
+		}
+		if (std::strncmp(name, "texdesc-heap-", 13) == 0) {
+			const bool automatic = std::strncmp(name, "texdesc-heap-auto-", 18) == 0;
+			MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+			hd.size = 0x100000;
+			hd.storageMode = MTLStorageModePrivate;
+			hd.type = automatic ? MTLHeapTypeAutomatic : MTLHeapTypePlacement;
+			RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&fx.ser];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+			td.storageMode = std::strstr(name, "shared") != nullptr    ? MTLStorageModeShared
+			                 : std::strstr(name, "managed") != nullptr ? MTLStorageModeManaged
+			                                                           : MTLStorageModePrivate;
+#pragma clang diagnostic pop
+			if (automatic)
+				(void)[heap newTextureWithDescriptor:td];
+			else
+				(void)[heap newTextureWithDescriptor:td offset:0];
+		} else if (std::strncmp(name, "texdesc-buffer-", 15) == 0 ||
+		           std::strncmp(name, "texdesc-linear-", 15) == 0 ||
+		           std::strncmp(name, "texdesc-tiled-", 14) == 0) {
+			std::vector<uint8_t> memory(0x10000, 0);
+			RgfxBuffer *buf =
+			    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+			                                    regionOffset:0x10000
+			                                          length:memory.size()
+			                                         options:MTLResourceStorageModeShared
+			                                     deallocator:nil
+			                                          device:nil
+			                                      serializer:&fx.ser];
+			id<RgfxMetalBufferInternals> spi = (id<RgfxMetalBufferInternals>)buf;
+			td.storageMode = MTLStorageModeShared;
+			if (std::strncmp(name, "texdesc-buffer-", 15) == 0) {
+				(void)[buf newTextureWithDescriptor:td offset:0 bytesPerRow:256];
+			} else if (std::strncmp(name, "texdesc-linear-", 15) == 0) {
+				(void)[spi newLinearTextureWithDescriptor:td
+				                                   offset:0
+				                              bytesPerRow:256
+				                            bytesPerImage:256 * 64];
+			} else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+				td.storageMode = MTLStorageModeManaged; // as the tiled SPI's callers ask
+#pragma clang diagnostic pop
+				(void)[spi newTiledTextureWithDescriptor:td offset:0 bytesPerRow:256];
+			}
+		}
 	}
 	unsigned format = 0, plane = 0;
 	if (std::sscanf(name, "surface-two-plane-%u-plane-%u", &format, &plane) == 2)
@@ -1832,9 +2204,11 @@ void test_mipmapped_buffer_texture_ends_the_process()
 // Metal's words, before the host is sent it, whose platform would end the host's process there
 // (the bundle used to send it): by the public form, any type but 2D; by the linear SPI, any but
 // 2D, 2D array and texture buffer. The AMD, the Intel and the M3 GPU say these words at a 1D,
-// 1D array, cube or cube array type, and at a 2D array by the public form; at a 3D or multisample
-// type they are the M3's, the AMD's too at the 3D one (`oracle_storage DEVICE lintypes
-// FORM:TYPE`, docs/graphics-kext/dgpu-oracle.md, Q11).
+// 1D array, cube or cube array type, and at a 2D array by the public form; at the 3D type they
+// are the M3's and the AMD's (`oracle_storage DEVICE lintypes FORM:TYPE`,
+// docs/graphics-kext/dgpu-oracle.md, Q11). A multisample type in the CPU's storage, as these
+// descriptors are, ends it first at the descriptor's validation, as on both x86 Macs by every
+// form (oracle_texdesc buffer ms.*).
 void test_buffer_texture_types_end_the_process()
 {
 	const struct {
@@ -1855,6 +2229,16 @@ void test_buffer_texture_types_end_the_process()
 				continue;
 			const std::string dies = std::string(linear ? "linear" : "buffer") +
 			                         "-texture-type-" + std::to_string(t.type);
+			const bool multisample = t.type == MTLTextureType2DMultisample ||
+			                         t.type == MTLTextureType2DMultisampleArray;
+			if (multisample) {
+				checkDies(dies.c_str(),
+				          "-[MTLTextureDescriptorInternal validateWithDevice:]: failed assertion "
+				          "`Texture Descriptor Validation\nMTLTextureDescriptor: Multisample "
+				          "textures cannot be allocated with MTLStorageModeShared or "
+				          "MTLStorageModeManaged on this device.\n'");
+				continue;
+			}
 			std::string words = "_mtlValidateStrideTextureParameters: failed assertion `Texture "
 			                    "Descriptor Validation\n";
 			if (t.type == MTLTextureType3D)
@@ -1962,6 +2346,7 @@ void test_invalid_texture_descriptors_end_the_process()
 		                                                   mipmapped:NO];
 		td.textureType = type;
 		td.sampleCount = samples;
+		td.storageMode = MTLStorageModePrivate;
 		rgfxEndAtInvalidTextureDescriptor(td);
 		g_checks++;
 	};
@@ -1971,6 +2356,25 @@ void test_invalid_texture_descriptors_end_the_process()
 	passes(MTLPixelFormatBGR5A1Unorm, MTLTextureType2D, 1); // 43
 	passes(MTLPixelFormatRGBA16Unorm, MTLTextureType2D, 1);  // 110
 	passes(MTLPixelFormatRG32Uint, MTLTextureType2D, 1);     // 103
+}
+
+// Every texture creator ends the process at Metal's descriptor validation as the x86 Macs end it,
+// the rules a descriptor breaks a line each in their order, and goes on at what they made
+// (kDescriptorCases). A heap's creators and a buffer's, by the public form and the linear and
+// tiled SPI, run it first; a heap's then ends it at a descriptor of another storage mode than the
+// heap's (kCreatorCases).
+void test_texture_descriptor_validation_as_the_x86_macs()
+{
+	for (const DescriptorCase &c : kDescriptorCases) {
+		if (c.words != nullptr) {
+			checkDies(("texdesc-" + std::string(c.name)).c_str(), c.words);
+		} else {
+			rgfxEndAtInvalidTextureDescriptor(descriptorOf(c));
+			g_checks++;
+		}
+	}
+	for (const auto &c : kCreatorCases)
+		checkDies(c.name, c.words);
 }
 
 // A texture over an IOSurface ends the process with Metal's words, before the host is sent
@@ -9860,6 +10264,7 @@ void test_automatic_heap_places_as_metal()
 		                                                       width:256
 		                                                      height:256
 		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
 		RgfxHeapSizeAlign bound = {};
 		CHECK(rgfxHeapTextureBound(MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 256, 256, 1, 1, 1,
 		                           1, &bound));
@@ -10143,6 +10548,7 @@ void test_heap_outlives_its_resources()
 		                                                       width:8
 		                                                      height:8
 		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate; // the heap's
 		tex = [heap newTextureWithDescriptor:td offset:0x10000];
 		CHECK(buf != nil && tex != nil);
 		drainRing(fx.ring);
@@ -10466,7 +10872,9 @@ void test_texture_views()
 	hd.size = 0x100000;
 	hd.type = MTLHeapTypePlacement;
 	RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&fx.ser];
-	id<MTLTexture> placed = [heap newTextureWithDescriptor:bd offset:0x10000];
+	MTLTextureDescriptor *pd = [bd copy];
+	pd.storageMode = MTLStorageModePrivate; // the heap's
+	id<MTLTexture> placed = [heap newTextureWithDescriptor:pd offset:0x10000];
 	id<MTLTexture> placedView = [placed newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
 	CHECK(placedView.heap == heap && placedView.heapOffset == 0x10000);
 	CHECK(placed.isAliasable && placedView.isAliasable); // a Placement heap's
@@ -14288,6 +14696,7 @@ int main(int argc, char **argv)
 		test_mipmapped_buffer_texture_ends_the_process();
 		test_buffer_texture_types_end_the_process();
 		test_invalid_texture_descriptors_end_the_process();
+		test_texture_descriptor_validation_as_the_x86_macs();
 		test_invalid_surface_textures_end_the_process();
 		test_unalignable_linear_formats_end_the_process();
 		test_memoryless_icb_ends_the_process();

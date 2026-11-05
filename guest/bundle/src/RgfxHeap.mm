@@ -352,7 +352,9 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	if (_type != MTLHeapTypePlacement) {
 		return nil;
 	}
-	rgfxEndAtInvalidTextureDescriptor(descriptor); // as Metal's validation, sending nothing
+	// As Metal's validation, sending nothing.
+	rgfxEndAtInvalidTextureDescriptor(descriptor, self.device);
+	rgfxEndAtHeapStorageMismatch(descriptor, self.storageMode);
 	RgfxTexture *texture = [RgfxTexture textureWithDescriptor:descriptor
 	                                                     heap:[self rgfxObjId]
 	                                               heapOffset:offset
@@ -437,7 +439,8 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 		return nil;
 	}
 	// As Metal's validation, before the host is asked the texture's size.
-	rgfxEndAtInvalidTextureDescriptor(descriptor);
+	rgfxEndAtInvalidTextureDescriptor(descriptor, self.device);
+	rgfxEndAtHeapStorageMismatch(descriptor, self.storageMode);
 	const MTLSizeAndAlign sa = rgfxHeapTextureSizeAndAlign(ser, descriptor, [self class], _cmd);
 	uint64_t offset = 0;
 	if (![self rgfxTakeRange:sa.size align:sa.align offset:&offset]) {

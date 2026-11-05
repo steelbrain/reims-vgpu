@@ -128,16 +128,29 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 /// Ends the process, with Metal's words, at a descriptor Metal's texture descriptor validation
-/// ends it at on every Mac (measured on the AMD, Intel and M3 GPUs at the device's and a heap's
-/// newTextureWithDescriptor:, docs/graphics-kext/dgpu-oracle.md, Q12): one of a three-channel
-/// format (45 to 48, 95 to 100 and 120 to 122), which Metal's setter takes and Metal describes no
-/// format for, and a multisample one of a compressed or 4:2:2 format, or of
-/// MTLPixelFormatUnspecialized. And, as the AMD 5300M and the Intel 630 under macOS 26.7.1 end it
-/// (oracle_bundle buftex.depth and devtex.*: Depth32Float in Shared storage over a buffer, and in
-/// Shared or Managed from the device, Stencil8 in Managed; Private passes; the M3 Max makes the
-/// one over a buffer), at a depth, stencil or depth-stencil texture in Shared or Managed storage. The device's, the heaps' and a buffer's texture creators
-/// call it before they send the host anything; it returns for any other descriptor.
-void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor);
+/// (`-[MTLTextureDescriptorInternal validateWithDevice:]`) ends it at, as the AMD 5300M and the
+/// Intel 630 under macOS 26.7.1 end it at every texture creator (oracle_texdesc at the device's, a
+/// Private heap's and a Shared buffer's; oracle_surftex over an IOSurface; Q12; Q20): one
+/// assertion listing every rule broken, a line each: a width, height, depth or array length of 0
+/// or past what the type takes (16384 a side, 2048 for a 3D texture's and an array's), a format
+/// the device lacks (Invalid, the three-channel formats, the packed 16-bit ones, sRGB R8 and RG8,
+/// ASTC, ETC2, EAC, PVRTC, the XR10 formats, Unspecialized, every two-plane one, and
+/// Depth24Unorm_Stencil8 and X24_Stencil8 as the lane answers no Depth24Stencil8, as the Intel 630
+/// does), a depth, height, array length, sample count or level count the type does not take,
+/// more levels than the size holds, a cube not square, a multisample texture of a format that has
+/// none or a count the device does not make (`device`'s supportsTextureSampleCount:, else the x86
+/// Macs' 2, 4 and 8), a compressed, depth or 4:2:2 format of a type it does not take, a 4:2:2
+/// one of an odd width or with levels, a depth, stencil or multisample texture in Shared or
+/// Managed storage, Memoryless storage and a storage mode Metal has no name for, and usage bit
+/// 0x80. A type past MTLTextureTypeTextureBuffer ends it with no words, as there. The device's, the heaps' and a buffer's texture creators, by the public form and the
+/// linear and tiled SPI, and the creator over an IOSurface, call it before they send the host
+/// anything; it returns for any other descriptor.
+void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLDevice> device = nil);
+
+/// Ends the process, with Metal's words, where a heap's texture creator ends it after the
+/// descriptor's validation, as the AMD 5300M and the Intel 630 under macOS 26.7.1 end it at a
+/// Private heap (oracle_texdesc heap): a descriptor of another storage mode than the heap's.
+void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode);
 
 /// Ends the process, with Metal's words, where `minimumLinearTextureAlignmentForPixelFormat:` ends
 /// it on the x86-64 Macs, and returns for the 64 raw formats both answer (256), alike on the AMD
@@ -155,18 +168,15 @@ void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format);
 
 /// Ends the process, with Metal's words, where newTextureWithDescriptor:iosurface:plane: ends it on
 /// the AMD 5300M and the Intel 630 under macOS 26.7.1 (oracle_surftex, docs/graphics-kext/
-/// dgpu-oracle.md, Q20). At the descriptor's own validation, over any surface: as
-/// rgfxEndAtInvalidTextureDescriptor, and at a format the device lacks, a width or height of 0, a
-/// depth, array length or sample count above 1 its type does not allow, a multisample texture of
-/// 1 sample or in Shared or Managed storage, Memoryless storage, a 4:2:2 format of an odd width,
-/// and every two-plane format, Y'CbCr or extended-range, which the x86 Macs lack (Q13). Then over
-/// a surface without planes: at a type other than 2D or TextureBuffer, a depth other than 1, more
+/// dgpu-oracle.md, Q20). At the descriptor's own validation, over any surface
+/// (rgfxEndAtInvalidTextureDescriptor, every two-plane format among those the device lacks, Q13).
+/// Then over a surface without planes: at a type other than 2D or TextureBuffer, a depth other than 1, more
 /// than one level, rows wider than the surface's bytesPerRow (a compressed or 4:2:2 format's
 /// counted in its blocks), a depth or stencil format, a plane other than 0, and more rows than
 /// the surface's. The device's creator calls it before it sends the host anything; it returns for
 /// any other texture, which the creator makes, or answers nil for (RgfxIOSurfaceTexture).
 void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceRef surface,
-                                    NSUInteger plane);
+                                    NSUInteger plane, id<MTLDevice> device = nil);
 
 /// Ends the process, with Metal's words, at a view of a texture in `from`, of `fromType`,
 /// `levelCount` levels and `sliceCount` slices, that Metal's validation ends it at on the AMD 5300M

@@ -470,80 +470,6 @@ const RgfxNamedFormat kNoMultisample[] = {
 
 } // namespace
 
-// Metal's validation lists each rule a descriptor breaks, a line each, in this order (measured:
-// a 4x and a 2x 2DMultisample texture of BC1, GBGR422 and Unspecialized, a 1x one of BC1, and 2D
-// ones of 45 and 100; the x86 GPUs name a format they lack, ASTC among them, as an invalid one).
-void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor)
-{
-	if (descriptor == nil) {
-		return;
-	}
-	const uint64_t format = descriptor.pixelFormat;
-	// A depth or stencil texture the CPU reaches: the x86 Macs' validation keeps their textures
-	// Private (oracle_bundle buftex.depth and devtex.*, AMD 5300M and Intel 630, macOS 26.7.1).
-	const bool depthOrStencil = format == MTLPixelFormatDepth16Unorm ||
-	                            format == MTLPixelFormatDepth32Float ||
-	                            format == MTLPixelFormatStencil8 ||
-	                            format == MTLPixelFormatDepth24Unorm_Stencil8 ||
-	                            format == MTLPixelFormatDepth32Float_Stencil8 ||
-	                            format == MTLPixelFormatX32_Stencil8 ||
-	                            format == MTLPixelFormatX24_Stencil8;
-	if (depthOrStencil && (descriptor.storageMode == MTLStorageModeShared ||
-	                       descriptor.storageMode == MTLStorageModeManaged)) {
-		RgfxMetalAssertionFailed(
-		    "-[MTLTextureDescriptorInternal validateWithDevice:]",
-		    @"Texture Descriptor Validation\nMTLTextureDescriptor: Depth, Stencil, DepthStencil "
-		    @"textures cannot be allocated with MTLStorageModeShared or MTLStorageModeManaged on "
-		    @"this device.\n");
-	}
-	const MTLTextureType type = descriptor.textureType;
-	const bool multisample =
-	    type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
-	const bool threeChannel = (format >= 45 && format <= 48) ||
-	                          (format >= 95 && format <= 100) || (format >= 120 && format <= 122);
-	const char *name = nullptr;
-	for (const RgfxNamedFormat &f : kNoMultisample) {
-		if (f.format == format) {
-			name = f.name;
-		}
-	}
-	if (!threeChannel && !(multisample && name != nullptr)) {
-		return;
-	}
-	NSMutableString *words = [NSMutableString stringWithString:@"Texture Descriptor Validation\n"];
-	if (threeChannel) {
-		[words appendFormat:@"MTLTextureDescriptor has invalid pixelFormat (%llu).\n",
-		                    (unsigned long long)format];
-		if (multisample) {
-			[words appendString:@"MTLTextureDescriptor pixelFormat (MTLPixelFormatInvalid) does "
-			                    @"not support multisample textures.\n"];
-		}
-	} else {
-		[words appendFormat:@"MTLTextureDescriptor pixelFormat (%s) does not support multisample "
-		                    @"textures.\n",
-		                    name];
-		const bool subsampled = format == 240 || format == 241;
-		const bool blocks = format != 263; // compressed, or 4:2:2
-		if (descriptor.sampleCount > 1 && blocks) {
-			[words appendString:@"MTLTextureDescriptor has a compressed pixel format set with a "
-			                    @"sample count greater than one.\n"];
-		} else if (descriptor.sampleCount <= 1) {
-			[words appendString:@"MTLTextureDescriptor sampleCount must be > 1 for multisample "
-			                    @"textures.\n"];
-		}
-		if (blocks) {
-			[words appendString:@"MTLTextureDescriptor: compressed pixel formats require texture "
-			                    @"type of MTLTextureType2D[Array], MTLTextureType3D or "
-			                    @"MTLTextureTypeCube[Array].\n"];
-		}
-		if (subsampled) {
-			[words appendString:@"MTLTextureDescriptor: MTLPixelFormat422 requires "
-			                    @"MTLTextureType2D.\n"];
-		}
-	}
-	RgfxMetalAssertionFailed("-[MTLTextureDescriptorInternal validateWithDevice:]", words);
-}
-
 namespace {
 
 // The formats the x86 Macs' device lacks, which Metal names MTLPixelFormatInvalid
@@ -725,64 +651,257 @@ void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64
 		                         [@"Texture Creation\n" stringByAppendingString:rule]);
 }
 
-// Metal checks a texture over a surface in three steps, each its own assertion, and lists every
-// rule of one step a descriptor breaks, a line each (measured: oracle_surftex, Q20).
-void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceRef surface,
-                                    NSUInteger plane)
+namespace {
+
+// The bytes of the descriptor's storage mode's name, as Metal's assertions name it.
+const char *rgfxStorageModeName(MTLStorageMode mode)
 {
-	if (descriptor == nil || surface == nullptr)
+	switch (mode) {
+	case MTLStorageModeShared:
+		return "MTLStorageModeShared";
+	case MTLStorageModeManaged:
+		return "MTLStorageModeManaged";
+	case MTLStorageModePrivate:
+		return "MTLStorageModePrivate";
+	case MTLStorageModeMemoryless:
+		return "MTLStorageModeMemoryless";
+	}
+	return "MTLStorageMode(unknown)";
+}
+
+// The most mipmap levels a texture of `width` x `height` x `depth` takes: one for each halving
+// of its largest side down to 1.
+uint64_t rgfxMaxLevels(uint64_t width, uint64_t height, uint64_t depth)
+{
+	uint64_t side = std::max<uint64_t>({width, height, depth, 1});
+	uint64_t levels = 1;
+	while (side > 1) {
+		side >>= 1;
+		levels++;
+	}
+	return levels;
+}
+
+} // namespace
+
+// Metal's descriptor validation, `-[MTLTextureDescriptorInternal validateWithDevice:]`, which
+// every texture creator runs first: one assertion listing every rule the descriptor breaks, a line
+// each, in the order the x86 Macs list them. Measured on the AMD 5300M and the Intel 630 under
+// macOS 26.7.1, alike at the device's, a Private heap's and a Shared buffer's creators
+// (oracle_texdesc), over an IOSurface (oracle_surftex, Q20) and in Q12's cases; the two differ
+// only in Depth24Unorm_Stencil8 and X24_Stencil8, which the Intel GPU lacks, as the lane does.
+// Where the x86 Macs and the M3 Max differ (a format the x86 Macs lack, which they name by number
+// and the M3 by name), these are the x86 Macs' words. A sample count of a multisample texture is
+// checked against `device` where it answers supportsTextureSampleCount:, else against the counts
+// the x86 Macs make (2, 4 and 8).
+void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLDevice> device)
+{
+	if (descriptor == nil)
 		return;
-	rgfxEndAtInvalidTextureDescriptor(descriptor);
 	const uint64_t format = descriptor.pixelFormat;
 	const MTLTextureType type = descriptor.textureType;
 	const uint64_t width = descriptor.width, height = descriptor.height;
 	const uint64_t depth = descriptor.depth, arrayLength = descriptor.arrayLength;
 	const uint64_t samples = descriptor.sampleCount, levels = descriptor.mipmapLevelCount;
 	const MTLStorageMode storage = descriptor.storageMode;
+	const uint64_t usage = descriptor.usage;
+	auto ull = [](uint64_t n) { return static_cast<unsigned long long>(n); };
+	// A type past MTLTextureTypeTextureBuffer ends the process with no words, at each creator of
+	// both x86 Macs (oracle_texdesc type10).
+	if (type > MTLTextureTypeTextureBuffer) {
+		NSLog(@"RGFX: texture type %llu ends the process, as Metal's creators do", ull(type));
+		abort();
+	}
+	NSString *typeName = rgfxTextureTypeName(type);
+	const bool oneD = type == MTLTextureType1D || type == MTLTextureType1DArray;
+	const bool threeD = type == MTLTextureType3D;
+	const bool cube = type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray;
 	const bool multisample =
 	    type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
-	auto ull = [](uint64_t n) { return static_cast<unsigned long long>(n); };
-	// The descriptor's own validation, as at every texture creator. The x86 Macs lack the
-	// two-plane formats too, and end at a texture of one over any surface or plane as an invalid
-	// format (oracle_surftex, Q13 and Q20).
-	NSMutableString *rules = [NSMutableString string];
-	if (format == MTLPixelFormatInvalid || rgfxDeviceLacks(format) || rgfxTwoPlaneFormat(format))
-		[rules appendFormat:@"MTLTextureDescriptor has invalid pixelFormat (%llu).\n", ull(format)];
-	if (width == 0)
-		[rules appendString:@"MTLTextureDescriptor has width of zero.\n"];
-	if (height == 0)
-		[rules appendString:@"MTLTextureDescriptor has height of zero.\n"];
-	// Measured of 2D and 2DArray textures; the rule and its words name the type.
-	if (type != MTLTextureType3D && depth > 1)
-		[rules appendFormat:@"MTLTextureDescriptor has depth (%llu) greater than the maximum "
-		                    @"allowed size of 1.\nMTLTextureDescriptor requests a depth of %llu "
-		                    @"but the texture type %@ requires that depth is 1\n",
-		                    ull(depth), ull(depth), rgfxTextureTypeName(type)];
 	const bool arrayed = type == MTLTextureType1DArray || type == MTLTextureType2DArray ||
 	                     type == MTLTextureTypeCubeArray ||
 	                     type == MTLTextureType2DMultisampleArray;
-	if (!arrayed && arrayLength > 1)
-		[rules appendFormat:@"MTLTextureDescriptor has arrayLength (%llu) greater than the maximum "
-		                    @"allowed size of 1.\nMTLTextureDescriptor requests an arrayLength of "
-		                    @"%llu, but %@ requires that arrayLength is 1\n",
-		                    ull(arrayLength), ull(arrayLength), rgfxTextureTypeName(type)];
-	if (!multisample && samples > 1)
+	// A format the device lacks, which the x86 Macs name MTLPixelFormatInvalid: Invalid itself,
+	// the three-channel formats (Q12), and every two-plane format (Q13).
+	const bool threeChannel = (format >= 45 && format <= 48) ||
+	                          (format >= 95 && format <= 100) || (format >= 120 && format <= 122);
+	const bool lacked = format == MTLPixelFormatInvalid || rgfxDeviceLacks(format) ||
+	                    rgfxTwoPlaneFormat(format) || threeChannel;
+	const bool subsampled = format == MTLPixelFormatGBGR422 || format == MTLPixelFormatBGRG422;
+	// The compressed formats the device has (BC1 to BC7), and the 4:2:2 ones, which Metal counts
+	// among them.
+	const bool compressed = !lacked && ((format >= 130 && format <= 135) ||
+	                                    (format >= 140 && format <= 143) ||
+	                                    (format >= 150 && format <= 153) || subsampled);
+	const bool depthOrStencil = !lacked && rgfxDepthStencilBytes(format) != 0;
+	// The largest side each type takes (measured: 16384 wide, 2048 for a 3D texture's sides; one
+	// row for the 1D types and a texture buffer, one slice for every type but 3D, one element for
+	// every type but the arrays, 2048 elements for an array).
+	const uint64_t maxWidth = threeD ? 2048 : 16384;
+	const uint64_t maxHeight =
+	    (oneD || type == MTLTextureTypeTextureBuffer) ? 1 : threeD ? 2048 : 16384;
+	const uint64_t maxDepth = threeD ? 2048 : 1;
+	const uint64_t maxArray = arrayed ? 2048 : 1;
+	NSMutableString *rules = [NSMutableString string];
+	auto side = [&](const char *what, uint64_t n, uint64_t max) {
+		if (n == 0)
+			[rules appendFormat:@"MTLTextureDescriptor has %s of zero.\n", what];
+		else if (n > max)
+			[rules appendFormat:@"MTLTextureDescriptor has %s (%llu) greater than the maximum "
+			                    @"allowed size of %llu.\n",
+			                    what, ull(n), ull(max)];
+	};
+	side("width", width, maxWidth);
+	side("height", height, maxHeight);
+	side("depth", depth, maxDepth);
+	side("arrayLength", arrayLength, maxArray);
+	if (lacked)
+		[rules appendFormat:@"MTLTextureDescriptor has invalid pixelFormat (%llu).\n", ull(format)];
+	if (oneD && height != 1)
+		[rules appendFormat:@"MTLTextureDescriptor requests a height of %llu but the texture type "
+		                    @"%@ requires that height is 1\n",
+		                    ull(height), typeName];
+	if (!threeD && depth != 1)
+		[rules appendFormat:@"MTLTextureDescriptor requests a depth of %llu but the texture type "
+		                    @"%@ requires that depth is 1\n",
+		                    ull(depth), typeName];
+	if (!arrayed && arrayLength != 1)
+		[rules appendFormat:@"MTLTextureDescriptor requests an arrayLength of %llu, but %@ "
+		                    @"requires that arrayLength is 1\n",
+		                    ull(arrayLength), typeName];
+	// A cube array's elements are six slices each: 341 of them fill the 2048.
+	const uint64_t maxElements = type == MTLTextureTypeCubeArray ? 341 : 2048;
+	if (arrayed && (arrayLength == 0 || arrayLength > maxElements))
+		[rules appendFormat:@"MTLTextureDescriptor arrayLength (%llu) is set to zero or greater "
+		                    @"than the max allowed size (%llu).\n",
+		                    ull(arrayLength), ull(maxElements)];
+	if (!multisample && oneD && levels != 1)
+		[rules appendFormat:@"MTLTextureDescriptor requests a mipmapLevelCount of %llu but the "
+		                    @"texture type %@ requires that mipmapLevelCount is 1\n",
+		                    ull(levels), typeName];
+	else if (!multisample && subsampled && levels > 1)
+		[rules appendFormat:@"MTLTextureDescriptor requests %llu mipmap levels, but the "
+		                    @"MTLPixelFormat422 pixel format does not support mipmaps.\n",
+		                    ull(levels)];
+	else if (!multisample) {
+		const uint64_t most =
+		    rgfxMaxLevels(width, oneD ? 1 : height, threeD ? depth : 1);
+		if (levels == 0 || levels > most)
+			[rules appendFormat:@"MTLTextureDescriptor requests %llu mipmap levels, but the "
+			                    @"dimensions (%llu, %llu, %llu) can only support a maxiumum of "
+			                    @"%llu levels\n",
+			                    ull(levels), ull(width), ull(height), ull(depth), ull(most)];
+	}
+	if (cube && width != height)
+		[rules appendString:@"MTLTextureDescriptor width must equal height for cube textures.\n"];
+	// The formats no multisample texture has: a compressed or 4:2:2 one, BGR5A1Unorm and
+	// RGB9E5Float (measured), and a format the device lacks, named Invalid.
+	const char *noMultisample = nullptr;
+	if (lacked)
+		noMultisample = "MTLPixelFormatInvalid";
+	else if (format == MTLPixelFormatBGR5A1Unorm)
+		noMultisample = "MTLPixelFormatBGR5A1Unorm";
+	else if (format == MTLPixelFormatRGB9E5Float)
+		noMultisample = "MTLPixelFormatRGB9E5Float";
+	else if (compressed)
+		for (const RgfxNamedFormat &f : kNoMultisample)
+			if (f.format == format)
+				noMultisample = f.name;
+	if (multisample && levels != 1)
+		[rules appendString:@"MTLTextureDescriptor mipmapLevelCount must equal 1 for multisample "
+		                    @"textures.\n"];
+	if (multisample && noMultisample != nullptr)
+		[rules appendFormat:@"MTLTextureDescriptor pixelFormat (%s) does not support multisample "
+		                    @"textures.\n",
+		                    noMultisample];
+	// The sample count, where a compressed format's line takes the place of a count above 1
+	// (Q12).
+	if (!multisample && samples != 1)
 		[rules appendString:@"MTLTextureDescriptor has sampleCount set but is using a type that "
 		                    @"does not allow sampleCount.\n"];
 	if (multisample && samples <= 1)
 		[rules appendString:@"MTLTextureDescriptor sampleCount must be > 1 for multisample "
 		                    @"textures.\n"];
-	if (multisample && (storage == MTLStorageModeShared || storage == MTLStorageModeManaged))
+	if (multisample && compressed && samples > 1)
+		[rules appendString:@"MTLTextureDescriptor has a compressed pixel format set with a sample "
+		                    @"count greater than one.\n"];
+	auto countMade = [&] {
+		if ([device respondsToSelector:@selector(supportsTextureSampleCount:)])
+			return static_cast<bool>([device supportsTextureSampleCount:samples]);
+		return samples == 2 || samples == 4 || samples == 8;
+	};
+	if (multisample && samples > 1 && !countMade())
+		[rules appendFormat:@"MTLTextureDescriptor sampleCount (%llu) is not supported by "
+		                    @"device.\n",
+		                    ull(samples)];
+	const bool compressedType = type == MTLTextureType2D || type == MTLTextureType2DArray ||
+	                            threeD || cube;
+	if (compressed && !compressedType)
+		[rules appendString:@"MTLTextureDescriptor: compressed pixel formats require texture type "
+		                    @"of MTLTextureType2D[Array], MTLTextureType3D or "
+		                    @"MTLTextureTypeCube[Array].\n"];
+	if (depthOrStencil && (oneD || threeD || type == MTLTextureTypeTextureBuffer))
+		[rules appendString:@"MTLTextureDescriptor: depth/stencil pixel formats require texture "
+		                    @"type of MTLTextureType2D[Array] or MTLTextureTypeCube[Array].\n"];
+	if (subsampled && type != MTLTextureType2D)
+		[rules appendString:@"MTLTextureDescriptor: MTLPixelFormat422 requires MTLTextureType2D.\n"];
+	if (subsampled && width % 2 != 0)
+		[rules appendString:@"MTLTextureDescriptor: MTLPixelFormat422 requires even width.\n"];
+	// The x86 Macs keep depth, stencil and multisample textures Private (oracle_bundle
+	// buftex.depth and devtex.*), and have no memoryless storage (Q5).
+	const bool cpuStorage = storage == MTLStorageModeShared || storage == MTLStorageModeManaged;
+	if (depthOrStencil && cpuStorage)
+		[rules appendString:@"MTLTextureDescriptor: Depth, Stencil, DepthStencil textures cannot be "
+		                    @"allocated with MTLStorageModeShared or MTLStorageModeManaged on this "
+		                    @"device.\n"];
+	if (multisample && cpuStorage)
 		[rules appendString:@"MTLTextureDescriptor: Multisample textures cannot be allocated with "
 		                    @"MTLStorageModeShared or MTLStorageModeManaged on this device.\n"];
 	if (storage == MTLStorageModeMemoryless)
 		[rules appendString:@"MTLTextureDescriptor: MTLResourceStorageModeMemoryless is not a "
 		                    @"supported storage mode on this device.\n"];
-	if ((format == MTLPixelFormatGBGR422 || format == MTLPixelFormatBGRG422) && width % 2 != 0)
-		[rules appendString:@"MTLTextureDescriptor: MTLPixelFormat422 requires even width.\n"];
+	// A storage mode Metal has no name for, a line the x86 Macs give twice.
+	if (storage > MTLStorageModeMemoryless)
+		for (int twice = 0; twice < 2; twice++)
+			[rules appendFormat:@"invalid storageMode (%llu). Must be one of MTLStorageModeShared(0) "
+			                    @"MTLStorageModeManaged(1) MTLStorageModeMemoryless(3) "
+			                    @"MTLStorageModePrivate(2)\n",
+			                    ull(storage)];
+	// A usage bit Metal does not know: 0x80, the one measured (other bits past the SDK's may be
+	// the system's own, so they pass).
+	if ((usage & 0x80) != 0)
+		[rules appendString:@"MTLTextureUsage has unknown bits 0x80.\n"];
 	if (rules.length > 0)
 		RgfxMetalAssertionFailed("-[MTLTextureDescriptorInternal validateWithDevice:]",
 		                         [@"Texture Descriptor Validation\n" stringByAppendingString:rules]);
+}
+
+void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode)
+{
+	if (descriptor == nil || descriptor.storageMode == heapMode)
+		return;
+	RgfxMetalAssertionFailed(
+	    "-[MTLIOAccelHeap newSubResourceWithLength:alignment:options:offset:]",
+	    [NSString stringWithFormat:@"The requested storage mode (%s) is not compatible with the "
+	                               @"heap's mode (%s)",
+	                               rgfxStorageModeName(descriptor.storageMode),
+	                               rgfxStorageModeName(heapMode)]);
+}
+
+// Metal checks a texture over a surface in three steps, each its own assertion, and lists every
+// rule of one step a descriptor breaks, a line each (measured: oracle_surftex, Q20).
+void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceRef surface,
+                                    NSUInteger plane, id<MTLDevice> device)
+{
+	if (descriptor == nil || surface == nullptr)
+		return;
+	rgfxEndAtInvalidTextureDescriptor(descriptor, device);
+	const uint64_t format = descriptor.pixelFormat;
+	const MTLTextureType type = descriptor.textureType;
+	const uint64_t width = descriptor.width, height = descriptor.height;
+	const uint64_t depth = descriptor.depth, arrayLength = descriptor.arrayLength;
+	const uint64_t levels = descriptor.mipmapLevelCount;
+	auto ull = [](uint64_t n) { return static_cast<unsigned long long>(n); };
 	// A surface with planes passes the rest, a plane past its planes answering nil
 	// (RgfxIOSurfaceTexture).
 	if (IOSurfaceGetPlaneCount(surface) != 0)

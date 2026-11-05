@@ -78,7 +78,7 @@
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
 	// Where Metal's validation ends the process, so does the bundle, sending nothing.
-	rgfxEndAtInvalidTextureDescriptor(descriptor);
+	rgfxEndAtInvalidTextureDescriptor(descriptor, self);
 	// A Managed texture's CPU copy is a Shared buffer of the slabs where the host reads a copy
 	// wherever its buffer lies (RGFX_FEATURE_MANAGED_TEXTURE_SLABS), so the copies take the
 	// process's own pages and not the region every process shares; else a region block. One of
@@ -110,7 +110,7 @@
 	// Where Metal ends the process, so does the bundle, sending nothing; else over this
 	// process's copy of the plane in the device region, synced with the surface's pages
 	// (RgfxIOSurface.h).
-	rgfxEndAtInvalidSurfaceTexture(descriptor, iosurface, plane);
+	rgfxEndAtInvalidSurfaceTexture(descriptor, iosurface, plane, self);
 	return [RgfxIOSurfaceTexture textureWithDescriptor:descriptor
 	                                         iosurface:iosurface
 	                                             plane:plane
