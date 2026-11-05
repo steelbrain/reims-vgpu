@@ -456,7 +456,11 @@ pl_run() {
 # held workspace (potluck cp), for a job that ended without its keep; fails where neither has it.
 pl_kept() {
   local k=${POTLUCK_STATE:-$HOME/.local/state/potluck}/jobs/$(cat "$RUN/job-$1")/keep/$2
-  if [[ -e $k ]]; then cp -R "$k" "$3"; else [[ -n ${4:-} ]] && potluck cp "$4:$2" "$3"; fi
+  if [[ -e $k ]]; then
+    cp -R "$k" "$3" && echo "$2: from the job's keep"
+  else
+    [[ -n ${4:-} ]] && potluck cp "$4:$2" "$3" && echo "$2: no keep, from the workspace (potluck cp)"
+  fi
 }
 # pl_workspace JOB: the job's workspace.
 pl_workspace() {
