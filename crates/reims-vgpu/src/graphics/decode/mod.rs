@@ -1061,15 +1061,16 @@ impl<P: Platform> GraphicsDecoder<P> {
             if d.made != 0 {
                 log::info!(
                     target: "reims_vgpu::graphics",
-                    "IOSurface device caches: {} made; {} fills of {} MiB, {} downloads of {} MiB, \
-                     {} asked of a cache nothing wrote; {} fills or downloads the host's devices' \
-                     writes changed; {} written caches copied at a release with no client \
-                     left; {} copies out not made, the CPU's generation past the cache's; {} \
+                    "IOSurface device caches: {} made; {} fills of {} MiB ({} as made), {} \
+                     downloads of {} MiB, {} asked of a cache nothing wrote; {} fills or \
+                     downloads the host's devices' writes changed; {} written caches copied at a \
+                     release with no client left; {} copies out not made, the CPU's generation \
+                     past the cache's; {} \
                      deferred, {} refused, {} named their pages ({} copied), {} released \
                      unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
                      downloads they answered, {} unread; {} copy by runs, {} copies by runs \
                      refused",
-                    d.made, d.fills, d.filled_bytes >> 20, d.downloads,
+                    d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.behind,
                     d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
                     d.early, d.early_bytes >> 20, d.early_aside, d.early_read, d.early_unread,
@@ -1312,9 +1313,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                 views.host_runs(runs),
             )
         };
+        // The CPU's generation the kext wrote into the block's header as it cached the block, or
+        // since, which the cache's first fill is of.
+        let generation = surface_cache::cpu_generation(&self.shared.region, block).unwrap_or(0);
         let (made, length) = match (view, by_runs) {
             (Some(view), _) => (
-                self.surface_caches.make(device, block, &view, pages),
+                (self.surface_caches).make(device, block, &view, pages, generation),
                 view.length(),
             ),
             (None, Some((runs, unmade))) => {
@@ -1325,6 +1329,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     runs,
                     Arc::clone(&unmade),
                     pages,
+                    generation,
                 );
                 if !matches!(made, Ok(true)) {
                     self.view_by_runs(device, block, &unmade);
