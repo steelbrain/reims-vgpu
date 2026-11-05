@@ -92,17 +92,19 @@ use reims_graphics::wire::{
     RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
     RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE,
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
-    RGFX_CMD_MANAGED_BUFFER_CREATE, RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_QUEUE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK,
-    RGFX_CMD_RESOURCE_ID_SMALL_CHUNK, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
-    RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
-    RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW,
-    RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
-    RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
-    RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_EVT_PIPELINE_REFLECTION,
-    RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_LINKED_BINARY_FUNCTIONS,
-    RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP, RGFX_LINKED_PRIVATE_FUNCTIONS,
-    RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
+    RGFX_CMD_MANAGED_BUFFER_CREATE, RGFX_CMD_MANAGED_TEXTURE_CREATE,
+    RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_RESOURCE_ID_SMALL_CHUNK,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
+    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+    RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE,
+    RGFX_COMPUTE_PIPELINE_SUPPORT_ICB, RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH,
+    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
+    RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN,
+    RGFX_LINKED_BINARY_FUNCTIONS, RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP,
+    RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH,
+    RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_PIPELINE_KIND_COMPUTE,
+    RGFX_PIPELINE_KIND_MESH, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
     RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
     RGFX_PIPELINE_REFUSED, RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE,
     RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
@@ -117,13 +119,13 @@ use reims_graphics::wire::{
     RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc,
     RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
     RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
-    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMsgHeader, RgfxObjectCreate,
-    RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
-    RgfxRenderPipelineCreate, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
-    RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
-    RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate,
-    RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
-    RgfxVertexBufferLayout, RgfxVideoSessionCreate,
+    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMeshPipelineReflection,
+    RgfxMeshRenderPipelineCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
+    RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk,
+    RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue,
+    RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter,
+    RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::memory::map::MemoryMap;
@@ -134,17 +136,17 @@ use reims_vgpu_core::platform::os::clock::{Clock as _, MonoTime};
 use reims_vgpu_core::platform::resource::{
     Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
 };
-use reims_vgpu_core::platform::types::Swizzle;
+use reims_vgpu_core::platform::types::{MtlSize, Swizzle};
 use reims_vgpu_core::platform::values::{
     AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
-    FullComputePipelineDesc, FullRenderPipelineDesc, HeapDesc, LinkedFunctionsDesc, OptionSet,
-    SamplerDesc, StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix, SurfacePlane,
-    TextureDesc, VertexDesc,
+    FullComputePipelineDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc,
+    LinkedFunctionsDesc, OptionSet, SamplerDesc, StageInputDesc, StencilDesc, SurfaceFacts,
+    SurfaceMatrix, SurfacePlane, TextureDesc, VertexDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
-use zerocopy::{FromBytes, Immutable, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Metal's page on Apple silicon, to which a Shared heap's memory is rounded up: the guest's
 /// block holds it whole ([`RGFX_CMD_HEAP_OVER_HOST_MEMORY`]).
@@ -230,7 +232,49 @@ pub(crate) type SubmittedSink = Arc<dyn Fn(RgfxCbSubmitted) + Send + Sync>;
 /// pipeline is made (or refused). The ring loop sets one that writes the reply to
 /// the queue's completion ring, keyed to the create by its `seqno`; until it is
 /// set, the reply is built and dropped.
-pub(crate) type ReflectionSink = Arc<dyn Fn(RgfxPipelineReflection) + Send + Sync>;
+pub(crate) type ReflectionSink = Arc<dyn Fn(PipelineReply) + Send + Sync>;
+
+/// A `PIPELINE_REFLECTION` reply: its record, and, after it, a made mesh render pipeline's
+/// limits ([`RgfxMeshPipelineReflection`], at [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]), which
+/// no other reply carries.
+///
+/// [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]: reims_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PipelineReply {
+    /// The record.
+    pub(crate) reflection: RgfxPipelineReflection,
+    /// A made mesh render pipeline's limits.
+    pub(crate) mesh: Option<RgfxMeshPipelineReflection>,
+}
+
+impl PipelineReply {
+    /// A reply of `reflection` alone.
+    pub(crate) fn of(reflection: RgfxPipelineReflection) -> Self {
+        PipelineReply {
+            reflection,
+            mesh: None,
+        }
+    }
+
+    /// The reply's bytes: the record, its header's size counting the mesh limits after it where
+    /// it carries them.
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        let mut reflection = self.reflection;
+        let mut out = Vec::with_capacity(
+            size_of::<RgfxPipelineReflection>() + size_of::<RgfxMeshPipelineReflection>(),
+        );
+        if let Some(mesh) = &self.mesh {
+            reflection.header.size = (size_of::<RgfxPipelineReflection>()
+                + size_of::<RgfxMeshPipelineReflection>())
+                as u32;
+            out.extend_from_slice(reflection.as_bytes());
+            out.extend_from_slice(mesh.as_bytes());
+        } else {
+            out.extend_from_slice(reflection.as_bytes());
+        }
+        out
+    }
+}
 
 /// The sinks a message's records go to: those of the ring it came from. A sink not set builds and
 /// drops its records, and a command buffer gets no scheduled handler or `CB_SUBMITTED` without
@@ -2885,9 +2929,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let hold = video::SessionHold::new(m.obj_id, session, &self.shared.video_worker);
                 self.insert(m.obj_id, ObjHandle::VideoSession(hold))
             }
-            RGFX_CMD_RENDER_PIPELINE_CREATE | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
-                self.decode_pipeline(device, message)
-            }
+            RGFX_CMD_RENDER_PIPELINE_CREATE
+            | RGFX_CMD_MESH_RENDER_PIPELINE_CREATE
+            | RGFX_CMD_COMPUTE_PIPELINE_CREATE => self.decode_pipeline(device, message),
             RGFX_CMD_COMMAND_BUFFER => {
                 let drain = self.command_buffer_drain();
                 if drain.is_none() && self.context_closed() {
@@ -3190,7 +3234,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if let (Some(sink), Some(refused)) =
                     (&self.sinks.reflection, refused_reply(message))
                 {
-                    sink(refused);
+                    sink(PipelineReply::of(refused));
                 }
                 return Ok(Err(e));
             }
@@ -3198,7 +3242,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let compiled = compile_refusing::<P>(device, job);
         let refused = compiled.is_refused();
         if let Some(sink) = self.sinks.reflection.clone() {
-            sink(compiled.reflection);
+            sink(compiled.reply());
         }
         self.finish_pipeline(compiled);
         Ok(if refused {
@@ -3263,6 +3307,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 },
             });
         }
+        if header.r#type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE {
+            return self.prepare_mesh_pipeline(message);
+        }
         let m = read::<RgfxRenderPipelineCreate>(message).ok_or(DecodeError::Malformed)?;
         let vertex_library = library(m.vertex_library_obj_id)?;
         let vertex_name = str_tail(message, m.vertex_name_offset, m.vertex_name_len)
@@ -3313,6 +3360,125 @@ impl<P: Platform> GraphicsDecoder<P> {
                 fragment_linked,
                 fields: render_fields(message, &m)?,
             },
+        })
+    }
+
+    /// [`Self::prepare_pipeline`] of a `MESH_RENDER_PIPELINE_CREATE`: its object, mesh and
+    /// fragment functions, each stage's constants and linked functions, its label and the rest of
+    /// its descriptor. A create naming library 0 and no name for its object function has none (a
+    /// pipeline with no object stage), and likewise for its fragment function (one that does not
+    /// rasterize); one with no mesh function is [`DecodeError::Malformed`], as the bundle ends
+    /// the process at such a descriptor before posting it, as Metal does.
+    fn prepare_mesh_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
+        let m = read::<RgfxMeshRenderPipelineCreate>(message).ok_or(DecodeError::Malformed)?;
+        let stage = |library: u64, (name_offset, name_len): (u32, u32), (at, count): (u32, u32)| {
+            if library == 0 && name_len == 0 {
+                return Ok(None);
+            }
+            let name = str_tail(message, name_offset, name_len).ok_or(DecodeError::Malformed)?;
+            let constants = constants_tail(message, at, count).ok_or(DecodeError::Malformed)?;
+            Ok(Some((
+                self.library_ref(library)?,
+                name.to_owned(),
+                constants,
+            )))
+        };
+        let object = stage(
+            m.object_library_obj_id,
+            (m.object_name_offset, m.object_name_len),
+            (m.object_constants_offset, m.object_constant_count),
+        )?;
+        let mesh = stage(
+            m.mesh_library_obj_id,
+            (m.mesh_name_offset, m.mesh_name_len),
+            (m.mesh_constants_offset, m.mesh_constant_count),
+        )?
+        .ok_or(DecodeError::Malformed)?;
+        let fragment = stage(
+            m.fragment_library_obj_id,
+            (m.fragment_name_offset, m.fragment_name_len),
+            (m.fragment_constants_offset, m.fragment_constant_count),
+        )?;
+        let label = if m.label_len == 0 {
+            None
+        } else {
+            Some(
+                str_tail(message, m.label_offset, m.label_len)
+                    .ok_or(DecodeError::Malformed)?
+                    .to_owned(),
+            )
+        };
+        let in_use = usize::try_from(m.color_attachment_count)
+            .ok()
+            .filter(|&n| n <= m.colors.len())
+            .ok_or(DecodeError::Malformed)?;
+        let colors = m.colors[..in_use]
+            .iter()
+            .zip(0u64..)
+            .map(|(c, index)| (index, color_attachment(c)))
+            .collect();
+        let size = |[width, height, depth]: [u32; 3]| {
+            MtlSize::new(width.into(), height.into(), depth.into())
+        };
+        Ok(PipelineJob {
+            obj_id: m.obj_id,
+            seqno: m.header.seqno,
+            shape: PipelineShape::Mesh(Box::new(MeshShape {
+                object,
+                mesh,
+                fragment,
+                label,
+                object_linked: self.linked_tail(
+                    message,
+                    m.object_linked_offset,
+                    m.object_linked_count,
+                )?,
+                mesh_linked: self.linked_tail(
+                    message,
+                    m.mesh_linked_offset,
+                    m.mesh_linked_count,
+                )?,
+                fragment_linked: self.linked_tail(
+                    message,
+                    m.fragment_linked_offset,
+                    m.fragment_linked_count,
+                )?,
+                fields: MeshFields {
+                    colors,
+                    depth_pixel_format: m.depth_pixel_format.into(),
+                    stencil_pixel_format: m.stencil_pixel_format.into(),
+                    raster_sample_count: m.raster_sample_count.into(),
+                    alpha_to_coverage: m.flags & RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE != 0,
+                    alpha_to_one: m.flags & RGFX_RENDER_PIPELINE_ALPHA_TO_ONE != 0,
+                    rasterization_enabled: m.flags & RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED
+                        != 0,
+                    max_total_threads_per_object_threadgroup: m
+                        .max_total_threads_per_object_threadgroup
+                        .into(),
+                    max_total_threads_per_mesh_threadgroup: m
+                        .max_total_threads_per_mesh_threadgroup
+                        .into(),
+                    max_total_threadgroups_per_mesh_grid: m
+                        .max_total_threadgroups_per_mesh_grid
+                        .into(),
+                    object_threadgroup_size_is_multiple_of_execution_width: m.flags
+                        & RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH
+                        != 0,
+                    mesh_threadgroup_size_is_multiple_of_execution_width: m.flags
+                        & RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH
+                        != 0,
+                    payload_memory_length: m.payload_memory_length.into(),
+                    max_vertex_amplification_count: m.max_vertex_amplification_count.into(),
+                    required_threads_per_object_threadgroup: size(
+                        m.required_threads_per_object_threadgroup,
+                    ),
+                    required_threads_per_mesh_threadgroup: size(
+                        m.required_threads_per_mesh_threadgroup,
+                    ),
+                    support_indirect_command_buffers: m.flags & RGFX_RENDER_PIPELINE_SUPPORT_ICB
+                        != 0,
+                },
+            })),
         })
     }
 
@@ -3386,6 +3552,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let handle = compiled.handle.unwrap_or_else(|| {
             ObjHandle::Refused(refused::Refused::of(match compiled.reflection.kind {
                 RGFX_PIPELINE_KIND_COMPUTE => RGFX_CMD_COMPUTE_PIPELINE_CREATE,
+                RGFX_PIPELINE_KIND_MESH => RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
                 _ => RGFX_CMD_RENDER_PIPELINE_CREATE,
             }))
         });
@@ -3405,10 +3572,12 @@ pub(crate) struct PipelineJob<P: Platform> {
 }
 
 impl<P: Platform> PipelineJob<P> {
-    /// [`RGFX_PIPELINE_KIND_RENDER`] or [`RGFX_PIPELINE_KIND_COMPUTE`].
+    /// [`RGFX_PIPELINE_KIND_RENDER`], [`RGFX_PIPELINE_KIND_MESH`] or
+    /// [`RGFX_PIPELINE_KIND_COMPUTE`].
     pub(crate) fn kind(&self) -> u32 {
         match self.shape {
             PipelineShape::Render { .. } => RGFX_PIPELINE_KIND_RENDER,
+            PipelineShape::Mesh(_) => RGFX_PIPELINE_KIND_MESH,
             PipelineShape::Compute { .. } => RGFX_PIPELINE_KIND_COMPUTE,
         }
     }
@@ -3427,6 +3596,7 @@ enum PipelineShape<P: Platform> {
         fragment_linked: Vec<LinkedRef<P>>,
         fields: RenderFields,
     },
+    Mesh(Box<MeshShape<P>>),
     Compute {
         library: LibraryRef<P>,
         name: String,
@@ -3434,6 +3604,23 @@ enum PipelineShape<P: Platform> {
         linked: Vec<LinkedRef<P>>,
         fields: ComputeFields,
     },
+}
+
+/// A stage's function as a create names it: its library, name and constants.
+type StageRef<P> = (LibraryRef<P>, String, Vec<FunctionConstant>);
+
+/// A prepared mesh render pipeline's functions and descriptor.
+struct MeshShape<P: Platform> {
+    /// The object function; `None` for none.
+    object: Option<StageRef<P>>,
+    mesh: StageRef<P>,
+    /// The fragment function; `None` for none.
+    fragment: Option<StageRef<P>>,
+    label: Option<String>,
+    object_linked: Vec<LinkedRef<P>>,
+    mesh_linked: Vec<LinkedRef<P>>,
+    fragment_linked: Vec<LinkedRef<P>>,
+    fields: MeshFields,
 }
 
 /// A linked function a pipeline create names, prepared: its library, name, constants and
@@ -3485,6 +3672,29 @@ struct ComputeFields {
     max_call_stack_depth: u64,
     support_indirect_command_buffers: bool,
     stage_input: Option<StageInputDesc>,
+}
+
+/// A mesh render pipeline create's descriptor past its functions, label and linked functions:
+/// the fields of [`FullMeshRenderPipelineDesc`] the compile hands the platform with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MeshFields {
+    colors: Vec<(u64, ColorAttachmentDesc)>,
+    depth_pixel_format: u64,
+    stencil_pixel_format: u64,
+    raster_sample_count: u64,
+    alpha_to_coverage: bool,
+    alpha_to_one: bool,
+    rasterization_enabled: bool,
+    max_total_threads_per_object_threadgroup: u64,
+    max_total_threads_per_mesh_threadgroup: u64,
+    max_total_threadgroups_per_mesh_grid: u64,
+    object_threadgroup_size_is_multiple_of_execution_width: bool,
+    mesh_threadgroup_size_is_multiple_of_execution_width: bool,
+    payload_memory_length: u64,
+    max_vertex_amplification_count: u64,
+    required_threads_per_object_threadgroup: MtlSize,
+    required_threads_per_mesh_threadgroup: MtlSize,
+    support_indirect_command_buffers: bool,
 }
 
 /// The highest vertex buffer and attribute index Metal's arrays hold: a larger one raises there.
@@ -3629,6 +3839,8 @@ pub(crate) struct CompiledPipeline<P: Platform> {
     handle: Option<ObjHandle<P>>,
     /// The reply: the pipeline's reflection, or a refusal.
     pub(crate) reflection: RgfxPipelineReflection,
+    /// A made mesh render pipeline's limits, which its reply carries after the reflection.
+    mesh: Option<RgfxMeshPipelineReflection>,
     /// Why it was refused, for the host's log; `None` for a made pipeline.
     refusal: Option<String>,
 }
@@ -3641,6 +3853,7 @@ impl<P: Platform> CompiledPipeline<P> {
             obj_id,
             handle: None,
             reflection: refused_reflection(obj_id, seqno, kind),
+            mesh: None,
             refusal: Some(reason.into()),
         }
     }
@@ -3651,7 +3864,16 @@ impl<P: Platform> CompiledPipeline<P> {
             obj_id,
             handle: Some(handle),
             reflection,
+            mesh: None,
             refusal: None,
+        }
+    }
+
+    /// The reply the create owes: its reflection, with a made mesh pipeline's limits after it.
+    pub(crate) fn reply(&self) -> PipelineReply {
+        PipelineReply {
+            reflection: self.reflection,
+            mesh: self.mesh,
         }
     }
 
@@ -3740,6 +3962,27 @@ impl<P: Platform> PipelineJob<P> {
                     out.push(("fragment", name.clone(), constants.clone()));
                 }
                 out.extend(linked("vertex-linked", vertex_linked));
+                out.extend(linked("fragment-linked", fragment_linked));
+            }
+            PipelineShape::Mesh(shape) => {
+                let MeshShape {
+                    object,
+                    mesh,
+                    fragment,
+                    object_linked,
+                    mesh_linked,
+                    fragment_linked,
+                    ..
+                } = &**shape;
+                if let Some((_, name, constants)) = object {
+                    out.push(("object", name.clone(), constants.clone()));
+                }
+                out.push(("mesh", mesh.1.clone(), mesh.2.clone()));
+                if let Some((_, name, constants)) = fragment {
+                    out.push(("fragment", name.clone(), constants.clone()));
+                }
+                out.extend(linked("object-linked", object_linked));
+                out.extend(linked("mesh-linked", mesh_linked));
                 out.extend(linked("fragment-linked", fragment_linked));
             }
             PipelineShape::Compute {
@@ -3840,6 +4083,105 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 Err(e) => refused(format!("the platform answered an error: {}", e.description)),
             })
         }
+        PipelineShape::Mesh(shape) => {
+            let MeshShape {
+                object,
+                mesh,
+                fragment,
+                label,
+                object_linked,
+                mesh_linked,
+                fragment_linked,
+                fields,
+            } = *shape;
+            // Each stage's function: a library being made is waited for here, and one the
+            // platform refused, or an entry point it makes no function of, refuses the pipeline.
+            let function =
+                |stage: &str,
+                 (library, name, constants): StageRef<P>|
+                 -> RaiseResult<Result<P::Function, String>> {
+                    let Some(library) = library.resolve() else {
+                        return Ok(Err(no_library(stage)));
+                    };
+                    Ok(specialised::<P>(&library, &name, &constants)?
+                        .ok_or_else(|| no_function(&name)))
+                };
+            let object = match object.map(|f| function("object", f)).transpose()? {
+                None => None,
+                Some(Ok(made)) => Some(made),
+                Some(Err(reason)) => return Ok(refused(reason)),
+            };
+            let mesh = match function("mesh", mesh)? {
+                Ok(made) => made,
+                Err(reason) => return Ok(refused(reason)),
+            };
+            let fragment = match fragment.map(|f| function("fragment", f)).transpose()? {
+                None => None,
+                Some(Ok(made)) => Some(made),
+                Some(Err(reason)) => return Ok(refused(reason)),
+            };
+            let object_linked = match linked_functions::<P>(object_linked)? {
+                Ok(linked) => linked,
+                Err(reason) => return Ok(refused(reason)),
+            };
+            let mesh_linked = match linked_functions::<P>(mesh_linked)? {
+                Ok(linked) => linked,
+                Err(reason) => return Ok(refused(reason)),
+            };
+            let fragment_linked = match linked_functions::<P>(fragment_linked)? {
+                Ok(linked) => linked,
+                Err(reason) => return Ok(refused(reason)),
+            };
+            let desc = FullMeshRenderPipelineDesc::<P> {
+                label: label.as_deref(),
+                object: object.as_ref(),
+                mesh: &mesh,
+                fragment: fragment.as_ref(),
+                colors: fields.colors,
+                depth_pixel_format: fields.depth_pixel_format,
+                stencil_pixel_format: fields.stencil_pixel_format,
+                raster_sample_count: fields.raster_sample_count,
+                alpha_to_coverage: fields.alpha_to_coverage,
+                alpha_to_one: fields.alpha_to_one,
+                rasterization_enabled: fields.rasterization_enabled,
+                max_total_threads_per_object_threadgroup: fields
+                    .max_total_threads_per_object_threadgroup,
+                max_total_threads_per_mesh_threadgroup: fields
+                    .max_total_threads_per_mesh_threadgroup,
+                max_total_threadgroups_per_mesh_grid: fields.max_total_threadgroups_per_mesh_grid,
+                object_threadgroup_size_is_multiple_of_execution_width: fields
+                    .object_threadgroup_size_is_multiple_of_execution_width,
+                mesh_threadgroup_size_is_multiple_of_execution_width: fields
+                    .mesh_threadgroup_size_is_multiple_of_execution_width,
+                payload_memory_length: fields.payload_memory_length,
+                max_vertex_amplification_count: fields.max_vertex_amplification_count,
+                required_threads_per_object_threadgroup: fields
+                    .required_threads_per_object_threadgroup,
+                required_threads_per_mesh_threadgroup: fields.required_threads_per_mesh_threadgroup,
+                support_indirect_command_buffers: fields.support_indirect_command_buffers,
+                object_linked,
+                mesh_linked,
+                fragment_linked,
+            };
+            // A nil state or an `NSError` refuses; a refusal Metal answers with none dies at the
+            // send, inside the caller's refusal scope.
+            Ok(match device.new_mesh_render_pipeline_state_full(&desc) {
+                Ok(Some(pipeline)) => {
+                    let mut reflection = render_reflection::<P>(&pipeline, seqno, obj_id);
+                    reflection.kind = RGFX_PIPELINE_KIND_MESH;
+                    let mesh = mesh_reflection::<P>(&pipeline);
+                    let mut made = CompiledPipeline::made(
+                        obj_id,
+                        ObjHandle::RenderPipeline(pipeline),
+                        reflection,
+                    );
+                    made.mesh = Some(mesh);
+                    made
+                }
+                Ok(None) => refused("the platform answered nil".to_owned()),
+                Err(e) => refused(format!("the platform answered an error: {}", e.description)),
+            })
+        }
         PipelineShape::Compute {
             library,
             name,
@@ -3901,10 +4243,10 @@ fn small_chunks(r#type: u32, chunk: u32) -> Option<std::ops::Range<usize>> {
 pub(crate) fn refused_reply(message: &[u8]) -> Option<RgfxPipelineReflection> {
     let header = read::<RgfxMsgHeader>(message)?;
     let obj_id = u64::from_le_bytes(message.get(16..24)?.try_into().ok()?);
-    let kind = if header.r#type == RGFX_CMD_RENDER_PIPELINE_CREATE {
-        RGFX_PIPELINE_KIND_RENDER
-    } else {
-        RGFX_PIPELINE_KIND_COMPUTE
+    let kind = match header.r#type {
+        RGFX_CMD_RENDER_PIPELINE_CREATE => RGFX_PIPELINE_KIND_RENDER,
+        RGFX_CMD_MESH_RENDER_PIPELINE_CREATE => RGFX_PIPELINE_KIND_MESH,
+        _ => RGFX_PIPELINE_KIND_COMPUTE,
     };
     Some(refused_reflection(obj_id, header.seqno, kind))
 }
@@ -4058,6 +4400,27 @@ fn render_reflection<P: Platform>(
         status: RGFX_PIPELINE_OK,
         kind: RGFX_PIPELINE_KIND_RENDER,
         flags,
+    }
+}
+
+/// A made mesh render pipeline's limits, which its reply carries after its reflection: the
+/// state's own queries, each held in the wire's 32 bits (`maxTotalThreadgroupsPerMeshGrid`'s
+/// `NSUIntegerMax` as their highest value).
+fn mesh_reflection<P: Platform>(pipeline: &P::RenderPipeline) -> RgfxMeshPipelineReflection {
+    let u32_of = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+    RgfxMeshPipelineReflection {
+        max_total_threads_per_object_threadgroup: u32_of(
+            pipeline.max_total_threads_per_object_threadgroup(),
+        ),
+        max_total_threads_per_mesh_threadgroup: u32_of(
+            pipeline.max_total_threads_per_mesh_threadgroup(),
+        ),
+        object_thread_execution_width: u32_of(pipeline.object_thread_execution_width()),
+        mesh_thread_execution_width: u32_of(pipeline.mesh_thread_execution_width()),
+        max_total_threadgroups_per_mesh_grid: u32_of(
+            pipeline.max_total_threadgroups_per_mesh_grid(),
+        ),
+        reserved_14: 0,
     }
 }
 
@@ -6600,7 +6963,9 @@ mod tests {
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), region);
         let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
-        dec.set_reflection_sink(Arc::new(move |r| sink_replies.lock().push(r)));
+        dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
+            sink_replies.lock().push(r.reflection);
+        }));
         let air = [1u8, 2, 3, 4];
         let mut lib_msg = RgfxLibraryCreate {
             header: RgfxMsgHeader {
@@ -6862,6 +7227,180 @@ mod tests {
             panic!("{:?}", calls[1].args);
         };
         assert!(logged.contains("fragment: None"), "{logged}");
+    }
+
+    /// A `MESH_RENDER_PIPELINE_CREATE` of pipeline `obj_id` from library 1's `mmain` and, with
+    /// `object` and `fragment`, its `omain` and `fmain`: one BGRA8Unorm target, rasterizing where
+    /// it has a fragment function, a mesh threadgroup of at most 32 threads, a payload of 256 bytes
+    /// and the mesh threadgroup size required 4 x 1 x 1.
+    pub(super) fn mesh_create(obj_id: u64, object: bool, fragment: bool) -> Vec<u8> {
+        let head = size_of::<RgfxMeshRenderPipelineCreate>();
+        let mut tail = Vec::new();
+        let mut name = |n: &[u8], on: bool| -> (u64, u32, u32) {
+            if !on {
+                return (0, 0, 0);
+            }
+            let at = (head + tail.len()) as u32;
+            tail.extend_from_slice(n);
+            (1, at, n.len() as u32)
+        };
+        let (object_library, object_at, object_len) = name(b"omain", object);
+        let (mesh_library, mesh_at, mesh_len) = name(b"mmain", true);
+        let (fragment_library, fragment_at, fragment_len) = name(b"fmain", fragment);
+        let total = (head + tail.len()).next_multiple_of(8);
+        let mut colors = [RgfxColorAttachmentDesc::default(); 8];
+        colors[0].pixel_format = 80;
+        colors[0].write_mask = 0xf;
+        let m = RgfxMeshRenderPipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
+                size: total as u32,
+                seqno: 4,
+            },
+            obj_id,
+            object_library_obj_id: object_library,
+            mesh_library_obj_id: mesh_library,
+            fragment_library_obj_id: fragment_library,
+            object_name_offset: object_at,
+            object_name_len: object_len,
+            mesh_name_offset: mesh_at,
+            mesh_name_len: mesh_len,
+            fragment_name_offset: fragment_at,
+            fragment_name_len: fragment_len,
+            raster_sample_count: 1,
+            color_attachment_count: 1,
+            flags: if fragment {
+                RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED
+            } else {
+                0
+            },
+            max_total_threads_per_mesh_threadgroup: 32,
+            payload_memory_length: 256,
+            required_threads_per_mesh_threadgroup: [4, 1, 1],
+            colors,
+            ..RgfxMeshRenderPipelineCreate::default()
+        };
+        let mut bytes = m.as_bytes().to_vec();
+        bytes.extend_from_slice(&tail);
+        bytes.resize(total, 0);
+        bytes
+    }
+
+    /// A mesh render pipeline create reaches the platform's mesh creator with its descriptor, and
+    /// is answered with its reflection of the mesh kind and, after it, the state's mesh limits,
+    /// the reply's size counting them; an unbounded grid is the wire's highest. A create naming
+    /// no mesh function is malformed; one the platform refuses is a refused reply of the mesh
+    /// kind, with no limits after it
+    #[test]
+    fn a_mesh_render_create_is_answered_with_its_mesh_limits() {
+        use reims_vgpu_core::testkit::faults::Fault;
+        let (p, mut dec, _) = pipeline_decoder();
+        let device = p.device();
+        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let sink_replies = Arc::clone(&replies);
+        dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
+            sink_replies.lock().push(r.bytes());
+        }));
+        assert_eq!(
+            dec.decode(&device, &mesh_create(100, true, true)).unwrap(),
+            Ok(())
+        );
+        let calls = p
+            .call_log()
+            .calls_to("newRenderPipelineStateWithMeshDescriptor:options:reflection:error:");
+        let Arg::Val(logged) = &calls[0].args[0] else {
+            panic!("{:?}", calls[0].args);
+        };
+        for part in [
+            "object: Some(",
+            "fragment: Some(",
+            "max_total_threads_per_mesh_threadgroup: 32",
+            "payload_memory_length: 256",
+            "rasterization_enabled: true",
+        ] {
+            assert!(
+                logged.contains(part),
+                "{logged}
+lacks {part}"
+            );
+        }
+        let reply = replies.lock()[0].clone();
+        assert_eq!(
+            reply.len(),
+            size_of::<RgfxPipelineReflection>() + size_of::<RgfxMeshPipelineReflection>()
+        );
+        let (r, _) = RgfxPipelineReflection::read_from_prefix(&reply).unwrap();
+        assert_eq!(r.header.size as usize, reply.len());
+        assert_eq!(
+            (r.obj_id, r.status, r.kind),
+            (100, RGFX_PIPELINE_OK, RGFX_PIPELINE_KIND_MESH)
+        );
+        let (limits, _) = RgfxMeshPipelineReflection::read_from_prefix(
+            &reply[reims_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
+        )
+        .unwrap();
+        assert_eq!(
+            limits,
+            RgfxMeshPipelineReflection {
+                max_total_threads_per_object_threadgroup: 1024,
+                max_total_threads_per_mesh_threadgroup: 32,
+                object_thread_execution_width: 32,
+                mesh_thread_execution_width: 32,
+                max_total_threadgroups_per_mesh_grid: u32::MAX,
+                reserved_14: 0,
+            }
+        );
+
+        // No object stage: the fake answers no object limits, as an x86 Mac's Metal does.
+        assert_eq!(
+            dec.decode(&device, &mesh_create(101, false, false))
+                .unwrap(),
+            Ok(())
+        );
+        let reply = replies.lock()[1].clone();
+        let (limits, _) = RgfxMeshPipelineReflection::read_from_prefix(
+            &reply[reims_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                limits.max_total_threads_per_object_threadgroup,
+                limits.object_thread_execution_width
+            ),
+            (0, 0)
+        );
+
+        let mut nameless = mesh_create(102, false, true);
+        edit_head(&mut nameless, |m: &mut RgfxMeshRenderPipelineCreate| {
+            (m.mesh_library_obj_id, m.mesh_name_len) = (0, 0);
+        });
+        assert_eq!(
+            dec.decode(&device, &nameless).unwrap(),
+            Err(DecodeError::Malformed)
+        );
+
+        p.faults().at(
+            "MTLDevice",
+            "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:",
+            0,
+            Fault::Crash,
+        );
+        assert_eq!(
+            dec.decode(&device, &mesh_create(103, true, true)).unwrap(),
+            Err(DecodeError::Refused)
+        );
+        let reply = replies.lock().last().unwrap().clone();
+        assert_eq!(reply.len(), size_of::<RgfxPipelineReflection>());
+        let (r, _) = RgfxPipelineReflection::read_from_prefix(&reply).unwrap();
+        assert_eq!(
+            (r.obj_id, r.status, r.kind, r.header.size as usize),
+            (
+                103,
+                RGFX_PIPELINE_REFUSED,
+                RGFX_PIPELINE_KIND_MESH,
+                reply.len()
+            )
+        );
     }
 
     /// A pipeline create the decoder carries out at once (not on the device's compile pool) that
@@ -7388,8 +7927,10 @@ mod tests {
         );
         let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
-        dec.set_reflection_sink(Arc::new(move |r: RgfxPipelineReflection| {
-            sink_replies.lock().push((r.obj_id, r.status));
+        dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
+            sink_replies
+                .lock()
+                .push((r.reflection.obj_id, r.reflection.status));
         }));
         let caller =
             include_bytes!("../../../../reims-vgpu-vulkan/metallibs/linked_caller.metallib");
@@ -7670,8 +8211,10 @@ mod tests {
         );
         let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
-        dec.set_reflection_sink(Arc::new(move |r: RgfxPipelineReflection| {
-            sink_replies.lock().push((r.obj_id, r.status));
+        dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
+            sink_replies
+                .lock()
+                .push((r.reflection.obj_id, r.reflection.status));
         }));
         for (obj_id, bytes) in [(1, caller), (2, stitched)] {
             let mut m = RgfxLibraryCreate {
@@ -8631,7 +9174,9 @@ mod tests {
 
         let replies = Arc::new(Mutex::new(Vec::<RgfxPipelineReflection>::new()));
         let sink_replies = Arc::clone(&replies);
-        dec.set_reflection_sink(Arc::new(move |r| sink_replies.lock().push(r)));
+        dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
+            sink_replies.lock().push(r.reflection);
+        }));
 
         // A library the pipelines draw their functions from.
         let air = [1u8, 2, 3, 4];

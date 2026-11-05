@@ -40,10 +40,10 @@ use reims_graphics::wire::{
     RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
     RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_PAGES,
     RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER, RGFX_CMD_MANAGED_BUFFER_CREATE,
-    RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE,
-    RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER,
-    RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE,
-    RgfxObjectCreate,
+    RGFX_CMD_MANAGED_TEXTURE_CREATE, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
+    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+    RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE, RgfxObjectCreate,
 };
 use reims_vgpu_core::raise::{Origin, Raise, RaiseResult};
 
@@ -158,6 +158,7 @@ pub(crate) fn posted_create(message: &[u8]) -> Option<(u32, u64)> {
             | RGFX_CMD_TEXTURE_FROM_IOSURFACE
             | RGFX_CMD_VIDEO_SESSION_CREATE
             | RGFX_CMD_RENDER_PIPELINE_CREATE
+            | RGFX_CMD_MESH_RENDER_PIPELINE_CREATE
             | RGFX_CMD_COMPUTE_PIPELINE_CREATE
     );
     (posted && m.obj_id != 0).then_some((kind, m.obj_id))
@@ -169,6 +170,10 @@ pub(crate) enum Stage {
     Vertex,
     Fragment,
     Tile,
+    /// A mesh render pipeline's object stage.
+    Object,
+    /// A mesh render pipeline's mesh stage.
+    Mesh,
     Kernel,
     /// The encoder's own state: its pipeline, its depth/stencil state, its tessellation factors.
     Encoder,
@@ -335,6 +340,7 @@ mod tests {
             RGFX_CMD_MANAGED_BUFFER_CREATE,
             RGFX_CMD_SHARED_EVENT_CREATE,
             RGFX_CMD_RENDER_PIPELINE_CREATE,
+            RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
         ] {
             assert_eq!(posted_create(&create(kind, 5)), Some((kind, 5)));
         }

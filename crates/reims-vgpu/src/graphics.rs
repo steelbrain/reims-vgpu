@@ -41,9 +41,9 @@ use reims_graphics::wire::{
     RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE,
     RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
-    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_RENDER_PIPELINE_CREATE,
-    RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
-    RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
+    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT,
+    RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
     RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_HEAP_OVER_PAGES,
     RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
@@ -55,7 +55,7 @@ use reims_graphics::wire::{
     RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
     RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
     RgfxDisplayColor, RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
-    RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
+    RgfxPageRun, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -85,9 +85,9 @@ use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::worker::{Unsettled, Worker};
 use crate::graphics::decode::{
     Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, GraphicsDecoder, LibraryJob,
-    LibraryStart, MadeLibrary, PipelineJob, ReflectionSink, ScheduledSink, SignalSink, Sinks,
-    SubmittedSink, SurfacePresent, compile_refusing, complete, make_library, refused_reply,
-    refusing,
+    LibraryStart, MadeLibrary, PipelineJob, PipelineReply, ReflectionSink, ScheduledSink,
+    SignalSink, Sinks, SubmittedSink, SurfacePresent, compile_refusing, complete, make_library,
+    refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
@@ -1125,7 +1125,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         self.pages_buffers
             .wait(pages_context(sender_context(poster, message)));
         match r#type {
-            RGFX_CMD_RENDER_PIPELINE_CREATE | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
+            RGFX_CMD_RENDER_PIPELINE_CREATE
+            | RGFX_CMD_MESH_RENDER_PIPELINE_CREATE
+            | RGFX_CMD_COMPUTE_PIPELINE_CREATE => {
                 self.start_pipeline(poster, message);
                 return;
             }
@@ -1255,8 +1257,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             submitted_poster.post(record.as_bytes());
         });
         let reflection_poster = poster.clone();
-        let reflection: ReflectionSink = Arc::new(move |record: RgfxPipelineReflection| {
-            reflection_poster.post(record.as_bytes());
+        let reflection: ReflectionSink = Arc::new(move |reply: PipelineReply| {
+            reflection_poster.post(&reply.bytes());
         });
         Sinks {
             completion: Some(completion),
@@ -1528,7 +1530,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
                 );
             }
-            let reflection = compiled.reflection;
+            let reply = compiled.reply();
             // Stored where no destroy, close or reset cancelled it, under the lock of its table,
             // which its destroy removes from after cancelling it; a reset waits for the store.
             {
@@ -1537,7 +1539,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     .finish_pipeline_if(compiled, || self.pending.live(obj_id, began));
                 self.pending.finish(obj_id, began);
             }
-            poster.post(reflection.as_bytes());
+            poster.post(&reply.bytes());
         });
     }
 

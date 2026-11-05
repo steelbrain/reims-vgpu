@@ -220,7 +220,15 @@ pub(crate) fn draws(tag: u16) -> bool {
             | RGFX_OP_RENDER_DISPATCH_THREADS_PER_TILE_IN_REGION_INDEX
             | RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER
             | RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT
+            | RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS
+            | RGFX_OP_RENDER_DRAW_MESH_THREADS
+            | RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT
     )
+}
+
+/// A grid or threadgroup size of the wire (width, height, depth) as Metal's `MTLSize`.
+fn size([width, height, depth]: [u64; 3]) -> MtlSize {
+    MtlSize::new(width, height, depth)
 }
 
 /// What the render ops' checks read of the open encoder's pass, which its
@@ -1395,6 +1403,270 @@ pub(crate) fn decode_op<P: Platform>(
             )?;
         }
 
+        // ---- The object and mesh stages, and the mesh draws ----
+        RGFX_OP_RENDER_SET_OBJECT_BUFFER_OFFSET => {
+            let m: RgfxOpSetObjectBufferOffset = body(tag, payload)?;
+            // The slot holds nil for a refused buffer ([`refused`]): nothing to offset.
+            if pass
+                .refused
+                .holds(Slot::new(Stage::Object, Bound::Buffer, m.index))
+            {
+                return Ok(true);
+            }
+            enc.encode(
+                on,
+                RenderCmd::SetObjectBufferOffset {
+                    offset: m.offset,
+                    index: m.index,
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_OBJECT_BUFFERS => {
+            let m: RgfxOpSetObjectBuffers = body(tag, payload)?;
+            let es: Vec<RgfxBufferBinding> = elems(
+                tag,
+                payload,
+                size_of::<RgfxOpSetObjectBuffers>(),
+                m.range_length as usize,
+            )?;
+            let (named, offsets) =
+                resolve_buffers(objs, &es, (&pass.refused, Stage::Object, m.range_location))?;
+            let buffers: Vec<Option<&P::Buffer>> = named;
+            enc.encode(
+                on,
+                RenderCmd::SetObjectBuffers {
+                    buffers: &buffers,
+                    offsets: &offsets,
+                    range: NsRange {
+                        location: m.range_location,
+                        length: m.range_length,
+                    },
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_OBJECT_TEXTURES => {
+            let m: RgfxOpSetObjectTextures = body(tag, payload)?;
+            let es: Vec<RgfxTextureBinding> = elems(
+                tag,
+                payload,
+                size_of::<RgfxOpSetObjectTextures>(),
+                m.range_length as usize,
+            )?;
+            let named =
+                resolve_textures(objs, &es, (&pass.refused, Stage::Object, m.range_location))?;
+            let textures: Vec<Option<&P::Texture>> = named;
+            enc.encode(
+                on,
+                RenderCmd::SetObjectTextures {
+                    textures: &textures,
+                    range: NsRange {
+                        location: m.range_location,
+                        length: m.range_length,
+                    },
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES => {
+            let m: RgfxOpSetObjectSamplerStates = body(tag, payload)?;
+            let es: Vec<RgfxSamplerBinding> = elems(
+                tag,
+                payload,
+                size_of::<RgfxOpSetObjectSamplerStates>(),
+                m.range_length as usize,
+            )?;
+            let named =
+                resolve_samplers(objs, &es, (&pass.refused, Stage::Object, m.range_location))?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
+            enc.encode(
+                on,
+                RenderCmd::SetObjectSamplerStates {
+                    samplers: &samplers,
+                    range: NsRange {
+                        location: m.range_location,
+                        length: m.range_length,
+                    },
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES_LOD_CLAMPS => {
+            let m: RgfxOpSetObjectSamplerStatesLodClamps = body(tag, payload)?;
+            let es: Vec<RgfxSamplerLodBinding> = elems(
+                tag,
+                payload,
+                size_of::<RgfxOpSetObjectSamplerStatesLodClamps>(),
+                m.range_length as usize,
+            )?;
+            let (named, mins, maxs) =
+                resolve_samplers_lod(objs, &es, (&pass.refused, Stage::Object, m.range_location))?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
+            enc.encode(
+                on,
+                RenderCmd::SetObjectSamplerStatesLodClamps {
+                    samplers: &samplers,
+                    lod_min_clamps: &mins,
+                    lod_max_clamps: &maxs,
+                    range: NsRange {
+                        location: m.range_location,
+                        length: m.range_length,
+                    },
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_MESH_BUFFER_OFFSET => {
+            let m: RgfxOpSetMeshBufferOffset = body(tag, payload)?;
+            // The slot holds nil for a refused buffer ([`refused`]): nothing to offset.
+            if pass
+                .refused
+                .holds(Slot::new(Stage::Mesh, Bound::Buffer, m.index))
+            {
+                return Ok(true);
+            }
+            enc.encode(
+                on,
+                RenderCmd::SetMeshBufferOffset {
+                    offset: m.offset,
+                    index: m.index,
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_MESH_BUFFERS => {
+            let m: RgfxOpSetMeshBuffers = body(tag, payload)?;
+            let es: Vec<RgfxBufferBinding> = elems(
+                tag,
+                payload,
+                size_of::<RgfxOpSetMeshBuffers>(),
+                m.range_length as usize,
+            )?;
+            let (named, offsets) =
+                resolve_buffers(objs, &es, (&pass.refused, Stage::Mesh, m.range_location))?;
+            let buffers: Vec<Option<&P::Buffer>> = named;
+            enc.encode(
+                on,
+                RenderCmd::SetMeshBuffers {
+                    buffers: &buffers,
+                    offsets: &offsets,
+                    range: NsRange {
+                        location: m.range_location,
+                        length: m.range_length,
+                    },
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_MESH_TEXTURES => {
+            let m: RgfxOpSetMeshTextures = body(tag, payload)?;
+            let es: Vec<RgfxTextureBinding> = elems(
+                tag,
+                payload,
+                size_of::<RgfxOpSetMeshTextures>(),
+                m.range_length as usize,
+            )?;
+            let named =
+                resolve_textures(objs, &es, (&pass.refused, Stage::Mesh, m.range_location))?;
+            let textures: Vec<Option<&P::Texture>> = named;
+            enc.encode(
+                on,
+                RenderCmd::SetMeshTextures {
+                    textures: &textures,
+                    range: NsRange {
+                        location: m.range_location,
+                        length: m.range_length,
+                    },
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES => {
+            let m: RgfxOpSetMeshSamplerStates = body(tag, payload)?;
+            let es: Vec<RgfxSamplerBinding> = elems(
+                tag,
+                payload,
+                size_of::<RgfxOpSetMeshSamplerStates>(),
+                m.range_length as usize,
+            )?;
+            let named =
+                resolve_samplers(objs, &es, (&pass.refused, Stage::Mesh, m.range_location))?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
+            enc.encode(
+                on,
+                RenderCmd::SetMeshSamplerStates {
+                    samplers: &samplers,
+                    range: NsRange {
+                        location: m.range_location,
+                        length: m.range_length,
+                    },
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES_LOD_CLAMPS => {
+            let m: RgfxOpSetMeshSamplerStatesLodClamps = body(tag, payload)?;
+            let es: Vec<RgfxSamplerLodBinding> = elems(
+                tag,
+                payload,
+                size_of::<RgfxOpSetMeshSamplerStatesLodClamps>(),
+                m.range_length as usize,
+            )?;
+            let (named, mins, maxs) =
+                resolve_samplers_lod(objs, &es, (&pass.refused, Stage::Mesh, m.range_location))?;
+            let samplers: Vec<Option<&P::SamplerState>> = named;
+            enc.encode(
+                on,
+                RenderCmd::SetMeshSamplerStatesLodClamps {
+                    samplers: &samplers,
+                    lod_min_clamps: &mins,
+                    lod_max_clamps: &maxs,
+                    range: NsRange {
+                        location: m.range_location,
+                        length: m.range_length,
+                    },
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_SET_OBJECT_THREADGROUP_MEMORY_LENGTH => {
+            let m: RgfxOpSetObjectThreadgroupMemoryLength = body(tag, payload)?;
+            enc.encode(
+                on,
+                RenderCmd::SetObjectThreadgroupMemoryLength {
+                    length: m.length,
+                    index: m.index,
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS => {
+            let m: RgfxOpDrawMeshThreadgroups = body(tag, payload)?;
+            enc.encode(
+                on,
+                RenderCmd::DrawMeshThreadgroups {
+                    threadgroups_per_grid: size(m.threadgroups_per_grid),
+                    threads_per_object_threadgroup: size(m.threads_per_object_threadgroup),
+                    threads_per_mesh_threadgroup: size(m.threads_per_mesh_threadgroup),
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_DRAW_MESH_THREADS => {
+            let m: RgfxOpDrawMeshThreads = body(tag, payload)?;
+            enc.encode(
+                on,
+                RenderCmd::DrawMeshThreads {
+                    threads_per_grid: size(m.threads_per_grid),
+                    threads_per_object_threadgroup: size(m.threads_per_object_threadgroup),
+                    threads_per_mesh_threadgroup: size(m.threads_per_mesh_threadgroup),
+                },
+            )?;
+        }
+        RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT => {
+            let m: RgfxOpDrawMeshThreadgroupsIndirect = body(tag, payload)?;
+            // The indirect buffer must name an object.
+            let indirect_buffer = objs.require_buffer(m.indirect_buffer_obj_id)?;
+            enc.encode(
+                on,
+                RenderCmd::DrawMeshThreadgroupsIndirect {
+                    indirect_buffer,
+                    indirect_buffer_offset: m.indirect_buffer_offset,
+                    threads_per_object_threadgroup: size(m.threads_per_object_threadgroup),
+                    threads_per_mesh_threadgroup: size(m.threads_per_mesh_threadgroup),
+                },
+            )?;
+        }
+
         // ---- Array-tailed: viewports, scissor rects, amplification ----
         RGFX_OP_RENDER_SET_SCISSOR_RECTS => {
             let m: RgfxOpSetScissorRects = body(tag, payload)?;
@@ -2565,6 +2837,165 @@ mod tests {
                 ),
                 "useResources:count:usage:stages:",
             ),
+            // The object and mesh stages', and the mesh draws.
+            (
+                RGFX_OP_RENDER_SET_OBJECT_BUFFERS,
+                tailed(
+                    range.as_bytes(),
+                    &[RgfxBufferBinding {
+                        buffer_obj_id: BUF_VERTEX,
+                        offset: 0,
+                    }
+                    .as_bytes()],
+                ),
+                "setObjectBuffers:offsets:withRange:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_MESH_BUFFERS,
+                tailed(
+                    range.as_bytes(),
+                    &[RgfxBufferBinding {
+                        buffer_obj_id: BUF_VERTEX,
+                        offset: 16,
+                    }
+                    .as_bytes()],
+                ),
+                "setMeshBuffers:offsets:withRange:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_OBJECT_BUFFER_OFFSET,
+                RgfxOpSetObjectBufferOffset {
+                    offset: 32,
+                    index: 0,
+                }
+                .as_bytes()
+                .to_vec(),
+                "setObjectBufferOffset:atIndex:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_MESH_BUFFER_OFFSET,
+                RgfxOpSetMeshBufferOffset {
+                    offset: 48,
+                    index: 0,
+                }
+                .as_bytes()
+                .to_vec(),
+                "setMeshBufferOffset:atIndex:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_OBJECT_TEXTURES,
+                tailed(
+                    range.as_bytes(),
+                    &[RgfxTextureBinding {
+                        texture_obj_id: TEX_A,
+                    }
+                    .as_bytes()],
+                ),
+                "setObjectTextures:withRange:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_MESH_TEXTURES,
+                tailed(
+                    range.as_bytes(),
+                    &[RgfxTextureBinding {
+                        texture_obj_id: TEX_B,
+                    }
+                    .as_bytes()],
+                ),
+                "setMeshTextures:withRange:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES,
+                tailed(
+                    range.as_bytes(),
+                    &[RgfxSamplerBinding {
+                        sampler_obj_id: SAMP_A,
+                    }
+                    .as_bytes()],
+                ),
+                "setObjectSamplerStates:withRange:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES,
+                tailed(
+                    range.as_bytes(),
+                    &[RgfxSamplerBinding {
+                        sampler_obj_id: SAMP_B,
+                    }
+                    .as_bytes()],
+                ),
+                "setMeshSamplerStates:withRange:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_OBJECT_SAMPLER_STATES_LOD_CLAMPS,
+                tailed(
+                    range.as_bytes(),
+                    &[RgfxSamplerLodBinding {
+                        sampler_obj_id: SAMP_A,
+                        lod_min_clamp_bits: 0.0f32.to_bits(),
+                        lod_max_clamp_bits: 8.0f32.to_bits(),
+                    }
+                    .as_bytes()],
+                ),
+                "setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_MESH_SAMPLER_STATES_LOD_CLAMPS,
+                tailed(
+                    range.as_bytes(),
+                    &[RgfxSamplerLodBinding {
+                        sampler_obj_id: SAMP_B,
+                        lod_min_clamp_bits: 1.0f32.to_bits(),
+                        lod_max_clamp_bits: 4.0f32.to_bits(),
+                    }
+                    .as_bytes()],
+                ),
+                "setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:",
+            ),
+            (
+                RGFX_OP_RENDER_SET_OBJECT_THREADGROUP_MEMORY_LENGTH,
+                RgfxOpSetObjectThreadgroupMemoryLength {
+                    length: 256,
+                    index: 0,
+                }
+                .as_bytes()
+                .to_vec(),
+                "setObjectThreadgroupMemoryLength:atIndex:",
+            ),
+            (
+                RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS,
+                RgfxOpDrawMeshThreadgroups {
+                    threadgroups_per_grid: [4, 1, 1],
+                    threads_per_object_threadgroup: [32, 1, 1],
+                    threads_per_mesh_threadgroup: [64, 1, 1],
+                }
+                .as_bytes()
+                .to_vec(),
+                "drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+            ),
+            (
+                RGFX_OP_RENDER_DRAW_MESH_THREADS,
+                RgfxOpDrawMeshThreads {
+                    threads_per_grid: [128, 1, 1],
+                    threads_per_object_threadgroup: [32, 1, 1],
+                    threads_per_mesh_threadgroup: [64, 1, 1],
+                }
+                .as_bytes()
+                .to_vec(),
+                "drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+            ),
+            (
+                RGFX_OP_RENDER_DRAW_MESH_THREADGROUPS_INDIRECT,
+                RgfxOpDrawMeshThreadgroupsIndirect {
+                    indirect_buffer_obj_id: BUF_INDIRECT,
+                    indirect_buffer_offset: 0,
+                    threads_per_object_threadgroup: [32, 1, 1],
+                    threads_per_mesh_threadgroup: [64, 1, 1],
+                }
+                .as_bytes()
+                .to_vec(),
+                "drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+            ),
         ];
 
         let mark = p.call_log().mark();
@@ -2580,7 +3011,7 @@ mod tests {
         let got = p.call_log().sels_since(mark);
         assert_eq!(got, expected);
         // The whole remaining set was exercised.
-        assert_eq!(expected.len(), 72);
+        assert_eq!(expected.len(), 86);
     }
 
     /// An array-tailed op resolves each element and passes the slices through: the
