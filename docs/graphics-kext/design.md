@@ -1383,7 +1383,14 @@ what an app then sees of it, its presented handlers, `presentedTime` and
 guest and on a Mac alike.
 
 **Boot display.** The device's option ROM gives firmware a GOP framebuffer in
-BAR2, and the kext takes the display over when it starts.
+BAR2, and the kext takes the display over when it starts. At its start, before
+IOFramebuffer moves the console onto it, `ReimsGraphics` records the boot
+framebuffer the platform expert's console info names as its
+`RgfxBootFramebuffer` property (`Answered`, `Address`, `Width`, `Height`,
+`RowBytes`, `Depth`; `guest/kext/src/RgfxBootConsole.hpp`), so a boot's check
+reads whether the firmware gave the OS a framebuffer from the registry, long
+after the kernel's message ring has wrapped: `ioreg -r -c ReimsGraphics -l |
+grep RgfxBootFramebuffer`. A boot with no GOP mode has an `Address` of 0.
 
 **QEMU's console.** `reims-graphics-pci`'s QEMU console carries the window's
 input, and shows what the display shows: at each of its updates the device reads

@@ -368,6 +368,9 @@ private:
 	void quiesce();
 	void teardown();
 
+	// The boot framebuffer the OS had at the start, published (RgfxBootConsole.hpp).
+	void publishBootConsole();
+
 	// Modes and scanout.
 	static UInt32 strideFor(UInt32 width);
 	UInt64 scanoutLimit() const;

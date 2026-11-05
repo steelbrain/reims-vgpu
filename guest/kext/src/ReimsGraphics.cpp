@@ -5,10 +5,12 @@
 
 #include "ReimsGraphics.hpp"
 #include "RgfxAccelerator.hpp"
+#include "RgfxBootConsole.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxPipeColor.hpp"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOUserClient.h>
 #include <kern/clock.h>
 #include <kern/task.h>
@@ -1016,6 +1018,8 @@ bool ReimsGraphics::start(IOService *provider)
 	pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!pci)
 		return false;
+	// Before IOFramebuffer's start can move the console onto this framebuffer.
+	publishBootConsole();
 	submitLock = IOSimpleLockAlloc();
 	interruptLock = IOSimpleLockAlloc();
 	stateLock = IOLockAlloc();
@@ -1266,6 +1270,42 @@ void ReimsGraphics::quiesce()
 		kick->disable();
 		workLoop->removeEventSource(kick);
 	}
+}
+
+// The boot framebuffer the platform expert's console info names now, before IOFramebuffer moves
+// the console onto this framebuffer, as the RgfxBootFramebuffer property (RgfxBootConsole.hpp),
+// and once in the log.
+void ReimsGraphics::publishBootConsole()
+{
+	PE_Video video = {};
+	IOPlatformExpert *platform = getPlatform();
+	const bool answered = platform && platform->getConsoleInfo(&video) == kIOReturnSuccess;
+	const RgfxBootConsole boot = rgfxBootConsole(answered, video.v_baseAddr, video.v_rowBytes,
+	                                             video.v_width, video.v_height, video.v_depth);
+	IOLog("ReimsGraphics: boot framebuffer %s 0x%llx (%ux%u, %u bytes a row, %u bits)\n",
+	      boot.answered ? "at" : "unknown,", boot.address, boot.width, boot.height, boot.rowBytes,
+	      boot.depth);
+	OSDictionary *dict = OSDictionary::withCapacity(6);
+	if (!dict)
+		return;
+	dict->setObject("Answered", boot.answered ? kOSBooleanTrue : kOSBooleanFalse);
+	const struct {
+		const char *key;
+		UInt64 value;
+		UInt32 bits;
+	} fields[] = {
+		{"Address", boot.address, 64}, {"Width", boot.width, 32},
+		{"Height", boot.height, 32},   {"RowBytes", boot.rowBytes, 32},
+		{"Depth", boot.depth, 32},
+	};
+	for (const auto &f : fields) {
+		if (OSNumber *n = OSNumber::withNumber(f.value, f.bits)) {
+			dict->setObject(f.key, n);
+			n->release();
+		}
+	}
+	setProperty(kRgfxBootFramebufferKey, dict);
+	dict->release();
 }
 
 // A start refused before it took the device leaves it unreset, writing nothing to a device whose
