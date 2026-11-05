@@ -1013,8 +1013,15 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
 }
 
 /// A doorbell write's answer allocates nothing on the ringing thread, the guest's vCPU: each of
-/// several buffers that ask is answered inside the write, which the allocator counts, its
+/// four buffers that ask is answered inside the write, which the allocator counts, its
 /// `CB_SUBMITTED` posted and its vector raised there, then completed by its queue's thread.
+///
+/// The write answers a buffer only where the queue's thread holds neither its take nor its ring
+/// (`answer_on_doorbell`), which `consumer_idle` does not show alone: a wake that came while the
+/// thread was awake (the ring of the buffer before) has it wake once more and look at the ring,
+/// though `consumer_idle` read 1 before it woke. A buffer the write left is answered by the
+/// thread, as any is, and the next buffer is rung, up to 64 (measured on the M3 Max: in 1 of 30
+/// runs of the package's graphics tests, the write left buffer 101).
 #[test]
 fn a_doorbell_s_answer_allocates_nothing() {
     use std::sync::atomic::AtomicUsize;
@@ -1052,7 +1059,11 @@ fn a_doorbell_s_answer_allocates_nothing() {
         RGFX_STATUS_OK
     );
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
-    for cb in 100..104 {
+    let mut answered = 0;
+    for cb in 100..164 {
+        if answered == 4 {
+            break;
+        }
         // The queue's thread sleeps with the ring idle, as the guest rings for a buffer.
         for _ in 0..2000 {
             // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
@@ -1071,15 +1082,20 @@ fn a_doorbell_s_answer_allocates_nothing() {
         let ((), allocations) = crate::counted::allocations_in(|| {
             device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
         });
-        assert!(
-            ring.has_event(),
-            "buffer {cb} was not answered in the write"
-        );
-        assert!(
-            raised.load(Ordering::SeqCst) > raises,
-            "no raise in the write"
-        );
-        assert_eq!(allocations, 0, "the answer of buffer {cb} allocated");
+        if ring.has_event() {
+            assert!(
+                raised.load(Ordering::SeqCst) > raises,
+                "no raise in the write"
+            );
+            assert_eq!(allocations, 0, "the answer of buffer {cb} allocated");
+            answered += 1;
+        } else {
+            // The queue's thread held the ring: it answers the buffer itself.
+            assert!(
+                eventually(|| ring.has_event()),
+                "buffer {cb} was never answered"
+            );
+        }
         let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
         assert_eq!(
             (posted.header.r#type, posted.cb_obj_id),
@@ -1095,6 +1111,7 @@ fn a_doorbell_s_answer_allocates_nothing() {
         let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
         assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
     }
+    assert_eq!(answered, 4, "the writes answered {answered} buffers of 64");
 }
 
 /// The name of the thread each raise that called the device ran on, once its calls returned.
