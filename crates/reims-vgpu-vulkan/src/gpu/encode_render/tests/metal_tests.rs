@@ -6091,6 +6091,10 @@ fn resolving_pass<P: Platform>(
 /// resolve's writes (the samples `MultisampleResolve` leaves there:
 /// `samples_resolved_into_the_twin_are_metals`)
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-rounded-resolve, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn resolves_into_other_formats_are_metals_or_die_named() {
     let (p, d) = (platform(), dev());
     let metal = MetalPlatform::system_default_device()
@@ -6373,6 +6377,10 @@ fn resolves_into_other_formats_are_metals_or_die_named() {
 /// resolve of its own, whose texels are Metal's
 /// (`resolves_into_other_formats_are_metals_or_die_named`)
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-rounded-resolve, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn samples_resolved_into_the_twin_are_metals() {
     let (p, d) = (platform(), dev());
     let Some(md) = MetalPlatform::system_default_device() else {
