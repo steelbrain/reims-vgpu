@@ -8845,6 +8845,116 @@ fn a_reset_waits_for_a_close_s_slow_release() {
     assert!(world.live("MTLSamplerState").is_empty());
 }
 
+/// A colour matrix of `rows` for display 0's transaction 1, in one `DISPLAY_COLOR` part.
+#[cfg(target_os = "macos")]
+fn color_matrix(rows: [[f32; 4]; 3]) -> Vec<u8> {
+    let mut bytes = RgfxDisplayColor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_DISPLAY_COLOR,
+            size: 40 + 16 * 3,
+            seqno: 0,
+        },
+        display: 0,
+        transaction_id: 1,
+        stage: RGFX_COLOR_MATRIX,
+        entry_count: 3,
+        first_entry: 0,
+        part_entries: 3,
+    }
+    .as_bytes()
+    .to_vec();
+    for row in rows {
+        let [x, y, z, w] = row.map(f32::to_bits);
+        bytes.extend_from_slice(RgfxColorEntry { x, y, z, w }.as_bytes());
+    }
+    bytes
+}
+
+/// On Metal, a display colour of the identity matrix reads as no colour: the scanout's bytes as
+/// the guest wrote them, its alpha included (a colour pass would make it opaque), with each of
+/// blue, green and red taking all 256 values; a matrix off the identity still draws through the
+/// colour, which swaps red and blue here and makes every pixel opaque
+#[cfg(target_os = "macos")]
+#[test]
+fn on_metal_an_identity_colour_matrix_reads_as_no_colour() {
+    let platform = reims_vgpu_metal::MetalPlatform::process();
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: None,
+            scanout_written: None,
+        },
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(platform, config).unwrap();
+    let (width, height, stride) = (256usize, 4usize, 1024usize);
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let x = x as u8;
+        let y = y as u8;
+        [x, x.wrapping_mul(37).wrapping_add(y), 255 - x, x ^ 0x5a ^ y]
+    };
+    // SAFETY: the scanout lies in the device's region, mapped while the device lives.
+    unsafe {
+        let base = device.region_base().add(RGFX_ALLOCATIONS_OFFSET as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let p = pixel(x, y);
+                std::ptr::copy_nonoverlapping(p.as_ptr(), base.add(y * stride + x * 4), 4);
+            }
+        }
+    }
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(256, 4, 1024)),
+        RGFX_STATUS_OK
+    );
+    let keep = || {
+        let mut present = RgfxPresentSurface::read_from_bytes(&present_surface(0)).unwrap();
+        present.flags = RGFX_PRESENT_KEEP;
+        present.as_bytes().to_vec()
+    };
+    let read = || {
+        let mut dst = vec![7u8; 1920 * 1080 * 4];
+        assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .map(|(x, y)| <[u8; 4]>::try_from(&dst[(y * 1920 + x) * 4..][..4]).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let guest_pixels: Vec<[u8; 4]> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| pixel(x, y)))
+        .collect();
+    assert_eq!(read(), guest_pixels, "with no colour");
+
+    guest.send(
+        &device,
+        color_matrix([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, -0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]),
+    );
+    assert_eq!(answered(&device, &mut guest, keep()), RGFX_STATUS_OK);
+    assert!(device.control.presented.color().1.is_identity());
+    assert_eq!(read(), guest_pixels, "with the identity matrix");
+
+    guest.send(
+        &device,
+        color_matrix([
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ]),
+    );
+    assert_eq!(answered(&device, &mut guest, keep()), RGFX_STATUS_OK);
+    let swapped: Vec<[u8; 4]> = guest_pixels
+        .iter()
+        .map(|&[b, g, r, _]| [r, g, b, 0xff])
+        .collect();
+    assert_eq!(read(), swapped, "with red and blue swapped");
+}
+
 /// `copyFromTexture:...toTexture:...`, a presented surface's copy into a drawable.
 const SURFACE_COPY: &str = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:\
                             toTexture:destinationSlice:destinationLevel:destinationOrigin:";

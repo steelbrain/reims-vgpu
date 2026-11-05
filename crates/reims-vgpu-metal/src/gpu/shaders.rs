@@ -741,6 +741,110 @@ mod tests {
         })
     }
 
+    /// The identity matrix changes no pixel, so the host may leave it out (`reims-vgpu`'s
+    /// `graphics/color.rs` stages it off): drawn through it, with or without gamma tables around
+    /// it, a frame gives the bytes it gives without it, for every level of an 8-bit and a 10-bit
+    /// frame, every half in [0, 2) of a float one, and every byte of the scanout, each channel
+    #[test]
+    fn the_identity_matrix_changes_no_pixel() {
+        const IDENTITY: [[f32; 4]; 3] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        let d = device();
+        let pre = curve(256, |x| [x * x, x.sqrt(), x]);
+        let post = curve(1024, |x| [x.powf(1.0 / 2.2), x, 1.0 - x]);
+        let colours = [
+            (
+                PipeColor {
+                    matrix: Some(IDENTITY),
+                    tables: [&[], &[], &[]],
+                },
+                PipeColor {
+                    matrix: None,
+                    tables: [&[], &[], &[]],
+                },
+            ),
+            (
+                PipeColor {
+                    matrix: Some(IDENTITY),
+                    tables: [&[], &pre, &post],
+                },
+                PipeColor {
+                    matrix: None,
+                    tables: [&[], &pre, &post],
+                },
+            ),
+        ];
+
+        // 8-bit: each channel takes all 256 levels.
+        let px: Vec<[u8; 4]> = (0..=255u8)
+            .map(|i| [i, 255 - i, i.wrapping_mul(37), i])
+            .collect();
+        let rgba8 = rgba8_frame(&d, &px, 256, 1);
+        // 10-bit: each channel all 1024, R in the low bits.
+        let (w10, h10) = (32, 32);
+        let px10: Vec<u32> = (0..1024u32)
+            .map(|i| i | ((1023 - i) << 10) | ((i * 7 % 1024) << 20) | ((i % 4) << 30))
+            .collect();
+        let rgb10 = texture(d.get(), MTLPixelFormat::RGB10A2Unorm, w10, h10);
+        upload(&rgb10, &px10, w10, h10, w10 * 4, 0);
+        // Halves: every bit pattern from 0 to 0x3fff, 0 to just under 2, denormals, 0.5 and 1
+        // among them, a channel each from another start.
+        let (wf, hf) = (128, 128);
+        let pxf: Vec<[u16; 4]> = (0..0x4000u16)
+            .map(|i| [i, 0x3fff - i, i.wrapping_mul(7) & 0x3fff, 0x3c00])
+            .collect();
+        let half = texture(d.get(), MTLPixelFormat::RGBA16Float, wf, hf);
+        upload(&half, &pxf, wf, hf, wf * 8, 0);
+        for (identity, none) in &colours {
+            for (name, frame) in [("8-bit", &rgba8), ("10-bit", &rgb10), ("half", &half)] {
+                let a = pipe_color(&d, frame, identity);
+                let b = pipe_color(&d, frame, none);
+                assert!(a == b, "a {name} frame changed under the identity");
+            }
+        }
+        let rgba8_out = pipe_color(&d, &rgba8, &colours[0].1);
+        let opaque: Vec<[u8; 4]> = px.iter().map(|&[r, g, b, _]| [b, g, r, 0xff]).collect();
+        assert_eq!(
+            rgba8_out, opaque,
+            "an 8-bit frame through no stage is its own bytes"
+        );
+
+        // The scanout, in place: BGRA bytes, each channel all 256 levels.
+        let bytes: Vec<u8> = px.iter().flat_map(|&[r, g, b, a]| [b, g, r, a]).collect();
+        let scanout = shared_buffer(&d, &bytes);
+        let at: Vec<u8> = [0u32, 0, 256, 0]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let at = shared_buffer(&d, &at);
+        let draw = |color: &PipeColor<'_>| {
+            color_pass(
+                &d,
+                (256, 1),
+                "displayPipeColorScanoutFragment",
+                color,
+                None,
+                |enc| {
+                    // SAFETY: live buffers at the indices the fragment reads.
+                    unsafe {
+                        enc.setFragmentBuffer_offset_atIndex(Some(&scanout), 0, 4);
+                        enc.setFragmentBuffer_offset_atIndex(Some(&at), 0, 5);
+                    }
+                },
+            )
+        };
+        for (identity, none) in &colours {
+            assert!(
+                draw(identity) == draw(none),
+                "the scanout changed under the identity"
+            );
+        }
+        assert_eq!(draw(&colours[0].1), opaque);
+    }
+
     /// The scanout's colour function reads the guest's BGRA8 pixels in place from its buffer:
     /// its first pixel past a word offset, its rows a stride apart, drawn one target pixel each
     /// at the viewport's corner; outside the viewport the target keeps its clear

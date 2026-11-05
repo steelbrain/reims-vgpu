@@ -16,6 +16,15 @@
 //! entries, drops what was staged of its stage, and the stage keeps its table; a present that
 //! comes while a stage's parts are not all in drops them too.
 //!
+//! **The identity.** A matrix stage a transaction sets to the identity (rows `[1, 0, 0, 0]`,
+//! `[0, 1, 0, 0]` and `[0, 0, 1, 0]`, compared as floats) is staged off: it gives each finite
+//! input back exactly (`1 * x + 0 * y + 0 * z + 0` is `x`), so the display shows the red, green
+//! and blue it shows without it, and the window draws no colour pass for it (WindowServer sets
+//! identity matrices during its fades, and no gamma table: measured on an x86-64 macOS 26 guest).
+//! A gamma table that is a linear ramp stays on: its interpolation gives the identity only to
+//! within a few ulps, and it clamps its input, so leaving it out could change a pixel of a float
+//! surface.
+//!
 //! **What the window does with it.** The window's sink draws the display through the colour
 //! (`sink`) while any stage is on: each gamma stage interpolates linearly between its entries,
 //! entry `k` of `n` at input `k / (n - 1)`, its input clamped to [0, 1]; the matrix gives output
@@ -66,6 +75,18 @@ impl DisplayColor {
 pub(crate) struct ColorChange {
     /// By `RGFX_COLOR_*` stage.
     pub(crate) stages: [Option<Option<Table>>; STAGES],
+}
+
+/// The identity matrix's rows (the module doc).
+const IDENTITY: [[f32; 4]; 3] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+];
+
+/// Whether a matrix stage's `rows` are the identity's, compared as floats (`-0.0` is `0.0`).
+fn is_identity_matrix(rows: &[[f32; 4]]) -> bool {
+    rows.len() == IDENTITY.len() && rows.iter().zip(&IDENTITY).all(|(row, one)| row == one)
 }
 
 /// Why a `DISPLAY_COLOR` part was dropped.
@@ -133,7 +154,9 @@ impl ColorStaging {
         if so_far.len() == usize::try_from(count).unwrap_or(usize::MAX) {
             let table = std::mem::take(so_far);
             *building = None;
-            self.staged.stages[stage] = Some((!table.is_empty()).then(|| Table::from(table)));
+            let on = !table.is_empty()
+                && !(color.stage == RGFX_COLOR_MATRIX && is_identity_matrix(&table));
+            self.staged.stages[stage] = Some(on.then(|| Table::from(table)));
         }
         Ok(())
     }
@@ -282,6 +305,73 @@ mod tests {
             stage(&mut s, part(RGFX_COLOR_POST_GAMMA, 4, 2, 2)),
             Err(Dropped::Order)
         );
+    }
+
+    /// A matrix stage set to the identity is staged off, `-0.0` counting as `0.0`, and turns off
+    /// a matrix set before; a matrix one float off the identity, its offset included, stays on,
+    /// and so does a linear gamma ramp
+    #[test]
+    fn an_identity_matrix_is_staged_off() {
+        let staged = |stage: u32, rows: &[[f32; 4]]| {
+            let mut s = ColorStaging::default();
+            let color = RgfxDisplayColor {
+                stage,
+                entry_count: u32::try_from(rows.len()).unwrap(),
+                part_entries: u32::try_from(rows.len()).unwrap(),
+                ..RgfxDisplayColor::default()
+            };
+            let entries: Vec<RgfxColorEntry> = rows
+                .iter()
+                .map(|r| {
+                    let [x, y, z, w] = r.map(f32::to_bits);
+                    RgfxColorEntry { x, y, z, w }
+                })
+                .collect();
+            s.part(&color, &entries).unwrap();
+            s.take().unwrap().stages[usize::try_from(stage).unwrap()].clone()
+        };
+        let mut identity = IDENTITY;
+        assert_eq!(staged(RGFX_COLOR_MATRIX, &identity), Some(None));
+        identity[0][1] = -0.0;
+        assert_eq!(staged(RGFX_COLOR_MATRIX, &identity), Some(None));
+        for (row, column, value) in [(0, 0, 0.999_999_9), (1, 2, 1e-30), (2, 3, 1.0 / 255.0)] {
+            let mut rows = IDENTITY;
+            rows[row][column] = value;
+            let on = staged(RGFX_COLOR_MATRIX, &rows);
+            assert_eq!(
+                on.flatten().as_deref(),
+                Some(&rows[..]),
+                "[{row}][{column}]"
+            );
+        }
+        let mut nan = IDENTITY;
+        nan[1][1] = f32::NAN;
+        assert!(staged(RGFX_COLOR_MATRIX, &nan).unwrap().is_some());
+        let ramp: Vec<[f32; 4]> = (0..256u16)
+            .map(|k| {
+                let v = f32::from(k) / 255.0;
+                [v, v, v, 0.0]
+            })
+            .collect();
+        for stage in [RGFX_COLOR_PRE_GAMMA, RGFX_COLOR_POST_GAMMA] {
+            assert!(staged(stage, &ramp).unwrap().is_some());
+        }
+
+        // Applied, the identity turns off the matrix set before.
+        let mut color = DisplayColor::default();
+        let mut change = ColorChange::default();
+        let swap: Table = Arc::from(vec![
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ]);
+        change.stages[RGFX_COLOR_MATRIX as usize] = Some(Some(swap));
+        color.apply(change);
+        assert!(!color.is_identity());
+        let mut change = ColorChange::default();
+        change.stages[RGFX_COLOR_MATRIX as usize] = staged(RGFX_COLOR_MATRIX, &IDENTITY);
+        color.apply(change);
+        assert!(color.is_identity());
     }
 
     /// A change sets the stages it names and leaves the others' tables; a colour is the identity
