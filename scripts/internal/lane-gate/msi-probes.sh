@@ -18,7 +18,8 @@
 #                   guest's home: its commands run there, on this machine
 #   SETTLE_LOAD, SETTLE_S   the host's 1-minute load average the probes wait for (default 4), and
 #                   the longest wait (default 180 s)
-# Each probe's results (PROBE_RESULTS/NAME/):
+# Each probe's results (PROBE_RESULTS/NAME/, and a copy in R/probe-results/NAME/, which the next
+# round's probe of the same name leaves alone):
 #   status          "ran", "skipped: WHY" or "not reached: WHY" (probe-batch.sh queues it again)
 #   stdout, stderr  run.sh's, over SSH, in the guest's copy of the probe's directory (~/probes/NAME)
 #   rc              its exit status: 137 where its budget ran out (the guest kills its process group)
@@ -256,6 +257,11 @@ for p in $(in_order); do
   fi
   cp -R "$p" "$out/probe"
   [[ $(cat "$out/status") == ran ]] || log "$name: $(cat "$out/status")"
+  # A copy in the round's directory, since PROBE_RESULTS/NAME is the next round's for a probe of the
+  # same name (cp -a reflinks on the lane host's btrfs).
+  if [[ -n ${R:-} && -d $R ]]; then
+    mkdir -p "$R/probe-results" && cp -a "$out" "$R/probe-results/" || log "$name: no copy in $R/probe-results"
+  fi
 done
 if [[ -n $HC ]]; then
   catch_wait
