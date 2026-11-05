@@ -1217,6 +1217,112 @@ fn a_doorbell_s_answer_allocates_nothing() {
     assert_eq!((done.cb_obj_id, done.status), (164, RGFX_CB_OK));
 }
 
+/// What a lone command buffer that asks for its `CB_SUBMITTED` costs from its doorbell write to
+/// the record on its queue's completion ring, the queue's thread asleep before each, as for a
+/// guest's `commitAndWaitUntilSubmitted` on an idle queue: answered inside the write
+/// (`mmio_write_taking`, the vCPU's time), and taken by the queue's thread that the write wakes
+/// (`mmio_write`). Prints the mean, median, 90th and 99th percentiles and the most, in
+/// microseconds: a measurement, run by hand (`--run-ignored only --no-capture`, in a release
+/// build).
+#[test]
+#[ignore = "a measurement, run by hand"]
+#[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
+    use std::time::Instant;
+
+    const ROUNDS: u64 = 2000;
+    let platform = Arc::new(FakePlatform::new());
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(Arc::new(|_| {})),
+            scanout_written: None,
+        },
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let (context, mut guest) = (3, Guest::new(&device));
+    let queue = obj(context, 1);
+    assert_eq!(
+        create_queue(
+            &device,
+            &mut guest,
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            1
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    let stats = |name: &str, mut us: Vec<f64>| {
+        us.sort_by(f64::total_cmp);
+        let n = us.len();
+        let mean = us.iter().sum::<f64>() / n as f64;
+        println!(
+            "{name}: mean {mean:.2} p50 {:.2} p90 {:.2} p99 {:.2} max {:.2} us (n {n})",
+            us[n / 2],
+            us[n * 9 / 10],
+            us[n * 99 / 100],
+            us[n - 1]
+        );
+    };
+    let finish = |ring: &mut QueueRing, cb: u64| {
+        for _ in 0..3000 {
+            platform.world().complete_all(CompleteOn::Caller);
+            if ring.has_event() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+        ring.scheduled.clear();
+    };
+    for taking in [true, false] {
+        let mut us = Vec::new();
+        for round in 0..ROUNDS {
+            let cb = 1000 + round + if taking { 0 } else { ROUNDS };
+            wait_idle(&device, SUBMIT_OFF);
+            // A pause as the guest's, so the queue's thread sleeps as it does between frames.
+            std::thread::sleep(Duration::from_micros(200));
+            ring.arm();
+            ring.publish(asking(queue, cb));
+            let start = Instant::now();
+            if taking {
+                device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+                assert!(
+                    ring.has_event(),
+                    "buffer {cb} was not answered in the write"
+                );
+            } else {
+                device.mmio_write(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+                while !ring.has_event() {
+                    assert!(start.elapsed() < Duration::from_secs(2), "no CB_SUBMITTED");
+                    std::hint::spin_loop();
+                }
+            }
+            us.push(start.elapsed().as_secs_f64() * 1e6);
+            let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
+            assert_eq!(posted.header.r#type, RGFX_EVT_CB_SUBMITTED);
+            finish(&mut ring, cb);
+        }
+        stats(
+            if taking {
+                "answered in the doorbell write"
+            } else {
+                "taken by the queue's thread"
+            },
+            us,
+        );
+    }
+}
+
 /// Waits about 2 s at most for the service thread of the queue whose submission ring is at region
 /// offset `submit_off` to sleep with its ring idle (its `consumer_idle` 1), as the guest finds it
 /// when it rings for a buffer.
