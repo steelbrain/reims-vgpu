@@ -34,8 +34,9 @@ use objc2_metal::{
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineDescriptor,
     MTLComputePipelineState, MTLDepthStencilState, MTLDevice, MTLEvent, MTLFunction, MTLHeap,
     MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectComputeCommand,
-    MTLIndirectRenderCommand, MTLLibrary, MTLOrigin, MTLRasterizationRateLayerDescriptor,
-    MTLRasterizationRateMap, MTLRasterizationRateMapDescriptor, MTLRegion, MTLRenderCommandEncoder,
+    MTLIndirectRenderCommand, MTLLibrary, MTLMeshRenderPipelineDescriptor, MTLOrigin,
+    MTLRasterizationRateLayerDescriptor, MTLRasterizationRateMap,
+    MTLRasterizationRateMapDescriptor, MTLRegion, MTLRenderCommandEncoder,
     MTLRenderPassColorAttachmentDescriptor, MTLRenderPassColorAttachmentDescriptorArray,
     MTLRenderPassDescriptor, MTLRenderPipelineColorAttachmentDescriptor,
     MTLRenderPipelineColorAttachmentDescriptorArray, MTLRenderPipelineDescriptor,
@@ -401,6 +402,21 @@ pub unsafe trait DeviceSpi: Message {
         let reflection: *mut *mut AnyObject = std::ptr::null_mut();
         unsafe {
             msg_send![self, newRenderPipelineStateWithDescriptor: descriptor, options: options, reflection: reflection, error: error]
+        }
+    }
+    /// Reflection is nil.
+    ///
+    /// # Safety
+    /// `error` is a writable out-parameter.
+    unsafe fn newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
+        &self,
+        descriptor: &MTLMeshRenderPipelineDescriptor,
+        options: u64,
+        error: *mut *mut NSError,
+    ) -> Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+        let reflection: *mut *mut AnyObject = std::ptr::null_mut();
+        unsafe {
+            msg_send![self, newRenderPipelineStateWithMeshDescriptor: descriptor, options: options, reflection: reflection, error: error]
         }
     }
     /// A nil descriptor is sent as it is; reflection is nil.

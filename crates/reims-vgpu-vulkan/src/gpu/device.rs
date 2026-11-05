@@ -38,8 +38,8 @@ use reims_vgpu_core::platform::types::{
 };
 use reims_vgpu_core::platform::values::{
     ArgumentDesc, BufferDeallocator, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
-    FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet, RenderPipelineDesc,
-    SamplerDesc,
+    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
+    RenderPipelineDesc, SamplerDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange};
 use reims_vgpu_core::raise::{Kept, OnFault, RaiseResult, keep_forever};
@@ -2103,6 +2103,17 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         desc: &FullRenderPipelineDesc<'_, VulkanPlatform>,
     ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
         super::states::new_render_pipeline_state_full(self, desc)
+    }
+
+    /// Dies at the send: this platform makes no mesh pipeline yet.
+    fn new_mesh_render_pipeline_state_full(
+        &self,
+        _desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
+    ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+        crate::answer::unrepresentable(
+            "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:",
+            "a mesh render pipeline",
+        )
     }
 
     /// The graphics lane's whole descriptor: the compile's refusal of a function or descriptor it

@@ -68,6 +68,37 @@ impl RenderEncoder<FakePlatform> for Fk<kind::RenderEncoder> {
             RenderCmd::DrawPatches { number_of_patch_control_points, patch_start, patch_count, patch_index_buffer, patch_index_buffer_offset, instance_count, base_instance } => {
         self.act(Policy::Caught, sel, vec![Arg::U64(number_of_patch_control_points), Arg::U64(patch_start), Arg::U64(patch_count), Arg::opt(patch_index_buffer), Arg::U64(patch_index_buffer_offset), Arg::U64(instance_count), Arg::U64(base_instance)])
     }
+            RenderCmd::DrawMeshThreadgroups { threadgroups_per_grid, threads_per_object_threadgroup, threads_per_mesh_threadgroup } => {
+        self.act(Policy::Caught,
+            sel,
+            vec![
+                Arg::val(&threadgroups_per_grid),
+                Arg::val(&threads_per_object_threadgroup),
+                Arg::val(&threads_per_mesh_threadgroup),
+            ],
+        )
+    }
+            RenderCmd::DrawMeshThreadgroupsIndirect { indirect_buffer, indirect_buffer_offset, threads_per_object_threadgroup, threads_per_mesh_threadgroup } => {
+        self.act(Policy::Caught,
+            sel,
+            vec![
+                Arg::obj(indirect_buffer),
+                Arg::U64(indirect_buffer_offset),
+                Arg::val(&threads_per_object_threadgroup),
+                Arg::val(&threads_per_mesh_threadgroup),
+            ],
+        )
+    }
+            RenderCmd::DrawMeshThreads { threads_per_grid, threads_per_object_threadgroup, threads_per_mesh_threadgroup } => {
+        self.act(Policy::Caught,
+            sel,
+            vec![
+                Arg::val(&threads_per_grid),
+                Arg::val(&threads_per_object_threadgroup),
+                Arg::val(&threads_per_mesh_threadgroup),
+            ],
+        )
+    }
             RenderCmd::DrawPrimitivesIndirect { primitive_type, indirect_buffer, indirect_buffer_offset } => {
         self.act(Policy::Caught,
             "drawPrimitives:indirectBuffer:indirectBufferOffset:",
@@ -349,6 +380,51 @@ impl RenderEncoder<FakePlatform> for Fk<kind::RenderEncoder> {
         self.act(Policy::Caught,
             "setThreadgroupMemoryLength:offset:atIndex:",
             vec![Arg::U64(length), Arg::U64(offset), Arg::U64(index)],
+        )
+    }
+            RenderCmd::SetMeshBufferOffset { offset, index }
+            | RenderCmd::SetObjectBufferOffset { offset, index }
+            | RenderCmd::SetObjectThreadgroupMemoryLength { length: offset, index } => {
+        self.act(Policy::Caught,
+            sel,
+            vec![Arg::U64(offset), Arg::U64(index)],
+        )
+    }
+            RenderCmd::SetMeshBuffers { buffers, offsets, range }
+            | RenderCmd::SetObjectBuffers { buffers, offsets, range } => {
+        self.act(Policy::Caught,
+            sel,
+            vec![
+                Arg::objs(buffers),
+                Arg::U64s(offsets.to_vec()),
+                Arg::val(&range),
+            ],
+        )
+    }
+            RenderCmd::SetMeshSamplerStatesLodClamps { samplers, lod_min_clamps, lod_max_clamps, range }
+            | RenderCmd::SetObjectSamplerStatesLodClamps { samplers, lod_min_clamps, lod_max_clamps, range } => {
+        self.act(Policy::Caught,
+            sel,
+            vec![
+                Arg::objs(samplers),
+                Arg::F32s(lod_min_clamps.to_vec()),
+                Arg::F32s(lod_max_clamps.to_vec()),
+                Arg::val(&range),
+            ],
+        )
+    }
+            RenderCmd::SetMeshSamplerStates { samplers, range }
+            | RenderCmd::SetObjectSamplerStates { samplers, range } => {
+        self.act(Policy::Caught,
+            sel,
+            vec![Arg::objs(samplers), Arg::val(&range)],
+        )
+    }
+            RenderCmd::SetMeshTextures { textures, range }
+            | RenderCmd::SetObjectTextures { textures, range } => {
+        self.act(Policy::Caught,
+            sel,
+            vec![Arg::objs(textures), Arg::val(&range)],
         )
     }
             RenderCmd::SetTileBufferOffset { offset, index } => {

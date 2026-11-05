@@ -781,6 +781,43 @@ impl reims_vgpu_core::platform::resource::RenderPipeline for MetalRenderPipeline
         .to_u64()
     }
 
+    fn max_total_threads_per_object_threadgroup(&self) -> u64 {
+        let p = self.get();
+        msg::get("maxTotalThreadsPerObjectThreadgroup", || {
+            p.maxTotalThreadsPerObjectThreadgroup()
+        })
+        .to_u64()
+    }
+
+    fn max_total_threads_per_mesh_threadgroup(&self) -> u64 {
+        let p = self.get();
+        msg::get("maxTotalThreadsPerMeshThreadgroup", || {
+            p.maxTotalThreadsPerMeshThreadgroup()
+        })
+        .to_u64()
+    }
+
+    fn object_thread_execution_width(&self) -> u64 {
+        let p = self.get();
+        msg::get("objectThreadExecutionWidth", || {
+            p.objectThreadExecutionWidth()
+        })
+        .to_u64()
+    }
+
+    fn mesh_thread_execution_width(&self) -> u64 {
+        let p = self.get();
+        msg::get("meshThreadExecutionWidth", || p.meshThreadExecutionWidth()).to_u64()
+    }
+
+    fn max_total_threadgroups_per_mesh_grid(&self) -> u64 {
+        let p = self.get();
+        msg::get("maxTotalThreadgroupsPerMeshGrid", || {
+            p.maxTotalThreadgroupsPerMeshGrid()
+        })
+        .to_u64()
+    }
+
     fn resource_index(&self) -> u64 {
         let p = self.get();
         msg::get("resourceIndex", || ResourceIndexSpi::resourceIndex(p))

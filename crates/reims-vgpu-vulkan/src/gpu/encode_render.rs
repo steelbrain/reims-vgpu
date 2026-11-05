@@ -3003,6 +3003,22 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
             // Metal draws alike at every point size on this host, and a vertex function's
             // `[[point_size]]` decides a point's: it encodes nothing.
             RenderCmd::SetPointSize { .. } => self.encoder.nothing(sel),
+            RenderCmd::DrawMeshThreadgroups { .. }
+            | RenderCmd::DrawMeshThreadgroupsIndirect { .. }
+            | RenderCmd::DrawMeshThreads { .. }
+            | RenderCmd::SetMeshBufferOffset { .. }
+            | RenderCmd::SetMeshBuffers { .. }
+            | RenderCmd::SetMeshSamplerStatesLodClamps { .. }
+            | RenderCmd::SetMeshSamplerStates { .. }
+            | RenderCmd::SetMeshTextures { .. }
+            | RenderCmd::SetObjectBufferOffset { .. }
+            | RenderCmd::SetObjectBuffers { .. }
+            | RenderCmd::SetObjectSamplerStatesLodClamps { .. }
+            | RenderCmd::SetObjectSamplerStates { .. }
+            | RenderCmd::SetObjectTextures { .. }
+            | RenderCmd::SetObjectThreadgroupMemoryLength { .. } => {
+                unrepresentable(sel, "a mesh or object stage command")
+            }
             // Metal's indexed strips restart at the index set, until the encoder ends, and
             // nothing else changes (the module docs), as the runtime's do.
             RenderCmd::SetPrimitiveRestartEnabled { enabled, index } => {

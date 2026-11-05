@@ -464,6 +464,122 @@ impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
     }
 }
 
+/// A whole `MTLMeshRenderPipelineDescriptor`, as a value: what the graphics lane carries of a
+/// guest's descriptor. Each enum is its Metal raw value. Order: label, the object, mesh and
+/// fragment functions, the colour attachments at their indices, the depth and stencil formats,
+/// the raster sample count, alpha-to-coverage, alpha-to-one, rasterization, the stages'
+/// maxima and their execution-width promises, the payload length, the maximum vertex
+/// amplification count, the required threadgroup sizes, indirect command buffer support, then
+/// the object, mesh and fragment stages' linked functions where they link any.
+pub struct FullMeshRenderPipelineDesc<'a, P: Platform> {
+    /// `setLabel:`, when set.
+    pub label: Option<&'a str>,
+    /// `setObjectFunction:`; `None` leaves it nil (a pipeline with no object stage).
+    pub object: Option<&'a P::Function>,
+    /// `setMeshFunction:`.
+    pub mesh: &'a P::Function,
+    /// `setFragmentFunction:`; `None` leaves it nil (a pipeline that does not rasterize).
+    pub fragment: Option<&'a P::Function>,
+    /// The colour attachments set, each at its index (0 to 7).
+    pub colors: Vec<(u64, ColorAttachmentDesc)>,
+    /// `setDepthAttachmentPixelFormat:` (`MTLPixelFormat`; 0 for none).
+    pub depth_pixel_format: u64,
+    /// `setStencilAttachmentPixelFormat:` (`MTLPixelFormat`; 0 for none).
+    pub stencil_pixel_format: u64,
+    /// `setRasterSampleCount:`.
+    pub raster_sample_count: u64,
+    /// `setAlphaToCoverageEnabled:`.
+    pub alpha_to_coverage: bool,
+    /// `setAlphaToOneEnabled:`.
+    pub alpha_to_one: bool,
+    /// `setRasterizationEnabled:`.
+    pub rasterization_enabled: bool,
+    /// `setMaxTotalThreadsPerObjectThreadgroup:`, when set (0 leaves Metal's).
+    pub max_total_threads_per_object_threadgroup: u64,
+    /// `setMaxTotalThreadsPerMeshThreadgroup:`, when set (0 leaves Metal's).
+    pub max_total_threads_per_mesh_threadgroup: u64,
+    /// `setMaxTotalThreadgroupsPerMeshGrid:`, when set (0 leaves Metal's).
+    pub max_total_threadgroups_per_mesh_grid: u64,
+    /// `setObjectThreadgroupSizeIsMultipleOfThreadExecutionWidth:`.
+    pub object_threadgroup_size_is_multiple_of_execution_width: bool,
+    /// `setMeshThreadgroupSizeIsMultipleOfThreadExecutionWidth:`.
+    pub mesh_threadgroup_size_is_multiple_of_execution_width: bool,
+    /// `setPayloadMemoryLength:`, when set (0 leaves Metal's).
+    pub payload_memory_length: u64,
+    /// `setMaxVertexAmplificationCount:`.
+    pub max_vertex_amplification_count: u64,
+    /// `setRequiredThreadsPerObjectThreadgroup:`, when set (a size of zeros leaves Metal's).
+    pub required_threads_per_object_threadgroup: MtlSize,
+    /// `setRequiredThreadsPerMeshThreadgroup:`, when set (a size of zeros leaves Metal's).
+    pub required_threads_per_mesh_threadgroup: MtlSize,
+    /// `setSupportIndirectCommandBuffers:`.
+    pub support_indirect_command_buffers: bool,
+    /// `setObjectLinkedFunctions:`, where the stage links any.
+    pub object_linked: LinkedFunctionsDesc<P>,
+    /// `setMeshLinkedFunctions:`, where the stage links any.
+    pub mesh_linked: LinkedFunctionsDesc<P>,
+    /// `setFragmentLinkedFunctions:`, where the stage links any.
+    pub fragment_linked: LinkedFunctionsDesc<P>,
+}
+
+impl<P: Platform> fmt::Debug for FullMeshRenderPipelineDesc<'_, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FullMeshRenderPipelineDesc")
+            .field("label", &self.label)
+            .field("object", &self.object.map(|f| f.id()))
+            .field("mesh", &self.mesh.id())
+            .field("fragment", &self.fragment.map(|f| f.id()))
+            .field("colors", &self.colors)
+            .field("depth_pixel_format", &self.depth_pixel_format)
+            .field("stencil_pixel_format", &self.stencil_pixel_format)
+            .field("raster_sample_count", &self.raster_sample_count)
+            .field("alpha_to_coverage", &self.alpha_to_coverage)
+            .field("alpha_to_one", &self.alpha_to_one)
+            .field("rasterization_enabled", &self.rasterization_enabled)
+            .field(
+                "max_total_threads_per_object_threadgroup",
+                &self.max_total_threads_per_object_threadgroup,
+            )
+            .field(
+                "max_total_threads_per_mesh_threadgroup",
+                &self.max_total_threads_per_mesh_threadgroup,
+            )
+            .field(
+                "max_total_threadgroups_per_mesh_grid",
+                &self.max_total_threadgroups_per_mesh_grid,
+            )
+            .field(
+                "object_threadgroup_size_is_multiple_of_execution_width",
+                &self.object_threadgroup_size_is_multiple_of_execution_width,
+            )
+            .field(
+                "mesh_threadgroup_size_is_multiple_of_execution_width",
+                &self.mesh_threadgroup_size_is_multiple_of_execution_width,
+            )
+            .field("payload_memory_length", &self.payload_memory_length)
+            .field(
+                "max_vertex_amplification_count",
+                &self.max_vertex_amplification_count,
+            )
+            .field(
+                "required_threads_per_object_threadgroup",
+                &self.required_threads_per_object_threadgroup,
+            )
+            .field(
+                "required_threads_per_mesh_threadgroup",
+                &self.required_threads_per_mesh_threadgroup,
+            )
+            .field(
+                "support_indirect_command_buffers",
+                &self.support_indirect_command_buffers,
+            )
+            .field("object_linked", &self.object_linked)
+            .field("mesh_linked", &self.mesh_linked)
+            .field("fragment_linked", &self.fragment_linked)
+            .finish()
+    }
+}
+
 /// A whole `MTLComputePipelineDescriptor`, as a value: what the graphics lane carries of a guest's
 /// descriptor. Order: label, the compute function, whether the threadgroup size is a multiple of
 /// the execution width, the maximum threads per threadgroup where set, the maximum call stack

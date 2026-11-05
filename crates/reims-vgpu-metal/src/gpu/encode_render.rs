@@ -234,6 +234,67 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                     },
                 )
             }
+            RenderCmd::DrawMeshThreadgroups {
+                threadgroups_per_grid,
+                threads_per_object_threadgroup,
+                threads_per_mesh_threadgroup,
+            } => {
+                let (grid, object, mesh) = (
+                    threadgroups_per_grid.mtl(),
+                    threads_per_object_threadgroup.mtl(),
+                    threads_per_mesh_threadgroup.mtl(),
+                );
+                msg::send(
+                    "drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+                    Policy::Caught,
+                    || {
+                        e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                            grid, object, mesh,
+                        )
+                    },
+                )
+            }
+            RenderCmd::DrawMeshThreadgroupsIndirect {
+                indirect_buffer,
+                indirect_buffer_offset,
+                threads_per_object_threadgroup,
+                threads_per_mesh_threadgroup,
+            } => {
+                let (indirect, offset) = (indirect_buffer.get(), indirect_buffer_offset.to_usize());
+                let (object, mesh) = (
+                    threads_per_object_threadgroup.mtl(),
+                    threads_per_mesh_threadgroup.mtl(),
+                );
+                msg::send(
+                    "drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+                    Policy::Caught,
+                    || unsafe {
+                        e.drawMeshThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                            indirect, offset, object, mesh,
+                        )
+                    },
+                )
+            }
+            RenderCmd::DrawMeshThreads {
+                threads_per_grid,
+                threads_per_object_threadgroup,
+                threads_per_mesh_threadgroup,
+            } => {
+                let (grid, object, mesh) = (
+                    threads_per_grid.mtl(),
+                    threads_per_object_threadgroup.mtl(),
+                    threads_per_mesh_threadgroup.mtl(),
+                );
+                msg::send(
+                    "drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+                    Policy::Caught,
+                    || {
+                        e.drawMeshThreads_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                            grid, object, mesh,
+                        )
+                    },
+                )
+            }
             RenderCmd::DrawPatchesIndirect {
                 number_of_patch_control_points,
                 patch_index_buffer,
@@ -618,6 +679,138 @@ impl reims_vgpu_core::platform::render::RenderEncoder<MetalPlatform> for MetalRe
                 msg::send("setLineWidth:", Policy::Caught, || {
                     e.setLineWidth(line_width)
                 })
+            }
+            RenderCmd::SetMeshBufferOffset { offset, index } => {
+                let (offset, index) = (offset.to_usize(), index.to_usize());
+                msg::send("setMeshBufferOffset:atIndex:", Policy::Caught, || unsafe {
+                    e.setMeshBufferOffset_atIndex(offset, index)
+                })
+            }
+            RenderCmd::SetMeshBuffers {
+                buffers,
+                offsets,
+                range,
+            } => {
+                let sel = "setMeshBuffers:offsets:withRange:";
+                check_len(sel, offsets.len(), range);
+                check_len(sel, buffers.len(), range);
+                let buffers = objects(buffers.iter().map(|o| o.map(Obj::get)));
+                let (list, offsets, range) = (array(&buffers), array(offsets), range.mtl());
+                msg::send(sel, Policy::Caught, || unsafe {
+                    e.setMeshBuffers_offsets_withRange(list, offsets, range)
+                })
+            }
+            RenderCmd::SetMeshSamplerStatesLodClamps {
+                samplers,
+                lod_min_clamps,
+                lod_max_clamps,
+                range,
+            } => {
+                let sel = "setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:";
+                check_len(sel, lod_max_clamps.len(), range);
+                check_len(sel, lod_min_clamps.len(), range);
+                check_len(sel, samplers.len(), range);
+                let samplers = objects(samplers.iter().map(|o| o.map(Obj::get)));
+                let (list, min, max) = (
+                    array(&samplers),
+                    array(lod_min_clamps),
+                    array(lod_max_clamps),
+                );
+                let range = range.mtl();
+                msg::send(sel, Policy::Caught, || unsafe {
+                    e.setMeshSamplerStates_lodMinClamps_lodMaxClamps_withRange(
+                        list, min, max, range,
+                    )
+                })
+            }
+            RenderCmd::SetMeshSamplerStates { samplers, range } => {
+                let sel = "setMeshSamplerStates:withRange:";
+                check_len(sel, samplers.len(), range);
+                let samplers = objects(samplers.iter().map(|o| o.map(Obj::get)));
+                let (list, range) = (array(&samplers), range.mtl());
+                msg::send(sel, Policy::Caught, || unsafe {
+                    e.setMeshSamplerStates_withRange(list, range)
+                })
+            }
+            RenderCmd::SetMeshTextures { textures, range } => {
+                let sel = "setMeshTextures:withRange:";
+                check_len(sel, textures.len(), range);
+                let textures = objects(textures.iter().map(|o| o.map(Obj::get)));
+                let (list, range) = (array(&textures), range.mtl());
+                msg::send(sel, Policy::Caught, || unsafe {
+                    e.setMeshTextures_withRange(list, range)
+                })
+            }
+            RenderCmd::SetObjectBufferOffset { offset, index } => {
+                let (offset, index) = (offset.to_usize(), index.to_usize());
+                msg::send(
+                    "setObjectBufferOffset:atIndex:",
+                    Policy::Caught,
+                    || unsafe { e.setObjectBufferOffset_atIndex(offset, index) },
+                )
+            }
+            RenderCmd::SetObjectBuffers {
+                buffers,
+                offsets,
+                range,
+            } => {
+                let sel = "setObjectBuffers:offsets:withRange:";
+                check_len(sel, offsets.len(), range);
+                check_len(sel, buffers.len(), range);
+                let buffers = objects(buffers.iter().map(|o| o.map(Obj::get)));
+                let (list, offsets, range) = (array(&buffers), array(offsets), range.mtl());
+                msg::send(sel, Policy::Caught, || unsafe {
+                    e.setObjectBuffers_offsets_withRange(list, offsets, range)
+                })
+            }
+            RenderCmd::SetObjectSamplerStatesLodClamps {
+                samplers,
+                lod_min_clamps,
+                lod_max_clamps,
+                range,
+            } => {
+                let sel = "setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:";
+                check_len(sel, lod_max_clamps.len(), range);
+                check_len(sel, lod_min_clamps.len(), range);
+                check_len(sel, samplers.len(), range);
+                let samplers = objects(samplers.iter().map(|o| o.map(Obj::get)));
+                let (list, min, max) = (
+                    array(&samplers),
+                    array(lod_min_clamps),
+                    array(lod_max_clamps),
+                );
+                let range = range.mtl();
+                msg::send(sel, Policy::Caught, || unsafe {
+                    e.setObjectSamplerStates_lodMinClamps_lodMaxClamps_withRange(
+                        list, min, max, range,
+                    )
+                })
+            }
+            RenderCmd::SetObjectSamplerStates { samplers, range } => {
+                let sel = "setObjectSamplerStates:withRange:";
+                check_len(sel, samplers.len(), range);
+                let samplers = objects(samplers.iter().map(|o| o.map(Obj::get)));
+                let (list, range) = (array(&samplers), range.mtl());
+                msg::send(sel, Policy::Caught, || unsafe {
+                    e.setObjectSamplerStates_withRange(list, range)
+                })
+            }
+            RenderCmd::SetObjectTextures { textures, range } => {
+                let sel = "setObjectTextures:withRange:";
+                check_len(sel, textures.len(), range);
+                let textures = objects(textures.iter().map(|o| o.map(Obj::get)));
+                let (list, range) = (array(&textures), range.mtl());
+                msg::send(sel, Policy::Caught, || unsafe {
+                    e.setObjectTextures_withRange(list, range)
+                })
+            }
+            RenderCmd::SetObjectThreadgroupMemoryLength { length, index } => {
+                let (length, index) = (length.to_usize(), index.to_usize());
+                msg::send(
+                    "setObjectThreadgroupMemoryLength:atIndex:",
+                    Policy::Caught,
+                    || unsafe { e.setObjectThreadgroupMemoryLength_atIndex(length, index) },
+                )
             }
             RenderCmd::SetPointSize { point_size } => {
                 msg::send("setPointSize:", Policy::Caught, || {

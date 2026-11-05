@@ -15,7 +15,7 @@ use super::descriptor::PipelineDescriptorModel;
 use super::fatal;
 use super::icb::IcbModel;
 use super::rate_map::RateMapModel;
-use super::resource::PipelineModel;
+use super::resource::{MeshLimits, PipelineModel};
 use super::{Backing, ResolveIds, common, new_buffer, new_state, new_texture};
 use crate::num;
 use crate::platform::caps::{
@@ -27,8 +27,9 @@ use crate::platform::types::{
     SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use crate::platform::values::{
-    ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
-    HeapDesc, HeapMade, IcbDesc, OptionSet, RenderPipelineDesc, SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
+    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
+    RenderPipelineDesc, SamplerDesc,
 };
 use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
@@ -783,6 +784,39 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                     Space::RENDER_PIPELINE,
                     None,
                 ))
+            },
+        ))
+    }
+
+    /// The whole value is the call's first argument, then the options (0). The pipeline answers
+    /// the descriptor's thread maxima, else 1024, with an execution width of 32 a stage, the
+    /// object stage's answers 0 without an object function, and the grid's maximum
+    /// `NSUIntegerMax`, as the x86 Macs answer (docs/graphics-kext/dgpu-oracle.md).
+    fn new_mesh_render_pipeline_state_full(
+        &self,
+        desc: &FullMeshRenderPipelineDesc<'_, FakePlatform>,
+    ) -> Result<Option<<FakePlatform as Platform>::RenderPipeline>, NsErrorText> {
+        let or_1024 = |v: u64| if v == 0 { 1024 } else { v };
+        let has_object = desc.object.is_some();
+        let limits = MeshLimits {
+            object_threads: if has_object {
+                or_1024(desc.max_total_threads_per_object_threadgroup)
+            } else {
+                0
+            },
+            mesh_threads: or_1024(desc.max_total_threads_per_mesh_threadgroup),
+            object_width: if has_object { 32 } else { 0 },
+            mesh_width: 32,
+            grid: u64::MAX,
+        };
+        fatal(self.make_or_error(
+            Policy::Fatal,
+            "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:",
+            vec![Arg::val(desc), Arg::U64(0)],
+            |w| {
+                let p = new_pipeline::<kind::RenderPipeline>(w, Space::RENDER_PIPELINE, None);
+                p.with_model_mut(|m: &mut PipelineModel| m.mesh = limits);
+                Some(p)
             },
         ))
     }

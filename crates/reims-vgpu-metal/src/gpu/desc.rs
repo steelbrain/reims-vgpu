@@ -33,13 +33,13 @@ use objc2_foundation::{NSArray, NSDictionary, NSString};
 use objc2_metal::*;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::types::MtlSamplePosition;
+use reims_vgpu_core::platform::types::{MtlSamplePosition, MtlSize};
 use reims_vgpu_core::platform::values::{
     AttachmentState, BufferDeallocator, BufferDesc, ColorAttachmentDesc, ColorAttachmentSet,
     ComputePassDesc, DepthAttachmentSet, DepthStencilDesc, FullComputePipelineDesc,
-    FullRenderPipelineDesc, HeapDesc, IcbDesc, LinkedFunctionsDesc, OptionSet, PassSet,
-    RenderPipelineDesc, SamplerDesc, StageInputDesc, StencilAttachmentSet, StencilDesc,
-    TextureDesc, VertexDesc,
+    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, IcbDesc, LinkedFunctionsDesc,
+    OptionSet, PassSet, RenderPipelineDesc, SamplerDesc, StageInputDesc, StencilAttachmentSet,
+    StencilDesc, TextureDesc, VertexDesc,
 };
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
@@ -283,6 +283,9 @@ impl reims_vgpu_core::platform::descriptor::ComputePipelineDescriptor<MetalPlatf
 
 /// `MTLTileRenderPipelineDescriptor *`.
 pub type MetalTileRenderPipelineDescriptor = Obj<MTLTileRenderPipelineDescriptor>;
+
+/// `MTLMeshRenderPipelineDescriptor *`.
+pub type MetalMeshRenderPipelineDescriptor = Obj<MTLMeshRenderPipelineDescriptor>;
 
 impl reims_vgpu_core::platform::descriptor::TileRenderPipelineDescriptor<MetalPlatform>
     for MetalTileRenderPipelineDescriptor
@@ -794,6 +797,148 @@ pub fn apply_full_render_pipeline(
     if let Some(linked) = linked_functions(&desc.vertex_linked) {
         msg::get("setVertexLinkedFunctions:", || {
             o.setVertexLinkedFunctions(Some(&linked))
+        });
+    }
+    if let Some(linked) = linked_functions(&desc.fragment_linked) {
+        msg::get("setFragmentLinkedFunctions:", || {
+            o.setFragmentLinkedFunctions(Some(&linked))
+        });
+    }
+}
+
+/// Applies the whole mesh render pipeline value `desc` to the fresh descriptor `d`, in the
+/// value's order ([`FullMeshRenderPipelineDesc`]). A maximum, payload length or required size of
+/// 0 is left as Metal's descriptor has it; every other raw value goes to Metal unvalidated, and
+/// Metal checks it.
+pub fn apply_full_mesh_render_pipeline(
+    desc: &FullMeshRenderPipelineDesc<'_, MetalPlatform>,
+    d: &MetalMeshRenderPipelineDescriptor,
+) {
+    let o = d.get();
+    if let Some(label) = desc.label {
+        let label = msg::new_string(label);
+        msg::get("setLabel:", || o.setLabel(Some(&label)));
+    }
+    if let Some(function) = desc.object {
+        let function = function.get();
+        // SAFETY: a live function of this device.
+        msg::get("setObjectFunction:", || unsafe {
+            o.setObjectFunction(Some(function));
+        });
+    }
+    let function = desc.mesh.get();
+    // SAFETY: as above.
+    msg::get("setMeshFunction:", || unsafe {
+        o.setMeshFunction(Some(function))
+    });
+    if let Some(function) = desc.fragment {
+        let function = function.get();
+        // SAFETY: as above.
+        msg::get("setFragmentFunction:", || unsafe {
+            o.setFragmentFunction(Some(function));
+        });
+    }
+    if let Some(array) = part("colorAttachments", || o.colorAttachments()) {
+        for (index, c) in &desc.colors {
+            if let Some(a) = msg::get("objectAtIndexedSubscript:", || {
+                array.get().objectAtIndexedSubscript_or_nil(*index)
+            })
+            .map(Obj::from_retained)
+            {
+                apply_pipeline_color_attachment(c, a.get());
+            }
+        }
+    }
+    msg::get("setDepthAttachmentPixelFormat:", || {
+        o.setDepthAttachmentPixelFormat(MTLPixelFormat(desc.depth_pixel_format.to_usize()));
+    });
+    msg::get("setStencilAttachmentPixelFormat:", || {
+        o.setStencilAttachmentPixelFormat(MTLPixelFormat(desc.stencil_pixel_format.to_usize()));
+    });
+    // SAFETY: raw guest values go to Metal unvalidated; Metal checks them itself.
+    msg::get("setRasterSampleCount:", || unsafe {
+        o.setRasterSampleCount(desc.raster_sample_count.to_usize());
+    });
+    msg::get("setAlphaToCoverageEnabled:", || {
+        o.setAlphaToCoverageEnabled(desc.alpha_to_coverage);
+    });
+    msg::get("setAlphaToOneEnabled:", || {
+        o.setAlphaToOneEnabled(desc.alpha_to_one)
+    });
+    msg::get("setRasterizationEnabled:", || {
+        o.setRasterizationEnabled(desc.rasterization_enabled);
+    });
+    if desc.max_total_threads_per_object_threadgroup != 0 {
+        msg::get("setMaxTotalThreadsPerObjectThreadgroup:", || {
+            o.setMaxTotalThreadsPerObjectThreadgroup(
+                desc.max_total_threads_per_object_threadgroup.to_usize(),
+            );
+        });
+    }
+    if desc.max_total_threads_per_mesh_threadgroup != 0 {
+        msg::get("setMaxTotalThreadsPerMeshThreadgroup:", || {
+            o.setMaxTotalThreadsPerMeshThreadgroup(
+                desc.max_total_threads_per_mesh_threadgroup.to_usize(),
+            );
+        });
+    }
+    if desc.max_total_threadgroups_per_mesh_grid != 0 {
+        msg::get("setMaxTotalThreadgroupsPerMeshGrid:", || {
+            o.setMaxTotalThreadgroupsPerMeshGrid(
+                desc.max_total_threadgroups_per_mesh_grid.to_usize(),
+            );
+        });
+    }
+    msg::get(
+        "setObjectThreadgroupSizeIsMultipleOfThreadExecutionWidth:",
+        || {
+            o.setObjectThreadgroupSizeIsMultipleOfThreadExecutionWidth(
+                desc.object_threadgroup_size_is_multiple_of_execution_width,
+            );
+        },
+    );
+    msg::get(
+        "setMeshThreadgroupSizeIsMultipleOfThreadExecutionWidth:",
+        || {
+            o.setMeshThreadgroupSizeIsMultipleOfThreadExecutionWidth(
+                desc.mesh_threadgroup_size_is_multiple_of_execution_width,
+            );
+        },
+    );
+    if desc.payload_memory_length != 0 {
+        msg::get("setPayloadMemoryLength:", || {
+            o.setPayloadMemoryLength(desc.payload_memory_length.to_usize());
+        });
+    }
+    // SAFETY: as above.
+    msg::get("setMaxVertexAmplificationCount:", || unsafe {
+        o.setMaxVertexAmplificationCount(desc.max_vertex_amplification_count.to_usize());
+    });
+    if desc.required_threads_per_object_threadgroup != MtlSize::new(0, 0, 0) {
+        msg::get("setRequiredThreadsPerObjectThreadgroup:", || {
+            o.setRequiredThreadsPerObjectThreadgroup(
+                desc.required_threads_per_object_threadgroup.mtl(),
+            );
+        });
+    }
+    if desc.required_threads_per_mesh_threadgroup != MtlSize::new(0, 0, 0) {
+        msg::get("setRequiredThreadsPerMeshThreadgroup:", || {
+            o.setRequiredThreadsPerMeshThreadgroup(
+                desc.required_threads_per_mesh_threadgroup.mtl(),
+            );
+        });
+    }
+    msg::get("setSupportIndirectCommandBuffers:", || {
+        o.setSupportIndirectCommandBuffers(desc.support_indirect_command_buffers);
+    });
+    if let Some(linked) = linked_functions(&desc.object_linked) {
+        msg::get("setObjectLinkedFunctions:", || {
+            o.setObjectLinkedFunctions(Some(&linked))
+        });
+    }
+    if let Some(linked) = linked_functions(&desc.mesh_linked) {
+        msg::get("setMeshLinkedFunctions:", || {
+            o.setMeshLinkedFunctions(Some(&linked))
         });
     }
     if let Some(linked) = linked_functions(&desc.fragment_linked) {

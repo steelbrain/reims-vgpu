@@ -284,6 +284,17 @@ pub trait RenderPipeline: Handle {
     fn imageblock_sample_length(&self) -> u64;
     /// sel: maxTotalThreadsPerThreadgroup
     fn max_total_threads_per_threadgroup(&self) -> u64;
+    /// sel: maxTotalThreadsPerObjectThreadgroup — 0 for a pipeline with no object stage, as
+    /// Metal answers.
+    fn max_total_threads_per_object_threadgroup(&self) -> u64;
+    /// sel: maxTotalThreadsPerMeshThreadgroup — 0 for a pipeline with no mesh stage.
+    fn max_total_threads_per_mesh_threadgroup(&self) -> u64;
+    /// sel: objectThreadExecutionWidth — 0 for a pipeline with no object stage.
+    fn object_thread_execution_width(&self) -> u64;
+    /// sel: meshThreadExecutionWidth — 0 for a pipeline with no mesh stage.
+    fn mesh_thread_execution_width(&self) -> u64;
+    /// sel: maxTotalThreadgroupsPerMeshGrid — 0 for a pipeline with no mesh stage.
+    fn max_total_threadgroups_per_mesh_grid(&self) -> u64;
     /// sel: resourceIndex SPI
     fn resource_index(&self) -> u64;
     /// sel: supportIndirectCommandBuffers

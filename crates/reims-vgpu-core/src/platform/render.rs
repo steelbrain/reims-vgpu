@@ -122,6 +122,29 @@ pub enum RenderCmd<'a, P: Platform> {
         indirect_buffer: &'a P::Buffer,
         indirect_buffer_offset: u64,
     },
+    /// `drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`
+    /// The graphics lane's only.
+    DrawMeshThreadgroups {
+        threadgroups_per_grid: MtlSize,
+        threads_per_object_threadgroup: MtlSize,
+        threads_per_mesh_threadgroup: MtlSize,
+    },
+    /// `drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`
+    /// nil: `indirect_buffer` — never nil: the graphics lane's decoder raises on a nil indirect
+    /// buffer first.
+    DrawMeshThreadgroupsIndirect {
+        indirect_buffer: &'a P::Buffer,
+        indirect_buffer_offset: u64,
+        threads_per_object_threadgroup: MtlSize,
+        threads_per_mesh_threadgroup: MtlSize,
+    },
+    /// `drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`
+    /// The graphics lane's only.
+    DrawMeshThreads {
+        threads_per_grid: MtlSize,
+        threads_per_object_threadgroup: MtlSize,
+        threads_per_mesh_threadgroup: MtlSize,
+    },
     /// `drawPatches:patchIndexBuffer:patchIndexBufferOffset:indirectBuffer:indirectBufferOffset:`
     /// nil: `indirect_buffer` — never nil: the decoder raises on a nil indirect buffer first.
     /// nil: `patch_index_buffer` is nil when the command's reference is 0 (no lookup is made).
@@ -296,6 +319,73 @@ pub enum RenderCmd<'a, P: Platform> {
     SetFrontFacingWinding { front_facing_winding: u64 },
     /// `setLineWidth:` (SPI)
     SetLineWidth { line_width: f32 },
+    /// `setMeshBufferOffset:atIndex:` (the graphics lane's only, as every mesh and object
+    /// stage command)
+    SetMeshBufferOffset { offset: u64, index: u64 },
+    /// `setMeshBuffers:offsets:withRange:`
+    /// `buffers`: its length is `range.length`.
+    /// `offsets`: its length is `range.length`.
+    SetMeshBuffers {
+        buffers: &'a [Option<&'a P::Buffer>],
+        offsets: &'a [u64],
+        range: NsRange,
+    },
+    /// `setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:`
+    /// `samplers`: its length is `range.length`.
+    /// `lod_min_clamps`: its length is `range.length`. `lod_max_clamps`: its length is
+    /// `range.length`.
+    SetMeshSamplerStatesLodClamps {
+        samplers: &'a [Option<&'a P::SamplerState>],
+        lod_min_clamps: &'a [f32],
+        lod_max_clamps: &'a [f32],
+        range: NsRange,
+    },
+    /// `setMeshSamplerStates:withRange:`
+    /// `samplers`: its length is `range.length`.
+    SetMeshSamplerStates {
+        samplers: &'a [Option<&'a P::SamplerState>],
+        range: NsRange,
+    },
+    /// `setMeshTextures:withRange:`
+    /// `textures`: its length is `range.length`.
+    SetMeshTextures {
+        textures: &'a [Option<&'a P::Texture>],
+        range: NsRange,
+    },
+    /// `setObjectBufferOffset:atIndex:`
+    SetObjectBufferOffset { offset: u64, index: u64 },
+    /// `setObjectBuffers:offsets:withRange:`
+    /// `buffers`: its length is `range.length`.
+    /// `offsets`: its length is `range.length`.
+    SetObjectBuffers {
+        buffers: &'a [Option<&'a P::Buffer>],
+        offsets: &'a [u64],
+        range: NsRange,
+    },
+    /// `setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:`
+    /// `samplers`: its length is `range.length`.
+    /// `lod_min_clamps`: its length is `range.length`. `lod_max_clamps`: its length is
+    /// `range.length`.
+    SetObjectSamplerStatesLodClamps {
+        samplers: &'a [Option<&'a P::SamplerState>],
+        lod_min_clamps: &'a [f32],
+        lod_max_clamps: &'a [f32],
+        range: NsRange,
+    },
+    /// `setObjectSamplerStates:withRange:`
+    /// `samplers`: its length is `range.length`.
+    SetObjectSamplerStates {
+        samplers: &'a [Option<&'a P::SamplerState>],
+        range: NsRange,
+    },
+    /// `setObjectTextures:withRange:`
+    /// `textures`: its length is `range.length`.
+    SetObjectTextures {
+        textures: &'a [Option<&'a P::Texture>],
+        range: NsRange,
+    },
+    /// `setObjectThreadgroupMemoryLength:atIndex:`
+    SetObjectThreadgroupMemoryLength { length: u64, index: u64 },
     /// `setPointSize:` (SPI)
     SetPointSize { point_size: f32 },
     /// `setPrimitiveRestartEnabled:index:` (SPI)
@@ -499,6 +589,15 @@ impl<P: Platform> RenderCmd<'_, P> {
             Self::DrawIndexedPrimitivesIndirect { .. } => {
                 "drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:"
             }
+            Self::DrawMeshThreadgroups { .. } => {
+                "drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"
+            }
+            Self::DrawMeshThreadgroupsIndirect { .. } => {
+                "drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"
+            }
+            Self::DrawMeshThreads { .. } => {
+                "drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"
+            }
             Self::DrawPatchesIndirect { .. } => {
                 "drawPatches:patchIndexBuffer:patchIndexBufferOffset:indirectBuffer:indirectBufferOffset:"
             }
@@ -551,6 +650,23 @@ impl<P: Platform> RenderCmd<'_, P> {
             Self::SetFragmentTextures { .. } => "setFragmentTextures:withRange:",
             Self::SetFrontFacingWinding { .. } => "setFrontFacingWinding:",
             Self::SetLineWidth { .. } => "setLineWidth:",
+            Self::SetMeshBufferOffset { .. } => "setMeshBufferOffset:atIndex:",
+            Self::SetMeshBuffers { .. } => "setMeshBuffers:offsets:withRange:",
+            Self::SetMeshSamplerStatesLodClamps { .. } => {
+                "setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:"
+            }
+            Self::SetMeshSamplerStates { .. } => "setMeshSamplerStates:withRange:",
+            Self::SetMeshTextures { .. } => "setMeshTextures:withRange:",
+            Self::SetObjectBufferOffset { .. } => "setObjectBufferOffset:atIndex:",
+            Self::SetObjectBuffers { .. } => "setObjectBuffers:offsets:withRange:",
+            Self::SetObjectSamplerStatesLodClamps { .. } => {
+                "setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:"
+            }
+            Self::SetObjectSamplerStates { .. } => "setObjectSamplerStates:withRange:",
+            Self::SetObjectTextures { .. } => "setObjectTextures:withRange:",
+            Self::SetObjectThreadgroupMemoryLength { .. } => {
+                "setObjectThreadgroupMemoryLength:atIndex:"
+            }
             Self::SetPointSize { .. } => "setPointSize:",
             Self::SetPrimitiveRestartEnabled { .. } => "setPrimitiveRestartEnabled:index:",
             Self::SetProvokingVertexMode { .. } => "setProvokingVertexMode:",

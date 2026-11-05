@@ -668,6 +668,26 @@ impl RenderPipeline for Fk<kind::RenderPipeline> {
         1024
     }
 
+    fn max_total_threads_per_object_threadgroup(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.object_threads)
+    }
+
+    fn max_total_threads_per_mesh_threadgroup(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.mesh_threads)
+    }
+
+    fn object_thread_execution_width(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.object_width)
+    }
+
+    fn mesh_thread_execution_width(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.mesh_width)
+    }
+
+    fn max_total_threadgroups_per_mesh_grid(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.grid)
+    }
+
     fn resource_index(&self) -> u64 {
         self.resource_index_value()
     }
@@ -788,6 +808,24 @@ pub struct PipelineModel {
     pub common: ResourceCommon,
     /// A compute pipeline's `staticThreadgroupMemoryLength`.
     pub static_threadgroup_memory_length: u64,
+    /// A mesh render pipeline's answers, in the order of [`MeshLimits`]'s fields (all 0 for any
+    /// other pipeline).
+    pub mesh: MeshLimits,
+}
+
+/// What a fake mesh render pipeline answers for its stages' limits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MeshLimits {
+    /// `maxTotalThreadsPerObjectThreadgroup`.
+    pub object_threads: u64,
+    /// `maxTotalThreadsPerMeshThreadgroup`.
+    pub mesh_threads: u64,
+    /// `objectThreadExecutionWidth`.
+    pub object_width: u64,
+    /// `meshThreadExecutionWidth`.
+    pub mesh_width: u64,
+    /// `maxTotalThreadgroupsPerMeshGrid`.
+    pub grid: u64,
 }
 
 impl Fk<kind::ComputePipeline> {

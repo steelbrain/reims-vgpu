@@ -41,8 +41,9 @@ use reims_vgpu_core::platform::types::{
     TextureLevelInfo, TextureLevelQuery,
 };
 use reims_vgpu_core::platform::values::{
-    ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
-    HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc, SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
+    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc,
+    RenderPipelineDesc, SamplerDesc,
 };
 use reims_vgpu_core::raise::death::DeathKind;
 use reims_vgpu_core::raise::{Kept, keep_forever};
@@ -210,6 +211,57 @@ pub(super) fn create_or_die<T: Message>(
     let made = msg::get(sel, || call(out));
     // SAFETY: Metal wrote nil or an autoreleased NSError to the out-parameter.
     unsafe { made_or_error(made, error) }
+}
+
+/// The refusal of a mesh render pipeline whose stage function is of another stage's type, made
+/// before Metal sees the descriptor: Metal on the M3 Max ends the process with SIGSEGV inside
+/// `newRenderPipelineStateWithMeshDescriptor:options:reflection:error:` at a vertex function as the
+/// mesh function, a mesh function as the fragment function and a fragment function as the object
+/// function, and refuses an object function as the mesh function and a mesh function as the object
+/// function (measured: `guest/bundle/tools/oracle/oracle_mesh`, macOS 27.0.1). A guest's input
+/// never ends the host, so each is refused, in the domain, code and words the guest's bundle
+/// answers it with before it sends the create (the x86 Macs' compiler's domain and codes:
+/// `RgfxRenderPipelineState.mm`, `wrongStageError`).
+fn wrong_mesh_stage(desc: &FullMeshRenderPipelineDesc<'_, MetalPlatform>) -> Option<NsErrorText> {
+    use objc2_metal::{MTLFunction as _, MTLFunctionType};
+    let stage = |f: &MetalFunction| msg::get("functionType", || f.get().functionType());
+    let refusal = |code: i64, description: &str| NsErrorText {
+        domain: "CompilerError".to_owned(),
+        code,
+        description: description.to_owned(),
+    };
+    let mesh = stage(desc.mesh);
+    if mesh == MTLFunctionType::Vertex {
+        return Some(refusal(
+            2,
+            "RasterizationEnabled is false but the vertex shader's return type is not void",
+        ));
+    }
+    if mesh != MTLFunctionType::Mesh {
+        return Some(refusal(
+            1,
+            "meshFunction functionType is not MTLFunctionTypeMesh.",
+        ));
+    }
+    if desc
+        .object
+        .is_some_and(|f| stage(f) != MTLFunctionType::Object)
+    {
+        return Some(refusal(
+            1,
+            "objectFunction functionType is not MTLFunctionTypeObject.",
+        ));
+    }
+    if desc
+        .fragment
+        .is_some_and(|f| stage(f) != MTLFunctionType::Fragment)
+    {
+        return Some(refusal(
+            1,
+            "fragmentFunction functionType is not MTLFunctionTypeFragment.",
+        ));
+    }
+    None
 }
 
 /// A creator's answer: the object it made, else the `NSError` it wrote, else nil.
@@ -818,6 +870,27 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         let d = crate::platform::class_new(objc2_metal::MTLRenderPipelineDescriptor::new);
         desc::apply_full_render_pipeline(desc, &d);
         render_pipeline_state_with_descriptor(self, &d)
+    }
+
+    fn new_mesh_render_pipeline_state_full(
+        &self,
+        desc: &FullMeshRenderPipelineDesc<'_, MetalPlatform>,
+    ) -> Result<Option<MetalRenderPipeline>, NsErrorText> {
+        if let Some(refusal) = wrong_mesh_stage(desc) {
+            return Err(refusal);
+        }
+        let d = crate::platform::class_new(objc2_metal::MTLMeshRenderPipelineDescriptor::new);
+        desc::apply_full_mesh_render_pipeline(desc, &d);
+        let (device, descriptor) = (self.get(), d.get());
+        // SAFETY: `create_or_die`'s out-parameter.
+        create_or_die(
+            "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:",
+            |error| unsafe {
+                DeviceSpi::newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
+                    device, descriptor, 0, error,
+                )
+            },
+        )
     }
 
     fn new_compute_pipeline_state_full(
@@ -1863,6 +1936,151 @@ pub(crate) mod tests {
         let bytes = include_bytes!("../../../../tests/suite/fixtures/shaders/kernel.metallib");
         let lib = d.new_library(bytes).unwrap().unwrap().unwrap();
         assert_eq!(lib.get().functionNames().count(), 1);
+    }
+
+    /// A mesh render pipeline's functions: an object function and the mesh function it feeds, a
+    /// mesh function alone, a fragment function, and a vertex function.
+    const MESH_SOURCE: &str = "#include <metal_stdlib>
+using namespace metal;
+struct V { float4 p [[position]]; };
+using M = metal::mesh<V, void, 3, 1, topology::triangle>;
+struct P { uint n; };
+static void tri(M m, uint t) {
+  if (t == 0) { m.set_primitive_count(1); m.set_index(0, 0); m.set_index(1, 1); m.set_index(2, 2); }
+  if (t < 3) { V v; v.p = float4(float(t) - 1.0, float(t & 1), 0, 1); m.set_vertex(t, v); }
+}
+[[object]] void omain(object_data P &p [[payload]], mesh_grid_properties g,
+                      uint t [[thread_index_in_threadgroup]]) {
+  if (t == 0) { p.n = 1; g.set_threadgroups_per_grid(uint3(1, 1, 1)); }
+}
+[[mesh]] void mpay(M m, const object_data P &p [[payload]], uint t [[thread_index_in_threadgroup]]) {
+  tri(m, t);
+}
+[[mesh]] void mmain(M m, uint t [[thread_index_in_threadgroup]]) { tri(m, t); }
+fragment float4 fmain() { return float4(1, 0, 0, 1); }
+vertex float4 vmain(uint v [[vertex_id]]) { return float4(0, 0, 0, 1); }
+";
+
+    /// A mesh render pipeline of `mesh` (with `object` and `fragment` where given) into one
+    /// BGRA8Unorm target, every other field Metal's.
+    fn mesh_desc<'a>(
+        object: Option<&'a MetalFunction>,
+        mesh: &'a MetalFunction,
+        fragment: Option<&'a MetalFunction>,
+    ) -> FullMeshRenderPipelineDesc<'a, MetalPlatform> {
+        FullMeshRenderPipelineDesc {
+            label: None,
+            object,
+            mesh,
+            fragment,
+            colors: vec![(
+                0,
+                reims_vgpu_core::platform::values::ColorAttachmentDesc {
+                    pixel_format: 80,
+                    ..Default::default()
+                },
+            )],
+            depth_pixel_format: 0,
+            stencil_pixel_format: 0,
+            raster_sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization_enabled: fragment.is_some(),
+            max_total_threads_per_object_threadgroup: 0,
+            max_total_threads_per_mesh_threadgroup: 0,
+            max_total_threadgroups_per_mesh_grid: 0,
+            object_threadgroup_size_is_multiple_of_execution_width: false,
+            mesh_threadgroup_size_is_multiple_of_execution_width: false,
+            payload_memory_length: if object.is_some() { 16 } else { 0 },
+            max_vertex_amplification_count: 1,
+            required_threads_per_object_threadgroup: MtlSize::default(),
+            required_threads_per_mesh_threadgroup: MtlSize::default(),
+            support_indirect_command_buffers: false,
+            object_linked: Default::default(),
+            mesh_linked: Default::default(),
+            fragment_linked: Default::default(),
+        }
+    }
+
+    /// newRenderPipelineStateWithMeshDescriptor:options:reflection:error: makes a mesh render
+    /// pipeline, whose state answers its stages' limits as Metal's does; one whose stage
+    /// function is of another stage's type is refused before Metal sees it, in the x86 Macs'
+    /// domain and codes (Metal on the M3 Max ends the process at a vertex function as the mesh
+    /// function, a mesh function as the fragment function and a fragment function as the object
+    /// function: oracle_mesh, macOS 27.0.1)
+    #[test]
+    fn mesh_render_pipelines() {
+        use reims_vgpu_core::platform::resource::RenderPipeline as _;
+        let d = dev();
+        let library = Obj::from_retained(
+            objc2_metal::MTLDevice::newLibraryWithSource_options_error(
+                d.get(),
+                &NSString::from_str(MESH_SOURCE),
+                None,
+            )
+            .expect("the mesh functions compile"),
+        );
+        let f = |name: &str| function(&library, name);
+        let (omain, mpay, mmain, fmain, vmain) =
+            (f("omain"), f("mpay"), f("mmain"), f("fmain"), f("vmain"));
+
+        let state = d
+            .new_mesh_render_pipeline_state_full(&mesh_desc(Some(&omain), &mpay, Some(&fmain)))
+            .unwrap()
+            .expect("a mesh pipeline with an object stage");
+        assert_eq!(state.max_total_threads_per_threadgroup(), 0);
+        assert_eq!(state.max_total_threads_per_object_threadgroup(), 1024);
+        assert_eq!(state.max_total_threads_per_mesh_threadgroup(), 1024);
+        assert!(state.mesh_thread_execution_width() > 0);
+        assert!(state.object_thread_execution_width() > 0);
+        assert!(state.max_total_threadgroups_per_mesh_grid() > 0);
+        assert!(
+            d.new_mesh_render_pipeline_state_full(&mesh_desc(None, &mmain, None))
+                .unwrap()
+                .is_some(),
+            "a mesh pipeline that does not rasterize"
+        );
+
+        let refused = |object, mesh, fragment| {
+            d.new_mesh_render_pipeline_state_full(&mesh_desc(object, mesh, fragment))
+                .err()
+                .map(|e| (e.domain, e.code, e.description))
+        };
+        let words = |code: i64, description: &str| {
+            Some(("CompilerError".to_owned(), code, description.to_owned()))
+        };
+        assert_eq!(
+            refused(None, &vmain, Some(&fmain)),
+            words(
+                2,
+                "RasterizationEnabled is false but the vertex shader's return type is not void"
+            )
+        );
+        assert_eq!(
+            refused(None, &omain, Some(&fmain)),
+            words(1, "meshFunction functionType is not MTLFunctionTypeMesh.")
+        );
+        assert_eq!(
+            refused(Some(&fmain), &mpay, Some(&fmain)),
+            words(
+                1,
+                "objectFunction functionType is not MTLFunctionTypeObject."
+            )
+        );
+        assert_eq!(
+            refused(Some(&mmain), &mpay, Some(&fmain)),
+            words(
+                1,
+                "objectFunction functionType is not MTLFunctionTypeObject."
+            )
+        );
+        assert_eq!(
+            refused(None, &mmain, Some(&mpay)),
+            words(
+                1,
+                "fragmentFunction functionType is not MTLFunctionTypeFragment."
+            )
+        );
     }
 
     /// newComputePipelineStateWithFunction:error: and

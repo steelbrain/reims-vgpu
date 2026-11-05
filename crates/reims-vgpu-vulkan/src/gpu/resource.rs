@@ -2128,6 +2128,31 @@ impl RenderPipeline for VulkanRenderPipeline {
         u64::from(plain(|| self.raw.max_total_threads_per_threadgroup()))
     }
 
+    /// 0: this platform makes no mesh pipeline yet.
+    fn max_total_threads_per_object_threadgroup(&self) -> u64 {
+        0
+    }
+
+    /// 0: this platform makes no mesh pipeline yet.
+    fn max_total_threads_per_mesh_threadgroup(&self) -> u64 {
+        0
+    }
+
+    /// 0: this platform makes no mesh pipeline yet.
+    fn object_thread_execution_width(&self) -> u64 {
+        0
+    }
+
+    /// 0: this platform makes no mesh pipeline yet.
+    fn mesh_thread_execution_width(&self) -> u64 {
+        0
+    }
+
+    /// 0: this platform makes no mesh pipeline yet.
+    fn max_total_threadgroups_per_mesh_grid(&self) -> u64 {
+        0
+    }
+
     fn resource_index(&self) -> u64 {
         plain(|| self.raw.resource_index())
     }
