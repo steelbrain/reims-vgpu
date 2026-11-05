@@ -638,6 +638,29 @@ impl<P: Platform> SurfaceViews<P> {
         crate::device_writes::page_runs(&pages, GUEST_PAGE)
     }
 
+    /// Each guest page of `runs`, in their order, as its host address in the guest's RAM mapping
+    /// and its bytes (a run's last may be short): what a cache the host's CPU copies reads and
+    /// writes ([`super::surface_cache`]'s copied pages). `None` where the host has no mapping of
+    /// the guest's RAM, or a page of them lies outside it.
+    pub(crate) fn host_pages_in_order(&self, runs: &[RgfxPageRun]) -> Option<Vec<(HostPtr, u64)>> {
+        let (memory, _) = self.memory.as_ref()?;
+        let mut pages = Vec::new();
+        for r in runs {
+            let end = r.address.checked_add(r.length)?;
+            let mut at = r.address;
+            while at < end {
+                let bytes = (GUEST_PAGE - at % GUEST_PAGE).min(end - at);
+                let host = memory.virtual_address_for_physical(at, bytes);
+                if host.is_null() {
+                    return None;
+                }
+                pages.push((host, bytes));
+                at += bytes;
+            }
+        }
+        Some(pages)
+    }
+
     /// The block at `offset` went (its `BLOCK_RELEASE`): its view goes once the buffers over it
     /// and the cache have let it go, and what the block held of it is returned, for the caller to
     /// let go of with no lock held.

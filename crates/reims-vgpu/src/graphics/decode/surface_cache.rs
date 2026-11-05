@@ -41,7 +41,12 @@
 //!   ([`RGFX_SURFACE_PAGES_ATTACH`](reims_graphics::wire::RGFX_SURFACE_PAGES_ATTACH)), and the
 //!   cache takes them as they are, keeping its bytes, its generation and whether a buffer wrote
 //!   it, so the download that follows copies what the GPU wrote. A release of a block whose pages
-//!   were never named copies nothing. Such caches hold at most the device's budget of them
+//!   were never named copies nothing. Pages the host makes no view of, or no buffer over, at that
+//!   naming are taken all the same, copied (`CachePages::Copied`): each fill and download goes
+//!   through a Shared buffer of its own, which the host's CPU fills from the pages, or empties into
+//!   them once the GPU's copy is done, through its mapping of the guest's RAM, in place of the
+//!   refusal that left the CPU lock asking with pages that held neither the GPU's writes nor a
+//!   way for its own to reach the GPU. Such caches hold at most the device's budget of them
 //!   (`DEFERRED_BUDGET_LO`), from their make to their release, named or not; a block past it, or
 //!   one whose cache the platform does not make, is refused with no cache, and the kext names its
 //!   pages instead.
@@ -75,10 +80,13 @@ use std::sync::{Arc, OnceLock};
 
 use reims_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
 use reims_graphics::wire::RgfxBufferOverSurfacePages;
+use reims_vgpu_core::host::HostPtr;
+use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::EventRef;
+use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::NsRange;
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
@@ -94,6 +102,8 @@ const ON: OnFault = OnFault::Return;
 
 /// `MTLResourceStorageModePrivate`, in `MTLResourceOptions`.
 pub(crate) const STORAGE_PRIVATE: u64 = 2 << 4;
+/// `MTLResourceStorageModeShared`, in `MTLResourceOptions`.
+const STORAGE_SHARED: u64 = 0;
 /// `MTLResourceStorageModeMask`.
 pub(crate) const STORAGE_MASK: u64 = 0xf << 4;
 
@@ -101,9 +111,9 @@ pub(crate) const STORAGE_MASK: u64 = 0xf << 4;
 pub(crate) struct SurfaceCache<P: Platform> {
     /// The cache: a Private buffer of the surface's bytes, which the block's buffers are.
     device: P::Buffer,
-    /// A Shared buffer over the surface's own pages, the other end of each copy; `None` for a
-    /// deferred block whose pages the kext has not named yet.
-    pages: Option<P::Buffer>,
+    /// The surface's pages, the other end of each copy; `None` for a deferred block whose pages
+    /// the kext has not named yet.
+    pages: Option<CachePages<P>>,
     /// The surface's bytes.
     length: u64,
     /// The CPU's generation of the surface the cache holds; `None` until its first fill.
@@ -119,6 +129,69 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// `BUFFER_OVER_SURFACE_PAGES` is checked against while the block has no view: its cache
     /// counts against the deferred budget until it goes, its pages named or not.
     deferred: Option<u64>,
+}
+
+/// A cache's other end: the surface's pages.
+enum CachePages<P: Platform> {
+    /// A Shared buffer over the pages, the surface's view of them.
+    View(P::Buffer),
+    /// A deferred block's pages the host made no view of, or no buffer over, at their naming:
+    /// copied through a Shared buffer of each copy's own (the module doc).
+    Copied(Arc<CopiedPages>),
+}
+
+/// The pages of a copied cache ([`CachePages::Copied`]): each run of them the guest's RAM
+/// mapping holds contiguously, as its host address and its bytes, in the surface's order.
+struct CopiedPages {
+    runs: Vec<(HostPtr, u64)>,
+}
+
+impl CopiedPages {
+    /// The pages of `runs` (host address, bytes), merged where one ends where the next starts,
+    /// where they hold at least `length` bytes; `None` otherwise.
+    fn new(runs: &[(HostPtr, u64)], length: u64) -> Option<Self> {
+        let mut merged: Vec<(HostPtr, u64)> = Vec::new();
+        let mut total = 0u64;
+        for &(at, bytes) in runs {
+            total = total.checked_add(bytes)?;
+            let follows = |&(start, len): &(HostPtr, u64)| {
+                start.addr().to_u64().checked_add(len) == Some(at.addr().to_u64())
+            };
+            match merged.last_mut() {
+                Some(last) if follows(last) => last.1 += bytes,
+                _ => merged.push((at, bytes)),
+            }
+        }
+        (total >= length && length != 0).then_some(CopiedPages { runs: merged })
+    }
+
+    /// Copies the first `length` bytes of the pages into `to`, or the other way where `into`,
+    /// in the surface's order.
+    ///
+    /// # Safety
+    /// `buffer` is `length` bytes the caller may read and write that no GPU work uses now; each
+    /// run is the host's mapping of guest RAM pages the kext holds wired while their block is
+    /// named, which the guest's CPU may write meanwhile, as on a GPU of its own memory.
+    unsafe fn copy(&self, buffer: *mut u8, length: u64, into: bool) {
+        let mut at = 0u64;
+        for &(host, bytes) in &self.runs {
+            if at >= length {
+                break;
+            }
+            let n = bytes.min(length - at);
+            let page = host.as_ptr::<u8>();
+            // SAFETY: the caller's; `at + n` is at most `length`, and the run holds `n` bytes.
+            unsafe {
+                let here = buffer.add(at.to_usize());
+                if into {
+                    std::ptr::copy_nonoverlapping(here, page, n.to_usize());
+                } else {
+                    std::ptr::copy_nonoverlapping(page, here, n.to_usize());
+                }
+            }
+            at += n;
+        }
+    }
 }
 
 /// The host's transfer queue, on which every copy runs, and the event its fills signal.
@@ -253,6 +326,8 @@ pub(crate) struct CacheCounts {
     pub(crate) deferred: u64,
     pub(crate) deferred_refused: u64,
     pub(crate) attached: u64,
+    /// Of them, pages the host made no view of, or no buffer over, copied instead.
+    pub(crate) attached_copied: u64,
     pub(crate) unattached: u64,
 }
 
@@ -418,7 +493,7 @@ impl<P: Platform> SurfaceCaches<P> {
             block,
             SurfaceCache {
                 device: cache,
-                pages: Some(pages),
+                pages: Some(CachePages::View(pages)),
                 length,
                 generation: None,
                 written: false,
@@ -550,7 +625,7 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(Some(false));
         };
         if let Some(cache) = self.by_block.get_mut(&block) {
-            cache.pages = Some(pages);
+            cache.pages = Some(CachePages::View(pages));
         }
         let pages = Pages {
             runs: host_pages,
@@ -561,6 +636,34 @@ impl<P: Platform> SurfaceCaches<P> {
         Ok(Some(true))
     }
 
+    /// The pages of the deferred block at `block`, `copied` from the guest's RAM, whose host
+    /// addresses are `host_pages` ([`Self::make`]), taken for its cache where the host made no
+    /// view of them or no buffer over it (`CachePages::Copied`), as [`Self::attach`] takes them:
+    /// `Some(true)`; `Some(false)` where they hold fewer bytes than the cache; `None` where the
+    /// block has no deferred cache whose pages are not named.
+    pub(crate) fn attach_copied(
+        &mut self,
+        block: u64,
+        copied: &[(HostPtr, u64)],
+        host_pages: Vec<Range<u64>>,
+    ) -> Option<bool> {
+        let length = self.unattached(block)?;
+        let Some(copied) = CopiedPages::new(copied, length) else {
+            return Some(false);
+        };
+        if let Some(cache) = self.by_block.get_mut(&block) {
+            cache.pages = Some(CachePages::Copied(Arc::new(copied)));
+        }
+        let pages = Pages {
+            runs: host_pages,
+            written: false,
+        };
+        self.watched.0.lock().insert(block, pages);
+        self.counts.attached += 1;
+        self.counts.attached_copied += 1;
+        Some(true)
+    }
+
     /// The bytes of the deferred block at `block`'s cache, where its pages are not named yet.
     pub(crate) fn unattached(&self, block: u64) -> Option<u64> {
         (self.by_block.get(&block))
@@ -569,12 +672,13 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The cache of the deferred block `m` names, which has no view while its pages are not
-    /// named, where the block's size holds the `m.block_size` bytes `m` names and the cache at
-    /// least `m.length` bytes, as a view's are checked ([`super::surface_pages::SurfaceViews::view_for`]).
+    /// named, nor where they are copied, where the block's size holds the `m.block_size` bytes `m`
+    /// names and the cache at least `m.length` bytes, as a view's are checked
+    /// ([`super::surface_pages::SurfaceViews::view_for`]).
     pub(crate) fn deferred_buffer(&self, m: &RgfxBufferOverSurfacePages) -> Option<&P::Buffer> {
         (self.by_block.get(&m.block_offset))
             .filter(|c| {
-                c.pages.is_none()
+                !matches!(c.pages, Some(CachePages::View(_)))
                     && c.deferred.is_some_and(|size| m.block_size <= size)
                     && m.length != 0
                     && m.length <= c.length
@@ -806,7 +910,9 @@ impl<P: Platform> SurfaceCaches<P> {
             return Ok(());
         };
         wait_for_users::<P>(&cb, &self.ends, cache)?;
-        copy::<P>(&cb, pages, &cache.device, cache.length)?;
+        if !pages_into_cache::<P>(device, &cb, pages, &cache.device, cache.length)? {
+            return Ok(());
+        }
         transfer.signalled += 1;
         let value = transfer.signalled;
         cb.encode_signal(Some(EventRef::Event(&transfer.event)), value)?;
@@ -947,13 +1053,34 @@ impl<P: Platform> SurfaceCaches<P> {
             done();
             return Ok(());
         };
+        // A copied cache's pages take the staging buffer's bytes once the GPU's copy into it is
+        // done, before `done`.
+        let (to, copied) = match pages {
+            CachePages::View(pages) => (pages.clone_ref(), None),
+            CachePages::Copied(copied) => {
+                let Some(staging) =
+                    device.new_buffer_of_length(ON, cache.length, STORAGE_SHARED)?
+                else {
+                    done();
+                    return Ok(());
+                };
+                (staging, Some(Arc::clone(copied)))
+            }
+        };
         wait_for_users::<P>(&cb, &self.ends, cache)?;
-        copy::<P>(&cb, &cache.device, pages, cache.length)?;
+        copy::<P>(&cb, &cache.device, &to, cache.length)?;
         // The buffers live until the copy is done, past the cache's own end at a release.
-        let held = (cache.device.clone_ref(), pages.clone_ref());
+        let length = cache.length;
+        let held = (cache.device.clone_ref(), to);
         cb.add_completed_handler(
             ON,
             Box::new(move |_: CompletedInfo| {
+                if let Some(copied) = copied {
+                    let contents = held.1.contents().as_ptr::<u8>();
+                    // SAFETY: the staging buffer's `length` Shared bytes, which the copy into it,
+                    // now done, was the last GPU work to use; the pages are named, so wired.
+                    unsafe { copied.copy(contents, length, true) };
+                }
                 drop(held);
                 done();
             }),
@@ -1440,6 +1567,17 @@ impl<P: Platform> Caches<P> {
         self.state.lock().attach(device, block, view, host_pages)
     }
 
+    /// The deferred block at `block`'s pages taken copied ([`SurfaceCaches::attach_copied`]),
+    /// which copies nothing, so waits for no command buffer.
+    pub(crate) fn attach_copied(
+        &self,
+        block: u64,
+        copied: &[(HostPtr, u64)],
+        host_pages: Vec<Range<u64>>,
+    ) -> Option<bool> {
+        self.state.lock().attach_copied(block, copied, host_pages)
+    }
+
     /// Waits, on the calling thread, for the last fill of the block at `block`'s cache to be done,
     /// `timeout` at most, with no lock held, woken by the fill's completed handler: for work the
     /// host starts outside a command buffer that writes the cache, which a command buffer's wait
@@ -1464,6 +1602,36 @@ fn wait_for_users<P: Platform>(
         }
     }
     Ok(())
+}
+
+/// Encodes on `cb` a copy of the surface's `length` bytes from its pages into `cache`: from its
+/// view, or, where they are copied, from a Shared buffer of the copy's own that the host's CPU
+/// fills from the pages now, the CPU's writes before the command buffer that asked the fill in
+/// them, and that lives until the copy is done. False, with nothing encoded, where the platform
+/// made no such buffer.
+fn pages_into_cache<P: Platform>(
+    device: &P::Device,
+    cb: &P::CommandBuffer,
+    pages: &CachePages<P>,
+    cache: &P::Buffer,
+    length: u64,
+) -> RaiseResult<bool> {
+    let copied = match pages {
+        CachePages::View(view) => {
+            copy::<P>(cb, view, cache, length)?;
+            return Ok(true);
+        }
+        CachePages::Copied(copied) => copied,
+    };
+    let Some(staging) = device.new_buffer_of_length(ON, length, STORAGE_SHARED)? else {
+        return Ok(false);
+    };
+    // SAFETY: the new buffer's `length` Shared bytes, which no GPU work uses yet; the pages are
+    // named, so wired.
+    unsafe { copied.copy(staging.contents().as_ptr::<u8>(), length, false) };
+    copy::<P>(cb, &staging, cache, length)?;
+    cb.add_completed_handler(ON, Box::new(move |_: CompletedInfo| drop(staging)))?;
+    Ok(true)
 }
 
 /// Encodes a copy of `length` bytes from `from` to `to` on `cb`.
@@ -1503,7 +1671,6 @@ mod tests {
         RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
         RgfxMsgHeader, RgfxObjectDestroy, RgfxQueueCreate,
     };
-    use reims_vgpu_core::num::ToU64 as _;
     use reims_vgpu_core::testkit::calllog::{Arg, Call};
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
@@ -2505,5 +2672,131 @@ mod tests {
         assert_eq!(defer(&mut r, fourth, page), refused, "no caches");
         let mut none = deferring(0);
         assert_eq!(defer(&mut none, BLOCK, page), refused, "no budget");
+    }
+
+    /// The live Shared buffer `id`'s bytes, each set to `with` first where given.
+    fn buffer_bytes(r: &Rig, id: u64, with: Option<u8>) -> Vec<u8> {
+        use reims_vgpu_core::platform::ObjId;
+        use reims_vgpu_core::testkit::objects::kind;
+        let buffer = (r.p.world().find(ObjId(id)))
+            .and_then(|o| o.cast::<kind::Buffer>())
+            .expect("a live buffer");
+        let (contents, length) = (buffer.contents(), buffer.length());
+        assert!(!contents.is_null(), "a Shared buffer");
+        // SAFETY: a live Shared buffer's `length` bytes, which no work of the test's uses now.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(contents.as_ptr::<u8>(), length.to_usize()) };
+        if let Some(value) = with {
+            bytes.fill(value);
+        }
+        bytes.to_vec()
+    }
+
+    /// The `length` bytes of guest RAM from page `first`, read, or written with `with`.
+    fn ram_bytes(r: &Rig, first: u64, length: u64, with: Option<u8>) -> Vec<u8> {
+        let at = r
+            .ram
+            .host_addr(RAM + first * r.page)
+            .unwrap()
+            .as_ptr::<u8>();
+        // SAFETY: the rig's RAM, `length` bytes from page `first` in it, which no work uses now.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(at, length.to_usize()) };
+        if let Some(value) = with {
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = value ^ (i as u8);
+            }
+        }
+        bytes.to_vec()
+    }
+
+    /// A deferred block's pages that the host makes no buffer over, at the CPU lock that names
+    /// them, are taken copied, not refused: a download copies the cache into a Shared buffer of
+    /// its own, whose bytes the host's CPU moves into the pages once that copy is done, before
+    /// the answer; a fill after the CPU's write copies the pages into another such buffer, which
+    /// the GPU copies into the cache; the block's buffers are its cache. Runs that are not the
+    /// surface's bytes are refused still
+    #[test]
+    fn a_deferred_blocks_pages_with_no_view_are_copied() {
+        use reims_vgpu_core::testkit::Step;
+        let mut r = deferring(8);
+        let page = r.page;
+        let length = 2 * page;
+        assert_eq!(defer(&mut r, BLOCK, length), RGFX_STATUS_OK);
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let before = ram_bytes(&r, 1, length, Some(0x5a));
+        assert_eq!(
+            attach(&mut r, BLOCK, 0, &[(1, 1)], length),
+            RGFX_STATUS_REFUSED,
+            "runs short of the surface are refused"
+        );
+        assert_eq!(r.dec.caches().unattached(BLOCK), Some(length));
+        // The platform makes no buffer over the pages' view (`buffer_over`).
+        r.p.script().push("newBufferWithDescriptor:", Step::Nil);
+        assert_eq!(
+            attach(&mut r, BLOCK, 0, &[(1, 2)], length),
+            RGFX_STATUS_OK,
+            "no buffer over the view: copied, not refused"
+        );
+        assert_eq!(r.dec.caches().unattached(BLOCK), None);
+        assert_eq!(r.dec.caches().counts().attached_copied, 1);
+        assert_eq!(cache_id(&r), cache, "the same cache");
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.buffer(0x300, BLOCK, length), Ok(()));
+        assert!(
+            r.p.call_log().sels_since(mark).is_empty(),
+            "no buffer made: its buffers are the cache"
+        );
+
+        // The download: the GPU copies the cache into a staging buffer; the pages take it once
+        // that copy is done, then the answer.
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let out = copies(&r.p.call_log().since(mark));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, cache, "out of the cache");
+        assert_ne!(out[0].1, cache);
+        assert!(!done.load(Ordering::SeqCst), "not before the copy is done");
+        assert_eq!(
+            ram_bytes(&r, 1, length, None),
+            before,
+            "the pages wait for it"
+        );
+        // As the GPU's copy would, the staging buffer takes the cache's bytes.
+        assert_eq!(
+            buffer_bytes(&r, out[0].1, Some(0xc3)).len(),
+            length.to_usize()
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(
+            done.load(Ordering::SeqCst),
+            "answered once the pages hold it"
+        );
+        assert!(
+            ram_bytes(&r, 1, length, None).iter().all(|&b| b == 0xc3),
+            "the pages hold what the GPU copied out of the cache"
+        );
+
+        // The CPU writes the pages under a read-write lock: the next use fills the cache from
+        // them, through a staging buffer the host's CPU filled.
+        let written = ram_bytes(&r, 1, length, Some(0x11));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+        let filled = copies(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1);
+        assert_eq!(filled[0].1, cache, "into the cache");
+        assert_ne!(filled[0].0, out[0].1, "from a staging buffer of its own");
+        assert_eq!(
+            buffer_bytes(&r, filled[0].0, None),
+            written,
+            "the CPU's write, in the fill's staging buffer before the GPU copies it"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let released = release(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(released.load(Ordering::SeqCst));
+        assert_eq!(r.dec.caches().len(), 0);
     }
 }

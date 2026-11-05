@@ -1033,10 +1033,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                     "IOSurface device caches: {} made; {} fills of {} MiB, {} downloads of {} MiB, \
                      {} asked of a cache nothing wrote; {} fills or downloads the host's devices' \
                      writes changed; {} written caches copied at a release with no client \
-                     left; {} deferred, {} refused, {} named their pages, {} released unnamed",
+                     left; {} deferred, {} refused, {} named their pages ({} copied), {} \
+                     released unnamed",
                     d.made, d.fills, d.filled_bytes >> 20, d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread, d.deferred,
-                    d.deferred_refused, d.attached, d.unattached
+                    d.deferred_refused, d.attached, d.attached_copied, d.unattached
                 );
             }
         }
@@ -1115,8 +1116,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     ///   the device keeps no caches, the deferred caches' budget has no room or the platform made
     ///   none, and the kext then names the block's pages as any block's;
     /// - its pages, found by the block whatever context sends them (the maker's may have closed),
-    ///   get a view, which the cache takes, keeping its bytes: [`RGFX_STATUS_OK`], else
-    ///   [`RGFX_STATUS_REFUSED`] with the cache as it was, its pages not named;
+    ///   get a view, which the cache takes, keeping its bytes: [`RGFX_STATUS_OK`]. Where the host
+    ///   makes no view of them, or no buffer over it, the cache takes them copied, through the
+    ///   host's mapping of the guest's RAM ([`surface_cache`]'s module doc): [`RGFX_STATUS_OK`]
+    ///   too. [`RGFX_STATUS_REFUSED`], with the cache as it was and its pages not named, only
+    ///   where the runs are not the surface's bytes of guest RAM the host maps;
     ///   [`RGFX_STATUS_INVALID_ARGUMENT`] for a block with no deferred cache whose pages are not
     ///   named, with no view made.
     ///
@@ -1182,6 +1186,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             runs,
             settle,
         );
+        // Runs that are not whole guest pages summing to the surface, or with no guest RAM to map,
+        // are refused; pages the host made no view of, or no buffer over, are copied instead.
+        let copyable = !matches!(
+            made,
+            Ok(Some(Err(surface_pages::PagesRefusal::NoMemoryMap
+                | surface_pages::PagesRefusal::PageSize
+                | surface_pages::PagesRefusal::Unaligned
+                | surface_pages::PagesRefusal::Length)))
+        );
         let why = match made {
             Ok(None) => return None,
             Ok(Some(Ok(()))) => {
@@ -1207,6 +1220,26 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(Some(Err(why))) => format!("no view of its pages ({why:?})"),
             Err(raise) => format!("the platform raised at its view ({raise:?})"),
         };
+        if copyable {
+            let (copied, host_pages) = {
+                let views = views.lock();
+                (views.host_pages_in_order(runs), views.host_runs(runs))
+            };
+            let taken = copied.map(|c| self.surface_caches.attach_copied(block, &c, host_pages));
+            match taken {
+                Some(Some(true)) => {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "the IOSurface block at {block:#x}: its deferred device cache took its {} \
+                         runs copied, the host's CPU moving its bytes: {why}",
+                        runs.len()
+                    );
+                    return Some(RGFX_STATUS_OK);
+                }
+                Some(None) => return Some(RGFX_STATUS_INVALID_ARGUMENT),
+                Some(Some(false)) | None => {}
+            }
+        }
         log::warn!(
             target: "reims_vgpu::graphics",
             "the IOSurface block at {block:#x}: its deferred device cache took none of its {} \
