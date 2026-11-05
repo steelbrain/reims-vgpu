@@ -3476,8 +3476,8 @@ void test_linked_function_specialised_on_the_wire()
 	    { "effect_vertex", 0, {} },
 	    { "effect_fragment", 1, { { "state", 36, 0, true } } },
 	}));
-	// An entry the table reads as a visible function.
-	RgfxLibrary *gradients = make(metallibOf({ { "gradient_v1", 3, { { "variant", 33, 1, true } } } }));
+	// A visible function's entry (TYPE 4, as Apple's compiler writes one).
+	RgfxLibrary *gradients = make(metallibOf({ { "gradient_v1", 4, { { "variant", 33, 1, true } } } }));
 	static const uint32_t state[4] = { 0x465, 0x82, 0x1145e, 0xc };
 	static const uint32_t variant = 7;
 	MTLFunctionConstantValues *fragmentValues = [MTLFunctionConstantValues new];
