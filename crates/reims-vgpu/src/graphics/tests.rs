@@ -3461,6 +3461,72 @@ fn a_drain_s_first_doorbell_to_its_last_cb_complete() {
     }
 }
 
+/// What a CPU lock's `SURFACE_DOWNLOAD` costs the device from its doorbell to its `COMPLETE`
+/// where the surface's pages already hold its cache (a decoder's output whose early copy has
+/// landed, or a cache nothing wrote): the control thread's wake and take, a block lane's wake
+/// where the download goes to the lane, and the answer, with the device's threads asleep before
+/// each, as between a client's frames. The fake platform's GPU shares the CPU's memory, so the
+/// block has no cache and the host answers at once, as it does a landed copy. Printed as p50,
+/// p90 and p99 in microseconds over 2000 downloads, after 100 to warm up: a measurement, run by
+/// hand (`--run-ignored only --no-capture`, in a release build).
+#[test]
+#[ignore = "a measurement, run by hand"]
+#[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+fn a_landed_download_s_doorbell_to_its_answer() {
+    use std::time::Instant;
+
+    const ROUNDS: usize = 2000;
+    const WARM: usize = 100;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let download = RgfxSurfaceDownload {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SURFACE_DOWNLOAD,
+            size: 0,
+            seqno: 0,
+        },
+        block_offset: BLOCK,
+    };
+    let mut us = Vec::with_capacity(ROUNDS);
+    for round in 0..WARM + ROUNDS {
+        // A pause as between a client's frames, so the device's threads sleep.
+        std::thread::sleep(Duration::from_millis(2));
+        let start = Instant::now();
+        guest.send(&device, download.as_bytes().to_vec());
+        let bytes = loop {
+            if let Some(bytes) = guest.event_now() {
+                break bytes;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "the download went unanswered"
+            );
+            std::hint::spin_loop();
+        };
+        let elapsed = start.elapsed();
+        let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            (complete.header.r#type, complete.status),
+            (RGFX_EVT_COMPLETE, RGFX_STATUS_OK)
+        );
+        if round >= WARM {
+            us.push(elapsed.as_secs_f64() * 1e6);
+        }
+    }
+    us.sort_by(f64::total_cmp);
+    let n = us.len();
+    println!(
+        "landed download, doorbell to COMPLETE: p50 {:.1} p90 {:.1} p99 {:.1} max {:.1} us",
+        us[n / 2],
+        us[n * 9 / 10],
+        us[n * 99 / 100],
+        us[n - 1],
+    );
+}
+
 /// A command buffer that asks for its `CB_SUBMITTED`, sent behind one of its queue that waits for
 /// an event and is still being walked, is answered at its scheduling, after that one's, not at its
 /// take: the waiting one holds its queue from its begin, as it would from its commit had it been
