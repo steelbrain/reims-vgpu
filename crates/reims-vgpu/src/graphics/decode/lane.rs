@@ -10,11 +10,20 @@
 //!   wait for nothing, are carried out on the service thread instead, as each waits there for
 //!   nothing (`graphics.rs`'s `carry_out`).
 //! - **Threads.** A lane with work has one thread of its own, made as a job comes and none is
-//!   running, which goes once it has had no job for [`IDLE`]. A job that comes while every thread
-//!   of the lane is busy may get the lane another, up to [`LANE_THREADS`] in all, where the
-//!   device's budget of such threads ([`Budget`]) has one to spare; a lane never waits for the
-//!   budget, so those threads add speed and nothing else, and a device of many busy queues holds
-//!   one thread a busy lane and the budget's at most.
+//!   running. A job that comes while every thread of the lane is busy may get the lane another,
+//!   up to [`LANE_THREADS`] in all, where the device's budget of such threads ([`Budget`]) has one
+//!   to spare; a lane never waits for the budget, so those threads add speed and nothing else, and
+//!   a device of many busy queues holds one thread a busy lane and the budget's at most.
+//! - **Which thread takes a job.** A job goes to the lane's thread that went idle last, so the
+//!   jobs of a lane that needs one thread at a time stay on one thread, and a thread goes once it
+//!   has had no job for [`IDLE`]: the threads a burst of jobs made go a second after the burst,
+//!   and a burst after that grows the lane again as the first did. A thread that goes gives back
+//!   the budget's thread first, so the lane's own is the last to go. Woken in turn instead, the
+//!   longest idle first, every thread took a job in each round and none went: a game's queue kept
+//!   the three threads it had from the game's start, one of which ran on the host's efficiency
+//!   cores alone, and its walks took 13.4 ms of CPU a frame where two threads took 10.4 ms
+//!   (game_6000 at 92.7 against 105.6 fps, on a Core Ultra 9 275HX host with an RTX 5080 Laptop
+//!   GPU; measured).
 //! - **Turns.** Each command buffer is given a turn as it is begun, in the order they are taken
 //!   ([`Lane::turn`]). Its commit (or its stand-in's, or the failure posted at once for it) waits
 //!   for its turn ([`Turn::wait`]), which comes once every turn before it has passed, and its turn
@@ -97,8 +106,11 @@ struct State {
     own: bool,
     /// The budget's threads the lane has.
     extra: usize,
-    /// How many of the lane's threads wait for a job.
-    idle: usize,
+    /// The lane's threads that wait for a job, the one that went idle last at the end: a job wakes
+    /// it first (the module doc).
+    idle: Vec<Arc<Idler>>,
+    /// The threads woken for a job that have not yet taken the lane's lock again.
+    woken: usize,
     /// The queue went: its threads go once its jobs are done.
     closed: bool,
     /// The turns given so far, and every turn below `passed` has passed.
@@ -108,15 +120,22 @@ struct State {
     early: BTreeSet<u64>,
 }
 
+/// A lane's thread waiting for a job ([`State::idle`]).
+#[derive(Default)]
+struct Idler {
+    /// A job came for it, or the lane closed.
+    wake: Condvar,
+}
+
 /// A command queue's lane (the module doc).
 pub(crate) struct Lane {
     /// The queue's id, for its threads' names.
     queue: u64,
     /// The device's budget of extra threads.
     budget: Arc<Budget>,
+    /// How long a thread of the lane's stays with no job before it goes: [`IDLE`].
+    idle_for: Duration,
     state: Mutex<State>,
-    /// A job came, or the lane closed.
-    work: Condvar,
     /// A turn passed.
     turned: Condvar,
 }
@@ -130,11 +149,16 @@ impl std::fmt::Debug for Lane {
 impl Lane {
     /// The lane of queue `queue`, with no thread yet, its extra threads from `budget`.
     pub(crate) fn new(queue: u64, budget: Arc<Budget>) -> Arc<Lane> {
+        Lane::with_idle(queue, budget, IDLE)
+    }
+
+    /// The lane of queue `queue`, whose threads go after `idle_for` with no job.
+    fn with_idle(queue: u64, budget: Arc<Budget>, idle_for: Duration) -> Arc<Lane> {
         Arc::new(Lane {
             queue,
             budget,
+            idle_for,
             state: Mutex::default(),
-            work: Condvar::new(),
             turned: Condvar::new(),
         })
     }
@@ -174,16 +198,21 @@ impl Lane {
     }
 
     /// Runs `job` on one of the lane's threads, after the jobs that came before it have started:
-    /// an idle one, else the lane's own where it has none, else one of the budget's where every
-    /// thread of the lane is busy and the budget has one to spare, else the next of the lane's
-    /// to be free. On the calling thread where the lane has no thread and none can be made.
+    /// the idle one that went idle last, else the lane's own where it has none, else one of the
+    /// budget's where every thread of the lane is busy and the budget has one to spare, else the
+    /// next of the lane's to be free. On the calling thread where the lane has no thread and none
+    /// can be made.
     pub(crate) fn run(self: &Arc<Self>, job: Job) {
         let mut state = self.state.lock();
         state.jobs.push_back(job);
-        // An idle thread for each job not yet started: one woken before takes the one before.
-        if state.idle >= state.jobs.len() {
+        // A woken thread for each job not yet started: one woken before takes the one before.
+        if state.woken >= state.jobs.len() {
+            return;
+        }
+        if let Some(idler) = state.idle.pop() {
+            state.woken += 1;
             drop(state);
-            self.work.notify_one();
+            idler.wake.notify_one();
             return;
         }
         let own = !state.own;
@@ -198,7 +227,7 @@ impl Lane {
         let lane = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name(format!("reims-vgpu.graphics-lane-{:#x}", self.queue))
-            .spawn(move || lane.serve(own));
+            .spawn(move || lane.serve());
         if spawned.is_err() {
             let mut state = self.state.lock();
             if !own {
@@ -221,9 +250,11 @@ impl Lane {
         }
     }
 
-    /// A lane thread, the lane's `own` or one of the budget's: the jobs, in the order they came,
-    /// until the lane closes with none left or none comes for [`IDLE`].
-    fn serve(&self, own: bool) {
+    /// A lane thread: the jobs, in the order they came, until the lane closes with none left or
+    /// none comes for the lane's `idle_for`. It goes as one of the budget's where the lane has any,
+    /// else as the lane's own, so the lane's own thread is the last to go.
+    fn serve(&self) {
+        let me = Arc::new(Idler::default());
         let mut state = self.state.lock();
         loop {
             if let Some(job) = state.jobs.pop_front() {
@@ -235,25 +266,36 @@ impl Lane {
             if state.closed {
                 break;
             }
-            state.idle += 1;
-            let waited = self.work.wait_for(&mut state, IDLE);
-            state.idle -= 1;
+            state.idle.push(Arc::clone(&me));
+            let waited = me.wake.wait_for(&mut state, self.idle_for);
+            // Still among the idle where nothing woke it; else a job or the close took it out.
+            if let Some(at) = state.idle.iter().rposition(|idler| Arc::ptr_eq(idler, &me)) {
+                state.idle.remove(at);
+            } else {
+                state.woken -= 1;
+            }
             if waited.timed_out() && state.jobs.is_empty() {
                 break;
             }
         }
-        if own {
-            state.own = false;
-        } else {
+        if state.extra > 0 {
             state.extra -= 1;
             self.budget.give_back();
+        } else {
+            state.own = false;
         }
     }
 
     /// The queue went: the lane's threads go once the jobs it has are done.
     pub(crate) fn close(&self) {
-        self.state.lock().closed = true;
-        self.work.notify_all();
+        let mut state = self.state.lock();
+        state.closed = true;
+        let idle = std::mem::take(&mut state.idle);
+        state.woken += idle.len();
+        drop(state);
+        for idler in idle {
+            idler.wake.notify_one();
+        }
     }
 
     /// How many threads the lane has (for the tests).
@@ -493,5 +535,109 @@ mod tests {
         }
         assert!(until(|| lanes.iter().all(|lane| lane.threads() == 0)));
         assert_eq!(running.load(Ordering::Acquire), 3 * QUEUES as usize);
+    }
+
+    /// How long the lanes of the tests below keep a thread with no job.
+    const TEST_IDLE: Duration = Duration::from_millis(100);
+
+    /// Runs `n` jobs on `lane` that wait at one gate, and waits until they run at once and the lane
+    /// has `n` threads; the gate opened, waits until they are done.
+    fn burst(lane: &Arc<Lane>, n: usize) {
+        let gate = Arc::new(Gate::default());
+        let running = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..n {
+            let (gate, running, done) =
+                (Arc::clone(&gate), Arc::clone(&running), Arc::clone(&done));
+            lane.run(Box::new(move || {
+                running.fetch_add(1, Ordering::AcqRel);
+                gate.pass();
+                done.fetch_add(1, Ordering::AcqRel);
+            }));
+        }
+        assert!(
+            until(|| running.load(Ordering::Acquire) == n),
+            "the burst's {n} jobs did not run at once"
+        );
+        assert_eq!(lane.threads(), n, "a thread a job of the burst");
+        gate.open();
+        assert!(until(|| done.load(Ordering::Acquire) == n));
+    }
+
+    /// The pause after each job of [`one_at_a_time_until_one_thread`], and how many jobs it runs at
+    /// most: about 4 s of them.
+    const JOB_GAP: Duration = Duration::from_millis(5);
+    const MOST_JOBS: u32 = 800;
+
+    /// Runs jobs on `lane` one at a time, each after the one before has ended and its thread has
+    /// had [`JOB_GAP`] to wait again, until the lane has one thread left after the jobs of more
+    /// than [`TEST_IDLE`]; whether it came to that within [`MOST_JOBS`]. The threads the jobs ran
+    /// on are pushed to `ran_on`.
+    fn one_at_a_time_until_one_thread(
+        lane: &Arc<Lane>,
+        ran_on: &Mutex<Vec<std::thread::ThreadId>>,
+    ) -> bool {
+        let past_idle = u32::try_from(TEST_IDLE.as_millis() / JOB_GAP.as_millis()).unwrap() + 1;
+        for n in 0..MOST_JOBS {
+            let ended = Arc::new(AtomicUsize::new(0));
+            let (job_ended, ran) = (Arc::clone(&ended), Arc::new(Mutex::new(None)));
+            let job_ran = Arc::clone(&ran);
+            lane.run(Box::new(move || {
+                *job_ran.lock() = Some(std::thread::current().id());
+                job_ended.store(1, Ordering::Release);
+            }));
+            assert!(until(|| ended.load(Ordering::Acquire) == 1));
+            ran_on.lock().extend(ran.lock().take());
+            std::thread::sleep(JOB_GAP);
+            if n >= past_idle && lane.threads() == 1 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Jobs that come one at a time go to the thread that went idle last, so the threads a burst
+    /// made go after the lane's idle time while the jobs go on, the budget's first: woken the
+    /// longest idle first, each of the three took a job in turn and none went.
+    #[test]
+    fn a_burst_s_threads_go_while_jobs_come_one_at_a_time() {
+        let budget = Budget::new(LANE_THREADS);
+        let lane = Lane::with_idle(4, Arc::clone(&budget), TEST_IDLE);
+        burst(&lane, 3);
+        let ran_on = Mutex::new(Vec::new());
+        assert!(
+            one_at_a_time_until_one_thread(&lane, &ran_on),
+            "{} threads stayed for jobs one at a time",
+            lane.threads()
+        );
+        assert_eq!(budget.taken(), 0, "the lane's own thread is the one left");
+        // The last jobs ran on the one thread left.
+        let ran_on = ran_on.lock();
+        let last = ran_on.last().copied();
+        assert!(ran_on.iter().rev().take(5).all(|id| Some(*id) == last));
+        drop(ran_on);
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+    }
+
+    /// A burst that comes once a lane is down to one thread grows it to [`LANE_THREADS`] again,
+    /// as the first burst did.
+    #[test]
+    fn a_burst_after_the_threads_went_grows_the_lane_to_its_limit_again() {
+        let budget = Budget::new(LANE_THREADS);
+        let lane = Lane::with_idle(5, Arc::clone(&budget), TEST_IDLE);
+        burst(&lane, LANE_THREADS);
+        assert!(one_at_a_time_until_one_thread(
+            &lane,
+            &Mutex::new(Vec::new())
+        ));
+        burst(&lane, LANE_THREADS);
+        assert_eq!(budget.taken(), LANE_THREADS - 1);
+        // With no job at all, every thread goes.
+        assert!(
+            until(|| lane.threads() == 0),
+            "the idle lane's threads stayed"
+        );
+        assert_eq!(budget.taken(), 0);
     }
 }
