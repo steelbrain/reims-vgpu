@@ -892,9 +892,10 @@
 // [`RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS`], [`RGFX_FEATURE_UNSHARED_QUEUES`],
 // [`RGFX_FEATURE_MANAGED_AT_OFFSET`], [`RGFX_FEATURE_HEAP_OVER_PAGES`],
 // [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
-// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`],
-// [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`], [`RGFX_FEATURE_SMALL_ID_CHUNKS`] and
-// [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are reserved.
+// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_HOST_TIME`],
+// [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`],
+// [`RGFX_FEATURE_SMALL_ID_CHUNKS`] and [`RGFX_FEATURE_DISPLAY_COLOR`]). Bits 9 and 10 are
+// reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -1023,6 +1024,13 @@
 // such caches may hold.
 #define RGFX_FEATURE_SURFACE_DEFERRED (1 << 19)
 
+// `FEATURES_LO` bit 20, `HOST_TIME`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: [`RGFX_REG_HOST_TIME_LO`] and `_HI` read the host's monotonic
+// clock, the one a `VBLANK`'s `host_time_ns` is on. A read between two of the guest's own clock's
+// bounds the two clocks' offset by its round trip, whatever an interrupt's delivery takes. Every
+// host offers it.
+#define RGFX_FEATURE_HOST_TIME (1 << 20)
+
 // `FEATURES_LO` bit 21, `MANAGED_TEXTURE_SLABS`, which the guest takes through
 // [`RGFX_REG_DRIVER_FEATURES_LO`]: a [`RgfxManagedTextureCreate`]'s CPU copy may be any `Shared`
 // buffer over the guest's memory the sender holds, and the host reads and writes the copy where
@@ -1095,6 +1103,18 @@
 
 // `DEFERRED_BUDGET_HI`, RO: [`RGFX_REG_DEFERRED_BUDGET_LO`]'s high 32 bits.
 #define RGFX_REG_DEFERRED_BUDGET_HI 52
+
+// `HOST_TIME_LO`, RO: where the guest took [`RGFX_FEATURE_HOST_TIME`], the host's monotonic clock
+// at the read, in nanoseconds, its low 32 bits: the clock a `VBLANK`'s `host_time_ns` is on. Each
+// read takes the clock afresh, and nothing is latched for [`RGFX_REG_HOST_TIME_HI`]: the guest
+// reads `HI`, `LO` and `HI` again, and takes the second `HI` where `LO` is below 2^31, else the
+// first. It reads 0 where the guest did not take the feature, as at any offset a host does not
+// know.
+#define RGFX_REG_HOST_TIME_LO 56
+
+// `HOST_TIME_HI`, RO: the host's monotonic clock at the read, its high 32 bits, as
+// [`RGFX_REG_HOST_TIME_LO`].
+#define RGFX_REG_HOST_TIME_HI 60
 
 // What `MAGIC` reads: "RGFX", little-endian.
 #define RGFX_MAGIC 1481000786

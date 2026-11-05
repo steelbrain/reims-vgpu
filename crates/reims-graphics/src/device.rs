@@ -225,7 +225,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8, 11 to 19 and 21 to 24.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 24.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -244,6 +244,7 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_ICB_SLOTS
     | RGFX_FEATURE_COMMIT_ORDER
     | RGFX_FEATURE_SURFACE_DEFERRED
+    | RGFX_FEATURE_HOST_TIME
     | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
     | RGFX_FEATURE_MANAGED_BUFFER_SLABS
     | RGFX_FEATURE_SMALL_ID_CHUNKS
@@ -874,9 +875,14 @@ impl Device {
                 .all(|queue| queue.wake.parked(None))
     }
 
-    /// A 32-bit read of BAR 0 at `offset`. Offsets with no register read 0.
+    /// A 32-bit read of BAR 0 at `offset`. Offsets with no register read 0, and so do
+    /// `HOST_TIME_LO` and `_HI` where the driver did not take `HOST_TIME`.
     pub fn mmio_read(&self, offset: u64) -> u32 {
         let size = self.shared.region.size();
+        let host_time = || {
+            self.shared.driver_features.load(Ordering::Acquire) & u64::from(RGFX_FEATURE_HOST_TIME)
+                != 0
+        };
         match u32::try_from(offset).unwrap_or(u32::MAX) {
             RGFX_REG_MAGIC => RGFX_MAGIC,
             RGFX_REG_VERSION => RGFX_VERSION,
@@ -895,6 +901,9 @@ impl Device {
                 (self.shared.host.deferred_budget() & 0xffff_ffff) as u32
             }
             RGFX_REG_DEFERRED_BUDGET_HI => (self.shared.host.deferred_budget() >> 32) as u32,
+            // The clock the refresh thread's grid stamps each VBLANK on.
+            RGFX_REG_HOST_TIME_LO if host_time() => (now_ns() & 0xffff_ffff) as u32,
+            RGFX_REG_HOST_TIME_HI if host_time() => (now_ns() >> 32) as u32,
             _ => 0,
         }
     }

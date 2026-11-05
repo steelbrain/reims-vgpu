@@ -676,6 +676,8 @@ sit in BAR0 from 0x800.
 | 0x02c | `CONSUMED` | WO | writing a completion ring's offset wakes its producer waiting for room, under `CONSUMED_DOORBELL`; no host handles it yet, so it reads 0 and a write is ignored |
 | 0x030 | `DEFERRED_BUDGET_LO` | RO | under `SURFACE_DEFERRED`, the bytes of the host GPU's memory deferred blocks' device caches may hold, low 32 bits: a quarter of the device-local heap's budget, the same for the device's life; 0 without the feature |
 | 0x034 | `DEFERRED_BUDGET_HI` | RO | its high 32 bits |
+| 0x038 | `HOST_TIME_LO` | RO | under `HOST_TIME`, the host's monotonic clock at the read in ns, low 32 bits: the clock `VBLANK`s are stamped on; nothing is latched, so the guest reads `HI`, `LO`, `HI` and takes the second `HI` where `LO` is below 2^31, else the first; 0 where the guest did not take the feature |
+| 0x03c | `HOST_TIME_HI` | RO | its high 32 bits |
 
 **The wire's version.** `VERSION` reads `RGFX_VERSION`
 (`crates/reims-graphics/src/wire.rs`), the version of the wire the host
@@ -788,6 +790,10 @@ only where no negotiation can carry it.
   lock needs them (`RGFX_SURFACE_PAGES_DEFERRED` and `_ATTACH`; `wire.rs`). A
   host offers it where it offers `SURFACE_CACHE`, with its budget in
   `DEFERRED_BUDGET_LO` and `_HI`.
+- Bit 20 is `HOST_TIME`: `HOST_TIME_LO` and `_HI` read the host's monotonic
+  clock, the one `VBLANK`s are stamped on, so a guest can measure the two
+  clocks' offset rather than infer it from the `VBLANK`s' delivery. Every host
+  offers it.
 - Bit 21 is `MANAGED_TEXTURE_SLABS`: a `MANAGED_TEXTURE_CREATE` may name any
   Shared buffer over the sender's memory as its CPU copy, and the host reads
   and writes the copy where the buffer's contents lie, so the bundle takes a

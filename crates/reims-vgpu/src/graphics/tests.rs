@@ -6514,7 +6514,8 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// (`INDIRECT_COMMAND_BUFFERS`), makes the queues the kext asks unshared on the platform's
 /// unshared queue (`UNSHARED_QUEUES`), tells a producer waiting for room on a full submission
 /// ring of the device's takes (`SUBMIT_ROOM`), reads indirect command buffers' CPU encodes from
-/// slots in the region (`ICB_SLOTS`), and shows the display pipe's colour (`DISPLAY_COLOR`)
+/// slots in the region (`ICB_SLOTS`), lets the guest read the clock its VBLANKs are stamped on
+/// (`HOST_TIME`), and shows the display pipe's colour (`DISPLAY_COLOR`)
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_core::testkit::GuestRam;
@@ -6553,6 +6554,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_SUBMIT_ROOM
             | RGFX_FEATURE_ICB_SLOTS
             | RGFX_FEATURE_COMMIT_ORDER
+            | RGFX_FEATURE_HOST_TIME
             | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
             | RGFX_FEATURE_MANAGED_BUFFER_SLABS
             | RGFX_FEATURE_SMALL_ID_CHUNKS
@@ -6573,6 +6575,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_SUBMIT_ROOM
             | RGFX_FEATURE_ICB_SLOTS
             | RGFX_FEATURE_COMMIT_ORDER
+            | RGFX_FEATURE_HOST_TIME
             | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
             | RGFX_FEATURE_MANAGED_BUFFER_SLABS
             | RGFX_FEATURE_SMALL_ID_CHUNKS

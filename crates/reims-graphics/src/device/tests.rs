@@ -2524,6 +2524,53 @@ fn the_deferred_budget_reads_as_the_host_gives_it() {
     assert_eq!(budget(), (0x2345_6000, 1));
 }
 
+/// `HOST_TIME_LO` and `_HI` read the host's monotonic clock, the one each `VBLANK` is stamped on,
+/// once the driver took `HOST_TIME`: a read of `HI`, `LO` and `HI` again lies between two of the
+/// host's own. They read 0 before the driver took it, and again after a reset
+#[test]
+fn the_host_time_reads_the_vblank_clock_once_taken() {
+    struct Clock;
+    impl Host for Clock {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+            false
+        }
+        fn features(&self) -> u64 {
+            u64::from(RGFX_FEATURE_HOST_TIME)
+        }
+    }
+    let rig = Rig::with_host(Box::new(Clock));
+    let read = |offset: u32| rig.device.mmio_read(offset.into());
+    let registers = || (read(RGFX_REG_HOST_TIME_LO), read(RGFX_REG_HOST_TIME_HI));
+    let host_time = || {
+        let hi = read(RGFX_REG_HOST_TIME_HI);
+        let lo = read(RGFX_REG_HOST_TIME_LO);
+        let again = read(RGFX_REG_HOST_TIME_HI);
+        (u64::from(if lo < 0x8000_0000 { again } else { hi }) << 32) | u64::from(lo)
+    };
+    assert_eq!(
+        rig.device.mmio_read(RGFX_REG_FEATURES_LO.into()),
+        RGFX_FEATURE_HOST_TIME
+    );
+    assert_eq!(registers(), (0, 0));
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    rig.device
+        .mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), RGFX_FEATURE_HOST_TIME);
+    assert_eq!(read(RGFX_REG_DRIVER_FEATURES_LO), RGFX_FEATURE_HOST_TIME);
+    rig.start();
+    let before = super::now_ns();
+    let time = host_time();
+    let after = super::now_ns();
+    assert!(
+        before <= time && time <= after,
+        "{before} <= {time} <= {after}"
+    );
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    assert_eq!(registers(), (0, 0));
+}
+
 /// The device's feature bits are its host's; a `SURFACE_PAGES` hands the host the runs it lists
 /// in its block, read out of the region, and the flags the message gives the block, and is
 /// answered with the host's answer; one whose runs lie past the block, or a block outside the
