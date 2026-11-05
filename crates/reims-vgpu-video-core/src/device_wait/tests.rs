@@ -179,3 +179,67 @@ fn a_hold_keeps_what_it_holds() {
     assert!(weak.upgrade().is_none());
     assert_eq!(format!("{:?}", GuestHold::nothing()), "GuestHold(nothing)");
 }
+
+/// What a hold holds, which counts its drops in `log`.
+struct Payload(Arc<Mutex<Vec<&'static str>>>);
+
+impl Drop for Payload {
+    fn drop(&mut self) {
+        self.0.lock().push("let go");
+    }
+}
+
+/// A write a failed call's device may still make is told of once the work
+/// a backend kept past its deadline is done and let go, before what the
+/// hold holds goes; a hold no one told of a late write tells of none.
+#[test]
+fn a_late_write_is_told_of_once_kept_work_lets_its_hold_go() {
+    struct KeptWork {
+        done: Arc<AtomicBool>,
+        _hold: GuestHold,
+    }
+    impl Unfinished for KeptWork {
+        fn finished(&mut self) -> bool {
+            self.done.load(Ordering::SeqCst)
+        }
+    }
+    let clock = Arc::new(VirtualRuntime::default());
+    let runtime: Arc<dyn Runtime> = clock.clone();
+    let lingering = Lingering::new(&runtime);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let hold = GuestHold::new(Arc::new(Payload(Arc::clone(&log))));
+    let done = Arc::new(AtomicBool::new(false));
+    lingering.keep(
+        "a frame",
+        Box::new(KeptWork {
+            done: Arc::clone(&done),
+            _hold: hold.clone(),
+        }),
+    );
+    let told = Arc::clone(&log);
+    hold.report_late_write(Box::new(move || told.lock().push("wrote")));
+    drop(hold);
+    clock.advance(LINGER_POLL);
+    assert!(log.lock().is_empty(), "told before the device was done");
+    done.store(true, Ordering::SeqCst);
+    let mut ticks = 0;
+    assert!(eventually(|| {
+        if ticks < 1000 {
+            clock.advance(LINGER_POLL);
+            ticks += 1;
+        }
+        log.lock().len() == 2
+    }));
+    assert_eq!(*log.lock(), ["wrote", "let go"]);
+
+    let quiet = Arc::new(Mutex::new(Vec::new()));
+    drop(GuestHold::new(Arc::new(Payload(Arc::clone(&quiet)))));
+    assert_eq!(*quiet.lock(), ["let go"]);
+    let at_once = Arc::new(AtomicBool::new(false));
+    let set = Arc::clone(&at_once);
+    GuestHold::nothing().report_late_write(Box::new(move || set.store(true, Ordering::SeqCst)));
+    assert!(
+        at_once.load(Ordering::SeqCst),
+        "a hold of nothing tells at once"
+    );
+}

@@ -30,7 +30,9 @@
 //! - **A bounded wait.** The GPU is waited for until core's deadline ([`device_wait`]); work not
 //!   done by then is kept with everything it may still write and the device's hold on both
 //!   surfaces ([`Lingering`]), and the accelerator answers kIOReturnError to every transform after
-//!   it, until the guest resets the device.
+//!   it, until the guest resets the device. A destination written in place is told written at the
+//!   deadline, as far as the GPU ran, and again once the kept work is done and lets the hold go
+//!   (core's `GuestHold::report_late_write`).
 //! - **Made ahead.** A Vulkan driver makes a kernel's pipeline at its first dispatch of each
 //!   threadgroup size, not where the runtime makes its pipeline state, and with the shader caches
 //!   cold the making of the costliest took 2.5 s on MoltenVK on the M3 Max and 1.5 s on an RTX

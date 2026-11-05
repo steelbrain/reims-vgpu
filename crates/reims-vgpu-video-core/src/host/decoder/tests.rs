@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -452,6 +452,9 @@ struct SurfaceMemory {
     lent_to_devices: bool,
     /// Its mapping's life: it goes with the surface.
     life: MemoryLife,
+    /// How many times a device's write of it was told of
+    /// (`GuestSurface::device_wrote`).
+    wrote: AtomicUsize,
 }
 
 struct HeldSurface {
@@ -521,6 +524,10 @@ impl GuestSurface for HeldSurface {
         (self.memory.lent_to_devices && !self.memory.read_only)
             .then_some(&self.device as &dyn DeviceMemory)
     }
+
+    fn device_wrote(&self) {
+        self.memory.wrote.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Drop for HeldSurface {
@@ -560,6 +567,11 @@ impl Surfaces for GuestMemory {
 impl GuestMemory {
     fn held(&self) -> usize {
         self.holds.lock().values().sum()
+    }
+
+    /// How many times a device's write of surface `mapping_id` was told of.
+    fn wrote(&self, mapping_id: u64) -> usize {
+        (self.surfaces.lock().get(&mapping_id)).map_or(0, |s| s.wrote.load(Ordering::SeqCst))
     }
 }
 
@@ -1049,6 +1061,7 @@ fn nv12_surface() -> SurfaceMemory {
         read_only: false,
         lent_to_devices: true,
         life: MemoryLife::new(),
+        wrote: AtomicUsize::new(0),
     }
 }
 
@@ -4011,13 +4024,20 @@ fn a_device_write_past_its_deadline_keeps_its_buffer_until_the_device_is_done()
             "the buffer the device writes is let go"
         );
         assert_eq!(frames.still_writing.lock().len(), 1);
-        // The device is done: the backend lets the hold go, and the next
-        // delivery's sweep sends the buffer's `rels`. Here that is the
-        // settle's. Were it the next frame's, it would race that frame's
-        // `Dbuf`, as on Apple's host: the delivery sweeps on its own thread
-        // as the session's queue handles the frame (devices.md,
-        // "Messages", its surfaces, and "The decoder session").
+        assert_eq!(
+            guest.memory.wrote(1),
+            0,
+            "a write told of before the device is done"
+        );
+        // The device is done: the backend lets the hold go, which tells the
+        // host of its write (`GuestHold`), and the next delivery's sweep
+        // sends the buffer's `rels`. Here that is the settle's. Were it the
+        // next frame's, it would race that frame's `Dbuf`, as on Apple's
+        // host: the delivery sweeps on its own thread as the session's queue
+        // handles the frame (devices.md, "Messages", its surfaces, and "The
+        // decoder session").
         frames.still_writing.lock().clear();
+        assert_eq!(guest.memory.wrote(1), 1, "the late write is told of once");
         frames.device_stalls.store(false, Ordering::SeqCst);
         guest.settle();
         assert_eq!(guest.seen(), ["rels [1]"]);

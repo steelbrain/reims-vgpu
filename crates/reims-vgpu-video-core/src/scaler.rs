@@ -362,6 +362,14 @@ impl ScalerDevice {
                                 outputs: std::mem::take(&mut outputs),
                             };
                             let status = accelerator.transform(&mut job);
+                            if status != io_return::SUCCESS {
+                                // A device that missed its deadline may still write the
+                                // destination: told of once it is done (`GuestHold`).
+                                let destination = Arc::clone(destination);
+                                job.hold.report_late_write(Box::new(move || {
+                                    destination.device_wrote();
+                                }));
+                            }
                             outputs = std::mem::take(&mut job.outputs);
                             status
                         }

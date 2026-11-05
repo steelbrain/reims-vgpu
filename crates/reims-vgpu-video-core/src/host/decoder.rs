@@ -1981,6 +1981,12 @@ impl ZeroCopy {
                     "frame {} cannot be written into the guest's buffer: {error}",
                     frame.frame_id()
                 );
+                // A device that missed its deadline may still write the buffer: told of
+                // once it is done (`GuestHold`).
+                let wrote = Arc::clone(held);
+                target
+                    .hold()
+                    .report_late_write(Box::new(move || wrote.surface.device_wrote()));
                 Some(Err(error.status()))
             }
         }

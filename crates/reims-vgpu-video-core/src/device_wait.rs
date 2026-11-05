@@ -31,7 +31,9 @@
 //!   which the backend keeps with the rest. While a hold lives the session
 //!   sends no `rels` for the buffer, so the guest sees it in use and its
 //!   pages are neither reused nor unmapped (the mapper answers an unmap of
-//!   a held surface Busy).
+//!   a held surface Busy). Once the last of the hold goes, the device's
+//!   write is told of ([`GuestHold::report_late_write`]), so that a copy
+//!   of the pages the host keeps elsewhere is not left stale.
 //!
 //! [`Lingering`]'s thread asks each kept work's question every
 //! [`LINGER_POLL`], and drops it once the device is done: its memory is
@@ -133,19 +135,60 @@ pub fn deadline(runtime: &dyn Runtime) -> MonoTime {
 /// does: no `rels` goes for the buffer, so the guest sees it in use, and
 /// its pages are neither reused nor unmapped (module docs). Made by core
 /// for each buffer it lends a device ([`crate::device_memory::GuestTarget::hold`]).
+///
+/// **A write past the deadline.** A device that missed its deadline may
+/// still write the buffer, after the call that lent it has answered the
+/// guest and told the host nothing of that write; the host may keep a copy
+/// of those pages that the write makes stale
+/// ([`crate::surfaces::GuestSurface::device_wrote`]). So the call's owner,
+/// where the call fails, gives the hold what tells of the write
+/// ([`GuestHold::report_late_write`]): it runs once every holder has let
+/// go, the work a backend kept until its device is done among them
+/// ([`Lingering`]), and before what the hold holds goes.
 #[derive(Clone)]
-pub struct GuestHold(Option<Arc<dyn Any + Send + Sync>>);
+pub struct GuestHold(Option<Arc<Held>>);
+
+/// What a [`GuestHold`] holds, and what tells of a write past the deadline.
+struct Held {
+    _held: Arc<dyn Any + Send + Sync>,
+    late_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Drop for Held {
+    /// The last holder let go: a write past the deadline is told of, then
+    /// what was held goes.
+    fn drop(&mut self) {
+        let wrote = self.late_write.lock().take();
+        if let Some(wrote) = wrote {
+            wrote();
+        }
+    }
+}
 
 impl GuestHold {
     /// A hold on whatever `held` holds while it lives.
     pub fn new(held: Arc<dyn Any + Send + Sync>) -> Self {
-        Self(Some(held))
+        Self(Some(Arc::new(Held {
+            _held: held,
+            late_write: Mutex::new(None),
+        })))
     }
 
     /// A hold of nothing: a target a test makes over memory no session
     /// holds.
     pub fn nothing() -> Self {
         Self(None)
+    }
+
+    /// The call this hold was made for failed, and a device may still write
+    /// the buffer: `wrote` tells of that write once every holder has let go
+    /// (the type's docs), in place of what was given before. A hold of
+    /// nothing tells at once.
+    pub fn report_late_write(&self, wrote: Box<dyn FnOnce() + Send>) {
+        match &self.0 {
+            Some(held) => *held.late_write.lock() = Some(wrote),
+            None => wrote(),
+        }
     }
 }
 

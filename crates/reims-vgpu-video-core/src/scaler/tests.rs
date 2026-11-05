@@ -83,6 +83,8 @@ struct HostSurface {
     /// Made read-only for its clients by the guest: lent for reading only,
     /// as the glue's platforms lend such a surface.
     read_only: bool,
+    /// How many times a device's write of a surface was told of.
+    wrote: Arc<AtomicUsize>,
 }
 
 impl GuestSurface for HostSurface {
@@ -104,6 +106,10 @@ impl GuestSurface for HostSurface {
         read(&self.bytes.lock());
         Ok(())
     }
+
+    fn device_wrote(&self) {
+        self.wrote.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Drop for HostSurface {
@@ -122,6 +128,8 @@ type OnRetain = Box<dyn FnOnce() + Send>;
 struct HostSurfaces {
     surfaces: Mutex<SurfaceTable>,
     holds: Arc<AtomicUsize>,
+    /// How many times a device's write of a surface was told of.
+    wrote: Arc<AtomicUsize>,
     /// The IDs the guest made read-only for their clients.
     read_only: Mutex<HashSet<u64>>,
     /// What the next retain of each ID runs first, as the IOSurface
@@ -177,6 +185,7 @@ impl Surfaces for HostSurfaces {
             bytes: Arc::clone(bytes),
             holds: Arc::clone(&self.holds),
             read_only,
+            wrote: Arc::clone(&self.wrote),
         }))
     }
 }
@@ -739,4 +748,69 @@ fn side_buffers_over_their_limits_need_a_reset_and_long_lists_end_the_vm() {
         d.process(&r, TRANSFORM_SIZE, &ram),
         Outcome::Reply(_)
     ));
+}
+
+/// A backend whose device misses its deadline: it keeps the job's hold in
+/// `still_writing`, as a backend keeps it with its work, and fails the
+/// transform.
+struct StuckBackend {
+    still_writing: Arc<Mutex<Vec<GuestHold>>>,
+}
+
+impl ScalerBackend for StuckBackend {
+    fn create_accelerator(&self) -> Result<Box<dyn Accelerator>, String> {
+        Ok(Box::new(StuckBackend {
+            still_writing: Arc::clone(&self.still_writing),
+        }))
+    }
+}
+
+impl Accelerator for StuckBackend {
+    fn capabilities(&self) -> Capabilities {
+        caps()
+    }
+
+    fn transform(&mut self, job: &mut TransformJob<'_>) -> io_return::IoReturn {
+        self.still_writing.lock().push(job.hold.clone());
+        io_return::ERROR
+    }
+}
+
+/// A transform whose device missed its deadline answers its error, keeps
+/// both surfaces held while the device may still write the destination,
+/// and tells the host of that write once the device is done, as the
+/// backend lets its hold go (`crate::device_wait::GuestHold`).
+#[test]
+fn a_write_past_the_deadline_is_told_of_once_the_device_is_done() {
+    let surfaces = Arc::new(HostSurfaces::default());
+    let picture = reference::test_picture(64, 32);
+    surfaces.add(7, ScalerFormat::Nv12VideoRange, 64, 32, &picture);
+    surfaces.add(9, ScalerFormat::Bgra, 32, 16, &picture);
+    let still_writing = Arc::new(Mutex::new(Vec::new()));
+    let d = ScalerDevice::new(
+        Arc::clone(&surfaces) as Arc<dyn Surfaces>,
+        Arc::new(StuckBackend {
+            still_writing: Arc::clone(&still_writing),
+        }),
+    );
+    assert_eq!(d.start(), Ok(()));
+    let out = reply(d.process(&transform_request(7, 9), TRANSFORM_SIZE, &Ram::new(0)));
+    assert_eq!(u32_at(&out, STATUS), io_return::ERROR);
+    assert_eq!(surfaces.holds.load(Ordering::SeqCst), 2, "both stay held");
+    assert_eq!(
+        surfaces.wrote.load(Ordering::SeqCst),
+        0,
+        "told before the device is done"
+    );
+    still_writing.lock().clear();
+    assert_eq!(
+        surfaces.wrote.load(Ordering::SeqCst),
+        1,
+        "the write is told of once"
+    );
+    assert_eq!(
+        surfaces.holds.load(Ordering::SeqCst),
+        0,
+        "both let go after"
+    );
 }
