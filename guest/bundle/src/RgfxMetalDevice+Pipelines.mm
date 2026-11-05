@@ -11,6 +11,7 @@
 #import "RgfxComputePipelineState.h"
 #import "RgfxLibrary.h"
 #import "RgfxMetalError.h"
+#import "RgfxPipelineReflection.h"
 #import "RgfxRenderPipelineState.h"
 #import "RgfxUnsupported.h"
 
@@ -614,11 +615,12 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                               reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection
                                    error:(__autoreleasing NSError **)error
 {
-	// The reflection is answered by the host over the completion ring (reader is a
-	// later transport piece), so there is none to hand back synchronously.
+	id<MTLRenderPipelineState> state = [self rgfxRenderPipelineForDescriptor:descriptor options:options error:error];
 	if (reflection)
-		*reflection = nil;
-	return [self rgfxRenderPipelineForDescriptor:descriptor options:options error:error];
+		*reflection = state != nil ? RgfxRenderPipelineReflectionOf(descriptor.vertexFunction, descriptor.vertexDescriptor,
+		                                                            descriptor.fragmentFunction, options)
+		                           : nil;
+	return state;
 }
 
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
@@ -650,7 +652,12 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 		                                                                 options:options
 		                                                                   error:&err];
 		if (completionHandler)
-			completionHandler(state, nil, err); // reflection: see the error: variant above
+			completionHandler(state,
+			                  state != nil ? RgfxRenderPipelineReflectionOf(descriptor.vertexFunction,
+			                                                                descriptor.vertexDescriptor,
+			                                                                descriptor.fragmentFunction, options)
+			                               : nil,
+			                  err);
 	});
 }
 
@@ -709,10 +716,10 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                              reflection:(MTLAutoreleasedComputePipelineReflection *)reflection
                                   error:(__autoreleasing NSError **)error
 {
-	(void)options;
+	id<MTLComputePipelineState> state = [self rgfxComputePipelineForFunction:computeFunction error:error];
 	if (reflection)
-		*reflection = nil;
-	return [self rgfxComputePipelineForFunction:computeFunction error:error];
+		*reflection = state != nil ? RgfxComputePipelineReflectionOf(computeFunction, nil, options) : nil;
+	return state;
 }
 
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)computeFunction
@@ -735,14 +742,15 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                               (MTLNewComputePipelineStateWithReflectionCompletionHandler)
                                   completionHandler
 {
-	(void)options;
 	completionHandler = [completionHandler copy];
 	RgfxRunCreation(^{
 		NSError *err = nil;
 		id<MTLComputePipelineState> state =
 		    [self newComputePipelineStateWithFunction:computeFunction error:&err];
 		if (completionHandler)
-			completionHandler(state, nil, err);
+			completionHandler(state,
+			                  state != nil ? RgfxComputePipelineReflectionOf(computeFunction, nil, options) : nil,
+			                  err);
 	});
 }
 
@@ -752,9 +760,14 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
                                reflection:(MTLAutoreleasedComputePipelineReflection *)reflection
                                     error:(__autoreleasing NSError **)error
 {
+	id<MTLComputePipelineState> state = [self rgfxComputePipelineForDescriptor:descriptor
+	                                                                 options:options
+	                                                                   error:error];
 	if (reflection)
-		*reflection = nil;
-	return [self rgfxComputePipelineForDescriptor:descriptor options:options error:error];
+		*reflection = state != nil ? RgfxComputePipelineReflectionOf(descriptor.computeFunction,
+		                                                             descriptor.stageInputDescriptor, options)
+		                           : nil;
+	return state;
 }
 
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor
@@ -771,7 +784,11 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 		                                                                  options:options
 		                                                                    error:&err];
 		if (completionHandler)
-			completionHandler(state, nil, err);
+			completionHandler(state,
+			                  state != nil ? RgfxComputePipelineReflectionOf(descriptor.computeFunction,
+			                                                                 descriptor.stageInputDescriptor, options)
+			                               : nil,
+			                  err);
 	});
 }
 
@@ -822,11 +839,16 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 	RgfxRunCreation(^{
 		NSError *err = nil;
 		id<MTLComputePipelineState> state = nil;
-		if ([descriptor isKindOfClass:[MTLComputePipelineDescriptor class]])
-			state = [self rgfxComputePipelineForDescriptor:descriptor options:options error:&err];
-		else
+		id reflection = nil;
+		if ([descriptor isKindOfClass:[MTLComputePipelineDescriptor class]]) {
+			MTLComputePipelineDescriptor *d = descriptor;
+			state = [self rgfxComputePipelineForDescriptor:d options:options error:&err];
+			if (state != nil)
+				reflection = RgfxComputePipelineReflectionOf(d.computeFunction, d.stageInputDescriptor, options);
+		} else {
 			RGFX_UNSUPPORTED_ERROR(&err, "precompiled compute pipelines of another descriptor");
-		RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+		}
+		RgfxCallCreationHandlerWithReflection(completionHandler, state, reflection, err, _cmd);
 	});
 }
 
@@ -841,11 +863,17 @@ static State rgfxUnlessRefused(State state, NSError *__autoreleasing *error)
 	RgfxRunCreation(^{
 		NSError *err = nil;
 		id<MTLRenderPipelineState> state = nil;
-		if ([descriptor isKindOfClass:[MTLRenderPipelineDescriptor class]])
-			state = [self rgfxRenderPipelineForDescriptor:descriptor options:options error:&err];
-		else
+		id reflection = nil;
+		if ([descriptor isKindOfClass:[MTLRenderPipelineDescriptor class]]) {
+			MTLRenderPipelineDescriptor *d = descriptor;
+			state = [self rgfxRenderPipelineForDescriptor:d options:options error:&err];
+			if (state != nil)
+				reflection = RgfxRenderPipelineReflectionOf(d.vertexFunction, d.vertexDescriptor, d.fragmentFunction,
+				                                            options);
+		} else {
 			RGFX_UNSUPPORTED_ERROR(&err, "precompiled render pipelines of another descriptor");
-		RgfxCallCreationHandler(completionHandler, state, err, _cmd);
+		}
+		RgfxCallCreationHandlerWithReflection(completionHandler, state, reflection, err, _cmd);
 	});
 }
 

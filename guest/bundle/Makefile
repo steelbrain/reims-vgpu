@@ -48,6 +48,10 @@
 #                   the stitchable functions' reflection the bundle builds against Metal's own,
 #                   build/reflection_check-x86_64 (ARCH=arm64 likewise) over
 #                   build/air_arguments.metallib.
+#   make pipeline-reflection-check
+#                   pipelines' reflection the bundle builds against Metal's own,
+#                   build/pipeline_reflection_check-x86_64 (ARCH=arm64 likewise) over
+#                   build/oracle_reflection.metallib.
 #   make peer-test-build, make peer-test
 #                   the wire round trip of the bundle's ring code against the host's library
 #                   (tests/peer_tests.mm; native arch, this Mac's GPU, never in `make test`):
@@ -319,7 +323,8 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_REFLECTED) $
 	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) \
 		RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) arch -$(ARCH) $(AIR_TESTBIN)
 	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
-		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
+		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
+		RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt src
 	arch -$(ARCH) $(VIDEO_TESTBIN)
@@ -529,9 +534,24 @@ $(REFLECTBIN): tools/reflection_check.mm src/RgfxReflection.mm src/RgfxAirArgume
 		tools/reflection_check.mm src/RgfxReflection.mm -x c++ src/RgfxAirArguments.cpp \
 		-framework Foundation -framework Metal -o $@
 
+# --- pipelines' reflection's check against Metal's own (tools/pipeline_reflection_check.mm) ------
+# As reflection-check: one binary for ARCH, run on a real device (an x86 Mac's: the answers the
+# bundle's are of), never in `make test`. Its library is ORACLE_REFLECTION_LIB.
+PIPEREFLECTBIN = $(BUILD)/pipeline_reflection_check-$(ARCH)
+
+pipeline-reflection-check: $(PIPEREFLECTBIN) $(ORACLE_REFLECTION_LIB)
+
+$(PIPEREFLECTBIN): tools/pipeline_reflection_check.mm tools/oracle/oracle_walk.h src/RgfxPipelineReflection.mm \
+	src/RgfxAirArguments.cpp $(HEADERS) Makefile
+	@mkdir -p $(@D)
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) -I tools -mmacosx-version-min=26.0 -x objective-c++ \
+		tools/pipeline_reflection_check.mm src/RgfxPipelineReflection.mm -x c++ src/RgfxAirArguments.cpp \
+		-framework Foundation -framework Metal -o $@
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe reflection-check peer-test peer-test-build \
+.PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe reflection-check \
+	pipeline-reflection-check peer-test peer-test-build \
 	spguard clean
 

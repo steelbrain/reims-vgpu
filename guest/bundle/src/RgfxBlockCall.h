@@ -26,11 +26,14 @@ NSArray<NSString *> *_Nullable RgfxBlockArgumentTypes(id _Nullable block);
 
 /// Calls `handler`, a creation's completion handler, with `object` and `error`: (object, error)
 /// for a handler of two object arguments, (object, nil, error) for one of three, whose second is
-/// the creation's reflection, which the device does not give. A handler of any other shape, or
-/// with no signature, is not called; that is logged, once per selector, with `cmd`, and answers
-/// NO. A nil handler answers YES.
+/// the creation's reflection. A handler of any other shape, or with no signature, is not called;
+/// that is logged, once per selector, with `cmd`, and answers NO. A nil handler answers YES.
 BOOL RgfxCallCreationHandler(id _Nullable handler, id _Nullable object, NSError *_Nullable error,
                              SEL cmd);
+
+/// As RgfxCallCreationHandler, a handler of three object arguments given `reflection` second.
+BOOL RgfxCallCreationHandlerWithReflection(id _Nullable handler, id _Nullable object,
+                                           id _Nullable reflection, NSError *_Nullable error, SEL cmd);
 
 /// Runs `creation`, an asynchronous creator's create and its call of its completion handler, after
 /// the creator returns: on the global concurrent queue of default QoS, in an autorelease pool of

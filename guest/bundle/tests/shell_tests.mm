@@ -44,6 +44,7 @@
 #import "RgfxFunction.h"
 #import "RgfxLibrary.h"
 #import "RgfxMetalError.h"
+#import "RgfxPipelineReflection.h"
 #import "RgfxRenderPipelineState.h"
 #include <set>
 #include <vector>
@@ -3308,6 +3309,241 @@ void test_stitched_libraries_in_archives()
 	                                                               error:&err];
 	CHECK(![alone addLibraryWithDescriptor:plain error:&err] && err != nil);
 	drain();
+}
+
+// A pipeline answers the reflection an x86 Mac's Metal gives it (RgfxPipelineReflection.h), built
+// from its functions' AIR nodes, over the .metallib built from tools/oracle/oracle_reflection.metal
+// (RGFX_ORACLE_REFLECTION): the values below are the AMD Radeon Pro 5300M's and the Intel UHD
+// Graphics 630's (macOS 26.7.1, tools/oracle/oracle_reflection.m), of Metal's own classes; options
+// that ask for none answer nil; a stage with no bindings answers an empty -...Bindings and a nil
+// -...Arguments; an argument a false constant gates is left out, and one at an index constants
+// compute makes no reflection. tools/pipeline_reflection_check.mm compares them with an x86 Mac's
+// own, getter by getter and instance variable by instance variable.
+void test_pipeline_reflection_from_air()
+{
+	Fixture fx(0x80000); // the library's bytes fit
+	const char *path = getenv("RGFX_ORACLE_REFLECTION");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		       return nil;
+	       }];
+	auto ask = [](id object, NSString *member) -> id {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	auto number = [](id object, NSString *member) {
+		return ((NSUInteger(*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	auto flag = [](id object, NSString *member) {
+		return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	// Each binding's name, its binding type and whether it is used, in order.
+	auto shape = [&](NSArray *bindings) {
+		std::string out;
+		for (id b in bindings)
+			out += std::string([ask(b, @"name") UTF8String]) + ":" + std::to_string(number(b, @"type")) +
+			       (flag(b, @"isUsed") ? "" : "-") + " ";
+		return out;
+	};
+	auto fn = [&](NSString *name) { return [lib newFunctionWithName:name]; };
+	const MTLPipelineOption both = MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo;
+
+	// Options of neither kind answer none.
+	CHECK(RgfxComputePipelineReflectionOf(fn(@"k_basic"), nil, MTLPipelineOptionNone) == nil);
+	id basic = RgfxComputePipelineReflectionOf(fn(@"k_basic"), nil, MTLPipelineOptionBindingInfo);
+	CHECK([NSStringFromClass([basic class]) isEqualToString:@"MTLComputePipelineReflectionInternal"]);
+	NSArray *bindings = ask(basic, @"bindings");
+	CHECK(shape(bindings) == "out:0 params:0 in:0 r:2 s:2 w:2 rw:2 smp:3 tg:1 ");
+	CHECK(shape(ask(basic, @"builtInArguments")) == "gid:15 tid:15 ");
+	CHECK([ask(basic, @"arguments") isEqualToArray:bindings] && ask(basic, @"arguments") != bindings);
+	if (bindings.count == 9) {
+		id params = bindings[1];
+		CHECK(number(params, @"bufferAlignment") == 32 && number(params, @"bufferDataSize") == 192 &&
+		      number(params, @"bufferDataType") == MTLDataTypeStruct && number(params, @"access") == 0);
+		NSArray *members = [ask(params, @"bufferStructType") members];
+		CHECK(members.count == 12);
+		if (members.count == 12) {
+			MTLStructMember *counts = members[6];
+			CHECK([counts.name isEqualToString:@"counts"] && counts.offset == 52 && counts.dataType == MTLDataTypeArray &&
+			      counts.arrayType.arrayLength == 3 && counts.arrayType.elementType == MTLDataTypeInt &&
+			      counts.arrayType.stride == 4);
+			CHECK(((MTLStructMember *)members[3]).dataType == MTLDataTypeFloat3 &&
+			      ((MTLStructMember *)members[7]).structType.members.count == 2 &&
+			      ((MTLStructMember *)members[8]).dataType == MTLDataTypeFloat4x4);
+		}
+		CHECK(number(bindings[0], @"access") == MTLBindingAccessReadWrite && number(bindings[0], @"bufferAlignment") == 4);
+		CHECK(number(bindings[5], @"access") == MTLBindingAccessWriteOnly &&
+		      number(bindings[6], @"textureDataType") == MTLDataTypeHalf &&
+		      number(bindings[6], @"textureType") == MTLTextureType2D);
+		// Its texture type's data type is the texture's sample type, as the binding's.
+		id rw = ask(bindings[6], @"dataTypeDescription");
+		CHECK(number(rw, @"dataType") == MTLDataTypeTexture && number(rw, @"textureDataType") == MTLDataTypeHalf &&
+		      number(ask(bindings[3], @"dataTypeDescription"), @"textureDataType") == MTLDataTypeFloat);
+		CHECK(number(bindings[8], @"threadgroupMemoryDataSize") == 4 &&
+		      number(bindings[8], @"threadgroupMemoryAlignment") == 4);
+		NSArray *builtIns = ask(basic, @"builtInArguments");
+		CHECK(builtIns.count == 2 && number(builtIns[0], @"builtInType") == 5 &&
+		      number(builtIns[0], @"builtInDataType") == MTLDataTypeUInt2 && number(builtIns[1], @"builtInType") == 8);
+	}
+	CHECK(shape(ask(RgfxComputePipelineReflectionOf(fn(@"k_unused"), nil, both), @"bindings")) ==
+	      "used:0 unused:0- unusedConstant:0- unusedTexture:2- unusedSampler:3- unusedMemory:1- ");
+	id nothing = RgfxComputePipelineReflectionOf(fn(@"k_nothing"), nil, MTLPipelineOptionBufferTypeInfo);
+	CHECK(nothing != nil && ask(nothing, @"arguments") == nil && [ask(nothing, @"bindings") count] == 0 &&
+	      ask(nothing, @"builtInArguments") == nil);
+	// k_more's simdgroup_index_in_threadgroup is listed nowhere.
+	CHECK(shape(ask(RgfxComputePipelineReflectionOf(fn(@"k_more"), nil, both), @"builtInArguments")) ==
+	      "group:15 perGroup:15 lane:15 grid:15 t:15 ");
+	// Nor are simdgroups_per_threadgroup, quadgroup_index_in_threadgroup, quadgroups_per_threadgroup
+	// and dispatch_threads_per_threadgroup.
+	NSArray *more = ask(RgfxComputePipelineReflectionOf(fn(@"k_builtins"), nil, both), @"builtInArguments");
+	CHECK(shape(more) == "inGroup:15 groups:15 width:15 inQuad:15 gid:15 tid:15 ");
+	if (more.count == 6) {
+		const NSUInteger kTypes[] = {7, 11, 20, 17, 5, 8};
+		for (NSUInteger i = 0; i < 6; i++)
+			CHECK(number(more[i], @"builtInType") == kTypes[i]);
+		CHECK(number(more[0], @"builtInDataType") == MTLDataTypeUInt3 &&
+		      number(more[2], @"builtInDataType") == MTLDataTypeUInt);
+	}
+	// Arrays of vectors and matrices are of their element's data type, of its size's stride.
+	NSArray *arrayMembers =
+	    [ask([ask(RgfxComputePipelineReflectionOf(fn(@"k_arrays"), nil, both), @"bindings") firstObject],
+	         @"bufferStructType") members];
+	CHECK(arrayMembers.count == 7);
+	if (arrayMembers.count == 7) {
+		const struct {
+			MTLDataType element;
+			NSUInteger length, stride, offset;
+		} kArrays[] = {{MTLDataTypeFloat, 2, 4, 0},
+		               {MTLDataTypeFloat4, 2, 16, 16},
+		               {MTLDataTypeFloat4x4, 2, 64, 48},
+		               {MTLDataTypeUInt2, 3, 8, 176},
+		               {MTLDataTypeStruct, 2, 16, 200}};
+		for (NSUInteger i = 0; i < 5; i++) {
+			MTLStructMember *m = arrayMembers[i];
+			CHECK(m.dataType == MTLDataTypeArray && m.offset == kArrays[i].offset &&
+			      m.arrayType.elementType == kArrays[i].element && m.arrayType.arrayLength == kArrays[i].length &&
+			      m.arrayType.stride == kArrays[i].stride);
+		}
+		CHECK(((MTLStructMember *)arrayMembers[5]).dataType == MTLDataTypeShort &&
+		      ((MTLStructMember *)arrayMembers[6]).dataType == MTLDataTypeHalf3 &&
+		      ((MTLStructMember *)arrayMembers[6]).offset == 234);
+	}
+
+	// An argument buffer: its members' bindings, an array of textures of index stride 1.
+	id ab = [ask(RgfxComputePipelineReflectionOf(fn(@"k_argument_buffer"), nil, both), @"bindings") firstObject];
+	CHECK(flag(ask(ab, @"bufferPointerType"), @"elementIsArgumentBuffer") &&
+	      flag(ask(ab, @"bufferStructType"), @"isIndirectArgumentBuffer"));
+	NSArray *members = [ask(ab, @"bufferStructType") members];
+	CHECK(members.count == 7);
+	if (members.count == 7) {
+		CHECK(number(ask(members[3], @"indirectArgumentType"), @"type") == 4 &&
+		      number(ask(members[3], @"indirectArgumentType"), @"indirectConstantDataSize") == 4);
+		CHECK(((MTLStructMember *)members[4]).arrayType.argumentIndexStride == 1 &&
+		      ((MTLStructMember *)members[4]).arrayType.elementType == MTLDataTypeTexture &&
+		      ((MTLStructMember *)members[5]).argumentIndex == 6);
+	}
+
+	// Function constants: a false one's arguments are left out; an index they compute makes none.
+	MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+	const bool on = true, off = false;
+	const int index = 5;
+	[values setConstantValue:&on type:MTLDataTypeBool withName:@"kOn"];
+	[values setConstantValue:&off type:MTLDataTypeBool withName:@"kOff"];
+	NSError *err = nil;
+	id<MTLFunction> predicates = [lib newFunctionWithName:@"k_predicates" constantValues:values error:&err];
+	CHECK(shape(ask(RgfxComputePipelineReflectionOf(predicates, nil, both), @"bindings")) == "out:0 on:0 ");
+	[values setConstantValue:&index type:MTLDataTypeInt withName:@"kIndex"];
+	id<MTLFunction> constants = [lib newFunctionWithName:@"k_constants" constantValues:values error:&err];
+	CHECK(constants != nil && RgfxComputePipelineReflectionOf(constants, nil, both) == nil);
+
+	// A descriptor's buffers come first, named by their index, used where a read attribute is theirs.
+	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+	const struct {
+		NSUInteger attribute;
+		MTLVertexFormat format;
+		NSUInteger offset, buffer;
+	} kAttributes[] = {{0, MTLVertexFormatFloat4, 0, 0},
+	                   {1, MTLVertexFormatFloat2, 0, 1},
+	                   {2, MTLVertexFormatFloat4, 16, 0},
+	                   {5, MTLVertexFormatFloat, 0, 2}};
+	for (const auto &a : kAttributes) {
+		vd.attributes[a.attribute].format = a.format;
+		vd.attributes[a.attribute].offset = a.offset;
+		vd.attributes[a.attribute].bufferIndex = a.buffer;
+	}
+	vd.layouts[0].stride = 32;
+	vd.layouts[1].stride = 8;
+	vd.layouts[2].stride = 4;
+	id stageIn = RgfxRenderPipelineReflectionOf(fn(@"v_stage_in"), vd, fn(@"f_plain"), both);
+	CHECK([NSStringFromClass([stageIn class]) isEqualToString:@"MTLRenderPipelineReflectionInternal"]);
+	NSArray *vertex = ask(stageIn, @"vertexBindings");
+	CHECK(shape(vertex) == "vertexBuffer.0:0 vertexBuffer.1:0 vertexBuffer.2:0- mvp:0 ");
+	if (vertex.count == 4)
+		CHECK(flag(vertex[0], @"isVertexDescriptorBuffer") && number(vertex[0], @"bufferDataSize") == 32 &&
+		      number(vertex[2], @"bufferDataSize") == 4 && number(vertex[0], @"bufferAlignment") == 4 &&
+		      ask(vertex[0], @"bufferStructType") == nil && number(vertex[3], @"bufferAlignment") == 32);
+	CHECK(ask(stageIn, @"fragmentArguments") == nil && [ask(stageIn, @"fragmentBindings") count] == 0 &&
+	      ask(stageIn, @"vertexBuiltInArguments") == nil && number(stageIn, @"postVertexDumpStride") == 36);
+	id buffers = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_textures"), both);
+	CHECK(shape(ask(buffers, @"vertexBindings")) == "uniforms:0 positions:0 unusedUV:0- heights:2 ");
+	CHECK(shape(ask(buffers, @"vertexBuiltInArguments")) == "vid:15 iid:15 ");
+	CHECK(shape(ask(buffers, @"fragmentBindings")) ==
+	      "color:2 unusedTexture:2- shadow:2 smp:3 unusedSampler:3- tint:0 unusedBuffer:0- ");
+	CHECK(number(RgfxRenderPipelineReflectionOf(fn(@"v_only"), nil, nil, both), @"postVertexDumpStride") == 12);
+	// base_vertex and base_instance are listed, a fragment function's front_facing and sample_id are
+	// not; the outputs' size counts the point size's. A descriptor's buffers are named by their place
+	// in buffer index order: buffers 1, 4 and 30 are vertexBuffer.0, .1 and .2.
+	MTLVertexDescriptor *spread = [MTLVertexDescriptor vertexDescriptor];
+	const NSUInteger kSpread[][3] = {{0, 0, 4}, {1, 0, 1}, {2, 0, 30}, {5, 16, 4}}; // attribute, offset, buffer
+	for (const auto &a : kSpread) {
+		spread.attributes[a[0]].format = a[0] == 1 ? MTLVertexFormatFloat2 : MTLVertexFormatFloat4;
+		spread.attributes[a[0]].offset = a[1];
+		spread.attributes[a[0]].bufferIndex = a[2];
+	}
+	spread.layouts[1].stride = 8;
+	spread.layouts[4].stride = 32;
+	spread.layouts[30].stride = 16;
+	id moreOut = RgfxRenderPipelineReflectionOf(fn(@"v_more"), spread, fn(@"f_more"), both);
+	NSArray *spreadBuffers = ask(moreOut, @"vertexBindings");
+	CHECK(shape(spreadBuffers) == "vertexBuffer.0:0 vertexBuffer.1:0 vertexBuffer.2:0- mvp:0 ");
+	if (spreadBuffers.count == 4)
+		CHECK(number(spreadBuffers[0], @"index") == 1 && number(spreadBuffers[1], @"index") == 4 &&
+		      number(spreadBuffers[2], @"index") == 30 && number(spreadBuffers[2], @"bufferDataSize") == 16);
+	CHECK(shape(ask(moreOut, @"vertexBuiltInArguments")) == "vid:15 base:15 baseInstance:15 ");
+	NSArray *vertexBuiltIns = ask(moreOut, @"vertexBuiltInArguments");
+	if (vertexBuiltIns.count == 3)
+		CHECK(number(vertexBuiltIns[1], @"builtInType") == 3 && number(vertexBuiltIns[2], @"builtInType") == 4);
+	CHECK(number(moreOut, @"postVertexDumpStride") == 68 && ask(moreOut, @"fragmentArguments") == nil);
+
+	// A mesh pipeline: each stage's payload, the mesh and the object's grid.
+	id mesh = RgfxMeshPipelineReflectionOf(fn(@"o_payload"), fn(@"m_payload"), fn(@"f_mesh"), both);
+	CHECK(shape(ask(mesh, @"objectBindings")) == "payload:34 scale:0 unused:0- ");
+	CHECK(shape(ask(mesh, @"meshBindings")) == "payload:34 positions:0 unused:2- ");
+	CHECK(shape(ask(mesh, @"objectBuiltInArguments")) == "grid:15 tid:15 ");
+	CHECK(shape(ask(mesh, @"meshBuiltInArguments")) == "output:35 tid:15 ");
+	NSArray *meshBuiltIns = ask(mesh, @"meshBuiltInArguments");
+	if (meshBuiltIns.count == 2)
+		CHECK(number(meshBuiltIns[0], @"meshVertexCount") == 3 && number(meshBuiltIns[0], @"meshTopologyType") == 3 &&
+		      [[ask(meshBuiltIns[0], @"meshVertexStruct") members] count] == 2 &&
+		      [[ask(meshBuiltIns[0], @"meshPrimitiveStruct") members] count] == 0);
+	NSArray *objectBindings = ask(mesh, @"objectBindings");
+	if (objectBindings.count == 3)
+		CHECK(number(objectBindings[0], @"access") == MTLBindingAccessReadWrite &&
+		      number(objectBindings[0], @"objectPayloadDataSize") == 8 && number(objectBindings[0], @"index") == 0xFFFFFFFF);
+	CHECK(number(mesh, @"postVertexDumpStride") == 0 && [ask(mesh, @"vertexBindings") count] == 0);
 }
 
 // A visible function answers its reflection from its signature in its AIR module
@@ -13337,6 +13573,7 @@ int main(int argc, char **argv)
 		test_unread_function_list_answers_from_shadow();
 		test_constants_without_cnst_resolve_from_air();
 		test_stitchable_reflection_from_air();
+		test_pipeline_reflection_from_air();
 		test_library_members_as_metal();
 		test_library_type_and_install_name();
 		test_command_graph();

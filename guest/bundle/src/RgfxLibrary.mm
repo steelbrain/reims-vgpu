@@ -352,6 +352,9 @@ std::shared_ptr<const FunctionTable> functionTableOf(const uint8_t *bytes, size_
 	std::map<std::string, std::shared_ptr<const RgfxAirFunction>> _air;
 	// Each visible function's signature read likewise; null where it did not read.
 	std::map<std::string, std::shared_ptr<const RgfxAirVisible>> _visible;
+	// Each entry point's nodes whole, read likewise when a pipeline's reflection asks; null where
+	// they did not read.
+	std::map<std::string, std::shared_ptr<const RgfxAirEntries>> _entries;
 }
 
 // The host drops the library's id as the app lets it go. Its functions keep it alive (RgfxFunction), and a pipeline made from them needs it no more: the
@@ -628,6 +631,39 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 		      name.c_str(), why);
 	_air.emplace(name, air);
 	return air;
+}
+
+- (std::shared_ptr<const RgfxAirEntries>)rgfxAirEntryNamed:(const std::string &)name
+{
+	std::lock_guard<std::mutex> hold(_airLock);
+	auto known = _entries.find(name);
+	if (known != _entries.end())
+		return known->second;
+	__block RgfxAirEntries read;
+	const char *why = nullptr;
+	std::shared_ptr<const RgfxAirEntries> entries;
+	if ([self rgfxReadModuleOf:name
+	                      with:^bool(const uint8_t *bitcode, size_t size) {
+		                      return rgfxReadAirEntries(bitcode, size, read);
+	                      }
+	                       why:&why]) {
+		for (RgfxAirEntry &e : read.entries) {
+			if (e.name == name) {
+				auto one = std::make_shared<RgfxAirEntries>();
+				one->entries.push_back(std::move(e));
+				one->constants = std::move(read.constants);
+				entries = std::move(one);
+				break;
+			}
+		}
+		if (entries == nullptr)
+			why = "its module declares no such entry point";
+	}
+	if (entries == nullptr && why != nullptr)
+		NSLog(@"RGFX: %s: its nodes were not read (%s): pipelines of it answer no reflection",
+		      name.c_str(), why);
+	_entries.emplace(name, entries);
+	return entries;
 }
 
 // The signature of the visible function `name`, read as rgfxAirFunctionNamed: reads arguments:

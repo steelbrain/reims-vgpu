@@ -10,8 +10,8 @@ stricter than the M3's, guests may rely on it.
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
-`oracle_icb`, `oracle_order`, `oracle_names` and `oracle_surftex`; the upload costs (Q17) are
-`guest/bundle/tools/upload_probe.m`'s.
+`oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex` and `oracle_reflection`; the upload
+costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -960,6 +960,62 @@ What our stack does:
   than 2D (all made on the M3 too, but the Cube); and a TextureBuffer over any surface. The bundle
   sends these, posted, and the host's refusal fails the command buffers that name them
   (`refused.rs`). They are the host runtime's gaps.
+
+## Q21: pipelines' reflection
+
+Probe: `oracle_reflection DEVICE [CASE]`, 11-05, with `ORACLE_IVARS=1`; and the bundle's
+`tools/pipeline_reflection_check.mm`, which makes the same pipelines on the device and compares
+the device's reflection with the bundle's, getter by getter and instance variable by instance
+variable. Both run over `oracle_reflection.metal`'s kernels, vertex, fragment, object and mesh
+functions: buffers of every scalar, vector, matrix and struct type, argument buffers, threadgroup
+memory, every texture type and access, arrays of textures and samplers, arguments the function
+never references, arguments under function constants, stage inputs, built-ins and payloads.
+
+**What the creators answer.** A pipeline made with options of neither
+`MTLPipelineOptionBindingInfo` nor `MTLPipelineOptionBufferTypeInfo` answers no reflection (nil);
+either, or both, answers the same whole reflection, an `MTLComputePipelineReflectionInternal` or
+`MTLRenderPipelineReflectionInternal`, in the synchronous creators and in the completion handlers
+alike. AMD and Intel agree on every value but one (below) *(class 3)*:
+- each stage's bindings are its function's resource arguments, in the order the function declares
+  them, after the buffers its vertex or stage input descriptor reads; `-bindings` and `-arguments`
+  are two arrays of the same objects. Its built-in arguments are listed apart, a fragment
+  function's nowhere. `builtInType` numbers them: `vertex_id` 1, `instance_id` 2, `base_vertex` 3,
+  `base_instance` 4, `thread_position_in_grid` 5, `threads_per_grid` 6,
+  `thread_position_in_threadgroup` 7, `thread_index_in_threadgroup` 8, `threads_per_threadgroup` 9,
+  `threadgroup_position_in_grid` 10, `threadgroups_per_grid` 11, `thread_index_in_quadgroup` 17,
+  `thread_index_in_simdgroup` 18, `threads_per_simdgroup` 20, `mesh_grid_properties` 23, a mesh
+  24; `simdgroup_index_in_threadgroup`, `simdgroups_per_threadgroup`,
+  `quadgroup_index_in_threadgroup`, `quadgroups_per_threadgroup` and
+  `dispatch_threads_per_threadgroup` are listed nowhere. An empty list is a nil instance
+  variable, which `-...Bindings` answers as an empty array and `-...Arguments` as nil;
+- a texture's type (`dataTypeDescription`) is an `MTLTextureReferenceTypeInternal` of data type
+  texture and of the texture's sample type (`textureDataType`), as the binding answers; an
+  array member's type is of its element's data type and of the element's size's stride;
+- an argument a false function constant gates is left out; one the AIR marks `air.arg_unused` is
+  unused (`isUsed` and `isActive` 0), built-ins among them. An argument the function reads only in
+  code its constants remove is unused too;
+- a constant buffer's alignment is 32, where the M3 answers its pointee's (16 for a `Params` of
+  `float4x4`) *(class 2)*. The M3's answers differ only there and in the private `_flags` of
+  its pipelines' reflection (register spills and atomics, which it sets and the x86 GPUs leave
+  0);
+- a descriptor's buffer is `vertexBuffer.N` (`stageInBuffer.N`), N its place among the
+  descriptor's buffers in buffer index order (buffers 1, 4 and 30 are `vertexBuffer.0`, `.1` and
+  `.2`, at indices 1, 4 and 30): a struct buffer of no struct type, its layout's stride,
+  alignment 4, used where the function reads an attribute it holds, and the only binding that is
+  no argument (`isArgument` 0);
+- the private `postVertexDumpStride` is the vertex function's outputs' size and 12 on AMD and on
+  the M3, and its outputs' size and 8 on Intel *(class 2)*; a mesh pipeline's is 0.
+
+**Ours** (`RgfxPipelineReflection.mm`): the bundle builds the same objects, of Metal's own classes,
+from each function's AIR nodes, and answers them in every creator that takes options, with AMD's
+stride. It answers nil, as before, for a pipeline of a function whose binding index function
+constants compute (`[[buffer(kIndex)]]`), whose module the reader does not follow, or with a type,
+built-in or binding no x86 Mac's answer was measured for. An argument read only in code its
+constants remove is answered used *(class 4: Metal reflects the specialised code)*.
+`pipeline_reflection_check` (11-05, 80 cases of 433490 values) finds no difference on the AMD
+GPU, and on the Intel GPU only `postVertexDumpStride`, 4 less than ours on each vertex pipeline;
+on both, the one case ours does not make is `c_constants` (`k_constants`), whose binding index
+function constants compute.
 
 ## Not measured
 

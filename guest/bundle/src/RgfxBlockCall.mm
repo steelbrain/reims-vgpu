@@ -97,6 +97,11 @@ NSArray<NSString *> *RgfxBlockArgumentTypes(id block)
 
 BOOL RgfxCallCreationHandler(id handler, id object, NSError *error, SEL cmd)
 {
+	return RgfxCallCreationHandlerWithReflection(handler, object, nil, error, cmd);
+}
+
+BOOL RgfxCallCreationHandlerWithReflection(id handler, id object, id reflection, NSError *error, SEL cmd)
+{
 	if (handler == nil)
 		return YES;
 	NSArray<NSString *> *types = RgfxBlockArgumentTypes(handler);
@@ -110,7 +115,7 @@ BOOL RgfxCallCreationHandler(id handler, id object, NSError *error, SEL cmd)
 		return YES;
 	}
 	if (allObjects && types.count == 3) {
-		reinterpret_cast<void (*)(id, id, id, id)>(invoke)(handler, object, nil, error);
+		reinterpret_cast<void (*)(id, id, id, id)>(invoke)(handler, object, reflection, error);
 		return YES;
 	}
 	logUncalled(cmd, handler);

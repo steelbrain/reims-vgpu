@@ -18,7 +18,10 @@
 #import "RgfxResource.h"
 
 #ifdef __cplusplus
+#include <memory>
 #include <string>
+
+#include "RgfxAirArguments.hpp"
 
 class RgfxRegion;
 class RgfxSerializer;
@@ -70,6 +73,14 @@ static const MTLFunctionType kRgfxFunctionTypeExtern = (MTLFunctionType)4;
 /// from a URL.
 - (nullable id)bitcodeData;
 - (BOOL)serializeToURL:(NSURL *)url error:(NSError *_Nullable __autoreleasing *_Nullable)error;
+
+#ifdef __cplusplus
+/// The entry point `name`'s nodes whole, with its module's function constants (rgfxReadAirEntries;
+/// `entries` then holds that one entry), read once from the bitcode the library's bytes hold for
+/// it: null where the library kept no bytes (one Metal's link or stitching made), or they do not
+/// read. A pipeline's reflection is made from it.
+- (std::shared_ptr<const RgfxAirEntries>)rgfxAirEntryNamed:(const std::string &)name;
+#endif
 
 /// Creates a library from `length` bytes of .metallib/AIR at `bytes`, serialising
 /// an RGFX_CMD_LIBRARY_CREATE (the bytes forwarded unchanged, with their content
