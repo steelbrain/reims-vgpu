@@ -37,7 +37,11 @@ hand-off to the kernel) is a restart (watch.txt "REBOOT"), a panic's as a rule. 
 is the restart, not a hang: no catch is taken for it. Once SSH answers again it writes
 DIR/reboot-N/: guest-info.txt again (the kexts load at new addresses) and the panic reports the
 guest wrote since (/Library/Logs/DiagnosticReports/*.panic changed in the last 30 minutes, as
-root; asked again every 10 s for 3 minutes, as the guest writes them a while after its desktop).
+root; asked again every 10 s for 3 minutes, as the guest writes them a while after its desktop);
+then guest-kernel.log, `log show` of the kernel's and our kext's and bundle's lines over the 120 s
+before the newest panic report's timestamp (what logd wrote before the panic), and ips/, the crash
+reports the guest wrote from 300 s before that timestamp to 60 s after (DiagnosticReports, its
+Retired/, every user's).
 
 --from-boot (msi-boot.sh's CATCH_FROM_BOOT, started with QEMU): the boot itself is watched too. A
 second hand-off to the kernel on the serial console is a restart (REBOOT, before SSH has
@@ -47,6 +51,7 @@ above; until that present, QEMU's screen every 5 s (QMP screendump, boot-screens
 seconds since the catcher started).
 """
 import argparse
+import datetime
 import json
 import os
 import re
@@ -460,12 +465,58 @@ def main():
             if got:
                 break
             time.sleep(10)
+        texts = []
         for path in got:
             rc, text = ssh(args, "echo '%s' | sudo -S -p '' cat '%s'" % (args.password, path), 60)
             with open(os.path.join(d, os.path.basename(path)), "w") as f:
                 f.write(text)
+            texts.append(text)
         ev("reboot %d: %d panic report(s) into reboot-%d%s" % (
             n, len(got), n, ": " + " ".join(os.path.basename(x) for x in got) if got else ""))
+        before_panic(d, texts)
+
+    def before_panic(d, texts):
+        """What the guest logged over the 120 s before its panic (the newest panic report's
+        timestamp), as far as logd wrote it, into guest-kernel.log; and the crash reports the guest
+        wrote from 300 s before it to 60 s after, from DiagnosticReports, its Retired/ and the
+        user's, into ips/."""
+        stamps = []
+        for text in texts:
+            try:
+                stamps.append(json.loads(text.splitlines()[0]).get("timestamp", ""))
+            except (ValueError, IndexError):
+                pass
+        m = [re.match(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)(?:\.\d+)? ([+-]\d{4})", x) for x in stamps if x]
+        m = [x for x in m if x]
+        if not m:
+            ev("reboot: no panic timestamp, so no log window")
+            return
+        t = max(datetime.datetime.strptime(x.group(1) + " " + x.group(2), "%Y-%m-%d %H:%M:%S %z") for x in m)
+        fmt = "%Y-%m-%d %H:%M:%S"  # the guest's wall time: the panic report's offset is its zone's
+        pred = 'sender == "ReimsGraphics" OR sender == "reims-graphics" OR process == "kernel"'
+        cmd = ("echo '%s' | sudo -S -p '' log show --style compact --info --debug --predicate '%s' "
+               "--start '%s' --end '%s'" % (args.password, pred,
+                                            (t - datetime.timedelta(seconds=120)).strftime(fmt), t.strftime(fmt)))
+        rc, text = ssh(args, cmd, 300)
+        with open(os.path.join(d, "guest-kernel.log"), "w") as f:
+            f.write(text)
+        lo, hi = t.timestamp() - 300, t.timestamp() + 60
+        rc, names = ssh(args, "echo '%s' | sudo -S -p '' sh -c 'stat -f \"%%m %%N\" /Library/Logs/DiagnosticReports/*.ips "
+                        "/Library/Logs/DiagnosticReports/Retired/*.ips /Users/*/Library/Logs/DiagnosticReports/*.ips' "
+                        "2> /dev/null" % args.password, 60)
+        os.makedirs(os.path.join(d, "ips"), exist_ok=True)
+        took = []
+        for line in names.splitlines():
+            mt, _, path = line.partition(" ")
+            if mt.isdigit() and lo <= int(mt) <= hi:
+                rc, body = ssh(args, "echo '%s' | sudo -S -p '' cat '%s'" % (args.password, path), 60)
+                name = os.path.basename(path)
+                with open(os.path.join(d, "ips", name), "w") as f:
+                    f.write(body)
+                took.append(name)
+        ev("reboot: %d log lines from %s to %s into guest-kernel.log; %d crash report(s) into ips/%s" % (
+            len(text.splitlines()), (t - datetime.timedelta(seconds=120)).strftime(fmt), t.strftime(fmt),
+            len(took), ": " + " ".join(took) if took else ""))
 
     def ssh_check():
         rc, text = ssh(args, "true", 15)
