@@ -1054,7 +1054,7 @@ Max at load averages of 28 to 52).
 refuses an allocation only when memory runs out, never because another process
 holds much, so neither does the kext. The one process whose refusal would stall
 every other is the compositor. So the last 160 MiB of the blocks' room and the
-last 1024 of the table's 16384 entries go only to WindowServer's blocks
+last 4096 of the table's 16384 entries go only to WindowServer's blocks
 (`RgfxBlockTable`'s reserve). WindowServer takes the first gap from the start
 like any process, and reaches into the reserve only once the rest is full; any
 other process is refused at the reserve's edge, as at the region's end. Of the
@@ -1064,8 +1064,15 @@ for one process's 2048 queues beside as many of the others'
 WindowServer's blocks and queues came to, which is what the reserve is sized
 from: on an RTX 5080 host at the display's 3840x2400 mode, WindowServer held
 134 MiB at most, at login, and 118 to 126 MiB in 110 to 366 blocks as five apps
-opened, with 2 queues (measured). A larger display, or a second one,
-needs the reserve measured again.
+opened, with 2 queues (measured). With some 70 processes open its blocks came to
+1358 and 169.7 MiB, past the reserve's 160 (measured), most of the bytes its
+no-copy buffers' copies and its Managed textures' CPU copies. Those lie in its own
+pages now, as its Managed buffers' CPU copies do ("Managed storage"), so what
+WindowServer keeps in the region is what no page of its own can hold: its rings,
+its encoders' upload chunks and command buffers' bodies, its surfaces' blocks,
+and the slabs the kernel had no superpage for. The entries hold three times the
+1358 blocks. A larger display, or a second one, needs the reserve measured
+again.
 
 The kext knows WindowServer's client by two tests at its open: the opening
 process is named `WindowServer`, and it holds the entitlement

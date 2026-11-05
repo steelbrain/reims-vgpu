@@ -15,6 +15,19 @@
 
 #include <stdint.h>
 
+// The most blocks the kext's table hands out at once.
+constexpr uint32_t kRgfxMaxBlocks = 16384;
+// WindowServer's reserve (RgfxBlockTable's): the last bytes of the region and the last entries of
+// the table, which no other process is given. Sized from what WindowServer held on an RTX 5080
+// host at the display's 3840x2400 mode, measured: 134 MiB at most (at login), 118 to 126 MiB as
+// five apps opened, so the bytes hold a WindowServer started again with a fifth to spare. Its
+// blocks came to 110 to 366 there, and to 1358 with some 70 processes open; the entries hold
+// three times that. Its blocks then held 169.7 MiB, most of it its no-copy buffers' copies and its
+// Managed textures' CPU copies, which lie in its own pages now (the bundle's RgfxSlabs.hpp), as
+// its Managed buffers' do.
+constexpr uint64_t kRgfxWindowServerReserveBytes = 160ull << 20;
+constexpr uint32_t kRgfxWindowServerReserveEntries = 4096;
+
 // Where a block is in its life.
 enum RgfxBlockState : uint8_t {
 	// Its owner's, to name in its messages.

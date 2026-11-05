@@ -460,6 +460,27 @@ int main()
 		check(x.t.reservedPeakCount == 2, "the peak counts WindowServer's entries");
 	}
 	{
+		// The kext's own table: with every entry outside WindowServer's reserve held by other
+		// processes, WindowServer is still given three times the most blocks it was measured
+		// to hold (1358, with some 70 processes open), and the others none.
+		static RgfxBlock big[kRgfxMaxBlocks];
+		const uint64_t page = 0x1000;
+		RgfxBlockTable t = {big, 0, kRgfxMaxBlocks, page, page + 2ull * kRgfxMaxBlocks * page,
+		                    0, 0, 0, 0, 0, 0, 0};
+		t.reserveEntries = kRgfxWindowServerReserveEntries;
+		uint64_t at = 0;
+		uint32_t others = 0;
+		while (rgfxBlockAlloc(t, b, 2, page, page, &at) == kRgfxBlockOk)
+			others++;
+		check(others == kRgfxMaxBlocks - kRgfxWindowServerReserveEntries,
+		      "the other processes fill every entry outside the reserve");
+		uint32_t ws = 0;
+		while (rgfxBlockAlloc(t, a, 1, page, page, &at, nullptr, true) == kRgfxBlockOk)
+			ws++;
+		check(ws >= 3 * 1358, "WindowServer gets three times its measured blocks");
+		check(t.reservedPeakCount == ws, "and its peak counts them");
+	}
+	{
 		// With no reserve, every allocation is as before.
 		Table x;
 		uint64_t at = 0;
