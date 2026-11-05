@@ -8318,9 +8318,9 @@ void test_binds_note_shadow_writes()
 			return ps;
 		};
 		RgfxComputePipelineState *throughArgs =
-		    kernel({{RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, false, false}});
+		    kernel({{RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, false, false, false}});
 		RgfxComputePipelineState *noArgs =
-		    kernel({{RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Read, false, false}});
+		    kernel({{RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Read, false, false, false}});
 		const MTLSize one = MTLSizeMake(1, 1, 1);
 		CHECK(writtenBack([&](id<MTLComputeCommandEncoder> ce) {
 			[ce useResource:b usage:MTLResourceUsageRead];
@@ -11118,7 +11118,7 @@ void test_iosurface_writes_by_function()
 		air->name = "f";
 		air->stage = stage;
 		for (const auto &[index, access] : textures)
-			air->arguments.push_back({RgfxAirKind::Texture, index, 1, access, false, false});
+			air->arguments.push_back({RgfxAirKind::Texture, index, 1, access, false, false, false});
 		[fn rgfxSetAirFunction:air];
 		return fn;
 	};
@@ -11135,8 +11135,9 @@ void test_iosurface_writes_by_function()
 		air->name = "c";
 		air->stage = RgfxAirStage::Kernel;
 		for (RgfxAirAccess access : accesses)
-			air->arguments.push_back({RgfxAirKind::Texture, 0, 1, access, false, true});
-		air->arguments.push_back({RgfxAirKind::Texture, 1, 1, RgfxAirAccess::Write, false, false});
+			air->arguments.push_back({RgfxAirKind::Texture, 0, 1, access, false, true, false});
+		air->arguments.push_back(
+		    {RgfxAirKind::Texture, 1, 1, RgfxAirAccess::Write, false, false, false});
 		[fn rgfxSetAirFunction:air];
 		return fn;
 	};
@@ -11153,7 +11154,7 @@ void test_iosurface_writes_by_function()
 		air->name = "a";
 		air->stage = stage;
 		air->arguments.push_back(
-		    {RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, writesTextures, false});
+		    {RgfxAirKind::IndirectBuffer, 0, 1, RgfxAirAccess::Read, writesTextures, false, false});
 		[fn rgfxSetAirFunction:air];
 		return fn;
 	};

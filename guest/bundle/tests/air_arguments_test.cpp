@@ -75,6 +75,7 @@ RgfxAirVisible visible(const std::vector<uint8_t> &lib, const std::string &name)
 struct Listed {
 	std::string name;
 	uint64_t publicOffset = 0;
+	int type = -1; // its TYPE tag's byte: 0 to 2 for a vertex, fragment or kernel function
 };
 
 std::vector<Listed> listed(const std::vector<uint8_t> &lib)
@@ -99,6 +100,8 @@ std::vector<Listed> listed(const std::vector<uint8_t> &lib)
 				              strnlen(reinterpret_cast<const char *>(lib.data() + t + 6), n));
 			else if (std::memcmp(lib.data() + t, "OFFT", 4) == 0)
 				f.publicOffset = rd(t + 6, 8);
+			else if (std::memcmp(lib.data() + t, "TYPE", 4) == 0)
+				f.type = static_cast<int>(rd(t + 6, 1));
 			t += 6 + n;
 		}
 		out.push_back(f);
@@ -262,6 +265,58 @@ int main()
 	check(readsAnywhere.arguments.size() == 2 && !rgfxAirWritesTextureAnywhere(readsAnywhere) &&
 	          rgfxAirWritesTexture(readsAnywhere, 3) && !rgfxAirWritesTexture(readsAnywhere, 0),
 	      "reads_where_constants_say: reads at any index, writes texture 3 alone");
+	// A count function constants set: an argument of every index from its first, which writes
+	// there; at any index too, at none (rgfxAirWritesTextureAnywhere).
+	RgfxAirFunction counted;
+	counted.arguments.push_back(
+	    {RgfxAirKind::Texture, 3, 0, RgfxAirAccess::Write, false, false, true});
+	check(!rgfxAirWritesTexture(counted, 2) && rgfxAirWritesTexture(counted, 3) &&
+	          rgfxAirWritesTexture(counted, 40) && !rgfxAirWritesTextureAnywhere(counted),
+	      "a written texture of any count from 3: written at 3 and up");
+	counted.arguments[0].anyIndex = true;
+	counted.arguments[0].index = 0;
+	check(!rgfxAirWritesTexture(counted, 3) && rgfxAirWritesTextureAnywhere(counted),
+	      "at any index too: written at none, anywhere");
+	// No source of ours declares one (an `array_ref` binding), but Metal Performance Shaders'
+	// kernels do: read from the OS's libraries, where it has them, never kept.
+	{
+		static const char *const kMps[] = {
+		    "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/"
+		    "MPSCore.framework/Versions/A/Resources/default.metallib",
+		    "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/"
+		    "MPSImage.framework/Versions/A/Resources/default.metallib",
+		    "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/"
+		    "MPSNDArray.framework/Versions/A/Resources/default.metallib",
+		};
+		size_t libraries = 0, entries = 0, unread = 0, anyCount = 0;
+		for (const char *mps : kMps) {
+			const std::vector<uint8_t> os = readFile(mps);
+			if (os.size() < 0x58)
+				continue;
+			libraries++;
+			for (const Listed &f : listed(os)) {
+				const uint8_t *bc = nullptr;
+				size_t n = 0;
+				if (f.type < 0 || f.type > 2 ||
+				    !rgfxMetallibBitcode(os.data(), os.size(), f.name, &bc, &n))
+					continue;
+				entries++;
+				std::vector<RgfxAirFunction> fns;
+				if (!rgfxReadAirFunctions(bc, n, fns)) {
+					unread++;
+					continue;
+				}
+				for (const RgfxAirFunction &fn : fns)
+					for (const RgfxAirArgument &a : fn.arguments)
+						anyCount += a.anyCount ? 1 : 0;
+			}
+		}
+		std::printf("air_arguments_test: the OS's MPS libraries: %zu, %zu entry points, %zu unread, "
+		            "%zu arguments of any count\n",
+		            libraries, entries, unread, anyCount);
+		check(libraries == 0 || anyCount > 0,
+		      "the OS's MPS kernels' arguments of any count are read");
+	}
 	check(!rgfxAirWritesTextureAnywhere(planes) && !rgfxAirWritesTextureAnywhere(all),
 	      "functions of fixed indices write nowhere else");
 
@@ -286,6 +341,10 @@ int main()
 	expect(stageIn, RgfxAirKind::Texture, 0, 1, RgfxAirAccess::Write,
 	       "a written texture at 0 under a constant");
 	check(rgfxAirWritesTexture(stageIn, 0), "reads_stage_in writes texture 0");
+	const RgfxAirFunction patch = entry(lib, "reads_patch");
+	check(patch.stage == RgfxAirStage::Vertex && patch.arguments.size() == 1,
+	      "reads_patch: its texture alone, past its control points and patch input");
+	expect(patch, RgfxAirKind::Texture, 3, 1, RgfxAirAccess::Sample, "a sampled texture at 3");
 	const RgfxAirFunction table = entry(lib, "calls_through_table");
 	check(table.arguments.size() == 2, "calls_through_table: its buffer and texture alone");
 	expect(table, RgfxAirKind::Buffer, 0, 1, RgfxAirAccess::ReadWrite, "a device buffer at 0");

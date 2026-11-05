@@ -585,8 +585,11 @@ bool binding(const Module &m, const Module::Md &node, size_t from, RgfxAirArgume
 				a.anyIndex = true;
 			else if (!mdInteger(m, node.ops[i + 1], index))
 				return false;
-			if (!mdInteger(m, node.ops[i + 2], count) || index < 0 || count < 1 ||
-			    index > UINT32_MAX || count > UINT32_MAX)
+			if (mdGlobalVariable(m, node.ops[i + 2]))
+				a.anyCount = true;
+			else if (!mdInteger(m, node.ops[i + 2], count) || count < 1 || count > UINT32_MAX)
+				return false;
+			if (index < 0 || index > UINT32_MAX)
 				return false;
 			a.index = static_cast<uint32_t>(index);
 			a.count = static_cast<uint32_t>(count);
@@ -651,11 +654,12 @@ bool indirectWritesTextures(const Module &m, const Module::Md &node)
 
 // The binding kinds besides buffers, argument buffers, textures and samplers that our Metal
 // compiler gives an `air.location_index`, none of them a texture: a vertex function's and a
-// kernel's stage input attribute (an attribute of the stage input descriptor, fetched from
-// buffers), and the function tables and acceleration structures, bound among the buffers.
+// kernel's stage input attribute and a post-tessellation vertex function's patch input (an
+// attribute of the stage input descriptor, fetched from buffers), and the function tables and
+// acceleration structures, bound among the buffers.
 bool bindsNoTexture(const std::string &kind)
 {
-	return kind == "air.vertex_input" || kind == "air.stage_in" ||
+	return kind == "air.vertex_input" || kind == "air.stage_in" || kind == "air.patch_input" ||
 	       kind == "air.visible_function_table" ||
 	       kind == "air.intersection_function_table" ||
 	       kind == "air.instance_acceleration_structure" ||
@@ -1268,7 +1272,7 @@ bool rgfxAirWritesTexture(const RgfxAirFunction &fn, uint32_t index)
 {
 	for (const RgfxAirArgument &a : fn.arguments) {
 		if (a.kind == RgfxAirKind::Texture && !a.anyIndex && index >= a.index &&
-		    index - a.index < a.count && writes(a.access))
+		    (a.anyCount || index - a.index < a.count) && writes(a.access))
 			return true;
 	}
 	return false;

@@ -15,12 +15,18 @@
 // declared under a function constant puts `air.function_constant` and the constant's node ahead
 // of its kind; it is read as the function's whatever the constant's value. A binding index that
 // is an expression of function constants is a global variable the module's initialiser sets in
-// place of the integer; the argument is read as one at any index. A binding of a kind the reader
-// does not know makes the function's answer unknown; a vertex function's and a kernel's stage
-// input attributes, function tables and acceleration structures are named, as bindings of no
-// texture. Threadgroup memory is an `air.buffer` of `air.address_space` 3, at an index of its own
-// that no buffer is bound to: it is no argument here. Read from modules that Apple's Metal compiler built from our own sources
-// (tests/air_arguments.metal), and as LLVM's text form of the same modules prints them.
+// place of the integer; the argument is read as one at any index. So is a count (the length of an
+// `array_ref` of textures or buffers, which Metal Performance Shaders' kernels bind); the argument
+// is read as one of every index from its first. A binding of a kind the reader does not know
+// makes the function's answer unknown; a vertex function's and a kernel's stage input attributes,
+// a post-tessellation vertex function's patch inputs, function tables and acceleration structures
+// are named, as bindings of no texture. Threadgroup memory is an `air.buffer` of
+// `air.address_space` 3, at an index of its own that no buffer is bound to: it is no argument
+// here. Read from modules that Apple's Metal compiler built from our own sources
+// (tests/air_arguments.metal), and as LLVM's text form of the same modules prints them; a count
+// set by function constants, which no source of ours declares, from macOS 27's frameworks'
+// modules on the M3 Max, where 709 entry points bind one (Metal Performance Shaders' kernels
+// among them).
 //
 // The reader is LLVM's bitstream format (its documented container: abbreviations, blocks and
 // records) over the module's blocks that carry the above: the module's global values and its
@@ -56,6 +62,9 @@ struct RgfxAirArgument {
 	// Whether its binding index is an expression of function constants (`[[texture(kIndex)]]`),
 	// which the function's specialisation sets: it may be at any index, and `index` is 0.
 	bool anyIndex;
+	// Whether its count is an expression of function constants, which the function's
+	// specialisation sets: it may take every index from `index` on, and `count` is 0.
+	bool anyCount;
 };
 
 // One function constant a module declares. The module lists them in the named metadata
@@ -214,8 +223,8 @@ bool rgfxMetallibBitcode(const uint8_t *lib, size_t size, const std::string &nam
 
 // What `fn` does with the textures bound at `index` of its stage: true where an argument there
 // may write them (write or read_write), false where its arguments there only read or sample them
-// or none is there. An argument at any index (anyIndex) is at none: see
-// rgfxAirWritesTextureAnywhere.
+// or none is there. An argument of any count (anyCount) is at every index from its first; one at
+// any index (anyIndex) is at none: see rgfxAirWritesTextureAnywhere.
 bool rgfxAirWritesTexture(const RgfxAirFunction &fn, uint32_t index);
 
 // Whether `fn` has a texture argument it may write (write or read_write) whose binding index

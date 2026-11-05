@@ -2,9 +2,10 @@
 // with binding arguments of each kind and access, arrays of them, argument buffers with and
 // without a written texture, a function constant, arguments declared under function constants,
 // binding indices function constants set, a vertex function's and a kernel's stage input, a
-// function table and an acceleration structure, threadgroup memory, and a function of no texture;
-// stitchable functions of every kind of type in their signatures; and function constants of
-// several types. Built into a .metallib by Apple's Metal compiler at test time; never committed.
+// post-tessellation vertex function's patch input, a function table and an acceleration
+// structure, threadgroup memory, and a function of no texture; stitchable functions of every kind
+// of type in their signatures; and function constants of several types. Built into a .metallib by
+// Apple's Metal compiler at test time; never committed.
 #include <metal_raytracing>
 #include <metal_stdlib>
 using namespace metal;
@@ -152,6 +153,24 @@ vertex VertexOut reads_attributes(Attributes in [[stage_in]], constant float4 &s
 	VertexOut o;
 	o.p = in.position * scale;
 	return o;
+}
+
+// A post-tessellation vertex function's patch: its control points and its patch input, attributes
+// fetched from buffers, bindings of no texture.
+struct PatchPoint {
+	float4 p [[attribute(0)]];
+};
+
+struct PatchIn {
+	patch_control_point<PatchPoint> points;
+	float4 color [[attribute(1)]];
+};
+
+[[patch(quad, 4)]] vertex float4 reads_patch(PatchIn in [[stage_in]],
+                                            float2 uv [[position_in_patch]],
+                                            texture2d<float> t [[texture(3)]])
+{
+	return in.points[0].p * uv.x + in.color + t.read(uint2(0));
 }
 
 // A kernel's stage input, its attributes fetched from buffers: a binding of no texture.
