@@ -20,6 +20,17 @@
 //! nothing: the host re-protects only watched granules. A watch's range is resolved once, as it
 //! begins; `changed` answers within the live watches only.
 //!
+//! **Resolved once.** The pages behind an import's bytes stay the same while the runtime holds it
+//! (the memory it is given stays mapped, with the same backing, for the import's life), so the
+//! guest runs behind a range of it are resolved once and kept ([`RESOLVED_KEPT`] ranges an
+//! import), and a range inside a kept one is cut from it. The runtime reports the writes of each
+//! command buffer's in-place writers at its commit, at each of its batches' completion turns and
+//! at its completion, each over the same ranges; resolving a 3840x2400 surface over scattered
+//! 4 KiB guest pages each time (about 9,000 pieces of the backing table, under its lock) took
+//! 57% of QEMU's CPU time in a stock-lane present loop on the RTX 5080 Laptop GPU, and held each
+//! such commit about 7 ms and each completion as long again (**measured** 2026-11-05, round
+//! 20261105-092958, perf at 499 Hz).
+//!
 //! **Writers.** The runtime's named writes ([`DirtyLog::wrote_as`]) and questions
 //! ([`DirtyLog::changed_except`]) go to the log, so a shadow's own copy back or merge never comes
 //! back to it as a change, while the guest's and any other writer's do.
@@ -199,6 +210,49 @@ struct Shared {
     /// The host address of the import's pointer, as the backing table knows it.
     at: u64,
     watches: Mutex<Vec<Watched>>,
+    /// The ranges resolved so far, each with its segments, the latest last (module docs,
+    /// "Resolved once").
+    resolved: Mutex<Vec<(Range<u64>, Arc<[Segment]>)>>,
+    /// How many times the backing table was asked for the import's bytes.
+    #[cfg(test)]
+    resolutions: AtomicU64,
+}
+
+/// The ranges of an import whose segments are kept (module docs, "Resolved once"): the oldest
+/// goes when another is resolved.
+const RESOLVED_KEPT: usize = 4;
+
+impl Shared {
+    fn new(log: Arc<DirtyLog>, at: u64) -> Shared {
+        Shared {
+            log,
+            at,
+            watches: Mutex::new(Vec::new()),
+            resolved: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            resolutions: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The segments of `range`, which lies in the range `kept` was resolved for: those of `kept` that
+/// meet it, the first and the last cut to it.
+fn cut(kept: &[Segment], range: &Range<u64>) -> Vec<Segment> {
+    let first = kept.partition_point(|s| s.offset.saturating_add(s.length) <= range.start);
+    (kept.get(first..).unwrap_or(&[]).iter())
+        .take_while(|s| s.offset < range.end)
+        .map(|s| {
+            let start = s.offset.max(range.start);
+            let end = s.offset.saturating_add(s.length).min(range.end);
+            Segment {
+                offset: start,
+                length: end.saturating_sub(start),
+                guest: s
+                    .guest
+                    .map(|g| g.saturating_add(start.saturating_sub(s.offset))),
+            }
+        })
+        .collect()
 }
 
 /// The runtime's questions about one import (module docs), over its device's log.
@@ -231,11 +285,7 @@ impl ImportDirty {
         let first = resolved(at, 1).into_iter().next()?;
         let (log, _) = first.ram?;
         Some(ImportDirty {
-            shared: Arc::new(Shared {
-                log,
-                at,
-                watches: Mutex::new(Vec::new()),
-            }),
+            shared: Arc::new(Shared::new(log, at)),
         })
     }
 
@@ -246,16 +296,39 @@ impl ImportDirty {
         let first = resolved(first, 1).into_iter().next()?;
         let (log, _) = first.ram?;
         Some(ImportDirty {
-            shared: Arc::new(Shared {
-                log,
-                at: 0,
-                watches: Mutex::new(Vec::new()),
-            }),
+            shared: Arc::new(Shared::new(log, 0)),
         })
     }
 
-    /// The import's bytes `range` as segments of the import, in this log's RAM or none.
-    fn segments(&self, range: &Range<u64>) -> Vec<Segment> {
+    /// The import's bytes `range` as segments of the import, in this log's RAM or none: cut from
+    /// a range resolved before that holds it, or resolved now and kept (module docs, "Resolved
+    /// once").
+    fn segments(&self, range: &Range<u64>) -> Arc<[Segment]> {
+        {
+            let kept = self.shared.resolved.lock();
+            let holding =
+                (kept.iter().rev()).find(|(r, _)| r.start <= range.start && range.end <= r.end);
+            match holding {
+                Some((r, segments)) if r == range => return Arc::clone(segments),
+                Some((_, segments)) => return cut(segments, range).into(),
+                None => {}
+            }
+        }
+        let segments: Arc<[Segment]> = self.resolve(range).into();
+        let mut kept = self.shared.resolved.lock();
+        // A range the new one holds is cut from it from now on.
+        kept.retain(|(r, _)| !(range.start <= r.start && r.end <= range.end));
+        if kept.len() >= RESOLVED_KEPT {
+            kept.remove(0);
+        }
+        kept.push((range.clone(), Arc::clone(&segments)));
+        segments
+    }
+
+    /// The import's bytes `range` as segments, from the backing table.
+    fn resolve(&self, range: &Range<u64>) -> Vec<Segment> {
+        #[cfg(test)]
+        self.shared.resolutions.fetch_add(1, Ordering::Relaxed);
         let length = range.end.saturating_sub(range.start);
         let pieces = resolved(self.shared.at.saturating_add(range.start), length);
         if pieces.is_empty() {
@@ -307,10 +380,13 @@ impl ImportDirty {
         }
     }
 
-    /// The guest runs of this log behind the import's bytes `range`.
-    fn runs(&self, range: &Range<u64>) -> impl Iterator<Item = Range<u64>> {
-        (self.segments(range).into_iter())
-            .filter_map(|s| s.guest.map(|g| g..g.saturating_add(s.length)))
+    /// Each guest run of this log behind the import's bytes `range`, to `f`.
+    fn each_run(&self, range: &Range<u64>, mut f: impl FnMut(Range<u64>)) {
+        for s in self.segments(range).iter() {
+            if let Some(g) = s.guest {
+                f(g..g.saturating_add(s.length));
+            }
+        }
     }
 }
 
@@ -319,7 +395,7 @@ impl rt::DirtyPages for ImportDirty {
     type Watch = ImportWatch;
 
     fn watch(&self, range: Range<u64>) -> ImportWatch {
-        let segments: Arc<[Segment]> = self.segments(&range).into();
+        let segments = self.segments(&range);
         let runs: Vec<Range<u64>> = (segments.iter())
             .filter_map(|s| s.guest.map(|g| g..g.saturating_add(s.length)))
             .collect();
@@ -346,18 +422,14 @@ impl rt::DirtyPages for ImportDirty {
     }
 
     fn wrote(&self, range: Range<u64>) {
-        for run in self.runs(&range) {
-            self.shared.log.wrote(run);
-        }
+        self.each_run(&range, |run| self.shared.log.wrote(run));
     }
 
     fn wrote_as(&self, range: Range<u64>, writer: NonZeroU64) {
         if !writers() {
             return rt::DirtyPages::wrote(self, range);
         }
-        for run in self.runs(&range) {
-            self.shared.log.wrote_as(run, writer);
-        }
+        self.each_run(&range, |run| self.shared.log.wrote_as(run, writer));
     }
 
     fn changed_except(&self, since: rt::DirtyStamp, writer: NonZeroU64, out: &mut Vec<Range<u64>>) {
