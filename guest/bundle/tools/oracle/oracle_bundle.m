@@ -41,6 +41,8 @@
 //                bytesPerRow:: .bc1 and .depth (formats minimumLinearTextureAlignmentForPixelFormat:
 //                may end the process at), .shortrow (468 x 36 BGRA8 rows 1536 bytes apart, under
 //                the row's 1872); linear.shortrow, the same by the buffer's linear SPI
+//   devtex.*     a 64 x 64 2D texture the device makes, usage RenderTarget: .depth.shared,
+//                .depth.managed, .stencil.managed and .depth.private, by format and storage mode
 // Build: see README.md.
 #import "oracle_common.h"
 #include <objc/message.h>
@@ -816,6 +818,21 @@ static void buffer_texture(id<MTLDevice> d, const char *tag, MTLPixelFormat form
 	printf("%s texture=%s\n", tag, t ? "made" : "nil");
 }
 
+static void device_texture(id<MTLDevice> d, const char *tag, MTLPixelFormat format,
+                           MTLStorageMode storage)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+	                                                                              width:64
+	                                                                             height:64
+	                                                                          mipmapped:NO];
+	td.storageMode = storage;
+	td.usage = MTLTextureUsageRenderTarget;
+	printf("%s format=%lu storage=%lu\n", tag, (unsigned long)format, (unsigned long)storage);
+	fflush(stdout);
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	printf("%s texture=%s\n", tag, t ? "made" : "nil");
+}
+
 // --- the cases ----------------------------------------------------------------------------
 
 static const char *const kCases[] = {
@@ -826,6 +843,8 @@ static const char *const kCases[] = {
     "view.class",       "view.levels",      "view.slices",   "view.type",     "view.slicecount",
     "view.noformat",    "view.ok",          "buftex.bc1",    "buftex.depth",  "buftex.shortrow",
     "linear.shortrow",  "functypes.dyn",    "failmiss2",
+    "devtex.depth.shared", "devtex.depth.managed", "devtex.stencil.managed",
+    "devtex.depth.private",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -903,6 +922,14 @@ static int run_case(id<MTLDevice> d, const char *c)
 		buffer_texture(d, c, MTLPixelFormatBGRA8Unorm, 468, 36, 1536, NO);
 	else if (!strcmp(c, "linear.shortrow"))
 		buffer_texture(d, c, MTLPixelFormatBGRA8Unorm, 468, 36, 1536, YES);
+	else if (!strcmp(c, "devtex.depth.shared"))
+		device_texture(d, c, MTLPixelFormatDepth32Float, MTLStorageModeShared);
+	else if (!strcmp(c, "devtex.depth.managed"))
+		device_texture(d, c, MTLPixelFormatDepth32Float, MTLStorageModeManaged);
+	else if (!strcmp(c, "devtex.stencil.managed"))
+		device_texture(d, c, MTLPixelFormatStencil8, MTLStorageModeManaged);
+	else if (!strcmp(c, "devtex.depth.private"))
+		device_texture(d, c, MTLPixelFormatDepth32Float, MTLStorageModePrivate);
 	else {
 		fprintf(stderr, "no case %s\n", c);
 		return 2;
