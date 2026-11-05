@@ -29,6 +29,7 @@
 #include <mach/thread_act.h>
 #include <sys/fcntl.h>
 #include <sys/stat.h>
+#include <sys/dirent.h>
 #include <sys/uio.h>
 #include <sys/vnode.h>
 #include <sys/vnode_if.h>
@@ -37,9 +38,12 @@
 #include "RgfxGatePayload.h"
 #include "RgfxGatePrefs.hpp"
 #include "rgfx_match.h"
+#include "rgfx_tree.h"
 
-// MacKernelSDK omits these VNOP prototypes; they are exported BSD KPIs, as
-// VNOP_MKDIR is.
+// MacKernelSDK omits these VNOP prototypes. No KPI symbol set lists them (the
+// macOS 26.7.1 KDK's BSDKernel and MACFramework sets name none); they are the
+// kernel's own global functions, which the kext imports as it imports
+// VNOP_MKDIR.
 extern "C" int VNOP_MKDIR(vnode_t, vnode_t *, struct componentname *,
                           struct vnode_attr *, vfs_context_t);
 extern "C" int VNOP_REMOVE(vnode_t, vnode_t, struct componentname *, int,
@@ -52,6 +56,7 @@ extern "C" int VNOP_RENAMEX(vnode_t, vnode_t, struct componentname *, vnode_t,
                             vnode_t, struct componentname *, vfs_rename_flags_t,
                             vfs_context_t);
 extern "C" int VNOP_REMOVEXATTR(vnode_t, const char *, int, vfs_context_t);
+extern "C" int VNOP_READDIR(vnode_t, struct uio *, int, int *, int *, vfs_context_t);
 
 namespace rgfxgate {
 
@@ -287,11 +292,12 @@ static bool bundleTagged(vfs_context_t ctx) {
 	return restricted && classed;
 }
 
-// Undo tagRootless for one path so the install can rewrite it: drop the storage
-// class and the restricted flag, below the MAC layer as the tag sets them.
+// Undo tagRootless for one path so the install can remove it: drop the storage
+// class and the restricted flag, below the MAC layer as the tag sets them. A
+// symbolic link is cleared itself, never what it names.
 static void clearRootless(const char *path, vfs_context_t ctx) {
 	vnode_t vp = nullptr;
-	if (vnode_lookup(path, 0, &vp, ctx) != 0)
+	if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
 		return;
 	VNOP_REMOVEXATTR(vp, kRootlessXattr, 0, ctx);
 	struct vnode_attr va;
@@ -302,10 +308,11 @@ static void clearRootless(const char *path, vfs_context_t ctx) {
 }
 
 // Unlink one file by full path, below the MAC layer as the directory creates
-// use VNOP_MKDIR. Already absent counts as success.
+// use VNOP_MKDIR. Already absent counts as success. A symbolic link is
+// unlinked itself, never what it names.
 static void removeFile(const char *path, vfs_context_t ctx) {
 	vnode_t vp = nullptr;
-	if (vnode_lookup(path, 0, &vp, ctx) != 0)
+	if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
 		return;
 	const char *slash = nullptr;
 	for (const char *q = path; *q; q++)
@@ -340,7 +347,7 @@ static void removeFile(const char *path, vfs_context_t ctx) {
 // unlinks files. Non-empty or absent is left as it is (best effort).
 static void removeDir(const char *path, vfs_context_t ctx) {
 	vnode_t vp = nullptr;
-	if (vnode_lookup(path, 0, &vp, ctx) != 0)
+	if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
 		return;
 	char leaf[256];
 	struct componentname cn;
@@ -391,26 +398,98 @@ bool rgfxRenameNode(const char *from, const char *to, bool swap,
 	return ok;
 }
 
-// Remove a staged or swapped-out tree rooted at `root`: unlock and unlink its
-// files, then its directories deepest first, then the root. The payload layout
-// (kFiles/kDirs) is the layout we ever stage, so a tree of our own build is
-// cleared whole; a tree from a differing older build may leave entries this
-// kext does not know, and its root rmdir then fails -- clutter, not a brick,
-// swept the next time an install stages here. Best effort throughout.
+// The file system rgfx_tree_remove walks (rgfx_tree.h): lookups that do not
+// follow a final symbolic link, a directory's entries as VNOP_READDIR gives
+// them, and each node unlocked (clearRootless) and removed below the MAC layer.
+// `buf` holds one read of a directory's records.
+struct KernelTree {
+	vfs_context_t ctx;
+	uint8_t *buf;
+	size_t cap;
+
+	RgfxNodeKind kind(const char *path) {
+		vnode_t vp = nullptr;
+		if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
+			return kRgfxNodeAbsent;
+		const RgfxNodeKind k = vnode_isdir(vp) ? kRgfxNodeDir : kRgfxNodeFile;
+		vnode_put(vp);
+		return k;
+	}
+
+	// The first entry of `dir` other than "." and "..": its reads from the
+	// directory's start, each as many `struct direntry` records as `buf` holds,
+	// until one holds such an entry or the directory ends.
+	bool first(const char *dir, char *name, size_t namecap) {
+		vnode_t vp = nullptr;
+		if (vnode_open(dir, FREAD, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
+			return false;
+		bool found = false;
+		uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
+		off_t offset = 0;
+		for (int reads = 0; uio != nullptr && reads < 64; reads++) {
+			uio_reset(uio, offset, UIO_SYSSPACE, UIO_READ);
+			uio_addiov(uio, (user_addr_t)(uintptr_t)buf, cap);
+			int eof = 0, count = 0;
+			if (VNOP_READDIR(vp, uio, VNODE_READDIR_EXTENDED, &eof, &count, ctx) != 0)
+				break;
+			const size_t got = cap - (size_t)uio_resid(uio);
+			size_t pos = 0;
+			const char *n = nullptr;
+			size_t nl = 0;
+			if (rgfx_dir_next<struct direntry>(buf, got, &pos, &n, &nl)) {
+				if (nl < namecap) {
+					memcpy(name, n, nl);
+					name[nl] = '\0';
+					found = true;
+				}
+				break;
+			}
+			if (eof || got == 0)
+				break;
+			offset = uio_offset(uio);
+		}
+		if (uio != nullptr)
+			uio_free(uio);
+		vnode_close(vp, FREAD, ctx);
+		return found;
+	}
+
+	void remove(const char *path, RgfxNodeKind kind) {
+		clearRootless(path, ctx);
+		if (kind == kRgfxNodeDir)
+			removeDir(path, ctx);
+		else
+			removeFile(path, ctx);
+	}
+};
+
+// Remove a staged or swapped-out tree rooted at `root`: every file and
+// directory under it, whichever build staged them, deepest first, then the
+// root (rgfx_tree_remove). Reading the directories, rather than the payload's
+// list of this build's files, removes a file an older build staged and this
+// one dropped: one left would keep the root, and the next install would stage
+// into that root and swap it in as the live bundle, the old file with it. Best
+// effort: a node that cannot be removed is logged, and the root then stays.
 static void removeTree(const char *root, vfs_context_t ctx) {
-	char p[1024];
-	for (uint32_t i = 0; i < kFileCount; i++) {
-		joinPath(p, sizeof(p), root, kFiles[i].rel);
-		clearRootless(p, ctx);
-		removeFile(p, ctx);
+	vnode_t vp = nullptr;
+	if (vnode_lookup(root, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
+		return; // nothing there
+	vnode_put(vp);
+	struct Scratch {
+		char path[1024];
+		uint8_t records[2048];
+	};
+	Scratch *s = static_cast<Scratch *>(IOMalloc(sizeof(Scratch)));
+	if (s == nullptr) {
+		SYSLOG("rgfxgate", "no memory to remove %s", root);
+		return;
 	}
-	for (uint32_t i = kDirCount; i-- > 0;) {
-		joinPath(p, sizeof(p), root, kDirs[i]);
-		clearRootless(p, ctx);
-		removeDir(p, ctx);
+	if (strlcpy(s->path, root, sizeof(s->path)) < sizeof(s->path)) {
+		KernelTree fs = {ctx, s->records, sizeof(s->records)};
+		if (!rgfx_tree_remove(fs, s->path, sizeof(s->path)))
+			SYSLOG("rgfxgate", "%s could not be removed whole", root);
 	}
-	clearRootless(root, ctx);
-	removeDir(root, ctx);
+	IOFree(s, sizeof(Scratch));
 }
 
 // Build the whole bundle tree under `root` (the staging sibling) and write its
