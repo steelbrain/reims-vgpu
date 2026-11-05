@@ -310,7 +310,7 @@
 #define RVG_GRAPHICS_DOORBELL_CONTROL 0
 
 // Where the guest's allocations start in the region, the scanout among them: below it are the
-// control and device rings, which the host's dirty log need not cover.
+// control rings, which the host's dirty log need not cover.
 #define RVG_GRAPHICS_ALLOCATIONS_OFFSET 4194304
 
 // The device: one paravirtualized GPU and its display ports.

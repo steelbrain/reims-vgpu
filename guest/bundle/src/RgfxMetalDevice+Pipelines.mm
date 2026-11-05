@@ -28,14 +28,14 @@
 
 namespace {
 
-// How long a library create waits for room on the device ring before it reports the
-// ring full: the host drains the ring as it runs, so a full ring is transient.
+// How long a library create waits for the kext to post it on the control ring before it
+// reports the ring full: the host drains the ring as it runs, so a full ring is transient.
 constexpr useconds_t kLibraryRetrySleepUs = 1000;
 constexpr int kLibraryRetries = 2000; // about two seconds
 
-// The largest library create sent inline in the ring (header and bytes): a quarter of
-// the device ring, so one create never holds most of it. Larger libraries go in a
-// region block (LIBRARY_FROM_REGION).
+// The largest library create sent inline in the control ring (header and bytes): a
+// quarter of the ring's data, so one create never holds most of it. Larger libraries go
+// in a region block (LIBRARY_FROM_REGION).
 constexpr uint64_t kLibraryInlineMax = RGFX_CONTROL_RING_DATA_SIZE / 4;
 
 // Narrows a universal .metallib to its generic AIR slice, the only one the host compiles: for

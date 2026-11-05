@@ -74,10 +74,10 @@ RgfxRingWriter::RgfxRingWriter(volatile uint8_t *ring_base, uint32_t data_size, 
       m_doorbellContext(doorbell_context), m_forward(nullptr), m_forwardContext(nullptr),
       m_produced(0), m_nextSeqno(1)
 {
-	// The bundle's rings (the device ring and the per-queue rings) are its own: fresh, and the
-	// host resets each at device init and at reset, so the writer starts from 0. (The interim
-	// "join at the current producer" was for sharing the framebuffer kext's control ring; the
-	// device ring replaced that, so each ring has a single producer and starts clean.)
+	// The rings the bundle writes itself, its command queues' submission rings, are its own:
+	// each is fresh, in a block the kext handed the process, with the process its single
+	// producer, so the writer starts from 0. The lifecycle goes through the kext instead (the
+	// forwarding writer below), which posts it on the control ring.
 }
 
 RgfxRingWriter::RgfxRingWriter(RgfxForward forward, void *forward_context, uint32_t max_size)
