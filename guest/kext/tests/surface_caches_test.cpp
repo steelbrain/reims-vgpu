@@ -639,7 +639,7 @@ void otherBlocks()
 // A new block in place of a surface whose cached block went, its release unanswered, waits for
 // the host's copy of that block's cache into the pages, past a lock's 2 s, until the release is
 // late; then it goes on. A CPU lock of the surface waits for the answer as long, and for another
-// lock's download as long as for the GPU's writes. A block kept for good, or one let go with its
+// lock's download, or its own, as long too. A block kept for good, or one let go with its
 // attach in flight, posts no release and leaves nothing to wait for; nor does another surface's
 // release.
 void writeBack()
@@ -690,13 +690,24 @@ void writeBack()
 	          !rgfxCacheWritingBack(t, &surfaceObject),
 	      "the release answered, the pages hold the cache: the new block is made");
 	check(rgfxCacheLockWaitMs(t, kSurface, 2000) == 2000, "and a lock waits as it does");
-	// A lock waiting for another lock's download waits as it waits for the GPU's writes.
+	// A lock waiting for another lock's download waits as long as the download's answer, and
+	// that as long as a release's: a lock that went on at 2 s read pages without the GPU's
+	// writes, as the host's copy came later.
 	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
 	check(rgfxCacheNoteWrite(t, kSurface) &&
 	          rgfxCacheNext(t, kSurface, &offset, &mark) == kRgfxCacheDownload &&
 	          rgfxCacheNext(t, kSurface, &offset, &mark) == kRgfxCacheWait,
 	      "a second lock waits for the first's download");
-	check(rgfxCacheLockWaitMs(t, kSurface, 2000) == 2000, "as long as for the GPU's writes");
+	check(rgfxCacheLockWaitMs(t, kSurface, 2000) == kRgfxWriteBackWaitMs,
+	      "as long as for a release, past the lock's 2 s");
+	check(rgfxCacheDownloadWaitMs(0, 2000) == kRgfxWriteBackWaitMs &&
+	          rgfxCacheDownloadWaitMs(1500, 2000) == kRgfxWriteBackWaitMs - 1500,
+	      "the download's own answer: what is left of that wait from the lock's start");
+	check(rgfxCacheDownloadWaitMs(kRgfxWriteBackWaitMs, 2000) == 0 &&
+	          rgfxCacheDownloadWaitMs(kRgfxWriteBackWaitMs + 7, 2000) == 0,
+	      "none left: the lock goes on without asking");
+	check(rgfxCacheDownloadWaitMs(100, kRgfxWriteBackWaitMs + 100) == kRgfxWriteBackWaitMs,
+	      "never shorter than the lock's own wait");
 	rgfxCacheDownloaded(t, kSurface, mark, true);
 	check(rgfxCacheReleased(t, kBlock, &map, &wire, &held) == 0 &&
 	          rgfxCacheBlockLetGo(t, kSurface, kBlock, false, &surfaceObject, &map, &wire, true) &&

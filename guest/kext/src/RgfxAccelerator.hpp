@@ -398,9 +398,11 @@ public:
 	// releasing client's thread, under no lock of the kext's.
 	void retryRefusedBlocks();
 	// A CPU lock of the cached surface whose block is at `offset` follows a GPU write: the host
-	// copies its device cache into its pages (SURFACE_DOWNLOAD). True once answered OK, waiting
-	// up to `timeoutMs` (RgfxAcceleratorContexts.cpp).
-	bool downloadSurfaceCache(UInt64 offset, UInt32 timeoutMs);
+	// copies its device cache into its pages (SURFACE_DOWNLOAD). kIOReturnSuccess once answered
+	// OK, waiting up to `timeoutMs`; kIOReturnTimeout where no answer came by then,
+	// kIOReturnUnsupported where the host answered otherwise, else what the post returned
+	// (RgfxAcceleratorContexts.cpp).
+	IOReturn downloadSurfaceCache(UInt64 offset, UInt32 timeoutMs);
 	// Names the pages of the in-place block at `offset` made by context `context`: wires the
 	// first `length` bytes of the surface's memory `memory`, writes their runs past the `size`
 	// bytes its holders map, and posts its SURFACE_PAGES with `flags` (RGFX_SURFACE_PAGES_*): a

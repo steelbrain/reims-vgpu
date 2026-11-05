@@ -2148,7 +2148,7 @@ RgfxPagesNaming RgfxAccelerator::attachSurfacePages(UInt32 context, UInt64 offse
 	return naming;
 }
 
-bool RgfxAccelerator::downloadSurfaceCache(UInt64 offset, UInt32 timeoutMs)
+IOReturn RgfxAccelerator::downloadSurfaceCache(UInt64 offset, UInt32 timeoutMs)
 {
 	RgfxSurfaceDownload message = {};
 	message.block_offset = offset;
@@ -2157,7 +2157,10 @@ bool RgfxAccelerator::downloadSurfaceCache(UInt64 offset, UInt32 timeoutMs)
 	IOReturn r = postLifecycle(RGFX_CMD_SURFACE_DOWNLOAD, &message, sizeof(message),
 	                           RGFX_EVT_COMPLETE, &answer, sizeof(answer), &answered, nullptr,
 	                           timeoutMs);
-	return r == kIOReturnSuccess && answered >= sizeof(answer) && answer.status == RGFX_STATUS_OK;
+	if (r != kIOReturnSuccess)
+		return r;
+	return answered >= sizeof(answer) && answer.status == RGFX_STATUS_OK ? kIOReturnSuccess
+	                                                                       : kIOReturnUnsupported;
 }
 
 bool RgfxAccelerator::postSurfacePages(UInt32 context, UInt64 offset, UInt64 total, UInt64 size,
