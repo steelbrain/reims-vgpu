@@ -17,6 +17,15 @@
 //! sample the surface in its own format (WindowServer's display surfaces are 10-bit,
 //! `BGR10A2Unorm`) and write the drawable's. The first surface of each format is logged.
 //!
+//! **The display's colour.** While any stage of the display pipe's colour is on (`color`: gamma
+//! tables and a colour matrix a transaction set), the draw puts what the display shows through it:
+//! a presented surface is drawn into the drawable by the colour's fragment function
+//! (`displayPipeColorFragment`), in place of the copy or the plain present shaders, and the
+//! scanout by its twin (`displayPipeColorScanoutFragment`), which reads the guest's pixels in
+//! place from the imported pages, as the blit does, one drawable pixel for each, clipped as the
+//! blit clips. The colour's buffers are made again only when a present changes it. With every
+//! stage off, the draw is as before.
+//!
 //! **The import.** The buffer covers the scanout's pages only: the host pages from the one its
 //! first row starts in to the one `stride × height` bytes on ends in, kept to the region. It is
 //! made at the first draw of a scanout and again only when the guest moves the scanout or changes
@@ -49,9 +58,15 @@ use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::MtlViewport;
 
+use super::color::DisplayColor;
 use super::{DrawnPresents, Presented, Shown};
 use crate::display::no_catch;
 use crate::platform::ApiPlatform;
+use reims_graphics::wire::{
+    RGFX_COLOR_MATRIX, RGFX_COLOR_PLANE_GAMMA, RGFX_COLOR_POST_GAMMA, RGFX_COLOR_PRE_GAMMA,
+};
+use reims_vgpu_core::platform::resource::Library as _;
+use reims_vgpu_core::platform::values::RenderPipelineDesc;
 
 /// `MTLLoadActionClear`.
 const LOAD_ACTION_CLEAR: u64 = 2;
@@ -84,7 +99,78 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     /// The present shaders' pipelines and the strip's two buffers, made at the first surface
     /// whose format a copy cannot carry; `None` inside where the platform refused them.
     converter: std::sync::OnceLock<Option<Converter<P>>>,
+    /// The colour's fragment functions, a surface's and the scanout's, made at the first draw
+    /// through a colour; `None` inside where the platform's library holds them not.
+    color_functions: std::sync::OnceLock<Option<[P::Function; 2]>>,
+    /// The colour's pipelines, by what they draw and the drawable's pixel format.
+    color_pipelines: Mutex<ColorPipelines<P>>,
+    /// The colour's buffers, made for the colour of that count of changes.
+    color_buffers: Mutex<Option<(u64, ColorBuffers<P>)>>,
 }
+
+/// The colour's pipelines made so far, each with what it draws and the drawable's pixel format.
+type ColorPipelines<P> = Vec<((ColorSource, u64), <P as Platform>::RenderPipeline)>;
+
+/// What a draw through the colour reads: a presented surface's texture, or the scanout's pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorSource {
+    /// `displayPipeColorFragment`.
+    Surface,
+    /// `displayPipeColorScanoutFragment`.
+    Scanout,
+}
+
+/// Where a draw through the colour reads the scanout (`displayPipeColorScanoutFragment`'s
+/// buffers 4 and 5): the imported pages, and the drawable pixel its top left goes to, its row's
+/// 4-byte words and its first pixel's word in the buffer.
+struct ScanoutRead<P: Platform> {
+    buffer: P::Buffer,
+    origin: (u32, u32),
+    stride_words: u32,
+    first_word: u32,
+}
+
+/// The colour's buffers (the module doc): the properties, `displayPipeColorFragment`'s buffer 0
+/// (the matrix's rows, then each stage's entry count), and the three gamma stages' tables, its
+/// buffers 1 to 3 (an empty stage's a buffer of one zero entry).
+struct ColorBuffers<P: Platform> {
+    properties: P::Buffer,
+    tables: [P::Buffer; 3],
+}
+
+impl<P: Platform> ColorBuffers<P> {
+    /// The same buffers, retained again.
+    fn clone_refs(&self) -> ColorBuffers<P> {
+        ColorBuffers {
+            properties: self.properties.clone_ref(),
+            tables: self.tables.each_ref().map(|b| b.clone_ref()),
+        }
+    }
+}
+
+/// What a draw through the colour reads (`ScanoutDraw::encode_color_pass`).
+enum Read<'a, P: Platform> {
+    /// A presented surface's texture.
+    Surface(&'a P::Texture),
+    /// The scanout's pages.
+    Scanout(&'a ScanoutRead<P>),
+}
+
+impl<P: Platform> Clone for Read<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: Platform> Copy for Read<'_, P> {}
+
+/// The colour's fragment functions: a surface's, and the scanout's.
+const COLOR_FRAGMENTS: [&str; 2] = [
+    "displayPipeColorFragment",
+    "displayPipeColorScanoutFragment",
+];
+/// The colour pipelines' label.
+const COLOR_LABEL: &str = "reims-vgpu.display-pipe-color";
 
 /// The region's pages under a scanout, imported (the module doc).
 pub(crate) struct ScanoutImport<P: Platform> {
@@ -145,6 +231,9 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             shown: Arc::clone(shown),
             presented: Arc::clone(presented),
             converter: std::sync::OnceLock::new(),
+            color_functions: std::sync::OnceLock::new(),
+            color_pipelines: Mutex::default(),
+            color_buffers: Mutex::default(),
         })
     }
 
@@ -229,10 +318,14 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         region: PixelRect,
     ) -> Option<(P::CommandBuffer, DrawnPresents<P>)> {
         let mut presents = self.presented.drawn();
+        let (changes, color) = self.presented.color();
+        let color = (!color.is_identity()).then_some((changes, color));
         if let Some((surface, hold)) = self.presented.shown() {
             let (from, to) = (surface.pixel_format(), texture.pixel_format());
             self.presented.seen_format(from, to);
-            let drawn = if BGRA8_FORMATS.contains(&from) && BGRA8_FORMATS.contains(&to) {
+            let drawn = if let Some((changes, color)) = &color {
+                self.encode_colored(*changes, color, &surface, texture, region)
+            } else if BGRA8_FORMATS.contains(&from) && BGRA8_FORMATS.contains(&to) {
                 self.encode_surface(&surface, texture, region)
             } else {
                 self.encode_converted(&surface, texture, region)
@@ -244,8 +337,311 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             }
             self.presented.refuse_format(from, to);
         }
-        let command_buffer = self.encode_scanout(texture, region)?;
+        let command_buffer = match &color {
+            Some((changes, color)) => self.encode_scanout_colored(*changes, color, texture, region),
+            None => self.encode_scanout(texture, region),
+        }?;
         Some((command_buffer, presents))
+    }
+
+    /// A command buffer of the sink's queue with the scanout drawn into `texture` at `region`
+    /// through `color` (the module doc), clipped as [`Self::encode_scanout`] clips its blit, after
+    /// a clear of the drawable to black; not committed. `None` where the guest has no scanout, or
+    /// the platform refuses its pages, the colour's pipeline or buffers.
+    fn encode_scanout_colored(
+        &self,
+        changes: u64,
+        color: &DisplayColor,
+        texture: &P::Texture,
+        region: PixelRect,
+    ) -> Option<P::CommandBuffer> {
+        let scanout = (*self.shown.scanout.lock())?;
+        let (buffer, source_offset) = self.scanout_buffer(&scanout)?;
+        let (texture_width, texture_height) = (texture.width(), texture.height());
+        let x = region.x.min(texture_width);
+        let y = region.y.min(texture_height);
+        let width = u64::from(scanout.width)
+            .min(region.width)
+            .min(texture_width - x);
+        let height = u64::from(scanout.height)
+            .min(region.height)
+            .min(texture_height - y);
+        // The scanout's offset and stride are multiples of 4 (`reims_graphics`'s `SET_SCANOUT`),
+        // and its pages' import starts at a page.
+        let read = ScanoutRead {
+            buffer,
+            origin: (u32::try_from(x).ok()?, u32::try_from(y).ok()?),
+            stride_words: scanout.stride / 4,
+            first_word: u32::try_from(source_offset / 4).ok()?,
+        };
+        let at = PixelRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+        self.encode_color_pass(
+            &command_buffer,
+            changes,
+            color,
+            Read::Scanout(&read),
+            texture,
+            at,
+        )?;
+        Some(command_buffer)
+    }
+
+    /// A command buffer of the sink's queue with the presented `surface` drawn into `texture` at
+    /// `region` through `color` (the module doc), after a clear of the drawable to black; not
+    /// committed. `None`, with nothing committed, where the platform refuses the colour's
+    /// pipeline or buffers.
+    fn encode_colored(
+        &self,
+        changes: u64,
+        color: &DisplayColor,
+        surface: &P::Texture,
+        texture: &P::Texture,
+        region: PixelRect,
+    ) -> Option<P::CommandBuffer> {
+        let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+        let (texture_width, texture_height) = (texture.width(), texture.height());
+        let x = region.x.min(texture_width);
+        let y = region.y.min(texture_height);
+        let at = PixelRect {
+            x,
+            y,
+            width: region.width.min(texture_width - x),
+            height: region.height.min(texture_height - y),
+        };
+        self.encode_color_pass(
+            &command_buffer,
+            changes,
+            color,
+            Read::Surface(surface),
+            texture,
+            at,
+        )?;
+        Some(command_buffer)
+    }
+
+    /// The colour's pipeline for `source` into a drawable of `format`, made and kept at its first
+    /// use; `None` where the platform's library holds not the colour's functions, or refuses the
+    /// pipeline.
+    fn color_pipeline(
+        &self,
+        converter: &Converter<P>,
+        source: ColorSource,
+        format: u64,
+    ) -> Option<P::RenderPipeline> {
+        let functions = self
+            .color_functions
+            .get_or_init(|| {
+                let library = self.device.new_shader_library().ok().flatten()?;
+                let function = |name| no_catch(library.new_function(OnFault::Die, name));
+                Some([function(COLOR_FRAGMENTS[0])?, function(COLOR_FRAGMENTS[1])?])
+            })
+            .as_ref()?;
+        let mut pipelines = self.color_pipelines.lock();
+        if let Some((_, pipeline)) = pipelines.iter().find(|(key, _)| *key == (source, format)) {
+            return Some(pipeline.clone_ref());
+        }
+        let fragment = match source {
+            ColorSource::Surface => &functions[0],
+            ColorSource::Scanout => &functions[1],
+        };
+        let made = self
+            .device
+            .new_render_pipeline_state(&RenderPipelineDesc {
+                label: Some(COLOR_LABEL),
+                vertex: &converter.pipelines.vertex_function,
+                fragment,
+                color0_pixel_format: format,
+                blend_over: false,
+                resource_index: None,
+            })
+            .ok()
+            .flatten()?;
+        pipelines.push(((source, format), made.clone_ref()));
+        Some(made)
+    }
+
+    /// The colour's buffers for `color`, the colour of `changes` changes, made again where the
+    /// colour changed since the last made; `None` where the platform refuses one.
+    fn color_buffers(&self, changes: u64, color: &DisplayColor) -> Option<ColorBuffers<P>> {
+        let mut kept = self.color_buffers.lock();
+        if let Some((made_for, buffers)) = kept.as_ref()
+            && *made_for == changes
+        {
+            return Some(buffers.clone_refs());
+        }
+        let bytes = |entries: &[[f32; 4]]| -> Vec<u8> {
+            entries
+                .iter()
+                .flatten()
+                .flat_map(|f| f.to_le_bytes())
+                .collect()
+        };
+        let stage = |s: u32| {
+            let s = usize::try_from(s).ok()?;
+            color.stages.get(s).and_then(Option::as_ref)
+        };
+        let count = |s: u32| stage(s).map_or(0, |t| u32::try_from(t.len()).unwrap_or(0));
+        let mut properties = match stage(RGFX_COLOR_MATRIX) {
+            Some(rows) => bytes(rows),
+            None => bytes(&[[0.0; 4]; 3]),
+        };
+        for s in [
+            RGFX_COLOR_PLANE_GAMMA,
+            RGFX_COLOR_PRE_GAMMA,
+            RGFX_COLOR_MATRIX,
+            RGFX_COLOR_POST_GAMMA,
+        ] {
+            properties.extend_from_slice(&count(s).to_le_bytes());
+        }
+        let table = |s: u32| match stage(s) {
+            Some(entries) => self.buffer_of(&bytes(entries)),
+            None => self.buffer_of(&[0; 16]),
+        };
+        let made = ColorBuffers {
+            properties: self.buffer_of(&properties)?,
+            tables: [
+                table(RGFX_COLOR_PLANE_GAMMA)?,
+                table(RGFX_COLOR_PRE_GAMMA)?,
+                table(RGFX_COLOR_POST_GAMMA)?,
+            ],
+        };
+        *kept = Some((changes, made.clone_refs()));
+        Some(made)
+    }
+
+    /// A shared buffer holding `bytes`; `None` where the platform refuses it.
+    fn buffer_of(&self, bytes: &[u8]) -> Option<P::Buffer> {
+        let length = u64::try_from(bytes.len()).ok()?;
+        let buffer = no_catch(self.device.new_buffer_of_length(OnFault::Die, length, 0))?;
+        let contents: *mut u8 = buffer.contents().as_ptr();
+        if contents.is_null() {
+            return None;
+        }
+        // SAFETY: the buffer is `length` bytes of shared memory, its contents mapped while it
+        // lives, and nothing else writes it yet.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents, bytes.len()) };
+        Some(buffer)
+    }
+
+    /// Encodes into `command_buffer` a render pass that clears `texture` to black and draws
+    /// `read` over `at` through `color`, the colour of `changes` changes; `None`, with no pass
+    /// encoded, where the platform refuses the colour's pipeline or buffers.
+    fn encode_color_pass(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        changes: u64,
+        color: &DisplayColor,
+        read: Read<'_, P>,
+        texture: &P::Texture,
+        at: PixelRect,
+    ) -> Option<()> {
+        let converter = self.converter()?;
+        let source = match read {
+            Read::Surface(_) => ColorSource::Surface,
+            Read::Scanout(_) => ColorSource::Scanout,
+        };
+        let pipeline = self.color_pipeline(converter, source, texture.pixel_format())?;
+        let buffers = self.color_buffers(changes, color)?;
+        let scanout_at = match read {
+            Read::Scanout(r) => {
+                let words = [r.origin.0, r.origin.1, r.stride_words, r.first_word];
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                Some(self.buffer_of(&bytes)?)
+            }
+            Read::Surface(_) => None,
+        };
+        let pass = self.platform.render_pass_descriptor();
+        no_catch(pass.set_color_attachment(
+            OnFault::Die,
+            0,
+            &ColorAttachmentSet {
+                texture: Some(Some(texture)),
+                load_action: Some(LOAD_ACTION_CLEAR),
+                store_action: Some(STORE_ACTION_STORE),
+                clear_color: Some(ClearColor {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 1.0,
+                }),
+                ..ColorAttachmentSet::default()
+            },
+        ));
+        let encoder = no_catch(command_buffer.render_encoder(OnFault::Die, &pass))?;
+        #[expect(clippy::as_conversions, reason = "pixel counts far below 2^52")]
+        let viewport = MtlViewport {
+            origin_x: at.x as f64,
+            origin_y: at.y as f64,
+            width: at.width as f64,
+            height: at.height as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        };
+        if at.width > 0 && at.height > 0 {
+            let mut cmds = vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(&pipeline),
+                },
+                RenderCmd::SetViewport { viewport },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&converter.positions),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&converter.coordinates),
+                    offset: 0,
+                    index: 1,
+                },
+                RenderCmd::SetFragmentBuffer {
+                    buffer: Some(&buffers.properties),
+                    offset: 0,
+                    index: 0,
+                },
+            ];
+            for (index, table) in (1..).zip(&buffers.tables) {
+                cmds.push(RenderCmd::SetFragmentBuffer {
+                    buffer: Some(table),
+                    offset: 0,
+                    index,
+                });
+            }
+            match (read, &scanout_at) {
+                (Read::Surface(surface), _) => cmds.push(RenderCmd::SetFragmentTexture {
+                    texture: Some(surface),
+                    index: 0,
+                }),
+                (Read::Scanout(r), Some(scanout_at)) => {
+                    cmds.push(RenderCmd::SetFragmentBuffer {
+                        buffer: Some(&r.buffer),
+                        offset: 0,
+                        index: 4,
+                    });
+                    cmds.push(RenderCmd::SetFragmentBuffer {
+                        buffer: Some(scanout_at),
+                        offset: 0,
+                        index: 5,
+                    });
+                }
+                (Read::Scanout(_), None) => {}
+            }
+            cmds.push(RenderCmd::DrawPrimitives {
+                primitive_type: TRIANGLE_STRIP,
+                vertex_start: 0,
+                vertex_count: 4,
+            });
+            for cmd in cmds {
+                no_catch(encoder.encode(OnFault::Die, cmd));
+            }
+        }
+        no_catch(encoder.encode(OnFault::Die, RenderCmd::EndEncoding));
+        Some(())
     }
 
     /// A command buffer of the sink's queue with the scanout blitted into `texture` at `region`,
@@ -460,5 +856,326 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         if let Some(encoder) = no_catch(command_buffer.render_encoder(OnFault::Die, &pass)) {
             no_catch(encoder.encode(OnFault::Die, RenderCmd::EndEncoding));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reims_vgpu_core::platform::ObjId;
+    use reims_vgpu_core::platform::values::TextureDesc;
+    use reims_vgpu_core::testkit::objects::kind;
+    use reims_vgpu_core::testkit::{Arg, FakePlatform};
+
+    use super::super::color::Table;
+    use super::super::{DisplayHold, ShownTexture};
+    use super::*;
+
+    const FRAGMENT_BUFFER: &str = "setFragmentBuffer:offset:atIndex:";
+    const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
+    const COPY_IN: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:\
+                           sourceSize:toTexture:destinationSlice:destinationLevel:\
+                           destinationOrigin:";
+    const NEW_BUFFER: &str = "newBufferWithLength:options:";
+    const NEW_TEXTURE: &str = "newTextureWithDescriptor:";
+    const NEW_PIPELINE: &str = "newRenderPipelineStateWithDescriptor:error:";
+    const NAMED: &str = "newFunctionWithName:";
+
+    /// The scanout `rig` shows.
+    const SCANOUT: Scanout = Scanout {
+        width: 64,
+        height: 32,
+        stride: 256,
+        offset: reims_graphics::wire::RGFX_ALLOCATIONS_OFFSET,
+    };
+
+    /// A sink over a fresh region, showing a 64 × 32 scanout at the region's allocations, and a
+    /// BGRA8 drawable of that size.
+    fn rig() -> (
+        Arc<FakePlatform>,
+        ScanoutDraw<FakePlatform>,
+        Arc<Presented<FakePlatform>>,
+        <FakePlatform as Platform>::Texture,
+    ) {
+        let platform = Arc::new(FakePlatform::new());
+        let region = Arc::new(Region::new(reims_graphics::REGION_SIZE as usize).unwrap());
+        let shown = Arc::new(Shown::default());
+        *shown.scanout.lock() = Some(SCANOUT);
+        let presented = Arc::new(Presented::<FakePlatform>::default());
+        let draw = ScanoutDraw::new(Arc::clone(&platform), &region, &shown, &presented).unwrap();
+        let drawable = texture(&draw, 80);
+        (platform, draw, presented, drawable)
+    }
+
+    /// A 64 × 32 texture of `format` on the sink's device.
+    fn texture(
+        draw: &ScanoutDraw<FakePlatform>,
+        format: u64,
+    ) -> <FakePlatform as Platform>::Texture {
+        let descriptor = draw.platform.texture_descriptor(&TextureDesc {
+            pixel_format: format,
+            width: 64,
+            height: 32,
+            ..TextureDesc::default()
+        });
+        draw.device
+            .new_texture(OnFault::Die, &descriptor)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The bytes of a buffer the fake platform made.
+    fn bytes_of(buffer: &<FakePlatform as Platform>::Buffer) -> Vec<u8> {
+        let length = usize::try_from(buffer.length()).unwrap();
+        let contents: *const u8 = buffer.contents().as_ptr();
+        // SAFETY: the fake buffer's contents are `length` bytes it holds while it lives.
+        unsafe { std::slice::from_raw_parts(contents, length) }.to_vec()
+    }
+
+    fn floats(entries: &[[f32; 4]]) -> Vec<u8> {
+        entries
+            .iter()
+            .flatten()
+            .flat_map(|f| f.to_le_bytes())
+            .collect()
+    }
+
+    /// The display's colour becomes `stages`, its `changes`-th change.
+    fn set_color(presented: &Presented<FakePlatform>, changes: u64, stages: [Option<Table>; 4]) {
+        *presented.color.lock() = (changes, Arc::new(DisplayColor { stages }));
+    }
+
+    /// The fragment buffers a draw since `mark` bound, by index.
+    fn fragment_buffers(platform: &FakePlatform, mark: u64) -> Vec<(u64, ObjId)> {
+        platform
+            .call_log()
+            .since(mark)
+            .into_iter()
+            .filter(|c| c.sel == FRAGMENT_BUFFER)
+            .map(|c| (c.args[2].as_u64().unwrap(), c.args[0].as_obj().unwrap()))
+            .collect()
+    }
+
+    /// The buffers a test keeps alive.
+    type Made = Mutex<Vec<<FakePlatform as Platform>::Buffer>>;
+
+    /// The buffers the fake platform makes from here on, kept alive (up to `n`).
+    fn keep_new_buffers(platform: &FakePlatform, n: usize) -> Arc<Made> {
+        let made: Arc<Made> = Arc::default();
+        for _ in 0..n {
+            let made = Arc::clone(&made);
+            platform
+                .world()
+                .on_new::<kind::Buffer>(move |b| made.lock().push(b.clone_ref()));
+        }
+        made
+    }
+
+    /// The four words of the scanout's place a draw bound at fragment buffer 5.
+    fn scanout_words(made: &Made, id: ObjId) -> Vec<u32> {
+        let made = made.lock();
+        let buffer = made
+            .iter()
+            .find(|b| b.id() == id)
+            .expect("the scanout's place");
+        let bytes = bytes_of(buffer);
+        let (words, _) = bytes.as_chunks::<4>();
+        words.iter().map(|w| u32::from_le_bytes(*w)).collect()
+    }
+
+    /// With every stage off, the scanout is blitted into the drawable and nothing is drawn; with
+    /// a stage on, it is drawn into the drawable by the scanout's colour function, reading the
+    /// imported pages in place (no copy), with the properties at fragment buffer 0 (the matrix's
+    /// rows, each stage's entry count), the gamma tables at 1 to 3, the pages at 4 and the
+    /// scanout's place at 5 (the drawable pixel of its top left, its row and first pixel in
+    /// words); the next draw of the same colour makes no table, texture or pipeline, and a change
+    /// of the colour makes its buffers again
+    #[test]
+    fn a_color_draws_the_scanout_through_its_tables() {
+        let (platform, draw, presented, drawable) = rig();
+        let log = platform.call_log();
+        let region = PixelRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 32,
+        };
+
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, region).unwrap();
+        let blits: Vec<_> = log
+            .since(mark)
+            .into_iter()
+            .filter(|c| c.sel == COPY_IN)
+            .collect();
+        assert_eq!(blits.len(), 1);
+        assert!(blits[0].args.contains(&Arg::obj(&drawable)));
+        assert_eq!(
+            log.sels_since(mark).iter().filter(|s| **s == DRAW).count(),
+            0
+        );
+        let (pages, _) = draw.scanout_buffer(&SCANOUT).unwrap();
+
+        let post: Table = Arc::from(vec![[0.0, 0.0, 0.0, 0.0], [0.5, 0.25, 1.0, 0.0]]);
+        set_color(&presented, 1, [None, None, None, Some(Arc::clone(&post))]);
+        let made = keep_new_buffers(&platform, 16);
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, region).unwrap();
+        let calls = log.since(mark);
+        let named: Vec<_> = calls
+            .iter()
+            .filter(|c| c.sel == NAMED)
+            .map(|c| c.args[0].clone())
+            .collect();
+        // After the present shaders' (the converter's, made at its first use), the colour's two.
+        assert!(
+            named.ends_with(&COLOR_FRAGMENTS.map(|f| Arg::Str(f.to_owned()))),
+            "{named:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.sel == COPY_IN),
+            "the pages are read in place"
+        );
+        assert_eq!(calls.iter().filter(|c| c.sel == NEW_TEXTURE).count(), 0);
+        assert_eq!(calls.iter().filter(|c| c.sel == DRAW).count(), 1);
+        let bound = fragment_buffers(&platform, mark);
+        assert_eq!(
+            bound.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert_eq!(bound[4].1, pages.id());
+        assert_eq!(scanout_words(&made, bound[5].1), [0, 0, 64, 0]);
+
+        let buffers = draw.color_buffers(1, &presented.color().1).unwrap();
+        assert_eq!(buffers.properties.id(), bound[0].1);
+        let mut properties = floats(&[[0.0; 4]; 3]);
+        for count in [0u32, 0, 0, 2] {
+            properties.extend_from_slice(&count.to_le_bytes());
+        }
+        assert_eq!(bytes_of(&buffers.properties), properties);
+        assert_eq!(bytes_of(&buffers.tables[0]), [0; 16]);
+        assert_eq!(bytes_of(&buffers.tables[1]), [0; 16]);
+        assert_eq!(bytes_of(&buffers.tables[2]), floats(&post));
+        assert_eq!(buffers.tables[2].id(), bound[3].1);
+
+        // The same colour again: only the scanout's place is made.
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, region).unwrap();
+        assert_eq!(
+            log.sels_since(mark)
+                .iter()
+                .filter(|s| **s == NEW_BUFFER)
+                .count(),
+            1
+        );
+        for made in [NEW_TEXTURE, NEW_PIPELINE, NAMED] {
+            assert_eq!(
+                log.sels_since(mark).iter().filter(|s| **s == made).count(),
+                0,
+                "{made}"
+            );
+        }
+        assert_eq!(fragment_buffers(&platform, mark)[..5], bound[..5]);
+
+        // A matrix and a plane table, into a region off the drawable's corner: the buffers are
+        // made again, and the scanout's place names the region's corner.
+        let rows: Table = Arc::from(vec![
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.25],
+        ]);
+        let plane: Table = Arc::from(vec![[1.0, 1.0, 1.0, 0.0], [0.0, 0.0, 0.0, 0.0]]);
+        set_color(
+            &presented,
+            2,
+            [
+                Some(Arc::clone(&plane)),
+                None,
+                Some(Arc::clone(&rows)),
+                Some(post),
+            ],
+        );
+        let corner = PixelRect {
+            x: 8,
+            y: 4,
+            width: 64,
+            height: 32,
+        };
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, corner).unwrap();
+        assert_eq!(
+            log.sels_since(mark)
+                .iter()
+                .filter(|s| **s == NEW_BUFFER)
+                .count(),
+            5
+        );
+        let buffers = draw.color_buffers(2, &presented.color().1).unwrap();
+        let mut properties = floats(&rows);
+        for count in [2u32, 0, 3, 2] {
+            properties.extend_from_slice(&count.to_le_bytes());
+        }
+        assert_eq!(bytes_of(&buffers.properties), properties);
+        assert_eq!(bytes_of(&buffers.tables[0]), floats(&plane));
+        let bound = fragment_buffers(&platform, mark);
+        assert_eq!(bound[0].1, buffers.properties.id());
+        assert_eq!(scanout_words(&made, bound[5].1), [8, 4, 64, 0]);
+
+        // Every stage off again: the blit, as before.
+        set_color(&presented, 3, Default::default());
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, region).unwrap();
+        assert_eq!(
+            log.sels_since(mark).iter().filter(|s| **s == DRAW).count(),
+            0
+        );
+        assert!(
+            log.since(mark)
+                .iter()
+                .any(|c| c.sel == COPY_IN && c.args.contains(&Arg::obj(&drawable)))
+        );
+    }
+
+    /// A presented surface is drawn through the colour (a stage on) by the surface's colour
+    /// function, in place of the copy a BGRA8 surface takes, sampled straight from the surface
+    #[test]
+    fn a_color_draws_a_presented_surface_through_its_tables() {
+        let (platform, draw, presented, drawable) = rig();
+        let log = platform.call_log();
+        let surface = texture(&draw, 80);
+        *presented.texture.lock() = Some(ShownTexture {
+            texture: surface.clone_ref(),
+            hold: Arc::new(DisplayHold {
+                span: None,
+                answers: Mutex::default(),
+            }),
+        });
+        let region = PixelRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 32,
+        };
+        let pre: Table = Arc::from(vec![[0.25, 0.25, 0.25, 0.0]]);
+        set_color(&presented, 1, [None, Some(pre), None, None]);
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, region).unwrap();
+        let calls = log.since(mark);
+        assert_eq!(calls.iter().filter(|c| c.sel == DRAW).count(), 1);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.sel == COPY_IN || c.sel.starts_with("copyFromTexture"))
+        );
+        let sampled: Vec<_> = calls
+            .iter()
+            .filter(|c| c.sel == "setFragmentTexture:atIndex:")
+            .map(|c| c.args[0].as_obj())
+            .collect();
+        assert_eq!(sampled, [Some(surface.id())]);
+        let bound = fragment_buffers(&platform, mark);
+        assert_eq!(
+            bound.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
     }
 }

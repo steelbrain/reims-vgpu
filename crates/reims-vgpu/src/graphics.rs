@@ -41,17 +41,17 @@ use reims_graphics::wire::{
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT,
     RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
-    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_ICB_SLOTS,
-    RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
+    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_HEAP_OVER_PAGES,
+    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS, RGFX_FEATURE_MANAGED_AT_OFFSET,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_SUBMIT_ROOM,
     RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER,
     RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
     RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
     RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
     RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
-    RgfxCbScheduled, RgfxCbSubmitted, RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup,
-    RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection, RgfxSamplerState, RgfxSurfacePages,
-    RgfxVideoCaps,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
+    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxPipelineReflection,
+    RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, FixedScreen, Host, Mode, PresentAnswer, Scanout,
@@ -75,6 +75,7 @@ use crate::device::{GuestMemoryLease, MemoryMap};
 use crate::display::no_catch;
 use crate::entry;
 use crate::error::Error;
+use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::worker::{Unsettled, Worker};
@@ -89,6 +90,7 @@ use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
 use crate::platform::ApiPlatform;
 use crate::window::WindowLink;
 
+mod color;
 mod compile;
 mod completion;
 mod decode;
@@ -255,7 +257,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // in its slabs.
             // A host that maps the guest's pages maps a process's own pages too, for its no-copy
             // buffers (`BUFFER_OVER_PAGES`) and the heaps of its buffers' slabs
-            // (`HEAP_OVER_PAGES`).
+            // (`HEAP_OVER_PAGES`). Every host carries the display pipe's colour out
+            // (`DISPLAY_COLOR`), its window drawing through it.
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);
@@ -267,6 +270,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_SUBMIT_ROOM)
                 | u64::from(RGFX_FEATURE_ICB_SLOTS)
                 | u64::from(RGFX_FEATURE_MANAGED_TEXTURE_SLABS)
+                | u64::from(RGFX_FEATURE_DISPLAY_COLOR)
                 | if unified_memory {
                     0
                 } else {
@@ -325,6 +329,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 device: gpu_device,
                 presents,
                 presented,
+                color: Mutex::default(),
                 pool,
                 pending: Pending::default(),
                 region: Arc::clone(&region),
@@ -462,6 +467,9 @@ struct GraphicsControl<P: ApiPlatform> {
     presented: Arc<Presented<P>>,
     /// The presents waiting for the command buffers that write their surfaces.
     presents: Arc<PresentQueue<P>>,
+    /// The display colour's `DISPLAY_COLOR` parts staged since the last present, which the next
+    /// one takes (`color`): on the presents' lane, in ring order with the presents.
+    color: Mutex<ColorStaging>,
     /// The threads ring 0's pipeline and library creates compile on (`compile`, `make`).
     pool: CompilePool,
     /// The pipelines being compiled, which a command buffer naming one waits for.
@@ -533,6 +541,15 @@ pub(crate) struct ShownTexture<P: Platform> {
     hold: Arc<DisplayHold>,
 }
 
+/// What a present shows: a surface's texture (`None`: the scanout), by the surface's id, or what the
+/// display shows already (`RGFX_PRESENT_KEEP`), with only its colour changed.
+pub(crate) enum Shows<P: Platform> {
+    /// The surface `id`'s texture, or the scanout for `None`.
+    Surface(u32, Option<ShownTexture<P>>),
+    /// What the display shows already.
+    Kept,
+}
+
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
 /// the decoder made over it, which the window's sink draws into the next drawable (`sink`), and
 /// the presents' answers, given at the first refresh of the device's display after that draw has
@@ -556,6 +573,9 @@ pub(crate) struct Presented<P: Platform> {
     answers: PresentAnswers<PresentAnswer>,
     /// The last (surface, drawable) pixel formats logged.
     formats: Mutex<Option<(u64, u64)>>,
+    /// The display's colour (`color`), and how many times a present or the reset changed it,
+    /// which the sink's buffers of it are named by.
+    color: Mutex<(u64, Arc<DisplayColor>)>,
 }
 
 impl<P: Platform> Default for Presented<P> {
@@ -568,6 +588,7 @@ impl<P: Platform> Default for Presented<P> {
             refused: AtomicBool::new(false),
             formats: Mutex::new(None),
             answers: PresentAnswers::default(),
+            color: Mutex::new((0, Arc::default())),
         }
     }
 }
@@ -619,17 +640,53 @@ impl<P: Platform> Presented<P> {
         Box::new(move || drop(join))
     }
 
-    /// Shows `texture` (the surface `id`'s), or the scanout for `None`, and asks the window for a
-    /// frame; `answer` is given at the vblank the display first shows it ([`PresentAnswers`]), or
-    /// at once without a window. The hold of the texture shown before is returned, for the caller
-    /// to let go of with no lock held: a release waiting for it may be answered there.
+    /// Shows `texture` (the surface `id`'s), or the scanout for `None`, or keeps what the display
+    /// shows where `shows` is [`Shows::Kept`], with the colour stages `color` sets
+    /// ([`DisplayColor::apply`]), and asks the window for a frame; `answer` is given at the vblank
+    /// the display first shows it ([`PresentAnswers`]), or at once without a window. The hold of
+    /// the texture shown before is returned, for the caller to let go of with no lock held: a
+    /// release waiting for it may be answered there.
     #[must_use]
     fn show(
         &self,
-        id: u32,
-        texture: Option<ShownTexture<P>>,
+        shows: Shows<P>,
+        color: Option<ColorChange>,
         answer: PresentAnswer,
     ) -> Option<Arc<DisplayHold>> {
+        if let Some(change) = color {
+            let mut shown = self.color.lock();
+            let mut next = DisplayColor::clone(&shown.1);
+            next.apply(change);
+            if next.is_identity() != shown.1.is_identity() {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "the display's colour is {}",
+                    if next.is_identity() {
+                        "the identity again"
+                    } else {
+                        "no longer the identity: the window draws through it"
+                    }
+                );
+            }
+            *shown = (shown.0.wrapping_add(1), Arc::new(next));
+        }
+        let hold = match shows {
+            Shows::Kept => None,
+            Shows::Surface(id, texture) => self.swap(id, texture),
+        };
+        match self.window.get() {
+            Some(window) => {
+                self.answers.shown(answer);
+                window.new_frame();
+            }
+            None => answer.answer(RGFX_STATUS_OK),
+        }
+        hold
+    }
+
+    /// The display shows `texture` (the surface `id`'s), or the scanout for `None`: the hold of
+    /// the texture shown before, for [`Self::show`]'s caller.
+    fn swap(&self, id: u32, texture: Option<ShownTexture<P>>) -> Option<Arc<DisplayHold>> {
         let previous = self.surface_id.swap(id, Ordering::AcqRel);
         if previous != id {
             log::info!(
@@ -649,20 +706,24 @@ impl<P: Platform> Presented<P> {
                  {refusal}"
             );
         }
-        match self.window.get() {
-            Some(window) => {
-                self.answers.shown(answer);
-                window.new_frame();
-            }
-            None => answer.answer(RGFX_STATUS_OK),
-        }
         hold
     }
 
+    /// The display's colour, and the count of its changes, which names it.
+    pub(crate) fn color(&self) -> (u64, Arc<DisplayColor>) {
+        let color = self.color.lock();
+        (color.0, Arc::clone(&color.1))
+    }
+
     /// The device's reset: the display shows the scanout, which the reset keeps, in place of any
-    /// surface, whose texture is let go of in a refusal scope; the answers still owed are given
-    /// as they come, and dropped, as each is of a present taken before the reset.
+    /// surface, whose texture is let go of in a refusal scope, with every colour stage off; the
+    /// answers still owed are given as they come, and dropped, as each is of a present taken
+    /// before the reset.
     fn reset(&self) {
+        {
+            let mut color = self.color.lock();
+            *color = (color.0.wrapping_add(1), Arc::default());
+        }
         let previous = self.surface_id.swap(0, Ordering::AcqRel);
         let shown = self.texture.lock().take();
         let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
@@ -820,6 +881,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     self.pool.context_closed(context);
                 }
                 self.presents.reset();
+                self.color.lock().reset();
                 self.decoders.reset_done();
                 (contexts, dropped)
             };
@@ -1692,12 +1754,15 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     }
 
     /// Shows the IOSurface `iosurface_id` (0: the scanout) once the command buffers committed that
-    /// write its copy have finished, after the presents before it ([`PresentQueue`]), answering
-    /// once the window shows it; answered invalid at once, with nothing changed, where the decoder
-    /// holds no texture over it.
+    /// write its copy have finished, after the presents before it ([`PresentQueue`]), with the
+    /// colour stages staged since the last present ([`ColorStaging::take`]), answering once the
+    /// window shows it; answered invalid at once, with nothing changed and the colour still
+    /// staged, where the decoder holds no texture over it.
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
         if iosurface_id == 0 {
-            self.presents.present(0, None, answer, Vec::new(), None);
+            let color = self.color.lock().take();
+            self.presents
+                .present(0, None, color, answer, Vec::new(), None);
             return;
         }
         let decoder = self.decoder();
@@ -1730,10 +1795,36 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 // Its block is held from here, before the texture's destroy and the block's
                 // release can come: the present shows it later.
                 let shown = self.presented.hold(texture, span);
+                let color = self.color.lock().take();
                 self.presents
-                    .present(iosurface_id, Some(shown), answer, writers, fill);
+                    .present(iosurface_id, Some(shown), color, answer, writers, fill);
             }
             None => answer.answer(RGFX_STATUS_INVALID_ARGUMENT),
+        }
+    }
+
+    /// A present that keeps what the display shows (`RGFX_PRESENT_KEEP`), with the colour stages
+    /// staged since the last present, after the presents before it, answered once the window
+    /// shows it.
+    fn present_kept(&self, answer: PresentAnswer) {
+        let color = self.color.lock().take();
+        self.presents.present_kept(color, answer);
+    }
+
+    /// One `DISPLAY_COLOR` part, staged for the next present ([`ColorStaging::part`]); one the
+    /// staging refuses is logged.
+    fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
+        if let Err(dropped) = self.color.lock().part(color, entries) {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "a display colour part of transaction {} (stage {}, entries {} on of {}, {} \
+                 carried) was dropped ({dropped:?}): the stage keeps its table",
+                color.transaction_id,
+                color.stage,
+                color.first_entry,
+                color.entry_count,
+                entries.len()
+            );
         }
     }
 
@@ -1788,6 +1879,14 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
         self.control
             .present_surface(iosurface_id, generation, answer);
+    }
+
+    fn present_keep(&self, answer: PresentAnswer) {
+        self.control.present_kept(answer);
+    }
+
+    fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
+        self.control.display_color(color, entries);
     }
 
     fn surface_textures(&self, iosurface_id: u32) -> Vec<u64> {

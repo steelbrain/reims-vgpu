@@ -70,8 +70,9 @@ use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
 
+use super::color::ColorChange;
 use super::decode::FillWait;
-use super::{DisplayHold, Presented, ShownTexture};
+use super::{DisplayHold, Presented, ShownTexture, Shows};
 
 /// The presents waiting for their surfaces' writers, and how far each queue has finished.
 pub(crate) struct PresentQueue<P: Platform> {
@@ -102,10 +103,11 @@ struct State<P: Platform> {
 
 /// One present not yet shown.
 struct Waiting<P: Platform> {
-    /// The IOSurface's id; 0 for the scanout.
-    id: u32,
-    /// The texture over it, its block held; `None` for the scanout.
-    texture: Option<ShownTexture<P>>,
+    /// What it shows: the IOSurface's texture, its block held, by its id (0 and `None` for the
+    /// scanout), or what the display shows already.
+    shows: Shows<P>,
+    /// The colour stages it sets, as the display shows it (`color`).
+    color: Option<ColorChange>,
     /// The present's answer, owed once it is shown.
     answer: PresentAnswer,
     /// The command buffers it waits for.
@@ -133,28 +135,47 @@ impl<P: Platform> PresentQueue<P> {
         self.state.lock().queues.insert(queue, poster);
     }
 
-    /// Shows IOSurface `id`'s `texture` (`None`: the scanout) once each command buffer in
-    /// `writers` has finished, and `fill`, its surface's device cache's fill, where it has one,
-    /// and every present made before it is shown; `answer` goes as [`Presented`] gives it. A
-    /// writer past what its queue's ring has published holds nothing (the module doc). Called
-    /// with no lock of the decoder's held: what a ring has published is read with the ring held.
+    /// Shows IOSurface `id`'s `texture` (`None`: the scanout), with the colour stages `color`
+    /// sets, once each command buffer in `writers` has finished, and `fill`, its surface's
+    /// device cache's fill, where it has one, and every present made before it is shown;
+    /// `answer` goes as [`Presented`] gives it. A writer past what its queue's ring has
+    /// published holds nothing (the module doc). Called with no lock of the decoder's held: what
+    /// a ring has published is read with the ring held.
     pub(crate) fn present(
         &self,
         id: u32,
         texture: Option<ShownTexture<P>>,
+        color: Option<ColorChange>,
         answer: PresentAnswer,
         writers: Vec<RgfxSurfaceWriter>,
         fill: Option<FillWait>,
     ) {
         let writers = self.published(writers);
-        let mut state = self.state.lock();
-        state.waiting.push_back(Waiting {
-            id,
-            texture,
+        self.push(Waiting {
+            shows: Shows::Surface(id, texture),
+            color,
             answer,
             writers,
             fill,
         });
+    }
+
+    /// A present that keeps what the display shows, with the colour stages `color` sets
+    /// (`RGFX_PRESENT_KEEP`): shown once every present made before it is.
+    pub(crate) fn present_kept(&self, color: Option<ColorChange>, answer: PresentAnswer) {
+        self.push(Waiting {
+            shows: Shows::Kept,
+            color,
+            answer,
+            writers: Vec::new(),
+            fill: None,
+        });
+    }
+
+    /// `waiting` joins the presents, which are shown as they are ready.
+    fn push(&self, waiting: Waiting<P>) {
+        let mut state = self.state.lock();
+        state.waiting.push_back(waiting);
         let gone = self.show_ready(&mut state);
         drop(state);
         drop(gone);
@@ -325,7 +346,7 @@ impl<P: Platform> PresentQueue<P> {
             let Some(shown) = state.waiting.pop_front() else {
                 return gone;
             };
-            gone.extend(self.presented.show(shown.id, shown.texture, shown.answer));
+            gone.extend(self.presented.show(shown.shows, shown.color, shown.answer));
         }
     }
 

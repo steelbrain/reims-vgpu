@@ -1837,6 +1837,128 @@ fn a_present_needs_the_surface_s_texture() {
     }
 }
 
+/// A `DISPLAY_COLOR` part of display 0's transaction 1: `stage`'s `count` entries, `part` of them
+/// from `first` on, entry `k`'s red `k`.
+fn display_color(stage: u32, count: u32, first: u32, part: u32) -> Vec<u8> {
+    let mut bytes = RgfxDisplayColor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_DISPLAY_COLOR,
+            size: 40 + 16 * part,
+            seqno: 0,
+        },
+        display: 0,
+        transaction_id: 1,
+        stage,
+        entry_count: count,
+        first_entry: first,
+        part_entries: part,
+    }
+    .as_bytes()
+    .to_vec();
+    for k in first..first + part {
+        #[expect(clippy::as_conversions, reason = "entry indices far below 2^24")]
+        let red = (k as f32).to_bits();
+        bytes.extend_from_slice(
+            RgfxColorEntry {
+                x: red,
+                y: 0,
+                z: 0,
+                w: 0,
+            }
+            .as_bytes(),
+        );
+    }
+    bytes
+}
+
+/// The display's colour stages: a stage's parts take effect with the next present the host
+/// accepts, a kept present (`RGFX_PRESENT_KEEP`) changes the colour and nothing else, a refused
+/// present leaves what is staged for the next, and the reset turns every stage off; the device
+/// offers the feature
+#[test]
+fn display_colors_take_effect_with_the_next_accepted_present() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let device = headless(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let features = device.mmio_read(RGFX_REG_FEATURES_LO.into());
+    assert_ne!(features & RGFX_FEATURE_DISPLAY_COLOR, 0);
+    let mut guest = Guest::new(&device);
+    let present = |id: u32, flags: u32| {
+        RgfxPresentSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_PRESENT_SURFACE,
+                size: 32,
+                seqno: 0,
+            },
+            display: 0,
+            iosurface_id: id,
+            transaction_id: 1,
+            flags,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    let answered = |guest: &mut Guest, command: Vec<u8>| {
+        guest.send(&device, command);
+        let bytes = guest.event().expect("a COMPLETE");
+        RgfxComplete::read_from_bytes(&bytes).unwrap().status
+    };
+    let reds = |stage: u32| -> Option<Vec<f32>> {
+        let (_, color) = device.control.presented.color();
+        let table = color.stages[usize::try_from(stage).unwrap()].as_ref()?;
+        Some(table.iter().map(|e| e[0]).collect())
+    };
+
+    // 300 entries in two parts, then a present of a surface the decoder holds no texture over:
+    // refused, and the colour keeps its stages.
+    guest.send(&device, display_color(RGFX_COLOR_POST_GAMMA, 300, 0, 256));
+    guest.send(&device, display_color(RGFX_COLOR_POST_GAMMA, 300, 256, 44));
+    assert_eq!(
+        answered(&mut guest, present(0x77, 0)),
+        RGFX_STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(reds(RGFX_COLOR_POST_GAMMA), None);
+    let (before, _) = device.control.presented.color();
+
+    // The kept present after it takes the staged table, and shows what it showed.
+    assert_eq!(
+        answered(&mut guest, present(0, RGFX_PRESENT_KEEP)),
+        RGFX_STATUS_OK
+    );
+    let table = reds(RGFX_COLOR_POST_GAMMA).expect("the post-gamma table");
+    assert_eq!(table.len(), 300);
+    assert_eq!((table[0], table[255], table[299]), (0.0, 255.0, 299.0));
+    assert_ne!(device.control.presented.color().0, before);
+    assert!(device.control.presented.texture.lock().is_none());
+
+    // A matrix of three rows, and the pre-gamma table turned off, with a present of the scanout:
+    // the post-gamma table stays.
+    guest.send(&device, display_color(RGFX_COLOR_MATRIX, 3, 0, 3));
+    guest.send(&device, display_color(RGFX_COLOR_PRE_GAMMA, 0, 0, 0));
+    assert_eq!(answered(&mut guest, present(0, 0)), RGFX_STATUS_OK);
+    assert_eq!(reds(RGFX_COLOR_MATRIX), Some(vec![0.0, 1.0, 2.0]));
+    assert_eq!(reds(RGFX_COLOR_PRE_GAMMA), None);
+    assert_eq!(reds(RGFX_COLOR_POST_GAMMA).map(|t| t.len()), Some(300));
+
+    // A part out of order is dropped: the stage keeps its table.
+    guest.send(&device, display_color(RGFX_COLOR_POST_GAMMA, 2, 1, 1));
+    assert_eq!(
+        answered(&mut guest, present(0, RGFX_PRESENT_KEEP)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(reds(RGFX_COLOR_POST_GAMMA).map(|t| t.len()), Some(300));
+
+    // The reset, which the control thread tells the host: every stage off.
+    device.reset();
+    for _ in 0..3000 {
+        if device.control.presented.color().1.is_identity() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(device.control.presented.color().1.is_identity());
+}
+
 /// A `LIBRARY_CREATE` of library `obj_id`, whose bytes the fake platform takes as a library.
 fn library_create(obj_id: u64) -> Vec<u8> {
     keyed_library_create(obj_id, &[1, 2, 3, 4], None)
@@ -6171,8 +6293,8 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// buffers over the IOSurfaces they share (`SURFACE_ORDER`), makes indirect command buffers
 /// (`INDIRECT_COMMAND_BUFFERS`), makes the queues the kext asks unshared on the platform's
 /// unshared queue (`UNSHARED_QUEUES`), tells a producer waiting for room on a full submission
-/// ring of the device's takes (`SUBMIT_ROOM`), and reads indirect command buffers' CPU encodes
-/// from slots in the region (`ICB_SLOTS`)
+/// ring of the device's takes (`SUBMIT_ROOM`), reads indirect command buffers' CPU encodes from
+/// slots in the region (`ICB_SLOTS`), and shows the display pipe's colour (`DISPLAY_COLOR`)
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_core::testkit::GuestRam;
@@ -6212,6 +6334,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_ICB_SLOTS
             | RGFX_FEATURE_COMMIT_ORDER
             | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
+            | RGFX_FEATURE_DISPLAY_COLOR
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
     // The fake's GPU shares the CPU's memory: no caches, so no deferred blocks and no budget.
@@ -6229,6 +6352,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_ICB_SLOTS
             | RGFX_FEATURE_COMMIT_ORDER
             | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
+            | RGFX_FEATURE_DISPLAY_COLOR
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
