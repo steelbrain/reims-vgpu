@@ -110,7 +110,7 @@
 //! the GPU's memory. Neither is measured on a discrete RADV or ANV device yet.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -555,8 +555,12 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     transfer: Option<Transfer<P>>,
     /// Each command queue's end event, by the queue's id, and the last value signalled: made with
     /// the queue ([`Caches::queue_made`]), or at its first buffer that uses a cache where it was
-    /// not; let go of at the queue's end where no buffer signalled it ([`Self::queue_ended`]).
+    /// not; let go of once the queue is gone and no cache names it any more
+    /// ([`Self::queue_ended`]).
     ends: HashMap<u64, (P::Event, u64)>,
+    /// The queues gone whose end event a cache still names, for a later copy of it to wait for:
+    /// each let go of once none does ([`Self::sweep_gone`]).
+    gone: HashSet<u64>,
     /// The caches' pages, watched for the host's devices' writes while this lives.
     watched: Arc<Watched>,
     counts: CacheCounts,
@@ -612,6 +616,7 @@ impl<P: Platform> SurfaceCaches<P> {
             by_block: HashMap::new(),
             transfer: None,
             ends: HashMap::new(),
+            gone: HashSet::new(),
             watched,
             counts: CacheCounts::default(),
             pending: HashMap::new(),
@@ -1556,14 +1561,46 @@ impl<P: Platform> SurfaceCaches<P> {
         Ok(self.transfer.is_some())
     }
 
-    /// Queue `queue` is gone: its end event, where no command buffer of it signalled it, so no
-    /// copy waits for it, to let go of. One a buffer signalled stays, for the copies that wait
-    /// for the queue's last buffers.
-    fn queue_ended(&mut self, queue: u64) -> Option<P::Event> {
-        match self.ends.entry(queue) {
-            Entry::Occupied(end) if end.get().1 == 0 => Some(end.remove().0),
-            _ => None,
+    /// Queue `queue` is gone: the end events to let go of, its own where no cache names it
+    /// ([`Self::sweep_gone`]), so no copy waits for it any more. One a cache still names stays,
+    /// for that cache's next copy, which waits for the queue's last buffer that used it, and goes
+    /// at a later sweep once the cache's copy, or its release, names it no more.
+    fn queue_ended(&mut self, queue: u64) -> Vec<P::Event> {
+        if self.ends.contains_key(&queue) {
+            self.gone.insert(queue);
         }
+        self.sweep_gone()
+    }
+
+    /// Whether a cache names queue `queue`: a command buffer of it used the cache since the
+    /// cache's last copy, which the next copy waits for, or the cache's early copy ran on it.
+    fn names_queue(&self, queue: u64) -> bool {
+        (self.by_block.values()).any(|cache| {
+            cache.users.contains_key(&queue)
+                || (cache.read_back.copy.as_ref()).is_some_and(|copy| copy.queue == queue)
+        })
+    }
+
+    /// The end events of the queues gone that no cache names any more, taken out to be let go
+    /// of: a queue's buffers that used a cache name its queue until the cache's next copy, which
+    /// waits for them, or its release, so each gone queue's event is looked at again at each
+    /// queue's make and end. Kept until the device's reset, they piled up one a queue that ever
+    /// used a cache, as processes came and went.
+    fn sweep_gone(&mut self) -> Vec<P::Event> {
+        if self.gone.is_empty() {
+            return Vec::new();
+        }
+        let unnamed: Vec<u64> = (self.gone.iter().copied())
+            .filter(|&queue| !self.names_queue(queue))
+            .collect();
+        let mut events = Vec::with_capacity(unnamed.len());
+        for queue in unnamed {
+            self.gone.remove(&queue);
+            if let Some((event, _)) = self.ends.remove(&queue) {
+                events.push(event);
+            }
+        }
+        events
     }
 
     /// The device's reset: every block's cache goes uncopied, as its surface's pages are the
@@ -1574,6 +1611,7 @@ impl<P: Platform> SurfaceCaches<P> {
     pub(crate) fn reset(&mut self) {
         let caches = std::mem::take(&mut self.by_block);
         let ends = std::mem::take(&mut self.ends);
+        self.gone.clear();
         self.deferred.clear();
         self.deferred_bytes = 0;
         self.watched.0.lock().clear();
@@ -1701,8 +1739,10 @@ impl<P: Platform> Caches<P> {
             true => None,
             false => device.new_event(ON)?,
         };
-        {
+        let swept = {
             let mut state = self.state.lock();
+            // A queue of the same id is the queue's again, whose event it takes on.
+            state.gone.remove(&queue);
             // Kept only where the caches are still on, and where no buffer's begin or finish made
             // the same meanwhile; else let go of below.
             if state.on {
@@ -1720,31 +1760,35 @@ impl<P: Platform> Caches<P> {
                     state.transfer = made.take();
                 }
             }
-        }
-        if (end.is_some() || made.is_some() || read_back_end.is_some())
-            && let Err(refusal) = refusals::refusing(move || drop((end, made, read_back_end)))
+            // And the gone queues' events no cache names any more ([`SurfaceCaches::sweep_gone`]).
+            state.sweep_gone()
+        };
+        if (end.is_some() || made.is_some() || read_back_end.is_some() || !swept.is_empty())
+            && let Err(refusal) =
+                refusals::refusing(move || drop((end, made, read_back_end, swept)))
         {
             log::warn!(
                 target: "reims_vgpu::graphics",
-                "queue {queue:#x}'s spare end event or transfer queue was let go of, and its \
-                 release was refused: {refusal}"
+                "queue {queue:#x}'s spare end event or transfer queue, or a gone queue's end \
+                 event, was let go of, and its release was refused: {refusal}"
             );
         }
         Ok(())
     }
 
     /// Command queue `queue` is gone (its destroy, or its context's close): its end event goes
-    /// where no buffer of it signalled it ([`SurfaceCaches::queue_ended`]), let go of with no
-    /// lock held. A refusal is logged.
+    /// once no cache names it, and so do the other gone queues' that none names any more
+    /// ([`SurfaceCaches::queue_ended`]), let go of with no lock held. A refusal is logged.
     pub(crate) fn queue_ended(&self, queue: u64) {
-        let Some(end) = self.state.lock().queue_ended(queue) else {
+        let ends = self.state.lock().queue_ended(queue);
+        if ends.is_empty() {
             return;
-        };
-        if let Err(refusal) = refusals::refusing(move || drop(end)) {
+        }
+        if let Err(refusal) = refusals::refusing(move || drop(ends)) {
             log::warn!(
                 target: "reims_vgpu::graphics",
-                "queue {queue:#x}'s end event was let go of, and its release was refused: \
-                 {refusal}"
+                "queue {queue:#x}'s end event, or another gone queue's, was let go of, and its \
+                 release was refused: {refusal}"
             );
         }
     }
@@ -2830,8 +2874,8 @@ mod tests {
 
     /// A queue's end event is made with the queue, so its first command buffer that uses a cache
     /// makes no event as it fills the cache and signals the end event; at the queue's destroy, the
-    /// end event goes where no buffer of it signalled it, and stays where one did, for the copies
-    /// that wait for the queue's last buffers
+    /// end event goes where no cache names the queue, and stays where one does, for the cache's
+    /// next copy, which waits for the queue's last buffer that used it
     #[test]
     fn a_queues_end_event_is_made_with_it_and_its_first_buffer_makes_none() {
         let mut r = cached();
@@ -2867,6 +2911,56 @@ mod tests {
         }
         assert_eq!(end(&r, 1), Some(one), "signalled: kept");
         assert_eq!(end(&r, 2), None, "never signalled: let go of");
+    }
+
+    /// A gone queue's end event goes once no cache names it: at the queue's end where every
+    /// cache it used was copied since, else at a later queue's make or end, once the cache's copy
+    /// or its release names it no more. Kept until the device's reset, one piled up for each
+    /// queue that ever used a cache, as processes came and went
+    #[test]
+    fn a_gone_queues_end_event_goes_once_no_cache_names_it() {
+        let mut r = cached();
+        let has_end = |r: &Rig, queue: u64| r.dec.caches().ends.contains_key(&queue);
+        let destroy = |r: &mut Rig, obj_id: u64| {
+            let destroy = RgfxObjectDestroy {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_OBJECT_DESTROY,
+                    size: size_of::<RgfxObjectDestroy>() as u32,
+                    seqno: 0,
+                },
+                obj_id,
+            };
+            assert_eq!(r.dec.decode(&r.device, destroy.as_bytes()).unwrap(), Ok(()));
+        };
+        // Queue 1 writes the cache, which a download then copies: no cache names queue 1.
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let downloaded = download(&r, BLOCK);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        destroy(&mut r, 1);
+        assert!(!has_end(&r, 1), "named by no cache: let go of at its end");
+        // Queue 2 reads the cache, which names it still at its end, for its next copy.
+        use_surfaces(&mut r, 2, 0x101, &[(BLOCK, 0, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        destroy(&mut r, 2);
+        assert!(has_end(&r, 2), "named by the cache: kept");
+        // The block's release lets the cache go; the next queue's make looks again.
+        let released = release(&r, BLOCK);
+        assert!(released.load(Ordering::SeqCst));
+        assert!(has_end(&r, 2), "not looked at again yet");
+        let queue = RgfxQueueCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_QUEUE_CREATE,
+                size: size_of::<RgfxQueueCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 3,
+            ..RgfxQueueCreate::default()
+        };
+        assert_eq!(r.dec.decode(&r.device, queue.as_bytes()).unwrap(), Ok(()));
+        assert!(!has_end(&r, 2), "let go of at queue 3's make");
+        assert!(has_end(&r, 3), "queue 3's own, made with it");
     }
 
     /// A fill of a cache waits for every command buffer begun and not finished that uses it, and
