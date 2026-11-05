@@ -20,8 +20,9 @@
 //!
 //! - **Copies by runs.** A device that uses a lease's RAM copies between its buffers and runs of
 //!   the RAM by their host addresses ([`copies`], [`ram_over`]), so a surface's device cache needs
-//!   no view of the surface's pages (`reims-vgpu`'s `graphics/decode/surface_cache.rs`): once the
-//!   runtime has those copies ([`RUNTIME_COPIES`]).
+//!   no view of the surface's pages (`reims-vgpu`'s `graphics/decode/surface_cache.rs`). The
+//!   runtime gathers and scatters the runs' 4 KiB pages from its imports of the RAM's chunks; a
+//!   copy it refuses encodes nothing, and the cache takes its view then.
 //!
 //! The registry's lock is a leaf: the runtime is called after it is let go.
 
@@ -173,18 +174,9 @@ fn live_leases() -> Vec<Arc<LeasedRam>> {
     registry.leases.iter().filter_map(Weak::upgrade).collect()
 }
 
-/// Whether the runtime copies between a buffer and runs of a device's RAM: not yet. metal2vulkan
-/// is asked for both copies, on its blit encoder ([`copy_from_host_ram`], [`copy_to_host_ram`]);
-/// until the runtime this tree builds on has them, no device copies by runs ([`copies`]), so
-/// every device cache keeps its view of its surface's pages, as before.
-const RUNTIME_COPIES: bool = false;
-
 /// Whether `device` copies between its buffers and the guest's RAM by the RAM's runs: it uses a
-/// lease's RAM, and the runtime has the copies ([`RUNTIME_COPIES`]).
+/// lease's RAM ([`copy_from_host_ram`], [`copy_to_host_ram`]).
 pub(crate) fn copies(device: &rt::Device) -> bool {
-    if !RUNTIME_COPIES {
-        return false;
-    }
     let id = device.registry_id();
     live_leases().iter().any(|l| l.users.lock().contains(&id))
 }
@@ -205,28 +197,33 @@ pub(crate) fn ram_over(device: &rt::Device, runs: &[Range<u64>]) -> Option<Arc<r
 pub(crate) struct RunsCopyRefused;
 
 /// The runtime's copy of `runs` of `ram`, host addresses in the bytes' order, into `destination`
-/// from `destination_offset`, on `encoder`: refused until the runtime has it
-/// ([`RUNTIME_COPIES`]), encoding nothing.
+/// from `destination_offset`, on `encoder`; one it refuses encodes nothing.
 pub(crate) fn copy_from_host_ram(
-    _encoder: &mut rt::BlitCommandEncoder,
-    _ram: &rt::HostRam,
-    _runs: &[Range<u64>],
-    _destination: &rt::Buffer,
-    _destination_offset: u64,
+    encoder: &mut rt::BlitCommandEncoder,
+    ram: &rt::HostRam,
+    runs: &[Range<u64>],
+    destination: &rt::Buffer,
+    destination_offset: u64,
 ) -> Result<(), RunsCopyRefused> {
-    Err(RunsCopyRefused)
+    (encoder.copy_from_host_ram(ram, runs, destination, destination_offset)).map_err(refused)
+}
+
+/// A refusal of a copy by runs, logged.
+fn refused(error: rt::Error) -> RunsCopyRefused {
+    log::warn!(target: "reims_vgpu::vulkan", "the runtime refused a copy by runs: {error}");
+    RunsCopyRefused
 }
 
 /// The runtime's copy of `source` from `source_offset` into `runs` of `ram`, on `encoder`, as
-/// [`copy_from_host_ram`] copies the other way: refused until the runtime has it.
+/// [`copy_from_host_ram`] copies the other way.
 pub(crate) fn copy_to_host_ram(
-    _encoder: &mut rt::BlitCommandEncoder,
-    _source: &rt::Buffer,
-    _source_offset: u64,
-    _ram: &rt::HostRam,
-    _runs: &[Range<u64>],
+    encoder: &mut rt::BlitCommandEncoder,
+    source: &rt::Buffer,
+    source_offset: u64,
+    ram: &rt::HostRam,
+    runs: &[Range<u64>],
 ) -> Result<(), RunsCopyRefused> {
-    Err(RunsCopyRefused)
+    (encoder.copy_to_host_ram(source, source_offset, ram, runs)).map_err(refused)
 }
 
 /// The runs of the guest's RAM behind `length` bytes from `start`, which the runtime asks of a
@@ -248,6 +245,7 @@ mod tests {
     use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
     use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use reims_vgpu_core::platform::device::GpuDevice as _;
+    use reims_vgpu_core::platform::resource::Buffer as _;
     use reims_vgpu_core::platform::types::NsRange;
     use reims_vgpu_core::raise::OnFault;
 
@@ -355,6 +353,116 @@ mod tests {
         // SAFETY: the mapping made above, which nothing uses any more.
         assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
     }
+    /// A device that copies the RAM by its runs ([`super::copies`]) gathers runs of it into a
+    /// buffer, and scatters a buffer back into them, byte for byte in the runs' order, scattered
+    /// and out of order as a surface's pages lie; one that does not refuses both, encoding
+    /// nothing, the RAM as it was. The flag is the process's, which nextest runs this test alone in.
+    #[test]
+    fn a_copy_by_runs_gathers_and_scatters_the_rams_pages() {
+        let device = dev();
+        let length = 8 * MIB;
+        let fd = memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, which the test unmaps after the lease and
+        // every buffer over it.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        let at = start.addr().to_u64();
+        let lease = lease_guest_memory(
+            [GuestRamFile {
+                host: at,
+                guest: 0,
+                length,
+                fd,
+                offset: 0,
+            }],
+            None,
+        );
+        // SAFETY: the RAM's first pages, mapped until the end, which no GPU work uses now.
+        let ram =
+            unsafe { std::slice::from_raw_parts_mut(start.cast::<u8>(), (8 * PAGE).to_usize()) };
+        for (i, b) in ram.iter_mut().enumerate() {
+            *b = (i * 7 + i / PAGE.to_usize()) as u8;
+        }
+        let before = ram.to_vec();
+        // Page 5, then 1 and 2, then 0: a surface's pages, out of order.
+        let pages = [(5, 1), (1, 2), (0, 1)];
+        let runs: Vec<_> = (pages.iter())
+            .map(|&(p, n)| at + p * PAGE..at + (p + n) * PAGE)
+            .collect();
+        let gathered: Vec<u8> = (pages.iter())
+            .flat_map(|&(p, n)| before[(p * PAGE).to_usize()..((p + n) * PAGE).to_usize()].to_vec())
+            .collect();
+        let total = 4 * PAGE;
+        let q = device.new_command_queue().unwrap();
+        let shared = |len: u64| {
+            (device.new_buffer_of_length(OnFault::Die, len, 0))
+                .unwrap()
+                .unwrap()
+        };
+        let into = shared(total);
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let gather = e
+            .copy_from_guest_ram(OnFault::Die, &runs, &into, 0)
+            .unwrap();
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        assert_eq!(gather, super::copies(&device.raw));
+        // SAFETY: the buffer's Shared contents, `total` bytes, which no GPU work uses now.
+        let got =
+            unsafe { std::slice::from_raw_parts(into.contents().as_ptr::<u8>(), total.to_usize()) };
+        if gather {
+            assert!(got == gathered.as_slice(), "the pages, in the runs' order");
+        } else {
+            assert!(got.iter().all(|&b| b == 0), "nothing copied");
+        }
+
+        let from = shared(total);
+        // SAFETY: as above, written before the GPU uses it.
+        let src = unsafe {
+            std::slice::from_raw_parts_mut(from.contents().as_ptr::<u8>(), total.to_usize())
+        };
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i * 13 + 1) as u8;
+        }
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let scatter = e.copy_to_guest_ram(OnFault::Die, &from, 0, &runs).unwrap();
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        assert_eq!(scatter, gather);
+        let mut want = before.clone();
+        if scatter {
+            let mut next = 0;
+            for &(p, n) in &pages {
+                let span = (p * PAGE).to_usize()..((p + n) * PAGE).to_usize();
+                let len = span.len();
+                want[span].copy_from_slice(&src[next..next + len]);
+                next += len;
+            }
+        }
+        assert!(
+            ram == want.as_slice(),
+            "the buffer, in the runs' order; the rest as it was"
+        );
+        drop((cb, e, q, into, from, lease));
+        // SAFETY: the mapping made above, which nothing uses any more.
+        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
+    }
+
     /// What a slab of guest RAM costs on this device (arch-shared-mem's design): placement heaps
     /// over one 2 MiB run of the leased RAM each, 4 KiB buffers placed in one of them, heaps over
     /// views of 2 and 32 runs apart, and a command buffer's round trip with one heap alive and with
