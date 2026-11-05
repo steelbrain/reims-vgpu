@@ -46,6 +46,15 @@ inline bool rgfxSubmitRoutesQueueDestroy(uint32_t type)
 	return type == RGFX_CMD_OBJECT_DESTROY;
 }
 
+// Whether an accepted `type` is a pipeline create: a render, mesh render or compute pipeline's,
+// which the device answers with a PIPELINE_REFLECTION, and which alone a client may post
+// deferred (kRgfxSubmitDeferred).
+inline bool rgfxSubmitIsPipelineCreate(uint32_t type)
+{
+	return type == RGFX_CMD_RENDER_PIPELINE_CREATE || type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE ||
+	       type == RGFX_CMD_COMPUTE_PIPELINE_CREATE;
+}
+
 // Whether a message of an accepted `type` makes a host object under its obj_id, which an
 // OBJECT_DESTROY of that id drops. The destroy, the queries (a heap texture's size, an argument
 // layout) and the writes into an object already made (a Managed range or region, a shared
@@ -67,6 +76,7 @@ inline bool rgfxSubmitMakes(uint32_t type)
 	case RGFX_CMD_DEPTH_STENCIL_CREATE:
 	case RGFX_CMD_LIBRARY_CREATE:
 	case RGFX_CMD_RENDER_PIPELINE_CREATE:
+	case RGFX_CMD_MESH_RENDER_PIPELINE_CREATE:
 	case RGFX_CMD_COMPUTE_PIPELINE_CREATE:
 	case RGFX_CMD_EVENT_CREATE:
 	case RGFX_CMD_SHARED_EVENT_CREATE:

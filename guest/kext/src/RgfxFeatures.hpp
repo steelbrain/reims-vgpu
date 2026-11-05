@@ -58,7 +58,11 @@
 //  - DISPLAY_COLOR (bit 24): the display pipe takes its gamma selectors (5 to 7) and sends each
 //    transaction's gamma tables and colour matrix as DISPLAY_COLOR parts before its present, a
 //    transaction that sets only a colour as a present that keeps the surface shown
-//    (RgfxPipeColor.hpp), which needs nothing of the bundle.
+//    (RgfxPipeColor.hpp), which needs nothing of the bundle;
+//  - MESH_PIPELINES (bit 25): the bundle makes mesh render pipelines and draws them, whose
+//    MESH_RENDER_PIPELINE_CREATE the kext admits as it does the other pipeline creates, its
+//    PIPELINE_REFLECTION answer carrying the mesh stages' limits after the record
+//    (RgfxSubmitGate.hpp).
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -86,7 +90,8 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_MANAGED_AT_OFFSET | RGFX_FEATURE_HEAP_OVER_PAGES | RGFX_FEATURE_SUBMIT_ROOM |
     RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER | RGFX_FEATURE_SURFACE_DEFERRED |
     RGFX_FEATURE_HOST_TIME | RGFX_FEATURE_MANAGED_TEXTURE_SLABS |
-    RGFX_FEATURE_MANAGED_BUFFER_SLABS | RGFX_FEATURE_SMALL_ID_CHUNKS | RGFX_FEATURE_DISPLAY_COLOR;
+    RGFX_FEATURE_MANAGED_BUFFER_SLABS | RGFX_FEATURE_SMALL_ID_CHUNKS | RGFX_FEATURE_DISPLAY_COLOR |
+    RGFX_FEATURE_MESH_PIPELINES;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

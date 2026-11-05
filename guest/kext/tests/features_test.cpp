@@ -49,8 +49,9 @@ constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CON
 // the kext checks, a full submission ring's post waits for the host's room record, and each post
 // names the buffers of the process's other queues posted before it, which needs nothing of the
 // kext; the kext makes WindowServer's queues unshared, which needs nothing of the bundle, and
-// defers fresh cached surfaces' blocks; and the bundle lays its Managed textures' and buffers'
-// CPU copies in its slabs, which needs nothing of the kext.
+// defers fresh cached surfaces' blocks; the bundle lays its Managed textures' and buffers'
+// CPU copies in its slabs, which needs nothing of the kext; and it makes mesh render pipelines,
+// whose creates the kext admits as the other pipeline creates.
 constexpr uint64_t kPages = RGFX_FEATURE_PAGES_BUFFERS;
 constexpr uint64_t kOrder = RGFX_FEATURE_SURFACE_ORDER;
 constexpr uint64_t kIcb = RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS;
@@ -66,9 +67,10 @@ constexpr uint64_t kTextureSlabs = RGFX_FEATURE_MANAGED_TEXTURE_SLABS;
 constexpr uint64_t kBufferSlabs = RGFX_FEATURE_MANAGED_BUFFER_SLABS;
 constexpr uint64_t kSmallIds = RGFX_FEATURE_SMALL_ID_CHUNKS;
 constexpr uint64_t kColor = RGFX_FEATURE_DISPLAY_COLOR;
+constexpr uint64_t kMesh = RGFX_FEATURE_MESH_PIPELINES;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
-                              kBufferSlabs | kSmallIds | kColor;
+                              kBufferSlabs | kSmallIds | kColor | kMesh;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -78,12 +80,13 @@ int main()
 	// Of the bits from 3 the kext carries out PAGES_BUFFERS, SURFACE_ORDER,
 	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM,
 	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, MANAGED_TEXTURE_SLABS,
-	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS and DISPLAY_COLOR, and writes each only where offered.
+	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR and MESH_PIPELINES, and writes each
+	// only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
-	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS and DISPLAY_COLOR from "
-	      "bit 3");
+	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR and "
+	      "MESH_PIPELINES from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -134,6 +137,11 @@ int main()
 	      "DISPLAY_COLOR offered, written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried) == 0,
 	      "DISPLAY_COLOR not offered, not written");
+	check(RGFX_FEATURE_MESH_PIPELINES == (1u << 25), "MESH_PIPELINES is bit 25");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kMesh) == kMesh,
+	      "MESH_PIPELINES offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kMesh, 0) == kRgfxOfferedFeatures,
+	      "MESH_PIPELINES offered but not taken is not in the word");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
 	      "every other bit offered, none written");

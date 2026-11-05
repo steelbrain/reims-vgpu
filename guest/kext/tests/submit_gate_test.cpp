@@ -67,6 +67,7 @@ int main()
 	    RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_VIDEO_SESSION_CREATE,
 	    RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_ICB_CREATE, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
 	    RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_MANAGED_BUFFER_CREATE,
+	    RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
 	};
 	const uint32_t makesNone[] = {
 	    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_BUFFER_DID_MODIFY_RANGE, RGFX_CMD_TEXTURE_REPLACE_REGION,
@@ -85,11 +86,21 @@ int main()
 		for (uint32_t t : makesNone)
 			listed |= t == type;
 		if (type <= RGFX_CMD_BUFFER_OVER_PAGES || type == RGFX_CMD_BUFFER_MANAGED_AT_OFFSET ||
-		    type == RGFX_CMD_HEAP_OVER_PAGES || type == RGFX_CMD_MANAGED_BUFFER_CREATE)
+		    type == RGFX_CMD_HEAP_OVER_PAGES || type == RGFX_CMD_MANAGED_BUFFER_CREATE ||
+		    type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE)
 			check(listed, "every wire type of the accepted range is placed");
 		else if (!listed)
 			check(!rgfxSubmitMakes(type), "a type the wire does not name makes none");
 	}
+
+	// The pipeline creates, which the device answers with a PIPELINE_REFLECTION and a client may
+	// post deferred: the render, mesh render and compute pipelines', and no other type.
+	for (uint32_t type = RGFX_CMD_QUEUE_CREATE + 1; type < RGFX_CMD_CONTEXT_CLOSE; type++)
+		check(rgfxSubmitIsPipelineCreate(type) == (type == RGFX_CMD_RENDER_PIPELINE_CREATE ||
+		                                           type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE ||
+		                                           type == RGFX_CMD_COMPUTE_PIPELINE_CREATE),
+		      "the render, mesh render and compute pipeline creates are the pipeline creates");
+	check(rgfxSubmitAdmitted(RGFX_CMD_MESH_RENDER_PIPELINE_CREATE), "a mesh pipeline create is accepted");
 
 	// A destroy follows a create only where it was posted and made something, and either timed
 	// out or its context closed since the submit's check.
@@ -113,7 +124,7 @@ int main()
 	      "nor an indirect command buffer's commands");
 	// The timeout path is as before for every type that waits for an answer.
 	const uint32_t answered[] = {RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
-	                             RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_ICB_CREATE, RGFX_CMD_LIBRARY_CREATE,
+	                             RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_ICB_CREATE, RGFX_CMD_LIBRARY_CREATE,
 	                             RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_LIBRARY_FROM_REGION};
 	for (uint32_t t : answered)
 		check(rgfxSubmitDestroysBehind(t, true, true, false),

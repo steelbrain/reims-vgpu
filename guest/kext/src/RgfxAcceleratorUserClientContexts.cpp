@@ -364,8 +364,7 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	memcpy(&objId, message + kObjIdOffset, sizeof(objId));
 	// Creates and destroys of the client's own objects only: QUEUE_CREATE goes through its own
 	// selector (its rings are checked), CONTEXT_CLOSE is the kext's (RgfxSubmitGate.hpp).
-	const bool pipeline =
-	    type == RGFX_CMD_RENDER_PIPELINE_CREATE || type == RGFX_CMD_COMPUTE_PIPELINE_CREATE;
+	const bool pipeline = rgfxSubmitIsPipelineCreate(type);
 	if (r == kIOReturnSuccess &&
 	    (!rgfxSubmitAdmitted(type) || (objId >> RGFX_CONTEXT_OBJ_ID_SHIFT) != ctx ||
 	     (deferAsked && !pipeline)))
@@ -404,7 +403,7 @@ IOReturn RgfxAcceleratorUserClient::submitMethod(IOExternalMethodArguments *a)
 	// COMPLETE of a library create or lookup (a library's last region chunk is its create) or of
 	// an argument layout, whose layout the device writes into the client's block before it.
 	UInt32 replyType = 0;
-	if (type == RGFX_CMD_RENDER_PIPELINE_CREATE || type == RGFX_CMD_COMPUTE_PIPELINE_CREATE)
+	if (pipeline)
 		replyType = RGFX_EVT_PIPELINE_REFLECTION;
 	else if (type == RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN)
 		replyType = RGFX_EVT_SIZE_AND_ALIGN;
