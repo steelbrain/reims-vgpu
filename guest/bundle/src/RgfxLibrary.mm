@@ -1113,20 +1113,27 @@ id<MTLLibrary> RgfxLinkOverShadows(NSArray<id<MTLFunction>> *functions, RgfxLink
 	return rgfxOursOver(linked, makeLibrary, @"link: Metal's linked library answered no bytes", error);
 }
 
-id<MTLLibrary> RgfxCompileOverMetal(RgfxCompileBlock compile, RgfxLibraryMaker makeLibrary, NSError **error)
+id<MTLLibrary> RgfxLibraryOverMetal(RgfxCompileBlock make, RgfxLibraryMaker makeLibrary, NSString *creator,
+                                     NSError **error)
 {
 	NSError *metals = nil;
-	id<MTLLibrary> compiled = compile(&metals);
-	if (compiled == nil || [(id)compiled isKindOfClass:[RgfxLibrary class]]) {
+	id<MTLLibrary> made = make(&metals);
+	if (made == nil || [(id)made isKindOfClass:[RgfxLibrary class]]) {
 		if (error)
 			*error = metals;
-		return compiled;
+		return made;
 	}
-	id<MTLLibrary> lib = rgfxOursOver(compiled, makeLibrary,
-	                                  @"newLibraryWithSource: Metal's library answered no bytes", error);
+	id<MTLLibrary> lib = rgfxOursOver(
+	    made, makeLibrary, [NSString stringWithFormat:@"%@ Metal's library answered no bytes", creator],
+	    error);
 	if (lib != nil && error)
 		*error = metals;
 	return lib;
+}
+
+id<MTLLibrary> RgfxCompileOverMetal(RgfxCompileBlock compile, RgfxLibraryMaker makeLibrary, NSError **error)
+{
+	return RgfxLibraryOverMetal(compile, makeLibrary, @"newLibraryWithSource:", error);
 }
 
 id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, id<MTLBinaryArchive> destination,

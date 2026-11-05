@@ -624,7 +624,7 @@ newLibraryWithFile:error: implemented
 newLibraryWithGraphs:functions:error: absent %absent-as-metal
 newLibraryWithGraphsSPI:functions:error: absent %absent-as-metal
 newLibraryWithImageFilterFunctionsSPI:imageFilterFunctionInfo:error: implemented
-newLibraryWithMPSGraphPackageURL:name:error: unsupported libraries of an MPS graph package
+newLibraryWithMPSGraphPackageURL:name:error: implemented
 newLibraryWithSource:options:completionHandler: implemented
 newLibraryWithSource:options:error: implemented
 newLibraryWithStitchedDescriptor:completionHandler: implemented

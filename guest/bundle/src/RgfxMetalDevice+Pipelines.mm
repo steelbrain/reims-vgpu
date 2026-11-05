@@ -486,6 +486,96 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 	});
 }
 
+// --- libraries of a function array and of packages ---------------------------
+
+// A library of the visible and stitchable functions given (newLibraryWithFunctionArray:error:,
+// SPI): Metal's own over the functions' shadows, made ours (RgfxLinkOverShadows), as both x86 Macs
+// make one (the AMD 5300M and the Intel 630 under macOS 26.7.1: oracle_bundle libforms, a library
+// of div_visible, and one of div_stitchable). Metal's assertion at an empty array is its own.
+- (id<MTLLibrary>)newLibraryWithFunctionArray:(NSArray<id<MTLFunction>> *)functions
+                                        error:(__autoreleasing NSError **)error
+{
+	if (![IOGPUMetalDevice instancesRespondToSelector:_cmd]) {
+		RGFX_UNSUPPORTED_ERROR_IN(error, "libraries of a function array", MTLLibraryErrorDomain,
+		                          MTLLibraryErrorUnsupported);
+		return nil;
+	}
+	return RgfxLinkOverShadows(
+	    functions,
+	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError *__autoreleasing *e) {
+		    return [self rgfxMetalLibraryOfFunctions:shadows error:e];
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError *__autoreleasing *e) {
+		    return [self newLibraryWithData:data error:e];
+	    },
+	    error);
+}
+
+- (id<MTLLibrary>)rgfxMetalLibraryOfFunctions:(NSArray<id<MTLFunction>> *)shadows
+                                        error:(__autoreleasing NSError **)error
+{
+	return [super newLibraryWithFunctionArray:shadows error:error];
+}
+
+// The library of a Metal package and of an MPS graph package: Metal's own reading of the package,
+// the base class's, made ours over the bytes of the library it answers (RgfxLibraryOverMetal), so
+// a refusal is Metal's own, words and log line included. Both x86 Macs answer nil and
+// MTLLibraryErrorDomain 1 "Invalid metal package" for a missing path and a .metallib, and nil and
+// MTLLibraryErrorDomain 6 "failed to open MPSGraph package" for a missing package, logging "Error:
+// did not find file at url: ..." (oracle_bundle libforms). Where the base class lacks the form, its
+// words for a missing package.
+- (id<MTLLibrary>)newLibraryWithMetalPackageURL:(NSURL *)url error:(__autoreleasing NSError **)error
+{
+	if (![IOGPUMetalDevice instancesRespondToSelector:_cmd]) {
+		if (error)
+			*error = [NSError errorWithDomain:MTLLibraryErrorDomain
+			                             code:MTLLibraryErrorUnsupported
+			                         userInfo:@{NSLocalizedDescriptionKey : @"Invalid metal package"}];
+		return nil;
+	}
+	return RgfxLibraryOverMetal(
+	    ^id<MTLLibrary>(NSError *__autoreleasing *e) {
+		    return [self rgfxMetalLibraryOfPackage:url error:e];
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError *__autoreleasing *e) {
+		    return [self newLibraryWithData:data error:e];
+	    },
+	    @"newLibraryWithMetalPackageURL:", error);
+}
+
+- (id<MTLLibrary>)rgfxMetalLibraryOfPackage:(NSURL *)url error:(__autoreleasing NSError **)error
+{
+	return [super newLibraryWithMetalPackageURL:url error:error];
+}
+
+- (id<MTLLibrary>)newLibraryWithMPSGraphPackageURL:(NSURL *)url
+                                              name:(NSString *)name
+                                             error:(__autoreleasing NSError **)error
+{
+	if (![IOGPUMetalDevice instancesRespondToSelector:_cmd]) {
+		if (error)
+			*error = [NSError errorWithDomain:MTLLibraryErrorDomain
+			                             code:MTLLibraryErrorFileNotFound
+			                         userInfo:@{NSLocalizedDescriptionKey : @"failed to open MPSGraph package"}];
+		return nil;
+	}
+	return RgfxLibraryOverMetal(
+	    ^id<MTLLibrary>(NSError *__autoreleasing *e) {
+		    return [self rgfxMetalLibraryOfGraphPackage:url name:name error:e];
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError *__autoreleasing *e) {
+		    return [self newLibraryWithData:data error:e];
+	    },
+	    @"newLibraryWithMPSGraphPackageURL:", error);
+}
+
+- (id<MTLLibrary>)rgfxMetalLibraryOfGraphPackage:(NSURL *)url
+                                            name:(NSString *)name
+                                           error:(__autoreleasing NSError **)error
+{
+	return [super newLibraryWithMPSGraphPackageURL:url name:name error:error];
+}
+
 // --- render pipelines --------------------------------------------------------
 
 // `state`, or nil and an NSError where the host refused its create: the kext hands the create's

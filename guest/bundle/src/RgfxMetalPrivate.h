@@ -86,6 +86,16 @@ NS_ASSUME_NONNULL_BEGIN
                                         options:(nullable MTLCompileOptions *)options
                                    compilerTask:(nullable id)compilerTask
                                           error:(NSError *_Nullable *_Nullable)error;
+// measured: macOS 27 and 26.7.1, `@32@0:8@16^@24`, `@32@0:8@16^@24` and `@40@0:8@16@24^@32`,
+// _MTLDevice's: a library of the visible and stitchable functions given (Metal asserts at an empty
+// array), of a Metal package's URL, and of an MPS graph package's.
+- (nullable id<MTLLibrary>)newLibraryWithFunctionArray:(NSArray<id<MTLFunction>> *)functions
+                                                 error:(NSError *_Nullable *_Nullable)error;
+- (nullable id<MTLLibrary>)newLibraryWithMetalPackageURL:(NSURL *)url
+                                                   error:(NSError *_Nullable *_Nullable)error;
+- (nullable id<MTLLibrary>)newLibraryWithMPSGraphPackageURL:(NSURL *)url
+                                                       name:(nullable NSString *)name
+                                                      error:(NSError *_Nullable *_Nullable)error;
 @end
 
 // measured: macOS 27 and 26.6.1 Metal.framework — the private selectors of Metal's own library

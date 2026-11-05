@@ -148,6 +148,14 @@ typedef id<MTLLibrary> _Nullable (^RgfxCompileBlock)(NSError *__autoreleasing _N
 id<MTLLibrary> _Nullable RgfxCompileOverMetal(RgfxCompileBlock compile, RgfxLibraryMaker makeLibrary,
                                               NSError *__autoreleasing _Nullable *_Nullable error);
 
+/// A library Metal's own creator `make` answers on the device (a source compile, a Metal package's,
+/// an MPS graph package's), made ours as `RgfxCompileOverMetal` makes it, with Metal's error passed
+/// through as Metal gave it; `creator` names the creator in the refusal of a library Metal answers
+/// no bytes for.
+id<MTLLibrary> _Nullable RgfxLibraryOverMetal(RgfxCompileBlock make, RgfxLibraryMaker makeLibrary,
+                                              NSString *creator,
+                                              NSError *__autoreleasing _Nullable *_Nullable error);
+
 /// A stitched library of a descriptor (`newLibraryWithStitchedDescriptor:` and Metal's other
 /// descriptor entry points), by `stitch`, Metal's own, over a copy of `descriptor` whose functions
 /// are their shadows and which names no binary archive (Metal would read ours as its own) nor fails

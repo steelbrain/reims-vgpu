@@ -419,32 +419,6 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
-// Libraries of a function array, of a Metal package and of an MPS graph package
-// (`@32@0:8@16^@24` twice, `@40@0:8@16@24^@32`): the device makes libraries of metallibs and
-// stitched descriptors only.
-- (id<MTLLibrary>)newLibraryWithFunctionArray:(NSArray *)functions error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, "libraries of a function array", MTLLibraryErrorDomain,
-	                          MTLLibraryErrorUnsupported);
-	return nil;
-}
-
-- (id<MTLLibrary>)newLibraryWithMetalPackageURL:(NSURL *)url error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, "libraries of a Metal package", MTLLibraryErrorDomain,
-	                          MTLLibraryErrorUnsupported);
-	return nil;
-}
-
-- (id<MTLLibrary>)newLibraryWithMPSGraphPackageURL:(NSURL *)url
-                                              name:(NSString *)name
-                                             error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, "libraries of an MPS graph package", MTLLibraryErrorDomain,
-	                          MTLLibraryErrorUnsupported);
-	return nil;
-}
-
 // OpenGL's functions of its IR (`@32@0:8^v16Q24` and `@40@0:8^v16@24Q32` for each of GL, GL Core
 // and GL ES) and drawables (`@16@0:8`): the device runs no OpenGL.
 - (id<MTLFunction>)newFunctionWithGLIR:(void *)ir functionType:(NSUInteger)functionType

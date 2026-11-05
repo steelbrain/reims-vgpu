@@ -2787,6 +2787,156 @@ void test_source_compiles_through_metals_frontend()
 	CHECK(ours != nil); // kept until here: its release would post
 }
 
+// The device's base class's form of a library creator `sel` (IOGPUMetalDevice's, which the device
+// calls through super; _MTLDevice's where this Mac's Metal has no IOGPUMetalDevice), or null where
+// neither has it.
+IMP baseForm(SEL sel)
+{
+	Class base = objc_getClass("IOGPUMetalDevice") ?: objc_getClass("_MTLDevice");
+	return base != nil && class_getInstanceMethod(base, sel) != nullptr
+	           ? class_getMethodImplementation(base, sel)
+	           : nullptr;
+}
+
+// A library of a function array (newLibraryWithFunctionArray:error:, SPI) is Metal's own over the
+// functions' shadows, made ours as the device makes it (RgfxLinkOverShadows over the base class's
+// form): ours over the bytes Metal's library answers, which go to the host as an app's .metallib,
+// with Metal's functions and Metal's library as its shadow, and no error.
+void test_function_array_library_over_shadows()
+{
+	Fixture fx(0x40000); // the library's bytes fit
+	const char *path = getenv("RGFX_STITCHABLE");
+	SEL sel = sel_registerName("newLibraryWithFunctionArray:error:");
+	IMP array = baseForm(sel);
+	CHECK(path != nullptr && array != nullptr);
+	if (path == nullptr || array == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+		       return [metal newLibraryWithData:d error:nil];
+	       }];
+	id<MTLFunction> add = [lib newFunctionWithName:@"stitch_add"];
+	id<MTLFunction> mul = [lib newFunctionWithName:@"stitch_mul"];
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+	__block NSArray<id<MTLFunction>> *given = nil;
+	__block id<MTLLibrary> metals = nil;
+	__block NSData *made = nil;
+	RgfxSerializer *ser = &fx.ser;
+	NSError *err = nil;
+	id<MTLLibrary> ours = RgfxLinkOverShadows(
+	    @[ add, mul ],
+	    ^id<MTLLibrary>(NSArray<id<MTLFunction>> *shadows, NSError **e) {
+		    given = shadows;
+		    metals = ((id(*)(id, SEL, NSArray *, NSError **))array)(metal, sel, shadows, e);
+		    return metals;
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError **) {
+		    const void *p = nullptr;
+		    size_t n = 0;
+		    dispatch_data_t map = dispatch_data_create_map(data, &p, &n);
+		    made = [NSData dataWithBytes:p length:n];
+		    uint32_t st = 0;
+		    RgfxLibrary *l = [RgfxLibrary libraryWithData:p
+		                                           length:n
+		                                              key:nullptr
+		                                           device:nil
+		                                       serializer:ser
+		                                           status:&st];
+		    (void)map;
+		    return l;
+	    },
+	    &err);
+	CHECK(err == nil && metals != nil);
+	CHECK(given.count == 2 && given[0] == [(RgfxFunction *)add rgfxShadow] &&
+	      given[1] == [(RgfxFunction *)mul rgfxShadow] && given[0] != nil);
+	CHECK([(id)ours isKindOfClass:[RgfxLibrary class]] && [(RgfxLibrary *)ours rgfxShadow] == metals);
+	NSArray<NSString *> *names = [ours.functionNames sortedArrayUsingSelector:@selector(compare:)];
+	CHECK([names isEqualToArray:[metals.functionNames sortedArrayUsingSelector:@selector(compare:)]]);
+	CHECK([names containsObject:@"stitch_add"] && [names containsObject:@"stitch_mul"]);
+	CHECK([ours newFunctionWithName:@"stitch_add"].functionType ==
+	      [metals newFunctionWithName:@"stitch_add"].functionType);
+	NSData *metalsBytes = [(id<RgfxMetalLibraryInternals>)metals libraryDataContents];
+	CHECK(made.length > 0 && [made isEqualToData:metalsBytes]);
+	auto msg = nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	RgfxLibraryCreate head;
+	std::memcpy(&head, msg.data(), sizeof(head));
+	CHECK(head.obj_id == [(RgfxLibrary *)ours rgfxObjId] && head.byte_length == made.length);
+	CHECK(std::memcmp(msg.data() + RGFX_LIBRARY_BYTES_OFFSET, made.bytes, made.length) == 0);
+}
+
+// The library of a Metal package and of an MPS graph package (SPI) is Metal's own reading of the
+// package, made ours as the device makes it (RgfxLibraryOverMetal over the base class's forms): for
+// a package that is not there, and a .metallib named as a Metal package, Metal's refusal passes
+// through as Metal gave it, the public device's words and code (both x86 Macs: MTLLibraryErrorDomain
+// 1 "Invalid metal package", and 6 "failed to open MPSGraph package"), and nothing reaches the
+// maker or the ring.
+void test_package_libraries_answer_metals_refusals()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_STITCHABLE");
+	SEL package = sel_registerName("newLibraryWithMetalPackageURL:error:");
+	SEL graph = sel_registerName("newLibraryWithMPSGraphPackageURL:name:error:");
+	IMP packageForm = baseForm(package), graphForm = baseForm(graph);
+	CHECK(path != nullptr && packageForm != nullptr && graphForm != nullptr);
+	if (path == nullptr || packageForm == nullptr || graphForm == nullptr)
+		return;
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	RgfxLibraryMaker never = ^id<MTLLibrary>(dispatch_data_t, NSError **) {
+		CHECK(false); // nothing to make of no library
+		return nil;
+	};
+	NSURL *urls[] = {[NSURL fileURLWithPath:@"/nonexistent/rgfx.mtlpackage"], [NSURL fileURLWithPath:@(path)]};
+	for (NSURL *url : urls) {
+		__block NSError *given = nil;
+		NSError *err = nil;
+		id<MTLLibrary> lib = RgfxLibraryOverMetal(
+		    ^id<MTLLibrary>(NSError **e) {
+			    id<MTLLibrary> l = ((id(*)(id, SEL, NSURL *, NSError **))packageForm)(metal, package, url, e);
+			    given = *e;
+			    return l;
+		    },
+		    never, @"newLibraryWithMetalPackageURL:", &err);
+		NSError *publicError = nil;
+		id<MTLLibrary> pub = ((id(*)(id, SEL, NSURL *, NSError **))objc_msgSend)(metal, package, url,
+		                                                                        &publicError);
+		CHECK(lib == nil && pub == nil && given != nil && err == given);
+		CHECK([err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorUnsupported);
+		CHECK(err.code == publicError.code &&
+		      [err.localizedDescription isEqualToString:publicError.localizedDescription]);
+	}
+	__block NSError *given = nil;
+	NSError *err = nil;
+	NSURL *missing = [NSURL fileURLWithPath:@"/nonexistent/rgfx.mpsgraphpackage"];
+	id<MTLLibrary> lib = RgfxLibraryOverMetal(
+	    ^id<MTLLibrary>(NSError **e) {
+		    id<MTLLibrary> l = ((id(*)(id, SEL, NSURL *, NSString *, NSError **))graphForm)(
+		        metal, graph, missing, @"rgfx", e);
+		    given = *e;
+		    return l;
+	    },
+	    never, @"newLibraryWithMPSGraphPackageURL:", &err);
+	CHECK(lib == nil && given != nil && err == given);
+	CHECK([err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorFileNotFound);
+	CHECK([err.localizedDescription isEqualToString:@"failed to open MPSGraph package"]);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> drain;
+	CHECK(!fx.ring.next(&h, &drain));
+}
+
 } // namespace
 
 // A device that stitches as ours does (RgfxStitchOverShadows), on Metal's own stitch, making its
@@ -13136,6 +13286,8 @@ int main(int argc, char **argv)
 		test_stitched_dag_over_shadows();
 		test_library_air_arguments();
 		test_source_compiles_through_metals_frontend();
+		test_function_array_library_over_shadows();
+		test_package_libraries_answer_metals_refusals();
 		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();
 		test_unread_function_list_answers_from_shadow();
