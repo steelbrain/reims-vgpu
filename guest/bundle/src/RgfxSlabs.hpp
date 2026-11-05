@@ -23,6 +23,15 @@
  * tracking is resolved (the caller resolves it): the host's placed buffer takes its heap's
  * storage, CPU cache and hazard tracking modes, and refuses another storage or cache mode.
  *
+ * MANAGED OVER A COPY. Where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS (the sources'
+ * `managedOverCopy`), a Managed buffer lies in the Shared class of its cache and hazard tracking
+ * modes: its range is a Shared buffer's, made as any (BUFFER_AT_OFFSET in the slab's heap, or
+ * BUFFER_OVER_PAGES over a larger slab of superpages), and the Managed buffer a
+ * MANAGED_BUFFER_CREATE over it, its CPU copy. So a Managed buffer of any size lies where a Shared
+ * one of its size does, the process's own superpages first, on every host. Its range goes back
+ * once the copy's destroy follows the buffer's. Without the feature a Managed buffer has a class
+ * of its own (below, the region's source).
+ *
  * THE SIZES. A buffer of up to kSmallMax bytes takes a range of one of its class's slabs, first
  * fit over the slabs in the order they were made, so older slabs fill first and newer ones empty.
  * A class's slabs grow from kSlabFirst, doubling, to kSlabMax, and are never smaller than twice
@@ -66,6 +75,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -145,19 +155,39 @@ public:
 	/// is `heap` (0s for a class with none); false where the device never got it.
 	virtual bool makeBuffer(const Memory &memory, const Heap &heap, uint64_t offset,
 	                        uint64_t length, uint32_t options, Made *out) = 0;
+
+	/// The options of the class a buffer of `options` lies in (MANAGED OVER A COPY): the Shared
+	/// class's for a Managed buffer of a source over copies, else `options`.
+	virtual uint32_t classOptions(uint32_t options) const { return options; }
+
+	/// Whether a buffer of `options` is a Managed buffer over a Shared copy (makeOverCopy).
+	virtual bool overCopy(uint32_t options) const { return false; }
+
+	/// The Managed buffer of `length` bytes and `options` whose CPU copy is the Shared buffer
+	/// `copy` made in a slab of this source; false where the device never got it.
+	virtual bool makeOverCopy(const Made &copy, uint64_t length, uint32_t options, Made *out)
+	{
+		return false;
+	}
+
+	/// Destroys the Shared buffer `copy` a Managed buffer lay over, once that buffer's destroy is
+	/// posted, its address given back where its create picked it: `then` once the destroy is.
+	virtual void dropCopy(const Made &copy, std::function<void()> then) { then(); }
 };
 
 /// Slabs of the device region: each a block of the kext's (RgfxRegion::allocate), in Metal's
 /// 16 KiB pages, its bytes whatever the block held before. A Shared slab is a Placement heap over
-/// host memory and its buffers BUFFER_AT_OFFSET there. A Managed one is, where the device took
-/// RGFX_FEATURE_MANAGED_AT_OFFSET (`managedAtOffset`), a Shared Placement heap over host memory
-/// too, each buffer a BUFFER_MANAGED_AT_OFFSET at an address of its own whose CPU copy the host
-/// places in the heap at its range; else a block whose buffers are each a
+/// host memory and its buffers BUFFER_AT_OFFSET there. A Managed buffer is, where the device took
+/// RGFX_FEATURE_MANAGED_BUFFER_SLABS (`managedOverCopy`), a MANAGED_BUFFER_CREATE over a Shared
+/// buffer of the Shared class (MANAGED OVER A COPY). Else Managed buffers have slabs of their own:
+/// where the device took RGFX_FEATURE_MANAGED_AT_OFFSET (`managedAtOffset`), a Shared Placement
+/// heap over host memory too, each buffer a BUFFER_MANAGED_AT_OFFSET at an address of its own whose
+/// CPU copy the host places in the heap at its range; else a block whose buffers are each a
 /// BUFFER_OVER_HOST_MEMORY over their own range, their CPU copy.
 class RgfxRegionSlabSource : public RgfxSlabSource {
 public:
 	RgfxRegionSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
-	                     bool managedAtOffset = false);
+	                     bool managedAtOffset = false, bool managedOverCopy = false);
 
 	uint64_t unit() const override { return kUnit; }
 	uint64_t capacity() const override;
@@ -168,6 +198,10 @@ public:
 	void dropHeap(const Heap &heap) override;
 	bool makeBuffer(const Memory &memory, const Heap &heap, uint64_t offset, uint64_t length,
 	                uint32_t options, Made *out) override;
+	uint32_t classOptions(uint32_t options) const override;
+	bool overCopy(uint32_t options) const override;
+	bool makeOverCopy(const Made &copy, uint64_t length, uint32_t options, Made *out) override;
+	void dropCopy(const Made &copy, std::function<void()> then) override;
 
 	/// Metal's page, which a heap over host memory is made of.
 	static constexpr uint64_t kUnit = 0x4000;
@@ -176,6 +210,7 @@ protected:
 	RgfxRegion &m_region;
 	RgfxSerializer &m_serializer;
 	bool m_managedAtOffset;
+	bool m_managedOverCopy;
 };
 
 /// The process's own memory a source of pages slabs takes from the kernel: calls the device wires
@@ -196,14 +231,15 @@ struct RgfxPagesMemory {
 /// superpage, one run of guest RAM, is a heap the host makes over that RAM (HEAP_OVER_PAGES;
 /// RGFX_FEATURE_HEAP_OVER_PAGES), its buffers placed there as in a region slab's heap. A larger
 /// slab is more than one run, and holds one dedicated Shared buffer, a BUFFER_OVER_PAGES over the
-/// block's view; a larger Managed one, and a slab where the kernel has no superpages to give or
-/// the kext no pages block, are the region's. A slab goes with its heap's destroy, then its
-/// block's release (the kext's Free, which waits for the device's answer), then its pages.
+/// block's view, or a Managed buffer over such a Shared copy (MANAGED OVER A COPY); a larger
+/// Managed one of a class of its own, and a slab where the kernel has no superpages to give or the
+/// kext no pages block, are the region's. A slab goes with its heap's destroy, then its block's
+/// release (the kext's Free, which waits for the device's answer), then its pages.
 class RgfxPagesSlabSource : public RgfxRegionSlabSource {
 public:
 	RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
 	                    const RgfxPagesMemory &memory, uint64_t capacity,
-	                    bool managedAtOffset = false);
+	                    bool managedAtOffset = false, bool managedOverCopy = false);
 
 	uint64_t unit() const override { return kUnit; }
 	bool serves(uint32_t options, uint64_t size) const override;
@@ -269,7 +305,9 @@ public:
 	/// past its first `keep` bytes, which the caller writes. False where no slab can hold it.
 	bool take(uint64_t length, uint32_t options, uint64_t keep, Range *out);
 
-	/// The buffer of `length` bytes and `options` over `range` (RgfxSlabSource::makeBuffer).
+	/// The buffer of `length` bytes and `options` over `range` (RgfxSlabSource::makeBuffer): a
+	/// Managed one of a source over copies over a Shared buffer made there first, which give()
+	/// destroys (MANAGED OVER A COPY), where the Managed buffer was not made too.
 	bool makeBuffer(const Range &range, uint64_t length, uint32_t options,
 	                RgfxSlabSource::Made *out);
 
@@ -278,7 +316,8 @@ public:
 	typedef uint64_t (*Clock)(void *context);
 	void setClock(Clock now, void *context);
 
-	/// Gives `range` back, once its buffer's destroy is posted.
+	/// Gives `range` back, once its buffer's destroy is posted: after the destroy of the Shared
+	/// copy a Managed buffer over it lay over, where it has one.
 	void give(const Range &range);
 
 	/// Lets every empty and cached slab go, with the doomed ones, where the source had no room
@@ -331,6 +370,8 @@ private:
 		uint32_t zeroing = 0;      // pieces the background is zeroing
 		bool doomed = false;       // let go: no buffer takes from it again
 		uint64_t idleSince = 0;    // the time, in ms, a cached slab was cached, an empty one emptied
+		// The Shared copies Managed buffers lie over, by their ranges' offsets.
+		std::map<uint64_t, RgfxSlabSource::Made> copies;
 	};
 
 	struct BySerial {
@@ -365,6 +406,8 @@ private:
 	size_t dropDoomed(bool evict);
 	/// Gives a slab's heap and memory back, and frees it. Called without the lock.
 	void drop(Slab *slab);
+	/// Gives `range` back to its slab, its buffers' destroys all posted.
+	void giveBack(const Range &range);
 	/// The class of `options`. Caller holds the lock.
 	Class &classOf(uint32_t options);
 	/// Lets go the empty slabs of small buffers left empty kCacheIdleMs by `now`, and sets when

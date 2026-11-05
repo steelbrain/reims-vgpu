@@ -304,6 +304,12 @@ public:
 	                                        uint32_t options,
 	                                        uint64_t align = kDefaultAddressAlign);
 
+	/// A Managed buffer of `length` bytes at a picked GPU address, its CPU copy the first `length`
+	/// bytes of the Shared buffer `cpu_buffer` over the process's memory (`MANAGED_BUFFER_CREATE`,
+	/// where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS).
+	RgfxCreated createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length, uint32_t options,
+	                                uint64_t align = kDefaultAddressAlign);
+
 	/// The process wrote `length` bytes at `location` of Managed buffer `buffer`'s CPU copy
 	/// (`didModifyRange:`): every command buffer committed after it sees them. False where the
 	/// message was not posted.

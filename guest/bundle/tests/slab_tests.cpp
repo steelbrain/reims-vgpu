@@ -1216,6 +1216,105 @@ void test_pages_source_short_of_superpages()
 	}
 }
 
+// Where the device took MANAGED_BUFFER_SLABS, a Managed buffer lies in its Shared class: a range
+// of the Shared buffers' slabs, the process's own superpages first, at any size, its CPU copy a
+// Shared buffer there (BUFFER_AT_OFFSET in a superpage's heap, BUFFER_OVER_PAGES over a larger
+// slab's view, BUFFER_AT_OFFSET in a region slab's heap where the kernel has no superpage), and the
+// Managed buffer a MANAGED_BUFFER_CREATE over it at an address of its own. Its range goes back
+// once the copy's destroy follows the buffer's, the copy's address given back where its create
+// picked it.
+void test_managed_buffers_over_shared_copies()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PagesKext kext(16 * kMiB, &log);
+	region.setBlockSource(&PagesKext::alloc, &PagesKext::release, &kext);
+	region.setPagesBlockSource(&PagesKext::pagesBlock, &kext);
+	PagesVm vm(&log);
+	vm.superpagesLeft = 3;
+	RgfxPagesMemory calls;
+	calls.context = &vm;
+	calls.superpages = &PagesVm::superpages;
+	calls.unmap = &PagesVm::unmap;
+	RgfxRegionSlabSource regionSource(region, ser, false, true);
+	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30, false, true);
+	CHECK(regionSource.overCopy(kManaged) && !regionSource.overCopy(kShared));
+	CHECK(regionSource.classOptions(kManaged) == kShared && pages.classOptions(kShared) == kShared);
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pages);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+
+	// A small one: a superpage's heap of the Shared class, shared with a Shared buffer.
+	RgfxSlabs::Range m, s;
+	CHECK(slabs.take(0x1000, kManaged, 0, &m) && m.offset == 0 && m.size == 0x1000);
+	CHECK(log == std::vector<std::string>({"superpages 2097152"}));
+	auto heap = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
+	CHECK(heap.options == kShared && heap.size_bytes == 2 * kMiB);
+	RgfxSlabSource::Made made;
+	CHECK(slabs.makeBuffer(m, 0x800, kManaged, &made));
+	auto copy = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(copy.heap_obj_id == heap.obj_id && copy.offset == 0 && copy.length == 0x800 &&
+	      copy.options == kShared);
+	auto over = expectMessage<RgfxManagedBufferCreate>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	CHECK(over.cpu_buffer_obj_id == copy.obj_id && over.length == 0x800 &&
+	      over.options == kManaged && over.gpu_address != 0);
+	CHECK(made.objId == over.obj_id && made.gpuAddress == over.gpu_address && made.ownsAddress);
+	CHECK(slabs.take(0x1000, kShared, 0, &s) && s.slab == m.slab && s.offset == 0x1000);
+
+	// A large one: superpages with no heap, its copy over the block's view.
+	RgfxSlabs::Range big;
+	CHECK(slabs.take(3 * kMiB, kManaged, 0, &big) && big.size == 3 * kMiB && big.offset == 0);
+	CHECK(endsWith(log, {"superpages 4194304"}) && kext.pages.size() == 2);
+	CHECK(!ring.next(&h, &bytes));
+	CHECK(slabs.makeBuffer(big, 3 * kMiB, kManaged, &made));
+	auto bigCopy = expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
+	CHECK(bigCopy.offset == 0 && bigCopy.length == 3 * kMiB && bigCopy.options == kShared);
+	auto bigOver = expectMessage<RgfxManagedBufferCreate>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	CHECK(bigOver.cpu_buffer_obj_id == bigCopy.obj_id && bigOver.length == 3 * kMiB);
+	CHECK(made.objId == bigOver.obj_id && bigOver.gpu_address != bigCopy.gpu_address);
+	CHECK(slabs.stats().slabs == 2 && slabs.stats().firstSlabs == 2);
+
+	// No superpage left: a region slab's heap of the Shared class, nothing of the region's own.
+	RgfxSlabs::Range r;
+	CHECK(slabs.take(0x1000, kManaged | 0x1, 0, &r));
+	CHECK(endsWith(log, {"superpages 2097152 refused"}));
+	auto regionHeap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+	CHECK(regionHeap.options == (kShared | 0x1));
+	CHECK(slabs.makeBuffer(r, 0x1000, kManaged | 0x1, &made));
+	auto regionCopy = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(regionCopy.heap_obj_id == regionHeap.obj_id && regionCopy.options == (kShared | 0x1));
+	auto regionOver = expectMessage<RgfxManagedBufferCreate>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	CHECK(regionOver.cpu_buffer_obj_id == regionCopy.obj_id && regionOver.options == (kManaged | 0x1));
+
+	// Each give destroys its copy, and only then is the range free again: the small Managed
+	// buffer's range is taken again by the next buffer of the class.
+	CHECK(!ring.next(&h, &bytes));
+	slabs.give(m);
+	auto destroyed = expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY);
+	CHECK(destroyed.obj_id == copy.obj_id && !ring.next(&h, &bytes));
+	RgfxSlabs::Range again;
+	CHECK(slabs.take(0x1000, kManaged, 0, &again) && again.slab == m.slab && again.offset == 0);
+	// A Shared buffer's give destroys nothing of its own.
+	slabs.give(s);
+	CHECK(!ring.next(&h, &bytes));
+	slabs.give(big);
+	CHECK(expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY).obj_id == bigCopy.obj_id);
+	slabs.give(r);
+	CHECK(expectMessage<RgfxObjectDestroy>(ring, RGFX_CMD_OBJECT_DESTROY).obj_id ==
+	      regionCopy.obj_id);
+	slabs.give(again);
+	CHECK(slabs.reclaim() && slabs.stats().slabs == 0 && kext.pages.empty() && vm.held.empty());
+	while (ring.next(&h, &bytes)) {
+	}
+}
+
 } // namespace
 
 void rgfxSlabTests()
@@ -1235,4 +1334,5 @@ void rgfxSlabTests()
 	test_pages_slab_source();
 	test_superpages_one_call_each();
 	test_pages_source_short_of_superpages();
+	test_managed_buffers_over_shared_copies();
 }

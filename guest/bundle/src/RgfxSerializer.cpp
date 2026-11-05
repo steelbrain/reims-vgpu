@@ -361,6 +361,27 @@ RgfxCreated RgfxSerializer::createBufferManagedAtOffset(RgfxObjId heap, uint64_t
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length,
+                                                uint32_t options, uint64_t align)
+{
+	RgfxCreated out = {};
+	// The GPU copy's address; no address left for it: no object, as for a buffer over host
+	// memory.
+	out.gpu_address = m_ids.allocAddress(length, align);
+	if (out.gpu_address == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+
+	RgfxManagedBufferCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.gpu_address = out.gpu_address;
+	msg.cpu_buffer_obj_id = cpu_buffer;
+	msg.length = length;
+	msg.options = options;
+	out.posted = m_control.tryPost(RGFX_CMD_MANAGED_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::createBufferOverPages(uint64_t length, uint32_t options,
                                                   uint64_t block_offset, uint64_t block_size,
                                                   uint64_t offset)

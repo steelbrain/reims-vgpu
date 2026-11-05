@@ -630,9 +630,13 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
 	_serializer->setAsker(&rgfxKextAsk, connContext);
 	_stateCache = [[RgfxStateCache alloc] initWithDevice:self serializer:_serializer];
-	// Managed buffers' CPU copies lie in heaps of their slabs where the host places them there.
-	_slabSource = std::make_unique<RgfxRegionSlabSource>(
-	    *_region, *_serializer, (_caps.features() & RGFX_FEATURE_MANAGED_AT_OFFSET) != 0);
+	// Managed buffers lie over Shared copies of the Shared buffers' slabs where the host makes
+	// them over any Shared buffer (MANAGED_BUFFER_SLABS); else their CPU copies lie in heaps of
+	// their own slabs where the host places them there.
+	const bool managedAtOffset = (_caps.features() & RGFX_FEATURE_MANAGED_AT_OFFSET) != 0;
+	const bool managedOverCopy = (_caps.features() & RGFX_FEATURE_MANAGED_BUFFER_SLABS) != 0;
+	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer, managedAtOffset,
+	                                                     managedOverCopy);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
 	// The slabs whose buffers lie in heaps, and large Shared buffers, are the process's own
 	// superpages, wired into pages blocks the host makes heaps or buffers over, where the region
@@ -644,7 +648,7 @@ RGFX_LOG_UNRECOGNIZED
 		memory.unmap = &rgfxUnmapPages;
 		_pagesSource = std::make_unique<RgfxPagesSlabSource>(
 		    *_region, *_serializer, memory, [NSProcessInfo processInfo].physicalMemory,
-		    (_caps.features() & RGFX_FEATURE_MANAGED_AT_OFFSET) != 0);
+		    managedAtOffset, managedOverCopy);
 		_slabs->setFirst(_pagesSource.get());
 	}
 	if (!_slabs->start())

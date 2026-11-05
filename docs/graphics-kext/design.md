@@ -791,6 +791,12 @@ only where no negotiation can carry it.
   and writes the copy where the buffer's contents lie, so the bundle takes a
   Managed texture's CPU copy from its slabs ("Managed storage", below). Every
   host offers it, and the kext takes it.
+- Bit 22 is `MANAGED_BUFFER_SLABS`: ring 0 carries `MANAGED_BUFFER_CREATE`, a
+  Managed buffer whose CPU copy is the first bytes of any Shared buffer over
+  the sender's memory, read and written where that buffer's contents lie, so
+  the bundle takes a Managed buffer's CPU copy from its Shared slabs, its own
+  superpages among them, on every host ("Managed storage", below). Every host
+  offers it, and the kext takes it.
 - Bit 24 is `DISPLAY_COLOR`: the guest sends the display pipe's gamma tables
   and colour matrix as `DISPLAY_COLOR` parts, which the next `PRESENT_SURFACE`
   shows, and a present may keep the surface shown and change only the colour
@@ -1642,7 +1648,7 @@ that waits for its answer would close it, at the cost the known creates remove.
 
 | group | messages | `Platform` call |
 |---|---|---|
-| memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `BUFFER_MANAGED_AT_OFFSET`, `HEAP_OVER_PAGES`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
+| memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `BUFFER_MANAGED_AT_OFFSET`, `HEAP_OVER_PAGES`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `MANAGED_BUFFER_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
 | Managed ranges | `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION` | `Buffer::did_modify_range`, `Texture::replace_region` |
 | heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
@@ -1660,12 +1666,19 @@ the host's import, and the kext's block table holds one entry per slab:
 - A Shared slab is one Placement `HEAP_OVER_HOST_MEMORY` of the buffers'
   options, hazard tracking resolved, and each buffer a `BUFFER_AT_OFFSET`
   there, at the heap's GPU address plus its offset. Where the device took
-  `MANAGED_AT_OFFSET`, a Managed slab is a Shared Placement heap too, and each
-  buffer a `BUFFER_MANAGED_AT_OFFSET` at an address of its own: the host's GPU
-  copy, beside a CPU copy placed in the heap at the buffer's range. Elsewhere a
-  Managed slab is a plain block, and each buffer a `BUFFER_OVER_HOST_MEMORY`
-  over its own range, its CPU copy. The buffer's `heap` is nil: the slab is no
-  object of the app's.
+  `MANAGED_BUFFER_SLABS`, a Managed buffer lies in the Shared class of its
+  cache and hazard tracking modes: its CPU copy is a Shared buffer of that
+  class, made as any (a `BUFFER_AT_OFFSET`, or the `BUFFER_OVER_PAGES` of a
+  larger slab of superpages, below), and the buffer a `MANAGED_BUFFER_CREATE`
+  over it at an address of its own, so a Managed buffer of any size lies where
+  a Shared one of its size does, on every host; its range goes back once the
+  copy's destroy follows the buffer's. Without that feature, where the device
+  took `MANAGED_AT_OFFSET`, a Managed slab is a Shared Placement heap too, and
+  each buffer a `BUFFER_MANAGED_AT_OFFSET` at an address of its own: the host's
+  GPU copy, beside a CPU copy placed in the heap at the buffer's range.
+  Elsewhere a Managed slab is a plain block, and each buffer a
+  `BUFFER_OVER_HOST_MEMORY` over its own range, its CPU copy. The buffer's
+  `heap` is nil: the slab is no object of the app's.
 - `allocatedSize` is the pages taken, 4096 for a 256-byte buffer, and contents
   and GPU addresses start a page, as both x86-64 Macs' GPUs answer (AMD 5300M,
   Intel 630, measured with `tools/shmem`). Every new buffer reads zeros: a
@@ -1685,8 +1698,9 @@ the host's import, and the kext's block table holds one entry per slab:
   of guest RAM, wired into a pages block and made one `HEAP_OVER_PAGES`, its
   buffers placed in it as in a region slab's heap. A larger dedicated Shared
   slab is superpages too, more than one run, with no heap: its one buffer is a
-  `BUFFER_OVER_PAGES` over the block's view. A larger Managed slab is the
-  region's, as is a slab where the kernel has no superpage to give (no
+  `BUFFER_OVER_PAGES` over the block's view, or a Managed buffer's CPU copy.
+  A larger Managed slab of a class of its own (no `MANAGED_BUFFER_SLABS`) is
+  the region's, as is a slab where the kernel has no superpage to give (no
   contiguous 2 MiB free, or the wire budget spent) or the kext gives no pages
   block. Each superpage is one kernel call: a slab of several reserves its
   range (no access, at a 2 MiB boundary), then gives back each piece in turn
@@ -1738,12 +1752,13 @@ its command buffer's completion, not as it runs, and memory mapped read-only is
 never written back.
 
 **Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is
-memory of its process's, which the guest maps: a buffer's a range of a slab
-("Shared and Managed buffers lie in slabs") or a region block, a texture's a
-Shared buffer of the slabs where the device takes
-`RGFX_FEATURE_MANAGED_TEXTURE_SLABS` (the process's own superpages where the
-device takes them, so no app-sized copy lies in the region), else a region
-block. The host decides the form from the platform's answer of whether the GPU
+memory of its process's, which the guest maps: a buffer's a Shared buffer of
+the slabs where the device takes `RGFX_FEATURE_MANAGED_BUFFER_SLABS`, else a
+range of a slab ("Shared and Managed buffers lie in slabs") or a region block;
+a texture's a Shared buffer of the slabs where the device takes
+`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`, else a region block. The slabs are the
+process's own superpages where the device takes them, so no app-sized copy
+lies in the region. The host decides the form from the platform's answer of whether the GPU
 shares the CPU's memory:
 - **Shared memory:** one copy. The buffer is a no-copy buffer over its block,
   and a one-level 2D texture of a linear format a texture over its block's

@@ -272,7 +272,7 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 		std::memcpy(range.contents, bytes, length);
 	RgfxSlabSource::Made made;
 	if (!slabs->makeBuffer(range, length, static_cast<uint32_t>(options), &made)) {
-		slabs->give(range); // no buffer lies over the range
+		slabs->give(range); // no buffer lies over the range, but a copy made for it goes first
 		return nil;
 	}
 	// The range goes back to its slab once the host has dropped the buffer.
@@ -383,7 +383,7 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	}
 	RgfxSlabSource::Made made;
 	if (!slabs->makeBuffer(range, length, static_cast<uint32_t>(options), &made)) {
-		slabs->give(range); // no buffer lies over the range
+		slabs->give(range); // no buffer lies over the range, but a copy made for it goes first
 		return nil;
 	}
 	// The range goes back to its slab once the host has dropped the buffer, then the caller's

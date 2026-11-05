@@ -45,9 +45,45 @@ constexpr int32_t kHeapTypePlacement = 1;
 // --- the region's slabs --------------------------------------------------------------------
 
 RgfxRegionSlabSource::RgfxRegionSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
-                                           bool managedAtOffset)
-    : m_region(region), m_serializer(serializer), m_managedAtOffset(managedAtOffset)
+                                           bool managedAtOffset, bool managedOverCopy)
+    : m_region(region), m_serializer(serializer), m_managedAtOffset(managedAtOffset),
+      m_managedOverCopy(managedOverCopy)
 {
+}
+
+uint32_t RgfxRegionSlabSource::classOptions(uint32_t options) const
+{
+	return overCopy(options) ? (options & ~kStorageMask) : options;
+}
+
+bool RgfxRegionSlabSource::overCopy(uint32_t options) const
+{
+	return m_managedOverCopy && ((options & kStorageMask) >> kStorageShift) == kStorageManaged;
+}
+
+bool RgfxRegionSlabSource::makeOverCopy(const Made &copy, uint64_t length, uint32_t options,
+                                        Made *out)
+{
+	RgfxCreated created = m_serializer.createManagedBuffer(copy.objId, length, options);
+	if (created.obj_id == 0 || m_serializer.refused(created))
+		return false; // no address left, or the device never got it
+	out->objId = created.obj_id;
+	out->gpuAddress = created.gpu_address;
+	out->ownsAddress = true;
+	return true;
+}
+
+void RgfxRegionSlabSource::dropCopy(const Made &copy, std::function<void()> then)
+{
+	// Its address, where its create picked one, goes back once the destroy is on the ring, then
+	// its range (RgfxSerializer::destroy).
+	RgfxSerializer &serializer = m_serializer;
+	const uint64_t address = copy.ownsAddress ? copy.gpuAddress : 0;
+	m_serializer.destroy(copy.objId, [&serializer, address, then = std::move(then)] {
+		if (address != 0)
+			serializer.releaseAddress(address);
+		then();
+	});
 }
 
 uint64_t RgfxRegionSlabSource::capacity() const
@@ -138,9 +174,9 @@ bool RgfxRegionSlabSource::makeBuffer(const Memory &memory, const Heap &heap, ui
 
 RgfxPagesSlabSource::RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
                                          const RgfxPagesMemory &memory, uint64_t capacity,
-                                         bool managedAtOffset)
-    : RgfxRegionSlabSource(region, serializer, managedAtOffset), m_memory(memory),
-      m_capacity(capacity)
+                                         bool managedAtOffset, bool managedOverCopy)
+    : RgfxRegionSlabSource(region, serializer, managedAtOffset, managedOverCopy),
+      m_memory(memory), m_capacity(capacity)
 {
 }
 
@@ -407,6 +443,8 @@ bool RgfxSlabs::takeIn(Slab *slab, uint64_t size, uint64_t keep,
 
 bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *out)
 {
+	// A Managed buffer over a copy lies in its Shared class (MANAGED OVER A COPY).
+	options = m_source.classOptions(options);
 	RgfxSlabSource *first = nullptr;
 	{
 		std::lock_guard<std::mutex> hold(m_lock);
@@ -522,8 +560,19 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 bool RgfxSlabs::makeBuffer(const Range &range, uint64_t length, uint32_t options,
                            RgfxSlabSource::Made *out)
 {
-	const Slab *slab = static_cast<const Slab *>(range.slab);
-	return slab->source->makeBuffer(slab->memory, slab->heap, range.offset, length, options, out);
+	Slab *slab = const_cast<Slab *>(static_cast<const Slab *>(range.slab));
+	RgfxSlabSource &source = *slab->source;
+	if (!source.overCopy(options))
+		return source.makeBuffer(slab->memory, slab->heap, range.offset, length, options, out);
+	// The Shared copy first, as a buffer of the slab's class, then the Managed buffer over it.
+	RgfxSlabSource::Made copy;
+	if (!source.makeBuffer(slab->memory, slab->heap, range.offset, length, slab->options, &copy))
+		return false;
+	// Where the Managed buffer is not made, the caller's give() destroys the copy all the same.
+	const bool made = source.makeOverCopy(copy, length, options, out);
+	std::lock_guard<std::mutex> hold(m_lock);
+	slab->copies[range.offset] = copy;
+	return made;
 }
 
 void RgfxSlabs::uncache(Slab *slab)
@@ -556,6 +605,26 @@ void RgfxSlabs::doom(Slab *slab)
 }
 
 void RgfxSlabs::give(const Range &range)
+{
+	Slab *slab = const_cast<Slab *>(static_cast<const Slab *>(range.slab));
+	RgfxSlabSource::Made copy;
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		auto it = slab->copies.find(range.offset);
+		if (it != slab->copies.end()) {
+			copy = it->second;
+			slab->copies.erase(it);
+		}
+	}
+	if (copy.objId == 0) {
+		giveBack(range);
+		return;
+	}
+	// The Managed buffer's destroy is posted: its copy's follows it, then the range goes back.
+	slab->source->dropCopy(copy, [this, range] { giveBack(range); });
+}
+
+void RgfxSlabs::giveBack(const Range &range)
 {
 	Slab *slab = const_cast<Slab *>(static_cast<const Slab *>(range.slab));
 	bool dropNow = false;
