@@ -331,19 +331,21 @@ public:
 	bool refused(const RgfxCreated &created);
 
 	/// A texture of shape `desc`. When `heap` is RGFX_OBJ_NONE the texture is
-	/// device-placed at a picked GPU address; otherwise it lies at `heap_offset`
-	/// in `heap`. A resource id is picked either way.
+	/// device-placed at a picked GPU address, whose range holds `span` bytes (its
+	/// allocatedSize), as a buffer's holds its length; otherwise it lies at
+	/// `heap_offset` in `heap`. A resource id is picked either way.
 	RgfxCreated createTexture(const RgfxTextureDescriptor &desc, RgfxObjId heap = RGFX_OBJ_NONE,
-	                          uint64_t heap_offset = 0, uint64_t align = kDefaultAddressAlign);
+	                          uint64_t heap_offset = 0, uint64_t align = kDefaultAddressAlign,
+	                          uint64_t span = 1);
 
 	/// A Managed texture of shape `desc` at a picked GPU address, whose CPU copy is the Shared
 	/// buffer `cpu_buffer` over a block, of blocks `bytes_per_block` bytes and `block_width` by
-	/// `block_height` texels (RgfxManagedLayout.hpp), `flags` RGFX_MANAGED_TEXTURE_LINEAR or 0. A
-	/// resource id is picked.
+	/// `block_height` texels (RgfxManagedLayout.hpp), `flags` RGFX_MANAGED_TEXTURE_LINEAR or 0,
+	/// the address's range `span` bytes (its allocatedSize). A resource id is picked.
 	RgfxCreated createManagedTexture(const RgfxTextureDescriptor &desc, RgfxObjId cpu_buffer,
 	                                 uint32_t bytes_per_block, uint32_t block_width,
 	                                 uint32_t block_height, uint32_t flags,
-	                                 uint64_t align = kDefaultAddressAlign);
+	                                 uint64_t align = kDefaultAddressAlign, uint64_t span = 1);
 
 	/// The process wrote the texels of `size` at `origin` of `level` and `slice` of Managed
 	/// texture `texture`'s CPU copy (`replaceRegion:`): every command buffer committed after it

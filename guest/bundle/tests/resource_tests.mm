@@ -795,6 +795,103 @@ struct SamplerAnswer {
 	}
 };
 
+// A device-placed texture's GPU address holds its allocatedSize: textures (Private, Shared and
+// Managed, of one level, mipmapped, arrays and up to 16 MiB) and buffers made in turn lie in GPU
+// address ranges of their bytes no two of which meet, each at a 4 KiB page or past it by
+// nothing, as both x86 Macs' are (oracle_bundle texaddr: the AMD 5300M and the Intel 630 under
+// macOS 26.7.1 place successive textures past each other's allocatedSize). A texture keeps its
+// address while it lives, and the range goes back once it is let go.
+void test_device_texture_addresses_hold_their_bytes()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x4000000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	@autoreleasepool {
+		const MTLTextureUsage read = MTLTextureUsageShaderRead;
+		auto device = [&](MTLTextureDescriptor *d) {
+			RgfxTexture *t = [RgfxTexture textureWithDescriptor:d
+			                                                heap:RGFX_OBJ_NONE
+			                                          heapOffset:0
+			                                              device:nil
+			                                          serializer:&fx.ser];
+			drainRing(fx.ring);
+			return t;
+		};
+		MTLTextureDescriptor *mips = texture2D(MTLPixelFormatRGBA8Unorm, 256, 256, read);
+		mips.mipmapLevelCount = 9;
+		MTLTextureDescriptor *array = texture2D(MTLPixelFormatRGBA8Unorm, 64, 64, read);
+		array.textureType = MTLTextureType2DArray;
+		array.arrayLength = 3;
+		MTLTextureDescriptor *shared = texture2D(MTLPixelFormatBGRA8Unorm, 1000, 7, read);
+		shared.storageMode = MTLStorageModeShared;
+		MTLTextureDescriptor *managed = texture2D(MTLPixelFormatRGBA8Unorm, 300, 300, read);
+		managed.storageMode = MTLStorageModeManaged;
+		NSArray<MTLTextureDescriptor *> *shapes = @[
+			texture2D(MTLPixelFormatRGBA8Unorm, 64, 64, read), mips, array, shared,
+			texture2D(MTLPixelFormatRGBA8Unorm, 2048, 2048, read), managed
+		];
+		struct Range {
+			id resource;
+			uint64_t at, bytes;
+		};
+		std::vector<Range> live;
+		auto disjoint = [&] {
+			for (size_t i = 0; i < live.size(); i++) {
+				if (live[i].at == 0 || live[i].at % 0x1000 != 0)
+					return false;
+				for (size_t j = i + 1; j < live.size(); j++) {
+					const Range &a = live[i], &b = live[j];
+					if (a.at < b.at + b.bytes && b.at < a.at + a.bytes)
+						return false;
+				}
+			}
+			return true;
+		};
+		auto add = [&](int k) {
+			MTLTextureDescriptor *d = shapes[static_cast<NSUInteger>(k) % shapes.count];
+			RgfxTexture *t = d.storageMode == MTLStorageModeManaged
+			                     ? [RgfxTexture managedTextureWithDescriptor:d
+			                                                          region:&region
+			                                                           slabs:nullptr
+			                                                          device:nil
+			                                                      serializer:&fx.ser]
+			                     : device(d);
+			drainRing(fx.ring);
+			CHECK(t != nil && t.allocatedSize != 0);
+			live.push_back({t, [internals(t) gpuAddress], t.allocatedSize});
+			RgfxBuffer *b = [RgfxBuffer bufferWithLength:0x3000 + 0x800 * k
+			                                     options:MTLResourceStorageModePrivate
+			                                      device:nil
+			                                  serializer:&fx.ser];
+			drainRing(fx.ring);
+			CHECK(b != nil);
+			live.push_back({b, b.gpuAddress, b.length});
+		};
+		for (int k = 0; k < 12; k++)
+			add(k);
+		CHECK(disjoint());
+		// Each texture keeps the address it was made at.
+		for (const Range &r : live)
+			if ([r.resource isKindOfClass:[RgfxTexture class]])
+				CHECK([internals((RgfxTexture *)r.resource) gpuAddress] == r.at);
+		// Let every other texture go: their ranges come back, and what is made after lies in no
+		// live one.
+		for (size_t i = 0; i < live.size();) {
+			if ([live[i].resource isKindOfClass:[RgfxTexture class]] && i % 4 == 0)
+				live.erase(live.begin() + static_cast<std::ptrdiff_t>(i));
+			else
+				i++;
+		}
+		drainRing(fx.ring);
+		for (int k = 12; k < 24; k++)
+			add(k);
+		CHECK(disjoint());
+		live.clear();
+	}
+	drainRing(fx.ring);
+}
+
+
 // A sampler answers no GPU address and no pixel format, and its gpuResourceID's value as its
 // identifier, as Metal's: samplers the host answers with one id answer one identifier.
 void test_sampler_answers()
@@ -1178,6 +1275,7 @@ void rgfxResourceTests()
 	test_buffer_linear_textures();
 	test_texture_compression();
 	test_texture_answers();
+	test_device_texture_addresses_hold_their_bytes();
 	test_sampler_answers();
 	test_state_cache_samplers();
 	test_state_cache_keeps_the_last_made();

@@ -446,7 +446,7 @@ bool RgfxSerializer::refused(const RgfxCreated &created)
 }
 
 RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, RgfxObjId heap,
-                                          uint64_t heap_offset, uint64_t align)
+                                          uint64_t heap_offset, uint64_t align, uint64_t span)
 {
 	RgfxCreated out = {};
 	out.resource_id = m_ids.allocResourceId();
@@ -459,8 +459,8 @@ RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, Rgf
 	msg.resource_id = out.resource_id;
 	msg.desc = desc;
 	if (heap == RGFX_OBJ_NONE) {
-		// Device-placed: pick a GPU address; heap_obj_id stays 0.
-		out.gpu_address = m_ids.allocAddress(1, align);
+		// Device-placed: pick a GPU address, its range the texture's bytes; heap_obj_id stays 0.
+		out.gpu_address = m_ids.allocAddress(std::max<uint64_t>(span, 1), align);
 		msg.gpu_address = out.gpu_address;
 	} else {
 		msg.heap_obj_id = heap;
@@ -483,14 +483,14 @@ bool RgfxSerializer::bufferDidModifyRange(RgfxObjId buffer, uint64_t location, u
 RgfxCreated RgfxSerializer::createManagedTexture(const RgfxTextureDescriptor &desc,
                                                  RgfxObjId cpu_buffer, uint32_t bytes_per_block,
                                                  uint32_t block_width, uint32_t block_height,
-                                                 uint32_t flags, uint64_t align)
+                                                 uint32_t flags, uint64_t align, uint64_t span)
 {
 	RgfxCreated out = {};
 	out.resource_id = m_ids.allocResourceId();
 	if (out.resource_id == 0)
 		return out;
 	out.obj_id = m_ids.allocObjId();
-	out.gpu_address = m_ids.allocAddress(1, align);
+	out.gpu_address = m_ids.allocAddress(std::max<uint64_t>(span, 1), align);
 
 	RgfxManagedTextureCreate msg = {};
 	msg.obj_id = out.obj_id;

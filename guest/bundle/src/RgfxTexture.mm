@@ -846,6 +846,29 @@ void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceR
 @interface RgfxTexture () <RgfxMetalTextureInternals>
 @end
 
+namespace {
+// The bytes a texture of shape `d` of memory of its own takes, which its allocatedSize answers:
+// every level of every slice and sample, in its format's blocks (0 for a format not sized here).
+uint64_t rgfxTextureBytes(const RgfxTextureDescriptor &d)
+{
+	RgfxBlockShape b = rgfxBlockShapeOf(static_cast<MTLPixelFormat>(d.pixel_format));
+	uint64_t slices = d.array_length ? d.array_length : 1;
+	if (d.texture_type == MTLTextureTypeCube || d.texture_type == MTLTextureTypeCubeArray) {
+		slices *= 6;
+	}
+	uint64_t samples = d.sample_count ? d.sample_count : 1;
+	uint64_t total = 0;
+	uint32_t levels = d.mipmap_level_count ? d.mipmap_level_count : 1;
+	for (uint32_t level = 0; level < levels; level++) {
+		uint64_t w = std::max<uint64_t>(1, d.width >> level);
+		uint64_t h = std::max<uint64_t>(1, d.height >> level);
+		uint64_t z = std::max<uint64_t>(1, d.depth >> level);
+		total += ((w + b.width - 1) / b.width) * ((h + b.height - 1) / b.height) * z * b.bytes;
+	}
+	return total * slices * samples;
+}
+} // namespace
+
 @implementation RgfxTexture {
 	RgfxTextureDescriptor _desc; // the mapped shape the getters answer from
 	uint64_t _gpuAddress;        // the picked GPU address (0 when heap-placed)
@@ -935,7 +958,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	}
 	RgfxCreated created = serializer->createManagedTexture(
 	    desc, [cpu rgfxObjId], block.bytes, block.width, block.height,
-	    block.linear ? RGFX_MANAGED_TEXTURE_LINEAR : 0);
+	    block.linear ? RGFX_MANAGED_TEXTURE_LINEAR : 0, RgfxSerializer::kDefaultAddressAlign,
+	    rgfxTextureBytes(desc));
 	if (created.resource_id == 0) {
 		return nil;
 	}
@@ -1059,21 +1083,7 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	if (self.rgfxHeapRangeSize != 0) {
 		return static_cast<NSUInteger>(self.rgfxHeapRangeSize); // its Automatic heap's size of it
 	}
-	RgfxBlockShape b = rgfxBlockShapeOf(static_cast<MTLPixelFormat>(_desc.pixel_format));
-	uint64_t slices = _desc.array_length ? _desc.array_length : 1;
-	if (_desc.texture_type == MTLTextureTypeCube || _desc.texture_type == MTLTextureTypeCubeArray) {
-		slices *= 6;
-	}
-	uint64_t samples = _desc.sample_count ? _desc.sample_count : 1;
-	uint64_t total = 0;
-	uint32_t levels = _desc.mipmap_level_count ? _desc.mipmap_level_count : 1;
-	for (uint32_t level = 0; level < levels; level++) {
-		uint64_t w = std::max<uint64_t>(1, _desc.width >> level);
-		uint64_t h = std::max<uint64_t>(1, _desc.height >> level);
-		uint64_t d = std::max<uint64_t>(1, _desc.depth >> level);
-		total += ((w + b.width - 1) / b.width) * ((h + b.height - 1) / b.height) * d * b.bytes;
-	}
-	return static_cast<NSUInteger>(total * slices * samples);
+	return static_cast<NSUInteger>(rgfxTextureBytes(_desc));
 }
 
 - (NSUInteger)bufferOffset
@@ -1097,7 +1107,9 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		return nil; // a texture must have a route and a shape
 	}
 	RgfxTextureDescriptor desc = rgfxTextureDescriptorFromMTL(descriptor);
-	RgfxCreated created = serializer->createTexture(desc, heap, heapOffset);
+	RgfxCreated created = serializer->createTexture(desc, heap, heapOffset,
+	                                                RgfxSerializer::kDefaultAddressAlign,
+	                                                rgfxTextureBytes(desc));
 	if (created.resource_id == 0) {
 		return nil; // no resource id left: no texture, as Metal answers one it cannot make
 	}
@@ -1993,8 +2005,15 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // The GPU address of the texture's memory, nonzero for every kind: its texture's for a view, at
 // any level and slice, its buffer's plus its offset for one over a buffer, its heap's plus its
 // offset there for one in a heap (RgfxIOSurfaceTexture answers its own). Else it is the address
-// its create reserved, which no other resource takes, where Metal's is that of the texture's
-// memory: the host does not place a device-placed texture's memory at it.
+// its create reserved, a range of the GPU addresses buffers take that holds its allocatedSize,
+// page-aligned, which no other resource meets while it lives and which goes back after its
+// destroy, as both x86 Macs place a texture (oracle_bundle texaddr: the AMD 5300M and the Intel
+// 630 under macOS 26.7.1). The bytes there are Metal's texture's in its GPU's tiled layout, which
+// no program relies on (argument buffers name a texture by its gpuResourceID); the host places
+// none of the texture's memory there, so a shader that reaches the range through a pointer meets
+// no resource: on the Vulkan platform it reads zeros and its writes are dropped (metal2vulkan's
+// residency.rs, read), and on the Metal platform it touches GPU addresses nothing maps (not
+// measured).
 - (uint64_t)gpuAddress
 {
 	if (_parent != nil) {
