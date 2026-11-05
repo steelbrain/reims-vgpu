@@ -172,7 +172,7 @@ const TEXTURE_SIDE: u64 = 64;
 
 /// This thread's CPU time in nanoseconds, the instructions it retired and its cycles, each as a
 /// count that only grows; the counters are 0 where the host gives none.
-pub(super) fn counts() -> Counts {
+pub(in crate::graphics) fn counts() -> Counts {
     let mut at = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -189,7 +189,7 @@ pub(super) fn counts() -> Counts {
 
 /// What [`counts`] answers, and the differences of two answers.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Counts(pub(super) [u64; 3]);
+pub(in crate::graphics) struct Counts(pub(in crate::graphics) [u64; 3]);
 
 impl std::ops::Sub for Counts {
     type Output = Counts;
@@ -207,7 +207,7 @@ impl std::ops::AddAssign for Counts {
 }
 
 /// The names of [`Counts`]' figures.
-pub(super) const FIGURES: [&str; 3] = ["CPU ns", "instructions", "cycles"];
+pub(in crate::graphics) const FIGURES: [&str; 3] = ["CPU ns", "instructions", "cycles"];
 
 /// This thread's instructions and cycles: on macOS from the kernel's own per-thread counters
 /// (`thread_selfcounts`, which a process reads of its threads unprivileged).

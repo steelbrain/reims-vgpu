@@ -103,6 +103,8 @@ mod compile;
 mod completion;
 mod decode;
 mod device_info;
+#[cfg(test)]
+mod display_cost;
 #[cfg(target_os = "macos")]
 mod metal;
 mod present;

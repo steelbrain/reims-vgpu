@@ -165,7 +165,7 @@ mod commit_order;
 mod composite_cost;
 mod compute;
 #[cfg(test)]
-mod draw_cost;
+pub(super) mod draw_cost;
 #[cfg(test)]
 mod fuzz;
 #[cfg(test)]
