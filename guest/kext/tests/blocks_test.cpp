@@ -115,8 +115,9 @@ int main()
 		check(x.t.blocks[0].pins == 1, "nor the new owner's pin");
 	}
 	{
-		// A close answered frees every block of the client, whatever its state; one not
-		// answered keeps them all from use, save a releasing one the device answers OK.
+		// A close answered frees every block of the client, but a releasing one, which stays, no
+		// one's, until its release's answer; one not answered keeps them all from use, save a
+		// releasing one the device answers OK.
 		Table x;
 		uint64_t live = 0, freed = 0, releasing = 0, other = 0;
 		rgfxBlockAlloc(x.t, a, 1, 0x1000, 0x1000, &live);
@@ -139,36 +140,47 @@ int main()
 		void *took[2] = {rgfxBlockTakeWired(x.t, a), rgfxBlockTakeWired(x.t, a)};
 		check(took[0] == &pagesA && took[1] == &pagesA2, "the closed client's wired pages, in order");
 		check(rgfxBlockTakeWired(x.t, a) == nullptr, "each once");
-		check(rgfxBlockFreeOwner(x.t, a) == 3 && x.t.count == 1 && x.t.blocks[0].owner == b,
-		      "an answered close frees the client's blocks");
-		check(x.t.blocks[0].wired == &pagesB, "the other client's pages stay wired");
-		// A releasing block taken out answers no wired pages to its release's answer.
-		check(!rgfxBlockReleasingAt(x.t, releasing, release.serial),
-		      "a releasing block taken out is its release's no more");
-		// Its offset is given out again, and that block's release is posted: the old release's
-		// late answer is not the new block's, whose release still holds its surface.
+		check(rgfxBlockFreeOwner(x.t, a) == 3 && x.t.count == 2 &&
+		          x.t.blocks[0].offset == releasing && x.t.blocks[0].owner == rgfxBlockNoOwner() &&
+		          x.t.blocks[1].owner == b,
+		      "an answered close frees the client's blocks, but the releasing one");
+		check(x.t.blocks[1].wired == &pagesB, "the other client's pages stay wired");
+		// The releasing block stays its release's, its wired pages taken: the release worker
+		// may post its release only now, and its answer unwires nothing.
+		check(rgfxBlockReleasingAt(x.t, releasing, release.serial) && !x.t.blocks[0].wired,
+		      "a releasing block stays its release's past its owner's close");
+		RgfxBlockPin none;
+		check(!rgfxBlockPin(x.t, a, releasing, 0x10, &none) &&
+		          rgfxBlockFree(x.t, a, releasing) == kRgfxBlockBadArgument,
+		      "and is its closed owner's no more");
+		// The other offsets are given out again, but not the releasing block's, whose release
+		// would end the new block's grant at the device.
 		uint64_t again = 0;
 		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &again) == kRgfxBlockOk &&
 		          again == kStart,
 		      "the first freed offset is given out again");
 		uint64_t reused = 0;
 		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &reused) == kRgfxBlockOk &&
-		          reused == kStart + 0x1000 && rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &reused) ==
-		                                           kRgfxBlockOk &&
+		          reused == kStart + 0x1000,
+		      "and the second's");
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &reused) == kRgfxBlockOk &&
+		          reused == other + 0x1000,
+		      "but not the releasing block's while its release is unanswered");
+		void *wired = &pagesB;
+		rgfxBlockReleased(x.t, releasing, release.serial, true, &wired);
+		check(wired == nullptr && rgfxBlockIndex(x.t, releasing) < 0,
+		      "its answer, after the close, unwires nothing and frees the block");
+		check(rgfxBlockAlloc(x.t, b, 2, 0x1000, 0x1000, &reused) == kRgfxBlockOk &&
 		          reused == releasing,
-		      "and the released block's too");
+		      "whose offset is given out again only then");
 		rgfxBlockFree(x.t, b, reused);
 		RgfxBlock newer;
 		check(rgfxBlockNextRelease(x.t, &newer) && newer.offset == releasing &&
 		          newer.serial != release.serial,
 		      "the new block's release, of another serial");
-		check(!rgfxBlockReleasingAt(x.t, releasing, release.serial) &&
-		          rgfxBlockReleasingAt(x.t, releasing, newer.serial),
-		      "the old release's answer finds the offset another's");
-		void *wired = &pagesB;
 		rgfxBlockReleased(x.t, releasing, release.serial, true, &wired);
 		check(wired == nullptr && rgfxBlockReleasingAt(x.t, releasing, newer.serial),
-		      "a release answered after the close unwires nothing and frees nothing of the new");
+		      "a stale answer of the old release frees nothing of the new");
 
 		check(rgfxBlockKeepOwner(y.t, a) == 3 && y.t.count == 4, "an unanswered close keeps them");
 		RgfxBlockPin pin;

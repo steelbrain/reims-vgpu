@@ -409,17 +409,24 @@ inline void *rgfxBlockTakeWired(RgfxBlockTable &t, const void *owner)
 	return nullptr;
 }
 
-// `owner`'s close was answered: the device holds nothing of its blocks, and they all go. How
-// many. The caller takes their wired pages first (rgfxBlockTakeWired).
+// `owner`'s close was answered: the device holds nothing of its blocks, and they go, save a
+// releasing one, which stays, no one's, until its release's answer (rgfxBlockReleased): the
+// release worker takes a block's release before it posts it, and may wait for ring room or a
+// naming meanwhile, so that release may reach the device after this. Its offset is then given
+// to no other block, whose grant or share the release would end at the device. How many of the
+// owner's blocks there were. The caller takes their wired pages first (rgfxBlockTakeWired).
 inline uint32_t rgfxBlockFreeOwner(RgfxBlockTable &t, const void *owner)
 {
 	uint32_t kept = 0, freed = 0;
 	for (uint32_t i = 0; i < t.count; i++) {
-		if (t.blocks[i].owner == owner) {
+		RgfxBlock &b = t.blocks[i];
+		if (b.owner == owner) {
 			freed++;
-			continue;
+			if (b.state != kRgfxBlockReleasing)
+				continue;
+			b.owner = rgfxBlockNoOwner();
 		}
-		t.blocks[kept++] = t.blocks[i];
+		t.blocks[kept++] = b;
 	}
 	t.count = kept;
 	return freed;

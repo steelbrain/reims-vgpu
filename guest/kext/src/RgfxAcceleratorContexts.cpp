@@ -332,9 +332,9 @@ void finishRelease(const RgfxReleaseEntry &e, bool answered)
 	// surface and the surface's wire are let go, before the block can be anyone else's. A kept
 	// block's surface keeps them, its locks waiting, for the release posted again: the device
 	// copies the cache into the pages at that release's answer. Only while the block is still
-	// this release's: a pages block its owner's answered close took may have given its offset to
-	// another block since, whose own release holds its surface. What it held goes out of the
-	// lock.
+	// this release's, as it is until this answer (rgfxBlockFreeOwner keeps a releasing block past
+	// its owner's close), and not another block's at its offset, whose own release holds its
+	// surface. What it held goes out of the lock.
 	RgfxReleasedSurface gone = {};
 	if (ok && rgfxBlockReleasingAt(blockTable, e.offset, e.serial))
 		rgfxSurfaceCacheReleased(e.offset, &gone);
