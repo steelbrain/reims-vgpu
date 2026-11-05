@@ -439,6 +439,7 @@ fn a_reservation_after_one_of_0_alone_hands_out_ids_twice_as_metals() {
 /// A reservation of 2^31 - 1, the highest ID Metal takes without spinning, is taken, plain IDs
 /// then starting at 1, as Metal's
 #[test]
+#[ignore = "opt-in: it holds 16 GiB of the GPU's memory, where other processes' work fails"]
 fn a_reservation_of_2_31_minus_1_is_metals() {
     fn ids<P: Platform>(d: &P::Device) -> Vec<u64> {
         d.reserve_resource_indices(5, &[(1 << 31) - 1]).unwrap();

@@ -116,11 +116,13 @@ Run the checks a change can reach, and no others. Measured on the M3 Max,
 `cargo xtask check` takes about 3 min, 180 s after a core edit, of which
 the workspace's tests are 138 s of GPU time and core's x86-64 tests under
 Rosetta 8 s; `make test`, the full suite, takes 5 min of GPU time.
-`.config/nextest.toml` runs the test that faults a Mac's GPU on purpose,
-and the one that holds the most of its memory, first and alone, so the
-check's tests no longer fail as each other's victims
-([docs/lessons.md](docs/lessons.md)). A GPU test can still fail beside GPU
-work or heavy load elsewhere on the host, and passes run again alone.
+The test that faults a Mac's GPU on purpose and the one that holds the
+most of its memory are opt-in (`#[ignore]`): they fail the work of every
+process on the Mac, the desktop's included, so they run only for a change
+to what they test (`--run-ignored only`), and then first and alone
+(`.config/nextest.toml`, [docs/lessons.md](docs/lessons.md)). A GPU test
+can still fail beside GPU work or heavy load elsewhere on the host, and
+passes run again alone.
 
 | the change touches | check it with |
 |---|---|

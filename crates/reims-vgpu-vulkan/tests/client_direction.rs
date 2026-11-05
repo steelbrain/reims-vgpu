@@ -1166,6 +1166,7 @@ fn small_blits_dropped<P: Platform>(p: &P, d: &P::Device, past_the_level: bool) 
 }
 
 #[test]
+#[ignore = "opt-in: it faults the GPU on purpose, a GPU recovery that fails every process's in-flight work"]
 fn metal_drops_small_blits_into_the_texture() {
     let p = MetalPlatform::new(Box::new(NoLauncher));
     small_blits_dropped(&p, &MetalPlatform::system_default_device().unwrap(), true);

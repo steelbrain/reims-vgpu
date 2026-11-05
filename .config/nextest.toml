@@ -9,7 +9,8 @@
 # package or binary the workspace no longer has fails every nextest run, so a rename updates this
 # file too.
 
-# Writes that fault a Mac's GPU on purpose. Each fault is a GPU recovery (84 GPU events in its
+# Writes that fault a Mac's GPU on purpose: opt-in (`#[ignore]`), run only for a change to what
+# they test, with `--run-ignored only`. Each fault is a GPU recovery (84 GPU events in its
 # 1.8 s, measured on the M3 Max, macOS 27.0.1), and every command buffer of another process in
 # flight then fails as its victim ("Discarded (victim of GPU error/recovery)"): the YCbCr
 # sweeps, the extended-range blends (Metal's side then reads zeros), the in-flight detaches, the
@@ -20,8 +21,8 @@ filter = 'binary_id(reims-vgpu-vulkan::client_direction) & test(=metal_drops_sma
 threads-required = "num-test-threads"
 priority = 100
 
-# A reservation of 2^31 - 1 resource IDs: 16 GiB of memory for about a second, six times any
-# other test's peak, where others' command buffers fail with "Insufficient Memory" when the
+# A reservation of 2^31 - 1 resource IDs, opt-in (`#[ignore]`) like the one above: 16 GiB of
+# memory for about a second, six times any other test's peak, where others' command buffers fail with "Insufficient Memory" when the
 # GPU's memory runs out.
 [[profile.default.overrides]]
 platform = 'cfg(target_os = "macos")'
