@@ -21,7 +21,9 @@ where the display updated after a first Control-Up. Writes RUNDIR/drag.txt, one 
 the composites being the host log's display updates ("the display shows IOSurface") in the
 case's host-time span, the gaps those between them (and the span's ends), the CPU QEMU's (the
 process's own, its exited threads' included) and its graphics threads' (each to its last reading,
-Window), in percent of a core. Mission Control's numbers are over its animations: each
+Window), in percent of a core, and cpu_rule=2, that rule's number (report.py compares the CPU
+columns only across runs of one rule: before it, rule 1, a thread born or gone inside the window
+counted nothing). Mission Control's numbers are over its animations: each
 from the first display update after a Control-Up to its last within 0.8 s (anim_ms their median
 length, start_ms the median wait from the key to the first update, animated those with two
 updates or more); its CPU over the whole case.
@@ -42,6 +44,9 @@ PORT, USER, PASS = os.environ["PORT"], os.environ["GUEST_USER"], os.environ["GUE
 SECONDS = float(os.environ.get("DRAG_S", "10"))
 CASES = os.environ.get("DRAG_CASES", "plain glass resize mission").split()
 RATE = 120  # pointer moves a second
+# How qemu_cpu and gfx_cpu are counted (Window): 2 since QEMU's own utime+stime and each graphics
+# thread's last reading; 1 before, each thread's ticks between the window's two looks.
+CPU_RULE = 2
 RADIUS = 150  # points: the path spans 2 RADIUS across and 1.2 RADIUS down
 SOPTS = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o",
          "PreferredAuthentications=password", "-o", "PubkeyAuthentication=no", "-o", "ConnectTimeout=5",
@@ -338,7 +343,7 @@ def measured(a, b, t0, t1, spans):
     return dict(moved=1, t0=round(t0, 3), t1=round(t1, 3), composites_s=round(n / total, 2), gap_p99_ms=round(1000 * p99, 1),
                 gap_max_ms=round(1000 * (gaps[-1] if gaps else total), 1),
                 qemu_cpu=round(100 * cpu["qemu"] / hz / (t1 - t0), 1),
-                gfx_cpu=round(100 * cpu["gfx"] / hz / (t1 - t0), 1))
+                gfx_cpu=round(100 * cpu["gfx"] / hz / (t1 - t0), 1), cpu_rule=CPU_RULE)
 
 
 def textedit():

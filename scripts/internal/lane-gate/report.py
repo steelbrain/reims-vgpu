@@ -682,6 +682,9 @@ class Run:
             for k in ("qemu_cpu", "gfx_cpu"):
                 if k in kv:
                     self.lmetric(f"{k}.drag.{name}", kv[k])
+            # How msi-drag.py counted those two, where its line says (cpu_rule; cpu_rule_of).
+            if "cpu_rule" in kv:
+                self.lmetric(f"cpu_rule.drag.{name}", kv["cpu_rule"])
 
     # The runtime's counts work() rates over a window, and the field whose subfields sum to a count.
     WORK_FIELDS = ("shadowed_textures", "shadow_copies", "shadow_texels_copied_in", "shadow_texels_copied_back",
@@ -958,6 +961,33 @@ TOOL_OF = [(r"bench\..*", "bench"), (r"present\..*", "present_probe"), (r"decode
 OLDER_TOOL = {"bench": "sweep+bench"}
 
 
+# The drag tool's hashes (meta.json's tools.drag) whose msi-drag.py counted QEMU's CPU by rule 2
+# before its lines said so: 6b1ecb8d0's, until cpu_rule was written.
+DRAG_CPU_RULE_2 = {"9ea504722f4bdd50"}
+
+
+def cpu_rule_of(metrics, meta, key):
+    """The rule msi-drag.py counted a drag's CPU by: its line's cpu_rule (KEY), else 2 for a tool
+    in DRAG_CPU_RULE_2, else 1."""
+    if key in metrics:
+        return metrics[key]
+    return 2 if meta.get("tools", {}).get("drag") in DRAG_CPU_RULE_2 else 1
+
+
+def cpu_rule_changed(name, metrics, meta, base_metrics, base_meta):
+    """(the baseline's rule, the run's) where NAME is a drag's CPU row (qemu_cpu.drag.CASE,
+    gfx_cpu.drag.CASE, either leg's) and msi-drag.py counted it by another rule in the baseline
+    (cpu_rule: 2 from 6b1ecb8d0, which counts the CPU of QEMU's threads that start or end inside
+    the drag, 1 before); None otherwise. The tool's hash alone does not say: msi-drag.py changes
+    for other reasons, and its update counts did not change with the rule."""
+    m = re.fullmatch(r"(shared\.)?(?:qemu|gfx)_cpu\.drag\.(\w+)", name)
+    if not m:
+        return None
+    key = f"{m.group(1) or ''}cpu_rule.drag.{m.group(2)}"
+    now, was = cpu_rule_of(metrics, meta, key), cpu_rule_of(base_metrics, base_meta, key)
+    return (was, now) if now != was else None
+
+
 def tool_changed(name, meta, base_meta):
     for rx, tool in TOOL_OF:
         if re.fullmatch(rx, name):
@@ -1075,7 +1105,12 @@ def compare(run, base, noise):
             bv = base.get("metrics_best", {}).get(name, bv)
         rel = (v - bv) / abs(bv) if bv else 0.0
         verdict = ""
-        if tainted(cur["metrics"], name):
+        rule = cpu_rule_changed(name, cur["metrics"], run.meta, bm, base["meta"])
+        if rule:
+            verdict = (f"not comparable: msi-drag.py counted it by CPU rule {rule[1]:g}, the baseline by "
+                       f"rule {rule[0]:g}")
+            items.pop("metric." + name, None)
+        elif tainted(cur["metrics"], name):
             leg = "boot" if name.startswith("shared.") else "bench"
             verdict = f"TAINTED: {getattr(run, 'taint', {}).get(leg, 'tainted')}, not compared"
             if g:
