@@ -447,15 +447,28 @@ inline bool rgfxSurfaceRevives(const RgfxSurfaceEntry &e, const void *cache, boo
 	return e.used && e.dormant && cache != nullptr && e.cache == cache && cacheKept;
 }
 
+// Which dormant entries rgfxSurfaceOldestDormant looks at.
+enum RgfxDormantKind : uint32_t {
+	// Every one.
+	kRgfxDormantAny = 0,
+	// The deferred ones alone, whose bytes count against the deferred cap.
+	kRgfxDormantDeferredOnly,
+	// Those not deferred, whose pages are wired: a deferred one's going lets none go.
+	kRgfxDormantWiredOnly,
+};
+
 // The dormant entry to go first, or -1: the oldest of those whose surfaces are volatile, else
-// the oldest; of the deferred ones alone where `deferredOnly`. One still pending, its last
-// holder's BLOCK_UNSHARE not yet posted, is not let go, so no BLOCK_RELEASE overtakes that.
-inline int32_t rgfxSurfaceOldestDormant(const RgfxSurfaceTable &t, bool deferredOnly = false)
+// the oldest; of those of `kind` alone. One still pending, its last holder's BLOCK_UNSHARE not
+// yet posted, is not let go, so no BLOCK_RELEASE overtakes that.
+inline int32_t rgfxSurfaceOldestDormant(const RgfxSurfaceTable &t,
+                                        RgfxDormantKind kind = kRgfxDormantAny)
 {
 	int32_t oldest = -1;
 	for (uint32_t i = 0; i < t.capacity; i++) {
 		const RgfxSurfaceEntry &e = t.entries[i];
-		if (!e.used || !e.dormant || e.pending || (deferredOnly && !e.deferred))
+		if (!e.used || !e.dormant || e.pending ||
+		    (kind == kRgfxDormantDeferredOnly && !e.deferred) ||
+		    (kind == kRgfxDormantWiredOnly && e.deferred))
 			continue;
 		const RgfxSurfaceEntry *o = oldest < 0 ? nullptr : &t.entries[oldest];
 		if (o == nullptr || (e.purgeable && !o->purgeable) ||
@@ -466,17 +479,19 @@ inline int32_t rgfxSurfaceOldestDormant(const RgfxSurfaceTable &t, bool deferred
 }
 
 // The dormant entry to let go while the dormant blocks pass kRgfxDormantMaxBlocks or `maxBytes`
-// of pages, the first to go (rgfxSurfaceOldestDormant), and why; -1 within both.
+// of wired pages, the first to go (rgfxSurfaceOldestDormant), and why; -1 within both. Past the
+// bytes alone, the first of those not deferred: a deferred one's bytes are not wired.
 inline int32_t rgfxSurfaceOverCaps(const RgfxSurfaceTable &t, uint64_t maxBytes,
                                    RgfxDormantCause *why)
 {
-	if (t.dormantCount > kRgfxDormantMaxBlocks)
+	if (t.dormantCount > kRgfxDormantMaxBlocks) {
 		*why = kRgfxDormantCount;
-	else if (t.dormantBytes > maxBytes)
-		*why = kRgfxDormantBytes;
-	else
+		return rgfxSurfaceOldestDormant(t);
+	}
+	if (t.dormantBytes <= maxBytes)
 		return -1;
-	return rgfxSurfaceOldestDormant(t);
+	*why = kRgfxDormantBytes;
+	return rgfxSurfaceOldestDormant(t, kRgfxDormantWiredOnly);
 }
 
 // The dormant deferred entry to let go while their bytes pass `maxBytes`, half the device's
@@ -487,7 +502,7 @@ inline int32_t rgfxSurfaceOverDeferredCap(const RgfxSurfaceTable &t, uint64_t ma
 	if (t.dormantDeferredBytes <= maxBytes)
 		return -1;
 	*why = kRgfxDormantDeferredBytes;
-	return rgfxSurfaceOldestDormant(t, true);
+	return rgfxSurfaceOldestDormant(t, kRgfxDormantDeferredOnly);
 }
 
 // What an ask whose new block found no room in the region does next. Before its first wait

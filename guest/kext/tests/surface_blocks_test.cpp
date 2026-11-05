@@ -212,11 +212,23 @@ void deferred()
 	check(t.deferredBytes == kTwoPlanes + kBgra4k &&
 	          t.dormantDeferredBytes == kTwoPlanes + kBgra4k && t.dormantBytes == 0x4000,
 	      "each counted where it belongs");
-	check(rgfxSurfaceOldestDormant(t) == 1 && rgfxSurfaceOldestDormant(t, true) == 0,
+	check(rgfxSurfaceOldestDormant(t) == 1 &&
+	          rgfxSurfaceOldestDormant(t, kRgfxDormantDeferredOnly) == 0 &&
+	          rgfxSurfaceOldestDormant(t, kRgfxDormantWiredOnly) == 1,
 	      "the oldest of all, and of the deferred");
 	check(rgfxSurfaceOverDeferredCap(t, kBgra4k, &why) == 0 && why == kRgfxDormantDeferredBytes,
 	      "past half the budget, the oldest deferred goes");
 	check(rgfxSurfaceOverCaps(t, 0x4000, &why) == -1, "the wired cap still holds");
+	// The deferred ones older, or volatile: past the wired pages' cap the block not deferred
+	// goes, the only one whose going lets wired pages go, never a deferred one first.
+	old.dormantSeq = t.dormantSeq + 1;
+	check(rgfxSurfaceOverCaps(t, 0x3fff, &why) == 1 && why == kRgfxDormantBytes,
+	      "past the wired cap, the oldest wired block, not an older deferred one");
+	d.purgeable = true;
+	check(rgfxSurfaceOverCaps(t, 0x3fff, &why) == 1 && why == kRgfxDormantBytes,
+	      "nor a volatile deferred one");
+	d.purgeable = false;
+	old.dormantSeq = 0;
 	rgfxSurfaceClear(t, d);
 	check(t.deferredBytes == kBgra4k && t.dormantDeferredBytes == kBgra4k && t.dormantCount == 2,
 	      "a deferred block let go leaves both counts");
