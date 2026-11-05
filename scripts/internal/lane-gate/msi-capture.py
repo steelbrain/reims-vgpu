@@ -26,8 +26,12 @@ CAPTURE_MAX_S seconds (default 600) after QEMU's start, and writes into RUNDIR/c
                                    bytes equal the frame before; its header line says the block,
                                    the offset, length, stride, rows and mode
   shots     the guest's own screenshots (Command-Shift-3 over QMP, the system's screenshot, which
-            WindowServer composes as the screen shows) once a second from the host's first
-            present on: shots.tsv "EPOCH SEQ" a key sent (msi-boot.sh copies the PNGs back).
+            WindowServer composes as the screen shows) once a second from the user's desktop on
+            (capture/desktop-up, which msi-boot.sh writes once WindowServer, Dock and Finder run;
+            with CAPTURE_FROM_NOW, one written after this capture started): shots.tsv "EPOCH SEQ"
+            a key sent (msi-boot.sh copies the PNGs back). Never during the boot or the login: the
+            keys hold Shift, and macOS skips its automatic login where Shift is held as the login
+            window comes up.
 
 Both write capture/NAME.done ("frames=N distinct=M ..."), and the scanout's files are given to the
 user sudo ran it for.
@@ -214,23 +218,17 @@ def scanout(pid, t_end):
 
 
 def shots(pid, t_end):
-    # From the host's first present on: WindowServer draws the screen from then.
-    lp = os.path.join(B, "launch.log")
-    off0 = 0
-    if FROM_NOW:  # at a restart: the first present after it
-        try:
-            off0 = os.path.getsize(lp)
-        except OSError:
-            pass
+    # From the user's desktop on (capture/desktop-up): a key sent during the login, Shift held,
+    # stops macOS's automatic login.
+    up, t0 = os.path.join(C, "desktop-up"), time.time()
     while time.time() < t_end and not os.path.exists(STOP):
         try:
-            with open(lp, errors="replace") as f:
-                f.seek(off0)
-                if "the display shows IOSurface" in f.read():
-                    break
+            if not FROM_NOW or os.path.getmtime(up) >= t0:
+                os.stat(up)
+                break
         except OSError:
             pass
-        time.sleep(0.2)
+        time.sleep(0.5)
     idx = open(os.path.join(C, "shots.tsv"), "w")
     n, fails = 0, 0
     nxt = time.time()

@@ -278,9 +278,10 @@ touch "$R/.start"
 # The boot capture (CAPTURE=1, msi-capture.py): the guest's scanout read from QEMU's memory every
 # CAPTURE_MS (default 100) ms from QEMU's start to the host's first present of an IOSurface (from
 # there the display's content is in the host's device caches, and the scanout is not drawn), and
-# the guest's screenshots once a second from that present until CAPTURE_SETTLE_S (default 60)
-# seconds after the desktop is up, where the Dock has settled (below). The scanout's reader runs as
-# root, for /proc/PID/mem.
+# the guest's screenshots once a second from the desktop (WindowServer, Dock and Finder up: Shift
+# held during the login stops macOS's automatic login) until CAPTURE_SETTLE_S (default 60) seconds
+# after it, where the Dock has settled (below). The scanout's reader runs as root, for
+# /proc/PID/mem.
 CAPPIDS=()
 # A cold pipeline cache (COLD_CACHE=KEY) and a command at QEMU's start (QEMU_HOOK_B64): msi-launch.sh's
 # run.sh execs a wrapper, which execs QEMU in turn, so QEMU keeps run.sh's pid (msi-launch.sh
@@ -451,6 +452,8 @@ desktop || { log "BOOT_FAIL no desktop (WindowServer, Dock, Finder) in 3 min"; e
 [[ -n $T_QEMU ]] && kv desktop_s "$(sub "$(date +%s.%N | cut -c1-14)" "$T_QEMU")"
 log "desktop up"
 T_DESK=$(date +%s)
+# The capture's screenshots start here (msi-capture.py shots), never during the login.
+[[ ${CAPTURE:-0} == 1 ]] && touch "$R/capture/desktop-up"
 # The kext's lines: its IOLog lines reach only the kernel's ring (dmesg, 128 KiB, which a busy
 # desktop's other lines fill in a minute or two), no log stream. From the desktop on, the ring's
 # Rgfx, RGFX and ReimsGraphics lines are taken every 5 s into kring.raw ("[UPTIME]: LINE"), in the
