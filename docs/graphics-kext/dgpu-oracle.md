@@ -10,7 +10,7 @@ stricter than the M3's, guests may rely on it.
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
-`oracle_icb`, `oracle_order` and `oracle_names`; the upload costs (Q17) are
+`oracle_icb`, `oracle_order`, `oracle_names` and `oracle_surftex`; the upload costs (Q17) are
 `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
@@ -891,6 +891,61 @@ size of its aperture), and the Intel 630's publishes none. Neither does the stoc
 framebuffer, in a macOS 26 x86 guest. Ours publishes none, as the Intel's does: IOFramebuffer's own
 setup, for a new mode too, gets no VRAM range (`ReimsGraphics.cpp`, getVRAMRange). Both answers are
 inside the envelope *(class 2)*.
+
+## Q20: which textures over an IOSurface Metal makes, answers nil for, or ends the process at
+
+Probe: `oracle_surftex DEVICE`, 11-05, each of its 151 cases in a child process of its own, with
+`MTL_DEBUG_LAYER` unset. `newTextureWithDescriptor:iosurface:plane:` over a 64 x 64 surface:
+`'BGRA'`, `'RGhA'` and `'L008'` made without planes (`IOSurfaceCreate`, as WindowServer's
+surfaces are), `'BGRA'` of one plane, `'BGRA'` without planes of 512-byte rows, and a `420v`
+CVPixelBuffer's two planes. Each case changes one thing of a 2D texture of the plane's own size
+and format: the plane, the size, the type, depth, array length, levels and samples, the format,
+the usage, the storage, CPU cache and hazard tracking modes, and the swizzle.
+
+The AMD and the Intel 630 gave the same answer at every case. Where the process ends, Metal's
+assertion lists every rule of one step a descriptor breaks, a line each. There are three steps:
+
+| step | what ends the process there (AMD and Intel 630) | M3 |
+|---|---|---|
+| the descriptor's validation, `-[MTLTextureDescriptorInternal validateWithDevice:]`, over every surface | a width or height of 0; a format the device lacks, named by number ("has invalid pixelFormat (40)": B5G6R5, BGRA10_XR, BGR10_XR, Invalid, and the two-plane Y'CbCr 500); a depth, array length or sample count above 1 that the type does not allow, the type named ("requests a depth of 2 but the texture type MTLTextureType2DArray requires that depth is 1"); a multisample texture of one sample, or in Shared or Managed storage; Memoryless storage; a depth or stencil format in Shared or Managed storage; a 4:2:2 format of an odd width ("MTLPixelFormat422 requires even width.") | the same, but it makes B5G6R5, BGR10_XR, the Y'CbCr formats (Q13) and Memoryless textures, and passes multisample ones in Managed storage on to the next step |
+| the surface's rows, `_mtlValidateStrideTextureParameters`, over a surface without planes | a type other than 2D or TextureBuffer; a depth other than 1; more than one level; rows of a format of one texel a block wider than the surface's `bytesPerRow` ("bytesPerRow (256) must be greater or equal to (260) bytes"); a depth or stencil format ("cannot create compressed, depth, or stencil textures", though BC1 and BC7 pass) | the same, in the same words |
+| the texture's place, `-[MTLIOAccelTexture initWithDevice:descriptor:iosurface:plane:...]`, over a surface without planes | a plane other than 0 ("IOSurface is non-planar, but plane 2 specified"); a compressed format's rows, in blocks, wider than the surface's ("Descriptor rowBytes (264) > IOSurface rowBytes (256)" at BC1 132 wide); more rows than the surface's, a compressed format's in texels ("Descriptor height*arrayLength > IOSurface height") | the same, `IOGPUMetalTexture`'s |
+
+Over a plane of a surface with planes only the first step applies on the x86 Macs: a texture
+wider or taller than its plane, of another format's bytes, of any type (1D, 2DArray, Cube, 3D of
+depth 2, TextureBuffer, 2DMultisample in Private storage), mipmapped, of Depth32Float in Private
+storage or of BC1 is made. The M3 makes the same but the Cube, at which its own assertion ends the
+process ("carriesComplexTexture || numFaces == 1"), and the BC1, for which it answers nil. A plane
+past a planar surface's planes answers nil on all three. All three make the formats of one texel a
+block whose rows fit, a surface of 512-byte rows taking a texture 128 wide, the 4:2:2 formats of
+an even width (an odd height too, as a render target as well), every usage (usage 0 answers 0x17),
+every storage but Memoryless, and every CPU cache and hazard tracking mode and swizzle; and a
+TextureBuffer of one row. The x86 Macs make BC1 and BC7 textures wherever their rows fit, where the
+M3 answers nil, over a surface with planes or without, in Managed or Private storage. The M3
+answers nil for a render target of the 4:2:0 Y'CbCr format 500 of an odd width or height.
+
+The two x86 GPUs differ only in the words at `Depth24Unorm_Stencil8` in Managed storage: the
+AMD's are the depth formats' storage rule, the Intel's "invalid pixelFormat (255)", as the Intel
+lacks the format.
+
+What our stack does:
+- *(class 3)* The device's creator ends the process at every rule the x86 Macs end it at, with
+  their words, before it sends the host anything (`rgfxEndAtInvalidSurfaceTexture`,
+  RgfxTexture.h). The bundle had sent each of these to the host, posted, and answered a texture;
+  the host refused most, and the guest's command buffers naming the texture then failed.
+- The two-plane Y'CbCr formats stay the M3's (Q13), but for a render target of 4:2:0 or 4:2:2
+  chroma at an odd width or height. The x86 Macs end at it, as at every texture of the formats
+  ("invalid pixelFormat (500)."), and neither the M3 (nil) nor the host makes one, so the process
+  ends there with the x86 Macs' words.
+- *(outside the envelope, the host's limit)* A block-compressed format over a surface answers
+  nil (`RgfxIOSurfaceTexture`). Both x86 Macs make it wherever its rows fit, but the host makes no
+  texture of one over a surface's rows (metal2vulkan's `NotLinear`), and a texture the host then
+  refused would fail every command buffer naming it. It is the host runtime's gap.
+- What the x86 Macs make, the host also refuses in places: over a planar surface's plane, a
+  texture wider than its rows or taller than the plane, a mipmapped one, and one of a type other
+  than 2D (all made on the M3 too, but the Cube); and a TextureBuffer over any surface. The bundle
+  sends these, posted, and the host's refusal fails the command buffers that name them
+  (`refused.rs`). They are the host runtime's gaps.
 
 ## Not measured
 
