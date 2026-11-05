@@ -3139,7 +3139,7 @@ void test_library_members_as_metal()
 // type is 2, Dynamic and the install name they hold, which its shadow answers, nil with none.
 void test_library_type_and_install_name()
 {
-	Fixture fx;
+	Fixture fx(0x40000); // the five libraries' bytes fit
 	const char *path = getenv("RGFX_STITCHABLE");
 	CHECK(path != nullptr);
 	if (path == nullptr)
