@@ -27,6 +27,15 @@
 //             status then (and the long buffer's), whether its scheduled handler had run by
 //             then, when that handler runs, and how long waitUntilScheduled blocks right after
 //             the call.
+//   events    when the CPU sees a shared event's signal encoded between two ~100 ms kernels of
+//             one command buffer, 10 runs: a listener's block (notifyListener:atValue:block:), a
+//             thread polling signaledValue and a thread in waitUntilSignaledValue:timeoutMS:,
+//             against the buffer's GPUStartTime, GPUEndTime and completed handler; a buffer that
+//             signals 1 after a ~50 ms kernel and then waits for 2 before another, where the CPU
+//             waits for 1 and only then sets 2 (from the waiting thread, and from a listener's
+//             block), 10 runs each: whether the wait for 1 returned, when, and when the buffer
+//             completed; and a signal at the very end of a buffer, 20 runs: its listener's block
+//             against the buffer's completed handler. Times are ms from the commit.
 // Build: see README.md.
 #import "oracle_common.h"
 #include <dispatch/dispatch.h>
@@ -633,6 +642,203 @@ static void case_submitted(void)
 	}
 }
 
+enum { EVENT_RUNS = 10, END_SIGNAL_RUNS = 20 };
+
+// A command buffer of `parts` ~`iters` kernels, with `between` encoded after each but the last.
+static id<MTLCommandBuffer> parts_cb(id<MTLBuffer> big, uint32_t iters, int parts,
+                                     void (^between)(id<MTLCommandBuffer>, int))
+{
+	id<MTLCommandBuffer> cb = [Q commandBuffer];
+	for (int k = 0; k < parts; k++) {
+		id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+		enc_slow(e, big, iters);
+		[e endEncoding];
+		if (k + 1 < parts && between)
+			between(cb, k);
+	}
+	return cb;
+}
+
+static void print_status_counts(int *status)
+{
+	printf("    status at the end:");
+	for (int i = 0; i < 6; i++)
+		if (status[i])
+			printf(" %s %d", status_name(i), status[i]);
+	printf("\n");
+}
+
+static void case_events(void)
+{
+	gSlow = cpipe("slow_write");
+	if (!gSlow)
+		return;
+	id<MTLBuffer> big = [D newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+	// Calibrate one kernel near 100 ms.
+	uint32_t iters = 2000;
+	double gpu = 0;
+	for (int k = 0; k < 6; k++) {
+		oracle_commit_wait(long_cb(Q, big, iters), NULL, &gpu);
+		if ((gpu > 75 && gpu < 150) || k == 5)
+			break;
+		iters = (uint32_t)(iters * (100.0 / (gpu > 0.5 ? gpu : 0.5)));
+	}
+	printf("case events: one kernel %u iterations = %.1f ms GPU\n", iters, gpu);
+	MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] init];
+	dispatch_queue_t gq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+
+	printf("  1. kernel, signal 1, kernel in one buffer, %d runs (ms from the commit)\n", EVENT_RUNS);
+	{
+		double start[EVENT_RUNS], end[EVENT_RUNS], heard[EVENT_RUNS], polled[EVENT_RUNS];
+		double waited[EVENT_RUNS], done[EVENT_RUNS], heard_gpu[EVENT_RUNS], left[EVENT_RUNS];
+		int missed = 0;
+		for (int k = 0; k < EVENT_RUNS; k++) {
+			id<MTLSharedEvent> ev = [D newSharedEvent];
+			id<MTLCommandBuffer> cb = parts_cb(big, iters, 2, ^(id<MTLCommandBuffer> c, int _) {
+				[c encodeSignalEvent:ev value:1];
+			});
+			__block volatile double tl = 0, tc = 0, tp = 0, tw = 0;
+			[ev notifyListener:listener
+			           atValue:1
+			             block:^(id<MTLSharedEvent> _e, uint64_t _v) { tl = oracle_now_ms(); }];
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> _) { tc = oracle_now_ms(); }];
+			dispatch_group_t g = dispatch_group_create();
+			double t0 = oracle_now_ms();
+			[cb commit];
+			dispatch_group_async(g, gq, ^{
+				while (ev.signaledValue < 1 && oracle_now_ms() - t0 < 5000)
+					;
+				tp = oracle_now_ms();
+			});
+			dispatch_group_async(g, gq, ^{
+				if ([ev waitUntilSignaledValue:1 timeoutMS:5000])
+					tw = oracle_now_ms();
+			});
+			[cb waitUntilCompleted];
+			dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC));
+			usleep(5000);
+			if (tl == 0 || tw == 0)
+				missed++;
+			double c0 = t0 / 1e3;
+			start[k] = (cb.GPUStartTime - c0) * 1e3;
+			end[k] = (cb.GPUEndTime - c0) * 1e3;
+			heard[k] = tl - t0;
+			polled[k] = tp - t0;
+			waited[k] = tw - t0;
+			done[k] = tc - t0;
+			heard_gpu[k] = heard[k] - start[k];
+			left[k] = done[k] - heard[k];
+			usleep(5000);
+		}
+		print_ms("GPUStartTime", start, EVENT_RUNS);
+		print_ms("signaledValue first reads 1 (polling)", polled, EVENT_RUNS);
+		print_ms("waitUntilSignaledValue:1 returns", waited, EVENT_RUNS);
+		print_ms("the listener's block runs", heard, EVENT_RUNS);
+		print_ms("  the same, from GPUStartTime", heard_gpu, EVENT_RUNS);
+		print_ms("GPUEndTime", end, EVENT_RUNS);
+		print_ms("the completed handler runs", done, EVENT_RUNS);
+		print_ms("  completed handler after the listener's block", left, EVENT_RUNS);
+		printf("    runs where the listener or the wait missed the signal: %d of %d\n", missed,
+		       EVENT_RUNS);
+	}
+
+	static const char *const pattern_names[] = {
+	    "2. kernel, signal 1, wait for 2, kernel; the CPU waits for 1 (waitUntilSignaledValue), then sets 2",
+	    "3. the same; a listener's block for 1 sets 2",
+	};
+	for (int s = 0; s < 2; s++) {
+		printf("  %s, %d runs (ms from the commit)\n", pattern_names[s], EVENT_RUNS);
+		double reached_at[EVENT_RUNS], set_at[EVENT_RUNS], done[EVENT_RUNS], end[EVENT_RUNS];
+		int reached = 0, completed = 0, status[6] = {0};
+		for (int k = 0; k < EVENT_RUNS; k++) {
+			id<MTLSharedEvent> ev = [D newSharedEvent];
+			id<MTLCommandBuffer> cb = parts_cb(big, iters / 2, 2, ^(id<MTLCommandBuffer> c, int _) {
+				[c encodeSignalEvent:ev value:1];
+				[c encodeWaitForEvent:ev value:2];
+			});
+			dispatch_semaphore_t fin = dispatch_semaphore_create(0);
+			__block volatile double tc = 0, tr = 0, ts = 0;
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> _) {
+				tc = oracle_now_ms();
+				dispatch_semaphore_signal(fin);
+			}];
+			double t0 = oracle_now_ms();
+			if (s == 1)
+				[ev notifyListener:listener
+				           atValue:1
+				             block:^(id<MTLSharedEvent> e, uint64_t _v) {
+					             tr = oracle_now_ms();
+					             e.signaledValue = 2;
+					             ts = oracle_now_ms();
+				             }];
+			[cb commit];
+			if (s == 0) {
+				BOOL got = [ev waitUntilSignaledValue:1 timeoutMS:5000];
+				tr = got ? oracle_now_ms() : 0;
+				ev.signaledValue = 2; // set whatever the wait answered, so the buffer ends
+				ts = oracle_now_ms();
+			} else {
+				for (int w = 0; w < 500 && ts == 0; w++)
+					usleep(10000);
+				if (ts == 0) {
+					ev.signaledValue = 2;
+					ts = oracle_now_ms();
+				}
+			}
+			if (dispatch_semaphore_wait(fin, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) == 0)
+				completed++;
+			reached += tr != 0;
+			status[cb.status < 6 ? cb.status : 5]++;
+			reached_at[k] = tr ? tr - t0 : -1;
+			set_at[k] = ts - t0;
+			done[k] = tc ? tc - t0 : -1;
+			end[k] = (cb.GPUEndTime - t0 / 1e3) * 1e3;
+			usleep(5000);
+		}
+		print_ms("the CPU sees 1", reached_at, EVENT_RUNS);
+		print_ms("the CPU has set 2", set_at, EVENT_RUNS);
+		print_ms("GPUEndTime", end, EVENT_RUNS);
+		print_ms("the completed handler runs", done, EVENT_RUNS);
+		printf("    the CPU saw 1 before setting 2: %d of %d; completed within 10 s: %d of %d\n",
+		       reached, EVENT_RUNS, completed, EVENT_RUNS);
+		print_status_counts(status);
+	}
+
+	printf("  4. kernel, then signal 1 as the buffer's last command, %d runs (ms from the commit)\n",
+	       END_SIGNAL_RUNS);
+	{
+		double heard[END_SIGNAL_RUNS], done[END_SIGNAL_RUNS], gap[END_SIGNAL_RUNS];
+		double end[END_SIGNAL_RUNS];
+		int before = 0;
+		for (int k = 0; k < END_SIGNAL_RUNS; k++) {
+			id<MTLSharedEvent> ev = [D newSharedEvent];
+			id<MTLCommandBuffer> cb = parts_cb(big, iters / 2, 1, nil);
+			[cb encodeSignalEvent:ev value:1];
+			__block volatile double tl = 0, tc = 0;
+			[ev notifyListener:listener
+			           atValue:1
+			             block:^(id<MTLSharedEvent> _e, uint64_t _v) { tl = oracle_now_ms(); }];
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> _) { tc = oracle_now_ms(); }];
+			double t0 = oracle_now_ms();
+			[cb commit];
+			[cb waitUntilCompleted];
+			for (int w = 0; w < 100 && (tl == 0 || tc == 0); w++)
+				usleep(1000);
+			before += tl != 0 && tl <= tc;
+			heard[k] = tl - t0;
+			done[k] = tc - t0;
+			gap[k] = tc - tl;
+			end[k] = (cb.GPUEndTime - t0 / 1e3) * 1e3;
+			usleep(5000);
+		}
+		print_ms("GPUEndTime", end, END_SIGNAL_RUNS);
+		print_ms("the listener's block runs", heard, END_SIGNAL_RUNS);
+		print_ms("the completed handler runs", done, END_SIGNAL_RUNS);
+		print_ms("  completed handler after the listener's block", gap, END_SIGNAL_RUNS);
+		printf("    the listener's block ran first: %d of %d\n", before, END_SIGNAL_RUNS);
+	}
+}
+
 static int run_case(int argc, char **argv)
 {
 	L = oracle_library(D, gArgv0, "oracle");
@@ -644,6 +850,8 @@ static int run_case(int argc, char **argv)
 		case_timing();
 	else if (!strcmp(argv[0], "submitted"))
 		case_submitted();
+	else if (!strcmp(argv[0], "events"))
+		case_events();
 	else
 		return 2;
 	return 0;
@@ -664,7 +872,7 @@ int main(int argc, char **argv)
 	}
 	oracle_header("oracle_cmdbuf", D);
 	D = nil;
-	static const char *const all[] = {"hazards", "timing", "submitted"};
+	static const char *const all[] = {"hazards", "timing", "submitted", "events"};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 && strcmp(argv[2], all[i]))
 			continue;
