@@ -187,12 +187,12 @@ inline RgfxPipeSends rgfxPipeSends(bool showsSurface, bool setsColor)
 }
 
 // Whether a transaction that sends `sends` completes at the host's answer to it, once the display
-// shows it; the others complete with the transaction before them, or at once where none is
-// outstanding (RgfxPipeTransactions.hpp). A present that keeps the surface completes with the
-// transaction before it.
+// shows it: a surface's, and a colour's kept present, at the refresh that shows the colour. One
+// that sends nothing completes with the transaction before it, or at once where none is
+// outstanding (RgfxPipeTransactions.hpp).
 inline bool rgfxPipeWaitsForAnswer(RgfxPipeSends sends)
 {
-	return sends == RgfxPipeSends::Surface;
+	return sends != RgfxPipeSends::Nothing;
 }
 
 #endif // RGFX_PIPE_COLOR_HPP_

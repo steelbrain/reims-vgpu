@@ -578,7 +578,7 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 	}
 	const RgfxPipeSends sends =
 	    rgfxPipeSends(planeType == kPlaneIOSurface && surface != 0, colored);
-	if (sends == RgfxPipeSends::Nothing) {
+	if (!rgfxPipeWaitsForAnswer(sends)) {
 		// Nothing for the host to show: the display keeps its surface, and the transaction is
 		// done with the last one before it (at once where none is outstanding).
 		Transactions::Completion now = {};
@@ -621,14 +621,7 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 		IOLog("RGFX pipe: transaction %u: PRESENT_SURFACE not sent: 0x%x\n", id, r);
 		return r;
 	}
-	if (!rgfxPipeWaitsForAnswer(sends)) {
-		// Done with the transaction before it, or at once, as one with nothing to show.
-		Transactions::Completion now = {};
-		if (transactions.nothingToShow(id, cookie, notified, &now))
-			completeLocked(now, mach_absolute_time());
-		IOLockUnlock(lock);
-		return kIOReturnSuccess;
-	}
+	// Done at the host's answer: the display shows its surface, or its colour, from then.
 	transactions.sent(seqno, id, cookie, notified);
 	IOLockUnlock(lock);
 	return kIOReturnSuccess;

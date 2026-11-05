@@ -27,7 +27,8 @@
  * transaction, and its submit sends each staged table, and the colour matrix where its dirty mask
  * has the matrix's bit, as DISPLAY_COLOR parts before its PRESENT_SURFACE. A begin drops what the
  * transaction before it staged and never submitted. A transaction with no IOSurface that sets a
- * colour goes as a PRESENT_SURFACE that keeps the surface shown (RGFX_PRESENT_KEEP). Where the
+ * colour goes as a PRESENT_SURFACE that keeps the surface shown (RGFX_PRESENT_KEEP), and
+ * completes when the host answers it, at the refresh that shows the colour. Where the
  * host did not take the feature, 5 and 6 are refused as unsupported, and 7 takes no structure.
  *
  * A submitted transaction's plane 0, where it is an IOSurface, goes to the host on the control

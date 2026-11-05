@@ -174,10 +174,10 @@ static void sends()
 	CHECK(rgfxPipeSends(true, true) == RgfxPipeSends::Surface);
 	CHECK(rgfxPipeSends(false, true) == RgfxPipeSends::Keep);
 	CHECK(rgfxPipeSends(false, false) == RgfxPipeSends::Nothing);
-	// A surface's present completes at the host's answer; a colour alone with the transaction
-	// before it.
+	// A surface's present and a colour's kept present complete at the host's answer, once the
+	// display shows them; nothing sent, with the transaction before it.
 	CHECK(rgfxPipeWaitsForAnswer(RgfxPipeSends::Surface));
-	CHECK(!rgfxPipeWaitsForAnswer(RgfxPipeSends::Keep));
+	CHECK(rgfxPipeWaitsForAnswer(RgfxPipeSends::Keep));
 	CHECK(!rgfxPipeWaitsForAnswer(RgfxPipeSends::Nothing));
 }
 
