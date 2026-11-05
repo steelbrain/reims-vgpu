@@ -8,8 +8,9 @@
 // from tests/air_arguments_old.metal for macOS 10.12 (RGFX_AIR_ARGUMENTS_OLD); every node of an
 // entry point whole (rgfxReadAirEntries), over the oracle probe's library (RGFX_ORACLE_REFLECTION,
 // built from tools/oracle/oracle_reflection.metal); no answer, nor a crash, for bytes that are
-// not such a module; and every function of the repo's committed .metallibs found by the read the
-// device makes for its kind (RGFX_COMMITTED_METALLIBS).
+// not such a module; one read of each module answering what the three readers answer, and the
+// process's cache of those reads (RgfxAirModuleCache); and every function of the repo's committed
+// .metallibs found by the read the device makes for its kind (RGFX_COMMITTED_METALLIBS).
 #include "RgfxAirArguments.hpp"
 #include "RgfxFunctionConstants.hpp"
 
@@ -22,8 +23,103 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
+// What the readers answer, compared whole: every field, a shared layout or node by its value.
+static bool operator==(const RgfxAirArgument &a, const RgfxAirArgument &b);
+static bool operator==(const RgfxAirConstant &a, const RgfxAirConstant &b);
+static bool operator==(const RgfxAirFunction &a, const RgfxAirFunction &b);
+static bool operator==(const RgfxAirType &a, const RgfxAirType &b);
+static bool operator==(const RgfxAirField &a, const RgfxAirField &b);
+static bool operator==(const RgfxAirVisible &a, const RgfxAirVisible &b);
+static bool operator==(const RgfxAirOutput &a, const RgfxAirOutput &b);
+static bool operator==(const RgfxAirMember &a, const RgfxAirMember &b);
+static bool operator==(const RgfxAirNode &a, const RgfxAirNode &b);
+static bool operator==(const RgfxAirEntry &a, const RgfxAirEntry &b);
+static bool operator==(const RgfxAirEntries &a, const RgfxAirEntries &b);
+
+template <class T>
+static bool sameValue(const std::shared_ptr<const T> &a, const std::shared_ptr<const T> &b)
+{
+	return a == nullptr ? b == nullptr : b != nullptr && *a == *b;
+}
+
+static bool operator==(const RgfxAirArgument &a, const RgfxAirArgument &b)
+{
+	return a.kind == b.kind && a.index == b.index && a.count == b.count && a.access == b.access &&
+	       a.writesTextures == b.writesTextures && a.anyIndex == b.anyIndex && a.anyCount == b.anyCount;
+}
+
+static bool operator==(const RgfxAirConstant &a, const RgfxAirConstant &b)
+{
+	return a.name == b.name && a.type == b.type && a.index == b.index && a.required == b.required;
+}
+
+static bool operator==(const RgfxAirFunction &a, const RgfxAirFunction &b)
+{
+	return a.name == b.name && a.stage == b.stage && a.arguments == b.arguments && a.constants == b.constants &&
+	       a.constantsRead == b.constantsRead;
+}
+
+static bool operator==(const RgfxAirType &a, const RgfxAirType &b)
+{
+	return a.kind == b.kind && a.scalar == b.scalar && a.size == b.size && a.align == b.align &&
+	       a.addressSpace == b.addressSpace && a.count == b.count && a.rows == b.rows && a.packed == b.packed &&
+	       a.shape == b.shape && a.depth == b.depth && a.access == b.access && a.name == b.name &&
+	       a.fields == b.fields && a.element == b.element;
+}
+
+static bool operator==(const RgfxAirField &a, const RgfxAirField &b)
+{
+	return a.name == b.name && a.offset == b.offset && a.type == b.type;
+}
+
+static bool operator==(const RgfxAirVisible &a, const RgfxAirVisible &b)
+{
+	return a.name == b.name && a.signature == b.signature && a.returnsVoid == b.returnsVoid &&
+	       a.returnType == b.returnType && a.argumentNames == b.argumentNames && a.argumentTypes == b.argumentTypes &&
+	       a.constants == b.constants && a.constantsRead == b.constantsRead;
+}
+
+static bool operator==(const RgfxAirOutput &a, const RgfxAirOutput &b)
+{
+	return a.kind == b.kind && a.typeName == b.typeName && a.name == b.name;
+}
+
+static bool operator==(const RgfxAirMember &a, const RgfxAirMember &b)
+{
+	return a.offset == b.offset && a.size == b.size && a.arrayLength == b.arrayLength && a.typeName == b.typeName &&
+	       a.name == b.name && sameValue(a.layout, b.layout) && sameValue(a.indirect, b.indirect) &&
+	       a.hasFirstId == b.hasFirstId && a.firstId == b.firstId && a.hasRenderTarget == b.hasRenderTarget &&
+	       a.hasRasterOrderGroup == b.hasRasterOrderGroup && a.renderTarget == b.renderTarget &&
+	       a.rasterOrderGroup == b.rasterOrderGroup;
+}
+
+static bool operator==(const RgfxAirNode &a, const RgfxAirNode &b)
+{
+	return a.hasPosition == b.hasPosition && a.position == b.position && a.kind == b.kind &&
+	       a.predicated == b.predicated && a.predicate == b.predicate && a.hasLocation == b.hasLocation &&
+	       a.indexIsGlobal == b.indexIsGlobal && a.index == b.index && a.count == b.count && a.access == b.access &&
+	       a.hasAddressSpace == b.hasAddressSpace && a.hasBufferSize == b.hasBufferSize &&
+	       a.hasTypeSize == b.hasTypeSize && a.hasTypeAlign == b.hasTypeAlign && a.addressSpace == b.addressSpace &&
+	       a.bufferSize == b.bufferSize && a.typeSize == b.typeSize && a.typeAlign == b.typeAlign &&
+	       a.typeName == b.typeName && a.name == b.name && a.unused == b.unused && sameValue(a.layout, b.layout) &&
+	       a.hasMesh == b.hasMesh && a.meshVertexData == b.meshVertexData &&
+	       a.meshPrimitiveData == b.meshPrimitiveData && a.meshVertices == b.meshVertices &&
+	       a.meshPrimitives == b.meshPrimitives && a.meshTopology == b.meshTopology;
+}
+
+static bool operator==(const RgfxAirEntry &a, const RgfxAirEntry &b)
+{
+	return a.name == b.name && a.stage == b.stage && a.outputs == b.outputs && a.arguments == b.arguments;
+}
+
+static bool operator==(const RgfxAirEntries &a, const RgfxAirEntries &b)
+{
+	return a.entries == b.entries && a.constants == b.constants;
+}
 
 namespace {
 int checks = 0;
@@ -166,6 +262,39 @@ std::vector<uint8_t> moduleBytes(const std::vector<uint8_t> &lib, const std::str
 	if (!rgfxMetallibBitcode(lib.data(), lib.size(), name, &bc, &n))
 		return {};
 	return std::vector<uint8_t>(bc, bc + n);
+}
+
+// One read of each function's module answers what each of the three readers answers for it, and
+// the process's cache hands out that answer. Answers how many modules it compared.
+size_t moduleReadsAsReaders(const std::vector<uint8_t> &lib, const std::string &what)
+{
+	size_t compared = 0;
+	for (const Listed &f : listed(lib)) {
+		const std::vector<uint8_t> bc = moduleBytes(lib, f.name);
+		if (bc.empty())
+			continue;
+		RgfxAirModule once;
+		rgfxReadAirModule(bc.data(), bc.size(), once);
+		std::vector<RgfxAirFunction> fns;
+		std::vector<RgfxAirVisible> vis;
+		RgfxAirEntries entries;
+		const bool fnsRead = rgfxReadAirFunctions(bc.data(), bc.size(), fns);
+		const bool visRead = rgfxReadAirVisible(bc.data(), bc.size(), vis);
+		const bool entriesRead = rgfxReadAirEntries(bc.data(), bc.size(), entries);
+		check(once.functionsRead == fnsRead && once.functions == fns,
+		      what + " " + f.name + ": one read's arguments are rgfxReadAirFunctions'");
+		check(once.visibleRead == visRead && once.visible == vis,
+		      what + " " + f.name + ": one read's visible functions are rgfxReadAirVisible's");
+		check(once.entriesRead == entriesRead && once.entries == entries,
+		      what + " " + f.name + ": one read's nodes are rgfxReadAirEntries'");
+		const std::shared_ptr<const RgfxAirModule> kept = rgfxAirModules().moduleOf(bc.data(), bc.size());
+		check(kept != nullptr && kept->functionsRead == fnsRead && kept->functions == fns &&
+		          kept->visibleRead == visRead && kept->visible == vis && kept->entriesRead == entriesRead &&
+		          kept->entries == entries,
+		      what + " " + f.name + ": the process's read is the same");
+		compared++;
+	}
+	return compared;
 }
 
 // The .metallib files of the directory `dir`, by name.
@@ -1019,6 +1148,80 @@ int main()
 				read++;
 		}
 		check(true, "4000 spoilt modules' nodes read without a crash (" + std::to_string(read) + " answered)");
+	}
+
+	// One read of each module answers what the three readers answer for it, over every library
+	// above, and so does the process's cache of modules.
+	{
+		const char *oldPath = std::getenv("RGFX_AIR_ARGUMENTS_OLD");
+		const size_t compared = moduleReadsAsReaders(lib, "air_arguments") +
+		                        moduleReadsAsReaders(readFile(oldPath), "air_arguments_old") +
+		                        moduleReadsAsReaders(oracle, "oracle_reflection");
+		std::printf("air_arguments_test: one read of each module: %zu modules compared\n", compared);
+		check(compared >= 40, "every module compared (" + std::to_string(compared) + ")");
+	}
+
+	// The cache: equal bytes, at any address, are read once and share their read; it keeps the
+	// most recently looked-up modules while their bytes fit its budget, reads one it let go again,
+	// and keeps none larger than the budget. A read it let go stays valid while it is held.
+	{
+		std::vector<std::vector<uint8_t>> three = {moduleBytes(lib, "every_access"),
+		                                           moduleBytes(lib, "reads_in_vertex"),
+		                                           moduleBytes(lib, "writes_in_fragment")};
+		std::sort(three.begin(), three.end(),
+		          [](const std::vector<uint8_t> &x, const std::vector<uint8_t> &y) { return x.size() > y.size(); });
+		const std::vector<uint8_t> &a = three[0], &b = three[1], &c = three[2]; // a the largest
+		check(!c.empty() && a != b && b != c && a != c, "three modules to keep");
+		const std::vector<uint8_t> a2 = a; // the same bytes at another address
+		RgfxAirModuleCache cache(a.size() + b.size());
+		const auto pa = cache.moduleOf(a.data(), a.size());
+		check(pa != nullptr && cache.reads() == 1 && cache.kept() == 1 && cache.keptBytes() == a.size(),
+		      "the first lookup reads the module, and keeps it");
+		check(cache.moduleOf(a2.data(), a2.size()) == pa && cache.reads() == 1,
+		      "equal bytes at another address: the same read, not read again");
+		RgfxAirModule direct;
+		rgfxReadAirModule(a.data(), a.size(), direct);
+		check(pa->functionsRead == direct.functionsRead && pa->functions == direct.functions &&
+		          pa->visibleRead == direct.visibleRead && pa->visible == direct.visible &&
+		          pa->entriesRead == direct.entriesRead && pa->entries == direct.entries,
+		      "the read kept is rgfxReadAirModule's");
+		const auto pb = cache.moduleOf(b.data(), b.size());
+		check(pb != pa && cache.reads() == 2 && cache.kept() == 2 && cache.keptBytes() == a.size() + b.size(),
+		      "other bytes are read, and kept");
+		check(cache.moduleOf(a.data(), a.size()) == pa && cache.reads() == 2, "a, looked up again");
+		const auto pc = cache.moduleOf(c.data(), c.size());
+		check(cache.reads() == 3 && cache.kept() == 2 && cache.keptBytes() == a.size() + c.size(),
+		      "c past the budget lets b go, the least recently looked up");
+		check(cache.moduleOf(c.data(), c.size()) == pc && cache.moduleOf(a.data(), a.size()) == pa &&
+		          cache.reads() == 3,
+		      "a and c are kept");
+		const auto pb2 = cache.moduleOf(b.data(), b.size());
+		check(pb2 != pb && cache.reads() == 4 && cache.kept() == 2 && cache.keptBytes() == a.size() + b.size(),
+		      "b, let go, is read again, and lets c go");
+		check(pb->functions == pb2->functions && pb->entries == pb2->entries && pb->visible == pb2->visible,
+		      "a read let go stays valid while it is held, and is the same as the new one");
+		RgfxAirModuleCache tiny(a.size() - 1);
+		const auto big = tiny.moduleOf(a.data(), a.size());
+		check(big != nullptr && big->functions == pa->functions && tiny.kept() == 0 && tiny.keptBytes() == 0,
+		      "a module larger than the budget is read, not kept");
+		check(tiny.moduleOf(a.data(), a.size()) != big && tiny.reads() == 2, "and is read at each lookup");
+		// Threads looking up one module at once: every one is answered the read kept.
+		RgfxAirModuleCache shared(1u << 20);
+		std::vector<std::shared_ptr<const RgfxAirModule>> got(8);
+		std::vector<std::thread> threads;
+		for (size_t i = 0; i < got.size(); i++)
+			threads.emplace_back([&, i] { got[i] = shared.moduleOf(a.data(), a.size()); });
+		for (std::thread &t : threads)
+			t.join();
+		check(std::all_of(got.begin(), got.end(), [&](const auto &m) { return m != nullptr && m == got[0]; }) &&
+		          shared.reads() >= 1 && shared.reads() <= got.size() && shared.kept() == 1 &&
+		          shared.moduleOf(a2.data(), a2.size()) == got[0],
+		      "threads looking up one module at once share one read");
+		// The process's own, which every library reads through.
+		const uint64_t before = rgfxAirModules().reads();
+		const auto p1 = rgfxAirModules().moduleOf(a.data(), a.size());
+		check(rgfxAirModules().moduleOf(a2.data(), a2.size()) == p1 && rgfxAirModules().reads() - before <= 1,
+		      "the process's cache reads a module once");
 	}
 
 	// Every function of the repo's committed .metallibs (RGFX_COMMITTED_METALLIBS: the suite's

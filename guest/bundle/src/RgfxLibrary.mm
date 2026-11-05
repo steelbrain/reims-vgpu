@@ -346,7 +346,10 @@ std::shared_ptr<const FunctionTable> functionTableOf(const uint8_t *bytes, size_
 	BOOL _madeFromURL; // newLibraryWithURL:'s, which Metal does not serialize
 	NSString *_fileName; // the last part of newLibraryWithURL:'s URL, nil for any other
 	BOOL _dynamic;       // a dynamic library's bytes (rgfxMetallibIsDynamic)
-	std::mutex _airLock; // guards _air and _visible
+	std::mutex _airLock; // guards the four below
+	// The module `_source` holds for each function a read below asked for, by name, as the process
+	// read it (rgfxAirModules), with why there is none (null where there is one).
+	std::map<std::string, std::pair<std::shared_ptr<const RgfxAirModule>, const char *>> _modules;
 	// Each entry point's arguments read from its bitcode in `_source`, by name, once each: null
 	// where they did not read.
 	std::map<std::string, std::shared_ptr<const RgfxAirFunction>> _air;
@@ -564,22 +567,26 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	return logged.insert(name).second;
 }
 
-// Reads the module the library holds for the function `name`, from the bytes it was made from,
-// with `read`; false where the library kept no bytes (one Metal's link or stitching made), with
-// `*why` null, or where it holds no module for the function or `read` says false, with `*why`
-// saying so.
-- (bool)rgfxReadModuleOf:(const std::string &)name
-                    with:(bool (^)(const uint8_t *bitcode, size_t size))read
-                     why:(const char **)why
+// The module the library holds for the function `name`, in the bytes it was made from, as the
+// process read it (rgfxAirModules: one read for every library over equal bytes), once for the
+// library: null where the library kept no bytes (one Metal's link or stitching made), with `*why`
+// null, or where it holds no bitcode for the function, with `*why` saying so. Called holding
+// _airLock.
+- (std::shared_ptr<const RgfxAirModule>)rgfxModuleOf:(const std::string &)name why:(const char **)why
 {
 	*why = nullptr;
+	auto known = _modules.find(name);
+	if (known != _modules.end()) {
+		*why = known->second.second;
+		return known->second.first;
+	}
 	dispatch_data_t source = nil;
 	{
 		std::lock_guard<std::mutex> shadowHold(_shadowLock);
 		source = _source;
 	}
 	if (source == nil)
-		return false;
+		return nullptr;
 	const void *mapped = nullptr;
 	size_t size = 0;
 	dispatch_data_t map = dispatch_data_create_map(source, &mapped, &size);
@@ -588,37 +595,33 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	rgfxMetallibAirSlice(bytes, size);
 	const uint8_t *bitcode = nullptr;
 	size_t bitcodeSize = 0;
-	if (map == nil || !rgfxMetallibBitcode(bytes, size, name, &bitcode, &bitcodeSize)) {
+	std::shared_ptr<const RgfxAirModule> module;
+	if (map == nil || !rgfxMetallibBitcode(bytes, size, name, &bitcode, &bitcodeSize))
 		*why = "the library holds no bitcode for it";
-		return false;
-	}
-	if (!read(bitcode, bitcodeSize)) {
-		*why = "its module did not read";
-		return false;
-	}
-	return true;
+	else
+		module = rgfxAirModules().moduleOf(bitcode, bitcodeSize);
+	_modules.emplace(name, std::make_pair(module, *why));
+	return module;
 }
 
 // The arguments of the entry point `name`, read from its bitcode in the bytes the library was
-// made from, once: null where the library kept no bytes (one Metal's link or stitching made), or
-// they do not read, so which textures the function writes is unknown.
+// made from (rgfxModuleOf:why:), once: null where the library kept no bytes (one Metal's link or
+// stitching made), or they do not read, so which textures the function writes is unknown.
 - (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunctionNamed:(const std::string &)name
 {
 	std::lock_guard<std::mutex> hold(_airLock);
 	auto known = _air.find(name);
 	if (known != _air.end())
 		return known->second;
-	__block std::vector<RgfxAirFunction> read;
 	const char *why = nullptr;
+	std::shared_ptr<const RgfxAirModule> module = [self rgfxModuleOf:name why:&why];
 	std::shared_ptr<const RgfxAirFunction> air;
-	if ([self rgfxReadModuleOf:name
-	                      with:^bool(const uint8_t *bitcode, size_t size) {
-		                      return rgfxReadAirFunctions(bitcode, size, read);
-	                      }
-	                       why:&why]) {
-		for (RgfxAirFunction &f : read) {
+	if (module != nullptr && !module->functionsRead) {
+		why = "its module did not read";
+	} else if (module != nullptr) {
+		for (const RgfxAirFunction &f : module->functions) {
 			if (f.name == name) {
-				air = std::make_shared<const RgfxAirFunction>(std::move(f));
+				air = std::shared_ptr<const RgfxAirFunction>(module, &f);
 				break;
 			}
 		}
@@ -639,19 +642,17 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	auto known = _entries.find(name);
 	if (known != _entries.end())
 		return known->second;
-	__block RgfxAirEntries read;
 	const char *why = nullptr;
+	std::shared_ptr<const RgfxAirModule> module = [self rgfxModuleOf:name why:&why];
 	std::shared_ptr<const RgfxAirEntries> entries;
-	if ([self rgfxReadModuleOf:name
-	                      with:^bool(const uint8_t *bitcode, size_t size) {
-		                      return rgfxReadAirEntries(bitcode, size, read);
-	                      }
-	                       why:&why]) {
-		for (RgfxAirEntry &e : read.entries) {
+	if (module != nullptr && !module->entriesRead) {
+		why = "its module did not read";
+	} else if (module != nullptr) {
+		for (const RgfxAirEntry &e : module->entries.entries) {
 			if (e.name == name) {
 				auto one = std::make_shared<RgfxAirEntries>();
-				one->entries.push_back(std::move(e));
-				one->constants = std::move(read.constants);
+				one->entries.push_back(e);
+				one->constants = module->entries.constants;
 				entries = std::move(one);
 				break;
 			}
@@ -674,17 +675,15 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	auto known = _visible.find(name);
 	if (known != _visible.end())
 		return known->second;
-	__block std::vector<RgfxAirVisible> read;
 	const char *why = nullptr;
+	std::shared_ptr<const RgfxAirModule> module = [self rgfxModuleOf:name why:&why];
 	std::shared_ptr<const RgfxAirVisible> visible;
-	if ([self rgfxReadModuleOf:name
-	                      with:^bool(const uint8_t *bitcode, size_t size) {
-		                      return rgfxReadAirVisible(bitcode, size, read);
-	                      }
-	                       why:&why]) {
-		for (RgfxAirVisible &v : read) {
+	if (module != nullptr && !module->visibleRead) {
+		why = "its module did not read";
+	} else if (module != nullptr) {
+		for (const RgfxAirVisible &v : module->visible) {
 			if (v.name == name) {
-				visible = std::make_shared<const RgfxAirVisible>(std::move(v));
+				visible = std::shared_ptr<const RgfxAirVisible>(module, &v);
 				break;
 			}
 		}

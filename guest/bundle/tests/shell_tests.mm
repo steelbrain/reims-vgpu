@@ -3446,6 +3446,110 @@ void test_library_air_arguments()
 	      !rgfxAirUnreadFirstLog("no_function_of_this_name"));
 }
 
+} // namespace
+
+// The library's own readers of a function's AIR, which its functions and pipelines call.
+@interface RgfxLibrary (AirReads)
+- (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunctionNamed:(const std::string &)name;
+- (std::shared_ptr<const RgfxAirVisible>)rgfxAirVisibleNamed:(const std::string &)name;
+@end
+
+namespace {
+
+// Libraries over equal bytes share their functions' AIR reads, each module read once for the
+// process (rgfxAirModules): an entry point's arguments and nodes and a visible function's
+// signature come from one read of its module, and a second library over the same bytes at another
+// address (a framework's library made again by another of its objects) reads none again. The
+// lookups an app's launch makes, its functions and their pipelines' reflection over two such
+// libraries, read each module at most once, where each library read it for each kind it asked.
+void test_libraries_over_equal_bytes_share_their_air_reads()
+{
+	Fixture fx(0x40000); // the library's bytes fit
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	NSData *copy = [NSData dataWithBytes:bytes.bytes length:bytes.length]; // at another address
+	CHECK(bytes.length > 0 && copy.bytes != bytes.bytes);
+	auto make = [&](NSData *b) {
+		uint32_t status = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:b.bytes
+		                                         length:b.length
+		                                            key:nullptr
+		                                         device:nil
+		                                     serializer:&fx.ser
+		                                         status:&status];
+		[lib rgfxSetSource:dispatch_data_create(b.bytes, b.length, nil, ^{
+			     (void)b;
+		     })
+		       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+			       return nil;
+		       }];
+		drainRing(fx.ring);
+		return lib;
+	};
+	RgfxLibrary *first = make(bytes);
+	RgfxLibrary *second = make(copy);
+	CHECK(first != nil && second != nil);
+	if (first == nil || second == nil)
+		return;
+	// Each library's lookups: every function's, as the app makes them, and an entry point's nodes,
+	// as its pipelines' reflection asks. Answers how many reads the library's lookups would be,
+	// one per kind of each function, read for that library alone.
+	auto lookUp = [&](RgfxLibrary *lib, size_t *entryPoints, size_t *visibles) {
+		size_t kinds = 0;
+		*entryPoints = *visibles = 0;
+		for (NSString *name in first.functionNames) {
+			RgfxFunction *fn = (RgfxFunction *)[lib newFunctionWithName:name];
+			const std::string n = name.UTF8String;
+			const MTLFunctionType type = fn.functionType;
+			if (type == MTLFunctionTypeVertex || type == MTLFunctionTypeFragment || type == MTLFunctionTypeKernel) {
+				CHECK([fn rgfxAirFunction] == [lib rgfxAirFunctionNamed:n]);
+				(void)[lib rgfxAirEntryNamed:n];
+				kinds += 2;
+				(*entryPoints)++;
+			} else if (type == MTLFunctionTypeVisible) {
+				(void)[lib rgfxAirVisibleNamed:n];
+				kinds++;
+				(*visibles)++;
+			}
+		}
+		return kinds;
+	};
+	const uint64_t before = rgfxAirModules().reads();
+	size_t entryPoints = 0, visibles = 0;
+	const size_t firstKinds = lookUp(first, &entryPoints, &visibles);
+	const uint64_t afterFirst = rgfxAirModules().reads();
+	const size_t secondKinds = lookUp(second, &entryPoints, &visibles);
+	const uint64_t afterSecond = rgfxAirModules().reads();
+	CHECK(entryPoints >= 8 && visibles >= 8);
+	// Earlier tests read some of these modules: the first library's lookups read at most one
+	// module per function.
+	CHECK(afterFirst - before <= entryPoints + visibles);
+	CHECK(afterSecond == afterFirst); // the second library reads nothing
+	NSLog(@"RGFX test: %zu functions over two libraries: %zu lookups, each a read for its library "
+	      @"alone; %llu modules read",
+	      entryPoints + visibles, firstKinds + secondKinds,
+	      static_cast<unsigned long long>(afterSecond - before));
+	// The same reads, shared: one object for both libraries.
+	size_t shared = 0;
+	for (NSString *name in first.functionNames) {
+		const std::string n = name.UTF8String;
+		const auto a = [first rgfxAirFunctionNamed:n], b = [second rgfxAirFunctionNamed:n];
+		const auto va = [first rgfxAirVisibleNamed:n], vb = [second rgfxAirVisibleNamed:n];
+		CHECK(a == b && va == vb);
+		const auto ea = [first rgfxAirEntryNamed:n], eb = [second rgfxAirEntryNamed:n];
+		CHECK((ea == nullptr) == (eb == nullptr));
+		if (ea != nullptr && eb != nullptr)
+			CHECK(ea->entries.size() == 1 && eb->entries.size() == 1 && ea->entries[0].name == n &&
+			      eb->entries[0].name == n && ea->entries[0].arguments.size() == eb->entries[0].arguments.size() &&
+			      ea->constants == eb->constants);
+		shared += (a != nullptr) + (va != nullptr);
+	}
+	CHECK(shared >= 16);
+}
+
 // A stitched library kept in a binary archive is found as Metal's archive finds one (measured:
 // macOS 27, M3 Max): a create that fails on a miss is made where an archive of the descriptor
 // holds the same graphs over the same functions, in any order and of any library over the same
@@ -13912,6 +14016,7 @@ int main(int argc, char **argv)
 		test_stitched_library_over_shadows();
 		test_stitched_dag_over_shadows();
 		test_library_air_arguments();
+		test_libraries_over_equal_bytes_share_their_air_reads();
 		test_source_compiles_through_metals_frontend();
 		test_function_array_library_holds_the_functions();
 		test_package_libraries_answer_metals_refusals();

@@ -1351,14 +1351,10 @@ bool layoutOf(const Module &m, uint64_t id, unsigned depth,
 	return true;
 }
 
-} // namespace
-
-bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAirVisible> &out)
+// The visible functions of the module `m` (rgfxReadAirVisible).
+bool visibleOf(const Module &m, std::vector<RgfxAirVisible> &out)
 {
 	out.clear();
-	Module m;
-	if (!readModule(bitcode, size, m))
-		return false;
 	auto it = m.named.find("air.visible");
 	if (it == m.named.end())
 		return true;
@@ -1383,12 +1379,10 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 	return true;
 }
 
-bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxAirFunction> &out)
+// The entry points' arguments of the module `m` (rgfxReadAirFunctions).
+bool functionsOf(const Module &m, std::vector<RgfxAirFunction> &out)
 {
 	out.clear();
-	Module m;
-	if (!readModule(bitcode, size, m))
-		return false;
 	static const struct {
 		const char *name;
 		RgfxAirStage stage;
@@ -1415,12 +1409,10 @@ bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxA
 	return true;
 }
 
-bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out)
+// The entry points' nodes whole of the module `m` (rgfxReadAirEntries).
+bool entriesOf(const Module &m, RgfxAirEntries &out)
 {
 	out = {};
-	Module m;
-	if (!readModule(bitcode, size, m))
-		return false;
 	static const struct {
 		const char *name;
 		RgfxAirEntryStage stage;
@@ -1479,6 +1471,98 @@ bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out
 		}
 	}
 	return true;
+}
+
+} // namespace
+
+bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAirVisible> &out)
+{
+	out.clear();
+	Module m;
+	return readModule(bitcode, size, m) && visibleOf(m, out);
+}
+
+bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxAirFunction> &out)
+{
+	out.clear();
+	Module m;
+	return readModule(bitcode, size, m) && functionsOf(m, out);
+}
+
+bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out)
+{
+	out = {};
+	Module m;
+	return readModule(bitcode, size, m) && entriesOf(m, out);
+}
+
+void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out)
+{
+	out = {};
+	Module m;
+	if (!readModule(bitcode, size, m))
+		return;
+	out.functionsRead = functionsOf(m, out.functions);
+	out.visibleRead = visibleOf(m, out.visible);
+	out.entriesRead = entriesOf(m, out.entries);
+}
+
+std::shared_ptr<const RgfxAirModule> RgfxAirModuleCache::moduleOf(const uint8_t *bitcode, size_t size)
+{
+	const std::string_view key(reinterpret_cast<const char *>(bitcode), bitcode != nullptr ? size : 0);
+	{
+		std::lock_guard<std::mutex> hold(lock_);
+		auto found = byBytes_.find(key);
+		if (found != byBytes_.end()) {
+			order_.splice(order_.begin(), order_, found->second);
+			return found->second->module;
+		}
+	}
+	auto read = std::make_shared<RgfxAirModule>();
+	rgfxReadAirModule(bitcode, size, *read);
+	std::shared_ptr<const RgfxAirModule> module = std::move(read);
+	std::lock_guard<std::mutex> hold(lock_);
+	reads_++;
+	auto found = byBytes_.find(key);
+	if (found != byBytes_.end()) {
+		// Another thread read the same bytes meanwhile: its read is the one kept.
+		order_.splice(order_.begin(), order_, found->second);
+		return found->second->module;
+	}
+	order_.push_front(Kept{std::string(key), module});
+	byBytes_.emplace(std::string_view(order_.front().bytes), order_.begin());
+	keptBytes_ += key.size();
+	while (keptBytes_ > budget_ && !order_.empty()) {
+		const Kept &last = order_.back();
+		keptBytes_ -= last.bytes.size();
+		byBytes_.erase(std::string_view(last.bytes));
+		order_.pop_back();
+	}
+	return module;
+}
+
+uint64_t RgfxAirModuleCache::reads() const
+{
+	std::lock_guard<std::mutex> hold(lock_);
+	return reads_;
+}
+
+size_t RgfxAirModuleCache::kept() const
+{
+	std::lock_guard<std::mutex> hold(lock_);
+	return order_.size();
+}
+
+size_t RgfxAirModuleCache::keptBytes() const
+{
+	std::lock_guard<std::mutex> hold(lock_);
+	return keptBytes_;
+}
+
+RgfxAirModuleCache &rgfxAirModules()
+{
+	static auto *modules = new RgfxAirModuleCache(kRgfxAirModuleCacheBytes);
+	return *modules;
 }
 
 namespace {

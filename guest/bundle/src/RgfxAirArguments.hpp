@@ -44,8 +44,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 enum class RgfxAirStage : uint8_t { Kernel, Vertex, Fragment };
@@ -310,6 +314,67 @@ struct RgfxAirEntries {
 // of each whole. False where it is not one the reader can follow, or a node or layout is not one
 // it knows the form of; `out` then holds nothing.
 bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out);
+
+// --- One read of a module, kept for the process -----------------------------------------------
+
+// What the three readers above answer for one module, from one read of its bitstream: each
+// `...Read` and its value are what that reader returns and puts in `out` for the same bytes.
+struct RgfxAirModule {
+	bool functionsRead = false;
+	std::vector<RgfxAirFunction> functions; // rgfxReadAirFunctions
+	bool visibleRead = false;
+	std::vector<RgfxAirVisible> visible; // rgfxReadAirVisible
+	bool entriesRead = false;
+	RgfxAirEntries entries; // rgfxReadAirEntries
+};
+
+// Reads the AIR module at `bitcode` (as rgfxReadAirFunctions takes it) once, into `out`.
+void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out);
+
+// The modules a process read, by their bytes: a module's reads are a function of its bytes alone,
+// so every lookup of equal bytes, from any library over them, shares one read. It keeps the most
+// recently looked-up modules, a copy of each one's bytes (its key, compared whole) with its
+// reads, while those bytes total at most `budget`; a module it let go is read again at its next
+// lookup. The reads it hands out stay valid while a holder keeps them. Safe on any thread; two
+// threads that look up one module at once may each read it, and both are answered the first read
+// kept.
+class RgfxAirModuleCache {
+public:
+	explicit RgfxAirModuleCache(size_t budget) : budget_(budget) {}
+	RgfxAirModuleCache(const RgfxAirModuleCache &) = delete;
+	RgfxAirModuleCache &operator=(const RgfxAirModuleCache &) = delete;
+
+	// The reads of the module at `bitcode`: those kept for equal bytes, else read now (and kept).
+	std::shared_ptr<const RgfxAirModule> moduleOf(const uint8_t *bitcode, size_t size);
+
+	// How many modules it read, how many it keeps, and their bytes (tests).
+	uint64_t reads() const;
+	size_t kept() const;
+	size_t keptBytes() const;
+
+private:
+	struct Kept {
+		std::string bytes;
+		std::shared_ptr<const RgfxAirModule> module;
+	};
+	using Order = std::list<Kept>;
+	mutable std::mutex lock_;
+	Order order_; // the most recently looked up first
+	std::unordered_map<std::string_view, Order::iterator> byBytes_; // views of each Kept's bytes
+	size_t keptBytes_ = 0;
+	uint64_t reads_ = 0;
+	const size_t budget_;
+};
+
+// The bytes of modules the process keeps (rgfxAirModules). measured: the 40,177 distinct modules
+// of macOS 27's frameworks' .metallibs on the M3 Max are 11,072 bytes each on average, so this
+// keeps about 1,500 such modules.
+constexpr size_t kRgfxAirModuleCacheBytes = 16u << 20;
+
+// The process's cache of modules, of kRgfxAirModuleCacheBytes, which every library reads its
+// functions' modules through; never destroyed, as a library may be freed on any thread while the
+// process exits.
+RgfxAirModuleCache &rgfxAirModules();
 
 // Narrows a universal .metallib (a big-endian fat header: magic CA FE BA BE, or CA FE BA BF with
 // 64-bit offsets) to its slice of generic AIR bitcode, a .metallib itself; other bytes, and a
