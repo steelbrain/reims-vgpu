@@ -3027,7 +3027,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// is let go of where no view needs it; the message sees it from now on.
     fn put(&self, obj_id: u64, entry: Entry<P>) {
         let context = self.context_made(context_of(obj_id));
-        let (at, replaced) = context.insert(obj_id, entry);
+        let (at, replaced) = context.insert(obj_id, entry, self.view_at(&context));
         self.saw(&context, obj_id, Some(at));
         // As a store over a live id let go of what it named.
         drop(replaced.map(tables::Removed::into_entry));
@@ -3040,7 +3040,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(context) = self.context_made_if(context_of(obj_id), &live) else {
             return;
         };
-        if let Some((at, replaced)) = context.insert_if(obj_id, entry, &live) {
+        if let Some((at, replaced)) = context.insert_if(obj_id, entry, self.view_at(&context), &live) {
             self.saw(&context, obj_id, Some(at));
             drop(replaced.map(tables::Removed::into_entry));
         }
@@ -3057,9 +3057,19 @@ impl<P: Platform> GraphicsDecoder<P> {
             return;
         };
         self.forget_library(obj_id);
-        let (at, replaced) = context.insert(obj_id, entry);
+        let (at, replaced) = context.insert(obj_id, entry, self.view_at(&context));
         self.saw(&context, obj_id, Some(at));
         drop(replaced.map(tables::Removed::into_entry));
+    }
+
+    /// The clock of the message's view of `context`'s table, where it took one: a make of the
+    /// message's is named by that view ([`Self::saw`]), so it is kept for it ([`tables`]).
+    fn view_at(&self, context: &Arc<Context<P>>) -> Option<u64> {
+        let views = self.views.borrow();
+        views
+            .iter()
+            .find(|v| Arc::ptr_eq(v.context(), context))
+            .map(View::at)
     }
 
     /// The message's own change of `obj_id` in `context`'s table: made at `at`, or removed.
@@ -3076,8 +3086,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Removes what `obj_id` names (an `OBJECT_DESTROY`): its CPU copy and then its object are let
-    /// go of, each in a refusal scope ([`drop_refused`]), at once, or where a view taken before
-    /// needs it, once that view closes ([`tables`]); a texture's surface names are forgotten. A
+    /// go of, each in a refusal scope ([`drop_refused`]), at once, or where an open view names
+    /// it, once the last such view closes ([`tables`]); a texture's surface names are forgotten. A
     /// buffer over a block's surface view is let go of on the surface worker, where it may be the
     /// last hold of the view's mapping ([`surface_pages`]), and a video session on the video worker
     /// ([`video::SessionHold`]).

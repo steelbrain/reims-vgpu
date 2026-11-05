@@ -21,11 +21,15 @@
 //! a lock held.
 //!
 //! **When an entry goes.** An entry removed (a destroy, an id made again, the context's close or
-//! the device's reset) while a view taken before the removal is open is kept on the table's gone
-//! list, where only such views find it, and let go of when the last of them closes, on that view's
-//! thread, in the order the entries were removed: as an object destroyed after a whole message
-//! under one lock is let go of after it. Else it is let go of at once, by whoever removed it. Each
-//! release is made in a refusal scope ([`super::drop_refused`]).
+//! the device's reset) while a view that names it is open is kept on the table's gone list, where
+//! only such views find it, and let go of when the last of them closes, on that view's thread,
+//! with the others it frees in the order they were removed: as an object destroyed after a whole
+//! message under one lock is let go of after it. A view names an entry where it was taken at or
+//! after the entry's make, or by the message that made it ([`View::made`]), and before its removal.
+//! Else it is let go of at once, by whoever removed it, as one is that only a view taken before its
+//! make saw nothing of: an older view open meanwhile (a message that waits) keeps only what it
+//! names, so the list holds no more than the open views name. Each release is made in a refusal
+//! scope ([`super::drop_refused`]).
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -140,6 +144,9 @@ pub(crate) struct Entry<P: Platform> {
     pub(crate) icb_dropped: Option<Box<super::icb::Dropped>>,
     /// The table's clock at its make.
     made: u64,
+    /// The first clock of a view that names it: its make's, or the making message's view's where
+    /// that was taken before ([`Context::insert`]'s `seen_from`).
+    seen: u64,
 }
 
 impl<P: Platform> Entry<P> {
@@ -156,6 +163,7 @@ impl<P: Platform> Entry<P> {
             over_view: false,
             icb_dropped: None,
             made: 0,
+            seen: 0,
         }
     }
 
@@ -291,29 +299,33 @@ impl<P: Platform> Tables<P> {
         })
     }
 
-    /// Removes `owned`, `id`'s entry: onto the gone list where a view is open (each was taken
-    /// before this), else handed back to let go of.
+    /// Removes `owned`, `id`'s entry: onto the gone list where an open view names it (each open
+    /// view was taken before this), else handed back to let go of.
     fn retire(&mut self, id: u64, owned: Owned<P>) -> Option<Removed<P>> {
         self.clock += 1;
         let removed = Removed { id, owned };
-        if self.views.is_empty() {
+        if self.views.range(removed.owned.entry().seen..).next().is_none() {
             return Some(removed);
         }
         self.gone.push((removed, self.clock));
         None
     }
 
-    /// The gone entries no open view can find any more, in the order removed.
+    /// The gone entries no open view names any more, in the order removed: a view names one where
+    /// it was taken from the entry's `seen` up to its removal.
     fn sweep(&mut self) -> Vec<Removed<P>> {
-        let Some((&oldest, _)) = self.views.first_key_value() else {
+        if self.views.is_empty() {
             return std::mem::take(&mut self.gone)
                 .into_iter()
                 .map(|(r, _)| r)
                 .collect();
-        };
+        }
+        let views = &self.views;
         let (keep, out): (Vec<_>, Vec<_>) = std::mem::take(&mut self.gone)
             .into_iter()
-            .partition(|(_, removed_at)| oldest < *removed_at);
+            .partition(|(r, removed_at)| {
+                views.range(r.owned.entry().seen..*removed_at).next().is_some()
+            });
         self.gone = keep;
         out.into_iter().map(|(r, _)| r).collect()
     }
@@ -345,11 +357,14 @@ impl<P: Platform> Context<P> {
     }
 
     /// Stores `entry` under `id`, in place of what the id named, and the pointer to it; what it
-    /// replaced, to let go of where no view needs it.
-    pub(crate) fn insert(&self, id: u64, mut entry: Entry<P>) -> Made<P> {
+    /// replaced, to let go of where no view needs it. `seen_from` is the clock of the making
+    /// message's view of this table, where it has one ([`View::at`]), which names the entry
+    /// though taken before its make ([`View::made`]).
+    pub(crate) fn insert(&self, id: u64, mut entry: Entry<P>, seen_from: Option<u64>) -> Made<P> {
         let mut t = self.tables.write();
         t.clock += 1;
         entry.made = t.clock;
+        entry.seen = seen_from.map_or(t.clock, |at| at.min(t.clock));
         let owned = Owned::new(entry);
         let at = owned.0;
         let replaced = t.live.insert(id, owned).and_then(|old| t.retire(id, old));
@@ -362,6 +377,7 @@ impl<P: Platform> Context<P> {
         &self,
         id: u64,
         mut entry: Entry<P>,
+        seen_from: Option<u64>,
         live: impl FnOnce() -> bool,
     ) -> Option<Made<P>> {
         let mut t = self.tables.write();
@@ -370,6 +386,7 @@ impl<P: Platform> Context<P> {
         }
         t.clock += 1;
         entry.made = t.clock;
+        entry.seen = seen_from.map_or(t.clock, |at| at.min(t.clock));
         let owned = Owned::new(entry);
         let at = owned.0;
         let replaced = t.live.insert(id, owned).and_then(|old| t.retire(id, old));
@@ -516,6 +533,11 @@ impl<P: Platform> View<P> {
         }
     }
 
+    /// The table's clock at the view's taking.
+    pub(crate) fn at(&self) -> u64 {
+        self.at
+    }
+
     /// The context viewed.
     pub(crate) fn context(&self) -> &Arc<Context<P>> {
         &self.context
@@ -532,10 +554,11 @@ impl<P: Platform> View<P> {
                 Some(found)
             }
         };
-        // SAFETY: the entry was in the table, made by the view's taking, or removed after it, so
-        // it is freed only once no view taken before its removal is open, and this one is until
-        // it drops; or it is the message's own make, removed (if at all) after this view's taking.
-        // Either way it outlives `&self`.
+        // SAFETY: the entry was in the table, made by the view's taking, or removed after it; or
+        // it is the message's own make, whose `seen` is this view's clock or earlier (the
+        // decoder's `view_at`), removed (if at all) after this view's taking. Either way this view
+        // names it, so it is freed only once no such view is open, and this one is until it
+        // drops: it outlives `&self`.
         found.map(|p| unsafe { p.as_ref() })
     }
 
@@ -584,14 +607,14 @@ mod tests {
     fn a_view_sees_the_table_as_of_its_taking() {
         let p = FakePlatform::new();
         let ctx = Arc::new(Context::<FakePlatform>::new(1));
-        let (_, replaced) = ctx.insert(1, Entry::of(fence(&p)));
+        let (_, replaced) = ctx.insert(1, Entry::of(fence(&p)), None);
         assert!(replaced.is_none());
         let view = View::take(Arc::clone(&ctx));
         assert!(
             ctx.remove(1).is_some_and(|(_, now)| now.is_none()),
             "kept for the open view"
         );
-        let (_, replaced) = ctx.insert(2, Entry::of(fence(&p)));
+        let (_, replaced) = ctx.insert(2, Entry::of(fence(&p)), None);
         assert!(replaced.is_none());
         assert!(view.get(1).is_some(), "removed after the view: found");
         assert!(view.get(2).is_none(), "made after the view: not found");
@@ -607,15 +630,115 @@ mod tests {
         assert!(late.get(2).is_some());
     }
 
+    /// One view taken long ago and still open (a message that waits) while frames of messages
+    /// each take a view, remove the objects the frame before made and make as many: the table
+    /// keeps only what an open view can name, the removed objects the old view saw, and every
+    /// frame's removals go with the frame's view.
+    #[test]
+    fn an_old_view_keeps_only_what_it_can_name() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in 0..4 {
+            ctx.insert(id, Entry::of(fence(&p)), None);
+        }
+        let old = View::take(Arc::clone(&ctx));
+        // One object the old view saw, removed while it is open: kept for it.
+        assert!(ctx.remove(0).is_some_and(|(_, now)| now.is_none()));
+        let mut next = 100;
+        for _ in 0..1000 {
+            let frame = View::take(Arc::clone(&ctx));
+            for id in next - 4..next {
+                ctx.remove(id);
+            }
+            for id in next..next + 4 {
+                ctx.insert(id, Entry::of(fence(&p)), None);
+            }
+            next += 4;
+            drop(frame);
+        }
+        assert!(old.get(0).is_some(), "removed after the old view: still found");
+        assert!(old.get(1).is_some(), "live, made before the old view");
+        assert!(old.get(next - 1).is_none(), "made after the old view: not found");
+        assert_eq!(
+            ctx.gone_len(),
+            1,
+            "only the removed object the old view can name is kept"
+        );
+        drop(old);
+        assert_eq!(ctx.gone_len(), 0);
+    }
+
+    /// An object a message made, while its view of the table is open, is named by that view
+    /// though it was made after the view's taking: removed by another message meanwhile, it is
+    /// kept until the maker's view closes.
+    #[test]
+    fn a_message_s_own_make_stays_for_its_view() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        let maker = View::take(Arc::clone(&ctx));
+        let (at, _) = ctx.insert(7, Entry::of(fence(&p)), Some(maker.at()));
+        maker.made(7, at);
+        let other = View::take(Arc::clone(&ctx));
+        assert!(ctx.remove(7).is_some_and(|(_, now)| now.is_none()));
+        drop(other);
+        assert_eq!(ctx.gone_len(), 1, "kept: the maker's view names it");
+        assert!(maker.get(7).is_some());
+        drop(maker);
+        assert_eq!(ctx.gone_len(), 0);
+    }
+
+    /// What frames of messages cost while one old view stays open, over time (a CPU bench, run by
+    /// name with `--ignored`): each frame takes a view, removes the 8 objects the frame before
+    /// made and makes 8, and drops its view; each 2,000 frames, how many removed entries the
+    /// table keeps, a frame's cost, and a lookup's of an id the table never held (a miss looks
+    /// through every kept entry).
+    #[test]
+    #[ignore = "a bench: run it by name"]
+    fn gone_cost_with_an_old_view_open() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        let old = View::take(Arc::clone(&ctx));
+        let mut next = 1_000_000;
+        for round in 1..=10 {
+            let t = std::time::Instant::now();
+            for _ in 0..2000 {
+                let frame = View::take(Arc::clone(&ctx));
+                for id in next - 8..next {
+                    ctx.remove(id);
+                }
+                for id in next..next + 8 {
+                    ctx.insert(id, Entry::of(fence(&p)), None);
+                }
+                next += 8;
+                drop(frame);
+            }
+            let per_frame = t.elapsed() / 2000;
+            let t = std::time::Instant::now();
+            for i in 0..1000u64 {
+                let miss = View::take(Arc::clone(&ctx));
+                assert!(miss.get(5_000_000_000 + i).is_none());
+            }
+            let per_miss = t.elapsed() / 1000;
+            eprintln!(
+                "frames {:6}: gone {:6}, a frame {:9.1?}, a missed lookup in a new view {:9.1?}",
+                round * 2000,
+                ctx.gone_len(),
+                per_frame,
+                per_miss
+            );
+        }
+        drop(old);
+    }
+
     /// An entry removed with no view open is handed back at once, and a view taken after a
     /// removal never keeps it.
     #[test]
     fn an_entry_no_view_needs_is_handed_back() {
         let p = FakePlatform::new();
         let ctx = Arc::new(Context::<FakePlatform>::new(1));
-        ctx.insert(1, Entry::of(fence(&p)));
+        ctx.insert(1, Entry::of(fence(&p)), None);
         assert!(ctx.remove(1).is_some_and(|(_, now)| now.is_some()));
-        ctx.insert(1, Entry::of(fence(&p)));
+        ctx.insert(1, Entry::of(fence(&p)), None);
         let older = View::take(Arc::clone(&ctx));
         assert!(ctx.remove(1).is_some_and(|(_, now)| now.is_none()));
         let newer = View::take(Arc::clone(&ctx));
