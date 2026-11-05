@@ -309,14 +309,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `MANAGED_BUFFER_CREATE`: a `Managed` buffer at the guest's address whose CPU copy is the
     /// first `length` bytes of a `Shared` buffer over the guest's memory the sender holds,
     /// wherever they lie ([`GuestBytes`]): over a block, placed in a heap over one or over a pages
-    /// block's guest RAM, or over a pages block's view. Where the GPU shares the CPU's memory, or
-    /// the platform refuses the GPU's copy, one copy: a buffer of its own over those bytes, which
-    /// keeps the CPU copy's buffer, and so a view its bytes lie in, until the platform frees it.
-    /// Else two: the platform's own `Managed` buffer, filled from the bytes, with the CPU copy's
-    /// buffer kept as its copy. The buffer lies over what its CPU copy lies over. A CPU copy that
-    /// is no such buffer (a `Managed` one, one of the GPU's own memory, a refused one), or is
-    /// shorter than the buffer, is a bad reference; a buffer of no bytes is malformed, and one of
-    /// options other than `Managed` is refused.
+    /// block's guest RAM, or over a pages block's view. Where the GPU shares the CPU's memory, one
+    /// copy: a buffer of its own over those bytes, which keeps the CPU copy's buffer, and so a
+    /// view its bytes lie in, until the platform frees it. Else two: the platform's own `Managed`
+    /// buffer, filled from the bytes, with the CPU copy's buffer kept as its copy, refused where
+    /// the platform refuses that buffer. The buffer lies over what its CPU copy lies over. A CPU
+    /// copy that is no such buffer (a `Managed` one, one of the GPU's own memory, a refused one),
+    /// or is shorter than the buffer, is a bad reference; a buffer of no bytes is malformed, and
+    /// one of options other than `Managed` is refused.
     pub(super) fn managed_buffer_create(
         &self,
         device: &P::Device,
@@ -344,18 +344,17 @@ impl<P: Platform> GraphicsDecoder<P> {
         let span = self.span_of(m.cpu_buffer_obj_id);
         let cpu = cpu.clone_ref();
         let pin = (m.gpu_address != 0).then_some(m.gpu_address);
-        let gpu = match self.unified() {
-            true => None,
-            false => self.gpu_copy(device, m.length, options, pin)?,
-        };
-        let (buffer, cpu) = match gpu {
-            Some(buffer) => {
+        let (buffer, cpu) = match self.unified() {
+            false => {
+                let Some(buffer) = self.gpu_copy(device, m.length, options, pin)? else {
+                    return Ok(Err(DecodeError::Refused));
+                };
                 if !self.fill_gpu_copy(&buffer, bytes.ram, bytes.at, m.length)? {
                     return Ok(Err(DecodeError::Refused));
                 }
                 (buffer, Some(cpu))
             }
-            None => {
+            true => {
                 let Some(buffer) =
                     self.buffer_over_bytes(device, bytes, m.length, options, pin, cpu)?
                 else {
@@ -1705,51 +1704,70 @@ mod tests {
 
     /// `MANAGED_BUFFER_CREATE` on a GPU that shares the CPU's memory: one copy, a no-copy buffer
     /// of the `Managed` options over its CPU copy's buffer's bytes at the guest's address, which
-    /// keeps that buffer. Its range messages and synchronize copy nothing. So does one whose GPU
-    /// copy the platform refuses on a GPU of its own memory.
+    /// keeps that buffer. Its range messages and synchronize copy nothing.
     #[test]
     fn a_managed_buffer_over_a_shared_buffer_on_unified_memory_is_one_copy() {
-        for unified in [true, false] {
-            let (mut r, ram, page) = pages_rig();
-            r.dec.set_unified_memory(unified);
-            let copies = shared_copies(&mut r, &ram, page);
-            for (i, (cpu, first)) in copies.into_iter().enumerate() {
-                let obj_id = 60 + i as u64;
-                if !unified {
-                    r.p.script().push("newBufferWithDescriptor:", Step::Nil);
-                }
-                let mark = r.p.call_log().mark();
-                assert_eq!(r.send(&managed_over(obj_id, cpu, 0x300, MANAGED)), Ok(()));
-                let calls = r.p.call_log().since(mark);
-                let news: Vec<_> = calls.iter().filter(|c| c.sel.starts_with("new")).collect();
-                let pin = 0x1_0000_0000 + obj_id * 0x10_0000;
-                let over = news.last().unwrap();
-                // SAFETY: the range is only formatted.
-                let bytes = unsafe { HostRange::new(HostPtr::from_ptr(first as *mut u8), 0x300) };
-                assert_eq!(
-                    over.args[0],
-                    Arg::val(&BufferDesc {
-                        length: 0x300,
-                        options: vec![OptionSet::ResourceOptions(MANAGED.into())],
-                        pinned_gpu_address: Some(pin),
-                        contents: Some(bytes),
-                        no_copy: true,
-                        deallocator: Some(Box::new(|_, _| {})),
-                    }),
-                    "unified {unified}, copy {cpu}"
-                );
-                let buffer = r.dec.require_buffer(obj_id).unwrap();
-                assert_eq!(buffer.gpu_address(), pin);
-                assert_eq!(buffer.contents().addr(), first);
-                assert!(r.dec.managed_copy(obj_id).unwrap().cpu.is_none());
-                let mark = r.p.call_log().mark();
-                assert_eq!(r.modified(obj_id, 0, 0x300), Ok(()));
-                assert!(r.synchronize(obj_id, RGFX_BLIT_RESOURCE_BUFFER).unwrap());
-                assert_eq!(
-                    r.p.call_log().sels_since(mark),
-                    ["didModifyRange:", "synchronizeResource:"]
-                );
-            }
+        let (mut r, ram, page) = pages_rig();
+        r.dec.set_unified_memory(true);
+        let copies = shared_copies(&mut r, &ram, page);
+        for (i, (cpu, first)) in copies.into_iter().enumerate() {
+            let obj_id = 60 + i as u64;
+            let mark = r.p.call_log().mark();
+            assert_eq!(r.send(&managed_over(obj_id, cpu, 0x300, MANAGED)), Ok(()));
+            let calls = r.p.call_log().since(mark);
+            let news: Vec<_> = calls.iter().filter(|c| c.sel.starts_with("new")).collect();
+            let pin = 0x1_0000_0000 + obj_id * 0x10_0000;
+            let over = news.last().unwrap();
+            // SAFETY: the range is only formatted.
+            let bytes = unsafe { HostRange::new(HostPtr::from_ptr(first as *mut u8), 0x300) };
+            assert_eq!(
+                over.args[0],
+                Arg::val(&BufferDesc {
+                    length: 0x300,
+                    options: vec![OptionSet::ResourceOptions(MANAGED.into())],
+                    pinned_gpu_address: Some(pin),
+                    contents: Some(bytes),
+                    no_copy: true,
+                    deallocator: Some(Box::new(|_, _| {})),
+                }),
+                "copy {cpu}"
+            );
+            let buffer = r.dec.require_buffer(obj_id).unwrap();
+            assert_eq!(buffer.gpu_address(), pin);
+            assert_eq!(buffer.contents().addr(), first);
+            assert!(r.dec.managed_copy(obj_id).unwrap().cpu.is_none());
+            let mark = r.p.call_log().mark();
+            assert_eq!(r.modified(obj_id, 0, 0x300), Ok(()));
+            assert!(r.synchronize(obj_id, RGFX_BLIT_RESOURCE_BUFFER).unwrap());
+            assert_eq!(
+                r.p.call_log().sels_since(mark),
+                ["didModifyRange:", "synchronizeResource:"]
+            );
+        }
+    }
+
+    /// A `MANAGED_BUFFER_CREATE` whose GPU copy the platform refuses on a GPU of its own memory
+    /// is refused, as Metal's answers nil, with no buffer made over its CPU copy in its place.
+    #[test]
+    fn a_managed_buffer_over_a_shared_buffer_the_gpu_has_no_memory_for_is_refused() {
+        let (mut r, ram, page) = pages_rig();
+        r.dec.set_unified_memory(false);
+        let copies = shared_copies(&mut r, &ram, page);
+        for (i, (cpu, _)) in copies.into_iter().enumerate() {
+            let obj_id = 60 + i as u64;
+            r.p.script().push("newBufferWithDescriptor:", Step::Nil);
+            let mark = r.p.call_log().mark();
+            assert_eq!(
+                r.send(&managed_over(obj_id, cpu, 0x300, MANAGED)),
+                Err(DecodeError::Refused),
+                "copy {cpu}"
+            );
+            assert_eq!(
+                made(r.p.call_log().sels_since(mark)),
+                ["newBufferWithDescriptor:"],
+                "copy {cpu}"
+            );
+            assert!(r.dec.named(obj_id).is_none());
         }
     }
 
