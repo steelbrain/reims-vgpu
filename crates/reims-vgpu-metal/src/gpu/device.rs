@@ -406,6 +406,12 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         self.new_command_queue()
     }
 
+    /// No: a Mac's GPU shares the CPU's memory, so the host keeps no device caches to copy
+    /// guest pages into, and Metal has no copy by host addresses.
+    fn copies_guest_ram(&self) -> bool {
+        false
+    }
+
     fn deserialize_compute_pipeline_descriptor(
         &self,
         hold: Hold<'_>,

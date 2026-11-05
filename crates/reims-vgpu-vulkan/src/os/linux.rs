@@ -30,6 +30,9 @@ pub use surface::{LinuxSurface, LinuxSurfaces, attachment};
 pub use threads::LinuxThreads;
 pub use vm::LinuxVm;
 
+pub(crate) use host_ram::{
+    copies as copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over,
+};
 #[cfg(test)]
 pub(crate) use import::views_through_dma_bufs;
 pub(crate) use import::{

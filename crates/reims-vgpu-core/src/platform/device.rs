@@ -106,6 +106,15 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// answers `new_command_queue`'s queue. Never nil-checked; a raise inside it dies at the
     /// call, as one inside `newCommandQueue` does.
     fn new_command_queue_unshared(&self) -> Option<P::CommandQueue>;
+    /// No Metal counterpart: whether the device copies between its buffers and the guest's RAM
+    /// by the RAM's host addresses ([`BlitEncoder::copy_from_guest_ram`],
+    /// [`BlitEncoder::copy_to_guest_ram`]), so a copy of guest pages needs no view of them.
+    /// False where the platform has no such copy; where true, a copy may still be refused, and
+    /// the caller copies another way.
+    ///
+    /// [`BlitEncoder::copy_from_guest_ram`]: super::blit::BlitEncoder::copy_from_guest_ram
+    /// [`BlitEncoder::copy_to_guest_ram`]: super::blit::BlitEncoder::copy_to_guest_ram
+    fn copies_guest_ram(&self) -> bool;
     /// sel: newComputePipelineDescriptorWithSerializedData:deserializationContext: SPI
     /// `data` becomes a `dispatch_data_t` with core's destructor; `context` runs synchronously
     /// during the call. aborts: a malformed or truncated blob, inside Metal's deserializer.

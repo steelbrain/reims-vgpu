@@ -187,6 +187,13 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         }))
     }
 
+    /// Unlogged, as the property the platform answers it from: [`World::copy_guest_ram`].
+    ///
+    /// [`World::copy_guest_ram`]: crate::testkit::objects::World::copy_guest_ram
+    fn copies_guest_ram(&self) -> bool {
+        self.world().copies_guest_ram()
+    }
+
     fn deserialize_compute_pipeline_descriptor(
         &self,
         hold: Hold<'_>,

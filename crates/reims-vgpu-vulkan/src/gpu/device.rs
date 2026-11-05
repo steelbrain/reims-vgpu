@@ -1160,6 +1160,19 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         Some(Obj::new(QueueObject::new(raw, self.clone_ref())))
     }
 
+    /// On Linux, where the device uses the guest's RAM whole and the runtime copies by its runs
+    /// (`os/linux/host_ram.rs`); never on macOS, whose devices are handed no RAM.
+    fn copies_guest_ram(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            crate::os::copies_guest_ram(&self.raw)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     /// Decoded as Metal's deserializer decodes it ([`serialized::compute`]): nil for an empty blob;
     /// a blob Metal aborts on dies here, and the resolver's raise is the caller's.
     fn deserialize_compute_pipeline_descriptor(

@@ -127,7 +127,7 @@ use crate::answer::{
 use crate::gpu::command::{CommandBufferObject, Failing, Progress, VulkanCommandBuffer};
 use crate::gpu::fill;
 use crate::gpu::metal_space::{self, FirstUse};
-use crate::gpu::resource::VulkanTexture;
+use crate::gpu::resource::{VulkanBuffer, VulkanTexture};
 use crate::gpu::{origin, range, size};
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -286,6 +286,15 @@ impl<E> Drop for EncoderObject<E> {
 /// The runtime's encoder is boxed: its handle is about 1.2 KiB, which each move between its making
 /// and its end would copy.
 pub type VulkanBlitEncoder = Obj<EncoderObject<Box<rt::BlitCommandEncoder>>>;
+
+/// What the encoder's lines name [`BlitEncoder::copy_from_guest_ram`] by: no selector of Metal's
+/// does.
+#[cfg(target_os = "linux")]
+const GUEST_RAM_TO_BUFFER: &str = "copyFromGuestRam:toBuffer:destinationOffset: (no Metal)";
+
+/// What they name [`BlitEncoder::copy_to_guest_ram`] by.
+#[cfg(target_os = "linux")]
+const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:sourceOffset:toGuestRam: (no Metal)";
 
 /// A raw `MTLBlitOption` of a copy between a buffer and a texture, sent with `sel`: none, depth
 /// or stencil of a combined texture, or a PVRTC texture's blocks row by row. The runtime copies
@@ -630,6 +639,69 @@ fn buffer_copy_shape(
 }
 
 impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
+    /// On Linux, through the RAM the destination's device uses that holds every run
+    /// (`os/linux/host_ram.rs`), where the runtime copies by runs: a first use of Metal's device,
+    /// as a blit's copy is. False, with nothing encoded, where no such RAM holds them or the
+    /// runtime refuses the copy; never on macOS.
+    fn copy_from_guest_ram(
+        &self,
+        _on: OnFault,
+        runs: &[std::ops::Range<u64>],
+        destination: &VulkanBuffer,
+        destination_offset: u64,
+    ) -> RaiseResult<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let device = &destination.device.raw;
+            let Some(ram) = (crate::os::copies_guest_ram(device))
+                .then(|| crate::os::ram_over(device, runs))
+                .flatten()
+            else {
+                return Ok(false);
+            };
+            metal_space::first_use(FirstUse::BlitCommand);
+            let copied = self.with(GUEST_RAM_TO_BUFFER, |e| {
+                crate::os::copy_from_host_ram(e, &ram, runs, &destination.raw, destination_offset)
+            });
+            Ok(copied.is_ok())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (runs, destination, destination_offset);
+            Ok(false)
+        }
+    }
+
+    /// As [`Self::copy_from_guest_ram`], the other way, through the RAM the source's device uses.
+    fn copy_to_guest_ram(
+        &self,
+        _on: OnFault,
+        source: &VulkanBuffer,
+        source_offset: u64,
+        runs: &[std::ops::Range<u64>],
+    ) -> RaiseResult<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let device = &source.device.raw;
+            let Some(ram) = (crate::os::copies_guest_ram(device))
+                .then(|| crate::os::ram_over(device, runs))
+                .flatten()
+            else {
+                return Ok(false);
+            };
+            metal_space::first_use(FirstUse::BlitCommand);
+            let copied = self.with(BUFFER_TO_GUEST_RAM, |e| {
+                crate::os::copy_to_host_ram(e, &source.raw, source_offset, &ram, runs)
+            });
+            Ok(copied.is_ok())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (source, source_offset, runs);
+            Ok(false)
+        }
+    }
+
     /// Each command but `endEncoding` is a first use of Metal's device
     /// ([`FirstUse::BlitCommand`]: measured for fills and copies, taken alike for the rest), and
     /// a reset or copy of an indirect command buffer is work for Metal's tiler

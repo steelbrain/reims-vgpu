@@ -18,6 +18,11 @@
 //!   reporting, memory hot-unplug): the device holds the pages it imported, and would go on
 //!   reading the old ones. The VMs `reims-ctl` makes have none.
 //!
+//! - **Copies by runs.** A device that uses a lease's RAM copies between its buffers and runs of
+//!   the RAM by their host addresses ([`copies`], [`ram_over`]), so a surface's device cache needs
+//!   no view of the surface's pages (`reims-vgpu`'s `graphics/decode/surface_cache.rs`): once the
+//!   runtime has those copies ([`RUNTIME_COPIES`]).
+//!
 //! The registry's lock is a leaf: the runtime is called after it is let go.
 
 use std::ops::Range;
@@ -35,7 +40,20 @@ use super::files;
 #[derive(Debug)]
 pub(crate) struct LeasedRam {
     uses: Mutex<Vec<rt::HostRamUse>>,
+    /// The registry IDs of the devices that use it, one for each of `uses`.
+    users: Mutex<Vec<u64>>,
+    /// Its ranges, each a host address and a length.
+    ranges: Vec<(u64, u64)>,
     ram: Option<Arc<rt::HostRam>>,
+}
+
+impl LeasedRam {
+    /// Whether `run`, host addresses, lies in one of its ranges.
+    fn holds(&self, run: &Range<u64>) -> bool {
+        run.start < run.end
+            && (self.ranges.iter())
+                .any(|&(at, n)| run.start >= at && run.end <= at.saturating_add(n))
+    }
 }
 
 /// The devices that take the RAM, and the leases' RAM alive now.
@@ -55,6 +73,8 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
 pub(crate) fn lease(ranges: &[(u64, u64)], logged: bool) -> Arc<LeasedRam> {
     let ram = Arc::new(LeasedRam {
         uses: Mutex::new(Vec::new()),
+        users: Mutex::new(Vec::new()),
+        ranges: ranges.to_vec(),
         ram: runtime_ram(ranges, logged).map(Arc::new),
     });
     let devices = {
@@ -129,7 +149,10 @@ fn hand(device: &rt::Device, ram: &LeasedRam) {
         return;
     };
     match device.use_host_ram(host_ram) {
-        Ok(used) => ram.uses.lock().push(used),
+        Ok(used) => {
+            ram.uses.lock().push(used);
+            ram.users.lock().push(device.registry_id());
+        }
         Err(refusal) => {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {
@@ -142,6 +165,68 @@ fn hand(device: &rt::Device, ram: &LeasedRam) {
             });
         }
     }
+}
+
+/// The leases' RAM alive now, taken with the registry's lock let go.
+fn live_leases() -> Vec<Arc<LeasedRam>> {
+    let registry = REGISTRY.lock();
+    registry.leases.iter().filter_map(Weak::upgrade).collect()
+}
+
+/// Whether the runtime copies between a buffer and runs of a device's RAM: not yet. metal2vulkan
+/// is asked for both copies, on its blit encoder ([`copy_from_host_ram`], [`copy_to_host_ram`]);
+/// until the runtime this tree builds on has them, no device copies by runs ([`copies`]), so
+/// every device cache keeps its view of its surface's pages, as before.
+const RUNTIME_COPIES: bool = false;
+
+/// Whether `device` copies between its buffers and the guest's RAM by the RAM's runs: it uses a
+/// lease's RAM, and the runtime has the copies ([`RUNTIME_COPIES`]).
+pub(crate) fn copies(device: &rt::Device) -> bool {
+    if !RUNTIME_COPIES {
+        return false;
+    }
+    let id = device.registry_id();
+    live_leases().iter().any(|l| l.users.lock().contains(&id))
+}
+
+/// The RAM `device` uses whose ranges hold every one of `runs`, host addresses: what a copy by
+/// the RAM's runs goes through. `None` where no lease's RAM the device uses holds them all.
+pub(crate) fn ram_over(device: &rt::Device, runs: &[Range<u64>]) -> Option<Arc<rt::HostRam>> {
+    let id = device.registry_id();
+    live_leases().into_iter().find_map(|l| {
+        let ram = l.ram.as_ref()?;
+        let used = l.users.lock().contains(&id);
+        (used && runs.iter().all(|r| l.holds(r))).then(|| Arc::clone(ram))
+    })
+}
+
+/// The runtime refused a copy by runs of a device's RAM.
+#[derive(Debug)]
+pub(crate) struct RunsCopyRefused;
+
+/// The runtime's copy of `runs` of `ram`, host addresses in the bytes' order, into `destination`
+/// from `destination_offset`, on `encoder`: refused until the runtime has it
+/// ([`RUNTIME_COPIES`]), encoding nothing.
+pub(crate) fn copy_from_host_ram(
+    _encoder: &mut rt::BlitCommandEncoder,
+    _ram: &rt::HostRam,
+    _runs: &[Range<u64>],
+    _destination: &rt::Buffer,
+    _destination_offset: u64,
+) -> Result<(), RunsCopyRefused> {
+    Err(RunsCopyRefused)
+}
+
+/// The runtime's copy of `source` from `source_offset` into `runs` of `ram`, on `encoder`, as
+/// [`copy_from_host_ram`] copies the other way: refused until the runtime has it.
+pub(crate) fn copy_to_host_ram(
+    _encoder: &mut rt::BlitCommandEncoder,
+    _source: &rt::Buffer,
+    _source_offset: u64,
+    _ram: &rt::HostRam,
+    _runs: &[Range<u64>],
+) -> Result<(), RunsCopyRefused> {
+    Err(RunsCopyRefused)
 }
 
 /// The runs of the guest's RAM behind `length` bytes from `start`, which the runtime asks of a

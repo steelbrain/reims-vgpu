@@ -3,6 +3,8 @@
 //! Every blit command is ordered: each logs its selector and arguments (`fake::calllog`) and
 //! consults the script (`fake::script`); see `fake::impls` for the outcome channels.
 
+use std::ops::Range;
+
 use super::super::calllog::Arg;
 use super::super::objects::{Fk, kind};
 use super::super::platform::FakePlatform;
@@ -11,7 +13,51 @@ use crate::platform::blit::*;
 use crate::raise::{OnFault, RaiseResult};
 use crate::testkit::script::Policy;
 
+/// The name the fake logs and scripts [`BlitEncoder::copy_from_guest_ram`] under, with the runs
+/// (each run's start and end, in order), the destination and its offset: no selector of Metal's
+/// names it. It copies where the device copies the guest's RAM
+/// ([`World::copy_guest_ram`](super::super::objects::World::copy_guest_ram)), unless a scripted
+/// value says otherwise.
+pub const GUEST_RAM_TO_BUFFER: &str = "copyFromGuestRam:toBuffer:destinationOffset: (no Metal)";
+
+/// The name the fake logs and scripts [`BlitEncoder::copy_to_guest_ram`] under, with the source,
+/// its offset and the runs, as [`GUEST_RAM_TO_BUFFER`].
+pub const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:sourceOffset:toGuestRam: (no Metal)";
+
+/// The runs as the fake logs them: each run's start and end, in order.
+fn runs_arg(runs: &[Range<u64>]) -> Arg {
+    Arg::U64s(runs.iter().flat_map(|r| [r.start, r.end]).collect())
+}
+
 impl BlitEncoder<FakePlatform> for Fk<kind::BlitEncoder> {
+    fn copy_from_guest_ram(
+        &self,
+        on: OnFault,
+        runs: &[Range<u64>],
+        destination: &<FakePlatform as crate::platform::Platform>::Buffer,
+        destination_offset: u64,
+    ) -> RaiseResult<bool> {
+        let copies = self.world().copies_guest_ram();
+        let args = vec![
+            runs_arg(runs),
+            Arg::obj(destination),
+            Arg::U64(destination_offset),
+        ];
+        self.thr(Policy::On(on), GUEST_RAM_TO_BUFFER, args, || copies)
+    }
+
+    fn copy_to_guest_ram(
+        &self,
+        on: OnFault,
+        source: &<FakePlatform as crate::platform::Platform>::Buffer,
+        source_offset: u64,
+        runs: &[Range<u64>],
+    ) -> RaiseResult<bool> {
+        let copies = self.world().copies_guest_ram();
+        let args = vec![Arg::obj(source), Arg::U64(source_offset), runs_arg(runs)];
+        self.thr(Policy::On(on), BUFFER_TO_GUEST_RAM, args, || copies)
+    }
+
     fn encode(&self, on: OnFault, cmd: BlitCmd<'_, FakePlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         match cmd {

@@ -19,6 +19,29 @@ use crate::spi::methods::BlitEncoderSpi;
 pub type MetalBlitEncoder = Obj<ProtocolObject<dyn MTLBlitCommandEncoder>>;
 
 impl reims_vgpu_core::platform::blit::BlitEncoder<MetalPlatform> for MetalBlitEncoder {
+    /// Never: the platform copies no guest RAM by its host addresses
+    /// (`GpuDevice::copies_guest_ram`), and encodes nothing.
+    fn copy_from_guest_ram(
+        &self,
+        _on: OnFault,
+        _runs: &[std::ops::Range<u64>],
+        _destination: &crate::gpu::resource::MetalBuffer,
+        _destination_offset: u64,
+    ) -> RaiseResult<bool> {
+        Ok(false)
+    }
+
+    /// Never, as [`Self::copy_from_guest_ram`].
+    fn copy_to_guest_ram(
+        &self,
+        _on: OnFault,
+        _source: &crate::gpu::resource::MetalBuffer,
+        _source_offset: u64,
+        _runs: &[std::ops::Range<u64>],
+    ) -> RaiseResult<bool> {
+        Ok(false)
+    }
+
     /// One call per command: a raise inside Metal is the caller's to catch. Every command but
     /// `EndEncoding` is encoded only under a handler (`Caught`); the resource flush also ends its
     /// encoder with none, so `EndEncoding` is `On(on)`, as the caller says. Raw guest values go

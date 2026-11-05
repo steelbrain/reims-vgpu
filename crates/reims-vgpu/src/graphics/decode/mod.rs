@@ -920,6 +920,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.surface_caches.set_deferred_budget(budget);
     }
 
+    /// Whether a cached block on `device` is named by its runs, with no view: the device copies
+    /// the guest's RAM by them and keeps caches (`surface_pages`, "By runs").
+    fn copies_by_runs(&self, device: &P::Device) -> bool {
+        device.copies_guest_ram() && self.surface_caches.lock().on()
+    }
+
     /// Whether `SURFACE_PAGES` makes views ([`RGFX_FEATURE_SURFACE_PAGES`]).
     pub(crate) fn surface_pages_available(&self) -> bool {
         self.shared.surface_views.lock().available(&self.platform)
@@ -1072,6 +1078,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         settle: &worker::Settle,
     ) -> Option<u32> {
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
+        let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
+        let by_runs = cached && self.copies_by_runs(device);
         let views = &self.shared.surface_views;
         let made = if private {
             Ok(surface_pages::SurfaceViews::private_pages(
@@ -1089,6 +1097,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 pages,
                 runs,
                 settle,
+                by_runs,
             )
         };
         let status = match made {
@@ -1098,7 +1107,6 @@ impl<P: Platform> GraphicsDecoder<P> {
                 RGFX_STATUS_OK
             }
             Ok(Some(Ok(()))) => {
-                let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
                 self.cache_surface(device, pages.block_offset, runs, cached);
                 RGFX_STATUS_OK
             }
@@ -1203,6 +1211,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             pages,
             runs,
             settle,
+            self.copies_by_runs(device),
         );
         // Runs that are not whole guest pages summing to the surface, or with no guest RAM to map,
         // are refused; pages the host made no view of, or no buffer over, are copied instead.
@@ -1216,12 +1225,19 @@ impl<P: Platform> GraphicsDecoder<P> {
         let why = match made {
             Ok(None) => return None,
             Ok(Some(Ok(()))) => {
-                let (view, host_pages) = {
+                let (named, host_pages) = {
                     let views = views.lock();
-                    (views.view(block), views.host_runs(runs))
+                    let named = match (views.view(block), views.by_runs(block)) {
+                        (Some(view), _) => Some(surface_cache::Named::View(view)),
+                        (None, Some((runs, unmade))) => {
+                            Some(surface_cache::Named::Runs(runs, unmade))
+                        }
+                        (None, None) => None,
+                    };
+                    (named, views.host_runs(runs))
                 };
-                let attached = match view {
-                    Some(view) => self.surface_caches.attach(device, block, &view, host_pages),
+                let attached = match named {
+                    Some(named) => self.surface_caches.attach(device, block, named, host_pages),
                     None => Ok(Some(false)),
                 };
                 match attached {
@@ -1267,33 +1283,79 @@ impl<P: Platform> GraphicsDecoder<P> {
         Some(RGFX_STATUS_REFUSED)
     }
 
-    /// Gives the block at `block`, whose view of `runs` was just made, a device cache where the
-    /// kext marked it `cached` and the device keeps caches ([`surface_cache`]); else the block
-    /// keeps its view alone, and its buffers lie over the pages.
+    /// Gives the block at `block`, whose view of `runs` was just made, or which is named by its
+    /// runs, a device cache where the kext marked it `cached` and the device keeps caches
+    /// ([`surface_cache`]); else the block keeps its view alone, and its buffers lie over the
+    /// pages. A block named by its runs that gets no cache takes its view now.
     fn cache_surface(&self, device: &P::Device, block: u64, runs: &[RgfxPageRun], cached: bool) {
         if !cached || !self.surface_caches.lock().on() {
             self.uncache_surface(device, block);
             return;
         }
-        let (view, pages) = {
+        let (view, by_runs, pages) = {
             let views = self.shared.surface_views.lock();
-            let Some(view) = views.view(block) else {
-                return;
-            };
-            (view, views.host_runs(runs))
+            (
+                views.view(block),
+                views.by_runs(block),
+                views.host_runs(runs),
+            )
         };
-        match self.surface_caches.make(device, block, &view, pages) {
+        let (made, length) = match (view, by_runs) {
+            (Some(view), _) => (
+                self.surface_caches.make(device, block, &view, pages),
+                view.length(),
+            ),
+            (None, Some((runs, unmade))) => {
+                let length = unmade.length();
+                let made = self.surface_caches.make_by_runs(
+                    device,
+                    block,
+                    runs,
+                    Arc::clone(&unmade),
+                    pages,
+                );
+                if !matches!(made, Ok(true)) {
+                    self.view_by_runs(device, block, &unmade);
+                }
+                (made, length)
+            }
+            (None, None) => return,
+        };
+        match made {
             Ok(true) => {}
             Ok(false) => log::warn!(
                 target: "reims_vgpu::graphics",
-                "the IOSurface block at {block:#x}: the platform made no device cache of its {:#x} \
-                 bytes; its buffers lie over its pages",
-                view.length()
+                "the IOSurface block at {block:#x}: the platform made no device cache of its \
+                 {length:#x} bytes; its buffers lie over its pages"
             ),
             Err(raise) => log::warn!(
                 target: "reims_vgpu::graphics",
                 "the IOSurface block at {block:#x}: the platform raised at its device cache \
                  ({raise:?}); its buffers lie over its pages"
+            ),
+        }
+    }
+
+    /// The block at `block`, named by its runs and given no device cache, takes the view
+    /// `unmade` makes, which its buffers then lie over; one not made leaves the block with
+    /// none, and its buffers are refused.
+    fn view_by_runs(&self, device: &P::Device, block: u64, unmade: &surface_pages::Unmade<P>) {
+        match unmade.make(device) {
+            Ok(Ok((view, import))) => {
+                self.shared.surface_views.lock().viewed(block, view);
+                // The view's buffers hold it; the import's buffer goes on the worker, where it
+                // may be the last hold of the import.
+                self.shared.surface_worker.drop_later(block, block, import);
+            }
+            Ok(Err(why)) => log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: no device cache, and no view of its pages \
+                 ({why:?}); its buffers are refused"
+            ),
+            Err(raise) => log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: no device cache, and the platform raised at \
+                 the buffer over its view ({raise:?}); its buffers are refused"
             ),
         }
     }

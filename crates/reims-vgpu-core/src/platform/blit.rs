@@ -11,6 +11,8 @@
 // to ten.
 #![allow(clippy::too_many_arguments)]
 
+use std::ops::Range;
+
 use super::host_range::HostRange;
 use super::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange};
 use super::{Handle, Platform};
@@ -344,4 +346,30 @@ pub trait BlitEncoder<P: Platform>: Handle {
     /// Sends one [`BlitCmd`]. `on` says what a raise in a command reached both under a handler
     /// and with none (`EndEncoding`) does; the other commands are reached one way only.
     fn encode(&self, on: OnFault, cmd: BlitCmd<'_, P>) -> RaiseResult<()>;
+    /// No Metal counterpart: copies the guest's RAM at `runs`, host addresses in the host's
+    /// mapping of the guest's RAM (the memory map's), in the bytes' order, into `destination`
+    /// from `destination_offset`, ordered against the encoder's other commands as a
+    /// `CopyBufferToBuffer` is; so a copy of guest pages needs no buffer over a view of them.
+    /// False, with nothing encoded, where the platform does not copy them: a device that copies
+    /// none of the guest's RAM ([`GpuDevice::copies_guest_ram`]), runs outside the RAM it was
+    /// handed, or a refusal of the runtime's. `on` is as for [`Self::encode`].
+    ///
+    /// [`GpuDevice::copies_guest_ram`]: super::device::GpuDevice::copies_guest_ram
+    fn copy_from_guest_ram(
+        &self,
+        on: OnFault,
+        runs: &[Range<u64>],
+        destination: &P::Buffer,
+        destination_offset: u64,
+    ) -> RaiseResult<bool>;
+    /// No Metal counterpart: copies `source` from `source_offset` into the guest's RAM at `runs`,
+    /// as [`Self::copy_from_guest_ram`] copies the other way; false, with nothing encoded, where
+    /// it does not.
+    fn copy_to_guest_ram(
+        &self,
+        on: OnFault,
+        source: &P::Buffer,
+        source_offset: u64,
+        runs: &[Range<u64>],
+    ) -> RaiseResult<bool>;
 }

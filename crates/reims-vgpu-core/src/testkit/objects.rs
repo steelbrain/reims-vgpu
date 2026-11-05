@@ -940,6 +940,10 @@ pub struct World {
     /// Whether a command buffer's `split` commits it as a part and answers the next
     /// ([`World::split_command_buffers`]).
     splits: AtomicBool,
+    /// What the devices' [`GpuDevice::copies_guest_ram`] answers ([`World::copy_guest_ram`]).
+    ///
+    /// [`GpuDevice::copies_guest_ram`]: crate::platform::device::GpuDevice::copies_guest_ram
+    guest_ram_copies: AtomicBool,
 }
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
@@ -976,6 +980,7 @@ impl World {
             held_submissions: Mutex::new(None),
             notifications: Mutex::new(Vec::new()),
             splits: AtomicBool::new(false),
+            guest_ram_copies: AtomicBool::new(false),
         })
     }
 
@@ -990,6 +995,24 @@ impl World {
     /// Whether a command buffer's `split` splits it ([`World::split_command_buffers`]).
     pub fn splits(&self) -> bool {
         self.splits.load(Ordering::SeqCst)
+    }
+
+    /// Has the devices copy the guest's RAM by its runs ([`GpuDevice::copies_guest_ram`]), or
+    /// not, as a device of the Vulkan platform handed the guest's RAM whole does; not at first.
+    /// The copies answer as scripted ([`GUEST_RAM_TO_BUFFER`], [`BUFFER_TO_GUEST_RAM`]).
+    ///
+    /// [`GpuDevice::copies_guest_ram`]: crate::platform::device::GpuDevice::copies_guest_ram
+    /// [`GUEST_RAM_TO_BUFFER`]: super::impls::blit::GUEST_RAM_TO_BUFFER
+    /// [`BUFFER_TO_GUEST_RAM`]: super::impls::blit::BUFFER_TO_GUEST_RAM
+    pub fn copy_guest_ram(&self, on: bool) {
+        self.guest_ram_copies.store(on, Ordering::SeqCst);
+    }
+
+    /// What the devices' [`GpuDevice::copies_guest_ram`] answers.
+    ///
+    /// [`GpuDevice::copies_guest_ram`]: crate::platform::device::GpuDevice::copies_guest_ram
+    pub fn copies_guest_ram(&self) -> bool {
+        self.guest_ram_copies.load(Ordering::SeqCst)
     }
 
     fn arc(&self) -> Arc<World> {

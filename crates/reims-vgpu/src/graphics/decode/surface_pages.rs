@@ -42,6 +42,16 @@
 //! stays mapped as long as the device, so the heap needs no hold on the view; it lies over the
 //! block, which is not released while it lives.
 //!
+//! **By runs.** A cached block (`RGFX_SURFACE_PAGES_CACHED`) on a device that copies the guest's
+//! RAM by its runs ([`GpuDevice::copies_guest_ram`]) takes no view: its `SURFACE_PAGES` checks
+//! its runs and finds their pages' host addresses in the guest's RAM, in the surface's order, and
+//! its device cache copies by those ([`super::surface_cache`]), so the block costs no mapping and
+//! no import. What would make its view is kept with it ([`Unmade`]): the cache makes the view
+//! where the platform refuses a copy, or where it makes no cache, and the block then lies over
+//! the view as any other. A block whose runs leave the RAM's mapping takes its view as before.
+//!
+//! [`GpuDevice::copies_guest_ram`]: reims_vgpu_core::platform::device::GpuDevice::copies_guest_ram
+//!
 //! **Off ring 0's threads.** A view costs a kernel mapping per run, and the runtime's import of
 //! them: real surfaces' runs are single 4 KiB pages, most laid right below the run before (measured
 //! on the msi 5080 host, macOS 26 guest, Safari scrolling: every run one page, 74% of them
@@ -196,6 +206,8 @@ pub(crate) struct ViewCounts {
     /// Pages blocks' views made (`RGFX_SURFACE_PAGES_PRIVATE`), each at its block's first
     /// `BUFFER_OVER_PAGES`, which `made` does not count.
     pub(crate) private: u64,
+    /// Cached blocks named by their runs, with no view (the module doc).
+    pub(crate) by_runs: u64,
 }
 
 /// How a surface's runs lie in guest RAM, for the log: each run takes a kernel mapping of its own
@@ -260,6 +272,55 @@ pub(crate) struct Private<P: Platform> {
     ram: Option<(HostPtr, u64)>,
 }
 
+/// What makes the view of a block named by its runs (the module doc): its runs, checked, the
+/// guest's RAM they are mapped through, and the platform's hold on it.
+pub(crate) struct Unmade<P: Platform> {
+    memory: Arc<MemoryMap<P>>,
+    lease: Lease,
+    key: Vec<(u64, u64)>,
+    length: u64,
+}
+
+impl<P: Platform> Unmade<P> {
+    /// The surface's bytes.
+    pub(crate) fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// The view, mapped now, and a Shared buffer over the whole of it on `device`, which holds
+    /// the view and the runtime's import of its pages; the refusal where either is not made.
+    pub(crate) fn make(&self, device: &P::Device) -> RaiseResult<Result<Made<P>, PagesRefusal>> {
+        let view = match map_view(
+            &self.memory,
+            Arc::clone(&self.lease),
+            &self.key,
+            self.length,
+        ) {
+            Ok(view) => view,
+            Err(why) => return Ok(Err(why)),
+        };
+        Ok(
+            match buffer_over(device, &view, 0, view.length(), 0, None)? {
+                Some(import) => Ok((view, import)),
+                None => Err(PagesRefusal::NoBuffer),
+            },
+        )
+    }
+}
+
+/// A block named by its runs ([`SurfaceViews::by_runs`]): its pages' host addresses in the
+/// guest's RAM, in the surface's order, as runs, and what makes its view.
+pub(crate) type NamedByRuns<P> = (Vec<Range<u64>>, Arc<Unmade<P>>);
+
+/// A block named by its runs, with no view (the module doc).
+struct ByRuns<P: Platform> {
+    /// The pages' host addresses in the guest's RAM, in the surface's order, as runs.
+    runs: Vec<Range<u64>>,
+    unmade: Arc<Unmade<P>>,
+    /// The size of the block's part its holders map.
+    size: u64,
+}
+
 /// The views of the surfaces whose blocks name their pages, by block offset, and the cache.
 pub(crate) struct SurfaceViews<P: Platform> {
     /// The guest's RAM, through which the views are made, and the platform's hold on it; `None`
@@ -269,6 +330,8 @@ pub(crate) struct SurfaceViews<P: Platform> {
     teardown: Option<Arc<Worker>>,
     /// Each block's view, and the size of the block's part its holders map.
     by_block: HashMap<u64, (Arc<SurfaceView<P>>, u64)>,
+    /// Each block named by its runs, with no view.
+    by_runs: HashMap<u64, ByRuns<P>>,
     /// Each pages block's view, by block offset.
     private: HashMap<u64, Private<P>>,
     /// The views made or taken last, the latest at the back.
@@ -297,6 +360,7 @@ enum Found<P: Platform> {
 pub(crate) struct Released<P: Platform> {
     _view: Option<Arc<SurfaceView<P>>>,
     _private: Option<Private<P>>,
+    _by_runs: Option<ByRuns<P>>,
 }
 
 impl<P: Platform> SurfaceViews<P> {
@@ -309,6 +373,7 @@ impl<P: Platform> SurfaceViews<P> {
             memory,
             teardown,
             by_block: HashMap::new(),
+            by_runs: HashMap::new(),
             private: HashMap::new(),
             cache: VecDeque::new(),
             counts: ViewCounts::default(),
@@ -332,7 +397,9 @@ impl<P: Platform> SurfaceViews<P> {
     }
 
     /// `SURFACE_PAGES`: the view of `runs` for the block `pages` names, in place of any it had:
-    /// the cache's over the same runs, else one made, with a buffer over it on `device`. The
+    /// the cache's over the same runs, else one made, with a buffer over it on `device`; or, where
+    /// `by_runs`, no view, the block named by its runs (the module doc), where every page lies in
+    /// the guest RAM's mapping. The
     /// mapping and the import are made with `views` unlocked, so a message that asks of the
     /// views meanwhile does not wait for them; the views and the cache are changed only here,
     /// by one `SURFACE_PAGES` of a block at a time (the surface [`Worker`]), and at a release,
@@ -349,6 +416,7 @@ impl<P: Platform> SurfaceViews<P> {
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
         settle: &Settle,
+        by_runs: bool,
     ) -> RaiseResult<Option<Result<(), PagesRefusal>>> {
         let (old, found) = {
             let mut v = views.lock();
@@ -358,7 +426,13 @@ impl<P: Platform> SurfaceViews<P> {
             let old = (
                 v.by_block.remove(&pages.block_offset),
                 v.private.remove(&pages.block_offset),
+                v.by_runs.remove(&pages.block_offset),
             );
+            if by_runs && v.name_by_runs(platform, pages, runs) {
+                drop(v);
+                drop(old);
+                return Ok(Some(Ok(())));
+            }
             (old, v.find(platform, pages, runs))
         };
         drop(old);
@@ -402,7 +476,11 @@ impl<P: Platform> SurfaceViews<P> {
             if v.resets != settle.resets {
                 return false;
             }
-            (v.by_block.remove(&block), v.private.remove(&block))
+            (
+                v.by_block.remove(&block),
+                v.private.remove(&block),
+                v.by_runs.remove(&block),
+            )
         };
         drop(old);
         true
@@ -494,6 +572,40 @@ impl<P: Platform> SurfaceViews<P> {
         why
     }
 
+    /// Names the block `pages` names by `runs` (the module doc), with no view: false, naming
+    /// nothing, where the runs are refused or a page is not in the guest RAM's mapping, for the
+    /// caller to make its view (whose refusal is counted there).
+    fn name_by_runs(
+        &mut self,
+        platform: &P,
+        pages: &RgfxSurfacePages,
+        runs: &[RgfxPageRun],
+    ) -> bool {
+        let Ok(key) = self.checked_runs(platform, pages, runs) else {
+            return false;
+        };
+        let Some((memory, lease)) = self.memory.as_ref() else {
+            return false;
+        };
+        let Some(host) = in_order(memory, &key) else {
+            return false;
+        };
+        let unmade = Unmade {
+            memory: Arc::clone(memory),
+            lease: Arc::clone(lease),
+            key,
+            length: pages.length,
+        };
+        let block = ByRuns {
+            runs: host,
+            unmade: Arc::new(unmade),
+            size: pages.block_size,
+        };
+        self.by_runs.insert(pages.block_offset, block);
+        self.counts.by_runs += 1;
+        true
+    }
+
     /// The runs of `pages`, checked (the module doc), as (address, length) pairs.
     fn checked_runs(
         &self,
@@ -579,6 +691,29 @@ impl<P: Platform> SurfaceViews<P> {
     /// The device's resets so far ([`Settle`]).
     pub(crate) fn resets(&self) -> u64 {
         self.resets
+    }
+
+    /// Whether the block at `m.block_offset` is named, by a view or by its runs, where its
+    /// holders' part holds the `m.block_size` bytes `m` names and its pages at least `m.length`
+    /// bytes.
+    pub(crate) fn names(&self, m: &RgfxBufferOverSurfacePages) -> bool {
+        let fits =
+            |size: u64, length: u64| m.block_size <= size && m.length != 0 && m.length <= length;
+        self.view_for(m).is_some()
+            || (self.by_runs.get(&m.block_offset)).is_some_and(|b| fits(b.size, b.unmade.length()))
+    }
+
+    /// The runs and the view's maker of the block at `block`, where it is named by its runs.
+    pub(crate) fn by_runs(&self, block: u64) -> Option<NamedByRuns<P>> {
+        (self.by_runs.get(&block)).map(|b| (b.runs.clone(), Arc::clone(&b.unmade)))
+    }
+
+    /// The block at `block`, named by its runs, lies over `view` from now on: its cache made no
+    /// copy by runs, or none was made.
+    pub(crate) fn viewed(&mut self, block: u64, view: Arc<SurfaceView<P>>) {
+        if let Some(b) = self.by_runs.remove(&block) {
+            self.by_block.insert(block, (view, b.size));
+        }
     }
 
     /// The view of the block at `m.block_offset`, where its holders' part holds the
@@ -730,9 +865,11 @@ impl<P: Platform> SurfaceViews<P> {
     pub(crate) fn released(&mut self, offset: u64) -> Option<Released<P>> {
         let view = self.by_block.remove(&offset).map(|(view, _)| view);
         let private = self.private.remove(&offset);
-        (view.is_some() || private.is_some()).then_some(Released {
+        let by_runs = self.by_runs.remove(&offset);
+        (view.is_some() || private.is_some() || by_runs.is_some()).then_some(Released {
             _view: view,
             _private: private,
+            _by_runs: by_runs,
         })
     }
 
@@ -758,6 +895,7 @@ impl<P: Platform> SurfaceViews<P> {
         let views = std::mem::take(&mut self.by_block);
         let private = std::mem::take(&mut self.private);
         let cache = std::mem::take(&mut self.cache);
+        self.by_runs.clear();
         if let Err(refusal) = refusals::refusing(move || drop((views, private, cache))) {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -781,7 +919,29 @@ impl<P: Platform> SurfaceViews<P> {
 }
 
 /// A view just made, and the buffer over the whole of it that holds its import.
-type Made<P> = (Arc<SurfaceView<P>>, <P as Platform>::Buffer);
+pub(crate) type Made<P> = (Arc<SurfaceView<P>>, <P as Platform>::Buffer);
+
+/// The host addresses of the guest pages of `key` in `memory`'s mapping of the guest's RAM, in
+/// their order, as runs, each page that follows the last one's end in the same run; `None` where
+/// a page is not in the mapping.
+fn in_order<P: Platform>(memory: &MemoryMap<P>, key: &[(u64, u64)]) -> Option<Vec<Range<u64>>> {
+    let mut runs: Vec<Range<u64>> = Vec::new();
+    for &(address, length) in key {
+        let end = address.checked_add(length)?;
+        for at in (address..end).step_by(GUEST_PAGE.to_usize()) {
+            let host = memory.virtual_address_for_physical(at, GUEST_PAGE);
+            if host.is_null() {
+                return None;
+            }
+            let host = host.addr().to_u64();
+            match runs.last_mut() {
+                Some(last) if last.end == host => last.end += GUEST_PAGE,
+                _ => runs.push(host..host + GUEST_PAGE),
+            }
+        }
+    }
+    Some(runs)
+}
 
 /// A view of the runs `key` through `memory`, which holds `lease`, `length` bytes, let go of on
 /// `teardown`.
@@ -911,15 +1071,18 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             return Ok(Err(super::DecodeError::BadReference));
         }
         self.settle_surface(m.block_offset);
-        let view = self.shared.surface_views.lock().view_for(&m);
+        let (names, view) = {
+            let views = self.shared.surface_views.lock();
+            (views.names(&m), views.view_for(&m))
+        };
         // A block with a device cache: the buffer is the cache, over the surface's bytes in the
-        // pages' layout (`surface_cache`). A deferred block whose pages are not named has its
-        // cache and no view.
+        // pages' layout (`surface_cache`); a block named by its runs has one, or took its view. A
+        // deferred block whose pages are not named has its cache, and neither.
         let cache = {
             let caches = self.surface_caches.lock();
-            match &view {
-                Some(_) => caches.buffer(m.block_offset),
-                None => caches.deferred_buffer(&m),
+            match names {
+                true => caches.buffer(m.block_offset),
+                false => caches.deferred_buffer(&m),
             }
             .map(|c| c.clone_ref())
         };
@@ -1195,7 +1358,7 @@ pub(super) mod tests {
         }
 
         /// The view the block at `block` has.
-        fn view(&self, block: u64) -> Arc<SurfaceView<FakePlatform>> {
+        pub(crate) fn view(&self, block: u64) -> Arc<SurfaceView<FakePlatform>> {
             Arc::clone(&self.dec.views_of_surfaces().by_block[&block].0)
         }
 
