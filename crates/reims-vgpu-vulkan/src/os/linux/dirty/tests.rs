@@ -205,7 +205,7 @@ fn a_range_is_resolved_once() {
     let _lease = ram(base, Some(Arc::clone(&log)));
     // From guest 1 MiB - 8 KiB: two pages below the hole, then guest 4 GiB on.
     let d = ImportDirty::new(base + 0x10_0000 - 2 * P).unwrap();
-    let resolutions = || d.shared.resolutions.load(Ordering::Relaxed);
+    let resolutions = || d.shared.resolved.resolutions();
     let _w = d.watch(0..4 * P);
     assert_eq!(resolutions(), 1);
     let s1 = harvest(&log, &[]);
@@ -230,46 +230,4 @@ fn a_range_is_resolved_once() {
     d.wrote(0..8 * P);
     d.wrote(0..8 * P);
     assert_eq!(resolutions(), 2);
-}
-
-/// A kept range's segments cut to a range inside it: the first and last pieces cut, their guest
-/// addresses moved by as much, a piece in no RAM kept as none
-#[test]
-fn cut_segments() {
-    let kept = [
-        Segment {
-            offset: 0,
-            length: 2 * P,
-            guest: Some(0x10_0000 - 2 * P),
-        },
-        Segment {
-            offset: 2 * P,
-            length: P,
-            guest: None,
-        },
-        Segment {
-            offset: 3 * P,
-            length: 4 * P,
-            guest: Some(0x1_0000_0000),
-        },
-    ];
-    let range = |r: Range<u64>| -> Vec<(u64, u64, Option<u64>)> {
-        (cut(&kept, &r).into_iter())
-            .map(|s| (s.offset, s.length, s.guest))
-            .collect()
-    };
-    assert_eq!(
-        range(P..4 * P + 8),
-        vec![
-            (P, P, Some(0x10_0000 - P)),
-            (2 * P, P, None),
-            (3 * P, P + 8, Some(0x1_0000_0000)),
-        ]
-    );
-    assert_eq!(
-        range(5 * P..6 * P),
-        vec![(5 * P, P, Some(0x1_0000_0000 + 2 * P))]
-    );
-    assert_eq!(range(2 * P + 1..2 * P + 2), vec![(2 * P + 1, 1, None)]);
-    assert_eq!(range(7 * P..8 * P), vec![]);
 }

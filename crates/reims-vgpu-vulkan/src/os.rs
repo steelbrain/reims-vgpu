@@ -17,6 +17,9 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+/// The dirty log's kept resolutions of an import's ranges, Linux's alone but measured anywhere.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod resolutions;
 mod surface;
 mod wsi;
 

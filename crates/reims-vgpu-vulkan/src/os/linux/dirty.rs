@@ -22,8 +22,9 @@
 //!
 //! **Resolved once.** The pages behind an import's bytes stay the same while the runtime holds it
 //! (the memory it is given stays mapped, with the same backing, for the import's life), so the
-//! guest runs behind a range of it are resolved once and kept ([`RESOLVED_KEPT`] ranges an
-//! import), and a range inside a kept one is cut from it. The runtime reports the writes of each
+//! guest runs behind a range of it are resolved once and kept (the latest
+//! [`KEPT`](crate::os::resolutions::KEPT) ranges an import, [`Resolutions`]), and a range inside
+//! a kept one is cut from it. The runtime reports the writes of each
 //! command buffer's in-place writers at its commit, at each of its batches' completion turns and
 //! at its completion, each over the same ranges; resolving a 3840x2400 surface over scattered
 //! 4 KiB guest pages each time (about 9,000 pieces of the backing table, under its lock) took
@@ -58,6 +59,7 @@ use reims_vgpu_core::sync::Mutex;
 
 use super::{LinuxClock, files};
 use crate::os::GuestRamFile;
+use crate::os::resolutions::Resolutions;
 
 /// One range of a device's RAM, registered by its lease.
 #[derive(Debug)]
@@ -210,20 +212,9 @@ struct Shared {
     /// The host address of the import's pointer, as the backing table knows it.
     at: u64,
     watches: Mutex<Vec<Watched>>,
-    /// The ranges resolved so far, each with its segments, the latest last (module docs,
-    /// "Resolved once").
-    resolved: Mutex<Vec<Kept>>,
-    /// How many times the backing table was asked for the import's bytes.
-    #[cfg(test)]
-    resolutions: AtomicU64,
+    /// The ranges resolved so far, with their segments (module docs, "Resolved once").
+    resolved: Resolutions,
 }
-
-/// The ranges of an import whose segments are kept (module docs, "Resolved once"): the oldest
-/// goes when another is resolved.
-const RESOLVED_KEPT: usize = 4;
-
-/// A range of an import, resolved, and its segments.
-type Kept = (Range<u64>, Arc<[Segment]>);
 
 impl Shared {
     fn new(log: Arc<DirtyLog>, at: u64) -> Shared {
@@ -231,31 +222,9 @@ impl Shared {
             log,
             at,
             watches: Mutex::new(Vec::new()),
-            resolved: Mutex::new(Vec::new()),
-            #[cfg(test)]
-            resolutions: AtomicU64::new(0),
+            resolved: Resolutions::default(),
         }
     }
-}
-
-/// The segments of `range`, which lies in the range `kept` was resolved for: those of `kept` that
-/// meet it, the first and the last cut to it.
-fn cut(kept: &[Segment], range: &Range<u64>) -> Vec<Segment> {
-    let first = kept.partition_point(|s| s.offset.saturating_add(s.length) <= range.start);
-    (kept.get(first..).unwrap_or(&[]).iter())
-        .take_while(|s| s.offset < range.end)
-        .map(|s| {
-            let start = s.offset.max(range.start);
-            let end = s.offset.saturating_add(s.length).min(range.end);
-            Segment {
-                offset: start,
-                length: end.saturating_sub(start),
-                guest: s
-                    .guest
-                    .map(|g| g.saturating_add(start.saturating_sub(s.offset))),
-            }
-        })
-        .collect()
 }
 
 /// The runtime's questions about one import (module docs), over its device's log.
@@ -307,31 +276,11 @@ impl ImportDirty {
     /// a range resolved before that holds it, or resolved now and kept (module docs, "Resolved
     /// once").
     fn segments(&self, range: &Range<u64>) -> Arc<[Segment]> {
-        {
-            let kept = self.shared.resolved.lock();
-            let holding =
-                (kept.iter().rev()).find(|(r, _)| r.start <= range.start && range.end <= r.end);
-            match holding {
-                Some((r, segments)) if r == range => return Arc::clone(segments),
-                Some((_, segments)) => return cut(segments, range).into(),
-                None => {}
-            }
-        }
-        let segments: Arc<[Segment]> = self.resolve(range).into();
-        let mut kept = self.shared.resolved.lock();
-        // A range the new one holds is cut from it from now on.
-        kept.retain(|(r, _)| !(range.start <= r.start && r.end <= range.end));
-        if kept.len() >= RESOLVED_KEPT {
-            kept.remove(0);
-        }
-        kept.push((range.clone(), Arc::clone(&segments)));
-        segments
+        (self.shared.resolved).segments(range, |range| self.resolve(range))
     }
 
     /// The import's bytes `range` as segments, from the backing table.
     fn resolve(&self, range: &Range<u64>) -> Vec<Segment> {
-        #[cfg(test)]
-        self.shared.resolutions.fetch_add(1, Ordering::Relaxed);
         let length = range.end.saturating_sub(range.start);
         let pieces = resolved(self.shared.at.saturating_add(range.start), length);
         if pieces.is_empty() {
