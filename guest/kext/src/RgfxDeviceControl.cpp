@@ -4,6 +4,7 @@
  */
 
 #include "RgfxDeviceControl.hpp"
+#include "RgfxGammaCapability.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/graphics/IOFramebuffer.h>
@@ -95,8 +96,9 @@ struct Connection {
 static_assert(sizeof(Connection) == 12, "attribute 0x925 is 12 bytes");
 
 // Attribute 0x711's request and answer, the same bytes both ways: the
-// display (its index), the request (one bit), and in the answer, 1 and the
-// request's answer in the body.
+// display (its index), the request (one bit), and in the answer, its entry
+// count and its entries in the body, 0x32c bytes apart (IOPresentment reads
+// at most 8; RgfxGammaCapability.hpp).
 struct Query {
 	UInt32 field_00;
 	UInt32 field_04;
@@ -104,11 +106,16 @@ struct Query {
 	UInt8 field_0c[0x1960];
 };
 static_assert(sizeof(Query) == 0x196c, "attribute 0x711 is 0x196c bytes");
+static_assert(__builtin_offsetof(Query, field_08) == kRgfxCapabilityCount &&
+                  __builtin_offsetof(Query, field_0c) == kRgfxCapabilityEntries,
+              "the count and the entries are where IOPresentment reads them");
 
-constexpr UInt32 kQueryAnswered = 1;
+// Each answer holds one entry.
+constexpr UInt32 kQueryEntries = 1;
 
 // The requests the display answers: each bit of the low 16 but 0x40. Every
-// answer is zeros but those of requests 1, 2 and 0x10.
+// answer's entry is zeros, which names no plane, but those of requests 1, 2
+// and 0x10.
 constexpr UInt32 kQueryRequests = 0xffbf;
 constexpr UInt32 kQuery1 = 0x1;
 constexpr UInt32 kQueryGamma = 0x2;
@@ -132,21 +139,6 @@ struct __attribute__((packed)) Query1 {
 	UInt32 field_28; // 1.0f
 };
 static_assert(sizeof(Query1) == 0x2c, "request 1's answer is 0x2c bytes");
-
-// Request 2's answer: field_04 is whether the display takes a gamma table and
-// field_28 its entries. The display pipe sends none, so both are 0.
-struct __attribute__((packed)) QueryGamma {
-	UInt32 field_00; // 5
-	UInt64 field_04;
-	UInt32 field_0c;
-	UInt32 field_10; // 0x80
-	UInt32 field_14;
-	UInt64 field_18;
-	UInt32 field_20; // 0.0f
-	UInt32 field_24; // 1.0f
-	UInt64 field_28;
-};
-static_assert(sizeof(QueryGamma) == 0x30, "request 2's answer is 0x30 bytes");
 
 // Request 0x10's answer: two of these after 0x1c bytes of zeros, each the
 // current mode's size.
@@ -367,7 +359,7 @@ IOReturn RgfxDeviceControl::answerQuery(const void *input, size_t inputSize, voi
 		size.field_18 = 0x10000;
 	}
 
-	reply->field_08 = kQueryAnswered;
+	reply->field_08 = kQueryEntries;
 	bzero(reply->field_0c, sizeof reply->field_0c);
 	switch (request) {
 	case kQuery1: {
@@ -381,10 +373,9 @@ IOReturn RgfxDeviceControl::answerQuery(const void *input, size_t inputSize, voi
 		break;
 	}
 	case kQueryGamma: {
-		QueryGamma g = {};
-		g.field_00 = 5;
-		g.field_10 = 0x80;
-		g.field_24 = kFloatOne;
+		// The display's gamma, as the AMD's display answers it: plane 0 takes
+		// tables of 256 entries.
+		const RgfxGammaCapability g = rgfxGammaCapability();
 		memcpy(reply->field_0c, &g, sizeof g);
 		break;
 	}

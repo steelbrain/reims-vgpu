@@ -852,9 +852,10 @@ ours, 20 minutes apart, and each lane's guest capture (`screencapture`) beside i
   display pipe then gives the host a gamma table and a colour matrix that re-encode the frame for
   its profile's gamma 2.2 (`displayPresentFragmentWithGammaTableAndColorMatrix`, shaders.metal):
   about enc2.2(dec_sRGB(v)) a channel, 16 to 23, 32 to 38, 64 to 67, 128 to 127 and 200 to 199.
-  Our display pipe takes no gamma table (request 2 of RgfxDeviceControl answers none), and the
-  host presents our frame as it is: the guest capture and the host shot agree within 2 levels for
-  98.5% of pixels. On the host, the stock lane's dark tones are lighter than ours, by up to about
+  Our display pipe took no gamma table then (request 2 of RgfxDeviceControl answered none), and
+  the host presented our frame as it is: the guest capture and the host shot agree within 2 levels
+  for 98.5% of pixels. Request 2 now answers the AMD's gamma (design.md, "The display's colour"),
+  so CoreDisplay sends our pipe its profile's tables; the pixels have not been compared since. On the host, the stock lane's dark tones are lighter than ours, by up to about
   7 levels.
 - **Decided: the lane keeps its own.** Colour management depends on the display, and each lane
   is consistent with what it declares: ours declares sRGB and shows sRGB pixels, which is right

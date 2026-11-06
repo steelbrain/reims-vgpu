@@ -33,8 +33,12 @@
  * IOFramebuffer. IOPresentment asks them once it has the pipe, naming the
  * display by its index (0, the one framebuffer) or that index plus 1:
  * - 0x925, 12 bytes each way: whether the display is connected.
- * - 0x711, 0x196c bytes each way: one query about the display, by a
- *   request bit; the current mode's size is the one answer with content.
+ * - 0x711, 0x196c bytes each way: one query about the display's
+ *   capabilities, by a request bit. Request 2 answers its gamma: plane 0
+ *   takes tables, as on the AMD's display (RgfxGammaCapability.hpp), so
+ *   CoreDisplay fades and calibrates through the display pipe's gamma
+ *   selectors. Request 0x10 answers the current mode's size, request 1 has
+ *   words of its own, and the rest name no plane.
  * - 0x986, 0x90 bytes each way: one 128-byte block of the display's EDID.
  *
  * The first calls are logged, so a boot shows what was asked.

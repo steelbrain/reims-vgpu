@@ -1327,7 +1327,15 @@ colour matrix (6), the matrix, which rides the transaction at 0xb0 with dirty
 bit 0x40, and the pipe's gamma table after the matrix (7). CGDisplayFade, Night
 Shift and ColorSync's calibration set them; WindowServer's boot fade is a run
 of transactions about 16 to 30 ms apart that each set only selector 7's table,
-with no surface. The kext decodes the tables as macOS 26's IOAcceleratorFamily2
+with no surface. CoreDisplay sends tables only to a plane that has gamma, from
+the device control's answer to request 2 of attribute 0x711; a display whose
+answer names no plane gets "Attempting to get capabilities from plane with no
+gamma" and its fades drawn into WindowServer's own frames, whose last showed
+34% of the fade out and 71% of the fade in on car 13's boot (B4). The device
+control answers as macOS 26.7.1's AMD Radeon framebuffer does: plane 0 takes
+tables of type 0x10 (8 bits a channel to CoreDisplay) and 256 entries, values
+0.0 to 1.0 (read; `guest/kext/src/RgfxGammaCapability.hpp`,
+`tests/gamma_capability_test.cpp`). The kext decodes the tables as macOS 26's IOAcceleratorFamily2
 does and stages each for the transaction begun (read;
 `guest/kext/src/RgfxPipeColor.hpp`, `tests/pipe_color_test.cpp`); the submit
 sends them, and the matrix where it is dirty, as `DISPLAY_COLOR` parts of at
@@ -1347,7 +1355,9 @@ the display through them (`crates/reims-vgpu/src/graphics/color.rs`,
 display engine samples between them is not measured). Selectors 10 and 11 (the
 pipe's linearization before the matrix and its gamma after it, in
 IOPresentment's configuration format), 12 (a surface copy) and 13 (triage) stay
-refused: no WindowServer seen calls them.
+refused: no WindowServer seen calls them, and IOPresentment sends 11 only for a
+gamma entry of the configuration type (1), which the AMD adds as a second entry
+where its display path has it and the device control does not answer.
 
 **The display pipe's notification words.** The kext answers a pipe client with
 asynchronous results whose words IOAccelerator's notification callbacks read
