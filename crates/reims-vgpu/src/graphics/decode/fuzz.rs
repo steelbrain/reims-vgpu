@@ -35,9 +35,9 @@ use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
-    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxBufferCreate, RgfxMsgHeader,
-    RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate, RgfxTextureCreate,
-    RgfxTextureDescriptor,
+    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_EVT_CB_SCHEDULED, RgfxBufferCreate,
+    RgfxCbScheduled, RgfxMsgHeader, RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate,
+    RgfxTextureCreate, RgfxTextureDescriptor,
 };
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_core::testkit::FakePlatform;
@@ -743,10 +743,20 @@ fn an_answer_at_the_doorbell_keeps_the_order_of_a_take() {
                 }
                 if answering {
                     let posted = Arc::clone(&seen);
-                    let yes = dec.decoders().answer_at_doorbell(CONTEXT, &m, move |r| {
-                        posted.lock().push(("submitted", r.cb_obj_id));
-                        true
-                    });
+                    let yes = dec
+                        .decoders()
+                        .answer_at_doorbell(CONTEXT, &m, move |bytes| {
+                            // A CB_SUBMITTED or a CB_SCHEDULED, which share a layout.
+                            let m = RgfxCbScheduled::read_from_bytes(bytes).unwrap();
+                            let (r#type, cb_obj_id) = (m.header.r#type, m.cb_obj_id);
+                            let kind = if r#type == RGFX_EVT_CB_SCHEDULED {
+                                "scheduled"
+                            } else {
+                                "submitted"
+                            };
+                            posted.lock().push((kind, cb_obj_id));
+                            true
+                        });
                     answered += u64::from(yes);
                 }
                 let begun = refusing(|| dec.begin_taken(&device, &m, Some(queue)));

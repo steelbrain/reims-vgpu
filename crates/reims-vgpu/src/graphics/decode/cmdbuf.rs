@@ -58,6 +58,22 @@
 //! [`TAKE_IN_FLIGHT_MAX`], so the platform's `commandBuffer`, which waits while a queue holds 64,
 //! does not wait at its begin.
 //!
+//! **Scheduling.** A buffer that gets its `CB_SUBMITTED` at its take (it asks for one and waits
+//! for nothing) gets its `CB_SCHEDULED` there too, right after it, where no buffer begun before it
+//! on its queue owes its own ([`Line::owes`]), so a queue's records keep their order; one answered
+//! on a doorbell's thread gets it there where the same holds, and it then needs no submission
+//! handler unless it holds something. A buffer that does not ask keeps its `CB_SCHEDULED` to its
+//! scheduling: posted at its take, it would need its ticket in the commit order there, as a
+//! `CB_SUBMITTED` there does, and a walk held on one of a process's queues would then hold up the
+//! process's other queues' commits ([`Begun::scheduled_at_take`]). Metal makes such a buffer `Scheduled` within a fraction of a millisecond of its
+//! commit, whatever its queue runs on the GPU before it: on the M3 Max (macOS 27) the scheduled
+//! handler of a buffer on an idle queue runs about 10 us after `commitAndWaitUntilSubmitted`
+//! returns, and behind a 120 ms buffer `waitUntilScheduled` returns in 0.1 ms; commit to the
+//! scheduled handler was 0.20 ms on the AMD 5300M and 0.05 ms on Apple's paravirtualized device
+//! (11-03, `cws_probe`). Waiting for the platform's submission put it at 0.39 ms on the RTX 5080
+//! host (car 12, `submit_probe`), 0.26 ms of it from the take (11-03). Any other buffer gets it at
+//! its commit, behind an order on the GPU ([`Line`]), or at its scheduling.
+//!
 //! **Two kinds of failure.** A message or op that will not parse structurally — a
 //! short message, a bad `len`, an op body too short for a header — is a protocol
 //! error, reported as a [`DecodeError`] and the work abandoned. A structurally
@@ -115,7 +131,7 @@ use reims_vgpu_core::platform::values::{
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use super::super::completion::{cb_complete, cb_failed};
 use super::commit_order::Until;
@@ -278,29 +294,53 @@ type Unposted = (
     Option<Arc<Scheduled>>,
 );
 
-/// A command buffer's `CB_SCHEDULED`, posted once: by its submission handler, or, for a buffer the
-/// platform failed before it took its work, which runs no submission handler, by its completion
-/// handler ahead of its completion, so each buffer's comes before its `CB_COMPLETE`.
+/// A command buffer's `CB_SCHEDULED`, posted once: by the first of the answer on a doorbell's
+/// thread or the host's take of it, for a buffer that gets its `CB_SUBMITTED` there and has none
+/// before it on its queue that owes its own ([`Begun::post_at_take`]); its commit, behind an order on the GPU
+/// ([`Line`]); its submission handler; or, for a buffer the platform failed before it took its
+/// work, which runs no submission handler, its completion handler ahead of its completion, so each
+/// buffer's comes before its `CB_COMPLETE`.
 struct Scheduled {
     sink: ScheduledSink,
     record: RgfxCbScheduled,
     /// Whether it is posted, held across the post.
     posted: Mutex<bool>,
+    /// Its queue's count of the begun buffers that owe their record ([`Line::owes`]), which it
+    /// leaves once it is posted, or as it goes unposted; `None` where it was posted already as it
+    /// was made.
+    owed: Option<Arc<AtomicUsize>>,
 }
 
 impl Scheduled {
-    /// Posts the record unless it is posted already.
+    /// Posts the record unless it is posted already, then leaves its queue's count of owed
+    /// records: a buffer that finds none owed after it finds its record on the ring before its
+    /// own.
     fn post(&self) {
         let mut posted = self.posted.lock();
         if !*posted {
             (self.sink)(self.record);
             *posted = true;
+            if let Some(owed) = &self.owed {
+                owed.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 
     /// Whether the record is posted.
     fn is_posted(&self) -> bool {
         *self.posted.lock()
+    }
+}
+
+impl Drop for Scheduled {
+    /// A record never posted (its buffer never committed, or failed before it was taken, its
+    /// `CB_COMPLETE` standing for both) is owed no more.
+    fn drop(&mut self) {
+        if !*self.posted.get_mut()
+            && let Some(owed) = &self.owed
+        {
+            owed.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -321,13 +361,17 @@ type Records = (Option<Arc<Submitted>>, Arc<Scheduled>);
 /// the buffer until the buffer it waits for finishes (the Vulkan platform holds a wait on a shared
 /// event on the host until its value is reached), and the buffers behind it on its queue with it.
 /// So such a buffer gets its `CB_SUBMITTED` at its take, as one that waits for nothing does, and
-/// its `CB_SCHEDULED` at its commit; so does every buffer of its queue committed while one of them
-/// is not yet taken by the platform. A buffer that waits for an event, or for the host's fill of a
-/// device cache, or is behind one on its queue, keeps its records at its scheduling ([`Held`]).
+/// its `CB_SCHEDULED` there too where it gets that, else at its commit; so does every buffer of
+/// its queue committed while one of them is not yet taken by the platform. A buffer that waits for an event, or for the host's fill of a device cache, or is
+/// behind one on its queue, keeps its records at its scheduling ([`Held`]).
 ///
 /// The records of a queue go in its commit order: a buffer whose records go at its commit first
 /// posts those of every buffer committed before it on its queue not yet posted, whose order on the
 /// queue is fixed and none of which waits for anything by then ([`Line::post_through`]).
+///
+/// A buffer that asks for its `CB_SUBMITTED` and waits for nothing, and finds no buffer begun
+/// before it on its queue that owes its `CB_SCHEDULED` ([`Self::owes`]), gets its records at its
+/// take, or at its doorbell, whatever its queue's order on the GPU ([`Begun::post_at_take`]).
 #[derive(Default)]
 pub(crate) struct Line {
     /// The committed buffers' records not seen posted, oldest first.
@@ -335,14 +379,29 @@ pub(crate) struct Line {
     /// How many committed buffers of the queue that wait on the GPU for a buffer of another queue
     /// the platform has not yet taken.
     ordered: Arc<AtomicUsize>,
+    /// How many begun buffers of the queue owe their `CB_SCHEDULED`: counted from the begin until
+    /// the record is posted, or goes unposted ([`Scheduled`]).
+    owed: Arc<AtomicUsize>,
 }
 
 impl Line {
+    /// Whether a buffer begun before now on the queue owes its `CB_SCHEDULED`, so a later
+    /// buffer's would come before it.
+    pub(crate) fn owes(&self) -> bool {
+        self.owed.load(Ordering::Acquire) > 0
+    }
+
     /// How many committed buffers of the queue that wait on the GPU for a buffer of another queue
     /// the platform has not yet taken.
     #[cfg(test)]
     pub(crate) fn ordered(&self) -> usize {
         self.ordered.load(Ordering::Acquire)
+    }
+
+    /// The count of the queue's begun buffers that owe their `CB_SCHEDULED` ([`Self::owes`]).
+    #[cfg(test)]
+    pub(crate) fn owed(&self) -> &AtomicUsize {
+        &self.owed
     }
 
     /// Whether a buffer committed now posts its records at its commit, having none of its own
@@ -479,6 +538,10 @@ pub(crate) struct Begun<P: Platform> {
     line: Arc<Line>,
     /// Its `CB_SUBMITTED`, where it asks for one.
     submitted: Option<Arc<Submitted>>,
+    /// Its `CB_SCHEDULED`, where there is a sink.
+    scheduled: Option<Arc<Scheduled>>,
+    /// No buffer begun before it on its queue owed its `CB_SCHEDULED` as it was begun.
+    first: bool,
     /// Its hold of its queue, where it waits.
     held: Option<Arc<Held>>,
     /// A buffer before it on its queue holds the queue.
@@ -502,6 +565,49 @@ impl<P: Platform> Begun<P> {
     /// scheduling.
     pub(crate) fn submitted_at_take(&self) -> Option<&Arc<Submitted>> {
         (self.submitted.as_ref()).filter(|_| self.held.is_none() && !self.behind)
+    }
+
+    /// Its `CB_SCHEDULED`, where it gets it at its take: it gets its `CB_SUBMITTED` there
+    /// ([`Self::submitted_at_take`]), and no buffer begun before it on its queue owed its own as
+    /// it was begun, so the queue's records keep their order. Metal makes a buffer that waits for
+    /// nothing `Scheduled` within a fraction of a millisecond of its commit, whatever runs on the
+    /// GPU before it (the module doc). Any other gets it at its commit ([`Line`]), or at its
+    /// scheduling: one that does not ask would need its ticket in the commit order at its take,
+    /// as the `CB_SUBMITTED` there needs, so that another queue's buffer of its process begun
+    /// after the record is committed after it, and a walk held on one queue would then hold up
+    /// its process's other queues (`a_walk_held_in_a_draw_holds_up_no_other_queue`).
+    fn scheduled_at_take(&self) -> Option<&Arc<Scheduled>> {
+        (self.scheduled.as_ref()).filter(|_| self.first && self.submitted_at_take().is_some())
+    }
+
+    /// Whether it gets a record at its take ([`Self::post_at_take`]), so its ticket in the commit
+    /// order is to be issued first: where it gets its `CB_SUBMITTED` there.
+    pub(crate) fn posts_at_take(&self) -> bool {
+        self.submitted_at_take().is_some()
+    }
+
+    /// Posts what it gets at its take: its `CB_SUBMITTED` ([`Self::submitted_at_take`]), unless
+    /// an answer on a doorbell's thread posted it, then its `CB_SCHEDULED`
+    /// ([`Self::scheduled_at_take`]), unless that answer posted it too.
+    pub(crate) fn post_at_take(&self) {
+        if let Some(submitted) = self.submitted_at_take() {
+            submitted.post();
+        }
+        if let Some(scheduled) = self.scheduled_at_take() {
+            scheduled.post();
+        }
+    }
+}
+
+/// Command buffer `cb_obj_id`'s `CB_SCHEDULED` record, at its message's `seqno`.
+fn scheduled_record(cb_obj_id: u64, seqno: u64) -> RgfxCbScheduled {
+    RgfxCbScheduled {
+        header: RgfxMsgHeader {
+            r#type: RGFX_EVT_CB_SCHEDULED,
+            size: size_of::<RgfxCbScheduled>() as u32,
+            seqno,
+        },
+        cb_obj_id,
     }
 }
 
@@ -803,6 +909,9 @@ pub(crate) struct Answered {
     /// Its `CB_SUBMITTED` was posted; else the queue's ring was busy or full, and its begin posts
     /// it.
     posted: bool,
+    /// Its `CB_SCHEDULED` was posted after it, no buffer begun before it on its queue owing its
+    /// own; else its begin posts it where it may ([`Begun::post_at_take`]).
+    scheduled: bool,
 }
 
 impl<P: Platform> Decoders<P> {
@@ -819,13 +928,16 @@ impl<P: Platform> Decoders<P> {
     /// and not completed and no answered buffer not yet begun, and each lock it takes is free,
     /// each tried. Its turn in its queue's lane and its
     /// ticket in the commit order are taken together, or neither, and kept on its queue
-    /// ([`Answered`]), and the answer is posted through `post`, which waits for nothing and answers
-    /// whether it posted it. False, with nothing taken, where it is not answered.
+    /// ([`Answered`]), and the answer is posted through `post`, which posts a record's bytes,
+    /// waits for nothing and answers whether it posted it: its `CB_SUBMITTED`, then, where that
+    /// was posted and no buffer begun before it on its queue owes its `CB_SCHEDULED`
+    /// ([`Line::owes`]), its `CB_SCHEDULED`, as its take would post it
+    /// ([`Begun::post_at_take`]). False, with nothing taken, where it is not answered.
     pub(crate) fn answer_at_doorbell(
         &self,
         context: u32,
         message: &[u8],
-        post: impl FnOnce(&RgfxCbSubmitted) -> bool,
+        mut post: impl FnMut(&[u8]) -> bool,
     ) -> bool {
         let shared = &*self.0;
         let Some(m) = read::<RgfxCommandBuffer>(message) else {
@@ -912,7 +1024,12 @@ impl<P: Platform> Decoders<P> {
             // Its place among the tickets is taken: a buffer that names it may take its own
             // ([`super::commit_order`]).
             counts.order.commit.begin(m.header.seqno);
-            let posted = post(&record);
+            let posted = post(record.as_bytes());
+            // Every buffer of the queue taken before it is begun, and counted among the owed
+            // ([`Line::owes`]) where its record is still to come.
+            let scheduled = posted
+                && !counts.line.owes()
+                && post(scheduled_record(m.cb_obj_id, m.header.seqno).as_bytes());
             *slot = Some(Answered {
                 seqno: m.header.seqno,
                 cb_obj_id: m.cb_obj_id,
@@ -922,6 +1039,7 @@ impl<P: Platform> Decoders<P> {
                 ticket,
                 turn,
                 posted,
+                scheduled,
             });
             true
         });
@@ -1023,7 +1141,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// The IOSurfaces whose device caches it uses (its `SURFACE_USE` ops) are filled first where
     /// they hold an older generation, and it signals its queue's end event for their later copies
     /// ([`super::surface_cache`]). A buffer that asks for its `CB_SUBMITTED` and waits for nothing
-    /// gets it before the walk; any other at its scheduling.
+    /// gets it before the walk, and its `CB_SCHEDULED` there too where none begun before it on its
+    /// queue owes its own ([`Begun::post_at_take`]); any other at its scheduling.
     pub(super) fn decode_command_buffer(
         &self,
         device: &P::Device,
@@ -1034,13 +1153,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(begun) => begun,
             Err(e) => return Ok(Err(e)),
         };
-        // Submitted at once, unless it waits (for an event, or for the host's fill of a device
-        // cache) or a buffer before it on its queue does: then at its scheduling. Its ticket in
-        // the commit order is issued first, so a buffer its process sends after the answer is
-        // committed after this one ([`super::sequencer`]).
-        if let Some(submitted) = begun.submitted_at_take() {
+        // Submitted and scheduled at once where it asks, unless it waits (for an event, or for the
+        // host's fill of a device cache) or a buffer before it on its queue does: then at its
+        // scheduling; and scheduled at its take only where no buffer before it on its queue owes
+        // its scheduling.
+        // Its ticket in the commit order is issued first, so a buffer its process sends after the
+        // answer is committed after this one ([`super::sequencer`]).
+        if begun.posts_at_take() {
             self.issue_ticket();
-            submitted.post();
+            begun.post_at_take();
         }
         self.finish_command_buffer(device, message, begun)
     }
@@ -1081,8 +1202,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// taken: the turn, the mark and the ticket the answer on a doorbell's thread took for it,
     /// where it was answered there ([`Answered`]). A context closed before the buffer came gets
     /// [`DecodeError::ContextClosed`], with no turn taken; and where it gets its
-    /// `CB_SUBMITTED` at its take, that is posted here, once its ticket in the commit order is
-    /// issued, unless the answer posted it.
+    /// `CB_SUBMITTED` or its `CB_SCHEDULED` at its take, they are posted here, once its ticket in
+    /// the commit order is issued, unless the answer posted them ([`Begun::post_at_take`]).
     pub(crate) fn begin_taken(
         &mut self,
         device: &P::Device,
@@ -1102,6 +1223,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     *self.ticket.borrow_mut() = Some(answered.ticket);
                     *self.turn.borrow_mut() = answered.turn;
                     self.posted_at_doorbell.set(answered.posted);
+                    self.scheduled_at_doorbell.set(answered.scheduled);
                 }
                 None => *self.turn.borrow_mut() = Self::turn_on(counts),
             }
@@ -1119,9 +1241,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(begun) => begun,
             Err(e) => return Ok(Err(e)),
         };
-        if let Some(submitted) = begun.submitted_at_take() {
+        if begun.posts_at_take() {
             self.issue_ticket();
-            submitted.post();
+            begun.post_at_take();
         }
         Ok(Ok(begun))
     }
@@ -1259,6 +1381,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         let waits_for_order = !order_waits.is_empty();
         *self.order_waits.borrow_mut() = order_waits;
         let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
+        // Owed by its queue from now until it is posted, after every buffer begun before it.
+        let (scheduled, first) = self
+            .scheduled(m.cb_obj_id, m.header.seqno, Some(&counts.line))
+            .map_or((None, false), |(s, first)| (Some(s), first));
         // Those GPU waits hold back none of its records, nor its queue ([`Line`]).
         let (behind, held) = hold(counts, fill_waits || take.waits);
         Ok(Ok(Begun {
@@ -1275,6 +1401,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             waits_for_order,
             line: Arc::clone(&counts.line),
             submitted,
+            scheduled,
+            first,
             held,
             behind,
             drain,
@@ -1306,6 +1434,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             waits_for_order,
             line,
             submitted,
+            scheduled,
             held,
             behind,
             drain,
@@ -1348,14 +1477,16 @@ impl<P: Platform> GraphicsDecoder<P> {
         let signal_committed = signalled.as_ref().map(Signalled::committed);
         // Register the submission and completion paths and commit: no scheduled or completed
         // handler, so the platform posts the buffer's records from the threads that submit it
-        // and see it complete, waking no handler thread.
-        let scheduled = self.scheduled(cb_obj_id, seqno);
+        // and see it complete, waking no handler thread; and none to submit where its records
+        // went at its take and it holds nothing.
         // Its records go at its commit where the platform may hold it, or a buffer before it on
-        // its queue, for a buffer of another queue on the GPU ([`Line`]); else at its scheduling.
+        // its queue, for a buffer of another queue on the GPU ([`Line`]); else at its scheduling,
+        // where they did not go at its take.
         let early = held.is_none() && !behind && (waits_for_order || line.behind_an_order());
         let order_hold = waits_for_order.then(|| line.ordered_hold());
         let noted = scheduled.clone().map(|s| (submitted.clone(), s));
-        let submission = submission_handler(submitted.clone(), held.clone(), scheduled.clone());
+        let unposted = scheduled.clone().filter(|s| !s.is_posted());
+        let submission = submission_handler(submitted.clone(), held.clone(), unposted);
         let submission = taken_with(submission, order_hold.clone());
         let handler = self.completed_handler(
             cb_obj_id,
@@ -1627,21 +1758,32 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
     }
 
-    /// The `CB_SCHEDULED` of command buffer `cb_obj_id`, at `seqno`, where there is a sink.
-    fn scheduled(&self, cb_obj_id: u64, seqno: u64) -> Option<Arc<Scheduled>> {
+    /// The `CB_SCHEDULED` of command buffer `cb_obj_id`, at `seqno`, where there is a sink: posted
+    /// already where the answer on a doorbell's thread posted it, else owed by its queue, whose
+    /// records `line` keeps, until it is posted ([`Line::owes`]); and whether no buffer begun
+    /// before it on that queue owed its own then (true without a `line`).
+    fn scheduled(
+        &self,
+        cb_obj_id: u64,
+        seqno: u64,
+        line: Option<&Line>,
+    ) -> Option<(Arc<Scheduled>, bool)> {
         let sink = self.sinks.scheduled.clone()?;
-        Some(Arc::new(Scheduled {
+        let posted = self.scheduled_at_doorbell.get();
+        let (owed, first) = match line {
+            Some(line) if !posted => {
+                let before = line.owed.fetch_add(1, Ordering::AcqRel);
+                (Some(Arc::clone(&line.owed)), before == 0)
+            }
+            _ => (None, true),
+        };
+        let scheduled = Scheduled {
             sink,
-            record: RgfxCbScheduled {
-                header: RgfxMsgHeader {
-                    r#type: RGFX_EVT_CB_SCHEDULED,
-                    size: size_of::<RgfxCbScheduled>() as u32,
-                    seqno,
-                },
-                cb_obj_id,
-            },
-            posted: Mutex::new(false),
-        }))
+            record: scheduled_record(cb_obj_id, seqno),
+            posted: Mutex::new(posted),
+            owed,
+        };
+        Some((Arc::new(scheduled), first))
     }
 
     /// The completion handler of command buffer `cb_obj_id`, at `seqno`, whose op stream did
@@ -3677,7 +3819,7 @@ mod tests {
         for ran in [false, true] {
             posted.lock().clear();
             let submitted = dec.submitted(150, 80, true);
-            let scheduled = dec.scheduled(150, 80);
+            let scheduled = dec.scheduled(150, 80, None).map(|(s, _)| s);
             let submission = submission_handler(submitted.clone(), None, scheduled.clone());
             let handler = dec.completed_handler(
                 150,
@@ -3874,9 +4016,9 @@ mod tests {
         assert!(!called_before_submitted(&p, &at, mark, 152).contains(&ENCODER));
     }
 
-    /// A buffer that asks and waits for nothing but whose walk then faults is submitted as it was
-    /// taken, and fails at its completion, as Metal reports a command buffer's errors: the
-    /// stand-in's `CB_COMPLETE`, its failure, follows. One the host cannot take, of a queue it
+    /// A buffer that asks and waits for nothing but whose walk then faults is submitted and
+    /// scheduled as it was taken, and fails at its completion, as Metal reports a command
+    /// buffer's errors: the stand-in's `CB_COMPLETE`, its failure, follows. One the host cannot take, of a queue it
     /// does not hold, gets no `CB_SUBMITTED`.
     #[test]
     fn a_buffer_whose_walk_faults_is_submitted_then_fails() {
@@ -3901,6 +4043,7 @@ mod tests {
             *posted.lock(),
             [
                 (RGFX_EVT_CB_SUBMITTED, 160, 90),
+                (RGFX_EVT_CB_SCHEDULED, 160, 90),
                 (RGFX_EVT_CB_COMPLETE, 160, 90)
             ]
         );
@@ -3912,7 +4055,7 @@ mod tests {
             dec.decode(&device, &message).unwrap(),
             Err(DecodeError::BadReference)
         );
-        assert_eq!(posted.lock().len(), 2);
+        assert_eq!(posted.lock().len(), 3);
     }
 
     /// A `COMMAND_BUFFER` of queue 1 that draws and asks for its `CB_SUBMITTED`.
@@ -3932,12 +4075,19 @@ mod tests {
         posts: bool,
     ) -> bool {
         let posted = Arc::clone(posted);
-        dec.decoders().answer_at_doorbell(0, message, move |m| {
+        dec.decoders().answer_at_doorbell(0, message, move |bytes| {
             if posts {
-                (posted.lock()).push((m.header.r#type, m.cb_obj_id, m.header.seqno));
+                (posted.lock()).push(record_of(bytes));
             }
             posts
         })
+    }
+
+    /// The type, buffer and seqno of the `CB_SUBMITTED` or `CB_SCHEDULED` record `bytes`, as an
+    /// answer on a doorbell's thread posts it: the two share a layout.
+    fn record_of(bytes: &[u8]) -> (u32, u64, u64) {
+        let m = RgfxCbScheduled::read_from_bytes(bytes).unwrap();
+        (m.header.r#type, m.cb_obj_id, m.header.seqno)
     }
 
     /// What the answer on a doorbell's thread kept on queue 1, let go of; whether there was any.
@@ -3952,8 +4102,9 @@ mod tests {
     /// not where it waits for an event or a
     /// buffer before it holds its queue, not on a queue its context does not hold, not while its
     /// queue holds [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed or an answered
-    /// buffer not yet begun. Where it is, its `CB_SUBMITTED` is posted there, and what the answer
-    /// took is kept on its queue; where it is not, nothing is.
+    /// buffer not yet begun. Where it is, its `CB_SUBMITTED` and then its `CB_SCHEDULED` are posted
+    /// there, no buffer before it owing its own, and what the answer took is kept on its queue;
+    /// where it is not, nothing is.
     #[test]
     fn a_buffer_is_answered_at_the_doorbell_only_where_it_need_wait_for_nothing() {
         let (p, mut dec, posted) = posting(false);
@@ -3962,7 +4113,7 @@ mod tests {
         let answered = |dec: &GraphicsDecoder<FakePlatform>, message: &[u8]| {
             let before = posted.lock().len();
             let yes = answer(dec, message, &posted, true);
-            assert_eq!(posted.lock().len(), before + usize::from(yes));
+            assert_eq!(posted.lock().len(), before + 2 * usize::from(yes));
             assert_eq!(
                 let_go_of_answer(dec),
                 yes,
@@ -3971,10 +4122,10 @@ mod tests {
             yes
         };
         assert!(answered(&dec, &asking(170, 100)));
-        assert_eq!(
-            posted.lock().last(),
-            Some(&(RGFX_EVT_CB_SUBMITTED, 170, 100))
-        );
+        assert!(posted.lock().ends_with(&[
+            (RGFX_EVT_CB_SUBMITTED, 170, 100),
+            (RGFX_EVT_CB_SCHEDULED, 170, 100)
+        ]));
         let plain = command_buffer_message(171, 101, &render_ops());
         assert!(!answered(&dec, &plain), "no ask");
         // An ask that is not the stream's last op is left to the take, unread; a last op whose
@@ -4023,7 +4174,13 @@ mod tests {
             "an answered buffer not yet begun"
         );
         assert!(let_go_of_answer(&dec));
-        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 175, 105)]);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_CB_SUBMITTED, 175, 105),
+                (RGFX_EVT_CB_SCHEDULED, 175, 105)
+            ]
+        );
     }
 
     /// A buffer that uses a block whose `SURFACE_PAGES` the surface worker is still carrying out
@@ -4055,12 +4212,19 @@ mod tests {
         assert!(answer(&dec, &message, &posted, true), "another block's");
         assert!(let_go_of_answer(&dec));
         drop(other);
-        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 180, 110)]);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_CB_SUBMITTED, 180, 110),
+                (RGFX_EVT_CB_SCHEDULED, 180, 110)
+            ]
+        );
     }
 
     /// A buffer answered on a doorbell's thread calls nothing of the platform's there, and its
     /// begin takes what the answer took: it makes the calls a decode makes, and gets its
-    /// `CB_SUBMITTED` once, the answer's, or its begin's where the answer found the ring busy.
+    /// `CB_SUBMITTED` and `CB_SCHEDULED` once each, the answer's, or its begin's where the answer
+    /// found the ring busy.
     #[test]
     fn a_buffer_answered_at_the_doorbell_is_carried_out_as_one_decoded() {
         let (p, mut dec, posted) = posting(true);
@@ -4098,6 +4262,162 @@ mod tests {
             );
             posted.lock().clear();
         }
+    }
+
+    /// A buffer that asks for its `CB_SUBMITTED` and waits for nothing gets its `CB_SCHEDULED`
+    /// right after it as the host takes it, before its walk and its commit, with no submission
+    /// handler, though the platform holds its submission. One that does not ask gets its record
+    /// at its scheduling, from its submission handler, and an asking buffer behind it then gets
+    /// its `CB_SUBMITTED` at its take and its `CB_SCHEDULED` at its scheduling, after the one
+    /// before it. So does one behind a buffer that waits for an event; once nothing before it owes
+    /// its record, an asking buffer's goes at its take again.
+    #[test]
+    fn a_buffer_answered_at_its_take_is_scheduled_there() {
+        const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
+        const SCHED: u32 = RGFX_EVT_CB_SCHEDULED;
+        const ENCODER: &str = "renderCommandEncoderWithDescriptor:";
+        let (p, mut dec, posted) = posting(true);
+        let device = p.device();
+        create_events(&p, &mut dec, 0);
+        // The call-log mark at each `CB_SCHEDULED`'s post: every call logged before it was made
+        // before the post.
+        let at = Arc::new(Mutex::new(Vec::new()));
+        let (log, marks, sink) = (Arc::clone(&p), Arc::clone(&at), Arc::clone(&posted));
+        dec.set_scheduled_sink(Arc::new(move |m| {
+            marks.lock().push((m.cb_obj_id, log.call_log().mark()));
+            (sink.lock()).push((m.header.r#type, m.cb_obj_id, m.header.seqno));
+        }));
+        let before_scheduled = |from: u64, cb_obj_id: u64| -> Vec<&'static str> {
+            let (_, posted) = *at.lock().iter().find(|(cb, _)| *cb == cb_obj_id).unwrap();
+            (p.call_log().since(from).into_iter())
+                .filter(|c| c.seq < posted)
+                .map(|c| c.sel)
+                .collect()
+        };
+        let mut asks = render_ops();
+        asks.extend(op(RGFX_OP_SUBMITTED, &[]));
+        p.world().hold_submissions();
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(161, 91, &asks);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        let before = before_scheduled(mark, 161);
+        assert!(!before.contains(&ENCODER) && !before.contains(&"commit"));
+        let sels = p.call_log().sels_since(mark);
+        assert!(sels.contains(&"commit") && !sels.contains(&"addSubmissionHandler"));
+        assert_eq!(
+            *posted.lock(),
+            [(SUB, 161, 91), (SCHED, 161, 91)],
+            "at its take, the platform holding it"
+        );
+        posted.lock().clear();
+        for (cb, seqno, ops) in [(160, 90, render_ops()), (165, 95, asks.clone())] {
+            let mark = p.call_log().mark();
+            let message = command_buffer_message(cb, seqno, &ops);
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+            let sels = p.call_log().sels_since(mark);
+            assert!(
+                sels.contains(&"addSubmissionHandler"),
+                "{cb} has no submission handler"
+            );
+        }
+        assert_eq!(
+            *posted.lock(),
+            [(SUB, 165, 95)],
+            "the plain buffer's record waits for its scheduling, and so the next one's"
+        );
+        p.world().release_submissions();
+        assert_eq!(
+            posted.lock()[1..],
+            [(SCHED, 160, 90), (SCHED, 165, 95)],
+            "each at its scheduling, in their order"
+        );
+        posted.lock().clear();
+
+        p.world().hold_submissions();
+        let mut waits = event_op(RGFX_OP_WAIT_EVENT, 7, 1);
+        waits.extend(render_ops());
+        let mark = p.call_log().mark();
+        let message = command_buffer_message(162, 92, &waits);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert!(
+            p.call_log()
+                .sels_since(mark)
+                .contains(&"addSubmissionHandler")
+        );
+        let message = command_buffer_message(163, 93, &asks);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert!(posted.lock().is_empty(), "the wait holds both");
+        p.world().release_submissions();
+        assert_eq!(
+            *posted.lock(),
+            [(SCHED, 162, 92), (SUB, 163, 93), (SCHED, 163, 93)],
+            "each at its scheduling, in their order"
+        );
+        let line = Arc::clone(&dec.queue_counts(1).unwrap().line);
+        assert!(!line.owes());
+        let message = command_buffer_message(164, 94, &asks);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(
+            posted.lock()[3..],
+            [(SUB, 164, 94), (SCHED, 164, 94)],
+            "at its take"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        assert!(!line.owes());
+    }
+
+    /// An answer on a doorbell's thread posts the buffer's `CB_SCHEDULED` after its
+    /// `CB_SUBMITTED` where no buffer begun before it on its queue owes its own, and the buffer's
+    /// take posts neither again and adds no submission handler. Where one is owed, the answer
+    /// posts the `CB_SUBMITTED` alone, and so does the take while it is still owed; the
+    /// buffer's `CB_SCHEDULED` then goes at its scheduling.
+    #[test]
+    fn an_answer_at_the_doorbell_schedules_where_nothing_before_is_owed() {
+        const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
+        const SCHED: u32 = RGFX_EVT_CB_SCHEDULED;
+        let (p, mut dec, posted) = posting(true);
+        let device = p.device();
+        let message = asking(185, 115);
+        assert!(answer(&dec, &message, &posted, true));
+        assert_eq!(*posted.lock(), [(SUB, 185, 115), (SCHED, 185, 115)]);
+        let mark = p.call_log().mark();
+        let begun = dec
+            .begin_taken(&device, &message, Some(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            dec.finish_command_buffer(&device, &message, begun).unwrap(),
+            Ok(())
+        );
+        dec.end_message();
+        assert_eq!(posted.lock().len(), 2, "each posted once");
+        assert!(
+            !p.call_log()
+                .sels_since(mark)
+                .contains(&"addSubmissionHandler")
+        );
+
+        // A record owed by a buffer before it.
+        let line = Arc::clone(&dec.queue_counts(1).unwrap().line);
+        line.owed.fetch_add(1, Ordering::AcqRel);
+        let message = asking(186, 116);
+        assert!(answer(&dec, &message, &posted, true));
+        assert_eq!(posted.lock()[2..], [(SUB, 186, 116)]);
+        let begun = dec
+            .begin_taken(&device, &message, Some(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(posted.lock().len(), 3, "still owed at its take");
+        line.owed.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(
+            dec.finish_command_buffer(&device, &message, begun).unwrap(),
+            Ok(())
+        );
+        dec.end_message();
+        // The fake schedules a buffer as it is committed.
+        assert_eq!(posted.lock()[2..], [(SUB, 186, 116), (SCHED, 186, 116)]);
+        assert!(!line.owes());
+        p.world().complete_all(CompleteOn::Caller);
     }
 
     /// What an answer on a doorbell's thread took is let go of where the buffer is never begun
@@ -4213,7 +4533,13 @@ mod tests {
             assert_eq!(b.join().unwrap(), Ok(()));
         });
         assert_eq!(commits(), ["first", "second"]);
-        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 100, 1)]);
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_CB_SUBMITTED, 100, 1),
+                (RGFX_EVT_CB_SCHEDULED, 100, 1)
+            ]
+        );
         drop(dec);
     }
 
@@ -4265,7 +4591,14 @@ mod tests {
         let failed = failed.lock();
         assert_eq!(failed.iter().map(|f| f.0).collect::<Vec<_>>(), [193, 194]);
         assert_ne!(failed[1].1, RGFX_CB_OK, "the answered buffer failed");
-        assert_eq!(*posted.lock(), [(RGFX_EVT_CB_SUBMITTED, 194, 124)]);
+        // The decoder holds no scheduled sink, so the buffer before it owes no record.
+        assert_eq!(
+            *posted.lock(),
+            [
+                (RGFX_EVT_CB_SUBMITTED, 194, 124),
+                (RGFX_EVT_CB_SCHEDULED, 194, 124)
+            ]
+        );
     }
 
     /// A `COMMAND_BUFFER` message for queue `queue_obj_id`, command buffer `cb_obj_id`, carrying
@@ -6571,7 +6904,7 @@ mod tests {
         assert_eq!(
             *posted.lock(),
             [(RGFX_EVT_CB_SCHEDULED, 300, RGFX_CB_OK)],
-            "scheduled once, as its last part is"
+            "scheduled once, at its take"
         );
         for (part, (start, end)) in parts.iter().zip([(10, 20), (25, 40), (45, 60)]) {
             assert!(p.world().set_gpu_times(*part, start, end));
@@ -6672,8 +7005,10 @@ mod tests {
         assert_eq!(p.world().committed().len(), 1, "its order not yet reached");
     }
 
-    /// While a command buffer's parts are out, a command buffer of another queue of its context
-    /// is walked but committed only after its last part; one of another context is not held.
+    /// While a command buffer's parts are out, a command buffer of another queue of its context,
+    /// begun before it, is walked but committed only after its last part, waiting at its commit;
+    /// one begun after its take waits for its ticket there anyway, as it was scheduled at its take
+    /// ([`Begun::post_at_take`]).
     #[test]
     fn another_queue_s_commit_waits_for_a_buffer_s_last_part() {
         let Split { p, mut dec, .. } = splitting();
@@ -6691,15 +7026,28 @@ mod tests {
         let ops = [render_ops(), render_ops(), render_ops()].concat();
         let last = hooked(&ops) - 1;
         let gate = Arc::clone(&dec.shared.split_gate);
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let (tx, rx) = (Mutex::new(Some(tx)), Mutex::new(rx));
+        let (begun_tx, begun_rx) = std::sync::mpsc::channel::<()>();
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<()>();
+        let (begun_tx, out_tx, out_rx) = (
+            Mutex::new(Some(begun_tx)),
+            Mutex::new(Some(out_tx)),
+            Mutex::new(out_rx),
+        );
         let clock = Arc::clone(&p);
         dec.set_walk_hook(Some(Arc::new(move |index| {
             clock.virtual_clock().advance(SPLIT_AFTER);
+            // The other queue's buffer, begun first, walks on once the first part is out.
+            if std::thread::current().name() == Some("other") {
+                if index == 0 {
+                    begun_tx.lock().take();
+                    let _ = out_rx.lock().recv();
+                }
+                return;
+            }
             // Its first part is out, at its first encoder's end: the other queue's buffer goes;
             // at its last op, that buffer waits at its commit.
             if index == 1 {
-                tx.lock().take();
+                out_tx.lock().take();
             }
             if index == last {
                 for _ in 0..1000 {
@@ -6722,11 +7070,9 @@ mod tests {
         std::thread::scope(|scope| {
             let b = std::thread::Builder::new()
                 .name("other".into())
-                .spawn_scoped(scope, || {
-                    let _ = rx.lock().recv();
-                    other.decode(&p.device(), &later).unwrap()
-                })
+                .spawn_scoped(scope, || other.decode(&p.device(), &later).unwrap())
                 .unwrap();
+            let _ = begun_rx.recv();
             let a = std::thread::Builder::new()
                 .name("parts".into())
                 .spawn_scoped(scope, || {

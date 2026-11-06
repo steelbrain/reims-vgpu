@@ -1451,7 +1451,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// [`Decoders::answer_at_doorbell`]): it runs on that queue, no
     /// reset is under way, every lock it takes is free, each tried, no pipeline it names is still
     /// compiling, and no no-copy buffer of its context is being made on the surface worker
-    /// ([`Self::start_buffer_over_pages`]), which its begin waits for. Its `CB_SUBMITTED` is posted through `poster` waiting for nothing, once
+    /// ([`Self::start_buffer_over_pages`]), which its begin waits for. Its `CB_SUBMITTED` is
+    /// posted through `poster` waiting for nothing, and its `CB_SCHEDULED` after it where no buffer
+    /// before it on its queue owes its own, once
     /// its turn in its queue's lane and its ticket in the commit order are taken, which its begin
     /// on the service thread takes in their place ([`Self::begin_command_buffer`]), so the
     /// guest's later buffers are committed after it as they would be had it been answered there.
@@ -1470,9 +1472,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         if poster.stale() {
             return false;
         }
-        (self.decoders).answer_at_doorbell(context, message, |record| {
-            poster.try_post(record.as_bytes())
-        })
+        (self.decoders).answer_at_doorbell(context, message, |record| poster.try_post(record))
     }
 
     /// A pipeline create from ring 0: prepared here, on its context's lane, with the decoder's

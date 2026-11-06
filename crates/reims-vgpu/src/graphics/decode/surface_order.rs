@@ -1252,11 +1252,12 @@ mod tests {
     /// A buffer that waits on the GPU for a buffer of another queue holds back none of its
     /// records, nor its queue, as a Mac's order over IOSurfaces holds back none (Q16 of
     /// docs/graphics-kext/dgpu-oracle.md): with the platform holding every buffer (as the Vulkan
-    /// platform holds a wait for a shared event's value), it gets its `CB_SUBMITTED` at its take
-    /// and its `CB_SCHEDULED` at its commit, after those of the buffer committed before it on its
-    /// queue, and so does the buffer after it; its GPU wait stays, and the completions keep their
-    /// order. Once the platform takes them, nothing is posted twice, and a later buffer's records
-    /// go at its scheduling again
+    /// platform holds a wait for a shared event's value), it gets its `CB_SUBMITTED` and its
+    /// `CB_SCHEDULED` at its take where it asks, after those of the buffer committed before it on
+    /// its queue, and so does the buffer after it; its GPU wait stays, and the completions keep their order. Once
+    /// the platform takes them, nothing is posted twice. Where a buffer before it on its queue
+    /// still owes its `CB_SCHEDULED`, its own goes at its commit, and so does the next buffer's,
+    /// behind it on the platform
     #[test]
     fn an_order_on_the_gpu_holds_back_no_record() {
         use reims_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
@@ -1270,11 +1271,7 @@ mod tests {
 
         let (outcome, _) = r.commit(B, 1, &ops(None, &asks()));
         assert_eq!(outcome, Ok(()));
-        assert_eq!(
-            of(&posted, &[p]),
-            [(SUB, p)],
-            "at its take; scheduled once taken"
-        );
+        assert_eq!(of(&posted, &[p]), [(SUB, p), (SCHED, p)], "at its take");
         let (_, _) = r.commit(A, 5, &ops(Some(&[]), &[]));
         assert!(of(&posted, &[x]).is_empty(), "A's: once taken");
 
@@ -1287,8 +1284,8 @@ mod tests {
         );
         assert_eq!(
             of(&posted, &[p, o]),
-            [(SUB, p), (SUB, o), (SCHED, p), (SCHED, o)],
-            "its records at its take and its commit, its queue's earlier one's first"
+            [(SUB, p), (SCHED, p), (SUB, o), (SCHED, o)],
+            "its records at its take, its queue's earlier one's first"
         );
         let (held, line) = r
             .dec
@@ -1310,8 +1307,8 @@ mod tests {
             of(&posted, &[p, o, c]),
             [
                 (SUB, p),
-                (SUB, o),
                 (SCHED, p),
+                (SUB, o),
                 (SCHED, o),
                 (SUB, c),
                 (SCHED, c),
@@ -1323,17 +1320,40 @@ mod tests {
         );
         assert_eq!(line.ordered(), 0);
 
-        // Nothing of B's waits for another queue now: a buffer's scheduling is the platform's.
+        // A record owed before them on B (as by a buffer behind one that held B, not yet taken
+        // by the platform): the ordered buffer's goes at its commit, and so does the next one's,
+        // behind it on the platform, while a buffer that waits for nothing gets its own at its
+        // scheduling once A's is done.
         r.p.world().hold_submissions();
-        let d = cb(B, 4);
-        let (_, _) = r.commit(B, 4, &ops(Some(&[(A, 5)]), &asks()));
+        let (_, _) = r.commit(A, 6, &ops(Some(&[]), &[]));
+        line.owed().fetch_add(1, Ordering::AcqRel);
+        let (d, e) = (cb(B, 4), cb(B, 5));
+        let (_, _) = r.commit(B, 4, &ops(Some(&[(A, 6)]), &asks()));
+        let (_, _) = r.commit(B, 5, &ops(None, &asks()));
         assert_eq!(
-            of(&posted, &[d]),
-            [(SUB, d)],
+            of(&posted, &[d, e]),
+            [(SUB, d), (SCHED, d), (SUB, e), (SCHED, e)],
+            "at their commits"
+        );
+        assert_eq!(line.ordered(), 1);
+        line.owed().fetch_sub(1, Ordering::AcqRel);
+        r.p.world().release_submissions();
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(line.ordered(), 0);
+        let f = cb(B, 6);
+        r.p.world().hold_submissions();
+        line.owed().fetch_add(1, Ordering::AcqRel);
+        let (_, _) = r.commit(B, 6, &ops(Some(&[(A, 6)]), &asks()));
+        assert_eq!(
+            of(&posted, &[f]),
+            [(SUB, f)],
             "A's finished: scheduled once taken"
         );
+        line.owed().fetch_sub(1, Ordering::AcqRel);
         r.p.world().release_submissions();
-        assert_eq!(of(&posted, &[d]), [(SUB, d), (SCHED, d)]);
+        assert_eq!(of(&posted, &[f]), [(SUB, f), (SCHED, f)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(!line.owes());
     }
 
     /// A buffer that waits for a guest's event still holds its queue as it did beside the surface
@@ -1406,9 +1426,9 @@ mod tests {
 
     /// A buffer answered on a doorbell's thread behind one that waits on the GPU for a buffer of
     /// another queue, answered between that buffer's take and its commit (as the queue's lane
-    /// walks it), gets each record once and in its queue's order: its `CB_SUBMITTED` is the
-    /// answer's, which no take or commit posts again, and its `CB_SCHEDULED` goes at its commit,
-    /// after the ordered buffer's; once the platform takes both, nothing is posted again.
+    /// walks it), gets each record once and in its queue's order: its `CB_SUBMITTED` and its
+    /// `CB_SCHEDULED` are the answer's, after the ordered buffer's, posted at its take, and no
+    /// take or commit posts them again; once the platform takes both, nothing is posted again.
     #[test]
     fn a_doorbell_answer_behind_an_order_posts_each_record_once_in_order() {
         use reims_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
@@ -1429,7 +1449,7 @@ mod tests {
             .begin_taken(&r.device, &ordered, Some(B))
             .unwrap()
             .unwrap();
-        assert_eq!(of(&posted, &[o]), [(SUB, o)], "at its take");
+        assert_eq!(of(&posted, &[o]), [(SUB, o), (SCHED, o)], "at its take");
 
         // The next buffer, now at the head of the ring, ends in its ask: the doorbell answers it.
         let next = message(B, 3, &ops(None, &asks()));
@@ -1437,23 +1457,25 @@ mod tests {
         let answered = r
             .dec
             .decoders()
-            .answer_at_doorbell(context(B), &next, move |m| {
+            .answer_at_doorbell(context(B), &next, move |bytes| {
+                // A CB_SUBMITTED or a CB_SCHEDULED, which share a layout.
+                let m = <reims_graphics::wire::RgfxCbScheduled as zerocopy::FromBytes>::read_from_bytes(
+                    bytes,
+                )
+                .unwrap();
                 sink.lock().push((m.header.r#type, m.cb_obj_id));
                 true
             });
         assert!(answered, "no buffer before it holds its queue");
-        assert_eq!(of(&posted, &[o, d]), [(SUB, o), (SUB, d)]);
+        let answered = [(SUB, o), (SCHED, o), (SUB, d), (SCHED, d)];
+        assert_eq!(of(&posted, &[o, d]), answered);
 
         let finished = r
             .dec
             .finish_command_buffer(&r.device, &ordered, begun)
             .unwrap();
         assert_eq!(finished, Ok(()));
-        assert_eq!(
-            of(&posted, &[o, d]),
-            [(SUB, o), (SUB, d), (SCHED, o)],
-            "the ordered buffer's at its commit"
-        );
+        assert_eq!(of(&posted, &[o, d]), answered, "nothing at its commit");
         let begun = r
             .dec
             .begin_taken(&r.device, &next, Some(B))
@@ -1466,8 +1488,8 @@ mod tests {
         assert_eq!(finished, Ok(()));
         assert_eq!(
             of(&posted, &[o, d]),
-            [(SUB, o), (SUB, d), (SCHED, o), (SCHED, d)],
-            "the answered one's at its commit, behind the ordered one's, its answer not again"
+            answered,
+            "the answer's not again at the answered one's take or commit"
         );
 
         assert_eq!(r.p.world().release_submissions(), 3);
@@ -1476,8 +1498,8 @@ mod tests {
             of(&posted, &[o, d]),
             [
                 (SUB, o),
-                (SUB, d),
                 (SCHED, o),
+                (SUB, d),
                 (SCHED, d),
                 (DONE, o),
                 (DONE, d)

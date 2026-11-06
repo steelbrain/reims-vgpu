@@ -742,8 +742,9 @@ first round of a run), and within the 630's usual 1 to 5 ms, whatever it is orde
 completes after the access it is ordered after. Our stack: the bundle names the order
 (`SURFACE_ORDER`, design.md "Surface order"), the host makes the later buffer wait on the GPU, and
 the wait holds back neither the buffer's `CB_SUBMITTED` nor its `CB_SCHEDULED`, which it posts at
-the buffer's commit, nor those of the buffers committed behind it on its queue (`cmdbuf.rs`,
-`Line`).
+the buffer's take where it asks and no buffer before it on its queue owes its own, else at its
+commit, nor
+those of the buffers committed behind it on its queue (`cmdbuf.rs`, `Line`).
 
 **A divergence the lane does not use.** A read on another queue of the same process (on the M3, of
 another process too) is not always ordered after a pending write: on all three GPUs some rounds read

@@ -772,6 +772,8 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The command buffer's `CB_SUBMITTED` was posted on a doorbell's thread before its begin
     /// ([`cmdbuf::Answered`]).
     posted_at_doorbell: Cell<bool>,
+    /// Its `CB_SCHEDULED` was posted there too.
+    scheduled_at_doorbell: Cell<bool>,
     /// The drain of the message's context, taken at its command buffer's begin
     /// ([`Self::command_buffer_drain`]).
     drain: RefCell<Option<Arc<Drain>>>,
@@ -914,6 +916,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             ticket: RefCell::new(None),
             turn: RefCell::new(None),
             posted_at_doorbell: Cell::new(false),
+            scheduled_at_doorbell: Cell::new(false),
             drain: RefCell::new(None),
             order_waits: RefCell::new(Vec::new()),
             commit_after: RefCell::new(Vec::new()),
@@ -948,6 +951,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.commit_after.get_mut().clear();
         self.turn.get_mut().take();
         self.posted_at_doorbell.set(false);
+        self.scheduled_at_doorbell.set(false);
         self.drain.get_mut().take();
         self.order_waits.get_mut().clear();
     }

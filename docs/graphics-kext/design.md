@@ -1999,8 +1999,22 @@ handler.
 
 **Scheduled** (per-queue completion ring). A `CB_SCHEDULED` record (the command-buffer
 `ObjId`, at the buffer's seqno; 24 bytes, and the guest reads a record of at least that size)
-goes on the queue's completion ring once the host's platform has taken the buffer's work for
-the GPU, ahead of its `CB_COMPLETE`: the buffer's submission handler posts it. On
+goes on the queue's completion ring once, ahead of its `CB_COMPLETE`. A buffer that gets its
+`CB_SUBMITTED` at its take (it asks for one and waits for nothing, below) gets it there too,
+right after its `CB_SUBMITTED`, where no buffer begun before it on its queue owes its own, so a
+queue's records keep their order; one answered on its doorbell's thread gets it there, with its
+`CB_SUBMITTED`, where the same holds there. A buffer that does not ask keeps it to its
+scheduling: posted at its take, it would need the buffer's ticket in its process's commit order
+there, as the `CB_SUBMITTED` does, and a walk held on one of the process's queues would then hold
+up the commits of its others (`a_walk_held_in_a_draw_holds_up_no_other_queue`). Metal makes such
+a buffer `Scheduled` within a
+fraction of a millisecond of its commit, whatever its queue runs on the GPU before it (below);
+waiting for the platform's submission instead put the scheduled handler of a tiny buffer on an
+idle queue 0.39 ms after the commit on the RTX 5080 host (car 12, `submit_probe`), against
+0.20 ms on an AMD 5300M Mac and 0.05 ms on Apple's paravirtualized device. Such a buffer gets
+no submission handler where it holds nothing. Any other buffer gets it at its commit, behind an
+order on the GPU ("Surface order", below), or once the host's platform has taken the buffer's
+work for the GPU: the buffer's submission handler posts it. On
 metal2vulkan it runs on the thread that took the buffer's last batch for its `VkQueue`, once
 every wait of the buffer is satisfied, before the buffer reads `Scheduled`, and nothing
 committed later on the queue runs before the buffer; on Metal, which tells of no point before
@@ -2057,6 +2071,15 @@ and a bundle sends it only where the bit is set, which it reads in the device in
   before that commit. Where nothing need be waited for, the answer comes earlier still: on the
   guest's vCPU, inside its doorbell write, before the queue's thread takes the buffer
   ("The answer at the doorbell", below).
+- Loose (what "scheduled" means on the host), the same way: a buffer that asks for its
+  `CB_SUBMITTED` and waits for nothing is `Scheduled` once the host has taken it, or at its
+  doorbell, before its platform has its work,
+  where Metal makes it so once it has submitted it, which the guest cannot tell apart either:
+  nothing of the guest's is ordered by a buffer's scheduling but its later commits, which the
+  ticket orders, and what the GPU reads and writes, which a present, a CPU lock and another
+  queue's or process's buffer wait for from the commit or the post on, not from the scheduling
+  (§14, "CPU locks"; "Surface order", below). A buffer that waits on an event or a fill, or is
+  behind one that does, is `Scheduled` at its scheduling, past its waits, as on a Mac.
 - Inside the envelope (a fault): a buffer whose ops the host cannot carry out after it was
   answered fails at its `CB_COMPLETE`, as Metal reports a command buffer's errors at its
   completion, not at its commit.
@@ -2243,7 +2266,9 @@ committed in. The bundle names the order instead, as it posts each buffer:
   and the M3 in a run's first round, within 1 to 5 ms), and completes it after
   that access (dgpu-oracle.md, Q16). So the wait holds back none of the buffer's
   records, nor its queue: it gets its `CB_SUBMITTED` at its take, as a buffer
-  that waits for nothing does, and its `CB_SCHEDULED` at its commit, though the
+  that waits for nothing does, and its `CB_SCHEDULED` there too where it gets
+  that and no buffer before it on its queue owes its own, else at its commit,
+  though the
   platform may hold it until the buffer it waits for finishes (the Vulkan
   platform holds a wait for a shared event's value on the host until it is
   reached). So does every buffer committed behind it on its queue while the
