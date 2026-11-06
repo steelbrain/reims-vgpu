@@ -2053,7 +2053,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(OpenEncoder::Compute(enc, marks)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "compute"));
                     };
-                    // A dispatch while a slot holds a refused object is dropped ([`refused`]).
+                    // A dispatch while a slot of the encoder's state holds a refused object is
+                    // dropped ([`refused`]).
                     let dropped =
                         marks.skips() || (marks.drops_draws() && compute::dispatches(tag));
                     if !dropped {
@@ -2112,13 +2113,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         pass: &render::PassFacts,
     ) -> RaiseResult<Result<&'o [u8], DecodeError>> {
         let mut draws = Draws::new();
-        // Whether a slot holds a refused object ([`refused`]). Only an op's binding marks or ends a
-        // mark, so it is read again after each op [`render::decode_op`] carries out, not at each
-        // draw gathered.
+        // Whether a slot of the encoder's state holds a refused object ([`refused`]). Only an op's
+        // binding marks or ends a mark, so it is read again after each op [`render::decode_op`]
+        // carries out, not at each draw gathered.
         let mut refused = pass.refused.drops_draws();
         while !ops.is_empty() {
             // Draws one after another go to the encoder together; each other op, after them. While
-            // a slot holds a refused object, each op goes alone, and a draw is dropped.
+            // a slot of the encoder's state holds a refused object, each op goes alone, and a draw
+            // is dropped.
             if !refused && let Some((draw, len)) = self.vertex_draw(ops) {
                 draws.push(draw, enc)?;
                 ops = &ops[len..];

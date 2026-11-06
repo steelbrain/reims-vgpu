@@ -12,9 +12,15 @@
 //! - a resolver that meets one answers [`reference()`], a raise of its own, which the command
 //!   buffer's walk takes at the op ([`is_refused`]): an op that uses the object itself (a copy, a
 //!   fill, an indirect or indexed draw from it, a fence update or wait) is dropped;
-//! - a binding of one binds nil (a pipeline state is not set at all) and marks its slot
-//!   ([`Marks`]): the encoder's draws and dispatches are dropped while a slot of it is marked, and
-//!   a binding of an object the host holds, or of nil, at that slot ends the mark;
+//! - a binding of one binds nil and marks its slot ([`Marks`]), until a binding of an object the
+//!   host holds, or of nil, at that slot ends the mark. A buffer, texture or sampler bound so is
+//!   the guest's own nil there, and the encoder's draws and dispatches run, as Metal's do with nil
+//!   bound: a read of the texture is zero on the AMD 5300M and the Intel 630, and of the buffer
+//!   zero on the AMD and undefined on the Intel; a sampler's is the default one's on the AMD and
+//!   zero on the Intel (`oracle_nilbind`, docs/graphics-kext/dgpu-oracle.md, Q24). An offset op at
+//!   such a buffer slot sets nothing. A pipeline state is not set at all, and a depth/stencil
+//!   state or tessellation factor buffer is bound nil: the encoder's draws and dispatches are
+//!   dropped while one of these is marked;
 //! - an indirect command buffer's CPU encode of one is dropped and its command reset, and that
 //!   command's later draws and dispatches are dropped until the guest resets it
 //!   ([`super::icb::Dropped`]);
@@ -229,12 +235,23 @@ impl Slot {
     pub(crate) fn state(bound: Bound) -> Self {
         Slot::new(Stage::Encoder, bound, 0)
     }
+
+    /// Whether the encoder's draws and dispatches are dropped while the slot holds a refused
+    /// object: one of the encoder's own state's, which its draws cannot go without. A buffer,
+    /// texture or sampler slot is nil, which Metal draws with.
+    fn drops_draws(&self) -> bool {
+        matches!(
+            self.bound,
+            Bound::Pipeline | Bound::DepthStencil | Bound::TessellationFactors
+        )
+    }
 }
 
 /// The open encoder's binding slots that hold an object whose create the host refused, bound as
-/// nil: its draws and dispatches are dropped while any is held, as what they would read is
-/// not there. Empty in every run that refuses nothing, where each op and binding costs one load
-/// ([`Self::any`]), and the set itself is reached only out of line.
+/// nil: its draws and dispatches are dropped while a slot of its own state is held (a pipeline, a
+/// depth/stencil state, tessellation factors), and run while only a buffer, texture or sampler
+/// slot is, as with nil bound there. Empty in every run that refuses nothing, where each op and
+/// binding costs one load ([`Self::any`]), and the set itself is reached only out of line.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Marks {
     slots: RefCell<HashSet<Slot>>,
@@ -347,10 +364,18 @@ impl Marks {
         self.skipped.get()
     }
 
-    /// Whether an op that draws or dispatches is dropped.
+    /// Whether an op that draws or dispatches is dropped: the encoder's later ops are, or a slot of
+    /// its own state holds a refused object ([`Slot::drops_draws`]).
     #[inline]
     pub(crate) fn drops_draws(&self) -> bool {
-        self.skips() || self.any()
+        self.skips() || (self.any() && self.holds_state())
+    }
+
+    /// Whether the set holds a slot of the encoder's own state ([`Slot::drops_draws`]).
+    #[cold]
+    #[inline(never)]
+    fn holds_state(&self) -> bool {
+        self.slots.borrow().iter().any(Slot::drops_draws)
     }
 }
 
@@ -359,11 +384,12 @@ mod tests {
     use super::*;
 
     /// A binding of a refused object binds nil and marks its slot; a binding of another object, or
-    /// of nil, at that slot ends the mark; a binding at another slot leaves it.
+    /// of nil, at that slot ends the mark; a binding at another slot leaves it. The draws are
+    /// dropped while the encoder's own state's slot is marked.
     #[test]
     fn a_slot_is_marked_from_a_refused_binding_to_the_next_binding() {
         let marks = Marks::default();
-        let slot = Slot::new(Stage::Fragment, Bound::Texture, 0);
+        let slot = Slot::state(Bound::Pipeline);
         let other = Slot::new(Stage::Fragment, Bound::Texture, 1);
         assert!(!marks.drops_draws());
         assert_eq!(marks.bound::<u32>(slot, Err(reference(7))), Ok(None));
@@ -372,6 +398,36 @@ mod tests {
         assert!(marks.holds(slot), "a binding elsewhere ends no mark");
         assert_eq!(marks.bound::<u32>(slot, Ok(None)), Ok(None));
         assert!(!marks.holds(slot) && !marks.drops_draws());
+    }
+
+    /// A refused buffer, texture or sampler is nil at its slot, and the draws go on, as Metal's
+    /// with nil bound there (oracle_nilbind); its slot stays marked, so an offset op there sets
+    /// nothing. A refused state beside it drops them until it is bound again.
+    #[test]
+    fn a_refused_resource_binds_nil_and_drops_no_draws() {
+        let marks = Marks::default();
+        let resources = [
+            Slot::new(Stage::Vertex, Bound::Buffer, 0),
+            Slot::new(Stage::Fragment, Bound::Texture, 2),
+            Slot::new(Stage::Kernel, Bound::Sampler, 1),
+        ];
+        for slot in resources {
+            assert_eq!(marks.bound::<u32>(slot, Err(reference(7))), Ok(None));
+            assert!(marks.holds(slot));
+        }
+        assert!(!marks.drops_draws());
+        for bound in [
+            Bound::Pipeline,
+            Bound::DepthStencil,
+            Bound::TessellationFactors,
+        ] {
+            let state = Slot::state(bound);
+            assert_eq!(marks.bound::<u32>(state, Err(reference(8))), Ok(None));
+            assert!(marks.drops_draws());
+            assert_eq!(marks.bound(state, Ok(Some(&1u32))), Ok(Some(&1)));
+            assert!(!marks.drops_draws());
+        }
+        assert!(resources.iter().all(|&slot| marks.holds(slot)));
     }
 
     /// A raise that is not a refused reference passes through a binding, and marks nothing.

@@ -6510,8 +6510,8 @@ fn op_of(tag: u16, body: &[u8]) -> (u16, Vec<u8>) {
 
 /// An object whose posted create the host refused fails no command buffer that names it, as
 /// Metal fails none for an object it made (`decode::refused`): a pass with it as an attachment is
-/// skipped, a draw while it is bound is dropped and one after a binding of another at its slot is
-/// not, a copy from it is dropped and the fill beside it is not, a wait for an event of it is
+/// skipped, a binding of it binds nil and the draws after it run, as with nil bound, a copy from
+/// it is dropped and the fill beside it is not, a wait for an event of it is
 /// dropped, and a signal of a shared event of it still reaches the guest. A create over it stands
 /// refused in turn, and its destroy lets the id go.
 #[test]
@@ -6604,7 +6604,8 @@ fn what_names_a_refused_create_is_dropped_and_its_command_buffer_completes() {
         ),
         op_of(RGFX_OP_RENDER_DRAW_PRIMITIVES, draw.as_bytes()),
         op_of(RGFX_OP_ENCODER_END, &[]),
-        // A pass that binds it: its draw is dropped until another is bound there.
+        // A pass that binds it: nil is bound there, and its draws run, as Metal's do with nil
+        // bound (oracle_nilbind).
         op_of(RGFX_OP_ENCODER_BEGIN_RENDER, sized.as_bytes()),
         op_of(
             RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
@@ -6673,7 +6674,11 @@ fn what_names_a_refused_create_is_dropped_and_its_command_buffer_completes() {
         1,
         "the pass skipped"
     );
-    assert_eq!(log.count(DRAW), 1, "the draw while it was bound dropped");
+    assert_eq!(
+        log.count(DRAW),
+        2,
+        "the draw while it was bound runs, with nil there"
+    );
     let binds: Vec<Vec<Arg>> = (log.calls().into_iter())
         .filter(|c| c.sel == BIND)
         .map(|c| c.args)

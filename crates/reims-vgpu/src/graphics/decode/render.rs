@@ -206,8 +206,8 @@ fn resolve_heaps<'a, P: Platform>(
 }
 
 /// Whether render op `tag` draws (or dispatches its tiles, or executes an indirect command
-/// buffer): one dropped while a slot of its encoder holds an object whose create the host
-/// refused ([`refused`]).
+/// buffer): one dropped while a slot of its encoder's state holds an object whose create the
+/// host refused ([`refused`]).
 pub(crate) fn draws(tag: u16) -> bool {
     matches!(
         tag,

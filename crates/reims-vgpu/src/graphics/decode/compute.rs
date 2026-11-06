@@ -136,7 +136,8 @@ fn resolve_resources<'a, P: Platform>(
 }
 
 /// Whether compute op `tag` dispatches (or executes an indirect command buffer): one dropped
-/// while a slot of its encoder holds an object whose create the host refused ([`refused`]).
+/// while a slot of its encoder's state holds an object whose create the host refused
+/// ([`refused`]).
 pub(crate) fn dispatches(tag: u16) -> bool {
     matches!(
         tag,

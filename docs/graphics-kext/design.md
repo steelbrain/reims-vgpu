@@ -1477,9 +1477,13 @@ naming where the host refused it, as Metal would have made it. Its id stands
 for a refused object until its destroy (the decoder's `refused`), and what
 names it is dropped, never the command buffer that names it: an op that uses
 it (a copy, a fill, an indexed or indirect draw from it, a fence update or
-wait) is dropped; a binding of it binds nil and marks its slot, and the
-encoder's draws and dispatches are dropped while a slot is marked, until the
-slot is bound again; an indirect command buffer's CPU encode of it is dropped
+wait) is dropped; a binding of it binds nil and marks its slot until the slot
+is bound again. The draws and dispatches of an encoder with a buffer, texture
+or sampler bound so run, as Metal's do with nil bound there (the x86 Macs read
+a texture as zero, `oracle_nilbind`, dgpu-oracle.md Q24), and an offset op at
+such a buffer slot sets nothing; while a pipeline state, depth/stencil state or
+tessellation factor buffer slot is marked, they are dropped. An indirect
+command buffer's CPU encode of it is dropped
 and its command reset, and that command's later draws and dispatches are
 dropped until the guest resets it or copies a command over it; a use list's
 entry of it is nil; a render pass with it as
