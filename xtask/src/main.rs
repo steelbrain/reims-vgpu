@@ -52,7 +52,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "check",
-        about: "testkit, header --check, the prebuilt option ROM's record (make -C firmware prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64",
+        about: "testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64",
         run: cmd_check,
     },
 ];
@@ -203,10 +203,12 @@ fn cmd_check(args: &[String]) -> Res<bool> {
     let mut ok = true;
     ok &= cmd_testkit(&[])?;
     ok &= header::cmd_header(&["--check".to_owned()])?;
-    // The option ROM reims-ctl carries is built from the tree's sources: a change to what it is
-    // built from (the wire header among them) without it built again fails here, though the
-    // library's checks reach neither (firmware/prebuilt.sh).
+    // The option ROM and the guest's kexts reims-ctl carries are built from the tree's sources:
+    // a change to what they are built from (the wire header among them) without them built
+    // again fails here, though the library's checks reach neither (firmware/prebuilt.sh,
+    // guest/tools/prebuilt.py).
     ok &= make(&["-C", "firmware", "prebuilt-check"])?;
+    ok &= make(&["-C", "guest", "prebuilt-check"])?;
     if !flag(args, "--no-cargo") {
         let features = if cfg!(target_os = "linux") {
             LINUX_FEATURES
