@@ -80,8 +80,8 @@ mod tests {
     type Tex = Retained<ProtocolObject<dyn MTLTexture>>;
     type Dev = ProtocolObject<dyn MTLDevice>;
 
-    /// The display's and the blits' seven entry points.
-    const FUNCTIONS: [&str; 7] = [
+    /// The display's and the blits' nine entry points.
+    const FUNCTIONS: [&str; 9] = [
         "BlitInRGB_2P_XR10_A8",
         "BlitOutRGB_2P_XR10_A8",
         "displayPresentVertex",
@@ -89,6 +89,8 @@ mod tests {
         "displayPresentFragmentWithGammaTableAndColorMatrix",
         "displayPipeColorFragment",
         "displayPipeColorScanoutFragment",
+        "displayPipeLutFragment",
+        "displayPipeLutScanoutFragment",
     ];
 
     /// The 2P XR10 A8 pixel format (not public), its plane views' formats, and the XR10
@@ -316,9 +318,9 @@ mod tests {
         [p[2], p[1], p[0], p[3]]
     }
 
-    /// The source compiles on this host's Metal, with the seven entry points
+    /// The source compiles on this host's Metal, with the nine entry points
     #[test]
-    fn the_source_compiles_with_the_seven_functions() {
+    fn the_source_compiles_with_the_nine_functions() {
         let lib = shader_library(&device());
         for f in FUNCTIONS {
             assert!(

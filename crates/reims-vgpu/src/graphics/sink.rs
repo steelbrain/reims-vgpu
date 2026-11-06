@@ -26,6 +26,23 @@
 //! blit clips. The colour's buffers are made again only when a present changes it. With every
 //! stage off, the draw is as before.
 //!
+//! **The colour as a table.** A colour with no matrix maps each channel on its own: its output
+//! in red depends only on the input's red, and so on. Where the drawable is 8-bit unorm and what
+//! the draw reads takes only `n` values per channel (the scanout's bytes, 256; an 8-bit unorm
+//! surface, 256; a 10-bit unorm one, 1024, drawn at its own size, so each drawable pixel samples
+//! one of its texels), the draw then looks each channel up in a table of every input value
+//! (`displayPipeLutFragment`, `displayPipeLutScanoutFragment`) in place of running the stages at
+//! each pixel. The table is `n` × 1 pixels of the drawable's format, which the colour's function
+//! itself draws, through the very pipeline the pass would use, from a ramp of every value in the
+//! read's format (a texture of the surface's format, or 256 scanout pixels of one byte each):
+//! entry k is what the pass draws for a pixel of value k, so the drawable's bytes are the
+//! pass's. The draw that first needs a table draws it into a new one, ahead of its own pass, in
+//! its own command buffer, and so does each draw after it until a command buffer that drew it
+//! has completed without error: a draw dropped before its commit, or failed on the GPU, never
+//! leaves a table undrawn. A new colour,
+//! another read or another drawable format makes the table again. A colour with a matrix, a
+//! surface of another format or size, or a drawable of another format, take the pass.
+//!
 //! **The import.** The buffer covers the scanout's pages only: the host pages from the one its
 //! first row starts in to the one `stride × height` bytes on ends in, kept to the region. It is
 //! made at the first draw of a scanout and again only when the guest moves the scanout or changes
@@ -58,8 +75,10 @@ use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
 use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
 use reims_vgpu_core::platform::resource::Texture as _;
-use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlSize};
-use reims_vgpu_core::platform::values::ColorAttachmentSet;
+use reims_vgpu_core::platform::types::{
+    ClearColor, CommandBufferStatus, MtlOrigin, MtlRegion, MtlSize,
+};
+use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
@@ -112,15 +131,24 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     /// The present shaders' pipelines and the strip's two buffers, made at the first surface
     /// whose format a copy cannot carry; `None` inside where the platform refused them.
     converter: std::sync::OnceLock<Option<Converter<P>>>,
-    /// The colour's fragment functions, a surface's and the scanout's, made at the first draw
-    /// through a colour; `None` inside where the platform's library holds them not.
-    color_functions: std::sync::OnceLock<Option<[P::Function; 2]>>,
+    /// The colour's fragment functions ([`COLOR_FRAGMENTS`]), made at the first draw through a
+    /// colour; `None` inside where the platform's library holds them not.
+    color_functions: std::sync::OnceLock<Option<[P::Function; 4]>>,
     /// The colour's pipelines, by what they draw and the drawable's pixel format.
     color_pipelines: Mutex<ColorPipelines<P>>,
     /// The colour's buffers, made for the colour of that count of changes.
     color_buffers: Mutex<Option<(u64, ColorBuffers<P>)>>,
     /// Whether a draw was refused yet: the first refusal is logged at WARN ([`Self::scoped`]).
     refused: AtomicBool,
+    /// The colour's table last drawn (the module doc).
+    color_table: Mutex<Option<ColorTable<P>>>,
+    /// The ramps the tables of surfaces are drawn from, by pixel format, made at their first use.
+    ramps: Mutex<Vec<(u64, P::Texture)>>,
+    /// The scanout's ramp, made at its first use; `None` inside where the platform refused it.
+    scanout_ramp: std::sync::OnceLock<Option<ScanoutRead<P>>>,
+    /// For the tests: every colour takes the pass, with no table.
+    #[cfg(test)]
+    tables_off: AtomicBool,
 }
 
 /// An encoder a draw holds open, ended by [`Open::end`]. One a death in the draw unwinds past
@@ -193,6 +221,38 @@ enum ColorSource {
     Surface,
     /// `displayPipeColorScanoutFragment`.
     Scanout,
+    /// `displayPipeLutFragment`: a surface through the colour's table.
+    SurfaceTable,
+    /// `displayPipeLutScanoutFragment`: the scanout through the colour's table.
+    ScanoutTable,
+}
+
+impl ColorSource {
+    /// Its fragment function's place in [`COLOR_FRAGMENTS`].
+    fn function(self) -> usize {
+        match self {
+            ColorSource::Surface => 0,
+            ColorSource::Scanout => 1,
+            ColorSource::SurfaceTable => 2,
+            ColorSource::ScanoutTable => 3,
+        }
+    }
+}
+
+/// What a colour's table is drawn from: the scanout's bytes, or a surface of a pixel format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableSource {
+    Scanout,
+    Surface(u64),
+}
+
+/// The colour's table last drawn (the module doc): what it is for, the colour's count of
+/// changes, what it reads and the drawable's pixel format; the table; and whether a command
+/// buffer that drew it has completed.
+struct ColorTable<P: Platform> {
+    made_for: (u64, TableSource, u64),
+    texture: P::Texture,
+    drawn: Arc<AtomicBool>,
 }
 
 /// Where a draw through the colour reads the scanout (`displayPipeColorScanoutFragment`'s
@@ -239,11 +299,45 @@ impl<P: Platform> Clone for Read<'_, P> {
 
 impl<P: Platform> Copy for Read<'_, P> {}
 
-/// The colour's fragment functions: a surface's, and the scanout's.
-const COLOR_FRAGMENTS: [&str; 2] = [
+/// The colour's fragment functions: a surface's and the scanout's, then their twins that look the
+/// colour up in its table.
+const COLOR_FRAGMENTS: [&str; 4] = [
     "displayPipeColorFragment",
     "displayPipeColorScanoutFragment",
+    "displayPipeLutFragment",
+    "displayPipeLutScanoutFragment",
 ];
+/// The drawables' pixel formats a colour's table is drawn in: `MTLPixelFormatRGBA8Unorm` and
+/// `MTLPixelFormatBGRA8Unorm`, whose bytes a draw reads back as it wrote them.
+const TABLE_DRAWABLES: [u64; 2] = [70, 80];
+/// The values each channel of the scanout takes, and so its table's entries.
+const SCANOUT_VALUES: u64 = 256;
+/// `MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget`, and storage mode private: a table.
+const TABLE_USAGE: u64 = 0x1 | 0x4;
+const PRIVATE: u64 = 0x20;
+/// `MTLTextureUsageShaderRead`: a ramp.
+const RAMP_USAGE: u64 = 0x1;
+
+/// The bytes of a ramp's pixel of value `k` in every channel.
+type RampPixel = fn(u32) -> [u8; 4];
+
+/// The values each channel of a surface of pixel format `format` takes, where it is one a table
+/// can carry: `MTLPixelFormatRGBA8Unorm` (70) and `BGRA8Unorm` (80), 256; `RGB10A2Unorm` (90) and
+/// `BGR10A2Unorm` (94), 1024; with the bytes of a ramp's pixel of value `k` in every channel. An
+/// sRGB or float format samples to values off the n-step grid, and takes the pass.
+fn table_values(format: u64) -> Option<(u64, RampPixel)> {
+    match format {
+        70 | 80 => Some((256, |k| {
+            let k = u8::try_from(k).unwrap_or(u8::MAX);
+            [k, k, k, u8::MAX]
+        })),
+        90 | 94 => Some((1024, |k| {
+            let k = k.min(1023);
+            (k | (k << 10) | (k << 20) | (3 << 30)).to_le_bytes()
+        })),
+        _ => None,
+    }
+}
 /// The colour pipelines' label.
 const COLOR_LABEL: &str = "reims-vgpu.display-pipe-color";
 
@@ -337,7 +431,18 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             color_pipelines: Mutex::default(),
             color_buffers: Mutex::default(),
             refused: AtomicBool::new(false),
+            color_table: Mutex::new(None),
+            ramps: Mutex::default(),
+            scanout_ramp: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            tables_off: AtomicBool::new(false),
         })
+    }
+
+    /// For the tests: every colour takes the pass from now on, with no table.
+    #[cfg(test)]
+    pub(crate) fn without_tables(&self) {
+        self.tables_off.store(true, Ordering::Relaxed);
     }
 
     /// Runs `draw`, a draw of the display, in a refusal scope (the module doc, "A refused draw"):
@@ -587,17 +692,19 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             .get_or_init(|| {
                 let library = self.device.new_shader_library().ok().flatten()?;
                 let function = |name| no_catch(library.new_function(OnFault::Die, name));
-                Some([function(COLOR_FRAGMENTS[0])?, function(COLOR_FRAGMENTS[1])?])
+                Some([
+                    function(COLOR_FRAGMENTS[0])?,
+                    function(COLOR_FRAGMENTS[1])?,
+                    function(COLOR_FRAGMENTS[2])?,
+                    function(COLOR_FRAGMENTS[3])?,
+                ])
             })
             .as_ref()?;
         let mut pipelines = self.color_pipelines.lock();
         if let Some((_, pipeline)) = pipelines.iter().find(|(key, _)| *key == (source, format)) {
             return Some(pipeline.clone_ref());
         }
-        let fragment = match source {
-            ColorSource::Surface => &functions[0],
-            ColorSource::Scanout => &functions[1],
-        };
+        let fragment = &functions[source.function()];
         let made = self
             .device
             .new_render_pipeline_state(&RenderPipelineDesc {
@@ -678,8 +785,10 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     }
 
     /// Encodes into `command_buffer` a render pass that clears `texture` to black and draws
-    /// `read` over `at` through `color`, the colour of `changes` changes; `None`, with no pass
-    /// encoded, where the platform refuses the colour's pipeline or buffers.
+    /// `read` over `at` through `color`, the colour of `changes` changes: through the colour's
+    /// table where it has one for them (the module doc), drawn first where it is not yet, else by
+    /// the colour's pass; `None`, with no pass encoded, where the platform refuses the colour's
+    /// pipeline or buffers.
     fn encode_color_pass(
         &self,
         command_buffer: &P::CommandBuffer,
@@ -689,13 +798,211 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         texture: &P::Texture,
         at: PixelRect,
     ) -> Option<()> {
+        let table = self.color_table(command_buffer, changes, color, read, texture, at);
+        self.encode_color_draw(
+            command_buffer,
+            changes,
+            color,
+            read,
+            table.as_ref(),
+            texture,
+            at,
+        )
+    }
+
+    /// The colour's table for drawing `read` into `drawable` over `at` through `color`, the
+    /// colour of `changes` changes, drawn into `command_buffer` first where no command buffer
+    /// that drew it has completed; `None` where the draw takes the pass (the module doc), or the
+    /// platform refuses the table, its ramp or its draw.
+    fn color_table(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        changes: u64,
+        color: &DisplayColor,
+        read: Read<'_, P>,
+        drawable: &P::Texture,
+        at: PixelRect,
+    ) -> Option<P::Texture> {
+        #[cfg(test)]
+        if self.tables_off.load(Ordering::Relaxed) {
+            return None;
+        }
+        let matrix = usize::try_from(RGFX_COLOR_MATRIX).ok()?;
+        let format = drawable.pixel_format();
+        if color.stages.get(matrix)?.is_some() || !TABLE_DRAWABLES.contains(&format) {
+            return None;
+        }
+        let (source, values) = match read {
+            Read::Scanout(_) => (TableSource::Scanout, SCANOUT_VALUES),
+            Read::Surface(surface) => {
+                let (values, _) = table_values(surface.pixel_format())?;
+                if (surface.width(), surface.height()) != (at.width, at.height) {
+                    return None;
+                }
+                (TableSource::Surface(surface.pixel_format()), values)
+            }
+        };
+        let made_for = (changes, source, format);
+        let mut kept = self.color_table.lock();
+        let (texture, drawn) = match kept.as_ref() {
+            Some(table) if table.made_for == made_for => {
+                if table.drawn.load(Ordering::Acquire) {
+                    return Some(table.texture.clone_ref());
+                }
+                (table.texture.clone_ref(), Arc::clone(&table.drawn))
+            }
+            _ => {
+                let texture = self.new_texture(format, values, TABLE_USAGE, Some(PRIVATE))?;
+                let drawn = Arc::new(AtomicBool::new(false));
+                *kept = Some(ColorTable {
+                    made_for,
+                    texture: texture.clone_ref(),
+                    drawn: Arc::clone(&drawn),
+                });
+                (texture, drawn)
+            }
+        };
+        drop(kept);
+        let whole = PixelRect {
+            x: 0,
+            y: 0,
+            width: values,
+            height: 1,
+        };
+        match source {
+            TableSource::Scanout => {
+                let ramp = self.scanout_ramp()?;
+                self.encode_color_draw(
+                    command_buffer,
+                    changes,
+                    color,
+                    Read::Scanout(ramp),
+                    None,
+                    &texture,
+                    whole,
+                )?;
+            }
+            TableSource::Surface(surface) => {
+                let ramp = self.ramp(surface)?;
+                self.encode_color_draw(
+                    command_buffer,
+                    changes,
+                    color,
+                    Read::Surface(&ramp),
+                    None,
+                    &texture,
+                    whole,
+                )?;
+            }
+        }
+        no_catch(command_buffer.add_completed_handler(
+            OnFault::Die,
+            Box::new(move |info| {
+                if info.status == CommandBufferStatus::COMPLETED {
+                    drawn.store(true, Ordering::Release);
+                }
+            }),
+        ));
+        Some(texture)
+    }
+
+    /// A texture of `format`, `width` × 1 pixels, of `usage` and `options`, on the sink's
+    /// device; `None` where the platform refuses it.
+    fn new_texture(
+        &self,
+        format: u64,
+        width: u64,
+        usage: u64,
+        options: Option<u64>,
+    ) -> Option<P::Texture> {
+        let descriptor = self.platform.texture_descriptor(&TextureDesc {
+            pixel_format: format,
+            width,
+            height: 1,
+            usage,
+            resource_options: options,
+            ..TextureDesc::default()
+        });
+        no_catch(self.device.new_texture(OnFault::Die, &descriptor))
+    }
+
+    /// The ramp a table of a surface of pixel format `format` is drawn from: a texture of that
+    /// format whose pixel k holds value k in every channel, made at its first use; `None` where
+    /// the format takes no table or the platform refuses the texture.
+    fn ramp(&self, format: u64) -> Option<P::Texture> {
+        let mut ramps = self.ramps.lock();
+        if let Some((_, ramp)) = ramps.iter().find(|(f, _)| *f == format) {
+            return Some(ramp.clone_ref());
+        }
+        let (values, pixel) = table_values(format)?;
+        let ramp = self.new_texture(format, values, RAMP_USAGE, None)?;
+        let bytes: Vec<u8> = (0..u32::try_from(values).ok()?).flat_map(pixel).collect();
+        let length = u64::try_from(bytes.len()).ok()?;
+        // SAFETY: the bytes live across the call, which copies them out and keeps no pointer.
+        let pixels =
+            unsafe { HostRange::new(HostPtr::from_ptr(bytes.as_ptr().cast_mut()), length) };
+        no_catch(ramp.replace_region(
+            MtlRegion {
+                origin: MtlOrigin::new(0, 0, 0),
+                size: MtlSize::new(values, 1, 1),
+            },
+            0,
+            0,
+            pixels,
+            length,
+            length,
+        ));
+        ramps.push((format, ramp.clone_ref()));
+        Some(ramp)
+    }
+
+    /// The scanout's ramp: 256 pixels whose pixel k holds byte k in every channel, read from the
+    /// top left of a table as the scanout's colour function reads the scanout; made at its first
+    /// use, `None` where the platform refuses its buffer.
+    fn scanout_ramp(&self) -> Option<&ScanoutRead<P>> {
+        self.scanout_ramp
+            .get_or_init(|| {
+                let bytes: Vec<u8> = (0..=u8::MAX).flat_map(|k| [k; 4]).collect();
+                Some(ScanoutRead {
+                    buffer: self.buffer_of(&bytes)?,
+                    origin: (0, 0),
+                    stride_words: u32::try_from(SCANOUT_VALUES).ok()?,
+                    first_word: 0,
+                })
+            })
+            .as_ref()
+    }
+
+    /// Encodes into `command_buffer` a render pass that clears `texture` to black and draws
+    /// `read` over `at`, through `table`, the colour's table, where it is given, else through
+    /// `color`, the colour of `changes` changes, by the colour's pass; `None`, with no pass
+    /// encoded, where the platform refuses the colour's pipeline or buffers.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one pass, of the colour's or its table's"
+    )]
+    fn encode_color_draw(
+        &self,
+        command_buffer: &P::CommandBuffer,
+        changes: u64,
+        color: &DisplayColor,
+        read: Read<'_, P>,
+        table: Option<&P::Texture>,
+        texture: &P::Texture,
+        at: PixelRect,
+    ) -> Option<()> {
         let converter = self.converter()?;
-        let source = match read {
-            Read::Surface(_) => ColorSource::Surface,
-            Read::Scanout(_) => ColorSource::Scanout,
+        let source = match (read, table) {
+            (Read::Surface(_), None) => ColorSource::Surface,
+            (Read::Scanout(_), None) => ColorSource::Scanout,
+            (Read::Surface(_), Some(_)) => ColorSource::SurfaceTable,
+            (Read::Scanout(_), Some(_)) => ColorSource::ScanoutTable,
         };
         let pipeline = self.color_pipeline(converter, source, texture.pixel_format())?;
-        let buffers = self.color_buffers(changes, color)?;
+        let buffers = match table {
+            None => Some(self.color_buffers(changes, color)?),
+            Some(_) => None,
+        };
         let scanout_at = match read {
             Read::Scanout(r) => {
                 let words = [r.origin.0, r.origin.1, r.stride_words, r.first_word];
@@ -750,17 +1057,25 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                     offset: 0,
                     index: 1,
                 },
-                RenderCmd::SetFragmentBuffer {
+            ];
+            if let Some(buffers) = &buffers {
+                cmds.push(RenderCmd::SetFragmentBuffer {
                     buffer: Some(&buffers.properties),
                     offset: 0,
                     index: 0,
-                },
-            ];
-            for (index, table) in (1..).zip(&buffers.tables) {
-                cmds.push(RenderCmd::SetFragmentBuffer {
-                    buffer: Some(table),
-                    offset: 0,
-                    index,
+                });
+                for (index, table) in (1..).zip(&buffers.tables) {
+                    cmds.push(RenderCmd::SetFragmentBuffer {
+                        buffer: Some(table),
+                        offset: 0,
+                        index,
+                    });
+                }
+            }
+            if let Some(table) = table {
+                cmds.push(RenderCmd::SetFragmentTexture {
+                    texture: Some(table),
+                    index: 1,
                 });
             }
             match (read, &scanout_at) {
@@ -1022,8 +1337,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
 #[cfg(test)]
 mod tests {
     use reims_vgpu_core::platform::ObjId;
-    use reims_vgpu_core::platform::values::TextureDesc;
-    use reims_vgpu_core::testkit::objects::kind;
+    use reims_vgpu_core::testkit::objects::{CompleteOn, kind};
     use reims_vgpu_core::testkit::{Arg, FakePlatform};
 
     use super::super::color::Table;
@@ -1039,6 +1353,8 @@ mod tests {
     const NEW_TEXTURE: &str = "newTextureWithDescriptor:";
     const NEW_PIPELINE: &str = "newRenderPipelineStateWithDescriptor:error:";
     const NAMED: &str = "newFunctionWithName:";
+    const FRAGMENT_TEXTURE: &str = "setFragmentTexture:atIndex:";
+    const REPLACE: &str = "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
 
     /// The scanout `rig` shows.
     const SCANOUT: Scanout = Scanout {
@@ -1144,11 +1460,14 @@ mod tests {
 
     /// A death in a draw (the platform's, at the scanout's copy, or at a draw through the
     /// display's colour) refuses that draw alone: it answers nothing, the encoder it held open is
-    /// ended after the death, nothing is committed, and the next draw draws
+    /// ended after the death, nothing is committed, and the next draw draws. The colour's pass,
+    /// with no table (a death in a draw through the colour's table:
+    /// `a_death_in_a_table_s_draw_refuses_that_draw_alone`)
     #[test]
     fn a_death_in_a_draw_refuses_that_draw_alone() {
         use reims_vgpu_core::testkit::Step;
         let (platform, draw, presented, drawable) = rig();
+        draw.without_tables();
         let log = platform.call_log();
         let region = PixelRect {
             x: 0,
@@ -1182,16 +1501,86 @@ mod tests {
         }
     }
 
+    /// A death in a draw through the colour's table refuses that draw alone, wherever it comes:
+    /// at the upload of the ramp the table is drawn from, at the draw of the table, or at the draw
+    /// of the frame through it. Every encoder the draw began is ended, the one open at the death
+    /// after it, nothing is committed, and the next draw draws the table and the frame through it
+    /// and commits
+    #[test]
+    fn a_death_in_a_table_s_draw_refuses_that_draw_alone() {
+        use reims_vgpu_core::testkit::Step;
+        const BEGIN: &str = "renderCommandEncoderWithDescriptor:";
+        let (platform, draw, presented, drawable) = rig();
+        let log = platform.call_log();
+        let region = PixelRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 32,
+        };
+        let surface = texture(&draw, 94);
+        *presented.texture.lock() = Some(ShownTexture {
+            texture: surface.clone_ref(),
+            hold: Arc::new(DisplayHold {
+                span: None,
+                answers: Mutex::default(),
+            }),
+        });
+        let post: Table = Arc::from(vec![[0.0, 0.0, 0.0, 0.0], [0.5, 0.25, 1.0, 0.0]]);
+        // Where it dies, and the calls of that selector before it that go through.
+        for (changes, (at, before)) in (1..).zip([(REPLACE, 0), (DRAW, 0), (DRAW, 1)]) {
+            set_color(
+                &presented,
+                changes,
+                [None, None, None, Some(Arc::clone(&post))],
+            );
+            for _ in 0..before {
+                platform.script().push(at, Step::Default);
+            }
+            platform.script().push(at, Step::crash());
+            let mark = log.mark();
+            assert!(draw.encode(&drawable, region).is_none(), "{at} {before}");
+            let sels = log.sels_since(mark);
+            let died = sels
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| **s == at)
+                .nth(before)
+                .map(|(i, _)| i)
+                .expect("the call that died");
+            let ended = sels.iter().filter(|s| **s == "endEncoding").count();
+            assert_eq!(
+                sels.iter().filter(|s| **s == BEGIN).count(),
+                ended,
+                "every encoder ended: {sels:?}"
+            );
+            if at == DRAW {
+                assert_eq!(&sels[died + 1..], ["endEncoding"], "{sels:?}");
+            }
+            assert!(!sels.contains(&"commit"), "{sels:?}");
+
+            let mark = log.mark();
+            let (command_buffer, presents) = draw.encode(&drawable, region).expect("a draw");
+            presents.after(&command_buffer);
+            command_buffer.commit(OnFault::Die).unwrap();
+            let sels = log.sels_since(mark);
+            assert_eq!(count_since(&platform, mark, DRAW), 2, "{sels:?}");
+            assert!(sels.contains(&"commit"), "{sels:?}");
+        }
+    }
+
     /// With every stage off, the scanout is blitted into the drawable and nothing is drawn; with
     /// a stage on, it is drawn into the drawable by the scanout's colour function, reading the
     /// imported pages in place (no copy), with the properties at fragment buffer 0 (the matrix's
     /// rows, each stage's entry count), the gamma tables at 1 to 3, the pages at 4 and the
     /// scanout's place at 5 (the drawable pixel of its top left, its row and first pixel in
     /// words); the next draw of the same colour makes no table, texture or pipeline, and a change
-    /// of the colour makes its buffers again
+    /// of the colour makes its buffers again. The colour's pass, with no table (the module doc;
+    /// `a_color_with_no_matrix_draws_the_scanout_through_its_table`)
     #[test]
     fn a_color_draws_the_scanout_through_its_tables() {
         let (platform, draw, presented, drawable) = rig();
+        draw.without_tables();
         let log = platform.call_log();
         let region = PixelRect {
             x: 0,
@@ -1226,7 +1615,7 @@ mod tests {
             .filter(|c| c.sel == NAMED)
             .map(|c| c.args[0].clone())
             .collect();
-        // After the present shaders' (the converter's, made at its first use), the colour's two.
+        // After the present shaders' (the converter's, made at its first use), the colour's four.
         assert!(
             named.ends_with(&COLOR_FRAGMENTS.map(|f| Arg::Str(f.to_owned()))),
             "{named:?}"
@@ -1336,10 +1725,12 @@ mod tests {
     }
 
     /// A presented surface is drawn through the colour (a stage on) by the surface's colour
-    /// function, in place of the copy a BGRA8 surface takes, sampled straight from the surface
+    /// function, in place of the copy a BGRA8 surface takes, sampled straight from the surface.
+    /// The colour's pass, with no table (`a_surface_takes_the_table_at_its_own_size_in_unorm`)
     #[test]
     fn a_color_draws_a_presented_surface_through_its_tables() {
         let (platform, draw, presented, drawable) = rig();
+        draw.without_tables();
         let log = platform.call_log();
         let surface = texture(&draw, 80);
         *presented.texture.lock() = Some(ShownTexture {
@@ -1377,5 +1768,445 @@ mod tests {
             bound.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             [0, 1, 2, 3]
         );
+    }
+
+    /// The textures a draw since `mark` bound to its fragment stage, with their indices.
+    fn fragment_textures(platform: &FakePlatform, mark: u64) -> Vec<(ObjId, u64)> {
+        platform
+            .call_log()
+            .since(mark)
+            .into_iter()
+            .filter(|c| c.sel == FRAGMENT_TEXTURE)
+            .map(|c| (c.args[0].as_obj().unwrap(), c.args[1].as_u64().unwrap()))
+            .collect()
+    }
+
+    /// How many calls of `sel` since `mark`.
+    fn count_since(platform: &FakePlatform, mark: u64, sel: &str) -> usize {
+        (platform.call_log().sels_since(mark).iter())
+            .filter(|s| **s == sel)
+            .count()
+    }
+
+    /// A colour with no matrix draws the scanout through its table (the module doc). The first
+    /// draw makes the table, 256 × 1 of the drawable's format, and draws it by the scanout's
+    /// colour function with the colour's buffers (0 to 3) from the ramp of every byte (its pixels
+    /// at 4, its place at 5: the table's top left, a row of 256 words); then it draws the scanout
+    /// through the table by the table's function: the pages at 4, their place at 5, the table at
+    /// texture 1, and no colour buffer. Each draw draws the table again until a command buffer
+    /// that drew it has completed, then the pass alone runs; a new colour makes a new table, and
+    /// a colour with a matrix takes the colour's pass
+    #[test]
+    fn a_color_with_no_matrix_draws_the_scanout_through_its_table() {
+        let (platform, draw, presented, drawable) = rig();
+        let log = platform.call_log();
+        let region = PixelRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 32,
+        };
+        let (pages, _) = draw.scanout_buffer(&SCANOUT).unwrap();
+        let post: Table = Arc::from(vec![[0.0, 0.0, 0.0, 0.0], [0.5, 0.25, 1.0, 0.0]]);
+        set_color(&presented, 1, [None, None, None, Some(Arc::clone(&post))]);
+        let made = keep_new_buffers(&platform, 32);
+
+        let mark = log.mark();
+        let (first, _) = draw.encode(&drawable, region).unwrap();
+        assert_eq!(
+            count_since(&platform, mark, DRAW),
+            2,
+            "the table, then the pass"
+        );
+        assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 1);
+        let table = (draw.color_table.lock().as_ref())
+            .map(|t| t.texture.clone_ref())
+            .unwrap();
+        assert_eq!(
+            (table.width(), table.height(), table.pixel_format()),
+            (256, 1, 80)
+        );
+        let bound = fragment_buffers(&platform, mark);
+        assert_eq!(
+            bound.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 4, 5]
+        );
+        let ramp = draw.scanout_ramp().unwrap();
+        assert_eq!(bound[4].1, ramp.buffer.id());
+        assert_eq!(
+            bytes_of(&ramp.buffer),
+            (0..=u8::MAX).flat_map(|k| [k; 4]).collect::<Vec<_>>()
+        );
+        assert_eq!(scanout_words(&made, bound[5].1), [0, 0, 256, 0]);
+        assert_eq!(bound[6].1, pages.id());
+        assert_eq!(scanout_words(&made, bound[7].1), [0, 0, 64, 0]);
+        assert_eq!(fragment_textures(&platform, mark), [(table.id(), 1)]);
+
+        // Not completed yet: the next draw draws the table again, into the same texture.
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, region).unwrap();
+        assert_eq!(count_since(&platform, mark, DRAW), 2);
+        assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 0);
+
+        // Once a buffer that drew it has completed, the pass alone.
+        platform.world().set_auto_complete(Some(CompleteOn::Caller));
+        first.commit(OnFault::Die).unwrap();
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, region).unwrap();
+        assert_eq!(count_since(&platform, mark, DRAW), 1);
+        assert_eq!(
+            count_since(&platform, mark, NEW_BUFFER),
+            1,
+            "the scanout's place"
+        );
+        assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 0);
+        assert_eq!(count_since(&platform, mark, NEW_PIPELINE), 0);
+        assert_eq!(
+            fragment_buffers(&platform, mark)
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
+            [4, 5]
+        );
+        assert_eq!(fragment_textures(&platform, mark), [(table.id(), 1)]);
+
+        // A new colour: a new table.
+        let plane: Table = Arc::from(vec![[1.0, 1.0, 1.0, 0.0], [0.0, 0.0, 0.0, 0.0]]);
+        set_color(&presented, 2, [Some(plane), None, None, None]);
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, region).unwrap();
+        assert_eq!(count_since(&platform, mark, DRAW), 2);
+        assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 1);
+
+        // A matrix: the colour's pass, its buffers bound, no table.
+        let rows: Table = Arc::from(vec![
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]);
+        set_color(&presented, 3, [None, None, Some(rows), Some(post)]);
+        let mark = log.mark();
+        let _ = draw.encode(&drawable, region).unwrap();
+        assert_eq!(count_since(&platform, mark, DRAW), 1);
+        assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 0);
+        assert_eq!(
+            fragment_buffers(&platform, mark)
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5]
+        );
+        assert!(fragment_textures(&platform, mark).is_empty());
+    }
+
+    /// A presented surface takes the colour's table where its format is 8-bit or 10-bit unorm
+    /// and it is drawn at its own size: the table, of 256 or 1024 entries, is drawn from a ramp
+    /// of the surface's format (made once for each format, its width the table's, pixel k value
+    /// k in every channel) by the surface's colour function, then the surface through the table
+    /// at texture 1. A surface drawn at another size, or of an sRGB format, takes the pass
+    #[test]
+    fn a_surface_takes_the_table_at_its_own_size_in_unorm() {
+        let (platform, draw, presented, drawable) = rig();
+        let log = platform.call_log();
+        let region = PixelRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 32,
+        };
+        let post: Table = Arc::from(vec![[0.0, 0.0, 0.0, 0.0], [0.5, 0.25, 1.0, 0.0]]);
+        set_color(&presented, 1, [None, None, None, Some(post)]);
+        let show = |surface: &<FakePlatform as Platform>::Texture| {
+            *presented.texture.lock() = Some(ShownTexture {
+                texture: surface.clone_ref(),
+                hold: Arc::new(DisplayHold {
+                    span: None,
+                    answers: Mutex::default(),
+                }),
+            });
+        };
+        for (format, values) in [(80, 256), (70, 256), (94, 1024), (90, 1024)] {
+            let surface = texture(&draw, format);
+            show(&surface);
+            let mark = log.mark();
+            let _ = draw.encode(&drawable, region).unwrap();
+            assert_eq!(count_since(&platform, mark, DRAW), 2, "{format}");
+            assert_eq!(
+                count_since(&platform, mark, NEW_TEXTURE),
+                2,
+                "{format}: ramp, table"
+            );
+            assert_eq!(count_since(&platform, mark, REPLACE), 1, "{format}");
+            let ramp = (draw.ramps.lock().iter())
+                .find(|(f, _)| *f == format)
+                .map(|(_, r)| r.clone_ref())
+                .unwrap();
+            let table = (draw.color_table.lock().as_ref())
+                .map(|t| t.texture.clone_ref())
+                .unwrap();
+            assert_eq!(
+                (ramp.width(), ramp.height(), ramp.pixel_format()),
+                (values, 1, format)
+            );
+            assert_eq!(
+                (table.width(), table.height(), table.pixel_format()),
+                (values, 1, 80)
+            );
+            assert_eq!(
+                fragment_textures(&platform, mark),
+                [(ramp.id(), 0), (table.id(), 1), (surface.id(), 0)],
+                "{format}"
+            );
+            // Again: the ramp is kept.
+            let mark = log.mark();
+            let _ = draw.encode(&drawable, region).unwrap();
+            assert_eq!(count_since(&platform, mark, NEW_TEXTURE), 0, "{format}");
+        }
+        let (_, pixel) = table_values(94).unwrap();
+        assert_eq!(
+            pixel(5),
+            (5u32 | (5 << 10) | (5 << 20) | (3 << 30)).to_le_bytes()
+        );
+        let (_, pixel) = table_values(80).unwrap();
+        assert_eq!(pixel(7), [7, 7, 7, 0xff]);
+
+        // At another size, and in sRGB: the pass.
+        let surface = texture(&draw, 80);
+        show(&surface);
+        let quarter = PixelRect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 16,
+        };
+        let srgb = texture(&draw, 81);
+        for (shown, at) in [(&surface, quarter), (&srgb, region)] {
+            show(shown);
+            let mark = log.mark();
+            let _ = draw.encode(&drawable, at).unwrap();
+            assert_eq!(count_since(&platform, mark, DRAW), 1);
+            assert_eq!(fragment_textures(&platform, mark), [(shown.id(), 0)]);
+        }
+    }
+
+    /// On Metal, the colour's table draws the drawable's bytes the colour's pass draws: the
+    /// scanout, and a surface of each format a table carries, holding every value in each
+    /// channel across a width off a power of two (3840), through colours of one stage and of
+    /// three, of 1 to 1024 entries, none the identity
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_the_table_draws_what_the_pass_draws() {
+        the_table_draws_what_the_pass_draws(reims_vgpu_metal::MetalPlatform::process());
+    }
+
+    /// On the Vulkan platform (MoltenVK's on a Mac), the colour's table draws the bytes the
+    /// colour's pass draws, as on Metal (`on_metal_the_table_draws_what_the_pass_draws`)
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_the_table_draws_what_the_pass_draws() {
+        use reims_vgpu_core::tasks::isolation::TaskThreads;
+        the_table_draws_what_the_pass_draws(Arc::new(reims_vgpu_vulkan::VulkanPlatform::new(
+            Box::new(TaskThreads::new()),
+        )));
+    }
+
+    /// `on_metal_the_table_draws_what_the_pass_draws`, on `platform`.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn the_table_draws_what_the_pass_draws<P: ApiPlatform>(platform: Arc<P>) {
+        crate::entry::run(|_| table_draws_what_the_pass_draws(&platform));
+    }
+
+    /// [`the_table_draws_what_the_pass_draws`]'s body, inside the library's entry.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn table_draws_what_the_pass_draws<P: ApiPlatform>(platform: &Arc<P>) {
+        use reims_graphics::wire::RGFX_ALLOCATIONS_OFFSET;
+
+        const W: u32 = 3840;
+        const H: u32 = 4;
+        let region = Arc::new(Region::new(reims_graphics::REGION_SIZE as usize).unwrap());
+        // Channel c of pixel (x, y) at `n` values: each takes every value along a row.
+        let value = |c: u32, x: u32, y: u32, n: u32| match c {
+            0 => x % n,
+            1 => (x * 3 + y * 7) % n,
+            _ => n - 1 - (x + y) % n,
+        };
+        let pixels = |n: u32, pixel: &dyn Fn([u32; 3], u32) -> [u8; 4]| -> Vec<u8> {
+            (0..H)
+                .flat_map(|y| (0..W).map(move |x| (x, y)))
+                .flat_map(|(x, y)| pixel([0, 1, 2].map(|c| value(c, x, y, n)), x % 251))
+                .collect()
+        };
+        let eight = |order: [usize; 3]| {
+            move |v: [u32; 3], a: u32| -> [u8; 4] {
+                let b = v.map(|c| u8::try_from(c).unwrap());
+                [
+                    b[order[0]],
+                    b[order[1]],
+                    b[order[2]],
+                    u8::try_from(a).unwrap(),
+                ]
+            }
+        };
+        let ten = |v: [u32; 3], a: u32| {
+            (v[0] | (v[1] << 10) | (v[2] << 20) | ((a % 4) << 30)).to_le_bytes()
+        };
+        // The scanout: BGRA bytes.
+        let scanout = pixels(256, &eight([2, 1, 0]));
+        // SAFETY: the scanout lies inside the region, mapped while it lives.
+        unsafe {
+            let at = region.base().add(RGFX_ALLOCATIONS_OFFSET as usize);
+            std::ptr::copy_nonoverlapping(scanout.as_ptr(), at, scanout.len());
+        }
+        let shown = Arc::new(Shown::default());
+        *shown.scanout.lock() = Some(Scanout {
+            width: W,
+            height: H,
+            stride: W * 4,
+            offset: RGFX_ALLOCATIONS_OFFSET,
+        });
+        let presented = Arc::new(Presented::<P>::default());
+        let tabled = ScanoutDraw::new(Arc::clone(platform), &region, &shown, &presented).unwrap();
+        let passed = ScanoutDraw::new(Arc::clone(platform), &region, &shown, &presented).unwrap();
+        passed.without_tables();
+        let new_texture = |format: u64, usage: u64| {
+            let descriptor = platform.texture_descriptor(&TextureDesc {
+                pixel_format: format,
+                width: u64::from(W),
+                height: u64::from(H),
+                usage,
+                resource_options: Some(0),
+                ..TextureDesc::default()
+            });
+            (platform.metal_device(None).unwrap())
+                .new_texture(OnFault::Die, &descriptor)
+                .unwrap()
+                .unwrap()
+        };
+        let whole = PixelRect {
+            x: 0,
+            y: 0,
+            width: u64::from(W),
+            height: u64::from(H),
+        };
+        let read = |draw: &ScanoutDraw<P>| -> Vec<u8> {
+            let target = new_texture(80, 0x1 | 0x4);
+            let (command_buffer, hold) = draw.encode_shown(&target, whole).unwrap();
+            command_buffer.commit(OnFault::Die).unwrap();
+            command_buffer.wait_until_completed(OnFault::Die).unwrap();
+            drop(hold);
+            let mut bytes = vec![0; (W * H * 4) as usize];
+            platform.read_pixels(&target, &mut bytes, (W * 4) as usize);
+            bytes
+        };
+        let curve = |n: usize, power: [f32; 3]| -> Table {
+            #[expect(clippy::as_conversions, reason = "small counts")]
+            let top = n.saturating_sub(1).max(1) as f32;
+            #[expect(clippy::as_conversions, reason = "small counts")]
+            let entries = (0..n)
+                .map(|k| {
+                    let x = k as f32 / top;
+                    [x.powf(power[0]), x.powf(power[1]), x.powf(power[2]), 0.0]
+                })
+                .collect::<Vec<_>>();
+            Arc::from(entries)
+        };
+        let colours: [[Option<Table>; 4]; 4] = [
+            // A display profile's plane gamma.
+            [
+                Some(curve(256, [1.0 / 2.2, 1.0 / 1.8, 1.2])),
+                None,
+                None,
+                None,
+            ],
+            // Three stages of odd and even counts.
+            [
+                Some(curve(17, [0.5, 1.5, 1.0])),
+                Some(curve(1024, [2.0, 0.7, 1.1])),
+                None,
+                Some(Arc::from(vec![
+                    [1.0, 0.0, 0.25, 0.0],
+                    [0.0, 1.0, 0.75, 0.0],
+                ])),
+            ],
+            // One entry: a constant.
+            [
+                None,
+                Some(Arc::from(vec![[0.25, 0.5, 0.75, 0.0]])),
+                None,
+                None,
+            ],
+            // A post-gamma past the ends.
+            [None, None, None, Some(curve(257, [3.0, 0.3, 1.0]))],
+        ];
+        let surfaces: [(u64, Vec<u8>); 4] = [
+            (80, pixels(256, &eight([2, 1, 0]))),
+            (70, pixels(256, &eight([0, 1, 2]))),
+            (94, pixels(1024, &ten)),
+            (90, pixels(1024, &ten)),
+        ];
+        let mut changes = 0;
+        for source in [None].into_iter().chain(surfaces.iter().map(Some)) {
+            *presented.texture.lock() = source.map(|(format, bytes)| {
+                let texture = new_texture(*format, 0x1);
+                let length = bytes.len() as u64;
+                // SAFETY: the bytes live across the call, which copies them out.
+                let range =
+                    unsafe { HostRange::new(HostPtr::from_ptr(bytes.as_ptr().cast_mut()), length) };
+                texture
+                    .replace_region(
+                        MtlRegion {
+                            origin: MtlOrigin::new(0, 0, 0),
+                            size: MtlSize::new(u64::from(W), u64::from(H), 1),
+                        },
+                        0,
+                        0,
+                        range,
+                        u64::from(W) * 4,
+                        length,
+                    )
+                    .unwrap();
+                ShownTexture {
+                    texture,
+                    hold: Arc::new(DisplayHold {
+                        span: None,
+                        answers: Mutex::default(),
+                    }),
+                }
+            });
+            let name = source.map_or("the scanout".to_owned(), |(f, _)| format!("format {f}"));
+            for (i, stages) in colours.iter().enumerate() {
+                changes += 1;
+                *presented.color.lock() = (
+                    changes,
+                    Arc::new(DisplayColor {
+                        stages: stages.clone(),
+                    }),
+                );
+                let through = read(&passed);
+                let looked_up = read(&tabled);
+                assert!(
+                    (tabled.color_table.lock().as_ref()).is_some_and(|t| t.made_for.0 == changes),
+                    "{name}, colour {i}: no table drawn"
+                );
+                let differ = (through.iter().zip(&looked_up)).position(|(a, b)| a != b);
+                assert_eq!(
+                    differ,
+                    None,
+                    "{name}, colour {i}: byte {differ:?}: pass {:?}, table {:?}",
+                    differ.map(|d| &through[d & !3..(d & !3) + 4]),
+                    differ.map(|d| &looked_up[d & !3..(d & !3) + 4]),
+                );
+                // The colour changed the bytes: the comparison is not of two copies.
+                let original = source.map_or(&scanout, |(_, b)| b);
+                assert!(
+                    source.is_some_and(|(f, _)| *f >= 90)
+                        || through
+                            .chunks(4)
+                            .zip(original.chunks(4))
+                            .any(|(a, b)| a[..3] != b[..3]),
+                    "{name}, colour {i}: the pass changed nothing"
+                );
+            }
+        }
     }
 }

@@ -167,6 +167,37 @@ fragment float4 displayPipeColorScanoutFragment(PresentVertex in [[stage_in]],
     return float4(display_pipe_color(v, color, plane_gamma, pre_gamma, post_gamma), 1.0f);
 }
 
+// The display pipe's colour as a table of every input value (graphics/sink.rs): for a colour with
+// no matrix, each output channel depends only on the same channel's input, and a frame whose
+// channels take `n` values (an 8-bit or 10-bit unorm surface, or the scanout's bytes) has `n`
+// inputs per channel. Entry k of `lut` (n × 1, in the drawable's format) is what the colour's
+// function above drew for a pixel of value k in every channel, so each channel is looked up at
+// its own value, and a pixel comes out as the colour's function would draw it. Alpha is 1, as
+// there.
+
+// A presented frame, sampled as `displayPipeColorFragment` samples it: its value in each
+// channel is the nearest of the table's n.
+fragment float4 displayPipeLutFragment(PresentVertex in [[stage_in]],
+                                       texture2d<float> frame [[texture(0)]],
+                                       texture2d<float, access::read> lut [[texture(1)]]) {
+    float3 v = frame.sample(frame_sampler, in.tex).rgb;
+    uint3 k = uint3(rint(clamp(v, 0.0f, 1.0f) * float(lut.get_width() - 1)));
+    return float4(lut.read(uint2(k.r, 0)).r, lut.read(uint2(k.g, 0)).g, lut.read(uint2(k.b, 0)).b,
+                  1.0f);
+}
+
+// The guest's scanout, read in place as `displayPipeColorScanoutFragment` reads it: each byte is
+// its channel's entry.
+fragment float4 displayPipeLutScanoutFragment(PresentVertex in [[stage_in]],
+                                              device const uchar4 *scanout [[buffer(4)]],
+                                              constant DisplayPipeScanout &at [[buffer(5)]],
+                                              texture2d<float, access::read> lut [[texture(1)]]) {
+    uint2 p = uint2(in.position.xy) - at.origin;
+    uchar4 bgra = scanout[at.first + p.y * at.stride + p.x];
+    return float4(lut.read(uint2(bgra.z, 0)).r, lut.read(uint2(bgra.y, 0)).g,
+                  lut.read(uint2(bgra.x, 0)).b, 1.0f);
+}
+
 // ---- XR10 two-plane textures (pixel formats 550 and 551) ----
 //
 // The guest's texture is two planes: colour, viewed as BGR10_XR (or its sRGB form), and alpha,

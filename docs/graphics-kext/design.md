@@ -1377,7 +1377,10 @@ scanout: kept, a reset in the middle of a fade would leave the window black,
 with no transaction left to undo it. While any stage is on, the window draws
 the display through them (`crates/reims-vgpu/src/graphics/color.rs`,
 `sink.rs`), each table interpolated linearly between its entries (how a Mac's
-display engine samples between them is not measured). Selectors 10 and 11 (the
+display engine samples between them is not measured). A colour with no matrix
+is drawn through a table of every input value, which the colour's own pass
+draws once per colour from a ramp, so each frame costs a lookup per channel and
+the bytes stay the pass's. Selectors 10 and 11 (the
 pipe's linearization before the matrix and its gamma after it, in
 IOPresentment's configuration format), 12 (a surface copy) and 13 (triage) stay
 refused: no WindowServer seen calls them, and IOPresentment sends 11 only for a
