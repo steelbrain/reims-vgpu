@@ -461,6 +461,33 @@ void rgfxMetallibAirSlice(const uint8_t *&bytes, size_t &size);
 bool rgfxMetallibBitcode(const uint8_t *lib, size_t size, const std::string &name,
                          const uint8_t **bitcode, size_t *bitcodeSize);
 
+// rgfxMetallibBitcode's answers for a .metallib, by function name, from one walk of its function
+// list: a lookup hashes the name where rgfxMetallibBitcode walks the list to it. The list's first
+// function of a name answers for it, and a function past the first one whose group does not read
+// answers nothing, as there.
+class RgfxMetallibBitcodeIndex {
+public:
+	// Walks the function list of the `size` bytes at `lib` (one slice, as rgfxMetallibAirSlice
+	// gives).
+	RgfxMetallibBitcodeIndex(const uint8_t *lib, size_t size);
+
+	// rgfxMetallibBitcode(bytes, size, name, ...), for `bytes` whose function list is the one the
+	// index walked: the same bytes, or bytes of the same content key (RgfxLibraryKey.hpp), whose
+	// function list and header are those bytes'. Bytes of another length or header are walked.
+	bool find(const uint8_t *bytes, size_t size, const std::string &name, const uint8_t **bitcode,
+	          size_t *bitcodeSize) const;
+
+private:
+	struct Range {
+		bool valid;
+		uint64_t offset, size;
+	};
+	bool read_ = false; // the header read: the section lies inside the bytes
+	size_t size_ = 0;
+	uint64_t list_ = 0, section_ = 0, sectionSize_ = 0;
+	std::unordered_map<std::string, Range> byName_;
+};
+
 // What `fn` does with the textures bound at `index` of its stage: true where an argument there
 // may write them (write or read_write), false where its arguments there only read or sample them
 // or none is there. An argument of any count (anyCount) is at every index from its first; one at

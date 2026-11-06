@@ -9,8 +9,9 @@
 // entry point whole (rgfxReadAirEntries), over the oracle probe's library (RGFX_ORACLE_REFLECTION,
 // built from tools/oracle/oracle_reflection.metal); no answer, nor a crash, for bytes that are
 // not such a module; one read of each module answering what the three readers answer, and the
-// process's cache of those reads (RgfxAirModuleCache); and every function of the repo's committed
-// .metallibs found by the read the device makes for its kind (RGFX_COMMITTED_METALLIBS).
+// process's cache of those reads (RgfxAirModuleCache); the index of a function list's bitcode
+// answering as rgfxMetallibBitcode (RgfxMetallibBitcodeIndex); and every function of the repo's
+// committed .metallibs found by the read the device makes for its kind (RGFX_COMMITTED_METALLIBS).
 #include "RgfxAirArguments.hpp"
 #include "RgfxFunctionConstants.hpp"
 
@@ -314,6 +315,40 @@ size_t moduleReadsAsReaders(const std::vector<uint8_t> &lib, const std::string &
 		compared++;
 	}
 	return compared;
+}
+
+// The index of a library's function list answers what rgfxMetallibBitcode answers, for every name
+// in `names`, over the bytes it walked and over a copy of them at another address. Answers how
+// many it found.
+size_t indexAsWalk(const std::vector<uint8_t> &lib, const std::vector<std::string> &names,
+                   const std::string &what)
+{
+	const RgfxMetallibBitcodeIndex index(lib.data(), lib.size());
+	const std::vector<uint8_t> copy = lib;
+	size_t found = 0;
+	for (const std::string &name : names) {
+		for (const std::vector<uint8_t> *bytes : {&lib, &copy}) {
+			const uint8_t *walkedAt = nullptr, *indexedAt = nullptr;
+			size_t walkedSize = 0, indexedSize = 0;
+			const bool walked = rgfxMetallibBitcode(bytes->data(), bytes->size(), name, &walkedAt, &walkedSize);
+			const bool indexed = index.find(bytes->data(), bytes->size(), name, &indexedAt, &indexedSize);
+			check(walked == indexed && (!walked || (walkedAt == indexedAt && walkedSize == indexedSize)),
+			      what + " " + name + ": the index answers as the walk");
+			found += indexed ? 1 : 0;
+		}
+	}
+	return found;
+}
+
+// The names `lib`'s function list holds, then one it does not and the empty one.
+std::vector<std::string> namesOf(const std::vector<uint8_t> &lib)
+{
+	std::vector<std::string> names;
+	for (const Listed &f : listed(lib))
+		names.push_back(f.name);
+	names.push_back("no_such_function");
+	names.push_back("");
+	return names;
 }
 
 // The .metallib files of the directory `dir`, by name.
@@ -1290,6 +1325,54 @@ int main()
 		                        moduleReadsAsReaders(oracle, "oracle_reflection");
 		std::printf("air_arguments_test: one read of each module: %zu modules compared\n", compared);
 		check(compared >= 40, "every module compared (" + std::to_string(compared) + ")");
+	}
+
+	// The bitcode index answers what rgfxMetallibBitcode answers: for every name of every library
+	// above and of the committed metallibs, for one of another library's names (bytes of another
+	// header, which it walks), and for libraries whose header and function list are spoilt.
+	{
+		const char *oldPath = std::getenv("RGFX_AIR_ARGUMENTS_OLD");
+		const std::vector<uint8_t> old = readFile(oldPath);
+		size_t found = indexAsWalk(lib, namesOf(lib), "air_arguments") +
+		               indexAsWalk(old, namesOf(old), "air_arguments_old") +
+		               indexAsWalk(oracle, namesOf(oracle), "oracle_reflection");
+		const char *dirs = std::getenv("RGFX_COMMITTED_METALLIBS");
+		const std::string list = dirs != nullptr ? dirs : "";
+		for (size_t at = 0; at < list.size();) {
+			size_t colon = list.find(':', at);
+			if (colon == std::string::npos)
+				colon = list.size();
+			for (const std::string &file : metallibsIn(list.substr(at, colon - at))) {
+				const std::vector<uint8_t> one = readFile(file.c_str());
+				found += indexAsWalk(one, namesOf(one), file);
+			}
+			at = colon + 1;
+		}
+		check(found >= 2 * 300, "the index finds the libraries' functions (" + std::to_string(found) + ")");
+		const RgfxMetallibBitcodeIndex index(lib.data(), lib.size());
+		for (const std::string &name : namesOf(oracle)) {
+			const uint8_t *walkedAt = nullptr, *indexedAt = nullptr;
+			size_t walkedSize = 0, indexedSize = 0;
+			const bool walked = rgfxMetallibBitcode(oracle.data(), oracle.size(), name, &walkedAt, &walkedSize);
+			check(index.find(oracle.data(), oracle.size(), name, &indexedAt, &indexedSize) == walked &&
+			          walkedAt == indexedAt && walkedSize == indexedSize,
+			      name + ": bytes of another header are walked");
+		}
+		uint64_t section = 0;
+		std::memcpy(&section, lib.data() + 0x48, sizeof(section));
+		check(section > 0x58 && section < lib.size(), "the test library's bitcode section");
+		const std::vector<std::string> names = namesOf(lib);
+		uint32_t seed = 0x5eed;
+		size_t answered = 0;
+		for (int round = 0; round < 2000; round++) {
+			std::vector<uint8_t> spoilt = lib;
+			for (int k = 0; k < 1 + round % 4; k++) {
+				seed = seed * 1103515245u + 12345u;
+				spoilt[(seed >> 8) % section] ^= static_cast<uint8_t>(1u << ((seed >> 4) & 7));
+			}
+			answered += indexAsWalk(spoilt, names, "spoilt round " + std::to_string(round));
+		}
+		check(answered > 0, "2000 spoilt libraries' indices answer as the walk (" + std::to_string(answered) + " found)");
 	}
 
 	// The cache: equal bytes, at any address, are read once and share their read; it keeps the

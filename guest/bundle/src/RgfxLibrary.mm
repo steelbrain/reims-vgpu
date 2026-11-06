@@ -27,6 +27,7 @@
 #include <set>
 #include <unistd.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "RgfxAirArguments.hpp"
@@ -289,10 +290,13 @@ RGFX_LOG_UNRECOGNIZED
 namespace {
 
 // A .metallib's function list as readMetallibFunctions reads it: `readable` where the bytes were
-// a readable .metallib.
+// a readable .metallib; each function's place in `functions` by name (the first of a name); and
+// each function's bitcode, as rgfxMetallibBitcode finds it in those bytes, by name.
 struct FunctionTable {
 	std::vector<MetallibFunction> functions;
 	bool readable = false;
+	std::unordered_map<std::string, size_t> byName;
+	std::unique_ptr<RgfxMetallibBitcodeIndex> bitcode;
 };
 
 // The most function tables the process keeps by content key (functionTableOf).
@@ -310,6 +314,9 @@ std::shared_ptr<const FunctionTable> functionTableOf(const uint8_t *bytes, size_
 	auto read = [&] {
 		auto table = std::make_shared<FunctionTable>();
 		table->readable = readMetallibFunctions(bytes, length, table->functions);
+		for (size_t i = 0; i < table->functions.size(); i++)
+			table->byName.emplace(table->functions[i].name, i);
+		table->bitcode = std::make_unique<RgfxMetallibBitcodeIndex>(bytes, length);
 		return std::shared_ptr<const FunctionTable>(std::move(table));
 	};
 	if (key == nullptr)
@@ -477,17 +484,14 @@ static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
 	                       serializer:serializer];
 }
 
-// The table entry for `name`, or null when the table does not hold it.
+// The table entry for `name` (the first of that name), or null when the table does not hold it.
 - (const MetallibFunction *)rgfxEntryNamed:(NSString *)name
 {
 	const char *n = name.UTF8String;
 	if (n == nullptr)
 		return nullptr;
-	for (const MetallibFunction &f : _table->functions) {
-		if (f.name == n)
-			return &f;
-	}
-	return nullptr;
+	auto found = _table->byName.find(n);
+	return found != _table->byName.end() ? &_table->functions[found->second] : nullptr;
 }
 
 // Metal's own function `name` of the library's shadow, for a library whose function list did not
@@ -596,7 +600,7 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	const uint8_t *bitcode = nullptr;
 	size_t bitcodeSize = 0;
 	std::shared_ptr<const RgfxAirModule> module;
-	if (map == nil || !rgfxMetallibBitcode(bytes, size, name, &bitcode, &bitcodeSize))
+	if (map == nil || !_table->bitcode->find(bytes, size, name, &bitcode, &bitcodeSize))
 		*why = "the library holds no bitcode for it";
 	else
 		module = rgfxAirModules().moduleOf(bitcode, bitcodeSize);

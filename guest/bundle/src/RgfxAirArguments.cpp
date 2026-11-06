@@ -3169,6 +3169,69 @@ bool rgfxMetallibBitcode(const uint8_t *p, size_t n, const std::string &name,
 	return false;
 }
 
+RgfxMetallibBitcodeIndex::RgfxMetallibBitcodeIndex(const uint8_t *p, size_t n)
+{
+	// rgfxMetallibBitcode's walk, keeping each group's answer where it would stop at its name.
+	if (p == nullptr || n < 0x58 || std::memcmp(p, "MTLB", 4) != 0)
+		return;
+	size_ = n;
+	list_ = le64(p + 0x18);
+	section_ = le64(p + 0x48);
+	sectionSize_ = le64(p + 0x50);
+	if (list_ > n || n - list_ < 4 || section_ > n || sectionSize_ > n - section_)
+		return;
+	read_ = true;
+	const uint32_t count = le32(p + list_);
+	uint64_t q = list_ + 4;
+	for (uint32_t i = 0; i < count; i++) {
+		if (n - q < 4)
+			return; // past here every name answers false, as the walk stops here
+		const uint32_t group = le32(p + q);
+		if (group < 4 || group > n - q)
+			return;
+		const uint64_t end = q + group;
+		std::string fnName;
+		uint64_t offset = 0, length = 0;
+		bool haveOffset = false, haveLength = false;
+		for (uint64_t t = q + 4; end - t >= 6 && std::memcmp(p + t, "ENDT", 4) != 0;) {
+			const uint16_t tagSize = static_cast<uint16_t>(p[t + 4] | (p[t + 5] << 8));
+			const uint8_t *data = p + t + 6;
+			if (tagSize > end - t - 6)
+				return;
+			if (std::memcmp(p + t, "NAME", 4) == 0)
+				fnName.assign(reinterpret_cast<const char *>(data),
+				              strnlen(reinterpret_cast<const char *>(data), tagSize));
+			else if (std::memcmp(p + t, "OFFT", 4) == 0 && tagSize >= 24) {
+				offset = le64(data + 16);
+				haveOffset = true;
+			} else if (std::memcmp(p + t, "MDSZ", 4) == 0 && tagSize >= 8) {
+				length = le64(data);
+				haveLength = true;
+			}
+			t += 6 + static_cast<uint64_t>(tagSize);
+		}
+		const bool valid = haveOffset && haveLength && offset <= sectionSize_ && length <= sectionSize_ - offset;
+		byName_.emplace(std::move(fnName), Range{valid, offset, length}); // the first of a name answers
+		q = end;
+	}
+}
+
+bool RgfxMetallibBitcodeIndex::find(const uint8_t *p, size_t n, const std::string &name,
+                                    const uint8_t **bitcode, size_t *bitcodeSize) const
+{
+	if (p == nullptr || n != size_ || n < 0x58 || std::memcmp(p, "MTLB", 4) != 0 || le64(p + 0x18) != list_ ||
+	    le64(p + 0x48) != section_ || le64(p + 0x50) != sectionSize_)
+		return rgfxMetallibBitcode(p, n, name, bitcode, bitcodeSize);
+	if (!read_)
+		return false;
+	auto found = byName_.find(name);
+	if (found == byName_.end() || !found->second.valid)
+		return false;
+	*bitcode = p + section_ + found->second.offset;
+	*bitcodeSize = static_cast<size_t>(found->second.size);
+	return true;
+}
+
 bool rgfxAirWritesTexture(const RgfxAirFunction &fn, uint32_t index)
 {
 	for (const RgfxAirArgument &a : fn.arguments) {
