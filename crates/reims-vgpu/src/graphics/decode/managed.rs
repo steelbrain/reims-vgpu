@@ -577,6 +577,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         if !self.holds_resource_id(m.obj_id, m.resource_id) {
             return Ok(Err(DecodeError::BadResourceId));
         }
+        if !super::described::<P>(device, m.desc.pixel_format.into()) {
+            return Ok(Err(DecodeError::Refused));
+        }
         let Some(layout) = LinearLayout::of(&m) else {
             return Ok(Err(DecodeError::Malformed));
         };

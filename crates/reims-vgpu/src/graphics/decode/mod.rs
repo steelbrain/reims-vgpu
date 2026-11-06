@@ -2253,6 +2253,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(m) = read::<RgfxHeapTextureSizeAndAlign>(message) else {
             return Some(answer(RGFX_STATUS_INVALID_ARGUMENT, 0, 0));
         };
+        if !described::<P>(device, m.desc.pixel_format.into()) {
+            return Some(answer(RGFX_STATUS_REFUSED, 0, 0));
+        }
         // The shape alone: a texture's resource index is no part of its size.
         let desc = TextureDesc {
             resource_index: None,
@@ -2576,7 +2579,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 let drain = self.command_buffer_drain();
                 self.replace_region(message, drain)
             }
-            RGFX_CMD_TEXTURE_VIEW => self.texture_view(message),
+            RGFX_CMD_TEXTURE_VIEW => self.texture_view(device, message),
             RGFX_CMD_HEAP_CREATE => {
                 let Some(m) = read::<RgfxHeapCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
@@ -2661,11 +2664,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if !self.holds_resource_id(m.obj_id, m.resource_id) {
                     return Ok(Err(DecodeError::BadResourceId));
                 }
+                if !described::<P>(device, m.desc.pixel_format.into()) {
+                    return Ok(Err(DecodeError::Refused));
+                }
                 // The guest picks the resource id, pinned as the texture's
                 // resource index so its argument buffers name the same texture
                 // the host made. `texture_descriptor` forwards the raw pixel
-                // format, so a format Metal refuses aborts here; the guest bundle
-                // only ever sends one it read from a real descriptor.
+                // format, one the device describes (checked above, as Metal
+                // asserts at any other): the guest bundle only ever sends one it
+                // read from a real descriptor.
                 let desc = texture_desc(&m.desc, m.resource_id);
                 let descriptor = self.platform.texture_descriptor(&desc);
                 let span = self.span_of(m.heap_obj_id);
@@ -2730,6 +2737,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if !self.holds_resource_id(m.obj_id, m.resource_id) {
                     return Ok(Err(DecodeError::BadResourceId));
                 }
+                if !described::<P>(device, m.desc.pixel_format.into()) {
+                    return Ok(Err(DecodeError::Refused));
+                }
                 let desc = texture_desc(&m.desc, m.resource_id);
                 let descriptor = self.platform.texture_descriptor(&desc);
                 // The texture reads the guest's named buffer; a buffer the host
@@ -2770,6 +2780,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 if !self.holds_resource_id(m.obj_id, m.resource_id) {
                     return Ok(Err(DecodeError::BadResourceId));
+                }
+                if !described::<P>(device, m.desc.pixel_format.into()) {
+                    return Ok(Err(DecodeError::Refused));
                 }
                 let desc = texture_desc(&m.desc, m.resource_id);
                 let descriptor = self.platform.texture_descriptor(&desc);
@@ -2819,6 +2832,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 };
                 if !self.holds_resource_id(m.obj_id, m.resource_id) {
                     return Ok(Err(DecodeError::BadResourceId));
+                }
+                if !described::<P>(device, m.desc.pixel_format.into()) {
+                    return Ok(Err(DecodeError::Refused));
                 }
                 // Made by Metal's IOSurface creator over the buffer the guest keeps its copy
                 // of the surface in, which stands for the surface: the plane lies in it as
@@ -3828,6 +3844,28 @@ fn stage_input(
     )
 }
 
+/// The reason a render pipeline create of `fields` is refused before the platform is asked:
+/// an attachment of a pixel format but none (0) that the device describes no format for, where
+/// Metal asserts as it makes the state ([`described`]). `None` for every other create.
+fn undescribed_attachment<P: Platform>(
+    device: &P::Device,
+    fields: &RenderFields,
+) -> Option<String> {
+    let colors =
+        (fields.colors.iter()).map(|(i, c)| (format!("colour attachment {i}"), c.pixel_format));
+    let others = [
+        ("depth attachment".to_owned(), fields.depth_pixel_format),
+        ("stencil attachment".to_owned(), fields.stencil_pixel_format),
+    ];
+    let (at, raw) = colors
+        .chain(others)
+        .find(|&(_, raw)| raw != 0 && !described::<P>(device, raw))?;
+    Some(format!(
+        "its {at} is pixel format {raw}, which the device describes no format for (Metal asserts \
+         there)"
+    ))
+}
+
 /// A colour attachment of the wire as the platform's value: each field its own.
 fn color_attachment(c: &RgfxColorAttachmentDesc) -> ColorAttachmentDesc {
     ColorAttachmentDesc {
@@ -4038,6 +4076,10 @@ pub(crate) fn compile_pipeline<P: Platform>(
             fragment_linked,
             fields,
         } => {
+            // An attachment Metal asserts at as it makes the state refuses it before any wait.
+            if let Some(reason) = undescribed_attachment::<P>(device, &fields) {
+                return Ok(refused(reason));
+            }
             // A library being made is waited for here; one the platform refused refuses the
             // pipeline.
             let Some(vertex_library) = vertex_library.resolve() else {
@@ -4661,6 +4703,43 @@ fn read_at<T: FromBytes>(message: &[u8], offset: u32) -> Option<T> {
     read(message.get(offset as usize..)?)
 }
 
+/// The largest raw pixel format the device is asked to describe ([`described`]): Metal's answer
+/// was measured for every value up to it, 264 of them described on the M3 Max (metal2vulkan's
+/// `pixel_format_info`). Past it lies no format of the SDK, and Metal's `setPixelFormat:` asserts
+/// at every value it does not take.
+const LAST_ASKED_PIXEL_FORMAT: u64 = 2047;
+
+/// Whether the device describes `raw` as a pixel format: `MTLPixelFormatGetInfoForDevice`
+/// answers any but its answer for a value it describes no format for (`MTLPixelFormatInvalid`,
+/// every word 0), asked only up to [`LAST_ASKED_PIXEL_FORMAT`].
+///
+/// Metal asserts, ending the process, where a texture, a view of one, or an attachment of a
+/// render pipeline state is of a value it describes no format for: its `setPixelFormat:` at a
+/// value it does not take ("pixelFormat (2000) is not a valid MTLPixelFormat"), and every texture
+/// creator and the state's creation at one it takes but describes none for ("MTLTextureDescriptor
+/// has invalid pixelFormat (630)"; measured on the M3 Max, which the Vulkan platform imitates as
+/// deaths at the creator, `reims_vgpu_vulkan`'s `gpu::desc` and `gpu::serialized`). A Metal
+/// assertion is no death of the library's, so on a Mac host no refusal scope takes it: the lane
+/// refuses such an op itself, before any platform call (docs/graphics-kext/design.md, "Guest
+/// input the host refuses"). The guest's bundle sends only formats it read from a real
+/// descriptor, which Metal's own checks in the guest passed. The description is the platform's
+/// own: Metal's of the host's GPU, and on the Vulkan platform Metal's on an Apple GPU, where the
+/// runtime makes no texture of a format it describes none for (it dies there, as Metal asserts).
+pub(crate) fn described<P: Platform>(device: &P::Device, raw: u64) -> bool {
+    if raw > LAST_ASKED_PIXEL_FORMAT {
+        return false;
+    }
+    let info = device.pixel_format_info(raw);
+    let empty = info.flags == 0
+        && info.cast_class == 0
+        && info.block_bytes == 0
+        && info.block_width == 0
+        && info.block_height == 0
+        && info.block_depth == 0;
+    let named_invalid = (info.name.as_deref()).is_none_or(|n| n == "MTLPixelFormatInvalid");
+    !(empty && named_invalid)
+}
+
 /// The core texture descriptor values from a wire texture descriptor, with the
 /// guest-picked resource id pinned as the texture's resource index (the SPI the
 /// guest's argument buffers name it by), which the caller checked lies in its
@@ -4856,12 +4935,169 @@ mod tests {
 
     use reims_graphics::wire::{
         RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_LIBRARY_BYTES_OFFSET, RGFX_RESOURCE_ID_CHUNKS,
-        RgfxLibraryCreate, RgfxLibraryFromRegion,
+        RgfxLibraryCreate, RgfxLibraryFromRegion, RgfxTextureView,
     };
     use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
     use zerocopy::IntoBytes;
 
     use super::*;
+
+    /// A texture, a view of one, a heap's size for one, and a render pipeline state's attachment
+    /// whose pixel format the device describes none for (past the values it is asked of, or one
+    /// it answers `MTLPixelFormatInvalid` for), where Metal asserts, are refused before the
+    /// platform makes anything; a format it describes is made as before, and an attachment of
+    /// none (0) is no attachment
+    #[test]
+    fn a_pixel_format_the_device_describes_none_for_is_refused_before_the_platform() {
+        use reims_vgpu_core::platform::types::PixelFormatInfo;
+        const INFO: &str = "MTLPixelFormatGetInfoForDevice()";
+        const MAKES: [&str; 3] = [
+            "newTextureWithDescriptor:",
+            "newTextureViewWithPixelFormat:resourceIndex:",
+            "heapTextureSizeAndAlignWithDescriptor:",
+        ];
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(
+            Arc::clone(&p),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let grant = RgfxResourceIdChunk {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RESOURCE_ID_CHUNK,
+                size: size_of::<RgfxResourceIdChunk>() as u32,
+                seqno: 0,
+            },
+            context: 0,
+            chunk: 1,
+        };
+        assert_eq!(dec.decode(&device, grant.as_bytes()).unwrap(), Ok(()));
+        let invalid = PixelFormatInfo {
+            name: Some("MTLPixelFormatInvalid".to_owned()),
+            ..PixelFormatInfo::default()
+        };
+        let texture = |obj_id: u64, pixel_format: u32| RgfxTextureCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_CREATE,
+                size: size_of::<RgfxTextureCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            resource_id: 0x40 + obj_id,
+            desc: RgfxTextureDescriptor {
+                pixel_format,
+                texture_type: 2,
+                width: 64,
+                height: 64,
+                depth: 1,
+                mipmap_level_count: 1,
+                array_length: 1,
+                sample_count: 1,
+                usage: 1,
+                ..RgfxTextureDescriptor::default()
+            },
+            ..RgfxTextureCreate::default()
+        };
+        let made_since = |mark| {
+            (p.call_log().sels_since(mark).into_iter())
+                .filter(|s| MAKES.contains(s))
+                .count()
+        };
+
+        // Past the values asked: refused, the device not asked.
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, texture(1, 4096).as_bytes()).unwrap(),
+            Err(DecodeError::Refused)
+        );
+        assert!(!p.call_log().sels_since(mark).contains(&INFO));
+        assert_eq!(made_since(mark), 0);
+        // One the device describes none for: asked, then refused.
+        p.script().push(INFO, Step::value(invalid.clone()));
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, texture(2, 630).as_bytes()).unwrap(),
+            Err(DecodeError::Refused)
+        );
+        assert!(p.call_log().sels_since(mark).contains(&INFO));
+        assert_eq!(made_since(mark), 0);
+        // One it describes: made.
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, texture(3, 80).as_bytes()).unwrap(),
+            Ok(())
+        );
+        assert_eq!(made_since(mark), 1);
+
+        // A view of it in a format past the values asked.
+        let view = RgfxTextureView {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_VIEW,
+                size: size_of::<RgfxTextureView>() as u32,
+                seqno: 0,
+            },
+            obj_id: 4,
+            parent_obj_id: 3,
+            resource_id: 0x44,
+            pixel_format: 4096,
+            ..RgfxTextureView::default()
+        };
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, view.as_bytes()).unwrap(),
+            Err(DecodeError::Refused)
+        );
+        assert_eq!(made_since(mark), 0);
+
+        // A heap's size for one: answered refused.
+        let asked = RgfxHeapTextureSizeAndAlign {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
+                size: size_of::<RgfxHeapTextureSizeAndAlign>() as u32,
+                seqno: 9,
+            },
+            obj_id: 5,
+            desc: texture(5, 4096).desc,
+        };
+        let mark = p.call_log().mark();
+        let answer = dec
+            .heap_texture_size_and_align(&device, asked.as_bytes())
+            .unwrap();
+        assert_eq!(answer.status, RGFX_STATUS_REFUSED);
+        assert_eq!(made_since(mark), 0);
+
+        // A render pipeline state's attachments.
+        let fields = |colour: u32, depth: u32| {
+            let mut m = RgfxRenderPipelineCreate {
+                color_attachment_count: 2,
+                depth_pixel_format: depth,
+                ..RgfxRenderPipelineCreate::default()
+            };
+            m.colors[0].pixel_format = 80;
+            m.colors[1].pixel_format = colour;
+            render_fields(m.as_bytes(), &m).unwrap()
+        };
+        let refused = undescribed_attachment::<FakePlatform>(&device, &fields(4096, 0)).unwrap();
+        assert!(
+            refused.contains("colour attachment 1 is pixel format 4096"),
+            "{refused}"
+        );
+        // Colour attachment 0's format asked first, then the depth's: 1 is none, which is not.
+        p.script().after(INFO, 1, Step::value(invalid));
+        let refused = undescribed_attachment::<FakePlatform>(&device, &fields(0, 252)).unwrap();
+        assert!(
+            refused.contains("depth attachment is pixel format 252"),
+            "{refused}"
+        );
+        assert_eq!(
+            undescribed_attachment::<FakePlatform>(&device, &fields(0, 252)),
+            None
+        );
+        assert_eq!(
+            undescribed_attachment::<FakePlatform>(&device, &fields(81, 0)),
+            None
+        );
+    }
 
     /// What the surface views did is logged at every 256th `SURFACE_PAGES`, and at the first one
     /// ten seconds or more after the last log, however few came between.

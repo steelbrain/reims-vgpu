@@ -11,7 +11,8 @@
 //! a slice count the type does not take) ends the process in the platform, which the refusal
 //! scope the decode runs in turns into this op's refusal, and a view Metal answers nil for is
 //! refused too. Either way nothing is made, and the guest's later use of the id fails as a use
-//! of any refused create does.
+//! of any refused create does. A view of a pixel format the device describes none for is
+//! refused before the platform is asked, as Metal asserts there ([`super::described`]).
 
 use reims_graphics::wire::{
     RGFX_TEXTURE_VIEW_SUBRANGE, RGFX_TEXTURE_VIEW_SWIZZLE, RgfxTextureView,
@@ -27,7 +28,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `TEXTURE_VIEW`: the platform's view of the named texture (module doc). Malformed for flags
     /// the wire does not define, or a swizzle without its type, levels and slices; a bad reference
     /// for a parent that is no texture the sender holds; a bad resource id as for any texture.
-    pub(super) fn texture_view(&self, message: &[u8]) -> RaiseResult<Result<(), DecodeError>> {
+    pub(super) fn texture_view(
+        &self,
+        device: &P::Device,
+        message: &[u8],
+    ) -> RaiseResult<Result<(), DecodeError>> {
         let Some(m) = read::<RgfxTextureView>(message) else {
             return Ok(Err(DecodeError::Malformed));
         };
@@ -40,6 +45,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         if !self.holds_resource_id(m.obj_id, m.resource_id) {
             return Ok(Err(DecodeError::BadResourceId));
+        }
+        if !super::described::<P>(device, m.pixel_format.into()) {
+            return Ok(Err(DecodeError::Refused));
         }
         let made = {
             let Some(ObjHandle::Texture(parent)) = self.named(m.parent_obj_id) else {
