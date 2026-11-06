@@ -45,7 +45,7 @@ fn a_range_is_resolved_once_and_ranges_inside_it_cut() {
     let asked = AtomicU64::new(0);
     let r = Resolutions::default();
     let ask = |range: Range<u64>| -> Vec<Segment> {
-        r.segments(&range, |range| resolve(range, &asked)).to_vec()
+        (r.segments(&range, |range| resolve(range, &asked)).iter()).collect()
     };
     let direct = |range: Range<u64>| resolve(&range, &AtomicU64::new(0));
     assert_eq!(ask(0..8 * P), direct(0..8 * P));
@@ -82,6 +82,102 @@ fn the_oldest_range_goes_past_kept() {
     assert_eq!(asked.load(Ordering::Relaxed), KEPT.to_u64() + 2);
 }
 
+/// A range asked twice whole is answered with the kept range's own segments, and one inside it
+/// with its cut
+#[test]
+fn a_whole_answer_shares_the_kept_segments() {
+    let asked = AtomicU64::new(0);
+    let r = Resolutions::default();
+    let a = r
+        .segments(&(0..8 * P), |range| resolve(range, &asked))
+        .shared();
+    let b = r
+        .segments(&(0..8 * P), |range| resolve(range, &asked))
+        .shared();
+    assert!(Arc::ptr_eq(&a, &b));
+    let inside = r
+        .segments(&(P..2 * P), |range| resolve(range, &asked))
+        .shared();
+    assert_eq!(&inside[..], &resolve(&(P..2 * P), &AtomicU64::new(0))[..]);
+}
+
+/// Wholes that meet or touch are one, and an empty one is none
+#[test]
+fn wholes_join_where_they_meet() {
+    let r = Resolutions::with_wholes([10..20, 0..10, 35..50, 30..40, 60..60, 70..80]);
+    let wholes: Vec<Range<u64>> = r.wholes.iter().map(|w| w.range.clone()).collect();
+    assert_eq!(wholes, vec![0..20, 30..50, 70..80]);
+}
+
+/// Each run inside a whole is cut from it, the whole resolved once at the first ask, with the
+/// answers of resolving each run; a range in no one whole is kept as any other
+#[test]
+fn runs_inside_a_whole_resolve_it_once() {
+    let asked = AtomicU64::new(0);
+    let r = Resolutions::with_wholes([0..64 * P, 64 * P..128 * P, 256 * P..300 * P]);
+    let ask = |range: Range<u64>| -> Vec<Segment> {
+        (r.segments(&range, |range| resolve(range, &asked)).iter()).collect()
+    };
+    let direct = |range: Range<u64>| resolve(&range, &AtomicU64::new(0));
+    assert_eq!(
+        asked.load(Ordering::Relaxed),
+        0,
+        "resolved at the first ask"
+    );
+    for page in 0..128 {
+        assert_eq!(
+            ask(page * P..(page + 1) * P),
+            direct(page * P..(page + 1) * P)
+        );
+    }
+    assert_eq!(ask(63 * P + 8..65 * P - 8), direct(63 * P + 8..65 * P - 8));
+    assert_eq!(
+        asked.load(Ordering::Relaxed),
+        1,
+        "the two that touch are one"
+    );
+    assert_eq!(ask(299 * P..300 * P), direct(299 * P..300 * P));
+    assert_eq!(asked.load(Ordering::Relaxed), 2);
+    // Across a gap between wholes, and past the last.
+    assert_eq!(ask(127 * P..257 * P), direct(127 * P..257 * P));
+    assert_eq!(ask(127 * P..257 * P), direct(127 * P..257 * P));
+    assert_eq!(ask(299 * P..301 * P), direct(299 * P..301 * P));
+    assert_eq!(asked.load(Ordering::Relaxed), 4);
+    assert_eq!(r.kept.lock().len(), 2);
+}
+
+/// Three threads asking at once, as the runtime's reports do, get the answers one would, and a
+/// whole is resolved once
+#[test]
+fn three_threads_answer_as_one() {
+    let asked = AtomicU64::new(0);
+    let r = Resolutions::with_wholes([0..512 * P]);
+    let start = Barrier::new(3);
+    std::thread::scope(|s| {
+        for _ in 0..3 {
+            s.spawn(|| {
+                start.wait();
+                for round in 0..4 {
+                    for page in 0..512 {
+                        let range = page * P..(page + 1) * P;
+                        let got: Vec<Segment> =
+                            (r.segments(&range, |range| resolve(range, &asked)).iter()).collect();
+                        assert_eq!(got, resolve(&range, &AtomicU64::new(0)));
+                    }
+                    let range = 1024 * P + round * P..1100 * P;
+                    let got: Vec<Segment> =
+                        (r.segments(&range, |range| resolve(range, &asked)).iter()).collect();
+                    assert_eq!(got, resolve(&range, &AtomicU64::new(0)));
+                }
+            });
+        }
+    });
+    assert!(r.wholes[0].segments.get().is_some());
+    // The whole once; the kept range at least once, and once a thread at most.
+    let asked = asked.load(Ordering::Relaxed);
+    assert!((2..=4).contains(&asked), "{asked}");
+}
+
 /// A kept range's segments cut to a range inside it: the first and last pieces cut, their guest
 /// addresses moved by as much, a piece in no RAM kept as none
 #[test]
@@ -104,7 +200,7 @@ fn cut_segments() {
         },
     ];
     let range = |r: Range<u64>| -> Vec<(u64, u64, Option<u64>)> {
-        (cut(&kept, &r).into_iter())
+        cut(&kept, &r)
             .map(|s| (s.offset, s.length, s.guest))
             .collect()
     };
@@ -203,8 +299,8 @@ impl Backing {
 }
 
 /// The guest physical runs of `segments`, as the Linux log's `guest_runs` takes them.
-fn guest_runs(segments: &[Segment]) -> impl Iterator<Item = Range<u64>> + '_ {
-    (segments.iter()).filter_map(|s| s.guest.map(|g| g..g + s.length))
+fn guest_runs(segments: impl Iterator<Item = Segment>) -> impl Iterator<Item = Range<u64>> {
+    segments.filter_map(|s| s.guest.map(|g| g..g + s.length))
 }
 
 /// This thread's CPU time in nanoseconds and the instructions it retired, each a count that only
@@ -272,14 +368,14 @@ fn reports_cost() {
         .map(|g| HOST_RAM + g.start..HOST_RAM + g.end)
         .collect();
     let own = Resolutions::default();
-    let ram = Resolutions::default();
+    let ram = Resolutions::with_wholes([HOST_RAM..HOST_RAM + RAM]);
     let report = || {
         let bytes = 0..SURFACE_PAGES * P;
         let segments = own.segments(&bytes, |r| backing.resolve(VIEW, r));
-        log.wrote_runs(guest_runs(&segments));
+        log.wrote_runs(guest_runs(segments.iter()));
         for run in &window {
             let segments = ram.segments(run, |r| backing.resolve(0, r));
-            log.wrote_runs(guest_runs(&segments));
+            log.wrote_runs(guest_runs(segments.iter()));
         }
     };
     // One report first, as the commit's resolves the surface's own bytes before the others ask.

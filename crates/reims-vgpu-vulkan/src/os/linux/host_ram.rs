@@ -131,11 +131,7 @@ fn runtime_ram(ranges: &[(u64, u64)], logged: bool) -> Option<rt::HostRam> {
         }
     };
     let dirty = logged
-        .then(|| {
-            ranges
-                .first()
-                .and_then(|&(at, _)| super::dirty::ImportDirty::of_ram(at))
-        })
+        .then(|| super::dirty::ImportDirty::of_ram(ranges))
         .flatten();
     Some(match dirty {
         Some(dirty) => ram.with_dirty_pages(Arc::new(dirty)),

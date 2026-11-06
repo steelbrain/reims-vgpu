@@ -231,3 +231,39 @@ fn a_range_is_resolved_once() {
     d.wrote(0..8 * P);
     assert_eq!(resolutions(), 2);
 }
+
+/// The guest's RAM handed whole answers in host addresses, each run of it cut from its ranges,
+/// kept whole: the backing table is asked once for ranges that touch, however many runs are
+/// asked, and the answers are those of resolving each run, across the hole in the guest's RAM too
+#[test]
+fn the_rams_runs_are_cut_from_its_ranges() {
+    let base = 0x7e80_0000_0000;
+    let (log, _) = log();
+    let _lease = ram(base, Some(Arc::clone(&log)));
+    let d = ImportDirty::of_ram(&[(base, 0x10_0000), (base + 0x10_0000, 0x10_0000)]).unwrap();
+    let resolutions = || d.shared.resolved.resolutions();
+    for page in 0..0x200 {
+        let run = base + page * P..base + (page + 1) * P;
+        assert_eq!(d.segments(&run).iter().collect::<Vec<_>>(), d.resolve(&run));
+    }
+    let across = base + 0x10_0000 - P - 8..base + 0x10_0000 + P + 8;
+    assert_eq!(
+        d.segments(&across).iter().collect::<Vec<_>>(),
+        d.resolve(&across)
+    );
+    assert_eq!(resolutions(), 1);
+    let _w = d.watch(base + 0x10_0000 - 2 * P..base + 0x10_0000 + 2 * P);
+    let s1 = harvest(&log, &[]);
+    harvest(&log, &[0x10_0000 - P..0x10_0000]);
+    assert_eq!(
+        changed(&d, s1),
+        vec![base + 0x10_0000 - P..base + 0x10_0000]
+    );
+    let s2 = harvest(&log, &[]);
+    d.wrote(base + 0x10_0000 + P..base + 0x10_0000 + P + 1);
+    assert_eq!(
+        changed(&d, s2),
+        vec![base + 0x10_0000 + P..base + 0x10_0000 + 2 * P]
+    );
+    assert_eq!(resolutions(), 1);
+}
