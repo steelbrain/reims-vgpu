@@ -66,9 +66,11 @@ run_info() {
 	*com.steelbrain.ReimsGraphics\ *) item kexts PASS "$kexts" ;;
 	*) item kexts FAIL "ReimsGraphics is not loaded: $kexts" ;;
 	esac
-	# The loader's log (ApvLoadLog) says whether every site of ReimsGraphics resolved.
+	# The loader's log says whether every site of ReimsGraphics resolved: guest/loader's
+	# ReimsGraphicsLoader keeps it in LoaderLog, the older AppleParavirtGPULoader in ApvLoadLog.
 	local ld bind
-	ld=$(ioreg -l -w0 -c AppleParavirtGPULoader 2>/dev/null | grep -o -E 'ReimsGraphics:[^"]{0,160}')
+	ld=$({ ioreg -l -w0 -c ReimsGraphicsLoader; ioreg -l -w0 -c AppleParavirtGPULoader; } 2>/dev/null |
+		grep -o -E 'ReimsGraphics:[^"]{0,160}')
 	bind=$(echo "$ld" | grep -o -E 'ReimsGraphics: all [0-9]+ sites resolved.{0,40}' | head -1)
 	if [ -n "$bind" ]; then item loader-bind PASS "$bind"; else
 		item loader-bind FAIL "$(echo "$ld" | head -2 | tr '\n' ' ')"
