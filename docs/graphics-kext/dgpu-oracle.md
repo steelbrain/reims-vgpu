@@ -1235,8 +1235,51 @@ What our stack does:
   Until 11-05 the bundle copied a few of these rules and sent the rest to the host, posted: a
   texture the app held, whose command buffers' draws the host then dropped (`refused.rs`).
 - *(class 2)* Over a buffer, at a depth other than 1, the AMD's words.
+- *(class 2)* Over a Shared buffer by the public form, a block-compressed format answers nil, as
+  the AMD answers it 64 x 64 and 62 x 64, where the Intel makes it; the host's platform makes no
+  such texture over a buffer's bytes either. Both make a single block's (2 x 2), which ours
+  answers nil too *(class 4)*. So it does a TextureBuffer, which all three make by that form
+  *(class 4)*: the host carries none by it.
 - The shell tests check every case the device answered (`kDescriptorCases`) and each creator's
   order (`kCreatorCases`).
+
+## Q24: what a command buffer does with nil where an object belongs
+
+Probe: `oracle_nilbind DEVICE`, 11-05, each of its 27 cases in a child process of its own, with
+`MTL_DEBUG_LAYER` unset. The target is a 4 x 4 RGBA8Unorm texture cleared to 64s. A draw covers
+it and writes red one half plus half of what its fragment function read, so a read of zero
+draws (128, 0, 0, 255) and a draw that did not run leaves 64s; a dispatch writes what it read and
+a marker into a buffer. The texture bound where one is bound is 1 x 1 of 255s, the buffer a
+float4 of 1s.
+
+| case | AMD | Intel 630 |
+|---|---|---|
+| a fragment or kernel function reads a texture bound nil, or never bound | the draw or dispatch runs, reading zero | the same |
+| a fragment function samples a bound texture with a sampler bound nil | it runs, reading the texture | it runs, reading zero |
+| a fragment or kernel function reads a buffer bound nil, or never bound | it runs, reading zero | it runs, reading other values ((255, 0, 255) drawn, -2.8e38 dispatched) |
+| a kernel writes a texture bound nil | it runs, and the write goes nowhere | the same |
+| a render pass of color attachment 0 nil (its size set or not, a pipeline of the target's format or of none, color 1 the target), or of a depth attachment nil beside color 0 | the encoder is made, its draws run against what is attached, and the command buffer completes | the same |
+| `setRenderPipelineState:nil`, then a draw | the process ends (SIGSEGV) | the same |
+| `useResource:nil` | the process ends (SIGSEGV) | it goes on, and the draw runs |
+| a blit from or to nil: a copy from a texture into a buffer and from the target into a buffer, a fill, `generateMipmapsForTexture:` | the process ends (SIGSEGV) | the same |
+| a copy from a nil texture into the target | the process ends (SIGSEGV) | the command buffer completes, and nothing is copied |
+
+Every command buffer that ran completed with no error. So a draw or dispatch with nil bound runs
+on both *(class 3)*, a nil texture reading zero *(class 3)*, a nil buffer zero on the AMD *(class
+2)*, and a nil sampler the default one's sampling on the AMD and zero on the Intel *(class 2)*.
+
+What our stack does with an object whose posted create the host refused (`decode::refused`):
+- *(class 3, and class 2 the AMD's)* A binding of a buffer, texture or sampler of one binds nil,
+  and the encoder's draws and dispatches run, as with nil bound. Nil is the platform's: on the
+  Vulkan platform metal2vulkan's neutral image, sampler and zero buffer, which read zero and
+  sample by the default sampler, as the AMD; on the Metal platform, Metal's own. Until 11-05 they
+  were dropped while such a slot was bound.
+- *(class 4)* A render pass with an attachment of one is skipped whole, where both Macs run it
+  without it: an assertion in the host's Metal at a pass with no attachment would end the host's
+  process, and the Metal platform was not measured there. A pipeline state of one is not set, and
+  the draws are dropped until another is, and a blit from or to one is dropped, where both Macs
+  end the process at nil: the bundle does not know the create was refused, so cannot end it.
+- A use list's entry of one is nil, as the Intel goes on.
 
 ## Not measured
 
