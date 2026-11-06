@@ -316,12 +316,13 @@ pub struct CommandBufferObject {
 /// scheduled on a handler thread, woken for it, where it runs it on its scheduler thread as it
 /// submits the command buffer (`rt::WorkCounts::scheduled_where_submitted`). Every command
 /// buffer this platform commits carries a submission check ([`backing::submission_check`]), which
-/// the runtime runs on its scheduler thread, so that thread submits it, once its waits are met
-/// and the work ahead of it on its queue is submitted: after `commit` returns, as Metal submits
-/// on a thread of its own and tells the program only through scheduled (the runtime's
-/// measurement on an M4). A range placed between the commit and the submission lies by the threads'
-/// timing, on Metal as here. A command buffer the runtime fails before its submission takes
-/// nothing.
+/// the runtime runs just before it submits the command buffer, once its waits are met and the work
+/// ahead of it on its queue is submitted: inside `commit`, on the committing thread, where that
+/// thread makes the submission pass ([`CommandBuffer::commit`]), else on the runtime's scheduler
+/// thread after `commit` returns, as Metal submits on a thread of its own and tells the program
+/// only through scheduled (the runtime's measurement on an M4). A range placed between the commit
+/// and the submission lies by the threads' timing, on Metal as here. A command buffer the runtime
+/// fails before its submission takes nothing.
 fn tiler_handler() -> rt::Handler {
     Box::new(|_| metal_space::first_use(FirstUse::TilerSubmission))
 }
@@ -1399,10 +1400,16 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// ([`tiler_handler`]). One committed while a command buffer of its queue that Metal's GPU
     /// hangs at is in flight runs nothing and completes without an error, as on Metal, as the
     /// runtime commits it (the module docs). It is committed through the runtime's
-    /// `commit_and_submit`, which submits on this thread the ready batches that need nothing of
-    /// the scheduler's thread, and runs their submission handlers here, inside the call; a batch
-    /// with a submission check, which every command buffer here carries but one committed failed,
-    /// is the scheduler's thread's, as under `commit`.
+    /// `commit_and_submit`, which, where no other submission pass is under way, submits on this
+    /// thread the device's ready batches committed first, this one's among them, and runs their
+    /// submission checks and submission handlers here, inside the call, of whichever command
+    /// buffer, queue or thread they are; a batch whose checks wait for another submission's GPU
+    /// signal to land, and what is behind it, is the scheduler thread's. So no check or
+    /// submission handler of the process takes a lock a caller holds across a commit: the check
+    /// takes its command buffer's note and the detach registry's lock
+    /// ([`backing::submission_check`]), the tiler's handler the process's space
+    /// ([`tiler_handler`]), and the decoder's handlers their records' locks and the completion
+    /// ring's.
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
         // The guest's GPU work, which keeps the GPU awake ([`crate::awake`]).
         self.device.awake.touch();
@@ -1759,6 +1766,62 @@ mod tests {
             .unwrap_err();
             assert_eq!(site.file, "commit");
         }
+    }
+
+    /// A commit runs the command buffer's submission check and its submission handler inside the
+    /// call, on the committing thread, where no other submission pass is under way
+    /// (`rt::CommandBuffer::commit_and_submit`): the handler finds a lock the caller holds across
+    /// the commit held, as the decoder's device caches hold theirs across an early copy, so a
+    /// check or handler that took a lock its commit's caller holds would deadlock there. Those of
+    /// this platform and the decoder take none: the check takes its command buffer's note and the
+    /// detach registry's lock ([`backing::submission_check`]), the decoder's handlers their
+    /// records' locks and the completion ring's, and the tiler's handler the process's space
+    /// ([`tiler_handler`]), none of which a commit's caller holds.
+    #[test]
+    fn a_commit_checks_and_submits_inside_the_call_under_the_caller_s_locks() {
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_core::platform::types::NsRange;
+
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let b = crate::gpu::resource::tests::shared(16);
+        let cb = buffer(&q);
+        let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        let fill = BlitCmd::FillBuffer {
+            buffer: &b,
+            range: NsRange::new(0, 16),
+            value: 7,
+        };
+        blit.encode(OnFault::Return, fill).unwrap();
+        blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+        let caller = Arc::new(Mutex::new(()));
+        let ran = Arc::new(Mutex::new(None));
+        let (lock, at) = (Arc::clone(&caller), Arc::clone(&ran));
+        cb.add_submission_handler(
+            OnFault::Return,
+            Box::new(move || {
+                let held = lock.try_lock().is_none();
+                *at.lock() = Some((std::thread::current().id(), held));
+            }),
+        )
+        .unwrap();
+        let checked = d.raw.work_counts().batches_checked_at_commit;
+        let held = caller.lock();
+        cb.commit(OnFault::Return).unwrap();
+        let seen = ran.lock().take();
+        drop(held);
+        assert_eq!(
+            seen,
+            Some((std::thread::current().id(), true)),
+            "its handler ran inside the commit, on its thread, the caller's lock held"
+        );
+        assert_eq!(
+            d.raw.work_counts().batches_checked_at_commit,
+            checked + 1,
+            "its check ran inside the commit"
+        );
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!(cb.status(), CommandBufferStatus::COMPLETED);
     }
 
     /// `encodeSignalEventScheduled:value:` sets the event's value as its command buffer is

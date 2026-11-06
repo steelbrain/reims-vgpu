@@ -1097,14 +1097,15 @@ pub(crate) fn uses_detached(cb: &rt::CommandBuffer, opened: &Opened) -> bool {
 }
 
 /// The check of each submission of the command buffer committed as `cb`
-/// ([`rt::CommandBuffer::set_submission_check`]), which the runtime runs on its scheduler thread
-/// once the submission's event waits are met, just before it submits it: one that uses a
+/// ([`rt::CommandBuffer::set_submission_check`]), which the runtime runs once the submission's
+/// event waits are met, just before it submits it, on the thread that submits it (the
+/// committing thread inside its commit, or the runtime's scheduler thread): one that uses a
 /// detached buffer or heap, or one released detached since `cb` was made, fails with
 /// [`DETACHED_USE`]; any other is noted submitted ([`Opened::submit`]). The runtime drops it,
 /// and so closes `cb`, once the command buffer completed, after its completed handlers ran.
 pub(crate) fn submission_check(cb: Opened) -> rt::SubmissionCheck {
     Arc::new(move |submission: &rt::Submission<'_>| {
-        // A callout on the runtime's scheduler thread: marked ours, so a panic here aborts.
+        // A callout inside the runtime's submission: marked ours, so a panic here aborts.
         let _env = BlockEnv::foreign();
         cb.submit(submission)
     })
