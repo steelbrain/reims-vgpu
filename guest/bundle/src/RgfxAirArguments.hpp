@@ -368,7 +368,9 @@ private:
 
 // The bytes of modules the process keeps (rgfxAirModules). measured: the 40,177 distinct modules
 // of macOS 27's frameworks' .metallibs on the M3 Max are 11,072 bytes each on average, so this
-// keeps about 1,500 such modules.
+// keeps about 1,500 such modules. A kept module holds about 1.5 times its bytes in all, its copy
+// and its reads (11,770 bytes in use for 7,690 of bitcode, over 2,000 of those modules, arm64 and
+// x86_64 alike), so a full cache holds about 25 MiB.
 constexpr size_t kRgfxAirModuleCacheBytes = 16u << 20;
 
 // The process's cache of modules, of kRgfxAirModuleCacheBytes, which every library reads its
