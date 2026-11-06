@@ -4554,7 +4554,8 @@ mod tests {
     /// Through the decoder on `P`, as the host takes two queues' rings on threads of their own:
     /// buffer A of queue 1 fills a tracked buffer, and buffer B of queue 2, committed plainly
     /// after A by the guest, names A in its `COMMIT_ORDER` and copies the buffer out. B is taken
-    /// first, on a thread of its own; A is begun 50 ms on and committed 100 ms after that. The
+    /// first, on a thread of its own; A is begun 50 ms on and committed 100 ms after that, and
+    /// its message ends, raising its queue's commit mark, once the platform has scheduled it. The
     /// bytes B copied.
     #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
@@ -4578,6 +4579,9 @@ mod tests {
         let completed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&completed);
         dec.set_completion_sink(Arc::new(move |m| sink.lock().push(m.cb_obj_id)));
+        let scheduled = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&scheduled);
+        dec.set_scheduled_sink(Arc::new(move |m| sink.lock().push(m.cb_obj_id)));
         for obj_id in [1, 2] {
             let queue = RgfxQueueCreate {
                 header: RgfxMsgHeader {
@@ -4650,6 +4654,14 @@ mod tests {
                 first.finish_command_buffer(device, &a, begun).unwrap(),
                 Ok(())
             );
+            let start = Instant::now();
+            while !scheduled.lock().contains(&20) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "A was never scheduled"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
             first.end_message();
             assert_eq!(taken_first.join().unwrap(), Ok(()));
         });
@@ -4673,9 +4685,12 @@ mod tests {
 
     /// On Metal, a plain commit on another queue that the guest made after a buffer's, and that
     /// names it in its `COMMIT_ORDER`, reads the tracked buffer it writes, though the host took
-    /// it first: Metal orders a tracked resource across a process's queues by commit order (the
-    /// M3, the 5300M and the 630, docs/graphics-kext/dgpu-oracle.md, Q6), and the host commits
-    /// it after the buffer it names.
+    /// it first: the host commits it only once the buffer it names is committed, here once Metal
+    /// has scheduled that one, and Metal orders a tracked resource across queues behind work it
+    /// has submitted (docs/graphics-kext/dgpu-oracle.md, Q6 and Q7). Committed as soon as the
+    /// named buffer's `commit` returned, it missed that buffer's writes in 1 of 40 runs of
+    /// `graphics::decode`'s tests in one process (measured on the M3 Max; Q6's 0 of 5 ran on an
+    /// idle GPU).
     #[cfg(target_os = "macos")]
     #[test]
     fn on_metal_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names() {
