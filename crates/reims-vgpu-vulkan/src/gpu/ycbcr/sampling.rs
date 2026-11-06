@@ -901,10 +901,6 @@ fn code_reading_members_sample_under_every_mode_as_metals() {
 /// samples repeat, mirrored repeat and mirror clamp to the edge as clamp to the edge, and so
 /// does the runtime's, whose address-mode map takes those modes there
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "MoltenVK: the runtime records ycbcr-filter-not-exact, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
-)]
 fn ycbcr10_420_samples_under_every_mode_as_metals() {
     samples_under_every_mode_as_metals(505, [b"x420", b"xf22"]);
 }
