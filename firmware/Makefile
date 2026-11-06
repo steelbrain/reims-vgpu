@@ -4,8 +4,14 @@
 # the reims-graphics device's (docs/graphics-kext/design.md), built on the
 # host's wire protocol header in ../crates/reims-graphics/include.
 #
-#   make        build/ReimsVgpu.{efi,rom} and build/ReimsGraphics.{efi,rom}
-#   make clean  remove build/
+#   make           build/ReimsVgpu.{efi,rom} and build/ReimsGraphics.{efi,rom}
+#   make prebuilt  on a Mac, also prebuilt/ReimsGraphics.rom, which reims-ctl carries, and
+#                  prebuilt/ReimsGraphics.toml, the sha256 of the files it was built from
+#                  (prebuilt.sh): commit both with a change to what the ROM is built from
+#   make prebuilt-check
+#                  fail where the committed ROM is stale: a file its record names changed
+#                  (cargo xtask check runs it)
+#   make clean     remove build/
 #
 # BUILD moves the output: cargo xtask dist runs `make rom` with BUILD set to
 # <target>/firmware. Needs clang and lld (on macOS, Homebrew's: brew install
@@ -92,9 +98,15 @@ $(BUILD)/obj/%.obj: src/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
+prebuilt: $(BUILD)/$(GNAME).rom
+	sh prebuilt.sh $(BUILD)
+
+prebuilt-check:
+	@sh prebuilt.sh --check
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all efi rom clean
+.PHONY: all efi rom prebuilt prebuilt-check clean
 
 -include $(OBJECTS:.obj=.d) $(GOBJECTS:.obj=.d)

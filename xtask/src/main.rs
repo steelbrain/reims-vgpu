@@ -52,7 +52,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "check",
-        about: "testkit, header --check, rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64",
+        about: "testkit, header --check, the prebuilt option ROM's record (make -C firmware prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64",
         run: cmd_check,
     },
 ];
@@ -139,6 +139,18 @@ fn cargo_with(args: &[&str], env: &[(&str, &std::path::Path)]) -> Res<bool> {
     Ok(status.success())
 }
 
+/// Runs `make` with `args` from the repository's root: one of the check's steps that are not
+/// cargo's.
+fn make(args: &[&str]) -> Res<bool> {
+    println!("$ make {}", args.join(" "));
+    let status = std::process::Command::new("make")
+        .args(args)
+        .current_dir(repo_root())
+        .status()
+        .map_err(|e| format!("make: {e}"))?;
+    Ok(status.success())
+}
+
 /// The features `check` tests with: every feature of the workspace's crates but the C API's
 /// `vulkan`, which makes every handle of the C API the Vulkan platform's, so that the pins and
 /// the C harness, which drive the product's C API, would run on that platform instead
@@ -191,6 +203,10 @@ fn cmd_check(args: &[String]) -> Res<bool> {
     let mut ok = true;
     ok &= cmd_testkit(&[])?;
     ok &= header::cmd_header(&["--check".to_owned()])?;
+    // The option ROM reims-ctl carries is built from the tree's sources: a change to what it is
+    // built from (the wire header among them) without it built again fails here, though the
+    // library's checks reach neither (firmware/prebuilt.sh).
+    ok &= make(&["-C", "firmware", "prebuilt-check"])?;
     if !flag(args, "--no-cargo") {
         let features = if cfg!(target_os = "linux") {
             LINUX_FEATURES

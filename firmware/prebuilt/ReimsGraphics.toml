@@ -1,0 +1,17 @@
+# prebuilt/ReimsGraphics.rom, the option ROM reims-ctl carries for reims-vgpu's own device,
+# and the sha256 of each file it was built from: make -C firmware prebuilt writes both on a
+# Mac, and make -C firmware prebuilt-check checks them against the tree. Built with:
+#   Apple clang version 21.0.0 (clang-2100.4.1.1)
+#   Homebrew LLD 23.1.4 (compatible with GNU linkers)
+rom = "749434f87f562895548f60681cd4cd8bf6cc0d0e967ac2fea297674426709161"
+
+[sources]
+"crates/reims-graphics/include/reims_graphics_wire.h" = "48eb0e5bffaf6a1d2adee16ee9df6c2a88e7352d7fe867bd39509ca85868e5d7"
+"firmware/Makefile" = "dfdc68504271e09cec05f2408c7a73c7fa2487f20ffef0944fe20b078ae3b322"
+"firmware/src/OptionRom.S" = "54cb57ea2e5b4ac67e1627f5251314d56c4792a376a9c535deb661f0e29714a4"
+"firmware/src/ReimsGraphics.c" = "554751ff15edbdf69a038d5b2aefd8315b9c54610c090c0890d9c72b13dacdef"
+"firmware/src/ReimsGraphics.h" = "83e3439b9baf9c06ee75c57537792770efa7a5cb07e22bf1fb47f6ffef7af169"
+"firmware/src/ReimsGraphicsName.c" = "107e7e34240a3942dcd410b701768ab81013f42932783b7fa90fcefc3f815f19"
+"firmware/src/ReimsGraphicsOutput.c" = "c35ed747684d90c2b195d95613d79111a9f7c0777654f5f027ed9951bdd7a112"
+"firmware/src/ReimsGraphicsRom.S" = "db1211cc9d4b40628d101a7377eeeebfefc57820ec5fd1a72fffefb90c2ed2bb"
+"firmware/src/Uefi.h" = "d9b349424b645428c114d141b0ca7c4b92ccef573803e16eea501258eb5572ee"
