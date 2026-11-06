@@ -223,38 +223,40 @@ Stages:
 13. **Loading: through OpenCore, with a bridge for our kext only.** OpenCore
     injects kexts into the Boot kernel collection and links them only against
     Boot-collection symbols, but a display kext uses IOGraphicsFamily, which
-    is in the System collection. So our kext needs a loader bridge (a Lilu
-    plugin plus a generated shim) to reach it, exactly as the x86-64 port's
-    kexts do. That bridge is infrastructure, separate from the port's GPU
-    driver kexts: our lane replaces those driver kexts with our own and keeps
-    none of them. The clean image carries only Lilu, the loader, our shim and
-    ReimsGraphics.kext. Nothing of the guest OS is patched or hooked beyond
-    what this bridge already does for the existing lane.
+    is in the System collection. So our kext loads through a loader, a Lilu
+    plugin, and two generated shims: ReimsGraphicsLoader
+    (guest/loader/README.md). The image carries only Lilu and the set
+    `make -C guest set` builds, in this order: the loader, the shims for
+    IOGraphicsFamily and AppleGraphicsDeviceControl, ReimsGraphics.kext,
+    and RgfxGate.kext. None of the x86-64 port's kexts are in it, and the
+    loader needs none of them. Nothing of the guest OS is patched or hooked
+    beyond what the loader does.
     - Iterating: patch a copy of a VM's OpenCore image directly
       (scripts/internal/opencore-add-kexts.sh). No rebuild inside the guest.
     - The loader binds our kext from a table generated from one build of
-      it: each bridge site (a GOT or vtable pointer, a call into
-      IOGraphicsFamily, IOAcceleratorFamily or AppleGraphicsDeviceControl) by
-      its offset in the binary. Swapping a new ReimsGraphics binary into an
-      image's set therefore binds only while those sites stay put, and no
-      script here regenerates the table. A change that grows the kext's
-      `__const` or `__data` (a new initialized global, or a member of one)
-      moves every pointer after it. A change in an object linked before the
-      provider calls (`ReimsGraphics.o`, `RgfxAccelerator.o`) moves those
-      calls. Either needs the table generated again; a swap fails to bind. To
-      spot it, the loader logs `apvload: ... ReimsGraphics: got +0x...
+      it. The table holds each bridge site by its offset in the binary: a
+      GOT or vtable pointer, or a call into IOGraphicsFamily or
+      AppleGraphicsDeviceControl. Swapping a new ReimsGraphics binary into an
+      image's set therefore binds only while those sites stay put. A change
+      that grows the kext's `__const` or `__data` (a new initialized global,
+      or a member of one) moves every pointer after it. A change in an
+      object linked before the provider calls (`ReimsGraphics.o`,
+      `RgfxAccelerator.o`) moves those calls. Either fails to bind. To spot
+      it, the loader logs `rgfxload: ... ReimsGraphics: got +0x...
       <symbol> failed the placeholder check (old 0x...)`, then
-      `publishIndependent: ReimsGraphics not ready (bind failed)`, and the
-      guest boots with no framebuffer or Metal device. Before a swap, check
-      that `otool -rv` lists every relocation at or past `__DATA`, and every
-      provider call, at the same offset and symbol as the binary the table
-      was made from. The swap also keeps the set's own `Info.plist`, whose
-      `OSBundleLibraries` name the bridge shims and which carries no
-      personalities. The build's own `Info.plist` makes OpenCore refuse the
-      kext ("Prelinked injection ReimsGraphics.kext ... Invalid Parameter"
-      on the serial log).
-    - Shipping (later): reims-util injects the set when it builds an image.
-      Not needed to prototype.
+      `publish: ReimsGraphics not ready (bind failed)`, and the guest boots
+      with no framebuffer or Metal device. So never swap ReimsGraphics
+      alone: `make -C guest set` builds the kext, its shims and the loader
+      together, and stages the kext with an `Info.plist` whose
+      `OSBundleLibraries` name the shims and which carries no personalities.
+      The kext build's own `Info.plist` makes OpenCore refuse the kext
+      ("Prelinked injection ReimsGraphics.kext ... Invalid Parameter" on
+      the serial log).
+    - Shipping: the repository carries the set prebuilt in guest/prebuilt,
+      with its Kernel > Add entries in `set.toml` and the record of its
+      sources in `sources.toml` (`make -C guest prebuilt`;
+      `make -C guest prebuilt-check` fails when they differ from the tree).
+      reims-ctl adds the set to an image, since a Linux host cannot build it.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync
