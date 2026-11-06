@@ -9170,3 +9170,99 @@ fn a_commit_on_the_device_s_thread_posts_a_decoder_buffer_s_records_there() {
     );
     platform.world().complete_all(CompleteOn::Thread);
 }
+
+/// What a decoder buffer's records cost when a commit on a thread the raise is not named for
+/// takes the buffer ([`a_foreign_commit_hands_a_decoder_buffer_s_records_to_its_queue_s_thread`])
+/// and hands them to the queue's service thread, against one on a device's thread, which posts
+/// them inline: the commit call's time on the committing thread, and the time from the commit's
+/// start to the buffer's `CB_SCHEDULED` on the ring, with the queue's thread asleep before each, as
+/// between frames. Prints the mean, median, 90th and 99th percentiles and the most, in
+/// microseconds: a measurement, run by hand (`--run-ignored only --no-capture`, in a release
+/// build).
+#[test]
+#[ignore = "a measurement, run by hand"]
+#[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+fn a_handed_over_record_s_cost() {
+    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use std::time::Instant;
+
+    const ROUNDS: usize = 1000;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, mut guest, mut ring) = one_queue(&raised);
+    guest.send(&device, shared_event_create(obj(1, 7), 0));
+    // A committer on a thread named `name`: at each word it commits a draw of its own, and
+    // answers when the commit began and how long it took.
+    let committer = |name: &str| {
+        let queue = platform.device().new_command_queue().expect("a queue");
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(Instant, Duration)>();
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                for () in go_rx {
+                    let draw = no_catch(queue.command_buffer(OnFault::Die)).expect("a buffer");
+                    let start = Instant::now();
+                    no_catch(draw.commit(OnFault::Die));
+                    let _ = done_tx.send((start, start.elapsed()));
+                }
+            })
+            .unwrap();
+        (go_tx, done_rx)
+    };
+    // (handed over, inline)
+    let committers = [
+        committer("reims-vgpu.window"),
+        committer("reims-vgpu.graphics-lane-bench"),
+    ];
+    let submit_off = ring.submit_off;
+    let mut commit_us: [Vec<f64>; 2] = Default::default();
+    let mut scheduled_us: [Vec<f64>; 2] = Default::default();
+    for (round, cb) in (0..2 * ROUNDS).zip(5000_u64..) {
+        let kind = round % 2;
+        platform.world().hold_submissions();
+        ring.send(&device, waiting_and_asking(obj(1, 1), cb, obj(1, 7), 1));
+        committed(&platform, 1);
+        wait_idle(&device, submit_off);
+        // A pause as the guest's, so the queue's thread sleeps as it does between frames.
+        std::thread::sleep(Duration::from_micros(200));
+        ring.arm();
+        platform.world().release_submissions_at_next_commit();
+        committers[kind].0.send(()).unwrap();
+        let (start, took) = committers[kind].1.recv().unwrap();
+        while !ring.scheduled.iter().any(|&(_, id)| id == cb) {
+            if ring.has_event() {
+                let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
+                assert_eq!(
+                    (posted.header.r#type, posted.cb_obj_id),
+                    (RGFX_EVT_CB_SUBMITTED, cb)
+                );
+            }
+            assert!(start.elapsed() < Duration::from_secs(2), "no CB_SCHEDULED");
+            std::hint::spin_loop();
+        }
+        scheduled_us[kind].push(start.elapsed().as_secs_f64() * 1e6);
+        commit_us[kind].push(took.as_secs_f64() * 1e6);
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let complete = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((complete.cb_obj_id, complete.status), (cb, RGFX_CB_OK));
+        ring.scheduled.clear();
+    }
+    assert_eq!(device.handed_over(), 2 * ROUNDS as u64);
+    let stats = |name: &str, us: &[f64]| {
+        let mut us = us.to_vec();
+        us.sort_by(f64::total_cmp);
+        let n = us.len();
+        let mean = us.iter().sum::<f64>() / n as f64;
+        println!(
+            "{name}: mean {mean:.2} p50 {:.2} p90 {:.2} p99 {:.2} max {:.2} us (n {n})",
+            us[n / 2],
+            us[n * 9 / 10],
+            us[n * 99 / 100],
+            us[n - 1]
+        );
+    };
+    stats("commit call, handed over", &commit_us[0]);
+    stats("commit call, inline", &commit_us[1]);
+    stats("commit to CB_SCHEDULED, handed over", &scheduled_us[0]);
+    stats("commit to CB_SCHEDULED, inline", &scheduled_us[1]);
+}
