@@ -51,8 +51,10 @@
 //                event's: IOObjectGetClass and IOObjectConformsTo of an IOKit connection (an
 //                IOSurfaceRoot user client), of mach_task_self() and of a send right of a receive
 //                right the probe holds (on a thread of its own, so a call that waits for an
-//                answer no one gives is reported after 1 s), and IOConnectCallMethod of
-//                selector 0x114 with three scalars in and two out on each
+//                answer no one gives is reported after 1 s), IOConnectCallMethod of selector
+//                0x114 with three scalars in and two out on each, and, first, IOConnectAddClient
+//                of each to the IOSurfaceRoot connection, which the kernel answers from its
+//                look-up of the port
 // Build: see README.md.
 #import "oracle_common.h"
 #import <IOSurface/IOSurface.h>
@@ -813,15 +815,17 @@ static void case_kill(id<MTLDevice> d)
 	       (long)cb.status, after.signaledValue, (int)reached);
 }
 
-// What IOObjectGetClass, IOObjectConformsTo and IOConnectCallMethod answer for `port`, each on a
-// thread of its own, reported after 1 s where it has not returned.
-static void connect_calls(const char *what, mach_port_t port)
+// What IOConnectAddClient (to `conn`, where it is one), IOObjectGetClass, IOObjectConformsTo and
+// IOConnectCallMethod answer for `port`, in that order, each on a thread of its own, reported
+// after 1 s where it has not returned.
+static void connect_calls(const char *what, mach_port_t port, io_connect_t conn)
 {
 	dispatch_queue_t q = dispatch_queue_create("oe.connect", DISPATCH_QUEUE_CONCURRENT);
 	void (^call)(const char *, kern_return_t (^)(char *)) = ^(const char *name,
 	                                                          kern_return_t (^op)(char *)) {
 		__block kern_return_t kr = 0;
-		__block char detail[128] = "";
+		// On the heap: a call that never returns keeps it.
+		char *detail = (char *)calloc(1, 128);
 		dispatch_semaphore_t done = dispatch_semaphore_create(0);
 		dispatch_async(q, ^{
 			kr = op(detail);
@@ -832,6 +836,12 @@ static void connect_calls(const char *what, mach_port_t port)
 		else
 			printf("connect %s %s: kr 0x%x %s\n", what, name, kr, detail);
 	};
+	// First: a call whose port is its argument, never its destination.
+	if (conn != MACH_PORT_NULL)
+		call("IOConnectAddClient", ^kern_return_t(char *detail) {
+			snprintf(detail, 128, "to the IOSurfaceRoot connection");
+			return IOConnectAddClient(conn, port);
+		});
 	call("IOObjectGetClass", ^kern_return_t(char *detail) {
 		io_name_t name = "";
 		kern_return_t kr = IOObjectGetClass(port, name);
@@ -858,10 +868,12 @@ static void case_connect(void)
 	io_connect_t conn = MACH_PORT_NULL;
 	kern_return_t kr = root ? IOServiceOpen(root, mach_task_self(), 0, &conn) : KERN_FAILURE;
 	printf("connect IOSurfaceRoot open kr 0x%x\n", kr);
-	if (kr == KERN_SUCCESS)
-		connect_calls("connection", conn);
-	connect_calls("task", mach_task_self());
-	connect_calls("recv", oe_receive_right());
+	if (kr != KERN_SUCCESS)
+		conn = MACH_PORT_NULL;
+	if (conn != MACH_PORT_NULL)
+		connect_calls("connection", conn, conn);
+	connect_calls("task", mach_task_self(), conn);
+	connect_calls("recv", oe_receive_right(), conn);
 }
 
 static void case_spawn(id<MTLDevice> d)
