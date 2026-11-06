@@ -9,7 +9,7 @@
 //   intro        the classes of a shared event and of its handle, up to NSObject: each class's
 //                own instance and class methods with their type encodings, its instance
 //                variables and protocols; and which shared-event creators the device answers
-//   fake         MTLSharedEventHandle's initWithMTLSharedEvent: (where it answers) over an object
+//   fake         MTLSharedEventHandle's initWithSharedEvent: (where it answers) over an object
 //                of the probe's own that answers eventPort with a port the probe made: which
 //                selectors the init sends it, the handle's eventPort and label, and the port's
 //                send references at each step
@@ -33,7 +33,9 @@
 //                unarchiver over an empty archive
 //   xpc          a handle sent through an in-process NSXPC connection (an anonymous listener):
 //                the event made from it on the far side, its value, and a set there seen here;
-//                xpc.event, the shared event itself sent (what class arrives, and its value)
+//                xpc.event, the shared event itself sent (what class arrives, and its value);
+//                fake.xpc, a handle made over the fake's port (fake, above) sent: the port and
+//                label the far side's handle answers
 //   spawn        two processes: the probe spawns a peer of itself, which takes the event's port
 //                over a Mach message and makes an event from it (newSharedEventWithMachPort:).
 //                Each step's line: the value the peer reads; a CPU set in the peer as this
@@ -96,6 +98,8 @@ static const char *port_type(mach_port_name_t name)
 	return "other";
 }
 
+static mach_port_t oe_receive_right(void);
+
 // --- SPI by message ---------------------------------------------------------------------
 
 static mach_port_t event_port(id e)
@@ -106,12 +110,16 @@ static mach_port_t event_port(id e)
 	return ((mach_port_t(*)(id, SEL))objc_msgSend)(e, s);
 }
 
+// newSharedEventWithMachPort:'s +1 event, which ARC takes as the new... family's.
+typedef id __attribute__((ns_returns_retained)) (*oe_new_from_port)(id, SEL, mach_port_t);
+
+static id<MTLSharedEvent> from_port(id<MTLDevice> d, mach_port_t port) NS_RETURNS_RETAINED;
 static id<MTLSharedEvent> from_port(id<MTLDevice> d, mach_port_t port)
 {
 	SEL s = sel_registerName("newSharedEventWithMachPort:");
 	if (![(id)d respondsToSelector:s])
 		return nil;
-	return ((id(*)(id, SEL, mach_port_t))objc_msgSend)(d, s, port);
+	return ((oe_new_from_port)objc_msgSend)(d, s, port);
 }
 
 // --- intro --------------------------------------------------------------------------------
@@ -209,27 +217,37 @@ static void case_intro(id<MTLDevice> d)
 }
 @end
 
-static void case_fake(void)
+// A handle made by MTLSharedEventHandle's initWithSharedEvent: over a fake (OEFakeEvent) whose
+// port is `port`: nil where the class has no such init.
+static MTLSharedEventHandle *fake_handle(mach_port_t port)
 {
-	mach_port_t rx = MACH_PORT_NULL;
-	mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &rx);
-	mach_port_insert_right(mach_task_self(), rx, rx, MACH_MSG_TYPE_MAKE_SEND);
-	printf("fake port made refs %d\n", send_refs(rx));
-	SEL init = sel_registerName("initWithMTLSharedEvent:");
-	printf("fake handle responds initWithMTLSharedEvent:=%d\n",
+	SEL init = sel_registerName("initWithSharedEvent:");
+	printf("fake handle responds initWithSharedEvent:=%d\n",
 	       (int)[MTLSharedEventHandle instancesRespondToSelector:init]);
 	if (![MTLSharedEventHandle instancesRespondToSelector:init])
-		return;
+		return nil;
+	OEFakeEvent *fake = [[OEFakeEvent alloc] init];
+	fake.port = port;
+	fake.label = @"fake-label";
+	id h = [MTLSharedEventHandle alloc];
+	h = ((id(*)(id, SEL, id))objc_msgSend)(h, init, fake);
+	return h;
+}
+
+static void case_fake(void)
+{
+	mach_port_t rx = oe_receive_right();
+	printf("fake port made refs %d\n", send_refs(rx));
 	@autoreleasepool {
-		OEFakeEvent *fake = [[OEFakeEvent alloc] init];
-		fake.port = rx;
-		fake.label = @"fake-label";
-		MTLSharedEventHandle *h = ((id(*)(id, SEL, id))objc_msgSend)([MTLSharedEventHandle alloc],
-		                                                             init, fake);
+		MTLSharedEventHandle *h = fake_handle(rx);
 		printf("fake handle=%s refs after init %d\n", cls(h), send_refs(rx));
 		mach_port_t hp = event_port(h);
 		printf("fake handle eventPort=%s same=%d label=%s refs %d\n", hp ? "nonzero" : "0",
 		       (int)(hp == rx), h.label ? h.label.UTF8String : "nil", send_refs(rx));
+		SEL tid = sel_registerName("labelTraceID");
+		if ([h respondsToSelector:tid])
+			printf("fake handle labelTraceID=%llu\n",
+			       ((uint64_t(*)(id, SEL))objc_msgSend)(h, tid));
 		h = nil;
 	}
 	printf("fake handle let go refs %d type %s\n", send_refs(rx), port_type(rx));
@@ -454,6 +472,7 @@ static void case_coding(id<MTLDevice> d)
 @protocol OEPeer
 - (void)takeHandle:(MTLSharedEventHandle *)handle reply:(void (^)(uint64_t value))reply;
 - (void)takeEvent:(id)event reply:(void (^)(NSString *cls, uint64_t value))reply;
+- (void)takeFakeHandle:(MTLSharedEventHandle *)handle reply:(void (^)(uint32_t port))reply;
 @end
 
 @interface OEPeerImpl : NSObject <OEPeer, NSXPCListenerDelegate>
@@ -483,6 +502,13 @@ static void case_coding(id<MTLDevice> d)
 	       _original.signaledValue);
 	reply(e ? e.signaledValue : 0);
 }
+- (void)takeFakeHandle:(MTLSharedEventHandle *)handle reply:(void (^)(uint32_t))reply
+{
+	mach_port_t p = event_port(handle);
+	printf("fake.xpc far side: handle=%s eventPort refs %d label=%s\n", cls(handle), send_refs(p),
+	       handle.label ? handle.label.UTF8String : "nil");
+	reply(p);
+}
 - (void)takeEvent:(id)event reply:(void (^)(NSString *, uint64_t))reply
 {
 	BOOL shared = [event conformsToProtocol:@protocol(MTLSharedEvent)];
@@ -492,7 +518,7 @@ static void case_coding(id<MTLDevice> d)
 }
 @end
 
-static void case_xpc(id<MTLDevice> d, BOOL sendEvent)
+static void case_xpc(id<MTLDevice> d, BOOL sendEvent, BOOL fake)
 {
 	id<MTLSharedEvent> se = [d newSharedEvent];
 	se.signaledValue = 7;
@@ -518,7 +544,17 @@ static void case_xpc(id<MTLDevice> d, BOOL sendEvent)
 		printf("xpc error %s\n", err_text(e));
 		dispatch_semaphore_signal(done);
 	}];
-	if (sendEvent) {
+	if (fake) {
+		mach_port_t rx = oe_receive_right();
+		MTLSharedEventHandle *h = fake_handle(rx);
+		printf("fake.xpc handle=%s refs %d\n", cls(h), send_refs(rx));
+		[peer takeFakeHandle:h
+		               reply:^(uint32_t p) {
+			               printf("fake.xpc reply: the far side's port is the probe's=%d refs %d\n",
+			                      (int)(p == rx), send_refs(rx));
+			               dispatch_semaphore_signal(done);
+		               }];
+	} else if (sendEvent) {
 		[peer takeEvent:se
 		          reply:^(NSString *name, uint64_t v) {
 			          printf("xpc.event arrived as %s value=%llu\n", name.UTF8String, v);
@@ -751,7 +787,7 @@ out:;
 static const char *const kCases[] = {"intro",        "fake",         "refs",          "values",
                                      "machport.null", "machport.dead", "machport.recv", "machport.task",
                                      "handle.nil",   "label",        "coding",        "xpc",
-                                     "xpc.event",    "spawn"};
+                                     "xpc.event",    "fake.xpc",     "spawn"};
 
 static int run_case(id<MTLDevice> d, const char *c)
 {
@@ -772,9 +808,11 @@ static int run_case(id<MTLDevice> d, const char *c)
 	else if (!strcmp(c, "coding"))
 		case_coding(d);
 	else if (!strcmp(c, "xpc"))
-		case_xpc(d, NO);
+		case_xpc(d, NO, NO);
 	else if (!strcmp(c, "xpc.event"))
-		case_xpc(d, YES);
+		case_xpc(d, YES, NO);
+	else if (!strcmp(c, "fake.xpc"))
+		case_xpc(d, NO, YES);
 	else if (!strcmp(c, "spawn"))
 		case_spawn(d);
 	else {
