@@ -3916,6 +3916,29 @@ void test_pipeline_reflection_from_air()
 	CHECK(shape(specialised) == "out:0 on:0 onTexture:2 placed:0 readWhereOff:0- ");
 	CHECK(specialised.count == 5 && number(specialised[2], @"index") == 1 && number(specialised[3], @"index") == 5 &&
 	      number(specialised[4], @"index") == 3 && !flag(specialised[4], @"isActive"));
+	// k_specialised (Metal's answers, measured on both x86 Macs): with kOn, kIndex 5 and kMode 1,
+	// `plus` is at kIndex + 1, `either` (under kOn || kOff) is kept, `modeOne` (read in kMode's
+	// case 1) is used, and `optional` (read where kOpt, undefined, is defined and true), `modeTwo`
+	// and `smp` (read where kMode is 2) are not.
+	const int one = 1, two = 2, seven = 7;
+	[values setConstantValue:&one type:MTLDataTypeInt withName:@"kMode"];
+	NSArray *specOn = ask(RgfxComputePipelineReflectionOf(
+	                          [lib newFunctionWithName:@"k_specialised" constantValues:values error:&err], nil, both),
+	                      @"bindings");
+	CHECK(shape(specOn) == "out:0 plus:0 either:0 modeOne:0 optional:0- modeTwo:2- smp:3- ");
+	CHECK(specOn.count == 7 && number(specOn[1], @"index") == 6 && number(specOn[2], @"index") == 9);
+	// With kOn false, kIndex 7, kMode 2 and kOpt true: `either` is left out and `modeOne` unused.
+	MTLFunctionConstantValues *offValues = [MTLFunctionConstantValues new];
+	[offValues setConstantValue:&off type:MTLDataTypeBool withName:@"kOn"];
+	[offValues setConstantValue:&off type:MTLDataTypeBool withName:@"kOff"];
+	[offValues setConstantValue:&seven type:MTLDataTypeInt withName:@"kIndex"];
+	[offValues setConstantValue:&two type:MTLDataTypeInt withName:@"kMode"];
+	[offValues setConstantValue:&on type:MTLDataTypeBool withName:@"kOpt"];
+	NSArray *specOff = ask(RgfxComputePipelineReflectionOf(
+	                           [lib newFunctionWithName:@"k_specialised" constantValues:offValues error:&err], nil, both),
+	                       @"bindings");
+	CHECK(shape(specOff) == "out:0 plus:0 modeOne:0- optional:0 modeTwo:2 smp:3 ");
+	CHECK(specOff.count == 6 && number(specOff[1], @"index") == 8);
 
 	// A descriptor's buffers come first, named by their index, used where a read attribute is theirs.
 	MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
@@ -3945,6 +3968,16 @@ void test_pipeline_reflection_from_air()
 		      ask(vertex[0], @"bufferStructType") == nil && number(vertex[3], @"bufferAlignment") == 32);
 	CHECK(ask(stageIn, @"fragmentArguments") == nil && [ask(stageIn, @"fragmentBindings") count] == 0 &&
 	      ask(stageIn, @"vertexBuiltInArguments") == nil && number(stageIn, @"postVertexDumpStride") == 36);
+	// v_specialised: with kMode 1 it reads `uv` and not `uvs` or vertex_id; with kMode 2 the reverse,
+	// so the descriptor's buffer of `uv` alone is unused (measured, both x86 Macs).
+	id modeOne = RgfxRenderPipelineReflectionOf(
+	    [lib newFunctionWithName:@"v_specialised" constantValues:values error:&err], vd, fn(@"f_plain"), both);
+	CHECK(shape(ask(modeOne, @"vertexBindings")) == "vertexBuffer.0:0 vertexBuffer.1:0 vertexBuffer.2:0- mvp:0 uvs:0- ");
+	CHECK(shape(ask(modeOne, @"vertexBuiltInArguments")) == "vid:15- ");
+	id modeTwo = RgfxRenderPipelineReflectionOf(
+	    [lib newFunctionWithName:@"v_specialised" constantValues:offValues error:&err], vd, fn(@"f_plain"), both);
+	CHECK(shape(ask(modeTwo, @"vertexBindings")) == "vertexBuffer.0:0 vertexBuffer.1:0- vertexBuffer.2:0- mvp:0 uvs:0 ");
+	CHECK(shape(ask(modeTwo, @"vertexBuiltInArguments")) == "vid:15 ");
 	id buffers = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_textures"), both);
 	CHECK(shape(ask(buffers, @"vertexBindings")) == "uniforms:0 positions:0 unusedUV:0- heights:2 ");
 	CHECK(shape(ask(buffers, @"vertexBuiltInArguments")) == "vid:15 iid:15 ");

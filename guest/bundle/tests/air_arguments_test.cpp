@@ -1049,6 +1049,7 @@ int main()
 			if (x.name == name)
 				one.entries.push_back(x);
 		one.constants = e.constants;
+		one.code = e.code;
 		check(one.entries.size() == 1, name + ": its module declares it");
 		return one;
 	};
@@ -1158,6 +1159,63 @@ int main()
 			      "k_nested: child, a pointer to an argument buffer of its own");
 		}
 
+		// The specialisation of k_specialised by its constants' values (RgfxAirArguments.hpp):
+		// Metal's answers, measured on both x86 Macs (tools/pipeline_reflection_check's
+		// c_specialised_on and c_specialised_off).
+		const RgfxAirEntries specialised = entriesOf("k_specialised");
+		check(specialised.code != nullptr, "k_specialised: its module's code is read");
+		auto value = [](uint32_t index, uint32_t type, int32_t v) {
+			RgfxFunctionConstant c = {};
+			c.index = index;
+			c.data_type = type;
+			if (type == 53) // MTLDataTypeBool
+				c.value[0] = static_cast<uint8_t>(v != 0);
+			else
+				std::memcpy(c.value, &v, sizeof v);
+			return c;
+		};
+		auto usedOf = [&](const RgfxAirEntries &e, const std::vector<RgfxFunctionConstant> &values,
+		                  RgfxAirSpecialisation &spec) {
+			std::string out;
+			check(rgfxAirSpecialise(e, e.entries.at(0), values.data(), static_cast<uint32_t>(values.size()), spec) &&
+			          spec.bodyRead,
+			      e.entries.at(0).name + ": its body is followed");
+			for (size_t i = 0; i < spec.used.size(); i++)
+				out += spec.used[i] ? "1" : "0";
+			return out;
+		};
+		const RgfxAirEntry &ks = specialised.entries.at(0);
+		const std::vector<RgfxFunctionConstant> on = {value(0, 53, 1), value(1, 53, 0), value(2, 29, 5),
+		                                              value(3, 29, 1)};
+		const std::vector<RgfxFunctionConstant> off = {value(0, 53, 0), value(1, 53, 0), value(2, 29, 7),
+		                                               value(3, 29, 2), value(4, 53, 1)};
+		RgfxAirSpecialisation specOn, specOff;
+		// out, plus, either, modeOne, optional, modeTwo, smp, gid.
+		check(usedOf(specialised, on, specOn) == "11110001", "k_specialised under kMode 1: what it uses");
+		check(usedOf(specialised, off, specOff) == "11001111", "k_specialised under kMode 2 and kOpt: what it uses");
+		auto global = [](const RgfxAirSpecialisation &spec, uint64_t g) {
+			auto it = spec.globals.find(g);
+			return it == spec.globals.end() ? INT64_MIN : it->second;
+		};
+		check(ks.arguments.at(1).indexIsGlobal && global(specOn, ks.arguments.at(1).indexGlobal) == 6 &&
+		          global(specOff, ks.arguments.at(1).indexGlobal) == 8,
+		      "k_specialised: plus at kIndex + 1");
+		check(ks.arguments.at(2).predicated && global(specOn, ks.arguments.at(2).predicateGlobal) == 1 &&
+		          global(specOff, ks.arguments.at(2).predicateGlobal) == 0,
+		      "k_specialised: either under kOn || kOff");
+		// With no values, the required constants are unknown, so is plus's index, and every argument
+		// they decide the reads of may be used; kOpt is not defined, so `optional` is not.
+		RgfxAirSpecialisation none;
+		check(usedOf(specialised, {}, none) == "11110111" && global(none, ks.arguments.at(1).indexGlobal) == INT64_MIN,
+		      "k_specialised with no values: what it may use, plus's index unknown");
+		const RgfxAirEntries vertex = entriesOf("v_specialised");
+		RgfxAirSpecialisation modeOne, modeTwo;
+		// position, uv, unread (no read anywhere: the AIR's air.arg_unused stands), mvp, uvs, vid.
+		check(usedOf(vertex, {value(3, 29, 1)}, modeOne) == "111100" &&
+		          usedOf(vertex, {value(3, 29, 2)}, modeTwo) == "101111",
+		      "v_specialised under kMode 1 and 2: what it uses");
+		// No code where the module declares no function constants.
+		check(entriesOf("k_basic").code == nullptr, "k_basic: no constants, no code");
 		// Spoilt modules: none crashes the reader.
 		const uint8_t *bc = nullptr;
 		size_t n = 0;
@@ -1176,6 +1234,32 @@ int main()
 				read++;
 		}
 		check(true, "4000 spoilt modules' nodes read without a crash (" + std::to_string(read) + " answered)");
+		// Spoilt code: no module's specialisation crashes or runs on.
+		check(rgfxMetallibBitcode(oracle.data(), oracle.size(), "k_specialised", &bc, &n), "code to spoil");
+		const std::vector<uint8_t> goodCode(bc, bc + n);
+		read = 0;
+		int followed = 0;
+		for (int round = 0; round < 4000; round++) {
+			std::vector<uint8_t> spoilt = goodCode;
+			for (int k2 = 0; k2 < 1 + round % 4; k2++) {
+				seed = seed * 1103515245u + 12345u;
+				spoilt[(seed >> 8) % spoilt.size()] ^= static_cast<uint8_t>(1u << ((seed >> 4) & 7));
+			}
+			const size_t cut = round % 7 == 0 ? (seed >> 3) % spoilt.size() : spoilt.size();
+			RgfxAirEntries e;
+			if (!rgfxReadAirEntries(spoilt.data(), cut, e))
+				continue;
+			read++;
+			for (const RgfxAirEntry &x : e.entries) {
+				RgfxAirSpecialisation spec;
+				if (rgfxAirSpecialise(e, x, round % 2 == 0 ? on.data() : off.data(),
+				                      static_cast<uint32_t>(round % 2 == 0 ? on.size() : off.size()), spec) &&
+				    spec.bodyRead)
+					followed++;
+			}
+		}
+		check(true, "4000 spoilt modules' code specialised without a crash (" + std::to_string(read) + " read, " +
+		                std::to_string(followed) + " followed)");
 	}
 
 	// One read of each module answers what the three readers answer for it, over every library
