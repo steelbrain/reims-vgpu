@@ -5967,6 +5967,77 @@ mod tests {
         );
     }
 
+    /// A buffer whose commit the platform refuses after its handlers were added (a death at the
+    /// commit, which the lane's scope takes, or a raise there) is not carried out, and the process
+    /// goes on: its handlers never run, its stand-in posts its signal and its failure once, and the
+    /// queue's next buffer is committed and completes.
+    #[test]
+    fn a_commit_refused_after_its_handlers_were_added_fails_that_buffer_alone() {
+        use reims_graphics::wire::{RGFX_CB_INTERNAL, RGFX_CB_OK};
+        for (step, death) in [
+            (Step::crash(), true),
+            (
+                Step::raise("NSInternalInconsistencyException", "refused"),
+                false,
+            ),
+        ] {
+            let (p, mut dec) = setup();
+            let device = p.device();
+            create_events(&p, &mut dec, 0);
+            let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
+            let signals = Arc::clone(&posted);
+            dec.set_signal_sink(Arc::new(move |m| {
+                signals.lock().push((m.header.r#type, m.obj_id, m.value));
+            }));
+            let completions = Arc::clone(&posted);
+            dec.set_completion_sink(Arc::new(move |m| {
+                completions
+                    .lock()
+                    .push((m.header.r#type, m.cb_obj_id, u64::from(m.status)));
+            }));
+
+            let mut ops = render_ops();
+            ops.extend(event_op(RGFX_OP_SIGNAL_EVENT, 7, 4));
+            let message = command_buffer_message(160, 90, &ops);
+            p.script().push("commit", step);
+            let mark = p.call_log().mark();
+            let outcome = refusing(|| dec.decode(&device, &message));
+            let raise = outcome.expect_err("the commit was refused");
+            assert_eq!(
+                raise.to_string().contains("refused: platform call commit"),
+                death,
+                "{raise}"
+            );
+            let sels = p.call_log().sels_since(mark);
+            let seen = sels.iter().position(|&s| s == "addCompletionSeenHandler");
+            let commit = sels.iter().position(|&s| s == "commit");
+            assert!(seen.is_some() && seen < commit, "{sels:?}");
+            dec.end_message();
+            assert!(posted.lock().is_empty());
+
+            assert!(dec.stand_in_for_failed(&device, &message).unwrap());
+            dec.end_message();
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(
+                *posted.lock(),
+                [
+                    (RGFX_EVT_EVENT_SIGNALLED, 7, 4),
+                    (RGFX_EVT_CB_COMPLETE, 160, u64::from(RGFX_CB_INTERNAL)),
+                ]
+            );
+
+            posted.lock().clear();
+            let next = command_buffer_message(161, 91, &render_ops());
+            assert_eq!(dec.decode(&device, &next).unwrap(), Ok(()));
+            dec.end_message();
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(
+                *posted.lock(),
+                [(RGFX_EVT_CB_COMPLETE, 161, u64::from(RGFX_CB_OK))]
+            );
+        }
+    }
+
     /// An event op with an encoder open faults the exec, as does one naming no event.
     #[test]
     fn an_event_op_inside_an_encoder_or_naming_no_event_faults() {
