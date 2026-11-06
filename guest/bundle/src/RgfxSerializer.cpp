@@ -77,6 +77,29 @@ void RgfxSerializer::setAsker(AskFn ask, void *context)
 	m_askContext = context;
 }
 
+void RgfxSerializer::setEventSharer(EventShareFn share, EventTakeFn take, void *context)
+{
+	m_eventShare = share;
+	m_eventTake = take;
+	m_eventContext = context;
+}
+
+uint32_t RgfxSerializer::shareEvent(RgfxObjId event)
+{
+	return m_eventShare ? m_eventShare(m_eventContext, event) : 0;
+}
+
+RgfxCreated RgfxSerializer::takeSharedEvent(uint32_t port, uint64_t *value)
+{
+	RgfxCreated out = {};
+	*value = 0;
+	if (!m_eventTake || port == 0)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	out.posted = m_eventTake(m_eventContext, port, out.obj_id, value);
+	return out;
+}
+
 size_t RgfxSerializer::SizeKeyHash::operator()(const SizeKey &key) const
 {
 	uint64_t h = 1469598103934665603ull; // FNV-1a

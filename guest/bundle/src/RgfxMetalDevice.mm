@@ -420,12 +420,82 @@ bool rgfxKextQueueOpener(void *context, const RgfxQueueCreate &q)
 // device owns them).
 @interface RgfxMetalDevice ()
 - (void)rgfxRingDoorbell:(uint32_t)ringId;
+- (uint64_t)rgfxListenQueue;
 @end
 
 namespace {
 void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 {
 	[(__bridge RgfxMetalDevice *)context rgfxRingDoorbell:ring_id];
+}
+
+// What the serializer's sharer reaches (RgfxSerializer::setEventSharer): the accelerator, which
+// the process opens each event's port on, the process's context, and the device, whose queue
+// takes the values other processes give its events.
+struct RgfxEventShareLink {
+	mach_port_t accelerator = MACH_PORT_NULL;
+	// The device's own connection, which answers whether a port it is handed is a shared event's
+	// port of the kext's (rgfxKextTakeEvent).
+	io_connect_t connection = IO_OBJECT_NULL;
+	uint64_t context = 0;
+	__weak RgfxMetalDevice *device = nil;
+};
+
+// A shared event's port (kRgfxSharedEventUserClientType): a connection of the kext's opened for
+// the event, which names it for other processes (kRgfxSharedEventMethodExport), its values from
+// them going to the device's listen queue. The connection's send right, which the event holds;
+// MACH_PORT_NULL, nothing left open, where the kext or the device refused it.
+uint32_t rgfxKextShareEvent(void *context, RgfxObjId event)
+{
+	RgfxEventShareLink *link = static_cast<RgfxEventShareLink *>(context);
+	RgfxMetalDevice *device = link->device;
+	const uint64_t listen = [device rgfxListenQueue];
+	if (listen == 0)
+		return MACH_PORT_NULL;
+	io_connect_t port = IO_OBJECT_NULL;
+	kern_return_t kr =
+	    IOServiceOpen(link->accelerator, mach_task_self(), kRgfxSharedEventUserClientType, &port);
+	if (kr != KERN_SUCCESS)
+		return MACH_PORT_NULL;
+	const uint64_t in[3] = {link->context, event, listen};
+	uint64_t status = ~0ull;
+	uint32_t outCount = 1;
+	kr = IOConnectCallScalarMethod(port, kRgfxSharedEventMethodExport, in, 3, &status, &outCount);
+	if (kr != KERN_SUCCESS || outCount != 1 || status != RGFX_STATUS_OK) {
+		os_log_error(OS_LOG_DEFAULT, "RGFX: shared event 0x%llx: no port (kr=0x%x status %llu)",
+		             (unsigned long long)event, kr, (unsigned long long)status);
+		IOServiceClose(port);
+		return MACH_PORT_NULL;
+	}
+	return port;
+}
+
+// The process's new shared event `event` made of the one the port another process's event (or
+// this one's) gave names (kRgfxSharedEventMethodImport), its values from the other holders going
+// to the device's listen queue: the event's value in `*value`. False where the port is no shared
+// event's port, or the kext or the device made nothing.
+bool rgfxKextTakeEvent(void *context, uint32_t port, RgfxObjId event, uint64_t *value)
+{
+	RgfxEventShareLink *link = static_cast<RgfxEventShareLink *>(context);
+	RgfxMetalDevice *device = link->device;
+	// Whether the port is a shared event's port of the kext's, asked of the device's connection
+	// (RgfxAcceleratorUserClient::connectClient): the kernel looks the port up and sends it
+	// nothing, so a send right of another process's own port answers nil at once, as Metal's,
+	// where the import's call made on it would kill the process (oracle_events connect).
+	if (IOConnectAddClient(link->connection, port) != KERN_SUCCESS)
+		return false;
+	const uint64_t listen = [device rgfxListenQueue];
+	if (listen == 0)
+		return false;
+	const uint64_t in[3] = {link->context, event, listen};
+	uint64_t out[2] = {~0ull, 0};
+	uint32_t outCount = 2;
+	kern_return_t kr =
+	    IOConnectCallScalarMethod(port, kRgfxSharedEventMethodImport, in, 3, out, &outCount);
+	if (kr != KERN_SUCCESS || outCount != 2 || out[0] != RGFX_STATUS_OK)
+		return false;
+	*value = out[1];
+	return true;
 }
 } // namespace
 
@@ -486,6 +556,12 @@ RGFX_LOG_UNRECOGNIZED
 	std::unique_ptr<RgfxRegionSlabSource> _slabSource;
 	std::unique_ptr<RgfxPagesSlabSource> _pagesSource;
 	std::unique_ptr<RgfxSlabs> _slabs;
+	// Shared events across processes: the sharer's link, and the queue whose completion ring
+	// takes the values other processes give the device's shared events, made at the first port
+	// asked or taken (rgfxListenQueue), under _listenLock.
+	RgfxEventShareLink _shareLink;
+	std::mutex _listenLock;
+	id<MTLCommandQueue> _listenQueue;
 }
 
 RGFX_LOG_UNRECOGNIZED
@@ -636,6 +712,17 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
 	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
 	_serializer->setAsker(&rgfxKextAsk, connContext);
+	// Shared events cross processes through the kext's ports where the kext makes them and the
+	// host took the feature that names their events (RgfxUserClientABI.hpp,
+	// kRgfxSharedEventUserClientType).
+	if ((_caps.kextFeatures() & kRgfxKextFeatureSharedEvents) != 0 &&
+	    (_caps.features() & RGFX_FEATURE_SHARED_EVENT_NAMES) != 0) {
+		_shareLink.accelerator = port;
+		_shareLink.connection = _conn;
+		_shareLink.context = ctx[0];
+		_shareLink.device = self;
+		_serializer->setEventSharer(&rgfxKextShareEvent, &rgfxKextTakeEvent, &_shareLink);
+	}
 	_stateCache = [[RgfxStateCache alloc] initWithDevice:self serializer:_serializer];
 	// Managed buffers lie over Shared copies of the Shared buffers' slabs where the host makes
 	// them over any Shared buffer (MANAGED_BUFFER_SLABS); else their CPU copies lie in heaps of
@@ -670,6 +757,17 @@ RGFX_LOG_UNRECOGNIZED
 		_completions.reset();
 	}
 	return self;
+}
+
+// The queue whose completion ring takes the values other processes give this process's shared
+// events (SHARED_EVENT_NAME's listen queue): a queue of the device's own, which no command buffer
+// uses, made at the first ask and kept. Its id; 0 where none could be made.
+- (uint64_t)rgfxListenQueue
+{
+	std::lock_guard<std::mutex> hold(_listenLock);
+	if (_listenQueue == nil)
+		_listenQueue = [self newCommandQueue];
+	return _listenQueue != nil ? [(RgfxResource *)_listenQueue rgfxObjId] : 0;
 }
 
 // --- accessors the category slices route through -----------------------------

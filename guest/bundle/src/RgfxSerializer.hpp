@@ -252,6 +252,23 @@ public:
 	                      uint32_t capacity, uint32_t *reply_size);
 	void setAsker(AskFn ask, void *context);
 
+	/// Where shared events cross processes (the accelerator kext's shared event ports,
+	/// RgfxSharedEventUserClient.hpp): `share` names the process's shared event `event` for other
+	/// processes and answers its port, a send right of the caller's, 0 where it gave none; `take`
+	/// makes the process's new shared event `event` of the one `port` names, a send right the
+	/// caller holds, answering the event's value in `*value`, false where it made none. Called
+	/// with `context`. With none set, no event crosses.
+	typedef uint32_t (*EventShareFn)(void *context, RgfxObjId event);
+	typedef bool (*EventTakeFn)(void *context, uint32_t port, RgfxObjId event, uint64_t *value);
+	void setEventSharer(EventShareFn share, EventTakeFn take, void *context);
+	/// Whether events cross processes here: a sharer is set.
+	bool sharesEvents() const { return m_eventShare != nullptr; }
+	/// Names shared event `event` for other processes: its port, 0 where none was given.
+	uint32_t shareEvent(RgfxObjId event);
+	/// The process's new shared event made of the one `port` names: its id in `obj_id` and the
+	/// event's value in `*value`, `posted` false where none was made (the id then names nothing).
+	RgfxCreated takeSharedEvent(uint32_t port, uint64_t *value);
+
 	// --- queries --------------------------------------------------------------
 
 	/// The size and alignment the host's device gives a texture of shape `desc` in a heap
@@ -574,6 +591,9 @@ private:
 	void *m_queueCloseContext = nullptr;
 	AskFn m_ask = nullptr;
 	void *m_askContext = nullptr;
+	EventShareFn m_eventShare = nullptr;
+	EventTakeFn m_eventTake = nullptr;
+	void *m_eventContext = nullptr;
 
 	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.
 	typedef std::array<uint8_t, sizeof(RgfxTextureDescriptor)> SizeKey;

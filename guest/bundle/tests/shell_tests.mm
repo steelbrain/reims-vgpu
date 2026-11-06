@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <mach/mach.h>
 #include <memory>
 #include <tuple>
 
@@ -725,6 +726,205 @@ void test_shared_event_routing()
 	CHECK([ev newSharedEventHandle] == nil);
 
 	CHECK([RgfxSharedEvent sharedEventWithInitialValue:0 device:nil serializer:nullptr] == nil);
+}
+
+
+// The kext's shared event ports, as the bundle sees them (RgfxSerializer::setEventSharer): each
+// export a port of a kernel object of its own (a semaphore's, which this task only sends to, as
+// it only sends to the kext's), and each import of a port another process gave answered `value`.
+struct FakeEventSharer {
+	std::vector<std::pair<RgfxObjId, mach_port_t>> exported;
+	std::vector<std::pair<uint32_t, RgfxObjId>> taken;
+	std::set<uint32_t> foreign; // the ports "another process" gave, which an import finds
+	uint64_t value = 0;
+	bool refuse = false;
+
+	static uint32_t share(void *context, RgfxObjId event)
+	{
+		auto *self = static_cast<FakeEventSharer *>(context);
+		semaphore_t port = MACH_PORT_NULL;
+		if (self->refuse ||
+		    semaphore_create(mach_task_self(), &port, SYNC_POLICY_FIFO, 0) != KERN_SUCCESS)
+			return MACH_PORT_NULL;
+		self->exported.push_back({event, port});
+		return port;
+	}
+	static bool take(void *context, uint32_t port, RgfxObjId event, uint64_t *value)
+	{
+		auto *self = static_cast<FakeEventSharer *>(context);
+		self->taken.push_back({port, event});
+		if (self->refuse || self->foreign.count(port) == 0)
+			return false;
+		*value = self->value;
+		return true;
+	}
+	// A port another process's event gave: a send right this task holds.
+	mach_port_t foreignPort()
+	{
+		semaphore_t port = MACH_PORT_NULL;
+		semaphore_create(mach_task_self(), &port, SYNC_POLICY_FIFO, 0);
+		foreign.insert(port);
+		return port;
+	}
+};
+
+int sendRefs(mach_port_t port)
+{
+	mach_port_urefs_t refs = 0;
+	if (mach_port_get_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, &refs) != KERN_SUCCESS)
+		return -1;
+	return static_cast<int>(refs);
+}
+
+// A shared event's port and handle, and the events made of them, as Metal's (measured: the AMD
+// 5300M and the Intel 630 under macOS 26.7.1, oracle_events): the port is asked of the kext
+// once, the same name at each ask, the event holding one send reference; a handle takes one of
+// its own and keeps the label; an event made here of this process's own port is its alias,
+// which reads what the other sets at once and names the same host event, and takes a reference;
+// one made of another process's port is a new event of the host event, at the value the host
+// answered, labelled as its handle; MACH_PORT_NULL, a dead name, a port this task receives and a
+// port no shared event gave are nil, asking nothing, the references as they were; and each event
+// lets its reference go at its dealloc. Without a sharer there is no port and no handle. The
+// event codes only through an NSXPCCoder.
+void test_shared_event_ports_and_handles()
+{
+	Fixture fx;
+	FakeEventSharer sharer;
+	fx.ser.setEventSharer(&FakeEventSharer::share, &FakeEventSharer::take, &sharer);
+	mach_port_t port = MACH_PORT_NULL;
+	@autoreleasepool {
+		RgfxSharedEvent *ev = [RgfxSharedEvent sharedEventWithInitialValue:5
+		                                                           device:nil
+		                                                       serializer:&fx.ser];
+		CHECK(ev != nil);
+		expectMessage<RgfxSharedEventCreate>(fx.ring, RGFX_CMD_SHARED_EVENT_CREATE);
+		port = [ev eventPort];
+		CHECK(port != MACH_PORT_NULL);
+		CHECK([ev eventPort] == port);
+		CHECK(sharer.exported.size() == 1 && sharer.exported[0].first == ev.rgfxObjId);
+		CHECK(sendRefs(port) == 1);
+
+		// Its alias: the same host event, each reading the other's set at once. (Each event made
+		// here goes in a pool of its own, so its going is where the test lets go of it.)
+		@autoreleasepool {
+		RgfxSharedEvent *alias = [RgfxSharedEvent sharedEventFromPort:port
+		                                                        label:nil
+		                                                       device:nil
+		                                                   serializer:&fx.ser];
+		CHECK(alias != nil && alias != ev && alias.rgfxIsAlias);
+		CHECK(alias.rgfxObjId == ev.rgfxObjId);
+		CHECK([alias eventPort] == port);
+		CHECK(alias.label == nil);
+		CHECK(sendRefs(port) == 2);
+		CHECK(sharer.taken.empty());
+		alias.signaledValue = 8;
+		CHECK(ev.signaledValue == 8);
+		auto set = expectMessage<RgfxSharedEventSetValue>(fx.ring, RGFX_CMD_SHARED_EVENT_SET_VALUE);
+		CHECK(set.obj_id == ev.rgfxObjId && set.value == 8);
+		ev.signaledValue = 9;
+		CHECK(alias.signaledValue == 9);
+		expectMessage<RgfxSharedEventSetValue>(fx.ring, RGFX_CMD_SHARED_EVENT_SET_VALUE);
+		CHECK([alias waitUntilSignaledValue:9 timeoutMS:0]);
+
+		// Metal's handle over the port: a reference of its own, and the event's label.
+		ev.label = @"shared";
+		MTLSharedEventHandle *handle = [ev newSharedEventHandle];
+		CHECK(handle != nil);
+		CHECK([handle eventPort] == port);
+		CHECK([handle.label isEqualToString:@"shared"]);
+		CHECK(sendRefs(port) == 3);
+		handle = nil;
+		CHECK(sendRefs(port) == 2);
+		alias = nil;
+		}
+		CHECK(sendRefs(port) == 1);
+
+		// Another process's port: a new event at the host's value, labelled as asked.
+		sharer.value = 42;
+		mach_port_t theirs = sharer.foreignPort();
+		@autoreleasepool {
+		RgfxSharedEvent *imported = [RgfxSharedEvent sharedEventFromPort:theirs
+		                                                           label:@"theirs"
+		                                                          device:nil
+		                                                      serializer:&fx.ser];
+		CHECK(imported != nil && !imported.rgfxIsAlias);
+		CHECK(sharer.taken.size() == 1 && sharer.taken[0].first == theirs);
+		CHECK(imported.rgfxObjId == sharer.taken[0].second && imported.rgfxObjId != ev.rgfxObjId);
+		CHECK(imported.signaledValue == 42);
+		CHECK([imported.label isEqualToString:@"theirs"]);
+		CHECK([imported eventPort] == theirs);
+		CHECK(sendRefs(theirs) == 2);
+		// Made again of the port it was made of: its alias.
+		RgfxSharedEvent *again = [RgfxSharedEvent sharedEventFromPort:theirs
+		                                                        label:nil
+		                                                       device:nil
+		                                                   serializer:&fx.ser];
+		CHECK(again.rgfxIsAlias && again.rgfxObjId == imported.rgfxObjId);
+		CHECK(sharer.taken.size() == 1);
+		again = nil;
+		imported = nil;
+		}
+		CHECK(sendRefs(theirs) == 1);
+		// Its going let go of its host event.
+		auto destroyed = expectMessage<RgfxObjectDestroy>(fx.ring, RGFX_CMD_OBJECT_DESTROY);
+		CHECK(destroyed.obj_id == sharer.taken[0].second);
+
+		// The ports that name no shared event: nil, nothing asked, the references unchanged.
+		mach_port_t received = MACH_PORT_NULL;
+		mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &received);
+		mach_port_insert_right(mach_task_self(), received, received, MACH_MSG_TYPE_MAKE_SEND);
+		for (mach_port_t bad : {(mach_port_t)MACH_PORT_NULL, (mach_port_t)MACH_PORT_DEAD, received})
+			CHECK([RgfxSharedEvent sharedEventFromPort:bad label:nil device:nil
+			                                serializer:&fx.ser] == nil);
+		CHECK(sendRefs(received) == 1);
+		CHECK(sharer.taken.size() == 1);
+		mach_port_t unknown = MACH_PORT_NULL;
+		semaphore_create(mach_task_self(), &unknown, SYNC_POLICY_FIFO, 0);
+		CHECK([RgfxSharedEvent sharedEventFromPort:unknown label:nil device:nil
+		                                serializer:&fx.ser] == nil);
+		CHECK(sharer.taken.size() == 2 && sendRefs(unknown) == 1);
+		mach_port_mod_refs(mach_task_self(), received, MACH_PORT_RIGHT_RECEIVE, -1);
+		mach_port_deallocate(mach_task_self(), received);
+		semaphore_destroy(mach_task_self(), unknown);
+		semaphore_destroy(mach_task_self(), theirs);
+
+		// It codes only through an NSXPCCoder, as Metal's.
+		NSError *error = nil;
+		NSData *data = [NSKeyedArchiver archivedDataWithRootObject:ev
+		                                     requiringSecureCoding:YES
+		                                                     error:&error];
+		CHECK(data == nil && [error.domain isEqualToString:NSCocoaErrorDomain] &&
+		      error.code == 4866);
+		NSKeyedArchiver *archiver = [[NSKeyedArchiver alloc] initRequiringSecureCoding:NO];
+		NSString *reason = nil;
+		@try {
+			[ev encodeWithCoder:archiver];
+		} @catch (NSException *e) {
+			reason = e.reason;
+		}
+		CHECK([reason isEqualToString:@"This object may only be encoded by an NSXPCCoder."]);
+		[archiver finishEncoding];
+		CHECK([RgfxSharedEvent supportsSecureCoding]);
+		CHECK([ev conformsToProtocol:@protocol(NSSecureCoding)]);
+		ev = nil;
+	}
+	// The event's going let its reference go: the port is gone.
+	CHECK(sendRefs(port) == -1);
+	semaphore_destroy(mach_task_self(), port);
+
+	// Without a sharer, or where it gives no port: none, and no handle.
+	Fixture plain;
+	RgfxSharedEvent *lone = [RgfxSharedEvent sharedEventWithInitialValue:0
+	                                                             device:nil
+	                                                         serializer:&plain.ser];
+	CHECK([lone eventPort] == MACH_PORT_NULL);
+	CHECK([lone newSharedEventHandle] == nil);
+	sharer.refuse = true;
+	RgfxSharedEvent *refused = [RgfxSharedEvent sharedEventWithInitialValue:0
+	                                                                device:nil
+	                                                            serializer:&fx.ser];
+	CHECK([refused eventPort] == MACH_PORT_NULL);
+	CHECK([refused newSharedEventHandle] == nil);
 }
 
 
@@ -14081,6 +14281,7 @@ int main(int argc, char **argv)
 		test_event_routing();
 		test_fence_routing();
 		test_shared_event_routing();
+		test_shared_event_ports_and_handles();
 		test_texture_routing();
 		test_texture_cpu_copies();
 		test_tiled_texture_over_backing();

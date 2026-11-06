@@ -10,6 +10,10 @@
 #include "RgfxReplyReader.hpp"
 #include "RgfxSerializer.hpp"
 
+#include <mach/mach.h>
+
+#include <mutex>
+
 // One pending notifyListener registration: the value at which the block fires, on the
 // listener's queue.
 @interface RgfxSharedEventPending : NSObject
@@ -24,6 +28,47 @@ RGFX_LOG_UNRECOGNIZED
 @interface RgfxSharedEvent () <RgfxMetalSharedEventInternals>
 - (void)rgfxRaiseTo:(uint64_t)value;
 @end
+
+namespace {
+// This process's events by their ports, so an event made from one of them here is its alias:
+// weak, each removed as its event goes.
+std::mutex gPortsLock;
+NSMapTable<NSNumber *, RgfxSharedEvent *> *gPorts;
+
+void rgfxNamePort(mach_port_t port, RgfxSharedEvent *event)
+{
+	std::lock_guard<std::mutex> hold(gPortsLock);
+	if (gPorts == nil)
+		gPorts = [NSMapTable strongToWeakObjectsMapTable];
+	[gPorts setObject:event forKey:@(port)];
+}
+
+RgfxSharedEvent *rgfxEventOfPort(mach_port_t port)
+{
+	std::lock_guard<std::mutex> hold(gPortsLock);
+	return [gPorts objectForKey:@(port)];
+}
+
+void rgfxForgetPort(mach_port_t port, RgfxSharedEvent *event)
+{
+	std::lock_guard<std::mutex> hold(gPortsLock);
+	RgfxSharedEvent *named = [gPorts objectForKey:@(port)];
+	if (named == nil || named == event)
+		[gPorts removeObjectForKey:@(port)];
+}
+
+// Whether `port` is a send right of this task's and no more: a port this task receives, a dead
+// name and MACH_PORT_NULL name no other process's event.
+bool rgfxSendRightOnly(mach_port_t port)
+{
+	if (!MACH_PORT_VALID(port))
+		return false;
+	mach_port_type_t type = 0;
+	if (mach_port_type(mach_task_self(), port, &type) != KERN_SUCCESS)
+		return false;
+	return (type & MACH_PORT_TYPE_SEND) != 0 && (type & MACH_PORT_TYPE_RECEIVE) == 0;
+}
+} // namespace
 
 @implementation RgfxSharedEvent {
 	// The value as this process knows it: the create's initial value, raised by the CPU's sets
@@ -40,6 +85,15 @@ RGFX_LOG_UNRECOGNIZED
 	// Signalled each time the value moves, for waitUntilSignaledValue:timeoutMS:.
 	NSCondition *_valueChanged;
 	uint64_t _traceId; // globalTraceObjectID
+	// Under _portLock: its port (eventPort), MACH_PORT_NULL until asked, the export's or the one
+	// it was made from, and whether it was asked (an export is asked once). It holds one send
+	// reference of it where `_holdsPortRef`, let go at its dealloc.
+	std::mutex _portLock;
+	mach_port_t _eventPort;
+	BOOL _portAsked;
+	BOOL _holdsPortRef;
+	// The event this one is this process's alias of: every call is its.
+	RgfxSharedEvent *_original;
 }
 
 + (instancetype)sharedEventWithOptions:(NSInteger)options
@@ -73,8 +127,74 @@ RGFX_LOG_UNRECOGNIZED
 	return ev;
 }
 
++ (instancetype)sharedEventFromPort:(mach_port_t)port
+                              label:(NSString *)label
+                             device:(id<MTLDevice>)device
+                         serializer:(RgfxSerializer *)serializer
+{
+	if (!rgfxSendRightOnly(port))
+		return nil;
+	// One of this process's own: its alias.
+	if (RgfxSharedEvent *original = rgfxEventOfPort(port)) {
+		RgfxSharedEvent *alias = [[RgfxSharedEvent alloc] initWithObjId:[original rgfxObjId]
+		                                                         device:device
+		                                                     serializer:serializer];
+		if (alias == nil)
+			return nil;
+		alias->_original = original->_original ? original->_original : original;
+		alias->_traceId = RgfxNextTraceObjectId();
+		alias->_eventPort = port;
+		alias->_portAsked = YES;
+		alias->_holdsPortRef =
+		    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, 1) == KERN_SUCCESS;
+		alias.label = label;
+		return alias;
+	}
+	if (serializer == nullptr || !serializer->sharesEvents())
+		return nil;
+	uint64_t value = 0;
+	RgfxCreated created = serializer->takeSharedEvent(port, &value);
+	if (!created.posted)
+		return nil;
+	RgfxSharedEvent *ev = [[RgfxSharedEvent alloc] initWithObjId:created.obj_id
+	                                                     device:device
+	                                                 serializer:serializer];
+	if (ev == nil)
+		return nil;
+	ev->_traceId = RgfxNextTraceObjectId();
+	ev->_signaledValue = value;
+	ev->_pending = [NSMutableArray array];
+	ev->_valueChanged = [[NSCondition alloc] init];
+	ev->_eventPort = port;
+	ev->_portAsked = YES;
+	ev->_holdsPortRef =
+	    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, 1) == KERN_SUCCESS;
+	ev.label = label;
+	rgfxNamePort(port, ev);
+	return ev;
+}
+
+- (BOOL)rgfxIsAlias
+{
+	return _original != nil;
+}
+
 - (void)dealloc
 {
+	{
+		std::lock_guard<std::mutex> hold(_portLock);
+		if (_eventPort != MACH_PORT_NULL) {
+			if (_original == nil)
+				rgfxForgetPort(_eventPort, self);
+			// Its send reference: an export's last, where no handle or other event holds the
+			// port, ends the port, and the kext lets go of the name.
+			if (_holdsPortRef)
+				mach_port_deallocate(mach_task_self(), _eventPort);
+		}
+	}
+	// An alias names its original's host event, which goes with the original.
+	if (_original != nil)
+		return;
 	if (_reader != nullptr && _eventToken != 0) {
 		_reader->removeEventListener(_eventToken);
 	}
@@ -85,7 +205,7 @@ RGFX_LOG_UNRECOGNIZED
 
 - (void)rgfxRegisterWithReplyReader:(RgfxReplyReader *)reader
 {
-	if (reader == nullptr) {
+	if (reader == nullptr || _original != nil) {
 		return;
 	}
 	_reader = reader;
@@ -142,6 +262,8 @@ RGFX_LOG_UNRECOGNIZED
 
 - (uint64_t)signaledValue
 {
+	if (_original != nil)
+		return [_original signaledValue];
 	[_valueChanged lock];
 	const uint64_t value = _signaledValue;
 	[_valueChanged unlock];
@@ -150,6 +272,10 @@ RGFX_LOG_UNRECOGNIZED
 
 - (void)setSignaledValue:(uint64_t)signaledValue
 {
+	if (_original != nil) {
+		[_original setSignaledValue:signaledValue];
+		return;
+	}
 	// To the host first, whose GPU waits it may release, then here.
 	if (_serializer != nullptr)
 		_serializer->setSharedEventValue([self rgfxObjId], signaledValue);
@@ -163,6 +289,8 @@ RGFX_LOG_UNRECOGNIZED
 // coming from the queues' readers, which the completion thread drives.
 - (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds
 {
+	if (_original != nil)
+		return [_original waitUntilSignaledValue:value timeoutMS:milliseconds];
 	NSDate *deadline =
 	    [NSDate dateWithTimeIntervalSinceNow:static_cast<double>(milliseconds) / 1000.0];
 	for (;;) {
@@ -195,6 +323,18 @@ RGFX_LOG_UNRECOGNIZED
 	if (block == nil) {
 		return;
 	}
+	if (_original != nil) {
+		// The original's value, the event passed to the block this one, as it was asked of.
+		__weak RgfxSharedEvent *weakSelf = self;
+		MTLSharedEventNotificationBlock asked = [block copy];
+		[_original notifyListener:listener
+		                  atValue:value
+		                    block:^(id<MTLSharedEvent> event, uint64_t at) {
+			                    RgfxSharedEvent *strongSelf = weakSelf;
+			                    asked(strongSelf ? strongSelf : event, at);
+		                    }];
+		return;
+	}
 	dispatch_queue_t queue = listener.dispatchQueue;
 	if (queue == nil)
 		queue = dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
@@ -216,13 +356,76 @@ RGFX_LOG_UNRECOGNIZED
 	}
 }
 
+// The event's port: a port of the kext's that names its host event, given at the first ask and
+// the same name at each (measured: Metal's, oracle_events refs), which the event holds a send
+// reference of; the one it was made from for an event made from a port or a handle.
+// MACH_PORT_NULL where the kext gave none, or the device carries no event across processes.
+- (mach_port_t)eventPort
+{
+	std::lock_guard<std::mutex> hold(_portLock);
+	if (!_portAsked && _serializer != nullptr && _serializer->sharesEvents()) {
+		_portAsked = YES;
+		_eventPort = _serializer->shareEvent([self rgfxObjId]);
+		_holdsPortRef = _eventPort != MACH_PORT_NULL;
+		if (_eventPort != MACH_PORT_NULL)
+			rgfxNamePort(_eventPort, self);
+	}
+	return _eventPort;
+}
+
+// The trace id of the label, which a handle made of the event asks for and keeps: none, the
+// device keeping no trace (measured: a handle made of an event whose labelTraceID answers 0
+// answers 0, oracle_events fake).
+- (uint64_t)labelTraceID
+{
+	return 0;
+}
+
+// The token another process makes the event from (newSharedEventWithHandle:): Metal's own
+// handle over the event's port, which takes a send reference of it of its own and keeps the
+// label (measured, oracle_events refs, label). nil where the event has no port.
 - (MTLSharedEventHandle *)newSharedEventHandle
 {
-	// A shared-event handle is the cross-process token another process rebuilds the event from
-	// (newSharedEventWithHandle:). The wire has no event one context makes and another uses, so
-	// none is minted, and the ask is logged.
-	RGFX_UNSUPPORTED("shared event handles (an event shared across processes)");
-	return nil;
+	if ([self eventPort] == MACH_PORT_NULL) {
+		RGFX_UNSUPPORTED("shared event handles where the kext or the host does not carry events "
+		                 "across processes");
+		return nil;
+	}
+	return [[MTLSharedEventHandle alloc] initWithSharedEvent:self];
 }
+
+// --- NSSecureCoding: through an NSXPCCoder alone, as Metal's (measured, oracle_events coding:
+// a keyed archiver's encode and decode each raise, and the convenience archiver answers
+// NSCocoaErrorDomain 4866) ------------------------------------------------------------------
+
++ (BOOL)supportsSecureCoding
+{
+	return YES;
+}
+
+// Its handle, which carries its port; the far side makes an event of it on its own device.
+- (void)encodeWithCoder:(NSCoder *)coder
+{
+	if (![coder isKindOfClass:[NSXPCCoder class]])
+		@throw [NSException exceptionWithName:NSInvalidArgumentException
+		                               reason:@"This object may only be encoded by an NSXPCCoder."
+		                             userInfo:nil];
+	[coder encodeObject:[self newSharedEventHandle] forKey:@"handle"];
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-designated-initializers"
+- (instancetype)initWithCoder:(NSCoder *)coder
+{
+	if (![coder isKindOfClass:[NSXPCCoder class]])
+		@throw [NSException exceptionWithName:NSInvalidArgumentException
+		                               reason:@"This object may only be decoded by an NSXPCCoder."
+		                             userInfo:nil];
+	MTLSharedEventHandle *handle = [coder decodeObjectOfClass:[MTLSharedEventHandle class]
+	                                                   forKey:@"handle"];
+	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+	return handle != nil ? (id)[device newSharedEventWithHandle:handle] : nil;
+}
+#pragma clang diagnostic pop
 
 @end

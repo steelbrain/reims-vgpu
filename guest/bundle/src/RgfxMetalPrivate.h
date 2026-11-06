@@ -344,6 +344,21 @@ NS_ASSUME_NONNULL_BEGIN
 @protocol RgfxMetalSharedEventInternals
 // `@16@0:8`: the event as an IOSurface shared event.
 - (id)IOSurfaceSharedEvent;
+// `I16@0:8`: the event's Mach port (IOSurfaceSharedEvent's), the same name at each ask; the
+// event holds one send reference of it, let go at its dealloc (measured, oracle_events refs: the
+// AMD 5300M and the Intel 630 under macOS 26.7.1).
+- (mach_port_t)eventPort;
+// `Q16@0:8`: the trace id of the event's label, which a handle made of the event keeps.
+- (uint64_t)labelTraceID;
+@end
+
+// measured: MTLSharedEventHandle on macOS 26.7.1 (oracle_events intro and fake, the AMD 5300M and
+// the Intel 630): its maker from an event, `@24@0:8@16`, which asks the event its eventPort, its
+// label and its labelTraceID, and takes a send reference of the port of its own, let go at its
+// dealloc; and its port, `I16@0:8`, which its NSXPC coding carries to another process.
+@interface MTLSharedEventHandle (RgfxPrivate)
+- (instancetype)initWithSharedEvent:(id<MTLSharedEvent>)event;
+- (mach_port_t)eventPort;
 @end
 
 @protocol RgfxMetalHeapInternals

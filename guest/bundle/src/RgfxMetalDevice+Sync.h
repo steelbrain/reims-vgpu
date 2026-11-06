@@ -30,6 +30,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable id<MTLFence>)newFence;
 - (nullable id<MTLSharedEvent>)newSharedEvent;
 - (nullable id<MTLSharedEvent>)newSharedEventWithHandle:(MTLSharedEventHandle *)sharedEventHandle;
+- (nullable id<MTLSharedEvent>)newSharedEventWithMachPort:(mach_port_t)port;
 
 @end
 

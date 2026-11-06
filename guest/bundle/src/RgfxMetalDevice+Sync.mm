@@ -36,14 +36,34 @@
 	return event;
 }
 
+// An event made from a handle, which another process's event (or this one's) made: of the port it
+// carries, labelled as the handle is, as Metal's (measured: the AMD 5300M and the Intel 630,
+// oracle_events refs and label). nil for a nil handle, as Metal's.
 - (id<MTLSharedEvent>)newSharedEventWithHandle:(MTLSharedEventHandle *)sharedEventHandle
 {
-	// A handle names another process's event, which the wire has no way to share (no event
-	// one context makes and another uses; RgfxSharedEvent's newSharedEventHandle mints none),
-	// so the import is declined, and logged.
-	(void)sharedEventHandle;
-	RGFX_UNSUPPORTED("shared event handles (an event shared across processes)");
-	return nil;
+	if (sharedEventHandle == nil)
+		return nil;
+	return [self rgfxSharedEventFromPort:[sharedEventHandle eventPort]
+	                               label:sharedEventHandle.label];
+}
+
+// The event of a port, from a handle or not (RgfxSharedEvent's sharedEventFromPort:), registered
+// for the values the host posts it where it is a new one.
+- (id<MTLSharedEvent>)rgfxSharedEventFromPort:(mach_port_t)port label:(NSString *)label
+{
+	RgfxSerializer *serializer = [self serializer];
+	if (serializer == nullptr || !serializer->sharesEvents()) {
+		RGFX_UNSUPPORTED("shared events from another process where the kext or the host does not "
+		                 "carry them");
+		return nil;
+	}
+	RgfxSharedEvent *event = [RgfxSharedEvent sharedEventFromPort:port
+	                                                        label:label
+	                                                       device:self
+	                                                   serializer:serializer];
+	if (event != nil && !event.rgfxIsAlias)
+		[event rgfxRegisterWithReplyReader:[self replyReader]];
+	return event;
 }
 
 // The creators with options (measured: _MTLDevice's on macOS 27's x86-64 slice, `@24@0:8q16`
@@ -64,13 +84,11 @@
 	return event;
 }
 
-// A shared event over a Mach port (measured: _MTLDevice's, `@20@0:8I16`): as one from another
-// process's handle, above, the device has no host event to name by it.
+// A shared event over a Mach port (measured: _MTLDevice's, `@20@0:8I16`), another event's
+// eventPort: unlabelled, as Metal's (oracle_events label).
 - (id<MTLSharedEvent>)newSharedEventWithMachPort:(mach_port_t)port
 {
-	(void)port;
-	RGFX_UNSUPPORTED("shared events from another process");
-	return nil;
+	return [self rgfxSharedEventFromPort:port label:nil];
 }
 
 @end
