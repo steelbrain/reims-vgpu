@@ -1507,6 +1507,109 @@ fn an_asking_buffer_s_doorbell_to_its_cb_submitted_behind_a_walk() {
     println!("{behind}: {after_the_walk} of {ROUNDS} answered once the walk had ended");
 }
 
+/// What a lone command buffer costs from its doorbell write to its `CB_SCHEDULED` on its queue's
+/// completion ring, as for a guest's commit on an idle queue whose thread sleeps before each: a
+/// sampler bind whose walk is made to take `WALK` us by a spin after its first op, standing for a
+/// GPU runtime's record and submit before it takes the buffer's work (the fake takes it as it is
+/// committed). One that asks for its `CB_SUBMITTED`, rung for through `mmio_write_taking` as QEMU
+/// rings, and one that does not, rung for the same way, so the queue's thread takes it. Prints the
+/// mean, median, 90th and 99th percentiles and the most, in microseconds: a measurement, run by
+/// hand (`--run-ignored only --no-capture`, in a release build).
+#[test]
+#[ignore = "a measurement, run by hand"]
+#[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+fn a_lone_buffer_s_doorbell_to_its_cb_scheduled() {
+    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+    use std::time::Instant;
+
+    const ROUNDS: usize = 2000;
+    /// The walk, in us.
+    const WALK: u64 = 150;
+    let spin_for = |us: u64| {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_micros(us) {
+            std::hint::spin_loop();
+        }
+    };
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    device
+        .control
+        .decoder()
+        .set_walk_hook(Some(Arc::new(move |index: usize| {
+            if index == 0 {
+                spin_for(WALK);
+            }
+        })));
+    let asking_sampler = |cb: u64| {
+        let mut message = sampler_command_buffer(obj(1, 1), cb, obj(1, 4));
+        let ops_at = RGFX_COMMAND_BUFFER_OPS_OFFSET as usize;
+        let op_bytes = u64::from_le_bytes(message[ops_at - 8..ops_at].try_into().unwrap()) + 8;
+        message[ops_at - 8..ops_at].copy_from_slice(&op_bytes.to_le_bytes());
+        let submitted = RgfxOpHeader {
+            tag: RGFX_OP_SUBMITTED,
+            flags: 0,
+            len: 8,
+        };
+        message.extend_from_slice(submitted.as_bytes());
+        message
+    };
+    let submit_off = ring.submit_off;
+    // (asks, does not ask)
+    let mut us: [Vec<f64>; 2] = Default::default();
+    for (round, cb) in (0..2 * ROUNDS).zip(3000_u64..) {
+        let asks = round % 2 == 0;
+        wait_idle(&device, submit_off);
+        // A pause as the guest's, so the queue's thread sleeps as it does between frames.
+        std::thread::sleep(Duration::from_micros(200));
+        ring.arm();
+        ring.publish(if asks {
+            asking_sampler(cb)
+        } else {
+            sampler_command_buffer(obj(1, 1), cb, obj(1, 4))
+        });
+        let start = Instant::now();
+        device.mmio_write_taking(RGFX_REG_DOORBELL.into(), submit_off as u32);
+        while !ring.scheduled.iter().any(|&(_, id)| id == cb) {
+            if ring.has_event() {
+                let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
+                assert_eq!(
+                    (posted.header.r#type, posted.cb_obj_id),
+                    (RGFX_EVT_CB_SUBMITTED, cb)
+                );
+            }
+            assert!(start.elapsed() < Duration::from_secs(2), "no CB_SCHEDULED");
+            std::hint::spin_loop();
+        }
+        us[usize::from(!asks)].push(start.elapsed().as_secs_f64() * 1e6);
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let complete = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((complete.cb_obj_id, complete.status), (cb, RGFX_CB_OK));
+        ring.scheduled.clear();
+    }
+    let stats = |name: &str, us: &[f64]| {
+        let mut us = us.to_vec();
+        us.sort_by(f64::total_cmp);
+        let n = us.len();
+        let mean = us.iter().sum::<f64>() / n as f64;
+        println!(
+            "{name}: mean {mean:.2} p50 {:.2} p90 {:.2} p99 {:.2} max {:.2} us (n {n})",
+            us[n / 2],
+            us[n * 9 / 10],
+            us[n * 99 / 100],
+            us[n - 1]
+        );
+    };
+    stats(
+        &format!("doorbell to CB_SCHEDULED, asking, a {WALK} us walk"),
+        &us[0],
+    );
+    stats(
+        &format!("doorbell to CB_SCHEDULED, not asking, a {WALK} us walk"),
+        &us[1],
+    );
+}
+
 /// Waits about 2 s at most for the service thread of the queue whose submission ring is at region
 /// offset `submit_off` to sleep with its ring idle (its `consumer_idle` 1), as the guest finds it
 /// when it rings for a buffer.
