@@ -11,8 +11,8 @@ The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
 `oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection`,
-`oracle_mesh`, `oracle_texdesc` and `oracle_nilbind`; the upload costs (Q17) are
-`guest/bundle/tools/upload_probe.m`'s.
+`oracle_mesh`, `oracle_events`, `oracle_texdesc` and `oracle_nilbind`; the upload costs (Q17)
+are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -559,7 +559,7 @@ Validation", but the x86 setter's. Our stack: every texture creator ends the pro
 these, sending the host nothing *(class 3)*, rather than sending a create the host refuses
 (`rgfxEndAtInvalidTextureDescriptor`, RgfxTexture.h): with the x86 Macs' words, and at a
 three-channel format, which a guest's x86 setter ends the process at first, with the M3's
-create's. Q23 has the rest of the validation.
+create's. Q24 has the rest of the validation.
 
 ## Q13: two-plane Y'CbCr textures
 
@@ -1175,7 +1175,7 @@ processes a value reaches the other process as the host posts it there, so a rea
 other's CPU set may see the value before it, where Metal's shared page is read at once *(class
 4)*.
 
-## Q23: which texture descriptors each creator makes or ends the process at
+## Q24: which texture descriptors each creator makes or ends the process at
 
 Probe: `oracle_texdesc DEVICE CREATOR`, 11-05, each of its 108 cases in a child process of its
 own, with `MTL_DEBUG_LAYER` unset, at the device's `newTextureWithDescriptor:`, a Private
@@ -1243,7 +1243,7 @@ What our stack does:
 - The shell tests check every case the device answered (`kDescriptorCases`) and each creator's
   order (`kCreatorCases`).
 
-## Q24: what a command buffer does with nil where an object belongs
+## Q25: what a command buffer does with nil where an object belongs
 
 Probe: `oracle_nilbind DEVICE`, 11-05, each of its 27 cases in a child process of its own, with
 `MTL_DEBUG_LAYER` unset. The target is a 4 x 4 RGBA8Unorm texture cleared to 64s. A draw covers

@@ -1390,7 +1390,7 @@ static const SurfaceCase kSurfaceCases[] = {
 // the Intel 630's words where it ended the process (the AMD's too, but at Depth24Unorm_Stencil8
 // and X24_Stencil8, which the AMD makes and the lane lacks, as the Intel does), null where both
 // made the texture, and "" where both ended it with no words. A Private heap's creator answers
-// alike (docs/graphics-kext/dgpu-oracle.md, Q23).
+// alike (docs/graphics-kext/dgpu-oracle.md, Q24).
 struct DescriptorCase {
 	const char *name;
 	uint64_t format, type, width, height, depth, arrayLength, levels, samples, usage, storage;
@@ -2253,7 +2253,7 @@ void test_buffer_texture_types_end_the_process()
 
 // A texture over a buffer's bytes of a block-compressed format is nil and posts nothing, by the
 // public form, as the AMD 5300M answers it over a Shared buffer (oracle_texdesc buffer bc1.*,
-// docs/graphics-kext/dgpu-oracle.md, Q23); a plain format's beside it is made.
+// docs/graphics-kext/dgpu-oracle.md, Q24); a plain format's beside it is made.
 void test_compressed_buffer_textures_answer_nil()
 {
 	Fixture fx;

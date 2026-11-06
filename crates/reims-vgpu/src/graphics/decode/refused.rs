@@ -17,7 +17,7 @@
 //!   the guest's own nil there, and the encoder's draws and dispatches run, as Metal's do with nil
 //!   bound: a read of the texture is zero on the AMD 5300M and the Intel 630, and of the buffer
 //!   zero on the AMD and undefined on the Intel; a sampler's is the default one's on the AMD and
-//!   zero on the Intel (`oracle_nilbind`, docs/graphics-kext/dgpu-oracle.md, Q24). An offset op at
+//!   zero on the Intel (`oracle_nilbind`, docs/graphics-kext/dgpu-oracle.md, Q25). An offset op at
 //!   such a buffer slot sets nothing. A pipeline state is not set at all, and a depth/stencil
 //!   state or tessellation factor buffer is bound nil: the encoder's draws and dispatches are
 //!   dropped while one of these is marked;

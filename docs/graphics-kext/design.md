@@ -1480,7 +1480,7 @@ it (a copy, a fill, an indexed or indirect draw from it, a fence update or
 wait) is dropped; a binding of it binds nil and marks its slot until the slot
 is bound again. The draws and dispatches of an encoder with a buffer, texture
 or sampler bound so run, as Metal's do with nil bound there (the x86 Macs read
-a texture as zero, `oracle_nilbind`, dgpu-oracle.md Q24), and an offset op at
+a texture as zero, `oracle_nilbind`, dgpu-oracle.md Q25), and an offset op at
 such a buffer slot sets nothing; while a pipeline state, depth/stencil state or
 tessellation factor buffer slot is marked, they are dropped. An indirect
 command buffer's CPU encode of it is dropped
