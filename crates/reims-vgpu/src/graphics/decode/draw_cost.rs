@@ -1129,6 +1129,28 @@ fn measure<P: ApiPlatform>(
     }
 }
 
+/// The mc shapes' command buffers: in `mc`, 92 passes of 3 draws, each pass's ops beginning with
+/// its pipeline and constant buffers; in `mc1`, the same ops in one pass. The other shapes keep
+/// one pass.
+#[test]
+fn the_mc_shapes_cut_their_draws_into_passes() {
+    let draws = |pass: &Vec<Step>| pass.iter().filter(|s| matches!(s, Step::Draw(..))).count();
+    let mc = steps(Shape::MC, 0);
+    assert_eq!(mc.len(), 92);
+    for pass in &mc {
+        assert_eq!(draws(pass), 3);
+        assert!(matches!(pass[0], Step::Pipeline(PIPELINE_ID)));
+    }
+    let mc1 = steps(Shape::MC1, 0);
+    assert_eq!(mc1.len(), 1);
+    assert_eq!(mc1[0].len(), mc.iter().map(Vec::len).sum::<usize>());
+    for shape in [Shape::TEN_K, Shape::MANY, Shape::WS] {
+        let one = steps(shape, 0);
+        assert_eq!(one.len(), 1);
+        assert_eq!(draws(&one[0]), shape.draws);
+    }
+}
+
 /// On the Vulkan platform: the decoder, the platform and the runtime alone.
 #[cfg(feature = "vulkan")]
 #[test]
