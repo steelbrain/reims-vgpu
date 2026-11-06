@@ -10,8 +10,9 @@ stricter than the M3's, guests may rely on it.
 The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools/oracle/README.md)):
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
-`oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection` and
-`oracle_mesh`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
+`oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection`,
+`oracle_mesh`, `oracle_texdesc` and `oracle_nilbind`; the upload costs (Q17) are
+`guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -554,10 +555,11 @@ and sent them on (boot pm29, oracle_caps); the oracles' answers, alike at the de
 
 The x86 GPUs name a format they lack (ASTC) as an invalid one, where the M3 names it. Every
 message is `-[MTLTextureDescriptorInternal validateWithDevice:]`'s "Texture Descriptor
-Validation", but the x86 setter's. Our stack: the device's and the heaps' creators end the
-process at each of these with the words of the M3's create, sending the host nothing *(class
-3)*, rather than sending a create the host refuses (`rgfxEndAtInvalidTextureDescriptor`,
-RgfxTexture.h).
+Validation", but the x86 setter's. Our stack: every texture creator ends the process at each of
+these, sending the host nothing *(class 3)*, rather than sending a create the host refuses
+(`rgfxEndAtInvalidTextureDescriptor`, RgfxTexture.h): with the x86 Macs' words, and at a
+three-channel format, which a guest's x86 setter ends the process at first, with the M3's
+create's. Q23 has the rest of the validation.
 
 ## Q13: two-plane Y'CbCr textures
 
@@ -1172,6 +1174,69 @@ events of one port in one process are one object's, so they read each other at o
 processes a value reaches the other process as the host posts it there, so a read right after the
 other's CPU set may see the value before it, where Metal's shared page is read at once *(class
 4)*.
+
+## Q23: which texture descriptors each creator makes or ends the process at
+
+Probe: `oracle_texdesc DEVICE CREATOR`, 11-05, each of its 108 cases in a child process of its
+own, with `MTL_DEBUG_LAYER` unset, at the device's `newTextureWithDescriptor:`, a Private
+Automatic heap's of 256 MiB, and a Shared buffer's `newTextureWithDescriptor:offset:bytesPerRow:`.
+Each case changes one or more things of a 64 x 64 2D BGRA8Unorm texture of one level and sample,
+usage ShaderRead, in Private storage (Shared over the buffer): its size, type, depth, array
+length, levels, samples, format, usage or storage.
+
+Every creator runs the descriptor's validation first,
+`-[MTLTextureDescriptorInternal validateWithDevice:]`. Where it fails, one assertion, "Texture
+Descriptor Validation", lists every rule the descriptor breaks, a line each, in this order on
+both x86 Macs *(class 3)*:
+1. A width, height, depth or array length of 0, or past what the type takes ("has height (2)
+   greater than the maximum allowed size of 1."): 16384 a side, 2048 for a 3D texture's sides,
+   one row for the 1D types and a TextureBuffer, one slice for every type but 3D, one element
+   for every type but the arrays, and 2048 for an array.
+2. A format the device lacks, by number ("has invalid pixelFormat (40)."): Invalid, B5G6R5,
+   A1BGR5, ABGR4, sRGB R8 and RG8, the XR10 formats, ASTC, ETC2, EAC, PVRTC, Unspecialized
+   (263), the two-plane ones (500), and, on the Intel only, Depth24Unorm_Stencil8 and
+   X24_Stencil8.
+3. What the type takes: a 1D type's height, a depth for every type but 3D and an array length
+   for every type but the arrays ("requests a depth of 2 but the texture type MTLTextureType2D
+   requires that depth is 1"), and an array of 0 elements or more than 2048, or 341 for a cube
+   array.
+4. Levels: a 1D type's other than 1, a 4:2:2 format's above 1, and 0 or more than the size
+   holds ("requests 8 mipmap levels, but the dimensions (64, 64, 1) can only support a maxiumum
+   of 7 levels"). Then a cube that is not square.
+5. Multisample textures: levels other than 1; a format that has none (BGR5A1Unorm, RGB9E5Float,
+   the compressed and 4:2:2 formats, and one the device lacks, named Invalid); a sample count
+   other than 1 on another type; a count of 1, or one the device does not make (3 and 16; it
+   makes 2, 4 and 8); and a compressed format with samples.
+6. A compressed format of a type other than 2D, 2DArray, 3D, Cube or CubeArray; a depth or
+   stencil format of 1D, 1DArray, 3D or TextureBuffer; a 4:2:2 format of a type other than 2D,
+   or of an odd width.
+7. Storage: a depth, stencil or multisample texture in Shared or Managed storage; Memoryless
+   storage; and a mode Metal has no name for (5), whose line comes twice. Then usage bit 0x80.
+
+A texture type past TextureBuffer (10) ends the process at every creator with no words. A pixel
+format value no format has (9999) ends it at the descriptor's setter, which is Metal's own in a
+guest too. After the validation, a heap's creator ends the process at a descriptor of another
+storage mode than the heap's ("The requested storage mode (MTLStorageModeShared) is not
+compatible with the heap's mode (MTLStorageModePrivate)", in
+`-[MTLIOAccelHeap newSubResourceWithLength:alignment:options:offset:]`), and otherwise answers as
+the device's. A buffer's creator then checks its own rules (Q11). The two GPUs differ at
+Depth24Unorm_Stencil8 and X24_Stencil8, which the AMD makes, and over a buffer: there the Intel
+ends the process at a depth other than 1, 0 included, before the validation, with "Buffer
+texture: cannot support depth > 1." (`validateTextureDescriptor`), where the AMD lists the
+validation's depth lines.
+
+What our stack does:
+- *(class 3)* Every texture creator runs one copy of the validation before it sends the host
+  anything (`rgfxEndAtInvalidTextureDescriptor`, RgfxTexture.h): the device's, both of a heap's,
+  a buffer's public form and its linear and tiled SPI, and the creator over an IOSurface (Q20).
+  It takes the Intel's answer at the two depth-stencil formats, as the lane lacks them, and
+  checks a sample count against the device's `supportsTextureSampleCount:`. A heap's creators
+  then end the process at a storage mode other than the heap's (`rgfxEndAtHeapStorageMismatch`).
+  Until 11-05 the bundle copied a few of these rules and sent the rest to the host, posted: a
+  texture the app held, whose command buffers' draws the host then dropped (`refused.rs`).
+- *(class 2)* Over a buffer, at a depth other than 1, the AMD's words.
+- The shell tests check every case the device answered (`kDescriptorCases`) and each creator's
+  order (`kCreatorCases`).
 
 ## Not measured
 
