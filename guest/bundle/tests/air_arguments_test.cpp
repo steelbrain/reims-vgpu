@@ -1130,6 +1130,34 @@ int main()
 		          entriesOf("o_payload").entries.at(0).stage == RgfxAirEntryStage::Object,
 		      "o_payload and m_payload: their payload");
 		check(entriesOf("k_nothing").entries.at(0).arguments.empty(), "k_nothing: no nodes");
+		// A fragment function's reads of its colour attachments: nodes of kind air.render_target and
+		// the attachment's index, of no binding.
+		const RgfxAirEntry fetch = entriesOf("f_fetch").entries.at(0);
+		check(fetch.arguments.size() == 4 && fetch.arguments.at(2).kind == "air.render_target" &&
+		          fetch.arguments.at(2).hasRenderTarget && fetch.arguments.at(2).renderTarget == 0 &&
+		          fetch.arguments.at(3).renderTarget == 1 && fetch.arguments.at(3).typeName == "half4" &&
+		          !fetch.arguments.at(3).hasLocation,
+		      "f_fetch: its colour attachments' reads");
+		// An argument buffer's struct of members is its first id and its layout, the layout's ids its
+		// own from 0; a C array of members is its node of count 1 and the member's array length.
+		const RgfxAirEntry nested = entriesOf("k_nested").entries.at(0);
+		const RgfxAirNode &nestedBuffer = nested.arguments.at(0);
+		check(nestedBuffer.layout != nullptr && nestedBuffer.layout->size() == 9, "k_nested: 9 members");
+		if (nestedBuffer.layout != nullptr && nestedBuffer.layout->size() == 9) {
+			const RgfxAirMember &leaves = nestedBuffer.layout->at(2), &buffers = nestedBuffer.layout->at(4);
+			check(leaves.hasFirstId && leaves.firstId == 3 && leaves.arrayLength == 2 && leaves.layout != nullptr &&
+			          leaves.layout->size() == 2 && leaves.layout->at(1).indirect != nullptr &&
+			          leaves.layout->at(1).indirect->index == 1,
+			      "k_nested: leaves, two structs of members from id 3");
+			check(buffers.indirect != nullptr && buffers.indirect->index == 9 && buffers.indirect->count == 1 &&
+			          buffers.arrayLength == 2,
+			      "k_nested: buffers, a C array of 2 at id 9");
+			check(nestedBuffer.layout->at(6).indirect != nullptr &&
+			          nestedBuffer.layout->at(6).indirect->kind == "air.indirect_buffer" &&
+			          nestedBuffer.layout->at(6).indirect->layout != nullptr,
+			      "k_nested: child, a pointer to an argument buffer of its own");
+		}
+
 		// Spoilt modules: none crashes the reader.
 		const uint8_t *bc = nullptr;
 		size_t n = 0;

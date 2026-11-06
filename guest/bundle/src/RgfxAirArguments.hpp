@@ -238,6 +238,8 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 //   `air.arg_type_name` "T", `air.arg_name` "n";
 //   `air.read`, `air.write`, `air.read_write`, `air.sample`: its access;
 //   `air.arg_unused`: the function never references it;
+//   `air.render_target` n, as its kind: a fragment function's input of colour attachment n's value
+//   (`[[color(n)]]`);
 //   `air.mesh` !info: a mesh function's mesh, its `air.mesh_type_info` node of its vertex and
 //   primitive data (each a node of outputs, below), its vertex and primitive counts and its
 //   topology (`air.triangle`, ...).
@@ -295,6 +297,9 @@ struct RgfxAirNode {
 	std::string typeName, name;
 	bool unused = false;
 	std::shared_ptr<const std::vector<RgfxAirMember>> layout;
+	// `air.render_target` n, its kind: a fragment function's input of colour attachment n's value.
+	bool hasRenderTarget = false;
+	uint32_t renderTarget = 0;
 	// `air.mesh`: its vertex and primitive data, its vertex and primitive counts and its topology's
 	// name.
 	bool hasMesh = false;

@@ -13,11 +13,16 @@
 //   - options of neither MTLPipelineOptionBindingInfo nor MTLPipelineOptionBufferTypeInfo answer
 //     no reflection (nil); either answers the whole of it;
 //   - each stage's bindings are its function's arguments of a buffer, an argument buffer,
-//     threadgroup memory, a texture, a sampler or an object's payload, in the order the function
-//     declares them, after the buffers its vertex or stage input descriptor reads; its built-in
-//     arguments (thread_position_in_grid, vertex_id, a mesh, ...) are listed apart; a fragment
-//     function's are not listed; an empty list is none, which `-...Bindings` answers as an empty
+//     threadgroup memory, a texture, a sampler, an object's payload, a function table or an
+//     acceleration structure, in the order the function declares them, after the buffers its
+//     vertex or stage input descriptor reads; its built-in arguments (thread_position_in_grid,
+//     vertex_id, a mesh, ...) are listed apart; a fragment function's, and the colour attachments
+//     it reads, are not listed; an empty list is none, which `-...Bindings` answers as an empty
 //     array and `-...Arguments` as nil;
+//   - an argument buffer's members are its textures, buffers, samplers, constants and pointers to
+//     argument buffers of their own, metal::arrays of textures and samplers, C arrays of any of
+//     those, and structs of members and C arrays of them, as RgfxPipelineReflection.mm's
+//     argumentMember says;
 //   - the function is specialised by its constants' values first (RgfxAirArguments.hpp, "An entry
 //     point's specialisation"): an argument its predicate leaves out (`[[function_constant(k)]]`,
 //     of a constant or of an expression of them) is left out, one at an index or of a count
@@ -44,7 +49,8 @@
 //   - an argument at a binding index or of a count function constants compute, or under a
 //     predicate, where the function has no value of a constant it needs, or the module's code is
 //     not one the reader follows;
-//   - a binding, member, built-in or type of a kind no x86 Mac's answer was measured for.
+//   - a binding, member, built-in or type of a kind no x86 Mac's answer was measured for, an
+//     imageblock among them (neither x86 Mac makes a pipeline of one).
 // Where the module's code is not one the reader follows, an argument the AIR marks used whose only
 // reads are in code the function's constants remove is answered used, where Metal answers it
 // unused (it reflects the specialised code).

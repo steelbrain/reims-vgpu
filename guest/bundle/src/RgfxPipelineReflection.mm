@@ -9,6 +9,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 
+#include <algorithm>
 #include <cstring>
 #include <set>
 #include <string>
@@ -310,10 +311,44 @@ bool textureType(const std::string &name, NSUInteger &type, NSUInteger &dataType
 			found = true;
 		}
 	}
+	// A texture of ulong is one of 64-bit atomics (measured: the Intel UHD Graphics 630 answers it of
+	// MTLDataTypeULong; the AMD Radeon Pro 5300M makes no pipeline of one).
 	uint32_t align = 0;
 	return found && valueType(n.substr(open + 1, comma - open - 1), dataType, align) &&
 	       (dataType == MTLDataTypeFloat || dataType == MTLDataTypeHalf || dataType == MTLDataTypeInt ||
-	        dataType == MTLDataTypeUInt || dataType == MTLDataTypeShort || dataType == MTLDataTypeUShort);
+	        dataType == MTLDataTypeUInt || dataType == MTLDataTypeShort || dataType == MTLDataTypeUShort ||
+	        dataType == MTLDataTypeULong);
+}
+
+// The binding type of a function table or an acceleration structure the AIR names `kind`, and an
+// argument buffer member's data type of one; false for another kind (measured: k_tables, f_tables
+// and k_ab_tables, both x86 Macs; the AMD Radeon Pro 5300M makes no render pipeline of a fragment
+// function of either).
+bool tableType(const std::string &kind, NSUInteger *binding = nullptr, NSUInteger *dataType = nullptr)
+{
+	static const struct {
+		const char *kind;
+		MTLBindingType binding;
+		MTLDataType dataType;
+	} kTables[] = {
+	    {"air.visible_function_table", MTLBindingTypeVisibleFunctionTable, MTLDataTypeVisibleFunctionTable},
+	    {"air.intersection_function_table", MTLBindingTypeIntersectionFunctionTable,
+	     MTLDataTypeIntersectionFunctionTable},
+	    {"air.primitive_acceleration_structure", MTLBindingTypePrimitiveAccelerationStructure,
+	     MTLDataTypePrimitiveAccelerationStructure},
+	    {"air.instance_acceleration_structure", MTLBindingTypeInstanceAccelerationStructure,
+	     MTLDataTypeInstanceAccelerationStructure},
+	};
+	for (const auto &t : kTables) {
+		if (kind == t.kind) {
+			if (binding != nullptr)
+				*binding = t.binding;
+			if (dataType != nullptr)
+				*dataType = t.dataType;
+			return true;
+		}
+	}
+	return false;
 }
 
 // A binding's access, as Metal numbers it: read and sample 0, read_write 1, write 2.
@@ -350,7 +385,8 @@ struct Maker {
 		return true;
 	}
 
-	// Sets `o`'s unsigned instance variable `name`, of the encoding `type` ('Q', 'I', 'S' or 'c').
+	// Sets `o`'s unsigned instance variable `name`, of the encoding `type` ('Q', 'I', 'S', 'c' or
+	// 'B').
 	bool setNumber(id o, const char *name, char type, uint64_t value)
 	{
 		Ivar v = ivarOf(o, name, type);
@@ -397,6 +433,22 @@ struct Maker {
 		                                      details:nil];
 		if (a != nil && elementInfo != nil)
 			setObject(a, "_elementTypeInfo", elementInfo);
+		return a;
+	}
+
+	// An argument buffer's array of members (a C array of them, or of structs of them): its
+	// elements' binding `details` (none for structs'), each element `ids` ids from the last. Its
+	// _isIndirectArgumentBuffer is a char on macOS 26.7.1 and a bool on macOS 27 (measured: the
+	// class's instance variables).
+	id argumentArray(NSUInteger length, NSUInteger elementType, NSUInteger stride, id elementInfo, id details,
+	                 NSUInteger ids)
+	{
+		id a = array(length, elementType, stride, elementInfo);
+		const char flag = a != nil && ivarOf(a, "_isIndirectArgumentBuffer", 'c') != nullptr ? 'c' : 'B';
+		if (a == nil || (details != nil && !setObject(a, "_details", details)) ||
+		    !setNumber(a, "_isIndirectArgumentBuffer", flag, 1))
+			return nil;
+		[a setIndirectArgumentIndexStride:ids];
 		return a;
 	}
 
@@ -471,12 +523,61 @@ struct Maker {
 		return a == nil ? nil : member(m.name, m.offset, MTLDataTypeArray, 0, rt, rog, a, nil);
 	}
 
-	// An argument buffer's member: a texture (or an array of them), a buffer, a sampler or a
-	// constant, its binding its details.
+	// How many ids an argument buffer's layout takes: past its last member's last, each member's
+	// ids from its first, where it is a struct of members, or its node's index.
+	bool idsOf(const std::vector<RgfxAirMember> &layout, unsigned depth, NSUInteger &out)
+	{
+		out = 0;
+		for (const RgfxAirMember &m : layout) {
+			NSUInteger first = 0, each = 0;
+			if (m.hasFirstId && m.layout != nullptr && depth < 8) {
+				if (!idsOf(*m.layout, depth + 1, each))
+					return false;
+				first = m.firstId;
+			} else if (m.indirect != nullptr && !m.hasFirstId) {
+				first = m.indirect->index;
+				each = m.indirect->count;
+			} else {
+				return false;
+			}
+			out = std::max<NSUInteger>(out, first + each * std::max<NSUInteger>(m.arrayLength, 1));
+		}
+		return true;
+	}
+
+	// An argument buffer's member, as Metal answers each kind (measured: k_argument_buffer,
+	// k_nested, k_nested_more and k_ab_tables, both x86 Macs):
+	// - a texture, a buffer, a sampler, a constant, a pointer to an argument buffer of its own, a
+	//   function table or an acceleration structure: its binding its details, of the binding's data
+	//   type and type object (a texture's an object of its own);
+	// - a metal::array of textures or samplers (one node of a count): an array of the element's data
+	//   type, of stride 0 and index stride 1, the binding its member's details;
+	// - a C array of any of those (a member of an array length): an argument buffer's array, the
+	//   element's binding its details, not its member's, of the element's type object (none for a
+	//   constant or a sampler), of the constant's size's stride, 0 for a resource's;
+	// - a struct of members (its first id), or a C array of them: a struct of the member's own
+	//   argument buffer members, at ids from the struct's first, its argument index; an array's
+	//   index stride is the ids an element takes.
 	id argumentMember(const RgfxAirMember &m)
 	{
-		if (m.indirect == nullptr || m.hasFirstId || m.arrayLength != 0) {
-			fail(@"an argument buffer's member of a kind not measured");
+		const NSUInteger rt = m.hasRenderTarget ? m.renderTarget : kNoIndex;
+		const NSUInteger rog = m.hasRasterOrderGroup ? m.rasterOrderGroup : kNoIndex;
+		if (m.hasFirstId) {
+			NSUInteger ids = 0;
+			if (m.layout == nullptr || m.indirect != nullptr || !idsOf(*m.layout, 0, ids)) {
+				fail(@"an argument buffer's struct of members of no layout");
+				return nil;
+			}
+			id st = structType(*m.layout, true);
+			if (st == nil)
+				return nil;
+			if (m.arrayLength == 0)
+				return member(m.name, m.offset, MTLDataTypeStruct, m.firstId, rt, rog, st, nil);
+			id a = argumentArray(m.arrayLength, MTLDataTypeStruct, 0, st, nil, ids);
+			return a == nil ? nil : member(m.name, m.offset, MTLDataTypeArray, m.firstId, rt, rog, a, nil);
+		}
+		if (m.indirect == nullptr) {
+			fail(@"an argument buffer's member of no node");
 			return nil;
 		}
 		if (m.indirect->indexIsGlobal || m.indirect->countIsGlobal) {
@@ -484,8 +585,6 @@ struct Maker {
 			return nil;
 		}
 		const RgfxAirNode &n = *m.indirect;
-		const NSUInteger rt = m.hasRenderTarget ? m.renderTarget : kNoIndex;
-		const NSUInteger rog = m.hasRasterOrderGroup ? m.rasterOrderGroup : kNoIndex;
 		id info = nil;
 		id binding = resource(n, RgfxAirEntryStage::Kernel, &info, &m);
 		if (binding == nil)
@@ -499,15 +598,7 @@ struct Maker {
 			textureType(n.typeName, shape, dataType, depth);
 			info = texture(dataType, shape, accessOf(n.access), depth);
 			type = MTLDataTypeTexture;
-			if (n.count > 1) {
-				id a = array(n.count, MTLDataTypeTexture, 0, info);
-				if (a == nil)
-					return nil;
-				[a setIndirectArgumentIndexStride:1];
-				info = a;
-				type = MTLDataTypeArray;
-			}
-		} else if (n.kind == "air.buffer") {
+		} else if (n.kind == "air.buffer" || n.kind == "air.indirect_buffer") {
 			type = MTLDataTypePointer;
 		} else if (n.kind == "air.sampler") {
 			type = MTLDataTypeSampler;
@@ -515,10 +606,30 @@ struct Maker {
 			uint32_t align = 0;
 			if (!valueType(n.typeName, type, align))
 				return nil;
-		}
-		if (n.count > 1 && n.kind != "air.texture") {
-			fail(@"an argument buffer's array of other than textures");
+		} else if (!tableType(n.kind, nullptr, &type)) {
+			fail([NSString stringWithFormat:@"an argument buffer's member of %s was not measured", n.kind.c_str()]);
 			return nil;
+		}
+		if (m.arrayLength != 0) {
+			if (n.count != 1) {
+				fail(@"an argument buffer's C array of arrays");
+				return nil;
+			}
+			const NSUInteger stride = n.kind == "air.indirect_constant" ? m.size : 0;
+			id a = argumentArray(m.arrayLength, type, stride, info, binding, 1);
+			return a == nil ? nil : member(m.name, m.offset, MTLDataTypeArray, n.index, rt, rog, a, nil);
+		}
+		if (n.count > 1) {
+			if (n.kind != "air.texture" && n.kind != "air.sampler") {
+				fail(@"an argument buffer's array of other than textures and samplers");
+				return nil;
+			}
+			id a = array(n.count, type, 0, info);
+			if (a == nil)
+				return nil;
+			[a setIndirectArgumentIndexStride:1];
+			info = a;
+			type = MTLDataTypeArray;
 		}
 		return member(m.name, m.offset, type, n.index, rt, rog, info, binding);
 	}
@@ -556,6 +667,18 @@ struct Maker {
 		if (n.kind == "air.sampler") {
 			id b = [make(c.binding) initWithName:name
 			                               type:MTLBindingTypeSampler
+			                             access:MTLBindingAccessReadOnly
+			                              index:n.index
+			                             active:used
+			                        arrayLength:n.count];
+			return argument(b, used);
+		}
+		NSUInteger table = 0;
+		if (tableType(n.kind, &table)) {
+			// Read only whatever the AIR's access (measured: an intersection function table of
+			// air.read_write answers MTLBindingAccessReadOnly), of no type object.
+			id b = [make(c.binding) initWithName:name
+			                               type:table
 			                             access:MTLBindingAccessReadOnly
 			                              index:n.index
 			                             active:used
@@ -990,7 +1113,7 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 		if (isStageInput(n.kind))
 			continue;
 		const bool resource = n.kind == "air.buffer" || n.kind == "air.indirect_buffer" || n.kind == "air.texture" ||
-		                      n.kind == "air.sampler" || n.kind == "air.payload";
+		                      n.kind == "air.sampler" || n.kind == "air.payload" || tableType(n.kind);
 		if (resource) {
 			id info = nil;
 			id b = m.resource(n, entry.stage, &info, nullptr);
@@ -1001,7 +1124,8 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 			[bindings addObject:b];
 			continue;
 		}
-		// A fragment function's built-ins and inputs Metal lists nowhere.
+		// A fragment function's built-ins and inputs Metal lists nowhere, the colour attachments it
+		// reads among them (measured: f_fetch's).
 		if (entry.stage == RgfxAirEntryStage::Fragment) {
 			if (n.hasLocation) {
 				*why = [NSString stringWithFormat:@"a fragment binding of %s was not measured", n.kind.c_str()];

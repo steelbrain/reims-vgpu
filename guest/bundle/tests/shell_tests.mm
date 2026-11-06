@@ -3848,6 +3848,57 @@ void test_pipeline_reflection_from_air()
 		      ((MTLStructMember *)members[4]).arrayType.elementType == MTLDataTypeTexture &&
 		      ((MTLStructMember *)members[5]).argumentIndex == 6);
 	}
+	// k_nested's members (Metal's answers, measured on both x86 Macs), each its data type, its
+	// argument index, an array's element type, length, stride and index stride, and whether an
+	// array's elements' binding (its -elementIndirectArgumentType) or the member's own is given.
+	id nested = [ask(RgfxComputePipelineReflectionOf(fn(@"k_nested"), nil, both), @"bindings") firstObject];
+	NSArray *nestedMembers = [ask(nested, @"bufferStructType") members];
+	CHECK(nestedMembers.count == 9);
+	if (nestedMembers.count == 9) {
+		const struct {
+			MTLDataType type;
+			NSUInteger index;
+			MTLDataType element;
+			NSUInteger stride, indexStride;
+			bool elementBinding, binding;
+		} kNested[] = {
+		    {MTLDataTypeStruct, 0, MTLDataTypeNone, 0, 0, false, false},     // leaf
+		    {MTLDataTypePointer, 2, MTLDataTypeNone, 0, 0, false, true},     // data
+		    {MTLDataTypeArray, 3, MTLDataTypeStruct, 0, 2, false, false},    // leaves
+		    {MTLDataTypeArray, 7, MTLDataTypeSampler, 0, 1, false, true},    // samplers
+		    {MTLDataTypeArray, 9, MTLDataTypePointer, 0, 1, true, false},    // buffers
+		    {MTLDataTypeArray, 11, MTLDataTypeFloat4, 16, 1, true, false},   // values
+		    {MTLDataTypePointer, 13, MTLDataTypeNone, 0, 0, false, true},    // child
+		    {MTLDataTypeArray, 14, MTLDataTypePointer, 0, 1, true, false},   // inners
+		    {MTLDataTypeArray, 16, MTLDataTypeTexture, 0, 1, true, false},   // textures
+		};
+		for (NSUInteger i = 0; i < 9; i++) {
+			MTLStructMember *m = nestedMembers[i];
+			CHECK(m.dataType == kNested[i].type && m.argumentIndex == kNested[i].index);
+			CHECK((ask(m, @"indirectArgumentType") != nil) == kNested[i].binding);
+			if (m.dataType == MTLDataTypeArray)
+				CHECK(m.arrayType.arrayLength == 2 && m.arrayType.elementType == kNested[i].element &&
+				      m.arrayType.stride == kNested[i].stride &&
+				      m.arrayType.argumentIndexStride == kNested[i].indexStride &&
+				      (ask(m.arrayType, @"elementIndirectArgumentType") != nil) == kNested[i].elementBinding);
+		}
+		MTLStructMember *leaf = nestedMembers[0], *leaves = nestedMembers[2], *child = nestedMembers[6];
+		CHECK(leaf.structType.members.count == 2 && flag(leaf.structType, @"isIndirectArgumentBuffer") &&
+		      leaf.structType.members[1].argumentIndex == 1);
+		// An element's members' ids are the struct's own, from 0.
+		CHECK(leaves.arrayType.elementStructType.members[1].argumentIndex == 1 &&
+		      number(ask(leaves.arrayType.elementStructType.members[0], @"indirectArgumentType"), @"index") == 0);
+		CHECK(number(ask(nestedMembers[3], @"indirectArgumentType"), @"arrayLength") == 2);
+		CHECK(child.pointerType.elementIsArgumentBuffer && child.pointerType.dataSize == 16 &&
+		      child.pointerType.alignment == 8 && child.pointerType.elementStructType.members.count == 2);
+	}
+	// Function tables and acceleration structures: bindings of their own types, read only (the
+	// intersection function table's AIR says read_write).
+	NSArray *tables = ask(RgfxComputePipelineReflectionOf(fn(@"k_tables"), nil, both), @"bindings");
+	CHECK(shape(tables) == "table:24 intersections:27 primitives:25 instances:26 out:0 ");
+	if (tables.count == 5)
+		CHECK(number(tables[1], @"access") == MTLBindingAccessReadOnly && number(tables[3], @"index") == 3 &&
+		      [NSStringFromClass([tables[0] class]) isEqualToString:@"MTLBindingInternal"]);
 
 	// Function constants: a false one's arguments are left out, an index they compute is the
 	// index, and an argument read only where kOff is true is not used.
@@ -3900,6 +3951,13 @@ void test_pipeline_reflection_from_air()
 	CHECK(shape(ask(buffers, @"fragmentBindings")) ==
 	      "color:2 unusedTexture:2- shadow:2 smp:3 unusedSampler:3- tint:0 unusedBuffer:0- ");
 	CHECK(number(RgfxRenderPipelineReflectionOf(fn(@"v_only"), nil, nil, both), @"postVertexDumpStride") == 12);
+	// A fragment function's reads of its colour attachments are listed nowhere; its tables and
+	// acceleration structures are its bindings (measured: the Intel GPU's; the AMD GPU makes no such
+	// pipeline).
+	id fetch = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_fetch"), both);
+	CHECK(fetch != nil && ask(fetch, @"fragmentArguments") == nil && [ask(fetch, @"fragmentBindings") count] == 0);
+	CHECK(shape(ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_tables"), both),
+	                @"fragmentBindings")) == "primitives:25 table:24 ");
 	// base_vertex and base_instance are listed, a fragment function's front_facing and sample_id are
 	// not; the outputs' size counts the point size's. A descriptor's buffers are named by their place
 	// in buffer index order: buffers 1, 4 and 30 are vertexBuffer.0, .1 and .2.

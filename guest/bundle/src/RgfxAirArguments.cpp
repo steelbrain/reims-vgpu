@@ -1984,6 +1984,13 @@ bool wholeNode(const Module &m, uint64_t id, unsigned depth,
 				return false;
 			out.hasMesh = true;
 			i += 1;
+		} else if (k == "air.render_target" && out.kind.empty()) {
+			// A fragment function's input of a colour attachment's value: the attachment's index.
+			out.kind = k;
+			if (!mdUnsigned(m, *node, i + 1, out.renderTarget))
+				return false;
+			out.hasRenderTarget = true;
+			i += 1;
 		} else if (out.kind.empty()) {
 			out.kind = k;
 		} else {
