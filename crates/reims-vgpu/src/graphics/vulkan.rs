@@ -83,7 +83,8 @@ struct ScanoutPresenter {
 
 impl Presenter for ScanoutPresenter {
     /// The next image, the scanout blitted into it, and its present once the runtime has
-    /// scheduled the blit. `cursor` is never given (`graphics`'s module doc).
+    /// scheduled the blit; nothing, the image kept for the next draw, where the draw is refused
+    /// (`sink`'s module doc, "A refused draw"). `cursor` is never given (`graphics`'s module doc).
     fn draw(
         &mut self,
         drawable: (u64, u64),
@@ -100,15 +101,20 @@ impl Presenter for ScanoutPresenter {
             let Some(texture) = self.swapchain.texture(frame) else {
                 return Drawn::Nothing;
             };
-            let Some((command_buffer, presents)) = self.draw.encode(texture, region) else {
+            let swapchain = &self.swapchain;
+            let committed = self.draw.scoped(|| {
+                let (command_buffer, presents) = self.draw.encode(texture, region)?;
+                // A draw dropped here answers its presents at the next refresh.
+                if !swapchain.encode_ready(frame, &command_buffer) {
+                    return None;
+                }
+                presents.after(&command_buffer);
+                no_catch(command_buffer.commit(OnFault::Die));
+                Some(command_buffer)
+            });
+            let Some(command_buffer) = committed else {
                 return Drawn::Nothing;
             };
-            // A draw dropped here answers its presents at the next refresh.
-            if !self.swapchain.encode_ready(frame, &command_buffer) {
-                return Drawn::Nothing;
-            }
-            presents.after(&command_buffer);
-            no_catch(command_buffer.commit(OnFault::Die));
             self.swapchain.present(frame, command_buffer);
             Drawn::Presented
         })

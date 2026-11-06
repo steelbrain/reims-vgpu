@@ -1486,11 +1486,14 @@ carried out whole. So is each of the Vulkan platform's releases of what a
 command buffer's commands used, and each change it makes, as the command
 buffer ends on the runtime's thread, and so is each such release while a death
 in the op unwinds past it: a scope a release opens in the unwind takes a death
-in it, where one outside any such scope still ends the process. What dies
-elsewhere off the op's thread still ends the process: a notice the runtime's
-scheduler thread announces at a host step, which names no command buffer, the
-runtime's own releases after the platform's handlers ran, and the window's
-draw. This
+in it, where one outside any such scope still ends the process. A draw of the
+display (the window's, and the host's reads of it) reads what the guest set
+and presented, and runs in a scope of its own: a death in it refuses that draw
+alone, its encoder ended and nothing of it committed, and the window keeps the
+frame it shows, while the read answers that the platform refused the draw.
+What dies elsewhere off the op's thread still ends the process: a notice the
+runtime's scheduler thread announces at a host step, which names no command
+buffer, and the runtime's own releases after the platform's handlers ran. This
 is the lane's own rule: the paravirt device's rule of ending the process at the
 op (AGENTS.md, the contract) is Apple's framework's behaviour, which that
 device keeps.

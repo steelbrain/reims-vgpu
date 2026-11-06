@@ -45,8 +45,9 @@ impl FrameSink for MetalScanoutSink {
     }
 
     /// The scanout blitted into `drawable`'s texture, presented in the same command buffer;
-    /// false, the drawable dropped, where the guest has no scanout. The window's cursor is the
-    /// host's, so `cursor` is never given (`graphics`'s module doc).
+    /// false, the drawable dropped, where the guest has no scanout, or where the draw is refused
+    /// (`sink`'s module doc, "A refused draw"). The window's cursor is the host's, so `cursor` is
+    /// never given (`graphics`'s module doc).
     fn draw(
         &self,
         drawable: &ProtocolObject<dyn CAMetalDrawable>,
@@ -57,16 +58,19 @@ impl FrameSink for MetalScanoutSink {
             let texture: <MetalPlatform as Platform>::Texture =
                 Obj::from_retained(msg::get("texture", || drawable.texture()));
             self.draw.drawn((texture.width(), texture.height()));
-            let Some((command_buffer, presents)) = self.draw.encode(&texture, region) else {
-                return false;
-            };
-            let drawable: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(drawable);
-            msg::get("presentDrawable:", || {
-                command_buffer.get().presentDrawable(drawable);
-            });
-            presents.after(&command_buffer);
-            no_catch(command_buffer.commit(OnFault::Die));
-            true
+            self.draw
+                .scoped(|| {
+                    let (command_buffer, presents) = self.draw.encode(&texture, region)?;
+                    let drawable: &ProtocolObject<dyn MTLDrawable> =
+                        ProtocolObject::from_ref(drawable);
+                    msg::get("presentDrawable:", || {
+                        command_buffer.get().presentDrawable(drawable);
+                    });
+                    presents.after(&command_buffer);
+                    no_catch(command_buffer.commit(OnFault::Die));
+                    Some(())
+                })
+                .is_some()
         })
     }
 

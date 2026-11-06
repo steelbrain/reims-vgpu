@@ -141,18 +141,28 @@ impl<P: ApiPlatform> DisplayRead<P> {
             width: u64::from(width),
             height: u64::from(height),
         };
-        let Some((command_buffer, hold)) = draw.encode_shown(texture, whole) else {
+        // The draw, in its refusal scope, as the window's is (`sink`'s module doc, "A refused
+        // draw"): a refused one answers that the platform refused the draw.
+        let drawn = draw
+            .scoped(|| {
+                let Some((command_buffer, hold)) = draw.encode_shown(texture, whole) else {
+                    return Some(None);
+                };
+                no_catch(command_buffer.commit(OnFault::Die));
+                no_catch(command_buffer.wait_until_completed(OnFault::Die));
+                // The draw has read the surface's block.
+                drop(hold);
+                Some(Some(command_buffer.status()))
+            })
+            .ok_or(Error::Metal)?;
+        let Some(status) = drawn else {
             // No scanout, no surface: the display shows black.
             for pixel in dst.as_chunks_mut::<4>().0 {
                 pixel.copy_from_slice(&BLACK);
             }
             return Ok(());
         };
-        no_catch(command_buffer.commit(OnFault::Die));
-        no_catch(command_buffer.wait_until_completed(OnFault::Die));
-        // The draw has read the surface's block.
-        drop(hold);
-        if command_buffer.status() == CommandBufferStatus::ERROR {
+        if status == CommandBufferStatus::ERROR {
             return Err(Error::Gpu);
         }
         self.platform.read_pixels(texture, dst, row);

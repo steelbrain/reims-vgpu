@@ -35,8 +35,19 @@
 //! nothing of that scanout. The buffer's deallocator holds the region, which keeps the region
 //! mapped while a command buffer still reads it: Metal (or the runtime) runs it once the buffer
 //! has gone, after the sink, a later import and every command buffer that used it.
+//!
+//! **A refused draw.** What a draw reads is the guest's (its scanout's pages, the surface it
+//! presented and its format, the display's colour), so a draw runs in a refusal scope of its
+//! own ([`ScanoutDraw::scoped`]): a death in it, the platform refusing an encode or a create
+//! among them, refuses that draw alone, as the lane refuses a guest op
+//! (docs/graphics-kext/design.md, "Guest input the host refuses"). Nothing of it is committed, an
+//! encoder it left open is ended on the way ([`Open`]), as Metal asserts at an encoder released
+//! without its end, and the window keeps the frame it shows. The presents the draw took are
+//! answered at the next refresh, as for a draw that shows nothing, and the next draw is tried as
+//! any is. The first refusal is logged at WARN, later ones at debug.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_graphics::Scanout;
 use reims_graphics::region::Region;
@@ -50,7 +61,7 @@ use reims_vgpu_core::platform::resource::Texture as _;
 use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlSize};
 use reims_vgpu_core::platform::values::ColorAttachmentSet;
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::PixelRect;
 
@@ -108,6 +119,68 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     color_pipelines: Mutex<ColorPipelines<P>>,
     /// The colour's buffers, made for the colour of that count of changes.
     color_buffers: Mutex<Option<(u64, ColorBuffers<P>)>>,
+    /// Whether a draw was refused yet: the first refusal is logged at WARN ([`Self::scoped`]).
+    refused: AtomicBool,
+}
+
+/// An encoder a draw holds open, ended by [`Open::end`]. One a death in the draw unwinds past
+/// (the draw's scope takes the death, [`ScanoutDraw::scoped`]) is ended as the unwind drops it, in
+/// a refusal scope of its own: Metal asserts at an encoder released without its end, and the
+/// command buffer it encodes into is never committed.
+struct Open<E> {
+    /// The encoder, until it is ended.
+    encoder: Option<E>,
+    /// Its end: `endEncoding`.
+    end: fn(&E) -> RaiseResult<()>,
+}
+
+impl<E> Open<E> {
+    /// `encoder`, open, which `end` ends.
+    fn new(encoder: E, end: fn(&E) -> RaiseResult<()>) -> Open<E> {
+        Open {
+            encoder: Some(encoder),
+            end,
+        }
+    }
+
+    /// The encoder, set from [`Open::new`] until [`Open::end`] or the drop takes it.
+    fn get(&self) -> &E {
+        match &self.encoder {
+            Some(encoder) => encoder,
+            None => unreachable!("an encoder is open until it is taken"),
+        }
+    }
+
+    /// Ends the encoder.
+    fn end(mut self) {
+        if let Some(encoder) = self.encoder.take() {
+            no_catch((self.end)(&encoder));
+        }
+    }
+}
+
+impl<E> Drop for Open<E> {
+    fn drop(&mut self) {
+        if let Some(encoder) = self.encoder.take() {
+            let end = self.end;
+            if let Err(refusal) = refusals::refusing(|| no_catch(end(&encoder))) {
+                log::debug!(
+                    target: "reims_vgpu::graphics",
+                    "the end of a refused draw's encoder was refused too: {refusal}"
+                );
+            }
+        }
+    }
+}
+
+/// A render encoder's end.
+fn end_render<P: Platform>(encoder: &P::RenderEncoder) -> RaiseResult<()> {
+    encoder.encode(OnFault::Die, RenderCmd::EndEncoding)
+}
+
+/// A blit encoder's end.
+fn end_blit<P: Platform>(encoder: &P::BlitEncoder) -> RaiseResult<()> {
+    encoder.encode(OnFault::Die, BlitCmd::EndEncoding)
 }
 
 /// The colour's pipelines made so far, each with what it draws and the drawable's pixel format.
@@ -263,7 +336,31 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             color_functions: std::sync::OnceLock::new(),
             color_pipelines: Mutex::default(),
             color_buffers: Mutex::default(),
+            refused: AtomicBool::new(false),
         })
+    }
+
+    /// Runs `draw`, a draw of the display, in a refusal scope (the module doc, "A refused draw"):
+    /// what it answers, or `None` where a death in it refused it there, logged.
+    pub(crate) fn scoped<T>(&self, draw: impl FnOnce() -> Option<T>) -> Option<T> {
+        match refusals::refusing(draw) {
+            Ok(drawn) => drawn,
+            Err(refusal) => {
+                if self.refused.swap(true, Ordering::AcqRel) {
+                    log::debug!(
+                        target: "reims_vgpu::graphics",
+                        "a draw of the display was refused: {refusal}"
+                    );
+                } else {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "a draw of the display was refused, and the window keeps the frame it \
+                         shows: {refusal} (later refusals are logged at debug)"
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// The buffer over `scanout`'s pages and where its first row starts in it, imported where
@@ -341,18 +438,23 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     /// those made so far, whatever it draws: where it shows the scanout in place of a surface it
     /// cannot draw, or nothing, they are answered at the next refresh, so the guest's compositor
     /// does not wait on a window that cannot show them.
+    ///
+    /// It runs in the draw's refusal scope ([`Self::scoped`]): `None` too where a death in it
+    /// refused it, nothing committed, and its presents are answered at the next refresh.
     pub(crate) fn encode(
         &self,
         texture: &P::Texture,
         region: PixelRect,
     ) -> Option<(P::CommandBuffer, DrawnPresents<P>)> {
-        let mut presents = self.presented.drawn();
-        let (command_buffer, hold) = self.encode_shown(texture, region)?;
-        if let Some(hold) = hold {
-            // The surface's block stays until the draw has read it.
-            presents.reading(hold);
-        }
-        Some((command_buffer, presents))
+        self.scoped(|| {
+            let mut presents = self.presented.drawn();
+            let (command_buffer, hold) = self.encode_shown(texture, region)?;
+            if let Some(hold) = hold {
+                // The surface's block stays until the draw has read it.
+                presents.reading(hold);
+            }
+            Some((command_buffer, presents))
+        })
     }
 
     /// A command buffer of the sink's queue with what the display shows drawn into `texture` at
@@ -619,7 +721,10 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 ..ColorAttachmentSet::default()
             },
         ));
-        let encoder = no_catch(command_buffer.render_encoder(OnFault::Die, &pass))?;
+        let encoder = Open::new(
+            no_catch(command_buffer.render_encoder(OnFault::Die, &pass))?,
+            end_render::<P>,
+        );
         #[expect(clippy::as_conversions, reason = "pixel counts far below 2^52")]
         let viewport = MtlViewport {
             origin_x: at.x as f64,
@@ -683,10 +788,10 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 vertex_count: 4,
             });
             for cmd in cmds {
-                no_catch(encoder.encode(OnFault::Die, cmd));
+                no_catch(encoder.get().encode(OnFault::Die, cmd));
             }
         }
-        no_catch(encoder.encode(OnFault::Die, RenderCmd::EndEncoding));
+        encoder.end();
         Some(())
     }
 
@@ -709,9 +814,12 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             self.clear(&command_buffer, texture);
         }
         if width > 0 && height > 0 {
-            let blit = no_catch(command_buffer.blit_encoder(OnFault::Die))?;
+            let blit = Open::new(
+                no_catch(command_buffer.blit_encoder(OnFault::Die))?,
+                end_blit::<P>,
+            );
             let stride = u64::from(scanout.stride);
-            no_catch(blit.encode(
+            no_catch(blit.get().encode(
                 OnFault::Die,
                 BlitCmd::CopyBufferToTexture {
                     source_buffer: &buffer,
@@ -725,7 +833,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                     destination_origin: MtlOrigin::new(x, y, 0),
                 },
             ));
-            no_catch(blit.encode(OnFault::Die, BlitCmd::EndEncoding));
+            blit.end();
         }
         Some(command_buffer)
     }
@@ -749,8 +857,11 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             self.clear(&command_buffer, texture);
         }
         if width > 0 && height > 0 {
-            let blit = no_catch(command_buffer.blit_encoder(OnFault::Die))?;
-            no_catch(blit.encode(
+            let blit = Open::new(
+                no_catch(command_buffer.blit_encoder(OnFault::Die))?,
+                end_blit::<P>,
+            );
+            no_catch(blit.get().encode(
                 OnFault::Die,
                 BlitCmd::CopyTextureRegion {
                     source_texture: surface,
@@ -764,7 +875,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                     destination_origin: MtlOrigin::new(x, y, 0),
                 },
             ));
-            no_catch(blit.encode(OnFault::Die, BlitCmd::EndEncoding));
+            blit.end();
         }
         Some(command_buffer)
     }
@@ -831,7 +942,10 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 ..ColorAttachmentSet::default()
             },
         ));
-        let encoder = no_catch(command_buffer.render_encoder(OnFault::Die, &pass))?;
+        let encoder = Open::new(
+            no_catch(command_buffer.render_encoder(OnFault::Die, &pass))?,
+            end_render::<P>,
+        );
         let (texture_width, texture_height) = (texture.width(), texture.height());
         let x = region.x.min(texture_width);
         let y = region.y.min(texture_height);
@@ -872,10 +986,10 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                     vertex_count: 4,
                 },
             ] {
-                no_catch(encoder.encode(OnFault::Die, cmd));
+                no_catch(encoder.get().encode(OnFault::Die, cmd));
             }
         }
-        no_catch(encoder.encode(OnFault::Die, RenderCmd::EndEncoding));
+        encoder.end();
         Some(command_buffer)
     }
 
@@ -1026,6 +1140,46 @@ mod tests {
         let bytes = bytes_of(buffer);
         let (words, _) = bytes.as_chunks::<4>();
         words.iter().map(|w| u32::from_le_bytes(*w)).collect()
+    }
+
+    /// A death in a draw (the platform's, at the scanout's copy, or at a draw through the
+    /// display's colour) refuses that draw alone: it answers nothing, the encoder it held open is
+    /// ended after the death, nothing is committed, and the next draw draws
+    #[test]
+    fn a_death_in_a_draw_refuses_that_draw_alone() {
+        use reims_vgpu_core::testkit::Step;
+        let (platform, draw, presented, drawable) = rig();
+        let log = platform.call_log();
+        let region = PixelRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 32,
+        };
+        let post: Table = Arc::from(vec![[0.0, 0.0, 0.0, 0.0], [0.5, 0.25, 1.0, 0.0]]);
+        for (at, color) in [(COPY_IN, None), (DRAW, Some(post))] {
+            if let Some(post) = color {
+                set_color(&presented, 1, [None, None, None, Some(post)]);
+            }
+            platform.script().push(at, Step::crash());
+            let mark = log.mark();
+            assert!(draw.encode(&drawable, region).is_none());
+            let sels = log.sels_since(mark);
+            let died = sels
+                .iter()
+                .position(|s| *s == at)
+                .expect("the call that died");
+            assert_eq!(&sels[died + 1..], ["endEncoding"], "{sels:?}");
+            assert!(!sels.contains(&"commit"));
+
+            let mark = log.mark();
+            let (command_buffer, presents) = draw.encode(&drawable, region).expect("a draw");
+            presents.after(&command_buffer);
+            command_buffer.commit(OnFault::Die).unwrap();
+            let sels = log.sels_since(mark);
+            assert_eq!(sels.iter().filter(|s| **s == at).count(), 1, "{sels:?}");
+            assert!(sels.contains(&"commit"));
+        }
     }
 
     /// With every stage off, the scanout is blitted into the drawable and nothing is drawn; with
