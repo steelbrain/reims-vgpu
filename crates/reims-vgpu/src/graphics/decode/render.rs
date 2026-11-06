@@ -128,7 +128,11 @@ fn resolve_buffers<'a, P: Platform>(
     let mut offsets = Vec::with_capacity(es.len());
     for (i, e) in (0u64..).zip(es) {
         let slot = Slot::new(stage, Bound::Buffer, first.wrapping_add(i));
-        named.push(marks.bound(slot, objs.get_buffer(e.buffer_obj_id))?);
+        named.push(refused::bind!(
+            marks,
+            slot,
+            objs.get_buffer(e.buffer_obj_id)
+        ));
         offsets.push(e.offset);
     }
     Ok((named, offsets))
@@ -179,7 +183,11 @@ fn resolve_samplers_lod<'a, P: Platform>(
     let mut maxs = Vec::with_capacity(es.len());
     for (i, e) in (0u64..).zip(es) {
         let slot = Slot::new(stage, Bound::Sampler, first.wrapping_add(i));
-        named.push(marks.bound(slot, objs.get_sampler(e.sampler_obj_id))?);
+        named.push(refused::bind!(
+            marks,
+            slot,
+            objs.get_sampler(e.sampler_obj_id)
+        ));
         mins.push(f32::from_bits(e.lod_min_clamp_bits));
         maxs.push(f32::from_bits(e.lod_max_clamp_bits));
     }
@@ -304,9 +312,11 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE => {
             let m: RgfxOpSetRenderPipelineState = body(tag, payload)?;
             let slot = Slot::state(Bound::Pipeline);
-            let pipeline = pass
-                .refused
-                .bound(slot, objs.get_render_pipeline(m.pipeline_obj_id))?;
+            let pipeline = refused::bind!(
+                pass.refused,
+                slot,
+                objs.get_render_pipeline(m.pipeline_obj_id)
+            );
             // A refused pipeline is not set: the encoder's draws are dropped until the next
             // ([`refused`]).
             if pass.refused.holds(slot) {
@@ -322,7 +332,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_RENDER_SET_VERTEX_BUFFER => {
             let m: RgfxOpSetVertexBuffer = body(tag, payload)?;
             let slot = Slot::new(Stage::Vertex, Bound::Buffer, m.index);
-            let buffer = pass.refused.bound(slot, objs.get_buffer(m.buffer_obj_id))?;
+            let buffer = refused::bind!(pass.refused, slot, objs.get_buffer(m.buffer_obj_id));
             enc.encode(
                 on,
                 RenderCmd::SetVertexBuffer {
@@ -335,7 +345,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_RENDER_SET_FRAGMENT_BUFFER => {
             let m: RgfxOpSetFragmentBuffer = body(tag, payload)?;
             let slot = Slot::new(Stage::Fragment, Bound::Buffer, m.index);
-            let buffer = pass.refused.bound(slot, objs.get_buffer(m.buffer_obj_id))?;
+            let buffer = refused::bind!(pass.refused, slot, objs.get_buffer(m.buffer_obj_id));
             enc.encode(
                 on,
                 RenderCmd::SetFragmentBuffer {
@@ -348,9 +358,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE => {
             let m: RgfxOpSetFragmentTexture = body(tag, payload)?;
             let slot = Slot::new(Stage::Fragment, Bound::Texture, m.index);
-            let texture = pass
-                .refused
-                .bound(slot, objs.get_texture(m.texture_obj_id))?;
+            let texture = refused::bind!(pass.refused, slot, objs.get_texture(m.texture_obj_id));
             enc.encode(
                 on,
                 RenderCmd::SetFragmentTexture {
@@ -1010,9 +1018,11 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_RENDER_SET_DEPTH_STENCIL_STATE => {
             let m: RgfxOpSetDepthStencilState = body(tag, payload)?;
             let slot = Slot::state(Bound::DepthStencil);
-            let state = pass
-                .refused
-                .bound(slot, objs.get_depth_stencil(m.depth_stencil_state_obj_id))?;
+            let state = refused::bind!(
+                pass.refused,
+                slot,
+                objs.get_depth_stencil(m.depth_stencil_state_obj_id)
+            );
             enc.encode(
                 on,
                 RenderCmd::SetDepthStencilState {
@@ -1066,7 +1076,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_BUFFER => {
             let m: RgfxOpSetTessellationFactorBuffer = body(tag, payload)?;
             let slot = Slot::state(Bound::TessellationFactors);
-            let buffer = pass.refused.bound(slot, objs.get_buffer(m.buffer_obj_id))?;
+            let buffer = refused::bind!(pass.refused, slot, objs.get_buffer(m.buffer_obj_id));
             enc.encode(
                 on,
                 RenderCmd::SetTessellationFactorBuffer {
@@ -1167,7 +1177,11 @@ pub(crate) fn decode_op<P: Platform>(
                     Bound::Buffer,
                     m.range_location.wrapping_add(i),
                 );
-                named.push(pass.refused.bound(slot, objs.get_buffer(e.buffer_obj_id))?);
+                named.push(refused::bind!(
+                    pass.refused,
+                    slot,
+                    objs.get_buffer(e.buffer_obj_id)
+                ));
                 offsets.push(e.offset);
                 strides.push(e.stride);
             }

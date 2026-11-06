@@ -1885,24 +1885,32 @@ impl<P: Platform> GraphicsDecoder<P> {
                     // A dispatch while a slot holds a refused object is dropped ([`refused`]).
                     let dropped =
                         marks.skips() || (marks.drops_draws() && compute::dispatches(tag));
-                    if !dropped && !contain(compute::decode_op(tag, body, self, enc, marks, ON))? {
-                        return Err(unknown_op(tag));
+                    if !dropped {
+                        match compute::decode_op(tag, body, self, enc, marks, ON) {
+                            Ok(true) => {}
+                            Ok(false) => return Err(unknown_op(tag)),
+                            Err(raise) => contain(raise)?,
+                        }
                     }
                 }
                 RGFX_OP_GROUP_BLIT => {
                     let Some(OpenEncoder::Blit(enc)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "blit"));
                     };
-                    if !contain(blit::decode_op(tag, body, self, enc, ON))? {
-                        return Err(unknown_op(tag));
+                    match blit::decode_op(tag, body, self, enc, ON) {
+                        Ok(true) => {}
+                        Ok(false) => return Err(unknown_op(tag)),
+                        Err(raise) => contain(raise)?,
                     }
                 }
                 RGFX_OP_GROUP_VIDEO => {
                     let Some(OpenEncoder::Video(session)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "video"));
                     };
-                    if !contain(video::decode_op(tag, body, self, session.session(), cb))? {
-                        return Err(unknown_op(tag));
+                    match video::decode_op(tag, body, self, session.session(), cb) {
+                        Ok(true) => {}
+                        Ok(false) => return Err(unknown_op(tag)),
+                        Err(raise) => contain(raise)?,
                     }
                 }
                 _ => return Err(unknown_op(tag)),
@@ -1933,11 +1941,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         pass: &render::PassFacts,
     ) -> RaiseResult<Result<&'o [u8], DecodeError>> {
         let mut draws = Draws::new();
+        // Whether a slot holds a refused object ([`refused`]). Only an op's binding marks or ends a
+        // mark, so it is read again after each op [`render::decode_op`] carries out, not at each
+        // draw gathered.
+        let mut refused = pass.refused.drops_draws();
         while !ops.is_empty() {
             // Draws one after another go to the encoder together; each other op, after them. While
-            // a slot holds a refused object, each op goes alone, and a draw is dropped
-            // ([`refused`]).
-            let refused = pass.refused.drops_draws();
+            // a slot holds a refused object, each op goes alone, and a draw is dropped.
             if !refused && let Some((draw, len)) = self.vertex_draw(ops) {
                 draws.push(draw, enc)?;
                 ops = &ops[len..];
@@ -1950,9 +1960,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             if op_group(tag) != RGFX_OP_GROUP_RENDER {
                 break;
             }
-            let dropped = refused && render::draws(tag);
-            if !dropped && !contain(render::decode_op(tag, body, self, enc, pass, ON))? {
-                return Err(unknown_op(tag));
+            if !(refused && render::draws(tag)) {
+                match render::decode_op(tag, body, self, enc, pass, ON) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(unknown_op(tag)),
+                    Err(raise) => contain(raise)?,
+                }
+                refused = pass.refused.drops_draws();
             }
             ops = &ops[len..];
         }
@@ -2291,12 +2305,17 @@ fn end_abandoned<P: Platform>(open: OpenEncoder<P>) {
     });
 }
 
-/// `done`, the outcome of an encoder op: an op that named an object whose create the host refused
-/// is dropped, and the walk goes on ([`refused`]); any other outcome as it is.
-fn contain(done: RaiseResult<bool>) -> RaiseResult<bool> {
-    match done {
-        Err(raise) if refused::is_refused(&raise) => Ok(true),
-        done => done,
+/// The raise of an encoder op: one that named an object whose create the host refused drops the
+/// op, and the walk goes on ([`refused`]); any other is the op's. Each walk matches an op's answer
+/// where the op wrote it, and passes only a raise here, out of line: an answer passed on whole to
+/// a function (a [`Raise`]'s size) was copied at every op.
+#[cold]
+#[inline(never)]
+fn contain(raise: Raise) -> RaiseResult<()> {
+    if refused::is_refused(&raise) {
+        Ok(())
+    } else {
+        Err(raise)
     }
 }
 

@@ -89,6 +89,8 @@ impl Refused {
     }
 
     /// The raise of a resolver that met it, named by `obj_id` ([`reference()`]).
+    #[cold]
+    #[inline(never)]
     pub(crate) fn reference(&self, obj_id: u64) -> Raise {
         self.used(obj_id);
         reference(obj_id)
@@ -97,7 +99,10 @@ impl Refused {
 
 /// The raise of a resolver that met `obj_id`, which stands for a refused object: the op that
 /// named it is dropped where the command buffer's walk takes it ([`is_refused`]), and elsewhere
-/// it is refused as any other raise is.
+/// it is refused as any other raise is. Out of line, as is [`Refused::reference`], so no
+/// resolver's own code holds its detail's formatting.
+#[cold]
+#[inline(never)]
 pub(crate) fn reference(obj_id: u64) -> Raise {
     Raise::foreign(SITE).with_detail(format_args!(
         "an op named object {obj_id:#x}, whose create the host refused"
@@ -111,10 +116,22 @@ pub(crate) fn is_refused(raise: &Raise) -> bool {
 
 /// `got`, a nil-allowed resolve, with an object whose create the host refused resolved to nil:
 /// an entry of a use list.
+#[inline]
 pub(crate) fn or_nil<T>(got: RaiseResult<Option<T>>) -> RaiseResult<Option<T>> {
     match got {
-        Err(raise) if is_refused(&raise) => Ok(None),
-        got => got,
+        Ok(object) => Ok(object),
+        Err(raise) => nil_if_refused(raise).map(|()| None),
+    }
+}
+
+/// [`or_nil`]'s raise: a refused object's is nil, any other is the entry's.
+#[cold]
+#[inline(never)]
+fn nil_if_refused(raise: Raise) -> RaiseResult<()> {
+    if is_refused(&raise) {
+        Ok(())
+    } else {
+        Err(raise)
     }
 }
 
@@ -216,45 +233,108 @@ impl Slot {
 
 /// The open encoder's binding slots that hold an object whose create the host refused, bound as
 /// nil: its draws and dispatches are dropped while any is held, as what they would read is
-/// not there. Empty in every run that refuses nothing, where each binding costs one look.
+/// not there. Empty in every run that refuses nothing, where each op and binding costs one load
+/// ([`Self::any`]), and the set itself is reached only out of line.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Marks {
     slots: RefCell<HashSet<Slot>>,
+    /// Whether `slots` holds any.
+    held: Cell<bool>,
     /// The encoder's later ops are all dropped: a predication's start named a refused buffer, so
     /// its ends and what lies between them have nothing to pair with.
     skipped: Cell<bool>,
 }
 
+/// [`Marks::bound`] in the op's own function: `$got`, the resolve of an object to bind at `$slot`
+/// of `$marks`, as the object, or nil where its create was refused, which marks the slot; any other
+/// raise returns from the op. The resolve is matched where the resolver wrote it, and only a raise
+/// is passed on, out of line ([`Marks::bind_raise`]): through [`Marks::bound`], which a function
+/// of `render::decode_op`'s size calls out of line, each binding passed the whole result (a
+/// [`Raise`]'s size) through memory.
+macro_rules! bind {
+    ($marks:expr, $slot:expr, $got:expr) => {
+        match $got {
+            Ok(object) => {
+                $marks.ends($slot);
+                object
+            }
+            Err(raise) => {
+                $marks.bind_raise($slot, raise)?;
+                None
+            }
+        }
+    };
+}
+pub(crate) use bind;
+
 impl Marks {
     /// Whether a slot holds an object whose create was refused.
+    #[inline]
     pub(crate) fn any(&self) -> bool {
-        !self.slots.borrow().is_empty()
+        self.held.get()
     }
 
     /// Whether `slot` holds an object whose create was refused.
+    #[inline]
     pub(crate) fn holds(&self, slot: Slot) -> bool {
-        self.any() && self.slots.borrow().contains(&slot)
+        self.any() && self.marked(slot)
     }
 
     /// `got`, the resolve of an object to bind at `slot`: an object whose create was refused is
-    /// bound as nil, and marks the slot; any other binding ends the slot's mark.
+    /// bound as nil, and marks the slot; any other binding ends the slot's mark. An op's own
+    /// binding uses [`bind!`], which reads the resolve where the resolver wrote it.
+    #[inline]
     pub(crate) fn bound<T>(
         &self,
         slot: Slot,
         got: RaiseResult<Option<T>>,
     ) -> RaiseResult<Option<T>> {
-        match got {
-            Err(raise) if is_refused(&raise) => {
-                self.slots.borrow_mut().insert(slot);
-                Ok(None)
-            }
-            got => {
-                if got.is_ok() && self.any() {
-                    self.slots.borrow_mut().remove(&slot);
-                }
-                got
-            }
+        Ok(bind!(self, slot, got))
+    }
+
+    /// [`bind!`]'s object: the binding at `slot` ends its mark, if it has one.
+    #[inline(always)]
+    pub(crate) fn ends(&self, slot: Slot) {
+        if self.any() {
+            self.unmark(slot);
         }
+    }
+
+    /// [`bind!`]'s raise: a refused object's marks `slot` and binds nil, any other is the
+    /// binding's.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn bind_raise(&self, slot: Slot, raise: Raise) -> RaiseResult<()> {
+        if is_refused(&raise) {
+            self.mark(slot);
+            Ok(())
+        } else {
+            Err(raise)
+        }
+    }
+
+    /// Whether the set holds `slot`.
+    #[cold]
+    #[inline(never)]
+    fn marked(&self, slot: Slot) -> bool {
+        self.slots.borrow().contains(&slot)
+    }
+
+    /// Marks `slot`.
+    #[cold]
+    #[inline(never)]
+    fn mark(&self, slot: Slot) {
+        self.slots.borrow_mut().insert(slot);
+        self.held.set(true);
+    }
+
+    /// Ends `slot`'s mark, if it has one.
+    #[cold]
+    #[inline(never)]
+    fn unmark(&self, slot: Slot) {
+        let mut slots = self.slots.borrow_mut();
+        slots.remove(&slot);
+        self.held.set(!slots.is_empty());
     }
 
     /// The encoder's later ops are all dropped.
@@ -268,6 +348,7 @@ impl Marks {
     }
 
     /// Whether an op that draws or dispatches is dropped.
+    #[inline]
     pub(crate) fn drops_draws(&self) -> bool {
         self.skips() || self.any()
     }

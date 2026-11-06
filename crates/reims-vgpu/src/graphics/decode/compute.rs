@@ -183,7 +183,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE => {
             let m: RgfxComputeOpSetComputePipelineState = body(tag, payload)?;
             let slot = Slot::state(Bound::Pipeline);
-            let state = marks.bound(slot, objs.get_compute_pipeline(m.pipeline_obj_id))?;
+            let state = refused::bind!(marks, slot, objs.get_compute_pipeline(m.pipeline_obj_id));
             // A refused pipeline is not set: the encoder's dispatches are dropped until the next
             // ([`refused`]).
             if marks.holds(slot) {
@@ -271,7 +271,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_COMPUTE_SET_TEXTURE => {
             let m: RgfxComputeOpSetTexture = body(tag, payload)?;
             let slot = Slot::new(Stage::Kernel, Bound::Texture, m.index);
-            let texture = marks.bound(slot, objs.get_texture(m.texture_obj_id))?;
+            let texture = refused::bind!(marks, slot, objs.get_texture(m.texture_obj_id));
             enc.encode(
                 on,
                 ComputeCmd::SetTexture {
