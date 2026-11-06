@@ -2046,7 +2046,8 @@ bit 2; every host sets it). A command buffer committed by `commitAndWaitUntilSub
 buffer's seqno; 24 bytes) once, ahead of its `CB_SCHEDULED` and `CB_COMPLETE`: as soon as the
 host takes it, before it walks the buffer's ops, where the buffer waits for no event (its
 `WAIT_EVENT` ops), the host fills no device cache it uses first (decided at the take from its
-`SURFACE_USE` ops, which lead the stream; a fill not yet done counts) and no buffer before it on
+`SURFACE_USE` ops, which lead the stream; a fill not yet done counts), it follows no copy of one
+asked before it and not yet made ("What a walk sees", "Device caches") and no buffer before it on
 its queue waits for one and is not yet scheduled; else at its scheduling. The call returns
 there. A guest whose bundle sends no such op never sees the event,
 and a bundle sends it only where the bit is set, which it reads in the device info's
@@ -2278,8 +2279,9 @@ committed in. The bundle names the order instead, as it posts each buffer:
   platform holds a wait for a shared event's value on the host until it is
   reached). So does every buffer committed behind it on its queue while the
   platform holds it, and each buffer's records still go in its queue's order. A
-  buffer that waits for an event, or for the host's fill of a device cache, or
-  is behind one, keeps its records at its scheduling.
+  buffer that waits for an event, or for the host's fill of a device cache or a
+  copy of one it follows, or is behind one, keeps its records at its
+  scheduling.
 - Work the host starts off a buffer's own GPU timeline waits for the same
   buffers on the CPU first: a video session's decode runs on a queue of its own
   as the host walks the buffer, so its output lands only after the reads and
@@ -2445,23 +2447,45 @@ commit. Each outcome the new design allows is one of those two:
   (its range messages) and the sequencer's
   `a_range_message_is_carried_out_once_its_context_s_tickets_are_given_back`.
 - **Device caches.** A command buffer counts among the users of each cached
-  block it uses from its begin to its commit. A fill waits for every user, and
-  a copy out of a cache (a download, a release, the block named again) for every
-  user that may write it, so each copy comes before a user's begin or after its
-  commit, as under the lock. A download and a release do not wait on ring 0's
-  thread: each is made in the finish of the last buffer that may write the
-  cache begun before it was asked, after that buffer's commit, in the order
-  they were asked, and answered once its copy is done, as before. A buffer
-  begun after one was asked waits at its begin until it is made, as under the
-  lock it would have been begun after it,
-  and nothing of ring 0's names the block meanwhile that a copy changes: a
-  download leaves the block's buffers as they are, and the kext names a
-  released block again only once its release is answered. The block named
-  again still waits there, as the buffers ring 0 makes over the block after it
-  lie over what it leaves. A buffer counts its blocks in block order, a copy
-  waits only for buffers begun before it, and one past its begin waits for
-  nothing a fill or a copy holds, so the waits end. Tested by
-  `a_fill_waits_for_the_buffers_using_the_cache`,
+  block it uses from its begin to its commit, each use under a number of its own
+  in the order they are counted. A fill follows every user counted before it was
+  asked, and a copy out of a cache (a download, a release, the block named
+  again) every such user that may write it, so each copy comes before a user's
+  begin or after its commit, as under the lock. No thread that asks a copy waits
+  for those users: a copy none holds up, and no copy asked before it, is made at
+  once; any other is made in the finish of the last of them, after its commit,
+  in the order the copies were asked, a download and a release answered once
+  their copy is done, as before. So a fill at a begin waits for no other queue's
+  walk, nor does a present's fill on the control thread: on a GPU of its own
+  memory, a WindowServer buffer whose surface a page's long buffer used waited
+  on its queue's thread for that walk (13.5 s behind a WebGPU page's buffer on
+  the RTX 5080 Laptop GPU host; measured). A buffer counted after a copy was
+  asked is ordered after it on the GPU instead: it waits for the cache's own
+  event, which the copy's command buffer signals to the copy's number, where it
+  reads what the copy writes (a fill) or may write what the copy reads (any
+  copy), and it holds its queue, as a buffer that waits for a fill does; its
+  marks of the cache and its end value are kept apart until the copy is made, so
+  the copy follows none of them. A buffer finished before a copy it follows is
+  made stays counted among the users of every cache it used until it is: the
+  copies run on one queue in the order they are made, and one made behind the
+  buffer would wait there for its end, and so for the copy it follows, behind it
+  on that queue. A buffer that only reads follows no copy out, which leaves the
+  cache as it is. A copy that copies nothing signals from a command buffer of
+  its own, after the copy before it; where the platform makes no event, the
+  begin waits for the copy on the CPU, as it did for the users. Nothing of ring
+  0's names the block meanwhile that a copy changes: a download leaves the
+  block's buffers as they are, and the kext names a released block again only
+  once its release is answered. The block named again still waits there, for the
+  writers and the copies asked, as the buffers ring 0 makes over the block after
+  it lie over what it leaves. A buffer's uses are counted together, after those
+  of the buffers begun before it; a copy follows only buffers begun before it
+  was asked, and a buffer waits only for copies asked before it was begun, so
+  the waits end, on the CPU and on the GPU. Tested by
+  `a_fill_follows_the_buffers_using_the_cache`,
+  `a_begin_waits_on_the_cpu_for_no_other_queue_s_long_walk`,
+  `a_present_s_fill_behind_a_walk_is_made_in_its_finish`,
+  `a_begin_behind_a_download_waits_on_the_gpu_only_where_it_writes`,
+  `a_copy_behind_a_buffer_waiting_for_a_copy_is_made_after_that_copy`,
   `two_queues_take_one_fill_and_a_download_waits_for_both` and
   `a_copy_out_of_a_cache_is_made_as_its_writers_finish` (`surface_cache`).
 - **The device's reset.** A reset ends every queue at once and is passed to
@@ -2493,10 +2517,10 @@ commit. Each outcome the new design allows is one of those two:
   run in the order they are committed, and metal2vulkan resolves barriers,
   layouts and fences at submit, in commit order. Four things a buffer does
   before its commit are seen beyond it, and each keeps the lock's order:
-  - its hold of its queue: a buffer that waits for an event, or for the
-    host's fill of a device cache, holds its queue from its begin, not its
-    commit, so a buffer after it that asks for its `CB_SUBMITTED` is answered
-    at its scheduling, as behind one already committed;
+  - its hold of its queue: a buffer that waits for an event, or for the host's
+    fill of a device cache or a copy of one it follows, holds its queue from its
+    begin, not its commit, so a buffer after it that asks for its `CB_SUBMITTED`
+    is answered at its scheduling, as behind one already committed;
   - a video encoder's work, which its session starts as it is walked: a buffer
     that holds one is walked only in its turn, and one whose turn is next at
     its begin is walked and committed on the service thread itself, where it

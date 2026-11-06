@@ -524,9 +524,7 @@ pub(crate) struct Begun<P: Platform> {
     cb: P::CommandBuffer,
     /// Its place in its queue's count.
     in_flight: InFlight,
-    /// The blocks of the device caches it uses.
-    used: Vec<u64>,
-    /// Its count among those caches' users, until its commit.
+    /// Its count among the users of the device caches it uses, until its commit.
     uses: Option<Uses<P>>,
     /// It holds `SURFACE_ORDER`: it signals its queue's surface timeline as it ends.
     order: bool,
@@ -1369,7 +1367,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         for u in &take.uses {
             self.settle_surface(u.block_offset);
         }
-        let (used, fill_waits, uses) = (self.surface_caches).before(device, &cb, &take.uses)?;
+        let (fill_waits, uses) = (self.surface_caches).before(device, &cb, &take.uses)?;
         // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
         // off it (`surface_order`).
         let order_waits = match &take.order {
@@ -1394,7 +1392,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             seqno: m.header.seqno,
             cb,
             in_flight,
-            used,
             uses,
             order: take.order.is_some(),
             marks: Arc::clone(&counts.order),
@@ -1427,7 +1424,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             seqno,
             cb,
             in_flight,
-            used,
             uses,
             order,
             marks,
@@ -1541,7 +1537,6 @@ impl<P: Platform> GraphicsDecoder<P> {
                 queue.as_ref(),
                 &cb,
                 uses,
-                &used,
                 commit,
             )?,
             None => commit()?,
