@@ -683,9 +683,10 @@ RGFX_RESOURCE_SPI
 // Q11), and so does the bundle, sending nothing: the host's platform would end the host's process
 // at the type. So it does at a 3D or multisample type, with the M3's words (rgfxLinearTypeDies);
 // the x86 GPUs end the process there too, the Intel GPU with other words at the 3D one, and both
-// at a multisample one in Shared storage before they reach its type. A texture buffer, not
-// measured, answers nil, logged once, and sends nothing. One off the device's linear texture
-// alignment is nil (rgfxAtLinearAlignment:).
+// at a multisample one in Shared storage before they reach its type. A texture buffer, which the
+// three make (oracle_texdesc buffer texbuf), answers nil, logged once, and sends nothing, as the
+// host carries none by this form. So does a block-compressed format (below). One off the
+// device's linear texture alignment is nil (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
                                bytesPerRow:(NSUInteger)bytesPerRow
@@ -711,6 +712,23 @@ RGFX_RESOURCE_SPI
 			      (unsigned long long)[self rgfxObjId], (unsigned long)descriptor.textureType);
 		}
 		return nil;
+	}
+	// A block-compressed format (BC1 to BC7) answers nil, sending nothing, as the AMD 5300M answers
+	// it over a Shared buffer, 64 x 64 and 62 x 64, where the Intel 630 makes it (oracle_texdesc
+	// buffer bc1.*): the host's platform makes no texture of one over a buffer's bytes, and one it
+	// refused would drop every draw that named it. Both make one of a single block, 2 x 2, which
+	// the bundle answers nil for too.
+	if (descriptor != nil) {
+		const uint64_t f = descriptor.pixelFormat;
+		if ((f >= 130 && f <= 135) || (f >= 140 && f <= 143) || (f >= 150 && f <= 153)) {
+			static std::atomic<bool> logged{false};
+			if (!logged.exchange(true)) {
+				NSLog(@"RGFX: a texture over buffer 0x%llx of block-compressed format %llu, which "
+				      @"the host does not carry: answered nil",
+				      (unsigned long long)[self rgfxObjId], (unsigned long long)f);
+			}
+			return nil;
+		}
 	}
 	if (![self rgfxAtLinearAlignment:descriptor offset:offset bytesPerRow:bytesPerRow])
 		return nil;

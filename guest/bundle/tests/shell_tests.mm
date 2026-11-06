@@ -2251,6 +2251,51 @@ void test_buffer_texture_types_end_the_process()
 	}
 }
 
+// A texture over a buffer's bytes of a block-compressed format is nil and posts nothing, by the
+// public form, as the AMD 5300M answers it over a Shared buffer (oracle_texdesc buffer bc1.*,
+// docs/graphics-kext/dgpu-oracle.md, Q23); a plain format's beside it is made.
+void test_compressed_buffer_textures_answer_nil()
+{
+	Fixture fx;
+	@autoreleasepool {
+		std::vector<uint8_t> memory(0x10000, 0);
+		RgfxBuffer *buf =
+		    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                    regionOffset:0x10000
+		                                          length:memory.size()
+		                                         options:MTLResourceStorageModeShared
+		                                     deallocator:nil
+		                                          device:nil
+		                                      serializer:&fx.ser];
+		CHECK(buf != nil);
+		drainRing(fx.ring);
+		auto over = [&](MTLPixelFormat format, NSUInteger width, NSUInteger height) {
+			MTLTextureDescriptor *td =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+			                                                       width:width
+			                                                      height:height
+			                                                   mipmapped:NO];
+			td.storageMode = MTLStorageModeShared;
+			return [buf newTextureWithDescriptor:td offset:0 bytesPerRow:256];
+		};
+		for (const MTLPixelFormat f : {MTLPixelFormatBC1_RGBA, MTLPixelFormatBC3_RGBA_sRGB,
+		                               MTLPixelFormatBC4_RUnorm, MTLPixelFormatBC5_RGSnorm,
+		                               MTLPixelFormatBC6H_RGBFloat, MTLPixelFormatBC7_RGBAUnorm}) {
+			CHECK(over(f, 64, 64) == nil);
+			CHECK(over(f, 2, 2) == nil);
+		}
+		CHECK(ringEmpty(fx.ring));
+		id<MTLTexture> plain = over(MTLPixelFormatBGRA8Unorm, 64, 64);
+		CHECK(plain != nil);
+		CHECK(expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER)
+		          .buffer_obj_id == buf.rgfxObjId);
+		id<MTLTexture> subsampled = over(MTLPixelFormatGBGR422, 64, 64);
+		CHECK(subsampled != nil);
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+}
+
 // A Shared heap the device is asked for, and a depth or stencil texture the CPU reaches (over a
 // Shared buffer's bytes, or of a Managed descriptor), end the process with Metal's words before
 // the host is sent anything, as the heap and texture descriptor validation of the AMD 5300M and
@@ -14695,6 +14740,7 @@ int main(int argc, char **argv)
 		test_tiled_texture_over_backing();
 		test_mipmapped_buffer_texture_ends_the_process();
 		test_buffer_texture_types_end_the_process();
+		test_compressed_buffer_textures_answer_nil();
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_descriptor_validation_as_the_x86_macs();
 		test_invalid_surface_textures_end_the_process();
