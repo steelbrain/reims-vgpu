@@ -84,9 +84,12 @@ enum {
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
 // second word kRgfxAccelMethodFeatures answers: PagesBlock, Submit's deferred flag and
-// TakeAnswers, and OpenContext's span. Each bit is set by the change that lands its call.
-constexpr uint64_t kRgfxKextFeatureWord =
-    kRgfxKextFeaturePagesBlock | kRgfxKextFeatureDeferredAnswers | kRgfxKextFeatureContextSpan;
+// TakeAnswers, OpenContext's span, and shared events' ports. Each bit is set by the change that
+// lands its call.
+constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
+                                          kRgfxKextFeatureDeferredAnswers |
+                                          kRgfxKextFeatureContextSpan |
+                                          kRgfxKextFeatureSharedEvents;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -294,6 +297,14 @@ public:
 	// The GPU memory the guest is told of, from the host's device info (RgfxMemorySize.hpp):
 	// false where the region is not mapped.
 	bool readMemorySize(RgfxMemorySize *out) const;
+
+	// Shared events' ports (RgfxSharedEventUserClient.hpp): the client of ours that holds context
+	// `ctx` open for task `caller`, retained for the caller, or null where none does; a name for an
+	// export, unique from the kext's start, never 0; and a name's SHARED_EVENT_UNNAME, posted once
+	// its port has gone (or an export posted it unanswered), waiting for no answer.
+	RgfxAcceleratorUserClient *copyContextClient(task_t caller, UInt64 ctx);
+	UInt64 takeSharedEventName();
+	void unnameSharedEvent(UInt64 name);
 
 	// The framebuffer on our PCI device (ReimsGraphics), retained for the caller, or nullptr
 	// before it has started. The first lookup that finds it names this accelerator on it
@@ -519,6 +530,8 @@ public:
 private:
 	IOReturn newDisplayPipe(task_t owningTask, void *securityID, UInt32 type,
 	                        OSDictionary *properties, IOUserClient **handler);
+	IOReturn newSharedEventPort(task_t owningTask, void *securityID, UInt32 type,
+	                            OSDictionary *properties, IOUserClient **handler);
 	IOReturn newSurface(task_t owningTask, void *securityID, UInt32 type,
 	                    OSDictionary *properties, IOUserClient **handler);
 	UInt32 readRegister(UInt32 offset) const;

@@ -13,6 +13,8 @@
 #include "RgfxContextSlots.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxRegionSpans.hpp"
+#include "RgfxSharedEventPorts.hpp"
+#include "RgfxSharedEventUserClient.hpp"
 #include "RgfxSubmitGate.hpp"
 
 #include <IOKit/IOLib.h>
@@ -307,6 +309,94 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	default:
 		return kIOReturnUnsupported;
 	}
+}
+
+// MARK: - Shared events' ports
+
+namespace {
+// How long a shared event's name or import waits for the device: the host carries it out on the
+// caller's context's lane, behind what the context posted before it, a pipeline's compile among
+// them.
+constexpr UInt32 kShareMs = 60000;
+} // namespace
+
+IOReturn RgfxAcceleratorUserClient::connectClient(IOUserClient *client)
+{
+	RgfxSharedEventUserClient *port = OSDynamicCast(RgfxSharedEventUserClient, client);
+	const bool share = ucType == kRgfxAccelUserClientType && port &&
+	                   rgfxPortIsShareOf(port->acceleratorOf(), owner);
+	return share ? kIOReturnSuccess : kIOReturnBadArgument;
+}
+
+bool RgfxAcceleratorUserClient::holdsContext(task_t caller, UInt64 ctx)
+{
+	if (ucType != kRgfxAccelUserClientType)
+		return false;
+	IOLockLock(listLock);
+	const bool holds = !asks.closing && rgfxPortCallerHolds(task, caller, hasContext, context, ctx);
+	IOLockUnlock(listLock);
+	return holds;
+}
+
+IOReturn RgfxAcceleratorUserClient::exportSharedEvent(UInt64 ctx, UInt64 eventId, UInt64 listen,
+                                                      UInt64 name, UInt32 *status, bool *posted)
+{
+	*posted = false;
+	// An ask, so the name is posted before the context's CONTEXT_CLOSE, never after it.
+	UInt32 asked = 0;
+	Ask ask = {this, beginAsk(&asked)};
+	if (!ask.begun || asked != ctx || !ownsQueue(listen))
+		return kIOReturnBadArgument;
+	RgfxSharedEventName m = rgfxSharedEventNameMessage(eventId, name, listen);
+	UInt8 reply[ReimsGraphics::kLifecycleReplyMax];
+	UInt32 length = 0;
+	UInt64 seqno = 0;
+	IOReturn r = owner->postLifecycle(RGFX_CMD_SHARED_EVENT_NAME, &m, sizeof(m), RGFX_EVT_COMPLETE,
+	                                  reply, sizeof(reply), &length, &seqno, kShareMs);
+	*posted = r == kIOReturnSuccess || r == kIOReturnTimeout;
+	if (r != kIOReturnSuccess)
+		return r;
+	RgfxComplete complete = {};
+	if (length < sizeof(complete))
+		return kIOReturnInternalError;
+	memcpy(&complete, reply, sizeof(complete));
+	*status = complete.status;
+	return kIOReturnSuccess;
+}
+
+IOReturn RgfxAcceleratorUserClient::importSharedEvent(UInt64 ctx, UInt64 eventId, UInt64 listen,
+                                                      UInt64 name, UInt32 *status, UInt64 *value)
+{
+	// An ask, so the new event is made before the context's CONTEXT_CLOSE, never after it.
+	UInt32 asked = 0;
+	Ask ask = {this, beginAsk(&asked)};
+	if (!ask.begun || asked != ctx || !ownsQueue(listen))
+		return kIOReturnBadArgument;
+	RgfxSharedEventImport m = rgfxSharedEventImportMessage(eventId, name, listen);
+	UInt8 reply[ReimsGraphics::kLifecycleReplyMax];
+	UInt32 length = 0;
+	UInt64 seqno = 0;
+	IOReturn r = owner->postLifecycle(RGFX_CMD_SHARED_EVENT_IMPORT, &m, sizeof(m),
+	                                  RGFX_EVT_SHARED_EVENT_VALUE, reply, sizeof(reply), &length,
+	                                  &seqno, kShareMs);
+	if (r == kIOReturnTimeout) {
+		// Not answered in time: the process takes the import as failed, and the device keeps
+		// nothing of it, the destroy following the import on the ring.
+		RgfxObjectDestroy destroy = {};
+		destroy.header.type = RGFX_CMD_OBJECT_DESTROY;
+		destroy.obj_id = eventId;
+		owner->postLifecycle(RGFX_CMD_OBJECT_DESTROY, &destroy, sizeof(destroy), 0, nullptr, 0,
+		                     nullptr, nullptr, 0);
+	}
+	if (r != kIOReturnSuccess)
+		return r;
+	RgfxSharedEventValue answer = {};
+	if (length < sizeof(answer))
+		return kIOReturnInternalError;
+	memcpy(&answer, reply, sizeof(answer));
+	*status = answer.status;
+	*value = answer.value;
+	return kIOReturnSuccess;
 }
 
 // Whether a LIBRARY_FROM_REGION message is its library's last chunk, the one the device answers:

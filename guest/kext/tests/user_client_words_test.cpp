@@ -142,6 +142,7 @@ static void features()
 		kRgfxKextFeatureConsumedDoorbell,
 		kRgfxKextFeatureDeferredAnswers,
 		kRgfxKextFeatureContextSpan,
+		kRgfxKextFeatureSharedEvents,
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
@@ -149,6 +150,12 @@ static void features()
 	CHECK(kRgfxAccelMethodTakeAnswers == 0x112);
 	CHECK(kRgfxAccelMethodTakeAnswers == kRgfxAccelMethodFeatures + 3);
 	CHECK(kRgfxSubmitDeferred == 1);
+	// A shared event's port: 'RGSE', its two selectors past TakeAnswers, so a call on a
+	// connection of another type finds no selector of the accelerator's of that number.
+	CHECK(kRgfxSharedEventUserClientType == 0x52475345);
+	CHECK(kRgfxSharedEventMethodExport == 0x113);
+	CHECK(kRgfxSharedEventMethodImport == 0x114);
+	CHECK(kRgfxSharedEventMethodExport == kRgfxAccelMethodTakeAnswers + 1);
 }
 
 int main()

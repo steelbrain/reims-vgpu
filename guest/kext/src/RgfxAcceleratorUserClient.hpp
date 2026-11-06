@@ -65,6 +65,31 @@ public:
 	// no other process is given (RgfxBlockTable).
 	bool isWindowServer() const { return windowServer; }
 
+	// A shared event's port's calls (RgfxSharedEventUserClient), for the port's caller `caller`
+	// in its context `ctx`: whether this client holds that context open for that task
+	// (rgfxPortCallerHolds); and the export and the import, each an ask of this client's, so its
+	// close waits for them, posted on the control ring and answered by the device: the export's
+	// SHARED_EVENT_NAME of the caller's shared event `eventId` as `name`, its status in
+	// `*status` and whether it was posted in `*posted`; the import's SHARED_EVENT_IMPORT of the
+	// caller's new shared event `eventId` from `name`, its status and the event's value in
+	// `*status` and `*value`, destroyed behind where the device did not answer in time. Each
+	// names the caller's queue `listen`, which must be one of this client's.
+	// kIOReturnBadArgument where the context is not this client's or is closing, or `listen` is no
+	// queue of it; else postLifecycle's return.
+	bool holdsContext(task_t caller, UInt64 ctx);
+	IOReturn exportSharedEvent(UInt64 ctx, UInt64 eventId, UInt64 listen, UInt64 name,
+	                           UInt32 *status, bool *posted);
+	IOReturn importSharedEvent(UInt64 ctx, UInt64 eventId, UInt64 listen, UInt64 name,
+	                           UInt32 *status, UInt64 *value);
+	// IOConnectAddClient(this client's connection, port), which the bundle calls before it calls
+	// on a port it was handed: kIOReturnSuccess where the port is a shared event's port of this
+	// client's accelerator (rgfxPortIsShareOf), kIOReturnBadArgument where it is another user
+	// client. The kernel looks the port up in the caller's space and sends it nothing, and
+	// answers kIOReturnBadArgument itself for a port that is no IOKit connection, so a send right
+	// of another process's own port is refused at once, where an IOKit call made on it kills the
+	// caller (measured on the 5300M and the 630, oracle_events connect). Connects nothing.
+	IOReturn connectClient(IOUserClient *client) override;
+
 	// Dispatch our selectors (the doorbell).
 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
 	                        IOExternalMethodDispatch *dispatch, OSObject *target,

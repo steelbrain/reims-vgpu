@@ -65,7 +65,8 @@ OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAcceleratorSurfaces.o \
 	$(BUILD)/obj/RgfxSurfaceUserClient.o \
 	$(BUILD)/obj/RgfxAcceleratorUserClientWindow.o \
-	$(BUILD)/obj/RgfxAcceleratorLocks.o
+	$(BUILD)/obj/RgfxAcceleratorLocks.o \
+	$(BUILD)/obj/RgfxSharedEventUserClient.o
 
 all: $(BINARY)
 
@@ -108,7 +109,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/ring_room_test $(BUILD)/tests/context_slots_test $(BUILD)/tests/pages_block_test \
 	$(BUILD)/tests/close_table_test $(BUILD)/tests/ask_gate_test \
 	$(BUILD)/tests/pipe_color_test $(BUILD)/tests/id_chunks_test $(BUILD)/tests/boot_console_test \
-	$(BUILD)/tests/gamma_capability_test
+	$(BUILD)/tests/gamma_capability_test \
+	$(BUILD)/tests/shared_event_ports_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

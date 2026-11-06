@@ -68,9 +68,10 @@ constexpr uint64_t kBufferSlabs = RGFX_FEATURE_MANAGED_BUFFER_SLABS;
 constexpr uint64_t kSmallIds = RGFX_FEATURE_SMALL_ID_CHUNKS;
 constexpr uint64_t kColor = RGFX_FEATURE_DISPLAY_COLOR;
 constexpr uint64_t kMesh = RGFX_FEATURE_MESH_PIPELINES;
+constexpr uint64_t kShares = RGFX_FEATURE_SHARED_EVENT_NAMES;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
-                              kBufferSlabs | kSmallIds | kColor | kMesh;
+                              kBufferSlabs | kSmallIds | kColor | kMesh | kShares;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -80,13 +81,13 @@ int main()
 	// Of the bits from 3 the kext carries out PAGES_BUFFERS, SURFACE_ORDER,
 	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM,
 	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, MANAGED_TEXTURE_SLABS,
-	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR and MESH_PIPELINES, and writes each
-	// only where offered.
+	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, MESH_PIPELINES and
+	// SHARED_EVENT_NAMES, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
-	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR and "
-	      "MESH_PIPELINES from bit 3");
+	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, "
+	      "MESH_PIPELINES and SHARED_EVENT_NAMES from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -142,6 +143,11 @@ int main()
 	      "MESH_PIPELINES offered, written");
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kMesh, 0) == kRgfxOfferedFeatures,
 	      "MESH_PIPELINES offered but not taken is not in the word");
+	check(RGFX_FEATURE_SHARED_EVENT_NAMES == (1u << 26), "SHARED_EVENT_NAMES is bit 26");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kShares) == kShares,
+	      "SHARED_EVENT_NAMES offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kShares, 0) == kRgfxOfferedFeatures,
+	      "SHARED_EVENT_NAMES offered but not taken is not in the word");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
 	      "every other bit offered, none written");

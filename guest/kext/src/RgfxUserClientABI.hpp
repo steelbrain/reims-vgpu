@@ -14,6 +14,12 @@
 // (kRgfxSurfaceUserClientType) and of the types Apple's frameworks open.
 enum {
 	kRgfxAccelUserClientType = 0x52474658,
+	// A shared event's port ('RGSE', RgfxSharedEventUserClient.hpp): a connection the process
+	// that hands its shared event to another opens on the accelerator. Its send right is the
+	// event's eventPort, which a handle carries to another process, and which that process's
+	// calls on it (kRgfxSharedEventMethodImport) prove it holds. Where the kext's word holds
+	// kRgfxKextFeatureSharedEvents.
+	kRgfxSharedEventUserClientType = 0x52475345,
 };
 
 // External-method selectors the user client dispatches.
@@ -161,7 +167,28 @@ enum {
 	// Returns success whether or not the one waited for came: the answers that did are out all
 	// the same. The kext routes it to its context methods beside the range above.
 	kRgfxAccelMethodTakeAnswers = 0x112,
-	// A new selector takes the next number design.md's registry gives out.
+	// A new selector takes the next number design.md's registry gives out. 0x113 and 0x114 are a
+	// shared event's port's own (below).
+};
+
+// A shared event's port's selectors (kRgfxSharedEventUserClientType), numbered past the
+// accelerator's own so that a call on a connection of another kind is refused there as unknown.
+enum {
+	// Names the caller's shared event for other processes, once per port: in the caller's
+	// context (OpenContext's out[0]), the event's obj_id and the obj_id of the caller's queue
+	// whose completion ring takes the values other holders give the event; out the device's
+	// status (RGFX_STATUS_OK, or the refusal). The device has the name when it returns OK, and
+	// the port then names the event until no process holds it (SHARED_EVENT_UNNAME).
+	// kIOReturnBadArgument where the context is not one the calling task holds, or the ids are
+	// not in it; kIOReturnExclusiveAccess where the port names an event already.
+	kRgfxSharedEventMethodExport = 0x113,
+	// Makes the caller's new shared event from the event the port names: in the caller's context,
+	// the new event's obj_id and its listen queue, as Export's; out the device's status, and the
+	// event's value, which the new event starts at. Any task that holds the port may call it, and
+	// only one that does: that is what makes the port the capability. kIOReturnBadArgument where
+	// the context is not one the calling task holds, or the ids are not in it;
+	// kIOReturnNotReady where the port names no event yet.
+	kRgfxSharedEventMethodImport = 0x114,
 };
 
 // kRgfxAccelMethodSubmit's flags, its optional scalar in.
@@ -187,6 +214,9 @@ enum {
 	kRgfxKextFeatureDeferredAnswers = 1 << 4,
 	// OpenContext's (0x100) sixth output, the span of the context's GPU addresses.
 	kRgfxKextFeatureContextSpan = 1 << 5,
+	// A shared event's port (kRgfxSharedEventUserClientType) and its selectors, 0x113 and 0x114,
+	// which the bundle uses where the feature word holds RGFX_FEATURE_SHARED_EVENT_NAMES too.
+	kRgfxKextFeatureSharedEvents = 1 << 6,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

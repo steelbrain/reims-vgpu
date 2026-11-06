@@ -667,6 +667,7 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 	case RGFX_EVT_SIZE_AND_ALIGN:
 	case RGFX_EVT_SAMPLER_STATE:
 	case RGFX_EVT_ICB_STATE:
+	case RGFX_EVT_SHARED_EVENT_VALUE:
 		answerLifecycle(type, seqno, payload, size);
 		return;
 	case RGFX_EVT_VBLANK: {

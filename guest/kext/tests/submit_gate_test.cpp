@@ -33,6 +33,12 @@ int main()
 	check(!rgfxSubmitAdmitted(RGFX_CMD_GET_DISPLAYS), "a display command is not a submit message");
 	check(!rgfxSubmitAdmitted(RGFX_CMD_PRESENT_SURFACE), "PRESENT_SURFACE is not one");
 	check(!rgfxSubmitAdmitted(RGFX_CMD_COMMAND_BUFFER), "a command buffer rides a queue's ring");
+	// A shared event's name, import and unname are the kext's, built from a port the caller
+	// holds: a process that posted one could make an event of another process's without its port.
+	check(!rgfxSubmitAdmitted(RGFX_CMD_SHARED_EVENT_NAME), "SHARED_EVENT_NAME is the kext's");
+	check(!rgfxSubmitAdmitted(RGFX_CMD_SHARED_EVENT_IMPORT), "SHARED_EVENT_IMPORT is the kext's");
+	check(!rgfxSubmitAdmitted(RGFX_CMD_SHARED_EVENT_UNNAME), "SHARED_EVENT_UNNAME is the kext's");
+	check(rgfxSubmitAdmitted(RGFX_CMD_SHARED_EVENT_SET_VALUE), "a shared event's set is a process's");
 
 	// The accepted range: every type strictly between QUEUE_CREATE and CONTEXT_CLOSE.
 	check(rgfxSubmitAdmitted(RGFX_CMD_OBJECT_DESTROY), "OBJECT_DESTROY is accepted");

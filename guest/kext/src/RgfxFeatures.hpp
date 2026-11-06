@@ -7,7 +7,7 @@
 // DRIVER_FEATURES_LO and _HI after its reset and before DRIVER_READY with the bits the kext and its
 // bundle carry out, masked by the offer, and reads back the ones the host took. A host older than
 // the registers reads them as 0, so nothing from bit 3 is taken there. Of those bits the kext and
-// its bundle carry out fourteen:
+// its bundle carry out fifteen:
 //  - PAGES_BUFFERS (bit 7): the kext makes pages blocks over a process's own memory
 //    (kRgfxAccelMethodPagesBlock), and the bundle lays its no-copy buffers over them
 //    (BUFFER_OVER_PAGES);
@@ -62,7 +62,11 @@
 //  - MESH_PIPELINES (bit 25): the bundle makes mesh render pipelines and draws them, whose
 //    MESH_RENDER_PIPELINE_CREATE the kext admits as it does the other pipeline creates, its
 //    PIPELINE_REFLECTION answer carrying the mesh stages' limits after the record
-//    (RgfxSubmitGate.hpp).
+//    (RgfxSubmitGate.hpp);
+//  - SHARED_EVENT_NAMES (bit 26): a process hands its shared event to another through a port of
+//    the kext's (RgfxSharedEventUserClient.hpp), for which the kext posts SHARED_EVENT_NAME,
+//    SHARED_EVENT_IMPORT and SHARED_EVENT_UNNAME, and the bundle's events take the values other
+//    holders give them on a queue of their own.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -91,7 +95,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER | RGFX_FEATURE_SURFACE_DEFERRED |
     RGFX_FEATURE_HOST_TIME | RGFX_FEATURE_MANAGED_TEXTURE_SLABS |
     RGFX_FEATURE_MANAGED_BUFFER_SLABS | RGFX_FEATURE_SMALL_ID_CHUNKS | RGFX_FEATURE_DISPLAY_COLOR |
-    RGFX_FEATURE_MESH_PIPELINES;
+    RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

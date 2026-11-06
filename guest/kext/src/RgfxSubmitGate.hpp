@@ -32,10 +32,20 @@
 #include "reims_graphics_wire.h"
 
 // Whether submitMethod accepts a message of `type`: an object create or destroy, strictly between
-// QUEUE_CREATE and CONTEXT_CLOSE. (The caller also checks the obj_id lies in the sender's context.)
+// QUEUE_CREATE and CONTEXT_CLOSE, but a shared event's name, import and unname, which are the
+// kext's alone: a name is a port's (RgfxSharedEventUserClient.hpp), and a process that posted one
+// could make an event of another process's without holding its port. (The caller also checks the
+// obj_id lies in the sender's context.)
 inline bool rgfxSubmitAdmitted(uint32_t type)
 {
-	return type > RGFX_CMD_QUEUE_CREATE && type < RGFX_CMD_CONTEXT_CLOSE;
+	switch (type) {
+	case RGFX_CMD_SHARED_EVENT_NAME:
+	case RGFX_CMD_SHARED_EVENT_IMPORT:
+	case RGFX_CMD_SHARED_EVENT_UNNAME:
+		return false;
+	default:
+		return type > RGFX_CMD_QUEUE_CREATE && type < RGFX_CMD_CONTEXT_CLOSE;
+	}
 }
 
 // Whether an accepted `type`, when its obj_id is one of the client's command queues, must be
