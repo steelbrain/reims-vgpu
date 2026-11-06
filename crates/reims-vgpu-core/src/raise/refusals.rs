@@ -9,9 +9,13 @@
 //! a scope [`trap`] returns at once, and the death writes its line and ends the process.
 //!
 //! **Unwinding.** The thread unwinds from the death to the scope, and the `Drop`s between them
-//! run: a handle dropped there is released. A death while the thread is already unwinding is not
-//! trapped and ends the process. So does a death on a thread that runs no scope (a platform's own
-//! threads), but where the scope was carried there.
+//! run: a handle dropped there is released. A `Drop` the unwind runs may open a scope of its own
+//! (a release refused alone, [`Carried::run`]), and a death inside it unwinds to that scope, as
+//! one does on a thread that is not unwinding: the scope answers it, and the unwind it was opened
+//! in goes on to its own scope. A death in such a `Drop` outside any scope it opened is not
+//! trapped and ends the process, since no unwind may leave a `Drop` an unwind runs. So does a
+//! death on a thread that runs no scope (a platform's own threads), but where the scope was
+//! carried there.
 //!
 //! **Carried scopes.** Work an op registers to run later on another thread (a command buffer's
 //! completed handler, which the platform runs on its own thread after it reads the buffer's
@@ -35,6 +39,10 @@ use crate::raise::death::DeathId;
 thread_local! {
     /// How many scopes this thread is inside.
     static DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// Whether the innermost scope was entered while the thread was unwinding already: one a
+    /// `Drop` the unwind runs opened, which a death inside it may unwind to (module doc,
+    /// "Unwinding").
+    static ENTERED_UNWINDING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// A death a scope caught: what died, and the detail its line would have carried.
@@ -57,19 +65,27 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// Leaves the scope as the thread leaves `refusing`, whether `f` returned or unwound.
-struct Depth;
+/// Leaves the scope as the thread leaves `refusing`, whether `f` returned or unwound, and puts
+/// back what the scope it was inside was entered as.
+struct Depth {
+    /// [`ENTERED_UNWINDING`] of the scope this one is inside.
+    outer_entered_unwinding: bool,
+}
 
 impl Depth {
     fn enter() -> Depth {
         DEPTH.with(|d| d.set(d.get().saturating_add(1)));
-        Depth
+        let unwinding = std::thread::panicking();
+        Depth {
+            outer_entered_unwinding: ENTERED_UNWINDING.with(|e| e.replace(unwinding)),
+        }
     }
 }
 
 impl Drop for Depth {
     fn drop(&mut self) {
         DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        ENTERED_UNWINDING.with(|e| e.set(self.outer_entered_unwinding));
     }
 }
 
@@ -119,10 +135,18 @@ impl Carried {
     }
 }
 
-/// `raise::death`'s hook: inside a scope, the death unwinds to it as a [`Refusal`]. Returns where
-/// the thread is in no scope, or is unwinding already: the process then ends as it always did.
+/// Whether a death on this thread now unwinds to the innermost scope: the thread is inside one,
+/// and is not unwinding, or that scope was entered as it unwound, inside a `Drop` the unwind runs
+/// (module doc, "Unwinding").
+fn takes_a_death() -> bool {
+    is_refusing() && (!std::thread::panicking() || ENTERED_UNWINDING.with(Cell::get))
+}
+
+/// `raise::death`'s hook: inside a scope that can take it ([`takes_a_death`]), the death unwinds
+/// to it as a [`Refusal`]. Returns where the thread is in no scope, or is unwinding already
+/// toward it: the process then ends as it always did.
 pub(crate) fn trap(id: DeathId, detail: Option<&str>) {
-    if !is_refusing() || std::thread::panicking() {
+    if !takes_a_death() {
         return;
     }
     resume_unwind(Box::new(Refusal {
@@ -234,6 +258,32 @@ mod tests {
         assert_eq!(plain.run(|| 4), Ok(4));
         let d = catch_death(|| plain.run(|| crate::fatal!(SITE)));
         assert_eq!(d.map(|_| ()), Err(SITE));
+    }
+
+    /// A death in a `Drop` an unwind runs, inside a scope that `Drop` opened, is that scope's
+    /// refusal, and the unwind goes on to its own scope, which answers the first death; outside
+    /// every scope the `Drop` opened, the thread is unwinding toward a scope no unwind can reach
+    /// from there, and no scope takes the death
+    #[test]
+    fn a_death_while_unwinding_is_refused_in_a_scope_opened_since() {
+        /// A release that dies, refused alone in a scope of its own, as the lane's releases are.
+        struct RefusedRelease<'a>(&'a Cell<Option<String>>);
+        impl Drop for RefusedRelease<'_> {
+            fn drop(&mut self) {
+                assert!(std::thread::panicking() && is_refusing());
+                let refused: Result<(), Refusal> = refusing(|| Raise::platform("release").fatal());
+                self.0.set(refused.err().map(|r| r.to_string()));
+            }
+        }
+        let released = Cell::new(None);
+        let r: Result<(), Refusal> = refusing(|| {
+            let _held = RefusedRelease(&released);
+            Raise::platform("commit").fatal()
+        });
+        assert!(r.unwrap_err().to_string().contains("commit"));
+        let released = released.take().expect("the release ran in the unwind");
+        assert!(released.contains("release"), "{released}");
+        assert!(!is_refusing());
     }
 
     /// An unwind that is not a death passes the scope by
