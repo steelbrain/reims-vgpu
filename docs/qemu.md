@@ -404,6 +404,16 @@ guest, under KVM:
 - `profile-997` on the guest's eight vCPUs adds about 30% of a host core to
   QEMU's CPU time.
 
+On the host, QEMU is never traced with a per-task perf recorder: `perf record
+-p` or `-t`, or tracepoint or uprobe events its new threads inherit. Each
+thread carries the events, so **measured** on the same host, a thread's exit
+took 0.12 to 12 s and at least 0.13 s of CPU in `perf_event_exit_task`, and
+as the host's bursts of graphics threads exited, those exits filled 22 to 23
+of its 24 CPUs, starved the vCPUs and froze the guest for 1.3 to 10 s: frames
+of up to 9.5 s. A host trace records system-wide (`perf record -a`), filtered
+by pid, and measures only after perf's first sample, since attaching its
+uprobes made present gaps of 378 and 521 ms.
+
 ### fbt probes in the guest's kexts
 
 `dtrace -l -P fbt -m com.steelbrain.ReimsGraphics` lists no probes. The
