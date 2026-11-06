@@ -91,8 +91,10 @@ pub(crate) fn hook_message(info: &dyn std::fmt::Display) -> String {
 /// in the library's code (on the FIFO thread, in one of its queue blocks, in a Metal completion
 /// handler, inside a public entry point or a C export, each marked by `rt::enter_ours`) ends the
 /// process as a death does: one line on stderr, then `abort()`, before anything unwinds, so no
-/// panic crosses into the host's frames and no drop runs first. A panic anywhere else is the
-/// host's own, and goes to the previous hook.
+/// panic crosses into the host's frames and no drop runs first. Inside a refusal scope (the
+/// graphics lane's ops) it is refused as a death there is: the line is written, and the panic
+/// unwinds to the scope, which refuses the op (`reims_vgpu_core::raise::refusals`, "Panics"). A
+/// panic anywhere else is the host's own, and goes to the previous hook.
 pub fn install_panic_hook() {
     HOOK.call_once(|| {
         let previous = std::panic::take_hook();
@@ -100,6 +102,9 @@ pub fn install_panic_hook() {
             if is_our_thread() {
                 use std::io::Write as _;
                 let _ = std::io::stderr().write_all(hook_message(info).as_bytes());
+                if reims_vgpu_core::raise::refusals::refuses_panics() {
+                    return;
+                }
                 #[allow(clippy::disallowed_methods)] // a panic's abort (6.5)
                 std::process::abort();
             }
@@ -123,6 +128,40 @@ mod tests {
             .env(var, "1")
             .output()
             .unwrap()
+    }
+
+    /// A panic of ours inside a refusal scope is refused there, its line written, and the process
+    /// goes on; outside every scope the hook still ends the process. In a child, with the
+    /// capture off, as the product runs.
+    #[test]
+    fn a_panic_in_a_refusal_scope_is_refused_and_the_process_goes_on() {
+        use reims_vgpu_core::raise::death::DeathId;
+        use reims_vgpu_core::raise::refusals::refusing;
+        if std::env::var_os("RVG_SCOPED_PANIC_CHILD").is_some() {
+            reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+            install_panic_hook();
+            let _ours = reims_vgpu_core::rt::enter_ours();
+            let r: Result<(), _> = refusing(|| panic!("in a guest op"));
+            assert_eq!(r.unwrap_err().id, DeathId::Panic);
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), b"the process goes on\n");
+            panic!("outside every scope");
+        }
+        let out = child(
+            "singleton::tests::a_panic_in_a_refusal_scope_is_refused_and_the_process_goes_on",
+            "RVG_SCOPED_PANIC_CHILD",
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.signal(), Some(6), "{out:?}");
+        let refused = stderr
+            .find("reims-vgpu: panic: ")
+            .expect("the refused panic's line");
+        let goes_on = stderr
+            .find("the process goes on")
+            .expect("the process went on");
+        let ended = stderr
+            .rfind("outside every scope")
+            .expect("the panic outside");
+        assert!(refused < goes_on && goes_on < ended, "{stderr}");
     }
 
     /// platform() is one per process (D17). In a child: making the platform installs the aborting

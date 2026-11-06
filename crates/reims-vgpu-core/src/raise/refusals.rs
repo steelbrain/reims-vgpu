@@ -8,6 +8,13 @@
 //! paravirt device never opens a scope, so its deaths stay where its contract puts them: outside
 //! a scope [`trap`] returns at once, and the death writes its line and ends the process.
 //!
+//! **Panics.** A panic is a bug (architecture 6.5), and one inside a scope is refused as a death
+//! there is: the library's panic hook writes its line and lets it unwind ([`refuses_panics`]),
+//! and the scope answers it as a [`Refusal`] of [`DeathId::Panic`], logged as the bug it is. So
+//! no guest input ends the process through a panic in the lane's code either. Under the test
+//! capture a panic is a test's failure, and goes on past every scope, as any other unwind does:
+//! a test's assertion in work a scope runs fails the test.
+//!
 //! **Unwinding.** The thread unwinds from the death to the scope, and the `Drop`s between them
 //! run: a handle dropped there is released. A `Drop` the unwind runs may open a scope of its own
 //! (a release refused alone, [`Carried::run`]), and a death inside it unwinds to that scope, as
@@ -90,8 +97,8 @@ impl Drop for Depth {
 }
 
 /// Runs `f` in a refusal scope: `Ok` with what `f` returns, or `Err` with the [`Refusal`] of a
-/// death on this thread inside it, which ended `f` there (module doc). Any other unwind goes on
-/// past the scope.
+/// death on this thread inside it, or of a panic there ([`refuses_panics`]), which ended `f`
+/// there (module doc). Any other unwind goes on past the scope.
 pub fn refusing<T>(f: impl FnOnce() -> T) -> Result<T, Refusal> {
     let depth = Depth::enter();
     let r = catch_unwind(AssertUnwindSafe(f));
@@ -100,9 +107,50 @@ pub fn refusing<T>(f: impl FnOnce() -> T) -> Result<T, Refusal> {
         Ok(v) => Ok(v),
         Err(payload) => match payload.downcast::<Refusal>() {
             Ok(refusal) => Err(*refusal),
-            Err(other) => resume_unwind(other),
+            Err(other) => match panic_message(&*other) {
+                Some(message) if panics_refused() => {
+                    log::error!(
+                        target: "reims_vgpu::refused",
+                        "a panic in a refusal scope, a bug, refused the op it met: {message}"
+                    );
+                    Err(Refusal {
+                        id: DeathId::Panic,
+                        detail: Some(message),
+                    })
+                }
+                _ => resume_unwind(other),
+            },
         },
     }
+}
+
+/// What a panic says: the message of `panic!` and of the panics of std (an index out of bounds,
+/// an overflow, an `unwrap`), whose payload is a string; `None` for any other payload, an unwind
+/// of the library's own (a test capture's death, an isolated task's stop) among them.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    match payload.downcast_ref::<&'static str>() {
+        Some(message) => Some((*message).to_owned()),
+        None => payload.downcast_ref::<String>().cloned(),
+    }
+}
+
+/// Whether a scope answers a panic: always, but under the test capture (the module doc,
+/// "Panics"), where a panic is a test's failure.
+fn panics_refused() -> bool {
+    #[cfg(any(test, feature = "testkit"))]
+    if crate::testkit::capture::capture_enabled() {
+        return false;
+    }
+    true
+}
+
+/// The panic hook's question (architecture 6.5): whether the panic on this thread now is a
+/// scope's to refuse, so the hook writes its line and lets it unwind there instead of ending the
+/// process: the thread is inside a scope ([`refusing`]), and scopes answer panics. A panic in a
+/// `Drop` an unwind runs, outside any scope the `Drop` opened, still ends the process once the
+/// hook returns, as Rust ends it for any panic that would leave such a `Drop`.
+pub fn refuses_panics() -> bool {
+    is_refusing() && panics_refused()
 }
 
 /// Whether this thread is inside a refusal scope.
@@ -283,6 +331,60 @@ mod tests {
         assert!(r.unwrap_err().to_string().contains("commit"));
         let released = released.take().expect("the release ran in the unwind");
         assert!(released.contains("release"), "{released}");
+        assert!(!is_refusing());
+    }
+
+    /// A panic in a scope is its refusal, a bug's, where scopes answer panics (the product, and the
+    /// subprocess harness with the capture off); under the capture it is a test's failure, and
+    /// passes every scope by
+    #[test]
+    fn a_panic_in_a_scope_is_its_refusal() {
+        use crate::testkit::capture::{capture_enabled, set_capture_enabled};
+        assert!(capture_enabled());
+        let r = catch_unwind(|| refusing(|| -> u32 { panic!("a test's assertion") }));
+        let payload = r.unwrap_err();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"a test's assertion"));
+        if std::env::var_os("RVG_REFUSAL_PANICS_CHILD").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "raise::refusals::tests::a_panic_in_a_scope_is_its_refusal",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("RVG_REFUSAL_PANICS_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            return;
+        }
+        // In a child: as the product, a scope answers a panic.
+        set_capture_enabled(false);
+        assert!(!refuses_panics());
+        let held = Cell::new(false);
+        let r = refusing(|| {
+            assert!(refuses_panics());
+            held.set(true);
+            let words = [1u32, 2];
+            let at = words.len() + usize::from(held.get());
+            words[at]
+        });
+        let refusal = r.unwrap_err();
+        assert_eq!(refusal.id, DeathId::Panic);
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("a panic: index out of bounds"),
+            "{refusal}"
+        );
+        let r: Result<(), Refusal> = refusing(|| panic!("formatted {}", 7));
+        assert_eq!(r.unwrap_err().to_string(), "a panic: formatted 7");
+        // A carried scope answers one too, on the thread that runs the work.
+        let carried = refusing(carry).unwrap();
+        let r = std::thread::spawn(move || carried.run(|| -> u32 { panic!("in a handler") }))
+            .join()
+            .unwrap();
+        assert_eq!(r.unwrap_err().to_string(), "a panic: in a handler");
         assert!(!is_refusing());
     }
 

@@ -1,8 +1,8 @@
 //! A fuzz of the decoder over the bytes a guest process controls: the messages its context sends
 //! the decoder (creates, destroys, the region chunks they name) and the op streams of its command
-//! buffers, which any process writes into its own rings. A panic there unwinds out of the host's
-//! decode and ends the VM's process, and none of the decoder's refusals catches one
-//! (`refusals::refusing` lets any other unwind go on), so the decoder must answer every input with
+//! buffers, which any process writes into its own rings. A panic there is a bug: the refusal
+//! scope refuses its op in the product, logged as one, and under the test capture it passes every
+//! scope (`refusals::refusing`), so it fails the target. The decoder must answer every input with
 //! a result: carried out, refused, or a fault in the refusal scope (the decoder's `refusing`, as
 //! `GraphicsDevice::handle_stage3` runs it).
 //!

@@ -110,6 +110,9 @@ pub enum DeathId {
     GuestDisplay(crate::display::guest_display::DeathKind),
     /// The device's display ports'.
     Displays(crate::device::displays::DeathKind),
+    /// A panic in a refusal scope, which the scope refuses as a death there
+    /// ([`crate::raise::refusals`], "Panics"): no death site raises it.
+    Panic,
     /// A test's own death at a site it names (the testkit's fakes and the tests of the death
     /// machinery).
     #[cfg(any(test, feature = "testkit"))]
@@ -202,6 +205,12 @@ impl DeathId {
                 file: k.id(),
                 line: 0,
             },
+            // A panic outside every scope ends the process in the panic hook's `abort()` (6.5).
+            DeathId::Panic => DeathSite {
+                kind: DeathKind::Abort,
+                file: "panic",
+                line: 0,
+            },
         }
     }
 }
@@ -234,6 +243,7 @@ impl fmt::Display for DeathId {
             DeathId::Manager(k) => k.fmt(f),
             DeathId::GuestDisplay(k) => write!(f, "{k}"),
             DeathId::Displays(k) => write!(f, "{k}"),
+            DeathId::Panic => f.write_str("a panic"),
         }
     }
 }

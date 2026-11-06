@@ -700,7 +700,10 @@ that test identity only: production never computes them.
 
 A panic is a bug, never control flow, and it ends the process as a death does: one line
 (`reims-vgpu: panic: …`), then `abort()`, before anything unwinds, so no drop runs first and no
-panic of the library's reaches the host's frames. The API's singleton
+panic of the library's reaches the host's frames. Inside a refusal scope (the graphics lane's
+ops, `raise::refusals`) it is refused as a death there is: the line is written, the panic unwinds
+to the scope, and the op is refused, logged as a bug; under the test capture it is the test's
+failure, and passes every scope. The API's singleton
 (`reims-vgpu/src/singleton.rs`) installs a chained panic hook that does this when the panicking
 thread is running the library's code (the FIFO thread, a worker running one of core's blocks, a
 Metal completion handler or buffer deallocator, a public entry point, or a C export, each marked

@@ -1465,7 +1465,8 @@ this lane ends the offending context or its process on malformed input. The
 host runs each op in a refusal scope (`reims_vgpu_core::raise::refusals`): a
 death at a platform call, where the platform refuses a create or an encode and
 the paravirt device ends the process, unwinds to the op's scope instead, and the
-op is refused there, logged once at WARN with the platform's reason. A command
+op is refused there, logged once at WARN with the platform's reason. A panic in
+the lane's code, a bug, is refused there too, logged at ERROR. A command
 buffer refused mid-stream has its open encoder ended and is never committed.
 Work an op registers to run on another thread takes the op's scope with it
 (`refusals::carry`): a command buffer's completed handler runs the platform's
