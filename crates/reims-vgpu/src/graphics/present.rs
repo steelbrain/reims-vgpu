@@ -61,18 +61,28 @@
 //! copy, and the window showed that newer frame, then the older one it had presented between,
 //! then the newer again.
 //!
+//! **Where a present's time goes.** Each answer is logged at debug, on [`TIMING`]'s target:
+//! how long after the device's last refresh its `PRESENT_SURFACE` was taken, how long it waited
+//! for its writers and fill to be shown, how long the window's draw of it took to finish, and at
+//! which refresh it was answered. It tells a present the host answers a refresh late (its show
+//! or its draw done past the first refresh after its take) from one the guest's compositor
+//! sent late in the refresh, which a guest's present latency alone does not.
+//!
 //! [`RgfxSurfaceWriters`]: reims_graphics::wire::RgfxSurfaceWriters
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_STATUS_OK, RgfxSurfaceWriter};
 use reims_graphics::{CompletionPoster, PresentAnswer};
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::Platform;
+use reims_vgpu_core::platform::os::clock::MonoTime;
 use reims_vgpu_core::sync::Mutex;
 
 use super::color::ColorChange;
+use super::compile::Now;
 use super::decode::FillWait;
 use super::{DisplayHold, Presented, ShownTexture, Shows};
 
@@ -116,6 +126,8 @@ struct Waiting<P: Platform> {
     writers: Vec<RgfxSurfaceWriter>,
     /// The fill of its surface's device cache it waits for, where it asked one.
     fill: Option<FillWait>,
+    /// When it was taken.
+    taken: Taken,
 }
 
 impl<P: Platform> PresentQueue<P> {
@@ -152,6 +164,7 @@ impl<P: Platform> PresentQueue<P> {
         writers: Vec<RgfxSurfaceWriter>,
         fill: Option<FillWait>,
     ) {
+        let taken = self.presented.answers.taken();
         let writers = self.published(writers);
         self.push(Waiting {
             shows: Shows::Surface(id, texture),
@@ -159,6 +172,7 @@ impl<P: Platform> PresentQueue<P> {
             answer,
             writers,
             fill,
+            taken,
         });
     }
 
@@ -171,6 +185,7 @@ impl<P: Platform> PresentQueue<P> {
             answer,
             writers: Vec::new(),
             fill: None,
+            taken: self.presented.answers.taken(),
         });
     }
 
@@ -355,7 +370,7 @@ impl<P: Platform> PresentQueue<P> {
             let Some(shown) = state.waiting.pop_front() else {
                 return gone;
             };
-            gone.extend(self.presented.show(shown.shows, shown.color, shown.answer));
+            gone.extend((self.presented).show(shown.shows, shown.color, shown.answer, shown.taken));
         }
     }
 
@@ -381,12 +396,16 @@ impl Answer for PresentAnswer {
 /// When shown presents are answered (the module doc).
 pub(crate) struct PresentAnswers<A> {
     state: Mutex<AnswersState<A>>,
+    /// The platform's monotonic clock, which the timing lines read.
+    now: Now,
 }
 
 /// [`PresentAnswers`]' state.
 struct AnswersState<A> {
     /// The device's refreshes so far.
     refreshes: u64,
+    /// When the host was told of the last of them.
+    last_refresh: Option<MonoTime>,
     /// The number the next present shown takes.
     next: u64,
     /// The presents shown and not yet answered, in the order shown, their numbers counting up
@@ -401,6 +420,59 @@ struct Owed<A> {
     shown_at: u64,
     /// Where the window's draw of it is.
     draw: Draw,
+    /// When it was taken, shown, and its draw finished (or was dropped).
+    taken: Taken,
+    shown: MonoTime,
+    drawn: Option<MonoTime>,
+}
+
+/// The target of each answer's timing line, at debug (the module doc).
+pub(crate) const TIMING: &str = "reims_vgpu::graphics::present_timing";
+
+/// When a present was taken, against the device's refreshes ([`PresentAnswers::taken`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Taken {
+    /// When.
+    at: MonoTime,
+    /// The device's refreshes before it.
+    refreshes: u64,
+    /// How long after the last of them, where there was one.
+    since_refresh: Option<Duration>,
+}
+
+/// What an answer's timing line says ([`PresentAnswers::refreshed`]).
+struct Timing {
+    taken: Taken,
+    shown: MonoTime,
+    drawn: Option<MonoTime>,
+    /// The refresh that answered it, and when.
+    refresh: u64,
+    at: MonoTime,
+}
+
+impl Timing {
+    /// Logs it, at debug on [`TIMING`]'s target.
+    fn log(&self) {
+        let us = |from: MonoTime, to: MonoTime| to.saturating_duration_since(from).as_micros();
+        let taken = &self.taken;
+        let after = match taken.since_refresh {
+            Some(since) => format!("{} us after refresh {}", since.as_micros(), taken.refreshes),
+            None => "before the first refresh".to_owned(),
+        };
+        let drawn = match self.drawn {
+            Some(drawn) => format!("its draw done {} us after its show", us(self.shown, drawn)),
+            None => "undrawn".to_owned(),
+        };
+        log::debug!(
+            target: TIMING,
+            "a present taken {after}: shown {} us after its take, {drawn}, answered at refresh {} \
+             ({} after its take), {} us after its take",
+            us(taken.at, self.shown),
+            self.refresh,
+            self.refresh - taken.refreshes,
+            us(taken.at, self.at),
+        );
+    }
 }
 
 /// Where the window's draw of a present is.
@@ -426,21 +498,44 @@ impl Drawing {
     }
 }
 
-impl<A> Default for PresentAnswers<A> {
-    fn default() -> Self {
+impl<A> PresentAnswers<A> {
+    /// No present shown yet, the timing lines read on `now`.
+    pub(crate) fn new(now: Now) -> Self {
         PresentAnswers {
             state: Mutex::new(AnswersState {
                 refreshes: 0,
+                last_refresh: None,
                 next: 0,
                 owed: VecDeque::new(),
             }),
+            now,
         }
     }
 }
 
+/// For the tests: a clock that stays at 0.
+#[cfg(test)]
+impl<A> Default for PresentAnswers<A> {
+    fn default() -> Self {
+        PresentAnswers::new(Box::new(MonoTime::default))
+    }
+}
+
 impl<A: Answer> PresentAnswers<A> {
-    /// A present is shown; the window will draw it.
-    pub(crate) fn shown(&self, answer: A) {
+    /// A present is taken now: when, against the device's refreshes, for its timing line.
+    pub(crate) fn taken(&self) -> Taken {
+        let at = (self.now)();
+        let state = self.state.lock();
+        Taken {
+            at,
+            refreshes: state.refreshes,
+            since_refresh: state.last_refresh.map(|r| at.saturating_duration_since(r)),
+        }
+    }
+
+    /// A present `taken` then is shown; the window will draw it.
+    pub(crate) fn shown(&self, answer: A, taken: Taken) {
+        let shown = (self.now)();
         let mut state = self.state.lock();
         let shown_at = state.refreshes;
         state.next += 1;
@@ -448,6 +543,9 @@ impl<A: Answer> PresentAnswers<A> {
             answer,
             shown_at,
             draw: Draw::Not,
+            taken,
+            shown,
+            drawn: None,
         });
     }
 
@@ -473,6 +571,7 @@ impl<A: Answer> PresentAnswers<A> {
         if drawing.is_empty() {
             return;
         }
+        let drawn = (self.now)();
         let mut state = self.state.lock();
         let front = state.next - state.owed.len().to_u64();
         for number in drawing.0 {
@@ -481,6 +580,7 @@ impl<A: Answer> PresentAnswers<A> {
                 .and_then(|i| state.owed.get_mut(i.to_usize()))
             {
                 owed.draw = Draw::Done;
+                owed.drawn = Some(drawn);
             }
         }
     }
@@ -491,9 +591,13 @@ impl<A: Answer> PresentAnswers<A> {
     /// first, so an answer frees every earlier present's surface for the guest to draw into: none
     /// is given while the window's draw of an earlier one still reads its surface.
     pub(crate) fn refreshed(&self) {
+        let at = (self.now)();
+        let timed = log::log_enabled!(target: TIMING, log::Level::Debug);
+        let mut timings = Vec::new();
         let answers: Vec<A> = {
             let mut state = self.state.lock();
             state.refreshes += 1;
+            state.last_refresh = Some(at);
             let now = state.refreshes;
             let mut answers = Vec::new();
             while let Some(front) = state.owed.front() {
@@ -506,6 +610,15 @@ impl<A: Answer> PresentAnswers<A> {
                     break;
                 }
                 if let Some(owed) = state.owed.pop_front() {
+                    if timed {
+                        timings.push(Timing {
+                            taken: owed.taken,
+                            shown: owed.shown,
+                            drawn: owed.drawn,
+                            refresh: now,
+                            at,
+                        });
+                    }
                     answers.push(owed.answer);
                 }
             }
@@ -514,6 +627,9 @@ impl<A: Answer> PresentAnswers<A> {
         for answer in answers {
             answer.answer_ok();
         }
+        for timing in timings {
+            timing.log();
+        }
     }
 }
 
@@ -521,9 +637,12 @@ impl<A: Answer> PresentAnswers<A> {
 mod tests {
     use std::sync::Arc;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use reims_vgpu_core::platform::os::clock::MonoTime;
     use reims_vgpu_core::sync::Mutex;
 
-    use super::{Answer, Drawing, PresentAnswers};
+    use super::{Answer, Drawing, PresentAnswers, TIMING};
 
     /// An answer that records the refresh it was given at.
     struct Recorded {
@@ -573,11 +692,14 @@ mod tests {
             }
             let frame = shown_at.len();
             shown_at.push(r);
-            answers.shown(Recorded {
-                frame,
-                log: Arc::clone(&log),
-                refresh: Arc::clone(&refresh),
-            });
+            answers.shown(
+                Recorded {
+                    frame,
+                    log: Arc::clone(&log),
+                    refresh: Arc::clone(&refresh),
+                },
+                answers.taken(),
+            );
             match window {
                 Window::Draws => {
                     let drawn = answers.drawn();
@@ -630,10 +752,10 @@ mod tests {
             log: Arc::clone(&log),
             refresh: Arc::clone(&refresh),
         };
-        answers.shown(rec(0));
+        answers.shown(rec(0), answers.taken());
         // The window takes frame 0 and its draw runs on.
         let drawing = answers.drawn();
-        answers.shown(rec(1));
+        answers.shown(rec(1), answers.taken());
         for r in 1..=3 {
             *refresh.lock() = r;
             answers.refreshed();
@@ -661,9 +783,9 @@ mod tests {
             log: Arc::clone(&log),
             refresh: Arc::clone(&refresh),
         };
-        answers.shown(rec(0));
+        answers.shown(rec(0), answers.taken());
         let first = answers.drawn();
-        answers.shown(rec(1));
+        answers.shown(rec(1), answers.taken());
         let second = answers.drawn();
         answers.done(second);
         for r in 1..=3 {
@@ -684,11 +806,14 @@ mod tests {
         let answers = PresentAnswers::<Recorded>::default();
         let log = Arc::new(Mutex::new(Vec::new()));
         let refresh = Arc::new(Mutex::new(0u64));
-        answers.shown(Recorded {
-            frame: 0,
-            log: Arc::clone(&log),
-            refresh: Arc::clone(&refresh),
-        });
+        answers.shown(
+            Recorded {
+                frame: 0,
+                log: Arc::clone(&log),
+                refresh: Arc::clone(&refresh),
+            },
+            answers.taken(),
+        );
         let drawing = answers.drawn();
         for r in 1..=3 {
             *refresh.lock() = r;
@@ -700,5 +825,49 @@ mod tests {
         *refresh.lock() = 4;
         answers.refreshed();
         assert_eq!(*log.lock(), [(0, 4)]);
+    }
+
+    /// Each answer logs at debug where its present's time went: the refresh it was taken after,
+    /// its draw's end, and the refresh that answered it, counted from its take
+    #[test]
+    fn each_answer_logs_its_timing_at_debug() {
+        let logs = reims_vgpu_core::testkit::logs::capture();
+        // A clock 100 us on at each read.
+        let clock = AtomicU64::new(0);
+        let answers = PresentAnswers::<Recorded>::new(Box::new(move || {
+            MonoTime::from_nanos(clock.fetch_add(100_000, Ordering::Relaxed))
+        }));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let refresh = Arc::new(Mutex::new(0u64));
+        let rec = |frame| Recorded {
+            frame,
+            log: Arc::clone(&log),
+            refresh: Arc::clone(&refresh),
+        };
+        // Taken before any refresh, drawn at once: answered at the first.
+        answers.shown(rec(0), answers.taken());
+        let drawing = answers.drawn();
+        answers.done(drawing);
+        answers.refreshed();
+        // Taken after refresh 1, never drawn: answered at the second refresh after its show.
+        answers.shown(rec(1), answers.taken());
+        answers.refreshed();
+        answers.refreshed();
+        let lines: Vec<String> = (logs.take().into_iter())
+            .filter(|(level, target, _)| *level == log::Level::Debug && target == TIMING)
+            .map(|(_, _, line)| line)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "a present taken before the first refresh: shown 100 us after its take, its draw \
+                 done 100 us after its show, answered at refresh 1 (1 after its take), 300 us \
+                 after its take",
+                "a present taken 100 us after refresh 1: shown 100 us after its take, undrawn, \
+                 answered at refresh 3 (2 after its take), 300 us after its take",
+            ]
+        );
+        drop(logs);
+        assert_eq!(log.lock().len(), 2, "both answered");
     }
 }

@@ -341,7 +341,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
                 decoder.set_video(video);
             }
-            let presented = Arc::new(Presented::default());
+            let clock = Arc::clone(&platform);
+            let presented = Arc::new(Presented::new(Box::new(move || clock.clock().now_mono())));
             let presents = Arc::new(PresentQueue::new(Arc::clone(&presented)));
             // A present that waits for its surface's fill is shown as the fill finishes.
             let waiting = Arc::downgrade(&presents);
@@ -643,8 +644,20 @@ pub(crate) struct Presented<P: Platform> {
     color: Mutex<(u64, Arc<DisplayColor>)>,
 }
 
+/// For the tests: the timing lines' clock stays at 0.
+#[cfg(test)]
 impl<P: Platform> Default for Presented<P> {
     fn default() -> Self {
+        Presented::new(Box::new(
+            reims_vgpu_core::platform::os::clock::MonoTime::default,
+        ))
+    }
+}
+
+impl<P: Platform> Presented<P> {
+    /// Nothing shown yet: the scanout, with every colour stage off; the presents' timing lines
+    /// read `now`, the platform's monotonic clock.
+    fn new(now: compile::Now) -> Self {
         Presented {
             texture: Mutex::new(None),
             holds: Mutex::default(),
@@ -652,13 +665,11 @@ impl<P: Platform> Default for Presented<P> {
             window: OnceLock::new(),
             refused: AtomicBool::new(false),
             formats: Mutex::new(None),
-            answers: PresentAnswers::default(),
+            answers: PresentAnswers::new(now),
             color: Mutex::new((0, Arc::default())),
         }
     }
-}
 
-impl<P: Platform> Presented<P> {
     /// `texture`, over a surface whose present was taken, held for the display from now: the
     /// block at `span` it lies in is not given back until the display is done with it
     /// ([`DisplayHold`]).
@@ -708,7 +719,8 @@ impl<P: Platform> Presented<P> {
     /// Shows `texture` (the surface `id`'s), or the scanout for `None`, or keeps what the display
     /// shows where `shows` is [`Shows::Kept`], with the colour stages `color` sets
     /// ([`DisplayColor::apply`]), and asks the window for a frame; `answer` is given at the vblank
-    /// the display first shows it ([`PresentAnswers`]), or at once without a window. The hold of
+    /// the display first shows it ([`PresentAnswers`]), or at once without a window, and the
+    /// present's timing, from when it was `taken`, logged there at debug. The hold of
     /// the texture shown before is returned, for the caller to let go of with no lock held: a
     /// release waiting for it may be answered there.
     #[must_use]
@@ -717,6 +729,7 @@ impl<P: Platform> Presented<P> {
         shows: Shows<P>,
         color: Option<ColorChange>,
         answer: PresentAnswer,
+        taken: present::Taken,
     ) -> Option<Arc<DisplayHold>> {
         if let Some(change) = color {
             let mut shown = self.color.lock();
@@ -741,7 +754,7 @@ impl<P: Platform> Presented<P> {
         };
         match self.window.get() {
             Some(window) => {
-                self.answers.shown(answer);
+                self.answers.shown(answer, taken);
                 window.new_frame();
             }
             None => answer.answer(RGFX_STATUS_OK),
