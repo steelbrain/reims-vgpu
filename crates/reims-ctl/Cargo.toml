@@ -1,7 +1,7 @@
-# reims-ctl: creates, boots and manages macOS VMs on QEMU's apple-gfx (README.md). It links
-# nothing of the library: it runs the QEMU that scripts/install-ctl.sh builds on it. Its own
-# workspace, so it builds without the rest of the tree (or the metal2vulkan the library's
-# workspace fetches).
+# reims-ctl: creates, boots and manages macOS VMs on QEMU with reims-vgpu (README.md). It links
+# nothing of the library: it runs the QEMU that scripts/install-ctl.sh builds on it, with the
+# option ROM and guest kexts it carries (src/prebuilt.rs). Its own workspace, so it builds
+# without the rest of the tree (or the metal2vulkan the library's workspace fetches).
 [package]
 name = "reims-ctl"
 version = "0.1.0"
@@ -27,6 +27,10 @@ ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.153"
 shlex = "2.0.1"
+toml = "1.1.2"
+
+[build-dependencies]
+# Reads guest/prebuilt/set.toml, the guest's kexts build.rs embeds.
 toml = "1.1.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]

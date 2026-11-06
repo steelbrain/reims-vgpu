@@ -1,12 +1,14 @@
 //! Making a VM: its directory, disks, firmware and `vm.toml`, then its registry entry.
 //!
 //! An x86-64 VM (`q35-x86_64`) boots OpenCore from an OpenCore image of its own, with its own
-//! OVMF code and variables: made for it by reims-util, or copies of an image given and the OVMF
-//! beside it ([`firmware_beside`]). Its disk is a new one or an existing one (copied, reflinked
-//! where the file system can, or used in place). A new disk needs an installer: one reims-util
-//! downloads from Apple (reims_util.rs), before the VM's directory is made, so a download
-//! stopped part way leaves no VM half made, or one given. An installer is used in place, except
-//! a DMG, which qemu-img converts to a raw image in the VM's directory ([`installer_media`]).
+//! OVMF code and variables: made for it by reims-util, holding the guest's kexts for
+//! reims-vgpu's own device where the VM is on it ([`reims_util::kext_args`]), or copies of an
+//! image given and the OVMF beside it ([`firmware_beside`]). Its disk is a new one or an
+//! existing one (copied, reflinked where the file system can, or used in place). A new disk
+//! needs an installer: one reims-util downloads from Apple (reims_util.rs), before the VM's
+//! directory is made, so a download stopped part way leaves no VM half made, or one given. An
+//! installer is used in place, except a DMG, which qemu-img converts to a raw image in the VM's
+//! directory ([`installer_media`]).
 //!
 //! An arm64 VM (`vmapple-arm64`) is one Virtualization.framework made: installed here from an
 //! IPSW (vz.rs), or imported from macosvm's or tart's directory (an APFS clone of its disk and
@@ -54,6 +56,8 @@ pub struct Spec {
     pub cpus: Option<u32>,
     pub memory_mib: Option<u64>,
     pub disk: Option<DiskSource>,
+    /// The graphics device; none for the profile's default ([`Graphics::default_for`]).
+    pub graphics: Option<Graphics>,
     pub display: Display,
     pub gpu: Gpu,
     pub logs: bool,
@@ -81,6 +85,7 @@ impl Spec {
             cpus: None,
             memory_mib: None,
             disk: None,
+            graphics: None,
             display: Display::default(),
             gpu: Gpu::default(),
             logs: false,
@@ -171,6 +176,23 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     if !Profile::supported_on(host).contains(&profile) {
         bail!("{host} cannot run {profile} VMs");
     }
+    let graphics = spec
+        .graphics
+        .unwrap_or_else(|| Graphics::default_for(profile));
+    if graphics == Graphics::ReimsVgpu {
+        if profile != Profile::Q35X86_64 {
+            bail!(
+                "reims-vgpu's own GPU device is for x86-64 VMs: an arm64 macOS guest drives only \
+                 apple-gfx"
+            );
+        }
+        let d = &spec.display;
+        check_reims_vgpu_display(Some(d.count), Some(&d.resolution), Some(d.hidpi), d.refresh)?;
+        // The image reims-util makes holds them.
+        if spec.opencore.is_none() {
+            crate::prebuilt::set()?;
+        }
+    }
     let dir = spec.dir.clone().unwrap_or_else(|| default_dir(&spec.name));
     // Checked here, before a download, and again as the directory is taken, after it (claim).
     if dir.exists() && std::fs::read_dir(&dir)?.next().is_some() {
@@ -222,7 +244,7 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     }
     let made = claim(&dir)?;
     let result = match profile {
-        Profile::Q35X86_64 => make_q35(&spec, host, &dir, macos.as_deref(), progress),
+        Profile::Q35X86_64 => make_q35(&spec, graphics, &dir, macos.as_deref(), progress),
         Profile::VmappleArm64 => make_vmapple(&spec, host, &dir, progress),
     };
     let vm = match result {
@@ -281,6 +303,7 @@ fn claim(dir: &Path) -> Result<bool> {
 }
 
 fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageFormat) -> VmConfig {
+    // Saved by name: an image made for the one it is on may not suit another.
     VmConfig {
         name: spec.name.clone(),
         profile,
@@ -290,7 +313,10 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
         disk_format,
         stop_timeout_secs: 90,
         extra_args: vec![],
-        graphics: Graphics::ReimsVgpu,
+        graphics: Some(
+            spec.graphics
+                .unwrap_or_else(|| Graphics::default_for(profile)),
+        ),
         video_acceleration: true,
         display: spec.display.clone(),
         gpu: spec.gpu.clone(),
@@ -368,7 +394,7 @@ fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
 
 fn make_q35(
     spec: &Spec,
-    _host: Host,
+    graphics: Graphics,
     dir: &Path,
     macos: Option<&str>,
     progress: &mut dyn FnMut(&str),
@@ -402,7 +428,8 @@ fn make_q35(
     let mac = spec.mac.clone().unwrap_or_else(random_mac);
     let (oc_name, oc_format) = match &spec.opencore {
         None => {
-            reims_util::opencore(&dir.join("opencore.qcow2"), &mac, macos, progress)?;
+            let kexts = reims_util::kext_args(graphics)?;
+            reims_util::opencore(&dir.join("opencore.qcow2"), &mac, macos, &kexts, progress)?;
             (PathBuf::from("opencore.qcow2"), ImageFormat::Qcow2)
         }
         Some(src) => {

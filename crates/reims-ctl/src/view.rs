@@ -210,7 +210,7 @@ impl Target {
             );
         }
         let device = match vm.config.profile {
-            // qemu.rs gives apple-gfx-pci, or vmware-svga, the id gfx.
+            // qemu.rs gives reims-graphics-pci, apple-gfx-pci or vmware-svga the id gfx.
             Profile::Q35X86_64 => Some(("gfx", display - 1)),
             Profile::VmappleArm64 if display == 1 => None,
             Profile::VmappleArm64 => {

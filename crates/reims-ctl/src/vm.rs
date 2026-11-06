@@ -30,9 +30,13 @@ pub struct VmConfig {
     pub stop_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Graphics::is_reims_vgpu")]
-    pub graphics: Graphics,
-    /// The host's video decode, encode and scaling for the guest, on reims-vgpu: the
+    /// The guest's graphics device ([`VmConfig::graphics`]). None, as settings saved before the
+    /// choice of three have it, is the profile's default ([`Graphics::default_for`]): an x86-64
+    /// VM saved then, which ran apple-gfx, runs reims-vgpu's own device now. Any other is saved
+    /// by name, apple-gfx too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphics: Option<Graphics>,
+    /// The host's video decode, encode and scaling for the guest, on apple-gfx: the
     /// VideoToolbox and M2 scaler devices (`qemu`'s module doc). Off, the VM has neither, and
     /// the guest does all three in software. On unless its settings say off.
     #[serde(default = "on", skip_serializing_if = "is_on")]
@@ -102,31 +106,51 @@ impl ImageFormat {
 }
 
 /// The guest's graphics device.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Graphics {
-    /// apple-gfx on the library: the guest's GPU, each display in a window of the library's.
-    #[default]
+    /// reims-vgpu's own GPU device, QEMU's `reims-graphics-pci`, on an x86-64 VM: the guest
+    /// drives it with reims-vgpu's kexts, which reims-ctl puts in the VM's OpenCore image
+    /// ([`crate::prebuilt`]), on one display in a window of the library's. The default on x86-64.
     ReimsVgpu,
+    /// apple-gfx on the library: the device Apple's paravirtualized graphics drivers drive,
+    /// each display in a window of the library's. The only device an arm64 VM has.
+    AppleGfx,
     /// QEMU's VMware SVGA II, on an x86-64 VM: one display, the firmware's framebuffer, with no
     /// GPU acceleration (macOS has no driver for the device), in QEMU's own window.
     VmwareSvga,
 }
 
 impl Graphics {
-    pub const ALL: [Graphics; 2] = [Graphics::ReimsVgpu, Graphics::VmwareSvga];
+    pub const ALL: [Graphics; 3] = [
+        Graphics::ReimsVgpu,
+        Graphics::AppleGfx,
+        Graphics::VmwareSvga,
+    ];
 
     pub fn id(self) -> &'static str {
         match self {
             Graphics::ReimsVgpu => "reims-vgpu",
+            Graphics::AppleGfx => "apple-gfx",
             Graphics::VmwareSvga => "vmware-svga",
         }
     }
 
-    pub fn describe(self) -> &'static str {
+    /// Its name, short, for `list`.
+    pub fn name(self) -> &'static str {
         match self {
             Graphics::ReimsVgpu => "reims-vgpu",
+            Graphics::AppleGfx => "apple-gfx",
             Graphics::VmwareSvga => "VMware SVGA",
+        }
+    }
+
+    /// Its name for the interface's choice and `show`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Graphics::ReimsVgpu => "reims-vgpu, its own GPU device and macOS drivers",
+            Graphics::AppleGfx => "apple-gfx, Apple's paravirtualized GPU",
+            Graphics::VmwareSvga => "VMware SVGA, no GPU acceleration",
         }
     }
 
@@ -134,12 +158,60 @@ impl Graphics {
         Graphics::ALL
             .into_iter()
             .find(|g| g.id() == s.trim())
-            .with_context(|| format!("graphics is reims-vgpu or vmware-svga, not {s:?}"))
+            .with_context(|| format!("graphics is reims-vgpu, apple-gfx or vmware-svga, not {s:?}"))
     }
 
-    fn is_reims_vgpu(&self) -> bool {
-        *self == Graphics::ReimsVgpu
+    /// The device a VM of `profile` has where its settings name none: reims-vgpu's own on
+    /// x86-64, apple-gfx, the only one, on arm64.
+    pub fn default_for(profile: Profile) -> Graphics {
+        match profile {
+            Profile::Q35X86_64 => Graphics::ReimsVgpu,
+            Profile::VmappleArm64 => Graphics::AppleGfx,
+        }
     }
+
+    /// Whether the library runs the device, and draws its displays in its windows.
+    pub fn library(self) -> bool {
+        self != Graphics::VmwareSvga
+    }
+}
+
+/// Refuses a display setting reims-vgpu's device does not honor, each given for a VM on it:
+/// the device has one display, whose window opens at 1920x1080 and keeps the size the person
+/// gives it, which the guest follows, at the refresh rate of the host screen it is on; the
+/// guest runs a HiDPI desktop of its own accord at a window at least 2880 pixels wide (the
+/// kext's EDID density). A refresh of 0 is none, as `set` takes it. Settings saved for
+/// apple-gfx are not given: they stay for it, and reims-vgpu leaves them aside.
+pub fn check_reims_vgpu_display(
+    count: Option<u32>,
+    resolution: Option<&str>,
+    hidpi: Option<bool>,
+    refresh: Option<u32>,
+) -> Result<()> {
+    const APPLE: &str = "choose apple-gfx (--graphics apple-gfx)";
+    if let Some(n) = count.filter(|&n| n != 1) {
+        bail!("reims-vgpu has one display, not {n}: for more, {APPLE}");
+    }
+    if let Some(r) = resolution.filter(|r| parse_resolution(r.trim()).ok() != Some((1920, 1080))) {
+        bail!(
+            "reims-vgpu's display follows its window, which opens at 1920x1080 and takes the size \
+             you give it: for {}, resize the window, or {APPLE}",
+            r.trim()
+        );
+    }
+    if hidpi == Some(true) {
+        bail!(
+            "on reims-vgpu the guest runs HiDPI of its own accord, in a window at least 2880 \
+             pixels wide: turn HiDPI off, or {APPLE}"
+        );
+    }
+    if let Some(r) = refresh.filter(|&r| r != 0) {
+        bail!(
+            "reims-vgpu's display runs at the host screen's refresh rate, not {r} Hz: leave the \
+             refresh rate empty, or {APPLE}"
+        );
+    }
+    Ok(())
 }
 
 /// The controller an x86-64 VM's system disk is on, which its settings choose.
@@ -473,11 +545,20 @@ impl VmConfig {
             check_env_name(k)?;
         }
         check_mac(&self.network.mac)?;
-        if self.graphics == Graphics::VmwareSvga && self.profile != Profile::Q35X86_64 {
-            bail!(
-                "{}: VMware SVGA is for x86-64 VMs: an arm64 macOS guest drives only apple-gfx",
-                self.name
-            );
+        if self.profile != Profile::Q35X86_64 {
+            match self.graphics() {
+                Graphics::AppleGfx => {}
+                Graphics::ReimsVgpu => bail!(
+                    "{}: reims-vgpu's own GPU device is for x86-64 VMs: an arm64 macOS guest \
+                     drives only apple-gfx (reims-ctl set {} --graphics apple-gfx)",
+                    self.name,
+                    self.name
+                ),
+                Graphics::VmwareSvga => bail!(
+                    "{}: VMware SVGA is for x86-64 VMs: an arm64 macOS guest drives only apple-gfx",
+                    self.name
+                ),
+            }
         }
         match self.profile {
             Profile::Q35X86_64 if self.q35.is_none() => bail!("{}: no [q35] settings", self.name),
@@ -496,11 +577,17 @@ impl VmConfig {
         stop_timeout(self.stop_timeout_secs)
     }
 
-    /// The displays the guest has: VMware SVGA's one, or apple-gfx's.
+    /// The guest's graphics device: the settings', else the profile's default.
+    pub fn graphics(&self) -> Graphics {
+        self.graphics
+            .unwrap_or_else(|| Graphics::default_for(self.profile))
+    }
+
+    /// The displays the guest has: apple-gfx's, or reims-vgpu's or VMware SVGA's one.
     pub fn display_count(&self) -> u32 {
-        match self.graphics {
-            Graphics::ReimsVgpu => self.display.count,
-            Graphics::VmwareSvga => 1,
+        match self.graphics() {
+            Graphics::AppleGfx => self.display.count,
+            Graphics::ReimsVgpu | Graphics::VmwareSvga => 1,
         }
     }
 }
@@ -1001,7 +1088,7 @@ mod tests {
             disk_format: ImageFormat::Qcow2,
             stop_timeout_secs: 90,
             extra_args: vec!["-boot".into(), "menu=on".into()],
-            graphics: Graphics::ReimsVgpu,
+            graphics: None,
             video_acceleration: true,
             display: Display::default(),
             gpu: Gpu {
@@ -1037,12 +1124,106 @@ mod tests {
         let mut c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
-        // A VM on reims-vgpu saves as it did before the choice existed.
-        assert!(!text.contains("graphics"), "{text}");
-        c.graphics = Graphics::VmwareSvga;
+        for g in Graphics::ALL {
+            c.graphics = Some(g);
+            let text = toml::to_string_pretty(&c).unwrap();
+            assert!(
+                text.contains(&format!("graphics = \"{}\"\n", g.id())),
+                "{text}"
+            );
+            assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+        }
+    }
+
+    /// A VM whose settings name no graphics, as every VM on apple-gfx saved before there were
+    /// three had them, runs its profile's default: reims-vgpu's own device on x86-64, apple-gfx
+    /// on arm64. One on apple-gfx is saved by name, so it stays there.
+    #[test]
+    fn a_vm_naming_no_graphics_runs_its_profiles_default() {
+        let mut c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
-        assert!(text.contains("graphics = \"vmware-svga\""), "{text}");
-        assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+        assert!(!text.contains("graphics"), "{text}");
+        let loaded = toml::from_str::<VmConfig>(&text).unwrap();
+        assert_eq!(loaded.graphics(), Graphics::ReimsVgpu);
+        assert_eq!(toml::to_string_pretty(&loaded).unwrap(), text);
+        c.graphics = Some(Graphics::AppleGfx);
+        let apple = toml::to_string_pretty(&c).unwrap();
+        assert!(apple.contains("graphics = \"apple-gfx\"\n"), "{apple}");
+        assert_eq!(
+            toml::from_str::<VmConfig>(&apple).unwrap().graphics(),
+            Graphics::AppleGfx
+        );
+        c.graphics = None;
+        c.profile = Profile::VmappleArm64;
+        assert_eq!(c.graphics(), Graphics::AppleGfx);
+        assert_eq!(
+            Graphics::default_for(Profile::Q35X86_64),
+            Graphics::ReimsVgpu
+        );
+    }
+
+    /// reims-vgpu's own device is an x86-64 VM's: an arm64 VM given it is refused, saying what
+    /// it runs instead.
+    #[test]
+    fn reims_vgpu_is_for_x86_64_vms() {
+        let mut c = x86_64_config();
+        c.graphics = Some(Graphics::ReimsVgpu);
+        assert!(c.check().is_ok());
+        c.profile = Profile::VmappleArm64;
+        c.q35 = None;
+        c.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1,
+        });
+        let e = format!("{:#}", c.check().unwrap_err());
+        assert!(e.contains("--graphics apple-gfx"), "{e}");
+        c.graphics = None;
+        assert!(c.check().is_ok());
+        assert_eq!(c.display_count(), 1);
+        c.display.count = 2;
+        assert_eq!(c.display_count(), 2);
+        for g in Graphics::ALL {
+            assert_eq!(Graphics::parse(g.id()).unwrap(), g);
+        }
+        assert!(Graphics::parse("vga").is_err());
+    }
+
+    /// reims-vgpu takes the display settings its device honors, given for it, and refuses the
+    /// rest, saying what to do instead.
+    #[test]
+    fn reims_vgpu_refuses_display_settings_it_does_not_honor() {
+        assert!(check_reims_vgpu_display(None, None, None, None).is_ok());
+        assert!(
+            check_reims_vgpu_display(Some(1), Some(" 1920x1080"), Some(false), Some(0)).is_ok()
+        );
+        for (refused, says) in [
+            (
+                check_reims_vgpu_display(Some(2), None, None, None),
+                "one display",
+            ),
+            (
+                check_reims_vgpu_display(None, Some("2560x1600"), None, None),
+                "for 2560x1600, resize the window",
+            ),
+            (
+                check_reims_vgpu_display(None, Some("host"), None, None),
+                "for host",
+            ),
+            (
+                check_reims_vgpu_display(None, None, Some(true), None),
+                "2880",
+            ),
+            (
+                check_reims_vgpu_display(None, None, None, Some(120)),
+                "not 120 Hz",
+            ),
+        ] {
+            let e = format!("{:#}", refused.unwrap_err());
+            assert!(
+                e.contains(says) && e.contains("--graphics apple-gfx"),
+                "{e}"
+            );
+        }
     }
 
     /// A VM whose settings name no controller has its disk on SATA, and one on SATA saves
@@ -1103,7 +1284,7 @@ mod tests {
     fn vmware_svga_is_an_x86_64_vms_one_display() {
         let mut c = x86_64_config();
         c.display.count = 2;
-        c.graphics = Graphics::parse("vmware-svga").unwrap();
+        c.graphics = Some(Graphics::parse("vmware-svga").unwrap());
         assert!(c.check().is_ok());
         assert_eq!(c.display_count(), 1);
         c.profile = Profile::VmappleArm64;
@@ -1113,10 +1294,9 @@ mod tests {
             ecid: 1,
         });
         assert!(c.check().is_err());
-        c.graphics = Graphics::ReimsVgpu;
+        c.graphics = Some(Graphics::AppleGfx);
         assert!(c.check().is_ok());
         assert_eq!(c.display_count(), 2);
-        assert!(Graphics::parse("vga").is_err());
     }
 
     #[test]

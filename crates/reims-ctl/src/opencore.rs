@@ -2,17 +2,21 @@
 //!
 //! reims-util makes a VM's image when the VM is made (reims_util.rs). A newer reims-util's
 //! image can carry what an older one's lacks, such as Lilu and ReimsVgpu.kext, which on macOS
-//! 26 let WindowServer run a display wider than 2048 pixels and Chrome draw on the GPU
-//! (docs/qemu.md, "x86-64 macOS guests: displays wider than 2048 pixels"). [`renew`] replaces a
-//! VM's image with one the installed reims-util makes, presenting the same Mac, so macOS sees
-//! no new machine. reims-ctl keeps no copy of that identity: it is read from the old image's
+//! 26 let WindowServer run a display wider than 2048 pixels on apple-gfx and Chrome draw on the
+//! GPU (docs/qemu.md, "x86-64 macOS guests: displays wider than 2048 pixels"); and a VM on
+//! reims-vgpu's own GPU device needs the guest's kexts this reims-ctl carries
+//! ([`crate::prebuilt`]), which an image made for apple-gfx, or by an older reims-ctl, lacks or
+//! holds other builds of ([`missing_guest_kexts`]). [`renew`] replaces a VM's image with one the
+//! installed reims-util makes for the VM's graphics, presenting the same Mac, so macOS sees no
+//! new machine. reims-ctl keeps no copy of that identity: it is read from the old image's
 //! config.plist.
 //!
 //! An image is read as reims-util writes it: qcow2 (or raw), a GPT, and a FAT32 EFI system
 //! partition holding EFI/OC/config.plist.
 
-use crate::vm::{ImageFormat, Vm};
-use crate::{paths, reims_util, runtime};
+use crate::prebuilt::Kext;
+use crate::vm::{Graphics, ImageFormat, Vm};
+use crate::{paths, prebuilt, reims_util, runtime};
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -35,9 +39,7 @@ pub struct Config(plist::Dictionary);
 
 impl Config {
     pub fn read(path: &Path, format: ImageFormat) -> Result<Config> {
-        let disk = Disk::open(path, format)?;
-        let bytes = Fat32::open(&disk, esp_start(&disk)?)?
-            .read_file("EFI/OC/config.plist")?
+        let bytes = read_file(path, format, "EFI/OC/config.plist")?
             .context("its EFI system partition has no EFI/OC/config.plist")?;
         Config::parse(&bytes)
     }
@@ -79,8 +81,9 @@ impl Config {
         })
     }
 
-    /// Whether OpenCore loads ReimsVgpu.kext: an enabled entry of Kernel > Add names it.
-    pub fn loads_reims_vgpu(&self) -> bool {
+    /// The kexts OpenCore loads, in its order: the bundle each enabled entry of Kernel > Add
+    /// names (its BundlePath, under EFI/OC/Kexts).
+    pub fn loaded_kexts(&self) -> Vec<&str> {
         self.0
             .get("Kernel")
             .and_then(plist::Value::as_dictionary)
@@ -89,10 +92,14 @@ impl Config {
             .into_iter()
             .flatten()
             .filter_map(plist::Value::as_dictionary)
-            .any(|e| {
-                e.get("BundlePath").and_then(plist::Value::as_string) == Some("ReimsVgpu.kext")
-                    && e.get("Enabled").and_then(plist::Value::as_boolean) == Some(true)
-            })
+            .filter(|e| e.get("Enabled").and_then(plist::Value::as_boolean) == Some(true))
+            .filter_map(|e| e.get("BundlePath").and_then(plist::Value::as_string))
+            .collect()
+    }
+
+    /// Whether OpenCore loads ReimsVgpu.kext: an enabled entry of Kernel > Add names it.
+    pub fn loads_reims_vgpu(&self) -> bool {
+        self.loaded_kexts().contains(&"ReimsVgpu.kext")
     }
 
     /// Whether OpenCore shows its boot picker at each start: Misc > Boot > ShowPicker. Hidden,
@@ -134,12 +141,98 @@ pub fn missing_kext(vm: &Vm) -> Option<String> {
     })
 }
 
+/// How an image holds the guest's kexts for reims-vgpu's own device.
+#[derive(Debug, PartialEq)]
+enum GuestKexts {
+    /// Each, in the set's order, with the executable reims-ctl carries.
+    Held,
+    /// Not these, which it does not load.
+    Lacks(Vec<&'static str>),
+    /// Each, but these are other builds than reims-ctl's, or out of the set's order.
+    Other(Vec<&'static str>),
+}
+
+/// How an image whose OpenCore loads `loaded`, in its order, holds `set`; `executable` reads a
+/// kext's executable from it, which is compared where the kext has one.
+fn guest_kexts(
+    set: &'static [Kext],
+    loaded: &[&str],
+    executable: &mut dyn FnMut(&Kext) -> Option<Vec<u8>>,
+) -> GuestKexts {
+    let at = |k: &Kext| loaded.iter().position(|b| b.eq_ignore_ascii_case(k.bundle));
+    let lacks: Vec<_> = set
+        .iter()
+        .filter(|k| at(k).is_none())
+        .map(|k| k.bundle)
+        .collect();
+    if !lacks.is_empty() {
+        return GuestKexts::Lacks(lacks);
+    }
+    let mut last = None;
+    let other: Vec<_> = set
+        .iter()
+        .filter(|k| {
+            let i = at(k);
+            let in_order = last < i;
+            last = i;
+            let other_build =
+                k.executable.is_some() && executable(k).as_deref() != k.executable_bytes();
+            !in_order || other_build
+        })
+        .map(|k| k.bundle)
+        .collect();
+    if other.is_empty() {
+        GuestKexts::Held
+    } else {
+        GuestKexts::Other(other)
+    }
+}
+
+/// What to tell of a VM on reims-vgpu's own GPU device whose OpenCore image lacks the guest's
+/// kexts this reims-ctl carries, or holds other builds of them; None where it holds them, the VM
+/// is on another device, or the image cannot be read.
+pub fn missing_guest_kexts(vm: &Vm) -> Option<String> {
+    if vm.config.graphics() != Graphics::ReimsVgpu {
+        return None;
+    }
+    let q = vm.config.q35.as_ref()?;
+    let image = vm.path(&q.opencore);
+    let config = Config::read(&image, q.opencore_format).ok()?;
+    let set = match prebuilt::set() {
+        Ok(s) => s,
+        Err(e) => return Some(format!("{e:#}")),
+    };
+    let mut executable = |k: &Kext| {
+        let file = format!("EFI/OC/Kexts/{}/{}", k.bundle, k.executable?);
+        read_file(&image, q.opencore_format, &file).ok()?
+    };
+    let fix = format!(
+        "To make it a new image that has this reims-ctl's, presenting the same Mac, press U in \
+         reims-ctl or run reims-ctl update-opencore {}.",
+        vm.name()
+    );
+    match guest_kexts(set, &config.loaded_kexts(), &mut executable) {
+        GuestKexts::Held => None,
+        GuestKexts::Lacks(b) => Some(format!(
+            "Its OpenCore image lacks reims-vgpu's macOS drivers ({}), without which macOS has \
+             no driver for its GPU device. {fix}",
+            b.join(", ")
+        )),
+        GuestKexts::Other(b) => Some(format!(
+            "Its OpenCore image holds other builds of reims-vgpu's macOS drivers ({}) than this \
+             reims-ctl carries, which may not drive its GPU device. {fix}",
+            b.join(", ")
+        )),
+    }
+}
+
 /// Replaces a stopped VM's OpenCore image with one the installed reims-util makes, presenting
 /// the same Mac, with its boot picker shown where `show_picker` says, or as the old image shows
 /// it when `None`. The new image is made beside the old one, which stays as it was if that fails.
-/// The VM keeps its OVMF: its variables hold its boot entries. The image is set in the VM's
-/// settings as they are once it is made, which `vm` becomes: others may be saved meanwhile.
-/// Returns what happened.
+/// It holds the kexts for the VM's graphics ([`reims_util::kext_args`]): on reims-vgpu's own
+/// device, the guest's that this reims-ctl carries. The VM keeps its OVMF: its variables hold
+/// its boot entries. The image is set in the VM's settings as they are once it is made, which
+/// `vm` becomes: others may be saved meanwhile. Returns what happened.
 pub fn renew(
     vm: &mut Vm,
     show_picker: Option<bool>,
@@ -161,7 +254,8 @@ pub fn renew(
     let picker = show_picker.unwrap_or_else(|| config.shows_picker());
     let image = vm.dir.join("opencore.qcow2");
     let new = vm.dir.join("opencore.new.qcow2");
-    let made = reims_util::opencore_as(&new, &id, picker, progress).and_then(|()| {
+    let kexts = reims_util::kext_args(vm.config.graphics())?;
+    let made = reims_util::opencore_as(&new, &id, picker, &kexts, progress).and_then(|()| {
         // reims-util hides the picker unless --show-picker asks for it; an older one shows it.
         ensure!(
             !Config::read(&new, ImageFormat::Qcow2).is_ok_and(|c| c.shows_picker() != picker),
@@ -205,6 +299,11 @@ pub fn renew(
             "; the installed reims-util put no ReimsVgpu.kext in it: run reims-ctl update, \
              which installs the reims-util it needs, and make it again",
         );
+    } else if missing_guest_kexts(vm).is_some() {
+        s.push_str(
+            "; the installed reims-util did not put reims-vgpu's macOS drivers in it as given: \
+             run reims-ctl update, which installs the reims-util it needs, and make it again",
+        );
     }
     Ok(s)
 }
@@ -215,6 +314,13 @@ pub fn renew(
 fn entry(p: &Path) -> Option<std::path::PathBuf> {
     let name = p.file_name()?;
     Some(std::fs::canonicalize(p.parent()?).ok()?.join(name))
+}
+
+/// The file at `path` (as [`Fat32::read_file`] takes it) on the EFI system partition of the
+/// image at `image`; None where there is none.
+fn read_file(image: &Path, format: ImageFormat, path: &str) -> Result<Option<Vec<u8>>> {
+    let disk = Disk::open(image, format)?;
+    Fat32::open(&disk, esp_start(&disk)?)?.read_file(path)
 }
 
 const SECTOR: u64 = 512;
@@ -757,6 +863,118 @@ mod tests {
             dir.join("opencore.qcow2").is_file(),
             "the new image was deleted"
         );
+    }
+
+    /// The image of a VM is made for its graphics: on reims-vgpu with the guest's kexts the
+    /// tests carry, in their order, written to the data directory; on apple-gfx with none.
+    #[test]
+    fn renew_makes_the_image_for_the_vms_graphics() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = crate::testenv::Env::new("renew-graphics");
+        let dir = env.root.join("vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let made = env.root.join("made.img");
+        std::fs::write(&made, image(plist("").as_bytes())).unwrap();
+        std::fs::copy(&made, dir.join("opencore.img")).unwrap();
+        let args = env.root.join("args");
+        let util = env.root.join("reims-util");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\n\
+             while [ \"$1\" != -o ]; do shift; done\ncp '{made}' \"$2\"\n\
+             echo '{{\"event\":\"done\",\"result\":{{\"kexts\":[]}}}}'\n",
+            args = args.display(),
+            made = made.display(),
+        );
+        std::fs::write(&util, script).unwrap();
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set("REIMS_CTL_UTIL", &util);
+        let config = |graphics: &str| {
+            format!(
+                r#"
+                name = "t"
+                profile = "q35-x86_64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "disk.qcow2"
+                {graphics}
+                [q35]
+                opencore = "opencore.img"
+                opencore_format = "raw"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
+                "#
+            )
+        };
+        std::fs::write(dir.join(crate::vm::CONFIG_FILE), config("")).unwrap();
+        let mut vm = Vm::load(&dir).unwrap();
+        renew(&mut vm, None, &mut |_| {}).unwrap();
+        let given = std::fs::read_to_string(&args).unwrap();
+        let given: Vec<&str> = given.lines().collect();
+        let added: Vec<&str> = given
+            .windows(2)
+            .filter(|w| w[0] == "--add-kext")
+            .map(|w| w[1])
+            .collect();
+        let kexts = env.root.join("data/prebuilt");
+        assert_eq!(added.len(), 2, "{given:?}");
+        assert!(
+            added[0].starts_with(kexts.to_str().unwrap())
+                && added[0].ends_with("/A.kext,25.4.0,25.99.99"),
+            "{added:?}"
+        );
+        assert!(added[1].ends_with("/B.kext"), "{added:?}");
+        let a = added[0].split(',').next().unwrap();
+        assert!(Path::new(a).join("Contents/MacOS/A").is_file());
+        assert!(
+            !given
+                .iter()
+                .any(|a| ["--no-kexts", "--no-apv-arm64-port", "--no-video"].contains(a)),
+            "{given:?}"
+        );
+        std::fs::copy(&made, dir.join("opencore.img")).unwrap();
+        std::fs::write(
+            dir.join(crate::vm::CONFIG_FILE),
+            config("graphics = \"apple-gfx\""),
+        )
+        .unwrap();
+        let mut vm = Vm::load(&dir).unwrap();
+        renew(&mut vm, None, &mut |_| {}).unwrap();
+        let given = std::fs::read_to_string(&args).unwrap();
+        assert!(!given.contains("--add-kext"), "{given}");
+    }
+
+    /// An image holds the guest's kexts where OpenCore loads each, in the set's order, with
+    /// the executable reims-ctl carries; one it does not load is lacking, and one out of order
+    /// or of another build is another.
+    #[test]
+    fn an_image_holds_the_guest_kexts_loaded_in_order_as_carried() {
+        let set = crate::prebuilt::set().unwrap();
+        let ours = |k: &Kext| k.executable_bytes().map(<[u8]>::to_vec);
+        let held = guest_kexts(
+            set,
+            &["Lilu.kext", "ReimsVgpu.kext", "a.KEXT", "B.kext"],
+            &mut |k| ours(k),
+        );
+        assert_eq!(held, GuestKexts::Held);
+        assert_eq!(
+            guest_kexts(set, &["Lilu.kext", "B.kext"], &mut |k| ours(k)),
+            GuestKexts::Lacks(vec!["A.kext"])
+        );
+        assert_eq!(
+            guest_kexts(set, &["B.kext", "A.kext"], &mut |k| ours(k)),
+            GuestKexts::Other(vec!["B.kext"])
+        );
+        assert_eq!(
+            guest_kexts(set, &["A.kext", "B.kext"], &mut |_| Some(b"older".to_vec())),
+            GuestKexts::Other(vec!["A.kext"])
+        );
+        assert_eq!(
+            guest_kexts(set, &["A.kext", "B.kext"], &mut |_| None),
+            GuestKexts::Other(vec!["A.kext"])
+        );
+        let entries = "<dict><key>BundlePath</key><string>A.kext</string><key>Enabled</key><true/></dict>\
+             <dict><key>BundlePath</key><string>B.kext</string><key>Enabled</key><false/></dict>";
+        assert_eq!(config(entries).loaded_kexts(), ["A.kext"]);
     }
 
     #[test]

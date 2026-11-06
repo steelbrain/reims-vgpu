@@ -1,9 +1,11 @@
 //! reims-util (<https://github.com/steelbrain/reims-util>) makes what a new x86-64 VM boots from:
 //! an OpenCore image, with OVMF's code and variables beside it, and a macOS installer, downloaded
 //! from Apple and checked against Apple's chunklists. It also makes an existing VM a new OpenCore
-//! image presenting the same Mac (opencore.rs). reims-ctl runs it with `--json`: each line
-//! on its stdout is an event, `step`, `progress` or `note`, and the last is `done`, with what it
-//! made, or `error`.
+//! image presenting the same Mac (opencore.rs). An image holds Lilu and ReimsVgpu.kext, which
+//! reims-util adds itself, and, for a VM on reims-vgpu's own device, the guest's kexts reims-ctl
+//! carries, each given by `--add-kext` in the set's order ([`kext_args`]). reims-ctl runs it
+//! with `--json`: each line on its stdout is an event, `step`, `progress` or `note`, and the last
+//! is `done`, with what it made, or `error`.
 //!
 //! It is installed beside reims-ctl, at [`REV`], by `cargo install` from its repository
 //! ([`install`]). `reims-ctl __record-install`, which scripts/install-ctl.sh runs last, installs
@@ -26,6 +28,8 @@
 
 use crate::opencore::Identity;
 use crate::paths;
+use crate::prebuilt::{self, Kext};
+use crate::vm::Graphics;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::ffi::OsStr;
@@ -36,7 +40,7 @@ use std::time::{Duration, Instant};
 
 pub const REPO: &str = "https://github.com/steelbrain/reims-util";
 /// The commit [`install`] installs.
-pub const REV: &str = "ed7398997f83f9d004477e6eab8eaf46a462a47a";
+pub const REV: &str = "fe9bfe1a622ae1be8d254effa74b5354bd098e43";
 
 /// The reims-util binary: `REIMS_CTL_UTIL`, else the one beside reims-ctl, where both are
 /// installed, else the first on PATH.
@@ -227,29 +231,71 @@ struct Smbios {
     serial: String,
 }
 
+/// The arguments that add kexts to the OpenCore image of a VM on `graphics`, beyond Lilu and
+/// ReimsVgpu.kext, which reims-util adds itself: on reims-vgpu's own device, each of the guest's
+/// kexts ([`prebuilt::guest_kexts`], written to the data directory first), in the set's order,
+/// which is the order OpenCore loads them in; none on another.
+pub fn kext_args(graphics: Graphics) -> Result<Vec<String>> {
+    if graphics != Graphics::ReimsVgpu {
+        return Ok(Vec::new());
+    }
+    add_kexts(prebuilt::set()?, &prebuilt::guest_kexts()?)
+}
+
+/// `--add-kext PATH[,MIN[,MAX]]` for each of `set`, at `bundles`: its bundle's path, then the
+/// Darwin versions it loads on, as reims-util takes them. A bound only of the newest is given
+/// with the oldest, 0.0.0, before it.
+fn add_kexts(set: &[Kext], bundles: &[PathBuf]) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    for (k, b) in set.iter().zip(bundles) {
+        let mut v = b
+            .to_str()
+            .filter(|p| !p.contains(','))
+            .with_context(|| {
+                format!(
+                    "{} is not a path reims-util's --add-kext takes (UTF-8, with no ','): set \
+                     XDG_DATA_HOME to a directory whose path is",
+                    b.display()
+                )
+            })?
+            .to_string();
+        match (k.min_kernel, k.max_kernel) {
+            (None, None) => {}
+            (Some(min), None) => v.push_str(&format!(",{min}")),
+            (min, Some(max)) => v.push_str(&format!(",{},{max}", min.unwrap_or("0.0.0"))),
+        }
+        args.extend(["--add-kext".to_string(), v]);
+    }
+    Ok(args)
+}
+
 /// Makes an OpenCore image at `image`, with `OVMF_CODE.fd` and `OVMF_VARS.fd` beside it, for a VM
 /// whose network card is `mac`, which becomes its ROM, as a Mac's ROM is its first network
-/// card's address, and which installs macOS `version` where it is known.
+/// card's address, and which installs macOS `version` where it is known; `kexts` adds kexts
+/// ([`kext_args`]).
 pub fn opencore(
     image: &Path,
     mac: &str,
     version: Option<&str>,
+    kexts: &[String],
     progress: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let mut args = vec!["--rom", mac];
     if let Some(m) = version.and_then(model_for) {
         args.extend(["--model", m]);
     }
+    args.extend(kexts.iter().map(String::as_str));
     make_opencore(image, &args, progress)
 }
 
 /// Makes an OpenCore image at `image` presenting the Mac `id`, for a VM that has its OVMF: no
 /// OVMF is written. `show_picker` shows OpenCore's boot picker at each start, which reims-util
-/// hides by default.
+/// hides by default; `kexts` adds kexts ([`kext_args`]).
 pub fn opencore_as(
     image: &Path,
     id: &Identity,
     show_picker: bool,
+    kexts: &[String],
     progress: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let mut args = vec![
@@ -268,6 +314,7 @@ pub fn opencore_as(
     if show_picker {
         args.push("--show-picker");
     }
+    args.extend(kexts.iter().map(String::as_str));
     make_opencore(image, &args, progress)
 }
 
@@ -489,6 +536,63 @@ mod tests {
         assert!(list[0].has_offline());
         assert_eq!(list[1].number(), "10.15");
         assert!(!list[1].has_offline());
+    }
+
+    /// Each kext of the set is added in its order, by its bundle's path and its bounds; a path
+    /// reims-util would read past is refused.
+    #[test]
+    fn kexts_are_added_in_the_sets_order_with_their_bounds() {
+        static SET: &[Kext] = &[
+            Kext {
+                bundle: "A.kext",
+                executable: None,
+                min_kernel: Some("25.4.0"),
+                max_kernel: Some("25.99.99"),
+                files: &[],
+            },
+            Kext {
+                bundle: "B.kext",
+                executable: None,
+                min_kernel: None,
+                max_kernel: Some("25.99.99"),
+                files: &[],
+            },
+            Kext {
+                bundle: "C.kext",
+                executable: None,
+                min_kernel: Some("25.4.0"),
+                max_kernel: None,
+                files: &[],
+            },
+            Kext {
+                bundle: "D.kext",
+                executable: None,
+                min_kernel: None,
+                max_kernel: None,
+                files: &[],
+            },
+        ];
+        let at: Vec<PathBuf> = ["A", "B", "C", "D"]
+            .iter()
+            .map(|n| PathBuf::from(format!("/d/kexts-1/{n}.kext")))
+            .collect();
+        assert_eq!(
+            add_kexts(SET, &at).unwrap(),
+            [
+                "--add-kext",
+                "/d/kexts-1/A.kext,25.4.0,25.99.99",
+                "--add-kext",
+                "/d/kexts-1/B.kext,0.0.0,25.99.99",
+                "--add-kext",
+                "/d/kexts-1/C.kext,25.4.0",
+                "--add-kext",
+                "/d/kexts-1/D.kext",
+            ]
+        );
+        let comma = vec![PathBuf::from("/d,e/A.kext")];
+        assert!(add_kexts(&SET[..1], &comma).is_err());
+        assert!(kext_args(Graphics::AppleGfx).unwrap().is_empty());
+        assert!(kext_args(Graphics::VmwareSvga).unwrap().is_empty());
     }
 
     #[test]

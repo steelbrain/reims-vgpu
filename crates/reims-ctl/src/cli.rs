@@ -161,14 +161,17 @@ Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl
 buttons on the top row hold that key for the next key or click.";
 
 const UPDATE_OPENCORE_HELP: &str = "\
-An image an older reims-util made lacks what a newer one's carries, such as ReimsVgpu.kext, which \
-macOS 26 needs for a display wider than 2048 pixels and for GPU-accelerated Chrome. The new image \
-presents the same Mac (its model, serial number, MLB, UUID and ROM, read from the old image's \
-config.plist), so macOS sees no new machine, and the VM keeps its OVMF variables, which hold its \
-boot entries. Its boot selection, OpenCore's picker, is carried over unless --boot-selection \
-gives it; hidden, OpenCore boots macOS's startup disk at once. Whatever else was changed in the \
-old image is not carried over. The VM must be stopped; reims-ctl update installs the reims-util \
-this reims-ctl needs.";
+The new image is made for the VM's graphics. On reims-vgpu it holds the macOS drivers of \
+reims-vgpu's own GPU device that this reims-ctl carries, which an image made for apple-gfx, or by \
+an older reims-ctl, lacks or holds other builds of: make it again after a change of graphics or an \
+update of reims-ctl, as reims-ctl start warns. An image an older reims-util made also lacks what a \
+newer one's carries, such as ReimsVgpu.kext, which macOS 26 needs on apple-gfx for a display wider \
+than 2048 pixels and for GPU-accelerated Chrome. The new image presents the same Mac (its model, \
+serial number, MLB, UUID and ROM, read from the old image's config.plist), so macOS sees no new \
+machine, and the VM keeps its OVMF variables, which hold its boot entries. Its boot selection, \
+OpenCore's picker, is carried over unless --boot-selection gives it; hidden, OpenCore boots \
+macOS's startup disk at once. Whatever else was changed in the old image is not carried over. The \
+VM must be stopped; reims-ctl update installs the reims-util this reims-ctl needs.";
 
 /// `--flag`, `--flag=true`, `--flag false`.
 fn bool_arg() -> clap::Arg {
@@ -272,19 +275,25 @@ pub struct CreateArgs {
     /// arm64: the machine identifier's ECID, where the bundle does not hold it
     #[arg(long)]
     pub ecid: Option<u64>,
-    /// Displays, 1 to 8, each in a window of its own
+    /// x86-64: reims-vgpu (the default), apple-gfx or vmware-svga (see reims-ctl set --help);
+    /// arm64 VMs have apple-gfx alone
+    #[arg(long)]
+    pub graphics: Option<String>,
+    /// apple-gfx: displays, 1 to 8, each in a window of its own (reims-vgpu has one)
     #[arg(long)]
     pub displays: Option<u32>,
-    /// The guest's first mode: WIDTHxHEIGHT, or host for the host screen's modes
+    /// apple-gfx: the guest's first mode: WIDTHxHEIGHT, or host for the host screen's modes
+    /// (reims-vgpu's display follows its window, which opens at 1920x1080)
     #[arg(long)]
     pub resolution: Option<String>,
-    /// Run the mode HiDPI (3840x2160 looks like 1920x1080)
+    /// apple-gfx: run the mode HiDPI (3840x2160 looks like 1920x1080); on reims-vgpu the guest
+    /// runs HiDPI of its own accord in a window at least 2880 pixels wide
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub hidpi: Option<bool>,
     /// Borderless windows that fill their screens
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub borderless: Option<bool>,
-    /// The refresh rate offered to the guest
+    /// apple-gfx: the refresh rate offered to the guest (reims-vgpu's is the host screen's)
     #[arg(long)]
     pub refresh: Option<u32>,
     /// The GPU (Linux): auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
@@ -313,8 +322,12 @@ pub struct SetArgs {
     /// RAM, such as 8G
     #[arg(long)]
     pub memory: Option<String>,
-    /// x86-64: reims-vgpu, or vmware-svga for QEMU's VMware SVGA: one display with no GPU
-    /// acceleration, in QEMU's own window
+    /// x86-64: reims-vgpu (the default), its own GPU device, which the guest drives with the
+    /// kexts reims-ctl puts in its OpenCore image (after a change to it, run update-opencore),
+    /// on one display in a window whose size the guest follows; apple-gfx, Apple's
+    /// paravirtualized GPU, the only one of arm64 VMs, with up to 8 displays and the host's video
+    /// hardware; or vmware-svga, QEMU's VMware SVGA: one display with no GPU acceleration, in
+    /// QEMU's own window
     #[arg(long)]
     pub graphics: Option<String>,
     /// x86-64: the system disk's controller: ahci (SATA), or nvme once macOS is installed (an
@@ -322,22 +335,26 @@ pub struct SetArgs {
     /// move, or OpenCore may start it
     #[arg(long)]
     pub disk_controller: Option<String>,
+    /// apple-gfx: 1 to 8 (reims-vgpu has one)
     #[arg(long)]
     pub displays: Option<u32>,
-    /// WIDTHxHEIGHT, or host
+    /// apple-gfx: WIDTHxHEIGHT, or host (reims-vgpu's display follows its window)
     #[arg(long)]
     pub resolution: Option<String>,
+    /// apple-gfx (on reims-vgpu the guest runs HiDPI of its own accord, in a window at least
+    /// 2880 pixels wide)
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub hidpi: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub borderless: Option<bool>,
-    /// The refresh rate offered to the guest; 0 for the host screen's
+    /// apple-gfx: the refresh rate offered to the guest; 0 for the host screen's, reims-vgpu's
+    /// alone
     #[arg(long)]
     pub refresh: Option<u32>,
     /// auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
     #[arg(long)]
     pub gpu: Option<String>,
-    /// On reims-vgpu: the host's hardware video decode, encode and scaling for the guest. Off,
+    /// On apple-gfx: the host's hardware video decode, encode and scaling for the guest. Off,
     /// the guest does them in software
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub video_acceleration: Option<bool>,
@@ -521,8 +538,8 @@ pub fn main(cli: Cli) -> Result<i32> {
 }
 
 pub fn script_comment(vm: &Vm) -> String {
-    let screen = match vm.config.graphics {
-        vm::Graphics::ReimsVgpu => "Its window opens under -display none",
+    let screen = match vm.config.graphics() {
+        vm::Graphics::ReimsVgpu | vm::Graphics::AppleGfx => "Its window opens under -display none",
         vm::Graphics::VmwareSvga if crate::host::has_screen(&vm.config.extra_env) => {
             "Its window is QEMU's own, under -display gtk"
         }
@@ -577,11 +594,11 @@ fn list(json: bool) -> Result<()> {
                     state,
                     c.cpus,
                     format_mib(c.memory_mib),
-                    match c.graphics {
-                        vm::Graphics::ReimsVgpu => {
+                    match c.graphics() {
+                        vm::Graphics::AppleGfx => {
                             format!("{}x {}", c.display.count, c.display.resolution)
                         }
-                        g => g.describe().into(),
+                        g => g.name().into(),
                     },
                     paths::tilde(&e.dir)
                 );
@@ -678,6 +695,7 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
     s.bundle = abs(&a.bundle);
     s.bundle_mode = ImportMode::parse(&a.bundle_mode)?;
     s.ecid = a.ecid;
+    s.graphics = a.graphics.as_deref().map(vm::Graphics::parse).transpose()?;
     if let Some(n) = a.displays {
         s.display.count = n;
     }
@@ -844,14 +862,30 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
     if let Some(r) = c.display.refresh {
         disp.push_str(&format!(", {r} Hz"));
     }
-    match c.graphics {
-        vm::Graphics::ReimsVgpu => add("displays", disp),
+    let graphics = c.graphics();
+    match graphics {
         vm::Graphics::VmwareSvga => add(
             "graphics",
             "VMware SVGA, no GPU acceleration, in QEMU's window".into(),
         ),
+        g => add("graphics", g.describe().into()),
     }
-    if c.graphics == vm::Graphics::ReimsVgpu && c.profile.gpu_choice(host) {
+    // reims-vgpu's one display follows its window (vm::check_reims_vgpu_display): of the
+    // settings, only borderless reaches it.
+    match graphics {
+        vm::Graphics::AppleGfx => add("displays", disp),
+        vm::Graphics::ReimsVgpu => add(
+            "display",
+            if c.display.borderless {
+                "one, filling its screen, borderless"
+            } else {
+                "one, in a window whose size the guest follows"
+            }
+            .into(),
+        ),
+        vm::Graphics::VmwareSvga => {}
+    }
+    if graphics.library() && c.profile.gpu_choice(host) {
         add(
             "gpu",
             match (&c.gpu.name, &c.gpu.driver_file) {
@@ -861,7 +895,7 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             },
         );
     }
-    if c.graphics == vm::Graphics::ReimsVgpu {
+    if graphics == vm::Graphics::AppleGfx {
         add(
             "video",
             if c.video_acceleration {
@@ -1024,7 +1058,7 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
         c.memory_mib = parse_size_mib(m)?;
     }
     if let Some(g) = &a.graphics {
-        c.graphics = vm::Graphics::parse(g)?;
+        c.graphics = Some(vm::Graphics::parse(g)?);
     }
     if let Some(d) = &a.disk_controller {
         let d = vm::DiskController::parse(d)?;
@@ -1047,6 +1081,10 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     }
     if let Some(r) = a.refresh {
         c.display.refresh = (r != 0).then_some(r);
+    }
+    if c.graphics() == vm::Graphics::ReimsVgpu {
+        vm::check_reims_vgpu_display(a.displays, a.resolution.as_deref(), a.hidpi, a.refresh)
+            .with_context(|| c.name.clone())?;
     }
     if let Some(g) = &a.gpu {
         c.gpu = resolve_gpu(g)?;
@@ -1098,6 +1136,12 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
         ""
     };
     println!("{}: saved{note}", vm.name());
+    // A change to reims-vgpu wants the guest's kexts in its image.
+    if a.graphics.is_some()
+        && let Some(w) = opencore::missing_guest_kexts(&vm)
+    {
+        println!("{}: {w}", vm.name());
+    }
     show(&vm, host);
     Ok(())
 }

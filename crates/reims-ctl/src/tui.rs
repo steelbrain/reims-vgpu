@@ -1073,13 +1073,16 @@ impl App {
         self.overlay = Some(Overlay::Confirm {
             title: format!("Make {name} a new OpenCore image?"),
             body: format!(
-                "reims-util makes it a new OpenCore image, with what it carries now, such as \
-                 ReimsVgpu.kext, which macOS 26 needs for a display wider than 2048 pixels and for \
-                 GPU-accelerated Chrome. It presents the same Mac, a {} with serial {}, and the VM \
-                 keeps its OVMF variables, which hold its boot entries, and its boot selection \
-                 (e changes it).\n\nThe image it replaces is deleted, with anything else changed \
-                 in it.",
-                id.model, id.serial
+                "reims-util makes it a new OpenCore image for its graphics, {}, with what it \
+                 carries now, such as ReimsVgpu.kext, which macOS 26 needs for a display wider \
+                 than 2048 pixels and for GPU-accelerated Chrome on apple-gfx, and on reims-vgpu \
+                 the macOS drivers of its GPU device that this reims-ctl carries. It presents the \
+                 same Mac, a {} with serial {}, and the VM keeps its OVMF variables, which hold \
+                 its boot entries, and its boot selection (e changes it).\n\nThe image it \
+                 replaces is deleted, with anything else changed in it.",
+                vm.config.graphics().id(),
+                id.model,
+                id.serial
             ),
             options: vec![
                 ("Cancel", Action::None),
@@ -1399,8 +1402,14 @@ impl App {
                 ),
             ),
         ]);
+        if profile == Profile::Q35X86_64 {
+            fields.push(graphics_field(Graphics::default_for(profile)));
+        }
         if profile.gpu_choice(self.host) {
-            fields.push(self.gpu_field(&crate::vm::Gpu::default()));
+            fields.push(
+                self.gpu_field(&crate::vm::Gpu::default())
+                    .show_if("graphics", LIBRARY),
+            );
         }
         fields.extend([
             Field::text(
@@ -1408,9 +1417,11 @@ impl App {
                 "Displays",
                 "1",
                 "1 to 8, each in a window of its own.",
-            ),
-            Field::text("resolution", "Resolution", "1920x1080", RESOLUTION_HELP),
-            Field::toggle("hidpi", "HiDPI", false, HIDPI_HELP),
+            )
+            .show_if("graphics", APPLE_GFX),
+            Field::text("resolution", "Resolution", "1920x1080", RESOLUTION_HELP)
+                .show_if("graphics", APPLE_GFX),
+            Field::toggle("hidpi", "HiDPI", false, HIDPI_HELP).show_if("graphics", APPLE_GFX),
             Field::toggle(
                 "logs",
                 "Logs",
@@ -1442,20 +1453,10 @@ impl App {
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
         ];
-        // The displays', the GPU's and video acceleration's fields are reims-vgpu's; an arm64 VM
-        // has no other.
-        let library = &["reims-vgpu"];
+        // The displays' and video acceleration's fields are apple-gfx's, and borderless and the
+        // GPU's the library's devices'; an arm64 VM has no other than apple-gfx.
         if c.profile == Profile::Q35X86_64 {
-            let options = Graphics::ALL.map(|g| (g.id().to_string(), g.describe().to_string()));
-            fields.push(Field::choice(
-                "graphics",
-                "Graphics",
-                options.to_vec(),
-                c.graphics.id(),
-                "reims-vgpu gives the guest its GPU, each display in a window. VMware SVGA is \
-                 QEMU's: one display at the firmware's resolution, with no GPU acceleration \
-                 (macOS has no driver for it), in QEMU's own window.",
-            ));
+            fields.push(graphics_field(c.graphics()));
         }
         fields.extend([
             Field::text(
@@ -1464,23 +1465,23 @@ impl App {
                 &c.display.count.to_string(),
                 "1 to 8, each in a window of its own.",
             )
-            .show_if("graphics", library),
+            .show_if("graphics", APPLE_GFX),
             Field::text(
                 "resolution",
                 "Resolution",
                 &c.display.resolution,
                 RESOLUTION_HELP,
             )
-            .show_if("graphics", library),
+            .show_if("graphics", APPLE_GFX),
             Field::toggle("hidpi", "HiDPI", c.display.hidpi, HIDPI_HELP)
-                .show_if("graphics", library),
+                .show_if("graphics", APPLE_GFX),
             Field::toggle(
                 "borderless",
                 "Borderless",
                 c.display.borderless,
                 "Windows without borders that fill their screens.",
             )
-            .show_if("graphics", library),
+            .show_if("graphics", LIBRARY),
             Field::text(
                 "refresh",
                 "Refresh rate",
@@ -1488,10 +1489,10 @@ impl App {
                 "Hz offered to the guest; empty for the host screen's.",
             )
             .placeholder("the host screen's")
-            .show_if("graphics", library),
+            .show_if("graphics", APPLE_GFX),
         ]);
         if c.profile.gpu_choice(self.host) {
-            fields.push(self.gpu_field(&c.gpu).show_if("graphics", library));
+            fields.push(self.gpu_field(&c.gpu).show_if("graphics", LIBRARY));
         }
         fields.extend([
             Field::toggle(
@@ -1501,7 +1502,7 @@ impl App {
                 "The guest decodes, encodes and scales video on the host's hardware. Off, it \
                  does all of that in software.",
             )
-            .show_if("graphics", library),
+            .show_if("graphics", APPLE_GFX),
             Field::toggle(
                 "audio",
                 "Audio",
@@ -1758,9 +1759,16 @@ impl App {
             }
             None => bail!("this host runs no VMs"),
         }
-        s.display.count = f.text("displays").parse().context("displays: a number")?;
-        s.display.resolution = f.text("resolution");
-        s.display.hidpi = f.toggle("hidpi");
+        if f.is_shown("graphics") {
+            s.graphics = Some(Graphics::parse(&f.choice("graphics"))?);
+        }
+        // Hidden on reims-vgpu, whose one display follows its window: the defaults, which it
+        // honors.
+        if f.is_shown("displays") {
+            s.display.count = f.text("displays").parse().context("displays: a number")?;
+            s.display.resolution = f.text("resolution");
+            s.display.hidpi = f.toggle("hidpi");
+        }
         s.display.check()?;
         s.logs = f.toggle("logs");
         s.ssh_port = ssh_port_field(f)?;
@@ -2159,6 +2167,27 @@ fn gpu_from_choice(id: &str, list: &[GpuInfo]) -> crate::vm::Gpu {
 const RESOLUTION_HELP: &str =
     "The guest's first mode: WIDTHxHEIGHT, or host for the host screen's own modes and density.";
 
+/// The graphics field's values that show a field of apple-gfx's alone, and one of the library's.
+const APPLE_GFX: &[&str] = &["apple-gfx"];
+const LIBRARY: &[&str] = &["reims-vgpu", "apple-gfx"];
+
+/// The graphics choice of an x86-64 VM, at `current`.
+fn graphics_field(current: Graphics) -> Field {
+    let options = Graphics::ALL.map(|g| (g.id().to_string(), g.describe().to_string()));
+    Field::choice(
+        "graphics",
+        "Graphics",
+        options.to_vec(),
+        current.id(),
+        "reims-vgpu is its own GPU device, which macOS drives with the drivers reims-ctl puts in \
+         the VM's OpenCore image (after a change to it, U makes the image again): one display, \
+         in a window whose size the guest follows. apple-gfx is Apple's paravirtualized GPU, \
+         with up to 8 displays and the host's video hardware. VMware SVGA is QEMU's: one \
+         display at the firmware's resolution, with no GPU acceleration (macOS has no driver \
+         for it), in QEMU's own window.",
+    )
+}
+
 const HIDPI_HELP: &str = "Run the mode at twice the density, as a Retina screen does: the desktop \
      looks like half the mode, so a larger mode makes everything smaller (3840x2160 looks like \
      1920x1080, 3200x1800 like 1600x900, 2560x1440 like 1280x720). Needs a mode at least 1920 \
@@ -2243,19 +2272,19 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     c.cpus = f.text("cpus").parse().context("CPU cores: a number")?;
     c.memory_mib = parse_size_mib(&f.text("memory")).context("memory")?;
     if f.is_shown("graphics") {
-        c.graphics = Graphics::parse(&f.choice("graphics"))?;
+        c.graphics = Some(Graphics::parse(&f.choice("graphics"))?);
     }
     if f.is_shown("disk_controller")
         && let Some(q) = &mut c.q35
     {
         q.disk_controller = DiskController::parse(&f.choice("disk_controller"))?;
     }
-    // Hidden on VMware SVGA, the displays' settings stay as they were.
+    // Hidden on reims-vgpu and VMware SVGA, the displays' settings stay as they were for
+    // apple-gfx; borderless is reims-vgpu's too.
     if f.is_shown("displays") {
         c.display.count = f.text("displays").parse().context("displays: a number")?;
         c.display.resolution = f.text("resolution");
         c.display.hidpi = f.toggle("hidpi");
-        c.display.borderless = f.toggle("borderless");
         let r = f.text("refresh");
         c.display.refresh = if r.is_empty() {
             None
@@ -2263,13 +2292,16 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
             Some(r.parse().context("refresh rate: a number")?)
         };
     }
+    if f.is_shown("borderless") {
+        c.display.borderless = f.toggle("borderless");
+    }
     if f.is_shown("gpu") {
         let id = f.choice("gpu");
         if id != gpu_id(&c.gpu) {
             c.gpu = gpu_from_choice(&id, gpus.unwrap_or(&[]));
         }
     }
-    // Hidden on VMware SVGA, which has no video devices, it stays as it was.
+    // Hidden on reims-vgpu and VMware SVGA, which have no video devices, it stays as it was.
     if f.is_shown("video_acceleration") {
         c.video_acceleration = f.toggle("video_acceleration");
     }
@@ -2393,6 +2425,7 @@ fn copy_to_clipboard(s: &str) -> Option<&'static str> {
 
 const HELP: &str = "\
 reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in windows of their own.
+An x86-64 VM runs reims-vgpu's own GPU device unless its settings choose another (e, graphics).
 
   ↑ ↓ / j k   choose a VM, or click it
   Enter       open its menu: what can be done with it now, each with its key. A right
@@ -2413,8 +2446,13 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
               scaling), audio, network, logs, extra QEMU arguments (they apply at its next
               start), and on x86-64 its disk controller (SATA, or NVMe once macOS is
               installed), its installer image, its boot selection (OpenCore's picker, which
-              makes it a new OpenCore image) and graphics: reims-vgpu, or QEMU's VMware
-              SVGA, one display with no GPU acceleration, in QEMU's own window
+              makes it a new OpenCore image) and graphics: reims-vgpu, its own GPU device,
+              on one display in a window whose size the guest follows, with the macOS
+              drivers reims-ctl puts in its OpenCore image (U after a change); apple-gfx,
+              Apple's paravirtualized GPU, with up to 8 displays and the host's video
+              hardware; or QEMU's VMware SVGA, one display with no GPU acceleration, in
+              QEMU's own window. Displays, resolution, HiDPI, refresh rate and video
+              acceleration are apple-gfx's
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and
@@ -2426,8 +2464,11 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
               zipped into your Downloads folder
   d           delete it
   U           make it a new OpenCore image (x86-64) with the installed reims-util, presenting
-              the same Mac: an older image lacks ReimsVgpu.kext, which macOS 26 needs for
-              displays wider than 2048 pixels and GPU-accelerated Chrome
+              the same Mac, for its graphics: on reims-vgpu with the macOS drivers of its GPU
+              device that this reims-ctl carries, which an image made for apple-gfx or by an
+              older reims-ctl lacks; on apple-gfx with ReimsVgpu.kext, which an older image
+              lacks and macOS 26 needs for displays wider than 2048 pixels and GPU-accelerated
+              Chrome
   u           update reims-ctl and QEMU from your reims-vgpu checkout
   r           reload the list
   ?           this help
@@ -2839,20 +2880,25 @@ mod tests {
         assert!(!form(&app).is_shown("disk_controller"));
     }
 
-    /// The edit form turns video acceleration off on reims-vgpu, on either kind of VM, and has
-    /// no such field on VMware SVGA, which has no video devices, whose setting stays as it was.
+    /// The edit form turns video acceleration off on apple-gfx, on either kind of VM, and has no
+    /// such field on reims-vgpu or VMware SVGA, which have no video devices, whose setting stays
+    /// as it was.
     #[test]
     fn the_edit_form_turns_video_acceleration_off() {
+        let mut apple = vm_row("t", true);
+        apple.vm.as_mut().unwrap().config.graphics = Some(Graphics::AppleGfx);
         let mut svga = vm_row("s", true);
         let c = &mut svga.vm.as_mut().unwrap().config;
-        c.graphics = Graphics::VmwareSvga;
+        c.graphics = Some(Graphics::VmwareSvga);
         c.video_acceleration = false;
         let mut arm64 = vm_row("a", false);
         arm64.vm.as_mut().unwrap().config.vmapple = Some(crate::vm::Vmapple {
             aux: "aux.img".into(),
             ecid: 1234,
         });
-        let mut app = test_app(vec![vm_row("t", true), arm64, svga]);
+        let mut reims = vm_row("r", true);
+        reims.vm.as_mut().unwrap().config.video_acceleration = false;
+        let mut app = test_app(vec![apple, arm64, svga, reims]);
         for row in [0, 1] {
             app.overlay = None;
             app.table.select(Some(row));
@@ -2870,17 +2916,57 @@ mod tests {
             assert!(!vm.config.video_acceleration);
         }
 
-        app.overlay = None;
-        app.table.select(Some(2));
+        for row in [2, 3] {
+            app.overlay = None;
+            app.table.select(Some(row));
+            app.open_edit();
+            assert!(!form(&app).is_shown("video_acceleration"));
+            let mut vm = app.rows[row].vm.as_ref().unwrap().clone();
+            vm.config.video_acceleration = true;
+            apply_edit(&mut vm, form(&app), None).unwrap();
+            assert!(
+                vm.config.video_acceleration,
+                "a hidden field changes nothing"
+            );
+        }
+    }
+
+    /// An x86-64 VM whose settings name no graphics is on reims-vgpu, whose edit form shows
+    /// borderless alone of the displays' settings, which stay as they were for apple-gfx;
+    /// choosing apple-gfx shows them, and saves it by name.
+    #[test]
+    fn the_edit_form_shows_reims_vgpu_its_display_settings_alone() {
+        let mut row = vm_row("t", true);
+        let c = &mut row.vm.as_mut().unwrap().config;
+        c.display.count = 3;
+        c.display.hidpi = true;
+        c.display.resolution = "3840x2160".into();
+        let mut app = test_app(vec![row]);
         app.open_edit();
-        assert!(!form(&app).is_shown("video_acceleration"));
-        let mut vm = app.rows[2].vm.as_ref().unwrap().clone();
-        vm.config.video_acceleration = true;
+        assert_eq!(form(&app).choice("graphics"), "reims-vgpu");
+        for hidden in ["displays", "resolution", "hidpi", "refresh"] {
+            assert!(!form(&app).is_shown(hidden), "{hidden}");
+        }
+        assert!(form(&app).is_shown("borderless"));
+        let mut vm = app.rows[0].vm.as_ref().unwrap().clone();
         apply_edit(&mut vm, form(&app), None).unwrap();
-        assert!(
-            vm.config.video_acceleration,
-            "a hidden field changes nothing"
+        assert_eq!(vm.config.graphics, Some(Graphics::ReimsVgpu));
+        assert_eq!(
+            (vm.config.display.count, vm.config.display.hidpi),
+            (3, true)
         );
+        for _ in 0..form(&app).fields.len() {
+            if form(&app).focused_key() == "graphics" {
+                break;
+            }
+            press(&mut app, [KeyCode::Down]);
+        }
+        press(&mut app, [KeyCode::Right]);
+        assert_eq!(form(&app).choice("graphics"), "apple-gfx");
+        assert!(form(&app).is_shown("displays") && form(&app).is_shown("hidpi"));
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert_eq!(vm.config.graphics, Some(Graphics::AppleGfx));
+        assert_eq!(vm.config.display.count, 3);
     }
 
     #[test]

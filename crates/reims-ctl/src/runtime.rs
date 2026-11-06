@@ -310,10 +310,14 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
 /// about the library, which a VM on VMware SVGA does not run.
 pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
     let mut w = Vec::new();
-    if vm.config.graphics != Graphics::ReimsVgpu {
+    let graphics = vm.config.graphics();
+    if !graphics.library() {
         return w;
     }
-    if vm.config.profile == Profile::Q35X86_64 {
+    if graphics == Graphics::ReimsVgpu {
+        w.extend(crate::opencore::missing_guest_kexts(vm));
+    }
+    if graphics == Graphics::AppleGfx && vm.config.profile == Profile::Q35X86_64 {
         w.extend(crate::opencore::missing_kext(vm));
         // docs/qemu.md, "x86-64 macOS guests: Metal's error mode": without it, macOS 26's icon
         // service ends as it starts, again and again, and the library logs each command it left
@@ -425,7 +429,7 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
         );
     }
     let screen = crate::host::has_screen(&vm.config.extra_env);
-    if vm.config.graphics == Graphics::VmwareSvga && screen {
+    if vm.config.graphics() == Graphics::VmwareSvga && screen {
         let displays = crate::install::display_backends(&qemu);
         if !displays.is_empty() && !displays.iter().any(|d| d == "gtk") {
             bail!(
@@ -440,7 +444,18 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
         audio_backend,
         nested_vmx: crate::host::kvm_nested_vmx(),
         screen,
+        graphics_rom: graphics_rom(vm)?,
     })
+}
+
+/// The option ROM of reims-vgpu's own device, written into the data directory for a VM on it
+/// ([`crate::prebuilt::graphics_rom`]); an empty path, which no command names, for another.
+fn graphics_rom(vm: &Vm) -> Result<std::path::PathBuf> {
+    if vm.config.graphics() == Graphics::ReimsVgpu {
+        crate::prebuilt::graphics_rom()
+    } else {
+        Ok(std::path::PathBuf::new())
+    }
 }
 
 /// The invocation `start` would run, with QEMU's real path where it is installed.
@@ -453,6 +468,7 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
             audio_backend: crate::install::default_audio_backend(&[]),
             nested_vmx: crate::host::kvm_nested_vmx(),
             screen: crate::host::has_screen(&vm.config.extra_env),
+            graphics_rom: graphics_rom(vm).unwrap_or_else(|_| crate::prebuilt::graphics_rom_path()),
         }
     });
     qemu::invocation(vm, &ctx)

@@ -11,6 +11,7 @@ mod install;
 mod logs;
 mod opencore;
 mod paths;
+mod prebuilt;
 mod qemu;
 mod qmp;
 mod reims_util;

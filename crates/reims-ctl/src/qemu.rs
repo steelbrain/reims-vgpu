@@ -2,8 +2,9 @@
 //! prints as a shell script, so a printed script runs the VM exactly as reims-ctl does.
 //!
 //! Every profile gets:
-//! - on reims-vgpu, the library's window for each display: `-display none` with
-//!   `REIMS_VGPU_WINDOW` unset (`0` would keep apple-gfx headless), never a window of QEMU's own;
+//! - on the library's devices (reims-vgpu's and apple-gfx), the library's window for each
+//!   display: `-display none` with `REIMS_VGPU_WINDOW` unset (`0` would keep the device
+//!   headless), never a window of QEMU's own;
 //! - a QMP socket (`-qmp`), through which reims-ctl stops the VM;
 //! - QEMU's pid file;
 //! - user networking with virtio-net, and an optional SSH port forward; with networking off,
@@ -36,29 +37,41 @@
 //! stays dark and WindowServer waits on the GPU for good. Without S3, macOS's sleep stops at a
 //! dark wake, from which input wakes the display (docs/qemu.md).
 //!
-//! On reims-vgpu, an x86-64 VM has `apple-gfx-iosurface-pci` after its `apple-gfx-pci`, at slot
-//! 6: the IOSurface device a guest running Apple's arm64 GPU driver, ported, waits for, and the
-//! one switch for what that driver needs. The library isolates a task, and device info offers
-//! argument buffers, only while the mapper has a descriptor table, which the port's mapper
-//! driver writes at its start. Apple's x86-64 driver never touches the mapper, so its tasks run
-//! in process as without the device (docs/qemu.md, "The IOSurface device over PCI").
+//! An x86-64 VM's graphics ([`Graphics`]) are one of three:
+//! - reims-vgpu's own GPU device, `reims-graphics-pci`, at apple-gfx's slot, 4, with the device's
+//!   id, `gfx`, which the terminal viewer's screendumps name, and the option ROM reims-ctl
+//!   carries as its `romfile` ([`Ctx::graphics_rom`], [`crate::prebuilt`]), which the device has
+//!   no default for. The guest drives it with the kexts reims-ctl puts in the VM's OpenCore
+//!   image. Its BAR 2, the library's region, is 1 GiB below 4 GiB, which macOS gives an address
+//!   only where q35 leaves room there, so the machine keeps 1 GiB of RAM below 4 GiB
+//!   (`max-ram-below-4g=1G`): with more, the guest's kext finds no region. Its one display opens
+//!   in the library's window at 1920x1080 and follows the window's size at the host screen's
+//!   rate: the displays' count, resolution, HiDPI and refresh are apple-gfx's, and only
+//!   borderless reaches it (`REIMS_VGPU_WINDOW_BORDERLESS`). It has none of apple-gfx's other
+//!   devices, the IOSurface mapper and the video devices below, whose x86-64 guest drivers were
+//!   ports, which no image reims-util makes now holds.
+//! - apple-gfx, `apple-gfx-pci`, with `apple-gfx-iosurface-pci` after it, at slot 6: the
+//!   IOSurface device a guest running Apple's arm64 GPU driver, ported, waits for, and the one
+//!   switch for what that driver needs. The library isolates a task, and device info offers
+//!   argument buffers, only while the mapper has a descriptor table, which the port's mapper
+//!   driver writes at its start. Apple's x86-64 driver never touches the mapper, so its tasks run
+//!   in process as without the device (docs/qemu.md, "The IOSurface device over PCI").
+//! - QEMU's `vmware-svga` in apple-gfx's slot (`graphics = "vmware-svga"`), with the id `gfx`.
+//!   The library then draws nothing, so the window's and the GPU's variables are left out, and
+//!   QEMU's own window, GTK's (`-display gtk`), shows the display. Where QEMU's environment names
+//!   no Wayland compositor or X server, GTK's window would end QEMU as it starts, so it is
+//!   `-display none` there, and the guest runs headless, as on the library's window.
 //!
-//! An x86-64 VM may have QEMU's `vmware-svga` in apple-gfx's slot instead (`graphics =
-//! "vmware-svga"`), with the device's id, `gfx`, which the terminal viewer's screendumps name.
-//! The library then draws nothing, so the window's and the GPU's variables are left out, and
-//! QEMU's own window, GTK's (`-display gtk`), shows the display. Where QEMU's environment names
-//! no Wayland compositor or X server, GTK's window would end QEMU as it starts, so it is
-//! `-display none` there, and the guest runs headless, as on the library's window.
-//!
-//! Every VM on reims-vgpu also has the VideoToolbox device (`apple-videotoolbox-pci`, 106b:1a03)
+//! Every VM on apple-gfx also has the VideoToolbox device (`apple-videotoolbox-pci`, 106b:1a03)
 //! and the M2 scaler device (`apple-m2scaler-pci`, 106b:1a0b). arm64 macOS ships their guest
-//! drivers, which link the IOSurface mapper vmapple builds in. x86-64 macOS ships none:
-//! reims-util's images carry ports of them for macOS 26.7 (reims_util.rs), which link the port's
-//! mapper driver, so an x86-64 VM has the devices at slots 8 and 9, after its mapper, and one on
-//! `vmware-svga`, which has no mapper, has neither. A guest without the drivers leaves both
-//! devices without one (docs/qemu.md, "The VideoToolbox device" and "The M2 scaler device").
-//! A VM whose settings turn video acceleration off (`video_acceleration = false`) has neither,
-//! and its guest decodes, encodes and scales video in software.
+//! drivers, which link the IOSurface mapper vmapple builds in. x86-64 macOS ships none: images
+//! of reims-util before [`crate::reims_util::REV`] carried ports of them for macOS 26.7, which
+//! link the port's mapper driver, so an x86-64 VM on apple-gfx has the devices at slots 8 and 9,
+//! after its mapper,
+//! and one on reims-vgpu or `vmware-svga`, which have no mapper, has neither. A guest without
+//! the drivers leaves both devices without one (docs/qemu.md, "The VideoToolbox device" and "The
+//! M2 scaler device"). A VM whose settings turn video acceleration off (`video_acceleration =
+//! false`) has neither, and its guest decodes, encodes and scales video in software.
 //!
 //! `vmapple-arm64` follows scripts/internal/run_vmapple.sh, with the video devices besides.
 
@@ -93,6 +106,9 @@ pub struct Ctx {
     pub nested_vmx: bool,
     /// Whether QEMU's own window can open ([`crate::host::has_screen`]).
     pub screen: bool,
+    /// The option ROM of reims-vgpu's own device, which its `romfile` names
+    /// ([`crate::prebuilt::graphics_rom`]).
+    pub graphics_rom: PathBuf,
 }
 
 /// A value inside a QEMU option list: commas doubled.
@@ -118,7 +134,8 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
 
     let mut env = Vec::new();
     let mut unset = vec!["REIMS_VGPU_WINDOW".to_string()];
-    let library = c.graphics == Graphics::ReimsVgpu;
+    let graphics = c.graphics();
+    let library = graphics.library();
     if c.logs.enabled {
         env.push(("REIMS_VGPU_LOG".into(), c.logs.level.clone()));
     } else if library {
@@ -129,7 +146,10 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
     if library && c.display.borderless {
         env.push(("REIMS_VGPU_WINDOW_BORDERLESS".into(), "1".into()));
     }
-    if library && let Some(r) = c.display.refresh {
+    // reims-vgpu's display runs at its host screen's rate (the module doc).
+    if graphics == Graphics::AppleGfx
+        && let Some(r) = c.display.refresh
+    {
         env.push(("REIMS_VGPU_WINDOW_REFRESH".into(), r.to_string()));
     }
     if library
@@ -167,16 +187,23 @@ const LOGS_OFF: &str = "warn,reims_vgpu_core::device::lifecycle=info";
 fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let c = &vm.config;
     let q = c.q35.as_ref().context("no [q35] settings")?;
+    let graphics = c.graphics();
     let mem = format!("{}M", c.memory_mib);
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
+    let mut machine = String::from("q35");
     if c.profile.memfd_ram(ctx.host) {
-        push(&["-machine", "q35,memory-backend=ram,dump-guest-core=off"]);
+        machine.push_str(",memory-backend=ram,dump-guest-core=off");
+    }
+    // Room below 4 GiB for reims-vgpu's 1 GiB BAR 2 (the module doc).
+    if graphics == Graphics::ReimsVgpu {
+        machine.push_str(",max-ram-below-4g=1G");
+    }
+    push(&["-machine", &machine]);
+    if c.profile.memfd_ram(ctx.host) {
         push(&[
             "-object",
             &format!("memory-backend-memfd,id=ram,size={mem},share=on"),
         ]);
-    } else {
-        push(&["-machine", "q35"]);
     }
     push(&["-accel", c.profile.accel(ctx.host), "-m", &mem]);
     let mut cpu = format!(
@@ -285,8 +312,12 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         ]);
     }
     push(&["-vga", "none"]);
-    let gfx = match c.graphics {
+    let gfx = match graphics {
         Graphics::ReimsVgpu => format!(
+            "reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,romfile={}",
+            optp(&ctx.graphics_rom)
+        ),
+        Graphics::AppleGfx => format!(
             "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays={},resolution={}",
             c.display.count,
             c.display.qemu_resolution()?
@@ -295,7 +326,7 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     };
     push(&["-device", &gfx]);
     // After the GPU it names, which realizes first.
-    if c.graphics == Graphics::ReimsVgpu {
+    if graphics == Graphics::AppleGfx {
         push(&[
             "-device",
             "apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6",
@@ -421,7 +452,7 @@ fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     if !c.network.enabled {
         push(&["-nic", "none"]);
     }
-    let qemu_window = c.graphics == Graphics::VmwareSvga && ctx.screen;
+    let qemu_window = !c.graphics().library() && ctx.screen;
     push(&["-display", if qemu_window { "gtk" } else { "none" }]);
     if c.logs.enabled {
         push(&["-serial", &format!("file:{}", vm.serial_log().display())]);
@@ -535,7 +566,7 @@ mod tests {
                 disk_format: ImageFormat::Qcow2,
                 stop_timeout_secs: 90,
                 extra_args: vec![],
-                graphics: Graphics::ReimsVgpu,
+                graphics: Some(Graphics::AppleGfx),
                 video_acceleration: true,
                 display: Display::default(),
                 gpu: Gpu::default(),
@@ -570,6 +601,7 @@ mod tests {
             audio_backend: "pipewire".into(),
             nested_vmx: false,
             screen: true,
+            graphics_rom: "/d/firmware/ReimsGraphics-0123456789abcdef.rom".into(),
         }
     }
 
@@ -862,7 +894,7 @@ mod tests {
     #[test]
     fn vmware_svga_takes_apple_gfx_slot_in_qemus_window() {
         let mut vm = q35_vm();
-        vm.config.graphics = Graphics::VmwareSvga;
+        vm.config.graphics = Some(Graphics::VmwareSvga);
         vm.config.display.count = 2;
         vm.config.display.borderless = true;
         vm.config.display.refresh = Some(120);
@@ -889,9 +921,76 @@ mod tests {
         };
         let a = invocation(&vm, &headless).unwrap().args;
         assert!(has(&a, &["-display", "none"]));
-        // On reims-vgpu, the library's window, never QEMU's.
-        let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
-        assert!(has(&a, &["-display", "none"]));
+        // On the library's devices, the library's window, never QEMU's.
+        let mut vm = q35_vm();
+        for g in [Graphics::AppleGfx, Graphics::ReimsVgpu] {
+            vm.config.graphics = Some(g);
+            let a = invocation(&vm, &ctx(linux())).unwrap().args;
+            assert!(has(&a, &["-display", "none"]));
+        }
+    }
+
+    /// reims-vgpu's own device, with the ROM reims-ctl carries, in apple-gfx's slot, on a machine
+    /// that leaves its BAR room below 4 GiB, and none of apple-gfx's devices: the default of an
+    /// x86-64 VM whose settings name no graphics. Of the display settings only borderless
+    /// reaches it; the GPU and the logs are the library's, as on apple-gfx.
+    #[test]
+    fn reims_vgpu_has_its_own_device_and_none_of_apple_gfxs() {
+        let mut vm = q35_vm();
+        vm.config.graphics = None;
+        vm.config.display.count = 2;
+        vm.config.display.resolution = "2560x1600".into();
+        vm.config.display.borderless = true;
+        vm.config.display.refresh = Some(120);
+        vm.config.gpu.driver_file = Some("/icd/nvidia.json".into());
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        let a = &inv.args;
+        for pair in [
+            &[
+                "-machine",
+                "q35,memory-backend=ram,dump-guest-core=off,max-ram-below-4g=1G",
+            ][..],
+            &["-vga", "none"],
+            &[
+                "-device",
+                "reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,\
+                 romfile=/d/firmware/ReimsGraphics-0123456789abcdef.rom",
+            ],
+            &["-display", "none"],
+        ] {
+            assert!(has(a, pair), "missing {pair:?} in {a:?}");
+        }
+        for device in [
+            "apple-gfx",
+            "apple-videotoolbox",
+            "apple-m2scaler",
+            "vmware-svga",
+        ] {
+            assert!(!a.iter().any(|x| x.contains(device)), "{device} in {a:?}");
+        }
+        let env: BTreeMap<_, _> = inv.env.iter().cloned().collect();
+        assert_eq!(env["REIMS_VGPU_WINDOW_BORDERLESS"], "1");
+        assert_eq!(env["VK_DRIVER_FILES"], "/icd/nvidia.json");
+        assert!(env.contains_key("REIMS_VGPU_LOG"));
+        assert!(!env.contains_key("REIMS_VGPU_WINDOW_REFRESH"), "{env:?}");
+        assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
+        // A comma in the ROM's path stays in the option's value; without memfd RAM the machine
+        // still leaves the BAR its room.
+        let c = Ctx {
+            graphics_rom: "/a,b/ReimsGraphics.rom".into(),
+            ..ctx(mac())
+        };
+        let a = invocation(&vm, &c).unwrap().args;
+        assert!(has(&a, &["-machine", "q35,max-ram-below-4g=1G"]), "{a:?}");
+        assert!(
+            a.iter()
+                .any(|x| x.ends_with(",romfile=/a,,b/ReimsGraphics.rom")),
+            "{a:?}"
+        );
+        // apple-gfx keeps the machine's RAM below 4 GiB as it was.
+        vm.config.graphics = Some(Graphics::AppleGfx);
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(!a.iter().any(|x| x.contains("max-ram-below-4g")), "{a:?}");
     }
 
     #[test]
