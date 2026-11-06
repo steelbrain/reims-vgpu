@@ -133,7 +133,8 @@ passes run again alone.
 | the video crates (`crates/reims-vgpu-video-*`), or their glue in `reims-vgpu` and the C API | `cargo xtask check` on a Mac; the Linux tests on a VA-API host and on an NVIDIA host; and, where a backend changes, the conformance suite on that backend's hardware ("The video crates' checks", below) |
 | `xtask/` | `cargo test -p xtask`, rustfmt and clippy on it |
 | `crates/reims-ctl` | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it (`cargo xtask check` does not reach it); a change to the QEMU command it builds, or to `scripts/install-ctl.sh`, also needs an install and a VM boot on each host it touches |
-| `firmware/` | build it (`make -C firmware`); a change not meant to alter what the guest's firmware sees keeps the ROM's bytes |
+| `guest/` (kext, bundle, rgfxgate, loader) | `make -C guest test` on a Mac; a change to a source the set is built from also needs `make -C guest prebuilt KDK=<KDK Extensions dir>`, committing `guest/prebuilt` with it (`make -C guest prebuilt-check` fails otherwise) |
+| `firmware/` | build it (`make -C firmware`); a change not meant to alter what the guest's firmware sees keeps the ROM's bytes; a change to what `ReimsGraphics.rom` is built from (its sources, the Makefile, `crates/reims-graphics/include/reims_graphics_wire.h`) also runs `make -C firmware prebuilt` on a Mac, committing the ROM and record it writes |
 | `vendor/qemu` | build it (`make qemu`) and realize the devices paused (`-S`); a change to `hw/display/apple-gfx*.c`, or to what QEMU calls, also needs a VM boot ([docs/lessons.md](docs/lessons.md), [docs/qemu.md](docs/qemu.md)) |
 | docs and comments | nothing |
 
@@ -350,15 +351,31 @@ The suite's inputs:
   merges**, not before each commit (Checking a change).
 - **Stage explicit paths, and never commit build output.** Before each
   commit, `git diff --cached --name-only | grep -E
-  '(^|/)target[^/]*/|\.(bin|o|obj|rlib|rmeta|dylib|a|efi|rom)$'` must print
-  nothing.
-  - **The one exception is metallibs** compiled from this repository's own
-    `.metal` sources, which only Apple's compiler makes: the Vulkan
-    platform's, in `crates/reims-vgpu-vulkan/metallibs`, which a build off a
-    Mac copies, and the suite's inputs, in `tests/suite/fixtures/shaders`.
-    Each is committed with the source it is compiled from. The Vulkan
+  '(^|/)target[^/]*/|\.(bin|o|obj|rlib|rmeta|dylib|a|efi|rom)$' | grep -vxF
+  firmware/prebuilt/ReimsGraphics.rom` must print nothing.
+  - **The exceptions are the outputs below**, each committed with the
+    sources it is built from.
+  - **Metallibs** compiled from this repository's own `.metal` sources,
+    which only Apple's compiler makes: the Vulkan platform's, in
+    `crates/reims-vgpu-vulkan/metallibs`, which a build off a Mac copies, and
+    the suite's inputs, in `tests/suite/fixtures/shaders`. The Vulkan
     platform's are rewritten by `cargo xtask metallibs` on a Mac, and a
     stale one fails the Mac's `cargo xtask check` and the Linux build.
+  - **The reims-graphics device's option ROM**,
+    `firmware/prebuilt/ReimsGraphics.rom`, which reims-ctl embeds and names
+    as the device's `romfile`. `make -C firmware prebuilt` rewrites it on a
+    Mac with its record, `firmware/prebuilt/ReimsGraphics.toml`, and a stale
+    one fails `cargo xtask check` and reims-ctl's `cargo test`
+    (`make -C firmware prebuilt-check`).
+  - **The guest's OpenCore kext set for that device**, in `guest/prebuilt`:
+    `set.toml`, `sources.toml`, and for each of `ReimsGraphicsLoader`,
+    `RgfxIOGraphicsFamilyBridge`, `RgfxAppleGraphicsDeviceControlBridge`,
+    `ReimsGraphics` and `RgfxGate`, `<name>.kext/Contents/Info.plist` and
+    `<name>.kext/Contents/MacOS/<name>`. reims-ctl embeds the bundles
+    `set.toml` lists and adds them to the OpenCore image of an x86-64 VM on
+    reims-vgpu. `make -C guest prebuilt` rewrites them from `guest/` on a Mac
+    with a KDK, with the record of their sources, `sources.toml`, and a stale
+    set fails `make -C guest prebuilt-check`, which `cargo xtask check` runs.
 - **Never commit Apple binaries.** The build needs none: the option ROM is
   built from `firmware/`. The committed metallibs hold only our shaders and
   constant samplers, with no Apple code linked in. Nothing taken from a
