@@ -623,6 +623,12 @@ pub(crate) struct CacheCounts {
     /// buffers' uses of a cache: each where the platform made no event to wait on the GPU with
     /// ([`Caches::before`]), or a decode's for a deferred fill ([`Caches::wait_filled`]).
     pub(crate) cpu_waits: u64,
+    /// Command buffers that use a cache and ask for their `CB_SUBMITTED`, looked at on a
+    /// doorbell's thread with the caches' lock free ([`Caches::waits_for_nothing`]): those that
+    /// wait for no copy of their caches, which the doorbell may answer, and those that wait for
+    /// one, left to their queue's thread.
+    pub(crate) doorbell_free: u64,
+    pub(crate) doorbell_waits: u64,
 }
 
 /// One cache's pages, host addresses in the guest's RAM, and how many times a device of the host
@@ -641,6 +647,11 @@ impl Watched {
     /// The writes of the host's devices over the block's pages so far.
     fn writes(&self, block: u64) -> u64 {
         self.0.lock().get(&block).map_or(0, |p| p.writes)
+    }
+
+    /// [`Self::writes`], with the lock tried: `None` where it is busy.
+    fn try_writes(&self, block: u64) -> Option<u64> {
+        Some(self.0.try_lock()?.get(&block).map_or(0, |p| p.writes))
     }
 }
 
@@ -1369,6 +1380,26 @@ impl<P: Platform> SurfaceCaches<P> {
         let asked = (self.deferred.get(&block))
             .is_some_and(|q| writes || q.iter().any(|d| matches!(d.copy, Asked::Fill { .. })));
         asked || (self.needs_fill(u) && (self.pending(block, false) > 0 || self.deferring(block)))
+    }
+
+    /// Whether the use `u` waits on the GPU for no copy of its block's cache where it is begun
+    /// now ([`Self::before_one`]): the block has no cache, or its cache needs no fill for it,
+    /// no copy of it asked and not made is one it follows, and its last fill is done. `None`
+    /// where the lock of the pages' watch is busy: a doorbell's thread tries it
+    /// ([`Caches::waits_for_nothing`]).
+    fn waits_for_nothing(&self, u: &RgfxOpSurfaceUse) -> Option<bool> {
+        let block = u.block_offset;
+        let (Some(cache), Some((held, host))) = (self.by_block.get(&block), self.will_hold(block))
+        else {
+            return Some(true);
+        };
+        let host_writes = self.watched.try_writes(block)?;
+        let fills = held.is_none_or(|held| u.cpu_gen > held) || host_writes > host;
+        let writes = u.flags & RGFX_SURFACE_USE_WRITES != 0;
+        let follows = (self.deferred.get(&block))
+            .is_some_and(|q| writes || q.iter().any(|d| matches!(d.copy, Asked::Fill { .. })));
+        let filled = (self.transfer.as_ref()).is_none_or(|t| t.fills.reached(cache.filled_at));
+        Some(!fills && !follows && filled)
     }
 
     /// Whether the block at `block`'s cache has its event, which the command buffers that follow
@@ -2714,12 +2745,39 @@ impl<P: Platform> Caches<P> {
         Ok((waits, (!held.blocks.is_empty()).then_some(held)))
     }
 
-    /// Whether none of the blocks `blocks` has a cache, so a command buffer that uses only them
-    /// needs no fill and counts among no cache's users: answered waiting for nothing and
-    /// allocating nothing (a doorbell's thread), `None` where the lock is busy.
-    pub(crate) fn none_cached(&self, mut blocks: impl Iterator<Item = u64>) -> Option<bool> {
-        let state = self.state.try_lock()?;
-        Some(blocks.all(|block| !state.has(block)))
+    /// Whether a command buffer whose `SURFACE_USE` ops are `uses` waits for no copy of a cache
+    /// at its begin ([`Self::before`]), so it gets its `CB_SUBMITTED` at its take: no block of
+    /// them that has a cache needs a fill ([`SurfaceCaches::needs_fill`]), or follows a copy of
+    /// its cache asked and not yet made ([`SurfaceCaches::follow`]), and each one's last fill is
+    /// done. Answered waiting for nothing and allocating nothing (a doorbell's thread), each lock
+    /// tried: `None` where one is busy.
+    pub(crate) fn waits_for_nothing(
+        &self,
+        mut uses: impl Iterator<Item = RgfxOpSurfaceUse>,
+    ) -> Option<bool> {
+        let mut state = self.state.try_lock()?;
+        let (mut cached, mut busy) = (false, false);
+        let none = uses.all(|u| {
+            cached |= state.has(u.block_offset);
+            match state.waits_for_nothing(&u) {
+                Some(none) => none,
+                None => {
+                    busy = true;
+                    false
+                }
+            }
+        });
+        if busy {
+            return None;
+        }
+        // Counted where a block of them has a cache: a use of one with none waits for nothing.
+        if cached {
+            match none {
+                true => state.counts.doorbell_free += 1,
+                false => state.counts.doorbell_waits += 1,
+            }
+        }
+        Some(none)
     }
 
     /// Ends command buffer `cb` of queue `queue`, which `uses` counted among the users of caches
@@ -3304,6 +3362,17 @@ mod tests {
         uses: &[(u64, u64, bool)],
         asks: bool,
     ) {
+        let message = surfaces_message(queue, cb_obj_id, uses, asks);
+        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+    }
+
+    /// The `COMMAND_BUFFER` message of [`use_surfaces_asking`], at seqno `cb_obj_id`.
+    fn surfaces_message(
+        queue: u64,
+        cb_obj_id: u64,
+        uses: &[(u64, u64, bool)],
+        asks: bool,
+    ) -> Vec<u8> {
         let mut ops = Vec::new();
         for &(block_offset, cpu_gen, writes) in uses {
             let body = RgfxOpSurfaceUse {
@@ -3340,7 +3409,7 @@ mod tests {
         };
         let mut message = m.as_bytes().to_vec();
         message.extend_from_slice(&ops);
-        assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        message
     }
 
     /// The (event, value) of each call to `sel` in `calls`.
@@ -4594,6 +4663,81 @@ mod tests {
         assert!(downloaded.load(Ordering::SeqCst));
     }
 
+    /// A buffer that uses a device cache is answered `CB_SUBMITTED` at its doorbell, before its
+    /// queue's thread takes it, where it would get it at its take: its cache's last fill is done,
+    /// it needs no fill, and no copy asked of the cache is one it follows (R184, R224: it was
+    /// refused for using a cache at all). Not while the make's fill runs, nor where the buffer's
+    /// generation is newer than the cache's, nor for a writer behind a download that waits for
+    /// another writer, which a reader is not behind; nor while the caches' lock is busy.
+    #[test]
+    fn a_buffer_using_a_cache_is_answered_at_its_doorbell_where_it_waits_for_no_copy() {
+        let r = cached();
+        let answered = |r: &Rig, message: &[u8]| {
+            let yes = (r.dec.decoders()).answer_at_doorbell(0, message, |_| true);
+            // What the answer took, let go of, as a begin would take it.
+            let took = r
+                .dec
+                .queue_counts(1)
+                .unwrap()
+                .answered
+                .lock()
+                .take()
+                .is_some();
+            assert_eq!(took, yes, "kept on its queue where answered");
+            yes
+        };
+        let reads = |cb, generation| surfaces_message(1, cb, &[(BLOCK, generation, false)], true);
+        let writes = |cb, generation| surfaces_message(1, cb, &[(BLOCK, generation, true)], true);
+        assert!(!answered(&r, &reads(0x300, 0)), "the make's fill runs");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(
+            answered(&r, &reads(0x301, 0)),
+            "a reader of the cache's generation"
+        );
+        assert!(answered(&r, &writes(0x302, 0)), "a writer of it");
+        assert!(
+            !answered(&r, &reads(0x303, 1)),
+            "a newer generation, which fills"
+        );
+        // A writer begun, and a download asked behind it.
+        let queue = r.device.new_command_queue().unwrap();
+        let writer = queue.command_buffer(ON).unwrap().unwrap();
+        let use_of = [RgfxOpSurfaceUse {
+            flags: RGFX_SURFACE_USE_WRITES,
+            ..reading(BLOCK, 0)[0]
+        }];
+        let (_, uses) = (r.dec.surface_caches)
+            .before(&r.device, &writer, &use_of)
+            .unwrap();
+        let downloaded = download(&r, BLOCK);
+        assert!(
+            !answered(&r, &writes(0x304, 0)),
+            "a writer behind the download"
+        );
+        assert!(answered(&r, &reads(0x305, 0)), "a reader is not behind it");
+        {
+            let _held = r.dec.caches();
+            assert!(!answered(&r, &reads(0x306, 0)), "the caches' lock busy");
+        }
+        (r.dec.surface_caches)
+            .finish(&r.device, 1, None, &writer, uses.unwrap(), || {
+                writer.commit(ON)
+            })
+            .unwrap();
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(downloaded.load(Ordering::SeqCst));
+        assert!(
+            answered(&r, &writes(0x307, 0)),
+            "the download made and done"
+        );
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.doorbell_free, counts.doorbell_waits),
+            (4, 3),
+            "the looks with the lock free"
+        );
+    }
+
     /// A download and a release asked while a command buffer that may write the cache is begun
     /// and not finished are not waited for where they are asked: each is made, in the order
     /// asked, in that buffer's finish, after its commit, and a buffer begun meanwhile that only
@@ -4713,9 +4857,10 @@ mod tests {
                 "a begin waited for another buffer's commit"
             );
             assert_eq!(begin.join().unwrap(), Ok(true));
-            assert_eq!(
-                caches.none_cached([BLOCK].into_iter()),
-                Some(false),
+            assert!(
+                caches
+                    .waits_for_nothing(reading(BLOCK, 1).into_iter())
+                    .is_some(),
                 "the doorbell's look found the caches' lock held"
             );
             let downloaded = download(&r, BLOCK);

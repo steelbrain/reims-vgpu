@@ -45,18 +45,18 @@
 //! **An answer on the doorbell's thread.** A buffer that gets its `CB_SUBMITTED` at its take may
 //! get it on the thread of the guest's doorbell write instead, before its queue's service thread
 //! takes it off its ring (`reims_graphics`'s `Device::mmio_write_taking`), where nothing need be
-//! waited for or allocated there ([`Decoders::answer_at_doorbell`]): it uses no device cache,
-//! and every lock the answer takes is tried. Its turn in its queue's lane and its ticket in the
-//! commit order are taken there, in the order its begin would take them, and kept on its queue
-//! with its mark in that order ([`Answered`]), then its `CB_SUBMITTED` is posted. Its begin, on
-//! the service thread, takes them in place of its own ([`GraphicsDecoder::begin_taken`]), makes
-//! its command buffer and hands its walk and commit to the lane as it does any buffer's, and
-//! posts no second `CB_SUBMITTED`; so its commit, and every commit it orders, comes where it
-//! would had the answer been posted at its begin. One never begun (its queue gone, the device
-//! reset) lets them go with its queue's entry. A queue's command buffers made and not completed
-//! are counted ([`InFlight`]), and one is answered there only while its queue holds fewer than
-//! [`TAKE_IN_FLIGHT_MAX`], so the platform's `commandBuffer`, which waits while a queue holds 64,
-//! does not wait at its begin.
+//! waited for or allocated there ([`Decoders::answer_at_doorbell`]): it waits for no copy of a
+//! device cache it uses, and every lock the answer takes is tried. Its turn in its queue's lane
+//! and its ticket in the commit order are taken there, in the order its begin would take them,
+//! and kept on its queue with its mark in that order ([`Answered`]), then its `CB_SUBMITTED` is
+//! posted. Its begin, on the service thread, takes them in place of its own
+//! ([`GraphicsDecoder::begin_taken`]), makes its command buffer and hands its walk and commit to
+//! the lane as it does any buffer's, and posts no second `CB_SUBMITTED`; so its commit, and every
+//! commit it orders, comes where it would had the answer been posted at its begin. One never begun
+//! (its queue gone, the device reset) lets them go with its queue's entry. A queue's command
+//! buffers made and not completed are counted ([`InFlight`]), and one is answered there only while
+//! its queue holds fewer than [`TAKE_IN_FLIGHT_MAX`], so the platform's `commandBuffer`, which
+//! waits while a queue holds 64, does not wait at its begin.
 //!
 //! **Scheduling.** A buffer that gets its `CB_SUBMITTED` at its take (it asks for one and waits
 //! for nothing) gets its `CB_SCHEDULED` there too, right after it, where no buffer begun before it
@@ -868,12 +868,17 @@ impl<'o> Glance<'o> {
         glance
     }
 
-    /// The blocks the stream's `SURFACE_USE` ops name, in stream order.
-    fn used_blocks(&self) -> impl Iterator<Item = u64> + 'o {
+    /// The stream's `SURFACE_USE` ops, in stream order.
+    fn uses(&self) -> impl Iterator<Item = RgfxOpSurfaceUse> + 'o {
         (op_bodies(self.ops))
             .filter(|&(tag, _)| tag == RGFX_OP_SURFACE_USE)
             .filter_map(|(_, body)| RgfxOpSurfaceUse::read_from_prefix(body).ok())
-            .map(|(op, _)| op.block_offset)
+            .map(|(op, _)| op)
+    }
+
+    /// The blocks the stream's `SURFACE_USE` ops name, in stream order.
+    fn used_blocks(&self) -> impl Iterator<Item = u64> + 'o {
+        self.uses().map(|op| op.block_offset)
     }
 
     /// The buffers of other queues its first `SURFACE_ORDER` (or `COMMIT_ORDER`) names.
@@ -918,13 +923,14 @@ impl<P: Platform> Decoders<P> {
     /// module doc), where it gets that at its take ([`Begun::submitted_at_take`]) with nothing
     /// waited for or allocated on the way: its context's work is not refused, it names a command
     /// queue of its context, it asks for its `CB_SUBMITTED`, its last op, and waits for no event,
-    /// it uses no device cache ([`super::surface_cache`]) and no block whose `SURFACE_PAGES` the
-    /// surface worker is still carrying out ([`super::worker::Unsettled`]), which its begin waits
-    /// for, waits for no buffer of another queue ([`super::surface_order`]), names in its
-    /// `COMMIT_ORDER` only buffers begun ([`super::commit_order`]), no buffer before it holds its
-    /// queue, its queue holds fewer than [`TAKE_IN_FLIGHT_MAX`] command buffers made
-    /// and not completed and no answered buffer not yet begun, and each lock it takes is free,
-    /// each tried. Its turn in its queue's lane and its
+    /// nor for a copy of a device cache it uses (a fill it needs or one not yet done, or a copy
+    /// asked before it that it follows, [`super::surface_cache::Caches::waits_for_nothing`]), it
+    /// uses no block whose `SURFACE_PAGES` the surface worker is still carrying out
+    /// ([`super::worker::Unsettled`]), which its begin waits for, waits for no buffer of another
+    /// queue ([`super::surface_order`]), names in its `COMMIT_ORDER` only buffers begun
+    /// ([`super::commit_order`]), no buffer before it holds its queue, its queue holds fewer than
+    /// [`TAKE_IN_FLIGHT_MAX`] command buffers made and not completed and no answered buffer not yet
+    /// begun, and each lock it takes is free, each tried. Its turn in its queue's lane and its
     /// ticket in the commit order are taken together, or neither, and kept on its queue
     /// ([`Answered`]), and the answer is posted through `post`, which posts a record's bytes,
     /// waits for nothing and answers whether it posted it: its `CB_SUBMITTED`, then, where that
@@ -953,7 +959,7 @@ impl<P: Platform> Decoders<P> {
         if !glance.asks
             || glance.waits
             || context_of(m.queue_obj_id) != context
-            || shared.surface_caches.none_cached(glance.used_blocks()) != Some(true)
+            || shared.surface_caches.waits_for_nothing(glance.uses()) != Some(true)
             || shared.unsettled.try_any(glance.used_blocks()) != Some(false)
         {
             return false;

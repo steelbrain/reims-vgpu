@@ -2646,9 +2646,18 @@ commit. Each outcome the new design allows is one of those two:
   the ops only where the stream's last op is the buffer's `SUBMITTED`, where the
   bundle appends it at the commit, so a buffer that does not ask costs the vCPU
   no scan of its ops. A buffer that does not ask, or whose ask is not its last
-  op, or that uses a device cache, waits for an event or another queue's
-  buffer, sits behind a held buffer, or finds a lock busy is left to the
-  queue's thread, as before. The answer takes the buffer's turn in its queue's lane and its ticket
+  op, or that waits for a copy of a device cache it uses (a fill it needs or
+  one not yet done, or a copy asked before it that it follows), waits for an
+  event or another queue's buffer, sits behind a held buffer, or finds a lock
+  busy is left to the queue's thread, as before. One that uses a device cache
+  and waits for none of its copies is answered there: it was left to the
+  queue's thread for using one at all. A copy asked between the answer and the
+  buffer's begin (a fill a write of the host's devices over the pages asks, a
+  present's fill, a download or a release) is followed at the begin all the
+  same where the buffer must follow it ("Device caches" above), the buffer
+  waiting for it on the GPU with its answer given: the two were concurrent,
+  and the buffer is ordered after the copy, as one begun after it is.
+  The answer takes the buffer's turn in its queue's lane and its ticket
   in the commit order together, with its mark (every ticket issued before its
   own), keeps them on the queue (`cmdbuf`'s `Answered`), and posts the record.
   The queue's thread then takes the buffer without waiting for ring 0 again
@@ -2683,9 +2692,10 @@ commit. Each outcome the new design allows is one of those two:
   `a_buffer_answered_at_the_doorbell_is_carried_out_as_one_decoded`,
   `a_buffer_begun_after_an_answer_is_committed_after_the_answered_buffer`,
   `a_reset_between_an_answer_and_its_begin_lets_the_answer_go` and
-  `a_refused_make_after_an_answer_fails_in_turn`, the decoder's fuzz
-  (`an_answer_at_the_doorbell_keeps_the_order_of_a_take`), and the device's
-  `an_answered_command_buffer_waits_for_no_later_ring_0_message`.
+  `a_refused_make_after_an_answer_fails_in_turn`, the `surface_cache` test
+  `a_buffer_using_a_cache_is_answered_at_its_doorbell_where_it_waits_for_no_copy`,
+  the decoder's fuzz (`an_answer_at_the_doorbell_keeps_the_order_of_a_take`),
+  and the device's `an_answered_command_buffer_waits_for_no_later_ring_0_message`.
 
 ## Stage 3 guest stack (from the prior-art study)
 
