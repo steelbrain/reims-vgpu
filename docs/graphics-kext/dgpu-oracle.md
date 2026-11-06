@@ -954,15 +954,32 @@ What our stack does:
   RgfxTexture.h). The bundle had sent each of these to the host, posted, and answered a texture;
   the host refused most, and the guest's command buffers naming the texture then failed. That
   includes every two-plane format, which the lane made as the M3 does until 11-05 (Q13).
-- *(outside the envelope, the host's limit)* A block-compressed format over a surface answers
-  nil (`RgfxIOSurfaceTexture`). Both x86 Macs make it wherever its rows fit, but the host makes no
-  texture of one over a surface's rows (metal2vulkan's `NotLinear`), and a texture the host then
-  refused would fail every command buffer naming it. It is the host runtime's gap.
-- What the x86 Macs make, the host also refuses in places: over a planar surface's plane, a
-  texture wider than its rows or taller than the plane, a mipmapped one, and one of a type other
-  than 2D (all made on the M3 too, but the Cube); and a TextureBuffer over any surface. The bundle
-  sends these, posted, and the host's refusal fails the command buffers that name them
-  (`refused.rs`). They are the host runtime's gaps.
+- *(class 3)* A BC1 to BC7 texture over a surface is made and posted, as both x86 Macs make it
+  wherever its rows fit (`RgfxIOSurfaceTexture`). The Vulkan runtime makes it in their form since
+  metal2vulkan's stack 34, row j of its blocks at the plane's row j, over a surface without planes
+  and over a plane at an offset and rows that are multiples of 16 bytes
+  (`bc_textures_over_a_surface_s_rows_are_made`). The bundle's own CPU access takes the same rows
+  (`test_iosurface_block_compressed_textures_are_made`). Until then the bundle answered nil for
+  every block-compressed texture over a surface, as the runtime made none.
+- *(outside the envelope, the host's limit)* The Metal platform answers nil for a BC texture over
+  a surface's plane: it makes the texture over the buffer that stands for the surface, and Metal's
+  buffer creator answers nil for BC1 and BC7, as the M3's own IOSurface creator does
+  (`bc_textures_over_a_surface_s_plane_are_metals`, measured on the M3 under macOS 27). The
+  guest's texture of one is then a refused create there (`refused.rs`).
+- What the x86 Macs make, the Vulkan runtime still refuses in places, as its
+  `NotImplemented(SurfacePlaneShape)` at stack 34, where the three GPUs lay the texels out no one
+  way: over a planar surface's plane, a texture wider than its rows, a mipmapped one, a 2DArray of
+  more than one slice, a 3D, Cube or 2DMultisample one, a 1D one wider than a row, and a BC
+  texture or a TextureBuffer at an offset or rows off 16 bytes; and, over any surface, a texture
+  past the surface's end (`TexelsPastBufferLength`). The bundle sends these, posted, and the
+  host's refusal fails the command buffers that name them (`refused.rs`). They are the host
+  runtime's gaps. Stack 34 makes a TextureBuffer over any surface, and over a planar surface's
+  plane a 1D texture whose row fits and a 2DArray of one slice, each laid out as the 2D texture of
+  its rows.
+- *(outside the envelope, the runtime's M3 form)* A texture taller than its plane, inside the
+  surface, is made as the M3 lays it out, its rows past the plane at the plane's pitch. On both
+  x86 GPUs the bytes past the plane are left unwritten (metal2vulkan's byte probe), which the
+  runtime cannot follow, as it is given no plane height.
 
 ## Q21: pipelines' reflection
 

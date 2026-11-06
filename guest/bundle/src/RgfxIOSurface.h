@@ -145,11 +145,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// A texture of shape `descriptor` over plane `plane` of `surface`, over the plane's GPU
 /// view, taken on first use: the surface's pages in place, else a copy in its shared block or a
 /// block of this process's own in `region`, synced from the surface's pages. Nil when the
-/// surface has no such plane, its format is block-compressed (which Metal makes, but the host
-/// makes no texture of over a surface's rows), its plane has no CPU mapping, the region has no
-/// room, or
-/// no texture resource id is left. The device's creator first ends the process where Metal does
-/// (rgfxEndAtInvalidSurfaceTexture).
+/// surface has no such plane, its plane has no CPU mapping, the region has no room, or no
+/// texture resource id is left. The device's creator first ends the process where Metal does
+/// (rgfxEndAtInvalidSurfaceTexture). A block-compressed texture is made as any other, its row j
+/// of blocks at the plane's row j, as the AMD 5300M and the Intel 630 make one wherever its rows
+/// fit (oracle_surftex, Q20).
 + (nullable instancetype)textureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                      iosurface:(IOSurfaceRef)surface
                                          plane:(NSUInteger)plane
@@ -384,8 +384,9 @@ void rgfxIOSurfaceWriteBack(const std::vector<std::shared_ptr<void>> &writes);
 bool rgfxIOSurfaceWritesInPlace(const std::vector<std::shared_ptr<void>> &writes);
 
 /// How many textures over `surface` were answered nil for `cause` ("arguments", "plane",
-/// "descriptor", "plane shape", "region", "buffer", "resource id", "texture"), and the "RGFX:"
-/// line logged for the first, without the prefix (for the tests): 0 and empty where none was.
+/// "plane shape", "region", "buffer", "origin", "resource id", "create", "texture"), and the
+/// "RGFX:" line logged for the first, without the prefix (for the tests): 0 and empty where none
+/// was.
 uint64_t rgfxIOSurfaceNilLog(IOSurfaceRef _Nullable surface, const char *_Nonnull cause,
                              std::string *_Nonnull line);
 

@@ -11572,6 +11572,119 @@ void test_iosurface_cpu_access_in_the_texture_s_format()
 	CFRelease(s);
 }
 
+// A BC1 or BC7 texture over a surface is made, as the AMD 5300M and the Intel 630 make one
+// wherever its rows fit (oracle_surftex, Q20), and its create posted, over a surface without
+// planes and over either plane of a two-plane one, at the plane's place in the copy and its rows
+// 256 bytes apart. Its CPU access reads and writes its rows of blocks, row j at the plane's row j.
+void test_iosurface_block_compressed_textures_are_made()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	SurfaceBlockAt src{RGFX_ALLOCATIONS_OFFSET + 0x40000};
+	region.setSurfaceSource(&SurfaceBlockAt::acquire, &SurfaceBlockAt::release, &src);
+	const uint64_t kPitch = 256;
+	auto over = [&](IOSurfaceRef s, MTLPixelFormat format, NSUInteger w, NSUInteger h,
+	                NSUInteger plane) {
+		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		                                                                              width:w
+		                                                                             height:h
+		                                                                          mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:s
+		                                            plane:plane
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+	auto posted = [&](uint32_t format, uint32_t w, uint32_t h, uint64_t offset, uint32_t plane) {
+		auto m = expectMessage<RgfxSurfaceTextureMessage>(fx.ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+		return m.texture.desc.pixel_format == format && m.texture.desc.width == w &&
+		       m.texture.desc.height == h && m.texture.offset == offset &&
+		       m.texture.bytes_per_row == kPitch && m.texture.plane == plane;
+	};
+	// A 64 x 64 'BGRA' surface, 256 bytes a row: a BC1 texture of 16 blocks of 8 bytes a row, and
+	// a BC7 one of 16 of 16.
+	IOSurfaceRef flat = filledBgraSurface(64, 64);
+	CHECK(IOSurfaceGetBytesPerRow(flat) == 256);
+	const uint8_t *copy = mem.data() + src.offset;
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *bc1 = over(flat, MTLPixelFormatBC1_RGBA, 64, 64, 0);
+		CHECK(bc1 != nil);
+		(void)expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(posted(MTLPixelFormatBC1_RGBA, 64, 64, 0, 0));
+		RgfxIOSurfaceTexture *bc7 = over(flat, MTLPixelFormatBC7_RGBAUnorm, 64, 64, 0);
+		CHECK(bc7 != nil && posted(MTLPixelFormatBC7_RGBAUnorm, 64, 64, 0, 0));
+		CHECK(bc1.pixelFormat == MTLPixelFormatBC1_RGBA && bc7.pixelFormat == MTLPixelFormatBC7_RGBAUnorm);
+		// The BC1 texture's blocks from (4, 4), two by two: 16 bytes of rows 1 and 2 from byte 8.
+		std::vector<uint8_t> out(2 * 16 + 16, 0xee);
+		[bc1 getBytes:out.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(4, 4, 8, 8) mipmapLevel:0];
+		CHECK(std::memcmp(out.data(), copy + kPitch + 8, 16) == 0 &&
+		      std::memcmp(out.data() + 16, copy + 2 * kPitch + 8, 16) == 0);
+		CHECK(std::all_of(out.begin() + 32, out.end(), [](uint8_t b) { return b == 0xee; }));
+		// The BC7 texture's first block: 16 bytes of row 0, in the copy and the surface.
+		uint8_t block[16];
+		for (int i = 0; i < 16; i++)
+			block[i] = static_cast<uint8_t>(0xc0 + i);
+		[bc7 replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:block bytesPerRow:16];
+		CHECK(std::memcmp(copy, block, 16) == 0 && copy[16] == 16 && copy[kPitch] == 7);
+		IOSurfaceLock(flat, kIOSurfaceLockReadOnly, nullptr);
+		CHECK(std::memcmp(IOSurfaceGetBaseAddress(flat), block, 16) == 0);
+		IOSurfaceUnlock(flat, kIOSurfaceLockReadOnly, nullptr);
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+	CFRelease(flat);
+
+	// A 64 x 48 'x420' surface: plane 0 128 bytes a row, plane 1 32 x 24 of 128 bytes a row, in
+	// the copy at 0 and 12288. A BC7 texture over plane 0 of 8 blocks of 16 bytes a row, and a
+	// BC1 one over plane 1 of 8 blocks of 8.
+	src.offset = RGFX_ALLOCATIONS_OFFSET + 0x80000;
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @64,
+		(id)kIOSurfaceHeight : @48,
+		(id)kIOSurfacePixelFormat : @(0x78343230u),
+		(id)kIOSurfaceAllocSize : @(128 * 48 + 128 * 24),
+		(id)kIOSurfacePlaneInfo : @[
+			@{
+				(id)kIOSurfacePlaneWidth : @64,
+				(id)kIOSurfacePlaneHeight : @48,
+				(id)kIOSurfacePlaneBytesPerElement : @2,
+				(id)kIOSurfacePlaneBytesPerRow : @128,
+				(id)kIOSurfacePlaneOffset : @0,
+				(id)kIOSurfacePlaneSize : @(128 * 48),
+			},
+			@{
+				(id)kIOSurfacePlaneWidth : @32,
+				(id)kIOSurfacePlaneHeight : @24,
+				(id)kIOSurfacePlaneBytesPerElement : @4,
+				(id)kIOSurfacePlaneBytesPerRow : @128,
+				(id)kIOSurfacePlaneOffset : @(128 * 48),
+				(id)kIOSurfacePlaneSize : @(128 * 24),
+			},
+		],
+	};
+	IOSurfaceRef planar = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(planar != nullptr && IOSurfaceGetPlaneCount(planar) == 2);
+	const uint64_t kChroma = 12288;
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *bc7 = over(planar, MTLPixelFormatBC7_RGBAUnorm, 32, 48, 0);
+		CHECK(bc7 != nil);
+		(void)expectMessage<RgfxBufferOverHostMemory>(fx.ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(posted(MTLPixelFormatBC7_RGBAUnorm, 32, 48, 0, 0));
+		RgfxIOSurfaceTexture *bc1 = over(planar, MTLPixelFormatBC1_RGBA, 32, 24, 1);
+		CHECK(bc1 != nil && posted(MTLPixelFormatBC1_RGBA, 32, 24, kChroma, 1));
+		CHECK(bc1.iosurfacePlane == 1 && bc7.iosurfacePlane == 0);
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+	CFRelease(planar);
+}
+
 // A surface copy's writers (RgfxIOSurface.h): a block made for this process starts with none
 // whatever it held, and its texture names them to the host; each commit of a buffer that draws
 // the copy names its queue and seqno there, in the queue's own slot, raised; another queue takes
@@ -14611,19 +14724,6 @@ void test_iosurface_nil_is_logged()
 	CHECK(rgfxIOSurfaceNilLog(s, "arguments", &line) == 1 &&
 	      has(line, "no descriptor"));
 	CHECK(rgfxIOSurfaceNilLog(s, "buffer", &line) == 0 && line.empty());
-	// A block-compressed format, which Metal makes but the host makes no texture of over a
-	// surface's rows (oracle_surftex, Q20), answers nil before the surface's pages are looked at.
-	MTLTextureDescriptor *bc1 =
-	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBC1_RGBA
-	                                                       width:64
-	                                                      height:64
-	                                                   mipmapped:NO];
-	@autoreleasepool {
-		CHECK(texture(bc1, 0) == nil);
-	}
-	CHECK(rgfxIOSurfaceNilLog(s, "descriptor", &line) == 1 &&
-	      has(line, "a block-compressed format over a surface, which the host makes no texture "
-	                "of"));
 	CHECK(region.used() == 0 && ringEmpty(fx.ring));
 	CFRelease(s);
 	rgfxIOSurfaceKeepFlush(); // nothing kept outlives the test's region
@@ -14944,6 +15044,7 @@ int main(int argc, char **argv)
 		test_iosurface_shared_block();
 		test_iosurface_planes();
 		test_iosurface_cpu_access_in_the_texture_s_format();
+		test_iosurface_block_compressed_textures_are_made();
 		test_iosurface_writers();
 		test_iosurface_order();
 		test_iosurface_slots_free_at_completion();
