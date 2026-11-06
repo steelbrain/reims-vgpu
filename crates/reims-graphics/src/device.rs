@@ -11,14 +11,14 @@
 //! command meanwhile. The guest's kexts are its sole producer, under one lock: the framebuffer's
 //! display commands, and the object lifecycle the accelerator posts for the guest's processes
 //! (creates and destroys, `QUEUE_CREATE`, `CONTEXT_CLOSE`), which the control thread hands, with
-//! no ring held, to the lane of the process's context (`lanes`): `reims-vgpu.graphics-context-*`
-//! carries the context's messages out in ring order, handing its creates and destroys to the
-//! host's decoder ([`Host::stage3_message`]), so one context's slow message holds up only its own
-//! later ones. `reims-vgpu.graphics-presents` carries the `PRESENT_SURFACE`s out, in ring order,
-//! and `reims-vgpu.graphics-block-*` a block's `SURFACE_PAGES` and `SURFACE_DOWNLOAD`s, whichever
-//! process posted them, but for a download the host carries out on the control thread, where the
-//! block's lane has nothing left and the host need wait for nothing
-//! ([`Host::try_surface_download`]).
+//! no ring held, to the lane of the process's context (`lanes`): the context's lane carries its
+//! messages out in ring order, handing its creates and destroys to the host's decoder
+//! ([`Host::stage3_message`]), so one context's slow message holds up only its own later ones.
+//! The presents' lane carries the `PRESENT_SURFACE`s out, in ring order, and a block's lane the
+//! block's `SURFACE_PAGES` and `SURFACE_DOWNLOAD`s, whichever process posted them, but for a
+//! download the host carries out on the control thread, where the block's lane has nothing left
+//! and the host need wait for nothing ([`Host::try_surface_download`]). Ring 0's threads,
+//! `reims-vgpu.graphics-ring0-*`, serve the lanes, each lane with a job on one of them.
 //! The replies (a pipeline's reflection, a `COMPLETE`) come back on the control completion ring.
 //! Every other ring is a command queue's own (below), so each ring keeps a single producer and a
 //! single consumer, and their `consumer_idle` handshakes never race.
@@ -144,7 +144,7 @@ use zerocopy::{FromBytes, IntoBytes};
 use crate::control;
 use crate::device::backlog::Backlog;
 use crate::device::gate::{Gate, Look, Offer};
-use crate::device::lanes::{Key, Lanes};
+use crate::device::lanes::{Hand, Key, Lanes};
 use crate::display::{Mode, Scanout, Screen};
 use crate::ops::RgfxCommandBuffer;
 use crate::region::Region;
@@ -284,9 +284,8 @@ const COMPLETE: RingAt = RingAt {
 pub trait Host: Send + Sync + 'static {
     /// Raise MSI-X vector `vector`, the vector of the completion ring an event was published on
     /// (0 for the control ring's; a queue's, as its `QUEUE_CREATE` gives it), after the event. On
-    /// the thread that posts it: the control, refresh or a queue's service thread, a lane's
-    /// (`reims-vgpu.graphics-context-*`, `reims-vgpu.graphics-presents`,
-    /// `reims-vgpu.graphics-block-*`), the host's inside
+    /// the thread that posts it: the control, refresh or a queue's service thread, one of ring 0's
+    /// threads, which serve the lanes (`reims-vgpu.graphics-ring0-*`), the host's inside
     /// [`Device::mmio_write_taking`], or one of the host's that holds a
     /// [`CompletionPoster`] or a [`CompleteAnswer`]. Locks may be held around it, none that a call
     /// of the device's waits for: a queue's claim on its messages, on its service thread and
@@ -387,7 +386,7 @@ pub trait Host: Send + Sync + 'static {
     /// host that carries out [`RGFX_FEATURE_PAGES_BUFFERS`] keeps for its `BUFFER_OVER_PAGES`
     /// buffers alone. The host gives `answer` from any thread once it has carried the message
     /// out, and carries out every later message that names the block as if after it. Called on
-    /// the block's lane (`reims-vgpu.graphics-block-*`), in ring order, after the messages of
+    /// the block's lane (on one of ring 0's threads), in ring order, after the messages of
     /// its context's published before it that name the block. The default maps nothing, and
     /// refuses at once.
     fn surface_pages(
@@ -805,6 +804,17 @@ impl Device {
         host: Box<dyn Host>,
         screen: Box<dyn Screen>,
     ) -> Option<Device> {
+        Device::with_lanes(region, host, screen, Lanes::default())
+    }
+
+    /// [`Self::new`], over `lanes`, whose threads wait as long as they keep (the tests; else
+    /// [`crate::keep::KEEP`]).
+    fn with_lanes(
+        region: Arc<Region>,
+        host: Box<dyn Host>,
+        screen: Box<dyn Screen>,
+        lanes: Lanes,
+    ) -> Option<Device> {
         if region.size() < RGFX_ALLOCATIONS_OFFSET + 4096 {
             return None;
         }
@@ -834,7 +844,7 @@ impl Device {
             room_poll_ns: AtomicU64::new(u64::try_from(ROOM_POLL.as_nanos()).unwrap_or(u64::MAX)),
             control_done: AtomicU64::new(0),
             gate: Gate::default(),
-            lanes: Arc::default(),
+            lanes: Arc::new(lanes),
             queues: Mutex::new(Queues::default()),
             weak_self: OnceLock::new(),
             #[cfg(test)]
@@ -1429,30 +1439,31 @@ impl Shared {
     }
 
     /// Hands `message`, taken at reset count `epoch`, ring 0's count through it `through`, to the
-    /// lane `key` ([`lanes`]), starting the lane's thread where it has none. Where no thread can
-    /// be started, the lane's jobs are carried out here.
+    /// lane `key` ([`lanes`]), starting one of ring 0's threads for the lane where it has none and
+    /// none waits for a lane. Where no thread can be started, the lane's jobs are carried out
+    /// here.
     fn hand(&self, key: Key, message: Message, through: u64, epoch: u64) {
-        let start = self.lanes.hand(key, message, through, epoch, |surface| {
+        let hand = self.lanes.hand(key, message, through, epoch, |surface| {
             self.host.surface_textures(surface)
         });
-        if !start {
+        let Hand::Start(index) = hand else {
             return;
-        }
+        };
         let lanes = Arc::clone(&self.lanes);
         let shared = self.weak_self.get().cloned().unwrap_or_default();
         let started = std::thread::Builder::new()
-            .name(key.thread_name())
-            .spawn(move || serve_lane(&lanes, &shared, key, true));
+            .name(lanes::thread_name(index))
+            .spawn(move || serve_ring0(&lanes, &shared, index, key));
         if let Err(e) = started {
             log::warn!(
                 target: "reims_graphics",
-                "{} could not be started ({e}): its messages are carried out on the control \
-                 thread",
-                key.thread_name()
+                "{} could not be started ({e}): the messages of {key:?}'s lane are carried out on \
+                 the control thread",
+                lanes::thread_name(index)
             );
-            self.lanes.unserved(key);
+            self.lanes.unstarted(index, key);
             let shared = self.weak_self.get().cloned().unwrap_or_default();
-            serve_lane(&self.lanes, &shared, key, false);
+            serve_lane(&self.lanes, &shared, key, None);
         }
     }
 
@@ -2397,12 +2408,26 @@ impl RefreshGrid {
 
 /// A completion ring locked: waiting for it where `wait`, else only where no other thread holds
 /// it.
-/// A lane's thread ([`lanes`]): carries out each job of the lane `key` in turn, with no lock of
-/// the device's held, as the control thread carries out an object-lifecycle message, posts its
-/// answer, and goes once the lane has had no job for a while (at once where not `wait`), or the
-/// device ends. A job taken before a reset is not carried out.
-fn serve_lane(lanes: &Lanes, shared: &Weak<Shared>, key: Key, wait: bool) {
-    while let Some(job) = lanes.next(key, wait) {
+/// Ring 0's thread `index` ([`lanes`], "Threads"): serves the lane `first`, then each lane it is
+/// given, until it has waited [`crate::keep::KEEP`] for one, or the device ends.
+fn serve_ring0(lanes: &Lanes, shared: &Weak<Shared>, index: usize, first: Key) {
+    let mut key = first;
+    loop {
+        serve_lane(lanes, shared, key, Some(index));
+        match lanes.park(index) {
+            Some(next) => key = next,
+            None => return,
+        }
+    }
+}
+
+/// Serves the lane `key` ([`lanes`]): carries out each of its jobs in turn, with no lock of the
+/// device's held, as the control thread carries out an object-lifecycle message, and posts its
+/// answer, until the lane has no job left or the device ends; on ring 0's thread `spare`, which
+/// then waits for another lane, or, where `None`, on the control thread. A job taken before a
+/// reset is not carried out.
+fn serve_lane(lanes: &Lanes, shared: &Weak<Shared>, key: Key, spare: Option<usize>) {
+    while let Some(job) = lanes.next(key, spare) {
         let Some(shared) = shared.upgrade() else {
             lanes.finished(key);
             return;

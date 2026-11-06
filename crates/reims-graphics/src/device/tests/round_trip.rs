@@ -66,9 +66,9 @@ fn stats(mut us: Vec<f64>) -> (f64, f64, f64) {
 
 /// A context's synchronous creates, each posted once the one before it is answered, as the kext
 /// posts a create it waits for: back to back (`warm`), each after `ASYNC` of the context's creates
-/// it does not wait for (`behind`), and each after a pause longer than a lane's thread waits
-/// (`cold`). Prints the mean, median and 99th percentile of each, from the post's doorbell to
-/// the answer read.
+/// it does not wait for (`behind`), and each after a pause of 1.2 s (`cold`), in which the lane's
+/// thread has gone to wait for another lane. Prints the mean, median and 99th percentile of each,
+/// from the post's doorbell to the answer read.
 #[test]
 #[ignore = "a measurement, run by hand"]
 #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time

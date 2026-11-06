@@ -7,13 +7,12 @@
 //! object-lifecycle message of a context's ([`backlog`](super::backlog)'s `Whose::Context`) to
 //! the context's lane, and each `PRESENT_SURFACE`, with the `DISPLAY_COLOR`s that stage its
 //! colour, to the presents' lane. A lane carries its jobs out one at a time, in the order they
-//! were handed, on a thread made as a job comes to a lane with none, which goes once the lane has
-//! had no job for [`IDLE`]. The control thread carries the rest out itself: the display commands,
-//! and a message no lane is for, which the host refuses. It first offers the host a
-//! `SURFACE_DOWNLOAD` of a block whose lane has nothing left to carry out, which the host carries
-//! out there where it need wait for nothing (`Host::try_surface_download`): the download keeps its
-//! place behind the block's earlier messages, all carried out, and the lane's thread is not woken
-//! for it. One the host leaves goes to the block's lane.
+//! were handed, on one of ring 0's threads (below). The control thread carries the rest out
+//! itself: the display commands, and a message no lane is for, which the host refuses. It first
+//! offers the host a `SURFACE_DOWNLOAD` of a block whose lane has nothing left to carry out, which
+//! the host carries out there where it need wait for nothing (`Host::try_surface_download`): the
+//! download keeps its place behind the block's earlier messages, all carried out, and no thread is
+//! woken for it. One the host leaves goes to the block's lane.
 //!
 //! A block's lane keeps the messages that make and copy what the host holds of the block's pages
 //! (its view and device cache) in ring order, whichever process posted them and for whichever
@@ -93,22 +92,38 @@
 //! oldest job not yet carried out is never waiting: the waits end, by induction on the ring
 //! order.
 //!
+//! **Threads.** Ring 0's threads (`reims-vgpu.graphics-ring0-<i>`) serve the lanes: a lane that is
+//! handed a job and has no thread is given the thread that went idle last ([`Lanes::hand`]), or
+//! one made for it where none waits, and keeps it until it has no job left; the thread then waits
+//! for the next lane, and goes once it has waited [`KEEP`] (the [`keep`](crate::keep) module). A
+//! lane with nothing to do holds no thread, and a thread is woken only for a lane it is given. So
+//! the device holds as many threads as it had lanes busy at once in the last [`KEEP`], whichever
+//! contexts and blocks they were: with a thread of each lane's own, made as a job came to a lane
+//! with none and gone once the lane had had none for 1 s, every block's first `SURFACE_PAGES` made
+//! a thread, and so did every lane's job after a pause of a second, 345 threads in 30 s of a
+//! WindowServer probe (car 12's B1, msi RTX 5080 host; measured). A thread is never refused to a
+//! lane with a job, so the waits still end.
+//!
 //! **A reset** drops every job not yet begun ([`Lanes::reset`]); one begun carries on, and the
 //! control thread tells the host of the reset only once it has ended ([`Lanes::wait_begun`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 use zerocopy::FromBytes;
 
 use super::backlog::{Whose, whose};
+#[cfg(doc)]
+use crate::keep::KEEP;
+use crate::keep::Keep;
 use crate::ring::Message;
 use crate::wire::*;
 
-/// How long a lane's thread waits for a job before it goes.
-pub(super) const IDLE: Duration = Duration::from_secs(1);
+/// The name of ring 0's thread `index` (the module doc, "Threads").
+pub(super) fn thread_name(index: usize) -> String {
+    format!("reims-vgpu.graphics-ring0-{index}")
+}
 
 /// Which lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -141,15 +156,6 @@ impl Key {
         match whose(message.header.r#type, field(message)) {
             Whose::Context(context) => Some(Key::Context(context)),
             Whose::Every | Whose::NoOne => None,
-        }
-    }
-
-    /// The name of the lane's thread.
-    pub(super) fn thread_name(self) -> String {
-        match self {
-            Key::Context(context) => format!("reims-vgpu.graphics-context-{context}"),
-            Key::Presents => "reims-vgpu.graphics-presents".to_owned(),
-            Key::Block(offset) => format!("reims-vgpu.graphics-block-{offset:#x}"),
         }
     }
 }
@@ -216,12 +222,24 @@ struct Lane {
     running: Option<Note>,
     /// Ring 0's count through the last job handed to it.
     handed: u64,
-    /// A thread serves it.
+    /// A thread serves it, or was given it.
     served: bool,
-    /// Its thread waits here for a job, or for the lanes its first job waits for: a lane is woken
-    /// only for what it waits for, as each context's lane stays made for [`IDLE`] after its last
-    /// job, and a device of many processes holds many such lanes.
+    /// Its thread waits here for the lanes its first job waits for: a lane is woken only for what
+    /// it waits for, as a device of many processes holds many lanes.
     wake: Arc<Condvar>,
+}
+
+/// One of ring 0's threads (the module doc, "Threads").
+#[derive(Debug, Default)]
+struct Ring0Thread {
+    /// The lane it was given to serve next, while it waited for one.
+    given: Option<Key>,
+    /// It waits here for a lane.
+    wake: Arc<Condvar>,
+    /// When it last began to wait for a lane, on [`Lanes::keep`]'s clock: read as it joins the
+    /// spares, under their lock, so a test that sees it there and moves the clock moves it past
+    /// its wait's start.
+    since: u64,
 }
 
 impl Lane {
@@ -265,8 +283,17 @@ struct State {
     /// The lanes whose thread waits for other lanes to carry out the jobs its first job waits
     /// for: each is woken once they have ([`Lanes::finished`]).
     blocked: HashSet<Key>,
+    /// Ring 0's threads, by the index in their names; `None` where none has it.
+    threads: Vec<Option<Ring0Thread>>,
+    /// The threads that wait for a lane, by index, the one that went idle last at the end.
+    spares: Vec<usize>,
     /// The device ended.
     ended: bool,
+    /// How many of ring 0's threads were made, and how many went (the tests).
+    #[cfg(test)]
+    made: u64,
+    #[cfg(test)]
+    gone: u64,
     /// How many times a blocked lane was woken (the tests).
     #[cfg(test)]
     woken: u64,
@@ -516,13 +543,34 @@ pub(super) struct Lanes {
     state: Mutex<State>,
     /// A job was carried out, a reset came, or the device ended ([`Self::wait_begun`]).
     moved: Condvar,
+    /// How long a thread with no lane waits for one before it goes: [`KEEP`], but in the tests.
+    keep: Keep,
+}
+
+/// What [`Lanes::hand`] asks of its caller.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Hand {
+    /// Nothing: the lane has a thread, or was given one that waited for a lane.
+    Served,
+    /// To start ring 0's thread `index` ([`thread_name`]), to serve the lane first
+    /// ([`Lanes::unstarted`] where it cannot).
+    Start(usize),
 }
 
 impl Lanes {
+    /// Lanes whose threads wait `keep` for a lane before they go (the tests; else [`KEEP`]).
+    #[cfg(test)]
+    pub(super) fn with_keep(keep: Keep) -> Lanes {
+        Lanes {
+            keep,
+            ..Lanes::default()
+        }
+    }
+
     /// Hands `message`, ring 0's count through it `through`, taken at reset count `epoch`, to the
     /// lane `key`, with the edges it waits for; `surface_textures` answers the objects the host
-    /// names an IOSurface by, for a present's. Whether the lane has no thread, so the caller
-    /// starts one ([`Self::unserved`] where it cannot).
+    /// names an IOSurface by, for a present's. Where the lane has no thread, it is given the
+    /// thread that went idle last, or the caller starts one for it.
     pub(super) fn hand(
         &self,
         key: Key,
@@ -530,11 +578,11 @@ impl Lanes {
         through: u64,
         epoch: u64,
         surface_textures: impl FnOnce(u32) -> Vec<u64>,
-    ) -> bool {
+    ) -> Hand {
         let mut state = self.state.lock();
         if state.epoch != epoch {
             // Taken before a reset the lanes were told of: moot.
-            return false;
+            return Hand::Served;
         }
         let mut job = Job {
             message,
@@ -550,13 +598,37 @@ impl Lanes {
         let lane = state.lanes.entry(key).or_default();
         lane.handed = through;
         lane.jobs.push_back((job, note));
-        let start = !lane.served;
+        // A job handed makes no lane's job ready, its own lane's first among them: each waits only
+        // for jobs handed before. So a lane with a thread has nothing to be woken for.
+        if lane.served {
+            return Hand::Served;
+        }
         lane.served = true;
-        let wake = Arc::clone(&lane.wake);
-        drop(state);
-        // A job handed makes no other lane's job ready: each waits only for jobs handed before.
-        wake.notify_one();
-        start
+        if let Some(index) = state.spares.pop()
+            && let Some(thread) = state.threads.get_mut(index).and_then(Option::as_mut)
+        {
+            thread.given = Some(key);
+            let wake = Arc::clone(&thread.wake);
+            drop(state);
+            wake.notify_one();
+            return Hand::Served;
+        }
+        let threads = &mut state.threads;
+        let index = threads
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(threads.len());
+        if index == threads.len() {
+            threads.push(None);
+        }
+        if let Some(slot) = threads.get_mut(index) {
+            *slot = Some(Ring0Thread::default());
+        }
+        #[cfg(test)]
+        {
+            state.made += 1;
+        }
+        Hand::Start(index)
     }
 
     /// Whether the lane `key` has no job of the current reset count not yet carried out: none
@@ -565,19 +637,30 @@ impl Lanes {
         self.state.lock().busy_through(key).is_none()
     }
 
-    /// The lane `key` has no thread after all: its jobs are carried out by whoever calls
-    /// [`Self::next`] with `wait` false.
-    pub(super) fn unserved(&self, key: Key) {
-        if let Some(lane) = self.state.lock().lanes.get_mut(&key) {
+    /// Ring 0's thread `index`, which [`Self::hand`] asked for to serve the lane `key`, could not
+    /// be started: the lane has no thread after all, and its jobs are carried out by whoever calls
+    /// [`Self::next`] with no thread's index.
+    pub(super) fn unstarted(&self, index: usize, key: Key) {
+        let mut state = self.state.lock();
+        if let Some(slot) = state.threads.get_mut(index) {
+            *slot = None;
+        }
+        #[cfg(test)]
+        {
+            state.made -= 1;
+        }
+        if let Some(lane) = state.lanes.get_mut(&key) {
             lane.served = false;
         }
     }
 
     /// The next job of the lane `key`, once each lane it waits for is through its edge, for the
-    /// lane's thread: carried out, it is [`Self::finished`]. `None` once the device ends, or where
-    /// the lane has had no job for [`IDLE`] (at once, where not `wait`): the lane then has no
-    /// thread. A job taken before a reset is dropped.
-    pub(super) fn next(&self, key: Key, wait: bool) -> Option<Job> {
+    /// thread that serves it, ring 0's thread `spare` where it is one: carried out, it is
+    /// [`Self::finished`]. `None` once the device ends, or where the lane has no job left: the lane
+    /// then has no thread, and ring 0's thread `spare` waits for another lane
+    /// ([`Self::park`]), from here, so a job handed to the lane meanwhile is given to it. A job
+    /// taken before a reset is dropped.
+    pub(super) fn next(&self, key: Key, spare: Option<usize>) -> Option<Job> {
         let mut state = self.state.lock();
         loop {
             if state.ended {
@@ -589,21 +672,16 @@ impl Lanes {
             let ready = match lane.jobs.front() {
                 Some((job, _)) => state.ready(job),
                 None => {
-                    let gone = !wait || wake.wait_for(&mut state, IDLE).timed_out();
-                    let empty = state
-                        .lanes
-                        .get(&key)
-                        .is_none_or(|lane| lane.jobs.is_empty());
-                    if gone && empty {
-                        if let Some(lane) = state.lanes.get_mut(&key) {
-                            lane.served = false;
-                            if lane.running.is_none() {
-                                state.lanes.remove(&key);
-                            }
+                    if let Some(lane) = state.lanes.get_mut(&key) {
+                        lane.served = false;
+                        if lane.running.is_none() {
+                            state.lanes.remove(&key);
                         }
-                        return None;
                     }
-                    continue;
+                    if let Some(index) = spare {
+                        self.spare(&mut state, index);
+                    }
+                    return None;
                 }
             };
             if !ready {
@@ -664,6 +742,59 @@ impl Lanes {
         done
     }
 
+    /// Ring 0's thread `index`, with no lane to serve, waits for one, the threads that went idle
+    /// after it given one first ([`Self::hand`]): the lane it is given, or `None` once it has
+    /// waited [`KEEP`] for one, or the device ended; it then goes.
+    pub(super) fn park(&self, index: usize) -> Option<Key> {
+        let mut state = self.state.lock();
+        let wake = (state.threads.get(index))
+            .and_then(Option::as_ref)
+            .map(|thread| Arc::clone(&thread.wake))?;
+        let given = |state: &mut State| {
+            (state.threads.get_mut(index))
+                .and_then(Option::as_mut)
+                .and_then(|thread| thread.given.take())
+        };
+        // A thread that left its lane without a look at it ([`Self::next`]) waits from here.
+        let has_given = (state.threads.get(index))
+            .and_then(Option::as_ref)
+            .is_some_and(|thread| thread.given.is_some());
+        if !has_given && !state.spares.contains(&index) {
+            self.spare(&mut state, index);
+        }
+        let since = (state.threads.get(index))
+            .and_then(Option::as_ref)
+            .map_or(0, |thread| thread.since);
+        let mut kept = false;
+        loop {
+            if let Some(key) = given(&mut state) {
+                return Some(key);
+            }
+            if state.ended || kept {
+                if let Some(at) = state.spares.iter().rposition(|&i| i == index) {
+                    state.spares.remove(at);
+                }
+                if let Some(slot) = state.threads.get_mut(index) {
+                    *slot = None;
+                }
+                #[cfg(test)]
+                {
+                    state.gone += 1;
+                }
+                return None;
+            }
+            kept = self.keep.wait(&wake, &mut state, since);
+        }
+    }
+
+    /// Ring 0's thread `index` joins the spares, the last to go idle, from now.
+    fn spare(&self, state: &mut State, index: usize) {
+        if let Some(thread) = state.threads.get_mut(index).and_then(Option::as_mut) {
+            thread.since = self.keep.now();
+            state.spares.push(index);
+        }
+    }
+
     /// Whether every message of context `context`'s handed through ring 0's count `through` is
     /// carried out: a command buffer of the context waits for it, once the control thread has
     /// handed out every message it waits for.
@@ -710,12 +841,15 @@ impl Lanes {
         }
     }
 
-    /// The device ended: the lanes' threads go at their next look.
+    /// The device ended: the lanes' threads go at their next look, and so do those that wait for
+    /// a lane.
     pub(super) fn end(&self) {
         let wakes = {
             let mut state = self.state.lock();
             state.ended = true;
-            state.wakes()
+            let mut wakes = state.wakes();
+            wakes.extend((state.threads.iter().flatten()).map(|thread| Arc::clone(&thread.wake)));
+            wakes
         };
         for wake in wakes {
             wake.notify_one();
@@ -741,6 +875,19 @@ impl Lanes {
         (state.blocked.contains(&key), state.woken)
     }
 
+    /// How many of ring 0's threads there are, how many of them wait for a lane, and how many
+    /// were made and went (the tests).
+    #[cfg(test)]
+    pub(super) fn threads(&self) -> Ring0Threads {
+        let state = self.state.lock();
+        Ring0Threads {
+            live: state.threads.iter().flatten().count(),
+            spares: state.spares.len(),
+            made: state.made,
+            gone: state.gone,
+        }
+    }
+
     /// Whether no lane has a job not yet carried out (the tests).
     #[cfg(test)]
     pub(super) fn idle(&self) -> bool {
@@ -751,6 +898,19 @@ impl Lanes {
             .values()
             .all(|lane| lane.unfinished(epoch).next().is_none())
     }
+}
+
+/// Ring 0's threads, as [`Lanes::threads`] counts them (the tests).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Ring0Threads {
+    /// Those running.
+    pub(super) live: usize,
+    /// Those that wait for a lane.
+    pub(super) spares: usize,
+    /// Those made and gone, since the device was made.
+    pub(super) made: u64,
+    pub(super) gone: u64,
 }
 
 /// The 8 bytes at offset 16 of `message`, where it holds them.

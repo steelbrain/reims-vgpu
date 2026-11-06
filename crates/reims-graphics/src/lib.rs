@@ -15,11 +15,14 @@
 //!   in a window of the library's, and the C API hands it to QEMU's `reims-graphics-pci`.
 //! - `ring` is the host's two ends of a ring, `control` the commands, [`display`] the display's
 //!   modes, scanout and cursor, and [`region`] the region's memory.
+//! - [`keep`] is how long the device's pools of threads, and the host's, keep a thread with
+//!   nothing to do.
 
 mod control;
 pub mod device;
 pub mod display;
 pub mod icb;
+pub mod keep;
 pub mod managed;
 pub mod ops;
 pub mod region;

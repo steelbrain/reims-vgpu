@@ -1643,7 +1643,8 @@ fn a_raise_may_call_the_device_at_once() {
     assert_eq!(returned.lock().first(), Some(&here));
     reset(&device);
 
-    // On the presents' lane, at a present of the scanout, which the host shows and answers at once.
+    // On the presents' lane (one of ring 0's threads), at a present of the scanout, which the host
+    // shows and answers at once.
     let (device, returned, mut guest, _ring) = started();
     // SAFETY: as `Guest`'s helpers; `armed` is at 0xc0 of the control completion ring.
     unsafe {
@@ -1656,9 +1657,10 @@ fn a_raise_may_call_the_device_at_once() {
         .store(1, Ordering::SeqCst);
     }
     guest.send(&device, present_surface(0));
-    assert_eq!(
-        returned_on(&returned).as_deref(),
-        Some("reims-vgpu.graphics-presents")
+    let on = returned_on(&returned);
+    assert!(
+        (on.as_deref()).is_some_and(|name| name.starts_with("reims-vgpu.graphics-ring0-")),
+        "{on:?}"
     );
     reset(&device);
 }

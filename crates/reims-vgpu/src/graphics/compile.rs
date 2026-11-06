@@ -1,12 +1,12 @@
 //! Pipeline compiles off ring 0's threads: the [`CompilePool`] that runs them and the
 //! [`Pending`] pipelines a command buffer waits for.
 //!
-//! A pipeline create on ring 0 is prepared on its context's lane (`reims-graphics`' device,
-//! `reims-vgpu.graphics-context-*`), which then goes on with the context's later messages, and is
-//! compiled on one of the pool's threads, `reims-vgpu.graphics-compile-*`; its reply goes on ring
-//! 0's completion ring when the compile ends, keyed to the create by its seqno. Its process waits
-//! for that reply, as Metal's synchronous creators wait for their compile; nothing else does. A
-//! library create is made there too.
+//! A pipeline create on ring 0 is prepared on its context's lane (`reims-graphics`' device, on one
+//! of ring 0's threads, `reims-vgpu.graphics-ring0-*`), which then goes on with the context's later
+//! messages, and is compiled on one of the pool's threads, `reims-vgpu.graphics-compile-*`; its
+//! reply goes on ring 0's completion ring when the compile ends, keyed to the create by its seqno.
+//! Its process waits for that reply, as Metal's synchronous creators wait for their compile;
+//! nothing else does. A library create is made there too.
 //!
 //! **Turns.** Metal compiles each process's pipelines in that process, so one process's burst of
 //! creates delays no other's. The pool's threads serve the processes (contexts) in turns: the

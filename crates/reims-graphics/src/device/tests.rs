@@ -168,6 +168,11 @@ impl Rig {
 
     /// A rig whose device has `host` (what the rig records of the host's stays empty).
     fn with_host(host: Box<dyn Host>) -> Rig {
+        Rig::with_lanes(host, Lanes::default())
+    }
+
+    /// [`Self::with_host`], the device's ring 0's lanes `lanes`.
+    fn with_lanes(host: Box<dyn Host>, lanes: Lanes) -> Rig {
         let mode = Arc::new(Mutex::new(MODE));
         let told = Arc::new(Mutex::new(Vec::new()));
         let interrupts = Arc::new(AtomicU32::new(0));
@@ -175,13 +180,14 @@ impl Rig {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let presented = Arc::new(Mutex::new(Vec::new()));
         let region = Arc::new(Region::new(REGION_SIZE as usize).unwrap());
-        let device = Device::new(
+        let device = Device::with_lanes(
             region,
             host,
             Box::new(TestScreen {
                 mode: Arc::clone(&mode),
                 told: Arc::clone(&told),
             }),
+            lanes,
         )
         .unwrap();
         Rig {
@@ -2380,7 +2386,7 @@ fn a_reset_is_told_to_the_host_before_the_messages_after_it() {
     std::thread::sleep(Duration::from_millis(50));
     let control = Some("reims-vgpu.graphics-control".to_owned());
     let queue = Some(format!("reims-vgpu.graphics-queue-{QUEUE:#x}"));
-    let lane = Some("reims-vgpu.graphics-context-4".to_owned());
+    let lane = Some(RING0.to_owned());
     assert_eq!(
         *seen.lock(),
         [
@@ -2739,10 +2745,20 @@ struct Taking {
 /// where the doorbell's thread did not.
 struct TakingHost(Arc<Taking>);
 
-/// The calling thread's name.
+/// The calling thread's name, any of ring 0's threads' as [`RING0`]: which of them serves a lane
+/// is theirs to choose.
 fn thread_name() -> Option<String> {
-    std::thread::current().name().map(str::to_owned)
+    (std::thread::current().name()).map(|name| match name.strip_prefix(RING0_PREFIX) {
+        Some(_) => RING0.to_owned(),
+        None => name.to_owned(),
+    })
 }
+
+/// What [`thread_name`] answers on any of ring 0's threads, which serve the lanes.
+const RING0: &str = "reims-vgpu.graphics-ring0-*";
+
+/// The names of ring 0's threads begin so.
+const RING0_PREFIX: &str = "reims-vgpu.graphics-ring0-";
 
 /// Command buffer `cb_obj_id`'s `CB_SUBMITTED` at `seqno`.
 fn cb_submitted(seqno: u64, cb_obj_id: u64) -> RgfxCbSubmitted {
@@ -3180,7 +3196,7 @@ fn a_buffer_behind_its_process_s_create_is_answered_on_the_lane_s_thread() {
     let raised = taking.raised.lock().clone();
     assert_eq!(
         raised.first(),
-        Some(&(3, Some("reims-vgpu.graphics-context-5".to_owned()))),
+        Some(&(3, Some(RING0.to_owned()))),
         "the CB_SUBMITTED is raised on the lane's thread: {raised:?}"
     );
     let carried = taking.carried.lock();
@@ -3218,6 +3234,8 @@ mod lanes_fuzz;
 mod peer;
 /// What a synchronous create's round trip costs, measured by hand (`round_trip.rs`).
 mod round_trip;
+/// Ring 0's threads: kept through a steady load's pauses, gone after a burst (`threads.rs`).
+mod threads;
 
 // ---------------------------------------------------------------------------------------------
 // Ring 0's lanes (`device::lanes`): what crosses contexts waits for the lanes it reads.
@@ -3393,7 +3411,7 @@ impl Host for OrderHost {
     }
     fn surface_download(&self, _block_offset: u64, answer: CompleteAnswer) {
         self.record(RGFX_CMD_SURFACE_DOWNLOAD);
-        let thread = std::thread::current().name().map(str::to_owned);
+        let thread = thread_name();
         self.downloaded_on.lock().push(thread);
         answer.answer(RGFX_STATUS_OK);
     }
@@ -3870,54 +3888,6 @@ fn a_context_s_answer_comes_before_one_published_ahead_of_it_by_another_context(
     assert_eq!(seqno(rig.event().expect("A's answer")), first);
 }
 
-/// A reset drops what the lanes have not begun: a lane's message begun before it goes on, the
-/// host is told of the reset only once that message has ended, and the messages behind it, in its
-/// context's lane or in another lane waiting for it, are never carried out.
-/// A lane's thread is woken only for what it waits for: one with nothing to do goes after
-/// [`lanes::IDLE`] while another context's lane is busy, rather than waking at each of its jobs, as
-/// every lane once did (a device of many processes holds many such lanes).
-#[test]
-fn an_idle_lane_goes_while_another_context_s_is_busy() {
-    const IDLE_CONTEXT: u32 = 4;
-    const BUSY: u64 = 5;
-    let mut rig = Rig::new();
-    rig.start();
-    rig.send(object_message(
-        RGFX_CMD_EVENT_CREATE,
-        (u64::from(IDLE_CONTEXT) << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1,
-    ));
-    let served = || rig.device.shared.lanes.served(Key::Context(IDLE_CONTEXT));
-    for _ in 0..2000 {
-        if served() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(
-        served(),
-        "the context's message was never handed to its lane"
-    );
-    rig.lanes_done();
-    // The busy context posts every 20 ms, for at most three times the idle lane's wait.
-    let rounds = 3 * lanes::IDLE.as_millis() / 20;
-    let mut gone = false;
-    for n in 0..rounds {
-        rig.send(object_message(
-            RGFX_CMD_EVENT_CREATE,
-            (BUSY << RGFX_CONTEXT_OBJ_ID_SHIFT) | (n as u64 + 2),
-        ));
-        std::thread::sleep(Duration::from_millis(20));
-        if !rig.device.shared.lanes.served(Key::Context(IDLE_CONTEXT)) {
-            gone = true;
-            break;
-        }
-    }
-    assert!(
-        gone,
-        "the idle lane's thread was woken by the busy context's jobs"
-    );
-}
-
 /// A surface's pages the kext hands over from another process's CPU lock, for a maker that has
 /// closed, and the download the lock posts right after them without waiting for their answer, are
 /// carried out in that order on the block's lane, while the maker's lane is still behind a held
@@ -3996,7 +3966,7 @@ fn a_download_of_a_block_whose_lane_is_idle_is_carried_out_on_the_control_thread
         *seen.downloaded_on.lock(),
         [
             Some("reims-vgpu.graphics-control".to_owned()),
-            Some(Key::Block(BLOCK).thread_name())
+            Some(RING0.to_owned())
         ]
     );
 }
@@ -4039,7 +4009,7 @@ fn a_download_behind_its_block_s_pages_on_the_lane_is_carried_out_after_them_the
         *seen.downloaded_on.lock(),
         [
             Some("reims-vgpu.graphics-control".to_owned()),
-            Some(Key::Block(BLOCK).thread_name())
+            Some(RING0.to_owned())
         ],
         "the other block's on the control thread, then this block's on its lane"
     );
@@ -4255,6 +4225,9 @@ fn pages_handed_over_leave_a_shared_block_s_holders() {
     assert_eq!(rig.complete(), (release, RGFX_STATUS_OK));
 }
 
+/// A reset drops what the lanes have not begun: a lane's message begun before it goes on, the
+/// host is told of the reset only once that message has ended, and the messages behind it, in its
+/// context's lane or in another lane waiting for it, are never carried out.
 #[test]
 fn a_reset_drops_what_the_lanes_have_not_begun() {
     const A: u32 = 6;

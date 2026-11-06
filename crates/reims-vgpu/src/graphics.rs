@@ -121,11 +121,10 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 
 /// A graphics device's callbacks. `scanout_written` is called on the device's refresh thread
 /// (`reims-vgpu.graphics-refresh`), and `raise_interrupt` on the thread that posts the event it
-/// raises for: the device's control thread (`reims-vgpu.graphics-control`), a lane that carries
-/// out a guest process's control messages (`reims-vgpu.graphics-context-<n>`), its presents
-/// (`reims-vgpu.graphics-presents`) or a block's pages and downloads
-/// (`reims-vgpu.graphics-block-<offset>`), its refresh thread, a command queue's service thread
-/// (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
+/// raises for: the device's control thread (`reims-vgpu.graphics-control`), one of ring 0's
+/// threads (`reims-vgpu.graphics-ring0-<i>`), which carry out a guest process's control messages,
+/// its presents and a block's pages and downloads, each on its lane, its refresh thread, a command
+/// queue's service thread (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
 /// (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), the surface worker (`reims-vgpu.graphics-surfaces-<i>`),
 /// the indirect command buffers' worker (`reims-vgpu.icb-create-<i>`), the worker that lets go of

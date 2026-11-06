@@ -941,17 +941,13 @@ and `a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create`.
 
 **Ring 0's lanes.** The control thread takes ring 0 in ring order and carries
 out only the display commands itself. It hands each context's messages, in ring
-order, to that context's lane, a thread of its own
-(`reims-vgpu.graphics-context-<n>`, made as a message comes to a lane with
-none, gone after 1 s with none), every `PRESENT_SURFACE` and
-`DISPLAY_COLOR` to the presents' lane (`reims-vgpu.graphics-presents`), in
-ring order, and every `SURFACE_PAGES` and
-`SURFACE_DOWNLOAD` to the lane of the block it names
-(`reims-vgpu.graphics-block-<offset>`), whichever process posted it and for
-whichever context, so a block's pages handed over from another process's CPU
-lock, or after its maker closed, and the download or release posted right
-after them, keep their order without waiting for the maker's lane. A lane
-carries its messages out one at a time and posts their answers, so one
+order, to that context's lane, every `PRESENT_SURFACE` and `DISPLAY_COLOR` to
+the presents' lane, in ring order, and every `SURFACE_PAGES` and
+`SURFACE_DOWNLOAD` to the lane of the block it names, whichever process posted
+it and for whichever context, so a block's pages handed over from another
+process's CPU lock, or after its maker closed, and the download or release
+posted right after them, keep their order without waiting for the maker's lane.
+A lane carries its messages out one at a time and posts their answers, so one
 process's slow message (a heap over pages took 469 ms at the median and 4.25 s
 at most in a boot on an RTX 5080 host) holds up only that process's later
 messages and command buffers. A message
@@ -1000,8 +996,22 @@ orders are carried out in either order, as the processes' own posts race. A
 process that waited for an answer finds its message carried out. A reset drops
 the messages a lane has not begun, and is told to the host once those begun
 have returned. A lane's thread is woken only for its own messages and for the
-lanes its next message waits for, so a lane with nothing to do costs nothing
-and goes after a second with none, whatever other processes do. Tested by
+lanes its next message waits for, and a lane with nothing to do holds no
+thread, whatever other processes do.
+
+Ring 0's threads (`reims-vgpu.graphics-ring0-<i>`) serve the lanes. A lane
+handed a message while it has no thread is given the thread that went idle
+last, or one made for it where none waits, and keeps it until it has no
+message left; the thread then waits for the next lane, and goes once it has
+waited 10 s for one (`reims_graphics`'s `keep`). So the device holds as many
+threads as it had lanes busy at once in the last 10 s, whichever contexts and
+blocks they were. With a thread of each lane's own, made as a message came to a
+lane with none and gone after 1 s with none, every new block's first
+`SURFACE_PAGES` made a thread, and so did every lane's message after a pause of
+a second: 345 threads were made in 30 s of a WindowServer probe, and a vCPU sat
+30 ms or more in a page fault while one of them unmapped its 2 MiB stack, a
+write of the process's memory map the fault waits behind (car 12's B1, RTX 5080
+host; measured). Tested by
 `a_present_waits_for_another_context_s_texture_over_its_surface`,
 `a_present_waits_for_a_destroy_or_a_close_of_a_texture_over_its_surface`,
 `a_present_waits_for_no_message_that_leaves_its_surface_s_textures`,
@@ -1015,13 +1025,17 @@ and goes after a second with none, whatever other processes do. Tested by
 `a_sync_create_is_answered_before_its_context_s_later_messages_are_carried_out`,
 `a_context_s_answer_comes_before_one_published_ahead_of_it_by_another_context`,
 `a_reset_drops_what_the_lanes_have_not_begun`,
-`an_idle_lane_goes_while_another_context_s_is_busy` and
+`a_steady_load_s_lanes_are_served_by_one_thread_through_its_pauses`,
+`a_burst_s_other_threads_go_once_they_have_waited_keep` and
 `lanes_keep_every_order_over_random_interleavings`, which checks random
 interleavings of several processes' messages against an order worked out from
 the messages alone. A synchronous create's answer takes 7.2 us on average from
-its doorbell, against 4.1 us from the control thread alone, and 68 us against
-23 us where the lane's thread is made again after a pause
-(`a_sync_create_s_round_trip`, release build, M3 Max). A context's burst of 200
+its doorbell, against 4.1 us from the control thread alone
+(`a_sync_create_s_round_trip`, release build, M3 Max). After a pause of 1.2 s,
+in which the lane's thread went to wait for another lane, it took 64 to 171 us
+at the median of three runs, against 116 to 353 us where the pause ended the
+lane's thread and the create made it again (the same test, alternating runs on
+the M3 Max under other builds' load). A context's burst of 200
 messages and a synchronous create take as long beside 75 idle lanes as beside
 none: 0.1 to 1.4 ms at the median either way, on the M3 Max under other builds'
 load (`a_burst_beside_idle_lanes`, release build).
