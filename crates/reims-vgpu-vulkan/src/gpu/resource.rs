@@ -3591,6 +3591,71 @@ pub(crate) mod tests {
         );
     }
 
+    /// A BC1 or BC7 texture over a surface's rows, through the buffer that stands for the
+    /// surface, is made, as the x86 Macs make it (docs/graphics-kext/dgpu-oracle.md, Q20), and
+    /// reads back row j of its blocks from the plane's row j, as theirs read: over a surface
+    /// without planes, and over plane 1 of a surface with planes, at an offset and rows that are
+    /// multiples of 16 bytes. metal2vulkan makes these since its stack 34; the guest's bundle
+    /// sends them
+    #[test]
+    fn bc_textures_over_a_surface_s_rows_are_made() {
+        use reims_vgpu_core::platform::values::SurfaceFacts;
+        let p = platform();
+        let (rows, pitch) = (64u64, 256u64);
+        let b = shared(2 * rows * pitch);
+        let bytes: Vec<u8> = (0..2 * rows * pitch).map(|i| (i * 7 % 251) as u8).collect();
+        // SAFETY: the buffer's Shared bytes, which nothing else touches yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr(), bytes.len())
+        };
+        for (format, block) in [(130, 8), (152, 16)] {
+            let desc = p.texture_descriptor(&TextureDesc {
+                pixel_format: format,
+                width: 64,
+                height: 32,
+                usage: 1,
+                ..TextureDesc::default()
+            });
+            for planar in [false, true] {
+                let offset = if planar { rows * pitch } else { 0 };
+                let facts = SurfaceFacts {
+                    pixel_format: u32::from_be_bytes(if planar { *b"420v" } else { *b"BGRA" }),
+                    plane_count: if planar { 2 } else { 0 },
+                    width: 64,
+                    height: rows,
+                    chroma_offset: offset,
+                    chroma_bytes_per_row: if planar { pitch } else { 0 },
+                    ycbcr_matrix: None,
+                };
+                let plane = SurfacePlane {
+                    plane: u64::from(planar),
+                    offset,
+                    bytes_per_row: pitch,
+                    planar,
+                    facts: Some(facts),
+                };
+                let what = format!("format {format}, planar {planar}");
+                let t = b
+                    .new_texture_over_surface_plane(OnFault::Return, &desc, plane)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{what}: nil"));
+                assert_eq!((t.pixel_format(), t.width(), t.height()), (format, 64, 32));
+                // 16 blocks a row, 8 rows of them.
+                let row = 16 * block;
+                let mut read = vec![0u8; (row * 8).to_usize()];
+                let region = rt::Region::new_3d(0, 0, 0, 64, 32, 1);
+                t.raw.get_bytes(&mut read, row, 0, region, 0, 0).unwrap();
+                let expected: Vec<u8> = (0..8)
+                    .flat_map(|j| {
+                        let at = (offset + j * pitch).to_usize();
+                        bytes[at..at + row.to_usize()].to_vec()
+                    })
+                    .collect();
+                assert_eq!(read, expected, "{what}");
+            }
+        }
+    }
+
     /// A texture on a surface writes the surface's memory, and holds one reference of the
     /// surface while it lives; its views share that reference. One over plane 1 of the surface,
     /// which has no planes, dies where it is made
