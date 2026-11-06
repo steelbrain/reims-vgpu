@@ -157,13 +157,15 @@ fn bind_each<'a, R, T>(
     (marks, bound, first): (&Marks, Bound, u64),
     resolve: impl Fn(&R) -> RaiseResult<Option<&'a T>>,
 ) -> RaiseResult<Vec<Option<&'a T>>> {
-    (0u64..)
-        .zip(recs)
-        .map(|(i, r)| {
-            let slot = Slot::new(Stage::Kernel, bound, first.wrapping_add(i));
-            marks.bound(slot, resolve(r))
-        })
-        .collect()
+    let mut named = Vec::with_capacity(recs.len());
+    for (i, r) in (0u64..).zip(recs) {
+        named.push(refused::bind!(
+            marks,
+            Slot::new(Stage::Kernel, bound, first.wrapping_add(i)),
+            resolve(r)
+        ));
+    }
+    Ok(named)
 }
 
 /// Decodes one compute-encoder op: `tag` its op, `payload` its body (the bytes
@@ -271,8 +273,11 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_COMPUTE_SET_TEXTURE => {
             let m: RgfxComputeOpSetTexture = body(tag, payload)?;
-            let slot = Slot::new(Stage::Kernel, Bound::Texture, m.index);
-            let texture = refused::bind!(marks, slot, objs.get_texture(m.texture_obj_id));
+            let texture = refused::bind!(
+                marks,
+                Slot::new(Stage::Kernel, Bound::Texture, m.index),
+                objs.get_texture(m.texture_obj_id)
+            );
             enc.encode(
                 on,
                 ComputeCmd::SetTexture {

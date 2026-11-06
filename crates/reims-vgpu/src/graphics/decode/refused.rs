@@ -250,29 +250,35 @@ impl Slot {
 /// The open encoder's binding slots that hold an object whose create the host refused, bound as
 /// nil: its draws and dispatches are dropped while a slot of its own state is held (a pipeline, a
 /// depth/stencil state, tessellation factors), and run while only a buffer, texture or sampler
-/// slot is, as with nil bound there. Empty in every run that refuses nothing, where each op and
-/// binding costs one load ([`Self::any`]), and the set itself is reached only out of line.
+/// slot is, as with nil bound there. Empty in every run that refuses nothing, where a binding
+/// reads one flag ([`Self::any`]), a walk one after each op ([`Self::drops_draws`]), and the set
+/// itself is reached only where a slot is marked or its mark ends.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Marks {
     slots: RefCell<HashSet<Slot>>,
     /// Whether `slots` holds any.
     held: Cell<bool>,
+    /// Whether the encoder's draws and dispatches are dropped ([`Self::drops_draws`]), kept where
+    /// `slots` and `skipped` change.
+    drops: Cell<bool>,
     /// The encoder's later ops are all dropped: a predication's start named a refused buffer, so
     /// its ends and what lies between them have nothing to pair with.
     skipped: Cell<bool>,
 }
 
-/// [`Marks::bound`] in the op's own function: `$got`, the resolve of an object to bind at `$slot`
-/// of `$marks`, as the object, or nil where its create was refused, which marks the slot; any other
-/// raise returns from the op. The resolve is matched where the resolver wrote it, and only a raise
-/// is passed on, out of line ([`Marks::bind_raise`]): through [`Marks::bound`], which a function
-/// of `render::decode_op`'s size calls out of line, each binding passed the whole result (a
-/// [`Raise`]'s size) through memory.
+/// A binding, in the op's own function: `$got`, the resolve of an object to bind at `$slot` of
+/// `$marks`, as the object, or nil where its create was refused, which marks the slot; any other
+/// binding ends the slot's mark, and any other raise returns from the op. The resolve is matched
+/// where the resolver wrote it, and only a raise is passed on, out of line
+/// ([`Marks::bind_raise`]): through a function, which one of `render::decode_op`'s size calls out
+/// of line, each binding passed the whole result (a [`Raise`]'s size) through memory.
 macro_rules! bind {
     ($marks:expr, $slot:expr, $got:expr) => {
         match $got {
             Ok(object) => {
-                $marks.ends($slot);
+                if $marks.any() {
+                    $marks.unmark($slot);
+                }
                 object
             }
             Err(raise) => {
@@ -295,26 +301,6 @@ impl Marks {
     #[inline]
     pub(crate) fn holds(&self, slot: Slot) -> bool {
         self.any() && self.marked(slot)
-    }
-
-    /// `got`, the resolve of an object to bind at `slot`: an object whose create was refused is
-    /// bound as nil, and marks the slot; any other binding ends the slot's mark. An op's own
-    /// binding uses [`bind!`], which reads the resolve where the resolver wrote it.
-    #[inline]
-    pub(crate) fn bound<T>(
-        &self,
-        slot: Slot,
-        got: RaiseResult<Option<T>>,
-    ) -> RaiseResult<Option<T>> {
-        Ok(bind!(self, slot, got))
-    }
-
-    /// [`bind!`]'s object: the binding at `slot` ends its mark, if it has one.
-    #[inline(always)]
-    pub(crate) fn ends(&self, slot: Slot) {
-        if self.any() {
-            self.unmark(slot);
-        }
     }
 
     /// [`bind!`]'s raise: a refused object's marks `slot` and binds nil, any other is the
@@ -343,20 +329,26 @@ impl Marks {
     fn mark(&self, slot: Slot) {
         self.slots.borrow_mut().insert(slot);
         self.held.set(true);
+        if slot.drops_draws() {
+            self.drops.set(true);
+        }
     }
 
     /// Ends `slot`'s mark, if it has one.
     #[cold]
     #[inline(never)]
-    fn unmark(&self, slot: Slot) {
+    pub(crate) fn unmark(&self, slot: Slot) {
         let mut slots = self.slots.borrow_mut();
         slots.remove(&slot);
         self.held.set(!slots.is_empty());
+        let drops = self.skipped.get() || slots.iter().any(Slot::drops_draws);
+        self.drops.set(drops);
     }
 
     /// The encoder's later ops are all dropped.
     pub(crate) fn skip_rest(&self) {
         self.skipped.set(true);
+        self.drops.set(true);
     }
 
     /// Whether the encoder's later ops are all dropped ([`Self::skip_rest`]).
@@ -368,20 +360,22 @@ impl Marks {
     /// its own state holds a refused object ([`Slot::drops_draws`]).
     #[inline]
     pub(crate) fn drops_draws(&self) -> bool {
-        self.skips() || (self.any() && self.holds_state())
-    }
-
-    /// Whether the set holds a slot of the encoder's own state ([`Slot::drops_draws`]).
-    #[cold]
-    #[inline(never)]
-    fn holds_state(&self) -> bool {
-        self.slots.borrow().iter().any(Slot::drops_draws)
+        self.drops.get()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binding of `got` at `slot` of `marks`, as an op makes one ([`bind!`]).
+    fn binding<T>(
+        marks: &Marks,
+        slot: Slot,
+        got: RaiseResult<Option<T>>,
+    ) -> RaiseResult<Option<T>> {
+        Ok(bind!(marks, slot, got))
+    }
 
     /// A binding of a refused object binds nil and marks its slot; a binding of another object, or
     /// of nil, at that slot ends the mark; a binding at another slot leaves it. The draws are
@@ -392,11 +386,11 @@ mod tests {
         let slot = Slot::state(Bound::Pipeline);
         let other = Slot::new(Stage::Fragment, Bound::Texture, 1);
         assert!(!marks.drops_draws());
-        assert_eq!(marks.bound::<u32>(slot, Err(reference(7))), Ok(None));
+        assert_eq!(binding::<u32>(&marks, slot, Err(reference(7))), Ok(None));
         assert!(marks.holds(slot) && marks.drops_draws());
-        assert_eq!(marks.bound(other, Ok(Some(&1u32))), Ok(Some(&1)));
+        assert_eq!(binding(&marks, other, Ok(Some(&1u32))), Ok(Some(&1)));
         assert!(marks.holds(slot), "a binding elsewhere ends no mark");
-        assert_eq!(marks.bound::<u32>(slot, Ok(None)), Ok(None));
+        assert_eq!(binding::<u32>(&marks, slot, Ok(None)), Ok(None));
         assert!(!marks.holds(slot) && !marks.drops_draws());
     }
 
@@ -412,7 +406,7 @@ mod tests {
             Slot::new(Stage::Kernel, Bound::Sampler, 1),
         ];
         for slot in resources {
-            assert_eq!(marks.bound::<u32>(slot, Err(reference(7))), Ok(None));
+            assert_eq!(binding::<u32>(&marks, slot, Err(reference(7))), Ok(None));
             assert!(marks.holds(slot));
         }
         assert!(!marks.drops_draws());
@@ -422,9 +416,9 @@ mod tests {
             Bound::TessellationFactors,
         ] {
             let state = Slot::state(bound);
-            assert_eq!(marks.bound::<u32>(state, Err(reference(8))), Ok(None));
+            assert_eq!(binding::<u32>(&marks, state, Err(reference(8))), Ok(None));
             assert!(marks.drops_draws());
-            assert_eq!(marks.bound(state, Ok(Some(&1u32))), Ok(Some(&1)));
+            assert_eq!(binding(&marks, state, Ok(Some(&1u32))), Ok(Some(&1)));
             assert!(!marks.drops_draws());
         }
         assert!(resources.iter().all(|&slot| marks.holds(slot)));
@@ -437,7 +431,7 @@ mod tests {
         let slot = Slot::state(Bound::Pipeline);
         let other = Raise::foreign("rgfx.decode.object");
         assert!(!is_refused(&other));
-        assert_eq!(marks.bound::<u32>(slot, Err(other.clone())), Err(other));
+        assert_eq!(binding::<u32>(&marks, slot, Err(other.clone())), Err(other));
         assert!(!marks.drops_draws());
     }
 

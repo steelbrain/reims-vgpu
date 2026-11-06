@@ -2106,16 +2106,64 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// The render ops at the start of `ops`, on `enc`, whose pass `pass` describes, up to the
     /// first op of another group or the stream's end: what is left of `ops`, or a malformed op's
     /// error, each as [`Self::walk`] answers it at that op.
+    ///
+    /// Only an op's binding marks a slot that holds a refused object, or ends its mark
+    /// ([`refused`]). While no slot of the encoder's state holds one, whether one does is read once
+    /// after each op [`render::decode_op`] carries out; from the op that leaves one held, the
+    /// pass's ops go on in [`Self::refused_render_ops`].
     fn render_ops<'o>(
         &self,
         mut ops: &'o [u8],
         enc: &P::RenderEncoder,
         pass: &render::PassFacts,
     ) -> RaiseResult<Result<&'o [u8], DecodeError>> {
+        if pass.refused.drops_draws() {
+            return self.refused_render_ops(ops, enc, pass);
+        }
         let mut draws = Draws::new();
-        // Whether a slot of the encoder's state holds a refused object ([`refused`]). Only an op's
-        // binding marks or ends a mark, so it is read again after each op [`render::decode_op`]
-        // carries out, not at each draw gathered.
+        while !ops.is_empty() {
+            // Draws one after another go to the encoder together; each other op, after them.
+            if let Some((draw, len)) = self.vertex_draw(ops) {
+                draws.push(draw, enc)?;
+                ops = &ops[len..];
+                continue;
+            }
+            draws.send(enc)?;
+            let Some((tag, body, len)) = next_op(ops) else {
+                return Ok(Err(DecodeError::Malformed));
+            };
+            if op_group(tag) != RGFX_OP_GROUP_RENDER {
+                break;
+            }
+            match render::decode_op(tag, body, self, enc, pass, ON) {
+                Ok(true) => {}
+                Ok(false) => return Err(unknown_op(tag)),
+                Err(raise) => contain(raise)?,
+            }
+            ops = &ops[len..];
+            // The draws gathered were sent before the op, so none is left behind.
+            if pass.refused.drops_draws() {
+                return self.refused_render_ops(ops, enc, pass);
+            }
+        }
+        draws.send(enc)?;
+        Ok(Ok(ops))
+    }
+
+    /// [`Self::render_ops`] while a slot of the encoder's state may hold a refused object: each op
+    /// goes alone while one does, and a draw is dropped. Out of line, as only a pass that binds a
+    /// refused pipeline, depth/stencil state or tessellation factor buffer reaches it.
+    #[cold]
+    #[inline(never)]
+    fn refused_render_ops<'o>(
+        &self,
+        mut ops: &'o [u8],
+        enc: &P::RenderEncoder,
+        pass: &render::PassFacts,
+    ) -> RaiseResult<Result<&'o [u8], DecodeError>> {
+        let mut draws = Draws::new();
+        // Whether a slot of the encoder's state holds a refused object, read again after each op
+        // that may mark one.
         let mut refused = pass.refused.drops_draws();
         while !ops.is_empty() {
             // Draws one after another go to the encoder together; each other op, after them. While
@@ -2151,7 +2199,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// body reads and whose buffer resolves, then a `DRAW_PRIMITIVES` whose body reads, as
     /// [`render::decode_op`] reads each. `None` for anything else, which the walk then carries out
     /// an op at a time, faulting where each op does. The lookup has no effect on what the message
-    /// names: a miss is looked up again by the op.
+    /// names: a miss is looked up again by the op. Inlined at both of the render walk's loops: out
+    /// of line, each op's look went through a call, and its answer through memory.
+    #[inline(always)]
     fn vertex_draw<'s>(&'s self, ops: &[u8]) -> Option<(VertexDraw<'s, P>, usize)> {
         #[cfg(test)]
         if !tests::GATHERS.get() {

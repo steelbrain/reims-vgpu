@@ -127,10 +127,9 @@ fn resolve_buffers<'a, P: Platform>(
     let mut named = Vec::with_capacity(es.len());
     let mut offsets = Vec::with_capacity(es.len());
     for (i, e) in (0u64..).zip(es) {
-        let slot = Slot::new(stage, Bound::Buffer, first.wrapping_add(i));
         named.push(refused::bind!(
             marks,
-            slot,
+            Slot::new(stage, Bound::Buffer, first.wrapping_add(i)),
             objs.get_buffer(e.buffer_obj_id)
         ));
         offsets.push(e.offset);
@@ -145,13 +144,15 @@ fn resolve_textures<'a, P: Platform>(
     es: &[RgfxTextureBinding],
     (marks, stage, first): (&Marks, Stage, u64),
 ) -> RaiseResult<Vec<Option<&'a P::Texture>>> {
-    (0u64..)
-        .zip(es)
-        .map(|(i, e)| {
-            let slot = Slot::new(stage, Bound::Texture, first.wrapping_add(i));
-            marks.bound(slot, objs.get_texture(e.texture_obj_id))
-        })
-        .collect()
+    let mut named = Vec::with_capacity(es.len());
+    for (i, e) in (0u64..).zip(es) {
+        named.push(refused::bind!(
+            marks,
+            Slot::new(stage, Bound::Texture, first.wrapping_add(i)),
+            objs.get_texture(e.texture_obj_id)
+        ));
+    }
+    Ok(named)
 }
 
 /// Resolves a sampler-binding array of `stage`'s from slot `first` into its objects (nil for
@@ -161,13 +162,15 @@ fn resolve_samplers<'a, P: Platform>(
     es: &[RgfxSamplerBinding],
     (marks, stage, first): (&Marks, Stage, u64),
 ) -> RaiseResult<Vec<Option<&'a P::SamplerState>>> {
-    (0u64..)
-        .zip(es)
-        .map(|(i, e)| {
-            let slot = Slot::new(stage, Bound::Sampler, first.wrapping_add(i));
-            marks.bound(slot, objs.get_sampler(e.sampler_obj_id))
-        })
-        .collect()
+    let mut named = Vec::with_capacity(es.len());
+    for (i, e) in (0u64..).zip(es) {
+        named.push(refused::bind!(
+            marks,
+            Slot::new(stage, Bound::Sampler, first.wrapping_add(i)),
+            objs.get_sampler(e.sampler_obj_id)
+        ));
+    }
+    Ok(named)
 }
 
 /// Resolves a sampler-with-LOD-clamps array of `stage`'s from slot `first` into its objects
@@ -182,10 +185,9 @@ fn resolve_samplers_lod<'a, P: Platform>(
     let mut mins = Vec::with_capacity(es.len());
     let mut maxs = Vec::with_capacity(es.len());
     for (i, e) in (0u64..).zip(es) {
-        let slot = Slot::new(stage, Bound::Sampler, first.wrapping_add(i));
         named.push(refused::bind!(
             marks,
-            slot,
+            Slot::new(stage, Bound::Sampler, first.wrapping_add(i)),
             objs.get_sampler(e.sampler_obj_id)
         ));
         mins.push(f32::from_bits(e.lod_min_clamp_bits));
@@ -331,8 +333,11 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_VERTEX_BUFFER => {
             let m: RgfxOpSetVertexBuffer = body(tag, payload)?;
-            let slot = Slot::new(Stage::Vertex, Bound::Buffer, m.index);
-            let buffer = refused::bind!(pass.refused, slot, objs.get_buffer(m.buffer_obj_id));
+            let buffer = refused::bind!(
+                pass.refused,
+                Slot::new(Stage::Vertex, Bound::Buffer, m.index),
+                objs.get_buffer(m.buffer_obj_id)
+            );
             enc.encode(
                 on,
                 RenderCmd::SetVertexBuffer {
@@ -344,8 +349,11 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_FRAGMENT_BUFFER => {
             let m: RgfxOpSetFragmentBuffer = body(tag, payload)?;
-            let slot = Slot::new(Stage::Fragment, Bound::Buffer, m.index);
-            let buffer = refused::bind!(pass.refused, slot, objs.get_buffer(m.buffer_obj_id));
+            let buffer = refused::bind!(
+                pass.refused,
+                Slot::new(Stage::Fragment, Bound::Buffer, m.index),
+                objs.get_buffer(m.buffer_obj_id)
+            );
             enc.encode(
                 on,
                 RenderCmd::SetFragmentBuffer {
@@ -357,8 +365,11 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE => {
             let m: RgfxOpSetFragmentTexture = body(tag, payload)?;
-            let slot = Slot::new(Stage::Fragment, Bound::Texture, m.index);
-            let texture = refused::bind!(pass.refused, slot, objs.get_texture(m.texture_obj_id));
+            let texture = refused::bind!(
+                pass.refused,
+                Slot::new(Stage::Fragment, Bound::Texture, m.index),
+                objs.get_texture(m.texture_obj_id)
+            );
             enc.encode(
                 on,
                 RenderCmd::SetFragmentTexture {
@@ -1017,10 +1028,9 @@ pub(crate) fn decode_op<P: Platform>(
         // ---- Depth/stencil state and resolve textures ----
         RGFX_OP_RENDER_SET_DEPTH_STENCIL_STATE => {
             let m: RgfxOpSetDepthStencilState = body(tag, payload)?;
-            let slot = Slot::state(Bound::DepthStencil);
             let state = refused::bind!(
                 pass.refused,
-                slot,
+                Slot::state(Bound::DepthStencil),
                 objs.get_depth_stencil(m.depth_stencil_state_obj_id)
             );
             enc.encode(
@@ -1075,8 +1085,11 @@ pub(crate) fn decode_op<P: Platform>(
         }
         RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_BUFFER => {
             let m: RgfxOpSetTessellationFactorBuffer = body(tag, payload)?;
-            let slot = Slot::state(Bound::TessellationFactors);
-            let buffer = refused::bind!(pass.refused, slot, objs.get_buffer(m.buffer_obj_id));
+            let buffer = refused::bind!(
+                pass.refused,
+                Slot::state(Bound::TessellationFactors),
+                objs.get_buffer(m.buffer_obj_id)
+            );
             enc.encode(
                 on,
                 RenderCmd::SetTessellationFactorBuffer {
@@ -1172,14 +1185,13 @@ pub(crate) fn decode_op<P: Platform>(
             let mut offsets = Vec::with_capacity(es.len());
             let mut strides = Vec::with_capacity(es.len());
             for (i, e) in (0u64..).zip(&es) {
-                let slot = Slot::new(
-                    Stage::Vertex,
-                    Bound::Buffer,
-                    m.range_location.wrapping_add(i),
-                );
                 named.push(refused::bind!(
                     pass.refused,
-                    slot,
+                    Slot::new(
+                        Stage::Vertex,
+                        Bound::Buffer,
+                        m.range_location.wrapping_add(i),
+                    ),
                     objs.get_buffer(e.buffer_obj_id)
                 ));
                 offsets.push(e.offset);
