@@ -6984,7 +6984,7 @@ mod tests {
         assert!(
             logs.take()
                 .iter()
-                .all(|(level, ..)| *level != log::Level::Warn)
+                .all(|(level, _, line)| *level != log::Level::Warn || !line.contains(shape))
         );
     }
 
@@ -7106,10 +7106,13 @@ mod tests {
             dec.decode(&device, &message(15, whole, whole)).unwrap(),
             Err(DecodeError::Refused)
         );
+        // The logger is the process's: only this test's surface's warnings.
         let warned: Vec<_> = logs
             .take()
             .into_iter()
-            .filter(|(level, ..)| *level == log::Level::Warn)
+            .filter(|(level, _, line)| {
+                *level == log::Level::Warn && line.contains("IOSurface 0x2c")
+            })
             .map(|(.., line)| line)
             .collect();
         assert_eq!(warned.len(), 1, "{warned:?}");
