@@ -46,6 +46,7 @@
 
 void rgfxQueueTests(const char *self);
 int rgfxQueueDiesCase(const char *name);
+int rgfxQueueTimings(int rounds);
 
 @interface QueueTestHandle : RgfxResource <MTLBuffer, MTLTexture>
 @end
@@ -1352,6 +1353,89 @@ void test_a_mid_buffer_signal_wakes_a_cpu_wait_before_the_buffer_ends()
 		[cb waitUntilCompleted];
 		CHECK(cb.status == MTLCommandBufferStatusCompleted);
 	}
+}
+
+// The guest's share of a command buffer's scheduling and completion: how long after the host
+// posts a buffer's CB_SCHEDULED, then its CB_COMPLETE, its handlers run and its waits return,
+// through the queue's reader, the completion thread (woken by a stand-in of the kext's wait, as
+// the kext wakes it) and the queue's completion queue, the host's post made by this thread.
+// `rounds` buffers of each kind: one with a scheduled and a completed handler, one with a completed
+// handler alone, one with none; each record posted 2 ms after the last, so the threads sleep in
+// between as between a client's frames. Prints the median, 90th and 99th percentiles and the most,
+// in microseconds: a measurement, run by hand (`shell_tests --queue-timing [rounds]`), never in
+// `make test`.
+int rgfxQueueTimings(int rounds)
+{
+	using Clock = std::chrono::steady_clock;
+	auto us = [](Clock::time_point from, Clock::time_point to) {
+		return std::chrono::duration<double, std::micro>(to - from).count();
+	};
+	auto print = [](const char *name, std::vector<double> v) {
+		std::sort(v.begin(), v.end());
+		const size_t n = v.size();
+		if (n == 0)
+			return;
+		std::printf("queue-timing: %s: p50 %.1f p90 %.1f p99 %.1f max %.1f us (n %zu)\n", name,
+		            v[n / 2], v[n * 9 / 10], v[n * 99 / 100], v[n - 1], n);
+	};
+	std::vector<double> schedHandler, schedWaitBoth, schedWaitCompleted, doneHandler,
+	    doneWaitBoth, doneWaitCompleted, doneWaitNone;
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		for (int round = 0; round < rounds; round++) {
+			for (int kind = 0; kind < 3; kind++) {
+				@autoreleasepool {
+					__block Clock::time_point scheduledRan, completedRan;
+					id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+					if (kind == 0) {
+						[cb addScheduledHandler:^(id<MTLCommandBuffer> x) {
+							(void)x;
+							scheduledRan = Clock::now();
+						}];
+					}
+					if (kind <= 1) {
+						[cb addCompletedHandler:^(id<MTLCommandBuffer> x) {
+							(void)x;
+							completedRan = Clock::now();
+						}];
+					}
+					[cb commit];
+					const uint64_t seqno = nextSeqno(q);
+					std::this_thread::sleep_for(std::chrono::milliseconds(2));
+					const Clock::time_point scheduledAt = Clock::now();
+					hostScheduled(q, *driven.kext, seqno, cb);
+					[cb waitUntilScheduled];
+					const Clock::time_point scheduledSeen = Clock::now();
+					std::this_thread::sleep_for(std::chrono::milliseconds(2));
+					const Clock::time_point completedAt = Clock::now();
+					hostComplete(q, *driven.kext, seqno, cb);
+					[cb waitUntilCompleted];
+					const Clock::time_point completedSeen = Clock::now();
+					CHECK(cb.status == MTLCommandBufferStatusCompleted);
+					if (kind == 0) {
+						schedHandler.push_back(us(scheduledAt, scheduledRan));
+						schedWaitBoth.push_back(us(scheduledAt, scheduledSeen));
+						doneHandler.push_back(us(completedAt, completedRan));
+						doneWaitBoth.push_back(us(completedAt, completedSeen));
+					} else if (kind == 1) {
+						schedWaitCompleted.push_back(us(scheduledAt, scheduledSeen));
+						doneWaitCompleted.push_back(us(completedAt, completedSeen));
+					} else {
+						doneWaitNone.push_back(us(completedAt, completedSeen));
+					}
+				}
+			}
+		}
+	}
+	print("CB_SCHEDULED to its scheduled handler", schedHandler);
+	print("CB_SCHEDULED to waitUntilScheduled, both handlers", schedWaitBoth);
+	print("CB_SCHEDULED to waitUntilScheduled, a completed handler alone", schedWaitCompleted);
+	print("CB_COMPLETE to its completed handler", doneHandler);
+	print("CB_COMPLETE to waitUntilCompleted, both handlers", doneWaitBoth);
+	print("CB_COMPLETE to waitUntilCompleted, a completed handler alone", doneWaitCompleted);
+	print("CB_COMPLETE to waitUntilCompleted, no handler", doneWaitNone);
+	return 0;
 }
 
 void rgfxQueueTests(const char *self)

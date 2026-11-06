@@ -14003,6 +14003,7 @@ void rgfxArchiveTests();
 void rgfxResourceTests();
 void rgfxQueueTests(const char *self);
 int rgfxQueueDiesCase(const char *name);
+int rgfxQueueTimings(int rounds);
 void rgfxCreateTests();
 void rgfxKnownPipelineTests();
 void rgfxIcbTests();
@@ -14063,6 +14064,10 @@ int main(int argc, char **argv)
 		return dies_case(argv[2]);
 	if (argc == 3 && std::strcmp(argv[1], "--queue-dies") == 0)
 		return rgfxQueueDiesCase(argv[2]);
+	// A measurement, run by hand: the guest's share of a buffer's scheduling and completion
+	// (tests/queue_tests.mm).
+	if (argc >= 2 && std::strcmp(argv[1], "--queue-timing") == 0)
+		return rgfxQueueTimings(argc >= 3 ? std::atoi(argv[2]) : 2000);
 	@autoreleasepool {
 		test_buffer_routing();
 		test_private_buffer_has_no_contents();
