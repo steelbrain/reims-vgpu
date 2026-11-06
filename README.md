@@ -196,7 +196,7 @@ set. [docs/api.md](docs/api.md) section 2 lists every setting and variable,
 
 | Pathway | Host | Guest | QEMU machine and device | Platform | Run with |
 |---|---|---|---|---|---|
-| **x86-64 macOS / Linux Vulkan** | x86-64 Linux (KVM) | x86-64 macOS | `q35` through OpenCore, PCI `apple-gfx-pci` (`106b:eeee`) with its option ROM | **Vulkan** through metal2vulkan | `reims-ctl` |
+| **x86-64 macOS / Linux Vulkan** | x86-64 Linux (KVM) | x86-64 macOS | `q35` through OpenCore, PCI `reims-graphics-pci` with its option ROM and reims-vgpu's own macOS drivers (reims-ctl's default), or `apple-gfx-pci` (`106b:eeee`) | **Vulkan** through metal2vulkan | `reims-ctl` |
 | **arm64 macOS / macOS Metal** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Metal** | `reims-ctl`, or `make vm` |
 | **arm64 macOS / macOS Vulkan** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Vulkan** through metal2vulkan, on MoltenVK | `reims-ctl`, installed with `GPU_ARM=vulkan scripts/install-ctl.sh` |
 
