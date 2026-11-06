@@ -106,6 +106,9 @@ static bool operator==(const RgfxAirNode &a, const RgfxAirNode &b)
 	       a.hasTypeSize == b.hasTypeSize && a.hasTypeAlign == b.hasTypeAlign && a.addressSpace == b.addressSpace &&
 	       a.bufferSize == b.bufferSize && a.typeSize == b.typeSize && a.typeAlign == b.typeAlign &&
 	       a.typeName == b.typeName && a.name == b.name && a.unused == b.unused && sameValue(a.layout, b.layout) &&
+	       a.predicateGlobal == b.predicateGlobal && a.countIsGlobal == b.countIsGlobal &&
+	       a.indexGlobal == b.indexGlobal && a.countGlobal == b.countGlobal && a.hasRenderTarget == b.hasRenderTarget &&
+	       a.renderTarget == b.renderTarget &&
 	       a.hasMesh == b.hasMesh && a.meshVertexData == b.meshVertexData &&
 	       a.meshPrimitiveData == b.meshPrimitiveData && a.meshVertices == b.meshVertices &&
 	       a.meshPrimitives == b.meshPrimitives && a.meshTopology == b.meshTopology;
@@ -113,12 +116,28 @@ static bool operator==(const RgfxAirNode &a, const RgfxAirNode &b)
 
 static bool operator==(const RgfxAirEntry &a, const RgfxAirEntry &b)
 {
-	return a.name == b.name && a.stage == b.stage && a.outputs == b.outputs && a.arguments == b.arguments;
+	return a.name == b.name && a.function == b.function && a.stage == b.stage && a.outputs == b.outputs &&
+	       a.arguments == b.arguments;
+}
+
+// Two modules' code, which is opaque, compared by what it answers: each entry point's
+// specialisation by no constant values.
+static bool sameCode(const RgfxAirEntries &a, const RgfxAirEntries &b)
+{
+	if ((a.code == nullptr) != (b.code == nullptr))
+		return false;
+	for (const RgfxAirEntry &e : a.entries) {
+		RgfxAirSpecialisation x, y;
+		if (rgfxAirSpecialise(a, e, nullptr, 0, x) != rgfxAirSpecialise(b, e, nullptr, 0, y) ||
+		    x.globals != y.globals || x.bodyRead != y.bodyRead || x.used != y.used)
+			return false;
+	}
+	return true;
 }
 
 static bool operator==(const RgfxAirEntries &a, const RgfxAirEntries &b)
 {
-	return a.entries == b.entries && a.constants == b.constants;
+	return a.entries == b.entries && a.constants == b.constants && sameCode(a, b);
 }
 
 namespace {
@@ -1274,20 +1293,34 @@ int main()
 	}
 
 	// The cache: equal bytes, at any address, are read once and share their read; it keeps the
-	// most recently looked-up modules while their bytes fit its budget, reads one it let go again,
-	// and keeps none larger than the budget. A read it let go stays valid while it is held.
+	// most recently looked-up modules while their costs fit its budget, reads one it let go again,
+	// and keeps none costlier than the budget. A read it let go stays valid while it is held. A
+	// module's cost is its bytes, and its decoded code's where it declares function constants.
 	{
 		std::vector<std::vector<uint8_t>> three = {moduleBytes(lib, "every_access"),
 		                                           moduleBytes(lib, "reads_in_vertex"),
 		                                           moduleBytes(lib, "writes_in_fragment")};
+		auto costOf = [](const std::vector<uint8_t> &m) {
+			RgfxAirModule read;
+			rgfxReadAirModule(m.data(), m.size(), read);
+			return rgfxAirModuleCost(read, m.size());
+		};
 		std::sort(three.begin(), three.end(),
-		          [](const std::vector<uint8_t> &x, const std::vector<uint8_t> &y) { return x.size() > y.size(); });
-		const std::vector<uint8_t> &a = three[0], &b = three[1], &c = three[2]; // a the largest
+		          [&](const std::vector<uint8_t> &x, const std::vector<uint8_t> &y) { return costOf(x) > costOf(y); });
+		const std::vector<uint8_t> &a = three[0], &b = three[1], &c = three[2]; // a the costliest
 		check(!c.empty() && a != b && b != c && a != c, "three modules to keep");
+		const size_t ca = costOf(a), cb = costOf(b), cc = costOf(c);
+		RgfxAirModule withCode;
+		rgfxReadAirModule(moduleBytes(lib, "every_access").data(), moduleBytes(lib, "every_access").size(), withCode);
+		check(withCode.entries.code != nullptr &&
+		          rgfxAirModuleCost(withCode, moduleBytes(lib, "every_access").size()) >
+		              moduleBytes(lib, "every_access").size(),
+		      "every_access declares a constant: its code costs beside its bytes");
+		check(ca == costOf(a), "a module's cost is the same at each read");
 		const std::vector<uint8_t> a2 = a; // the same bytes at another address
-		RgfxAirModuleCache cache(a.size() + b.size());
+		RgfxAirModuleCache cache(ca + cb);
 		const auto pa = cache.moduleOf(a.data(), a.size());
-		check(pa != nullptr && cache.reads() == 1 && cache.kept() == 1 && cache.keptBytes() == a.size(),
+		check(pa != nullptr && cache.reads() == 1 && cache.kept() == 1 && cache.keptBytes() == ca,
 		      "the first lookup reads the module, and keeps it");
 		check(cache.moduleOf(a2.data(), a2.size()) == pa && cache.reads() == 1,
 		      "equal bytes at another address: the same read, not read again");
@@ -1298,24 +1331,24 @@ int main()
 		          pa->entriesRead == direct.entriesRead && pa->entries == direct.entries,
 		      "the read kept is rgfxReadAirModule's");
 		const auto pb = cache.moduleOf(b.data(), b.size());
-		check(pb != pa && cache.reads() == 2 && cache.kept() == 2 && cache.keptBytes() == a.size() + b.size(),
+		check(pb != pa && cache.reads() == 2 && cache.kept() == 2 && cache.keptBytes() == ca + cb,
 		      "other bytes are read, and kept");
 		check(cache.moduleOf(a.data(), a.size()) == pa && cache.reads() == 2, "a, looked up again");
 		const auto pc = cache.moduleOf(c.data(), c.size());
-		check(cache.reads() == 3 && cache.kept() == 2 && cache.keptBytes() == a.size() + c.size(),
+		check(cache.reads() == 3 && cache.kept() == 2 && cache.keptBytes() == ca + cc,
 		      "c past the budget lets b go, the least recently looked up");
 		check(cache.moduleOf(c.data(), c.size()) == pc && cache.moduleOf(a.data(), a.size()) == pa &&
 		          cache.reads() == 3,
 		      "a and c are kept");
 		const auto pb2 = cache.moduleOf(b.data(), b.size());
-		check(pb2 != pb && cache.reads() == 4 && cache.kept() == 2 && cache.keptBytes() == a.size() + b.size(),
+		check(pb2 != pb && cache.reads() == 4 && cache.kept() == 2 && cache.keptBytes() == ca + cb,
 		      "b, let go, is read again, and lets c go");
 		check(pb->functions == pb2->functions && pb->entries == pb2->entries && pb->visible == pb2->visible,
 		      "a read let go stays valid while it is held, and is the same as the new one");
-		RgfxAirModuleCache tiny(a.size() - 1);
+		RgfxAirModuleCache tiny(ca - 1);
 		const auto big = tiny.moduleOf(a.data(), a.size());
 		check(big != nullptr && big->functions == pa->functions && tiny.kept() == 0 && tiny.keptBytes() == 0,
-		      "a module larger than the budget is read, not kept");
+		      "a module costlier than the budget is read, not kept");
 		check(tiny.moduleOf(a.data(), a.size()) != big && tiny.reads() == 2, "and is read at each lookup");
 		// Threads looking up one module at once: every one is answered the read kept.
 		RgfxAirModuleCache shared(1u << 20);

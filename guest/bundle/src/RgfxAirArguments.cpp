@@ -2982,6 +2982,38 @@ void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out)
 	out.visibleRead = visibleOf(plain, out.visible);
 }
 
+size_t rgfxAirModuleCost(const RgfxAirModule &module, size_t size)
+{
+	size_t n = size;
+	const RgfxAirCode *c = module.entries.code.get();
+	if (c == nullptr)
+		return n;
+	// A map's node: its value and three links and a colour, as libc++ lays them out.
+	constexpr size_t kNode = 4 * sizeof(void *);
+	using C = RgfxAirCode;
+	n += sizeof(C) + c->types.capacity() * sizeof(C::Type) + c->globals.capacity() * sizeof(C::Global) +
+	     c->constants.size() * (kNode + sizeof(std::pair<const uint32_t, C::Scalar>)) +
+	     c->casts.size() * (kNode + sizeof(std::pair<const uint32_t, uint32_t>)) +
+	     c->sections.capacity() * sizeof(std::string) + c->attributes.capacity() * sizeof(C::Attributes) +
+	     c->bodies.capacity() * sizeof(C::Body) +
+	     c->fcGlobals.size() * (kNode + sizeof(std::pair<const uint64_t, uint32_t>));
+	for (const C::Type &t : c->types)
+		n += t.params.capacity() * sizeof(uint32_t);
+	for (const std::string &section : c->sections)
+		n += section.capacity();
+	for (const C::Body &body : c->bodies) {
+		n += body.blocks.capacity() * sizeof(std::vector<C::Inst>) +
+		     body.constants.size() * (kNode + sizeof(std::pair<const uint32_t, C::Scalar>)) +
+		     body.casts.size() * (kNode + sizeof(std::pair<const uint32_t, uint32_t>));
+		for (const std::vector<C::Inst> &block : body.blocks) {
+			n += block.capacity() * sizeof(C::Inst);
+			for (const C::Inst &inst : block)
+				n += (inst.ops.capacity() + inst.blocks.capacity()) * sizeof(uint32_t);
+		}
+	}
+	return n;
+}
+
 std::shared_ptr<const RgfxAirModule> RgfxAirModuleCache::moduleOf(const uint8_t *bitcode, size_t size)
 {
 	const std::string_view key(reinterpret_cast<const char *>(bitcode), bitcode != nullptr ? size : 0);
@@ -2996,6 +3028,7 @@ std::shared_ptr<const RgfxAirModule> RgfxAirModuleCache::moduleOf(const uint8_t 
 	auto read = std::make_shared<RgfxAirModule>();
 	rgfxReadAirModule(bitcode, size, *read);
 	std::shared_ptr<const RgfxAirModule> module = std::move(read);
+	const size_t cost = rgfxAirModuleCost(*module, key.size());
 	std::lock_guard<std::mutex> hold(lock_);
 	reads_++;
 	auto found = byBytes_.find(key);
@@ -3004,12 +3037,12 @@ std::shared_ptr<const RgfxAirModule> RgfxAirModuleCache::moduleOf(const uint8_t 
 		order_.splice(order_.begin(), order_, found->second);
 		return found->second->module;
 	}
-	order_.push_front(Kept{std::string(key), module});
+	order_.push_front(Kept{std::string(key), module, cost});
 	byBytes_.emplace(std::string_view(order_.front().bytes), order_.begin());
-	keptBytes_ += key.size();
+	keptBytes_ += cost;
 	while (keptBytes_ > budget_ && !order_.empty()) {
 		const Kept &last = order_.back();
-		keptBytes_ -= last.bytes.size();
+		keptBytes_ -= last.cost;
 		byBytes_.erase(std::string_view(last.bytes));
 		order_.pop_back();
 	}

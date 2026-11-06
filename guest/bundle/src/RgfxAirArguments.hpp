@@ -354,13 +354,19 @@ struct RgfxAirModule {
 // Reads the AIR module at `bitcode` (as rgfxReadAirFunctions takes it) once, into `out`.
 void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out);
 
+// What a module of `size` bytes read as `module` costs a cache's budget: its bytes, and the bytes
+// its decoded code holds (RgfxAirEntries::code: its containers' elements, for a module that
+// declares function constants), which grow with its function bodies rather than with its
+// metadata.
+size_t rgfxAirModuleCost(const RgfxAirModule &module, size_t size);
+
 // The modules a process read, by their bytes: a module's reads are a function of its bytes alone,
 // so every lookup of equal bytes, from any library over them, shares one read. It keeps the most
 // recently looked-up modules, a copy of each one's bytes (its key, compared whole) with its
-// reads, while those bytes total at most `budget`; a module it let go is read again at its next
-// lookup. The reads it hands out stay valid while a holder keeps them. Safe on any thread; two
-// threads that look up one module at once may each read it, and both are answered the first read
-// kept.
+// reads, while their costs (rgfxAirModuleCost) total at most `budget`; a module it let go is read
+// again at its next lookup. The reads it hands out stay valid while a holder keeps them. Safe on
+// any thread; two threads that look up one module at once may each read it, and both are answered
+// the first read kept.
 class RgfxAirModuleCache {
 public:
 	explicit RgfxAirModuleCache(size_t budget) : budget_(budget) {}
@@ -370,7 +376,7 @@ public:
 	// The reads of the module at `bitcode`: those kept for equal bytes, else read now (and kept).
 	std::shared_ptr<const RgfxAirModule> moduleOf(const uint8_t *bitcode, size_t size);
 
-	// How many modules it read, how many it keeps, and their bytes (tests).
+	// How many modules it read, how many it keeps, and their costs (tests).
 	uint64_t reads() const;
 	size_t kept() const;
 	size_t keptBytes() const;
@@ -379,6 +385,7 @@ private:
 	struct Kept {
 		std::string bytes;
 		std::shared_ptr<const RgfxAirModule> module;
+		size_t cost;
 	};
 	using Order = std::list<Kept>;
 	mutable std::mutex lock_;
@@ -389,11 +396,13 @@ private:
 	const size_t budget_;
 };
 
-// The bytes of modules the process keeps (rgfxAirModules). measured: the 40,177 distinct modules
-// of macOS 27's frameworks' .metallibs on the M3 Max are 11,072 bytes each on average, so this
-// keeps about 1,500 such modules. A kept module holds about 1.5 times its bytes in all, its copy
-// and its reads (11,770 bytes in use for 7,690 of bitcode, over 2,000 of those modules, arm64 and
-// x86_64 alike), so a full cache holds about 25 MiB.
+// The costs of the modules the process keeps (rgfxAirModules). measured: the 40,177 distinct
+// modules of macOS 27's frameworks' .metallibs on the M3 Max are 11,072 bytes each on average, so
+// this keeps about 1,500 such modules of no code. One of no code holds about 1.5 times its bytes
+// in all, its copy and its reads (11,770 bytes in use for 7,690 of bitcode, over 2,000 of those
+// modules, arm64 and x86_64 alike), so a full cache of them holds about 25 MiB. One of code holds
+// about 1.2 times its cost (158 MB in use for costs of 131 MB, over the first 1,000 such modules,
+// arm64), so a full cache of them holds about 19 MiB.
 constexpr size_t kRgfxAirModuleCacheBytes = 16u << 20;
 
 // The process's cache of modules, of kRgfxAirModuleCacheBytes, which every library reads its
