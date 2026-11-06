@@ -36,7 +36,9 @@
 //              display pipe calls) of a lone buffer after an idle gap (-g): ret_us (the call) and
 //              sched_us (its start to the buffer's scheduled handler).
 //   submitted.tiny.behind  the same call of a tiny buffer committed behind a buffer of a few
-//              milliseconds (four fills of 64 MiB of Private memory) on its queue: ret_us.
+//              milliseconds (four fills of 64 MiB of Private memory) on its queue: ret_us; and,
+//              from the busy buffer's own times, busy_start_us (its commit to its GPUStartTime)
+//              and busy_gpu_us (GPUStartTime to GPUEndTime), and round_us, a round's whole time.
 //   mt.commit.qN       N threads, each with its own queue, committing back to back: cb_s.
 //   mt.wait.qN         N threads, each with its own queue, each committing and waiting: cb_s,
 //              ret_us over all of them.
@@ -510,7 +512,7 @@ static NSString *submitted(BOOL tiny, BOOL behind)
 	if (behind)
 		big = [gDevice newBufferWithLength:64u << 20 options:MTLResourceStorageModePrivate];
 	warm(q, buf);
-	Samples ret = {0}, sched = {0};
+	Samples ret = {0}, sched = {0}, busyStart = {0}, busyGpu = {0}, round = {0};
 	Cpu cpu = cpuNow();
 	double t0 = nowUs(), end = t0 + gSeconds * 1e6;
 	long n = 0;
@@ -519,12 +521,14 @@ static NSString *submitted(BOOL tiny, BOOL behind)
 	while (nowUs() < end) {
 		@autoreleasepool {
 			id<MTLCommandBuffer> busy = nil;
+			double r0 = nowUs(), bc = 0;
 			if (behind) {
 				busy = [q commandBuffer];
 				id<MTLBlitCommandEncoder> b = [busy blitCommandEncoder];
 				for (int i = 0; i < 4; i++)
 					[b fillBuffer:big range:NSMakeRange(0, big.length) value:(uint8_t)i];
 				[b endEncoding];
+				bc = nowUs();
 				[busy commit];
 			} else {
 				gap(gGapUs);
@@ -552,19 +556,30 @@ static NSString *submitted(BOOL tiny, BOOL behind)
 			double s = atomic_load(&st->scheduled);
 			if (s > 0)
 				sAdd(&sched, s - c, c - t0);
+			if (busy != nil && busy.GPUStartTime > 0 && busy.GPUEndTime >= busy.GPUStartTime) {
+				sAdd(&busyStart, busy.GPUStartTime * 1e6 - bc, c - t0);
+				sAdd(&busyGpu, (busy.GPUEndTime - busy.GPUStartTime) * 1e6, c - t0);
+			}
+			sAdd(&round, nowUs() - r0, c - t0);
 			n++;
 		}
 	}
 	free(st);
 	if (why)
 		return why;
-	NSString *line = behind ? [NSString stringWithFormat:@"OK n=%ld %@ %@", n, sLine("ret", &ret),
-	                                                     cpuLine(cpu, n)]
+	NSString *line = behind ? [NSString stringWithFormat:@"OK n=%ld %@ %@ %@ %@ %@", n,
+	                                                     sLine("ret", &ret),
+	                                                     sLine("busy_start", &busyStart),
+	                                                     sLine("busy_gpu", &busyGpu),
+	                                                     sLine("round", &round), cpuLine(cpu, n)]
 	                        : [NSString stringWithFormat:@"OK n=%ld %@ %@ %@", n, sLine("ret", &ret),
 	                                                     sLine("sched", &sched), cpuLine(cpu, n)];
 	sDetail("ret", &ret);
 	sFree(&ret);
 	sFree(&sched);
+	sFree(&busyStart);
+	sFree(&busyGpu);
+	sFree(&round);
 	return line;
 }
 
