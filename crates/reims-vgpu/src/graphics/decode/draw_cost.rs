@@ -362,13 +362,13 @@ enum Step {
 /// Command buffer `cb`'s render ops, of a repetition of `shape`, a list a render pass: each of
 /// the shape's groups the pipeline and the constant buffers, then its draws of the stream.
 fn steps(shape: Shape, cb: usize) -> Vec<Vec<Step>> {
-    assert!(shape.draws % shape.groups == 0 && shape.groups % shape.passes == 0);
+    assert!(shape.draws.is_multiple_of(shape.groups) && shape.groups.is_multiple_of(shape.passes));
     let a_group = shape.draws / shape.groups;
     let mut passes = vec![Vec::new(); shape.passes];
     let mut steps = Vec::new();
     for draw in 0..shape.draws {
-        if draw % a_group == 0 {
-            if draw > 0 && draw / a_group % (shape.groups / shape.passes) == 0 {
+        if draw.is_multiple_of(a_group) {
+            if draw > 0 && (draw / a_group).is_multiple_of(shape.groups / shape.passes) {
                 passes[draw / a_group / (shape.groups / shape.passes) - 1] =
                     std::mem::take(&mut steps);
             }
