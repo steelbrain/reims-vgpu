@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "RgfxEncoder.hpp"
+#include "RgfxManagedLayout.hpp"
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
@@ -80,6 +81,34 @@ bool planeShape(IOSurfaceRef s, size_t plane, PlaneShape *out)
 	uint64_t eh = std::max<uint64_t>(out->elementHeight, 1);
 	out->rows = (height + eh - 1) / eh;
 	return out->rowBytes != 0 && out->rows != 0;
+}
+
+/// Where a region of a texture over a plane lies in the plane's rows, in the blocks of the
+/// texture's format (RgfxIOSurfaceTexture's CPU access).
+struct RgfxSurfaceCpuSpan {
+	uint64_t row;   // the plane's row of the region's first row of blocks
+	uint64_t byte;  // the region's first byte in each of those rows
+	uint64_t rows;  // rows of blocks
+	uint64_t bytes; // bytes of each row of blocks
+};
+
+/// Where `region` of a texture of `format` over a plane of shape `s` lies in the plane's rows:
+/// row j of the texture's blocks (rgfxPixelFormatBlock) at the plane's row j, as Metal lays a
+/// texture over a surface's plane out, whatever the plane's own elements. False for a format of
+/// no block there, and for a region whose blocks pass the plane's rows or a row's bytes.
+bool cpuSpan(MTLPixelFormat format, const PlaneShape &s, MTLRegion region,
+             RgfxSurfaceCpuSpan *span)
+{
+	RgfxFormatBlock b = {};
+	if (!rgfxPixelFormatBlock(static_cast<uint32_t>(format), &b))
+		return false;
+	const uint64_t x = region.origin.x / b.width, y = region.origin.y / b.height;
+	const uint64_t across = (region.origin.x + region.size.width + b.width - 1) / b.width - x;
+	const uint64_t down = (region.origin.y + region.size.height + b.height - 1) / b.height - y;
+	if (y + down > s.rows || (x + across) * b.bytes > s.rowBytes)
+		return false;
+	*span = {y, x * b.bytes, down, across * b.bytes};
+	return true;
 }
 
 /// The CPU address of plane `plane` of `s` in this process (null when unmapped).
@@ -1517,19 +1546,13 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 	return _shadow->inPlace ? _shadow->buffer.length : static_cast<NSUInteger>(_shadow->block.size);
 }
 
-// The texture's own CPU access reads and writes its view, for formats of one element per pixel
-// at level 0 / slice 0: the copy, a write also going to the surface's pages, or in place the
-// pages alone. A texture inside its plane (the video driver's, which nothing reads on the CPU)
-// has none.
-
-- (BOOL)rgfxCpuRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger)slice
-{
-	const PlaneShape &s = _shadow->planes[_plane].shape;
-	return _offset == 0 && level == 0 && slice == 0 && s.elementWidth == 1 &&
-	       s.elementHeight == 1 &&
-	       region.origin.y + region.size.height <= s.rows &&
-	       (region.origin.x + region.size.width) * s.bytesPerElement <= s.rowBytes;
-}
+// The texture's own CPU access reads and writes its view at level 0 / slice 0, in the texels of
+// the texture's own format: the copy, a write also going to the surface's pages, or in place the
+// pages alone. Row j of the texture's blocks lies at row j of its plane, as Metal lays a texture
+// over a surface's plane out (a block-compressed one's rows of blocks on the AMD 5300M and the
+// Intel 630 too: oracle_surftex, Q20), whatever the plane's own elements. A texture inside its
+// plane (the video driver's, which nothing reads on the CPU) has none, nor has one of a format
+// rgfxPixelFormatBlock gives no block (a depth or stencil one, which is Private over a surface).
 
 - (void)getBytes:(void *)pixelBytes
       bytesPerRow:(NSUInteger)bytesPerRow
@@ -1538,7 +1561,9 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
       mipmapLevel:(NSUInteger)level
             slice:(NSUInteger)slice
 {
-	if (![self rgfxCpuRegion:region level:level slice:slice]) {
+	RgfxSurfaceCpuSpan span = {};
+	if (_offset != 0 || level != 0 || slice != 0 ||
+	    !cpuSpan(self.pixelFormat, _shadow->planes[_plane].shape, region, &span)) {
 		return;
 	}
 	_shadow->uploadIfChanged();
@@ -1548,12 +1573,10 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 	CachedLock cpu(*_shadow, kIOSurfaceLockReadOnly);
 	ViewLock g(_shadow->lock);
 	const ShadowPlane &p = _shadow->planes[_plane];
-	uint64_t bpe = p.shape.bytesPerElement;
 	const uint8_t *rows = _shadow->pixels() + p.offset;
-	for (NSUInteger r = 0; r < region.size.height; r++) {
+	for (uint64_t r = 0; r < span.rows; r++) {
 		std::memcpy(static_cast<uint8_t *>(pixelBytes) + r * bytesPerRow,
-		            rows + (region.origin.y + r) * p.pitch + region.origin.x * bpe,
-		            region.size.width * bpe);
+		            rows + (span.row + r) * p.pitch + span.byte, span.bytes);
 	}
 }
 
@@ -1577,7 +1600,9 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
           bytesPerRow:(NSUInteger)bytesPerRow
         bytesPerImage:(NSUInteger)bytesPerImage
 {
-	if (![self rgfxCpuRegion:region level:level slice:slice]) {
+	RgfxSurfaceCpuSpan span = {};
+	if (_offset != 0 || level != 0 || slice != 0 ||
+	    !cpuSpan(self.pixelFormat, _shadow->planes[_plane].shape, region, &span)) {
 		return;
 	}
 	_shadow->uploadIfChanged();
@@ -1590,12 +1615,10 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 	CopyWriteLock write(_shadow->surface, !_shadow->inPlace);
 	ViewLock g(_shadow->lock);
 	const ShadowPlane &p = _shadow->planes[_plane];
-	uint64_t bpe = p.shape.bytesPerElement;
 	uint8_t *rows = _shadow->pixels() + p.offset;
-	for (NSUInteger r = 0; r < region.size.height; r++) {
-		std::memcpy(rows + (region.origin.y + r) * p.pitch + region.origin.x * bpe,
-		            static_cast<const uint8_t *>(pixelBytes) + r * bytesPerRow,
-		            region.size.width * bpe);
+	for (uint64_t r = 0; r < span.rows; r++) {
+		std::memcpy(rows + (span.row + r) * p.pitch + span.byte,
+		            static_cast<const uint8_t *>(pixelBytes) + r * bytesPerRow, span.bytes);
 	}
 	_shadow->writeBack(&write);
 }

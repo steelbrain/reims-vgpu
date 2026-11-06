@@ -11463,6 +11463,115 @@ void test_iosurface_planes()
 	CFRelease(plain);
 }
 
+// The shared copy block a texture over a surface takes in these tests, at `offset` in the region.
+struct SurfaceBlockAt {
+	uint64_t offset;
+	static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+	                    uint64_t *serial, bool *fresh)
+	{
+		*offset = static_cast<SurfaceBlockAt *>(c)->offset;
+		*serial = 5;
+		*fresh = true;
+		return true;
+	}
+	static void release(void *, uint64_t) {}
+};
+
+// A 'BGRA' surface without planes, `width` by `height` pixels, each byte of row r at i holding
+// r * 7 + i.
+IOSurfaceRef filledBgraSurface(int width, int height)
+{
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @(width),
+		(id)kIOSurfaceHeight : @(height),
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(s != nullptr && IOSurfaceGetPlaneCount(s) == 0);
+	IOSurfaceLock(s, 0, nullptr);
+	auto *base = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(s));
+	const size_t bpr = IOSurfaceGetBytesPerRow(s);
+	for (size_t r = 0; r < static_cast<size_t>(height); r++)
+		for (size_t i = 0; i < bpr; i++)
+			base[r * bpr + i] = static_cast<uint8_t>(r * 7 + i);
+	IOSurfaceUnlock(s, 0, nullptr);
+	return s;
+}
+
+// A texture over a surface reads and writes on the CPU in its own format's texels, row j of
+// them at the plane's row j, whatever the surface's elements, as Metal's does: over a 'BGRA'
+// surface, an R8Unorm texture one byte a texel, writing nothing past the caller's rows, and an
+// RGBA16Float one eight; a replace writes the texture's texels in the copy and in the surface.
+void test_iosurface_cpu_access_in_the_texture_s_format()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	SurfaceBlockAt src{RGFX_ALLOCATIONS_OFFSET + 0x40000};
+	region.setSurfaceSource(&SurfaceBlockAt::acquire, &SurfaceBlockAt::release, &src);
+	IOSurfaceRef s = filledBgraSurface(16, 16);
+	const size_t bpr = IOSurfaceGetBytesPerRow(s);
+	CHECK(bpr >= 64 && bpr <= 256);
+	// The copy's rows, 256 bytes apart.
+	const uint64_t kPitch = 256;
+	const uint8_t *copy = mem.data() + src.offset;
+	auto over = [&](MTLPixelFormat format, NSUInteger w, NSUInteger h) {
+		MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		                                                                              width:w
+		                                                                             height:h
+		                                                                          mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:s
+		                                            plane:0
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+	auto rowsRead = [&](const std::vector<uint8_t> &out, size_t rows, size_t bytes) {
+		for (size_t r = 0; r < rows; r++)
+			if (std::memcmp(out.data() + r * bytes, copy + r * kPitch, bytes) != 0)
+				return false;
+		return true;
+	};
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *r8 = over(MTLPixelFormatR8Unorm, 16, 16);
+		CHECK(r8 != nil);
+		// The copy holds the surface's rows.
+		CHECK(copy[0] == 0 && copy[kPitch + 3] == 7 + 3 && copy[2 * kPitch + 5] == 14 + 5);
+		// 16 rows of 16 bytes, and nothing past them.
+		std::vector<uint8_t> out(16 * 16 + 64, 0xee);
+		[r8 getBytes:out.data() bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0];
+		CHECK(rowsRead(out, 16, 16));
+		CHECK(std::all_of(out.begin() + 16 * 16, out.end(), [](uint8_t b) { return b == 0xee; }));
+		// Two texels of row 2 from 1: two bytes, in the copy and the surface.
+		const uint8_t written[2] = {0xa1, 0xb2};
+		const uint8_t after = copy[2 * kPitch + 3];
+		[r8 replaceRegion:MTLRegionMake2D(1, 2, 2, 1) mipmapLevel:0 withBytes:written bytesPerRow:2];
+		CHECK(copy[2 * kPitch + 1] == 0xa1 && copy[2 * kPitch + 2] == 0xb2 &&
+		      copy[2 * kPitch + 3] == after);
+		IOSurfaceLock(s, kIOSurfaceLockReadOnly, nullptr);
+		const auto *pixels = static_cast<const uint8_t *>(IOSurfaceGetBaseAddress(s));
+		CHECK(pixels[2 * bpr + 1] == 0xa1 && pixels[2 * bpr + 2] == 0xb2 &&
+		      pixels[2 * bpr + 3] == after);
+		IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, nullptr);
+
+		// 8 texels of 8 bytes a row: each row's 64 bytes.
+		RgfxIOSurfaceTexture *half = over(MTLPixelFormatRGBA16Float, 8, 16);
+		CHECK(half != nil);
+		std::vector<uint8_t> wide(64 * 16, 0xee);
+		[half getBytes:wide.data() bytesPerRow:64 fromRegion:MTLRegionMake2D(0, 0, 8, 16) mipmapLevel:0];
+		CHECK(rowsRead(wide, 16, 64));
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+	CFRelease(s);
+}
+
 // A surface copy's writers (RgfxIOSurface.h): a block made for this process starts with none
 // whatever it held, and its texture names them to the host; each commit of a buffer that draws
 // the copy names its queue and seqno there, in the queue's own slot, raised; another queue takes
@@ -14834,6 +14943,7 @@ int main(int argc, char **argv)
 		test_iosurface_copy_block_after_destroys();
 		test_iosurface_shared_block();
 		test_iosurface_planes();
+		test_iosurface_cpu_access_in_the_texture_s_format();
 		test_iosurface_writers();
 		test_iosurface_order();
 		test_iosurface_slots_free_at_completion();
