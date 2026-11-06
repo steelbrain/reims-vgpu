@@ -825,6 +825,11 @@ only where no negotiation can carry it.
   takes it. No mesh pipeline supports indirect command buffers: the bundle
   ends the process at one that asks, as the x86 Macs' Metal does
   (dgpu-oracle.md, Q22), so no indirect command carries a mesh draw.
+- Bit 26 is `SHARED_EVENT_NAMES`: ring 0 carries `SHARED_EVENT_NAME`,
+  `SHARED_EVENT_IMPORT` and `SHARED_EVENT_UNNAME`, which the kext posts for the
+  shared events one process hands another, and the host posts the values one
+  holder gives the event to the others' listen queues ("Shared events across
+  processes", below). Every host offers it, and the kext takes it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -921,7 +926,11 @@ the kext posts for the buffer's context before the process learns of the block,
 after the surface's `SURFACE_PAGES` was answered: what the buffer reads of the
 surface the host made there, and the buffer names none of the other process's
 objects, so it waits for its own context's share and for none of the other
-process's messages. Shared events and textures do not cross processes. A
+process's messages. Textures do not cross processes, and a shared event crosses
+only by its name ("Shared events across processes"): the process that makes an
+event of another's posts its own `SHARED_EVENT_IMPORT`, an object message of
+its context's, which its buffers that name the event wait for, and the kext's
+`SHARED_EVENT_UNNAME` is context 0's, which no buffer is. A
 display command (`GET_DISPLAYS` to `DISPLAY_COLOR`) or a `SURFACE_DOWNLOAD`
 holds up no buffer: none reads what they make. A present waits for the writers
 the guest's record of its surface names, whatever the host has taken. A
@@ -1750,7 +1759,7 @@ that waits for its answer would close it, at the cost the known creates remove.
 | heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
 | shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `MESH_RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state_full`, `new_mesh_render_pipeline_state_full` and `new_compute_pipeline_state_full` (the whole descriptor the guest set: vertex or stage-input descriptor, every colour attachment, each stage's linked functions, those made with options or a specialized name by `Library::new_function_with_options`; the Vulkan platform refuses a specialized name, which its runtime's function descriptor lacks) |
-| sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY` | `new_event`, `new_shared_event`, `new_fence` |
+| sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY`; the kext's `SHARED_EVENT_NAME` (answered `COMPLETE`), `SHARED_EVENT_IMPORT` (answered `SHARED_EVENT_VALUE`) and `SHARED_EVENT_UNNAME` (not answered) | `new_event`, `new_shared_event`, `new_fence`; an import's value `SharedEvent::signaled_value` |
 | queue | `QUEUE_CREATE` (priority, region offset, vector), `QUEUE_DESTROY` | `new_command_queue` |
 
 `*_OVER_HOST_MEMORY` map guest region blocks (Shared) and the host builds a
@@ -2117,6 +2126,72 @@ they were registered at, at once where the value has reached it, as Metal's do
 (measured). A shared event made at another value is set to it on the host after
 its create.
 
+**Shared events across processes.** A process hands its shared event to
+another as Metal's do: by the event's `eventPort` (SPI), or by its handle
+(`newSharedEventHandle`), Metal's own `MTLSharedEventHandle`, which NSXPC
+carries with the port; the other process makes an event of its own from either
+(`newSharedEventWithMachPort:`, SPI, and `newSharedEventWithHandle:`). Both are
+the one host event: each process's command buffers signal and wait on it on the
+GPU's timeline, and each process's CPU sets, waits and listeners work on it.
+What Metal answers was measured on the AMD 5300M and the Intel 630 under macOS
+26.7.1 (`guest/bundle/tools/oracle/oracle_events.m`, identical on both): the
+port is the same name at each ask, and the event holds one send reference of
+it; a handle takes a reference of its own and keeps the event's label; an event
+made from the port or a handle takes one more, is a new object of the same
+value, and is labelled as the handle (nil from a port); each lets its reference
+go at its dealloc; `MACH_PORT_NULL`, a dead name, a port the process receives, a
+task port and a nil handle are answered nil, the references as they were; and
+the event and its handle code only through an NSXPCCoder (a keyed archiver's
+encode and decode raise `NSInvalidArgumentException`, "This object may only be
+encoded by an NSXPCCoder.", and the convenience archiver answers
+`NSCocoaErrorDomain` 4866). An event made from a port keeps working once the
+event that gave it is gone, while the port is held.
+
+- **The port is a connection of the kext's.** The kext can give a process no
+  port of an object of its own (`IOUserClient::copyPortNameForObjectInTask` is
+  in `com.apple.kpi.private` alone), so the bundle opens a connection of its own
+  type on the accelerator for each event it hands out
+  (`RgfxSharedEventUserClient`, user-client type 'RGSE'), and its send right is
+  the event's `eventPort`. Its `Export` (0x113) has the kext name the event
+  device-wide: `SHARED_EVENT_NAME`, a name from 1 the kext never gives again,
+  answered `COMPLETE`; the kext answers the bundle only then, so an import that
+  follows finds the name. Its `Import` (0x114), by any process that holds the
+  port, has the kext make the caller's new event of the name:
+  `SHARED_EVENT_IMPORT`, answered `SHARED_EVENT_VALUE` with the host event's
+  value, which the new event starts at. A call on the port proves the caller
+  holds it, and each names the caller's context: the kext finds the client of
+  the calling task that holds that context open, and posts through its asks, so
+  a process names and makes events in no context but its own. `Submit` refuses
+  the three messages: only the kext builds them. Before it calls on a port it
+  was handed, the bundle asks its own connection whether the port is one of
+  these (`IOConnectAddClient`, which the kext's `connectClient` answers): the
+  kernel looks the port up in the caller's space and sends it nothing, so a send
+  right of another process's own port is answered nil at once, as Metal's, where
+  an IOKit call made on it kills the caller (dgpu-oracle.md, Q23).
+- **One host event, its values to every holder.** The host keeps the event of
+  each name (`decode::shares`): each holder's id in its own table is that one
+  event. The values one holder's command buffers signal it to, as the host
+  posts each to that holder, and its CPU's sets, as the host carries them out,
+  are posted to every other holder as `EVENT_SIGNALLED` for its own id, on the
+  completion ring of a queue the bundle keeps for that (its listen queue, which
+  no command buffer uses), each tried at once and kept for a thread of the
+  host's where the ring has no room, so a process that stops taking its rings
+  holds up no other process's.
+- **The port holds the event.** The name holds the host event as a holder does,
+  until the connection goes: once no task holds a send right of it, IOKit frees
+  it, and its free posts `SHARED_EVENT_UNNAME`. Its close, and IOKit's word that
+  its creator died, only detach it from the accelerator, so a port another
+  process holds outlives a creator killed with it. The host event goes once its
+  last holder and its last name have.
+- **Residual: a value read across processes waits for its post.** Metal's event
+  is a kernel object whose value page each process maps, so a CPU set in one
+  process is read at once in the other (measured: "read 8 at once" across a
+  spawned pair). Ours raises the other process's value as its post arrives, on
+  its listen queue's ring, so a read right after another process's set may see
+  the value before it. Two events of one process over one port are one object's
+  (the second is the first's alias), so within a process a read sees a set at
+  once, as Metal's does.
+
 Metal's CPU sees a signal from the middle of a buffer while the buffer runs
 (docs/graphics-kext/dgpu-oracle.md, Q18): on the 5300M and the M3 within a few
 milliseconds of the GPU reaching it, on the 630 about 100 ms after the commit,
@@ -2136,9 +2211,11 @@ and again at INFO once it finishes (at most 32 per device). It is diagnostics
 only: Metal waits without end for a value nothing reaches (measured: the buffer
 stays `Committed`), and so does the host while the process lives. Once its
 context is gone, at its close or a reset of the device, nothing is left to
-set or signal its events, which cross no process: the host sets each shared
-event past every value and signals each plain event past every value from a
-queue of its own, so a buffer still waiting on one runs and finishes. It then
+set or signal its events: the host sets each shared event past every value and
+signals each plain event past every value from a queue of its own, so a buffer
+still waiting on one runs and finishes. A shared event another process or a
+name still holds is left to them ("Shared events across processes"), and set
+past every value once its last hold goes. It then
 lets go of what it holds (its buffers' GPU addresses among them, which the
 rebooted guest picks again after a reset), and the close's answer, which
 waits for the context's buffers, comes. A Mac drops such a buffer instead
@@ -2915,8 +2992,15 @@ the kext and the bundle include.
 | 0x110 | `SubmitBatch` | 1 << 1 `SubmitBatch` | reserved: lifecycle messages in one call |
 | 0x111 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
 | 0x112 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
+| 0x113 | `Export`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | names the caller's shared event for other processes ("Shared events across processes") |
+| 0x114 | `Import`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | makes the caller's new shared event of the one the port names |
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers` and 1 << 5 `ContextSpan`; no other bit yet.
+A shared event's port is a connection of a second type, 'RGSE' (0x52475345), on
+the accelerator, which the bundle opens for each event it hands out: 0x113 and
+0x114 are its own selectors, numbered past the accelerator's own so that a call
+on a connection of another kind finds none of that number there.
+
+The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan` and 1 << 6 `SharedEvents`; no other bit yet.
 
 - **Boot-gated — base class / kernel family (notes UNKNOWN #1).** The scaffold
   subclasses `IOAccelerator`, the base the macOS SDK and KDK expose (the IOGPU

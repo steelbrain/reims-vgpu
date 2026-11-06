@@ -1109,6 +1109,70 @@ encoded into ICBs is not supported on this device". The M3 draws from one. Ours 
 Macs' *(class 2)*: no mesh pipeline it makes supports them, so its indirect commands carry no
 mesh draw (`RgfxIndirectCommandBuffer.mm`).
 
+## Q23: shared events across processes
+
+Probe: `oracle_events DEVICE`, 11-05, on the 5300M and the 630 (macOS 26.7.1), identical on both
+but for timings. Every case runs in a child process of its own; `spawn` and `kill` run a second
+process.
+
+- **The classes.** A shared event is `_MTLSharedEvent`, a subclass of `IOSurfaceSharedEvent`,
+  whose `_eventPort` (`I`) and `_signaledValue` (`r^Q`, a pointer: the value is a page the kernel
+  shares) are its own; its handle is `MTLSharedEventHandle`, of one private struct (`{I port, @
+  label, Q labelTraceID}`), made by `initWithSharedEvent:`. Both adopt `NSSecureCoding`. The device
+  answers `newSharedEventWithHandle:` (`@24@0:8@16`) and the SPI `newSharedEventWithMachPort:`
+  (`@20@0:8I16`).
+- **The port and its references.** `eventPort` is the same name at each ask, a send right the
+  event holds one reference of. A handle's `initWithSharedEvent:` asks the event its `eventPort`,
+  `label` and `labelTraceID` (an object of the probe's own, answering each, made a handle of its
+  port, which NSXPC carried to the far side) and takes a reference of its own; an event made from
+  the port or a handle takes one more, is a new object (`sameObject=0`) of the same value and the
+  same `eventPort`; each lets its reference go at its dealloc. With a reference kept, an event made
+  from the port after the first event went has its value.
+- **What it refuses.** `newSharedEventWithMachPort:` of `MACH_PORT_NULL`, `MACH_PORT_DEAD`, a send
+  right of a port the probe receives, and `mach_task_self()` answer nil, the port's references as
+  they were; `newSharedEventWithHandle:` of nil answers nil.
+- **Labels.** A handle keeps the label the event had at its make (a relabel after leaves it); an
+  event made from the handle has the handle's; one made from the port has none.
+- **Coding.** The event and the handle each code only through an NSXPCCoder:
+  `encodeWithCoder:` of a keyed archiver raises `NSInvalidArgumentException`, "This object may
+  only be encoded by an NSXPCCoder.", `initWithCoder:` of a keyed unarchiver "This object may only
+  be decoded by an NSXPCCoder.", and the convenience archiver answers no data and
+  `NSCocoaErrorDomain` 4866, secure or not. Through an anonymous NSXPC listener, a handle arrives
+  as a handle of the same port (made of the probe's own object, too), and the event itself
+  arrives as an event, not the same object, of its value.
+- **Values.** Two events of one port in one process read each other's CPU sets at once; a
+  listener of one fires on the other's set and on its GPU signal; a GPU wait on one is released
+  by a set of the other. Across two processes (`spawn`): the peer's event made from the port reads
+  the probe's value; a CPU set in the peer is read in the probe at once; a GPU signal in the probe
+  fires the peer's listener before the probe tells it; a GPU wait in the peer is released by a
+  CPU set in the probe, and its signal after is seen in the probe within 0.2 ms; after the probe
+  let go of its event, the peer's sets and waits go on.
+- **The port outlives its maker** (`kill`). A peer makes an event, sends its port and is killed
+  with SIGKILL: the probe's send right stays (2 references, a send right), and an event made from
+  the port after the kill has the value and the same `eventPort`. A CPU set of it is read at once
+  in the event made before the kill, and a GPU signal of that one releases a CPU wait on the other.
+- **IOKit's calls on ports that are no shared event's** (`connect`). `IOConnectAddClient` of a
+  port to an IOSurfaceRoot connection, which takes the port as its argument, never as its
+  destination, answers `kIOReturnBadArgument` (0xe00002c2) for `mach_task_self()` and for a send
+  right of a port the probe receives, and `kIOReturnUnsupported` (0xe00002c7) for the connection
+  itself. `IOObjectGetClass` and `IOConnectCallMethod` answer `kIOReturnBadArgument` for the
+  connection and the task port, and `IOObjectConformsTo` false. The first call made on the
+  received port as its destination (`IOObjectGetClass`) kills the process (SIGKILL) before it
+  answers.
+
+**Ours** (design.md, "Shared events across processes"): the port is a connection of the kext's
+(the kext can link no call that gives a process a port of its own objects), the handle Metal's own
+over it, and both processes' events one host event, so GPU signals and waits, CPU sets, waits and
+listeners work across them, and the references, labels, refusals and coding are as measured. The
+port outlives a maker killed with SIGKILL, as measured: the host event lives as long as the port.
+Before it calls on a port it was handed, the bundle asks `IOConnectAddClient` of it to its own
+connection, which the kext answers success only for its own shared event ports, so a port of
+another process's own is answered nil, where a call on it would kill the process. Two
+events of one port in one process are one object's, so they read each other at once. Across
+processes a value reaches the other process as the host posts it there, so a read right after the
+other's CPU set may see the value before it, where Metal's shared page is read at once *(class
+4)*.
+
 ## Not measured
 
 - Cross-process lock waits for pending GPU work: rgk-lock's `lock_probe` (x86 matches the M3,
