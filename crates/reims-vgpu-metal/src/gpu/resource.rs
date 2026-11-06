@@ -179,7 +179,10 @@ impl reims_vgpu_core::platform::resource::Buffer<MetalPlatform> for MetalBuffer 
     /// Metal makes a texture over a surface's plane only over an `IOSurfaceRef`, and no public
     /// call makes one over a buffer's bytes. A format Metal makes no texture of over a buffer (a
     /// two-plane YCbCr or XR10 one among them) is that creator's nil, whatever the facts; any
-    /// other is made as over the buffer, the facts unread.
+    /// other is made as over the buffer, the facts unread. A BC1 or BC7 texture is that
+    /// creator's nil, which Metal's IOSurface creator answers over the surface itself (measured
+    /// on the M3 Max under macOS 27 with no validation layer, over a surface without planes:
+    /// `bc_textures_over_a_surface_s_plane_are_metals`; with planes too, dgpu-oracle.md Q20).
     fn new_texture_over_surface_plane(
         &self,
         on: OnFault,
@@ -1563,6 +1566,64 @@ mod tests {
         let k = kit();
         assert!(buffer(&k.device, 64).iosurface().is_none());
         assert!(k.texture.iosurface().is_none());
+    }
+
+    /// A BC1 or BC7 texture over a surface's plane, through the buffer that stands for the
+    /// surface, is nil, over a surface without planes and over a plane of one with planes: the
+    /// buffer's creator answers nil, and does not end the process, as Metal's IOSurface creator
+    /// answers nil over the surface itself, measured here over a surface without planes
+    #[test]
+    fn bc_textures_over_a_surface_s_plane_are_metals() {
+        use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
+        use reims_vgpu_core::platform::values::{SurfaceFacts, TextureDesc};
+
+        use crate::os::iosurface::MetalSurfaces;
+
+        let d = dev();
+        let spec = SurfaceSpec {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            alloc_size: 256 * 64,
+            width: 64,
+            height: 64,
+            bytes_per_element: 4,
+            bytes_per_row: 256,
+            element_width: 1,
+            element_height: 1,
+            ..SurfaceSpec::default()
+        };
+        let surface = MetalSurfaces::new().create(&spec).unwrap();
+        let stand_in = buffer(&d, 256 * 64);
+        let facts = |plane_count| SurfaceFacts {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            plane_count,
+            width: 64,
+            height: 64,
+            chroma_offset: 0,
+            chroma_bytes_per_row: 0,
+            ycbcr_matrix: None,
+        };
+        for format in [130, 152] {
+            let desc = crate::gpu::desc::texture_descriptor(&TextureDesc {
+                pixel_format: format,
+                width: 64,
+                height: 32,
+                usage: 1,
+                ..TextureDesc::default()
+            });
+            let theirs = d.new_texture_on_surface(&desc, Some(&surface), 0).unwrap();
+            assert!(theirs.is_none(), "Metal's IOSurface creator: {format}");
+            for (plane, planar) in [(0, false), (1, true)] {
+                let at = SurfacePlane {
+                    plane,
+                    offset: plane * 256 * 32,
+                    bytes_per_row: 256,
+                    planar,
+                    facts: Some(facts(if planar { 2 } else { 0 })),
+                };
+                let ours = stand_in.new_texture_over_surface_plane(OnFault::Return, &desc, at);
+                assert!(ours.unwrap().is_none(), "{format} over plane {plane}");
+            }
+        }
     }
 
     /// replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage: copies the bytes into
