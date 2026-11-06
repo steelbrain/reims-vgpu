@@ -3844,18 +3844,20 @@ fn stage_input(
     )
 }
 
-/// The reason a render pipeline create of `fields` is refused before the platform is asked:
-/// an attachment of a pixel format but none (0) that the device describes no format for, where
-/// Metal asserts as it makes the state ([`described`]). `None` for every other create.
+/// The reason a render or mesh render pipeline create of these attachments is refused before
+/// the platform is asked: an attachment of a pixel format but none (0) that the device
+/// describes no format for, where Metal asserts as it makes the state ([`described`]). `None`
+/// for every other create.
 fn undescribed_attachment<P: Platform>(
     device: &P::Device,
-    fields: &RenderFields,
+    colors: &[(u64, ColorAttachmentDesc)],
+    depth_pixel_format: u64,
+    stencil_pixel_format: u64,
 ) -> Option<String> {
-    let colors =
-        (fields.colors.iter()).map(|(i, c)| (format!("colour attachment {i}"), c.pixel_format));
+    let colors = (colors.iter()).map(|(i, c)| (format!("colour attachment {i}"), c.pixel_format));
     let others = [
-        ("depth attachment".to_owned(), fields.depth_pixel_format),
-        ("stencil attachment".to_owned(), fields.stencil_pixel_format),
+        ("depth attachment".to_owned(), depth_pixel_format),
+        ("stencil attachment".to_owned(), stencil_pixel_format),
     ];
     let (at, raw) = colors
         .chain(others)
@@ -4077,7 +4079,12 @@ pub(crate) fn compile_pipeline<P: Platform>(
             fields,
         } => {
             // An attachment Metal asserts at as it makes the state refuses it before any wait.
-            if let Some(reason) = undescribed_attachment::<P>(device, &fields) {
+            if let Some(reason) = undescribed_attachment::<P>(
+                device,
+                &fields.colors,
+                fields.depth_pixel_format,
+                fields.stencil_pixel_format,
+            ) {
                 return Ok(refused(reason));
             }
             // A library being made is waited for here; one the platform refused refuses the
@@ -4149,6 +4156,16 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 fragment_linked,
                 fields,
             } = *shape;
+            // An attachment Metal asserts at as it makes the state refuses it before any wait,
+            // as for a render pipeline.
+            if let Some(reason) = undescribed_attachment::<P>(
+                device,
+                &fields.colors,
+                fields.depth_pixel_format,
+                fields.stencil_pixel_format,
+            ) {
+                return Ok(refused(reason));
+            }
             // Each stage's function: a library being made is waited for here, and one the
             // platform refused, or an entry point it makes no function of, refuses the pipeline.
             let function =
@@ -5077,26 +5094,28 @@ mod tests {
             m.colors[1].pixel_format = colour;
             render_fields(m.as_bytes(), &m).unwrap()
         };
-        let refused = undescribed_attachment::<FakePlatform>(&device, &fields(4096, 0)).unwrap();
+        let check = |f: RenderFields| {
+            undescribed_attachment::<FakePlatform>(
+                &device,
+                &f.colors,
+                f.depth_pixel_format,
+                f.stencil_pixel_format,
+            )
+        };
+        let refused = check(fields(4096, 0)).unwrap();
         assert!(
             refused.contains("colour attachment 1 is pixel format 4096"),
             "{refused}"
         );
         // Colour attachment 0's format asked first, then the depth's: 1 is none, which is not.
         p.script().after(INFO, 1, Step::value(invalid));
-        let refused = undescribed_attachment::<FakePlatform>(&device, &fields(0, 252)).unwrap();
+        let refused = check(fields(0, 252)).unwrap();
         assert!(
             refused.contains("depth attachment is pixel format 252"),
             "{refused}"
         );
-        assert_eq!(
-            undescribed_attachment::<FakePlatform>(&device, &fields(0, 252)),
-            None
-        );
-        assert_eq!(
-            undescribed_attachment::<FakePlatform>(&device, &fields(81, 0)),
-            None
-        );
+        assert_eq!(check(fields(0, 252)), None);
+        assert_eq!(check(fields(81, 0)), None);
     }
 
     /// What the surface views did is logged at every 256th `SURFACE_PAGES`, and at the first one
@@ -7650,6 +7669,45 @@ lacks {part}"
                 reply.len()
             )
         );
+    }
+
+    /// A mesh render pipeline create of an attachment the device describes no format for is
+    /// refused before the platform is asked, as a render pipeline create's is: its colour or its
+    /// depth attachment past the values asked is a refused reply of the mesh kind, the mesh
+    /// creator never called; described ones are made.
+    #[test]
+    fn a_mesh_render_create_of_an_undescribed_attachment_is_refused_before_the_platform() {
+        const MAKE: &str = "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:";
+        let (p, mut dec, _) = pipeline_decoder();
+        let device = p.device();
+        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let sink_replies = Arc::clone(&replies);
+        dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
+            sink_replies.lock().push(r.bytes());
+        }));
+        for (obj_id, colour, depth) in [(110, 4096, 0), (111, 80, 4096)] {
+            let mut create = mesh_create(obj_id, true, true);
+            edit_head(&mut create, |m: &mut RgfxMeshRenderPipelineCreate| {
+                (m.colors[0].pixel_format, m.depth_pixel_format) = (colour, depth);
+            });
+            assert_eq!(
+                dec.decode(&device, &create).unwrap(),
+                Err(DecodeError::Refused)
+            );
+            assert!(p.call_log().calls_to(MAKE).is_empty());
+            let reply = replies.lock().last().unwrap().clone();
+            assert_eq!(reply.len(), size_of::<RgfxPipelineReflection>());
+            let (r, _) = RgfxPipelineReflection::read_from_prefix(&reply).unwrap();
+            assert_eq!(
+                (r.obj_id, r.status, r.kind),
+                (obj_id, RGFX_PIPELINE_REFUSED, RGFX_PIPELINE_KIND_MESH)
+            );
+        }
+        assert_eq!(
+            dec.decode(&device, &mesh_create(112, true, true)).unwrap(),
+            Ok(())
+        );
+        assert_eq!(p.call_log().calls_to(MAKE).len(), 1);
     }
 
     /// A pipeline create the decoder carries out at once (not on the device's compile pool) that
