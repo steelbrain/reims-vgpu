@@ -42,6 +42,11 @@ impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
         Ok(())
     }
 
+    /// The runtime's value: the event's timeline as the GPU and the CPU have raised it.
+    fn signaled_value(&self) -> u64 {
+        plain(|| rt::SharedEvent::signaled_value(self))
+    }
+
     /// Blocks up to `milliseconds`.
     fn wait_until_signaled_value(&self, value: u64, milliseconds: u64) -> bool {
         plain(|| {

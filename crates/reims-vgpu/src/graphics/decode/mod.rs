@@ -179,6 +179,7 @@ mod managed;
 mod refused;
 mod render;
 mod sequencer;
+pub(crate) mod shares;
 mod split;
 mod surface_cache;
 mod surface_order;
@@ -668,6 +669,9 @@ pub(crate) struct Shared<P: Platform> {
     /// command buffer of the guest's, nor one waiting on another's GPU queue, holds it up; `None`
     /// where the platform made none.
     release_queue: OnceLock<Option<P::CommandQueue>>,
+    /// The names of the shared events other processes made events of their own from, and their
+    /// holders, which each holder's values go to ([`shares`]).
+    shares: Arc<shares::Shares<P>>,
     /// The budget of the queues' lanes' extra threads ([`lane`]).
     lanes: Arc<lane::Budget>,
     /// The listener the command buffers' notifications of the values they signal run on, made at
@@ -891,6 +895,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
             commit_cancel: commit_order::Cancel::default(),
             release_queue: OnceLock::new(),
+            shares: Arc::default(),
             lanes,
             #[cfg(test)]
             walk_hook: Mutex::new(None),
@@ -2108,10 +2113,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         let mut dropped = 0;
         let mut objects = Vec::new();
         let queues = self.shared.surface_order.lock().queues_of(context);
+        // Its holds of shared events other processes hold too: those stay as they are.
+        let held_on = self.shared.shares.close(context);
         if let Some(state) = self.context_state(context) {
             // Its events first, while its table holds them: a view open on it, a walk's, keeps
             // what the removal retires out of its answer until the view closes.
-            self.release_events(device, &state);
+            self.release_events(device, &state, &held_on);
             let (removed, count) = state.remove_all();
             dropped = count;
             // Its queues end first, each signalling on its own host queue where it is let go of
@@ -2157,19 +2164,21 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// A context is gone, at its close or the device's reset, and with it everything that could
-    /// set or signal its events: no event of the guest's crosses processes, and its queues
-    /// have ended. A command buffer of its that waits for one of their values not yet reached
-    /// would wait for good, holding its queue, every object it names, the GPU addresses its
-    /// buffers pin among them, and its context's drain, which the close's answer waits for.
-    /// So each event the context's table `state` holds is set past every value, before the
-    /// close takes it out, as a view a walk holds open keeps what is taken out from the close:
-    /// a shared event on the CPU, and the plain events, which only a command buffer signals, by
-    /// one command buffer on the decoder's own queue ([`Shared::release_queue`]), which no
-    /// buffer of the guest's holds up. A refusal is logged, and the close goes on.
-    fn release_events(&self, device: &P::Device, state: &tables::Context<P>) {
+    /// set or signal its events but a shared event another process holds too (`held_on`, its
+    /// ids, which stay as they are: [`shares`]), and its queues have ended. A command buffer of
+    /// its that waits for one of their values not yet reached would wait for good, holding its
+    /// queue, every object it names, the GPU addresses its buffers pin among them, and its
+    /// context's drain, which the close's answer waits for. So each other event the context's
+    /// table `state` holds is set past every value, before the close takes it out, as a view a
+    /// walk holds open keeps what is taken out from the close: a shared event on the CPU, and
+    /// the plain events, which only a command buffer signals, by one command buffer on the
+    /// decoder's own queue ([`Shared::release_queue`]), which no buffer of the guest's holds up.
+    /// A refusal is logged, and the close goes on.
+    fn release_events(&self, device: &P::Device, state: &tables::Context<P>, held_on: &[u64]) {
         let context = state.id;
         let mut plain = 0usize;
         state.for_each_live(|id, entry| match &entry.handle {
+            ObjHandle::SharedEvent(_) if held_on.contains(&id) => {}
             ObjHandle::SharedEvent(event) => {
                 if let Err(raise) = refusing(|| event.set_signaled_value(u64::MAX)) {
                     log::warn!(
@@ -2287,6 +2296,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         shared.surface_views.lock().reset();
         self.surface_caches.reset();
         shared.surface_order.lock().reset();
+        shared.shares.reset();
         (contexts, dropped)
     }
 
@@ -2471,6 +2481,19 @@ impl<P: Platform> GraphicsDecoder<P> {
                 if let Some(queue) = &queue {
                     self.queue_ended(m.obj_id, Some(queue));
                 }
+                // A shared event's last holder in any process, where a closed context's command
+                // buffer may still wait on it: set past every value, as its close would have
+                // ([`shares`]).
+                if let Some(event) = self.shared.shares.forget(m.obj_id)
+                    && let Err(raise) = refusing(|| event.set_signaled_value(u64::MAX))
+                {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "shared event {:#x}, the last holder of a closed context's, was not set \
+                         past every value at its destroy: {raise}",
+                        m.obj_id
+                    );
+                }
                 self.remove(m.obj_id);
                 Ok(Ok(()))
             }
@@ -2534,6 +2557,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     _ => return Ok(Err(DecodeError::BadReference)),
                 };
                 event.set_signaled_value(m.value)?;
+                // The other processes that hold it learn of the value as the host carries the set
+                // out ([`shares`]).
+                self.shared.shares.set(m.obj_id, m.value);
                 Ok(Ok(()))
             }
             RGFX_CMD_QUEUE_CREATE => {

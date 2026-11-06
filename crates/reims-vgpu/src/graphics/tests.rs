@@ -3505,6 +3505,102 @@ fn ring_events(platform: &FakePlatform, ring: &mut QueueRing, n: usize) -> Vec<(
     got
 }
 
+/// A `SHARED_EVENT_NAME` or `SHARED_EVENT_IMPORT` as the kext builds it.
+fn shared_event_share(r#type: u32, obj_id: u64, name: u64, listen_queue_obj_id: u64) -> Vec<u8> {
+    RgfxSharedEventName {
+        header: RgfxMsgHeader {
+            r#type,
+            size: size_of::<RgfxSharedEventName>() as u32,
+            seqno: 0,
+        },
+        obj_id,
+        name,
+        listen_queue_obj_id,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// A shared event one process names and another makes one of its own from is one event across
+/// them, as a Mac's is: the import is answered the event's value; a command buffer's signals in
+/// the namer are posted to the importer's listen queue, for the importer's own id, as they reach
+/// the namer's own ring; and the importer's CPU set is posted to the namer's listen queue. A name
+/// of an event the process does not hold, and an import of a name the kext let go of, are refused
+#[test]
+fn a_named_shared_event_is_one_event_across_two_processes() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, mut guest, [mut namer, mut namer_listen, mut importer]) =
+        two_processes(&raised);
+    // Process 1 names its event 20, the other holders' values going to its queue 2.
+    let name = shared_event_share(RGFX_CMD_SHARED_EVENT_NAME, obj(1, 20), 7, obj(1, 2));
+    assert_eq!(answered(&device, &mut guest, name), RGFX_STATUS_OK);
+    let none = shared_event_share(RGFX_CMD_SHARED_EVENT_NAME, obj(1, 99), 8, obj(1, 2));
+    assert_eq!(answered(&device, &mut guest, none), RGFX_STATUS_NOT_FOUND);
+    // Process 2 makes its event 21 of the name, its values going to its queue 1.
+    let import = shared_event_share(RGFX_CMD_SHARED_EVENT_IMPORT, obj(2, 21), 7, obj(2, 1));
+    guest.send(&device, import);
+    let value = RgfxSharedEventValue::read_from_bytes(&guest.event().unwrap()).unwrap();
+    assert_eq!(
+        (value.header.r#type, value.header.seqno),
+        (RGFX_EVT_SHARED_EVENT_VALUE, guest.seqno)
+    );
+    assert_eq!((value.status, value.value), (RGFX_STATUS_OK, 0));
+
+    // Process 1's buffer signals 4 and 5.
+    namer.send(
+        &device,
+        render_command_buffer(obj(1, 1), 100, obj(1, 11), obj(1, 20)),
+    );
+    assert_eq!(
+        ring_events(&platform, &mut namer, 3),
+        [
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 5),
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    assert_eq!(
+        ring_events(&platform, &mut importer, 2),
+        [
+            (RGFX_EVT_EVENT_SIGNALLED, obj(2, 21), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(2, 21), 5),
+        ]
+    );
+    // Process 2's CPU sets it to 9.
+    let set = RgfxSharedEventSetValue {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SHARED_EVENT_SET_VALUE,
+            size: size_of::<RgfxSharedEventSetValue>() as u32,
+            seqno: 0,
+        },
+        obj_id: obj(2, 21),
+        value: 9,
+    };
+    guest.send(&device, set.as_bytes().to_vec());
+    assert_eq!(
+        ring_events(&platform, &mut namer_listen, 1),
+        [(RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 9)]
+    );
+    assert!(!namer.has_event() && !importer.has_event());
+
+    // The kext lets go of the name: a later import finds none, and makes nothing.
+    let unname = RgfxSharedEventUnname {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SHARED_EVENT_UNNAME,
+            size: size_of::<RgfxSharedEventUnname>() as u32,
+            seqno: 0,
+        },
+        reserved_10: 0,
+        name: 7,
+    };
+    guest.send(&device, unname.as_bytes().to_vec());
+    carried_out_of(&device, &mut guest, 0);
+    let again = shared_event_share(RGFX_CMD_SHARED_EVENT_IMPORT, obj(2, 22), 7, obj(2, 1));
+    guest.send(&device, again);
+    let refused = RgfxSharedEventValue::read_from_bytes(&guest.event().unwrap()).unwrap();
+    assert_eq!((refused.status, refused.value), (RGFX_STATUS_NOT_FOUND, 0));
+}
+
 /// A command buffer whose walk is held inside the platform's draw, as a driver's cold pipeline
 /// make holds one, holds up no other queue's: with the draw held, another process's ring-0
 /// messages are carried out and its pipeline compiled, and its buffers are taken, begun, answered
@@ -7077,6 +7173,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_SMALL_ID_CHUNKS
             | RGFX_FEATURE_DISPLAY_COLOR
             | RGFX_FEATURE_MESH_PIPELINES
+            | RGFX_FEATURE_SHARED_EVENT_NAMES
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
     // The fake's GPU shares the CPU's memory: no caches, so no deferred blocks and no budget.
@@ -7099,6 +7196,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_SMALL_ID_CHUNKS
             | RGFX_FEATURE_DISPLAY_COLOR
             | RGFX_FEATURE_MESH_PIPELINES
+            | RGFX_FEATURE_SHARED_EVENT_NAMES
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);

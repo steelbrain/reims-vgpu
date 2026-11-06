@@ -42,20 +42,22 @@ use reims_graphics::wire::{
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE,
     RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CONTEXT_OBJ_ID_SHIFT,
+    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
+    RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
     RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
     RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_HEAP_OVER_PAGES,
     RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_PAGES_BUFFERS,
-    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
-    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
-    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxIcbState, RgfxLibraryLookup,
-    RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxSurfacePages, RgfxVideoCaps,
+    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
+    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER,
+    RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
+    RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
+    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState,
+    RgfxSharedEventName, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -82,6 +84,7 @@ use crate::error::Error;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
+use crate::graphics::decode::shares::ListenSink;
 use crate::graphics::decode::worker::{Unsettled, Worker};
 use crate::graphics::decode::{
     Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, GraphicsDecoder, LibraryJob,
@@ -268,7 +271,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // A host that maps the guest's pages maps a process's own pages too, for its no-copy
             // buffers (`BUFFER_OVER_PAGES`) and the heaps of its buffers' slabs
             // (`HEAP_OVER_PAGES`). Every host carries the display pipe's colour out
-            // (`DISPLAY_COLOR`), its window drawing through it. A host whose GPU answers Metal3
+            // (`DISPLAY_COLOR`), its window drawing through it, and names the shared events one
+            // process hands another (`SHARED_EVENT_NAMES`). A host whose GPU answers Metal3
             // makes mesh render pipelines and draws them (`MESH_PIPELINES`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
@@ -285,6 +289,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_MANAGED_BUFFER_SLABS)
                 | u64::from(RGFX_FEATURE_SMALL_ID_CHUNKS)
                 | u64::from(RGFX_FEATURE_DISPLAY_COLOR)
+                | u64::from(RGFX_FEATURE_SHARED_EVENT_NAMES)
                 | if meshes {
                     u64::from(RGFX_FEATURE_MESH_PIPELINES)
                 } else {
@@ -1171,6 +1176,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.start_icb(poster, message);
                 return;
             }
+            RGFX_CMD_SHARED_EVENT_NAME
+            | RGFX_CMD_SHARED_EVENT_IMPORT
+            | RGFX_CMD_SHARED_EVENT_UNNAME => {
+                self.share_event(poster, message);
+                return;
+            }
             RGFX_CMD_COMMAND_BUFFER => {
                 self.pending.wait_for_command_buffer(message);
                 if !foreign_queue(poster, message) {
@@ -1591,6 +1602,49 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
         if let Some(answer) = answer {
             poster.post(answer.as_bytes());
+        }
+    }
+
+    /// A shared event's name, import or unname from ring 0, the kext's for a process that hands
+    /// its event to another or makes one of its own from another's, and for the port it gave out
+    /// gone (`decode::shares`), a name and an import answered at once through `poster`: a name's
+    /// `COMPLETE`, an import's `SHARED_EVENT_VALUE`. The values other holders give the event go to
+    /// the sender's listen queue's completion ring, posted there waiting for nothing.
+    fn share_event(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, _, obj_id) = message_identity(message);
+        if ty == RGFX_CMD_SHARED_EVENT_UNNAME {
+            let decoder = (self.decoders).sender(Some(0), Sinks::default());
+            entry::run(|_| decoder.unname_shared_event(message));
+            return;
+        }
+        // Both messages name the listen queue after the name.
+        let listen_queue = RgfxSharedEventName::read_from_prefix(message)
+            .map_or(0, |(m, _)| m.listen_queue_obj_id);
+        let listen = self.presents.queue_poster(listen_queue).map(|ring| {
+            Arc::new(move |m: &RgfxEventSignalled| ring.try_post(m.as_bytes())) as ListenSink
+        });
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        if ty == RGFX_CMD_SHARED_EVENT_NAME {
+            let (seqno, status) = entry::run(|_| decoder.name_shared_event(message, listen));
+            log::info!(
+                target: "reims_vgpu::graphics",
+                "shared event {obj_id:#x} named for other processes: status {status}"
+            );
+            if let Some(seqno) = seqno {
+                poster.post(complete(seqno, status).as_bytes());
+            }
+        } else {
+            let answer = entry::run(|_| decoder.import_shared_event(message, listen));
+            if let Some(answer) = answer {
+                log::info!(
+                    target: "reims_vgpu::graphics",
+                    "shared event {obj_id:#x} made from another process's: status {}, value {}",
+                    answer.status,
+                    answer.value
+                );
+                poster.post(answer.as_bytes());
+            }
         }
     }
 

@@ -62,8 +62,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
 /// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_HOST_TIME`],
 /// [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`],
-/// [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`] and
-/// [`RGFX_FEATURE_MESH_PIPELINES`]). Bits 9 and 10 are
+/// [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`],
+/// [`RGFX_FEATURE_MESH_PIPELINES`] and [`RGFX_FEATURE_SHARED_EVENT_NAMES`]). Bits 9 and 10 are
 /// reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -218,6 +218,14 @@ pub const RGFX_FEATURE_DISPLAY_COLOR: u32 = 1 << 24;
 /// ops. Every host offers it; where the host's platform makes no mesh pipeline, the create is
 /// refused as one the platform refused.
 pub const RGFX_FEATURE_MESH_PIPELINES: u32 = 1 << 25;
+/// `FEATURES_LO` bit 26, `SHARED_EVENT_NAMES`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_SHARED_EVENT_NAME`] and
+/// [`RGFX_CMD_SHARED_EVENT_IMPORT`], which the accelerator kext posts for a process's shared event
+/// another process makes an event of its own from, and [`RGFX_CMD_SHARED_EVENT_UNNAME`]: both
+/// name one host event, which every holder's command buffers signal and wait on, and the values
+/// one holder's buffers and CPU give it are posted to every other holder
+/// ([`RgfxSharedEventName::listen_queue_obj_id`]).
+pub const RGFX_FEATURE_SHARED_EVENT_NAMES: u32 = 1 << 26;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -634,6 +642,31 @@ pub const RGFX_CMD_MANAGED_BUFFER_CREATE: u32 = 0x22d;
 /// ([`RgfxMeshPipelineReflection`]). `OBJECT_DESTROY` drops it, as a render pipeline. A host
 /// without the feature refuses the message as one it does not know.
 pub const RGFX_CMD_MESH_RENDER_PIPELINE_CREATE: u32 = 0x22e;
+/// Command `SHARED_EVENT_NAME` ([`RgfxSharedEventName`]), which the accelerator kext posts for a
+/// process's `SharedEventExport`, where the guest took [`RGFX_FEATURE_SHARED_EVENT_NAMES`]: the
+/// process's shared event `obj_id` is named `name` device-wide, so another process may make an
+/// event of its own from the name ([`RGFX_CMD_SHARED_EVENT_IMPORT`]), until the kext lets go of
+/// the name ([`RGFX_CMD_SHARED_EVENT_UNNAME`]). Answered by
+/// [`RGFX_EVT_COMPLETE`]: [`RGFX_STATUS_OK`], or [`RGFX_STATUS_NOT_FOUND`] where the sender holds
+/// no shared event of that id (one whose create the host refused among them) or no queue of
+/// `listen_queue_obj_id`'s; the kext hands the process the name's port only once it is answered
+/// OK, so a later import finds the name. A host without the feature refuses the message as one it
+/// does not know.
+pub const RGFX_CMD_SHARED_EVENT_NAME: u32 = 0x22f;
+/// Command `SHARED_EVENT_IMPORT` ([`RgfxSharedEventImport`]), which the accelerator kext posts for
+/// a process's `SharedEventImport` of a port another process's `SharedEventExport` gave out, where
+/// the guest took [`RGFX_FEATURE_SHARED_EVENT_NAMES`]: the process's new shared event `obj_id` is
+/// the host event named `name`. Answered by [`RGFX_EVT_SHARED_EVENT_VALUE`], with the event's
+/// value, or [`RGFX_STATUS_NOT_FOUND`] where the name was let go of, or never given (nothing is
+/// made then). A host without the feature refuses the message as one it does not know.
+pub const RGFX_CMD_SHARED_EVENT_IMPORT: u32 = 0x230;
+/// Command `SHARED_EVENT_UNNAME` ([`RgfxSharedEventUnname`]), which the accelerator kext posts
+/// once the port a `SHARED_EVENT_NAME` gave out is gone (no process holds it, or its connection
+/// was closed), where the guest took [`RGFX_FEATURE_SHARED_EVENT_NAMES`]: no process can import
+/// the name from then on. A name holds its event as a holder does: the host's event goes once
+/// its last name and its last holder are gone. Context 0's, which no process is. Not answered. A
+/// host without the feature refuses the message as one it does not know.
+pub const RGFX_CMD_SHARED_EVENT_UNNAME: u32 = 0x231;
 
 /// `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 /// held context `context` closed the device or died. The host ends the context's command queues
@@ -787,6 +820,9 @@ pub const RGFX_EVT_ICB_STATE: u32 = 0x407;
 /// `producer_waiting` as 1 after a take that moved its `consumer`, and stored 0 there. A producer
 /// waiting for room on the ring looks again.
 pub const RGFX_EVT_SUBMIT_ROOM: u32 = 0x408;
+/// Event `SHARED_EVENT_VALUE` ([`RgfxSharedEventValue`], on the control completion ring): a
+/// `SHARED_EVENT_IMPORT`'s answer.
+pub const RGFX_EVT_SHARED_EVENT_VALUE: u32 = 0x409;
 
 /// A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 pub const RGFX_CB_OK: u32 = 0;
@@ -1251,6 +1287,77 @@ pub struct RgfxSharedEventSetValue {
     /// The shared event.
     pub obj_id: u64,
     /// The value `setSignaledValue:` was given.
+    pub value: u64,
+}
+
+/// `SHARED_EVENT_NAME`: the sender's shared event `obj_id` named `name` device-wide. Every holder of
+/// the event (its maker, and each process that made an event from the name) is posted the values
+/// the others' command buffers signal it to and their CPUs set it to, as [`RgfxEventSignalled`]
+/// for its own id, on the completion ring of its queue `listen_queue_obj_id`, as the host learns
+/// of them: a signal where the host posts it to the signaller, a CPU set as the host carries it
+/// out. The kext builds the message: `name` is the kext's, never the process's.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSharedEventName {
+    /// [`RGFX_CMD_SHARED_EVENT_NAME`].
+    pub header: RgfxMsgHeader,
+    /// The sender's shared event.
+    pub obj_id: u64,
+    /// Its name, unique to the device from the kext's start: never 0.
+    pub name: u64,
+    /// The sender's queue whose completion ring takes the values other holders give the event.
+    pub listen_queue_obj_id: u64,
+}
+
+/// `SHARED_EVENT_IMPORT`: the sender's new shared event `obj_id` is the host event named `name`, its
+/// values posted on the completion ring of the sender's queue `listen_queue_obj_id`, as
+/// [`RgfxSharedEventName`]'s are. The kext builds the message from the port the process gave it.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSharedEventImport {
+    /// [`RGFX_CMD_SHARED_EVENT_IMPORT`].
+    pub header: RgfxMsgHeader,
+    /// The sender's new shared event's guest-picked id.
+    pub obj_id: u64,
+    /// The name the event was given ([`RgfxSharedEventName::name`]).
+    pub name: u64,
+    /// The sender's queue whose completion ring takes the values other holders give the event.
+    pub listen_queue_obj_id: u64,
+}
+
+/// `SHARED_EVENT_UNNAME`: the name `name` is no longer the kext's to give out.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSharedEventUnname {
+    /// [`RGFX_CMD_SHARED_EVENT_UNNAME`].
+    pub header: RgfxMsgHeader,
+    /// 0: the message is context 0's, which no process is, so it waits for no process's
+    /// messages.
+    pub reserved_10: u64,
+    /// The name ([`RgfxSharedEventName::name`]).
+    pub name: u64,
+}
+
+/// `SHARED_EVENT_VALUE`: a `SHARED_EVENT_IMPORT`'s answer, with its `seqno`: the event's value as
+/// the host's event has it, the value the new event starts at.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxSharedEventValue {
+    /// [`RGFX_EVT_SHARED_EVENT_VALUE`], with the import's `seqno`.
+    pub header: RgfxMsgHeader,
+    /// An `RGFX_STATUS_*`: [`RGFX_STATUS_OK`] where the event is made.
+    pub status: u32,
+    /// Pads to a multiple of 8; 0.
+    pub reserved_14: u32,
+    /// The event's value; 0 where it was not made.
     pub value: u64,
 }
 

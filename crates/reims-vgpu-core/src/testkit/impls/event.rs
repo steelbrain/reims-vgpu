@@ -32,6 +32,15 @@ impl SharedEvent<FakePlatform> for Fk<kind::SharedEvent> {
         Ok(())
     }
 
+    fn signaled_value(&self) -> u64 {
+        let step = self.call("signaledValue", vec![]);
+        fatal(step.throws(Policy::Fatal, "signaledValue"));
+        if let Some(v) = step.get::<u64>() {
+            return v;
+        }
+        super::super::objects::event_value(self.obj())
+    }
+
     fn wait_until_signaled_value(&self, value: u64, milliseconds: u64) -> bool {
         let step = self.call(
             "waitUntilSignaledValue:timeoutMS:",

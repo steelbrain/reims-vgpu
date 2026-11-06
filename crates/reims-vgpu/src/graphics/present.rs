@@ -280,6 +280,13 @@ impl<P: Platform> PresentQueue<P> {
             .collect()
     }
 
+    /// The poster onto queue `queue`'s completion ring, while the host holds the queue: where a
+    /// shared event's other holders' values go for the process that named it its listen queue
+    /// (`decode::shares`).
+    pub(crate) fn queue_poster(&self, queue: u64) -> Option<CompletionPoster> {
+        self.state.lock().queues.get(&queue).cloned()
+    }
+
     /// Queue `queue` is gone: nothing more of it finishes.
     pub(crate) fn queue_gone(&self, queue: u64) {
         self.state.lock().queues.remove(&queue);

@@ -947,8 +947,8 @@
 // [`RGFX_FEATURE_SUBMIT_ROOM`], [`RGFX_FEATURE_ICB_SLOTS`], [`RGFX_FEATURE_COMMIT_ORDER`],
 // [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_HOST_TIME`],
 // [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`],
-// [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`] and
-// [`RGFX_FEATURE_MESH_PIPELINES`]). Bits 9 and 10 are
+// [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`],
+// [`RGFX_FEATURE_MESH_PIPELINES`] and [`RGFX_FEATURE_SHARED_EVENT_NAMES`]). Bits 9 and 10 are
 // reserved.
 #define RGFX_REG_FEATURES_LO 8
 
@@ -1128,6 +1128,15 @@
 // ops. Every host offers it; where the host's platform makes no mesh pipeline, the create is
 // refused as one the platform refused.
 #define RGFX_FEATURE_MESH_PIPELINES (1 << 25)
+
+// `FEATURES_LO` bit 26, `SHARED_EVENT_NAMES`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: ring 0 carries [`RGFX_CMD_SHARED_EVENT_NAME`] and
+// [`RGFX_CMD_SHARED_EVENT_IMPORT`], which the accelerator kext posts for a process's shared event
+// another process makes an event of its own from, and [`RGFX_CMD_SHARED_EVENT_UNNAME`]: both
+// name one host event, which every holder's command buffers signal and wait on, and the values
+// one holder's buffers and CPU give it are posted to every other holder
+// ([`RgfxSharedEventName::listen_queue_obj_id`]).
+#define RGFX_FEATURE_SHARED_EVENT_NAMES (1 << 26)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1581,6 +1590,34 @@
 // without the feature refuses the message as one it does not know.
 #define RGFX_CMD_MESH_RENDER_PIPELINE_CREATE 558
 
+// Command `SHARED_EVENT_NAME` ([`RgfxSharedEventName`]), which the accelerator kext posts for a
+// process's `SharedEventExport`, where the guest took [`RGFX_FEATURE_SHARED_EVENT_NAMES`]: the
+// process's shared event `obj_id` is named `name` device-wide, so another process may make an
+// event of its own from the name ([`RGFX_CMD_SHARED_EVENT_IMPORT`]), until the kext lets go of
+// the name ([`RGFX_CMD_SHARED_EVENT_UNNAME`]). Answered by
+// [`RGFX_EVT_COMPLETE`]: [`RGFX_STATUS_OK`], or [`RGFX_STATUS_NOT_FOUND`] where the sender holds
+// no shared event of that id (one whose create the host refused among them) or no queue of
+// `listen_queue_obj_id`'s; the kext hands the process the name's port only once it is answered
+// OK, so a later import finds the name. A host without the feature refuses the message as one it
+// does not know.
+#define RGFX_CMD_SHARED_EVENT_NAME 559
+
+// Command `SHARED_EVENT_IMPORT` ([`RgfxSharedEventImport`]), which the accelerator kext posts for
+// a process's `SharedEventImport` of a port another process's `SharedEventExport` gave out, where
+// the guest took [`RGFX_FEATURE_SHARED_EVENT_NAMES`]: the process's new shared event `obj_id` is
+// the host event named `name`. Answered by [`RGFX_EVT_SHARED_EVENT_VALUE`], with the event's
+// value, or [`RGFX_STATUS_NOT_FOUND`] where the name was let go of, or never given (nothing is
+// made then). A host without the feature refuses the message as one it does not know.
+#define RGFX_CMD_SHARED_EVENT_IMPORT 560
+
+// Command `SHARED_EVENT_UNNAME` ([`RgfxSharedEventUnname`]), which the accelerator kext posts
+// once the port a `SHARED_EVENT_NAME` gave out is gone (no process holds it, or its connection
+// was closed), where the guest took [`RGFX_FEATURE_SHARED_EVENT_NAMES`]: no process can import
+// the name from then on. A name holds its event as a holder does: the host's event goes once
+// its last name and its last holder are gone. Context 0's, which no process is. Not answered. A
+// host without the feature refuses the message as one it does not know.
+#define RGFX_CMD_SHARED_EVENT_UNNAME 561
+
 // `CONTEXT_CLOSE` ([`RgfxContextClose`]), on ring 0 from the accelerator kext: the process that
 // held context `context` closed the device or died. The host ends the context's command queues
 // and drops every object whose id lies in its range ([`RGFX_CONTEXT_OBJ_ID_SHIFT`]), then answers
@@ -1752,6 +1789,10 @@
 // `producer_waiting` as 1 after a take that moved its `consumer`, and stored 0 there. A producer
 // waiting for room on the ring looks again.
 #define RGFX_EVT_SUBMIT_ROOM 1032
+
+// Event `SHARED_EVENT_VALUE` ([`RgfxSharedEventValue`], on the control completion ring): a
+// `SHARED_EVENT_IMPORT`'s answer.
+#define RGFX_EVT_SHARED_EVENT_VALUE 1033
 
 // A command buffer's status in [`RgfxCbComplete`]: finished with no error.
 #define RGFX_CB_OK 0
@@ -6088,6 +6129,37 @@ typedef struct {
   uint64_t initial_value;
 } RgfxSharedEventCreate;
 
+// `SHARED_EVENT_IMPORT`: the sender's new shared event `obj_id` is the host event named `name`, its
+// values posted on the completion ring of the sender's queue `listen_queue_obj_id`, as
+// [`RgfxSharedEventName`]'s are. The kext builds the message from the port the process gave it.
+typedef struct {
+  // [`RGFX_CMD_SHARED_EVENT_IMPORT`].
+  RgfxMsgHeader header;
+  // The sender's new shared event's guest-picked id.
+  uint64_t obj_id;
+  // The name the event was given ([`RgfxSharedEventName::name`]).
+  uint64_t name;
+  // The sender's queue whose completion ring takes the values other holders give the event.
+  uint64_t listen_queue_obj_id;
+} RgfxSharedEventImport;
+
+// `SHARED_EVENT_NAME`: the sender's shared event `obj_id` named `name` device-wide. Every holder of
+// the event (its maker, and each process that made an event from the name) is posted the values
+// the others' command buffers signal it to and their CPUs set it to, as [`RgfxEventSignalled`]
+// for its own id, on the completion ring of its queue `listen_queue_obj_id`, as the host learns
+// of them: a signal where the host posts it to the signaller, a CPU set as the host carries it
+// out. The kext builds the message: `name` is the kext's, never the process's.
+typedef struct {
+  // [`RGFX_CMD_SHARED_EVENT_NAME`].
+  RgfxMsgHeader header;
+  // The sender's shared event.
+  uint64_t obj_id;
+  // Its name, unique to the device from the kext's start: never 0.
+  uint64_t name;
+  // The sender's queue whose completion ring takes the values other holders give the event.
+  uint64_t listen_queue_obj_id;
+} RgfxSharedEventName;
+
 // `SHARED_EVENT_SET_VALUE`: the shared event `obj_id` set to `value` from the CPU.
 typedef struct {
   // [`RGFX_CMD_SHARED_EVENT_SET_VALUE`].
@@ -6097,6 +6169,30 @@ typedef struct {
   // The value `setSignaledValue:` was given.
   uint64_t value;
 } RgfxSharedEventSetValue;
+
+// `SHARED_EVENT_UNNAME`: the name `name` is no longer the kext's to give out.
+typedef struct {
+  // [`RGFX_CMD_SHARED_EVENT_UNNAME`].
+  RgfxMsgHeader header;
+  // 0: the message is context 0's, which no process is, so it waits for no process's
+  // messages.
+  uint64_t reserved_10;
+  // The name ([`RgfxSharedEventName::name`]).
+  uint64_t name;
+} RgfxSharedEventUnname;
+
+// `SHARED_EVENT_VALUE`: a `SHARED_EVENT_IMPORT`'s answer, with its `seqno`: the event's value as
+// the host's event has it, the value the new event starts at.
+typedef struct {
+  // [`RGFX_EVT_SHARED_EVENT_VALUE`], with the import's `seqno`.
+  RgfxMsgHeader header;
+  // An `RGFX_STATUS_*`: [`RGFX_STATUS_OK`] where the event is made.
+  uint32_t status;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+  // The event's value; 0 where it was not made.
+  uint64_t value;
+} RgfxSharedEventValue;
 
 // `SIZE_AND_ALIGN`: a `HEAP_TEXTURE_SIZE_AND_ALIGN`'s answer. `status` is [`RGFX_STATUS_OK`]
 // with the device's `size` and `align` (a size of 0 for a shape no texture has, as Metal answers

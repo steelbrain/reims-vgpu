@@ -137,6 +137,7 @@ use super::super::completion::{cb_complete, cb_failed};
 use super::commit_order::Until;
 use super::lane::{Lane, Turn};
 use super::sequencer::Ticket;
+use super::shares::FanOut;
 use super::split::{Parts, SplitHold};
 use super::surface_cache::Uses;
 use super::surface_order::{Marks, Signalled};
@@ -170,11 +171,13 @@ struct EventOps {
 struct Finisher(Option<Arc<Signals>>);
 
 impl Finisher {
-    /// The buffer's signals, made at the first, their values going to `sink`.
-    fn signals(&mut self, sink: Option<&SignalSink>) -> &Arc<Signals> {
+    /// The buffer's signals, made at the first, their values going to `sink`, and to the other
+    /// holders of the events' names through `fan_out`.
+    fn signals(&mut self, sink: Option<&SignalSink>, fan_out: &Arc<dyn FanOut>) -> &Arc<Signals> {
         self.0.get_or_insert_with(|| {
             Arc::new(Signals(Mutex::new(Posting {
                 sink: sink.cloned(),
+                fan_out: Arc::clone(fan_out),
                 signals: Vec::new(),
             })))
         })
@@ -209,15 +212,17 @@ impl Drop for Finisher {
 /// go: a notification that comes later posts nothing. A value already reached when its
 /// notification is asked for goes at once: the event is at it, whatever raised it. A signal of a
 /// shared event whose create the host refused goes with the completion wherever it lies
-/// ([`GraphicsDecoder::note_refused_signal`]).
-#[derive(Default)]
+/// ([`GraphicsDecoder::note_refused_signal`]). Each post goes to the other processes that hold
+/// the event's name too, as it is posted ([`super::shares`]): whether the event has a name is
+/// read then, so a buffer walked before the name was given posts its later values to them.
 struct Signals(Mutex<Posting>);
 
 /// [`Signals`]' state.
-#[derive(Default)]
 struct Posting {
     /// Where the values go: none without a sink, and none once the completion handler posted.
     sink: Option<SignalSink>,
+    /// Where they go besides: the other holders of an event's name.
+    fan_out: Arc<dyn FanOut>,
     /// Each (shared event, value), in stream order, and whether it is posted.
     signals: Vec<(u64, u64, bool)>,
 }
@@ -239,12 +244,17 @@ impl Signals {
     /// completion handler has run.
     fn reached(&self, at: usize) {
         let mut posting = self.0.lock();
-        let Posting { sink, signals } = &mut *posting;
+        let Posting {
+            sink,
+            fan_out,
+            signals,
+        } = &mut *posting;
         if let (Some(sink), Some((obj_id, value, posted))) = (sink.as_ref(), signals.get_mut(at))
             && !*posted
         {
             *posted = true;
             sink(event_signalled(*obj_id, *value));
+            fan_out.reached(*obj_id, *value);
         }
     }
 
@@ -255,10 +265,14 @@ impl Signals {
         let Some(sink) = posting.sink.take() else {
             return;
         };
-        for (obj_id, value, posted) in &mut posting.signals {
+        let Posting {
+            fan_out, signals, ..
+        } = &mut *posting;
+        for (obj_id, value, posted) in signals {
             if !*posted {
                 *posted = true;
                 sink(event_signalled(*obj_id, *value));
+                fan_out.reached(*obj_id, *value);
             }
         }
     }
@@ -1864,7 +1878,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         op: RgfxOpEvent,
         mid: bool,
     ) -> RaiseResult<()> {
-        let signals = events.signals.signals(self.sinks.signal.as_ref());
+        let fan_out: Arc<dyn FanOut> = self.shared.shares.clone();
+        let signals = events.signals.signals(self.sinks.signal.as_ref(), &fan_out);
         let at = signals.push(op.event_obj_id, op.value);
         if !mid || !signals.posts() {
             return Ok(());
@@ -1880,7 +1895,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// notification could watch, and the walk runs ahead of the GPU, so a post as the walk reaches
     /// it could come before the buffer's earlier work is done.
     fn note_refused_signal(&self, events: &mut EventOps, op: RgfxOpEvent) {
-        let signals = events.signals.signals(self.sinks.signal.as_ref());
+        let fan_out: Arc<dyn FanOut> = self.shared.shares.clone();
+        let signals = events.signals.signals(self.sinks.signal.as_ref(), &fan_out);
         signals.push(op.event_obj_id, op.value);
     }
 

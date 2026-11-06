@@ -33,6 +33,10 @@ impl reims_vgpu_core::platform::event::SharedEvent<MetalPlatform> for MetalShare
             self.setSignaledValue(signaled_value)
         })
     }
+    /// `signaledValue`.
+    fn signaled_value(&self) -> u64 {
+        msg::get("signaledValue", || self.signaledValue())
+    }
     /// `waitUntilSignaledValue:timeoutMS:`, which blocks up to `milliseconds`.
     fn wait_until_signaled_value(&self, value: u64, milliseconds: u64) -> bool {
         msg::get("waitUntilSignaledValue:timeoutMS:", || {

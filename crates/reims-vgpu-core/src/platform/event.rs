@@ -12,6 +12,9 @@ pub trait SharedEvent<P: Platform>: Handle {
     fn new_shared_event_handle(&self) -> Option<P::SharedEventHandle>;
     /// sel: setSignaledValue:
     fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()>;
+    /// sel: signaledValue — the value as the event has it now: what the CPU set and the GPU
+    /// signalled it to, the highest of them, as Metal's only rises.
+    fn signaled_value(&self) -> u64;
     /// sel: waitUntilSignaledValue:timeoutMS:
     /// (5000 ms). `false` on timeout (measured: `NO` for an unsignalled value after 10 ms). Blocks
     /// the calling thread; the fake runs it on the virtual clock. No path reaches it under a
