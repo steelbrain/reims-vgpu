@@ -43,10 +43,22 @@
 //                listener and read see it; a GPU wait in the peer released by a CPU set here,
 //                and the peer's signal after it seen here; a handle round trip in the peer; and
 //                the event in the peer once this process has let go of it
+//   kill         a peer of the probe's makes an event, sends its port and is killed (SIGKILL):
+//                the port as the probe then holds it, an event made from it before the kill and
+//                one made after, their values, a CPU set of one seen by the other, and a GPU
+//                signal of one seen by the other
+//   connect      what IOKit's object and connection calls answer for ports that are no shared
+//                event's: IOObjectGetClass and IOObjectConformsTo of an IOKit connection (an
+//                IOSurfaceRoot user client), of mach_task_self() and of a send right of a receive
+//                right the probe holds (on a thread of its own, so a call that waits for an
+//                answer no one gives is reported after 1 s), and IOConnectCallMethod of
+//                selector 0x114 with three scalars in and two out on each
 // Build: see README.md.
 #import "oracle_common.h"
 #import <IOSurface/IOSurface.h>
+#include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
+#include <signal.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <spawn.h>
@@ -590,6 +602,24 @@ typedef struct {
 
 enum { OE_HELLO = 1, OE_EVENT, OE_ACK, OE_SET, OE_READY, OE_SIGNALLED, OE_COMMITTED, OE_DONE, OE_GONE };
 
+// The probe's port, which the probe hands a peer through its exception port (EXC_MASK_RPC_ALERT,
+// which no exception raises); MACH_PORT_NULL where it has none.
+static mach_port_t oe_probe_port(void)
+{
+	exception_mask_t masks[EXC_TYPES_COUNT];
+	mach_port_t ports[EXC_TYPES_COUNT];
+	exception_behavior_t behaviors[EXC_TYPES_COUNT];
+	thread_state_flavor_t flavors[EXC_TYPES_COUNT];
+	mach_msg_type_number_t n = EXC_TYPES_COUNT;
+	if (task_get_exception_ports(mach_task_self(), EXC_MASK_RPC_ALERT, masks, &n, ports, behaviors,
+	                             flavors) != KERN_SUCCESS ||
+	    n == 0 || !MACH_PORT_VALID(ports[0]))
+		return MACH_PORT_NULL;
+	task_set_exception_ports(mach_task_self(), EXC_MASK_RPC_ALERT, MACH_PORT_NULL, EXCEPTION_DEFAULT,
+	                         THREAD_STATE_NONE);
+	return ports[0];
+}
+
 static kern_return_t oe_send(mach_port_t to, uint64_t op, uint64_t a, uint64_t b, mach_port_t port,
                              mach_msg_type_name_t disposition)
 {
@@ -711,6 +741,129 @@ static int run_peer(id<MTLDevice> d)
 	return 0;
 }
 
+// The exporter (kill): makes an event at 5, sends the probe its port, and waits to be killed.
+static int run_exporter(id<MTLDevice> d)
+{
+	mach_port_t probe = oe_probe_port();
+	if (!probe) {
+		printf("kill exporter: no port from the probe\n");
+		return 1;
+	}
+	id<MTLSharedEvent> e = [d newSharedEvent];
+	e.signaledValue = 5;
+	oe_send(probe, OE_EVENT, 5, 0, event_port(e), MACH_MSG_TYPE_COPY_SEND);
+	sleep(60);
+	return 0;
+}
+
+// A peer of the probe's, `mode` its role, given the probe's receive right `rx` through its
+// exception port; its pid, or 0 where the spawn failed.
+static pid_t spawn_peer(mach_port_t rx, const char *mode)
+{
+	posix_spawnattr_t attr;
+	posix_spawnattr_init(&attr);
+	posix_spawnattr_setexceptionports_np(&attr, EXC_MASK_RPC_ALERT, rx, EXCEPTION_DEFAULT,
+	                                     THREAD_STATE_NONE);
+	char *args[] = {(char *)g_argv0, (char *)g_device, (char *)mode, NULL};
+	pid_t pid = 0;
+	int sr = posix_spawn(&pid, g_argv0, NULL, &attr, args, environ);
+	posix_spawnattr_destroy(&attr);
+	if (sr != 0) {
+		printf("posix_spawn %s failed %d\n", mode, sr);
+		return 0;
+	}
+	return pid;
+}
+
+static void case_kill(id<MTLDevice> d)
+{
+	mach_port_t rx = oe_receive_right();
+	pid_t pid = spawn_peer(rx, "--exporter");
+	if (!pid)
+		return;
+	oe_rcv r;
+	if (!oe_recv(rx, OE_EVENT, &r, "probe")) {
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+		return;
+	}
+	mach_port_t port = r.m.port.name;
+	id<MTLSharedEvent> before = from_port(d, port);
+	printf("kill: before the kill fromPort=%s value=%llu port refs %d type %s\n", cls(before),
+	       before ? before.signaledValue : 0ull, send_refs(port), port_type(port));
+	kill(pid, SIGKILL);
+	int st = 0;
+	waitpid(pid, &st, 0);
+	usleep(200000);
+	printf("kill: the exporter %s(%d); port refs %d type %s\n",
+	       WIFSIGNALED(st) ? "died" : "exit", WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st),
+	       send_refs(port), port_type(port));
+	id<MTLSharedEvent> after = from_port(d, port);
+	printf("kill: after the kill fromPort=%s value=%llu eventPort same=%d\n", cls(after),
+	       after ? after.signaledValue : 0ull, after ? event_port(after) == port : 0);
+	if (!before || !after)
+		return;
+	after.signaledValue = 6;
+	printf("kill: after set 6, before reads %llu\n", before.signaledValue);
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLCommandBuffer> cb = signal_cb(q, before, 7);
+	[cb waitUntilCompleted];
+	BOOL reached = [after waitUntilSignaledValue:7 timeoutMS:1000];
+	printf("kill: before signalled 7 on the GPU: status %ld, after reads %llu, wait=%d\n",
+	       (long)cb.status, after.signaledValue, (int)reached);
+}
+
+// What IOObjectGetClass, IOObjectConformsTo and IOConnectCallMethod answer for `port`, each on a
+// thread of its own, reported after 1 s where it has not returned.
+static void connect_calls(const char *what, mach_port_t port)
+{
+	dispatch_queue_t q = dispatch_queue_create("oe.connect", DISPATCH_QUEUE_CONCURRENT);
+	void (^call)(const char *, kern_return_t (^)(char *)) = ^(const char *name,
+	                                                          kern_return_t (^op)(char *)) {
+		__block kern_return_t kr = 0;
+		__block char detail[128] = "";
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		dispatch_async(q, ^{
+			kr = op(detail);
+			dispatch_semaphore_signal(done);
+		});
+		if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)))
+			printf("connect %s %s: no answer in 1 s\n", what, name);
+		else
+			printf("connect %s %s: kr 0x%x %s\n", what, name, kr, detail);
+	};
+	call("IOObjectGetClass", ^kern_return_t(char *detail) {
+		io_name_t name = "";
+		kern_return_t kr = IOObjectGetClass(port, name);
+		snprintf(detail, 128, "class=%s", name);
+		return kr;
+	});
+	call("IOObjectConformsTo", ^kern_return_t(char *detail) {
+		boolean_t c = IOObjectConformsTo(port, "IOUserClient");
+		snprintf(detail, 128, "conforms IOUserClient=%d", c);
+		return 0;
+	});
+	call("IOConnectCallMethod", ^kern_return_t(char *detail) {
+		uint64_t in[3] = {1, 2, 3}, out[2] = {0, 0};
+		uint32_t n = 2;
+		kern_return_t kr = IOConnectCallMethod(port, 0x114, in, 3, NULL, 0, out, &n, NULL, NULL);
+		snprintf(detail, 128, "outputs %u", n);
+		return kr;
+	});
+}
+
+static void case_connect(void)
+{
+	io_service_t root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOSurfaceRoot"));
+	io_connect_t conn = MACH_PORT_NULL;
+	kern_return_t kr = root ? IOServiceOpen(root, mach_task_self(), 0, &conn) : KERN_FAILURE;
+	printf("connect IOSurfaceRoot open kr 0x%x\n", kr);
+	if (kr == KERN_SUCCESS)
+		connect_calls("connection", conn);
+	connect_calls("task", mach_task_self());
+	connect_calls("recv", oe_receive_right());
+}
+
 static void case_spawn(id<MTLDevice> d)
 {
 	mach_port_t rx = oe_receive_right();
@@ -787,7 +940,8 @@ out:;
 static const char *const kCases[] = {"intro",        "fake",         "refs",          "values",
                                      "machport.null", "machport.dead", "machport.recv", "machport.task",
                                      "handle.nil",   "label",        "coding",        "xpc",
-                                     "xpc.event",    "fake.xpc",     "spawn"};
+                                     "xpc.event",    "fake.xpc",     "spawn",         "kill",
+                                     "connect"};
 
 static int run_case(id<MTLDevice> d, const char *c)
 {
@@ -815,6 +969,10 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_xpc(d, NO, YES);
 	else if (!strcmp(c, "spawn"))
 		case_spawn(d);
+	else if (!strcmp(c, "kill"))
+		case_kill(d);
+	else if (!strcmp(c, "connect"))
+		case_connect();
 	else {
 		printf("%s unknown case\n", c);
 		return 2;
@@ -854,6 +1012,14 @@ int main(int argc, char **argv)
 		int rc;
 		@autoreleasepool {
 			rc = run_peer(oracle_device(argv[1]));
+		}
+		fflush(stdout);
+		return rc;
+	}
+	if (argc == 3 && !strcmp(argv[2], "--exporter")) {
+		int rc;
+		@autoreleasepool {
+			rc = run_exporter(oracle_device(argv[1]));
 		}
 		fflush(stdout);
 		return rc;
