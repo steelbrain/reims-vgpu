@@ -103,6 +103,7 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/display_modes_test $(BUILD)/tests/surface_locks_test \
 	$(BUILD)/tests/bundle_paths_test $(BUILD)/tests/surface_caches_test \
 	$(BUILD)/tests/vblank_clock_test $(BUILD)/tests/submit_gate_test $(BUILD)/tests/memory_size_test \
+	$(BUILD)/tests/device_name_test \
 	$(BUILD)/tests/queue_limits_test $(BUILD)/tests/user_client_words_test \
 	$(BUILD)/tests/features_test $(BUILD)/tests/latency_test $(BUILD)/tests/release_table_test \
 	$(BUILD)/tests/deferred_answers_test $(BUILD)/tests/video_codecs_test \

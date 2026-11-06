@@ -369,6 +369,17 @@ bool RgfxAccelerator::start(IOService *provider)
 			setProperty("VRAM,totalMB", memory.vramMB, 32);
 		}
 	}
+	// The GPU's name, as a Mac's GPU states it (RgfxDeviceName.hpp): `model` on the PCI device,
+	// which System Information shows as its Chipset Model. A host that gave no name has none
+	// stated.
+	{
+		uint8_t model[kRgfxDeviceModelMax];
+		const size_t length = readDeviceModel(model);
+		if (OSData *data = length ? OSData::withBytes(model, static_cast<unsigned>(length)) : nullptr) {
+			pci->setProperty("model", data);
+			data->release();
+		}
+	}
 	nameProviderForVideo();
 	// AppleGVA reads the video codecs off this service once Metal's matching sees it, after
 	// registerService.
@@ -577,6 +588,18 @@ bool RgfxAccelerator::readMemorySize(RgfxMemorySize *out) const
 	                          (first - page));
 	map->release();
 	return true;
+}
+
+size_t RgfxAccelerator::readDeviceModel(uint8_t (&out)[kRgfxDeviceModelMax]) const
+{
+	const void *info = nullptr;
+	IOMemoryMap *map = mapDeviceInfo(kRgfxDeviceNameEnd, &info);
+	if (!map)
+		return 0;
+	const size_t length =
+	    rgfxDeviceModelFrom(static_cast<const uint8_t *>(info) + kRgfxDeviceNameFirst, out);
+	map->release();
+	return length;
 }
 
 IOMemoryMap *RgfxAccelerator::mapDeviceInfo(UInt64 size, const void **info) const

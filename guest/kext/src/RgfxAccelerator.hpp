@@ -52,6 +52,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 
 #include "RgfxBlockTable.hpp"
+#include "RgfxDeviceName.hpp"
 #include "RgfxMemorySize.hpp"
 #include "RgfxUserClientABI.hpp"
 #include "reims_graphics_wire.h"
@@ -297,6 +298,9 @@ public:
 	// The GPU memory the guest is told of, from the host's device info (RgfxMemorySize.hpp):
 	// false where the region is not mapped.
 	bool readMemorySize(RgfxMemorySize *out) const;
+	// The GPU's `model` bytes, from the host's device name (RgfxDeviceName.hpp): how many, 0
+	// where the host gave no name or the region is not mapped.
+	size_t readDeviceModel(uint8_t (&out)[kRgfxDeviceModelMax]) const;
 
 	// Shared events' ports (RgfxSharedEventUserClient.hpp): the client of ours that holds context
 	// `ctx` open for task `caller`, retained for the caller, or null where none does; a name for an
