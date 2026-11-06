@@ -559,6 +559,11 @@ const VIEWS_LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(1
 /// pages waits for the release of the surface's last block (its `kRgfxWriteBackWaitMs`).
 const PAGES_COPY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long after it was asked a `SURFACE_DOWNLOAD` or a `BLOCK_RELEASE` of a cached block is
+/// answered for the answer to be counted and logged as slow ([`GraphicsDecoder::timed`]): a CPU
+/// lock of the surface in the guest waits for it.
+const SLOW_ANSWER: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Whether a `SURFACE_PAGES`, the `counted`th the views' counts hold, logs what the surface
 /// views did at `now`, the last log having been at `last`: every [`VIEWS_LOGGED_EVERY`]th, and
 /// the first [`VIEWS_LOGGED_AFTER`] or more after the last log.
@@ -628,6 +633,9 @@ pub(crate) struct Shared<P: Platform> {
     /// When what the surface views did was last logged, or the decoder made, in the platform
     /// clock's nanoseconds ([`views_log_due`]).
     views_logged_at: AtomicU64,
+    /// The `SURFACE_DOWNLOAD`s and `BLOCK_RELEASE`s answered [`SLOW_ANSWER`] or more after they
+    /// were asked ([`GraphicsDecoder::timed`]; diagnostics only).
+    slow_answers: Arc<AtomicU64>,
     /// The blocks whose `SURFACE_PAGES` is not yet carried out ([`worker::Unsettled`]).
     unsettled: Arc<worker::Unsettled>,
     /// The threads the views are made and let go of on, a block's jobs in their order
@@ -867,6 +875,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             unified_memory: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
             views_logged_at: AtomicU64::new(made_at.as_nanos()),
+            slow_answers: Arc::default(),
             unsettled: Arc::default(),
             surface_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-surfaces")),
             close_worker: worker::Worker::new("reims-vgpu.graphics-closes"),
@@ -1147,13 +1156,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                      deferred, {} refused, {} named their pages ({} copied), {} released \
                      unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
                      downloads they answered, {} unread; {} copy by runs, {} copies by runs \
-                     refused",
+                     refused; {} downloads or releases answered {} ms or more after they were \
+                     asked",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
                     d.unheld_released, d.unheld, d.unheld_bytes >> 20, d.retaken, d.behind,
                     d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
                     d.early, d.early_bytes >> 20, d.early_aside, d.early_read, d.early_unread,
-                    d.by_runs, d.runs_refused
+                    d.by_runs, d.runs_refused,
+                    self.shared.slow_answers.load(Ordering::Relaxed), SLOW_ANSWER.as_millis()
                 );
             }
         }
@@ -1482,9 +1493,11 @@ impl<P: Platform> GraphicsDecoder<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
+        let asked = self.platform.clock().now_mono();
         self.settle_surface(block);
+        let (ran, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).download(device, block, region, done, failed);
+        (self.surface_caches).download(device, block, region, ran, done, failed);
     }
 
     /// [`Self::surface_download`] where it waits for nothing and commits no copy now
@@ -1501,8 +1514,64 @@ impl<P: Platform> GraphicsDecoder<P> {
         if self.shared.unsettled.any(std::iter::once(block)) {
             return false;
         }
+        let asked = self.platform.clock().now_mono();
+        let (ran, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).try_download(device, block, region, done, failed)
+        (self.surface_caches).try_download(device, block, region, ran, done, failed)
+    }
+
+    /// `done`, the answer of a `what` (`SURFACE_DOWNLOAD` or `BLOCK_RELEASE`) of the block at
+    /// `block` asked at `asked` and now let past the block's `SURFACE_PAGES`, timed; and what its
+    /// copy out of the block's device cache runs as it is carried out, once the command buffers
+    /// that may write the cache have finished ([`surface_cache::Caches::download`]). An answer
+    /// that comes [`SLOW_ANSWER`] or more after it was asked is counted and logged, with how long
+    /// it waited for the `SURFACE_PAGES`, for those buffers, and then for its copy into the pages
+    /// (the transfer queue, and the GPU's wait for the buffers that used the cache). Diagnostics
+    /// only.
+    fn timed(
+        &self,
+        what: &'static str,
+        block: u64,
+        asked: MonoTime,
+        done: surface_cache::Answer,
+    ) -> (surface_cache::Answer, surface_cache::Answer) {
+        let settled = self.platform.clock().now_mono();
+        let ran_at = Arc::new(AtomicU64::new(settled.as_nanos()));
+        let platform = Arc::clone(&self.platform);
+        let ran: surface_cache::Answer = {
+            let (platform, ran_at) = (Arc::clone(&platform), Arc::clone(&ran_at));
+            Box::new(move || {
+                ran_at.store(platform.clock().now_mono().as_nanos(), Ordering::Relaxed);
+            })
+        };
+        let slow = Arc::clone(&self.shared.slow_answers);
+        let done = Box::new(move || {
+            let answered = platform.clock().now_mono();
+            let took = answered.saturating_duration_since(asked);
+            if took >= SLOW_ANSWER {
+                slow.fetch_add(1, Ordering::Relaxed);
+                let ran = MonoTime::from_nanos(ran_at.load(Ordering::Relaxed));
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "the IOSurface block at {block:#x}: a {what} answered {} ms after it was \
+                     asked: {} ms for its SURFACE_PAGES, {} ms behind the command buffers that \
+                     may write its device cache, then {} ms for its copy into the pages",
+                    took.as_millis(),
+                    settled.saturating_duration_since(asked).as_millis(),
+                    ran.saturating_duration_since(settled).as_millis(),
+                    answered.saturating_duration_since(ran).as_millis()
+                );
+            }
+            done();
+        });
+        (ran, done)
+    }
+
+    /// The `SURFACE_DOWNLOAD`s and `BLOCK_RELEASE`s answered [`SLOW_ANSWER`] or more after they
+    /// were asked ([`Self::timed`]).
+    #[cfg(test)]
+    pub(crate) fn slow_answers(&self) -> u64 {
+        self.shared.slow_answers.load(Ordering::Relaxed)
     }
 
     /// The block at `offset` was released, its `RGFX_BLOCK_RELEASE_*` `flags`: its surface view,
@@ -1522,7 +1591,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
+        let asked = self.platform.clock().now_mono();
         self.settle_surface(offset);
+        let (ran, done) = self.timed("BLOCK_RELEASE", offset, asked, done);
         let gone = self.shared.surface_views.lock().released(offset);
         if let Some(gone) = gone {
             self.shared.surface_worker.drop_later(offset, offset, gone);
@@ -1530,7 +1601,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let worker = Arc::clone(&self.shared.surface_worker);
         let let_go = Box::new(move |cache| worker.drop_later(offset, offset, cache));
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).release(device, offset, flags, region, done, failed, let_go);
+        (self.surface_caches).release(device, offset, flags, region, ran, done, failed, let_go);
     }
 
     /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`

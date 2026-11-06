@@ -272,8 +272,9 @@ struct Landing {
     landed: Condvar,
 }
 
-/// An answer waiting for an early copy to land.
-type Answer = Box<dyn FnOnce() + Send>;
+/// What runs once, as what it waits for is done: an answer waiting for a copy to land, or what a
+/// copy out of a cache runs as it is carried out.
+pub(crate) type Answer = Box<dyn FnOnce() + Send>;
 
 impl Landing {
     /// A copy in flight.
@@ -2166,17 +2167,18 @@ impl<P: Platform> Caches<P> {
 
     /// `SURFACE_DOWNLOAD` of the block at `block` ([`SurfaceCaches::download`]), after every
     /// command buffer begun and not finished that may write it, waiting for none
-    /// ([`Self::after_writers`]): `done` once the pages hold the cache, or `failed` where the
-    /// platform raised at the copy.
+    /// ([`Self::after_writers`]), `ran` as it is carried out then: `done` once the pages hold the
+    /// cache, or `failed` where the platform raised at the copy.
     pub(crate) fn download(
         &self,
         device: &P::Device,
         block: u64,
         region: Arc<Region>,
+        ran: Answer,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) {
-        self.after_writers(block, download_op(device, block, region, done, failed));
+        self.after_writers(block, download_op(device, block, region, ran, done, failed));
     }
 
     /// [`Self::download`] where it waits for no lock and commits no copy now: the caches' lock
@@ -2190,6 +2192,7 @@ impl<P: Platform> Caches<P> {
         device: &P::Device,
         block: u64,
         region: Arc<Region>,
+        ran: Answer,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
     ) -> bool {
@@ -2199,7 +2202,7 @@ impl<P: Platform> Caches<P> {
         if state.copies_now(block) {
             return false;
         }
-        state.after_writers(block, download_op(device, block, region, done, failed));
+        state.after_writers(block, download_op(device, block, region, ran, done, failed));
         drop(state);
         self.moved.notify_all();
         true
@@ -2207,10 +2210,10 @@ impl<P: Platform> Caches<P> {
 
     /// The block at `block` went, its `BLOCK_RELEASE` ([`SurfaceCaches::released`]), after every
     /// command buffer begun and not finished that may write its cache, waiting for none
-    /// ([`Self::after_writers`]): `done` once the pages hold the cache, or `failed` where the
-    /// platform raised at the copy, and the cache handed to `let_go`, which lets go of it on a
-    /// thread of its own, with no lock of the caches' held. Nothing names the block until it is
-    /// answered: the kext gives it out again only then.
+    /// ([`Self::after_writers`]), `ran` as it is carried out then: `done` once the pages hold the
+    /// cache, or `failed` where the platform raised at the copy, and the cache handed to
+    /// `let_go`, which lets go of it on a thread of its own, with no lock of the caches' held.
+    /// Nothing names the block until it is answered: the kext gives it out again only then.
     #[allow(clippy::too_many_arguments)] // the release, its answers, and what the copy reads
     pub(crate) fn release(
         &self,
@@ -2218,6 +2221,7 @@ impl<P: Platform> Caches<P> {
         block: u64,
         flags: u32,
         region: Arc<Region>,
+        ran: Answer,
         done: Box<dyn FnOnce() + Send>,
         failed: Box<dyn FnOnce(Raise) + Send>,
         let_go: Box<dyn FnOnce(SurfaceCache<P>) + Send>,
@@ -2251,6 +2255,7 @@ impl<P: Platform> Caches<P> {
         self.after_writers(
             block,
             Box::new(move |state| {
+                ran();
                 let cpu = cpu_generation(&region, block);
                 let clients = surface_clients(&region, block);
                 match refusing(|| state.released(&device, block, flags, cpu, clients, done)) {
@@ -2398,16 +2403,19 @@ impl<P: Platform> Caches<P> {
 
 /// A `SURFACE_DOWNLOAD` of the block at `block` as a copy out of its cache
 /// ([`SurfaceCaches::download`]), reading the CPU's generation in the block's header in `region`
-/// as it is made: `done` once the pages hold the cache, or `failed` where the platform raised.
+/// as it is made, `ran` first: `done` once the pages hold the cache, or `failed` where the
+/// platform raised.
 fn download_op<P: Platform>(
     device: &P::Device,
     block: u64,
     region: Arc<Region>,
+    ran: Answer,
     done: Box<dyn FnOnce() + Send>,
     failed: Box<dyn FnOnce(Raise) + Send>,
 ) -> CopyOut<P> {
     let device = device.clone_ref();
     Box::new(move |state| {
+        ran();
         let cpu = cpu_generation(&region, block);
         if let Err(raise) = refusing(|| state.download(&device, block, cpu, done)) {
             failed(raise);
@@ -3207,6 +3215,40 @@ mod tests {
             }
             r.p.world().complete_all(CompleteOn::Caller);
             assert!(first.load(Ordering::SeqCst) && then.load(Ordering::SeqCst));
+        }
+    }
+
+    /// A download or a release answered [`SLOW_ANSWER`](super::super::SLOW_ANSWER) or more after
+    /// it was asked, its copy into the pages that long in flight, is counted as slow (and logged,
+    /// with where it waited); one answered sooner is not
+    #[test]
+    fn a_download_or_release_answered_late_is_counted_slow() {
+        let mut r = cached();
+        let late = super::super::SLOW_ANSWER;
+        for (n, second) in ["download", "release"].into_iter().enumerate() {
+            use_surfaces(&mut r, 1, 0x100 + n as u64, &[(BLOCK, 0, true)]);
+            r.p.world().complete_all(CompleteOn::Caller);
+            let soon = download(&r, BLOCK);
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(soon.load(Ordering::SeqCst));
+            assert_eq!(r.dec.slow_answers(), n as u64, "{second}: answered at once");
+
+            // The writer, and the copy of its write into the pages, in flight.
+            use_surfaces(&mut r, 1, 0x200 + n as u64, &[(BLOCK, 0, true)]);
+            let then = if second == "download" {
+                download(&r, BLOCK)
+            } else {
+                release(&r, BLOCK)
+            };
+            assert!(!then.load(Ordering::SeqCst), "{second}: its copy in flight");
+            r.p.virtual_clock().advance(late);
+            r.p.world().complete_all(CompleteOn::Caller);
+            assert!(then.load(Ordering::SeqCst));
+            assert_eq!(
+                r.dec.slow_answers(),
+                n as u64 + 1,
+                "{second}: answered late"
+            );
         }
     }
 
@@ -4960,7 +5002,14 @@ mod tests {
         let ask = || {
             let set = Arc::clone(&done);
             let answer = Box::new(move || set.store(true, Ordering::SeqCst));
-            caches.download(&r.device, BLOCK, region, answer, no_raise());
+            caches.download(
+                &r.device,
+                BLOCK,
+                region,
+                Box::new(|| {}),
+                answer,
+                no_raise(),
+            );
         };
         let mark = r.p.call_log().mark();
         let (in_commit, committing) = std::sync::mpsc::channel();
