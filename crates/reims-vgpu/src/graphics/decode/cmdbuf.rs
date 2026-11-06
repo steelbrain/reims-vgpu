@@ -5083,6 +5083,15 @@ mod tests {
         }
     }
 
+    /// Held by the tests that pin buffers in the contexts' range of GPU addresses on the Vulkan
+    /// platform. Its device is the process's, and so are its addresses: under `cargo test`, whose
+    /// tests share one process, `on_vulkan_a_pin_meets_no_range_of_a_texture_buffer`'s pin was
+    /// refused in 4 of 20 one-process runs of `graphics::decode` (measured on the M3 Max), where
+    /// `on_vulkan_the_host_s_own_ranges_lie_below_every_unit`'s pin at the range's base, 96 KiB,
+    /// covers its address.
+    #[cfg(feature = "vulkan")]
+    static CONTEXT_RANGE_PINS: Mutex<()> = Mutex::new(());
+
     /// A decoder on the Vulkan platform with a queue (1), and, as a process in slot 0 picks
     /// (`RgfxIdSpace`, next fit from the slot's base, a pick of Metal's span of a pin), a
     /// device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes no
@@ -5146,6 +5155,7 @@ mod tests {
     #[test]
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
         use reims_graphics::wire::RGFX_CONTEXT_VA_BASE;
+        let _pins = CONTEXT_RANGE_PINS.lock();
         let _pool = reims_vgpu_core::rt::Pool::here();
         let (mut dec, device) = decoder_with_a_texture_buffer();
         let buffer = buffer_at(11, RGFX_CONTEXT_VA_BASE + 0x8000, 0x1_0000);
@@ -5163,6 +5173,7 @@ mod tests {
             RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END, RGFX_CONTEXT_VA_UNIT, RGFX_CONTEXT_VA_UNITS,
         };
         use reims_vgpu_core::platform::resource::Buffer as _;
+        let _pins = CONTEXT_RANGE_PINS.lock();
         let _pool = reims_vgpu_core::rt::Pool::here();
         let (mut dec, device) = decoder_with_a_texture_buffer();
         let placed = buffer_at(11, 0, 64 << 20);
