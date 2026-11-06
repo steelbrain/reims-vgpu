@@ -1342,18 +1342,13 @@ int main()
 	// nodes, a visible function's signature, a mesh or object function's nodes. Core Image's
 	// kernels (TYPE 5) and intersection functions get no read. kernel_trunc.metallib, which the
 	// suite's build.sh cuts to 1000 bytes on purpose, has no bitcode for its function. The nodes
-	// of the entry points below do not read: each has an argument of a kind the node reader does
-	// not follow, a fragment function's framebuffer-fetch input (`[[color(0)]]`) or an explicit
-	// imageblock, so their pipelines answer no reflection (RgfxPipelineReflectionOf.mm).
+	// of the entry points below do not read: each has an explicit imageblock, an argument of a
+	// kind the node reader does not follow, so their pipelines answer no reflection
+	// (RgfxPipelineReflectionOf.mm). A fragment function's framebuffer-fetch input (`[[color(0)]]`,
+	// `air.render_target`) reads, so rounding's fetch fragments are not listed.
 	{
 		const std::vector<std::string> nodesUnread = {
 		    "mutdec_imageblock.metallib mutdec_imageblock",
-		    "rounding.metallib fetch_float_fragment",
-		    "rounding.metallib fetch_half_fragment",
-		    "rounding.metallib fetch_seen_fragment",
-		    "rounding_safe.metallib fetch_float_fragment",
-		    "rounding_safe.metallib fetch_half_fragment",
-		    "rounding_safe.metallib fetch_seen_fragment",
 		    "slice_write_repro.metallib slice_write",
 		    "slice_write_repro.metallib slice_write_l0",
 		};
