@@ -6,7 +6,8 @@
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E 'test(draw_cost)'
 //! --no-capture`).
 //!
-//! A command buffer is one render pass of draws ([`Shape`], [`Stream`]). In `draws.10k`'s stream
+//! A command buffer is one render pass of draws, or, in a compositor's frame, many ([`Shape`],
+//! [`Stream`]). In `draws.10k`'s stream
 //! each draw of 3 vertices comes after a `setVertexBuffer:` at index 0 of an upload chunk at its
 //! next 256-byte offset, as the bundle sends `setVertexBytes:` (a 64 KiB
 //! `BUFFER_OVER_HOST_MEMORY` chunk of the region, 256 draws a chunk). In a compositor's, each
@@ -20,8 +21,10 @@
 //! load of 50: within 0.2% run to run, where CPU time moved 15%).
 //!
 //! The environment picks what runs: `DRAW_COST_SHAPE` the shape (`10k`, the default; `many`, 64
-//! command buffers of 16 draws, whose figures show a command buffer's own cost; or `ws`, 8 of 500
-//! draws of a compositor's stream), `DRAW_COST_RUNS` the runs (9), `DRAW_COST_ONLY` one path, for
+//! command buffers of 16 draws, whose figures show a command buffer's own cost; `ws`, 8 of 500
+//! draws of a compositor's stream; `mc`, 8 of WindowServer's Mission Control composites, each of
+//! 92 render passes of 3 draws; or `mc1`, the same ops in one pass a command buffer, whose gap to
+//! `mc` is what 91 more passes cost), `DRAW_COST_RUNS` the runs (9), `DRAW_COST_ONLY` one path, for
 //! a profile of it (`decoder`, `platform` or `runtime`, the runtime or Metal alone), and
 //! `DRAW_COST_SECONDS` a time to keep running that path for, so a sampling profiler can attach.
 
@@ -64,12 +67,15 @@ use super::{GraphicsDecoder, ObjHandle};
 use crate::platform::ApiPlatform;
 
 /// How a repetition's work is cut: command buffers, committed back to back and then waited for,
-/// each of one render pass of `draws` draws of `stream`'s.
+/// each of `draws` draws of `stream`'s in `groups` equal runs, each run after the pipeline and
+/// the constant buffers are set, the runs in `passes` render passes.
 #[derive(Debug, Clone, Copy)]
 struct Shape {
     cbs: usize,
     draws: usize,
     stream: Stream,
+    groups: usize,
+    passes: usize,
 }
 
 /// What a command buffer's draws send ([`steps`]).
@@ -90,18 +96,42 @@ impl Shape {
         cbs: 3,
         draws: 10_000,
         stream: Stream::Bytes,
+        groups: 1,
+        passes: 1,
     };
     /// Many short command buffers, as a guest's frame of 60 to 100 is cut: 64 of 16 draws.
     const MANY: Shape = Shape {
         cbs: 64,
         draws: 16,
         stream: Stream::Bytes,
+        groups: 1,
+        passes: 1,
     };
     /// A compositor's frames: 8 command buffers of 500 draws.
     const WS: Shape = Shape {
         cbs: 8,
         draws: 500,
         stream: Stream::Layers,
+        groups: 1,
+        passes: 1,
+    };
+    /// WindowServer's Mission Control composites as the msi 5080's car 13 boot counted them
+    /// (c13-mission's P2, a median of 3,954: 92 encoders, 270 draws, 2,110 render ops, no use
+    /// ops): 8 command buffers of 92 render passes of 3 draws of a compositor's stream, each pass
+    /// after its pipeline and constant buffers, the first pass clearing the target and the rest
+    /// loading it. The draws' binds are the compositor stream's, which the counts do not name:
+    /// 17 render ops a pass here against the 23 counted, the attachments one target.
+    const MC: Shape = Shape {
+        cbs: 8,
+        draws: 276,
+        stream: Stream::Layers,
+        groups: 92,
+        passes: 92,
+    };
+    /// [`MC`](Shape::MC)'s ops in one render pass a command buffer.
+    const MC1: Shape = Shape {
+        passes: 1,
+        ..Shape::MC
     };
 
     /// The 256-byte upload slots a draw takes: its vertex bytes, and its fragment bytes in a
@@ -123,13 +153,21 @@ impl Shape {
         self.chunks_a_cb() * self.cbs as u64
     }
 
-    /// The shape `DRAW_COST_SHAPE` names: `many`, `ws` or, by default, `10k`.
+    /// The shape `DRAW_COST_SHAPE` names: `many`, `ws`, `mc`, `mc1` or, by default, `10k`.
     fn chosen() -> Shape {
         match std::env::var("DRAW_COST_SHAPE").as_deref() {
             Ok("many") => Shape::MANY,
             Ok("ws") => Shape::WS,
+            Ok("mc") => Shape::MC,
+            Ok("mc1") => Shape::MC1,
             _ => Shape::TEN_K,
         }
+    }
+
+    /// The load action of pass `pass` of a command buffer: the first clears the target, the
+    /// rest load it.
+    fn load(pass: usize) -> u64 {
+        if pass == 0 { CLEAR } else { LOAD }
     }
 }
 /// Repetitions a run times, after [`WARM`] repetitions.
@@ -158,11 +196,12 @@ const TEXTURES: u64 = 16;
 const RUN: usize = 4;
 
 /// `MTLPixelFormatBGRA8Unorm`; `MTLTextureUsageShaderRead`, and `| RenderTarget`; `Clear`,
-/// `Store`; `MTLPrimitiveTypeTriangle` and `TriangleStrip`.
+/// `Load`, `Store`; `MTLPrimitiveTypeTriangle` and `TriangleStrip`.
 const BGRA8: u64 = 80;
 const SAMPLED_USAGE: u64 = 1;
 const TARGET_USAGE: u64 = 1 | 4;
 const CLEAR: u64 = 2;
+const LOAD: u64 = 1;
 const STORE: u64 = 1;
 const TRIANGLE: u64 = 3;
 const TRIANGLE_STRIP: u64 = 4;
@@ -320,15 +359,25 @@ enum Step {
     Draw(u64, u64),
 }
 
-/// Command buffer `cb`'s render ops, of a repetition of `shape`: the pipeline and the constant
-/// buffers, then the draws of its stream.
-fn steps(shape: Shape, cb: usize) -> Vec<Step> {
-    let mut steps = vec![
-        Step::Pipeline(PIPELINE_ID),
-        Step::VertexBuffer(CONSTANTS_ID, 0, 1),
-        Step::FragmentBuffer(CONSTANTS_ID, 0, 0),
-    ];
+/// Command buffer `cb`'s render ops, of a repetition of `shape`, a list a render pass: each of
+/// the shape's groups the pipeline and the constant buffers, then its draws of the stream.
+fn steps(shape: Shape, cb: usize) -> Vec<Vec<Step>> {
+    assert!(shape.draws % shape.groups == 0 && shape.groups % shape.passes == 0);
+    let a_group = shape.draws / shape.groups;
+    let mut passes = vec![Vec::new(); shape.passes];
+    let mut steps = Vec::new();
     for draw in 0..shape.draws {
+        if draw % a_group == 0 {
+            if draw > 0 && draw / a_group % (shape.groups / shape.passes) == 0 {
+                passes[draw / a_group / (shape.groups / shape.passes) - 1] =
+                    std::mem::take(&mut steps);
+            }
+            steps.extend([
+                Step::Pipeline(PIPELINE_ID),
+                Step::VertexBuffer(CONSTANTS_ID, 0, 1),
+                Step::FragmentBuffer(CONSTANTS_ID, 0, 0),
+            ]);
+        }
         let slot = draw as u64 * shape.slots();
         match shape.stream {
             Stream::Bytes => {
@@ -354,7 +403,8 @@ fn steps(shape: Shape, cb: usize) -> Vec<Step> {
             }
         }
     }
-    steps
+    passes[shape.passes - 1] = steps;
+    passes
 }
 
 /// The op the bundle sends for `step`.
@@ -418,27 +468,30 @@ fn step_op(step: Step) -> Vec<u8> {
 /// The `COMMAND_BUFFER` message of command buffer `cb` of a repetition of `shape`, as the bundle
 /// sends its ops ([`steps`]).
 fn command_buffer(shape: Shape, cb: usize, cb_obj_id: u64) -> Vec<u8> {
-    let pass = RgfxRenderPassDesc {
+    let desc = RgfxRenderPassDesc {
         color_count: 1,
         flags: RGFX_PASS_FLAG_RT_SIZE,
         render_target_width: SIDE as u32,
         render_target_height: SIDE as u32,
         ..RgfxRenderPassDesc::default()
     };
-    let color = RgfxRenderPassColorAttachment {
-        texture_obj_id: TARGET_ID,
-        load_action: CLEAR as u32,
-        store_action: STORE as u32,
-        clear_color_bits: [0, 0, 0, 1.0f64.to_bits()],
-        ..RgfxRenderPassColorAttachment::default()
-    };
-    let mut begin = pass.as_bytes().to_vec();
-    begin.extend_from_slice(color.as_bytes());
-    let mut ops = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin);
-    for step in steps(shape, cb) {
-        ops.extend(step_op(step));
+    let mut ops = Vec::new();
+    for (pass, steps) in steps(shape, cb).into_iter().enumerate() {
+        let color = RgfxRenderPassColorAttachment {
+            texture_obj_id: TARGET_ID,
+            load_action: Shape::load(pass) as u32,
+            store_action: STORE as u32,
+            clear_color_bits: [0, 0, 0, 1.0f64.to_bits()],
+            ..RgfxRenderPassColorAttachment::default()
+        };
+        let mut begin = desc.as_bytes().to_vec();
+        begin.extend_from_slice(color.as_bytes());
+        ops.extend(op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin));
+        for step in steps {
+            ops.extend(step_op(step));
+        }
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
     }
-    ops.extend(op(RGFX_OP_ENCODER_END, &[]));
     let m = RgfxCommandBuffer {
         header: RgfxMsgHeader {
             r#type: RGFX_CMD_COMMAND_BUFFER,
@@ -605,9 +658,9 @@ impl<P: ApiPlatform> Bench<P> {
         sampler
     }
 
-    /// Each command buffer's render ops of a repetition, their objects looked up: made before a
-    /// count starts.
-    fn bound(&self) -> Vec<Vec<Bound<'_, P>>> {
+    /// Each command buffer's render ops of a repetition, a list a pass, their objects looked
+    /// up: made before a count starts.
+    fn bound(&self) -> Vec<Vec<Vec<Bound<'_, P>>>> {
         let named = |step: Step| match step {
             Step::Pipeline(id) => match self.decoder.object(id) {
                 Some(ObjHandle::RenderPipeline(p)) => Bound::Pipeline(p),
@@ -627,7 +680,12 @@ impl<P: ApiPlatform> Bench<P> {
             Step::Draw(primitive_type, count) => Bound::Draw(primitive_type, count),
         };
         (0..self.shape.cbs)
-            .map(|cb| steps(self.shape, cb).into_iter().map(named).collect())
+            .map(|cb| {
+                steps(self.shape, cb)
+                    .into_iter()
+                    .map(|pass| pass.into_iter().map(named).collect())
+                    .collect()
+            })
             .collect()
     }
 
@@ -725,34 +783,38 @@ impl<P: ApiPlatform> Bench<P> {
         // Each command buffer's commands, made before the count starts; the draws' lists are
         // kept until it ends, so their frees fall outside it.
         let bound = self.bound();
-        let mut sent: Vec<Vec<Sent<'_, P>>> =
-            bound.iter().map(|b| Self::sent(b, &samplers)).collect();
-        let mut kept = Vec::with_capacity(sent.iter().map(Vec::len).sum());
+        let mut sent: Vec<Vec<Vec<Sent<'_, P>>>> = bound
+            .iter()
+            .map(|cb| cb.iter().map(|b| Self::sent(b, &samplers)).collect())
+            .collect();
+        let mut kept = Vec::with_capacity(sent.iter().flatten().map(Vec::len).sum());
         let (tx, rx) = mpsc::channel();
         let start = counts();
         for cb_sent in &mut sent {
             let cb = queue.command_buffer(o).unwrap().unwrap();
-            let pass = self.platform.render_pass_descriptor();
-            let attachment = ColorAttachmentSet {
-                texture: Some(Some(target)),
-                load_action: Some(CLEAR),
-                store_action: Some(STORE),
-                ..ColorAttachmentSet::default()
-            };
-            pass.set_color_attachment(o, 0, &attachment).unwrap();
-            let e = cb.render_encoder(o, &pass).unwrap().unwrap();
-            e.encoding(|| {
-                for s in cb_sent.drain(..) {
-                    match s {
-                        Sent::Cmd(cmd) => e.encode(o, cmd).unwrap(),
-                        Sent::Draws(draws) => {
-                            e.encode_draws(o, &draws).unwrap();
-                            kept.push(draws);
+            for (p, pass_sent) in cb_sent.iter_mut().enumerate() {
+                let pass = self.platform.render_pass_descriptor();
+                let attachment = ColorAttachmentSet {
+                    texture: Some(Some(target)),
+                    load_action: Some(Shape::load(p)),
+                    store_action: Some(STORE),
+                    ..ColorAttachmentSet::default()
+                };
+                pass.set_color_attachment(o, 0, &attachment).unwrap();
+                let e = cb.render_encoder(o, &pass).unwrap().unwrap();
+                e.encoding(|| {
+                    for s in pass_sent.drain(..) {
+                        match s {
+                            Sent::Cmd(cmd) => e.encode(o, cmd).unwrap(),
+                            Sent::Draws(draws) => {
+                                e.encode_draws(o, &draws).unwrap();
+                                kept.push(draws);
+                            }
                         }
                     }
-                }
-            });
-            e.encode(o, RenderCmd::EndEncoding).unwrap();
+                });
+                e.encode(o, RenderCmd::EndEncoding).unwrap();
+            }
             let tx = tx.clone();
             cb.add_completed_handler(o, Box::new(move |_| tx.send(()).unwrap()))
                 .unwrap();
@@ -791,19 +853,20 @@ enum Sent<'a, P: Platform> {
     Draws(Vec<VertexDraw<'a, P>>),
 }
 
-/// The pass descriptor of the bench's target, as the platform's own form of it.
-fn target_pass<P: ApiPlatform>(bench: &Bench<P>) -> P::RenderPassDescriptor {
+/// The pass descriptor of the bench's target for pass `pass` of a command buffer, as the
+/// platform's own form of it.
+fn target_pass<P: ApiPlatform>(bench: &Bench<P>, pass: usize) -> P::RenderPassDescriptor {
     let (_, target) = bench.queue_and_target();
-    let pass = bench.platform.render_pass_descriptor();
+    let desc = bench.platform.render_pass_descriptor();
     let attachment = ColorAttachmentSet {
         texture: Some(Some(target)),
-        load_action: Some(CLEAR),
+        load_action: Some(Shape::load(pass)),
         store_action: Some(STORE),
         ..ColorAttachmentSet::default()
     };
-    pass.set_color_attachment(OnFault::Die, 0, &attachment)
+    desc.set_color_attachment(OnFault::Die, 0, &attachment)
         .unwrap();
-    pass
+    desc
 }
 
 /// The runtime alone, on the Vulkan platform's objects of `bench`: the calls the platform makes
@@ -814,36 +877,41 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     let (queue, _) = bench.queue_and_target();
     let shape = bench.shape;
     let bound = bench.bound();
-    let (pass, _) = target_pass(bench).pass();
+    let passes = [
+        target_pass(bench, 0).pass().0,
+        target_pass(bench, 1).pass().0,
+    ];
     let (tx, rx) = mpsc::channel();
     let start = counts();
     for cb_bound in &bound {
         let cb = queue.raw.command_buffer().unwrap();
-        let mut e = cb.render_command_encoder(&pass).unwrap();
-        for &b in cb_bound {
-            match b {
-                Bound::Pipeline(p) => e.set_render_pipeline_state(&p.raw),
-                Bound::VertexBuffer(buffer, offset, index) => {
-                    e.set_vertex_buffer(Some(&buffer.raw), offset, index as u32)
+        for (p, pass_bound) in cb_bound.iter().enumerate() {
+            let mut e = cb.render_command_encoder(&passes[p.min(1)]).unwrap();
+            for &b in pass_bound {
+                match b {
+                    Bound::Pipeline(p) => e.set_render_pipeline_state(&p.raw),
+                    Bound::VertexBuffer(buffer, offset, index) => {
+                        e.set_vertex_buffer(Some(&buffer.raw), offset, index as u32)
+                    }
+                    Bound::FragmentBuffer(buffer, offset, index) => {
+                        e.set_fragment_buffer(Some(&buffer.raw), offset, index as u32)
+                    }
+                    Bound::FragmentTexture(texture, index) => {
+                        let texels = texture.texels("setFragmentTexture:atIndex:");
+                        e.set_fragment_texture(Some(texels), index as u32)
+                    }
+                    Bound::FragmentSampler(sampler) => {
+                        e.set_fragment_sampler_states(&[Some(&**sampler)], None, 0)
+                    }
+                    Bound::Draw(primitive_type, count) => {
+                        let primitive = rt::DrawPrimitiveType::from_raw(primitive_type).unwrap();
+                        e.draw_primitives(primitive, 0, count as u32, 1, 0)
+                    }
                 }
-                Bound::FragmentBuffer(buffer, offset, index) => {
-                    e.set_fragment_buffer(Some(&buffer.raw), offset, index as u32)
-                }
-                Bound::FragmentTexture(texture, index) => {
-                    let texels = texture.texels("setFragmentTexture:atIndex:");
-                    e.set_fragment_texture(Some(texels), index as u32)
-                }
-                Bound::FragmentSampler(sampler) => {
-                    e.set_fragment_sampler_states(&[Some(&**sampler)], None, 0)
-                }
-                Bound::Draw(primitive_type, count) => {
-                    let primitive = rt::DrawPrimitiveType::from_raw(primitive_type).unwrap();
-                    e.draw_primitives(primitive, 0, count as u32, 1, 0)
-                }
+                .unwrap();
             }
-            .unwrap();
+            e.end_encoding().unwrap();
         }
-        e.end_encoding().unwrap();
         let tx = tx.clone();
         cb.add_completed_handler(Box::new(move |_: &rt::CommandBuffer| tx.send(()).unwrap()))
             .unwrap();
@@ -869,52 +937,56 @@ fn through_metal(bench: &Bench<reims_vgpu_metal::MetalPlatform>) -> Counts {
     };
     let (queue, _) = bench.queue_and_target();
     let bound = bench.bound();
-    let pass = target_pass(bench);
+    let passes = [target_pass(bench, 0), target_pass(bench, 1)];
     objc2::rc::autoreleasepool(|_| {
         let mut committed = Vec::with_capacity(bound.len());
         let start = counts();
         for cb_bound in &bound {
             let cb = queue.get().commandBuffer().unwrap();
-            let e = cb.renderCommandEncoderWithDescriptor(pass.get()).unwrap();
-            for &b in cb_bound {
-                // SAFETY: the bench's objects, at indices and offsets inside what they hold and
-                // what the pipelines' functions bind; the sampler list outlives its call.
-                unsafe {
-                    match b {
-                        Bound::Pipeline(p) => e.setRenderPipelineState(p.get()),
-                        Bound::VertexBuffer(buffer, offset, index) => e
-                            .setVertexBuffer_offset_atIndex(
-                                Some(buffer.get()),
-                                offset as usize,
-                                index as usize,
-                            ),
-                        Bound::FragmentBuffer(buffer, offset, index) => e
-                            .setFragmentBuffer_offset_atIndex(
-                                Some(buffer.get()),
-                                offset as usize,
-                                index as usize,
-                            ),
-                        Bound::FragmentTexture(texture, index) => {
-                            e.setFragmentTexture_atIndex(Some(texture.get()), index as usize)
+            for (p, pass_bound) in cb_bound.iter().enumerate() {
+                let e = cb
+                    .renderCommandEncoderWithDescriptor(passes[p.min(1)].get())
+                    .unwrap();
+                for &b in pass_bound {
+                    // SAFETY: the bench's objects, at indices and offsets inside what they hold and
+                    // what the pipelines' functions bind; the sampler list outlives its call.
+                    unsafe {
+                        match b {
+                            Bound::Pipeline(p) => e.setRenderPipelineState(p.get()),
+                            Bound::VertexBuffer(buffer, offset, index) => e
+                                .setVertexBuffer_offset_atIndex(
+                                    Some(buffer.get()),
+                                    offset as usize,
+                                    index as usize,
+                                ),
+                            Bound::FragmentBuffer(buffer, offset, index) => e
+                                .setFragmentBuffer_offset_atIndex(
+                                    Some(buffer.get()),
+                                    offset as usize,
+                                    index as usize,
+                                ),
+                            Bound::FragmentTexture(texture, index) => {
+                                e.setFragmentTexture_atIndex(Some(texture.get()), index as usize)
+                            }
+                            Bound::FragmentSampler(sampler) => {
+                                let list: [*const ProtocolObject<dyn MTLSamplerState>; 1] =
+                                    [sampler.get()];
+                                e.setFragmentSamplerStates_withRange(
+                                    std::ptr::NonNull::from(&list).cast(),
+                                    NSRange::new(0, 1),
+                                )
+                            }
+                            Bound::Draw(primitive_type, count) => e
+                                .drawPrimitives_vertexStart_vertexCount(
+                                    MTLPrimitiveType(primitive_type as usize),
+                                    0,
+                                    count as usize,
+                                ),
                         }
-                        Bound::FragmentSampler(sampler) => {
-                            let list: [*const ProtocolObject<dyn MTLSamplerState>; 1] =
-                                [sampler.get()];
-                            e.setFragmentSamplerStates_withRange(
-                                std::ptr::NonNull::from(&list).cast(),
-                                NSRange::new(0, 1),
-                            )
-                        }
-                        Bound::Draw(primitive_type, count) => e
-                            .drawPrimitives_vertexStart_vertexCount(
-                                MTLPrimitiveType(primitive_type as usize),
-                                0,
-                                count as usize,
-                            ),
                     }
                 }
+                e.endEncoding();
             }
-            e.endEncoding();
             cb.commit();
             committed.push(cb);
         }
@@ -1024,11 +1096,12 @@ fn measure<P: ApiPlatform>(
             seen.push(a_draw(total, REPS as u64));
         }
     }
+    let ops: usize = steps(shape, 0).iter().map(|p| p.len() + 2).sum();
     println!(
         "{name}: a draw on the decoding thread, median [lowest, highest] of {runs} runs of {REPS} \
-         repetitions of {} command buffers of {} draws of {:?} (a command buffer's: {} times as \
-         much)",
-        shape.cbs, shape.draws, shape.stream, shape.draws
+         repetitions of {} command buffers of {} draws of {:?} in {} passes, {ops} ops (a command \
+         buffer's: {} times as much)",
+        shape.cbs, shape.draws, shape.stream, shape.passes, shape.draws
     );
     for (f, figure) in FIGURES.iter().enumerate() {
         let mut medians = [0.0f64; 3];
