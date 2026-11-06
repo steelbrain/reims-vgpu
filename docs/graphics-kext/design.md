@@ -1064,7 +1064,8 @@ an `ICB_CREATE`. A worker runs the jobs of one
 key one at a time, in the order they were handed over, and different keys' at
 once, on at most four threads (`reims-vgpu.graphics-surfaces-<i>`,
 `reims-vgpu.icb-create-<i>`), each made as a job finds none waiting and gone
-after a second with none. The surface worker's key is the block, the ICB
+after 10 s with none; a job wakes the thread that went idle last, so a steady
+load's jobs stay on the threads it runs at once. The surface worker's key is the block, the ICB
 worker's the process. So a block's slow view holds up only that block's later
 jobs, and a key that finds every thread busy waits for the next free one. No
 job waits for a job of another key, so jobs waiting for a thread never wait
@@ -1075,8 +1076,9 @@ build checks. What the guest can tell apart from one thread: two
 order, which no answer orders, and the process's later messages wait for
 both. Tested by `a_key_whose_job_hangs_holds_no_other_keys_jobs`,
 `a_key_waits_for_a_free_thread_once_every_thread_is_busy`,
-`each_keys_jobs_run_one_at_a_time_in_handed_order` and
-`an_idle_thread_ends_after_the_idle_time`. Beside K blocks that each run 25 ms
+`each_keys_jobs_run_one_at_a_time_in_handed_order`,
+`an_idle_thread_ends_after_keep` and
+`jobs_after_a_burst_go_to_the_thread_that_went_idle_last`. Beside K blocks that each run 25 ms
 jobs back to back, another block's job starts after its hand-off in 0.015 ms at
 the median for K of 1 or 2, 5 to 6 ms for 4, 22 to 23 ms for 6 and 35 to 38 ms
 for 8, where one thread took 24, 54 to 56, 115 to 117, 179 to 182 and 241 ms
@@ -2501,11 +2503,14 @@ commit. Each outcome the new design allows is one of those two:
   four a lane, only where the device-wide budget of twice the host's cores has
   one free, which a lane never waits for. So 2048 busy queues hold one thread
   each and the budget's at most. A job goes to the thread that went idle last,
-  and a thread goes after a second with no job, the budget's before the lane's
-  own: the threads a burst made go a second after it, while jobs that come one
-  at a time stay on one thread. Each lane thread gives itself the FIFO thread's
-  scheduler hints as it starts (on Linux, a utilization floor; no thread is
-  bound to a CPU). Tested through the device by
+  and a thread goes after 10 s with no job, the budget's before the lane's
+  own: the threads a burst made go 10 s after it, while a steady load's stay
+  through its pauses and jobs that come one at a time stay on one thread
+  (`a_lane_keeps_its_thread_through_a_steady_load_s_pauses`,
+  `a_burst_s_other_threads_go_after_keep_while_one_takes_the_jobs`). Each lane
+  thread gives itself the FIFO thread's scheduler hints as it starts (on Linux,
+  a utilization floor; no thread is bound to a CPU). Tested through the device
+  by
   `a_queue_s_buffers_are_walked_at_once_and_committed_in_order`,
   `a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling`
   `a_video_buffer_is_walked_in_its_turn` and

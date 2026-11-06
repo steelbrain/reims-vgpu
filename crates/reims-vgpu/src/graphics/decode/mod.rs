@@ -155,6 +155,9 @@ const HEAP_PAGE: u64 = 0x4000;
 mod argument;
 mod blit;
 #[cfg(test)]
+#[cfg(target_os = "macos")]
+mod churn;
+#[cfg(test)]
 mod close_cost;
 mod cmdbuf;
 mod commit_order;

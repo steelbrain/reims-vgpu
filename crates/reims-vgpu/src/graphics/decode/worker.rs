@@ -16,7 +16,9 @@
 //! **Keys.** A worker runs the jobs handed over under one key one at a time, in the order they were
 //! handed over, and those of different keys at once, on at most [`POOL_THREADS`] threads named
 //! `<name>-<i>`. A thread is started when a key's job finds none waiting, and ends once it has
-//! waited [`IDLE`] with nothing to do; a key's job wakes one waiting thread, never more. A key
+//! waited [`KEEP`] with nothing to do; a key's job wakes one waiting thread, never more, the one
+//! that went idle last, so the threads a steady load runs at once take its jobs and stay through
+//! its pauses, and those only a burst ran wait longest and go (`reims_graphics::keep`). A key
 //! whose job finds every thread busy waits for the next free one, behind the keys that were
 //! waiting before it, and is counted (a cap hit, logged at debug); a thread runs a job of each
 //! waiting key in turn. Where no thread can be started, the job runs where it is handed over.
@@ -58,16 +60,13 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
 
+use reims_graphics::keep::{KEEP, Keep};
 use reims_vgpu_core::platform::os::MonoTime;
 use reims_vgpu_core::sync::{Condvar, Mutex};
 
 /// The most threads a [`Worker`] runs.
 pub(crate) const POOL_THREADS: usize = 4;
-
-/// How long a [`Worker`]'s thread waits for a job before it ends.
-pub(crate) const IDLE: Duration = Duration::from_secs(1);
 
 /// A job of a [`Worker`]'s.
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
@@ -104,11 +103,9 @@ pub(crate) struct Worker {
 /// What a worker's threads share.
 struct Shared {
     name: &'static str,
-    /// How long a thread waits for a job before it ends: [`IDLE`], or a test's.
-    idle: Duration,
+    /// How long a thread waits for a job before it ends: [`KEEP`], but in the tests.
+    keep: Keep,
     state: Mutex<State>,
-    /// Signalled, for one thread, as a key's job waits for one.
-    ready: Condvar,
     /// The keys whose job found every thread busy.
     cap_hits: AtomicU64,
     /// A thread could not be started (logged once).
@@ -129,11 +126,25 @@ struct State {
     ready: VecDeque<u64>,
     /// Which of the threads' names are taken, a thread's for its life.
     named: [bool; POOL_THREADS],
-    /// The threads waiting for a key's job, and the wakes signalled to them not yet taken.
-    idle: usize,
+    /// The threads waiting for a key's job, the one that went idle last at the end: a key's job
+    /// wakes it first, taking it out.
+    idle: Vec<Arc<Idler>>,
+    /// The threads woken for a key's job that have not yet taken the lock again.
     woken: usize,
     /// The worker is gone: its threads end once no job waits.
     closed: bool,
+    /// How many threads were made, and how many ended (tests only).
+    #[cfg(test)]
+    made: usize,
+    #[cfg(test)]
+    gone: usize,
+}
+
+/// A worker's thread waiting for a job ([`State::idle`]).
+#[derive(Default)]
+struct Idler {
+    /// A key's job came for it, or the worker went.
+    wake: Condvar,
 }
 
 /// A key's jobs: those not yet taken, in the order handed over, and whether one runs.
@@ -170,17 +181,16 @@ impl State {
 impl Worker {
     /// A worker whose threads are named `name-<i>`.
     pub(crate) fn new(name: &'static str) -> Self {
-        Worker::with_idle(name, IDLE)
+        Worker::with_keep(name, Keep::new(KEEP))
     }
 
-    /// [`Self::new`], whose threads end after `idle` with nothing to do.
-    fn with_idle(name: &'static str, idle: Duration) -> Self {
+    /// [`Self::new`], whose threads end once they have waited `keep` with nothing to do.
+    fn with_keep(name: &'static str, keep: Keep) -> Self {
         Worker {
             shared: Arc::new(Shared {
                 name,
-                idle,
+                keep,
                 state: Mutex::new(State::default()),
-                ready: Condvar::new(),
                 cap_hits: AtomicU64::new(0),
                 refused: AtomicBool::new(false),
                 done: Condvar::new(),
@@ -201,10 +211,10 @@ impl Worker {
             return;
         }
         state.ready.push_back(key);
-        if state.idle > state.woken {
+        if let Some(idler) = state.idle.pop() {
             state.woken += 1;
             drop(state);
-            shared.ready.notify_one();
+            idler.wake.notify_one();
             return;
         }
         let Some(index) = state.named.iter().position(|taken| !taken) else {
@@ -219,6 +229,10 @@ impl Worker {
             return;
         };
         state.named[index] = true;
+        #[cfg(test)]
+        {
+            state.made += 1;
+        }
         drop(state);
         let spawned = {
             let shared = Arc::clone(shared);
@@ -239,6 +253,10 @@ impl Worker {
         }
         let mut state = shared.state.lock();
         state.named[index] = false;
+        #[cfg(test)]
+        {
+            state.made -= 1;
+        }
         // Unless a thread took it meanwhile.
         let Some(at) = state.ready.iter().position(|&k| k == key) else {
             return;
@@ -287,6 +305,13 @@ impl Worker {
         self.shared.cap_hits.load(Ordering::Relaxed)
     }
 
+    /// How many threads wait for a job, and how many were made and ended (tests only).
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize, usize) {
+        let state = self.shared.state.lock();
+        (state.idle.len(), state.made, state.gone)
+    }
+
     /// The threads running (tests only).
     #[cfg(test)]
     pub(crate) fn threads(&self) -> usize {
@@ -324,14 +349,23 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.shared.state.lock().closed = true;
-        self.shared.ready.notify_all();
+        let idle = {
+            let mut state = self.shared.state.lock();
+            state.closed = true;
+            let idle = std::mem::take(&mut state.idle);
+            state.woken += idle.len();
+            idle
+        };
+        for idler in idle {
+            idler.wake.notify_one();
+        }
     }
 }
 
 /// A worker's thread `index`: runs a job of each waiting key in turn, and ends once it has waited
-/// the worker's idle time with nothing to do, or the worker is gone and no job waits.
+/// the worker's keep with nothing to do, or the worker is gone and no job waits.
 fn work(shared: &Shared, index: usize) {
+    let me = Arc::new(Idler::default());
     let mut state = shared.state.lock();
     loop {
         if let Some(key) = state.ready.pop_front() {
@@ -356,15 +390,30 @@ fn work(shared: &Shared, index: usize) {
         if state.closed {
             break;
         }
-        state.idle += 1;
-        let timed_out = shared.ready.wait_for(&mut state, shared.idle).timed_out();
-        state.idle -= 1;
-        state.woken = state.woken.saturating_sub(1);
-        if timed_out && state.ready.is_empty() {
+        // Its wait's start read under the lock it joins the idle under, so a test that sees it
+        // there and moves the clock moves it past the start.
+        state.idle.push(Arc::clone(&me));
+        let since = shared.keep.now();
+        let mut kept = false;
+        while !kept && state.idle.iter().any(|idler| Arc::ptr_eq(idler, &me)) {
+            kept = shared.keep.wait(&me.wake, &mut state, since);
+        }
+        // Still among the idle where no job or the worker's end woke it.
+        if let Some(at) = state.idle.iter().rposition(|idler| Arc::ptr_eq(idler, &me)) {
+            state.idle.remove(at);
+        } else {
+            state.woken = state.woken.saturating_sub(1);
+        }
+        // Gone, unless a key waits that no thread was woken for: one that was takes it.
+        if kept && state.ready.len() <= state.woken {
             break;
         }
     }
     state.named[index] = false;
+    #[cfg(test)]
+    {
+        state.gone += 1;
+    }
 }
 
 /// A worker's gate (tests only): shut, no thread starts a job.
@@ -481,6 +530,9 @@ impl Drop for Settle {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
+    use std::time::Duration;
+
+    use reims_graphics::keep::TestClock;
 
     use super::*;
 
@@ -649,22 +701,38 @@ mod tests {
         );
     }
 
-    /// A thread ends once it has waited [`IDLE`] with nothing to do, and a later job starts one
-    /// again
+    /// Waits about 10 s for `done`.
+    fn until(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..10_000 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("{what}");
+    }
+
+    /// A worker whose threads wait [`KEEP`] of `clock`'s time for a job.
+    fn worker_on(clock: &Arc<TestClock>) -> Worker {
+        Worker::with_keep("reims-vgpu.test-worker", Keep::on(clock, KEEP))
+    }
+
+    /// A thread ends once it has waited [`KEEP`] with nothing to do, not before, and a later job
+    /// starts one again
     #[test]
-    fn an_idle_thread_ends_after_the_idle_time() {
-        let worker = Worker::new("reims-vgpu.test-worker");
+    fn an_idle_thread_ends_after_keep() {
+        let clock = TestClock::new();
+        let worker = worker_on(&clock);
         worker.submit(1, Box::new(|| {}));
         worker.flush();
-        assert_eq!(worker.threads(), 1);
-        std::thread::sleep(IDLE / 2);
+        until("the thread did not wait", || worker.counts().0 == 1);
+        clock.advance(KEEP - Duration::from_secs(1));
+        // It looks at the clock every millisecond.
+        std::thread::sleep(Duration::from_millis(20));
         assert_eq!(worker.threads(), 1, "not yet idle long enough");
-        let mut waited = IDLE / 2;
-        while worker.threads() > 0 {
-            assert!(waited < IDLE * 5, "the idle thread did not end");
-            std::thread::sleep(Duration::from_millis(20));
-            waited += Duration::from_millis(20);
-        }
+        clock.advance(Duration::from_secs(1));
+        until("the idle thread did not end", || worker.threads() == 0);
+        assert_eq!(worker.counts(), (0, 1, 1), "(waiting, made, ended)");
         let (ran, wait) = mpsc::channel();
         worker.submit(
             2,
@@ -676,6 +744,57 @@ mod tests {
             wait.recv_timeout(Duration::from_secs(5)),
             Ok(Some("reims-vgpu.test-worker-0".to_owned()))
         );
+    }
+
+    /// After a burst on three threads, jobs one at a time, each after a pause of 2 s, go to the
+    /// thread that went idle last, so the other two wait on and end once [`KEEP`] has passed since
+    /// the burst, while the one that takes the jobs stays: woken the longest idle first, each
+    /// thread took a job in turn and none ended.
+    #[test]
+    fn jobs_after_a_burst_go_to_the_thread_that_went_idle_last() {
+        let clock = TestClock::new();
+        let worker = worker_on(&clock);
+        let (started, begun) = mpsc::channel();
+        let mut goes = Vec::new();
+        for key in 0..3 {
+            let (job, go) = blocking(&started, key);
+            worker.submit(key, job);
+            goes.push(go);
+        }
+        for _ in 0..3 {
+            begun.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        drop(goes);
+        worker.flush();
+        until("the burst's threads did not wait", || {
+            worker.counts().0 == 3
+        });
+        let one = |key: u64, waiting: usize| {
+            let (ran, wait) = mpsc::channel();
+            worker.submit(
+                key,
+                Box::new(move || {
+                    let _ = ran.send(std::thread::current().name().map(str::to_owned));
+                }),
+            );
+            let name = wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.flush();
+            until("the job's thread did not wait again", || {
+                worker.counts().0 == waiting
+            });
+            name
+        };
+        let pauses = KEEP.as_secs() / 2;
+        let mut ran_on = std::collections::HashSet::new();
+        for n in 1..pauses {
+            clock.advance(Duration::from_secs(2));
+            ran_on.insert(one(10 + n, 3));
+            assert_eq!(worker.counts(), (3, 3, 0), "{} s after the burst", 2 * n);
+        }
+        assert_eq!(ran_on.len(), 1, "the jobs went to one thread: {ran_on:?}");
+        clock.advance(Duration::from_secs(2));
+        one(99, 1);
+        assert_eq!(worker.counts(), (1, 3, 2), "(waiting, made, ended)");
     }
 
     /// A job runs in its key's turn, which a waitless job's says it may not wait in

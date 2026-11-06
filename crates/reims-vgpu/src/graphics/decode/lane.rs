@@ -16,9 +16,10 @@
 //!   a device of many busy queues holds one thread a busy lane and the budget's at most.
 //! - **Which thread takes a job.** A job goes to the lane's thread that went idle last, so the
 //!   jobs of a lane that needs one thread at a time stay on one thread, and a thread goes once it
-//!   has had no job for [`IDLE`]: the threads a burst of jobs made go a second after the burst,
-//!   and a burst after that grows the lane again as the first did. A thread that goes gives back
-//!   the budget's thread first, so the lane's own is the last to go. Woken in turn instead, the
+//!   has had no job for [`KEEP`](reims_graphics::keep::KEEP), 10 s: the threads a steady load runs
+//!   at once stay through its pauses, those only a burst of jobs made go 10 s after the burst, and
+//!   a burst after that grows the lane again as the first did. A thread that goes gives back the
+//!   budget's thread first, so the lane's own is the last to go. Woken in turn instead, the
 //!   longest idle first, every thread took a job in each round and none went: a game's queue kept
 //!   the three threads it had from the game's start, one of which ran on the host's efficiency
 //!   cores alone, and its walks took 13.4 ms of CPU a frame where two threads took 10.4 ms
@@ -56,9 +57,6 @@ use reims_vgpu_core::sync::{Condvar, Mutex};
 
 /// The most threads a lane runs its jobs on at once: its own and the budget's.
 pub(crate) const LANE_THREADS: usize = 4;
-
-/// How long a lane's thread stays with no job before it goes.
-const IDLE: Duration = Duration::from_secs(1);
 
 /// The rest of a command buffer's work, for a lane's thread.
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
@@ -143,6 +141,11 @@ struct State {
     woken: usize,
     /// The queue went: its threads go once its jobs are done.
     closed: bool,
+    /// How many threads the lane made, and how many went (for the tests).
+    #[cfg(test)]
+    made: usize,
+    #[cfg(test)]
+    gone: usize,
     /// The turns given so far, and every turn below `passed` has passed.
     issued: u64,
     passed: u64,
@@ -163,8 +166,9 @@ pub(crate) struct Lane {
     queue: u64,
     /// The device's budget of extra threads.
     budget: Arc<Budget>,
-    /// How long a thread of the lane's stays with no job before it goes: [`IDLE`].
-    idle_for: Duration,
+    /// How long a thread of the lane's stays with no job before it goes:
+    /// [`KEEP`](reims_graphics::keep::KEEP), but in the tests.
+    idle_for: reims_graphics::keep::Keep,
     state: Mutex<State>,
     /// A turn passed.
     turned: Condvar,
@@ -179,15 +183,20 @@ impl std::fmt::Debug for Lane {
 impl Lane {
     /// The lane of queue `queue`, with no thread yet, its extra threads from `budget`.
     pub(crate) fn new(queue: u64, budget: Arc<Budget>) -> Arc<Lane> {
-        Lane::with_idle(queue, budget, IDLE)
+        Lane::with_idle(queue, budget, reims_graphics::keep::KEEP)
     }
 
     /// The lane of queue `queue`, whose threads go after `idle_for` with no job.
     fn with_idle(queue: u64, budget: Arc<Budget>, idle_for: Duration) -> Arc<Lane> {
+        Lane::with_keep(queue, budget, reims_graphics::keep::Keep::new(idle_for))
+    }
+
+    /// The lane of queue `queue`, whose threads go once they have waited `keep` with no job.
+    fn with_keep(queue: u64, budget: Arc<Budget>, keep: reims_graphics::keep::Keep) -> Arc<Lane> {
         Arc::new(Lane {
             queue,
             budget,
-            idle_for,
+            idle_for: keep,
             state: Mutex::default(),
             turned: Condvar::new(),
         })
@@ -253,6 +262,10 @@ impl Lane {
         } else {
             return;
         }
+        #[cfg(test)]
+        {
+            state.made += 1;
+        }
         drop(state);
         let lane = Arc::clone(self);
         let spawned = std::thread::Builder::new()
@@ -260,6 +273,10 @@ impl Lane {
             .spawn(move || lane.serve());
         if spawned.is_err() {
             let mut state = self.state.lock();
+            #[cfg(test)]
+            {
+                state.made -= 1;
+            }
             if !own {
                 state.extra -= 1;
                 self.budget.give_back();
@@ -300,15 +317,22 @@ impl Lane {
             if state.closed {
                 break;
             }
+            // Its wait's start read under the lock it joins the idle under, so a test that sees it
+            // there and moves the clock moves it past the start.
             state.idle.push(Arc::clone(&me));
-            let waited = me.wake.wait_for(&mut state, self.idle_for);
+            let since = self.idle_for.now();
+            let mut kept = false;
+            while !kept && state.idle.iter().any(|idler| Arc::ptr_eq(idler, &me)) {
+                kept = self.idle_for.wait(&me.wake, &mut state, since);
+            }
             // Still among the idle where nothing woke it; else a job or the close took it out.
             if let Some(at) = state.idle.iter().rposition(|idler| Arc::ptr_eq(idler, &me)) {
                 state.idle.remove(at);
             } else {
                 state.woken -= 1;
             }
-            if waited.timed_out() && state.jobs.is_empty() {
+            // Gone, unless a job waits that no thread was woken for: one that was takes it.
+            if kept && state.jobs.len() <= state.woken {
                 break;
             }
         }
@@ -317,6 +341,10 @@ impl Lane {
             self.budget.give_back();
         } else {
             state.own = false;
+        }
+        #[cfg(test)]
+        {
+            state.gone += 1;
         }
     }
 
@@ -337,6 +365,14 @@ impl Lane {
     pub(crate) fn threads(&self) -> usize {
         let state = self.state.lock();
         usize::from(state.own) + state.extra
+    }
+
+    /// How many of the lane's threads wait for a job, and how many it made and went (for the
+    /// tests).
+    #[cfg(test)]
+    fn counts(&self) -> (usize, usize, usize) {
+        let state = self.state.lock();
+        (state.idle.len(), state.made, state.gone)
     }
 }
 
@@ -756,5 +792,88 @@ mod tests {
             "the idle lane's threads stayed"
         );
         assert_eq!(budget.taken(), 0);
+    }
+
+    /// A lane's threads on a clock the tests move, kept [`KEEP`].
+    mod kept {
+        use std::collections::HashSet;
+
+        use reims_graphics::keep::{KEEP, Keep, TestClock};
+
+        use super::*;
+
+        /// A lane of `budget` whose threads wait [`KEEP`] of `clock`'s time for a job.
+        fn lane_on(clock: &Arc<TestClock>, budget: &Arc<Budget>) -> Arc<Lane> {
+            Lane::with_keep(10, Arc::clone(budget), Keep::on(clock, KEEP))
+        }
+
+        /// Runs a job on `lane`, and waits until it has run and `idle` of the lane's threads wait
+        /// for a job; the thread it ran on.
+        fn one_job(lane: &Arc<Lane>, idle: usize) -> std::thread::ThreadId {
+            let ran = Arc::new(Mutex::new(None));
+            let on = Arc::clone(&ran);
+            lane.run(Box::new(move || {
+                *on.lock() = Some(std::thread::current().id());
+            }));
+            let done = || ran.lock().is_some() && lane.counts().0 == idle;
+            for _ in 0..10_000 {
+                if done() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(done(), "the job ran with {:?}", lane.counts());
+            ran.lock().unwrap()
+        }
+
+        /// Jobs one at a time, each after a pause longer than a lane's thread was once kept
+        /// (1 s), run on the one thread the first made, which the lane keeps through the pauses
+        /// and lets go once it has had no job for [`KEEP`].
+        #[test]
+        fn a_lane_keeps_its_thread_through_a_steady_load_s_pauses() {
+            let clock = TestClock::new();
+            let budget = Budget::new(LANE_THREADS);
+            let lane = lane_on(&clock, &budget);
+            let mut ran_on = HashSet::new();
+            for _ in 0..30 {
+                ran_on.insert(one_job(&lane, 1));
+                clock.advance(Duration::from_secs(2));
+            }
+            assert_eq!(ran_on.len(), 1, "one thread ran the jobs");
+            assert_eq!(lane.counts(), (1, 1, 0), "(waiting, made, gone)");
+            clock.advance(KEEP);
+            assert!(until(|| lane.threads() == 0), "the idle thread stayed");
+            assert_eq!(lane.counts(), (0, 1, 1));
+        }
+
+        /// A burst's threads but the one that takes the jobs after it go once they have had no
+        /// job for [`KEEP`] since the burst, the budget's first, while jobs come one at a time
+        /// with pauses of 2 s.
+        #[test]
+        fn a_burst_s_other_threads_go_after_keep_while_one_takes_the_jobs() {
+            let clock = TestClock::new();
+            let budget = Budget::new(LANE_THREADS);
+            let lane = lane_on(&clock, &budget);
+            burst(&lane, 3);
+            assert!(until(|| lane.counts().0 == 3));
+            let pauses = KEEP.as_secs() / 2;
+            let mut ran_on = HashSet::new();
+            for n in 1..pauses {
+                clock.advance(Duration::from_secs(2));
+                ran_on.insert(one_job(&lane, 3));
+                assert_eq!(lane.counts(), (3, 3, 0), "{} s after the burst", 2 * n);
+            }
+            assert_eq!(
+                ran_on.len(),
+                1,
+                "the jobs after the burst ran on one thread"
+            );
+            clock.advance(Duration::from_secs(2));
+            one_job(&lane, 1);
+            assert_eq!(lane.counts(), (1, 3, 2), "(waiting, made, gone)");
+            assert_eq!(budget.taken(), 0, "the lane's own thread is the one left");
+            clock.advance(KEEP);
+            assert!(until(|| lane.threads() == 0), "the last thread stayed");
+        }
     }
 }
