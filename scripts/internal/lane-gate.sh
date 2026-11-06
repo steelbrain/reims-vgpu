@@ -7,7 +7,8 @@
 #                                 [--bench-phases "PHASE..."] [--boot-tag TAG] [--capture-boot]
 #                                 [--no-appload] [--no-bench | --wait-bench] [--qemu-hook CMD]
 #                                 [--bench-host-log FILTER]
-#                                 [--publish | --probe-tip] [--keep-workspace] [--boot-only] [--priority N] [REV]
+#                                 [--publish | --probe-tip] [--keep-workspace] [--boot-only] [--priority N]
+#                                 [--shared-boot] [REV]
 #
 #   REV           the commit to check (default HEAD); the gate checks commits, never a dirty tree
 #   --record      store the run as a sample of REV's baseline (in baselines/SHA/runs), measure the
@@ -77,6 +78,9 @@
 #   --boot-only   the correctness boot of a resumed run alone, in its kept workspace, taking no lock
 #                 (as a bench leg), so two runs' boots can be queued back to back
 #   --priority N  the potluck jobs' priority (default 3, a --landed car's 4)
+#   --shared-boot  the correctness boot's job takes the 5080 alone, not the whole host (no --exclusive):
+#                 it times nothing, so other jobs' builds may run beside it once its 180 s wait for
+#                 them ends; the bench boot keeps the whole host
 #
 # What it runs: the Mac builds the guest's side, and the lane host runs the rest as potluck jobs
 # (potluck's lease is the lock), dispatched from a throwaway commit of the run's own (do_ship):
@@ -129,7 +133,7 @@ fi
 [[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
 . "$GH/config.sh"
 
-record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0 keep_ws=0 boot_only=0 prio= post_probes= advance=
+shared_boot=0 record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0 keep_ws=0 boot_only=0 prio= post_probes= advance=
 while (($#)); do
   case $1 in
     --record) record=1 ;;
@@ -158,6 +162,7 @@ while (($#)); do
     --probe-tip) publish=1 probe_tip=1 ;;
     --keep-workspace) keep_ws=1 ;;
     --boot-only) boot_only=1 ;;
+    --shared-boot) shared_boot=1 ;;
     --priority) prio=$2; shift ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     -*) die "unknown option $1" ;;
@@ -689,7 +694,9 @@ POST_PROBES=$([[ $mode == boot && -n $post_probes ]] && echo "$MR/post-probes")
 POST_PROBE_TIP=$sha
 EOF
   set +e
-  pl_run "$mode" --timeout "$tmo" --ram 64 --priority "$PL_PRIO" --exclusive --gpu "$PL_GPU" --workspace "$ws" ${advance:+--advance} \
+  local xa=--exclusive
+  [[ $mode == boot ]] && ((shared_boot)) && xa=
+  pl_run "$mode" --timeout "$tmo" --ram 64 --priority "$PL_PRIO" ${xa:+"$xa"} --gpu "$PL_GPU" --workspace "$ws" ${advance:+--advance} \
     --label "lane-gate=$mode" --keep "lg-out/$mode" -- bash lg/bin/msi-job.sh boot "$mode" "$(base64 < "$RUN/boot-$mode.env" | tr -d '\n')"
   local rc=$?
   set -e

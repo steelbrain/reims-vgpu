@@ -27,10 +27,11 @@
 #                  [--cold-cache KEY] [--qemu-hook CMD] [--pre-qemu CMD] [--log-add FILTER]
 #                  [--host-log FILTER] [--stage NAME=DIR[@TIP]]... [--ram GIB] [--after CMD]
 #                  [--image PATH] [--rom PATH] [--gfx-b64 B64] [--qemu-env K=V]... [--no-metal-check]
-#                  [--stage-local NAME=DIR[@TIP]]... [--appload] [--kring-s S] [--bin FILE]...
+#                  [--stage-local NAME=DIR[@TIP]]... [--appload] [--kring-s S] [--bin FILE]... [--shared]
 #
 # The round runs as a potluck job on the lane host (lane-gate/msi-round.sh), holding the 5080 and the
-# whole host (--exclusive; potluck's lease is the lock), dispatched from a throwaway commit of the
+# whole host (--exclusive; potluck's lease is the lock; --shared takes the 5080 alone, for a round
+# that times nothing, so other jobs' builds may run beside it once its 180 s wait for them ends), dispatched from a throwaway commit of the
 # round's own (lane-gate/ship-commit.sh) that carries the gate's host scripts, the tip's bench and the
 # round's boot.env. This script only reads the lane host's state (its queue and published tips, over
 # ssh); the job makes every change there. --stage NAME=DIR[@TIP] adds the probe in DIR on the lane host
@@ -85,7 +86,7 @@ L=$(cd "$(dirname "$0")" && pwd)
 GH=${LANE_GATE_HOME:-$HOME/.cache/rgk-lane-gate}
 force=0 list=0 dry=0 capture=0 want_tip= first= hold= only=0 exclude= from_boot=0 host_tip= image_tip=
 cold_cache= qemu_hook= pre_qemu= log_add= host_log= stages=() lstages=() ram=64 after=
-oc_path= rom_path= gfx_b64= qemu_env=() metal_check=1 appload=0 kring_s= bins=()
+oc_path= rom_path= gfx_b64= qemu_env=() metal_check=1 appload=0 kring_s= bins=() excl=--exclusive
 while (($#)); do
   a=$1
   shift
@@ -117,6 +118,7 @@ while (($#)); do
     --gfx-b64) gfx_b64=${1:?--gfx-b64 B64}; shift ;;
     --qemu-env) qemu_env+=("${1:?--qemu-env K=V}"); shift ;;
     --no-metal-check) metal_check=0 ;;
+    --shared) excl= ;;
     --list) list=1 ;;
     --dry-run) dry=1 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -314,7 +316,7 @@ echo "probe-batch: round $ROUND from $commit on $branch"
 # among the jobs running on its machine): the hold, the boot's own time and its waits for quiet and
 # the cool-down (12 minutes), and 40 minutes more for --after.
 tmo=$(( (HOLD_S + 720) / 60 + ${after:+40} + 0 ))
-out=$(cd "$wt" && potluck dispatch --json --timeout "${tmo}m" --ram "$ram" --exclusive --gpu "${POTLUCK_MSI_GPU:-5080}" \
+out=$(cd "$wt" && potluck dispatch --json --timeout "${tmo}m" --ram "$ram" ${excl:+"$excl"} --gpu "${POTLUCK_MSI_GPU:-5080}" \
   --on "node=${POTLUCK_MSI_NODE:-msi-laptop}" --label lane-gate=round -- bash lg/bin/msi-round.sh) ||
   { echo "probe-batch: potluck dispatch: $out" >&2; exit 1; }
 job=$(python3 -I -c 'import json, sys; print(json.load(sys.stdin)["job"])' <<< "$out")
