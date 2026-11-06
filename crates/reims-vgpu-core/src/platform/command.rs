@@ -30,6 +30,37 @@ pub const REFUSED_DOMAIN: &str = "reims-vgpu.refused";
 /// `MTLCommandBufferErrorInternal`, the code of a refused command buffer's error.
 const ERROR_INTERNAL: i64 = 1;
 
+thread_local! {
+    /// How deep this thread is in platform commits that may run submission handlers inside the
+    /// call ([`committing`]).
+    static COMMITTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `commit`, a platform's commit that may run the submission handlers of any command buffer
+/// of the process inside the call, on this thread (the Vulkan platform's runtime submits there the
+/// ready batches committed before it, its own among them), marked so a handler run inside it can
+/// tell ([`inside_commit`]). A platform whose submission handlers run only on its own threads
+/// (Metal's) marks none.
+pub fn committing<R>(commit: impl FnOnce() -> R) -> R {
+    /// Leaves the mark on drop, an unwinding commit's included.
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            COMMITTING.with(|c| c.set(c.get() - 1));
+        }
+    }
+    COMMITTING.with(|c| c.set(c.get() + 1));
+    let _leave = Leave;
+    commit()
+}
+
+/// Whether this thread is inside a platform commit that may run submission handlers
+/// ([`committing`]): a submission handler that runs where this is false runs on the platform's
+/// own thread.
+pub fn inside_commit() -> bool {
+    COMMITTING.with(|c| c.get() > 0)
+}
+
 impl CompletedInfo {
     /// What a completed handler learns of a command buffer whose read the platform refused
     /// ([`REFUSED_DOMAIN`]): status `Error`, and an internal error naming the refusal.

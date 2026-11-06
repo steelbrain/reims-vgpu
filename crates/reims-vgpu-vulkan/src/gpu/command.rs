@@ -210,6 +210,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use metal2vulkan::metal::DispatchType;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Handle;
+use reims_vgpu_core::platform::command::committing as committing_here;
 use reims_vgpu_core::platform::command::{
     CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler, run_completed,
 };
@@ -1409,7 +1410,10 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// takes its command buffer's note and the detach registry's lock
     /// ([`backing::submission_check`]), the tiler's handler the process's space
     /// ([`tiler_handler`]), and the decoder's handlers their records' locks and the completion
-    /// ring's.
+    /// ring's. The call is marked as one that runs submission handlers inside it
+    /// (`reims_vgpu_core::platform::command::committing`), so a handler of a buffer whose records
+    /// go to a guest knows it runs on the committing thread, which may be one that must not post
+    /// them.
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
         // The guest's GPU work, which keeps the GPU awake ([`crate::awake`]).
         self.device.awake.touch();
@@ -1434,11 +1438,9 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             committing(|| {
                 timing::commit(&self.raw, || match (failure, check) {
                     (Some(failure), _) => self.raw.commit_failed(failure),
-                    (None, Some(check)) => self
-                        .raw
-                        .set_submission_check(check)
-                        .and_then(|()| self.raw.commit_and_submit()),
-                    (None, None) => self.raw.commit_and_submit(),
+                    (None, Some(check)) => (self.raw.set_submission_check(check))
+                        .and_then(|()| committing_here(|| self.raw.commit_and_submit())),
+                    (None, None) => committing_here(|| self.raw.commit_and_submit()),
                 })
             })
         })
@@ -1776,7 +1778,9 @@ mod tests {
     /// this platform and the decoder take none: the check takes its command buffer's note and the
     /// detach registry's lock ([`backing::submission_check`]), the decoder's handlers their
     /// records' locks and the completion ring's, and the tiler's handler the process's space
-    /// ([`tiler_handler`]), none of which a commit's caller holds.
+    /// ([`tiler_handler`]), none of which a commit's caller holds. The commit is marked on its
+    /// thread (`reims_vgpu_core::platform::command::committing`), so a decoder's handler run there
+    /// on a thread the host's raise is not named for hands its records over to post.
     #[test]
     fn a_commit_checks_and_submits_inside_the_call_under_the_caller_s_locks() {
         use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
@@ -1801,7 +1805,8 @@ mod tests {
             OnFault::Return,
             Box::new(move || {
                 let held = lock.try_lock().is_none();
-                *at.lock() = Some((std::thread::current().id(), held));
+                let inside = reims_vgpu_core::platform::command::inside_commit();
+                *at.lock() = Some((std::thread::current().id(), held, inside));
             }),
         )
         .unwrap();
@@ -1812,8 +1817,9 @@ mod tests {
         drop(held);
         assert_eq!(
             seen,
-            Some((std::thread::current().id(), true)),
-            "its handler ran inside the commit, on its thread, the caller's lock held"
+            Some((std::thread::current().id(), true, true)),
+            "its handler ran inside the commit, on its thread, the caller's lock held, the commit \
+             marked"
         );
         assert_eq!(
             d.raw.work_counts().batches_checked_at_commit,

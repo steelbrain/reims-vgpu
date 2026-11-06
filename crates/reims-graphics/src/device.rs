@@ -67,7 +67,10 @@
 //! with no lock held that a call of the device's waits for, directly or through a thread of the
 //! device's ([`Host`]), so a callback may call the device at once, and may wait for something the
 //! host holds while it calls the device (QEMU's BQL). [`Device::mmio_write`]'s reset waits only
-//! for the message the control thread is taking, which never waits for the host.
+//! for the message the control thread is taking, which never waits for the host. A completion
+//! record a thread that may not raise hands over ([`CompletionPoster::post_elsewhere`]) is posted,
+//! and raised for, by its queue's service thread, or by the next thread of the device's that posts
+//! onto that ring, which posts it first.
 //!
 //! **An answer on the doorbell's thread.** A `DOORBELL` write of a command queue's ring through
 //! [`Device::mmio_write_taking`] offers the queue's next `COMMAND_BUFFER` to the host on the
@@ -132,7 +135,7 @@
 //! commands go unanswered. A completion ring whose guest count is out of reach gets no event
 //! until the reset.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -621,6 +624,15 @@ pub(crate) struct Shared {
     /// A weak handle to this shared state, set at the device's make: a queue's service thread and
     /// its completion poster hold it, so neither keeps the device alive.
     weak_self: OnceLock<Weak<Shared>>,
+    /// How many completion records were handed over to the queues' threads to post
+    /// ([`CompletionPoster::post_elsewhere`]).
+    handed_over: AtomicU64,
+    /// When the last line of `handed_over` was written, on the host's monotonic clock
+    /// ([`Shared::post_handed`]).
+    handed_logged_ns: AtomicU64,
+    /// The longest a record handed over waited for a thread to take it to post, in nanoseconds,
+    /// since that line ([`Shared::post_handed`]).
+    handed_wait_ns: AtomicU64,
     /// Where the tests stop the control thread once it has found no reset came since it took a
     /// message it carried out or handed on with no ring held, before it moves `control_done` past
     /// it: called with the count it moves to.
@@ -696,10 +708,29 @@ pub(crate) struct QueueShared {
     complete: Mutex<Producer>,
     /// Where posts onto the completion ring wait for room.
     room: Room,
+    /// The records a thread that may not post onto the completion ring handed over
+    /// ([`CompletionPoster::post_elsewhere`]), for the service thread, or the next thread of the
+    /// device's that posts onto the ring, to post in their order.
+    handed: Mutex<Handed>,
+    /// Whether `handed` holds a record or a thread is posting them: every post onto the
+    /// completion ring then goes behind them ([`Shared::post_behind_handed`]).
+    handing: AtomicBool,
     /// The service thread's own wake.
     wake: Wake,
     /// Set when the queue is destroyed, or at a reset or the device's end.
     ending: AtomicBool,
+}
+
+/// A queue's records handed over to be posted onto its completion ring
+/// ([`CompletionPoster::post_elsewhere`]).
+#[derive(Default)]
+struct Handed {
+    /// The records, each with the reset count it was posted at and, for one handed over, when, on
+    /// the host's monotonic clock (0 for a post that joined them), oldest first.
+    records: VecDeque<(Vec<u8>, u64, u64)>,
+    /// Whether a thread is posting them now: a post onto the ring then joins them, and that
+    /// thread posts it in its turn.
+    posting: bool,
 }
 
 impl QueueShared {
@@ -847,6 +878,9 @@ impl Device {
             lanes: Arc::new(lanes),
             queues: Mutex::new(Queues::default()),
             weak_self: OnceLock::new(),
+            handed_over: AtomicU64::new(0),
+            handed_logged_ns: AtomicU64::new(0),
+            handed_wait_ns: AtomicU64::new(0),
             #[cfg(test)]
             before_count: Mutex::new(None),
         });
@@ -871,6 +905,12 @@ impl Device {
     /// The region's first byte, which the host maps into the guest as BAR 2.
     pub fn region_base(&self) -> *mut u8 {
         self.shared.region.base()
+    }
+
+    /// How many completion records were handed over to the queues' threads to post, from threads
+    /// that may not post them ([`CompletionPoster::post_elsewhere`]).
+    pub fn handed_over(&self) -> u64 {
+        self.shared.handed_over.load(Ordering::Relaxed)
     }
 
     /// The region's size: BAR 2's.
@@ -1143,6 +1183,28 @@ impl CompletionPoster {
             },
         };
         !matches!(posted, Post::NoRoom | Post::Busy)
+    }
+
+    /// [`Self::post`], from a thread that may neither post onto the ring nor raise its vector: a
+    /// thread of the host's, or one of the library's the host's raise callback is not named for
+    /// (the window's render thread, a commit's inside a call of the host's into the library),
+    /// which runs a command buffer's submission handler inside its commit. The message is handed
+    /// to the queue's service thread, which posts it and raises the vector, after the records
+    /// handed over before it; every post onto the ring from then on goes after it. This waits for
+    /// nothing and raises nothing: a full ring holds back the service thread, not this one. A
+    /// poster of the control ring, onto which no submission handler posts, posts at once.
+    pub fn post_elsewhere(&self, message: &[u8]) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        match &self.queue {
+            None => shared.post_waiting(message, self.epoch),
+            Some((queue, _)) => {
+                if let Some(queue) = queue.upgrade() {
+                    shared.hand_over(&queue, message, self.epoch);
+                }
+            }
+        }
     }
 }
 
@@ -1919,6 +1981,8 @@ impl Shared {
             consuming: Mutex::new(None),
             complete: Mutex::new(producer),
             room: Room::default(),
+            handed: Mutex::new(Handed::default()),
+            handing: AtomicBool::new(false),
             wake,
             ending: AtomicBool::new(false),
         });
@@ -2030,6 +2094,10 @@ impl Shared {
     /// The loop of a queue's service thread: take, then sleep, until the queue or the device ends.
     fn queue_loop(&self, queue: &Arc<QueueShared>, poster: &CompletionPoster) {
         while !self.ending() && !queue.ended() {
+            // The records handed over to it, posted first, as a post onto its ring would.
+            if queue.handing.load(Ordering::Acquire) {
+                self.post_behind_handed(queue, None);
+            }
             self.take_queue_messages(queue, poster);
             let idle = {
                 let submit = queue.submit.lock();
@@ -2268,6 +2336,16 @@ impl Shared {
     /// Posts `message` onto `queue`'s completion ring, waiting for room ([`Room`]) while the
     /// device is not reset or ended and the queue lives.
     fn post_queue_waiting(&self, queue: &QueueShared, message: &[u8], epoch: u64) {
+        if queue.handing.load(Ordering::Acquire)
+            && self.post_behind_handed(queue, Some((message, epoch)))
+        {
+            return;
+        }
+        self.post_queue_now(queue, message, epoch);
+    }
+
+    /// [`Self::post_queue_waiting`] of `message` with no record handed over before it.
+    fn post_queue_now(&self, queue: &QueueShared, message: &[u8], epoch: u64) {
         loop {
             let seen = queue.room.wakes();
             if self.post_queue(queue, message, epoch) != Post::NoRoom
@@ -2289,6 +2367,11 @@ impl Shared {
     /// [`Self::post_queue`], which waits for the ring held elsewhere where `wait`, and else is
     /// [`Post::Busy`].
     fn post_queue_on(&self, queue: &QueueShared, message: &[u8], epoch: u64, wait: bool) -> Post {
+        // A post that waits for nothing goes behind no record handed over: busy until they are
+        // posted.
+        if !wait && queue.handing.load(Ordering::Acquire) {
+            return Post::Busy;
+        }
         let raise = {
             let Some(mut completion) = lock_ring(&queue.complete, wait) else {
                 return Post::Busy;
@@ -2442,6 +2525,92 @@ fn serve_lane(lanes: &Lanes, shared: &Weak<Shared>, key: Key, spare: Option<usiz
         }
         if let Some(answer) = answer {
             shared.post_waiting(&answer, job.epoch);
+        }
+    }
+}
+
+impl Shared {
+    /// Hands `message`, posted at reset count `epoch`, to `queue`'s service thread to post
+    /// ([`CompletionPoster::post_elsewhere`]), after the records handed over before it, and wakes
+    /// that thread unless a thread is posting them already. Waits for nothing.
+    fn hand_over(&self, queue: &QueueShared, message: &[u8], epoch: u64) {
+        let wake = {
+            let mut handed = queue.handed.lock();
+            handed
+                .records
+                .push_back((message.to_vec(), epoch, now_ns()));
+            queue.handing.store(true, Ordering::Release);
+            !handed.posting
+        };
+        self.handed_over.fetch_add(1, Ordering::Relaxed);
+        if wake {
+            queue.wake.wake();
+        }
+    }
+
+    /// Posts `message` (where given) behind the records handed over on `queue`'s ring: it joins
+    /// them where a thread is posting them, which posts it in its turn; else this thread posts
+    /// them, oldest first, then it, waiting for room as a post does. False, with nothing done,
+    /// where none is held any more: the caller posts it at once.
+    fn post_behind_handed(&self, queue: &QueueShared, message: Option<(&[u8], u64)>) -> bool {
+        {
+            let mut handed = queue.handed.lock();
+            if handed.records.is_empty() && !handed.posting {
+                queue.handing.store(false, Ordering::Release);
+                return false;
+            }
+            if let Some((message, epoch)) = message {
+                handed.records.push_back((message.to_vec(), epoch, 0));
+            }
+            if handed.posting {
+                return true;
+            }
+            handed.posting = true;
+        }
+        self.post_handed(queue);
+        true
+    }
+
+    /// Posts the records handed over on `queue`'s ring, oldest first, until none is left, with
+    /// no lock held across a post; one posted after a reset since it was handed over is dropped
+    /// as a post drops it. At most once a second, says at info how many were handed over in all,
+    /// and the longest one waited for a thread to take it since the last line.
+    fn post_handed(&self, queue: &QueueShared) {
+        loop {
+            let (message, epoch, at) = {
+                let mut handed = queue.handed.lock();
+                match handed.records.pop_front() {
+                    Some(next) => next,
+                    None => {
+                        handed.posting = false;
+                        queue.handing.store(false, Ordering::Release);
+                        break;
+                    }
+                }
+            };
+            if at != 0 {
+                let waited = now_ns().saturating_sub(at);
+                self.handed_wait_ns.fetch_max(waited, Ordering::Relaxed);
+            }
+            self.post_queue_now(queue, &message, epoch);
+        }
+        let now = now_ns();
+        let last = self.handed_logged_ns.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 1_000_000_000
+            && self
+                .handed_logged_ns
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let waited = self.handed_wait_ns.swap(0, Ordering::Relaxed);
+            log::info!(
+                target: "reims_graphics::handed",
+                "{} completion records handed over to the queues' threads in all, from threads \
+                 that may not post them; the longest wait for a thread to post one since the \
+                 last line: {} us",
+                self.handed_over.load(Ordering::Relaxed),
+                waited / 1_000
+            );
         }
     }
 }

@@ -2017,7 +2017,12 @@ order on the GPU ("Surface order", below), or once the host's platform has taken
 work for the GPU: the buffer's submission handler posts it. On
 metal2vulkan it runs on the thread that took the buffer's last batch for its `VkQueue`, once
 every wait of the buffer is satisfied, before the buffer reads `Scheduled`, and nothing
-committed later on the queue runs before the buffer; on Metal, which tells of no point before
+committed later on the queue runs before the buffer. That thread may be any that commits, since
+the runtime takes the ready batches inside a commit (`commit_and_submit`): where it is not one
+the header names for the device's raise (the window's render thread, a paravirtualized device's,
+the host's inside `rvg_graphics_device_read_display`), the handler hands the buffer's records to
+its queue's service thread, which posts them and raises, and every later post onto that ring
+goes after them (`a_foreign_commit_hands_a_decoder_buffer_s_records_to_its_queue_s_thread`); on Metal, which tells of no point before
 scheduling, it is a scheduled handler, run once every wait of the buffer is satisfied and its
 work is submitted. A buffer the platform fails before it takes its work runs no submission
 handler, and its completion handler posts its `CB_SCHEDULED` first

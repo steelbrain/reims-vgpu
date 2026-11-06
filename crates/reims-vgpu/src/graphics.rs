@@ -414,6 +414,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         self.device.region_base()
     }
 
+    /// How many of the guest's completion records were handed over to the queues' threads to
+    /// post, from threads that may not post them (the sinks' `post_from_handler`).
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn handed_over(&self) -> u64 {
+        self.device.handed_over()
+    }
+
     /// The objects the stage-3 decoder holds: the tests check a create reached it.
     #[cfg(any(test, feature = "testkit"))]
     pub fn decoder_object_count(&self) -> usize {
@@ -1257,13 +1264,15 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let signal: SignalSink = Arc::new(move |record: RgfxEventSignalled| {
             signal_poster.post(record.as_bytes());
         });
+        // A buffer's submission handler posts these, on whichever thread runs it
+        // ([`post_from_handler`]).
         let scheduled_poster = poster.clone();
         let scheduled: ScheduledSink = Arc::new(move |record: RgfxCbScheduled| {
-            scheduled_poster.post(record.as_bytes());
+            post_from_handler(&scheduled_poster, record.as_bytes());
         });
         let submitted_poster = poster.clone();
         let submitted: SubmittedSink = Arc::new(move |record: RgfxCbSubmitted| {
-            submitted_poster.post(record.as_bytes());
+            post_from_handler(&submitted_poster, record.as_bytes());
         });
         let reflection_poster = poster.clone();
         let reflection: ReflectionSink = Arc::new(move |reply: PipelineReply| {
@@ -2058,6 +2067,53 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         self.control.answer_command_buffer(completion, message)
     }
 }
+
+/// Posts a command buffer's `CB_SUBMITTED` or `CB_SCHEDULED` `record` through `poster`: at once,
+/// raising the queue's vector there, on a thread the header names for the device's raise
+/// (`RvgGraphicsRaiseFn`: the device's and the decoder's own threads, and the platform's that
+/// run a buffer's handlers); handed to the queue's service thread, which posts it and raises
+/// there, where a submission handler runs inside a commit on any other thread
+/// ([`foreign_committer`]). The platform's runtime may run every ready buffer's submission
+/// handlers inside one commit (`reims_vgpu_core::platform::command::committing`): the window's
+/// render thread, the host's thread inside `rvg_graphics_device_read_display`, or another
+/// device's, which neither post nor raise for this one, so none of them waits for room on a full
+/// ring either.
+fn post_from_handler(poster: &CompletionPoster, record: &[u8]) {
+    if foreign_committer() {
+        poster.post_elsewhere(record);
+    } else {
+        poster.post(record);
+    }
+}
+
+/// Whether this thread runs a submission handler inside a platform commit
+/// (`reims_vgpu_core::platform::command::inside_commit`) and is none of the threads the
+/// header names for the device's raise ([`RAISE_THREADS`]). A handler run outside a commit runs
+/// on the platform's own thread.
+fn foreign_committer() -> bool {
+    reims_vgpu_core::platform::command::inside_commit()
+        && !std::thread::current()
+            .name()
+            .is_some_and(|name| RAISE_THREADS.iter().any(|named| name.starts_with(named)))
+}
+
+/// The names, or their prefixes, of the library's threads `RvgGraphicsRaiseFn` names: the
+/// control thread, a context's, the presents' and a block's lanes, the refresh thread, a queue's
+/// service thread and its lane's, a compile's thread, the surfaces', ICB makes' and closes'
+/// workers' threads.
+const RAISE_THREADS: [&str; 11] = [
+    "reims-vgpu.graphics-control",
+    "reims-vgpu.graphics-context-",
+    "reims-vgpu.graphics-presents",
+    "reims-vgpu.graphics-block-",
+    "reims-vgpu.graphics-refresh",
+    "reims-vgpu.graphics-queue-",
+    "reims-vgpu.graphics-lane-",
+    "reims-vgpu.graphics-compile-",
+    "reims-vgpu.graphics-surfaces-",
+    "reims-vgpu.icb-create-",
+    "reims-vgpu.graphics-closes-",
+];
 
 /// What the window and its sink share: the scanout the guest set, and the size of the drawable
 /// the window's render thread last drew into, its size in pixels.
