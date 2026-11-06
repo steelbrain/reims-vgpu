@@ -279,6 +279,33 @@ The suite's inputs:
   anything irreversible or outward-facing. A question for the owner never
   blocks the rest of the work.
 
+## Landing work
+
+- When the merge pipeline is idle and any finished lane waits, start a run
+  with every finished lane at once; lanes still running form the next batch.
+  Add no lane once a batch's checks start. The moment its last check passes,
+  merge it into its target, or report it ready where the owner holds that
+  branch's merges.
+- When a batch fails, take the failing lane out and run the rest as the next
+  batch; the lane rejoins once fixed.
+- Log each lane's finish and merge times in the checklist file. If a finished
+  lane waits more than one pipeline run for its own run to start, fix the
+  pipeline before starting more lanes.
+- Report progress as merged commit hashes and each finished lane's wait. A
+  plan is not progress.
+- Never let an agent block on a command that returns only when a queued job
+  starts: submit and poll, or time out near the expected wait. Every 15
+  minutes, check each agent and remote job, and act on any with no new
+  output.
+- On a first-in-first-out queue without backfill, submit a whole-machine job
+  only when that machine has nothing running or queued; otherwise it holds
+  the head of the queue while the machine drains. Submit short jobs before
+  long ones.
+- Shared test machines serve the merge pipeline first: queue measurements
+  only while no pipeline job waits, since queue wait grows steeply as a
+  machine nears full use. Run a harness on its shortest case before a long
+  run, and stop a series at a harness fault until it is fixed.
+
 ## Rules for changing code
 
 - **Behaviour changes are deliberate.** Some behaviours look odd and are
