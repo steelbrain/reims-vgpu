@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>ReimsGraphics</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.steelbrain.ReimsGraphics</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ReimsGraphics</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1.0.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>2.9</string>
+		<key>com.apple.iokit.IOSurface</key>
+		<string>1.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>20.0.0</string>
+		<key>com.steelbrain.RgfxAppleGraphicsDeviceControlBridge</key>
+		<string>1.0.0</string>
+		<key>com.steelbrain.RgfxIOGraphicsFamilyBridge</key>
+		<string>1.0.0</string>
+	</dict>
+	<key>OSBundleRequired</key>
+	<string>Root</string>
+</dict>
+</plist>

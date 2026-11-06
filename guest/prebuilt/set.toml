@@ -1,0 +1,57 @@
+# The kexts an x86-64 macOS guest's OpenCore image injects for the reims-graphics
+# device: one [[kext]] per Kernel > Add entry, in order, after Lilu's, each the bundle
+# beside this file named by BundlePath. Written by `make -C guest prebuilt`; do not edit.
+# The keys are OpenCore's, but sha256, the SHA-256 of the entry's executable.
+format = 1
+MinKernel = "25.4.0"
+MaxKernel = "25.99.99"
+
+[[kext]]
+BundlePath = "ReimsGraphicsLoader.kext"
+ExecutablePath = "Contents/MacOS/ReimsGraphicsLoader"
+PlistPath = "Contents/Info.plist"
+Arch = "x86_64"
+MinKernel = "25.4.0"
+MaxKernel = "25.99.99"
+Comment = "Binds ReimsGraphics to IOGraphicsFamily and AppleGraphicsDeviceControl"
+sha256 = "26c3ea9a2abd2946d855b7525e72c9194eb462a30fdab61e97867885ba5138dc"
+
+[[kext]]
+BundlePath = "RgfxIOGraphicsFamilyBridge.kext"
+ExecutablePath = "Contents/MacOS/RgfxIOGraphicsFamilyBridge"
+PlistPath = "Contents/Info.plist"
+Arch = "x86_64"
+MinKernel = "25.4.0"
+MaxKernel = "25.99.99"
+Comment = "IOGraphicsFamily placeholders ReimsGraphics links against"
+sha256 = "347b0d81deeb1aba5a6bb2640c9f69bce68607b88b3d7fc5b7f43687ce365253"
+
+[[kext]]
+BundlePath = "RgfxAppleGraphicsDeviceControlBridge.kext"
+ExecutablePath = "Contents/MacOS/RgfxAppleGraphicsDeviceControlBridge"
+PlistPath = "Contents/Info.plist"
+Arch = "x86_64"
+MinKernel = "25.4.0"
+MaxKernel = "25.99.99"
+Comment = "AppleGraphicsDeviceControl placeholders ReimsGraphics links against"
+sha256 = "12bded4c6d70f1177662195121927ca9ce0af450a80f3fcf79ba1b555887f95d"
+
+[[kext]]
+BundlePath = "ReimsGraphics.kext"
+ExecutablePath = "Contents/MacOS/ReimsGraphics"
+PlistPath = "Contents/Info.plist"
+Arch = "x86_64"
+MinKernel = "25.4.0"
+MaxKernel = "25.99.99"
+Comment = "The reims-graphics display, accelerator and device control"
+sha256 = "ef90881e13bf12ce8e61e0b8975d5c2e408d32af4f0f3d4fbf9d49db5155cd8f"
+
+[[kext]]
+BundlePath = "RgfxGate.kext"
+ExecutablePath = "Contents/MacOS/RgfxGate"
+PlistPath = "Contents/Info.plist"
+Arch = "x86_64"
+MinKernel = "25.4.0"
+MaxKernel = "25.99.99"
+Comment = "Installs the reims-graphics Metal bundle and lets macOS load it"
+sha256 = "44d238921f7b5e20afd64649c464ad2a8748d7e35b89ea0c2e08a66b4c4af0b7"
