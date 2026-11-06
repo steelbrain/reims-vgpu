@@ -703,7 +703,7 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// it on that queue, which would never run.
     parked: Vec<Parked>,
     /// The deferred copy being made ([`Self::make_deferred`]): its event and number, for the
-    /// command buffer its copy commits, if any, to signal ([`Self::signal_in`]).
+    /// command buffer its copy commits, if any, to signal ([`Self::fill`], [`Self::write_back`]).
     signal_with: Option<(P::SharedEvent, u64)>,
     /// A deferred fill made nothing, and the presents waiting for one are to be told
     /// ([`Self::take_tell`]).
