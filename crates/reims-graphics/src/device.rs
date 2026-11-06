@@ -1368,7 +1368,7 @@ impl Shared {
         let taken = (u64::from(value) << shift) & self.host.features() & KNOWN_FEATURES;
         let _ = self
             .driver_features
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                 Some((old & !half) | taken)
             });
     }

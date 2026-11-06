@@ -107,7 +107,7 @@ impl Budget {
     /// One thread of the budget, where it has one to spare; waits for nothing.
     fn take(&self) -> bool {
         (self.taken)
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < self.limit).then_some(n + 1)
             })
             .is_ok()
