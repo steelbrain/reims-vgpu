@@ -15,9 +15,9 @@
 //! - **the device's Vulkan memory heaps**, for `recommendedMaxWorkingSetSize`, which the runtime
 //!   does not answer: the sum of the device-local heaps, the memory the GPU reaches at its own
 //!   speed, as Metal answers on a Mac of a discrete GPU from its VRAM;
-//! - **the device's Vulkan limits**, for `maxArgumentBufferSamplerCount`, which the runtime does
-//!   not answer: the most sampler states an argument buffer can name at once
-//!   ([`argument_buffer_sampler_count`]);
+//! - **the device's Vulkan limits and descriptor features**, for `maxArgumentBufferSamplerCount`,
+//!   which the runtime does not answer: the most sampler states an argument buffer can name at
+//!   once, as the runtime places them in its set-1 sampler arrays ([`sampler_count`]);
 //! - **Metal's documented relations**:
 //!   - a family the platform claims claims the families it contains (`implied`): each Apple
 //!     family every Apple family before it, Apple1 Common1, Apple3 Common2, Apple5 Common3, and
@@ -34,8 +34,8 @@
 //! `locationNumber`, `maxTransferRate`, the peer group, `maxArgumentBufferSamplerCount`,
 //! `maximumConcurrentCompilationTaskCount`, `architecture.name`, `supportsPrimitiveMotionBlur`,
 //! `supportsPlacementSparse`, `supportsCounterSampling:` and `recommendedMaxWorkingSetSize`: each
-//! is `None` here (the working set the heaps' sum, the sampler count the limits'), and a query of
-//! the runtime's to come.
+//! is `None` here (the working set the heaps' sum, the sampler count the one its sampler arrays
+//! hold), and a query of the runtime's to come.
 //! `supports32BitMSAA` and `supportsPullModelInterpolation` are the runtime's answers; a gap in the
 //! latter is `None`.
 
@@ -254,17 +254,11 @@ pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
 }
 
 /// `maxArgumentBufferSamplerCount` of `device`: how many sampler states an argument buffer can
-/// name at once. The runtime puts every live sampler state in the element of a set-1 sampler
-/// array its resource ID gives, which an argument buffer's sampler reads; it sizes that array by
-/// the least of the profile's `maxDescriptorSetUpdateAfterBindSamplers` and
-/// `maxPerStageDescriptorUpdateAfterBindSamplers`, and a state past it reads the neutral sampler
-/// (metal2vulkan's `sampler.rs`, `Degradation::UnlistedArgumentSampler`). It refuses a sampler
-/// state past `maxSamplerAllocationCount` live ones (`SamplerCount`). So the answer is the least
-/// of the three, the host GPU's own count, where Metal answers 500000 on an M3 Max and 2048 on an
-/// AMD Radeon Pro 5300M and an Intel UHD Graphics 630 (macOS 26.7.1; docs/graphics-kext/
-/// dgpu-oracle.md, Q9).
+/// name at once ([`sampler_count`] of the device's profile and `maxSamplerAllocationCount`),
+/// where Metal answers 500000 on an M3 Max and 2048 on an AMD Radeon Pro 5300M and an Intel UHD
+/// Graphics 630 (macOS 26.7.1; docs/graphics-kext/dgpu-oracle.md, Q9).
 fn argument_buffer_sampler_count(device: &rt::Device) -> u64 {
-    let limits = device.compile_device().profile().limits();
+    let profile = device.compile_device().profile();
     // SAFETY: the instance and physical device are the runtime's, read only, while `device`
     // lives.
     let allocations = unsafe {
@@ -274,11 +268,54 @@ fn argument_buffer_sampler_count(device: &rt::Device) -> u64 {
             .limits
             .max_sampler_allocation_count
     };
-    let least = limits
-        .max_descriptor_set_update_after_bind_samplers
-        .min(limits.max_per_stage_descriptor_update_after_bind_samplers)
-        .min(allocations);
-    u64::from(least)
+    let limits = profile.limits();
+    sampler_count(
+        reads_sampler_arrays(profile.descriptors()),
+        limits.max_descriptor_set_update_after_bind_samplers,
+        limits.max_per_stage_descriptor_update_after_bind_samplers,
+        allocations,
+    )
+}
+
+/// Whether a function on a device of `d` can read a set-1 sampler array, as metal2vulkan's
+/// `pipeline::link` (`heap_set`) and `lower::sampler` make one: a runtime array, partially
+/// bound and updated after bind (`descriptorBindingSampledImageUpdateAfterBind`, which covers
+/// `SAMPLER` bindings), indexed non-uniformly (`shaderSampledImageArrayNonUniformIndexing`,
+/// which covers arrays of samplers). Without them it makes no function that reads an argument
+/// buffer's sampler.
+fn reads_sampler_arrays(d: &metal2vulkan::device::DescriptorCaps) -> bool {
+    d.runtime_descriptor_array
+        && d.partially_bound
+        && d.update_after_bind_sampled_image
+        && d.non_uniform_sampled_image
+}
+
+/// How many sampler states an argument buffer can name at once on a device that `reads` set-1
+/// sampler arrays, of the limits `set` (`maxDescriptorSetUpdateAfterBindSamplers`), `stage`
+/// (`maxPerStageDescriptorUpdateAfterBindSamplers`) and `allocations`
+/// (`maxSamplerAllocationCount`), as metal2vulkan at pin 15 places them:
+/// - a live sampler state is at its element of every set-1 sampler array, the lowest above 0 no
+///   live state holds; element 0 ([`metal2vulkan::bind::NEUTRAL_HEAP_ELEMENT`]) is the neutral
+///   sampler, so a device's elements hold one state fewer than they number;
+/// - an array has at most as many elements as the handle search reaches
+///   ([`metal2vulkan::bind::HANDLE_TABLE_CAPACITY`], 65536), `set` and `stage`, and none where
+///   the device cannot read one ([`reads_sampler_arrays`]);
+/// - the device holds at most `allocations` Vulkan samplers, the neutral's among them, and
+///   refuses a state past them (`SamplerCount`).
+///
+/// A state past the count reads as the neutral through an argument buffer, announced as
+/// `unlisted-argument-sampler` (metal2vulkan's `sampler.rs` and `heap_sets.rs`). So the count is
+/// the least of the elements and `allocations`, less the neutral's one, and 0 where that is
+/// none.
+fn sampler_count(reads: bool, set: u32, stage: u32, allocations: u32) -> u64 {
+    let elements = if reads {
+        u64::from(metal2vulkan::bind::HANDLE_TABLE_CAPACITY)
+            .min(u64::from(set))
+            .min(u64::from(stage))
+    } else {
+        0
+    };
+    elements.min(u64::from(allocations)).saturating_sub(1)
 }
 
 /// `architecture.name` of a device of PCI vendor `vendor` and device `device` whose driver
@@ -410,6 +447,28 @@ mod tests {
     use super::*;
     use crate::gpu::device::tests::dev;
 
+    /// The sampler count is the least of the handle search's 65536 elements, the two
+    /// update-after-bind sampler limits and the sampler allocations, less the neutral sampler's
+    /// element; none where the device cannot read a sampler array, and none, not a wrap, where no
+    /// element is left past the neutral's.
+    #[test]
+    fn the_sampler_count_is_the_runtimes_elements_past_the_neutral() {
+        const ALL: u32 = u32::MAX;
+        // An RTX 5080's profile: 4000 sampler allocations.
+        assert_eq!(sampler_count(true, 1_048_576, 1_048_576, 4000), 3999);
+        // lavapipe: 32768 samplers in a set and a stage.
+        assert_eq!(sampler_count(true, 32768, 32768, ALL), 32767);
+        // MoltenVK on the M3 Max: limits past the handle search's reach.
+        assert_eq!(sampler_count(true, ALL, ALL, ALL), 65535);
+        assert_eq!(sampler_count(true, 70000, 2048, 3000), 2047);
+        // No set-1 sampler array: none.
+        assert_eq!(sampler_count(false, ALL, ALL, ALL), 0);
+        // One element is the neutral's alone, and none is none.
+        assert_eq!(sampler_count(true, 1, 1, 1), 0);
+        assert_eq!(sampler_count(true, 0, ALL, ALL), 0);
+        assert_eq!(sampler_count(true, ALL, ALL, 0), 0);
+    }
+
     /// A device no Metal device stands for answers the M3 Max's feature profile and FP configs;
     /// the one Metal's registry ID names, Metal's own (on macOS)
     #[test]
@@ -515,9 +574,11 @@ mod tests {
                 .is_some_and(|bytes| bytes > 0)
         );
         assert_eq!(identity.flags.is_low_power, None);
-        // The sampler states an argument buffer names: the least of the limits that bound the
-        // runtime's sampler array and its live samplers, so never none.
-        let limits = d.raw.compile_device().profile().limits();
+        // The sampler states an argument buffer names: the device's profile's and its sampler
+        // allocations', placed as the runtime places them (`sampler_count`), never none on a
+        // device whose functions read argument buffers' samplers.
+        let profile = d.raw.compile_device().profile();
+        let limits = profile.limits();
         // SAFETY: the instance and physical device are the runtime's, read only, while `d` lives.
         let allocations = unsafe {
             let raw = d.raw.raw();
@@ -526,19 +587,20 @@ mod tests {
                 .limits
                 .max_sampler_allocation_count
         };
+        let reads = reads_sampler_arrays(profile.descriptors());
         let samplers = identity.sizes.max_argument_buffer_sampler_count.unwrap();
-        assert!(samplers > 0);
-        assert!(samplers <= u64::from(allocations));
-        assert!(samplers <= u64::from(limits.max_descriptor_set_update_after_bind_samplers));
-        assert!(samplers <= u64::from(limits.max_per_stage_descriptor_update_after_bind_samplers));
-        assert!(
-            [
-                allocations,
+        assert_eq!(
+            samplers,
+            sampler_count(
+                reads,
                 limits.max_descriptor_set_update_after_bind_samplers,
                 limits.max_per_stage_descriptor_update_after_bind_samplers,
-            ]
-            .contains(&u32::try_from(samplers).unwrap())
+                allocations,
+            )
         );
+        assert!(reads && samplers > 0);
+        assert!(samplers < u64::from(allocations));
+        assert!(samplers < u64::from(metal2vulkan::bind::HANDLE_TABLE_CAPACITY));
         // BGRA8Unorm (80): 16-byte texture buffers, and a 4-byte texel's 64x64 tile in 16 KiB,
         // as Metal answers on the M3 Max; a format Metal asserts on (BC1_RGBA, 130) has none.
         let bgra8 = identity.formats.iter().find(|f| f.format == 80).unwrap();
