@@ -109,9 +109,14 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         })
     }
 
+    /// Its submission handlers, and those of the buffers the world takes at this commit
+    /// ([`World::release_submissions_at_next_commit`]), run inside the call, marked so
+    /// ([`crate::platform::command::committing`]), as the Vulkan platform's runtime runs them.
+    ///
+    /// [`World::release_submissions_at_next_commit`]: crate::testkit::objects::World::release_submissions_at_next_commit
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         self.act(Policy::On(on), "commit", vec![])?;
-        super::super::objects::commit_obj(self.obj());
+        crate::platform::command::committing(|| super::super::objects::commit_obj(self.obj()));
         Ok(())
     }
 

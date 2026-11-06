@@ -934,6 +934,9 @@ pub struct World {
     /// Committed command buffers whose work the platform has not taken, in commit order, while
     /// submissions are held ([`World::hold_submissions`]); `None` while they are not.
     held_submissions: Mutex<Option<Vec<Arc<FakeObj>>>>,
+    /// Whether the next commit, on whichever thread, first takes the held work
+    /// ([`World::release_submissions_at_next_commit`]).
+    release_at_commit: AtomicBool,
     /// The shared events' notifications not yet due, each with its event (the root of a shared
     /// copy) and value ([`notify_event`]), in the order asked for.
     notifications: Mutex<Vec<(ObjId, u64, Notification)>>,
@@ -978,6 +981,7 @@ impl World {
             release_dies: Mutex::new(Vec::new()),
             release_holds: Mutex::new(Vec::new()),
             held_submissions: Mutex::new(None),
+            release_at_commit: AtomicBool::new(false),
             notifications: Mutex::new(Vec::new()),
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
@@ -1221,6 +1225,15 @@ impl World {
             }
         }
         held.len()
+    }
+
+    /// The next command buffer committed, on whichever thread, first takes the work held since
+    /// [`World::hold_submissions`], inside its commit and on its thread, as
+    /// [`World::release_submissions`] does, then its own: as the Vulkan platform's runtime
+    /// submits, inside a commit, the ready batches committed before it, and runs their submission
+    /// handlers there.
+    pub fn release_submissions_at_next_commit(&self) {
+        self.release_at_commit.store(true, Ordering::Release);
     }
 
     /// Whether `cb`, just committed, is held ([`World::hold_submissions`]), listed if so.
@@ -1520,6 +1533,9 @@ pub fn complete_obj(
 /// submissions are held ([`World::hold_submissions`]) it is only listed for completion, and the
 /// rest waits for [`World::release_submissions`].
 pub fn commit_obj(cb: &Arc<FakeObj>) {
+    if cb.world.release_at_commit.swap(false, Ordering::AcqRel) {
+        cb.world.release_submissions();
+    }
     if cb.world.holds_submission(cb) {
         cb.world.note_committed(cb);
         return;

@@ -8874,3 +8874,299 @@ fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
         assert_eq!(at(x, y), [0, 0, 0, 0xff], "({x}, {y}) is not black");
     }
 }
+
+/// Queue 1 of process 1 on a headless device, as [`one_queue`] makes it, with both its rings of
+/// `data` bytes and the device raising through `raise`.
+fn one_queue_raising(
+    data: u32,
+    raise: GraphicsRaiseFn,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    Guest,
+    QueueRing,
+) {
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    let platform = Arc::new(FakePlatform::new());
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(raise),
+            scanout_written: None,
+        },
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let rings = (SUBMIT_OFF, COMPLETE_OFF);
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, rings, data, 0),
+        RGFX_STATUS_OK
+    );
+    let ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(data));
+    (device, platform, guest, ring)
+}
+
+/// The threads a device raised on, each with what its raise `found`.
+type Raises = Arc<Mutex<Vec<(Option<String>, std::thread::ThreadId, bool)>>>;
+
+/// A raise callback that notes each raise's thread in `raises`, with what `found` answers there.
+fn noting_raises(
+    raises: &Raises,
+    found: impl Fn() -> bool + Send + Sync + 'static,
+) -> GraphicsRaiseFn {
+    let raises = Arc::clone(raises);
+    Arc::new(move |vector| {
+        assert_eq!(vector, 0);
+        let thread = std::thread::current();
+        let seen = found();
+        raises
+            .lock()
+            .push((thread.name().map(str::to_owned), thread.id(), seen));
+    })
+}
+
+/// A `COMMAND_BUFFER` `cb_obj_id` on queue `queue_obj_id` that waits for shared event `event` to
+/// reach `value` and asks for its `CB_SUBMITTED`: its records go at its scheduling, from its
+/// submission handler.
+fn waiting_and_asking(queue_obj_id: u64, cb_obj_id: u64, event: u64, value: u64) -> Vec<u8> {
+    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+
+    let wait = RgfxOpEvent {
+        event_obj_id: event,
+        value,
+    };
+    command_buffer_of(
+        queue_obj_id,
+        cb_obj_id,
+        &[
+            (RGFX_OP_WAIT_EVENT, wait.as_bytes()),
+            (RGFX_OP_SUBMITTED, &[]),
+        ],
+    )
+}
+
+/// The next `CB_SUBMITTED` on `ring` (none other comes first) and then the `CB_SCHEDULED`, both
+/// of command buffer `cb_obj_id`.
+fn submitted_then_scheduled(ring: &mut QueueRing, cb_obj_id: u64) {
+    let bytes = ring.event().expect("a CB_SUBMITTED");
+    let submitted = RgfxCbSubmitted::read_from_bytes(&bytes).unwrap();
+    assert_eq!(
+        (submitted.header.r#type, submitted.cb_obj_id),
+        (RGFX_EVT_CB_SUBMITTED, cb_obj_id)
+    );
+    let scheduled = eventually(|| {
+        ring.has_event();
+        ring.scheduled.iter().any(|&(_, cb)| cb == cb_obj_id)
+    });
+    assert!(scheduled, "no CB_SCHEDULED of {cb_obj_id:#x}");
+}
+
+/// A decoder's command buffer whose submission handler runs inside a commit on a thread the
+/// header names for no raise, as the Vulkan platform's runtime runs every ready buffer's in a
+/// commit, posts nothing there: here the window's render thread commits a draw of its own, holding
+/// a lock of its own as a host's thread holds QEMU's BQL, and its commit takes the buffer held
+/// before it. The buffer's `CB_SUBMITTED` and `CB_SCHEDULED` reach the guest from the queue's
+/// service thread, which raises there and may wait there for the lock the render thread holds
+/// across its commit: the raise never comes on the committing thread
+#[test]
+fn a_foreign_commit_hands_a_decoder_buffer_s_records_to_its_queue_s_thread() {
+    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+
+    let caller = Arc::new(parking_lot::Mutex::new(()));
+    let raises = Raises::default();
+    let waits_for = Arc::clone(&caller);
+    let raise = noting_raises(&raises, move || {
+        waits_for.try_lock_for(Duration::from_secs(1)).is_some()
+    });
+    let (device, platform, mut guest, mut ring) = one_queue_raising(0x1_0000, raise);
+    guest.send(&device, shared_event_create(obj(1, 7), 0));
+    platform.world().hold_submissions();
+    ring.send(&device, waiting_and_asking(obj(1, 1), 100, obj(1, 7), 1));
+    committed(&platform, 1);
+    assert!(!ring.has_event(), "posted before its scheduling");
+    ring.arm();
+
+    let draw_queue = platform.device().new_command_queue().expect("a queue");
+    platform.world().release_submissions_at_next_commit();
+    let (committing, holding) = (Arc::clone(&caller), Arc::clone(&raises));
+    let window = std::thread::Builder::new()
+        .name("reims-vgpu.window".into())
+        .spawn(move || {
+            let draw = no_catch(draw_queue.command_buffer(OnFault::Die)).expect("a buffer");
+            let held = committing.lock();
+            no_catch(draw.commit(OnFault::Die));
+            let raised_inside = holding.lock().len();
+            drop(held);
+            (std::thread::current().id(), raised_inside)
+        })
+        .unwrap();
+    let (window, raised_inside) = window.join().unwrap();
+
+    submitted_then_scheduled(&mut ring, 100);
+    assert_eq!(raised_inside, 0, "raised inside the render thread's commit");
+    let raises = raises.lock().clone();
+    assert_eq!(raises.len(), 1, "{raises:?}");
+    let (name, thread, found) = &raises[0];
+    assert_ne!(*thread, window, "raised on the committing thread");
+    assert!(
+        name.as_deref()
+            .is_some_and(|n| n.starts_with("reims-vgpu.graphics-queue-")),
+        "raised on {name:?}"
+    );
+    assert!(
+        found,
+        "the raise could not take the lock the committer let go"
+    );
+    assert_eq!(device.handed_over(), 2);
+    platform.world().complete_all(CompleteOn::Thread);
+}
+
+/// The host's read of the display calls nothing back and waits for no room on a completion ring,
+/// though its commit, on the host's thread, takes a decoder's buffer held before it whose queue's
+/// completion ring is full: the buffer's `CB_SUBMITTED` and `CB_SCHEDULED` are handed to the
+/// queue's service thread, which posts them, and raises, once the guest has made room
+#[test]
+fn a_read_of_the_display_calls_nothing_back_and_waits_for_no_full_ring() {
+    use reims_graphics::ops::{RGFX_OP_SIGNAL_EVENT, RgfxOpEvent};
+
+    const DATA: u32 = 0x1000;
+    const SIGNALS: u64 = 150;
+    let raises = Raises::default();
+    let (device, platform, mut guest, mut ring) =
+        one_queue_raising(DATA, noting_raises(&raises, || true));
+    platform
+        .world()
+        .set_auto_complete(Some(CompleteOn::Detached));
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(64, 32, 256)),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, shared_event_create(obj(1, 7), 0));
+    // A buffer that signals the event 150 times: its completion posts each value, 32 bytes, more
+    // than the ring holds, and waits on its completion thread for room the guest does not make.
+    let signals: Vec<RgfxOpEvent> = (1..=SIGNALS)
+        .map(|value| RgfxOpEvent {
+            event_obj_id: obj(1, 7),
+            value,
+        })
+        .collect();
+    let ops: Vec<(u16, &[u8])> = (signals.iter())
+        .map(|s| (RGFX_OP_SIGNAL_EVENT, s.as_bytes()))
+        .collect();
+    ring.arm();
+    ring.send(&device, command_buffer_of(obj(1, 1), 100, &ops));
+    // SAFETY: the completion ring's producer count is its header's first field, in the region.
+    let produced = |ring: &QueueRing| unsafe { ring.load_u64(ring.complete_off as usize) };
+    assert!(
+        eventually(|| produced(&ring) > u64::from(DATA) - 40),
+        "the ring did not fill: {} of {DATA} bytes",
+        produced(&ring)
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let full = produced(&ring);
+
+    platform.world().hold_submissions();
+    ring.send(&device, waiting_and_asking(obj(1, 1), 101, obj(1, 7), 1000));
+    committed(&platform, 1);
+    platform.world().release_submissions_at_next_commit();
+    let device = Arc::new(device);
+    let reader = Arc::clone(&device);
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    let host = std::thread::Builder::new()
+        .name("host".into())
+        .spawn(move || {
+            let mut dst = vec![0u8; 1920 * 1080 * 4];
+            let read = reader.read_display(&mut dst);
+            let _ = read_tx.send((std::thread::current().id(), read.1.is_ok()));
+        })
+        .unwrap();
+    let (host_thread, read) = read_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the read waited for the full ring");
+    host.join().unwrap();
+    assert!(read, "the read failed");
+    assert_eq!(produced(&ring), full, "posted onto a full ring");
+    assert_eq!(
+        device.handed_over(),
+        2,
+        "the buffer's records were not handed over"
+    );
+    assert!(
+        raises
+            .lock()
+            .iter()
+            .all(|(_, thread, _)| *thread != host_thread),
+        "raised inside the read"
+    );
+
+    // The guest makes room: the signals, the first buffer's completion and the second's records
+    // all come, the second's from the queue's service thread.
+    ring.arm();
+    let mut submitted = false;
+    let mut signalled = 0;
+    while !submitted || signalled < SIGNALS {
+        let Some(bytes) = ring.event() else {
+            break;
+        };
+        let header = RgfxMsgHeader::read_from_prefix(&bytes).unwrap().0;
+        match header.r#type {
+            RGFX_EVT_EVENT_SIGNALLED => signalled += 1,
+            RGFX_EVT_CB_SUBMITTED => {
+                let posted = RgfxCbSubmitted::read_from_bytes(&bytes).unwrap();
+                assert_eq!(posted.cb_obj_id, 101);
+                submitted = true;
+            }
+            RGFX_EVT_CB_COMPLETE => {}
+            other => panic!("an event of type {other:#x}"),
+        }
+    }
+    assert!(submitted, "no CB_SUBMITTED of the held buffer");
+    assert_eq!(signalled, SIGNALS);
+    let scheduled = eventually(|| {
+        ring.has_event();
+        ring.scheduled.iter().any(|&(_, cb)| cb == 101)
+    });
+    assert!(scheduled, "no CB_SCHEDULED of the held buffer");
+    for (name, thread, _) in raises.lock().iter() {
+        assert_ne!(*thread, host_thread, "raised inside the read");
+        let name = name.as_deref().unwrap_or_default();
+        assert!(
+            name.starts_with("reims-vgpu.graphics-") || name == "com.Metal.CompletionQueueDispatch",
+            "raised on {name:?}"
+        );
+    }
+    platform.world().complete_all(CompleteOn::Thread);
+}
+
+/// A decoder's command buffer whose submission handler runs inside a commit on one of the
+/// device's threads, which the header names for the raise, posts its records there, as before:
+/// here the queue's next buffer's commit, on its queue's thread, takes the buffer held before it.
+/// Nothing is handed over, and the raise comes on that thread
+#[test]
+fn a_commit_on_the_device_s_thread_posts_a_decoder_buffer_s_records_there() {
+    let raises = Raises::default();
+    let (device, platform, mut guest, mut ring) =
+        one_queue_raising(0x1_0000, noting_raises(&raises, || true));
+    guest.send(&device, shared_event_create(obj(1, 7), 0));
+    platform.world().hold_submissions();
+    ring.send(&device, waiting_and_asking(obj(1, 1), 100, obj(1, 7), 1));
+    committed(&platform, 1);
+    assert!(!ring.has_event(), "posted before its scheduling");
+    ring.arm();
+    platform.world().release_submissions_at_next_commit();
+    ring.send(&device, command_buffer(obj(1, 1), 101));
+    submitted_then_scheduled(&mut ring, 100);
+    assert_eq!(device.handed_over(), 0, "a record was handed over");
+    let raises = raises.lock().clone();
+    assert_eq!(raises.len(), 1, "{raises:?}");
+    let name = raises[0].0.as_deref().unwrap_or_default();
+    assert!(
+        name.starts_with("reims-vgpu.graphics-queue-")
+            || name.starts_with("reims-vgpu.graphics-lane-"),
+        "raised on {name:?}"
+    );
+    platform.world().complete_all(CompleteOn::Thread);
+}
