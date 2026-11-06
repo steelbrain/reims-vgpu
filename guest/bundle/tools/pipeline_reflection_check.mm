@@ -16,8 +16,11 @@
 //                and 30, buffer 30 holding only an attribute the function declares and does not read
 //   c_nested     an argument buffer of a struct of members, arrays of them, of samplers, buffers,
 //                constants and textures, and a pointer to another argument buffer
+//   c_nested_more  an argument buffer of C arrays of samplers and of pointers to argument
+//                buffers, a struct of members holding one and a C array, and a C array of those
 //   c_tables     a visible function table, an intersection function table and acceleration
 //                structures of both kinds
+//   c_ab_tables  the same, as an argument buffer's members
 //   c_more_textures  textures of further shapes, sample types and access
 //   c_imageblock an imageblock
 //   c_atomic_texture  a texture of 64-bit atomics (its library, LIB, is
@@ -371,7 +374,8 @@ int main(int argc, char **argv)
 		                {"c_builtins_only", "k_builtins_only"}, {"c_nothing", "k_nothing"},
 		                {"c_argument_buffer", "k_argument_buffer"}, {"k_arrays", "k_arrays"},
 		                {"k_builtins", "k_builtins"}, {"c_nested", "k_nested"},
-		                {"c_tables", "k_tables"}, {"c_more_textures", "k_more_textures"},
+		                {"c_nested_more", "k_nested_more"}, {"c_tables", "k_tables"},
+		                {"c_ab_tables", "k_ab_tables"}, {"c_more_textures", "k_more_textures"},
 		                {"c_imageblock", "k_imageblock"}};
 		for (const auto &k : kKernels)
 			if (CASE(k.name))

@@ -415,6 +415,27 @@ kernel void k_nested(device Nested &n [[buffer(0)]], device float *out [[buffer(
 	           n.inners[1]->a;
 }
 
+// More of them: C arrays of samplers and of pointers to argument buffers, a struct of members that
+// holds a struct of members and a C array, and a C array of such structs.
+struct Deep {
+	Leaf leaf [[id(0)]];
+	device float *data [[id(2)]] [2];
+};
+
+struct More {
+	sampler samplers [[id(0)]] [2];
+	device Child *children [[id(2)]] [2];
+	Deep deep [[id(4)]];
+	Deep deeps [[id(8)]] [2];
+};
+
+kernel void k_nested_more(device More &m [[buffer(0)]], device float *out [[buffer(1)]],
+                          uint gid [[thread_position_in_grid]])
+{
+	float4 c = m.deep.leaf.t.sample(m.samplers[1], float2(0)) + m.deeps[1].leaf.t.sample(m.deeps[0].leaf.s, float2(0));
+	out[gid] = c.x + m.children[1]->data[gid] + m.deep.data[1][gid] + m.deeps[1].data[0][gid];
+}
+
 [[visible]] float twice(float x)
 {
 	return 2 * x;
@@ -432,6 +453,26 @@ kernel void k_tables(visible_function_table<float(float)> table [[buffer(0)]],
 	intersector<instancing, triangle_data> j;
 	auto hit2 = j.intersect(r, instances, 1);
 	out[gid] = table[0](float(gid)) + hit.distance + hit2.distance;
+}
+
+// An argument buffer of a function table, an intersection function table and acceleration
+// structures.
+struct Tables {
+	visible_function_table<float(float)> table [[id(0)]];
+	intersection_function_table<triangle_data> intersections [[id(1)]];
+	primitive_acceleration_structure primitives [[id(2)]];
+	instance_acceleration_structure instances [[id(3)]];
+};
+
+kernel void k_ab_tables(device Tables &t [[buffer(0)]], device float *out [[buffer(1)]],
+                        uint gid [[thread_position_in_grid]])
+{
+	ray r(float3(0), float3(0, 0, 1));
+	intersector<triangle_data> i;
+	auto hit = i.intersect(r, t.primitives, t.intersections);
+	intersector<instancing, triangle_data> j;
+	auto hit2 = j.intersect(r, t.instances, 1);
+	out[gid] = t.table[0](float(gid)) + hit.distance + hit2.distance;
 }
 
 kernel void k_more_textures(texture2d<ushort> shorts [[texture(0)]],
