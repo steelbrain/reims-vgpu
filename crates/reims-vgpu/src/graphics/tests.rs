@@ -820,6 +820,30 @@ impl QueueRing {
         device.mmio_write(RGFX_REG_DOORBELL.into(), self.submit_off as u32);
     }
 
+    /// Publishes `command` (its `size` its length) on the submission ring and rings the queue's
+    /// doorbell through `mmio_write_taking`, as QEMU rings, only where the host marked the ring
+    /// idle, as the guest's writer does (`RgfxRingWriter`): whether it rang.
+    fn send_as_guest(&mut self, device: &GraphicsDevice<FakePlatform>, command: Vec<u8>) -> bool {
+        self.publish(command);
+        let idle = self.marked_idle();
+        if idle {
+            device.mmio_write_taking(RGFX_REG_DOORBELL.into(), self.submit_off as u32);
+        }
+        idle
+    }
+
+    /// Whether the host marked the submission ring idle (`consumer_idle` 1), so the guest's
+    /// writer rings the doorbell for what it has just published.
+    fn marked_idle(&self) -> bool {
+        // SAFETY: as the helpers above; `consumer_idle` is at 0x80 of the submission ring header,
+        // read after the publish's store, as the writer reads it after a full fence.
+        let idle = unsafe {
+            AtomicU32::from_ptr(self.base.add(self.submit_off as usize + 0x80).cast())
+                .load(Ordering::SeqCst)
+        };
+        idle == 1
+    }
+
     /// Publishes `command` (its `size` its length) on the submission ring, ringing no doorbell.
     fn publish(&mut self, mut command: Vec<u8>) {
         let len = command.len() as u32;
@@ -1378,7 +1402,8 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
 
 /// What a command buffer that asks for its `CB_SUBMITTED` costs from its doorbell write to the
 /// record on its queue's completion ring, as for a guest's `commitAndWaitUntilSubmitted` of a
-/// tiny buffer, rung for through `mmio_write_taking` as QEMU rings: on an idle queue, and just
+/// tiny buffer, rung for through `mmio_write_taking` as QEMU rings, where the host marked the ring
+/// idle, as the guest rings: on an idle queue, and just
 /// behind a short buffer (a sampler bind, walked on the queue's service thread where its commit
 /// waits for nothing) that does not ask, rung for `GAP` µs before it with the queue's thread
 /// asleep, whose walk is made to take `WALK` µs by a spin after its first op, standing for a GPU
@@ -1449,7 +1474,7 @@ fn an_asking_buffer_s_doorbell_to_its_cb_submitted_behind_a_walk() {
         let start = Instant::now();
         if plain {
             device.mmio_write(RGFX_REG_DOORBELL.into(), submit_off as u32);
-        } else {
+        } else if ring.marked_idle() {
             taking();
         }
         let in_write = !plain && ring.has_event();
@@ -4293,18 +4318,21 @@ fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread
 }
 
 /// A command buffer that asks for its `CB_SUBMITTED` behind a short buffer its queue's service
-/// thread walks is answered before that walk ends, as behind one a lane's thread walks: rung for
-/// through `mmio_write_taking` during the walk, inside the write; and published before the
-/// service thread took the buffer before it, by that thread, before the walk. Each completes
-/// after the buffer before it. The service thread held its claim on the queue's messages through
-/// the walk, so the write answered nothing and the buffer was answered only at its take, after
-/// the walk and the commit before it: a guest's `commitAndWaitUntilSubmitted` behind a buffer
-/// of fills waited for them
+/// thread walks is answered before that walk ends, as behind one a lane's thread walks:
+/// published during the walk, rung for, as the guest rings only for a ring the host marked idle,
+/// which the service thread marks it through the walk, and answered inside the write; and
+/// published before the service thread took the buffer before it, by that thread, before the
+/// walk. Each completes after the buffer before it. The service thread held its claim on the
+/// queue's messages through the walk, so the write answered nothing and the buffer was answered
+/// only at its take, after the walk and the commit before it; and once it let the claim go, it
+/// still kept the ring marked busy, so the guest rang no doorbell for a buffer it published
+/// during the walk, which was answered after it all the same: a guest's
+/// `commitAndWaitUntilSubmitted` behind a buffer of fills waited for them
 #[test]
 fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the_walk_ends() {
     let raised = Arc::new(AtomicU32::new(0));
     let ok = u64::from(RGFX_CB_OK);
-    // Rung for during the walk.
+    // Published, and rung for, during the walk.
     let (device, platform, _guest, mut ring) = one_queue(&raised);
     let gate = WalkGate::in_place(&device);
     ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
@@ -4314,8 +4342,10 @@ fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the
         walked_on.starts_with("reims-vgpu.graphics-queue-"),
         "the short buffer walked on {walked_on:?}"
     );
-    ring.publish(asking(obj(1, 1), 101));
-    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), ring.submit_off as u32);
+    assert!(
+        ring.send_as_guest(&device, asking(obj(1, 1), 101)),
+        "the ring was not marked idle during the walk: the guest rang no doorbell"
+    );
     assert!(
         ring.has_event(),
         "the write did not answer the buffer behind the walk"

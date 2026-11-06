@@ -2510,9 +2510,13 @@ commit. Each outcome the new design allows is one of those two:
     thread offers the queue's next buffer to the host there, as a doorbell's
     thread does, so a buffer that asks for its `CB_SUBMITTED` behind it is
     answered before the walk, or at its own doorbell during it, as behind a
-    walk on a lane thread. Held through the walk, the claim kept the doorbell
-    from answering, and a guest's `commitAndWaitUntilSubmitted` behind a
-    buffer of fills waited for that walk and its commit (tested by
+    walk on a lane thread. Through the walk the thread marks the ring idle
+    (`consumer_idle` 1), as before it sleeps, since the guest rings a
+    queue's doorbell only for a ring marked so; it clears the mark when it
+    takes the claim back. Held through the walk, the claim kept the doorbell
+    from answering, and with the ring marked busy the guest rang none, so a
+    guest's `commitAndWaitUntilSubmitted` behind a buffer of fills waited for
+    that walk and its commit (tested by
     `a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the_walk_ends`);
   - its signal of its queue's surface timeline ("Surface order"), and the
     release that stands in for one of a buffer that does not run: each is

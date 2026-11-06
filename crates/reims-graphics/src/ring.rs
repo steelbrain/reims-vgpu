@@ -416,6 +416,17 @@ impl Consumer {
         waiting.load(Ordering::SeqCst) == 1 && waiting.swap(0, Ordering::SeqCst) == 1
     }
 
+    /// While the host works on something other than the ring's take (a walk the queue's service
+    /// thread carries out): sets `consumer_idle` and issues a full fence, so the guest rings its
+    /// doorbell for what it publishes from then on, and the host's look at the ring after the
+    /// fence finds what it published before ([`Self::awake`] clears it again).
+    pub(crate) fn mark_idle(&self, region: &Region) {
+        region
+            .atomic_u32(self.at.header + CONSUMER_IDLE)
+            .store(1, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+    }
+
     /// The host woke: clears `consumer_idle`, so the guest rings no doorbell while it takes.
     pub(crate) fn awake(&self, region: &Region) {
         region

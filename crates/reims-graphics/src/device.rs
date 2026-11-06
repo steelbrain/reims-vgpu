@@ -90,7 +90,10 @@
 //! messages lasts through the host's begin of the buffer it hands over, which places that buffer
 //! among the queue's ([`QueueClaim`]): a host that then walks and commits the buffer on that
 //! thread lets the hold go first, and offers the queue's next buffer there, as a doorbell's
-//! thread does, so a buffer rung for meanwhile is answered before that walk, not after it.
+//! thread does, so a buffer published meanwhile is answered before that walk, not after it.
+//! Until it takes the hold back the thread marks the ring idle, as before it sleeps: the guest
+//! rings for a buffer it publishes during the walk, which it does only for a ring marked idle,
+//! and the doorbell's write answers it there.
 //!
 //! **An answer on a lane's thread.** A buffer the service thread takes and must wait for ring 0
 //! for is filed at the queue gate with its message ([`gate`]'s offer). The lane whose move ends
@@ -1073,24 +1076,40 @@ pub struct QueueClaim<'a> {
     queue: &'a Arc<QueueShared>,
     /// The queue's `consuming`, until the claim is let go.
     held: Option<MutexGuard<'a, Option<u64>>>,
+    /// Whether the let-go marked the queue's submission ring idle, which the retake clears.
+    idled: bool,
 }
 
 impl<'a> QueueClaim<'a> {
-    /// Lets go of the claim, then offers the queue's next message to the host on this thread as a
-    /// doorbell's thread does ([`Host::answer_command_buffer`]): a buffer the guest published and
-    /// rang for before the claim was let go, and now waits for its `CB_SUBMITTED`, is answered
-    /// here where it need wait for nothing, not after the work this thread carries out next. A
-    /// doorbell rung afterwards offers its buffer itself. Once let go, it stays so for the call.
+    /// Lets go of the claim, marks the queue's submission ring idle until the claim is taken
+    /// back, then offers the queue's next message to the host on this thread as a doorbell's
+    /// thread does ([`Host::answer_command_buffer`]): a buffer the guest published before the
+    /// claim was let go, and now waits for its `CB_SUBMITTED`, is answered here where it need
+    /// wait for nothing, not after the work this thread carries out next. The guest rings a
+    /// queue's doorbell only while its ring is marked idle, so it rings for a buffer it publishes
+    /// during that work, and the doorbell's thread offers it in the write. Once let go, it stays
+    /// so for the call.
     pub fn let_go(&mut self) {
         if self.held.take().is_some() {
+            self.idled = self.shared.mark_idle(self.queue);
             self.shared.answer_on_doorbell(self.queue);
         }
     }
 
-    /// The queue's `consuming` again, taken where the claim was let go.
+    /// The queue's `consuming` again, taken where the claim was let go, with the queue's
+    /// submission ring no longer marked idle, as while this thread takes.
     fn retake(self) -> MutexGuard<'a, Option<u64>> {
-        let QueueClaim { queue, held, .. } = self;
-        held.unwrap_or_else(|| queue.consuming.lock())
+        let QueueClaim {
+            shared,
+            queue,
+            held,
+            idled,
+        } = self;
+        let consuming = held.unwrap_or_else(|| queue.consuming.lock());
+        if idled {
+            shared.mark_awake(queue);
+        }
+        consuming
     }
 }
 
@@ -1794,6 +1813,27 @@ impl Shared {
         }
     }
 
+    /// Marks `queue`'s submission ring idle while its service thread works on something other
+    /// than its take ([`QueueClaim::let_go`]), where the device is started, the ring is not broken
+    /// and the queue lives: whether it was marked.
+    fn mark_idle(&self, queue: &QueueShared) -> bool {
+        let submit = queue.submit.lock();
+        if !self.started() || submit.broken || self.ending() || queue.ended() {
+            return false;
+        }
+        submit.consumer.mark_idle(&self.region);
+        true
+    }
+
+    /// Clears the idle mark of [`Self::mark_idle`] where the queue still lives: an ended queue's
+    /// rings may be another process's block by now ([`QueueShared::fence`]).
+    fn mark_awake(&self, queue: &QueueShared) {
+        let submit = queue.submit.lock();
+        if !queue.ended() {
+            submit.consumer.awake(&self.region);
+        }
+    }
+
     /// Offers `queue`'s next message to the host on this thread, a doorbell's (the module doc),
     /// where it is a `COMMAND_BUFFER` of at most [`DOORBELL_MESSAGE_MAX`] bytes, none answered is
     /// left for the service thread to take, the device is started and the queue lives, and nothing
@@ -2272,6 +2312,7 @@ impl Shared {
                 shared: self,
                 queue,
                 held: Some(consuming),
+                idled: false,
             };
             self.host.command_buffer(poster, message.bytes, &mut claim);
             consuming = claim.retake();
