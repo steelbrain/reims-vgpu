@@ -18,8 +18,9 @@
 # macOS on arm64 and Linux on x86-64 (Ubuntu or Debian, Arch or CachyOS; other
 # distributions get the list of what to install). It:
 #   1. checks the build's dependencies, and offers to install those missing
-#      (Homebrew on macOS; apt or pacman on Linux, through sudo), and Rust
-#      through rustup.rs, whose installer asks its own questions;
+#      (Homebrew on macOS; apt or pacman on Linux, through sudo), and rustup
+#      through rustup.rs, beside any other cargo, whose installer asks its own
+#      questions;
 #   2. fetches vendor/qemu, QEMU's source, without QEMU's own submodules (its
 #      build fetches what it needs); cargo fetches metal2vulkan itself, at the
 #      commit the library's Cargo.toml names;
@@ -53,6 +54,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The PATH this ran with, which the user's shell has; the build's own puts rustup's first.
+START_PATH="$PATH"
 YES=0 UPDATE=0 SKIP_QEMU=0
 for arg in "$@"; do
   case "$arg" in
@@ -363,23 +366,27 @@ else
   fi
 fi
 
-if ! command -v cargo >/dev/null 2>&1 && [[ -x "$HOME/.cargo/bin/cargo" ]]; then
-  # shellcheck disable=SC1091
-  . "$HOME/.cargo/env"
+# The build runs the toolchain rust-toolchain.toml pins, through rustup's proxies in Cargo's
+# home, so they come first on PATH here: a shell that sourced no Cargo env has none on it, and
+# another cargo found first, a distribution's (Arch's rust, which its cargo-nextest pulls in),
+# builds with its own release.
+CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+if [[ -x "$CARGO_BIN/rustup" ]]; then
+  export PATH="$CARGO_BIN:$PATH"
 fi
 if ! command -v rustup >/dev/null 2>&1; then
   if command -v cargo >/dev/null 2>&1; then
-    die "cargo is installed without rustup: the build needs the toolchain rust-toolchain.toml pins, which rustup installs (https://rustup.rs)"
+    say "$(command -v cargo) is a cargo without rustup: the build needs the toolchain rust-toolchain.toml pins, which rustup installs beside it"
+  else
+    say "Rust is not installed"
   fi
-  say "Rust is not installed"
-  ask "Install it from https://rustup.rs?" || die "install Rust (https://rustup.rs), then run this again"
+  ask "Install rustup from https://rustup.rs?" || die "install rustup (https://rustup.rs), then run this again"
   if [[ $YES == 1 ]]; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
   else
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   fi
-  # shellcheck disable=SC1091
-  . "$HOME/.cargo/env"
+  export PATH="$CARGO_BIN:$PATH"
 fi
 
 # ------------------------------------------------------------------ sources
@@ -545,7 +552,7 @@ echo
 # By its full path, which works before PATH finds reims-ctl.
 echo "Check this host:"
 printf '  %q doctor\n' "$BIN"
-if ! command -v reims-ctl >/dev/null 2>&1 || [[ "$(command -v reims-ctl)" != "$BIN" ]]; then
+if [[ "$(PATH="$START_PATH" command -v reims-ctl 2>/dev/null)" != "$BIN" ]]; then
   echo
   warn "$(dirname "$BIN") is not first on your PATH: open a new terminal, or run: . \"\$HOME/.cargo/env\""
 fi
