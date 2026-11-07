@@ -567,6 +567,24 @@ fn private_dir(d: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a start of a stopped VM does to its settings first, before [`start`]: for an x86-64 VM
+/// on reims-vgpu, its disk's macOS ([`crate::macos::settle`]), which may save the graphics its
+/// settings named none of. Notes go to `progress`; warnings are returned, for a start that
+/// still runs.
+pub fn prepare(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Vec<String> {
+    let mut w = Vec::new();
+    if running(vm) {
+        return w;
+    }
+    match crate::macos::settle(vm) {
+        Ok(crate::macos::Settled::Kept) => {}
+        Ok(crate::macos::Settled::Saved(note)) => progress(&note),
+        Ok(crate::macos::Settled::Warn(s)) => w.push(s),
+        Err(e) => w.push(format!("{e:#}")),
+    }
+    w
+}
+
 /// Starts the VM, and returns QEMU's pid once QMP answers.
 pub fn start(vm: &Vm, host: Host) -> Result<i32> {
     if let Some(p) = pid(vm) {

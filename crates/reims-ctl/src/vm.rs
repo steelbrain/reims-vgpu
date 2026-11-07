@@ -31,9 +31,11 @@ pub struct VmConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
     /// The guest's graphics device ([`VmConfig::graphics`]). None, as settings saved before the
-    /// choice of three have it, is the profile's default ([`Graphics::default_for`]): an x86-64
-    /// VM saved then, which ran apple-gfx, runs reims-vgpu's own device now. Any other is saved
-    /// by name, apple-gfx too.
+    /// choice of three have it, is the profile's default ([`Graphics::default_for`]) until the
+    /// first start that finds macOS on the VM's disk saves the device for that macOS by name
+    /// (macos.rs): an x86-64 VM saved then, which ran apple-gfx, runs reims-vgpu's own device
+    /// on macOS 26.4 and later, and stays on apple-gfx on an older macOS. A create saves it by
+    /// name where it knows the macOS, apple-gfx too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphics: Option<Graphics>,
     /// The host's video decode, encode and scaling for the guest, on apple-gfx: the
@@ -164,8 +166,9 @@ impl Graphics {
             .with_context(|| format!("graphics is reims-vgpu, apple-gfx or vmware-svga, not {s:?}"))
     }
 
-    /// The device a VM of `profile` has where its settings name none: reims-vgpu's own on
-    /// x86-64, apple-gfx, the only one, on arm64.
+    /// The device a VM of `profile` has where its settings name none, and its macOS is not known
+    /// yet: reims-vgpu's own on x86-64, apple-gfx, the only one, on arm64. An x86-64 VM on a
+    /// macOS reims-vgpu's kexts don't load on runs apple-gfx ([`crate::macos::graphics_for`]).
     pub fn default_for(profile: Profile) -> Graphics {
         match profile {
             Profile::Q35X86_64 => Graphics::ReimsVgpu,

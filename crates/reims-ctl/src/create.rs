@@ -207,6 +207,8 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     let mut spec = spec;
     // The macOS version, where an installer was downloaded for it.
     let mut macos = None;
+    // The macOS the VM will run, where reims-ctl knows it: the download's, or the given disk's.
+    let mut found = Vec::new();
     if profile == Profile::Q35X86_64 {
         if spec.macos.is_some() && spec.installer.is_some() {
             bail!("give macOS to download or an installer, not both");
@@ -237,14 +239,40 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
         if let Some(d) = spec.macos.take() {
             let i = reims_util::installer(&d, progress)?;
             spec.installer = Some(i.image);
+            found.push(crate::macos::Macos {
+                version: i.version.clone(),
+                build: i.build,
+            });
             macos = Some(i.version);
+        } else if let Some(DiskSource::Existing { path, .. }) = &spec.disk {
+            match ImageFormat::detect(path).and_then(|f| crate::macos::on_disk(path, f)) {
+                Ok(f) => found = f,
+                Err(e) => progress(&format!(
+                    "reims-ctl can't tell which macOS {} holds ({e:#}): it runs on {}",
+                    path.display(),
+                    graphics.id()
+                )),
+            }
         }
     } else if spec.macos.is_some() {
         bail!("an arm64 VM installs macOS from an IPSW (--ipsw latest)");
     }
+    // A VM whose settings name no graphics runs the device for its macOS, saved by name where
+    // reims-ctl knows the macOS, and otherwise decided at the first start that finds macOS on
+    // its disk (macos.rs).
+    let saved = match profile {
+        Profile::Q35X86_64 => spec.graphics.or_else(|| crate::macos::graphics_for(&found)),
+        Profile::VmappleArm64 => Some(graphics),
+    };
+    let graphics = saved.unwrap_or(graphics);
+    if let Some(note) =
+        crate::macos::create_note(&spec.name, &found, graphics, spec.graphics.is_some())
+    {
+        progress(&note);
+    }
     let made = claim(&dir)?;
     let result = match profile {
-        Profile::Q35X86_64 => make_q35(&spec, graphics, &dir, macos.as_deref(), progress),
+        Profile::Q35X86_64 => make_q35(&spec, saved, graphics, &dir, macos.as_deref(), progress),
         Profile::VmappleArm64 => make_vmapple(&spec, host, &dir, progress),
     };
     let vm = match result {
@@ -393,8 +421,11 @@ fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
     Ok(())
 }
 
+/// Makes an x86-64 VM on `graphics`, which its settings save as `saved`: none where they name
+/// no graphics.
 fn make_q35(
     spec: &Spec,
+    saved: Option<Graphics>,
     graphics: Graphics,
     dir: &Path,
     macos: Option<&str>,
@@ -463,6 +494,7 @@ fn make_q35(
         None => None,
     };
     let mut c = base_config(spec, Profile::Q35X86_64, disk, disk_format);
+    c.graphics = saved;
     c.network.mac = mac;
     c.q35 = Some(Q35 {
         opencore: oc_name,

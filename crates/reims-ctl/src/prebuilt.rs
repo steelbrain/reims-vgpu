@@ -70,6 +70,41 @@ fn carried() -> Option<&'static [Kext]> {
     Some(tests::SET)
 }
 
+/// A Darwin version bound, X.Y.Z, as its major, minor and patch.
+fn version(v: &str) -> Option<(u32, u32, u32)> {
+    let mut p = v.trim().split('.').map(|n| n.parse::<u32>().ok());
+    let v = (p.next()??, p.next()??, p.next()??);
+    p.next().is_none().then_some(v)
+}
+
+/// The Darwin versions, major and minor, that OpenCore loads every kext of the set on: the
+/// latest of their MinKernel and the earliest of their MaxKernel. None where reims-ctl carries
+/// no set, or the bounds leave none.
+pub fn bounds() -> Option<((u32, u32), (u32, u32))> {
+    let (mut min, mut max) = ((0, 0, 0), (u32::MAX, u32::MAX, u32::MAX));
+    for k in carried()? {
+        if let Some(m) = k.min_kernel {
+            min = min.max(version(m)?);
+        }
+        if let Some(m) = k.max_kernel {
+            max = max.min(version(m)?);
+        }
+    }
+    (min <= max).then_some(((min.0, min.1), (max.0, max.1)))
+}
+
+/// Whether OpenCore loads every kext of the set on Darwin `major`.`minor` (its patch level taken
+/// as 0, as no bound names one but 99); None where reims-ctl carries no set.
+pub fn loads_on((major, minor): (u32, u32)) -> Option<bool> {
+    let mut loads = true;
+    for k in carried()? {
+        let at = (major, minor, 0);
+        loads &= k.min_kernel.and_then(version).is_none_or(|m| m <= at)
+            && k.max_kernel.and_then(version).is_none_or(|m| at <= m);
+    }
+    Some(loads)
+}
+
 /// The directory the embedded files are written into.
 fn dir() -> PathBuf {
     paths::data_dir().join("prebuilt")
@@ -270,6 +305,21 @@ mod tests {
             "nothing beside it"
         );
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The set loads on the Darwin versions its bounds cover, a whole Darwin version for a
+    /// bound of 99: the tests' set, Darwin 25.4.0 to 25.99.99, on macOS 26.4 and later releases
+    /// of macOS 26.
+    #[test]
+    fn the_set_loads_within_its_bounds() {
+        assert_eq!(bounds(), Some(((25, 4), (25, 99))));
+        assert_eq!(loads_on((25, 4)), Some(true));
+        assert_eq!(loads_on((25, 99)), Some(true));
+        assert_eq!(loads_on((25, 3)), Some(false));
+        assert_eq!(loads_on((24, 6)), Some(false));
+        assert_eq!(loads_on((26, 0)), Some(false));
+        assert_eq!(version("25.4.0"), Some((25, 4, 0)));
+        assert_eq!(version("25.4"), None);
     }
 
     /// The set embedded, where the checkout has one, is whole: each kext's executable is one of

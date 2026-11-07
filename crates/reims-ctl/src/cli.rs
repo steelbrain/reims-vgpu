@@ -323,8 +323,8 @@ pub struct CreateArgs {
     /// arm64: the machine identifier's ECID, where the bundle does not hold it
     #[arg(long)]
     pub ecid: Option<u64>,
-    /// x86-64: reims-vgpu (the default), apple-gfx or vmware-svga (see reims-ctl set --help);
-    /// arm64 VMs have apple-gfx alone
+    /// x86-64: reims-vgpu (the default on macOS 26.4 and later), apple-gfx (the default on an
+    /// older macOS) or vmware-svga (see reims-ctl set --help); arm64 VMs have apple-gfx alone
     #[arg(long)]
     pub graphics: Option<String>,
     /// apple-gfx: displays, 1 to 8, each in a window of its own (reims-vgpu has one)
@@ -370,12 +370,14 @@ pub struct SetArgs {
     /// RAM, such as 8G
     #[arg(long)]
     pub memory: Option<String>,
-    /// x86-64: reims-vgpu (the default), its own GPU device, which the guest drives with the
-    /// kexts reims-ctl puts in its OpenCore image (after a change to it, run update-opencore),
-    /// on one display in a window whose size the guest follows; apple-gfx, Apple's
-    /// paravirtualized GPU, the only one of arm64 VMs, with up to 8 displays and the host's video
-    /// hardware; or vmware-svga, QEMU's VMware SVGA: one display with no GPU acceleration, in
-    /// QEMU's own window
+    /// x86-64: reims-vgpu (the default on macOS 26.4 and later), its own GPU device, which the
+    /// guest drives with the kexts reims-ctl puts in its OpenCore image (after a change to it,
+    /// run update-opencore), on one display in a window whose size the guest follows; apple-gfx
+    /// (the default on an older macOS, which the kexts don't load on), Apple's paravirtualized
+    /// GPU, the only one of arm64 VMs, with up to 8 displays and the host's video hardware; or
+    /// vmware-svga, QEMU's VMware SVGA: one display with no GPU acceleration, in QEMU's own
+    /// window. Without it, a VM runs the default for the macOS its disk holds, saved at its
+    /// first start
     #[arg(long)]
     pub graphics: Option<String>,
     /// x86-64: the system disk's controller: ahci (SATA), or nvme once macOS is installed (an
@@ -452,9 +454,11 @@ pub fn main(cli: Cli) -> Result<i32> {
             yes,
         } => delete(&name, keep_files, yes)?,
         Cmd::Start { name } => {
-            let vm = Registry::load()?.open(&name)?;
-            for w in runtime::warnings(&vm, host)
+            let mut vm = Registry::load()?.open(&name)?;
+            let first = runtime::prepare(&mut vm, &mut |p| println!("{name}: {p}"));
+            for w in first
                 .into_iter()
+                .chain(runtime::warnings(&vm, host))
                 .chain(crate::usb::problems(&vm))
             {
                 eprintln!("warning: {w}");
@@ -471,7 +475,10 @@ pub fn main(cli: Cli) -> Result<i32> {
             let t = timeout.map_or(vm.config.stop_timeout(), vm::stop_timeout);
             runtime::stop(&vm, force, t, |s| println!("{name}: {s}"))?;
         }
-        Cmd::Show { name } => show(&Registry::load()?.open(&name)?, host),
+        Cmd::Show { name } => show(
+            &crate::macos::as_started(&Registry::load()?.open(&name)?),
+            host,
+        ),
         Cmd::Set(a) => set(*a, host)?,
         Cmd::View {
             name,
@@ -490,7 +497,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Command { name, output } => {
-            let vm = Registry::load()?.open(&name)?;
+            let vm = crate::macos::as_started(&Registry::load()?.open(&name)?);
             let script =
                 runtime::invocation_for_print(&vm, host)?.shell_script(&script_comment(&vm));
             match output {
@@ -632,7 +639,7 @@ fn list(json: bool) -> Result<()> {
         "NAME", "STATE", "CPUS", "MEMORY", "DISPLAYS"
     );
     for e in &reg.vms {
-        match Vm::load(&e.dir) {
+        match Vm::load(&e.dir).map(|vm| crate::macos::as_started(&vm)) {
             Ok(vm) => {
                 let c = &vm.config;
                 let state = if runtime::running(&vm) {
@@ -778,6 +785,10 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         println!("{name}: {}", runtime::SET_METAL_ERROR_MODE);
     }
     if a.start {
+        let mut vm = vm;
+        for w in runtime::prepare(&mut vm, &mut |p| println!("{name}: {p}")) {
+            eprintln!("warning: {w}");
+        }
         let pid = runtime::start(&vm, host)?;
         println!("{name}: running, pid {pid}");
     }
@@ -1205,7 +1216,7 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     {
         println!("{}: {w}", vm.name());
     }
-    show(&vm, host);
+    show(&crate::macos::as_started(&vm), host);
     Ok(())
 }
 

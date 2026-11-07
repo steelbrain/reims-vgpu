@@ -336,26 +336,40 @@ fn esp_start(disk: &Disk) -> Result<u64> {
     let mut header = [0u8; SECTOR as usize];
     disk.read(SECTOR, &mut header)?;
     ensure!(&header[..8] == b"EFI PART", "it has no GPT");
+    partitions(disk, &ESP_TYPE)?
+        .into_iter()
+        .next()
+        .context("its GPT has no EFI system partition")
+}
+
+/// Where each partition of type `kind` (its GUID, as GPT stores it) starts, in bytes, in the
+/// GPT's order; none on a disk with no GPT.
+pub(crate) fn partitions(disk: &Disk, kind: &[u8; 16]) -> Result<Vec<u64>> {
+    let mut header = [0u8; SECTOR as usize];
+    disk.read(SECTOR, &mut header)?;
+    if &header[..8] != b"EFI PART" {
+        return Ok(Vec::new());
+    }
     let size = u64::from(le32(&header, 84));
     ensure!((128..=4096).contains(&size), "GPT entries of {size} bytes");
     let count = u64::from(le32(&header, 80).min(128));
     let mut entries = vec![0u8; (count * size) as usize];
     disk.read(le64(&header, 72) * SECTOR, &mut entries)?;
-    entries
+    Ok(entries
         .chunks_exact(size as usize)
-        .find(|e| e[..16] == ESP_TYPE)
+        .filter(|e| e[..16] == *kind)
         .map(|e| le64(e, 32) * SECTOR)
-        .context("its GPT has no EFI system partition")
+        .collect())
 }
 
 /// An image's bytes as the guest sees them.
-enum Disk {
+pub(crate) enum Disk {
     Raw { file: File, size: u64 },
     Qcow2(Qcow2),
 }
 
 impl Disk {
-    fn open(path: &Path, format: ImageFormat) -> Result<Disk> {
+    pub(crate) fn open(path: &Path, format: ImageFormat) -> Result<Disk> {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         Ok(match format {
             ImageFormat::Raw => Disk::Raw {
@@ -366,7 +380,7 @@ impl Disk {
         })
     }
 
-    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+    pub(crate) fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let size = match self {
             Disk::Raw { size, .. } => *size,
             Disk::Qcow2(q) => q.size,
@@ -388,7 +402,7 @@ const QCOW2_OFFSET: u64 = 0x00ff_ffff_ffff_fe00;
 
 /// A qcow2 image (QEMU's docs/interop/qcow2.txt) with no backing file: each guest cluster
 /// found through the L1 and L2 tables, unallocated and zero clusters reading as zeros.
-struct Qcow2 {
+pub(crate) struct Qcow2 {
     file: File,
     cluster_bits: u32,
     size: u64,
@@ -401,6 +415,16 @@ impl Qcow2 {
         file.read_exact_at(&mut h, 0)?;
         ensure!(&h[..4] == b"QFI\xfb", "not a qcow2 image");
         ensure!(be64(&h, 8) == 0, "a qcow2 image with a backing file");
+        // Version 3's incompatible features: an external data file (bit 2) or extended L2
+        // entries (bit 4) lay the clusters out otherwise.
+        if be32(&h, 4) >= 3 {
+            let mut f = [0u8; 8];
+            file.read_exact_at(&mut f, 72)?;
+            ensure!(
+                u64::from_be_bytes(f) & (1 << 2 | 1 << 4) == 0,
+                "a qcow2 image with an external data file or extended L2 entries"
+            );
+        }
         let cluster_bits = be32(&h, 20);
         ensure!(
             (9..=21).contains(&cluster_bits),
@@ -595,15 +619,15 @@ fn entries(bytes: &[u8]) -> Vec<Entry> {
     out
 }
 
-fn le16(b: &[u8], o: usize) -> u16 {
+pub(crate) fn le16(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
 
-fn le32(b: &[u8], o: usize) -> u32 {
+pub(crate) fn le32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
-fn le64(b: &[u8], o: usize) -> u64 {
+pub(crate) fn le64(b: &[u8], o: usize) -> u64 {
     u64::from(le32(b, o)) | u64::from(le32(b, o + 4)) << 32
 }
 

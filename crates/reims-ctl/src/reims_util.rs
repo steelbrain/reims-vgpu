@@ -164,6 +164,8 @@ pub struct Installer {
     /// Its macOS's version: the macOS's number ("26") for an online installer, the release
     /// ("26.6.2") for an offline one.
     pub version: String,
+    /// An offline installer's build ("25G83"); none for an online one.
+    pub build: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +183,8 @@ struct OfflineResult {
 #[derive(Deserialize)]
 struct OfflineRelease {
     version: String,
+    #[serde(default)]
+    build: Option<String>,
 }
 
 /// Downloads `d`'s installer into the installers directory, or continues its download, or
@@ -210,12 +214,14 @@ pub fn installer(d: &Download, progress: &mut dyn FnMut(&str)) -> Result<Install
         Installer {
             image: o.image,
             version: o.installer.version,
+            build: o.installer.build.filter(|b| !b.trim().is_empty()),
         }
     } else {
         let o: OnlineResult = serde_json::from_value(r).context("read reims-util's result")?;
         Installer {
             image: o.image,
             version: o.title.rsplit(' ').next().unwrap_or_default().to_string(),
+            build: None,
         }
     })
 }

@@ -983,11 +983,17 @@ impl App {
         // What runtime::warnings finds shows in the VM's details, not here.
         let host = self.host;
         self.spawn(&vm.config.name.clone(), "starting", move |_| {
+            // What the start did to its settings first, and why, follows the start's line.
+            let mut vm = vm;
+            let mut said = Vec::new();
+            let warned = runtime::prepare(&mut vm, &mut |s| said.push(s.to_string()));
             let pid = runtime::start(&vm, host)?;
-            Ok(format!(
-                "{}: running (pid {pid}); its window is open",
-                vm.name()
-            ))
+            let mut s = format!("{}: running (pid {pid}); its window is open", vm.name());
+            for n in said.iter().chain(&warned) {
+                s.push_str("; ");
+                s.push_str(n);
+            }
+            Ok(s)
         });
     }
 
@@ -1867,8 +1873,15 @@ impl App {
             }
             None => bail!("this host runs no VMs"),
         }
+        // The default, as the form offers it, is none given: the VM runs the device for its
+        // macOS (macos.rs), the default where its macOS runs it.
         if f.is_shown("graphics") {
-            s.graphics = Some(Graphics::parse(&f.choice("graphics"))?);
+            let g = Graphics::parse(&f.choice("graphics"))?;
+            s.graphics = self
+                .host
+                .default_profile()
+                .is_none_or(|p| g != Graphics::default_for(p))
+                .then_some(g);
         }
         // Hidden on reims-vgpu, whose one display follows its window: the defaults, which it
         // honors.
@@ -2408,8 +2421,13 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     let c = &mut vm.config;
     c.cpus = f.text("cpus").parse().context("CPU cores: a number")?;
     c.memory_mib = parse_size_mib(&f.text("memory")).context("memory")?;
+    // A VM whose settings name no graphics keeps none where the choice stays the default it
+    // runs, which its first start may decide from its macOS (macos.rs).
     if f.is_shown("graphics") {
-        c.graphics = Some(Graphics::parse(&f.choice("graphics"))?);
+        let g = Graphics::parse(&f.choice("graphics"))?;
+        if c.graphics.is_some() || g != c.graphics() {
+            c.graphics = Some(g);
+        }
     }
     if f.is_shown("disk_controller")
         && let Some(q) = &mut c.q35
@@ -2562,7 +2580,8 @@ fn copy_to_clipboard(s: &str) -> Option<&'static str> {
 
 const HELP: &str = "\
 reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in windows of their own.
-An x86-64 VM runs reims-vgpu's own GPU device unless its settings choose another (e, graphics).
+An x86-64 VM runs reims-vgpu's own GPU device on macOS 26.4 and later, and apple-gfx on an older
+macOS, unless its settings choose another (e, graphics).
 
   ↑ ↓ / j k   choose a VM, or click it
   Enter       open its menu: what can be done with it now, each with its key. A right
@@ -3270,8 +3289,8 @@ mod tests {
     }
 
     /// An x86-64 VM whose settings name no graphics is on reims-vgpu, whose edit form shows
-    /// borderless alone of the displays' settings, which stay as they were for apple-gfx;
-    /// choosing apple-gfx shows them, and saves it by name.
+    /// borderless alone of the displays' settings, which stay as they were for apple-gfx; saved
+    /// as it is, it still names none, and choosing apple-gfx shows them, and saves it by name.
     #[test]
     fn the_edit_form_shows_reims_vgpu_its_display_settings_alone() {
         let mut row = vm_row("t", true);
@@ -3288,7 +3307,7 @@ mod tests {
         assert!(form(&app).is_shown("borderless"));
         let mut vm = app.rows[0].vm.as_ref().unwrap().clone();
         apply_edit(&mut vm, form(&app), None).unwrap();
-        assert_eq!(vm.config.graphics, Some(Graphics::ReimsVgpu));
+        assert_eq!(vm.config.graphics, None);
         assert_eq!(
             (vm.config.display.count, vm.config.display.hidpi),
             (3, true)

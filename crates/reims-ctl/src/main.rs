@@ -9,6 +9,7 @@ mod gpu;
 mod host;
 mod install;
 mod logs;
+mod macos;
 mod opencore;
 mod paths;
 mod prebuilt;

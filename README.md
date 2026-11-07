@@ -80,7 +80,8 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    its Mac identity. `--installer` takes an installer of your own.
 
 3. **On apple-gfx, set Metal's error mode in the guest**, once. A VM on reims-vgpu's own device,
-   the default, doesn't need it: skip this step. On apple-gfx (`--graphics apple-gfx`), macOS's
+   the default for macOS 26.4 and later, doesn't need it: skip this step. An older macOS runs on
+   apple-gfx, which reims-ctl picks for it. On apple-gfx (`--graphics apple-gfx`), macOS's
    icon service crashes as soon as it starts without it, and a fresh install never gets a working
    desktop: either it stays on its wallpaper with no menu bar and no Dock, or it comes up gray,
    with a menu bar but no Dock. Since you can't count on a desktop yet, you set it from macOS
@@ -198,7 +199,7 @@ set. [docs/api.md](docs/api.md) section 2 lists every setting and variable,
 
 | Pathway | Host | Guest | QEMU machine and device | Platform | Run with |
 |---|---|---|---|---|---|
-| **x86-64 macOS / Linux Vulkan** | x86-64 Linux (KVM) | x86-64 macOS | `q35` through OpenCore, PCI `reims-graphics-pci` with its option ROM and reims-vgpu's own macOS drivers (reims-ctl's default), or `apple-gfx-pci` (`106b:eeee`) | **Vulkan** through metal2vulkan | `reims-ctl` |
+| **x86-64 macOS / Linux Vulkan** | x86-64 Linux (KVM) | x86-64 macOS | `q35` through OpenCore, PCI `reims-graphics-pci` with its option ROM and reims-vgpu's own macOS drivers (reims-ctl's default on macOS 26.4 and later), or `apple-gfx-pci` (`106b:eeee`) | **Vulkan** through metal2vulkan | `reims-ctl` |
 | **arm64 macOS / macOS Metal** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Metal** | `reims-ctl`, or `make vm` |
 | **arm64 macOS / macOS Vulkan** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Vulkan** through metal2vulkan, on MoltenVK | `reims-ctl`, installed with `GPU_ARM=vulkan scripts/install-ctl.sh` |
 
