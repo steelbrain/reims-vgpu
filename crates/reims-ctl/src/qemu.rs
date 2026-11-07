@@ -73,6 +73,14 @@
 //! M2 scaler device"). A VM whose settings turn video acceleration off (`video_acceleration =
 //! false`) has neither, and its guest decodes, encodes and scales video in software.
 //!
+//! The xHCI controller has seven ports (`p2=7,p3=7`), each taking a USB 2 and a USB 3 device:
+//! the keyboard, the tablet, and four more at their own speeds. Its 14 ports are within the 15
+//! macOS numbers on one controller. QEMU's default of four leaves two beside the keyboard and
+//! the tablet, and where a device takes the last free port QEMU chains a full-speed hub there
+//! first (hw/usb/bus.c, `usb_claim_port`), on which a high-speed device does not attach: one
+//! more device at its own speed. With as many USB 2 ports as USB 3 ones no port is USB 2
+//! alone: QEMU gives a device the first free port, and one freed goes to the back of the line.
+//!
 //! `vmapple-arm64` follows scripts/internal/run_vmapple.sh, with the video devices besides.
 
 use crate::host::{Host, Os, Profile};
@@ -343,7 +351,7 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     }
     push(&[
         "-device",
-        "qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on",
+        "qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on,p2=7,p3=7",
     ]);
     push(&[
         "-device",
@@ -657,7 +665,7 @@ mod tests {
             ],
             &[
                 "-device",
-                "qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on",
+                "qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on,p2=7,p3=7",
             ],
             &["-audiodev", "pipewire,id=snd0"],
             &[
