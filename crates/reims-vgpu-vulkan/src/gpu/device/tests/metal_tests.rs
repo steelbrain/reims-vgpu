@@ -3448,10 +3448,6 @@ fn a_texture_over_a_surface_reads_another_ones_writes_as_metals() {
 /// pages (`copied-host-pages`): the texture read must still see the other's writes, as Metal's
 /// does
 #[test]
-#[ignore = "metal2vulkan cd511955f7 makes each buffer over the same bytes a copy of its own, \
-            joined to no other, so a write through one texture reaches the other's copy only \
-            after its command buffer completed and the next commit; ledger: TRANSIENT WRONG \
-            FRAMES PAST THE GATE ON NVIDIA"]
 fn a_texture_over_a_copied_surface_reads_another_ones_writes_as_metals() {
     use crate::os::tests::{bgra_surface_over_at, free};
     let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
