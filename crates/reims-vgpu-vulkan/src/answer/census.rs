@@ -18,8 +18,18 @@
 //!
 //! The record is written as JSON to `<dir>/census-<pid>.json` (through a temporary file renamed
 //! over it), by the library's thread `reims-vgpu.census`: when a kind or a selector is first met,
-//! every 30 seconds while counts change, and at the process's exit (`atexit`). A failed write is
-//! logged once and tried again at the next.
+//! and every 30 seconds while counts change; and by an exit handler (`atexit`, registered as the
+//! writer starts, at the first record) as the process exits. A failed write is logged once and
+//! tried again at the next.
+//!
+//! The exit's write is skipped where the runtime's exit guard ends the process at once. On Linux
+//! with the GNU C library, an exit while the Vulkan driver runs the runtime's work (another
+//! thread's call, a pipeline's making, a CPU device's commands) ends in the guard's exit handler,
+//! with `_exit`, and one line on stderr saying so; the exit handlers registered before the guard's
+//! last registration do not run. The runtime registers that handler again after later calls of its
+//! own, so where one of those came after this handler's registration, the census is not written
+//! at the exit. The file then holds the writer's last write: its counts up to 30 seconds old, and
+//! without a kind or a selector first met in the moments before the exit.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Once, OnceLock};
@@ -261,7 +271,7 @@ unsafe extern "C" {
     fn atexit(f: extern "C" fn()) -> i32;
 }
 
-/// The write at the process's exit.
+/// The write at the process's exit, where the exit runs it (the module docs).
 extern "C" fn at_exit() {
     if let Some(dir) = dir() {
         write_if_dirty(dir);
