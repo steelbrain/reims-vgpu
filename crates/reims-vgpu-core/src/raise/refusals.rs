@@ -138,10 +138,13 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
 /// "Panics"), where a panic is a test's failure.
 fn panics_refused() -> bool {
     #[cfg(any(test, feature = "testkit"))]
-    if crate::testkit::capture::capture_enabled() {
-        return false;
+    {
+        !crate::testkit::capture::capture_enabled()
     }
-    true
+    #[cfg(not(any(test, feature = "testkit")))]
+    {
+        true
+    }
 }
 
 /// The panic hook's question (architecture 6.5): whether the panic on this thread now is a
