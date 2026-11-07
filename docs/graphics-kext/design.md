@@ -1017,8 +1017,13 @@ messages change, and only for messages published before it
   `BLOCK_RELEASE` waits for its block's lane: each reads the view or device
   cache the block's lane makes and copies;
 - a `SURFACE_PAGES` waits for its context's lane only through the last message
-  of those four kinds that names its block; a `SURFACE_DOWNLOAD` waits for no
-  other lane, as on the control thread before.
+  of those four kinds that names its block, and for each lane through its last
+  `BLOCK_RELEASE` of a block described cached whose runs share a page with its
+  own: the release copies that block's device cache into the pages, and the
+  kext makes a surface's new block over them once it has waited 10 s for the
+  release's answer, when a slow message on the release's lane may still hold
+  it; a `SURFACE_DOWNLOAD` waits for no other lane, as on the control thread
+  before.
 
 `reims_graphics`'s `device::lanes` lists every message that names a block or
 its pages by offset, and what orders each against the block's lane.

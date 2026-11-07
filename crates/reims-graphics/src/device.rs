@@ -1564,9 +1564,11 @@ impl Shared {
     /// none waits for a lane. Where no thread can be started, the lane's jobs are carried out
     /// here.
     fn hand(&self, key: Key, message: Message, through: u64, epoch: u64) {
-        let hand = self.lanes.hand(key, message, through, epoch, |surface| {
-            self.host.surface_textures(surface)
-        });
+        let hand = self
+            .lanes
+            .hand(key, message, through, epoch, &self.region, |surface| {
+                self.host.surface_textures(surface)
+            });
         let Hand::Start(index) = hand else {
             return;
         };
@@ -1761,23 +1763,7 @@ impl Shared {
         seqno: u64,
         epoch: u64,
     ) -> Option<u32> {
-        let end = self.region.size().saturating_sub(RGFX_CURSOR_SPAN);
-        let block_end = pages.block_offset.checked_add(pages.block_size);
-        let runs_bytes = u64::from(pages.run_count) * size_of::<RgfxPageRun>() as u64;
-        let runs_end = pages.runs_offset.checked_add(runs_bytes);
-        let fits = pages.block_offset >= RGFX_CONTEXT_ALLOCATIONS_OFFSET
-            && block_end.is_some_and(|e| e <= end)
-            && pages.runs_offset >= pages.block_offset
-            && pages.runs_offset.is_multiple_of(8)
-            && runs_end.zip(block_end).is_some_and(|(r, b)| r <= b);
-        let runs = if fits {
-            usize::try_from(runs_bytes)
-                .ok()
-                .and_then(|len| self.region.read(pages.runs_offset, len))
-        } else {
-            None
-        };
-        let Some(bytes) = runs else {
+        let Some(runs) = page_runs(&self.region, pages) else {
             log::warn!(
                 target: "reims_graphics",
                 "a SURFACE_PAGES of {} runs at {:#x} for the block of {:#x} bytes at {:#x} lies \
@@ -1786,12 +1772,6 @@ impl Shared {
             );
             return Some(RGFX_STATUS_INVALID_ARGUMENT);
         };
-        let runs = bytes
-            .as_chunks::<{ size_of::<RgfxPageRun>() }>()
-            .0
-            .iter()
-            .filter_map(|run| RgfxPageRun::read_from_bytes(run).ok())
-            .collect();
         (self.host).surface_pages(pages, runs, flags, self.complete_answer(seqno, epoch));
         None
     }
@@ -2648,6 +2628,31 @@ impl RefreshGrid {
         self.last = tick;
         tick
     }
+}
+
+/// The runs a `SURFACE_PAGES` lists, read out of its block in `region`, where the block lies in
+/// the processes' blocks and its runs, whole, in the block; else `None`.
+fn page_runs(region: &Region, pages: &RgfxSurfacePages) -> Option<Vec<RgfxPageRun>> {
+    let end = region.size().saturating_sub(RGFX_CURSOR_SPAN);
+    let block_end = pages.block_offset.checked_add(pages.block_size);
+    let runs_bytes = u64::from(pages.run_count) * size_of::<RgfxPageRun>() as u64;
+    let runs_end = pages.runs_offset.checked_add(runs_bytes);
+    let fits = pages.block_offset >= RGFX_CONTEXT_ALLOCATIONS_OFFSET
+        && block_end.is_some_and(|e| e <= end)
+        && pages.runs_offset >= pages.block_offset
+        && pages.runs_offset.is_multiple_of(8)
+        && runs_end.zip(block_end).is_some_and(|(r, b)| r <= b);
+    if !fits {
+        return None;
+    }
+    let bytes = region.read(pages.runs_offset, usize::try_from(runs_bytes).ok()?)?;
+    let runs = bytes
+        .as_chunks::<{ size_of::<RgfxPageRun>() }>()
+        .0
+        .iter()
+        .filter_map(|run| RgfxPageRun::read_from_bytes(run).ok())
+        .collect();
+    Some(runs)
 }
 
 /// A completion ring locked: waiting for it where `wait`, else only where no other thread holds

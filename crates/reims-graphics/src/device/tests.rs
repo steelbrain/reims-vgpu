@@ -4347,6 +4347,91 @@ fn a_block_s_pages_wait_for_what_their_context_made_over_the_block_before() {
     );
 }
 
+/// A `SURFACE_PAGES` of `block`, of 0x2000 bytes, for `context`, with `flags`, listing `runs`,
+/// which it writes into the block's second page in `rig`'s region.
+fn pages_over(rig: &Rig, context: u32, block: u64, runs: &[RgfxPageRun], flags: u32) -> Vec<u8> {
+    rig.region().write(block + 0x1000, runs.as_bytes());
+    let mut bytes = surface_pages_message(context, block, flags);
+    let mut pages = RgfxSurfacePages::read_from_prefix(&bytes).unwrap().0;
+    pages.run_count = runs.len() as u32;
+    pages.block_size = 0x2000;
+    pages.runs_offset = block + 0x1000;
+    pages.length = runs.iter().map(|run| run.length).sum();
+    bytes[..size_of::<RgfxSurfacePages>()].copy_from_slice(pages.as_bytes());
+    bytes
+}
+
+/// A block's `SURFACE_PAGES` waits for a cached block's `BLOCK_RELEASE` published before it over
+/// a page of its own, which its context's lane is still behind, whichever context's lane it is:
+/// the release copies the cache into the pages, and the kext makes a surface's new block over
+/// them once it has waited 10 s for the release's answer. Not for the release of a block over
+/// other pages, nor of one never described cached, which copies nothing.
+#[test]
+fn a_block_s_pages_wait_for_a_cached_block_s_release_over_their_pages() {
+    const OWNER: u32 = 6;
+    const MAKER: u32 = 5;
+    const OLD: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x20_0000;
+    const PLAIN: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x30_0000;
+    const NEW: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x40_0000;
+    const ELSEWHERE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x50_0000;
+    let run = |address: u64, length: u64| RgfxPageRun { address, length };
+    let seen = OrderSeen::new();
+    let mut rig = seen.rig();
+    let old_runs = [run(0x10_0000, 0x2000), run(0x20_0000, 0x1000)];
+    let old = rig.send(pages_over(
+        &rig,
+        OWNER,
+        OLD,
+        &old_runs,
+        RGFX_SURFACE_PAGES_CACHED,
+    ));
+    assert_eq!(rig.complete(), (old, RGFX_STATUS_OK));
+    let plain = rig.send(pages_over(&rig, OWNER, PLAIN, &[run(0x30_0000, 0x1000)], 0));
+    assert_eq!(rig.complete(), (plain, RGFX_STATUS_OK));
+    seen.hold(&mut rig, OWNER);
+    let released = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, OWNER, OLD, 0x2000));
+    let plain_released = rig.send(block_message(RGFX_CMD_BLOCK_RELEASE, OWNER, PLAIN, 0x2000));
+    // Over the old block's last page, uncached, for another context: the kext's new block of the
+    // surface past its wait.
+    let new_runs = [run(0x40_0000, 0x1000), run(0x20_0000, 0x1000)];
+    let new = rig.send(pages_over(&rig, MAKER, NEW, &new_runs, 0));
+    // Over the page right past the old block's first run, and the uncached block's page.
+    let other_runs = [run(0x30_0000, 0x1000), run(0x10_2000, 0x1000)];
+    let elsewhere = rig.send(pages_over(&rig, MAKER, ELSEWHERE, &other_runs, 0));
+    assert_eq!(rig.complete(), (elsewhere, RGFX_STATUS_OK));
+    settle();
+    assert_eq!(
+        seen.types(),
+        [
+            RGFX_CMD_SURFACE_PAGES,
+            RGFX_CMD_SURFACE_PAGES,
+            RGFX_CMD_BUFFER_CREATE,
+            RGFX_CMD_SURFACE_PAGES
+        ],
+        "the new block's pages overtook the release of the cached block over them"
+    );
+    seen.release();
+    let mut answered = [rig.complete(), rig.complete(), rig.complete()];
+    answered.sort_unstable();
+    assert_eq!(
+        answered,
+        [
+            (released, RGFX_STATUS_OK),
+            (plain_released, RGFX_STATUS_OK),
+            (new, RGFX_STATUS_OK)
+        ]
+    );
+    // The old block's release is the owner's first; the release of the uncached block may come
+    // before or after the new block's pages.
+    let types = seen.types();
+    let first_release = types.iter().position(|&t| t == RGFX_CMD_BLOCK_RELEASE);
+    let new_pages = types.iter().rposition(|&t| t == RGFX_CMD_SURFACE_PAGES);
+    assert!(
+        first_release.zip(new_pages).is_some_and(|(r, p)| r < p) && types.len() == 7,
+        "the new block's pages went before the release over them: {types:x?}"
+    );
+}
+
 /// A shared block's release waits for the lanes of its holders also where the kext hands the
 /// block's pages over after the shares: the pages leave the block's holders as they are.
 #[test]

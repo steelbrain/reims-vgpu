@@ -49,7 +49,18 @@
 //!   block's lane makes and copies (below);
 //! - a `SURFACE_PAGES` of a block for context `c`, for `c`'s lane through its last message of
 //!   those four kinds that names the block: a block described again is described after what was
-//!   made over it before.
+//!   made over it before;
+//! - a `SURFACE_PAGES` that lists runs, for each context's lane through its last `BLOCK_RELEASE`
+//!   not yet carried out of a block described cached ([`RGFX_SURFACE_PAGES_CACHED`]) whose runs
+//!   share a page with its own: the release copies that block's device cache into the pages,
+//!   and the host's `SURFACE_PAGES` waits for that copy only once the release has asked for it.
+//!   The kext makes a surface's new block over the same pages once it has waited 10 s for the
+//!   release's answer (its `kRgfxWriteBackWaitMs`), and a release behind a slow message on its
+//!   context's lane is not carried out by then. The lanes keep each block's last `SURFACE_PAGES`
+//!   marked cached, where its runs lie, until a `SURFACE_PAGES` of a block over its span (the
+//!   kext gives a block's span out again only once its release is answered OK), and read both
+//!   blocks' runs out of the region as the new one is handed: a block's runs stay in the block
+//!   until then.
 //!
 //! **What names a block.** Every message that names a region block, or the pages it describes, by
 //! its offset, and what orders it against the block's lane:
@@ -107,7 +118,7 @@
 //! **A reset** drops every job not yet begun ([`Lanes::reset`]); one begun carries on, and the
 //! control thread tells the host of the reset only once it has ended ([`Lanes::wait_begun`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
@@ -117,6 +128,7 @@ use super::backlog::{Whose, whose};
 #[cfg(doc)]
 use crate::keep::KEEP;
 use crate::keep::Keep;
+use crate::region::Region;
 use crate::ring::Message;
 use crate::wire::*;
 
@@ -280,6 +292,11 @@ struct State {
     /// The jobs on the blocks' lanes not yet carried out that a context's command buffers wait
     /// for (its `SURFACE_PAGES`), by context, then ring 0's count through each, then block.
     pending: BTreeSet<(u32, u64, u64)>,
+    /// Each block's last `SURFACE_PAGES` marked cached that listed runs, by the block's offset,
+    /// until a `SURFACE_PAGES` of a block over its span (the module doc): what a `SURFACE_PAGES`
+    /// over the same pages waits for the block's `BLOCK_RELEASE` by. Their blocks' spans never
+    /// meet.
+    cached: BTreeMap<u64, RgfxSurfacePages>,
     /// The lanes whose thread waits for other lanes to carry out the jobs its first job waits
     /// for: each is woken once they have ([`Lanes::finished`]).
     blocked: HashSet<Key>,
@@ -377,18 +394,20 @@ impl State {
     }
 
     /// The edges a job `note` of the lane `key` is handed with (the module doc), and what the
-    /// lanes keep of it. `surface_textures` answers the objects the host names a surface by.
+    /// lanes keep of it. `surface_textures` answers the objects the host names a surface by; a
+    /// `SURFACE_PAGES`'s runs are read out of `region`.
     fn edges(
         &mut self,
         key: Key,
         message: &Message,
         note: &Note,
+        region: &Region,
         surface_textures: impl FnOnce(u32) -> Vec<u64>,
     ) -> Vec<(Key, u64)> {
         let context = match key {
             Key::Context(context) => context,
             Key::Presents => return self.present_edges(message, surface_textures),
-            Key::Block(block) => return self.block_edges(block, note),
+            Key::Block(block) => return self.block_edges(block, message, note, region),
         };
         let mut edges = Vec::new();
         if self.seen.insert(context) {
@@ -471,16 +490,24 @@ impl State {
         edges
     }
 
-    /// The edges of a job `note` of block `block`'s lane (the module doc): a `SURFACE_PAGES` for
-    /// context `c` waits for `c`'s lane through its last message not yet carried out that names
-    /// the block; a `SURFACE_DOWNLOAD` waits for no other lane.
-    fn block_edges(&self, block: u64, note: &Note) -> Vec<(Key, u64)> {
+    /// The edges of a job `note`, `message`, of block `block`'s lane (the module doc): a
+    /// `SURFACE_PAGES` for context `c` waits for `c`'s lane through its last message not yet
+    /// carried out that names the block, and for each lane through its last release not yet
+    /// carried out of a cached block over the same pages ([`Self::releases_over`]); a
+    /// `SURFACE_DOWNLOAD` waits for no other lane.
+    fn block_edges(
+        &mut self,
+        block: u64,
+        message: &Message,
+        note: &Note,
+        region: &Region,
+    ) -> Vec<(Key, u64)> {
         let (RGFX_CMD_SURFACE_PAGES, Some(context)) = (note.r#type, note.context) else {
             return Vec::new();
         };
         let lane = Key::Context(context);
         let epoch = self.epoch;
-        (self.lanes.get(&lane))
+        let mut edges: Vec<(Key, u64)> = (self.lanes.get(&lane))
             .and_then(|l| {
                 (l.unfinished(epoch))
                     .filter(|n| n.block == Some(block))
@@ -489,7 +516,67 @@ impl State {
             })
             .map(|through| (lane, through))
             .into_iter()
-            .collect()
+            .collect();
+        if let Some(pages) = read::<RgfxSurfacePages>(message) {
+            edges.extend(self.releases_over(&pages, region));
+            self.keep_cached(pages, message);
+        }
+        edges
+    }
+
+    /// Each context's lane through its last `BLOCK_RELEASE` not yet carried out of a block
+    /// described cached whose runs share a page with those `pages` lists, read out of `region`
+    /// (the module doc).
+    fn releases_over(&self, pages: &RgfxSurfacePages, region: &Region) -> Vec<(Key, u64)> {
+        let epoch = self.epoch;
+        let releases: Vec<(Key, u64, RgfxSurfacePages)> = (self.lanes.iter())
+            .filter(|(key, _)| matches!(key, Key::Context(_)))
+            .flat_map(|(key, lane)| {
+                (lane.unfinished(epoch))
+                    .filter(|n| n.r#type == RGFX_CMD_BLOCK_RELEASE)
+                    .filter_map(|n| Some((*key, n.through, *self.cached.get(&n.block?)?)))
+            })
+            .collect();
+        if releases.is_empty() {
+            return Vec::new();
+        }
+        let Some(runs) = super::page_runs(region, pages).filter(|runs| !runs.is_empty()) else {
+            return Vec::new();
+        };
+        let runs = spans(&runs);
+        let mut edges: HashMap<Key, u64> = HashMap::new();
+        for (key, through, released) in releases {
+            let meets = super::page_runs(region, &released)
+                .is_some_and(|theirs| spans_meet(&spans(&theirs), &runs));
+            if meets {
+                let at = edges.entry(key).or_default();
+                *at = (*at).max(through);
+            }
+        }
+        edges.into_iter().collect()
+    }
+
+    /// Keeps `pages`, the `SURFACE_PAGES` `message`, where it is marked cached and lists runs, in
+    /// place of what the lanes kept of the blocks over its block's span, which went.
+    fn keep_cached(&mut self, pages: RgfxSurfacePages, message: &Message) {
+        let start = pages.block_offset;
+        let end = start.saturating_add(pages.block_size);
+        let gone: Vec<u64> = (self.cached.range(..end))
+            .rev()
+            .take_while(|(_, kept)| kept.block_offset.saturating_add(kept.block_size) > start)
+            .map(|(&offset, _)| offset)
+            .collect();
+        for offset in gone {
+            self.cached.remove(&offset);
+        }
+        let flags = (message
+            .bytes
+            .get(RGFX_SURFACE_PAGES_CACHE_OFFSET as usize..))
+        .and_then(|bytes| RgfxSurfacePagesCache::read_from_prefix(bytes).ok())
+        .map_or(0, |(cache, _)| cache.flags);
+        if flags & RGFX_SURFACE_PAGES_CACHED != 0 && pages.run_count > 0 {
+            self.cached.insert(start, pages);
+        }
     }
 
     /// A `PRESENT_SURFACE`'s edges (the module doc).
@@ -569,14 +656,16 @@ impl Lanes {
 
     /// Hands `message`, ring 0's count through it `through`, taken at reset count `epoch`, to the
     /// lane `key`, with the edges it waits for; `surface_textures` answers the objects the host
-    /// names an IOSurface by, for a present's. Where the lane has no thread, it is given the
-    /// thread that went idle last, or the caller starts one for it.
+    /// names an IOSurface by, for a present's, and a `SURFACE_PAGES`'s runs are read out of
+    /// `region`. Where the lane has no thread, it is given the thread that went idle last, or the
+    /// caller starts one for it.
     pub(super) fn hand(
         &self,
         key: Key,
         message: Message,
         through: u64,
         epoch: u64,
+        region: &Region,
         surface_textures: impl FnOnce(u32) -> Vec<u64>,
     ) -> Hand {
         let mut state = self.state.lock();
@@ -591,7 +680,7 @@ impl Lanes {
             after: Vec::new(),
         };
         let note = Note::of(&job);
-        job.after = state.edges(key, &job.message, &note, surface_textures);
+        job.after = state.edges(key, &job.message, &note, region, surface_textures);
         if let (Key::Block(block), Some(context)) = (key, note.context) {
             state.pending.insert((context, through, block));
         }
@@ -814,7 +903,7 @@ impl Lanes {
     }
 
     /// The device's reset, to reset count `epoch`: every job not yet begun is dropped, and what
-    /// the lanes keep of the guest's contexts, blocks and chunks is forgotten. A job begun goes
+    /// the lanes keep of the guest's contexts, blocks, their pages and chunks is forgotten. A job begun goes
     /// on ([`Self::wait_begun`]).
     pub(super) fn reset(&self, epoch: u64) {
         let mut state = self.state.lock();
@@ -827,6 +916,7 @@ impl Lanes {
         state.chunks.clear();
         state.seen.clear();
         state.pending.clear();
+        state.cached.clear();
         let wakes = state.wakes();
         drop(state);
         for wake in wakes {
@@ -945,4 +1035,38 @@ fn block_of(message: &Message) -> Option<u64> {
 /// `message`'s bytes as `T`, where they are as many.
 fn read<T: FromBytes>(message: &Message) -> Option<T> {
     T::read_from_prefix(&message.bytes).ok().map(|(t, _)| t)
+}
+
+/// The guest physical spans `runs` cover, each `[start, end)`, in order, those that meet or touch
+/// joined.
+fn spans(runs: &[RgfxPageRun]) -> Vec<(u64, u64)> {
+    let mut spans: Vec<(u64, u64)> = (runs.iter())
+        .filter(|run| run.length > 0)
+        .map(|run| (run.address, run.address.saturating_add(run.length)))
+        .collect();
+    spans.sort_unstable();
+    let mut joined: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match joined.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => joined.push((start, end)),
+        }
+    }
+    joined
+}
+
+/// Whether two lists of [`spans`] share a byte.
+fn spans_meet(a: &[(u64, u64)], b: &[(u64, u64)]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while let (Some(&(a0, a1)), Some(&(b0, b1))) = (a.get(i), b.get(j)) {
+        if a0 < b1 && b0 < a1 {
+            return true;
+        }
+        if a1 <= b1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    false
 }

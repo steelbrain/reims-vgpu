@@ -48,7 +48,8 @@
 //!   as at a fill. A download or a release that copies nothing is answered once a copy into the
 //!   pages still in flight lands, and a `SURFACE_PAGES` over pages a release still copies into
 //!   (the kext made a new block of the surface before the release's answer) waits for the copy
-//!   before it is carried out ([`Caches::wait_copies_into`]).
+//!   before it is carried out ([`Caches::wait_copies_into`]), and for the release itself where
+//!   its context's lane has not carried it out yet (`reims_graphics`'s `device::lanes`).
 //! - **Early copy.** A surface the CPU reads back after each GPU write (a decoder's output, or a
 //!   pixel transfer's, that its client locks each frame to read) is copied into its pages as the
 //!   write ends, not at the lock that follows it ([`SurfaceCaches::early_copies`]). Once a
