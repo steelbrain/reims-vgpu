@@ -361,50 +361,8 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
-// OpenGL's functions of its IR (`@32@0:8^v16Q24` and `@40@0:8^v16@24Q32` for each of GL, GL Core
-// and GL ES) and drawables (`@16@0:8`): the device runs no OpenGL.
-- (id<MTLFunction>)newFunctionWithGLIR:(void *)ir functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLIR:(void *)ir
-                     inputsDescription:(id)inputsDescription
-                          functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLCoreIR:(void *)ir functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLCoreIR:(void *)ir
-                         inputsDescription:(id)inputsDescription
-                              functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLESIR:(void *)ir functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLESIR:(void *)ir
-                       inputsDescription:(id)inputsDescription
-                            functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
+// OpenGL's drawables (`@16@0:8`): the device makes none (its functions of GL IR are
+// RgfxMetalDevice+GL.mm's).
 - (id)newGLDrawable
 {
 	RGFX_UNSUPPORTED(kOpenGL);

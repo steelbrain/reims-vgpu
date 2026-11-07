@@ -43,6 +43,7 @@
 #import "RgfxBlockCall.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxFunction.h"
+#import "RgfxGLFunction.h"
 #import "RgfxLibrary.h"
 #import "RgfxMetalError.h"
 #import "RgfxPipelineReflection.h"
@@ -2113,6 +2114,15 @@ static int dies_case(const char *name)
 		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureType3D, one, one, true);
 	if (std::strcmp(name, "view-cube-count") == 0)
 		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureTypeCube, one, NSMakeRange(0, 4), true);
+	// A function of GL IR's encoder, at any buffer index.
+	if (std::strcmp(name, "gl-function-encoder") == 0) {
+		const uint8_t ir[8] = {4, 0, 0, 0, 3, 0, 0, 0};
+		RgfxGLFunction *f = [[RgfxGLFunction alloc] initWithIR:ir
+		                                          functionType:MTLFunctionTypeVertex
+		                                     inputsDescription:nil
+		                                                device:MTLCreateSystemDefaultDevice()];
+		(void)[f newArgumentEncoderWithBufferIndex:0];
+	}
 	if (std::strcmp(name, "function-array-empty") == 0)
 		(void)[RgfxFunctionArrayLibrary libraryOfFunctions:@[] device:nil error:nullptr];
 	// An encoder of tests/air_arguments.metal's every_access at buffer index 5, where it takes
@@ -2181,6 +2191,15 @@ void test_function_encoder_of_no_buffer_ends_the_process()
 	checkDies("encoder-no-buffer",
 	          "-[_MTLFunction newArgumentEncoderWithBufferIndex:reflection:functionReflection:]: "
 	          "failed assertion `bufferIndex 5 does not identify an argument buffer'");
+}
+
+// A function of GL IR's encoder ends the process with Metal's words, as Metal's own function of GL
+// IR does at buffer 0 (measured: macOS 26.7.1, the Intel 630's device).
+void test_gl_function_encoder_ends_the_process()
+{
+	checkDies("gl-function-encoder",
+	          "-[_MTLFunction newArgumentEncoderWithBufferIndex:reflection:functionReflection:]: "
+	          "failed assertion `bufferIndex 0 does not identify an argument buffer'");
 }
 
 // A Memoryless indirect command buffer ends the process, before the host is asked, as on the AMD
@@ -14976,6 +14995,7 @@ int rgfxQueueTimings(int rounds);
 void rgfxCreateTests();
 void rgfxKnownPipelineTests();
 void rgfxIcbTests();
+void rgfxGLTests();
 
 // A block's arguments come from its own signature, and a creation's completion handler is called
 // with the arguments its shape takes: (object, error), or (object, nil reflection, error); a
@@ -15191,6 +15211,8 @@ int main(int argc, char **argv)
 		rgfxCreateTests();        // tests/create_tests.mm
 		rgfxKnownPipelineTests(); // tests/known_pipeline_tests.mm
 		rgfxIcbTests();           // tests/icb_tests.mm
+		rgfxGLTests();            // tests/gl_tests.mm
+		test_gl_function_encoder_ends_the_process();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks);
 	return 0;

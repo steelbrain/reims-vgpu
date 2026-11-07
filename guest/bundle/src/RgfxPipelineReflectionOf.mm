@@ -6,6 +6,7 @@
 #import "RgfxPipelineReflection.h"
 
 #import "RgfxFunction.h"
+#import "RgfxGLFunction.h"
 #import "RgfxLibrary.h"
 
 #include <mutex>
@@ -44,8 +45,11 @@ bool RgfxStageReflectionOf(id<MTLFunction> function, NSString *prefix, const std
 		*why = @"its function's AIR was not read";
 		return false;
 	}
-	return RgfxStageReflectionOfEntry(*module, module->entries[0], [f rgfxConstants], [f rgfxConstantCount], prefix,
-	                                  buffers, out, why);
+	if (!RgfxStageReflectionOfEntry(*module, module->entries[0], [f rgfxConstants], [f rgfxConstantCount], prefix,
+	                                buffers, out, why))
+		return false;
+	out.pluginReturnData = RgfxGLPluginReturnData(function);
+	return true;
 }
 
 id RgfxComputePipelineReflectionOf(id<MTLFunction> kernel, MTLStageInputOutputDescriptor *stageInput,

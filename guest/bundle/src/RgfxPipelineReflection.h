@@ -92,6 +92,7 @@ struct RgfxStageReflection {
 	NSArray *_Nullable bindings = nil; // nil where there are none
 	NSArray *_Nullable builtIns = nil; // nil where there are none
 	uint64_t outputBytes = 0;          // a vertex function's outputs' size
+	NSData *_Nullable pluginReturnData = nil; // a GL shader variant's (RgfxGLPluginReturnData)
 };
 
 // The answers of the entry point `entry` of the module `module` (rgfxReadAirEntries), specialised by

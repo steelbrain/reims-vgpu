@@ -1162,7 +1162,12 @@ id RgfxComputePipelineReflectionMake(const RgfxStageReflection &kernel, NSString
 	}
 	Maker m{c};
 	id r = [[c.compute alloc] init];
+	// A GL shader variant's return data goes where Metal's class keeps one: macOS 26's does
+	// (measured: 26.7.1), macOS 27's has no such instance variable (measured: 27.0.1).
+	const bool keepsReturnData = class_getInstanceVariable(c.compute, "_pluginReturnData") != nullptr;
 	if (r == nil || !m.setObject(r, "_arguments", kernel.bindings) ||
+	    (kernel.pluginReturnData != nil && keepsReturnData &&
+	     !m.setObject(r, "_pluginReturnData", kernel.pluginReturnData)) ||
 	    !m.setObject(r, "_bindings", kernel.bindings ? [NSArray arrayWithArray:kernel.bindings] : nil) ||
 	    !m.setObject(r, "_builtInArguments", kernel.builtIns) || !m.setNumber(r, "_traceBufferIndex", 'I', kNoIndex)) {
 		*why = m.why ?: @"Metal's compute pipeline reflection was not made";
@@ -1185,12 +1190,12 @@ id RgfxRenderPipelineReflectionMake(const RgfxStageReflection *vertex, const Rgf
 	bool ok = r != nil;
 	const struct {
 		const RgfxStageReflection *stage;
-		const char *arguments, *bindings, *builtIns;
+		const char *arguments, *bindings, *builtIns, *pluginReturnData;
 	} kStages[] = {
-	    {vertex, "_vertexArguments", "_vertexBindings", "_vertexBuiltInArguments"},
-	    {fragment, "_fragmentArguments", "_fragmentBindings", nullptr},
-	    {object, "_objectArguments", "_objectBindings", "_objectBuiltInArguments"},
-	    {mesh, "_meshArguments", "_meshBindings", "_meshBuiltInArguments"},
+	    {vertex, "_vertexArguments", "_vertexBindings", "_vertexBuiltInArguments", "_vertexPluginReturnData"},
+	    {fragment, "_fragmentArguments", "_fragmentBindings", nullptr, "_fragmentPluginReturnData"},
+	    {object, "_objectArguments", "_objectBindings", "_objectBuiltInArguments", "_objectPluginReturnData"},
+	    {mesh, "_meshArguments", "_meshBindings", "_meshBuiltInArguments", "_meshPluginReturnData"},
 	};
 	for (const auto &s : kStages) {
 		if (!ok || s.stage == nullptr || s.stage->bindings == nil)
@@ -1201,6 +1206,12 @@ id RgfxRenderPipelineReflectionMake(const RgfxStageReflection *vertex, const Rgf
 	for (const auto &s : kStages) {
 		if (ok && s.stage != nullptr && s.stage->builtIns != nil && s.builtIns != nullptr)
 			ok = m.setObject(r, s.builtIns, s.stage->builtIns);
+	}
+	// A GL shader variant's return data, which Metal's own device answers from its compiler's
+	// run of the GL code generator (measured: macOS 26.7.1, the bytes the generator gives).
+	for (const auto &s : kStages) {
+		if (ok && s.stage != nullptr && s.stage->pluginReturnData != nil)
+			ok = m.setObject(r, s.pluginReturnData, s.stage->pluginReturnData);
 	}
 	const uint64_t stride = vertex != nullptr ? vertex->outputBytes + kPostVertexDumpPadding : 0;
 	ok = ok && m.setNumber(r, "_postVertexDumpStride", 'Q', stride) &&

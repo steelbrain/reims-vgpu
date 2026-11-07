@@ -28,6 +28,7 @@
 %spi-no-dylibs the IOGPU base answers NO, the lane's answer: it makes no dynamic libraries (RGFX_UNSUPPORTED, and supportsDynamicLibraries answers NO), where Metal's devices answer YES
 %spi-no-pipeline-libraries the IOGPU base answers NO, the lane's answer: it makes no pipeline libraries (newPipelineLibraryWithFilePath:error: is RGFX_UNSUPPORTED), where Metal's devices answer YES
 %spi-no-shared-textures the IOGPU base answers NO, the lane's answer: it makes no shared textures or handles (RGFX_UNSUPPORTED), where Metal's devices answer YES
+%gl-function Metal's own function of GL IR answers it, the same for every shader (measured: macOS 26.7.1, the Intel 630's device: the name __main, MTLPatchTypeNone, a control point count of 0, no vertex or stage input attributes, no function constants, no options)
 
 [RgfxArgumentEncoder]
 alignment implemented
@@ -272,6 +273,21 @@ newIntersectionFunctionWithDescriptor:completionHandler: implemented
 newIntersectionFunctionWithDescriptor:error: unsupported ray tracing
 reflectionForFunctionWithName: metal a function array's library reflects no function: both x86 Macs answer nil (measured, tools/oracle/oracle_bundle.m libforms3)
 type metal a function array's library is executable: both x86 Macs answer MTLLibraryTypeExecutable (measured, tools/oracle/oracle_bundle.m libforms2)
+
+[RgfxGLFunction]
+device implemented
+functionConstantsDictionary metal %gl-function
+functionType implemented
+label implemented
+name metal %gl-function
+newArgumentEncoderWithBufferIndex: metal Metal's function of GL IR asserts that the index identifies no argument buffer (measured: macOS 26.7.1, the Intel 630's device), and so does this, with its words
+newArgumentEncoderWithBufferIndex:reflection: metal as newArgumentEncoderWithBufferIndex:, which ends the process
+options metal %gl-function
+patchControlPointCount metal %gl-function
+patchType metal %gl-function
+setLabel: implemented
+stageInputAttributes metal %gl-function
+vertexAttributes metal %gl-function
 
 [RgfxHeap]
 allocatedSize implemented
@@ -601,12 +617,12 @@ newDynamicLibraryWithURL:options:error: unsupported dynamic libraries
 newEvent implemented
 newEventWithOptions: implemented
 newFence implemented
-newFunctionWithGLCoreIR:functionType: unsupported OpenGL
-newFunctionWithGLCoreIR:inputsDescription:functionType: unsupported OpenGL
-newFunctionWithGLESIR:functionType: unsupported OpenGL
-newFunctionWithGLESIR:inputsDescription:functionType: unsupported OpenGL
-newFunctionWithGLIR:functionType: unsupported OpenGL
-newFunctionWithGLIR:inputsDescription:functionType: unsupported OpenGL
+newFunctionWithGLCoreIR:functionType: implemented
+newFunctionWithGLCoreIR:inputsDescription:functionType: implemented
+newFunctionWithGLESIR:functionType: implemented
+newFunctionWithGLESIR:inputsDescription:functionType: implemented
+newFunctionWithGLIR:functionType: implemented
+newFunctionWithGLIR:inputsDescription:functionType: implemented
 newGLDrawable unsupported OpenGL
 newHeapWithDescriptor: implemented
 newIOCommandQueueWithDescriptor:error: partial Metal IO command queues
