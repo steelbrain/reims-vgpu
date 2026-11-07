@@ -4,8 +4,8 @@
 # that holds the most of its memory run first, each with nothing else in flight; the longest
 # tests start next, so the run does not end on one that began late. Why, and what these tests
 # did to the others before, is in docs/lessons.md ("Tools and worktrees", and "The platform and
-# the runtime" for Metal's compiles). Every override but the last two is the Mac's alone; on
-# Linux only the last two apply, and nextest runs the other tests in its own order. A filter that
+# the runtime" for Metal's compiles). Every override but the last three is the Mac's alone; on
+# Linux only the last three apply, and nextest runs the other tests in its own order. A filter that
 # names a package or binary the workspace no longer has fails every nextest run, so a rename
 # updates this file too.
 
@@ -77,4 +77,15 @@ priority = 50
 [[profile.default.overrides]]
 platform = 'cfg(target_os = "linux")'
 filter = 'binary_id(reims-vgpu-vulkan) & test(/^gpu::paging_discard::/)'
+threads-required = "num-test-threads"
+
+# The VA-API backend's tests of the GPU held (`va::spin`, `va::wait::gpu`, `va::wait::held`),
+# opt-in (`#[ignore]`) and run on the VA-API host with `--run-ignored only`, each alone. Each
+# holds the GPU's ring with a spin of its own and times the display's calls against it, so a
+# test made beside another's spin waits for that spin too: run together (nextest's default),
+# jpeg_conversions_then_copies_out_do_not_wait_for_a_held_graphics_ring failed 1 of 1 on the
+# Radeon 780M, then passed 6 of 6 alone (jobs m3-max-4299, m3-max-4303, 2026-11-07).
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = 'binary_id(reims-vgpu-video-vaapi) & test(/^va::(spin|wait::(gpu|held))::/)'
 threads-required = "num-test-threads"
