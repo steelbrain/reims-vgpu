@@ -352,7 +352,8 @@ pub struct CreateArgs {
     #[arg(long)]
     pub resolution: Option<String>,
     /// apple-gfx: run the mode HiDPI (3840x2160 looks like 1920x1080); on reims-vgpu the guest
-    /// runs HiDPI of its own accord in a window at least 2880 pixels wide
+    /// starts HiDPI by itself in a window at least 3840 pixels wide, and offers it in its
+    /// Displays settings from 2880
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub hidpi: Option<bool>,
     /// Borderless windows that fill their screens
@@ -410,8 +411,8 @@ pub struct SetArgs {
     /// in the desktop's points
     #[arg(long)]
     pub resolution: Option<String>,
-    /// apple-gfx (on reims-vgpu the guest runs HiDPI of its own accord, in a window at least
-    /// 2880 pixels wide)
+    /// apple-gfx (on reims-vgpu the guest starts HiDPI by itself in a window at least 3840
+    /// pixels wide, and offers it in its Displays settings from 2880)
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub hidpi: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]

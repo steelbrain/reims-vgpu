@@ -185,10 +185,11 @@ impl Graphics {
 /// Refuses a display setting reims-vgpu's device does not honor, each given for a VM on it:
 /// the device has one display, whose window opens at the resolution's size
 /// ([`Display::window_size`]) and keeps the size the person gives it, which the guest follows,
-/// at the refresh rate of the host screen it is on; the guest runs a HiDPI desktop of its own
-/// accord at a window at least 2880 pixels wide (the kext's EDID density). A refresh of 0 is
-/// none, as `set` takes it. Settings saved for apple-gfx are not given: they stay for it, and
-/// of them reims-vgpu takes the resolution alone, as its window's first size.
+/// at the refresh rate of the host screen it is on; the guest starts a HiDPI desktop by itself
+/// in a window at least 3840 pixels wide, and offers one in its Displays settings from 2880 (the
+/// kext's HiDPI modes, whose pixels halve exactly; a window of an odd size runs 1x). A refresh
+/// of 0 is none, as `set` takes it. Settings saved for apple-gfx are not given: they stay for
+/// it, and of them reims-vgpu takes the resolution alone, as its window's first size.
 pub fn check_reims_vgpu_display(
     count: Option<u32>,
     resolution: Option<&str>,
@@ -211,8 +212,9 @@ pub fn check_reims_vgpu_display(
     }
     if hidpi == Some(true) {
         bail!(
-            "on reims-vgpu the guest runs HiDPI of its own accord, in a window at least 2880 \
-             pixels wide: turn HiDPI off, or {APPLE}"
+            "on reims-vgpu the guest picks HiDPI itself (it starts HiDPI in a window at least \
+             3840 pixels wide, and offers it in its Displays settings from 2880): turn HiDPI \
+             off, or {APPLE}"
         );
     }
     if let Some(r) = refresh.filter(|&r| r != 0) {
