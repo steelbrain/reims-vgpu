@@ -16,6 +16,13 @@
 //! that, presenting the same Mac ([`crate::opencore::renew`]), the old one kept beside it as
 //! `<image>.pre-migration-1`. A VM whose settings name graphics had them set by its user, or by
 //! a reims-ctl that knew of the device, and keeps them.
+//!
+//! Migration 2 is for the x86-64 VMs whose OpenCore image still loads the ported drivers
+//! ([`PORTED`]), whatever graphics their settings name: an image reims-util made before
+//! reims-ctl's graphics option, which migration 1 left be where the VM's settings named graphics.
+//! Each image is made again for the graphics the VM has, presenting the same Mac, the old one
+//! kept as `<image>.pre-migration-2`; one whose settings name no graphics is migration 1's case,
+//! and gets its plan.
 
 use crate::macos::{self, Macos};
 use crate::opencore::{self, Config};
@@ -28,7 +35,19 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// The migrations this reims-ctl carries: 1 to this.
-pub const CURRENT: u32 = 1;
+pub const CURRENT: u32 = 2;
+
+/// The ported drivers older OpenCore images load, by bundle name: the seven kexts that run Apple's
+/// arm64 GPU driver on x86-64, which reims-util carried until its fe9bfe1 (reims_util::REV).
+const PORTED: [&str; 7] = [
+    "AppleParavirtGPULoader.kext",
+    "IOGPUFamilyBridge.kext",
+    "IOGraphicsFamilyBridge.kext",
+    "AppleGraphicsDeviceControlBridge.kext",
+    "AppleParavirtIOSurface.kext",
+    "AppleParavirtGPUIOGPUFamily.kext",
+    "APVDisplayPort.kext",
+];
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 struct State {
@@ -69,10 +88,10 @@ fn lock() -> Option<File> {
     (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(f)
 }
 
-/// What migration 1 does to a VM.
+/// What a migration does to a VM.
 #[derive(Debug, PartialEq)]
 enum Plan {
-    /// Nothing: an arm64 VM, or one whose settings name graphics.
+    /// Nothing: a VM the migration is not for.
     Skip,
     /// It runs: at its next start.
     Defer,
@@ -81,6 +100,8 @@ enum Plan {
     /// Its image made again for its macOS: on the graphics saved in its settings, or, where its
     /// disk holds no macOS yet, on the default, with none saved; the macOS that decided.
     Image(Option<Graphics>, Option<Macos>),
+    /// Its image made again for the graphics its settings name, which stay.
+    Again(Graphics),
 }
 
 /// Migration 1's plan for `vm`, `running` or not, its disk's macOS read by `found`.
@@ -105,6 +126,44 @@ fn plan(vm: &Vm, running: bool, found: impl FnOnce() -> Result<Vec<Macos>>) -> P
                 .or(found.first())
                 .cloned();
             Plan::Image(graphics, decided)
+        }
+    }
+}
+
+/// Migration 2's plan for `vm`, `running` or not, from the kexts its image loads; one whose
+/// settings name no graphics gets migration 1's, its disk's macOS read by `found`.
+fn plan_2(
+    vm: &Vm,
+    running: bool,
+    kexts: &[String],
+    found: impl FnOnce() -> Result<Vec<Macos>>,
+) -> Plan {
+    let ported = kexts
+        .iter()
+        .any(|k| PORTED.iter().any(|p| k.eq_ignore_ascii_case(p)));
+    if vm.config.profile != Profile::Q35X86_64 || !ported {
+        return Plan::Skip;
+    }
+    match vm.config.graphics {
+        None => plan(vm, running, found),
+        Some(_) if running => Plan::Defer,
+        Some(g) => Plan::Again(g),
+    }
+}
+
+/// Migration `n`'s plan for `vm`, `running` or not.
+fn plan_of(n: u32, vm: &Vm, running: bool) -> Plan {
+    let found = || macos::on_disk(&vm.disk(), vm.config.disk_format);
+    match n {
+        1 => plan(vm, running, found),
+        _ => {
+            let kexts = vm
+                .config
+                .q35
+                .as_ref()
+                .map(|q| loaded(&vm.path(&q.opencore), q.opencore_format))
+                .unwrap_or_default();
+            plan_2(vm, running, &kexts, found)
         }
     }
 }
@@ -138,15 +197,26 @@ pub fn run(say: &mut dyn FnMut(&str)) {
                 continue;
             }
         };
-        let p = plan(&vm, runtime::running(&vm), || {
-            macos::on_disk(&vm.disk(), vm.config.disk_format)
-        });
-        if p == Plan::Defer {
-            state.deferred.push(vm.dir.clone());
+        // A VM that waited for its start since an earlier update still has every migration to run.
+        let waited = state.deferred.iter().any(|d| same_dir(d, &vm.dir));
+        let first = if waited { 1 } else { state.done + 1 };
+        let running = runtime::running(&vm);
+        let mut defer = false;
+        for n in first..=CURRENT {
+            let p = plan_of(n, &vm, running);
+            defer = p == Plan::Defer;
+            if let Some(line) = carry_out(&mut vm, p, n) {
+                say(&line);
+                told = true;
+            }
+            if defer {
+                break;
+            }
         }
-        if let Some(line) = carry_out(&mut vm, p) {
-            say(&line);
-            told = true;
+        if defer && !waited {
+            state.deferred.push(vm.dir.clone());
+        } else if !running {
+            state.deferred.retain(|d| !same_dir(d, &vm.dir));
         }
     }
     if !registry.vms.is_empty() && !told {
@@ -172,12 +242,12 @@ pub fn at_start(vm: &mut Vm, progress: &mut dyn FnMut(&str)) {
     if state.deferred.len() == before || save(&state).is_err() {
         return;
     }
-    let p = plan(vm, false, || {
-        macos::on_disk(&vm.disk(), vm.config.disk_format)
-    });
-    if let Some(line) = carry_out(vm, p) {
-        let name = format!("{}: ", vm.name());
-        progress(line.strip_prefix(&name).unwrap_or(&line));
+    let name = format!("{}: ", vm.name());
+    for n in 1..=CURRENT {
+        let p = plan_of(n, vm, false);
+        if let Some(line) = carry_out(vm, p, n) {
+            progress(line.strip_prefix(&name).unwrap_or(&line));
+        }
     }
 }
 
@@ -185,8 +255,9 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     a == b || std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
 }
 
-/// Carries out `plan` on `vm`: the line telling what happened, or None where nothing did.
-fn carry_out(vm: &mut Vm, plan: Plan) -> Option<String> {
+/// Carries out migration `n`'s `plan` on `vm`: the line telling what happened, or None where
+/// nothing did.
+fn carry_out(vm: &mut Vm, plan: Plan, n: u32) -> Option<String> {
     let name = vm.name().to_string();
     let manual = format!(
         "reims-ctl set {name} --graphics reims-vgpu (for macOS 26.4 or later) or apple-gfx \
@@ -202,23 +273,39 @@ fn carry_out(vm: &mut Vm, plan: Plan) -> Option<String> {
             "{name}: left as it was: reims-ctl can't tell which macOS its disk holds ({why}); \
              {manual}"
         )),
-        Plan::Image(graphics, decided) => Some(match image(vm, graphics, decided.as_ref()) {
+        Plan::Image(graphics, decided) => {
+            Some(match image(vm, graphics, decided.as_ref(), None, n) {
+                Ok(line) => format!("{name}: {line}"),
+                Err(e) => format!("{name}: left as it was: {e:#}; {manual}"),
+            })
+        }
+        Plan::Again(graphics) => Some(match image(vm, None, None, Some(graphics), n) {
             Ok(line) => format!("{name}: {line}"),
-            Err(e) => format!("{name}: left as it was: {e:#}; {manual}"),
+            Err(e) => format!(
+                "{name}: left as it was: {e:#}; reims-ctl update-opencore {name} makes its \
+                 OpenCore image again"
+            ),
         }),
     }
 }
 
-/// Saves `graphics` in `vm`'s settings and makes its OpenCore image again for them, keeping the
-/// old image beside it; what changed, or an error with the VM as it was.
-fn image(vm: &mut Vm, graphics: Option<Graphics>, decided: Option<&Macos>) -> Result<String> {
+/// Saves `graphics` in `vm`'s settings and makes its OpenCore image again for them, or, with
+/// `kept`, for the graphics its settings name, keeping the old image beside it as migration `n`'s
+/// backup; what changed, or an error with the VM as it was.
+fn image(
+    vm: &mut Vm,
+    graphics: Option<Graphics>,
+    decided: Option<&Macos>,
+    kept: Option<Graphics>,
+    n: u32,
+) -> Result<String> {
     let q = vm.config.q35.clone().context("it boots no OpenCore")?;
     let old = vm.path(&q.opencore);
     let before = loaded(&old, q.opencore_format);
     // A copy of an image in the VM's directory, which the new one replaces; one elsewhere stays.
     let backup = old
         .starts_with(&vm.dir)
-        .then(|| backup_of(&old))
+        .then(|| backup_of(&old, n))
         .flatten()
         .filter(|b| !b.exists());
     if let Some(b) = &backup {
@@ -251,6 +338,11 @@ fn image(vm: &mut Vm, graphics: Option<Graphics>, decided: Option<&Macos>) -> Re
     let q = vm.config.q35.clone().context("it boots no OpenCore")?;
     let after = loaded(&vm.path(&q.opencore), q.opencore_format);
     let mut line = match (graphics, decided) {
+        _ if kept.is_some() => format!(
+            "its OpenCore image is made again for {}, without the ported drivers older images \
+             held",
+            kept.map(Graphics::name).unwrap_or_default()
+        ),
         (Some(Graphics::ReimsVgpu), Some(m)) => {
             format!(
                 "now on reims-vgpu's own GPU device, whose drivers {} runs",
@@ -319,10 +411,10 @@ fn loaded(image: &Path, format: crate::vm::ImageFormat) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Where migration 1 keeps a VM's old image: beside it, `.pre-migration-1` after its name.
-fn backup_of(image: &Path) -> Option<PathBuf> {
+/// Where migration `n` keeps a VM's old image: beside it, `.pre-migration-<n>` after its name.
+fn backup_of(image: &Path, n: u32) -> Option<PathBuf> {
     let name = image.file_name()?.to_str()?;
-    Some(image.with_file_name(format!("{name}.pre-migration-{CURRENT}")))
+    Some(image.with_file_name(format!("{name}.pre-migration-{n}")))
 }
 
 #[cfg(test)]
@@ -451,6 +543,7 @@ mod tests {
         let line = carry_out(
             &mut v,
             Plan::Image(Some(Graphics::ReimsVgpu), Some(macos("26.7.2", "25G332"))),
+            1,
         )
         .unwrap();
         assert!(
@@ -493,6 +586,7 @@ mod tests {
         let line = carry_out(
             &mut v,
             Plan::Image(Some(Graphics::AppleGfx), Some(macos("15.7.2", "24G325"))),
+            1,
         )
         .unwrap();
         assert!(
@@ -519,6 +613,7 @@ mod tests {
         let line = carry_out(
             &mut v,
             Plan::Image(Some(Graphics::ReimsVgpu), Some(macos("26.7.2", "25G332"))),
+            1,
         )
         .unwrap();
         assert!(line.starts_with("stuck: left as it was:"), "{line}");
@@ -531,6 +626,172 @@ mod tests {
         );
         assert_eq!(std::fs::read(dir.join("opencore.img")).unwrap(), before);
         assert!(!dir.join("opencore.img.pre-migration-1").exists());
+    }
+
+    /// The ported drivers' kexts, as an image from before reims-util's fe9bfe1 loads them.
+    fn ported() -> String {
+        std::iter::once("Lilu.kext")
+            .chain(["ReimsVgpu.kext"])
+            .chain(PORTED)
+            .map(entry)
+            .collect()
+    }
+
+    fn names(kexts: &[&str]) -> Vec<String> {
+        kexts.iter().map(|k| k.to_string()).collect()
+    }
+
+    /// Migration 2 is for an x86-64 VM whose image loads the ported drivers, whatever graphics
+    /// its settings name, which stay; one whose settings name none gets migration 1's plan. An
+    /// image reims-util makes since fe9bfe1, or one migration 2 made, holds none, and is left be.
+    #[test]
+    fn migration_2_is_for_images_with_the_ported_drivers() {
+        let env = crate::testenv::Env::new("migrate-plan-2");
+        let new = || Ok(vec![macos("26.7.2", "25G332")]);
+        let old = names(&[
+            "Lilu.kext",
+            "ReimsVgpu.kext",
+            "AppleParavirtGPUIOGPUFamily.kext",
+        ]);
+        let fresh = names(&["Lilu.kext", "ReimsVgpu.kext"]);
+        let ours = names(&["Lilu.kext", "ReimsGraphicsLoader.kext", "RgfxGate.kext"]);
+        for (g, graphics) in [
+            ("apple-gfx", Graphics::AppleGfx),
+            ("reims-vgpu", Graphics::ReimsVgpu),
+            ("vmware-svga", Graphics::VmwareSvga),
+        ] {
+            let v = vm(&env.root.join(g), "q35-x86_64", Some(g), "");
+            assert_eq!(plan_2(&v, false, &old, new), Plan::Again(graphics), "{g}");
+            assert_eq!(plan_2(&v, true, &old, new), Plan::Defer, "{g}");
+            assert_eq!(plan_2(&v, false, &fresh, new), Plan::Skip, "{g}");
+            assert_eq!(plan_2(&v, false, &ours, new), Plan::Skip, "{g}");
+            assert_eq!(plan_2(&v, false, &[], new), Plan::Skip, "{g}");
+        }
+        // Names compare as FAT32 compares them, case aside.
+        let shouted = names(&["APPLEPARAVIRTGPULOADER.KEXT"]);
+        let v = vm(&env.root.join("case"), "q35-x86_64", Some("apple-gfx"), "");
+        assert_eq!(
+            plan_2(&v, false, &shouted, new),
+            Plan::Again(Graphics::AppleGfx)
+        );
+        // No graphics named: migration 1's plan, from its disk's macOS.
+        let v = vm(&env.root.join("none"), "q35-x86_64", None, "");
+        assert_eq!(
+            plan_2(&v, false, &old, new),
+            Plan::Image(Some(Graphics::ReimsVgpu), Some(macos("26.7.2", "25G332")))
+        );
+        assert_eq!(plan_2(&v, false, &fresh, new), Plan::Skip);
+        let v = vm(
+            &env.root.join("arm"),
+            "vmapple-arm64",
+            Some("apple-gfx"),
+            "",
+        );
+        assert_eq!(plan_2(&v, false, &old, new), Plan::Skip);
+        // The plan reads the kexts from the VM's image.
+        let v = vm(
+            &env.root.join("img"),
+            "q35-x86_64",
+            Some("apple-gfx"),
+            &ported(),
+        );
+        assert_eq!(plan_of(2, &v, false), Plan::Again(Graphics::AppleGfx));
+        let v = vm(
+            &env.root.join("img2"),
+            "q35-x86_64",
+            Some("apple-gfx"),
+            &entry("Lilu.kext"),
+        );
+        assert_eq!(plan_of(2, &v, false), Plan::Skip);
+    }
+
+    /// Migration 2 makes the image again for the graphics the VM's settings name, which stay,
+    /// keeping the old image as `.pre-migration-2`; an update from a reims-ctl that ran
+    /// migration 1 runs migration 2 alone, once, and leaves the image it made be.
+    #[test]
+    fn migration_2_makes_the_image_again_for_the_graphics_set() {
+        let env = crate::testenv::Env::new("migrate-image-2");
+        let made = env.root.join("made.img");
+        let args = env.root.join("args");
+        std::fs::write(
+            &made,
+            qcow2(&oc_image(plist(&entry("Lilu.kext")).as_bytes())),
+        )
+        .unwrap();
+        util(&env, &made, &args, false);
+        let dir = env.root.join("gfx");
+        let mut v = vm(&dir, "q35-x86_64", Some("apple-gfx"), &ported());
+        let old_bytes = std::fs::read(dir.join("opencore.img")).unwrap();
+        let line = carry_out(&mut v, Plan::Again(Graphics::AppleGfx), 2).unwrap();
+        assert!(
+            line.starts_with("gfx: its OpenCore image is made again for apple-gfx"),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "without 8 kexts (ReimsVgpu.kext, AppleParavirtGPULoader.kext and 6 more)"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains("kept as opencore.img.pre-migration-2"),
+            "{line}"
+        );
+        let saved = Vm::load(&dir).unwrap();
+        assert_eq!(saved.config.graphics, Some(Graphics::AppleGfx));
+        assert_eq!(
+            saved.config.q35.as_ref().unwrap().opencore,
+            Path::new("opencore.qcow2")
+        );
+        assert_eq!(
+            std::fs::read(dir.join("opencore.img.pre-migration-2")).unwrap(),
+            old_bytes
+        );
+        assert_eq!(plan_of(2, &saved, false), Plan::Skip);
+
+        // reims-util fails: the VM as it was.
+        util(&env, &made, &args, true);
+        let dir = env.root.join("stuck");
+        let mut v = vm(&dir, "q35-x86_64", Some("apple-gfx"), &ported());
+        let before = std::fs::read(dir.join("opencore.img")).unwrap();
+        let line = carry_out(&mut v, Plan::Again(Graphics::AppleGfx), 2).unwrap();
+        assert!(line.starts_with("stuck: left as it was:"), "{line}");
+        assert!(line.contains("reims-ctl update-opencore stuck"), "{line}");
+        assert_eq!(std::fs::read(dir.join("opencore.img")).unwrap(), before);
+        assert!(!dir.join("opencore.img.pre-migration-2").exists());
+
+        // After migration 1: migration 2 alone, on the VM whose image holds the ported drivers.
+        util(&env, &made, &args, false);
+        let mut reg = Registry::default();
+        for (name, kexts) in [("ported", ported()), ("fresh", entry("Lilu.kext"))] {
+            let dir = env.root.join(name);
+            vm(&dir, "q35-x86_64", Some("apple-gfx"), &kexts);
+            reg.add(name, &dir).unwrap();
+        }
+        reg.save().unwrap();
+        save(&State {
+            done: 1,
+            deferred: vec![],
+        })
+        .unwrap();
+        let mut said = Vec::new();
+        run(&mut |s| said.push(s.to_string()));
+        assert!(said[0].starts_with("reims-ctl is updated"), "{said:?}");
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said[1].starts_with("ported: its OpenCore image is made again"),
+            "{said:?}"
+        );
+        assert!(
+            env.root
+                .join("ported/opencore.img.pre-migration-2")
+                .exists()
+        );
+        assert!(!env.root.join("fresh/opencore.img.pre-migration-2").exists());
+        assert_eq!(load().done, 2);
+        let mut said = Vec::new();
+        run(&mut |s| said.push(s.to_string()));
+        assert!(said.is_empty(), "{said:?}");
     }
 
     #[test]

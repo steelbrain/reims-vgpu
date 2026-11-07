@@ -182,7 +182,8 @@ stays on apple-gfx if not; the choice is saved in its settings. Its OpenCore ima
 for it, presenting the same Mac and without the ported drivers older images held, and the old \
 image is kept beside it as <image>.pre-migration-1. A VM that is running then is updated at its \
 next start. One that can't be updated stays as it was, and its line says why. A VM whose settings \
-name graphics keeps them.";
+name graphics keeps them; where its OpenCore image still loads the ported drivers, the image is \
+made again for those graphics, and the old one is kept as <image>.pre-migration-2.";
 
 const UPDATE_OPENCORE_HELP: &str = "\
 The new image is made for the VM's graphics. On reims-vgpu it holds the macOS drivers of \
