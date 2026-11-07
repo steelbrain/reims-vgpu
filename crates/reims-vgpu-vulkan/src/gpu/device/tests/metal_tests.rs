@@ -3206,33 +3206,6 @@ pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
     (device, cache)
 }
 
-/// The platform's device options with a shader cache of their own, as [`device_with_own_cache`]
-/// makes its device with.
-pub(crate) fn options_with_own_cache() -> (rt::DeviceOptions, OwnCache) {
-    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let home = std::env::var_os("HOME").expect("a home directory");
-    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::path::PathBuf::from(home).join(format!(
-        ".cache/reims-vgpu-vulkan-tests-own/{}-{n}",
-        std::process::id()
-    ));
-    // One a process of the same ID left: this process's own, and emptied.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut options = crate::platform::device_options().clone();
-    options.shader_cache = rt::ShaderCacheOptions::in_directory(&dir);
-    (options, OwnCache(dir))
-}
-
-/// The directory of [`device_with_own_cache`]'s shader cache, removed as it drops.
-pub(crate) struct OwnCache(std::path::PathBuf);
-
-impl Drop for OwnCache {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// The spec of a 'b3a8' surface of `size` (`kCVPixelFormatType_30RGBLE_8A_BiPlanar`): plane 0
 /// the 32-bit colour words, plane 1 the alpha bytes, rows `rows` bytes apart in each, plane 1
 /// after plane 0 at a multiple of 4096.

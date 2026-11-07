@@ -2266,13 +2266,40 @@ pub(crate) mod tests {
         DEVICE.clone_ref()
     }
 
+    /// The platform's device options with a shader cache of their own, as
+    /// `metal_tests::device_with_own_cache` makes its device with.
+    pub(crate) fn options_with_own_cache() -> (rt::DeviceOptions, OwnCache) {
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let home = std::env::var_os("HOME").expect("a home directory");
+        let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::path::PathBuf::from(home).join(format!(
+            ".cache/reims-vgpu-vulkan-tests-own/{}-{n}",
+            std::process::id()
+        ));
+        // One a process of the same ID left: this process's own, and emptied.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut options = crate::platform::device_options().clone();
+        options.shader_cache = rt::ShaderCacheOptions::in_directory(&dir);
+        (options, OwnCache(dir))
+    }
+
+    /// The directory of [`options_with_own_cache`]'s shader cache, removed as it drops.
+    pub(crate) struct OwnCache(std::path::PathBuf);
+
+    impl Drop for OwnCache {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// A device the platform adopts starts the runtime's check of textures over host pages, with
     /// no texture made ([`start_in_place_checks`]): a device of a shader cache of its own, empty,
     /// so no record holds the verdicts, adopted as the first of its process (nextest's, one a
     /// test), ends the check.
     #[test]
     fn an_adopted_device_starts_its_in_place_check() {
-        let (options, _cache) = metal_tests::options_with_own_cache();
+        let (options, _cache) = options_with_own_cache();
         let raw = rt::Device::system_default_with(&options).unwrap();
         assert!(raw.in_place_check_took().is_none(), "no check ran before");
         assert!(
