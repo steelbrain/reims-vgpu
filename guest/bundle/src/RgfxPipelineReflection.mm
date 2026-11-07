@@ -710,16 +710,24 @@ struct Maker {
 		// scalar one: a buffer binding of type 22, read only, of the value's type, size and
 		// alignment, its type object a pointer to the value that is no constant buffer (measured:
 		// macOS 26.7.1, the AMD 5300M and the Intel 630 alike, a float and a uint). A struct passed
-		// so was not measured.
+		// so is of MTLDataTypeStruct, its size and alignment the node's, as both Macs' pipelines of
+		// OpenCL mode answer one of a float and an int (8 bytes, aligned to 4); its function
+		// reflection's binding type was not measured apart from the scalars', and is theirs.
 		if (n.kind == "air.constant") {
 			NSUInteger type = 0;
 			uint32_t align = 0;
-			if (n.layout != nullptr || !n.hasTypeSize || !valueType(n.typeName, type, align)) {
+			id element = nil;
+			if (n.layout != nullptr && n.hasTypeSize && n.hasTypeAlign) {
+				type = MTLDataTypeStruct;
+				align = n.typeAlign;
+				if ((element = structType(*n.layout, false)) == nil)
+					return nil;
+			} else if (n.layout != nullptr || !n.hasTypeSize || !valueType(n.typeName, type, align)) {
 				fail([NSString stringWithFormat:@"a value argument of %s was not measured", n.typeName.c_str()]);
 				return nil;
 			}
 			const NSUInteger alignment = n.hasTypeAlign ? n.typeAlign : align;
-			id p = pointer(type, nil, MTLBindingAccessReadOnly, alignment, n.typeSize, false, false);
+			id p = pointer(type, element, MTLBindingAccessReadOnly, alignment, n.typeSize, false, false);
 			id b = [make(c.bufferBinding) initWithName:name
 			                                     type:kValueBindingType
 			                                   access:MTLBindingAccessReadOnly

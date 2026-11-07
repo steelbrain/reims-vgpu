@@ -601,6 +601,35 @@ void test_cl_library_arguments()
 			CHECK(a.access == (i == 0 ? MTLArgumentAccessReadWrite : MTLArgumentAccessReadOnly));
 		}
 	}
+
+	// A struct passed by value: of MTLDataTypeStruct, its size and alignment (a float and an int:
+	// 8 bytes, aligned to 4), as the x86 Macs' pipelines of OpenCL mode answer it.
+	bytes = clLibraryBytes(metal,
+	                       @"typedef struct { float a; int b; } S;\n"
+	                       @"__kernel void st(__global float *o, S s) { o[get_global_id(0)] = s.a + (float)s.b; }\n",
+	                       &names);
+	std::vector<uint8_t> structKernels;
+	CHECK(bytes.length >= 4 &&
+	      RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes.bytes), bytes.length, structKernels));
+	metallib = structKernels;
+	const std::vector<uint8_t> structKept(static_cast<const uint8_t *>(bytes.bytes),
+	                                      static_cast<const uint8_t *>(bytes.bytes) + bytes.length);
+	RgfxLibrary *structs = structKernels.empty() ? nil : keptOver(structKept);
+	CHECK(structs != nil && [structs.functionNames isEqualToArray:@[ @"__entry_st" ]]);
+	id structReflection = [(id<RgfxGLTestsFunctionReflection>)[structs newFunctionWithName:@"__entry_st"]
+	    reflectionWithOptions:3];
+	NSArray *structArguments = [structReflection valueForKey:@"arguments"];
+	CHECK(structArguments.count == 2);
+	if (structArguments.count == 2) {
+		MTLArgument *o = structArguments[0], *v = structArguments[1];
+		CHECK(strcmp(o.name.UTF8String, "o") == 0 && o.type == 0 && o.index == 0);
+		CHECK(strcmp(v.name.UTF8String, "s") == 0 && v.type == 22 && v.index == 1);
+		CHECK(v.bufferDataType == MTLDataTypeStruct && v.bufferDataSize == 8 && v.bufferAlignment == 4);
+		CHECK(v.access == MTLArgumentAccessReadOnly);
+		id type = [v valueForKey:@"dataTypeDescription"];
+		CHECK([type isKindOfClass:[MTLPointerType class]] && ![[type valueForKey:@"isConstantBuffer"] boolValue]);
+		CHECK([[type valueForKey:@"elementStructType"] isKindOfClass:[MTLStructType class]]);
+	}
 	drainRing(ring);
 }
 
