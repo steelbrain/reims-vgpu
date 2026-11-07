@@ -2889,6 +2889,7 @@ void test_region_write_combined_parts()
 		CHECK(rings.ok && rings.submit_offset == rings.submit_block);
 		CHECK(rings.complete_offset == rings.complete_block && rings.complete_offset != 0);
 	}
+	std::fill(mem.begin(), mem.end(), 0xee); // the rings above zeroed theirs
 	RgfxRegion region(mem.data(), mem.size());
 	Source src;
 	region.setBlockSource(&Source::alloc, &Source::release, &src);
