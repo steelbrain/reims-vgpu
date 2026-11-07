@@ -1390,6 +1390,21 @@ hw/usb/host-libusb.c):
   grants VM apps through a provisioning profile; reims-ctl offers no
   passthrough there.
 
+**Measured** on a CachyOS host (kernel 7.3.1) with a macOS 26.7.2 (25G332)
+guest on reims-graphics-pci, given a USB stick the host's kernel makes
+(`dummy_hcd`'s bus, and `g_mass_storage` on a 64 MB FAT image: 0525:a4a5,
+high speed):
+- `system_profiler SPUSBHostDataType` lists it ("Mass Storage Gadget", 480
+  Mb/s) under the controller's driver, AppleUSBXHCIPCI, and `ioreg -p
+  IOUSB` as an IOUSBHostDevice. On macOS 26, `SPUSBDataType` lists nothing.
+- macOS mounts its volume, and a file the guest writes there is in the
+  host's image once the VM stops.
+- Taken back while the VM runs (QMP's `device_del`), it leaves the guest's
+  USB tree and its disk list; given again (`device_add`), it comes back at
+  another location and macOS mounts it again.
+- While the guest has it, QEMU takes it from the host's driver: its disk
+  (`/dev/sda`) leaves the host, and comes back once the VM stops.
+
 **Unknown**: a guest's view of a device on a USB 3 port; whether macOS
 guests before 26 drive the controller with 14 ports as with 8.
 
