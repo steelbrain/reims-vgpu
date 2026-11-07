@@ -577,7 +577,9 @@ Stages:
       the key set in `/Library/Preferences/com.apple.AppleGVA.plist` at every
       boot, after the bundle step (`guest/rgfxgate/src/RgfxGatePrefs.cpp`): an
       absent file gets a fresh XML plist, an XML plist gets the key with every
-      other byte kept, and a binary or unreadable one is left and logged.
+      other byte kept, a binary one, as cfprefsd writes it (`defaults delete`
+      leaves an empty one), gets the key with every object kept, and an
+      unreadable one is left and logged.
       AppleGVA reads it from the next service start (measured on the guest,
       macOS 26.6.1).
     - **The GPU is named GFX0.** AppleGVA's video routing finds the GPU by

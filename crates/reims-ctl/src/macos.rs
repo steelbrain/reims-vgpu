@@ -255,10 +255,11 @@ pub fn as_started(vm: &Vm) -> Vm {
 
 /// AppleGVA's gvaForceAMDKE as a VM's macOS keeps it, in
 /// /Library/Preferences/com.apple.AppleGVA.plist on its Data volume. RgfxGate, a kext of the
-/// guest's set, sets it true at each boot on reims-vgpu's own device where that file is absent or
-/// an XML plist (guest/rgfxgate/src/RgfxGatePrefs.cpp), and nothing undoes it once the VM moves
-/// to other graphics. Some, with how many other keys the file holds, where it is true; None where
-/// the disk holds no such setting, or reims-ctl can't read it (an encrypted Data volume).
+/// guest's set, sets it true at each boot on reims-vgpu's own device where that file is absent, an
+/// XML plist or a binary one (guest/rgfxgate/src/RgfxGatePrefs.cpp), and nothing undoes it once
+/// the VM moves to other graphics. Some, with how many other keys the file holds, where it is
+/// true; None where the disk holds no such setting, or reims-ctl can't read it (an encrypted Data
+/// volume).
 fn gva_forced(vm: &Vm) -> Option<usize> {
     let read = || -> Result<Option<usize>> {
         let disk = Disk::open(&vm.disk(), vm.config.disk_format)?;
@@ -287,9 +288,9 @@ fn gva_forced(vm: &Vm) -> Option<usize> {
 /// ([`gva_forced`]), with the command that removes it, and RgfxGate's Metal bundle. Measured on
 /// apple-gfx with a macOS 26.7.2 guest: VideoToolbox answers the same with the setting and
 /// without it (no hardware decoding of H.264 or HEVC, no hardware encoder among its 15); with the
-/// file removed, the next boot on reims-vgpu writes it again, where `defaults delete` leaves an
-/// empty binary plist, which RgfxGate keeps as it is; root can't remove the bundle, which SIP
-/// protects. None where the guest keeps no such setting.
+/// file removed, the next boot on reims-vgpu writes it again, as it sets it again in the empty
+/// binary plist `defaults delete` leaves; root can't remove the bundle, which SIP protects. None
+/// where the guest keeps no such setting.
 pub fn gva_note(vm: &Vm) -> Option<String> {
     let graphics = vm.config.graphics();
     if vm.config.profile != Profile::Q35X86_64 || graphics == Graphics::ReimsVgpu {
