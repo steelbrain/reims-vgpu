@@ -55,7 +55,7 @@ use reims_vgpu_core::platform::types::CommandBufferStatus;
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
-use super::decode::{GraphicsVideoSession, VideoDecode, VideoPlane, op_fault};
+use super::decode::{GraphicsVideoSession, PlanePages, VideoDecode, VideoPlane, op_fault};
 
 /// How long a session's end waits for its last picture to land.
 pub(crate) const TEARDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -129,6 +129,9 @@ pub(crate) struct OutputPlane<P: Platform> {
     /// The host address of the plane's first byte, in the surface's pages; `None` in a device
     /// cache.
     pub(crate) host: Option<HostPtr>,
+    /// The memory the buffer lies in, as a device reaches it in place ([`VideoPlane::pages`]);
+    /// `None` in a device cache, and in memory of another kind.
+    pub(crate) pages: Option<PlanePages>,
 }
 
 /// One plane's host bytes, which a picture lands in ([`Landing::host`]).
@@ -459,6 +462,7 @@ fn output_plane<P: Platform>(plane: &VideoPlane<'_, P>, rows: u64) -> RaiseResul
         rows_held,
         cached: plane.cached,
         host,
+        pages: plane.pages.clone(),
     })
 }
 

@@ -87,6 +87,7 @@
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use reims_graphics::wire::{
@@ -104,6 +105,8 @@ use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_video_core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
+use reims_vgpu_video_core::surfaces::SurfaceError;
 
 use super::worker::{Settle, Worker};
 
@@ -130,15 +133,68 @@ const TEARDOWN: u64 = u64::MAX;
 /// the module doc). So the view's mapping, whose teardown is one unmap of every run it maps, is
 /// let go of on the surface worker ([`TEARDOWN`]) wherever that is, never on the thread that let
 /// go of the view last.
+///
+/// A device of the host's video reaches the view as its memory ([`Self::memory`]): one mapping
+/// of the surface's pages, whose identity ends as the view goes, and whose hold keeps the
+/// mapping, not the view, so a device's import of it (a CUDA registration, a dma-buf) holds the
+/// pages mapped until the device has let go of it, which it does once the identity ends.
 pub(crate) struct SurfaceView<P: Platform> {
     /// The view's first byte, and its bytes: its mapping's.
     base: HostPtr,
     length: u64,
-    /// The view, the runs mapped in order, and the platform's hold on the guest's RAM, kept until
-    /// the view's teardown; taken as it goes.
+    /// The mapping, which the devices' imports of the view hold too.
+    held: Arc<MappingHold<P>>,
+    /// The view's life, which ends as it goes ([`Self::memory`]).
+    life: MemoryLife,
+}
+
+/// A view's mapping: the runs mapped in order, and the platform's hold on the guest's RAM, kept
+/// until the last hold goes, then let go of on the surface worker ([`TEARDOWN`]).
+struct MappingHold<P: Platform> {
+    /// Taken as it goes.
     held: Option<(Arc<Mapping<P>>, Lease)>,
-    /// Where `held` is let go of; `None` where it goes where the view does (the costs' runs).
+    /// Where `held` is let go of; `None` where it goes where the hold does (the costs' runs).
     teardown: Option<Arc<Worker>>,
+}
+
+impl<P: Platform> Drop for MappingHold<P> {
+    fn drop(&mut self) {
+        if let (Some(held), Some(worker)) = (self.held.take(), self.teardown.take()) {
+            worker.drop_later(TEARDOWN, 0, held);
+        }
+    }
+}
+
+/// A view's memory as the host's video devices take it ([`SurfaceView::memory`]).
+struct ViewMemory<P: Platform> {
+    identity: MemoryIdentity,
+    /// The mapping's first byte, a page's, and its bytes.
+    base: HostPtr,
+    length: usize,
+    held: Arc<MappingHold<P>>,
+}
+
+impl<P: Platform> DeviceMemory for ViewMemory<P> {
+    fn identity(&self) -> MemoryIdentity {
+        self.identity.clone()
+    }
+
+    fn length(&self) -> usize {
+        self.length
+    }
+
+    /// The whole mapping, the surface's first byte its first, held mapped by the view's mapping
+    /// hold, which outlives the view while the caller keeps it.
+    fn host_view(&self) -> Result<HostView, SurfaceError> {
+        let first = NonNull::new(self.base.as_ptr::<u8>())
+            .ok_or_else(|| SurfaceError::Unreachable("a view at no address".to_owned()))?;
+        Ok(HostView {
+            first,
+            size: self.length,
+            offset: 0,
+            hold: Box::new(Arc::clone(&self.held)),
+        })
+    }
 }
 
 /// The platform's hold on the guest's RAM the views are made of.
@@ -154,9 +210,28 @@ impl<P: Platform> SurfaceView<P> {
         SurfaceView {
             base: mapping.virtual_address(),
             length: mapping.length(),
-            held: Some((mapping, lease)),
-            teardown,
+            held: Arc::new(MappingHold {
+                held: Some((mapping, lease)),
+                teardown,
+            }),
+            life: MemoryLife::new(),
         }
+    }
+
+    /// The view as the host's video devices take memory: its identity, which ends as the view
+    /// goes, and its whole mapping, held while the caller keeps what it makes of it; `None` for
+    /// a view of no bytes.
+    pub(crate) fn memory(&self) -> Option<Arc<dyn DeviceMemory>> {
+        let length = usize::try_from(self.length).ok().filter(|&n| n > 0)?;
+        if self.base.is_null() {
+            return None;
+        }
+        Some(Arc::new(ViewMemory {
+            identity: self.life.identity(),
+            base: self.base,
+            length,
+            held: Arc::clone(&self.held),
+        }))
     }
 
     /// The view's bytes: the surface's.
@@ -167,14 +242,6 @@ impl<P: Platform> SurfaceView<P> {
     /// The view's first byte.
     pub(crate) fn base(&self) -> HostPtr {
         self.base
-    }
-}
-
-impl<P: Platform> Drop for SurfaceView<P> {
-    fn drop(&mut self) {
-        if let (Some(held), Some(worker)) = (self.held.take(), self.teardown.take()) {
-            worker.drop_later(TEARDOWN, 0, held);
-        }
     }
 }
 
@@ -1627,6 +1694,59 @@ pub(super) mod tests {
             );
         }
         assert_eq!(Arc::strong_count(&view), 1, "the cache let it go");
+    }
+
+    /// A device's hold of a view's memory keeps the view's mapping past the view: the view's
+    /// identity ends as the view goes, which tells a device to let go of what it made of the
+    /// memory (a CUDA registration of its pages), and the mapping is torn down only once the
+    /// device's hold goes too, after the device let go, so the pages a registration pinned are
+    /// still mapped when it is undone.
+    #[test]
+    fn a_view_s_mapping_outlives_it_while_a_device_holds_its_memory() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut r = rig(64);
+        let page = r.page;
+        assert_eq!(r.pages(BLOCK, &[(1, 1)], page), RGFX_STATUS_OK);
+        let view = r.view(BLOCK);
+        let at = view.base().addr();
+        let memory = view.memory().expect("a view's memory");
+        let identity = memory.identity();
+        let gone = Arc::new(AtomicBool::new(false));
+        identity.when_gone({
+            let gone = Arc::clone(&gone);
+            move || gone.store(true, Ordering::SeqCst)
+        });
+        let host = memory.host_view().expect("the view's host view");
+        assert_eq!(
+            (host.first.as_ptr().addr(), host.size, host.offset),
+            (at, page.to_usize(), 0)
+        );
+        assert_eq!(memory.length(), page.to_usize());
+        drop((view, memory));
+        r.dec
+            .block_released(&r.device, BLOCK, 0, Box::new(|| ()), no_raise());
+        for i in 0..CACHED_VIEWS as u64 {
+            assert_eq!(
+                r.pages(BLOCK + 0x8000, &[(10 + i, 1)], page),
+                RGFX_STATUS_OK
+            );
+        }
+        r.dec.surface_worker().flush();
+        assert!(
+            gone.load(Ordering::SeqCst),
+            "the view went, its identity with it"
+        );
+        assert!(!identity.is_live());
+        let torn_down = || {
+            (r.p.call_log().calls_to("mach_vm_deallocate").iter())
+                .filter(|c| c.args.first() == Some(&Arg::Ptr(at)))
+                .count()
+        };
+        assert_eq!(torn_down(), 0, "the device's hold keeps the mapping");
+        drop(host);
+        r.dec.surface_worker().flush();
+        assert_eq!(torn_down(), 1, "torn down on the worker once the hold went");
     }
 
     /// A destroy that gives back a name the guest picked lets go of its object at once, though the

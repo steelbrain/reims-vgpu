@@ -171,6 +171,7 @@ fn planes<'a>(
         width,
         height,
         cached: buffer.contents().is_null(),
+        pages: None,
     };
     (plane(luma, 0, 96, 64), plane(chroma, 8192, 48, 32))
 }
@@ -500,6 +501,7 @@ fn a_staged_plane_copies_whole_or_by_rows() {
         rows_held: height,
         cached: true,
         host: None,
+        pages: None,
     };
     assert_eq!(plane_copies(256, &plane(128, 4)), [(256, 4096, 512)]);
     assert_eq!(

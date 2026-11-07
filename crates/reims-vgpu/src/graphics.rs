@@ -126,7 +126,7 @@ mod vulkan;
 #[cfg(vulkan_platform)]
 pub(crate) use vulkan::graphics_video as vulkan_graphics_video;
 
-pub use decode::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
+pub use decode::{GraphicsVideo, GraphicsVideoSession, PlanePages, VideoDecode, VideoPlane};
 
 /// Raises MSI-X vector `vector`: the device's interrupt.
 pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;

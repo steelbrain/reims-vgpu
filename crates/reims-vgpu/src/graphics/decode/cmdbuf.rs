@@ -2677,10 +2677,11 @@ mod tests {
     use reims_vgpu_core::testkit::Step;
     use reims_vgpu_core::testkit::calllog::Arg;
     use reims_vgpu_core::testkit::objects::CompleteOn;
+    use reims_vgpu_video_core::device_memory::MemoryIdentity;
     use zerocopy::IntoBytes;
 
     use super::super::split::SPLIT_AFTER;
-    use super::super::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
+    use super::super::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane, no_raise};
     use super::*;
 
     /// One op: its header then its body, `len` the whole op.
@@ -2699,11 +2700,16 @@ mod tests {
     /// A fresh decoder with a queue (id 1), two buffers (2 vertex, 3 index) and two
     /// textures (4 colour attachment, 5 fragment) already created.
     fn setup() -> (Arc<FakePlatform>, GraphicsDecoder<FakePlatform>) {
+        setup_over(0x10000)
+    }
+
+    /// [`setup`], over a region of `size` bytes.
+    fn setup_over(size: usize) -> (Arc<FakePlatform>, GraphicsDecoder<FakePlatform>) {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_graphics::region::Region::new(size).unwrap()),
         );
 
         let queue = RgfxQueueCreate {
@@ -3104,6 +3110,8 @@ mod tests {
     struct VideoSeen {
         decodes: Mutex<Vec<SeenDecode>>,
         cached: Mutex<Vec<[bool; 2]>>,
+        /// Each plane's memory: its identity, where the plane's buffer lies in it, and its bytes.
+        pages: Mutex<Vec<[Option<(MemoryIdentity, u64, usize)>; 2]>>,
         output_rows: Mutex<Vec<u32>>,
         ended_on: Mutex<Vec<Option<String>>>,
     }
@@ -3173,6 +3181,19 @@ mod tests {
                 .cached
                 .lock()
                 .push([d.luma.cached, d.chroma.cached]);
+            let pages = |p: &VideoPlane<'_, FakePlatform>| {
+                (p.pages.as_ref()).map(|pages| {
+                    (
+                        pages.memory.identity(),
+                        pages.buffer_offset,
+                        pages.memory.length(),
+                    )
+                })
+            };
+            self.seen
+                .pages
+                .lock()
+                .push([pages(&d.luma), pages(&d.chroma)]);
             self.seen.output_rows.lock().push(d.output_rows);
             Ok(self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1)
         }
@@ -3299,6 +3320,10 @@ mod tests {
             )]
         );
         assert_eq!(*seen.cached.lock(), [[false, false]], "a buffer of its own");
+        assert!(
+            seen.pages.lock()[0].iter().all(Option::is_none),
+            "a device buffer is no memory the host's video reaches in place"
+        );
         assert_eq!(*seen.output_rows.lock(), [16], "the rows the surface holds");
         let calls = p.call_log().calls();
         let sels: Vec<&str> = calls
@@ -3312,6 +3337,97 @@ mod tests {
             .find(|c| c.sel == "encodeWaitForEvent:value:")
             .unwrap();
         assert_eq!(wait.args.get(1), Some(&Arg::U64(1)));
+    }
+
+    /// A plane of a buffer over host memory in a block of the region reaches the host's video as
+    /// the block's memory: the block's bytes, the buffer's place in them, and an identity that
+    /// ends at the block's `BLOCK_RELEASE`, one for the block whichever decode names it.
+    #[test]
+    fn a_video_decode_s_planes_carry_their_block_s_memory() {
+        use reims_graphics::wire::{
+            RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN,
+            RgfxBufferOverHostMemory,
+        };
+
+        let block = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+        let size = (block + 0x10_0000 + RGFX_CURSOR_SPAN) as usize;
+        let (p, mut dec) = setup_over(size);
+        let device = p.device();
+        let seen = Arc::new(VideoSeen::default());
+        dec.set_video(Arc::new(FakeVideo(Arc::clone(&seen), p.device())));
+        let session = RgfxVideoSessionCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_VIDEO_SESSION_CREATE,
+                size: size_of::<RgfxVideoSessionCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 40,
+            codec: RGFX_VIDEO_CODEC_H264,
+            direction: RGFX_VIDEO_DECODE,
+        };
+        assert_eq!(dec.decode(&device, session.as_bytes()).unwrap(), Ok(()));
+        dec.region.grant(0, block, 0x1_0000);
+        let buffer = RgfxBufferOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+                size: size_of::<RgfxBufferOverHostMemory>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            gpu_address: 0,
+            region_offset: block + 0x1000,
+            length: 0x8000,
+            options: 0,
+            reserved_34: 0,
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        for t in [
+            surface_plane_texture(7, 0, 10, 32, 64, 16),
+            surface_plane_texture(8, 1, 30, 32 + 64 * 16, 32, 8),
+        ] {
+            assert_eq!(dec.decode(&device, t.as_bytes()).unwrap(), Ok(()));
+        }
+        let decode = RgfxVideoOpDecodeH264 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 16,
+            bitstream_size: 100,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            parameter_sets_size: 0,
+            output_rows: 0,
+        };
+        let pass = RgfxOpVideoPass { session_obj_id: 40 };
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes());
+        ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, decode.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        for seq in [1, 2] {
+            let message = command_buffer_message(100 + seq, seq, &ops);
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        }
+        let pages = seen.pages.lock().clone();
+        assert_eq!(pages.len(), 2);
+        let mut keys = Vec::new();
+        for planes in &pages {
+            for plane in planes {
+                let (identity, at, bytes) = plane.clone().expect("the block's memory");
+                assert_eq!((at, bytes), (0x1000, 0x1_0000));
+                assert!(identity.is_live());
+                keys.push(identity.key());
+            }
+        }
+        assert!(
+            keys.iter().all(|&k| k == keys[0]),
+            "one identity for the block"
+        );
+        dec.block_released(&device, block, 0, Box::new(|| ()), no_raise());
+        assert!(
+            pages
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|(identity, ..)| !identity.is_live()),
+            "the block's release ends it"
+        );
     }
 
     /// A video decode of a command buffer that waits for a buffer of another queue starts once

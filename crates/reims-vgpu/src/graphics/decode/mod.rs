@@ -150,6 +150,7 @@ use reims_vgpu_core::platform::values::{
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_video_core::device_memory::MemoryLife;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Metal's page on Apple silicon, to which a Shared heap's memory is rounded up: the guest's
@@ -195,7 +196,7 @@ mod waits;
 mod work;
 pub(crate) mod worker;
 
-pub use video::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
+pub use video::{GraphicsVideo, GraphicsVideoSession, PlanePages, VideoDecode, VideoPlane};
 
 pub(crate) use cmdbuf::Begun;
 use lane::{Lane, Turn};
@@ -640,6 +641,10 @@ pub(crate) struct Shared<P: Platform> {
     unified_memory: AtomicBool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,
+    /// The life of each block of the region a video decode's output lay in, by its offset, as the
+    /// host's video devices take its memory: made at the first such decode and ended at the
+    /// block's `BLOCK_RELEASE` ([`video`]).
+    block_lives: Mutex<HashMap<u64, MemoryLife>>,
     /// When what the surface views did was last logged, or the decoder made, in the platform
     /// clock's nanoseconds ([`views_log_due`]).
     views_logged_at: AtomicU64,
@@ -889,6 +894,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             closed: ClosedContexts::default(),
             unified_memory: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
+            block_lives: Mutex::new(HashMap::new()),
             views_logged_at: AtomicU64::new(made_at.as_nanos()),
             slow_answers: Arc::default(),
             unsettled: Arc::default(),
@@ -1619,6 +1625,8 @@ impl<P: Platform> GraphicsDecoder<P> {
         if let Some(gone) = gone {
             self.shared.surface_worker.drop_later(offset, offset, gone);
         }
+        // What the host's video devices made of the block's memory goes with its life.
+        drop(self.shared.block_lives.lock().remove(&offset));
         let worker = Arc::clone(&self.shared.surface_worker);
         let let_go = Box::new(move |cache| worker.drop_later(offset, offset, cache));
         let region = Arc::clone(&self.shared.region);

@@ -13,6 +13,7 @@
 //! process still reads lands once the read is done.
 
 use std::mem::ManuallyDrop;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use reims_graphics::ops::video::{
@@ -28,6 +29,8 @@ use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::PixelFormatInfo;
 use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_video_core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
+use reims_vgpu_video_core::surfaces::SurfaceError;
 use zerocopy::FromBytes;
 
 use super::worker::Worker;
@@ -188,6 +191,24 @@ pub struct VideoPlane<'a, P: Platform> {
     /// ([`RGFX_FEATURE_SURFACE_CACHE`](reims_graphics::wire::RGFX_FEATURE_SURFACE_CACHE)), rather
     /// than a buffer over its pages.
     pub cached: bool,
+    /// The memory the buffer lies in, as a device of the host's video reaches it in place: the
+    /// surface's view of its pages, or its block of the region (a copy block); `None` for a device
+    /// cache, and for a buffer over memory of another kind.
+    pub pages: Option<PlanePages>,
+}
+
+/// The memory a plane's buffer lies in, as the host's video devices take it
+/// ([`VideoPlane::pages`]): one mapping of it in the host's address space, whose identity lives
+/// as long as the mapping is the surface's (its view, or its block until its `BLOCK_RELEASE`),
+/// and whose host view is held mapped for as long as the device keeps it. What a device makes of
+/// it (a CUDA registration, a dma-buf's import) is kept by the identity and let go of once it
+/// ends.
+#[derive(Clone)]
+pub struct PlanePages {
+    /// The mapping.
+    pub memory: Arc<dyn DeviceMemory>,
+    /// Where the buffer's first byte lies in it, from its first byte.
+    pub buffer_offset: u64,
 }
 
 /// One access unit to decode, of the session's codec: H.264's ([`RGFX_OP_VIDEO_DECODE_H264`]) or
@@ -210,6 +231,72 @@ pub struct VideoDecode<'a, P: Platform> {
     /// apart, and half as many chroma rows from the chroma plane's (the op's `output_rows`): 0
     /// where the planes are the picture's crop alone.
     pub output_rows: u32,
+}
+
+/// A block of the region as the host's video devices take memory ([`PlanePages`]): its bytes in
+/// the region's mapping, which stays mapped while the region lives, held by the host view, and
+/// the block's life, which its `BLOCK_RELEASE` ends ([`GraphicsDecoder::block_released`]).
+struct RegionMemory {
+    identity: MemoryIdentity,
+    /// The block's first byte's host address.
+    first: u64,
+    /// The block's bytes.
+    length: usize,
+    /// The host's page.
+    page: usize,
+    region: Arc<reims_graphics::region::Region>,
+}
+
+impl RegionMemory {
+    /// The block of `size` bytes at `block` in `region`, of life `identity`, in host pages of
+    /// `page` bytes; `None` past it.
+    fn new(
+        region: &Arc<reims_graphics::region::Region>,
+        block: u64,
+        size: u64,
+        page: u64,
+        identity: MemoryIdentity,
+    ) -> Option<Self> {
+        if !region.contains(block, size) {
+            return None;
+        }
+        let base = u64::try_from(region.base().addr()).ok()?;
+        Some(Self {
+            identity,
+            first: base.checked_add(block)?,
+            length: usize::try_from(size).ok()?,
+            page: usize::try_from(page).ok().filter(|&p| p > 0)?,
+            region: Arc::clone(region),
+        })
+    }
+}
+
+impl DeviceMemory for RegionMemory {
+    fn identity(&self) -> MemoryIdentity {
+        self.identity.clone()
+    }
+
+    fn length(&self) -> usize {
+        self.length
+    }
+
+    /// The block's whole host pages, the block's first byte at its offset in them, held mapped
+    /// by the region.
+    fn host_view(&self) -> Result<HostView, SurfaceError> {
+        let page = self.page;
+        let at = usize::try_from(self.first)
+            .map_err(|_| SurfaceError::Unreachable("a block past the address space".to_owned()))?;
+        let offset = at % page;
+        let size = (offset + self.length).next_multiple_of(page);
+        let first = NonNull::new((at - offset) as *mut u8)
+            .ok_or_else(|| SurfaceError::Unreachable("a block at no address".to_owned()))?;
+        Ok(HostView {
+            first,
+            size,
+            offset,
+            hold: Box::new(Arc::clone(&self.region)),
+        })
+    }
 }
 
 /// The fields the decode ops' bodies share ([`RgfxVideoOpDecodeH264`],
@@ -343,6 +430,9 @@ pub(super) fn decode_op<P: Platform>(
             width: luma_place.width,
             height: luma_place.height,
             cached: luma_cache.is_some(),
+            pages: (luma_cache.is_none())
+                .then(|| objs.plane_pages(luma_place.buffer_obj_id, luma))
+                .flatten(),
         },
         chroma: VideoPlane {
             buffer: chroma,
@@ -352,6 +442,9 @@ pub(super) fn decode_op<P: Platform>(
             width: chroma_place.width,
             height: chroma_place.height,
             cached: chroma_cache.is_some(),
+            pages: (chroma_cache.is_none())
+                .then(|| objs.plane_pages(chroma_place.buffer_obj_id, chroma))
+                .flatten(),
         },
         output_rows: m.output_rows,
     };
@@ -378,6 +471,39 @@ impl<P: Platform> GraphicsDecoder<P> {
             Some(ObjHandle::Refused(r)) => Err(r.reference(id)),
             _ => Err(bad_reference()),
         }
+    }
+
+    /// The memory the buffer `obj_id`, `buffer`, lies in, as the host's video devices take it
+    /// ([`PlanePages`]): its surface's view where it lies over one, its block of the region where
+    /// it lies in one; `None` for a buffer over neither, or whose bytes lie outside it.
+    fn plane_pages(&self, obj_id: u64, buffer: &P::Buffer) -> Option<PlanePages> {
+        let entry = self.entry(obj_id)?;
+        let contents = u64::try_from(buffer.contents().addr()).ok()?;
+        let length = buffer.length();
+        let (memory, first) = if entry.over_view {
+            let (block, _) = entry.span?;
+            let view = self.shared.surface_views.lock().view(block)?;
+            (view.memory()?, u64::try_from(view.base().addr()).ok()?)
+        } else {
+            let bytes = entry.bytes.filter(|b| b.ram.is_none())?;
+            let (block, size) = self.region.block_of(bytes.at, bytes.length)?;
+            let identity = (self.shared.block_lives.lock())
+                .entry(block)
+                .or_insert_with(MemoryLife::new)
+                .identity();
+            let page = self.platform.vm().page_size();
+            let memory = RegionMemory::new(&self.region, block, size, page, identity)?;
+            let first = memory.first;
+            (Arc::new(memory) as Arc<dyn DeviceMemory>, first)
+        };
+        let buffer_offset = contents.checked_sub(first)?;
+        let fits = (buffer_offset.checked_add(length))
+            .zip(u64::try_from(memory.length()).ok())
+            .is_some_and(|(end, bytes)| end <= bytes);
+        fits.then_some(PlanePages {
+            memory,
+            buffer_offset,
+        })
     }
 
     /// Where texture `id`, one over an IOSurface plane, lies, and the buffer it lies in; an exec

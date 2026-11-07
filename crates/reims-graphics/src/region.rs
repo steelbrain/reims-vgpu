@@ -219,6 +219,15 @@ impl Region {
         Self::in_held(&self.blocks.lock(), context, offset, len)
     }
 
+    /// The block the `len` bytes at `offset` lie in, whoever holds it: its offset and size;
+    /// `None` where they lie in no one block.
+    pub fn block_of(&self, offset: u64, len: u64) -> Option<(u64, u64)> {
+        let blocks = self.blocks.lock();
+        let (&at, held) = blocks.range(..=offset).next_back()?;
+        let end = offset.checked_add(len)?;
+        (end <= at.saturating_add(held.size)).then_some((at, held.size))
+    }
+
     /// A copy of the `len` bytes at `offset`, where they lie in one block context `context`
     /// holds; the block cannot be revoked, and so given to another process, while it is copied.
     pub fn read_held(&self, context: u32, offset: u64, len: usize) -> Option<Vec<u8>> {
@@ -451,6 +460,21 @@ mod tests {
         assert!(region.read(64 * 1024 - 2, 3).is_none());
         assert!(region.read(u64::MAX, 1).is_none());
         assert!(Region::new(0).is_none());
+    }
+
+    /// A span's block is the granted or shared block it lies in, whoever holds it; a span past
+    /// its block's end, or in none, has none
+    #[test]
+    fn a_span_s_block_is_the_one_it_lies_in() {
+        let region = Region::new(1 << 20).unwrap();
+        region.grant(3, 0x1_0000, 0x4000);
+        region.share(4, 0x2_0000, 0x2000);
+        assert_eq!(region.block_of(0x1_1000, 0x1000), Some((0x1_0000, 0x4000)));
+        assert_eq!(region.block_of(0x1_0000, 0x4000), Some((0x1_0000, 0x4000)));
+        assert_eq!(region.block_of(0x2_1000, 0x1000), Some((0x2_0000, 0x2000)));
+        assert_eq!(region.block_of(0x1_3000, 0x2000), None);
+        assert_eq!(region.block_of(0x8000, 0x10), None);
+        assert_eq!(region.block_of(u64::MAX, 2), None);
     }
 
     /// A region over memory it is given reads and writes that memory, and frees it, through its
