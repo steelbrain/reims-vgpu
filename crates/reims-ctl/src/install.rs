@@ -216,12 +216,25 @@ mod tests {
             std::os::unix::fs::symlink(b, qemu.join("current")).unwrap();
         };
         link(builds[0]);
-        let mut running = std::process::Command::new(qemu.join("current").join(bin))
-            .args(["--exact", "install::tests::idle_as_a_qemu"])
-            .env("REIMS_CTL_TEST_IDLE", "1")
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let spawn = || {
+            std::process::Command::new(qemu.join("current").join(bin))
+                .args(["--exact", "install::tests::idle_as_a_qemu"])
+                .env("REIMS_CTL_TEST_IDLE", "1")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+        };
+        // The copy is busy for as long as a process another test forked before its copy closed
+        // holds it open, until that process execs: Linux refuses to exec it then (ETXTBSY).
+        let mut tries = 0;
+        let mut running = loop {
+            match spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 200 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                r => break r.unwrap(),
+            }
+        };
         link(builds[4]);
         let pruned = std::process::Command::new("bash")
             .arg("-c")

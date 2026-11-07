@@ -743,6 +743,33 @@ pub fn tail(path: &Path, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// A QEMU for tests: a process whose command line names `pidfile` and which writes its pid
+/// there once it runs, as QEMU's `-pidfile` does, running `secs` seconds. It returns once the
+/// pid file names it. A pid file the test wrote itself after `spawn` could name a process
+/// whose command line still reads empty: Linux wakes the parent once the child's exec has
+/// replaced its memory, and sets the new program's command line after that.
+#[cfg(test)]
+pub(crate) fn test_qemu(pidfile: &Path, secs: u32) -> std::process::Child {
+    let mut qemu = std::process::Command::new("sh")
+        .args(["-c", &format!("echo $$ > \"$0\"; sleep {secs}; :")])
+        .arg(pidfile)
+        .spawn()
+        .unwrap();
+    let (id, deadline) = (qemu.id(), Instant::now() + Duration::from_secs(10));
+    let written = || {
+        let s = std::fs::read_to_string(pidfile).unwrap_or_default();
+        s.trim().parse::<u32>().ok() == Some(id)
+    };
+    while !written() {
+        if Instant::now() > deadline || qemu.try_wait().unwrap().is_some() {
+            let _ = qemu.kill();
+            panic!("the test QEMU wrote no pid file at {}", pidfile.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    qemu
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,13 +858,8 @@ mod tests {
             vms.push(Vm::load(&dir).unwrap());
         }
         reg.save().unwrap();
-        // a runs: a process whose command line names its pid file, as QEMU's does.
-        let mut qemu = std::process::Command::new("sh")
-            .args(["-c", "sleep 30; :"])
-            .arg(vms[0].pidfile())
-            .spawn()
-            .unwrap();
-        std::fs::write(vms[0].pidfile(), format!("{}\n", qemu.id())).unwrap();
+        // a runs.
+        let mut qemu = test_qemu(&vms[0].pidfile(), 30);
         let r = start(&vms[1], Host::current());
         let _ = qemu.kill();
         let _ = qemu.wait();
@@ -951,16 +973,7 @@ mod tests {
             dir: d.clone(),
             config: toml::from_str(config).unwrap(),
         };
-        // QEMU: a process whose command line names its pid file, as QEMU's does.
-        let qemu = || {
-            let q = std::process::Command::new("sh")
-                .args(["-c", "sleep 10; :"])
-                .arg(vm.pidfile())
-                .spawn()
-                .unwrap();
-            std::fs::write(vm.pidfile(), format!("{}\n", q.id())).unwrap();
-            q
-        };
+        let qemu = || test_qemu(&vm.pidfile(), 10);
         let mut running = qemu();
         let asked = fake_qmp(&vm.qmp_socket());
         let (tx, rx) = std::sync::mpsc::channel();

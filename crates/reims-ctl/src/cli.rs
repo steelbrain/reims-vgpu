@@ -1379,13 +1379,7 @@ mod tests {
         let dir = env.root.join("vms/x");
         register("x", &dir, "name = ");
         let pidfile = vm::pidfile_in(&dir);
-        // A process whose command line names the pid file, as QEMU's does.
-        let mut qemu = std::process::Command::new("sh")
-            .args(["-c", "sleep 30; :"])
-            .arg(&pidfile)
-            .spawn()
-            .unwrap();
-        std::fs::write(&pidfile, format!("{}\n", qemu.id())).unwrap();
+        let mut qemu = crate::runtime::test_qemu(&pidfile, 30);
         let r = delete_vm("x", false);
         let _ = qemu.kill();
         let _ = qemu.wait();

@@ -1043,12 +1043,20 @@ mod tests {
             qmp_socket_in(&dir, &long, runtime, short),
             qmp_socket_in(&dir, &other, runtime, short)
         );
+        // Bound where it falls, in the runtime directory or the short one: under a `$TMPDIR`
+        // too long for even a hashed name, as a CI job's can be, the short one.
         let tmp = std::env::temp_dir().join(format!("reims-ctl-qmp-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let s = qmp_socket_in(&dir, &long, &tmp, short);
+        let short_tmp = Path::new("/tmp").join(format!("reims-ctl-qmp-{}", std::process::id()));
+        for d in [&tmp, &short_tmp] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let s = qmp_socket_in(&dir, &long, &tmp, &short_tmp);
         let bound = std::os::unix::net::UnixListener::bind(&s)
             .and_then(|_l| std::os::unix::net::UnixStream::connect(&s));
-        let _ = std::fs::remove_dir_all(&tmp);
+        for d in [&tmp, &short_tmp] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        assert!(s.as_os_str().len() <= SOCKET_PATH_MAX, "{}", s.display());
         bound.unwrap_or_else(|e| panic!("{}: {e}", s.display()));
     }
 
