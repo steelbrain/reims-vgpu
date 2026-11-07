@@ -35,12 +35,15 @@
 //!     within the GPU's memory in 180 to 215, and into the pages across PCIe in 3.5 ms, as the
 //!     link idles down under a load of decodes alone; a CPU lock of the surface then downloads it
 //!     in 1 to 5 ms (12.4 MB).
-//!   - Elsewhere it lands in the surface's pages, through a buffer of the decoder's over the
-//!     buffer's import ([`ImportedPlanes`]), where the GPU shares the CPU's memory: copied in the
-//!     decode's own submission where the decode queue's family copies, and on a lent runtime
+//!   - Elsewhere it lands in the surface's pages, where the GPU shares the CPU's memory: copied in
+//!     the decode's own submission where the decode queue's family copies, and on a lent runtime
 //!     queue ([`RuntimeQueue`]) where it decodes alone, as each submission's copy out on a GPU of
-//!     its own memory without a reserved queue is. **Measured** with Mesa 26.2.6 (2026-11-07):
-//!     the video-decode family of a Radeon 780M (RADV) and of an Iris Xe (ANV, whose video
+//!     its own memory without a reserved queue is. The copy writes a buffer of the decoder's over
+//!     the pages' import by their pointer ([`ImportedPlanes`]), or, where the runtime imported
+//!     them otherwise (as dma-bufs, or in its import of the guest's RAM), the runtime's buffer
+//!     itself, which only a copy on a runtime queue reaches. **Measured** with Mesa 26.2.6
+//!     (2026-11-07): no output surface of a 26.7.2 guest's on a Radeon 780M (RADV) was imported
+//!     by its pointer; the video-decode family of the 780M and of an Iris Xe (ANV, whose video
 //!     queues `ANV_DEBUG=video-decode` makes) decodes alone, with no transfer, graphics or
 //!     compute. The 780M could decode into the pages themselves (its decode output and DPB may
 //!     be distinct, and an output may be linear over imported host memory), but the decode
@@ -141,8 +144,9 @@ struct DeviceVideo {
     /// What it answers for each HEVC profile it decodes; none where it decodes no HEVC.
     h265: Vec<H265Capabilities>,
     /// Whether the decoders copy pictures out on a queue of the runtime's families (the
-    /// reserved queue, or a lent one: [`RuntimeQueue`]), which writes the runtime's buffers, an
-    /// IOSurface's device cache among them.
+    /// reserved queue, or a lent one: [`RuntimeQueue`]), which writes the runtime's buffers.
+    runtime_copies: bool,
+    /// Whether an IOSurface's device cache is among those buffers: on a GPU of its own memory.
     caches: bool,
     /// The kind of event its sessions signal, by where the copies out go ([`EventKind::of`]).
     events: EventKind,
@@ -259,8 +263,9 @@ impl DeviceVideo {
                     handles.physical_device,
                 ),
         };
+        let runtime_copies = reserved.is_some() || lent.is_some();
         // The device caches are a GPU of its own memory's: elsewhere a picture lands in the pages.
-        let caches = !unified && (reserved.is_some() || lent.is_some());
+        let caches = !unified && runtime_copies;
         let events = EventKind::of(lent.is_some());
         let copy_queue = match (reserved, &lent) {
             (Some(_), _) => "the reserved queue",
@@ -317,6 +322,7 @@ impl DeviceVideo {
             video,
             h264,
             h265,
+            runtime_copies,
             caches,
             events,
             device: device.clone_ref(),
@@ -470,8 +476,9 @@ fn decoded_codecs(
 enum Output {
     /// In the surface's pages, through the decoder's buffer over their import.
     Pages(ImportedPlanes),
-    /// In the surface's device cache, the runtime's buffer, which `keep` holds.
-    Cache {
+    /// In the runtime's buffer of the surface, which `keep` holds: its device cache, or its pages
+    /// where they are imported other than by their pointer.
+    Runtime {
         planes: BufferPlanes,
         _keep: Arc<dyn Send + Sync>,
     },
@@ -481,7 +488,7 @@ impl Surface for Output {
     fn landing(&self) -> Landing {
         match self {
             Self::Pages(planes) => planes.landing(),
-            Self::Cache { planes, .. } => Landing::Buffer(*planes),
+            Self::Runtime { planes, .. } => Landing::Buffer(*planes),
         }
     }
 }
@@ -927,14 +934,12 @@ fn output(video: &DeviceVideo, decode: &VideoDecode<'_, VulkanPlatform>) -> Rais
     if luma.cached || chroma.cached {
         return cache_output(video, luma, chroma);
     }
-    let video = &video.video;
     let (Some((import, luma_host)), Some((chroma_import, chroma_host))) =
         (plane_import(luma), plane_import(chroma))
     else {
-        return Err(decode_fault(
-            "an output surface whose planes are no host pages in place",
-        ));
+        return runtime_pages_output(video, luma, chroma);
     };
+    let video = &video.video;
     // Each plane's first byte from the luma buffer's byte 0 in the import.
     let chroma_at = (chroma_import.memory == import.memory)
         .then(|| chroma_import.offset.checked_sub(import.offset))
@@ -994,12 +999,78 @@ fn cache_output(
             "an output surface in a device cache, which the device's copies do not reach",
         ));
     }
-    // SAFETY: the buffers are written only by the decode's copy, ordered after the cache's fill
-    // (the op's wait) and before the work of the command buffer that waits for the decode, while
-    // the output holds them.
+    if !(luma.cached && chroma.cached) {
+        return Err(decode_fault("an output surface whose planes lie apart"));
+    }
+    let planes = runtime_planes(luma, chroma)?;
+    let keep: Arc<dyn Send + Sync> = Arc::new((luma.buffer.clone_ref(), chroma.buffer.clone_ref()));
+    Ok(Output::Runtime {
+        planes,
+        _keep: keep,
+    })
+}
+
+/// The output of planes in their surface's pages, which the runtime imported in place other than
+/// by their pointer (as dma-bufs, or in its import of the guest's RAM), so that no buffer of the
+/// decoder's binds there: the runtime's buffer itself, which the decoders' copy out writes on a
+/// runtime queue ([`RuntimeQueue`]), the write bracketed for the dirty log as for
+/// [`ImportedPlanes`]. A copy out on the decode queue reaches no buffer of the runtime's; pages
+/// imported by their pointer that answer no import are a read-only view, which drops the GPU's
+/// writes, and a copy of the pages is the runtime's to bring in step.
+fn runtime_pages_output(
+    video: &DeviceVideo,
+    luma: &VideoPlane<'_, VulkanPlatform>,
+    chroma: &VideoPlane<'_, VulkanPlatform>,
+) -> RaiseResult<Output> {
+    let in_place = |p: &VideoPlane<'_, VulkanPlatform>| {
+        matches!(
+            p.buffer.raw.host_backing(),
+            Some(rt::HostBacking::ImportedAsDmaBuf | rt::HostBacking::InHostRam)
+        )
+    };
+    if !video.runtime_copies || !in_place(luma) || !in_place(chroma) {
+        return Err(decode_fault(
+            "an output surface whose planes are no host pages in place",
+        ));
+    }
+    let host = |p: &VideoPlane<'_, VulkanPlatform>| {
+        let at = u64::try_from(p.buffer.raw.contents()?.as_ptr().addr()).ok()?;
+        let first = at.checked_add(p.offset)?;
+        Some((first, end_of(first, p)?))
+    };
+    let (Some((luma_first, luma_end)), Some((chroma_first, chroma_end))) =
+        (host(luma), host(chroma))
+    else {
+        return Err(decode_fault(
+            "an output surface whose planes are no host pages in place",
+        ));
+    };
+    let planes = runtime_planes(luma, chroma)?;
+    // The planes' bytes, written while the output lives, for the dirty log.
+    let first = luma_first.min(chroma_first);
+    let last = luma_end.max(chroma_end);
+    let keep: Arc<dyn Send + Sync> = Arc::new((
+        luma.buffer.clone_ref(),
+        chroma.buffer.clone_ref(),
+        host_write(first, last - first),
+    ));
+    Ok(Output::Runtime {
+        planes,
+        _keep: keep,
+    })
+}
+
+/// The planes in the runtime's buffer they lie in, one for both.
+fn runtime_planes(
+    luma: &VideoPlane<'_, VulkanPlatform>,
+    chroma: &VideoPlane<'_, VulkanPlatform>,
+) -> RaiseResult<BufferPlanes> {
+    // SAFETY: the buffers are written only by the decode's copy, ordered after the op's wait
+    // (a device cache's fill, the guest's writes) and before the work of the command buffer
+    // that waits for the decode, while the output holds them.
     let ((buffer, luma_base), (chroma_buffer, chroma_base)) =
         unsafe { (luma.buffer.raw.vk_buffer(), chroma.buffer.raw.vk_buffer()) };
-    if !(luma.cached && chroma.cached) || chroma_buffer != buffer {
+    if chroma_buffer != buffer {
         return Err(decode_fault("an output surface whose planes lie apart"));
     }
     let plane = |p: &VideoPlane<'_, VulkanPlatform>, base: u64| {
@@ -1016,16 +1087,11 @@ fn cache_output(
     else {
         return Err(decode_fault("an output plane past 4 GiB"));
     };
-    let planes = BufferPlanes {
+    Ok(BufferPlanes {
         buffer,
         luma: luma_plane,
         chroma: chroma_plane,
         size,
-    };
-    let keep: Arc<dyn Send + Sync> = Arc::new((luma.buffer.clone_ref(), chroma.buffer.clone_ref()));
-    Ok(Output::Cache {
-        planes,
-        _keep: keep,
     })
 }
 
