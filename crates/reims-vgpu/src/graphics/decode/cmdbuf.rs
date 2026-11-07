@@ -3103,6 +3103,8 @@ mod tests {
     /// A decode a fake host's video was handed: its session's codec, its access unit (offset,
     /// size), its parameter sets and its planes (offset, bytes per row, width, height).
     type SeenDecode = (u32, u64, u64, Vec<u8>, [u64; 4], [u64; 4]);
+    /// A plane's memory: its identity, where the plane's buffer lies in it, and its bytes.
+    type SeenPages = [Option<(MemoryIdentity, u64, usize)>; 2];
 
     /// What a fake host's video was handed: each decode, whether each of its planes was in a
     /// device cache, and the thread each of its sessions ended on.
@@ -3111,7 +3113,7 @@ mod tests {
         decodes: Mutex<Vec<SeenDecode>>,
         cached: Mutex<Vec<[bool; 2]>>,
         /// Each plane's memory: its identity, where the plane's buffer lies in it, and its bytes.
-        pages: Mutex<Vec<[Option<(MemoryIdentity, u64, usize)>; 2]>>,
+        pages: Mutex<Vec<SeenPages>>,
         output_rows: Mutex<Vec<u32>>,
         ended_on: Mutex<Vec<Option<String>>>,
     }

@@ -29,7 +29,7 @@ use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::PixelFormatInfo;
 use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_video_core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
+use reims_vgpu_video_core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
 use reims_vgpu_video_core::surfaces::SurfaceError;
 use zerocopy::FromBytes;
 
@@ -489,7 +489,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             let (block, size) = self.region.block_of(bytes.at, bytes.length)?;
             let identity = (self.shared.block_lives.lock())
                 .entry(block)
-                .or_insert_with(MemoryLife::new)
+                .or_default()
                 .identity();
             let page = self.platform.vm().page_size();
             let memory = RegionMemory::new(&self.region, block, size, page, identity)?;
