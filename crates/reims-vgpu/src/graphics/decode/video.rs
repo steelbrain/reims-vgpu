@@ -19,7 +19,9 @@ use reims_graphics::ops::video::{
     RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RgfxVideoOpDecodeH264,
     RgfxVideoOpDecodeH265,
 };
-use reims_graphics::wire::{RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxVideoCodecCaps};
+use reims_graphics::wire::{
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxVideoCodecCaps, RgfxVideoOutputLayout,
+};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
 use reims_vgpu_core::platform::event::EventRef;
@@ -40,6 +42,11 @@ const FILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 pub trait GraphicsVideo<P: Platform>: Send + Sync {
     /// One answer for each codec and direction the hardware takes.
     fn caps(&self) -> Vec<RgfxVideoCodecCaps>;
+    /// How a decode of `codec`, one of [`Self::caps`], lands its pictures in place, in the
+    /// output surfaces' planes; all zero where it lands them by a copy alone.
+    fn layout(&self, _codec: &RgfxVideoCodecCaps) -> RgfxVideoOutputLayout {
+        RgfxVideoOutputLayout::default()
+    }
     /// A session of `codec` (`RGFX_VIDEO_CODEC_*`) in `direction` (`RGFX_VIDEO_DECODE` or
     /// `RGFX_VIDEO_ENCODE`); `None` where the hardware has no such codec.
     fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>>;
@@ -188,6 +195,10 @@ pub struct VideoDecode<'a, P: Platform> {
     pub luma: VideoPlane<'a, P>,
     /// The output's chroma plane (`RG8`, a pair of samples a pixel, or `RG16`).
     pub chroma: VideoPlane<'a, P>,
+    /// The luma rows the output surface holds from the luma plane's first, `bytes_per_row`
+    /// apart, and half as many chroma rows from the chroma plane's (the op's `output_rows`): 0
+    /// where the planes are the picture's crop alone.
+    pub output_rows: u32,
 }
 
 /// The fields the decode ops' bodies share ([`RgfxVideoOpDecodeH264`],
@@ -200,6 +211,7 @@ struct DecodeOp {
     luma_texture_obj_id: u64,
     chroma_texture_obj_id: u64,
     parameter_sets_size: u32,
+    output_rows: u32,
 }
 
 impl DecodeOp {
@@ -219,6 +231,7 @@ impl DecodeOp {
                             luma_texture_obj_id: m.luma_texture_obj_id,
                             chroma_texture_obj_id: m.chroma_texture_obj_id,
                             parameter_sets_size: m.parameter_sets_size,
+                            output_rows: m.output_rows,
                         };
                         (op, rest)
                     })
@@ -329,6 +342,7 @@ pub(super) fn decode_op<P: Platform>(
             height: chroma_place.height,
             cached: chroma_cache.is_some(),
         },
+        output_rows: m.output_rows,
     };
     // After the buffers of other queues its command buffer runs after: the reads of the
     // output it would land over among them.

@@ -3104,6 +3104,7 @@ mod tests {
     struct VideoSeen {
         decodes: Mutex<Vec<SeenDecode>>,
         cached: Mutex<Vec<[bool; 2]>>,
+        output_rows: Mutex<Vec<u32>>,
         ended_on: Mutex<Vec<Option<String>>>,
     }
 
@@ -3172,6 +3173,7 @@ mod tests {
                 .cached
                 .lock()
                 .push([d.luma.cached, d.chroma.cached]);
+            self.seen.output_rows.lock().push(d.output_rows);
             Ok(self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1)
         }
     }
@@ -3216,8 +3218,9 @@ mod tests {
     }
 
     /// A video encoder hands its session each decode with the objects it names resolved: the
-    /// access unit's place in its buffer, the parameter sets that follow the op's body, and where
-    /// each plane's texture lies in the surface's buffer; the command buffer then waits for the
+    /// access unit's place in its buffer, the parameter sets that follow the op's body, where
+    /// each plane's texture lies in the surface's buffer, and the rows the surface holds
+    /// (`output_rows`); the command buffer then waits for the
     /// session's event to reach the value the decode answers, before its commit. A session the
     /// host has no video for is refused.
     #[test]
@@ -3269,7 +3272,7 @@ mod tests {
             luma_texture_obj_id: 7,
             chroma_texture_obj_id: 8,
             parameter_sets_size: sets.len() as u32,
-            ..RgfxVideoOpDecodeH264::default()
+            output_rows: 16,
         }
         .as_bytes()
         .to_vec();
@@ -3296,6 +3299,7 @@ mod tests {
             )]
         );
         assert_eq!(*seen.cached.lock(), [[false, false]], "a buffer of its own");
+        assert_eq!(*seen.output_rows.lock(), [16], "the rows the surface holds");
         let calls = p.call_log().calls();
         let sels: Vec<&str> = calls
             .iter()

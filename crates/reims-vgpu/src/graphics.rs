@@ -367,7 +367,14 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     },
                     ..RgfxVideoCaps::default()
                 };
-                for (slot, codec) in caps.codecs.iter_mut().zip(video.caps()) {
+                // A picture lands in place only in a surface's pages: none where the guest asks
+                // its outputs cached.
+                for ((slot, layout), codec) in
+                    (caps.codecs.iter_mut().zip(&mut caps.layouts)).zip(video.caps())
+                {
+                    if !cached {
+                        *layout = video.layout(&codec);
+                    }
                     *slot = codec;
                     caps.codec_count += 1;
                 }

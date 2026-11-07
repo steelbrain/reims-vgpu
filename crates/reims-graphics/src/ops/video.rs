@@ -49,8 +49,14 @@ pub struct RgfxVideoOpDecodeH264 {
     pub chroma_texture_obj_id: u64,
     /// The bytes of SPS and PPS NAL units after this body, before its padding; 0 for none.
     pub parameter_sets_size: u32,
-    /// Zero.
-    pub reserved_2c: u32,
+    /// The luma rows the output surface holds from the luma texture's first, whole rows of its
+    /// bytes per row (the texture's height, then the rows its surface extends it by below,
+    /// before plane 1), and half as many chroma rows from the chroma texture's: where the
+    /// codec's [`RgfxVideoOutputLayout`](crate::wire::RgfxVideoOutputLayout) is not zero, and the
+    /// textures are their planes' whole, the host may write the picture's whole coded rows
+    /// there. 0 where the textures are the picture's crop alone (a tile of a larger surface, or a
+    /// guest older than the field).
+    pub output_rows: u32,
 }
 
 /// Where a `DECODE_H264` op's parameter sets start: right after its body.
@@ -93,8 +99,8 @@ pub struct RgfxVideoOpDecodeH265 {
     pub chroma_texture_obj_id: u64,
     /// The bytes of the SPS and PPS NAL units after this body, before its padding; 0 for none.
     pub parameter_sets_size: u32,
-    /// Zero.
-    pub reserved_2c: u32,
+    /// As [`RgfxVideoOpDecodeH264::output_rows`].
+    pub output_rows: u32,
 }
 
 /// Where a `DECODE_H265` op's parameter sets start: right after its body.

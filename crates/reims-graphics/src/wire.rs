@@ -3192,6 +3192,29 @@ pub struct RgfxVideoCodecCaps {
     pub bitstream_alignment: u32,
 }
 
+/// How a decode of one codec lands its picture in place, in the output surface's planes
+/// themselves, with no copy: the host's GPU writes the picture's whole coded rows and columns
+/// there, in units of `granularity`, so a surface laid out to hold them takes it in place. The
+/// guest's video driver asks AppleGVA for such surfaces: each plane's rows the frame's height
+/// rounded up to a multiple of `granularity[1]` (chroma half), its rows `alignment` apart, from
+/// the frame's width rounded up to a multiple of `granularity[0]`, and its first byte at a
+/// multiple of `alignment` ([`RgfxVideoOpDecodeH264`]'s `output_rows` says what a surface holds).
+/// All zero where the host lands a picture by a copy of its crop alone, and from a host older
+/// than these: the driver then asks for planes of the frame's height.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVideoOutputLayout {
+    /// The units of luma samples a decode writes in place: width, height.
+    pub granularity: [u32; 2],
+    /// What each plane's first byte, and the bytes from one of its rows to the next, are a
+    /// multiple of.
+    pub alignment: u32,
+    /// Zero.
+    pub reserved_0c: u32,
+}
+
 /// The video caps the host writes at the device's init, at [`RGFX_VIDEO_CAPS_OFFSET`]: one
 /// [`RgfxVideoCodecCaps`] for each codec and direction its hardware takes, which the guest's
 /// video driver lists, and none for the rest, which the guest's software codecs serve.
@@ -3210,6 +3233,9 @@ pub struct RgfxVideoCaps {
     pub flags: u32,
     /// Zero.
     pub reserved_30c: u32,
+    /// How each of `codecs` lands its pictures in place, by its index there; all zero for a codec
+    /// whose pictures land by a copy, and from a host older than them.
+    pub layouts: [RgfxVideoOutputLayout; RGFX_VIDEO_CAPS_CODECS],
 }
 
 /// `VIDEO_SESSION_CREATE`: a video session.
@@ -3839,8 +3865,12 @@ const _: () = {
     );
     // The video caps follow it, still in the completion ring's span.
     assert!(size_of::<RgfxVideoCodecCaps>() == 48);
-    assert!(size_of::<RgfxVideoCaps>() == 8 + 48 * RGFX_VIDEO_CAPS_CODECS + 8);
+    assert!(size_of::<RgfxVideoOutputLayout>() == 16);
+    assert!(
+        size_of::<RgfxVideoCaps>() == 8 + 48 * RGFX_VIDEO_CAPS_CODECS + 8 + 16 * RGFX_VIDEO_CAPS_CODECS
+    );
     assert!(core::mem::offset_of!(RgfxVideoCaps, reserved_30c) == 0x30c);
+    assert!(core::mem::offset_of!(RgfxVideoCaps, layouts) == 0x310);
     assert!(RGFX_VIDEO_CAPS_OFFSET == RGFX_DEVICE_INFO_OFFSET + size_of::<RgfxDeviceInfo>() as u64);
     assert!(RGFX_VIDEO_CAPS_OFFSET.is_multiple_of(8));
     assert!(
