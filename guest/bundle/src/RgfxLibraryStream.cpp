@@ -69,7 +69,10 @@ bool makeWindow(RgfxRegion &region, uint64_t length, Window *w)
 		if (s.bytes == lastBytes)
 			continue; // a library smaller than the chunk: the same window again
 		lastBytes = s.bytes;
-		RgfxRegion::Block b = region.allocate(s.bytes);
+		// The chunks, which the process only writes, past the acks' page, which it reads:
+		// write-combined where the kext maps parts so.
+		RgfxRegion::Block b =
+		    region.allocate(s.bytes, RgfxRegion::kDefaultBlockAlign, kRgfxStagingPage);
 		if (!b.ok)
 			continue;
 		w->offset = b.offset;

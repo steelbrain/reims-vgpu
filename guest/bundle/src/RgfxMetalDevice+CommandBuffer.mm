@@ -60,8 +60,8 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 		return nil; // the region had no room for the ring pair
 	}
 	auto releaseRings = [region, rings] {
-		region->release(rings.submit_offset);
-		region->release(rings.complete_offset);
+		region->release(rings.submit_block);
+		region->release(rings.complete_block);
 	};
 	RgfxRingWriter *submit = [self addQueueSubmitRingAtOffset:rings.submit_offset
 	                                                dataSize:kQueueSubmitDataSize];

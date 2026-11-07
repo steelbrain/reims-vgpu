@@ -85,12 +85,13 @@ enum {
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
 // second word kRgfxAccelMethodFeatures answers: PagesBlock, Submit's deferred flag and
-// TakeAnswers, OpenContext's span, and shared events' ports. Each bit is set by the change that
-// lands its call.
+// TakeAnswers, OpenContext's span, shared events' ports, and Alloc's write-combined part. Each
+// bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureDeferredAnswers |
                                           kRgfxKextFeatureContextSpan |
-                                          kRgfxKextFeatureSharedEvents;
+                                          kRgfxKextFeatureSharedEvents |
+                                          kRgfxKextFeatureWriteCombined;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -288,6 +289,18 @@ public:
 	// client's task (retained for the caller), and the doorbell write that wakes the
 	// host's consumer of ring `ringId`.
 	IODeviceMemory *copyRegion() const;
+	// The region again, as a descriptor of its own that only write-combined spans are mapped
+	// from (retained for the caller; null before the contexts' start, or where it could not be
+	// made). A mapping's cache mode is set on its descriptor's one VM object for every page of
+	// it (xnu's IOKit hands the mode to mach_make_memory_entry with MAP_MEM_ONLY, which changes
+	// the object's WIMG bits), and the fault path maps a physically contiguous object's pages in
+	// the object's mode (vm_fault's pmap_map_block_addr; both read from the public xnu source).
+	// So a write-combined span mapped from the region's own descriptor would leave each region
+	// page faulted after it write-combined, and each write-back span after it would walk the
+	// object's resident pages to take the mode back. Measured on the Radeon 780M host:
+	// draws.10k's encode took 7.7 ms with the spans write-back, 1.05-1.3 ms write-combined.
+	// Defined with the contexts' state (RgfxAcceleratorContexts.cpp).
+	IODeviceMemory *copyWriteCombinedRegion() const;
 	// The region's first `size` bytes from RGFX_DEVICE_INFO_OFFSET (the device info, and the
 	// video caps after it), mapped read-only into the kernel: the map, which the caller
 	// releases, with *info its first byte; null where it cannot be mapped.
@@ -363,10 +376,11 @@ public:
 	// is kIOReturnBusy while a create naming it is in flight (pinRange). freeBlocks frees the
 	// owner's blocks after its close is answered; keepBlocks keeps them from use for good after
 	// a close that was not.
-	// allocBlock maps the block into the client's window before it returns; freeBlock takes it
-	// back from the window before the block is freed.
+	// allocBlock maps the block into the client's window before it returns, its bytes from
+	// `writeCombinedFrom` on write-combined (none where that is past the block); freeBlock takes
+	// it back from the window before the block is freed.
 	IOReturn allocBlock(RgfxAcceleratorUserClient *owner, UInt32 context, UInt64 size,
-	                    UInt64 align, UInt64 *offset);
+	                    UInt64 align, UInt64 writeCombinedFrom, UInt64 *offset);
 	IOReturn freeBlock(RgfxAcceleratorUserClient *owner, UInt64 offset);
 	// A pages block (kRgfxAccelMethodPagesBlock) of `owner` of context `context` over the
 	// `length` bytes at `address` in `task`, `writable` there: the block's offset and size. The

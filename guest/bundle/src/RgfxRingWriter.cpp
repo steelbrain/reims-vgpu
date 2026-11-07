@@ -57,9 +57,22 @@ void fullFence()
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
+// Orders every store before it, write-combined ones among them, before every store after it:
+// the ring's data and the bodies and chunks a message names may lie in write-combined parts of
+// their blocks (RgfxRegion.hpp, WRITE-COMBINED PARTS), whose stores x86 does not keep in order
+// with others, as a release store does for write-back memory.
+void storeFence()
+{
+#if defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_sfence();
+#else
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+#endif
+}
+
 // Copies `len` bytes to the ring at byte offset `at` (already within the data
-// area, no wrap). The region is write-back memory; a plain copy is right, and
-// the release store of `producer` orders it before the host reads it.
+// area, no wrap). A plain copy: storeFence orders it before the release store of
+// `producer`, so the host reads it whole.
 void writeBytes(volatile uint8_t *data, uint32_t at, const void *src, uint32_t len)
 {
 	std::memcpy(const_cast<uint8_t *>(data + at), src, len);
@@ -118,6 +131,7 @@ bool RgfxRingWriter::tryPostKnown(uint32_t type, const void *message, uint32_t s
 	std::memcpy(buf.get(), message, size);
 	RgfxMsgHeader header = { type, size, 0 };
 	std::memcpy(buf.get(), &header, sizeof(header));
+	storeFence();
 	uint64_t seqno = 0;
 	if (!m_deferredPost(m_deferredContext, buf.get(), size, &seqno, out_deferred))
 		return false;
@@ -221,6 +235,8 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 		std::memcpy(buf, message, size);
 		RgfxMsgHeader header = { type, size, 0 };
 		std::memcpy(buf, &header, sizeof(header));
+		// What the message names (a library's staging chunk) is written before the kext posts it.
+		storeFence();
 		uint64_t seqno = 0;
 		if (!m_forward(m_forwardContext, buf, size, &seqno, out_status))
 			return false;
@@ -260,6 +276,7 @@ bool RgfxRingWriter::tryPost(uint32_t type, const void *message, uint32_t size, 
 	if (beforePublish)
 		beforePublish(seqno);
 
+	storeFence();
 	store64(m_header + kProducer, m_produced);
 	fullFence();
 	if (m_doorbell && load32(m_header + kConsumerIdle) == 1)

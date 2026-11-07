@@ -57,8 +57,11 @@ public:
 	// bytes back over the span, read-only, before the span can be anyone else's. Any thread; the
 	// window's lock alone, which a caller may take under the accelerator's context or surface
 	// lock. mapSpan fails, the op it serves with it, where the window is closed or the span is not
-	// one; an unmapSpan that cannot map the window back closes the window.
-	IOReturn mapSpan(UInt64 offset, UInt64 length);
+	// one; an unmapSpan that cannot map the window back closes the window. The span is mapped
+	// write-back, or write-combined where `writeCombined` (the bytes the process only writes,
+	// allocBlock's), from the region's descriptor for those spans
+	// (RgfxAccelerator::copyWriteCombinedRegion), and write-back where that is missing.
+	IOReturn mapSpan(UInt64 offset, UInt64 length, bool writeCombined = false);
 	void unmapSpan(UInt64 offset, UInt64 length);
 
 	// Whether the client's task is WindowServer (initWithTask): its blocks may take the reserve
