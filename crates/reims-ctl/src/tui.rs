@@ -1764,12 +1764,20 @@ impl App {
                 let mut vm = Registry::load()?.open(name)?;
                 let installer = installer_change(&vm, f)?;
                 let picker = picker_change(&vm, f)?;
-                if (installer.is_some() || picker.is_some())
+                let graphics = vm.config.graphics();
+                apply_edit(&mut vm, f, self.gpus.as_deref())?;
+                // A change of graphics makes the OpenCore image for them, where the VM is
+                // stopped; while it runs, its next start makes one without reims-vgpu's kexts on
+                // another device, and warns of an image that lacks them on reims-vgpu.
+                let image = picker.is_some()
+                    || (vm.config.graphics() != graphics
+                        && !runtime::running(&vm)
+                        && opencore::made_for_other_graphics(&vm));
+                if (installer.is_some() || image)
                     && let Some(a) = self.activity.get(name)
                 {
                     bail!("{name} is busy: {a}");
                 }
-                apply_edit(&mut vm, f, self.gpus.as_deref())?;
                 vm.save()?;
                 let note = if runtime::running(&vm) {
                     " (at its next start)"
@@ -1781,16 +1789,16 @@ impl App {
                 // After the rest is saved: a DMG takes seconds to convert, and a new OpenCore image
                 // about as long. The image first: the form, submitted again after a failure, finds
                 // it made, where it would convert a DMG again.
-                if installer.is_some() || picker.is_some() {
-                    let first = if picker.is_some() {
+                if installer.is_some() || image {
+                    let first = if image {
                         "making a new OpenCore image"
                     } else {
                         "changing the installer"
                     };
                     self.spawn_for(f, name, first, move |p| {
                         let mut done = Vec::new();
-                        if let Some(on) = picker {
-                            done.push(opencore::renew(&mut vm, Some(on), p)?);
+                        if image {
+                            done.push(opencore::renew(&mut vm, picker, p)?);
                         }
                         if let Some(path) = installer {
                             done.push(set_installer(&mut vm, path, p)?);
@@ -2604,7 +2612,7 @@ macOS, unless its settings choose another (e, graphics).
               installed), its installer image, its boot selection (OpenCore's picker, which
               makes it a new OpenCore image) and graphics: reims-vgpu, its own GPU device,
               on one display in a window whose size the guest follows, with the macOS
-              drivers reims-ctl puts in its OpenCore image (U after a change); apple-gfx,
+              drivers reims-ctl puts in its OpenCore image (made again on a change); apple-gfx,
               Apple's paravirtualized GPU, with up to 8 displays and the host's video
               hardware; or QEMU's VMware SVGA, one display with no GPU acceleration, in
               QEMU's own window. Displays, resolution, HiDPI, refresh rate and video

@@ -175,9 +175,11 @@ buttons on the top row hold that key for the next key or click.";
 const UPDATE_OPENCORE_HELP: &str = "\
 The new image is made for the VM's graphics. On reims-vgpu it holds the macOS drivers of \
 reims-vgpu's own GPU device that this reims-ctl carries, which an image made for apple-gfx, or by \
-an older reims-ctl, lacks or holds other builds of: make it again after a change of graphics or an \
-update of reims-ctl, as reims-ctl start warns. An image an older reims-util made also lacks what a \
-newer one's carries, such as ReimsVgpu.kext, which macOS 26 needs on apple-gfx for a display wider \
+an older reims-ctl, lacks or holds other builds of: make it again after an update of reims-ctl, as \
+reims-ctl start warns. A change of graphics with reims-ctl set or the interface's edit form makes it \
+again where the VM is stopped, and a start on other graphics than reims-vgpu makes one without its \
+drivers where the image holds them. An image an older reims-util made also lacks what a newer one's \
+carries, such as ReimsVgpu.kext, which macOS 26 needs on apple-gfx for a display wider \
 than 2048 pixels and for GPU-accelerated Chrome. The new image presents the same Mac (its model, \
 serial number, MLB, UUID and ROM, read from the old image's config.plist), so macOS sees no new \
 machine, and the VM keeps its OVMF variables, which hold its boot entries. Its boot selection, \
@@ -371,8 +373,9 @@ pub struct SetArgs {
     #[arg(long)]
     pub memory: Option<String>,
     /// x86-64: reims-vgpu (the default on macOS 26.4 and later), its own GPU device, which the
-    /// guest drives with the kexts reims-ctl puts in its OpenCore image (after a change to it,
-    /// run update-opencore), on one display in a window whose size the guest follows; apple-gfx
+    /// guest drives with the kexts reims-ctl puts in its OpenCore image (a change of graphics
+    /// makes the image again for them, as update-opencore does, where the VM is stopped), on one
+    /// display in a window whose size the guest follows; apple-gfx
     /// (the default on an older macOS, which the kexts don't load on), Apple's paravirtualized
     /// GPU, the only one of arm64 VMs, with up to 8 displays and the host's video hardware; or
     /// vmware-svga, QEMU's VMware SVGA: one display with no GPU acceleration, in QEMU's own
@@ -1210,11 +1213,28 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
         ""
     };
     println!("{}: saved{note}", vm.name());
-    // A change to reims-vgpu wants the guest's kexts in its image.
-    if a.graphics.is_some()
-        && let Some(w) = opencore::missing_guest_kexts(&vm)
-    {
-        println!("{}: {w}", vm.name());
+    // A graphics given makes the OpenCore image for it, where the VM is stopped; while it runs,
+    // its next start makes one without reims-vgpu's kexts on another device, and warns of an
+    // image that lacks them on reims-vgpu.
+    if a.graphics.is_some() && opencore::made_for_other_graphics(&vm) {
+        let name = vm.name().to_string();
+        let running = runtime::running(&vm);
+        if !running {
+            match opencore::renew(&mut vm, None, &mut |p| println!("{name}: {p}")) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!(
+                    "warning: {name}: its OpenCore image is made for other graphics, and a new \
+                     one couldn't be made ({e:#}): reims-ctl update-opencore {name} makes it"
+                ),
+            }
+        } else if let Some(w) = opencore::missing_guest_kexts(&vm) {
+            println!("{name}: {w}");
+        } else {
+            println!(
+                "{name}: its OpenCore image loads reims-vgpu's macOS drivers: its next start \
+                 makes it a new one without them"
+            );
+        }
     }
     show(&crate::macos::as_started(&vm), host);
     Ok(())

@@ -226,13 +226,47 @@ pub fn missing_guest_kexts(vm: &Vm) -> Option<String> {
     }
 }
 
+/// Whether a VM's OpenCore image has OpenCore load any of the guest's kexts for reims-vgpu's own
+/// device; None where the image can't be read, or reims-ctl carries no set.
+fn loads_guest_kexts(vm: &Vm) -> Option<bool> {
+    let q = vm.config.q35.as_ref()?;
+    let config = Config::read(&vm.path(&q.opencore), q.opencore_format).ok()?;
+    let loaded = config.loaded_kexts();
+    let set = prebuilt::set().ok()?;
+    Some(
+        set.iter()
+            .any(|k| loaded.iter().any(|b| b.eq_ignore_ascii_case(k.bundle))),
+    )
+}
+
+/// Whether a VM on another device than reims-vgpu's own has an OpenCore image that loads the
+/// guest's kexts for it, as one made for reims-vgpu does. On a macOS they load on, OpenCore loads
+/// them with no device of theirs there (measured on apple-gfx with a macOS 26.7.2 guest:
+/// ReimsGraphicsLoader and RgfxGate loaded), and RgfxGate installs its Metal bundle in
+/// /Library/GPUBundles and sets AppleGVA's gvaForceAMDKE at each boot (guest/rgfxgate).
+pub fn holds_unused_guest_kexts(vm: &Vm) -> bool {
+    vm.config.graphics() != Graphics::ReimsVgpu && loads_guest_kexts(vm) == Some(true)
+}
+
+/// Whether a VM's OpenCore image is made for other graphics than the VM runs: on reims-vgpu,
+/// lacking the guest's kexts or holding other builds ([`missing_guest_kexts`]); on another
+/// device, loading them ([`holds_unused_guest_kexts`]).
+pub fn made_for_other_graphics(vm: &Vm) -> bool {
+    match vm.config.graphics() {
+        Graphics::ReimsVgpu => missing_guest_kexts(vm).is_some(),
+        _ => holds_unused_guest_kexts(vm),
+    }
+}
+
 /// Replaces a stopped VM's OpenCore image with one the installed reims-util makes, presenting
 /// the same Mac, with its boot picker shown where `show_picker` says, or as the old image shows
 /// it when `None`. The new image is made beside the old one, which stays as it was if that fails.
 /// It holds the kexts for the VM's graphics ([`reims_util::kext_args`]): on reims-vgpu's own
 /// device, the guest's that this reims-ctl carries. The VM keeps its OVMF: its variables hold
 /// its boot entries. The image is set in the VM's settings as they are once it is made, which
-/// `vm` becomes: others may be saved meanwhile. Returns what happened.
+/// `vm` becomes: others may be saved meanwhile. Returns what happened, and, where the old image
+/// loaded reims-vgpu's kexts on other graphics, what they left in the guest
+/// ([`crate::macos::gva_note`]).
 pub fn renew(
     vm: &mut Vm,
     show_picker: Option<bool>,
@@ -254,6 +288,7 @@ pub fn renew(
     let picker = show_picker.unwrap_or_else(|| config.shows_picker());
     let image = vm.dir.join("opencore.qcow2");
     let new = vm.dir.join("opencore.new.qcow2");
+    let dropped = holds_unused_guest_kexts(vm);
     let kexts = reims_util::kext_args(vm.config.graphics())?;
     let made = reims_util::opencore_as(&new, &id, picker, &kexts, progress).and_then(|()| {
         // reims-util hides the picker unless --show-picker asks for it; an older one shows it.
@@ -304,6 +339,11 @@ pub fn renew(
             "; the installed reims-util did not put reims-vgpu's macOS drivers in it as given: \
              run reims-ctl update, which installs the reims-util it needs, and make it again",
         );
+    }
+    // What the kexts left in the guest stays there.
+    if dropped && let Some(n) = crate::macos::gva_note(vm) {
+        s.push_str("; ");
+        s.push_str(&n);
     }
     Ok(s)
 }
@@ -965,6 +1005,147 @@ mod tests {
         renew(&mut vm, None, &mut |_| {}).unwrap();
         let given = std::fs::read_to_string(&args).unwrap();
         assert!(!given.contains("--add-kext"), "{given}");
+    }
+
+    /// A VM on apple-gfx or VMware SVGA whose image loads a kext of the guest's set, as one made
+    /// for reims-vgpu does, has its image made for other graphics; one whose image loads none
+    /// does not. On reims-vgpu, an image lacking them is made for other graphics.
+    #[test]
+    fn an_image_follows_the_graphics_by_the_guest_kexts_it_loads() {
+        let env = crate::testenv::Env::new("follow");
+        let dir = env.root.join("vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = |bundle: &str| {
+            format!(
+                "<dict><key>BundlePath</key><string>{bundle}</string>\
+                 <key>Enabled</key><true/></dict>"
+            )
+        };
+        let vm = |graphics: &str, kexts: &str| {
+            std::fs::write(dir.join("opencore.img"), image(plist(kexts).as_bytes())).unwrap();
+            let config = format!(
+                r#"
+                name = "t"
+                profile = "q35-x86_64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "disk.img"
+                disk_format = "raw"
+                graphics = "{graphics}"
+                [q35]
+                opencore = "opencore.img"
+                opencore_format = "raw"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
+                "#
+            );
+            std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+            Vm::load(&dir).unwrap()
+        };
+        let lilu = entry("Lilu.kext");
+        let ours = lilu.clone() + &entry("A.kext") + &entry("B.kext");
+        for g in ["apple-gfx", "vmware-svga"] {
+            let v = vm(g, &ours);
+            assert!(
+                holds_unused_guest_kexts(&v) && made_for_other_graphics(&v),
+                "{g}"
+            );
+            let v = vm(g, &lilu);
+            assert!(
+                !holds_unused_guest_kexts(&v) && !made_for_other_graphics(&v),
+                "{g}"
+            );
+        }
+        let v = vm("reims-vgpu", &ours);
+        assert!(!holds_unused_guest_kexts(&v));
+        let v = vm("reims-vgpu", &lilu);
+        assert!(!holds_unused_guest_kexts(&v) && made_for_other_graphics(&v));
+    }
+
+    /// A start of a VM on apple-gfx whose image loads the guest's kexts, as one made for
+    /// reims-vgpu does, makes it a new image for apple-gfx, without them, first, telling of the
+    /// AppleGVA setting they left in its guest; a start on reims-vgpu leaves an image lacking
+    /// them be, which its warnings tell of.
+    #[test]
+    fn a_start_makes_an_image_without_the_guest_kexts_for_other_graphics() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = crate::testenv::Env::new("start-follow");
+        let dir = env.root.join("vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = |bundle: &str| {
+            format!(
+                "<dict><key>BundlePath</key><string>{bundle}</string>\
+                 <key>Enabled</key><true/></dict>"
+            )
+        };
+        let lilu = entry("Lilu.kext");
+        let made = env.root.join("made.img");
+        std::fs::write(&made, image(plist(&lilu).as_bytes())).unwrap();
+        let args = env.root.join("args");
+        let util = env.root.join("reims-util");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\n\
+             while [ \"$1\" != -o ]; do shift; done\ncp '{made}' \"$2\"\n\
+             echo '{{\"event\":\"done\",\"result\":{{}}}}'\n",
+            args = args.display(),
+            made = made.display(),
+        );
+        std::fs::write(&util, script).unwrap();
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set("REIMS_CTL_UTIL", &util);
+        let vm = |graphics: &str, kexts: &str| {
+            std::fs::write(dir.join("opencore.img"), image(plist(kexts).as_bytes())).unwrap();
+            let config = format!(
+                r#"
+                name = "t"
+                profile = "q35-x86_64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "disk.img"
+                disk_format = "raw"
+                graphics = "{graphics}"
+                [q35]
+                opencore = "opencore.img"
+                opencore_format = "raw"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
+                "#
+            );
+            std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+            Vm::load(&dir).unwrap()
+        };
+        // Its guest keeps what RgfxGate wrote, which the new image's note tells of.
+        crate::macos::tests::gva_disk(&dir.join("disk.img"));
+        let mut v = vm(
+            "apple-gfx",
+            &(lilu.clone() + &entry("A.kext") + &entry("B.kext")),
+        );
+        let mut said = Vec::new();
+        let warned = crate::runtime::prepare(&mut v, &mut |s| said.push(s.to_string()));
+        assert!(warned.is_empty(), "{warned:?}");
+        assert!(said.iter().any(|s| s.contains("without them")), "{said:?}");
+        assert!(said.iter().any(|s| s.contains("AppleGVA")), "{said:?}");
+        assert!(
+            !std::fs::read_to_string(&args)
+                .unwrap()
+                .contains("--add-kext")
+        );
+        let q = v.config.q35.as_ref().unwrap();
+        assert_eq!(q.opencore, Path::new("opencore.qcow2"));
+        assert!(!holds_unused_guest_kexts(&v));
+        std::fs::remove_file(&args).unwrap();
+        // Started again, it makes no image, and tells nothing again.
+        let mut said = Vec::new();
+        crate::runtime::prepare(&mut v, &mut |s| said.push(s.to_string()));
+        assert!(said.is_empty() && !args.exists(), "{said:?}");
+        // Lacking them on reims-vgpu, the image stays.
+        let mut v = vm("reims-vgpu", &lilu);
+        crate::runtime::prepare(&mut v, &mut |_| {});
+        assert!(!args.exists());
+        assert_eq!(
+            v.config.q35.as_ref().unwrap().opencore,
+            Path::new("opencore.img")
+        );
     }
 
     /// An image holds the guest's kexts where OpenCore loads each, in the set's order, with

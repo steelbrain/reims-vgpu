@@ -253,6 +253,71 @@ pub fn as_started(vm: &Vm) -> Vm {
     v
 }
 
+/// AppleGVA's gvaForceAMDKE as a VM's macOS keeps it, in
+/// /Library/Preferences/com.apple.AppleGVA.plist on its Data volume. RgfxGate, a kext of the
+/// guest's set, sets it true at each boot on reims-vgpu's own device where that file is absent or
+/// an XML plist (guest/rgfxgate/src/RgfxGatePrefs.cpp), and nothing undoes it once the VM moves
+/// to other graphics. Some, with how many other keys the file holds, where it is true; None where
+/// the disk holds no such setting, or reims-ctl can't read it (an encrypted Data volume).
+fn gva_forced(vm: &Vm) -> Option<usize> {
+    let read = || -> Result<Option<usize>> {
+        let disk = Disk::open(&vm.disk(), vm.config.disk_format)?;
+        for start in crate::opencore::partitions(&disk, &APFS_TYPE)? {
+            let c = Container::open(&disk, start)?;
+            for bytes in c.files(APFS_VOL_ROLE_DATA, GVA_PREFERENCES)? {
+                let v = plist::Value::from_reader(std::io::Cursor::new(bytes))?;
+                let Some(d) = v.as_dictionary() else {
+                    continue;
+                };
+                let forced = d.get("gvaForceAMDKE").is_some_and(|k| {
+                    k.as_boolean() == Some(true) || k.as_signed_integer().is_some_and(|n| n != 0)
+                });
+                if forced {
+                    return Ok(Some(d.len() - 1));
+                }
+            }
+        }
+        Ok(None)
+    };
+    read().ok().flatten()
+}
+
+/// What a new OpenCore image without reims-vgpu's kexts, for an x86-64 VM on other graphics,
+/// tells of what they left in its macOS, which reims-ctl can't change: the AppleGVA setting
+/// ([`gva_forced`]), with the command that removes it, and RgfxGate's Metal bundle. Measured on
+/// apple-gfx with a macOS 26.7.2 guest: VideoToolbox answers the same with the setting and
+/// without it (no hardware decoding of H.264 or HEVC, no hardware encoder among its 15); with the
+/// file removed, the next boot on reims-vgpu writes it again, where `defaults delete` leaves an
+/// empty binary plist, which RgfxGate keeps as it is; root can't remove the bundle, which SIP
+/// protects. None where the guest keeps no such setting.
+pub fn gva_note(vm: &Vm) -> Option<String> {
+    let graphics = vm.config.graphics();
+    if vm.config.profile != Profile::Q35X86_64 || graphics == Graphics::ReimsVgpu {
+        return None;
+    }
+    let others = gva_forced(vm)?;
+    let g = graphics.name();
+    let file = format!("/{GVA_PREFERENCES}");
+    let undo = if others == 0 {
+        format!(
+            "sudo rm {file} (the drivers write it again if the VM goes back to reims-vgpu's \
+             device)"
+        )
+    } else {
+        format!("sudo plutil -remove gvaForceAMDKE {file}")
+    };
+    Some(format!(
+        "its macOS keeps a setting reims-vgpu's macOS drivers made, AppleGVA's gvaForceAMDKE, \
+         which points VideoToolbox at an AMD video driver, as reims-vgpu's device has: {g} has \
+         none, so it changes nothing there. To remove it anyway, run this in the guest's \
+         Terminal: {undo}. The drivers' Metal bundle, /Library/GPUBundles/reims-graphics.bundle, \
+         stays too: macOS protects it, and {g} doesn't use it"
+    ))
+}
+
+/// AppleGVA's preferences, from the Data volume's root.
+const GVA_PREFERENCES: &str = "Library/Preferences/com.apple.AppleGVA.plist";
+
 /// Each macOS the disk image at `path` holds: none where it has no GPT, no APFS container, or no
 /// macOS installed on one yet.
 pub fn on_disk(path: &Path, format: crate::vm::ImageFormat) -> Result<Vec<Macos>> {
@@ -295,6 +360,7 @@ const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 8;
 /// `apfs_fs_flags`.
 const APFS_FS_UNENCRYPTED: u64 = 1;
 const APFS_VOL_ROLE_PREBOOT: u16 = 0x10;
+const APFS_VOL_ROLE_DATA: u16 = 0x40;
 /// A file-system record's type, the top four bits of its key's first word.
 const APFS_TYPE_INODE: u8 = 3;
 const APFS_TYPE_FILE_EXTENT: u8 = 8;
@@ -421,8 +487,8 @@ impl<'a> Container<'a> {
         bail!("the object map has no object {oid}")
     }
 
-    /// Each macOS its Preboot volumes hold, for an install whose volumes are in the container.
-    fn macos(&self) -> Result<Vec<Macos>> {
+    /// Its volumes' superblocks.
+    fn volumes(&self) -> Result<Vec<Vec<u8>>> {
         let omap = le64(&self.nx, 160);
         let count = (le32(&self.nx, 180) as usize).min(100);
         let mut volumes = Vec::new();
@@ -439,6 +505,28 @@ impl<'a> Container<'a> {
             );
             volumes.push(sb);
         }
+        Ok(volumes)
+    }
+
+    /// The file at `path`, from a volume's root, on each unencrypted volume of `role` that holds
+    /// it.
+    fn files(&self, role: u16, path: &str) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        for sb in self.volumes()? {
+            if le16(&sb, 964) != role || le64(&sb, 264) & APFS_FS_UNENCRYPTED == 0 {
+                continue;
+            }
+            let fs = Volume::open(self, &sb)?;
+            if let Some(file) = fs.lookup(ROOT_DIR_INO_NUM, path)? {
+                out.push(fs.read(file)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Each macOS its Preboot volumes hold, for an install whose volumes are in the container.
+    fn macos(&self) -> Result<Vec<Macos>> {
+        let volumes = self.volumes()?;
         // The UUIDs an install's Preboot directory may be named by.
         let ids: BTreeSet<String> = volumes
             .iter()
@@ -454,14 +542,9 @@ impl<'a> Container<'a> {
                 if !ids.contains(&name.to_ascii_uppercase()) {
                     continue;
                 }
-                let mut at = Some(dir);
-                for part in ["System", "Library", "CoreServices", "SystemVersion.plist"] {
-                    at = match at {
-                        Some(d) => fs.child(d, part)?,
-                        None => break,
-                    };
-                }
-                if let Some(file) = at {
+                if let Some(file) =
+                    fs.lookup(dir, "System/Library/CoreServices/SystemVersion.plist")?
+                {
                     found.push(parse_version(&fs.read(file)?)?);
                 }
             }
@@ -705,6 +788,18 @@ impl<'a, 'c> Volume<'a, 'c> {
             .map(|(_, id)| id))
     }
 
+    /// The inode `path`, names separated by '/', names from directory `dir`.
+    fn lookup(&self, dir: u64, path: &str) -> Result<Option<u64>> {
+        let mut at = dir;
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            match self.child(at, part)? {
+                Some(id) => at = id,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(at))
+    }
+
     /// The bytes of file `id`, uncompressed, at most [`MOST_FILE`].
     fn read(&self, id: u64) -> Result<Vec<u8>> {
         let records = self.records(id)?;
@@ -716,7 +811,7 @@ impl<'a, 'c> Volume<'a, 'c> {
         ensure!(inode.len() >= 96, "a short APFS inode");
         ensure!(
             le32(inode, 68) & UF_COMPRESSED == 0,
-            "SystemVersion.plist is compressed"
+            "a compressed file, which reims-ctl does not read"
         );
         let size = dstream_size(inode).unwrap_or(0).min(MOST_FILE);
         let mut extents: Vec<(u64, u64, u64)> = Vec::new();
@@ -780,7 +875,7 @@ fn checksum_ok(b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::vm::ImageFormat;
 
@@ -875,80 +970,99 @@ mod tests {
         )
     }
 
-    /// A disk holding a GPT, one APFS partition from sector 40, and in it a Preboot volume
-    /// holding each of `installs`, a directory name and SystemVersion.plist's bytes, beside a
-    /// data volume whose group is `group`.
-    fn disk(installs: &[(&str, &[u8])], group: [u8; 16]) -> Vec<u8> {
+    /// A volume for [`disk`]: its role, UUID and volume group, and its files, each a path from
+    /// its root and the file's bytes.
+    struct Vol<'a> {
+        role: u16,
+        uuid: [u8; 16],
+        group: [u8; 16],
+        files: Vec<(&'a str, &'a [u8])>,
+    }
+
+    /// A disk holding a GPT, one APFS partition from sector 40, and in it `vols`, each with a
+    /// file-system tree of one leaf.
+    fn disk(vols: &[Vol]) -> Vec<u8> {
         const START: usize = 40 * 512;
-        // Blocks: 0 the superblock, 1-2 the container's object map, 3 the Preboot volume, 4-5
-        // its object map, 6 its tree, 7 the data volume, 8.. the files.
-        let mut blocks: Vec<Vec<u8>> = vec![Vec::new(); 8];
+        // Blocks: 0 the superblock, 1-2 the container's object map, then a volume's superblock,
+        // object map (two) and tree at 3 + 4i, then the files' data.
+        let mut blocks: Vec<Vec<u8>> = vec![Vec::new(); 3 + 4 * vols.len()];
         let mut nx = object(OBJECT_TYPE_NX_SUPERBLOCK | OBJ_PHYSICAL, 1, 1);
         put(&mut nx, 32, NX_MAGIC);
         put(&mut nx, 36, &(BS as u32).to_le_bytes());
         put(&mut nx, 160, &1u64.to_le_bytes());
         put(&mut nx, 180, &100u32.to_le_bytes());
-        put(&mut nx, 184, &1026u64.to_le_bytes());
-        put(&mut nx, 192, &1027u64.to_le_bytes());
-        blocks[0] = nx;
-        let [om, omt] = omap(1, &[(1026, 3), (1027, 7)]);
-        (blocks[1], blocks[2]) = (om, omt);
-        let mut sb = object(OBJECT_TYPE_FS, 1026, 1);
-        put(&mut sb, 32, APFS_MAGIC);
-        put(&mut sb, 56, &APFS_INCOMPAT_CASE_INSENSITIVE.to_le_bytes());
-        put(&mut sb, 116, &OBJECT_TYPE_BTREE.to_le_bytes());
-        put(&mut sb, 128, &4u64.to_le_bytes());
-        put(&mut sb, 136, &1028u64.to_le_bytes());
-        put(&mut sb, 264, &APFS_FS_UNENCRYPTED.to_le_bytes());
-        put(&mut sb, 964, &APFS_VOL_ROLE_PREBOOT.to_le_bytes());
-        blocks[3] = sb;
-        let [om, omt] = omap(4, &[(1028, 6)]);
-        (blocks[4], blocks[5]) = (om, omt);
-        let mut data = object(OBJECT_TYPE_FS, 1027, 1);
-        put(&mut data, 32, APFS_MAGIC);
-        put(&mut data, 1008, &group);
-        blocks[7] = data;
-        // The tree: the root directory, then for each install its directories and file.
-        let mut records = Vec::new();
-        let mut next = 16;
-        for (dir, plist) in installs {
-            let ids: Vec<u64> = (next..next + 5).collect();
-            next += 5;
-            records.push(drec(ROOT_DIR_INO_NUM, dir, ids[0]));
-            for (i, part) in ["System", "Library", "CoreServices", "SystemVersion.plist"]
-                .iter()
-                .enumerate()
-            {
-                records.push(drec(ids[i], part, ids[i + 1]));
-            }
-            let file = ids[4];
-            let mut inode = vec![0u8; 96 + 4 + 40];
-            put(&mut inode, 8, &(file + 100).to_le_bytes());
-            put(&mut inode, 92, &1u16.to_le_bytes());
-            put(&mut inode, 94, &40u16.to_le_bytes());
-            inode[96] = INO_EXT_TYPE_DSTREAM;
-            put(&mut inode, 98, &40u16.to_le_bytes());
-            put(&mut inode, 100, &(plist.len() as u64).to_le_bytes());
-            records.push((key(file, APFS_TYPE_INODE), inode));
-            let block = blocks.len() as u64;
-            let mut contents = plist.to_vec();
-            contents.resize(BS, 0);
-            blocks.push(contents);
-            let ext = [(BS as u64).to_le_bytes(), block.to_le_bytes(), [0; 8]].concat();
-            let ek = [
-                key(file + 100, APFS_TYPE_FILE_EXTENT),
-                0u64.to_le_bytes().to_vec(),
-            ];
-            records.push((ek.concat(), ext));
+        let mut map = Vec::new();
+        for i in 0..vols.len() {
+            put(&mut nx, 184 + i * 8, &(1026 + i as u64).to_le_bytes());
+            map.push((1026 + i as u64, 3 + 4 * i as u64));
         }
-        records.sort_by(|a, b| {
-            let id = |k: &[u8]| (le64(k, 0) & OBJ_ID_MASK, le64(k, 0) >> 60);
-            id(&a.0).cmp(&id(&b.0))
-        });
-        let mut tree = leaf(&records, false, 1028);
-        put(&mut tree, 24, &OBJECT_TYPE_BTREE.to_le_bytes());
-        blocks[6] = tree;
-        for b in blocks.iter_mut().take(8) {
+        blocks[0] = nx;
+        let [om, omt] = omap(1, &map);
+        (blocks[1], blocks[2]) = (om, omt);
+        for (i, v) in vols.iter().enumerate() {
+            let at = 3 + 4 * i;
+            let tree_oid = 2000 + i as u64;
+            let mut sb = object(OBJECT_TYPE_FS, 1026 + i as u64, 1);
+            put(&mut sb, 32, APFS_MAGIC);
+            put(&mut sb, 56, &APFS_INCOMPAT_CASE_INSENSITIVE.to_le_bytes());
+            put(&mut sb, 116, &OBJECT_TYPE_BTREE.to_le_bytes());
+            put(&mut sb, 128, &(at as u64 + 1).to_le_bytes());
+            put(&mut sb, 136, &tree_oid.to_le_bytes());
+            put(&mut sb, 240, &v.uuid);
+            put(&mut sb, 264, &APFS_FS_UNENCRYPTED.to_le_bytes());
+            put(&mut sb, 964, &v.role.to_le_bytes());
+            put(&mut sb, 1008, &v.group);
+            blocks[at] = sb;
+            let [om, omt] = omap(at as u64 + 1, &[(tree_oid, at as u64 + 3)]);
+            (blocks[at + 1], blocks[at + 2]) = (om, omt);
+            // The tree: each file's directories, once each, then its inode and extent.
+            let mut records = Vec::new();
+            let mut dirs: std::collections::BTreeMap<String, u64> = Default::default();
+            let mut next = 16;
+            for (path, bytes) in &v.files {
+                let parts: Vec<&str> = path.split('/').collect();
+                let mut parent = ROOT_DIR_INO_NUM;
+                for (j, part) in parts.iter().enumerate() {
+                    let prefix = parts[..=j].join("/");
+                    if let Some(&id) = dirs.get(&prefix) {
+                        parent = id;
+                        continue;
+                    }
+                    let id = next;
+                    next += 1;
+                    records.push(drec(parent, part, id));
+                    dirs.insert(prefix, id);
+                    parent = id;
+                }
+                let file = parent;
+                let mut inode = vec![0u8; 96 + 4 + 40];
+                put(&mut inode, 8, &(file + 1000).to_le_bytes());
+                put(&mut inode, 92, &1u16.to_le_bytes());
+                put(&mut inode, 94, &40u16.to_le_bytes());
+                inode[96] = INO_EXT_TYPE_DSTREAM;
+                put(&mut inode, 98, &40u16.to_le_bytes());
+                put(&mut inode, 100, &(bytes.len() as u64).to_le_bytes());
+                records.push((key(file, APFS_TYPE_INODE), inode));
+                let block = blocks.len() as u64;
+                let mut contents = bytes.to_vec();
+                contents.resize(BS, 0);
+                blocks.push(contents);
+                let ext = [(BS as u64).to_le_bytes(), block.to_le_bytes(), [0; 8]].concat();
+                let ek = [
+                    key(file + 1000, APFS_TYPE_FILE_EXTENT),
+                    0u64.to_le_bytes().to_vec(),
+                ];
+                records.push((ek.concat(), ext));
+            }
+            records.sort_by(|a, b| {
+                let id = |k: &[u8]| (le64(k, 0) & OBJ_ID_MASK, le64(k, 0) >> 60);
+                id(&a.0).cmp(&id(&b.0))
+            });
+            let mut tree = leaf(&records, false, tree_oid);
+            put(&mut tree, 24, &OBJECT_TYPE_BTREE.to_le_bytes());
+            blocks[at + 3] = tree;
+        }
+        for b in blocks.iter_mut().take(3 + 4 * vols.len()) {
             seal(b);
         }
         let mut img = vec![0u8; START + blocks.len() * BS];
@@ -962,6 +1076,40 @@ mod tests {
             put(&mut img, START + i * BS, b);
         }
         img
+    }
+
+    /// A Preboot volume holding SystemVersion.plist's `installs`, each in the directory named.
+    fn preboot<'a>(installs: &[(&'a str, &'a [u8])]) -> (Vol<'a>, Vec<String>) {
+        let paths: Vec<String> = installs
+            .iter()
+            .map(|(d, _)| format!("{d}/System/Library/CoreServices/SystemVersion.plist"))
+            .collect();
+        let vol = Vol {
+            role: APFS_VOL_ROLE_PREBOOT,
+            uuid: [0; 16],
+            group: [0; 16],
+            files: Vec::new(),
+        };
+        (vol, paths)
+    }
+
+    /// A data volume of the volume group [`GROUP`], holding `files`.
+    /// Writes at `path` a raw disk whose Data volume keeps the AppleGVA setting RgfxGate writes,
+    /// in a file of that key alone, as it makes one.
+    pub(crate) fn gva_disk(path: &Path) {
+        let pref = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>gvaForceAMDKE</key><true/></dict></plist>"#;
+        let (pre, _) = preboot(&[]);
+        std::fs::write(path, disk(&[pre, data(vec![(GVA_PREFERENCES, pref)])])).unwrap();
+    }
+
+    fn data<'a>(files: Vec<(&'a str, &'a [u8])>) -> Vol<'a> {
+        Vol {
+            role: APFS_VOL_ROLE_DATA,
+            uuid: GROUP,
+            group: GROUP,
+            files,
+        }
     }
 
     fn system_version(version: &str, build: &str) -> Vec<u8> {
@@ -996,13 +1144,17 @@ mod tests {
     fn a_disk_tells_the_macos_its_preboot_volume_holds() {
         let ours = system_version("15.6.1", "24G90");
         let stale = system_version("14.0", "23A344");
-        let img = disk(
-            &[
-                ("D36E3C34-BDAF-44AA-BE65-17C5DD686BC1", &ours),
-                ("00112233-4455-6677-8899-AABBCCDDEEFF", &stale),
-            ],
-            GROUP,
-        );
+        let installs = [
+            ("D36E3C34-BDAF-44AA-BE65-17C5DD686BC1", &ours[..]),
+            ("00112233-4455-6677-8899-AABBCCDDEEFF", &stale[..]),
+        ];
+        let (mut pre, paths) = preboot(&installs);
+        pre.files = paths
+            .iter()
+            .zip(&installs)
+            .map(|(p, (_, b))| (p.as_str(), *b))
+            .collect();
+        let img = disk(&[pre, data(Vec::new())]);
         let found = read(&img, "one").unwrap();
         assert_eq!(
             found,
@@ -1011,17 +1163,76 @@ mod tests {
                 build: Some("24G90".into())
             }]
         );
-        // A damaged object is an error, not a disk without macOS.
+        // A damaged object, the Preboot volume's tree, is an error, not a disk without macOS.
         let mut bad = img.clone();
         bad[40 * 512 + 6 * BS + 100] ^= 1;
         assert!(read(&bad, "bad").is_err());
+    }
+
+    /// A guest whose Data volume's AppleGVA preferences set gvaForceAMDKE, as RgfxGate leaves
+    /// them, is told, with the file's other keys counted; one without the key, or without the
+    /// file, is not.
+    #[test]
+    fn a_guest_tells_the_gva_setting_reims_vgpus_kexts_leave() {
+        let pref = |body: &str| {
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>{body}</dict></plist>"#
+            )
+            .into_bytes()
+        };
+        let forced = pref("<key>gvaForceAMDKE</key><true/>");
+        let kept = pref("<key>gvaForceAMDKE</key><true/><key>other</key><integer>1</integer>");
+        let off = pref("<key>other</key><integer>1</integer>");
+        let env = crate::testenv::Env::new("gva");
+        let dir = env.root.join("vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::vm::CONFIG_FILE),
+            r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.img"
+            disk_format = "raw"
+            graphics = "apple-gfx"
+            [q35]
+            opencore = "opencore.img"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            "#,
+        )
+        .unwrap();
+        let vm = Vm::load(&dir).unwrap();
+        let note = || gva_note(&vm).unwrap_or_default();
+        let with = |files: Vec<(&str, &[u8])>| {
+            let (pre, _) = preboot(&[]);
+            std::fs::write(dir.join("disk.img"), disk(&[pre, data(files)])).unwrap();
+            gva_forced(&vm)
+        };
+        assert_eq!(with(vec![(GVA_PREFERENCES, &forced)]), Some(0));
+        // A file of the key alone, as RgfxGate makes one, is removed; another loses the key.
+        assert!(note().contains("sudo rm /Library/Preferences/com.apple.AppleGVA.plist"));
+        assert_eq!(with(vec![(GVA_PREFERENCES, &kept)]), Some(1));
+        assert!(note().contains(
+            "sudo plutil -remove gvaForceAMDKE /Library/Preferences/com.apple.AppleGVA.plist"
+        ));
+        assert_eq!(with(vec![(GVA_PREFERENCES, &off)]), None);
+        assert_eq!(gva_note(&vm), None);
+        assert_eq!(
+            with(vec![("Library/Preferences/other.plist", &forced)]),
+            None
+        );
+        assert_eq!(with(Vec::new()), None);
     }
 
     /// A disk with no GPT, as a new one is, or no APFS container, holds no macOS.
     #[test]
     fn a_new_disk_holds_no_macos() {
         assert_eq!(read(&vec![0u8; 1 << 16], "empty").unwrap(), []);
-        let mut img = disk(&[], GROUP);
+        let (pre, _) = preboot(&[]);
+        let mut img = disk(&[pre, data(Vec::new())]);
         assert_eq!(read(&img, "no-install").unwrap(), []);
         img[1024] ^= 0xff;
         assert_eq!(read(&img, "no-apfs").unwrap(), []);
