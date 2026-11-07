@@ -69,10 +69,12 @@ constexpr uint64_t kSmallIds = RGFX_FEATURE_SMALL_ID_CHUNKS;
 constexpr uint64_t kColor = RGFX_FEATURE_DISPLAY_COLOR;
 constexpr uint64_t kMesh = RGFX_FEATURE_MESH_PIPELINES;
 constexpr uint64_t kShares = RGFX_FEATURE_SHARED_EVENT_NAMES;
+constexpr uint64_t kOpenCL = RGFX_FEATURE_OPENCL_MODE;
 constexpr uint64_t kPrivate = RGFX_FEATURE_PRIVATE_RENDER_STATE;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
-                              kBufferSlabs | kSmallIds | kColor | kMesh | kShares | kPrivate;
+                              kBufferSlabs | kSmallIds | kColor | kMesh | kShares | kOpenCL |
+                              kPrivate;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -83,12 +85,12 @@ int main()
 	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM,
 	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, MANAGED_TEXTURE_SLABS,
 	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, MESH_PIPELINES,
-	// SHARED_EVENT_NAMES and PRIVATE_RENDER_STATE, and writes each only where offered.
+	// SHARED_EVENT_NAMES, OPENCL_MODE and PRIVATE_RENDER_STATE, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
 	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, "
-	      "MESH_PIPELINES, SHARED_EVENT_NAMES and PRIVATE_RENDER_STATE from bit 3");
+	      "MESH_PIPELINES, SHARED_EVENT_NAMES, OPENCL_MODE and PRIVATE_RENDER_STATE from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -149,6 +151,13 @@ int main()
 	      "SHARED_EVENT_NAMES offered, written");
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kShares, 0) == kRgfxOfferedFeatures,
 	      "SHARED_EVENT_NAMES offered but not taken is not in the word");
+	check(RGFX_FEATURE_OPENCL_MODE == (1u << 27), "OPENCL_MODE is bit 27");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kOpenCL) == kOpenCL,
+	      "OPENCL_MODE offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kOpenCL, 0) == kRgfxOfferedFeatures,
+	      "OPENCL_MODE offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kOpenCL, kOpenCL) == (kRgfxOfferedFeatures | kOpenCL),
+	      "OPENCL_MODE taken is in the word");
 	check(RGFX_FEATURE_PRIVATE_RENDER_STATE == (1u << 28), "PRIVATE_RENDER_STATE is bit 28");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPrivate) == kPrivate,
 	      "PRIVATE_RENDER_STATE offered, written");

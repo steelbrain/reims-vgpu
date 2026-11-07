@@ -318,6 +318,11 @@ struct RgfxAirEntry {
 	// Its outputs (the entry's second node), in order: none for a kernel or a void function.
 	std::vector<RgfxAirOutput> outputs;
 	std::vector<RgfxAirNode> arguments;
+	// A kernel's `air.work_group_size` and its three sizes, a node of the entry's after its
+	// arguments' (an OpenCL C kernel's reqd_work_group_size, as Metal's compiler writes it for the
+	// GL renderer's programs; measured: macOS 26.7.1 and macOS 27).
+	bool hasWorkGroupSize = false;
+	uint32_t workGroupSize[3] = {1, 1, 1};
 };
 
 // The code of a module that declares function constants: its functions' bodies, as the reader

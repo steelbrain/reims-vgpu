@@ -15340,6 +15340,7 @@ void rgfxCreateTests();
 void rgfxKnownPipelineTests();
 void rgfxIcbTests();
 void rgfxGLTests();
+void rgfxClModeTests();
 
 // A block's arguments come from its own signature, and a creation's completion handler is called
 // with the arguments its shape takes: (object, error), or (object, nil reflection, error); a
@@ -15560,6 +15561,7 @@ int main(int argc, char **argv)
 		rgfxKnownPipelineTests(); // tests/known_pipeline_tests.mm
 		rgfxIcbTests();           // tests/icb_tests.mm
 		rgfxGLTests();            // tests/gl_tests.mm
+		rgfxClModeTests();        // tests/cl_mode_tests.mm
 		test_gl_function_encoder_ends_the_process();
 	}
 	std::printf("shell_tests: OK (%d checks)\n", g_checks.load());

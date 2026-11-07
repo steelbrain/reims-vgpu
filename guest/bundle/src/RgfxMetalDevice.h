@@ -109,6 +109,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// RGFX_FEATURE_MESH_PIPELINES (RgfxMeshPipelineDevice, which the render encoders ask).
 - (BOOL)rgfxMakesMeshPipelines;
 
+/// Whether the host makes compute pipelines of OpenCL mode, of the GL renderer's OpenCL kernels:
+/// the caps' features hold RGFX_FEATURE_OPENCL_MODE (RgfxFunction's newFunctionWithPluginData:).
+- (BOOL)rgfxMakesOpenCLModePipelines;
+
 /// The host's video codecs, as the video caps the host wrote say (RgfxVideoCaps): no codec
 /// where the host wrote none or the kext does not read them.
 - (const RgfxVideoCaps *)videoCaps;

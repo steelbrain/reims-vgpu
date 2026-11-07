@@ -67,6 +67,8 @@
 //    the kext's (RgfxSharedEventUserClient.hpp), for which the kext posts SHARED_EVENT_NAME,
 //    SHARED_EVENT_IMPORT and SHARED_EVENT_UNNAME, and the bundle's events take the values other
 //    holders give them on a queue of their own;
+//  - OPENCL_MODE (bit 27): the bundle makes the GL renderer's OpenCL kernels' pipelines of OpenCL
+//    mode (RGFX_COMPUTE_PIPELINE_OPENCL_MODE), which needs nothing of the kext;
 //  - PRIVATE_RENDER_STATE (bit 28): the bundle's render pipeline creates carry their descriptors'
 //    private state (RGFX_RENDER_PIPELINE_PRIVATE_STATE), which needs nothing of the kext.
 //
@@ -97,7 +99,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER | RGFX_FEATURE_SURFACE_DEFERRED |
     RGFX_FEATURE_HOST_TIME | RGFX_FEATURE_MANAGED_TEXTURE_SLABS |
     RGFX_FEATURE_MANAGED_BUFFER_SLABS | RGFX_FEATURE_SMALL_ID_CHUNKS | RGFX_FEATURE_DISPLAY_COLOR |
-    RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES |
+    RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES | RGFX_FEATURE_OPENCL_MODE |
     RGFX_FEATURE_PRIVATE_RENDER_STATE;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.

@@ -5,7 +5,9 @@
 #import "RgfxFunction.h"
 
 #import "RgfxArgumentEncoder.h"
+#import "RgfxGLFunction.h"
 #import "RgfxLibrary.h"
+#import "RgfxMetalDevice.h"
 #import "RgfxUnsupported.h"
 
 #import "RgfxMetalError.h"
@@ -40,6 +42,61 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	NSLog(@"RGFX: answered by Metal's own function: -[%s %s]", class_getName(cls), sel_getName(cmd));
 }
 
+// Logs, once per reason, that a kernel's function of OpenCL mode was not made.
+void logClOnce(const std::string &why)
+{
+	static std::mutex lock;
+	static std::set<std::string> said;
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		if (!said.insert(why).second)
+			return;
+	}
+	NSLog(@"RGFX: an OpenCL kernel's function was not made: %s; answered nil", why.c_str());
+}
+
+NSArray<NSNumber *> *numbersOf(const std::vector<uint32_t> &values)
+{
+	NSMutableArray<NSNumber *> *a = [NSMutableArray arrayWithCapacity:values.size()];
+	for (uint32_t v : values)
+		[a addObject:@(v)];
+	return a;
+}
+
+// The plugin return data of a kernel's function of OpenCL mode, as Metal answers it
+// (RgfxClMode.hpp): its buffers' and values' indices, its entry's name and its
+// reqd_work_group_size, in a binary property list.
+NSData *clReturnData(const RgfxClBindings &b, const std::string &entry)
+{
+	NSMutableDictionary *d = [NSMutableDictionary dictionary];
+	d[@"LinkerScript_buffer_bindings"] = numbersOf(b.buffers);
+	if (!b.byValue.empty())
+		d[@"LinkerScript_byVal_bindings"] = numbersOf(b.byValue);
+	d[@"LinkerScript_function_name"] = @(entry.c_str());
+	if (b.hasWorkGroupSize)
+		d[@"air.work_group_size"] = @[ @(b.workGroupSize[0]), @(b.workGroupSize[1]), @(b.workGroupSize[2]) ];
+	return [NSPropertyListSerialization dataWithPropertyList:d
+	                                                  format:NSPropertyListBinaryFormat_v1_0
+	                                                 options:0
+	                                                   error:nil];
+}
+
+// The bitcodeType of an OpenCL kernel's function, and the plugin data the GL renderer gives it
+// (GLDComputeProgramRec::createKernel; measured: 32 bytes, the first u32 2, the rest 0).
+constexpr NSUInteger kClBitcodeType = 2;
+constexpr size_t kClPluginDataLength = 32;
+
+bool isRendererPluginData(NSData *data)
+{
+	if (data.length != kClPluginDataLength)
+		return false;
+	const uint8_t *p = static_cast<const uint8_t *>(data.bytes);
+	for (size_t i = 0; i < kClPluginDataLength; i++)
+		if (p[i] != (i == 0 ? 2 : 0))
+			return false;
+	return true;
+}
+
 } // namespace
 
 @implementation RgfxFunction {
@@ -66,6 +123,8 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	id _returnType;                                 // what -returnType answers
 	NSArray *_arguments;                            // what -arguments and -bindings answer
 	BOOL _reflectedHere;                            // whether the two above are the answers
+	std::shared_ptr<const RgfxClBindings> _cl;      // a kernel's function of OpenCL mode's
+	NSData *_pluginData;                            //   bindings, and its plugin data
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -435,10 +494,66 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 }
 
 // Metal answers nil for every function, one made of a descriptor with plugin data too (measured):
-// its setPluginData: ends the process.
+// its setPluginData: ends the process. A kernel's function of OpenCL mode holds the plugin data it
+// was made with (measured: macOS 26.7.1, newFunctionWithPluginData:bitcodeType:).
 - (id)pluginData
 {
-	return nil;
+	return _pluginData;
+}
+
+- (id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(NSUInteger)bitcodeType
+{
+	if (bitcodeType != kClBitcodeType || !isRendererPluginData(pluginData)) {
+		logClOnce("its plugin data or bitcodeType is not the GL renderer's");
+		return nil;
+	}
+	id device = self.device;
+	if (![device respondsToSelector:@selector(rgfxMakesOpenCLModePipelines)] ||
+	    ![(RgfxMetalDevice *)device rgfxMakesOpenCLModePipelines]) {
+		logClOnce("the host makes no pipeline of OpenCL mode");
+		return nil;
+	}
+	if (![_library isKindOfClass:[RgfxLibrary class]]) {
+		logClOnce("its library is not the device's");
+		return nil;
+	}
+	RgfxLibrary *library = (RgfxLibrary *)_library;
+	std::shared_ptr<const RgfxAirEntries> module = [library rgfxAirEntryNamed:_name];
+	const RgfxAirEntry *entry = nullptr;
+	if (module != nullptr)
+		for (const RgfxAirEntry &e : module->entries)
+			if (e.name == _name)
+				entry = &e;
+	if (entry == nullptr) {
+		logClOnce("its AIR names no entry " + _name);
+		return nil;
+	}
+	RgfxClBindings bindings;
+	std::string why;
+	if (!RgfxClBindingsOf(*entry, bindings, why)) {
+		logClOnce(why);
+		return nil;
+	}
+	id<MTLFunction> variant = [library newFunctionWithName:@(_name.c_str())];
+	if (![(id)variant isKindOfClass:[RgfxFunction class]]) {
+		logClOnce("its library has no function " + _name);
+		return nil;
+	}
+	[(RgfxFunction *)variant rgfxSetClBindings:std::make_shared<const RgfxClBindings>(bindings)
+	                                pluginData:[pluginData copy]];
+	RgfxGLSetPluginReturnData(variant, clReturnData(bindings, _name));
+	return variant;
+}
+
+- (void)rgfxSetClBindings:(std::shared_ptr<const RgfxClBindings>)bindings pluginData:(NSData *)pluginData
+{
+	_cl = std::move(bindings);
+	_pluginData = pluginData;
+}
+
+- (std::shared_ptr<const RgfxClBindings>)rgfxClBindings
+{
+	return _cl;
 }
 
 // Metal's function aborts here, for any argument, nil too (measured: macOS 27), and so does ours.

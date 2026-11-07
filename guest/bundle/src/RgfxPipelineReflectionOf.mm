@@ -25,10 +25,57 @@ void logOnce(NSString *what, NSString *why)
 		NSLog(@"RGFX: %@: no reflection (%@); answered nil", what, why);
 }
 
+// A kernel's entry as its pipeline of OpenCL mode binds it (RgfxClMode.hpp; measured: macOS
+// 26.7.1, the Intel 630 and the AMD 5300M alike, through the GL renderer): each __global and
+// __constant pointer at its index plus 3; each value passed by value a buffer at its index plus 3,
+// read only and no constant buffer, of the value's type, size and alignment; each __local pointer
+// the threadgroup memory at its own index; then the three buffers the renderer binds, after the
+// kernel's own arguments.
+RgfxAirEntry clModeEntry(const RgfxAirEntry &entry, const RgfxClBindings &cl)
+{
+	RgfxAirEntry out = entry;
+	for (RgfxAirNode &n : out.arguments) {
+		if (n.kind == "air.constant") {
+			n.kind = "air.buffer";
+			n.hasAddressSpace = true;
+			n.addressSpace = 1;
+			n.access = RgfxAirAccess::Read;
+			n.index += kRgfxClHiddenBuffers;
+		} else if (n.kind == "air.buffer" && n.hasAddressSpace && n.addressSpace != 3) {
+			n.index += kRgfxClHiddenBuffers;
+		}
+	}
+	static const struct {
+		const char *name, *type;
+		RgfxAirAccess access;
+		uint32_t size;
+	} kHidden[kRgfxClHiddenBuffers] = {{"__global_offset_and_num_dims", "uint", RgfxAirAccess::Read, 4},
+	                                   {"__printf_buffer", "char", RgfxAirAccess::ReadWrite, 1},
+	                                   {"__image_order_data_type_table", "uint", RgfxAirAccess::Read, 4}};
+	for (uint32_t i = 0; i < kRgfxClHiddenBuffers; i++) {
+		RgfxAirNode h;
+		h.hasPosition = true;
+		h.position = cl.parameters + i;
+		h.kind = "air.buffer";
+		h.hasLocation = true;
+		h.index = i;
+		h.count = 1;
+		h.access = kHidden[i].access;
+		h.hasAddressSpace = true;
+		h.addressSpace = 1;
+		h.hasTypeSize = h.hasTypeAlign = true;
+		h.typeSize = h.typeAlign = kHidden[i].size;
+		h.typeName = kHidden[i].type;
+		h.name = kHidden[i].name;
+		out.arguments.push_back(std::move(h));
+	}
+	return out;
+}
+
 } // namespace
 
 bool RgfxStageReflectionOf(id<MTLFunction> function, NSString *prefix, const std::vector<RgfxDescriptorBuffer> &buffers,
-                           RgfxStageReflection &out, NSString *__strong *why)
+                           RgfxStageReflection &out, NSString *__strong *why, bool openCLMode)
 {
 	if (![(id)function isKindOfClass:[RgfxFunction class]]) {
 		*why = @"a function no library of the device made";
@@ -45,8 +92,10 @@ bool RgfxStageReflectionOf(id<MTLFunction> function, NSString *prefix, const std
 		*why = @"its function's AIR was not read";
 		return false;
 	}
-	if (!RgfxStageReflectionOfEntry(*module, module->entries[0], [f rgfxConstants], [f rgfxConstantCount], prefix,
-	                                buffers, out, why))
+	std::shared_ptr<const RgfxClBindings> cl = openCLMode ? [f rgfxClBindings] : nullptr;
+	const RgfxAirEntry entry = cl != nullptr ? clModeEntry(module->entries[0], *cl) : module->entries[0];
+	if (!RgfxStageReflectionOfEntry(*module, entry, [f rgfxConstants], [f rgfxConstantCount], prefix, buffers, out,
+	                                why))
 		return false;
 	out.pluginReturnData = RgfxGLPluginReturnData(function);
 	return true;
@@ -59,7 +108,7 @@ id RgfxComputePipelineReflectionOf(id<MTLFunction> kernel, MTLStageInputOutputDe
 		return nil;
 	RgfxStageReflection k;
 	NSString *why = nil;
-	id r = RgfxStageReflectionOf(kernel, @"stageInBuffer", RgfxStageInputBuffers(stageInput), k, &why)
+	id r = RgfxStageReflectionOf(kernel, @"stageInBuffer", RgfxStageInputBuffers(stageInput), k, &why, true)
 	           ? RgfxComputePipelineReflectionMake(k, &why)
 	           : nil;
 	if (r == nil)

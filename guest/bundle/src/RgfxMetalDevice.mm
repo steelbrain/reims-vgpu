@@ -1419,6 +1419,11 @@ RGFX_LOG_UNRECOGNIZED
 	return (_caps.features() & RGFX_FEATURE_MESH_PIPELINES) != 0;
 }
 
+- (BOOL)rgfxMakesOpenCLModePipelines
+{
+	return (_caps.features() & RGFX_FEATURE_OPENCL_MODE) != 0;
+}
+
 // Mesh shaders where the host makes mesh pipelines, as the M3 Max, the AMD 5300M and the Intel 630
 // answer YES (measured, tools/base_answers_probe.m, 11-05). Their SPI's supportsMeshShadersInICB
 // the x86 Macs answer NO and the M3 Max YES; the device leaves it to the base's NO, as no mesh

@@ -104,10 +104,13 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
                                 const std::vector<RgfxDescriptorBuffer> &buffers, RgfxStageReflection &out,
                                 NSString *__strong _Nullable *_Nonnull why);
 
-// As RgfxStageReflectionOfEntry, of `function`, one of our libraries' (RgfxFunction). This and the
-// creators' three below are RgfxPipelineReflectionOf.mm's.
+// As RgfxStageReflectionOfEntry, of `function`, one of our libraries' (RgfxFunction); where
+// `openCLMode` and the function is a kernel's of OpenCL mode (RgfxFunction's rgfxClBindings), as
+// its pipeline of OpenCL mode binds it (RgfxClMode.hpp). This and the creators' three below are
+// RgfxPipelineReflectionOf.mm's.
 bool RgfxStageReflectionOf(id<MTLFunction> function, NSString *prefix, const std::vector<RgfxDescriptorBuffer> &buffers,
-                           RgfxStageReflection &out, NSString *__strong _Nullable *_Nonnull why);
+                           RgfxStageReflection &out, NSString *__strong _Nullable *_Nonnull why,
+                           bool openCLMode = false);
 
 // Metal's compute pipeline reflection of a kernel's answers; nil, with `*why`, where Metal lacks a
 // class or instance variable it needs.

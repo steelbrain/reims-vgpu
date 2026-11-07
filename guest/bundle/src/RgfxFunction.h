@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "RgfxAirArguments.hpp" // RgfxAirFunction
+#include "RgfxClMode.hpp"         // RgfxClBindings
 #include "RgfxSerializer.hpp"   // RgfxLinkedFunctionRef
 #endif
 
@@ -156,7 +157,24 @@ typedef struct {
 /// empty array for one that is not stitchable; Metal's own function answers where it is null, or
 /// of a type the reader does not know.
 - (void)rgfxSetAirVisible:(std::shared_ptr<const RgfxAirVisible>)visible;
+/// Marks the function as a kernel's of OpenCL mode (newFunctionWithPluginData:bitcodeType: of 2):
+/// what its pipelines bind, which their reflection follows (RgfxClMode.hpp), and the plugin data
+/// it was made with, which `pluginData` answers.
+- (void)rgfxSetClBindings:(std::shared_ptr<const RgfxClBindings>)bindings pluginData:(NSData *)pluginData;
+/// What `rgfxSetClBindings:pluginData:` set; null for any other function.
+- (std::shared_ptr<const RgfxClBindings>)rgfxClBindings;
 #endif
+
+/// The function a pipeline of OpenCL mode is made of, which the GL renderer asks of each kernel
+/// of an OpenCL program it builds (GLDComputeProgramRec::createKernel, with 32 bytes of plugin data
+/// and bitcodeType 2; read from its code, measured: macOS 26.7.1). Metal answers a new function of
+/// the same name and stage holding the plugin data, and Metal links the kernel for OpenCL mode as
+/// it makes the pipeline. Ours is a new function of the same entry point, with the plugin return
+/// data Metal's has (RgfxGLPluginReturnData, RgfxClMode.hpp); the host links the kernel
+/// (RGFX_COMPUTE_PIPELINE_OPENCL_MODE). nil, logged once per reason, where the plugin data or
+/// bitcodeType is not the renderer's, the host makes no pipeline of OpenCL mode
+/// (RGFX_FEATURE_OPENCL_MODE), or the kernel binds what the rule does not cover.
+- (nullable id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(NSUInteger)bitcodeType;
 
 /// The function SPI RenderBox reads as it keys its pipelines: the SHA-256 of the function's
 /// bitcode, valid for the function's life (measured type: r^{?=[32C]}16@0:8).

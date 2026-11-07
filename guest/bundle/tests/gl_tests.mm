@@ -396,9 +396,12 @@ std::vector<uint8_t> clContainer(const std::vector<RgfxMetallibFunction> &fs)
 	return out;
 }
 
+} // namespace
+
 // Metal's compiler over OpenCL C source, as the GL renderer's cl2Metal compiles a compute program
 // (MTLCompileOptions' languageVersion 0x20002, sourceLanguage 1 and its additional arguments,
-// read from its code): the library's bytes, or none where this Mac's Metal makes none.
+// read from its code): the library's bytes, or none where this Mac's Metal makes none. Shared
+// with tests/cl_mode_tests.mm.
 NSData *clLibraryBytes(id<MTLDevice> metal, NSString *source, NSArray<NSString *> **names)
 {
 	MTLCompileOptions *o = [MTLCompileOptions new];
@@ -418,6 +421,8 @@ NSData *clLibraryBytes(id<MTLDevice> metal, NSString *source, NSArray<NSString *
 	*names = [lib.functionNames sortedArrayUsingSelector:@selector(compare:)];
 	return ((id(*)(id, SEL))objc_msgSend)(lib, contents);
 }
+
+namespace {
 
 void test_cl_library()
 {

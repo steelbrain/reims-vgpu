@@ -201,6 +201,11 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 		p.flags |= RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH;
 	if (descriptor.supportIndirectCommandBuffers)
 		p.flags |= RGFX_COMPUTE_PIPELINE_SUPPORT_ICB;
+	// A kernel's function of OpenCL mode (newFunctionWithPluginData:bitcodeType:, made only where
+	// the host makes such pipelines): the host links it for OpenCL mode, and answers the maximum
+	// threads per threadgroup of one of reqd_work_group_size.
+	if ([rf rgfxClBindings] != nullptr)
+		p.flags |= RGFX_COMPUTE_PIPELINE_OPENCL_MODE;
 	p.max_total_threads_per_threadgroup =
 	    static_cast<uint32_t>(descriptor.maxTotalThreadsPerThreadgroup);
 	p.max_call_stack_depth = static_cast<uint32_t>(descriptor.maxCallStackDepth);

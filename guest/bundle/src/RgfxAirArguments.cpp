@@ -2879,6 +2879,18 @@ bool entriesOf(const Module &m, RgfxAirEntries &out)
 				}
 				e.arguments.push_back(std::move(n));
 			}
+			for (size_t k = 3; k < entry->ops.size(); k++) {
+				const Module::Md *extra = mdNode(m, entry->ops[k]);
+				std::string key;
+				if (extra == nullptr || !mdText(m, *extra, 0, key) || key != "air.work_group_size")
+					continue;
+				if (extra->ops.size() != 4 || !mdUnsigned(m, *extra, 1, e.workGroupSize[0]) ||
+				    !mdUnsigned(m, *extra, 2, e.workGroupSize[1]) || !mdUnsigned(m, *extra, 3, e.workGroupSize[2])) {
+					out = {};
+					return false;
+				}
+				e.hasWorkGroupSize = true;
+			}
 			if (e.name.empty()) {
 				out = {};
 				return false;

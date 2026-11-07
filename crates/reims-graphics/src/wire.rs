@@ -63,8 +63,9 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_HOST_TIME`],
 /// [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`],
 /// [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`],
-/// [`RGFX_FEATURE_MESH_PIPELINES`], [`RGFX_FEATURE_SHARED_EVENT_NAMES`] and
-/// [`RGFX_FEATURE_PRIVATE_RENDER_STATE`]). Bits 9 and 10 are reserved.
+/// [`RGFX_FEATURE_MESH_PIPELINES`], [`RGFX_FEATURE_SHARED_EVENT_NAMES`],
+/// [`RGFX_FEATURE_OPENCL_MODE`] and [`RGFX_FEATURE_PRIVATE_RENDER_STATE`]). Bits 9 and 10 are
+/// reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -226,6 +227,14 @@ pub const RGFX_FEATURE_MESH_PIPELINES: u32 = 1 << 25;
 /// one holder's buffers and CPU give it are posted to every other holder
 /// ([`RgfxSharedEventName::listen_queue_obj_id`]).
 pub const RGFX_FEATURE_SHARED_EVENT_NAMES: u32 = 1 << 26;
+/// `FEATURES_LO` bit 27, `OPENCL_MODE`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`]: a [`RgfxComputePipelineCreate`] may carry
+/// [`RGFX_COMPUTE_PIPELINE_OPENCL_MODE`], and the host makes that pipeline of OpenCL mode (Metal's
+/// `openCLModeEnabled`): its function is a kernel of the AIR Metal's compiler writes for OpenCL C
+/// (`__entry_<name>`), linked as Metal links it, with three buffers of the dispatcher's ahead of
+/// the kernel's own. A host offers it only where its platform makes such pipelines. A host
+/// without it reads the flag as no flag, so the guest sends the flag only where it took the bit.
+pub const RGFX_FEATURE_OPENCL_MODE: u32 = 1 << 27;
 /// `FEATURES_LO` bit 28, `PRIVATE_RENDER_STATE`, which the guest takes through
 /// [`RGFX_REG_DRIVER_FEATURES_LO`]: a [`RgfxRenderPipelineCreate`] may carry
 /// [`RGFX_RENDER_PIPELINE_PRIVATE_STATE`] and, after its head, the
@@ -3351,6 +3360,9 @@ pub const RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH: u32 = 1 << 5;
 pub const RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH: u32 = 1 << 0;
 /// [`RgfxComputePipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
 pub const RGFX_COMPUTE_PIPELINE_SUPPORT_ICB: u32 = 1 << 1;
+/// [`RgfxComputePipelineCreate`] `flags`: `openCLModeEnabled` (Apple SPI), where the guest took
+/// [`RGFX_FEATURE_OPENCL_MODE`].
+pub const RGFX_COMPUTE_PIPELINE_OPENCL_MODE: u32 = 1 << 2;
 
 /// The bytes of [`RgfxFunctionConstant::value`]: the widest constant's, a `long4` or `ulong4`.
 pub const RGFX_FUNCTION_CONSTANT_VALUE_BYTES: usize = 32;
