@@ -7320,10 +7320,11 @@ void test_gl_renderer_spi()
 		CHECK(bgra != nil && [bgra swizzleKey] == 0x05020304u);
 		CHECK(plain != nil && [plain swizzleKey] == 0x05040302u);
 		drainRing(f.control);
-		// The same pass with and without the marks, committed the two ways: the same ops.
+		// The same pass with and without the marks, committed the two ways: the same ops. Its
+		// target is a stand-in, as other encoder tests'.
 		auto pass = [&](bool marks, bool hold) {
 			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-			rp.colorAttachments[0].texture = target;
+			rp.colorAttachments[0].texture = handle(42);
 			id<MTLCommandBuffer> cb = [f.queue commandBuffer];
 			RgfxRenderCommandEncoder *e = (RgfxRenderCommandEncoder *)[cb renderCommandEncoderWithDescriptor:rp];
 			[e setRenderPipelineState:handle(7)];
@@ -7341,10 +7342,31 @@ void test_gl_renderer_spi()
 			drainRing(f.control);
 			return postedOps(f.submit);
 		};
-		const auto plainOps = pass(false, false);
+		// Each pass's encoder takes the queue's next barrier fence, which its ENCODER_BEGIN_RENDER
+		// and its fence ops name; every other op's bytes, and the ops' tags and sizes, are
+		// compared whole.
+		auto shape = [](std::vector<std::pair<uint16_t, std::vector<uint8_t>>> ops) {
+			for (auto &op : ops)
+				if (op.first == RGFX_OP_ENCODER_BEGIN_RENDER || op.first == RGFX_OP_RENDER_UPDATE_FENCE ||
+				    op.first == RGFX_OP_RENDER_WAIT_FOR_FENCE)
+					op.second.assign(op.second.size(), 0);
+			return ops;
+		};
+		// Where two differ, the first op that does is printed.
+		auto same = [](const std::vector<std::pair<uint16_t, std::vector<uint8_t>>> &a,
+		               const std::vector<std::pair<uint16_t, std::vector<uint8_t>>> &b) {
+			for (size_t i = 0; i < a.size() && i < b.size(); i++)
+				if (a[i] != b[i]) {
+					fprintf(stderr, "op %zu differs: tag 0x%x, %zu and %zu bytes\n", i, a[i].first,
+					        a[i].second.size(), b[i].second.size());
+					break;
+				}
+			return a == b;
+		};
+		const auto plainOps = shape(pass(false, false));
 		CHECK(!plainOps.empty());
-		CHECK(pass(true, false) == plainOps);
-		CHECK(pass(false, true) == plainOps);
+		CHECK(same(shape(pass(true, false)), plainOps));
+		CHECK(same(shape(pass(false, true)), plainOps));
 	}
 }
 
