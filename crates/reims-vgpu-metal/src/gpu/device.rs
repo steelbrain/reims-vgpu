@@ -2125,11 +2125,11 @@ vertex void vvoid(uint v [[vertex_id]]) {}
             "-cl-single-precision-constant -fapplecl-lax-vector-conversions \
              -fapplecl-functional-casts -fapplecl-inline-definitions -cl-std=CL1.2",
         );
-        // SAFETY: MTLCompileOptions' SPI setters (`v24@0:8Q16`, `v24@0:8q16`, `v24@0:8@16`), with
-        // the values the renderer sends.
+        // SAFETY: MTLCompileOptions' SPI setters (of a `Q`, a `C` and an object), with the values
+        // the renderer sends.
         unsafe {
             let _: () = msg_send![&*options, setLanguageVersion: 0x20002u64];
-            let _: () = msg_send![&*options, setSourceLanguage: 1i64];
+            let _: () = msg_send![&*options, setSourceLanguage: 1u8];
             let _: () = msg_send![&*options, setAdditionalCompilerArguments: &*arguments];
         }
         let library = Obj::from_retained(
