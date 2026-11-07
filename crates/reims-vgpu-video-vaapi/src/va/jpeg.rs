@@ -1345,13 +1345,32 @@ struct Rows {
     count: u32,
 }
 
-/// `rows` of an output in bands of `each` rows at most, top to bottom;
-/// with no `each`, one band from the output's first row to the last of
-/// `rows`.
+impl Rows {
+    /// The same rows from the even row at or above the first: what a band
+    /// is read from, so that 4:2:0's chroma rows are whole in what is read
+    /// ([`Out::view`], [`write_band`]).
+    fn from_even(self) -> Rows {
+        Rows {
+            top: self.top & !1,
+            count: self.count.saturating_add(self.top & 1),
+        }
+    }
+}
+
+/// `rows` of an output in bands of `each` rows at most, an even count, top
+/// to bottom; with no `each`, one band from the output's first row to the
+/// last of `rows`. From an odd row, each band is read from the row above
+/// it ([`Rows::from_even`]), so it is 2 rows fewer, and what is read of it
+/// fits in `each`.
 fn bands(rows: Rows, each: Option<u32>) -> Vec<Rows> {
     let end = rows.top.saturating_add(rows.count);
     let Some(each) = each.filter(|&each| each > 0) else {
         return vec![Rows { top: 0, count: end }];
+    };
+    let each = if rows.top.is_multiple_of(2) {
+        each
+    } else {
+        each.saturating_sub(2).max(2)
     };
     let step = usize::try_from(each).unwrap_or(usize::MAX);
     (rows.top..end)
@@ -1379,10 +1398,10 @@ fn in_bands(
 }
 
 /// Writes the rows of `request.region` that `band` holds into `planes`:
-/// `samples` are the band's, their first row the band's top, and each
-/// plane's rows from the region's top are skipped down to the band's.
-/// Where the band is the output from its first row, this is
-/// [`write_samples`] itself.
+/// `samples` are the band's, their first row the even row at or above the
+/// band's top ([`Rows::from_even`]), and each plane's rows from the
+/// region's top are skipped down to the band's. Where the band is the
+/// output from its first row, this is [`write_samples`] itself.
 fn write_band(
     samples: &DecodedSamples<'_>,
     request: &JpegDecode<'_>,
@@ -1397,7 +1416,7 @@ fn write_band(
     }
     let within = JpegDecode {
         region: PixelRect {
-            y: top - band.top,
+            y: top - band.from_even().top,
             height: bottom - top,
             ..region
         },
@@ -1555,9 +1574,10 @@ impl Out {
     }
 
     /// Lends `use_samples` its `rows`' samples, of `kind`, and where they
-    /// are in the bytes, from the first of `rows`: host memory as the GPU
-    /// wrote it, the driver's image ([`OwnedSurface::view`]), or the strip
-    /// a 1:1 run copied `rows` into ([`Strips::read`]).
+    /// are in the bytes, from the even row at or above the first of `rows`
+    /// ([`Rows::from_even`]): host memory as the GPU wrote it, the driver's
+    /// image ([`OwnedSurface::view`]), or the strip a 1:1 run copied the
+    /// rows into ([`Strips::read`]).
     fn view(
         &self,
         rows: Rows,
@@ -1565,6 +1585,7 @@ impl Out {
         reading: &Reading<'_>,
         use_samples: impl FnOnce(&Layout, &[u8]) -> Result<(), Failed>,
     ) -> Result<Readback, Failed> {
+        let rows = rows.from_even();
         let from = |layout: Layout| {
             layout.at_row(rows.top).ok_or_else(|| {
                 Failed::Jpeg(JpegError::Malfunction(format!(
@@ -2451,6 +2472,14 @@ mod tests {
         // Read whole, one band from the output's first row.
         assert_eq!(bands(rows(8, 100), None), [rows(0, 108)]);
         assert_eq!(bands(rows(0, 16), Some(16)), [rows(0, 16)]);
+        // From an odd row, 2 rows fewer a band, each read from the row
+        // above it.
+        assert_eq!(
+            bands(rows(9, 100), Some(32)),
+            [rows(9, 30), rows(39, 30), rows(69, 30), rows(99, 10)]
+        );
+        assert_eq!(rows(39, 30).from_even(), rows(38, 31));
+        assert_eq!(rows(40, 30).from_even(), rows(40, 30));
     }
 
     /// Bytes 0, 1, 2, ... of a pseudo-random sequence.
@@ -2494,101 +2523,116 @@ mod tests {
     /// A decode's region written into a padded destination of `format` from
     /// a surface of `fourcc`, whole and in bands of `each` rows, through
     /// strips and through the whole surface's rows: the same bytes,
-    /// padding left as it was. A 4:2:2 strip is read as the BGRA band a run
-    /// copies it into ([`strip_format`]) holds it: its rows at the top, at the
-    /// surface's pitch, laid out as YUY2.
+    /// padding left as it was, from an even row and from an odd one. A
+    /// 4:2:2 strip is read as the BGRA band a run copies it into
+    /// ([`strip_format`]) holds it: its rows at the top, at the surface's
+    /// pitch, laid out as YUY2.
     #[test]
     fn an_output_written_in_bands_is_the_output_written_whole() {
         use reims_vgpu_video_core::jpeg::JpegOutputFormat as F;
         use reims_vgpu_video_core::jpeg::JpegSubsampling as S;
         // An 80x61 image in a 96x64 surface, 128 bytes a row (256 for
         // YUY2's two a pixel), its region two MCUs in and down and to its
-        // edges: 64x45, its last row odd.
+        // edges: 64x45, its last row odd; and from the row below, 64x44.
         let (height, rows) = (61u32, 64u32);
-        let cases = [
-            (ffi::VA_FOURCC_NV12, S::Yuv420, F::Biplanar420),
-            (va::VA_FOURCC_Y800, S::Grey, F::Yuyv),
-            (va::VA_FOURCC_Y800, S::Grey, F::Biplanar420),
-            (va::VA_FOURCC_444P, S::Yuv444, F::Biplanar444),
-            (va::VA_FOURCC_YUY2, S::Yuv422, F::Biplanar422),
-            (va::VA_FOURCC_YUY2, S::Yuv422, F::Yuyv),
-            (va::VA_FOURCC_YUY2, S::Yuv422, F::Uyvy),
-        ];
-        for (fourcc, subsampling, format) in cases {
-            let planes = match fourcc {
-                ffi::VA_FOURCC_NV12 => 2,
-                va::VA_FOURCC_444P => 3,
-                _ => 1,
-            };
-            let pitch = if fourcc == va::VA_FOURCC_YUY2 {
-                256
-            } else {
-                128
-            };
-            let plane = pitch * rows as usize;
-            let layout = Layout {
-                fourcc,
-                planes,
-                offsets: [0, plane, 2 * plane],
-                pitches: [pitch; 3],
-            };
-            let bytes = noise(plane * planes);
-            let request = JpegDecode {
-                data: &[],
-                width: 80,
-                height,
-                subsampling,
-                region: PixelRect {
-                    x: 16,
-                    y: 16,
-                    width: 64,
-                    height: 45,
-                },
-                scale: 1,
-                format,
-            };
-            let destination = || match format {
-                F::Yuyv | F::Uyvy => vec![vec![0x5a; 140 * 45]],
-                F::Biplanar420 => vec![vec![0x5a; 72 * 45], vec![0x5a; 72 * 23]],
-                F::Biplanar422 => vec![vec![0x5a; 72 * 45], vec![0x5a; 72 * 45]],
-                _ => vec![vec![0x5a; 72 * 45], vec![0x5a; 136 * 45]],
-            };
-            let strides = match format {
-                F::Yuyv | F::Uyvy => vec![140],
-                F::Biplanar420 | F::Biplanar422 => vec![72, 72],
-                _ => vec![72, 136],
-            };
-            fn lend<'a>(
-                buffers: &'a mut [Vec<u8>],
-                strides: &[usize],
-            ) -> Vec<PlaneDestination<'a>> {
-                (buffers.iter_mut().zip(strides))
-                    .map(|(bytes, &bytes_per_row)| PlaneDestination {
-                        rows: u32::try_from(bytes.len() / bytes_per_row).unwrap_or(0),
-                        bytes,
-                        bytes_per_row,
-                    })
-                    .collect()
-            }
-            let mut whole = destination();
-            let samples = samples_of(&layout, &bytes, subsampling).expect("samples");
-            write_samples(&samples, &request, &mut lend(&mut whole, &strides))
-                .expect("written whole");
-            let band = Rows { top: 16, count: 45 };
-            for each in [16, 32, 48] {
-                let (mut striped, mut offset) = (destination(), destination());
-                for band in bands(band, Some(each)) {
-                    let (strip, strip_bytes) = strip_of(&layout, &bytes, rows, band);
-                    let samples = samples_of(&strip, &strip_bytes, subsampling).expect("samples");
-                    write_band(&samples, &request, band, &mut lend(&mut striped, &strides))
-                        .unwrap_or_else(|_| panic!("a strip of {band:?}"));
-                    let from = layout.at_row(band.top).expect("a layout from the row");
-                    let samples = samples_of(&from, &bytes, subsampling).expect("samples");
-                    write_band(&samples, &request, band, &mut lend(&mut offset, &strides))
-                        .unwrap_or_else(|_| panic!("rows {band:?}"));
+        for (y, region_height) in [(16, 45), (17, 44)] {
+            let cases = [
+                (ffi::VA_FOURCC_NV12, S::Yuv420, F::Biplanar420),
+                (va::VA_FOURCC_Y800, S::Grey, F::Yuyv),
+                (va::VA_FOURCC_Y800, S::Grey, F::Biplanar420),
+                (va::VA_FOURCC_444P, S::Yuv444, F::Biplanar444),
+                (va::VA_FOURCC_YUY2, S::Yuv422, F::Biplanar422),
+                (va::VA_FOURCC_YUY2, S::Yuv422, F::Yuyv),
+                (va::VA_FOURCC_YUY2, S::Yuv422, F::Uyvy),
+            ];
+            for (fourcc, subsampling, format) in cases {
+                let planes = match fourcc {
+                    ffi::VA_FOURCC_NV12 => 2,
+                    va::VA_FOURCC_444P => 3,
+                    _ => 1,
+                };
+                let pitch = if fourcc == va::VA_FOURCC_YUY2 {
+                    256
+                } else {
+                    128
+                };
+                let plane = pitch * rows as usize;
+                let layout = Layout {
+                    fourcc,
+                    planes,
+                    offsets: [0, plane, 2 * plane],
+                    pitches: [pitch; 3],
+                };
+                let bytes = noise(plane * planes);
+                let request = JpegDecode {
+                    data: &[],
+                    width: 80,
+                    height,
+                    subsampling,
+                    region: PixelRect {
+                        x: 16,
+                        y,
+                        width: 64,
+                        height: region_height,
+                    },
+                    scale: 1,
+                    format,
+                };
+                let destination = || match format {
+                    F::Yuyv | F::Uyvy => vec![vec![0x5a; 140 * 45]],
+                    F::Biplanar420 => vec![vec![0x5a; 72 * 45], vec![0x5a; 72 * 23]],
+                    F::Biplanar422 => vec![vec![0x5a; 72 * 45], vec![0x5a; 72 * 45]],
+                    _ => vec![vec![0x5a; 72 * 45], vec![0x5a; 136 * 45]],
+                };
+                let strides = match format {
+                    F::Yuyv | F::Uyvy => vec![140],
+                    F::Biplanar420 | F::Biplanar422 => vec![72, 72],
+                    _ => vec![72, 136],
+                };
+                fn lend<'a>(
+                    buffers: &'a mut [Vec<u8>],
+                    strides: &[usize],
+                ) -> Vec<PlaneDestination<'a>> {
+                    (buffers.iter_mut().zip(strides))
+                        .map(|(bytes, &bytes_per_row)| PlaneDestination {
+                            rows: u32::try_from(bytes.len() / bytes_per_row).unwrap_or(0),
+                            bytes,
+                            bytes_per_row,
+                        })
+                        .collect()
                 }
-                assert!(striped == whole, "{format:?} in strips of {each}");
-                assert!(offset == whole, "{format:?} in bands of {each}");
+                let mut whole = destination();
+                let samples = samples_of(&layout, &bytes, subsampling).expect("samples");
+                write_samples(&samples, &request, &mut lend(&mut whole, &strides))
+                    .expect("written whole");
+                let band = Rows {
+                    top: y,
+                    count: region_height,
+                };
+                for each in [16, 32, 48] {
+                    let (mut striped, mut offset) = (destination(), destination());
+                    for band in bands(band, Some(each)) {
+                        let read = band.from_even();
+                        assert!(read.count.next_multiple_of(2) <= each, "{band:?}, {each}");
+                        let (strip, strip_bytes) = strip_of(&layout, &bytes, rows, read);
+                        let samples =
+                            samples_of(&strip, &strip_bytes, subsampling).expect("samples");
+                        write_band(&samples, &request, band, &mut lend(&mut striped, &strides))
+                            .unwrap_or_else(|_| panic!("a strip of {band:?}"));
+                        let from = layout.at_row(read.top).expect("a layout from the row");
+                        let samples = samples_of(&from, &bytes, subsampling).expect("samples");
+                        write_band(&samples, &request, band, &mut lend(&mut offset, &strides))
+                            .unwrap_or_else(|_| panic!("rows {band:?}"));
+                    }
+                    assert!(
+                        striped == whole,
+                        "{format:?} from row {y} in strips of {each}"
+                    );
+                    assert!(
+                        offset == whole,
+                        "{format:?} from row {y} in bands of {each}"
+                    );
+                }
             }
         }
     }
