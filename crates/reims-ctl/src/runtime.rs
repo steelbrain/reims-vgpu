@@ -170,6 +170,55 @@ pub fn host_max_map_count() -> Option<u64> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+/// The file of MGLRU's thrashing guard (Linux; the kernel's
+/// Documentation/admin-guide/mm/multigen_lru.rst, "Thrashing prevention"): the pages used in the
+/// last that many milliseconds are kept from eviction, and where they can't be kept in memory the
+/// kernel's OOM killer runs. Measured on this project's CachyOS hosts, whose kernel defaults it to
+/// 100: kswapd invoked the global OOM killer with most RAM free, killing a compiler with 19 GiB
+/// free on one, and making 19 of a day's 22 OOM kills on another. A VM's QEMU can be the one
+/// killed; scripts/install-ctl.sh and `reims-ctl doctor` offer to set 0, which turns the guard
+/// off, while memory that does run out still ends in the OOM killer.
+pub const MIN_TTL_FILE: &str = "/sys/kernel/mm/lru_gen/min_ttl_ms";
+
+/// The systemd-tmpfiles line that writes 0 to [`MIN_TTL_FILE`] at each boot, which
+/// scripts/install-ctl.sh shows too.
+pub const MIN_TTL_TMPFILES: &str = "w /sys/kernel/mm/lru_gen/min_ttl_ms - - - - 0";
+
+/// The thrashing guard's milliseconds in `file` ([`MIN_TTL_FILE`]); None where it isn't there.
+pub fn min_ttl_ms(file: &Path) -> Option<u64> {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// What the thrashing guard at `ms` does to VMs, for a value above 0; None at 0.
+pub fn min_ttl_note(ms: u64) -> Option<String> {
+    (ms > 0).then(|| {
+        format!(
+            "{ms}: where the kernel can't keep the pages used in the last {ms} ms in memory, it \
+             kills a process, which can be a VM's QEMU, even while RAM is free (measured on hosts \
+             at 100, killing builds with most RAM free); 0 turns this off"
+        )
+    })
+}
+
+/// How to keep the thrashing guard off after a restart, and, where it is not `off` yet, how to
+/// turn it off now, as scripts/install-ctl.sh says it.
+pub fn min_ttl_fix(off: bool) -> String {
+    let keep = format!(
+        "the line {MIN_TTL_TMPFILES} in a file in /etc/tmpfiles.d, such as \
+         /etc/tmpfiles.d/reims-ctl-min-ttl.conf"
+    );
+    if off {
+        format!("it's 0 now; {keep}, keeps it at 0 after a restart")
+    } else {
+        format!(
+            "echo 0 | sudo tee {MIN_TTL_FILE} turns it off now, and {keep}, keeps it at 0 after \
+             a restart"
+        )
+    }
+}
+
 /// The `vm.max_map_count` at which an NVIDIA GPU takes all of a guest of `memory_mib` without
 /// copies, and the value to suggest raising it to; scripts/install-ctl.sh keeps the same rule.
 /// docs/qemu.md, "Linux hosts: vm.max_map_count": a view of an x86-64 guest's memory mapped from
@@ -863,6 +912,33 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("vm.max_map_count=8388608"), "{note}");
+    }
+
+    /// The thrashing guard is told of above 0 only, read from its file as the kernel writes it,
+    /// and the line that keeps it off is the one scripts/install-ctl.sh shows, for the same file.
+    #[test]
+    fn the_thrashing_guard_is_told_of_above_0_with_its_fix() {
+        let env = crate::testenv::Env::new("min-ttl");
+        let file = env.root.join("min_ttl_ms");
+        assert_eq!(min_ttl_ms(&file), None);
+        std::fs::write(&file, "100\n").unwrap();
+        assert_eq!(min_ttl_ms(&file), Some(100));
+        std::fs::write(&file, "0\n").unwrap();
+        assert_eq!(min_ttl_ms(&file), Some(0));
+        assert_eq!(min_ttl_note(0), None);
+        let note = min_ttl_note(100).unwrap();
+        assert!(note.starts_with("100: "), "{note}");
+        assert!(
+            note.contains("last 100 ms") && note.contains("QEMU"),
+            "{note}"
+        );
+        let fix = min_ttl_fix(false);
+        assert!(fix.contains(&format!("sudo tee {MIN_TTL_FILE}")), "{fix}");
+        assert!(fix.contains(MIN_TTL_TMPFILES), "{fix}");
+        assert!(min_ttl_fix(true).starts_with("it's 0 now"));
+        let script = include_str!("../../../scripts/install-ctl.sh");
+        assert!(script.contains(&format!("min_ttl_file={MIN_TTL_FILE}\n")));
+        assert!(script.contains(&format!("min_ttl_line='{MIN_TTL_TMPFILES}'\n")));
     }
 
     /// The udmabuf message names the group that owns the node, says what to do where root alone

@@ -317,6 +317,26 @@ else
     uncopied=$((maps > 24576 ? (maps - 24576) / 256 : 0))
     say "vm.max_map_count is $maps: on an NVIDIA GPU, past about $uncopied MiB of a new VM's $((vm_mib / 1024)) GiB the GPU gets copies of its memory, which is slower; sudo sysctl -w vm.max_map_count=$raise, and a file in /etc/sysctl.d to keep it, avoids them"
   fi
+  # MGLRU's thrashing guard (reims-ctl's runtime::MIN_TTL_FILE): above 0, the
+  # kernel kills a process where it can't keep the pages used in the last that
+  # many ms, even with RAM free, and a VM's QEMU can be the one. Measured on
+  # CachyOS hosts at 100, its kernel's default there. Offered off on a terminal
+  # only, and never required; the tmpfiles.d line keeps it off.
+  min_ttl_file=/sys/kernel/mm/lru_gen/min_ttl_ms
+  min_ttl_line='w /sys/kernel/mm/lru_gen/min_ttl_ms - - - - 0'
+  min_ttl="$(cat "$min_ttl_file" 2>/dev/null || echo 0)"
+  if [[ $min_ttl =~ ^[0-9]+$ ]] && ((min_ttl > 0)); then
+    warn "$min_ttl_file is $min_ttl: where the kernel can't keep the pages used in the last $min_ttl ms in memory, it kills a process, which can be a VM's QEMU, even while RAM is free (measured on hosts at 100, killing builds with most RAM free); 0 turns this off"
+    if [[ -t 0 ]] && ask "Write 0 to $min_ttl_file now with sudo?"; then
+      echo 0 | sudo tee "$min_ttl_file" >/dev/null || warn "sudo didn't write it"
+    fi
+    keep="the line $min_ttl_line in a file in /etc/tmpfiles.d, such as /etc/tmpfiles.d/reims-ctl-min-ttl.conf"
+    if [[ "$(cat "$min_ttl_file" 2>/dev/null)" == 0 ]]; then
+      say "It's 0 now; $keep, keeps it at 0 after a restart"
+    else
+      say "echo 0 | sudo tee $min_ttl_file turns it off now, and $keep, keeps it at 0 after a restart"
+    fi
+  fi
   # USB passthrough (reims-ctl usb): QEMU opens a USB device's file in
   # /dev/bus/usb, which only root may write unless a udev rule says otherwise.
   # This one gives USB devices other than hubs to the kvm group, over SSH too,

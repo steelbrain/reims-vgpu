@@ -829,6 +829,34 @@ fn confirm(question: &str) -> bool {
     std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim(), "y" | "Y" | "yes")
 }
 
+/// On a terminal, offers to write 0 to MGLRU's thrashing guard, `file`, with sudo; then how to
+/// keep it at 0, or to turn it off where it is not. Without a terminal it only tells.
+fn offer_min_ttl_off(file: &Path) -> String {
+    use std::io::IsTerminal;
+    let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if terminal
+        && confirm(&format!(
+            "     Write 0 to {} now with sudo?",
+            file.display()
+        ))
+    {
+        let wrote = std::process::Command::new("sudo")
+            .arg("tee")
+            .arg(file)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut c| {
+                c.stdin.take().expect("piped").write_all(b"0\n")?;
+                c.wait()
+            });
+        if let Err(e) = &wrote {
+            eprintln!("     sudo didn't run: {e}");
+        }
+    }
+    runtime::min_ttl_fix(runtime::min_ttl_ms(file) == Some(0))
+}
+
 pub fn delete_vm(name: &str, keep_files: bool) -> Result<String> {
     let mut reg = Registry::load()?;
     let entry = reg
@@ -1519,6 +1547,20 @@ fn doctor(host: Host) -> Result<i32> {
                         None => n.to_string(),
                     },
                 );
+            }
+            // MGLRU's thrashing guard, told of above 0 and offered off on a terminal; never a
+            // failure, as VMs run with it.
+            let min_ttl = Path::new(runtime::MIN_TTL_FILE);
+            if let Some(ms) = runtime::min_ttl_ms(min_ttl) {
+                let note = runtime::min_ttl_note(ms);
+                line(
+                    true,
+                    "lru_gen min_ttl_ms",
+                    note.clone().unwrap_or(ms.to_string()),
+                );
+                if note.is_some() {
+                    println!("     {}", offer_min_ttl_off(min_ttl));
+                }
             }
             let gpus = gpu::list();
             line(
