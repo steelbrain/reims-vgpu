@@ -38,6 +38,10 @@ constexpr const char *kDynamicLoads =
     "the dynamic libraries of a pipeline's functions, which Metal's own pipeline routes load "
     "(measured on the M3 Max: Core Image's and a source library's pipelines); the device's "
     "functions name none";
+constexpr const char *kGLDrawables =
+    "a GL window's drawable: the base's opens user client type 7 on the accelerator, which the "
+    "kext serves over the window's surface (guest/kext/src/RgfxGLUserClients.hpp); a kext "
+    "without it refuses the open, and the base answers nil";
 constexpr const char *kSubAllocation =
     "sub-allocations of Metal's own command buffers' memory (measured on the M3 Max: Core Image "
     "asks the device); the device's command buffers are its own";
@@ -71,6 +75,7 @@ constexpr Left kLeftToTheBase[] = {
     {"newTranslatedDriverCompilerOptions:compilerOptionsSize:", kValues},
     {"newDagStringWithGraphs:", kValues},
     {"newDynamicLibraryError:message:", kValues},
+    {"newGLDrawable", kGLDrawables},
     {"loadDynamicLibrariesForComputeDescriptor:error:", kDynamicLoads},
     {"loadDynamicLibrariesForComputeDescriptor:options:error:", kDynamicLoads},
     {"loadDynamicLibrariesForFunction:insertLibraries:error:", kDynamicLoads},

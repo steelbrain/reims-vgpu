@@ -3079,6 +3079,30 @@ on a connection of another kind finds none of that number there.
 
 The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents` and 1 << 7 `WriteCombined`; no other bit yet.
 
+**A GL window: the drawable (type 7) and the window surface (type 0x20).**
+These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its
+IOGPU base, which opens type 7. The kext serves both types
+(`guest/kext/src/RgfxGLUserClients.{hpp,cpp}`, with the rules in
+`RgfxGLSurfaces.hpp` and their native test). Measured on a macOS 26.6.1
+guest, for window-backed and layer-backed `NSOpenGLView`s alike:
+- the app opens type 7, then its `SLSBindSurface` opens type 0x20 for the
+  window's surface: `SetIDMode`(id, 0x4024), then `SetShape` with the
+  view's size;
+- the drawable's set surface (selector 1) names that id. Its lookups
+  (selector 5) of indexes 0 and 1 get two IOSurfaces, which the kext makes
+  in the app's task;
+- the app draws into those IOSurfaces through the bundle, and WindowServer
+  composites the window from them (screen dumps show the frames). It opens
+  no user client of the accelerator for the window.
+
+The rules are IOGPU's, read from IOGPUFamily's x86_64 code in the 26.7.1
+KDK: the mode and shape checks, the request bits a drawable's mode gives,
+the eleven buffer slots and their formats, and when buffers are made again.
+Not served, each answering `kIOReturnUnsupported`:
+- surface modes of IOGPU's shared buffers (0x700000);
+- a drawable's scaled sources and shared events;
+- every surface method but `SetIDMode` and `SetShape`.
+
 - **Boot-gated — base class / kernel family (notes UNKNOWN #1).** The scaffold
   subclasses `IOAccelerator`, the base the macOS SDK and KDK expose (the IOGPU
   kernel family — `IOGPU`, its device/queue classes and its submission/

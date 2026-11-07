@@ -68,6 +68,7 @@
 
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOTypes.h>
+#include <libkern/c++/OSDictionary.h>
 
 // A surface's device cache (IOSurfaceDeviceCache), opaque here.
 struct RgfxDeviceCache;
@@ -120,6 +121,34 @@ IOReturn rgfxIOSurfaceLock(OSObject *surface, uint32_t options, uint32_t *seed)
     __asm__("__ZN9IOSurface11lockSurfaceEjPj");
 IOReturn rgfxIOSurfaceUnlock(OSObject *surface, uint32_t options, uint32_t *seed)
     __asm__("__ZN9IOSurface13unlockSurfaceEjPj");
+}
+
+// A GL window's buffers (RgfxGLUserClients.cpp), made as IOGPU makes them (read from IOGPUFamily's
+// x86_64 code in macOS 26.7.1's KDK, IOGPUSurfaceMTL::shape_buffers and its callers): createSurface
+// in the window surface's task, clientRetain, and, when the buffer goes, release_surface_async
+// alone, which takes over the reference createSurface gave and the client retain (read from
+// IOSurface's code: it holds the surface in its pending set, releases the caller's reference, and
+// lets the rest go on a thread call of its own).
+extern "C" {
+// IOSurfaceRoot::createSurface(task*, OSDictionary*): a new IOSurface of `properties` in `task`,
+// retained for the caller, or null.
+OSObject *rgfxIOSurfaceRootCreate(void *root, task_t task, OSDictionary *properties)
+    __asm__("__ZN13IOSurfaceRoot13createSurfaceEP4taskP12OSDictionary");
+// IOSurfaceRoot::release_surface_async(IOSurface*): lets go of a surface createSurface made and
+// clientRetain held.
+void rgfxIOSurfaceRootReleaseAsync(void *root, OSObject *surface)
+    __asm__("__ZN13IOSurfaceRoot21release_surface_asyncEP9IOSurface");
+// IOSurfaceRoot::copyPortNameForSurfaceInTask(task*, IOSurface*, unsigned int*): a send right
+// to `surface` in `task`, its name in `*name`, which IOSurfaceLookupFromMachPort opens there.
+IOReturn rgfxIOSurfaceRootPortName(void *root, task_t task, OSObject *surface, uint32_t *name)
+    __asm__("__ZN13IOSurfaceRoot28copyPortNameForSurfaceInTaskEP4taskP9IOSurfacePj");
+// IOSurface::clientRetain(): one client more.
+void rgfxIOSurfaceClientRetain(OSObject *surface) __asm__("__ZN9IOSurface12clientRetainEv");
+// IOSurface::setValue(char const*, OSMetaClassBase const*, unsigned int*): one of the surface's
+// values, as IOSurfaceSetValue sets it, `*error` 0 or IOSurface's error.
+IOReturn rgfxIOSurfaceSetValue(OSObject *surface, const char *key, const OSMetaClassBase *value,
+                               uint32_t *error)
+    __asm__("__ZN9IOSurface8setValueEPKcPK15OSMetaClassBasePj");
 }
 
 // IOSurface's kIOSurfaceLockReadOnly.

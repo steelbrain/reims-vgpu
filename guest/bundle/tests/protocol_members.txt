@@ -623,7 +623,7 @@ newFunctionWithGLESIR:functionType: implemented
 newFunctionWithGLESIR:inputsDescription:functionType: implemented
 newFunctionWithGLIR:functionType: implemented
 newFunctionWithGLIR:inputsDescription:functionType: implemented
-newGLDrawable unsupported OpenGL
+newGLDrawable base %base-creator
 newHeapWithDescriptor: implemented
 newIOCommandQueueWithDescriptor:error: partial Metal IO command queues
 newIOFileHandleWithURL:compressionMethod:error: implemented

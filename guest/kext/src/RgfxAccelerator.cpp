@@ -8,6 +8,7 @@
 #include "ReimsGraphics.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
 #include "RgfxDisplayPipeUserClient.hpp"
+#include "RgfxGLUserClients.hpp"
 #include "RgfxSurfaceUserClient.hpp"
 
 #include <IOKit/IOLib.h>
@@ -439,9 +440,11 @@ IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UIn
                                         OSDictionary *properties, IOUserClient **handler)
 {
 	// The types served: the display pipe (4), the one the IOGPUMetalDevice base builds its
-	// device over (5), ours, and a shared event's port (RgfxSharedEventUserClient). Any other is refused, logged once per type. IOAccel surfaces
-	// (0) are among them: CoreDisplay opens them at display start for its display surface, and
-	// maps the framebuffer's memory for it when they are refused.
+	// device over (5), ours, a shared event's port (RgfxSharedEventUserClient), and a GL
+	// window's drawable (7) and surface (0x20) (RgfxGLUserClients.hpp). Any other is refused,
+	// logged once per type. IOAccel surfaces (0) are among them: CoreDisplay opens them at
+	// display start for its display surface, and maps the framebuffer's memory for it when
+	// they are refused.
 	RgfxCaller caller;
 	IOLog("RGFX: newUserClient type=%u from %s[%d]\n", type, caller.name, caller.pid);
 	// Unregistered, without its bundle, the accelerator is no GPU ("The bundle"): a task that
@@ -459,6 +462,8 @@ IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UIn
 		return newDisplayPipe(owningTask, securityID, type, properties, handler);
 	if (type == kRgfxSharedEventUserClientType)
 		return newSharedEventPort(owningTask, securityID, type, properties, handler);
+	if (type == kRgfxGLDrawableUserClientType || type == kRgfxGLSurfaceUserClientType)
+		return newGLClient(owningTask, securityID, type, properties, handler);
 	if (type != kRgfxAccelUserClientType && type != kRgfxIOGPUDeviceUserClientType) {
 		static char site;
 		if (rgfxFirstCalls(&site, type, 1))
@@ -497,6 +502,34 @@ IOReturn RgfxAccelerator::newDisplayPipe(task_t owningTask, void *securityID, UI
 	if (!client->initWithTask(owningTask, securityID, type, properties)) {
 		client->release();
 		return kIOReturnBadArgument;
+	}
+	if (!client->attach(this)) {
+		client->release();
+		return kIOReturnInternalError;
+	}
+	if (!client->start(this)) {
+		client->detach(this);
+		client->release();
+		return kIOReturnInternalError;
+	}
+	*handler = client;
+	return kIOReturnSuccess;
+}
+
+// A GL window's drawable or surface (RgfxGLUserClients.hpp).
+IOReturn RgfxAccelerator::newGLClient(task_t owningTask, void *securityID, UInt32 type,
+                                      OSDictionary *properties, IOUserClient **handler)
+{
+	IOUserClient *client = nullptr;
+	if (type == kRgfxGLDrawableUserClientType)
+		client = OSTypeAlloc(RgfxGLDrawableUserClient);
+	else
+		client = OSTypeAlloc(RgfxGLSurfaceUserClient);
+	if (!client)
+		return kIOReturnNoMemory;
+	if (!client->initWithTask(owningTask, securityID, type, properties)) {
+		client->release();
+		return kIOReturnNoResources;
 	}
 	if (!client->attach(this)) {
 		client->release();

@@ -11,7 +11,6 @@ namespace {
 constexpr const char *kRayTracing = "ray tracing";
 constexpr const char *kFunctionPointers = "function pointers";
 constexpr const char *kMetal4 = "the Metal 4 API";
-constexpr const char *kOpenGL = "OpenGL";
 constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 } // namespace
 
@@ -358,14 +357,6 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 - (id)newBinaryLibraryWithOptions:(NSUInteger)options url:(NSURL *)url error:(NSError **)error
 {
 	RGFX_UNSUPPORTED_ERROR(error, "binary libraries");
-	return nil;
-}
-
-// OpenGL's drawables (`@16@0:8`): the device makes none (its functions of GL IR are
-// RgfxMetalDevice+GL.mm's).
-- (id)newGLDrawable
-{
-	RGFX_UNSUPPORTED(kOpenGL);
 	return nil;
 }
 

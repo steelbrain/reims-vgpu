@@ -552,6 +552,8 @@ private:
 	                            OSDictionary *properties, IOUserClient **handler);
 	IOReturn newSurface(task_t owningTask, void *securityID, UInt32 type,
 	                    OSDictionary *properties, IOUserClient **handler);
+	IOReturn newGLClient(task_t owningTask, void *securityID, UInt32 type,
+	                     OSDictionary *properties, IOUserClient **handler);
 	UInt32 readRegister(UInt32 offset) const;
 	void writeRegister(UInt32 offset, UInt32 value);
 	void teardown();
