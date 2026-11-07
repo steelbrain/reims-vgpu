@@ -2449,13 +2449,15 @@ pub(crate) mod tests {
         assert_eq!(first.gpu_address(), pin);
         let logs = logs::capture();
         assert!(d.new_buffer(pinned()).unwrap().is_none());
-        let lines = logs.take();
+        // The device's own threads log beside the test: its awake thread's first line, written
+        // as the thread starts, can land after the capture began. The lines of the creator's
+        // target alone.
+        let lines: Vec<_> = (logs.take().into_iter())
+            .filter(|(_, target, _)| target == "reims_vgpu_vulkan::gpu")
+            .collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
-        let (level, target, line) = &lines[0];
-        assert_eq!(
-            (*level, target.as_str()),
-            (log::Level::Warn, "reims_vgpu_vulkan::gpu")
-        );
+        let (level, _, line) = &lines[0];
+        assert_eq!(*level, log::Level::Warn);
         assert!(
             line.starts_with(
                 "newBufferWithDescriptor: answered nil: Metal's space refused the pin: Held {"
