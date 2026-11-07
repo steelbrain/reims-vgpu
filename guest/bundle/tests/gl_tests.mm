@@ -456,6 +456,10 @@ void test_cl_library()
 	CHECK(broken(modules + 4, 0x12345678));                // no wrapper
 	CHECK(broken(0x14, 12 + 28 + 5));                      // a table that ends inside a name
 	CHECK(none == std::vector<uint8_t>{7});
+	// The table's first u16 is a release's own (macOS 27's 9).
+	std::vector<uint8_t> c9 = container, out9;
+	set32(c9, table, 0x00020009);
+	CHECK(RgfxMetallibOfClLibrary(c9.data(), c9.size(), out9) && out9 == out);
 
 	// This Mac's own container, where its Metal compiles OpenCL C (two kernels, one program).
 	NSArray<NSString *> *names = nil;

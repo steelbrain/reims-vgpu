@@ -161,9 +161,10 @@ bool RgfxMetallibOfClLibrary(const uint8_t *bytes, size_t length, std::vector<ui
 	size_t tableSize = 0, modulesSize = 0;
 	if (!section(0, &table, &tableSize) || !section(3, &modules, &modulesSize) || tableSize < 12)
 		return false;
-	const uint16_t head[4] = {8, 2, 1, 1};
-	for (int i = 0; i < 4; i++)
-		if ((table[2 * i] | table[2 * i + 1] << 8) != head[i])
+	// The table's first u16 differs by release (8, then 9) and is not read.
+	const uint16_t head[3] = {2, 1, 1};
+	for (int i = 0; i < 3; i++)
+		if ((table[2 + 2 * i] | table[3 + 2 * i] << 8) != head[i])
 			return false;
 	const uint32_t count = le32(table + 8);
 	if (count == 0)

@@ -60,12 +60,13 @@ std::vector<uint8_t> RgfxWriteMetallib(const RgfxMetallibFunction &f);
 /// the host compiles from each module's own metadata, read from metal2vulkan's code at the pin).
 /// False, with `out` untouched, where `bytes` are not that container or do not read whole. The
 /// layout (measured: macOS 26.7.1, the Intel UHD 630's and the AMD Radeon Pro 5300M's devices, 15
-/// programs of our own of one or two kernels):
+/// programs of our own of one or two kernels; macOS 27, the M3 Max's, two of them):
 ///   - the u32 1, then 12 zero bytes;
 ///   - from 0x10, ten pairs of a u32 offset and a u32 size, of which the first places the
 ///     function table and the fourth the modules (the others are not read: the second holds 8
 ///     zero bytes a function, the sixth "default.metallib", the seventh a u32 count and the names);
-///   - the function table: the u16s 8, 2, 1 and 1, a u32 count, then each function's seven u32s
+///   - the function table: a u16 (8 on macOS 26.7.1, 9 on macOS 27; not read), the u16s 2, 1
+///     and 1, a u32 count, then each function's seven u32s
 ///     and its NUL-terminated name. The first u32 is the stage (2, a kernel, the only one seen),
 ///     the third the function's offset in the second section, the fifth its module's offset from
 ///     the fourth's; the second, fourth and sixth were 0 and the seventh 0xfc (field_04, field_0c,
