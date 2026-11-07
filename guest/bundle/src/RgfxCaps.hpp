@@ -197,6 +197,18 @@ enum RgfxSpiFeature : int {
 /// Graphics" for "Intel(R) UHD Graphics 630"). Where that leaves nothing, the whole name.
 std::string rgfxFamilyNameOf(const char *name);
 
+/// The MTLDeviceSPI `vendorName` of a device named `name`: the vendor its first word names, in
+/// the words Metal's devices answer, "NVIDIA", "AMD" or "Intel(R)" (measured: "AMD" for the AMD
+/// Radeon Pro 5300M, "Intel(R)" for the Intel UHD Graphics 630, macOS 26.7.1), for a name whose
+/// first word is "NVIDIA", "AMD", "Intel" or "Intel(R)"; "AMD" for any other. The system's GL
+/// renderer (AppleMetalOpenGLRenderer) picks its settings by finding "AMD" or "ATI", "NVIDIA" or
+/// "Intel" in the answer, else by the Apple GPU families 7 and 5, and ends every process that
+/// makes a GL context on any other device ("Unknown GPU!!", read from its code; measured with the
+/// IOGPU base's "Apple" beside Mac2 alone, macOS 26.6.1): a GPU of another vendor answers the one
+/// the x86 Macs' discrete GPUs answer, which the renderer runs gl_cases' cases with as it does
+/// with the others (tools/gl_cases.m, measured: macOS 26.6.1 on an RTX 5080 host).
+std::string rgfxVendorNameOf(const char *name);
+
 class RgfxCaps {
 public:
 	RgfxCaps();

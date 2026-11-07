@@ -307,6 +307,18 @@ uint64_t RgfxCaps::maxThreadsPerThreadgroup(uint32_t dim) const
 	return m_info.max_threads_per_threadgroup[dim];
 }
 
+std::string rgfxVendorNameOf(const char *name)
+{
+	std::string first;
+	for (const char *c = name; *c != '\0' && *c != ' '; c++)
+		first += *c;
+	if (first == "NVIDIA")
+		return "NVIDIA";
+	if (first == "Intel" || first == "Intel(R)")
+		return "Intel(R)";
+	return "AMD";
+}
+
 std::string rgfxFamilyNameOf(const char *name)
 {
 	std::vector<std::string> words;

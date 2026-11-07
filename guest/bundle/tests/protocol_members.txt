@@ -1017,7 +1017,7 @@ unmapShaderSampleBuffer metal the device maps no shader sample buffer (its map i
 validateDynamicLibrary:state:error: base %base-spi
 validateDynamicLibraryDescriptor:error: base %base-spi
 validateDynamicLibraryURL:error: base %base-spi
-vendorName base %base-spi
+vendorName implemented class 2 (the Macs diverge): the host GPU's vendor, from the first word of the device name, in the words the Macs answer (measured: "AMD" for AMD Radeon Pro 5300M, "Intel(R)" for Intel(R) UHD Graphics 630), so "NVIDIA" for an RTX 5080; "AMD" for a name of no vendor the system's GL renderer knows, which it ends the process at; the IOGPU base answered "Apple" beside Mac2 alone, which no Mac does
 writeMeshShaderEmulatorDataStructureHeader:meshShaderPSO:scalingFactor: base %base-spi
 
 [RgfxParallelRenderCommandEncoder]

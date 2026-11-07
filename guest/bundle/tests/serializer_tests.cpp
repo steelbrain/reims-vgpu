@@ -623,6 +623,28 @@ void test_family_names()
 		CHECK(rgfxFamilyNameOf(name) == family);
 }
 
+// The SPI vendor name, from the device name's first word: the two x86 Macs' names give their
+// own answers (measured), the hosts' names their vendors' in those words, and a name of no vendor
+// the GL renderer knows the AMD's.
+void test_vendor_names()
+{
+	const std::pair<const char *, const char *> cases[] = {
+	    {"AMD Radeon Pro 5300M", "AMD"},
+	    {"Intel(R) UHD Graphics 630", "Intel(R)"},
+	    {"NVIDIA GeForce RTX 5080 Laptop GPU", "NVIDIA"},
+	    {"AMD Radeon 780M (RADV GFX1103_R1)", "AMD"},
+	    {"Intel(R) Arc(tm) Graphics (MTL)", "Intel(R)"},
+	    {"Intel Arc A770", "Intel(R)"},
+	    {"Apple M3 Max", "AMD"},
+	    {"llvmpipe (LLVM 20.1.8, 256 bits)", "AMD"},
+	    {"reims-graphics", "AMD"},
+	    {"", "AMD"},
+	    {"NVIDIAX", "AMD"}, // a first word that only begins with a vendor's
+	};
+	for (const auto &[name, vendor] : cases)
+		CHECK(rgfxVendorNameOf(name) == vendor);
+}
+
 // Heap and buffer creates carry the three modes and Metal's bit 24 to the host, and no other
 // bit: the GL renderer's no-copy buffers' bit 20 (0x100000) among them.
 void test_host_resource_options()
@@ -2933,6 +2955,7 @@ int main()
 	test_caps();
 	test_spi_features();
 	test_family_names();
+	test_vendor_names();
 	test_host_resource_options();
 	test_caps_features();
 	test_archive_file();

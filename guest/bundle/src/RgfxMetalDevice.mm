@@ -979,6 +979,14 @@ RGFX_LOG_UNRECOGNIZED
 	return [NSString stringWithUTF8String:rgfxFamilyNameOf(self.name.UTF8String).c_str()];
 }
 
+// The MTLDeviceSPI vendor name, the host GPU's vendor from the name the device answers
+// (rgfxVendorNameOf): "NVIDIA" for "NVIDIA GeForce RTX 5080 Laptop GPU". The IOGPU base answered
+// "Apple", on which the system's GL renderer ends every process that makes a GL context.
+- (NSString *)vendorName
+{
+	return [NSString stringWithUTF8String:rgfxVendorNameOf(self.name.UTF8String).c_str()];
+}
+
 - (uint64_t)registryID
 {
 	// The guest's own accelerator's registry entry ID: WindowServer finds the Metal device
