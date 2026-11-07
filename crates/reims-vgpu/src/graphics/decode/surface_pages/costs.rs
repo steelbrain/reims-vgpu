@@ -744,7 +744,7 @@ fn measure_large_takes<P: ApiPlatform>(label: &str) {
 
 /// The range mappings alone, with no GPU device made: what a profiler of the views' own code
 /// runs, outside the GPU's locks (`RGK_BENCH_MAP_ONLY=1` with the Vulkan test).
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 fn map_only<P: ApiPlatform>(label: &str) {
     let platform = P::process();
     let page = platform.vm().page_size().max(GUEST_PAGE);
@@ -797,7 +797,7 @@ fn map_only<P: ApiPlatform>(label: &str) {
 }
 
 /// The Vulkan platform's costs (module docs).
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn surface_view_costs_vulkan() {
@@ -813,7 +813,7 @@ fn surface_view_costs_vulkan() {
 /// The same views and imports made with nothing of ours between: the kernel's `mmap` of each
 /// run, and the runtime's import of the view, as it checks the pages' write permission
 /// (`PROCMAP_QUERY` a mapping) and as it is told they are writable (`assume_writable`).
-#[cfg(all(feature = "vulkan", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 mod raw {
     use std::os::fd::AsRawFd as _;
     use std::ptr::NonNull;
@@ -920,7 +920,7 @@ fn surface_view_costs_metal() {
 }
 
 /// The Vulkan platform's takes of pages slabs (module docs).
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn pages_take_costs_vulkan() {
@@ -936,7 +936,7 @@ fn pages_take_costs_metal() {
 }
 
 /// The Vulkan platform's takes of large pages slabs (module docs).
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn large_take_costs_vulkan() {

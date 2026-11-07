@@ -319,8 +319,9 @@ Set in `Cargo.toml` (architecture 2.3):
 
 ### Features
 
-- `reims-vgpu/vulkan` and `reims-vgpu-c/vulkan`: the Vulkan platform as the API's, and the C API's,
-  platform. Off by default on macOS; on Linux the library builds only with them.
+- `reims-vgpu/vulkan` and `reims-vgpu-c/vulkan`: on macOS, the Vulkan platform as the API's, and
+  the C API's, platform, off by default. On Linux the Vulkan platform is the only one, with or
+  without them: they change nothing there, and a build with no features is the Linux library.
 - `macos-sdl` (`reims-vgpu-window`, forwarded by `reims-vgpu` and `reims-vgpu-c`), on by default:
   SDL3's window on macOS, which `REIMS_VGPU_WINDOW_IMPL=sdl` opens in place of AppKit's. Without it
   the macOS library has no SDL.

@@ -680,7 +680,7 @@ fn a_metal_window_frame_has_the_guest_s_cursor_over_it() {
 
 /// On the Vulkan platform, the window opens on the host screen CoreGraphics gives for the port,
 /// as on Metal; the testkit's platform does not ask CoreGraphics
-#[cfg(all(feature = "vulkan", target_os = "macos"))]
+#[cfg(all(vulkan_platform, target_os = "macos"))]
 #[test]
 fn a_vulkan_display_s_window_opens_on_the_host_screen() {
     use reims_vgpu_metal::MetalPlatform;
@@ -701,7 +701,7 @@ fn a_vulkan_display_s_window_opens_on_the_host_screen() {
 /// the window's layer: it names no device for the layer, which the swapchain sets, and the
 /// layer's drawables are not framebuffer-only, as the swapchain's images take transfers too;
 /// without a frame queue it has none, and the window never opens
-#[cfg(all(feature = "vulkan", target_os = "macos"))]
+#[cfg(all(vulkan_platform, target_os = "macos"))]
 #[test]
 fn a_vulkan_display_has_a_window_sink() {
     use reims_vgpu_core::tasks::isolation::TaskThreads;

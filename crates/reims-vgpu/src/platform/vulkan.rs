@@ -1,5 +1,5 @@
-//! `VulkanPlatform` as an `ApiPlatform` (feature `vulkan`): the runtime's devices, on macOS over
-//! MoltenVK and on Linux natively.
+//! `VulkanPlatform` as an `ApiPlatform` (`cfg(vulkan_platform)`): the runtime's devices, on macOS
+//! over MoltenVK, with the `vulkan` feature, and on Linux natively, always.
 
 use reims_vgpu_core::memory::dirty::DirtyLog;
 use reims_vgpu_core::num::ToU64 as _;

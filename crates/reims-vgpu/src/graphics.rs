@@ -3,10 +3,10 @@
 //!
 //! The device's region (BAR 2) is made here and shared: the device takes the guest's commands
 //! from its rings, and the window's sink imports the region's pages under the scanout as a
-//! no-copy buffer on the platform (Metal on macOS, the Vulkan platform's runtime with the
-//! `vulkan` feature) and blits the scanout out of it into each drawable, on the GPU, with no copy
-//! on the CPU (`sink`). The buffer's deallocator holds the region, so it stays mapped until the
-//! GPU has let the buffer go, after the device and the window.
+//! no-copy buffer on the platform (Metal on macOS, the Vulkan platform's runtime on Linux and with
+//! the `vulkan` feature) and blits the scanout out of it into each drawable, on the GPU, with no
+//! copy on the CPU (`sink`). The buffer's deallocator holds the region, so it stays mapped until
+//! the GPU has let the buffer go, after the device and the window.
 //!
 //! **The window** ([`WindowScreen`]) is a display window of `reims-vgpu-window` that keeps its
 //! size (`WindowConfig::keeps_its_size`): the guest follows it. It opens sized for the config's
@@ -115,10 +115,10 @@ mod metal;
 mod present;
 mod read;
 mod sink;
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 mod vulkan;
 
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 pub(crate) use vulkan::graphics_video as vulkan_graphics_video;
 
 pub use decode::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
@@ -2614,7 +2614,7 @@ impl Screen for WindowScreen {
 }
 
 /// The window's sink over `region` on `platform` ([`sink::ScanoutDraw`]): Metal's on macOS's
-/// product platform, the Vulkan platform's swapchain presenter with the `vulkan` feature;
+/// product platform, the Vulkan platform's swapchain presenter (`cfg(vulkan_platform)`);
 /// `None` on any other platform (the testkit's), or where the platform refuses a command queue.
 fn scanout_sink<P: ApiPlatform>(
     platform: &Arc<P>,
@@ -2631,7 +2631,7 @@ fn scanout_sink<P: ApiPlatform>(
     ) {
         return metal::sink(metal, region, shown, &presented);
     }
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     if let (Ok(vulkan), Ok(presented)) = (
         Arc::clone(&any).downcast::<reims_vgpu_vulkan::VulkanPlatform>(),
         Arc::clone(&presented_any).downcast::<Presented<reims_vgpu_vulkan::VulkanPlatform>>(),

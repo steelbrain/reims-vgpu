@@ -1,7 +1,7 @@
 //! A proof of concept: the `Platform` implementation over `metal2vulkan-runtime`, a Metal-shaped
-//! API on Vulkan (architecture D1). The Metal platform stays the product: this one is the API's
-//! platform only under the `vulkan` features of `reims-vgpu` and `reims-vgpu-c`, which
-//! `cargo xtask dist --platform vulkan` selects.
+//! API on Vulkan (architecture D1). On Linux it is the API's only platform. On macOS the Metal
+//! platform stays the product: this one is the API's platform only under the `vulkan` features of
+//! `reims-vgpu` and `reims-vgpu-c`, which `cargo xtask dist --platform vulkan` selects.
 //!
 //! - **GPU objects** are the runtime's ([`gpu`]): each handle is an [`Obj`] over the runtime's
 //!   object and what core's trait asks of it beside (the device it came from, the IOSurface it

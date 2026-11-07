@@ -18,9 +18,10 @@ default = ["macos-sdl"]
 # SDL3's window on macOS (`reims-vgpu`'s `macos-sdl`), on by default: `--no-default-features`
 # builds the macOS library without SDL, its windows AppKit's alone.
 macos-sdl = ["reims-vgpu/macos-sdl"]
-# The Vulkan platform's proof of concept (architecture 11.1): every handle is made on
-# `VulkanPlatform` in place of `MetalPlatform`. Off by default: the Metal platform is the product.
-# `cargo xtask dist --platform vulkan` builds the dist tree with it.
+# The Vulkan platform on macOS (architecture 11.1): every handle is made on `VulkanPlatform` in
+# place of `MetalPlatform`. Off by default: the Metal platform is the product there, and
+# `cargo xtask dist --platform vulkan` builds the dist tree with it. On Linux every handle is
+# made on `VulkanPlatform` with or without it (`Plat`, `lib.rs`).
 vulkan = ["reims-vgpu/vulkan"]
 
 [dependencies]

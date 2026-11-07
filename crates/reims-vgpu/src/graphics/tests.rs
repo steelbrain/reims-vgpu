@@ -9139,7 +9139,6 @@ fn a_reset_waits_for_a_close_s_slow_release() {
 }
 
 /// A colour matrix of `rows` for display 0's transaction 1, in one `DISPLAY_COLOR` part.
-#[cfg(any(target_os = "macos", feature = "vulkan"))]
 fn color_matrix(rows: [[f32; 4]; 3]) -> Vec<u8> {
     let mut bytes = RgfxDisplayColor {
         header: RgfxMsgHeader {
@@ -9409,7 +9408,7 @@ fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
 }
 
 /// The pixel the odd-width reads put at `(x, y)`, B, G, R and A: no two alike within 7 rows
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 fn odd_width_pixel(x: usize, y: usize) -> [u8; 4] {
     let v = x * 7 + y * 131;
     [v as u8, (v >> 8) as u8, (x ^ y) as u8, 0xff]
@@ -9417,7 +9416,7 @@ fn odd_width_pixel(x: usize, y: usize) -> [u8; 4] {
 
 /// How a read of `width` × `height` pixels, rows of `width * 4` bytes, differs from `want`: the
 /// count and the first, or `None` where every pixel is `want`'s
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 fn read_differs(
     dst: &[u8],
     (width, height): (usize, usize),
@@ -9442,7 +9441,7 @@ fn read_differs(
 /// width's bytes or padded to 64 or 256 bytes: through no colour (the blit), a matrix that swaps
 /// red and blue (the colour's fragment), and a post-gamma ramp that inverts every channel (the
 /// table's fragment)
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 #[test]
 fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
     let platform = crate::singleton::vulkan_platform();
@@ -9544,7 +9543,7 @@ fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
 /// padded to 64 bytes as a guest's IOSurface rows are, reads row for row at a mode of its size,
 /// rendered to (shadowed) and read only (in place): copied as the guest wrote it with no colour,
 /// and drawn through a matrix that swaps red and blue
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 #[test]
 fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
     const RING_DATA: u32 = 0x1_0000;

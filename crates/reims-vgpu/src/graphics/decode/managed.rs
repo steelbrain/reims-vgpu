@@ -1966,7 +1966,6 @@ mod tests {
     /// reads the copy where its layout puts the slice: rows 256 bytes apart, slices 16 rows), and
     /// the copy after a blit wrote 0x5a into slice 1 and synchronized it, as a guest does (the GPU
     /// writes it there, slices 0 and 2 kept).
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn managed_array_in_place_on<P: crate::platform::ApiPlatform>() -> (Vec<u8>, Vec<u8>) {
         use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
         use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -2103,7 +2102,6 @@ mod tests {
     }
 
     /// Checks [`managed_array_in_place_on`]'s answers against the layout.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn check_managed_array_in_place((read, after): (Vec<u8>, Vec<u8>)) {
         let (w, h, row, slice) = (48usize, 16usize, 256usize, 256 * 16usize);
         for y in 0..h {
@@ -2142,7 +2140,7 @@ mod tests {
 
     /// As on Metal ([`on_metal_a_managed_2d_array_lies_over_its_cpu_copy`]), on the Vulkan
     /// platform.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_managed_2d_array_lies_over_its_cpu_copy() {
         check_managed_array_in_place(

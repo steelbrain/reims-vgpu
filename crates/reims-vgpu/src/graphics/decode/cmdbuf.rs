@@ -4566,7 +4566,6 @@ mod tests {
     /// A command buffer begun after another's answer on a doorbell's thread, on another queue, is
     /// committed after the answered buffer, which is begun only after it: the answer's ticket in
     /// the commit order holds it, as the ticket of one answered at its begin would.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[test]
     fn a_buffer_begun_after_an_answer_is_committed_after_the_answered_buffer() {
         let (p, mut dec, posted) = posting(false);
@@ -4684,7 +4683,6 @@ mod tests {
 
     /// A `COMMAND_BUFFER` message for queue `queue_obj_id`, command buffer `cb_obj_id`, carrying
     /// `ops`.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn command_buffer_on(queue_obj_id: u64, cb_obj_id: u64, ops: &[u8]) -> Vec<u8> {
         let mut msg = command_buffer_message(cb_obj_id, cb_obj_id, ops);
         let (mut m, _) = RgfxCommandBuffer::read_from_prefix(&msg).unwrap();
@@ -4699,7 +4697,6 @@ mod tests {
     /// out. Whether A was answered before the CPU let H go, 100 ms on, and the bytes B copied.
     /// Two processes' queues are two queues of the platform's device to the decoder, and an
     /// IOSurface's device cache one tracked buffer to every process that uses it.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn a_later_commit_on_another_queue<P: crate::platform::ApiPlatform>() -> (bool, Vec<u8>) {
         use std::time::{Duration, Instant};
@@ -4842,7 +4839,7 @@ mod tests {
 
     /// The same on the Vulkan platform
     /// (`on_metal_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes`).
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes() {
         let (early, bytes) = a_later_commit_on_another_queue::<reims_vgpu_vulkan::VulkanPlatform>();
@@ -4855,7 +4852,6 @@ mod tests {
     /// sets 2 encodes it. Whether the value 1 reached the guest within 5 s of the commit, before
     /// the buffer completed; then the CPU sets 2, whatever came: whether the buffer completed
     /// within 10 s of that, and whether the value went ahead of its completion, once.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn a_cpu_wait_for_a_mid_buffer_signal<P: crate::platform::ApiPlatform>() -> (bool, bool, bool) {
         use std::time::{Duration, Instant};
@@ -4975,7 +4971,7 @@ mod tests {
 
     /// The same on the Vulkan platform
     /// (`on_metal_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends`).
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends() {
         let (early, finished, once) =
@@ -4990,7 +4986,6 @@ mod tests {
     /// first, on a thread of its own; A is begun 50 ms on and committed 100 ms after that, and
     /// its message ends, raising its queue's commit mark, once the platform has scheduled it. The
     /// bytes B copied.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn a_plain_commit_after_a_named_buffer_of_another_queue<P: crate::platform::ApiPlatform>()
     -> Vec<u8> {
@@ -5138,7 +5133,7 @@ mod tests {
 
     /// The same on the Vulkan platform
     /// (`on_metal_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names`).
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names() {
         let bytes = a_plain_commit_after_a_named_buffer_of_another_queue::<
@@ -5155,7 +5150,6 @@ mod tests {
     /// names A in its surface order, asks for its submission and copies the buffer out. The
     /// records of B posted by the time its decode returned, whether B was still unfinished 100 ms
     /// on, the order of the completions, and the bytes B copied.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn an_order_behind_a_held_buffer<P: crate::platform::ApiPlatform>()
     -> (Vec<u32>, bool, Vec<u64>, Vec<u8>) {
@@ -5314,7 +5308,7 @@ mod tests {
     /// still runs after A, copying what A wrote; the order in which the runtime reports the two
     /// queues' completions is its own: on MoltenVK on the M3 Max it reported B's before A's in 20
     /// runs of 20, with B's records held back to its scheduling as with them posted at its commit.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_an_order_behind_a_held_buffer_holds_back_no_record() {
         let (posted, waited, mut completed, bytes) =
@@ -5332,7 +5326,6 @@ mod tests {
     /// counts its draw at 16, the second starts at `Disabled` at 0, as the bundle starts a
     /// sub-encoder after one that set a mode, and draws; then `Disabled` at 24 and a draw. The
     /// buffer's words once the command buffer finished.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn sub_encoders_after_a_count<P: crate::platform::ApiPlatform>() -> [u64; 4] {
         use std::time::{Duration, Instant};
@@ -5504,7 +5497,7 @@ mod tests {
 
     /// The same on the Vulkan platform, whose runtime writes nothing under `Disabled` at any
     /// offset.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_sub_encoders_after_a_count_write_nothing_under_disabled() {
         let fill = u64::from_ne_bytes([0xee; 8]);
@@ -5516,7 +5509,7 @@ mod tests {
 
     /// A `BUFFER_CREATE` of `length` bytes, id `obj_id`, at `gpu_address` (0: where the host
     /// places it).
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     fn buffer_at(obj_id: u64, gpu_address: u64, length: u64) -> RgfxBufferCreate {
         RgfxBufferCreate {
             header: RgfxMsgHeader {
@@ -5537,14 +5530,14 @@ mod tests {
     /// refused in 4 of 20 one-process runs of `graphics::decode` (measured on the M3 Max), where
     /// `on_vulkan_the_host_s_own_ranges_lie_below_every_unit`'s pin at the range's base, 96 KiB,
     /// covers its address.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     static CONTEXT_RANGE_PINS: Mutex<()> = Mutex::new(());
 
     /// A decoder on the Vulkan platform with a queue (1), and, as a process in slot 0 picks
     /// (`RgfxIdSpace`, next fit from the slot's base, a pick of Metal's span of a pin), a
     /// device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes no
     /// pin of: the runtime makes its bytes at an address it picks itself.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     fn decoder_with_a_texture_buffer() -> (
         GraphicsDecoder<reims_vgpu_vulkan::VulkanPlatform>,
         <reims_vgpu_vulkan::VulkanPlatform as Platform>::Device,
@@ -5599,7 +5592,7 @@ mod tests {
     /// A guest's pin meets no range the Vulkan platform's runtime placed for itself: a buffer
     /// pinned at the pick after a texture buffer's is made, though the runtime made the texture
     /// buffer's bytes where it picks.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
         use reims_graphics::wire::RGFX_CONTEXT_VA_BASE;
@@ -5614,7 +5607,7 @@ mod tests {
     /// itself lies below them, and, with it, a queue's and a texture buffer's ranges made, the
     /// first pick of every unit the kext hands the contexts out in and the last unit's last pick
     /// are made.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_the_host_s_own_ranges_lie_below_every_unit() {
         use reims_graphics::wire::{

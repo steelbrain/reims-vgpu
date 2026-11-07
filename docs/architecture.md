@@ -154,8 +154,8 @@ keep their defaults unless a Rust host hands the display a `Preferences` reader 
 reims-vgpu-core  <-  reims-vgpu-metal  <-  reims-vgpu-window  <-  reims-vgpu  <-  reims-vgpu-c
 reims-vgpu-c  <-  QEMU, the suite's runner, the pins
 reims-vgpu-core, reims-vgpu-metal (macOS), metal2vulkan-runtime  <-  reims-vgpu-vulkan
-reims-vgpu-vulkan  <-  reims-vgpu, reims-vgpu-c  (their `vulkan` feature: off by default on macOS,
-                                                  required on Linux)
+reims-vgpu-vulkan  <-  reims-vgpu, reims-vgpu-c  (on Linux always; on macOS their `vulkan`
+                                                  feature, off by default)
 ```
 
 - **The Vulkan platform** (`reims-vgpu-vulkan`) is a second `Platform` over
@@ -163,12 +163,14 @@ reims-vgpu-vulkan  <-  reims-vgpu, reims-vgpu-c  (their `vulkan` feature: off by
   its public repository `Cargo.toml` names, on the host's Vulkan driver, or MoltenVK on a Mac. On
   macOS it takes its OS services (IOSurfaces, Mach VM, the clock, threads) from the metal crate;
   on Linux it has its own (`os/linux/`: a host VM over `mmap` of the guest RAM's files, and an
-  IOSurface stand-in over that memory). The API's and the C API's `vulkan` features take it
-  (10, 11.1): on Linux the library builds only with them, and on macOS `cargo xtask dist
-  --platform vulkan` builds a tree on it (11.3), the Metal platform staying the product and the
-  default. Where its answer differs from Metal's it logs the difference and goes on, and dies
-  where Metal would or where the runtime cannot run the call (api.md section 2; the ledger,
-  `docs/accuracy-ledger.md`). A method it has not built dies at its selector.
+  IOSurface stand-in over that memory). On Linux it is the library's only platform, with or
+  without any feature: `reims-vgpu`'s build script sets `cfg(vulkan_platform)` there, and its
+  dependencies are not optional. On macOS the API's and the C API's `vulkan` features take it
+  (10, 11.1), and `cargo xtask dist --platform vulkan` builds a tree on it (11.3), the Metal
+  platform staying the product and the default. Where its answer differs from Metal's it logs the
+  difference and goes on, and dies where Metal would or where the runtime cannot run the call
+  (api.md section 2; the ledger, `docs/accuracy-ledger.md`). A method it has not built dies at its
+  selector.
 
 - **Core** depends on `parking_lot`, `zerocopy`, `bitflags` and `log` only (`loom` under
   `cfg(loom)`). Its `testkit` feature exposes `core::testkit` outside core's own tests; only
@@ -1017,12 +1019,13 @@ section 3 has its types and signatures.
   and waited on as separate calls. `read_pixels` copies a target into host memory.
 - **The process's platform.** `singleton.rs` makes the one `MetalPlatform` on first use: it
   installs the panic hook (6.5), then the stderr logger if `REIMS_VGPU_LOG` asks for it (14).
-- **The Vulkan platform** (feature `vulkan`, 2.2). `VulkanPlatform` is an `ApiPlatform` too:
-  `singleton.rs` makes its one instance the same way, its devices are the runtime's (the default
-  one, or the one whose registry ID a config names: Metal's for the default device, the runtime's
-  own for any other), and `read_pixels` reads the texture back through the runtime. On Linux it
-  is the default platform. A window display on it gets the host's screen as the window crate
-  lists them, and a sink that draws into the window's swapchain ("Windows", below).
+- **The Vulkan platform** (on Linux, and on macOS with the `vulkan` feature, 2.2).
+  `VulkanPlatform` is an `ApiPlatform` too: `singleton.rs` makes its one instance the same way,
+  its devices are the runtime's (the default one, or the one whose registry ID a config names:
+  Metal's for the default device, the runtime's own for any other), and `read_pixels` reads the
+  texture back through the runtime. On Linux it is the default platform. A window display on it
+  gets the host's screen as the window crate lists them, and a sink that draws into the window's
+  swapchain ("Windows", below).
 - **Entries.** Every public method, and every release of a handle, runs inside `entry::run`:
   the thread is marked as the library's (6.5), and a real pool and a holder are open (7.4), so
   what the call held or Metal autoreleased on the thread is released before it returns.
@@ -1038,7 +1041,7 @@ section 3 has its types and signatures.
   the window crate's policy. Once the display exists the window gets its sink
   (`window::window_sink`; the testkit's platform gets a fixed screen and no sink). On
   `MetalPlatform`, `MetalSink` encodes the display's current frame into a drawable in a command
-  buffer of the frame queue, presents it and commits. On `VulkanPlatform` (feature `vulkan`),
+  buffer of the frame queue, presents it and commits. On `VulkanPlatform`,
   `window::vulkan`'s `SwapchainSink` makes a presenter over a swapchain of the window's surface
   (on macOS one of its `CAMetalLayer`), which encodes the frame into the swapchain's next image,
   commits, and presents the image on the swapchain's presenting queue once the runtime has
@@ -1082,10 +1085,10 @@ docs/api.md is the C API's specification; the header repeats each rule where it 
   additive, and `rvg_status_message` describes each.
 - Every call of a host function runs in `ffi::host_call` (6.7). The log hook
   (`rvg_log_set_handler`, `log.rs`) sends the library's lines to the host's function (14).
-- The exports are written over `Plat`: `MetalPlatform` in the product, the testkit's
-  `FakePlatform` in the crate's unit tests, which then run the product's code. The crate's
-  `vulkan` feature (off by default) makes it `VulkanPlatform` (2.2, 10); nothing else of the C API
-  changes, the header included.
+- The exports are written over `Plat`: `MetalPlatform` in the product on macOS, the testkit's
+  `FakePlatform` in the crate's unit tests, which then run the product's code. On Linux it is
+  `VulkanPlatform`, and on macOS the crate's `vulkan` feature (off by default) makes it so (2.2,
+  10); nothing else of the C API changes, the header included.
 
 ### 11.2 The header
 

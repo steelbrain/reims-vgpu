@@ -7,13 +7,14 @@
 //! [`IoSurfaceDevice`] are counted references with `clone_ref()` and no `Clone`: the last drop
 //! of a device, display or IOSurface device is its end, run on the releasing thread. They are
 //! generic over the platform with [`DefaultPlatform`] as the default, so their forwarding is
-//! unit-tested on core's fake platform. The `vulkan` feature adds `VulkanPlatform`, over
-//! metal2vulkan's runtime, whose window displays draw each frame into a swapchain of their
-//! window, on macOS one over the window's `CAMetalLayer`.
+//! unit-tested on core's fake platform. The Vulkan platform, `VulkanPlatform`, over
+//! metal2vulkan's runtime, draws each frame of a window display into a swapchain of its window,
+//! on macOS one over the window's `CAMetalLayer`.
 //!
-//! **By OS.** On macOS the default platform is `MetalPlatform`, the product. On Linux the library
-//! is the Vulkan platform's: it builds only with the `vulkan` feature, and `VulkanPlatform` is the
-//! default.
+//! **By OS.** On macOS the default platform is `MetalPlatform`, the product, and the `vulkan`
+//! feature adds `VulkanPlatform` beside it. On Linux the library is the Vulkan platform's, with or
+//! without the feature, and `VulkanPlatform` is the default. The build script sets
+//! `cfg(vulkan_platform)` wherever the library has `VulkanPlatform`, and the code is gated on it.
 //!
 //! Behaviour is core's; this crate adds none. Its closures are called synchronously on the
 //! thread core calls them on, in core's order, which is the order of VM-memory operations and
@@ -24,13 +25,10 @@
 //!
 //! The library logs through the `log` crate: a Rust host installs its own logger.
 
-// With the `vulkan` feature, the proof that a window's presenter is `Send` (its swapchain, the
+// With the Vulkan platform, the proof that a window's presenter is `Send` (its swapchain, the
 // swapchains it retired, and the runtime's types under them) nests deeper than rustc's default
 // limit of 128 (E0275), as the C crate's does.
 #![recursion_limit = "256"]
-
-#[cfg(all(target_os = "linux", not(feature = "vulkan")))]
-compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
 
 /// The unit tests' allocator, which counts a thread's allocations where a test asks.
 #[cfg(test)]
@@ -82,7 +80,7 @@ pub use reims_vgpu_metal::MetalPlatform;
 /// its capabilities, which they make devices on.
 #[cfg(feature = "testkit")]
 pub use reims_vgpu_video_core;
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 pub use reims_vgpu_vulkan::VulkanPlatform;
 pub use scaler::{GuestMemory, ScalerDevice, ScalerDeviceConfig, ScalerOutcome};
 pub use video::{

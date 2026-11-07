@@ -20,13 +20,13 @@
 //!
 //! **Windows.** A window display's host screen and what draws its frames are chosen by the
 //! platform's type (`window::host_screen`, `window::window_sink`): `MetalPlatform` answers from
-//! the host's screens and with a sink over Metal; the Vulkan platform (feature `vulkan`), from
-//! the host's screens and, on macOS, with a sink that has Metal copy the runtime's frames into
-//! the window; the testkit's platform, a fixed screen (`FAKE_HOST_SCREEN`) and no sink, so its
-//! window displays never open a window. So the trait below names no Objective-C type.
+//! the host's screens and with a sink over Metal; the Vulkan platform (`cfg(vulkan_platform)`),
+//! from the host's screens and, on macOS, with a sink that has Metal copy the runtime's frames
+//! into the window; the testkit's platform, a fixed screen (`FAKE_HOST_SCREEN`) and no sink, so
+//! its window displays never open a window. So the trait below names no Objective-C type.
 //!
 //! **By platform.** Each platform's `ApiPlatform` is a file of its own: `platform/metal.rs`
-//! (macOS) and `platform/vulkan.rs` (feature `vulkan`).
+//! (macOS) and `platform/vulkan.rs` (Linux, and macOS with the `vulkan` feature).
 
 use std::any::Any;
 use std::sync::{Arc, OnceLock, Weak};
@@ -217,7 +217,7 @@ impl HostQueue for DisplayThread {
 
 #[cfg(target_os = "macos")]
 mod metal;
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 mod vulkan;
 
 #[cfg(any(test, feature = "testkit"))]
@@ -311,7 +311,7 @@ mod tests {
 
     /// The Vulkan platform's devices: the default one, the same object again by the registry ID
     /// the platform answers for it, and none for an ID no device has (the suite's `UINT64_MAX`)
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn vulkan_devices_by_registry_id() {
         use reims_vgpu_core::tasks::isolation::TaskThreads;
@@ -328,7 +328,7 @@ mod tests {
     /// The Vulkan platform's lease of the guest's RAM lets views be made of the pages the host
     /// names a file behind, showing the file from its offset, while it lives; never of a range
     /// without a file
-    #[cfg(all(feature = "vulkan", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_vulkan_lease_lets_views_be_made_of_the_guests_ram() {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};

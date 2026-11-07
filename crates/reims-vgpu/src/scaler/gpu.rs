@@ -68,7 +68,7 @@ mod params;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod metal;
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 #[cfg_attr(
     target_os = "macos",
     allow(

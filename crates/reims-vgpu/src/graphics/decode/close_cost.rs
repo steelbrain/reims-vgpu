@@ -269,7 +269,7 @@ fn on_fake_close_cost() {
 }
 
 /// On the Vulkan platform: the decoder's, the platform's and the runtime's.
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a close's cost an object"]
 fn on_vulkan_close_cost() {

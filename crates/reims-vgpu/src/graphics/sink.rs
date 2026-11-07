@@ -2001,7 +2001,7 @@ mod tests {
 
     /// On the Vulkan platform (MoltenVK's on a Mac), the colour's table draws the bytes the
     /// colour's pass draws, as on Metal (`on_metal_the_table_draws_what_the_pass_draws`)
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_the_table_draws_what_the_pass_draws() {
         use reims_vgpu_core::tasks::isolation::TaskThreads;
@@ -2011,13 +2011,11 @@ mod tests {
     }
 
     /// `on_metal_the_table_draws_what_the_pass_draws`, on `platform`.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn the_table_draws_what_the_pass_draws<P: ApiPlatform>(platform: Arc<P>) {
         crate::entry::run(|_| table_draws_what_the_pass_draws(&platform));
     }
 
     /// [`the_table_draws_what_the_pass_draws`]'s body, inside the library's entry.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn table_draws_what_the_pass_draws<P: ApiPlatform>(platform: &Arc<P>) {
         use reims_graphics::wire::RGFX_ALLOCATIONS_OFFSET;
 

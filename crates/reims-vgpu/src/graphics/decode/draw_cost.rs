@@ -880,7 +880,7 @@ fn target_pass<P: ApiPlatform>(bench: &Bench<P>, pass: usize) -> P::RenderPassDe
 
 /// The runtime alone, on the Vulkan platform's objects of `bench`: the calls the platform makes
 /// of it for each command.
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     use metal2vulkan_runtime as rt;
     let (queue, _) = bench.queue_and_target();
@@ -1161,7 +1161,7 @@ fn the_mc_shapes_cut_their_draws_into_passes() {
 }
 
 /// On the Vulkan platform: the decoder, the platform and the runtime alone.
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a draw's cost"]
 fn on_vulkan_draw_cost() {

@@ -1,6 +1,7 @@
 //! Builds `tests/c/harness.c` against the committed `include/reims_vgpu.h`, links it to this
 //! crate's dynamic library, and runs it. The harness uses the platform the library is built on, as
-//! a C host does: `MetalPlatform`, or `VulkanPlatform` with the `vulkan` feature.
+//! a C host does: on macOS `MetalPlatform`, or `VulkanPlatform` with the `vulkan` feature; on
+//! Linux `VulkanPlatform`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

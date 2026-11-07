@@ -159,7 +159,7 @@ impl DisplayStats {
 
     /// One of the window's draws took `gpu` of GPU time.
     #[cfg_attr(
-        not(any(test, feature = "vulkan")),
+        not(any(test, vulkan_platform)),
         expect(
             dead_code,
             reason = "only the Vulkan platform's sink measures its frames' GPU time"

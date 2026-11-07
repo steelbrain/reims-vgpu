@@ -215,7 +215,7 @@ fn each_gpu(ahead: Ahead) {
         );
         firsts(&name, gpu, ahead, &|| None);
     }
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     {
         let runtime = StdRuntime::shared();
         let started = runtime.now();
@@ -244,7 +244,7 @@ fn each_gpu(ahead: Ahead) {
 /// it makes the pipeline states
 #[test]
 fn the_making_ahead_makes_what_the_first_transforms_take() {
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     match vulkan::VulkanGpu::process(&StdRuntime::shared()) {
         Ok(gpu) => {
             let name = format!("Vulkan, {}", gpu.name());

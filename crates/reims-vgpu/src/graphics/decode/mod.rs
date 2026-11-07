@@ -8381,7 +8381,7 @@ lacks {part}"
 
     /// [`on_metal_a_linked_function_s_specialized_name_resolves_its_call`] on the Vulkan
     /// platform, whose answers are Metal's
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_linked_function_s_specialized_name_resolves_its_call() {
         a_linked_function_s_specialized_name_resolves_its_call::<reims_vgpu_vulkan::VulkanPlatform>(
@@ -8480,7 +8480,6 @@ lacks {part}"
     const STITCHABLE: &str = include_str!("../../../../../guest/bundle/tests/stitchable.metal");
 
     /// `stitch_caller`'s and `stitch_caller_extra`'s inputs: `fused` makes 20 of them, and `pair` 5.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const STITCH_INPUTS: [f32; 3] = [2.0, 3.0, 4.0];
 
     /// What the guest sends of a stitched library, made on this Mac as the guest's route makes it
@@ -8584,7 +8583,6 @@ lacks {part}"
 
     /// Where a compute pipeline links `fused` from: one of the lists of `MTLLinkedFunctions`, or
     /// none.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const STITCH_LINKS: [Option<u32>; 3] = [
         Some(RGFX_LINKED_FUNCTIONS),
         Some(RGFX_LINKED_PRIVATE_FUNCTIONS),
@@ -8673,7 +8671,6 @@ lacks {part}"
     /// the guest sends (`caller`'s bytes, then `stitched`'s), then for each of [`STITCH_LINKS`] a
     /// pipeline create of `caller`'s `kernel` linking `stitched`'s `linked`, and what each pipeline
     /// made writes of [`STITCH_INPUTS`], run on the platform; `None` for one refused.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn stitched_links_through_the_decoder<P: crate::platform::ApiPlatform>(
         (caller, stitched): (&[u8], &[u8]),
         kernel: &str,
@@ -8801,7 +8798,6 @@ lacks {part}"
 
     /// The Vulkan crate's metallibs of the shell tests' stitchable functions and of the library
     /// Metal's stitcher makes of them (its build.rs, `stitched`), which a host without Metal takes.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const COMMITTED_STITCHED: [&[u8]; 2] = [
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/stitchable.metallib"),
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/stitched.metallib"),
@@ -8874,7 +8870,7 @@ lacks {part}"
     /// 20; with nothing linked, it is refused. The one linked signature the runtime still refuses
     /// (Unsupported, Feature::Linking), a linked-constants signature on a module that still
     /// declares function constants, is not this library's: it declares none
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_stitched_function_links_and_computes_as_metal_s() {
         let [caller, stitched] = COMMITTED_STITCHED;
@@ -8909,13 +8905,11 @@ lacks {part}"
 
     /// The Vulkan crate's metallib of a kernel that reads a function constant only where it is
     /// defined (its `optional_constant.metal`), which a host without Metal takes as a Mac does.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const OPTIONAL_CONSTANT: &[u8] =
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/optional_constant.metallib");
 
     /// What [`OPTIONAL_CONSTANT`]'s `optional_constant` writes, made through the decoder on `P`
     /// from a compute create of each of `cases`' constants: `None` where the create is refused.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn optional_constant_through_the_decoder<P: crate::platform::ApiPlatform>(
         cases: &[&[RgfxFunctionConstant]],
     ) -> Vec<Option<i32>> {
@@ -9028,7 +9022,6 @@ lacks {part}"
     /// The constants [`optional_constant_through_the_decoder`]'s creates send: none, as the guest
     /// sends a function made with constant values that set none of its constants, or by a
     /// descriptor without them; then its constant, an `int` (`MTLDataTypeInt`) of 5.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn optional_constant_cases() -> [Vec<RgfxFunctionConstant>; 2] {
         let mut value = [0; reims_graphics::wire::RGFX_FUNCTION_CONSTANT_VALUE_BYTES];
         value[..4].copy_from_slice(&5i32.to_le_bytes());
@@ -9059,7 +9052,7 @@ lacks {part}"
 
     /// [`on_metal_a_stage_function_sent_with_no_constants_is_made_with_them_undefined`] on the
     /// Vulkan platform, whose answers are Metal's
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_stage_function_sent_with_no_constants_is_made_with_them_undefined() {
         let cases = optional_constant_cases();
@@ -9072,14 +9065,12 @@ lacks {part}"
 
     /// The Vulkan crate's metallib of the readers of a texture (its `ycbcr_probe.metal`), which a
     /// host without Metal takes as a Mac does.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const PROBE_LIBRARY: &[u8] =
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/ycbcr_probe.metallib");
 
     /// What `kernel` of [`PROBE_LIBRARY`] reads of `texture` on `P`'s `device`, into floats: a
     /// texel for each of a grid of `grid`, with the sampler `sampler` and the probe bytes `probe`
     /// where given.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn kernel_reads<P: Platform>(
         device: &P::Device,
         kernel: &str,
@@ -9169,7 +9160,6 @@ lacks {part}"
     /// ids kept on it as a graphics device keeps them, and context 1's first chunk of resource ids
     /// granted. Each test runs in a process of its own, so this is the first use of the device's
     /// ids.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn surface_decoder<P: crate::platform::ApiPlatform>() -> (GraphicsDecoder<P>, P::Device) {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
@@ -9192,13 +9182,11 @@ lacks {part}"
     }
 
     /// Context 1's object `n`.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const fn context_obj(n: u64) -> u64 {
         (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | n
     }
 
     /// A Shared buffer of the decoder's, object `n`, holding `bytes` from its first.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn buffer_holding<P: Platform>(
         dec: &mut GraphicsDecoder<P>,
         device: &P::Device,
@@ -9227,7 +9215,6 @@ lacks {part}"
 
     /// A 2D texture descriptor of the wire: `format`, `size`, one level, usage `ShaderRead`,
     /// options 0 (Shared), the identity swizzle, as WindowServer asks for its surfaces' textures.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn surface_desc(format: u32, (width, height): (u64, u64)) -> RgfxTextureDescriptor {
         RgfxTextureDescriptor {
             pixel_format: format,
@@ -9245,7 +9232,6 @@ lacks {part}"
 
     /// The `TEXTURE_FROM_IOSURFACE` of texture `n` (resource id `n`) over plane 0 of buffer 10,
     /// at offset 0 with rows `bytes_per_row` apart, of `desc`, carrying `facts`.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn surface_texture_message(
         n: u64,
         desc: RgfxTextureDescriptor,
@@ -9277,11 +9263,9 @@ lacks {part}"
     /// What the guest's texture `n` of the decoder answers: its format, type, width, height,
     /// usage, resource options and storage mode, and the bits of every texel `read()` reads of it
     /// into floats.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     type TextureAnswer = ([u64; 7], Vec<[u32; 4]>);
 
     /// [`TextureAnswer`] of `texture`, of `size`, on `device`.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn texture_answer<P: Platform>(
         device: &P::Device,
         texture: &P::Texture,
@@ -9304,19 +9288,15 @@ lacks {part}"
 
     /// The pin's textures: 16 x 8, of BGRA8 (80) over a 'BGRA' surface and of RGBA16F (115) over
     /// an 'RGhA' one, with the surfaces' OSTypes and bytes a texel.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const PIN_CASES: [(u32, &[u8; 4], u64); 2] = [(80, b"BGRA", 4), (115, b"RGhA", 8)];
 
     /// The pin's size, and its rows: the bundle's copy of a surface without planes lays its rows
     /// 256 bytes apart (`alignUp(IOSurfaceGetBytesPerRow, 256)`).
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const PIN_SIZE: (u64, u64) = (16, 8);
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const PIN_ROW: u64 = 256;
 
     /// The pin's bytes: each a value of its place, every row whole, so a half's bits are no NaN
     /// (RGBA16F's exponents stay below 31).
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn pin_bytes() -> Vec<u8> {
         (0..PIN_ROW * PIN_SIZE.1)
             .map(|i| ((i * 37 + i / 7) % 0x7b) as u8)
@@ -9327,7 +9307,6 @@ lacks {part}"
     /// the decoder on `P`, both ways over the guest's copy of the surface, at offset 0 with rows
     /// [`PIN_ROW`] apart, options 0 (Shared): by today's buffer creator (`TEXTURE_FROM_BUFFER`),
     /// and by the IOSurface creator (`TEXTURE_FROM_IOSURFACE`, its facts saying no planes).
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn surface_textures_without_planes<P: crate::platform::ApiPlatform>() -> Vec<[TextureAnswer; 2]>
     {
         use reims_graphics::wire::RgfxSurfaceFacts;
@@ -9375,16 +9354,12 @@ lacks {part}"
     /// size), and the bundle's copy of its 'x420' surface: plane 0 at 0, plane 1 at
     /// [`YCBCR_CHROMA_AT`], each row `alignUp(IOSurfaceGetBytesPerRowOfPlane(k), 256)` apart, and
     /// each plane at a multiple of 256.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const YCBCR_SIZE: (u64, u64) = (16, 8);
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const YCBCR_ROW: u64 = 256;
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const YCBCR_CHROMA_AT: u64 = YCBCR_ROW * YCBCR_SIZE.1;
 
     /// The bundle's copy of the 505 texture's surface: 10-bit luma codes in the top bits of 16-bit
     /// samples, then interleaved Cb and Cr codes, one pair per 2 x 2 block, of a fixed noise.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn ycbcr_bytes() -> Vec<u8> {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
         let mut code = || {
@@ -9417,11 +9392,9 @@ lacks {part}"
     /// The probe WindowServer's composite is like: a linear sample in normalized coordinates of an
     /// 8 x 5 grid of positions from (0.375, 0.375) texels, 1.875 apart, which meet each weight
     /// between two texels of a multiple of 1/8 and the edges.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const YCBCR_GRID: (u64, u64) = (8, 5);
 
     /// [`YCBCR_GRID`]'s bytes (`Probe` in `ycbcr_probe.metal`).
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn ycbcr_probe() -> Vec<u8> {
         let floats = [0.375f32, 0.375, 1.875, 1.875].map(f32::to_le_bytes);
         let words = [YCBCR_GRID.0 as u32, YCBCR_GRID.1 as u32, 1, 0].map(u32::to_le_bytes);
@@ -9429,7 +9402,6 @@ lacks {part}"
     }
 
     /// The linear, clamp-to-edge sampler of normalized coordinates the probe samples through.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn linear_sampler<P: Platform>(device: &P::Device) -> P::SamplerState {
         let desc = SamplerDesc {
             min_filter: Some(1),
@@ -9446,7 +9418,6 @@ lacks {part}"
     /// ([`ycbcr_bytes`]) samples through the probe ([`ycbcr_probe`]) through the decoder on `P`,
     /// with the surface's facts in its `TEXTURE_FROM_IOSURFACE`; `None` where the create is
     /// refused.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn ycbcr_through_the_decoder<P: crate::platform::ApiPlatform>() -> Option<Vec<[f32; 4]>> {
         use reims_graphics::wire::{RGFX_YCBCR_MATRIX_ITU_R_2020, RgfxSurfaceFacts};
         let (mut dec, device) = surface_decoder::<P>();
@@ -9486,7 +9457,6 @@ lacks {part}"
     /// 'x420' surface of BT.2020 (`on_metal_a_505_texture_over_an_x420_surface_samples_as_recorded`,
     /// an Apple M3 Max under macOS 27.0.1): each sample's red, green and blue, as their bits,
     /// in the grid's rows; every alpha is 1.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const METAL_505: [[u32; 3]; 40] = [
         [0x3f800000, 0x3f16c000, 0x00000000],
         [0x3e1b8000, 0x3f0d0000, 0x3e398000],
@@ -9589,7 +9559,7 @@ lacks {part}"
     /// without planes answers by the runtime's IOSurface creator what it answers by the buffer's
     /// creator, as Metal's own two creators answer alike
     /// (`on_metal_surface_textures_without_planes_are_the_buffer_s`)
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_surface_textures_without_planes_are_the_buffer_s() {
         let answers = surface_textures_without_planes::<reims_vgpu_vulkan::VulkanPlatform>();
@@ -9605,7 +9575,6 @@ lacks {part}"
     /// not made. A measurement, run by hand (`--run-ignored only --no-capture`); it prints the
     /// mean, median and 99th percentile of each. `RVG_SAMPLER_BENCH_LIVE` (comma-separated) sets
     /// other live counts.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn sampler_create_cost<P: crate::platform::ApiPlatform>() {
         use reims_vgpu_core::platform::os::Clock as _;
         let (mut dec, device) = surface_decoder::<P>();
@@ -9683,7 +9652,7 @@ lacks {part}"
     }
 
     /// [`sampler_create_cost`] on the Vulkan platform.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     #[ignore = "a measurement, run by hand"]
     fn on_vulkan_sampler_create_cost_by_live_samplers() {
@@ -9823,7 +9792,7 @@ lacks {part}"
     /// of the sampling is printed: on a native device nothing of [`reims_vgpu_vulkan::answer::DIES`]
     /// is relayed but what a native device relays (`DeviceSampling` among them); on MoltenVK,
     /// Metal's own sampler's filter of the converted texels is `YCbCrFilterNotExact`'s, relayed.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_505_texture_over_the_bundle_s_copy_samples_as_metal_s() {
         use reims_vgpu_vulkan::answer::{self, native};

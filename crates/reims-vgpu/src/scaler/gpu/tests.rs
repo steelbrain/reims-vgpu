@@ -33,7 +33,7 @@ fn gpus() -> Vec<(String, Arc<dyn ScalerBackend>)> {
         let backend = GpuScalerBackend::new(gpu, Arc::clone(&runtime)).with_smallest_side(1);
         out.push((name, Arc::new(backend)));
     }
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     match vulkan::VulkanGpu::process(&runtime) {
         Ok(gpu) => {
             let name = format!("Vulkan, {}", gpu.name());

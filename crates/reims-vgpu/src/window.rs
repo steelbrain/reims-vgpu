@@ -3,8 +3,9 @@
 //! reference, the modes and density a display matching its host screen offers, and the sink that
 //! draws the display's current frame into the window: on macOS, on the product's platform,
 //! `metal::MetalSink`, into each drawable the window's render thread takes of its layer; on the
-//! Vulkan platform (feature `vulkan`), on either OS, `vulkan::SwapchainSink`, into the window's
-//! swapchain (on macOS one over the window's `CAMetalLayer`, whose images are its drawables).
+//! Vulkan platform (`cfg(vulkan_platform)`: Linux's, and macOS's with the `vulkan` feature),
+//! `vulkan::SwapchainSink`, into the window's swapchain (on macOS one over the window's
+//! `CAMetalLayer`, whose images are its drawables).
 //!
 //! **What the guest sees.** A window display has all five display callbacks, whatever the host
 //! gives ([`tee`]): the guest reads a cursor glyph size limit of 256 and both cursor handler
@@ -46,7 +47,7 @@ use crate::entry;
 use crate::stats::{self, DisplayStats};
 
 /// The host screen the window of the display on `port` opens on: on the product's platform and
-/// on the Vulkan platform (feature `vulkan`), the one `reims_vgpu_window::screens` picks from
+/// on the Vulkan platform (`cfg(vulkan_platform)`), the one `reims_vgpu_window::screens` picks from
 /// the host's screens; on the testkit's, `crate::platform::FAKE_HOST_SCREEN`; on any other,
 /// none. A display matching its host screen is offered modes without one too ([`host_matched`]).
 pub(crate) fn host_screen<P: Platform>(port: u64) -> Option<HostScreen> {
@@ -61,10 +62,10 @@ pub(crate) fn host_screen<P: Platform>(port: u64) -> Option<HostScreen> {
 }
 
 /// Whether a window display on `P` opens on the host's own screens ([`host_screen`]): on the
-/// product's platform and on the Vulkan platform (feature `vulkan`).
+/// product's platform and on the Vulkan platform (`cfg(vulkan_platform)`).
 fn on_host_screens<P: Platform>() -> bool {
     let platform = TypeId::of::<P>();
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     if platform == TypeId::of::<reims_vgpu_vulkan::VulkanPlatform>() {
         return true;
     }
@@ -74,9 +75,10 @@ fn on_host_screens<P: Platform>() -> bool {
 /// What draws a window display's current frame into its window, over `display`, held weakly, in
 /// command buffers of `frame_queue`, the process's frame queue for the display's device (a Metal
 /// device, or the runtime's on Vulkan): on macOS, on the product's platform, a
-/// `metal::MetalSink`, and on the Vulkan platform (feature `vulkan`) the sink of `vulkan`, which
-/// draws each frame into the window's swapchain, on either OS. `None` on any other platform (the
-/// testkit's among them), or without a frame queue: nothing draws, and the window never opens.
+/// `metal::MetalSink`, and on the Vulkan platform (`cfg(vulkan_platform)`) the sink of `vulkan`,
+/// which draws each frame into the window's swapchain, on either OS. `None` on any other platform
+/// (the testkit's among them), or without a frame queue: nothing draws, and the window never
+/// opens.
 pub(crate) fn window_sink<P: Platform>(
     platform: &Arc<P>,
     display: Weak<CoreDisplay<P>>,
@@ -89,7 +91,7 @@ pub(crate) fn window_sink<P: Platform>(
         Ok(sink) => return sink,
         Err(unmatched) => unmatched,
     };
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     let display = match display.downcast::<Weak<CoreDisplay<reims_vgpu_vulkan::VulkanPlatform>>>() {
         Ok(display) => {
             use reims_vgpu_vulkan::VulkanPlatform;
@@ -260,10 +262,6 @@ impl Drop for WindowLink {
 /// guest's cursor over it where the window draws it ([`cursor::CursorPass`]), and each frame it
 /// commits counts as a window frame in the display's statistics, where they are on
 /// ([`crate::stats`]).
-#[cfg_attr(
-    not(any(target_os = "macos", feature = "vulkan")),
-    expect(dead_code, reason = "only the Metal and Vulkan platforms' sinks draw")
-)]
 pub(crate) struct SinkDisplay<P: Platform> {
     /// The display, held only for a draw.
     display: Weak<CoreDisplay<P>>,
@@ -280,10 +278,6 @@ pub(crate) struct SinkDisplay<P: Platform> {
 /// One window frame, as a sink draws it: the steps in which the sinks differ, which
 /// [`SinkDisplay::encode`] runs in order. The frame is dropped after the commit, or where the
 /// draw ends without one.
-#[cfg_attr(
-    not(any(target_os = "macos", feature = "vulkan")),
-    expect(dead_code, reason = "only the Metal and Vulkan platforms' sinks draw")
-)]
 pub(crate) trait WindowFrame<P: Platform> {
     /// The texture the frame is encoded into, asked once the command buffer is made; `None`
     /// draws nothing, and the command buffer goes uncommitted.
@@ -293,10 +287,6 @@ pub(crate) trait WindowFrame<P: Platform> {
     fn encoded(&mut self, command_buffer: &P::CommandBuffer);
 }
 
-#[cfg_attr(
-    not(any(target_os = "macos", feature = "vulkan")),
-    expect(dead_code, reason = "only the Metal and Vulkan platforms' sinks draw")
-)]
 impl<P: Platform> SinkDisplay<P> {
     /// `display`, drawn in command buffers of `queue`, the frame queue of its device, the
     /// guest's cursor glyph in textures `own_texture` makes ([`cursor::OwnTexture`]). Its maker
@@ -333,7 +323,7 @@ impl<P: Platform> SinkDisplay<P> {
     /// The display's statistics, where they are on: a sink that measures its frames' GPU time
     /// reports it there.
     #[cfg_attr(
-        not(feature = "vulkan"),
+        not(vulkan_platform),
         expect(
             dead_code,
             reason = "only the Vulkan platform's sink measures its frames' GPU time"
@@ -411,14 +401,10 @@ impl<P: Platform> SinkDisplay<P> {
     }
 }
 
-#[cfg_attr(
-    not(any(target_os = "macos", feature = "vulkan")),
-    expect(dead_code, reason = "only the Metal and Vulkan platforms' sinks draw")
-)]
 mod cursor;
 #[cfg(target_os = "macos")]
 mod metal;
 #[cfg(test)]
 mod tests;
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 mod vulkan;

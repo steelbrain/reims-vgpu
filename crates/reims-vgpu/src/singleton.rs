@@ -7,8 +7,9 @@
 //! (`reims_vgpu_core::logging::init`). Every function of the C API installs the hook too, before
 //! its body runs, since some make no platform.
 //!
-//! With the `vulkan` feature, `vulkan_platform` is the process's `VulkanPlatform`, made the
-//! same way on its first use: the only platform on Linux.
+//! Where the library has the Vulkan platform (`cfg(vulkan_platform)`: on Linux, and on macOS with
+//! the `vulkan` feature), `vulkan_platform` is the process's `VulkanPlatform`, made the same way on
+//! its first use: the only platform on Linux.
 
 // The docs name macOS's platform, which other OSes have none of: their links resolve, and are
 // checked, on macOS.
@@ -21,12 +22,12 @@ use reims_vgpu_core::rt::is_our_thread;
 use reims_vgpu_core::tasks::isolation::TaskThreads;
 #[cfg(target_os = "macos")]
 use reims_vgpu_metal::MetalPlatform;
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 use reims_vgpu_vulkan::VulkanPlatform;
 
 #[cfg(target_os = "macos")]
 static PLATFORM: OnceLock<Arc<MetalPlatform>> = OnceLock::new();
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 static VULKAN_PLATFORM: OnceLock<Arc<VulkanPlatform>> = OnceLock::new();
 static HOOK: Once = Once::new();
 
@@ -51,7 +52,7 @@ pub fn platform_ref() -> &'static Arc<MetalPlatform> {
 /// The process's Vulkan platform, made on first use as [`platform`] makes the Metal one: the
 /// panic hook first, the logger, then one `VulkanPlatform` whose launcher runs each isolated
 /// task's service on threads of its own ([`TaskThreads`]).
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 pub fn vulkan_platform() -> Arc<VulkanPlatform> {
     VULKAN_PLATFORM
         .get_or_init(|| {
@@ -187,7 +188,7 @@ mod tests {
 
     /// vulkan_platform() is one per process, and installs the aborting hook as platform() does;
     /// in a child, for the reason above.
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn one_vulkan_platform_per_process() {
         if std::env::var_os("RVG_VULKAN_PLATFORM_CHILD").is_some() {

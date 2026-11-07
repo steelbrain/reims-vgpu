@@ -15,9 +15,10 @@ default = ["macos-sdl"]
 macos-sdl = ["reims-vgpu-window/macos-sdl"]
 # Tests: the core objects behind the public handles (`core()`), and core's testkit.
 testkit = ["reims-vgpu-core/testkit"]
-# The Vulkan platform (architecture 2.2): `VulkanPlatform` as an `ApiPlatform`, which the C API's
-# own `vulkan` feature makes its platform. Off by default on macOS, where the Metal platform is the
-# product; on Linux the library builds only with it (`lib.rs`).
+# The Vulkan platform (architecture 2.2) on macOS: `VulkanPlatform` as an `ApiPlatform`, on
+# MoltenVK, which the C API's own `vulkan` feature makes its platform. Off by default, as the Metal
+# platform is the product there. On Linux the Vulkan platform is the library's only one, its
+# dependencies are not optional, and the feature changes nothing (`build.rs`).
 vulkan = [
     "dep:reims-vgpu-vulkan",
     "dep:reims-vgpu-video-vulkan",
@@ -28,12 +29,6 @@ vulkan = [
 [dependencies]
 reims-vgpu-core.workspace = true
 reims-vgpu-window.workspace = true
-reims-vgpu-vulkan = { workspace = true, optional = true }
-# The reims-graphics device's hardware video on the Vulkan platform (`graphics::vulkan::video`):
-# Vulkan Video's decoders, on the runtime's device and its video-decode queue, through ash.
-reims-vgpu-video-vulkan = { workspace = true, optional = true }
-metal2vulkan-runtime = { workspace = true, optional = true }
-ash = { workspace = true, optional = true }
 # The video device's host session (`video`).
 reims-vgpu-video-core.workspace = true
 # The reims-graphics device's host side (`graphics`).
@@ -53,11 +48,19 @@ parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 # as a host maps it, a shared mapping of a file (`platform::tests`).
 libc.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
 # The video device's backends on Linux (`video::backend_choice`): VA-API, on libva and libva-drm;
 # NVIDIA's NVDEC and NVENC, whose libraries it loads at run time.
-[target.'cfg(target_os = "linux")'.dependencies]
 reims-vgpu-video-vaapi.workspace = true
 reims-vgpu-video-nvidia.workspace = true
+# The Vulkan platform, the library's only one on Linux: the dependencies of the `vulkan` feature,
+# which on macOS are optional (below).
+reims-vgpu-vulkan.workspace = true
+# The reims-graphics device's hardware video on the Vulkan platform (`graphics::vulkan::video`):
+# Vulkan Video's decoders, on the runtime's device and its video-decode queue, through ash.
+reims-vgpu-video-vulkan.workspace = true
+metal2vulkan-runtime.workspace = true
+ash.workspace = true
 
 # The Metal platform, the product on macOS, and its window's drawable (`window::metal::MetalSink`,
 # `window::vulkan`'s macOS sink).
@@ -68,6 +71,12 @@ reims-vgpu-metal.workspace = true
 objc2.workspace = true
 objc2-metal.workspace = true
 objc2-quartz-core = { workspace = true, features = ["CAMetalLayer", "objc2-metal"] }
+# The Vulkan platform on MoltenVK, with the `vulkan` feature: the dependencies Linux always has
+# (above).
+reims-vgpu-vulkan = { workspace = true, optional = true }
+reims-vgpu-video-vulkan = { workspace = true, optional = true }
+metal2vulkan-runtime = { workspace = true, optional = true }
+ash = { workspace = true, optional = true }
 
 [dev-dependencies]
 reims-vgpu-core = { workspace = true, features = ["testkit"] }

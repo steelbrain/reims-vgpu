@@ -356,7 +356,7 @@ impl<P: ApiPlatform> Bench<P> {
 }
 
 /// The runtime alone, on the Vulkan platform's objects of `bench`.
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     let triangle = metal2vulkan_runtime::DrawPrimitiveType::from_raw(TRIANGLE).unwrap();
     let icb = &bench.icb().raw;
@@ -491,7 +491,7 @@ fn measure<P: ApiPlatform>(
 }
 
 /// On the Vulkan platform: the decoder, the platform and the runtime alone.
-#[cfg(feature = "vulkan")]
+#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a command's cost"]
 fn on_vulkan_icb_slots_cost() {

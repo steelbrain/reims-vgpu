@@ -12,12 +12,12 @@
 //! - every struct the host writes starts with `struct_size` ([`sized`]);
 //! - every callback table has one `ctx` and one `destroy` ([`table`]).
 //!
-//! The exports are made over [`Plat`]: the product's `MetalPlatform`, or with the `vulkan`
-//! feature the proof of concept's `VulkanPlatform`, and core's testkit platform in this crate's
-//! unit tests, which then run the product's code. On Linux the crate builds only with the
-//! `vulkan` feature, since Metal is macOS's.
+//! The exports are made over [`Plat`]: on macOS the product's `MetalPlatform`, or with the
+//! `vulkan` feature `VulkanPlatform`; on Linux `VulkanPlatform`, with or without the feature,
+//! since Metal is macOS's; and core's testkit platform in this crate's unit tests, which then run
+//! the product's code.
 
-// With the `vulkan` feature, a debug build's proof that the runtime's types are `Send` and `Sync`
+// On the Vulkan platform, a debug build's proof that the runtime's types are `Send` and `Sync`
 // nests deeper than rustc's default limit of 128 (E0275).
 #![recursion_limit = "256"]
 
@@ -64,15 +64,12 @@ pub use status::RvgStatus;
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(all(target_os = "linux", not(feature = "vulkan")))]
-compile_error!("on Linux, reims-vgpu-c builds only with the `vulkan` feature (VulkanPlatform)");
-
-/// The platform every handle is made on.
-#[cfg(not(any(test, feature = "vulkan")))]
+/// The platform every handle is made on: the product's, on macOS.
+#[cfg(not(any(test, feature = "vulkan", target_os = "linux")))]
 pub(crate) type Plat = reims_vgpu::MetalPlatform;
-/// The platform every handle is made on, with the `vulkan` feature: the proof of concept over
-/// metal2vulkan's runtime (architecture 2.2).
-#[cfg(all(not(test), feature = "vulkan"))]
+/// The platform every handle is made on, on Linux and with the `vulkan` feature: the Vulkan
+/// platform, over metal2vulkan's runtime (architecture 2.2).
+#[cfg(all(not(test), any(feature = "vulkan", target_os = "linux")))]
 pub(crate) type Plat = reims_vgpu::VulkanPlatform;
 /// The platform every handle is made on: core's testkit platform in this crate's unit tests.
 #[cfg(test)]
