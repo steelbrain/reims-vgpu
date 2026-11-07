@@ -36,6 +36,16 @@
 //             block), 10 runs each: whether the wait for 1 returned, when, and when the buffer
 //             completed; and a signal at the very end of a buffer, 20 runs: its listener's block
 //             against the buffer's completed handler. Times are ms from the commit.
+//   gputimes  what GPUStartTime and GPUEndTime answer for one long command buffer: K encoders
+//             (K = 1, 8, 32) of ~0.5 ms of GPU work each in one buffer ("whole"), against the
+//             same encoders committed back to back one buffer each ("apart"), compute
+//             (slow_write) and render (K passes over a 1920 x 1080 BGRA8 target, each clearing
+//             it and blending 6 full-target quads), 7 runs each, and a whole compute buffer
+//             whose CPU sleeps 1 ms between its encoders as it encodes them. For each, medians
+//             of: whole, the span (GPUEndTime less GPUStartTime), GPUStartTime from the commit,
+//             and the completed handler from GPUEndTime; apart, the buffers' spans summed, the
+//             span from the first's start to the last's end, and the first's start from the
+//             first commit. Times are ms.
 // Build: see README.md.
 #import "oracle_common.h"
 #include <dispatch/dispatch.h>
@@ -839,6 +849,156 @@ static void case_events(void)
 	}
 }
 
+enum { GPUTIMES_RUNS = 7, GPUTIMES_W = 1920, GPUTIMES_H = 1080 };
+
+static id<MTLRenderPipelineState> gBlend;
+static id<MTLTexture> gTarget;
+
+// One render pass over gTarget: a clear, then 6 blended full-target quads.
+static void enc_pass(id<MTLCommandBuffer> cb)
+{
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = gTarget;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+	[e setRenderPipelineState:gBlend];
+	float rect[4] = {-1, -1, 1, 1}, z = 0, color[4] = {0.2f, 0.4f, 0.6f, 0.3f};
+	[e setVertexBytes:rect length:sizeof rect atIndex:0];
+	[e setVertexBytes:&z length:sizeof z atIndex:1];
+	[e setFragmentBytes:color length:sizeof color atIndex:0];
+	for (int i = 0; i < 6; i++)
+		[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[e endEncoding];
+}
+
+// K encoders of one kind in `cb`: compute (slow_write of `iters`) or a render pass; the CPU
+// sleeps `sleep_us` between them.
+static void enc_k(id<MTLCommandBuffer> cb, int render, int k, id<MTLBuffer> b, uint32_t iters,
+                  useconds_t sleep_us)
+{
+	for (int i = 0; i < k; i++) {
+		if (i && sleep_us)
+			usleep(sleep_us);
+		if (render) {
+			enc_pass(cb);
+		} else {
+			id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+			enc_slow(e, b, iters);
+			[e endEncoding];
+		}
+	}
+}
+
+static void gputimes_row(const char *what, int render, int k, id<MTLBuffer> b, uint32_t iters,
+                         useconds_t sleep_us)
+{
+	double span[GPUTIMES_RUNS], start[GPUTIMES_RUNS], handler[GPUTIMES_RUNS];
+	double sum[GPUTIMES_RUNS], aspan[GPUTIMES_RUNS], astart[GPUTIMES_RUNS];
+	for (int r = 0; r < GPUTIMES_RUNS; r++) {
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		enc_k(cb, render, k, b, iters, sleep_us);
+		__block volatile double done = 0;
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> _) { done = oracle_now_ms(); }];
+		double c0 = oracle_now_ms();
+		[cb commit];
+		[cb waitUntilCompleted];
+		while (done == 0)
+			usleep(100);
+		span[r] = (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+		start[r] = cb.GPUStartTime * 1e3 - c0;
+		handler[r] = done - cb.GPUEndTime * 1e3;
+		if (cb.status != MTLCommandBufferStatusCompleted)
+			printf("  ! whole status %ld\n", (long)cb.status);
+		if (sleep_us) {
+			sum[r] = aspan[r] = astart[r] = 0;
+			continue;
+		}
+		id<MTLCommandBuffer> cbs[32];
+		for (int i = 0; i < k; i++) {
+			cbs[i] = [Q commandBuffer];
+			enc_k(cbs[i], render, 1, b, iters, 0);
+		}
+		double a0 = oracle_now_ms();
+		for (int i = 0; i < k; i++)
+			[cbs[i] commit];
+		[cbs[k - 1] waitUntilCompleted];
+		sum[r] = 0;
+		for (int i = 0; i < k; i++) {
+			[cbs[i] waitUntilCompleted];
+			sum[r] += (cbs[i].GPUEndTime - cbs[i].GPUStartTime) * 1e3;
+		}
+		aspan[r] = (cbs[k - 1].GPUEndTime - cbs[0].GPUStartTime) * 1e3;
+		astart[r] = cbs[0].GPUStartTime * 1e3 - a0;
+	}
+	sort_ms(span, GPUTIMES_RUNS);
+	sort_ms(start, GPUTIMES_RUNS);
+	sort_ms(handler, GPUTIMES_RUNS);
+	sort_ms(sum, GPUTIMES_RUNS);
+	sort_ms(aspan, GPUTIMES_RUNS);
+	sort_ms(astart, GPUTIMES_RUNS);
+	int m = GPUTIMES_RUNS / 2;
+	printf("  %-34s K %2d  whole: span %8.3f (min %8.3f max %8.3f) start %+7.3f handler %+7.3f  "
+	       "apart: summed %8.3f span %8.3f start %+7.3f\n",
+	       what, k, span[m], span[0], span[GPUTIMES_RUNS - 1], start[m], handler[m], sum[m], aspan[m],
+	       astart[m]);
+}
+
+static void case_gputimes(void)
+{
+	gSlow = cpipe("slow_write");
+	if (!gSlow)
+		return;
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [L newFunctionWithName:@"quad_vs"];
+	pd.fragmentFunction = [L newFunctionWithName:@"solid_fs"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	pd.colorAttachments[0].blendingEnabled = YES;
+	pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+	pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	NSError *err = nil;
+	gBlend = [D newRenderPipelineStateWithDescriptor:pd error:&err];
+	if (!gBlend) {
+		printf("  ! render pipeline: %s\n", err.description.UTF8String);
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor
+	    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                 width:GPUTIMES_W
+	                                height:GPUTIMES_H
+	                             mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	gTarget = [D newTextureWithDescriptor:td];
+	id<MTLBuffer> b = [D newBufferWithLength:N * 4 options:MTLResourceStorageModePrivate];
+	// Calibrate one encoder near 0.5 ms
+	uint32_t iters = 40;
+	double gpu = 0;
+	for (int k = 0; k < 8; k++) {
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		enc_k(cb, 0, 1, b, iters, 0);
+		oracle_commit_wait(cb, NULL, &gpu);
+		if ((gpu > 0.4 && gpu < 0.65) || k == 7)
+			break;
+		iters = (uint32_t)(iters * (0.5 / (gpu > 0.01 ? gpu : 0.01)));
+		if (iters < 1)
+			iters = 1;
+	}
+	id<MTLCommandBuffer> one = [Q commandBuffer];
+	enc_k(one, 1, 1, b, iters, 0);
+	double pass = 0;
+	oracle_commit_wait(one, NULL, &pass);
+	printf("case gputimes: compute encoder %u iterations = %.3f ms GPU; render pass = %.3f ms GPU\n",
+	       iters, gpu, pass);
+	int ks[] = {1, 8, 32};
+	for (int i = 0; i < 3; i++)
+		gputimes_row("compute", 0, ks[i], b, iters, 0);
+	for (int i = 0; i < 3; i++)
+		gputimes_row("render", 1, ks[i], b, iters, 0);
+	gputimes_row("compute, CPU sleeps 1 ms between", 0, 8, b, iters, 1000);
+}
+
 static int run_case(int argc, char **argv)
 {
 	L = oracle_library(D, gArgv0, "oracle");
@@ -852,6 +1012,8 @@ static int run_case(int argc, char **argv)
 		case_submitted();
 	else if (!strcmp(argv[0], "events"))
 		case_events();
+	else if (!strcmp(argv[0], "gputimes"))
+		case_gputimes();
 	else
 		return 2;
 	return 0;
@@ -872,7 +1034,7 @@ int main(int argc, char **argv)
 	}
 	oracle_header("oracle_cmdbuf", D);
 	D = nil;
-	static const char *const all[] = {"hazards", "timing", "submitted", "events"};
+	static const char *const all[] = {"hazards", "timing", "submitted", "events", "gputimes"};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 && strcmp(argv[2], all[i]))
 			continue;

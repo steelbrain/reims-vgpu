@@ -346,6 +346,33 @@ Probe: `oracle_cmdbuf DEVICE timing`. Times are from commit.
 | `kernelStartTime`/`kernelEndTime` | +0.08 / +0.16 ms | +0.06 / +0.09 ms |
 | async compute and render pipeline creators | return with the handler pending; it runs about 60 ms later on `Device serial queue` | the same |
 
+`oracle_cmdbuf DEVICE gputimes`: what `GPUStartTime` and `GPUEndTime` answer for one long
+buffer, K encoders of about 0.5 ms each in one buffer ("whole") against the same encoders
+committed back to back one buffer each ("apart"), compute (`slow_write`) and render (K passes
+over a 1920 x 1080 BGRA8 target, each clearing it and blending 6 full-target quads), medians of
+7 runs, in ms, on the 5300M and the 630 (macOS 26.7.1):
+
+| | AMD whole span | AMD apart, summed | Intel whole span | Intel apart, summed |
+|---|---|---|---|---|
+| compute, K 1 | 0.555 | 0.555 | 0.585 | 0.586 |
+| compute, K 8 | 1.599 | 1.844 | 4.089 | 4.372 |
+| compute, K 32 | 6.313 | 7.368 | 13.047 | 12.407 |
+| render, K 1 | 0.336 | 0.335 | 3.175 | 3.063 |
+| render, K 8 | 2.690 | 2.715 | 19.020 | 18.199 |
+| render, K 32 | 11.044 | 10.887 | 59.561 | 59.990 |
+| whole: `GPUStartTime` after the commit | 0.08 to 0.15 | | 0.12 to 0.40 | |
+| whole: the completed handler after `GPUEndTime` | 0.015 to 0.14 | | 0.012 to 0.14 | |
+
+So one buffer spans its encoders' GPU time summed, as back-to-back buffers do, within the GPUs'
+clock ramp (both clock up under a sustained load: the AMD's 8 compute encoders took 0.2 ms each
+against 0.56 ms alone) *(class 3)*. The CPU's time encoding a buffer never counts: a buffer of 8
+compute encoders whose CPU slept 1 ms between them spanned 4.52 ms on the AMD and 1.50 ms on the
+Intel, and the AMD, idle through the sleeps, started it 2.58 ms after its commit. Our stack: a
+buffer the host commits in parts as it walks it answers its first part's start, and its parts'
+GPU time summed as its span, never past its last part's end (`decode/split.rs`, "Its GPU times"),
+where the span from its first part's start to its last part's end held the host's walk between
+parts.
+
 `oracle_cmdbuf DEVICE submitted`: a tiny buffer's `commitAndWaitUntilSubmitted`, 20 runs each,
 times from the first commit (medians), on the 5300M, the 630 (both macOS 26.7.1) and the M3 Max
 (macOS 27.0.1):
