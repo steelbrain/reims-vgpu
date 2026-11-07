@@ -2573,10 +2573,8 @@ fn the_driver_takes_opencl_mode_where_offered() {
     let rig = Rig::with_host(Box::new(OpenCl));
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
-    rig.device.mmio_write(
-        RGFX_REG_DRIVER_FEATURES_LO.into(),
-        RGFX_FEATURE_OPENCL_MODE,
-    );
+    rig.device
+        .mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), RGFX_FEATURE_OPENCL_MODE);
     assert_eq!(
         rig.device.mmio_read(RGFX_REG_DRIVER_FEATURES_LO.into()),
         RGFX_FEATURE_OPENCL_MODE

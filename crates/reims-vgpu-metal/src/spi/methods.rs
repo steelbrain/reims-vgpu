@@ -471,7 +471,9 @@ pub unsafe trait FunctionSpi: Message {
         plugin_data: &NSData,
         bitcode_type: u8,
     ) -> Option<Retained<ProtocolObject<dyn MTLFunction>>> {
-        unsafe { msg_send![self, newFunctionWithPluginData: plugin_data, bitcodeType: bitcode_type] }
+        unsafe {
+            msg_send![self, newFunctionWithPluginData: plugin_data, bitcodeType: bitcode_type]
+        }
     }
 }
 
