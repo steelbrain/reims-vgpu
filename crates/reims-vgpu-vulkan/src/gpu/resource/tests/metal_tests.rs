@@ -6219,9 +6219,16 @@ where
 /// 551, which [`Placements`] keeps apart), nor a PVRTC one, nor one of 630 to 645, which an Apple
 /// M4 describes and the runtime does not ([`crate::gpu::format_info`]), nor `R10Unorm_PACKED` or
 /// `RG10Unorm_PACKED` (588, 589), whose size Metal answers as 0 bytes, so no heap's bytes show
-/// them (their placement: `gpu::device`'s `packed_10_bit_textures_over_memory_die_named`).
+/// them (their placement: `gpu::device`'s `packed_10_bit_textures_over_memory_die_named`), nor
+/// a one-plane YCbCr format the runtime holds for copies alone ([`one_plane_copies_only`]),
+/// whose texels it lays in a heap's bytes otherwise than Metal
+/// ([`legacy_heap_one_plane_textures_are_metals`]).
 fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
     let sel = "legacy_heap_formats";
+    let one_plane: Vec<u64> = one_plane_copies_only()
+        .iter()
+        .map(|&(raw, _)| raw)
+        .collect();
     (1..2048u64)
         .filter(|&raw| crate::gpu::format_info::described(sel, raw))
         .filter(|&raw| {
@@ -6230,6 +6237,7 @@ fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
                 .and_then(|raw| PixelFormat::try_from(raw).ok());
             pf.is_some_and(|pf| !metal2vulkan::metal::format::is_depth_stencil(pf))
         })
+        .filter(|raw| !one_plane.contains(raw))
         .filter(|&raw| !matches!(raw, 160..=167 | 550 | 551 | 588 | 589))
         .filter_map(|raw| {
             let block = crate::gpu::format_info::block(sel, raw);
@@ -6237,6 +6245,27 @@ fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
             (block.bytes() > 0).then_some((raw, (block.bytes(), (bw, bh))))
         })
         .collect()
+}
+
+/// The one-plane YCbCr formats the runtime holds for copies alone, with their bytes a texel
+/// (`metal2vulkan::metal::format::copies_only`, a footprint of one plane's rows): 501, 504,
+/// 521, 524, 560, 562, 563, 590 and 607.
+fn one_plane_copies_only() -> Vec<(u64, u64)> {
+    use metal2vulkan::metal::format::{Footprint, copies_only, footprint};
+    let formats: Vec<(u64, u64)> = (0..2048u32)
+        .filter_map(|raw| {
+            let pf = PixelFormat::try_from(raw).ok()?;
+            match footprint(pf) {
+                Some(Footprint::OnePlane { bytes, .. }) if copies_only(pf) => {
+                    Some((u64::from(raw), u64::from(bytes)))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let raws: Vec<u64> = formats.iter().map(|&(raw, _)| raw).collect();
+    assert_eq!(raws, [501, 504, 521, 524, 560, 562, 563, 590, 607]);
+    formats
 }
 
 /// What [`legacy_heap_bytes_on`] answers.
@@ -6281,7 +6310,9 @@ fn on_moltenvk(d: &VulkanDevice) -> bool {
 /// 1D texture and a 1D array, and a 3D texture of the plain formats; with the property, render
 /// targets whose shorter side is 15 texels, a 1D one and an `R32Uint` of `ShaderAtomic` usage.
 /// A texture a death of the format refuses (one the runtime lacks) is left out: 589 are compared
-/// on an Apple M3 Max under macOS 26.7
+/// on an Apple M3 Max under macOS 26.7. So are the one-plane YCbCr formats the runtime holds for
+/// copies alone, whose texels it lays in the heap's bytes otherwise than Metal
+/// ([`legacy_heap_one_plane_textures_are_metals`])
 #[test]
 fn legacy_heap_textures_are_metals_where_metal_keeps_them_plain() {
     let Some(metal) = MetalPlatform::system_default_device() else {
@@ -6362,6 +6393,40 @@ fn legacy_heap_textures_are_metals_where_metal_keeps_them_plain() {
         compared += 1;
     }
     assert!(compared >= 500, "{compared} compared");
+}
+
+/// A texture of each one-plane YCbCr format the runtime holds for copies alone
+/// ([`one_plane_copies_only`]), placed as core places its legacy heap's
+/// ([`legacy_heap_bytes_on`], rows of the format's bytes a texel), shows Metal's bytes both
+/// ways: 64 by 64 and 8 by 8 texels, without `allowGPUOptimizedContents` or with it, of
+/// `ShaderRead` usage and of `PixelFormatView` too. Off: Metal lays such a texture's texels in
+/// the heap's bytes as rows, those copied in, and the runtime lays them in its tiles, announcing
+/// `shadowed-texture` ("Metal tiles its elements in the heap's bytes"), so the bytes copied out
+/// and the texels read after other bytes are copied in both differ from Metal's, in every shape
+/// (measured on the M3 Max under macOS 27.0.1 on MoltenVK, 2026-11-07); metal2vulkan is asked to
+/// lay them in rows, as its footprint of one plane counts them (docs/accuracy-ledger.md, "The
+/// runtime's answers passed on")
+#[test]
+#[ignore = "the runtime lays a one-plane YCbCr texture it holds for copies alone in a heap's bytes in tiles, where Metal lays rows; metal2vulkan asked to lay rows; ledger: one-plane heap rows"]
+fn legacy_heap_one_plane_textures_are_metals() {
+    let Some(metal) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
+    for (format, bytes) in one_plane_copies_only() {
+        let block = (bytes, (1, 1));
+        for shape in [
+            LegacyShape::flat(format, block, (64, 64), 0x1, Some(false)),
+            LegacyShape::flat(format, block, (8, 8), 0x1, None),
+            LegacyShape::flat(format, block, (64, 64), 0x11, None),
+        ] {
+            let case = format!("{shape:?}");
+            let ours = legacy_heap_on_vulkan(&d, shape).unwrap().0;
+            let theirs = legacy_heap_bytes_on::<MetalPlatform>(&metal, &metal_desc, shape, 0x10000);
+            assert!(ours == theirs, "{case}");
+        }
+    }
 }
 
 /// A depth or stencil texture of one sample without `allowGPUOptimizedContents`, placed in a heap

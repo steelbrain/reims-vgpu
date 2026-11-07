@@ -109,11 +109,12 @@
 //!   `tests/no_copy_remap_linux.rs` measures a remap under each, on an RTX 5080 Laptop GPU and
 //!   on RADV's Radeon 780M and RX 7900 XTX. On those devices the GPU still reads the pages it
 //!   imported, as Metal's reads those it wired. Other drivers' host-pointer imports follow their
-//!   address (the runtime's `DriverFact::PointerImportsFollowTheirAddress`: ANV on i915, RADV,
-//!   lavapipe), and one that validates the pages again at each submission fails a submission
-//!   that lists the import in that window. RADV's pointer imports take only pages with no file
-//!   behind them (amdgpu's userptr), and it lists every import in every submission: once a file's
-//!   pages are mapped under one, every submission of the device fails, the runtime answering
+//!   address (the runtime's `Device::pointer_imports_follow_their_address`, which it checks once
+//!   per driver, release and kernel: ANV, RADV and lavapipe answer yes), and one that validates
+//!   the pages again at each submission fails a submission that lists the import in that window.
+//!   RADV's pointer imports take only pages with no file behind them (amdgpu's userptr), and it
+//!   lists every import in every submission: once a file's pages are mapped under one, every
+//!   submission of the device fails, the runtime answering
 //!   `DeviceLost`, and other pages with no file behind them are what the GPU reads from then
 //!   (measured on both, Mesa 26.2.4). So on RADV a host of the blocks setup whose task memory
 //!   has no file behind it has the GPU read what it maps under a live buffer, and loses the

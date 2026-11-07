@@ -11,10 +11,11 @@
 //! - **Their pointer** (`VK_EXT_external_memory_host`): the driver's. NVIDIA's import keeps the
 //!   pages it was made over: the GPU reads and fills the old pages, whether the range was ever
 //!   touched, and whether or not the GPU used the buffer before the remap (an RTX 5080 Laptop GPU,
-//!   NVIDIA 615.71.09, Linux 7.2, 2026-10-22). Where the runtime knows a driver's pointer imports
-//!   follow their address (`DriverFact::PointerImportsFollowTheirAddress`: ANV on i915, RADV,
-//!   lavapipe), the GPU reads the pages mapped there at each submission, which `HostMemory::new`'s
-//!   contract forbids changing under a live buffer, and the runtime's own tests check
+//!   NVIDIA 615.71.09, Linux 7.2, 2026-10-22). Where the device's own check finds its pointer
+//!   imports follow their address (`Device::pointer_imports_follow_their_address`, which the
+//!   runtime measures once per driver, release and kernel: ANV, RADV and lavapipe answer yes), the
+//!   GPU reads the pages mapped there at each submission, which `HostMemory::new`'s contract
+//!   forbids changing under a live buffer, and the runtime's own tests check
 //!   (`tests::pointer_residency` there). And where the device refuses a file's pages by their
 //!   pointer, it imports by their pointer only pages with no file behind them (RADV: amdgpu's
 //!   userptr, of private anonymous pages), and a file's pages mapped under such an import fail
@@ -163,15 +164,16 @@ fn files_by_pointer(dev: &Device) -> bool {
 
 /// Why GPU work after a file's pages were mapped, untold, under an import of `path` is not
 /// measured on `dev` (module docs), or `None` where it is: always for dma-bufs; for a pointer,
-/// where the driver's pointer imports are known to follow their address, or the device refuses a
-/// file's pages by their pointer.
+/// where the device's check finds its pointer imports follow their address, or the device refuses
+/// a file's pages by their pointer. The check answers within milliseconds of the device's making,
+/// waited for here up to 10 s; unanswered, it reads as not following.
 fn unmeasured(dev: &Device, path: Path) -> Option<&'static str> {
-    let follows = (dev.raw.properties().driver_facts)
-        .contains(&metal2vulkan_runtime::DriverFact::PointerImportsFollowTheirAddress);
+    let _ = dev.raw.settle_submit_checks(Duration::from_secs(10));
+    let follows = dev.raw.pointer_imports_follow_their_address();
     match path {
         Path::DmaBuf => None,
         Path::Pointer if follows => {
-            Some("the runtime knows the driver's pointer imports follow their address")
+            Some("the device's check finds its pointer imports follow their address")
         }
         Path::Pointer if !files_by_pointer(dev) => Some(
             "the device refuses a file's pages by their pointer, and fails its later submissions \

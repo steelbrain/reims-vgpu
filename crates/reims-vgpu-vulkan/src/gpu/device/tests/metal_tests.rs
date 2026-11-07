@@ -1335,11 +1335,16 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
 /// an `x420` surface and a `BGRA` one's) and at the heap size query, which Metal answers, a
 /// texture the runtime refuses dies where it is made, naming the raw format and Metal's name
 /// for it, but at the size query of a format whose bytes the runtime counts though it holds no
-/// image of it (501, 624 and 627: `metal2vulkan::metal::format::footprint`), which answers
-/// Metal's size and alignment. `newSharedTextureWithDescriptor:` at `Shared` storage answers
+/// image of it (624 to 627: `metal2vulkan::metal::format::footprint`), which answers Metal's
+/// size and alignment. `newSharedTextureWithDescriptor:` at `Shared` storage answers
 /// nil, as Metal does.
 /// The formats: the plane formats 576 to 579 (`R10Unorm_X6`, `RG10Unorm_X12` and their sRGB
-/// twins), 501 (`YCBCR8_422_1P`), 624 (`RGB10A8_2P`) and 627 (`RGB10A8_2P_HLG`). The runtime
+/// twins), which the runtime makes, and 624 to 627 (`RGB10A8_2P` and its `_sRGB`, `_PQ` and
+/// `_HLG` twins), the formats Metal describes and makes textures of that the runtime holds no
+/// image of, but the packed 10-bit ones (588 and 589,
+/// `packed_10_bit_textures_over_memory_die_named`). The one-plane YCbCr formats, 501 among
+/// them, the runtime holds for copies alone (`crate::gpu::ycbcr`'s
+/// `one_plane_textures_are_made_and_copied_as_metals`). The runtime
 /// makes a texture of a plane format at each creator Metal makes one at: over a buffer or a
 /// surface, from a descriptor alone, a 2D texture or a texture buffer, the device's or a heap's,
 /// and the shared one at `Private` storage (`shareable_padded_textures_are_metals`), of the
@@ -1403,7 +1408,7 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
     };
     let x420 = crate::gpu::ycbcr::measure::Shape::of(b"x420").surface((16, 16));
     let bgra = crate::os::tests::bgra_surface(16, 16);
-    for format in [576, 577, 578, 579, 501, 624, 627, 630, 640, 650] {
+    for format in [576, 577, 578, 579, 624, 625, 626, 627, 630, 640, 650] {
         let (private, shared) = (desc(format, 2), desc(format, 0));
         let ours = p.texture_descriptor(&private);
         assert_eq!(ours.pixel_format(), format);
@@ -1421,7 +1426,7 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
             dev().new_texture(OnFault::Return, &ours).unwrap()
         });
         let sel = "heapTextureSizeAndAlignWithDescriptor:";
-        let size = match padded || matches!(format, 501 | 624 | 627) {
+        let size = match padded || matches!(format, 624..=627) {
             true => Some(dev().heap_texture_size_and_align(&ours).unwrap()),
             false => {
                 dies(sel, format, &|| {

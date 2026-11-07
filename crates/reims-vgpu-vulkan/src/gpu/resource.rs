@@ -4040,10 +4040,10 @@ pub(crate) mod tests {
     #[test]
     fn texture_gaps_die_at_their_selectors() {
         let desc = bgra(8, 8, 0);
-        // YCBCR8_422_1P, a format the runtime refuses: taken and answered, and dying where a
+        // RGB10A8_2P, a format the runtime refuses: taken and answered, and dying where a
         // texture of it is made.
-        desc.set_pixel_format(501);
-        assert_eq!(desc.pixel_format(), 501);
+        desc.set_pixel_format(624);
+        assert_eq!(desc.pixel_format(), 624);
         let site = catch_death(|| dev().new_texture(OnFault::Return, &desc)).unwrap_err();
         assert_eq!(site.file, "newTextureWithDescriptor:");
     }
@@ -4059,7 +4059,7 @@ pub(crate) mod tests {
                 .map_or(0, |(_, n)| n)
         };
         let desc = bgra(8, 8, 0);
-        desc.set_pixel_format(501);
+        desc.set_pixel_format(624);
         let before = counted();
         let made = relaxed(|| dev().new_texture(OnFault::Return, &desc));
         assert!(
