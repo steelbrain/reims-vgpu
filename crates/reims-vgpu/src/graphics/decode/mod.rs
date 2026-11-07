@@ -1160,8 +1160,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             if d.made != 0 {
                 log::info!(
                     target: "reims_vgpu::graphics",
-                    "IOSurface device caches: {} made; {} fills of {} MiB ({} as made), {} \
-                     downloads of {} MiB, {} asked of a cache nothing wrote; {} fills or \
+                    "IOSurface device caches: {} made; {} fills of {} MiB ({} as made or named \
+                     again), {} downloads of {} MiB, {} asked of a cache nothing wrote; {} fills or \
                      downloads the host's devices' writes changed; {} written caches copied at a \
                      release with no client left; {} released held by the kext alone, as the \
                      kext counts them: {} of them written since their last copy, dropped \

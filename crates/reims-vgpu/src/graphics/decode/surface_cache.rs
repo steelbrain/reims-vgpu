@@ -16,10 +16,12 @@
 //!   with no use named (through an argument buffer, with no `useResource:`, which Metal leaves the
 //!   app to make resident) reads the pages as they were then, not a cache never filled. A command
 //!   buffer names each cached surface it uses (`RGFX_OP_SURFACE_USE`), with the CPU's generation
-//!   of the surface when it was committed. Where the cache holds an older generation, or none (a
-//!   block named again over the same pages), the cache is filled from the pages again before the
-//!   buffer's work; a buffer of the same generation
-//!   decoded later waits for that fill, on any queue. One of an older
+//!   of the surface when it was committed. Where the cache holds an older generation, the cache
+//!   is filled from the pages again before the buffer's work; a buffer of the same generation
+//!   decoded later waits for that fill, on any queue. A block named again over the same pages
+//!   keeps its cache, filled from the pages again as it is named, as of the generation in the
+//!   block's header then, as a new cache is: a texture over it that a command buffer reaches
+//!   with no use named reads the pages as they were then. One of an older
 //!   generation than the cache's (two queues' buffers committed apart and taken in the other
 //!   order) fills nothing. A buffer's write is in the pages before a newer generation's fill
 //!   wherever a read-write lock waited for it: a process names its buffer's writes to the kext
@@ -571,7 +573,8 @@ impl FillWait {
 pub(crate) struct CacheCounts {
     /// Caches made.
     pub(crate) made: u64,
-    /// Of the fills, those of a cache as it was made ([`SurfaceCaches::fill_made`]).
+    /// Of the fills, those of a cache as it was made, or as its block was named again over the
+    /// same pages ([`SurfaceCaches::fill_made`], [`SurfaceCaches::fill_named_again`]).
     pub(crate) made_fills: u64,
     /// Fills, and their bytes.
     pub(crate) fills: u64,
@@ -887,9 +890,9 @@ impl<P: Platform> SurfaceCaches<P> {
     /// `generation`, the CPU's generation of the surface in the block's header
     /// ([`Self::fill_made`]).
     ///
-    /// A block that has a cache keeps it where its pages are the same, filled again at its next
-    /// use, as the kext's generations of the surface may count anew; any other goes as at a
-    /// release ([`SurfaceCaches::released`]). Either way what a buffer wrote of the cache is
+    /// A block that has a cache keeps it where its pages are the same, filled again from them as
+    /// of `generation` ([`Self::fill_named_again`]), as the kext's generations of the surface may
+    /// count anew; any other goes as at a release ([`SurfaceCaches::released`]). Either way what a buffer wrote of the cache is
     /// copied into the pages first. (The kext names a block's pages once, before any process
     /// holds it, and a block's offset is given out again only once its release is answered.)
     pub(crate) fn make(
@@ -941,9 +944,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 if self.written_since_host(block) {
                     self.write_back(device, block, Box::new(|| {}))?;
                 }
-                if let Some(cache) = self.by_block.get_mut(&block) {
-                    cache.generation = None;
-                }
+                self.fill_named_again(device, block, generation)?;
                 return Ok(true);
             }
             self.released(device, block, 0, None, None, Box::new(|| {}))?;
@@ -996,6 +997,32 @@ impl<P: Platform> SurfaceCaches<P> {
     /// uses a new cache yet, so the fill waits for no command buffer.
     fn fill_made(&mut self, device: &P::Device, block: u64, generation: u64) -> RaiseResult<()> {
         self.fill(device, block, generation)?;
+        self.counts.made_fills += 1;
+        Ok(())
+    }
+
+    /// The cache of the block at `block`, named again over the same pages, filled from them as of
+    /// CPU generation `generation`, as a new cache is ([`Self::fill_made`]), after the copy of
+    /// what a buffer wrote of it into them: a use the guest names no `RGFX_OP_SURFACE_USE` of
+    /// reads the pages as they were then, not what the cache held before the naming. The kext's
+    /// generations of the surface may count anew, so the cache holds none but this fill's, and a
+    /// named use of a newer generation fills again. Filled at once where no command buffer begun
+    /// and not finished uses the cache and no copy of it waits, else in the finish of the last of
+    /// them ([`Self::defer_fill`]), as a use's fill is.
+    fn fill_named_again(
+        &mut self,
+        device: &P::Device,
+        block: u64,
+        generation: u64,
+    ) -> RaiseResult<()> {
+        if let Some(cache) = self.by_block.get_mut(&block) {
+            cache.generation = None;
+        }
+        if self.pending(block, false) > 0 || self.deferring(block) {
+            self.defer_fill(device, block, generation);
+        } else {
+            self.fill(device, block, generation)?;
+        }
         self.counts.made_fills += 1;
         Ok(())
     }
@@ -4211,35 +4238,51 @@ mod tests {
         assert!(abi.contains(&line), "the kext's header has no `{line}`");
     }
 
-    /// A block named again over the same pages keeps its cache, which its next use fills again;
-    /// one named over other pages, or not cached, loses it. What a buffer wrote of the cache goes
-    /// into its pages first each time, and nothing else is copied
+    /// A block named again over the same pages keeps its cache, filled from the pages again as it
+    /// is named, as of the generation in the block's header, once what a buffer wrote of the cache
+    /// went into them: the next use of that generation fills nothing more, and one of a newer
+    /// generation fills again. One named over other pages, or not cached, loses it, what a buffer
+    /// wrote of it going into its pages first. Nothing else is copied
     #[test]
-    fn a_block_named_again_keeps_what_its_cache_holds() {
+    fn a_block_named_again_keeps_its_cache_filled_from_its_pages() {
         let mut r = cached();
         let page = r.page;
         let cache = cache_id(&r);
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, true)]);
         r.p.world().complete_all(CompleteOn::Caller);
-        for (round, copied) in [(0, 1), (1, 0)] {
+        // The kext's generation in the header as the block is named again: the use's.
+        assert!(
+            r.dec
+                .region
+                .write(BLOCK + CPU_GEN_OFFSET, &1u64.to_le_bytes())
+        );
+        for (round, out) in [(0, 1), (1, 0)] {
             let mark = r.p.call_log().mark();
             assert_eq!(
                 r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
                 RGFX_STATUS_OK
             );
-            let back = copies(&r.p.call_log().since(mark));
-            assert_eq!(back.len(), copied, "round {round}");
+            let copied = copies(&r.p.call_log().since(mark));
+            assert_eq!(copied.len(), out + 1, "round {round}");
             assert!(
-                back.iter().all(|&(from, _)| from == cache),
-                "out of the cache"
+                copied[..out].iter().all(|&(from, _)| from == cache),
+                "out of the cache first, round {round}"
             );
+            assert_eq!(copied[out].1, cache, "then filled, round {round}");
             assert_eq!(cache_id(&r), cache, "kept, round {round}");
+            // The next naming waits for the copies into the pages to land.
+            r.p.world().complete_all(CompleteOn::Caller);
         }
-        r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();
-        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, true)]);
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "the generation the naming filled"
+        );
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 2, true)]);
         let filled = copies(&r.p.call_log().since(mark));
-        assert_eq!(filled.len(), 1, "filled again, of the generation it held");
+        assert_eq!(filled.len(), 1, "a newer generation fills again");
         assert_eq!(filled[0].1, cache);
         r.p.world().complete_all(CompleteOn::Caller);
 
@@ -4258,7 +4301,7 @@ mod tests {
         );
         assert_eq!(back[0].0, cache, "the old cache, into its pages");
         assert_eq!(back[1].1, other, "the new cache, filled from its pages");
-        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 1, true)]);
+        use_surfaces(&mut r, 1, 0x103, &[(BLOCK, 1, true)]);
         r.p.world().complete_all(CompleteOn::Caller);
 
         let mark = r.p.call_log().mark();
@@ -4269,7 +4312,41 @@ mod tests {
         assert_eq!(r.dec.caches().len(), 0, "not cached");
         r.p.world().complete_all(CompleteOn::Caller);
         let counts = r.dec.caches().counts();
-        assert_eq!((counts.made, counts.downloads), (2, 3));
+        assert_eq!(
+            (counts.made, counts.made_fills, counts.downloads),
+            (2, 4, 3),
+            "two made, each filled, and filled at the two namings; three copies out"
+        );
+    }
+
+    /// A block named again over the same pages while a command buffer begun and not finished uses
+    /// its cache is filled in that buffer's finish, as a use's fill is: the buffer reads what the
+    /// cache held
+    #[test]
+    fn a_block_named_again_behind_a_walk_is_filled_in_its_finish() {
+        let mut r = cached();
+        let page = r.page;
+        let cache = cache_id(&r);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let queue = r.device.new_command_queue().unwrap();
+        let reader = queue.command_buffer(ON).unwrap().unwrap();
+        let (_, uses) = (r.dec.surface_caches)
+            .before(&r.device, &reader, &reading(BLOCK, 0))
+            .unwrap();
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "filled under the walk"
+        );
+        drop(uses);
+        let filled = copies(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1, "made in the finish");
+        assert_eq!(filled[0].1, cache);
+        assert_eq!(r.dec.caches().counts().cpu_waits, 0);
     }
 
     /// A use of `block` at generation `cpu_gen` that only reads it.

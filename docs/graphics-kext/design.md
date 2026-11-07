@@ -401,8 +401,12 @@ Stages:
       (`RGFX_OP_SURFACE_USE`) with the kext's count of the surface's
       read-write locks when it was committed; the host fills the cache from
       the pages before the first buffer of a newer count, on its own transfer
-      queue, after every buffer that used the cache before. The pages are
-      written from the cache only at `SURFACE_DOWNLOAD`, which the kext asks
+      queue, after every buffer that used the cache before. It also fills a
+      cache as it is made, and as its block is named again over the same
+      pages, as of the count in the block's header then, so a texture that a
+      buffer reaches through an argument buffer with no `useResource:` (which
+      no `RGFX_OP_SURFACE_USE` names) reads the pages as they were. The pages
+      are written from the cache only at `SURFACE_DOWNLOAD`, which the kext asks
       at a CPU lock that follows a GPU write, and at the block's
       `BLOCK_RELEASE`, and only where a buffer that may write the surface was
       committed since the last copy (`reims-vgpu`'s
