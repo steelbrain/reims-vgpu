@@ -56,7 +56,13 @@
  *   - a vertex input's attribute name, a bare string after its air.location_index's two
  *     operands, is dropped (the input keeps its air.arg_name, which holds the same name);
  *   - a flat fragment input has no sampling key: `metal` writes [[flat]] as air.flat alone, and
- *     the generator writes air.center before it.
+ *     the generator writes air.center before it;
+ *   - a buffer input has the air.address_space `metal` writes, its parameter's pointer's, and,
+ *     where it lacks them, the air.arg_type_size and air.arg_type_align_size of its
+ *     air.arg_type_name. The generator writes no address space for a uniform buffer, and no
+ *     pointee size for one with air.buffer_size (measured: macOS 26.7.1). The device's reflection
+ *     reads both: without them a pipeline had no reflection, and gl_cases' uniforms and block
+ *     cases read black on the RTX 5080 host.
  * Measured on an x86 Mac (macOS 26.7.1, Intel UHD 630 and AMD 5300M): the .metallib of each of
  * a vertex and a fragment shader's variants loads with newLibraryWithData:, makes a render
  * pipeline, and draws what the renderer's own pipeline draws (tools/gld_lower.m).
