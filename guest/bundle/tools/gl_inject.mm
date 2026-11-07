@@ -15,8 +15,9 @@
 //     did, then set the reflection's plugin return data from the descriptor's GL variants.
 // Each change is written to stderr once; with GL_INJECT_LOG=1, so is each render pipeline the
 // class makes, with its functions and its error; with GL_INJECT_DUMP=DIR, each library it makes of
-// bytes is written to DIR/library-N.metallib (the variants' among them). Nothing outside the
-// process changes. Use it with
+// bytes is written to DIR/library-N.metallib (the variants' among them); with GL_INJECT_VENDOR=NAME,
+// the class answers vendorName with NAME (the GL renderer picks its per-vendor settings by it, and
+// stops the process on a vendor it does not know). Nothing outside the process changes. Use it with
 // gl_redirect (tools/gl_redirect.c), which points the accelerator's IOGLBundleName at the
 // renderer.
 // Our own code.
@@ -124,6 +125,12 @@ id library(id self, SEL cmd, dispatch_data_t data, NSError *__autoreleasing *err
 	return gLibrary(self, cmd, data, error);
 }
 
+// GL_INJECT_VENDOR's name, as vendorName answers it.
+id vendor(id self, SEL cmd)
+{
+	return @(getenv("GL_INJECT_VENDOR"));
+}
+
 void put(Class cls, const char *name, IMP imp, const char *types)
 {
 	SEL sel = sel_registerName(name);
@@ -171,6 +178,9 @@ void patch(NSArray *devices)
 		gCompute = (ComputeImp)wrap(cls, "newComputePipelineStateWithFunction:options:reflection:error:", (IMP)compute);
 		if (getenv("GL_INJECT_DUMP") != nullptr)
 			gLibrary = (LibraryImp)wrap(cls, "newLibraryWithData:error:", (IMP)library);
+		const char *v = getenv("GL_INJECT_VENDOR");
+		if (v != nullptr && v[0])
+			put(cls, "vendorName", (IMP)vendor, "@16@0:8");
 	});
 }
 
