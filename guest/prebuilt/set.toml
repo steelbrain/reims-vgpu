@@ -14,7 +14,7 @@ Arch = "x86_64"
 MinKernel = "25.4.0"
 MaxKernel = "25.99.99"
 Comment = "Binds ReimsGraphics to IOGraphicsFamily and AppleGraphicsDeviceControl"
-sha256 = "79e29d81c9af4484f9786e8edd3bd91243c7fdcddc33dc64c868c6b56a846ea8"
+sha256 = "10778b2b1b474cf838e46742534f0ec4a8ccd0a9b05a3d0037e8b80f259add02"
 
 [[kext]]
 BundlePath = "RgfxIOGraphicsFamilyBridge.kext"
@@ -24,7 +24,7 @@ Arch = "x86_64"
 MinKernel = "25.4.0"
 MaxKernel = "25.99.99"
 Comment = "IOGraphicsFamily placeholders ReimsGraphics links against"
-sha256 = "347b0d81deeb1aba5a6bb2640c9f69bce68607b88b3d7fc5b7f43687ce365253"
+sha256 = "d412ca4a56e654f02aaff5a95fc7665a0696c79ea65cfbd04b5eb03102866760"
 
 [[kext]]
 BundlePath = "RgfxAppleGraphicsDeviceControlBridge.kext"
@@ -44,7 +44,7 @@ Arch = "x86_64"
 MinKernel = "25.4.0"
 MaxKernel = "25.99.99"
 Comment = "The reims-graphics display, accelerator and device control"
-sha256 = "057d5f31c67ec8332c977b6c79eb6ebcee5ec59e337c1f942283eb4ad7dfaff1"
+sha256 = "085b54493afb250c00bdc7d404907555886c64d667e220bfce2132a8e4ac3e81"
 
 [[kext]]
 BundlePath = "RgfxGate.kext"
