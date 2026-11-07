@@ -359,7 +359,12 @@ Everything known to be wrong, untested or put off in the video devices' host sid
   - Read from host memory, whole or in strips, none of these outputs makes a call that holds the gate ([vaapi.md](vaapi.md), "What the gate costs").
   - `vaGetImage` takes a rectangle, and a program on libva alone read a YUY2 surface with it a band of 32 MiB at a time, every byte right: each call held the lock 13.1 to 14.8 ms at the mean, and 16.8 to 20.3 at most, for a band of 8192x8192 on the RX 7900 XTX, and 9.5 to 10.2 and 13.5 to 15.5 ms on the Radeon 780M, four a decode, each two thirds of a whole map's 20.5 ms on the RX 7900 XTX and twice its 5.2 ms on the Radeon 780M, since it copies the band into the image on the CPU with the lock held (U22).
 - **Why it waits:** on radeonsi at udmabuf's stock limits, every output of the engine's is read from host memory; what is left is a host where udmabuf cannot be opened, the other drivers, whose maps are not measured, and a fallback no run has taken.
-- **Fix:** `vaGetImage` of bands small enough that each hold is short, more calls a decode (not tried); or Mesa's, U22.
+- **Tried:** `vaGetImage` of bands of 2, 8 and 32 MiB in place of the derived map, so that each hold would be short (**measured**, Mesa 26.2.6, 2026-11-07, jobs 4279 and 4284: B90's bench, a thread decoding a 4:2:0 JPEG of 4096x4096 or 8192x8192 over and over, read through the driver's images, beside a session decoding a 64x64 JPEG over and over, three runs of each). The bands held the lock longer than the map, in all and at most:
+  - on the Radeon 780M, 36 to 63 ms a decode of 4096x4096 against the map's 6.8 to 8.0 ms, and 153 to 187 ms of 8192x8192 against 24 to 26 ms; its longest hold 38 and 153 ms against 1.9 to 4.9 and 7.1 to 12.5 ms;
+  - on the RX 7900 XTX, 32 to 56 ms of 4096x4096 against 12.5 to 13.0 ms, and 81 to 114 ms of 8192x8192 against 39 to 46 ms; its longest hold 14 to 44 and 55 ms against 6.7 to 7.2 and 17 to 26 ms;
+  - why a band's call holds the lock so long is not measured.
+  So the engine keeps the derived map.
+- **Fix:** Mesa's, U22.
 
 ### B92. After memory of the process's GPU is freed, its next VA-API work waits for every job then on the GPU
 
