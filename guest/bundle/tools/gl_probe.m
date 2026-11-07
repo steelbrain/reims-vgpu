@@ -16,7 +16,9 @@
 //     -n N     frames the timed loop of each context draws (default 200).
 // It prints:
 //   - each IOAccelerator service: its class, registry ID, IOGLBundleName and MetalPluginName;
-//   - each Metal device: its name and registry ID;
+//   - each Metal device: its name and registry ID, and its answers to what the GL renderer asks
+//     of a device as it makes its own (its vendor, the support queries, the sample counts, the
+//     primitive types and a few families);
 //   - each renderer CGL lists (display mask 0xffffffff), with its ID, whether it is online and
 //     accelerated, its display mask, video memory and the highest GL version it offers;
 //   - for each of three profiles (legacy, 3.2 core, 4.1 core), asking an accelerated renderer
@@ -38,6 +40,7 @@
 #import <IOKit/IOKitLib.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 #import <OpenGL/CGLIOSurface.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl3.h>
@@ -273,6 +276,47 @@ static void print_cf(const char *key, CFTypeRef v) {
 	printf("    %s: %s\n", key, d.UTF8String);
 }
 
+// What the GL renderer asks of its Metal device as it makes its own device (read from the
+// renderer: its features follow these answers): the vendor, and each support query, answered
+// through the runtime so a device that lacks one says so.
+static void print_renderer_queries(id<MTLDevice> d) {
+	id obj = (id)d;
+	printf("    renderer's queries:");
+	for (NSString *k in @[ @"vendorName", @"supports32bpcMSAATextures", @"supportsTexture2DMultisampleArray",
+	                       @"supportsBlackOrWhiteSamplerBorderColors", @"supportsCustomBorderColor",
+	                       @"supportsSamplerAddressModeClampToHalfBorder", @"supportsMirrorClampToEdgeSamplerMode",
+	                       @"supportsQueryTextureLOD", @"supportsForceSeamsOnCubemaps", @"supportsArgumentBuffersTier2",
+	                       @"supportsUnalignedVertexFetch", @"maxTextureWidth2D", @"maxTextureLayers",
+	                       @"maxTextureBufferWidth", @"maxConstantBufferArguments", @"maxComputeBuffers" ]) {
+		if (![obj respondsToSelector:NSSelectorFromString(k)]) {
+			printf(" %s=(none)", k.UTF8String);
+			continue;
+		}
+		@try {
+			printf(" %s=%s", k.UTF8String, [[[obj valueForKey:k] description] UTF8String]);
+		} @catch (NSException *e) {
+			printf(" %s=(raised)", k.UTF8String);
+		}
+	}
+	printf("\n    sample counts:");
+	for (NSUInteger n = 1; n <= 8; n *= 2) printf(" %lu=%d", (unsigned long)n, [d supportsTextureSampleCount:n]);
+	SEL prim = NSSelectorFromString(@"supportsPrimitiveType:");
+	printf("\n    supportsPrimitiveType:");
+	if ([obj respondsToSelector:prim])
+		for (NSUInteger t = 0; t < 8; t++)
+			printf(" %lu=%d", (unsigned long)t, ((BOOL(*)(id, SEL, NSUInteger))objc_msgSend)(obj, prim, t));
+	else
+		printf(" (none)");
+	printf("\n    families:");
+	const struct {
+		const char *name;
+		MTLGPUFamily family;
+	} fams[] = {{"Apple1", MTLGPUFamilyApple1}, {"Apple7", MTLGPUFamilyApple7}, {"Mac2", MTLGPUFamilyMac2},
+	            {"Common3", MTLGPUFamilyCommon3}, {"Metal3", MTLGPUFamilyMetal3}};
+	for (size_t i = 0; i < sizeof fams / sizeof fams[0]; i++) printf(" %s=%d", fams[i].name, [d supportsFamily:fams[i].family]);
+	printf("\n");
+}
+
 static void list_accelerators(void) {
 	printf("accelerators:\n");
 	io_iterator_t it = 0;
@@ -302,9 +346,11 @@ static void list_accelerators(void) {
 
 static void list_metal_devices(void) {
 	printf("metal devices:\n");
-	for (id<MTLDevice> d in MTLCopyAllDevices())
+	for (id<MTLDevice> d in MTLCopyAllDevices()) {
 		printf("  %s, registry ID 0x%llx, class %s\n", d.name.UTF8String, d.registryID,
 		       class_getName([(id)d class]));
+		print_renderer_queries(d);
+	}
 }
 
 static void list_renderers(void) {
