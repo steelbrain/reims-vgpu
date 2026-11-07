@@ -2,11 +2,13 @@
 // window holding an NSOpenGLView, clears it to (64, 128, 191) and draws a green triangle in
 // it each frame, swaps, and after N frames (default 120) reads the back buffer's centre and a
 // corner with glReadPixels, prints the renderer and the two pixels, and exits.
-//   gl_window [-l] [-c] [-n FRAMES] [-t SECONDS]
+//   gl_window [-l] [-c] [-r] [-n FRAMES] [-t SECONDS]
 //     -l   the view is layer-backed (wantsLayer, wantsBestResolutionOpenGLSurface), as an app
 //          linked against a current SDK gets: CoreAnimation presents its frames;
 //          without -l the window's surface is the context's drawable (CGL's surface path)
 //     -c   a 3.2 core profile context (default legacy)
+//     -r   at the middle frame the window's content resizes to 320x200, so the frames after it
+//          and the read draw at the new size
 //     -n   frames to draw
 //     -t   seconds to keep the window open after the last frame (default 2), for a screen grab
 // It prints the pixel format's renderer ID, GL_RENDERER and GL_VERSION, each frame's
@@ -21,7 +23,7 @@
 #include <getopt.h>
 #include <mach/mach_time.h>
 
-static BOOL gLayer = NO, gCore = NO;
+static BOOL gLayer = NO, gCore = NO, gResize = NO;
 static int gFrames = 120;
 static double gHold = 2;
 
@@ -135,6 +137,10 @@ static GLuint compile(GLenum type, const char *src) {
 	[NSTimer scheduledTimerWithTimeInterval:0
 	                                repeats:YES
 	                                  block:^(NSTimer *t) {
+		                                  if (gResize && frame == gFrames / 2) {
+			                                  [self.window setContentSize:NSMakeSize(320, 200)];
+			                                  printf("frame %d: resized to 320x200\n", frame);
+		                                  }
 		                                  self.view.frameIndex = frame;
 		                                  [self.view display];
 		                                  if (++frame == gFrames) {
@@ -156,9 +162,10 @@ int main(int argc, char **argv) {
 	@autoreleasepool {
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		int c;
-		while ((c = getopt(argc, argv, "lcn:t:")) != -1) {
+		while ((c = getopt(argc, argv, "lcrn:t:")) != -1) {
 			if (c == 'l') gLayer = YES;
 			else if (c == 'c') gCore = YES;
+			else if (c == 'r') gResize = YES;
 			else if (c == 'n') gFrames = atoi(optarg);
 			else if (c == 't') gHold = atof(optarg);
 			else return 2;
