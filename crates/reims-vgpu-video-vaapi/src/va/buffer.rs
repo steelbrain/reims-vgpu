@@ -122,6 +122,10 @@ pub(crate) fn render_picture(
     render(display, context, target, groups, None)
 }
 
+/// What a decoder's first `vaEndPicture` is, where it holds the display past
+/// the frame's deadline ([`Error::Stalled`]).
+pub(crate) const FIRST_PICTURE: &str = "a new decoder's first picture (vaEndPicture)";
+
 /// [`render_picture`] for a decoder's picture on `context`: the context's
 /// first `vaEndPicture` is made on the display's call thread by the frame's
 /// deadline, as a call that may wait for the GPU (module docs), and the
@@ -168,7 +172,7 @@ fn render(
     });
     let ended = if decoder.is_some_and(Context::first_end) {
         display.wait_call(
-            "a new decoder's first picture (vaEndPicture)",
+            FIRST_PICTURE,
             // SAFETY: a picture begun above on this context, ended once.
             // The context and the buffers outlive the call wherever it
             // returns: their destroys are made behind it.

@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use reims_vgpu_video_core::jpeg::JpegOutputFormat;
+use reims_vgpu_video_core::jpeg::{JpegError, JpegOutputFormat};
 use reims_vgpu_video_core::runtime::{Runtime, StdRuntime};
 
 use super::gpu::{
@@ -24,6 +24,7 @@ use super::gpu::{
 use super::kept;
 use super::tests::{NO_SYNC_SURFACE2, WAIT, within_5_s};
 use super::{Deadline, by};
+use crate::va::buffer::FIRST_PICTURE;
 use crate::va::display::{Display, Error};
 use crate::va::h264::H264Decoder;
 use crate::va::readback::{ReadbackWay, read_back_by};
@@ -224,10 +225,13 @@ fn jpeg_conversions_then_copies_out_do_not_wait_for_a_held_graphics_ring() {
 
 /// A JPEG conversion's run into host memory of ours (`420f` at 1/2), with
 /// the compute rings held: the decode fails as a malfunction by its
-/// deadline, waited for on the memory's dma-buf, and the next at once;
-/// the display's other calls go on, while it waits and after; and once
-/// the GPU is let go, what was kept is let go and the engine decodes
-/// again.
+/// deadline, and the next at once; and once the GPU is let go, what was
+/// kept is let go and the engine decodes again. Where the decode waits on
+/// the memory's dma-buf, the display's other calls go on, while it waits
+/// and after. Where its own first picture waits for the GPU on the
+/// display's call thread instead, as radeonsi's on Polaris's UVD does
+/// (`crate::va::jpeg`), they fail by their deadline while that call holds
+/// the display, and no call beside it takes longer.
 #[test]
 #[ignore = "needs an AMD GPU: run on the VA-API host"]
 fn a_jpeg_conversion_into_host_memory_on_a_held_gpu_fails_by_its_deadline() {
@@ -237,18 +241,34 @@ fn a_jpeg_conversion_into_host_memory_on_a_held_gpu_fails_by_its_deadline() {
     let Some(spins) = held(Ring::Compute, COMPUTE_SPINS) else {
         return;
     };
-    let (decoded, took) = std::thread::scope(|scope| {
+    let ((decoded, took), (beside, beside_took)) = std::thread::scope(|scope| {
         let decode = scope.spawn(|| timed(|| jpeg.decode()));
         std::thread::sleep(WAIT_FOR / 5);
-        other_calls_go_on(&display);
-        decode.join().expect("the decode's thread")
+        let beside = timed(|| display.call(|_| ()));
+        (decode.join().expect("the decode's thread"), beside)
     });
     assert!(malfunction(&decoded), "{decoded:?}");
     failed_by_its_deadline("the conversion into host memory", took, &spins);
+    let in_first_picture =
+        matches!(&decoded, Err(JpegError::Malfunction(why)) if why.contains(FIRST_PICTURE));
+    eprintln!("the decode failed in its first picture: {in_first_picture}");
+    if in_first_picture {
+        // Made before the call thread took the picture, or by its deadline.
+        assert!(beside_took < WAIT_FOR + SLACK, "a call beside it: {beside_took:?}");
+    } else {
+        assert!(
+            beside.is_ok() && beside_took < AT_ONCE,
+            "a call beside it: {beside:?} in {beside_took:?}"
+        );
+    }
     let (again, took) = timed(|| jpeg.decode());
     assert!(malfunction(&again), "{again:?}");
     assert!(took < JPEG_AT_ONCE, "the next decode: {took:?}");
-    other_calls_go_on(&display);
+    if in_first_picture {
+        other_calls_fail_by_their_deadline(&display, &spins);
+    } else {
+        other_calls_go_on(&display);
+    }
     let_go(&spins);
     decodes_again(&display, &mut jpeg).expect("a decode, the GPU let go");
 }

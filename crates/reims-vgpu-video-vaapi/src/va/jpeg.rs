@@ -160,7 +160,15 @@
 //! display's calls as before (docs/video/bugs.md, B90).
 //!
 //! A decode's driver calls, its waits and its conversion's runs are
-//! bounded by one deadline (`super::wait`). Past it the engine is stalled:
+//! bounded by one deadline (`super::wait`). Each decode is its context's
+//! first picture, whose `vaEndPicture` is made on the display's call thread
+//! by that deadline (`super::buffer::render_decode`), as a new decoder's
+//! is: radeonsi may wait there for the GPU. **Measured** on an RX 550
+//! (radeonsi on Polaris 12's UVD, Mesa 26.2.6, 2026-11-07), with its four
+//! compute rings that take a process's work held by spins of the tests'
+//! own (`super::spin`): the decode's `vaEndPicture` waited in
+//! `drmSyncobjWait` 1.22 s, until the spins ended, past the decode's 50 ms
+//! deadline, with the driver's lock held. Past the deadline the engine is stalled:
 //! that decode fails as kIOReturnDeviceError, and the surface the GPU may
 //! still write is kept until it is done, with the context it is written
 //! on, and until the display's call thread is done with what it has; the
@@ -184,7 +192,7 @@ use reims_vgpu_video_core::runtime::MonoTime;
 use reims_vgpu_video_core::surfaces::PlaneDestination;
 use reims_vgpu_video_core::sync::Mutex;
 
-use super::buffer::{Buffer, render_picture};
+use super::buffer::{Buffer, render_decode};
 use super::caps::{Config, Context, Entrypoint, Fourcc, Profile};
 use super::display::{Display, Error, check};
 use super::ffi::{self, jpeg as va};
@@ -834,7 +842,7 @@ impl VaapiJpegDecoder {
             Err(error @ Error::Stalled(_)) => return Err(malfunction(error)),
             Err(error) => return Err(decoded.write_failed(error)),
         };
-        if let Err(error) = buffers.render(&self.display, context.id, decoded.id()) {
+        if let Err(error) = buffers.render(&self.display, &context, decoded.id()) {
             if let Error::Stalled(what) = &error {
                 // A picture may be submitted: the context goes first.
                 let id = decoded.id();
@@ -2062,13 +2070,15 @@ impl<'a> Parameters<'a> {
         })
     }
 
-    /// Decodes the picture into `target`.
+    /// Decodes the picture into `target`, as `context`'s first picture
+    /// (module docs).
     fn render(
         &self,
         display: &Display,
-        context: ffi::VAContextID,
+        decoder: &Context,
         target: ffi::VASurfaceID,
     ) -> Result<(), Error> {
+        let context = decoder.id;
         let picture = Buffer::with_value(
             display,
             context,
@@ -2094,9 +2104,9 @@ impl<'a> Parameters<'a> {
             &self.slice,
         )?;
         let data = Buffer::with_bytes(display, context, ffi::VASliceDataBufferType, self.data)?;
-        render_picture(
+        render_decode(
             display,
-            context,
+            decoder,
             target,
             &[&[&picture, &quantization, &huffman], &[&slice, &data]],
         )
