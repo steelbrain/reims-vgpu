@@ -9,7 +9,10 @@
  * is a thin forwarder.
  *
  * MTLDepthStencilState exposes only `label` and `device` (and `gpuResourceID` on
- * macOS 26+); its state lives on the wire, so the wrapper holds only its objId.
+ * macOS 26+); its state lives on the wire, so the wrapper holds only its objId. It also answers
+ * the four queries the system's GL renderer sends a state it binds, `readsDepth`, `writesDepth`,
+ * `readsStencil` and `writesStencil`, YES for every state, as the x86 Macs' states answer them
+ * (RgfxDepthStencilState.mm).
  *
  * Our own ObjC++: conforms to MTLDepthStencilState but subclasses only NSObject
  * (via RgfxResource), so it instantiates and is unit-tested on the Mac.
@@ -39,6 +42,12 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable instancetype)depthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)descriptor
                                                   device:(nullable id<MTLDevice>)device
                                               serializer:(nullable RgfxSerializer *)serializer;
+
+/// The GL renderer's queries: YES for every state.
+- (BOOL)readsDepth;
+- (BOOL)writesDepth;
+- (BOOL)readsStencil;
+- (BOOL)writesStencil;
 
 @end
 

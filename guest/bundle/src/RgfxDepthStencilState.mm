@@ -54,6 +54,31 @@ RgfxStencilDescriptor RgfxStencilOf(MTLStencilDescriptor *s)
 	return state;
 }
 
+// The GL renderer's queries of the state it binds (GLDContextRec::updateRenderDepthStencil sends
+// them unguarded, read from its code). The AMD 5300M's states (GFX10_MtlDepthStencilState) and
+// the Intel 630's (MTLIGDepthStencilState) answer YES to each for every descriptor asked: the
+// default one, depth tests with and without writes, stencil tests, stencil replaces, and a
+// replace with a write mask of 0 (measured: macOS 26.7.1). So does this.
+- (BOOL)readsDepth
+{
+	return YES;
+}
+
+- (BOOL)writesDepth
+{
+	return YES;
+}
+
+- (BOOL)readsStencil
+{
+	return YES;
+}
+
+- (BOOL)writesStencil
+{
+	return YES;
+}
+
 // The state's id in an argument buffer or an indirect command buffer, which no x86 Mac's state
 // has: both the AMD 5300M's and the Intel 630's answer respondsToSelector: YES for it and raise an
 // unrecognized selector, an NSInvalidArgumentException that ends the process where nothing

@@ -7367,6 +7367,20 @@ void test_gl_renderer_spi()
 		CHECK(!plainOps.empty());
 		CHECK(same(shape(pass(true, false)), plainOps));
 		CHECK(same(shape(pass(false, true)), plainOps));
+		// A depth/stencil state answers YES to the renderer's four queries, a state that tests
+		// and writes nothing among them.
+		MTLDepthStencilDescriptor *none = [MTLDepthStencilDescriptor new];
+		MTLDepthStencilDescriptor *both = [MTLDepthStencilDescriptor new];
+		both.depthCompareFunction = MTLCompareFunctionLess;
+		both.depthWriteEnabled = YES;
+		both.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionEqual;
+		both.frontFaceStencil.depthStencilPassOperation = MTLStencilOperationReplace;
+		for (MTLDepthStencilDescriptor *d in @[ none, both ]) {
+			RgfxDepthStencilState *ds = [RgfxDepthStencilState depthStencilStateWithDescriptor:d
+			                                                                            device:nil
+			                                                                        serializer:&f.ser];
+			CHECK(ds != nil && [ds readsDepth] && [ds writesDepth] && [ds readsStencil] && [ds writesStencil]);
+		}
 	}
 }
 
