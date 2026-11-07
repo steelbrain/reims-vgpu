@@ -384,6 +384,31 @@ impl rt::DirtyPages for ImportDirty {
         (self.shared.log).wrote_runs_as(guest_runs(self.segments(&range).iter()), writer);
     }
 
+    /// One write of the runtime's over `runs`: [`wrote`](rt::DirtyPages::wrote) of each, under
+    /// one fence and one load of the harvest number in the log ([`DirtyLog::wrote_runs`]), where
+    /// the trait's default takes them once a run.
+    fn wrote_runs(&self, runs: &[Range<u64>]) {
+        let mut guest = Vec::new();
+        for run in runs {
+            guest.extend(guest_runs(self.segments(run).iter()));
+        }
+        (self.shared.log).wrote_runs(guest);
+    }
+
+    /// One write of `writer`'s over `runs`: [`wrote_as`](rt::DirtyPages::wrote_as) of each,
+    /// under one take of the log's named lock and one load of its harvest number
+    /// ([`DirtyLog::wrote_runs_as`]).
+    fn wrote_runs_as(&self, runs: &[Range<u64>], writer: NonZeroU64) {
+        if !writers() {
+            return rt::DirtyPages::wrote_runs(self, runs);
+        }
+        let mut guest = Vec::new();
+        for run in runs {
+            guest.extend(guest_runs(self.segments(run).iter()));
+        }
+        (self.shared.log).wrote_runs_as(guest, writer);
+    }
+
     fn changed_except(&self, since: rt::DirtyStamp, writer: NonZeroU64, out: &mut Vec<Range<u64>>) {
         self.changed_by(since.0, writers().then_some(writer), out);
     }

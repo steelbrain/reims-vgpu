@@ -768,15 +768,13 @@ const METAL_MESH_GRID: u64 = 1 << 20;
 /// The most threads this device runs an object (`object`) or a mesh threadgroup of: Metal's
 /// ([`METAL_THREADGROUP_THREADS`]), within the device's own limit for the stage, which the runtime
 /// refuses a draw past (`Unsupported{MeshShading}` naming it): `maxTaskWorkGroupInvocations` or
-/// `maxMeshWorkGroupInvocations` where the device runs the stages natively (`VK_EXT_mesh_shader`
-/// and `meshShader` enabled), else `maxComputeWorkGroupInvocations`, as the runtime runs both
-/// stages as compute work there (`lower::mesh::emulates`, read).
+/// `maxMeshWorkGroupInvocations` where the device runs the stages natively, else
+/// `maxComputeWorkGroupInvocations`, as the runtime runs both stages as compute work where it
+/// emulates them (`DeviceProfile::emulates_mesh_shading`).
 pub(crate) fn stage_threads(device: &VulkanDevice, object: bool) -> u64 {
-    use metal2vulkan::device::{VkExtension, VkFeature};
     let profile = device.raw.compile_device().profile();
-    let (enabled, limits) = (profile.enabled(), profile.limits());
-    let native = enabled.extensions.contains(&VkExtension::ExtMeshShader)
-        && enabled.features.contains(&VkFeature::MeshShader);
+    let limits = profile.limits();
+    let native = !profile.emulates_mesh_shading();
     let limit = match (native, object) {
         (true, true) => limits.mesh.max_task_work_group_invocations,
         (true, false) => limits.mesh.max_mesh_work_group_invocations,

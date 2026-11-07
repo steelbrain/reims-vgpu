@@ -725,15 +725,11 @@ fn views_in_srgb_twins_read_as_metals() {
 /// 0.9 of a texel before the texture to as far past it, are Metal's bit for bit. Of an `_sRGB`
 /// twin, whose such view Metal reads no defined value of (measured here: two reads of one view of
 /// one texture differ), they are those of Metal's view of its converted format's texture over the
-/// same surface, which the runtime reads. A linear sample of a 10-bit format's view takes the
-/// device's filter even so, and announces `ycbcr-filter-not-exact` ([`crate::answer::DIES`]): in
-/// strict mode it dies at the dispatch, and by default it reads Metal's bits on this host. Over
-/// the format's first OSType of its own bits and chroma
+/// same surface, which the runtime reads. The 2D array view is the runtime's luma view, whose
+/// bindings present the format that reads its codes, so its samples announce nothing that dies,
+/// at 8 bits and at 10, in strict mode. Over the format's first OSType of its own bits and
+/// chroma
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "MoltenVK: the runtime records ycbcr-filter-not-exact, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
-)]
 fn own_format_views_are_metals() {
     use metal2vulkan::metal::format::{YCbCrReads, ycbcr_format};
     use reims_vgpu_core::platform::types::Swizzle;
@@ -851,23 +847,9 @@ fn own_format_views_are_metals() {
                     None => (&d, &array),
                     Some(_) => (&e, &filtered),
                 };
-                let read_ours = || arrayed::<VulkanPlatform>(on, subject, size, sample);
+                let ours = arrayed::<VulkanPlatform>(on, subject, size, sample);
                 let theirs = arrayed::<MetalPlatform>(&rd, &read, size, sample);
                 let what = format!("{format} {swizzle:?} {sample:?}");
-                let ours = if sample == Some((1, 0)) && of(format).bits != 8 {
-                    *crate::answer::LAST_LINE.lock() = None;
-                    let site = catch_death(read_ours).map(drop);
-                    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-                    let named = "(metal2vulkan-degrade-ycbcr-filter-not-exact)";
-                    if site.map_err(|s| s.file) != Err("dispatchThreads:threadsPerThreadgroup:")
-                        || !line.contains(named)
-                    {
-                        differ.push(format!("{what}: did not die naming {named}: {line}"));
-                    }
-                    crate::answer::relaxed(read_ours)
-                } else {
-                    read_ours()
-                };
                 if ours != theirs {
                     let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
                     let at = ours.iter().zip(&theirs).position(|(a, b)| a != b);
@@ -1456,20 +1438,22 @@ fn sampling_a_mapped_texture_where_the_runtime_cannot_map_it_dies() {
 /// positions a third of a texel apart from four texels before the texture to four past it. Over
 /// the formats whose modes the map changes (505 and 500 under repeat and mirroring, 543 and 540
 /// under every mode, the border colour's among them) and a 4:4:4 one, whose map keeps repeat
-/// and mirroring (503)
+/// and mirroring (503). The runtime reads 4:2:0 planes in place, and 503's otherwise: its linear
+/// samples take the runtime's default filter, and each dispatch of one announces
+/// `ycbcr-filter-not-exact` ([`crate::answer::DIES`]), dying in strict mode at its selector, and
+/// by default reads within one step of the grid of Metal's step of the format, 1/2048 for 8-bit
+/// codes read converted (the bound metal2vulkan states for Metal's own sampler over the converted
+/// texels; measured on the M3 Max: half a step); its nearest samples are Metal's bit for bit
 #[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "MoltenVK: the runtime records ycbcr-filter-not-exact, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
-)]
 fn constexpr_samplers_sample_as_metals() {
     let size = (16, 8);
-    let cases: [(u64, &[u8; 4]); 5] = [
-        (505, b"x420"),
-        (543, b"x420"),
-        (500, b"420v"),
-        (RGB8_420_2P, b"420f"),
-        (503, b"444v"),
+    // Each format, its OSType, and whether the runtime reads its planes in place.
+    let cases: [(u64, &[u8; 4], bool); 5] = [
+        (505, b"x420", true),
+        (543, b"x420", true),
+        (500, b"420v", true),
+        (RGB8_420_2P, b"420f", true),
+        (503, b"444v", false),
     ];
     let kernels = [
         "sample_constexpr_repeat",
@@ -1484,7 +1468,8 @@ fn constexpr_samplers_sample_as_metals() {
     let grid = ((size.0 + 8) * 3, (size.1 + 8) * 3);
     let bytes = probe((-4.0, -4.0), 1.0 / 3.0, grid, true, 0);
     let d = exact();
-    for (format, ostype) in cases {
+    let mut differ = Vec::new();
+    for (format, ostype, in_place) in cases {
         let shape = Shape::of(ostype);
         let s = shape.surface(size);
         shape.fill_noise(&s, size, 11);
@@ -1498,14 +1483,16 @@ fn constexpr_samplers_sample_as_metals() {
                     .map(|t| t.map(f32::to_bits))
                     .collect()
             };
-            let ours = read(probed_texels::<VulkanPlatform>(
-                &d,
-                (kernel, 16),
-                &t,
-                grid,
-                None,
-                Some(&bytes),
-            ));
+            let read_ours = || {
+                read(probed_texels::<VulkanPlatform>(
+                    &d,
+                    (kernel, 16),
+                    &t,
+                    grid,
+                    None,
+                    Some(&bytes),
+                ))
+            };
             let theirs = read(probed_texels::<MetalPlatform>(
                 &md,
                 (kernel, 16),
@@ -1518,9 +1505,40 @@ fn constexpr_samplers_sample_as_metals() {
                 "{format} over {}: {kernel}",
                 String::from_utf8_lossy(ostype)
             );
-            assert_eq!(ours, theirs, "{what}");
+            if in_place || !kernel.ends_with("_linear") {
+                let ours = read_ours();
+                if ours != theirs {
+                    differ.push(format!("{what}: not Metal's bits"));
+                }
+                continue;
+            }
+            *crate::answer::LAST_LINE.lock() = None;
+            let site = catch_death(read_ours).map(drop);
+            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+            let named = "(metal2vulkan-degrade-ycbcr-filter-not-exact)";
+            if site.map_err(|s| s.file) != Err("dispatchThreads:threadsPerThreadgroup:")
+                || !line.contains(named)
+            {
+                differ.push(format!("{what}: did not die naming {named}: {line}"));
+            }
+            let ours = crate::answer::relaxed(read_ours);
+            let (ours, theirs) = (ours.as_flattened(), theirs.as_flattened());
+            // How far apart two values are: a NaN against a number is infinitely far.
+            let apart = |(&o, &m): (&u32, &u32)| {
+                let (o, m) = (f32::from_bits(o), f32::from_bits(m));
+                match (o.is_nan(), m.is_nan()) {
+                    (false, false) => (o - m).abs(),
+                    (true, true) => 0.0,
+                    _ => f32::INFINITY,
+                }
+            };
+            let worst = (ours.iter().zip(theirs)).map(apart).fold(0.0_f32, f32::max);
+            if ours.len() != theirs.len() || worst * 2048.0 > 1.0 {
+                differ.push(format!("{what}: {} steps of 1/2048 off", worst * 2048.0));
+            }
         }
     }
+    assert!(differ.is_empty(), "{}", differ.join("\n"));
 }
 
 /// How a test's work writes the surface's luma before a read of its texture of 505.

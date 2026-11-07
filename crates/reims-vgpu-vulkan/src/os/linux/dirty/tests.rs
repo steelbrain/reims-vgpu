@@ -158,6 +158,25 @@ fn the_runtimes_writes_and_writers() {
     assert_eq!(changed_except(&a, s1, W1), vec![3 * P..4 * P]);
 }
 
+/// A batch of the runtime's writes stamps the pages each run's own write does: runs out of
+/// offset order and two in one page, as the runtime may send them, and a named writer's batch
+/// does not come back to it
+#[test]
+fn the_runtimes_batched_writes_stamp_as_each_run_does() {
+    let base = 0x7e48_0000_0000;
+    let (log, _) = log();
+    let _lease = ram(base, Some(Arc::clone(&log)));
+    let d = ImportDirty::new(base).unwrap();
+    let _w = d.watch(0..8 * P);
+    let s1 = harvest(&log, &[]);
+    rt::DirtyPages::wrote_runs(&d, &[5 * P..5 * P + 8, P + 8..P + 16, P + 64..2 * P + 1]);
+    assert_eq!(changed(&d, s1), vec![P..3 * P, 5 * P..6 * P]);
+    let s2 = harvest(&log, &[]);
+    rt::DirtyPages::wrote_runs_as(&d, &[7 * P..7 * P + 1, 0..1], W1);
+    assert_eq!(changed_except(&d, s2, W1), vec![]);
+    assert_eq!(changed_except(&d, s2, W2), vec![0..P, 7 * P..8 * P]);
+}
+
 /// core's writes through a host address stamp the guest's pages behind it
 #[test]
 fn core_writes_reach_the_log() {

@@ -5774,9 +5774,10 @@ pub(crate) mod tests {
     }
 
     /// Whether the device's points reach Metal's largest, 511 pixels (its `pointSizeRange`).
-    /// Elsewhere (255 on ANV) every draw of a state that sizes its points dies in strict mode
+    /// Elsewhere (255 on ANV) every draw of points by a state that sizes them dies in strict mode
     /// (`device-point-size`, [`crate::answer::DIES`]), which a draw of [`SIZED`]'s pins here, so
     /// no such state draws a point there, and the test says so
+    /// ([`a_state_that_sizes_its_points_draws_lines_and_triangles_silently`] draws its others)
     fn points_reach_metals() -> bool {
         let reaches = dev().raw.properties().description.limits.max_point_size >= 511;
         if !reaches {
@@ -5788,6 +5789,19 @@ pub(crate) mod tests {
             eprintln!("the device's points end below Metal's 511 pixels: no point is drawn here");
         }
         reaches
+    }
+
+    /// A state that sizes its points ([`SIZED`]) draws lines, line strips, triangles and
+    /// triangle strips, indexed or not, in strict mode, with nothing that dies announced, on every
+    /// device, one whose points end below Metal's 511 pixels too: the runtime announces
+    /// `device-point-size` at a draw of points alone ([`points_reach_metals`])
+    #[test]
+    fn a_state_that_sizes_its_points_draws_lines_and_triangles_silently() {
+        let (e, indices) = drawing_encoder(SIZED.0, SIZED.1);
+        let draws = [1, 2, 3, STRIP].into_iter();
+        let cmds = draws.flat_map(|p| [three(p, None), three(p, Some(&indices))]);
+        send_all(&e, cmds.collect());
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
     }
 
     /// Whether the runtime draws the last provoking vertex through the device's own

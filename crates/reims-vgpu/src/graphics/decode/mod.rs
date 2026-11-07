@@ -8888,6 +8888,25 @@ lacks {part}"
         );
     }
 
+    /// On the Vulkan platform, a stitched function of fewer parameters than its call gets Metal's
+    /// answers (`on_metal_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes`):
+    /// the runtime links `pair`, made of the two parameters its graph takes, to
+    /// `stitch_caller_extra`'s call of three by position, drops the third, and the pipeline writes
+    /// 2 + 3 from either list; with nothing linked, it is refused
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes() {
+        let [caller, stitched] = COMMITTED_STITCHED;
+        assert_eq!(
+            stitched_links_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(
+                (caller, stitched),
+                "stitch_caller_extra",
+                "pair"
+            ),
+            [Some(5.0), Some(5.0), None]
+        );
+    }
+
     /// The Vulkan crate's metallib of a kernel that reads a function constant only where it is
     /// defined (its `optional_constant.metal`), which a host without Metal takes as a Mac does.
     #[cfg(any(target_os = "macos", feature = "vulkan"))]
