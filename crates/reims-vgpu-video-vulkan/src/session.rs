@@ -902,10 +902,10 @@ impl<P: SessionParameters> Session<P> {
             planes.check(width, height, self.caps.profile.sample_bytes())?;
         }
         // Where the device decodes into outputs, a picture that lands in a
-        // buffer is decoded into the session's scratch image and copied
-        // out of it.
+        // buffer, or in an image that cannot be the decode's target, is
+        // decoded into the session's scratch image and copied out of it.
         if self.caps.decodes_into_output
-            && matches!(decode.output, Target::Buffer(..))
+            && (matches!(decode.output, Target::Buffer(..)) || !self.caps.outputs_are_targets)
             && self.scratch.is_none()
         {
             let usage = vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR;
@@ -943,13 +943,13 @@ impl<P: SessionParameters> Session<P> {
         // What the decode writes beside the DPB picture, if anything, and
         // what the picture is then copied out of, if anything.
         let (written, copy) = match (self.caps.decodes_into_output, decode.output) {
-            (true, Target::Image(image, view)) => {
+            (true, Target::Image(image, view)) if self.caps.outputs_are_targets => {
                 let view = view.ok_or_else(|| {
                     Error::Unsupported("an output a decode writes, with no view".into())
                 })?;
                 (Some((image, view)), None)
             }
-            (true, Target::Buffer(..)) => {
+            (true, _) => {
                 let scratch = self
                     .scratch
                     .as_ref()

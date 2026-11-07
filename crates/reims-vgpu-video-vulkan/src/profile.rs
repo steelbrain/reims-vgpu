@@ -229,12 +229,20 @@ pub struct Capabilities<P> {
     pub dpb_and_output_coincide: bool,
     /// Whether it may be another image.
     pub dpb_and_output_distinct: bool,
-    /// Whether the decoder decodes each picture straight into its output,
-    /// beside its DPB picture (`DPB_AND_OUTPUT_DISTINCT`, where outputs
-    /// of the profile's format may be decode targets); else into its DPB
-    /// picture, then copies that into the output
-    /// (`DPB_AND_OUTPUT_COINCIDE`).
+    /// Whether the decoder decodes each picture beside its DPB picture
+    /// (`DPB_AND_OUTPUT_DISTINCT`): straight into its output image where
+    /// [`Self::outputs_are_targets`], and else into the session's scratch
+    /// image, copied into the output; else into its DPB picture, then
+    /// copies that into the output (`DPB_AND_OUTPUT_COINCIDE`).
     pub decodes_into_output: bool,
+    /// Where it decodes into outputs, whether an output image may be the
+    /// decode's target itself: an image of the profile's format with
+    /// [`OUTPUT_USAGE`] and [`OUTPUT_FLAGS`] beside `VIDEO_DECODE_DST`.
+    /// **Measured** with Mesa 26.2.6 (2026-11-07): RADV on a Radeon 780M
+    /// decodes only beside the DPB, and lists decode targets with no
+    /// `TRANSFER_DST`, so there a picture lands in an output image, as in
+    /// a buffer, through the scratch image.
+    pub outputs_are_targets: bool,
     /// `minBitstreamBufferOffsetAlignment`.
     pub min_bitstream_buffer_offset_alignment: u64,
     /// `minBitstreamBufferSizeAlignment`.
@@ -263,6 +271,7 @@ impl<P: Copy> Capabilities<P> {
             dpb_and_output_coincide: self.dpb_and_output_coincide,
             dpb_and_output_distinct: self.dpb_and_output_distinct,
             decodes_into_output: self.decodes_into_output,
+            outputs_are_targets: self.outputs_are_targets,
             min_bitstream_buffer_offset_alignment: self.min_bitstream_buffer_offset_alignment,
             min_bitstream_buffer_size_alignment: self.min_bitstream_buffer_size_alignment,
             std_header_version: self.std_header_version,
@@ -382,6 +391,7 @@ fn profile_capabilities(
         dpb_and_output_coincide: false,
         dpb_and_output_distinct: false,
         decodes_into_output: false,
+        outputs_are_targets: false,
         min_bitstream_buffer_offset_alignment: caps.min_bitstream_buffer_offset_alignment,
         min_bitstream_buffer_size_alignment: caps.min_bitstream_buffer_size_alignment,
         std_header_version: caps.std_header_version,
@@ -410,12 +420,23 @@ fn profile_capabilities(
     };
     let dst = vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR;
     let dpb = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR;
-    if caps.dpb_and_output_distinct
-        && offered(dpb, dpb, vk::ImageCreateFlags::empty())?
-        && offered(dst, dst | OUTPUT_USAGE, OUTPUT_FLAGS)?
-    {
-        caps.decodes_into_output = true;
-        return Ok(Some(caps));
+    if caps.dpb_and_output_distinct && offered(dpb, dpb, vk::ImageCreateFlags::empty())? {
+        if offered(dst, dst | OUTPUT_USAGE, OUTPUT_FLAGS)? {
+            caps.decodes_into_output = true;
+            caps.outputs_are_targets = true;
+            return Ok(Some(caps));
+        }
+        // A decode target copied out of, the scratch image, and outputs
+        // the copies write.
+        if offered(
+            dst,
+            dst | vk::ImageUsageFlags::TRANSFER_SRC,
+            vk::ImageCreateFlags::empty(),
+        )? && plain_outputs(device, format)
+        {
+            caps.decodes_into_output = true;
+            return Ok(Some(caps));
+        }
     }
     if caps.dpb_and_output_coincide
         && offered(

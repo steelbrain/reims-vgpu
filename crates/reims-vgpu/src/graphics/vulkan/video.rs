@@ -1068,6 +1068,7 @@ mod tests {
             dpb_and_output_coincide: true,
             dpb_and_output_distinct: false,
             decodes_into_output: false,
+            outputs_are_targets: false,
             min_bitstream_buffer_offset_alignment: alignment,
             min_bitstream_buffer_size_alignment: alignment,
             std_header_version: vk::ExtensionProperties::default(),

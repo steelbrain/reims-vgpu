@@ -220,8 +220,8 @@ fn print_capabilities(device: &Arc<VideoDevice>) {
     for caps in h264_capabilities(device) {
         println!(
             "profile {}: level_idc {}, {}x{} to {}x{}, granularity {}x{}, {} DPB slots, {} active \
-             references, coincide {}, distinct {}, decodes into outputs {}, bitstream offset {} \
-             size {} alignment",
+             references, coincide {}, distinct {}, decodes into outputs {} (outputs are targets \
+             {}), bitstream offset {} size {} alignment",
             caps.profile.profile_idc,
             caps.max_level_idc,
             caps.min_coded_extent.width,
@@ -235,6 +235,7 @@ fn print_capabilities(device: &Arc<VideoDevice>) {
             caps.dpb_and_output_coincide,
             caps.dpb_and_output_distinct,
             caps.decodes_into_output,
+            caps.outputs_are_targets,
             caps.min_bitstream_buffer_offset_alignment,
             caps.min_bitstream_buffer_size_alignment,
         );

@@ -307,7 +307,7 @@ impl<S: SurfaceSource> Accelerator for VulkanH265<S> {
             let spec = SurfaceSpec {
                 extent: session.image_extent,
                 profile: session.caps.profile,
-                decode_target: session.caps.decodes_into_output,
+                decode_target: session.caps.decodes_into_output && session.caps.outputs_are_targets,
             };
             (spec, session.extent)
         };
