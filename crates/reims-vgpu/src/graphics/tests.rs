@@ -8793,13 +8793,14 @@ fn a_pages_block_s_view_is_made_off_ring_0_and_its_context_waits_for_it() {
 /// A heap over a pages block of several runs, a slab of plain pages, makes the block's view off
 /// ring 0's threads as a no-copy buffer does: while it is being made, ring 0 goes on with another
 /// context's messages, and the heap's context's next message waits for it; then the view and the
-/// heap over it are made, and the message after it
+/// heap over it are made, and the message after it. The view is 4 pages, so the heap of 3 rounded
+/// up to Metal's 16 KiB page fits it on a host of 4 KiB pages
 #[test]
 fn a_heap_over_a_pages_block_s_view_is_made_off_ring_0() {
     let (device, platform, _ram, page) = surface_device(8);
     let mut guest = Guest::new(&device);
     guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
-    let mut pages = surface_pages(&device, page, &[(5, 2), (1, 1)]);
+    let mut pages = surface_pages(&device, page, &[(5, 2), (1, 2)]);
     pages.extend_from_slice(
         RgfxSurfacePagesCache {
             flags: RGFX_SURFACE_PAGES_PRIVATE,
