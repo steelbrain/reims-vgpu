@@ -54,6 +54,11 @@ void drainRing(TestRing &ring); // shell_tests.mm
 - (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunctionNamed:(const std::string &)name;
 @end
 
+// A function's reflection by itself, Metal's MTLFunction SPI (RgfxFunction.mm).
+@protocol RgfxGLTestsFunctionReflection
+- (id)reflectionWithOptions:(NSUInteger)options;
+@end
+
 void rgfxGLTests();
 
 namespace {
@@ -542,8 +547,60 @@ void test_cl_library_arguments()
 		CHECK(a != nullptr && b != nullptr);
 		if (a != nullptr && b != nullptr)
 			CHECK(a->name == f.name && a->arguments.size() == b->arguments.size());
+		// The function's own reflection, which the GL renderer asks of each kernel it builds: Metal's
+		// class, listing the arguments a compute pipeline's reflection of the function lists.
+		id<MTLFunction> fn = [overContainer newFunctionWithName:@(f.name.c_str())];
+		id own = [(id<RgfxGLTestsFunctionReflection>)fn reflectionWithOptions:3];
+		id pipeline = RgfxComputePipelineReflectionOf(fn, nil, MTLPipelineOptionArgumentInfo | MTLPipelineOptionBufferTypeInfo);
+		CHECK((own != nil) == (pipeline != nil));
+		if (own == nil || pipeline == nil)
+			continue;
+		CHECK(strcmp(object_getClassName(own), "MTLFunctionReflectionInternal") == 0);
+		NSArray *ownArguments = [own valueForKey:@"arguments"], *pipelineArguments = [pipeline valueForKey:@"arguments"];
+		CHECK([[ownArguments valueForKey:@"name"] isEqualToArray:[pipelineArguments valueForKey:@"name"]]);
+		CHECK([[own valueForKey:@"bindings"] count] == ownArguments.count);
 	}
 
+	// A kernel's arguments passed by value, as this Mac's Metal compiles OpenCL C for the GL
+	// renderer: type 22, of the value's type and size, with a pointer type that is no constant
+	// buffer, as the x86 Macs answer (measured: macOS 26.7.1, the AMD 5300M and the Intel 630).
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	NSArray<NSString *> *names = nil;
+	NSData *bytes = clLibraryBytes(metal,
+	                               @"__kernel void scale(__global float *b, float k, uint n) {\n"
+	                               @"  if (get_global_id(0) < n) b[get_global_id(0)] *= k;\n}\n",
+	                               &names);
+	std::vector<uint8_t> scale;
+	if (bytes.length < 4 ||
+	    !RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes.bytes), bytes.length, scale)) {
+		fprintf(stderr, "gl_tests: this Mac's Metal answers no OpenCL container: no value arguments checked\n");
+		drainRing(ring);
+		return;
+	}
+	metallib = scale;
+	std::vector<uint8_t> kept(static_cast<const uint8_t *>(bytes.bytes),
+	                          static_cast<const uint8_t *>(bytes.bytes) + bytes.length);
+	RgfxLibrary *values = keptOver(kept);
+	CHECK(values != nil && [values.functionNames isEqualToArray:@[ @"__entry_scale" ]]);
+	id reflection = [(id<RgfxGLTestsFunctionReflection>)[values newFunctionWithName:@"__entry_scale"]
+	    reflectionWithOptions:3];
+	NSArray *arguments = [reflection valueForKey:@"arguments"];
+	CHECK(arguments.count == 3);
+	if (arguments.count == 3) {
+		const struct {
+			const char *name;
+			NSUInteger type, index, dataType, size;
+		} want[] = {{"b", 0, 0, 3, 4}, {"k", 22, 1, 3, 4}, {"n", 22, 2, 33, 4}};
+		for (NSUInteger i = 0; i < 3; i++) {
+			MTLArgument *a = arguments[i];
+			CHECK(strcmp(a.name.UTF8String, want[i].name) == 0 && a.type == want[i].type && a.index == want[i].index);
+			CHECK(a.bufferDataType == want[i].dataType && a.bufferDataSize == want[i].size && a.bufferAlignment == 4);
+			id type = [a valueForKey:@"dataTypeDescription"];
+			CHECK([type isKindOfClass:[MTLPointerType class]] && ![[type valueForKey:@"isConstantBuffer"] boolValue]);
+			// The written buffer is read-write, as the Macs answer a kernel's written global one.
+			CHECK(a.access == (i == 0 ? MTLArgumentAccessReadWrite : MTLArgumentAccessReadOnly));
+		}
+	}
 	drainRing(ring);
 }
 

@@ -9,6 +9,7 @@
 #import "RgfxUnsupported.h"
 
 #import "RgfxMetalError.h"
+#import "RgfxPipelineReflection.h"
 #import "RgfxReflection.h"
 
 #import <objc/message.h>
@@ -233,6 +234,19 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 {
 	RGFX_UNSUPPORTED("a function's stage-in attributes (its reflection is not read)");
 	return nil;
+}
+
+// The MTLFunction SPI reflectionWithOptions:, which the system's GL renderer sends each kernel of
+// an OpenCL program it builds (gldBuildComputeProgram, with options 3, reading the arguments'
+// access, type, dataTypeDescription's isConstantBuffer and bufferDataSize; read from its code):
+// the function's arguments, as a pipeline's reflection of it lists them, in Metal's
+// MTLFunctionReflectionInternal (RgfxFunctionReflectionOf). Metal's answers one for options 0, 1
+// and 3 alike (measured: macOS 26.7.1, the AMD 5300M and the Intel 630), whose contents for 0 and
+// 1 were not compared: the answer is the same for every value. nil, logged, where it is not made.
+- (id)reflectionWithOptions:(NSUInteger)options
+{
+	(void)options;
+	return RgfxFunctionReflectionOf(self);
 }
 
 - (MTLPatchType)patchType

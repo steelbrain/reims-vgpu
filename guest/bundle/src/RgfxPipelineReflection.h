@@ -113,6 +113,12 @@ bool RgfxStageReflectionOf(id<MTLFunction> function, NSString *prefix, const std
 // class or instance variable it needs.
 id _Nullable RgfxComputePipelineReflectionMake(const RgfxStageReflection &kernel, NSString *__strong _Nullable *_Nonnull why);
 
+// Metal's reflection of a function by itself (MTLFunctionReflectionInternal, which
+// -[_MTLFunction reflectionWithOptions:] answers): its arguments and bindings, the same objects, as
+// a pipeline's of the function lists them (measured: macOS 26.7.1, the AMD 5300M and the Intel 630
+// alike, OpenCL C and Metal kernels). nil, with `*why`, as RgfxComputePipelineReflectionMake.
+id _Nullable RgfxFunctionReflectionMake(const RgfxStageReflection &stage, NSString *__strong _Nullable *_Nonnull why);
+
 // Metal's render pipeline reflection of its stages' answers, null for a stage the pipeline does not
 // have: a vertex pipeline's (`vertex`, `fragment`), or a mesh pipeline's (`object`, `mesh`,
 // `fragment`, with `mesh` not null). nil, with `*why`, as RgfxComputePipelineReflectionMake.
@@ -131,6 +137,9 @@ id _Nullable RgfxComputePipelineReflectionOf(id<MTLFunction> _Nullable kernel,
 id _Nullable RgfxRenderPipelineReflectionOf(id<MTLFunction> _Nullable vertex,
                                             MTLVertexDescriptor *_Nullable vertexDescriptor,
                                             id<MTLFunction> _Nullable fragment, MTLPipelineOption options);
+// The reflection a function answers by itself (RgfxFunctionReflectionMake): nil, logged once per
+// reason, where it is not made.
+id _Nullable RgfxFunctionReflectionOf(id<MTLFunction> function);
 id _Nullable RgfxMeshPipelineReflectionOf(id<MTLFunction> _Nullable object, id<MTLFunction> _Nullable mesh,
                                           id<MTLFunction> _Nullable fragment, MTLPipelineOption options);
 

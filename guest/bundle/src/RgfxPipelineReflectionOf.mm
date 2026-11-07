@@ -67,6 +67,17 @@ id RgfxComputePipelineReflectionOf(id<MTLFunction> kernel, MTLStageInputOutputDe
 	return r;
 }
 
+id RgfxFunctionReflectionOf(id<MTLFunction> function)
+{
+	RgfxStageReflection stage;
+	NSString *why = nil;
+	id r = RgfxStageReflectionOf(function, @"stageInBuffer", {}, stage, &why) ? RgfxFunctionReflectionMake(stage, &why)
+	                                                                          : nil;
+	if (r == nil)
+		logOnce([NSString stringWithFormat:@"function %@", function.name], why);
+	return r;
+}
+
 id RgfxRenderPipelineReflectionOf(id<MTLFunction> vertex, MTLVertexDescriptor *vertexDescriptor,
                                   id<MTLFunction> fragment, MTLPipelineOption options)
 {

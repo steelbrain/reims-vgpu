@@ -99,6 +99,8 @@ constexpr NSUInteger kNoIndex = 0xFFFFFFFF;
 // The binding type of a built-in argument, of an argument buffer's constant member, and of a mesh.
 constexpr NSUInteger kBuiltInBindingType = 15;
 constexpr NSUInteger kIndirectConstantBindingType = 4;
+// The binding type of a kernel's argument passed by value (an OpenCL C kernel's, `air.constant`).
+constexpr NSUInteger kValueBindingType = 22;
 constexpr NSUInteger kMeshBindingType = 35;
 // The built-in type and data type of a mesh, and the data type of mesh_grid_properties.
 constexpr NSUInteger kMeshBuiltInType = 24;
@@ -704,6 +706,37 @@ struct Maker {
 			                                   alignment:align];
 			return argument(b, used);
 		}
+		// A kernel's argument passed by value, as Metal's compiler describes an OpenCL C kernel's
+		// scalar one: a buffer binding of type 22, read only, of the value's type, size and
+		// alignment, its type object a pointer to the value that is no constant buffer (measured:
+		// macOS 26.7.1, the AMD 5300M and the Intel 630 alike, a float and a uint). A struct passed
+		// so was not measured.
+		if (n.kind == "air.constant") {
+			NSUInteger type = 0;
+			uint32_t align = 0;
+			if (n.layout != nullptr || !n.hasTypeSize || !valueType(n.typeName, type, align)) {
+				fail([NSString stringWithFormat:@"a value argument of %s was not measured", n.typeName.c_str()]);
+				return nil;
+			}
+			const NSUInteger alignment = n.hasTypeAlign ? n.typeAlign : align;
+			id p = pointer(type, nil, MTLBindingAccessReadOnly, alignment, n.typeSize, false, false);
+			id b = [make(c.bufferBinding) initWithName:name
+			                                     type:kValueBindingType
+			                                   access:MTLBindingAccessReadOnly
+			                                 isActive:used
+			                            locationIndex:n.index
+			                                arraySize:1
+			                                 dataType:type
+			                              pixelFormat:MTLPixelFormatInvalid
+			                                  aluType:0
+			                         isConstantBuffer:NO
+			                                 dataSize:n.typeSize
+			                                alignment:alignment];
+			if (p == nil || b == nil || !setObject(b, "_typeInfo", p))
+				return nil;
+			*info = p;
+			return argument(b, used);
+		}
 		if (n.kind == "air.payload") {
 			if (n.layout == nullptr || !n.hasTypeSize || !n.hasTypeAlign) {
 				fail(@"a payload of other than a struct");
@@ -1113,7 +1146,8 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 		if (isStageInput(n.kind))
 			continue;
 		const bool resource = n.kind == "air.buffer" || n.kind == "air.indirect_buffer" || n.kind == "air.texture" ||
-		                      n.kind == "air.sampler" || n.kind == "air.payload" || tableType(n.kind);
+		                      n.kind == "air.sampler" || n.kind == "air.payload" || n.kind == "air.constant" ||
+		                      tableType(n.kind);
 		if (resource) {
 			id info = nil;
 			id b = m.resource(n, entry.stage, &info, nullptr);
@@ -1171,6 +1205,36 @@ id RgfxComputePipelineReflectionMake(const RgfxStageReflection &kernel, NSString
 	    !m.setObject(r, "_bindings", kernel.bindings ? [NSArray arrayWithArray:kernel.bindings] : nil) ||
 	    !m.setObject(r, "_builtInArguments", kernel.builtIns) || !m.setNumber(r, "_traceBufferIndex", 'I', kNoIndex)) {
 		*why = m.why ?: @"Metal's compute pipeline reflection was not made";
+		return nil;
+	}
+	return r;
+}
+
+id RgfxFunctionReflectionMake(const RgfxStageReflection &stage, NSString *__strong *why)
+{
+	const Classes &c = classes();
+	if (c.missing != nil) {
+		*why = [NSString stringWithFormat:@"Metal has no %@", c.missing];
+		return nil;
+	}
+	// Metal's class of a function's own reflection (macOS 26's MTLFunctionReflection), which
+	// macOS releases before 26 do not have.
+	static Class cls = NSClassFromString(@"MTLFunctionReflectionInternal");
+	if (cls == Nil || ![cls instancesRespondToSelector:@selector(init)]) {
+		*why = @"Metal has no MTLFunctionReflectionInternal";
+		return nil;
+	}
+	Maker m{c};
+	id r = [[cls alloc] init];
+	// As the compute pipeline's, a GL shader variant's return data where the class keeps one
+	// (measured: macOS 26.7.1's does).
+	const bool keepsReturnData = class_getInstanceVariable(cls, "_pluginReturnData") != nullptr;
+	if (r == nil || !m.setObject(r, "_arguments", stage.bindings) ||
+	    !m.setObject(r, "_bindings", stage.bindings ? [NSArray arrayWithArray:stage.bindings] : nil) ||
+	    !m.setObject(r, "_builtInArguments", stage.builtIns) ||
+	    (stage.pluginReturnData != nil && keepsReturnData &&
+	     !m.setObject(r, "_pluginReturnData", stage.pluginReturnData))) {
+		*why = m.why ?: @"Metal's function reflection was not made";
 		return nil;
 	}
 	return r;
