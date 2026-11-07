@@ -8889,7 +8889,7 @@ lacks {part}"
     /// the runtime links `pair`, made of the two parameters its graph takes, to
     /// `stitch_caller_extra`'s call of three by position, drops the third, and the pipeline writes
     /// 2 + 3 from either list; with nothing linked, it is refused
-    #[cfg(feature = "vulkan")]
+    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes() {
         let [caller, stitched] = COMMITTED_STITCHED;
