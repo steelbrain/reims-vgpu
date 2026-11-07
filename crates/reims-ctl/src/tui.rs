@@ -1739,7 +1739,7 @@ impl App {
                     let vm = create::create(spec, host, p)?;
                     let next = if runtime::install_steps(&vm).is_some() {
                         "; its details say how to install macOS"
-                    } else if vm.config.q35.is_some() {
+                    } else if runtime::needs_error_mode(&vm) {
                         "; set Metal's error mode in its macOS if it isn't (README)"
                     } else {
                         ""

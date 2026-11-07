@@ -774,7 +774,7 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
     println!("created {name} in {}", paths::tilde(&vm.dir));
     if let Some(steps) = runtime::install_steps(&vm) {
         println!("{steps}");
-    } else if vm.config.q35.is_some() {
+    } else if runtime::needs_error_mode(&vm) {
         println!("{name}: {}", runtime::SET_METAL_ERROR_MODE);
     }
     if a.start {
@@ -1091,17 +1091,15 @@ pub fn set_installer(
     {
         let _ = std::fs::remove_file(c);
     }
+    let error_mode = match runtime::needs_error_mode(vm) {
+        true => format!("; {}", runtime::SET_METAL_ERROR_MODE),
+        false => String::new(),
+    };
     Ok(match (&path, running) {
         (Some(p), false) => format!("{name}: {} attached for the next start", paths::tilde(p)),
         (Some(_), true) => format!("{name}: the installer changes at the next start"),
-        (None, false) => format!(
-            "{name}: installer removed; {}",
-            runtime::SET_METAL_ERROR_MODE
-        ),
-        (None, true) => format!(
-            "{name}: the installer goes at the next start; {}",
-            runtime::SET_METAL_ERROR_MODE
-        ),
+        (None, false) => format!("{name}: installer removed{error_mode}"),
+        (None, true) => format!("{name}: the installer goes at the next start{error_mode}"),
     })
 }
 

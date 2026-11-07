@@ -79,10 +79,12 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    in place), and `--opencore` the OpenCore image it booted with, with OVMF beside it, which keeps
    its Mac identity. `--installer` takes an installer of your own.
 
-3. **Set Metal's error mode in the guest**, once. Without it, macOS's icon service crashes as soon
-   as it starts, and a fresh install never gets a working desktop: either it stays on its
-   wallpaper with no menu bar and no Dock, or it comes up gray, with a menu bar but no Dock. Since
-   you can't count on a desktop yet, you set it from macOS Recovery:
+3. **On apple-gfx, set Metal's error mode in the guest**, once. A VM on reims-vgpu's own device,
+   the default, doesn't need it: skip this step. On apple-gfx (`--graphics apple-gfx`), macOS's
+   icon service crashes as soon as it starts without it, and a fresh install never gets a working
+   desktop: either it stays on its wallpaper with no menu bar and no Dock, or it comes up gray,
+   with a menu bar but no Dock. Since you can't count on a desktop yet, you set it from macOS
+   Recovery:
 
    1. Turn on the VM's boot selection, so that OpenCore shows its picker: in reims-ctl, press
       `e` on the VM, switch **Boot selection** on and save (or run

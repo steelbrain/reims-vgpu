@@ -153,8 +153,15 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
     Ok(())
 }
 
-/// The reminder where an x86-64 VM's macOS gets installed.
+/// The reminder where an x86-64 VM on apple-gfx gets its macOS installed ([`needs_error_mode`]).
 pub const SET_METAL_ERROR_MODE: &str = "set Metal's error mode once macOS is installed (README)";
+
+/// Whether the VM's macOS needs Metal's error mode set (README; docs/qemu.md, "x86-64 macOS guests:
+/// Metal's error mode"): an x86-64 VM on apple-gfx, whose icon service otherwise ends as it starts.
+/// On reims-vgpu's own device a 26.7.2 guest without it comes up with its Dock and icon services.
+pub fn needs_error_mode(vm: &Vm) -> bool {
+    vm.config.q35.is_some() && vm.config.graphics() == Graphics::AppleGfx
+}
 
 /// The host's `vm.max_map_count` (Linux).
 pub fn host_max_map_count() -> Option<u64> {
@@ -290,6 +297,10 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
         "pick Reinstall macOS"
     };
     let name = vm.name();
+    let error_mode = match needs_error_mode(vm) {
+        true => " and set Metal's error mode (README)",
+        false => "",
+    };
     let first = match q.disk_controller {
         DiskController::Ahci => String::new(),
         DiskController::Nvme => format!(
@@ -302,7 +313,7 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
         "{first}To install macOS, start {name}: OpenCore boots its installer into macOS \
          Recovery. If the VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK Media) as \
          APFS and quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
-         (reims-ctl eject {name}) and set Metal's error mode (README)."
+         (reims-ctl eject {name}){error_mode}."
     ))
 }
 
@@ -1093,5 +1104,41 @@ mod tests {
         );
         vm.config.q35.as_mut().unwrap().installer = None;
         assert_eq!(install_steps(&vm), None);
+    }
+
+    /// An x86-64 VM's install steps say to set Metal's error mode on apple-gfx alone: reims-vgpu's
+    /// own device, the default, needs none.
+    #[test]
+    fn install_steps_name_the_error_mode_on_apple_gfx_alone() {
+        let config = r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            installer = "installer.img"
+        "#;
+        let mut vm = Vm {
+            dir: "/vms/t".into(),
+            config: toml::from_str(config).unwrap(),
+        };
+        assert!(!needs_error_mode(&vm));
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.ends_with("eject the installer (reims-ctl eject t).")
+                && !steps.contains("error mode"),
+            "{steps}"
+        );
+        vm.config.graphics = Some(Graphics::AppleGfx);
+        assert!(needs_error_mode(&vm));
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.ends_with("(reims-ctl eject t) and set Metal's error mode (README)."),
+            "{steps}"
+        );
     }
 }

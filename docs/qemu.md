@@ -1104,8 +1104,12 @@ pipelines per state.
 
 ### x86-64 macOS guests: Metal's error mode
 
-An x86-64 macOS guest needs one setting, made once inside the guest. On a
-desktop that comes up:
+An x86-64 macOS guest on `apple-gfx-pci` needs one setting, made once inside
+the guest. One on `reims-graphics-pci` does not: a macOS 26.7.2 guest on it
+without the key comes up with its Dock, `iconservicesagent` and
+`iconservicesd` running and no crash report (measured on a Radeon 780M host,
+2026-11-07), and `reims-ctl` names the setting for apple-gfx VMs alone
+(`runtime::needs_error_mode`). On a desktop that comes up:
 
 ```sh
 sudo defaults write /Library/Preferences/.GlobalPreferences METAL_ERROR_MODE -int 5
