@@ -37,7 +37,14 @@
 //! was made over staying, and a buffer's deallocator running only once it went
 //! ([`never_replaced`]).
 
-#![cfg(target_os = "macos")] // Compares with Metal, which is macOS's.
+#![cfg(target_os = "macos")]
+// Compares with Metal, which is macOS's.
+// Every platform object is `Send` and `Sync` (core's `Handle`, and `Obj`'s bound, which an
+// encoder's drop asks of `PredicatedEncoder`), and the proof walks the object's fields: an
+// encoder's command buffer, its predication, and the runtime objects that holds, 141 to 150
+// levels deep (measured: rustc warns at a limit of 140, not at 150). That is deeper than
+// rustc's default of 128, as in the library (`src/lib.rs`).
+#![recursion_limit = "256"]
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
