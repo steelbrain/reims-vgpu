@@ -797,7 +797,21 @@ library can run AppKit (`reims-vgpu-window`'s `native/macos/main_thread.rs`).
   The guest's boot firmware sets binary version 62 (it writes `0x3e` to
   0x1034 before the kernel runs, and nothing writes 0x1034 again), and below
   version 245 the port count at 0x122c reads 1 (`supportsMultipleDisplays`;
-  docs/testing.md 6.21), so port 1 never gets a mode.
+  docs/testing.md 6.21), so port 1 never gets a mode. The x86-64 macOS
+  26.7.2 guest on `apple-gfx-pci,displays=2` does the same (um790, 11-07):
+  at each boot it asks for binary version 0, reads 0x122c while that
+  version is stored (1, logged at debug by `reims_vgpu_core::device::mmio`),
+  and only then asks for 245; it makes one guest display, on port 0, its
+  IORegistry holds one `AppleParavirtFramebuffer`, and port 1's window
+  stays black at 640x480.
+- **The rate.** The guest's modes run at the host screen's rate
+  (`crates/reims-vgpu-window/features.md`, "Matching the host's screen").
+  With um790's 3840x2160 screen set to 50 Hz (11-07, x86-64 26.7.2 on
+  `apple-gfx-pci`), `CGDisplayModeGetRefreshRate` reads 50.00 for every
+  mode, and system_profiler "1920 x 1080 @ 50.00Hz", through SDL's Wayland
+  driver and through its X11 one on Xwayland. Set to 60 Hz, both read 0.00
+  and system_profiler gives no rate: the guest shows a 60 Hz mode as one of
+  no stated rate.
 
 ### Isolated tasks
 
@@ -2461,9 +2475,10 @@ has AES depends on what else the host's Homebrew holds.
   heavier than the tour `scripts/internal/vm_drive.py` drives.
 - `kernel-irqchip=off`, and a boot without vendor/qemu's `663b9b9c0b`.
 - Several displays: the macOS 13.6 guest does not drive port 1 at version
-  62 ("Window mode", above). Whether it would with 0x122c reporting both
-  ports, which guests negotiate version 245, and whether the one USB
-  tablet's pointer reaches a second display.
+  62 ("Window mode", above), nor does the x86-64 26.7.2 guest, which reads
+  0x122c before it asks for 245. Whether a guest that negotiates 245 before
+  it reads 0x122c drives port 1, and whether the one USB tablet's pointer
+  reaches a second display.
 - The `manual` entries of `crates/reims-vgpu-window/features.md` that
   "Window mode" does not record as measured, the guest's input, capture
   and the system's hot keys among them.
