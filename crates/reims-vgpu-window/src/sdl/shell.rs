@@ -478,28 +478,61 @@ impl Shell {
 
     /// Sets the cursor: over the image the guest's, or none while the guest hides its own or the
     /// window draws it itself (`handle`'s module doc); the host's arrow elsewhere and before the
-    /// guest has set one.
+    /// guest has set one. SDL's cursor is the process's, so only the window the pointer is in
+    /// (SDL's mouse focus) sets it ([`cursor_step`]).
     fn refresh_cursor(&mut self) {
         let guest = self.window.guest();
-        let ours = if self.over_image {
-            let per_pixel =
-                geometry::cursor_points_per_pixel(self.layout.image, guest.mode.unwrap_or((0, 0)));
-            if !guest.host_cursor_visible() && guest.cursor.is_some() {
+        // SAFETY: SDL's video runs on this thread.
+        let has_pointer = unsafe { SDL_GetMouseFocus() } == self.sdl;
+        let hidden = !guest.host_cursor_visible() && guest.cursor.is_some();
+        let ours = match cursor_step(has_pointer, self.over_image, hidden) {
+            CursorStep::Leave => return,
+            CursorStep::Hide => {
                 // SAFETY: SDL's video runs on this thread.
                 unsafe { SDL_HideCursor() };
                 return;
             }
-            self.cursor
-                .cursor(guest.cursor.as_deref(), per_pixel, self.density)
-                .map(|c| c.raw())
-        } else {
-            None
+            CursorStep::Guest => {
+                let mode = guest.mode.unwrap_or((0, 0));
+                let per_pixel = geometry::cursor_points_per_pixel(self.layout.image, mode);
+                self.cursor
+                    .cursor(guest.cursor.as_deref(), per_pixel, self.density)
+                    .map(|c| c.raw())
+            }
+            CursorStep::Arrow => None,
         };
         // SAFETY: SDL's video runs on this thread; the cursor is one it made, or its default.
         unsafe {
             SDL_SetCursor(ours.unwrap_or_else(|| SDL_GetDefaultCursor()));
             SDL_ShowCursor();
         }
+    }
+}
+
+/// What a window's refresh does to SDL's cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorStep {
+    /// Nothing: the pointer is in another window, or in none.
+    Leave,
+    /// Hides it: the guest hides its own, or the window draws it.
+    Hide,
+    /// The guest's, else the host's arrow where the guest has set none.
+    Guest,
+    /// The host's arrow.
+    Arrow,
+}
+
+/// What a window's refresh does to SDL's cursor, which is the process's: a window the pointer is
+/// not in (`has_pointer`, SDL's mouse focus) leaves it as it is, so that another display's window,
+/// whose guest changes its cursor or whose layout changes, does not set the arrow over the image
+/// the pointer is in; the window the pointer is in sets it over its image (`over_image`), hidden
+/// where the guest hides its own (`hidden`), and the arrow elsewhere.
+fn cursor_step(has_pointer: bool, over_image: bool, hidden: bool) -> CursorStep {
+    match (has_pointer, over_image, hidden) {
+        (false, _, _) => CursorStep::Leave,
+        (true, true, true) => CursorStep::Hide,
+        (true, true, false) => CursorStep::Guest,
+        (true, false, _) => CursorStep::Arrow,
     }
 }
 
@@ -632,6 +665,25 @@ fn ended(c: &mut impl Closing) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the window the pointer is in sets SDL's cursor, which is the process's: another
+    /// window's refresh leaves it as it is, whatever it shows
+    #[test]
+    fn a_window_the_pointer_is_not_in_leaves_the_cursor() {
+        for over_image in [false, true] {
+            for hidden in [false, true] {
+                assert_eq!(
+                    cursor_step(false, over_image, hidden),
+                    CursorStep::Leave,
+                    "over the image {over_image}, hidden {hidden}"
+                );
+            }
+        }
+        assert_eq!(cursor_step(true, true, false), CursorStep::Guest);
+        assert_eq!(cursor_step(true, true, true), CursorStep::Hide);
+        assert_eq!(cursor_step(true, false, false), CursorStep::Arrow);
+        assert_eq!(cursor_step(true, false, true), CursorStep::Arrow);
+    }
 
     /// The pointer is held over the image in whole points, rounded out; an image on whole points
     /// is the rect itself

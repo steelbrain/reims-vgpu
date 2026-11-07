@@ -419,6 +419,12 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: sdl::cursor::a_short_or_empty_glyph`,
   `test: handle::a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw`,
   `manual`
+- With several displays' windows open, the cursor is set only by the window
+  the pointer is in: SDL's cursor is the process's, so another window's guest
+  changing its cursor, or that window's layout changing, leaves the cursor
+  over the image the pointer is in as it is.
+  `test: sdl::shell::a_window_the_pointer_is_not_in_leaves_the_cursor`,
+  `manual` (a VM with two displays)
 - Leaving: closing a window asks the host to end the VM; the window closes
   at the display's release, once its swapchain is gone. `manual`
 
