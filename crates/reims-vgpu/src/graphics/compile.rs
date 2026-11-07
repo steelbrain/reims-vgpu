@@ -12,9 +12,12 @@
 //! creates delays no other's. The pool's threads serve the processes (contexts) in turns: the
 //! next compile is of the context that owns the scanout where it has one waiting (the context of
 //! the surface the display last presented, WindowServer's), else of the context with the fewest
-//! compiles running, the one longest without a turn among equals; each context's own compiles go
-//! in the order it handed them over. So a context's single create waits for at most the first
-//! running compile to end, whatever another context has queued, and the scanout owner's waits
+//! compiles running, the one longest without a turn among equals: a context goes to the back of
+//! the turns as a compile of it is taken and again as one ends, so a context whose compiles all
+//! ended before a thread took the next goes behind one that waited through them. Each context's
+//! own compiles go in the order it handed them over. So a context's single create waits for at
+//! most the first running compile to end, whatever another context has queued, and the scanout
+//! owner's waits
 //! behind no other context's. Library makes go before every pipeline compile: a pipeline that
 //! names a library another context is still making waits for it on its thread, and that library
 //! has then always been taken by a thread already. Each compile's wait and run time is logged at
@@ -137,7 +140,7 @@ struct PoolState {
     /// Each context's waiting compiles.
     queues: HashMap<u32, ContextQueue>,
     /// The contexts with compiles waiting, in the order they take turns: a context goes to the
-    /// back as a compile of it is taken.
+    /// back as a compile of it is taken and as one ends.
     turns: VecDeque<u32>,
     /// The compiles each context has running.
     running: HashMap<u32, usize>,
@@ -191,13 +194,19 @@ impl PoolState {
         Some(queued)
     }
 
-    /// A compile of `context` ended.
+    /// A compile of `context` ended: the context goes to the back of the turns, behind those
+    /// that waited while it ran.
     fn ended(&mut self, context: u32) {
         if let Some(n) = self.running.get_mut(&context) {
             *n -= 1;
             if *n == 0 {
                 self.running.remove(&context);
             }
+        }
+        if let Some(at) = self.turns.iter().position(|&c| c == context)
+            && let Some(c) = self.turns.remove(at)
+        {
+            self.turns.push_back(c);
         }
     }
 }
@@ -748,10 +757,11 @@ mod tests {
     }
 
     /// One context's backlog holds no other context's create: with four threads busy on context
-    /// 1's twenty compiles, context 2's single create is taken as the first of them ends and so
-    /// finishes one compile time after that, where in the order compiles were handed over it
-    /// would wait for five. The order is read as the pool took the compiles: a thread put off
-    /// between its take and its compile's start lets a compile taken after its own start first
+    /// 1's twenty compiles, context 2's single create is taken as the first of them ends, though
+    /// all four end before a thread takes the next, and so finishes one compile time after that,
+    /// where in the order compiles were handed over it would wait for five. The order is read as
+    /// the pool took the compiles: a thread put off between its take and its compile's start lets
+    /// a compile taken after its own start first
     #[test]
     fn a_context_s_create_waits_behind_no_other_context_s_backlog() {
         const TAKES: Duration = Duration::from_millis(100);
@@ -799,6 +809,55 @@ mod tests {
             took < 3 * TAKES,
             "context 2's create finished {took:?} after the release, more than a compile's wait"
         );
+    }
+
+    /// A context's compile ending puts the context behind one that waited through it: with one
+    /// thread, context 2's create handed over while context 1's compile runs is taken as that
+    /// compile ends, before context 1's next, though neither then has a compile running and
+    /// context 1 joined the turns first
+    #[test]
+    fn a_context_that_waited_through_another_s_compile_goes_next() {
+        let pool = pool(1);
+        let starts = Starts::default();
+        pool.hold();
+        compile(
+            &pool,
+            &starts,
+            CompileKind::Pipeline,
+            1,
+            "1.0",
+            Duration::ZERO,
+        );
+        // The thread takes 1.0 and holds at the gate; then 1 hands over two more, 2 its create.
+        for _ in 0..5000 {
+            if !pool.taken().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(pool.taken(), [1], "the thread took no compile");
+        for name in ["1.1", "1.2"] {
+            compile(
+                &pool,
+                &starts,
+                CompileKind::Pipeline,
+                1,
+                name,
+                Duration::ZERO,
+            );
+        }
+        compile(
+            &pool,
+            &starts,
+            CompileKind::Pipeline,
+            2,
+            "2",
+            Duration::ZERO,
+        );
+        pool.release();
+        let order = started(&starts, 4);
+        assert_eq!(pool.taken(), [1, 2, 1, 1], "started in {order:?}");
+        assert_eq!(order, ["1.0", "2", "1.1", "1.2"]);
     }
 
     /// The scanout owner's compile goes before every other context's waiting, and so before one
