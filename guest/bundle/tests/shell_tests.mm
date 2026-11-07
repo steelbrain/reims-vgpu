@@ -3229,6 +3229,8 @@ void test_render_pipeline_private_state()
 	desc.vertexFunction = [lib newFunctionWithName:@"vmain"];
 	desc.fragmentFunction = [lib newFunctionWithName:@"fmain"];
 	desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	// The states live to the test's end, so no destroy comes between the creates.
+	NSMutableArray *states = [NSMutableArray array];
 	auto create = [&]() {
 		NSError *err = nil;
 		RgfxRenderPipelineState *ps =
@@ -3237,6 +3239,7 @@ void test_render_pipeline_private_state()
 		                                                   serializer:&fx.ser
 		                                                        error:&err];
 		CHECK(ps != nil && err == nil);
+		[states addObject:ps];
 		return nextMessage(fx.ring, RGFX_CMD_RENDER_PIPELINE_CREATE);
 	};
 	RgfxRenderPipelineCreate head;
