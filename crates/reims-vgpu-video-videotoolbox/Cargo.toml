@@ -10,14 +10,12 @@ license.workspace = true
 [lints]
 workspace = true
 
-[dependencies]
-log = "0.4"
-
-# The backend itself, which only macOS builds: the device's traits it implements, and the codecs
-# above the hardware.
+# The backend itself, which only macOS builds: the device's traits it implements, the codecs
+# above the hardware, and the log lines it writes.
 [target.'cfg(target_os = "macos")'.dependencies]
 reims-vgpu-video-codec = { path = "../reims-vgpu-video-codec" }
 reims-vgpu-video-core = { path = "../reims-vgpu-video-core" }
+log = "0.4"
 
 [dev-dependencies]
 # The suite every backend runs, and its stream readers.
