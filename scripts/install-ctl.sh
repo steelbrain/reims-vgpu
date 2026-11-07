@@ -101,10 +101,11 @@ case "$OS/$ARCH" in
     ;;
   Linux/x86_64)
     PLATFORM=linux-x86_64
-    # libusb (usb-host, USB passthrough) is enabled by name: configure leaves
-    # out an optional feature whose library it does not find, saying nothing.
+    # libusb (usb-host, USB passthrough) and SPICE (-spice, a display a SPICE
+    # client connects to) are enabled by name: configure leaves out an
+    # optional feature whose library it does not find, saying nothing.
     QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp
-      --enable-libusb)
+      --enable-libusb --enable-spice)
     QEMU_BINARY=qemu-system-x86_64
     ;;
   *) die "reims-ctl supports macOS on arm64 and Linux on x86-64; this is $OS on $ARCH" ;;
@@ -231,17 +232,18 @@ else
   # CMake and the X11, Wayland, xkbcommon and EGL headers for SDL3's video,
   # which it builds from source), and QEMU (glib, pixman, libslirp; GTK 3 for
   # its own window, which a VM on VMware SVGA shows its display in; pipewire,
-  # pulse and ALSA for its audio backends; libusb for USB passthrough; bzip2
-  # unpacks its firmware). A new x86-64 VM's OVMF comes from reims-util, with
-  # its OpenCore image.
+  # pulse and ALSA for its audio backends; libusb for USB passthrough; the
+  # SPICE server for -spice; bzip2 unpacks its firmware). A new x86-64 VM's
+  # OVMF comes from reims-util, with its OpenCore image.
   apt_pkgs=(build-essential git curl ca-certificates pkg-config python3 python3-venv ninja-build
     flex bison bzip2 cmake clang lld binutils libglib2.0-dev libpixman-1-dev libslirp-dev
-    zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libusb-1.0-0-dev libvulkan1
+    zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libusb-1.0-0-dev
+    libspice-server-dev libvulkan1
     libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev
     libxtst-dev libxkbcommon-dev libwayland-dev libwayland-bin libdecor-0-dev
     libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libgtk-3-dev)
   pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake clang lld
-    glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb vulkan-icd-loader
+    glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb spice vulkan-icd-loader
     libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
     wayland libdecor mesa libdrm dbus systemd-libs gtk3)
   case " $distro_id $distro_like " in
