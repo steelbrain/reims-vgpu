@@ -274,6 +274,127 @@ mod tests {
         assert_eq!(left, [&builds[0], &builds[2], &builds[3], &builds[4]]);
     }
 
+    /// The installer's --skip-qemu keeps the installed QEMU: with none installed it ends at
+    /// once, before it builds or installs anything, saying what to do.
+    #[test]
+    fn the_installer_skips_qemu_only_where_one_is_installed() {
+        let dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo");
+        let script = Path::new(&dir).join("../../scripts/install-ctl.sh");
+        let root = std::env::temp_dir().join(format!("reims-ctl-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .arg("--skip-qemu")
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env_remove("GPU_ARM")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(
+            err.contains("--skip-qemu keeps the installed QEMU, and none is installed")
+                && err.contains("run this without --skip-qemu, which builds it"),
+            "{err}"
+        );
+    }
+
+    /// What the installer says of the QEMU build --skip-qemu keeps: nothing where it was built
+    /// from what this checkout builds it from, which a change to reims-ctl alone leaves as it
+    /// was; else that QEMU or the library changed since its commit, that the checkout lacks
+    /// that commit, or that it runs on the other GPU arm.
+    #[test]
+    fn the_installer_says_when_the_qemu_it_keeps_is_not_this_checkouts() {
+        let dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo");
+        let text =
+            std::fs::read_to_string(Path::new(&dir).join("../../scripts/install-ctl.sh")).unwrap();
+        let function = script_function(&text, "kept_qemu");
+        let repo = std::env::temp_dir().join(format!("reims-ctl-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let commit = |file: &str| {
+            let path = repo.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            std::fs::write(&path, text + "x\n").unwrap();
+            git(&["add", file]);
+            git(&["commit", "-q", "-m", file]);
+            git(&["rev-parse", "--short", "HEAD"])
+        };
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        commit("vendor/qemu/configure");
+        let built = commit("crates/reims-vgpu/src/lib.rs");
+        commit("crates/reims-ctl/src/main.rs");
+        commit("docs/qemu.md");
+        let kept = |build: &str, arm_suffix: &str, gpu_arm: &str| {
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("set -euo pipefail\n{function}kept_qemu \"$1\""))
+                .arg("kept")
+                .arg(format!("/data/reims-ctl/qemu/{build}"))
+                .env("ROOT", &repo)
+                .env("ARM_SUFFIX", arm_suffix)
+                .env("GPU_ARM", gpu_arm)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let this = kept(&format!("20261107-120000-{built}"), "", "vulkan");
+        let on_vulkan = kept(
+            &format!("20261107-120000-{built}-vulkan"),
+            "-vulkan",
+            "vulkan",
+        );
+        let other_arm = kept(&format!("20261107-120000-{built}"), "-vulkan", "vulkan");
+        let unknown = kept("20261107-120000-0000000", "", "vulkan");
+        commit("crates/reims-vgpu/src/lib.rs");
+        let changed = kept(&format!("20261107-120000-{built}"), "", "vulkan");
+        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!(this, "");
+        assert_eq!(on_vulkan, "");
+        assert_eq!(
+            other_arm,
+            "the installed QEMU runs on Metal, not GPU_ARM=vulkan: run this without --skip-qemu \
+             to build it on vulkan\n"
+        );
+        assert_eq!(
+            unknown,
+            "the installed QEMU was built at 0000000, which this checkout does not have: run this \
+             without --skip-qemu to build this checkout's\n"
+        );
+        assert_eq!(
+            changed,
+            format!(
+                "the installed QEMU was built at {built}, and QEMU or the library it links changed \
+                 since: run this without --skip-qemu to build this checkout's\n"
+            )
+        );
+    }
+
     #[test]
     fn audio_backend_prefers_the_native_one() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();

@@ -43,7 +43,9 @@
 #             was force-pushed, the checkout's commit is kept on a branch
 #             BRANCH-before-update-DATE and the checkout moves to the remote's;
 #             reims-ctl update runs this
-# --skip-qemu install reims-ctl alone, keeping the installed QEMU
+# --skip-qemu install reims-ctl alone, keeping the installed QEMU, which it
+#             needs; it warns where the QEMU or library this checkout builds
+#             changed since that QEMU's build
 #
 # Environment: GPU_ARM (above); CARGO_TARGET_DIR, the library's build (default
 # the checkout's target/); XDG_DATA_HOME and XDG_CACHE_HOME move the install
@@ -131,6 +133,11 @@ case "$OS/${GPU_ARM:-}" in
 esac
 ARM_SUFFIX=""
 [[ $OS == Darwin && $GPU_ARM == vulkan ]] && ARM_SUFFIX=-vulkan
+
+# Every VM runs on QEMU: --skip-qemu keeps the installed one, and needs one.
+if [[ $SKIP_QEMU == 1 && ! -x "$DATA/qemu/current/bin/$QEMU_BINARY" ]]; then
+  die "--skip-qemu keeps the installed QEMU, and none is installed ($DATA/qemu/current/bin/$QEMU_BINARY is missing): run this without --skip-qemu, which builds it"
+fi
 
 # ------------------------------------------------------------------ update
 
@@ -407,6 +414,27 @@ prune_qemu() {
   done
 }
 
+# kept_qemu DIR: why the QEMU build DIR, which --skip-qemu keeps, is not the
+# one this checkout builds, a line each. DIR's name ends in the commit it was
+# built at, then -vulkan for a macOS build on Vulkan. The build is QEMU's
+# source and the library and option ROM it links (cargo xtask dist): all of
+# the tree's crates but reims-ctl, which is its own workspace.
+kept_qemu() {
+  local built="${1##*/}" suffix="" arm=Metal
+  built="${built#*-*-}"
+  [[ $built == *-vulkan ]] && suffix=-vulkan arm=Vulkan
+  built="${built%-vulkan}"
+  if [[ $suffix != "$ARM_SUFFIX" ]]; then
+    echo "the installed QEMU runs on $arm, not GPU_ARM=$GPU_ARM: run this without --skip-qemu to build it on $GPU_ARM"
+  fi
+  if ! git -C "$ROOT" cat-file -e "$built^{commit}" 2>/dev/null; then
+    echo "the installed QEMU was built at $built, which this checkout does not have: run this without --skip-qemu to build this checkout's"
+  elif ! git -C "$ROOT" diff --quiet "$built" HEAD -- vendor/qemu crates firmware xtask \
+    Cargo.toml Cargo.lock rust-toolchain.toml .cargo ':!crates/reims-ctl'; then
+    echo "the installed QEMU was built at $built, and QEMU or the library it links changed since: run this without --skip-qemu to build this checkout's"
+  fi
+}
+
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 if [[ $GPU_ARM == metal ]]; then DIST="$TARGET/dist"; else DIST="$TARGET/dist-vulkan"; fi
@@ -460,8 +488,8 @@ if [[ $SKIP_QEMU == 0 ]]; then
   prune_qemu "$DATA/qemu"
   QEMU_DIR="$DATA/qemu/$ID"
 else
-  QEMU_DIR="$(cd "$DATA/qemu/current" 2>/dev/null && pwd -P || true)"
-  [[ -n "$QEMU_DIR" ]] || warn "no QEMU installed yet: run this without --skip-qemu"
+  QEMU_DIR="$(cd "$DATA/qemu/current" && pwd -P)"
+  kept_qemu "$QEMU_DIR" | while read -r why; do warn "$why"; done
 fi
 
 # ------------------------------------------------------------------ reims-ctl
@@ -484,13 +512,13 @@ if [[ $OS == Darwin ]]; then
 EOF
   codesign -s - -f --entitlements "$ent" "$BIN" 2>/dev/null
 fi
-"$BIN" __record-install --repo "$ROOT" --qemu "${QEMU_DIR:-}" --commit "$COMMIT"
+"$BIN" __record-install --repo "$ROOT" --qemu "$QEMU_DIR" --commit "$COMMIT"
 
 echo
 printf '%sreims-ctl is installed.%s\n' "$green$bold" "$off"
 echo "  reims-ctl            the interactive interface: create, start and stop VMs"
 echo "  reims-ctl help       the same from a shell"
-[[ -n "${QEMU_DIR:-}" ]] && echo "  QEMU                 $QEMU_DIR"
+echo "  QEMU                 $QEMU_DIR"
 echo
 # By its full path, which works before PATH finds reims-ctl.
 echo "Check this host:"
