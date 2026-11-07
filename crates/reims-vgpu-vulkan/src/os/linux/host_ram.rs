@@ -11,6 +11,16 @@
 //!   the device's held pointer imports add to every submission's cost, or where it refuses the
 //!   chunk's pointer, and as long as one dma-buf holds there (`rt::HostRam::with_largest_dma_buf`);
 //!   by its pointer otherwise, and where the source refuses. Without udmabuf, by pointer alone.
+//!   **Measured** 2026-11-07, an x86-64 macOS 26 guest on the reims-vgpu device: CachyOS's
+//!   7.3.1 kernels answer `size_limit_mb` 2147483647 as they boot, and its 7.2.8 kernel the
+//!   default 64. Only the devices handed the RAM (below) use the source, and NVIDIA's driver
+//!   never asks it: on an RTX 5080 (7.2.8), whose held pointer imports cost a submission
+//!   nothing, the runtime took a 16 GiB guest's RAM by pointer, in 64 MiB chunks. A device that
+//!   takes views through dma-bufs (RADV) is not handed the RAM, as a chunk's dma-bufs pin its
+//!   pages, which then stay resident: handed the RAM, a Radeon 780M (RADV, 7.3.1) took a 16 GiB
+//!   guest's RAM in chunks of about 2.5 to 3 GiB, and 12.3 GiB of it was resident by the desktop
+//!   and at the end, where views alone kept 7.9 to 8.0 GiB by the desktop and 10.4 to 10.8 GiB at
+//!   the end.
 //!
 //! - **What is handed.** Each lease's ranges of the guest's RAM (`super::files`'s
 //!   `lease_guest_memory`): the host's own shared mappings of the files it named, writable, mapped
