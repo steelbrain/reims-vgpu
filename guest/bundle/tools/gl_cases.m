@@ -5,7 +5,9 @@
 //   gl_cases [-v] [CASE...]   runs the named cases (default all); -v prints each shader's info log
 // Each case prints "NAME: pass" or "NAME: FAIL (got r,g,b,a, want r,g,b,a)" (with the link log
 // where the program does not link), and the last line counts them. The cases run in a 4.1 core
-// context, except those named legacy-*, which run in a legacy one. It makes no window.
+// context, except those named legacy-*, which run in a legacy one. Those named msaa-* draw into a
+// framebuffer of 4 samples, resolved into the one read, and those named point-* draw points. It
+// makes no window.
 // Our own code.
 #define GL_SILENCE_DEPRECATION 1
 #import <Foundation/Foundation.h>
@@ -20,10 +22,13 @@ extern void glVertex2f(GLfloat, GLfloat);
 extern void glTexCoord2f(GLfloat, GLfloat);
 extern void glColor4f(GLfloat, GLfloat, GLfloat, GLfloat);
 extern void glEnable(GLenum);
+extern void glAlphaFunc(GLenum, GLfloat);
 #define GL_QUADS 0x0007
 #define GL_POLYGON 0x0009
 #define GL_POINT_SPRITE 0x8861
 #define GL_TEXTURE_2D_LEGACY 0x0DE1
+#define GL_ALPHA_TEST 0x0BC0
+#define GL_VERTEX_PROGRAM_TWO_SIDE 0x8643
 
 static BOOL gVerbose = NO;
 
@@ -214,6 +219,50 @@ static void setupClip(GLuint p) {
 	glEnable(GL_CLIP_DISTANCE0);
 }
 
+// A logic operation: the quad's codes XORed into the clear's.
+static void setupLogicOp(GLuint p) {
+	glEnable(GL_COLOR_LOGIC_OP);
+	glLogicOp(GL_XOR);
+}
+
+// The sample mask: two samples of four keep the quad's colour, so the resolve averages it with
+// the clear's.
+static void setupSampleMask(GLuint p) {
+	glEnable(GL_SAMPLE_MASK);
+	glSampleMaski(0, 0x3);
+}
+
+// Sample coverage of a half: two samples of four keep the quad's colour (where the coverage is
+// spread over a quad of pixels, two in each).
+static void setupSampleCoverage(GLuint p) {
+	glEnable(GL_SAMPLE_COVERAGE);
+	glSampleCoverage(0.5f, GL_FALSE);
+}
+
+// A point of the vertex function's size, its coordinates from the default upper-left origin.
+static void setupPointSize(GLuint p) {
+	glEnable(GL_PROGRAM_POINT_SIZE);
+}
+
+// A point of the vertex function's size, its coordinates from the lower-left origin.
+static void setupPointLowerLeft(GLuint p) {
+	glEnable(GL_PROGRAM_POINT_SIZE);
+	glPointParameteri(GL_POINT_SPRITE_COORD_ORIGIN, GL_LOWER_LEFT);
+}
+
+// Legacy alpha test: the quad's alpha of 0.25 fails a test of greater than 0.5, so the clear stays.
+static void setupAlphaTest(GLuint p) {
+	glEnable(GL_ALPHA_TEST);
+	glAlphaFunc(GL_GREATER, 0.5f);
+}
+
+// Legacy two-sided colour: the quad, wound clockwise here, is a back face, so it takes the back
+// colour.
+static void setupTwoSide(GLuint p) {
+	glEnable(GL_VERTEX_PROGRAM_TWO_SIDE);
+	glFrontFace(GL_CW);
+}
+
 // Legacy fixed function: no program, the 2x2 texture of setupTexture on unit 0, which the quad's
 // texture coordinate (0.75, 0.75) reads white.
 static void setupLegacyTexture(GLuint p) {
@@ -226,6 +275,10 @@ static void setupLegacyTexture(GLuint p) {
 
 #define VS41 "#version 410\nin vec2 p; out vec2 uv; void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.5, 1.0); }\n"
 #define FS41(body) "#version 410\nin vec2 uv; out vec4 o;\n" body
+// One point of 32 pixels centred at window (32, 24): the centre pixel's coordinate in it is
+// (0.516, 0.234) from the upper-left origin and (0.516, 0.766) from the lower-left.
+#define VSPOINT "#version 410\nin vec2 p; void main() { gl_PointSize = 32.0; gl_Position = vec4(0.0, -0.25, 0.5, 1.0); }\n"
+#define FSPOINT "#version 410\nout vec4 o; void main() { o = vec4(gl_PointCoord, 0.0, 1.0); }\n"
 
 static const Case kCases[] = {
     {"constant", VS41, FS41("void main() { o = vec4(0.25, 0.5, 0.75, 1.0); }"), NULL, 0, {64, 128, 191, 255}, 1},
@@ -284,11 +337,23 @@ static const Case kCases[] = {
      "#version 410\nin vec2 p; out float gl_ClipDistance[1]; void main() { gl_ClipDistance[0] = -p.x - 0.5; gl_Position = "
      "vec4(p, 0.5, 1.0); }\n",
      FS41("void main() { o = vec4(1.0); }"), setupClip, 0, {64, 128, 191, 255}, 1},
+    {"logicop", VS41, FS41("void main() { o = vec4(1.0, 1.0, 0.0, 0.0); }"), setupLogicOp, 0, {191, 127, 191, 255}, 0},
+    {"msaa-samplemask", VS41, FS41("void main() { o = vec4(1.0); }"), setupSampleMask, 0, {160, 192, 223, 255}, 2},
+    {"msaa-samplecoverage", VS41, FS41("void main() { o = vec4(1.0); }"), setupSampleCoverage, 0, {160, 192, 223, 255},
+     2},
+    {"point-size", VSPOINT, FSPOINT, setupPointSize, 0, {131, 60, 0, 255}, 2},
+    {"point-lowerleft", VSPOINT, FSPOINT, setupPointLowerLeft, 0, {131, 195, 0, 255}, 2},
     {"legacy-color", "#version 120\nattribute vec2 p; varying vec4 c; void main() { c = vec4(0.25, 0.5, 0.75, 1.0); gl_Position = vec4(p, 0.5, 1.0); }\n",
      "#version 120\nvarying vec4 c; void main() { gl_FragColor = c; }\n", NULL, 0, {64, 128, 191, 255}, 1},
     {"legacy-texture", "#version 120\nattribute vec2 p; varying vec2 uv; void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.5, 1.0); }\n",
      "#version 120\nuniform sampler2D t; varying vec2 uv; void main() { gl_FragColor = texture2D(t, vec2(0.75, 0.75)); }\n",
      setupTexture, 0, {255, 255, 255, 255}, 0},
+    {"legacy-alphatest", "#version 120\nattribute vec2 p; void main() { gl_Position = vec4(p, 0.5, 1.0); }\n",
+     "#version 120\nvoid main() { gl_FragColor = vec4(1.0, 1.0, 1.0, 0.25); }\n", setupAlphaTest, 0, {64, 128, 191, 255}, 0},
+    {"legacy-twoside",
+     "#version 120\nattribute vec2 p; void main() { gl_FrontColor = vec4(0.0, 1.0, 0.0, 1.0); gl_BackColor = vec4(1.0, "
+     "0.0, 0.0, 1.0); gl_Position = vec4(p, 0.5, 1.0); }\n",
+     "#version 120\nvoid main() { gl_FragColor = gl_Color; }\n", setupTwoSide, 0, {255, 0, 0, 255}, 0},
     {"legacy-fixed-quads", NULL, NULL, setupLegacyTexture, GL_QUADS, {255, 255, 255, 255}, 0},
     {"legacy-fixed-polygon", NULL, NULL, NULL, GL_POLYGON, {255, 128, 0, 255}, 1},
 };
@@ -313,6 +378,7 @@ static CGLContextObj makeContext(BOOL legacy) {
 
 static BOOL runCase(const Case *c) {
 	const BOOL legacy = strncmp(c->name, "legacy-", 7) == 0;
+	const GLsizei samples = strncmp(c->name, "msaa-", 5) == 0 ? 4 : 0;
 	CGLContextObj ctx = makeContext(legacy);
 	if (!ctx) {
 		printf("%s: FAIL (no context)\n", c->name);
@@ -331,6 +397,20 @@ static BOOL runCase(const Case *c) {
 	glBindRenderbuffer(GL_RENDERBUFFER, ds);
 	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 64, 64);
 	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, ds);
+	// An msaa-* case draws into a framebuffer of 4 samples, resolved into the one above at the end.
+	GLuint msfb = 0, mscolour = 0, msds = 0;
+	if (samples) {
+		glGenFramebuffers(1, &msfb);
+		glBindFramebuffer(GL_FRAMEBUFFER, msfb);
+		glGenRenderbuffers(1, &mscolour);
+		glBindRenderbuffer(GL_RENDERBUFFER, mscolour);
+		glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, 64, 64);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, mscolour);
+		glGenRenderbuffers(1, &msds);
+		glBindRenderbuffer(GL_RENDERBUFFER, msds);
+		glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, 64, 64);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, msds);
+	}
 	glViewport(0, 0, 64, 64);
 	glClearColor(64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1);
 	glClearDepth(1);
@@ -371,7 +451,7 @@ static BOOL runCase(const Case *c) {
 		glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
 		glEnableVertexAttribArray(0);
 		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
-		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		glDrawArrays(strncmp(c->name, "point-", 6) == 0 ? GL_POINTS : GL_TRIANGLE_STRIP, 0, 4);
 		if (strcmp(c->name, "stencil") == 0) {
 			// The second draw passes where the stencil is 1: everywhere the first drew.
 			glStencilFunc(GL_EQUAL, 1, 0xff);
@@ -395,6 +475,12 @@ static BOOL runCase(const Case *c) {
 		glVertex2f(1, 1);
 		glVertex2f(-1, 1);
 		glEnd();
+	}
+	if (samples) {
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, msfb);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+		glBlitFramebuffer(0, 0, 64, 64, 0, 0, 64, 64, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		glBindFramebuffer(GL_FRAMEBUFFER, fb);
 	}
 	glFinish();
 	uint8_t got[4] = {0};
