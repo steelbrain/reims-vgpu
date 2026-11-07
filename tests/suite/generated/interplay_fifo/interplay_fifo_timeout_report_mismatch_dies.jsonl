@@ -1,4 +1,4 @@
-# interplay_fifo_timeout_report_mismatch_dies: A barrier blocked for 2 s posts a stamp-wait report (from DeviceCore::wait_stamp), which looks every waiting stampIndex up as a child id and asserts that the child there has that stampIndex (DeviceCore::fifo_for_stamp_index). Child 1 on stampIndex 3 blocks on slot 6, and child 3 exists on stampIndex 5: the host dies when the report runs, with no MMIO write to cause it (docs/testing.md, section 7.4: "read, not yet locked").
+# interplay_fifo_timeout_report_mismatch_dies: A barrier blocked for 2 s posts a stamp-wait report (from DeviceCore::wait_stamp), which looks every waiting stampIndex up as a child id and asserts that the child there has that stampIndex (DeviceCore::fifo_for_stamp_index). Child 1 on stampIndex 3 blocks on slot 6, and child 3 exists on stampIndex 5: the host dies when the report runs, with no MMIO write to cause it (docs/testing.md, section 7.4).
 {"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_gpa": "0x40008000", "stamp_slots": 7, "watchdog_s": 30}
 {"off": "0x1034", "op": "mmio_w", "val": "0xf5"}
 {"off": "0x101c", "op": "mmio_w", "val": "0x10001"}
