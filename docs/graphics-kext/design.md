@@ -124,9 +124,14 @@ Stages:
      freeing a block never changes the VM's memory map. It is ordinary
      cached memory, and the guest maps it write-back. Uncached loads cost
      79-138 ns against 2-4 ns cached, and AMD CPUs apply the guest's choice.
-   - The region is private anonymous memory of QEMU's process, and the host
-     side runs in that process: RADV refuses to import a memfd's or any shared
-     mapping (measured on the 780M and the RX 7900 XTX).
+   - The region is memory of QEMU's process, and the host side runs in that
+     process. On Linux it is a shared mapping of a memfd of the library's
+     (`reims-vgpu-vulkan`'s `RegionMemory`): RADV refuses a pointer to a
+     memfd's or any shared mapping (measured on the 780M and the RX 7900 XTX),
+     and imports dma-bufs of each block's pages instead, which cost a
+     submission the same at any size, where amdgpu walks every page of every
+     pointer import in each submission; NVIDIA imports it by pointer. On macOS
+     it is private anonymous memory.
    - Blocks are few and large, each imported into Vulkan once, and the guest
      sub-allocates buffers inside them. RADV lists every import in every
      submission, and an import costs 17-43 us plus about 16 us per MiB of

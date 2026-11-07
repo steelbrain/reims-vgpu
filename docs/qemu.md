@@ -323,8 +323,9 @@ is its transport:
   `CB_SUBMITTED` and raising the interrupt inside the call, and wakes the
   queue's thread, which takes the buffer either way.
 - **BAR 2**, 64-bit and prefetchable: the library's region
-  (`rvg_graphics_device_region`), 1 GiB of private anonymous memory of
-  QEMU's process, as two RAM regions over the one mapping: the control
+  (`rvg_graphics_device_region`), 1 GiB of memory of QEMU's process (on
+  Linux a shared mapping of a memfd of the library's, on macOS private
+  anonymous memory), as two RAM regions over the one mapping: the control
   rings, below `RVG_GRAPHICS_ALLOCATIONS_OFFSET` (0x400000), and the guest's
   allocations from there. Only the allocations are dirty-logged
   (`DIRTY_MEMORY_VGA`), where the guest's scanout lies; the library asks at

@@ -358,9 +358,10 @@ pub unsafe extern "C" fn rvg_graphics_device_release(device: *mut RvgGraphicsDev
 }
 
 /// The device's region: its first byte, page-aligned, and, through `size` where it is not NULL,
-/// its size, a power of two. The host maps it into the guest as BAR 2, once; it is private
-/// anonymous memory of the host's process, zeroed, mapped while the device lives
-/// (rvg_graphics_device_release). Calls back: never.
+/// its size, a power of two. The host maps it into the guest as BAR 2, once; it is memory of the
+/// host's process (on Linux a shared mapping of a memfd of the library's, on macOS private
+/// anonymous memory), zeroed, mapped while the device lives (rvg_graphics_device_release). Calls
+/// back: never.
 ///
 /// # Safety
 /// `device` is a live graphics device handle; `size` is NULL or writable.
