@@ -1338,6 +1338,13 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	return static_cast<MTLTextureUsage>(rgfxAnsweredUsage(_desc.usage));
 }
 
+- (uint32_t)swizzleKey
+{
+	const MTLTextureSwizzleChannels s = self.swizzle;
+	return static_cast<uint32_t>(s.red) | static_cast<uint32_t>(s.green) << 8 |
+	       static_cast<uint32_t>(s.blue) << 16 | static_cast<uint32_t>(s.alpha) << 24;
+}
+
 - (MTLTextureSwizzleChannels)swizzle
 {
 	return MTLTextureSwizzleChannelsMake(

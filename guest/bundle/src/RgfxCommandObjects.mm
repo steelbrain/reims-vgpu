@@ -1641,6 +1641,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	return _readyToPost.load(std::memory_order_acquire);
 }
 
+- (void)commitAndHold
+{
+	[self commit];
+}
+
 - (void)commit
 {
 	// Commit is once: a second, or a commitAndWaitUntilSubmitted after it, ends the process with
@@ -2771,6 +2776,12 @@ RGFX_LOG_UNRECOGNIZED
 - (void)setFrontFacingWinding:(MTLWinding)frontFacingWinding
 {
 	_enc->renderSetFrontFacingWinding(static_cast<uint64_t>(frontFacingWinding));
+}
+- (void)setDepthCleared
+{
+}
+- (void)setStencilCleared
+{
 }
 - (void)setTriangleFillMode:(MTLTriangleFillMode)fillMode
 {

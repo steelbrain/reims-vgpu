@@ -7279,6 +7279,75 @@ static std::vector<std::pair<uint16_t, std::vector<uint8_t>>> postedOps(TestRing
 	return ops;
 }
 
+// The SPI the system's GL renderer sends that Metal's x86 devices answer (measured: macOS 26.7.1,
+// an AMD 5300M and an Intel 630): a texture's swizzleKey packs its swizzle, red lowest, for the
+// texture and each view of it; a render encoder's setDepthCleared and setStencilCleared post
+// nothing; a buffer's commitAndHold commits it, posting what commit posts.
+void test_gl_renderer_spi()
+{
+	QueueFixture f;
+	@autoreleasepool {
+		int calls = 0;
+		f.ids.setResourceIdSource(&oneChunk, &calls);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+		RgfxTexture *target = [RgfxTexture textureWithDescriptor:td
+		                                                    heap:RGFX_OBJ_NONE
+		                                              heapOffset:0
+		                                                  device:nil
+		                                              serializer:&f.ser];
+		CHECK(target != nil && [target swizzleKey] == 0x05040302u);
+		RgfxTexture *rrr1 = (RgfxTexture *)[target
+		    newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                      textureType:MTLTextureType2D
+		                           levels:NSMakeRange(0, 1)
+		                           slices:NSMakeRange(0, 1)
+		                          swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleRed,
+		                                                                MTLTextureSwizzleRed, MTLTextureSwizzleOne)];
+		RgfxTexture *bgra = (RgfxTexture *)[target
+		    newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                      textureType:MTLTextureType2D
+		                           levels:NSMakeRange(0, 1)
+		                           slices:NSMakeRange(0, 1)
+		                          swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+		                                                                MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+		RgfxTexture *plain = (RgfxTexture *)[target newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
+		CHECK(rrr1 != nil && [rrr1 swizzleKey] == 0x01020202u);
+		CHECK(bgra != nil && [bgra swizzleKey] == 0x05020304u);
+		CHECK(plain != nil && [plain swizzleKey] == 0x05040302u);
+		drainRing(f.control);
+		// The same pass with and without the marks, committed the two ways: the same ops.
+		auto pass = [&](bool marks, bool hold) {
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = target;
+			id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+			RgfxRenderCommandEncoder *e = (RgfxRenderCommandEncoder *)[cb renderCommandEncoderWithDescriptor:rp];
+			[e setRenderPipelineState:handle(7)];
+			if (marks) {
+				[e setDepthCleared];
+				[e setStencilCleared];
+			}
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[e endEncoding];
+			if (hold)
+				[(RgfxCmdBuffer *)cb commitAndHold];
+			else
+				[cb commit];
+			CHECK(cb.status >= MTLCommandBufferStatusCommitted);
+			drainRing(f.control);
+			return postedOps(f.submit);
+		};
+		const auto plainOps = pass(false, false);
+		CHECK(!plainOps.empty());
+		CHECK(pass(true, false) == plainOps);
+		CHECK(pass(false, true) == plainOps);
+	}
+}
+
 // A render encoder sends the object and mesh stages' commands and the mesh draws where the host
 // makes mesh pipelines, and drops them elsewhere (an encoder of no device, a unit test's, makes
 // none until told).
@@ -15135,6 +15204,7 @@ int main(int argc, char **argv)
 		test_command_buffer_event_ops();
 		test_message_reserve();
 		test_parallel_sub_encoders_start_from_defaults();
+		test_gl_renderer_spi();
 		test_mesh_commands_follow_the_host();
 		test_parallel_sub_encoders_on_threads();
 		test_command_buffer_keeps_once();

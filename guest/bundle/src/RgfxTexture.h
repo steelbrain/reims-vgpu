@@ -47,6 +47,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface RgfxTexture : RgfxResource <MTLTexture>
 
+/// MTLTextureSPI's `swizzleKey`, which the system's GL renderer asks of every texture it samples
+/// or draws to: the four channels of `swizzle`, one byte each, red lowest, as Metal's x86 devices
+/// answer it (measured: macOS 26.7.1, an AMD 5300M and an Intel 630: 0x05040302 for the default
+/// swizzle, of any pixel format, and 0x01020202 for a view of red, red, red, one).
+- (uint32_t)swizzleKey;
+
 /// Creates a texture of shape `descriptor`. When `heap` is RGFX_OBJ_NONE the
 /// texture is device-placed (a GPU address is picked); otherwise it lies at
 /// `heapOffset` in the heap `heap`. A resource id is picked either way, and given

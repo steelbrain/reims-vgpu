@@ -170,6 +170,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// builds); the two names would collide in ObjC++.
 @interface RgfxCmdBuffer : RgfxResource <MTLCommandBuffer>
 
+/// MTLCommandBufferSPI's `commitAndHold`, which the system's GL renderer sends for the buffers of
+/// its preprocessing encoders: Metal's x86 devices commit the buffer and hold its submission until
+/// the queue's next commit (measured: macOS 26.7.1, an AMD 5300M and an Intel 630: Committed for
+/// 2 s, then Completed with the next buffer). The buffer commits as `commit` commits it: it
+/// runs in the same order, only no later than Metal's.
+- (void)commitAndHold;
+
 /// Made by the queue (see RgfxCommandQueue): binds the buffer to its queue, its
 /// guest-picked `cbObjId`, the queue's submission `ring`, and whether it retains its
 /// references. Constructs the RgfxEncoder over `ring` for (queue, cb).
@@ -216,6 +223,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// command buffer when it vends the encoder; `endEncoding` writes RGFX_OP_ENCODER_END
 /// — unless this encoder belongs to a parallel render encoder, which owns the framing.
 @interface RgfxRenderCommandEncoder : NSObject <MTLRenderCommandEncoder>
+/// The render encoder SPI the system's GL renderer sends after it clears the depth or the stencil
+/// attachment with a draw, which Metal's x86 encoders answer (measured: macOS 26.7.1, an AMD 5300M
+/// and an Intel 630, with no change to the pass): marks for the driver's own clear state, which the
+/// device does not keep. Each posts nothing.
+- (void)setDepthCleared;
+- (void)setStencilCleared;
 /// `enc` is the command buffer's RgfxEncoder (borrowed); `emitEnd` is NO for a
 /// sub-encoder of a parallel render encoder (the parallel encoder writes the END). The object
 /// and mesh stages' commands are sent where `device` makes mesh pipelines
