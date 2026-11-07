@@ -1233,7 +1233,8 @@ own, with `MTL_DEBUG_LAYER` unset, at the device's `newTextureWithDescriptor:`, 
 Automatic heap's of 256 MiB, and a Shared buffer's `newTextureWithDescriptor:offset:bytesPerRow:`.
 Each case changes one or more things of a 64 x 64 2D BGRA8Unorm texture of one level and sample,
 usage ShaderRead, in Private storage (Shared over the buffer): its size, type, depth, array
-length, levels, samples, format, usage or storage.
+length, levels, samples, format, usage or storage. Its last 13 cases (11-07) are RGBA32Float
+textures of 2 GiB to 8 TiB, at the device's creator.
 
 Every creator runs the descriptor's validation first,
 `-[MTLTextureDescriptorInternal validateWithDevice:]`. Where it fails, one assertion, "Texture
@@ -1275,6 +1276,23 @@ Depth24Unorm_Stencil8 and X24_Stencil8, which the AMD makes, and over a buffer: 
 ends the process at a depth other than 1, 0 included, before the validation, with "Buffer
 texture: cannot support depth > 1." (`validateTextureDescriptor`), where the AMD lists the
 validation's depth lines.
+
+The device's creator answers nil, past the validation, for a texture of more bytes than the
+device makes, on all three; creating one that is made commits no memory (the process's footprint
+stays under 3 MB). By the bytes `heapTextureSizeAndAlignWithDescriptor:` answers, which here are
+the texture's own:
+
+| texture | AMD (`maxBufferLength` 3208642560, `recommendedMaxWorkingSetSize` 4278190080) | Intel 630 (2147483648, 1610612736) |
+|---|---|---|
+| 16384 x 8192 (2 GiB) | made | made |
+| 16384 x 8193 (2 GiB and a row) | made | nil |
+| 3 and 4 GiB (2D), 8 and 16 GiB (2DArrays of 16384 x 16384) | made | nil |
+| 20, 24, 28, 32 and 64 GiB; a 2DArray of 2048 slices (8 TiB); a 3D 2048 a side (128 GiB) | nil | nil |
+
+The Intel answers nil past its `maxBufferLength`, as it does a buffer and a heap past it (Q8);
+the AMD makes one of 16 GiB, just over 4 times its working set, and none of 20 GiB. The M3 Max
+under macOS 27.0.1 answers nil for the 8 TiB and the 128 GiB textures (the smaller ones were not
+asked of it, as its memory is the desktop's).
 
 What our stack does:
 - *(class 3)* Every texture creator runs one copy of the validation before it sends the host

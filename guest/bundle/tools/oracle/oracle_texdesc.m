@@ -10,13 +10,18 @@
 // buffer of 64 MiB, at offset 0, rows the texture's row of 4-byte texels rounded up to 256).
 // The descriptor of a case starts as a 64 x 64 2D BGRA8Unorm texture, one level, one sample,
 // depth and array length 1, usage ShaderRead, Private storage (Shared over a buffer), and changes
-// what the case's name says. Each case prints:
+// what the case's name says. The header gives the device's recommendedMaxWorkingSetSize and
+// maxBufferLength. Each case prints:
 //   case N NAME | CREATOR | asked: fmt F type T WxHxD a A m M s S usage U storage S'
 //   case N NAME => made: fmt F type T WxHxD a A m M s S usage U storage S | nil
+// before which a made texture's line gives its allocatedSize, the device's currentAllocatedSize
+// and the process's footprint, and a size case's at the device's creator the size and alignment
+// heapTextureSizeAndAlignWithDescriptor: answers;
 // and, where the case ends the process, Metal's words (its stderr is the child's stdout), then
 //   => case N died on signal X | exited X
 // Build: see README.md.
 #import "oracle_common.h"
+#include <mach/mach.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -173,6 +178,22 @@ static const struct Case kCases[] = {
     {"w16385.d2", BGRA8, T2D, 16385, 1, 2, 1, 1, 1, kDefault, kDefault, 1},
     {"depth32f.shared.ms", MTLPixelFormatDepth32Float, MS, 64, 64, 1, 1, 1, 4,
      MTLTextureUsageRenderTarget, MTLStorageModeShared, 0},
+    // RGBA32Float textures within every rule, of 2 GiB to 8 TiB, around and past the device's
+    // memory, at which the device's creator answers nil for the bytes alone.
+    CB("size.2g", MTLPixelFormatRGBA32Float, T2D, 16384, 8192, 1, 1),
+    CB("size.2g+row", MTLPixelFormatRGBA32Float, T2D, 16384, 8193, 1, 1),
+    CB("size.3g", MTLPixelFormatRGBA32Float, T2D, 16384, 12288, 1, 1),
+    CB("size.4g", MTLPixelFormatRGBA32Float, T2D, 16384, 16384, 1, 1),
+    CB("size.8g", MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1, 2),
+    CB("size.16g", MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1, 4),
+    CB("size.20g", MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1, 5),
+    CB("size.24g", MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1, 6),
+    CB("size.28g", MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1, 7),
+    CB("size.32g", MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1, 8),
+    CB("size.64g", MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1, 16),
+    CB("size.3d.128g", MTLPixelFormatRGBA32Float, MTLTextureType3D, 2048, 2048, 2048, 1),
+    CB("size.2darray.8t", MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1,
+       2048),
 };
 enum { kCaseCount = sizeof kCases / sizeof kCases[0] };
 
@@ -217,6 +238,12 @@ static int runCase(id<MTLDevice> d, int creator, const char *creatorName, int n)
 	       (unsigned long)td.arrayLength, (unsigned long)td.mipmapLevelCount,
 	       (unsigned long)td.sampleCount, (unsigned long)td.usage,
 	       (unsigned long)td.storageMode);
+	// The size cases' bytes as Metal places them, which makes nothing.
+	if (creator == kDevice && !strncmp(c->name, "size.", 5)) {
+		const MTLSizeAndAlign sa = [d heapTextureSizeAndAlignWithDescriptor:td];
+		printf("case %d %s heapTextureSizeAndAlign: size %llu align %llu\n", n, c->name,
+		       (unsigned long long)sa.size, (unsigned long long)sa.align);
+	}
 	fflush(stdout);
 	id<MTLTexture> t = nil;
 	id<MTLHeap> heap = nil;
@@ -251,6 +278,16 @@ static int runCase(id<MTLDevice> d, int creator, const char *creatorName, int n)
 	if (t == nil) {
 		printf("case %d %s => nil\n", n, c->name);
 	} else {
+		task_vm_info_data_t vm;
+		mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+		const unsigned long long footprint =
+		    task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS
+		        ? vm.phys_footprint
+		        : 0;
+		printf("case %d %s allocatedSize %llu, device's allocated size then %llu, footprint "
+		       "%llu\n",
+		       n, c->name, (unsigned long long)t.allocatedSize,
+		       (unsigned long long)d.currentAllocatedSize, footprint);
 		printf("case %d %s => made: fmt %lu type %lu %lux%lux%lu a %lu m %lu s %lu usage 0x%lx "
 		       "storage %lu\n",
 		       n, c->name, (unsigned long)t.pixelFormat, (unsigned long)t.textureType,
@@ -287,7 +324,12 @@ int main(int argc, char **argv)
 			return 2;
 		return runCase(oracle_device(argv[1]), creator, argv[2], n);
 	}
-	oracle_header("oracle_texdesc", oracle_device(argv[1]));
+	id<MTLDevice> device = oracle_device(argv[1]);
+	oracle_header("oracle_texdesc", device);
+	printf("# recommendedMaxWorkingSetSize %llu, maxBufferLength %llu, currentAllocatedSize %llu\n",
+	       (unsigned long long)device.recommendedMaxWorkingSetSize,
+	       (unsigned long long)device.maxBufferLength,
+	       (unsigned long long)device.currentAllocatedSize);
 	fflush(stdout);
 	for (int n = 0; n < kCaseCount; n++) {
 		char index[16];
