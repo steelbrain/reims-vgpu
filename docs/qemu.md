@@ -374,10 +374,12 @@ is its transport:
   4 GiB (`-machine q35,...,max-ram-below-4g=1G`): with q35's default of
   2 GiB there, BAR 2 gets no address and the kext finds no region
   (docs/graphics-kext/design.md, the region; `REGION_SIZE` in
-  `crates/reims-graphics/src/device.rs`). `reims-ctl`'s VMs do not have the
-  device, so a host that adds it adds the option too. Where it does not, the
-  device's realize warns, naming the option: on a PC machine (one with the
-  `max-ram-below-4g` property) with RAM at 1 GiB.
+  `crates/reims-graphics/src/device.rs`). `reims-ctl` gives its x86-64 VMs
+  the device by default and adds the option with it
+  (`crates/reims-ctl/src/qemu.rs`). Another host that adds the device adds
+  the option too. Where it does not, the device's realize warns, naming the
+  option: on a PC machine (one with the `max-ram-below-4g` property) with
+  RAM at 1 GiB.
 
 `CONFIG_REIMS_GRAPHICS` is set for every target when the library is found,
 not only the HVF and KVM targets `MAC_PVG` is limited to. A Mac builds it
