@@ -2557,6 +2557,32 @@ fn the_driver_takes_private_render_state_where_offered() {
     );
 }
 
+/// A host that offers `OPENCL_MODE` lets the driver take it: the driver's write reads back
+#[test]
+fn the_driver_takes_opencl_mode_where_offered() {
+    struct OpenCl;
+    impl Host for OpenCl {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+            false
+        }
+        fn features(&self) -> u64 {
+            u64::from(RGFX_FEATURE_OPENCL_MODE)
+        }
+    }
+    let rig = Rig::with_host(Box::new(OpenCl));
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_LO.into(),
+        RGFX_FEATURE_OPENCL_MODE,
+    );
+    assert_eq!(
+        rig.device.mmio_read(RGFX_REG_DRIVER_FEATURES_LO.into()),
+        RGFX_FEATURE_OPENCL_MODE
+    );
+}
+
 /// `HOST_TIME_LO` and `_HI` read the host's monotonic clock, the one each `VBLANK` is stamped on,
 /// once the driver took `HOST_TIME`: a read of `HI`, `LO` and `HI` again lies between two of the
 /// host's own. They read 0 before the driver took it, and again after a reset
