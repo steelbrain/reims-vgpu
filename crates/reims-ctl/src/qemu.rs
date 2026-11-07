@@ -23,7 +23,8 @@
 //! `q35-x86_64` follows the command line the x86-64 guests were measured on (docs/qemu.md):
 //! RAM as a shared memfd, which the library on Linux requires; the keyboard and tablet on a
 //! qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's interrupt
-//! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller, which
+//! transfers under GPU load and its input freezes, with the host's USB devices the VM's settings
+//! give it beside them ([`crate::usb`]); fixed PCI addresses (the AHCI controller, which
 //! holds OpenCore's image, the installer and, on SATA, the system disk, at slot 2, where
 //! OpenCore's boot entries name it; on NVMe, the system disk's controller at slot 10,
 //! [`DiskController`]); `isa-applesmc` with Apple's SMC key, [`OSK`];
@@ -74,12 +75,12 @@
 //! false`) has neither, and its guest decodes, encodes and scales video in software.
 //!
 //! The xHCI controller has seven ports (`p2=7,p3=7`), each taking a USB 2 and a USB 3 device:
-//! the keyboard, the tablet, and four more at their own speeds. Its 14 ports are within the 15
-//! macOS numbers on one controller. QEMU's default of four leaves two beside the keyboard and
-//! the tablet, and where a device takes the last free port QEMU chains a full-speed hub there
-//! first (hw/usb/bus.c, `usb_claim_port`), on which a high-speed device does not attach: one
-//! more device at its own speed. With as many USB 2 ports as USB 3 ones no port is USB 2
-//! alone: QEMU gives a device the first free port, and one freed goes to the back of the line.
+//! the keyboard, the tablet, and up to [`crate::vm::USB_DEVICES_MAX`] host devices, at their
+//! own speeds. Its 14 ports are within the 15 macOS numbers on one controller. QEMU's default of
+//! four would leave two: where a device takes the last free port, QEMU chains a full-speed hub
+//! there first (hw/usb/bus.c, `usb_claim_port`), on which a high-speed device does not attach,
+//! so one port stays free. With as many USB 2 ports as USB 3 ones no port is USB 2 alone: QEMU
+//! gives a device the first free port, and one freed goes to the back of the line.
 //!
 //! `vmapple-arm64` follows scripts/internal/run_vmapple.sh, with the video devices besides.
 
@@ -359,6 +360,9 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         "-device",
         "usb-tablet,id=tablet,bus=xhci.0",
     ]);
+    for u in &c.usb {
+        push(&["-device", &crate::usb::device_arg(u)?]);
+    }
     if c.audio.enabled {
         push(&["-audiodev", &audiodev(vm, ctx)]);
         push(&[
@@ -598,6 +602,7 @@ mod tests {
                 }),
                 vmapple: None,
                 extra_env: BTreeMap::new(),
+                usb: vec![],
             },
         }
     }
@@ -694,6 +699,43 @@ mod tests {
         assert!(!a.iter().any(|x| x.contains("installer")), "no installer");
         assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
         assert!(!inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+    }
+
+    /// The host's USB devices a VM is given are on its xHCI controller after the keyboard and
+    /// the tablet, each by its IDs, and by its port where it was chosen beside a twin.
+    #[test]
+    fn usb_devices_are_passed_through_after_the_keyboard_and_tablet() {
+        let mut vm = q35_vm();
+        vm.config.usb = vec![
+            UsbDevice {
+                id: "1050:0407".into(),
+                port: None,
+                name: "Yubico YubiKey".into(),
+            },
+            UsbDevice {
+                id: "0403:6001".into(),
+                port: Some("3-2.1".into()),
+                name: "FTDI FT232R".into(),
+            },
+        ];
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        let tablet = a
+            .iter()
+            .position(|x| x == "usb-tablet,id=tablet,bus=xhci.0")
+            .unwrap();
+        assert_eq!(
+            a[tablet + 1..tablet + 5],
+            [
+                "-device",
+                "usb-host,id=usb-1050-0407,bus=xhci.0,vendorid=0x1050,productid=0x0407",
+                "-device",
+                "usb-host,id=usb-0403-6001-3-2.1,bus=xhci.0,vendorid=0x0403,productid=0x6001,\
+                 hostbus=3,hostport=2.1",
+            ]
+        );
+        // None chosen: none passed through, on the same controller.
+        let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
+        assert!(!a.iter().any(|x| x.starts_with("usb-host")), "{a:?}");
     }
 
     /// With logs off the library still logs its warnings and device resets, which

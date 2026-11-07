@@ -18,7 +18,7 @@ use crate::update::Channel;
 use crate::vm::{
     DiskController, Graphics, Registry, Vm, format_mib, parse_resolution, parse_size_mib,
 };
-use crate::{install, logs, opencore, paths, reims_util, runtime, update};
+use crate::{install, logs, opencore, paths, reims_util, runtime, update, usb};
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -103,6 +103,13 @@ enum Overlay {
         options: Vec<(&'static str, Action)>,
         choice: usize,
     },
+    /// The host's USB devices, to give the VM `vm` or take back (usb.rs): `choice` is the
+    /// selected row of [`usb::rows`].
+    Usb {
+        vm: String,
+        devices: Vec<usb::HostDevice>,
+        choice: usize,
+    },
     /// A VM's menu, hanging from a cell: the one right-clicked, or the VM's name in the list.
     /// `all` holds every command, as Ctrl with Enter or the right click opens it.
     Menu {
@@ -145,6 +152,7 @@ enum VmCommand {
     Stop,
     PowerOff,
     Edit,
+    Usb,
     ShowCommand,
     ToggleLogs,
     ViewLogs,
@@ -155,12 +163,13 @@ enum VmCommand {
 
 impl VmCommand {
     /// Each with its key, in the menu's order.
-    const ALL: [(VmCommand, char); 11] = [
+    const ALL: [(VmCommand, char); 12] = [
         (VmCommand::Start, 's'),
         (VmCommand::View, 'v'),
         (VmCommand::Stop, 'x'),
         (VmCommand::PowerOff, 'K'),
         (VmCommand::Edit, 'e'),
+        (VmCommand::Usb, 'p'),
         (VmCommand::ShowCommand, 'c'),
         (VmCommand::ToggleLogs, 'l'),
         (VmCommand::ViewLogs, 'L'),
@@ -332,6 +341,10 @@ impl App {
     fn refresh_state(&mut self) {
         for r in &mut self.rows {
             r.pid = r.vm.as_ref().ok().and_then(runtime::pid);
+        }
+        // Devices plugged in or out show as they are.
+        if let Some(Overlay::Usb { devices, .. }) = &mut self.overlay {
+            *devices = usb::host_devices();
         }
         self.last_state = Instant::now();
     }
@@ -598,6 +611,11 @@ impl App {
                 at,
                 all,
             }) => self.menu_key(k, vm, choice, at, all),
+            Some(Overlay::Usb {
+                vm,
+                devices,
+                choice,
+            }) => self.usb_key(k, vm, devices, choice),
             None => self.main_key(k),
         }
         self.open_failed_form();
@@ -723,7 +741,7 @@ impl App {
             return;
         };
         let Some(row) = self.rows.get(i) else { return };
-        let Some(&(first, _)) = vm_menu(row, all).first() else {
+        let Some(&(first, _)) = vm_menu(row, all, self.host).first() else {
             return;
         };
         // The name shows on the VM's row, past the highlight symbol.
@@ -743,7 +761,7 @@ impl App {
         self.rows
             .iter()
             .find(|r| r.name == name)
-            .map(|r| vm_menu(r, all))
+            .map(|r| vm_menu(r, all, self.host))
             .unwrap_or_default()
     }
 
@@ -889,6 +907,7 @@ impl App {
             VmCommand::Stop => self.stop(false),
             VmCommand::PowerOff => self.ask_force_stop(),
             VmCommand::Edit => self.open_edit(),
+            VmCommand::Usb => self.open_usb(),
             VmCommand::ShowCommand => self.show_command(),
             VmCommand::ToggleLogs => self.toggle_logs(),
             VmCommand::ViewLogs => self.view_logs(),
@@ -1150,6 +1169,95 @@ impl App {
             options,
             choice: 1,
         });
+    }
+
+    /// Opens the selected VM's USB devices, where its host passes them through.
+    fn open_usb(&mut self) {
+        let Some(vm) = self.selected_vm() else { return };
+        if let Err(why) = usb_available(self.host, &vm) {
+            return self.say(&why, Level::Warn);
+        }
+        self.overlay = Some(Overlay::Usb {
+            vm: vm.config.name.clone(),
+            devices: usb::host_devices(),
+            choice: 0,
+        });
+    }
+
+    /// The rows of the USB devices' view of the VM named `vm`: the host's `devices`, each
+    /// with what of the VM's settings, as the list last read them, gives it.
+    fn usb_rows(&self, vm: &str, devices: &[usb::HostDevice]) -> Vec<usb::Row> {
+        let chosen = self
+            .rows
+            .iter()
+            .find(|r| r.name == vm)
+            .and_then(|r| r.vm.as_ref().ok())
+            .map(|vm| vm.config.usb.clone())
+            .unwrap_or_default();
+        usb::rows(&chosen, devices)
+    }
+
+    fn usb_key(
+        &mut self,
+        k: KeyEvent,
+        vm: String,
+        mut devices: Vec<usb::HostDevice>,
+        choice: usize,
+    ) {
+        let rows = self.usb_rows(&vm, &devices);
+        let last = rows.len().saturating_sub(1);
+        let mut choice = choice.min(last);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => choice = (choice + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                choice = choice.saturating_sub(1)
+            }
+            KeyCode::Home => choice = 0,
+            KeyCode::End => choice = last,
+            KeyCode::Char('r') => {
+                devices = usb::host_devices();
+                self.say("rescanned this host's USB devices", Level::Info);
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if let Some(row) = rows.get(choice) {
+                    self.toggle_usb(&vm, &devices, row);
+                }
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::Usb {
+            vm,
+            devices,
+            choice,
+        });
+    }
+
+    /// Gives the VM named `name` the device of `row`, or takes it back: at once while it runs
+    /// (usb::apply).
+    fn toggle_usb(&mut self, name: &str, devices: &[usb::HostDevice], row: &usb::Row) {
+        let Some(vm) = self
+            .rows
+            .iter()
+            .find(|r| r.name == name)
+            .and_then(|r| r.vm.as_ref().ok())
+            .cloned()
+        else {
+            return;
+        };
+        match usb::apply(&vm, |cur| usb::toggle(cur, devices, row)) {
+            Ok((_, said)) => {
+                let failed = said
+                    .iter()
+                    .any(|s| s.contains("failed") || s.contains("can't"));
+                self.say(
+                    &said.join("; "),
+                    if failed { Level::Warn } else { Level::Ok },
+                );
+            }
+            Err(e) => self.say(&format!("{e:#}"), Level::Error),
+        }
+        let _ = self.reload();
     }
 
     fn toggle_logs(&mut self) {
@@ -1892,6 +2000,15 @@ impl App {
                 options,
                 choice,
             }) => draw_confirm(f, area, title, body, options, *choice),
+            Some(Overlay::Usb {
+                vm,
+                devices,
+                choice,
+            }) => {
+                let rows = self.usb_rows(vm, devices);
+                let running = self.rows.iter().any(|r| &r.name == vm && r.pid.is_some());
+                draw_usb(f, area, vm, running, &rows, devices, *choice);
+            }
             // A menu whose VM has left the list closes.
             Some(Overlay::Menu {
                 vm,
@@ -2036,6 +2153,7 @@ impl App {
                     for w in incompatible
                         .into_iter()
                         .chain(runtime::warnings(vm, self.host))
+                        .chain(usb::problems(vm))
                     {
                         lines.push(Line::from(""));
                         lines.push(Line::from(Span::styled(w, Style::new().fg(Color::Yellow))));
@@ -2098,7 +2216,7 @@ fn key_hints() -> Line<'static> {
 /// A VM's menu: what can be done with it as it is now, each with its label. A VM whose
 /// settings do not load can only be deleted. With `all`, every command, whatever the VM's
 /// state: one that cannot be done now says why on the status line.
-fn vm_menu(row: &VmRow, all: bool) -> Vec<(VmCommand, &'static str)> {
+fn vm_menu(row: &VmRow, all: bool, host: Host) -> Vec<(VmCommand, &'static str)> {
     let vm = row.vm.as_ref().ok();
     if vm.is_none() && !all {
         return vec![(VmCommand::Delete, "Delete…")];
@@ -2114,6 +2232,10 @@ fn vm_menu(row: &VmRow, all: bool) -> Vec<(VmCommand, &'static str)> {
                 VmCommand::Stop => ("Stop", running),
                 VmCommand::PowerOff => ("Power off…", running),
                 VmCommand::Edit => ("Edit settings…", true),
+                VmCommand::Usb => (
+                    "USB devices…",
+                    vm.is_some_and(|vm| usb_available(host, vm).is_ok()),
+                ),
                 VmCommand::ShowCommand => ("Show QEMU command", true),
                 VmCommand::ToggleLogs => match vm.map(|vm| vm.config.logs.enabled) {
                     Some(true) => ("Turn logs off", true),
@@ -2128,6 +2250,21 @@ fn vm_menu(row: &VmRow, all: bool) -> Vec<(VmCommand, &'static str)> {
             (all || now).then_some((c, label))
         })
         .collect()
+}
+
+/// Whether the VM can be given the host's USB devices: an x86-64 VM on a Linux host. Else why
+/// not, to say.
+fn usb_available(host: Host, vm: &Vm) -> Result<(), String> {
+    if host.os != Os::Linux {
+        return Err(usb::MAC_HOST.into());
+    }
+    if vm.config.q35.is_none() {
+        return Err(format!(
+            "{}: USB passthrough is for x86-64 VMs on Linux hosts",
+            vm.name()
+        ));
+    }
+    Ok(())
 }
 
 fn gpu_id(g: &crate::vm::Gpu) -> String {
@@ -2453,6 +2590,9 @@ An x86-64 VM runs reims-vgpu's own GPU device unless its settings choose another
               hardware; or QEMU's VMware SVGA, one display with no GPU acceleration, in
               QEMU's own window. Displays, resolution, HiDPI, refresh rate and video
               acceleration are apple-gfx's
+  p           give it this host's USB devices (Linux): Space gives the selected one to
+              the guest or takes it back, at once while the VM runs; a device you gave it
+              joins the guest when it is plugged in. More in reims-ctl usb --help
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and
@@ -2578,6 +2718,112 @@ fn draw_confirm(
         spans.push(Span::raw("  "));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), o);
+}
+
+/// Draws the USB devices' view of the VM `vm`: each of `rows` with a box checked where the VM
+/// has the device, its name, IDs and notes, `choice` highlighted, and what lets QEMU open the
+/// devices this user can't.
+fn draw_usb(
+    f: &mut Frame,
+    area: Rect,
+    vm: &str,
+    running: bool,
+    rows: &[usb::Row],
+    devices: &[usb::HostDevice],
+    choice: usize,
+) {
+    let width = area.width.saturating_sub(4).min(100);
+    let inner_w = width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let when = if running {
+        "at once, while it runs"
+    } else {
+        "from its next start"
+    };
+    lines.push(
+        Line::from(format!(
+            "This host's USB devices. One you give {vm} is the guest's, {when}, until the VM \
+             stops or you take it back; one not plugged in joins the guest when it is."
+        ))
+        .dim(),
+    );
+    lines.push(Line::from(""));
+    let first_row = lines.len();
+    if rows.is_empty() {
+        lines.push(Line::from(
+            "No USB devices are plugged into this host, other than hubs.",
+        ));
+    }
+    let name_w = rows
+        .iter()
+        .map(|r| r.name().chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(inner_w.saturating_sub(24).clamp(12, 44));
+    let mut closed = false;
+    for (i, r) in rows.iter().enumerate() {
+        let mut name: String = r.name().chars().take(name_w).collect();
+        if r.name().chars().count() > name_w {
+            name.pop();
+            name.push('…');
+        }
+        let notes = r.notes(devices);
+        closed |= r.device.as_ref().is_some_and(|d| !d.usable());
+        let text = format!(
+            "{} [{}] {name:<name_w$}  {}{}",
+            if i == choice { "›" } else { " " },
+            if r.chosen.is_some() { "x" } else { " " },
+            r.id(),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", notes.join(", "))
+            }
+        );
+        lines.push(if i == choice {
+            Line::from(text).style(Style::new().fg(Color::Black).bg(Color::Cyan))
+        } else if r.device.is_none() {
+            Line::from(text).dim()
+        } else {
+            Line::from(text)
+        });
+    }
+    lines.push(Line::from(""));
+    if closed {
+        lines.push(
+            Line::from(format!("QEMU can't open what you can't: {}.", usb::fix()))
+                .style(Style::new().fg(Color::Yellow)),
+        );
+    }
+    lines.push(
+        Line::from(format!(
+            "Space give or take back · r rescan · Esc close · up to {} devices a VM",
+            crate::vm::USB_DEVICES_MAX
+        ))
+        .dim(),
+    );
+    // Rows wrap to the popup's width; the highlighted one stays in sight.
+    let rows_of = |l: &Line| (l.width().max(1)).div_ceil(inner_w.max(1)) as u16;
+    let need: u16 = lines.iter().map(rows_of).sum::<u16>() + 2;
+    let height = need.min(area.height);
+    let popup = area.centered(Constraint::Length(width), Constraint::Length(height));
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(Line::from(format!(" {vm}: USB devices ")).bold())
+        .border_style(Style::new().fg(Color::Cyan));
+    let body = block.inner(popup);
+    let above: u16 = lines[..first_row + choice.min(rows.len().saturating_sub(1))]
+        .iter()
+        .map(rows_of)
+        .sum();
+    let scroll = (above + 1).saturating_sub(body.height);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        popup,
+    );
 }
 
 /// Draws a VM's menu below the cell `at`, or above it where the screen has no room below,
@@ -2810,17 +3056,37 @@ mod tests {
         }
     }
 
+    const LINUX: Host = Host {
+        os: Os::Linux,
+        arch: Arch::X86_64,
+    };
+
     #[test]
     fn a_vms_menu_holds_what_can_be_done_with_it_now() {
         use VmCommand::*;
-        let commands = |r: &VmRow| vm_menu(r, false).iter().map(|it| it.0).collect::<Vec<_>>();
+        let commands = |r: &VmRow| {
+            vm_menu(r, false, LINUX)
+                .iter()
+                .map(|it| it.0)
+                .collect::<Vec<_>>()
+        };
         let every = [ShowCommand, ToggleLogs, ViewLogs, Report];
-        let stopped = [&[Start, Edit][..], &every, &[UpdateOpencore, Delete]].concat();
+        let stopped = [&[Start, Edit, Usb][..], &every, &[UpdateOpencore, Delete]].concat();
         assert_eq!(commands(&vm_row("t", true)), stopped);
         let mut running = vm_row("t", true);
         running.pid = Some(1);
-        let running_menu = [&[View, Stop, PowerOff, Edit][..], &every].concat();
+        let running_menu = [&[View, Stop, PowerOff, Edit, Usb][..], &every].concat();
         assert_eq!(commands(&running), running_menu);
+        // A Mac passes no USB device through.
+        let mac = Host {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        };
+        assert!(
+            !vm_menu(&vm_row("t", true), false, mac)
+                .iter()
+                .any(|it| it.0 == Usb)
+        );
         // Only x86-64 VMs boot OpenCore.
         let arm64 = [&[Start, Edit][..], &every, &[Delete]].concat();
         assert_eq!(commands(&vm_row("t", false)), arm64);
@@ -2831,21 +3097,93 @@ mod tests {
         assert_eq!(commands(&broken), [Delete]);
 
         let mut row = vm_row("t", true);
-        assert!(vm_menu(&row, false).contains(&(ToggleLogs, "Turn logs on")));
+        assert!(vm_menu(&row, false, LINUX).contains(&(ToggleLogs, "Turn logs on")));
         row.vm.as_mut().unwrap().config.logs.enabled = true;
-        assert!(vm_menu(&row, false).contains(&(ToggleLogs, "Turn logs off")));
+        assert!(vm_menu(&row, false, LINUX).contains(&(ToggleLogs, "Turn logs off")));
 
         // The menu of everything holds every command, whatever the VM's state.
         let each = VmCommand::ALL.map(|c| c.0);
         for row in [&vm_row("t", true), &running, &vm_row("t", false), &broken] {
-            let all = vm_menu(row, true);
+            let all = vm_menu(row, true, LINUX);
             assert_eq!(all.iter().map(|it| it.0).collect::<Vec<_>>(), each);
             // Each item is labelled as in the menu of what can be done now.
-            for it in vm_menu(row, false) {
+            for it in vm_menu(row, false, LINUX) {
                 assert!(all.contains(&it), "{it:?}");
             }
         }
-        assert!(vm_menu(&broken, true).contains(&(ToggleLogs, "Turn logs on or off")));
+        assert!(vm_menu(&broken, true, LINUX).contains(&(ToggleLogs, "Turn logs on or off")));
+    }
+
+    /// p opens a VM's USB devices: a device it was given that is not plugged in shows checked,
+    /// after the host's devices, and Space takes it back, in its settings as they are now. A
+    /// Mac host says why it has none.
+    #[test]
+    fn the_usb_view_takes_back_a_device_not_plugged_in() {
+        let env = crate::testenv::Env::new("tui-usb");
+        let dir = env.root.join("vms/t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut vm = vm_row("t", true).vm.unwrap();
+        vm.dir = dir.clone();
+        vm.config.usb = vec![crate::vm::UsbDevice {
+            id: "fffe:0001".into(),
+            port: None,
+            name: "Gadget Away".into(),
+        }];
+        vm.save().unwrap();
+        let mut reg = Registry::default();
+        reg.add("t", &dir).unwrap();
+        reg.save().unwrap();
+
+        let mut app = App::with(Host {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        });
+        app.reload().unwrap();
+        press(&mut app, [KeyCode::Char('p')]);
+        assert!(app.overlay.is_none());
+        assert!(app.status.as_ref().unwrap().0.contains("Linux host"));
+
+        let mut app = App::with(LINUX);
+        app.reload().unwrap();
+        press(&mut app, [KeyCode::Char('p')]);
+        let Some(Overlay::Usb { devices, .. }) = &app.overlay else {
+            panic!("no USB view");
+        };
+        let devices = devices.clone();
+        let rows = app.usb_rows("t", &devices);
+        let away = rows.len() - 1;
+        assert_eq!(rows[away].name(), "Gadget Away");
+        assert!(rows[away].chosen.is_some() && rows[away].device.is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let at = find(&buf, buf.area, "[x] Gadget Away").expect("the device's row");
+        let row: String = (at.x..buf.area.right())
+            .map(|x| buf[(x, at.y)].symbol().to_string())
+            .collect();
+        assert!(row.contains("fffe:0001  not plugged in"), "{row}");
+
+        // Edited meanwhile, as by reims-ctl set: the change keeps it.
+        let mut now = Vm::load(&dir).unwrap();
+        now.config.cpus = 3;
+        now.save().unwrap();
+        press(&mut app, [KeyCode::End, KeyCode::Char(' ')]);
+        let saved = Vm::load(&dir).unwrap().config;
+        assert!(saved.usb.is_empty(), "{:?}", saved.usb);
+        assert_eq!(saved.cpus, 3);
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("Gadget Away is no longer chosen"),
+            "{:?}",
+            app.status.as_ref().map(|s| &s.0)
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Usb { .. })));
+        press(&mut app, [KeyCode::Esc]);
+        assert!(app.overlay.is_none());
     }
 
     /// An x86-64 VM's edit form offers its disk's controller as its settings have it, and saves

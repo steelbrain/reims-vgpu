@@ -438,6 +438,14 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
             );
         }
     }
+    // QEMU's configure leaves usb-host out where it finds no libusb, as an install before
+    // scripts/install-ctl.sh named it did.
+    if !vm.config.usb.is_empty() && crate::install::has_device(&qemu, "usb-host") == Some(false) {
+        bail!(
+            "this QEMU has no usb-host, which passes USB devices through: reims-ctl update builds \
+             one with it"
+        );
+    }
     Ok(Ctx {
         host,
         qemu,

@@ -101,6 +101,18 @@ pub enum Cmd {
     },
     /// List the GPUs a VM can be given (Linux)
     Gpus,
+    /// List this host's USB devices, and give a VM some or take them back (Linux)
+    #[command(after_help = usb_help())]
+    Usb {
+        /// The VM whose devices to show or change (without one, this host's devices)
+        name: Option<String>,
+        /// Give the VM this device (repeatable)
+        #[arg(long, value_name = "DEVICE")]
+        add: Vec<String>,
+        /// Take this device back from the VM (repeatable)
+        #[arg(long, value_name = "DEVICE")]
+        remove: Vec<String>,
+    },
     /// Print the end of a VM's QEMU log, or its serial console's
     Logs {
         name: String,
@@ -172,6 +184,42 @@ machine, and the VM keeps its OVMF variables, which hold its boot entries. Its b
 OpenCore's picker, is carried over unless --boot-selection gives it; hidden, OpenCore boots \
 macOS's startup disk at once. Whatever else was changed in the old image is not carried over. The \
 VM must be stopped; reims-ctl update installs the reims-util this reims-ctl needs.";
+
+/// `usb --help`'s account of passthrough, with the udev rule the install adds.
+fn usb_help() -> String {
+    format!(
+        "\
+DEVICE is a device's number in the list, its ID (1050:0407), its port (3-2.1) or a word of its \
+name; --add takes the ID of a device that isn't plugged in, too.
+
+A device a VM has is the guest's while the VM runs: QEMU takes it from this host's drivers, and \
+macOS in the guest drives it, as a Mac drives a device plugged into it. It comes back to this \
+host when the VM stops, or when you take it back. While the VM runs, --add and --remove attach \
+and detach it at once; either way the VM keeps it for its next start. A VM takes up to {max} \
+devices.
+
+A device is known by its vendor and product IDs, so the VM has it in any port. Where this host \
+has two devices with the same IDs, the one you give is known by its port too, and the VM has it \
+only in that port. A device that isn't plugged in joins the guest when it is, and one unplugged \
+comes back when it is plugged in again.
+
+QEMU opens the device's file in /dev/bus/usb, which only root may write unless a udev rule \
+says otherwise. scripts/install-ctl.sh, which reims-ctl update runs, adds {file}, which gives \
+USB devices other than hubs to the kvm group and to the user at this host's screen:
+
+  {rule}
+
+Over SSH, without a session at the screen, you need to be in the kvm group (sudo usermod -aG \
+kvm $USER, then log in again).
+
+macOS hosts have no USB passthrough: macOS gives a USB device that one of its drivers holds, \
+almost any device, only to a program running as root or holding an entitlement Apple grants VM \
+apps.",
+        max = vm::USB_DEVICES_MAX,
+        file = crate::usb::UDEV_RULE_FILE,
+        rule = crate::usb::UDEV_RULE,
+    )
+}
 
 /// `--flag`, `--flag=true`, `--flag false`.
 fn bool_arg() -> clap::Arg {
@@ -405,7 +453,10 @@ pub fn main(cli: Cli) -> Result<i32> {
         } => delete(&name, keep_files, yes)?,
         Cmd::Start { name } => {
             let vm = Registry::load()?.open(&name)?;
-            for w in runtime::warnings(&vm, host) {
+            for w in runtime::warnings(&vm, host)
+                .into_iter()
+                .chain(crate::usb::problems(&vm))
+            {
                 eprintln!("warning: {w}");
             }
             let pid = runtime::start(&vm, host)?;
@@ -475,6 +526,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             );
         }
         Cmd::Gpus => gpus(host),
+        Cmd::Usb { name, add, remove } => usb(host, name.as_deref(), &add, &remove)?,
         Cmd::Logs {
             name,
             lines,
@@ -939,6 +991,19 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             }
         },
     );
+    if !c.usb.is_empty() {
+        add(
+            "usb",
+            c.usb
+                .iter()
+                .map(|u| match u.name.as_str() {
+                    "" => u.id.clone(),
+                    n => format!("{n} ({})", u.id),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
     add(
         "logs",
         if c.logs.enabled {
@@ -1175,6 +1240,115 @@ fn gpus(host: Host) {
     println!("Give a VM one with: reims-ctl set NAME --gpu NUMBER");
 }
 
+/// `reims-ctl usb`: this host's USB devices, or a VM's choice of them, changed by `add` and
+/// `remove` first.
+fn usb(host: Host, name: Option<&str>, add: &[String], remove: &[String]) -> Result<()> {
+    use crate::usb;
+    if host.os != crate::host::Os::Linux {
+        bail!("{}", usb::MAC_HOST);
+    }
+    let devices = usb::host_devices();
+    let Some(name) = name else {
+        if !add.is_empty() || !remove.is_empty() {
+            bail!("name the VM to give the devices to: reims-ctl usb NAME --add DEVICE");
+        }
+        if devices.is_empty() {
+            println!("No USB devices are plugged into this host, other than hubs.");
+            return Ok(());
+        }
+        for (i, r) in usb::rows(&[], &devices).iter().enumerate() {
+            println!("{}", usb_line(i, None, r, &devices));
+        }
+        println!("Give a VM one with: reims-ctl usb NAME --add NUMBER");
+        return Ok(());
+    };
+    let mut vm = Registry::load()?.open(name)?;
+    if !add.is_empty() || !remove.is_empty() {
+        // Each named in the list as it was, then turned over in the settings as they are.
+        let rows = usb::rows(&vm.config.usb, &devices);
+        let mut picks = Vec::new();
+        // A device not plugged in, given by its IDs.
+        let mut absent = Vec::new();
+        for (arg, on) in add
+            .iter()
+            .map(|a| (a, true))
+            .chain(remove.iter().map(|a| (a, false)))
+        {
+            let found = usb::find(&rows, arg);
+            let by_id = vm::UsbDevice {
+                id: arg.trim().to_ascii_lowercase(),
+                port: None,
+                name: String::new(),
+            };
+            let r = match found {
+                Ok(i) => &rows[i],
+                Err(_) if on && by_id.ids().is_ok() => {
+                    absent.push(by_id);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match (r.chosen.is_some(), on) {
+                (true, true) => println!("{name}: {} has it already", r.name()),
+                (false, false) => println!("{name}: {} isn't the VM's", r.name()),
+                _ => picks.push(r.clone()),
+            }
+        }
+        if !picks.is_empty() || !absent.is_empty() {
+            let (saved, said) = usb::apply(&vm, |cur| {
+                let mut c = picks
+                    .iter()
+                    .fold(cur.to_vec(), |c, r| usb::toggle(&c, &devices, r));
+                for u in &absent {
+                    if !c.contains(u) {
+                        c.push(u.clone());
+                    }
+                }
+                c
+            })?;
+            for s in said {
+                println!("{s}");
+            }
+            vm = saved;
+        }
+    }
+    let rows = usb::rows(&vm.config.usb, &devices);
+    if rows.is_empty() {
+        println!("No USB devices are plugged into this host, other than hubs.");
+        return Ok(());
+    }
+    for (i, r) in rows.iter().enumerate() {
+        println!("{}", usb_line(i, Some(r.chosen.is_some()), r, &devices));
+    }
+    if add.is_empty() && remove.is_empty() {
+        println!(
+            "Give {name} one with: reims-ctl usb {name} --add NUMBER; take one back with --remove NUMBER"
+        );
+    }
+    Ok(())
+}
+
+/// A line of `usb`'s list: its number, whether the VM has it, its name, IDs and notes.
+fn usb_line(
+    i: usize,
+    chosen: Option<bool>,
+    r: &crate::usb::Row,
+    devices: &[crate::usb::HostDevice],
+) -> String {
+    let mark = match chosen {
+        Some(true) => "[x] ",
+        Some(false) => "[ ] ",
+        None => "",
+    };
+    let mut line = format!("{:>2}. {mark}{}  [{}]", i + 1, r.name(), r.id());
+    let notes = r.notes(devices);
+    if !notes.is_empty() {
+        line.push_str("  ");
+        line.push_str(&notes.join(", "));
+    }
+    line
+}
+
 fn doctor(host: Host) -> Result<i32> {
     let mut bad = 0;
     let mut line = |ok: bool, what: &str, detail: String| {
@@ -1306,6 +1480,53 @@ fn doctor(host: Host) -> Result<i32> {
                         .join("; ")
                 },
             );
+            // USB passthrough: QEMU's usb-host, and the devices this user may open, which
+            // fail the check only where a VM is given USB devices.
+            let devices = crate::usb::host_devices();
+            let closed: Vec<String> = devices
+                .iter()
+                .filter(|d| !d.usable())
+                .map(|d| d.file().display().to_string())
+                .collect();
+            let used = Registry::load().is_ok_and(|reg| {
+                reg.vms
+                    .iter()
+                    .filter_map(|e| Vm::load(&e.dir).ok())
+                    .any(|vm| !vm.config.usb.is_empty())
+            });
+            let usb_host = install::qemu_binary(profile)
+                .ok()
+                .and_then(|q| install::has_device(&q, "usb-host"));
+            let (ok, detail) = if usb_host == Some(false) {
+                (
+                    !used,
+                    "this QEMU has no usb-host, which passes USB devices through: reims-ctl \
+                     update builds one with it"
+                        .to_string(),
+                )
+            } else if devices.is_empty() {
+                (true, "no devices plugged in, other than hubs".to_string())
+            } else if closed.is_empty() {
+                (
+                    true,
+                    format!(
+                        "{} to pass through (reims-ctl usb)",
+                        plural(devices.len(), "device")
+                    ),
+                )
+            } else {
+                (
+                    !used,
+                    format!(
+                        "you can't open {} of the {} plugged in ({}): {}",
+                        closed.len(),
+                        plural(devices.len(), "device"),
+                        closed.join(", "),
+                        crate::usb::fix()
+                    ),
+                )
+            };
+            line(ok, "usb", detail);
             let session = std::env::var_os("WAYLAND_DISPLAY").is_some()
                 || std::env::var_os("DISPLAY").is_some();
             line(
@@ -1357,6 +1578,15 @@ fn doctor(host: Host) -> Result<i32> {
         }
     }
     Ok(if bad == 0 { 0 } else { 1 })
+}
+
+/// `n` of `what`: 1 device, 2 devices.
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
 }
 
 #[cfg(test)]

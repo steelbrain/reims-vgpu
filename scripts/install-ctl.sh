@@ -308,6 +308,30 @@ else
     uncopied=$((maps > 24576 ? (maps - 24576) / 256 : 0))
     say "vm.max_map_count is $maps: on an NVIDIA GPU, past about $uncopied MiB of a new VM's $((vm_mib / 1024)) GiB the GPU gets copies of its memory, which is slower; sudo sysctl -w vm.max_map_count=$raise, and a file in /etc/sysctl.d to keep it, avoids them"
   fi
+  # USB passthrough (reims-ctl usb): QEMU opens a USB device's file in
+  # /dev/bus/usb, which only root may write unless a udev rule says otherwise.
+  # This one gives USB devices other than hubs to the kvm group, over SSH too,
+  # and to the user at the host's screen (uaccess, which a file sorting before
+  # systemd's 73-seat-late.rules sets). reims-ctl's usb::UDEV_RULE is the same
+  # line, which its tests check.
+  usb_rule_file=/etc/udev/rules.d/70-reims-ctl-usb.rules
+  usb_rule='SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{bDeviceClass}!="09", GROUP="kvm", MODE="0664", TAG+="uaccess"'
+  if ! grep -qsxF "$usb_rule" "$usb_rule_file"; then
+    say "A VM can be given this host's USB devices once QEMU, running as you, may open them"
+    if ask "Add the udev rule $usb_rule_file, giving USB devices other than hubs to the kvm group and to you at this host's screen, with sudo?"; then
+      printf '# reims-ctl: USB devices for VMs (reims-ctl usb --help)\n%s\n' "$usb_rule" |
+        sudo tee "$usb_rule_file" >/dev/null
+      # Applied to the devices plugged in now, as to those plugged in later.
+      sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb ||
+        warn "udev did not reload its rules: unplug a USB device and plug it in again, or restart, before giving it to a VM"
+    else
+      warn "without the rule, a VM can be given only the USB devices you may open; reims-ctl usb --help shows it"
+    fi
+  fi
+  # Unless /dev/udmabuf's group, kvm, was the one named above.
+  if [[ ${group:-} != kvm ]] && getent group kvm >/dev/null && ! id -nG | tr ' ' '\n' | grep -qx kvm; then
+    say "You're not in the kvm group: over SSH, where a desktop session's access doesn't apply, add yourself to it (sudo usermod -aG kvm \$USER) to give VMs USB devices there"
+  fi
 fi
 
 if ! command -v cargo >/dev/null 2>&1 && [[ -x "$HOME/.cargo/bin/cargo" ]]; then

@@ -20,6 +20,7 @@ mod runtime;
 mod testenv;
 mod tui;
 mod update;
+mod usb;
 mod view;
 mod vm;
 mod vz;

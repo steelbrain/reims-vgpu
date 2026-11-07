@@ -120,6 +120,30 @@ fn backends(qemu: &Path, option: &'static str) -> Vec<String> {
     list
 }
 
+/// What `qemu -device NAME,help` answered, by binary and device.
+type Probes = HashMap<(PathBuf, &'static str), Option<bool>>;
+
+/// Whether `qemu` was built with the device `name` (`-device NAME,help` lists its properties,
+/// and fails for a device it does not have), cached per binary; None where it does not run.
+pub fn has_device(qemu: &Path, name: &'static str) -> Option<bool> {
+    static CACHE: OnceLock<Mutex<Probes>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (qemu.to_path_buf(), name);
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return *v;
+    }
+    let has = std::process::Command::new(qemu)
+        .args(["-device", &format!("{name},help")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
+        .map(|s| s.success());
+    cache.lock().unwrap().insert(key, has);
+    has
+}
+
 /// The audio backend to use where the VM names none: the host's native one, among those built.
 pub fn default_audio_backend(available: &[String]) -> String {
     let wanted: &[&str] = if cfg!(target_os = "macos") {

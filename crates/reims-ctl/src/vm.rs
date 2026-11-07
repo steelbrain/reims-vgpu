@@ -57,6 +57,9 @@ pub struct VmConfig {
     pub vmapple: Option<Vmapple>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_env: BTreeMap<String, String>,
+    /// The host's USB devices the guest is given while the VM runs (usb.rs), x86-64 VMs'.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usb: Vec<UsbDevice>,
 }
 
 fn default_stop_timeout() -> u64 {
@@ -522,6 +525,78 @@ fn default_disk_port() -> u32 {
     3
 }
 
+/// A USB device of the host's that the guest is given while the VM runs (usb.rs): one
+/// `[[usb]]` table of the settings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsbDevice {
+    /// Its vendor and product IDs, `vvvv:pppp` in hex, as lsusb shows them: the device wherever
+    /// it is plugged in.
+    pub id: String,
+    /// Where it is plugged in, for a device chosen while the host had another with its IDs:
+    /// Linux's name for the port, such as `3-2.1` (bus 3, the hub on port 2, its port 1). With
+    /// it the guest gets only the device in that port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+    /// Its name when it was chosen, shown while it is not plugged in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+/// The most USB devices a VM takes: its xHCI controller's seven ports, less the keyboard's and
+/// the tablet's, and one left free, where QEMU would chain a full-speed hub (`qemu`'s module
+/// doc).
+pub const USB_DEVICES_MAX: usize = 4;
+
+impl UsbDevice {
+    /// Its vendor and product IDs.
+    pub fn ids(&self) -> Result<(u16, u16)> {
+        let bad = || {
+            anyhow::anyhow!(
+                "a USB device's ID is its vendor and product IDs in hex, as lsusb shows them, \
+                 such as 1050:0407, not {:?}",
+                self.id
+            )
+        };
+        let (v, p) = self.id.split_once(':').ok_or_else(bad)?;
+        let hex = |s: &str| {
+            (s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| u16::from_str_radix(s, 16).ok())
+                .flatten()
+        };
+        Ok((hex(v).ok_or_else(bad)?, hex(p).ok_or_else(bad)?))
+    }
+
+    /// Its port's bus and the port numbers from there, as QEMU's `hostbus` and `hostport` take
+    /// them: `3-2.1` is bus 3 and `2.1`.
+    pub fn bus_port(&self) -> Result<Option<(u32, &str)>> {
+        let Some(p) = self.port.as_deref() else {
+            return Ok(None);
+        };
+        parse_usb_port(p)
+            .map(Some)
+            .with_context(|| format!("{}: {:?} names no USB port", self.id, p))
+    }
+
+    pub fn check(&self) -> Result<()> {
+        self.ids()?;
+        self.bus_port()?;
+        Ok(())
+    }
+}
+
+/// A USB port's name as Linux gives it (`3-2.1`): its bus, and the port numbers from the bus's
+/// root hub, at most 7 (USB's tiers).
+pub fn parse_usb_port(p: &str) -> Option<(u32, &str)> {
+    let (bus, ports) = p.split_once('-')?;
+    let number = |s: &str| {
+        (1..=3).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) && !s.starts_with('0')
+    };
+    if !number(bus) || ports.split('.').count() > 7 || !ports.split('.').all(number) {
+        return None;
+    }
+    Some((bus.parse().ok()?, ports))
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Vmapple {
     /// The auxiliary storage Virtualization.framework made, relative to the VM's directory. QEMU
@@ -545,6 +620,7 @@ impl VmConfig {
             check_env_name(k)?;
         }
         check_mac(&self.network.mac)?;
+        self.check_usb()?;
         if self.profile != Profile::Q35X86_64 {
             match self.graphics() {
                 Graphics::AppleGfx => {}
@@ -567,6 +643,35 @@ impl VmConfig {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Refuses USB devices the VM cannot be given: on an arm64 VM, whose host is a Mac, any
+    /// ([`crate::usb::MAC_HOST`]); more than [`USB_DEVICES_MAX`]; one named twice, which QEMU
+    /// would refuse by its id; and an ID or port that names no device.
+    fn check_usb(&self) -> Result<()> {
+        if self.usb.is_empty() {
+            return Ok(());
+        }
+        if self.profile != Profile::Q35X86_64 {
+            bail!("{}: {}", self.name, crate::usb::MAC_HOST);
+        }
+        if self.usb.len() > USB_DEVICES_MAX {
+            bail!(
+                "{}: a VM takes {USB_DEVICES_MAX} USB devices at most, not {}",
+                self.name,
+                self.usb.len()
+            );
+        }
+        for (i, u) in self.usb.iter().enumerate() {
+            u.check().with_context(|| self.name.clone())?;
+            if self.usb[..i]
+                .iter()
+                .any(|o| crate::usb::qemu_id(o) == crate::usb::qemu_id(u))
+            {
+                bail!("{}: USB device {} is chosen twice", self.name, u.id);
+            }
+        }
+        Ok(())
     }
 
     /// How long `stop` waits for the guest to shut down before it powers the VM off: `None`
@@ -1124,7 +1229,94 @@ mod tests {
             }),
             vmapple: None,
             extra_env: BTreeMap::from([("A".into(), "b".into())]),
+            usb: vec![],
         }
+    }
+
+    /// The USB devices a VM is given are kept as `[[usb]]` tables, checked as QEMU takes them:
+    /// an x86-64 VM's, at most four, each once, by IDs and a port that name a device.
+    #[test]
+    fn usb_devices_are_checked_as_qemu_takes_them() {
+        let mut c = x86_64_config();
+        c.usb = vec![UsbDevice {
+            id: "1050:0407".into(),
+            port: Some("3-2.1".into()),
+            name: "Yubico YubiKey".into(),
+        }];
+        assert!(c.check().is_ok());
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+        assert!(
+            text.ends_with(
+                "\n[[usb]]\nid = \"1050:0407\"\nport = \"3-2.1\"\nname = \"Yubico YubiKey\"\n"
+            ),
+            "{text}"
+        );
+        let u = |id: &str, port: Option<&str>| UsbDevice {
+            id: id.into(),
+            port: port.map(String::from),
+            name: String::new(),
+        };
+        // Saved without a port or a name, it reads back so.
+        c.usb = vec![u("0403:6001", None)];
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.ends_with("\n[[usb]]\nid = \"0403:6001\"\n"), "{text}");
+        assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+        let refused = |c: &VmConfig| format!("{:#}", c.check().unwrap_err());
+        c.usb = (1..=5).map(|i| u(&format!("1050:000{i}"), None)).collect();
+        assert!(
+            refused(&c).contains("4 USB devices at most"),
+            "{}",
+            refused(&c)
+        );
+        c.usb.pop();
+        assert!(c.check().is_ok());
+        c.usb = vec![u("1050:0407", None), u("1050:0407", None)];
+        assert!(refused(&c).contains("chosen twice"), "{}", refused(&c));
+        // Two alike, each in its port, are two devices.
+        c.usb = vec![u("0403:6001", Some("1-4")), u("0403:6001", Some("2-1.2"))];
+        assert!(c.check().is_ok());
+        for bad in [
+            "1050:407",
+            "1050-0407",
+            "10500407",
+            "1050:04g7",
+            ":0407",
+            "1050:0407 ",
+        ] {
+            c.usb = vec![u(bad, None)];
+            assert!(refused(&c).contains("such as 1050:0407"), "{bad:?}");
+        }
+        for bad in [
+            "3",
+            "3-",
+            "0-1",
+            "3-0",
+            "3-2.1,x=y",
+            "3-2.1.1.1.1.1.1.1",
+            "3-02",
+            "a-1",
+        ] {
+            c.usb = vec![u("1050:0407", Some(bad))];
+            assert!(refused(&c).contains("names no USB port"), "{bad:?}");
+        }
+        assert_eq!(parse_usb_port("3-2.1"), Some((3, "2.1")));
+        assert_eq!(parse_usb_port("1-10"), Some((1, "10")));
+        // An arm64 VM, which runs on a Mac, takes none.
+        c.usb = vec![u("1050:0407", None)];
+        c.profile = Profile::VmappleArm64;
+        c.q35 = None;
+        c.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1,
+        });
+        assert!(
+            refused(&c).contains("needs a Linux host"),
+            "{}",
+            refused(&c)
+        );
+        c.usb.clear();
+        assert!(c.check().is_ok());
     }
 
     #[test]
