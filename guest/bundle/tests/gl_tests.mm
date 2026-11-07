@@ -4,7 +4,13 @@
 //     bitcode, is a library this Mac's Metal loads, with the one function of that name and stage,
 //     whose bitcode the bundle's reader finds as it was and reads to the same entry points; its
 //     header, tags and hash are the layout's; the same function gives the same bytes; the bitcode
-//     unwrapper takes LLVM's wrapper off, and leaves other bytes as they are;
+//     unwrapper takes LLVM's wrapper off, and leaves other bytes as they are; all of them written
+//     into one library are what this Mac's Metal loads too, each in its place as `metal` places a
+//     library's functions;
+//   - the .metallib of the kernels in the container Metal's compiler answers for OpenCL C source,
+//     over a container written here in the measured layout from that library's kernels, and over
+//     this Mac's own where its Metal compiles OpenCL C; other bytes, and a container that does not
+//     read whole, give none;
 //   - a function of GL IR (src/RgfxGLFunction.*): what it answers, as Metal's own function of GL IR
 //     does (measured: macOS 26.7.1), the IR it keeps, and the variants' return data;
 //   - the pipeline reflection (src/RgfxPipelineReflection.mm): a GL variant's return data is what
@@ -17,6 +23,8 @@
 // that on a device.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 
 #include <CommonCrypto/CommonDigest.h>
 
@@ -204,6 +212,267 @@ void test_metallib_writer()
 	CHECK(RgfxUnwrapBitcode(wrapped, &n) == wrapped + 20 && n == 12);
 	n = 8;
 	CHECK(RgfxUnwrapBitcode(wrapped, &n) == wrapped && n == 8);
+}
+
+// The stage functions of the RGFX_AIR_ARGUMENTS library, their bitcode unwrapped, as
+// RgfxWriteMetallib takes them; `lib` holds the bytes they point into.
+std::vector<RgfxMetallibFunction> stageFunctions(const std::vector<uint8_t> &lib)
+{
+	std::vector<RgfxMetallibFunction> out;
+	for (const Listed &f : functionsOf(lib)) {
+		const uint8_t *slice = nullptr;
+		size_t sliceSize = 0;
+		if (f.type > 2 || f.vers.size() != 8 ||
+		    !rgfxMetallibBitcode(lib.data(), lib.size(), f.name, &slice, &sliceSize))
+			continue;
+		RgfxMetallibFunction w;
+		w.name = f.name;
+		w.stage = static_cast<RgfxMetallibStage>(f.type);
+		std::memcpy(&w.airMajor, f.vers.data(), 2);
+		std::memcpy(&w.airMinor, f.vers.data() + 2, 2);
+		std::memcpy(&w.languageMajor, f.vers.data() + 4, 2);
+		std::memcpy(&w.languageMinor, f.vers.data() + 6, 2);
+		size_t n = sliceSize;
+		w.bitcode = RgfxUnwrapBitcode(slice, &n);
+		w.bitcodeLength = n;
+		out.push_back(w);
+	}
+	return out;
+}
+
+// What this Mac's Metal makes of `out`: its function names, sorted, with each one's type checked
+// against `fs`; empty where it does not load.
+NSArray<NSString *> *metalLoads(id<MTLDevice> metal, const std::vector<uint8_t> &out,
+                                const std::vector<RgfxMetallibFunction> &fs)
+{
+	dispatch_data_t data = dispatch_data_create(out.data(), out.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+	NSError *error = nil;
+	id<MTLLibrary> loaded = [metal newLibraryWithData:data error:&error];
+	if (loaded == nil) {
+		fprintf(stderr, "gl_tests: %s\n", error.localizedDescription.UTF8String);
+		return @[];
+	}
+	for (const RgfxMetallibFunction &f : fs) {
+		id<MTLFunction> fn = [loaded newFunctionWithName:@(f.name.c_str())];
+		CHECK(fn != nil && fn.functionType == metalTypeOf(static_cast<uint8_t>(f.stage)));
+	}
+	return [loaded.functionNames sortedArrayUsingSelector:@selector(compare:)];
+}
+
+NSArray<NSString *> *namesOf(const std::vector<RgfxMetallibFunction> &fs)
+{
+	NSMutableArray<NSString *> *names = [NSMutableArray array];
+	for (const RgfxMetallibFunction &f : fs)
+		[names addObject:@(f.name.c_str())];
+	return [names sortedArrayUsingSelector:@selector(compare:)];
+}
+
+// Each of `fs` in `out` in its place: its tags, its bitcode where its OFFT and MDSZ say, and the
+// bitcode the bundle's reader finds by its name.
+void checkPlaced(const std::vector<uint8_t> &out, const std::vector<RgfxMetallibFunction> &fs)
+{
+	const uint8_t *p = out.data();
+	CHECK(le64(p + 0x10) == out.size() && le64(p + 0x18) == 0x58);
+	const uint64_t section = le64(p + 0x48), sectionSize = le64(p + 0x50);
+	CHECK(section + sectionSize == out.size() && sectionSize % 16 == 0);
+	// The metadata: 8 bytes a function, each; the public after the list, UUID and ENDT.
+	CHECK(le64(p + 0x30) == 8 * fs.size() && le64(p + 0x40) == 8 * fs.size());
+	CHECK(le64(p + 0x18) + 4 + le64(p + 0x20) + 26 == le64(p + 0x28));
+	CHECK(le64(p + 0x38) == le64(p + 0x28) + 8 * fs.size() && section == le64(p + 0x38) + 8 * fs.size());
+	const std::vector<Listed> back = functionsOf(out);
+	CHECK(back.size() == fs.size());
+	uint64_t at = 0;
+	for (size_t i = 0; i < back.size() && i < fs.size(); i++) {
+		CHECK(back[i].name == fs[i].name && back[i].type == static_cast<uint8_t>(fs[i].stage));
+		CHECK(back[i].offt.size() == 24 && back[i].mdsz.size() == 8);
+		if (back[i].offt.size() != 24 || back[i].mdsz.size() != 8)
+			continue;
+		CHECK(le64(back[i].offt.data()) == 8 * i && le64(back[i].offt.data() + 8) == 8 * i);
+		CHECK(le64(back[i].offt.data() + 16) == at);
+		const uint64_t size = le64(back[i].mdsz.data());
+		CHECK(size % 16 == 0 && at + size <= sectionSize);
+		uint8_t hash[CC_SHA256_DIGEST_LENGTH];
+		CC_SHA256(p + section + at, static_cast<CC_LONG>(size), hash);
+		CHECK(back[i].hash == std::vector<uint8_t>(hash, hash + sizeof hash));
+		size_t n = static_cast<size_t>(size);
+		const uint8_t *bc = RgfxUnwrapBitcode(p + section + at, &n);
+		CHECK(n == fs[i].bitcodeLength && std::memcmp(bc, fs[i].bitcode, n) == 0);
+		const uint8_t *found = nullptr;
+		size_t foundSize = 0;
+		CHECK(rgfxMetallibBitcode(p, out.size(), fs[i].name, &found, &foundSize));
+		CHECK(found == p + section + at);
+		at += size;
+	}
+	CHECK(at == sectionSize);
+}
+
+void test_metallib_writer_several()
+{
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	if (path == nullptr)
+		return; // test_metallib_writer says so
+	const std::vector<uint8_t> lib = readFile(path);
+	const std::vector<RgfxMetallibFunction> fs = stageFunctions(lib);
+	CHECK(fs.size() >= 8);
+	const std::vector<uint8_t> out = RgfxWriteMetallib(fs);
+	CHECK(RgfxWriteMetallib(fs) == out);
+	checkPlaced(out, fs);
+	uint8_t key[32];
+	CHECK(rgfxLibraryKey(out.data(), out.size(), key));
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK([metalLoads(metal, out, fs) isEqualToArray:namesOf(fs)]);
+	// One function in a list is the library of that function alone.
+	CHECK(RgfxWriteMetallib(std::vector<RgfxMetallibFunction>{fs[0]}) == RgfxWriteMetallib(fs[0]));
+}
+
+void put32(std::vector<uint8_t> &d, uint32_t v)
+{
+	for (int i = 0; i < 4; i++)
+		d.push_back(static_cast<uint8_t>(v >> (8 * i)));
+}
+
+void set32(std::vector<uint8_t> &d, size_t at, uint32_t v)
+{
+	for (int i = 0; i < 4; i++)
+		d[at + i] = static_cast<uint8_t>(v >> (8 * i));
+}
+
+// A container in the layout RgfxMetallibOfClLibrary reads, as Metal's compiler answers it for
+// OpenCL C source (measured: macOS 26.7.1), of `fs`' modules under their names.
+std::vector<uint8_t> clContainer(const std::vector<RgfxMetallibFunction> &fs)
+{
+	std::vector<uint8_t> table = {8, 0, 2, 0, 1, 0, 1, 0};
+	put32(table, static_cast<uint32_t>(fs.size()));
+	std::vector<uint8_t> modules, names;
+	put32(names, static_cast<uint32_t>(fs.size()));
+	for (size_t i = 0; i < fs.size(); i++) {
+		const uint32_t entry[7] = {2, 0, static_cast<uint32_t>(8 * i), 0, static_cast<uint32_t>(modules.size()), 0, 0xfc};
+		for (uint32_t w : entry)
+			put32(table, w);
+		table.insert(table.end(), fs[i].name.begin(), fs[i].name.end());
+		table.push_back(0);
+		names.insert(names.end(), fs[i].name.begin(), fs[i].name.end());
+		names.push_back(0);
+		put32(modules, static_cast<uint32_t>(20 + fs[i].bitcodeLength));
+		const uint32_t wrapper[5] = {0x0B17C0DE, 0, 20, static_cast<uint32_t>(fs[i].bitcodeLength), 0xffffffffu};
+		for (uint32_t w : wrapper)
+			put32(modules, w);
+		modules.insert(modules.end(), fs[i].bitcode, fs[i].bitcode + fs[i].bitcodeLength);
+	}
+	const std::string defaultName("default.metallib");
+	std::vector<std::vector<uint8_t>> sections = {table,
+	                                              std::vector<uint8_t>(8 * fs.size(), 0),
+	                                              {},
+	                                              modules,
+	                                              {},
+	                                              std::vector<uint8_t>(defaultName.begin(), defaultName.end()),
+	                                              names,
+	                                              {0, 0, 0, 0},
+	                                              {0, 0, 0, 0},
+	                                              {0, 0, 0, 0}};
+	sections[5].push_back(0);
+	std::vector<uint8_t> out(0x68, 0);
+	out[0] = 1;
+	for (size_t i = 0; i < sections.size(); i++) {
+		const bool empty = sections[i].empty() && i == 4;
+		set32(out, 0x10 + 8 * i, empty ? 0 : static_cast<uint32_t>(out.size()));
+		set32(out, 0x14 + 8 * i, static_cast<uint32_t>(sections[i].size()));
+		out.insert(out.end(), sections[i].begin(), sections[i].end());
+	}
+	return out;
+}
+
+// Metal's compiler over OpenCL C source, as the GL renderer's cl2Metal compiles a compute program
+// (MTLCompileOptions' languageVersion 0x20002, sourceLanguage 1 and its additional arguments,
+// read from its code): the library's bytes, or none where this Mac's Metal makes none.
+NSData *clLibraryBytes(id<MTLDevice> metal, NSString *source, NSArray<NSString *> **names)
+{
+	MTLCompileOptions *o = [MTLCompileOptions new];
+	SEL language = sel_registerName("setSourceLanguage:"), arguments = sel_registerName("setAdditionalCompilerArguments:");
+	if (![o respondsToSelector:language] || ![o respondsToSelector:arguments])
+		return nil;
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(o, sel_registerName("setLanguageVersion:"), 0x20002);
+	((void (*)(id, SEL, NSInteger))objc_msgSend)(o, language, 1);
+	((void (*)(id, SEL, id))objc_msgSend)(o, arguments,
+	                                      @"-cl-single-precision-constant -fapplecl-lax-vector-conversions "
+	                                      @"-fapplecl-functional-casts -fapplecl-inline-definitions -cl-std=CL1.2");
+	NSError *error = nil;
+	id<MTLLibrary> lib = [metal newLibraryWithSource:source options:o error:&error];
+	SEL contents = sel_registerName("libraryDataContents");
+	if (lib == nil || ![(id)lib respondsToSelector:contents])
+		return nil;
+	*names = [lib.functionNames sortedArrayUsingSelector:@selector(compare:)];
+	return ((id(*)(id, SEL))objc_msgSend)(lib, contents);
+}
+
+void test_cl_library()
+{
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	if (path == nullptr)
+		return; // test_metallib_writer says so
+	const std::vector<uint8_t> lib = readFile(path);
+	std::vector<RgfxMetallibFunction> kernels;
+	for (RgfxMetallibFunction &f : stageFunctions(lib))
+		if (f.stage == RgfxMetallibStage::Kernel && kernels.size() < 2)
+			kernels.push_back(f);
+	CHECK(kernels.size() == 2);
+	if (kernels.size() != 2)
+		return;
+	kernels[0].name = "__entry_first";
+	kernels[1].name = "__entry_second";
+	const std::vector<uint8_t> container = clContainer(kernels);
+	std::vector<uint8_t> out;
+	CHECK(RgfxMetallibOfClLibrary(container.data(), container.size(), out));
+	// The writer's VERS: the container states none.
+	for (RgfxMetallibFunction &f : kernels) {
+		const RgfxMetallibFunction defaults;
+		f.airMajor = defaults.airMajor;
+		f.airMinor = defaults.airMinor;
+		f.languageMajor = defaults.languageMajor;
+		f.languageMinor = defaults.languageMinor;
+	}
+	CHECK(out == RgfxWriteMetallib(kernels));
+	checkPlaced(out, kernels);
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK([metalLoads(metal, out, kernels) isEqualToArray:namesOf(kernels)]);
+
+	// Bytes that are not the container, or a container that does not read whole, give none.
+	std::vector<uint8_t> none = {7};
+	CHECK(!RgfxMetallibOfClLibrary(lib.data(), lib.size(), none) && none == std::vector<uint8_t>{7});
+	CHECK(!RgfxMetallibOfClLibrary(container.data(), 0x60, none));
+	const auto broken = [&](size_t at, uint32_t value) {
+		std::vector<uint8_t> c = container;
+		set32(c, at, value);
+		return !RgfxMetallibOfClLibrary(c.data(), c.size(), none);
+	};
+	const size_t table = le32(container.data() + 0x10), modules = le32(container.data() + 0x28);
+	CHECK(broken(0, 2));                                   // the leading 1
+	CHECK(broken(0x10, static_cast<uint32_t>(container.size()))); // the table past the end
+	CHECK(broken(table, 0x00030008));                      // the table's head
+	CHECK(broken(table + 8, 0));                           // no functions
+	CHECK(broken(table + 12, 1));                          // a stage not a kernel
+	CHECK(broken(table + 12 + 16, 0x7fffffff));            // a module past the section
+	CHECK(broken(modules, 0x7fffffff));                    // a module's size past the section
+	CHECK(broken(modules + 4, 0x12345678));                // no wrapper
+	CHECK(broken(0x14, 12 + 28 + 5));                      // a table that ends inside a name
+	CHECK(none == std::vector<uint8_t>{7});
+
+	// This Mac's own container, where its Metal compiles OpenCL C (two kernels, one program).
+	NSArray<NSString *> *names = nil;
+	NSData *bytes = clLibraryBytes(metal,
+	                               @"__kernel void add(__global const float *a, __global float *b) {\n"
+	                               @"  b[get_global_id(0)] += a[get_global_id(0)];\n}\n"
+	                               @"__kernel void twice(__global float *b) { b[get_global_id(0)] *= 2.0f; }\n",
+	                               &names);
+	if (bytes.length < 4 || le32(static_cast<const uint8_t *>(bytes.bytes)) != 1) {
+		fprintf(stderr, "gl_tests: this Mac's Metal answers no OpenCL container (%lu bytes): the written one only\n",
+		        (unsigned long)bytes.length);
+		return;
+	}
+	out.clear();
+	CHECK(RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes.bytes), bytes.length, out));
+	CHECK([metalLoads(metal, out, {}) isEqualToArray:names]);
+	CHECK(names.count == 2);
 }
 
 void test_gl_function_answers()
@@ -449,6 +718,8 @@ void rgfxGLTests()
 {
 	@autoreleasepool {
 		test_metallib_writer();
+		test_metallib_writer_several();
+		test_cl_library();
 		test_gl_function_answers();
 		test_reflection_answers_return_data();
 		test_stage_metadata_normalized();

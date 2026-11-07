@@ -52,49 +52,61 @@ uint32_t le32(const uint8_t *p)
 
 } // namespace
 
-std::vector<uint8_t> RgfxWriteMetallib(const RgfxMetallibFunction &f)
+std::vector<uint8_t> RgfxWriteMetallib(const std::vector<RgfxMetallibFunction> &functions)
 {
-	std::vector<uint8_t> section;
-	put32(section, kWrapperMagic);
-	put32(section, 0);
-	put32(section, kWrapperBytes);
-	put32(section, static_cast<uint32_t>(f.bitcodeLength));
-	put32(section, 0xffffffffu);
-	put(section, f.bitcode, f.bitcodeLength);
-	while (section.size() % 16 != 0)
-		section.push_back(0);
+	// Each function's bitcode, wrapped and padded, in turn; its tag group places it.
+	std::vector<uint8_t> sections;
+	std::vector<uint8_t> groups;
+	uint64_t metadataAt = 0;
+	for (const RgfxMetallibFunction &f : functions) {
+		const uint64_t at = sections.size();
+		put32(sections, kWrapperMagic);
+		put32(sections, 0);
+		put32(sections, kWrapperBytes);
+		put32(sections, static_cast<uint32_t>(f.bitcodeLength));
+		put32(sections, 0xffffffffu);
+		put(sections, f.bitcode, f.bitcodeLength);
+		while (sections.size() % 16 != 0)
+			sections.push_back(0);
+		const uint64_t size = sections.size() - at;
+		uint8_t hash[CC_SHA256_DIGEST_LENGTH];
+		CC_SHA256(sections.data() + at, static_cast<CC_LONG>(size), hash);
+
+		std::vector<uint8_t> tags;
+		tag(tags, "NAME", f.name.c_str(), static_cast<uint16_t>(f.name.size() + 1));
+		const uint8_t type = static_cast<uint8_t>(f.stage);
+		tag(tags, "TYPE", &type, 1);
+		tag(tags, "HASH", hash, sizeof hash);
+		std::vector<uint8_t> offsets;
+		put64(offsets, metadataAt);
+		put64(offsets, metadataAt);
+		put64(offsets, at);
+		tag(tags, "OFFT", offsets.data(), static_cast<uint16_t>(offsets.size()));
+		std::vector<uint8_t> vers;
+		put16(vers, f.airMajor);
+		put16(vers, f.airMinor);
+		put16(vers, f.languageMajor);
+		put16(vers, f.languageMinor);
+		tag(tags, "VERS", vers.data(), static_cast<uint16_t>(vers.size()));
+		std::vector<uint8_t> mdsz;
+		put64(mdsz, size);
+		tag(tags, "MDSZ", mdsz.data(), static_cast<uint16_t>(mdsz.size()));
+		put(tags, "ENDT", 4);
+		put32(groups, static_cast<uint32_t>(4 + tags.size()));
+		put(groups, tags.data(), tags.size());
+		metadataAt += 8;
+	}
 	uint8_t hash[CC_SHA256_DIGEST_LENGTH];
-	CC_SHA256(section.data(), static_cast<CC_LONG>(section.size()), hash);
-
-	std::vector<uint8_t> tags;
-	tag(tags, "NAME", f.name.c_str(), static_cast<uint16_t>(f.name.size() + 1));
-	const uint8_t type = static_cast<uint8_t>(f.stage);
-	tag(tags, "TYPE", &type, 1);
-	tag(tags, "HASH", hash, sizeof hash);
-	const uint8_t offsets[24] = {};
-	tag(tags, "OFFT", offsets, sizeof offsets);
-	std::vector<uint8_t> vers;
-	put16(vers, f.airMajor);
-	put16(vers, f.airMinor);
-	put16(vers, f.languageMajor);
-	put16(vers, f.languageMinor);
-	tag(tags, "VERS", vers.data(), static_cast<uint16_t>(vers.size()));
-	std::vector<uint8_t> mdsz;
-	put64(mdsz, section.size());
-	tag(tags, "MDSZ", mdsz.data(), static_cast<uint16_t>(mdsz.size()));
-	put(tags, "ENDT", 4);
-	std::vector<uint8_t> group;
-	put32(group, static_cast<uint32_t>(4 + tags.size()));
-	put(group, tags.data(), tags.size());
-
+	CC_SHA256(sections.data(), static_cast<CC_LONG>(sections.size()), hash);
 	std::vector<uint8_t> extension;
 	tag(extension, "UUID", hash, 16);
 	put(extension, "ENDT", 4);
 
-	const uint64_t listOffset = kHeaderBytes, listSize = group.size();
-	const uint64_t publicOffset = listOffset + 4 + group.size() + extension.size();
-	const uint64_t privateOffset = publicOffset + 8, bitcodeOffset = privateOffset + 8;
-	const uint64_t size = bitcodeOffset + section.size();
+	const uint64_t metadataSize = metadataAt;
+	const uint64_t listOffset = kHeaderBytes, listSize = groups.size();
+	const uint64_t publicOffset = listOffset + 4 + groups.size() + extension.size();
+	const uint64_t privateOffset = publicOffset + metadataSize, bitcodeOffset = privateOffset + metadataSize;
+	const uint64_t size = bitcodeOffset + sections.size();
 	std::vector<uint8_t> out;
 	out.reserve(size);
 	put(out, "MTLB", 4);
@@ -107,20 +119,87 @@ std::vector<uint8_t> RgfxWriteMetallib(const RgfxMetallibFunction &f)
 	put64(out, listOffset);
 	put64(out, listSize);
 	put64(out, publicOffset);
-	put64(out, 8);
+	put64(out, metadataSize);
 	put64(out, privateOffset);
-	put64(out, 8);
+	put64(out, metadataSize);
 	put64(out, bitcodeOffset);
-	put64(out, section.size());
-	put32(out, 1);
-	put(out, group.data(), group.size());
+	put64(out, sections.size());
+	put32(out, static_cast<uint32_t>(functions.size()));
+	put(out, groups.data(), groups.size());
 	put(out, extension.data(), extension.size());
 	for (int i = 0; i < 2; i++) {
-		put32(out, 8);
-		put(out, "ENDT", 4);
+		for (size_t n = 0; n < functions.size(); n++) {
+			put32(out, 8);
+			put(out, "ENDT", 4);
+		}
 	}
-	put(out, section.data(), section.size());
+	put(out, sections.data(), sections.size());
 	return out;
+}
+
+std::vector<uint8_t> RgfxWriteMetallib(const RgfxMetallibFunction &f)
+{
+	return RgfxWriteMetallib(std::vector<RgfxMetallibFunction>{f});
+}
+
+bool RgfxMetallibOfClLibrary(const uint8_t *bytes, size_t length, std::vector<uint8_t> &out)
+{
+	constexpr size_t kPairsAt = 0x10, kPairs = 10, kEntryWords = 7;
+	if (bytes == nullptr || length < kPairsAt + 8 * kPairs || le32(bytes) != 1 || le32(bytes + 4) != 0 ||
+	    le32(bytes + 8) != 0 || le32(bytes + 12) != 0)
+		return false;
+	// A section's bytes, where its pair places them inside `bytes`.
+	auto section = [&](size_t n, const uint8_t **at, size_t *size) {
+		const uint64_t offset = le32(bytes + kPairsAt + 8 * n), bytesOf = le32(bytes + kPairsAt + 8 * n + 4);
+		if (offset > length || bytesOf > length - offset)
+			return false;
+		*at = bytes + offset;
+		*size = static_cast<size_t>(bytesOf);
+		return true;
+	};
+	const uint8_t *table = nullptr, *modules = nullptr;
+	size_t tableSize = 0, modulesSize = 0;
+	if (!section(0, &table, &tableSize) || !section(3, &modules, &modulesSize) || tableSize < 12)
+		return false;
+	const uint16_t head[4] = {8, 2, 1, 1};
+	for (int i = 0; i < 4; i++)
+		if ((table[2 * i] | table[2 * i + 1] << 8) != head[i])
+			return false;
+	const uint32_t count = le32(table + 8);
+	if (count == 0)
+		return false;
+	std::vector<RgfxMetallibFunction> functions;
+	size_t at = 12;
+	for (uint32_t i = 0; i < count; i++) {
+		if (tableSize - at < 4 * kEntryWords + 1)
+			return false;
+		const uint8_t *entry = table + at;
+		const uint8_t *name = entry + 4 * kEntryWords;
+		const size_t nameLength = strnlen(reinterpret_cast<const char *>(name), tableSize - at - 4 * kEntryWords);
+		if (nameLength == 0 || nameLength == tableSize - at - 4 * kEntryWords)
+			return false;
+		at += 4 * kEntryWords + nameLength + 1;
+		const uint32_t stage = le32(entry), module = le32(entry + 16);
+		if (stage != static_cast<uint32_t>(RgfxMetallibStage::Kernel) || module > modulesSize ||
+		    modulesSize - module < 4)
+			return false;
+		const uint32_t moduleSize = le32(modules + module);
+		if (moduleSize > modulesSize - module - 4)
+			return false;
+		size_t bitcodeLength = moduleSize;
+		const uint8_t *wrapped = modules + module + 4;
+		const uint8_t *bitcode = RgfxUnwrapBitcode(wrapped, &bitcodeLength);
+		if (bitcode == wrapped)
+			return false;
+		RgfxMetallibFunction f;
+		f.name.assign(reinterpret_cast<const char *>(name), nameLength);
+		f.stage = RgfxMetallibStage::Kernel;
+		f.bitcode = bitcode;
+		f.bitcodeLength = bitcodeLength;
+		functions.push_back(f);
+	}
+	out = RgfxWriteMetallib(functions);
+	return true;
 }
 
 const uint8_t *RgfxUnwrapBitcode(const uint8_t *bitcode, size_t *length)

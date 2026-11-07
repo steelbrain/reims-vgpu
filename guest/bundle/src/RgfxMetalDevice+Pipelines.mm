@@ -17,6 +17,7 @@
 
 #include "RgfxAirArguments.hpp"
 #include "RgfxLibraryKey.hpp"
+#include "RgfxMetallibWriter.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -65,8 +66,10 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 
 } // namespace
 
-// Every library-from-bytes entry point funnels through here. A .metallib (or a fat file's AIR
-// slice) is first looked up by its content key, which finds a library the device made for any
+// Every library-from-bytes entry point funnels through here. The bytes Metal's compiler answers for
+// OpenCL C source, which are no .metallib, are taken as the .metallib of their kernels
+// (RgfxMetallibOfClLibrary). A .metallib (or a fat file's AIR slice) is first looked up by its
+// content key, which finds a library the device made for any
 // process with no bytes sent; otherwise the bytes go as one LIBRARY_CREATE (waiting for room
 // while the ring is momentarily full) or stream through region blocks, with the key, and the
 // device's answer is waited for, so a library it refuses is nil and an NSError here, as Metal's.
@@ -78,6 +81,11 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
                                           error:(__autoreleasing NSError **)error
 {
 	selectAirSlice(bytes, length);
+	std::vector<uint8_t> clKernels;
+	if (RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes), length, clKernels)) {
+		bytes = clKernels.data();
+		length = clKernels.size();
+	}
 	RgfxSerializer *ser = [self serializer];
 	if (ser == nullptr) {
 		if (error)
