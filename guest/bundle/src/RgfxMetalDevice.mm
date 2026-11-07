@@ -348,6 +348,19 @@ int rgfxSuperpages(void *, uint64_t size, uint8_t **bytes)
 	return rgfxTakeSuperpages(rgfxKernelSuperpageVm(), size, bytes);
 }
 
+// The pages source's memory where the kernel has no superpage left (RgfxPagesMemory::pages):
+// plain pages, zero-filled, tagged as the superpages are, which the kext's pages block wires.
+int rgfxPlainPages(void *, uint64_t size, uint8_t **bytes)
+{
+	mach_vm_address_t at = 0;
+	const kern_return_t kr = mach_vm_allocate(mach_task_self(), &at, size,
+	                                          VM_FLAGS_ANYWHERE |
+	                                              VM_MAKE_TAG(VM_MEMORY_IOACCELERATOR));
+	if (kr == KERN_SUCCESS)
+		*bytes = reinterpret_cast<uint8_t *>(at);
+	return kr;
+}
+
 void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
 {
 	rgfxGiveSuperpages(rgfxKernelSuperpageVm(), bytes, size);
@@ -733,12 +746,13 @@ RGFX_LOG_UNRECOGNIZED
 	                                                     managedOverCopy);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
 	// The slabs whose buffers lie in heaps, and large Shared buffers, are the process's own
-	// superpages, wired into pages blocks the host makes heaps or buffers over, where the region
-	// has a pages block source (above) and the device took HEAP_OVER_PAGES; else, and where the
-	// kernel has no superpage, the region's.
+	// superpages, or plain pages where the kernel has no superpage left, wired into pages blocks
+	// the host makes heaps or buffers over, where the region has a pages block source (above)
+	// and the device took HEAP_OVER_PAGES; else the region's.
 	if (_region->hasPagesBlocks() && (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
 		RgfxPagesMemory memory;
 		memory.superpages = &rgfxSuperpages;
+		memory.pages = &rgfxPlainPages;
 		memory.unmap = &rgfxUnmapPages;
 		_pagesSource = std::make_unique<RgfxPagesSlabSource>(
 		    *_region, *_serializer, memory, [NSProcessInfo processInfo].physicalMemory,

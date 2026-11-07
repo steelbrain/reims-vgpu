@@ -196,10 +196,14 @@ bool RgfxPagesSlabSource::heapedSlab(const Memory &memory, uint32_t options) con
 bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 {
 	// Superpages, each one run of guest RAM; where the kernel has none to give (no contiguous
-	// 2 MiB free, or the wire budget spent), the region's slab.
+	// 2 MiB free, or the wire budget spent), plain pages, which the kext wires as it makes the
+	// block; and where neither, the region's slab.
 	uint8_t *bytes = nullptr;
-	if (size == 0 || size % kUnit != 0 ||
-	    m_memory.superpages(m_memory.context, size, &bytes) != KERN_SUCCESS)
+	if (size == 0 || size % kUnit != 0)
+		return false;
+	if (m_memory.superpages(m_memory.context, size, &bytes) != KERN_SUCCESS &&
+	    (m_memory.pages == nullptr ||
+	     m_memory.pages(m_memory.context, size, &bytes) != KERN_SUCCESS))
 		return false;
 	RgfxRegion::Block block = m_region.acquirePages(bytes, size, true);
 	if (!block.ok) {
@@ -210,7 +214,7 @@ bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 	out->size = size;
 	out->regionOffset = block.offset;
 	out->blockSize = block.size;
-	out->zeroed = true; // fresh pages of the kernel's
+	out->zeroed = true; // fresh pages of the kernel's, superpages zeroed and plain ones zero-filled
 	return true;
 }
 

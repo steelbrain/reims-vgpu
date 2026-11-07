@@ -21,8 +21,8 @@ uint64_t alignUp(uint64_t v, uint64_t a)
 } // namespace
 
 RgfxUploadPool::RgfxUploadPool(RgfxRegion *region, RgfxSerializer *serializer,
-                               id<MTLDevice> device)
-    : m_region(region), m_serializer(serializer), m_device(device)
+                               id<MTLDevice> device, RgfxSlabs *slabs)
+    : m_region(region), m_serializer(serializer), m_slabs(slabs), m_device(device)
 {
 }
 
@@ -38,13 +38,36 @@ bool RgfxUploadPool::take(uint64_t size, RgfxUploadChunk *chunk)
 			}
 		}
 	}
-	if (m_region == nullptr || m_serializer == nullptr) {
+	if (m_serializer == nullptr) {
 		return false;
 	}
 	uint64_t bytes = alignUp(size > RgfxUploadArena::kUploadChunkSize
 	                             ? size
 	                             : RgfxUploadArena::kUploadChunkSize,
 	                         RgfxRegion::kDefaultBlockAlign);
+	// A Shared buffer of the slabs, in the process's own pages where the device maps them.
+	if (m_slabs != nullptr) {
+		RgfxBuffer *buffer = [RgfxBuffer bufferForDeviceWithLength:static_cast<NSUInteger>(bytes)
+		                                                   options:MTLResourceStorageModeShared
+		                                                     bytes:nullptr
+		                                                 maxLength:0
+		                                                     slabs:m_slabs
+		                                                    device:m_device
+		                                                serializer:m_serializer];
+		if (buffer != nil) {
+			{
+				std::lock_guard<std::mutex> hold(m_lock);
+				m_made++;
+			}
+			chunk->buffer = buffer;
+			chunk->bytes = static_cast<uint8_t *>([buffer contents]);
+			chunk->size = bytes;
+			return true;
+		}
+	}
+	if (m_region == nullptr) {
+		return false;
+	}
 	RgfxRegion::Block block = m_region->allocate(bytes);
 	if (!block.ok) {
 		return false;

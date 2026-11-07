@@ -2,9 +2,12 @@
  * RgfxUploads: where the bytes an encoder's set*Bytes:length:atIndex: hands in go, so the host
  * reads them as a buffer bound at an offset (the wire carries no inline constant data).
  *
- * A queue holds one RgfxUploadPool: chunks of the device region, each a Shared buffer over its
- * block (one BUFFER_OVER_HOST_MEMORY on ring 0 when the chunk is made, none after), which the
- * host sees in place, so the bytes are copied once, into the chunk, and never again. A command
+ * A queue holds one RgfxUploadPool: chunks, each a Shared buffer of the device's slabs
+ * (RgfxSlabs.hpp), which lie in the process's own pages where the device maps them, or, where
+ * the pool has no slabs, a Shared buffer over a block of the device region (one
+ * BUFFER_OVER_HOST_MEMORY on ring 0 when the chunk is made, none after). The host sees either in
+ * place, so the bytes are copied once, into the chunk, and never again. The pages first: the
+ * region is mapped uncached in the guest, which an AMD host applies (RgfxRegion.hpp). A command
  * buffer holds one RgfxUploadArena: it takes chunks from its queue's pool as its encoders need
  * room, packs each call's bytes at the next 256-byte boundary (the largest constant-buffer
  * offset alignment of the host GPUs, Metal's included), and gives the chunks back to the pool
@@ -36,8 +39,10 @@
 
 class RgfxRegion;
 class RgfxSerializer;
+class RgfxSlabs;
 
-/// One chunk: its buffer (a Shared RgfxBuffer over a region block), CPU pointer and size.
+/// One chunk: its buffer (a Shared RgfxBuffer of the slabs, or over a region block), CPU pointer
+/// and size.
 struct RgfxUploadChunk {
 	id<MTLBuffer> buffer;
 	uint8_t *bytes;
@@ -46,9 +51,11 @@ struct RgfxUploadChunk {
 
 class RgfxUploadPool {
 public:
-	/// A pool over `region`, its chunks' buffers created through `serializer` for `device`
-	/// (weak; nil in a unit test). Both pointers are borrowed and outlive the pool's queue.
-	RgfxUploadPool(RgfxRegion *region, RgfxSerializer *serializer, id<MTLDevice> device);
+	/// A pool over `slabs` where given, else over `region`, its chunks' buffers created through
+	/// `serializer` for `device` (weak; nil in a unit test). The pointers are borrowed and outlive
+	/// the pool's queue.
+	RgfxUploadPool(RgfxRegion *region, RgfxSerializer *serializer, id<MTLDevice> device,
+	               RgfxSlabs *slabs = nullptr);
 
 	/// A free chunk of at least `size` bytes, made where none is free. `ok` false (no chunk)
 	/// where the region has no room or the pool has no region or route.
@@ -63,6 +70,7 @@ public:
 private:
 	RgfxRegion *m_region;
 	RgfxSerializer *m_serializer;
+	RgfxSlabs *m_slabs;
 	__weak id<MTLDevice> m_device;
 	mutable std::mutex m_lock;
 	std::vector<RgfxUploadChunk> m_free;

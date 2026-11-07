@@ -64,6 +64,7 @@ class RgfxIdSpace;
 class RgfxEncoder;
 class RgfxReplyReader;
 class RgfxRegion;
+class RgfxSlabs;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -111,6 +112,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// (COMMAND_BUFFER_IN_REGION), kept until the buffer completes. Null in a unit test without
 /// one: such a buffer then completes with an out-of-memory error.
 @property(nonatomic, nullable) RgfxRegion *region;
+
+/// The device's slabs (borrowed) the queue's upload chunks are Shared buffers of (RgfxUploads.h).
+/// Null in a unit test without them: the chunks are then blocks of the region.
+@property(nonatomic, nullable) RgfxSlabs *slabs;
 
 /// Whether a command buffer of it that commitAndWaitUntilSubmitted commits asks the host for its
 /// submission (RGFX_OP_SUBMITTED), where the device has RGFX_FEATURE_CB_SUBMITTED: the call then

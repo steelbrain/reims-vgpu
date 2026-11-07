@@ -8,9 +8,9 @@
  * region (RgfxRegionSlabSource), whose Shared slabs are each one placement heap over host memory
  * (HEAP_OVER_HOST_MEMORY) with every buffer a BUFFER_AT_OFFSET in it, and whose Managed slabs are
  * plain blocks with each buffer a BUFFER_OVER_HOST_MEMORY over its own range of the block, its CPU
- * copy; or a superpage of the process's own (RgfxPagesSlabSource), one heap over its guest RAM
- * (HEAP_OVER_PAGES) with its buffers placed in it the same way, or for one large Shared buffer
- * several superpages, the buffer a BUFFER_OVER_PAGES over them. So a create is a take from a
+ * copy; or 2 MiB of the process's own pages (RgfxPagesSlabSource), a superpage or plain pages,
+ * one heap over its guest RAM (HEAP_OVER_PAGES) with its buffers placed in it the same way, or for
+ * one large Shared buffer more, the buffer a BUFFER_OVER_PAGES over them. So a create is a take from a
  * free list and one post on ring 0, and a free a give back: neither calls the kext, and the
  * region's block table holds one entry per slab.
  *
@@ -221,20 +221,31 @@ struct RgfxPagesMemory {
 	/// refusal, KERN_NO_SPACE where no contiguous 2 MiB is free and KERN_RESOURCE_SHORTAGE past the
 	/// user wire budget.
 	int (*superpages)(void *context, uint64_t size, uint8_t **bytes) = nullptr;
-	/// Gives back what superpages made.
+	/// `size` bytes of plain pages, zero-filled, which the kext's pages block wires: 0
+	/// (KERN_SUCCESS), or the kernel's refusal. Null for none.
+	int (*pages)(void *context, uint64_t size, uint8_t **bytes) = nullptr;
+	/// Gives back what superpages or pages made.
 	void (*unmap)(void *context, uint8_t *bytes, uint64_t size) = nullptr;
 };
 
-/// Slabs of the process's own pages: 2 MiB superpages wired into a pages block of the kext's
-/// (RgfxRegion::acquirePages; RGFX_FEATURE_PAGES_BUFFERS), so their buffers' memory is the guest's
-/// RAM, not the device region's, for the classes whose buffers lie in heaps. A slab of one
-/// superpage, one run of guest RAM, is a heap the host makes over that RAM (HEAP_OVER_PAGES;
-/// RGFX_FEATURE_HEAP_OVER_PAGES), its buffers placed there as in a region slab's heap. A larger
-/// slab is more than one run, and holds one dedicated Shared buffer, a BUFFER_OVER_PAGES over the
-/// block's view, or a Managed buffer over such a Shared copy (MANAGED OVER A COPY); a larger
-/// Managed one of a class of its own, and a slab where the kernel has no superpages to give or the
-/// kext no pages block, are the region's. A slab goes with its heap's destroy, then its block's
-/// release (the kext's Free, which waits for the device's answer), then its pages.
+/// Slabs of the process's own pages: 2 MiB superpages, or plain pages where the kernel has no
+/// superpage to give, wired into a pages block of the kext's (RgfxRegion::acquirePages;
+/// RGFX_FEATURE_PAGES_BUFFERS), so their buffers' memory is the guest's RAM, not the device
+/// region's, for the classes whose buffers lie in heaps. A slab of 2 MiB is a heap the host makes
+/// over its pages (HEAP_OVER_PAGES; RGFX_FEATURE_HEAP_OVER_PAGES): over the guest's RAM itself for
+/// a superpage, one run, and over the block's view for plain pages, many runs. Its buffers are
+/// placed there as in a region slab's heap. A larger slab holds one dedicated Shared buffer, a
+/// BUFFER_OVER_PAGES over the block's view, or a Managed buffer over such a Shared copy (MANAGED
+/// OVER A COPY); a larger Managed one of a class of its own, and a slab where the kernel has no
+/// pages to give or the kext no pages block, are the region's.
+///
+/// Why plain pages: the kernel's superpages are physically contiguous 2 MiB, which run out within
+/// minutes of a boot (measured on an x86-64 macOS 26.7.2 guest of 8 GiB: 19 for one process at
+/// boot with 2.5 GiB free, then KERN_NO_SPACE; none three minutes later), and the region is no RAM
+/// of the guest's, which the kernel maps uncached, as an AMD host applies (13 MB/s for a
+/// process's stores there, against 56 to 123 GB/s in a superpage; RgfxRegion.hpp). A slab goes
+/// with its heap's destroy, then its block's release (the kext's Free, which waits for the
+/// device's answer), then its pages.
 class RgfxPagesSlabSource : public RgfxRegionSlabSource {
 public:
 	RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &serializer,

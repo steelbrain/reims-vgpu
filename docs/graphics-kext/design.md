@@ -1118,10 +1118,10 @@ from: on an RTX 5080 host at the display's 3840x2400 mode, WindowServer held
 opened, with 2 queues (measured). With some 70 processes open its blocks came to
 1358 and 169.7 MiB, past the reserve's 160 (measured), most of the bytes its
 no-copy buffers' copies and its Managed textures' CPU copies. Those lie in its own
-pages now, as its Managed buffers' CPU copies do ("Managed storage"), so what
-WindowServer keeps in the region is what no page of its own can hold: its rings,
-its encoders' upload chunks and command buffers' bodies, its surfaces' blocks,
-and the slabs the kernel had no superpage for. The entries hold three times the
+pages now, as its Managed buffers' CPU copies and its encoders' upload chunks
+do ("Managed storage"), so what WindowServer keeps in the region is what no page
+of its own can hold: its rings, its command buffers' bodies and its surfaces'
+blocks. The entries hold three times the
 1358 blocks. A larger display, or a second one, needs the reserve measured
 again.
 
@@ -1815,14 +1815,24 @@ the host's import, and the kext's block table holds one entry per slab:
   `PagesBlock`) and makes heaps over them (`HEAP_OVER_PAGES`), a heaped slab
   of 2 MiB is the process's own memory instead: a 2 MiB superpage
   (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, tagged `VM_MEMORY_IOACCELERATOR`), one run
-  of guest RAM, wired into a pages block and made one `HEAP_OVER_PAGES`, its
-  buffers placed in it as in a region slab's heap. A larger dedicated Shared
-  slab is superpages too, more than one run, with no heap: its one buffer is a
-  `BUFFER_OVER_PAGES` over the block's view, or a Managed buffer's CPU copy.
-  A larger Managed slab of a class of its own (no `MANAGED_BUFFER_SLABS`) is
-  the region's, as is a slab where the kernel has no superpage to give (no
-  contiguous 2 MiB free, or the wire budget spent) or the kext gives no pages
-  block. Each superpage is one kernel call: a slab of several reserves its
+  of guest RAM, or where the kernel has no superpage to give (no contiguous
+  2 MiB free, or the wire budget spent) 2 MiB of plain pages, tagged the
+  same, many runs. Either is wired into a pages block and made one
+  `HEAP_OVER_PAGES`, its buffers placed in it as in a region slab's heap: the
+  host makes the heap over the run where the guest's RAM is mapped, and over
+  plain pages' runs over the block's view, which it makes off ring 0 as a
+  `BUFFER_OVER_PAGES`'s. A larger dedicated Shared slab is superpages or plain
+  pages too, with no heap: its one buffer is a `BUFFER_OVER_PAGES` over the
+  block's view, or a Managed buffer's CPU copy. A larger Managed slab of a
+  class of its own (no `MANAGED_BUFFER_SLABS`) is the region's, as is a slab
+  where the kernel gives no pages at all or the kext gives no pages block.
+  Plain pages because superpages run out: measured on an x86-64 macOS 26.7.2
+  guest of 8 GiB on the Radeon 780M host, a process got 19 at boot with
+  2.5 GiB free, then `KERN_NO_SPACE`, and none three minutes later; every
+  Shared buffer then lay in the region, where the guest's stores ran at
+  13 MB/s (Decided 5, "The guest maps host memory only"). A queue's upload
+  chunks, the bytes `set*Bytes:` hands in, are Shared buffers of the slabs
+  too. Each superpage is one kernel call: a slab of several reserves its
   range (no access, at a 2 MiB boundary), then gives back each piece in turn
   and makes a superpage in its hole (`VM_FLAGS_FIXED`), and one refusal gives
   back the superpages before it and the reservation after it, so the slab is

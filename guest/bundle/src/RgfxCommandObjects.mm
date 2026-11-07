@@ -916,7 +916,7 @@ struct RgfxBarrierSlot {
 	@synchronized(self) {
 		if (_uploadPool == nullptr) {
 			_uploadPool = std::make_shared<RgfxUploadPool>(self.region, [self serializer],
-			                                               self.device);
+			                                               self.device, self.slabs);
 		}
 		return _uploadPool;
 	}

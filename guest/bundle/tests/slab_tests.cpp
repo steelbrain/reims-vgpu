@@ -815,11 +815,13 @@ struct PagesKext {
 };
 
 // The kernel's memory for the pages source: `superpagesLeft` superpages of contiguous room, then
-// KERN_NO_SPACE; past the wire budget (`budgetSpent`), KERN_RESOURCE_SHORTAGE.
+// KERN_NO_SPACE; past the wire budget (`budgetSpent`), KERN_RESOURCE_SHORTAGE. Plain pages
+// (`pages`) where `refusePlain` is false, else KERN_NO_SPACE.
 struct PagesVm {
 	std::map<uint8_t *, std::vector<uint8_t>> held;
 	uint64_t superpagesLeft = 0;
 	bool budgetSpent = false;
+	bool refusePlain = false;
 	std::vector<std::string> *log;
 
 	explicit PagesVm(std::vector<std::string> *events) : log(events) {}
@@ -838,13 +840,30 @@ struct PagesVm {
 		vm->held[*bytes] = std::move(memory);
 		return KERN_SUCCESS;
 	}
+	static int pages(void *context, uint64_t size, uint8_t **bytes)
+	{
+		PagesVm *vm = static_cast<PagesVm *>(context);
+		const std::string what = "pages " + std::to_string(size);
+		if (vm->refusePlain) {
+			vm->log->push_back(what + " refused");
+			return KERN_NO_SPACE;
+		}
+		vm->log->push_back(what);
+		std::vector<uint8_t> memory(size, 0);
+		*bytes = memory.data();
+		vm->held[*bytes] = std::move(memory);
+		vm->plain.insert(*bytes);
+		return KERN_SUCCESS;
+	}
 	static void unmap(void *context, uint8_t *bytes, uint64_t size)
 	{
 		PagesVm *vm = static_cast<PagesVm *>(context);
 		vm->held.erase(bytes);
-		vm->superpagesLeft += size / (2 * kMiB);
+		if (vm->plain.erase(bytes) == 0)
+			vm->superpagesLeft += size / (2 * kMiB);
 		vm->log->push_back("unmap " + std::to_string(size));
 	}
+	std::set<uint8_t *> plain; // what pages made
 };
 
 bool endsWith(const std::vector<std::string> &log, const std::vector<std::string> &want)
@@ -993,6 +1012,81 @@ void test_pages_slab_source()
 	both.give(g);
 	both.give(bigManaged);
 	CHECK(both.reclaim() && kext.pages.empty() && vm.held.empty());
+}
+
+// Where the kernel has no superpage left (it runs out minutes after a boot), the pages source
+// takes plain pages: a heaped class's 2 MiB slab is a pages block of them, one HEAP_OVER_PAGES its
+// buffers are placed in, as over a superpage (the host makes the heap over the block's view); a
+// dedicated Shared slab larger than 2 MiB is plain pages too, its buffer a BUFFER_OVER_PAGES over
+// the view. Only where the kernel gives neither is the slab the region's. Plain pages go back as
+// superpages do, after the block's release.
+void test_pages_slab_source_plain_pages()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PagesKext kext(16 * kMiB, &log);
+	region.setBlockSource(&PagesKext::alloc, &PagesKext::release, &kext);
+	region.setPagesBlockSource(&PagesKext::pagesBlock, &kext);
+	PagesVm vm(&log);
+	vm.superpagesLeft = 0;
+	RgfxPagesMemory calls;
+	calls.context = &vm;
+	calls.superpages = &PagesVm::superpages;
+	calls.pages = &PagesVm::pages;
+	calls.unmap = &PagesVm::unmap;
+	RgfxRegionSlabSource regionSource(region, ser);
+	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30);
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pages);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+
+	RgfxSlabs::Range a, b;
+	CHECK(slabs.take(256, kShared, 0, &a) && a.offset == 0 && a.size == 0x1000);
+	CHECK(log == std::vector<std::string>({"superpages 2097152 refused", "pages 2097152"}));
+	CHECK(kext.pages.size() == 1 && kext.lastAddress == a.contents);
+	CHECK(kext.lastLength == 2 * kMiB && kext.lastWritable);
+	auto heap = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
+	CHECK(heap.block_offset == *kext.pages.begin() && heap.size_bytes == 2 * kMiB);
+	CHECK(slabs.take(0x3000, kShared, 0, &b) && b.slab == a.slab && b.offset == 0x1000);
+	RgfxSlabSource::Made made;
+	CHECK(slabs.makeBuffer(b, 0x2800, kShared, &made));
+	auto at = expectMessage<RgfxBufferAtOffset>(ring, RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(at.heap_obj_id == heap.obj_id && at.offset == 0x1000 && !made.ownsAddress);
+	// A dedicated Shared buffer past 2 MiB: plain pages with no heap, its buffer over the view.
+	RgfxSlabs::Range big;
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &big) && big.size == 3 * kMiB);
+	CHECK(endsWith(log, {"superpages 4194304 refused", "pages 4194304"}));
+	CHECK(kext.pages.size() == 2 && kext.lastAddress == big.contents);
+	CHECK(!ring.next(&h, &bytes));
+	CHECK(slabs.makeBuffer(big, 3 * kMiB, kShared, &made));
+	auto over = expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
+	CHECK(over.block_offset == *kext.pages.rbegin() && over.length == 3 * kMiB);
+	CHECK(made.ownsAddress && made.gpuAddress == over.gpu_address);
+	// Neither superpages nor plain pages: the region's heaped slab.
+	vm.refusePlain = true;
+	RgfxSlabs::Range c;
+	CHECK(slabs.take(0x1000, kSharedUntracked, 0, &c));
+	CHECK(endsWith(log, {"superpages 2097152 refused", "pages 2097152 refused"}));
+	CHECK(expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY).size_bytes ==
+	      2 * kMiB);
+	vm.refusePlain = false;
+	// Let go: each pages block released, then its plain pages unmapped.
+	for (RgfxSlabs::Range *r : {&a, &b, &big, &c})
+		slabs.give(*r);
+	log.clear();
+	CHECK(slabs.reclaim() && slabs.stats().slabs == 0 && kext.pages.empty() && vm.held.empty());
+	CHECK(log == std::vector<std::string>(
+	                 {"release pages", "unmap 2097152", "release pages", "unmap 4194304"}) ||
+	      log == std::vector<std::string>(
+	                 {"release pages", "unmap 4194304", "release pages", "unmap 2097152"}));
+	CHECK(vm.superpagesLeft == 0);
 }
 
 // The kernel's VM as xnu 26.4 and later answers RgfxSuperpages's calls, in 2 MiB pieces (read from
@@ -1332,6 +1426,7 @@ void rgfxSlabTests()
 	test_region_slab_source();
 	test_region_reclaims_slabs();
 	test_pages_slab_source();
+	test_pages_slab_source_plain_pages();
 	test_superpages_one_call_each();
 	test_pages_source_short_of_superpages();
 	test_managed_buffers_over_shared_copies();
