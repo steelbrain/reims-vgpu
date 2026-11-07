@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[path = "../support/cdylib.rs"]
 mod cdylib;
@@ -31,11 +32,15 @@ fn crate_dir() -> PathBuf {
 /// Set to record `expected.tsv` from this build instead of comparing with it.
 const RECORD: &str = "RVG_PINS_RECORD";
 
-/// Builds `api_pins.c` against this crate's dylib and runs it: its standard output.
-fn run_pins() -> String {
+/// Builds `api_pins.c` against this crate's dylib and runs it with `env` added to the test's
+/// environment: its standard output.
+fn run_pins(env: &[(&str, &str)]) -> String {
     let dylib = cdylib::dir().join(cdylib::file_name());
     assert!(dylib.exists(), "{} is missing", dylib.display());
-    let dir = std::env::temp_dir().join(format!("rvg-api-pins-{}", std::process::id()));
+    // A directory of each run's own: the tests of one process run at once under cargo test.
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    let run = RUNS.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("rvg-api-pins-{}-{run}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let bin = dir.join("api_pins");
@@ -57,7 +62,10 @@ fn run_pins() -> String {
         "cc failed:\n{}",
         String::from_utf8_lossy(&cc.stderr)
     );
-    let out = Command::new(&bin).output().unwrap();
+    let out = Command::new(&bin)
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -76,7 +84,7 @@ fn run_pins() -> String {
 /// connection types as the guest reads them, the log hook, and the deaths that remain)
 #[test]
 fn c_api_pins_match_the_recording() {
-    let got = run_pins();
+    let got = run_pins(&[]);
     let path = crate_dir().join("tests/pins/expected.tsv");
     if std::env::var_os(RECORD).is_some() {
         std::fs::write(&path, &got).unwrap();
@@ -87,6 +95,24 @@ fn c_api_pins_match_the_recording() {
         );
         return;
     }
+    matches_the_recording(&got);
+}
+
+/// The pins under Metal's validation layer, which ends the process at a call Metal's API
+/// forbids: the library makes none of its own, so they observe what `expected.tsv` records. (A
+/// texture over a buffer of other resource options than the buffer's ended them at the EFI
+/// display's texture until 11-07.)
+#[test]
+fn c_api_pins_pass_metal_s_validation_layer() {
+    if std::env::var_os(RECORD).is_some() {
+        return;
+    }
+    matches_the_recording(&run_pins(&[("MTL_DEBUG_LAYER", "1")]));
+}
+
+/// Fails, line by line, where `got` differs from `expected.tsv`.
+fn matches_the_recording(got: &str) {
+    let path = crate_dir().join("tests/pins/expected.tsv");
     let want = std::fs::read_to_string(&path).unwrap();
     let (got, want): (Vec<&str>, Vec<&str>) = (got.lines().collect(), want.lines().collect());
     assert!(want.len() >= 20, "{}", want.len());

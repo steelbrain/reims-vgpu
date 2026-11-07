@@ -72,9 +72,10 @@ use crate::guest::records::APV_PAGE_SHIFT;
 use crate::host::{HostPtr, HostTask, HostTraceRange, PhysRange, TraceRangeHandler};
 use crate::memory::mapping::Mapping;
 use crate::num::{self, ToUsize, Truncate};
+use crate::platform::descriptor::TextureDescriptor as _;
 use crate::platform::device::GpuDevice as _;
 use crate::platform::os::{Clock, Deadline};
-use crate::platform::resource::Buffer as _;
+use crate::platform::resource::{Buffer as _, GpuResource as _};
 use crate::platform::values::TextureDesc;
 use crate::platform::{Handle as _, Platform};
 use crate::raise::{OnFault, Raise};
@@ -428,9 +429,16 @@ impl<P: Platform> EfiDisplay<P> {
                 )),
                 None => None,
             };
-            // A send to a nil buffer answers a nil texture.
+            // A send to a nil buffer answers a nil texture. The texture takes the buffer's
+            // resource options, as Metal's texture over a buffer must: the descriptor's default
+            // storage is Managed, and with Metal's validation layer on, a texture of other options
+            // than its buffer's ends the process ("resourceOptions (0x10) must match backing
+            // buffer resource options (0x0)", measured on the M3 Max under macOS 27.0.1).
             let texture = match &buffer {
-                Some(b) => unraised(b.new_texture(OnFault::Die, &descriptor, 0, u64::from(stride))),
+                Some(b) => {
+                    descriptor.set_resource_options(b.resource_options());
+                    unraised(b.new_texture(OnFault::Die, &descriptor, 0, u64::from(stride)))
+                }
                 None => None,
             };
             self.state.lock().texture = texture;

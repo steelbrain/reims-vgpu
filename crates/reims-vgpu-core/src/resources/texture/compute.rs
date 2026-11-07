@@ -8,7 +8,7 @@ use crate::nil_send;
 use crate::platform::Platform;
 use crate::platform::compute::{ComputeCmd, ComputeEncoder};
 use crate::platform::descriptor::TextureDescriptor;
-use crate::platform::resource::{Buffer, Texture};
+use crate::platform::resource::{Buffer, GpuResource as _, Texture};
 use crate::platform::types::MtlSize;
 use crate::platform::values::TextureDesc;
 use crate::raise::{Kept, keep_forever};
@@ -234,6 +234,9 @@ impl<P: Platform> DualPlaneCompute<P> {
                     ..TextureDesc::default()
                 })),
             };
+            // The view takes the buffer's resource options, as Metal's texture over a buffer
+            // must (`display/efi.rs`): the descriptor's default storage is Managed.
+            td.set_resource_options(transfer_buffer.resource_options());
             // Metal validates the view here: a format-550 texture 63 texels wide (plane 0's
             // rows not 256-aligned) dies in MTLReportFailure
             // (iso-b:textures_dual_plane_xr10_bad_row).
@@ -622,15 +625,27 @@ mod tests {
                 vec![
                     "new_buffer_for_virtual_page",
                     "setPixelFormat:",
+                    "setResourceOptions:",
                     "newTextureWithDescriptor:offset:bytesPerRow:",
                     "setPixelFormat:",
+                    "setResourceOptions:",
                     "newTextureWithDescriptor:offset:bytesPerRow:",
                 ]
             );
-            // Each plane's pixel format is set on the one descriptor its view is made from.
-            let (pf, c) = ([&ordered[1], &ordered[3]], [&ordered[2], &ordered[4]]);
+            // Each plane's pixel format, and the transfer buffer's resource options, are set on
+            // the one descriptor its view is made from.
+            let (pf, ro, c) = (
+                [&ordered[1], &ordered[4]],
+                [&ordered[2], &ordered[5]],
+                [&ordered[3], &ordered[6]],
+            );
             let descriptor = Arg::Obj(Some(pf[0].obj));
             assert!(pf.iter().all(|x| Arg::Obj(Some(x.obj)) == descriptor));
+            assert!(ro.iter().all(|x| Arg::Obj(Some(x.obj)) == descriptor));
+            let options = (tr.paged.transfer_buffer.lock().as_ref())
+                .map(crate::platform::resource::GpuResource::resource_options)
+                .unwrap();
+            assert!(ro.iter().all(|x| u(x, 0) == options));
             assert!(c.iter().all(|x| x.args[0] == descriptor));
             assert_eq!((u(c[0], 1), u(c[0], 2)), (0x10, 16));
             assert_eq!((u(c[1], 1), u(c[1], 2)), (0x80, 16));
