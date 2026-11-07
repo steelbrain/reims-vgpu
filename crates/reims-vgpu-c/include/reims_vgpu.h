@@ -1005,6 +1005,13 @@ typedef void (*RvgGraphicsRaiseFn)(void *ctx, uint32_t vector);
 typedef bool (*RvgGraphicsScanoutWrittenFn)(void *ctx, uint64_t offset, uint64_t length);
 
 // The graphics device's callbacks.
+//
+// The cursor's three tell the host the guest's cursor on the device's display, for a host that
+// draws it (QEMU's console, for its SPICE, VNC, GTK and D-Bus displays); the device's window
+// shows it either way. Thread, and what they may call: as RvgModeChangeFn's, on the display
+// thread, one at a time with every display callback of the process, in the order the device
+// took the guest's cursor commands and resets. The guest sees nothing of whether the host gives
+// them.
 typedef struct {
   // sizeof(RvgGraphicsCallbacks) as the host was compiled.
   uint32_t struct_size;
@@ -1014,6 +1021,17 @@ typedef struct {
   RvgDestroyFn destroy;
   RvgGraphicsRaiseFn raise_interrupt;
   RvgGraphicsScanoutWrittenFn scanout_written;
+  // The guest set its cursor's image: `rgba` holds its pixels as straight-alpha RGBA (the
+  // guest gives them premultiplied, BGRA), each side 1 to 256 pixels, the hot spot inside.
+  // Followed by `cursor_show` where whether the cursor shows changed.
+  RvgCursorGlyphFn cursor_glyph;
+  // Whether the cursor shows, where that changed: 1 once the guest has an image while it
+  // shows its cursor; 0 once it hides it or removes its image, which a reset removes. It is
+  // hidden until the first call.
+  RvgCursorShowFn cursor_show;
+  // The guest moved its cursor, or a reset put it at (0, 0):
+  // rvg_graphics_device_cursor_position reads where its hot spot is.
+  RvgCursorMoveFn cursor_move;
 } RvgGraphicsCallbacks;
 
 // The graphics device's config.
@@ -1620,6 +1638,14 @@ RvgStatus rvg_graphics_device_read_display(RvgGraphicsDevice *device,
                                            size_t dst_length,
                                            uint32_t *width,
                                            uint32_t *height);
+
+// Where the guest last put its cursor's hot spot, in the display's pixels, each axis kept to 0
+// to 65535: (0, 0) before it moved it and after a reset. The host reads it at its cursor_move
+// (RvgGraphicsCallbacks). On any thread. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+RvgDisplayCoord rvg_graphics_device_cursor_position(const RvgGraphicsDevice *device);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -23,6 +23,7 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
                 raised.fetch_add(1, Ordering::SeqCst);
             })),
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -108,6 +109,7 @@ fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<Fa
                 raised.fetch_add(1, Ordering::SeqCst);
             })),
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -159,6 +161,7 @@ fn on_metal_guest_texture_ids_are_kept_from_the_host_s() {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -968,6 +971,7 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
         callbacks: GraphicsCallbacks {
             raise_interrupt: Some(Arc::new(move |vector| vrec.lock().push(vector))),
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -1051,6 +1055,7 @@ fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -1141,6 +1146,7 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
                 record.lock().push((vector, name));
             })),
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -1239,6 +1245,7 @@ fn a_doorbell_s_answer_allocates_nothing() {
                 count.fetch_add(1, Ordering::SeqCst);
             })),
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -1360,6 +1367,7 @@ fn a_landed_download_s_answer_at_its_doorbell_allocates_nothing() {
                 }
             })),
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -1438,6 +1446,7 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
         callbacks: GraphicsCallbacks {
             raise_interrupt: Some(Arc::new(|_| {})),
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -1812,6 +1821,7 @@ fn calling_back(ring: u64) -> (Arc<GraphicsDevice<FakePlatform>>, Returned) {
                 record.lock().push(name);
             })),
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -1939,6 +1949,115 @@ fn the_cursor_shows_with_an_image_while_the_guest_shows_it() {
     window.close();
 }
 
+/// What the host's cursor callbacks were told, in order.
+#[derive(Debug, PartialEq)]
+enum Told {
+    Glyph(u32, u32, (u16, u16), Vec<u8>),
+    Show(u8),
+    Move,
+}
+
+/// The host's cursor callbacks, recording what they are told and the threads they run on.
+fn telling(told: &Arc<Mutex<Vec<(Told, std::thread::ThreadId)>>>) -> GraphicsCallbacks {
+    let (glyph, show, moved) = (Arc::clone(told), Arc::clone(told), Arc::clone(told));
+    let here = || std::thread::current().id();
+    GraphicsCallbacks {
+        cursor_glyph: Some(Arc::new(move |g: &CursorGlyph<'_>| {
+            let told = Told::Glyph(g.width, g.height, g.hot_spot, g.rgba.to_vec());
+            glyph.lock().push((told, here()));
+        })),
+        cursor_show: Some(Arc::new(move |s| show.lock().push((Told::Show(s), here())))),
+        cursor_move: Some(Arc::new(move || moved.lock().push((Told::Move, here())))),
+        ..GraphicsCallbacks::default()
+    }
+}
+
+/// The guest's cursor reaches the host's callbacks off the threads that took it, in the order the
+/// device took its commands: the image as straight RGBA with its hot spot, that it shows once it
+/// has an image while the guest shows it and hides when the guest hides it, and each move, the
+/// hot spot's place kept to 0 to 65535; a reset puts it at (0, 0), still hidden with no image
+#[test]
+fn the_guest_s_cursor_reaches_the_host() {
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let config = GraphicsConfig {
+        callbacks: telling(&told),
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    let wait = |count: usize| {
+        for _ in 0..2000 {
+            if told.lock().len() >= count {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let told = told.lock();
+        assert_eq!(told.len(), count, "{told:?}");
+        told.iter()
+            .map(|(t, _)| format!("{t:?}"))
+            .collect::<Vec<_>>()
+    };
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    // The kext's cursor slot, at the region's end: two premultiplied BGRA pixels.
+    let slot = device.region_size() - RGFX_CURSOR_SPAN;
+    // SAFETY: the slot lies in the device's region, mapped while the device lives.
+    unsafe {
+        guest.write(slot as usize, &[10, 20, 30, 255, 64, 32, 0, 128]);
+    }
+    let set = RgfxSetCursor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_CURSOR,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width: 2,
+        height: 1,
+        hot_x: 1,
+        hot_y: 0,
+        reserved_24: 0,
+        offset: slot,
+    };
+    assert_eq!(
+        answered(&device, &mut guest, set.as_bytes().to_vec()),
+        RGFX_STATUS_OK
+    );
+    let move_to = |x, y, visible| {
+        RgfxMoveCursor {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_MOVE_CURSOR,
+                size: 0,
+                seqno: 0,
+            },
+            display: 0,
+            x,
+            y,
+            visible,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    guest.send(&device, move_to(100, 50, 1));
+    let glyph = Told::Glyph(2, 1, (1, 0), vec![30, 20, 10, 255, 0, 64, 128, 128]);
+    assert_eq!(
+        wait(3),
+        [format!("{glyph:?}"), "Show(1)".into(), "Move".into()]
+    );
+    assert_eq!(device.cursor_position(), (100, 50));
+
+    guest.send(&device, move_to(-5, 70_000, 0));
+    assert_eq!(wait(5)[3..], ["Move", "Show(0)"]);
+    assert_eq!(device.cursor_position(), (0, 65535));
+
+    device.reset();
+    assert_eq!(wait(6)[5..], ["Move"]);
+    assert_eq!(device.cursor_position(), (0, 0));
+    let here = std::thread::current().id();
+    assert!(told.lock().iter().all(|(_, on)| *on != here));
+}
+
 /// The window's sink makes its queue unshared and imports nothing at its making, then only the
 /// host pages under the scanout it draws (to `stride × height` bytes on), again only when the
 /// scanout moves or changes size, and kept to the region
@@ -2017,6 +2136,7 @@ fn windowed(asked: &Asked) -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) 
                 asked.lock().push((offset, length));
                 true
             })),
+            ..GraphicsCallbacks::default()
         },
         window: Some(WindowConfig::default()),
         memory_map: None,
@@ -9050,6 +9170,7 @@ fn on_metal_an_identity_colour_matrix_reads_as_no_colour() {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -9245,6 +9366,7 @@ fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
@@ -9299,6 +9421,7 @@ fn one_queue_raising(
         callbacks: GraphicsCallbacks {
             raise_interrupt: Some(raise),
             scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,

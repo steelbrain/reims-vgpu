@@ -21,6 +21,10 @@
 //!
 //! **Without a window** the display offers 1920 × 1080 at 60 Hz and shows nothing.
 //!
+//! **The host is told the guest's cursor**, with a window or without one, where it takes it
+//! ([`GraphicsCallbacks`]' `cursor_*`, [`HostCursor`]): its image, whether it shows and where the
+//! guest put its hot spot, on the display thread. QEMU's console draws it for QEMU's own displays.
+//!
 //! **The host reads what the display shows** ([`GraphicsDevice::read_display`], `read`): the
 //! window's draw, into a texture of the display's mode, read back once it has finished, with a
 //! window or without one; QEMU's console shows it, and its screendump saves it.
@@ -63,6 +67,7 @@ use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
     Screen,
 };
+use reims_vgpu_core::host::HostQueue;
 use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
 use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
@@ -78,7 +83,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::DefaultPlatform;
 use crate::device::{GuestMemoryLease, MemoryMap};
-use crate::display::no_catch;
+use crate::display::{CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn, no_catch};
 use crate::entry;
 use crate::error::Error;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
@@ -95,7 +100,7 @@ use crate::graphics::decode::{
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
-use crate::platform::ApiPlatform;
+use crate::platform::{ApiPlatform, api_state};
 use crate::window::WindowLink;
 
 mod color;
@@ -147,6 +152,12 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 /// buffer's `CB_SUBMITTED` latch, wherever that is posted; and the presents' queue, at a present
 /// answered at once with no window. No function of the device takes any of them, and
 /// `mmio_write_taking` only tries the claim and the decoder's locks.
+///
+/// The cursor's three run on the process's display thread (`reims-vgpu.display`, the
+/// `platform` module's), one at a time with every display callback of the process, in the order
+/// the device took the guest's cursor commands and resets (`HostCursor`): never inside a call of
+/// the host's, and the device never waits for them. The guest sees nothing of whether the host
+/// takes them.
 #[derive(Clone, Default)]
 pub struct GraphicsCallbacks {
     /// Raises the device's interrupt. Without it the guest gets no interrupt.
@@ -154,6 +165,14 @@ pub struct GraphicsCallbacks {
     /// The host's dirty log over the scanout, on the refresh thread. Without it the guest's
     /// scanout is taken as written at every refresh.
     pub scanout_written: Option<ScanoutWrittenFn>,
+    /// The guest set its cursor's image: its pixels as straight-alpha RGBA, which the guest
+    /// gave premultiplied BGRA (`reims-graphics`' `display`), and its hot spot.
+    pub cursor_glyph: Option<CursorGlyphFn>,
+    /// Whether the cursor shows changed, hidden until the first call: 1 once the guest has an
+    /// image while it shows its cursor, 0 once it has none or hides it.
+    pub cursor_show: Option<CursorShowFn>,
+    /// The guest moved its cursor: [`GraphicsDevice::cursor_position`] reads where.
+    pub cursor_move: Option<CursorMoveFn>,
 }
 
 /// A graphics device's config.
@@ -196,6 +215,8 @@ pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
     window: Option<WindowLink>,
     /// The device.
     device: reims_graphics::Device,
+    /// The guest's cursor as the host is told it.
+    cursor: Arc<HostCursor>,
     /// The stage-3 decoder and the device handle it drives, shared with the device's [`Host`],
     /// which feeds it the control ring's stage-3 messages; held here for the tests' look at it.
     #[cfg(any(test, feature = "testkit"))]
@@ -366,6 +387,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 reset_gate: Arc::default(),
                 inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
             });
+            let cursor = Arc::new(HostCursor::new(&platform, &config.callbacks));
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
                 features,
@@ -401,11 +423,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             );
             #[cfg(test)]
             let shown = window.is_some().then_some(shown);
-            let device = reims_graphics::Device::new(region, host, Box::new(SharedScreen(screen)))
+            let screen = SharedScreen {
+                screen,
+                cursor: Arc::clone(&cursor),
+            };
+            let device = reims_graphics::Device::new(region, host, Box::new(screen))
                 .ok_or(Error::HostResources)?;
             Ok(GraphicsDevice {
                 window,
                 device,
+                cursor,
                 #[cfg(any(test, feature = "testkit"))]
                 control,
                 #[cfg(test)]
@@ -504,6 +531,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// The host's reset of the device (the guest's bus reset).
     pub fn reset(&self) {
         entry::run(|_| self.device.reset());
+    }
+
+    /// Where the guest last put its cursor's hot spot, in the display's pixels, each axis kept
+    /// to 0 to 65535: (0, 0) before it moved it and after a reset. The host reads it at its
+    /// `cursor_move` ([`GraphicsCallbacks`]).
+    pub fn cursor_position(&self) -> (u16, u16) {
+        entry::run(|_| self.cursor.position())
     }
 }
 
@@ -2237,13 +2271,121 @@ struct CursorState {
 }
 
 impl CursorState {
+    /// Whether the cursor shows, where that changed since it was last told.
+    fn changed(&mut self) -> Option<bool> {
+        let show = self.image && self.visible;
+        if self.shown == Some(show) {
+            return None;
+        }
+        self.shown = Some(show);
+        Some(show)
+    }
+
     /// Tells `window` whether the cursor shows, where that changed.
     fn update(&mut self, window: &Window) {
-        let show = self.image && self.visible;
-        if self.shown != Some(show) {
-            self.shown = Some(show);
+        if let Some(show) = self.changed() {
             window.cursor_show(show);
         }
+    }
+}
+
+/// The guest's cursor as the host is told it ([`GraphicsCallbacks`]' `cursor_*`), beside what
+/// the screen shows of it. Each change is queued onto the display thread under the state's lock,
+/// so the host's callbacks run in the order the device took the guest's commands, and never
+/// inside a call of the host's: the device's reset tells the screen inside the host's reset or
+/// the guest's `STATUS` write.
+struct HostCursor {
+    /// The host's `cursor_glyph`.
+    glyph: Option<CursorGlyphFn>,
+    /// The host's `cursor_show`.
+    show: Option<CursorShowFn>,
+    /// The host's `cursor_move`.
+    moved: Option<CursorMoveFn>,
+    /// The display thread, where the host takes any of them.
+    queue: Option<Arc<dyn HostQueue>>,
+    /// What the host was told: hidden until the guest shows it.
+    state: Mutex<CursorState>,
+    /// Where the guest last put its cursor's hot spot, each axis kept to 0 to 65535: x in the
+    /// high 16 bits, y in the low.
+    position: AtomicU32,
+}
+
+impl HostCursor {
+    /// The host's cursor callbacks of `callbacks`, run on `platform`'s display thread, which is
+    /// made here where the host takes any.
+    fn new<P: ApiPlatform>(platform: &Arc<P>, callbacks: &GraphicsCallbacks) -> HostCursor {
+        let takes = callbacks.cursor_glyph.is_some()
+            || callbacks.cursor_show.is_some()
+            || callbacks.cursor_move.is_some();
+        HostCursor {
+            glyph: callbacks.cursor_glyph.clone(),
+            show: callbacks.cursor_show.clone(),
+            moved: callbacks.cursor_move.clone(),
+            queue: takes.then(|| api_state(platform).display_thread(platform)),
+            state: Mutex::new(CursorState {
+                image: false,
+                visible: true,
+                shown: Some(false),
+            }),
+            position: AtomicU32::new(0),
+        }
+    }
+
+    /// Queues `job` onto the display thread.
+    fn queue(&self, job: impl FnOnce() + Send + 'static) {
+        if let Some(queue) = &self.queue {
+            queue.exec_async(Box::new(job));
+        }
+    }
+
+    /// Tells the host whether the cursor shows, where that changed.
+    fn tell_shown(&self, state: &mut CursorState) {
+        if let Some(show) = state.changed()
+            && let Some(f) = &self.show
+        {
+            let f = Arc::clone(f);
+            self.queue(move || f(u8::from(show)));
+        }
+    }
+
+    /// The guest set its cursor image, or removed it (`None`).
+    fn image(&self, image: Option<&CursorImage>) {
+        let mut state = self.state.lock();
+        state.image = image.is_some();
+        if let (Some(image), Some(f)) = (image, &self.glyph) {
+            let (f, image) = (Arc::clone(f), image.clone());
+            self.queue(move || {
+                let hot = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+                f(&CursorGlyph {
+                    width: image.width,
+                    height: image.height,
+                    hot_spot: (hot(image.hot_spot.0), hot(image.hot_spot.1)),
+                    rgba: &image.rgba,
+                });
+            });
+        }
+        self.tell_shown(&mut state);
+    }
+
+    /// The guest moved its cursor's hot spot to (`x`, `y`), and shows it where `visible`.
+    fn moved(&self, x: i32, y: i32, visible: bool) {
+        let mut state = self.state.lock();
+        state.visible = visible;
+        let axis = |v: i32| u32::from(u16::try_from(v.max(0)).unwrap_or(u16::MAX));
+        self.position
+            .store((axis(x) << 16) | axis(y), Ordering::Release);
+        if let Some(f) = &self.moved {
+            let f = Arc::clone(f);
+            self.queue(move || f());
+        }
+        self.tell_shown(&mut state);
+    }
+
+    /// Where the guest last put its cursor's hot spot.
+    fn position(&self) -> (u16, u16) {
+        let p = self.position.load(Ordering::Acquire);
+        let half = |v: u32| u16::try_from(v & 0xffff).unwrap_or(u16::MAX);
+        (half(p >> 16), half(p))
     }
 }
 
@@ -2270,29 +2412,36 @@ impl Screen for HeadlessScreen {
     fn cursor_moved(&self, _x: i32, _y: i32, _visible: bool) {}
 }
 
-/// The device's [`Screen`], which the host's reads of the display share: each call goes to the
-/// one it holds.
-struct SharedScreen(Arc<dyn Screen>);
+/// The device's [`Screen`]: each call goes to the screen it holds, which the host's reads of
+/// the display share, and the cursor's to the host as well ([`HostCursor`]).
+struct SharedScreen {
+    /// The window's screen, or the headless one.
+    screen: Arc<dyn Screen>,
+    /// The cursor as the host is told it.
+    cursor: Arc<HostCursor>,
+}
 
 impl Screen for SharedScreen {
     fn mode(&self) -> Mode {
-        self.0.mode()
+        self.screen.mode()
     }
 
     fn scanout(&self, scanout: Option<Scanout>) {
-        self.0.scanout(scanout);
+        self.screen.scanout(scanout);
     }
 
     fn present(&self) {
-        self.0.present();
+        self.screen.present();
     }
 
     fn cursor_image(&self, image: Option<CursorImage>) {
-        self.0.cursor_image(image);
+        self.cursor.image(image.as_ref());
+        self.screen.cursor_image(image);
     }
 
     fn cursor_moved(&self, x: i32, y: i32, visible: bool) {
-        self.0.cursor_moved(x, y, visible);
+        self.cursor.moved(x, y, visible);
+        self.screen.cursor_moved(x, y, visible);
     }
 }
 

@@ -6,7 +6,9 @@
 //! queue: a core [`SerialQueue`] made at the process's first display (docs/api.md section 5).
 //! Core queues onto it exactly the jobs it queued onto the host's queue, at the same points, so
 //! every display callback of the process runs one at a time in the order they were queued, as
-//! they did on the main queue QEMU and the runner gave every display. The queue's worker exits
+//! they did on the main queue QEMU and the runner gave every display. A graphics device queues
+//! its host's cursor callbacks onto it too (`graphics`' `HostCursor`), made at the first device
+//! whose host takes them where no display made it. The queue's worker exits
 //! after [`reims_vgpu_core::rt::queue::IDLE_EXIT`] idle and the next job starts another. It is
 //! not a dispatch queue, so core models the new-frame source with its `CoalescingSignal`. The
 //! library never waits for it: no core path `sync`s onto a display's queue, and a queue's drop
@@ -168,7 +170,8 @@ pub(crate) fn api_state<P: Platform>(platform: &Arc<P>) -> Arc<ApiState<P>> {
 }
 
 impl<P: Platform> ApiState<P> {
-    /// The display thread, made now if this is the process's first display.
+    /// The display thread, made now if this is the process's first display, or its first
+    /// graphics device whose host takes the cursor.
     pub(crate) fn display_thread(&self, platform: &P) -> Arc<dyn HostQueue> {
         let mut slot = self.display_thread.lock();
         let thread = slot.get_or_insert_with(|| {

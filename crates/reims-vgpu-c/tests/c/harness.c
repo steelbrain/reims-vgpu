@@ -737,17 +737,31 @@ static bool on_graphics_scanout_written(void *ctx, uint64_t offset, uint64_t len
     return true;
 }
 
+static _Atomic int graphics_moved;
+
+static void on_graphics_cursor_move(void *ctx) {
+    (void)ctx;
+    graphics_moved++;
+}
+
 /* A graphics device with no window, on every host: its registers, its region, its doorbell, a
  * GET_DISPLAYS the guest writes into the control ring answered with DISPLAYS and an interrupt,
- * a taking write, a read of its display, its reset, and its release, which ends its table once
- * its threads have ended. */
+ * a MOVE_CURSOR the host is told of and reads, a taking write, a read of its display, its reset,
+ * and its release, which ends its table once its threads have ended. */
 static void check_graphics(void) {
-    RvgGraphicsCallbacks cb = {sizeof cb, &graphics_destroyed, on_graphics_destroy,
-                               on_graphics_raise, on_graphics_scanout_written};
+    RvgGraphicsCallbacks cb = {sizeof cb,
+                               &graphics_destroyed,
+                               on_graphics_destroy,
+                               on_graphics_raise,
+                               on_graphics_scanout_written,
+                               NULL,
+                               NULL,
+                               on_graphics_cursor_move};
     RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, NULL, NULL};
     RvgGraphicsDevice *d = NULL;
     graphics_destroyed = 0;
     graphics_raised = 0;
+    graphics_moved = 0;
     CHECK_STATUS(rvg_graphics_device_create(NULL, &d), RVG_ERR_INVALID_ARGUMENT);
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
     CHECK(d != NULL);
@@ -786,6 +800,16 @@ static void check_graphics(void) {
     uint32_t answer[4];
     memcpy(answer, region + 0x10000 + 256, sizeof answer);
     CHECK(produced >= 16 && answer[0] == 0x101 && answer[2] == 1);
+    /* MOVE_CURSOR (type 4, 32 bytes, seqno 2) to (300, 200), shown, after it: the host is told
+     * on the display thread and reads where the hot spot is; a reset puts it at (0, 0). */
+    CHECK(rvg_graphics_device_cursor_position(d).x == 0);
+    uint32_t move[8] = {4, 32, 2, 0, 0, 300, 200, 1};
+    memcpy(region + 256 + 16, move, sizeof move);
+    atomic_store((_Atomic uint64_t *)(void *)region, 48);
+    CHECK(write(doorbell[1], "\1\0\0\0\0\0\0\0", 8) == 8);
+    CHECK(wait_for(&graphics_moved, 1));
+    RvgDisplayCoord at = rvg_graphics_device_cursor_position(d);
+    CHECK(at.x == 300 && at.y == 200);
     /* The taking write rings as the plain one does: a ring no queue has is ignored. */
     rvg_graphics_device_mmio_write_taking(d, 0x020, 0x40000);
     CHECK(rvg_graphics_device_mmio_read(d, 0x010) == 1);
@@ -807,6 +831,9 @@ static void check_graphics(void) {
 
     rvg_graphics_device_reset(d);
     CHECK(rvg_graphics_device_mmio_read(d, 0x010) == 0);
+    CHECK(wait_for(&graphics_moved, 2));
+    at = rvg_graphics_device_cursor_position(d);
+    CHECK(at.x == 0 && at.y == 0);
     rvg_graphics_device_release(d);
     close(doorbell[1]);
     CHECK(wait_for(&graphics_destroyed, 1));

@@ -53,12 +53,13 @@ Every struct the host fills in, and every struct the library hands out, starts w
   - `struct_size` below the first version's size is `RVG_ERR_INVALID_ARGUMENT`;
   - fields past `struct_size` read as zero;
   - a `struct_size` above the library's is accepted when every byte past the library's size is zero, and is `RVG_ERR_UNSUPPORTED` otherwise. A host built against a newer header then works with an older library as long as it leaves the new fields at zero.
-- **A struct that has grown** keeps its first version's size as the least it accepts, and a host built against an earlier version passes that version's size and is read as it, the later fields zero. Five have grown:
+- **A struct that has grown** keeps its first version's size as the least it accepts, and a host built against an earlier version passes that version's size and is read as it, the later fields zero. Six have grown:
   - `RvgDeviceConfig`, at its fourth version, 72 bytes. Its first ends at `callbacks`: 48 bytes, the offset of `memory_files`, which came after. A host built before `memory_files` passes 48 and is read with no files, whatever follows its config in memory (the unit tests `device::tests::a_first_version_device_config_is_48_bytes` and `a_48_byte_device_config_is_accepted`). Its second ends at `memory_files`, 56 bytes, the offset of `process_isolation_follows_guest`; a host built before that field passes 56 and is read with it false (`device::tests::isolation_following_the_guest_is_accepted`). Its third ends at `process_isolation_follows_guest`, 64 bytes with its padding, the offset of `dirty_source`; a host built before that field passes 64 and is read with no dirty source (`device::tests::a_dirty_source_lives_with_its_device`).
   - `RvgDisplayConfig`, at its second version. Its first ends at `callbacks`: 56 bytes, the offset of `window`, which came after. A host built before `window` passes 56 and is read, with no window (the unit tests `window::tests::a_first_version_display_config_is_56_bytes` and `a_56_byte_display_config_is_accepted`).
   - `RvgWindowConfig`, at its third version, 32 bytes. Its first ends at `callbacks`, 16 bytes, and a host built against it gets no mode; its second ends at `mode_height`, 24 bytes with its padding, and a host built against it gets no density (the unit tests `window::tests::a_first_version_window_config_is_16_bytes_and_has_no_mode` and `a_second_version_window_config_is_24_bytes_and_has_no_density`).
   - `RvgWindowCallbacks`, at its second version, 64 bytes. Its first ends at `close`: 56 bytes, the offset of `scroll`, which came after. A host built against it passes 56 and is read with no `scroll`, whatever follows its table in memory (the unit test `window::tests::a_first_version_window_callbacks_is_56_bytes_and_has_no_scroll`), so its scrolling comes as notches through `wheel`.
   - `RvgGraphicsDeviceConfig`, at its second version, 40 bytes. Its first ends at `window`: 24 bytes, the offset of `memory_map`, which came after with `memory_files`. A host built before them passes 24 and is read with no memory map, so each IOSurface's GPU view stays a copy of its pages in the region (the unit test `graphics::tests::a_first_version_graphics_config_makes_a_device`).
+  - `RvgGraphicsCallbacks`, at its second version, 64 bytes. Its first ends at `scanout_written`: 40 bytes, the offset of `cursor_glyph`, which came after with `cursor_show` and `cursor_move`. A host built before them passes 40 and is read with no cursor callbacks, so it is told nothing of the guest's cursor (the unit test `graphics::tests::a_first_version_graphics_callbacks_tells_no_cursor`).
   - Every other struct is still at its first version.
 - **A struct the library writes** (`RvgCursorGlyph`, `RvgWindowScroll`): the host reads a field only if `struct_size` covers it.
 - **Zero is every field's default.** A setting that is on by default is named for turning it off: `disable_argument_buffers`. The exception is `display_port_count`, where 0 is refused.
@@ -129,7 +130,7 @@ The resume reasons are the codes 0 to 5 (`RVG_RESUME_ERROR_*`), with `RVG_RESUME
 | `raise_interrupt` | `rvg_status_message` |
 | `add_trace_range` | `rvg_trace_range_handler_retain`, `rvg_status_message` |
 | `remove_trace_range` | `rvg_trace_range_handler_release`, `rvg_status_message` |
-| a display callback | every function: the library never waits for the display thread |
+| a display callback, or the graphics device's `cursor_glyph`, `cursor_show`, `cursor_move` | every function: the library never waits for the display thread |
 | a window callback (`pointer`, `wheel`, `key`, `close`, `scroll`) | every function; it must not block (section 5) |
 | the IOSurface `raise_interrupt` | every function except releasing its own IOSurface device, which ends the process |
 | the video `send_to_guest` | `rvg_status_message` |
@@ -176,7 +177,7 @@ The header has 57 functions and every type, callback typedef and constant, with 
 | IOSurface device | `RvgIOSurfaceDeviceConfig`, `RvgIOSurfaceCallbacks`; `rvg_iosurface_device_create`, `_release`, `_mmio_read`, `_mmio_write` |
 | video device | `RvgVideoDeviceConfig`, `RvgVideoCallbacks`, `RvgVideoSendToGuestFn`, the `RVG_VIDEO_*` constants (Apple's PCI IDs 0x106b and 0x1a03, two queues, the guest's 0x4000-byte buffers, `RVG_VIDEO_INVALID_SESSION` -12903, `RVG_VIDEO_MAX_MESSAGE_SIZE` 16 MiB, `RVG_VIDEO_ALLOCATION_FAILED` -12904); `rvg_video_device_create`, `_release`, `_start`, `_deliver`, `_invalidate`, `_reset` |
 | scaler device | `RvgScalerDeviceConfig`, `RvgScalerGuestMemory`, `RvgScalerIsRamFn`, `RvgScalerReadFn`, `RvgScalerWriteFn`, `RvgScalerOutcome` and its `RVG_SCALER_REPLY`, `_NEEDS_RESET`, `_END_VM`, the `RVG_SCALER_*` constants (Apple's PCI IDs 0x106b and 0x1a0b, one queue); `rvg_scaler_device_create`, `_release`, `_scales`, `_start`, `_process`, `_reset` |
-| graphics device | `RvgGraphicsDeviceConfig`, `RvgGraphicsCallbacks`, `RvgGraphicsRaiseFn`, `RvgGraphicsScanoutWrittenFn`, the `RVG_GRAPHICS_*` constants (PCI IDs 0x1234 and 0x5247, class 0x0380, BAR 0's 4 KiB of registers with the MSI-X table and PBA from 0x800, one vector, BAR 2 the region, the DOORBELL register 0x20 and the control ring's id 0, the guest's allocations from 0x400000); `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write`, `_mmio_write_taking`, `_set_doorbell`, `_reset`, `_read_display` |
+| graphics device | `RvgGraphicsDeviceConfig`, `RvgGraphicsCallbacks`, `RvgGraphicsRaiseFn`, `RvgGraphicsScanoutWrittenFn`, the `RVG_GRAPHICS_*` constants (PCI IDs 0x1234 and 0x5247, class 0x0380, BAR 0's 4 KiB of registers with the MSI-X table and PBA from 0x800, one vector, BAR 2 the region, the DOORBELL register 0x20 and the control ring's id 0, the guest's allocations from 0x400000); `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write`, `_mmio_write_taking`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position` |
 | trace ranges | `rvg_trace_range_handler_invoke`, `_retain`, `_release` |
 
 ### What the header fixes
@@ -614,6 +615,9 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>; // the 
 pub struct GraphicsCallbacks {
     pub raise_interrupt: Option<GraphicsRaiseFn>,
     pub scanout_written: Option<ScanoutWrittenFn>, // None: every refresh shows the scanout
+    pub cursor_glyph: Option<CursorGlyphFn>,       // on the display thread, as a display's:
+    pub cursor_show: Option<CursorShowFn>,         // straight RGBA, shown with an image
+    pub cursor_move: Option<CursorMoveFn>,         // cursor_position reads where
 }
 #[derive(Clone, Default)]
 pub struct GraphicsConfig {
@@ -634,6 +638,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     pub fn reset(&self);
     pub fn read_display(&self, dst: &mut [u8])            // what the display shows, BGRA8,
         -> ((u32, u32), Result<(), Error>);              // and the mode's size
+    pub fn cursor_position(&self) -> (u16, u16);         // the guest's hot spot
 }
 
 // One plane of a surface, as a platform gives it to the video devices.
@@ -755,8 +760,9 @@ The header's 57 functions, in its order. "May" is the header's mark "may call ba
 | 55 | `rvg_graphics_device_set_doorbell` | | the host's doorbell file for the control ring (QEMU's ioeventfd), which the device polls with its own wake |
 | 56 | `rvg_graphics_device_reset` | | the guest's bus reset, as STATUS 0: the device as one just made, every object the guest made dropped, its display still showing its scanout |
 | 57 | `rvg_graphics_device_read_display` | | what the display shows now, read back: the scanout or the presented IOSurface, through the display's colour, drawn as the window draws it into a texture of the display's mode, BGRA8 rows of `width * 4` bytes, black where the guest shows nothing; the mode's size given whatever the result, so a NULL buffer asks it. Waits for the draw on the GPU; answers no present and tells the guest nothing |
+| 58 | `rvg_graphics_device_cursor_position` | | where the guest last put its cursor's hot spot, each axis kept to 0 to 65535: (0, 0) before it moves it and after a reset; the host reads it at its `cursor_move` |
 
-QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), its `reims-graphics-pci` eight of the graphics device's nine (all but `_mmio_write`, as each register write goes through `_mmio_write_taking`), the suite's runner 33 (all but `rvg_log_set_handler` and `rvg_frame_target_retain`), and the C harness (`tests/c/harness.c`) all 57, the scaler's process and reset after a start only where the device scales (elsewhere it checks that the start fails). What the runner leaves out is covered in the C API's tests: `api.log.handler` pins the log hook, and `frame::tests::a_retained_target_lives_until_its_last_release` checks that a retained target keeps its texture until its last release.
+QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), its `reims-graphics-pci` nine of the graphics device's ten (all but `_mmio_write`, as each register write goes through `_mmio_write_taking`), the suite's runner 33 (all but `rvg_log_set_handler` and `rvg_frame_target_retain`), and the C harness (`tests/c/harness.c`) all 58, the scaler's process and reset after a start only where the device scales (elsewhere it checks that the start fails). What the runner leaves out is covered in the C API's tests: `api.log.handler` pins the log hook, and `frame::tests::a_retained_target_lives_until_its_last_release` checks that a retained target keeps its texture until its last release.
 
 ## 5. Callbacks and threads
 
@@ -768,7 +774,7 @@ QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), its `reims-graphics-pci` eig
 | `read_memory` | as above | nothing | core's |
 | `raise_interrupt` | the FIFO threads and the reporting thread; or inside a call that may call back | the device's signal lock: never concurrent for one device | core's |
 | `add_trace_range`, `remove_trace_range` | the EFI display's present queue: its worker, or the host's thread inside a call that may call back (the MMIO write that starts or stops the EFI display, a release), where the queue's `sync` runs its block | the EFI display's present queue | add before the handler can run; remove once for each non-NULL range add returned, when presents from it stop, and never for NULL |
-| `mode_change`, `new_frame`, `cursor_glyph`, `cursor_show`, `cursor_move` | the display thread: one serial worker for the whole process (after 5 s idle it exits, and the next job starts a new one) | every display callback of the process: one at a time | the order the displays queued them |
+| `mode_change`, `new_frame`, `cursor_glyph`, `cursor_show`, `cursor_move`, and the graphics device's `cursor_glyph`, `cursor_show`, `cursor_move` | the display thread: one serial worker for the whole process (after 5 s idle it exits, and the next job starts a new one) | every display callback of the process: one at a time | the order the displays queued them; a graphics device's, the order its control thread took the guest's cursor commands, and its resets |
 | a window's `pointer`, `wheel`, `key`, `close`, `scroll` | on macOS the process's main thread, where AppKit runs; on Linux the library's thread `reims-vgpu.ui`; never inside a call of the host's | every window callback of the process: one at a time | the order the events arrived |
 | IOSurface `raise_interrupt` | the IOSurface device's own thread | itself | the ring's order |
 | video `send_to_guest` | the host session's threads, or the host's own inside `rvg_video_device_deliver` | nothing: the host copies each message and keeps the calls' order for the guest | the session's |
@@ -793,7 +799,7 @@ So the order the host sees is core's. The suite's `blk` records check it, as do 
 ### The display thread
 
 Every display is given the same executor in place of a host's queue:
-1. **One serial executor per process** (core's `SerialQueue`, "the display thread"), made at the process's first display. Another handle is the same queue, and a display drops its handle at its unplug.
+1. **One serial executor per process** (core's `SerialQueue`, "the display thread"), made at the process's first display, or at its first graphics device whose host gives a cursor callback. Another handle is the same queue, and a display drops its handle at its unplug, a graphics device at the end of its threads.
 2. **Jobs run in the order they were queued.** Core queues a display's job at each point where it hands work to the display's queue. A job runs after every job queued before it, across displays and devices, a `recreate` included.
 3. **`new_frame` coalesces** through core's `CoalescingSignal`, since the display thread is no dispatch queue: calls merge, and their count depends on timing (docs/testing.md 4.6).
 4. **A job reads its handler when it runs.** A display released with a job queued dies at that job (`ModeChangeHandlerGone` and the others); `QueueGone` is reachable in the same race. Only a guest's cursor doorbell queues a job that does not hold its display, so a host cannot cause this without a guest (the unit test `display::tests::a_display_released_with_a_job_queued_dies`).

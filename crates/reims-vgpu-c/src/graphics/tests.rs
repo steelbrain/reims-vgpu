@@ -18,6 +18,9 @@ fn callbacks() -> RvgGraphicsCallbacks {
         destroy: Some(destroy),
         raise_interrupt: Some(raise),
         scanout_written: None,
+        cursor_glyph: None,
+        cursor_show: None,
+        cursor_move: None,
     }
 }
 
@@ -162,6 +165,52 @@ fn a_first_version_graphics_config_makes_a_device() {
         assert!(!device.is_null());
         rvg_graphics_device_release(device);
     }
+}
+
+static MOVES: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C-unwind" fn cursor_moved(_ctx: *mut c_void) {
+    MOVES.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A host built against the first version of the callbacks passes a table that ends at
+/// `scanout_written`: it is told nothing of the cursor, whatever follows its table in memory.
+/// The second version's host is told of each move, a reset's among them, and reads where the
+/// hot spot is
+#[test]
+fn a_first_version_graphics_callbacks_tells_no_cursor() {
+    let moves = |struct_size: usize| {
+        let cb = RvgGraphicsCallbacks {
+            struct_size: struct_size as u32,
+            destroy: None,
+            cursor_move: Some(cursor_moved),
+            ..callbacks()
+        };
+        let c = config(&cb);
+        let mut device = std::ptr::null_mut();
+        let before = MOVES.load(Ordering::SeqCst);
+        // SAFETY: a live config and out-pointer; then a live device, released.
+        let at = unsafe {
+            assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
+            rvg_graphics_device_reset(device);
+            for _ in 0..2000 {
+                if MOVES.load(Ordering::SeqCst) > before {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Past a move the display thread would run late.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let at = rvg_graphics_device_cursor_position(device);
+            rvg_graphics_device_release(device);
+            at
+        };
+        assert_eq!(at, RvgDisplayCoord { x: 0, y: 0 });
+        MOVES.load(Ordering::SeqCst) - before
+    };
+    assert_eq!(RvgGraphicsCallbacks::V1_SIZE, 40);
+    assert_eq!(moves(RvgGraphicsCallbacks::V1_SIZE), 0);
+    assert_eq!(moves(size_of::<RvgGraphicsCallbacks>()), 1);
 }
 
 /// The read of the display: with no buffer it is refused, with the mode's size given, 1920 x

@@ -13,6 +13,10 @@ use std::sync::Arc;
 use reims_vgpu::{GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn};
 
 use crate::device::{RvgMemoryMap, RvgMemoryRangeFile, memory_map};
+use crate::display::{
+    RvgCursorGlyphFn, RvgCursorMoveFn, RvgCursorShowFn, RvgDisplayCoord, cursor_glyph, cursor_move,
+    cursor_show,
+};
 use crate::ffi;
 use crate::handle;
 use crate::sized::{self, HostStruct};
@@ -112,6 +116,13 @@ pub type RvgGraphicsScanoutWrittenFn =
     Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, offset: u64, length: u64) -> bool>;
 
 /// The graphics device's callbacks.
+///
+/// The cursor's three tell the host the guest's cursor on the device's display, for a host that
+/// draws it (QEMU's console, for its SPICE, VNC, GTK and D-Bus displays); the device's window
+/// shows it either way. Thread, and what they may call: as RvgModeChangeFn's, on the display
+/// thread, one at a time with every display callback of the process, in the order the device
+/// took the guest's cursor commands and resets. The guest sees nothing of whether the host gives
+/// them.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[expect(
@@ -127,10 +138,29 @@ pub struct RvgGraphicsCallbacks {
     pub destroy: RvgDestroyFn,
     pub raise_interrupt: RvgGraphicsRaiseFn,
     pub scanout_written: RvgGraphicsScanoutWrittenFn,
+    /// The guest set its cursor's image: `rgba` holds its pixels as straight-alpha RGBA (the
+    /// guest gives them premultiplied, BGRA), each side 1 to 256 pixels, the hot spot inside.
+    /// Followed by `cursor_show` where whether the cursor shows changed.
+    pub cursor_glyph: RvgCursorGlyphFn,
+    /// Whether the cursor shows, where that changed: 1 once the guest has an image while it
+    /// shows its cursor; 0 once it hides it or removes its image, which a reset removes. It is
+    /// hidden until the first call.
+    pub cursor_show: RvgCursorShowFn,
+    /// The guest moved its cursor, or a reset put it at (0, 0):
+    /// rvg_graphics_device_cursor_position reads where its hot spot is.
+    pub cursor_move: RvgCursorMoveFn,
 }
 
 // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
-unsafe impl HostStruct for RvgGraphicsCallbacks {}
+unsafe impl HostStruct for RvgGraphicsCallbacks {
+    /// The first version ends at `scanout_written`: a host built against it passes 40, and is
+    /// told nothing of the cursor.
+    const V1_SIZE: usize = 40;
+}
+
+const _: () = assert!(
+    std::mem::offset_of!(RvgGraphicsCallbacks, cursor_glyph) == RvgGraphicsCallbacks::V1_SIZE
+);
 
 /// The graphics device's config.
 #[repr(C)]
@@ -288,6 +318,9 @@ unsafe fn create(
         callbacks: GraphicsCallbacks {
             raise_interrupt,
             scanout_written,
+            cursor_glyph: cursor_glyph(&table, callbacks.cursor_glyph),
+            cursor_show: cursor_show(&table, callbacks.cursor_show),
+            cursor_move: cursor_move(&table, callbacks.cursor_move),
         },
         window: match (&window, &window_table) {
             (Some((w, wc)), Some(t)) => Some(w.to_config(window_callbacks(t, wc))),
@@ -505,6 +538,25 @@ pub unsafe extern "C" fn rvg_graphics_device_read_display(
             Ok(()) => RVG_OK,
             Err(e) => status(e),
         }
+    })
+}
+
+/// Where the guest last put its cursor's hot spot, in the display's pixels, each axis kept to 0
+/// to 65535: (0, 0) before it moved it and after a reset. The host reads it at its cursor_move
+/// (RvgGraphicsCallbacks). On any thread. Calls back: never.
+///
+/// # Safety
+/// `device` is a live graphics device handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_graphics_device_cursor_position(
+    device: *const RvgGraphicsDevice,
+) -> RvgDisplayCoord {
+    ffi::export(|| {
+        // SAFETY: the caller's contract.
+        let (x, y) = unsafe { live(device, "rvg_graphics_device_cursor_position") }
+            .device
+            .cursor_position();
+        RvgDisplayCoord { x, y }
     })
 }
 
