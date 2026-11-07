@@ -1323,10 +1323,13 @@ mod tests {
 
     /// A copy with no blit option between a buffer and a Depth32Float_Stencil8 texture copies
     /// its depth, 4 bytes a texel, both ways, as Metal's does on this host (the same bytes, with
-    /// the stencil left 0). A device that may clamp a depth outside `[0, 1]` (neither
-    /// `VK_EXT_depth_range_unrestricted` nor the runtime's `DepthImageKeepsValuesOutsideUnitRange`:
-    /// ANV) dies at the upload in strict mode, naming `restricted-depth-upload`, and copies depths
-    /// in `[0, 1]` both ways, by default, where any other device copies any bytes
+    /// the stencil left as it was). The stencil is written first, by a stencil-only upload: a new
+    /// texture's never-written stencil reads what its memory held before, which on an RX 550
+    /// (RADV) was an earlier process's bytes. A device that may clamp a depth outside `[0, 1]`
+    /// (neither `VK_EXT_depth_range_unrestricted` nor the runtime's
+    /// `DepthImageKeepsValuesOutsideUnitRange`: ANV) dies at the upload in strict mode, naming
+    /// `restricted-depth-upload`, and copies depths in `[0, 1]` both ways, by default, where any
+    /// other device copies any bytes
     #[test]
     fn no_option_copies_a_combined_textures_depth() {
         use metal2vulkan::device::VkExtension;
@@ -1348,6 +1351,12 @@ mod tests {
             },
         );
         let t = d.new_texture(OnFault::Return, &desc).unwrap().unwrap();
+        let seed: Vec<u8> = (0..16u8)
+            .map(|i| i.wrapping_mul(13).wrapping_add(0x40))
+            .collect();
+        let seeds = shared(16);
+        // SAFETY: the buffer's Shared bytes, written before any command uses them.
+        unsafe { std::ptr::copy_nonoverlapping(seed.as_ptr(), seeds.contents().as_ptr(), 16) };
         let source = shared(128);
         let p: Vec<u8> = if keeps {
             (0..128u8)
@@ -1364,6 +1373,19 @@ mod tests {
         let (depth, stencil, none) = (shared(64), shared(16), shared(128));
         let cb = buffer();
         let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        let stencil_up = BlitCmd::CopyBufferToTextureOptions {
+            source_buffer: Some(&seeds),
+            source_offset: 0,
+            source_bytes_per_row: 4,
+            source_bytes_per_image: 16,
+            source_size: MtlSize::new(4, 4, 1),
+            destination_texture: Some(&t),
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(0, 0, 0),
+            options: 2,
+        };
+        e.encode(OnFault::Return, stencil_up).unwrap();
         let up = || BlitCmd::CopyBufferToTexture {
             source_buffer: &source,
             source_offset: 0,
@@ -1405,7 +1427,7 @@ mod tests {
             .flat_map(|r| p[32 * r..32 * r + 16].to_vec())
             .collect();
         assert_eq!(bytes(&depth), rows);
-        assert_eq!(bytes(&stencil), [0; 16]);
+        assert_eq!(bytes(&stencil), seed);
         let padded: Vec<u8> = rows
             .chunks(16)
             .flat_map(|row| row.iter().copied().chain([0; 16]))
