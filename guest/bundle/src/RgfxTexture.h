@@ -41,6 +41,15 @@ class RgfxSlabs;
 /// The wire's RgfxTextureDescriptor of `d`: each Metal enum its raw value, the four swizzle
 /// channels one byte each, red lowest (RgfxTexture.mm).
 RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *_Nonnull d);
+
+/// Whether a texture of `d` of memory of its own takes more bytes than `maxLength` (the device's
+/// maxBufferLength; 0 holds none back): every level of every slice and sample, in its format's
+/// blocks, which its allocatedSize answers. The device's newTextureWithDescriptor: answers nil
+/// for one, sending nothing, as the Intel 630 under macOS 26.7.1 answers nil past its
+/// maxBufferLength (oracle_texdesc device: 2 GiB made, a row more nil), as a buffer and a heap
+/// past it are nil there and here; the AMD 5300M makes one of 16 GiB and none of 20 GiB, its
+/// maxBufferLength 3.2 GB (docs/graphics-kext/dgpu-oracle.md, Q24).
+bool rgfxTexturePastLength(MTLTextureDescriptor *_Nonnull d, uint64_t maxLength);
 #endif
 
 NS_ASSUME_NONNULL_BEGIN

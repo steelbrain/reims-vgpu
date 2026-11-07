@@ -983,6 +983,11 @@ uint64_t rgfxTextureBytes(const RgfxTextureDescriptor &d)
 }
 } // namespace
 
+bool rgfxTexturePastLength(MTLTextureDescriptor *d, uint64_t maxLength)
+{
+	return maxLength != 0 && rgfxTextureBytes(rgfxTextureDescriptorFromMTL(d)) > maxLength;
+}
+
 @implementation RgfxTexture {
 	RgfxTextureDescriptor _desc; // the mapped shape the getters answer from
 	uint64_t _gpuAddress;        // the picked GPU address (0 when heap-placed)

@@ -1295,6 +1295,12 @@ under macOS 27.0.1 answers nil for the 8 TiB and the 128 GiB textures (the small
 asked of it, as its memory is the desktop's).
 
 What our stack does:
+- *(class 2)* The device's creator answers nil for a texture of more bytes than the device's
+  `maxBufferLength`, every level of every slice and sample, sending nothing
+  (`rgfxTexturePastLength`, RgfxTexture.h), as the Intel does and as the bundle answers a buffer
+  and a heap past it. Until 11-07 the bundle sent it, posted, and answered a texture whose
+  create the host's platform could refuse for its size: a texture the app held, whose command
+  buffers' draws the host would then drop (`refused.rs`).
 - *(class 3)* Every texture creator runs one copy of the validation before it sends the host
   anything (`rgfxEndAtInvalidTextureDescriptor`, RgfxTexture.h): the device's, both of a heap's,
   a buffer's public form and its linear and tiled SPI, and the creator over an IOSurface (Q20).

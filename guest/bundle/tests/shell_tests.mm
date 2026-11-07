@@ -593,6 +593,57 @@ void test_device_heaps_answer_as_metal()
 	drainRing(fx.ring);
 }
 
+// The device's newTextureWithDescriptor: makes no texture of more bytes than maxBufferLength,
+// as the Intel 630 under macOS 26.7.1 makes none (oracle_texdesc device, Q24): its 2 GiB
+// maxBufferLength holds a 16384 x 8192 RGBA32Float texture, made there, and not one a row taller,
+// nil there. The bytes are every level of every slice and sample, in the format's blocks, as the
+// texture's allocatedSize answers; a limit of 0 holds none back.
+void test_textures_past_max_buffer_length_are_nil()
+{
+	auto shape = [](MTLPixelFormat format, MTLTextureType type, NSUInteger width,
+	                NSUInteger height, NSUInteger depth, NSUInteger array) {
+		MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+		d.pixelFormat = format;
+		d.textureType = type;
+		d.width = width;
+		d.height = height;
+		d.depth = depth;
+		d.arrayLength = array;
+		return d;
+	};
+	@autoreleasepool {
+		const uint64_t intel = 2147483648ull; // the Intel 630's maxBufferLength
+		CHECK(!rgfxTexturePastLength(
+		    shape(MTLPixelFormatRGBA32Float, MTLTextureType2D, 16384, 8192, 1, 1), intel));
+		CHECK(rgfxTexturePastLength(
+		    shape(MTLPixelFormatRGBA32Float, MTLTextureType2D, 16384, 8193, 1, 1), intel));
+		// What all three Macs answer nil for (huge.2darray, huge.3d), past ours on the RTX 5080
+		// (12821200896), and past no limit at 0.
+		MTLTextureDescriptor *slices =
+		    shape(MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1, 2048);
+		MTLTextureDescriptor *volume =
+		    shape(MTLPixelFormatRGBA32Float, MTLTextureType3D, 2048, 2048, 2048, 1);
+		CHECK(rgfxTexturePastLength(slices, 12821200896ull));
+		CHECK(rgfxTexturePastLength(volume, 12821200896ull));
+		CHECK(!rgfxTexturePastLength(slices, 0) && !rgfxTexturePastLength(volume, 0));
+		// Levels, faces, samples and blocks count: 64 x 64 BGRA8Unorm of a full chain is 21844
+		// bytes, a cube of one level 98304, 4 samples 65536, BC1 2048.
+		MTLTextureDescriptor *chain =
+		    shape(MTLPixelFormatBGRA8Unorm, MTLTextureType2D, 64, 64, 1, 1);
+		chain.mipmapLevelCount = 7;
+		CHECK(!rgfxTexturePastLength(chain, 21844) && rgfxTexturePastLength(chain, 21843));
+		MTLTextureDescriptor *cube =
+		    shape(MTLPixelFormatBGRA8Unorm, MTLTextureTypeCube, 64, 64, 1, 1);
+		CHECK(!rgfxTexturePastLength(cube, 98304) && rgfxTexturePastLength(cube, 98303));
+		MTLTextureDescriptor *ms =
+		    shape(MTLPixelFormatBGRA8Unorm, MTLTextureType2DMultisample, 64, 64, 1, 1);
+		ms.sampleCount = 4;
+		CHECK(!rgfxTexturePastLength(ms, 65536) && rgfxTexturePastLength(ms, 65535));
+		MTLTextureDescriptor *bc1 = shape(MTLPixelFormatBC1_RGBA, MTLTextureType2D, 64, 64, 1, 1);
+		CHECK(!rgfxTexturePastLength(bc1, 2048) && rgfxTexturePastLength(bc1, 2047));
+	}
+}
+
 // The id space is monotonic across wrappers: a second buffer gets the next objId
 // and a disjoint, higher GPU address, and its own BUFFER_CREATE.
 void test_second_buffer_is_monotonic()
@@ -15266,6 +15317,7 @@ int main(int argc, char **argv)
 		test_device_buffers_take_pages_of_slabs();
 		test_managed_buffers_place_their_cpu_copies_in_heaps();
 		test_device_heaps_answer_as_metal();
+		test_textures_past_max_buffer_length_are_nil();
 		test_shared_heaps_and_cpu_depth_textures_end_the_process();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();

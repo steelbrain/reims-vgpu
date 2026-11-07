@@ -82,6 +82,10 @@
 	rgfxEndAtInvalidTextureDescriptor(descriptor, self);
 	if (descriptor != nil && RgfxMakesNoResourceOf(descriptor.resourceOptions))
 		return nil;
+	// None of more bytes than maxBufferLength, as the Intel 630 makes none
+	// (rgfxTexturePastLength).
+	if (descriptor != nil && rgfxTexturePastLength(descriptor, [self maxBufferLength]))
+		return nil;
 	// A Managed texture's CPU copy is a Shared buffer of the slabs where the host reads a copy
 	// wherever its buffer lies (RGFX_FEATURE_MANAGED_TEXTURE_SLABS), so the copies take the
 	// process's own pages and not the region every process shares; else a region block. One of
