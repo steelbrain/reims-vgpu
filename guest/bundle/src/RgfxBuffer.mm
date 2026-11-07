@@ -251,7 +251,7 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
                                    device:(id<MTLDevice>)device
                                serializer:(RgfxSerializer *)serializer
 {
-	if (length == 0 || (maxLength != 0 && length > maxLength))
+	if (length == 0 || (maxLength != 0 && length > maxLength) || RgfxMakesNoResourceOf(options))
 		return nil;
 	if (!rgfxCpuStorage(options)) {
 		// The GPU's alone: no bytes reach it from here.

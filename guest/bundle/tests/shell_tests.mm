@@ -419,6 +419,24 @@ void test_device_buffers_take_pages_of_slabs()
 		// modes alone, as both x86 Macs do (0x200 for 0x100000, 0x210 for 0x100010).
 		CHECK(make(256, static_cast<MTLResourceOptions>(0x100000)).resourceOptions == 0x200);
 		CHECK(make(256, static_cast<MTLResourceOptions>(0x100010)).resourceOptions == 0x210);
+		// None with bit 18 (0x40000), of a length or of bytes, in any storage mode, as both x86
+		// Macs make none; bits 17 and 19 make one.
+		static const uint8_t seed[256] = {};
+		for (MTLResourceOptions mode : {MTLResourceStorageModeShared, MTLResourceStorageModeManaged,
+		                                MTLResourceStorageModePrivate}) {
+			CHECK(make(256, mode | kRgfxOptionBit18) == nil);
+			CHECK(make(256, mode | (kRgfxOptionBit18 >> 1)) != nil);
+			CHECK(make(256, mode | (kRgfxOptionBit18 << 1)) != nil);
+			CHECK([RgfxBuffer bufferForDeviceWithLength:256
+			                                    options:mode | kRgfxOptionBit18
+			                                      bytes:seed
+			                                  maxLength:0
+			                                      slabs:&slabs
+			                                     device:nil
+			                                 serializer:&fx.ser] == nil);
+		}
+		CHECK(RgfxMakesNoResourceOf(MTLResourceStorageModePrivate | kRgfxOptionBit18) &&
+		      !RgfxMakesNoResourceOf(MTLResourceStorageModePrivate | 0x100000));
 		CHECK(make(0x10000, MTLResourceStorageModeShared).allocatedSize == 0x10000);
 		CHECK(make(0x10001, MTLResourceStorageModeShared).allocatedSize == 0x11000);
 		RgfxBuffer *mib = make(0x100001, MTLResourceStorageModeManaged);

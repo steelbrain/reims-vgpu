@@ -75,6 +75,20 @@ NS_ASSUME_NONNULL_BEGIN
                                                     device:(nullable id<MTLDevice>)device
                                                 serializer:(nullable RgfxSerializer *)serializer;
 
+/// Bit 18 of MTLResourceOptions (0x40000), whose meaning nothing states. Both x86 Macs make no
+/// buffer of a length or of bytes, nor a texture of a descriptor, whose options hold it: nil in
+/// each storage mode, where they make one with bit 17 or 19 instead (measured: macOS 26.7.1 on the
+/// AMD 5300M and the Intel 630). They make a no-copy buffer and a heap's buffer with it, and
+/// diverge on a Private heap (the AMD's is nil, the Intel's is made).
+static const MTLResourceOptions kRgfxOptionBit18 = (MTLResourceOptions)1 << 18;
+
+/// Whether the device makes no buffer of a length or of bytes, nor a texture, of `options`
+/// (kRgfxOptionBit18).
+static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
+{
+	return (options & kRgfxOptionBit18) != 0;
+}
+
 #ifdef __cplusplus
 /// The buffer `newBufferWithLength:options:` (`bytes` null) and
 /// `newBufferWithBytes:length:options:` make: a Shared one in a range of a slab of `slabs`, which
@@ -87,7 +101,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// maxBufferLength; 0 holds none back). Nil too where `slabs` has no room for a Shared or
 /// Managed one, as Metal answers a buffer it cannot place, never memory the GPU does not see;
 /// and for bytes with a mode whose contents the CPU never reaches (Private), which Metal's
-/// validation refuses.
+/// validation refuses; and for options with bit 18, as the x86 Macs (RgfxMakesNoResourceOf).
 + (nullable instancetype)bufferForDeviceWithLength:(NSUInteger)length
                                            options:(MTLResourceOptions)options
                                              bytes:(nullable const void *)bytes
