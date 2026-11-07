@@ -89,7 +89,7 @@ impl Registration {
 
     /// The host address of the buffer's first byte, which the GPU writes
     /// by DMA.
-    fn first(&self) -> NonNull<u8> {
+    pub(crate) fn first(&self) -> NonNull<u8> {
         // SAFETY: the offset is inside the view (checked at registration).
         unsafe { self.view.first.add(self.view.offset) }
     }
@@ -114,4 +114,23 @@ impl Drop for Registration {
             log::warn!("{error}");
         }
     }
+}
+
+/// `memory`'s view registered on `gpu`: the process's registration of its
+/// mapping, made now where there is none. `Err` says why there is none: no
+/// decoders made the process's registrations, the mapping went, or CUDA
+/// refused it.
+pub(crate) fn registered(
+    gpu: &Arc<Gpu>,
+    memory: &dyn DeviceMemory,
+) -> Result<Arc<Registration>, String> {
+    // Made with the decoders whose picture is written.
+    let registrations =
+        (REGISTRATIONS.get()).ok_or("no decoders made the process's registrations")?;
+    registrations.get_or_make(
+        &memory.identity(),
+        0,
+        || Registration::new(gpu, memory),
+        || "the buffer's mapping went while it was held".to_owned(),
+    )
 }

@@ -15,7 +15,9 @@ use reims_vgpu_video_codec::h264::{
     Accelerator, PictureParams, ReferenceFrame, SliceParams, slice::SliceType, sps::Sps,
 };
 
-use super::decoder::{Decoder, DecoderSpec, Picture, SPARE_SURFACES, surface_count};
+use super::decoder::{
+    Decoder, DecoderSpec, InPlace, Picture, SPARE_SURFACES, active, surface_count,
+};
 use super::ffi::{self, Zeroed};
 use super::{ChromaFormat, NvdecCodec};
 use crate::cuda::Gpu;
@@ -25,17 +27,21 @@ use crate::error::Error;
 pub(crate) struct NvdecH264 {
     gpu: Arc<Gpu>,
     decoder: Option<Decoder>,
+    /// The sample being decoded, for its slices to go to NVDEC in place.
+    pub(crate) in_place: InPlace,
 }
 
 impl NvdecH264 {
     pub(crate) fn new(gpu: Arc<Gpu>) -> Self {
-        Self { gpu, decoder: None }
+        Self {
+            gpu,
+            decoder: None,
+            in_place: InPlace::default(),
+        }
     }
 
     fn decoder(&self) -> Result<&Decoder, Error> {
-        self.decoder
-            .as_ref()
-            .ok_or_else(|| Error::Unsupported("decoding before an SPS is active".into()))
+        active(self.decoder.as_ref())
     }
 }
 
@@ -81,8 +87,11 @@ impl Accelerator for NvdecH264 {
         slices: &[SliceParams<'_, Picture>],
     ) -> Result<(), Error> {
         let mut pic = picture_parameters(picture, params, slices);
-        self.decoder()?
-            .decode_nals(&mut pic, slices.iter().map(|slice| slice.nal))
+        active(self.decoder.as_ref())?.decode_nals(
+            &mut pic,
+            slices.iter().map(|slice| slice.nal),
+            &mut self.in_place,
+        )
     }
 }
 

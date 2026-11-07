@@ -46,7 +46,7 @@ impl Failures {
     }
 
     /// Whether a decode was noted as failed since the last call.
-    fn take(&self) -> bool {
+    pub(crate) fn take(&self) -> bool {
         self.0.swap(false, Ordering::Acquire)
     }
 }

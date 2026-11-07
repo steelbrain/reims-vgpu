@@ -555,15 +555,108 @@ impl Decoder {
     /// Decodes one picture of `nals`, its H.264 slices or HEVC slice
     /// segments, as [`Decoder::decode`] does: sent as an Annex B stream,
     /// each NAL unit after a three-byte start code, with
-    /// `pSliceDataOffsets` giving where each starts.
+    /// `pSliceDataOffsets` giving where each starts. Where `in_place` holds
+    /// the sample the units lie in, and they lie there as one run
+    /// ([`one_run`]), that run of the sample is sent as it is, with no copy
+    /// gathered; otherwise the units are gathered into one. Each is counted.
     pub(crate) fn decode_nals<'a>(
         &self,
         params: &mut ffi::CUVIDPICPARAMS,
         nals: impl Iterator<Item = &'a [u8]> + Clone,
+        in_place: &mut InPlace,
     ) -> Result<(), Error> {
+        match in_place
+            .sample()
+            .map(|sample| one_run(sample, nals.clone()))
+        {
+            Some(Some((run, starts))) => {
+                let decoded = self.decode(params, run, Slices::Starts(&starts));
+                in_place.in_place += 1;
+                return decoded;
+            }
+            Some(None) => in_place.gathered += 1,
+            None => {}
+        }
         let (bitstream, starts) = annex_b(nals)?;
         self.decode(params, &bitstream, Slices::Starts(&starts))
     }
+}
+
+/// `decoder`, the one made for the active SPS; an error before one is.
+pub(crate) fn active(decoder: Option<&Decoder>) -> Result<&Decoder, Error> {
+    decoder.ok_or_else(|| Error::Unsupported("decoding before an SPS is active".into()))
+}
+
+/// The sample, an Annex B access unit, an accelerator's pictures are being
+/// decoded from, for the decodes of its slices to send in place
+/// ([`Decoder::decode_nals`]), and the decodes sent so and gathered.
+#[derive(Debug, Default)]
+pub(crate) struct InPlace {
+    /// The sample's first byte's address and its length, while it is set.
+    sample: Option<(usize, usize)>,
+    /// Pictures sent as a run of their sample.
+    pub(crate) in_place: u64,
+    /// Pictures of a set sample whose units were gathered.
+    pub(crate) gathered: u64,
+}
+
+impl InPlace {
+    /// Takes `sample` as the one the next pictures are decoded from, until
+    /// [`Self::clear`].
+    ///
+    /// # Safety
+    ///
+    /// `sample` stays borrowed, and as it is, until [`Self::clear`] is
+    /// called: the codec decoder's one call on it.
+    pub(crate) unsafe fn set(&mut self, sample: &[u8]) {
+        self.sample = Some((sample.as_ptr().expose_provenance(), sample.len()));
+    }
+
+    /// No sample is set.
+    pub(crate) fn clear(&mut self) {
+        self.sample = None;
+    }
+
+    /// The sample set.
+    fn sample(&self) -> Option<&[u8]> {
+        let (at, len) = self.sample?;
+        // SAFETY: the bytes `set` was given, still borrowed and as they
+        // were until `clear` (its contract), which is the only way out of
+        // the decode that reads them.
+        Some(unsafe { std::slice::from_raw_parts(std::ptr::with_exposed_provenance(at), len) })
+    }
+}
+
+/// `nals`, units of `sample`, as one run of it: the bytes from the first
+/// unit's three-byte start code to the last unit's end, where each unit
+/// lies in `sample` after a start code and nothing but zeros lies between
+/// one unit's end and the next's start code (the zero byte a four-byte
+/// start code begins with, or `trailing_zero_8bits`), and where each starts
+/// in that run. `None` where they lie otherwise: in other memory, out of
+/// order, or with another unit between them (an SEI amid the slices).
+pub(crate) fn one_run<'s, 'a>(
+    sample: &'s [u8],
+    nals: impl Iterator<Item = &'a [u8]>,
+) -> Option<(&'s [u8], Vec<u32>)> {
+    let base = sample.as_ptr().addr();
+    let mut first = None;
+    let mut end = 0;
+    let mut starts = Vec::new();
+    for nal in nals {
+        let at = nal.as_ptr().addr().checked_sub(base)?;
+        let unit_end = at.checked_add(nal.len())?;
+        let start = at.checked_sub(3)?;
+        if nal.is_empty() || unit_end > sample.len() || sample.get(start..at)? != [0, 0, 1] {
+            return None;
+        }
+        let run_start = *first.get_or_insert(start);
+        if !starts.is_empty() && (start < end || sample.get(end..start)?.iter().any(|&b| b != 0)) {
+            return None;
+        }
+        starts.push(u32::try_from(start - run_start).ok()?);
+        end = unit_end;
+    }
+    Some((sample.get(first?..end)?, starts))
 }
 
 /// One decode surface, held until dropped.
@@ -702,6 +795,15 @@ impl StagedPlane {
 }
 
 impl PictureReadBack<'_> {
+    /// The luma and the chroma as they lie in the staging memory: each
+    /// one's bytes, its rows' bytes, packed, and its rows.
+    pub(crate) fn planes(&self) -> [(&[u8], usize, u32); 2] {
+        self.planes.map(|plane| {
+            let bytes = &self.staging.bytes()[plane.offset..plane.offset + plane.len()];
+            (bytes, plane.row_bytes, plane.rows)
+        })
+    }
+
     /// Copies the read back crop into `luma` and `chroma`, as much as fits,
     /// as [`copy_plane`] copies out of a mapped surface: the CPU's copy
     /// alone.
@@ -1563,6 +1665,51 @@ pub(crate) mod tests {
         assert_eq!(bitstream, [0, 0, 1, 0x65, 0xaa, 0, 0, 1, 0x41]);
         assert_eq!(starts, [0, 5]);
         Ok(())
+    }
+
+    /// Units of a sample that follow one another after start codes, with
+    /// zeros alone between them, are one run of it, a four-byte start code's
+    /// zero byte among them; units with another between them, out of order,
+    /// or not after a start code are not, nor are units of other memory.
+    #[test]
+    fn units_after_start_codes_with_zeros_between_are_one_run() {
+        let sample = [
+            0, 0, 1, 9, 0xf0, // an access unit delimiter
+            0, 0, 0, 1, 0x65, 0xaa, 0xbb, // a slice after a four-byte start code
+            0, 0, 0, 1, 0x41, 0xcc, // another
+            0, 0, 1, 6, 5, // an SEI
+            0, 0, 1, 0x41, 0xdd,
+        ];
+        let unit = |at: usize, len: usize| &sample[at..at + len];
+        let (run, starts) = one_run(&sample, [unit(9, 3), unit(16, 2)].into_iter()).unwrap();
+        assert_eq!(run, &sample[6..18]);
+        assert_eq!(starts, [0, 7]);
+        assert_eq!(
+            one_run(&sample, [unit(9, 3)].into_iter()),
+            Some((&sample[6..12], vec![0]))
+        );
+        // An SEI between them, the units out of order, or one not after a
+        // start code.
+        assert!(one_run(&sample, [unit(16, 2), unit(26, 2)].into_iter()).is_none());
+        assert!(one_run(&sample, [unit(16, 2), unit(9, 3)].into_iter()).is_none());
+        assert!(one_run(&sample, [unit(10, 2)].into_iter()).is_none());
+        let other = [0u8, 0, 1, 0x65];
+        assert!(one_run(&sample, [&other[3..]].into_iter()).is_none());
+        assert!(one_run(&sample, std::iter::empty()).is_none());
+    }
+
+    /// A sample set for a decode is read back as it was given, and none once
+    /// cleared.
+    #[test]
+    fn a_set_sample_is_the_one_given_until_cleared() {
+        let sample = [0u8, 0, 1, 0x65, 1, 2];
+        let mut in_place = InPlace::default();
+        assert!(in_place.sample().is_none());
+        // SAFETY: `sample` lives, unchanged, past the clear below.
+        unsafe { in_place.set(&sample) };
+        assert_eq!(in_place.sample(), Some(&sample[..]));
+        in_place.clear();
+        assert!(in_place.sample().is_none());
     }
 
     #[test]
