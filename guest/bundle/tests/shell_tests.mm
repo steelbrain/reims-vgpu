@@ -3545,7 +3545,7 @@ const RgfxFunctionConstant *constantAt(id<MTLFunction> function, uint32_t index)
 // archive, and made ours from the bytes Metal answers for it: its functions are the graphs'.
 void test_stitched_library_over_shadows()
 {
-	Fixture fx;
+	Fixture fx(0x10000); // the stitchable bytes' two libraries and the stitched one fit
 	const char *path = getenv("RGFX_STITCHABLE");
 	CHECK(path != nullptr);
 	if (path == nullptr)
