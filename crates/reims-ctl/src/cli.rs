@@ -332,8 +332,9 @@ pub struct CreateArgs {
     /// apple-gfx: displays, 1 to 8, each in a window of its own (reims-vgpu has one)
     #[arg(long)]
     pub displays: Option<u32>,
-    /// apple-gfx: the guest's first mode: WIDTHxHEIGHT, or host for the host screen's modes
-    /// (reims-vgpu's display follows its window, which opens at 1920x1080)
+    /// apple-gfx: the guest's first mode: WIDTHxHEIGHT, or host for the host screen's modes;
+    /// reims-vgpu: the size its window opens at, WIDTHxHEIGHT in the desktop's points, which the
+    /// guest follows
     #[arg(long)]
     pub resolution: Option<String>,
     /// apple-gfx: run the mode HiDPI (3840x2160 looks like 1920x1080); on reims-vgpu the guest
@@ -391,7 +392,8 @@ pub struct SetArgs {
     /// apple-gfx: 1 to 8 (reims-vgpu has one)
     #[arg(long)]
     pub displays: Option<u32>,
-    /// apple-gfx: WIDTHxHEIGHT, or host (reims-vgpu's display follows its window)
+    /// apple-gfx: WIDTHxHEIGHT, or host; reims-vgpu: the size its window opens at, WIDTHxHEIGHT
+    /// in the desktop's points
     #[arg(long)]
     pub resolution: Option<String>,
     /// apple-gfx (on reims-vgpu the guest runs HiDPI of its own accord, in a window at least
@@ -937,17 +939,17 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
         g => add("graphics", g.describe().into()),
     }
     // reims-vgpu's one display follows its window (vm::check_reims_vgpu_display): of the
-    // settings, only borderless reaches it.
+    // settings, only the window's first size and borderless reach it.
     match graphics {
         vm::Graphics::AppleGfx => add("displays", disp),
         vm::Graphics::ReimsVgpu => add(
             "display",
             if c.display.borderless {
-                "one, filling its screen, borderless"
+                "one, filling its screen, borderless".into()
             } else {
-                "one, in a window whose size the guest follows"
-            }
-            .into(),
+                let (w, h) = c.display.window_size().unwrap_or((1920, 1080));
+                format!("one, in a window opening at {w}x{h}, whose size the guest follows")
+            },
         ),
         vm::Graphics::VmwareSvga => {}
     }

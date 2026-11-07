@@ -342,9 +342,15 @@ is its transport:
   and MSI-X is enabled, and KVM injects it on the raising thread; elsewhere
   (HVF, TCG) a BH sends it under the BQL. Neither waits for a lock.
 - Under `-display none` the library opens a window for the display, unless
-  `REIMS_VGPU_WINDOW` is `0`, as `apple-gfx` does. The window keeps the size
-  the person gives it, and the display offers the guest that size in pixels
-  at the host screen's rate. Its input is queued for a BH and reaches the
+  `REIMS_VGPU_WINDOW` is `0`, as `apple-gfx` does. It opens at the
+  `resolution` property's size, `<width>x<height>` (1920x1080 without it),
+  a guest point per host point, shrunk to fit the screen; then the window
+  keeps the size the person gives it, and the display offers the guest that
+  size in pixels at the host screen's rate. On a KDE Wayland desktop of
+  3840x2160 at 2.1x, 1829x1029 points, `resolution=1280x720` opened the
+  window at 1280x720 points, and a macOS 26.7.2 guest ran 2688x1512;
+  `2560x1440` and the default opened it shrunk to 1744x981 points, the
+  guest at 3662x2039 (**measured**). Its input is queued for a BH and reaches the
   guest's tablet and keyboard through the device's console. Closing the
   window powers the VM off.
 - **The console** shows what the display shows, with a window or without

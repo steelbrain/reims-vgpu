@@ -183,11 +183,12 @@ impl Graphics {
 }
 
 /// Refuses a display setting reims-vgpu's device does not honor, each given for a VM on it:
-/// the device has one display, whose window opens at 1920x1080 and keeps the size the person
-/// gives it, which the guest follows, at the refresh rate of the host screen it is on; the
-/// guest runs a HiDPI desktop of its own accord at a window at least 2880 pixels wide (the
-/// kext's EDID density). A refresh of 0 is none, as `set` takes it. Settings saved for
-/// apple-gfx are not given: they stay for it, and reims-vgpu leaves them aside.
+/// the device has one display, whose window opens at the resolution's size
+/// ([`Display::window_size`]) and keeps the size the person gives it, which the guest follows,
+/// at the refresh rate of the host screen it is on; the guest runs a HiDPI desktop of its own
+/// accord at a window at least 2880 pixels wide (the kext's EDID density). A refresh of 0 is
+/// none, as `set` takes it. Settings saved for apple-gfx are not given: they stay for it, and
+/// of them reims-vgpu takes the resolution alone, as its window's first size.
 pub fn check_reims_vgpu_display(
     count: Option<u32>,
     resolution: Option<&str>,
@@ -198,12 +199,15 @@ pub fn check_reims_vgpu_display(
     if let Some(n) = count.filter(|&n| n != 1) {
         bail!("reims-vgpu has one display, not {n}: for more, {APPLE}");
     }
-    if let Some(r) = resolution.filter(|r| parse_resolution(r.trim()).ok() != Some((1920, 1080))) {
-        bail!(
-            "reims-vgpu's display follows its window, which opens at 1920x1080 and takes the size \
-             you give it: for {}, resize the window, or {APPLE}",
-            r.trim()
-        );
+    if let Some(r) = resolution {
+        let r = r.trim();
+        if r == "host" {
+            bail!(
+                "reims-vgpu's display follows its window, which opens at a size you give, such as \
+                 2560x1440, not at the host screen's modes: for host, {APPLE}"
+            );
+        }
+        parse_resolution(r)?;
     }
     if hidpi == Some(true) {
         bail!(
@@ -314,6 +318,17 @@ impl Display {
                  not {w}x{h}"
             ),
         }
+    }
+
+    /// The size reims-vgpu's window opens at, the resolution's, in the host's points (a guest
+    /// point per host point), shrunk to fit the screen, which its guest takes in pixels and
+    /// follows: measured on a Linux desktop at 2.1x, 1280x720 opened 1280x720 points and the
+    /// guest ran 2688x1512. None for the device's own, 1920x1080, and for `host`, which names no
+    /// size.
+    pub fn window_size(&self) -> Option<(u32, u32)> {
+        parse_resolution(self.resolution.trim())
+            .ok()
+            .filter(|&size| size != (1920, 1080))
     }
 
     /// The size a HiDPI desktop looks like, half the mode's pixels, where it runs one.
@@ -1069,6 +1084,24 @@ mod tests {
         assert!(d.qemu_resolution().is_err());
     }
 
+    /// reims-vgpu's window opens at the resolution's size, HiDPI or not; the device's own
+    /// 1920x1080 and `host` name none.
+    #[test]
+    fn reims_vgpu_s_window_opens_at_the_resolution_s_size() {
+        let d = |resolution: &str, hidpi| {
+            Display {
+                resolution: resolution.into(),
+                hidpi,
+                ..Default::default()
+            }
+            .window_size()
+        };
+        assert_eq!(d("2560x1440", false), Some((2560, 1440)));
+        assert_eq!(d("3840x2160", true), Some((3840, 2160)));
+        assert_eq!(d("1920x1080", false), None);
+        assert_eq!(d("host", false), None);
+    }
+
     #[test]
     fn sizes() {
         assert_eq!(parse_size_mib("8G").unwrap(), 8192);
@@ -1399,14 +1432,13 @@ mod tests {
         assert!(
             check_reims_vgpu_display(Some(1), Some(" 1920x1080"), Some(false), Some(0)).is_ok()
         );
+        // Its window opens at the size given.
+        assert!(check_reims_vgpu_display(None, Some("2560x1600"), None, None).is_ok());
+        assert!(check_reims_vgpu_display(None, Some("2560"), None, None).is_err());
         for (refused, says) in [
             (
                 check_reims_vgpu_display(Some(2), None, None, None),
                 "one display",
-            ),
-            (
-                check_reims_vgpu_display(None, Some("2560x1600"), None, None),
-                "for 2560x1600, resize the window",
             ),
             (
                 check_reims_vgpu_display(None, Some("host"), None, None),

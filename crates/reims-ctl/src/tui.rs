@@ -1534,7 +1534,7 @@ impl App {
             )
             .show_if("graphics", APPLE_GFX),
             Field::text("resolution", "Resolution", "1920x1080", RESOLUTION_HELP)
-                .show_if("graphics", APPLE_GFX),
+                .show_if("graphics", LIBRARY),
             Field::toggle("hidpi", "HiDPI", false, HIDPI_HELP).show_if("graphics", APPLE_GFX),
             Field::toggle(
                 "logs",
@@ -1586,7 +1586,7 @@ impl App {
                 &c.display.resolution,
                 RESOLUTION_HELP,
             )
-            .show_if("graphics", APPLE_GFX),
+            .show_if("graphics", LIBRARY),
             Field::toggle("hidpi", "HiDPI", c.display.hidpi, HIDPI_HELP)
                 .show_if("graphics", APPLE_GFX),
             Field::toggle(
@@ -1892,10 +1892,12 @@ impl App {
                 .then_some(g);
         }
         // Hidden on reims-vgpu, whose one display follows its window: the defaults, which it
-        // honors.
+        // honors. The resolution is its window's first size there.
+        if f.is_shown("resolution") {
+            s.display.resolution = f.text("resolution");
+        }
         if f.is_shown("displays") {
             s.display.count = f.text("displays").parse().context("displays: a number")?;
-            s.display.resolution = f.text("resolution");
             s.display.hidpi = f.toggle("hidpi");
         }
         s.display.check()?;
@@ -2322,8 +2324,10 @@ fn gpu_from_choice(id: &str, list: &[GpuInfo]) -> crate::vm::Gpu {
     }
 }
 
-const RESOLUTION_HELP: &str =
-    "The guest's first mode: WIDTHxHEIGHT, or host for the host screen's own modes and density.";
+const RESOLUTION_HELP: &str = "apple-gfx: the guest's first mode, WIDTHxHEIGHT, or host for the \
+     host screen's own modes and density. reims-vgpu: the size its window opens at, \
+     WIDTHxHEIGHT in the desktop's points, shrunk to fit the screen; the guest takes the \
+     window's size in pixels, and follows it as you resize it.";
 
 /// The graphics field's values that show a field of apple-gfx's alone, and one of the library's.
 const APPLE_GFX: &[&str] = &["apple-gfx"];
@@ -2443,10 +2447,15 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
         q.disk_controller = DiskController::parse(&f.choice("disk_controller"))?;
     }
     // Hidden on reims-vgpu and VMware SVGA, the displays' settings stay as they were for
-    // apple-gfx; borderless is reims-vgpu's too.
+    // apple-gfx; the resolution, its window's first size, and borderless are reims-vgpu's too.
+    if f.is_shown("resolution") {
+        c.display.resolution = f.text("resolution");
+        if c.graphics() == Graphics::ReimsVgpu {
+            crate::vm::check_reims_vgpu_display(None, Some(&c.display.resolution), None, None)?;
+        }
+    }
     if f.is_shown("displays") {
         c.display.count = f.text("displays").parse().context("displays: a number")?;
-        c.display.resolution = f.text("resolution");
         c.display.hidpi = f.toggle("hidpi");
         let r = f.text("refresh");
         c.display.refresh = if r.is_empty() {
@@ -3297,8 +3306,9 @@ mod tests {
     }
 
     /// An x86-64 VM whose settings name no graphics is on reims-vgpu, whose edit form shows
-    /// borderless alone of the displays' settings, which stay as they were for apple-gfx; saved
-    /// as it is, it still names none, and choosing apple-gfx shows them, and saves it by name.
+    /// the resolution and borderless alone of the displays' settings, the rest staying as they
+    /// were for apple-gfx; saved as it is, it still names none, and choosing apple-gfx shows
+    /// them, and saves it by name.
     #[test]
     fn the_edit_form_shows_reims_vgpu_its_display_settings_alone() {
         let mut row = vm_row("t", true);
@@ -3309,10 +3319,10 @@ mod tests {
         let mut app = test_app(vec![row]);
         app.open_edit();
         assert_eq!(form(&app).choice("graphics"), "reims-vgpu");
-        for hidden in ["displays", "resolution", "hidpi", "refresh"] {
+        for hidden in ["displays", "hidpi", "refresh"] {
             assert!(!form(&app).is_shown(hidden), "{hidden}");
         }
-        assert!(form(&app).is_shown("borderless"));
+        assert!(form(&app).is_shown("borderless") && form(&app).is_shown("resolution"));
         let mut vm = app.rows[0].vm.as_ref().unwrap().clone();
         apply_edit(&mut vm, form(&app), None).unwrap();
         assert_eq!(vm.config.graphics, None);

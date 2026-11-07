@@ -46,9 +46,11 @@
 //!   image. Its BAR 2, the library's region, is 1 GiB below 4 GiB, which macOS gives an address
 //!   only where q35 leaves room there, so the machine keeps 1 GiB of RAM below 4 GiB
 //!   (`max-ram-below-4g=1G`): with more, the guest's kext finds no region. Its one display opens
-//!   in the library's window at 1920x1080 and follows the window's size at the host screen's
-//!   rate: the displays' count, resolution, HiDPI and refresh are apple-gfx's, and only
-//!   borderless reaches it (`REIMS_VGPU_WINDOW_BORDERLESS`). It has none of apple-gfx's other
+//!   in the library's window at the resolution's size ([`crate::vm::Display::window_size`],
+//!   the device's `resolution`; 1920x1080 by default) and follows the window's size at the host
+//!   screen's rate: the displays' count, HiDPI and refresh
+//!   are apple-gfx's, and of the rest only borderless reaches it
+//!   (`REIMS_VGPU_WINDOW_BORDERLESS`). It has none of apple-gfx's other
 //!   devices, the IOSurface mapper and the video devices below, whose x86-64 guest drivers were
 //!   ports, which no image reims-util makes now holds.
 //! - apple-gfx, `apple-gfx-pci`, with `apple-gfx-iosurface-pci` after it, at slot 6: the
@@ -322,9 +324,14 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     }
     push(&["-vga", "none"]);
     let gfx = match graphics {
+        // The window's first size only where it is not the device's own, 1920x1080: a QEMU
+        // built before the property refuses it.
         Graphics::ReimsVgpu => format!(
-            "reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,romfile={}",
-            optp(&ctx.graphics_rom)
+            "reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,romfile={}{}",
+            optp(&ctx.graphics_rom),
+            c.display
+                .window_size()
+                .map_or(String::new(), |(w, h)| format!(",resolution={w}x{h}"))
         ),
         Graphics::AppleGfx => format!(
             "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays={},resolution={}",
@@ -982,8 +989,9 @@ mod tests {
 
     /// reims-vgpu's own device, with the ROM reims-ctl carries, in apple-gfx's slot, on a machine
     /// that leaves its BAR room below 4 GiB, and none of apple-gfx's devices: the default of an
-    /// x86-64 VM whose settings name no graphics. Of the display settings only borderless
-    /// reaches it; the GPU and the logs are the library's, as on apple-gfx.
+    /// x86-64 VM whose settings name no graphics. Of the display settings only the resolution,
+    /// as its window's first size, and borderless reach it; the GPU and the logs are the
+    /// library's, as on apple-gfx.
     #[test]
     fn reims_vgpu_has_its_own_device_and_none_of_apple_gfxs() {
         let mut vm = q35_vm();
@@ -1004,7 +1012,7 @@ mod tests {
             &[
                 "-device",
                 "reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,\
-                 romfile=/d/firmware/ReimsGraphics-0123456789abcdef.rom",
+                 romfile=/d/firmware/ReimsGraphics-0123456789abcdef.rom,resolution=2560x1600",
             ],
             &["-display", "none"],
         ] {
@@ -1034,7 +1042,15 @@ mod tests {
         assert!(has(&a, &["-machine", "q35,max-ram-below-4g=1G"]), "{a:?}");
         assert!(
             a.iter()
-                .any(|x| x.ends_with(",romfile=/a,,b/ReimsGraphics.rom")),
+                .any(|x| x.ends_with(",romfile=/a,,b/ReimsGraphics.rom,resolution=2560x1600")),
+            "{a:?}"
+        );
+        // At the device's own size, 1920x1080, the window's size is left to it.
+        vm.config.display.resolution = "1920x1080".into();
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(
+            a.iter()
+                .any(|x| x.starts_with("reims-graphics-pci,") && !x.contains("resolution")),
             "{a:?}"
         );
         // apple-gfx keeps the machine's RAM below 4 GiB as it was.
