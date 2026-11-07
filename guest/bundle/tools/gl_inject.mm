@@ -13,7 +13,10 @@
 //   - newRenderPipelineStateWithDescriptor:options:reflection:error: and
 //     newComputePipelineStateWithFunction:options:reflection:error:, which answer as the class
 //     did, then set the reflection's plugin return data from the descriptor's GL variants.
-// Each change is written to stderr once. Nothing outside the process changes. Use it with
+// Each change is written to stderr once; with GL_INJECT_LOG=1, so is each render pipeline the
+// class makes, with its functions and its error; with GL_INJECT_DUMP=DIR, each library it makes of
+// bytes is written to DIR/library-N.metallib (the variants' among them). Nothing outside the
+// process changes. Use it with
 // gl_redirect (tools/gl_redirect.c), which points the accelerator's IOGLBundleName at the
 // renderer.
 // Our own code.
@@ -23,6 +26,7 @@
 
 #import "RgfxGLFunction.h"
 
+#include <cstring>
 #include <mutex>
 
 #define DYLD_INTERPOSE(_replacement, _replacee)                                              \
@@ -66,10 +70,27 @@ typedef id (*ComputeImp)(id, SEL, id, NSUInteger, __autoreleasing id *, NSError 
 RenderImp gRender;
 ComputeImp gCompute;
 
+bool logging()
+{
+	static const bool on = [] {
+		const char *v = getenv("GL_INJECT_LOG");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	return on;
+}
+
 id render(id self, SEL cmd, MTLRenderPipelineDescriptor *d, NSUInteger options, __autoreleasing id *reflection,
           NSError *__autoreleasing *error)
 {
-	id state = gRender(self, cmd, d, options, reflection, error);
+	__autoreleasing NSError *local = nil;
+	NSError *__autoreleasing *out = error != nullptr ? error : &local;
+	id state = gRender(self, cmd, d, options, reflection, out);
+	if (logging())
+		fprintf(stderr, "gl_inject: render pipeline of %s%s and %s%s: %s%s\n", class_getName([d.vertexFunction class]),
+		        RgfxGLPluginReturnData(d.vertexFunction) != nil ? " (GL)" : "",
+		        d.fragmentFunction != nil ? class_getName([d.fragmentFunction class]) : "no fragment function",
+		        RgfxGLPluginReturnData(d.fragmentFunction) != nil ? " (GL)" : "", state != nil ? "made" : "nil",
+		        *out != nil ? [NSString stringWithFormat:@", %@", *out].UTF8String : "");
 	if (reflection != nullptr && *reflection != nil) {
 		setIvar(*reflection, "_vertexPluginReturnData", RgfxGLPluginReturnData(d.vertexFunction));
 		setIvar(*reflection, "_fragmentPluginReturnData", RgfxGLPluginReturnData(d.fragmentFunction));
@@ -84,6 +105,23 @@ id compute(id self, SEL cmd, id<MTLFunction> f, NSUInteger options, __autoreleas
 	if (reflection != nullptr && *reflection != nil)
 		setIvar(*reflection, "_pluginReturnData", RgfxGLPluginReturnData(f));
 	return state;
+}
+
+typedef id (*LibraryImp)(id, SEL, dispatch_data_t, NSError *__autoreleasing *);
+LibraryImp gLibrary;
+
+// GL_INJECT_DUMP=DIR writes each library the class makes of bytes to DIR/library-N.metallib.
+id library(id self, SEL cmd, dispatch_data_t data, NSError *__autoreleasing *error)
+{
+	static int count;
+	const char *dir = getenv("GL_INJECT_DUMP");
+	if (dir != nullptr && dir[0] && data != nil) {
+		NSString *path = [NSString stringWithFormat:@"%s/library-%d.metallib", dir, count++];
+		[(NSData *)data writeToFile:path atomically:NO];
+		if (logging())
+			fprintf(stderr, "gl_inject: wrote %s\n", path.UTF8String);
+	}
+	return gLibrary(self, cmd, data, error);
 }
 
 void put(Class cls, const char *name, IMP imp, const char *types)
@@ -131,6 +169,8 @@ void patch(NSArray *devices)
 		put(cls, "newFunctionWithGLESIR:inputsDescription:functionType:", (IMP)glIR3, "@40@0:8^v16@24Q32");
 		gRender = (RenderImp)wrap(cls, "newRenderPipelineStateWithDescriptor:options:reflection:error:", (IMP)render);
 		gCompute = (ComputeImp)wrap(cls, "newComputePipelineStateWithFunction:options:reflection:error:", (IMP)compute);
+		if (getenv("GL_INJECT_DUMP") != nullptr)
+			gLibrary = (LibraryImp)wrap(cls, "newLibraryWithData:error:", (IMP)library);
 	});
 }
 

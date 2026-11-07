@@ -14,6 +14,7 @@
 //   gld_lower wrap IN.metallib OUT       rewraps IN's first function as this tool's writer
 //                                        writes a .metallib, and loads it (the writer's check);
 //                                        a vertex function also makes a depth-only pipeline.
+//   gld_lower dis IN.metallib OUT.ll     IN's first function's bitcode as the system's LLVM prints it.
 //   gld_lower assemble IN.ll OUT         IN's text through the system's LLVM to bitcode, then
 //                                        wrapped and loaded as `wrap` does.
 // -d NAME picks the first of MTLCopyAllDevices whose name holds NAME.
@@ -513,6 +514,27 @@ int main(int argc, char **argv) {
 			id<MTLFunction> f = load(device, l.metallib, l.name);
 			if (f && l.type == 0) make_pipeline(device, f, nil);
 			return f ? 0 : 1;
+		}
+		if (strcmp(mode, "dis") == 0 && n == 2) {
+			// IN.metallib's first function's bitcode, read by the system's LLVM, as text.
+			NSData *in = read_file(rest[0]);
+			const uint8_t *p = in.bytes;
+			uint64_t bcOff = 0, bcSize = 0;
+			memcpy(&bcOff, p + 0x48, 8);
+			memcpy(&bcSize, p + 0x50, 8);
+			size_t length = (size_t)bcSize;
+			const char *bc = unwrap((const char *)p + bcOff, &length);
+			Ref context = LLVMContextCreate();
+			Ref buf = LLVMCreateMemoryBufferWithMemoryRangeCopy(bc, length, "bitcode");
+			Ref module = NULL;
+			if (LLVMParseBitcodeInContext2(context, buf, &module) || !module) {
+				fprintf(stderr, "gld_lower: %s: its bitcode does not read\n", rest[0]);
+				return 1;
+			}
+			char *text = LLVMPrintModuleToString(module);
+			[@(text) writeToFile:@(rest[1]) atomically:NO encoding:NSUTF8StringEncoding error:NULL];
+			printf("dis %s: %zu bytes of text\n", rest[0], strlen(text));
+			return 0;
 		}
 		if (strcmp(mode, "assemble") == 0 && n == 2) {
 			// IN.ll's text through the system's LLVM to bitcode, then as `lower` goes on: the
