@@ -7005,6 +7005,65 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
     assert_eq!(device.control.pool.favoured(), None);
 }
 
+/// A present waits for a writer of a queue created just before it whose handle the host has yet to
+/// make: the device tells the host of the queue before it answers the create, and the guest names
+/// the queue's buffers only after the answer, however late the queue's service thread has the
+/// decoder make the handle. With the service thread of process 1's new queue held there, as a
+/// no-copy buffer of the process being made holds it (`pages_buffers`), a present whose writer is
+/// the queue's first buffer, published on its ring, waits for it; once the thread goes on, the
+/// buffer is taken and committed, and the present is shown, and answered, when it finishes
+#[test]
+fn a_present_waits_for_a_writer_of_a_queue_whose_handle_is_not_yet_made() {
+    const RING_DATA: u32 = 0x1_0000;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, _ring) = surface_and_queue(&device);
+    // Process 1's messages so far carried out (the texture over the surface made), and its first
+    // queue's handle made.
+    carried_out_of(&device, &mut guest, 1);
+    let log = platform.call_log();
+    assert!(eventually(|| log.count("newCommandQueue") == 1));
+
+    // Process 1's second queue, answered while its service thread waits for the process's no-copy
+    // buffer before it hands the create to the host.
+    let pages = &device.control.pages_buffers;
+    let held = pages.begin(pages_context(1), 0, device.control.pool.now());
+    let (submit, complete) = (
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000,
+    );
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 4, (submit, complete), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    // Its first buffer draws the surface, and the surface is presented.
+    let mut fresh = QueueRing::new(&device, submit, complete, u64::from(RING_DATA));
+    fresh.publish(command_buffer_at(obj(1, 4), 400, 1));
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 4), 1)]);
+    guest.send(&device, present_surface(0x77));
+    let world = platform.world();
+    assert!(
+        eventually(|| device.control.presents.waiting() == 1 || shown_width(&device).is_some()),
+        "the present was not carried out"
+    );
+    assert_eq!(shown_width(&device), None, "shown before its writer ran");
+    assert_eq!(device.control.presents.waiting(), 1);
+    assert!(quiet(&guest), "answered before it was shown");
+    assert_eq!(log.count("newCommandQueue"), 1, "the new queue's handle was made");
+
+    // The service thread goes on: the new queue's handle is made and its buffer committed, and
+    // once the buffer finishes the surface shows and the present is answered.
+    drop(held);
+    let ids = committed(&platform, 1);
+    assert_eq!(log.count("newCommandQueue"), 2);
+    presents_waiting(&device, 1);
+    assert!(world.complete(ids[0], CommandBufferStatus::COMPLETED, None, CompleteOn::Caller));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+    presents_waiting(&device, 0);
+}
+
 /// A failure the host posts at once, ahead of the buffers before it on its queue, says nothing of
 /// them: a present waiting for the earlier buffer that wrote its surface still waits for that
 /// buffer to finish, and is shown only then

@@ -9,7 +9,12 @@
 //! writing a surface's copy names it in the copy's [`RgfxSurfaceWriters`] before its commit
 //! returns (its queue and the buffer's seqno on the queue's ring), so a present reads there which
 //! buffers it must see: it is shown once the host has posted each one's `CB_COMPLETE`, and only
-//! those. A buffer of another queue, or one that writes another surface, holds nothing.
+//! those. A buffer of another queue, or one that writes another surface, holds nothing. A writer
+//! names a queue the host holds from the queue's create on: the device tells the host of the
+//! queue before it answers the create ([`PresentQueue::queue_made`]), and the guest names a
+//! queue's buffers only after the answer, however late the queue's service thread has the
+//! decoder make its handle. A writer naming a queue the host does not hold (never made, destroyed,
+//! closed, or ended by the device's reset) holds nothing.
 //!
 //! A present whose writers have all finished, with none before it waiting, is shown at once; the
 //! others wait in order, and each `CB_COMPLETE` shows those at the front that are ready, so a
@@ -152,9 +157,9 @@ impl<P: Platform> PresentQueue<P> {
     /// Shows IOSurface `id`'s `texture` (`None`: the scanout), with the colour stages `color`
     /// sets, once each command buffer in `writers` has finished, and `fill`, its surface's
     /// device cache's fill, where it has one, and every present made before it is shown;
-    /// `answer` goes as [`Presented`] gives it. A writer past what its queue's ring has
-    /// published holds nothing (the module doc). Called with no lock of the decoder's held: what
-    /// a ring has published is read with the ring held.
+    /// `answer` goes as [`Presented`] gives it. A writer of a queue the host does not hold, or
+    /// past what its queue's ring has published, holds nothing (the module doc). Called with no
+    /// lock of the decoder's held: what a ring has published is read with the ring held.
     pub(crate) fn present(
         &self,
         id: u32,
@@ -262,7 +267,9 @@ impl<P: Platform> PresentQueue<P> {
         }
     }
 
-    /// `writers`, less each whose seqno is past every seqno its queue's ring has published.
+    /// `writers`, less each of a queue the host does not hold ([`Self::queue_made`] to
+    /// [`Self::queue_gone`], [`Self::context_gone`] or [`Self::reset`]), and each whose seqno is
+    /// past every seqno its queue's ring has published.
     fn published(&self, writers: Vec<RgfxSurfaceWriter>) -> Vec<RgfxSurfaceWriter> {
         if writers.is_empty() {
             return writers;
@@ -277,7 +284,10 @@ impl<P: Platform> PresentQueue<P> {
             .into_iter()
             .zip(posters)
             .filter(|(w, poster)| {
-                let published = poster.as_ref().and_then(CompletionPoster::published_seqno);
+                let Some(poster) = poster else {
+                    return false;
+                };
+                let published = poster.published_seqno();
                 let named = published.is_none_or(|published| w.seqno <= published);
                 if !named {
                     log::warn!(

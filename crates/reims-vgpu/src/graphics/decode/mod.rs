@@ -584,8 +584,10 @@ pub(crate) struct SurfacePresent<P: Platform> {
     /// The region block it lies in (its buffer's): its offset and size.
     pub(crate) span: Option<(u64, u64)>,
     /// The command buffers committed that write the texture's copy, which the present waits for:
-    /// the slots of its [`RgfxSurfaceWriters`] that name a queue the decoder holds (a slot naming
-    /// another, or none, has nothing to wait for).
+    /// the slots of its [`RgfxSurfaceWriters`] that name a buffer (a seqno not 0). Which of them
+    /// name a queue the host holds the present queue decides (`present::PresentQueue::present`):
+    /// it knows a queue from its create's answer, the decoder only once the queue's service
+    /// thread has had it make the queue's handle.
     pub(crate) writers: Vec<RgfxSurfaceWriter>,
     /// The context that made the texture.
     pub(crate) owner: u32,
@@ -2053,22 +2055,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                 _ => None,
             })
             .flatten()?;
-        let is_queue = |queue: u64| {
-            self.context_state(context_of(queue))
-                .and_then(|c| {
-                    c.with_live(queue, |e| matches!(e.handle, ObjHandle::CommandQueue(_)))
-                })
-                .unwrap_or(false)
-        };
         let writers = writers_at
             .and_then(|at| self.region.surface_writers(at))
-            .map(|record| {
-                record
-                    .writers
-                    .into_iter()
-                    .filter(|w| w.seqno != 0 && is_queue(w.queue_obj_id))
-                    .collect()
-            })
+            .map(|record| record.writers.into_iter().filter(|w| w.seqno != 0).collect())
             .unwrap_or_default();
         Some(SurfacePresent {
             texture,

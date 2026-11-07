@@ -963,7 +963,10 @@ its context's, which its buffers that name the event wait for, and the kext's
 `SHARED_EVENT_UNNAME` is context 0's, which no buffer is. A
 display command (`GET_DISPLAYS` to `DISPLAY_COLOR`) or a `SURFACE_DOWNLOAD`
 holds up no buffer: none reads what they make. A present waits for the writers
-the guest's record of its surface names, whatever the host has taken. A
+the guest's record of its surface names, whatever the host has taken, those of
+a queue created just before among them: the device tells the host of a queue
+before it answers its create, so the present knows the queue though the host has
+yet to make its handle. A
 download waits for the buffers that used the surface's device cache before it
 was taken, so a buffer posted after it that writes the surface, but taken
 before it, is among them, as one posted before it is: the guest writes a
