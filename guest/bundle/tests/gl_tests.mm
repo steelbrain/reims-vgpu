@@ -8,9 +8,13 @@
 //   - a function of GL IR (src/RgfxGLFunction.*): what it answers, as Metal's own function of GL IR
 //     does (measured: macOS 26.7.1), the IR it keeps, and the variants' return data;
 //   - the pipeline reflection (src/RgfxPipelineReflection.mm): a GL variant's return data is what
-//     the render reflection answers for its stage.
+//     the render reflection answers for its stage;
+//   - the stage metadata's normalization (src/RgfxGLLowering.*), over modules' text written here
+//     in the generator's shape: an integer user() varying named unsigned, a node without a type
+//     name given its signature's name and a name, and every other line as it was.
 // A variant is not lowered here: the GL code generator lowers the IR the renderer gives a device,
-// which only a GL context makes; tools/gl_probe.m and tools/gl_inject.mm check that on a device.
+// which only a GL context makes; tools/gl_probe.m, tools/gl_inject.mm and tools/gl_cases.m check
+// that on a device.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -28,6 +32,7 @@
 #import "RgfxPipelineReflection.h"
 
 #include "RgfxAirArguments.hpp"
+#include "RgfxGLLowering.hpp"
 #include "RgfxLibraryKey.hpp"
 #include "RgfxMetallibWriter.hpp"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks
@@ -262,6 +267,117 @@ void test_reflection_answers_return_data()
 	CHECK(RgfxComputePipelineReflectionMake(kernel, &why) != nil);
 }
 
+// A fragment stage in the shape the GL code generator writes one (measured: macOS 26.7.1, a
+// GLSL shader writing gl_FragDepth and reading gl_FragCoord and a flat int): our own text.
+const char kFragmentText[] = R"AIR(; ModuleID = 'fragment'
+define { float, <4 x float> } @__main(<4 x float> %0, i32 %1) {
+  ret { float, <4 x float> } undef
+}
+
+!air.fragment = !{!0}
+!air.version = !{!7}
+!gld.data = !{!8}
+
+!0 = !{{ float, <4 x float> } (<4 x float>, i32)* @__main, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.depth", !"air.depth_qualifier", !"air.any"}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{!5, !6}
+!5 = !{i32 0, !"air.position", !"air.center", !"air.perspective", !"air.arg_type_name", !"float4"}
+!6 = !{i32 1, !"air.fragment_input", !"user(slot8)", !"air.center", !"air.flat", !"air.arg_type_name", !"int", !"air.arg_name", !"user(slot8)"}
+!7 = !{i32 2, i32 3, i32 0}
+!8 = !{!"gld.text", !"a, {b} \22(c)\22"}
+)AIR";
+
+const char kFragmentNormalized[] = R"AIR(; ModuleID = 'fragment'
+define { float, <4 x float> } @__main(<4 x float> %0, i32 %1) {
+  ret { float, <4 x float> } undef
+}
+
+!air.fragment = !{!0}
+!air.version = !{!7}
+!gld.data = !{!8}
+
+!0 = !{{ float, <4 x float> } (<4 x float>, i32)* @__main, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.depth", !"air.depth_qualifier", !"air.any", !"air.arg_type_name", !"float", !"air.arg_name", !"#air_depth"}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{!5, !6}
+!5 = !{i32 0, !"air.position", !"air.center", !"air.perspective", !"air.arg_type_name", !"float4"}
+!6 = !{i32 1, !"air.fragment_input", !"user(slot8)", !"air.center", !"air.flat", !"air.arg_type_name", !"uint", !"air.arg_name", !"user(slot8)"}
+!7 = !{i32 2, i32 3, i32 0}
+!8 = !{!"gld.text", !"a, {b} \22(c)\22"}
+)AIR";
+
+// A vertex stage: integer varyings named signed (the rule makes them unsigned) and unsigned, a
+// float varying, an integer attribute (not a varying: left as it is), and outputs and inputs
+// without type names, one a distinct node.
+const char kVertexText[] = R"AIR(!air.vertex = !{!10}
+!10 = !{{ <4 x float>, <2 x i32>, i32, <4 x float>, i32 } (<2 x float>, i32, i16)* @__main, !11, !17}
+!11 = !{!12, !13, !14, !15, !16}
+!12 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"#air_position"}
+!13 = !{!"air.vertex_output", !"user(slot9)", !"air.arg_type_name", !"int2", !"air.arg_name", !"user(slot9)"}
+!14 = !{!"air.vertex_output", !"user(slot8)", !"air.arg_type_name", !"uint", !"air.arg_name", !"user(slot8)"}
+!15 = !{!"air.vertex_output", !"user(slot10)", !"air.arg_type_name", !"float4", !"air.arg_name", !"user(slot10)"}
+!16 = distinct !{!"air.render_target", i32 1, i32 0}
+!17 = !{!18, !19, !20}
+!18 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"attrib_0", !"air.arg_type_name", !"int2", !"air.arg_name", !"attrib_0"}
+!19 = !{i32 1, !"air.vertex_id"}
+!20 = !{i32 2, !"air.instance_id", !"air.arg_name", !"instance"})AIR";
+
+const char kVertexNormalized[] = R"AIR(!air.vertex = !{!10}
+!10 = !{{ <4 x float>, <2 x i32>, i32, <4 x float>, i32 } (<2 x float>, i32, i16)* @__main, !11, !17}
+!11 = !{!12, !13, !14, !15, !16}
+!12 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"#air_position"}
+!13 = !{!"air.vertex_output", !"user(slot9)", !"air.arg_type_name", !"uint2", !"air.arg_name", !"user(slot9)"}
+!14 = !{!"air.vertex_output", !"user(slot8)", !"air.arg_type_name", !"uint", !"air.arg_name", !"user(slot8)"}
+!15 = !{!"air.vertex_output", !"user(slot10)", !"air.arg_type_name", !"float4", !"air.arg_name", !"user(slot10)"}
+!16 = distinct !{!"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"uint", !"air.arg_name", !"#air_render_target_1"}
+!17 = !{!18, !19, !20}
+!18 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"attrib_0", !"air.arg_type_name", !"int2", !"air.arg_name", !"attrib_0"}
+!19 = !{i32 1, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"#air_vertex_id"}
+!20 = !{i32 2, !"air.instance_id", !"air.arg_name", !"instance", !"air.arg_type_name", !"ushort"})AIR";
+
+void test_stage_metadata_normalized()
+{
+	RgfxGLSignature fragment;
+	fragment.outputs = {"float", "float4"};
+	fragment.parameters = {"float4", "uint"};
+	std::string text = kFragmentText;
+	CHECK(RgfxGLNormalizeStageText(text, fragment));
+	CHECK(text == kFragmentNormalized);
+	// Normalized text stays as it is.
+	CHECK(!RgfxGLNormalizeStageText(text, fragment));
+	CHECK(text == kFragmentNormalized);
+	// Where the signature names no type, a node without a type name is left as it is; the
+	// varying is still made unsigned.
+	RgfxGLSignature unnamed;
+	unnamed.parameters = {"float4", "uint"};
+	text = kFragmentText;
+	CHECK(RgfxGLNormalizeStageText(text, unnamed));
+	CHECK(text.find("!2 = !{!\"air.depth\", !\"air.depth_qualifier\", !\"air.any\"}\n") != std::string::npos);
+	CHECK(text.find("!\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"user(slot8)\"}") != std::string::npos);
+
+	RgfxGLSignature vertex;
+	vertex.outputs = {"float4", "uint2", "uint", "float4", "uint"};
+	vertex.parameters = {"float2", "uint", "ushort"};
+	text = kVertexText;
+	CHECK(RgfxGLNormalizeStageText(text, vertex));
+	CHECK(text == kVertexNormalized);
+
+	// No vertex or fragment entry point: a kernel's module, or none at all.
+	const std::string kernel = "!air.kernel = !{!0}\n!0 = !{void ()* @__main, !1, !2}\n!1 = !{}\n!2 = "
+	                           "!{!3}\n!3 = !{!\"air.depth\"}\n";
+	text = kernel;
+	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text == kernel);
+	text = "";
+	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text.empty());
+	// An entry node naming nodes the text lacks.
+	const std::string dangling = "!air.vertex = !{!0}\n!0 = !{void ()* @__main, !5, !6}\n";
+	text = dangling;
+	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text == dangling);
+}
+
 } // namespace
 
 void rgfxGLTests()
@@ -270,5 +386,6 @@ void rgfxGLTests()
 		test_metallib_writer();
 		test_gl_function_answers();
 		test_reflection_answers_return_data();
+		test_stage_metadata_normalized();
 	}
 }
