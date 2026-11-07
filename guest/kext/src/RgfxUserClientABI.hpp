@@ -44,7 +44,11 @@ enum {
 	// asks for five holds RGFX_CONTEXT_VA_SPAN from the base. kIOReturnNoResources where the
 	// kext has no range left (RgfxContextSlots.hpp).
 	kRgfxAccelMethodOpenContext = 0x100,
-	// A region block: in size, align (a power of two); out: its region offset.
+	// A region block: in size, align (a power of two); out: its region offset. A third input,
+	// where the kext's word holds kRgfxKextFeatureWriteCombined, is the byte of the block from
+	// which the process's mapping of it is write-combined (kIOMapWriteCombineCache), a multiple of
+	// a page; the bytes before it, and the whole block where it is the block's size or more, are
+	// mapped write-back as any block's.
 	kRgfxAccelMethodAlloc = 0x101,
 	// Frees the client's block at the region offset scalarInput[0], and returns at once: the
 	// block is no longer the client's to name, and is given out again once the device answers
@@ -217,6 +221,8 @@ enum {
 	// A shared event's port (kRgfxSharedEventUserClientType) and its selectors, 0x113 and 0x114,
 	// which the bundle uses where the feature word holds RGFX_FEATURE_SHARED_EVENT_NAMES too.
 	kRgfxKextFeatureSharedEvents = 1 << 6,
+	// Alloc's (0x101) third input, the part of the block mapped write-combined.
+	kRgfxKextFeatureWriteCombined = 1 << 7,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

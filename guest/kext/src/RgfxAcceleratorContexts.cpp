@@ -955,9 +955,12 @@ void RgfxAccelerator::keepIdChunks(const void *owner)
 // MARK: - Blocks
 
 IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 context,
-                                    UInt64 size, UInt64 align, UInt64 *offset)
+                                    UInt64 size, UInt64 align, UInt64 writeCombinedFrom,
+                                    UInt64 *offset)
 {
 	if (!contextLock)
+		return kIOReturnBadArgument;
+	if (writeCombinedFrom < size && writeCombinedFrom % kRgfxBlockPage != 0)
 		return kIOReturnBadArgument;
 	const bool mayReserve = owner->isWindowServer();
 	IOLockLock(contextLock);
@@ -972,8 +975,17 @@ IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 co
 		const UInt64 bytes = rgfxBlockAlignUp(size, kRgfxBlockPage); // the block's, as allocated
 		// The block is in the process's window, and the device learns of it, before the
 		// process does: the grant is on the control ring before any message naming it, on that
-		// ring or a queue's. The block is pinned until then, so no free overtakes either.
-		IOReturn posted = owner->mapSpan(pin.offset, bytes);
+		// ring or a queue's. The block is pinned until then, so no free overtakes either. Its
+		// bytes from `writeCombinedFrom` are the ones the process only writes (a submission
+		// ring's data, command buffers' bodies, a library's staging chunks), mapped
+		// write-combined: an AMD host applies the guest's memory type, and the region's pages,
+		// which are no RAM of the guest's, are mapped uncached for any other ask (xnu's pmap
+		// sets PCD on every page it does not manage). The process fences its stores before it
+		// publishes them.
+		const UInt64 combined = writeCombinedFrom < bytes ? writeCombinedFrom : bytes;
+		IOReturn posted = combined ? owner->mapSpan(pin.offset, combined) : kIOReturnSuccess;
+		if (posted == kIOReturnSuccess && combined < bytes)
+			posted = owner->mapSpan(pin.offset + combined, bytes - combined, true);
 		if (posted == kIOReturnSuccess) {
 			RgfxBlockGrant grant = {};
 			grant.context = context;

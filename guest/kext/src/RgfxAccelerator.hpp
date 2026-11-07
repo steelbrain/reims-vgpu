@@ -85,12 +85,13 @@ enum {
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
 // second word kRgfxAccelMethodFeatures answers: PagesBlock, Submit's deferred flag and
-// TakeAnswers, OpenContext's span, and shared events' ports. Each bit is set by the change that
-// lands its call.
+// TakeAnswers, OpenContext's span, shared events' ports, and Alloc's write-combined part. Each
+// bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureDeferredAnswers |
                                           kRgfxKextFeatureContextSpan |
-                                          kRgfxKextFeatureSharedEvents;
+                                          kRgfxKextFeatureSharedEvents |
+                                          kRgfxKextFeatureWriteCombined;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -363,10 +364,11 @@ public:
 	// is kIOReturnBusy while a create naming it is in flight (pinRange). freeBlocks frees the
 	// owner's blocks after its close is answered; keepBlocks keeps them from use for good after
 	// a close that was not.
-	// allocBlock maps the block into the client's window before it returns; freeBlock takes it
-	// back from the window before the block is freed.
+	// allocBlock maps the block into the client's window before it returns, its bytes from
+	// `writeCombinedFrom` on write-combined (none where that is past the block); freeBlock takes
+	// it back from the window before the block is freed.
 	IOReturn allocBlock(RgfxAcceleratorUserClient *owner, UInt32 context, UInt64 size,
-	                    UInt64 align, UInt64 *offset);
+	                    UInt64 align, UInt64 writeCombinedFrom, UInt64 *offset);
 	IOReturn freeBlock(RgfxAcceleratorUserClient *owner, UInt64 offset);
 	// A pages block (kRgfxAccelMethodPagesBlock) of `owner` of context `context` over the
 	// `length` bytes at `address` in `task`, `writable` there: the block's offset and size. The

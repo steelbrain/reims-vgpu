@@ -2844,11 +2844,85 @@ void test_region_pages_blocks()
 	CHECK(src.released.size() == 1 && src.released[0] == mem.size() - 0x800);
 }
 
+// Where the kext maps parts of blocks write-combined, a block asked with a write-combined part
+// takes it from the write-combined source, and one asked without from the block source; a queue's
+// submission ring's data starts its block's second page, write-combined, with the ring's header
+// ending the first, and the pair names the blocks to release. Without the source every block is
+// the block source's, the rings at their blocks' starts.
+void test_region_write_combined_parts()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0xee);
+	struct Source {
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET;
+		std::vector<uint64_t> combinedFrom; // UINT64_MAX for a plain block
+		std::vector<uint64_t> released;
+		bool place(uint64_t size, uint64_t align, uint64_t from, uint64_t *offset)
+		{
+			next = (next + align - 1) & ~(align - 1);
+			*offset = next;
+			next += size;
+			combinedFrom.push_back(from);
+			return true;
+		}
+		static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+		{
+			return static_cast<Source *>(c)->place(size, align, UINT64_MAX, offset);
+		}
+		static bool combined(void *c, uint64_t size, uint64_t align, uint64_t from,
+		                     uint64_t *offset)
+		{
+			return static_cast<Source *>(c)->place(size, align, from, offset);
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	};
+	{
+		RgfxRegion region(mem.data(), mem.size());
+		Source src;
+		region.setBlockSource(&Source::alloc, &Source::release, &src);
+		CHECK(!region.writeCombines());
+		RgfxRegion::Block b = region.allocate(0x2000, 0x1000, 0);
+		CHECK(b.ok && src.combinedFrom == std::vector<uint64_t>({UINT64_MAX}));
+		RgfxRegion::RingPair rings = region.allocateRingPair(0x8000, 0x8000);
+		CHECK(rings.ok && rings.submit_offset == rings.submit_block);
+		CHECK(rings.complete_offset == rings.complete_block && rings.complete_offset != 0);
+	}
+	RgfxRegion region(mem.data(), mem.size());
+	Source src;
+	region.setBlockSource(&Source::alloc, &Source::release, &src);
+	region.setWriteCombinedSource(&Source::combined);
+	CHECK(region.writeCombines());
+	RgfxRegion::Block plain = region.allocate(0x2000);
+	RgfxRegion::Block whole = region.allocate(0x2000, 0x1000, 0);
+	RgfxRegion::Block tail = region.allocate(0x3000, 0x1000, 0x1000);
+	RgfxRegion::Block past = region.allocate(0x1000, 0x1000, 0x1000);
+	CHECK(plain.ok && whole.ok && tail.ok && past.ok);
+	CHECK(src.combinedFrom ==
+	      std::vector<uint64_t>({UINT64_MAX, 0, 0x1000, UINT64_MAX}));
+	src.combinedFrom.clear();
+	RgfxRegion::RingPair rings = region.allocateRingPair(0x8000, 0x8000);
+	CHECK(rings.ok && rings.submit_data_size == 0x8000);
+	CHECK(src.combinedFrom == std::vector<uint64_t>({0x1000, UINT64_MAX}));
+	CHECK(rings.submit_block % 0x1000 == 0);
+	CHECK(rings.submit_offset == rings.submit_block + 0x1000 - RGFX_RING_HEADER_SIZE);
+	CHECK((rings.submit_offset + RGFX_RING_HEADER_SIZE) % 0x1000 == 0);
+	CHECK(rings.submit_offset % RgfxRegion::kRingAlign == 0);
+	CHECK(rings.complete_block == rings.complete_offset);
+	// The ring's header and data are zeroed; the head of the block before them is not touched.
+	bool zeroed = true;
+	for (uint64_t i = 0; i < RGFX_RING_HEADER_SIZE + 0x8000; i++)
+		zeroed = zeroed && mem[rings.submit_offset + i] == 0;
+	CHECK(zeroed && mem[rings.submit_block] == 0xee);
+}
+
 int main()
 {
 	test_id_space();
 	test_obj_ids_are_given_once();
 	test_region_pages_blocks();
+	test_region_write_combined_parts();
 	test_address_picks();
 	test_resource_id_chunks();
 	test_small_resource_id_chunks();

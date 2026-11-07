@@ -105,7 +105,7 @@ void RgfxAcceleratorUserClient::closeWindow()
 		      context, n, ns / 1000, r, rns / 1000);
 }
 
-IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length)
+IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length, bool writeCombined)
 {
 	if (!windowLock)
 		return kIOReturnNotReady;
@@ -120,10 +120,11 @@ IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length)
 		r = kIOReturnBadArgument;
 	} else {
 		const UInt64 start = mach_absolute_time();
-		// The region's bytes, write-back as the kernel maps them, over the window's.
+		// The region's bytes over the window's: write-back as asked, which xnu's pmap maps
+		// uncached for a page it does not manage (PCD, the guest PAT's UC-), or write-combined.
+		const IOOptionBits cache = writeCombined ? kIOMapWriteCombineCache : kIOMapCopybackCache;
 		IOMemoryMap *map = region->createMappingInTask(task, windowBase + offset,
-		                                               kIOMapOverwrite | kIOMapCopybackCache,
-		                                               offset, length);
+		                                               kIOMapOverwrite | cache, offset, length);
 		if (map) {
 			// The mapping stays: an overwrite mapping is never taken down by its release.
 			map->release();
