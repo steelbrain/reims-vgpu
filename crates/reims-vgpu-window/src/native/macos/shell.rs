@@ -427,8 +427,9 @@ struct Sizing {
 
 impl Sizing {
     /// The content of a frame at most `room`: one guest point per host point, shrunk with its
-    /// ratio kept where it does not fit ([`geometry::initial_content_size`]), on whole pixels, so
-    /// the drawable is the content exactly.
+    /// ratio kept where it does not fit ([`geometry::initial_content_size`]), on an even number
+    /// of whole pixels, so the drawable is the content exactly and the mode the guest is offered
+    /// for it ([`geometry::offered_mode`]) is the whole drawable.
     fn content(&self, room: NSSize) -> NSSize {
         let (width, height) = geometry::initial_content_size(
             self.mode,
@@ -438,7 +439,15 @@ impl Sizing {
                 room.height - self.chrome.height,
             ),
         );
-        let whole = |points: f64| ((points * self.scale).floor() / self.scale).max(1.0);
+        let whole = |points: f64| {
+            let pixels = (points * self.scale).floor();
+            let even = if pixels >= 2.0 {
+                pixels - pixels % 2.0
+            } else {
+                pixels
+            };
+            (even / self.scale).max(1.0)
+        };
         NSSize::new(whole(width), whole(height))
     }
 
@@ -1036,7 +1045,7 @@ mod tests {
 
     /// A window that fills the visible area does not open over another such window: it opens 24
     /// points right and down, made smaller from there, its content keeping the guest's ratio on
-    /// whole pixels
+    /// an even number of whole pixels
     #[test]
     fn a_cascaded_window_shrinks_rather_than_overlap() {
         let visible = rect((0.0, 100.0), (1728.0, 1110.0));
@@ -1050,9 +1059,9 @@ mod tests {
         assert_eq!(content, NSSize::new(1728.0, 1080.0));
         let first = NSRect::new(visible.origin, sizing.frame(content));
         assert_eq!(first, visible);
-        // 1689.6x1056 of content, on whole pixels.
+        // 1689.6x1056 of content, on an even number of whole pixels: 3378x2112.
         let second = cascade(first, &sizing, visible, &[first]);
-        assert_eq!(second, rect((24.0, 100.0), (1689.5, 1086.0)));
+        assert_eq!(second, rect((24.0, 100.0), (1689.0, 1086.0)));
         let third = cascade(first, &sizing, visible, &[first, second]);
         assert_eq!(third, rect((48.0, 100.0), (1651.0, 1062.0)));
     }

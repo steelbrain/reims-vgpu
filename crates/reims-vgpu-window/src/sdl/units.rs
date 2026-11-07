@@ -41,11 +41,21 @@ pub(crate) struct Units {
 
 impl Units {
     /// The units of a screen whose current mode has `pixel_density` and whose content scale is
-    /// `content_scale`.
+    /// `content_scale`. A density above 1 (Wayland's) is taken to the nearest 120th, the unit of
+    /// Wayland's fractional scales, by which SDL's Wayland backend sizes a window's buffer: the
+    /// mode's density is a float (2.1 reads as 2.0999999), and at a size whose pixels end in a
+    /// half (965 points at 2.1 are 2026.5) the float rounds the other way.
     pub(crate) fn new(pixel_density: f32, content_scale: f32) -> Units {
-        Units {
-            pixels: f64::from(pixel_density).max(1.0),
-            scale: pixels_per_point(pixel_density, content_scale),
+        let in_120ths = |scale: f64| (scale * 120.0).round() / 120.0;
+        let pixels = f64::from(pixel_density).max(1.0);
+        let scale = pixels_per_point(pixel_density, content_scale);
+        if pixels > 1.0 {
+            Units {
+                pixels: in_120ths(pixels),
+                scale: in_120ths(scale),
+            }
+        } else {
+            Units { pixels, scale }
         }
     }
 
@@ -59,6 +69,24 @@ impl Units {
         ((points * self.scale).floor() / self.pixels).round() as i32
     }
 
+    /// The pixels SDL makes of `size`, one of its sizes: the size times the pixels per unit,
+    /// rounded halfway away from zero, as SDL's Wayland backend rounds a window's buffer from its
+    /// size in points (its `PointToPixel`, read from SDL 3.4.18's code); on X11 the size itself.
+    fn pixels_of(self, size: i32) -> i64 {
+        (f64::from(size) * self.pixels + 1e-6).round() as i64
+    }
+
+    /// The largest of SDL's sizes up to `size`, and not below `min`, whose pixels are even: at a
+    /// fractional scale some sizes in points come to an odd number of pixels (at 2.1, 971 points
+    /// are 2039 pixels, and the ten sizes from 965 to 974 points all come out odd).
+    fn even(self, size: i32, min: i32) -> i32 {
+        let mut even = size;
+        while even > min && self.pixels_of(even) % 2 != 0 {
+            even -= 1;
+        }
+        even
+    }
+
     /// [`MIN_CONTENT`] as a size SDL takes.
     pub(crate) fn min_content(self) -> (i32, i32) {
         let side = |points: i32| (f64::from(points) * self.per_point()).round() as i32;
@@ -69,7 +97,10 @@ impl Units {
 /// The content size, in `units`, of a windowed window for a guest mode `mode` at `guest_scale`,
 /// on a screen whose usable bounds are `usable` in those units, where known: a guest point per
 /// host point ([`geometry::initial_content_size`]), shrunk to fit the usable bounds less
-/// `title_room` points, on whole pixels, and at least [`MIN_CONTENT`] points.
+/// `title_room` points, on whole pixels, made smaller where it takes that to come to an even
+/// number of pixels each way, and at least [`MIN_CONTENT`] points. The guest is offered the
+/// window's pixels rounded down to even (the window crate's `geometry`), and a HiDPI mode is
+/// one whose pixels halve exactly, so a window of even pixels shows the guest's whole mode.
 pub(crate) fn windowed_size(
     mode: (u16, u16),
     guest_scale: u8,
@@ -87,8 +118,8 @@ pub(crate) fn windowed_size(
     let (width, height) = geometry::initial_content_size(mode, f64::from(guest_scale.max(1)), room);
     let min = units.min_content();
     (
-        units.whole(width).max(min.0),
-        units.whole(height).max(min.1),
+        units.even(units.whole(width).max(min.0), min.0),
+        units.even(units.whole(height).max(min.1), min.1),
     )
 }
 
@@ -154,5 +185,62 @@ mod tests {
         assert_eq!(x11_2x.min_content(), (640, 400));
         assert_eq!(wayland_2x.min_content(), (320, 200));
         assert_eq!(windowed_size((400, 300), 2, None, ROOM, x11_2x), (640, 400));
+    }
+
+    /// At the fractional scales desktops offer, a window opens on an even number of pixels each
+    /// way, as SDL rounds its sizes to pixels: on Wayland, points made smaller until they come to
+    /// an even number of pixels; on X11, the pixels themselves
+    #[test]
+    fn a_window_opens_on_an_even_number_of_pixels_at_fractional_scales() {
+        const ROOM: f64 = 48.0;
+        let modes = [
+            ((1920, 1080), 1),
+            ((2560, 1600), 1),
+            ((3840, 2160), 2),
+            ((1366, 768), 1),
+            ((1280, 800), 1),
+        ];
+        for scale in [1.25_f32, 1.5, 1.75, 2.1] {
+            // A 3840 × 2160 screen: its points on Wayland, its pixels on X11.
+            let points = (
+                (3840.0 / f64::from(scale)).round() as i32,
+                (2160.0 / f64::from(scale)).round() as i32,
+            );
+            let wayland = Units::new(scale, 1.0);
+            let x11 = Units::new(1.0, scale);
+            for (mode, guest_scale) in modes {
+                for (units, usable) in [(wayland, points), (x11, (3840, 2160))] {
+                    let size = windowed_size(mode, guest_scale, Some(usable), ROOM, units);
+                    let pixels = (units.pixels_of(size.0), units.pixels_of(size.1));
+                    assert!(
+                        pixels.0 % 2 == 0 && pixels.1 % 2 == 0,
+                        "{mode:?} at {scale}: {size:?}, {pixels:?} pixels"
+                    );
+                }
+            }
+        }
+        // Wayland at 2.1: 1570 points are 3297 pixels, and 1564 the next size down that is even.
+        let wayland_21 = Units::new(2.1, 1.0);
+        let size = windowed_size((2560, 1600), 1, Some((1829, 1029)), ROOM, wayland_21);
+        assert_eq!(size, (1564, 981));
+        assert_eq!(
+            (wayland_21.pixels_of(size.0), wayland_21.pixels_of(size.1)),
+            (3284, 2060)
+        );
+        // At 1.5: 2227 points are 3341 pixels (3340.5 rounded away from zero), 2225 are 3338.
+        let wayland_15 = Units::new(1.5, 1.0);
+        assert_eq!(
+            windowed_size((2560, 1600), 1, Some((2560, 1440)), ROOM, wayland_15),
+            (2225, 1392)
+        );
+        // X11 at 2.1: 3660 × 2059 pixels, one fewer high.
+        let x11_21 = Units::new(1.0, 2.1);
+        assert_eq!(
+            windowed_size((1920, 1080), 1, Some((3840, 2160)), ROOM, x11_21),
+            (3660, 2058)
+        );
+        // The ten sizes from 965 to 974 points are odd at 2.1 (2027 to 2045 pixels).
+        assert_eq!(wayland_21.even(974, 200), 964);
+        assert_eq!(wayland_21.pixels_of(964), 2024);
     }
 }

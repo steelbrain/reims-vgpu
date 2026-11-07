@@ -133,9 +133,33 @@ pub fn layout(bounds: (f64, f64), scale: f64, insets: Insets, guest: Option<(u16
     }
 }
 
+/// The guest mode a window that keeps its size offers the guest, for a drawable of `drawable`
+/// pixels: those pixels rounded down to even each way (and 1 where the drawable is 1). The
+/// guest kext offers a mode HiDPI only where its pixels halve exactly (guest/kext's
+/// `RgfxMode::hiDpi`), and at a fractional scale a window's pixels are often odd: a borderless
+/// window on a 3840 × 2160 screen at 2.1 is the screen's 1828.57 × 1028.57 points rounded to
+/// 1829 × 1029, which SDL's Wayland backend makes 3841 × 2161 pixels (points times the scale,
+/// rounded), and is offered 3840 × 2160, the screen's own pixels.
+pub fn offered_mode(drawable: (u64, u64)) -> (u64, u64) {
+    let even = |pixels: u64| if pixels >= 2 { pixels & !1 } else { pixels };
+    (even(drawable.0), even(drawable.1))
+}
+
 /// The largest rectangle of `guest`'s ratio in `area`, on whole pixels, centred (to within half
-/// a pixel). One side fills the area; the other is the ratio's, rounded, at least 1.
+/// a pixel). One side fills the area; the other is the ratio's, rounded, at least 1. A guest
+/// mode of the area's pixels, or at most one fewer each way, is drawn a guest pixel to a pixel,
+/// at the area's top left: that is the mode a window of odd pixels offers ([`offered_mode`]),
+/// which shows whole and unscaled, beside a column or row of black.
 fn fit(area: PixelRect, guest: (u16, u16)) -> PixelRect {
+    let (gw, gh) = (u64::from(guest.0), u64::from(guest.1));
+    if gw <= area.width && gh <= area.height && area.width - gw <= 1 && area.height - gh <= 1 {
+        return PixelRect {
+            x: area.x,
+            y: area.y,
+            width: gw,
+            height: gh,
+        };
+    }
     let (aw, ah) = (as_f64(area.width), as_f64(area.height));
     let (gw, gh) = (f64::from(guest.0), f64::from(guest.1));
     let (width, height) = if aw * gh <= ah * gw {
@@ -405,6 +429,38 @@ mod tests {
         assert_eq!(l.drawable, (1, 1));
         let l = layout((f64::NAN, f64::INFINITY), f64::NAN, NO_INSETS, None);
         assert_eq!(l.drawable, (1, 1));
+    }
+
+    /// The mode offered for a drawable is its pixels rounded down to even, and a guest at that
+    /// mode is drawn a guest pixel to a pixel, at the top left, beside a column or row of black
+    #[test]
+    fn an_odd_drawable_offers_an_even_mode_drawn_unscaled() {
+        assert_eq!(offered_mode((3841, 2161)), (3840, 2160));
+        assert_eq!(offered_mode((3662, 2039)), (3662, 2038));
+        assert_eq!(offered_mode((3840, 2160)), (3840, 2160));
+        assert_eq!(offered_mode((1, 1)), (1, 1));
+        // Borderless on a 3840 × 2160 screen at 2.1: 1829 × 1029 points, 3841 × 2161 pixels,
+        // which show the 3840 × 2160 offered whole.
+        let l = layout(
+            (1829.0, 1029.0),
+            3841.0 / 1829.0,
+            NO_INSETS,
+            Some((3840, 2160)),
+        );
+        assert_eq!(l.drawable, (3841, 2161));
+        let whole = |width, height| PixelRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        assert_eq!(l.pixels, whole(3840, 2160));
+        // A window of 3662 × 2039 pixels shows 3662 × 2038 whole.
+        let l = layout((3662.0, 2039.0), 1.0, NO_INSETS, Some((3662, 2038)));
+        assert_eq!(l.pixels, whole(3662, 2038));
+        // A guest two pixels narrower and lower is fitted as any other: scaled to fill a side.
+        let l = layout((3842.0, 2162.0), 1.0, NO_INSETS, Some((3840, 2160)));
+        assert_eq!(l.pixels.width, 3842);
     }
 
     /// With no guest mode yet, the image is the whole area inside the insets

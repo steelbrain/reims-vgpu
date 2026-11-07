@@ -8,16 +8,17 @@
 //! copy on the CPU (`sink`). The buffer's deallocator holds the region, so it stays mapped until
 //! the GPU has let the buffer go, after the device and the window.
 //!
-//! **The window** ([`WindowScreen`]) is a display window of `reims-vgpu-window` that keeps its
-//! size (`WindowConfig::keeps_its_size`): the guest follows it. It opens sized for the config's
-//! mode, else 1920 × 1080, and the display then offers the guest one mode, the window's size in
-//! pixels as its render thread last drew into it, at the refresh rate of the host screen it
-//! opened on; when that size changes (the person resized the window) the device tells the
-//! guest (`DISPLAY_CHANGED`). The guest's scanout shows in the window at once and then whenever
-//! the host's dirty log says the guest wrote it, at the screen's rate; the window draws it at
-//! the screen's pace. The guest's cursor image is the host's cursor over the image, shown while
-//! the guest shows its cursor; the guest's cursor position moves nothing, since the host's
-//! pointer moves the guest's (the window never draws the cursor into the image itself).
+//! **The window** ([`WindowScreen`]) is a display window of `reims-vgpu-window` that keeps its size
+//! (`WindowConfig::keeps_its_size`): the guest follows it. It opens sized for the config's mode,
+//! else 1920 × 1080, and the display then offers the guest one mode, the window's size in pixels as
+//! its render thread last drew into it, rounded down to even (a window of odd pixels shows the
+//! guest's mode unscaled, beside a column or row of black), at the refresh rate of the host screen
+//! it opened on; when that size changes (the person resized the window) the device tells the guest
+//! (`DISPLAY_CHANGED`). The guest's scanout shows in the window at once and then whenever the
+//! host's dirty log says the guest wrote it, at the screen's rate; the window draws it at the
+//! screen's pace. The guest's cursor image is the host's cursor over the image, shown while the
+//! guest shows its cursor; the guest's cursor position moves nothing, since the host's pointer
+//! moves the guest's (the window never draws the cursor into the image itself).
 //!
 //! **Without a window** the display offers 1920 × 1080 at 60 Hz and shows nothing.
 //!
@@ -80,7 +81,7 @@ use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_window::{FrameSink, Window, WindowConfig};
+use reims_vgpu_window::{FrameSink, Window, WindowConfig, geometry};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::DefaultPlatform;
@@ -2576,14 +2577,14 @@ fn hz_to_mhz(hz: f64) -> u32 {
 }
 
 impl Screen for WindowScreen {
-    /// The window's size in pixels as last drawn into, else the mode it opened for, at its host
-    /// screen's rate.
+    /// The window's size in pixels as last drawn into, else the mode it opened for, rounded down
+    /// to even ([`geometry::offered_mode`]), at its host screen's rate.
     fn mode(&self) -> Mode {
         let drawn = *self.shown.drawable.lock();
-        let (width, height) = drawn.unwrap_or_else(|| {
+        let (width, height) = geometry::offered_mode(drawn.unwrap_or_else(|| {
             let (w, h) = self.window.offered().unwrap_or((1920, 1080));
             (u64::from(w), u64::from(h))
-        });
+        }));
         let clamp = |v: u64| u32::try_from(v.max(1)).unwrap_or(u32::MAX);
         Mode {
             width: clamp(width),

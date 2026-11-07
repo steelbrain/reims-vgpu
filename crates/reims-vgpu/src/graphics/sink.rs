@@ -5,10 +5,12 @@
 //! the guest's pixels in place, and the CPU copies nothing.
 //!
 //! **Sizes.** The guest sets a scanout of the size the display offers, the window's size in
-//! pixels, so the image is the whole drawable and the blit covers it. While the two differ (the
-//! window resized, the guest not yet following), the blit copies what fits of the scanout at the
-//! image's top left, clipped to the drawable, after a clear of the drawable to black: a blit
-//! cannot scale, and the guest's next mode makes the sizes equal again.
+//! pixels rounded down to even, so the image is the whole drawable, or, for a drawable of odd
+//! pixels, all of it but a column or row, which stays black: the layout draws that mode a guest
+//! pixel to a pixel, at the drawable's top left (`geometry::offered_mode`). While the two differ
+//! otherwise (the window resized, the guest not yet following), the blit copies what fits of the
+//! scanout at the image's top left, clipped to the drawable, after a clear of the drawable to
+//! black: a blit cannot scale, and the guest's next mode makes the sizes match again.
 //!
 //! **A presented surface.** While the display pipe shows an IOSurface (`PRESENT_SURFACE`), the
 //! draw puts the texture the decoder made over it into the drawable instead, on the GPU: a copy,

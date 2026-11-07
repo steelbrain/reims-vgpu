@@ -42,9 +42,9 @@ Unset or unparsable values give the defaults below.
 - The title is "Reims vGPU", with " (port N)" for a display on port N above
   0. `test: handle::a_window_s_title_is_reims_vgpu_and_its_port`
 - A new window shows a guest point per host point, shrunk to fit the
-  screen's visible area: on a Retina screen, a HiDPI guest one guest pixel
-  per screen pixel, a 1× guest (the default 1920×1080) scaled up on the GPU,
-  not opened at half size. The guest's scale is the one a macOS 13.6 guest
+  screen's visible area, on an even number of pixels each way: on a Retina
+  screen, a HiDPI guest one guest pixel per screen pixel, a 1× guest (the
+  default 1920×1080) scaled up on the GPU, not opened at half size. The guest's scale is the one a macOS 13.6 guest
   picks from the size it is told: the width in whole millimetres to nearest,
   then in whole centimetres rounded up, HiDPI from 146.67 ppi across it for
   a mode at least 1920 pixels wide.
@@ -90,6 +90,13 @@ Unset or unparsable values give the defaults below.
   takes the window's size in pixels as its mode) never follows the guest's
   mode: it opens sized for the first mode offered, and from then on a guest
   mode change re-fits the image, as after the person's resize. `manual`
+- That guest is offered the window's pixels rounded down to even, and a
+  window of odd pixels (a resize, or a borderless window at a fractional
+  scale) shows that mode unscaled at its top left, beside a column or row of
+  black: the guest's kext offers a mode HiDPI only where its pixels halve
+  exactly, and a guest given a 3841 × 2161 mode never brought its display
+  up, HiDPI or not.
+  `test: geometry::an_odd_drawable_offers_an_even_mode_drawn_unscaled`
 - Sharp on every screen: one drawable pixel per screen pixel, following the
   window across screens of different scale. `manual`
 - Native full screen (the green button, ⌃⌘F) keeps the ratio. `manual`
@@ -320,14 +327,24 @@ runtime's own device. The switches above apply, and `resolution=` too.
   and the screen a display opens on are as above. The size is asked for in
   SDL's sizes: points on Wayland, and on X11 pixels, the desktop's content
   scale of them to the point, so an X11 desktop at 200% does not open the
-  window at half its size.
+  window at half its size. At a fractional scale (1.25, 1.5, 1.75, 2.1)
+  some sizes in points come to an odd number of pixels, so the size is
+  made smaller (by up to ten points at 2.1) to the largest that comes to
+  an even number each way, as SDL rounds it: on Wayland the points times
+  the scale in 120ths, rounded half away from zero; on X11 the pixels
+  themselves. The compositor may still give the window another size.
+  `test: sdl::units::a_window_opens_on_an_even_number_of_pixels_at_fractional_scales`,
   `test: handle::a_window_s_title_is_reims_vgpu_and_its_port`,
   `test: geometry::a_new_window_shows_a_guest_point_per_host_point`,
   `test: sdl::units::a_window_opens_a_guest_point_per_host_point_in_sdl_s_sizes`,
   `test: screens::display_i_opens_on_screen_i`, `manual` (X11 at a content
   scale above 1 among them)
 - Wayland lets no client place a windowed window: the compositor does.
-  Borderless windows fill the screen named, over its panels. `manual`
+  Borderless windows fill the screen named, over its panels. At a
+  fractional scale a borderless window is the compositor's points for the
+  screen rounded to whole points, so its pixels can pass the screen's by one
+  (3841 × 2161 on a 3840 × 2160 screen at 2.1); the reims-graphics guest is
+  offered the screen's own 3840 × 2160 (above). `manual`
 - The host's screens are SDL's: the primary first, then top to bottom and
   left to right, each at its scale (fractional ones included) and the
   refresh rate it is set to (its current mode's, as above); a change of

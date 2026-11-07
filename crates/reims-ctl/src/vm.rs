@@ -187,9 +187,10 @@ impl Graphics {
 /// ([`Display::window_size`]) and keeps the size the person gives it, which the guest follows,
 /// at the refresh rate of the host screen it is on; the guest starts a HiDPI desktop by itself
 /// in a window at least 3840 pixels wide, and offers one in its Displays settings from 2880 (the
-/// kext's HiDPI modes, whose pixels halve exactly; a window of an odd size runs 1x). A refresh
-/// of 0 is none, as `set` takes it. Settings saved for apple-gfx are not given: they stay for
-/// it, and of them reims-vgpu takes the resolution alone, as its window's first size.
+/// kext's HiDPI modes, whose pixels halve exactly: the guest is offered the window's pixels
+/// rounded down to even). A refresh of 0 is none, as `set` takes it. Settings saved for
+/// apple-gfx are not given: they stay for it, and of them reims-vgpu takes the resolution alone,
+/// as its window's first size.
 pub fn check_reims_vgpu_display(
     count: Option<u32>,
     resolution: Option<&str>,
