@@ -2279,11 +2279,14 @@ pub(crate) mod tests {
             kept(registry_id(&raw)).is_none(),
             "the test's process adopted a device before"
         );
+        use reims_vgpu_core::platform::os::Clock as _;
         let device = adopt(raw);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let clock = crate::os::OsClock::new();
+        let began = clock.now_mono();
         while device.raw.in_place_check_took().is_none() {
+            let waited = clock.now_mono().saturating_duration_since(began);
             assert!(
-                std::time::Instant::now() < deadline,
+                waited < std::time::Duration::from_secs(120),
                 "no check ended in 120 s: {:?}",
                 device.raw.in_place_check_report()
             );
