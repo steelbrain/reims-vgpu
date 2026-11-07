@@ -2314,7 +2314,9 @@ void test_buffer_texture_types_end_the_process()
 // A texture buffer over a buffer's bytes by the public form is made, at any offset, with rows of at
 // least its texels' bytes, its create carrying its type, offset and rows to the host; fewer bytes
 // a row answer nil, posting nothing, and none end the process with Metal's words, as the AMD 5300M
-// answers (measured under macOS 26.7.1, a scratch probe; dgpu-oracle.md Q11).
+// answers (measured under macOS 26.7.1, a scratch probe; dgpu-oracle.md Q11). Texels past the
+// buffer's bytes answer nil, posting nothing, where both Macs make the texture: the host's
+// platform refuses it.
 void test_buffer_texture_buffers()
 {
 	checkDies("buffer-texture-buffer-rows-0",
@@ -2353,6 +2355,12 @@ void test_buffer_texture_buffers()
 			drainRing(fx.ring);
 			CHECK([buf newTextureWithDescriptor:desc offset:0 bytesPerRow:63] == nil);
 			CHECK([buf newTextureWithDescriptor:desc offset:0 bytesPerRow:1] == nil);
+			// At the buffer's end it is made; past it, nil, which the host's platform refuses.
+			CHECK([made count] == 3);
+			id<MTLTexture> last = [buf newTextureWithDescriptor:desc offset:memory.size() - 64 bytesPerRow:64];
+			CHECK(last != nil);
+			drainRing(fx.ring);
+			CHECK([buf newTextureWithDescriptor:desc offset:memory.size() - 32 bytesPerRow:64] == nil);
 			CHECK(ringEmpty(fx.ring));
 		}
 	}

@@ -695,8 +695,9 @@ RGFX_RESOURCE_SPI
 // bytes from the offset (measured under macOS 26.7.1, RGBA32Float and RGBA8Unorm: a scratch
 // probe, dgpu-oracle.md Q11), which the host's platform makes by this form too. Rows of 0 bytes
 // end the process with the words both say; fewer than its texels' bytes the AMD answers nil, and
-// so does the bundle, where the Intel GPU ends the process. A block-compressed format answers
-// nil (below). One off the device's linear texture alignment is nil (rgfxAtLinearAlignment:).
+// so does the bundle, where the Intel GPU ends the process. One whose texels lie past the
+// buffer's bytes both make, and the host's platform refuses: the bundle answers nil. A
+// block-compressed format answers nil (below). One off the device's linear texture alignment is nil (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
                                bytesPerRow:(NSUInteger)bytesPerRow
@@ -731,6 +732,19 @@ RGFX_RESOURCE_SPI
 				      @"%llu texels' bytes: answered nil",
 				      (unsigned long long)[self rgfxObjId], (unsigned long)bytesPerRow,
 				      (unsigned long long)rowBytes);
+			}
+			return nil;
+		}
+		// Texels past the buffer's bytes: both Macs make the texture (measured: 4 RGBA32Float
+		// texels at offset 4064 of a 4096-byte buffer), and the host's platform refuses it, which
+		// would end the host's process; the bundle answers nil, logged once, and sends nothing.
+		if (static_cast<unsigned __int128>(offset) + rowBytes > [self length]) {
+			static std::atomic<bool> logged{false};
+			if (!logged.exchange(true)) {
+				NSLog(@"RGFX: a texture buffer past buffer 0x%llx's %lu bytes (offset %lu, %llu "
+				      @"bytes of texels), which the host does not carry: answered nil",
+				      (unsigned long long)[self rgfxObjId], (unsigned long)[self length],
+				      (unsigned long)offset, (unsigned long long)rowBytes);
 			}
 			return nil;
 		}
