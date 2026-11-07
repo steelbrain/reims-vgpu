@@ -179,8 +179,7 @@ fn every_driver_gpu() -> Vec<HostGpu> {
     if version < vk::API_VERSION_1_1 {
         return Vec::new();
     }
-    // SAFETY: a global command of a loaded entry.
-    let listed = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+    let listed = crate::os::instance_extensions(&entry);
     let direct = listed.iter().any(|p| {
         p.extension_name_as_c_str()
             .is_ok_and(|n| n == ash::lunarg::direct_driver_loading::NAME)

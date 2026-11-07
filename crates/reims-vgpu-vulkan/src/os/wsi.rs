@@ -31,6 +31,20 @@
 //! requires (`VK_KHR_swapchain` with `VK_KHR_surface`; `swapchain_maintenance1` with its surface
 //! counterpart and `VK_KHR_get_surface_capabilities2`), which the runtime checks before it makes
 //! the instance (`Error::InstanceExtensionRequired`).
+//!
+//! **The loader's list in one call.** The loader's instance extensions are read with one
+//! `vkEnumerateInstanceExtensionProperties` call into room for [`LISTED_FIRST`] of them, asked
+//! again with twice the room while the loader answers `VK_INCOMPLETE`
+//! ([`instance_extensions`]), where ash's read makes two calls, for the count and then the list.
+//! The loader loads and asks every driver its manifests name at each such call, and at each
+//! `vkCreateInstance`, and unloads one that makes no instance, and a driver's load can be slow.
+//! Measured on a host with a Radeon RX 550, a Radeon 780M and NVIDIA's driver package but no
+//! NVIDIA GPU (Vulkan loader 1.4.363, NVIDIA 615.78.08, Mesa 26.2.6, 2026-11-07): at each call,
+//! NVIDIA's driver library read the PCI configuration of each of the host's 45 PCI devices, which
+//! resumed each one runtime power management had suspended, 13 ms for most and 140 ms for a USB
+//! controller, 0.25 to 0.7 s a call. A test process that made the platform's device made 13 such
+//! calls and ran 7 to 10 s, against 0.05 s with that driver's manifest left out of the loader's
+//! search; 3 of the calls were this module's, 2 of them its list's read through ash.
 
 use std::ffi::{CStr, CString};
 
@@ -66,8 +80,7 @@ pub fn add_window_extensions(options: &mut rt::DeviceOptions) {
             return;
         }
     };
-    // SAFETY: a global command of a loaded entry.
-    let listed = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+    let listed = instance_extensions(&entry);
     let listed: Vec<&CStr> = listed
         .iter()
         .filter_map(|p| p.extension_name_as_c_str().ok())
@@ -126,6 +139,50 @@ pub fn present_fences(options: &rt::DeviceOptions) -> bool {
             .iter()
             .any(|(device, _)| name.as_c_str() == *device)
     })
+}
+
+/// The room the first call of [`instance_extensions`] has: more than any loader measured lists
+/// (26 on Linux, with the loader 1.4.363 and Mesa's and NVIDIA's drivers).
+const LISTED_FIRST: u32 = 64;
+
+/// The most room [`instance_extensions`] asks with, past which a loader that still answers
+/// `VK_INCOMPLETE` is taken to list nothing, as a failed call is.
+const LISTED_MOST: u32 = 1 << 16;
+
+/// The instance extensions `entry`'s loader lists, in its order, read in one call where they fit
+/// in room for [`LISTED_FIRST`] (the module doc); none where the loader fails the call.
+pub(crate) fn instance_extensions(entry: &ash::Entry) -> Vec<vk::ExtensionProperties> {
+    instance_extensions_from(entry, LISTED_FIRST)
+}
+
+/// [`instance_extensions`], its first call with room for `first` (at least one), and each next
+/// with twice the last's, while the loader answers `VK_INCOMPLETE`: it then writes as many as
+/// there is room for, and the count it leaves is that room, not how many it lists.
+fn instance_extensions_from(entry: &ash::Entry, first: u32) -> Vec<vk::ExtensionProperties> {
+    let mut room = first.max(1);
+    while room <= LISTED_MOST {
+        let mut listed: Vec<vk::ExtensionProperties> = Vec::with_capacity(room as usize);
+        let mut count = room;
+        // SAFETY: a global command of a loaded entry, with no layer named, and room for `count`
+        // properties at the pointer.
+        let result = unsafe {
+            (entry.fp_v1_0().enumerate_instance_extension_properties)(
+                std::ptr::null(),
+                &mut count,
+                listed.as_mut_ptr(),
+            )
+        };
+        match result {
+            vk::Result::SUCCESS => {
+                // SAFETY: the loader wrote `count` properties, at most the room asked for.
+                unsafe { listed.set_len(count.min(room) as usize) };
+                return listed;
+            }
+            vk::Result::INCOMPLETE => room *= 2,
+            _ => break,
+        }
+    }
+    Vec::new()
 }
 
 /// Adds `name` to `names` where it is not there yet.
@@ -314,6 +371,35 @@ mod tests {
         assert!(fence_extensions(&loader, &probed(&[], true)).is_err());
         assert!(fence_extensions(&loader[..1], &probed(&[both], true)).is_err());
         assert!(fence_extensions(&loader[1..], &probed(&[both], true)).is_err());
+    }
+
+    /// The loader's instance extensions read in one call are those ash's read of two calls lists,
+    /// in its order, whatever room the first call has
+    #[test]
+    fn the_instance_extensions_are_the_loaders_whatever_the_first_room() {
+        let Ok(entry) = open_loader() else {
+            return;
+        };
+        let named = |listed: &[vk::ExtensionProperties]| -> Vec<(CString, u32)> {
+            listed
+                .iter()
+                .filter_map(|p| {
+                    Some((p.extension_name_as_c_str().ok()?.to_owned(), p.spec_version))
+                })
+                .collect()
+        };
+        // SAFETY: a global command of a loaded entry.
+        let asked = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap();
+        assert!(!asked.is_empty());
+        assert_eq!(named(&instance_extensions(&entry)), named(&asked));
+        let len = u32::try_from(asked.len()).unwrap();
+        for first in [0, 1, 2, len - 1, len, len + 1] {
+            assert_eq!(
+                named(&instance_extensions_from(&entry, first)),
+                named(&asked),
+                "first room {first}"
+            );
+        }
     }
 
     /// Options that list a present-fence extension give present fences; others do not

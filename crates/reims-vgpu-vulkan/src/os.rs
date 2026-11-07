@@ -66,6 +66,10 @@ pub(crate) use host_os::{copies_guest_ram, copy_from_host_ram, copy_to_host_ram,
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::MATRIX_KEY;
 pub use surface::{PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout};
+/// The loader's instance extensions, read in one call where they fit (`wsi.rs`), for
+/// `crate::host_gpus`'s own instances.
+#[cfg(target_os = "linux")]
+pub(crate) use wsi::instance_extensions;
 pub use wsi::{add_window_extensions, present_fences};
 
 #[cfg(test)]
