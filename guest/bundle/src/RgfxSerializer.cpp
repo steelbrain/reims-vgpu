@@ -251,7 +251,7 @@ RgfxCreated RgfxSerializer::createHeap(uint64_t size_bytes, uint32_t options, in
 	msg.obj_id = out.obj_id;
 	msg.gpu_address = out.gpu_address;
 	msg.size_bytes = size_bytes;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	msg.heap_type = heap_type;
 	out.posted = m_control.tryPost(RGFX_CMD_HEAP_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
@@ -273,7 +273,7 @@ RgfxCreated RgfxSerializer::createHeapOverHostMemory(uint64_t size_bytes, uint32
 	msg.gpu_address = out.gpu_address;
 	msg.region_offset = region_offset;
 	msg.size_bytes = size_bytes;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	msg.heap_type = heap_type;
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_HEAP_OVER_HOST_MEMORY, &msg, sizeof(msg), &out.seqno);
@@ -297,7 +297,7 @@ RgfxCreated RgfxSerializer::createHeapOverPages(uint64_t size_bytes, uint32_t op
 	msg.block_offset = block_offset;
 	msg.block_size = block_size;
 	msg.size_bytes = size_bytes;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	msg.heap_type = heap_type;
 	out.posted = m_control.tryPost(RGFX_CMD_HEAP_OVER_PAGES, &msg, sizeof(msg), &out.seqno);
 	return out;
@@ -316,7 +316,7 @@ RgfxCreated RgfxSerializer::createBuffer(uint64_t length, uint32_t options, uint
 	msg.obj_id = out.obj_id;
 	msg.gpu_address = out.gpu_address;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
@@ -336,7 +336,7 @@ RgfxCreated RgfxSerializer::createBufferOverHostMemory(uint64_t length, uint32_t
 	msg.gpu_address = out.gpu_address;
 	msg.region_offset = region_offset;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_BUFFER_OVER_HOST_MEMORY, &msg, sizeof(msg), &out.seqno);
 	return out;
@@ -354,7 +354,7 @@ RgfxCreated RgfxSerializer::createBufferOverSurfacePages(uint64_t length, uint32
 	msg.block_offset = block_offset;
 	msg.block_size = block_size;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, &msg, sizeof(msg), &out.seqno);
 	return out;
@@ -378,7 +378,7 @@ RgfxCreated RgfxSerializer::createBufferManagedAtOffset(RgfxObjId heap, uint64_t
 	msg.heap_obj_id = heap;
 	msg.offset = offset;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
 	return out;
@@ -400,7 +400,7 @@ RgfxCreated RgfxSerializer::createManagedBuffer(RgfxObjId cpu_buffer, uint64_t l
 	msg.gpu_address = out.gpu_address;
 	msg.cpu_buffer_obj_id = cpu_buffer;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted = m_control.tryPost(RGFX_CMD_MANAGED_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
@@ -426,7 +426,7 @@ RgfxCreated RgfxSerializer::createBufferOverPages(uint64_t length, uint32_t opti
 	msg.block_size = block_size;
 	msg.offset = offset;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_OVER_PAGES, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
@@ -444,7 +444,7 @@ RgfxCreated RgfxSerializer::createBufferAtOffset(RgfxObjId heap, uint64_t offset
 	msg.heap_obj_id = heap;
 	msg.offset = offset;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
 	return out;
 }

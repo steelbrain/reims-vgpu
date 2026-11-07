@@ -415,6 +415,10 @@ void test_device_buffers_take_pages_of_slabs()
 			// Metal's default hazard tracking for a buffer: Tracked.
 			CHECK(b.resourceOptions == MTLResourceHazardTrackingModeTracked);
 		}
+		// A buffer made with bit 20, as the GL renderer makes its no-copy ones, answers the three
+		// modes alone, as both x86 Macs do (0x200 for 0x100000, 0x210 for 0x100010).
+		CHECK(make(256, static_cast<MTLResourceOptions>(0x100000)).resourceOptions == 0x200);
+		CHECK(make(256, static_cast<MTLResourceOptions>(0x100010)).resourceOptions == 0x210);
 		CHECK(make(0x10000, MTLResourceStorageModeShared).allocatedSize == 0x10000);
 		CHECK(make(0x10001, MTLResourceStorageModeShared).allocatedSize == 0x11000);
 		RgfxBuffer *mib = make(0x100001, MTLResourceStorageModeManaged);

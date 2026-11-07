@@ -623,6 +623,27 @@ void test_family_names()
 		CHECK(rgfxFamilyNameOf(name) == family);
 }
 
+// Heap and buffer creates carry the three modes and Metal's bit 24 to the host, and no other
+// bit: the GL renderer's no-copy buffers' bit 20 (0x100000) among them.
+void test_host_resource_options()
+{
+	CHECK(RgfxHostResourceOptions(0x100010u) == 0x10u);
+	CHECK(RgfxHostResourceOptions(0x1000321u) == 0x1000321u);
+	CHECK(RgfxHostResourceOptions(0xfffffcffu) == 0x10000ffu);
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	CHECK(ser.createBuffer(0x1000, 0x100010).posted);
+	CHECK(expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE).options == 0x10);
+	CHECK(ser.createBufferOverPages(0x1000, 0x100000, 0x60000, 0x1000, 0x40).posted);
+	CHECK(expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES).options == 0);
+	CHECK(ser.createHeap(0x10000, 0x1100020, 1).posted);
+	CHECK(expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE).options == 0x1000020);
+}
+
 // A heap, buffer or device-placed texture (Managed or not) whose GPU address finds no room in the
 // context's range is no object: the create posts nothing and answers ids of 0, so the caller
 // answers nil, as Metal does for one it cannot place, and a texture's resource id goes back; a
@@ -2834,6 +2855,7 @@ int main()
 	test_caps();
 	test_spi_features();
 	test_family_names();
+	test_host_resource_options();
 	test_caps_features();
 	test_archive_file();
 	test_lifecycle_messages();

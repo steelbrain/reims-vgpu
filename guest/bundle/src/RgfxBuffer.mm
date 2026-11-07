@@ -575,12 +575,18 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 // The buffer's options as Metal answers them (measured on the M3 Max under macOS 27): those it was
 // made with, a Default hazard tracking mode resolved to Tracked (0x200 for options of 0, 0x220 for
 // Private, 0x201 for WriteCombined, and Untracked kept); a heap's buffer answers the heap's,
-// whatever it was asked (0x120 in a Private heap, for a buffer asked to be Tracked too).
+// whatever it was asked (0x120 in a Private heap, for a buffer asked to be Tracked too). The three
+// modes alone: the AMD 5300M and the Intel 630 answer a buffer made with any one of bits 10 to 31
+// beside a storage mode without that bit, of a length or no-copy (0x200, 0x210 and 0x220 for
+// Shared, Managed and Private; measured: macOS 26.7.1), the GL renderer's bit 20 (0x100000, as
+// it makes its no-copy buffers) and Metal's private bit 24 among them.
 - (MTLResourceOptions)resourceOptions
 {
 	id<MTLHeap> heap = self.heap;
+	const MTLResourceOptions modes =
+	    MTLResourceCPUCacheModeMask | MTLResourceStorageModeMask | MTLResourceHazardTrackingModeMask;
 	return heap != nil ? heap.resourceOptions
-	                   : RgfxResolveHazardTracking(_options, MTLResourceHazardTrackingModeTracked);
+	                   : RgfxResolveHazardTracking(_options & modes, MTLResourceHazardTrackingModeTracked);
 }
 
 // The options it was made with, as asked; a heap's buffer answers the heap's, as resourceOptions.

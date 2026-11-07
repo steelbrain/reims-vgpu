@@ -41,6 +41,21 @@
 
 class RgfxIcbSlotTable;
 
+/// The MTLResourceOptions bits a heap or buffer create carries to the host: the CPU cache mode
+/// (bits 0-3), the storage mode (4-7), the hazard tracking mode (8-9), and Metal's private bit 24,
+/// which the host takes as Metal does. Any other bit is a hint from the caller to the device's
+/// driver, which the bundle is, and the bundle takes none; the host's runtime refuses a buffer
+/// with a bit Metal gives no meaning (measured, macOS 26.6.1 on an RTX 5080 host: the GL
+/// renderer's no-copy buffers, made with bit 20, 0x100000, by GLDBufferRec::load). A buffer
+/// answers its three modes alone, as the x86 Macs' do (RgfxBuffer's resourceOptions).
+constexpr uint32_t kRgfxHostResourceOptions = 0xfu | (0xfu << 4) | (0x3u << 8) | (1u << 24);
+
+/// `options` as a create carries them to the host: the bits kRgfxHostResourceOptions names.
+constexpr uint32_t RgfxHostResourceOptions(uint32_t options)
+{
+	return options & kRgfxHostResourceOptions;
+}
+
 /// A sampler's state, as MTLSamplerDescriptor gives it. The LOD clamps are
 /// floats here; the serialiser stores their bits on the wire (so it stays
 /// all-integer), as RgfxSamplerCreate asks.
