@@ -14,6 +14,27 @@
 //! ([`Route`]). Which conversions the driver does is tried once, at start;
 //! the rest is refused.
 //!
+//! **What the engine decodes** is tried at start too ([`trial`]): each
+//! sampling the driver lists for JPEG (`VAConfigAttribRTFormat`) is
+//! decoded from a flat 32x32 JPEG of its own, as a guest's decode of it
+//! would be made, and its samples checked. A sampling whose trial decodes
+//! wrong is refused, as one the driver does not list is
+//! (`UnsupportedStream`), the log saying why. **Measured** on an RX 550
+//! (radeonsi on Polaris 12's UVD, Mesa 26.2.6, 2026-11-07): the driver
+//! lists 4:2:0, 4:2:2 and grey up to 4096x4096, and its decode of grey into
+//! a Y800 surface, the driver's or ours, wrote a luma none of whose samples
+//! were the stream's, as did ffmpeg's VA-API decode of grey on it. Into an
+//! NV12 surface of the driver's, copied out by a run, grey decoded right
+//! for some streams and wrong for others: the trial's luma was not written
+//! at all; of jpeg-check.sh's 14 grey cases, 11 decoded right and 3 wrong
+//! (1x1, 7x4095, and 333x211 with restart intervals); and 15 more grey
+//! streams of cjpeg's and jpegtran's, 16x16 to 640x480, all decoded wrong,
+//! a 640x480 one that decoded right among them once jpegtran gave it
+//! restart intervals. Into an NV12 surface of ours it was wrong again. So
+//! no route decodes grey right on it, and grey is refused there. The trials
+//! pass on the RX 7900 XTX and the Radeon 780M, whose VCN decodes every
+//! sampling it lists.
+//!
 //! **Where the output is read.** The GPU writes the output into host
 //! memory of ours, imported as a linear surface ([`HostSurface`], the
 //! staged copy back's, `super::readback`), and the CPU reads it there once
@@ -173,6 +194,8 @@ use super::vpp::{BUFFER_ALIGNMENT, CONTEXT_SIZE, Pass, render, submit};
 use super::vpp_ffi as proc;
 use super::wait::{self, LetGo, Work};
 
+mod trial;
+
 /// `VAProfileJPEGBaseline`.
 const JPEG_BASELINE: Profile = Profile(va::VAProfileJPEGBaseline);
 
@@ -232,8 +255,11 @@ pub struct VaapiJpegDecoder {
     display: Display,
     /// The config each decode's context is made on, and holds.
     config: Arc<Config>,
-    /// The render-target formats the driver decodes JPEG into.
-    rt_formats: u32,
+    /// The samplings the engine decodes: those the driver lists whose
+    /// trial at start decoded right (module docs).
+    samplings: Vec<JpegSubsampling>,
+    /// Those it lists whose trial decoded wrong: refused.
+    wrong: Vec<JpegSubsampling>,
     /// The smallest surface the driver makes for JPEG.
     min_size: (u32, u32),
     /// The largest picture it decodes.
@@ -304,7 +330,11 @@ impl VaapiJpegDecoder {
                  memory of ours: {why}"
             );
         }
-        Ok(Self {
+        let listed = SUBSAMPLINGS
+            .into_iter()
+            .filter(|&s| rt_formats & SurfaceKind::of(s).rt_format != 0)
+            .collect();
+        let mut engine = Self {
             min_size: (
                 surfaces.min_width.unwrap_or(1),
                 surfaces.min_height.unwrap_or(1),
@@ -317,12 +347,89 @@ impl VaapiJpegDecoder {
             conversions,
             display,
             config,
-            rt_formats,
+            samplings: listed,
+            wrong: Vec::new(),
             decoding: Mutex::new(()),
             stalled: Mutex::new(None),
             host_refused: Mutex::new(host_refused),
             kept: Mutex::new(Vec::new()),
-        })
+        };
+        engine.try_samplings();
+        Ok(engine)
+    }
+
+    /// Decodes [`trial::flat`] of each sampling the driver lists, as a
+    /// guest's decode of it would be made, and refuses those whose decode
+    /// did not write the values (module docs). A trial that fails leaves its
+    /// sampling as the driver lists it, the log saying so.
+    fn try_samplings(&mut self) {
+        for subsampling in self.samplings.clone() {
+            let Some(tried) = self.trial(subsampling) else {
+                continue;
+            };
+            let (wrong, of) = match tried {
+                Ok((0, _)) => continue,
+                Ok(counts) => counts,
+                Err(error) => {
+                    log::warn!(
+                        "the JPEG engine's trial decode of {subsampling:?} failed, so it decodes \
+                         {subsampling:?} as the VA driver lists it: {error}"
+                    );
+                    continue;
+                }
+            };
+            log::warn!(
+                "the VA driver lists {subsampling:?} for JPEG, but the engine's trial decode of it \
+                 wrote {wrong} of {of} samples wrong at start: {subsampling:?} streams are refused"
+            );
+            self.samplings.retain(|&s| s != subsampling);
+            self.wrong.push(subsampling);
+        }
+    }
+
+    /// Decodes [`trial::flat`] of `subsampling` into its trial layout at
+    /// scale 1, and counts the samples it wrote wrong, of those it checked;
+    /// `None` for a sampling with no trial.
+    fn trial(&self, subsampling: JpegSubsampling) -> Option<Result<(usize, usize), JpegError>> {
+        let data = trial::flat(subsampling)?;
+        let format = trial::layout(subsampling)?;
+        let (across, down) = format.chroma_divisors()?;
+        let side = u32::from(trial::SIZE);
+        let request = JpegDecode {
+            data: &data,
+            width: side,
+            height: side,
+            subsampling,
+            region: PixelRect {
+                x: 0,
+                y: 0,
+                width: side,
+                height: side,
+            },
+            scale: 1,
+            format,
+        };
+        let row = usize::from(trial::SIZE);
+        let chroma_row = row / usize::try_from(across).ok()? * 2;
+        let chroma_rows = side / down;
+        let mut luma = vec![0; row * row];
+        let mut chroma = vec![0; chroma_row * usize::try_from(chroma_rows).ok()?];
+        let decoded = {
+            let mut planes = [
+                PlaneDestination {
+                    bytes: &mut luma,
+                    bytes_per_row: row,
+                    rows: side,
+                },
+                PlaneDestination {
+                    bytes: &mut chroma,
+                    bytes_per_row: chroma_row,
+                    rows: chroma_rows,
+                },
+            ];
+            JpegDecoder::decode(self, &request, &mut planes)
+        };
+        Some(decoded.map(|()| trial::wrong(subsampling, &luma, &chroma)))
     }
 
     /// Stalls the engine, the GPU not having finished `what` by its
@@ -369,12 +476,10 @@ impl VaapiJpegDecoder {
         None
     }
 
-    /// The samplings the driver decodes.
+    /// The samplings the engine decodes: those the driver lists whose
+    /// trial at start decoded right.
     pub fn subsamplings(&self) -> Vec<JpegSubsampling> {
-        SUBSAMPLINGS
-            .into_iter()
-            .filter(|&s| self.rt_formats & SurfaceKind::of(s).rt_format != 0)
-            .collect()
+        self.samplings.clone()
     }
 
     /// The conversions its video processing did at start, as the decoded
@@ -409,9 +514,14 @@ impl VaapiJpegDecoder {
             ));
         }
         // What the driver cannot decode at all, before what it cannot write.
-        if self.rt_formats & SurfaceKind::of(request.subsampling).rt_format == 0 {
+        if !self.samplings.contains(&request.subsampling) {
+            let why = if self.wrong.contains(&request.subsampling) {
+                "which the driver decodes wrong (the engine's trial at start)"
+            } else {
+                "which the driver does not decode"
+            };
             return Err(JpegError::UnsupportedStream(format!(
-                "{:?}, which the driver does not decode",
+                "{:?}, {why}",
                 request.subsampling
             )));
         }
@@ -1764,7 +1874,8 @@ fn rectangle(rect: PixelRect) -> proc::VARectangle {
 }
 
 impl JpegDecoder for VaapiJpegDecoder {
-    /// The samplings the driver lists, up to its largest picture.
+    /// The samplings the driver lists whose trial at start decoded right,
+    /// up to its largest picture (module docs).
     fn decodes(&self) -> JpegDecodes {
         JpegDecodes {
             subsamplings: self.subsamplings(),
