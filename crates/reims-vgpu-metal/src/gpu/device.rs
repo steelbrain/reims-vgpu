@@ -604,6 +604,13 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         })
     }
 
+    /// Where Metal's compute pipeline descriptors answer `setOpenCLModeEnabled:` (SPI; measured
+    /// on the M3 Max on macOS 27, and on the AMD 5300M and Intel 630 on macOS 26.7.1 through
+    /// Apple's OpenGL renderer).
+    fn makes_opencl_mode_pipelines(&self) -> bool {
+        crate::gpu::desc::opencl_mode_available()
+    }
+
     // Each creator from a value makes the descriptor with its class's `new`, makes it hold the
     // value (`desc`'s `apply_*`), then sends the descriptor's creator.
 
@@ -2088,6 +2095,101 @@ vertex void vvoid(uint v [[vertex_id]]) {}
                 rasterizing_state(&d, &v, fragment, Some(gl)).is_ok(),
                 "fragment {has}"
             );
+        }
+    }
+
+    /// An OpenCL kernel of a reqd_work_group_size of 64, in the shape the OpenCL-mode test
+    /// dispatches: each item writes its global id plus its local size.
+    const OPENCL_SOURCE: &str = "__kernel __attribute__((reqd_work_group_size(64, 1, 1))) \
+        void k(__global float *o) { o[get_global_id(0)] = (float)get_global_id(0) + \
+        (float)get_local_size(0); }";
+
+    /// A compute pipeline of OpenCL mode, of a kernel compiled from OpenCL C as Apple's OpenGL
+    /// renderer compiles one (source language 1, language version 0x20002, its arguments): Metal
+    /// answers the kernel's work-group size as the pipeline's maximum, links the kernel behind
+    /// its three buffers (the offsets and dimension count at 0, then 1 and 2), so the kernel's
+    /// argument is at 3, and the kernel's built-ins read as OpenCL's (measured: the M3 Max on
+    /// macOS 27, m3-max-4592)
+    #[test]
+    fn opencl_mode_compute_pipelines() {
+        use objc2::msg_send;
+        use objc2_metal::{
+            MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCompileOptions,
+            MTLComputeCommandEncoder as _, MTLDevice as _, MTLResourceOptions,
+        };
+        use reims_vgpu_core::platform::resource::ComputePipeline as _;
+        let d = dev();
+        assert!(d.makes_opencl_mode_pipelines());
+        let options = MTLCompileOptions::new();
+        let arguments = NSString::from_str(
+            "-cl-single-precision-constant -fapplecl-lax-vector-conversions \
+             -fapplecl-functional-casts -fapplecl-inline-definitions -cl-std=CL1.2",
+        );
+        // SAFETY: MTLCompileOptions' SPI setters (`v24@0:8Q16`, `v24@0:8q16`, `v24@0:8@16`), with
+        // the values the renderer sends.
+        unsafe {
+            let _: () = msg_send![&*options, setLanguageVersion: 0x20002u64];
+            let _: () = msg_send![&*options, setSourceLanguage: 1i64];
+            let _: () = msg_send![&*options, setAdditionalCompilerArguments: &*arguments];
+        }
+        let library = Obj::from_retained(
+            d.get()
+                .newLibraryWithSource_options_error(
+                    &NSString::from_str(OPENCL_SOURCE),
+                    Some(&options),
+                )
+                .expect("the OpenCL kernel compiles"),
+        );
+        let f = function(&library, "__entry_k");
+        let state = d
+            .new_compute_pipeline_state_full(&FullComputePipelineDesc {
+                label: None,
+                function: &f,
+                threadgroup_size_is_multiple_of_execution_width: false,
+                max_total_threads_per_threadgroup: 0,
+                max_call_stack_depth: 1,
+                support_indirect_command_buffers: false,
+                stage_input: None,
+                linked: Default::default(),
+                open_cl_mode: true,
+            })
+            .unwrap()
+            .expect("a pipeline of OpenCL mode");
+        assert_eq!(state.max_total_threads_per_threadgroup(), 64);
+
+        const N: usize = 128;
+        let buffer = |length: usize| {
+            d.get()
+                .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
+                .unwrap()
+        };
+        let (out, printf_buffer, table) = (buffer(N * 4), buffer(256), buffer(256));
+        let queue = d.get().newCommandQueue().unwrap();
+        let cb = queue.commandBuffer().unwrap();
+        let e = cb.computeCommandEncoder().unwrap();
+        e.setComputePipelineState(state.get());
+        // The global offset of each dimension, then the dimension count.
+        let offsets_and_dims: [u32; 4] = [0, 0, 0, 1];
+        // SAFETY: 16 readable bytes, copied by the call; the buffers outlive the command buffer.
+        unsafe {
+            e.setBytes_length_atIndex(std::ptr::NonNull::from(&offsets_and_dims).cast(), 16, 0);
+            e.setBuffer_offset_atIndex(Some(&printf_buffer), 0, 1);
+            e.setBuffer_offset_atIndex(Some(&table), 0, 2);
+            e.setBuffer_offset_atIndex(Some(&out), 0, 3);
+        }
+        let size = |width| MtlSizeObjc {
+            width,
+            height: 1,
+            depth: 1,
+        };
+        e.dispatchThreads_threadsPerThreadgroup(size(N), size(64));
+        e.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        // SAFETY: N floats of a shared buffer the GPU is done with.
+        let got = unsafe { std::slice::from_raw_parts(out.contents().as_ptr().cast::<f32>(), N) };
+        for (i, v) in got.iter().enumerate() {
+            assert_eq!(*v, i as f32 + 64.0, "item {i}");
         }
     }
 

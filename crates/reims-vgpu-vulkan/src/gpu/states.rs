@@ -1442,6 +1442,7 @@ mod tests {
             support_indirect_command_buffers: false,
             stage_input: None,
             linked: LinkedFunctionsDesc::default(),
+            open_cl_mode: false,
         };
         let site = catch_death(|| dev().new_compute_pipeline_state_full(&desc)).unwrap_err();
         assert_eq!(site.file, sel);
@@ -1524,6 +1525,7 @@ mod tests {
             support_indirect_command_buffers: false,
             stage_input: None,
             linked,
+            open_cl_mode: false,
         };
         let one = |f: &VulkanFunction| vec![f.clone_ref()];
         let linked = |functions, binary_functions, groups, private_functions| LinkedFunctionsDesc {

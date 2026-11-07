@@ -27,7 +27,7 @@ use dispatch2::DispatchData;
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{Message, msg_send};
-use objc2_foundation::{NSArray, NSError, NSRange, NSString};
+use objc2_foundation::{NSArray, NSData, NSError, NSRange, NSString};
 use objc2_io_surface::IOSurfaceRef;
 use objc2_metal::{
     MTLArgumentEncoder, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer,
@@ -463,10 +463,34 @@ pub unsafe trait FunctionSpi: Message {
             msg_send![self, newArgumentEncoderWithBufferIndex: buffer_index, reflection: reflection]
         }
     }
+    /// The kernel's function of OpenCL mode, made of `plugin_data` with `bitcode_type`, as
+    /// Apple's OpenGL renderer makes it for a pipeline of `setOpenCLModeEnabled:`, or nil.
+    fn newFunctionWithPluginData_bitcodeType_or_nil(
+        &self,
+        plugin_data: &NSData,
+        bitcode_type: u64,
+    ) -> Option<Retained<ProtocolObject<dyn MTLFunction>>> {
+        unsafe { msg_send![self, newFunctionWithPluginData: plugin_data, bitcodeType: bitcode_type] }
+    }
 }
 
 // SAFETY: an `id<MTLFunction>`.
 unsafe impl FunctionSpi for ProtocolObject<dyn MTLFunction> {}
+
+/// `setOpenCLModeEnabled:`, which links a kernel's function of OpenCL mode
+/// (`FunctionSpi::newFunctionWithPluginData_bitcodeType_or_nil`) behind three buffers of its own,
+/// its arguments at their indices plus three.
+///
+/// # Safety
+/// The implementor is an `MTLComputePipelineDescriptor`.
+pub unsafe trait ComputePipelineDescriptorSpi: Message {
+    fn setOpenCLModeEnabled(&self, enabled: bool) {
+        unsafe { msg_send![self, setOpenCLModeEnabled: enabled] }
+    }
+}
+
+// SAFETY: an `MTLComputePipelineDescriptor`.
+unsafe impl ComputePipelineDescriptorSpi for MTLComputePipelineDescriptor {}
 
 /// The attachment arrays' `objectAtIndexedSubscript:` with a nil result carried (objc2-metal's
 /// is nonnull). It raises past the end.

@@ -237,6 +237,12 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// size. The graphics lane's deferred surfaces take a quarter of it, read once at its device's
     /// start.
     fn own_memory_budget(&self) -> u64;
+    /// Whether the device makes compute pipelines of OpenCL mode
+    /// ([`FullComputePipelineDesc::open_cl_mode`]): on the Metal platform, where Metal's compute
+    /// pipeline descriptors take `setOpenCLModeEnabled:` (SPI) and its functions
+    /// `newFunctionWithPluginData:bitcodeType:` (SPI); the Vulkan platform makes none. The
+    /// graphics lane offers `OPENCL_MODE` where it does.
+    fn makes_opencl_mode_pipelines(&self) -> bool;
     /// sel: newBufferWithDescriptor: SPI — from a private `MTLBufferDescriptor` made from
     /// `desc`.
     fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<P::Buffer>>;

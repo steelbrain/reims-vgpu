@@ -1766,6 +1766,7 @@ mod tests {
                         private_functions: vec![linked],
                         ..LinkedFunctionsDesc::default()
                     },
+                    open_cl_mode: false,
                 })
         };
         let specialized = callee

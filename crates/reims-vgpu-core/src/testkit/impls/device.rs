@@ -434,6 +434,11 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         FAKE_OWN_MEMORY
     }
 
+    /// No: the fake device makes no pipeline of OpenCL mode, unlogged.
+    fn makes_opencl_mode_pipelines(&self) -> bool {
+        false
+    }
+
     /// The value's options folded as Metal's buffer descriptor folds them ([`fold_options`]), its
     /// contents, pin and deallocator.
     fn new_buffer(

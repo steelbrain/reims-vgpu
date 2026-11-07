@@ -54,8 +54,8 @@ use reims_graphics::wire::{
     RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_HEAP_OVER_PAGES,
     RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
-    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_PAGES_BUFFERS,
-    RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SHARED_EVENT_NAMES,
+    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
+    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SHARED_EVENT_NAMES,
     RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
     RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
     RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
@@ -312,8 +312,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // (`DISPLAY_COLOR`), its window drawing through it, and names the shared events one
             // process hands another (`SHARED_EVENT_NAMES`). A host whose GPU answers Metal3
             // makes mesh render pipelines and draws them (`MESH_PIPELINES`). A host whose device
-            // takes the private render state Apple's OpenGL renderer sets makes the guest's
-            // render pipelines with it (`PRIVATE_RENDER_STATE`).
+            // makes compute pipelines of OpenCL mode links an OpenCL kernel's function the
+            // bundle names so (`OPENCL_MODE`). A host whose device takes the private render
+            // state Apple's OpenGL renderer sets makes the guest's render pipelines with it
+            // (`PRIVATE_RENDER_STATE`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);
@@ -330,6 +332,11 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_SMALL_ID_CHUNKS)
                 | u64::from(RGFX_FEATURE_DISPLAY_COLOR)
                 | u64::from(RGFX_FEATURE_SHARED_EVENT_NAMES)
+                | if gpu_device.makes_opencl_mode_pipelines() {
+                    u64::from(RGFX_FEATURE_OPENCL_MODE)
+                } else {
+                    0
+                }
                 | if gpu_device.takes_private_render_state() {
                     u64::from(RGFX_FEATURE_PRIVATE_RENDER_STATE)
                 } else {

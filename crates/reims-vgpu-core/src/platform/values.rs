@@ -661,12 +661,19 @@ pub struct FullComputePipelineDesc<'a, P: Platform> {
     pub stage_input: Option<StageInputDesc>,
     /// `setLinkedFunctions:`, where the kernel links any.
     pub linked: LinkedFunctionsDesc<P>,
+    /// OpenCL mode: the function made of its plugin data first
+    /// (`newFunctionWithPluginData:bitcodeType:`, SPI), then `setOpenCLModeEnabled:` (SPI), which
+    /// links the kernel behind three buffers of its own and its arguments at their indices plus
+    /// three. Only a device that answers [`makes_opencl_mode_pipelines`] is asked.
+    ///
+    /// [`makes_opencl_mode_pipelines`]: super::device::GpuDevice::makes_opencl_mode_pipelines
+    pub open_cl_mode: bool,
 }
 
 impl<'a, P: Platform> FullComputePipelineDesc<'a, P> {
     /// The value of `function` with Metal's defaults elsewhere: no label, no execution-width
     /// promise, Metal's maximum threads per threadgroup, a call stack depth of one, no indirect
-    /// command buffer support, no stage-input descriptor and no linked functions.
+    /// command buffer support, no stage-input descriptor, no linked functions and no OpenCL mode.
     pub fn new(function: &'a P::Function) -> Self {
         FullComputePipelineDesc {
             label: None,
@@ -677,6 +684,7 @@ impl<'a, P: Platform> FullComputePipelineDesc<'a, P> {
             support_indirect_command_buffers: false,
             stage_input: None,
             linked: LinkedFunctionsDesc::default(),
+            open_cl_mode: false,
         }
     }
 }
@@ -701,6 +709,7 @@ impl<P: Platform> fmt::Debug for FullComputePipelineDesc<'_, P> {
             )
             .field("stage_input", &self.stage_input)
             .field("linked", &self.linked)
+            .field("open_cl_mode", &self.open_cl_mode)
             .finish()
     }
 }

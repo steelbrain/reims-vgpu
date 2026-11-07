@@ -50,9 +50,9 @@ use crate::msg::{self, Policy};
 use crate::platform::{MetalPlatform, Obj};
 use crate::spi::classes::MTLBufferDescriptor;
 use crate::spi::methods::{
-    AttachmentArraySpi, ForceResourceIndexSpi, HeapDescriptorSpi, IcbDescriptorSpi,
-    RENDER_PIPELINE_PRIVATE_SETTERS, RenderPassDescriptorSpi, RenderPipelineDescriptorSpi,
-    ResourceIndexDescriptorSpi, TextureDescriptorSpi,
+    AttachmentArraySpi, ComputePipelineDescriptorSpi, ForceResourceIndexSpi, FunctionSpi,
+    HeapDescriptorSpi, IcbDescriptorSpi, RENDER_PIPELINE_PRIVATE_SETTERS, RenderPassDescriptorSpi,
+    RenderPipelineDescriptorSpi, ResourceIndexDescriptorSpi, TextureDescriptorSpi,
 };
 
 /// A sub-object getter's `+0` result as a handle, retained.
@@ -1093,10 +1093,19 @@ pub fn apply_full_compute_pipeline(
         let label = msg::new_string(label);
         msg::get("setLabel:", || o.setLabel(Some(&label)));
     }
-    let function = desc.function.get();
+    // In OpenCL mode the descriptor takes the kernel's function of OpenCL mode, where the function
+    // makes one; Metal refuses the create otherwise.
+    let variant = desc
+        .open_cl_mode
+        .then(|| opencl_mode_function(desc.function.get()))
+        .flatten();
+    let function = variant.as_deref().unwrap_or(desc.function.get());
     msg::get("setComputeFunction:", || {
         o.setComputeFunction(Some(function))
     });
+    if desc.open_cl_mode {
+        msg::get("setOpenCLModeEnabled:", || o.setOpenCLModeEnabled(true));
+    }
     // SAFETY: a plain flag.
     msg::get(
         "setThreadGroupSizeIsMultipleOfThreadExecutionWidth:",
@@ -1132,6 +1141,45 @@ pub fn apply_full_compute_pipeline(
             o.setLinkedFunctions(Some(&linked))
         });
     }
+}
+
+/// Whether this Metal makes compute pipelines of OpenCL mode: its compute pipeline descriptors
+/// answer `setOpenCLModeEnabled:` (SPI). Read once.
+pub fn opencl_mode_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let d = msg::get("new", MTLComputePipelineDescriptor::new);
+        msg::get("respondsToSelector:", || {
+            objc2_foundation::NSObjectProtocol::respondsToSelector(
+                &*d,
+                objc2::sel!(setOpenCLModeEnabled:),
+            )
+        })
+    })
+}
+
+/// The kernel `f`'s function of OpenCL mode: made of the plugin data Apple's OpenGL renderer
+/// passes (32 bytes, the first 2) with bitcode type 2, as the renderer makes it; nil where `f`
+/// answers no `newFunctionWithPluginData:bitcodeType:` or makes none. Measured on the M3 Max
+/// (macOS 27): an `_MTLFunctionInternal`, whose pipeline of OpenCL mode reflects the same buffers
+/// as the AMD 5300M's and Intel 630's.
+fn opencl_mode_function(
+    f: &ProtocolObject<dyn MTLFunction>,
+) -> Option<Retained<ProtocolObject<dyn MTLFunction>>> {
+    if !msg::get("respondsToSelector:", || {
+        objc2_foundation::NSObjectProtocol::respondsToSelector(
+            f,
+            objc2::sel!(newFunctionWithPluginData:bitcodeType:),
+        )
+    }) {
+        return None;
+    }
+    let mut plugin_data = [0u8; 32];
+    plugin_data[0] = 2;
+    let data = objc2_foundation::NSData::with_bytes(&plugin_data);
+    msg::get("newFunctionWithPluginData:bitcodeType:", || {
+        f.newFunctionWithPluginData_bitcodeType_or_nil(&data, 2)
+    })
 }
 
 /// A stage-input descriptor's layouts, attributes, then index type and index buffer, onto `sd`.
@@ -1963,6 +2011,7 @@ mod tests {
                     binary_functions: vec![k.function.clone_ref()],
                     ..LinkedFunctionsDesc::default()
                 },
+                open_cl_mode: false,
             },
             &x,
         );

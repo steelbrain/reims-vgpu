@@ -1487,6 +1487,7 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
                     groups,
                     private_functions,
                 },
+                open_cl_mode: false,
             })
             .map(|state| state.map(drop))
         }))

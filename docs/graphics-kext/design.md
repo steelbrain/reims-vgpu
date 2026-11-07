@@ -877,6 +877,16 @@ only where no negotiation can carry it.
   shared events one process hands another, and the host posts the values one
   holder gives the event to the others' listen queues ("Shared events across
   processes", below). Every host offers it, and the kext takes it.
+- Bit 27 is `OPENCL_MODE`: a `COMPUTE_PIPELINE_CREATE` may carry
+  `RGFX_COMPUTE_PIPELINE_OPENCL_MODE`, and the host makes that pipeline of
+  OpenCL mode: Metal links the kernel behind three buffers of its own (the
+  global offsets and dimension count at 0, then 1 and 2) with its arguments at
+  their indices plus three. The bundle makes a kernel's function of OpenCL mode
+  (`newFunctionWithPluginData:bitcodeType:2`) only where the kext carries the
+  bit. A host offers it where its platform makes such pipelines: the Metal
+  platform where Metal's compute pipeline descriptors answer
+  `setOpenCLModeEnabled:` (the M3 Max on macOS 27, the AMD 5300M and Intel 630
+  on macOS 26.7.1), and the Vulkan platform not yet.
 - Bit 28 is `PRIVATE_RENDER_STATE`: a `RENDER_PIPELINE_CREATE` may carry
   `RGFX_RENDER_PIPELINE_PRIVATE_STATE` (flag bit 6), and then an
   `RgfxRenderPipelinePrivateState` (24 bytes) follows its head, ahead of the

@@ -97,7 +97,8 @@ use reims_graphics::wire::{
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
     RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
     RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE,
-    RGFX_COMPUTE_PIPELINE_SUPPORT_ICB, RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH,
+    RGFX_COMPUTE_PIPELINE_OPENCL_MODE, RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+    RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH,
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
     RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN,
     RGFX_LINKED_BINARY_FUNCTIONS, RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP,
@@ -3455,8 +3456,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// rasterization, input primitive topology, maximum vertex amplification count, indirect
     /// command buffer support, the vertex and fragment stages' linked functions, and its label;
     /// the compute form's function, threadgroup-size multiple, maximum threads per threadgroup,
-    /// maximum call stack depth, indirect command buffer support, stage-input descriptor and
-    /// linked functions. Each function is specialised by the index-keyed constants the wire
+    /// maximum call stack depth, indirect command buffer support, stage-input descriptor, linked
+    /// functions and OpenCL mode. Each function is specialised by the index-keyed constants the wire
     /// carries for it, and each linked function made with the options the guest made it with.
     pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
         let library = |obj_id: u64| self.library_ref(obj_id);
@@ -3490,6 +3491,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                             & RGFX_COMPUTE_PIPELINE_SUPPORT_ICB
                             != 0,
                         stage_input,
+                        open_cl_mode: m.flags & RGFX_COMPUTE_PIPELINE_OPENCL_MODE != 0,
                     },
                 },
             });
@@ -3860,6 +3862,7 @@ struct ComputeFields {
     max_call_stack_depth: u64,
     support_indirect_command_buffers: bool,
     stage_input: Option<StageInputDesc>,
+    open_cl_mode: bool,
 }
 
 /// A mesh render pipeline create's descriptor past its functions, label and linked functions:
@@ -4468,6 +4471,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 support_indirect_command_buffers: fields.support_indirect_command_buffers,
                 stage_input: fields.stage_input,
                 linked,
+                open_cl_mode: fields.open_cl_mode,
             };
             Ok(match device.new_compute_pipeline_state_full(&desc) {
                 Ok(Some(pipeline)) => {
@@ -8087,8 +8091,8 @@ lacks {part}"
     }
 
     /// Every field of a compute create reaches the platform's creator: the threadgroup-size
-    /// multiple, the maximum threads per threadgroup, the maximum call stack depth and indirect
-    /// command buffer support
+    /// multiple, the maximum threads per threadgroup, the maximum call stack depth, indirect
+    /// command buffer support and OpenCL mode
     #[test]
     fn a_compute_create_carries_its_whole_descriptor() {
         let (p, mut dec, replies) = pipeline_decoder();
@@ -8107,7 +8111,8 @@ lacks {part}"
             name_offset: head,
             name_len: name.len() as u32,
             flags: RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH
-                | RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+                | RGFX_COMPUTE_PIPELINE_SUPPORT_ICB
+                | RGFX_COMPUTE_PIPELINE_OPENCL_MODE,
             max_total_threads_per_threadgroup: 256,
             max_call_stack_depth: 7,
             ..RgfxComputePipelineCreate::default()
@@ -8127,6 +8132,7 @@ lacks {part}"
                     max_total_threads_per_threadgroup: 256, max_call_stack_depth: 7, \
                     support_indirect_command_buffers: true, stage_input: None";
         assert!(logged.contains(part), "{logged}");
+        assert!(logged.contains("open_cl_mode: true"), "{logged}");
     }
 
     /// A linked function [`append_linked`] appends: its name, list, `MTLFunctionOptions`, group
