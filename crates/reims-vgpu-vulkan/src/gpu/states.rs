@@ -84,13 +84,15 @@
 //!   there, naming the refusal. The runtime decides it once, as it makes the state: a state it
 //!   made is one whose use it decided, and nothing here decodes its functions again. The runtime
 //!   refuses a render state with rasterization off whose vertex function returns a value with
-//!   Metal's error too (`UnrasterizedVertexReturn`, code 3). With rasterization off the descriptor
-//!   keeps the fragment function, which the runtime checks as Metal links it and leaves out of the
-//!   Vulkan compile: it answers Metal's error (code 3) where a written colour attachment keeps the
-//!   fragment function's read of a `stage_in` input, which no vertex function writes then, or, with
-//!   `supportIndirectCommandBuffers`, its direct texture or sampler, and where the function writes
-//!   depth with no depth attachment; it makes the state otherwise, as Metal does (measured:
-//!   `unrasterized_states_are_metals`).
+//!   Metal's error too (`UnrasterizedVertexReturn`, code 3), and one with rasterization on whose
+//!   vertex function returns nothing (`RasterizedVoidVertex`, code 3) but in OpenGL mode, where
+//!   Metal makes it and it rasterizes nothing (`private_state`). With rasterization off the
+//!   descriptor keeps the fragment function, which the runtime checks as Metal links it and leaves
+//!   out of the Vulkan compile: it answers Metal's error (code 3) where a written colour
+//!   attachment keeps the fragment function's read of a `stage_in` input, which no vertex
+//!   function writes then, or, with `supportIndirectCommandBuffers`, its direct texture or
+//!   sampler, and where the function writes depth with no depth attachment but in OpenGL mode; it
+//!   makes the state otherwise, as Metal does (measured: `unrasterized_states_are_metals`).
 //!
 //!   The `NSError`'s domain is the driver's (`AGXMetalG15X_M1` on the M3 Max; another GPU family's
 //!   driver names another), and its text names the intrinsic or the symbol, which the runtime's
@@ -425,9 +427,10 @@ pub(crate) fn new_depth_stencil_state(
 /// - Metal's error as the runtime states it, with its code ([`rt::Error::MetalError`]), which the
 ///   runtime answers only where plain Metal answers nil with that `NSError`: a state that
 ///   supports indirect command buffers whose function uses a direct texture or sampler argument
-///   once Metal links the pipeline (`IndirectCommandsDirectArgument`), and a render state with
-///   rasterization off whose vertex function returns a value (`UnrasterizedVertexReturn`), among
-///   them; a problem the runtime adds there is the `NSError` too.
+///   once Metal links the pipeline (`IndirectCommandsDirectArgument`), a render state with
+///   rasterization off whose vertex function returns a value (`UnrasterizedVertexReturn`), and
+///   one with rasterization on whose vertex function returns nothing outside OpenGL mode
+///   (`RasterizedVoidVertex`), among them; a problem the runtime adds there is the `NSError` too.
 ///
 /// An answer the runtime cannot prove ([`rt::Error::Unproven`]) dies, naming it (`unproven`), as
 /// does every other refusal.
@@ -860,14 +863,14 @@ fn linked_functions(l: &LinkedFunctionsDesc<VulkanPlatform>) -> LinkedFunctions 
 }
 
 /// The private state `p` (the graphics wire's, as Apple's OpenGL renderer sets it) into the
-/// runtime's `private`: the sample mask and coverage, the coverage inversion, the logic operation
-/// and its switch, and the depth-stencil write switch, each the guest's raw value.
-///
-/// `openGLModeEnabled`, which the renderer sets on every pipeline, the runtime has no field for:
-/// it is dropped here, an interim divergence from Metal, which makes the pipeline with it, until
-/// metal2vulkan measures what it changes on Apple's Metal and gives it a field and rule or calls
-/// it inert.
+/// runtime's `private`: OpenGL mode, the sample mask and coverage, the coverage inversion, the
+/// logic operation and its switch, and the depth-stencil write switch, each the guest's raw
+/// value. OpenGL mode, which the renderer sets on every pipeline, changes nothing Metal draws or
+/// reflects, and makes two states Metal otherwise refuses: a fragment function writing depth
+/// without a depth attachment, and a rasterizing state whose vertex function returns nothing
+/// (metal2vulkan's measurement on the M3 Max, macOS 27.0.1; the runtime answers both).
 fn private_state(private: &mut metal2vulkan::pipeline::PrivateRenderState, p: &PrivateRenderDesc) {
+    private.open_gl_mode_enabled = p.open_gl_mode_enabled;
     private.sample_mask = p.sample_mask;
     private.sample_coverage = p.sample_coverage;
     private.sample_coverage_invert = p.sample_coverage_invert;
@@ -2187,8 +2190,8 @@ mod tests {
         );
     }
 
-    /// The graphics wire's private render state fills the runtime's, each field the guest's value
-    /// but `openGLModeEnabled`, which it has no field for; the rest stay Metal's defaults
+    /// The graphics wire's private render state fills the runtime's, each field the guest's
+    /// value; the rest stay Metal's defaults
     #[test]
     fn the_private_render_state_fills_the_runtimes() {
         let mut private = metal2vulkan::pipeline::PrivateRenderState::new();
@@ -2205,6 +2208,7 @@ mod tests {
             },
         );
         let mut want = metal2vulkan::pipeline::PrivateRenderState::new();
+        want.open_gl_mode_enabled = true;
         want.sample_mask = 3;
         want.sample_coverage = 0.5;
         want.sample_coverage_invert = true;
@@ -2212,6 +2216,66 @@ mod tests {
         want.logic_operation = 10;
         want.depth_stencil_write_disabled = true;
         assert_eq!(private, want);
+    }
+
+    /// A rasterizing render state whose vertex function returns nothing is Metal's
+    /// (metal2vulkan's measurement on the M3 Max, macOS 27.0.1, and the Metal platform's
+    /// `opengl_mode_makes_a_rasterizing_void_vertex_state`): the `NSError` of code 3
+    /// (`RasterizedVoidVertex`) outside OpenGL mode, with or without a fragment function, and
+    /// made in it
+    #[test]
+    fn a_rasterizing_void_vertex_state_is_made_in_opengl_mode_alone() {
+        use crate::gpu::device::tests::fixture_function;
+        let d = dev();
+        let vertex = fixture_function(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/unrasterized.metallib"
+        )));
+        let (_, fragment) = indirect_functions();
+        let made = |fragment: Option<&VulkanFunction>, private: Option<PrivateRenderDesc>| {
+            d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                label: None,
+                vertex: &vertex,
+                fragment,
+                vertex_descriptor: None,
+                colors: vec![(
+                    0,
+                    ColorAttachmentDesc {
+                        pixel_format: 70,
+                        ..ColorAttachmentDesc::default()
+                    },
+                )],
+                depth_pixel_format: 0,
+                stencil_pixel_format: 0,
+                raster_sample_count: 1,
+                alpha_to_coverage: false,
+                alpha_to_one: false,
+                rasterization_enabled: true,
+                input_primitive_topology: 0,
+                max_vertex_amplification_count: 1,
+                support_indirect_command_buffers: false,
+                vertex_linked: LinkedFunctionsDesc::default(),
+                fragment_linked: LinkedFunctionsDesc::default(),
+                private_state: private,
+            })
+            .map(|state| state.is_some())
+            .map_err(|e| e.code)
+        };
+        let gl = PrivateRenderDesc {
+            open_gl_mode_enabled: true,
+            ..PrivateRenderDesc::default()
+        };
+        for fragment in [Some(&fragment), None] {
+            let has = fragment.is_some();
+            assert_eq!(made(fragment, None), Err(3), "fragment {has}");
+            let plain = Some(PrivateRenderDesc::default());
+            assert_eq!(
+                made(fragment, plain),
+                Err(3),
+                "fragment {has}, the mode off"
+            );
+            assert_eq!(made(fragment, Some(gl)), Ok(true), "fragment {has}");
+        }
     }
 
     #[cfg(target_os = "macos")]

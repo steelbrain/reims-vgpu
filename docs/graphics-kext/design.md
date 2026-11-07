@@ -892,8 +892,7 @@ only where no negotiation can carry it.
   stencil. It does alpha test, two-sided colour and the point sprite origin
   in its shaders. A host offers it where its platform takes that state. The
   Metal platform does where its descriptors answer every setter. The Vulkan
-  platform always does, filling metal2vulkan's `PrivateRenderState` and
-  dropping `openGLModeEnabled`, which that state has no field for yet.
+  platform always does, filling metal2vulkan's `PrivateRenderState`.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
