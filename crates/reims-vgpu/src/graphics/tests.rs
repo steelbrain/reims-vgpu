@@ -6172,7 +6172,12 @@ fn a_compile_the_platform_refuses_is_a_refused_reflection() {
     );
     guest.send(&device, compute_pipeline_create(obj(1, 12), obj(1, 10)));
     expect_reflection(&mut guest, obj(1, 12), RGFX_PIPELINE_REFUSED);
-    faults.at("MTLLibrary", "newFunctionWithName:", 0, Fault::Crash);
+    faults.at(
+        "MTLLibrary",
+        "newFunctionWithName:constantValues:error:",
+        0,
+        Fault::Crash,
+    );
     guest.send(&device, compute_pipeline_create(obj(1, 13), obj(1, 10)));
     expect_reflection(&mut guest, obj(1, 13), RGFX_PIPELINE_REFUSED);
     assert_eq!(device.decoder_object_count(), 1, "only the library");

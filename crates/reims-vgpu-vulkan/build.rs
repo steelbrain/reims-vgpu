@@ -33,7 +33,9 @@
 //! `$OUT_DIR/tile_edges.metallib`, the tests' Core Image kernel, `src/gpu/ci_kernel.metal`,
 //! compiled as Core Image compiles one (`-fcikernel`, then `metallib -cikernel`) into
 //! `$OUT_DIR/ci_kernel.metallib`, the tests' mesh render pipelines' functions,
-//! `src/gpu/mesh.metal`, into `$OUT_DIR/mesh.metallib`, and those that import a symbol from a
+//! `src/gpu/mesh.metal`, into `$OUT_DIR/mesh.metallib`, the tests' kernel of a function constant
+//! it reads only where defined, `src/gpu/optional_constant.metal`, into
+//! `$OUT_DIR/optional_constant.metallib`, and those that import a symbol from a
 //! dynamic library, `src/gpu/refused_import.metal`, linked into three metallibs ([`imports`]), and
 //! the shell tests' stitchable functions, `guest/bundle/tests/stitchable.metal`, into
 //! `$OUT_DIR/stitchable.metallib`, with the library Metal's stitcher makes of them into
@@ -93,7 +95,7 @@ const STITCH_TOOL: [&str; 6] = [
 ];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
-const TEST_LIBRARIES: [&str; 23] = [
+const TEST_LIBRARIES: [&str; 24] = [
     "predication",
     "no_draw",
     "icb_encode",
@@ -117,6 +119,7 @@ const TEST_LIBRARIES: [&str; 23] = [
     "linked_caller",
     "linked_callee",
     "mesh",
+    "optional_constant",
 ];
 
 /// The files [`imports`] makes.

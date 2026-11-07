@@ -4229,7 +4229,8 @@ pub(crate) fn compile_pipeline<P: Platform>(
             let Some(vertex_library) = vertex_library.resolve() else {
                 return Ok(refused(no_library("vertex")));
             };
-            let Some(vertex) = specialised::<P>(&vertex_library, &vertex_name, &vertex_constants)?
+            let Some(vertex) =
+                stage_function::<P>(&vertex_library, &vertex_name, &vertex_constants)?
             else {
                 return Ok(refused(no_function(&vertex_name)));
             };
@@ -4239,7 +4240,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                     let Some(library) = library.resolve() else {
                         return Ok(refused(no_library("fragment")));
                     };
-                    let Some(function) = specialised::<P>(&library, &name, &constants)? else {
+                    let Some(function) = stage_function::<P>(&library, &name, &constants)? else {
                         return Ok(refused(no_function(&name)));
                     };
                     Some(function)
@@ -4312,7 +4313,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                     let Some(library) = library.resolve() else {
                         return Ok(Err(no_library(stage)));
                     };
-                    Ok(specialised::<P>(&library, &name, &constants)?
+                    Ok(stage_function::<P>(&library, &name, &constants)?
                         .ok_or_else(|| no_function(&name)))
                 };
             let object = match object.map(|f| function("object", f)).transpose()? {
@@ -4401,7 +4402,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
             let Some(library) = library.resolve() else {
                 return Ok(refused(no_library("kernel")));
             };
-            let Some(function) = specialised::<P>(&library, &name, &constants)? else {
+            let Some(function) = stage_function::<P>(&library, &name, &constants)? else {
                 return Ok(refused(no_function(&name)));
             };
             let linked = match linked_functions::<P>(linked)? {
@@ -4500,6 +4501,24 @@ fn constants_tail(message: &[u8], offset: u32, count: u32) -> Option<Vec<Functio
             })
             .collect(),
     )
+}
+
+/// A pipeline stage's function `name` of `library`, made with its constant values `constants`,
+/// none among them too, as the guest made it: the guest's bundle refuses a pipeline of a function
+/// made by name that declares constants, in Metal's words (`RgfxFunction`'s
+/// `rgfxUnspecialisedError`), so each stage function it names was made with constant values or by
+/// a descriptor, or declares none. Made with none, a function that declares constants reads them
+/// as undefined, and one that declares none is the function its name makes, at the same cost:
+/// Metal's `newFunctionWithName:constantValues:error:` makes both with values that set nothing,
+/// and a pipeline of each (measured: macOS 26.7.1, AMD Radeon Pro 5300M and Intel UHD Graphics
+/// 630). Made by name instead, a function that declares constants would have its pipeline refused
+/// on the Vulkan platform, as Metal ends its process there.
+fn stage_function<P: Platform>(
+    library: &P::Library,
+    name: &str,
+    constants: &[FunctionConstant],
+) -> RaiseResult<Option<P::Function>> {
+    library.new_function_with_constants(OnFault::Return, name, constants)
 }
 
 /// The function `name` of `library`, specialised by `constants` when there are any.
@@ -7870,7 +7889,12 @@ lacks {part}"
                 .unwrap(),
             Err(DecodeError::Refused)
         );
-        faults.at("MTLLibrary", "newFunctionWithName:", 0, Fault::Crash);
+        faults.at(
+            "MTLLibrary",
+            "newFunctionWithName:constantValues:error:",
+            0,
+            Fault::Crash,
+        );
         assert_eq!(
             dec.decode(&device, &whole_render_create(101, false))
                 .unwrap(),
@@ -8142,7 +8166,8 @@ lacks {part}"
         let mark = p.call_log().mark();
         assert_eq!(dec.decode(&device, &bytes).unwrap(), Ok(()));
         assert_eq!(replies.lock()[0].status, RGFX_PIPELINE_OK);
-        // Each function made in the wire's order, the binary one with its options.
+        // Each function made in the wire's order, the kernel with its constant values (none), the
+        // binary one with its options.
         let made: Vec<_> = p
             .call_log()
             .since(mark)
@@ -8154,7 +8179,7 @@ lacks {part}"
         assert_eq!(
             sels,
             [
-                "newFunctionWithName:",
+                "newFunctionWithName:constantValues:error:",
                 "newFunctionWithName:",
                 "newFunctionWithDescriptor:error:",
                 "newFunctionWithName:",
@@ -8809,6 +8834,169 @@ lacks {part}"
                 caller, stitched
             ),
             [Some(20.0), Some(20.0), None]
+        );
+    }
+
+    /// The Vulkan crate's metallib of a kernel that reads a function constant only where it is
+    /// defined (its `optional_constant.metal`), which a host without Metal takes as a Mac does.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    const OPTIONAL_CONSTANT: &[u8] =
+        include_bytes!("../../../../reims-vgpu-vulkan/metallibs/optional_constant.metallib");
+
+    /// What [`OPTIONAL_CONSTANT`]'s `optional_constant` writes, made through the decoder on `P`
+    /// from a compute create of each of `cases`' constants: `None` where the create is refused.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn optional_constant_through_the_decoder<P: crate::platform::ApiPlatform>(
+        cases: &[&[RgfxFunctionConstant]],
+    ) -> Vec<Option<i32>> {
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
+        use reims_vgpu_core::platform::values::ComputePassDesc;
+        use reims_vgpu_core::raise::OnFault;
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<P>::new(
+            Arc::clone(&platform),
+            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+        );
+        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let sink_replies = Arc::clone(&replies);
+        dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
+            sink_replies
+                .lock()
+                .push((r.reflection.obj_id, r.reflection.status));
+        }));
+        let mut m = RgfxLibraryCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_CREATE,
+                size: (RGFX_LIBRARY_BYTES_OFFSET as usize + OPTIONAL_CONSTANT.len())
+                    .next_multiple_of(8) as u32,
+                seqno: 1,
+            },
+            obj_id: 1,
+            byte_length: OPTIONAL_CONSTANT.len() as u64,
+            ..RgfxLibraryCreate::default()
+        }
+        .as_bytes()
+        .to_vec();
+        m.extend_from_slice(OPTIONAL_CONSTANT);
+        m.resize(m.len().next_multiple_of(8), 0);
+        assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()));
+        let mut made = Vec::new();
+        for (n, constants) in cases.iter().enumerate() {
+            let obj_id = 100 + n as u64;
+            let mut bytes = compute_create(obj_id);
+            let name = b"optional_constant";
+            let at = bytes.len() as u32;
+            bytes.extend_from_slice(name);
+            bytes.resize(bytes.len().next_multiple_of(8), 0);
+            let constants_at = bytes.len() as u32;
+            bytes.extend_from_slice(constants.as_bytes());
+            let size = bytes.len() as u32;
+            edit_head(&mut bytes, |m: &mut RgfxComputePipelineCreate| {
+                m.header.size = size;
+                (m.name_offset, m.name_len) = (at, name.len() as u32);
+                (m.constants_offset, m.constant_count) = (constants_at, constants.len() as u32);
+            });
+            let decoded = dec.decode(&device, &bytes).unwrap();
+            assert!(
+                decoded == Ok(()) || decoded == Err(DecodeError::Refused),
+                "{constants:?}: {decoded:?}"
+            );
+            let status = replies
+                .lock()
+                .pop()
+                .map(|(id, status)| (id == obj_id, status));
+            let Some(ObjHandle::ComputePipeline(pipeline)) = dec.object(obj_id) else {
+                assert_eq!(status, Some((true, RGFX_PIPELINE_REFUSED)), "{constants:?}");
+                made.push(None);
+                continue;
+            };
+            assert_eq!(status, Some((true, RGFX_PIPELINE_OK)), "{constants:?}");
+            let output = device
+                .new_buffer_of_length(OnFault::Return, 4, 0)
+                .unwrap()
+                .unwrap();
+            let queue = device.new_command_queue().unwrap();
+            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let enc = cb
+                .compute_encoder_for_pass(&ComputePassDesc::default())
+                .unwrap()
+                .unwrap();
+            let one = MtlSize::new(1, 1, 1);
+            for cmd in [
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(pipeline),
+                },
+                ComputeCmd::SetBuffers {
+                    buffers: &[Some(&output)],
+                    offsets: &[0],
+                    range: NsRange {
+                        location: 0,
+                        length: 1,
+                    },
+                },
+                ComputeCmd::DispatchThreadgroups {
+                    threadgroups_per_grid: one,
+                    threads_per_threadgroup: one,
+                },
+                ComputeCmd::EndEncoding,
+            ] {
+                enc.encode(OnFault::Return, cmd).unwrap();
+            }
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            // SAFETY: the GPU wrote the buffer's 4 bytes, and is done.
+            made.push(Some(unsafe { output.contents().as_ptr::<i32>().read() }));
+        }
+        made
+    }
+
+    /// The constants [`optional_constant_through_the_decoder`]'s creates send: none, as the guest
+    /// sends a function made with constant values that set none of its constants, or by a
+    /// descriptor without them; then its constant, an `int` (`MTLDataTypeInt`) of 5.
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    fn optional_constant_cases() -> [Vec<RgfxFunctionConstant>; 2] {
+        let mut value = [0; reims_graphics::wire::RGFX_FUNCTION_CONSTANT_VALUE_BYTES];
+        value[..4].copy_from_slice(&5i32.to_le_bytes());
+        [
+            Vec::new(),
+            vec![RgfxFunctionConstant {
+                index: 0,
+                data_type: 29,
+                value,
+            }],
+        ]
+    }
+
+    /// On Metal, from the wire: a kernel that declares a function constant, sent with none, as
+    /// the guest sends a function made with constant values that set none of its constants, is
+    /// made, and reads it as undefined (7), as Metal makes one of such values; sent with it, it
+    /// reads its value (5)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_a_stage_function_sent_with_no_constants_is_made_with_them_undefined() {
+        let cases = optional_constant_cases();
+        let cases: Vec<&[RgfxFunctionConstant]> = cases.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            optional_constant_through_the_decoder::<reims_vgpu_metal::MetalPlatform>(&cases),
+            [Some(7), Some(5)]
+        );
+    }
+
+    /// [`on_metal_a_stage_function_sent_with_no_constants_is_made_with_them_undefined`] on the
+    /// Vulkan platform, whose answers are Metal's
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn on_vulkan_a_stage_function_sent_with_no_constants_is_made_with_them_undefined() {
+        let cases = optional_constant_cases();
+        let cases: Vec<&[RgfxFunctionConstant]> = cases.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            optional_constant_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(&cases),
+            [Some(7), Some(5)]
         );
     }
 
