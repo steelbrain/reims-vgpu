@@ -15,11 +15,14 @@
 //     did, then set the reflection's plugin return data from the descriptor's GL variants.
 // Each change is written to stderr once; with GL_INJECT_LOG=1, so is each render pipeline the
 // class makes, with its functions and its error; with GL_INJECT_DUMP=DIR, each library it makes of
-// bytes is written to DIR/library-N.metallib (the variants' among them); with GL_INJECT_VENDOR=NAME,
-// the class answers vendorName with NAME (the GL renderer picks its per-vendor settings by it, and
-// stops the process on a vendor it does not know). Nothing outside the process changes. Use it with
-// gl_redirect (tools/gl_redirect.c), which points the accelerator's IOGLBundleName at the
-// renderer.
+// bytes is written to DIR/library-N.metallib (the variants' among them), and each render pipeline
+// to DIR/pipeline-N.txt: whether it was made, the libraries of its two functions, and its
+// descriptor's state (vertex attributes and layouts, color attachments, depth and stencil formats,
+// sample count, alpha to coverage, rasterization, topology), one line each; with
+// GL_INJECT_VENDOR=NAME, the class answers vendorName with NAME (the GL renderer picks its
+// per-vendor settings by it, and stops the process on a vendor it does not know). Nothing outside
+// the process changes. Use it with gl_redirect (tools/gl_redirect.c), which points the
+// accelerator's IOGLBundleName at the renderer.
 // Our own code.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -27,7 +30,9 @@
 
 #import "RgfxGLFunction.h"
 
+#include <atomic>
 #include <cstring>
+#include <map>
 #include <mutex>
 
 #define DYLD_INTERPOSE(_replacement, _replacee)                                              \
@@ -80,6 +85,91 @@ bool logging()
 	return on;
 }
 
+// GL_INJECT_DUMP's bookkeeping: each library made of bytes holds its number, and each function
+// made of it by name the library's.
+char kLibraryNumber, kFunctionLibrary;
+typedef id (*ByNameImp)(id, SEL, NSString *);
+std::mutex gByNameLock;
+std::map<Class, ByNameImp> gByName;
+
+id byName(id self, SEL cmd, NSString *name)
+{
+	ByNameImp imp = nullptr;
+	{
+		std::lock_guard<std::mutex> hold(gByNameLock);
+		for (Class c = object_getClass(self); c != nil && imp == nullptr; c = class_getSuperclass(c)) {
+			auto it = gByName.find(c);
+			if (it != gByName.end())
+				imp = it->second;
+		}
+	}
+	if (imp == nullptr)
+		return nil;
+	id f = imp(self, cmd, name);
+	id number = objc_getAssociatedObject(self, &kLibraryNumber);
+	if (f != nil && number != nil)
+		objc_setAssociatedObject(f, &kFunctionLibrary, number, OBJC_ASSOCIATION_RETAIN);
+	return f;
+}
+
+IMP wrap(Class cls, const char *name, IMP imp);
+
+void numberLibrary(id library, int number)
+{
+	if (library == nil)
+		return;
+	objc_setAssociatedObject(library, &kLibraryNumber, @(number), OBJC_ASSOCIATION_RETAIN);
+	Class cls = object_getClass(library);
+	std::lock_guard<std::mutex> hold(gByNameLock);
+	if (gByName.count(cls) == 0)
+		gByName[cls] = (ByNameImp)wrap(cls, "newFunctionWithName:", (IMP)byName);
+}
+
+int libraryOf(id function)
+{
+	NSNumber *n = function != nil ? objc_getAssociatedObject(function, &kFunctionLibrary) : nil;
+	return n != nil ? n.intValue : -1;
+}
+
+// DIR/pipeline-N.txt: the pipeline's two libraries, then its descriptor's state, one line each.
+void dumpPipeline(MTLRenderPipelineDescriptor *d, bool made)
+{
+	static std::atomic<int> count{0};
+	const char *dir = getenv("GL_INJECT_DUMP");
+	if (dir == nullptr || !dir[0])
+		return;
+	NSMutableString *t = [NSMutableString string];
+	[t appendFormat:@"made %d\nvertex %d\nfragment %d\n", made ? 1 : 0, libraryOf(d.vertexFunction),
+	                libraryOf(d.fragmentFunction)];
+	MTLVertexDescriptor *v = d.vertexDescriptor;
+	for (NSUInteger i = 0; i < 31; i++) {
+		MTLVertexAttributeDescriptor *a = v.attributes[i];
+		if (a.format != MTLVertexFormatInvalid)
+			[t appendFormat:@"attribute %lu %lu %lu %lu\n", (unsigned long)i, (unsigned long)a.format,
+			                (unsigned long)a.offset, (unsigned long)a.bufferIndex];
+		MTLVertexBufferLayoutDescriptor *l = v.layouts[i];
+		if (l.stride != 0)
+			[t appendFormat:@"layout %lu %lu %lu %lu\n", (unsigned long)i, (unsigned long)l.stride,
+			                (unsigned long)l.stepFunction, (unsigned long)l.stepRate];
+	}
+	for (NSUInteger i = 0; i < 8; i++) {
+		MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[i];
+		if (c.pixelFormat != MTLPixelFormatInvalid)
+			[t appendFormat:@"color %lu %lu %d %lu %lu %lu %lu %lu %lu %lu\n", (unsigned long)i,
+			                (unsigned long)c.pixelFormat, c.blendingEnabled ? 1 : 0,
+			                (unsigned long)c.sourceRGBBlendFactor, (unsigned long)c.destinationRGBBlendFactor,
+			                (unsigned long)c.rgbBlendOperation, (unsigned long)c.sourceAlphaBlendFactor,
+			                (unsigned long)c.destinationAlphaBlendFactor, (unsigned long)c.alphaBlendOperation,
+			                (unsigned long)c.writeMask];
+	}
+	[t appendFormat:@"depth %lu\nstencil %lu\nsamples %lu\nalpha_to_coverage %d\nrasterization %d\ntopology %lu\n",
+	                (unsigned long)d.depthAttachmentPixelFormat, (unsigned long)d.stencilAttachmentPixelFormat,
+	                (unsigned long)d.rasterSampleCount, d.alphaToCoverageEnabled ? 1 : 0,
+	                d.rasterizationEnabled ? 1 : 0, (unsigned long)d.inputPrimitiveTopology];
+	NSString *path = [NSString stringWithFormat:@"%s/pipeline-%d.txt", dir, count++];
+	[t writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+}
+
 id render(id self, SEL cmd, MTLRenderPipelineDescriptor *d, NSUInteger options, __autoreleasing id *reflection,
           NSError *__autoreleasing *error)
 {
@@ -96,6 +186,7 @@ id render(id self, SEL cmd, MTLRenderPipelineDescriptor *d, NSUInteger options, 
 		setIvar(*reflection, "_vertexPluginReturnData", RgfxGLPluginReturnData(d.vertexFunction));
 		setIvar(*reflection, "_fragmentPluginReturnData", RgfxGLPluginReturnData(d.fragmentFunction));
 	}
+	dumpPipeline(d, state != nil);
 	return state;
 }
 
@@ -114,15 +205,20 @@ LibraryImp gLibrary;
 // GL_INJECT_DUMP=DIR writes each library the class makes of bytes to DIR/library-N.metallib.
 id library(id self, SEL cmd, dispatch_data_t data, NSError *__autoreleasing *error)
 {
-	static int count;
+	static std::atomic<int> count{0};
 	const char *dir = getenv("GL_INJECT_DUMP");
+	int number = -1;
 	if (dir != nullptr && dir[0] && data != nil) {
-		NSString *path = [NSString stringWithFormat:@"%s/library-%d.metallib", dir, count++];
+		number = count++;
+		NSString *path = [NSString stringWithFormat:@"%s/library-%d.metallib", dir, number];
 		[(NSData *)data writeToFile:path atomically:NO];
 		if (logging())
 			fprintf(stderr, "gl_inject: wrote %s\n", path.UTF8String);
 	}
-	return gLibrary(self, cmd, data, error);
+	id library = gLibrary(self, cmd, data, error);
+	if (number >= 0)
+		numberLibrary(library, number);
+	return library;
 }
 
 // GL_INJECT_VENDOR's name, as vendorName answers it.
