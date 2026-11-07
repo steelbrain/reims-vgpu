@@ -2116,7 +2116,11 @@ mod tests {
             std::mem::forget(t);
         }
 
-        /// A crash during the exec completes it with 4
+        /// A crash during the exec completes it with 4. The crash signals the exec's GPU token,
+        /// which wakes the FIFO thread, before the token whose handler is the completion, so the
+        /// exec may return before its completion runs
+        /// (`the_exec_reply_drops_gpu_token_then_token_then_the_task`): here the completion takes
+        /// 50 ms, and the test waits for it
         #[test]
         fn a_crash_during_the_exec_completes_four() {
             let h = harness(dies_on(
@@ -2124,8 +2128,14 @@ mod tests {
             ));
             let t = h.task();
             let v = Arc::new(AtomicU64::new(0));
-            let (s, d) = done();
+            let s: Statuses = Arc::new(Mutex::new(Vec::new()));
+            let s2 = s.clone();
+            let d: Completion = Arc::new(move |st: ExecStatus, _| {
+                std::thread::sleep(Duration::from_millis(50));
+                s2.lock().push(st.raw());
+            });
             exec3(Hold::NONE, &t, None, 0, &v, d);
+            wait_until(|| !s.lock().is_empty());
             assert_eq!(*s.lock(), vec![4]);
             assert_eq!(v.load(Ordering::SeqCst), 0);
             // The kernel task is not asked (the device has none: asking raises).
