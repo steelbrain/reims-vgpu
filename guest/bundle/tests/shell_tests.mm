@@ -4315,7 +4315,7 @@ void test_libraries_over_equal_bytes_share_their_air_reads()
 // Metal cannot stitch, and for a descriptor that fails on a miss and that no archive holds.
 void test_stitched_libraries_in_archives()
 {
-	Fixture fx;
+	Fixture fx(0x10000); // two libraries of the stitchable bytes fit
 	const char *path = getenv("RGFX_STITCHABLE");
 	CHECK(path != nullptr);
 	if (path == nullptr)
@@ -5163,7 +5163,7 @@ void test_constants_without_cnst_resolve_from_air()
 // measured on macOS 27, M3 Max.)
 void test_library_members_as_metal()
 {
-	Fixture fx;
+	Fixture fx(0x10000); // two libraries of the stitchable bytes fit
 	const char *path = getenv("RGFX_STITCHABLE");
 	CHECK(path != nullptr);
 	if (path == nullptr)
