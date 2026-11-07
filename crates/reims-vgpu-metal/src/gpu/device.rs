@@ -2133,12 +2133,12 @@ vertex void vvoid(uint v [[vertex_id]]) {}
             let _: () = msg_send![&*options, setAdditionalCompilerArguments: &*arguments];
         }
         let library = Obj::from_retained(
-            d.get()
-                .newLibraryWithSource_options_error(
-                    &NSString::from_str(OPENCL_SOURCE),
-                    Some(&options),
-                )
-                .expect("the OpenCL kernel compiles"),
+            objc2_metal::MTLDevice::newLibraryWithSource_options_error(
+                d.get(),
+                &NSString::from_str(OPENCL_SOURCE),
+                Some(&options),
+            )
+            .expect("the OpenCL kernel compiles"),
         );
         let f = function(&library, "__entry_k");
         let state = d
