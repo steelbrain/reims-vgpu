@@ -146,6 +146,23 @@ pub fn lease_guest_memory(
     GuestMemoryLease
 }
 
+/// A graphics device's region in memory of the platform's own: none on macOS, where the region's
+/// private anonymous memory is what Metal and MoltenVK import in place. Uninhabited.
+#[derive(Debug)]
+pub enum RegionMemory {}
+
+impl RegionMemory {
+    /// None on macOS ([`RegionMemory`]).
+    pub fn new(_len: u64) -> Option<RegionMemory> {
+        None
+    }
+
+    /// Its first byte: never asked, as there is none.
+    pub fn base(&self) -> *mut u8 {
+        match *self {}
+    }
+}
+
 /// A fresh range of `len` bytes of zeros that a view can be made of: on Mach, any allocation.
 pub(crate) fn allocate_zeros(len: u64) -> Result<HostAddr, KernReturn> {
     allocate_aliasable(len)

@@ -1,13 +1,14 @@
 //! [`Region`]: the device's BAR 2, host memory the guest maps write-back, with the control rings
 //! at fixed offsets and the guest's allocations after them (`wire`).
 //!
-//! It is private anonymous memory of the host's process (`mmap` with `MAP_PRIVATE |
-//! MAP_ANONYMOUS`): RADV refuses to import a memfd's or any shared mapping (measured on the 780M
-//! and the RX 7900 XTX; `docs/graphics-kext/design.md`, Decided 5). The kernel hands it out
-//! zeroed and commits a page only when something first touches it, so a page neither the guest
-//! nor the host has used costs no host memory; a GPU import that pins the region commits what it
-//! pins. The host maps it into the guest once, at the device's start, and it stays mapped, at the
-//! same address, until the device's end.
+//! It is memory of the host's process: the platform's own where it gives the device some
+//! ([`Region::over`]; on Linux a shared mapping of a memfd of the library's, which every GPU
+//! imports, RADV through dma-bufs of its pages), else private anonymous memory (`mmap` with
+//! `MAP_PRIVATE | MAP_ANONYMOUS`, [`Region::new`]). Either is handed out zeroed and commits a page
+//! only when something first touches it, so a page neither the guest nor the host has used costs
+//! no host memory; a GPU import that pins the region commits what it pins. The host maps it into
+//! the guest once, at the device's start, and it stays mapped, at the same address, until the
+//! device's end.
 //!
 //! **Guest writes.** The guest writes the region while the host reads it. The host reads the
 //! rings' counters and flags with atomic loads and stores at their offsets, and copies out what a
@@ -37,6 +38,9 @@ pub struct Region {
     len: usize,
     /// The blocks the processes hold, by offset.
     blocks: Mutex<BTreeMap<u64, Held>>,
+    /// What holds the memory where the platform gave it ([`Region::over`]), which frees it as it
+    /// drops; `None` for the region's own mapping ([`Region::new`]), which its drop unmaps.
+    memory: Option<Box<dyn Send + Sync>>,
 }
 
 /// A block's size and who holds it.
@@ -90,6 +94,26 @@ impl Region {
             base: base.cast::<u8>(),
             len,
             blocks: Mutex::new(BTreeMap::new()),
+            memory: None,
+        })
+    }
+
+    /// The `len` bytes at `base`, which `memory` holds and frees as it drops, after the region's
+    /// last use. `None` where `base` is null or `len` is 0.
+    ///
+    /// # Safety
+    ///
+    /// `base` is page-aligned, and its `len` bytes are zeros, mapped readable and writable by this
+    /// process and reached by nothing else of it, from now until `memory` drops.
+    pub unsafe fn over(base: *mut u8, len: usize, memory: Box<dyn Send + Sync>) -> Option<Region> {
+        if base.is_null() || len == 0 {
+            return None;
+        }
+        Some(Region {
+            base,
+            len,
+            blocks: Mutex::new(BTreeMap::new()),
+            memory: Some(memory),
         })
     }
 
@@ -400,8 +424,14 @@ impl Region {
 
 impl Drop for Region {
     fn drop(&mut self) {
-        // SAFETY: the mapping `new` made, which nothing reaches after this.
-        unsafe { libc::munmap(self.base.cast(), self.len) };
+        match self.memory.take() {
+            // The platform's memory, which its holder frees.
+            Some(memory) => drop(memory),
+            // SAFETY: the mapping `new` made, which nothing reaches after this.
+            None => unsafe {
+                libc::munmap(self.base.cast(), self.len);
+            },
+        }
     }
 }
 
@@ -421,6 +451,59 @@ mod tests {
         assert!(region.read(64 * 1024 - 2, 3).is_none());
         assert!(region.read(u64::MAX, 1).is_none());
         assert!(Region::new(0).is_none());
+    }
+
+    /// A region over memory it is given reads and writes that memory, and frees it, through its
+    /// holder, only as it drops; none is made over a null base or 0 bytes
+    #[test]
+    fn a_region_over_given_memory_frees_it_as_it_drops() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        struct Holder {
+            at: usize,
+            len: usize,
+            freed: Arc<AtomicBool>,
+        }
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                // SAFETY: the test's own mapping, which nothing reaches after the region drops.
+                unsafe { libc::munmap(std::ptr::with_exposed_provenance_mut(self.at), self.len) };
+                self.freed.store(true, Ordering::Relaxed);
+            }
+        }
+        let len = 64 * 1024;
+        // SAFETY: a fresh anonymous mapping, at an address the kernel picks.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED);
+        let freed = Arc::new(AtomicBool::new(false));
+        let holder = Holder {
+            at: at.expose_provenance(),
+            len,
+            freed: Arc::clone(&freed),
+        };
+        // SAFETY: the mapping's zeros, which only the region reaches until the holder drops.
+        let region = unsafe { Region::over(at.cast(), len, Box::new(holder)) }.unwrap();
+        assert_eq!(region.size(), 64 * 1024);
+        assert!(region.read(0, 64 * 1024).unwrap().iter().all(|&b| b == 0));
+        assert!(region.write(100, &[1, 2, 3]));
+        assert_eq!(region.read(100, 3).unwrap(), [1, 2, 3]);
+        assert!(!freed.load(Ordering::Relaxed));
+        drop(region);
+        assert!(freed.load(Ordering::Relaxed));
+        // SAFETY: neither reaches any memory.
+        assert!(unsafe { Region::over(std::ptr::null_mut(), len, Box::new(())) }.is_none());
+        let mut byte = 0u8;
+        // SAFETY: as above.
+        assert!(unsafe { Region::over(&raw mut byte, 0, Box::new(())) }.is_none());
     }
 
     /// A surface plane's writers read slot by slot, a free slot (queue 0) as free, and nothing

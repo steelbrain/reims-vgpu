@@ -69,6 +69,14 @@ pub trait ApiPlatform: Platform {
         Box::new(())
     }
 
+    /// A graphics device's region of `len` bytes (BAR 2, `reims_graphics::Region`) in memory of
+    /// the platform's own, where its GPUs import that better than private anonymous memory;
+    /// `None` by default, and where the host gives none, for the region's own mapping.
+    fn graphics_region(&self, len: usize) -> Option<reims_graphics::Region> {
+        let _ = len;
+        None
+    }
+
     /// The host's hardware video for a graphics device on `device`, the guest's video driver's
     /// (`crate::GraphicsVideo`); `None` where the platform has none, and by default.
     fn graphics_video(&self, device: &Self::Device) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {

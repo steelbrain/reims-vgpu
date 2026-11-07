@@ -28,7 +28,7 @@ pub use device_lend::{DeviceLend, LendRefusal, LentDmaBuf, lend_to_devices};
 pub use files::{GuestMemoryLease, lease_guest_memory};
 pub use surface::{LinuxSurface, LinuxSurfaces, attachment};
 pub use threads::LinuxThreads;
-pub use vm::LinuxVm;
+pub use vm::{LinuxVm, RegionMemory};
 
 pub(crate) use host_ram::{
     copies as copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over,

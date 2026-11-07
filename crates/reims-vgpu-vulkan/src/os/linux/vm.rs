@@ -575,6 +575,33 @@ impl Drop for OwnMemory {
     }
 }
 
+/// A graphics device's region (BAR 2) in memory of the library's own ([`OwnMemory`]): a shared
+/// mapping of a memfd, so a device that refuses the region's pointer imports dma-bufs of its pages
+/// instead (`super::import`'s dma-buf source), as RADV refuses every page with a file behind it.
+///
+/// RADV imports host memory by pointer as an amdgpu userptr, and amdgpu walks every page of every
+/// userptr import a device holds in each of its submissions, where a dma-buf import costs a
+/// submission the same at any size (**measured** 2026-11-07, Radeon 780M, RADV of Mesa 26.2.6,
+/// Linux 7.3.1, raw Vulkan, the median of 300 empty submissions: 6.9 us with none held; 256 MiB of
+/// pointer imports in 4 pieces 90.7 us, in 128 pieces 171 us; 256 MiB of dma-buf imports in 4
+/// pieces 12.2 us, in 128 pieces 66.8 us). The region's blocks are the guest's Shared buffers,
+/// upload chunks and heaps, each imported as its buffer or heap is made.
+#[derive(Debug)]
+pub struct RegionMemory(OwnMemory);
+
+impl RegionMemory {
+    /// `len` bytes of zeros, rounded up to whole pages; `None` where the host gives no file, no
+    /// address space or no mapping within the views' budget.
+    pub fn new(len: u64) -> Option<RegionMemory> {
+        OwnMemory::new(len).map(RegionMemory)
+    }
+
+    /// Its first byte.
+    pub fn base(&self) -> *mut u8 {
+        ptr(self.0.first()).cast()
+    }
+}
+
 /// A new file of `length` bytes of zeros in memory (`memfd_create`), sealed against growing and
 /// shrinking, as `/dev/udmabuf` takes only a memfd sealed against shrinking
 /// ([`super::dma_buf`]). Where the kernel gives none, the kernel's error, the host's memory
@@ -1510,6 +1537,24 @@ pub(crate) mod tests {
         assert_eq!(crate::answer::out_of_host_memory_count(), before + 2);
         let at = allocate_aliasable(p).unwrap();
         assert!(vm().deallocate(at, p).is_success());
+    }
+
+    /// A graphics region's memory is zeros of one file of its own, mapped read and write, so a
+    /// device that refuses its pointer imports a dma-buf of its pages (`super::import`); none is
+    /// made of 0 bytes
+    #[test]
+    fn a_region_s_memory_is_one_file_s_pages() {
+        let len = 4 * page();
+        let memory = RegionMemory::new(len).unwrap();
+        let at = HostAddr::from_addr(memory.base().addr());
+        assert_eq!(at.addr().to_u64() % page(), 0);
+        assert_eq!((read(at, 0), read(at, len - 1)), (0, 0));
+        write(at, 5, 0x5a);
+        assert_eq!(read(at, 5), 0x5a);
+        let first = at.addr().to_u64();
+        assert_eq!(files::pieces(first, len).map(|p| p.len()), Some(1));
+        assert_eq!(files::writable(first, len), Some(true));
+        assert!(RegionMemory::new(0).is_none());
     }
 
     /// The host page is 4 KiB on x86-64 Linux, its shift 12

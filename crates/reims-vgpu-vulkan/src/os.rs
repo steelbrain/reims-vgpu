@@ -55,8 +55,9 @@ pub(crate) use host_os::{
     host_memory, host_memory_vouched, import_view, plane_shape, shown_at, surface_memory_hold,
 };
 pub use host_os::{
-    GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, default_driver_sizes,
-    default_gpu_core_count, default_registry_id, install_process_services, lease_guest_memory,
+    GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, RegionMemory,
+    default_driver_sizes, default_gpu_core_count, default_registry_id, install_process_services,
+    lease_guest_memory,
 };
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
