@@ -12,11 +12,12 @@ workspace = true
 
 [dependencies]
 log = "0.4"
-reims-vgpu-video-core = { path = "../reims-vgpu-video-core" }
 
-# The codecs above the hardware, which only the macOS backend reads.
+# The backend itself, which only macOS builds: the device's traits it implements, and the codecs
+# above the hardware.
 [target.'cfg(target_os = "macos")'.dependencies]
 reims-vgpu-video-codec = { path = "../reims-vgpu-video-codec" }
+reims-vgpu-video-core = { path = "../reims-vgpu-video-core" }
 
 [dev-dependencies]
 # The suite every backend runs, and its stream readers.
