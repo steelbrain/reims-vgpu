@@ -33,6 +33,32 @@ use crate::rt::Hold;
 /// `newBufferWithBytesNoCopy:…deallocator:` block). `None` is a nil block.
 pub type NoCopyDeallocator = Box<dyn FnOnce() + Send>;
 
+thread_local! {
+    /// Whether the platform relayed a gap at a creator this thread called inside the innermost
+    /// [`relaying_gaps`] ([`note_relayed_gap`]).
+    static RELAYED_GAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Notes that the creator running on this thread answers nil, or an `NSError` where it has an
+/// `error:` out-parameter, for a gap of the platform's own or of its device's, where Metal makes
+/// the object: a platform over a translation runtime relays such a refusal and goes on (the
+/// Vulkan platform's `answer::relay_gap`). The platform calls it inside the creator, on the
+/// creator's thread; Metal's never does. Core reads it around the creators whose nil Metal ends
+/// the process at, so it can fault the work instead ([`relaying_gaps`]).
+pub fn note_relayed_gap() {
+    RELAYED_GAP.with(|r| r.set(true));
+}
+
+/// Runs `create`, a call to a platform creator on this thread, and says whether the platform
+/// relayed a gap inside it ([`note_relayed_gap`]). A gap relayed inside it is also one of the
+/// enclosing call's, where calls nest.
+pub fn relaying_gaps<R>(create: impl FnOnce() -> R) -> (R, bool) {
+    let outer = RELAYED_GAP.with(|r| r.replace(false));
+    let made = create();
+    let relayed = RELAYED_GAP.with(|r| r.replace(outer | r.get()));
+    (made, relayed)
+}
+
 /// The deserialization context's `functionWithFunctionRef:` (`MTLDeserializationContext`,
 /// PGResourceManagerDeserializationContext): runs synchronously on the calling thread, during the
 /// SPI call, once per function reference the blob names, under the hold the platform

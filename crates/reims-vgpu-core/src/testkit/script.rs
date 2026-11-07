@@ -63,6 +63,10 @@ pub enum Step {
     /// Metal returned nil with this `NSError` (`newLibraryWithData:error:` and friends); a
     /// method without an error out-parameter treats it as `Nil`.
     Error(NsErrorText),
+    /// A creator the platform refuses for a gap of its own, where Metal makes the object: noted
+    /// as a relayed gap ([`crate::platform::device::note_relayed_gap`]), then as `Error`, nil
+    /// with this `NSError` where the creator has an error out-parameter, else `Nil`.
+    Gap(NsErrorText),
     /// Metal raised `name` with `reason` at the send (6.3).
     Raise {
         /// The exception's name (`NSInvalidArgumentException`, …).
@@ -138,6 +142,7 @@ impl std::fmt::Debug for Step {
             Step::Nil => f.write_str("Nil"),
             Step::Value(_) => f.write_str("Value(..)"),
             Step::Error(e) => f.debug_tuple("Error").field(e).finish(),
+            Step::Gap(e) => f.debug_tuple("Gap").field(e).finish(),
             Step::Raise { name, reason } => f
                 .debug_struct("Raise")
                 .field("name", name)
@@ -196,7 +201,7 @@ impl Step {
 
     /// Whether the call should return nil.
     pub fn is_nil(&self) -> bool {
-        matches!(self, Step::Nil | Step::Error(_))
+        matches!(self, Step::Nil | Step::Error(_) | Step::Gap(_))
     }
 
     /// The death this step scripts: a crash inside Metal is the platform's, at the marker
@@ -274,6 +279,9 @@ impl Step {
         make: impl FnOnce() -> Option<T>,
     ) -> RaiseResult<Option<T>> {
         self.throws(policy, sel)?;
+        if let Step::Gap(_) = self {
+            crate::platform::device::note_relayed_gap();
+        }
         if self.is_nil() {
             return Ok(None);
         }
@@ -291,6 +299,10 @@ impl Step {
         self.throws(policy, sel)?;
         match self {
             Step::Error(e) => Ok(Err(e.clone())),
+            Step::Gap(e) => {
+                crate::platform::device::note_relayed_gap();
+                Ok(Err(e.clone()))
+            }
             Step::Nil => Ok(Ok(None)),
             _ => Ok(Ok(make())),
         }

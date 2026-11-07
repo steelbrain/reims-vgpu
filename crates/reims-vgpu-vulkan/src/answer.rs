@@ -2505,12 +2505,16 @@ pub fn relays_gap(e: &Error) -> bool {
 /// [`Inexact::RefusedCreate`], counted ([`inexact_counts`]) and the process's first of the kind
 /// writing a line on stderr naming the refusal and `descriptor` ([`refusal_describing`]). The
 /// creator then answers nil, a pipeline or library creator with [`error_text`] as its
-/// `NSError`. `false` in strict mode and for every other refusal, which the creator decides as
-/// before: a death at `sel`.
+/// `NSError`, and the relay is noted for core on the creator's thread
+/// ([`reims_vgpu_core::platform::device::note_relayed_gap`]), which faults the work that names a
+/// function so refused where Metal would end the process at the nil one create later. `false` in
+/// strict mode and for every other refusal, which the creator decides as before: a death at
+/// `sel`.
 pub fn relay_gap(sel: &'static str, e: &Error, descriptor: Option<&str>) -> bool {
     if !relays_gap(e) {
         return false;
     }
+    reims_vgpu_core::platform::device::note_relayed_gap();
     if counted_first(Inexact::RefusedCreate) {
         let line = format!(
             "reims-vgpu: {sel}: {}; answered nil, relayed ({}), the first of its kind: \
@@ -2602,6 +2606,7 @@ pub(crate) fn dies_of<T>(
 mod tests {
     use super::*;
     use metal2vulkan_runtime::{Invalid, Problem, RuntimeGap};
+    use reims_vgpu_core::platform::device::relaying_gaps;
     use reims_vgpu_core::raise::{Origin, RaiseId};
     use reims_vgpu_core::testkit::capture::catch_death;
 
@@ -3598,8 +3603,11 @@ mod tests {
         for (sel, e) in gaps {
             let before = refused_creates();
             let refused = || Err::<(), _>(e.clone());
-            let made = relaxed(|| create(sel, Policy::Dies, Nil::Never, refused));
+            let (made, noted) =
+                relaying_gaps(|| relaxed(|| create(sel, Policy::Dies, Nil::Never, refused)));
             assert_eq!(made, Ok(None), "{sel}");
+            // Noted for core, which faults the work naming a function so refused
+            assert!(noted, "{sel}");
             assert_eq!(refused_creates(), before + 1, "{sel}");
             *LAST_LINE.lock() = None;
             let site = catch_death(|| create(sel, Policy::Dies, Nil::Never, refused)).unwrap_err();
@@ -3621,6 +3629,21 @@ mod tests {
         .unwrap_err();
         assert_eq!(site.file, "newTextureWithDescriptor:");
         assert_eq!(refused_creates(), before);
+        // Metal's nil is no gap
+        let (made, noted) = relaying_gaps(|| {
+            create(
+                "newTextureWithDescriptor:",
+                Policy::Dies,
+                Nil::Never,
+                || {
+                    Err::<(), _>(Error::Nil(metal2vulkan_runtime::Nil::new(
+                        "new_texture",
+                        Problem::StorageMode,
+                    )))
+                },
+            )
+        });
+        assert_eq!((made, noted), (Ok(None), false));
     }
 
     /// An unbuilt method, and a value the runtime cannot hold, die naming the selector

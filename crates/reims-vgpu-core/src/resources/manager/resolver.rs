@@ -16,6 +16,11 @@
 //! - A function whose IR sits over a hole in the task's page table, IR the guest has not
 //!   mapped, which its creator raises (`create/function.rs`, `mutgap_svc_function_over_hole`;
 //!   docs/qemu.md, "x86-64 macOS guests: WebGPU render bundles").
+//! - A function whose library, or the function itself, the platform refuses for a gap of its own
+//!   or of its device's, where Metal makes it, which its creator raises too (`create/function.rs`,
+//!   [`crate::platform::device::relaying_gaps`]). So the state that names it is never made, and
+//!   the exec or info that names the state faults, as where the platform refuses the state for a
+//!   gap.
 
 use crate::num::Truncate;
 use crate::platform::Platform;
@@ -55,6 +60,8 @@ pub fn function_with_function_ref<P: Platform>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::super::fixture::*;
     use super::*;
     use crate::platform::Handle;
@@ -161,6 +168,115 @@ mod tests {
         let (r, lines) = fx.logged(|| function_with_function_ref(Hold::NONE, &fx.m, 1));
         assert!(r.unwrap().is_none());
         assert_eq!(lines.len(), 1);
+    }
+
+    /// A state whose function's library the platform refuses for a gap: the function's
+    /// creation raises the function lookup's failure through the state's deserialization, so the
+    /// state is never made, the platform's state creator never runs (Metal's would abort at the
+    /// nil function), and the decoder's lookup of the state raises, which faults the exec that
+    /// names it. Metal's own refusal of the library is nil to Metal, which makes the state as
+    /// before. Each form: compute (11), render (14) and tile (51)
+    #[test]
+    fn a_state_naming_a_function_refused_for_a_gap_is_never_made() {
+        use super::super::create::function::ObjectFunction;
+        use super::super::create::pipeline::NewPipelineState;
+        use super::super::lookup::ManagerLookup;
+        use crate::platform::types::NsErrorText;
+        use crate::raise::RaiseId;
+        use crate::resources::manager::records::OperationHeader;
+        use crate::testkit::impls::ResolveIds;
+        use zerocopy::IntoBytes;
+        let refusal = NsErrorText {
+            domain: "runtime".to_owned(),
+            code: 0,
+            description: "not implemented: inline assembly".to_owned(),
+        };
+        for (command, deserialize, create) in [
+            (
+                11,
+                "newComputePipelineDescriptorWithSerializedData:deserializationContext:",
+                "newComputePipelineStateWithDescriptor:options:reflection:error:",
+            ),
+            (
+                14,
+                "newRenderPipelineDescriptorWithSerializedData:deserializationContext:",
+                "newRenderPipelineStateWithDescriptor:options:reflection:error:",
+            ),
+            (
+                51,
+                "newTileRenderPipelineDescriptorWithSerializedData:deserializationContext:",
+                "newRenderPipelineStateWithTileDescriptor:options:reflection:error:",
+            ),
+        ] {
+            for gap in [true, false] {
+                // Entry 1, a function whose IR is 3 bytes at task offset 0x2000; entry 2, a
+                // state whose 2-byte descriptor names it
+                let fx = Fx::new(
+                    &[(0, 0, 0), (6, 20, REC), (7, 18, REC + 0x100)],
+                    Placement::Off,
+                );
+                let header = |command_type| OperationHeader {
+                    command_type,
+                    field4: 0,
+                };
+                let function = ObjectFunction {
+                    offset: 0x2000,
+                    length: 3,
+                };
+                fx.write(REC, function.as_bytes());
+                fx.write(REC + 12, header(15).as_bytes());
+                fx.write(REC + 0x100, header(command).as_bytes());
+                let pipeline = NewPipelineState {
+                    field_00: 0,
+                    descriptor_length: 2,
+                };
+                fx.write(REC + 0x108, pipeline.as_bytes());
+                fx.write(REC + 0x110, &[1, 2]);
+                fx.next_cursor(0x100, 18);
+                fx.next_cursor(0, 20);
+                let script = fx.platform.script();
+                script.push(deserialize, Step::value(ResolveIds(vec![1])));
+                script.push(
+                    "data_from_virtual_offset",
+                    Step::value(Some(vec![9u8, 8, 7])),
+                );
+                let refused = match gap {
+                    true => Step::Gap(refusal.clone()),
+                    false => Step::Error(refusal.clone()),
+                };
+                script.push("newLibraryWithData:error:", refused);
+                let lookup = ManagerLookup::new(Arc::downgrade(&fx.m));
+                let (r, lines) = fx.logged(|| match command {
+                    11 => lookup.get_compute_pipeline_state(Hold::NONE, 2).map(|_| ()),
+                    _ => lookup.get_render_pipeline_state(Hold::NONE, 2).map(|_| ()),
+                });
+                let sels = fx.log().sels();
+                assert!(sels.contains(&deserialize), "{command}: {sels:?}");
+                if gap {
+                    let raised = r.err().unwrap();
+                    assert_eq!(
+                        raised.id(),
+                        RaiseId::Manager(RaiseKind::Lookup(ObjectKind::Function)),
+                        "{command}"
+                    );
+                    assert!(!sels.contains(&create), "{command}: {sels:?}");
+                    assert!(
+                        lines.contains(
+                            &"function 1 not made: the platform refused its library for a gap: \
+                              not implemented: inline assembly"
+                                .to_owned()
+                        ),
+                        "{command}: {lines:?}"
+                    );
+                } else {
+                    // Nil to Metal, which the fake makes the state of
+                    assert!(r.is_ok(), "{command}");
+                    assert!(sels.contains(&create), "{command}: {sels:?}");
+                    let resolved = fx.log().calls_to("deserializationContext");
+                    assert_eq!(resolved[0].args, vec![Arg::Obj(None)], "{command}");
+                }
+            }
+        }
     }
 
     #[test]

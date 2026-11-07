@@ -2745,7 +2745,7 @@ strings follow the entries, and a value gives their offset from the blob's
 start; an array is a u32 count then u32 offsets. A function is written as its
 `functionRef` (u32), which Metal resolves through the context's
 `functionWithFunctionRef:`; the device's context resolves it as an
-object-list reference. A failed lookup resolves to nil, except two, which raise
+object-list reference. A failed lookup resolves to nil, except three, which raise
 the function lookup's failure: the exec faults ("function lookup failed")
 rather than reaching Metal's abort on a nil function (`resources/manager/resolver.rs`).
 - One whose entry is empty (type 0). A guest empties a task's entries when the
@@ -2758,6 +2758,16 @@ rather than reaching Metal's abort on a nil function (`resources/manager/resolve
   guest has mapped it makes the function (docs/qemu.md, "x86-64 macOS guests:
   WebGPU render bundles"; `mutgap_svc_function_over_hole`). IR the task cannot
   otherwise copy (past the task's end, or ending at it) is still nil to Metal.
+- One whose library, or the function itself, the platform refuses for a gap
+  of its own or of its device's, where Metal makes it: the Vulkan platform
+  answers such a library its runtime's refusal as the `NSError`, and such a
+  function nil (`inexact-refused-create`), and notes the relay for core
+  (`platform::device::relaying_gaps`). The state that names the function is
+  never made, so the exec or info that names the state faults, as where the
+  platform refuses the state itself for a gap. Metal never refuses there, so
+  the suite cannot reach it; core's unit tests lock it
+  (`a_state_naming_a_function_refused_for_a_gap_is_never_made`). Metal's own
+  refusal of a function's IR is still nil to Metal.
 
 | blob | bytes (`<K>` = a function ref, u32 LE) |
 |---|---|
