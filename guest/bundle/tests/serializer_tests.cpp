@@ -2068,6 +2068,7 @@ void test_video_command_buffer()
 	d.bitstream_size = 4321;
 	d.luma_texture_obj_id = 6;
 	d.chroma_texture_obj_id = 7;
+	d.output_rows = 1088;
 	const uint8_t sets[11] = {0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68};
 	enc.videoDecodeH264(d, sets, sizeof(sets));
 	enc.videoDecodeH264(d, nullptr, 0);
@@ -2108,7 +2109,8 @@ void test_video_command_buffer()
 	std::memcpy(&got, op + RGFX_OP_BODY_OFFSET, sizeof(got));
 	CHECK(got.bitstream_buffer_obj_id == 5 && got.bitstream_offset == 0x100 &&
 	      got.bitstream_size == 4321 && got.luma_texture_obj_id == 6 &&
-	      got.chroma_texture_obj_id == 7 && got.parameter_sets_size == sizeof(sets));
+	      got.chroma_texture_obj_id == 7 && got.parameter_sets_size == sizeof(sets) &&
+	      got.output_rows == 1088);
 	const uint8_t *tail = op + RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET;
 	CHECK(std::memcmp(tail, sets, sizeof(sets)) == 0);
 	for (size_t i = sizeof(sets); i < 16; i++)
@@ -2130,7 +2132,8 @@ void test_video_command_buffer()
 	std::memcpy(&hevc, op + RGFX_OP_BODY_OFFSET, sizeof(hevc));
 	CHECK(hevc.bitstream_buffer_obj_id == 8 && hevc.bitstream_offset == 0 &&
 	      hevc.bitstream_size == 512 && hevc.luma_texture_obj_id == 9 &&
-	      hevc.chroma_texture_obj_id == 10 && hevc.parameter_sets_size == sizeof(hevcSets));
+	      hevc.chroma_texture_obj_id == 10 && hevc.parameter_sets_size == sizeof(hevcSets) &&
+	      hevc.output_rows == 0);
 	tail = op + RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H265_PARAMETER_SETS_OFFSET;
 	CHECK(std::memcmp(tail, hevcSets, sizeof(hevcSets)) == 0);
 	for (size_t i = sizeof(hevcSets); i < 24; i++)
