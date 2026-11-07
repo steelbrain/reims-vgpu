@@ -524,3 +524,68 @@ fn many_passes_over_a_surface_s_aligned_pages_hold_no_attachment_a_pass() {
 fn many_passes_over_a_private_buffer_hold_no_attachment_a_pass() {
     many_passes(Backed::Private, 512);
 }
+
+/// A few of the frame's passes over an IOSurface plane over guest pages at a width that is not a
+/// multiple of 4, its rows padded to 64 bytes as a guest's IOSurface rows are: the draws land in
+/// the rows, `row` bytes apart, and the padding past each row's texels keeps the bytes it held
+#[test]
+fn a_few_passes_over_padded_rows_at_an_odd_width_land_in_the_rows() {
+    let (p, d) = (platform(), dev());
+    let mut wrong = Vec::new();
+    for width in [1831u64, 1001] {
+        let row = (4 * width).next_multiple_of(64);
+        let len = row * H;
+        let mut upload_pages = Pages::new(slot(2 * PASSES));
+        let frame = Frame::new(&p, &d, width, &mut upload_pages);
+        let desc = p.texture_descriptor(&TextureDesc {
+            pixel_format: BGRA8,
+            width,
+            height: H,
+            usage: TARGET | READ,
+            ..TextureDesc::default()
+        });
+        let mut pages = Pages::new(len);
+        pages.write(0, &vec![0xa5; len.to_usize()]);
+        let buffer = pages.buffer(&d);
+        let facts = SurfaceFacts {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            plane_count: 0,
+            width,
+            height: H,
+            chroma_offset: 0,
+            chroma_bytes_per_row: 0,
+            ycbcr_matrix: None,
+        };
+        let plane = SurfacePlane {
+            plane: 0,
+            offset: 0,
+            bytes_per_row: row,
+            planar: false,
+            facts: Some(facts),
+        };
+        let target = buffer.new_texture_over_surface_plane(OnFault::Die, &desc, plane);
+        let target = target.unwrap().unwrap();
+        run(&p, &d, &frame, &target, WARM);
+        let got = pages.read(len);
+        let want = expected(width, row, WARM);
+        let texels = (4 * width).to_usize();
+        let differ: Vec<(usize, usize)> = (0..H.to_usize())
+            .flat_map(|y| (0..texels).map(move |b| (b, y)))
+            .filter(|&(b, y)| got[y * row.to_usize() + b] != want[y * row.to_usize() + b])
+            .collect();
+        let padding = (0..H.to_usize())
+            .flat_map(|y| (texels..row.to_usize()).map(move |b| y * row.to_usize() + b))
+            .filter(|&i| got[i] != 0xa5)
+            .count();
+        if !differ.is_empty() || padding != 0 {
+            wrong.push(format!(
+                "{width} wide, rows of {row}: {} texel bytes differ (the first at byte {:?}), \
+                 {padding} padding bytes written",
+                differ.len(),
+                differ.first()
+            ));
+        }
+        drop((target, buffer, frame));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

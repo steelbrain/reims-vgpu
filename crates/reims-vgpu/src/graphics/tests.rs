@@ -9139,7 +9139,7 @@ fn a_reset_waits_for_a_close_s_slow_release() {
 }
 
 /// A colour matrix of `rows` for display 0's transaction 1, in one `DISPLAY_COLOR` part.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "vulkan"))]
 fn color_matrix(rows: [[f32; 4]; 3]) -> Vec<u8> {
     let mut bytes = RgfxDisplayColor {
         header: RgfxMsgHeader {
@@ -9406,6 +9406,269 @@ fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
     for (x, y) in [(64, 0), (0, 32), (1919, 1079), (100, 100)] {
         assert_eq!(at(x, y), [0, 0, 0, 0xff], "({x}, {y}) is not black");
     }
+}
+
+/// The pixel the odd-width reads put at `(x, y)`, B, G, R and A: no two alike within 7 rows
+#[cfg(feature = "vulkan")]
+fn odd_width_pixel(x: usize, y: usize) -> [u8; 4] {
+    let v = x * 7 + y * 131;
+    [v as u8, (v >> 8) as u8, (x ^ y) as u8, 0xff]
+}
+
+/// How a read of `width` × `height` pixels, rows of `width * 4` bytes, differs from `want`: the
+/// count and the first, or `None` where every pixel is `want`'s
+#[cfg(feature = "vulkan")]
+fn read_differs(
+    dst: &[u8],
+    (width, height): (usize, usize),
+    want: impl Fn(usize, usize) -> [u8; 4],
+) -> Option<String> {
+    let got = |x: usize, y: usize| <[u8; 4]>::try_from(&dst[(y * width + x) * 4..][..4]).unwrap();
+    let differ: Vec<(usize, usize)> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .filter(|&(x, y)| got(x, y) != want(x, y))
+        .collect();
+    let &(x, y) = differ.first()?;
+    Some(format!(
+        "{} pixels differ, the first at ({x}, {y}): {:?} for {:?}",
+        differ.len(),
+        got(x, y),
+        want(x, y)
+    ))
+}
+
+/// On the Vulkan platform, a read at a mode of the scanout's size, as a window that size reads,
+/// gives the guest's pixels row for row at widths that are not a multiple of 4, with rows of the
+/// width's bytes or padded to 64 or 256 bytes: through no colour (the blit), a matrix that swaps
+/// red and blue (the colour's fragment), and a post-gamma ramp that inverts every channel (the
+/// table's fragment)
+#[cfg(feature = "vulkan")]
+#[test]
+fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
+    let platform = crate::singleton::vulkan_platform();
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks::default(),
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(platform, config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let keep = || {
+        let mut present = RgfxPresentSurface::read_from_bytes(&present_surface(0)).unwrap();
+        present.flags = RGFX_PRESENT_KEEP;
+        present.as_bytes().to_vec()
+    };
+    let identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+    let swap = [
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ];
+    // Each colour's name, its messages, and what it makes of a pixel.
+    type Colour = (&'static str, Vec<Vec<u8>>, fn([u8; 4]) -> [u8; 4]);
+    let colours: [Colour; 3] = [
+        ("no colour", vec![], |p| p),
+        (
+            "red and blue swapped",
+            vec![color_matrix(swap)],
+            |[b, g, r, _]| [r, g, b, 0xff],
+        ),
+        (
+            "inverted by a ramp",
+            vec![
+                color_matrix(identity),
+                display_color_entries(RGFX_COLOR_POST_GAMMA, &[[1.0; 3], [0.0; 3]]),
+            ],
+            |[b, g, r, _]| [255 - b, 255 - g, 255 - r, 0xff],
+        ),
+    ];
+    let height = 7usize;
+    let mut wrong = Vec::new();
+    for (width, stride) in [
+        (3662usize, 3662usize * 4),
+        (3662, 14656),
+        (3662, 14848),
+        (1831, 7360),
+        (1001, 1001 * 4),
+    ] {
+        // SAFETY: the scanout lies in the device's region, mapped while the device lives.
+        unsafe {
+            let base = device.region_base().add(RGFX_ALLOCATIONS_OFFSET as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let p = odd_width_pixel(x, y);
+                    std::ptr::copy_nonoverlapping(p.as_ptr(), base.add(y * stride + x * 4), 4);
+                }
+            }
+        }
+        let scanout = set_scanout(width as u32, height as u32, stride as u32);
+        assert_eq!(answered(&device, &mut guest, scanout), RGFX_STATUS_OK);
+        let mode = Mode {
+            width: width as u32,
+            height: height as u32,
+            refresh_mhz: 60_000,
+        };
+        let read = device
+            .read
+            .at_screen(Arc::new(reims_graphics::FixedScreen(mode)));
+        for (name, messages, want) in &colours {
+            if !messages.is_empty() {
+                for m in messages {
+                    guest.send(&device, m.clone());
+                }
+                assert_eq!(answered(&device, &mut guest, keep()), RGFX_STATUS_OK);
+            }
+            let mut dst = vec![7u8; width * height * 4];
+            assert_eq!(read.read(&mut dst), ((width as u32, height as u32), Ok(())));
+            let expected = |x: usize, y: usize| want(odd_width_pixel(x, y));
+            if let Some(differ) = read_differs(&dst, (width, height), expected) {
+                wrong.push(format!(
+                    "{width} wide, rows of {stride} bytes, {name}: {differ}"
+                ));
+            }
+        }
+        // No colour again for the next scanout.
+        guest.send(&device, color_matrix(identity));
+        guest.send(&device, display_color_entries(RGFX_COLOR_POST_GAMMA, &[]));
+        assert_eq!(answered(&device, &mut guest, keep()), RGFX_STATUS_OK);
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// On the Vulkan platform, a presented IOSurface at a width that is not a multiple of 4, its rows
+/// padded to 64 bytes as a guest's IOSurface rows are, reads row for row at a mode of its size,
+/// rendered to (shadowed) and read only (in place): copied as the guest wrote it with no colour,
+/// and drawn through a matrix that swaps red and blue
+#[cfg(feature = "vulkan")]
+#[test]
+fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
+    const RING_DATA: u32 = 0x1_0000;
+    let platform = crate::singleton::vulkan_platform();
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks::default(),
+        window: None,
+        memory_map: None,
+    };
+    let device = GraphicsDevice::with_platform(platform, config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let span = u64::from(RGFX_RING_HEADER_SIZE + RING_DATA);
+    guest.send(&device, block_grant(1, SUBMIT, span));
+    guest.send(&device, block_grant(1, COMPLETE, span));
+    let create = queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0);
+    assert_eq!(answered(&device, &mut guest, create), RGFX_STATUS_OK);
+    guest.send(&device, resource_id_chunk(1, 0));
+    let identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+    let swap = [
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ];
+    let height = 16usize;
+    let sizes = [(3662usize, 14656usize), (1831, 7360), (1001, 4032)];
+    // MTLTextureUsageShaderRead | RenderTarget, then ShaderRead alone.
+    let cases = [5u32, 1]
+        .into_iter()
+        .flat_map(|usage| sizes.map(|s| (s, usage)));
+    let mut wrong = Vec::new();
+    let mut at = BLOCK;
+    for (i, ((width, stride), usage)) in cases.enumerate() {
+        let n = i as u64;
+        let length = ((stride * height) as u64).next_multiple_of(0x1_0000);
+        guest.send(&device, block_grant(1, at, length));
+        guest.send(
+            &device,
+            buffer_over_host_memory(obj(1, 10 + 2 * n), at, length),
+        );
+        // SAFETY: the surface lies in the block just granted, in the device's region.
+        unsafe {
+            let base = device.region_base().add(at as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let p = odd_width_pixel(x, y);
+                    std::ptr::copy_nonoverlapping(p.as_ptr(), base.add(y * stride + x * 4), 4);
+                }
+            }
+        }
+        let (create, _) = RgfxTextureCreate::read_from_prefix(&texture_create(0, 0)).unwrap();
+        let id = 0x100 + i as u32;
+        let mut texture = RgfxTextureFromIOSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id: obj(1, 11 + 2 * n),
+            resource_id: 1 + n,
+            buffer_obj_id: obj(1, 10 + 2 * n),
+            offset: 0,
+            bytes_per_row: stride as u64,
+            iosurface_id: id,
+            plane: 0,
+            desc: RgfxTextureDescriptor {
+                width: width as u32,
+                height: height as u32,
+                usage,
+                ..create.desc
+            },
+            writers_offset: RGFX_SURFACE_NO_WRITERS,
+        }
+        .as_bytes()
+        .to_vec();
+        texture.resize(RGFX_SURFACE_FACTS_OFFSET as usize, 0);
+        texture.extend_from_slice(
+            RgfxSurfaceFacts {
+                surface_pixel_format: u32::from_be_bytes(*b"BGRA"),
+                plane_count: 0,
+                width: width as u32,
+                height: height as u32,
+                chroma_offset: 0,
+                chroma_bytes_per_row: 0,
+                ycbcr_matrix: RGFX_YCBCR_MATRIX_NONE,
+                reserved_24: 0,
+            }
+            .as_bytes(),
+        );
+        guest.send(&device, texture);
+        let mode = Mode {
+            width: width as u32,
+            height: height as u32,
+            refresh_mhz: 60_000,
+        };
+        let read = device
+            .read
+            .at_screen(Arc::new(reims_graphics::FixedScreen(mode)));
+        for (name, rows, swapped) in [
+            ("no colour", identity, false),
+            ("red and blue swapped", swap, true),
+        ] {
+            guest.send(&device, color_matrix(rows));
+            let present = present_surface(id);
+            assert_eq!(answered(&device, &mut guest, present), RGFX_STATUS_OK);
+            let mut dst = vec![7u8; width * height * 4];
+            assert_eq!(read.read(&mut dst), ((width as u32, height as u32), Ok(())));
+            let want = |x: usize, y: usize| match odd_width_pixel(x, y) {
+                [b, g, r, _] if swapped => [r, g, b, 0xff],
+                p => p,
+            };
+            if let Some(differ) = read_differs(&dst, (width, height), want) {
+                wrong.push(format!(
+                    "{width} wide, rows of {stride} bytes, usage {usage}, {name}: {differ}"
+                ));
+            }
+        }
+        at += length;
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Queue 1 of process 1 on a headless device, as [`one_queue`] makes it, with both its rings of

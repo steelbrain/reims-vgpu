@@ -88,6 +88,19 @@ impl<P: ApiPlatform> DisplayRead<P> {
         }
     }
 
+    /// Reads of the display `self` reads, at `screen`'s mode: the tests' read at the size of a
+    /// window, which a device without one does not have.
+    #[cfg(test)]
+    pub(crate) fn at_screen(&self, screen: Arc<dyn Screen>) -> DisplayRead<P> {
+        DisplayRead::new(
+            &self.platform,
+            &self.region,
+            &self.shown,
+            &self.presented,
+            screen,
+        )
+    }
+
     /// What the display shows now, into the first `width * height * 4` bytes of `dst`, rows of
     /// `width * 4` bytes, BGRA8 (the module doc), with the display's mode, `(width, height)`,
     /// which is returned whatever the result. [`Error::InvalidArgument`], with nothing written,
