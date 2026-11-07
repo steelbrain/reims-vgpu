@@ -6,9 +6,12 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <climits>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 
 namespace {
@@ -319,6 +322,41 @@ bool normalizeNode(std::string &line, bool input, const std::string &type)
 	NodeText n;
 	if (!splitNode(line, n))
 		return false;
+	// A vertex input's attribute name, which the generator writes as a bare string after the
+	// location's two operands, is not in the node `metal` writes.
+	bool edited = false;
+	for (size_t i = 0; input && i + 3 < n.ops.size(); i++) {
+		std::string key, bare;
+		unsigned a = 0, b = 0;
+		if (stringOp(n.ops[i], key) && key == "air.location_index" && intOp(n.ops[i + 1], a) &&
+		    intOp(n.ops[i + 2], b) && stringOp(n.ops[i + 3], bare) && bare.compare(0, 4, "air.") != 0) {
+			n.ops.erase(n.ops.begin() + static_cast<std::ptrdiff_t>(i + 3));
+			line = joinNode(n);
+			edited = true;
+			break;
+		}
+	}
+	// A flat fragment input's sampling key: `metal` writes [[flat]] as air.flat alone.
+	bool flat = false, fragmentInput = false;
+	for (const std::string &op : n.ops) {
+		std::string key;
+		if (stringOp(op, key)) {
+			flat |= key == "air.flat";
+			fragmentInput |= key == "air.fragment_input";
+		}
+	}
+	if (input && flat && fragmentInput) {
+		for (size_t i = 0; i < n.ops.size();) {
+			std::string key;
+			if (stringOp(n.ops[i], key) && (key == "air.center" || key == "air.centroid" || key == "air.sample")) {
+				n.ops.erase(n.ops.begin() + static_cast<std::ptrdiff_t>(i));
+				line = joinNode(n);
+				edited = true;
+			} else {
+				i++;
+			}
+		}
+	}
 	size_t kindAt = n.ops.size(), typeAt = n.ops.size();
 	bool named = false;
 	std::string kind, s;
@@ -335,7 +373,7 @@ bool normalizeNode(std::string &line, bool input, const std::string &type)
 		}
 	}
 	if (kindAt == n.ops.size() || kind.compare(0, 4, "air.") != 0 || (input && kindAt == 0))
-		return false;
+		return edited;
 	std::string current;
 	if (typeAt != n.ops.size()) {
 		std::string user;
@@ -343,13 +381,13 @@ bool normalizeNode(std::string &line, bool input, const std::string &type)
 		                         kindAt + 1 < n.ops.size() && stringOp(n.ops[kindAt + 1], user) &&
 		                         user.compare(0, 5, "user(") == 0;
 		if (!interpolant || !stringOp(n.ops[typeAt], current) || !signedIntegerName(current))
-			return false;
+			return edited;
 		n.ops[typeAt] = "!\"u" + current + "\"";
 		line = joinNode(n);
 		return true;
 	}
 	if (type.empty())
-		return false;
+		return edited;
 	n.ops.push_back("!\"air.arg_type_name\"");
 	n.ops.push_back("!\"" + type + "\"");
 	if (!named) {
@@ -378,9 +416,15 @@ bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signatur
 		lines.push_back(text.substr(at, end - at));
 		at = end + 1;
 	}
+	// Each numbered node's line, and the lines of the named lists the rules read.
 	std::vector<size_t> nodeLine;
-	unsigned entry = 0;
-	bool found = false;
+	size_t entryList = lines.size(), versionList = lines.size(), languageList = lines.size(),
+	       optionsList = lines.size(), flagsList = lines.size();
+	std::vector<bool> dropped(lines.size(), false);
+	bool changed = false;
+	auto starts = [](const std::string &line, const char *name) {
+		return line.compare(0, std::strlen(name), name) == 0;
+	};
 	for (size_t i = 0; i < lines.size(); i++) {
 		const std::string &line = lines[i];
 		unsigned n = 0;
@@ -388,39 +432,128 @@ bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signatur
 			if (nodeLine.size() <= n)
 				nodeLine.resize(n + 1, lines.size());
 			nodeLine[n] = i;
-		} else if (!found && (line.compare(0, 14, "!air.vertex = ") == 0 || line.compare(0, 16, "!air.fragment = ") == 0)) {
-			NodeText named;
-			found = splitNode(line, named) && !named.ops.empty() && refOp(named.ops[0], entry);
+		} else if (entryList == lines.size() &&
+		           (starts(line, "!air.vertex = ") || starts(line, "!air.fragment = "))) {
+			entryList = i;
+		} else if (starts(line, "!air.version = ")) {
+			versionList = i;
+		} else if (starts(line, "!air.language_version = ")) {
+			languageList = i;
+		} else if (starts(line, "!air.compile_options = ")) {
+			optionsList = i;
+		} else if (starts(line, "!llvm.module.flags = ")) {
+			flagsList = i;
+		} else if (starts(line, "!gld.") && line.find(" = ") != std::string::npos) {
+			dropped[i] = changed = true; // the generator's own list
 		}
 	}
 	auto node = [&](unsigned n, NodeText &out) {
 		return n < nodeLine.size() && nodeLine[n] < lines.size() && splitNode(lines[nodeLine[n]], out);
 	};
-	NodeText e, outputs, inputs;
-	unsigned outputsAt = 0, inputsAt = 0;
-	if (!found || !node(entry, e) || e.ops.size() < 3 || !refOp(e.ops[1], outputsAt) ||
-	    !refOp(e.ops[2], inputsAt) || !node(outputsAt, outputs) || !node(inputsAt, inputs))
-		return false;
-	bool changed = false;
-	for (size_t i = 0; i < outputs.ops.size(); i++) {
-		unsigned n = 0;
-		if (refOp(outputs.ops[i], n) && n < nodeLine.size() && nodeLine[n] < lines.size())
-			changed |= normalizeNode(lines[nodeLine[n]], false,
-			                         i < signature.outputs.size() ? signature.outputs[i] : std::string());
+	// A named list's entries, each kept where `slot` names a slot no entry before it took ("" keeps
+	// every entry; nullptr drops it), so the list holds what one module's compile writes.
+	auto keepFirst = [&](size_t list, const std::function<const char *(const NodeText &, std::string &)> &slot) {
+		NodeText named;
+		if (list >= lines.size() || !splitNode(lines[list], named))
+			return;
+		std::vector<std::string> kept, taken;
+		for (const std::string &op : named.ops) {
+			unsigned n = 0;
+			NodeText entry;
+			std::string scratch;
+			const char *s = refOp(op, n) && node(n, entry) ? slot(entry, scratch) : "";
+			if (s == nullptr)
+				continue;
+			if (s[0] != '\0') {
+				if (std::find(taken.begin(), taken.end(), s) != taken.end())
+					continue;
+				taken.emplace_back(s);
+			}
+			kept.push_back(op);
+		}
+		if (kept.size() != named.ops.size()) {
+			named.ops = kept;
+			lines[list] = joinNode(named);
+			changed = true;
+		}
+	};
+	// The versions: the module's own, the list's first (the generator links its builtins,
+	// compiled as another AIR and language version, in after it).
+	auto one = [](const NodeText &, std::string &) -> const char * { return "one"; };
+	keepFirst(versionList, one);
+	keepFirst(languageList, one);
+	// The compile options: the module's own of each (fast math, framebuffer fetch, denormals), and
+	// no air.compile.native_double_disable.
+	keepFirst(optionsList, [](const NodeText &option, std::string &s) -> const char * {
+		if (option.ops.size() != 1 || !stringOp(option.ops[0], s))
+			return "";
+		if (s == "air.compile.native_double_disable")
+			return nullptr;
+		if (s.rfind("air.compile.fast_math_", 0) == 0)
+			return "fast_math";
+		if (s.rfind("air.compile.framebuffer_fetch_", 0) == 0)
+			return "framebuffer_fetch";
+		return s.c_str();
+	});
+	// The module flags: the module's own of each.
+	keepFirst(flagsList, [](const NodeText &flag, std::string &s) -> const char * {
+		return flag.ops.size() >= 2 && stringOp(flag.ops[1], s) ? s.c_str() : "";
+	});
+	// The language: Metal's, at the AIR version's major and minor.
+	auto firstOf = [&](size_t list, unsigned &n) {
+		NodeText named;
+		return list < lines.size() && splitNode(lines[list], named) && !named.ops.empty() &&
+		       refOp(named.ops[0], n);
+	};
+	unsigned languageAt = 0;
+	NodeText language;
+	std::string name;
+	if (firstOf(languageList, languageAt) && node(languageAt, language) && !language.ops.empty() &&
+	    stringOp(language.ops[0], name) && name != "Metal") {
+		unsigned versionAt = 0, major = 2, minor = 3;
+		NodeText version;
+		if (firstOf(versionList, versionAt) && node(versionAt, version) && version.ops.size() >= 2) {
+			intOp(version.ops[0], major);
+			intOp(version.ops[1], minor);
+		}
+		language.ops = {"!\"Metal\"", "i32 " + std::to_string(major), "i32 " + std::to_string(minor),
+		                "i32 0"};
+		lines[nodeLine[languageAt]] = joinNode(language);
+		changed = true;
 	}
-	for (const std::string &op : inputs.ops) {
-		unsigned n = 0, param = 0;
-		NodeText in;
-		if (!refOp(op, n) || !node(n, in) || in.ops.empty() || !intOp(in.ops[0], param))
-			continue;
-		changed |= normalizeNode(lines[nodeLine[n]], true,
-		                         param < signature.parameters.size() ? signature.parameters[param] : std::string());
+	// The entry point's outputs and inputs.
+	unsigned entry = 0, outputsAt = 0, inputsAt = 0;
+	NodeText e, outputs, inputs;
+	NodeText named;
+	if (entryList < lines.size() && splitNode(lines[entryList], named) && !named.ops.empty() &&
+	    refOp(named.ops[0], entry) && node(entry, e) && e.ops.size() >= 3 && refOp(e.ops[1], outputsAt) &&
+	    refOp(e.ops[2], inputsAt) && node(outputsAt, outputs) && node(inputsAt, inputs)) {
+		for (size_t i = 0; i < outputs.ops.size(); i++) {
+			unsigned n = 0;
+			if (refOp(outputs.ops[i], n) && n < nodeLine.size() && nodeLine[n] < lines.size())
+				changed |= normalizeNode(lines[nodeLine[n]], false,
+				                         i < signature.outputs.size() ? signature.outputs[i] : std::string());
+		}
+		for (const std::string &op : inputs.ops) {
+			unsigned n = 0, param = 0;
+			NodeText in;
+			if (!refOp(op, n) || !node(n, in) || in.ops.empty() || !intOp(in.ops[0], param))
+				continue;
+			changed |= normalizeNode(lines[nodeLine[n]], true,
+			                         param < signature.parameters.size() ? signature.parameters[param]
+			                                                             : std::string());
+		}
 	}
 	if (!changed)
 		return false;
 	std::string joined;
-	for (size_t i = 0; i < lines.size(); i++)
-		joined += (i != 0 ? "\n" : "") + lines[i];
+	bool first = true;
+	for (size_t i = 0; i < lines.size(); i++) {
+		if (dropped[i])
+			continue;
+		joined += (first ? "" : "\n") + lines[i];
+		first = false;
+	}
 	text = joined;
 	return true;
 }
@@ -480,7 +613,7 @@ bool RgfxLowerGLIR(const uint8_t *ir, size_t irLength, const uint8_t *plugin, si
 		ok = false;
 		why = "the GL code generator's module names no entry point";
 	}
-	if (ok && f.stage != RgfxMetallibStage::Kernel) {
+	if (ok) {
 		char *printed = l.printModule(module);
 		std::string text = printed != nullptr ? printed : "";
 		if (printed != nullptr)

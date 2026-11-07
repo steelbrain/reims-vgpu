@@ -275,7 +275,10 @@ define { float, <4 x float> } @__main(<4 x float> %0, i32 %1) {
 }
 
 !air.fragment = !{!0}
-!air.version = !{!7}
+!air.version = !{!7, !12}
+!air.language_version = !{!9, !13}
+!air.compile_options = !{!10, !11, !14, !10, !19, !15}
+!llvm.module.flags = !{!16, !17, !18}
 !gld.data = !{!8}
 
 !0 = !{{ float, <4 x float> } (<4 x float>, i32)* @__main, !1, !4}
@@ -287,8 +290,22 @@ define { float, <4 x float> } @__main(<4 x float> %0, i32 %1) {
 !6 = !{i32 1, !"air.fragment_input", !"user(slot8)", !"air.center", !"air.flat", !"air.arg_type_name", !"int", !"air.arg_name", !"user(slot8)"}
 !7 = !{i32 2, i32 3, i32 0}
 !8 = !{!"gld.text", !"a, {b} \22(c)\22"}
+!9 = !{!"OpenGL GLSL", i32 1, i32 0, i32 0}
+!10 = !{!"air.compile.fast_math_enable"}
+!11 = !{!"air.compile.native_double_disable"}
+!12 = !{i32 2, i32 8, i32 0}
+!13 = !{!"Metal", i32 4, i32 0, i32 0}
+!14 = !{!"air.compile.framebuffer_fetch_disable"}
+!15 = !{!"air.compile.framebuffer_fetch_enable"}
+!16 = !{i32 7, !"air.max_textures", i32 128}
+!17 = !{i32 1, !"wchar_size", i32 4}
+!18 = !{i32 7, !"air.max_textures", i32 16}
+!19 = !{!"air.compile.fast_math_disable"}
 )AIR";
 
+// kFragmentText as the rules make it: the generator's list gone; one version, the module's own,
+// its language Metal's; the module's own compile options and module flags, once each; the flat
+// input without its sampling key, and named unsigned; the depth output named.
 const char kFragmentNormalized[] = R"AIR(; ModuleID = 'fragment'
 define { float, <4 x float> } @__main(<4 x float> %0, i32 %1) {
   ret { float, <4 x float> } undef
@@ -296,7 +313,9 @@ define { float, <4 x float> } @__main(<4 x float> %0, i32 %1) {
 
 !air.fragment = !{!0}
 !air.version = !{!7}
-!gld.data = !{!8}
+!air.language_version = !{!9}
+!air.compile_options = !{!10, !14}
+!llvm.module.flags = !{!16, !17}
 
 !0 = !{{ float, <4 x float> } (<4 x float>, i32)* @__main, !1, !4}
 !1 = !{!2, !3}
@@ -304,14 +323,25 @@ define { float, <4 x float> } @__main(<4 x float> %0, i32 %1) {
 !3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
 !4 = !{!5, !6}
 !5 = !{i32 0, !"air.position", !"air.center", !"air.perspective", !"air.arg_type_name", !"float4"}
-!6 = !{i32 1, !"air.fragment_input", !"user(slot8)", !"air.center", !"air.flat", !"air.arg_type_name", !"uint", !"air.arg_name", !"user(slot8)"}
+!6 = !{i32 1, !"air.fragment_input", !"user(slot8)", !"air.flat", !"air.arg_type_name", !"uint", !"air.arg_name", !"user(slot8)"}
 !7 = !{i32 2, i32 3, i32 0}
 !8 = !{!"gld.text", !"a, {b} \22(c)\22"}
+!9 = !{!"Metal", i32 2, i32 3, i32 0}
+!10 = !{!"air.compile.fast_math_enable"}
+!11 = !{!"air.compile.native_double_disable"}
+!12 = !{i32 2, i32 8, i32 0}
+!13 = !{!"Metal", i32 4, i32 0, i32 0}
+!14 = !{!"air.compile.framebuffer_fetch_disable"}
+!15 = !{!"air.compile.framebuffer_fetch_enable"}
+!16 = !{i32 7, !"air.max_textures", i32 128}
+!17 = !{i32 1, !"wchar_size", i32 4}
+!18 = !{i32 7, !"air.max_textures", i32 16}
+!19 = !{!"air.compile.fast_math_disable"}
 )AIR";
 
 // A vertex stage: integer varyings named signed (the rule makes them unsigned) and unsigned, a
-// float varying, an integer attribute (not a varying: left as it is), and outputs and inputs
-// without type names, one a distinct node.
+// float varying, an integer attribute (not a varying: its type name is left as it is, its bare
+// attribute name dropped), and outputs and inputs without type names, one a distinct node.
 const char kVertexText[] = R"AIR(!air.vertex = !{!10}
 !10 = !{{ <4 x float>, <2 x i32>, i32, <4 x float>, i32 } (<2 x float>, i32, i16)* @__main, !11, !17}
 !11 = !{!12, !13, !14, !15, !16}
@@ -334,7 +364,7 @@ const char kVertexNormalized[] = R"AIR(!air.vertex = !{!10}
 !15 = !{!"air.vertex_output", !"user(slot10)", !"air.arg_type_name", !"float4", !"air.arg_name", !"user(slot10)"}
 !16 = distinct !{!"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"uint", !"air.arg_name", !"#air_render_target_1"}
 !17 = !{!18, !19, !20}
-!18 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"attrib_0", !"air.arg_type_name", !"int2", !"air.arg_name", !"attrib_0"}
+!18 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"int2", !"air.arg_name", !"attrib_0"}
 !19 = !{i32 1, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"#air_vertex_id"}
 !20 = !{i32 2, !"air.instance_id", !"air.arg_name", !"instance", !"air.arg_type_name", !"ushort"})AIR";
 
@@ -370,6 +400,9 @@ void test_stage_metadata_normalized()
 	                           "!{!3}\n!3 = !{!\"air.depth\"}\n";
 	text = kernel;
 	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text == kernel);
+	// The module's rules hold for a kernel too: the generator's lists go.
+	text = kernel + "!gld.plugin_info = !{!1}\n";
+	CHECK(RgfxGLNormalizeStageText(text, vertex) && text == kernel);
 	text = "";
 	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text.empty());
 	// An entry node naming nodes the text lacks.

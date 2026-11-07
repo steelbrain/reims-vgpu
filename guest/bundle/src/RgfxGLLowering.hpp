@@ -35,6 +35,28 @@
  * A node that has both, or only lacks air.arg_name (each fragment's air.render_target, measured
  * to make pipelines), is left as it is.
  *
+ * More in the generator's module is not in the AIR `metal` writes. Metal's devices take it, but
+ * the Vulkan host's runtime reads AIR's metadata as a closed grammar and refuses a pipeline of a
+ * function with any of it (metal2vulkan's AIR decoder): every GL pipeline was refused on a 5080
+ * host ("UnknownKey" at gld.plugin_info, macOS 26.6.1), and the rest was found by compiling the
+ * pipelines of tools/gl_cases.m, dumped through tools/gl_inject.mm on the Intel 630, with the
+ * decoder's compile API (macOS 26.7.1: 6 of 29 still refused after the first rule). The
+ * generator links its builtins (GLDBuiltins.metal and the like, compiled as AIR 2.8 and Metal
+ * 4.0) into a shader that uses them, so their lists' entries follow the module's own. Every
+ * variant's module, a kernel's too, is made what one compile of `metal` writes:
+ *   - the generator's own named lists (gld.plugin_info, which holds the plugin return data the
+ *     generator also answers apart) are dropped;
+ *   - air.version and air.language_version hold the module's own entry alone, the first, and the
+ *     language, "OpenGL GLSL" 1.0.0, is "Metal" at the AIR version's major and minor (2.3, the
+ *     language `metal -mmacosx-version-min=11.0` writes with AIR 2.3);
+ *   - air.compile_options holds the module's own option of each kind (fast math, framebuffer
+ *     fetch, denormals), the first, and no air.compile.native_double_disable, which `metal` does
+ *     not write; llvm.module.flags holds the first flag of each name (the module's own limits,
+ *     4096 buffers, not the builtins' 31);
+ *   - a vertex input's attribute name, a bare string after its air.location_index's two
+ *     operands, is dropped (the input keeps its air.arg_name, which holds the same name);
+ *   - a flat fragment input has no sampling key: `metal` writes [[flat]] as air.flat alone, and
+ *     the generator writes air.center before it.
  * Measured on an x86 Mac (macOS 26.7.1, Intel UHD 630 and AMD 5300M): the .metallib of each of
  * a vertex and a fragment shader's variants loads with newLibraryWithData:, makes a render
  * pipeline, and draws what the renderer's own pipeline draws (tools/gld_lower.m).
@@ -73,12 +95,14 @@ struct RgfxGLSignature {
 	std::vector<std::string> outputs, parameters;
 };
 
-/// Makes the stage metadata of the vertex or fragment entry point of `text`, a module as LLVM
-/// prints it, follow the two rules above: an integer user() varying's air.arg_type_name is the
-/// unsigned name, and an output or input node without air.arg_type_name gets the name
-/// `signature` gives its value (an input's by its parameter index), and an air.arg_name where
-/// it has none. True where it changed `text`; `text` is unchanged otherwise, also where the
-/// module has no such entry point.
+/// Makes `text`, a module as LLVM prints it, follow the rules above: the module's (no gld.*
+/// lists; one version, its language Metal's; its own compile options and module flags, once
+/// each), and those of the stage metadata of its vertex or fragment entry point where it has one:
+/// an integer user() varying's air.arg_type_name is the unsigned name, a vertex input has no
+/// bare attribute name, a flat fragment input no sampling key, and an output or input node
+/// without air.arg_type_name gets the name `signature` gives its value (an input's by its
+/// parameter index), and an air.arg_name where it has none. True where it changed `text`; `text`
+/// is unchanged otherwise.
 bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signature);
 
 /// The GL IR a renderer's pointer holds: the u32 length at `ir`, then that many bytes. Writes the
