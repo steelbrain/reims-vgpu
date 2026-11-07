@@ -3195,6 +3195,20 @@ pub(crate) fn test_queue<P: reims_vgpu_core::platform::Platform>(d: &P::Device) 
 /// they make at their draws is the same on every run. Not
 /// kept for [`adopt`]: the process's other handles answer the shared device.
 pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
+    let (options, cache) = options_with_own_cache();
+    let raw = rt::Device::system_default_with(&options).unwrap();
+    let device = Obj::new(DeviceObject {
+        registry_id: registry_id(&raw),
+        raw,
+        caps: OnceLock::new(),
+        awake: Default::default(),
+    });
+    (device, cache)
+}
+
+/// The platform's device options with a shader cache of their own, as [`device_with_own_cache`]
+/// makes its device with.
+pub(crate) fn options_with_own_cache() -> (rt::DeviceOptions, OwnCache) {
     static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let home = std::env::var_os("HOME").expect("a home directory");
     let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3207,14 +3221,7 @@ pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
     std::fs::create_dir_all(&dir).unwrap();
     let mut options = crate::platform::device_options().clone();
     options.shader_cache = rt::ShaderCacheOptions::in_directory(&dir);
-    let raw = rt::Device::system_default_with(&options).unwrap();
-    let device = Obj::new(DeviceObject {
-        registry_id: registry_id(&raw),
-        raw,
-        caps: OnceLock::new(),
-        awake: Default::default(),
-    });
-    (device, OwnCache(dir))
+    (options, OwnCache(dir))
 }
 
 /// The directory of [`device_with_own_cache`]'s shader cache, removed as it drops.

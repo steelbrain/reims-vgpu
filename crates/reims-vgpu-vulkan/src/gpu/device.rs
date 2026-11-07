@@ -311,8 +311,9 @@ pub(crate) fn first_adopted() -> Option<rt::Device> {
 /// follows ([`metal_space::count_sampler_ids`]). A new device's class joins the process's
 /// placement of degradations ([`crate::answer::native::device_made`]), and its warm pass runs
 /// over the pipeline records earlier processes kept ([`crate::records`]), in the background. Its
-/// work counts go to the log where its filter names their target ([`crate::work_log`]), and its
-/// GPU is kept awake while the guest draws ([`crate::awake`]).
+/// work counts go to the log where its filter names their target ([`crate::work_log`]), its
+/// GPU is kept awake while the guest draws ([`crate::awake`]), and the runtime's check of
+/// textures over host pages starts ([`start_in_place_checks`]).
 pub fn adopt(raw: rt::Device) -> VulkanDevice {
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
@@ -328,6 +329,7 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
         crate::records::warm(&raw, crate::records::path_in(home.as_ref()));
     }
     crate::work_log::start(&raw);
+    start_in_place_checks(&raw);
     let made = Obj::new(DeviceObject {
         awake: crate::awake::Awake::start(&raw),
         raw,
@@ -336,6 +338,20 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     });
     devices.push((id, made.clone_ref()));
     made
+}
+
+/// Starts `raw`'s check of textures over host pages on the runtime's thread for it, where its
+/// verdicts are pending: where no record of an earlier process of the same driver and runtime
+/// holds them, and the policy takes such textures in place (`REIMS_VGPU_EXACT` names no
+/// `host_page_textures`). Waits for nothing. A texture the guest makes over its pages (a
+/// framebuffer of its compositor's) before its class's verdict is known is a shadow, copied in
+/// before each use and merged back after each write, where the verdict would have the texture in
+/// place (the runtime's `in_place.rs`); the check otherwise starts at the first such texture,
+/// which is then a shadow. The check's buffers lie outside Metal's address space and its textures
+/// take no resource ID (the runtime's `in_place_check.rs`), so no value the guest sees moves with
+/// it.
+fn start_in_place_checks(raw: &rt::Device) {
+    let _ = raw.settle_in_place_checks(std::time::Duration::ZERO);
 }
 
 /// The handle of the device made in the process whose registry ID, as this platform answers it
@@ -2248,6 +2264,31 @@ pub(crate) mod tests {
     /// The system default device (MoltenVK on the suite's host).
     pub(crate) fn dev() -> VulkanDevice {
         DEVICE.clone_ref()
+    }
+
+    /// A device the platform adopts starts the runtime's check of textures over host pages, with
+    /// no texture made ([`start_in_place_checks`]): a device of a shader cache of its own, empty,
+    /// so no record holds the verdicts, adopted as the first of its process (nextest's, one a
+    /// test), ends the check.
+    #[test]
+    fn an_adopted_device_starts_its_in_place_check() {
+        let (options, _cache) = metal_tests::options_with_own_cache();
+        let raw = rt::Device::system_default_with(&options).unwrap();
+        assert!(raw.in_place_check_took().is_none(), "no check ran before");
+        assert!(
+            kept(registry_id(&raw)).is_none(),
+            "the test's process adopted a device before"
+        );
+        let device = adopt(raw);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while device.raw.in_place_check_took().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no check ended in 120 s: {:?}",
+                device.raw.in_place_check_report()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// Descriptors and a function's argument buffer are laid out as the Metal platform's own
