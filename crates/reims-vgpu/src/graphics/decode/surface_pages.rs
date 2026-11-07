@@ -2153,7 +2153,10 @@ pub(super) mod tests {
         // GPU writes there reaches it.
         assert!(r.ram.write(RAM + 3 * page, b"third"));
         let fake = r.p.fake_vm();
-        assert_eq!(fake.read(view.base().wrapping_add(page), 5).unwrap(), b"third");
+        assert_eq!(
+            fake.read(view.base().wrapping_add(page), 5).unwrap(),
+            b"third"
+        );
         assert!(fake.write(view.base().wrapping_add(3 * page), b"GPU"));
         fake.sync();
         let mut got = [0u8; 3];

@@ -115,10 +115,10 @@ use reims_graphics::wire::{
     RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
     RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
     RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
-    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxHeapOverPages,
+    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages,
     RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc,
     RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
-    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
+    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign,
     RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMeshPipelineReflection,
     RgfxMeshRenderPipelineCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
     RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk,
@@ -1948,8 +1948,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// what is carried out there ([`surface_pages`]).
     pub(crate) fn over_pages_makes(&self, message: &[u8]) -> bool {
         let block = match read::<RgfxMsgHeader>(message).map(|h| h.r#type) {
-            Some(RGFX_CMD_BUFFER_OVER_PAGES) => read::<RgfxBufferOverPages>(message)
-                .map(|m| (m.block_offset, m.block_size, false)),
+            Some(RGFX_CMD_BUFFER_OVER_PAGES) => {
+                read::<RgfxBufferOverPages>(message).map(|m| (m.block_offset, m.block_size, false))
+            }
             Some(RGFX_CMD_HEAP_OVER_PAGES) => {
                 read::<RgfxHeapOverPages>(message).map(|m| (m.block_offset, m.block_size, true))
             }

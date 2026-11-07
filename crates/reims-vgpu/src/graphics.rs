@@ -43,9 +43,9 @@ use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_COMMAND_BUFFER,
-    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
-    RGFX_CMD_ICB_CREATE,
-    RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
+    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_OVER_PAGES,
+    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
+    RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
     RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
@@ -61,8 +61,8 @@ use reims_graphics::wire::{
     RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
     RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
     RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
-    RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState,
-    RgfxSharedEventName, RgfxSurfacePages, RgfxVideoCaps,
+    RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
+    RgfxSamplerState, RgfxSharedEventName, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -1792,24 +1792,27 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             self.pages_buffers.begin(block, 0, begun),
         );
         let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
-        decoder.on_surface_worker(block, Box::new(move || {
-            let outcome = {
-                let _carried = me.reset_gate.read_recursive();
-                if poster.stale() {
-                    return;
-                }
-                let mut decoder = (me.decoders)
-                    .sender(Some(sender_context(&poster, &message)), me.sinks(&poster));
-                decoder.decode_refusing(&me.device, &message)
-            };
-            me.report(&poster, &message, outcome, false);
-            log::debug!(
-                target: "reims_vgpu::graphics::surface_pages",
-                "{name} of the block at {block:#x} made on the worker {} us after its begin",
-                me.pool.now().saturating_duration_since(begun).as_micros()
-            );
-            drop(settles);
-        }));
+        decoder.on_surface_worker(
+            block,
+            Box::new(move || {
+                let outcome = {
+                    let _carried = me.reset_gate.read_recursive();
+                    if poster.stale() {
+                        return;
+                    }
+                    let mut decoder = (me.decoders)
+                        .sender(Some(sender_context(&poster, &message)), me.sinks(&poster));
+                    decoder.decode_refusing(&me.device, &message)
+                };
+                me.report(&poster, &message, outcome, false);
+                log::debug!(
+                    target: "reims_vgpu::graphics::surface_pages",
+                    "{name} of the block at {block:#x} made on the worker {} us after its begin",
+                    me.pool.now().saturating_duration_since(begun).as_micros()
+                );
+                drop(settles);
+            }),
+        );
         true
     }
 
