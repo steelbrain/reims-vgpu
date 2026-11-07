@@ -1,5 +1,5 @@
 // The native test of RgfxBootConsole.hpp: the boot framebuffer ReimsGraphics publishes, from the
-// platform expert's console info at its start.
+// platform expert's console info at its start, and how much of the scanout the boot screen holds.
 #include "RgfxBootConsole.hpp"
 
 #include <cstdio>
@@ -45,6 +45,21 @@ int main()
 	RgfxBootConsole wide = rgfxBootConsole(true, 1, 0x100000000ull, 0x1ffffffffull, 2, 3);
 	check(wide.rowBytes == UINT32_MAX && wide.width == UINT32_MAX, "past 32 bits saturates");
 	check(wide.height == 2 && wide.depth == 3, "the rest kept");
+
+	// The boot screen's span: the boot framebuffer's rows, or the largest mode's where that is
+	// more, inside the scanout's room.
+	const uint64_t room = 0x10000000;
+	check(rgfxBootScreenSpan(gop, 0, room) == 7680ull * 1080,
+	      "before any mode: the boot framebuffer's 1080 rows of 7680 bytes");
+	check(rgfxBootScreenSpan(gop, 14848ull * 2039, room) == 14848ull * 2039,
+	      "a 3662x2039 mode's rows, more than the boot framebuffer's");
+	check(rgfxBootScreenSpan(gop, 5376ull * 768, room) == 7680ull * 1080,
+	      "a smaller mode: the boot framebuffer's rows still");
+	check(rgfxBootScreenSpan(none, 0, room) == 0, "no boot framebuffer and no mode: nothing");
+	check(rgfxBootScreenSpan(unanswered, 7680ull * 1080, room) == 7680ull * 1080,
+	      "no console info: the mode's rows");
+	check(rgfxBootScreenSpan(wide, 0, room) == room, "never past the room");
+	check(rgfxBootScreenSpan(gop, 0, 4096) == 4096, "a room smaller than the boot framebuffer");
 
 	std::printf("boot_console_test: %d checks passed\n", checks);
 	return 0;

@@ -639,6 +639,12 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 				hook(clients[i], seqno, status, shown);
 			clients[i]->release();
 		}
+		// The display shows a surface from this answer: the boot screen under it, black, once.
+		if (status == RGFX_STATUS_OK && !bootScreenCleared &&
+		    seqno == __atomic_load_n(&bootScreenSeqno, __ATOMIC_ACQUIRE)) {
+			__atomic_store_n(&bootScreenCleared, true, __ATOMIC_RELEASE);
+			clearBootScreen();
+		}
 		return;
 	}
 	case RGFX_EVT_DISPLAYS: {
@@ -874,6 +880,36 @@ UInt64 ReimsGraphics::scanoutLimit() const
 	return rgfxScanoutRoom(regionSize, kCursorSlot);
 }
 
+// The boot screen, black: the logo and progress bar the firmware and the kernel's console drew
+// into the scanout, which the display shows again whenever it shows the scanout (PRESENT_SURFACE
+// 0, when the last display pipe client goes: WindowServer's quit at a shutdown, or its crash).
+// Measured on a macOS 26.7.2 guest: a shutdown showed the boot frame of 13 s in, unchanged, until
+// power off. Cleared on the work loop at the answer of the first present of a surface, while the
+// display shows that surface, so the clear is never seen; once, as nothing draws the boot screen
+// again. A clear that finds no mapping is not tried again.
+void ReimsGraphics::clearBootScreen()
+{
+	if (!region)
+		return;
+	IOLockLock(stateLock);
+	const UInt64 largest = largestScanout;
+	IOLockUnlock(stateLock);
+	const UInt64 length = rgfxBootScreenSpan(bootConsole, largest, scanoutLimit());
+	if (length == 0)
+		return;
+	IOMemoryMap *map = region->createMappingInTask(
+	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, RGFX_ALLOCATIONS_OFFSET, length);
+	if (!map) {
+		IOLog("ReimsGraphics: display %u: the boot screen was not cleared: no mapping of it\n",
+		      displayId);
+		return;
+	}
+	bzero(reinterpret_cast<void *>(map->getVirtualAddress()), static_cast<size_t>(length));
+	map->release();
+	IOLog("ReimsGraphics: display %u: the boot screen cleared (%llu bytes of the scanout)\n",
+	      displayId, length);
+}
+
 IOReturn ReimsGraphics::setScanout(const Mode &mode)
 {
 	UInt32 stride = strideFor(mode.width);
@@ -888,8 +924,11 @@ IOReturn ReimsGraphics::setScanout(const Mode &mode)
 	IOReturn r = command(RGFX_CMD_SET_SCANOUT, &s, sizeof(s));
 	if (r != kIOReturnSuccess)
 		return r;
+	const UInt64 span = static_cast<UInt64>(stride) * mode.height;
 	IOLockLock(stateLock);
 	modeSet.set(mode);
+	if (span > largestScanout)
+		largestScanout = span;
 	IOLockUnlock(stateLock);
 	IOLog("ReimsGraphics: display %u: scanout %ux%u at %u.%03u Hz, stride %u\n", displayId,
 	      mode.width, mode.height, mode.refreshMhz / 1000, mode.refreshMhz % 1000, stride);
@@ -1028,6 +1067,9 @@ bool ReimsGraphics::start(IOService *provider)
 	if (!submitLock || !interruptLock || !stateLock || !presentsLock)
 		return false;
 	nextSeqno = 1;
+	largestScanout = 0;
+	bootScreenSeqno = 0;
+	bootScreenCleared = false;
 	modeSet.reset();
 	taken = false;
 	submitRoom = false;
@@ -1275,7 +1317,7 @@ void ReimsGraphics::quiesce()
 
 // The boot framebuffer the platform expert's console info names now, before IOFramebuffer moves
 // the console onto this framebuffer, as the RgfxBootFramebuffer property (RgfxBootConsole.hpp),
-// and once in the log.
+// and once in the log; kept for clearBootScreen.
 void ReimsGraphics::publishBootConsole()
 {
 	PE_Video video = {};
@@ -1283,6 +1325,7 @@ void ReimsGraphics::publishBootConsole()
 	const bool answered = platform && platform->getConsoleInfo(&video) == kIOReturnSuccess;
 	const RgfxBootConsole boot = rgfxBootConsole(answered, video.v_baseAddr, video.v_rowBytes,
 	                                             video.v_width, video.v_height, video.v_depth);
+	bootConsole = boot;
 	IOLog("ReimsGraphics: boot framebuffer %s 0x%llx (%ux%u, %u bytes a row, %u bits)\n",
 	      boot.answered ? "at" : "unknown,", boot.address, boot.width, boot.height, boot.rowBytes,
 	      boot.depth);
@@ -2244,9 +2287,16 @@ IOReturn ReimsGraphics::postPresent(UInt32 surfaceId, UInt32 transactionId, UInt
 	p.present.flags = flags;
 	const bool kept = (flags & RGFX_PRESENT_KEEP) != 0;
 	const bool cached = !kept && rgfxSurfaceCacheGeneration(surfaceId, &p.gen.cpu_gen);
+	// Until the boot screen is cleared, a surface's present takes the clear's seqno, written
+	// before the host can answer it (handleEvent).
+	UInt64 *clearsBootScreen =
+	    !kept && surfaceId != 0 && !__atomic_load_n(&bootScreenCleared, __ATOMIC_ACQUIRE)
+	        ? &bootScreenSeqno
+	        : nullptr;
 	// Never waits for room: the caller does, with its lock let go (waitForRoom).
 	IOReturn r = kIOReturnSuccess;
-	if (!tryPost(RGFX_CMD_PRESENT_SURFACE, &p, cached ? sizeof(p) : sizeof(p.present), seqno))
+	if (!tryPost(RGFX_CMD_PRESENT_SURFACE, &p, cached ? sizeof(p) : sizeof(p.present), seqno,
+	             clearsBootScreen))
 		r = ready ? kIOReturnNoSpace : kIOReturnNotReady;
 	if (r == kIOReturnSuccess && !kept) {
 		IOSimpleLockLock(interruptLock);
@@ -2304,8 +2354,9 @@ void ReimsGraphics::removePipe(OSObject *client)
 	client->release();
 	if (showScanout) {
 		// The last client went with a surface shown: the scanout again, so whatever draws into
-		// it next is seen. Its answer goes to no client. It comes between no transaction's
-		// colour and present (lockPresents).
+		// it next is seen, and black till then: the boot screen was cleared at the first
+		// surface's present (clearBootScreen). Its answer goes to no client. It comes between no
+		// transaction's colour and present (lockPresents).
 		RgfxPresentSurface p = {};
 		p.display = displayId;
 		lockPresents();

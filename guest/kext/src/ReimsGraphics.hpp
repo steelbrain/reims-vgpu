@@ -32,6 +32,7 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
+#include "RgfxBootConsole.hpp"
 #include "RgfxDeferredAnswers.hpp"
 #include "RgfxDisplayModes.hpp"
 #include "RgfxPipeClients.hpp"
@@ -375,6 +376,8 @@ private:
 	static UInt32 strideFor(UInt32 width);
 	UInt64 scanoutLimit() const;
 	IOReturn setScanout(const Mode &mode);
+	// The boot screen in the scanout, black, once the display first shows a surface (handleEvent).
+	void clearBootScreen();
 
 	IOPCIDevice *pci;
 	IOMemoryMap *registerMap;
@@ -464,6 +467,15 @@ private:
 	RgfxVblankClock vblankClock;
 	bool refreshWanted;
 	UInt64 refreshSeqno;
+
+	// The boot screen the scanout holds until clearBootScreen: the boot framebuffer the OS had at
+	// the start (publishBootConsole); the largest span a mode's scanout has had (setScanout, under
+	// stateLock); the seqno of the latest present of a surface before the clear, which tryPost
+	// writes before the host sees the present; and whether it was cleared (the work loop's).
+	RgfxBootConsole bootConsole;
+	UInt64 largestScanout;
+	UInt64 bootScreenSeqno;
+	bool bootScreenCleared;
 
 	bool ready;
 	// start's and stop's alone: whether start reset the device to take it. Only a device taken is

@@ -9,6 +9,8 @@
 //   Width, Height, RowBytes, Depth  its size in pixels, its row in bytes, its bits a pixel
 // A boot whose firmware set no GOP mode has no boot framebuffer: Address is 0.
 //
+// rgfxBootScreenSpan is how much of the scanout the boot screen can hold.
+//
 // Header-only and free of the kernel's headers, so its native test
 // (tests/boot_console_test.cpp) builds it as the kext does.
 //
@@ -51,6 +53,19 @@ inline RgfxBootConsole rgfxBootConsole(bool answered, uint64_t base, uint64_t ro
 	c.rowBytes = rgfxBootConsoleWord(rowBytes);
 	c.depth = rgfxBootConsoleWord(depth);
 	return c;
+}
+
+// The bytes of the scanout, from its head, that the boot screen can hold (ReimsGraphics::
+// clearBootScreen): the boot framebuffer's rows, which the firmware and then the kernel drew the
+// logo and progress bar into (the option ROM's GOP framebuffer is the scanout's head, firmware/),
+// or the rows of the largest mode the scanout has had, where the kernel's console drew too, if
+// that is more; never past the scanout's `room`.
+inline uint64_t rgfxBootScreenSpan(const RgfxBootConsole &boot, uint64_t largestScanout,
+                                   uint64_t room)
+{
+	const uint64_t booted = static_cast<uint64_t>(boot.rowBytes) * boot.height;
+	const uint64_t span = booted > largestScanout ? booted : largestScanout;
+	return span < room ? span : room;
 }
 
 #endif // RGFX_BOOT_CONSOLE_HPP_
