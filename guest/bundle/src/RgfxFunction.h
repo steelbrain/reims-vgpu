@@ -173,8 +173,9 @@ typedef struct {
 /// data Metal's has (RgfxGLPluginReturnData, RgfxClMode.hpp); the host links the kernel
 /// (RGFX_COMPUTE_PIPELINE_OPENCL_MODE). nil, logged once per reason, where the plugin data or
 /// bitcodeType is not the renderer's, the host makes no pipeline of OpenCL mode
-/// (RGFX_FEATURE_OPENCL_MODE), or the kernel binds what the rule does not cover.
-- (nullable id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(NSUInteger)bitcodeType;
+/// (RGFX_FEATURE_OPENCL_MODE), or the kernel binds what the rule does not cover. bitcodeType is an
+/// unsigned char, as Metal's (measured type on the M3 Max, macOS 27).
+- (nullable id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(uint8_t)bitcodeType;
 
 /// The function SPI RenderBox reads as it keys its pipelines: the SHA-256 of the function's
 /// bitcode, valid for the function's life (measured type: r^{?=[32C]}16@0:8).

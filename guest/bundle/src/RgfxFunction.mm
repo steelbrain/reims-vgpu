@@ -83,7 +83,7 @@ NSData *clReturnData(const RgfxClBindings &b, const std::string &entry)
 
 // The bitcodeType of an OpenCL kernel's function, and the plugin data the GL renderer gives it
 // (GLDComputeProgramRec::createKernel; measured: 32 bytes, the first u32 2, the rest 0).
-constexpr NSUInteger kClBitcodeType = 2;
+constexpr uint8_t kClBitcodeType = 2;
 constexpr size_t kClPluginDataLength = 32;
 
 bool isRendererPluginData(NSData *data)
@@ -501,7 +501,7 @@ bool isRendererPluginData(NSData *data)
 	return _pluginData;
 }
 
-- (id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(NSUInteger)bitcodeType
+- (id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(uint8_t)bitcodeType
 {
 	if (bitcodeType != kClBitcodeType || !isRendererPluginData(pluginData)) {
 		logClOnce("its plugin data or bitcodeType is not the GL renderer's");

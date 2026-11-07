@@ -37,7 +37,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// the variant's .metallib, holding the generator's return data. Nil, logged once per reason,
 /// where the variant is not lowered or the device makes no library or function of it.
 /// `bitcodeType` (1 for GL, 3 for GL ES) does not change the lowering.
-- (nullable id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(NSUInteger)bitcodeType;
+- (nullable id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(uint8_t)bitcodeType;
 
 /// The IR (its u32 length first), as the renderer gave it.
 @property(nonatomic, readonly) NSData *rgfxIR;

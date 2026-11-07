@@ -463,12 +463,13 @@ pub unsafe trait FunctionSpi: Message {
             msg_send![self, newArgumentEncoderWithBufferIndex: buffer_index, reflection: reflection]
         }
     }
-    /// The kernel's function of OpenCL mode, made of `plugin_data` with `bitcode_type`, as
-    /// Apple's OpenGL renderer makes it for a pipeline of `setOpenCLModeEnabled:`, or nil.
+    /// The kernel's function of OpenCL mode, made of `plugin_data` with `bitcode_type` (an
+    /// unsigned char: `C`, measured on the M3 Max, macOS 27), as Apple's OpenGL renderer makes it
+    /// for a pipeline of `setOpenCLModeEnabled:`, or nil.
     fn newFunctionWithPluginData_bitcodeType_or_nil(
         &self,
         plugin_data: &NSData,
-        bitcode_type: u64,
+        bitcode_type: u8,
     ) -> Option<Retained<ProtocolObject<dyn MTLFunction>>> {
         unsafe { msg_send![self, newFunctionWithPluginData: plugin_data, bitcodeType: bitcode_type] }
     }

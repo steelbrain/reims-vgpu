@@ -76,7 +76,7 @@ void RgfxGLSetPluginReturnData(id<MTLFunction> function, NSData *data)
 	return self;
 }
 
-- (id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(NSUInteger)bitcodeType
+- (id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(uint8_t)bitcodeType
 {
 	(void)bitcodeType;
 	const uint8_t *payload = nullptr;
