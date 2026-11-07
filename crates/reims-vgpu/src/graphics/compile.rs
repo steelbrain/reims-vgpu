@@ -145,6 +145,11 @@ struct PoolState {
     favoured: Option<u32>,
     /// The pool is gone (or stopped): the threads end once nothing waits.
     closed: bool,
+    /// The context of each compile taken, in the order taken (tests only): a thread runs a
+    /// compile only after it has taken it, and one put off between the two runs its compile
+    /// after a later take's.
+    #[cfg(test)]
+    taken: Vec<u32>,
 }
 
 impl PoolState {
@@ -181,6 +186,8 @@ impl PoolState {
             self.turns.push_back(context);
         }
         *self.running.entry(context).or_default() += 1;
+        #[cfg(test)]
+        self.taken.push(context);
         Some(queued)
     }
 
@@ -326,6 +333,12 @@ impl CompilePool {
     #[cfg(test)]
     pub(crate) fn favoured(&self) -> Option<u32> {
         self.shared.state.lock().favoured
+    }
+
+    /// The context of each compile the threads took, in the order taken (tests only).
+    #[cfg(test)]
+    fn taken(&self) -> Vec<u32> {
+        self.shared.state.lock().taken.clone()
     }
 
     /// Shuts the gate: the threads hold before their next compile (tests only).
@@ -735,9 +748,10 @@ mod tests {
     }
 
     /// One context's backlog holds no other context's create: with four threads busy on context
-    /// 1's twenty compiles, context 2's single create starts as the first of them ends and so
+    /// 1's twenty compiles, context 2's single create is taken as the first of them ends and so
     /// finishes one compile time after that, where in the order compiles were handed over it
-    /// would wait for five
+    /// would wait for five. The order is read as the pool took the compiles: a thread put off
+    /// between its take and its compile's start lets a compile taken after its own start first
     #[test]
     fn a_context_s_create_waits_behind_no_other_context_s_backlog() {
         const TAKES: Duration = Duration::from_millis(100);
@@ -772,11 +786,12 @@ mod tests {
         let done = finish
             .recv_timeout(Duration::from_secs(10))
             .expect("context 2's create never ran");
-        let order = starts.lock().clone();
-        let at = order.iter().position(|n| n == "2");
+        let taken = pool.taken();
+        let at = taken.iter().position(|&context| context == 2);
         assert!(
             at.is_some_and(|at| at <= 4),
-            "context 2's create started late: {order:?}"
+            "context 2's create was taken late: {taken:?}, started in {:?}",
+            starts.lock().clone()
         );
         // Handed over last, it would finish after six compile times; it waits for one.
         let took = done.saturating_duration_since(released);
