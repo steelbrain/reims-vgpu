@@ -2115,14 +2115,64 @@ vertex float4 vmain(uint v [[vertex_id]]) { return float4(0, 0, 0, 1); }
     use reims_vgpu_core::num::ToU64;
     use reims_vgpu_core::platform::values::{ColorAttachmentDesc, PrivateRenderDesc};
 
-    /// A full-screen triangle whose fragment writes (1, 1, 0, 0).
+    /// A full-screen triangle whose fragment writes (1, 1, 0, 0), and a vertex function that
+    /// returns nothing.
     const PRIVATE_STATE_SOURCE: &str = "#include <metal_stdlib>
 using namespace metal;
 vertex float4 vmain(uint v [[vertex_id]]) {
     return float4(v == 1 ? 3.0 : -1.0, v == 2 ? 3.0 : -1.0, 0.5, 1.0);
 }
 fragment float4 fmain() { return float4(1.0, 1.0, 0.0, 0.0); }
+vertex void vvoid(uint v [[vertex_id]]) {}
 ";
+
+    /// [`PRIVATE_STATE_SOURCE`]'s library on `d`.
+    fn private_state_library(d: &MetalDevice) -> MetalLibrary {
+        Obj::from_retained(
+            objc2_metal::MTLDevice::newLibraryWithSource_options_error(
+                d.get(),
+                &NSString::from_str(PRIVATE_STATE_SOURCE),
+                None,
+            )
+            .expect("the functions compile"),
+        )
+    }
+
+    /// A rasterizing render pipeline of `vertex` and `fragment` into one RGBA8 colour, of the
+    /// private state `private`: made, or the `NSError`'s code.
+    fn rasterizing_state(
+        d: &MetalDevice,
+        vertex: &MetalFunction,
+        fragment: Option<&MetalFunction>,
+        private: Option<PrivateRenderDesc>,
+    ) -> Result<MetalRenderPipeline, i64> {
+        let color = ColorAttachmentDesc {
+            pixel_format: MTLPixelFormat::RGBA8Unorm.0.to_u64(),
+            write_mask: 0xf,
+            ..ColorAttachmentDesc::default()
+        };
+        d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+            label: None,
+            vertex,
+            fragment,
+            vertex_descriptor: None,
+            colors: vec![(0, color)],
+            depth_pixel_format: 0,
+            stencil_pixel_format: 0,
+            raster_sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization_enabled: true,
+            input_primitive_topology: 0,
+            max_vertex_amplification_count: 1,
+            support_indirect_command_buffers: false,
+            vertex_linked: Default::default(),
+            fragment_linked: Default::default(),
+            private_state: private,
+        })
+        .map(|state| state.expect("a render pipeline"))
+        .map_err(|e| e.code)
+    }
 
     /// What a draw of [`PRIVATE_STATE_SOURCE`] by a pipeline of the private state `private`
     /// leaves in an RGBA8 texel cleared to (64, 128, 191, 255).
@@ -2133,42 +2183,9 @@ fragment float4 fmain() { return float4(1.0, 1.0, 0.0, 0.0); }
             MTLRenderPassDescriptor, MTLStoreAction, MTLTextureUsage,
         };
         let d = dev();
-        let library = Obj::from_retained(
-            objc2_metal::MTLDevice::newLibraryWithSource_options_error(
-                d.get(),
-                &NSString::from_str(PRIVATE_STATE_SOURCE),
-                None,
-            )
-            .expect("the functions compile"),
-        );
+        let library = private_state_library(&d);
         let (v, f) = (function(&library, "vmain"), function(&library, "fmain"));
-        let color = ColorAttachmentDesc {
-            pixel_format: MTLPixelFormat::RGBA8Unorm.0.to_u64(),
-            write_mask: 0xf,
-            ..ColorAttachmentDesc::default()
-        };
-        let state = d
-            .new_render_pipeline_state_full(&FullRenderPipelineDesc {
-                label: None,
-                vertex: &v,
-                fragment: Some(&f),
-                vertex_descriptor: None,
-                colors: vec![(0, color)],
-                depth_pixel_format: 0,
-                stencil_pixel_format: 0,
-                raster_sample_count: 1,
-                alpha_to_coverage: false,
-                alpha_to_one: false,
-                rasterization_enabled: true,
-                input_primitive_topology: 0,
-                max_vertex_amplification_count: 1,
-                support_indirect_command_buffers: false,
-                vertex_linked: Default::default(),
-                fragment_linked: Default::default(),
-                private_state: private,
-            })
-            .unwrap()
-            .expect("a render pipeline");
+        let state = rasterizing_state(&d, &v, Some(&f), private).expect("a render pipeline");
         let td = texture_descriptor(4, 4, MTLStorageMode::Shared);
         td.get().setPixelFormat(MTLPixelFormat::RGBA8Unorm);
         td.get().setUsage(MTLTextureUsage::RenderTarget);
@@ -2241,6 +2258,39 @@ fragment float4 fmain() { return float4(1.0, 1.0, 0.0, 0.0); }
             ..renderer
         };
         assert_eq!(drawn_with(Some(masked)), [64, 128, 191, 255]);
+    }
+
+    /// OpenGL mode makes a rasterizing render pipeline whose vertex function returns `void`,
+    /// with or without a fragment function, which Metal refuses outside it with the `NSError` of
+    /// code 3 ("RasterizationEnabled is true but the vertex shader's return type is void";
+    /// measured by metal2vulkan on the M3 Max, macOS 27.0.1): the mode reaches Metal
+    #[test]
+    fn opengl_mode_makes_a_rasterizing_void_vertex_state() {
+        let d = dev();
+        let library = private_state_library(&d);
+        let (v, f) = (function(&library, "vvoid"), function(&library, "fmain"));
+        let gl = PrivateRenderDesc {
+            open_gl_mode_enabled: true,
+            ..PrivateRenderDesc::default()
+        };
+        for fragment in [Some(&f), None] {
+            let has = fragment.is_some();
+            assert_eq!(
+                rasterizing_state(&d, &v, fragment, None).err(),
+                Some(3),
+                "fragment {has}"
+            );
+            let plain = PrivateRenderDesc::default();
+            assert_eq!(
+                rasterizing_state(&d, &v, fragment, Some(plain)).err(),
+                Some(3),
+                "fragment {has}, the mode off"
+            );
+            assert!(
+                rasterizing_state(&d, &v, fragment, Some(gl)).is_ok(),
+                "fragment {has}"
+            );
+        }
     }
 
     fn render_descriptor(lib: &MetalLibrary) -> MetalRenderPipelineDescriptor {
