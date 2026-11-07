@@ -31,13 +31,32 @@
 //! waits between parts. Its handlers, records and tickets are the last part's, and come as they
 //! came: its `CB_SUBMITTED`, `CB_SCHEDULED` and `CB_COMPLETE` once each, its ticket given back
 //! at the last commit, its commit marks raised there. Its outcome is all the parts' ([`Parts`]):
-//! the first failed part's error, else the last part's; the first part's GPU start, and the last
-//! part's GPU end. A signal of a shared event stays in the part it was encoded in, before the
+//! the first failed part's error, else the last part's; and GPU times that start at the first
+//! part's start and span the parts' GPU time summed, never ending after the last part's end
+//! (below, "Its GPU times"). A signal of a shared event stays in the part it was encoded in, before the
 //! cut, and its value goes to the guest as the event reaches it, as a whole buffer's does; one
 //! of a shared event whose create the host refused goes with the buffer's completion, after its
 //! last part. A buffer whose walk faults after a part has its failure at its stand-in's
 //! completion, as any buffer whose walk faults; the parts committed before the fault ran, as the
 //! encoders before a fault of Metal's GPU run.
+//!
+//! **Its GPU times.** Each part runs once the walk has handed it over, so the GPU waits between
+//! parts for the walk of the next: from the first part's start to the last part's end the buffer
+//! spans the host's walk of it, which a Mac, whose GPU is handed the whole buffer at its commit,
+//! never waits for. The guest's compositor reads these times: macOS's SkyLight and QuartzCore,
+//! which composite WindowServer's frames, reference `GPUStartTime` and `GPUEndTime` (read from
+//! their selector references on macOS 27), and the bundle answers them with the record's span
+//! (`rgfxNoteGPUTimes:`). On a Mac one buffer spans its encoders' GPU time summed: on both x86
+//! Macs (macOS 26.7.1, an AMD Radeon Pro 5300M and an Intel UHD Graphics 630), a buffer of 8 or
+//! 32 compute encoders or render passes spanned what the same encoders committed one buffer each
+//! summed (AMD: 32 compute encoders 6.31 ms whole, 7.37 summed; 32 passes 11.04 and 10.89; Intel:
+//! 13.05 and 12.41; 59.56 and 59.99), the CPU's time encoding it never counted, and its
+//! `GPUStartTime` came 0.08 to 0.40 ms after its commit (measured, `oracle_cmdbuf DEVICE
+//! gputimes`; docs/graphics-kext/dgpu-oracle.md, Q7). So the record starts at the first part's
+//! start, which the GPU reached soonest after the commit, and spans the parts' GPU time summed,
+//! each part's end less its start: the time the buffer's work kept the GPU, as a buffer committed
+//! whole answers it. It never ends after the last part's end, where parts that overlap on the GPU
+//! sum to more.
 //!
 //! **What another message sees** ([`SplitGate`]). While a buffer of a context has parts out, from
 //! its first part's commit to its last, no other command buffer of the context is committed, and
@@ -221,6 +240,8 @@ pub(crate) struct Parts {
 struct Seen {
     /// The GPU start of the first part that has GPU times.
     gpu_start: Option<u64>,
+    /// The GPU time of the parts seen that have GPU times, summed: each one's end less its start.
+    gpu_busy: u64,
     /// The error of the first part that failed.
     error: Option<NsErrorText>,
 }
@@ -232,8 +253,9 @@ impl Parts {
         let parts = Arc::clone(self);
         Box::new(move |info: CompletedInfo| {
             let mut seen = parts.seen.lock();
-            if seen.gpu_start.is_none() {
-                seen.gpu_start = info.gpu_times_ns.map(|(start, _)| start);
+            if let Some((start, end)) = info.gpu_times_ns {
+                seen.gpu_start.get_or_insert(start);
+                seen.gpu_busy = seen.gpu_busy.saturating_add(end.saturating_sub(start));
             }
             if seen.error.is_none() {
                 seen.error = info.error;
@@ -244,9 +266,11 @@ impl Parts {
     }
 
     /// `handler`, the last part's, handed the whole buffer's outcome: the first failed part's
-    /// error, and status, where a part before the last failed, else the last part's; and the GPU
-    /// times from the first part's start to the last part's end. The platform runs a queue's
-    /// completion handlers in its commit order, so every part before the last has been seen.
+    /// error, and status, where a part before the last failed, else the last part's; and GPU
+    /// times that start at the first part's start and span every part's GPU time summed, ending no
+    /// later than the last part's end (the module docs, "Its GPU times"). The platform runs
+    /// a queue's completion handlers in its commit order, so every part before the last has been
+    /// seen.
     pub(crate) fn merged(self: Arc<Self>, handler: CompletedHandler) -> CompletedHandler {
         Box::new(move |mut info: CompletedInfo| {
             let seen = std::mem::take(&mut *self.seen.lock());
@@ -254,8 +278,10 @@ impl Parts {
                 info.error = Some(error);
                 info.status = CommandBufferStatus::ERROR;
             }
-            if let (Some(start), Some((_, end))) = (seen.gpu_start, info.gpu_times_ns) {
-                info.gpu_times_ns = Some((start.min(end), end));
+            if let (Some(first), Some((start, end))) = (seen.gpu_start, info.gpu_times_ns) {
+                let busy = seen.gpu_busy.saturating_add(end.saturating_sub(start));
+                let first = first.min(end);
+                info.gpu_times_ns = Some((first, first.saturating_add(busy).min(end)));
             }
             handler(info);
         })
@@ -344,8 +370,9 @@ mod tests {
         }
     }
 
-    /// The whole buffer's outcome: the first failed part's error, and the GPU times from the
-    /// first part's start to the last part's end.
+    /// The whole buffer's outcome: the first failed part's error, and GPU times that start at the
+    /// first part's start and span the parts' GPU time summed, no later than the last part's end:
+    /// the gaps between parts, where the GPU waited for the walk, are not the buffer's.
     #[test]
     fn a_buffer_s_outcome_is_all_its_parts() {
         let outcome = |parts: [CompletedInfo; 3]| {
@@ -368,15 +395,34 @@ mod tests {
             error: Some(error(code)),
             gpu_times_ns: Some((start, end)),
         };
-        assert_eq!(outcome([ok(10, 20), ok(25, 40), ok(45, 60)]), ok(10, 60));
+        assert_eq!(
+            outcome([ok(10, 20), ok(25, 40), ok(45, 60)]),
+            ok(10, 50),
+            "10 + 15 + 15 of GPU time, from the first part's start"
+        );
         assert_eq!(
             outcome([ok(10, 20), failed(25, 40, 8), failed(45, 60, 3)]),
-            failed(10, 60, 8),
+            failed(10, 50, 8),
             "the first failed part's error"
         );
         assert_eq!(
             outcome([ok(10, 20), ok(25, 40), failed(45, 60, 3)]),
-            failed(10, 60, 3)
+            failed(10, 50, 3)
+        );
+        assert_eq!(
+            outcome([ok(10, 30), ok(20, 45), ok(40, 60)]),
+            ok(10, 60),
+            "parts that overlap end no later than the last part"
+        );
+        let untimed = CompletedInfo {
+            status: CommandBufferStatus::COMPLETED,
+            error: None,
+            gpu_times_ns: None,
+        };
+        assert_eq!(
+            outcome([untimed.clone(), ok(30, 40), ok(50, 60)]),
+            ok(30, 50),
+            "a part with no GPU times adds none"
         );
     }
 }

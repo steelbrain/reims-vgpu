@@ -2740,8 +2740,13 @@ commit. Each outcome the new design allows is one of those two:
   last commit is met at the first part, so the walk never waits between
   parts. The parts run in their order on the queue, as one buffer's encoders
   do. The buffer's handlers, records, ticket and commit marks are its last
-  part's, and its outcome is all of them: the first failed part's error, the
-  first part's GPU start, the last part's GPU end. While a buffer's parts are
+  part's, and its outcome is all of them: the first failed part's error, and
+  GPU times that start at the first part's start and span the parts' GPU time
+  summed, never ending after the last part's end (`decode/split.rs`, "Its GPU
+  times": the GPU's waits between parts are for the host's walk, which a
+  Mac's GPU, handed the whole buffer at its commit, never has; one buffer on
+  both x86 Macs spans its encoders' GPU time summed, and macOS's compositor
+  reads a buffer's GPU times). While a buffer's parts are
   out, from its first part's commit to its last, no other command buffer of
   its context is committed (each waits at its commit, never at its walk), and
   the context's range messages that come are carried out after its last

@@ -6957,8 +6957,9 @@ mod tests {
 
     /// A command buffer of three render passes walked long is committed in three parts as it is
     /// walked, and is one command buffer to the guest: one `CB_SCHEDULED` and one `CB_COMPLETE`,
-    /// after its last part's completion, with the GPU times from its first part's start to its
-    /// last part's end, and the error of a part that failed.
+    /// after its last part's completion, with GPU times from its first part's start that span its
+    /// parts' GPU time summed ([`super::super::split`], "Its GPU times"), and the error of a part
+    /// that failed.
     #[test]
     fn a_buffer_walked_long_is_committed_in_parts_with_one_outcome() {
         use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
@@ -6996,7 +6997,8 @@ mod tests {
         let r = records.lock()[0];
         assert_eq!(
             (r.cb_obj_id, r.gpu_start_ns, r.gpu_end_ns, r.status),
-            (300, 10, 60, RGFX_CB_OK)
+            (300, 10, 50, RGFX_CB_OK),
+            "10 + 15 + 15 of GPU time, from the first part's start"
         );
         // A part that fails fails the command buffer, whose later parts complete as they do.
         let message = command_buffer_message(301, 31, &ops);
