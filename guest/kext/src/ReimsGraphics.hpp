@@ -70,9 +70,13 @@ public:
 	IOReturn setStartupDisplayMode(IODisplayModeID displayMode, IOIndex depth) override;
 	IOReturn getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	                                     IOTimingInformation *info) override;
+	// IODisplay: a mode's valid, safe and default flags, which IOFramebuffer gives in place of
+	// those getInformationForDisplayMode answers (modeFlags).
+	IOReturn connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
+	                      IOOptionBits *flags) override;
 
-	// IOFramebuffer: the timings the OS programs from the display's EDID, under the
-	// framebuffer's kIOFBTimingRangeKey. The driver takes a timing whose size and rate are a
+	// IOFramebuffer: the timings the OS programs, under the framebuffer's
+	// kIOFBTimingRangeKey. The driver takes a timing whose size and rate are a
 	// mode the device lists, and lists the programmed ones in place of its own.
 	IOReturn validateDetailedTiming(void *description, IOByteCount descripSize) override;
 	IOReturn setDetailedTimings(OSArray *array) override;
@@ -86,8 +90,8 @@ public:
 	IOReturn setAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
 	                                   uintptr_t value) override;
 
-	// IOFramebuffer: the display's EDID, made by the driver from the display's modes
-	// (makeEdid), which IODisplay reads for the display's identity.
+	// IOFramebuffer: the display's EDID, made by the driver from the display's native mode
+	// (makeEdid), which IODisplay reads for the display's identity and size.
 	bool hasDDCConnect(IOIndex connectIndex) override;
 	IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
 	                     IOOptionBits options, UInt8 *data, IOByteCount *length) override;
@@ -130,8 +134,6 @@ public:
 	bool isConsoleDevice() override;
 	IOReturn setCLUTWithEntries(IOColorEntry *colors, UInt32 index, UInt32 numEntries,
 	                            IOOptionBits options) override;
-	IOReturn connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
-	                      IOOptionBits *flags) override;
 	// And the properties processes read of it.
 	using IOFramebuffer::copyProperty;
 	OSObject *copyProperty(const OSSymbol *aKey) const override;
@@ -274,9 +276,8 @@ private:
 
 	// A mode's timing: the active size with reduced blanking (VESA CVT's second reduced
 	// blanking: a fixed 80-pixel horizontal blank and at least 460 us of vertical blank),
-	// its pixel clock in 10 kHz steps, as an EDID carries it. The EDID and
-	// getTimingInfoForDisplayMode both give it, so IODisplay and WindowServer find the
-	// driver's modes among the display's.
+	// its pixel clock in 10 kHz steps, as an EDID carries it. getTimingInfoForDisplayMode
+	// gives it.
 	struct Timing {
 		UInt64 pixelClock;
 		UInt32 hActive, hBlank, hFront, hSync;
@@ -284,18 +285,19 @@ private:
 	};
 	static void timingFor(const Mode &mode, Timing *timing);
 
-	// The display's EDID: a base block, then DisplayID extension blocks listing every mode,
-	// since a mode's pixel clock can be past the base block's limit. makeEdid fills block
-	// `index` (0 the base) and returns false past the last. Call with stateLock held.
+	// The display's EDID: one base block, with no timings. makeEdid fills block `index` (0,
+	// the base) and returns false past it. Call with stateLock held.
 	static constexpr UInt32 kEdidBlockBytes = 128;
-	static constexpr UInt32 kEdidModesPerBlock = 5;
-	static constexpr UInt32 kEdidMaxExtensions = (kMaxModes + kEdidModesPerBlock - 1) / kEdidModesPerBlock;
-	UInt32 edidExtensionCount() const;
 	bool makeEdid(UInt32 index, UInt8 *block) const;
 
 	static UInt32 refreshMhzOf(const IODetailedTimingInformationV2 &timing);
+	// The device's preferred mode, the display's native one; `mode` where the device lists
+	// none. Call with stateLock held.
+	Mode nativeMode(const Mode &mode) const;
 	// The physical size of a mode's display, in millimetres, as the EDID gives it.
 	void imageSize(const Mode &mode, UInt16 *width, UInt16 *height) const;
+	// The IODisplayModeInformation flags of a mode, the preferred one or not.
+	static UInt32 modeFlags(const Mode &mode, bool preferred);
 
 	// One of IOFramebuffer's interrupt registrations.
 	struct Interrupt {

@@ -31,6 +31,11 @@ struct RgfxMode {
 	uint32_t width;
 	uint32_t height;
 	uint32_t refreshMhz;
+
+	// Whether WindowServer may run the mode HiDPI, at half its points each way
+	// (kDisplayModeValidForHiResFlag, ReimsGraphics::modeFlags): a mode at least 2880 pixels
+	// wide, which the EDID gives at 220 pixels per inch, whose pixels halve exactly.
+	bool hiDpi() const { return width >= 2880 && width % 2 == 0 && height % 2 == 0; }
 };
 
 template <typename Timing, uint32_t Max> struct RgfxDisplayModes {

@@ -185,6 +185,21 @@ void idsStayWithTheirModes()
 	check(m.modes[1].id == window, "the mode set's mode takes back its ID");
 }
 
+// HiDPI is for modes at least 2880 pixels wide whose pixels halve exactly: the window's on a
+// host screen at twice its points, and never one of an odd size, which WindowServer would run
+// at half pixels.
+void hiDpiModesHalveExactly()
+{
+	check(RgfxMode{0, 2880, 1800, 60000}.hiDpi(), "2880x1800");
+	check(RgfxMode{0, 3840, 2160, 60000}.hiDpi(), "3840x2160");
+	check(kWindow.hiDpi(), "the window's 3840x2400");
+	check(!RgfxMode{0, 2878, 1800, 60000}.hiDpi(), "not below 2880 pixels wide");
+	check(!kOffered.hiDpi(), "not the 1920x1080 offered before the window draws");
+	check(!RgfxMode{0, 3841, 2161, 60000}.hiDpi(), "not an odd width and height");
+	check(!RgfxMode{0, 3662, 2039, 60000}.hiDpi(), "not an odd height");
+	check(!RgfxMode{0, 3663, 2040, 60000}.hiDpi(), "not an odd width");
+}
+
 // A mode or depth the framebuffer does not hold is answered as Apple's paravirtual framebuffer
 // answers it: kIOReturnUnsupportedMode for the pixel information, kIOReturnError elsewhere.
 void anUnknownModeIsAnsweredAsApplesFramebufferDoes()
@@ -211,6 +226,7 @@ int main()
 	aChangeBetweenTheCurrentModeAndTheList();
 	aChangeAfterTheStartupModeIsSet();
 	idsStayWithTheirModes();
+	hiDpiModesHalveExactly();
 	anUnknownModeIsAnsweredAsApplesFramebufferDoes();
 	std::printf("display_modes_test: OK (%d checks)\n", checks);
 	return 0;

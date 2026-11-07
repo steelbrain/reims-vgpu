@@ -855,17 +855,43 @@ UInt32 ReimsGraphics::refreshMhzOf(const IODetailedTimingInformationV2 &t)
 	return total ? static_cast<UInt32>((t.pixelClock * 1000 + total / 2) / total) : 0;
 }
 
-void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) const
+ReimsGraphics::Mode ReimsGraphics::nativeMode(const Mode &m) const
 {
-	// The EDID's size, from the preferred mode.
 	Mode native = m;
 	for (UInt32 i = 0; i < modeSet.modeCount; i++) {
 		if (modeSet.modes[i].id == modeSet.preferredId)
 			native = modeSet.modes[i];
 	}
+	return native;
+}
+
+void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) const
+{
+	// The EDID's size, from the preferred mode.
+	Mode native = nativeMode(m);
 	UInt32 ppi = native.width >= 2880 ? 220 : 110;
 	*width = static_cast<UInt16>((native.width * 254 + ppi * 5) / (ppi * 10));
 	*height = static_cast<UInt16>((native.height * 254 + ppi * 5) / (ppi * 10));
+}
+
+// A mode's information flags: valid and safe; the preferred mode is the default and the
+// display's native one; and a mode RgfxMode::hiDpi takes is valid for HiDPI
+// (kDisplayModeValidForHiResFlag). WindowServer then lists the mode at half its points each
+// way as well, drawn at all its pixels, and without the flag it lists no HiDPI mode at all.
+// Measured on the x86-64 guest, macOS 26.7.2: a native 3840x2160 started HiDPI, looking like
+// 1920x1080; a native 3200x1800 started at 1x and offered 1600x900 HiDPI, which kept to the
+// next boot once chosen. A mode whose pixels do not halve exactly has no HiDPI one; the host
+// offers this framebuffer even modes, since with a native 3841x2161 the guest never brought
+// its display up, with the flag or without it (CoreGraphics listed no mode, and the
+// framebuffer's mode was set again every 10 seconds).
+UInt32 ReimsGraphics::modeFlags(const Mode &m, bool preferred)
+{
+	UInt32 flags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
+	if (preferred)
+		flags |= kDisplayModeDefaultFlag | kDisplayModeNativeFlag;
+	if (m.hiDpi())
+		flags |= kDisplayModeValidForHiResFlag;
+	return flags;
 }
 
 UInt32 ReimsGraphics::strideFor(UInt32 width)
@@ -1537,7 +1563,7 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	info->nominalHeight = m.height;
 	info->refreshRate = static_cast<IOFixed1616>((static_cast<UInt64>(m.refreshMhz) << 16) / 1000);
 	info->maxDepthIndex = 0;
-	info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (preferred ? kDisplayModeDefaultFlag : 0);
+	info->flags = modeFlags(m, preferred);
 	info->imageWidth = mmWide;
 	info->imageHeight = mmHigh;
 	return kIOReturnSuccess;
@@ -1630,7 +1656,7 @@ IOReturn ReimsGraphics::setStartupDisplayMode(IODisplayModeID displayMode, IOInd
 	return ok ? kIOReturnSuccess : noSuchMode(RgfxModeCall::SetStartupMode);
 }
 
-// Each mode is a fixed-rate panel's, with the timing its EDID entry gives.
+// Each mode is a fixed-rate panel's, with the timing timingFor gives it.
 IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
                                                     IOTimingInformation *info)
 {
@@ -1679,6 +1705,36 @@ IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	return kIOReturnSuccess;
 }
 
+// IOFramebuffer gives a mode's valid, safe and default flags from IODisplay, which asks this
+// (IOFramebuffer::extGetInformationForDisplayMode and IODisplay::getConnectFlagsForDisplayMode,
+// read from IOGraphics' published source): unanswered, every mode is valid and safe alone. Of
+// the modes valid and safe, IOGraphicsLib's default is the one flagged default, else the one of
+// the most pixels (IOKitUser's published source), and WindowServer takes the default when the
+// display changes. Measured on the x86-64 guest, macOS 26.7.2, with no flag answered here: once
+// the window shrank, the mode set, which stays listed until another is set, was the default, so
+// the guest kept it. The preferred mode is the default, and a mode the framebuffer does not list
+// is left to IODisplay.
+IOReturn ReimsGraphics::connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
+                                     IOOptionBits *flags)
+{
+	Mode m;
+	IOLockLock(stateLock);
+	bool ok = modeSet.modeFor(displayMode, &m);
+	bool preferred = ok && modeSet.isPreferred(m);
+	IOLockUnlock(stateLock);
+	IOReturn r = kIOReturnUnsupported;
+	if (connectIndex != 0 || !flags)
+		r = kIOReturnBadArgument;
+	else if (ok) {
+		*flags = modeFlags(m, preferred) & kDisplayModeSafetyFlags;
+		r = kIOReturnSuccess;
+	}
+	FBTRACE(48, "connectFlags conn %d mode %d -> 0x%x flags 0x%x", static_cast<int>(connectIndex),
+	        static_cast<int>(displayMode), r,
+	        r == kIOReturnSuccess ? static_cast<unsigned>(*flags) : 0);
+	return r;
+}
+
 // A timing the device can show: a listed mode's size and rate, unscaled and progressive. For a
 // mode description, the description's mode information is filled in.
 IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount descripSize)
@@ -1720,7 +1776,7 @@ IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount de
 		info.nominalHeight = t->verticalActive;
 		info.refreshRate = static_cast<IOFixed1616>((static_cast<UInt64>(refresh) << 16) / 1000);
 		info.maxDepthIndex = 0;
-		info.flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (preferred ? kDisplayModeDefaultFlag : 0);
+		info.flags = modeFlags(host, preferred);
 		info.imageWidth = mmWide;
 		info.imageHeight = mmHigh;
 	}
@@ -1916,12 +1972,6 @@ void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
 	t->pixelClock = (clock + 5000) / 10000 * 10000;
 }
 
-UInt32 ReimsGraphics::edidExtensionCount() const
-{
-	UInt32 n = (modeSet.modeCount + kEdidModesPerBlock - 1) / kEdidModesPerBlock;
-	return n ? n : 1;
-}
-
 namespace {
 
 // The EDID's identity: our own three-letter PNP manufacturer ID "RVG", packed as five
@@ -1929,9 +1979,6 @@ namespace {
 constexpr UInt16 kEdidManufacturer = ((('R' - '@') << 10) | (('V' - '@') << 5) | ('G' - '@'));
 constexpr UInt16 kEdidProduct = 0x5247;
 constexpr char kEdidName[] = "Reims Display";
-
-// The largest pixel clock a base block's detailed timing holds: 16 bits of 10 kHz.
-constexpr UInt64 kEdidDetailedClockMax = 0xffffull * 10000;
 
 // The size, in millimetres, the EDID gives a mode's display: at 220 pixels per inch for a
 // mode at least 2880 pixels wide, as a high-density panel, and 110 otherwise.
@@ -1957,90 +2004,17 @@ constexpr UInt32 chroma(UInt32 thousandths)
 
 } // namespace
 
-// Block 0 is the base block: the identity, sRGB colour, the preferred mode's detailed timing
-// when its clock fits one (else the largest mode whose does), and the product name. Each
-// extension is a DisplayID 1.3 section with a type I timing block of up to five modes, the
-// preferred mode first and marked so.
+// The EDID is one base block: the identity, sRGB colour, the display's size and the product
+// name, with no timings. The display's modes are the driver's own (getDisplayModes), whose
+// flags give the default and native mode and the HiDPI ones (modeFlags). For a timing an EDID
+// lists, the OS programs a mode of its own, which lacked the HiDPI flag the driver gave it, and
+// WindowServer started on that mode, at 1x (measured on the x86-64 guest, macOS 26.7.2).
 bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 {
-	UInt32 extensions = edidExtensionCount();
-	if (index > extensions)
+	if (index > 0)
 		return false;
 	bzero(b, kEdidBlockBytes);
-
-	// The modes, the preferred one first.
-	Mode order[kMaxModes];
-	UInt32 n = 0;
-	for (UInt32 i = 0; i < modeSet.modeCount; i++) {
-		if (modeSet.modes[i].id == modeSet.preferredId)
-			order[n++] = modeSet.modes[i];
-	}
-	for (UInt32 i = 0; i < modeSet.modeCount; i++) {
-		if (modeSet.modes[i].id != modeSet.preferredId)
-			order[n++] = modeSet.modes[i];
-	}
-
-	if (index > 0) {
-		UInt32 first = (index - 1) * kEdidModesPerBlock;
-		UInt32 count = first < n ? n - first : 0;
-		if (count > kEdidModesPerBlock)
-			count = kEdidModesPerBlock;
-		b[0] = 0x70; // DisplayID
-		b[1] = 0x13; // version 1.3
-		b[3] = 0x00; // an extension section
-		b[4] = 0x00; // no further sections
-		UInt32 at = 5;
-		if (count) {
-			b[at++] = 0x03; // type I detailed timings
-			b[at++] = 0x00;
-			b[at++] = static_cast<UInt8>(count * 20);
-			for (UInt32 j = 0; j < count; j++, at += 20) {
-				Timing t;
-				timingFor(order[first + j], &t);
-				UInt32 clock = static_cast<UInt32>(t.pixelClock / 10000) - 1;
-				UInt8 *d = b + at;
-				d[0] = static_cast<UInt8>(clock);
-				d[1] = static_cast<UInt8>(clock >> 8);
-				d[2] = static_cast<UInt8>(clock >> 16);
-				// Preferred (bit 7) for the first mode of the first block; aspect undefined.
-				d[3] = static_cast<UInt8>((index == 1 && j == 0 ? 0x80 : 0x00) | 0x08);
-				UInt16 fields[8] = {
-				    static_cast<UInt16>(t.hActive - 1), static_cast<UInt16>(t.hBlank - 1),
-				    // Bit 15: positive horizontal sync.
-				    static_cast<UInt16>((t.hFront - 1) | 0x8000), static_cast<UInt16>(t.hSync - 1),
-				    static_cast<UInt16>(t.vActive - 1), static_cast<UInt16>(t.vBlank - 1),
-				    static_cast<UInt16>(t.vFront - 1), static_cast<UInt16>(t.vSync - 1),
-				};
-				for (UInt32 f = 0; f < 8; f++) {
-					d[4 + f * 2] = static_cast<UInt8>(fields[f]);
-					d[5 + f * 2] = static_cast<UInt8>(fields[f] >> 8);
-				}
-			}
-		}
-		b[2] = static_cast<UInt8>(at - 5);
-		UInt8 sum = 0;
-		for (UInt32 i = 1; i < at; i++)
-			sum = static_cast<UInt8>(sum + b[i]);
-		b[at] = static_cast<UInt8>(-sum);
-		edidChecksum(b);
-		return true;
-	}
-
-	// The base block's detailed timing: the preferred mode, or the largest that fits.
-	const Mode *detailed = nullptr;
-	for (UInt32 i = 0; i < n; i++) {
-		Timing t;
-		timingFor(order[i], &t);
-		if (t.pixelClock > kEdidDetailedClockMax || order[i].width > 4095 || order[i].height > 4095)
-			continue;
-		if (!detailed || i == 0 ||
-		    static_cast<UInt64>(order[i].width) * order[i].height >
-		        static_cast<UInt64>(detailed->width) * detailed->height)
-			detailed = &order[i];
-		if (i == 0)
-			break;
-	}
-	const Mode &native = n ? order[0] : modeSet.current;
+	const Mode native = nativeMode(modeSet.current);
 
 	static const UInt8 header[8] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
 	memcpy(b, header, sizeof(header));
@@ -2062,9 +2036,7 @@ bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 	b[21] = static_cast<UInt8>((edidMillimetres(native.width, native.width) + 5) / 10);
 	b[22] = static_cast<UInt8>((edidMillimetres(native.height, native.width) + 5) / 10);
 	b[23] = 120;  // gamma 2.2
-	// RGB 4:4:4, sRGB the default colour space, and the first timing the preferred one
-	// where it is.
-	b[24] = static_cast<UInt8>(0x04 | (detailed == &order[0] ? 0x02 : 0x00));
+	b[24] = 0x04; // RGB 4:4:4, sRGB the default colour space
 
 	// sRGB's primaries and D65 white, 10 bits each.
 	const UInt32 rx = chroma(640), ry = chroma(330), gx = chroma(300), gy = chroma(600);
@@ -2083,37 +2055,11 @@ bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 	for (UInt32 i = 38; i < 54; i++)
 		b[i] = 0x01;
 
+	// The descriptors: a dummy, the product name, padded as the descriptor asks, and two
+	// dummies.
 	UInt8 *d = b + 54;
-	if (detailed) {
-		Timing t;
-		timingFor(*detailed, &t);
-		UInt32 clock = static_cast<UInt32>(t.pixelClock / 10000);
-		UInt32 hmm = edidMillimetres(t.hActive, native.width);
-		UInt32 vmm = edidMillimetres(t.vActive, native.width);
-		d[0] = static_cast<UInt8>(clock);
-		d[1] = static_cast<UInt8>(clock >> 8);
-		d[2] = static_cast<UInt8>(t.hActive);
-		d[3] = static_cast<UInt8>(t.hBlank);
-		d[4] = static_cast<UInt8>(((t.hActive >> 8) << 4) | (t.hBlank >> 8));
-		d[5] = static_cast<UInt8>(t.vActive);
-		d[6] = static_cast<UInt8>(t.vBlank);
-		d[7] = static_cast<UInt8>(((t.vActive >> 8) << 4) | (t.vBlank >> 8));
-		d[8] = static_cast<UInt8>(t.hFront);
-		d[9] = static_cast<UInt8>(t.hSync);
-		d[10] = static_cast<UInt8>(((t.vFront & 0xf) << 4) | (t.vSync & 0xf));
-		d[11] = static_cast<UInt8>(((t.hFront >> 8) << 6) | ((t.hSync >> 8) << 4) |
-		                           ((t.vFront >> 4) << 2) | (t.vSync >> 4));
-		d[12] = static_cast<UInt8>(hmm);
-		d[13] = static_cast<UInt8>(vmm);
-		d[14] = static_cast<UInt8>(((hmm >> 8) << 4) | ((vmm >> 8) & 0xf));
-		// Digital separate sync, vertical negative, horizontal positive.
-		d[17] = 0x1a;
-	} else {
-		d[3] = 0x10; // a dummy descriptor
-	}
+	d[3] = 0x10;
 	d += 18;
-
-	// The product name, padded as the descriptor asks.
 	d[3] = 0xfc;
 	UInt32 len = sizeof(kEdidName) - 1;
 	for (UInt32 i = 0; i < 13; i++)
@@ -2123,7 +2069,7 @@ bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 	d += 18;
 	d[3] = 0x10;
 
-	b[126] = static_cast<UInt8>(extensions);
+	b[126] = 0; // no extensions
 	edidChecksum(b);
 	return true;
 }
@@ -2137,7 +2083,7 @@ bool ReimsGraphics::hasDDCConnect(IOIndex connectIndex)
 	return r;
 }
 
-// Block 1 is the base block and 2 on its extensions, as IODisplay asks for them.
+// Block 1 is the base block, as IODisplay asks for it; there is no other.
 IOReturn ReimsGraphics::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
                                     IOOptionBits options, UInt8 *data, IOByteCount *length)
 {
@@ -2548,15 +2494,6 @@ IOReturn ReimsGraphics::setCLUTWithEntries(IOColorEntry *colors, UInt32 index, U
 {
 	IOReturn r = super::setCLUTWithEntries(colors, index, numEntries, options);
 	FBTRACE(4, "setCLUTWithEntries %u+%u -> 0x%x", index, numEntries, r);
-	return r;
-}
-
-IOReturn ReimsGraphics::connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
-                                     IOOptionBits *flags)
-{
-	IOReturn r = super::connectFlags(connectIndex, displayMode, flags);
-	FBTRACE(48, "connectFlags conn %d mode %d -> 0x%x flags 0x%x", static_cast<int>(connectIndex),
-	        static_cast<int>(displayMode), r, flags ? static_cast<unsigned>(*flags) : 0);
 	return r;
 }
 
