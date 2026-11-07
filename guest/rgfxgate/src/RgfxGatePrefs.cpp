@@ -5,11 +5,13 @@
 // the sessions reach our bundle's video driver. On every normal boot the
 // install thread checks the domain's file and sets the key where it is not
 // true, keeping the file's other keys (rgfx_gva_pref.h): an absent file is
-// made, an XML plist edited in place; a binary or unreadable one is logged and
-// left. The edited text must parse, as the kernel's XML parser reads it, to a
-// dict with the key true and every other key kept, or nothing is written. The
-// write runs in kernel context, as root, through the ordinary VFS path:
-// /Library/Preferences is no SIP-restricted path.
+// made, an XML plist edited in place, a binary one (cfprefsd's, as `defaults
+// delete` leaves it) edited with every object kept; an unreadable one is logged
+// and left. An edited XML plist must parse, as the kernel's XML parser reads
+// it, to a dict with the key true and every other key kept, and an edited
+// binary one must read back so (rgfx_gva_pref_binary_kept), or nothing is
+// written. The write runs in kernel context, as root, through the ordinary VFS
+// path: /Library/Preferences is no SIP-restricted path.
 #include <Headers/kern_file.hpp>
 #include <Headers/kern_util.hpp>
 
@@ -31,8 +33,11 @@ static const char kGvaPrefPath[] = "/Library/Preferences/com.apple.AppleGVA.plis
 static const char kGvaKey[] = "gvaForceAMDKE";
 // A larger file is no preferences file of AppleGVA's: left as it is.
 static constexpr size_t kMaxPrefBytes = 64 * 1024;
-// Room the edit adds at most: a key and its value.
+// Room the edit adds at most: a key and its value. A binary plist's edit also
+// copies its top-level dict's references and writes its offset table again, in
+// entries one byte wider at most: within 4 times the file, and the room.
 static constexpr size_t kEditRoom = 512;
+static constexpr size_t kBinaryGrowth = 4;
 
 // The dict `bytes` holds as an XML plist, retained; nullptr where it holds
 // none.
@@ -95,15 +100,16 @@ void keepVideoPreference() {
 		}
 	}
 	const char *in = reinterpret_cast<const char *>(file);
+	bool binary = in != nullptr && rgfx_starts(in, size, 0, "bplist");
 	OSDictionary *before = nullptr;
-	size_t cap = size + kEditRoom;
+	size_t cap = (binary ? kBinaryGrowth * size : size) + kEditRoom;
 	char *out = static_cast<char *>(IOMalloc(cap));
 	size_t outLen = 0;
 	RgfxGvaPref verdict = kRgfxGvaPrefUnreadable;
 	if (out != nullptr)
 		verdict = rgfx_gva_pref_edit(in, size, out, cap, &outLen);
 	// An XML file the kernel's parser does not read as a dict is left too.
-	if (verdict == kRgfxGvaPrefWrite && in != nullptr) {
+	if (verdict == kRgfxGvaPrefWrite && in != nullptr && !binary) {
 		before = parseDict(in, size);
 		if (before == nullptr)
 			verdict = kRgfxGvaPrefUnreadable;
@@ -113,13 +119,14 @@ void keepVideoPreference() {
 		DBGLOG("rgfxgate", "AppleGVA preferences already set");
 		break;
 	case kRgfxGvaPrefBinary:
-		SYSLOG("rgfxgate", "AppleGVA preferences are a binary plist; left");
+		SYSLOG("rgfxgate", "AppleGVA preferences are a binary plist the edit cannot take; left");
 		break;
 	case kRgfxGvaPrefUnreadable:
 		SYSLOG("rgfxgate", "AppleGVA preferences are no XML plist with a dict; left");
 		break;
 	case kRgfxGvaPrefWrite:
-		if (!editKept(before, out, outLen)) {
+		if (binary ? !rgfx_gva_pref_binary_kept(file, size, reinterpret_cast<uint8_t *>(out), outLen)
+		           : !editKept(before, out, outLen)) {
 			SYSLOG("rgfxgate", "AppleGVA preferences edit does not read back; left");
 			break;
 		}
