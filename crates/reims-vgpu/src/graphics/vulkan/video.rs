@@ -36,9 +36,18 @@
 //!     link idles down under a load of decodes alone; a CPU lock of the surface then downloads it
 //!     in 1 to 5 ms (12.4 MB).
 //!   - Elsewhere it lands in the surface's pages, through a buffer of the decoder's over the
-//!     buffer's import ([`ImportedPlanes`]), copied in the decode's own submission where the GPU
-//!     shares the CPU's memory. The write is bracketed for the dirty log ([`host_write`]) while
-//!     the planes are held.
+//!     buffer's import ([`ImportedPlanes`]), where the GPU shares the CPU's memory: copied in the
+//!     decode's own submission where the decode queue's family copies, and on a lent runtime
+//!     queue ([`RuntimeQueue`]) where it decodes alone, as each submission's copy out on a GPU of
+//!     its own memory without a reserved queue is. **Measured** with Mesa 26.2.6 (2026-11-07):
+//!     the video-decode family of a Radeon 780M (RADV) and of an Iris Xe (ANV, whose video
+//!     queues `ANV_DEBUG=video-decode` makes) decodes alone, with no transfer, graphics or
+//!     compute. The 780M could decode into the pages themselves (its decode output and DPB may
+//!     be distinct, and an output may be linear over imported host memory), but the decode
+//!     writes whole coded rows (1088 of a 1080-row frame), past the luma plane the guest's
+//!     driver asks AppleGVA for, which ends at the frame's last row; the Iris's output is its
+//!     DPB picture, tiled. The write is bracketed for the dirty log ([`host_write`]) while the
+//!     planes are held.
 //! - **Order.** A decode starts as the host takes the command buffer that encodes it, after the
 //!   session's earlier decodes on the same queue. The session's event, which the command buffer
 //!   waits for, is then signalled by a submission of no work that waits for the decode and its
@@ -184,17 +193,30 @@ impl DeviceVideo {
         }
         // On a GPU of its own memory, a queue of the runtime's families for the copies out,
         // which reach the runtime's buffers: the reserved one, else a lent one. A lent one stays
-        // shared: the copies are bulk, and a queue that lent its `VkQueue` never moves.
+        // shared: the copies are bulk, and a queue that lent its `VkQueue` never moves. On a GPU
+        // that shares the CPU's memory, the copies out into the surfaces' pages go with the
+        // decodes where the decode family copies, and to a lent queue where it decodes alone.
         let unified = device
             .identity_caps()
             .flags
             .has_unified_memory
             .unwrap_or(false);
+        // SAFETY: the physical device is the instance's.
+        let families = unsafe {
+            handles
+                .instance
+                .get_physical_device_queue_family_properties(handles.physical_device)
+        };
+        let copies = vk::QueueFlags::TRANSFER | vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
+        let decode_copies = usize::try_from(queue.family)
+            .ok()
+            .and_then(|family| families.get(family))
+            .is_some_and(|family| family.queue_flags.intersects(copies));
         let reserved = (!unified)
             .then(|| handles.reserved_queues.first())
             .flatten()
             .filter(|reserved| handles.queue_families.contains(&reserved.family));
-        let lent = (!unified && reserved.is_none())
+        let lent = (reserved.is_none() && (!unified || !decode_copies))
             .then(|| match raw.new_command_queue() {
                 Ok(queue) => {
                     // SAFETY: the closure only reads the family; it submits nothing.
@@ -208,18 +230,7 @@ impl DeviceVideo {
             })
             .flatten()
             .filter(|lent| handles.queue_families.contains(&lent.family));
-        // SAFETY: the physical device is the instance's.
-        let families = unsafe {
-            handles
-                .instance
-                .get_physical_device_queue_family_properties(handles.physical_device)
-        };
         let codecs = decoded_codecs(&handles, queue.family, raw);
-        let copies = vk::QueueFlags::TRANSFER | vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
-        let decode_copies = usize::try_from(queue.family)
-            .ok()
-            .and_then(|family| families.get(family))
-            .is_some_and(|family| family.queue_flags.intersects(copies));
         if reserved.is_none() && lent.is_none() && !decode_copies {
             log::info!(
                 "hardware video: the video-decode family {} copies nothing, which a picture's \
@@ -248,7 +259,8 @@ impl DeviceVideo {
                     handles.physical_device,
                 ),
         };
-        let caches = reserved.is_some() || lent.is_some();
+        // The device caches are a GPU of its own memory's: elsewhere a picture lands in the pages.
+        let caches = !unified && (reserved.is_some() || lent.is_some());
         let events = EventKind::of(lent.is_some());
         let copy_queue = match (reserved, &lent) {
             (Some(_), _) => "the reserved queue",
