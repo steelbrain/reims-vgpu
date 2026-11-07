@@ -1,12 +1,18 @@
 // gl_probe: what OpenGL gives a guest. No window: every context is offscreen and draws into a
 // framebuffer object of its own, which the probe reads back.
-//   gl_probe [-x DIR] [-X DIR] [-n FRAMES]
+//   gl_probe [-x DIR] [-X DIR] [-c CLASS] [-n FRAMES]
 //     -x DIR   before any context is made, wraps the device's newFunctionWith{GL,GLCore,GLES}IR:
 //              members so each writes the IR it is given (DIR/ir-N.bin, the bytes from the u32
 //              length that heads them; DIR/in-N.bin, the inputs description) and then answers as
-//              the device does.
+//              the device does; the class of the functions it answers so each variant's plugin
+//              data is written (DIR/plugin-N-M.bin); and the device's
+//              newRenderPipelineStateWithDescriptor:options:reflection:error: so each pipeline's
+//              GL properties, its reflection's arguments and plugin return data are printed
+//              and the return data written (DIR/render-K-*.bin).
 //     -X DIR   as -x, but the wrapped members answer a function object of the probe's, whose
 //              newFunctionWithPluginData:bitcodeType: writes DIR/plugin-N-M.bin and answers nil.
+//     -c CLASS the device class -x and -X wrap (default RgfxMetalDevice), such as another Mac's
+//              Metal device class under gl_redirect.
 //     -n N     frames the timed loop of each context draws (default 200).
 // It prints:
 //   - each IOAccelerator service: its class, registry ID, IOGLBundleName and MetalPluginName;
@@ -48,6 +54,7 @@ static double now_ms(void) {
 // --- the IR dump -------------------------------------------------------------------------------
 
 static NSString *g_dumpDir;
+static const char *g_dumpClass;
 static BOOL g_stubFunctions;
 static int g_irCount;
 
@@ -94,6 +101,94 @@ static void dump_ir(int n, const char *which, const void *ir, id inputs, NSUInte
 }
 @end
 
+// -x: the functions the device answers keep their IR's number, and their class's
+// newFunctionWithPluginData:bitcodeType: writes each variant's plugin data before it answers.
+static IMP wrap_method(Class cls, SEL sel, IMP wrapper);
+static char kIrKey;
+typedef id (*PluginImp)(id, SEL, NSData *, NSUInteger);
+static PluginImp g_origPlugin;
+static int g_pluginCount;
+
+static id wrap_plugin(id self, SEL cmd, NSData *data, NSUInteger bitcodeType) {
+	NSNumber *n = objc_getAssociatedObject(self, &kIrKey);
+	int m = g_pluginCount++;
+	printf("  IR %d: newFunctionWithPluginData: %lu bytes, bitcodeType %lu (variant %d)\n",
+	       n ? n.intValue : -1, (unsigned long)data.length, (unsigned long)bitcodeType, m);
+	write_bytes([NSString stringWithFormat:@"plugin-%d-%d.bin", n ? n.intValue : -1, m], data.bytes,
+	            data.length);
+	id v = g_origPlugin(self, cmd, data, bitcodeType);
+	if (v) objc_setAssociatedObject(v, &kIrKey, @(n ? n.intValue : -1), OBJC_ASSOCIATION_RETAIN);
+	printf("    variant: %s\n", v ? class_getName([v class]) : "nil");
+	return v;
+}
+
+static void note_function(id f, int n) {
+	printf("    function: %s\n", f ? class_getName([f class]) : "nil");
+	if (!f) return;
+	objc_setAssociatedObject(f, &kIrKey, @(n), OBJC_ASSOCIATION_RETAIN);
+	SEL sel = sel_registerName("newFunctionWithPluginData:bitcodeType:");
+	if (!g_origPlugin && [f respondsToSelector:sel]) {
+		g_origPlugin = (PluginImp)wrap_method([f class], sel, (IMP)wrap_plugin);
+		printf("    wrapped -[%s newFunctionWithPluginData:bitcodeType:]\n", class_getName([f class]));
+	}
+}
+
+// -x also writes what each render pipeline the renderer makes asks: the descriptor's GL
+// properties, and the reflection's plugin return data.
+typedef id (*RenderImp)(id, SEL, id, NSUInteger, __autoreleasing id *, NSError *__autoreleasing *);
+static RenderImp g_origRender;
+static int g_renderCount;
+
+static void print_key(id object, NSString *key) {
+	@try {
+		id v = [object valueForKey:key];
+		printf(" %s=%s", key.UTF8String, v ? [[v description] UTF8String] : "nil");
+	} @catch (NSException *e) {
+		printf(" %s=(none)", key.UTF8String);
+	}
+}
+
+static id wrap_render(id self, SEL cmd, id desc, NSUInteger options, __autoreleasing id *reflection,
+                      NSError *__autoreleasing *error) {
+	int n = g_renderCount++;
+	printf("  render pipeline %d: options 0x%lx\n   ", n, (unsigned long)options);
+	for (NSString *k in @[ @"openGLModeEnabled", @"logicOperationEnabled", @"logicOperation",
+	                       @"sampleCoverage", @"sampleMask", @"pointCoordLowerLeft",
+	                       @"pointSizeOutputVS", @"twoSideEnabled", @"depthStencilWriteDisabled",
+	                       @"alphaToCoverageEnabled", @"alphaToOneEnabled", @"clipDistanceEnableMask",
+	                       @"rasterSampleCount", @"inputPrimitiveTopology", @"rasterizationEnabled",
+	                       @"alphaTestEnabled", @"pointSmoothEnabled", @"needsCustomBorderColorSamplers",
+	                       @"pluginData" ])
+		print_key(desc, k);
+	printf("\n");
+	NSNumber *vs = objc_getAssociatedObject([desc valueForKey:@"vertexFunction"], &kIrKey);
+	NSNumber *fs = objc_getAssociatedObject([desc valueForKey:@"fragmentFunction"], &kIrKey);
+	printf("    vertex IR %d, fragment IR %d\n", vs ? vs.intValue : -1, fs ? fs.intValue : -1);
+	__autoreleasing id local = nil;
+	__autoreleasing id *out = reflection ? reflection : &local;
+	id state = g_origRender(self, cmd, desc, options, out, error);
+	id r = *out;
+	printf("    state %s, reflection %s%s\n", state ? class_getName([state class]) : "nil",
+	       r ? class_getName([r class]) : "nil",
+	       error && *error ? [NSString stringWithFormat:@", %@", *error].UTF8String : "");
+	for (NSString *k in @[ @"vertexPluginReturnData", @"fragmentPluginReturnData", @"pluginReturnData" ]) {
+		if (![r respondsToSelector:NSSelectorFromString(k)]) continue;
+		NSData *d = [r valueForKey:k];
+		printf("    %s: %lu bytes\n", k.UTF8String, (unsigned long)d.length);
+		if (d.length) write_bytes([NSString stringWithFormat:@"render-%d-%@.bin", n, k], d.bytes, d.length);
+	}
+	if ([r respondsToSelector:NSSelectorFromString(@"performanceStatistics")])
+		printf("    performanceStatistics: %s\n",
+		       [[[r valueForKey:@"performanceStatistics"] description] UTF8String]);
+	for (NSString *k in @[ @"vertexArguments", @"fragmentArguments" ]) {
+		if (![r respondsToSelector:NSSelectorFromString(k)]) continue;
+		for (id a in [r valueForKey:k])
+			printf("    %s: %s\n", k.UTF8String,
+			       [[[a description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "] UTF8String]);
+	}
+	return state;
+}
+
 typedef id (*IrImp3)(id, SEL, void *, id, NSUInteger);
 typedef id (*IrImp2)(id, SEL, void *, NSUInteger);
 static IrImp3 g_orig3[3];
@@ -110,8 +205,9 @@ static id answer_ir(int which, id device, SEL cmd, void *ir, id inputs, NSUInteg
 		f.device = device;
 		return f;
 	}
-	return inputs || g_orig2[which] == NULL ? g_orig3[which](device, cmd, ir, inputs, type)
-	                                        : g_orig2[which](device, cmd, ir, type);
+	id f = g_orig3[which](device, cmd, ir, inputs, type);
+	note_function(f, n);
+	return f;
 }
 
 #define IR_WRAPPERS(i)                                                                          \
@@ -128,11 +224,23 @@ static id answer_ir(int which, id device, SEL cmd, void *ir, id inputs, NSUInteg
 			f.device = self;                                                                  \
 			return f;                                                                         \
 		}                                                                                     \
-		return g_orig2[i](self, cmd, ir, type);                                               \
+		id f = g_orig2[i](self, cmd, ir, type);                                               \
+		note_function(f, n);                                                                  \
+		return f;                                                                             \
 	}
 IR_WRAPPERS(0)
 IR_WRAPPERS(1)
 IR_WRAPPERS(2)
+
+// Wraps `sel` on `cls` with `wrapper`, answering the implementation it had: a method `cls`
+// inherits is added to `cls` itself, so its base and the base's other subclasses keep theirs.
+static IMP wrap_method(Class cls, SEL sel, IMP wrapper) {
+	Method m = class_getInstanceMethod(cls, sel);
+	if (!m) return NULL;
+	IMP old = method_getImplementation(m);
+	if (!class_addMethod(cls, sel, wrapper, method_getTypeEncoding(m))) method_setImplementation(m, wrapper);
+	return old;
+}
 
 static void wrap_device_class(Class cls) {
 	const char *three[3] = {"newFunctionWithGLIR:inputsDescription:functionType:",
@@ -143,13 +251,15 @@ static void wrap_device_class(Class cls) {
 	IMP w3[3] = {(IMP)wrap3_0, (IMP)wrap3_1, (IMP)wrap3_2};
 	IMP w2[3] = {(IMP)wrap2_0, (IMP)wrap2_1, (IMP)wrap2_2};
 	for (int i = 0; i < 3; i++) {
-		Method m3 = class_getInstanceMethod(cls, sel_registerName(three[i]));
-		Method m2 = class_getInstanceMethod(cls, sel_registerName(two[i]));
-		if (m3) g_orig3[i] = (IrImp3)method_setImplementation(m3, w3[i]);
-		if (m2) g_orig2[i] = (IrImp2)method_setImplementation(m2, w2[i]);
-		printf("  wrapped -[%s %s]%s, -[%s %s]%s\n", class_getName(cls), three[i], m3 ? "" : " (none)",
-		       class_getName(cls), two[i], m2 ? "" : " (none)");
+		g_orig3[i] = (IrImp3)wrap_method(cls, sel_registerName(three[i]), w3[i]);
+		g_orig2[i] = (IrImp2)wrap_method(cls, sel_registerName(two[i]), w2[i]);
+		printf("  wrapped -[%s %s]%s, -[%s %s]%s\n", class_getName(cls), three[i],
+		       g_orig3[i] ? "" : " (none)", class_getName(cls), two[i], g_orig2[i] ? "" : " (none)");
 	}
+	if (!g_stubFunctions)
+		g_origRender = (RenderImp)wrap_method(
+		    cls, sel_registerName("newRenderPipelineStateWithDescriptor:options:reflection:error:"),
+		    (IMP)wrap_render);
 }
 
 // --- inventory ---------------------------------------------------------------------------------
@@ -410,14 +520,16 @@ static void run_profile(const char *name, CGLOpenGLProfile profile, BOOL acceler
 int main(int argc, char **argv) {
 	@autoreleasepool {
 		int frames = 200, c;
-		while ((c = getopt(argc, argv, "x:X:n:")) != -1) {
+		while ((c = getopt(argc, argv, "x:X:n:c:")) != -1) {
 			if (c == 'x' || c == 'X') {
 				g_dumpDir = @(optarg);
 				g_stubFunctions = c == 'X';
+			} else if (c == 'c') {
+				g_dumpClass = optarg;
 			} else if (c == 'n') {
 				frames = atoi(optarg);
 			} else {
-				fprintf(stderr, "usage: gl_probe [-x DIR | -X DIR] [-n FRAMES]\n");
+				fprintf(stderr, "usage: gl_probe [-x DIR | -X DIR] [-c CLASS] [-n FRAMES]\n");
 				return 2;
 			}
 		}
@@ -429,8 +541,9 @@ int main(int argc, char **argv) {
 			                          withIntermediateDirectories:YES
 			                                           attributes:nil
 			                                                error:NULL];
-			Class cls = objc_getClass("RgfxMetalDevice");
-			printf("IR dump into %s (%s)\n", g_dumpDir.UTF8String, cls ? "RgfxMetalDevice" : "no RgfxMetalDevice");
+			const char *name = g_dumpClass ? g_dumpClass : "RgfxMetalDevice";
+			Class cls = objc_getClass(name);
+			printf("IR dump into %s (%s%s)\n", g_dumpDir.UTF8String, cls ? "" : "no ", name);
 			if (cls) wrap_device_class(cls);
 		}
 		list_renderers();
