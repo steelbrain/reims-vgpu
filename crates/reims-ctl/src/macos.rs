@@ -110,7 +110,7 @@ pub fn graphics_for(found: &[Macos]) -> Option<Graphics> {
 
 /// Why reims-vgpu's device has no driver on `m`, a macOS its kexts don't load on: "older than
 /// macOS 26.4, the first release reims-vgpu's macOS drivers run on".
-fn too_old_or_new(m: &Macos) -> String {
+pub fn too_old_or_new(m: &Macos) -> String {
     let (min, max) = prebuilt::bounds().unwrap_or(((0, 0), (u32::MAX, u32::MAX)));
     match m.darwin() {
         Some(d) if d > max => format!(

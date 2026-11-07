@@ -568,26 +568,31 @@ fn private_dir(d: &Path) -> Result<()> {
 }
 
 /// What a start of a stopped VM does to its settings and OpenCore image first, before [`start`]:
-/// for an x86-64 VM on reims-vgpu, its disk's macOS ([`crate::macos::settle`]), which may save
-/// the graphics its settings named none of; then, for one on another device whose image loads
-/// reims-vgpu's guest kexts, as an image made for reims-vgpu does after a change of graphics,
-/// a new image without them ([`crate::opencore::renew`]). An image reims-vgpu's kexts lack is
-/// warned of instead (`warnings`): the image may be one the user gave, which a new one would not
-/// carry over. Notes go to `progress`, the new image's with what the kexts left in the guest;
-/// warnings are returned, for a start that still runs.
+/// an update's change that waited while it ran ([`crate::migrate::at_start`]); for an x86-64 VM
+/// on reims-vgpu, its disk's macOS ([`crate::macos::settle`]), which may save
+/// the graphics its settings named none of; then a new image ([`crate::opencore::renew`]) for
+/// one on another device whose image loads reims-vgpu's guest kexts, as an image made for
+/// reims-vgpu does after a change of graphics, without them; and for one on reims-vgpu whose
+/// image holds other builds of them, as one an older reims-ctl made does after an update, with
+/// this reims-ctl's ([`crate::opencore::holds_other_guest_kexts`]). An image reims-vgpu's kexts
+/// lack is warned of instead (`warnings`): the image may be one the user gave, which a new one
+/// would not carry over. Notes go to `progress`, the new image's with what the kexts left in the
+/// guest; warnings are returned, for a start that still runs.
 pub fn prepare(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Vec<String> {
     let mut w = Vec::new();
     if running(vm) {
         return w;
     }
+    // An update's change that waited while the VM ran (crate::migrate).
+    crate::migrate::at_start(vm, progress);
     match crate::macos::settle(vm) {
         Ok(crate::macos::Settled::Kept) => {}
         Ok(crate::macos::Settled::Saved(note)) => progress(&note),
         Ok(crate::macos::Settled::Warn(s)) => w.push(s),
         Err(e) => w.push(format!("{e:#}")),
     }
+    let name = vm.name().to_string();
     if crate::opencore::holds_unused_guest_kexts(vm) {
-        let name = vm.name().to_string();
         let graphics = vm.config.graphics().name();
         progress(&format!(
             "its OpenCore image loads reims-vgpu's macOS drivers, which {graphics} has no use \
@@ -599,6 +604,19 @@ pub fn prepare(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Vec<String> {
                 "{name}'s OpenCore image loads reims-vgpu's macOS drivers, which {graphics} has no \
                  use for, and a new one without them couldn't be made ({e:#}): reims-ctl \
                  update-opencore {name} makes it"
+            )),
+        }
+    } else if crate::opencore::holds_other_guest_kexts(vm) {
+        progress(
+            "its OpenCore image holds other builds of reims-vgpu's macOS drivers than this \
+             reims-ctl carries: making it a new one with these, presenting the same Mac",
+        );
+        match crate::opencore::renew(vm, None, progress) {
+            Ok(s) => progress(s.strip_prefix(&format!("{name}: ")).unwrap_or(&s)),
+            Err(e) => w.push(format!(
+                "{name}'s OpenCore image holds other builds of reims-vgpu's macOS drivers than \
+                 this reims-ctl carries, and a new one with these couldn't be made ({e:#}): \
+                 reims-ctl update-opencore {name} makes it"
             )),
         }
     }

@@ -10,6 +10,7 @@ mod host;
 mod install;
 mod logs;
 mod macos;
+mod migrate;
 mod opencore;
 mod paths;
 mod prebuilt;

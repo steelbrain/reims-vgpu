@@ -126,6 +126,7 @@ pub enum Cmd {
     /// Zip a VM's logs, settings and the host's details into Downloads, for a bug report
     Report { name: String },
     /// Update reims-ctl and its QEMU from the checkout it was installed from
+    #[command(after_help = UPDATE_HELP)]
     Update {
         /// Switch the checkout to this channel first; later updates stay on it
         #[arg(long, value_enum)]
@@ -172,11 +173,23 @@ go to the guest as a US keyboard's and a tablet's.
 Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl and Shift \
 buttons on the top row hold that key for the next key or click.";
 
+const UPDATE_HELP: &str = "\
+After an update, the new reims-ctl's first run (its restart from the interface, or the next \
+command) updates the VMs an older reims-ctl made, once, with a line for each VM. An x86-64 VM \
+whose settings name no graphics, as those an older reims-ctl made on apple-gfx do, moves to \
+reims-vgpu's own GPU device if the macOS on its disk runs its drivers (macOS 26.4 or later), and \
+stays on apple-gfx if not; the choice is saved in its settings. Its OpenCore image is made again \
+for it, presenting the same Mac and without the ported drivers older images held, and the old \
+image is kept beside it as <image>.pre-migration-1. A VM that is running then is updated at its \
+next start. One that can't be updated stays as it was, and its line says why. A VM whose settings \
+name graphics keeps them.";
+
 const UPDATE_OPENCORE_HELP: &str = "\
 The new image is made for the VM's graphics. On reims-vgpu it holds the macOS drivers of \
-reims-vgpu's own GPU device that this reims-ctl carries, which an image made for apple-gfx, or by \
-an older reims-ctl, lacks or holds other builds of: make it again after an update of reims-ctl, as \
-reims-ctl start warns. A change of graphics with reims-ctl set or the interface's edit form makes it \
+reims-vgpu's own GPU device that this reims-ctl carries. A start makes the image again where it \
+holds other builds of them, as one an older reims-ctl made does after an update of reims-ctl; an \
+image that lacks them, as one made for apple-gfx does, stays as it is, which reims-ctl start warns \
+of: make it again here. A change of graphics with reims-ctl set or the interface's edit form makes it \
 again where the VM is stopped, and a start on other graphics than reims-vgpu makes one without its \
 drivers where the image holds them. An image an older reims-util made also lacks what a newer one's \
 carries, such as ReimsVgpu.kext, which macOS 26 needs on apple-gfx for a display wider \
@@ -450,6 +463,15 @@ pub fn main(cli: Cli) -> Result<i32> {
         None | Some(Cmd::Tui) => return crate::tui::run().map(|_| 0),
         Some(c) => c,
     };
+    // The first run after an update brings the VMs an older reims-ctl made up to date, telling
+    // of it on stderr, so a command's output stays as it is; reims-ctl's own commands, which the
+    // installer and reims-ctl run, leave it to the user's.
+    if !matches!(
+        cmd,
+        Cmd::VulkanProbe | Cmd::VzInstall { .. } | Cmd::VzLatest | Cmd::RecordInstall { .. }
+    ) {
+        crate::migrate::run(&mut |s| eprintln!("{s}"));
+    }
     match cmd {
         Cmd::List { json } => list(json)?,
         Cmd::Create(a) => create_cmd(*a, host)?,

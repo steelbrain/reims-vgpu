@@ -39,7 +39,19 @@ use std::time::{Duration, Instant};
 
 pub fn run() -> Result<()> {
     let host = Host::current();
+    // The first run after an update brings the VMs an older reims-ctl made up to date: what it
+    // changed shows first.
+    let mut updated = Vec::new();
+    crate::migrate::run(&mut |s| updated.push(s.to_string()));
     let mut app = App::new(host)?;
+    if !updated.is_empty() {
+        app.overlay = Some(Overlay::Text {
+            title: "reims-ctl is updated  (Esc close)".into(),
+            lines: updated,
+            scroll: 0,
+            kind: TextKind::Help,
+        });
+    }
     let mut terminal = ratatui::init();
     app.kitty_keys = ratatui::crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     let kitty_keys = app.kitty_keys;
