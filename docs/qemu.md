@@ -1859,6 +1859,12 @@ that what it shows is the change's:
   teardown after the run's work is done (exit 139), which is QEMU's own,
   and a lone GPU hang the driver reports (an NVIDIA Xid) that the same boot
   run again does not show. A crash while the guest runs is in scope.
+- **A known class, counted apart**: on `apple-gfx-pci`, the `exec faulted`
+  warnings of a guest without Metal's error mode key, from icon services
+  that end as they start ("x86-64 macOS guests: Metal's error mode"): 4 in
+  a 26.7.2 guest's first 126 s on a Radeon 780M, each with a `gpuRestart`
+  report, and none in 98 s once the key was set (2026-11-07). A boot that
+  needs a quiet log writes the key in its own overlay.
 
 ## Running a vmapple VM
 

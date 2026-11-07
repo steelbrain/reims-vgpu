@@ -112,7 +112,11 @@ An output image is made as `SurfaceSpec` says: NV12 or P010
 transfer source and destination, and shared between the graphics, decode
 and copy families. Where the device decodes into an output beside the
 DPB picture (`DPB_AND_OUTPUT_DISTINCT`), the decode writes the output,
-which then also has the decode-destination usage and the profile list.
+which then also has the decode-destination usage and the profile list,
+where the device lists decode targets with the output's usages
+(`Capabilities::outputs_are_targets`); else the decode writes the
+session's scratch image, which one copy takes into the output, as for
+buffer planes.
 Where the output and the DPB picture coincide (`DPB_AND_OUTPUT_COINCIDE`,
 all the 5080 offers), the decode writes the DPB picture and one GPU copy
 of both planes takes the picture into the output: in the decode's own
@@ -449,11 +453,19 @@ reports with standalone repros were written for NVIDIA):
   it, come with the integration on metal2vulkan's device.
 - Only H.264 and H.265. AV1 and VP9 decode on the same session and
   picture machinery with their own std structures.
-- The distinct path, decoding straight into the output image or into the
-  scratch image for a buffer, is built but unmeasured: the 5080 offers
-  coincident pictures alone.
-- Only NVIDIA measured. RADV and ANV, which expose Vulkan Video on the
-  AMD and Intel hosts, are unchecked, the encoders included.
+- Decoding straight into an output image is built but unmeasured: the
+  5080 and an Iris Xe offer coincident pictures alone, and a Radeon 780M
+  distinct ones whose decode targets no copy writes, so there each picture
+  goes through the scratch image.
+- Decode is measured on NVIDIA, RADV and ANV; the encoders on NVIDIA
+  alone. With Mesa 26.2.6 (2026-11-07), `tools/h264-check.sh` and
+  `tools/h265-check.sh` pass on a Radeon 780M (68 and 191 checks). On an
+  Iris Xe (ANV, whose video queues `ANV_DEBUG=video-decode` makes) H.264
+  passes (68 checks) and H.265 fails 26 of 182: each decode that reads its
+  stream in place crashes the tool or loses the device, with GPU hangs in
+  the kernel's log; dependent slice segments decode wrong
+  (`kvz-720p-dependent`); and a stream of 16 DPB pictures is refused (the
+  device has 16 slots and 8 active references).
 - Encode: no B pictures as references (no pyramid), no long-term
   references, temporal layers, intra refresh or regions of interest; no
   HRD parameters in the VUI (the 5080 claims no HRD compliance);
