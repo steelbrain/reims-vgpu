@@ -31,7 +31,13 @@
 //! streams of cjpeg's and jpegtran's, 16x16 to 640x480, all decoded wrong,
 //! a 640x480 one that decoded right among them once jpegtran gave it
 //! restart intervals. Into an NV12 surface of ours it was wrong again. So
-//! no route decodes grey right on it, and grey is refused there. The trials
+//! no route decodes grey right on it, and grey is refused there. Its grey
+//! decodes also fault the GPU: that day, processes decoding jpeg-check.sh's
+//! grey cases (development's engine, into Y800, and diagnostic builds of
+//! the routes above) made UVD fault reading outside its mappings 10 times
+//! (`VM fault ... read from 'UVD'`), and 3 times hung UVD's ring until the
+//! kernel reset the GPU, VRAM lost; those that refused grey made none in
+//! 792 engine starts, each with the trial's 32x32 grey decode. The trials
 //! pass on the RX 7900 XTX and the Radeon 780M, whose VCN decodes every
 //! sampling it lists.
 //!
