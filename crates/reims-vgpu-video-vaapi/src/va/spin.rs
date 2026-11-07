@@ -52,6 +52,10 @@
 //! 780M (528,000 and 1,500,000 reads in 500 ms). A spin held 3 s had amdgpu
 //! reset the RX 7900 XTX's graphics ring at 2 s.
 //!
+//! A render node another driver than amdgpu runs gets no spin ([`NoSpin::Unheld`]): no limit of
+//! amdgpu's bounds it there, and the tests of a held GPU say so and end (on iHD, measured on Iris
+//! Xe under i915 2026-11-07, every one of them failed instead, at amdgpu's missing parameter).
+//!
 //! **It stops at once on a reset.** While a spin lives, a thread reads the
 //! kernel's log (`journalctl -k -f`), and at any amdgpu line of a reset, a
 //! timeout or a hang it lets every spin go and says so
@@ -487,6 +491,17 @@ impl Spin {
     /// The shader, ready on `ring` of the GPU of the render node at `node`.
     pub(crate) fn new(node: &str, ring: Ring) -> Result<Self, NoSpin> {
         let (major, minor) = render_node(node).ok_or_else(|| format!("no render node {node}"))?;
+        // The spin is bounded by amdgpu's limit for a job on a ring (module docs): a GPU another
+        // driver runs has no such limit, so no spin is made for it.
+        let driver = std::fs::read_link(format!("/sys/dev/char/{major}:{minor}/device/driver"))
+            .ok()
+            .and_then(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "no driver the kernel names".to_owned());
+        if driver != "amdgpu" {
+            return Err(NoSpin::Unheld(format!(
+                "{node} is {driver}'s, and a spin is held under amdgpu's lockup_timeout alone"
+            )));
+        }
         let limit = std::fs::read_to_string("/sys/module/amdgpu/parameters/lockup_timeout")
             .map_err(|e| format!("no amdgpu.lockup_timeout: {e}"))?;
         if !limit_allows(limit.trim()) {
