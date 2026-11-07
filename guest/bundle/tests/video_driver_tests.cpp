@@ -251,6 +251,14 @@ const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction)
 // A device whose linear textures of the planes' formats take 64 bytes.
 uint32_t outputPlaneAlignment(uint32_t sampleBytes) { return sampleBytes == 1 || sampleBytes == 2 ? 64 : 0; }
 
+// The host's layout in place for every codec: none, but where a check sets it.
+RgfxVideoOutputLayout g_layout = {};
+RgfxVideoOutputLayout outputLayout(uint32_t codec)
+{
+	return codec == RGFX_VIDEO_CODEC_H264 || codec == RGFX_VIDEO_CODEC_HEVC ? g_layout
+	                                                                        : RgfxVideoOutputLayout{};
+}
+
 Session *openSession(uint32_t, uint32_t)
 {
 	if (g_opensBeforeFailure == 0)
@@ -656,6 +664,57 @@ void checkLayoutFromHost()
 	}
 }
 
+// Where the host decodes in place (a layout of 16 by 16 at 256 bytes, RADV's), a surface is
+// asked for as AMD's driver on a Mac answers (measured on a Radeon Pro 5300M, macOS 26.7.1):
+// the planes' rows the frame's height rounded up to whole macroblocks (chroma half), the widths
+// the frame's, one pitch for both planes from the width rounded up likewise, at the larger of
+// the host's 256 bytes and the textures' 64, each plane at that alignment. P010 takes two bytes
+// a sample. A layout of an H.264 session holds for HEVC alike; a function of another codec, and
+// a host with no layout, keeps the frame's own rows.
+void checkLayoutInPlace()
+{
+	rgfx::video::g_layout = {{16, 16}, 256, 0};
+	struct Want {
+		uint64_t sub;
+		uint32_t fourcc, width, height, chromaWidth, rows, pitch;
+	};
+	for (const Want &w : {Want{kCodecH264, 'NV12', 1920, 1080, 960, 1088, 2048},
+	                      Want{kCodecHevc, 'NV12', 1920, 1080, 960, 1088, 2048},
+	                      Want{kCodecH264, 'NV12', 1918, 1078, 959, 1088, 2048},
+	                      Want{kCodecH264, 'NV12', 1280, 720, 640, 720, 1280},
+	                      Want{kCodecH264, 'NV12', 640, 360, 320, 368, 768},
+	                      Want{kCodecHevc, 'NV12', 1000, 562, 500, 576, 1024},
+	                      Want{kCodecHevc, 'NV12', 3840, 2160, 1920, 2160, 3840},
+	                      Want{kCodecHevc, 'NV12', 176, 144, 88, 144, 256},
+	                      Want{kCodecHevc, 'x420', 1920, 1080, 960, 1088, 3840},
+	                      Want{kCodecHevc, 'xf20', 1367, 767, 684, 768, 2816},
+	                      Want{0x10, 'NV12', 1920, 1080, 960, 1080, 1920}}) {
+		uint32_t widths[2] = {}, heights[2] = {}, pitches[2] = {}, alignments[2] = {};
+		PixelRequirement pr = {};
+		pr.function_id = kFunctionDecode;
+		pr.sub_id = (uint32_t)w.sub;
+		pr.width = w.width;
+		pr.height = w.height;
+		pr.fourcc = w.fourcc;
+		pr.planes = 2;
+		pr.widths = widths;
+		pr.heights = heights;
+		pr.pitches = pitches;
+		pr.alignments = alignments;
+		CHECK(call(kGetPixelBufferInfo, &pr) == kOk, "GetPixelBufferInfo of %.4s", (const char *)&w.fourcc);
+		CHECK(widths[0] == w.width && heights[0] == w.rows && widths[1] == w.chromaWidth &&
+		          heights[1] == w.rows / 2,
+		      "%.4s %ux%u in place: planes %ux%u and %ux%u", (const char *)&w.fourcc, w.width, w.height,
+		      widths[0], heights[0], widths[1], heights[1]);
+		const uint32_t alignment = w.sub == 0x10 ? 64 : 256;
+		for (int p = 0; p < 2; p++)
+			CHECK(pitches[p] == w.pitch && alignments[p] == alignment,
+			      "%.4s %ux%u in place, plane %d: pitch %u alignment %u", (const char *)&w.fourcc, w.width,
+			      w.height, p, pitches[p], alignments[p]);
+	}
+	rgfx::video::g_layout = {};
+}
+
 // Get/SetContextParameter's records.
 struct ContextParam {
 	uint32_t function_id;
@@ -857,6 +916,7 @@ int main()
 	checkTileInfo();
 	checkTileInfoRefused();
 	checkLayoutFromHost();
+	checkLayoutInPlace();
 	std::printf("video_driver_tests: %d checks passed\n", g_checks);
 	return 0;
 }

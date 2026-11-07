@@ -1311,6 +1311,54 @@ void test_state_labels()
 	drainRing(fx.ring);
 }
 
+// The rows a surface holds for a plane run from its first byte to the next plane's, or to the
+// allocation's end for the last, at its pitch: a 1080p NV12 surface AppleGVA extends by 8 rows
+// below holds 1088 luma rows before its chroma plane and 544 chroma rows to its end; planes out
+// of order take the nearest after each. A texture over a surface whose GPU view is a copy holds
+// its planes' own rows alone: 0, as for a texture over no surface.
+void test_surface_rows_held()
+{
+	const uint64_t nv12[] = {0x1000, 0x1000 + 1088 * 2048};
+	const uint64_t end = nv12[1] + 544 * 2048 + 100;
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 0, 2048, end) == 1088);
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 1, 2048, end) == 544);
+	const uint64_t swapped[] = {nv12[1], nv12[0]};
+	CHECK(rgfxPlaneRowsHeld(swapped, 2, 1, 2048, end) == 1088);
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 2, 2048, end) == 0);
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 0, 0, end) == 0);
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 1, 2048, nv12[1]) == 0);
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	@autoreleasepool {
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(surface != nullptr);
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		d.storageMode = MTLStorageModeShared;
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:d
+		                                                           iosurface:surface
+		                                                               plane:0
+		                                                              region:&region
+		                                                              device:nil
+		                                                          serializer:&fx.ser];
+		CHECK(t != nil && rgfxIOSurfaceRowsHeld(t) == 0);
+		CHECK(rgfxIOSurfaceRowsHeld(nil) == 0);
+		t = nil;
+		CFRelease(surface);
+	}
+	drainRing(fx.ring);
+}
+
 // A shared event answers itself as its IOSurface shared event, as Metal's; a plain event answers
 // no such member.
 void test_shared_event_answers()
@@ -1341,6 +1389,7 @@ void rgfxResourceTests()
 	test_buffer_linear_textures();
 	test_texture_compression();
 	test_surface_copies_lock_the_surface_first();
+	test_surface_rows_held();
 	test_texture_answers();
 	test_device_texture_addresses_hold_their_bytes();
 	test_sampler_answers();

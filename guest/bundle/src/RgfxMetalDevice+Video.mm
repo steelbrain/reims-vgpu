@@ -7,6 +7,7 @@
 #import "RgfxIOSurface.h"
 #import "RgfxMetalDevice.h"
 
+#include <algorithm>
 #include <mutex>
 #include <unordered_map>
 
@@ -32,6 +33,10 @@ RgfxMetalDevice *processDevice()
 // one: an HEIF grid's canvas has one for each of its tiles but the first), past which the least
 // recently used goes: more than a decoder's pool holds, so a session's own surfaces stay.
 constexpr size_t kOutputsKept = 64;
+// The largest granularity and alignment a host's layout in place may name
+// (RgfxVideoOutputLayout): a CTU, and a page.
+constexpr uint32_t kMaxGranularity = 64;
+constexpr uint32_t kMaxLayoutAlignment = 4096;
 
 // The bitstream buffers a session uses in turn: a picture waits for the command buffer that
 // last read its buffer only where this many are in flight.
@@ -56,6 +61,9 @@ struct rgfx::video::Session {
 		id<MTLTexture> luma;
 		id<MTLTexture> chroma;
 		uint64_t lastUse;
+		// The luma rows the surface holds for a frame of its own (the op's output_rows), 0 for
+		// a tile or a surface whose view is a copy.
+		uint32_t rows = 0;
 	};
 	std::unordered_map<uint64_t, Output> outputs;
 	uint64_t uses = 0;
@@ -85,6 +93,26 @@ const RgfxVideoCodecCaps *rgfx::video::hostCodec(uint32_t codec, uint32_t direct
 			return &caps->codecs[i];
 	}
 	return nullptr;
+}
+
+RgfxVideoOutputLayout rgfx::video::outputLayout(uint32_t codec)
+{
+	RgfxMetalDevice *device = processDevice();
+	if (device == nil)
+		return {};
+	const RgfxVideoCaps *caps = [device videoCaps];
+	for (uint32_t i = 0; i < caps->codec_count && i < RGFX_VIDEO_CAPS_CODECS; i++) {
+		if (caps->codecs[i].codec != codec || caps->codecs[i].direction != RGFX_VIDEO_DECODE)
+			continue;
+		const RgfxVideoOutputLayout layout = caps->layouts[i];
+		// Units of a few macroblocks, and an alignment of a power of two up to a page.
+		const bool fits = layout.granularity[0] != 0 && layout.granularity[0] <= kMaxGranularity &&
+		                  layout.granularity[1] != 0 && layout.granularity[1] <= kMaxGranularity &&
+		                  layout.alignment != 0 && layout.alignment <= kMaxLayoutAlignment &&
+		                  (layout.alignment & (layout.alignment - 1)) == 0;
+		return fits ? layout : RgfxVideoOutputLayout{};
+	}
+	return {};
 }
 
 uint32_t rgfx::video::outputPlaneAlignment(uint32_t sampleBytes)
@@ -279,6 +307,7 @@ void *rgfx::video::decode(Session *session, const Decode &decode)
 			return nullptr;
 	}
 	id<MTLTexture> luma, chroma;
+	uint32_t outputRows = 0;
 	{
 		std::lock_guard<std::mutex> hold(session->lock);
 		const uint64_t id = outputKey(decode.output, decode.x, decode.y);
@@ -308,11 +337,20 @@ void *rgfx::video::decode(Session *session, const Decode &decode)
 			                             (h + 1) / 2);
 			if (output.luma == nil || output.chroma == nil)
 				return nullptr;
+			// The rows the surface holds past the planes' own, where its view is its pages:
+			// the luma rows, and twice the chroma rows, the lesser; 0 where they are no more.
+			if (!inside) {
+				const uint64_t rows = std::min(rgfxIOSurfaceRowsHeld(output.luma),
+				                               2 * rgfxIOSurfaceRowsHeld(output.chroma));
+				if (rows > output.luma.height && rows <= UINT32_MAX)
+					output.rows = (uint32_t)rows;
+			}
 			it = session->outputs.emplace(id, output).first;
 		}
 		it->second.lastUse = ++session->uses;
 		luma = it->second.luma;
 		chroma = it->second.chroma;
+		outputRows = inside ? 0 : it->second.rows;
 	}
 	std::lock_guard<std::mutex> submit(session->submit);
 	id<MTLCommandBuffer> cb = [session->queue commandBuffer];
@@ -329,7 +367,8 @@ void *rgfx::video::decode(Session *session, const Decode &decode)
 	                                  bitstream:bitstream
 	                                    ofBytes:size
 	                                       luma:luma
-	                                     chroma:chroma];
+	                                     chroma:chroma
+	                                 outputRows:outputRows];
 	[cb commit];
 	session->bitstreams[(session->nextBitstream - 1) % kBitstreams].reader = cb;
 	{

@@ -212,6 +212,20 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t nowNs);
 /// WindowServer's does (RgfxIOSurface.mm): for the tests.
 void rgfxIOSurfaceKeepCountClients(bool on);
 
+/// The rows of a plane, `pitch` bytes apart from its first byte at `offsets[plane]`, that lie before
+/// the next of the `count` planes' first bytes (`offsets`, from the surface's base) and before
+/// `end` (the surface's allocation): the rows its surface holds for it, the rows it extends the
+/// plane by below (CoreVideo's extended pixels) among them. 0 for a plane past `count`, a pitch of
+/// 0, or a plane at or past `end`.
+uint64_t rgfxPlaneRowsHeld(const uint64_t *_Nonnull offsets, size_t count, size_t plane,
+                           uint64_t pitch, uint64_t end);
+
+/// The rows the GPU's view of the surface `texture` lies over holds for the texture's plane, from
+/// the plane's first byte at the plane's pitch (rgfxPlaneRowsHeld), where the view is the
+/// surface's own pages and `texture` is over its whole plane; 0 where the view is a copy (which
+/// holds each plane's own rows), `texture` lies inside its plane, or it is over no IOSurface.
+uint64_t rgfxIOSurfaceRowsHeld(__unsafe_unretained id _Nullable texture);
+
 /// Records on `enc` that its command buffer writes `texture`, when `texture` is one
 /// over an IOSurface or a view of one, through any views (otherwise nothing), and, where its
 /// view is a copy, that its commit syncs it (rgfxIOSurfaceSyncBeforeCommit).

@@ -1008,16 +1008,40 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		// in a canvas lands at its place, hevcTilePlace): luma of the frame's size, chroma of
 		// half, in whole pairs; each plane's first byte and pitch at the alignment its texture and
 		// the copy take, one pitch for both planes.
-		const uint32_t alignment = rgfx::video::outputPlaneAlignment(sampleBytes);
+		uint32_t alignment = rgfx::video::outputPlaneAlignment(sampleBytes);
 		if (alignment == 0)
 			return kUnsupported;
-		const uint32_t chromaWidth = (r->width + 1) / 2, chromaHeight = (r->height + 1) / 2;
-		const uint32_t row = r->width * sampleBytes > chromaWidth * 2 * sampleBytes
-		                         ? r->width * sampleBytes
-		                         : chromaWidth * 2 * sampleBytes;
+		// Where the host decodes the codec in place (outputLayout), what the decode writes: the
+		// coded picture's whole rows and columns, in the host's units, at its planes' alignment,
+		// as AMD's driver on a Mac answers (rows of whole macroblocks, at 256 bytes): the planes'
+		// rows those, the frame's width as it is, and AppleGVA extends the planes below the
+		// frame by the rows past it.
+		const uint32_t codec = r->sub_id == kCodecHevc   ? RGFX_VIDEO_CODEC_HEVC
+		                       : r->sub_id == kCodecH264 ? RGFX_VIDEO_CODEC_H264
+		                                                 : 0;
+		const RgfxVideoOutputLayout layout = rgfx::video::outputLayout(codec);
+		uint32_t codedWidth = r->width, codedHeight = r->height;
+		if (layout.granularity[0] != 0 && layout.granularity[1] != 0 && layout.alignment != 0) {
+			const auto roundUp = [](uint32_t v, uint32_t unit) { return (v + unit - 1) / unit * unit; };
+			codedWidth = roundUp(r->width, layout.granularity[0]);
+			codedHeight = roundUp(r->height, layout.granularity[1]);
+			// A multiple of both: the textures' and the host's.
+			uint32_t a = alignment, b = layout.alignment;
+			while (b != 0) {
+				const uint32_t t = a % b;
+				a = b;
+				b = t;
+			}
+			alignment = alignment / a * layout.alignment;
+		}
+		const uint32_t chromaWidth = (r->width + 1) / 2, chromaHeight = (codedHeight + 1) / 2;
+		const uint32_t codedChroma = (codedWidth + 1) / 2;
+		const uint32_t row = codedWidth * sampleBytes > codedChroma * 2 * sampleBytes
+		                         ? codedWidth * sampleBytes
+		                         : codedChroma * 2 * sampleBytes;
 		const uint32_t pitch = (row + alignment - 1) / alignment * alignment;
 		r->widths[0] = r->width;
-		r->heights[0] = r->height;
+		r->heights[0] = codedHeight;
 		r->widths[1] = chromaWidth;
 		r->heights[1] = chromaHeight;
 		for (int p = 0; p < 2; p++) {

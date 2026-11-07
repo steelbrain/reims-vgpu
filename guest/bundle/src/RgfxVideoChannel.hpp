@@ -38,6 +38,13 @@ const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction);
 /// no device of ours, or for another sample size.
 uint32_t outputPlaneAlignment(uint32_t sampleBytes);
 
+/// How the host lands a decode of `codec` in place, in an output surface's planes
+/// (RgfxVideoCaps::layouts): the granularity it writes whole coded rows and columns in, and the
+/// alignment of the planes it writes so. All zero where the host lands the codec's pictures by a
+/// copy of their crop alone, the layout is past what a surface takes, or the process has no device
+/// of ours.
+RgfxVideoOutputLayout outputLayout(uint32_t codec);
+
 /// A session on the host, its queue, and the textures it made over output surfaces.
 struct Session;
 
@@ -62,6 +69,8 @@ void forgetOutputs(Session *session);
 /// textures over the whole planes; at its place for an HEIF grid's tile in its canvas, through
 /// textures of its crop there, which lies inside the planes. A place off (0, 0) is of even
 /// samples, and each plane's first byte there is at the alignment outputPlaneAlignment answers.
+/// For a frame of its own, the op names the rows the surface's planes hold (output_rows), which
+/// the host may decode the whole coded picture into in place (outputLayout).
 struct Decode {
 	const uint8_t *bytes;
 	size_t size;

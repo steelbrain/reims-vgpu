@@ -202,7 +202,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Encodes the buffer's one encoder, a video encoder on the session `session`, of `codec`
 /// (RGFX_VIDEO_CODEC_*), holding one decode (RGFX_OP_VIDEO_DECODE_H264 or _H265): the access unit
 /// that is `bitstream`'s first `bytes` bytes, after the `size` bytes of parameter sets at
-/// `parameterSets`, into the surface `luma` and `chroma` lie over, which the buffer writes. The
+/// `parameterSets`, into the surface `luma` and `chroma` lie over, which the buffer writes, and
+/// whose planes hold `outputRows` luma rows (the op's output_rows; 0 for the textures' own). The
 /// video driver's (RgfxVideoChannel.hpp).
 - (void)rgfxEncodeVideoSession:(uint64_t)session
                          codec:(uint32_t)codec
@@ -211,7 +212,8 @@ NS_ASSUME_NONNULL_BEGIN
                      bitstream:(id<MTLBuffer>)bitstream
                        ofBytes:(uint64_t)bytes
                           luma:(id<MTLTexture>)luma
-                        chroma:(id<MTLTexture>)chroma;
+                        chroma:(id<MTLTexture>)chroma
+                    outputRows:(uint32_t)outputRows;
 
 @end
 

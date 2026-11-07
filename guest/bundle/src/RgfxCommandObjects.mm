@@ -1546,6 +1546,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                        ofBytes:(uint64_t)bytes
                           luma:(id<MTLTexture>)luma
                         chroma:(id<MTLTexture>)chroma
+                    outputRows:(uint32_t)outputRows
 {
 	_encoder->beginVideoPass(session);
 	const uint64_t bitstreamId = rgfxReads(_encoder, bitstream);
@@ -1559,6 +1560,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		b.bitstream_size = bytes;
 		b.luma_texture_obj_id = lumaId;
 		b.chroma_texture_obj_id = chromaId;
+		b.output_rows = outputRows;
 		_encoder->videoDecodeH265(b, parameterSets, size);
 	} else {
 		RgfxVideoOpDecodeH264 b = {};
@@ -1566,6 +1568,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		b.bitstream_size = bytes;
 		b.luma_texture_obj_id = lumaId;
 		b.chroma_texture_obj_id = chromaId;
+		b.output_rows = outputRows;
 		_encoder->videoDecodeH264(b, parameterSets, size);
 	}
 	_encoder->endEncoder();

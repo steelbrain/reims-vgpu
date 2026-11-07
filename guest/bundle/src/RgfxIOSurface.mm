@@ -1358,6 +1358,7 @@ void rgfxIOSurfaceKeepCountClients(bool on)
 
 @interface RgfxIOSurfaceTexture ()
 - (std::shared_ptr<RgfxSurfaceShadow>)rgfxShadow;
+- (uint64_t)rgfxOffsetInPlane;
 @end
 
 @implementation RgfxIOSurfaceTexture {
@@ -1514,6 +1515,12 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 	return _plane;
 }
 
+// Bytes from the plane's first byte to the texture's: 0 for a texture over its whole plane.
+- (uint64_t)rgfxOffsetInPlane
+{
+	return _offset;
+}
+
 // The bytes the texture takes: its copy of the surface in the region, or the surface's pages its
 // buffer lies over in place (SecurityAgent's RenderBox asks as it accounts a surface's texture).
 - (NSUInteger)allocatedSize
@@ -1650,6 +1657,39 @@ static void rgfxNoteSync(RgfxEncoder *enc, const std::shared_ptr<RgfxSurfaceShad
 		return;
 	view->syncedBy.store(stamp, std::memory_order_relaxed);
 	enc->noteSurfaceSync(view);
+}
+
+uint64_t rgfxPlaneRowsHeld(const uint64_t *offsets, size_t count, size_t plane, uint64_t pitch,
+                           uint64_t end)
+{
+	if (plane >= count || pitch == 0)
+		return 0;
+	const uint64_t first = offsets[plane];
+	for (size_t k = 0; k < count; k++) {
+		if (offsets[k] > first && offsets[k] < end)
+			end = offsets[k];
+	}
+	return end > first ? (end - first) / pitch : 0;
+}
+
+uint64_t rgfxIOSurfaceRowsHeld(__unsafe_unretained id texture)
+{
+	if (!RgfxIsResource(texture))
+		return 0;
+	__unsafe_unretained RgfxIOSurfaceTexture *root = ((RgfxResource *)texture)->_rgfxSurfaceRoot;
+	if (root == nil || root != texture)
+		return 0;
+	const std::shared_ptr<RgfxSurfaceShadow> &view = rgfxShadowOfRoot(root);
+	if (view == nullptr || !view->inPlace || [root rgfxOffsetInPlane] != 0)
+		return 0;
+	std::vector<uint64_t> offsets;
+	for (const ShadowPlane &p : view->planes)
+		offsets.push_back(p.offset);
+	const size_t plane = root.iosurfacePlane;
+	if (plane >= view->planes.size())
+		return 0;
+	return rgfxPlaneRowsHeld(offsets.data(), offsets.size(), plane, view->planes[plane].pitch,
+	                         IOSurfaceGetAllocSize(view->surface));
 }
 
 void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, __unsafe_unretained id texture)
