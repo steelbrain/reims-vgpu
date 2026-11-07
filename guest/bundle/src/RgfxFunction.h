@@ -122,9 +122,17 @@ typedef struct {
 /// The shadow `rgfxSetShadow:` set; nil for none.
 - (nullable id<MTLFunction>)rgfxShadow;
 
-/// The shadow, made where there is none of the library's shadow by entry point, for a function made
-/// with no constant values (its own, as Metal's library answers newFunctionWithName:, measured:
-/// macOS 27); nil where it was made with values or its library has no shadow.
+/// Sets the constant values the function was made with (`newFunctionWithName:constantValues:`
+/// and `newFunctionWithDescriptor:`), which its shadow is made with (rgfxShadowOrMake). Copied.
+- (void)rgfxSetShadowConstantValues:(nullable MTLFunctionConstantValues *)values;
+
+/// The shadow, made where there is none from the library's shadow: by entry point, as Metal's
+/// library answers newFunctionWithName: (measured: macOS 27), for a function made with no
+/// constant values and no specialized name; else by a descriptor of the entry point, the constant
+/// values and the specialized name, as the stitch of a function MPS specialises needs it (measured:
+/// macOS 26.6.1 on the RTX 5080 host, Metal's own library on this device makes it and stitches
+/// it). nil where the library has no shadow, or Metal's own library made no such function, which
+/// is logged once.
 - (nullable id<MTLFunction>)rgfxShadowOrMake;
 
 /// The library the function was made from; nil where it was made without one.

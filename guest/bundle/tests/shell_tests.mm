@@ -3635,6 +3635,113 @@ void test_stitched_library_over_shadows()
 	}
 }
 
+// A stitch over functions specialised before it, as MPS stitches its uber shaders' visible
+// functions (MPSLibrary::CreateUberShaderKey: Geekbench 7's GPU benchmark ended there, the stitch
+// refused with "link: function ... has no function of Metal's own library"): a function made with
+// constant values, by a descriptor or by name, or under a specialized name, has a shadow, Metal's
+// own function of the same entry point, values and specialized name, which declares no constants
+// and answers the name a graph's node gives; Metal's stitch over the shadows makes the library.
+void test_stitch_over_specialised_functions()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_STITCH_CONSTANTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	auto make = [&](const void *p, size_t n) {
+		uint32_t status = 0;
+		return [RgfxLibrary libraryWithData:p
+		                             length:n
+		                                key:nullptr
+		                             device:nil
+		                         serializer:&fx.ser
+		                             status:&status];
+	};
+	RgfxLibrary *lib = make(bytes.bytes, bytes.length);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+		       return [metal newLibraryWithData:d error:nil];
+	       }];
+	CHECK([[lib rgfxShadow] newFunctionWithName:@"scaled"].functionConstantsDictionary.count == 1);
+
+	float two = 2.0f, five = 5.0f;
+	MTLFunctionConstantValues *k = [MTLFunctionConstantValues new];
+	[k setConstantValue:&two type:MTLDataTypeFloat atIndex:0];
+	MTLFunctionDescriptor *byDescriptor = [MTLFunctionDescriptor functionDescriptor];
+	byDescriptor.name = @"scaled";
+	byDescriptor.specializedName = @"scaled_k2";
+	byDescriptor.constantValues = k;
+	MTLFunctionConstantValues *bv = [MTLFunctionConstantValues new];
+	[bv setConstantValue:&five type:MTLDataTypeFloat withName:@"b"];
+	MTLFunctionDescriptor *named = [MTLFunctionDescriptor functionDescriptor];
+	named.name = @"add1";
+	named.specializedName = @"add1_named";
+	NSError *err = nil;
+	id<MTLFunction> scaled = [lib newFunctionWithDescriptor:byDescriptor error:&err];
+	CHECK(err == nil);
+	id<MTLFunction> bias = [lib newFunctionWithName:@"bias" constantValues:bv error:&err];
+	CHECK(err == nil);
+	id<MTLFunction> add1 = [lib newFunctionWithDescriptor:named error:&err];
+	CHECK(err == nil && scaled != nil && bias != nil && add1 != nil);
+	if (scaled == nil || bias == nil || add1 == nil)
+		return;
+	CHECK([scaled.name isEqualToString:@"scaled_k2"] && [add1.name isEqualToString:@"add1_named"]);
+	for (id<MTLFunction> fn in @[ scaled, bias, add1 ]) {
+		id<MTLFunction> shadow = [(RgfxFunction *)fn rgfxShadowOrMake];
+		CHECK(shadow != nil && ![(id)shadow isKindOfClass:[RgfxFunction class]]);
+		CHECK([shadow.name isEqualToString:fn.name]);
+		CHECK(shadow.functionConstantsDictionary.count == 0);
+		CHECK([(RgfxFunction *)fn rgfxShadowOrMake] == shadow); // made once
+	}
+
+	MTLFunctionStitchingInputNode *x = [[MTLFunctionStitchingInputNode alloc] initWithArgumentIndex:0];
+	MTLFunctionStitchingFunctionNode *times =
+	    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"scaled_k2"
+	                                                 arguments:@[ x ]
+	                                       controlDependencies:@[]];
+	MTLFunctionStitchingFunctionNode *plus =
+	    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"bias"
+	                                                 arguments:@[ times ]
+	                                       controlDependencies:@[]];
+	MTLFunctionStitchingFunctionNode *one =
+	    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"add1_named"
+	                                                 arguments:@[ plus ]
+	                                       controlDependencies:@[]];
+	MTLStitchedLibraryDescriptor *d = [[MTLStitchedLibraryDescriptor alloc] init];
+	d.functionGraphs = @[ [[MTLFunctionStitchingGraph alloc] initWithFunctionName:@"fused"
+	                                                                        nodes:@[ times, plus ]
+	                                                                   outputNode:one
+	                                                                   attributes:@[]] ];
+	d.functions = @[ scaled, bias, add1 ];
+	__block id<MTLLibrary> stitched = nil;
+	err = nil;
+	id<MTLLibrary> ours = RgfxStitchOverShadows(
+	    d, nil,
+	    ^id<MTLLibrary>(MTLStitchedLibraryDescriptor *shadowed, NSError **e) {
+		    stitched = [metal newLibraryWithStitchedDescriptor:shadowed error:e];
+		    return stitched;
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError **e) {
+		    const void *p = nullptr;
+		    size_t n = 0;
+		    dispatch_data_t map = dispatch_data_create_map(data, &p, &n);
+		    (void)map;
+		    return make(p, n);
+	    },
+	    &err);
+	CHECK(err == nil && stitched != nil);
+	CHECK([(id)ours isKindOfClass:[RgfxLibrary class]]);
+	CHECK([[ours functionNames] isEqualToArray:@[ @"fused" ]]);
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A stitched library of a DAG (newLibraryWithDAG:functions:error:, SkyLight's and MPS's) is
 // Metal's own over the functions' shadows too: its text is Metal's to read, and its answer, here
 // Metal's parser's error, is the guest's, with nothing sent to the host.
@@ -14980,6 +15087,7 @@ int main(int argc, char **argv)
 		test_core_image_extern_functions();
 		test_function_patch_answers();
 		test_stitched_library_over_shadows();
+		test_stitch_over_specialised_functions();
 		test_stitched_dag_over_shadows();
 		test_library_air_arguments();
 		test_libraries_over_equal_bytes_share_their_air_reads();

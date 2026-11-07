@@ -860,7 +860,11 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 			constants.push_back(k);
 		}
 	}
-	return [self rgfxFunctionNamed:name constants:constants];
+	id<MTLFunction> fn = [self rgfxFunctionNamed:name constants:constants];
+	// Its shadow is made with the same values, should a stitch or a link need it.
+	if ([(id)fn isKindOfClass:[RgfxFunction class]])
+		[(RgfxFunction *)fn rgfxSetShadowConstantValues:constantValues];
+	return fn;
 }
 
 - (void)newFunctionWithName:(NSString *)name

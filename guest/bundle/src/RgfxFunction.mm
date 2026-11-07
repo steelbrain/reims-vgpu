@@ -57,7 +57,8 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	std::string _specializedName;                 // the descriptor's, where it gave one
 	BOOL _haveSpecializedName;
 	id<MTLFunction> _shadow;                      // Metal's own, for Core Image's link
-	std::mutex _shadowLock;                       // guards _shadow, set once in use
+	MTLFunctionConstantValues *_shadowValues;     // the values it was made with, for its shadow
+	std::mutex _shadowLock;                       // guards the two above, set once in use
 	std::shared_ptr<const RgfxAirFunction> _air;  // its arguments, from the library's bitcode
 	std::shared_ptr<const RgfxAirVisible> _visible; // its signature, where it is a visible one
 	std::once_flag _reflected;                      // the two below, made once from _visible
@@ -283,12 +284,46 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	return _shadow;
 }
 
+- (void)rgfxSetShadowConstantValues:(MTLFunctionConstantValues *)values
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	_shadowValues = [values copy];
+}
+
+// The shadow of a function made with constant values or a specialized name is Metal's own
+// function of the same descriptor: its stitch finds a function by the name a graph's node gives,
+// the specialized one where there is one, and links the specialised body. The descriptor carries
+// no options and no archives, as the stitch over the shadows carries none
+// (RgfxStitchOverShadows): Metal reads the shadows' AIR alone.
 - (id<MTLFunction>)rgfxShadowOrMake
 {
 	std::lock_guard<std::mutex> hold(_shadowLock);
-	if (_shadow == nil && _constants.empty() && [_library isKindOfClass:[RgfxLibrary class]]) {
-		NSString *entry = [NSString stringWithUTF8String:_name.c_str()];
-		_shadow = [[(RgfxLibrary *)_library rgfxShadow] newFunctionWithName:entry];
+	if (_shadow != nil || ![_library isKindOfClass:[RgfxLibrary class]])
+		return _shadow;
+	id<MTLLibrary> metal = [(RgfxLibrary *)_library rgfxShadow];
+	if (metal == nil)
+		return nil;
+	NSString *entry = [NSString stringWithUTF8String:_name.c_str()];
+	if (_constants.empty() && _shadowValues == nil && !_haveSpecializedName) {
+		_shadow = [metal newFunctionWithName:entry];
+		return _shadow;
+	}
+	if (!_constants.empty() && _shadowValues == nil)
+		return nil; // specialised by values this function does not hold: no shadow, not a wrong one
+	MTLFunctionDescriptor *d = [MTLFunctionDescriptor functionDescriptor];
+	d.name = entry;
+	d.constantValues = _shadowValues;
+	if (_haveSpecializedName)
+		d.specializedName = [NSString stringWithUTF8String:_specializedName.c_str()];
+	NSError *error = nil;
+	_shadow = [metal newFunctionWithDescriptor:d error:&error];
+	if (_shadow == nil) {
+		static std::once_flag logged;
+		std::call_once(logged, [&] {
+			NSLog(@"RGFX: %s: Metal's own library made no function of its constant values: %@ "
+			      @"(logged once a process)",
+			      _name.c_str(), error.localizedDescription);
+		});
 	}
 	return _shadow;
 }
@@ -300,8 +335,8 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	id<MTLFunction> shadow = [self rgfxShadowOrMake];
 	if (![shadow respondsToSelector:cmd]) {
 		RgfxLogUnsupported([self class], cmd,
-		                   "no function of Metal's own answers it (one made with constant values, "
-		                   "or of a library Metal's own does not hold)");
+		                   "no function of Metal's own answers it (one of a library Metal's own "
+		                   "does not hold, or that Metal's own library made none of)");
 		return nil;
 	}
 	logAnsweredByShadow([self class], cmd);
@@ -377,7 +412,7 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	return [self rgfxShadowAnswer:_cmd];
 }
 
-// Metal answers nil for a function specialised by values (measured), which has no shadow.
+// Metal answers nil for a function specialised by values (measured).
 - (NSArray *)functionConstants
 {
 	if (!_constants.empty())

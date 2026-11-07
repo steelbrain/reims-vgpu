@@ -218,6 +218,16 @@ $(STITCHABLE): tests/stitchable.metal Makefile
 		-o $(BUILD)/stitchable.air
 	xcrun -sdk macosx metallib $(BUILD)/stitchable.air -o $@
 
+# The stitchable functions of tests/stitch_constants.metal, specialised by constant values before
+# the shell tests stitch them.
+STITCH_CONSTANTS = $(BUILD)/stitch_constants.metallib
+
+$(STITCH_CONSTANTS): tests/stitch_constants.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 tests/stitch_constants.metal \
+		-o $(BUILD)/stitch_constants.air
+	xcrun -sdk macosx metallib $(BUILD)/stitch_constants.air -o $@
+
 # The post-tessellation vertex functions of tests/patch.metal, for the shell tests' patch answers.
 PATCH_LIB = $(BUILD)/patch.metallib
 
@@ -332,13 +342,14 @@ $(VIDEO_DRIVER_TESTBIN): $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp $(HEADER
 		-framework IOSurface -framework CoreFoundation -o $@
 
 test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_REFLECTED) $(ORACLE_REFLECTION_LIB) \
-	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) \
-	$(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
+	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(STITCH_CONSTANTS) $(PATCH_LIB) $(INHERIT_TESTBIN) \
+	$(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
 	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) \
 		RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) RGFX_COMMITTED_METALLIBS=$(COMMITTED_METALLIBS) \
 		arch -$(ARCH) $(AIR_TESTBIN)
-	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
+	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_STITCH_CONSTANTS=$(STITCH_CONSTANTS) \
+		RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
 		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
 		RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
