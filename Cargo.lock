@@ -624,7 +624,6 @@ dependencies = [
 name = "reims-vgpu-core"
 version = "0.1.0"
 dependencies = [
- "bitflags",
  "log",
  "loom",
  "parking_lot",

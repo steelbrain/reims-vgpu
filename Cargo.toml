@@ -69,7 +69,6 @@ sdl3-sys = { version = "=0.7.2", default-features = false, features = [
 # core (architecture 2.2)
 parking_lot = "0.12.5"
 zerocopy = { version = "0.8.27", features = ["derive"] }
-bitflags = "2.9"
 # every crate's lines, and the default stderr logger (core::logging)
 log = "0.4.34"
 # metal and the public crate. objc2 `exception` is always on; `catch-all` is never enabled
@@ -99,7 +98,6 @@ serde_json = "1.0.151"
 # built from the crate's bundled source, with its symbols prefixed.
 tikv-jemallocator = "0.7.0"
 # dev and tooling
-proptest = "1.7"
 loom = "0.7"
 
 # Architecture 17.4. reims-vgpu-core adds its stricter set in lib.rs.

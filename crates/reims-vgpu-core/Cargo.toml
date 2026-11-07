@@ -15,7 +15,6 @@ testkit = []
 [dependencies]
 parking_lot.workspace = true
 zerocopy.workspace = true
-bitflags.workspace = true
 log.workspace = true
 
 [target.'cfg(loom)'.dependencies]
