@@ -12390,49 +12390,65 @@ void test_commit_order()
 // Two queues posting at once never name each other's buffers both ways: a post reads the other
 // queue's latest before its buffer goes on its ring and raises its own after, so where one waits
 // for the other, the other was on its ring before the read, and its own read came before this
-// one's raise.
+// one's raise. Only a run whose posts interleave, each queue naming the other, checks that: the
+// two threads start together, and a run where one finished before the other started, naming
+// nothing, runs again, up to 50 runs.
 void test_commit_order_names_no_cycle()
 {
-	RgfxCommitOrder order;
 	constexpr int kPosts = 20000;
 	struct Post {
 		uint64_t seqno;
 		uint64_t named; // the other queue's seqno it names, 0 for none
 	};
-	std::vector<Post> posts[2];
-	auto run = [&](int me) {
-		const size_t slot = order.join(0x100 + static_cast<uint64_t>(me));
-		CHECK(slot != RgfxCommitOrder::kNoSlot);
-		RgfxCommitNamed named;
-		uint64_t last = 0;
-		for (int i = 1; i <= kPosts; i++) {
-			std::vector<RgfxSurfaceOrderWait> waits;
-			order.name(slot, named, waits);
-			CHECK(waits.size() <= 1);
-			// What it names is cumulative: the latest named stands for every one before it.
-			if (!waits.empty())
-				last = waits[0].seqno;
-			posts[me].push_back({static_cast<uint64_t>(i), last});
-			order.posted(slot, static_cast<uint64_t>(i));
+	bool interleaved = false;
+	for (int attempt = 0; attempt < 50 && !interleaved; attempt++) {
+		RgfxCommitOrder order;
+		std::vector<Post> posts[2];
+		std::atomic<int> ready{0};
+		auto run = [&](int me) {
+			const size_t slot = order.join(0x100 + static_cast<uint64_t>(me));
+			CHECK(slot != RgfxCommitOrder::kNoSlot);
+			ready++;
+			while (ready.load() < 2)
+				std::this_thread::yield();
+			RgfxCommitNamed named;
+			uint64_t last = 0;
+			for (int i = 1; i <= kPosts; i++) {
+				std::vector<RgfxSurfaceOrderWait> waits;
+				order.name(slot, named, waits);
+				CHECK(waits.size() <= 1);
+				// What it names is cumulative: the latest named stands for every one before it.
+				if (!waits.empty())
+					last = waits[0].seqno;
+				posts[me].push_back({static_cast<uint64_t>(i), last});
+				order.posted(slot, static_cast<uint64_t>(i));
+			}
+		};
+		std::thread t0(run, 0), t1(run, 1);
+		t0.join();
+		t1.join();
+		bool names[2] = {false, false};
+		for (int q = 0; q < 2; q++)
+			for (const Post &p : posts[q])
+				names[q] = names[q] || p.named != 0;
+		interleaved = names[0] && names[1];
+		// Post p of queue 0 waits for queue 1 through p.named; post q of queue 1 waits for queue
+		// 0 through q.named. A cycle: q.seqno <= p.named and p.seqno <= q.named.
+		size_t j = 0;
+		for (const Post &p : posts[0]) {
+			// The posts of queue 1 that p waits for are 1..p.named; any of them that waits for p
+			// names queue 0 at p.seqno or past. The named seqnos only rise, so the first of them
+			// that can is the one to check: queue 1's posts up to p.named, the last of which
+			// names most.
+			if (p.named == 0)
+				continue;
+			while (j + 1 < posts[1].size() && posts[1][j + 1].seqno <= p.named)
+				j++;
+			CHECK(posts[1][j].seqno <= p.named);
+			CHECK(posts[1][j].named < p.seqno);
 		}
-	};
-	std::thread t0(run, 0), t1(run, 1);
-	t0.join();
-	t1.join();
-	// Post p of queue 0 waits for queue 1 through p.named; post q of queue 1 waits for queue 0
-	// through q.named. A cycle: q.seqno <= p.named and p.seqno <= q.named.
-	size_t j = 0;
-	for (const Post &p : posts[0]) {
-		// The posts of queue 1 that p waits for are 1..p.named; any of them that waits for p
-		// names queue 0 at p.seqno or past. The named seqnos only rise, so the first of them that
-		// can is the one to check: queue 1's posts up to p.named, the last of which names most.
-		if (p.named == 0)
-			continue;
-		while (j + 1 < posts[1].size() && posts[1][j + 1].seqno <= p.named)
-			j++;
-		CHECK(posts[1][j].seqno <= p.named);
-		CHECK(posts[1][j].named < p.seqno);
 	}
+	CHECK(interleaved);
 }
 
 // A process that names its command buffers' order (rgfxIOSurfaceSetOrder; RgfxIOSurface.h): the
@@ -15546,6 +15562,6 @@ int main(int argc, char **argv)
 		rgfxGLTests();            // tests/gl_tests.mm
 		test_gl_function_encoder_ends_the_process();
 	}
-	std::printf("shell_tests: OK (%d checks)\n", g_checks);
+	std::printf("shell_tests: OK (%d checks)\n", g_checks.load());
 	return 0;
 }

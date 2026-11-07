@@ -2960,6 +2960,6 @@ int main()
 	rgfxSlabTests();
 	rgfxLibraryStreamTests();
 	rgfxFunctionConstantsTests();
-	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
+	std::printf("serializer_tests: OK (%d checks)\n", g_checks.load());
 	return 0;
 }

@@ -27,8 +27,9 @@
 
 #include "reims_graphics_wire.h"
 
-/// Counts the checks a binary has run; printed in its one-line summary.
-inline int g_checks = 0;
+/// Counts the checks a binary has run; printed in its one-line summary. Atomic, as tests check
+/// from several threads at once.
+inline std::atomic<int> g_checks{0};
 
 #define CHECK(cond)                                                                                \
 	do {                                                                                           \
