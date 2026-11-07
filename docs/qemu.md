@@ -355,6 +355,18 @@ is its transport:
   update that comes while one is under way is done with it. The read waits
   for its draw on the GPU, never under the BQL, and the guest sees nothing
   of it.
+- **The cursor** is the console's too: the library tells the device the
+  guest's cursor on its display thread (`cursor_glyph`, `cursor_show`,
+  `cursor_move` of `RvgGraphicsCallbacks`), and the BH, in order with the
+  window's input, gives the console its image and hot spot
+  (`qemu_console_set_cursor`) and its place and whether it shows
+  (`qemu_console_set_mouse`). The library gives the hot spot's place
+  (`rvg_graphics_device_cursor_position`), and the console takes the image's
+  top-left corner, as virtio-gpu gives it, so the device takes the hot spot
+  off. QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw the cursor from it,
+  as they draw `apple-gfx`'s. The image the console reads back has no
+  cursor, and under `-display none` the console has no display: the window
+  shows the cursor as the host's pointer.
 - It has no default option ROM: `romfile=` names one.
 - **The machine:** macOS places every 64-bit prefetchable BAR below 4 GiB,
   where a 1 GiB BAR needs the window to start at or below 0x4000_0000. So a
