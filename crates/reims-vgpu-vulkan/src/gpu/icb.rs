@@ -2285,11 +2285,8 @@ mod tests {
     }
 
     /// The same, in a buffer an encoder made resident for writing, which the runtime executes
-    /// from its records on the host. Ignored until the runtime runs the command there:
-    /// metal2vulkan c8a0481cf8 on MoltenVK runs nothing, the output keeping [0; 4], with no
-    /// error, where the buffer made resident for reading alone runs it reading zero
+    /// from its records on the host: the runtime runs the command there too, reading zero
     #[test]
-    #[ignore = "metal2vulkan's host replay runs no command naming a released buffer (handed to it 11-03)"]
     fn a_command_naming_a_released_buffer_reads_zero_in_a_buffer_resident_for_writing() {
         assert_eq!(released_input_read(3), [1; 4]);
     }
