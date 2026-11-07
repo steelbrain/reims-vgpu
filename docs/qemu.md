@@ -1458,21 +1458,44 @@ with one output and one input stream:
 -audiodev pipewire,id=snd0 -device virtio-sound-pci,audiodev=snd0,addr=0x7
 ```
 
-arm64 macOS's `AppleVirtIO` kext has `AppleVirtIOSound`, matching virtio
-device 0x19 (read from macOS 27's `Info.plist`). **Unknown**: that x86-64
-macOS 26 has it too, and how either guest runs on QEMU's device.
+macOS's `AppleVirtIO` kext has `AppleVirtIOSound`, matching virtio device
+0x19: arm64's (read from macOS 27's `Info.plist`) and x86-64's. **Measured**
+with a macOS 26.7.2 (25G332) x86-64 guest on reims-ctl's q35 command, on a
+Radeon 780M host:
+- `AppleVirtIOPCITransport` binds the device (`pci1af4,1059`), with
+  `AppleVirtIOSound` and its user client on it. Core Audio lists one
+  device, "Apple Virtual Sound Device", with 2 output and 2 input channels
+  at 48 kHz: the default output, system output and input.
+- `afplay` of a 3 s 1 kHz tone reaches QEMU. With the audiodev made
+  `wav,path=...`, the file holds 3.1 s at 1 kHz. With `pipewire`, as
+  reims-ctl runs it, QEMU's stream runs, linked to the host's default sink,
+  and `pw-record` of that sink's monitor holds the same tone.
+- Safari's Media Source player plays H.264 with AAC (fragmented MP4) and
+  VP9 with Opus (WebM) to the end, and their audio reaches QEMU.
+
+How an arm64 guest runs on QEMU's device is not measured.
 
 `pa` in place of `pipewire` uses PulseAudio, and `none` gives the guest a
 working output whose samples QEMU drops. macOS 26 for x86-64 ships no
-Intel HDA driver (no `AppleHDA`), so `-device ich9-intel-hda -device
-hda-duplex` leaves the guest with no audio device; reims-ctl's x86-64 VMs
-have `ich9-intel-hda` with an `hda-output` for OpenCore's boot chime alone.
-`AppleUSBAudio`, which macOS does ship, drives a USB audio device on the
-xHCI controller above (`-device usb-audio,audiodev=snd0,bus=xhci.0`),
-output only.
+Intel HDA driver (no `AppleHDA`; 26.7.2 loads no HDA kext), so `-device
+ich9-intel-hda -device hda-duplex` leaves the guest with no audio device;
+reims-ctl's x86-64 VMs have `ich9-intel-hda` with an `hda-output` for
+OpenCore's boot chime alone, which plays on the same audiodev: the 26.7.2
+guest's `wav` capture starts with 2.5 s of it. `AppleUSBAudio`, which
+macOS does ship, drives a USB audio device on the xHCI controller above
+(`-device usb-audio,audiodev=snd0,bus=xhci.0`), output only.
 
 Without an output device, Safari's Media Source players fail. **Measured**
-with a macOS 26.6.1 guest on an RTX 5080 Laptop GPU host:
+with the 26.7.2 guest above with audio off (`audio.enabled = false`, no
+sound device):
+- A Media Source stream with an audio track fails with `MEDIA_ERR_DECODE`
+  ("Media failed to decode") within 0.1 s of its data's append, before it
+  plays: H.264 with AAC, muted or not, and VP9 with Opus. The muted one
+  and VP9 never start; the unmuted H.264 with AAC keeps its error while
+  its clock runs on after `play()`.
+- A video-only stream plays to the end.
+
+**Measured** with a macOS 26.6.1 guest on an RTX 5080 Laptop GPU host:
 - YouTube streams VP9 video and Opus audio. The video decodes (WebKit's GPU
   process queued its first frames), then the audio renderer finds no
   device (`err=-101`), and WebKit reports a `DecodeError`. The page keeps

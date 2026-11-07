@@ -11,8 +11,8 @@
 //!   `-nic none`, without which QEMU gives the machine its default NIC on user networking (on
 //!   q35 an e1000e in the first free slot, 1, where the root port's address is);
 //! - a virtio sound device on the host's audio backend, one output stream and one input stream,
-//!   which arm64 macOS's AppleVirtIOSound drives (x86-64 macOS's is unchecked): Safari's Media
-//!   Source players fail without an output device;
+//!   which x86-64 macOS's AppleVirtIOSound drives and arm64 macOS's matches (docs/qemu.md,
+//!   "x86-64 macOS guests: audio"): Safari's Media Source players fail without an output device;
 //! - on `q35-x86_64`, also an ICH9 Intel HDA controller with a line-out codec on that backend,
 //!   for OpenCore's boot chime: its AudioDxe drives HDA, not virtio sound, and x86-64 macOS 26
 //!   has no HDA driver, so the guest's only output is the virtio device;
