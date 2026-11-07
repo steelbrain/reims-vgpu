@@ -4,7 +4,11 @@
 //! (`crate::va::spin`), fails by its deadline, while the GPU is still held,
 //! and holds no other call of the display past that call's own deadline.
 //! Once the spin is let go, what was kept is let go too, and the work runs
-//! again. Run on the VA-API host's AMD GPUs, one test at a time
+//! again. On a GPU with no uncached memory the spin is timed
+//! (`crate::va::spin`): it holds the ring for its bound, inside which each
+//! test's calls are made, and is let go by waiting for it to end. Where no
+//! spin holds the GPU, as its answer says, each test says so and ends. Run on
+//! the VA-API host's AMD GPUs, one test at a time
 //! (`--test-threads=1`: a test sets the process's way back), on the render
 //! node `RVG_VAAPI_NODE` names (`/dev/dri/renderD128` where it is unset).
 
@@ -23,7 +27,7 @@ use super::{Deadline, by};
 use crate::va::display::{Display, Error};
 use crate::va::h264::H264Decoder;
 use crate::va::readback::{ReadbackWay, read_back_by};
-use crate::va::spin::{self, Ring, Spin};
+use crate::va::spin::{self, NoSpin, Ring, Spin};
 use crate::va::surface::{SurfaceFormat, SurfacePool};
 
 /// The wait each test's frames take in place of the device's: short, so
@@ -50,21 +54,30 @@ fn node() -> String {
     std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into())
 }
 
-/// `count` spins on `ring` of the display's GPU, the first begun.
-fn held(ring: Ring, count: usize) -> Vec<Spin> {
+/// `count` spins on `ring` of the display's GPU, the first begun; `None`
+/// where no spin holds the GPU, as its answer says, which is printed.
+fn held(ring: Ring, count: usize) -> Option<Vec<Spin>> {
     let node = node();
-    let spins: Vec<Spin> = (0..count)
-        .map(|_| Spin::new(&node, ring).expect("a spin"))
-        .collect();
+    let mut spins = Vec::with_capacity(count);
+    for _ in 0..count {
+        match Spin::new(&node, ring) {
+            Ok(spin) => spins.push(spin),
+            Err(NoSpin::Unheld(why)) => {
+                eprintln!("no spin holds {node}, as its answer says, so this test does not apply: {why}");
+                return None;
+            }
+            Err(NoSpin::Failed(why)) => panic!("a spin: {why}"),
+        }
+    }
     for (n, spin) in spins.iter().enumerate() {
         let queued = if n == 0 { spin.hold() } else { spin.queue() };
         queued.expect("a spin queued");
     }
-    spins
+    Some(spins)
 }
 
-/// Lets `spins` go, and fails the test where the kernel's log said amdgpu
-/// reset a ring.
+/// Lets `spins` go, a timed one by waiting for its bound, and fails the
+/// test where the kernel's log said amdgpu reset a ring.
 fn let_go(spins: &[Spin]) {
     spins.iter().for_each(Spin::release);
     for spin in spins {
@@ -159,7 +172,9 @@ fn a_jpeg_copy_out_into_host_memory_does_not_wait_for_a_held_graphics_ring() {
     let display = display();
     let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Biplanar420, 1);
     jpeg.decode().expect("a decode, the GPU free");
-    let spins = held(Ring::Graphics, 1);
+    let Some(spins) = held(Ring::Graphics, 1) else {
+        return;
+    };
     for _ in 0..3 {
         let (decoded, took) = timed(|| jpeg.decode());
         assert!(decoded.is_ok(), "{decoded:?} in {took:?}");
@@ -186,7 +201,9 @@ fn jpeg_conversions_then_copies_out_do_not_wait_for_a_held_graphics_ring() {
     jpeg.decode().expect("a conversion, the GPU free");
     jpeg.scale_by(1);
     jpeg.decode().expect("a copy out, the GPU free");
-    let spins = held(Ring::Graphics, 1);
+    let Some(spins) = held(Ring::Graphics, 1) else {
+        return;
+    };
     let mut decodes = Vec::new();
     for scale in [2, 2, 2, 1, 1, 1] {
         jpeg.scale_by(scale);
@@ -217,7 +234,9 @@ fn a_jpeg_conversion_into_host_memory_on_a_held_gpu_fails_by_its_deadline() {
     let display = display();
     let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Biplanar420, 2);
     jpeg.decode().expect("a decode, the GPU free");
-    let spins = held(Ring::Compute, COMPUTE_SPINS);
+    let Some(spins) = held(Ring::Compute, COMPUTE_SPINS) else {
+        return;
+    };
     let (decoded, took) = std::thread::scope(|scope| {
         let decode = scope.spawn(|| timed(|| jpeg.decode()));
         std::thread::sleep(WAIT_FOR / 5);
@@ -249,7 +268,9 @@ fn a_jpeg_copy_out_through_a_derived_map_on_a_held_gpu_fails_by_its_deadline() {
     read_back_by(Some(ReadbackWay::Derive));
     let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Biplanar420, 1);
     jpeg.decode().expect("a decode, the GPU free");
-    let spins = held(Ring::Compute, COMPUTE_SPINS);
+    let Some(spins) = held(Ring::Compute, COMPUTE_SPINS) else {
+        return;
+    };
     let (decoded, took) = timed(|| jpeg.decode());
     assert!(malfunction(&decoded), "{decoded:?}");
     failed_by_its_deadline("the JPEG copy out", took, &spins);
@@ -278,7 +299,9 @@ fn a_get_image_read_back_on_a_held_gpu_fails_by_its_deadline() {
     let frames = decoded(&mut decoder, &samples);
     // The surface's own wait: the frame's deadline is left to its read back.
     frames[0].surface.sync().expect("the decode");
-    let spins = held(Ring::Graphics, 1);
+    let Some(spins) = held(Ring::Graphics, 1) else {
+        return;
+    };
     let (missed, took) = timed(|| frames[0].read_back().map(|_| ()));
     assert!(stalled(&missed), "{missed:?}");
     failed_by_its_deadline("the read back by vaGetImage", took, &spins);
@@ -307,7 +330,9 @@ fn a_concealment_copy_on_a_held_gpu_fails_by_its_deadline() {
     let from = pool.get().expect("a surface");
     let to = pool.get().expect("a surface");
     assert!(from.copy_to(&to).expect("a copy, the GPU free"), "no copy");
-    let spins = held(Ring::Graphics, 1);
+    let Some(spins) = held(Ring::Graphics, 1) else {
+        return;
+    };
     let (copied, took) = timed(|| from.copy_to(&to));
     assert!(stalled(&copied), "{copied:?}");
     failed_by_its_deadline("the concealment copy", took, &spins);
@@ -334,7 +359,9 @@ fn a_wait_in_sync_surface_on_a_held_gpu_fails_by_its_deadline() {
     let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Bgra, 1);
     NO_SYNC_SURFACE2.set(true);
     jpeg.decode().expect("a decode, the GPU free");
-    let spins = held(Ring::Compute, COMPUTE_SPINS);
+    let Some(spins) = held(Ring::Compute, COMPUTE_SPINS) else {
+        return;
+    };
     let (decoded, took) = timed(|| jpeg.decode());
     assert!(malfunction(&decoded), "{decoded:?}");
     failed_by_its_deadline("the run waited for in vaSyncSurface", took, &spins);
@@ -359,7 +386,9 @@ fn an_encode_on_a_held_gpu_fails_by_its_deadline() {
     let second = noise(1);
     let coded = encoder.encode(&input(&first, 0)).expect("a frame taken");
     assert!(coded.iter().all(Result::is_ok), "an encode, the GPU free");
-    let spins = held(Ring::Graphics, 1);
+    let Some(spins) = held(Ring::Graphics, 1) else {
+        return;
+    };
     let (coded, took) = timed(|| encoder.encode(&input(&second, 1)));
     let missed = match &coded {
         Err(error) => matches!(error, Error::Stalled(_)),
@@ -399,7 +428,9 @@ fn a_new_decoders_first_picture_after_a_free_on_a_held_gpu_fails_by_its_deadline
         .iter()
         .for_each(|frame| frame.sync().expect("a decode, the GPU free"));
     drop(frames);
-    let spins = held(Ring::Graphics, 1);
+    let Some(spins) = held(Ring::Graphics, 1) else {
+        return;
+    };
     drop(before);
     let mut decoder = H264Decoder::new(&display, &avcc).expect("a decoder");
     let (first, took) = timed(|| decoder.decode(&samples[0], 0).map(|_| ()));

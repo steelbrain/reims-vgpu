@@ -7,18 +7,38 @@
 //! ([`Ring::Graphics`]), or on a compute queue ([`Ring::Compute`]).
 //!
 //! The shader is SPIR-V, written here word by word ([`shader`]). The flag
-//! is host-visible memory the GPU reads uncached where the driver has such
-//! memory (`VK_AMD_device_coherent_memory`), which the shader reads with
-//! volatile loads, so that it sees the host's write; it writes that it has
-//! begun beside the flag, so that a test times its calls only once the
-//! ring is held ([`Spin::hold`]). A spin still held after [`HELD_AT_MOST`]
-//! is let go by a thread of its own, so that a test whose wait does not end
-//! fails rather than hangs.
+//! is host-visible memory the GPU reads and writes uncached
+//! (`VK_AMD_device_coherent_memory`'s `DEVICE_UNCACHED_AMD`), which the
+//! shader reads with volatile loads, so that it sees the host's write; it
+//! writes that it has begun beside the flag, so that a test times its calls
+//! only once the ring is held ([`Spin::hold`]). A spin still held after
+//! [`HELD_AT_MOST`] is let go by a thread of its own, so that a test whose
+//! wait does not end fails rather than hangs.
+//!
+//! **Where the GPU has no such memory, the spin is timed** ([`Spin::timed`]):
+//! the GPU's caches would keep the shader's start from the host until it
+//! ended, and the host's flag from the shader, so it holds the ring for
+//! [`SPUN_AT_MOST`] by the GPU's clock, whatever the host does, and the host
+//! learns that it has begun from a timestamp the queue writes just before
+//! it, once the work ahead of it is done, which `vkGetQueryPoolResults`
+//! reads. A test lets it go by waiting for it to end. **Measured** on an
+//! RX 550 (RADV on GFX8, Mesa 26.2.6, 2026-11-07), which RADV gives no
+//! uncached memory: in host-visible memory, the host saw a spin begin 652 ms
+//! after its submit, as its 1.8 million reads of the flag ended it (0.36 µs
+//! a read); with the reads and writes nontemporal as well, it saw some begin
+//! in 0.3 ms and others as late, and no spin saw the host let it go. Timed,
+//! a spin on it held the graphics ring and a compute ring for 30,000,000
+//! ticks of its clock in 1.1999 s, the device's timestamp period of 40 ns,
+//! reading the flag 3.34 million times, and four spins on compute queues
+//! ran at once: radeonsi's compute work waited behind them. A GPU whose
+//! queue writes no timestamps, or whose host cannot reset a query, has no
+//! spin ([`NoSpin::Unheld`]), and the tests of a held GPU say so and end.
 //!
 //! **It ends on its own**, whatever the host does: after [`SPUN_AT_MOST`]
 //! by the GPU's own clock (`OpReadClockKHR` at device scope, at the period
 //! the device gives its timestamps), or after [`TURNS_AT_MOST`] reads of
-//! the flag, whichever comes first, so that a process that never sets the
+//! the flag ([`TIMED_TURNS_AT_MOST`] for a timed spin), whichever comes
+//! first, so that a process that never sets the
 //! flag holds the GPU for a second, not for good, and under amdgpu's limit
 //! for a job on a ring, past which it resets the ring: 2 s unless
 //! `amdgpu.lockup_timeout` says otherwise (kernel 7.2's `modinfo`), and a
@@ -61,6 +81,11 @@ pub(crate) const SPUN_AT_MOST: Duration = Duration::from_millis(1200);
 /// 780M's (module docs).
 pub(crate) const TURNS_AT_MOST: u64 = 1_800_000;
 
+/// How many times a timed spin reads the flag at most, should the GPU's
+/// clock not move: 1.8 s of the RX 550's reads (module docs), whose
+/// 3.34 million in [`SPUN_AT_MOST`] leave it a margin of half as many again.
+pub(crate) const TIMED_TURNS_AT_MOST: u64 = 5_000_000;
+
 /// amdgpu's limit for a job on a ring, below which a spin is refused.
 const LIMIT: Duration = Duration::from_secs(2);
 
@@ -83,11 +108,11 @@ const FLAG_BYTES: u64 = 24;
 
 /// The shader: one invocation that sets the word at [`BEGUN`], then reads
 /// the flag until it is not 0, or until it has spun `ticks` of the GPU's
-/// clock or read it [`TURNS_AT_MOST`] times, then writes the reads it made
+/// clock or read it `turns_most` times, then writes the reads it made
 /// and the ticks it spun at [`TURNS`] and [`SPUN`]. SPIR-V 1.0, with the
 /// GLSL450 memory model and the flag a `BufferBlock`; volatile loads and
 /// stores.
-fn shader(ticks: u64) -> Vec<u32> {
+fn shader(ticks: u64, turns_most: u64) -> Vec<u32> {
     let mut s = Spirv::default();
     // Ids, in the order they are numbered.
     let [
@@ -103,7 +128,7 @@ fn shader(ticks: u64) -> Vec<u32> {
         p_ulong,
         flag,
     ] = s.ids();
-    let [c0, c1, c2, c3, l0, l1, turns_most, ticks_most, device] = s.ids();
+    let [c0, c1, c2, c3, l0, l1, most_turns, ticks_most, device] = s.ids();
     let [
         entry,
         head,
@@ -159,7 +184,7 @@ fn shader(ticks: u64) -> Vec<u32> {
     for (id, value) in [
         (l0, 0),
         (l1, 1),
-        (turns_most, TURNS_AT_MOST),
+        (most_turns, turns_most),
         (ticks_most, ticks),
     ] {
         s.op(43, &[ulong, id, low(value), high(value)]);
@@ -183,7 +208,7 @@ fn shader(ticks: u64) -> Vec<u32> {
     s.op(5056, &[ulong, now, device]);
     s.op(130, &[ulong, spun, now, start]);
     s.op(171, &[boolean, set, f, c0]);
-    s.op(174, &[boolean, many, next, turns_most]);
+    s.op(174, &[boolean, many, next, most_turns]);
     s.op(174, &[boolean, long, spun, ticks_most]);
     s.op(166, &[boolean, either, set, many]);
     s.op(166, &[boolean, end, either, long]);
@@ -267,6 +292,9 @@ struct Gpu {
     commands: vk::CommandPool,
     command: vk::CommandBuffer,
     fence: vk::Fence,
+    /// A timed spin's query, the timestamp written just before it, which
+    /// says that it has begun; `None` where the flag says so.
+    query: Option<vk::QueryPool>,
     /// Whether the shader was submitted and its fence not yet seen.
     submitted: AtomicBool,
 }
@@ -314,6 +342,9 @@ impl Drop for Gpu {
         // using them.
         unsafe {
             self.device.destroy_fence(self.fence, None);
+            if let Some(query) = self.query {
+                self.device.destroy_query_pool(query, None);
+            }
             self.device.destroy_command_pool(self.commands, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
@@ -429,16 +460,39 @@ fn failed(what: &str) -> impl FnOnce(vk::Result) -> String + '_ {
     move |result| format!("{what}: {result}")
 }
 
+/// Why no spin is made.
+#[derive(Debug)]
+pub(crate) enum NoSpin {
+    /// The GPU has no memory that its shaders and the host both see while a
+    /// shader runs, so no spin holds it, as its own answer says (module
+    /// docs), and a test of a held GPU does not apply to it.
+    Unheld(String),
+    /// Anything else, which fails the test.
+    Failed(String),
+}
+
+impl From<String> for NoSpin {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+/// Why no spin holds a GPU without uncached memory whose start the host
+/// cannot see either ([`NoSpin::Unheld`]); what it lacks follows.
+const UNHELD: &str = "no host-visible memory the GPU reads and writes uncached \
+    (VK_AMD_device_coherent_memory's DEVICE_UNCACHED_AMD), which its caches would keep a spin's \
+    start and the host's flag out of, and no timestamp by which a timed spin's start is seen";
+
 impl Spin {
     /// The shader, ready on `ring` of the GPU of the render node at `node`.
-    pub(crate) fn new(node: &str, ring: Ring) -> Result<Self, String> {
+    pub(crate) fn new(node: &str, ring: Ring) -> Result<Self, NoSpin> {
         let (major, minor) = render_node(node).ok_or_else(|| format!("no render node {node}"))?;
         let limit = std::fs::read_to_string("/sys/module/amdgpu/parameters/lockup_timeout")
             .map_err(|e| format!("no amdgpu.lockup_timeout: {e}"))?;
         if !limit_allows(limit.trim()) {
-            return Err(format!(
+            return Err(NoSpin::Failed(format!(
                 "amdgpu.lockup_timeout {limit:?} is under {LIMIT:?}"
-            ));
+            )));
         }
         // SAFETY: loads the system's Vulkan loader.
         let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan: {e}"))?;
@@ -462,7 +516,7 @@ impl Spin {
         instance: ash::Instance,
         node: (i64, i64),
         ring: Ring,
-    ) -> Result<Gpu, String> {
+    ) -> Result<Gpu, NoSpin> {
         // SAFETY: the instance's own calls, with valid out-pointers.
         let physicals = unsafe { instance.enumerate_physical_devices() }
             .map_err(failed("vkEnumeratePhysicalDevices"))?;
@@ -488,7 +542,7 @@ impl Spin {
             })
             .ok_or_else(|| format!("no Vulkan device of render node {node:?}"))?;
         if !has(physical, ash::khr::shader_clock::NAME) {
-            return Err("no VK_KHR_shader_clock".into());
+            return Err(NoSpin::Failed("no VK_KHR_shader_clock".into()));
         }
         // SAFETY: a physical device of the instance.
         let properties = unsafe { instance.get_physical_device_properties(physical) };
@@ -510,9 +564,16 @@ impl Spin {
             })
             .and_then(|f| u32::try_from(f).ok())
             .ok_or_else(|| format!("no {ring:?} queue family"))?;
-        let uncached = has(physical, ash::amd::device_coherent_memory::NAME);
+        let coherent = has(physical, ash::amd::device_coherent_memory::NAME);
+        let mut reset = vk::PhysicalDeviceHostQueryResetFeatures::default();
+        let mut supported = vk::PhysicalDeviceFeatures2::default().push_next(&mut reset);
+        // SAFETY: a physical device of the instance, and a chain of valid
+        // structures.
+        unsafe { instance.get_physical_device_features2(physical, &mut supported) };
+        let timestamps = families[family as usize].timestamp_valid_bits > 0;
+        let timeable = timestamps && reset.host_query_reset != 0;
         let mut extensions = vec![ash::khr::shader_clock::NAME.as_ptr()];
-        if uncached {
+        if coherent {
             extensions.push(ash::amd::device_coherent_memory::NAME.as_ptr());
         }
         let priorities = [1.0f32];
@@ -521,16 +582,19 @@ impl Spin {
             .queue_priorities(&priorities)];
         let mut clock =
             vk::PhysicalDeviceShaderClockFeaturesKHR::default().shader_device_clock(true);
-        let mut coherent =
+        let mut uncached =
             vk::PhysicalDeviceCoherentMemoryFeaturesAMD::default().device_coherent_memory(true);
+        let mut host_reset =
+            vk::PhysicalDeviceHostQueryResetFeatures::default().host_query_reset(timeable);
         let features = vk::PhysicalDeviceFeatures::default().shader_int64(true);
         let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&extensions)
             .enabled_features(&features)
-            .push_next(&mut clock);
-        if uncached {
-            info = info.push_next(&mut coherent);
+            .push_next(&mut clock)
+            .push_next(&mut host_reset);
+        if coherent {
+            info = info.push_next(&mut uncached);
         }
         // SAFETY: a valid create info, for the call.
         let device = unsafe { instance.create_device(physical, &info, None) }
@@ -562,9 +626,22 @@ impl Spin {
                             .contains(wanted)
                 })
             };
-            let memory_type = (uncached.then(|| find(host | device_uncached)).flatten())
-                .or_else(|| find(host))
-                .ok_or_else(|| "no host-visible coherent memory".to_owned())?;
+            // Uncached, the flag holds the spin; else, the spin is timed.
+            let (memory_type, timed) = match (find(host | device_uncached), find(host)) {
+                (Some(uncached), _) if coherent => (uncached, false),
+                (_, Some(cached)) if timeable => (cached, true),
+                _ => {
+                    device.destroy_buffer(buffer, None);
+                    device.destroy_device(None);
+                    instance.destroy_instance(None);
+                    let lacks = if timestamps {
+                        "the host resets no query (hostQueryReset)"
+                    } else {
+                        "the queue family writes no timestamps"
+                    };
+                    return Err(NoSpin::Unheld(format!("{UNHELD}: {lacks}")));
+                }
+            };
             let memory = device
                 .allocate_memory(
                     &vk::MemoryAllocateInfo::default()
@@ -582,7 +659,12 @@ impl Spin {
                 .cast::<u8>();
             std::ptr::write_bytes(mapped, 0, FLAG_BYTES as usize);
             (*mapped.cast::<AtomicU32>()).store(1, Ordering::SeqCst);
-            let code = shader(ticks);
+            let turns_most = if timed {
+                TIMED_TURNS_AT_MOST
+            } else {
+                TURNS_AT_MOST
+            };
+            let code = shader(ticks, turns_most);
             let module = device
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
                 .map_err(failed("vkCreateShaderModule"))?;
@@ -661,9 +743,28 @@ impl Spin {
                         .command_buffer_count(1),
                 )
                 .map_err(failed("vkAllocateCommandBuffers"))?[0];
+            let query = if timed {
+                let pool = device
+                    .create_query_pool(
+                        &vk::QueryPoolCreateInfo::default()
+                            .query_type(vk::QueryType::TIMESTAMP)
+                            .query_count(1),
+                        None,
+                    )
+                    .map_err(failed("vkCreateQueryPool"))?;
+                device.reset_query_pool(pool, 0, 1);
+                Some(pool)
+            } else {
+                None
+            };
             device
                 .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())
                 .map_err(failed("vkBeginCommandBuffer"))?;
+            if let Some(pool) = query {
+                // Written once the work ahead of the spin is done, just
+                // before the spin.
+                device.cmd_write_timestamp(command, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 0);
+            }
             device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(
                 command,
@@ -696,6 +797,7 @@ impl Spin {
                 commands,
                 command,
                 fence,
+                query,
                 submitted: AtomicBool::new(false),
             })
         }
@@ -719,7 +821,23 @@ impl Spin {
 
     /// Whether the shader last queued has begun on the GPU.
     pub(crate) fn begun(&self) -> bool {
-        self.gpu.word(BEGUN).load(Ordering::SeqCst) != 0
+        let gpu = &self.gpu;
+        let Some(query) = gpu.query else {
+            return gpu.word(BEGUN).load(Ordering::SeqCst) != 0;
+        };
+        // The timestamp, and whether it is written.
+        let mut written = [[0u64; 2]];
+        let flags = vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY;
+        // SAFETY: the device's query, and room for its result and its
+        // availability.
+        let read = unsafe { gpu.device.get_query_pool_results(query, 0, &mut written, flags) };
+        read.is_ok() || written[0][1] != 0
+    }
+
+    /// Whether the spin is timed: it holds its ring for [`SPUN_AT_MOST`]
+    /// from its start, and [`Self::release`] does not end it (module docs).
+    pub(crate) fn timed(&self) -> bool {
+        self.gpu.query.is_some()
     }
 
     /// Queues the shader as [`Self::hold`] does, without waiting for it to
@@ -734,6 +852,11 @@ impl Spin {
         }
         gpu.word(FLAG).store(0, Ordering::SeqCst);
         gpu.word(BEGUN).store(0, Ordering::SeqCst);
+        if let Some(query) = gpu.query {
+            // SAFETY: the device's query, which no work in flight uses: the
+            // last spin has ended.
+            unsafe { gpu.device.reset_query_pool(query, 0, 1) };
+        }
         let commands = [gpu.command];
         let submits = [vk::SubmitInfo::default().command_buffers(&commands)];
         // SAFETY: the device's fence, signalled and waited for or never
@@ -762,7 +885,7 @@ impl Spin {
         Ok(())
     }
 
-    /// Lets the shader end.
+    /// Lets the shader end; a timed one ends by its own bound.
     pub(crate) fn release(&self) {
         self.gpu.word(FLAG).store(1, Ordering::SeqCst);
     }
@@ -792,7 +915,7 @@ mod tests {
 
     #[test]
     fn the_shader_ends_by_its_bounds() {
-        let words = shader(800_000_000);
+        let words = shader(800_000_000, TURNS_AT_MOST);
         assert_eq!(words[0], 0x0723_0203);
         // The two bounds, as 64-bit constants.
         let has = |v: u64| {
@@ -806,6 +929,9 @@ mod tests {
         // RX 7900 XTX's 0.95 µs a read (module docs).
         assert!(HELD_AT_MOST < SPUN_AT_MOST && SPUN_AT_MOST < LIMIT);
         assert!(Duration::from_nanos(TURNS_AT_MOST * 950) < LIMIT);
+        // A timed spin's turns at the RX 550's 0.36 µs a read.
+        assert!(Duration::from_nanos(TIMED_TURNS_AT_MOST * 360) < LIMIT);
+        assert!(Duration::from_nanos(TIMED_TURNS_AT_MOST * 360) > SPUN_AT_MOST);
     }
 
     #[test]
@@ -843,7 +969,7 @@ mod tests {
     #[ignore = "writes the shader where RVG_SPIN_SPIRV names, for spirv-val"]
     fn the_shader_is_written_out() {
         let path = std::env::var("RVG_SPIN_SPIRV").expect("RVG_SPIN_SPIRV");
-        let bytes: Vec<u8> = shader(800_000_000)
+        let bytes: Vec<u8> = shader(800_000_000, TURNS_AT_MOST)
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
@@ -851,13 +977,19 @@ mod tests {
     }
 
     /// The spin holds its ring, its clock moving at the device's
-    /// timestamp period, and ends when let go.
+    /// timestamp period, and ends when let go, or, timed, by its bound.
     #[test]
     #[ignore = "needs an AMD GPU: run on the VA-API host"]
     fn a_spin_holds_until_let_go() {
         let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
         for ring in [Ring::Graphics, Ring::Compute] {
-            let spin = Spin::new(&node, ring).expect("a spin");
+            let spin = match Spin::new(&node, ring) {
+                Err(NoSpin::Unheld(why)) => {
+                    eprintln!("no spin holds {node}, as its answer says: {why}");
+                    return;
+                }
+                made => made.expect("a spin"),
+            };
             spin.hold().expect("held");
             let start = StdRuntime.now();
             std::thread::sleep(Duration::from_millis(300));
@@ -866,7 +998,13 @@ mod tests {
             assert!(spin.ended(Duration::from_secs(2)), "{ring:?}: not ended");
             let wall = StdRuntime.elapsed_since(start);
             let (turns, ticks) = spin.ran();
-            eprintln!("{ring:?}: {turns} reads, {ticks} ticks in {wall:?}");
+            let timed = spin.timed();
+            eprintln!("{ring:?}: {turns} reads, {ticks} ticks in {wall:?}, timed {timed}");
+            if timed {
+                // Held to its bound, by the clock rather than the reads.
+                assert!(wall > SPUN_AT_MOST / 2, "{ring:?}: ended in {wall:?}");
+                assert!(turns < TIMED_TURNS_AT_MOST, "{ring:?}: ended by its reads");
+            }
             assert!(!reset_seen());
         }
     }
