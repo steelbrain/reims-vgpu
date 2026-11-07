@@ -119,6 +119,7 @@ mod metal;
 mod present;
 mod read;
 mod sink;
+mod video_host;
 #[cfg(vulkan_platform)]
 mod vulkan;
 
