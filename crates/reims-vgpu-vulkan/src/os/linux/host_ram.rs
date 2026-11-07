@@ -1,8 +1,16 @@
 //! The guest's RAM handed to a device whole, where the device takes no view of the guest's pages
 //! through dma-bufs (`super::import`'s `imports_need_files`, NVIDIA's 615 driver): the runtime
-//! imports it by pointer itself, in chunks, as objects over it are made, and takes each no-copy
-//! object's pages as runs of that RAM ([`runs`]) instead of an import of the object's own view,
-//! so such an object takes no kernel mapping a page.
+//! imports it itself, in chunks, as objects over it are made, and takes each no-copy object's
+//! pages as runs of that RAM ([`runs`]) instead of an import of the object's own view, so such an
+//! object takes no kernel mapping a page.
+//!
+//! - **By pointer or as dma-bufs.** Where `/dev/udmabuf` opens, the RAM has a source of dma-bufs
+//!   of its pages ([`dma_bufs`]): udmabuf's, through the backing table, as a no-copy import's
+//!   (`super::import`), each within udmabuf's limits as the host has them (`size_limit_mb`, 64 MiB
+//!   by default, which the library never raises). The runtime imports a chunk as a dma-buf where
+//!   the device's held pointer imports add to every submission's cost, or where it refuses the
+//!   chunk's pointer, and as long as one dma-buf holds there (`rt::HostRam::with_largest_dma_buf`);
+//!   by its pointer otherwise, and where the source refuses. Without udmabuf, by pointer alone.
 //!
 //! - **What is handed.** Each lease's ranges of the guest's RAM (`super::files`'s
 //!   `lease_guest_memory`): the host's own shared mappings of the files it named, writable, mapped
@@ -31,6 +39,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 
 use metal2vulkan_runtime as rt;
+use reims_vgpu_core::num::ToU64 as _;
 use reims_vgpu_core::sync::Mutex;
 
 use super::files;
@@ -130,12 +139,52 @@ fn runtime_ram(ranges: &[(u64, u64)], logged: bool) -> Option<rt::HostRam> {
             return None;
         }
     };
+    let ram = match dma_bufs() {
+        Some(source) => {
+            (ram.with_dma_buf(source)).with_largest_dma_buf(super::dma_buf::limits().bytes)
+        }
+        None => ram,
+    };
     let dirty = logged
         .then(|| super::dirty::ImportDirty::of_ram(ranges))
         .flatten();
     Some(match dirty {
         Some(dirty) => ram.with_dirty_pages(Arc::new(dirty)),
         None => ram,
+    })
+}
+
+/// The RAM's source of dma-bufs of its pages (`rt::HostRam::with_dma_buf`), where `/dev/udmabuf`
+/// opens: each request answered by [`ram_dma_bufs`].
+fn dma_bufs() -> Option<rt::DmaBufSource> {
+    if !super::dma_buf::opens() {
+        return None;
+    }
+    let zeros = super::dma_buf::Zeros::default();
+    Some(Arc::new(move |request: rt::DmaBufRequest| {
+        let first = request.start.as_ptr().addr().to_u64();
+        ram_dma_bufs(first, request.length, request.granule, &zeros)
+    }))
+}
+
+/// The dma-bufs [`dma_bufs`]'s source answers for `length` bytes of the RAM's pages from `first`,
+/// host addresses, at `granule`: those pages resolved through the backing table and cut within
+/// udmabuf's limits at multiples of `granule` from `first` (`super::dma_buf::of_pages`), as a
+/// no-copy import's source makes them. A refusal (pages the table resolves to no file, a limit,
+/// udmabuf's own) answers an error, which leaves the chunk to its pointer. The RAM's pages are its
+/// files' and never the block of zeros', so `zeros`, the source's files of zeros, stays empty.
+fn ram_dma_bufs(
+    first: u64,
+    length: u64,
+    granule: u64,
+    zeros: &super::dma_buf::Zeros,
+) -> std::io::Result<Vec<rt::DmaBufChunk>> {
+    super::dma_buf::of_pages(first, length, granule, zeros).map_err(|refusal| {
+        log::debug!(
+            target: "reims_vgpu_vulkan::os",
+            "no dma-buf of the guest's RAM's {length:#x} bytes at {first:#x}: {refusal}"
+        );
+        std::io::Error::other(refusal.to_string())
     })
 }
 
@@ -943,5 +992,123 @@ mod tests {
             [0, 0x5a, 0x5a, 0]
         );
         drop((cb, e, q, held, lease));
+    }
+    /// The RAM's source of dma-bufs ([`super::dma_bufs`]) is there where `/dev/udmabuf` opens, and
+    /// answers a request over the RAM's pages ([`super::ram_dma_bufs`]) with dma-bufs of exactly
+    /// those pages, in order, split only at multiples of the request's granule and each within
+    /// udmabuf's limits: what the CPU wrote through the RAM reads through them, and what is
+    /// written through them reaches the RAM. A request over pages no file is behind (anonymous
+    /// memory, not the RAM's) is refused with an error, which leaves the chunk to its pointer.
+    /// Without udmabuf the RAM has no source, and the test checks nothing more.
+    #[test]
+    fn the_rams_source_answers_dma_bufs_of_its_pages() {
+        let opens = super::super::dma_buf::opens();
+        assert_eq!(super::dma_bufs().is_some(), opens);
+        if !opens {
+            eprintln!("skipped: /dev/udmabuf does not open on this host");
+            return;
+        }
+        let length = 8 * MIB;
+        let fd = memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, which the test unmaps after the lease and
+        // every dma-buf over it.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        let at = start.addr().to_u64();
+        let lease = lease_guest_memory(
+            [GuestRamFile {
+                host: at,
+                guest: 0,
+                length,
+                fd,
+                offset: 0,
+            }],
+            None,
+        );
+        let ram =
+            |offset: u64| std::ptr::with_exposed_provenance_mut::<u8>((at + offset).to_usize());
+        // SAFETY: bytes of the RAM, mapped readable and writable until the end of the test.
+        unsafe {
+            ram(2 * MIB + 5).write_volatile(0x11);
+            ram(6 * MIB - 1).write_volatile(0x22);
+        }
+        // A dma-buf's bytes, mapped shared for `f` and unmapped after.
+        let through = |chunk: &metal2vulkan_runtime::DmaBufChunk, f: &mut dyn FnMut(*mut u8)| {
+            // SAFETY: a fresh shared mapping of the dma-buf, unmapped once `f` returns.
+            unsafe {
+                let mapped = libc::mmap(
+                    std::ptr::null_mut(),
+                    chunk.length.to_usize(),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    chunk.fd.as_raw_fd(),
+                    0,
+                );
+                assert_ne!(mapped, libc::MAP_FAILED);
+                f(mapped.cast());
+                assert_eq!(libc::munmap(mapped, chunk.length.to_usize()), 0);
+            }
+        };
+        let zeros = super::super::dma_buf::Zeros::default();
+        let limit = super::super::dma_buf::limits().bytes;
+        for (offset, bytes, granule) in [(2 * MIB, 4 * MIB, 4 * MIB), (MIB, 6 * MIB, MIB)] {
+            let chunks = super::ram_dma_bufs(at + offset, bytes, granule, &zeros).unwrap();
+            let mut ends = 0;
+            for chunk in &chunks {
+                assert!(
+                    chunk.length > 0 && chunk.length <= limit,
+                    "{}",
+                    chunk.length
+                );
+                ends += chunk.length;
+                assert!(
+                    ends == bytes || ends.is_multiple_of(granule),
+                    "a cut at {ends:#x}"
+                );
+            }
+            assert_eq!(ends, bytes, "the request's pages, no more");
+        }
+        let chunks = super::ram_dma_bufs(at + 2 * MIB, 4 * MIB, 4 * MIB, &zeros).unwrap();
+        assert_eq!(chunks.len(), 1);
+        through(&chunks[0], &mut |bytes| {
+            // SAFETY: the dma-buf's mapping, 4 MiB long.
+            unsafe {
+                assert_eq!(bytes.add(5).read_volatile(), 0x11);
+                assert_eq!(bytes.add((4 * MIB - 1).to_usize()).read_volatile(), 0x22);
+                bytes.add(0x100).write_volatile(0x33);
+            }
+        });
+        // SAFETY: a byte of the RAM, mapped readable.
+        assert_eq!(unsafe { ram(2 * MIB + 0x100).read_volatile() }, 0x33);
+        // Anonymous memory is no file's: the source refuses it.
+        // SAFETY: a fresh private anonymous mapping, unmapped below.
+        let anonymous = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                (2 * MIB).to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(anonymous, libc::MAP_FAILED);
+        let refused = super::ram_dma_bufs(anonymous.addr().to_u64(), 2 * MIB, 2 * MIB, &zeros);
+        assert!(refused.is_err());
+        drop((chunks, lease));
+        // SAFETY: the mappings made above, which nothing uses any more.
+        unsafe {
+            assert_eq!(libc::munmap(anonymous, (2 * MIB).to_usize()), 0);
+            assert_eq!(libc::munmap(start, length.to_usize()), 0);
+        }
     }
 }
