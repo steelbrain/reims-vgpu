@@ -6572,6 +6572,25 @@ typedef struct {
   uint32_t bitstream_alignment;
 } RgfxVideoCodecCaps;
 
+// How a decode of one codec lands its picture in place, in the output surface's planes
+// themselves, with no copy: the host's GPU writes the picture's whole coded rows and columns
+// there, in units of `granularity`, so a surface laid out to hold them takes it in place. The
+// guest's video driver asks AppleGVA for such surfaces: each plane's rows the frame's height
+// rounded up to a multiple of `granularity[1]` (chroma half), its rows `alignment` apart, from
+// the frame's width rounded up to a multiple of `granularity[0]`, and its first byte at a
+// multiple of `alignment` ([`RgfxVideoOpDecodeH264`]'s `output_rows` says what a surface holds).
+// All zero where the host lands a picture by a copy of its crop alone, and from a host older
+// than these: the driver then asks for planes of the frame's height.
+typedef struct {
+  // The units of luma samples a decode writes in place: width, height.
+  uint32_t granularity[2];
+  // What each plane's first byte, and the bytes from one of its rows to the next, are a
+  // multiple of.
+  uint32_t alignment;
+  // Zero.
+  uint32_t reserved_0c;
+} RgfxVideoOutputLayout;
+
 // The video caps the host writes at the device's init, at [`RGFX_VIDEO_CAPS_OFFSET`]: one
 // [`RgfxVideoCodecCaps`] for each codec and direction its hardware takes, which the guest's
 // video driver lists, and none for the rest, which the guest's software codecs serve.
@@ -6586,6 +6605,9 @@ typedef struct {
   uint32_t flags;
   // Zero.
   uint32_t reserved_30c;
+  // How each of `codecs` lands its pictures in place, by its index there; all zero for a codec
+  // whose pictures land by a copy, and from a host older than them.
+  RgfxVideoOutputLayout layouts[RGFX_VIDEO_CAPS_CODECS];
 } RgfxVideoCaps;
 
 // The body of [`RGFX_OP_VIDEO_DECODE_H264`], followed by its parameter sets.
@@ -6602,8 +6624,14 @@ typedef struct {
   uint64_t chroma_texture_obj_id;
   // The bytes of SPS and PPS NAL units after this body, before its padding; 0 for none.
   uint32_t parameter_sets_size;
-  // Zero.
-  uint32_t reserved_2c;
+  // The luma rows the output surface holds from the luma texture's first, whole rows of its
+  // bytes per row (the texture's height, then the rows its surface extends it by below,
+  // before plane 1), and half as many chroma rows from the chroma texture's: where the
+  // codec's [`RgfxVideoOutputLayout`](crate::wire::RgfxVideoOutputLayout) is not zero, and the
+  // textures are their planes' whole, the host may write the picture's whole coded rows
+  // there. 0 where the textures are the picture's crop alone (a tile of a larger surface, or a
+  // guest older than the field).
+  uint32_t output_rows;
 } RgfxVideoOpDecodeH264;
 
 // The body of [`RGFX_OP_VIDEO_DECODE_H265`], followed by its parameter sets.
@@ -6620,8 +6648,8 @@ typedef struct {
   uint64_t chroma_texture_obj_id;
   // The bytes of the SPS and PPS NAL units after this body, before its padding; 0 for none.
   uint32_t parameter_sets_size;
-  // Zero.
-  uint32_t reserved_2c;
+  // As [`RgfxVideoOpDecodeH264::output_rows`].
+  uint32_t output_rows;
 } RgfxVideoOpDecodeH265;
 
 // `VIDEO_SESSION_CREATE`: a video session.
