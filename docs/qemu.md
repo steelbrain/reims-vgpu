@@ -1352,6 +1352,47 @@ driver of every Mac that runs macOS 26, and the same load gave no freeze in
 
 **Unknown**: guests before macOS 26 on `qemu-xhci`.
 
+### x86-64 macOS guests: USB passthrough
+
+reims-ctl gives a q35 VM the host's USB devices with QEMU's `usb-host`, on
+the same controller, which has seven ports:
+
+```sh
+-device qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on,p2=7,p3=7 \
+-device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
+-device usb-host,id=usb-1050-0407,bus=xhci.0,vendorid=0x1050,productid=0x0407
+```
+
+Read from QEMU's code (hw/usb/hcd-xhci.c, hw/usb/bus.c,
+hw/usb/host-libusb.c):
+- The controller has `max(p2, p3)` ports for devices, each a USB 2 and a
+  USB 3 port where both counts reach it, and shows the guest `p2 + p3`
+  ports, USB 3 ones first. macOS numbers at most 15 ports on a controller,
+  so 7 and 7 is the most with every port taking either speed.
+- A USB device takes the first free port, and a port freed goes to the back
+  of the free ones, so with fewer USB 2 ports than USB 3 ones a device
+  attached and detached again can come to a port of one speed alone.
+- A device that takes the last free port gets a full-speed `usb-hub`
+  chained there first, which a high-speed device does not attach to
+  ("speed mismatch"). With the keyboard and the tablet, four devices leave
+  one port free, so reims-ctl gives a VM four at most. QEMU's default of
+  four ports would leave room for one.
+- `usb-host` takes a port as it is created, whether its device is plugged
+  in or not. Every 2 s QEMU opens the match of each `usb-host` device
+  without one, by `vendorid` and `productid`, and by `hostbus` and
+  `hostport` where they are given, and closes a device unplugged; so a
+  device plugged in after the VM started joins the guest, and one plugged in
+  again comes back. A device it fails to open three times (`libusb_open:
+  -3 [ACCESS]` in QEMU's log, where the user may not write its file in
+  `/dev/bus/usb`) is tried again only once it is unplugged.
+- On a macOS host, libusb takes a device from the macOS driver holding it
+  only as root or with `com.apple.vm.device-access`, an entitlement Apple
+  grants VM apps through a provisioning profile; reims-ctl offers no
+  passthrough there.
+
+**Unknown**: a guest's view of a device on a USB 3 port; whether macOS
+guests before 26 drive the controller with 14 ports as with 8.
+
 ### x86-64 macOS guests: sleep
 
 Give an x86-64 macOS guest no ACPI S3:
