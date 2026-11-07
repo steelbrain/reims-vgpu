@@ -1944,6 +1944,25 @@ static int dies_case(const char *name)
 		desc.mipmapLevelCount = 2;
 		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:64];
 	}
+	// buffer-texture-buffer-rows-0: a texture buffer of 4 RGBA32Float texels over a buffer, by the
+	// public form, with rows of 0 bytes.
+	if (std::strcmp(name, "buffer-texture-buffer-rows-0") == 0) {
+		std::vector<uint8_t> memory(4096, 0);
+		RgfxBuffer *buf =
+		    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                    regionOffset:0x10000
+		                                          length:memory.size()
+		                                         options:MTLResourceStorageModeShared
+		                                     deallocator:nil
+		                                          device:nil
+		                                      serializer:&fx.ser];
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+		                                                           width:4
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:0];
+	}
 	// buffer-texture-type-N and linear-texture-type-N: a texture of MTLTextureType N over a
 	// buffer, by the public form or the linear SPI.
 	const bool linearForm = std::strncmp(name, "linear-texture-type-", 20) == 0;
@@ -2290,6 +2309,54 @@ void test_buffer_texture_types_end_the_process()
 			checkDies(dies.c_str(), words.c_str());
 		}
 	}
+}
+
+// A texture buffer over a buffer's bytes by the public form is made, at any offset, with rows of at
+// least its texels' bytes, its create carrying its type, offset and rows to the host; fewer bytes
+// a row answer nil, posting nothing, and none end the process with Metal's words, as the AMD 5300M
+// answers (measured under macOS 26.7.1, a scratch probe; dgpu-oracle.md Q11).
+void test_buffer_texture_buffers()
+{
+	checkDies("buffer-texture-buffer-rows-0",
+	          "_mtlValidateStrideTextureParameters: failed assertion `Texture Descriptor Validation\nLinear "
+	          "texture: bytesPerRow (0) must be greater or equal to (64) bytes\n'");
+	Fixture fx;
+	@autoreleasepool {
+		std::vector<uint8_t> memory(0x10000, 0);
+		for (const MTLResourceOptions storage : {MTLResourceStorageModeShared, MTLResourceStorageModeManaged}) {
+			RgfxBuffer *buf = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+			                                                  regionOffset:0x10000
+			                                                        length:memory.size()
+			                                                       options:storage
+			                                                   deallocator:nil
+			                                                        device:nil
+			                                                    serializer:&fx.ser];
+			CHECK(buf != nil);
+			drainRing(fx.ring);
+			MTLTextureDescriptor *desc =
+			    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+			                                                           width:4
+			                                                 resourceOptions:storage
+			                                                           usage:MTLTextureUsageShaderRead];
+			NSMutableArray *made = [NSMutableArray array]; // kept, so no destroy posts between
+			for (const NSUInteger offset : {(NSUInteger)0, (NSUInteger)4, (NSUInteger)100}) {
+				id<MTLTexture> t = [buf newTextureWithDescriptor:desc offset:offset bytesPerRow:64];
+				if (t != nil)
+					[made addObject:t];
+				CHECK(t != nil && t.textureType == MTLTextureTypeTextureBuffer && t.width == 4);
+				CHECK(t.buffer == buf && t.bufferOffset == offset && t.bufferBytesPerRow == 64);
+				auto m = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+				CHECK(m.buffer_obj_id == buf.rgfxObjId && m.offset == offset && m.bytes_per_row == 64);
+				CHECK(m.desc.texture_type == MTLTextureTypeTextureBuffer && m.desc.width == 4);
+			}
+			CHECK([buf newTextureWithDescriptor:desc offset:16 bytesPerRow:4096] != nil);
+			drainRing(fx.ring);
+			CHECK([buf newTextureWithDescriptor:desc offset:0 bytesPerRow:63] == nil);
+			CHECK([buf newTextureWithDescriptor:desc offset:0 bytesPerRow:1] == nil);
+			CHECK(ringEmpty(fx.ring));
+		}
+	}
+	drainRing(fx.ring);
 }
 
 // A texture over a buffer's bytes of a block-compressed format is nil and posts nothing, by the
@@ -15204,6 +15271,7 @@ int main(int argc, char **argv)
 		test_mipmapped_buffer_texture_ends_the_process();
 		test_buffer_texture_types_end_the_process();
 		test_compressed_buffer_textures_answer_nil();
+		test_buffer_texture_buffers();
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_descriptor_validation_as_the_x86_macs();
 		test_invalid_surface_textures_end_the_process();

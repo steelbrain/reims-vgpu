@@ -689,10 +689,14 @@ RGFX_RESOURCE_SPI
 // Q11), and so does the bundle, sending nothing: the host's platform would end the host's process
 // at the type. So it does at a 3D or multisample type, with the M3's words (rgfxLinearTypeDies);
 // the x86 GPUs end the process there too, the Intel GPU with other words at the 3D one, and both
-// at a multisample one in Shared storage before they reach its type. A texture buffer, which the
-// three make (oracle_texdesc buffer texbuf), answers nil, logged once, and sends nothing, as the
-// host carries none by this form. So does a block-compressed format (below). One off the
-// device's linear texture alignment is nil (rgfxAtLinearAlignment:).
+// at a multisample one in Shared storage before they reach its type. A texture buffer is made, as
+// the AMD and the Intel GPU make one over a Shared or Managed buffer at any offset (4, 100 and
+// 256 among them) with rows of at least its texels' bytes, and their kernels read the buffer's
+// bytes from the offset (measured under macOS 26.7.1, RGBA32Float and RGBA8Unorm: a scratch
+// probe, dgpu-oracle.md Q11), which the host's platform makes by this form too. Rows of 0 bytes
+// end the process with the words both say; fewer than its texels' bytes the AMD answers nil, and
+// so does the bundle, where the Intel GPU ends the process. A block-compressed format answers
+// nil (below). One off the device's linear texture alignment is nil (rgfxAtLinearAlignment:).
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                     offset:(NSUInteger)offset
                                bytesPerRow:(NSUInteger)bytesPerRow
@@ -707,7 +711,30 @@ RGFX_RESOURCE_SPI
 		                               @"mipmapped, mipmapLevelCount (%lu) disallowed\n",
 		                               (unsigned long)descriptor.mipmapLevelCount]);
 	}
-	if (descriptor != nil && descriptor.textureType != MTLTextureType2D) {
+	if (descriptor != nil && descriptor.textureType == MTLTextureTypeTextureBuffer) {
+		RgfxFormatBlock block = {};
+		const uint64_t rowBytes =
+		    rgfxPixelFormatBlock(static_cast<uint32_t>(descriptor.pixelFormat), &block) && block.linear
+		        ? static_cast<uint64_t>(descriptor.width) * block.bytes
+		        : 0;
+		if (bytesPerRow == 0 && rowBytes != 0) {
+			RgfxMetalAssertionFailed(
+			    "_mtlValidateStrideTextureParameters",
+			    [NSString stringWithFormat:@"Texture Descriptor Validation\nLinear texture: bytesPerRow (0) "
+			                               @"must be greater or equal to (%llu) bytes\n",
+			                               (unsigned long long)rowBytes]);
+		}
+		if (bytesPerRow < rowBytes) {
+			static std::atomic<bool> logged{false};
+			if (!logged.exchange(true)) {
+				NSLog(@"RGFX: a texture buffer over buffer 0x%llx of %lu bytes a row, fewer than its "
+				      @"%llu texels' bytes: answered nil",
+				      (unsigned long long)[self rgfxObjId], (unsigned long)bytesPerRow,
+				      (unsigned long long)rowBytes);
+			}
+			return nil;
+		}
+	} else if (descriptor != nil && descriptor.textureType != MTLTextureType2D) {
 		NSString *type = rgfxLinearTypeName(descriptor.textureType);
 		if (type != nil)
 			rgfxLinearTypeDies(descriptor, type, @"MTLTextureType2D");
