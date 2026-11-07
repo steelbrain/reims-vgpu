@@ -168,9 +168,15 @@ pub(crate) fn allocate_zeros(len: u64) -> Result<HostAddr, KernReturn> {
     allocate_aliasable(len)
 }
 
-/// Whether the runtime imports read-only memory through a writable twin of its files: not on
-/// macOS, where it imports the bytes themselves ([`import_view`]).
+/// Whether the runtime imports a surface's read-only alias through a writable twin of its files:
+/// not on macOS, where it imports the bytes themselves ([`import_view`]).
 pub(crate) const TWINS_READ_ONLY: bool = false;
+
+/// Whether the runtime makes read-only memory, and memory made with `MTLResourceOptions` bit 24,
+/// over a copy of it whose GPU writes it drops: not on macOS, where MoltenVK hands Metal the
+/// pages, or a read-only view of them, and Metal's GPU answers its writes there itself, as the
+/// runtime's device answers yes to `drops_gpu_writes_to_read_only_memory`.
+pub(crate) const COPIES_READ_ONLY: bool = false;
 
 /// The memory the runtime imports for some bytes: on macOS those bytes themselves, which MoltenVK
 /// hands to Metal, which reads read-only pages.
@@ -191,9 +197,14 @@ impl ImportView {
         self.at
     }
 
-    /// Whether the GPU's writes through the import are kept where Metal drops them: never on
-    /// macOS, where read-only pages stay read-only to the GPU.
-    pub(crate) fn writes_kept(&self) -> bool {
+    /// Whether the runtime makes the object over a copy of read-only pages whose GPU writes it
+    /// drops: never on macOS, where read-only pages stay read-only to the GPU.
+    pub(crate) fn read_only(&self) -> bool {
+        false
+    }
+
+    /// Whether the import is a writable twin of read-only pages: never on macOS.
+    pub(crate) fn twinned(&self) -> bool {
         false
     }
 
@@ -214,8 +225,9 @@ impl ImportView {
     }
 }
 
-/// The memory the runtime imports for `length` bytes at `at`: those bytes ([`ImportView`]).
-pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView {
+/// The memory the runtime imports for `length` bytes at `at`: those bytes ([`ImportView`]),
+/// read-only ones too, whether a twin is asked for (`twin`, a surface's read-only alias) or not.
+pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64, _twin: bool) -> ImportView {
     ImportView { at }
 }
 

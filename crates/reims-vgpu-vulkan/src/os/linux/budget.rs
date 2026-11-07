@@ -406,10 +406,14 @@ mod tests {
         {
             let _limit = Limit::room(0);
             assert!(dies_at_the_budget(|| vm::allocate_aliasable(PAGE)));
-            assert!(dies_at_the_budget(|| import::import_view(p, PAGE)));
+            assert!(dies_at_the_budget(|| import::import_view(p, PAGE, true)));
             assert!(dies_at_the_budget(|| vm::OwnMemory::new(PAGE)));
         }
-        assert_ne!(import::import_view(p, PAGE).at(), p, "a twin with room");
+        assert_ne!(
+            import::import_view(p, PAGE, true).at(),
+            p,
+            "a twin with room"
+        );
         assert!(v.deallocate(at, 2 * PAGE).is_success());
     }
 
@@ -447,7 +451,7 @@ mod tests {
             crate::answer::relaxed(|| {
                 assert_eq!(vm::allocate_aliasable(PAGE).err(), Some(KernReturn(3)));
                 assert!(vm::OwnMemory::new(PAGE).is_none());
-                assert_eq!(import::import_view(p, PAGE).at(), p, "no twin");
+                assert_eq!(import::import_view(p, PAGE, true).at(), p, "no twin");
             });
         }
         assert_eq!(crate::answer::out_of_host_memory_count(), before + 4);

@@ -895,8 +895,9 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
     the budget (`budget.rs`, `HEADROOM`), and through dma-bufs past that. Any
     other import of a view's pages (a no-copy buffer's, a heap's or a
     rebind's) maps them from their files while they fit short of those 8,192
-    mappings too, as does the writable twin an import of read-only pages
-    needs. Past that line the library's import gate refuses the pages, and
+    mappings too, as does the writable twin an import of a surface's
+    read-only alias, or of a range core maps read-only, needs. Past that line
+    the library's import gate refuses the pages, and
     the runtime makes the object over a copy of them, which takes no mapping
     (metal2vulkan's `HostMemory::with_import_gate`, announced
     `copied-host-pages`; with `REIMS_VGPU_STRICT=1` it ends the process). The
@@ -925,6 +926,18 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
     over read-only pages, 50 MiB): medians of 29 fps for the Finder drag, 19
     for a Safari drag, 5 for a Safari scroll and 8 for the Apps stack, while
     Mission Control stayed under one frame a second.
+  - Read-only pages twinned or copied, measured on the Radeon 780M host
+    (RADV) at metal2vulkan 023ed62d8c, 2026-11-07: a macOS 26.7.2 guest on
+    apple-gfx at 1920x1080, each boot on a fresh overlay of one prepared
+    disk, ten boots alternating in one job. Every read-only import of each
+    boot was a buffer core made over a range it maps read-only (37 to 44 of
+    them, 29.5 MiB, three of 0x7e9000 bytes), and no guest object made with
+    bit 24 or replaced read-only came. Copied rather than twinned, a Finder
+    window's two 10 s drags drew 27.35 and 35.7 fps (six boots) against
+    27.65 and 36.35 (four), QEMU took 260-279% of a core in the second drag
+    against 240-251%, and Safari scrolling up a long page drew 34.5-35.6 fps
+    (four boots) against 37.0 and 39.4 (two); so core's ranges stay twinned
+    (`backing.rs`, `ImportSite::twins`).
   - A device lend (the video device's decoder writing a frame into the
     guest's buffer) maps its pages from their files only short of those
     8,192: past them the decoder declines the frame, and the session copies

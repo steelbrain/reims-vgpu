@@ -591,11 +591,11 @@ mod tests {
         run(&cb, &e, encode);
     }
 
-    /// A dispatch through a buffer over pages mapped read-only runs where its kernel reads the
-    /// buffer, at a `const` pointer, and dies where it is encoded where the kernel may write it,
-    /// by its slot writes, or the buffer is made resident for writing: on Linux the runtime
-    /// imports a writable twin of the pages, which the write would reach, where Metal's GPU drops
-    /// it ([`crate::gpu::writes::kept_write`]). The pages stay zeros
+    /// A dispatch through a buffer core makes over pages mapped read-only runs where its kernel
+    /// reads the buffer, at a `const` pointer, and dies where it is encoded where the kernel may
+    /// write it, by its slot writes, or the buffer is made resident for writing: on Linux the
+    /// runtime imports a writable twin of the pages, which the write would reach, where Metal's
+    /// GPU drops it ([`crate::gpu::writes::kept_write`]). The pages stay zeros
     #[cfg(target_os = "linux")]
     #[test]
     fn a_dispatch_through_read_only_pages_dies_on_linux() {
@@ -659,6 +659,54 @@ mod tests {
         let first = unsafe { pages.as_ptr::<u32>().read_volatile() };
         assert_eq!(first, 0);
         drop((cb, e, ro));
+        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+    }
+
+    /// A dispatch whose kernel stores into a guest's read-only buffer (made with bit 24,
+    /// `resource::tests::read_only_buffer`), bound at the slot it writes and made resident for
+    /// writing, completes with no error, its stores dropped, the pages staying zeros, as Metal
+    /// drops a kernel's stores there (`crate::gpu::writes`'s docs): through the runtime's copy of
+    /// the pages on Linux, and Metal's read-only view on macOS. The kernel reads it as the pages
+    #[test]
+    fn a_kernel_store_into_a_read_only_buffer_is_dropped() {
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::{host_bytes_at, read_only_buffer};
+        use crate::os::{OsVm, PAGE};
+
+        let add = pipeline(ADD, "add_one");
+        let (ro, pages) = read_only_buffer(1);
+        let out = shared(16);
+        let four = || ComputeCmd::DispatchThreads {
+            threads_per_grid: MtlSize::new(4, 1, 1),
+            threads_per_threadgroup: MtlSize::new(4, 1, 1),
+        };
+        run_serial(vec![
+            ComputeCmd::SetComputePipelineState { state: Some(&add) },
+            ComputeCmd::SetBuffers {
+                buffers: &[Some(&out), Some(&ro)],
+                offsets: &[0, 0],
+                range: NsRange::new(0, 2),
+            },
+            four(),
+        ]);
+        assert_eq!(words(&out), [1; 4], "read as the pages");
+        let source = holding(&[7; 4]);
+        run_serial(vec![
+            ComputeCmd::SetComputePipelineState { state: Some(&add) },
+            ComputeCmd::SetBuffers {
+                buffers: &[Some(&ro), Some(&source)],
+                offsets: &[0, 0],
+                range: NsRange::new(0, 2),
+            },
+            ComputeCmd::UseResources {
+                resources: &[Some(ResourceRef::Buffer(&ro))],
+                usage: 3,
+            },
+            four(),
+        ]);
+        assert!(host_bytes_at(pages, 16).iter().all(|&b| b == 0), "dropped");
+        drop((ro, source, out));
         assert!(OsVm::new().deallocate(pages, PAGE).is_success());
     }
 

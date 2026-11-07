@@ -205,6 +205,16 @@ impl<E> EncoderObject<E> {
         }
     }
 
+    /// Tells its command buffer that this encoder, a render pass, stores an attachment into
+    /// read-only memory the runtime copies, at which Metal's GPU faults it
+    /// ([`CommandBufferObject::faults_at_read_only_store`]); nothing once core let go of the
+    /// command buffer, which it can then commit no more.
+    pub(crate) fn faults_at_read_only_store(&self) {
+        if let Some(cb) = Obj::upgrade(&self.command_buffer) {
+            cb.faults_at_read_only_store(self.at);
+        }
+    }
+
     /// Its command buffer's progress, for `sel` ([`CommandBufferObject::progress`]); none once
     /// core let go of the command buffer, which it can then commit no more.
     pub(crate) fn progress(&self, sel: &'static str) -> Option<Arc<Progress>> {

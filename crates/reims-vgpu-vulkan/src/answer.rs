@@ -1287,16 +1287,22 @@ pub fn created_or_decided<T>(
 /// - `ReadOnlyPagesWritten`: a no-copy buffer, heap or rebind over pages the process maps
 ///   read-only, imported as dma-bufs of its pages, whose GPU writes reach the pages, where after
 ///   Metal's the CPU reads them as they were. Announced inside the call that makes it, which dies
-///   at its selector. This platform gives the runtime a writable twin of read-only pages on Linux
-///   (`crate::os`'s import), whose writes die where they are encoded, so no call here reaches it;
+///   at its selector. On Linux this platform gives the runtime a writable twin of a surface's
+///   read-only alias and of a range core maps read-only, whose writes die where they are
+///   encoded, and every other read-only page as it is, which the views' gate refuses, so the
+///   runtime copies it (`CopiedHostPages`): no call here reaches it where the runtime asks the
+///   gate, every import by pointer (`crate::os`'s import);
 /// - `CopiedHostPages`: a no-copy buffer, heap or rebind made over a copy of the guest's pages in
 ///   memory of the device's own, as their import failed (out of memory, or a driver out of the
 ///   mappings the host's kernel allows), or the views' gate refused it on Linux, where mapping the
 ///   pages from their files would have run the views of memory within the headroom of their
-///   budget of kernel mappings (`crate::os`'s import gate), which each commit fills from the
-///   pages and each completion writes back: a CPU write the GPU reads mid-command-buffer, or a GPU
-///   write the CPU reads before the batch completes, is not seen, where Metal's GPU uses the pages
-///   themselves. Announced inside the call that makes it, which dies at its selector.
+///   budget of kernel mappings, or the pages are a guest's read-only object's (a replace
+///   `readOnly:YES`, a heap or no-copy buffer made with `MTLResourceOptions` bit 24, pages mapped
+///   read-only), whose copy drops the GPU's writes, as Metal's GPU drops them (`crate::os`'s
+///   import gate, `crate::gpu::writes`), which each commit fills from the pages and each
+///   completion writes back: a CPU write the GPU reads mid-command-buffer, or a GPU write the CPU
+///   reads before the batch completes, is not seen, where Metal's GPU uses the pages themselves.
+///   Announced inside the call that makes it, which dies at its selector.
 ///
 /// Every kind not listed here or in [`HEARD`] is relayed, those the guest sees included, each for
 /// one of the reasons the module's docs give: logged once per device and not dying. Each relayed

@@ -158,6 +158,18 @@
 //!   encoders, its protection options, a use of a detached object at its commit, or another
 //!   type-9 draw's other failure, dies at the commit, as do two different ways at once of any
 //!   kind, which nothing measured.
+//!
+//!   A render pass that stores an attachment into read-only memory the runtime copies
+//!   (`Store`, `StoreAndMultisampleResolve`), where Metal's GPU faults the command buffer
+//!   (`kIOGPUCommandBufferCallbackErrorPageFault`, measured on the M3 Max, macOS 27.0.1, by
+//!   metal2vulkan's `probes/readonly_gpu_writes.m`) and the runtime's copy would take the store,
+//!   fails it so (`MTLCommandBufferErrorPageFault`, 3), its render encoder and every encoder
+//!   after it running nothing and every event signal firing, as a type-9 draw's page fault does
+//!   ([`CommandBufferObject::faults_at_read_only_store`]); which encoders of such a command
+//!   buffer run, and whether its signals fire, are not measured for this fault. Metal then fails
+//!   every later command buffer of the process, with a code nothing recorded, so the commit of
+//!   one, of the same task (the host's process, or an isolated task's, as Metal's process is the
+//!   task's there), dies ([`READ_ONLY_FAULTED`]).
 //! - **A submission that uses a detached buffer or heap** fails with
 //!   `MTLCommandBufferErrorOutOfMemory` (8), whose description is Metal's ("Insufficient
 //!   Memory"), as Metal fails it. Metal splits a command buffer into submissions, and decides
@@ -302,6 +314,55 @@ pub struct CommandBufferObject {
     /// Whether it signals an event as it is scheduled (`encodeSignalEventScheduled:value:`),
     /// which keeps it whole ([`CommandBufferObject::splits`]).
     signals_scheduled: AtomicBool,
+    /// Whether a render pass in it stores an attachment into read-only memory the runtime copies,
+    /// which fails it ([`CommandBufferObject::faults_at_read_only_store`]): its commit marks its
+    /// task's later commits ([`READ_ONLY_FAULTED`]).
+    read_only_store: AtomicBool,
+}
+
+/// The tasks a command buffer of which a render pass's store into read-only memory failed
+/// ([`CommandBufferObject::faults_at_read_only_store`]), each by its life, `None` for code
+/// outside an isolated task (the host's process): Metal fails every later command buffer of the
+/// process with a code nothing recorded (the module docs), so the commit of a later one of the
+/// same task dies ([`read_only_faulted`]).
+static READ_ONLY_FAULTED: Mutex<Vec<Option<std::sync::Weak<TaskLife>>>> = Mutex::new(Vec::new());
+
+/// Whether [`READ_ONLY_FAULTED`] ever took a task: until it does, a commit takes no lock for it.
+static ANY_READ_ONLY_FAULTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a command buffer of the task this thread runs the code of failed at a render pass's
+/// store into read-only memory, committed before ([`READ_ONLY_FAULTED`]).
+fn read_only_faulted() -> bool {
+    if !ANY_READ_ONLY_FAULTED.load(Ordering::Acquire) {
+        return false;
+    }
+    let task = TaskLife::current();
+    READ_ONLY_FAULTED
+        .lock()
+        .iter()
+        .any(|kept| same_task(kept, task.as_ref()))
+}
+
+/// Whether `kept`, a task [`READ_ONLY_FAULTED`] holds, is `task`: both the host's process, or
+/// the same live isolated task.
+fn same_task(kept: &Option<std::sync::Weak<TaskLife>>, task: Option<&Arc<TaskLife>>) -> bool {
+    match (kept, task) {
+        (None, None) => true,
+        (Some(kept), Some(task)) => kept.upgrade().is_some_and(|kept| Arc::ptr_eq(&kept, task)),
+        _ => false,
+    }
+}
+
+/// Marks the task this thread runs the code of as one a command buffer of which a render pass's
+/// store into read-only memory failed ([`READ_ONLY_FAULTED`]).
+fn mark_read_only_faulted() {
+    let task = TaskLife::current();
+    let mut faulted = READ_ONLY_FAULTED.lock();
+    faulted.retain(|kept| kept.as_ref().is_none_or(|k| k.strong_count() > 0));
+    if !faulted.iter().any(|kept| same_task(kept, task.as_ref())) {
+        faulted.push(task.as_ref().map(Arc::downgrade));
+    }
+    ANY_READ_ONLY_FAULTED.store(true, Ordering::Release);
 }
 
 /// The submission handler of a command buffer that holds work for Metal's tiler
@@ -459,6 +520,19 @@ impl CommandBufferObject {
     /// Records `failing`, which its commit fails it with ([`CommandBufferObject::failure`]).
     pub(crate) fn fail(&self, failing: Failing) {
         self.failing.lock().push(failing);
+    }
+
+    /// Records that the render pass at `from`, in the order the runtime ended its encoders, stores
+    /// an attachment into read-only memory the runtime copies, which fails it with Metal's page
+    /// fault from that pass on, its event signals firing (the module docs), and marks its task's
+    /// later commits at its own ([`READ_ONLY_FAULTED`]).
+    pub(crate) fn faults_at_read_only_store(&self, from: usize) {
+        self.fail(Failing {
+            code: rt::CommandBufferError::PageFault.metal_code(),
+            from,
+            signals: true,
+        });
+        self.read_only_store.store(true, Ordering::SeqCst);
     }
 
     /// Records `failing`, how a draw of primitive type 9 in it fails it, as Metal's GPU does,
@@ -979,6 +1053,7 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             tiler: AtomicBool::new(false),
             executions: Mutex::new(Vec::new()),
             signals_scheduled: AtomicBool::new(false),
+            read_only_store: AtomicBool::new(false),
         })))
     }
 
@@ -1418,6 +1493,17 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         // The guest's GPU work, which keeps the GPU awake ([`crate::awake`]).
         self.device.awake.touch();
         let progress = self.progress.lock().clone();
+        if read_only_faulted() {
+            unrepresentable(
+                "commit",
+                "a command buffer committed after a render pass's store into read-only memory \
+                 failed one of its process's, where Metal fails every later command buffer of \
+                 the process with a code nothing recorded",
+            );
+        }
+        if self.read_only_store.load(Ordering::SeqCst) {
+            mark_read_only_faulted();
+        }
         encoding("commit", Policy::Dies, || {
             predication::boundary(&self.predication, "commit");
             let opened = self.opened.lock().take();
@@ -1493,6 +1579,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             tiler: AtomicBool::new(false),
             executions: Mutex::new(Vec::new()),
             signals_scheduled: AtomicBool::new(false),
+            read_only_store: AtomicBool::new(false),
         });
         self.commit(on)?;
         Ok(Some(next))

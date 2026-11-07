@@ -397,23 +397,24 @@ fn keep_unrun<D, T>(made: &RaiseResult<Option<T>>, slot: Option<Slot<D>>) {
 
 /// What the runtime is given for a no-copy buffer over the `length` bytes at `start`, which
 /// core's `HostRange` vouches for, with `run`, the runtime's form of core's deallocator: the first
-/// byte it imports (the bytes, or a writable twin of them where it cannot import them as mapped,
-/// [`crate::os::import_view`]), the deallocator, which runs at Metal's moment, given the bytes'
-/// own address, and the keep-alive, which the runtime drops once it freed its import: it holds
-/// the twin, and an unmap hold on the bytes' pages, so that core's unmap of its mapping of them
-/// through the platform's VM, which its deallocator may make, waits for the free
-/// ([`crate::remap::UnmapHold`]); whether the import is a writable twin of read-only pages,
-/// whose GPU writes reach them where Metal drops them ([`Backing::writes_kept`]); and whether
-/// the runtime may be told the pages are writable ([`crate::os::ImportView::vouched`]).
+/// byte it imports (the bytes, or, at a site that twins them, a writable twin of them where it
+/// cannot import them as mapped, [`crate::os::import_view`], [`backing::ImportSite::twins`];
+/// read-only bytes elsewhere, which the runtime copies), the deallocator, which runs at Metal's
+/// moment, given the bytes' own address, and the keep-alive, which the runtime drops once it
+/// freed its import: it holds the twin, and an unmap hold on the bytes' pages, so that core's
+/// unmap of its mapping of them through the platform's VM, which its deallocator may make, waits
+/// for the free ([`crate::remap::UnmapHold`]); whether the pages are mapped read-only, and
+/// whether the import is their twin ([`Backing::imported`]); and whether the runtime may be told
+/// the pages are writable ([`crate::os::ImportView::vouched`]).
 fn no_copy_release(
     start: NonNull<u8>,
     length: u64,
     run: Option<rt::Deallocator>,
     site: backing::ImportSite,
 ) -> NoCopyImport {
-    let view = crate::os::import_view(start, length);
+    let view = crate::os::import_view(start, length, site.twins());
     let imported = view.at();
-    let kept = view.writes_kept();
+    let (read_only, twinned) = (view.read_only(), view.twinned());
     let vouched = view.vouched();
     let (run, twin) = view.release(start, run);
     let hold = crate::remap::UnmapHold::new(start, length);
@@ -422,7 +423,8 @@ fn no_copy_release(
         at: imported,
         run,
         keep: backing::keep_alive((twin, hold, traced)),
-        kept,
+        read_only,
+        twinned,
         vouched,
     }
 }
@@ -435,8 +437,10 @@ struct NoCopyImport {
     run: Option<rt::Deallocator>,
     /// What keeps the import's pages mapped until the runtime freed it.
     keep: rt::KeepAlive,
-    /// The import is a writable twin of read-only pages.
-    kept: bool,
+    /// The pages are mapped read-only ([`crate::os::ImportView::read_only`]).
+    read_only: bool,
+    /// The import is a writable twin of them ([`crate::os::ImportView::twinned`]).
+    twinned: bool,
     /// The runtime may be told the pages are writable.
     vouched: bool,
 }
@@ -761,7 +765,7 @@ impl VulkanDevice {
             // The runtime imports the pages as they are mapped, from their files on Linux where a
             // device needs them so (`crate::os::import_view`); writable, so no twin.
             let site = backing::ImportSite::SurfaceBase;
-            let view = crate::os::import_view(base, length);
+            let view = crate::os::import_view(base, length, site.twins());
             let traced = backing::ImportTrace::new(site, base, length, view.at());
             (base, backing::keep_alive((hold, view, traced)))
         } else {
@@ -1006,6 +1010,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         deallocator: Option<NoCopyDeallocator>,
     ) -> RaiseResult<Option<VulkanBuffer>> {
         let sel = "newBufferWithBytesNoCopy:length:options:deallocator:";
+        let bit_24 = options & READ_ONLY_OPTION != 0;
         let options = crate::gpu::resource_options(sel, options);
         let slot = deallocator.map(|d| Arc::new(Mutex::new(Some(d))));
         let run = slot
@@ -1022,7 +1027,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             at: imported,
             run,
             keep,
-            kept,
+            read_only,
+            twinned,
             vouched,
         } = no_copy_release(start, bytes.len(), run, backing::ImportSite::NoCopyBytes);
         let made = create_buffer(sel, placed_nil(&placing, Nil::BufferLength), None, || {
@@ -1057,7 +1063,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         made.map(|b| {
             b.map(|raw| {
                 let buffer = self.buffer(raw, None);
-                buffer.backing.imported(kept);
+                buffer
+                    .backing
+                    .imported(read_only || bit_24, twinned && !bit_24);
                 buffer
             })
         })
@@ -1750,9 +1758,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         // A no-copy buffer's memory, whose deallocator's run a detach may hold
         // ([`backing::Held`]).
         let mut own = None;
-        // Whether the runtime imports a no-copy buffer's memory through a writable twin of
-        // read-only pages.
-        let mut kept = false;
+        // Whether a no-copy buffer's pages are mapped read-only.
+        let mut read_only = false;
         let contents = match (desc.contents, desc.no_copy, &slot) {
             (None, false, None) => rt::BufferContents::Zero,
             (Some(bytes), false, None) if bytes.len() == desc.length => {
@@ -1764,8 +1771,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             }
             (Some(bytes), true, slot) => {
                 let start = pointer(sel, bytes.ptr());
-                // The bytes, or a writable twin of them where the runtime cannot import them as
-                // mapped, and what keeps them mapped until the runtime freed its import; the
+                // The bytes, and what keeps them mapped until the runtime freed its import; the
                 // deallocator is given the bytes' own address, at Metal's moment.
                 let held = Arc::new(backing::Held::default());
                 let run = slot.as_ref().map(|slot| {
@@ -1780,15 +1786,16 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     at: imported,
                     run,
                     keep,
-                    kept: twinned,
+                    read_only: mapped_read_only,
                     vouched,
+                    ..
                 } = no_copy_release(
                     start,
                     bytes.len(),
                     run,
                     backing::ImportSite::NoCopyDescriptor,
                 );
-                kept = twinned;
+                read_only = mapped_read_only;
                 rt::BufferContents::NoCopy {
                     // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the
                     // deallocator runs, or for the buffer's life with none, and an unmap of
@@ -1822,7 +1829,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 if let Some(own) = own {
                     backing.made_over_own(own);
                 }
-                backing.imported(kept);
+                backing.imported(read_only, false);
                 Obj::new(BufferObject {
                     raw,
                     device: self.clone_ref(),
@@ -2002,6 +2009,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             });
         let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
         let options = crate::gpu::resource_options(sel, held);
+        let bit_24 = held & READ_ONLY_OPTION != 0;
         let covered = desc.size.checked_next_multiple_of(backing::HEAP_GRANULE);
         if desc.size == 0 || covered.is_none_or(|need| bytes.len() < need) {
             return Ok(HeapMade {
@@ -2016,12 +2024,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let descriptor =
             rt::HeapDescriptor::new(heap_type, desc.size, options).with_placement(placement);
         let start = pointer(sel, bytes.ptr());
-        // The bytes, or a writable twin of them where the runtime cannot import them as mapped,
-        // and what keeps them mapped until the runtime freed its import.
+        // The bytes, and what keeps them mapped until the runtime freed its import.
         let NoCopyImport {
             at: imported,
             keep,
-            kept,
+            read_only,
             vouched,
             ..
         } = no_copy_release(start, bytes.len(), None, backing::ImportSite::Heap);
@@ -2058,7 +2065,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         Ok(HeapMade {
             heap: heap.map(|raw| {
                 let backing = Backing::fixed();
-                backing.imported(kept);
+                backing.imported(read_only || bit_24, false);
                 Obj::new(HeapObject {
                     raw,
                     device: self.clone_ref(),

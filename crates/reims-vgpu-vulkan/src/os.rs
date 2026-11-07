@@ -46,14 +46,15 @@ pub(crate) use host_os::open_loader;
 /// (`os/linux/import.rs`).
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use host_os::views_through_dma_bufs;
+pub(crate) use host_os::{
+    COPIES_READ_ONLY, Drawables, ImportView, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros,
+    dma_buf_refusal, host_memory, host_memory_vouched, import_view, plane_shape, shown_at,
+    surface_memory_hold,
+};
 /// A surface's memory lent to a device outside the runtime, on Linux (`os/linux/device_lend.rs`),
 /// and what a host attaches to a surface for as long as it lives.
 #[cfg(target_os = "linux")]
 pub use host_os::{DeviceLend, LendRefusal, LentDmaBuf, attachment, lend_to_devices};
-pub(crate) use host_os::{
-    Drawables, ImportView, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros, dma_buf_refusal,
-    host_memory, host_memory_vouched, import_view, plane_shape, shown_at, surface_memory_hold,
-};
 pub use host_os::{
     GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, RegionMemory,
     default_driver_sizes, default_gpu_core_count, default_registry_id, install_process_services,

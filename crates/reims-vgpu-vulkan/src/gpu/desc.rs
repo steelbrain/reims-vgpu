@@ -624,10 +624,16 @@ impl Source {
         self.0.as_ref().is_some_and(|t| t.gpu_read_only())
     }
 
-    /// Whether the GPU's writes to its texels reach read-only memory, where Metal's drop them
-    /// ([`crate::gpu::writes::texture_kept`]).
+    /// Whether its texels lie in read-only memory whose writes this platform does not answer as
+    /// Metal's GPU does ([`crate::gpu::writes::texture_kept`]).
     pub fn writes_kept(&self) -> bool {
         (self.0.as_ref()).is_some_and(|t| crate::gpu::writes::texture_kept(t))
+    }
+
+    /// Whether the GPU's writes to its texels reach read-only memory through a writable twin of
+    /// its pages, a surface's, where Metal's drop them ([`crate::gpu::writes::texture_twinned`]).
+    pub fn twinned(&self) -> bool {
+        (self.0.as_ref()).is_some_and(|t| crate::gpu::writes::texture_twinned(t))
     }
 
     /// The texture, if any.

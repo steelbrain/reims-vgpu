@@ -1,14 +1,28 @@
-//! What the runtime imports for host memory on Linux: the memory itself where the process may
-//! write all of it, and otherwise a writable twin of it.
+//! What the runtime imports for host memory on Linux: the memory itself, and for a surface's
+//! read-only alias, or a range core maps read-only and makes a buffer over, a writable twin of it.
 //!
-//! Linux drivers pin imported pages for writing, so the runtime refuses read-only memory (typed,
-//! `HostMemory`), where Metal reads it: the guest's ranges core maps read-only (the EFI
+//! Linux drivers pin imported pages for writing, so the runtime imports no read-only memory
+//! (typed, `HostMemory`), where Metal reads it: the guest's ranges core maps read-only (the EFI
 //! framebuffer among them), aliases of a read-only replace or heap, and surfaces the GPU only
-//! reads. For those the runtime is given a **twin** instead: a second view of the same file
-//! pages, read and write, at an address of its own ([`import_view`]). The GPU then reads what
-//! Metal's reads, but its writes reach those pages, where Metal drops them
-//! ([`ImportView::writes_kept`]): every command that may write through an object over such an
-//! import dies where it is encoded, naming it (`crate::gpu::writes::kept_write`).
+//! reads. For aliases of a read-only replace or heap, and a no-copy buffer a descriptor names or a
+//! heap over bytes, over pages mapped read-only, the runtime is given the pages themselves: the
+//! views' gate refuses
+//! them ([`import_gate`]), and the runtime makes the buffer or heap over a copy of them whose GPU
+//! writes it drops, as Metal's GPU drops them (its `copied-host-pages`, a kind of
+//! `crate::answer::DIES`), so the GPU reads what Metal's reads and its writes reach nothing past
+//! the copy ([`ImportView::read_only`]); so does an object made with `MTLResourceOptions` bit 24,
+//! whatever its pages. What Metal answers otherwise than a dropped write there (a pass's store
+//! into such memory, a texture's writes) is `crate::gpu::writes`'s.
+//!
+//! A surface's read-only alias, and a buffer core makes over a range it maps read-only, are given
+//! a **twin** instead (`crate::gpu::backing::ImportSite::twins`): a second view of the same file
+//! pages, read and write, at an address of its own ([`import_view`]), imported in place, so a
+//! surface's buffers lie in one import of the pages, as a writer's GPU writes through another
+//! import reach its readers, where a copy would read them as they were at its commit, and core's
+//! ranges cost no compare of their bytes at each commit. The GPU then reads what Metal's reads,
+//! but its writes reach those pages, where Metal drops them: every command that may write
+//! through an object over such an import dies where it is encoded, naming it
+//! (`crate::gpu::writes::kept_write`).
 //!
 //! The block of zeros a read-only alias maps past its ranges' pages is a file of zeros all such
 //! aliases share ([`allocate_zeros`]). Its twin is private memory of zeros instead, so the GPU's
@@ -30,7 +44,8 @@
 //! the pages were left in views through dma-bufs for want of mappings, which a device that pins a
 //! pointer's pages refuses, or are read-only with no twin, it refuses, and the runtime makes the
 //! buffer or heap over a copy of them in memory of the device's own instead, which takes no
-//! mapping (its `copied-host-pages`, a kind of `crate::answer::DIES`).
+//! mapping (its `copied-host-pages`, a kind of `crate::answer::DIES`), and whose GPU writes it
+//! drops where the process cannot write the pages.
 //!
 //! **What the imported pages cost the GPU** (**measured** 2026-10-26, raw Vulkan with no runtime
 //! between, kernels of our own reading 64 MiB and writing 64 MiB, the median GPU time of five in
@@ -98,9 +113,15 @@ use super::budget;
 use super::files;
 use super::vm;
 
-/// Whether the runtime imports read-only memory through a writable twin of its files: on Linux,
-/// so read-only memory the library makes has a file behind every byte (module docs).
+/// Whether the runtime imports a surface's read-only alias through a writable twin of its files:
+/// on Linux, so read-only memory the library makes has a file behind every byte (module docs).
 pub(crate) const TWINS_READ_ONLY: bool = true;
+
+/// Whether the runtime makes read-only memory other than a surface's, and memory made with
+/// `MTLResourceOptions` bit 24, over a copy of it whose GPU writes it drops, where Metal's GPU
+/// keeps them from the memory itself: on Linux, where the runtime's device answers no to
+/// `drops_gpu_writes_to_read_only_memory` (module docs).
+pub(crate) const COPIES_READ_ONLY: bool = true;
 
 /// Every live twin, by its first byte: its length and the first byte of the memory it twins.
 static TWINS: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
@@ -141,6 +162,8 @@ pub(crate) struct ImportView {
     pinned: Option<Pinned>,
     /// The table shows every page of the import mapped writable ([`ImportView::vouched`]).
     vouched: bool,
+    /// The table shows a page of the memory mapped read-only ([`ImportView::read_only`]).
+    read_only: bool,
 }
 
 /// The pages a device of the process may pin now: each live import's, of pages it takes as they
@@ -267,9 +290,11 @@ static TWINLESS: Refused = Refused::new("notwin");
 /// new pages, by their pointer (`rt::HostMemory::with_import_gate`), which every [`host_memory`]
 /// carries, asked on the thread that makes the buffer, heap or rebind, with no lock of the
 /// runtime's held, after [`import_view`] made what it imports. It refuses read-only pages, which
-/// reach it only where no twin of them was made short of the headroom of the views' budget
-/// ([`twin`], counted there), and, where a device of the process needs imported pages mapped from
-/// their files ([`imports_need_files`]), pages [`import_view`] left in views through dma-bufs, as
+/// reach it where no twin was asked for them (all but a surface's read-only alias), or none was
+/// made short of the headroom of the views' budget ([`twin`], counted there), so the runtime
+/// copies them, dropping the GPU's writes; and, where a device of the process needs imported
+/// pages mapped from their files ([`imports_need_files`]), pages [`import_view`] left in views
+/// through dma-bufs, as
 /// mapping them from their files would have come within that headroom (`super::budget`'s
 /// `claim`), each such refusal counted with its bytes ([`Refused`], trace record `nrcopy`). The
 /// runtime then makes the buffer or heap over a copy of the pages, which takes no mapping. A copy
@@ -451,10 +476,17 @@ impl ImportView {
         self.at
     }
 
-    /// Whether the GPU's writes through the import are kept where Metal drops them: it is a twin
-    /// of memory mapped read-only, the guest's pages or zeros (module docs).
-    pub(crate) fn writes_kept(&self) -> bool {
+    /// Whether the import is a writable twin of memory mapped read-only, the guest's pages or
+    /// zeros, whose GPU writes reach them where Metal drops them (module docs).
+    pub(crate) fn twinned(&self) -> bool {
         self.twin.is_some()
+    }
+
+    /// Whether the table shows a page of the memory mapped read-only: the runtime is given its
+    /// twin, or the pages themselves, which the gate refuses ([`import_gate`]), so the runtime
+    /// makes the object over a copy of them whose GPU writes it drops (module docs).
+    pub(crate) fn read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Whether the runtime may be told the import's pages are writable ([`host_memory_vouched`]):
@@ -627,18 +659,21 @@ impl SendPtr {
 
 /// The memory the runtime imports for `length` bytes at `at`: those bytes where every page of
 /// them is mapped writable or one has no file behind it (which the runtime then refuses as it
-/// refuses any import there), and otherwise a writable twin of their pages, at the same offset in
-/// its first page (module docs). Where a device needs imported pages mapped from their files, what
-/// of the bytes lies in views through dma-bufs is mapped from them, and a twin made, short of the
+/// refuses any import there), or where one is mapped read-only and `twin` is false (which the
+/// gate refuses, so the runtime copies them, dropping the GPU's writes); and otherwise, a
+/// surface's read-only alias, a writable twin of their pages, at the same offset in its first
+/// page (module docs). Where a device needs imported pages mapped from their files, what of the
+/// bytes lies in views through dma-bufs is mapped from them, and a twin made, short of the
 /// headroom of the views' budget, past which the gate refuses the pages and the runtime copies
 /// them ([`import_gate`]): the runtime asks the gate about every import, a no-copy buffer's,
 /// heap's or rebind's. Where none does, a twin may take the whole budget.
-pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
-    let plain = ImportView {
+pub(crate) fn import_view(at: NonNull<u8>, length: u64, twin: bool) -> ImportView {
+    let mut plain = ImportView {
         at,
         twin: None,
         pinned: None,
         vouched: false,
+        read_only: false,
     };
     let start = at.as_ptr().addr().to_u64();
     let page = vm::page_size();
@@ -669,10 +704,14 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
             ..plain
         };
     }
+    plain.read_only = true;
+    if !twin {
+        return plain;
+    }
     let Some(pieces) = files::pieces(first, end - first) else {
         return plain;
     };
-    let Some(twin) = vm::reclaiming(|| twin(first, end - first, &pieces, reach)) else {
+    let Some(twin) = vm::reclaiming(|| self::twin(first, end - first, &pieces, reach)) else {
         return plain;
     };
     log::debug!(
@@ -686,8 +725,7 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
     ImportView {
         at: twin_at,
         twin: Some(twin),
-        pinned: None,
-        vouched: false,
+        ..plain
     }
 }
 
@@ -824,14 +862,14 @@ mod tests {
         let at = vm::allocate_aliasable(2 * PAGE).unwrap();
         let first = at.addr().to_u64();
         let p = address(first + 0x40).unwrap();
-        let view = import_view(p, PAGE);
+        let view = import_view(p, PAGE, true);
         assert_eq!(view.at(), p, "writable: the memory itself");
-        assert!(!view.writes_kept());
+        assert!(!view.twinned());
         let (run, kept) = view.release(p, None);
         assert!(run.is_none() && kept.is_none());
         assert!(vm.protect_max(at, 2 * PAGE, VmProt::READ).is_ok());
-        let view = import_view(p, PAGE);
-        assert!(view.writes_kept());
+        let view = import_view(p, PAGE, true);
+        assert!(view.twinned());
         let twin = addr(view.at());
         assert_ne!(twin, addr(p));
         assert_eq!(twin & (PAGE - 1), 0x40, "the offset in its page");
@@ -862,6 +900,34 @@ mod tests {
         assert!(vm.deallocate(at, 2 * PAGE).is_success());
     }
 
+    /// Read-only memory imported without a twin (all but a surface's read-only alias) is given as
+    /// it is, read-only, and the gate refuses its pages, so the runtime copies them and drops the
+    /// GPU's writes; writable memory is not read-only, with a twin asked for or not
+    #[test]
+    fn read_only_memory_without_a_twin_is_refused_at_the_gate() {
+        let vm = LinuxVm::new();
+        let at = vm::allocate_aliasable(PAGE).unwrap();
+        let first = at.addr().to_u64();
+        let p = address(first).unwrap();
+        for twin in [false, true] {
+            let view = import_view(p, PAGE, twin);
+            assert_eq!((view.at(), view.read_only()), (p, false), "writable");
+            assert!(gate(first, first + PAGE));
+        }
+        assert!(vm.protect_max(at, PAGE, VmProt::READ).is_ok());
+        let view = import_view(p, PAGE, false);
+        assert_eq!(view.at(), p, "the pages themselves");
+        assert!(view.read_only() && !view.twinned());
+        assert!(!view.vouched());
+        assert!(!gate(first, first + PAGE), "refused, so copied");
+        let (run, kept) = view.release(p, None);
+        assert!(run.is_none() && kept.is_none());
+        let twinned = import_view(p, PAGE, true);
+        assert!(twinned.read_only() && twinned.twinned());
+        drop(twinned);
+        assert!(vm.deallocate(at, PAGE).is_success());
+    }
+
     /// The runtime may be told an import's pages are writable only where the table shows every
     /// one mapped writable as it is made: a range a view can be made of is vouched for; once one
     /// of its pages is protected read-only, the next import over it is a twin and is not; and
@@ -872,18 +938,18 @@ mod tests {
         let at = vm::allocate_aliasable(2 * PAGE).unwrap();
         let first = at.addr().to_u64();
         let p = address(first).unwrap();
-        let view = import_view(p, 2 * PAGE);
+        let view = import_view(p, 2 * PAGE, true);
         assert_eq!(view.at(), p);
         assert!(view.vouched(), "every page writable");
         drop(view);
         let second = address(first + PAGE).unwrap();
         let second = reims_vgpu_core::host::HostPtr::from_ptr(second.as_ptr());
         assert!(vm.protect_max(second, PAGE, VmProt::READ).is_ok());
-        let view = import_view(p, 2 * PAGE);
-        assert!(view.writes_kept(), "a twin of the read-only page");
+        let view = import_view(p, 2 * PAGE, true);
+        assert!(view.twinned(), "a twin of the read-only page");
         assert!(!view.vouched(), "a page read-only since the first import");
         drop(view);
-        let view = import_view(p, PAGE);
+        let view = import_view(p, PAGE, true);
         assert!(view.vouched(), "the page still writable");
         drop(view);
         assert!(vm.deallocate(at, 2 * PAGE).is_success());
@@ -899,7 +965,7 @@ mod tests {
             )
         };
         assert_ne!(anon, libc::MAP_FAILED);
-        let view = import_view(NonNull::new(anon.cast::<u8>()).unwrap(), PAGE);
+        let view = import_view(NonNull::new(anon.cast::<u8>()).unwrap(), PAGE, true);
         assert!(!view.vouched(), "memory the table does not know");
         drop(view);
         // SAFETY: the mapping made above.
@@ -945,7 +1011,7 @@ mod tests {
         }
         assert!(vm.protect_max(view, 4 * PAGE, VmProt::READ).is_ok());
         let p = address(view.addr().to_u64()).unwrap();
-        let import = import_view(p, 4 * PAGE);
+        let import = import_view(p, 4 * PAGE, true);
         let twin = addr(import.at());
         assert_ne!(twin, addr(p));
         assert_eq!(vm::tests::kernel_mappings(twin, twin + 4 * PAGE), 2);
@@ -964,7 +1030,7 @@ mod tests {
         assert!(zeros(&files::pieces(first, 1).unwrap()[0].backing.fd));
         assert!(vm.protect_max(at, PAGE, VmProt::READ).is_ok());
         let p = address(first).unwrap();
-        let view = import_view(p, PAGE);
+        let view = import_view(p, PAGE, true);
         let twin = addr(view.at());
         assert_ne!(twin, first);
         assert_eq!(read(twin), 0);
@@ -991,7 +1057,7 @@ mod tests {
         }];
         let alias = crate::gpu::backing::gather("test", &ranges, 3 * PAGE, true).unwrap();
         let at = alias.first();
-        let view = import_view(at, 3 * PAGE);
+        let view = import_view(at, 3 * PAGE, true);
         let twin = addr(view.at());
         assert_ne!(twin, addr(at), "a twin");
         assert_eq!(read(twin + 5), 0x6b, "the guest's page");
@@ -1041,7 +1107,7 @@ mod tests {
         let at = vm.allocate_anywhere(PAGE).unwrap();
         assert!(vm.protect_max(at, PAGE, VmProt::READ).is_ok());
         let p = NonNull::new(at.as_ptr::<u8>()).unwrap();
-        assert_eq!(import_view(p, PAGE).at(), p);
+        assert_eq!(import_view(p, PAGE, true).at(), p);
         assert!(vm.deallocate(at, PAGE).is_success());
     }
 
@@ -1088,7 +1154,7 @@ mod tests {
             let (first, end) = (addr(p), addr(p) + n * PAGE);
             let mappings = || vm::tests::kernel_mappings(first, end);
             assert_eq!(mappings(), 1, "the view, through a dma-buf");
-            let import = import_view(p, n * PAGE);
+            let import = import_view(p, n * PAGE, true);
             assert_eq!((import.at(), mappings()), (p, 1), "an import's, left");
             let (copied, copied_bytes) = counted(&COPIED);
             assert!(!gate(first, end), "refused at the gate");
@@ -1096,7 +1162,7 @@ mod tests {
             drop(import);
             // Room short of the headroom.
             budget::set_test_limit(Some(limit(budget::HEADROOM + 2 * n)));
-            let import = import_view(p, n * PAGE);
+            let import = import_view(p, n * PAGE, true);
             assert_eq!((import.at(), mappings()), (p, n), "from their files");
             assert!(gate(first, end), "let through");
         } else {
@@ -1123,12 +1189,12 @@ mod tests {
         let (first, end) = (addr(p), addr(p) + PAGE);
         let before = TWINLESS.count.load(Ordering::Relaxed);
         budget::set_test_limit(Some(budget::held() + budget::RESERVE + budget::HEADROOM));
-        let view = import_view(p, PAGE);
+        let view = import_view(p, PAGE, true);
         assert_eq!(view.at(), p, "no twin");
         assert!(!gate(first, end), "refused, read-only");
         assert_eq!(TWINLESS.count.load(Ordering::Relaxed), before + 1);
         budget::set_test_limit(None);
-        let view = import_view(p, PAGE);
+        let view = import_view(p, PAGE, true);
         assert_ne!(view.at(), p, "a twin");
         let twin = addr(view.at());
         assert!(gate(twin, twin + PAGE), "the twin let through");
@@ -1170,11 +1236,11 @@ mod tests {
         write(first + 7, 0x77);
         IMPORTS_NEED_FILES.store(true, std::sync::atomic::Ordering::Relaxed);
         let p = NonNull::new(view.as_ptr::<u8>()).unwrap();
-        let whole = import_view(p, n * PAGE);
+        let whole = import_view(p, n * PAGE, true);
         assert_eq!((whole.at(), mappings(first, end)), (p, n), "imported");
         assert_eq!(read(first + 7), 0x77);
         drop(whole);
-        let again = import_view(address(first + 4 * PAGE).unwrap(), 2 * PAGE);
+        let again = import_view(address(first + 4 * PAGE).unwrap(), 2 * PAGE, true);
         drop(again);
         assert_eq!(mappings(first, end), n, "no import");
         assert_eq!(read(first + 7), 0x77);

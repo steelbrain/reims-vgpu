@@ -2399,9 +2399,10 @@ pub(crate) mod tests {
     use crate::os::tests::bgra_surface;
     use crate::platform::tests::platform;
 
-    /// A no-copy buffer over `pages` pages of zeros mapped read-only, which the runtime imports
-    /// through a writable twin of them on Linux, and the pages' first byte, which the caller
-    /// frees once the buffer is gone.
+    /// A no-copy buffer core makes over `pages` pages of zeros mapped read-only
+    /// (`newBufferWithBytesNoCopy`), which the runtime imports through a writable twin of them on
+    /// Linux ([`crate::gpu::backing::ImportSite::twins`]), and the pages' first byte, which the
+    /// caller frees once the buffer is gone.
     #[cfg(target_os = "linux")]
     pub(crate) fn over_read_only_pages(pages: u64) -> (VulkanBuffer, HostPtr) {
         use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
@@ -2423,11 +2424,65 @@ pub(crate) mod tests {
         (b, at)
     }
 
-    /// A no-copy buffer over pages mapped read-only, made where Metal makes it, answers its own
-    /// address as its contents, and a GPU fill into it dies where it is encoded: on Linux the
-    /// runtime imports a writable twin of the pages, which the fill would reach, where Metal
-    /// drops the write (`os/linux/import.rs`, [`crate::gpu::writes::kept_write`]). The rest of
-    /// the command buffer runs, and the pages stay zeros
+    /// `MTLResourceOptions` bit 24, which core sets on a read-only detached buffer or heap.
+    pub(crate) const BIT_24: u64 = 0x100_0000;
+
+    /// A no-copy buffer a descriptor names over `pages` pages of zeros of the platform's own,
+    /// made with bit 24 ([`BIT_24`]), as the guest makes a read-only one: the runtime makes it
+    /// over a copy of the pages whose GPU writes it drops on Linux (announcing
+    /// `copied-host-pages`, which dies in strict mode, so it is made under the default), and
+    /// imports a read-only view of them on macOS; and the pages' first byte, which the caller
+    /// frees once the buffer is gone.
+    pub(crate) fn read_only_buffer(pages: u64) -> (VulkanBuffer, HostPtr) {
+        use crate::os::PAGE;
+
+        let at = crate::os::allocate_aliasable(pages * PAGE).unwrap();
+        // SAFETY: the pages outlive the buffer, which the caller drops before freeing them.
+        let bytes = unsafe { HostRange::new(at, pages * PAGE) };
+        let b = crate::answer::relaxed(|| {
+            dev().new_buffer(BufferDesc {
+                length: pages * PAGE,
+                options: vec![
+                    OptionSet::StorageMode(0),
+                    OptionSet::ResourceOptionsOr(BIT_24),
+                ],
+                pinned_gpu_address: None,
+                contents: Some(bytes),
+                no_copy: true,
+                deallocator: None,
+            })
+        })
+        .unwrap()
+        .expect("a read-only buffer, as Metal makes");
+        (b, at)
+    }
+
+    /// A 16 × 16 `BGRA8Unorm` texture of `usage` over `b` from its start, its rows 64 bytes apart.
+    pub(crate) fn bgra_over(b: &VulkanBuffer, usage: u64) -> VulkanTexture {
+        let desc = platform().texture_descriptor(&TextureDesc {
+            pixel_format: 80,
+            width: 16,
+            height: 16,
+            usage,
+            resource_options: Some(0),
+            ..TextureDesc::default()
+        });
+        b.new_texture(OnFault::Die, &desc, 0, 64).unwrap().unwrap()
+    }
+
+    /// The `n` bytes from `at`, read after no GPU work uses them.
+    pub(crate) fn host_bytes_at(at: HostPtr, n: usize) -> Vec<u8> {
+        // SAFETY: pages the caller mapped readable, which no GPU work uses now.
+        (0..n)
+            .map(|i| unsafe { at.wrapping_add(i as u64).as_ptr::<u8>().read_volatile() })
+            .collect()
+    }
+
+    /// A no-copy buffer core makes over pages mapped read-only, made where Metal makes it,
+    /// answers its own address as its contents, and a GPU fill into it dies where it is encoded:
+    /// on Linux the runtime imports a writable twin of the pages, which the fill would reach,
+    /// where Metal drops the write (`os/linux/import.rs`, [`crate::gpu::writes::kept_write`]).
+    /// The rest of the command buffer runs, and the pages stay zeros
     #[cfg(target_os = "linux")]
     #[test]
     fn a_fill_into_read_only_pages_dies_on_linux() {
@@ -2441,7 +2496,7 @@ pub(crate) mod tests {
 
         let (b, pages) = over_read_only_pages(2);
         assert_eq!(b.contents(), pages, "its own address, not the twin's");
-        assert!(b.backing.writes_kept());
+        assert!(b.backing.twinned_now());
         let q = dev().new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
@@ -2464,6 +2519,111 @@ pub(crate) mod tests {
         assert_eq!((read(0x10), read(0x2f)), (0, 0));
         drop((cb, e, b));
         assert!(OsVm::new().deallocate(pages, 2 * PAGE).is_success());
+    }
+
+    /// A guest's read-only buffer (a no-copy buffer made with bit 24, [`read_only_buffer`])
+    /// takes a blit's fill into it, and on Linux a copy into it too, the command buffer
+    /// completing with no error, and its pages stay as they were: the runtime drops the writes,
+    /// through its copy of the pages on Linux and Metal's read-only view on macOS, as Metal
+    /// drops a fill (measured, `crate::gpu::writes`'s docs). What Metal does with a copy into
+    /// such memory is unmeasured, so a Mac, whose GPU every process shares, runs only the fill.
+    /// On Linux a blit into a texture over it dies where it is encoded, as what Metal does
+    /// there is unmeasured. Its contents answer the pages' address on both
+    #[test]
+    fn a_blit_into_a_read_only_buffer_is_dropped() {
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
+
+        use crate::os::{OsVm, PAGE};
+
+        let (b, pages) = read_only_buffer(1);
+        assert_eq!(b.contents(), pages);
+        assert_eq!(b.backing.read_only_now(), crate::os::COPIES_READ_ONLY);
+        assert!(!b.backing.twinned_now() && !crate::gpu::writes::buffer_kept(&b));
+        let d = dev();
+        let source = d
+            .new_buffer_of_length(OnFault::Die, 0x40, 0)
+            .unwrap()
+            .unwrap();
+        // SAFETY: a Shared buffer of 0x40 bytes, which no command uses yet.
+        unsafe { std::ptr::write_bytes(source.contents().as_ptr::<u8>(), 0x3c, 0x40) };
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let fill = BlitCmd::FillBuffer {
+            buffer: &b,
+            range: NsRange::new(0x10, 0x20),
+            value: 0xa5,
+        };
+        e.encode(OnFault::Die, fill).unwrap();
+        if crate::os::COPIES_READ_ONLY {
+            let copy = BlitCmd::CopyBufferToBuffer {
+                source_buffer: Some(&source),
+                source_offset: 0,
+                destination_buffer: Some(&b),
+                destination_offset: 0x100,
+                size: 0x40,
+            };
+            e.encode(OnFault::Die, copy).unwrap();
+        }
+        let texture = bgra_over(&b, 0x1);
+        if crate::os::COPIES_READ_ONLY {
+            let into_texture = BlitCmd::CopyBufferToTexture {
+                source_buffer: &source,
+                source_offset: 0,
+                source_bytes_per_row: 16,
+                source_bytes_per_image: 0x40,
+                source_size: MtlSize::new(4, 4, 1),
+                destination_texture: &texture,
+                destination_slice: 0,
+                destination_level: 0,
+                destination_origin: MtlOrigin::new(0, 0, 0),
+            };
+            let sel = into_texture.selector();
+            let site = catch_death(|| e.encode(OnFault::Die, into_texture)).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+        }
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(cb.status().0, 4);
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        assert!(host_bytes_at(pages, 0x200).iter().all(|&byte| byte == 0));
+        drop((cb, e, texture, b));
+        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+    }
+
+    /// A CPU write of a texture over a guest's read-only buffer ([`read_only_buffer`]) dies at
+    /// `replaceRegion:` on Linux, where Metal's CPU write through the read-only mapping ends the
+    /// process, and the runtime's would land in its copy
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cpu_write_of_a_texture_over_a_read_only_buffer_dies_on_linux() {
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use reims_vgpu_core::platform::resource::Texture as _;
+        use reims_vgpu_core::platform::types::{MtlRegion, MtlSize};
+
+        use crate::os::{OsVm, PAGE};
+
+        let (b, pages) = read_only_buffer(1);
+        let texture = bgra_over(&b, 0x1);
+        let texels = [0x77u8; 64];
+        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(16, 1, 1));
+        let write = || texture.replace_region(region, 0, 0, HostRange::of_slice(&texels), 64, 0);
+        let site = catch_death(write).unwrap_err();
+        assert_eq!(
+            (site.kind, site.file),
+            (
+                DeathKind::Abort,
+                "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:"
+            )
+        );
+        assert!(host_bytes_at(pages, 64).iter().all(|&byte| byte == 0));
+        drop((texture, b));
+        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
     }
 
     /// A host range is copied whole into memory of the platform's own, which later writes to the

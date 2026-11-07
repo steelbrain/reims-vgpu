@@ -425,6 +425,10 @@ pub struct RenderEncoderObject {
     /// descriptor's or a late resolve setter's, is never sent ([`Unsent`]): a late store action
     /// that resolves into such a one dies ([`VulkanRenderEncoder::late_store`]).
     undecided: Mutex<Vec<(Attachment, Option<Unsent>)>>,
+    /// The attachments of [`Self::undecided`] whose texture lies over read-only memory the
+    /// runtime copies: a late store action that keeps such a one fails the command buffer as
+    /// Metal's GPU faults it ([`VulkanRenderEncoder::read_only_stores`]).
+    read_only_undecided: Mutex<Vec<Attachment>>,
     /// The store action a late setter gave each attachment whose store action the descriptor
     /// left `Unknown`, the last one set: whether a late depth or stencil resolve texture beside a
     /// dropped colour resolve may resolve ([`VulkanRenderEncoder::resolves_beside_dropped`]).
@@ -1027,13 +1031,14 @@ fn undecided(d: &rt::RenderPassDescriptor) -> Vec<(Attachment, Option<Unsent>)> 
     out
 }
 
-/// Why a pass's write into a texture is never sent: the runtime imports its memory through a
-/// writable twin of read-only pages, where the write would land
+/// Why a pass's write into a texture is never sent: its memory is read-only, which the runtime
+/// imports through a writable twin of a surface's pages, where the write would land, or copies,
+/// where what Metal does with a resolve into it is unmeasured
 /// ([`crate::gpu::writes::kept_write`]), or it lies on a surface whose GPU writes never reach its
 /// memory ([`crate::os::dropped_write`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Unsent {
-    /// Over memory the runtime imports through a writable twin of read-only pages.
+    /// Over read-only memory whose writes this platform does not answer as Metal's GPU does.
     Kept,
     /// On a surface whose GPU writes never reach its memory.
     Dropped,
@@ -1061,31 +1066,57 @@ impl Unsent {
     }
 }
 
-/// What a pass of `d` may write in memory the runtime imports through a writable twin of
-/// read-only pages ([`crate::gpu::writes::kept_write`]), as `sources` says of its attachments: an
-/// attachment's texture, whatever the pass's load and store actions, as the runtime's GPU may
-/// write the texels of one it loads and stores unchanged, or whose store it does not care for,
-/// which Vulkan leaves undefined; or a resolve texture its known store action resolves into.
-/// `None` for none. A resolve texture of an attachment whose store action is `Unknown` is written
-/// only where a late store action resolves into it ([`VulkanRenderEncoder::late_store`]), and a
-/// visibility result buffer only where a mode is set ([`Reach::visibility`]).
+/// What a pass of `d` may write in read-only memory whose writes this platform does not answer
+/// as Metal's GPU does ([`crate::gpu::writes::kept_write`]), as `sources` says of its
+/// attachments: an attachment's texture over a surface's memory the runtime twins, whatever the
+/// pass's load and store actions, as the runtime's GPU may write the texels of one it loads and
+/// stores unchanged, or whose store it does not care for, which Vulkan leaves undefined; one over
+/// read-only memory the runtime copies that the pass keeps by `CustomSampleDepthStore`, which
+/// nothing measured; or a resolve texture over either that its known store action resolves
+/// into, which nothing measured either for read-only memory Metal keeps the GPU's writes from.
+/// `None` for none. Another attachment over memory the runtime copies is answered by its store
+/// action ([`VulkanRenderEncoder::read_only_stores`]). A resolve texture of an attachment whose
+/// store action is `Unknown` is written only where a late store action resolves into it
+/// ([`VulkanRenderEncoder::late_store`]), and a visibility result buffer only where a mode is set
+/// ([`Reach::visibility`]).
 fn kept_attachment(d: &rt::RenderPassDescriptor, sources: &Sources) -> Option<&'static str> {
     let (depth, stencil) = (&d.depth_attachment, &d.stencil_attachment);
     let colors = d.color_attachments.iter().map(|a| a.store_action);
     let stores = colors.chain([depth.store_action, stencil.store_action]);
     let held = (sources.color.iter()).chain([&sources.depth, &sources.stencil]);
     for (store, [texture, resolve]) in stores.zip(held) {
-        if texture.writes_kept() {
+        if texture.twinned() {
             return Some(
                 "a pass, which the runtime's GPU may write whatever its load and store actions, \
                  whose attachment lies over",
             );
+        }
+        if store == rt::StoreAction::CustomSampleDepthStore && texture.writes_kept() {
+            return Some("a pass that keeps by CustomSampleDepthStore an attachment over");
         }
         if store.resolves() && resolve.writes_kept() {
             return Some("a pass that resolves into a texture over");
         }
     }
     None
+}
+
+/// Whether a pass's store action `store` keeps an attachment's texels in its memory: `Store`, and
+/// `StoreAndMultisampleResolve`, which keeps a multisample primary, at which Metal's GPU faults
+/// the command buffer where the memory is read-only (`crate::gpu::writes`'s measurements).
+/// `CustomSampleDepthStore`, which nothing measured there, dies before it is asked
+/// ([`kept_attachment`]).
+fn stores_out(store: rt::StoreAction) -> bool {
+    matches!(
+        store,
+        rt::StoreAction::Store | rt::StoreAction::StoreAndMultisampleResolve
+    )
+}
+
+/// Whether `texture`, an attachment's, lies in read-only memory the runtime copies, dropping the
+/// GPU's writes: read-only and not a surface's twin ([`crate::gpu::writes::Kept::Until`]).
+fn over_read_only_copy(texture: &Source) -> bool {
+    texture.writes_kept() && !texture.twinned()
 }
 
 /// What [`metal_aborts`] says of a pass without attachments whose `defaultRasterSampleCount` is
@@ -1199,9 +1230,11 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// for the 32 by 32 tiles that none of the draws reach of a pass that loads a texture of
 /// rotation 4 and draws, which Metal keeps in place and the runtime lands mirrored as the others
 /// (`rotated-load-tiles`, [`crate::gpu::desc`]), so such a pass dies at `endEncoding`, naming
-/// the kind; a pass that draws nothing is Metal's. One whose attachment or resolve texture lies
-/// over memory the runtime imports through a writable twin of read-only pages dies first
-/// ([`kept_attachment`]).
+/// the kind; a pass that draws nothing is Metal's. One whose attachment lies over read-only
+/// memory the runtime twins, or whose resolve texture it resolves into lies over read-only
+/// memory, dies first ([`kept_attachment`]); one that stores an attachment over read-only memory
+/// the runtime copies fails its command buffer as Metal's GPU faults it
+/// ([`VulkanRenderEncoder::read_only_stores`]).
 /// One whose attachment, resolve texture or visibility result buffer lies on a surface whose GPU
 /// writes never reach its memory dies ([`crate::os::dropped_write`]): Metal faults the command
 /// buffer of such a pass that stores what it cleared or drew, and completes one that stores
@@ -1270,6 +1303,7 @@ pub(crate) fn open(
     };
     if let Ok(Some(e)) = &made {
         e.undecided_dropped(&sources);
+        e.read_only_stores(&sources);
         let visibility = (sources.visibility.as_ref())
             .map_or(Kept::No, |b| crate::gpu::writes::buffer_bound(b).kept);
         plain(|| e.drawing.lock().borrow_mut().reach.visibility = visibility);
@@ -1439,9 +1473,12 @@ struct Reach {
     used_textures: Vec<Bound>,
     /// The buffers made resident with write usage, likewise.
     used_buffers: Vec<Bound>,
-    /// Whether the pass's visibility result buffer lies over memory the runtime imports through
-    /// a writable twin of read-only pages: a mode other than `Disabled` dies, as the pass writes
-    /// a result at its offset, a draw after it or not ([`crate::gpu::writes::kept_write`]).
+    /// Whether the pass's visibility result buffer lies over read-only memory the runtime imports
+    /// through a writable twin of its pages (a surface's, or a range core maps read-only): a mode
+    /// other than `Disabled` dies, as
+    /// the pass writes a result at its offset, a draw after it or not
+    /// ([`crate::gpu::writes::kept_write`]). One over read-only memory the runtime copies keeps
+    /// nothing: the result is dropped, as Metal drops it.
     visibility: Kept,
     /// The reflection of the pipeline state set, which this holds as Metal's encoder holds the
     /// state, and whether its functions write textures, which tells which texture slots they
@@ -1451,9 +1488,10 @@ struct Reach {
 }
 
 /// Whether a bind's `m` can decide what a draw asks of it ([`Reach::kept`], [`Reach::unsent`]):
-/// it lies over memory the runtime imports through a writable twin of read-only pages, on a
-/// surface whose GPU writes never reach its memory, or is a texture whose writes the runtime
-/// refuses. A draw asks nothing of any other.
+/// it lies over read-only memory whose writes this platform does not answer as Metal's GPU does
+/// (a surface's the runtime twins, or a texture over memory the runtime copies), on a surface
+/// whose GPU writes never reach its memory, or is a texture whose writes the runtime refuses. A
+/// draw asks nothing of any other.
 fn matters(m: &Bound) -> bool {
     !matches!(m.kept, Kept::No) || m.dropped || m.refused.is_some()
 }
@@ -1570,8 +1608,9 @@ impl Reach {
     }
 
     /// How a draw, a tile dispatch, or an execution whose commands take `inherits` of the encoder,
-    /// writes through an object over memory the runtime imports through a writable twin of
-    /// read-only pages ([`crate::gpu::writes::kept_write`]), the first found: a texture or buffer
+    /// writes through an object over read-only memory whose writes this platform does not answer
+    /// as Metal's GPU does ([`crate::gpu::writes::kept_write`]): a surface's the runtime twins, or,
+    /// for a texture, memory the runtime copies, the first found: a texture or buffer
     /// made resident with write usage, and, as [`Self::at_slots`] reads them, a texture bound at
     /// a slot a function writes and a buffer bound at one, of every stage, but for an execution,
     /// whose commands run no tile, object or mesh function and take the encoder's buffers only
@@ -1767,6 +1806,7 @@ fn opened(
         encoder: EncoderObject::new(raw, command_buffer),
         drawing: ReentrantMutex::new(RefCell::new(Drawing::default())),
         undecided: Mutex::new(undecided(&d)),
+        read_only_undecided: Mutex::new(Vec::new()),
         late_stores: Mutex::new(Vec::new()),
         no_layers: taken.class == Some(Class::NoLayers),
         dropped,
@@ -2081,8 +2121,9 @@ impl VulkanRenderEncoder {
     /// writes, which nothing measured ([`Reach::unsent`], [`crate::os::dropped_write`]), naming
     /// how ([`Whether::through`]). A vertex or fragment function's stores into a buffer on such a
     /// surface are sent, and dropped as on Metal. Before that, it dies where it may write through
-    /// an object over memory the runtime imports through a writable twin of read-only pages,
-    /// whose pages the write would reach ([`Reach::kept`], [`crate::gpu::writes::kept_write`]).
+    /// an object over read-only memory whose writes this platform does not answer as Metal's GPU
+    /// does ([`Reach::kept`], [`crate::gpu::writes::kept_write`]); a write through a buffer over
+    /// read-only memory the runtime copies is sent, and dropped as on Metal.
     /// One that issues nothing, which Metal writes nothing of, is not asked. A pass that holds
     /// nothing a draw asks of ([`Reach::quiet`]) finds nothing, so its draws only check the
     /// task's end, where the lookup would have.
@@ -3715,6 +3756,37 @@ impl VulkanRenderEncoder {
         self.dropped.iter().find(|d| d.index == index).copied()
     }
 
+    /// Fails the command buffer from this pass on with Metal's page fault where the pass keeps an
+    /// attachment whose texture lies over read-only memory the runtime copies
+    /// ([`over_read_only_copy`], [`stores_out`]), as `sources` holds the pass descriptor's: Metal's
+    /// GPU faults the command buffer there, where the runtime's copy would take the store
+    /// ([`crate::gpu::command::CommandBufferObject::faults_at_read_only_store`]). One whose store
+    /// action is `Unknown` waits for its late store action ([`Self::late_store`]). One that does
+    /// not store (`DontCare`, `MultisampleResolve`) is sent, as Metal completes it, its writes
+    /// dropped by the copy.
+    fn read_only_stores(&self, sources: &Sources) {
+        let colors = (0u32..).zip(&sources.color);
+        let attachments = (colors.map(|(i, [t, _])| (Attachment::Color(i), t)))
+            .chain([(Attachment::Depth, &sources.depth[0])])
+            .chain([(Attachment::Stencil, &sources.stencil[0])]);
+        let mut faults = false;
+        for (attachment, texture) in attachments {
+            if !plain(|| over_read_only_copy(texture)) {
+                continue;
+            }
+            match self.stored(attachment).map(|(action, _)| action) {
+                Some(rt::StoreAction::Unknown) => {
+                    plain(|| self.read_only_undecided.lock().push(attachment));
+                }
+                Some(action) => faults |= stores_out(action),
+                None => {}
+            }
+        }
+        if faults {
+            self.encoder.faults_at_read_only_store();
+        }
+    }
+
     /// Marks each undecided attachment ([`Self::late_store`]) with why a resolve into its resolve
     /// texture, as `sources` holds the pass descriptor's, is never sent ([`Unsent`]).
     fn undecided_dropped(&self, sources: &Sources) {
@@ -3792,7 +3864,10 @@ impl VulkanRenderEncoder {
     /// again encodes nothing, as plain Metal resolves nothing into the texture
     /// (`resolves_into_other_formats_are_metals_or_die_named`). A colour index past the eighth is
     /// the runtime's to refuse. One that resolves an undecided attachment into a resolve texture
-    /// whose GPU writes never reach its memory dies ([`crate::os::dropped_write`]).
+    /// whose GPU writes never reach its memory dies ([`crate::os::dropped_write`]). One that keeps
+    /// an undecided attachment over read-only memory the runtime copies fails the command buffer
+    /// as Metal's GPU faults it, and one that keeps it by `CustomSampleDepthStore` dies
+    /// ([`Self::read_only_stores`]).
     fn late_store(
         &self,
         sel: &'static str,
@@ -3816,6 +3891,20 @@ impl VulkanRenderEncoder {
                     && action.resolves()
                 {
                     unsent.dies(sel, "a store action that resolves into a texture");
+                }
+                let read_only = plain(|| {
+                    let mut undecided = self.read_only_undecided.lock();
+                    let at = undecided.iter().position(|&a| a == attachment);
+                    at.map(|at| undecided.remove(at)).is_some()
+                });
+                if read_only && action == rt::StoreAction::CustomSampleDepthStore {
+                    crate::gpu::writes::kept_write(
+                        sel,
+                        "a store action CustomSampleDepthStore that keeps an attachment over",
+                    );
+                }
+                if read_only && stores_out(action) {
+                    self.encoder.faults_at_read_only_store();
                 }
                 self.run(sel, call)?;
                 plain(|| {
@@ -5529,8 +5618,9 @@ pub(crate) mod tests {
 
     /// A draw of `read_only_beside_nested_vertex` and `read_only_beside_nested_fragment`
     /// ([`crate::gpu::writes::tests::PROBE`]), whose argument buffers' type the runtime refuses
-    /// the reflection of, through a buffer over pages mapped read-only bound at both functions'
-    /// buffer slot 1, which they declare `const` and cannot store through, draws, indexed: the
+    /// the reflection of, through a buffer core makes over pages mapped read-only bound at both
+    /// functions' buffer slot 1, which they declare `const` and cannot store through, draws,
+    /// indexed: the
     /// vertex function writes its words of slot 2 and the fragment function red. Bound at the
     /// vertex function's slot 2 too, a `device` pointer, the draw dies where it is encoded: on
     /// Linux the runtime imports a writable twin of the pages, which the write would reach
@@ -5631,6 +5721,180 @@ pub(crate) mod tests {
         let first = unsafe { pages.as_ptr::<u32>().read_volatile() };
         assert_eq!(first, 0);
         drop((cb, e, state, read_only));
+        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+    }
+
+    /// `MTLLoadActionDontCare`, `MTLLoadActionLoad`, `MTLStoreActionDontCare`,
+    /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionUnknown`.
+    #[cfg(target_os = "linux")]
+    const LOAD_DONT_CARE: u64 = 0;
+    #[cfg(target_os = "linux")]
+    const LOAD: u64 = 1;
+    #[cfg(target_os = "linux")]
+    const DONT_CARE: u64 = 0;
+    #[cfg(target_os = "linux")]
+    const MULTISAMPLE_RESOLVE: u64 = 2;
+    #[cfg(target_os = "linux")]
+    const UNKNOWN: u64 = 4;
+
+    /// A pass whose colour attachment is a 16 × 16 `BGRA8Unorm` texture over a guest's read-only
+    /// buffer (made with bit 24, `resource::tests::read_only_buffer`), loaded by `load` and
+    /// stored by `store`, or by `late`'s store action set in the pass where given, drawing
+    /// nothing, committed and completed: its command buffer's status and error code, and whether
+    /// the pages stayed zeros.
+    #[cfg(target_os = "linux")]
+    fn read_only_pass(load: u64, store: u64, late: Option<u64>) -> (u64, Option<i64>, bool) {
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
+        use crate::os::{OsVm, PAGE};
+
+        let (p, d) = (platform(), dev());
+        let (ro, pages) = read_only_buffer(1);
+        let target = bgra_over(&ro, READ | TARGET);
+        let pass = p.render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&target)),
+            load_action: Some(load),
+            store_action: Some(store),
+            clear_color: Some(ClearColor {
+                red: 1.0,
+                green: 0.5,
+                blue: 0.25,
+                alpha: 1.0,
+            }),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        if let Some(store_action) = late {
+            let set = RenderCmd::SetColorStoreAction {
+                store_action,
+                color_attachment_index: 0,
+            };
+            e.encode(OnFault::Die, set).unwrap();
+        }
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        let zeros = host_bytes_at(pages, 16 * 64).iter().all(|&b| b == 0);
+        let answer = (cb.status().0, cb.error().map(|e| e.code), zeros);
+        drop((cb, e, pass, target, ro));
+        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+        answer
+    }
+
+    /// Commits an empty command buffer of a fresh queue: the selector it dies at, if it dies.
+    #[cfg(target_os = "linux")]
+    fn later_commit() -> Option<&'static str> {
+        let q = dev().new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        match catch_death(|| cb.commit(OnFault::Die)) {
+            Ok(_) => {
+                cb.wait_until_completed(OnFault::Die).unwrap();
+                None
+            }
+            Err(site) => Some(site.file),
+        }
+    }
+
+    /// A pass that stores a colour attachment over a guest's read-only memory (`Store`) fails its
+    /// command buffer with Metal's page fault (`MTLCommandBufferErrorPageFault`, 3), as Metal's
+    /// GPU faults it, the pages staying zeros, where the runtime's copy of them would take the
+    /// store; the commit of every later command buffer of the process then dies, as Metal fails
+    /// each with a code nothing recorded (`crate::gpu::command`'s docs; one process per test, as
+    /// nextest runs them). Linux's: on macOS the pass goes to Metal, whose fault this host's GPU
+    /// takes no test of
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_store_into_read_only_memory_fails_its_command_buffer() {
+        assert_eq!(later_commit(), None, "before the fault");
+        assert_eq!(read_only_pass(CLEAR, STORE, None), (5, Some(3), true));
+        assert_eq!(later_commit(), Some("commit"), "after it");
+    }
+
+    /// A late store action that stores the colour attachment over a guest's read-only memory,
+    /// of a pass that left it `Unknown`, fails the command buffer as `Store` given at once does
+    /// (`a_store_into_read_only_memory_fails_its_command_buffer`)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_late_store_into_read_only_memory_fails_its_command_buffer() {
+        assert_eq!(
+            read_only_pass(CLEAR, UNKNOWN, Some(STORE)),
+            (5, Some(3), true)
+        );
+        assert_eq!(later_commit(), Some("commit"));
+    }
+
+    /// A pass over a colour attachment over a guest's read-only memory that does not store it
+    /// completes with no error, as Metal's does, the pages staying zeros: `DontCare`, given at
+    /// once or late, after a clear, a load or no load; and every later command buffer runs
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pass_that_does_not_store_read_only_memory_completes() {
+        for (load, store, late) in [
+            (CLEAR, DONT_CARE, None),
+            (LOAD, DONT_CARE, None),
+            (LOAD_DONT_CARE, DONT_CARE, None),
+            (CLEAR, UNKNOWN, Some(DONT_CARE)),
+        ] {
+            let answer = read_only_pass(load, store, late);
+            assert_eq!(answer, (4, None, true), "{load} {store} {late:?}");
+        }
+        assert_eq!(later_commit(), None);
+    }
+
+    /// A pass that resolves a multisample attachment of the device's memory into a texture over
+    /// a guest's read-only memory dies where it is made: what Metal does there is unknown (no
+    /// verdict over 520 processes, `crate::gpu::writes`'s docs). Linux's: on macOS it goes to
+    /// Metal
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resolve_into_read_only_memory_dies() {
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::{bgra_over, read_only_buffer};
+        use crate::os::{OsVm, PAGE};
+
+        /// `MTLTextureType2DMultisample`.
+        const MULTISAMPLE: u64 = 4;
+        let (p, d) = (platform(), dev());
+        let (ro, pages) = read_only_buffer(1);
+        let target = bgra_over(&ro, READ | TARGET);
+        let samples = d
+            .new_texture(
+                OnFault::Die,
+                &p.texture_descriptor(&TextureDesc {
+                    texture_type: MULTISAMPLE,
+                    pixel_format: BGRA8,
+                    width: 16,
+                    height: 16,
+                    sample_count: 4,
+                    usage: TARGET,
+                    resource_options: Some(0x20),
+                    ..TextureDesc::default()
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let pass = p.render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&samples)),
+            resolve_texture: Some(Some(&target)),
+            load_action: Some(CLEAR),
+            store_action: Some(MULTISAMPLE_RESOLVE),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let site = catch_death(|| cb.render_encoder(OnFault::Die, &pass)).unwrap_err();
+        assert_eq!(site.file, "renderCommandEncoderWithDescriptor:");
+        drop((cb, pass, samples, target, ro));
         assert!(OsVm::new().deallocate(pages, PAGE).is_success());
     }
 

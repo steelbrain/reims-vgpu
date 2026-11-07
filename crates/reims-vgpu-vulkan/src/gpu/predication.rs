@@ -1520,10 +1520,11 @@ impl Unit {
     }
 
     /// How the open encoder's next work, `inherits` what an execution's commands take of the
-    /// encoder, writes through an object over memory the runtime imports through a writable twin
-    /// of read-only pages ([`crate::gpu::writes::kept_write`]), the first found: a texture bound
-    /// at a slot its kernel writes, as [`Self::texel_writes`] reads them; a buffer bound at a slot
-    /// the kernel writes, by its slot writes (every slot where they cannot tell, and
+    /// encoder, writes through an object over read-only memory whose writes this platform does
+    /// not answer as Metal's GPU does ([`crate::gpu::writes::kept_write`]): a surface's the
+    /// runtime twins, or, for a texture, memory the runtime copies; the first found: a texture
+    /// bound at a slot its kernel writes, as [`Self::texel_writes`] reads them; a buffer bound at
+    /// a slot the kernel writes, by its slot writes (every slot where they cannot tell, and
     /// every bound buffer an execution's commands take where they run pipeline states of their
     /// own); and a texture or buffer made resident with write usage (a heap made resident is
     /// read, as Metal's are). `None` where it writes none, and where no pipeline state is set for
@@ -2016,8 +2017,10 @@ pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> Ra
     }
     // An execution of no command runs nothing: it writes and samples nothing.
     let empty = matches!(&work, Work::Execute { range, .. } if range.is_empty());
-    // A write through an object over memory the runtime imports through a writable twin of
-    // read-only pages dies, at every extent; with no such object, none is looked for.
+    // A write through an object over read-only memory whose writes this platform does not answer
+    // as Metal's GPU does dies, at every extent; with no such object, none is looked for. A
+    // kernel's stores into a buffer over read-only memory the runtime copies are sent, and
+    // dropped, as Metal drops them.
     if crate::os::TWINS_READ_ONLY
         && !empty
         && crate::gpu::writes::any_kept()
