@@ -1,7 +1,8 @@
-// The build's stitcher (build.rs): writes the library Metal's stitcher makes of the graph `fused`
-// over the functions of the metallib it is given, the shell tests' stitchable.metal, as the bytes
-// Metal answers for it, which the guest's route sends (the bundle's RgfxStitchOverShadows).
-// `fused` is `stitch_mul(stitch_add(a, b), c)`, the graph the shell tests stitch.
+// The build's stitcher (build.rs): writes the library Metal's stitcher makes of the graphs `fused`
+// and `pair` over the functions of the metallib it is given, the shell tests' stitchable.metal, as
+// the bytes Metal answers for it, which the guest's route sends (the bundle's
+// RgfxStitchOverShadows). `fused` is `stitch_mul(stitch_add(a, b), c)`, the graph the shell tests
+// stitch; `pair` is `stitch_add(a, b)`, of two inputs, which stitch_caller_extra calls with three.
 //
 // Usage: stitch <stitchable.metallib> <stitched.metallib>
 #import <Foundation/Foundation.h>
@@ -41,11 +42,21 @@ int main(int argc, char **argv)
 		    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"stitch_mul"
 		                                                 arguments:@[ sum, c ]
 		                                       controlDependencies:@[]];
+		MTLFunctionStitchingFunctionNode *pairSum =
+		    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"stitch_add"
+		                                                 arguments:@[ a, b ]
+		                                       controlDependencies:@[]];
 		MTLStitchedLibraryDescriptor *descriptor = [MTLStitchedLibraryDescriptor new];
-		descriptor.functionGraphs = @[ [[MTLFunctionStitchingGraph alloc] initWithFunctionName:@"fused"
-		                                                                                 nodes:@[ sum ]
-		                                                                            outputNode:product
-		                                                                            attributes:@[]] ];
+		descriptor.functionGraphs = @[
+			[[MTLFunctionStitchingGraph alloc] initWithFunctionName:@"fused"
+			                                                  nodes:@[ sum ]
+			                                             outputNode:product
+			                                             attributes:@[]],
+			[[MTLFunctionStitchingGraph alloc] initWithFunctionName:@"pair"
+			                                                  nodes:@[]
+			                                             outputNode:pairSum
+			                                             attributes:@[]],
+		];
 		descriptor.functions = @[
 			[library newFunctionWithName:@"stitch_add"], [library newFunctionWithName:@"stitch_mul"]
 		];

@@ -8473,18 +8473,21 @@ lacks {part}"
     }
 
     /// The shell tests' stitchable functions (guest/bundle/tests/stitchable.metal): `fused`, a
-    /// stitched graph of two of them, is `(a + b) * c`, which `stitch_caller` writes of its inputs.
+    /// stitched graph of two of them, is `(a + b) * c`, which `stitch_caller` writes of its inputs;
+    /// `pair`, a graph of one, is `a + b`, which `stitch_caller_extra` writes of its inputs, calling
+    /// it with one argument more than it takes.
     #[cfg(target_os = "macos")]
     const STITCHABLE: &str = include_str!("../../../../../guest/bundle/tests/stitchable.metal");
 
-    /// `stitch_caller`'s inputs, and what `fused` makes of them.
+    /// `stitch_caller`'s and `stitch_caller_extra`'s inputs: `fused` makes 20 of them, and `pair` 5.
     #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const STITCH_INPUTS: [f32; 3] = [2.0, 3.0, 4.0];
 
     /// What the guest sends of a stitched library, made on this Mac as the guest's route makes it
     /// (the bundle's `RgfxStitchOverShadows`): the caller's library, compiled by Metal, and the
-    /// library Metal's stitcher makes of the graph `fused` over that library's functions, each the
-    /// bytes Metal answers for it (`libraryDataContents`); and Metal's own device and libraries.
+    /// library Metal's stitcher makes of the graphs `fused` and `pair` over that library's
+    /// functions, each the bytes Metal answers for it (`libraryDataContents`); and Metal's own
+    /// device and libraries.
     #[cfg(target_os = "macos")]
     struct Stitched {
         device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
@@ -8546,13 +8549,20 @@ lacks {part}"
             Some(&product),
             &NSArray::<ProtocolObject<dyn MTLFunctionStitchingAttribute>>::new(),
         );
+        let pair = MTLFunctionStitchingGraph::initWithFunctionName_nodes_outputNode_attributes(
+            MTLFunctionStitchingGraph::alloc(),
+            &NSString::from_str("pair"),
+            &NSArray::new(),
+            Some(&call("stitch_add", &[input(0), input(1)])),
+            &NSArray::<ProtocolObject<dyn MTLFunctionStitchingAttribute>>::new(),
+        );
         let function = |name: &str| {
             caller
                 .newFunctionWithName(&NSString::from_str(name))
                 .unwrap()
         };
         let descriptor = MTLStitchedLibraryDescriptor::new();
-        descriptor.setFunctionGraphs(&NSArray::from_retained_slice(&[graph]));
+        descriptor.setFunctionGraphs(&NSArray::from_retained_slice(&[graph, pair]));
         // SAFETY: the functions are of a library of this device.
         unsafe {
             descriptor.setFunctions(&NSArray::from_retained_slice(&[
@@ -8581,10 +8591,11 @@ lacks {part}"
         None,
     ];
 
-    /// Metal's own answers: for each of [`STITCH_LINKS`], whether Metal makes `stitch_caller`'s
-    /// pipeline with `fused` linked there, and what the pipeline writes of [`STITCH_INPUTS`].
+    /// Metal's own answers: for each of [`STITCH_LINKS`], whether Metal makes the pipeline of the
+    /// caller library's `kernel` with the stitched library's `linked` linked there, and what the
+    /// pipeline writes of [`STITCH_INPUTS`].
     #[cfg(target_os = "macos")]
-    fn metal_s_own_stitched_links(s: &Stitched) -> Vec<Option<f32>> {
+    fn metal_s_own_stitched_links(s: &Stitched, kernel: &str, linked: &str) -> Vec<Option<f32>> {
         use objc2_foundation::{NSArray, NSString};
         use objc2_metal::{
             MTLBuffer as _, MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
@@ -8593,11 +8604,11 @@ lacks {part}"
         };
         let kernel = s
             .caller
-            .newFunctionWithName(&NSString::from_str("stitch_caller"))
+            .newFunctionWithName(&NSString::from_str(kernel))
             .unwrap();
         let fused = s
             .stitched
-            .newFunctionWithName(&NSString::from_str("fused"))
+            .newFunctionWithName(&NSString::from_str(linked))
             .unwrap();
         STITCH_LINKS
             .iter()
@@ -8660,12 +8671,13 @@ lacks {part}"
 
     /// What the guest's stitched library gets through the decoder on `P`: the two library creates
     /// the guest sends (`caller`'s bytes, then `stitched`'s), then for each of [`STITCH_LINKS`] a
-    /// pipeline create of `stitch_caller` linking `fused` from the stitched library, and what each
-    /// pipeline made writes of [`STITCH_INPUTS`], run on the platform; `None` for one refused.
+    /// pipeline create of `caller`'s `kernel` linking `stitched`'s `linked`, and what each pipeline
+    /// made writes of [`STITCH_INPUTS`], run on the platform; `None` for one refused.
     #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn stitched_links_through_the_decoder<P: crate::platform::ApiPlatform>(
-        caller: &[u8],
-        stitched: &[u8],
+        (caller, stitched): (&[u8], &[u8]),
+        kernel: &str,
+        linked: &str,
     ) -> Vec<Option<f32>> {
         use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
         use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
@@ -8709,12 +8721,12 @@ lacks {part}"
         for (n, &list) in STITCH_LINKS.iter().enumerate() {
             let obj_id = 100 + n as u64;
             let mut bytes = compute_create(obj_id);
-            let name = b"stitch_caller";
+            let name = kernel.as_bytes();
             let at = bytes.len() as u32;
             bytes.extend_from_slice(name);
             bytes.resize(bytes.len().next_multiple_of(8), 0);
             let specs: Vec<LinkedSpec<'_>> = list
-                .map(|list| ("fused", list, 0, "", &[][..], ""))
+                .map(|list| (linked, list, 0, "", &[][..], ""))
                 .into_iter()
                 .collect();
             let tail = append_linked(&mut bytes, 2, &specs);
@@ -8805,15 +8817,53 @@ lacks {part}"
     fn on_metal_a_stitched_function_links_and_computes_as_metal_s() {
         use reims_vgpu_metal::MetalPlatform;
         let s = stitched_on_metal();
-        let metal = metal_s_own_stitched_links(&s);
+        let metal = metal_s_own_stitched_links(&s, "stitch_caller", "fused");
         assert_eq!(metal, [Some(20.0), Some(20.0), None]);
+        let made = (s.caller_bytes.as_slice(), s.stitched_bytes.as_slice());
         assert_eq!(
-            stitched_links_through_the_decoder::<MetalPlatform>(&s.caller_bytes, &s.stitched_bytes),
+            stitched_links_through_the_decoder::<MetalPlatform>(made, "stitch_caller", "fused"),
             metal
         );
         let [caller, stitched] = COMMITTED_STITCHED;
         assert_eq!(
-            stitched_links_through_the_decoder::<MetalPlatform>(caller, stitched),
+            stitched_links_through_the_decoder::<MetalPlatform>(
+                (caller, stitched),
+                "stitch_caller",
+                "fused"
+            ),
+            metal
+        );
+    }
+
+    /// On Metal, a stitched function of fewer parameters than its call passes arguments links
+    /// and computes: `stitch_caller_extra` calls `pair` with three arguments, Metal's stitcher
+    /// makes it of the two its graph takes, and Metal's own pipeline drops the third and writes
+    /// 2 + 3 from either list, as MPS's reduce_stitched calls the write_fn it stitches of two
+    /// inputs with three. A guest's stitched library, sent as its bytes, gets the same answers
+    /// through the decoder, and so do the Vulkan crate's committed stitched metallibs
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_metal_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes() {
+        use reims_vgpu_metal::MetalPlatform;
+        let s = stitched_on_metal();
+        let metal = metal_s_own_stitched_links(&s, "stitch_caller_extra", "pair");
+        assert_eq!(metal, [Some(5.0), Some(5.0), None]);
+        let made = (s.caller_bytes.as_slice(), s.stitched_bytes.as_slice());
+        assert_eq!(
+            stitched_links_through_the_decoder::<MetalPlatform>(
+                made,
+                "stitch_caller_extra",
+                "pair"
+            ),
+            metal
+        );
+        let [caller, stitched] = COMMITTED_STITCHED;
+        assert_eq!(
+            stitched_links_through_the_decoder::<MetalPlatform>(
+                (caller, stitched),
+                "stitch_caller_extra",
+                "pair"
+            ),
             metal
         );
     }
@@ -8830,7 +8880,9 @@ lacks {part}"
         let [caller, stitched] = COMMITTED_STITCHED;
         assert_eq!(
             stitched_links_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(
-                caller, stitched
+                (caller, stitched),
+                "stitch_caller",
+                "fused"
             ),
             [Some(20.0), Some(20.0), None]
         );
