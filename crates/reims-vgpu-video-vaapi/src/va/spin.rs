@@ -972,11 +972,14 @@ mod tests {
         assert!(!says_reset("[UFW BLOCK] IN=enp5s0 OUT="));
     }
 
-    /// Dumps the shader for spirv-val: `RVG_SPIN_SPIRV=PATH`.
+    /// Dumps the shader for spirv-val: `RVG_SPIN_SPIRV=PATH`. Without it,
+    /// as in the VA-API host's run of the ignored tests, it writes nothing.
     #[test]
     #[ignore = "writes the shader where RVG_SPIN_SPIRV names, for spirv-val"]
     fn the_shader_is_written_out() {
-        let path = std::env::var("RVG_SPIN_SPIRV").expect("RVG_SPIN_SPIRV");
+        let Some(path) = std::env::var_os("RVG_SPIN_SPIRV") else {
+            return;
+        };
         let bytes: Vec<u8> = shader(800_000_000, TURNS_AT_MOST)
             .iter()
             .flat_map(|w| w.to_le_bytes())
