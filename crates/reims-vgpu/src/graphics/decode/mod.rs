@@ -4306,16 +4306,15 @@ pub(crate) fn compile_pipeline<P: Platform>(
             }
             // Each stage's function: a library being made is waited for here, and one the
             // platform refused, or an entry point it makes no function of, refuses the pipeline.
-            let function =
-                |stage: &str,
-                 (library, name, constants): StageRef<P>|
-                 -> RaiseResult<Result<P::Function, String>> {
-                    let Some(library) = library.resolve() else {
-                        return Ok(Err(no_library(stage)));
-                    };
-                    Ok(stage_function::<P>(&library, &name, &constants)?
-                        .ok_or_else(|| no_function(&name)))
+            let function = |stage: &str,
+                            (library, name, constants): StageRef<P>|
+             -> RaiseResult<Result<P::Function, String>> {
+                let Some(library) = library.resolve() else {
+                    return Ok(Err(no_library(stage)));
                 };
+                Ok(stage_function::<P>(&library, &name, &constants)?
+                    .ok_or_else(|| no_function(&name)))
+            };
             let object = match object.map(|f| function("object", f)).transpose()? {
                 None => None,
                 Some(Ok(made)) => Some(made),
