@@ -134,7 +134,11 @@ Stages:
      and what the process only writes takes a write-combined part of its
      block, which the kext maps so (a submission ring's data, command
      buffers' bodies and a library's staging chunks; the bundle's
-     `RgfxRegion.hpp`).
+     `RgfxRegion.hpp`). The kext maps those parts from a descriptor of the
+     region of their own: a mapping's cache mode is set on its descriptor's
+     one VM object, for every page of it, so asked of the region's own
+     descriptor it came out uncached like the rest (measured: no page of the
+     process's was write-combined; `RgfxAccelerator::copyWriteCombinedRegion`).
    - The region is memory of QEMU's process, and the host side runs in that
      process. On Linux it is a shared mapping of a memfd of the library's
      (`reims-vgpu-vulkan`'s `RegionMemory`): RADV refuses a pointer to a

@@ -289,6 +289,16 @@ public:
 	// client's task (retained for the caller), and the doorbell write that wakes the
 	// host's consumer of ring `ringId`.
 	IODeviceMemory *copyRegion() const;
+	// The region again, as a descriptor of its own that only write-combined spans are mapped
+	// from (retained for the caller; null before the contexts' start, or where it could not be
+	// made). A mapping's cache mode is set on its descriptor's one VM object for every page of
+	// it (xnu's IOKit hands the mode to mach_make_memory_entry with MAP_MEM_ONLY, which changes
+	// the object's WIMG bits; read from the public xnu source), so a write-combined span mapped
+	// from the region's own descriptor would leave each region page faulted after it
+	// write-combined, and the next write-back span would take them all back: measured on the
+	// Radeon 780M host, no page of the process's came out write-combined. Defined with the
+	// contexts' state (RgfxAcceleratorContexts.cpp).
+	IODeviceMemory *copyWriteCombinedRegion() const;
 	// The region's first `size` bytes from RGFX_DEVICE_INFO_OFFSET (the device info, and the
 	// video caps after it), mapped read-only into the kernel: the map, which the caller
 	// releases, with *info its first byte; null where it cannot be mapped.

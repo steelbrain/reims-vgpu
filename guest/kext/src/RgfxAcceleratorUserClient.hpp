@@ -59,7 +59,8 @@ public:
 	// lock. mapSpan fails, the op it serves with it, where the window is closed or the span is not
 	// one; an unmapSpan that cannot map the window back closes the window. The span is mapped
 	// write-back, or write-combined where `writeCombined` (the bytes the process only writes,
-	// allocBlock's).
+	// allocBlock's), from the region's descriptor for those spans
+	// (RgfxAccelerator::copyWriteCombinedRegion), and write-back where that is missing.
 	IOReturn mapSpan(UInt64 offset, UInt64 length, bool writeCombined = false);
 	void unmapSpan(UInt64 offset, UInt64 length);
 

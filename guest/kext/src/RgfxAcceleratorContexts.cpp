@@ -137,6 +137,9 @@ struct ContextState {
 	bool hooked;
 	// The thread call that posts freed blocks' releases (releaseFreedBlocks).
 	thread_call_t releaseCall;
+	// The region again, a descriptor of its own that only write-combined spans are mapped from
+	// (copyWriteCombinedRegion): null where it could not be made.
+	IODeviceMemory *combinedRegion;
 };
 ContextState state = {nullptr,
                       kRgfxContextSlotsEmpty,
@@ -148,6 +151,7 @@ ContextState state = {nullptr,
                       nullptr,
                       0,
                       false,
+                      nullptr,
                       nullptr};
 IOLock *&contextLock = state.contextLock;
 RgfxContextSlots &slots = state.slots;
@@ -681,6 +685,12 @@ bool RgfxAccelerator::startContexts()
 	RgfxReleaseEntry *releases =
 	    static_cast<RgfxReleaseEntry *>(IOMalloc(sizeof(RgfxReleaseEntry) * kMaxReleases));
 	thread_call_t timer = thread_call_allocate(releaseTimerFired, nullptr);
+	// The region's bytes again for the write-combined spans (copyWriteCombinedRegion), with no
+	// effect on the region's own descriptor; a context goes on without it.
+	IODeviceMemory *combined =
+	    region ? IODeviceMemory::withRange(region->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone),
+	                                       region->getLength())
+	           : nullptr;
 	RgfxBlock *expected = nullptr;
 	if (lock && wlock && table && rings && call && naming && rlock && releases && timer &&
 	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,
@@ -694,6 +704,7 @@ bool RgfxAccelerator::startContexts()
 		namingCall = naming;
 		releaseTable = {releases, kMaxReleases, 0};
 		releaseTimer = timer;
+		state.combinedRegion = combined;
 		__atomic_store_n(&releaseLock, rlock, __ATOMIC_RELEASE);
 		const UInt32 features = readRegister(RGFX_REG_FEATURES_LO);
 		surfacePages = (features & RGFX_FEATURE_SURFACE_PAGES) != 0;
@@ -764,10 +775,21 @@ bool RgfxAccelerator::startContexts()
 		IOFree(releases, sizeof(RgfxReleaseEntry) * kMaxReleases);
 	if (timer)
 		thread_call_free(timer);
+	OSSafeReleaseNULL(combined);
 	// Another opener is making it: wait for it to publish.
 	while (expected && !__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
 		IOSleep(1);
 	return __atomic_load_n(&contextLock, __ATOMIC_ACQUIRE) != nullptr;
+}
+
+IODeviceMemory *RgfxAccelerator::copyWriteCombinedRegion() const
+{
+	// Set before contextLock is published, and kept for the kernel's life.
+	IODeviceMemory *combined =
+	    __atomic_load_n(&contextLock, __ATOMIC_ACQUIRE) ? state.combinedRegion : nullptr;
+	if (combined)
+		combined->retain();
+	return combined;
 }
 
 // MARK: - Contexts
