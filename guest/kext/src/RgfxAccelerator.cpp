@@ -355,7 +355,9 @@ bool RgfxAccelerator::start(IOService *provider)
 
 	// The Metal discovery keys (MetalPluginName / MetalPluginClassName) and the PCI
 	// match that make Metal load the bundle are in src/Info.plist's accelerator
-	// personality, so they are already registry properties on this service. The
+	// personality, so they are already registry properties on this service; so is
+	// IOGLBundleName, the GL renderer OpenGL loads for it (AppleMetalOpenGLRenderer,
+	// which runs on the bundle's Metal device). The
 	// accelerator does not touch pixels or the control ring (the framebuffer owns
 	// those); it only publishes those keys and vends the region-map + doorbell user
 	// client. registerService lets Metal's IOServiceMatching("IOAccelerator")

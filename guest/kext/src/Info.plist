@@ -76,6 +76,8 @@
 			<string>RgfxAccelerator</string>
 			<key>IODVDBundleName</key>
 			<string>reims-graphics</string>
+			<key>IOGLBundleName</key>
+			<string>AppleMetalOpenGLRenderer</string>
 			<key>IOGVACodec</key>
 			<string>RgfxVideo</string>
 			<key>IOMatchCategory</key>

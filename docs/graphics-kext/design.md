@@ -3021,6 +3021,25 @@ finds and loads the bundle. The accelerator maps BAR 0 for the doorbell and
 holds BAR 2 to map each process's part of it in; it touches no pixels and no
 control ring (the framebuffer owns those).
 
+**OpenGL.** The personality also carries `IOGLBundleName =
+AppleMetalOpenGLRenderer`, the GL renderer OpenGL loads for an accelerator: the
+system's own GL over Metal, which finds its Metal device among
+`MTLCopyAllDevices()` by the accelerator's registry entry ID (the device's
+`registryID`). The renderer hands the device each GL shader as GL IR and each
+variant as plugin data; Metal's own devices lower the two to AIR in their
+compiler service. The bundle has none, so it lowers a variant in the app's
+process, through the GL code generator the system ships beside the renderer
+(`libGLDPlugin<V>.dylib`, called in place), into a .metallib of one function,
+and makes an ordinary library of it (`guest/bundle/src/RgfxGLFunction.h`,
+`RgfxGLLowering.hpp`): the host compiles GL shaders as it compiles any
+library. Measured on an x86 Mac (macOS 26.7.1, the Intel UHD 630): the
+renderer runs on a non-Apple Metal device, and the bundle's lowering draws what
+Metal's own does (`guest/bundle/tools/gl_probe.m`, `gl_inject.mm`). An
+on-screen context's drawable is the IOGPU base's, over the kext's GL drawable
+and window surface ("A GL window", below). OpenCL lists a GPU for every
+accelerator that names an `IOGLBundleName`, and runs its kernels through the
+same renderer.
+
 **Registration waits for the bundle.** Where the accelerator is registered and
 its bundle is not on disk, every WindowServer aborts in CoreDisplay as it
 brings the display up, and launchd starts another until it gives up: the
