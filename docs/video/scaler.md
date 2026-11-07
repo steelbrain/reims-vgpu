@@ -603,6 +603,8 @@ sums in the reference's order:
   worked out from the source; where the adaptive filter moves either
   pass, `scaler_transform_adaptive`, the same with the filter, a kernel
   of its own so that the rest run, and are made, without its code
+  (below); and for both planes of a 4:2:0 window that the filter does
+  not move, `scaler_transform_both_planes`, a kernel of its own too
   (below).
 
 **Making the kernels.** The Vulkan runtime makes a kernel's pipeline at
@@ -659,9 +661,30 @@ the tables here and below are of the kernels before it. Once made, a
 pipeline is kept in the runtime's shader cache and the driver's, and a
 later process's first transform takes a few milliseconds.
 
+Both planes of a 4:2:0 window then took a kernel of their own,
+`scaler_transform_both_planes`. Its `both_planes` works out a word's
+pixels in a loop over the two luma rows of a chroma row, a constant count.
+The driver unrolls that loop into two copies of a pixel's work, which
+run side by side. It is faster than `write_word`'s single loop over the
+word's block, and it is more code, which `scaler_transform` no longer
+holds. On the Radeon 780M (Mesa 26.2.6, 2026-11-07, six processes of
+each build, alternated, 300 transforms each after a first, at a load
+average of 0.6 to 1.2), 720p BGRA to 720p 420v went from a median of
+0.230 ms of GPU time to 0.206, its 10th percentile from 0.200 to 0.186.
+An earlier A/B on another Radeon 780M put `both_planes` inside
+`scaler_transform` instead. It was as fast, 0.207 ms against 0.227, and
+it made `scaler_transform` 31,216 bytes of code against 21,524
+(`RADV_DEBUG=shaderstats`). The suite's other benches stayed within
+their spread, `scaler_transform`'s 1080p BGRA turned 90 among them, at
+0.752 and 0.762 ms. Cold, the making ahead of all eight took 298 and
+297 ms against 274 and 274 ms for seven. With nothing made ahead, a
+first 720p BGRA to 720p 420v took 27 ms, its own kernel's making,
+against 47 to 53 ms for `scaler_transform`'s
+(`scaler/gpu/tests/firsts.rs`).
+
 **Made ahead.** When a process's first scaler device is made, a thread
 of the library's dispatches each kernel at each threadgroup size the
-transforms dispatch it at, seven in all (`params::DISPATCHED`), one
+transforms dispatch it at, eight in all (`params::DISPATCHED`), one
 after another, with parameters of zeros, so that every thread returns
 at its bounds check, on a command queue apart from the transforms',
 binding only a 16-byte buffer of its own (`gpu::make_ahead`). Neither
@@ -714,7 +737,7 @@ Metal makes a kernel's pipeline where the device makes its pipeline
 states, as it is made, which `rvg_scaler_device_scales` needs answered
 (0.7 s on the M3 Max with the kernels new to its compiler cache, at
 that load; 40 to 60 ms cached), so there the making ahead makes
-nothing, and its seven dispatches took 6 ms.
+nothing, and its dispatches, seven then, took 6 ms.
 
 The guest sees nothing of it: it reads and writes no guest memory and no
 surface, calls none of the host's functions, changes nothing of the C

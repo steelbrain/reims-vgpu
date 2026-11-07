@@ -10,8 +10,9 @@
 //!   the reference samples reaches the kernel as it is;
 //! - the destination window, its chroma's siting, how its codes are written, and one dispatch
 //!   per plane of the destination, over the words the window covers: of `scaler_transform`
-//!   (`scaler_transform_adaptive` where the adaptive filter moves a pass), or of `scaler_quads`
-//!   for the RGB plane of a copy of a Y'CbCr source;
+//!   (`scaler_transform_adaptive` where the adaptive filter moves a pass, and
+//!   `scaler_transform_both_planes` for both planes of a 4:2:0 window where it moves none), or of
+//!   `scaler_quads` for the RGB plane of a copy of a Y'CbCr source;
 //! - where a destination pixel takes more than one pixel of the turned source each way, the lines:
 //!   bands of the window's rows, each a dispatch of `scaler_lines` over the columns of the turned
 //!   source the window's across taps take and the band's rows, then its planes' dispatches, which
@@ -304,6 +305,10 @@ pub(crate) enum Kernel {
     /// filter moves, a kernel of its own so that the transforms it does not move run, and are
     /// made, without its code.
     TransformAdaptive,
+    /// `scaler_transform_both_planes`: `scaler_transform` for both planes of a 4:2:0 window whose
+    /// every edge is even, which the adaptive filter does not move, a kernel of its own so that the
+    /// others are made without its unrolled code.
+    TransformBothPlanes,
 }
 
 /// One dispatch: its kernel, its parameters, its threads across and down, and those of a
@@ -324,12 +329,13 @@ const LINES_ROWS: [u32; 2] = [16, 8];
 /// each at the first dispatch of its threadgroup's size: the dispatches that make them ahead of a
 /// guest's first transform (`gpu.rs`, `make_ahead`), in their order, the cheapest to make first
 /// (docs/video/scaler.md, "Made ahead").
-pub(super) const DISPATCHED: [(Kernel, (u32, u32)); 7] = [
+pub(super) const DISPATCHED: [(Kernel, (u32, u32)); 8] = [
     (Kernel::Shared, GROUP),
     (Kernel::Quads, GROUP),
     (Kernel::Lines, (LINES_COLUMNS, LINES_ROWS[0])),
     (Kernel::Lines, (LINES_COLUMNS, LINES_ROWS[1])),
     (Kernel::Across, GROUP),
+    (Kernel::TransformBothPlanes, GROUP),
     (Kernel::Transform, GROUP),
     (Kernel::TransformAdaptive, GROUP),
 ];
@@ -845,6 +851,10 @@ pub(super) fn work(
                 Kernel::Quads
             } else if p.adapt_across != 0 || p.adapt_down != 0 {
                 Kernel::TransformAdaptive
+            } else if pass.plane_kind == PlaneKind::Biplanar8 as u32
+                || pass.plane_kind == PlaneKind::Biplanar16 as u32
+            {
+                Kernel::TransformBothPlanes
             } else {
                 Kernel::Transform
             };

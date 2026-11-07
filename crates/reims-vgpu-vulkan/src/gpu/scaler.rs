@@ -31,13 +31,14 @@ use crate::platform::device_options;
 pub(crate) const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scaler.metallib"));
 
 /// The kernels' names in it, as [`Kernel`] orders them.
-pub(crate) const KERNELS: [&str; 6] = [
+pub(crate) const KERNELS: [&str; 7] = [
     "scaler_lines",
     "scaler_transform",
     "scaler_across",
     "scaler_across_shared",
     "scaler_quads",
     "scaler_transform_adaptive",
+    "scaler_transform_both_planes",
 ];
 
 /// The kernel a dispatch runs.
@@ -58,6 +59,9 @@ pub enum Kernel {
     /// `scaler_transform_adaptive`: `scaler_transform` for a transform whose passes the adaptive
     /// filter moves.
     TransformAdaptive,
+    /// `scaler_transform_both_planes`: `scaler_transform` for both planes of a 4:2:0 window whose
+    /// every edge is even, which the adaptive filter does not move.
+    TransformBothPlanes,
 }
 
 /// The kernels on the GPU the library draws on, a queue of their own, and one apart.
@@ -66,7 +70,7 @@ pub struct ScalerGpu {
     queue: rt::CommandQueue,
     /// The queue of [`ScalerGpu::submit_apart`].
     apart: rt::CommandQueue,
-    pipelines: [rt::ComputePipelineState; 6],
+    pipelines: [rt::ComputePipelineState; 7],
     name: String,
 }
 
@@ -180,6 +184,7 @@ impl ScalerGpu {
             pipeline(KERNELS[3])?,
             pipeline(KERNELS[4])?,
             pipeline(KERNELS[5])?,
+            pipeline(KERNELS[6])?,
         ];
         // Shared: the scaler's work is a guest app's video work, which shares a GPU queue as an
         // app's own queues do.
@@ -359,6 +364,7 @@ impl ScalerGpu {
                     Kernel::Shared => &self.pipelines[3],
                     Kernel::Quads => &self.pipelines[4],
                     Kernel::TransformAdaptive => &self.pipelines[5],
+                    Kernel::TransformBothPlanes => &self.pipelines[6],
                 };
                 encoder
                     .set_compute_pipeline_state(pipeline)

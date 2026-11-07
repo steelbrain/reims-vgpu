@@ -26,7 +26,7 @@
 "mesh.metallib" = "a4f408406cf4201e2eb244bb0d2e90ce6bf543a454866ec31aee2ad888e059d6"
 "optional_constant.metallib" = "7d4cb5e3a6fd887205add821821245423e460038a0c870994fab9bec715c2e39"
 "rounding_safe.metallib" = "9b8720555eefdfa339a8033f57c8dde9bca4f7d5ca2167d02b3c21067a6d350d"
-"scaler.metallib" = "4250e79e58ba2a1a74cf007d7e0904fbae669fc11543b8d5f5bcf87ccd277e9e"
+"scaler.metallib" = "3352095e443b310f2cd444f446afe99f23389a7ccdfab074ccf3e9eedbb5670c"
 "ci_kernel.metallib" = "d50192b91cff2f1163026c3dfcaf3e2d0a06216da5261480815baf39e60a819e"
 "stitchable.metallib" = "9fcb57e471dc781b5aa51d59ee0d67d910242524eeb63cd114b50cfe50e5736c"
 "stitched.metallib" = "9fcb57e471dc781b5aa51d59ee0d67d910242524eeb63cd114b50cfe50e5736c"

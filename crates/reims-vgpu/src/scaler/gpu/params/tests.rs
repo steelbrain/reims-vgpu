@@ -203,7 +203,7 @@ fn a_biplanar_window_is_a_dispatch_over_its_coverage() {
         &bound(&plan.destination_format),
     )
     .unwrap();
-    let [(Kernel::Transform, both, threads, _)] = work.passes.as_slice() else {
+    let [(Kernel::TransformBothPlanes, both, threads, _)] = work.passes.as_slice() else {
         panic!("one pass: {:?}", work.passes.len());
     };
     assert_eq!(both.plane_kind, PlaneKind::Biplanar8 as u32);

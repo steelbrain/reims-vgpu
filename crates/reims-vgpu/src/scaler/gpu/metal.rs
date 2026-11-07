@@ -133,5 +133,6 @@ fn kernel(kernel: Kernel) -> GpuKernel {
         Kernel::Shared => GpuKernel::Shared,
         Kernel::Quads => GpuKernel::Quads,
         Kernel::TransformAdaptive => GpuKernel::TransformAdaptive,
+        Kernel::TransformBothPlanes => GpuKernel::TransformBothPlanes,
     }
 }

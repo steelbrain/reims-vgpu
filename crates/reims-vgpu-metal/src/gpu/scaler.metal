@@ -4,7 +4,7 @@
 // each destination pixel samples and with what weights (the reference's `taps`), and every number
 // below that a format, a matrix or a window gives; these apply them.
 //
-// A transform is dispatches of six kernels, which the CPU picks (reims-vgpu's
+// A transform is dispatches of seven kernels, which the CPU picks (reims-vgpu's
 // `scaler/gpu/params.rs`, `work`), each summing in the reference's order.
 // - `scaler_transform`: one dispatch per plane of the destination. A thread writes one 32-bit word
 //   of the plane, so that no two threads write one word: the bytes of it the destination window
@@ -12,7 +12,9 @@
 //   rest of the word as it was. Each plane's offset and row pitch are multiples of 4, which the
 //   CPU checks before it asks for a dispatch. `scaler_transform_adaptive` is the same for a
 //   transform whose passes the adaptive filter moves, a kernel of its own so that the others run,
-//   and are made, without its code.
+//   and are made, without its code; `scaler_transform_both_planes` the same for both planes of a
+//   4:2:0 window whose every edge is even, which the filter does not move, a kernel of its own
+//   so that its unrolled code is not made into the others.
 // - `scaler_quads`, in its place for the RGB plane of a copy of a Y'CbCr source: a thread decodes
 //   two by two pixels, which share their chroma samples, into threadgroup memory, and the
 //   threadgroup then writes the plane's words a row at a time, side by side.
@@ -1045,6 +1047,73 @@ static void store(device uint *destination, uint word, uint value, uint mask) {
     destination[word] = value;
 }
 
+// Pixel (dx, dy) of the window, in Y'CbCr.
+template <typename From>
+static float4 ycbcr_at(constant ScalerParams &p, thread const From &from, uint dx, uint dy) {
+    float4 v = from.working_at(p, dx, dy);
+    return p.rgb != 0u ? to_ycbcr(p, v) : v;
+}
+
+// Both planes of a 4:2:0 window whose every edge is even, the first byte of whose word `first` of
+// chroma row `row` the window covers: that word of chroma, and the words of luma of the same
+// pixels in the two rows it covers, each pixel worked out once. Every chroma sample's two by two
+// pixels lie in the window, so its siting names pixels of its own (`chroma_pixels` without the
+// window's edges), and it is their mean. Its loop over the two rows has a constant count, which
+// the driver unrolls into two copies of a pixel's work, worked out side by side: faster than
+// `write_word`'s loop, and more code, which only `scaler_transform_both_planes` holds
+// (docs/video/scaler.md, "Making the kernels").
+template <typename From>
+static void both_planes(constant ScalerParams &p, thread const From &from,
+                        device uint *destination, uint row, uint first) {
+    uint bytes = p.plane_kind == KIND_BIPLANAR8 ? 1u : 2u;
+    uint shift = bytes == 1u ? 0u : 6u;
+    uint x0 = first / bytes;
+    float4 v[2][4];
+    uint luma[2] = {0u, 0u};
+    uint luma_mask = 0u;
+    for (uint k = 0; k < 4u / bytes; ++k) {
+        uint b = first + k * bytes;
+        if (b < p.first_byte || b >= p.end_byte) {
+            continue;
+        }
+        for (uint r = 0; r < 2u; ++r) {
+            v[r][k] = ycbcr_at(p, from, x0 + k - p.window_x, 2u * row + r - p.window_y);
+            luma[r] |= (luma_code(p, v[r][k].x) << shift) << (8u * bytes * k);
+        }
+        luma_mask |= (bytes == 1u ? 0xffu : 0xffffu) << (8u * bytes * k);
+    }
+    uint chroma = 0u;
+    uint chroma_mask = 0u;
+    uint2 xs = named(p.site_x, 2u, 0u, 0u, 2u);
+    uint2 ys = named(p.site_y, 2u, 0u, 0u, 2u);
+    for (uint q = 0; q < 2u / bytes; ++q) {
+        uint b = first + 2u * bytes * q;
+        if (b < p.first_byte || b >= p.end_byte) {
+            continue;
+        }
+        float2 sum = 0.0f;
+        float n = 0.0f;
+        for (uint py = ys.x; py < ys.y; ++py) {
+            for (uint px = xs.x; px < xs.y; ++px) {
+                sum += v[py][2u * q + px].yz;
+                n += 1.0f;
+            }
+        }
+        float2 c = sum / n;
+        uint cb = chroma_code(p, c.x) << shift;
+        uint cr = chroma_code(p, c.y) << shift;
+        uint pair = cb | (cr << (8u * bytes));
+        chroma |= pair << (16u * q);
+        chroma_mask |= (bytes == 1u ? 0xffffu : 0xffffffffu) << (16u * q);
+    }
+    for (uint r = 0; r < 2u; ++r) {
+        store(destination, (p.plane_offset + (2u * row + r) * p.plane_pitch + first) >> 2, luma[r],
+              luma_mask);
+    }
+    store(destination, (p.chroma_plane_offset + row * p.chroma_plane_pitch + first) >> 2, chroma,
+          chroma_mask);
+}
+
 // Word `first / 4` of row `row` of the dispatch's plane: the bytes of it the window covers, each
 // worked out as the reference works it out, and the rest of it as it was; of both planes of a
 // 4:2:0 window whose every edge is even, that word of chroma and the words of luma of the same
@@ -1205,6 +1274,24 @@ kernel void scaler_transform(device const uint *source [[buffer(0)]],
     }
     Direct<false> from = {source, taps, light};
     write_word(p, from, destination, p.first_row + at.y, (p.first_byte & ~3u) + at.x * 4u);
+}
+
+// The same, for both planes of a 4:2:0 window whose every edge is even, of a transform whose
+// passes the adaptive filter does not move (`both_planes`).
+kernel void scaler_transform_both_planes(device const uint *source [[buffer(0)]],
+                                         device uint *destination [[buffer(1)]],
+                                         device const ScalerTap *taps [[buffer(2)]],
+                                         constant ScalerParams &p [[buffer(3)]],
+                                         uint2 at [[thread_position_in_grid]],
+                                         uint2 in_group [[thread_position_in_threadgroup]],
+                                         uint2 group_size [[threads_per_threadgroup]]) {
+    threadgroup float light[LIGHT_CODES];
+    work_out_light(p, light, in_group.y * group_size.x + in_group.x, group_size.x * group_size.y);
+    if (at.x >= p.words || at.y >= p.rows) {
+        return;
+    }
+    Direct<false> from = {source, taps, light};
+    both_planes(p, from, destination, p.first_row + at.y, (p.first_byte & ~3u) + at.x * 4u);
 }
 
 // The same, for a transform whose passes the adaptive filter moves: a kernel of its own, so that

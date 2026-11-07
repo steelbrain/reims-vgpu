@@ -24,7 +24,7 @@ type First = (
 
 /// One transform for each kernel and threadgroup size the transforms dispatch
 /// ([`params::DISPATCHED`]).
-const FIRSTS: [First; 6] = [
+const FIRSTS: [First; 7] = [
     (
         "2160p 420v to 2160p BGRA",
         ScalerFormat::Nv12VideoRange,
@@ -55,6 +55,14 @@ const FIRSTS: [First; 6] = [
         (1280, 720),
         ScalerFormat::Bgra,
         (320, 180),
+        0x1000,
+    ),
+    (
+        "720p BGRA to 720p 420v",
+        ScalerFormat::Bgra,
+        (1280, 720),
+        ScalerFormat::Nv12VideoRange,
+        (1280, 720),
         0x1000,
     ),
     (
