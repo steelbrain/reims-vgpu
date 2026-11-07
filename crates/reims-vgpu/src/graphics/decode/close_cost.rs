@@ -27,7 +27,7 @@ use reims_vgpu_core::platform::values::{RenderPipelineDesc, SamplerDesc, Texture
 use reims_vgpu_core::raise::OnFault;
 use zerocopy::IntoBytes;
 
-use super::draw_cost::{counts, fixture, spread};
+use super::draw_cost::{counts, fixture, spread, suite_shaders};
 use super::{GraphicsDecoder, ObjHandle};
 use crate::platform::ApiPlatform;
 
@@ -121,8 +121,7 @@ fn made<P: ApiPlatform>(kind: Kind, n: u64) -> (GraphicsDecoder<P>, P::Device) {
         _ => None,
     };
     let kernel = matches!(kind, Kind::ComputePipeline).then(|| {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/suite/fixtures/shaders/compute_add.metallib");
+        let path = suite_shaders().join("compute_add.metallib");
         let library = device
             .new_library(&std::fs::read(path).unwrap())
             .unwrap()
