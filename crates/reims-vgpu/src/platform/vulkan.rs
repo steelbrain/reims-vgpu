@@ -35,13 +35,13 @@ impl ApiPlatform for VulkanPlatform {
     /// of its pages, which spares each of the device's submissions the walk of every page amdgpu
     /// makes of a userptr import; a device that takes the pointer imports it as before. None on
     /// macOS.
-    fn graphics_region(&self, len: usize) -> Option<reims_graphics::Region> {
+    fn graphics_region(&self, len: usize) -> Option<reims_graphics::region::Region> {
         let memory = reims_vgpu_vulkan::os::RegionMemory::new(u64::try_from(len).ok()?)?;
         let base = memory.base();
         // SAFETY: the memory's `len` bytes from its page-aligned first byte are fresh zeros of a
         // mapping of its own, read and write, which nothing else reaches and which it unmaps only
         // as it drops, after the region's last use.
-        unsafe { reims_graphics::Region::over(base, len, Box::new(memory)) }
+        unsafe { reims_graphics::region::Region::over(base, len, Box::new(memory)) }
     }
 
     /// The whole texture, through the runtime's `get_bytes`

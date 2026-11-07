@@ -69,10 +69,10 @@ pub trait ApiPlatform: Platform {
         Box::new(())
     }
 
-    /// A graphics device's region of `len` bytes (BAR 2, `reims_graphics::Region`) in memory of
-    /// the platform's own, where its GPUs import that better than private anonymous memory;
-    /// `None` by default, and where the host gives none, for the region's own mapping.
-    fn graphics_region(&self, len: usize) -> Option<reims_graphics::Region> {
+    /// A graphics device's region of `len` bytes (BAR 2, `reims_graphics::region::Region`) in
+    /// memory of the platform's own, where its GPUs import that better than private anonymous
+    /// memory; `None` by default, and where the host gives none, for the region's own mapping.
+    fn graphics_region(&self, len: usize) -> Option<reims_graphics::region::Region> {
         let _ = len;
         None
     }
