@@ -763,7 +763,12 @@ impl Spin {
             if let Some(pool) = query {
                 // Written once the work ahead of the spin is done, just
                 // before the spin.
-                device.cmd_write_timestamp(command, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 0);
+                device.cmd_write_timestamp(
+                    command,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    0,
+                );
             }
             device.cmd_bind_pipeline(command, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(
@@ -830,7 +835,10 @@ impl Spin {
         let flags = vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY;
         // SAFETY: the device's query, and room for its result and its
         // availability.
-        let read = unsafe { gpu.device.get_query_pool_results(query, 0, &mut written, flags) };
+        let read = unsafe {
+            gpu.device
+                .get_query_pool_results(query, 0, &mut written, flags)
+        };
         read.is_ok() || written[0][1] != 0
     }
 

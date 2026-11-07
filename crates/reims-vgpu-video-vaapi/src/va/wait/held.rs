@@ -64,7 +64,9 @@ fn held(ring: Ring, count: usize) -> Option<Vec<Spin>> {
         match Spin::new(&node, ring) {
             Ok(spin) => spins.push(spin),
             Err(NoSpin::Unheld(why)) => {
-                eprintln!("no spin holds {node}, as its answer says, so this test does not apply: {why}");
+                eprintln!(
+                    "no spin holds {node}, as its answer says, so this test does not apply: {why}"
+                );
                 return None;
             }
             Err(NoSpin::Failed(why)) => panic!("a spin: {why}"),
@@ -254,7 +256,10 @@ fn a_jpeg_conversion_into_host_memory_on_a_held_gpu_fails_by_its_deadline() {
     eprintln!("the decode failed in its first picture: {in_first_picture}");
     if in_first_picture {
         // Made before the call thread took the picture, or by its deadline.
-        assert!(beside_took < WAIT_FOR + SLACK, "a call beside it: {beside_took:?}");
+        assert!(
+            beside_took < WAIT_FOR + SLACK,
+            "a call beside it: {beside_took:?}"
+        );
     } else {
         assert!(
             beside.is_ok() && beside_took < AT_ONCE,

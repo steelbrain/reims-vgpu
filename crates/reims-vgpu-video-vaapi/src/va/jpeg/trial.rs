@@ -141,8 +141,8 @@ pub(super) fn wrong(subsampling: JpegSubsampling, luma: &[u8], chroma: &[u8]) ->
     let off = |sample: u8, value: u8| sample.abs_diff(value) > 1;
     let mut wrong = luma[..side * side].iter().filter(|&&s| off(s, y)).count();
     let pairs = (side / across) * (side / down);
-    for pair in chroma[..pairs * 2].chunks_exact(2) {
-        wrong += usize::from(off(pair[0], cb)) + usize::from(off(pair[1], cr));
+    for &[b, r] in chroma[..pairs * 2].as_chunks::<2>().0 {
+        wrong += usize::from(off(b, cb)) + usize::from(off(r, cr));
     }
     (wrong, side * side + pairs * 2)
 }
@@ -233,7 +233,10 @@ mod tests {
                 "{subsampling:?}"
             );
             assert_eq!(
-                image.frame.subsampling().and_then(super::super::subsampling),
+                image
+                    .frame
+                    .subsampling()
+                    .and_then(super::super::subsampling),
                 Some(subsampling)
             );
             walk(&image).expect("the scan walks");
@@ -268,8 +271,14 @@ mod tests {
         assert_eq!(wrong(JpegSubsampling::Yuv420, &off, &chroma).0, 1);
         let neutral = vec![0x80; side * side / 2];
         assert_eq!(wrong(JpegSubsampling::Grey, &luma, &neutral).0, 0);
-        assert_eq!(wrong(JpegSubsampling::Grey, &luma, &chroma).0, side * side / 2);
+        assert_eq!(
+            wrong(JpegSubsampling::Grey, &luma, &chroma).0,
+            side * side / 2
+        );
         let zeros = vec![0; side * side];
-        assert_eq!(wrong(JpegSubsampling::Grey, &zeros, &neutral).0, side * side);
+        assert_eq!(
+            wrong(JpegSubsampling::Grey, &zeros, &neutral).0,
+            side * side
+        );
     }
 }

@@ -1349,7 +1349,7 @@ impl Rows {
     /// The same rows from the even row at or above the first: what a band
     /// is read from, so that 4:2:0's chroma rows are whole in what is read
     /// ([`Out::view`], [`write_band`]).
-    fn from_even(self) -> Rows {
+    fn to_even(self) -> Rows {
         Rows {
             top: self.top & !1,
             count: self.count.saturating_add(self.top & 1),
@@ -1360,7 +1360,7 @@ impl Rows {
 /// `rows` of an output in bands of `each` rows at most, an even count, top
 /// to bottom; with no `each`, one band from the output's first row to the
 /// last of `rows`. From an odd row, each band is read from the row above
-/// it ([`Rows::from_even`]), so it is 2 rows fewer, and what is read of it
+/// it ([`Rows::to_even`]), so it is 2 rows fewer, and what is read of it
 /// fits in `each`.
 fn bands(rows: Rows, each: Option<u32>) -> Vec<Rows> {
     let end = rows.top.saturating_add(rows.count);
@@ -1399,7 +1399,7 @@ fn in_bands(
 
 /// Writes the rows of `request.region` that `band` holds into `planes`:
 /// `samples` are the band's, their first row the even row at or above the
-/// band's top ([`Rows::from_even`]), and each plane's rows from the
+/// band's top ([`Rows::to_even`]), and each plane's rows from the
 /// region's top are skipped down to the band's. Where the band is the
 /// output from its first row, this is [`write_samples`] itself.
 fn write_band(
@@ -1416,7 +1416,7 @@ fn write_band(
     }
     let within = JpegDecode {
         region: PixelRect {
-            y: top - band.from_even().top,
+            y: top - band.to_even().top,
             height: bottom - top,
             ..region
         },
@@ -1575,7 +1575,7 @@ impl Out {
 
     /// Lends `use_samples` its `rows`' samples, of `kind`, and where they
     /// are in the bytes, from the even row at or above the first of `rows`
-    /// ([`Rows::from_even`]): host memory as the GPU wrote it, the driver's
+    /// ([`Rows::to_even`]): host memory as the GPU wrote it, the driver's
     /// image ([`OwnedSurface::view`]), or the strip a 1:1 run copied the
     /// rows into ([`Strips::read`]).
     fn view(
@@ -1585,7 +1585,7 @@ impl Out {
         reading: &Reading<'_>,
         use_samples: impl FnOnce(&Layout, &[u8]) -> Result<(), Failed>,
     ) -> Result<Readback, Failed> {
-        let rows = rows.from_even();
+        let rows = rows.to_even();
         let from = |layout: Layout| {
             layout.at_row(rows.top).ok_or_else(|| {
                 Failed::Jpeg(JpegError::Malfunction(format!(
@@ -2478,8 +2478,8 @@ mod tests {
             bands(rows(9, 100), Some(32)),
             [rows(9, 30), rows(39, 30), rows(69, 30), rows(99, 10)]
         );
-        assert_eq!(rows(39, 30).from_even(), rows(38, 31));
-        assert_eq!(rows(40, 30).from_even(), rows(40, 30));
+        assert_eq!(rows(39, 30).to_even(), rows(38, 31));
+        assert_eq!(rows(40, 30).to_even(), rows(40, 30));
     }
 
     /// Bytes 0, 1, 2, ... of a pseudo-random sequence.
@@ -2612,7 +2612,7 @@ mod tests {
                 for each in [16, 32, 48] {
                     let (mut striped, mut offset) = (destination(), destination());
                     for band in bands(band, Some(each)) {
-                        let read = band.from_even();
+                        let read = band.to_even();
                         assert!(read.count.next_multiple_of(2) <= each, "{band:?}, {each}");
                         let (strip, strip_bytes) = strip_of(&layout, &bytes, rows, read);
                         let samples =

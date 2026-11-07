@@ -26,8 +26,7 @@ use reims_vgpu_video_core::encoder_backend::{
 use reims_vgpu_video_core::fourcc::FourCc;
 use reims_vgpu_video_core::jpeg::{
     DecodedSamples, JpegCapabilities, JpegDecode, JpegDecoder, JpegDecodes, JpegError,
-    JpegOutputFormat, JpegSubsampling,
-    SampleView, write_bgra, write_samples,
+    JpegOutputFormat, JpegSubsampling, SampleView, write_bgra, write_samples,
 };
 use reims_vgpu_video_core::plist;
 use reims_vgpu_video_core::status::OsStatus;
