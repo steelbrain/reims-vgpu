@@ -33,6 +33,7 @@
 #include "RgfxAirArguments.hpp"
 #include "RgfxFunctionConstants.hpp"
 #include "RgfxLibraryStream.hpp"
+#include "RgfxMetallibWriter.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -594,9 +595,17 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	const void *mapped = nullptr;
 	size_t size = 0;
 	dispatch_data_t map = dispatch_data_create_map(source, &mapped, &size);
-	// The library was made from a universal .metallib's AIR slice; the bytes kept are whole.
+	// The library was made from a universal .metallib's AIR slice; the bytes kept are whole. It
+	// was made from the .metallib of their kernels where they are the bytes Metal's compiler
+	// answers for OpenCL C source (RgfxMetallibOfClLibrary), which the process keeps as they are
+	// for the shadow.
 	const uint8_t *bytes = static_cast<const uint8_t *>(mapped);
 	rgfxMetallibAirSlice(bytes, size);
+	std::vector<uint8_t> clKernels;
+	if (map != nil && RgfxMetallibOfClLibrary(bytes, size, clKernels)) {
+		bytes = clKernels.data();
+		size = clKernels.size();
+	}
 	const uint8_t *bitcode = nullptr;
 	size_t bitcodeSize = 0;
 	std::shared_ptr<const RgfxAirModule> module;

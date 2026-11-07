@@ -37,6 +37,7 @@
 #include <vector>
 
 #import "RgfxGLFunction.h"
+#import "RgfxLibrary.h"
 #import "RgfxPipelineReflection.h"
 
 #include "RgfxAirArguments.hpp"
@@ -44,6 +45,14 @@
 #include "RgfxLibraryKey.hpp"
 #include "RgfxMetallibWriter.hpp"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks
+#include "RgfxSerializer.hpp"
+
+void drainRing(TestRing &ring); // shell_tests.mm
+
+// The library's reader of an entry point's arguments (RgfxLibrary.mm), as shell_tests.mm names it.
+@interface RgfxLibrary (GLTestsAirReads)
+- (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunctionNamed:(const std::string &)name;
+@end
 
 void rgfxGLTests();
 
@@ -479,6 +488,65 @@ void test_cl_library()
 	CHECK(names.count == 2);
 }
 
+// A library made from an OpenCL container's kernels keeps the container as the bytes it was
+// given (newLibraryWithData:, for its shadow), and its entry points' arguments read from the
+// kernels' bitcode in it, as from a library kept over the kernels' .metallib: where they did not,
+// the GL renderer's OpenCL kernels had no arguments (m3-max-3947).
+void test_cl_library_arguments()
+{
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	if (path == nullptr)
+		return; // test_metallib_writer says so
+	const std::vector<uint8_t> lib = readFile(path);
+	std::vector<RgfxMetallibFunction> kernels;
+	for (RgfxMetallibFunction &f : stageFunctions(lib))
+		if (f.stage == RgfxMetallibStage::Kernel && kernels.size() < 2)
+			kernels.push_back(f);
+	CHECK(kernels.size() == 2);
+	if (kernels.size() != 2)
+		return;
+	const std::vector<uint8_t> container = clContainer(kernels);
+	std::vector<uint8_t> metallib;
+	CHECK(RgfxMetallibOfClLibrary(container.data(), container.size(), metallib));
+	// The transport is never freed, as the shell tests' fixture's: a library may dealloc later.
+	TestRing &ring = *new TestRing(0x40000);
+	RgfxRingWriter &writer =
+	    *new RgfxRingWriter(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(writer, ids);
+	ring.setConsumerIdle(1);
+	auto keptOver = [&](const std::vector<uint8_t> &kept) {
+		uint32_t status = 0;
+		RgfxLibrary *made = [RgfxLibrary libraryWithData:metallib.data()
+		                                          length:metallib.size()
+		                                             key:nullptr
+		                                          device:nil
+		                                      serializer:&ser
+		                                          status:&status];
+		NSData *bytes = [NSData dataWithBytes:kept.data() length:kept.size()];
+		[made rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+			      (void)bytes;
+		      })
+		        shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+			        return nil;
+		        }];
+		drainRing(ring);
+		return made;
+	};
+	RgfxLibrary *overContainer = keptOver(container);
+	RgfxLibrary *overMetallib = keptOver(metallib);
+	CHECK(overContainer != nil && overMetallib != nil);
+	for (const RgfxMetallibFunction &f : kernels) {
+		std::shared_ptr<const RgfxAirFunction> a = [overContainer rgfxAirFunctionNamed:f.name];
+		std::shared_ptr<const RgfxAirFunction> b = [overMetallib rgfxAirFunctionNamed:f.name];
+		CHECK(a != nullptr && b != nullptr);
+		if (a != nullptr && b != nullptr)
+			CHECK(a->name == f.name && a->arguments.size() == b->arguments.size());
+	}
+
+	drainRing(ring);
+}
+
 void test_gl_function_answers()
 {
 	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
@@ -734,6 +802,7 @@ void rgfxGLTests()
 		test_metallib_writer();
 		test_metallib_writer_several();
 		test_cl_library();
+		test_cl_library_arguments();
 		test_gl_function_answers();
 		test_reflection_answers_return_data();
 		test_stage_metadata_normalized();
