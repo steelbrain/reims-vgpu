@@ -2057,7 +2057,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             .flatten()?;
         let writers = writers_at
             .and_then(|at| self.region.surface_writers(at))
-            .map(|record| record.writers.into_iter().filter(|w| w.seqno != 0).collect())
+            .map(|record| {
+                record
+                    .writers
+                    .into_iter()
+                    .filter(|w| w.seqno != 0)
+                    .collect()
+            })
             .unwrap_or_default();
         Some(SurfacePresent {
             texture,

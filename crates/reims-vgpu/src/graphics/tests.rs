@@ -7049,7 +7049,11 @@ fn a_present_waits_for_a_writer_of_a_queue_whose_handle_is_not_yet_made() {
     assert_eq!(shown_width(&device), None, "shown before its writer ran");
     assert_eq!(device.control.presents.waiting(), 1);
     assert!(quiet(&guest), "answered before it was shown");
-    assert_eq!(log.count("newCommandQueue"), 1, "the new queue's handle was made");
+    assert_eq!(
+        log.count("newCommandQueue"),
+        1,
+        "the new queue's handle was made"
+    );
 
     // The service thread goes on: the new queue's handle is made and its buffer committed, and
     // once the buffer finishes the surface shows and the present is answered.
@@ -7057,7 +7061,12 @@ fn a_present_waits_for_a_writer_of_a_queue_whose_handle_is_not_yet_made() {
     let ids = committed(&platform, 1);
     assert_eq!(log.count("newCommandQueue"), 2);
     presents_waiting(&device, 1);
-    assert!(world.complete(ids[0], CommandBufferStatus::COMPLETED, None, CompleteOn::Caller));
+    assert!(world.complete(
+        ids[0],
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
     let seqno = guest.seqno;
     assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
     assert_eq!(shown_width(&device), Some(64));
