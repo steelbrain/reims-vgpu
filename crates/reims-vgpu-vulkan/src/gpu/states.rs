@@ -985,7 +985,9 @@ pub(crate) fn stage_input_descriptor(
     out
 }
 
-/// The runtime's compute descriptor of a whole value's, the graphics lane's.
+/// The runtime's compute descriptor of a whole value's, the graphics lane's, OpenCL mode
+/// included: the runtime links a kernel of OpenCL mode as Metal does, behind the three buffers of
+/// Metal's OpenCL dispatcher, its arguments at their indices plus three.
 pub(crate) fn full_compute_descriptor(
     sel: &'static str,
     desc: &FullComputePipelineDesc<'_, VulkanPlatform>,
@@ -1011,6 +1013,7 @@ pub(crate) fn full_compute_descriptor(
         .stage_input
         .as_ref()
         .map(|s| stage_input_descriptor(sel, s));
+    d.open_cl_mode_enabled = desc.open_cl_mode;
     d
 }
 
@@ -1463,6 +1466,7 @@ mod tests {
             index_buffer_index: 0,
         });
         let d = full_compute_descriptor(sel, &desc);
+        assert!(!d.open_cl_mode_enabled);
         assert!(d.threadgroup_size_is_multiple_of_execution_width);
         assert_eq!(d.max_total_threads_per_threadgroup, Some(128));
         assert_eq!(d.max_call_stack_depth, 3);
@@ -1504,6 +1508,29 @@ mod tests {
             named(&callee, "linked_add_one"),
             binary,
         ]
+    }
+
+    /// A whole compute value of OpenCL mode is the runtime's descriptor of OpenCL mode, and the
+    /// device makes such pipelines
+    #[test]
+    fn a_whole_compute_value_carries_its_opencl_mode() {
+        use crate::gpu::device::tests::fixture_function;
+        let f = fixture_function(include_bytes!("../../../../tests/shaders/kernel.metallib"));
+        let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
+        let desc = |open_cl_mode| FullComputePipelineDesc {
+            label: None,
+            function: &f,
+            threadgroup_size_is_multiple_of_execution_width: false,
+            max_total_threads_per_threadgroup: 0,
+            max_call_stack_depth: 1,
+            support_indirect_command_buffers: false,
+            stage_input: None,
+            linked: LinkedFunctionsDesc::default(),
+            open_cl_mode,
+        };
+        assert!(full_compute_descriptor(sel, &desc(true)).open_cl_mode_enabled);
+        assert!(!full_compute_descriptor(sel, &desc(false)).open_cl_mode_enabled);
+        assert!(dev().makes_opencl_mode_pipelines());
     }
 
     /// A kernel that calls a visible function its library does not define is made with the

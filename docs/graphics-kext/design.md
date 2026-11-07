@@ -886,7 +886,8 @@ only where no negotiation can carry it.
   bit. A host offers it where its platform makes such pipelines: the Metal
   platform where Metal's compute pipeline descriptors answer
   `setOpenCLModeEnabled:` (the M3 Max on macOS 27, the AMD 5300M and Intel 630
-  on macOS 26.7.1), and the Vulkan platform not yet.
+  on macOS 26.7.1), and the Vulkan platform always, its runtime linking the
+  kernel as Metal does.
 - Bit 28 is `PRIVATE_RENDER_STATE`: a `RENDER_PIPELINE_CREATE` may carry
   `RGFX_RENDER_PIPELINE_PRIVATE_STATE` (flag bit 6), and then an
   `RgfxRenderPipelinePrivateState` (24 bytes) follows its head, ahead of the

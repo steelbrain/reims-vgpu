@@ -240,8 +240,8 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// Whether the device makes compute pipelines of OpenCL mode
     /// ([`FullComputePipelineDesc::open_cl_mode`]): on the Metal platform, where Metal's compute
     /// pipeline descriptors take `setOpenCLModeEnabled:` (SPI) and its functions
-    /// `newFunctionWithPluginData:bitcodeType:` (SPI); the Vulkan platform makes none. The
-    /// graphics lane offers `OPENCL_MODE` where it does.
+    /// `newFunctionWithPluginData:bitcodeType:` (SPI); on the Vulkan platform, whose runtime links
+    /// such a kernel as Metal does. The graphics lane offers `OPENCL_MODE` where it does.
     fn makes_opencl_mode_pipelines(&self) -> bool;
     /// sel: newBufferWithDescriptor: SPI — from a private `MTLBufferDescriptor` made from
     /// `desc`.

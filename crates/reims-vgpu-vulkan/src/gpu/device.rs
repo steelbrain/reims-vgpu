@@ -1614,9 +1614,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         crate::gpu::identity::device_local_budget(&self.raw)
     }
 
-    /// No: the runtime links no kernel of OpenCL mode yet.
+    /// Always: the runtime links a kernel of OpenCL mode as Metal does, behind its three buffers
+    /// (`states::full_compute_descriptor`).
     fn makes_opencl_mode_pipelines(&self) -> bool {
-        false
+        true
     }
 
     /// The runtime's buffer descriptor of the value: zero bytes, a copy of the contents, or,
@@ -2022,15 +2023,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         desc: &FullComputePipelineDesc<'_, VulkanPlatform>,
     ) -> Result<Option<VulkanComputePipeline>, NsErrorText> {
         let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
-        if desc.open_cl_mode {
-            // The device offers no OpenCL mode (`makes_opencl_mode_pipelines`), so the guest's
-            // bundle asks for none; a create that does fails as a compile Metal cannot make.
-            return Err(NsErrorText {
-                domain: "MTLLibraryErrorDomain".to_owned(),
-                code: 3,
-                description: "OpenCL mode is not supported on this device".to_owned(),
-            });
-        }
         let d = super::states::full_compute_descriptor(sel, desc);
         let mut options = rt::PipelineOptions::default();
         options.label = desc.label.map(str::to_owned);
