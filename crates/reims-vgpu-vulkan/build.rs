@@ -45,6 +45,12 @@
 //! same source with: a new `MTLCompileOptions` reads `languageVersion` Metal 4.0 and `mathMode`
 //! Fast (measured on an M3 Max, macOS 26.7, 25G229). A Mac needs Xcode's Metal toolchain
 //! (`xcrun -sdk macosx metal`); a `MACOSX_DEPLOYMENT_TARGET` changes no byte of the output.
+//! **Measured** with Metal 32023.922 on an M3 Max (2026-11-07): a compile in another directory
+//! writes the same metallib (the AIR names the source's path, the metallib does not), and so does
+//! a second compile, the stitched library's included. The bytes follow the toolchain: a metallib
+//! records the compiler's version and its AIR version and target (`air64_v29-apple-macosx27.2.0`
+//! there, `air64_v28-apple-macosx26.0.0` from Metal 32023.921), so a Mac with another Xcode
+//! writes each file again with the same sources.
 //!
 //! Any other host (Linux) takes the metallibs a Mac compiled instead: those committed in
 //! `metallibs/` beside this file ([`COMMITTED`]), or those in the directory `RVG_METALLIB_DIR`
