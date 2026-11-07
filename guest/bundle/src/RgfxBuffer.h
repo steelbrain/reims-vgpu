@@ -33,6 +33,20 @@ class RgfxSlabs;
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// Bit 18 of MTLResourceOptions (0x40000), whose meaning nothing states. Both x86 Macs make no
+/// buffer of a length or of bytes, nor a texture of a descriptor, whose options hold it: nil in
+/// each storage mode, where they make one with bit 17 or 19 instead (measured: macOS 26.7.1 on the
+/// AMD 5300M and the Intel 630). They make a no-copy buffer and a heap's buffer with it, and
+/// diverge on a Private heap (the AMD's is nil, the Intel's is made).
+static const MTLResourceOptions kRgfxOptionBit18 = (MTLResourceOptions)1 << 18;
+
+/// Whether the device makes no buffer of a length or of bytes, nor a texture, of `options`
+/// (kRgfxOptionBit18).
+static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
+{
+	return (options & kRgfxOptionBit18) != 0;
+}
+
 @interface RgfxBuffer : RgfxResource <MTLBuffer>
 
 /// Creates a device buffer of `length` bytes with `options`, serialising an
@@ -74,20 +88,6 @@ NS_ASSUME_NONNULL_BEGIN
                                                deallocator:(nullable void (^)(void))deallocator
                                                     device:(nullable id<MTLDevice>)device
                                                 serializer:(nullable RgfxSerializer *)serializer;
-
-/// Bit 18 of MTLResourceOptions (0x40000), whose meaning nothing states. Both x86 Macs make no
-/// buffer of a length or of bytes, nor a texture of a descriptor, whose options hold it: nil in
-/// each storage mode, where they make one with bit 17 or 19 instead (measured: macOS 26.7.1 on the
-/// AMD 5300M and the Intel 630). They make a no-copy buffer and a heap's buffer with it, and
-/// diverge on a Private heap (the AMD's is nil, the Intel's is made).
-static const MTLResourceOptions kRgfxOptionBit18 = (MTLResourceOptions)1 << 18;
-
-/// Whether the device makes no buffer of a length or of bytes, nor a texture, of `options`
-/// (kRgfxOptionBit18).
-static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
-{
-	return (options & kRgfxOptionBit18) != 0;
-}
 
 #ifdef __cplusplus
 /// The buffer `newBufferWithLength:options:` (`bytes` null) and
