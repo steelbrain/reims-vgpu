@@ -641,35 +641,45 @@ const char kVertexNormalized[] = R"AIR(!air.vertex = !{!10}
 !19 = !{i32 1, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"#air_vertex_id"}
 !20 = !{i32 2, !"air.instance_id", !"air.arg_name", !"instance", !"air.arg_type_name", !"ushort"})AIR";
 
-// A fragment stage's buffers in the shape the generator writes them (measured: macOS 26.7.1, the
-// uniform buffers of gl_cases' shaders): no air.address_space, and one of a known size with no
-// pointee size either; a texture beside them. Our own text.
+// A fragment stage's buffers in the shapes the generator writes them (measured: macOS 26.7.1, the
+// uniform buffers of gl_cases' shaders): no air.address_space; a uniform block of a known size
+// whose <4 x float> pointer is named "uchar", with no pointee size either. Beside them, a sized
+// i8 buffer, a float3 array and a struct pointee (no size is added for the struct), and a
+// texture. Our own text.
 const char kBufferText[] = R"AIR(!air.fragment = !{!0}
-!0 = !{{ <4 x float> } (i8 addrspace(2)*, i8 addrspace(1)*, %struct._texture_2d_t addrspace(1)*)* @__main, !1, !3}
+!0 = !{{ <4 x float> } (i8 addrspace(2)*, <4 x float> addrspace(2)*, %struct._texture_2d_t addrspace(1)*, i8 addrspace(1)*, [3 x <3 x float>] addrspace(2)*, %struct.S addrspace(1)*)* @__main, !1, !3}
 !1 = !{!2}
 !2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
-!3 = !{!4, !5, !6}
+!3 = !{!4, !5, !6, !7, !8, !9}
 !4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"fs_uniform_buffer"}
-!5 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"uchar", !"air.arg_name", !"u"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t"})AIR";
+!5 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"uchar", !"air.arg_name", !"fs_ubo_0"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t"}
+!7 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 2, i32 1, !"air.read", !"air.arg_type_name", !"uchar", !"air.arg_name", !"u"}
+!8 = !{i32 4, !"air.buffer", !"air.buffer_size", i32 48, !"air.location_index", i32 3, i32 1, !"air.read", !"air.arg_type_name", !"uchar", !"air.arg_name", !"a"}
+!9 = !{i32 5, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.arg_type_name", !"uchar", !"air.arg_name", !"s"})AIR";
 
-// kBufferText as the rules make it: each buffer's address space from its parameter's pointer, the
-// sized one's pointee size and alignment from its type name; the texture as it was.
+// kBufferText as the rules make it: each buffer's address space from its parameter's pointer, and
+// the pointee size and alignment of the sized ones from the pointer's pointee (16 for the block,
+// 1 for the i8, 48 aligned 16 for the array), the type name as it was; the struct's buffer with
+// its address space alone; the texture as it was.
 const char kBufferNormalized[] = R"AIR(!air.fragment = !{!0}
-!0 = !{{ <4 x float> } (i8 addrspace(2)*, i8 addrspace(1)*, %struct._texture_2d_t addrspace(1)*)* @__main, !1, !3}
+!0 = !{{ <4 x float> } (i8 addrspace(2)*, <4 x float> addrspace(2)*, %struct._texture_2d_t addrspace(1)*, i8 addrspace(1)*, [3 x <3 x float>] addrspace(2)*, %struct.S addrspace(1)*)* @__main, !1, !3}
 !1 = !{!2}
 !2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
-!3 = !{!4, !5, !6}
+!3 = !{!4, !5, !6, !7, !8, !9}
 !4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"fs_uniform_buffer"}
-!5 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"u"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t"})AIR";
+!5 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uchar", !"air.arg_name", !"fs_ubo_0"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t"}
+!7 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"u"}
+!8 = !{i32 4, !"air.buffer", !"air.buffer_size", i32 48, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 48, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uchar", !"air.arg_name", !"a"}
+!9 = !{i32 5, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"s"})AIR";
 
 void test_stage_metadata_normalized()
 {
 	{
 		RgfxGLSignature buffers;
 		buffers.outputs = {"float4"};
-		buffers.parameters = {"", "", ""};
+		buffers.parameters = {"", "", "", "", "", ""};
 		std::string text = kBufferText;
 		CHECK(RgfxGLNormalizeStageText(text, buffers));
 		CHECK(text == kBufferNormalized);

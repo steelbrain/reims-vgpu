@@ -315,12 +315,19 @@ bool signedIntegerName(const std::string &t)
 	return base == "char" || base == "short" || base == "int" || base == "long";
 }
 
-// The address space of each parameter of the function type an entry node's first operand holds
-// ("{ <4 x float> } (i8 addrspace(2)*, i32)* @__main"): N for a pointer into addrspace(N), 0 for
-// a pointer into none, -1 for a value that is not a pointer.
-std::vector<int> parameterAddressSpaces(const std::string &op)
+// A parameter of an entry point's function type: the address space of its pointer (N for a pointer
+// into addrspace(N), 0 for one into none) and the pointer's pointee type, or -1 and the type of a
+// value that is not a pointer.
+struct ParameterType {
+	int space = -1;
+	std::string pointee;
+};
+
+// The parameters of the function type an entry node's first operand holds
+// ("{ <4 x float> } (i8 addrspace(2)*, i32)* @__main").
+std::vector<ParameterType> parameterTypes(const std::string &op)
 {
-	std::vector<int> spaces;
+	std::vector<ParameterType> params;
 	// The parameter list: the outermost parentheses after the return type.
 	size_t open = std::string::npos;
 	int depth = 0;
@@ -336,7 +343,7 @@ std::vector<int> parameterAddressSpaces(const std::string &op)
 		}
 	}
 	if (open == std::string::npos)
-		return spaces;
+		return params;
 	std::string param;
 	depth = 0;
 	for (size_t i = open + 1; i < op.size(); i++) {
@@ -347,11 +354,20 @@ std::vector<int> parameterAddressSpaces(const std::string &op)
 			depth--;
 		if (depth < 0 || (depth == 0 && c == ',')) {
 			if (!param.empty()) {
-				int space = -1;
-				const size_t at = param.rfind("addrspace(");
-				if (!param.empty() && param.back() == '*')
-					space = at != std::string::npos ? std::atoi(param.c_str() + at + 10) : 0;
-				spaces.push_back(space);
+				ParameterType t;
+				t.pointee = param;
+				if (param.back() == '*') {
+					t.pointee.pop_back();
+					t.space = 0;
+					const size_t at = t.pointee.rfind(" addrspace(");
+					if (at != std::string::npos && t.pointee.back() == ')') {
+						t.space = std::atoi(t.pointee.c_str() + at + 11);
+						t.pointee.erase(at);
+					}
+					while (!t.pointee.empty() && t.pointee.back() == ' ')
+						t.pointee.pop_back();
+				}
+				params.push_back(t);
 			}
 			param.clear();
 			if (depth < 0)
@@ -362,40 +378,65 @@ std::vector<int> parameterAddressSpaces(const std::string &op)
 			continue;
 		param += c;
 	}
-	return spaces;
+	return params;
 }
 
-// The size and alignment `metal` writes for a buffer's pointee of Metal value type `name`
-// (air.arg_type_size, air.arg_type_align_size): a scalar's size, a vector of 2 or 4 that many
-// times it, of 3 four times it; false for any other name.
-bool valueTypeSize(const std::string &name, unsigned &size, unsigned &align)
+// The allocation size and alignment of LLVM type `t` in an AIR module's data layout, which
+// metal2vulkan checks a buffer's air.arg_type_size against and `metal` writes: an integer's bytes
+// rounded up to a power of two, half 2, float 4, double 8; a vector its elements' size rounded up
+// to a power of two, aligned to that; an array its count of its element's. False for any other
+// type (a struct, a pointer).
+bool llvmTypeSize(std::string t, uint64_t &size, uint64_t &align)
 {
-	std::string base = name;
-	unsigned count = 1;
-	if (!base.empty() && base.back() >= '2' && base.back() <= '4') {
-		count = static_cast<unsigned>(base.back() - '0');
-		base.pop_back();
+	while (!t.empty() && t.front() == ' ')
+		t.erase(0, 1);
+	while (!t.empty() && t.back() == ' ')
+		t.pop_back();
+	auto powerOfTwo = [](uint64_t n) {
+		uint64_t p = 1;
+		while (p < n)
+			p <<= 1;
+		return p;
+	};
+	if (t == "half" || t == "float" || t == "double") {
+		size = align = t == "half" ? 2 : t == "float" ? 4 : 8;
+		return true;
 	}
-	unsigned scalar = 0;
-	if (base == "uchar" || base == "char" || base == "bool")
-		scalar = 1;
-	else if (base == "ushort" || base == "short" || base == "half")
-		scalar = 2;
-	else if (base == "uint" || base == "int" || base == "float")
-		scalar = 4;
-	else if (base == "ulong" || base == "long")
-		scalar = 8;
-	if (scalar == 0)
+	if (t.size() > 1 && t[0] == 'i' && t.find_first_not_of("0123456789", 1) == std::string::npos) {
+		const uint64_t bits = std::strtoull(t.c_str() + 1, nullptr, 10);
+		if (bits == 0 || bits > 64)
+			return false;
+		size = align = powerOfTwo((bits + 7) / 8);
+		return true;
+	}
+	const bool vector = t.size() > 2 && t.front() == '<' && t.back() == '>';
+	const bool array = t.size() > 2 && t.front() == '[' && t.back() == ']';
+	if (!vector && !array)
 		return false;
-	align = scalar * (count == 3 ? 4 : count);
-	size = align;
+	const std::string inner = t.substr(1, t.size() - 2);
+	const size_t x = inner.find(" x ");
+	if (x == std::string::npos)
+		return false;
+	char *end = nullptr;
+	const uint64_t count = std::strtoull(inner.c_str(), &end, 10);
+	if (end != inner.c_str() + x || count == 0)
+		return false;
+	uint64_t elementSize = 0, elementAlign = 0;
+	if (!llvmTypeSize(inner.substr(x + 3), elementSize, elementAlign))
+		return false;
+	if (array) {
+		size = count * elementSize;
+		align = elementAlign;
+	} else {
+		size = align = powerOfTwo(count * elementSize);
+	}
 	return true;
 }
 
 // Makes one output or input node's text what the rules in RgfxGLLowering.hpp say; true where it
 // changed. `type` is the Metal name of the value's type from the entry point's signature, and
-// `space` the address space of an input's parameter (parameterAddressSpaces).
-bool normalizeNode(std::string &line, bool input, const std::string &type, int space = -1)
+// `param` an input's parameter in the entry point's function type (parameterTypes).
+bool normalizeNode(std::string &line, bool input, const std::string &type, const ParameterType &param = {})
 {
 	NodeText n;
 	if (!splitNode(line, n))
@@ -436,8 +477,11 @@ bool normalizeNode(std::string &line, bool input, const std::string &type, int s
 		}
 	}
 	// A buffer's address space and pointee size, which the generator does not write where `metal`
-	// does: air.address_space after the access (or the location), from the parameter's pointer;
-	// air.arg_type_size and air.arg_type_align_size before air.arg_type_name, from that name.
+	// does: air.address_space after the access (or the location), and air.arg_type_size and
+	// air.arg_type_align_size before air.arg_type_name, from the parameter's pointer. The size is
+	// the pointee's, not the type name's: the generator names a uniform block's pointer
+	// <4 x float> addrspace(2)* "uchar" (measured: macOS 26.7.1, gl_cases' block case), and
+	// metal2vulkan refuses a size other than the pointee's allocation size.
 	std::string first;
 	if (input && n.ops.size() > 1 && stringOp(n.ops[1], first) && first == "air.buffer") {
 		size_t accessAt = n.ops.size(), locationAt = n.ops.size(), nameAt = n.ops.size();
@@ -457,10 +501,9 @@ bool normalizeNode(std::string &line, bool input, const std::string &type, int s
 			else if (key == "air.arg_type_name")
 				nameAt = i;
 		}
-		std::string pointee;
-		unsigned size = 0, align = 0;
-		if (!hasSize && nameAt + 1 < n.ops.size() && stringOp(n.ops[nameAt + 1], pointee) &&
-		    valueTypeSize(pointee, size, align)) {
+		uint64_t size = 0, align = 0;
+		if (!hasSize && nameAt != n.ops.size() && param.space >= 0 &&
+		    llvmTypeSize(param.pointee, size, align)) {
 			n.ops.insert(n.ops.begin() + static_cast<std::ptrdiff_t>(nameAt),
 			             {"!\"air.arg_type_size\"", "i32 " + std::to_string(size),
 			              "!\"air.arg_type_align_size\"", "i32 " + std::to_string(align)});
@@ -469,9 +512,9 @@ bool normalizeNode(std::string &line, bool input, const std::string &type, int s
 		const size_t after = accessAt != n.ops.size() ? accessAt + 1
 		                     : locationAt + 2 < n.ops.size() ? locationAt + 3
 		                                                     : n.ops.size();
-		if (!hasSpace && space > 0 && after <= n.ops.size()) {
+		if (!hasSpace && param.space > 0 && after <= n.ops.size()) {
 			n.ops.insert(n.ops.begin() + static_cast<std::ptrdiff_t>(after),
-			             {"!\"air.address_space\"", "i32 " + std::to_string(space)});
+			             {"!\"air.address_space\"", "i32 " + std::to_string(param.space)});
 			edited = true;
 		}
 		if (edited)
@@ -654,7 +697,7 @@ bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signatur
 				changed |= normalizeNode(lines[nodeLine[n]], false,
 				                         i < signature.outputs.size() ? signature.outputs[i] : std::string());
 		}
-		const std::vector<int> spaces = parameterAddressSpaces(e.ops[0]);
+		const std::vector<ParameterType> params = parameterTypes(e.ops[0]);
 		for (const std::string &op : inputs.ops) {
 			unsigned n = 0, param = 0;
 			NodeText in;
@@ -663,7 +706,7 @@ bool RgfxGLNormalizeStageText(std::string &text, const RgfxGLSignature &signatur
 			changed |= normalizeNode(lines[nodeLine[n]], true,
 			                         param < signature.parameters.size() ? signature.parameters[param]
 			                                                             : std::string(),
-			                         param < spaces.size() ? spaces[param] : -1);
+			                         param < params.size() ? params[param] : ParameterType());
 		}
 	}
 	if (!changed)
