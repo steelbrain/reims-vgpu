@@ -21,6 +21,12 @@
 //! is: it passes at 34 dB for a conversion, 30 dB for a scale, and 28 dB
 //! where the output's size is odd.
 //!
+//! A stream outside what the backend answers it decodes
+//! (`JpegDecoder::decodes`: its samplings, and its largest picture) is to
+//! be refused as `UnsupportedStream`: that refusal passes, as answered,
+//! where a decode was asked for, and a decode of it fails. Inside the
+//! answer, every refusal fails.
+//!
 //! - `--format F`: `420f`, `422f`, `444f`, `yuvs`, `2vuy` or `BGRA`; the
 //!   stream's own (and `420f` for grey) by default.
 //! - `--crop X,Y,W,H`: a rectangle of MCUs, as `CropRect` gives it.
@@ -296,14 +302,35 @@ mod check {
             .map(|(engine, spent)| format!("{engine}={spent}ns"))
             .collect();
         println!("engines {}", busy.join(" "));
+        // What the backend says it decodes: a stream outside it is to be
+        // refused, as unsupported, and one inside it to decode.
+        let decodes = decoder.decodes();
+        let answered = parsed.is_ok() && !decodes.takes(subsampling, (width, height));
+        let answer = || {
+            format!(
+                "the backend decodes {:?} up to {}x{}",
+                decodes.subsamplings, decodes.max_size.0, decodes.max_size.1
+            )
+        };
         match (outcome, &options.expect_error) {
             (Err(error), Some(expected)) => {
                 let kind = kind(&error);
                 println!("decode refused, {kind}: {error}");
                 return Ok(pass && kind == expected);
             }
+            (Err(error @ JpegError::UnsupportedStream(_)), None) if answered => {
+                println!(
+                    "decode refused as answered, UnsupportedStream: {error}; {}",
+                    answer()
+                );
+                return Ok(pass);
+            }
             (Err(error), None) => {
                 println!("decode failed, {}: {error}", kind(&error));
+                return Ok(false);
+            }
+            (Ok(()), None) if answered => {
+                println!("decode ok, where {} refuses it", answer());
                 return Ok(false);
             }
             (Ok(()), Some(expected)) => {

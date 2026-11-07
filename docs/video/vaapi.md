@@ -1506,6 +1506,14 @@ conformance suite's scaler cases do ([scaler.md](scaler.md)). `BGRA`
 passes against the chroma interpolated from its centres, or taken from the
 nearest sample, as Apple's looks to be.
 
+A stream outside what the backend answers it decodes (`JpegDecoder::decodes`:
+the samplings, and the largest picture) passes refused as
+`UnsupportedStream`, "refused as answered", and fails decoded; inside the
+answer every refusal fails. So a GPU whose driver lists fewer samplings,
+or a smaller picture, passes the cases past them, by its own answer: the
+RX 550's lists no 4:4:4, and 4096x4096 at most. The script's last line
+counts the passes, those refused as answered among them, and the failures.
+
 **Results**, 2026-10-24, on both AMD GPUs with `--large`: all 102 cases
 passed on each GPU, the same on both. Of the decodes that copy samples:
 - Every plane was within 1 of both libjpeg-turbo 3.2.0 and ffmpeg

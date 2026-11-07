@@ -156,8 +156,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_vgpu_video_codec::jpeg::{self as syntax, Image};
 use reims_vgpu_video_core::jpeg::{
-    DecodedSamples, JpegCapabilities, JpegDecode, JpegDecoder, JpegError, JpegOutputFormat,
-    JpegSubsampling, PixelRect, SampleView, write_bgra, write_samples,
+    DecodedSamples, JpegCapabilities, JpegDecode, JpegDecoder, JpegDecodes, JpegError,
+    JpegOutputFormat, JpegSubsampling, PixelRect, SampleView, write_bgra, write_samples,
 };
 use reims_vgpu_video_core::runtime::MonoTime;
 use reims_vgpu_video_core::surfaces::PlaneDestination;
@@ -1764,6 +1764,14 @@ fn rectangle(rect: PixelRect) -> proc::VARectangle {
 }
 
 impl JpegDecoder for VaapiJpegDecoder {
+    /// The samplings the driver lists, up to its largest picture.
+    fn decodes(&self) -> JpegDecodes {
+        JpegDecodes {
+            subsamplings: self.subsamplings(),
+            max_size: self.max_size,
+        }
+    }
+
     fn capabilities(&self) -> JpegCapabilities {
         JpegCapabilities {
             cores: 1,

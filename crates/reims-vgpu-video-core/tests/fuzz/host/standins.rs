@@ -25,7 +25,8 @@ use reims_vgpu_video_core::encoder_backend::{
 };
 use reims_vgpu_video_core::fourcc::FourCc;
 use reims_vgpu_video_core::jpeg::{
-    DecodedSamples, JpegCapabilities, JpegDecode, JpegDecoder, JpegError, JpegOutputFormat,
+    DecodedSamples, JpegCapabilities, JpegDecode, JpegDecoder, JpegDecodes, JpegError,
+    JpegOutputFormat, JpegSubsampling,
     SampleView, write_bgra, write_samples,
 };
 use reims_vgpu_video_core::plist;
@@ -1066,6 +1067,18 @@ fn jpeg_planes(format: JpegOutputFormat, width: usize, height: usize) -> Vec<(us
 }
 
 impl JpegDecoder for Jpeg {
+    fn decodes(&self) -> JpegDecodes {
+        JpegDecodes {
+            subsamplings: vec![
+                JpegSubsampling::Yuv420,
+                JpegSubsampling::Yuv422,
+                JpegSubsampling::Yuv444,
+                JpegSubsampling::Grey,
+            ],
+            max_size: (u32::from(u16::MAX), u32::from(u16::MAX)),
+        }
+    }
+
     fn capabilities(&self) -> JpegCapabilities {
         self.capabilities
     }

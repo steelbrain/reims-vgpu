@@ -155,6 +155,30 @@ pub struct JpegCapabilities {
     pub interchange_formats: bool,
 }
 
+/// What a backend decodes at all, as its hardware answers: the samplings
+/// and the largest picture. A stream outside them is refused as
+/// [`JpegError::UnsupportedStream`] before any work. The guest hears of it
+/// only through those refusals (`jcap` has no key for it); the conformance
+/// suite's `jpeg-check` reads it, to tell such a refusal from one the
+/// backend should not make.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JpegDecodes {
+    /// The samplings it decodes.
+    pub subsamplings: Vec<JpegSubsampling>,
+    /// The largest width and height it decodes.
+    pub max_size: (u32, u32),
+}
+
+impl JpegDecodes {
+    /// Whether a stream of `subsampling`, `width` by `height`, is within
+    /// what it decodes.
+    pub fn takes(&self, subsampling: JpegSubsampling, (width, height): (u32, u32)) -> bool {
+        self.subsamplings.contains(&subsampling)
+            && width <= self.max_size.0
+            && height <= self.max_size.1
+    }
+}
+
 /// A rectangle of an image, in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelRect {
@@ -205,6 +229,9 @@ impl JpegDecode<'_> {
 pub trait JpegDecoder: Send + Sync {
     /// What `jcap` says of it.
     fn capabilities(&self) -> JpegCapabilities;
+
+    /// What it decodes at all ([`JpegDecodes`]).
+    fn decodes(&self) -> JpegDecodes;
 
     /// Decodes `request.data` and writes its region, at its scale, into
     /// the top-left corner of `planes`, in `request.format`: one plane for

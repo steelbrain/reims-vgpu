@@ -61,8 +61,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_vgpu_video_codec::jpeg as syntax;
 use reims_vgpu_video_core::jpeg::{
-    JpegCapabilities, JpegDecode, JpegDecoder, JpegError, JpegOutputFormat, JpegSubsampling,
-    PixelRect,
+    JpegCapabilities, JpegDecode, JpegDecoder, JpegDecodes, JpegError, JpegOutputFormat,
+    JpegSubsampling, PixelRect,
 };
 use reims_vgpu_video_core::surfaces::PlaneDestination;
 use reims_vgpu_video_core::sync::Mutex;
@@ -262,6 +262,22 @@ impl NvidiaJpegDecoder {
 }
 
 impl JpegDecoder for NvidiaJpegDecoder {
+    /// The four samplings the module docs measure, at any size a frame
+    /// header gives. nvJPEG's hardware decoder answers for each stream
+    /// whether it takes it (`nvjpegDecoderJpegSupported`), which nothing
+    /// here can say ahead, so a stream it refuses is within this answer.
+    fn decodes(&self) -> JpegDecodes {
+        JpegDecodes {
+            subsamplings: vec![
+                JpegSubsampling::Yuv420,
+                JpegSubsampling::Yuv422,
+                JpegSubsampling::Yuv444,
+                JpegSubsampling::Grey,
+            ],
+            max_size: (u32::from(u16::MAX), u32::from(u16::MAX)),
+        }
+    }
+
     fn capabilities(&self) -> JpegCapabilities {
         // What the guest is told is the same on every backend: one core, and
         // none of the four features. CMPhoto then sends no stream that needs

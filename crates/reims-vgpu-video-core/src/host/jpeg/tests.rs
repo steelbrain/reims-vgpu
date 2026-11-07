@@ -14,8 +14,8 @@ use crate::host::session_thread::DetachedThreads;
 use crate::host::tests::RecordingSink;
 use crate::host::{HostSession, names};
 use crate::jpeg::{
-    JpegCapabilities, JpegDecode, JpegDecoder, JpegError, JpegOutputFormat, JpegSubsampling,
-    PixelRect,
+    JpegCapabilities, JpegDecode, JpegDecoder, JpegDecodes, JpegError, JpegOutputFormat,
+    JpegSubsampling, PixelRect,
 };
 use crate::runtime::{Runtime, StdRuntime};
 use crate::status::NO_ERROR;
@@ -61,6 +61,18 @@ struct StandIn {
 }
 
 impl JpegDecoder for StandIn {
+    fn decodes(&self) -> JpegDecodes {
+        JpegDecodes {
+            subsamplings: vec![
+                JpegSubsampling::Yuv420,
+                JpegSubsampling::Yuv422,
+                JpegSubsampling::Yuv444,
+                JpegSubsampling::Grey,
+            ],
+            max_size: (u32::from(u16::MAX), u32::from(u16::MAX)),
+        }
+    }
+
     fn capabilities(&self) -> JpegCapabilities {
         JpegCapabilities {
             cores: 1,

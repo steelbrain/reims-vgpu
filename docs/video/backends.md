@@ -274,7 +274,7 @@ the guest sees is core's, so a backend passes when it does what it lists.
 | `decode-check STREAM REFERENCE [STREAM REFERENCE]...` | `decode`, `suite` | every frame of each stream matches its reference, a software decode's hashes, compared as a set, synchronous and asynchronous; an empty reference fails |
 | `encode INPUT WxH PREFIX [OPTION]...` | `encode` | nothing: raw frames encoded through the host session, and what the guest got written to PREFIX.mp4, PREFIX.264 or .265 and PREFIX.log |
 | `encode-check [--case P]...` | `encode`, `encode_check` | for each listed codec: each source depth with reordering and without, 641x361, full range, 1080p, 2160p or its refusal, a size past the largest, forced key frames, the rate controls, changes by `eset` mid-stream, `Quality`, and AVE's answers to edge values (below) |
-| `jpeg-check [OPTION]... FILE.jpg` | `jpeg` | a JPEG through the JPEG part, against libjpeg's and ffmpeg's planes; a decode with no `--reference` fails |
+| `jpeg-check [OPTION]... FILE.jpg` | `jpeg` | a JPEG through the JPEG part, against libjpeg's and ffmpeg's planes; a decode with no `--reference` fails; a stream outside what the part answers it decodes (`decodes`) passes refused as unsupported, and fails decoded |
 | `motion-check [--case P]...` | `motion::check` | eight moved textures, at 16x16 and 4x4 blocks and four sizes, through the motion session: Apple's grid, its padding cells (0, 0), and at least 70% of the picture's cells the way back, within 2 pixels at 16 (Apple's own steps are 4) and exactly at 4 |
 
 The suite's scaler cases (`scaler`) take a `ScalerBackend`, not a

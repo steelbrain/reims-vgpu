@@ -10,8 +10,10 @@
 # (vaapi-conformance NODE jpeg-check) decodes each on every render node (every /dev/dri/renderD* when none is named) through
 # the backend's JPEG decoder, and compares. A case passes when every plane
 # is within the tolerance of both references (RVGV_JPEG_TOLERANCE, 1 by
-# default), or when it is refused with the error it should be. A host with
-# no render node fails.
+# default), or when it is refused with the error it should be, or when its
+# stream is outside what the backend answers it decodes (its samplings and
+# largest picture) and refused as unsupported. The last line counts each.
+# A host with no render node fails.
 #
 # --large adds images of 8192x8192 (4:2:0 and 4:2:2) and 16384x16000 (several
 # GB of scratch).
@@ -254,4 +256,5 @@ for entry in "${cases[@]}"; do
     echo "$line" | tee -a "$summary"
   done
 done
+echo "jpeg-check: $(wc -l <"$summary") runs, $(grep -c ': pass;' "$summary") pass ($(grep -c 'decode refused as answered' "$summary") refused as the backend answers), $(grep -c ': FAIL;' "$summary") FAIL"
 exit "$failed"
