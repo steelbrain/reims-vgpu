@@ -8790,6 +8790,76 @@ fn a_pages_block_s_view_is_made_off_ring_0_and_its_context_waits_for_it() {
     assert!(guest.event_now().is_none(), "nothing else answered");
 }
 
+/// A heap over a pages block of several runs, a slab of plain pages, makes the block's view off
+/// ring 0's threads as a no-copy buffer does: while it is being made, ring 0 goes on with another
+/// context's messages, and the heap's context's next message waits for it; then the view and the
+/// heap over it are made, and the message after it
+#[test]
+fn a_heap_over_a_pages_block_s_view_is_made_off_ring_0() {
+    let (device, platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let mut pages = surface_pages(&device, page, &[(5, 2), (1, 1)]);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(&device, pages);
+    let pages_seqno = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(answer, (pages_seqno, RGFX_STATUS_OK));
+    let worker = device.control.decoder();
+    worker.surface_worker().flush();
+    worker.surface_worker().hold();
+    let mark = platform.call_log().mark();
+
+    let heap = RgfxHeapOverPages {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_HEAP_OVER_PAGES,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 11),
+        gpu_address: 0x2_0000_0000,
+        block_offset: SURFACE_BLOCK,
+        block_size: SURFACE_BLOCK_SIZE,
+        size_bytes: 3 * page,
+        options: 0,
+        heap_type: 1,
+    };
+    guest.send(&device, heap.as_bytes().to_vec());
+    guest.send(&device, event_create(obj(2, 10)));
+    assert!(objects_become(&device, 1), "ring 0 went on past it");
+    guest.send(&device, event_create(obj(1, 12)));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        device.decoder_object_count(),
+        1,
+        "the heap's context waits for its view"
+    );
+    let sels = platform.call_log().sels_since(mark);
+    assert!(
+        !sels.contains(&"newHeapWithDescriptor:"),
+        "no heap made yet: {sels:?}"
+    );
+
+    worker.surface_worker().release();
+    assert!(
+        objects_become(&device, 3),
+        "the heap, then the event after it"
+    );
+    worker.surface_worker().flush();
+    let made = platform.call_log().sels_since(mark);
+    assert!(
+        made.contains(&"newHeapWithDescriptor:"),
+        "the heap over the view: {made:?}"
+    );
+    assert_eq!(worker.views_of_surfaces().counts().private, 1);
+}
+
 /// A command buffer of a context whose no-copy buffer is being made on the surface worker is not
 /// answered at its doorbell, though it asks for its `CB_SUBMITTED` and need wait for nothing
 /// else: the doorbell write returns with nothing on its queue's ring, and the queue's thread

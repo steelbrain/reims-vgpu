@@ -43,7 +43,8 @@ use reims_graphics::ops::RgfxCommandBuffer;
 use reims_graphics::region::Region;
 use reims_graphics::wire::{
     RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_COMMAND_BUFFER,
-    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE,
+    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN,
+    RGFX_CMD_ICB_CREATE,
     RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
     RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
@@ -60,7 +61,7 @@ use reims_graphics::wire::{
     RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
     RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
     RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
-    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState,
+    RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState,
     RgfxSharedEventName, RgfxSurfacePages, RgfxVideoCaps,
 };
 use reims_graphics::{
@@ -588,9 +589,9 @@ struct GraphicsControl<P: ApiPlatform> {
     /// The indirect command buffers whose create was handed to [`Self::icb_worker`] and is not
     /// yet answered, by object id.
     icbs: Arc<Unsettled>,
-    /// The no-copy buffers whose `BUFFER_OVER_PAGES` was handed to the surface worker and is not
-    /// yet made ([`Self::start_buffer_over_pages`]): by their context ([`pages_context`]), and by
-    /// their pages block's offset.
+    /// The no-copy buffers and heaps whose `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` was handed to
+    /// the surface worker and is not yet made ([`Self::start_over_pages`]): by their context
+    /// ([`pages_context`]), and by their pages block's offset.
     pages_buffers: Arc<Unsettled>,
     /// What the device's reset waits for ([`Self::reset`]): held shared by each message carried
     /// out off ring 0's threads, a queue's command buffer, create or destroy, from before it
@@ -1205,7 +1206,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     ) {
         let message: &[u8] = &bytes;
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
-        if r#type == RGFX_CMD_BUFFER_OVER_PAGES && self.start_buffer_over_pages(poster, message) {
+        if (r#type == RGFX_CMD_BUFFER_OVER_PAGES || r#type == RGFX_CMD_HEAP_OVER_PAGES)
+            && self.start_over_pages(poster, message)
+        {
             return;
         }
         // A message of a context whose no-copy buffer is being made on the surface worker, which
@@ -1538,7 +1541,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// [`Decoders::answer_at_doorbell`]): it runs on that queue, no
     /// reset is under way, every lock it takes is free, each tried, no pipeline it names is still
     /// compiling, and no no-copy buffer of its context is being made on the surface worker
-    /// ([`Self::start_buffer_over_pages`]), which its begin waits for. Its `CB_SUBMITTED` is
+    /// ([`Self::start_over_pages`]), which its begin waits for. Its `CB_SUBMITTED` is
     /// posted through `poster` waiting for nothing, and its `CB_SCHEDULED` after it where no buffer
     /// before it on its queue owes its own, once
     /// its turn in its queue's lane and its ticket in the commit order are taken, which its begin
@@ -1758,9 +1761,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         poster.post(answer.as_bytes());
     }
 
-    /// A `BUFFER_OVER_PAGES` from ring 0 that makes its pages block's view (the block's first),
-    /// follows its block's `SURFACE_PAGES` still on the surface worker, or follows another of its
-    /// context's still being made: begun here, in ring order, and carried out on the surface
+    /// A `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` from ring 0 that makes its pages block's view
+    /// (the block's first; a heap over a block of one run makes none), follows its block's
+    /// `SURFACE_PAGES` still on the surface worker, or follows another of its context's still
+    /// being made: begun here, in ring order, and carried out on the surface
     /// worker behind its block's jobs handed to it before (another block's may be made first:
     /// `decode::worker`), so the view's mapping and import hold neither ring 0 nor the views'
     /// lock (`decode::surface_pages`). Until it is made its context and its block are unsettled
@@ -1771,30 +1775,24 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// create. Made under the reset gate, held shared recursively, as the surface
     /// worker's other jobs are; where the device was reset since, nothing is made. Whether it was
     /// handed over; else it is carried out here.
-    fn start_buffer_over_pages(
-        self: &Arc<Self>,
-        poster: &CompletionPoster,
-        message: &[u8],
-    ) -> bool {
-        let Ok((m, _)) = RgfxBufferOverPages::read_from_prefix(message) else {
+    fn start_over_pages(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) -> bool {
+        let Some((name, block)) = over_pages_block(message) else {
             return false;
         };
         let context = pages_context(sender_context(poster, message));
         let decoder = self.decoder();
-        if !self
-            .pages_buffers
-            .any([context, m.block_offset].into_iter())
-            && !decoder.buffer_over_pages_makes(message)
+        if !self.pages_buffers.any([context, block].into_iter())
+            && !decoder.over_pages_makes(message)
         {
             return false;
         }
         let begun = self.pool.now();
         let settles = (
             self.pages_buffers.begin(context, 0, begun),
-            self.pages_buffers.begin(m.block_offset, 0, begun),
+            self.pages_buffers.begin(block, 0, begun),
         );
         let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
-        decoder.on_surface_worker(m.block_offset, Box::new(move || {
+        decoder.on_surface_worker(block, Box::new(move || {
             let outcome = {
                 let _carried = me.reset_gate.read_recursive();
                 if poster.stale() {
@@ -1807,8 +1805,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             me.report(&poster, &message, outcome, false);
             log::debug!(
                 target: "reims_vgpu::graphics::surface_pages",
-                "BUFFER_OVER_PAGES of the block at {:#x} made on the worker {} us after its begin",
-                m.block_offset,
+                "{name} of the block at {block:#x} made on the worker {} us after its begin",
                 me.pool.now().saturating_duration_since(begun).as_micros()
             );
             drop(settles);
@@ -2690,10 +2687,24 @@ fn sender_context(poster: &CompletionPoster, message: &[u8]) -> u32 {
     (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
 }
 
-/// The key the no-copy buffers of context `context` being made are unsettled under in
+/// The key the no-copy buffers and heaps of context `context` being made are unsettled under in
 /// `GraphicsControl::pages_buffers`, apart from their blocks' offsets, which lie below 2^63.
 fn pages_context(context: u32) -> u64 {
     1 << 63 | u64::from(context)
+}
+
+/// The name of the `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` `message`, and its pages block's
+/// offset; `None` for any other message.
+fn over_pages_block(message: &[u8]) -> Option<(&'static str, u64)> {
+    match RgfxMsgHeader::read_from_prefix(message).ok()?.0.r#type {
+        RGFX_CMD_BUFFER_OVER_PAGES => RgfxBufferOverPages::read_from_prefix(message)
+            .ok()
+            .map(|(m, _)| ("BUFFER_OVER_PAGES", m.block_offset)),
+        RGFX_CMD_HEAP_OVER_PAGES => RgfxHeapOverPages::read_from_prefix(message)
+            .ok()
+            .map(|(m, _)| ("HEAP_OVER_PAGES", m.block_offset)),
+        _ => None,
+    }
 }
 
 /// Whether `message` is a `COMMAND_BUFFER` off a queue's ring that names another queue to run on:

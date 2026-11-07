@@ -115,7 +115,7 @@ use reims_graphics::wire::{
     RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
     RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
     RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
-    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages,
+    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxHeapOverPages,
     RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc,
     RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
     RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
@@ -1942,19 +1942,28 @@ impl<P: Platform> GraphicsDecoder<P> {
         );
     }
 
-    /// Whether the `BUFFER_OVER_PAGES` `message` makes its pages block's view (the block's first),
-    /// or follows its block's `SURFACE_PAGES` still being carried out on the surface worker: what
-    /// is carried out there ([`surface_pages`]).
-    pub(crate) fn buffer_over_pages_makes(&self, message: &[u8]) -> bool {
-        let Some(m) = read::<RgfxBufferOverPages>(message) else {
+    /// Whether the `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` `message` makes its pages block's view
+    /// (the block's first; a heap over a block of one run makes none, as it lies over the guest's
+    /// RAM), or follows its block's `SURFACE_PAGES` still being carried out on the surface worker:
+    /// what is carried out there ([`surface_pages`]).
+    pub(crate) fn over_pages_makes(&self, message: &[u8]) -> bool {
+        let block = match read::<RgfxMsgHeader>(message).map(|h| h.r#type) {
+            Some(RGFX_CMD_BUFFER_OVER_PAGES) => read::<RgfxBufferOverPages>(message)
+                .map(|m| (m.block_offset, m.block_size, false)),
+            Some(RGFX_CMD_HEAP_OVER_PAGES) => {
+                read::<RgfxHeapOverPages>(message).map(|m| (m.block_offset, m.block_size, true))
+            }
+            _ => None,
+        };
+        let Some((block, block_size, heap)) = block else {
             return false;
         };
-        self.shared.unsettled.any(std::iter::once(m.block_offset))
-            || self
-                .shared
-                .surface_views
-                .lock()
-                .private_unmade(m.block_offset)
+        if self.shared.unsettled.any(std::iter::once(block)) {
+            return true;
+        }
+        let views = self.shared.surface_views.lock();
+        views.private_unmade(block)
+            && !(heap && views.private_ram(block, block_size, None).is_some())
     }
 
     /// Hands `job`, of the block at `block`, to the surface worker, behind the block's jobs handed

@@ -128,8 +128,9 @@ pub(crate) struct Entry<P: Platform> {
     pub(crate) place: Option<PlanePlace>,
     /// A command queue's counts.
     pub(crate) queue: Option<QueueCounts>,
-    /// A heap over a pages block's guest RAM (`HEAP_OVER_PAGES`): the host bytes it lies in, its
-    /// first byte and length, which `span`, the block's, does not name.
+    /// A heap over a pages block's pages (`HEAP_OVER_PAGES`): the host bytes it lies in, in the
+    /// guest's RAM or the block's view, its first byte and length, which `span`, the block's, does
+    /// not name.
     pub(crate) ram: Option<(HostPtr, u64)>,
     /// A buffer whose contents are the guest's bytes: where they lie, which `span` names only for
     /// a buffer over its own block (`BUFFER_OVER_HOST_MEMORY`); `None` for any other object.
