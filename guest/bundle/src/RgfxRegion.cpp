@@ -42,12 +42,6 @@ void RgfxRegion::setBlockSource(AllocFn alloc, ReleaseFn release, void *context)
 	m_sourceContext = context;
 }
 
-void RgfxRegion::setWriteCombinedSource(WriteCombinedAllocFn alloc)
-{
-	std::lock_guard<std::mutex> guard(m_lock);
-	m_writeCombinedAlloc = alloc;
-}
-
 void RgfxRegion::setReclaim(ReclaimFn reclaim, void *context)
 {
 	std::lock_guard<std::mutex> guard(m_lock);
@@ -190,11 +184,6 @@ void RgfxRegion::release(uint64_t offset)
 
 RgfxRegion::Block RgfxRegion::allocate(uint64_t size, uint64_t align)
 {
-	return allocate(size, align, UINT64_MAX);
-}
-
-RgfxRegion::Block RgfxRegion::allocate(uint64_t size, uint64_t align, uint64_t writeCombinedFrom)
-{
 	Block out = {};
 	if (!isPowerOfTwo(align)) {
 		return out; // ok == false
@@ -202,13 +191,8 @@ RgfxRegion::Block RgfxRegion::allocate(uint64_t size, uint64_t align, uint64_t w
 
 	if (m_alloc != nullptr) {
 		uint64_t offset = 0;
-		const bool combined = m_writeCombinedAlloc != nullptr && writeCombinedFrom < size;
-		auto ask = [&] {
-			return combined ? m_writeCombinedAlloc(m_sourceContext, size, align,
-			                                       writeCombinedFrom, &offset)
-			                : m_alloc(m_sourceContext, size, align, &offset);
-		};
-		const bool placed = ask() || (reclaimed() && ask());
+		const bool placed = m_alloc(m_sourceContext, size, align, &offset) ||
+		                    (reclaimed() && m_alloc(m_sourceContext, size, align, &offset));
 		if (!placed || offset < m_floor || offset > m_size || size > m_size - offset) {
 			return out; // no room; ok == false
 		}
@@ -249,15 +233,7 @@ RgfxRegion::RingPair RgfxRegion::allocateRingPair(uint32_t submit_data_size,
 		return out; // ok == false
 	}
 
-	// Where the kext maps part of a block write-combined, the submission ring's data takes it,
-	// from its block's second page, and the ring's header, which the host writes too and the
-	// writer reads, ends the first page, write-back (WRITE-COMBINED PARTS).
-	const bool combined = writeCombines();
-	const uint64_t head = combined ? kDefaultBlockAlign - RGFX_RING_HEADER_SIZE : 0;
-	Block submit = combined
-	                   ? allocate(kDefaultBlockAlign + submit_data_size, kDefaultBlockAlign,
-	                              kDefaultBlockAlign)
-	                   : allocate(RGFX_RING_HEADER_SIZE + submit_data_size, kRingAlign);
+	Block submit = allocate(RGFX_RING_HEADER_SIZE + submit_data_size, kRingAlign);
 	if (!submit.ok) {
 		return out;
 	}
@@ -265,23 +241,20 @@ RgfxRegion::RingPair RgfxRegion::allocateRingPair(uint32_t submit_data_size,
 	if (complete_data_size != 0) {
 		complete = allocate(RGFX_RING_HEADER_SIZE + complete_data_size, kRingAlign);
 		if (!complete.ok) {
-			release(submit.offset);
 			return out;
 		}
 	}
 
 	// Zero each ring's header + byte ring so a fresh RgfxRingWriter (producer 0,
 	// consumer 0, consumer_idle 0, armed 0) starts clean over BAR memory whose
-	// contents are otherwise undefined.
-	std::memset(const_cast<uint8_t *>(submit.ptr + head), 0, submit.size - head);
+	// contents are otherwise undefined. The region is plain write-back memory.
+	std::memset(const_cast<uint8_t *>(submit.ptr), 0, submit.size);
 	if (complete_data_size != 0) {
 		std::memset(const_cast<uint8_t *>(complete.ptr), 0, complete.size);
 	}
 
-	out.submit_offset = submit.offset + head;
+	out.submit_offset = submit.offset;
 	out.complete_offset = complete_data_size != 0 ? complete.offset : 0;
-	out.submit_block = submit.offset;
-	out.complete_block = out.complete_offset;
 	out.ok = true;
 	return out;
 }

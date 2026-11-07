@@ -108,8 +108,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		return r;
 	}
 	case kRgfxAccelMethodAlloc: {
-		// Two inputs, or a third of the block's write-combined part (kRgfxKextFeatureWriteCombined).
-		if ((a->scalarInputCount != 2 && a->scalarInputCount != 3) || a->scalarOutputCount != 1)
+		if (a->scalarInputCount != 2 || a->scalarOutputCount != 1)
 			return kIOReturnBadArgument;
 		// An ask, so no block is made for a context releaseContext has closed.
 		UInt32 ctx = 0;
@@ -117,8 +116,7 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		if (!ask.begun)
 			return kIOReturnBadArgument;
 		UInt64 offset = 0;
-		const UInt64 writeCombinedFrom = a->scalarInputCount == 3 ? in[2] : UINT64_MAX;
-		IOReturn r = owner->allocBlock(this, ctx, in[0], in[1], writeCombinedFrom, &offset);
+		IOReturn r = owner->allocBlock(this, ctx, in[0], in[1], &offset);
 		out[0] = offset;
 		return r;
 	}

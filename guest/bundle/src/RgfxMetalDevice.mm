@@ -213,19 +213,6 @@ bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offse
 	       KERN_SUCCESS;
 }
 
-// The region's write-combined source (RgfxRegion::setWriteCombinedSource): the kext's Alloc with
-// its third input, the byte the block's write-combined part starts at
-// (kRgfxKextFeatureWriteCombined).
-bool rgfxKextAllocWriteCombined(void *context, uint64_t size, uint64_t align,
-                                uint64_t writeCombinedFrom, uint64_t *offset)
-{
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
-	uint64_t in[3] = {size, align, writeCombinedFrom};
-	uint32_t outCount = 1;
-	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodAlloc, in, 3, offset, &outCount) ==
-	       KERN_SUCCESS;
-}
-
 // What the process keeps for reuse, as RgfxRegion's reclaim; `context` is the RgfxSlabs: the
 // slabs' empty and cached blocks, and the IOSurface views the keep holds, a cache that costs no
 // refusal (a texture over one of their surfaces then asks the kext for its block, as with no
@@ -712,10 +699,6 @@ RGFX_LOG_UNRECOGNIZED
 	                             : RGFX_RESOURCE_ID_CHUNK);
 	_region = new RgfxRegion(base, mapSize);
 	_region->setBlockSource(&rgfxKextAlloc, &rgfxKextRelease, connContext);
-	// The bytes the process only writes in write-combined parts of their blocks, where the kext
-	// maps them so (RgfxRegion.hpp, WRITE-COMBINED PARTS).
-	if ((_caps.kextFeatures() & kRgfxKextFeatureWriteCombined) != 0)
-		_region->setWriteCombinedSource(&rgfxKextAllocWriteCombined);
 	_region->setSurfaceSource(&rgfxKextSurfaceBlock, &rgfxKextSurfaceRelease, connContext);
 	_region->setSurfacePagesSource(&rgfxKextSurfacePages, _caps.linearTextureAlignment(),
 	                               connContext);

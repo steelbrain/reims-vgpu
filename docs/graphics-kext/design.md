@@ -122,23 +122,19 @@ Stages:
    - The BAR is one host memory region that the device reserves at start and
      registers with KVM once. Blocks are ranges inside it, so making or
      freeing a block never changes the VM's memory map. It is ordinary
-     cached memory on the host, but the guest's kernel maps it uncached
-     whatever the kext asks: xnu's pmap sets PCD on every page it does not
-     manage (its PAT's UC-), and the region is no RAM of the guest's. An AMD
-     host applies the guest's memory type, where an Intel host's EPT ignores
-     it: measured on the Radeon 780M host, the guest's stores there ran at
-     13 MB/s and its loads at 8 to 180 MB/s, against 5.6 to 123 GB/s in its
-     own RAM. Uncached loads cost 79-138 ns against 2-4 ns cached. So what
-     the CPU touches most lies in the process's own pages instead (its Shared
-     and Managed buffers' slabs and its upload chunks, "Managed storage"),
-     and what the process only writes takes a write-combined part of its
-     block, which the kext maps so (a submission ring's data, command
-     buffers' bodies and a library's staging chunks; the bundle's
-     `RgfxRegion.hpp`). The kext maps those parts from a descriptor of the
-     region of their own: a mapping's cache mode is set on its descriptor's
-     one VM object, for every page of it, so asked of the region's own
-     descriptor it came out uncached like the rest (measured: no page of the
-     process's was write-combined; `RgfxAccelerator::copyWriteCombinedRegion`).
+     cached memory on the host, but every mapping of it in a guest process
+     is uncached, whatever cache mode the kext asks: xnu's fault path enters
+     a page with no cache flags, and its pmap gives a page it does not
+     manage PCD (the guest PAT's UC-; read from the public xnu source,
+     `pmap_get_cache_attributes` and `vm_fault`'s `pmap_enter` wrappers, and
+     measured: every page of a process's over BAR 2 was PCD alone, asked
+     write-back or write-combined). An AMD host applies the guest's memory
+     type, where an Intel host's EPT ignores it: measured on the Radeon 780M
+     host, the guest's stores there ran at 13 MB/s and its loads at 8 to
+     180 MB/s, against 5.6 to 123 GB/s in its own RAM. Uncached loads cost
+     79-138 ns against 2-4 ns cached. So what the CPU touches most lies in
+     the process's own pages instead: its Shared and Managed buffers' slabs
+     and its upload chunks ("Managed storage").
    - The region is memory of QEMU's process, and the host side runs in that
      process. On Linux it is a shared mapping of a memfd of the library's
      (`reims-vgpu-vulkan`'s `RegionMemory`): RADV refuses a pointer to a
@@ -3026,7 +3022,7 @@ the kext and the bundle include.
 | doorbell 0 | `Doorbell` | | writes a ring's id to `DOORBELL` |
 | doorbell 1 | `Consumed` | 1 << 3 `ConsumedDoorbell` | reserved: a completion ring's room doorbell (`CONSUMED`) |
 | 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output) | the context and its window; five outputs, or six with its GPU addresses' span |
-| 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
+| 0x101 | `Alloc` | | a region block |
 | 0x102 | `Free` | | frees a block |
 | 0x103 | `QueueCreate` | | a command queue; 6 inputs, or 7 with the flags wanted |
 | 0x104 | `QueueDestroy` | | closes a queue |
@@ -3052,7 +3048,7 @@ the accelerator, which the bundle opens for each event it hands out: 0x113 and
 0x114 are its own selectors, numbered past the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents` and 1 << 7 `WriteCombined`; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan` and 1 << 6 `SharedEvents`; no other bit yet.
 
 - **Boot-gated — base class / kernel family (notes UNKNOWN #1).** The scaffold
   subclasses `IOAccelerator`, the base the macOS SDK and KDK expose (the IOGPU

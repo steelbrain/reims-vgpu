@@ -150,8 +150,7 @@ bool RgfxBodyPool::take(uint64_t size, RgfxBodyBlock *block)
 	if (m_region == nullptr) {
 		return false;
 	}
-	// Written only, never read back here: write-combined where the kext maps parts so.
-	RgfxRegion::Block made = m_region->allocate(bytes, RgfxRegion::kDefaultBlockAlign, 0);
+	RgfxRegion::Block made = m_region->allocate(bytes);
 	if (!made.ok) {
 		return false;
 	}

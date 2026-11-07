@@ -137,9 +137,6 @@ struct ContextState {
 	bool hooked;
 	// The thread call that posts freed blocks' releases (releaseFreedBlocks).
 	thread_call_t releaseCall;
-	// The region again, a descriptor of its own that only write-combined spans are mapped from
-	// (copyWriteCombinedRegion): null where it could not be made.
-	IODeviceMemory *combinedRegion;
 };
 ContextState state = {nullptr,
                       kRgfxContextSlotsEmpty,
@@ -151,7 +148,6 @@ ContextState state = {nullptr,
                       nullptr,
                       0,
                       false,
-                      nullptr,
                       nullptr};
 IOLock *&contextLock = state.contextLock;
 RgfxContextSlots &slots = state.slots;
@@ -685,12 +681,6 @@ bool RgfxAccelerator::startContexts()
 	RgfxReleaseEntry *releases =
 	    static_cast<RgfxReleaseEntry *>(IOMalloc(sizeof(RgfxReleaseEntry) * kMaxReleases));
 	thread_call_t timer = thread_call_allocate(releaseTimerFired, nullptr);
-	// The region's bytes again for the write-combined spans (copyWriteCombinedRegion), with no
-	// effect on the region's own descriptor; a context goes on without it.
-	IODeviceMemory *combined =
-	    region ? IODeviceMemory::withRange(region->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone),
-	                                       region->getLength())
-	           : nullptr;
 	RgfxBlock *expected = nullptr;
 	if (lock && wlock && table && rings && call && naming && rlock && releases && timer &&
 	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,
@@ -704,7 +694,6 @@ bool RgfxAccelerator::startContexts()
 		namingCall = naming;
 		releaseTable = {releases, kMaxReleases, 0};
 		releaseTimer = timer;
-		state.combinedRegion = combined;
 		__atomic_store_n(&releaseLock, rlock, __ATOMIC_RELEASE);
 		const UInt32 features = readRegister(RGFX_REG_FEATURES_LO);
 		surfacePages = (features & RGFX_FEATURE_SURFACE_PAGES) != 0;
@@ -775,21 +764,10 @@ bool RgfxAccelerator::startContexts()
 		IOFree(releases, sizeof(RgfxReleaseEntry) * kMaxReleases);
 	if (timer)
 		thread_call_free(timer);
-	OSSafeReleaseNULL(combined);
 	// Another opener is making it: wait for it to publish.
 	while (expected && !__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
 		IOSleep(1);
 	return __atomic_load_n(&contextLock, __ATOMIC_ACQUIRE) != nullptr;
-}
-
-IODeviceMemory *RgfxAccelerator::copyWriteCombinedRegion() const
-{
-	// Set before contextLock is published, and kept for the kernel's life.
-	IODeviceMemory *combined =
-	    __atomic_load_n(&contextLock, __ATOMIC_ACQUIRE) ? state.combinedRegion : nullptr;
-	if (combined)
-		combined->retain();
-	return combined;
 }
 
 // MARK: - Contexts
@@ -977,12 +955,9 @@ void RgfxAccelerator::keepIdChunks(const void *owner)
 // MARK: - Blocks
 
 IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 context,
-                                    UInt64 size, UInt64 align, UInt64 writeCombinedFrom,
-                                    UInt64 *offset)
+                                    UInt64 size, UInt64 align, UInt64 *offset)
 {
 	if (!contextLock)
-		return kIOReturnBadArgument;
-	if (writeCombinedFrom < size && writeCombinedFrom % kRgfxBlockPage != 0)
 		return kIOReturnBadArgument;
 	const bool mayReserve = owner->isWindowServer();
 	IOLockLock(contextLock);
@@ -997,17 +972,8 @@ IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 co
 		const UInt64 bytes = rgfxBlockAlignUp(size, kRgfxBlockPage); // the block's, as allocated
 		// The block is in the process's window, and the device learns of it, before the
 		// process does: the grant is on the control ring before any message naming it, on that
-		// ring or a queue's. The block is pinned until then, so no free overtakes either. Its
-		// bytes from `writeCombinedFrom` are the ones the process only writes (a submission
-		// ring's data, command buffers' bodies, a library's staging chunks), mapped
-		// write-combined: an AMD host applies the guest's memory type, and the region's pages,
-		// which are no RAM of the guest's, are mapped uncached for any other ask (xnu's pmap
-		// sets PCD on every page it does not manage). The process fences its stores before it
-		// publishes them.
-		const UInt64 combined = writeCombinedFrom < bytes ? writeCombinedFrom : bytes;
-		IOReturn posted = combined ? owner->mapSpan(pin.offset, combined) : kIOReturnSuccess;
-		if (posted == kIOReturnSuccess && combined < bytes)
-			posted = owner->mapSpan(pin.offset + combined, bytes - combined, true);
+		// ring or a queue's. The block is pinned until then, so no free overtakes either.
+		IOReturn posted = owner->mapSpan(pin.offset, bytes);
 		if (posted == kIOReturnSuccess) {
 			RgfxBlockGrant grant = {};
 			grant.context = context;

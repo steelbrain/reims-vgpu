@@ -26,18 +26,6 @@
  * aligned to a cache line so the ring header's 64-byte lines never share one; resource
  * blocks default to a page so a block can later back a mapping.
  *
- * WRITE-COMBINED PARTS. The region is no RAM of the guest's, so the kernel maps it uncached
- * whatever the kext asks for write-back (xnu's pmap sets PCD on every page it does not manage),
- * and an AMD host applies the guest's memory type: plain stores there cost about 0.3 us per
- * 4 bytes. Where the kext maps part of a block write-combined (setWriteCombinedSource,
- * kRgfxKextFeatureWriteCombined), the bytes the process only writes take that part: a submission
- * ring's data (allocateRingPair, its header alone in the page before it), command buffers' bodies
- * and a library's staging chunks (allocate's `writeCombinedFrom`). Write-combined stores are
- * weakly ordered: the ring writer fences them (sfence) before it publishes a message that names
- * them, and a lock or a fence orders them for another thread, as for any store. The process never
- * reads them back, nor takes an atomic there: loads there are uncached, and a locked operation on
- * write-combined memory is not atomic.
- *
  * Our own code; depends only on the committed wire header. In a unit test the region
  * is a plain buffer; in the bundle it is the context's window.
  */
@@ -73,10 +61,6 @@ public:
 		uint32_t submit_data_size;
 		uint32_t complete_data_size;
 		bool ok;
-		/// The blocks the rings lie in, which release() takes: a ring's own offset, but for a
-		/// submission ring whose data is write-combined, which starts its block's second page.
-		uint64_t submit_block;
-		uint64_t complete_block;
 	};
 
 	/// The allocator over the region whose CPU base is `base`, `size` bytes long.
@@ -104,11 +88,6 @@ public:
 	/// `ok` is false when `align` is not a power of two or the region has no room.
 	Block allocate(uint64_t size, uint64_t align = kDefaultBlockAlign);
 
-	/// As allocate, with the block's bytes from `writeCombinedFrom` (a multiple of
-	/// kDefaultBlockAlign) mapped write-combined where a write-combined source is set
-	/// (WRITE-COMBINED PARTS); the whole block write-back otherwise.
-	Block allocate(uint64_t size, uint64_t align, uint64_t writeCombinedFrom);
-
 	/// Hands back the block at region offset `offset` (one allocate() returned) to the block
 	/// source; nothing without one.
 	void release(uint64_t offset);
@@ -119,16 +98,6 @@ public:
 	typedef bool (*AllocFn)(void *context, uint64_t size, uint64_t align, uint64_t *offset);
 	typedef void (*ReleaseFn)(void *context, uint64_t offset);
 	void setBlockSource(AllocFn alloc, ReleaseFn release, void *context);
-
-	/// Where blocks part of which is write-combined come from (WRITE-COMBINED PARTS): as the
-	/// block source's `alloc`, with the bytes from `writeCombinedFrom` mapped write-combined.
-	/// Called with the block source's context; its blocks go back through its `release`.
-	typedef bool (*WriteCombinedAllocFn)(void *context, uint64_t size, uint64_t align,
-	                                     uint64_t writeCombinedFrom, uint64_t *offset);
-	void setWriteCombinedSource(WriteCombinedAllocFn alloc);
-
-	/// Whether a write-combined source is set.
-	bool writeCombines() const { return m_writeCombinedAlloc != nullptr; }
 
 	/// What the process keeps for reuse and can give back where the kext has no room: `reclaim`
 	/// lets go of such blocks (the buffers' empty and cached slabs, RgfxSlabs.hpp, and the
@@ -275,7 +244,6 @@ private:
 	uint64_t m_floor;   // RGFX_ALLOCATIONS_OFFSET
 	uint64_t m_cursor;  // the next free offset, at or above the floor
 	AllocFn m_alloc = nullptr;     // the block source, where set (the kext)
-	WriteCombinedAllocFn m_writeCombinedAlloc = nullptr; // the write-combined source (the kext)
 	ReleaseFn m_release = nullptr;
 	void *m_sourceContext = nullptr;
 	ReclaimFn m_reclaim = nullptr; // the process's blocks kept for reuse, where set (the slabs)
