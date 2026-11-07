@@ -866,6 +866,23 @@ only where no negotiation can carry it.
   shared events one process hands another, and the host posts the values one
   holder gives the event to the others' listen queues ("Shared events across
   processes", below). Every host offers it, and the kext takes it.
+- Bit 28 is `PRIVATE_RENDER_STATE`: a `RENDER_PIPELINE_CREATE` may carry
+  `RGFX_RENDER_PIPELINE_PRIVATE_STATE` (flag bit 6), and then an
+  `RgfxRenderPipelinePrivateState` (24 bytes) follows its head, ahead of the
+  tail. It holds the descriptor's private state that Apple's OpenGL renderer
+  sets: `openGLModeEnabled`, `sampleMask`, `sampleCoverage`,
+  `sampleCoverageInvert`, `logicOperationEnabled`, `logicOperation` and
+  `depthStencilWriteDisabled`, each the guest's raw value. The bundle reads
+  them by key from every render pipeline descriptor where the kext took the
+  bit. Measured on the Intel 630 (macOS 26.7.1), the renderer sets
+  `openGLModeEnabled`, a sample mask and copy (2) on every pipeline. It sets
+  a GL logic operation, sample mask or sample coverage as their properties.
+  It sets `depthStencilWriteDisabled` on a pipeline that writes no depth or
+  stencil. It does alpha test, two-sided colour and the point sprite origin
+  in its shaders. A host offers it where its platform takes that state. The
+  Metal platform does where its descriptors answer every setter. The Vulkan
+  platform always does, filling metal2vulkan's `PrivateRenderState` and
+  dropping `openGLModeEnabled`, which that state has no field for yet.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

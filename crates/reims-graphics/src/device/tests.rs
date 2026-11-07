@@ -2530,6 +2530,33 @@ fn the_deferred_budget_reads_as_the_host_gives_it() {
     assert_eq!(budget(), (0x2345_6000, 1));
 }
 
+/// A host that offers `PRIVATE_RENDER_STATE` lets the driver take it: the driver's write reads
+/// back
+#[test]
+fn the_driver_takes_private_render_state_where_offered() {
+    struct Private;
+    impl Host for Private {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
+            false
+        }
+        fn features(&self) -> u64 {
+            u64::from(RGFX_FEATURE_PRIVATE_RENDER_STATE)
+        }
+    }
+    let rig = Rig::with_host(Box::new(Private));
+    rig.device
+        .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
+    rig.device.mmio_write(
+        RGFX_REG_DRIVER_FEATURES_LO.into(),
+        RGFX_FEATURE_PRIVATE_RENDER_STATE,
+    );
+    assert_eq!(
+        rig.device.mmio_read(RGFX_REG_DRIVER_FEATURES_LO.into()),
+        RGFX_FEATURE_PRIVATE_RENDER_STATE
+    );
+}
+
 /// `HOST_TIME_LO` and `_HI` read the host's monotonic clock, the one each `VBLANK` is stamped on,
 /// once the driver took `HOST_TIME`: a read of `HI`, `LO` and `HI` again lies between two of the
 /// host's own. They read 0 before the driver took it, and again after a reset

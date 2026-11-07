@@ -3210,6 +3210,78 @@ void test_render_pipeline_routing()
 	CHECK(err2 != nil);
 }
 
+// A render pipeline create carries its descriptor's private state, as Apple's OpenGL renderer sets
+// it, after its head where the host took RGFX_FEATURE_PRIVATE_RENDER_STATE, and not elsewhere: the
+// state's properties at their values, Metal's defaults for the ones left alone.
+void test_render_pipeline_private_state()
+{
+	Fixture fx;
+	const uint8_t libBytes[] = {1, 2, 3, 4};
+	uint32_t libStatus = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+	                                        length:sizeof(libBytes)
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&fx.ser
+	                                        status:&libStatus];
+	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+	desc.vertexFunction = [lib newFunctionWithName:@"vmain"];
+	desc.fragmentFunction = [lib newFunctionWithName:@"fmain"];
+	desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	auto create = [&]() {
+		NSError *err = nil;
+		RgfxRenderPipelineState *ps =
+		    [RgfxRenderPipelineState renderPipelineStateWithDescriptor:desc
+		                                                       device:nil
+		                                                   serializer:&fx.ser
+		                                                        error:&err];
+		CHECK(ps != nil && err == nil);
+		return nextMessage(fx.ring, RGFX_CMD_RENDER_PIPELINE_CREATE);
+	};
+	RgfxRenderPipelineCreate head;
+	RgfxRenderPipelinePrivateState state;
+
+	// Not carried: no flag, and the tail starts at the head's end.
+	auto bytes = create();
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK((head.flags & RGFX_RENDER_PIPELINE_PRIVATE_STATE) == 0);
+	CHECK(head.vertex_name_offset == sizeof(head));
+
+	// Carried, at Metal's defaults.
+	fx.ser.setCarriesPrivateRenderState(true);
+	bytes = create();
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK((head.flags & RGFX_RENDER_PIPELINE_PRIVATE_STATE) != 0);
+	CHECK(head.vertex_name_offset == sizeof(head) + sizeof(state));
+	CHECK(std::memcmp(bytes.data() + head.vertex_name_offset, "vmain", 5) == 0);
+	std::memcpy(&state, bytes.data() + sizeof(head), sizeof(state));
+	float coverage = 0;
+	std::memcpy(&coverage, &state.sample_coverage, sizeof(coverage));
+	CHECK(state.sample_mask == UINT64_MAX);
+	CHECK(coverage == 1.0f);
+	CHECK(state.logic_operation == 0 && state.flags == 0 && state.reserved_14 == 0);
+
+	// Carried, as the renderer sets it for an XOR logic operation, a sample mask and coverage.
+	[desc setValue:@YES forKey:@"openGLModeEnabled"];
+	[desc setValue:@3 forKey:@"sampleMask"];
+	[desc setValue:@0.5f forKey:@"sampleCoverage"];
+	[desc setValue:@YES forKey:@"sampleCoverageInvert"];
+	[desc setValue:@YES forKey:@"logicOperationEnabled"];
+	[desc setValue:@10 forKey:@"logicOperation"];
+	[desc setValue:@YES forKey:@"depthStencilWriteDisabled"];
+	bytes = create();
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	std::memcpy(&state, bytes.data() + sizeof(head), sizeof(state));
+	std::memcpy(&coverage, &state.sample_coverage, sizeof(coverage));
+	CHECK(state.sample_mask == 3);
+	CHECK(coverage == 0.5f);
+	CHECK(state.logic_operation == 10);
+	CHECK(state.flags == (RGFX_PRIVATE_RENDER_OPENGL_MODE | RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT |
+	                      RGFX_PRIVATE_RENDER_LOGIC_OPERATION |
+	                      RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED));
+}
+
 // A mesh render pipeline create maps the MTLMeshRenderPipelineDescriptor into the wire: its three
 // functions and label in the tail, its colours, flags, maxima, payload and required sizes in its
 // head. Its answer's mesh limits are what the state answers, NSUIntegerMax for the wire's highest
@@ -15351,6 +15423,7 @@ int main(int argc, char **argv)
 		test_library_and_function_routing();
 		test_libraries_of_one_key_share_their_function_table();
 		test_render_pipeline_routing();
+		test_render_pipeline_private_state();
 		test_mesh_pipeline_routing();
 		test_mesh_pipeline_refusals();
 		test_invalid_mesh_descriptors_end_the_process();

@@ -593,6 +593,11 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         fake_identity_caps()
     }
 
+    /// No: the fake device takes no private render state, unlogged.
+    fn takes_private_render_state(&self) -> bool {
+        false
+    }
+
     /// The identity's working set ([`FAKE_OWN_MEMORY`]), unlogged.
     fn own_memory_budget(&self) -> u64 {
         FAKE_OWN_MEMORY

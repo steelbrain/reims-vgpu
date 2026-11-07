@@ -106,11 +106,14 @@ use reims_graphics::wire::{
     RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_PIPELINE_KIND_COMPUTE,
     RGFX_PIPELINE_KIND_MESH, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
     RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
-    RGFX_PIPELINE_REFUSED, RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE,
-    RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
-    RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT,
-    RGFX_RESOURCE_ID_SMALL_CHUNK, RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT,
-    RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS,
+    RGFX_PIPELINE_REFUSED, RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED,
+    RGFX_PRIVATE_RENDER_LOGIC_OPERATION, RGFX_PRIVATE_RENDER_OPENGL_MODE,
+    RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT, RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE,
+    RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_PRIVATE_STATE,
+    RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED, RGFX_RENDER_PIPELINE_SUPPORT_ICB,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT, RGFX_RESOURCE_ID_SMALL_CHUNK,
+    RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+    RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS,
     RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
     RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
     RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
@@ -121,11 +124,12 @@ use reims_graphics::wire::{
     RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign,
     RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMeshPipelineReflection,
     RgfxMeshRenderPipelineCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
-    RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk,
-    RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue,
-    RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter,
-    RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
-    RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout, RgfxVideoSessionCreate,
+    RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
+    RgfxRenderPipelinePrivateState, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
+    RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
+    RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate,
+    RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
+    RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::memory::map::MemoryMap;
@@ -140,8 +144,8 @@ use reims_vgpu_core::platform::types::{MtlSize, Swizzle};
 use reims_vgpu_core::platform::values::{
     AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
     FullComputePipelineDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc,
-    LinkedFunctionsDesc, OptionSet, SamplerDesc, StageInputDesc, StencilDesc, SurfaceFacts,
-    SurfaceMatrix, SurfacePlane, TextureDesc, VertexDesc,
+    LinkedFunctionsDesc, OptionSet, PrivateRenderDesc, SamplerDesc, StageInputDesc, StencilDesc,
+    SurfaceFacts, SurfaceMatrix, SurfacePlane, TextureDesc, VertexDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
@@ -3819,7 +3823,7 @@ enum LinkedList {
 
 /// A render pipeline create's descriptor past its functions and label, owned: the fields of
 /// [`FullRenderPipelineDesc`] the compile hands the platform with them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct RenderFields {
     vertex_descriptor: Option<VertexDesc>,
     colors: Vec<(u64, ColorAttachmentDesc)>,
@@ -3832,6 +3836,7 @@ struct RenderFields {
     input_primitive_topology: u64,
     max_vertex_amplification_count: u64,
     support_indirect_command_buffers: bool,
+    private_state: Option<PrivateRenderDesc>,
 }
 
 /// A compute pipeline create's descriptor past its function and linked functions: the fields of
@@ -3873,7 +3878,8 @@ const LAST_VERTEX_INDEX: u32 = 30;
 
 /// A render create's descriptor fields ([`RenderFields`]): the colour attachments in use, the
 /// vertex descriptor's runs from the tail (none where it carries neither layouts nor
-/// attributes), and the rest from the head.
+/// attributes), the private state after the head where its flags carry
+/// [`RGFX_RENDER_PIPELINE_PRIVATE_STATE`], and the rest from the head.
 fn render_fields(
     message: &[u8],
     m: &RgfxRenderPipelineCreate,
@@ -3908,6 +3914,32 @@ fn render_fields(
         input_primitive_topology: m.input_primitive_topology.into(),
         max_vertex_amplification_count: m.max_vertex_amplification_count.into(),
         support_indirect_command_buffers: m.flags & RGFX_RENDER_PIPELINE_SUPPORT_ICB != 0,
+        private_state: if m.flags & RGFX_RENDER_PIPELINE_PRIVATE_STATE != 0 {
+            Some(private_render_state(message)?)
+        } else {
+            None
+        },
+    })
+}
+
+/// The [`RgfxRenderPipelinePrivateState`] after a render create's head, as the platform's value:
+/// each field the guest's raw value. A message too short to hold it is
+/// [`DecodeError::Malformed`].
+fn private_render_state(message: &[u8]) -> Result<PrivateRenderDesc, DecodeError> {
+    let at = size_of::<RgfxRenderPipelineCreate>();
+    let s = message
+        .get(at..)
+        .and_then(read::<RgfxRenderPipelinePrivateState>)
+        .ok_or(DecodeError::Malformed)?;
+    Ok(PrivateRenderDesc {
+        open_gl_mode_enabled: s.flags & RGFX_PRIVATE_RENDER_OPENGL_MODE != 0,
+        sample_mask: s.sample_mask,
+        sample_coverage: f32::from_bits(s.sample_coverage),
+        sample_coverage_invert: s.flags & RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT != 0,
+        logic_operation_enabled: s.flags & RGFX_PRIVATE_RENDER_LOGIC_OPERATION != 0,
+        logic_operation: s.logic_operation.into(),
+        depth_stencil_write_disabled: s.flags & RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED
+            != 0,
     })
 }
 
@@ -4276,6 +4308,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 support_indirect_command_buffers: fields.support_indirect_command_buffers,
                 vertex_linked,
                 fragment_linked,
+                private_state: fields.private_state,
             };
             // A nil state or an `NSError` refuses; a refusal Metal answers with none dies at the
             // send, inside the caller's refusal scope.
@@ -7608,7 +7641,77 @@ mod tests {
             input_primitive_topology: 3,
             max_vertex_amplification_count: 2,
             support_indirect_command_buffers: true,
+            private_state: None,
         }
+    }
+
+    /// A render create with the private state after its head reaches the platform's creator with
+    /// it, each field the guest's raw value, and the tail past the record read as before; a
+    /// message that ends inside the record is malformed
+    #[test]
+    fn a_render_create_carries_its_private_state() {
+        let head = size_of::<RgfxRenderPipelineCreate>();
+        let state = RgfxRenderPipelinePrivateState {
+            sample_mask: 3,
+            sample_coverage: 0.5f32.to_bits(),
+            logic_operation: 10,
+            flags: RGFX_PRIVATE_RENDER_OPENGL_MODE
+                | RGFX_PRIVATE_RENDER_LOGIC_OPERATION
+                | RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED,
+            reserved_14: 0,
+        };
+        let name = b"vmain";
+        let name_at = head + size_of_val(&state);
+        let total = (name_at + name.len()).next_multiple_of(8);
+        let m = RgfxRenderPipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RENDER_PIPELINE_CREATE,
+                size: total as u32,
+                seqno: 9,
+            },
+            obj_id: 100,
+            vertex_library_obj_id: 1,
+            vertex_name_offset: name_at as u32,
+            vertex_name_len: name.len() as u32,
+            raster_sample_count: 1,
+            flags: RGFX_RENDER_PIPELINE_PRIVATE_STATE,
+            ..RgfxRenderPipelineCreate::default()
+        };
+        let mut message = m.as_bytes().to_vec();
+        message.extend_from_slice(state.as_bytes());
+        message.extend_from_slice(name);
+        message.resize(total, 0);
+        let want = PrivateRenderDesc {
+            open_gl_mode_enabled: true,
+            sample_mask: 3,
+            sample_coverage: 0.5,
+            sample_coverage_invert: false,
+            logic_operation_enabled: true,
+            logic_operation: 10,
+            depth_stencil_write_disabled: true,
+        };
+        assert_eq!(
+            render_fields(&message, &m).map(|f| f.private_state),
+            Ok(Some(want))
+        );
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(replies.lock()[0].status, RGFX_PIPELINE_OK);
+        let calls = p
+            .call_log()
+            .calls_to("newRenderPipelineStateWithDescriptor:error:");
+        let Arg::Val(logged) = &calls[0].args[0] else {
+            panic!("{:?}", calls[0].args);
+        };
+        assert!(
+            logged.contains(&format!("private_state: {:?}", Some(want))),
+            "{logged}"
+        );
+        assert_eq!(
+            render_fields(&message[..head + 8], &m).map(|f| f.private_state),
+            Err(DecodeError::Malformed)
+        );
     }
 
     /// Every field of a render create reaches the platform's creator, read from the wire as the

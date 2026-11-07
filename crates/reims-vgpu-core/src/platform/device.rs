@@ -272,6 +272,11 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// family and feature set of the SDK, and the identity and capability getters. Read on each
     /// call; only the graphics lane asks it, once per device.
     fn identity_caps(&self) -> IdentityCaps;
+    /// Whether the device makes render pipelines with the private state Apple's OpenGL renderer
+    /// sets ([`FullRenderPipelineDesc::private_state`]): on the Metal platform, where Metal's
+    /// render pipeline descriptors answer each of its setters (SPI); on the Vulkan platform,
+    /// always. The graphics lane offers `PRIVATE_RENDER_STATE` where it does.
+    fn takes_private_render_state(&self) -> bool;
     /// The bytes of the GPU's own memory the process may hold, as the platform answers at the
     /// call: Metal's `recommendedMaxWorkingSetSize`; on the Vulkan platform the budget of the
     /// device-local heaps (`VK_EXT_memory_budget`) where the device has the extension, else their

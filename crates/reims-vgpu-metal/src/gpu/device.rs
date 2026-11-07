@@ -780,6 +780,12 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         read_identity_caps(self)
     }
 
+    /// Where Metal's render pipeline descriptors answer every setter of the private state Apple's
+    /// OpenGL renderer sets (SPI; measured on the Intel 630 on macOS 26.7.1 through the renderer).
+    fn takes_private_render_state(&self) -> bool {
+        crate::gpu::desc::private_render_state_available()
+    }
+
     fn own_memory_budget(&self) -> u64 {
         let d = self.get();
         msg::get("recommendedMaxWorkingSetSize", || {
@@ -2104,6 +2110,137 @@ vertex float4 vmain(uint v [[vertex_id]]) { return float4(0, 0, 0, 1); }
                 .unwrap()
                 .is_some()
         );
+    }
+
+    use reims_vgpu_core::num::ToU64;
+    use reims_vgpu_core::platform::values::{ColorAttachmentDesc, PrivateRenderDesc};
+
+    /// A full-screen triangle whose fragment writes (1, 1, 0, 0).
+    const PRIVATE_STATE_SOURCE: &str = "#include <metal_stdlib>
+using namespace metal;
+vertex float4 vmain(uint v [[vertex_id]]) {
+    return float4(v == 1 ? 3.0 : -1.0, v == 2 ? 3.0 : -1.0, 0.5, 1.0);
+}
+fragment float4 fmain() { return float4(1.0, 1.0, 0.0, 0.0); }
+";
+
+    /// What a draw of [`PRIVATE_STATE_SOURCE`] by a pipeline of the private state `private`
+    /// leaves in an RGBA8 texel cleared to (64, 128, 191, 255).
+    fn drawn_with(private: Option<PrivateRenderDesc>) -> [u8; 4] {
+        use objc2_metal::{
+            MTLClearColor, MTLCommandBuffer as _, MTLCommandEncoder as _, MTLDevice as _,
+            MTLLoadAction, MTLOrigin, MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder as _,
+            MTLRenderPassDescriptor, MTLStoreAction, MTLTextureUsage,
+        };
+        let d = dev();
+        let library = Obj::from_retained(
+            objc2_metal::MTLDevice::newLibraryWithSource_options_error(
+                d.get(),
+                &NSString::from_str(PRIVATE_STATE_SOURCE),
+                None,
+            )
+            .expect("the functions compile"),
+        );
+        let (v, f) = (function(&library, "vmain"), function(&library, "fmain"));
+        let color = ColorAttachmentDesc {
+            pixel_format: MTLPixelFormat::RGBA8Unorm.0.to_u64(),
+            write_mask: 0xf,
+            ..ColorAttachmentDesc::default()
+        };
+        let state = d
+            .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                label: None,
+                vertex: &v,
+                fragment: Some(&f),
+                vertex_descriptor: None,
+                colors: vec![(0, color)],
+                depth_pixel_format: 0,
+                stencil_pixel_format: 0,
+                raster_sample_count: 1,
+                alpha_to_coverage: false,
+                alpha_to_one: false,
+                rasterization_enabled: true,
+                input_primitive_topology: 0,
+                max_vertex_amplification_count: 1,
+                support_indirect_command_buffers: false,
+                vertex_linked: Default::default(),
+                fragment_linked: Default::default(),
+                private_state: private,
+            })
+            .unwrap()
+            .expect("a render pipeline");
+        let td = texture_descriptor(4, 4, MTLStorageMode::Shared);
+        td.get().setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+        td.get().setUsage(MTLTextureUsage::RenderTarget);
+        let texture = d.get().newTextureWithDescriptor(td.get()).unwrap();
+        let pass = MTLRenderPassDescriptor::new();
+        // SAFETY: index 0 of the colour attachments.
+        let a = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+        a.setTexture(Some(&texture));
+        a.setLoadAction(MTLLoadAction::Clear);
+        a.setStoreAction(MTLStoreAction::Store);
+        a.setClearColor(MTLClearColor {
+            red: 64.0 / 255.0,
+            green: 128.0 / 255.0,
+            blue: 191.0 / 255.0,
+            alpha: 1.0,
+        });
+        let queue = d.get().newCommandQueue().unwrap();
+        let cb = queue.commandBuffer().unwrap();
+        let e = cb.renderCommandEncoderWithDescriptor(&pass).unwrap();
+        e.setRenderPipelineState(state.get());
+        // SAFETY: three vertices of a function that reads no buffer.
+        unsafe { e.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3) };
+        e.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        let mut texel = [0u8; 4];
+        // SAFETY: one texel of a Shared RGBA8 texture the GPU is done with, into 4 bytes.
+        unsafe {
+            texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                std::ptr::NonNull::from(&mut texel).cast(),
+                16,
+                MTLRegion {
+                    origin: MTLOrigin { x: 1, y: 1, z: 0 },
+                    size: MtlSizeObjc {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                },
+                0,
+            );
+        }
+        texel
+    }
+
+    /// A render pipeline of the private state Apple's OpenGL renderer sets draws as Metal draws
+    /// it: at the renderer's defaults (OpenGL mode, a sample mask of `0xffffffff`, copy, no depth
+    /// or stencil writes) the fragment's colour, under GL's XOR the codes XORed into the clear's,
+    /// and under a sample mask of 0 nothing
+    #[test]
+    fn private_render_state_draws_as_metal_draws() {
+        assert!(dev().takes_private_render_state());
+        let renderer = PrivateRenderDesc {
+            open_gl_mode_enabled: true,
+            sample_mask: 0xffff_ffff,
+            logic_operation: 2,
+            depth_stencil_write_disabled: true,
+            ..PrivateRenderDesc::default()
+        };
+        assert_eq!(drawn_with(None), [255, 255, 0, 0]);
+        assert_eq!(drawn_with(Some(renderer)), [255, 255, 0, 0]);
+        let xor = PrivateRenderDesc {
+            logic_operation_enabled: true,
+            logic_operation: 10,
+            ..renderer
+        };
+        assert_eq!(drawn_with(Some(xor)), [191, 127, 191, 255]);
+        let masked = PrivateRenderDesc {
+            sample_mask: 0,
+            ..renderer
+        };
+        assert_eq!(drawn_with(Some(masked)), [64, 128, 191, 255]);
     }
 
     fn render_descriptor(lib: &MetalLibrary) -> MetalRenderPipelineDescriptor {

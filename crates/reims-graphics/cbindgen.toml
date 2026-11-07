@@ -276,6 +276,7 @@ include = [
     "RgfxRenderPassStencilAttachment",
     "RgfxRenderPassVisibility",
     "RgfxRenderPipelineCreate",
+    "RgfxRenderPipelinePrivateState",
     "RgfxResourceBinding",
     "RgfxResourceIdChunk",
     "RgfxRingHeader",

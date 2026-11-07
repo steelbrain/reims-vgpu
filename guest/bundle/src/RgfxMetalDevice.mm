@@ -742,6 +742,8 @@ RGFX_LOG_UNRECOGNIZED
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
 	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
 	_serializer->setAsker(&rgfxKextAsk, connContext);
+	_serializer->setCarriesPrivateRenderState((_caps.features() & RGFX_FEATURE_PRIVATE_RENDER_STATE) !=
+	                                          0);
 	// Shared events cross processes through the kext's ports where the kext makes them and the
 	// host took the feature that names their events (RgfxUserClientABI.hpp,
 	// kRgfxSharedEventUserClientType).

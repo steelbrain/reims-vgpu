@@ -162,8 +162,8 @@ use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::{MtlSize, NsErrorText};
 use reims_vgpu_core::platform::values::{
     ColorAttachmentDesc, DepthStencilDesc, FullComputePipelineDesc, FullMeshRenderPipelineDesc,
-    FullRenderPipelineDesc, LinkedFunctionsDesc, RenderPipelineDesc, SamplerDesc, StageInputDesc,
-    StencilDesc, VertexDesc,
+    FullRenderPipelineDesc, LinkedFunctionsDesc, PrivateRenderDesc, RenderPipelineDesc,
+    SamplerDesc, StageInputDesc, StencilDesc, VertexDesc,
 };
 use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::Mutex;
@@ -531,9 +531,11 @@ pub(crate) fn new_render_pipeline_state(
 }
 
 /// `newRenderPipelineStateWithDescriptor:error:` of the whole value `desc`, the graphics lane's:
-/// every field the value carries is the runtime descriptor's own. A raw value the runtime has no
-/// enumerator of dies at the send ([`metal_value`]); so does the compile's refusal where Metal
-/// answers no `NSError` ([`made`]). The lane calls it inside its refusal scope.
+/// every field the value carries is the runtime descriptor's own, the private state its
+/// [`PrivateRenderState`](metal2vulkan::pipeline::PrivateRenderState) but `openGLModeEnabled`
+/// ([`private_state`]). A raw value the runtime has no enumerator of dies at the send
+/// ([`metal_value`]); so does the compile's refusal where Metal answers no `NSError` ([`made`]).
+/// The lane calls it inside its refusal scope.
 pub(crate) fn new_render_pipeline_state_full(
     device: &VulkanDevice,
     desc: &FullRenderPipelineDesc<'_, VulkanPlatform>,
@@ -578,6 +580,9 @@ pub(crate) fn new_render_pipeline_state_full(
         desc.max_vertex_amplification_count,
     );
     d.support_indirect_command_buffers = desc.support_indirect_command_buffers;
+    if let Some(p) = &desc.private_state {
+        private_state(&mut d.private, p);
+    }
     let mut options = rt::PipelineOptions::default();
     options.label = desc.label.map(str::to_owned);
     timing::creation(
@@ -865,6 +870,23 @@ fn linked_functions(l: &LinkedFunctionsDesc<VulkanPlatform>) -> LinkedFunctions 
         .collect();
     out.private_functions = list(&l.private_functions);
     out
+}
+
+/// The private state `p` (the graphics wire's, as Apple's OpenGL renderer sets it) into the
+/// runtime's `private`: the sample mask and coverage, the coverage inversion, the logic operation
+/// and its switch, and the depth-stencil write switch, each the guest's raw value.
+///
+/// `openGLModeEnabled`, which the renderer sets on every pipeline, the runtime has no field for:
+/// it is dropped here, an interim divergence from Metal, which makes the pipeline with it, until
+/// metal2vulkan measures what it changes on Apple's Metal and gives it a field and rule or calls
+/// it inert.
+fn private_state(private: &mut metal2vulkan::pipeline::PrivateRenderState, p: &PrivateRenderDesc) {
+    private.sample_mask = p.sample_mask;
+    private.sample_coverage = p.sample_coverage;
+    private.sample_coverage_invert = p.sample_coverage_invert;
+    private.logic_operation_enabled = p.logic_operation_enabled;
+    private.logic_operation = p.logic_operation;
+    private.depth_stencil_write_disabled = p.depth_stencil_write_disabled;
 }
 
 /// The runtime's colour attachment of a whole value's: none for `MTLPixelFormatInvalid`.
@@ -1409,6 +1431,7 @@ mod tests {
             support_indirect_command_buffers: false,
             vertex_linked: LinkedFunctionsDesc::default(),
             fragment_linked: LinkedFunctionsDesc::default(),
+            private_state: None,
         }
     }
 
@@ -1783,6 +1806,7 @@ mod tests {
                     functions: vec![linked.clone_ref()],
                     ..LinkedFunctionsDesc::default()
                 },
+                private_state: None,
             })
             .ok()??;
         let out = d
@@ -2466,6 +2490,33 @@ mod tests {
             refusal_describing(&Error::DeviceLost, None),
             crate::answer::refusal(&Error::DeviceLost)
         );
+    }
+
+    /// The graphics wire's private render state fills the runtime's, each field the guest's value
+    /// but `openGLModeEnabled`, which it has no field for; the rest stay Metal's defaults
+    #[test]
+    fn the_private_render_state_fills_the_runtimes() {
+        let mut private = metal2vulkan::pipeline::PrivateRenderState::new();
+        private_state(
+            &mut private,
+            &PrivateRenderDesc {
+                open_gl_mode_enabled: true,
+                sample_mask: 3,
+                sample_coverage: 0.5,
+                sample_coverage_invert: true,
+                logic_operation_enabled: true,
+                logic_operation: 10,
+                depth_stencil_write_disabled: true,
+            },
+        );
+        let mut want = metal2vulkan::pipeline::PrivateRenderState::new();
+        want.sample_mask = 3;
+        want.sample_coverage = 0.5;
+        want.sample_coverage_invert = true;
+        want.logic_operation_enabled = true;
+        want.logic_operation = 10;
+        want.depth_stencil_write_disabled = true;
+        assert_eq!(private, want);
     }
 
     #[cfg(target_os = "macos")]

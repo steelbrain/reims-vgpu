@@ -205,6 +205,7 @@ impl<P: ApiPlatform> Bench<P> {
                 support_indirect_command_buffers: true,
                 vertex_linked: LinkedFunctionsDesc::default(),
                 fragment_linked: LinkedFunctionsDesc::default(),
+                private_state: None,
             })
             .unwrap()
             .unwrap();

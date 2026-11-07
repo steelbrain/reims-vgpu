@@ -215,6 +215,7 @@ impl Frame {
                 support_indirect_command_buffers: false,
                 vertex_linked: LinkedFunctionsDesc::default(),
                 fragment_linked: LinkedFunctionsDesc::default(),
+                private_state: None,
             })
             .unwrap()
             .unwrap()

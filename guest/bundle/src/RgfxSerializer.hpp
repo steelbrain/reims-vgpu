@@ -122,6 +122,9 @@ struct RgfxRenderPipelineParams {
 	uint32_t vertex_linked_count;
 	const RgfxLinkedFunctionRef *fragment_linked;
 	uint32_t fragment_linked_count;
+	/// The descriptor's private state, sent after the head with RGFX_RENDER_PIPELINE_PRIVATE_STATE;
+	/// null for none.
+	const RgfxRenderPipelinePrivateState *private_state;
 };
 
 /// A mesh render pipeline's descriptor, as MTLMeshRenderPipelineDescriptor gives it, in plain
@@ -279,6 +282,10 @@ public:
 	void setEventSharer(EventShareFn share, EventTakeFn take, void *context);
 	/// Whether events cross processes here: a sharer is set.
 	bool sharesEvents() const { return m_eventShare != nullptr; }
+	/// Whether render pipeline creates carry their descriptors' private state: the host took
+	/// RGFX_FEATURE_PRIVATE_RENDER_STATE. Set once, before the first create; off by default.
+	void setCarriesPrivateRenderState(bool carries) { m_privateRenderState = carries; }
+	bool carriesPrivateRenderState() const { return m_privateRenderState; }
 	/// Names shared event `event` for other processes: its port, 0 where none was given.
 	uint32_t shareEvent(RgfxObjId event);
 	/// The process's new shared event made of the one `port` names: its id in `obj_id` and the
@@ -609,6 +616,7 @@ private:
 	void *m_askContext = nullptr;
 	EventShareFn m_eventShare = nullptr;
 	EventTakeFn m_eventTake = nullptr;
+	bool m_privateRenderState = false;
 	void *m_eventContext = nullptr;
 
 	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.

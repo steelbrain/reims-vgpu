@@ -1396,6 +1396,50 @@ pub unsafe trait RenderPassDescriptorSpi: Message {
 // SAFETY: an `MTLRenderPassDescriptor`.
 unsafe impl RenderPassDescriptorSpi for MTLRenderPassDescriptor {}
 
+/// The private render state of `MTLRenderPipelineDescriptor` (SPI) that Apple's OpenGL renderer
+/// sets, where the descriptor answers each setter ([`RENDER_PIPELINE_PRIVATE_SETTERS`]).
+///
+/// # Safety
+/// The implementor is an `MTLRenderPipelineDescriptor`.
+pub unsafe trait RenderPipelineDescriptorSpi: Message {
+    fn setOpenGLModeEnabled(&self, enabled: bool) {
+        unsafe { msg_send![self, setOpenGLModeEnabled: enabled] }
+    }
+    fn setSampleMask(&self, mask: u64) {
+        unsafe { msg_send![self, setSampleMask: mask] }
+    }
+    fn setSampleCoverage(&self, coverage: f32) {
+        unsafe { msg_send![self, setSampleCoverage: coverage] }
+    }
+    fn setSampleCoverageInvert(&self, invert: bool) {
+        unsafe { msg_send![self, setSampleCoverageInvert: invert] }
+    }
+    fn setLogicOperationEnabled(&self, enabled: bool) {
+        unsafe { msg_send![self, setLogicOperationEnabled: enabled] }
+    }
+    fn setLogicOperation(&self, operation: u64) {
+        unsafe { msg_send![self, setLogicOperation: operation] }
+    }
+    fn setDepthStencilWriteDisabled(&self, disabled: bool) {
+        unsafe { msg_send![self, setDepthStencilWriteDisabled: disabled] }
+    }
+}
+
+/// The setters of [`RenderPipelineDescriptorSpi`], each of which a descriptor must answer for
+/// the platform to take the private render state.
+pub const RENDER_PIPELINE_PRIVATE_SETTERS: [&std::ffi::CStr; 7] = [
+    c"setOpenGLModeEnabled:",
+    c"setSampleMask:",
+    c"setSampleCoverage:",
+    c"setSampleCoverageInvert:",
+    c"setLogicOperationEnabled:",
+    c"setLogicOperation:",
+    c"setDepthStencilWriteDisabled:",
+];
+
+// SAFETY: an `MTLRenderPipelineDescriptor`.
+unsafe impl RenderPipelineDescriptorSpi for MTLRenderPipelineDescriptor {}
+
 /// `MTLIndirectCommandBufferDescriptorSPI`.
 ///
 /// # Safety

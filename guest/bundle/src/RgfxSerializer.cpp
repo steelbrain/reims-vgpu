@@ -1035,6 +1035,9 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 	msg.obj_id = out.obj_id;
 	msg.vertex_library_obj_id = p.vertex.library;
 	msg.fragment_library_obj_id = p.fragment.library;
+	// The private state, where the create carries it, follows the head first of all.
+	if (p.private_state != nullptr)
+		(void)append(p.private_state, sizeof(*p.private_state));
 
 	uint32_t vlen = nameLen(p.vertex.entry_point);
 	msg.vertex_name_offset = append(p.vertex.entry_point, vlen);
@@ -1070,7 +1073,7 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 		msg.colors[i] = p.colors[i];
 	msg.depth_pixel_format = p.depth_pixel_format;
 	msg.stencil_pixel_format = p.stencil_pixel_format;
-	msg.flags = p.flags;
+	msg.flags = p.flags | (p.private_state != nullptr ? RGFX_RENDER_PIPELINE_PRIVATE_STATE : 0);
 	msg.input_primitive_topology = p.input_primitive_topology;
 	msg.max_vertex_amplification_count = p.max_vertex_amplification_count;
 

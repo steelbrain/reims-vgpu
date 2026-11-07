@@ -1605,6 +1605,7 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
                 support_indirect_command_buffers: false,
                 vertex_linked,
                 fragment_linked,
+                private_state: None,
             })
             .map(|state| state.map(drop))
         }))

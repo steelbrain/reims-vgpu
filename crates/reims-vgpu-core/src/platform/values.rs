@@ -398,8 +398,8 @@ impl<P: Platform> fmt::Debug for LinkedFunctionsDesc<P> {
 /// value. Order: label, the vertex and fragment functions, the vertex descriptor, the colour
 /// attachments at their indices, the depth and stencil formats, the raster sample count,
 /// alpha-to-coverage, alpha-to-one, rasterization, the input primitive topology, the maximum
-/// vertex amplification count, indirect command buffer support, then the vertex and fragment
-/// stages' linked functions where they link any.
+/// vertex amplification count, indirect command buffer support, the vertex and fragment stages'
+/// linked functions where they link any, then the private state where the guest gave it.
 pub struct FullRenderPipelineDesc<'a, P: Platform> {
     /// `setLabel:`, when set.
     pub label: Option<&'a str>,
@@ -433,6 +433,42 @@ pub struct FullRenderPipelineDesc<'a, P: Platform> {
     pub vertex_linked: LinkedFunctionsDesc<P>,
     /// `setFragmentLinkedFunctions:`, where the stage links any.
     pub fragment_linked: LinkedFunctionsDesc<P>,
+    /// The private state Apple's OpenGL renderer sets, where the guest gave it; `None` leaves
+    /// Metal's. Only a device that answers [`takes_private_render_state`] is given it.
+    ///
+    /// [`takes_private_render_state`]: super::device::GpuDevice::takes_private_render_state
+    pub private_state: Option<PrivateRenderDesc>,
+}
+
+/// The private state (Apple SPI) of an `MTLRenderPipelineDescriptor` that Apple's OpenGL renderer
+/// sets on every pipeline, as a value: each field its setter's argument, the guest's raw value.
+/// Order: `setOpenGLModeEnabled:`, `setSampleMask:`, `setSampleCoverage:`,
+/// `setSampleCoverageInvert:`, `setLogicOperationEnabled:`, `setLogicOperation:`, then
+/// `setDepthStencilWriteDisabled:`. [`Default`] gives Metal's defaults.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct PrivateRenderDesc {
+    pub open_gl_mode_enabled: bool,
+    pub sample_mask: u64,
+    pub sample_coverage: f32,
+    pub sample_coverage_invert: bool,
+    pub logic_operation_enabled: bool,
+    pub logic_operation: u64,
+    pub depth_stencil_write_disabled: bool,
+}
+
+impl Default for PrivateRenderDesc {
+    fn default() -> Self {
+        PrivateRenderDesc {
+            open_gl_mode_enabled: false,
+            sample_mask: u64::MAX,
+            sample_coverage: 1.0,
+            sample_coverage_invert: false,
+            logic_operation_enabled: false,
+            logic_operation: 0,
+            depth_stencil_write_disabled: false,
+        }
+    }
 }
 
 impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
@@ -460,6 +496,7 @@ impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
             )
             .field("vertex_linked", &self.vertex_linked)
             .field("fragment_linked", &self.fragment_linked)
+            .field("private_state", &self.private_state)
             .finish()
     }
 }

@@ -1,11 +1,12 @@
 /*
- * RgfxRenderPipelineState: see RgfxRenderPipelineState.h. Our own ObjC++; no Apple
- * private SPI.
+ * RgfxRenderPipelineState: see RgfxRenderPipelineState.h. Our own ObjC++. Of Apple's private
+ * SPI it reads only the descriptor's private render state, by key, where the host takes it.
  */
 
 #import "RgfxRenderPipelineState.h"
 #import "RgfxUnsupported.h"
 
+#include <cstring>
 #include <vector>
 
 #import "RgfxFunction.h"
@@ -186,6 +187,45 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	out[2] = wire32(size.depth);
 }
 
+// The descriptor's value of its private property `key` (Apple SPI), read by key-value coding
+// where the descriptor answers its getter (`key` or `is<Key>`); nil where it answers neither.
+NSNumber *privateValue(MTLRenderPipelineDescriptor *d, NSString *key)
+{
+	NSString *is = [NSString stringWithFormat:@"is%@%@", [key substringToIndex:1].uppercaseString,
+	                                          [key substringFromIndex:1]];
+	if (![d respondsToSelector:NSSelectorFromString(key)] &&
+	    ![d respondsToSelector:NSSelectorFromString(is)])
+		return nil;
+	id v = [d valueForKey:key];
+	return [v isKindOfClass:[NSNumber class]] ? v : nil;
+}
+
+// The private state of `d` that Apple's OpenGL renderer sets (RgfxRenderPipelinePrivateState),
+// each property Metal's default where the descriptor does not answer it: a sample mask of all
+// ones, a coverage of 1, logic operation 0 and the flags off.
+RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
+{
+	RgfxRenderPipelinePrivateState s = {};
+	NSNumber *v = privateValue(d, @"sampleMask");
+	s.sample_mask = v != nil ? v.unsignedLongLongValue : UINT64_MAX;
+	const float coverage = (v = privateValue(d, @"sampleCoverage")) != nil ? v.floatValue : 1.0f;
+	std::memcpy(&s.sample_coverage, &coverage, sizeof(coverage));
+	s.logic_operation = (v = privateValue(d, @"logicOperation")) != nil ? wire32(v.unsignedLongValue) : 0;
+	const struct {
+		NSString *key;
+		uint32_t flag;
+	} flags[] = {
+	    {@"openGLModeEnabled", RGFX_PRIVATE_RENDER_OPENGL_MODE},
+	    {@"sampleCoverageInvert", RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT},
+	    {@"logicOperationEnabled", RGFX_PRIVATE_RENDER_LOGIC_OPERATION},
+	    {@"depthStencilWriteDisabled", RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED},
+	};
+	for (const auto &f : flags)
+		if (privateValue(d, f.key).boolValue)
+			s.flags |= f.flag;
+	return s;
+}
+
 } // namespace
 
 @implementation RgfxRenderPipelineState {
@@ -321,6 +361,11 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	p.input_primitive_topology = static_cast<uint32_t>(descriptor.inputPrimitiveTopology);
 	p.max_vertex_amplification_count =
 	    static_cast<uint32_t>(descriptor.maxVertexAmplificationCount);
+	RgfxRenderPipelinePrivateState privateState = {};
+	if (serializer->carriesPrivateRenderState()) {
+		privateState = privateStateOf(descriptor);
+		p.private_state = &privateState;
+	}
 
 	// Vertex descriptor (optional): scan for the in-use layouts and attributes.
 	std::vector<RgfxVertexBufferLayout> layouts;

@@ -38,8 +38,8 @@ use reims_vgpu_core::platform::values::{
     AttachmentState, BufferDeallocator, BufferDesc, ColorAttachmentDesc, ColorAttachmentSet,
     ComputePassDesc, DepthAttachmentSet, DepthStencilDesc, FullComputePipelineDesc,
     FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, IcbDesc, LinkedFunctionsDesc,
-    OptionSet, PassSet, RenderPipelineDesc, SamplerDesc, StageInputDesc, StencilAttachmentSet,
-    StencilDesc, TextureDesc, VertexDesc,
+    OptionSet, PassSet, PrivateRenderDesc, RenderPipelineDesc, SamplerDesc, StageInputDesc,
+    StencilAttachmentSet, StencilDesc, TextureDesc, VertexDesc,
 };
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
@@ -52,7 +52,8 @@ use crate::platform::{MetalPlatform, Obj};
 use crate::spi::classes::MTLBufferDescriptor;
 use crate::spi::methods::{
     AttachmentArraySpi, ForceResourceIndexSpi, HeapDescriptorSpi, IcbDescriptorSpi,
-    RenderPassDescriptorSpi, ResourceIndexDescriptorSpi, TextureDescriptorSpi,
+    RENDER_PIPELINE_PRIVATE_SETTERS, RenderPassDescriptorSpi, RenderPipelineDescriptorSpi,
+    ResourceIndexDescriptorSpi, TextureDescriptorSpi,
 };
 
 /// A sub-object getter's `+0` result as a handle, retained.
@@ -804,6 +805,51 @@ pub fn apply_full_render_pipeline(
             o.setFragmentLinkedFunctions(Some(&linked))
         });
     }
+    if let Some(p) = &desc.private_state {
+        apply_private_render_state(p, o);
+    }
+}
+
+/// The private render state `p` onto the render pipeline descriptor `o`, in the value's order
+/// ([`PrivateRenderDesc`]): each setter's SPI, which only a device that answers
+/// [`private_render_state_available`] is sent.
+fn apply_private_render_state(p: &PrivateRenderDesc, o: &MTLRenderPipelineDescriptor) {
+    msg::get("setOpenGLModeEnabled:", || {
+        o.setOpenGLModeEnabled(p.open_gl_mode_enabled)
+    });
+    msg::get("setSampleMask:", || o.setSampleMask(p.sample_mask));
+    msg::get("setSampleCoverage:", || {
+        o.setSampleCoverage(p.sample_coverage)
+    });
+    msg::get("setSampleCoverageInvert:", || {
+        o.setSampleCoverageInvert(p.sample_coverage_invert)
+    });
+    msg::get("setLogicOperationEnabled:", || {
+        o.setLogicOperationEnabled(p.logic_operation_enabled)
+    });
+    msg::get("setLogicOperation:", || {
+        o.setLogicOperation(p.logic_operation)
+    });
+    msg::get("setDepthStencilWriteDisabled:", || {
+        o.setDepthStencilWriteDisabled(p.depth_stencil_write_disabled)
+    });
+}
+
+/// Whether this Metal's render pipeline descriptors answer every setter of the private render
+/// state Apple's OpenGL renderer sets ([`RENDER_PIPELINE_PRIVATE_SETTERS`]). Read once.
+pub fn private_render_state_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let d = msg::get("new", MTLRenderPipelineDescriptor::new);
+        RENDER_PIPELINE_PRIVATE_SETTERS.iter().all(|name| {
+            msg::get("respondsToSelector:", || {
+                objc2_foundation::NSObjectProtocol::respondsToSelector(
+                    &*d,
+                    objc2::runtime::Sel::register(name),
+                )
+            })
+        })
+    })
 }
 
 /// Applies the whole mesh render pipeline value `desc` to the fresh descriptor `d`, in the
@@ -1831,9 +1877,9 @@ mod tests {
 
     /// The whole render value reaches the descriptor: every colour attachment it sets with its
     /// blend state and write mask, the vertex descriptor's layouts and attributes, the depth and
-    /// stencil formats, the sample count, the flags, the topology, the amplification count and
-    /// each stage's linked functions in their lists; with no fragment function the descriptor's
-    /// is nil
+    /// stencil formats, the sample count, the flags, the topology, the amplification count,
+    /// each stage's linked functions in their lists and the private state; with no fragment
+    /// function the descriptor's is nil
     #[test]
     fn a_whole_render_value_reaches_the_descriptor() {
         use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
@@ -1892,11 +1938,33 @@ mod tests {
                     private_functions: vec![k.function.clone_ref()],
                     ..LinkedFunctionsDesc::default()
                 },
+                private_state: Some(PrivateRenderDesc {
+                    open_gl_mode_enabled: true,
+                    sample_mask: 3,
+                    sample_coverage: 0.5,
+                    sample_coverage_invert: true,
+                    logic_operation_enabled: true,
+                    logic_operation: 10,
+                    depth_stencil_write_disabled: true,
+                }),
             },
             &x,
         );
         let o = x.get();
         assert!(o.fragmentFunction().is_none());
+        // The private state, read back by key.
+        assert!(private_render_state_available());
+        let value = |key: &str| -> Retained<objc2_foundation::NSNumber> {
+            // SAFETY: key-value coding of a property the descriptor declares, a number.
+            unsafe { objc2::msg_send![o, valueForKey: &*NSString::from_str(key)] }
+        };
+        assert!(value("openGLModeEnabled").boolValue());
+        assert_eq!(value("sampleMask").unsignedLongLongValue(), 3);
+        assert_eq!(value("sampleCoverage").floatValue(), 0.5);
+        assert!(value("sampleCoverageInvert").boolValue());
+        assert!(value("logicOperationEnabled").boolValue());
+        assert_eq!(value("logicOperation").unsignedLongLongValue(), 10);
+        assert!(value("depthStencilWriteDisabled").boolValue());
         let (v, f) = (o.vertexLinkedFunctions(), o.fragmentLinkedFunctions());
         let count = |a: Option<Retained<NSArray<ProtocolObject<dyn MTLFunction>>>>| {
             a.map_or(0, |a| a.count())

@@ -1711,6 +1711,12 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         crate::gpu::identity::read(&self.raw, &self.caps())
     }
 
+    /// Always: the runtime's render pipeline descriptors hold the private state, but
+    /// `openGLModeEnabled` (`states::new_render_pipeline_state_full`).
+    fn takes_private_render_state(&self) -> bool {
+        true
+    }
+
     fn own_memory_budget(&self) -> u64 {
         crate::gpu::identity::device_local_budget(&self.raw)
     }

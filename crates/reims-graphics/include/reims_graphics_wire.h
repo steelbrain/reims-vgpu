@@ -948,8 +948,8 @@
 // [`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_HOST_TIME`],
 // [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`],
 // [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`],
-// [`RGFX_FEATURE_MESH_PIPELINES`] and [`RGFX_FEATURE_SHARED_EVENT_NAMES`]). Bits 9 and 10 are
-// reserved.
+// [`RGFX_FEATURE_MESH_PIPELINES`], [`RGFX_FEATURE_SHARED_EVENT_NAMES`] and
+// [`RGFX_FEATURE_PRIVATE_RENDER_STATE`]). Bits 9 and 10 are reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -1137,6 +1137,15 @@
 // one holder's buffers and CPU give it are posted to every other holder
 // ([`RgfxSharedEventName::listen_queue_obj_id`]).
 #define RGFX_FEATURE_SHARED_EVENT_NAMES (1 << 26)
+
+// `FEATURES_LO` bit 28, `PRIVATE_RENDER_STATE`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`]: a [`RgfxRenderPipelineCreate`] may carry
+// [`RGFX_RENDER_PIPELINE_PRIVATE_STATE`] and, after its head, the
+// [`RgfxRenderPipelinePrivateState`] of the guest's descriptor: the private state (Apple SPI)
+// Apple's OpenGL renderer sets, which the host's platform makes the pipeline with. A host offers
+// it only where its platform takes that state. A host without it reads the flag as no flag and
+// the record as tail no offset names, so the guest sends them only where it took the bit.
+#define RGFX_FEATURE_PRIVATE_RENDER_STATE (1 << 28)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -2222,6 +2231,23 @@
 
 // [`RgfxRenderPipelineCreate`] `flags`: `supportIndirectCommandBuffers`.
 #define RGFX_RENDER_PIPELINE_SUPPORT_ICB (1 << 3)
+
+// [`RgfxRenderPipelineCreate`] `flags`: an [`RgfxRenderPipelinePrivateState`] follows the
+// create's head, where the guest took [`RGFX_FEATURE_PRIVATE_RENDER_STATE`]. Bits 4 and 5 are
+// the mesh create's.
+#define RGFX_RENDER_PIPELINE_PRIVATE_STATE (1 << 6)
+
+// [`RgfxRenderPipelinePrivateState`] `flags`: `openGLModeEnabled`.
+#define RGFX_PRIVATE_RENDER_OPENGL_MODE (1 << 0)
+
+// [`RgfxRenderPipelinePrivateState`] `flags`: `sampleCoverageInvert`.
+#define RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT (1 << 1)
+
+// [`RgfxRenderPipelinePrivateState`] `flags`: `logicOperationEnabled`.
+#define RGFX_PRIVATE_RENDER_LOGIC_OPERATION (1 << 2)
+
+// [`RgfxRenderPipelinePrivateState`] `flags`: `depthStencilWriteDisabled`.
+#define RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED (1 << 3)
 
 // [`RgfxMeshRenderPipelineCreate`] `flags`, beside the `RGFX_RENDER_PIPELINE_*` ones:
 // `objectThreadgroupSizeIsMultipleOfThreadExecutionWidth`.
@@ -5842,8 +5868,10 @@ typedef struct {
 // [`RgfxColorAttachmentDesc`] in use. The vertex and fragment stages' linked
 // functions (`vertexLinkedFunctions`, `fragmentLinkedFunctions`) are runs of
 // [`RgfxLinkedFunction`] in the tail. The optional pipeline `label` is tail
-// bytes (`label_len` 0 for none). The whole message's `size` is the fixed head
-// plus the tail, rounded up to a multiple of 8.
+// bytes (`label_len` 0 for none). With [`RGFX_RENDER_PIPELINE_PRIVATE_STATE`] in
+// `flags`, an [`RgfxRenderPipelinePrivateState`] follows the head, ahead of the
+// tail. The whole message's `size` is the fixed head plus the tail, rounded up
+// to a multiple of 8.
 typedef struct {
   // [`RGFX_CMD_RENDER_PIPELINE_CREATE`].
   RgfxMsgHeader header;
@@ -5909,6 +5937,26 @@ typedef struct {
   // The number of [`RgfxLinkedFunction`] the fragment stage links.
   uint32_t fragment_linked_count;
 } RgfxRenderPipelineCreate;
+
+// A render pipeline descriptor's private state (Apple SPI), as Apple's OpenGL renderer sets it,
+// after an [`RgfxRenderPipelineCreate`]'s head where its `flags` carry
+// [`RGFX_RENDER_PIPELINE_PRIVATE_STATE`]: each field the guest's descriptor's value. Measured on
+// the Intel 630 (macOS 26.7.1): every pipeline of the renderer sets `openGLModeEnabled`, a
+// `sampleMask` of `0xffffffff` (or the GL sample mask) and a `logicOperation` of copy (2); a GL
+// logic operation sets `logicOperationEnabled` and its operation, GL's sample coverage
+// `sampleCoverage`, and a pipeline that writes no depth or stencil `depthStencilWriteDisabled`.
+typedef struct {
+  // `sampleMask`.
+  uint64_t sample_mask;
+  // `sampleCoverage`, its `f32` bits.
+  uint32_t sample_coverage;
+  // `logicOperation`, the raw value (GL's copy is 2 and its XOR 10, measured).
+  uint32_t logic_operation;
+  // The `RGFX_PRIVATE_RENDER_*` flags.
+  uint32_t flags;
+  // Pads to a multiple of 8; 0.
+  uint32_t reserved_14;
+} RgfxRenderPipelinePrivateState;
 
 // One element of a resource array ([`RgfxOpUseResources`] and the like): a resource
 // (0 = nil) and its [kind](RGFX_RESOURCE_KIND_BUFFER), which says how the host
