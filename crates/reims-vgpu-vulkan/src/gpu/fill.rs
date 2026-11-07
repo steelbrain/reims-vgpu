@@ -33,19 +33,24 @@
 //! - **A colour in a format Metal packs none in** (every format outside [`PACKED`] and
 //!   [`OWN_FORMAT_PACKED`]: Invalid, the depth and stencil formats and the two-plane XR10
 //!   formats, 550 and 551, [`LEFTOVER_FORMATS`]; the compressed, 4:2:2, YCbCr and padded ones)
-//!   writes no byte of the colour, but bytes Metal holds from earlier work (measured): after an
-//!   RGBA32Uint fill of (7, 9, 3, 1) into one texture, a fill of any colour in one of these
-//!   formats later in the encoder, or in a later encoder of the command buffer, writes `07 00 00
-//!   00 09 00 00 00 03 00 00 00 01 00 00 00` into another texture's RGBA32Uint texel, cut at a
-//!   narrower one; with no colour packed before it in the command buffer, bytes no colour gave
-//!   (not a colour an earlier command buffer packed), which differ between texture formats and
-//!   between runs (a 550 colour into a 550 texture, paged out by core's XR10 kernel: plane 0 `77
-//!   d7 44 c7` in one process and `00 00 00 c0` in another, whatever the colour, NaN included;
-//!   `metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes`). The runtime's colour
-//!   fill holds the command buffer's last packed texel over zeros and fills those bytes, Metal's
-//!   in every case measured (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`, each of
-//!   these formats); where Metal's are other bytes of its own, it announces `UnpackedFillColor`,
-//!   one of Metal's answers, relayed.
+//!   writes no byte of the colour, but the 16 bytes of the calling thread's stack where Metal's
+//!   packing writes a colour in a format it packs, which hold what the last call to use them
+//!   left (measured on the M3 Max, macOS 27.0.1,
+//!   `metal_fills_a_colour_it_packs_none_in_with_its_stacks_bytes`): a fill sent right after an
+//!   RGBA32Uint fill of (7, 9, 3, 1) into another texture, with no call between the two, writes
+//!   `07 00 00 00 09 00 00 00 03 00 00 00 01 00 00 00` into an RGBA32Uint texel, cut at a
+//!   narrower one, and one sent right after a call that set the stack below to one byte writes
+//!   that byte. A call between them leaves its own bytes: an encoder's end and the next
+//!   encoder's start leave other bytes, and objc2's check of the method before each send in a
+//!   dev build, which the Metal platform's sends make, leaves the encoder's class and the
+//!   selector, as pointers (measured: `80 ef 0b 82 02 00 00 00 42 a2 3d fe 01 00 00 00`),
+//!   whatever came before. On the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 (macOS
+//!   26.7.1) every colour fill raises `NSInvalidArgumentException`: Metal's colour fill sends
+//!   `fillTexture:level:slice:region:bytes:length:`, which their encoders do not implement. The
+//!   runtime's colour fill holds the command buffer's last packed texel over zeros and fills
+//!   those bytes, Metal's for a fill sent right after another
+//!   (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`, each of these formats), and
+//!   announces `UnpackedFillColor`, one of Metal's answers, relayed.
 //! - **Where** ([`place`]): a level past the texture's writes nothing; the region is cut at the
 //!   level's extent. A 3D texture takes the region's depth and ignores the slice; every other
 //!   type ignores the region's `z` and depth. A 1D or 2D texture ignores the slice; an array
@@ -93,8 +98,8 @@ pub const MOST_PATTERN_BYTES: usize = 16;
 /// buffers): a longer pattern ends Metal's process in the call ([`streamed_pattern`]).
 pub const MOST_STREAMED_PATTERN_BYTES: usize = 32752;
 
-/// The formats Metal packs no colour in, for which a colour fill writes bytes Metal holds from
-/// earlier work (the module's docs).
+/// The formats Metal packs no colour in, for which a colour fill writes bytes of the calling
+/// thread's stack (the module's docs).
 pub const LEFTOVER_FORMATS: [PixelFormat; 10] = [
     PixelFormat::Invalid,
     PixelFormat::Depth16Unorm,
@@ -206,8 +211,8 @@ pub const RGBX: [PixelFormat; 11] = [
 ];
 
 /// The pixel format `raw` a colour fill for `sel` packs its colour in: any format, one of
-/// [`PACKED`] or [`OWN_FORMAT_PACKED`] packing it and any other taking the bytes an earlier
-/// colour fill left (the module's docs). A value no format is dies.
+/// [`PACKED`] or [`OWN_FORMAT_PACKED`] packing it and any other taking the bytes of the calling
+/// thread's stack on Metal (the module's docs). A value no format is dies.
 pub fn colour_format(sel: &'static str, raw: u64) -> PixelFormat {
     let format = u32::try_from(raw)
         .ok()

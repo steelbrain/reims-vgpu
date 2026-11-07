@@ -1,5 +1,7 @@
 //! The tests of `fill` that compare with Metal on this host: macOS only.
 
+use std::ffi::{c_char, c_void};
+
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
@@ -410,85 +412,147 @@ fn assert_metals(formats: &[u64], colors: &[ClearColor]) {
     );
 }
 
-/// What Metal writes for a colour in a format it packs none in, on this host: never the
-/// colour's bytes, but those the fill before it packed, into another texture, whatever the
-/// colour; this platform's colour fill writes the same
-/// (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`)
-#[test]
-fn metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes() {
-    let Some(d) = MetalPlatform::system_default_device() else {
-        return;
+/// `MTLRegion` as `objc_msgSend` takes it: the origin, then the size.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Region {
+    x: u64,
+    y: u64,
+    z: u64,
+    width: u64,
+    height: u64,
+    depth: u64,
+}
+
+/// `MTLClearColor` as `objc_msgSend` takes it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Colour {
+    red: f64,
+    green: f64,
+    blue: f64,
+    alpha: f64,
+}
+
+/// `fillTexture:level:slice:region:color:pixelFormat:` as `objc_msgSend` takes it: the encoder,
+/// the selector, the texture, the level, the slice, the region, the colour and the pixel format.
+type FillColour = unsafe extern "C" fn(
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    u64,
+    u64,
+    Region,
+    Colour,
+    u64,
+);
+
+// libobjc's, which the Metal platform links.
+unsafe extern "C" {
+    fn objc_msgSend();
+    fn sel_registerName(name: *const c_char) -> *const c_void;
+}
+
+/// The Objective-C object `o` is, as `objc_msgSend` takes it.
+fn object<T>(o: &T) -> *const c_void {
+    std::ptr::from_ref(o).cast()
+}
+
+/// Sets the 256 KiB of the stack below the caller's frame to `byte`.
+#[inline(never)]
+fn set_stack(byte: u8) {
+    let mut bytes = [byte; 256 * 1024];
+    std::hint::black_box(&mut bytes);
+}
+
+/// What Metal fills for a colour (0.25, 0.5, 0.75, 1) in `leftover`, a format it packs no colour
+/// in, into each texel of a `Private` texture of `format` `width` texels wide, sent right after a
+/// fill of (`red`, 9, 3, 1) packed in RGBA32Uint into another texture, in the same encoder, with no
+/// call between the two but, with `stack`, one that sets the stack below to that byte
+/// ([`set_stack`]): the texture's bytes, read back by a blit. Both fills are sent by
+/// `objc_msgSend` itself, not by the Metal platform, whose sends in a dev build first run objc2's
+/// check of the method, which leaves its own values in the bytes Metal fills (the module's docs).
+fn metals_leftover(
+    d: &<MetalPlatform as Platform>::Device,
+    leftover: u64,
+    (format, bytes, width): (u64, u64, u64),
+    red: u8,
+    stack: Option<u8>,
+) -> Vec<u8> {
+    let texture = |format, width| {
+        let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&TextureDesc {
+            pixel_format: format,
+            width,
+            height: 1,
+            usage: 3,
+            resource_options: Some(0x20),
+            ..TextureDesc::default()
+        });
+        d.new_texture(OnFault::Return, &desc).unwrap().unwrap()
     };
-    let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&TextureDesc {
-        pixel_format: 123,
-        width: 1,
-        height: 1,
-        usage: 3,
-        resource_options: Some(0x20),
-        ..TextureDesc::default()
-    });
-    let texture = || d.new_texture(OnFault::Return, &desc).unwrap().unwrap();
-    let (earlier_texture, t) = (texture(), texture());
+    let (earlier, t) = (texture(123, 1), texture(format, width));
+    let row = bytes * width;
     let out = d
-        .new_buffer_of_length(OnFault::Return, 16, 0)
+        .new_buffer_of_length(OnFault::Return, row, 0)
         .unwrap()
         .unwrap();
     let q = d.new_command_queue().unwrap();
-    let one = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(1, 1, 1));
-    let asked = ClearColor {
+    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+    let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+    // SAFETY: a NUL-terminated selector name.
+    let sel =
+        unsafe { sel_registerName(c"fillTexture:level:slice:region:color:pixelFormat:".as_ptr()) };
+    // SAFETY: `objc_msgSend` takes the arguments of the method it sends, which `FillColour` gives.
+    let send = unsafe { std::mem::transmute::<unsafe extern "C" fn(), FillColour>(objc_msgSend) };
+    let (encoder, earlier_texture, texture) =
+        (object(e.get()), object(earlier.get()), object(t.get()));
+    let region = |width| Region {
+        x: 0,
+        y: 0,
+        z: 0,
+        width,
+        height: 1,
+        depth: 1,
+    };
+    let (one, row_region) = (region(1), region(width));
+    let first = Colour {
+        red: f64::from(red),
+        green: 9.0,
+        blue: 3.0,
+        alpha: 1.0,
+    };
+    let asked = Colour {
         red: 0.25,
         green: 0.5,
         blue: 0.75,
         alpha: 1.0,
     };
-    for (red, format) in (7u8..).zip(LEFTOVER_FORMATS) {
-        let earlier = ClearColor {
-            red: f64::from(red),
-            green: 9.0,
-            blue: 3.0,
-            alpha: 1.0,
-        };
-        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-        let fills = [
-            (&earlier_texture, earlier, 123),
-            (&t, asked, u64::from(format.as_raw())),
-        ];
-        for (texture, color, pixel_format) in fills {
-            let fill = BlitCmd::<MetalPlatform>::FillTextureColor {
-                texture,
-                level: 0,
-                slice: 0,
-                region: one,
-                color,
-                pixel_format,
-            };
-            e.encode(OnFault::Return, fill).unwrap();
-        }
-        let down = BlitCmd::<MetalPlatform>::CopyTextureToBufferOptions {
-            source_texture: Some(&t),
-            source_slice: 0,
-            source_level: 0,
-            source_origin: MtlOrigin::new(0, 0, 0),
-            source_size: MtlSize::new(1, 1, 1),
-            destination_buffer: Some(&out),
-            destination_offset: 0,
-            destination_bytes_per_row: 16,
-            destination_bytes_per_image: 16,
-            options: 0,
-        };
-        e.encode(OnFault::Return, down).unwrap();
-        e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
-        cb.commit(OnFault::Return).unwrap();
-        cb.wait_until_completed(OnFault::Return).unwrap();
-        // SAFETY: a live Shared buffer of 16 bytes, read after the GPU's writes.
-        let metal = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), 16) };
-        assert_eq!(
-            metal,
-            [red, 0, 0, 0, 9, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0],
-            "{format:?}"
-        );
+    // SAFETY: a live encoder and texture, and the method's arguments.
+    unsafe { send(encoder, sel, earlier_texture, 0, 0, one, first, 123) };
+    if let Some(byte) = stack {
+        set_stack(byte);
     }
+    // SAFETY: as above.
+    unsafe { send(encoder, sel, texture, 0, 0, row_region, asked, leftover) };
+    let down = BlitCmd::<MetalPlatform>::CopyTextureToBufferOptions {
+        source_texture: Some(&t),
+        source_slice: 0,
+        source_level: 0,
+        source_origin: MtlOrigin::new(0, 0, 0),
+        source_size: MtlSize::new(width, 1, 1),
+        destination_buffer: Some(&out),
+        destination_offset: 0,
+        destination_bytes_per_row: row,
+        destination_bytes_per_image: row,
+        options: 0,
+    };
+    e.encode(OnFault::Return, down).unwrap();
+    e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+    cb.commit(OnFault::Return).unwrap();
+    cb.wait_until_completed(OnFault::Return).unwrap();
+    let n = usize::try_from(row).unwrap();
+    // SAFETY: a live Shared buffer of `n` bytes, read after the GPU's writes.
+    unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
 }
 
 /// Formats outside [`LEFTOVER_FORMATS`] Metal packs no fill's colour in either: compressed (BC1,
@@ -497,6 +561,33 @@ fn metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes() {
 const UNPACKED_FORMATS: [u64; 19] = [
     130, 140, 150, 152, 160, 170, 180, 186, 204, 222, 240, 241, 500, 505, 508, 576, 577, 578, 579,
 ];
+
+/// What Metal writes for a colour in a format it packs none in, on this host: never the colour's
+/// bytes, but those of the calling thread's stack where its packing writes a colour in a format
+/// it packs ([`metals_leftover`]): sent right after a fill packed in RGBA32Uint, that fill's bytes,
+/// whatever the colour; sent right after the stack below was set to one byte, that byte. Each of
+/// [`LEFTOVER_FORMATS`] and of [`UNPACKED_FORMATS`]. This platform's colour fill writes the first
+/// (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`)
+#[test]
+fn metal_fills_a_colour_it_packs_none_in_with_its_stacks_bytes() {
+    let Some(d) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let leftover = LEFTOVER_FORMATS.iter().map(|f| u64::from(f.as_raw()));
+    for (red, format) in (7u8..).zip(leftover.chain(UNPACKED_FORMATS)) {
+        assert_eq!(
+            metals_leftover(&d, format, (123, 16, 1), red, None),
+            [red, 0, 0, 0, 9, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0],
+            "{format}"
+        );
+        let byte = 0xa0 | (red & 0x0f);
+        assert_eq!(
+            metals_leftover(&d, format, (123, 16, 1), red, Some(byte)),
+            [byte; 16],
+            "{format}"
+        );
+    }
+}
 
 /// What a colour fill in `leftover`, a format Metal packs no colour in, of each texel of a
 /// `Private` texture of `format` `width` texels wide writes on platform `P`, after a fill of
@@ -588,16 +679,15 @@ fn leftover_on<P: Platform>(
     unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
 }
 
-/// A colour fill in a format Metal packs no colour in writes what Metal's does after a colour
-/// fill packed in RGBA32Uint earlier in the command buffer, in the same encoder or an earlier
-/// one ([`leftover_on`]): that fill's 16 bytes, repeated or cut at the texel, into an RGBA32Uint
-/// texel, 4 RGBA8Unorm ones and 4 R8Unorm ones, whatever the colour. The formats: each of
-/// [`LEFTOVER_FORMATS`] and of [`UNPACKED_FORMATS`]. Measured on the M3 Max (macOS
-/// 27.0.1), the same for every one of them and two colours: `07 00 00 00 09 00 00 00 03 00 00
-/// 00 01 00 00 00`, `07 00 00 00` each and `07` each. After a colour packed in a format of
-/// fewer bytes, only that many are the colour's; after a bytes fill alone, or a colour fill in
-/// an earlier command buffer, none of the bytes is a fill's. The runtime's colour fill writes
-/// those bytes, holding the command buffer's last packed texel
+/// A colour fill in a format Metal packs no colour in writes what Metal's does when sent right
+/// after a colour fill packed in RGBA32Uint ([`metals_leftover`]): that fill's 16 bytes, repeated
+/// or cut at the texel, into an RGBA32Uint texel, 4 RGBA8Unorm ones and 4 R8Unorm ones, whatever
+/// the colour, after that fill in the same encoder or in an earlier encoder of the command buffer
+/// ([`leftover_on`]). The runtime holds the command buffer's last packed texel; Metal's bytes
+/// after an encoder's end are those its own calls left on the stack (the module's docs). The
+/// formats: each of [`LEFTOVER_FORMATS`] and of [`UNPACKED_FORMATS`]. Measured on the M3 Max
+/// (macOS 27.0.1), the same for every one of them: `07 00 00 00 09 00 00 00 03 00 00 00 01 00 00
+/// 00`, `07 00 00 00` each and `07` each
 #[test]
 fn leftover_colours_fill_an_earlier_colours_bytes_as_metals() {
     let Some(metal) = MetalPlatform::system_default_device() else {
@@ -605,21 +695,14 @@ fn leftover_colours_fill_an_earlier_colours_bytes_as_metals() {
     };
     let d = crate::gpu::device::tests::dev();
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let mut differ = Vec::new();
     let leftover = LEFTOVER_FORMATS.iter().map(|f| u64::from(f.as_raw()));
     for leftover in leftover.chain(UNPACKED_FORMATS) {
         for texture in [(123, 16, 1), (70, 4, 4), (10, 1, 4)] {
+            let theirs = metals_leftover(&metal, leftover, texture, 7, None);
             for earlier_encoder in [false, true] {
                 let what = format!(
                     "a colour in {leftover} into {texture:?}, earlier encoder {earlier_encoder}"
-                );
-                let theirs = leftover_on::<MetalPlatform>(
-                    &metal,
-                    &metal_desc,
-                    leftover,
-                    texture,
-                    earlier_encoder,
                 );
                 let ours = catch_death(|| {
                     leftover_on::<VulkanPlatform>(
