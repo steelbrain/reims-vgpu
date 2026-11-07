@@ -6,9 +6,9 @@
 //                         reading a function constant; makes `scaled` with the constant set (2.0)
 //                         under the specialized name `scaled_k2`, by a descriptor, and `bias` with
 //                         constant values by name (5.0), and `add1` plain; stitches
-//                         `fused(x) = add1(bias(scaled_k2(x)))`; links `fused` into a kernel through
-//                         a visible function table, runs it over 64 elements and checks each
-//                         result, 2 * i + 5 + 1. Prints each step's object or error. Exits 0 when
+//                         `fused(x) = add1(bias(scaled_k2(x)))`; links `fused` into a kernel that
+//                         calls it by its declaration (MTLLinkedFunctions, as MPS links its uber
+//                         shaders), runs it over 64 elements and checks each result, 2 * i + 5 + 1. Prints each step's object or error. Exits 0 when
 //                         every step made its object and every result matched.
 //   stitch_probe --metal  the same steps, with no run, on Metal's own classes: the functions made
 //                         by the library's shadow (Metal's own library over the same bytes, which
@@ -32,10 +32,10 @@ static NSString *const kSource = @"#include <metal_stdlib>\n"
                                   "[[stitchable]] float scaled(float x) { return x * k; }\n"
                                   "[[stitchable]] float bias(float x) { return x + b; }\n"
                                   "[[stitchable]] float add1(float x) { return x + 1.0f; }\n"
+                                  "[[visible]] float fused(float x);\n"
                                   "kernel void run(device float *out [[buffer(0)]],\n"
-                                  "                visible_function_table<float(float)> t [[buffer(1)]],\n"
                                   "                uint i [[thread_position_in_grid]]) {\n"
-                                  "  out[i] = t[0](float(i));\n"
+                                  "  out[i] = fused(float(i));\n"
                                   "}\n";
 
 static int g_failed = 0;
@@ -137,11 +137,6 @@ int main(int argc, char **argv)
 		step("pipeline", pso, error);
 		if (pso == nil)
 			return 1;
-		MTLVisibleFunctionTableDescriptor *td = [MTLVisibleFunctionTableDescriptor new];
-		td.functionCount = 1;
-		id<MTLVisibleFunctionTable> table = [pso newVisibleFunctionTableWithDescriptor:td];
-		[table setFunction:[pso functionHandleWithFunction:fused] atIndex:0];
-		step("table", table, nil);
 		enum { kCount = 64 };
 		id<MTLBuffer> out = [device newBufferWithLength:kCount * sizeof(float)
 		                                        options:MTLResourceStorageModeShared];
@@ -150,7 +145,6 @@ int main(int argc, char **argv)
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 		[enc setComputePipelineState:pso];
 		[enc setBuffer:out offset:0 atIndex:0];
-		[enc setVisibleFunctionTable:table atBufferIndex:1];
 		[enc dispatchThreads:MTLSizeMake(kCount, 1, 1) threadsPerThreadgroup:MTLSizeMake(kCount, 1, 1)];
 		[enc endEncoding];
 		[cb commit];
