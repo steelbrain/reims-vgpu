@@ -9,7 +9,7 @@
 use crate::install::Install;
 use crate::paths;
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The branches an update can follow.
@@ -172,9 +172,65 @@ fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
     (o.status.success() && !out.is_empty()).then_some(out)
 }
 
+/// The binary to run after an update, from the path this process was started from
+/// (`std::env::current_exe`). The update installs the new reims-ctl over that path (cargo install
+/// --force writes it anew), so it names the new binary. On Linux the path is read from
+/// /proc/self/exe, which names a file replaced since as "PATH (deleted)": PATH is the new one.
+pub fn restart_path(exe: PathBuf) -> PathBuf {
+    if exe.exists() {
+        return exe;
+    }
+    match exe.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        Some(p) => PathBuf::from(p),
+        None => exe,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binary replaced since this process started is run from its path again, which holds the
+    /// new one; a path that is there, or names no replaced file, is run as it is.
+    #[test]
+    fn a_restart_runs_the_binary_the_update_installed_at_the_same_path() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let bin = d.join("reims-ctl");
+        std::fs::write(&bin, "new").unwrap();
+        assert_eq!(restart_path(d.join("reims-ctl (deleted)")), bin);
+        assert_eq!(restart_path(bin.clone()), bin);
+        // A file of that name is the one to run.
+        let named = d.join("odd (deleted)");
+        std::fs::write(&named, "").unwrap();
+        assert_eq!(restart_path(named.clone()), named);
+        assert_eq!(restart_path(d.join("gone")), d.join("gone"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// What /proc/self/exe names for a running binary replaced as an update replaces it: the
+    /// path with " (deleted)", which [`restart_path`] maps back to the path, now the new binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_names_a_replaced_running_binary_deleted() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-replaced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let bin = d.join("sleeper");
+        std::fs::copy("/bin/sleep", &bin).unwrap();
+        let mut child = Command::new(&bin).arg("30").spawn().unwrap();
+        // cargo install --force: the new binary written beside, then renamed over the old.
+        let new = d.join("sleeper.new");
+        std::fs::copy("/bin/sleep", &new).unwrap();
+        std::fs::rename(&new, &bin).unwrap();
+        let named = std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(named, d.join("sleeper (deleted)"));
+        assert_eq!(restart_path(named), bin);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn run(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")

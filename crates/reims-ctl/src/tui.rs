@@ -70,7 +70,7 @@ fn run_update(channel: Option<Channel>) -> Result<()> {
     update::update(channel)?;
     println!("\nUpdated. Starting the new reims-ctl…");
     use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe()?;
+    let exe = update::restart_path(std::env::current_exe()?);
     let err = std::process::Command::new(&exe).exec();
     Err(err).with_context(|| format!("run {}", exe.display()))
 }
