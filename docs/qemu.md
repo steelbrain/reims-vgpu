@@ -9,10 +9,10 @@ users run them with `reims-ctl`, whose installer,
 platform. This file says how QEMU is built and uses the library, and the
 measured facts QEMU's side and the guests rely on.
 
-arm64 macOS guests, on QEMU's `vmapple` machine, are not built now: their
-display was Apple's paravirtualized GPU, which this tree no longer has.
-They come back with Ambrosia, our own arm64 firmware ("arm64 guests",
-below).
+`make qemu` builds no `qemu-system-aarch64`, and `reims-ctl` makes no arm64
+VMs. QEMU's `vmapple` machine, without the Apple paravirtualized GPU it once
+had, builds again in an `aarch64-softmmu` build, under HVF or TCG, for
+Ambrosia, our own arm64 firmware ("arm64 guests", below).
 
 No test runs QEMU, so a VM boot is the only check of QEMU's side of the
 API ([lessons.md](lessons.md)). Each measurement below names its host and
@@ -91,13 +91,14 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | the input layer's smooth `scroll` events (`qemu_input_queue_scroll`, `qemu_input_scrolls_smoothly`, QMP `input-send-event`); a device without them (`usb-tablet`, which every x86-64 VM has) gets the event's wheel notches | `840feb5ced` |
 | the thread pool keeps at least one thread when a job finished before `thread_pool_submit_immediate` resized it: a backport of upstream's `2566b6e902`, which the merge of upstream master brings too | `850b5a4bb4` |
 | QMP's `x-query-virtio-status` and HMP's `info virtio-status` no longer crash on a virtio device: a patch from upstream's list (Vladimir Sementsov-Ogievskiy) that fixes upstream's `1ee0bc0c9bf0` | `d151bcd9` |
-| `vmapple`, not built now ("arm64 guests", below): patches 1 to 6 of the RFC v7 series "vmapple: make it work on the latest macOS release" (Mohamed Mediouni), and the branch's commits for HVF's ISV=0 data aborts and in-kernel vGIC, the secondary CPUs' pointer authentication keys, macOS 14 and later and macOS 27 guests, the AES engine's refusal without a crypto library, and `usb-vmapple-tablet`, Virtualization.framework's USB pointing device | `e181197cc2`, `663b9b9c0b`, `4a2e2b3967`, `450e03eed2`, `f116a9d560`, `c912618391`, `c2f5832f32`, `674af72fe2`, `da640879f0`, `e0ce93da92`, `d46ebaa252`, `61f7de5fc1`, `fc46f8bf02`, `a24c8eadfa`, `e1c37ea4d4`, `d235e51310`, `fbda9c8b28`, `c7a4f0700f` |
-| apple-gfx, Apple's paravirtualized GPU device on the library, with its windows, its option ROM, its IOSurface device and the VideoToolbox and M2 scaler devices, removed: `vmapple` stays in the tree but is not built, since its display was `apple-gfx-mmio` and its Kconfig depends on `MAC_PVG`, which nothing sets now; the option that finds the library is `reims_vgpu` (`--enable-reims-vgpu`) | `eb36a099` |
+| `vmapple` ("arm64 guests", below): patches 1 to 6 of the RFC v7 series "vmapple: make it work on the latest macOS release" (Mohamed Mediouni), and the branch's commits for HVF's ISV=0 data aborts and in-kernel vGIC, the secondary CPUs' pointer authentication keys, macOS 14 and later and macOS 27 guests, the AES engine's refusal without a crypto library, and `usb-vmapple-tablet`, Virtualization.framework's USB pointing device | `e181197cc2`, `663b9b9c0b`, `4a2e2b3967`, `450e03eed2`, `f116a9d560`, `c912618391`, `c2f5832f32`, `674af72fe2`, `da640879f0`, `e0ce93da92`, `d46ebaa252`, `61f7de5fc1`, `fc46f8bf02`, `a24c8eadfa`, `e1c37ea4d4`, `d235e51310`, `fbda9c8b28`, `c7a4f0700f` |
+| apple-gfx, Apple's paravirtualized GPU device on the library, with its windows, its option ROM, its IOSurface device and the VideoToolbox and M2 scaler devices, removed: `vmapple`, whose display was `apple-gfx-mmio`, stayed in the tree unbuilt until the next row's commits; the option that finds the library is `reims_vgpu` (`--enable-reims-vgpu`) | `eb36a099` |
+| `vmapple` for Ambrosia, built by default in an `aarch64-softmmu` build again: the machine without apple-gfx's display; no kernel-entry hook (the firmware makes macOS's kernel-entry changes, so AVPBooter boots only macOS 12 and 13 guests); RAM at 4 GiB, with the PCIe MMIO window from 0x50000000 below it for 1 GiB BARs (AVPBooter does not boot on this layout); TCG with the `max` CPU and a 24 MHz generic timer; the guest's write to its DMA configuration doorbell at 0x4ffff8 ignored, which panicked a macOS 27.0.1 kernel under TCG; and `virtio-net-pci` without its control queue in the machine's defaults, since one boot in four to six of a macOS 26 or 27 guest missed the completion of its first control command and never started DHCP | `15989559`, `cd2ecf44`, `bd408aea`, `a52f4a20`, `58a6f887`, `c7909d60` |
 
 The branch's other commits are the apple-gfx work `eb36a099` removes, and
 `cbb749d421`, an HVF workaround that `481e881b5c` reverts, upstream having
 fixed the same assertion. `docs/system/arm/vmapple.rst` describes the
-machine as it last ran here, and says it is not built.
+machine and how to run it on Ambrosia.
 
 ## The reims-graphics device
 
@@ -823,10 +824,10 @@ that what it shows is the change's:
 
 arm64 macOS guests ran on QEMU's `vmapple` machine on an Apple silicon Mac,
 and the machine's display was Apple's paravirtualized GPU. That device is
-gone from the library and from QEMU, so `vmapple` is not built now:
-`make qemu` builds no `qemu-system-aarch64`, and `reims-ctl` makes no arm64
-VMs. The machine's sources stay in `vendor/qemu` with the branch's commits
-for it ("What vendor/qemu carries", above), whose messages say what each
-one changes and why. arm64 guests come back with
-Ambrosia, our own arm64 firmware, which brings `vmapple` back without
-Apple's device.
+gone from the library and from QEMU: `make qemu` builds no
+`qemu-system-aarch64`, and `reims-ctl` makes no arm64 VMs. `vmapple` builds
+again, without the device, in an `aarch64-softmmu` build, and runs under HVF
+or TCG on Ambrosia, our own arm64 firmware, which enters macOS's kernel
+itself. Virtualization.framework's firmware, AVPBooter, does not boot on the
+machine's layout now. The branch's commits for it ("What vendor/qemu
+carries", above) say what each one changes and why.
