@@ -24,6 +24,7 @@
 #include "RgfxCaps.hpp"
 #include <utility>
 #include "RgfxEncoder.hpp"
+#include "RgfxFeatureProfile.hpp"
 #include "RgfxHeapRanges.hpp"
 #include "RgfxLibraryKey.hpp"
 #include "RgfxMemoryShadow.hpp"
@@ -428,6 +429,19 @@ void test_caps_features()
 	CHECK(caps.features() == word && caps.kextFeatures() == 1ull << 4);
 	caps.takeFeatures(KERN_SUCCESS, 0, 0);
 	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
+}
+
+// The feature profile the device answers: the host's where the guest's Metal has the
+// MTLArchitecture class (macOS 13 and later), else 10001, the x86 Macs' profile that macOS 11 and
+// 12's Metal knows, which has no limits for the M3 Max's 10.
+void test_feature_profile_for_guest()
+{
+	static_assert(rgfx_profile::kX86Mac == 10001);
+	CHECK(rgfx_profile::forGuest(10, true) == 10);       // the M3 Max's, macOS 13 to 26
+	CHECK(rgfx_profile::forGuest(10002, true) == 10002); // an x86 host's Metal device's own
+	CHECK(rgfx_profile::forGuest(10, false) == 10001);   // macOS 11 and 12
+	CHECK(rgfx_profile::forGuest(10002, false) == 10001);
+	CHECK(rgfx_profile::forGuest(0, false) == 10001); // a host that gives none
 }
 
 void test_caps()
@@ -2958,6 +2972,7 @@ int main()
 	test_vendor_names();
 	test_host_resource_options();
 	test_caps_features();
+	test_feature_profile_for_guest();
 	test_archive_file();
 	test_lifecycle_messages();
 	test_creates_with_no_address_post_nothing();

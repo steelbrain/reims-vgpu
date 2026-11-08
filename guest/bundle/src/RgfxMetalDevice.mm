@@ -33,6 +33,7 @@
 
 #include "RgfxCommitOrder.hpp"
 #include "RgfxCompletionThread.hpp"
+#include "RgfxFeatureProfile.hpp"
 #include "RgfxHeapSizes.hpp"
 #include "RgfxKnownPipelines.hpp"
 #include "RgfxRegion.hpp"
@@ -1627,10 +1628,12 @@ RGFX_LOG_UNRECOGNIZED
 // The host's answers, from the device info: its Metal device's own, or, where no Metal device
 // stands for its GPU, the M3 Max's (the Vulkan platform's), and 0 for a Metal device that does
 // not respond to one. Measured on the M3 Max (macOS 27): feature profile 10, FP configs 0xe
-// (half), 0x54 (single) and 0 (double), 40 cores.
+// (half), 0x54 (single) and 0 (double), 40 cores. The feature profile is the host's only where
+// the guest's Metal knows it (RgfxFeatureProfile.hpp).
 - (NSUInteger)featureProfile
 {
-	return _caps.size(kRgfxSizeFeatureProfile);
+	static const bool metalHasArchitecture = objc_getClass("MTLArchitecture") != Nil;
+	return rgfx_profile::forGuest(_caps.size(kRgfxSizeFeatureProfile), metalHasArchitecture);
 }
 
 - (NSUInteger)halfFPConfig
