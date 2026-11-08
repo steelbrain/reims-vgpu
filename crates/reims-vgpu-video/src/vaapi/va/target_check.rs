@@ -623,6 +623,83 @@ mod tests {
         }
     }
 
+    /// The check's streams decode to their samples on the driver's own surfaces, read back by the
+    /// CPU's copy: where they do not, a check's failure is the stream's, not the target's. Prints
+    /// each picture's first wrong sample.
+    #[test]
+    #[ignore = "needs a VA-API GPU: run on the VA-API host"]
+    fn the_checks_streams_decode_to_their_samples_on_the_drivers_own_surfaces() {
+        let display = display();
+        let mut wrong = Vec::new();
+        for (codec, format, name) in KINDS {
+            let (stream, mut decoder) = match codec {
+                TargetCodec::H264 => (
+                    streams::h264(H264_SIZE.0, H264_SIZE.1),
+                    Decoder::H264(H264Decoder::new_annex_b(&display)),
+                ),
+                TargetCodec::Hevc => (
+                    streams::hevc(
+                        HEVC_SIZE.0,
+                        HEVC_SIZE.1,
+                        if format == TargetFormat::P010 { 10 } else { 8 },
+                    ),
+                    Decoder::Hevc(HevcDecoder::new_annex_b(&display)),
+                ),
+            };
+            let (w, h) = (stream.width as usize, stream.height as usize);
+            let bytes = format.bytes_per_sample() as usize;
+            for (n, unit) in stream.units.iter().enumerate() {
+                let frames = match &mut decoder {
+                    Decoder::H264(d) => d.decode(unit, n as u64),
+                    Decoder::Hevc(d) => d.decode(unit, n as u64),
+                };
+                let frames = match frames {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        wrong.push(format!("{name} picture {n}: {e}"));
+                        continue;
+                    }
+                };
+                for frame in frames {
+                    let row = w * bytes;
+                    let mut luma = vec![0u8; row * h];
+                    let mut chroma = vec![0u8; row * h.div_ceil(2)];
+                    let rows = |bytes, rows| PlaneRows {
+                        bytes,
+                        bytes_per_row: row,
+                        rows,
+                        row_bytes: row,
+                    };
+                    (frame.read_back().expect("a read back"))
+                        .copy_into(rows(&mut luma, h), rows(&mut chroma, h.div_ceil(2)))
+                        .expect("a copy");
+                    let mut first = None;
+                    for (plane, data, count) in [(0, &luma, h), (1, &chroma, h.div_ceil(2))] {
+                        for y in 0..count {
+                            let mut expected = vec![0u8; row];
+                            write_samples(&mut expected, plane, y, stream.bit_depth, format);
+                            let got = &data[y * row..(y + 1) * row];
+                            if let Some(x) = (0..row).find(|&x| got[x] != expected[x]) {
+                                first.get_or_insert(format!(
+                                    "{name} picture {n}: plane {plane} row {y} byte {x} is {:#04x}, not {:#04x}",
+                                    got[x], expected[x]
+                                ));
+                            }
+                        }
+                    }
+                    match first {
+                        Some(why) => wrong.push(why),
+                        None => eprintln!("{name} picture {n}: every sample right"),
+                    }
+                }
+            }
+        }
+        for why in &wrong {
+            eprintln!("{why}");
+        }
+        assert!(wrong.is_empty(), "{} pictures wrong", wrong.len());
+    }
+
     /// The check runs to an answer for each codec and format on the GPU: the driver may refuse
     /// any, but each of the check's streams decodes one picture an access unit. Prints the
     /// answers.
