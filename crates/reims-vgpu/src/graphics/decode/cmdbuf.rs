@@ -133,7 +133,7 @@ use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::super::completion::{cb_complete, cb_failed};
+use super::super::completion::{cb_complete, cb_failed, cb_unlanded};
 use super::commit_order::Until;
 use super::lane::{Lane, Turn};
 use super::sequencer::Ticket;
@@ -152,14 +152,17 @@ use super::{
 const ON: OnFault = OnFault::Return;
 
 /// What a command buffer's op stream does with events: the shared events it signals, whose values
-/// go to the guest as the GPU reaches them or once it finishes ([`Signals`]), and the events it
-/// waits for.
+/// go to the guest as the GPU reaches them or once it finishes ([`Signals`]), the events it
+/// waits for, and the decodes of its video encoders, whose sessions' events it waits for too.
 #[derive(Default)]
 struct EventOps {
     /// Each (shared event, value) the buffer signals, in stream order.
     signals: Finisher,
     /// Each (event, value) the buffer waits for, in stream order.
     waits: Vec<(u64, u64)>,
+    /// Whether each of its decodes' pictures landed: the buffer completes failed where one did
+    /// not ([`video::Landed`]).
+    landings: Vec<Arc<video::Landed>>,
 }
 
 /// A buffer's [`Signals`], made at its first signal of a shared event and held for its completion
@@ -1819,7 +1822,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `submitted` and its `scheduled`; then it posts the values the buffer signalled its shared
     /// events to that no notification posted ([`Signals::finish`]), then its completion, which
     /// for a `stand_in` ([`Self::stand_in_for_failed`]) is its failure whatever the stand-in's
-    /// outcome, and lets `drain` (its context's) go.
+    /// outcome, and for a buffer one of whose decodes' pictures did not land is its failure too
+    /// ([`cb_unlanded`]), and lets `drain` (its context's) go.
     fn completed_handler(
         &self,
         cb_obj_id: u64,
@@ -1832,6 +1836,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let sink = self.sinks.completion.clone();
         let context = self.context;
         let signals = events.signals;
+        let landings = events.landings;
         let watched = (!events.waits.is_empty()).then(|| {
             self.shared
                 .waits
@@ -1866,10 +1871,12 @@ impl<P: Platform> GraphicsDecoder<P> {
             // buffer that failed may have signalled them before its fault, and a guest waiting
             // for one would wait for good: each is posted whatever the outcome.
             signals.finish();
+            let (start, end) = info.gpu_times_ns.unwrap_or((0, 0));
             let record = if stand_in {
                 cb_failed(cb_obj_id, seqno)
+            } else if info.error.is_none() && landings.iter().any(|landed| landed.failed()) {
+                cb_unlanded(cb_obj_id, seqno, start, end)
             } else {
-                let (start, end) = info.gpu_times_ns.unwrap_or((0, 0));
                 cb_complete(cb_obj_id, seqno, start, end, info.error.as_ref())
             };
             if let Some(sink) = &sink {
@@ -2079,7 +2086,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(OpenEncoder::Video(session)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "video"));
                     };
-                    match video::decode_op(tag, body, self, session.session(), cb) {
+                    let landings = &mut events.landings;
+                    match video::decode_op(tag, body, self, session.session(), cb, landings) {
                         Ok(true) => {}
                         Ok(false) => return Err(unknown_op(tag)),
                         Err(raise) => contain(raise)?,
@@ -2661,13 +2669,14 @@ mod tests {
         RgfxVideoOpDecodeH265,
     };
     use reims_graphics::wire::{
-        RGFX_CB_OK, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_EVENT_CREATE,
-        RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
-        RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_VIDEO_SESSION_CREATE,
-        RGFX_EVT_CB_COMPLETE, RGFX_SURFACE_NO_WRITERS, RGFX_VIDEO_CODEC_H264,
-        RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxBufferCreate, RgfxCbComplete,
-        RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate, RgfxSharedEventSetValue,
-        RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
+        RGFX_CB_INTERNAL, RGFX_CB_OK, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER,
+        RGFX_CMD_EVENT_CREATE, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
+        RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+        RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_EVT_CB_COMPLETE, RGFX_SURFACE_NO_WRITERS,
+        RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxBufferCreate,
+        RgfxCbComplete, RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate,
+        RgfxSharedEventSetValue, RgfxTextureCreate, RgfxTextureDescriptor,
+        RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
     };
     use reims_vgpu_core::platform::Handle;
     use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
@@ -2681,7 +2690,9 @@ mod tests {
     use zerocopy::IntoBytes;
 
     use super::super::split::SPLIT_AFTER;
-    use super::super::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane, no_raise};
+    use super::super::{
+        Decoded, GraphicsVideo, GraphicsVideoSession, Landed, VideoDecode, VideoPlane, no_raise,
+    };
     use super::*;
 
     /// One op: its header then its body, `len` the whole op.
@@ -3116,6 +3127,8 @@ mod tests {
         pages: Mutex<Vec<SeenPages>>,
         output_rows: Mutex<Vec<u32>>,
         ended_on: Mutex<Vec<Option<String>>>,
+        /// Each decode's picture fails to land, as its session finds once the decode ran.
+        unlanded: std::sync::atomic::AtomicBool,
     }
 
     /// A fake host's video of H.264 and HEVC decode, recording into its [`VideoSeen`]; each of
@@ -3168,7 +3181,7 @@ mod tests {
             self.codec
         }
 
-        fn decode(&self, d: &VideoDecode<'_, FakePlatform>) -> RaiseResult<u64> {
+        fn decode(&self, d: &VideoDecode<'_, FakePlatform>) -> RaiseResult<Decoded> {
             let plane =
                 |p: &VideoPlane<'_, FakePlatform>| [p.offset, p.bytes_per_row, p.width, p.height];
             self.seen.decodes.lock().push((
@@ -3197,7 +3210,14 @@ mod tests {
                 .lock()
                 .push([pages(&d.luma), pages(&d.chroma)]);
             self.seen.output_rows.lock().push(d.output_rows);
-            Ok(self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1)
+            let landed = Arc::new(Landed::default());
+            if self.seen.unlanded.load(Ordering::Relaxed) {
+                landed.fail();
+            }
+            Ok(Decoded {
+                value: self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1,
+                landed: Some(landed),
+            })
         }
     }
 
@@ -3339,6 +3359,83 @@ mod tests {
             .find(|c| c.sel == "encodeWaitForEvent:value:")
             .unwrap();
         assert_eq!(wait.args.get(1), Some(&Arg::U64(1)));
+    }
+
+    /// A decode's command buffer completes as its GPU work did where its picture landed, and
+    /// failed, Metal's internal error with its code and its GPU times, where it did not (its
+    /// planes refused, or a decode the hardware failed once it ran), which the guest's video
+    /// driver answers as a decode error; never as a picture decoded.
+    #[test]
+    fn a_decode_whose_picture_did_not_land_fails_its_command_buffer() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let seen = Arc::new(VideoSeen::default());
+        dec.set_video(Arc::new(FakeVideo(Arc::clone(&seen), p.device())));
+        let captured = Arc::new(Mutex::new(Vec::<RgfxCbComplete>::new()));
+        let sink = Arc::clone(&captured);
+        dec.set_completion_sink(Arc::new(move |record| sink.lock().push(record)));
+        assert_eq!(
+            dec.decode(&device, video_session_create(40).as_bytes())
+                .unwrap(),
+            Ok(())
+        );
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        for t in [
+            surface_plane_texture(7, 0, 10, 32, 64, 16),
+            surface_plane_texture(8, 1, 30, 32 + 64 * 16, 32, 8),
+        ] {
+            assert_eq!(dec.decode(&device, t.as_bytes()).unwrap(), Ok(()));
+        }
+        let decode = RgfxVideoOpDecodeH264 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 16,
+            bitstream_size: 100,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            parameter_sets_size: 0,
+            output_rows: 16,
+        };
+        let pass = RgfxOpVideoPass { session_obj_id: 40 };
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes());
+        ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, decode.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        for (cb_obj_id, unlanded) in [(100, false), (101, true)] {
+            seen.unlanded.store(unlanded, Ordering::Relaxed);
+            let message = command_buffer_message(cb_obj_id, cb_obj_id, &ops);
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+            let committed = p.world().committed();
+            assert_eq!(committed.len(), 1);
+            assert!(p.world().set_gpu_times(committed[0], 7_000, 9_000));
+            p.world().complete_all(CompleteOn::Caller);
+        }
+        let recs: Vec<_> = (captured.lock().iter())
+            .map(|r| {
+                (
+                    r.cb_obj_id,
+                    r.status,
+                    r.error_code,
+                    r.gpu_start_ns,
+                    r.gpu_end_ns,
+                )
+            })
+            .collect();
+        assert_eq!(
+            recs,
+            [
+                (100, RGFX_CB_OK, 0, 7_000, 9_000),
+                (101, RGFX_CB_INTERNAL, 1, 7_000, 9_000)
+            ]
+        );
     }
 
     /// A plane of a buffer over host memory in a block of the region reaches the host's video as

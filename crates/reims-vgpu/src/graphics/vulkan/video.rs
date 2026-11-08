@@ -97,7 +97,7 @@ use reims_vgpu_vulkan::platform::{
 };
 
 use crate::graphics::decode::{
-    GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane, op_fault,
+    Decoded, GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane, op_fault,
 };
 
 /// How long a session's end waits for its last signal to land.
@@ -813,7 +813,9 @@ impl GraphicsVideoSession<VulkanPlatform> for DecodeSession {
         self.state.lock().decoder.codec()
     }
 
-    fn decode(&self, decode: &VideoDecode<'_, VulkanPlatform>) -> RaiseResult<u64> {
+    /// Answers no [`Landed`](crate::graphics::decode::Landed): what fails here faults the decode,
+    /// and a failure of its GPU work after the call is not read.
+    fn decode(&self, decode: &VideoDecode<'_, VulkanPlatform>) -> RaiseResult<Decoded> {
         let mut state = self.state.lock();
         let state = &mut *state;
         let output = output(&self.video, decode)?;
@@ -825,7 +827,10 @@ impl GraphicsVideoSession<VulkanPlatform> for DecodeSession {
         state.signalled += 1;
         let value = state.signalled;
         self.signal(&state.decoder, value)?;
-        Ok(value)
+        Ok(Decoded {
+            value,
+            landed: None,
+        })
     }
 }
 

@@ -60,7 +60,9 @@ use reims_vgpu_core::platform::types::CommandBufferStatus;
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
-use super::decode::{GraphicsVideoSession, PlanePages, VideoDecode, VideoPlane, op_fault};
+use super::decode::{
+    Decoded, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoPlane, op_fault,
+};
 
 /// How long a session's end waits for its last picture to land.
 pub(crate) const TEARDOWN_WAIT: Duration = Duration::from_secs(10);
@@ -515,6 +517,8 @@ struct Job<P: Platform> {
     picture: Option<Box<dyn HostPicture<P>>>,
     output: Output<P>,
     _bitstream: P::Buffer,
+    /// Whether its picture landed, for the command buffer that waits for `value` ([`Landed`]).
+    landed: Arc<Landed>,
 }
 
 /// How a picture landed, which the session counts.
@@ -651,7 +655,7 @@ impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
         self.codec
     }
 
-    fn decode(&self, decode: &VideoDecode<'_, P>) -> RaiseResult<u64> {
+    fn decode(&self, decode: &VideoDecode<'_, P>) -> RaiseResult<Decoded> {
         let output = Output::of(decode)?;
         let au = access_unit(decode)?;
         let mut state = self.state.lock();
@@ -661,18 +665,23 @@ impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
         }
         let picture = state.decoder.decode(au).map_err(decode_fault)?;
         let value = state.value + 1;
+        let landed = Arc::new(Landed::default());
         let job = Job {
             value,
             picture,
             output,
             _bitstream: decode.bitstream.clone_ref(),
+            landed: Arc::clone(&landed),
         };
         let sent = (state.jobs.as_ref()).is_some_and(|jobs| jobs.send(job).is_ok());
         if !sent {
             return Err(decode_fault("the session's landing thread is gone"));
         }
         state.value = value;
-        Ok(value)
+        Ok(Decoded {
+            value,
+            landed: Some(landed),
+        })
     }
 }
 
@@ -732,6 +741,7 @@ fn land_pictures<P: Platform>(
             picture,
             output,
             _bitstream,
+            landed,
         } = job;
         match picture.map(|picture| land(picture, &output, &mut stage)) {
             None => counts.lock().skipped += 1,
@@ -745,6 +755,8 @@ fn land_pictures<P: Platform>(
                 }
             }
             Some(Err(error)) => {
+                // Before the signal: the command buffer waiting for it completes failed.
+                landed.fail();
                 let mut counts = counts.lock();
                 counts.failed += 1;
                 if counts.failed <= FAILURES_LOGGED {

@@ -239,12 +239,14 @@ fn a_decode_hands_its_parameter_sets_then_its_access_unit_in_place() {
     let at = bitstream.contents().addr() + 256;
     assert_eq!(
         s.decode(&decode(&bitstream, &sets, planes(&pages, &pages, 96)))
-            .unwrap(),
+            .unwrap()
+            .value,
         1
     );
     assert_eq!(
         s.decode(&decode(&bitstream, &[], planes(&pages, &pages, 96)))
-            .unwrap(),
+            .unwrap()
+            .value,
         2
     );
     assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
@@ -282,12 +284,14 @@ fn a_picture_lands_in_the_pages_its_rows_alone() {
     );
     assert_eq!(
         s.decode(&decode(&bitstream, &[], planes(&first, &first, 96)))
-            .unwrap(),
+            .unwrap()
+            .value,
         1
     );
     assert_eq!(
         s.decode(&decode(&bitstream, &[], planes(&second, &second, 96)))
-            .unwrap(),
+            .unwrap()
+            .value,
         2
     );
     drop(s);
@@ -313,7 +317,8 @@ fn a_plane_in_a_device_cache_lands_staged_then_copied() {
     let cache = buffer(&p, 16384, PRIVATE);
     assert_eq!(
         s.decode(&decode(&bitstream, &[], planes(&cache, &cache, 128)))
-            .unwrap(),
+            .unwrap()
+            .value,
         1
     );
     assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
@@ -343,7 +348,8 @@ fn a_plane_in_a_device_cache_lands_staged_then_copied() {
     let pages = buffer(&p, 16384, STORAGE_SHARED);
     assert_eq!(
         s.decode(&decode(&bitstream, &[], planes(&pages, &cache, 96)))
-            .unwrap(),
+            .unwrap()
+            .value,
         2
     );
     drop(s);
@@ -398,7 +404,7 @@ fn values_are_signalled_in_decode_order_once_landed() {
     let pages = buffer(&p, 16384, STORAGE_SHARED);
     for value in 1..=3 {
         let d = decode(&bitstream, &[], planes(&pages, &pages, 96));
-        assert_eq!(s.decode(&d).unwrap(), value);
+        assert_eq!(s.decode(&d).unwrap().value, value);
     }
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(event_of(&s).signaled_value(), 0);
@@ -421,11 +427,11 @@ fn a_decode_past_the_decoder_s_spare_pictures_waits_for_the_oldest_to_land() {
     let pages = buffer(&p, 16384, STORAGE_SHARED);
     let d = || decode(&bitstream, &[], planes(&pages, &pages, 96));
     // The first lands behind its gate, and the second waits for the landing thread.
-    assert_eq!(s.decode(&d()).unwrap(), 1);
-    assert_eq!(s.decode(&d()).unwrap(), 2);
+    assert_eq!(s.decode(&d()).unwrap().value, 1);
+    assert_eq!(s.decode(&d()).unwrap().value, 2);
     let (done, decoded) = mpsc::channel();
     std::thread::scope(|scope| {
-        scope.spawn(|| done.send(s.decode(&d()).unwrap()).unwrap());
+        scope.spawn(|| done.send(s.decode(&d()).unwrap().value).unwrap());
         assert!(decoded.recv_timeout(Duration::from_millis(100)).is_err());
         go.send(()).unwrap();
         assert_eq!(decoded.recv_timeout(Duration::from_secs(10)).unwrap(), 3);
@@ -434,7 +440,8 @@ fn a_decode_past_the_decoder_s_spare_pictures_waits_for_the_oldest_to_land() {
 }
 
 /// A picture that fails to land is counted, its output left as it was, and its value signalled
-/// all the same; a refused access unit faults its command buffer and spends no value.
+/// all the same, its decode answering that it did not land, which fails the command buffer that
+/// waits for it; a refused access unit faults its command buffer and spends no value.
 #[test]
 fn a_failed_landing_is_signalled_and_a_refusal_spends_no_value() {
     let p = FakePlatform::new();
@@ -443,13 +450,20 @@ fn a_failed_landing_is_signalled_and_a_refusal_spends_no_value() {
     let bitstream = buffer(&p, 4096, STORAGE_SHARED);
     let pages = buffer(&p, 16384, STORAGE_SHARED);
     let d = || decode(&bitstream, &[], planes(&pages, &pages, 96));
-    assert_eq!(s.decode(&d()).unwrap(), 1);
+    let failed = s.decode(&d()).unwrap();
+    assert_eq!(failed.value, 1);
     assert!(event_of(&s).wait_until_signaled_value(1, 10_000));
     assert!(bytes(&pages).iter().all(|&x| x == UNTOUCHED));
     assert_eq!(s.counts.lock().failed, 1);
+    assert!(
+        failed.landed.as_deref().is_some_and(Landed::failed),
+        "its command buffer completes failed"
+    );
     assert!(s.decode(&d()).is_err());
-    assert_eq!(s.decode(&d()).unwrap(), 2);
+    let next = s.decode(&d()).unwrap();
+    assert_eq!(next.value, 2);
     assert!(event_of(&s).wait_until_signaled_value(2, 10_000));
+    assert!(next.landed.as_deref().is_some_and(|l| !l.failed()));
 }
 
 /// A session's end waits for its last picture to land.
@@ -467,7 +481,8 @@ fn an_end_waits_for_the_last_picture() {
     let pages = buffer(&p, 16384, STORAGE_SHARED);
     assert_eq!(
         s.decode(&decode(&bitstream, &[], planes(&pages, &pages, 96)))
-            .unwrap(),
+            .unwrap()
+            .value,
         1
     );
     let opener = std::thread::Builder::new()

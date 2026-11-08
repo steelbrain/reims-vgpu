@@ -196,7 +196,9 @@ mod waits;
 mod work;
 pub(crate) mod worker;
 
-pub use video::{GraphicsVideo, GraphicsVideoSession, PlanePages, VideoDecode, VideoPlane};
+pub use video::{
+    Decoded, GraphicsVideo, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoPlane,
+};
 
 pub(crate) use cmdbuf::Begun;
 use lane::{Lane, Turn};

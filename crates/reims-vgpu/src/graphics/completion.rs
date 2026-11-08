@@ -14,8 +14,10 @@
 //! `MTLCommandBuffer.h`), with `MTLCommandBufferErrorInternal`'s code.
 //!
 //! The host emits [`cb_complete`] from the decoder's completion sink once a
-//! submitted command buffer's work lands, and [`cb_failed`] when the host could
-//! not carry a command buffer out at all, so a guest blocked on it unblocks.
+//! submitted command buffer's work lands, [`cb_unlanded`] once a buffer whose
+//! video decode's picture did not land completes, and [`cb_failed`] when the
+//! host could not carry a command buffer out at all, so a guest blocked on it
+//! unblocks.
 
 use reims_graphics::wire::{
     RGFX_CB_ACCESS_REVOKED, RGFX_CB_INTERNAL, RGFX_CB_INVALID_RESOURCE, RGFX_CB_OK,
@@ -108,6 +110,26 @@ pub fn cb_complete(
         gpu_end_ns,
         status,
         error_code,
+    }
+}
+
+/// The completion record for the command buffer `cb_obj_id`, finished at submission `seqno` with
+/// the GPU times `gpu_start_ns` and `gpu_end_ns`, one of whose video decodes' pictures did not land
+/// (its planes refused, or a decode the hardware failed once it ran): Metal's internal error,
+/// with its code, as Metal reports a failure that fits none of its codes. The guest's video
+/// driver reads the failed buffer as a decode that failed on the host, and fails its session's
+/// next schedule (docs/graphics-kext/design.md, "A decode the driver cannot complete is a decode
+/// error").
+pub fn cb_unlanded(
+    cb_obj_id: u64,
+    seqno: u64,
+    gpu_start_ns: u64,
+    gpu_end_ns: u64,
+) -> RgfxCbComplete {
+    RgfxCbComplete {
+        gpu_start_ns,
+        gpu_end_ns,
+        ..cb_failed(cb_obj_id, seqno)
     }
 }
 

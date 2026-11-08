@@ -644,7 +644,12 @@ Stages:
       for a picture the driver sent is known only when the picture's status
       is queried: the driver marks its session, and the session's next
       schedule fails, one picture late (`guest/bundle/src/RgfxVideoStatus.hpp`,
-      `queryReport` and `scheduleFails`).
+      `queryReport` and `scheduleFails`). The host reports one as the
+      picture's command buffer failing: an op it cannot carry out faults the
+      buffer, and a picture it took but could not land (its planes refused,
+      or a decode the hardware failed once it ran) still signals the
+      session's event, so the buffer completes, failed with Metal's internal
+      error (`crates/reims-vgpu/src/graphics/decode/video.rs`, `Landed`).
     - **Bitstreams:** AppleGVA asks for one bitstream buffer and writes the
       next access unit into it as soon as a picture is scheduled, without
       waiting for the decode that reads it. The driver copies each access

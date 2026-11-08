@@ -11,10 +11,17 @@
 //! other queues the command buffer runs after (its `SURFACE_ORDER`), on the CPU, as the session's
 //! queue is not the command buffer's ([`super::surface_order`]): a decode whose output another
 //! process still reads lands once the read is done.
+//!
+//! A picture the session fails to land after its decode was taken (its planes refused, or a
+//! decode the hardware failed once it ran) still signals its value, so the buffer completes; the
+//! buffer completes failed, Metal's internal error ([`Landed`]), which the guest's video driver
+//! answers as a decode error: the session's next schedule fails (`kVTVideoDecoderMalfunctionErr`,
+//! docs/graphics-kext/design.md, "A decode the driver cannot complete is a decode error").
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_graphics::ops::video::{
     RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RgfxVideoOpDecodeH264,
@@ -124,9 +131,37 @@ pub trait GraphicsVideoSession<P: Platform>: Send + Sync {
 
     /// Starts the decode of `decode`'s access unit, after the session's earlier work, and answers
     /// the value [`Self::event`] reaches once the output holds the picture, or, for a picture the
-    /// stream's random access skips, once the session's earlier work is done. An `Err` faults the
+    /// stream's random access skips, once the session's earlier work is done, and where the
+    /// picture may still fail to land after it, what it came to ([`Decoded`]). An `Err` faults the
     /// command buffer, and starts nothing.
-    fn decode(&self, decode: &VideoDecode<'_, P>) -> RaiseResult<u64>;
+    fn decode(&self, decode: &VideoDecode<'_, P>) -> RaiseResult<Decoded>;
+}
+
+/// A decode the session took ([`GraphicsVideoSession::decode`]).
+pub struct Decoded {
+    /// The value the session's event reaches once it is done.
+    pub value: u64,
+    /// Whether its picture landed, known once the event reaches `value`; `None` where the session
+    /// lands every picture it takes, or faults the decode.
+    pub landed: Option<Arc<Landed>>,
+}
+
+/// Whether a decode's picture landed: set by its session before it signals the decode's value,
+/// and read by the command buffer waiting for it as it completes, which completes failed, Metal's
+/// internal error, where the picture did not land (the module docs).
+#[derive(Debug, Default)]
+pub struct Landed(AtomicBool);
+
+impl Landed {
+    /// The picture did not land.
+    pub fn fail(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the picture did not land.
+    pub fn failed(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 /// Where a texture over a plane of an IOSurface lies in its buffer, as its
@@ -346,13 +381,15 @@ impl DecodeOp {
 
 /// Decodes one video-encoder op: `tag` its op, `payload` its body (the bytes after its
 /// [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)), on `session`, and has `cb`'s later work
-/// wait for it. `Ok(false)` for a tag the host does not know.
+/// wait for it, and its completion read whether its picture landed, from `landings`. `Ok(false)`
+/// for a tag the host does not know.
 pub(super) fn decode_op<P: Platform>(
     tag: u16,
     payload: &[u8],
     objs: &GraphicsDecoder<P>,
     session: &Arc<dyn GraphicsVideoSession<P>>,
     cb: &P::CommandBuffer,
+    landings: &mut Vec<Arc<Landed>>,
 ) -> RaiseResult<bool> {
     let Some(read) = DecodeOp::read(tag, payload) else {
         return Ok(false);
@@ -452,7 +489,8 @@ pub(super) fn decode_op<P: Platform>(
     // output it would land over among them.
     objs.wait_for_order_on_cpu();
     let done = session.decode(&decode)?;
-    cb.encode_wait(Some(session.event()), done)?;
+    cb.encode_wait(Some(session.event()), done.value)?;
+    landings.extend(done.landed);
     Ok(true)
 }
 
