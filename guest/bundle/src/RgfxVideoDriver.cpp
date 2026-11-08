@@ -842,15 +842,26 @@ void *decodeHevcPicture(const Command *c)
 {
 	Context *context = (Context *)c->context;
 	const uint8_t *P = c->parameters;
-	if (!context || !context->session || !P)
+	if (!context || !context->session || !P) {
+		static std::atomic<bool> said;
+		notSent(said, "its command names no decode session or no picture record");
 		return nullptr;
+	}
 	constexpr size_t kSliceRecord = 0x328;
 	const uint32_t slices = u32At(P, 0x28);
 	const uint8_t *records = (const uint8_t *)u64At(P, 0x30);
 	const uint8_t *bytes;
 	size_t bufferBytes;
-	if (!slices || !records || !hevcBitstreamBuffer(context->driver, u32At(records, 0x8), &bytes, &bufferBytes))
+	if (!slices || !records) {
+		static std::atomic<bool> said;
+		notSent(said, "its picture record holds no slice count (+0x28) or no slice records (+0x30)");
 		return nullptr;
+	}
+	if (!hevcBitstreamBuffer(context->driver, u32At(records, 0x8), &bytes, &bufferBytes)) {
+		static std::atomic<bool> said;
+		notSent(said, "its first slice record names (+0x8) no bitstream buffer of the driver's");
+		return nullptr;
+	}
 	uint64_t first = UINT64_MAX, end = 0;
 	for (uint32_t i = 0; i < slices; i++) {
 		const uint8_t *r = records + i * kSliceRecord;
@@ -858,8 +869,11 @@ void *decodeHevcPicture(const Command *c)
 		first = offset < first ? offset : first;
 		end = offset + size > end ? offset + size : end;
 	}
-	if (end > bufferBytes || first >= end)
+	if (end > bufferBytes || first >= end) {
+		static std::atomic<bool> said;
+		notSent(said, "its slice segments are empty or run past their bitstream buffer");
 		return nullptr;
+	}
 	std::vector<uint8_t> sets;
 	const auto *sps = (const rgfx::video::h265::Sps *)u64At(P, 0x18);
 	const auto *pps = (const rgfx::video::h265::Pps *)u64At(P, 0x20);
@@ -935,26 +949,43 @@ void *decodeH264Picture(const Command *c)
 {
 	Context *context = (Context *)c->context;
 	const uint8_t *P = c->parameters;
-	if (!context || !context->session || !P || !c->output)
+	if (!context || !context->session || !P || !c->output) {
+		static std::atomic<bool> said;
+		notSent(said, "its command names no decode session, no picture record or no output");
 		return nullptr;
+	}
 	// The access unit: the slices, which lie one after another in one bitstream buffer.
 	const uint8_t *bytes;
 	size_t bufferBytes;
 	const uint32_t pool = u32At(P, 0x270), index = u32At(P, 0x274), slices = u32At(P, 0x278);
 	const uint8_t *entries = (const uint8_t *)u64At(P, 0x290);
-	if (!slices || !entries || !bitstreamBuffer(context->driver, pool, index, &bytes, &bufferBytes))
+	if (!slices || !entries) {
+		static std::atomic<bool> said;
+		notSent(said, "its picture record holds no slice count (+0x278) or no slice entries (+0x290)");
 		return nullptr;
+	}
+	if (!bitstreamBuffer(context->driver, pool, index, &bytes, &bufferBytes)) {
+		static std::atomic<bool> said;
+		notSent(said, "its picture record names (+0x270, +0x274) no bitstream buffer of the driver's");
+		return nullptr;
+	}
 	uint64_t first = UINT64_MAX, end = 0;
 	for (uint32_t i = 0; i < slices; i++) {
 		const uint8_t *e = (const uint8_t *)u64At(entries, i * 8);
-		if (!e)
+		if (!e) {
+			static std::atomic<bool> said;
+			notSent(said, "one of its slice entries is null");
 			return nullptr;
+		}
 		const uint64_t size = u32At(e, 0), offset = u32At(e, 4);
 		first = offset < first ? offset : first;
 		end = offset + size > end ? offset + size : end;
 	}
-	if (end > bufferBytes)
+	if (end > bufferBytes) {
+		static std::atomic<bool> said;
+		notSent(said, "its slices run past their bitstream buffer");
 		return nullptr;
+	}
 	// The parameter sets, sent where they differ from the last ones.
 	std::vector<uint8_t> sets;
 	const auto *sps = (const rgfx::video::h264::Sps *)u64At(P, 0x260);
