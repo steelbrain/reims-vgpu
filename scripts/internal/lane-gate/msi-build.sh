@@ -2,6 +2,8 @@
 # The lane gate's host build, run on the Linux lane host (lane-gate.sh sends it with the
 # candidate's tree). Builds, outside any GPU lock:
 #   - the library's Vulkan dist (cargo xtask dist, into $TARGET/dist-vulkan),
+#   - the video crate's nvidia-probe, which a boot asks an NVIDIA GPU's decoders with
+#     (msi-boot.sh's host-video.tsv),
 #   - the option ROMs (firmware/build/ReimsGraphics.rom among them),
 #   - QEMU's qemu-system-x86_64 for the tree's vendor/qemu commit, out of tree, linked against
 #     that dist.
@@ -16,7 +18,8 @@
 #     SUBPROJECTS  a QEMU tree's subprojects/ whose downloaded wraps (softfloat, testfloat,
 #                  keycodemapdb) are copied into the source where it lacks them, so configure
 #                  downloads nothing
-# Prints the paths it built ("BUILT qemu PATH", "BUILT rom PATH") and "MSI_BUILD_OK".
+# Prints the paths it built ("BUILT qemu PATH", "BUILT rom PATH", "BUILT probe PATH") and
+# "MSI_BUILD_OK".
 set -euo pipefail
 GATE=$1 TREE=$2 STAGE=$3 QC=$4 SUB=$5
 export CARGO_TARGET_DIR=$GATE/target
@@ -31,6 +34,8 @@ cd "$TREE"
 t0=$(date +%s)
 cargo xtask dist
 echo "dist built in $(( $(date +%s) - t0 )) s"
+cargo build --quiet --release -p reims-vgpu-video --example nvidia-probe
+echo "BUILT probe $CARGO_TARGET_DIR/release/examples/nvidia-probe"
 make -C firmware > /dev/null
 echo "BUILT rom $TREE/firmware/build/ReimsGraphics.rom $(sha256sum < firmware/build/ReimsGraphics.rom | cut -c1-16)"
 

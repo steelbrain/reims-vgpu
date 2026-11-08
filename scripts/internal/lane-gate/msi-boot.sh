@@ -34,7 +34,7 @@
 #                 core_throttle_ms_during); the memory compaction counters at the start and end and
 #                 their growth (compact_stall_, compact_fail_, compact_success_start, _end and
 #                 _during, /proc/vmstat), and the free memory at the end (memfree_end_mib, ...)
-#   host-video.tsv  the host GPUs' hardware decode profiles, as Vulkan Video lists them
+#   host-video.tsv  the host GPUs' hardware decode profiles, as each GPU's video API lists them
 #   kernel-rgfx.log, kring.raw, kring-clock.txt   the kext's lines from the guest kernel's ring
 #                 (it logs to no log stream), the guest's boot time and clock against the host's;
 #                 kext-stalls.txt its texture-create stalls on the host's clock (below)
@@ -254,17 +254,42 @@ if [[ -n ${LOAD:-} ]]; then
     cc -O2 -Wall -Wextra -Werror -I"$R" "$(dirname "$0")/gpuload.c" -lvulkan -o gpuload ) \
     >> "$R/boot.log" 2>&1 || { log "BOOT_FAIL missing gpuload (its build failed)"; exit 2; }
 fi
-# The host GPUs' hardware decoders, as Vulkan Video lists each GPU's decode profiles (a query: no
-# GPU work): "GPU-NAME<TAB>gpu<TAB>-" for each GPU, then "GPU-NAME<TAB>CODEC<TAB>PROFILE" for each
-# profile it decodes, h264 or hevc, the profile as the Std headers name it (MAIN, MAIN_10, HIGH).
-# No file where vulkaninfo cannot answer.
-timeout 30 vulkaninfo --show-video-props 2> /dev/null | awk -F' = ' '
+# The host GPUs' hardware decoders, as each GPU's own video API lists them (queries: no GPU
+# work): "GPU-NAME<TAB>gpu<TAB>-" for each GPU, then "GPU-NAME<TAB>CODEC<TAB>PROFILE" for each
+# profile it decodes, h264 or hevc, the profile as VA-API names it without its codec (HIGH, MAIN,
+# MAIN10). A GPU's name is vulkaninfo's deviceName, which the guest's Metal device carries, found by
+# its PCI address. Its decoders are vainfo's VLD profiles on its render node, or, on an NVIDIA GPU,
+# NVDEC's, as the crate's nvidia-probe beside QEMU answers them (msi-build.sh builds it): 8-bit
+# 4:2:0 H.264 as Baseline, Main and High, and HEVC as Main at 8 bits and Main 10 at 10, the
+# profiles the reims-graphics device's NVDEC arm offers for them. No file where vulkaninfo
+# cannot answer.
+probe=$(dirname "$QEMU")/nvidia-probe
+timeout 30 vulkaninfo 2> /dev/null | awk -F' = ' '
   /^GPU[0-9]+:$/ { g = $0 }
-  /^\tdeviceName / { name[g] = $2; print $2 "\tgpu\t-" }
-  /videoCodecOperation = / { op = $2 }
-  /stdProfileIdc = / && op ~ /_DECODE_H26[45]_/ {
-    p = $2; sub(/^STD_VIDEO_H26[45]_PROFILE_IDC_/, "", p)
-    print name[g] "\t" (op ~ /H265/ ? "hevc" : "h264") "\t" p }' | sort -u > "$R/host-video.tsv"
+  /^\tdeviceName / { name[g] = $2 }
+  /^\tpciDomain / { dom[g] = $2 }
+  /^\tpciBus / { bus[g] = $2 }
+  /^\tpciDevice / { dev[g] = $2 }
+  /^\tpciFunction / { fn[g] = $2 }
+  END { for (g in name) if (g in bus)
+    printf "%s\t%04x:%02x:%02x.%x\n", name[g], strtonum(dom[g]), strtonum(bus[g]),
+      strtonum(dev[g]), strtonum(fn[g]) }' | sort -u |
+  while IFS=$'\t' read -r name pci; do
+    printf '%s\tgpu\t-\n' "$name"
+    driver=$(basename "$(readlink -f "/sys/bus/pci/devices/$pci/driver")")
+    if [[ $driver == nvidia ]]; then
+      [[ -x $probe ]] && timeout 30 "$probe" "$pci" 2> /dev/null | awk -v n="$name" '
+        /^  H264 Yuv420 8-bit:/ { print n "\th264\tBASELINE"; print n "\th264\tMAIN"; print n "\th264\tHIGH" }
+        /^  Hevc Yuv420 8-bit:/ { print n "\thevc\tMAIN" }
+        /^  Hevc Yuv420 10-bit:/ { print n "\thevc\tMAIN10" }'
+    else
+      node=$(find "/sys/bus/pci/devices/$pci/drm" -maxdepth 1 -name 'renderD*' -printf '%f\n' 2> /dev/null | sort | head -n1)
+      [[ -n $node ]] && timeout 30 vainfo --display drm --device "/dev/dri/$node" 2> /dev/null | awk -v n="$name" '
+        $1 ~ /^VAProfile(H264|HEVC)/ && /VAEntrypointVLD/ {
+          p = $1; sub(/:$/, "", p); sub(/^VAProfile/, "", p); c = (p ~ /^HEVC/) ? "hevc" : "h264"; sub(/^(H264|HEVC)/, "", p)
+          print n "\t" c "\t" toupper(p) }'
+    fi
+  done | sort -u > "$R/host-video.tsv"
 [[ -s $R/host-video.tsv ]] || rm -f "$R/host-video.tsv"
 # Both boots run in a potluck job that holds the host alone (--exclusive), and both wait for running
 # builds and the cool-down first (msi-launch.sh). The bench boot is also powered off after HOLD_S.

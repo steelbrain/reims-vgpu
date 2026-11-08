@@ -33,6 +33,8 @@ fi
 rm -rf "$D.tmp"
 mkdir -p "$D.tmp"
 cp --reflink=auto "$MR/qemu-system-x86_64" "$MR/ReimsGraphics.rom" "$D.tmp/"
+# The NVIDIA decoders' query of a boot of the published host (msi-boot.sh), where the run built it.
+[[ ! -e $MR/nvidia-probe ]] || cp "$MR/nvidia-probe" "$D.tmp/"
 # QEMU's data, dereferenced, so the copy needs nothing of the gate's: only what `ninja
 # qemu-system-x86_64` makes. Links to what a full build would generate (edk2's images, keymaps,
 # other targets' device trees, trace-events-all) dangle, and the lane's boots take OVMF from

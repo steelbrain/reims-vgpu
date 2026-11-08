@@ -476,7 +476,7 @@ class Run:
     def video(self, d):
         """Each decode SKIP (decode_md5's: VideoToolbox finds no hardware decoder for the stream's
         codec) as what the gate measured: SKIP where the host's GPU has no hardware decoder for the
-        codec (host-video.tsv, Vulkan Video's decode profiles) or the candidate's device does not
+        codec (host-video.tsv, the decode profiles its video API lists) or the candidate's device does not
         offer the codec (meta.json's tip_codecs; for HEVC also the guest's accelerator, which
         carries IOGVAHEVCDecode where it offers it); FAIL where both hold and VideoToolbox still
         finds none."""
@@ -501,7 +501,7 @@ class Run:
             if codec == "hevc" and offer is not None:
                 accel = "the accelerator carries " + ("IOGVAHEVCDecode" if offer["hevc"] else "no IOGVAHEVCDecode") + ", "
             if gpu in names and codec not in decodes:
-                it["detail"] = f"{host}'s {gpu} has no hardware {label} decoder (Vulkan Video lists no {label} decode profile)"
+                it["detail"] = f"{host}'s {gpu} has no hardware {label} decoder (its video API lists no {label} decode profile)"
             elif tip is not None and codec not in tip:
                 it["detail"] = f"the device offers no {label} decoder on this tip ({accel}{vt})"
             elif tip is None:

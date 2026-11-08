@@ -107,12 +107,15 @@ do_msi_build() {
   fi
   bash "$MR/bin/msi-build.sh" "$MSI_GATE" "$MSI_GATE/tree" "$MSI_GATE/stage" "$QC" "$MSI_QEMU_SUBPROJECTS" | tee "$OUT/msi-build.txt"
   grep -q MSI_BUILD_OK "$OUT/msi-build.txt"
-  local q r
+  local q r p
   q=$(awk '$1 == "BUILT" && $2 == "qemu" {print $3}' "$OUT/msi-build.txt")
   r=$(awk '$1 == "BUILT" && $2 == "rom" {print $3}' "$OUT/msi-build.txt")
+  p=$(awk '$1 == "BUILT" && $2 == "probe" {print $3}' "$OUT/msi-build.txt")
   # QEMU finds its firmware and option ROMs (kvmvapic.bin, efi-virtio.rom) in qemu-bundle/ beside
   # its binary: the build's bundle holds links into the commit's source tree, which stays.
+  # The boots ask an NVIDIA GPU's decoders with nvidia-probe, beside QEMU (msi-boot.sh).
   cp --reflink=auto "$q" "$MR/qemu-system-x86_64" && cp "$r" "$MR/ReimsGraphics.rom" &&
+    cp "$p" "$MR/nvidia-probe" &&
     rm -rf "$MR/qemu-bundle" && mkdir -p "$MR/qemu-bundle/usr/local/share" &&
     cp -a "$(dirname "$q")/qemu-bundle/usr/local/share/qemu" "$MR/qemu-bundle/usr/local/share/" &&
     test -e "$MR/qemu-bundle/usr/local/share/qemu/efi-virtio.rom"
