@@ -17,20 +17,10 @@ pub type VulkanEvent = Obj<rt::Event>;
 /// `id<MTLSharedEvent>`.
 pub type VulkanSharedEvent = Obj<rt::SharedEvent>;
 
-/// `MTLSharedEventHandle *`: in this process only, as the runtime's handle is.
-pub type VulkanSharedEventHandle = Obj<rt::SharedEventHandle>;
-
 /// `MTLSharedEventListener *`.
 pub type VulkanSharedEventListener = Obj<rt::SharedEventListener>;
 
 impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
-    /// A handle of this process: the runtime's handles open in the process that made them.
-    fn new_shared_event_handle(&self) -> Option<VulkanSharedEventHandle> {
-        Some(Obj::new(plain(|| {
-            rt::SharedEvent::new_shared_event_handle(self)
-        })))
-    }
-
     /// The value becomes at least `signaled_value`; the runtime refuses no value.
     fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()> {
         // evset: event, value: the guest's or the device's host set

@@ -97,7 +97,6 @@ pub mod kind {
         Fence => "MTLFence",
         Event => "MTLEvent",
         SharedEvent => "MTLSharedEvent",
-        SharedEventHandle => "MTLSharedEventHandle",
         SharedEventListener => "MTLSharedEventListener",
         SharedTextureHandle => "MTLSharedTextureHandle",
         Library => "MTLLibrary",

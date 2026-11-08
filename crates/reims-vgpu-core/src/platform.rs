@@ -83,8 +83,6 @@ pub trait Platform: Sized + Send + Sync + 'static {
     type Event: Handle;
     /// `id<MTLSharedEvent>`.
     type SharedEvent: event::SharedEvent<Self>;
-    /// `MTLSharedEventHandle *`.
-    type SharedEventHandle: Handle;
     /// `MTLSharedEventListener *` (the graphics lane's notifications run on one,
     /// [`event::SharedEvent::notify_listener`]).
     type SharedEventListener: Handle;

@@ -35,9 +35,7 @@ use crate::gpu::device::{self, VulkanDevice};
 use crate::gpu::encode_blit::VulkanBlitEncoder;
 use crate::gpu::encode_compute::VulkanComputeEncoder;
 use crate::gpu::encode_render::VulkanRenderEncoder;
-use crate::gpu::event::{
-    VulkanEvent, VulkanSharedEvent, VulkanSharedEventHandle, VulkanSharedEventListener,
-};
+use crate::gpu::event::{VulkanEvent, VulkanSharedEvent, VulkanSharedEventListener};
 use crate::gpu::icb::{VulkanIcb, VulkanIndirectComputeCommand, VulkanIndirectRenderCommand};
 use crate::gpu::rate_map::{VulkanRateMap, VulkanRateMapDescriptor, VulkanRateMapLayerDescriptor};
 use crate::gpu::resource::{
@@ -481,7 +479,6 @@ impl Platform for VulkanPlatform {
     type Fence = VulkanFence;
     type Event = VulkanEvent;
     type SharedEvent = VulkanSharedEvent;
-    type SharedEventHandle = VulkanSharedEventHandle;
     type SharedEventListener = VulkanSharedEventListener;
     type SharedTextureHandle = VulkanSharedTextureHandle;
     type Library = VulkanLibrary;

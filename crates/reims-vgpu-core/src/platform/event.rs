@@ -5,9 +5,6 @@ use crate::raise::RaiseResult;
 
 /// `id<MTLSharedEvent>`.
 pub trait SharedEvent<P: Platform>: Handle {
-    /// sel: newSharedEventHandle (+1, released after the send). No path reaches it under a
-    /// handler: a raise inside it dies at the send.
-    fn new_shared_event_handle(&self) -> Option<P::SharedEventHandle>;
     /// sel: setSignaledValue:
     fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()>;
     /// sel: signaledValue — the value as the event has it now: what the CPU set and the GPU

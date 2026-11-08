@@ -183,7 +183,6 @@ impl Platform for FakePlatform {
     type Fence = Fk<kind::Fence>;
     type Event = Fk<kind::Event>;
     type SharedEvent = Fk<kind::SharedEvent>;
-    type SharedEventHandle = Fk<kind::SharedEventHandle>;
     type SharedEventListener = Fk<kind::SharedEventListener>;
     type SharedTextureHandle = Fk<kind::SharedTextureHandle>;
     type Library = Fk<kind::Library>;

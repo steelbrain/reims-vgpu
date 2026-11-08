@@ -4,7 +4,7 @@
 //! (`fake::script`) before its model; see `fake::impls` for the outcome channels.
 
 use super::super::calllog::Arg;
-use super::super::objects::{Fk, Model, kind};
+use super::super::objects::{Fk, kind};
 use super::super::platform::FakePlatform;
 use super::fatal;
 use crate::platform::Platform;
@@ -13,15 +13,6 @@ use crate::raise::RaiseResult;
 use crate::testkit::script::Policy;
 
 impl SharedEvent<FakePlatform> for Fk<kind::SharedEvent> {
-    fn new_shared_event_handle(&self) -> Option<<FakePlatform as Platform>::SharedEventHandle> {
-        let target = self.erase();
-        fatal(
-            self.make(Policy::Fatal, "newSharedEventHandle", vec![], |w| {
-                Some(w.new_obj::<kind::SharedEventHandle>(Model::Target(target)))
-            }),
-        )
-    }
-
     fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()> {
         self.act(
             Policy::Caught,
