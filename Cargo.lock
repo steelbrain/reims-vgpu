@@ -436,6 +436,7 @@ dependencies = [
  "reims-vgpu-metal",
  "reims-vgpu-video-core",
  "reims-vgpu-video-nvidia",
+ "reims-vgpu-video-vaapi",
  "reims-vgpu-video-vulkan",
  "reims-vgpu-vulkan",
  "reims-vgpu-window",

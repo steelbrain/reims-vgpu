@@ -57,8 +57,10 @@ reims-vgpu-vulkan.workspace = true
 reims-vgpu-video-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
 ash.workspace = true
-# The reims-graphics device's hardware video on NVIDIA's NVDEC, whose libraries it loads at run
-# time (`graphics::nvidia`).
+# The reims-graphics device's hardware video on the host's own video APIs: VA-API on libva and
+# libva-drm (`graphics::vaapi`), and NVIDIA's NVDEC, whose libraries it loads at run time
+# (`graphics::nvidia`).
+reims-vgpu-video-vaapi.workspace = true
 reims-vgpu-video-nvidia.workspace = true
 
 # The Metal platform, the product on macOS, and its window's drawable (`graphics::metal`,

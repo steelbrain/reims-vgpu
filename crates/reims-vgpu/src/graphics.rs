@@ -121,6 +121,8 @@ mod nvidia;
 mod present;
 mod read;
 mod sink;
+#[cfg(all(vulkan_platform, target_os = "linux"))]
+mod vaapi;
 #[cfg(vulkan_platform)]
 mod video_choice;
 mod video_host;

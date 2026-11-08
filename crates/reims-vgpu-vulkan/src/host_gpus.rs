@@ -121,6 +121,17 @@ pub fn gpu_device_gpu() -> Option<HostGpu> {
     GPU.clone()
 }
 
+/// The render node of `device`'s GPU, as [`HostGpu::render_node`] finds it: the one its DRM node
+/// names, else the one sysfs lists for its PCI address; `None` where neither does. A host API's
+/// video on the GPU a runtime device runs on opens there (the reims-graphics device's VA-API).
+pub fn render_node_of(device: &rt::Device) -> Option<PathBuf> {
+    let properties = device.properties();
+    let pci_address = properties.pci_bus.map(pci_address_of);
+    (properties.drm_render)
+        .and_then(|(major, minor)| node_of(major, minor))
+        .or_else(|| pci_address.as_deref().and_then(node_at_pci))
+}
+
 /// The GPU of `identity`, the runtime's identity of a physical device: its address of its PCI
 /// bus, and its render node of its DRM node, else of its address (module doc).
 fn of_identity(identity: &rt::PhysicalDeviceIdentity) -> HostGpu {

@@ -38,8 +38,11 @@ reims-graphics = { path = "crates/reims-graphics" }
 # The video crates' runtime and memory, which the reims-graphics device's video arms share
 # (`crate::video` of `reims-vgpu`).
 reims-vgpu-video-core = { path = "crates/reims-vgpu-video-core" }
-# The reims-graphics device's hardware video on an NVIDIA GPU through NVDEC, on Linux, its
-# libraries loaded at run time (`graphics::nvidia` of `reims-vgpu`).
+# The reims-graphics device's hardware video on the host's GPU through libva, on Linux
+# (`graphics::vaapi` of `reims-vgpu`).
+reims-vgpu-video-vaapi = { path = "crates/reims-vgpu-video-vaapi" }
+# Its hardware video on an NVIDIA GPU through NVDEC, on Linux, its libraries loaded at run time
+# (`graphics::nvidia` of `reims-vgpu`).
 reims-vgpu-video-nvidia = { path = "crates/reims-vgpu-video-nvidia" }
 # The reims-graphics device's hardware video on the Vulkan platform: Vulkan Video on the runtime's
 # device.
