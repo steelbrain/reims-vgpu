@@ -154,7 +154,7 @@ resize it. [docs/api.md](docs/api.md) section 2 lists every setting and variable
 - The option ROM: `firmware/`, the device's UEFI driver, in C, which the guest's firmware runs.
   `firmware/prebuilt` holds the built ROM, which reims-ctl gives the device. `firmware/ambrosia`
   is the device's driver module for Ambrosia, which gives an arm64 guest's firmware an early
-  console on the device.
+  console on the device, with our configuration of Ambrosia and the check of a guest's boot on it.
 - The Vulkan platform's runtime: metal2vulkan's public repository, at the commit the workspace's
   `Cargo.toml` names.
 - VMs: `reims-ctl` (`crates/reims-ctl`) creates, boots and manages them.
@@ -209,6 +209,8 @@ make clean        # remove build/
 make -C guest test     # the guest side's tests, on a Mac
 make -C firmware       # the option ROM, in firmware/build
 make -C firmware/ambrosia bundle   # the Ambrosia module and a bundle that starts it, in firmware/ambrosia/build
+make -C firmware/ambrosia config-bundle GRAFT=... REIMS_GRAPHICS=... RGFXGATE=...
+                                   # our configuration: the module, Graft and our kexts (arm64e builds)
 ```
 
 The Makefile's header describes every target and its variables. `make` runs `cargo`, which you can

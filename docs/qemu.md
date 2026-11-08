@@ -885,3 +885,100 @@ library's window shut, and QMP's `screendump` shows the display:
   stopped QEMU under HVF as soon as the module set the scanout:
   `accel/hvf/hvf-all.c:74:do_hv_vm_protect: assertion failed:
   (!(size & ~page_mask))`.
+
+### arm64 guests: the boot check of our configuration
+
+Ambrosia's done list has 10 boots of our configuration: macOS 13.6, 14.6.1,
+15.6.1, 26.6.2 and 27.0.1, each under HVF on the M3 Max and under TCG on a
+Linux member. Our configuration is the module's early console with Graft and
+our two kexts added to the kernel collection. Its bundle is built from the
+kexts' arm64e builds, and `check-boot.sh` checks one boot of it:
+
+```sh
+make -C firmware/ambrosia config-bundle GRAFT=<Graft.kext> \
+  REIMS_GRAPHICS=<ReimsGraphics.kext> RGFXGATE=<RgfxGate.kext>
+make -C firmware/ambrosia guest-tools          # on a Mac: bench and present_probe for arm64
+firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
+  -q <qemu-system-aarch64 with the device> ~/.local/share/reims-ctl/vms/macos-26
+```
+
+- **The bundle.** `config-bundle` writes `build/Config.cpio`: the module's
+  `config.plist` with a `Kernel` > `Add` entry for each kext, Graft first,
+  and the kexts under `Kexts/`. It checks each kext's `CFBundleIdentifier`
+  (`com.steelbrain.Graft`, `com.steelbrain.ReimsGraphics`,
+  `com.steelbrain.RgfxGate`) and that its executable has an arm64e slice,
+  and names every kext that is not given or fails, writing no bundle.
+- **The boot.** The script boots APFS clones of the guest's disks (`cp -c`;
+  `cp --reflink=always` on Linux) in its log directory and removes them at
+  the end, with 8 GiB, 4 CPUs, the device, `REIMS_VGPU_WINDOW=0` and
+  `REIMS_VGPU_LOG=info`, and forwards SSH from port 10090 (`-p`).
+- **The checks**, each a line with PASS or FAIL and what it found, then the
+  verdict; the script's header says what each one reads. `firmware`:
+  Ambrosia entered the kernel; where it stops the boot, its line, and QEMU
+  is stopped at once. `console`: the module's early console. `ssh`: a login
+  within 90 s of QEMU's start under HVF, 300 s under TCG. `sip`, `boot-args`:
+  `csrutil status` enabled and `kern.bootargs` empty. `kexts`: `kmutil
+  showloaded` lists the three identifiers. `windowserver-metal`: the lane
+  gate's reading of it, the desktop's processes up, `bench -l` listing a
+  Metal device that is not Apple's paravirtual one, WindowServer's pid kept,
+  and the host's log showing an IOSurface the guest presented.
+  `metal-app`: `present_probe` full-screen in the user's session, under
+  `report.py`'s bar. `no-fatal`: no `reims-vgpu: fatal` line in QEMU's log
+  or the serial log.
+
+**Measured** on the M3 Max under HVF on 2026-11-08, with our QEMU at
+`bc378624` built as above on the library of `61b1aac9e`, Ambrosia 0.1.0's
+released image (`ea2987b`) and APFS clones of the 26.6.2 (25G83) guest
+`macos-26`:
+- With the module's bundle alone (`make bundle`, no `Kernel` > `Add`), six
+  checks passed: `firmware`, `console` (`reims-graphics at 00:05.0:
+  1920x1080, framebuffer 0x80400000`), `ssh` at 13.5 s, `sip`, `boot-args`
+  and `no-fatal`. Three failed, as they must with no kexts: `kexts` (none of
+  the three loaded), `windowserver-metal` (WindowServer up with no Dock or
+  Finder after 60 s, `bench -l` listing no Metal device, no IOSurface shown)
+  and `metal-app` (not run, with no Metal device). The screendump showed
+  Ambrosia's log on the early console and the kernel's progress bar. The
+  run took 76 s, 60 s of it the wait for a desktop.
+- With a bundle by hand holding `Kernel` > `Add` entries for the x86-64
+  builds of the three kexts (which `config-bundle` refuses), Ambrosia read
+  the three, then logged `boot failed: KextsNotPlaced` after reading the
+  disks, on the console too; `firmware` failed with that line, the guest's
+  checks failed as not run, and the run took 1.2 s.
+- With a login over SSH for each guest command, one boot's last login was
+  refused ("Permission denied") after about 20 had succeeded; the guest's
+  commands now share the first login's connection and retry a failed login.
+
+**What a pass still needs** (2026-11-08): arm64e builds of `ReimsGraphics.kext`
+and `RgfxGate.kext` (both x86-64 only) and of the Metal bundle `RgfxGate`
+installs; Graft built for arm64e (its only build is x86-64); and Ambrosia's
+kext placement: Ambrosia 0.1.0 reads every enabled `Kernel` > `Add` entry
+and then stops the boot with `boot failed: KextsNotPlaced`.
+
+**A TCG run** (`-t`) is not tried yet. What it needs:
+- **A node** with the arm64 guests: `homelab-um870-1` holds reflink copies of
+  all five in `~/.cache/rvg-vms` (`macos-13-arm64` to `macos-27-0-arm64`,
+  each with its `vm.toml`). The script's log directory (`-o`) must be on that
+  filesystem, so that its clones are reflinks. Another member needs copies of
+  the guests first.
+- **A GPU** for the device: the library runs the guest's Metal calls on the
+  host's GPU over Vulkan, so the potluck job holds one, `--gpu 780m` on
+  `homelab-um870-1` (its Radeon 780M, on amdgpu).
+- **The device's library and our QEMU, built on the node.** `cargo xtask
+  dist` (the library on Vulkan, `target/dist-vulkan`), then our QEMU at
+  `vendor/qemu`'s commit, `bc378624`, configured as above against that dist
+  tree but without `--enable-hvf`, for TCG: `--target-list=aarch64-softmmu
+  --enable-reims-vgpu --enable-gnutls --disable-docs --disable-bsd-user
+  --disable-linux-user --disable-tools`. The plain TCG boots built it with
+  `--disable-reims-vgpu`; with the device it is **unknown** whether it
+  builds or runs there.
+- **Copies from the Mac**: Ambrosia's `built/ambrosia.bin`, the bundle and
+  `build/guest-tools`, unless the node builds the bundle itself, which needs
+  clang, lld, cpio and python3 (**unknown** there).
+- **On the node's PATH**: `sshpass`, `python3`, `perl` and GNU `timeout`
+  (**unknown** for `sshpass`).
+- **RAM**: QEMU peaked at 7.3 to 10.5 GiB with an 8 GiB guest and no device
+  in the plain TCG boots, which took `--ram 16`; with the device and its GPU
+  work the peak is **unknown**, so a first run takes more (`--ram 24`) and
+  `potluck why` gives the peak for the next.
+- **Time**: the script's limits are 300 s to SSH and 180 s more for the
+  desktop, and the plain guests answered SSH there in 58 to 108 s.

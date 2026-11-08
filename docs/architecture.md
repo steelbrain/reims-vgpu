@@ -725,10 +725,15 @@ documents it.
 
 ```
 Makefile                 clang and lld: the module, build/ReimsGraphics.elf, and a bundle that starts it,
-                         build/ReimsGraphics.cpio (make bundle)
+                         build/ReimsGraphics.cpio (make bundle); our configuration's bundle,
+                         build/Config.cpio (make config-bundle); the guest probes (make guest-tools)
 ReimsGraphicsModule.c    the entry point: the device's BARs, its control ring and its mode
 AmbrosiaGraphics.h       Ambrosia's graphics driver interface, revision 1
 config.plist             the bundle's configuration, which names the module
+tools/stage-config.py    our configuration: config.plist with a Kernel > Add entry for Graft and each
+                         of our two kexts, after checking each is an arm64e kext with its identifier
+check-boot.sh            boots an arm64 guest with a bundle and checks the boot (docs/qemu.md,
+                         "arm64 guests: the boot check of our configuration")
 ```
 
 **What the module does.** It finds the device on bus 0, gives BAR 0 an address at the start of the
