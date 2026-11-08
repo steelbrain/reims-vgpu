@@ -2599,7 +2599,9 @@ pub(crate) mod tests {
         // The in-place check the device starts as it is adopted asks the kernel of its own
         // pages on another thread: it ends before the count is read, so only this test's
         // imports move it.
-        let _ = d.raw.settle_in_place_checks(std::time::Duration::from_secs(60));
+        let _ = d
+            .raw
+            .settle_in_place_checks(std::time::Duration::from_secs(60));
         let vm = crate::os::OsVm::new();
         let at = crate::os::allocate_aliasable(2 * PAGE).unwrap();
         let queried = || d.raw.work_counts().host_mappings_queried;

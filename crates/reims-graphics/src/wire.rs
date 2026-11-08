@@ -3867,7 +3867,8 @@ const _: () = {
     assert!(size_of::<RgfxVideoCodecCaps>() == 48);
     assert!(size_of::<RgfxVideoOutputLayout>() == 16);
     assert!(
-        size_of::<RgfxVideoCaps>() == 8 + 48 * RGFX_VIDEO_CAPS_CODECS + 8 + 16 * RGFX_VIDEO_CAPS_CODECS
+        size_of::<RgfxVideoCaps>()
+            == 8 + 48 * RGFX_VIDEO_CAPS_CODECS + 8 + 16 * RGFX_VIDEO_CAPS_CODECS
     );
     assert!(core::mem::offset_of!(RgfxVideoCaps, reserved_30c) == 0x30c);
     assert!(core::mem::offset_of!(RgfxVideoCaps, layouts) == 0x310);
