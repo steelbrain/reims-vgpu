@@ -653,9 +653,10 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
 /// keys nor the button reach the guest, it ends with an error instead. `progress` hears each
 /// step.
 ///
-/// The keys come first because the power button alone does not shut a guest down: a macOS 26
-/// vmapple guest did nothing with vmapple's in 90 s, where the keys shut it down in under 6 s
-/// (2026-10-11, M3 Max).
+/// The keys come first: they shut a macOS 26.7.2 guest down within 20 s (2026-11-07, Radeon 780M
+/// host). Neither they nor the button shut down a guest whose Setup Assistant is open, which macOS
+/// opens once on a Mac it has not run on (`create`'s note, `new_mac_note`), so that stop ends in
+/// the power-off, saying why it may have come.
 pub fn stop(
     vm: &Vm,
     force: bool,
@@ -705,10 +706,15 @@ pub fn stop(
             }
             std::thread::sleep(Duration::from_millis(300));
         }
-        progress("the guest did not shut down in time: powering off");
+        progress(NO_SHUTDOWN);
     }
     power_off(vm, p, &mut progress)
 }
+
+/// What a stop says as it powers off a guest that did not shut down in its timeout.
+pub const NO_SHUTDOWN: &str = "the guest did not shut down in time (a question about an unsaved \
+     document, or Setup Assistant, which macOS opens once on a new Mac, holds it up: answer it in \
+     the VM's window): powering off";
 
 fn power_off(vm: &Vm, p: i32, progress: &mut impl FnMut(&str)) -> Result<()> {
     let _ = qmp::run(&vm.qmp_socket(), "quit", None);

@@ -358,6 +358,25 @@ fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
     Ok(())
 }
 
+/// What a create that gives macOS on an existing disk a new OpenCore image says: the image
+/// presents a Mac of its own (a new serial number, MLB and UUID), so the disk's macOS boots on a
+/// Mac it has not run on, and runs Setup Assistant once at that boot. While Setup Assistant is
+/// open, macOS shuts down at neither the keys nor the power button [`crate::runtime::stop`]
+/// sends, so a stop then ends in a power-off at its timeout.
+/// Measured with a macOS 26.7.2 (25G332) disk on a Radeon 780M host, 2026-11-07: on a new image,
+/// Setup Assistant (`-MiniBuddyYes`) ran from about 10 s after boot, and the guest ignored the
+/// keys and the button for 180 s, and System Events' `shut down` for 120 s, while `sudo shutdown
+/// -h now` over SSH, which no stop can send without the guest's password, powered it off in 6 s;
+/// on the image it booted from before (`--opencore`), Setup Assistant did not run, and the keys
+/// shut it down within 20 s. None where the disk is new, or an image is given.
+fn new_mac_note(spec: &Spec) -> Option<&'static str> {
+    (matches!(spec.disk, Some(DiskSource::Existing { .. })) && spec.opencore.is_none()).then_some(
+        "macOS on this disk will boot on a new Mac (a new serial number and UUID), so it opens \
+         Setup Assistant once: finish it in the VM's window, since until then it does not shut \
+         down when asked. --opencore with the image the disk booted from keeps its Mac",
+    )
+}
+
 /// Makes an x86-64 VM on `graphics`, which its settings save by name.
 fn make_q35(
     spec: &Spec,
@@ -397,6 +416,9 @@ fn make_q35(
         None => {
             let kexts = reims_util::kext_args(graphics)?;
             reims_util::opencore(&dir.join("opencore.qcow2"), &mac, macos, &kexts, progress)?;
+            if let Some(note) = new_mac_note(spec) {
+                progress(note);
+            }
             (PathBuf::from("opencore.qcow2"), ImageFormat::Qcow2)
         }
         Some(src) => {
@@ -634,6 +656,32 @@ mod tests {
             d.join("udrw.dmg")
         );
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_disk_given_a_new_opencore_image_is_told_of_setup_assistant() {
+        let spec = |disk, opencore: Option<&str>| Spec {
+            disk,
+            opencore: opencore.map(PathBuf::from),
+            ..Spec::new("mac")
+        };
+        let existing = || {
+            Some(DiskSource::Existing {
+                path: "/vms/mac/disk.qcow2".into(),
+                mode: ImportMode::Copy,
+            })
+        };
+        let note = new_mac_note(&spec(existing(), None)).expect("a note");
+        assert!(
+            note.contains("Setup Assistant") && note.contains("--opencore"),
+            "{note}"
+        );
+        assert_eq!(
+            new_mac_note(&spec(existing(), Some("/vms/mac/opencore.qcow2"))),
+            None
+        );
+        let new = Some(DiskSource::New { size_mib: 131_072 });
+        assert_eq!(new_mac_note(&spec(new, None)), None);
     }
 
     #[test]
