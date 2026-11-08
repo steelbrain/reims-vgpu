@@ -507,7 +507,7 @@ fn a_quiet_granule_reads_no_page() {
         0,
         "quiet again from the write's own stamp"
     );
-    // A granule no watch holds reads as written, its pages unread.
+    // A granule no watch holds has no peak: its pages are read, and read as written.
     assert_eq!(changed(&log, &import(4 * GRANULE, P), s2), vec![0..P]);
 }
 
