@@ -36,6 +36,7 @@ on CachyOS) unless they say otherwise.
 | Zero copy: frames copied by the GPU into the guest's pages ("Zero copy") | `src/zero_copy.rs` |
 | The waits on the GPU, each bounded ("How a session waits for the GPU") | `src/wait.rs`, `src/nvenc/locks.rs`, `src/nvdec/decoder.rs` |
 | A GPU that does not finish, for the tests of the waits | `src/cuda/spin.rs` |
+| The reims-graphics device's decode on NVDEC: whole access units in place, each picture copied into the output's planes by the GPU ("The reims-graphics device") | `src/annex_b.rs`; reims-vgpu's `src/graphics/nvidia.rs`, `src/graphics/video_host.rs` |
 
 ## The binding
 
@@ -124,6 +125,44 @@ From the caps, asked once when the backend opens:
   session lists Apple's (as VA-API's do);
 - encoders: H.264 and HEVC, each profile NVENC lists that core has
   (`encode_profiles`), with NVENC's sizes and B-frames.
+
+## The reims-graphics device
+
+The reims-graphics device's video, on an NVIDIA GPU, runs on this backend's
+NVDEC through `AnnexBDecoder` (`src/annex_b.rs`), in a host video session of
+reims-vgpu's (`crates/reims-vgpu/src/graphics/video_host.rs`, `nvidia.rs`): the
+guest's video driver hands each decode a whole Annex B access unit, one
+picture, in decode order, and the planes of the output surface it lands in.
+The device's arm chooses the runtime device's own GPU, by its PCI address,
+where it is NVIDIA's and CUDA opens it (`graphics/video_choice.rs`).
+
+- **The access unit, in place.** The codec crate's decoder parses it where it
+  lies, in the host bytes of the guest's bitstream buffer, and hands NVDEC each
+  picture's slices, units of the access unit's own bytes. Where they lie in it
+  as one run (after start codes, only zeros between them), NVDEC is handed that
+  run as it is, with no copy (`nvdec::decoder::one_run`); otherwise the slices
+  are gathered into one buffer. NVDEC copies the bitstream within
+  `cuvidDecodePicture`, so the guest's buffer is read there alone. A session
+  logs at its end how many of its pictures went each way.
+- **The picture, by one GPU copy.** Where the output's planes lie in pages a
+  device reaches in place (the surface's view of the guest's RAM, or a copy
+  block of the device's region), their view is registered with CUDA once a
+  mapping, as "Zero copy" registers a guest buffer's, and each picture is one
+  `cuMemcpy2D` a plane from the mapped surface into the plane at its pitch,
+  its crop's rows alone, waited for before the session signals the decode's
+  value. Any pitch is taken, so the device asks no layout of the guest.
+  Elsewhere the picture is read back and copied by the CPU.
+- **A picture that does not land is a decode error.** A picture whose planes
+  the session refuses, or whose decode NVDEC failed once it ran, still
+  signals the decode's value, so its command buffer completes, failed with
+  Metal's internal error; the guest's video driver fails its session's next
+  schedule for it (`kVTVideoDecoderMalfunctionErr`), one picture late. A
+  stream's last such picture has no later schedule, and reaches the guest as
+  a decoded frame (AppleGVA's queries carry no error).
+- **Surfaces.** A picture holds its decode surface until it lands; the decoder
+  has `AnnexBDecoder::SPARE_PICTURES` (2) beyond its references and the
+  picture being decoded, and the session holds no more pictures unlanded than
+  that. Pictures land on the session's landing thread, in decode order.
 
 ## The decoders
 
