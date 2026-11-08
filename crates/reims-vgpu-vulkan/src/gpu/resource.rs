@@ -1324,13 +1324,16 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// made exportable ([`VulkanDevice`]'s `new_exportable_buffer_of_length`), else refused.
     fn export_memory(&self) -> Result<ExportedMemory, String> {
         let exported = plain(|| self.raw.export_memory_fd()).map_err(|error| error.to_string())?;
-        Ok(ExportedMemory {
-            fd: exported.fd,
-            allocation_size: exported.allocation_size,
-            offset: exported.offset,
-            length: exported.length,
-            dedicated: exported.dedicated,
-        })
+        Ok(exported_memory(exported))
+    }
+
+    /// The runtime's export of the buffer's memory as a dma-buf (`export_memory_dma_buf`): a
+    /// buffer the runtime made so ([`VulkanDevice`]'s
+    /// `new_dma_buf_buffer_of_length_padding_unobserved`), else refused.
+    fn export_dma_buf(&self) -> Result<ExportedMemory, String> {
+        let exported =
+            (plain(|| self.raw.export_memory_dma_buf())).map_err(|error| error.to_string())?;
+        Ok(exported_memory(exported))
     }
 
     /// The runtime's acquire of what another API wrote into the buffer's exported memory
@@ -1339,6 +1342,17 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
     /// next use in a command buffer committed after the call.
     fn external_write_done(&self) -> Result<(), String> {
         plain(|| self.raw.external_write_done()).map_err(|error| error.to_string())
+    }
+}
+
+/// What an import of a buffer's exported memory names, from the runtime's export of it.
+fn exported_memory(exported: rt::ExportedMemory) -> ExportedMemory {
+    ExportedMemory {
+        fd: exported.fd,
+        allocation_size: exported.allocation_size,
+        offset: exported.offset,
+        length: exported.length,
+        dedicated: exported.dedicated,
     }
 }
 

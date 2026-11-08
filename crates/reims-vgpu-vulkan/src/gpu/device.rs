@@ -670,13 +670,17 @@ impl VulkanDevice {
     /// `newBufferWithLength:options:`'s buffer (`new_buffer_of_length`), declaring the bytes
     /// between a texture's rows over it unobserved where `padding_unobserved`, and its byte
     /// `aligned_byte` on a multiple of 256 bytes of its memory where given
-    /// (`new_buffer_of_length_padding_unobserved`).
+    /// (`new_buffer_of_length_padding_unobserved`), in memory exportable as `export` where given
+    /// (`new_dma_buf_buffer_of_length_padding_unobserved`). A buffer to export is no buffer of
+    /// Metal's: any refusal of it answers `None`, logged at debug, and the caller makes the buffer
+    /// as any other, where one Metal makes refuses as `newBufferWithLength:options:` does.
     fn buffer_of_length(
         &self,
         length: u64,
         options: u64,
         padding_unobserved: bool,
         aligned_byte: Option<u64>,
+        export: Option<rt::MemoryExport>,
     ) -> RaiseResult<Option<VulkanBuffer>> {
         let sel = "newBufferWithLength:options:";
         let options = crate::gpu::resource_options(sel, options);
@@ -692,13 +696,26 @@ impl VulkanDevice {
             Some(byte) => descriptor.with_aligned_byte(byte),
             None => descriptor,
         };
+        let descriptor = match export {
+            Some(export) => descriptor.with_exported_as(export),
+            None => descriptor,
+        };
         let descriptor = with_token(in_slot(descriptor, &pool), placing.token());
-        let made = create_buffer(
-            sel,
-            placed_nil(&placing, Nil::BufferLength),
-            placing.pin_refused(),
-            || self.raw.new_buffer_with_descriptor(descriptor),
-        );
+        let made = match export {
+            None => create_buffer(
+                sel,
+                placed_nil(&placing, Nil::BufferLength),
+                placing.pin_refused(),
+                || self.raw.new_buffer_with_descriptor(descriptor),
+            ),
+            Some(export) => match plain(|| self.raw.new_buffer_with_descriptor(descriptor)) {
+                Ok(raw) => Ok(Some(raw)),
+                Err(error) => {
+                    log::debug!("no buffer of {length} bytes exportable as {export:?}: {error}");
+                    Ok(None)
+                }
+            },
+        };
         metal_space::let_go(pool);
         made.map(|b| b.map(|raw| self.buffer(raw, None)))
     }
@@ -1166,7 +1183,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         length: u64,
         options: u64,
     ) -> RaiseResult<Option<VulkanBuffer>> {
-        self.buffer_of_length(length, options, false, None)
+        self.buffer_of_length(length, options, false, None, None)
     }
 
     /// As `new_buffer_of_length`'s, with the runtime's declaration that the bytes between the
@@ -1184,7 +1201,23 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         options: u64,
         aligned_byte: Option<u64>,
     ) -> RaiseResult<Option<VulkanBuffer>> {
-        self.buffer_of_length(length, options, true, aligned_byte)
+        self.buffer_of_length(length, options, true, aligned_byte, None)
+    }
+
+    /// As `new_buffer_of_length_padding_unobserved`'s, in memory the runtime makes exportable as a
+    /// dma-buf (`BufferDescriptor::with_exported_as`, `MemoryExport::DmaBuf`), at the address
+    /// Metal's space gives it, as that buffer's. Any refusal (a device that exports no dma-buf of
+    /// a buffer's memory, `RuntimeGap::DmaBufExport`, among them) answers `None`, logged at debug,
+    /// and the caller makes the buffer as any other.
+    fn new_dma_buf_buffer_of_length_padding_unobserved(
+        &self,
+        _on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: Option<u64>,
+    ) -> RaiseResult<Option<VulkanBuffer>> {
+        let export = Some(rt::MemoryExport::DmaBuf);
+        self.buffer_of_length(length, options, true, aligned_byte, export)
     }
 
     /// The runtime's exportable buffer (`new_exportable_buffer`): a block of its own, exportable
@@ -3509,6 +3542,47 @@ pub(crate) mod tests {
         cb.commit(OnFault::Return).unwrap();
         cb.wait_until_completed(OnFault::Return).unwrap();
         assert_eq!(cb.status().0, 4, "completed");
+    }
+
+    /// A buffer made as a dma-buf device cache (`new_dma_buf_buffer_of_length_padding_unobserved`)
+    /// lies, on Linux, in memory the runtime exports as a dma-buf: its aligned byte on 256 bytes of
+    /// the allocation, its bytes within it, and the acquire of another API's writes taken. A
+    /// buffer made as any other exports no dma-buf. On macOS, where MoltenVK exports no dma-buf of
+    /// a buffer's memory, none is made, and the caller makes the cache as any other.
+    #[test]
+    fn a_dma_buf_cache_exports_its_memory_with_its_aligned_byte_on_256_bytes() {
+        use crate::core::platform::resource::Buffer as _;
+        let d = dev();
+        let (length, aligned) = (0x10_0000, 0x20);
+        let private = 2 << 4;
+        let made = d.new_dma_buf_buffer_of_length_padding_unobserved(
+            OnFault::Return,
+            length,
+            private,
+            Some(aligned),
+        );
+        let made = made.expect("no raise");
+        if cfg!(target_os = "macos") {
+            assert!(made.is_none(), "MoltenVK made a dma-buf buffer");
+            return;
+        }
+        let buffer = made.expect("a dma-buf buffer");
+        let exported = buffer.export_dma_buf().expect("its dma-buf");
+        assert_eq!((exported.offset + aligned) % 256, 0, "{exported:?}");
+        assert!(
+            exported.offset + length <= exported.allocation_size,
+            "{exported:?}"
+        );
+        buffer.external_write_done().expect("the acquire");
+        let plain = (d.new_buffer_of_length_padding_unobserved(
+            OnFault::Return,
+            length,
+            private,
+            Some(aligned),
+        ))
+        .expect("no raise")
+        .expect("a buffer");
+        assert!(plain.export_dma_buf().is_err());
     }
 
     #[cfg(target_os = "macos")]

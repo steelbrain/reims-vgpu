@@ -23,8 +23,10 @@
 //!   directory), the planes' rows and starts lie on multiples of 256 bytes of the memory, and
 //!   they hold the coded picture's rows. The cache's memory is exported once, and imported as the
 //!   decode's render target once a cache, a new import made while the decoder still holds the
-//!   last (a reference's). The picture is then there once its decode is done, and nothing is
-//!   copied. Each reason a session's pictures are not, of a cache made so, is logged once.
+//!   last (a reference's). The picture is then there once its decode is done and the platform
+//!   acquired what the driver wrote (`Buffer::external_write_done`, which the device's next
+//!   submission records before its commands), and nothing is copied. Each reason a session's
+//!   pictures are not, of a cache made so, is logged once.
 //! - **Otherwise a picture lands** in the output's planes one of three ways, each the fallback at
 //!   the last's refusal, the session counting each:
 //!   1. **In the surface's pages, by the driver's video processing** (the VA crate's
@@ -747,9 +749,11 @@ impl<P: Platform> VaPicture<P> {
 
 impl<P: Platform> HostPicture<P> for VaPicture<P> {
     fn land(self: Box<Self>, to: &mut Landing<'_, P>) -> Result<(), BackendError> {
-        // Decoded into its output's cache: there once its decode is done.
+        // Decoded into its output's cache: there once its decode is done, and the device's
+        // reads of the cache see it once the platform acquired what the driver wrote.
         if self.frame.is_in_target() {
             self.frame.sync()?;
+            to.luma.buffer.external_write_done()?;
             to.decoded_there();
             return Ok(());
         }
