@@ -117,6 +117,7 @@ struct Decoder {
     log: Log,
     answers: VecDeque<Result<Option<Picture>, &'static str>>,
     decoded: u8,
+    most_unlanded: usize,
 }
 
 impl HostDecoder<P> for Decoder {
@@ -133,18 +134,33 @@ impl HostDecoder<P> for Decoder {
         let picture = answer?;
         Ok(picture.map(|p| Box::new(p) as Box<dyn HostPicture<P>>))
     }
+
+    fn most_unlanded(&self) -> usize {
+        self.most_unlanded
+    }
 }
 
-/// A session over a decoder answering `answers`, and the log it keeps.
+/// A session over a decoder answering `answers`, and the log it keeps, that spares 8 pictures.
 fn session(
     p: &FakePlatform,
     answers: Vec<Result<Option<Picture>, &'static str>>,
     log: &Log,
 ) -> HostVideoSession<P> {
+    session_sparing(p, answers, log, 8)
+}
+
+/// [`session`]'s, its decoder sparing `most_unlanded` pictures.
+fn session_sparing(
+    p: &FakePlatform,
+    answers: Vec<Result<Option<Picture>, &'static str>>,
+    log: &Log,
+    most_unlanded: usize,
+) -> HostVideoSession<P> {
     let decoder = Decoder {
         log: Arc::clone(log),
         answers: answers.into(),
         decoded: 0,
+        most_unlanded,
     };
     HostVideoSession::new(
         &p.device(),
@@ -390,6 +406,31 @@ fn values_are_signalled_in_decode_order_once_landed() {
     assert!(event_of(&s).wait_until_signaled_value(3, 10_000));
     assert_eq!(s.counts.lock().skipped, 1);
     assert_eq!(s.counts.lock().landed, [2, 0, 0, 0, 0]);
+}
+
+/// A decode that would have the session hold more pictures unlanded than its decoder spares
+/// waits, once decoded, for the oldest to land.
+#[test]
+fn a_decode_past_the_decoder_s_spare_pictures_waits_for_the_oldest_to_land() {
+    let p = FakePlatform::new();
+    let log = Log::default();
+    let (go, gate) = mpsc::channel();
+    let answers = vec![Ok(Some(Picture::Gated(1, Arc::clone(&log), gate)))];
+    let s = session_sparing(&p, answers, &log, 2);
+    let bitstream = buffer(&p, 4096, STORAGE_SHARED);
+    let pages = buffer(&p, 16384, STORAGE_SHARED);
+    let d = || decode(&bitstream, &[], planes(&pages, &pages, 96));
+    // The first lands behind its gate, and the second waits for the landing thread.
+    assert_eq!(s.decode(&d()).unwrap(), 1);
+    assert_eq!(s.decode(&d()).unwrap(), 2);
+    let (done, decoded) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| done.send(s.decode(&d()).unwrap()).unwrap());
+        assert!(decoded.recv_timeout(Duration::from_millis(100)).is_err());
+        go.send(()).unwrap();
+        assert_eq!(decoded.recv_timeout(Duration::from_secs(10)).unwrap(), 3);
+    });
+    assert!(event_of(&s).wait_until_signaled_value(3, 10_000));
 }
 
 /// A picture that fails to land is counted, its output left as it was, and its value signalled

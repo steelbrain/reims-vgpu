@@ -116,15 +116,19 @@ mod device_info;
 mod display_cost;
 #[cfg(target_os = "macos")]
 mod metal;
+#[cfg(target_os = "linux")]
+mod nvidia;
 mod present;
 mod read;
 mod sink;
+#[cfg(vulkan_platform)]
+mod video_choice;
 mod video_host;
 #[cfg(vulkan_platform)]
 mod vulkan;
 
 #[cfg(vulkan_platform)]
-pub(crate) use vulkan::graphics_video as vulkan_graphics_video;
+pub(crate) use video_choice::graphics_video as vulkan_graphics_video;
 
 pub use decode::{GraphicsVideo, GraphicsVideoSession, PlanePages, VideoDecode, VideoPlane};
 

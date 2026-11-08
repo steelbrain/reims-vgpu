@@ -29,6 +29,11 @@
 //!   A picture that fails to land is logged and counted, and its value is signalled all the
 //!   same: the command buffer goes on with its output as the landing left it, as a GPU decode's
 //!   error leaves one.
+//!
+//!   A picture holds the hardware's surface until it has landed, so the session holds no more
+//!   pictures unlanded than the decoder spares ([`HostDecoder::most_unlanded`]): a decode past
+//!   them waits, once its picture is decoded, for the oldest to land. The landing waits only
+//!   for the hardware, so the wait ends.
 //! - **The event** is a shared event, as the host signals it: the runtime holds a command
 //!   buffer's wait for it on the host until the value is reached.
 //! - **An end** ([`Drop`]) closes the landing thread's queue and waits up to [`TEARDOWN_WAIT`]
@@ -38,7 +43,7 @@
 //! The session logs the first picture of each way it lands at `info` ("hardware video: ..."),
 //! and its counts at its end.
 
-#![allow(dead_code, reason = "the NVIDIA and VA-API arms build on it")]
+#![allow(dead_code, reason = "each of the host's video arms uses a part of it")]
 
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -91,6 +96,13 @@ pub(crate) trait HostDecoder<P: Platform>: Send + 'static {
     /// answered, until the session signals the decode's value: the hardware may read them there
     /// after this returns.
     fn decode(&mut self, au: &[u8]) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError>;
+
+    /// The most pictures it lets its session hold unlanded, queued for the landing thread or
+    /// landing, beside its references and the picture being decoded: a picture holds the
+    /// hardware's surface until it has landed, and the decoder has this many to spare. A decode
+    /// that would hold one more waits, once its picture is decoded, for the oldest to land. One
+    /// at the least.
+    fn most_unlanded(&self) -> usize;
 }
 
 /// A decoded picture, which the session's landing thread lands in its decode's output.
@@ -568,7 +580,7 @@ pub(crate) struct HostVideoSession<P: Platform> {
 /// A session's decoder, the landing thread's queue, and the last value a decode answered.
 struct State<P: Platform> {
     decoder: Box<dyn HostDecoder<P>>,
-    jobs: Option<mpsc::Sender<Job<P>>>,
+    jobs: Option<mpsc::SyncSender<Job<P>>>,
     value: u64,
 }
 
@@ -586,7 +598,8 @@ impl<P: Platform> HostVideoSession<P> {
             log::warn!("hardware video: {name}: no shared event for a session");
             return None;
         };
-        let (jobs, taken) = mpsc::channel();
+        // The landing thread holds the picture it lands, and the queue the rest.
+        let (jobs, taken) = mpsc::sync_channel(decoder.most_unlanded().max(1) - 1);
         let counts = Arc::new(Mutex::new(Counts::default()));
         let stage = Stage {
             device: device.clone_ref(),

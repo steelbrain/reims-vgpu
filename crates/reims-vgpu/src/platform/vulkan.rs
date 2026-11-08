@@ -70,7 +70,8 @@ impl ApiPlatform for VulkanPlatform {
         Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
     }
 
-    /// Vulkan Video on the device's video-decode queue (`graphics::vulkan::video`).
+    /// The first of the host's video arms that takes the device (`graphics::video_choice`): NVDEC
+    /// on an NVIDIA GPU, else Vulkan Video on the device's video-decode queue.
     fn graphics_video(
         &self,
         device: &<Self as Platform>::Device,
