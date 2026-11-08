@@ -226,13 +226,72 @@ const GUEST_PAGE: u64 = 4096;
 /// and a view of the pages starts on a page's first byte, where the device's lines start too.
 /// `None` where some class's verdicts all passed or are pending, or the device's lines do not
 /// divide a page: the pages' import decides.
+///
+/// A device that imports no shared memory by its pointer (`rt::Device::imports_shared_host_pointers`
+/// false: RADV) imports a view, a shared mapping of the guest's pages, as dma-bufs or not at all,
+/// so its verdicts are the dma-bufs' alone ([`dma_bufs_never_in_place`]), with the check that one
+/// dma-buf takes each plane's pages counted from `pages`, the view's pages, before it is made.
 pub(crate) fn surface_pages_never_in_place(
     raw: &rt::Device,
     planes: &[PagesPlane],
+    pages: &[std::ops::Range<u64>],
 ) -> Option<String> {
     let report = plain(|| raw.in_place_check_report());
     let line = plain(|| raw.in_place_check_line());
+    if plain(|| raw.imports_shared_host_pointers()).is_ok_and(|takes| !takes) {
+        return dma_bufs_never_in_place(&report, line, planes, pages);
+    }
     never_in_place(&report, line, planes)
+}
+
+/// [`surface_pages_never_in_place`] on a device whose views are dma-bufs, from its `report` and
+/// `line`: a plane's pages, cut from `pages`, more than one dma-buf takes, as
+/// [`surface_pages_in_place`] refuses them over the view; else the dma-bufs' verdicts as
+/// [`never_in_place`] reads a class's, where the device's lines divide a page.
+fn dma_bufs_never_in_place(
+    report: &[String],
+    line: u64,
+    planes: &[PagesPlane],
+    pages: &[std::ops::Range<u64>],
+) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    for (i, plane) in planes.iter().enumerate() {
+        let Some(end) = plane.end() else { continue };
+        let from = plane.offset - plane.offset % GUEST_PAGE;
+        let of_plane = cut(pages, from..end.next_multiple_of(GUEST_PAGE));
+        if let Err(refusal) = crate::os::one_dma_buf_of_fits(&of_plane) {
+            return Some(format!(
+                "plane {i}'s pages are no one dma-buf, which a texture over {} binds: {refusal}",
+                Class::DmaBuf.words()
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pages;
+    if line == 0 || !GUEST_PAGE.is_multiple_of(line) {
+        return None;
+    }
+    verdicts(report, line, 0, Class::DmaBuf, planes).err()
+}
+
+/// The runs of `pages`, host addresses of a surface's bytes in its order, that its bytes `span`
+/// lie in, cut to them, in order.
+#[cfg(target_os = "linux")]
+fn cut(pages: &[std::ops::Range<u64>], span: std::ops::Range<u64>) -> Vec<std::ops::Range<u64>> {
+    let mut out = Vec::new();
+    let mut at = 0u64;
+    for run in pages {
+        let end = at.saturating_add(run.end.saturating_sub(run.start));
+        let (from, to) = (span.start.max(at), span.end.min(end));
+        if from < to {
+            out.push(run.start + (from - at)..run.start + (to - at));
+        }
+        if end >= span.end {
+            break;
+        }
+        at = end;
+    }
+    out
 }
 
 /// [`surface_pages_never_in_place`] from the device's `report` and `line`.
@@ -357,5 +416,71 @@ mod tests {
             "lines across a page's end"
         );
         assert!(never_in_place(&refused, 0, &planes).is_none(), "no lines");
+    }
+
+    /// The runs a span of a surface's bytes lies in, cut to it
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // runs of one range
+    fn the_runs_of_a_span_are_cut_to_it() {
+        let runs = [0x1000..0x3000, 0x8000..0x9000, 0x4000..0x5000];
+        assert_eq!(cut(&runs, 0x1000..0x2800), [0x2000..0x3000, 0x8000..0x8800]);
+        assert_eq!(cut(&runs, 0..0x2000), [0x1000..0x3000]);
+        assert_eq!(cut(&runs, 0x3000..0x4000), [0x4000..0x5000]);
+        assert_eq!(cut(&runs, 0x4000..0x5000), []);
+    }
+
+    /// On a device whose views are dma-bufs, a surface's pages are answered as lying in place over
+    /// no import before its view where the dma-bufs' verdicts refuse them, whatever those by
+    /// pointer answer, or where a plane's pages, counted from the runs the view would map, are no
+    /// one dma-buf (here pages no file is behind, which the view's import refuses as well); and
+    /// left to the import where the dma-bufs' verdicts pass and each plane's pages fit one
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // pages of one run
+    fn a_dma_buf_device_refuses_pages_before_their_view_by_the_dma_bufs_alone() {
+        use crate::core::num::{ToU64 as _, ToUsize as _};
+        let line = 64;
+        let page = GUEST_PAGE;
+        let planes = [plane(0, 4096, 4096, 4)];
+        let report = |dma_buf: &str| -> Vec<String> {
+            let mut lines = vec![
+                "Pointer, rows on lines: Passed".to_owned(),
+                "Pointer renders, rows on lines: Passed".to_owned(),
+                "Pointer writes, rows on lines: Passed".to_owned(),
+            ];
+            for access in ["", " renders", " writes"] {
+                lines.push(format!("DmaBuf{access}, rows on lines: {dma_buf}"));
+            }
+            lines
+        };
+        let base = crate::os::allocate_aliasable(8 * page)
+            .unwrap()
+            .addr()
+            .to_u64();
+        let mapped = [base + 4 * page..base + 6 * page, base..base + 2 * page];
+        let passed = report("Passed");
+        assert!(never_in_place(&passed, line, &planes).is_none());
+        assert_eq!(
+            dma_bufs_never_in_place(&passed, line, &planes, &mapped),
+            None,
+            "the dma-bufs' verdicts pass and the pages fit one"
+        );
+        let failed = report("Failed");
+        assert!(
+            never_in_place(&failed, line, &planes).is_none(),
+            "those by pointer pass"
+        );
+        let why = dma_bufs_never_in_place(&failed, line, &planes, &mapped).unwrap();
+        assert!(why.contains("imported as dma-bufs"), "{why}");
+        let private = vec![0u8; (8 * page).to_usize()];
+        let at = (private.as_ptr().addr().to_u64()).next_multiple_of(page);
+        let unresolved = [at..at + 4 * page];
+        let why = dma_bufs_never_in_place(&passed, line, &planes, &unresolved).unwrap();
+        assert!(why.contains("plane 0's pages are no one dma-buf"), "{why}");
+        assert!(
+            dma_bufs_never_in_place(&passed, 0, &planes, &mapped).is_none(),
+            "no lines, pages that fit"
+        );
     }
 }

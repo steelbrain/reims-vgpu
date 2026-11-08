@@ -233,8 +233,12 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     /// Unlogged, as the world answers it: [`World::answer_surface_pages_unmade`].
     ///
     /// [`World::answer_surface_pages_unmade`]: crate::core::testkit::objects::World::answer_surface_pages_unmade
-    fn surface_pages_never_in_place(&self, planes: &[PagesPlane]) -> Option<String> {
-        self.world().surface_pages_never_in_place(planes)
+    fn surface_pages_never_in_place(
+        &self,
+        planes: &[PagesPlane],
+        pages: &[std::ops::Range<u64>],
+    ) -> Option<String> {
+        self.world().surface_pages_never_in_place(planes, pages)
     }
 
     fn new_compute_pipeline_state_for_function(

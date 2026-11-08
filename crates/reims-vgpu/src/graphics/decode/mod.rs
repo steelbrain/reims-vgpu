@@ -1311,7 +1311,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         // is answered that it needs a device cache with no view made, which the answer would let
         // go of unused; where its runs fail a view's checks, the view's path refuses them.
         if let Some(planes) = &planes
-            && let Some(why) = device.surface_pages_never_in_place(planes)
+            && let Some(ram) =
+                surface_pages::SurfaceViews::ram_runs(views, &self.platform, pages, runs)
+            && let Some(why) = device.surface_pages_never_in_place(planes, &ram)
         {
             let block = pages.block_offset;
             match surface_pages::SurfaceViews::cache_unmade(

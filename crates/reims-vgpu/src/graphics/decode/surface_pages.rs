@@ -110,7 +110,9 @@
 //! block in place asks for it at its `SURFACE_PAGES` (`RGFX_SURFACE_PAGES_ASK_CACHE`), with its
 //! surface's planes, which must lie in its bytes ([`layout_planes`]). Where the device answers
 //! first that textures over the surface would lie in place over no buffer of its pages, whatever
-//! it imports them as ([`GpuDevice::surface_pages_never_in_place`]), the block is answered
+//! it imports them as ([`GpuDevice::surface_pages_never_in_place`], asked of the runs' host pages
+//! a view would map: on a device that imports views as dma-bufs alone, RADV, by the dma-bufs'
+//! verdicts and the count of each plane's pieces against one dma-buf's), the block is answered
 //! `RGFX_STATUS_CACHE` at once, with no view made ([`SurfaceViews::cache_unmade`]), where its runs
 //! pass a view's checks. Otherwise its view is made as any block's, and the device asked whether
 //! textures over it lie in place ([`GpuDevice::surface_pages_in_place`]). Where they do, or where
@@ -765,6 +767,25 @@ impl<P: Platform> SurfaceViews<P> {
             }
             Err(why) => Err(v.refused(why)),
         }))
+    }
+
+    /// The host addresses of the guest pages of `runs`, checked (the module doc), in the mapping
+    /// of the guest's RAM the memory map names, in their order, as runs: what a view of them maps,
+    /// which the device is asked of before any is made
+    /// ([`GpuDevice::surface_pages_never_in_place`]). `None` where the runs fail a view's checks
+    /// or leave the mapping, for the view's path to refuse them.
+    ///
+    /// [`GpuDevice::surface_pages_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_never_in_place
+    pub(crate) fn ram_runs(
+        views: &Mutex<SurfaceViews<P>>,
+        platform: &P,
+        pages: &RgfxSurfacePages,
+        runs: &[RgfxPageRun],
+    ) -> Option<Vec<Range<u64>>> {
+        let v = views.lock();
+        let key = v.checked_runs(platform, pages, runs).ok()?;
+        let (memory, _) = v.memory.as_ref()?;
+        in_order(memory, &key)
     }
 
     /// An ask whether the block `pages` names needs a device cache
@@ -2418,6 +2439,7 @@ pub(super) mod tests {
     /// leaves it to the view, the block is asked over its view and kept in place where the device
     /// answers so, as before
     #[test]
+    #[allow(clippy::single_range_in_vec_init)] // pages of one run
     fn a_block_in_place_over_no_buffer_is_answered_a_cache_with_no_view() {
         let mut r = rig(16);
         let page = r.page;
@@ -2450,6 +2472,12 @@ pub(super) mod tests {
         assert!(
             world.surface_pages_asked().is_empty(),
             "nothing asked over a view"
+        );
+        let host = r.ram.host_addr(RAM + page).unwrap().addr().to_u64();
+        assert_eq!(
+            world.surface_pages_unmade_asked(),
+            [vec![host..host + 2 * page]],
+            "asked of the pages a view would map, in the guest RAM's mapping"
         );
         assert!(!r.dec.caches().has(BLOCK));
         assert_eq!(

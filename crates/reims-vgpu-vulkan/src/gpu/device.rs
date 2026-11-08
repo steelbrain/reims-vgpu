@@ -1247,8 +1247,12 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
 
     /// The runtime's verdicts for textures over no import of the pages yet
     /// (`crate::gpu::pages_in_place::surface_pages_never_in_place`).
-    fn surface_pages_never_in_place(&self, planes: &[PagesPlane]) -> Option<String> {
-        crate::gpu::pages_in_place::surface_pages_never_in_place(&self.raw, planes)
+    fn surface_pages_never_in_place(
+        &self,
+        planes: &[PagesPlane],
+        pages: &[std::ops::Range<u64>],
+    ) -> Option<String> {
+        crate::gpu::pages_in_place::surface_pages_never_in_place(&self.raw, planes, pages)
     }
 
     /// The runtime's alignment of a BGRA8 texture's offset and rows in a buffer at which the

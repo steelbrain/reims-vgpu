@@ -383,24 +383,37 @@ pub(crate) fn fits_one(first: u64, length: u64) -> Result<(), Refusal> {
     let page = vm::page_size();
     let start = first & !(page - 1);
     let end = first.saturating_add(length).next_multiple_of(page);
-    let resolved = files::pieces(start, end - start).ok_or(Refusal::Unresolved)?;
-    let of_zeros = super::import::of_zeros(&resolved);
+    fits_one_of(std::slice::from_ref(&(start..end)))
+}
+
+/// Whether one dma-buf takes the pages of `ranges`, host addresses of whole pages, in order: the
+/// pages a texture over a view of them binds, as [`fits_one`] counts a view's, asked before the
+/// view is made. Refused as [`fits_one`] is; a run of file pages that goes on from one range into
+/// the next counts once, as [`add_runs`] makes it one.
+pub(crate) fn fits_one_of(ranges: &[std::ops::Range<u64>]) -> Result<(), Refusal> {
     let mut pieces: u64 = 0;
+    let mut bytes: u64 = 0;
     // The file and the offset past the last run's end.
-    let mut last: Option<(&Arc<OwnedFd>, u64)> = None;
-    for (piece, of_zeros) in resolved.iter().zip(of_zeros) {
-        let follows = matches!(
-            last,
-            Some((fd, end)) if !of_zeros && Arc::ptr_eq(fd, &piece.backing.fd)
-                && end == piece.backing.offset
-        );
-        if !follows {
-            pieces += 1;
+    let mut last: Option<(Arc<OwnedFd>, u64)> = None;
+    for range in ranges {
+        let length = range.end.saturating_sub(range.start);
+        let resolved = files::pieces(range.start, length).ok_or(Refusal::Unresolved)?;
+        let of_zeros = super::import::of_zeros(&resolved);
+        for (piece, of_zeros) in resolved.into_iter().zip(of_zeros) {
+            let follows = matches!(
+                &last,
+                Some((fd, end)) if !of_zeros && Arc::ptr_eq(fd, &piece.backing.fd)
+                    && *end == piece.backing.offset
+            );
+            if !follows {
+                pieces += 1;
+            }
+            let end = piece.backing.offset + piece.length;
+            last = (!of_zeros).then_some((piece.backing.fd, end));
         }
-        last = (!of_zeros).then(|| (&piece.backing.fd, piece.backing.offset + piece.length));
+        bytes = bytes.saturating_add(length);
     }
     let limits = limits();
-    let bytes = end - start;
     if pieces > limits.pieces || bytes > limits.bytes {
         return Err(Refusal::Limit {
             pieces,
@@ -848,6 +861,47 @@ mod tests {
             of_pages(private, page, page, &Zeros::default()),
             Err(Refusal::Unresolved)
         ));
+    }
+
+    /// One dma-buf takes the pages of a list of ranges where they are no more runs of file pages
+    /// than its limit, counted as a dma-buf of them makes them: ranges whose pages follow on in
+    /// the file are one run, however they are cut, and every other page of a file one run each;
+    /// one more than the limit is refused with the count, and pages no file is behind are refused
+    /// as unresolved. It needs no udmabuf: it makes nothing
+    #[test]
+    fn a_list_of_ranges_fits_one_dma_buf_by_its_runs_of_file_pages() {
+        let page = vm::page_size();
+        let limits = limits();
+        let base = vm::allocate_aliasable(8 * page).unwrap().addr().to_u64();
+        let following = [base..base + page, base + page..base + 3 * page];
+        assert!(fits_one_of(&following).is_ok());
+        assert!(fits_one_of(std::slice::from_ref(&(base..base + 3 * page))).is_ok());
+        let private = vm::anonymous(None, page, "a test's private page").unwrap();
+        assert!(matches!(
+            fits_one_of(&[base..base + page, private..private + page]),
+            Err(Refusal::Unresolved)
+        ));
+        if limits.pieces > 1 << 16 {
+            eprintln!(
+                "skipped the limit: udmabuf takes {} pieces here",
+                limits.pieces
+            );
+            return;
+        }
+        // Every other page of a range, so no two pieces follow on in the file.
+        let count = limits.pieces + 1;
+        let at = vm::allocate_aliasable(2 * count * page)
+            .unwrap()
+            .addr()
+            .to_u64();
+        let apart: Vec<std::ops::Range<u64>> = (0..count)
+            .map(|i| at + 2 * i * page..at + (2 * i + 1) * page)
+            .collect();
+        assert!(fits_one_of(&apart[1..]).is_ok(), "as many as the limit");
+        match fits_one_of(&apart) {
+            Err(Refusal::Limit { pieces, .. }) => assert_eq!(pieces, count),
+            other => panic!("one past the limit: {other:?}"),
+        }
     }
 
     /// A view of more scattered pages than one dma-buf may hold is made of several, in order,

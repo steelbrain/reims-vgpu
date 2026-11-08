@@ -945,11 +945,14 @@ pub struct World {
     /// [`GpuDevice::surface_pages_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_in_place
     surface_pages: Mutex<(PagesInPlace, Vec<Vec<PagesPlane>>)>,
     /// What the devices' [`GpuDevice::surface_pages_never_in_place`] answers
-    /// ([`World::answer_surface_pages_unmade`]).
+    /// ([`World::answer_surface_pages_unmade`]), and the pages each call was asked of, in order.
     ///
     /// [`GpuDevice::surface_pages_never_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_never_in_place
-    never_in_place: Mutex<Option<String>>,
+    never_in_place: Mutex<(Option<String>, Vec<PagesRuns>)>,
 }
+
+/// A surface's pages as host addresses, as runs, in its order.
+type PagesRuns = Vec<std::ops::Range<u64>>;
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
 type OnNew<K> = Box<dyn FnOnce(&Fk<K>) + Send>;
@@ -988,7 +991,7 @@ impl World {
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
             surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
-            never_in_place: Mutex::new(None),
+            never_in_place: Mutex::new((None, Vec::new())),
         })
     }
 
@@ -1017,15 +1020,29 @@ impl World {
     /// [`GpuDevice::surface_pages_never_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_never_in_place
     /// [`GpuDevice::surface_pages_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_in_place
     pub fn answer_surface_pages_unmade(&self, why: Option<String>) {
-        *self.never_in_place.lock() = why;
+        self.never_in_place.lock().0 = why;
     }
 
     /// What the devices answer to [`GpuDevice::surface_pages_never_in_place`]
-    /// ([`World::answer_surface_pages_unmade`]).
+    /// ([`World::answer_surface_pages_unmade`]), the pages asked of kept.
     ///
     /// [`GpuDevice::surface_pages_never_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_never_in_place
-    pub fn surface_pages_never_in_place(&self, _planes: &[PagesPlane]) -> Option<String> {
-        self.never_in_place.lock().clone()
+    pub fn surface_pages_never_in_place(
+        &self,
+        _planes: &[PagesPlane],
+        pages: &[std::ops::Range<u64>],
+    ) -> Option<String> {
+        let mut state = self.never_in_place.lock();
+        state.1.push(pages.to_vec());
+        state.0.clone()
+    }
+
+    /// The pages, host addresses as runs, each call of [`GpuDevice::surface_pages_never_in_place`]
+    /// was asked of, in order.
+    ///
+    /// [`GpuDevice::surface_pages_never_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_never_in_place
+    pub fn surface_pages_unmade_asked(&self) -> Vec<Vec<std::ops::Range<u64>>> {
+        self.never_in_place.lock().1.clone()
     }
 
     /// The planes each call of [`GpuDevice::surface_pages_in_place`] was asked of, in order.
