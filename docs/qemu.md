@@ -911,7 +911,14 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
 - **The boot.** The script boots APFS clones of the guest's disks (`cp -c`;
   `cp --reflink=always` on Linux) in its log directory and removes them at
   the end, with 8 GiB, 4 CPUs, the device, `REIMS_VGPU_WINDOW=0` and
-  `REIMS_VGPU_LOG=info`, and forwards SSH from port 10090 (`-p`).
+  `REIMS_VGPU_LOG=info`, and forwards SSH from port 10090 (`-p`). Under TCG
+  the guest's RAM is a shared memfd, as `reims-ctl` gives its VMs on Linux:
+  `-machine vmapple,...,memory-backend=ram,dump-guest-core=off` and
+  `-object memory-backend-memfd,id=ram,size=8G,share=on`, so the GPU uses an
+  IOSurface's own pages in place ("The reims-graphics device", above); in
+  plain RAM on Linux, QEMU warns `guest RAM is not a shared memfd in pages
+  of the host's size: IOSurfaces are copied for the GPU`. Under HVF the RAM
+  stays QEMU's own.
 - **The checks**, each a line with PASS or FAIL and what it found, then the
   verdict; the script's header says what each one reads. `firmware`:
   Ambrosia entered the kernel; where it stops the boot, its line, and QEMU
@@ -954,7 +961,7 @@ installs; Graft built for arm64e (its only build is x86-64); and Ambrosia's
 kext placement: Ambrosia 0.1.0 reads every enabled `Kernel` > `Add` entry
 and then stops the boot with `boot failed: KextsNotPlaced`.
 
-**A TCG run** (`-t`) is not tried yet. What it needs:
+**A TCG run** (`-t`) runs on a Linux member. What it needs:
 - **A node** with the arm64 guests: `homelab-um870-1` holds reflink copies of
   all five in `~/.cache/rvg-vms` (`macos-13-arm64` to `macos-27-0-arm64`,
   each with its `vm.toml`). The script's log directory (`-o`) must be on that
@@ -962,23 +969,24 @@ and then stops the boot with `boot failed: KextsNotPlaced`.
   the guests first.
 - **A GPU** for the device: the library runs the guest's Metal calls on the
   host's GPU over Vulkan, so the potluck job holds one, `--gpu 780m` on
-  `homelab-um870-1` (its Radeon 780M, on amdgpu).
-- **The device's library and our QEMU, built on the node.** `cargo xtask
-  dist` (the library on Vulkan, `target/dist-vulkan`), then our QEMU at
+  `homelab-um870-1` (its Radeon 780M, on RADV).
+- **The device's library and our QEMU, built on the node**, in one potluck
+  workspace that the boots then reuse (`--workspace`): `cargo xtask dist`
+  (the library on Vulkan, `target/dist-vulkan`), then our QEMU at
   `vendor/qemu`'s commit, `bc378624`, configured as above against that dist
   tree but without `--enable-hvf`, for TCG: `--target-list=aarch64-softmmu
   --enable-reims-vgpu --enable-gnutls --disable-docs --disable-bsd-user
-  --disable-linux-user --disable-tools`. The plain TCG boots built it with
-  `--disable-reims-vgpu`; with the device it is **unknown** whether it
-  builds or runs there.
-- **Copies from the Mac**: Ambrosia's `built/ambrosia.bin`, the bundle and
-  `build/guest-tools`, unless the node builds the bundle itself, which needs
-  clang, lld, cpio and python3 (**unknown** there).
-- **On the node's PATH**: `sshpass`, `python3`, `perl` and GNU `timeout`
-  (**unknown** for `sshpass`).
-- **RAM**: QEMU peaked at 7.3 to 10.5 GiB with an 8 GiB guest and no device
-  in the plain TCG boots, which took `--ram 16`; with the device and its GPU
-  work the peak is **unknown**, so a first run takes more (`--ram 24`) and
-  `potluck why` gives the peak for the next.
+  --disable-linux-user --disable-tools`, then `make qemu-system-aarch64`.
+  The dispatch leaves out `vendor/qemu/roms/*` and
+  `vendor/qemu/tests/lcitool/libvirt-ci` (`--without-submodule`). On
+  `homelab-um870-1` the job took 9 min and peaked at 12.0 GiB (`--ram 16`).
+- **Copies from the Mac**: Ambrosia's `built/ambrosia.bin` and
+  `build/guest-tools`. The node has clang, lld, cpio and python3, so it can
+  build the bundle itself.
+- **On the node's PATH**: `sshpass`, `python3`, `perl` and GNU `timeout`;
+  `homelab-um870-1` has all four.
+- **RAM**: `--ram 18`. A boot with the device peaked at 11.8 GiB by `potluck
+  why`, page cache included, and at 9.4 GiB of anonymous and shared memory,
+  QEMU's own high-water mark 9.5 GiB.
 - **Time**: the script's limits are 300 s to SSH and 180 s more for the
-  desktop, and the plain guests answered SSH there in 58 to 108 s.
+  desktop; a boot with the module's bundle alone took 5 min 20 s.

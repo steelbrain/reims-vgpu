@@ -24,6 +24,8 @@
 #
 # The guest runs with 8 GiB and 4 CPUs, as Ambrosia's tested boots do, with QEMU's
 # REIMS_VGPU_WINDOW=0 (no window on the host) and REIMS_VGPU_LOG=info, as the lane gate runs it.
+# Under TCG, for a Linux member, its RAM is a shared memfd, as reims-ctl's VMs on Linux have it, so
+# the GPU uses an IOSurface's own pages in place; in plain RAM the device copies each surface.
 # Nothing is typed or clicked in the guest. The checks log in over SSH as GUEST_USER, password
 # GUEST_PASS (default aneesiqbal, as every owner VM), and copy the probes into ~/ambrosia-check.
 #
@@ -77,10 +79,14 @@ shift $((OPTIND - 1))
 vm=$1
 GUEST_USER=${GUEST_USER:-aneesiqbal} GUEST_PASS=${GUEST_PASS:-aneesiqbal}
 
+ram=8G
 if ((tcg)); then
   accel=(-accel tcg,thread=multi) limit=300 desktop_wait=180
+  machine=",memory-backend=ram,dump-guest-core=off"
+  mem=(-m "$ram" -object "memory-backend-memfd,id=ram,size=$ram,share=on")
 else
   accel=(-accel hvf,kernel-irqchip=on) limit=90 desktop_wait=60
+  machine= mem=(-m "$ram")
 fi
 
 [[ -n $firmware && -f $firmware ]] || die "no Ambrosia image: give its built/ambrosia.bin with -f"
@@ -202,7 +208,7 @@ fi
 
 t0=$(now)
 REIMS_VGPU_WINDOW=0 REIMS_VGPU_LOG=info "$qemu" "${accel[@]}" \
-  -M "vmapple,uuid=$ecid" -m 8G -smp 4 -bios "$firmware" \
+  -M "vmapple,uuid=$ecid$machine" "${mem[@]}" -smp 4 -bios "$firmware" \
   -drive "file=$clone/aux.img.trimmed,if=pflash,format=raw" \
   -drive "file=$clone/disk.img,if=pflash,format=raw" \
   -drive "file=$clone/aux.img.trimmed,if=none,id=aux,format=raw" \
