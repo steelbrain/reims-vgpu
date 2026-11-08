@@ -614,11 +614,21 @@ static void installEntry(void *, wait_result_t) {
 	// lookup: this thread is entered as a continuation very early in boot, and
 	// IOSleep yields it through the scheduler into a normal preemptible state
 	// before it takes the VFS namecache lock, which a development kernel
-	// otherwise faults on (lock_rw_old.c, preemption check).
-	vfs_context_t ctx = vfs_context_create(nullptr);
+	// otherwise faults on (lock_rw_old.c, preemption check). The VFS context
+	// waits for IOBSD too: Graft starts this kext before BSD is up on some
+	// releases, and a credential taken before the kernel task has its BSD
+	// process panics (Darwin 20: "thread wants credential but has no BSD
+	// process").
+	vfs_context_t ctx = nullptr;
 	bool ready = false;
 	for (int i = 0; i < 600; i++) {
 		IOSleep(100);
+		if (!ctx) {
+			IOService *resources = IOService::getResourceService();
+			if (!resources || !resources->getProperty("IOBSD"))
+				continue;
+			ctx = vfs_context_create(nullptr);
+		}
 		vnode_t vp = nullptr;
 		if (ctx && vnode_lookup("/Library/Preferences", 0, &vp, ctx) == 0) {
 			vnode_put(vp);
