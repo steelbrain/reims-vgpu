@@ -47,7 +47,9 @@ use crate::wait::Deadline;
 /// A codec an [`AnnexBDecoder`] decodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnnexBCodec {
+    /// H.264, of the profiles the codec crate decodes.
     H264,
+    /// HEVC, Main and Main 10.
     Hevc,
 }
 
@@ -227,18 +229,26 @@ fn with_sample<D, T>(
 /// ([`AnnexBPicture::write_into`]): `rows` rows of `row_bytes`,
 /// `bytes_per_row` apart, from `offset` into `memory`.
 pub struct MemoryPlane<'a> {
+    /// The memory the plane lies in.
     pub memory: &'a dyn DeviceMemory,
+    /// The plane's first byte in the memory.
     pub offset: usize,
+    /// Bytes from one of its rows to the next.
     pub bytes_per_row: usize,
+    /// The bytes of one of its rows that may be written.
     pub row_bytes: usize,
+    /// Its rows.
     pub rows: u32,
 }
 
 /// A plane of a picture read back ([`ReadBack::planes`]): `rows` rows of
 /// `bytes_per_row` each, packed.
 pub struct ReadPlane<'a> {
+    /// Its rows' bytes.
     pub bytes: &'a [u8],
+    /// The bytes of one of its rows.
     pub bytes_per_row: usize,
+    /// Its rows.
     pub rows: u32,
 }
 
