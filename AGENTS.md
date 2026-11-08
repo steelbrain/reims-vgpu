@@ -341,14 +341,17 @@ Three tiers:
     one fails `cargo xtask check` and reims-ctl's `cargo test`
     (`make -C firmware prebuilt-check`).
   - **The guest's OpenCore kext set for that device**, in `guest/prebuilt`:
-    `set.toml`, `sources.toml`, and for each of `ReimsGraphicsLoader`,
-    `RgfxIOGraphicsFamilyBridge`, `RgfxAppleGraphicsDeviceControlBridge`,
-    `ReimsGraphics` and `RgfxGate`, `<name>.kext/Contents/Info.plist` and
+    `set.toml`, `sources.toml`, and for each of `Graft`, `ReimsGraphics` and
+    `RgfxGate`, `<name>.kext/Contents/Info.plist` and
     `<name>.kext/Contents/MacOS/<name>`. reims-ctl embeds the bundles
     `set.toml` lists and adds them to the OpenCore image of an x86-64 VM on
     reims-vgpu. `make -C guest prebuilt` rewrites them from `guest/` on a Mac
-    with a KDK, with the record of their sources, `sources.toml`, and a stale
-    set fails `make -C guest prebuilt-check`, which `cargo xtask check` runs.
+    with Xcode alone, with the record of their sources, `sources.toml`, and a
+    stale set fails `make -C guest prebuilt-check`, which `cargo xtask check`
+    runs. Graft itself is not built here: `guest/graft` is a copy of Graft's
+    committed build and consumer tooling, made by Graft's `tools/vendor.py`
+    with its record, `guest/graft/source.toml`, which the same check
+    verifies. A new Graft replaces the directory and its record together.
 - **Never commit Apple binaries.** The build needs none: the option ROM is
   built from `firmware/`, and the kexts from `guest/`. The committed
   metallibs hold only our shaders and constant samplers, with no Apple code

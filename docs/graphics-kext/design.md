@@ -248,38 +248,38 @@ Stages:
     matches any display-class device. WindowServer composites in software
     with no Metal device: x86-64 macOS 26.5.2, 26.6.1 and 26.7.1 reach the
     desktop that way ("Software compositor activated"; measured).
-13. **Loading: through OpenCore, with a bridge for our kext only.** OpenCore
-    injects kexts into the Boot kernel collection and links them only against
-    Boot-collection symbols, but a display kext uses IOGraphicsFamily, which
-    is in the System collection. So our kext loads through a loader, a Lilu
-    plugin, and two generated shims: ReimsGraphicsLoader
-    (guest/loader/README.md). The image carries only Lilu and the set
-    `make -C guest set` builds, in this order: the loader, the shims for
-    IOGraphicsFamily and AppleGraphicsDeviceControl, ReimsGraphics.kext,
-    and RgfxGate.kext. None of the x86-64 port's kexts are in it, and the
-    loader needs none of them. Nothing of the guest OS is patched or hooked
-    beyond what the loader does.
+13. **Loading: through OpenCore, bound by Graft.** OpenCore injects kexts
+    into the Boot kernel collection and links them only against
+    Boot-collection symbols, but a display kext uses IOGraphicsFamily and
+    AppleGraphicsDeviceControl, which are in the System collection. So
+    ReimsGraphics is built with Graft's consumer rules
+    (`guest/graft/tools/consumer.mk`): its System-collection imports point at
+    placeholders inside the kext, and it carries a manifest
+    (`__DATA,__graft`) of every imported site and of the library classes it
+    derives from, with no personalities and no System-collection
+    `OSBundleLibraries`. OpenCore links that dormant kext in the Boot
+    collection. Graft (`guest/graft`, a copy of Graft's committed build)
+    starts from its own kext start. At a catalogue send after the
+    libraries are registered, it checks each parent class's size and vtable
+    against the running library, resolves each site by name, writes the
+    sites and vtables, and publishes ReimsGraphics' personalities, so
+    IOKit's matching starts it. On a missing symbol or a layout that
+    differs, Graft declines ReimsGraphics by name in its log and in the
+    registry root's `GraftClient.com.steelbrain.ReimsGraphics`, and the
+    guest boots on. The image carries the set `make -C guest set` builds,
+    in this order, with no kernel range: Graft.kext, ReimsGraphics.kext and
+    RgfxGate.kext. Nothing of the guest OS is patched or hooked beyond what
+    Graft does for these two.
     - Iterating: patch a copy of a VM's OpenCore image directly
       (scripts/internal/opencore-add-kexts.sh). No rebuild inside the guest.
-    - The loader binds our kext from a table generated from one build of
-      it. The table holds each bridge site by its offset in the binary: a
-      GOT or vtable pointer, or a call into IOGraphicsFamily or
-      AppleGraphicsDeviceControl. Swapping a new ReimsGraphics binary into an
-      image's set therefore binds only while those sites stay put. A change
-      that grows the kext's `__const` or `__data` (a new initialized global,
-      or a member of one) moves every pointer after it. A change in an
-      object linked before the provider calls (`ReimsGraphics.o`,
-      `RgfxAccelerator.o`) moves those calls. Either fails to bind. To spot
-      it, the loader logs `rgfxload: ... ReimsGraphics: got +0x...
-      <symbol> failed the placeholder check (old 0x...)`, then
-      `publish: ReimsGraphics not ready (bind failed)`, and the guest boots
-      with no framebuffer or Metal device. So never swap ReimsGraphics
-      alone: `make -C guest set` builds the kext, its shims and the loader
-      together, and stages the kext with an `Info.plist` whose
-      `OSBundleLibraries` name the shims and which carries no personalities.
-      The kext build's own `Info.plist` makes OpenCore refuse the kext
-      ("Prelinked injection ReimsGraphics.kext ... Invalid Parameter" on
-      the serial log).
+      Graft reads the sites from the kext's own manifest, so a new
+      ReimsGraphics binds without a new Graft. Swap in the kext
+      `make -C guest/kext` builds: that build stages it dormant with its
+      manifest. A kext built without Graft's rules carries personalities
+      and System-collection libraries, which OpenCore refuses.
+    - Checking: `make -C guest set-check` links the set into a release's
+      Boot collection with OpenCore's own linker, in user space, and checks
+      with Graft's `prelink.py` that the manifest and every site survive it.
     - Shipping: the repository carries the set prebuilt in guest/prebuilt,
       with its Kernel > Add entries in `set.toml` and the record of its
       sources in `sources.toml` (`make -C guest prebuilt`;
@@ -2972,7 +2972,7 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   volume does not carry it, so with SIP on Metal declines to load it and
   WindowServer, finding the accelerator registered, crashes and restarts in a
   loop.
-  Our install kext (`guest/rgfxgate`, a Lilu plug-in) therefore writes the
+  Our install kext (`guest/rgfxgate`, a Graft client) therefore writes the
   bundle to the data volume and gives the whole tree that exact storage class
   and the matching restricted flag from kernel context, below the file-system
   MAC layer, so only our bundle's own paths are tagged and SIP is relaxed for
@@ -2994,14 +2994,14 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   appears) and creates the container, with the same class, only where it is
   missing.
   - *Checklist (per supported OS).* The three load hooks and the three install
-    hooks are Lilu routes of six XNU MAC dispatchers
+    hooks are Graft routes of six XNU MAC dispatchers
     (`_mac_file_check_library_validation`, `_mac_file_check_mmap`,
     `_mac_vnode_check_signature`, `_mac_vnode_check_{create,open,truncate}`),
     whose argument lists `RgfxGateHooks.cpp` hard-codes. Routing is by symbol,
     not by raw bytes, so a moved patch site is not the risk; a changed
-    *prototype* is. When a new `KernelVersion` is added to the supported range
-    (Info.plist, BigSur..Tahoe), re-verify each of the six prototypes against
-    that OS's KDK before shipping it, and confirm `_csfg_get_cdhash` and
+    *prototype* is. RgfxGate has no kernel version range, so when a release
+    joins the test matrix, re-verify each of the six prototypes against that
+    release's kernel before shipping it, and confirm `_csfg_get_cdhash` and
     `_csblob_get_cdhash` still resolve (a miss on either now logs loudly and
     leaves the gate inert rather than bricking silently).
 - **Bundle updates.** The marker beside the executable (below, "Registration
