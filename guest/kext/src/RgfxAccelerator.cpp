@@ -312,7 +312,12 @@ bool RgfxAccelerator::start(IOService *provider)
 	// The framebuffer enables these too; doing so again is harmless. The
 	// accelerator needs BAR 0 for the doorbell and BAR 2 to hand to the bundle.
 	pci->setMemoryEnable(true);
-	pci->setBusLeadEnable(true);
+	// setBusMasterEnable rather than setBusLeadEnable, which macOS 11 does not export: a call
+	// through IOPCIDevice's vtable, the same slot on macOS 11 to 26 (ReimsGraphics::start).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	pci->setBusMasterEnable(true);
+#pragma clang diagnostic pop
 
 	registerMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
 	if (!registerMap) {

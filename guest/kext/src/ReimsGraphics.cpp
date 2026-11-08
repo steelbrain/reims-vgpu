@@ -1105,7 +1105,14 @@ bool ReimsGraphics::start(IOService *provider)
 	roomRecords = 0;
 
 	pci->setMemoryEnable(true);
-	pci->setBusLeadEnable(true);
+	// setBusMasterEnable, which the SDK deprecates in favour of setBusLeadEnable: it is virtual, so
+	// the call goes through IOPCIDevice's vtable, whose slot for it holds the same member on macOS 11
+	// to 26, and the kext imports nothing for it. setBusLeadEnable is a plain member the kernel links
+	// by name, and macOS 11's IOPCIFamily does not export it.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	pci->setBusMasterEnable(true);
+#pragma clang diagnostic pop
 
 	int msixIndex = -1;
 	IOReturn r = kIOReturnSuccess;

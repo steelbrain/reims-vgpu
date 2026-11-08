@@ -75,8 +75,12 @@ BUILD    = build
 CXX      = xcrun clang++
 
 # Shared flags. The serialiser check already builds -Wall -Wextra -Werror; the
-# shell holds to the same bar.
-CXXFLAGS = -isysroot $(SDK) -std=c++17 -Os \
+# shell holds to the same bar. The deployment target is macOS 11.0, the oldest
+# release the guest kexts serve: every symbol the SDK marks newer is then a weak
+# import, which dyld leaves NULL on a release that lacks it, where a strong one
+# would make dyld refuse the whole bundle. A tool that sets its own
+# -mmacosx-version-min later on its line overrides it.
+CXXFLAGS = -isysroot $(SDK) -mmacosx-version-min=11.0 -std=c++17 -Os \
 	-Wall -Wextra -Werror -Wno-unused-parameter \
 	-I src -I $(WIRE)
 
