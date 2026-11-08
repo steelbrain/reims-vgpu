@@ -343,6 +343,14 @@ fn imported_targets_and_their_references() {
         let known: Vec<u64> = reference.hashes.iter().map_while(|h| *h).collect();
         reference_pictures += known.len();
         let mut line = format!("{name}: {} pictures", known.len());
+        // A stream of dropped pictures has the decoder conceal each missing reference with a copy
+        // of another through vaGetImage and vaPutImage, which on radeonsi (Mesa 26.2.6) map an
+        // imported target on the CPU and fault (SIGBUS): a landing in a cache would keep those
+        // stand-ins in the driver's own surfaces, so the probe leaves such streams out.
+        if name.starts_with("drop") {
+            eprintln!("{line}; left out: its concealment copies map the targets on the CPU");
+            continue;
+        }
         for (i, &(what, laid, scribble)) in ways.iter().enumerate() {
             eprintln!("START {name}: {what}");
             let got = run(&display, stream, Some(laid), scribble);
