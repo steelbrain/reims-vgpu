@@ -1,13 +1,12 @@
-//! A held guest surface's memory as a device reaches it, outside any lend,
-//! for a backend whose GPU writes a decoded frame into the guest's pages
-//! itself rather than leaving it for the CPU to copy (ours).
+//! A guest surface's memory as a device reaches it, for a backend whose GPU
+//! writes a decoded frame into the guest's pages itself rather than leaving
+//! it for the CPU to copy (ours).
 //!
-//! - [`DeviceMemory`] is what a host gives of a surface it holds
-//!   ([`crate::surfaces::GuestSurface::device_memory`]): its pages as a
-//!   dma-buf, for a GPU that imports one (VA-API), as one contiguous view
-//!   in the host's address space, for one that registers host memory
-//!   (NVIDIA's `cuMemHostRegister`). Each is the same pages the surface's
-//!   lends give, so what a device writes there is what the guest reads.
+//! - [`DeviceMemory`] is what a host gives of a surface's pages: a dma-buf,
+//!   for a GPU that imports one (VA-API), or one contiguous view in the
+//!   host's address space, for one that registers host memory (NVIDIA's
+//!   `cuMemHostRegister`). Each is the same pages the guest reads, so what a
+//!   device writes there is what the guest reads.
 //! - [`MemoryIdentity`] names one mapping of one surface's pages: the same
 //!   for every hold on that mapping, and never the same for another mapping,
 //!   before or after, so an import kept by it can never be used for a
@@ -36,7 +35,6 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Weak};
 
 use crate::backend::PixelFormat;
-use crate::device_wait::GuestHold;
 use crate::num::ToU64;
 use crate::runtime::Runtime;
 use crate::surfaces::{PlaneLayout, SurfaceError, SurfaceLayout};
@@ -157,7 +155,7 @@ pub trait DeviceMemory: Send + Sync {
     fn identity(&self) -> MemoryIdentity;
 
     /// The bytes from the surface's first byte to the end of its
-    /// allocation, as [`crate::surfaces::GuestSurface::write`] lends them.
+    /// allocation.
     fn length(&self) -> usize;
 
     /// A dma-buf of `ranges` of the surface's bytes, each an offset from
@@ -177,7 +175,7 @@ pub trait DeviceMemory: Send + Sync {
     }
 
     /// One contiguous view of the surface's pages in the host's address
-    /// space, as the CPU's lends reach them, and a hold that keeps it
+    /// space, as the CPU reaches them, and a hold that keeps it
     /// mapped: the caller keeps both by [`DeviceMemory::identity`]. `Err`,
     /// with why, where the host has none.
     fn host_view(&self) -> Result<HostView, SurfaceError> {
@@ -272,21 +270,6 @@ pub struct TargetPlane {
     pub row_bytes: usize,
 }
 
-impl TargetPlane {
-    /// Where its `rows` rows of `row_bytes` bytes end, from the surface's
-    /// first byte: past the last byte a device writing them writes.
-    pub fn end_of(&self, rows: u32, row_bytes: usize) -> Option<usize> {
-        let rows = usize::try_from(rows).ok()?;
-        if rows == 0 {
-            return Some(self.offset);
-        }
-        (rows - 1)
-            .checked_mul(self.bytes_per_row)?
-            .checked_add(row_bytes)?
-            .checked_add(self.offset)
-    }
-}
-
 /// A guest buffer as a backend's device may write it: its memory, and its
 /// layout checked against that memory (module docs).
 ///
@@ -303,7 +286,6 @@ pub struct GuestTarget<'a> {
     width: u32,
     height: u32,
     planes: [TargetPlane; 2],
-    hold: GuestHold,
 }
 
 impl fmt::Debug for GuestTarget<'_> {
@@ -315,7 +297,6 @@ impl fmt::Debug for GuestTarget<'_> {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("planes", &self.planes)
-            .field("hold", &self.hold)
             .finish()
     }
 }
@@ -402,21 +383,7 @@ impl<'a> GuestTarget<'a> {
             width: layout.width,
             height: layout.height,
             planes,
-            hold: GuestHold::nothing(),
         })
-    }
-
-    /// The target with `hold`, the host's hold on the buffer, for
-    /// [`GuestTarget::hold`].
-    pub fn with_hold(self, hold: GuestHold) -> Self {
-        Self { hold, ..self }
-    }
-
-    /// The host's hold on the buffer, to keep while the device may still
-    /// write it past its deadline ([`crate::device_wait`]): while it lives
-    /// the buffer's pages are neither reused nor unmapped. A target made without one holds nothing.
-    pub fn hold(&self) -> GuestHold {
-        self.hold.clone()
     }
 
     /// The memory the planes lie in.
@@ -442,13 +409,6 @@ impl<'a> GuestTarget<'a> {
     /// Its luma plane, then its chroma plane.
     pub fn planes(&self) -> [TargetPlane; 2] {
         self.planes
-    }
-
-    /// The part of a frame of `width` by `height` a write puts in the
-    /// buffer, at its top left: all of it, or what fits, as the CPU's copy
-    /// takes what fits.
-    pub fn written_size(&self, width: u32, height: u32) -> (u32, u32) {
-        (width.min(self.width), height.min(self.height))
     }
 }
 

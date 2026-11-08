@@ -21,9 +21,6 @@ use crate::entry::no_catch;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-mod video;
-
-pub(crate) use video::graphics_video;
 
 /// The sink of a graphics display on the Vulkan platform, over `region`; `None` where the
 /// runtime refuses a queue.

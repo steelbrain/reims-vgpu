@@ -1,12 +1,12 @@
 //! Just enough of the ISO base media file format (ISO/IEC 14496-12) to
-//! take an H.264, HEVC, AV1 or VP9 track's decoder configuration record
-//! (`avcC`, `hvcC`, `av1C`, `vpcC`) and its samples out of an MP4, the way
+//! take an H.264 or HEVC track's decoder configuration record (`avcC`,
+//! `hvcC`) and its samples out of an MP4, the way
 //! VideoToolbox would be handed them: the record from the sample
 //! description, each sample as stored.
 
 /// One track: its decoder configuration record and where its samples are.
 pub struct Track {
-    /// The decoder configuration record: `avcC`, `hvcC`, `av1C` or `vpcC`.
+    /// The decoder configuration record: `avcC` or `hvcC`.
     pub avcc: Vec<u8>,
     /// Each sample's offset in the file and size, in decode order.
     pub samples: Vec<(usize, usize)>,
@@ -60,19 +60,6 @@ pub fn h264_track(file: &[u8]) -> Result<Track, String> {
 /// `hvcC` record in the place of `avcC`.
 pub fn hevc_track(file: &[u8]) -> Result<Track, String> {
     track(file, &[b"hvc1", b"hev1"], b"hvcC").map_err(|e| e.replace("{}", "HEVC"))
-}
-
-/// The first track whose sample description is `av01`, its `av1C` record
-/// in the place of `avcC` (AV1 Codec ISO Media File Format Binding, 2.3).
-pub fn av1_track(file: &[u8]) -> Result<Track, String> {
-    track(file, &[b"av01"], b"av1C").map_err(|e| e.replace("{}", "AV1"))
-}
-
-/// The first track whose sample description is `vp09`, its `vpcC` box's
-/// contents in the place of `avcC` (VP Codec ISO Media File Format
-/// Binding, 2.2).
-pub fn vp9_track(file: &[u8]) -> Result<Track, String> {
-    track(file, &[b"vp09"], b"vpcC").map_err(|e| e.replace("{}", "VP9"))
 }
 
 /// The first track whose sample description is one of `kinds`, with its

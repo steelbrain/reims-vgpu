@@ -39,8 +39,8 @@
 //! lives, so that each frame is answered without a wait of its own.
 //! Nothing of the work is destroyed until the GPU is done with it: a
 //! decoder's surfaces, its staged copy back's memory and its context, an
-//! encoder's session, and a guest buffer zero copy writes, with the host's
-//! hold on it. Nothing a call left on the call thread uses is destroyed
+//! encoder's session, and zero copy's import of a guest buffer. Nothing a
+//! call left on the call thread uses is destroyed
 //! before it returns: the display's releases are made behind it there
 //! (`super::calls`).
 

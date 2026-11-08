@@ -231,28 +231,6 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
     DEVICE.get_or_init(|| device)
 }
 
-/// The device extensions every device enables where it has them, for the video-decode queue's
-/// decodes ([`device_options`]): Vulkan Video's H.264 decode, and `VK_KHR_synchronization2`, whose
-/// commands the decodes record and submit with, core only from Vulkan 1.3, above the runtime's
-/// instance.
-pub const VIDEO_DECODE_EXTENSIONS: [&std::ffi::CStr; 4] = [
-    c"VK_KHR_video_queue",
-    c"VK_KHR_video_decode_queue",
-    c"VK_KHR_video_decode_h264",
-    c"VK_KHR_synchronization2",
-];
-
-/// The device extension of Vulkan Video's H.265 decode, which every device enables where it has
-/// it ([`device_options`]), beside [`VIDEO_DECODE_EXTENSIONS`]: the video-decode queue's decodes
-/// take HEVC where the device has it and the queue's family decodes it, and H.264 without it.
-pub const VIDEO_DECODE_H265_EXTENSION: &std::ffi::CStr = c"VK_KHR_video_decode_h265";
-
-/// The device extension that keeps the video-decode queue's images in one layout, which every
-/// device enables where it has it ([`device_options`]), beside [`VIDEO_DECODE_EXTENSIONS`], with
-/// its `unifiedImageLayoutsVideo` feature where the device has that: its decodes then keep their
-/// pictures in `VK_IMAGE_LAYOUT_GENERAL`, and run beside the copies out of earlier pictures.
-pub const VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION: &std::ffi::CStr = c"VK_KHR_unified_image_layouts";
-
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
@@ -270,27 +248,8 @@ pub const VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION: &std::ffi::CStr = c"VK_KHR_uni
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
 /// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
-/// those below the least severity the log takes ([`crate::answer::least_severity`]), and a
-/// video-decode queue of the caller's, with the extensions its decodes use where the device has
-/// them ([`VIDEO_DECODE_EXTENSIONS`], [`VIDEO_DECODE_H265_EXTENSION`],
-/// [`VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION`]), and one queue of the
-/// runtime's own families reserved for the caller. One set, so the runtime keeps one device per
-/// physical device across `open_device` and every other open.
-///
-/// **The video-decode queue** is the reims-graphics device's hardware video's (reims-vgpu's
-/// `platform::vulkan::graphics_video`), which alone submits to it. A device without a
-/// video-decode family is made all the same, with no such queue, and so is one without the
-/// extensions.
-///
-/// **The reserved queue** is that video's too: it copies decoded pictures out into the
-/// runtime's buffers there, an IOSurface's device cache among them, waiting for each decode on
-/// the GPU, since no runtime work ever runs on it. The runtime takes it off the end of its
-/// round robin, past the queues presenting keeps: on a device whose graphics family has no
-/// queue to spare (MoltenVK's, lavapipe's, a Radeon's single graphics queue) it reserves none,
-/// says so once at info level, and the copies go on a runtime command queue's `VkQueue`
-/// instead. The options are one set for every device, so a device without a video-decode
-/// family that has one to spare reserves it all the same, unused: measured on an RTX 5080
-/// Laptop GPU, whose graphics family has 16 queues, the round robin goes from 14 to 13.
+/// those below the least severity the log takes ([`crate::answer::least_severity`]). One set, so
+/// the runtime keeps one device per physical device across `open_device` and every other open.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
 /// host time its submission ended (`kernelEndTime`, or its queue's latest GPU end before it,
@@ -358,15 +317,6 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
             }
         }
         options.shader_cache.capacity = SHADER_CACHE_CAPACITY;
-        options.extra_queues = vec![ash::vk::QueueFlags::VIDEO_DECODE_KHR];
-        options.reserved_queues = 1;
-        options.optional_device_extensions = (VIDEO_DECODE_EXTENSIONS.iter())
-            .chain([
-                &VIDEO_DECODE_H265_EXTENSION,
-                &VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION,
-            ])
-            .map(|&name| name.to_owned())
-            .collect();
         options
     });
     &OPTIONS

@@ -18,21 +18,15 @@
 //!
 //! **What is kept.** The device may still be writing, so nothing it may
 //! write is handed back or used again until it is done:
-//! - the backend's own memory the work writes (a decode surface, staging
-//!   memory, an encoder's buffers) and the handle it runs on, which the
-//!   backend gives to [`Lingering`] with its question;
-//! - a guest buffer a device writes itself (zero copy): its hold
-//!   ([`GuestHold`], from [`crate::device_memory::GuestTarget::hold`]),
-//!   which the backend keeps with the rest. While a hold lives the
-//!   buffer's pages are neither reused nor unmapped. Once the last of the
-//!   hold goes, the device's write is told of
-//!   ([`GuestHold::report_late_write`]), so that a copy of the pages the
-//!   host keeps elsewhere is not left stale.
+//! the backend's own memory the work writes (a decode surface, staging
+//! memory, an encoder's buffers, an import of a guest buffer the device
+//! writes itself) and the handle it runs on, which the backend gives to
+//! [`Lingering`] with its question.
 //!
 //! [`Lingering`]'s thread asks each kept work's question every
 //! [`LINGER_POLL`], and drops it once the device is done: its memory is
-//! freed, its handle destroyed and its guest buffer let go. Work a device
-//! never finishes is kept until the process ends: that is what is leaked,
+//! freed and its handle destroyed. Work a device never finishes is kept
+//! until the process ends: that is what is leaked,
 //! on purpose, since freeing it would hand memory the device may still
 //! write to the host's allocator or back to the guest.
 //!
@@ -40,8 +34,6 @@
 //! after the work was due at most, and so is not left waiting on a stuck
 //! call.
 
-use std::any::Any;
-use std::fmt;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -114,77 +106,6 @@ fn pause_after(polled: Duration) -> Duration {
 /// A deadline [`DEVICE_WAIT`] from now on `runtime`'s clock.
 pub fn deadline(runtime: &dyn Runtime) -> MonoTime {
     runtime.deadline_in(DEVICE_WAIT)
-}
-
-/// Keeps a guest buffer held while it lives, as the host's own use of it
-/// does: its pages are neither reused nor unmapped (module docs). Made by
-/// the host for each buffer it lends a device
-/// ([`crate::device_memory::GuestTarget::hold`]).
-///
-/// **A write past the deadline.** A device that missed its deadline may
-/// still write the buffer, after the call that lent it has answered the
-/// guest and told the host nothing of that write; the host may keep a copy
-/// of those pages that the write makes stale
-/// ([`crate::surfaces::GuestSurface::device_wrote`]). So the call's owner,
-/// where the call fails, gives the hold what tells of the write
-/// ([`GuestHold::report_late_write`]): it runs once every holder has let
-/// go, the work a backend kept until its device is done among them
-/// ([`Lingering`]), and before what the hold holds goes.
-#[derive(Clone)]
-pub struct GuestHold(Option<Arc<Held>>);
-
-/// What a [`GuestHold`] holds, and what tells of a write past the deadline.
-struct Held {
-    _held: Arc<dyn Any + Send + Sync>,
-    late_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-}
-
-impl Drop for Held {
-    /// The last holder let go: a write past the deadline is told of, then
-    /// what was held goes.
-    fn drop(&mut self) {
-        let wrote = self.late_write.lock().take();
-        if let Some(wrote) = wrote {
-            wrote();
-        }
-    }
-}
-
-impl GuestHold {
-    /// A hold on whatever `held` holds while it lives.
-    pub fn new(held: Arc<dyn Any + Send + Sync>) -> Self {
-        Self(Some(Arc::new(Held {
-            _held: held,
-            late_write: Mutex::new(None),
-        })))
-    }
-
-    /// A hold of nothing: a target a test makes over memory no host
-    /// holds.
-    pub fn nothing() -> Self {
-        Self(None)
-    }
-
-    /// The call this hold was made for failed, and a device may still write
-    /// the buffer: `wrote` tells of that write once every holder has let go
-    /// (the type's docs), in place of what was given before. A hold of
-    /// nothing tells at once.
-    pub fn report_late_write(&self, wrote: Box<dyn FnOnce() + Send>) {
-        match &self.0 {
-            Some(held) => *held.late_write.lock() = Some(wrote),
-            None => wrote(),
-        }
-    }
-}
-
-impl fmt::Debug for GuestHold {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.0.is_some() {
-            "GuestHold(held)"
-        } else {
-            "GuestHold(nothing)"
-        })
-    }
 }
 
 /// Work a device did not finish by its deadline, with everything it may

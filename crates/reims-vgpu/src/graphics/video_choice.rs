@@ -5,7 +5,6 @@
 //!
 //! 1. NVDEC, where the device is an NVIDIA GPU that CUDA opens (Linux: `super::nvidia`).
 //! 2. VA-API, on the device's render node, whatever its vendor (Linux: `super::vaapi`).
-//! 3. Vulkan Video, on the device's video-decode queue (`super::vulkan::video`).
 
 use std::sync::Arc;
 
@@ -29,6 +28,6 @@ pub(crate) fn graphics_video(
     if let Some(video) = super::vaapi::open_on(device, Arc::clone(&runtime)) {
         return Some(video);
     }
-    let _ = runtime;
-    super::vulkan::graphics_video(device)
+    let _ = (device, runtime);
+    None
 }

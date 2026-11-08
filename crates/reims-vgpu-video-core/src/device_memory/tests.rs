@@ -199,9 +199,6 @@ fn a_target_is_its_layout_checked_against_its_memory() -> Result<(), String> {
         (chroma.offset, chroma.rows, chroma.row_bytes),
         (4096, 24, 64)
     );
-    assert_eq!(chroma.end_of(24, 64), Some(4096 + 64 * 24));
-    assert_eq!(luma.end_of(0, 64), Some(0));
-    assert_eq!(target.written_size(80, 40), (64, 40));
 
     // 16-bit samples: a row of 64 needs 128 bytes.
     let mut p010 = nv12(64, 48, [128, 128], [0, 8192]);

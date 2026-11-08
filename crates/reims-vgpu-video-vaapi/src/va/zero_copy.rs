@@ -60,10 +60,9 @@
 //! A frame's decode and its runs are waited for until one deadline
 //! (`super::wait`). Runs past it may still write the guest's pages: the
 //! frame fails as a malfunction, never declined to the CPU's copy, which
-//! would write the buffer too, and the import is kept, with the session's
-//! hold on the buffer, until the GPU is done with each strip, so that the
-//! guest sees the buffer in use until then. The frame's pool is stalled
-//! with it (`super::surface`).
+//! would write the buffer too, and the import is kept until the GPU is done
+//! with each strip. The frame's pool is stalled with it
+//! (`super::surface`).
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::Arc;
@@ -235,9 +234,8 @@ pub(crate) fn write(
     match import.run(frame.surface.id(), x, y, w, deadline) {
         Ok(()) => Ok(DeviceWrite::Written),
         Err(Error::Stalled(what)) => {
-            // The import goes first, then the hold (module docs).
             let works = import.works();
-            let held = (Arc::clone(&import), target.hold());
+            let held = Arc::clone(&import);
             wait::keep(display, "a stalled write into a guest buffer", works, held);
             frame.surface.stalled_if(Err(Error::Stalled(what)))
         }

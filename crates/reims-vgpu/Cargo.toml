@@ -21,9 +21,7 @@ testkit = ["reims-vgpu-core/testkit"]
 # dependencies are not optional, and the feature changes nothing (`build.rs`).
 vulkan = [
     "dep:reims-vgpu-vulkan",
-    "dep:reims-vgpu-video-vulkan",
     "dep:metal2vulkan-runtime",
-    "dep:ash",
 ]
 
 [dependencies]
@@ -52,11 +50,7 @@ libc.workspace = true
 # The Vulkan platform, the library's only one on Linux: the dependencies of the `vulkan` feature,
 # which on macOS are optional (below).
 reims-vgpu-vulkan.workspace = true
-# The reims-graphics device's hardware video on the Vulkan platform (`graphics::vulkan::video`):
-# Vulkan Video's decoders, on the runtime's device and its video-decode queue, through ash.
-reims-vgpu-video-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
-ash.workspace = true
 # The reims-graphics device's hardware video on the host's own video APIs: VA-API on libva and
 # libva-drm (`graphics::vaapi`), and NVIDIA's NVDEC, whose libraries it loads at run time
 # (`graphics::nvidia`).
@@ -73,9 +67,7 @@ objc2-quartz-core = { workspace = true, features = ["CAMetalLayer", "objc2-metal
 # The Vulkan platform on MoltenVK, with the `vulkan` feature: the dependencies Linux always has
 # (above).
 reims-vgpu-vulkan = { workspace = true, optional = true }
-reims-vgpu-video-vulkan = { workspace = true, optional = true }
 metal2vulkan-runtime = { workspace = true, optional = true }
-ash = { workspace = true, optional = true }
 
 [dev-dependencies]
 reims-vgpu-core = { workspace = true, features = ["testkit"] }

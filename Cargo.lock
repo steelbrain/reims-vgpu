@@ -422,7 +422,6 @@ dependencies = [
 name = "reims-vgpu"
 version = "0.1.0"
 dependencies = [
- "ash",
  "libc",
  "log",
  "metal2vulkan-runtime",
@@ -437,7 +436,6 @@ dependencies = [
  "reims-vgpu-video-core",
  "reims-vgpu-video-nvidia",
  "reims-vgpu-video-vaapi",
- "reims-vgpu-video-vulkan",
  "reims-vgpu-vulkan",
  "reims-vgpu-window",
  "sha2 0.10.9",
@@ -516,17 +514,6 @@ dependencies = [
 
 [[package]]
 name = "reims-vgpu-video-vaapi"
-version = "0.1.0"
-dependencies = [
- "ash",
- "log",
- "reims-vgpu-video-codec",
- "reims-vgpu-video-conformance",
- "reims-vgpu-video-core",
-]
-
-[[package]]
-name = "reims-vgpu-video-vulkan"
 version = "0.1.0"
 dependencies = [
  "ash",
