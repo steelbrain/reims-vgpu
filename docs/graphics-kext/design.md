@@ -649,6 +649,18 @@ Stages:
       WhateverGreen, or a second GPU), the name is left as it was and that is
       logged, so two are never published
       (`guest/kext/src/RgfxAccelerator.cpp`, `nameProviderForVideo`).
+    - **macOS 11 keeps small H.264 pictures off the hardware.** AppleGVA's
+      H.264 decoder on 11 declines a picture of at most 480×320 pixels
+      (153,600) where the session plays video (read from AppleGVA's code,
+      108.7.2). Its session create fails with
+      −12913 (`kVTVideoDecoderNotAvailableNowErr`), which
+      `VTIsHardwareDecodeSupported` still counts as supported. AppleGVA logs
+      why only with its debug preference set. From 12 the floor is 64×64
+      (AppleGVA logs "Playback Usage, resolution constrains: 64x64"). A Mac
+      on 11 declines the same streams, so nothing of the device answers it,
+      and a check of 11's hardware H.264 decodes a larger picture. Measured
+      on the 780M host, 2026-11-08: on 11.7.11, 320×240 and 480×320 failed
+      their create and 496×320's succeeded; on 12.7.6 all three decoded.
     - **Capabilities are the host's:** the block lists the engines and, per
       codec and direction, a function record (its ID, sub-ID, input format
       `rawb` for a bitstream or `NV12` for frames, and output formats), from
