@@ -28,6 +28,8 @@ mod readback;
 #[cfg(test)]
 mod spin;
 mod surface;
+#[cfg(test)]
+mod target_probe;
 mod vpp_ffi;
 mod wait;
 mod zero_copy;

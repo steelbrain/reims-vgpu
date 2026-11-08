@@ -224,6 +224,19 @@ pub(crate) fn end_context<'a>(
     wait::keep_work(&display, "a stalled decoder's context", Box::new(kept));
 }
 
+/// What makes a surface the probe's way, for tests: one surface of a format and size.
+#[cfg(test)]
+pub(crate) type MakeSurface =
+    Box<dyn FnMut(&Display, SurfaceFormat, u32, u32) -> Result<ffi::VASurfaceID, Error>>;
+
+#[cfg(test)]
+thread_local! {
+    /// What makes each surface a pool makes on this thread, for tests: where set, a surface over
+    /// memory of the test's own (`super::target_probe`), in place of one the driver allocates.
+    pub(crate) static MAKE_SURFACE: std::cell::RefCell<Option<MakeSurface>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn create_surfaces(
     display: &Display,
     surface_format: SurfaceFormat,
@@ -231,6 +244,19 @@ fn create_surfaces(
     height: u32,
     count: usize,
 ) -> Result<Vec<ffi::VASurfaceID>, Error> {
+    #[cfg(test)]
+    {
+        let made = MAKE_SURFACE.with(|make| {
+            (make.borrow_mut().as_mut()).map(|make| {
+                (0..count)
+                    .map(|_| make(display, surface_format, width, height))
+                    .collect::<Result<Vec<_>, Error>>()
+            })
+        });
+        if let Some(made) = made {
+            return made;
+        }
+    }
     let mut ids = vec![ffi::VA_INVALID_SURFACE; count];
     let mut format = ffi::VASurfaceAttrib::zeroed();
     format.type_ = ffi::VASurfaceAttribPixelFormat;
