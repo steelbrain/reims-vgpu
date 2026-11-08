@@ -142,7 +142,7 @@ is its transport:
   (HVF, TCG) a BH sends it under the BQL. Neither waits for a lock.
 - Under `-display none` the library opens a window for the display, unless
   `REIMS_VGPU_WINDOW` is `0`. It opens at the `resolution` property's size,
-  `<width>x<height>` (1920x1080 without it), a guest point per host point,
+  `<width>x<height>` (1920x1080 without it), a guest pixel per host point,
   shrunk to fit the screen; then the window keeps the size the person gives
   it, and the display offers the guest that size in pixels at the host
   screen's rate. On a KDE Wayland desktop of 3840x2160 at 2.1x, 1829x1029
