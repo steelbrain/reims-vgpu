@@ -2,9 +2,11 @@
 # A copy of a VM's OpenCore image with kexts added: each bundle in
 # EFI/OC/Kexts, with a Kernel > Add entry made as reims-util makes its own
 # (from the image's first entry where it has one: x86_64, its executable and
-# Info.plist, and no Darwin bounds, as guest/prebuilt's set has none). For
-# iterating on the guest kexts (guest/kext, guest/rgfxgate) and the Graft that
-# binds them, without installing anything inside the guest.
+# Info.plist), but with no Darwin bounds, where guest/prebuilt's set has them:
+# the kexts load on whatever release the VM runs, as work on a release the set
+# leaves out needs. For iterating on the guest kexts (guest/kext,
+# guest/rgfxgate) and the Graft that binds them, without installing anything
+# inside the guest.
 #
 #   scripts/internal/opencore-add-kexts.sh SRC OUT KEXT...
 #
