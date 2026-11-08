@@ -1633,7 +1633,16 @@ RGFX_LOG_UNRECOGNIZED
 - (NSUInteger)featureProfile
 {
 	static const bool metalHasArchitecture = objc_getClass("MTLArchitecture") != Nil;
-	return rgfx_profile::forGuest(_caps.size(kRgfxSizeFeatureProfile), metalHasArchitecture);
+	const uint64_t host = _caps.size(kRgfxSizeFeatureProfile);
+	const uint64_t profile = rgfx_profile::forGuest(host, metalHasArchitecture);
+	static std::atomic<bool> logged{false};
+	if (!logged.exchange(true)) {
+		NSLog(@"RGFX: feature profile %llu: the host's is %llu, and the guest's Metal %s the "
+		      @"MTLArchitecture class (logged once a process)",
+		      (unsigned long long)profile, (unsigned long long)host,
+		      metalHasArchitecture ? "has" : "lacks");
+	}
+	return profile;
 }
 
 - (NSUInteger)halfFPConfig
