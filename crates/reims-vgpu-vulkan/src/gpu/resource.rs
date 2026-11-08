@@ -17,7 +17,6 @@ use std::sync::{Arc, Weak};
 use metal2vulkan::metal::{PixelFormat, PrimitiveTopologyClass, TextureType, TextureUsage};
 use metal2vulkan::pipeline::{
     ComputePipelineDescriptor, MeshPipelineDescriptor, RenderPipelineDescriptor,
-    TileRenderPipelineDescriptor,
 };
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
@@ -924,8 +923,6 @@ fn guest_identifier(identifier: u64, indirect: bool) -> u64 {
 pub enum RenderDescriptor {
     /// A drawing pipeline's.
     Render(Box<RenderPipelineDescriptor>),
-    /// A tile pipeline's.
-    Tile(Box<TileRenderPipelineDescriptor>),
     /// A mesh render pipeline's, with what the state answers of the guest's values the runtime's
     /// descriptor does not hold.
     Mesh(Box<MeshDescriptor>),
@@ -1682,7 +1679,7 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     }
 
     /// The texture's resource ID: on Metal a texture's `resourceIndex` is its `gpuResourceID`
-    /// (measured, testing.md's placements).
+    /// (measured).
     fn resource_index(&self) -> u64 {
         plain(|| self.raw.gpu_resource_id()).0
     }

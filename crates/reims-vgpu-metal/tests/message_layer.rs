@@ -112,7 +112,6 @@ const CATCHERS: &[&str] = &["send", "get", "catch", "fatal_send", "value"];
 const HELPERS: &[&str] = &[
     "create_or_error",
     "create_or_die",
-    "deserialize",
     "part",
     "arguments",
     "class_new",

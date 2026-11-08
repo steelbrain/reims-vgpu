@@ -58,7 +58,7 @@ use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _, VertexDra
 use reims_vgpu_core::platform::resource::Library as _;
 use reims_vgpu_core::platform::types::NsRange;
 use reims_vgpu_core::platform::values::{
-    ColorAttachmentSet, RenderPipelineDesc, SamplerDesc, TextureDesc,
+    ColorAttachmentDesc, ColorAttachmentSet, FullRenderPipelineDesc, SamplerDesc, TextureDesc,
 };
 use reims_vgpu_core::raise::OnFault;
 use zerocopy::IntoBytes;
@@ -518,6 +518,21 @@ pub(super) fn test_shaders() -> std::path::PathBuf {
     .join("../../tests/shaders")
 }
 
+/// A colour attachment of `pixel_format` that blends each fragment, its colour premultiplied,
+/// over the target by its alpha: both source factors `one` (1), both destination factors
+/// `oneMinusSourceAlpha` (5).
+pub(super) fn over(pixel_format: u64) -> ColorAttachmentDesc {
+    ColorAttachmentDesc {
+        pixel_format,
+        blending_enabled: true,
+        source_rgb_blend_factor: 1,
+        destination_rgb_blend_factor: 5,
+        source_alpha_blend_factor: 1,
+        destination_alpha_blend_factor: 5,
+        ..ColorAttachmentDesc::default()
+    }
+}
+
 /// A function of the suite's fixture `name`.
 pub(super) fn fixture<P: Platform>(d: &P::Device, name: &str) -> P::Function {
     let path = test_shaders().join(format!("{name}.metallib"));
@@ -590,14 +605,18 @@ impl<P: ApiPlatform> Bench<P> {
             fixture::<P>(&device, "render_ftex"),
         ];
         for n in 0..PIPELINES {
+            let color = if n >= 2 {
+                over(BGRA8)
+            } else {
+                ColorAttachmentDesc {
+                    pixel_format: BGRA8,
+                    ..ColorAttachmentDesc::default()
+                }
+            };
             let pipeline = device
-                .new_render_pipeline_state(&RenderPipelineDesc {
-                    label: None,
-                    vertex: &vertex,
-                    fragment: &colours[(n % 2) as usize],
-                    color0_pixel_format: BGRA8,
-                    blend_over: n >= 2,
-                    resource_index: None,
+                .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                    colors: vec![(0, color)],
+                    ..FullRenderPipelineDesc::new(&vertex, Some(&colours[(n % 2) as usize]))
                 })
                 .unwrap()
                 .unwrap();

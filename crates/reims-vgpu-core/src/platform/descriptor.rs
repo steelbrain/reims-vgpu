@@ -1,7 +1,6 @@
-//! Platform traits for the Metal descriptors core keeps as objects (D5): the texture descriptor,
-//! the render pass descriptor, and the pipeline descriptors Metal makes from serialized data. The
-//! descriptors core only fills in and hands to a creator are values (`platform::values`), which
-//! the platform applies inside the creator.
+//! Platform traits for the Metal descriptors core keeps as objects (D5): the texture descriptor and
+//! the render pass descriptor. The descriptors core only fills in and hands to a creator are values
+//! (`platform::values`), which the platform applies inside the creator.
 //!
 //! A texture descriptor and a render pass descriptor are objects because Metal checks what they
 //! are given when it is set: a pixel format Metal refuses aborts at `setPixelFormat:`, and
@@ -84,22 +83,3 @@ pub trait RenderPassDescriptor<P: Platform>: Handle {
     /// The stencil attachment's load and store actions as Metal reads them (zeros for nil).
     fn stencil_attachment_state(&self) -> AttachmentState;
 }
-
-/// `MTLRenderPipelineDescriptor`, as Metal makes it from serialized data.
-pub trait RenderPipelineDescriptor<P: Platform>: Handle {
-    /// sel: setResourceIndex: then setForceResourceIndex: SPI
-    fn set_resource_index(&self, resource_index: u64, force: bool);
-}
-
-/// `MTLComputePipelineDescriptor`, as Metal makes it from serialized data. `P` is architecture
-/// 4.1's bound (`ComputePipelineDescriptor<Self>`); no method names another handle.
-pub trait ComputePipelineDescriptor<P: Platform>: Handle {
-    /// sel: setResourceIndex: then setForceResourceIndex: SPI
-    fn set_resource_index(&self, resource_index: u64, force: bool);
-}
-
-/// `MTLTileRenderPipelineDescriptor`. Core sends it no selector: it only passes one from
-/// `newTileRenderPipelineDescriptorWithSerializedData:deserializationContext:` to
-/// `newRenderPipelineStateWithTileDescriptor:options:error:` (`GpuDevice`). `P` is architecture
-/// 4.1's bound (`TileRenderPipelineDescriptor<Self>`).
-pub trait TileRenderPipelineDescriptor<P: Platform>: Handle {}

@@ -28,9 +28,8 @@ use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use crate::answer::{get, plain, plain_at, refused};
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
 use crate::gpu::desc::{
-    RenderPassDescriptorObject, TextureDescriptorObject, TextureFields,
-    VulkanComputePipelineDescriptor, VulkanRenderPassDescriptor, VulkanRenderPipelineDescriptor,
-    VulkanTextureDescriptor, VulkanTileRenderPipelineDescriptor,
+    RenderPassDescriptorObject, TextureDescriptorObject, TextureFields, VulkanRenderPassDescriptor,
+    VulkanTextureDescriptor,
 };
 use crate::gpu::device::{self, VulkanDevice};
 use crate::gpu::encode_blit::VulkanBlitEncoder;
@@ -547,9 +546,6 @@ impl Platform for VulkanPlatform {
     type IndirectComputeCommand = VulkanIndirectComputeCommand;
     type TextureDescriptor = VulkanTextureDescriptor;
     type RenderPassDescriptor = VulkanRenderPassDescriptor;
-    type RenderPipelineDescriptor = VulkanRenderPipelineDescriptor;
-    type ComputePipelineDescriptor = VulkanComputePipelineDescriptor;
-    type TileRenderPipelineDescriptor = VulkanTileRenderPipelineDescriptor;
     type RateMapDescriptor = VulkanRateMapDescriptor;
     type RateMapLayerDescriptor = VulkanRateMapLayerDescriptor;
     type AddressRangeArray = VulkanAddressRangeArray;

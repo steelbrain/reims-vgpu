@@ -281,33 +281,6 @@ pub unsafe trait DeviceSpi: Message {
             msg_send![self, newBufferWithBytesNoCopy: bytes, length: length, options: options, deallocator: deallocator]
         }
     }
-    fn newComputePipelineDescriptorWithSerializedData_deserializationContext(
-        &self,
-        data: &DispatchData,
-        context: &AnyObject,
-    ) -> Option<Retained<MTLComputePipelineDescriptor>> {
-        unsafe {
-            msg_send![self, newComputePipelineDescriptorWithSerializedData: data, deserializationContext: context]
-        }
-    }
-    fn newRenderPipelineDescriptorWithSerializedData_deserializationContext(
-        &self,
-        data: &DispatchData,
-        context: &AnyObject,
-    ) -> Option<Retained<MTLRenderPipelineDescriptor>> {
-        unsafe {
-            msg_send![self, newRenderPipelineDescriptorWithSerializedData: data, deserializationContext: context]
-        }
-    }
-    fn newTileRenderPipelineDescriptorWithSerializedData_deserializationContext(
-        &self,
-        data: &DispatchData,
-        context: &AnyObject,
-    ) -> Option<Retained<MTLTileRenderPipelineDescriptor>> {
-        unsafe {
-            msg_send![self, newTileRenderPipelineDescriptorWithSerializedData: data, deserializationContext: context]
-        }
-    }
     fn newSharedTextureWithHandle_withResourceIndex(
         &self,
         handle: Option<&MTLSharedTextureHandle>,

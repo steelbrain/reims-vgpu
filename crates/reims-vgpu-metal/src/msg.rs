@@ -10,8 +10,7 @@
 //!   an `On` call does one or the other as its caller's [`OnFault`] says.
 //! - [`get`]: a call whose raise dies at the call (a getter, a property setter, a Metal C
 //!   function).
-//! - [`catch`]: the call's exception handed back as [`Caught`], for the deserialization sends
-//!   whose raise may be their resolver's own.
+//! - [`catch`]: the call's exception handed back as [`Caught`], the caller's to decide.
 //!
 //! The call runs inside objc2's `exception::catch`, so an Objective-C exception stops at the
 //! call before any Rust frame of the caller unwinds. The closure owns nothing with a `Drop`
@@ -150,7 +149,7 @@ fn exception_detail(name: &str, reason: &str) -> Option<String> {
 }
 
 /// Runs `call`, a send of `sel`, and hands an exception inside it back to the caller, who
-/// decides it (the deserialization sends, whose raise may be their resolver's own).
+/// decides it.
 pub fn catch<R>(sel: &'static str, call: impl FnOnce() -> R) -> Result<R, Caught> {
     exception::catch(AssertUnwindSafe(call)).map_err(|exc| Caught::read(sel, exc.as_deref()))
 }
@@ -275,8 +274,7 @@ mod tests {
         );
     }
 
-    /// `Caught::decide` decides an exception caught at a call by its label, as `send` does: the
-    /// deserialization sends' own decision
+    /// `Caught::decide` decides an exception caught at a call by its label, as `send` does
     #[test]
     fn decide_decides_by_the_label() {
         let a = array();

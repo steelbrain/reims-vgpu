@@ -47,10 +47,10 @@
 //!   not carry. A binary archive miss cannot happen: core's descriptors list no archive.
 //!
 //!   Measured on the M3 Max (macOS 26.7, one case per process, plain and under `MTL_DEBUG_LAYER`):
-//!   the compute creators (both selectors), the render creator and the tile creator answer nil and
-//!   an `NSError` of code 3 for a render state setter on an indirect render command
-//!   (`set_cull_mode`, `set_depth_stencil_state`) in a kernel, vertex, fragment or tile function,
-//!   and for a fragment function's read of a program-scope `thread_index_in_quadgroup` (a read of
+//!   the compute creators (both selectors) and the render creator answer nil and an `NSError` of
+//!   code 3 for a render state setter on an indirect render command (`set_cull_mode`,
+//!   `set_depth_stencil_state`) in a kernel, vertex or fragment function, and for a fragment
+//!   function's read of a program-scope `thread_index_in_quadgroup` (a read of
 //!   `thread_index_in_simdgroup` or `threads_per_simdgroup` there is made); and of code 2
 //!   ("Undefined symbols:") for a function whose import the library at its install name lacks, or
 //!   whose install name names no file. The compute and render creators answer nil and an
@@ -154,8 +154,8 @@ use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunctions, MeshPipelineDescriptor,
     RenderPipelineDescriptor, StageInputAttributeDescriptor, StageInputDescriptor,
-    StageInputLayoutDescriptor, StageSource, TileRenderPipelineDescriptor,
-    VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
+    StageInputLayoutDescriptor, StageSource, VertexAttributeDescriptor,
+    VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
@@ -172,15 +172,13 @@ use crate::answer::{
     Nil, Policy, create, decide_describing, error_text, get_describing, plain, plain_at, relay_gap,
     unrepresentable,
 };
-use crate::gpu::desc::{VulkanRenderPipelineDescriptor, VulkanTileRenderPipelineDescriptor};
-use crate::gpu::device::{VulkanDevice, nil_pipeline_descriptor};
+use crate::gpu::device::VulkanDevice;
 use crate::gpu::metal_value;
 use crate::gpu::resource::{
     MeshAnswers, MeshDescriptor, MeshStageHeld, RenderDescriptor, RenderPipelineObject,
     VulkanDepthStencilState, VulkanFunction, VulkanRenderPipeline, VulkanSamplerState,
     render_pipeline_of, sampler_state,
 };
-use crate::gpu::serialized;
 use crate::gpu::timing;
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -463,15 +461,15 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
 
 /// The `NSError` code of Metal's pipeline creators for a function its compiler refuses on the
 /// device ("Encountered unlowered function call to air.set_cull_mode_render_command", to
-/// `air.get_thread_index_in_quadgroup.i32`), at the compute, render and tile creators (measured:
-/// the module docs), of the render creator for a colour attachment the fragment function's
+/// `air.get_thread_index_in_quadgroup.i32`), at the compute and render creators (measured: the
+/// module docs), of the render creator for a colour attachment the fragment function's
 /// outputs do not fit, and of the compute and render creators for a call through a
 /// visible-function reference nothing linked resolves ([`pipeline_error`]).
 const METAL_REFUSES: i64 = 3;
 
 /// The `NSError` code of Metal's pipeline creators for a function whose import no library it
 /// links exports, the library at its install name loading or not ("Undefined symbols:"), at the
-/// compute, render and tile creators (measured: the module docs).
+/// compute and render creators (measured: the module docs).
 const UNDEFINED_SYMBOLS: i64 = 2;
 
 /// The colour attachment of a raw pixel format, sent with `setPixelFormat:`: none for
@@ -482,8 +480,8 @@ fn color_attachment(raw: u64) -> Option<ColorAttachmentDescriptor> {
 }
 
 /// `newRenderPipelineStateWithDescriptor:error:` of the display's value, or a window cursor's:
-/// its two functions and colour 0's format, blending off or, with `blend_over`, the fragment's
-/// premultiplied colour over by its alpha, no vertex descriptor, the resource index as the placement. The
+/// its two functions and colour 0's format, blending off, no vertex descriptor, the resource index
+/// as the placement. The
 /// compile's refusal of a format the functions cannot write (an integer target) is the
 /// `NSError`, as Metal answers nil and an error there; no path reaches it under a handler, so
 /// every other refusal dies at the send.
@@ -491,22 +489,11 @@ pub(crate) fn new_render_pipeline_state(
     device: &VulkanDevice,
     desc: &RenderPipelineDesc<'_, VulkanPlatform>,
 ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
-    use metal2vulkan::metal::BlendFactor;
-
     let sel = "newRenderPipelineStateWithDescriptor:error:";
     let mut d =
         RenderPipelineDescriptor::new(StageSource::Function(desc.vertex.function_descriptor()));
     d.fragment = Some(StageSource::Function(desc.fragment.function_descriptor()));
     d.color_attachments[0] = color_attachment(desc.color0_pixel_format);
-    if desc.blend_over
-        && let Some(c) = d.color_attachments[0].as_mut()
-    {
-        c.blending_enabled = true;
-        c.source_rgb_blend_factor = BlendFactor::One;
-        c.destination_rgb_blend_factor = BlendFactor::OneMinusSourceAlpha;
-        c.source_alpha_blend_factor = BlendFactor::One;
-        c.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
-    }
     let mut options = rt::PipelineOptions::default();
     options.placement = placement(desc.resource_index);
     options.label = desc.label.map(str::to_owned);
@@ -1024,19 +1011,6 @@ pub(crate) fn full_compute_descriptor(
     d
 }
 
-/// The runtime's options of Metal's raw `MTLPipelineOption`, the state placed at `placement` and
-/// labelled `label`.
-fn pipeline_options(
-    options: u64,
-    placement: rt::IdPlacement,
-    label: Option<String>,
-) -> rt::PipelineOptions {
-    let mut out = rt::PipelineOptions::new(rt::PipelineOption::from_raw(options));
-    out.placement = placement;
-    out.label = label;
-    out
-}
-
 /// A pipeline creator's answer to core: the state, of the descriptor's input primitive topology
 /// `class`, the `NSError` ([`pipeline_error`]), the runtime's refusal as the `NSError` for a gap
 /// of its own or the device's, relayed by default ([`crate::answer::relay_gap`]), or a death at
@@ -1111,11 +1085,10 @@ fn unproven(sel: &'static str, unproven: &rt::Unproven, e: &rt::Error, formats: 
 
 /// What a refused pipeline's descriptor holds that the runtime's error does not say, for its
 /// death's line ([`decide_describing`]): a render descriptor's formats ([`render_formats`]) or a
-/// tile descriptor's ([`tile_formats`]).
+/// mesh descriptor's ([`mesh_formats`]).
 pub(crate) fn formats(d: &RenderDescriptor) -> String {
     match d {
         RenderDescriptor::Render(d) => render_formats(d),
-        RenderDescriptor::Tile(d) => tile_formats(d),
         RenderDescriptor::Mesh(m) => mesh_formats(&m.descriptor),
     }
 }
@@ -1204,13 +1177,6 @@ fn blend_state(c: &ColorAttachmentDescriptor) -> String {
     )
 }
 
-/// A tile descriptor's colour attachment formats, by index.
-pub(crate) fn tile_formats(d: &TileRenderPipelineDescriptor) -> String {
-    let colours = (d.color_attachment_formats.iter().enumerate())
-        .filter_map(|(i, f)| f.map(|f| format!("colour {i} {}", named(f.as_raw(), f.name()))));
-    listed(colours.collect(), "no colour attachments")
-}
-
 /// A compute descriptor's stage-in attribute formats, by index.
 pub(crate) fn compute_formats(d: &ComputePipelineDescriptor) -> String {
     match &d.stage_input {
@@ -1229,120 +1195,17 @@ pub(crate) fn compute_formats(d: &ComputePipelineDescriptor) -> String {
     }
 }
 
-/// `newRenderPipelineStateWithDescriptor:options:reflection:error:` of a guest's descriptor, at
-/// its resource index ([`crate::gpu::desc::PipelineDescriptorObject::placement`]); no reflection
-/// is asked for, as core asks for none. A nil descriptor, an empty blob's, is Metal's `NSError`
-/// for one ([`nil_pipeline_descriptor`]). A pixel format the runtime holds raw dies here
-/// ([`serialized::RawFormat`]). A blob's `textureWriteRoundingMode` of
-/// [`serialized::NEAREST_EVEN`] is decided once the runtime made the state, its compile's refusal
-/// staying the `NSError`: it dies where the state writes what nothing measured at the mode
-/// ([`serialized::rounded_writes`]).
-pub(crate) fn new_render_pipeline_state_from_descriptor(
-    device: &VulkanDevice,
-    descriptor: Option<&VulkanRenderPipelineDescriptor>,
-    options: u64,
-) -> RaiseResult<Result<Option<VulkanRenderPipeline>, NsErrorText>> {
-    let sel = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
-    let Some(descriptor) = descriptor else {
-        return Ok(Err(nil_pipeline_descriptor()));
-    };
-    if let Some(raw) = &descriptor.raw_format {
-        raw.dies(sel);
-    }
-    let (d, placement) = plain(|| (descriptor.desc.lock().clone(), descriptor.placement()));
-    let options = pipeline_options(options, placement, descriptor.label.clone());
-    timing::creation(
-        sel,
-        timing::RENDER_LATER,
-        || {
-            let state = plain_at(sel, || device.raw.new_render_pipeline_state(&d, &options))
-                .map_err(|e| {
-                    let colors = d.color_attachments.map(|c| c.map(|c| c.pixel_format));
-                    let depth = (d.depth_format, d.stencil_format);
-                    serialized::RawFormat::refused(sel, &colors, depth, || render_formats(&d), e)
-                });
-            if descriptor.nearest_even
-                && let Ok(raw) = &state
-                && let Some(what) =
-                    plain(|| serialized::rounded_writes(&d, &raw.fragment_color_outputs()))
-            {
-                serialized::rounded_writes_inexact(sel, &what);
-            }
-            let class = d.input_primitive_topology;
-            made(
-                sel,
-                (class, RenderDescriptor::Render(Box::new(d.clone()))),
-                state,
-            )
-        },
-        || timing::render_stages(&d),
-        |made| timing::raised_answer(made, |s| timing::state(s.unique_identifier())),
-    )
-}
-
-/// `newRenderPipelineStateWithTileDescriptor:options:reflection:error:` of a guest's descriptor;
-/// no reflection is asked for. A tile state takes no resource ID, as Metal's answers 0: core sets
-/// no resource index on a tile descriptor, so its placement is the runtime's. A nil descriptor,
-/// an empty blob's, is Metal's `NSError` for one ([`nil_pipeline_descriptor`]). A pixel format
-/// the runtime holds raw dies here ([`serialized::RawFormat`]).
-pub(crate) fn new_tile_render_pipeline_state(
-    device: &VulkanDevice,
-    descriptor: Option<&VulkanTileRenderPipelineDescriptor>,
-    options: u64,
-) -> RaiseResult<Result<Option<VulkanRenderPipeline>, NsErrorText>> {
-    let sel = "newRenderPipelineStateWithTileDescriptor:options:reflection:error:";
-    let Some(descriptor) = descriptor else {
-        return Ok(Err(nil_pipeline_descriptor()));
-    };
-    if let Some(raw) = &descriptor.raw_format {
-        raw.dies(sel);
-    }
-    let (d, placement) = plain(|| (descriptor.desc.lock().clone(), descriptor.placement()));
-    let options = pipeline_options(options, placement, descriptor.label.clone());
-    timing::creation(
-        sel,
-        timing::DISPATCH_LATER,
-        || {
-            made(
-                sel,
-                (
-                    PrimitiveTopologyClass::Unspecified,
-                    RenderDescriptor::Tile(Box::new(d.clone())),
-                ),
-                plain_at(sel, || {
-                    device.raw.new_tile_render_pipeline_state(&d, &options)
-                })
-                .map_err(|e| {
-                    let colors = d.color_attachment_formats;
-                    serialized::RawFormat::refused(
-                        sel,
-                        &colors,
-                        (None, None),
-                        || tile_formats(&d),
-                        e,
-                    )
-                }),
-            )
-        },
-        || format!("tile {}", timing::stage(&d.tile)),
-        |made| timing::raised_answer(made, |s| timing::state(s.unique_identifier())),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use metal2vulkan::metal::PixelFormat;
-    use metal2vulkan::pipeline::TileRenderPipelineDescriptor;
     use reims_vgpu_core::platform::Handle;
     use reims_vgpu_core::platform::device::GpuDevice;
     use reims_vgpu_core::platform::resource::{DepthStencilState, SamplerState};
     use reims_vgpu_core::platform::resource::{Library, RenderPipeline};
     use reims_vgpu_core::raise::OnFault;
-    use reims_vgpu_core::sync::Mutex;
     use reims_vgpu_core::testkit::capture::catch_death;
 
     use super::*;
-    use crate::gpu::desc::PipelineDescriptorObject;
     use crate::gpu::device::tests::dev;
     use crate::gpu::resource::VulkanFunction;
 
@@ -1391,7 +1254,7 @@ mod tests {
     /// attribute 1 a normalized `uchar4`, buffer 0) and the fragment function that returns the
     /// colour it outputs.
     fn vertex_descriptor_functions() -> (VulkanFunction, VulkanFunction) {
-        use crate::gpu::serialized::tests::fixture_function;
+        use crate::gpu::device::tests::fixture_function;
         (
             fixture_function(include_bytes!(
                 "../../../../tests/shaders/render_vdesc.metallib"
@@ -1562,7 +1425,7 @@ mod tests {
     /// value's other fields are the runtime descriptor's own
     #[test]
     fn a_whole_compute_value_carries_its_stage_input() {
-        use crate::gpu::serialized::tests::{STAGEIN, fixture_function};
+        use crate::gpu::device::tests::{STAGEIN, fixture_function};
         use reims_vgpu_core::platform::resource::ComputePipeline as _;
         use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
         let f = fixture_function(STAGEIN);
@@ -1926,91 +1789,15 @@ mod tests {
         );
     }
 
-    /// The display's vertex and plain fragment functions, from the platform's shader library.
-    fn display_functions(d: &VulkanDevice) -> (VulkanFunction, VulkanFunction) {
-        use reims_vgpu_core::display::pipeline::{FRAGMENT_FUNCTION, VERTEX_FUNCTION};
-        let library = d.new_shader_library().unwrap().unwrap();
-        let function = |name| {
-            library
-                .new_function(OnFault::Return, name)
-                .unwrap()
-                .unwrap()
-        };
-        (function(VERTEX_FUNCTION), function(FRAGMENT_FUNCTION))
-    }
-
     /// The suite's vertex and fragment functions, which use no texture or sampler: a state that
     /// supports indirect command buffers takes them, where Metal and the runtime
     /// refuse one of the display's, whose fragment function samples its texture.
     fn indirect_functions() -> (VulkanFunction, VulkanFunction) {
-        use crate::gpu::serialized::tests::fixture_function;
+        use crate::gpu::device::tests::fixture_function;
         (
             fixture_function(include_bytes!("../../../../tests/shaders/vert.metallib")),
             fixture_function(include_bytes!("../../../../tests/shaders/frag.metallib")),
         )
-    }
-
-    /// A guest's render pipeline descriptor, as the decoder makes one: the two functions, colour
-    /// 0 of `format`, and the resource index core sets.
-    fn guest_descriptor(
-        (vertex, fragment): &(VulkanFunction, VulkanFunction),
-        format: PixelFormat,
-        resource_index: Option<(u64, bool)>,
-    ) -> VulkanRenderPipelineDescriptor {
-        let mut desc =
-            RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
-        desc.fragment = Some(StageSource::Function(fragment.function_descriptor()));
-        desc.color_attachments[0] = Some(ColorAttachmentDescriptor::new(format));
-        Obj::new(PipelineDescriptorObject {
-            desc: Mutex::new(desc),
-            resource_index: Mutex::new(resource_index),
-            ignored: Vec::new(),
-            nearest_even: false,
-            label: None,
-            raw_format: None,
-        })
-    }
-
-    /// A guest's descriptor makes a pipeline, one of indirect command buffer support at its
-    /// resource index (of functions that use no direct texture or sampler), with a new identifier
-    /// at every creation
-    #[test]
-    fn guest_descriptors_make_pipelines() {
-        let d = dev();
-        let functions = display_functions(&d);
-        let indirect = indirect_functions();
-        let placed = guest_descriptor(&indirect, PixelFormat::BGRA8Unorm, Some((9, true)));
-        plain(|| placed.desc.lock().support_indirect_command_buffers = true);
-        let a = d
-            .new_render_pipeline_state_from_descriptor(Some(&placed), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(a.gpu_resource_id(), 9);
-        let any = guest_descriptor(&functions, PixelFormat::BGRA8Unorm, None);
-        let b = d
-            .new_render_pipeline_state_from_descriptor(Some(&any), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        // A state without indirect command buffer support has none, as on Metal.
-        assert_eq!(b.gpu_resource_id(), 0);
-        let c = d
-            .new_render_pipeline_state_from_descriptor(Some(&any), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let ids = [
-            a.unique_identifier(),
-            b.unique_identifier(),
-            c.unique_identifier(),
-        ];
-        assert!(ids.iter().all(|&id| id != 0));
-        assert!(
-            ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2],
-            "{ids:?}"
-        );
-        assert_eq!(b.clone_ref().unique_identifier(), b.unique_identifier());
     }
 
     /// A state of indirect command buffer support sizes its points, as an indirect command that
@@ -2021,21 +1808,20 @@ mod tests {
     fn indirect_states_answer_their_classes_while_they_live() {
         let d = dev();
         let functions = indirect_functions();
+        // `MTLPrimitiveTopologyClassPoint` and `Triangle`.
         let made = |class, indirect| {
-            let desc = guest_descriptor(&functions, PixelFormat::BGRA8Unorm, None);
-            plain(|| {
-                let mut held = desc.desc.lock();
-                held.support_indirect_command_buffers = indirect;
-                held.input_primitive_topology = class;
-            });
-            (d.new_render_pipeline_state_from_descriptor(Some(&desc), 0))
-                .unwrap()
-                .unwrap()
-                .unwrap()
+            d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                colors: crate::gpu::device::tests::colours_of(&[&[(1, 80)]]),
+                input_primitive_topology: class,
+                support_indirect_command_buffers: indirect,
+                ..FullRenderPipelineDesc::new(&functions.0, Some(&functions.1))
+            })
+            .unwrap()
+            .unwrap()
         };
-        let points = made(PrimitiveTopologyClass::Point, true);
-        let triangles = made(PrimitiveTopologyClass::Triangle, true);
-        let direct = made(PrimitiveTopologyClass::Point, false);
+        let points = made(1, true);
+        let triangles = made(3, true);
+        let direct = made(1, false);
         assert_eq!(points_sized(&points.raw), Some(true));
         assert_eq!(points_sized(&triangles.raw), Some(false));
         assert_eq!(points_sized(&direct.raw), None);
@@ -2043,82 +1829,6 @@ mod tests {
         drop(triangles);
         assert_eq!(points_sized(&raw), None);
         assert_eq!(points_sized(&points.raw), Some(true));
-    }
-
-    /// `desc` again, labelled `label`.
-    fn labelled(
-        desc: &VulkanRenderPipelineDescriptor,
-        label: &str,
-    ) -> VulkanRenderPipelineDescriptor {
-        Obj::new(PipelineDescriptorObject {
-            desc: Mutex::new(plain(|| desc.desc.lock().clone())),
-            resource_index: Mutex::new(plain(|| *desc.resource_index.lock())),
-            ignored: Vec::new(),
-            nearest_even: false,
-            label: Some(label.to_owned()),
-            raw_format: None,
-        })
-    }
-
-    /// A descriptor's label and a value's are their states', a diagnostic that changes nothing
-    /// else: the state takes its resource ID, and a compile's refusal is the error, as an
-    /// unlabelled one's
-    #[test]
-    fn render_labels_are_the_states() {
-        use reims_vgpu_core::platform::values::RenderPipelineDesc;
-        let d = dev();
-        let functions = display_functions(&d);
-        let indirect = indirect_functions();
-        let placed = guest_descriptor(&indirect, PixelFormat::BGRA8Unorm, Some((9, true)));
-        let placed = labelled(&placed, "guest");
-        plain(|| placed.desc.lock().support_indirect_command_buffers = true);
-        let a = d
-            .new_render_pipeline_state_from_descriptor(Some(&placed), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!((a.gpu_resource_id(), a.raw.label()), (9, Some("guest")));
-        let integer = guest_descriptor(&functions, PixelFormat::R32Uint, None);
-        let refused = |desc: &VulkanRenderPipelineDescriptor| {
-            d.new_render_pipeline_state_from_descriptor(Some(desc), 0)
-                .unwrap()
-                .unwrap_err()
-        };
-        assert_eq!(refused(&integer), refused(&labelled(&integer, "guest")));
-        let (vertex, fragment) = &functions;
-        let value = d
-            .new_render_pipeline_state(&RenderPipelineDesc {
-                label: Some("display"),
-                vertex,
-                fragment,
-                color0_pixel_format: 80,
-                blend_over: false,
-                resource_index: None,
-            })
-            .unwrap()
-            .unwrap();
-        assert_eq!(value.raw.label(), Some("display"));
-    }
-
-    /// A tile descriptor whose tile function is no kernel is refused, as Metal's compile refuses
-    /// it
-    #[test]
-    fn a_tile_descriptor_of_a_vertex_function_is_refused() {
-        let d = dev();
-        let (vertex, _) = display_functions(&d);
-        let mut desc =
-            TileRenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
-        desc.color_attachment_formats[0] = Some(PixelFormat::BGRA8Unorm);
-        let tile = Obj::new(PipelineDescriptorObject {
-            desc: Mutex::new(desc),
-            resource_index: Mutex::new(None),
-            ignored: Vec::new(),
-            nearest_even: false,
-            label: None,
-            raw_format: None,
-        });
-        let made = d.new_tile_render_pipeline_state(Some(&tile), 0);
-        assert!(!matches!(made, Ok(Ok(Some(_)))), "{made:?}");
     }
 
     /// Equal requests answer one object while it lives, as Metal's do; another request another
@@ -2377,8 +2087,8 @@ mod tests {
 
     /// A refused pipeline's death line names its descriptor's formats, numeric and named: a
     /// render descriptor's colour attachments with their blend states and write masks, its depth
-    /// and stencil and its vertex attributes (the XR10 state 26.6.2's compositor makes), a tile
-    /// descriptor's colours, and a compute descriptor's stage-in attributes
+    /// and stencil and its vertex attributes (the XR10 state 26.6.2's compositor makes), and a
+    /// compute descriptor's stage-in attributes
     #[test]
     fn a_refused_pipeline_names_its_descriptors_formats() {
         use metal2vulkan::metal::{
@@ -2455,17 +2165,6 @@ mod tests {
         );
         d.vertex_descriptor = Some(VertexDescriptor::new());
         assert!(render_formats(&d).ends_with(", no vertex attributes"));
-
-        let mut t = TileRenderPipelineDescriptor::new(cpu_stage());
-        assert_eq!(
-            formats(&RenderDescriptor::Tile(Box::new(t.clone()))),
-            "the descriptor's formats: no colour attachments"
-        );
-        t.color_attachment_formats[1] = Some(PixelFormat::BGRA8Unorm);
-        assert_eq!(
-            tile_formats(&t),
-            "the descriptor's formats: colour 1 80 (MTLPixelFormatBGRA8Unorm)"
-        );
 
         let mut c = ComputePipelineDescriptor::new(cpu_stage());
         assert_eq!(

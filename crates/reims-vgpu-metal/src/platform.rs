@@ -26,10 +26,7 @@ use reims_vgpu_core::platform::{Handle, ObjId, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
 use crate::gpu::command::{MetalCommandBuffer, MetalCommandQueue};
-use crate::gpu::desc::{
-    MetalComputePipelineDescriptor, MetalRenderPassDescriptor, MetalRenderPipelineDescriptor,
-    MetalTextureDescriptor, MetalTileRenderPipelineDescriptor,
-};
+use crate::gpu::desc::{MetalRenderPassDescriptor, MetalTextureDescriptor};
 use crate::gpu::device::MetalDevice;
 use crate::gpu::encode_blit::MetalBlitEncoder;
 use crate::gpu::encode_compute::MetalComputeEncoder;
@@ -274,9 +271,6 @@ impl Platform for MetalPlatform {
     type IndirectComputeCommand = MetalIndirectComputeCommand;
     type TextureDescriptor = MetalTextureDescriptor;
     type RenderPassDescriptor = MetalRenderPassDescriptor;
-    type RenderPipelineDescriptor = MetalRenderPipelineDescriptor;
-    type ComputePipelineDescriptor = MetalComputePipelineDescriptor;
-    type TileRenderPipelineDescriptor = MetalTileRenderPipelineDescriptor;
     type RateMapDescriptor = MetalRateMapDescriptor;
     type RateMapLayerDescriptor = MetalRateMapLayerDescriptor;
     type AddressRangeArray = MetalAddressRangeArray;

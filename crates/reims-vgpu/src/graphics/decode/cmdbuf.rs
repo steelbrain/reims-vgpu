@@ -5626,7 +5626,6 @@ mod tests {
                 vertex: &fixture::<P>(&device, "render_vbuf"),
                 fragment: &fixture::<P>(&device, "render_color"),
                 color0_pixel_format: BGRA8,
-                blend_over: false,
                 resource_index: None,
             })
             .unwrap()

@@ -667,7 +667,7 @@ impl Reflection {
     /// alone: a function whose argument types Metal's reflection is unmeasured for still answers,
     /// where its reflection is refused. A render or mesh render state with rasterization off runs
     /// no fragment function, whose slots it writes none of, though its descriptor keeps the
-    /// function (`crate::gpu::serialized`).
+    /// function.
     pub fn slots(&self) -> Result<&[Slots], &str> {
         let read = self.slots.get_or_init(|| {
             let budget = metal2vulkan::Budget::standard();
@@ -681,7 +681,6 @@ impl Reflection {
                         RenderDescriptor::Render(d) => {
                             (plain(|| d.slot_writes(&budget)), d.rasterization_enabled)
                         }
-                        RenderDescriptor::Tile(d) => (plain(|| d.slot_writes(&budget)), true),
                         RenderDescriptor::Mesh(m) => (
                             plain(|| m.descriptor.slot_writes(&budget)),
                             m.descriptor.rasterization_enabled,

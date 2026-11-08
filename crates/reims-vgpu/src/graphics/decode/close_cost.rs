@@ -187,7 +187,6 @@ fn made<P: ApiPlatform>(kind: Kind, n: u64) -> (GraphicsDecoder<P>, P::Device) {
                             vertex,
                             fragment,
                             color0_pixel_format: BGRA8,
-                            blend_over: false,
                             resource_index: None,
                         })
                         .unwrap()

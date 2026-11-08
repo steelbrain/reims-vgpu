@@ -384,19 +384,16 @@ MTLDevice name @@:
 MTLDevice newBufferWithBytesNoCopy:length:options:deallocator: @@:^vQQ@?
 MTLDevice newBufferWithDescriptor: @@:@
 MTLDevice newBufferWithIOSurface: @@:^{__IOSurface=}
-MTLDevice newComputePipelineDescriptorWithSerializedData:deserializationContext: @@:@@
 MTLDevice newComputePipelineStateWithDescriptor:options:reflection:error: @@:@Q^@^@
 MTLDevice newComputePipelineStateWithFunction:error: @@:@^@
 MTLDevice newLibraryWithData:error: @@:@^@
 MTLDevice newLibraryWithSource:options:error: @@:@@^@
-MTLDevice newRenderPipelineDescriptorWithSerializedData:deserializationContext: @@:@@
 MTLDevice newRenderPipelineStateWithDescriptor:error: @@:@^@
 MTLDevice newRenderPipelineStateWithDescriptor:options:reflection:error: @@:@Q^@^@
 MTLDevice newRenderPipelineStateWithTileDescriptor:options:reflection:error: @@:@Q^@^@
 MTLDevice newSharedEventWithHandle: @@:@
 MTLDevice newSharedTextureWithHandle:withResourceIndex: @@:@Q
 MTLDevice newTextureWithDescriptor:iosurface:plane: @@:@^{__IOSurface=}Q
-MTLDevice newTileRenderPipelineDescriptorWithSerializedData:deserializationContext: @@:@@
 MTLDevice reserveResourceIndicesForResourceType:indices:indexCount: v@:Q^QQ
 MTLDevice singleFPConfig Q@:
 MTLDevice supportsBufferWithAddressRanges B@:
@@ -689,7 +686,7 @@ fn every_spi_declaration_matches_the_runtime() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert_eq!(rows.len(), 258);
+    assert_eq!(rows.len(), 255);
 }
 
 /// The render-encoder SPI the host's AGX render encoder does not implement stays unimplemented

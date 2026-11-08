@@ -266,7 +266,6 @@ impl<P: Platform> Objects<P> {
                 vertex: &vertex,
                 fragment: &fragment,
                 color0_pixel_format: BGRA8,
-                blend_over: false,
                 resource_index: None,
             })
             .unwrap()

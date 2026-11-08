@@ -4940,7 +4940,7 @@ const LAST_ASKED_PIXEL_FORMAT: u64 = 2047;
 /// value it does not take ("pixelFormat (2000) is not a valid MTLPixelFormat"), and every texture
 /// creator and the state's creation at one it takes but describes none for ("MTLTextureDescriptor
 /// has invalid pixelFormat (630)"; measured on the M3 Max, which the Vulkan platform imitates as
-/// deaths at the creator, `reims_vgpu_vulkan`'s `gpu::desc` and `gpu::serialized`). A Metal
+/// deaths at the op, `reims_vgpu_vulkan`'s `gpu::desc` and `gpu::states`). A Metal
 /// assertion is no death of the library's, so on a Mac host no refusal scope takes it: the lane
 /// refuses such an op itself, before any platform call (docs/graphics-kext/design.md, "Guest
 /// input the host refuses"). The guest's bundle sends only formats it read from a real

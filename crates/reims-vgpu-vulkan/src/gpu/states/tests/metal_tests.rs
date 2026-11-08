@@ -2,46 +2,6 @@
 
 use super::*;
 
-/// A format the functions cannot write is the NSError Metal hands back; so is a nil
-/// descriptor, of Metal's code and text for one at each creator (compared on the host) in the
-/// runtime's domain
-#[test]
-fn guest_descriptor_refusals() {
-    let d = dev();
-    let functions = display_functions(&d);
-    let integer = guest_descriptor(&functions, PixelFormat::R32Uint, None);
-    let error = d
-        .new_render_pipeline_state_from_descriptor(Some(&integer), 0)
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.domain, "metal2vulkan-runtime");
-    let nil = d
-        .new_render_pipeline_state_from_descriptor(None, 0)
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(nil, nil_pipeline_descriptor());
-    let nil = d
-        .new_tile_render_pipeline_state(None, 0)
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(nil, nil_pipeline_descriptor());
-    assert_eq!(nil.domain, crate::answer::RUNTIME_DOMAIN);
-    if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-        let errors = [
-            md.new_compute_pipeline_state(None, 0).unwrap().err(),
-            md.new_render_pipeline_state_from_descriptor(None, 0)
-                .unwrap()
-                .err(),
-            md.new_tile_render_pipeline_state(None, 0).unwrap().err(),
-        ];
-        for error in errors {
-            let error = error.unwrap();
-            assert_eq!(error.code, nil.code, "{error}");
-            assert!(error.description.contains(&nil.description), "{error}");
-        }
-    }
-}
-
 /// `numbered_samplers.metal`'s functions, compiled by build.rs.
 const NUMBERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbered_samplers.metallib"));
 
@@ -139,7 +99,6 @@ fn numbered_ids<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> Vec<(&
         vertex: &v,
         fragment: &fr,
         color0_pixel_format: 80,
-        blend_over: false,
         resource_index: None,
     };
     let r = pooled(|| d.new_render_pipeline_state(&desc).unwrap().unwrap());
@@ -723,7 +682,6 @@ fn held_draw<P: reims_vgpu_core::platform::Platform>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: 80,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -850,20 +808,20 @@ fn a_texture_slot_sampled_through_an_argument_buffers_sampler_dies_where_it_is_m
 }
 
 /// The functions each pipeline test of [`refusals_metal_answers_are_its_nserror_codes`]
-/// makes: kernels by `newComputePipelineStateWithFunction:error:` and by a guest descriptor,
-/// vertex and fragment pairs by a guest render descriptor, and tile functions by a guest tile
-/// descriptor.
-type Pipelines<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a [&'a str]);
+/// makes: kernels by `newComputePipelineStateWithFunction:error:` and by a whole compute value,
+/// and vertex and fragment pairs by a whole render value.
+type Pipelines<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
 
 /// What each creator answers on `d` for the functions `pipelines` names of the metallib
 /// `library`, by name: `Ok` for a state, `Err` of the `NSError`'s code.
 fn answers<P: reims_vgpu_core::platform::Platform>(
     d: &P::Device,
     library: &[u8],
-    (kernels, renders, tiles): Pipelines<'_>,
+    (kernels, renders): Pipelines<'_>,
 ) -> Vec<(String, Result<(), i64>)> {
-    use crate::gpu::serialized::tests::{hex, pipeline_blob};
-    use reims_vgpu_core::rt::Hold;
+    use reims_vgpu_core::platform::values::FullComputePipelineDesc;
+
+    use crate::gpu::device::tests::render_value;
     let library = d.new_library(library).unwrap().unwrap().unwrap();
     let function = |name: &str| {
         library
@@ -883,16 +841,7 @@ fn answers<P: reims_vgpu_core::platform::Platform>(
             format!("{name} by function"),
             made.map(|s| s.map(drop)),
         ));
-        let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 5).then(|| f.clone_ref()));
-        let desc = d
-            .deserialize_compute_pipeline_descriptor(
-                Hold::NONE,
-                &hex("01 00 04 05000000"),
-                &mut resolve,
-            )
-            .unwrap()
-            .unwrap();
-        let made = d.new_compute_pipeline_state(Some(&desc), 0).unwrap();
+        let made = d.new_compute_pipeline_state_full(&FullComputePipelineDesc::new(&f));
         out.push(answer(
             format!("{name} by descriptor"),
             made.map(|s| s.map(drop)),
@@ -900,41 +849,10 @@ fn answers<P: reims_vgpu_core::platform::Platform>(
     }
     for &(vertex, fragment) in renders {
         let (v, f) = (function(vertex), function(fragment));
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            Ok(match r {
-                0x21 => Some(v.clone_ref()),
-                0x22 => Some(f.clone_ref()),
-                _ => None,
-            })
-        };
-        let desc = d
-            .deserialize_render_pipeline_descriptor(
-                Hold::NONE,
-                &pipeline_blob("basic", 0x21, 0x22, 0),
-                &mut resolve,
-            )
-            .unwrap()
-            .unwrap();
-        let made = d.new_render_pipeline_state_from_descriptor(Some(&desc), 0);
-        let made = made.unwrap().map(|s| s.map(drop));
-        out.push(answer(format!("{vertex} and {fragment}"), made));
-    }
-    for &name in tiles {
-        let t = function(name);
-        let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 0x31).then(|| t.clone_ref()));
-        let desc = d
-            .deserialize_tile_render_pipeline_descriptor(
-                Hold::NONE,
-                &pipeline_blob("tile", 0, 0, 0x31),
-                0x100,
-                &mut resolve,
-            )
-            .unwrap()
-            .unwrap();
-        let made = d.new_tile_render_pipeline_state(Some(&desc), 0);
+        let made = d.new_render_pipeline_state_full(&render_value::<P>((&v, &f), 1, &[&[(1, 70)]]));
         out.push(answer(
-            format!("{name} by tile"),
-            made.unwrap().map(|s| s.map(drop)),
+            format!("{vertex} and {fragment}"),
+            made.map(|s| s.map(drop)),
         ));
     }
     out
@@ -963,9 +881,8 @@ fn refusals_metal_answers_are_its_nserror_codes() {
             ("v_plain", "f_quad_lane16"),
             ("v_plain", "f_simd_width"),
         ],
-        &["t_cull", "t_draw"],
     );
-    let imports: Pipelines<'_> = (&["k_import"], &[("v_import", "f_import")], &["t_import"]);
+    let imports: Pipelines<'_> = (&["k_import"], &[("v_import", "f_import")]);
     // Read at run time: each names the build's `OUT_DIR` as its library's install name.
     let import = |name: &str| {
         std::fs::read(crate::gpu::device::tests::out_dir().join(format!("{name}.metallib")))
@@ -994,14 +911,12 @@ fn refusals_metal_answers_are_its_nserror_codes() {
                 Err(3),
                 Err(3),
                 Ok(()),
-                Err(3),
-                Ok(()),
             ]
             .as_slice(),
         ),
-        (&ext[..], imports, &[Ok(()); 4]),
-        (&other[..], imports, &[Err(2); 4]),
-        (&absent[..], imports, &[Err(2); 4]),
+        (&ext[..], imports, &[Ok(()); 3]),
+        (&other[..], imports, &[Err(2); 3]),
+        (&absent[..], imports, &[Err(2); 3]),
     ];
     let library = d
         .new_library(include_bytes!(concat!(
@@ -1038,23 +953,47 @@ const DIRECT_ARGUMENT: [&str; 3] = [
     "Compute function cannot be used with indirect command buffers",
 ];
 
-/// A case of [`indirect_answers`]: its name, its serialized descriptor in hex, and the
-/// metallibs whose first function each ref resolves to.
-type IndirectCase<'a> = (&'a str, &'a str, &'a [(u64, &'a [u8])]);
+/// A case of [`indirect_answers`]: its name, its whole value, and the metallibs whose first
+/// function each ref is: 5 the kernel, 0x21 the vertex function and 0x22 the fragment function,
+/// where it has one.
+type IndirectCase<'a> = (&'a str, IndirectValue<'a>, &'a [(u64, &'a [u8])]);
+
+/// The whole value of an [`IndirectCase`]: a compute value where its name says so, else a
+/// render value into `colours` ([`colours_of`]), rasterizing where `rasterization` says; each
+/// with indirect command buffer support where `indirect` says.
+///
+/// [`colours_of`]: crate::gpu::device::tests::colours_of
+#[derive(Clone, Copy, Debug)]
+struct IndirectValue<'a> {
+    indirect: bool,
+    colours: &'a [&'a [(u8, u32)]],
+    rasterization: bool,
+}
+
+/// Colour 0 `RGBA8Unorm`, Metal's defaults elsewhere.
+const RGBA8: &[&[(u8, u32)]] = &[&[(1, 70)]];
+
+/// A render value into [`RGBA8`], rasterizing, with indirect command buffer support.
+const INDIRECT: IndirectValue<'static> = IndirectValue {
+    indirect: true,
+    colours: RGBA8,
+    rasterization: true,
+};
 
 /// A creator's answer in [`indirect_answers`]: `Ok` for a state, `Err` of the `NSError`'s
 /// code and which of [`DIRECT_ARGUMENT`] its description holds, in the order it holds them.
 type IndirectAnswer = Result<(), (i64, Vec<usize>)>;
 
-/// What the compute and render creators answer on `d` for each of `cases`, a serialized
-/// descriptor (compute where its name says so) and the fixture functions its refs 5 (a
-/// kernel), 0x21 (a vertex function) and 0x22 (a fragment function) resolve to, by name.
+/// What the compute and render creators answer on `d` for each of `cases`, a whole value
+/// (compute where its name says so) of the fixture functions its refs 5 (a kernel), 0x21 (a
+/// vertex function) and 0x22 (a fragment function, where it has one) are, by name.
 fn indirect_answers<P: reims_vgpu_core::platform::Platform>(
     d: &P::Device,
     cases: &[IndirectCase<'_>],
 ) -> Vec<(String, IndirectAnswer)> {
-    use crate::gpu::serialized::tests::hex;
-    use reims_vgpu_core::rt::Hold;
+    use reims_vgpu_core::platform::values::{FullComputePipelineDesc, FullRenderPipelineDesc};
+
+    use crate::gpu::device::tests::colours_of;
     let function = |bytes: &[u8]| {
         let library = d.new_library(bytes).unwrap().unwrap().unwrap();
         let name = library.function_names().remove(0);
@@ -1064,26 +1003,26 @@ fn indirect_answers<P: reims_vgpu_core::platform::Platform>(
             .unwrap()
     };
     let mut out = Vec::new();
-    for &(name, blob, functions) in cases {
+    for &(name, value, functions) in cases {
         let functions: Vec<_> = functions.iter().map(|&(r, f)| (r, function(f))).collect();
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            Ok(functions
-                .iter()
-                .find(|(at, _)| *at == r)
-                .map(|(_, f)| f.clone_ref()))
-        };
+        let at = |r: u64| functions.iter().find(|(at, _)| *at == r).map(|(_, f)| f);
         let made = if name.starts_with("compute") {
-            let desc = d
-                .deserialize_compute_pipeline_descriptor(Hold::NONE, &hex(blob), &mut resolve)
-                .unwrap();
-            let made = d.new_compute_pipeline_state(desc.as_ref(), 0).unwrap();
-            made.map(|s| s.is_some())
+            d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+                support_indirect_command_buffers: value.indirect,
+                ..FullComputePipelineDesc::new(at(5).expect("a kernel at 5"))
+            })
+            .map(|s| s.is_some())
         } else {
-            let desc = d
-                .deserialize_render_pipeline_descriptor(Hold::NONE, &hex(blob), &mut resolve)
-                .unwrap();
-            let made = d.new_render_pipeline_state_from_descriptor(desc.as_ref(), 0);
-            made.unwrap().map(|s| s.is_some())
+            d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                colors: colours_of(value.colours),
+                rasterization_enabled: value.rasterization,
+                support_indirect_command_buffers: value.indirect,
+                ..FullRenderPipelineDesc::new(
+                    at(0x21).expect("a vertex function at 0x21"),
+                    at(0x22),
+                )
+            })
+            .map(|s| s.is_some())
         };
         let answer = made
             .map(|state| assert!(state, "{name}: nil"))
@@ -1101,7 +1040,7 @@ fn indirect_answers<P: reims_vgpu_core::platform::Platform>(
     out
 }
 
-/// A state that supports indirect command buffers (compute key 7, render key 25) whose
+/// A state that supports indirect command buffers whose
 /// kernel, vertex or fragment function uses a direct texture and sampler argument once Metal
 /// links the pipeline is the `NSError` at its creator, of Metal's code (3) and Metal's
 /// description, in the runtime's domain: where both functions use one, the description names
@@ -1132,104 +1071,99 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     let (render_vtex, render_ftex) = (shader!("render_vtex"), shader!("render_ftex"));
     let render_color = shader!("render_color");
     let colour_1 = &include_bytes!(concat!(env!("OUT_DIR"), "/icb_color1.metallib"))[..];
-    // Colour 0 `RGBA8Unorm`, and the functions at 0x21 and 0x22, with key 25 set to 1 or not.
-    let colour = "01000000 08000000 02 00 04 00000000 01 04 46000000";
-    let indirect =
-        format!("04 08 04 1c000000 01 04 21000000 02 04 22000000 19 04 01000000 000000 {colour}");
-    let direct = format!("03 08 04 14000000 01 04 21000000 02 04 22000000 00 {colour}");
+    let (indirect, direct) = (
+        INDIRECT,
+        IndirectValue {
+            indirect: false,
+            ..INDIRECT
+        },
+    );
+    let compute = IndirectValue {
+        colours: &[],
+        ..INDIRECT
+    };
     let cases: &[IndirectCase<'_>] = &[
+        ("compute", compute, &[(5, sample_k)]),
         (
-            "compute",
-            "02 07 04 01000000 00 04 05000000",
+            "compute plain",
+            IndirectValue {
+                indirect: false,
+                ..compute
+            },
             &[(5, sample_k)],
         ),
-        ("compute plain", "01 00 04 05000000", &[(5, sample_k)]),
-        (
-            "compute no texture",
-            "02 07 04 01000000 00 04 05000000",
-            &[(5, double_gid)],
-        ),
+        ("compute no texture", compute, &[(5, double_gid)]),
         (
             "fragment",
-            &indirect,
+            indirect,
             &[(0x21, tri_vert), (0x22, render_ftex)],
         ),
         (
             "both",
-            &indirect,
+            indirect,
             &[(0x21, render_vtex), (0x22, render_ftex)],
         ),
         (
             "fragment plain",
-            &direct,
+            direct,
             &[(0x21, tri_vert), (0x22, render_ftex)],
         ),
         (
             "no texture",
-            &indirect,
+            indirect,
             &[(0x21, tri_vert), (0x22, tri_frag)],
         ),
         (
             "vertex plain",
-            &direct,
+            direct,
             &[(0x21, render_vtex), (0x22, render_color)],
         ),
     ];
     // A vertex function's sample: Metal refuses the state where it reaches a colour the
     // fragment function reads, and makes it where the fragment function reads none or there
     // is none. A fragment function's sample where no colour attachment is written: Metal
-    // makes the state. Two attachments: offsets 12 and 12 plus the first's length.
-    let indirect_with = |colours: &str| {
-        format!("04 08 04 1c000000 01 04 21000000 02 04 22000000 19 04 01000000 000000 {colours}")
+    // makes the state.
+    let indirect_with = |colours| IndirectValue {
+        colours,
+        ..INDIRECT
     };
-    let invalid = indirect_with("01000000 08000000 02 00 04 00000000 01 04 00000000");
-    let unwritten =
-        indirect_with("01000000 08000000 03 00 04 00000000 01 04 46000000 09 04 00000000");
-    let invalid_then_1 = indirect_with(
-        "02000000 0c000000 19000000 02 00 04 00000000 01 04 00000000 \
-         02 00 04 01000000 01 04 46000000",
-    );
-    let unwritten_then_1 = indirect_with(
-        "02000000 0c000000 1f000000 03 00 04 00000000 01 04 46000000 09 04 00000000 \
-         02 00 04 01000000 01 04 46000000",
-    );
+    let invalid = indirect_with(&[&[(1, 0)]]);
+    let unwritten = indirect_with(&[&[(1, 70), (9, 0)]]);
+    let invalid_then_1 = indirect_with(&[&[(1, 0)], &[(0, 1), (1, 70)]]);
+    let unwritten_then_1 = indirect_with(&[&[(1, 70), (9, 0)], &[(0, 1), (1, 70)]]);
     let fragment: &[(u64, &[u8])] = &[(0x21, tri_vert), (0x22, render_ftex)];
     let linked: &[IndirectCase<'_>] = &[
         (
             "vertex",
-            &indirect,
+            indirect,
             &[(0x21, render_vtex), (0x22, render_color)],
         ),
         (
             "vertex unread",
-            &indirect,
+            indirect,
             &[(0x21, render_vtex), (0x22, tri_frag)],
         ),
-        (
-            "vertex alone",
-            "02 01 04 21000000 19 04 01000000",
-            &[(0x21, render_vtex)],
-        ),
+        ("vertex alone", indirect_with(&[]), &[(0x21, render_vtex)]),
         (
             "fragment, no colour attachment",
-            "03 01 04 21000000 02 04 22000000 19 04 01000000",
+            indirect_with(&[]),
             fragment,
         ),
-        ("fragment, colour 0 Invalid", &invalid, fragment),
-        ("fragment, colour 0 unwritten", &unwritten, fragment),
+        ("fragment, colour 0 Invalid", invalid, fragment),
+        ("fragment, colour 0 unwritten", unwritten, fragment),
         (
             "fragment, colour 0 Invalid, colour 1 written",
-            &invalid_then_1,
+            invalid_then_1,
             fragment,
         ),
         (
             "fragment, colour 0 unwritten, colour 1 written",
-            &unwritten_then_1,
+            unwritten_then_1,
             fragment,
         ),
         (
             "a fragment of colour 1, colour 0 alone",
-            &indirect,
+            indirect,
             &[(0x21, tri_vert), (0x22, colour_1)],
         ),
     ];
@@ -1262,15 +1196,11 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     }
     // Rasterization off, of a vertex function that returns a value: code 3, where Metal's
     // text names the fragment function's argument, the runtime's either refusal's.
-    let unrasterized = format!(
-        "05 08 04 20000000 01 04 21000000 02 04 22000000 07 04 00000000 19 04 01000000 00 \
-         {colour}"
-    );
-    let case = (
-        "fragment, rasterization off",
-        unrasterized.as_str(),
-        fragment,
-    );
+    let unrasterized = IndirectValue {
+        rasterization: false,
+        ..INDIRECT
+    };
+    let case = ("fragment, rasterization off", unrasterized, fragment);
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), &[case]);
     assert!(matches!(ours[0].1, Err((3, _))), "{ours:?}");
     if let Some(md) = &md {
@@ -1280,8 +1210,8 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     // Colour 0 `R8Unorm` under a mask of alpha alone, which holds none of its format's
     // channels: no colour is written, so the sample reaches none, and the state is made, as
     // Metal makes it.
-    let masked = indirect_with("01000000 08000000 03 00 04 00000000 01 04 0a000000 09 04 01000000");
-    let case = ("fragment, R8Unorm of alpha", masked.as_str(), fragment);
+    let masked = indirect_with(&[&[(1, 10), (9, 1)]]);
+    let case = ("fragment, R8Unorm of alpha", masked, fragment);
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), &[case]);
     assert_eq!(ours[0].1, Ok(()), "{ours:?}");
     if let Some(md) = &md {
@@ -1290,20 +1220,17 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     // The runtime's domain, as every pipeline `NSError` here carries.
     let d = dev();
     let library = d.new_library(sample_k).unwrap().unwrap().unwrap();
-    let f = library.new_function(OnFault::Return, "sample_k").unwrap();
-    let mut resolve =
-        |_: reims_vgpu_core::rt::Hold<'_>, _: u64| Ok(f.as_ref().map(|f| f.clone_ref()));
-    let blob = crate::gpu::serialized::tests::hex("02 07 04 01000000 00 04 05000000");
-    let desc = d
-        .deserialize_compute_pipeline_descriptor(
-            reims_vgpu_core::rt::Hold::NONE,
-            &blob,
-            &mut resolve,
-        )
+    let f = library
+        .new_function(OnFault::Return, "sample_k")
+        .unwrap()
         .unwrap();
     let error = d
-        .new_compute_pipeline_state(desc.as_ref(), 0)
-        .unwrap()
+        .new_compute_pipeline_state_full(
+            &reims_vgpu_core::platform::values::FullComputePipelineDesc {
+                support_indirect_command_buffers: true,
+                ..reims_vgpu_core::platform::values::FullComputePipelineDesc::new(&f)
+            },
+        )
         .unwrap_err();
     assert_eq!(error.domain, crate::answer::RUNTIME_DOMAIN);
 }
@@ -1330,28 +1257,12 @@ fn unrasterized_states_are_metals() {
     let void_vertex = &include_bytes!(concat!(env!("OUT_DIR"), "/unrasterized.metallib"))[..];
     let (tri_vert, tri_frag) = (shader!("vert"), shader!("frag"));
     let (render_color, render_ftex) = (shader!("render_color"), shader!("render_ftex"));
-    // A render blob of rasterization off: the vertex function at 0x21, the fragment function
-    // at 0x22 where `fragment`, key 25 where `icb`, and colour 0 `RGBA8Unorm` where `colour`.
-    let blob = |fragment: bool, icb: bool, colour: bool| {
-        let mut entries = vec!["01 04 21000000"];
-        entries.extend(fragment.then_some("02 04 22000000"));
-        entries.push("07 04 00000000");
-        entries.extend(icb.then_some("19 04 01000000"));
-        let n = entries.len() + usize::from(colour);
-        let head = 1 + 6 * n;
-        let at = head.next_multiple_of(4);
-        let mut out = format!("{n:02x}");
-        if colour {
-            out += &format!(" 08 04 {at:02x}000000");
-        }
-        for entry in entries {
-            out = format!("{out} {entry}");
-        }
-        if colour {
-            out += &" 00".repeat(at - head);
-            out += " 01000000 08000000 02 00 04 00000000 01 04 46000000";
-        }
-        out
+    // A render value of rasterization off, with indirect command buffer support where `icb`,
+    // and colour 0 `RGBA8Unorm` where `colour`.
+    let value = |icb: bool, colour: bool| IndirectValue {
+        indirect: icb,
+        colours: if colour { RGBA8 } else { &[] },
+        rasterization: false,
     };
     // Each case: its name, blob, functions and the answer expected.
     let mut rows = Vec::new();
@@ -1369,18 +1280,18 @@ fn unrasterized_states_are_metals() {
                 };
                 let name = format!("{what}, icb {icb}, colour {colour}");
                 let functions = vec![(0x21, void_vertex), (0x22, function)];
-                rows.push((name, blob(true, icb, colour), functions, expected));
+                rows.push((name, value(icb, colour), functions, expected));
             }
         }
     }
     for icb in [false, true] {
         let name = format!("a vertex function's return, icb {icb}");
         let functions = vec![(0x21, tri_vert)];
-        rows.push((name, blob(false, icb, true), functions, Err((3, vec![]))));
+        rows.push((name, value(icb, true), functions, Err((3, vec![]))));
     }
     let cases: Vec<IndirectCase<'_>> = rows
         .iter()
-        .map(|(name, blob, functions, _)| (name.as_str(), blob.as_str(), &functions[..]))
+        .map(|(name, value, functions, _)| (name.as_str(), *value, &functions[..]))
         .collect();
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), &cases);
     for ((name, _, _, expected), (_, answer)) in rows.iter().zip(&ours) {
@@ -1412,13 +1323,19 @@ fn an_input_no_vertex_output_writes_is_metals() {
     let cases: &[IndirectCase<'_>] = &[
         (
             "colour 0 written",
-            "03 08 04 14000000 01 04 21000000 02 04 22000000 00 \
-             01000000 08000000 02 00 04 00000000 01 04 46000000",
+            IndirectValue {
+                indirect: false,
+                ..INDIRECT
+            },
             functions,
         ),
         (
             "no colour attachment",
-            "02 01 04 21000000 02 04 22000000",
+            IndirectValue {
+                indirect: false,
+                colours: &[],
+                rasterization: true,
+            },
             functions,
         ),
     ];
@@ -1442,6 +1359,7 @@ fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
     use metal2vulkan::error::{Error as Compile, Feature};
     use reims_vgpu_core::platform::device::GpuDevice as _;
     use reims_vgpu_core::platform::resource::Library as _;
+    use reims_vgpu_core::platform::values::{FullComputePipelineDesc, FullRenderPipelineDesc};
 
     let d = dev();
     let library = d
@@ -1462,29 +1380,22 @@ fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
         Err(Compile::Unsupported(u)) => assert_eq!(u.feature, Feature::Reflection),
         other => panic!("{other:?}"),
     }
-    let compute = |indirect| {
-        let mut desc = compute.clone();
-        desc.support_indirect_command_buffers = indirect;
-        Obj::new(PipelineDescriptorObject {
-            desc: Mutex::new(desc),
-            resource_index: Mutex::new(None),
-            ignored: Vec::new(),
-            nearest_even: false,
-            label: None,
-            raw_format: None,
-        })
-    };
     for indirect in [false, true] {
-        let made = d.new_compute_pipeline_state(Some(&compute(indirect)), 0);
-        assert!(matches!(made, Ok(Ok(Some(_)))), "{indirect}: {made:?}");
+        let made = d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+            support_indirect_command_buffers: indirect,
+            ..FullComputePipelineDesc::new(&kernel)
+        });
+        assert!(matches!(made, Ok(Some(_))), "{indirect}: {made:?}");
     }
     let vertex = function("nested_arguments_vertex");
     let fragment = indirect_functions().1;
-    let render = guest_descriptor(&(vertex, fragment), PixelFormat::BGRA8Unorm, None);
     for indirect in [false, true] {
-        plain(|| render.desc.lock().support_indirect_command_buffers = indirect);
-        let made = d.new_render_pipeline_state_from_descriptor(Some(&render), 0);
-        assert!(matches!(made, Ok(Ok(Some(_)))), "{indirect}: {made:?}");
+        let made = d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+            colors: crate::gpu::device::tests::colours_of(&[&[(1, 80)]]),
+            support_indirect_command_buffers: indirect,
+            ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+        });
+        assert!(matches!(made, Ok(Some(_))), "{indirect}: {made:?}");
     }
 }
 

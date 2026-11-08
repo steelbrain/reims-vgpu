@@ -4665,7 +4665,6 @@ pub(crate) mod tests {
             vertex: &v,
             fragment: &f,
             color0_pixel_format: BGRA8,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -5348,129 +5347,9 @@ pub(crate) mod tests {
     }
 
     /// The sweep library, `rounding.metal`, compiled with fast math, the compiler's default.
+    #[cfg(target_os = "macos")]
     pub(crate) const ROUNDING: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/rounding.metallib"));
-
-    /// A guest's render state of `textureWriteRoundingMode` `mode` of [`ROUNDING`]'s
-    /// `sweep_vertex` and `fragment`, colour 0 of `RGBA8Unorm`, of `supportIndirectCommandBuffers`
-    /// where `icb`, decoded from a blob as core decodes one: its creator's answer.
-    fn texture_writing_state<P: Platform>(
-        d: &P::Device,
-        mode: u32,
-        fragment: &str,
-        icb: bool,
-    ) -> RaiseResult<Result<Option<P::RenderPipeline>, reims_vgpu_core::platform::types::NsErrorText>>
-    {
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::rt::Hold;
-
-        use crate::gpu::serialized::tests::rounded_render_of;
-
-        let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
-        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
-        let functions = [function("sweep_vertex"), function(fragment)];
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            let at = usize::try_from(r - 1).unwrap();
-            Ok(Some(functions[at].clone_ref()))
-        };
-        let mut entries = vec!["02 04 02000000"];
-        if icb {
-            entries.push("19 04 01000000");
-        }
-        let blob = rounded_render_of(&entries, &[&[(0, 0), (1, 70)]], mode);
-        let desc = d
-            .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-            .unwrap()
-            .unwrap();
-        d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-    }
-
-    /// Under a render state of `textureWriteRoundingMode` 2 whose fragment function writes
-    /// texture 0, an indexed draw, an indirect one and one of the private type 7 die at their
-    /// selectors with an `RGBA16Float` texture bound there, as a direct draw does, and are encoded
-    /// with an `RGBA8Unorm` one
-    #[test]
-    fn mode_2_half_float_texture_writes_die_at_every_kind_of_draw() {
-        use crate::gpu::serialized::NEAREST_EVEN;
-
-        let (p, d) = (platform(), dev());
-        let state =
-            texture_writing_state::<VulkanPlatform>(&d, NEAREST_EVEN, "write_fragment", false)
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        let kinds = buffer::<VulkanPlatform>(&d, 4, 0, &0u32.to_le_bytes());
-        let arguments: Vec<u8> = [3u32, 1, 0, 0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let indirect = buffer::<VulkanPlatform>(&d, 16, 0, &arguments);
-        let indices = buffer::<VulkanPlatform>(&d, 6, 0, &u16s(&[0, 1, 2]));
-        let target = texture(&p, &d, 70, READ | TARGET, (16, 16), None);
-        let q = d.new_command_queue().unwrap();
-        let draws = || {
-            [
-                (
-                    three(3, Some(&indices)),
-                    "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
-                ),
-                (
-                    RenderCmd::DrawPrimitivesIndirect {
-                        primitive_type: 3,
-                        indirect_buffer: &indirect,
-                        indirect_buffer_offset: 0,
-                    },
-                    "drawPrimitives:indirectBuffer:indirectBufferOffset:",
-                ),
-                (
-                    RenderCmd::DrawPrimitives {
-                        primitive_type: 7,
-                        vertex_start: 0,
-                        vertex_count: 4,
-                    },
-                    "drawPrimitives:vertexStart:vertexCount:",
-                ),
-            ]
-        };
-        for format in [115, 70] {
-            let t = texture(&p, &d, format, READ | 2, (16, 16), None);
-            for (draw, sel) in draws() {
-                let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-                let pass = p.render_pass_descriptor();
-                let attachment = ColorAttachmentSet {
-                    texture: Some(Some(&target)),
-                    load_action: Some(CLEAR),
-                    store_action: Some(STORE),
-                    ..ColorAttachmentSet::default()
-                };
-                pass.set_color_attachment(OnFault::Die, 0, &attachment)
-                    .unwrap();
-                let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-                send_all(
-                    &e,
-                    vec![
-                        RenderCmd::SetRenderPipelineState {
-                            pipeline_state: Some(&state),
-                        },
-                        RenderCmd::SetFragmentBuffer {
-                            buffer: Some(&kinds),
-                            offset: 0,
-                            index: 0,
-                        },
-                        RenderCmd::SetFragmentTexture {
-                            texture: Some(&t),
-                            index: 0,
-                        },
-                    ],
-                );
-                if format == 115 {
-                    assert_eq!(dies_at(&e, draw), sel);
-                } else {
-                    send_all(&e, vec![draw, RenderCmd::EndEncoding]);
-                }
-            }
-        }
-    }
 
     /// A pass that resolves `RGBA16Float` and one that resolves `RG11B10Float` (92), each at 4
     /// samples, in strict mode, on the platform's device, which resolves by the device's own
@@ -5665,7 +5544,6 @@ pub(crate) mod tests {
                 vertex: &vertex,
                 fragment: &fragment,
                 color0_pixel_format: BGRA8,
-                blend_over: false,
                 resource_index: None,
             })
             .unwrap()

@@ -714,7 +714,6 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
                 vertex: &converter.pipelines.vertex_function,
                 fragment,
                 color0_pixel_format: format,
-                blend_over: false,
                 resource_index: None,
             })
             .ok()

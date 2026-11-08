@@ -15,8 +15,8 @@
 //! `$OUT_DIR/ycbcr_probe.metallib`, the tests' functions Metal's compiler refuses,
 //! `src/gpu/refused.metal`, into `$OUT_DIR/refused.metallib`, those that use SIMD-group
 //! operations in each stage, `src/gpu/simd_stages.metal`, into `$OUT_DIR/simd_stages.metallib`,
-//! the tests' render functions for Metal's private render keys, `src/gpu/spi_keys.metal`, into
-//! `$OUT_DIR/spi_keys.metallib`, the tests' kernels that write a slice of an imageblock into a
+//! the depth-denormal test's render functions, `src/gpu/depth_denormals.metal`, into
+//! `$OUT_DIR/depth_denormals.metallib`, the tests' kernels that write a slice of an imageblock into a
 //! texture, `src/gpu/slice_write_repro.metal`, into `$OUT_DIR/slice_write_repro.metallib`, the
 //! tests' vertex function that returns nothing, `src/gpu/unrasterized.metal`, into
 //! `$OUT_DIR/unrasterized.metallib`, the tests' fragment function that writes colour 1 alone,
@@ -26,9 +26,8 @@
 //! constexpr samplers, `src/gpu/five_samplers.metal`, into `$OUT_DIR/five_samplers.metallib`,
 //! the tests' kernel that keeps the GPU busy, `src/gpu/spin.metal`, into
 //! `$OUT_DIR/spin.metallib`, the tests' kernels that read, sample and write textures of Apple's
-//! RGBX formats, `src/gpu/rgbx.metal`, into `$OUT_DIR/rgbx.metallib`, the tests' tile functions
-//! that read and write a colour attachment's imageblock cells, `src/gpu/tile_edges.metal`, into
-//! `$OUT_DIR/tile_edges.metallib`, the tests' Core Image kernel, `src/gpu/ci_kernel.metal`,
+//! RGBX formats, `src/gpu/rgbx.metal`, into `$OUT_DIR/rgbx.metallib`, the tests' Core Image
+//! kernel, `src/gpu/ci_kernel.metal`,
 //! compiled as Core Image compiles one (`-fcikernel`, then `metallib -cikernel`) into
 //! `$OUT_DIR/ci_kernel.metallib`, the tests' mesh render pipelines' functions,
 //! `src/gpu/mesh.metal`, into `$OUT_DIR/mesh.metallib`, the tests' kernel of a function constant
@@ -99,7 +98,7 @@ const STITCH_TOOL: [&str; 6] = [
 ];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
-const TEST_LIBRARIES: [&str; 24] = [
+const TEST_LIBRARIES: [&str; 23] = [
     "predication",
     "no_draw",
     "icb_encode",
@@ -110,7 +109,7 @@ const TEST_LIBRARIES: [&str; 24] = [
     "ycbcr_probe",
     "refused",
     "simd_stages",
-    "spi_keys",
+    "depth_denormals",
     "slice_write_repro",
     "unrasterized",
     "icb_color1",
@@ -118,7 +117,6 @@ const TEST_LIBRARIES: [&str; 24] = [
     "five_samplers",
     "spin",
     "rgbx",
-    "tile_edges",
     "argument_probe",
     "linked_caller",
     "linked_callee",

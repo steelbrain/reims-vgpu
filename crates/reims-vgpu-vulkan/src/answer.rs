@@ -69,13 +69,12 @@
 //!
 //! **A difference this platform finds itself** ([`Inexact`], [`inexact`]): a value it computes
 //! otherwise than Metal, which no runtime notice announces as a death (a `half` colour output's
-//! blend, a bfloat attachment's codes, a `textureWriteRoundingMode` the
-//! runtime does not take), or an answer it gives otherwise (a texture of protection options made
-//! unprotected, the identifier of a pipeline state made with indirect command buffer support, and
-//! of an indirect command buffer made after encoders whose take of Metal's range the runtime does
-//! not model), is relayed alike, its first occurrence
-//! writing a line naming the kind, and dies in strict mode. A death where Metal itself ends the
-//! process, or where the runtime cannot perform the call at all, is a death in either mode.
+//! blend, a bfloat attachment's codes), or an answer it gives otherwise (a texture of protection
+//! options made unprotected, the identifier of a pipeline state made with indirect command buffer
+//! support, and of an indirect command buffer made after encoders whose take of Metal's range the
+//! runtime does not model), is relayed alike, its first occurrence writing a line naming the kind,
+//! and dies in strict mode. A death where Metal itself ends the process, or where the runtime
+//! cannot perform the call at all, is a death in either mode.
 //!
 //! **On a native device** (off macOS, a driver other than MoltenVK, [`native`]), the kinds of
 //! [`native::NATIVE_RELAYED`] are relayed in strict mode too, each with its ground, the first
@@ -724,10 +723,9 @@ pub fn created_or_decided<T>(
 ///   can hold whose samplers the runtime cannot read, which Metal numbers and the runtime does
 ///   not, so every sampler state made while the state lives may answer another `gpuResourceID`.
 ///   One linked function alone, of `functions` or `privateFunctions`, called or not, is
-///   numbered as Metal numbers it and noted for nothing. One note
-///   covers them all, so it dies. No guest form here links a function: no serialized key
-///   carries one, and a dynamic library's import is refused. Announced at each draw or dispatch
-///   that binds the pipeline's variant, inside its call, which dies at its selector;
+///   numbered as Metal numbers it and noted for nothing. One note covers them all, so it dies. A
+///   dynamic library's import is refused. Announced at each draw or dispatch that binds the
+///   pipeline's variant, inside its call, which dies at its selector;
 /// - the note `PixelSamplerScaling`: a stage that samples through a pixel-coordinate sampler where
 ///   none of the runtime's exact paths reaches and the device filters a coordinate the runtime
 ///   scaled: a linear sample or gather through a sampler state bound at a slot, a linear sample of
@@ -2338,9 +2336,6 @@ pub enum Inexact {
     /// A bfloat attachment loaded and stored by a pass that draws, whose codes the runtime moves
     /// through `half` otherwise than Metal's tile store.
     BfloatLoaded,
-    /// A colour attachment write under `textureWriteRoundingMode` 2 the runtime is not measured
-    /// to store as Metal does: a resolve at a sample count nothing measured.
-    WriteRounding,
     /// A heap texture's size, alignment or bytes in the heap the runtime answers or lays out as
     /// its device's image, where Metal's are not measured or are its own: a texture is made, and
     /// its size answered, by the runtime's.
@@ -2398,10 +2393,9 @@ pub enum Inexact {
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::HalfOutputBlend,
         Self::BfloatLoaded,
-        Self::WriteRounding,
         Self::HeapLayout,
         Self::RateMap,
         Self::FillFormat,
@@ -2419,7 +2413,6 @@ impl Inexact {
         match self {
             Self::HalfOutputBlend => "inexact-half-output-blend",
             Self::BfloatLoaded => "inexact-bfloat-loaded",
-            Self::WriteRounding => "inexact-write-rounding",
             Self::HeapLayout => "inexact-heap-layout",
             Self::RateMap => "inexact-rate-map",
             Self::FillFormat => "inexact-fill-format",
@@ -2849,7 +2842,7 @@ mod tests {
         //     image on the M3 Max (the runtime's `DepthImageKeepsDenormals`),
         //     and its depth test compares one as Metal's does there, positive and negative,
         //     written by a blit or a pass's clear, under every compare function but `Never` and
-        //     `Always` (`serialized::draws`'
+        //     `Always` (`gpu::depth_denormals`'
         //     `denormal_depths_store_and_compare_as_metals`, which announces the kind); the
         //     runtime measured that depth test on an Apple M4 alone (`DepthTestKeepsDenormals`),
         //     so it announces the kind on this host too;
@@ -3153,7 +3146,6 @@ mod tests {
             match kind {
                 Inexact::HalfOutputBlend
                 | Inexact::BfloatLoaded
-                | Inexact::WriteRounding
                 | Inexact::HeapLayout
                 | Inexact::RateMap
                 | Inexact::FillFormat

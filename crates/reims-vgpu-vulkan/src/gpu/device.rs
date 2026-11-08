@@ -30,7 +30,7 @@ use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::caps::{DeviceCaps, IdentityCaps};
-use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
+use reims_vgpu_core::platform::device::{GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::os::vm::HostVm;
 use reims_vgpu_core::platform::types::{
     ArgumentKind, ArgumentLayout, ArgumentMember, NsErrorText, PixelFormatInfo,
@@ -43,20 +43,18 @@ use reims_vgpu_core::platform::values::{
 };
 use reims_vgpu_core::platform::{Handle, HostRange};
 use reims_vgpu_core::raise::{Kept, OnFault, RaiseResult, keep_forever};
-use reims_vgpu_core::rt::{BlockEnv, Hold};
+use reims_vgpu_core::rt::BlockEnv;
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
-    Nil, Policy, RUNTIME_DOMAIN, create, created_or_decided, decide, error_text, get,
-    get_describing, hearing, metal_aborts, plain, plain_at, relay_gap, send, unrepresentable,
+    Nil, Policy, create, created_or_decided, decide, error_text, get, get_describing, hearing,
+    metal_aborts, plain, plain_at, relay_gap, send, unrepresentable,
 };
 use crate::gpu::backing::{self, Backing, HEAP_GRANULE};
 use crate::gpu::caps;
 use crate::gpu::command::{QueueObject, VulkanCommandQueue};
 use crate::gpu::desc::{
-    Maker, PipelineDescriptorObject, TextureFields, VulkanComputePipelineDescriptor,
-    VulkanRenderPipelineDescriptor, VulkanTextureDescriptor, VulkanTileRenderPipelineDescriptor,
-    created_format_refused, format_refused,
+    Maker, TextureFields, VulkanTextureDescriptor, created_format_refused, format_refused,
 };
 use crate::gpu::event::{VulkanEvent, VulkanSharedEvent, VulkanSharedEventHandle};
 use crate::gpu::icb::VulkanIcb;
@@ -68,7 +66,6 @@ use crate::gpu::resource::{
     VulkanHeap, VulkanLibrary, VulkanRenderPipeline, VulkanSamplerState, VulkanSharedTextureHandle,
     VulkanTexture,
 };
-use crate::gpu::serialized;
 use crate::gpu::timing;
 use crate::os::{OsSurface, OsVm};
 use crate::platform::{Obj, VulkanPlatform};
@@ -232,7 +229,7 @@ pub fn registry_id(raw: &rt::Device) -> u64 {
 /// `id<MTLDevice>`.
 pub type VulkanDevice = Obj<DeviceObject>;
 
-/// The `NSError` Metal hands back for bytes that are no metallib (testing.md section 6.18).
+/// The `NSError` Metal hands back for bytes that are no metallib (measured).
 fn invalid_library_file() -> NsErrorText {
     NsErrorText {
         domain: "MTLLibraryErrorDomain".to_owned(),
@@ -261,19 +258,6 @@ fn compile_error(
             false => get_describing(sel, formats.as_deref(), || Err(e)),
         }
     })
-}
-
-/// The `NSError` a pipeline state made from a nil descriptor answers, which an empty serialized
-/// descriptor deserializes to, from each of the three descriptor creators: Metal's code, 2, and
-/// its text, "pipeline descriptor is nil", in the runtime's domain ([`RUNTIME_DOMAIN`]), as
-/// Metal's domain is its driver's name (`AGXMetalG15X_M1` on the M3 Max) and only core's log line
-/// reads it (`guest_descriptor_refusals` compares Metal's on the host).
-pub(crate) fn nil_pipeline_descriptor() -> NsErrorText {
-    NsErrorText {
-        domain: RUNTIME_DOMAIN.to_owned(),
-        code: 2,
-        description: "pipeline descriptor is nil".to_owned(),
-    }
 }
 
 /// The devices made in the process, by registry ID, each the one object every handle to it is.
@@ -1220,73 +1204,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         }
     }
 
-    /// Decoded as Metal's deserializer decodes it ([`serialized::compute`]): nil for an empty blob;
-    /// a blob Metal aborts on dies here, and the resolver's raise is the caller's.
-    fn deserialize_compute_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        context: FunctionResolver<'_, VulkanPlatform>,
-    ) -> RaiseResult<Option<VulkanComputePipelineDescriptor>> {
-        let decoded = timing::creation(
-            "newComputePipelineDescriptorWithSerializedData:deserializationContext:",
-            "",
-            || serialized::compute(hold, data, context),
-            || format!("{} bytes", data.len()),
-            |d| match d {
-                Ok(Some(d)) => format!("kernel {}", timing::stage(&d.desc.kernel)),
-                Ok(None) => "nil".to_owned(),
-                Err(_) => "raised".to_owned(),
-            },
-        )?;
-        Ok(decoded.map(|d| Obj::new(PipelineDescriptorObject::new(d))))
-    }
-
-    /// The descriptor's state, placed at the resource index core set and labelled with its blob's
-    /// label, under Metal's raw options; a nil descriptor is Metal's `NSError` for one
-    /// ([`nil_pipeline_descriptor`]). The runtime's
-    /// refusals are decided as the function form's: the compile's of a function or descriptor it
-    /// finds wrong are the `NSError`, and the rest die (an unspecialized function constant, as
-    /// Metal aborts for one; a resource index of 16384 or more, which ends Metal's process). One
-    /// that supports indirect command buffers is refused by the runtime, with Metal's `NSError`,
-    /// where its kernel uses a direct texture or sampler argument, and as unproven, which dies,
-    /// where the compile layer refuses to decide that; the runtime decides it once, as it makes
-    /// the state ([`super::states`]' docs). Every state takes a new identifier
-    /// ([`ComputePipelineObject::new`]).
-    fn new_compute_pipeline_state(
-        &self,
-        descriptor: Option<&VulkanComputePipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<VulkanComputePipeline>, NsErrorText>> {
-        let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
-        let Some(descriptor) = descriptor else {
-            return Ok(Err(nil_pipeline_descriptor()));
-        };
-        let desc = plain(|| descriptor.desc.lock().clone());
-        let mut pipeline_options = rt::PipelineOptions::new(rt::PipelineOption::from_raw(options));
-        pipeline_options.placement = descriptor.placement();
-        pipeline_options.label = descriptor.label.clone();
-        timing::creation(
-            sel,
-            timing::DISPATCH_LATER,
-            || match plain_at(sel, || {
-                self.raw
-                    .new_compute_pipeline_state(&desc, &pipeline_options)
-            }) {
-                Ok(state) => Ok(Ok(Some(Obj::new(ComputePipelineObject::of(
-                    state,
-                    desc.clone(),
-                ))))),
-                Err(e) => Ok(Err(compile_error(sel, e, Some(&desc)))),
-            },
-            || format!("kernel {}", timing::stage(&desc.kernel)),
-            |made| timing::raised_answer(made, |s| timing::state(s.unique_identifier)),
-        )
-    }
-
     /// Every refusal dies but the compile's of a function or descriptor it finds wrong, which is
-    /// the `NSError`: an unspecialized function constant dies, as Metal aborts for one (testing.md
-    /// section 6.18), and so does a nil function, which the runtime has no form for.
+    /// the `NSError`: an unspecialized function constant dies, as Metal aborts for one
+    /// (measured), and so does a nil function, which the runtime has no form for.
     fn new_compute_pipeline_state_for_function(
         &self,
         compute_function: Option<&VulkanFunction>,
@@ -1330,7 +1250,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     }
 
     /// A metallib only, as Metal and the runtime take: other bytes, raw AIR and a bitcode wrapper
-    /// among them, are Metal's `NSError` (testing.md section 6.18). A gap of the runtime's or the
+    /// among them, are Metal's `NSError` (measured). A gap of the runtime's or the
     /// device's is its refusal as the `NSError`, relayed by default ([`relay_gap`]).
     fn new_library(&self, data: &[u8]) -> RaiseResult<Result<Option<VulkanLibrary>, NsErrorText>> {
         let sel = "newLibraryWithData:error:";
@@ -1369,45 +1289,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         descriptor: &VulkanRateMapDescriptor,
     ) -> RaiseResult<Option<VulkanRateMap>> {
         super::rate_map::new_map(self, descriptor)
-    }
-
-    /// Decoded as the compute form is ([`serialized::render`]).
-    fn deserialize_render_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        context: FunctionResolver<'_, VulkanPlatform>,
-    ) -> RaiseResult<Option<VulkanRenderPipelineDescriptor>> {
-        let decoded = timing::creation(
-            "newRenderPipelineDescriptorWithSerializedData:deserializationContext:",
-            "",
-            || serialized::render(hold, data, context),
-            || format!("{} bytes", data.len()),
-            |d| match d {
-                Ok(Some(d)) => timing::render_stages(&d.desc),
-                Ok(None) => "nil".to_owned(),
-                Err(_) => "raised".to_owned(),
-            },
-        )?;
-        Ok(decoded.map(|d| Obj::new(PipelineDescriptorObject::new(d))))
-    }
-
-    /// The descriptor's state at its resource index ([`super::states`]).
-    fn new_render_pipeline_state_from_descriptor(
-        &self,
-        descriptor: Option<&VulkanRenderPipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<VulkanRenderPipeline>, NsErrorText>> {
-        super::states::new_render_pipeline_state_from_descriptor(self, descriptor, options)
-    }
-
-    /// The descriptor's tile state ([`super::states`]).
-    fn new_tile_render_pipeline_state(
-        &self,
-        descriptor: Option<&VulkanTileRenderPipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<VulkanRenderPipeline>, NsErrorText>> {
-        super::states::new_tile_render_pipeline_state(self, descriptor, options)
     }
 
     fn new_shared_event(&self) -> Option<VulkanSharedEvent> {
@@ -1680,29 +1561,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             private_usage: usage,
             gpu_read_only,
         })))
-    }
-
-    /// Decoded as the compute form is ([`serialized::tile`]), from `data` alone: Metal's data
-    /// spans it, and the rest of core's buffer is never read.
-    fn deserialize_tile_render_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        _buffer_length: u64,
-        context: FunctionResolver<'_, VulkanPlatform>,
-    ) -> RaiseResult<Option<VulkanTileRenderPipelineDescriptor>> {
-        let decoded = timing::creation(
-            "newTileRenderPipelineDescriptorWithSerializedData:deserializationContext:",
-            "",
-            || serialized::tile(hold, data, context),
-            || format!("{} bytes", data.len()),
-            |d| match d {
-                Ok(Some(d)) => format!("tile {}", timing::stage(&d.desc.tile)),
-                Ok(None) => "nil".to_owned(),
-                Err(_) => "raised".to_owned(),
-            },
-        )?;
-        Ok(decoded.map(|d| Obj::new(PipelineDescriptorObject::new(d))))
     }
 
     /// Keeps `indices` from plain allocation of IDs of the type for the device's life: textures
@@ -2294,6 +2152,69 @@ pub(crate) mod tests {
         let _ = d.raw.settle_in_place_checks(wait);
         let _ = d.raw.settle_queue_switch_check(wait);
         let _ = d.raw.settle_submit_checks(wait);
+    }
+
+    /// The one function of a fixture metallib.
+    pub(crate) fn fixture_function(bytes: &[u8]) -> VulkanFunction {
+        use reims_vgpu_core::platform::resource::Library as _;
+        let library = dev().new_library(bytes).unwrap().unwrap().unwrap();
+        let name = library.function_names().remove(0);
+        library
+            .new_function(OnFault::Return, &name)
+            .unwrap()
+            .unwrap()
+    }
+
+    pub(crate) const STAGEIN: &[u8] =
+        include_bytes!("../../../../tests/shaders/compute_stagein.metallib");
+
+    /// Colour attachments, each given by its properties' numbers and values: 0 its index, 1 its
+    /// pixel format, 2 whether it blends, 3 to 8 its source RGB factor, destination RGB factor,
+    /// RGB operation, source alpha factor, destination alpha factor and alpha operation, and 9
+    /// its write mask; Metal's defaults for those unnamed.
+    pub(crate) fn colours_of(
+        colours: &[&[(u8, u32)]],
+    ) -> Vec<(u64, reims_vgpu_core::platform::values::ColorAttachmentDesc)> {
+        use reims_vgpu_core::platform::values::ColorAttachmentDesc;
+        colours
+            .iter()
+            .map(|properties| {
+                let (mut index, mut c) = (0, ColorAttachmentDesc::default());
+                for &(key, value) in *properties {
+                    let value = u64::from(value);
+                    match key {
+                        0 => index = value,
+                        1 => c.pixel_format = value,
+                        2 => c.blending_enabled = value != 0,
+                        3 => c.source_rgb_blend_factor = value,
+                        4 => c.destination_rgb_blend_factor = value,
+                        5 => c.rgb_blend_operation = value,
+                        6 => c.source_alpha_blend_factor = value,
+                        7 => c.destination_alpha_blend_factor = value,
+                        8 => c.alpha_blend_operation = value,
+                        9 => c.write_mask = value,
+                        _ => panic!("no colour attachment property {key}"),
+                    }
+                }
+                (index, c)
+            })
+            .collect()
+    }
+
+    /// The whole render value of `vertex` and `fragment` into `colours` ([`colours_of`]) at
+    /// `samples` samples, Metal's defaults elsewhere.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn render_value<'a, P: reims_vgpu_core::platform::Platform>(
+        (vertex, fragment): (&'a P::Function, &'a P::Function),
+        samples: u64,
+        colours: &[&[(u8, u32)]],
+    ) -> reims_vgpu_core::platform::values::FullRenderPipelineDesc<'a, P> {
+        use reims_vgpu_core::platform::values::FullRenderPipelineDesc;
+        FullRenderPipelineDesc {
+            colors: colours_of(colours),
+            raster_sample_count: samples,
+            ..FullRenderPipelineDesc::new(vertex, Some(fragment))
+        }
     }
 
     /// The platform's device options with a shader cache of their own, as
@@ -3256,7 +3177,7 @@ pub(crate) mod tests {
         let before = crate::answer::inexact_counts();
         let error = crate::answer::relaxed(|| compile_error(sel, e.clone(), None));
         assert_eq!(error, error_text(&e));
-        assert_eq!(error.domain, RUNTIME_DOMAIN);
+        assert_eq!(error.domain, crate::answer::RUNTIME_DOMAIN);
         let counted = |counts: Vec<(crate::answer::Inexact, u64)>| {
             (counts.into_iter())
                 .find(|&(k, _)| k == crate::answer::Inexact::RefusedCreate)
@@ -3410,282 +3331,6 @@ pub(crate) mod tests {
         assert_ne!(a.unique_identifier(), 0);
         assert_ne!(a.unique_identifier(), b.unique_identifier());
         assert_eq!(a.clone_ref().unique_identifier(), a.unique_identifier());
-    }
-
-    /// A serialized compute descriptor makes the state its function makes, with the descriptor's
-    /// limits; a forced resource index places an ICB state there; each state takes a new
-    /// identifier; a nil descriptor is Metal's error
-    #[test]
-    fn compute_pipelines_from_serialized_descriptors() {
-        use crate::gpu::serialized::tests::{KERNEL, Resolve, fixture_function, hex};
-        use reims_vgpu_core::platform::descriptor::ComputePipelineDescriptor as _;
-        use reims_vgpu_core::platform::resource::ComputePipeline as _;
-        let d = dev();
-        let f = fixture_function(KERNEL);
-        let mut resolve = Resolve::answering(Some(f.clone_ref()));
-        let mut descriptor = |blob: &str| {
-            d.deserialize_compute_pipeline_descriptor(Hold::NONE, &hex(blob), &mut |h, r| {
-                resolve.call(h, r)
-            })
-            .unwrap()
-            .unwrap()
-        };
-        let plain_blob = descriptor("01 00 04 2a000000");
-        let limited = descriptor("02 08 04 40000000 00 04 2a000000");
-        let icb = descriptor("02 07 04 01000000 00 04 2a000000");
-        assert_eq!(resolve.refs, vec![0x2a; 3]);
-        let state = |desc| {
-            d.new_compute_pipeline_state(Some(desc), 0)
-                .unwrap()
-                .unwrap()
-                .unwrap()
-        };
-        let of_function = d
-            .new_compute_pipeline_state_for_function(Some(&f))
-            .unwrap()
-            .unwrap();
-        let a = state(&plain_blob);
-        assert_eq!(
-            (
-                a.thread_execution_width(),
-                a.max_total_threads_per_threadgroup()
-            ),
-            (
-                of_function.thread_execution_width(),
-                of_function.max_total_threads_per_threadgroup()
-            )
-        );
-        assert_eq!(state(&limited).max_total_threads_per_threadgroup(), 64);
-        icb.set_resource_index(12, true);
-        let placed = state(&icb);
-        assert!(placed.support_indirect_command_buffers());
-        assert_eq!(placed.gpu_resource_id(), 12);
-        let b = state(&plain_blob);
-        assert_ne!(a.unique_identifier(), b.unique_identifier());
-        assert_ne!(a.unique_identifier(), 0);
-        let e = d.new_compute_pipeline_state(None, 0).unwrap().unwrap_err();
-        assert!(e.description.contains("pipeline descriptor is nil"), "{e}");
-        assert!(
-            d.deserialize_compute_pipeline_descriptor(Hold::NONE, &[], &mut |_, _| Ok(None))
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// A blob's label is its state's, a diagnostic that changes nothing else: the state takes
-    /// its identifier and its resource ID as an unlabelled one does, and a compile's refusal is
-    /// the same error
-    #[test]
-    fn a_blobs_label_is_its_states_and_changes_nothing_else() {
-        use crate::gpu::serialized::tests::{KERNEL, Resolve, fixture_function, hex};
-        use reims_vgpu_core::platform::descriptor::ComputePipelineDescriptor as _;
-        use reims_vgpu_core::platform::resource::ComputePipeline as _;
-        let d = dev();
-        let descriptor = |f: &VulkanFunction, blob: &str| {
-            let mut resolve = Resolve::answering(Some(f.clone_ref()));
-            d.deserialize_compute_pipeline_descriptor(Hold::NONE, &hex(blob), &mut |h, r| {
-                resolve.call(h, r)
-            })
-            .unwrap()
-            .unwrap()
-        };
-        let f = fixture_function(KERNEL);
-        let state = |blob| {
-            d.new_compute_pipeline_state(Some(&descriptor(&f, blob)), 0)
-                .unwrap()
-                .unwrap()
-                .unwrap()
-        };
-        let (plain, labelled) = (
-            "01 00 04 2a000000",
-            "02 02 04 0d000000 00 04 2a000000 616200",
-        );
-        let [a, b, c] = [plain, labelled, plain].map(state);
-        assert_eq!(
-            (a.raw.label(), b.raw.label(), c.raw.label()),
-            (None, Some("ab"), None)
-        );
-        assert_eq!(
-            b.unique_identifier() - a.unique_identifier(),
-            c.unique_identifier() - b.unique_identifier()
-        );
-        let icb = descriptor(&f, "03 07 04 01000000 02 04 13000000 00 04 2a000000 616200");
-        icb.set_resource_index(12, true);
-        let placed = d
-            .new_compute_pipeline_state(Some(&icb), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            (placed.gpu_resource_id(), placed.raw.label()),
-            (12, Some("ab"))
-        );
-        let vert = fixture_function(include_bytes!("../../../../tests/shaders/vert.metallib"));
-        let refused = |blob| {
-            d.new_compute_pipeline_state(Some(&descriptor(&vert, blob)), 0)
-                .unwrap()
-                .unwrap_err()
-        };
-        assert_eq!(
-            refused("01 00 04 05000000"),
-            refused("02 02 04 0d000000 00 04 05000000 616200")
-        );
-    }
-
-    /// The suite's stage-input blob makes its kernel's state
-    #[test]
-    fn a_stage_input_descriptor_makes_its_state() {
-        use crate::gpu::serialized::tests::{Resolve, STAGEIN, fixture_function, stage_in_blob};
-        let d = dev();
-        let mut resolve = Resolve::answering(Some(fixture_function(STAGEIN)));
-        let desc = d
-            .deserialize_compute_pipeline_descriptor(Hold::NONE, &stage_in_blob(3), &mut |h, r| {
-                resolve.call(h, r)
-            })
-            .unwrap()
-            .unwrap();
-        assert!(desc.desc.lock().stage_input.is_some());
-        let made = d.new_compute_pipeline_state(Some(&desc), 0).unwrap();
-        assert!(matches!(made, Ok(Some(_))), "{:?}", made.err());
-    }
-
-    /// A vertex function as the compute function is Metal's error, as on Metal
-    #[test]
-    fn a_vertex_function_as_the_compute_function_is_an_error() {
-        use crate::gpu::serialized::tests::{Resolve, fixture_function, hex};
-        let d = dev();
-        let vert = fixture_function(include_bytes!("../../../../tests/shaders/vert.metallib"));
-        let mut resolve = Resolve::answering(Some(vert));
-        let desc = d
-            .deserialize_compute_pipeline_descriptor(
-                Hold::NONE,
-                &hex("01 00 04 05000000"),
-                &mut |h, r| resolve.call(h, r),
-            )
-            .unwrap()
-            .unwrap();
-        assert!(
-            d.new_compute_pipeline_state(Some(&desc), 0)
-                .unwrap()
-                .is_err()
-        );
-    }
-
-    /// A fixture function, `fixtures/shaders/<name>.metallib`'s one.
-    fn shader(name: &str) -> VulkanFunction {
-        let path = fixture_shaders().join(format!("{name}.metallib"));
-        crate::gpu::serialized::tests::fixture_function(&std::fs::read(path).unwrap())
-    }
-
-    /// A resolver of the suite's sentinel refs: vertex 0x21, fragment 0x22, tile 0x31.
-    fn by_ref(
-        functions: &[(u64, &VulkanFunction)],
-    ) -> impl FnMut(Hold<'_>, u64) -> RaiseResult<Option<VulkanFunction>> + use<> {
-        let functions: Vec<_> = functions.iter().map(|(r, f)| (*r, f.clone_ref())).collect();
-        move |_, r| {
-            Ok(functions
-                .iter()
-                .find(|(at, _)| *at == r)
-                .map(|(_, f)| f.clone_ref()))
-        }
-    }
-
-    /// The suite's render blobs make their states, placed at the resource index core sets, each
-    /// with a new identifier and Metal's imageblock length; a kernel as the vertex function is
-    /// Metal's error, and an empty blob is nil, whose state is Metal's error for a nil descriptor
-    #[test]
-    fn render_pipelines_from_serialized_descriptors() {
-        use crate::gpu::serialized::tests::pipeline_blob;
-        use reims_vgpu_core::platform::descriptor::RenderPipelineDescriptor as _;
-        use reims_vgpu_core::platform::resource::RenderPipeline as _;
-        let d = dev();
-        let (vert, frag, kernel) = (shader("vert"), shader("frag"), shader("kernel"));
-        let mut resolve = by_ref(&[(0x21, &vert), (0x22, &frag), (0x23, &kernel)]);
-        let mut descriptor = |blob: &[u8]| {
-            d.deserialize_render_pipeline_descriptor(Hold::NONE, blob, &mut resolve)
-                .unwrap()
-        };
-        let state = |desc: &VulkanRenderPipelineDescriptor| {
-            d.new_render_pipeline_state_from_descriptor(Some(desc), 0)
-                .unwrap()
-        };
-        for name in ["basic", "blend", "msaa4", "two", "nocolor", "nocolor4"] {
-            let desc = descriptor(&pipeline_blob(name, 0x21, 0x22, 0)).unwrap();
-            let made = state(&desc);
-            assert!(matches!(made, Ok(Some(_))), "{name}: {:?}", made.err());
-        }
-        let basic = descriptor(&pipeline_blob("basic", 0x21, 0x22, 0)).unwrap();
-        let a = state(&basic).unwrap().unwrap();
-        let b = state(&basic).unwrap().unwrap();
-        assert!(a.unique_identifier() != 0 && a.unique_identifier() != b.unique_identifier());
-        // Metal's answer for this pipeline (`info_replies`' 458), with no raise.
-        let eight = reims_vgpu_core::platform::types::MtlSize::new(8, 8, 1);
-        assert_eq!(a.imageblock_memory_length(eight), Ok(256));
-        let mut icb = pipeline_blob("basic", 0x21, 0x22, 0);
-        icb[0] += 1;
-        icb.splice(1..1, [0x19, 4, 1, 0, 0, 0]);
-        // The colour attachments' offset moves with the entry added before it
-        icb[9] += 6;
-        let icb = descriptor(&icb).unwrap();
-        icb.set_resource_index(11, true);
-        assert_eq!(state(&icb).unwrap().unwrap().gpu_resource_id(), 11);
-        let kernel_as_vertex = descriptor(&pipeline_blob("basic", 0x23, 0x22, 0)).unwrap();
-        assert!(state(&kernel_as_vertex).is_err());
-        assert!(descriptor(&[]).is_none());
-        let e = d
-            .new_render_pipeline_state_from_descriptor(None, 0)
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(e, nil_pipeline_descriptor());
-    }
-
-    /// The suite's tile blob makes a tile function's state, and an empty blob is nil
-    #[test]
-    fn tile_pipelines_from_serialized_descriptors() {
-        use crate::gpu::serialized::tests::pipeline_blob;
-        let d = dev();
-        // A tile function that never touches its imageblock
-        let tile = shader("mutdec_tgwrite_blue");
-        let mut resolve = by_ref(&[(0x31, &tile)]);
-        let desc = d
-            .deserialize_tile_render_pipeline_descriptor(
-                Hold::NONE,
-                &pipeline_blob("tile", 0, 0, 0x31),
-                0x100,
-                &mut resolve,
-            )
-            .unwrap()
-            .unwrap();
-        assert!(desc.desc.lock().threadgroup_size_matches_tile_size);
-        let made = d.new_tile_render_pipeline_state(Some(&desc), 0).unwrap();
-        assert!(matches!(made, Ok(Some(_))), "{:?}", made.err());
-        assert!(
-            d.deserialize_tile_render_pipeline_descriptor(Hold::NONE, &[], 0, &mut resolve)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    /// A tile function whose half4 imageblock lies over RGBA8Unorm makes its state, as Metal makes
-    /// it
-    #[test]
-    fn a_tile_pipeline_of_a_half_imageblock_over_rgba8unorm() {
-        use crate::gpu::serialized::tests::pipeline_blob;
-        let d = dev();
-        assert!(d.caps().flags.supports_tile_shaders);
-        let tile = shader("tile");
-        let mut resolve = by_ref(&[(0x31, &tile)]);
-        let desc = d
-            .deserialize_tile_render_pipeline_descriptor(
-                Hold::NONE,
-                &pipeline_blob("tile", 0, 0, 0x31),
-                0x100,
-                &mut resolve,
-            )
-            .unwrap()
-            .unwrap();
-        let made = d.new_tile_render_pipeline_state(Some(&desc), 0).unwrap();
-        assert!(matches!(made, Ok(Some(_))), "{:?}", made.err());
     }
 
     /// The creators of queues, events and fences each make a new object of the device; a shared

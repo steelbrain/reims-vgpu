@@ -9,7 +9,7 @@
 //!   (`blended-write-rounding`, relayed, a death in strict mode) and refuses a fragment
 //!   function's half-float and small-float texture writes, which die at their selector; a
 //!   half-float attachment it is not measured to store as Metal does is relayed as the state is
-//!   made, a death in strict mode ([`crate::gpu::serialized::rounded_writes`])), and, in
+//!   made, a death in strict mode), and, in
 //!   [`crate::gpu::format_info`], Apple's private pixel format description and level layout
 //!   (`Device::pixel_format_info`, `Device::texture_level_info`);
 //! - **the runtime's answer of Apple's private property** on the device

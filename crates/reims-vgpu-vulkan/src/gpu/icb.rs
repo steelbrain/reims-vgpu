@@ -2259,15 +2259,16 @@ mod tests {
     /// `icb_encode.metal`.
     const ICB_ENCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icb_encode.metallib"));
 
-    /// Two states of `nothing` and two of `a_vertex` and `a_colour`, each made from a guest
-    /// descriptor that supports indirect command buffers (compute key 7, render key 25).
+    /// Two states of `nothing` and two of `a_vertex` and `a_colour` (colour 0 RGBA8Unorm), each
+    /// made from a value that supports indirect command buffers.
     fn twin_states<P: Platform>(
         d: &P::Device,
         library: &P::Library,
     ) -> (Vec<P::ComputePipeline>, Vec<P::RenderPipeline>) {
-        use crate::gpu::serialized::tests::{hex, pipeline_blob};
         use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::rt::Hold;
+        use reims_vgpu_core::platform::values::{
+            ColorAttachmentDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
+        };
         let function = |name: &str| {
             library
                 .new_function(OnFault::Return, name)
@@ -2279,43 +2280,31 @@ mod tests {
             function("a_vertex"),
             function("a_colour"),
         );
-        let compute = hex("02 07 04 01000000 00 04 05000000");
-        // The basic blob with one more entry, key 25 set, before its three: the colour
-        // attachments' block, at the offset its key 8 holds (byte 3 on), moves past it.
-        let mut render = pipeline_blob("basic", 0x21, 0x22, 0);
-        render[0] += 1;
-        render[3] += 6;
-        render.splice(1..1, [25, 4, 1, 0, 0, 0]);
         let computes = (0..2)
             .map(|_| {
-                let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 5).then(|| kernel.clone_ref()));
-                let desc = d
-                    .deserialize_compute_pipeline_descriptor(Hold::NONE, &compute, &mut resolve)
-                    .unwrap()
-                    .unwrap();
-                d.new_compute_pipeline_state(Some(&desc), 0)
-                    .unwrap()
-                    .unwrap()
-                    .unwrap()
+                d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+                    support_indirect_command_buffers: true,
+                    ..FullComputePipelineDesc::new(&kernel)
+                })
+                .unwrap()
+                .unwrap()
             })
             .collect();
         let renders = (0..2)
             .map(|_| {
-                let mut resolve = |_: Hold<'_>, r: u64| {
-                    Ok(match r {
-                        0x21 => Some(vertex.clone_ref()),
-                        0x22 => Some(fragment.clone_ref()),
-                        _ => None,
-                    })
-                };
-                let desc = d
-                    .deserialize_render_pipeline_descriptor(Hold::NONE, &render, &mut resolve)
-                    .unwrap()
-                    .unwrap();
-                d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-                    .unwrap()
-                    .unwrap()
-                    .unwrap()
+                d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                    colors: vec![(
+                        0,
+                        ColorAttachmentDesc {
+                            pixel_format: 70,
+                            ..ColorAttachmentDesc::default()
+                        },
+                    )],
+                    support_indirect_command_buffers: true,
+                    ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+                })
+                .unwrap()
+                .unwrap()
             })
             .collect();
         (computes, renders)
@@ -2450,26 +2439,20 @@ mod tests {
         drop((renders, later_renders));
     }
 
-    /// A state of `mark` of `library`, made from a guest descriptor that supports indirect
-    /// command buffers (compute key 7).
+    /// A state of `mark` of `library`, made from a value that supports indirect command buffers.
     fn marking_state<P: Platform>(d: &P::Device, library: &P::Library) -> P::ComputePipeline {
-        use crate::gpu::serialized::tests::hex;
         use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::rt::Hold;
+        use reims_vgpu_core::platform::values::FullComputePipelineDesc;
         let mark = library
             .new_function(OnFault::Return, "mark")
             .unwrap()
             .unwrap();
-        let compute = hex("02 07 04 01000000 00 04 05000000");
-        let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 5).then(|| mark.clone_ref()));
-        let desc = d
-            .deserialize_compute_pipeline_descriptor(Hold::NONE, &compute, &mut resolve)
-            .unwrap()
-            .unwrap();
-        d.new_compute_pipeline_state(Some(&desc), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap()
+        d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+            support_indirect_command_buffers: true,
+            ..FullComputePipelineDesc::new(&mark)
+        })
+        .unwrap()
+        .unwrap()
     }
 
     /// Commits, on `d`, an execution of `icb`'s command 0, which writes `out`, and waits for it.

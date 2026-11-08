@@ -229,8 +229,8 @@ pub struct IcbDesc {
 
 /// `MTLRenderPipelineDescriptor` for the display's pipeline, or a window's cursor's, as a value.
 /// Order: label, vertex function, fragment function, then colour attachment 0's pixel format
-/// (through `colorAttachments` and `objectAtIndexedSubscript:`, which may raise) and, where set,
-/// its blending, then the resource index and its force flag.
+/// (through `colorAttachments` and `objectAtIndexedSubscript:`, which may raise), then the
+/// resource index and its force flag.
 pub struct RenderPipelineDesc<'a, P: Platform> {
     /// `setLabel:`, when set.
     pub label: Option<&'a str>,
@@ -240,11 +240,6 @@ pub struct RenderPipelineDesc<'a, P: Platform> {
     pub fragment: &'a P::Function,
     /// `colorAttachments[0].pixelFormat`.
     pub color0_pixel_format: u64,
-    /// Colour attachment 0 blends each fragment over the target by its alpha, its colour taken
-    /// as premultiplied: `setBlendingEnabled:`, then both source factors `one` and both
-    /// destination factors `oneMinusSourceAlpha`. Off (Metal's default, `one` over `zero`) for
-    /// the display's own pipelines.
-    pub blend_over: bool,
     /// `setResourceIndex:` then `setForceResourceIndex:` (SPI), when set.
     pub resource_index: Option<(u64, bool)>,
 }
@@ -256,7 +251,6 @@ impl<P: Platform> fmt::Debug for RenderPipelineDesc<'_, P> {
             .field("vertex", &self.vertex.id())
             .field("fragment", &self.fragment.id())
             .field("color0_pixel_format", &self.color0_pixel_format)
-            .field("blend_over", &self.blend_over)
             .field("resource_index", &self.resource_index)
             .finish()
     }
@@ -471,6 +465,34 @@ impl Default for PrivateRenderDesc {
     }
 }
 
+impl<'a, P: Platform> FullRenderPipelineDesc<'a, P> {
+    /// The value of `vertex` and `fragment` with Metal's defaults elsewhere: no label, no vertex
+    /// descriptor, no colour attachment, no depth or stencil format, one sample, rasterization
+    /// on, an unspecified topology class, an amplification count of one, no indirect command
+    /// buffer support, no linked functions and Metal's private state.
+    pub fn new(vertex: &'a P::Function, fragment: Option<&'a P::Function>) -> Self {
+        FullRenderPipelineDesc {
+            label: None,
+            vertex,
+            fragment,
+            vertex_descriptor: None,
+            colors: Vec::new(),
+            depth_pixel_format: 0,
+            stencil_pixel_format: 0,
+            raster_sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization_enabled: true,
+            input_primitive_topology: 0,
+            max_vertex_amplification_count: 1,
+            support_indirect_command_buffers: false,
+            vertex_linked: LinkedFunctionsDesc::default(),
+            fragment_linked: LinkedFunctionsDesc::default(),
+            private_state: None,
+        }
+    }
+}
+
 impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FullRenderPipelineDesc")
@@ -639,6 +661,24 @@ pub struct FullComputePipelineDesc<'a, P: Platform> {
     pub stage_input: Option<StageInputDesc>,
     /// `setLinkedFunctions:`, where the kernel links any.
     pub linked: LinkedFunctionsDesc<P>,
+}
+
+impl<'a, P: Platform> FullComputePipelineDesc<'a, P> {
+    /// The value of `function` with Metal's defaults elsewhere: no label, no execution-width
+    /// promise, Metal's maximum threads per threadgroup, a call stack depth of one, no indirect
+    /// command buffer support, no stage-input descriptor and no linked functions.
+    pub fn new(function: &'a P::Function) -> Self {
+        FullComputePipelineDesc {
+            label: None,
+            function,
+            threadgroup_size_is_multiple_of_execution_width: false,
+            max_total_threads_per_threadgroup: 0,
+            max_call_stack_depth: 1,
+            support_indirect_command_buffers: false,
+            stage_input: None,
+            linked: LinkedFunctionsDesc::default(),
+        }
+    }
 }
 
 impl<P: Platform> fmt::Debug for FullComputePipelineDesc<'_, P> {
@@ -1176,7 +1216,6 @@ mod tests {
                 vertex: &v,
                 fragment: &f,
                 color0_pixel_format: 80,
-                blend_over: false,
                 resource_index: Some((12, true)),
             })
             .unwrap()

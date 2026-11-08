@@ -10,11 +10,11 @@ use super::*;
 use crate::os::OsSurface;
 
 /// Of the suite's kernel function, made on `d`, a state without indirect command buffer
-/// support and one with it (`supportIndirectCommandBuffers`, compute key 7, set): whether
+/// support and one with it (`supportIndirectCommandBuffers` set): whether
 /// each supports them, its `resourceIndex` and its `gpuResourceID`.
 fn kernel_states<P: Platform>(d: &P::Device) -> [(bool, u64, u64); 2] {
     use reims_vgpu_core::platform::resource::{ComputePipeline as _, Library as _};
-    use reims_vgpu_core::rt::Hold;
+    use reims_vgpu_core::platform::values::FullComputePipelineDesc;
     let kernel = include_bytes!("../../../../../../tests/shaders/kernel.metallib");
     let library = d.new_library(kernel).unwrap().unwrap().unwrap();
     let name = library.function_names()[0].clone();
@@ -26,16 +26,11 @@ fn kernel_states<P: Platform>(d: &P::Device) -> [(bool, u64, u64); 2] {
         .new_compute_pipeline_state_for_function(Some(&f))
         .unwrap()
         .unwrap();
-    // Two entries: key 7 (`supportIndirectCommandBuffers`) 1, and key 0, the function's ref.
-    let blob = [2, 7, 4, 1, 0, 0, 0, 0, 4, 0x11, 0, 0, 0];
-    let mut resolve = |_: Hold<'_>, _: u64| Ok(Some(f.clone_ref()));
-    let desc = d
-        .deserialize_compute_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
     let supporting = d
-        .new_compute_pipeline_state(Some(&desc), 0)
-        .unwrap()
+        .new_compute_pipeline_state_full(&FullComputePipelineDesc {
+            support_indirect_command_buffers: true,
+            ..FullComputePipelineDesc::new(&f)
+        })
         .unwrap()
         .unwrap();
     [&plain, &supporting].map(|p| {
@@ -2616,7 +2611,6 @@ fn surface_references<P: Platform<Surface = OsSurface>>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: 80,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -3755,7 +3749,6 @@ fn rotated_uses<P: Platform<Surface = OsSurface>>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: 80,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -3917,7 +3910,6 @@ fn rotated_view_pass<P: Platform<Surface = OsSurface>>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: view,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()

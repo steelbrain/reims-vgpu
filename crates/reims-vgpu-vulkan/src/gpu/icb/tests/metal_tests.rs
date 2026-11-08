@@ -1587,26 +1587,20 @@ fn a_command_core_set_reaches_a_later_state_holding_its_identifier_as_metals() {
     }
 }
 
-/// An ICB-capable state of `name` in `library`, made from a guest descriptor (compute key 7),
-/// as `twin_states`' are
+/// An ICB-capable state of `name` in `library`, made from a whole value, as `twin_states`' are
 fn icb_kernel<P: Platform>(d: &P::Device, library: &P::Library, name: &str) -> P::ComputePipeline {
-    use crate::gpu::serialized::tests::hex;
     use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::Hold;
+    use reims_vgpu_core::platform::values::FullComputePipelineDesc;
     let kernel = library
         .new_function(OnFault::Return, name)
         .unwrap()
         .unwrap();
-    let blob = hex("02 07 04 01000000 00 04 05000000");
-    let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 5).then(|| kernel.clone_ref()));
-    let desc = d
-        .deserialize_compute_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    d.new_compute_pipeline_state(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap()
+    d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+        support_indirect_command_buffers: true,
+        ..FullComputePipelineDesc::new(&kernel)
+    })
+    .unwrap()
+    .unwrap()
 }
 
 /// A command a kernel wrote that an execution of another buffer ran, in an encoder that made
@@ -2130,22 +2124,17 @@ fn metal_reuses_a_released_states_identifier_here() {
     }
     drop(first);
     let second = if how == "other" {
-        use crate::gpu::serialized::tests::hex;
-        use reims_vgpu_core::rt::Hold;
+        use reims_vgpu_core::platform::values::FullComputePipelineDesc;
         let nothing = library
             .new_function(OnFault::Return, "nothing")
             .unwrap()
             .unwrap();
-        let compute = hex("02 07 04 01000000 00 04 05000000");
-        let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 5).then(|| nothing.clone_ref()));
-        let desc = d
-            .deserialize_compute_pipeline_descriptor(Hold::NONE, &compute, &mut resolve)
-            .unwrap()
-            .unwrap();
-        d.new_compute_pipeline_state(Some(&desc), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap()
+        d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+            support_indirect_command_buffers: true,
+            ..FullComputePipelineDesc::new(&nothing)
+        })
+        .unwrap()
+        .unwrap()
     } else {
         marking_state::<MetalPlatform>(&d, &library)
     };

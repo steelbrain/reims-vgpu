@@ -448,7 +448,6 @@ fn case<P: Platform>(p: &P, d: &P::Device, c: Case) -> Seen {
                         vertex: &v,
                         fragment: &f,
                         color0_pixel_format: BGRA8,
-                        blend_over: false,
                         resource_index: None,
                     })
                     .unwrap()
@@ -502,7 +501,6 @@ fn case<P: Platform>(p: &P, d: &P::Device, c: Case) -> Seen {
                     vertex: &v,
                     fragment: &f,
                     color0_pixel_format: BGRA8,
-                    blend_over: false,
                     resource_index: None,
                 })
                 .unwrap()
@@ -712,7 +710,6 @@ fn case<P: Platform>(p: &P, d: &P::Device, c: Case) -> Seen {
                     vertex: &v,
                     fragment: &f,
                     color0_pixel_format: BGRA8,
-                    blend_over: false,
                     resource_index: None,
                 })
                 .unwrap()
@@ -1458,7 +1455,6 @@ fn this_platform_dies_at_every_way_a_write_reaches_the_surface() {
             vertex: &v,
             fragment: &f,
             color0_pixel_format: BGRA8,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -1557,8 +1553,7 @@ const UNRASTERIZED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unrasteriz
 /// command buffer's status. Its vertex function returns nothing (`void_vertex`), and colour 0 is
 /// `BGRA8Unorm`.
 fn unrasterized_write<P: Platform>(p: &P, d: &P::Device) -> u64 {
-    use reims_vgpu_core::platform::Handle as _;
-    use reims_vgpu_core::rt::Hold;
+    use reims_vgpu_core::platform::values::{ColorAttachmentDesc, FullRenderPipelineDesc};
     let q = d.new_command_queue().unwrap();
     let (_s, t) = read_only_texture(p, d, &bgra(p, (64, 16), 3, 1));
     let own = d
@@ -1578,40 +1573,26 @@ fn unrasterized_write<P: Platform>(p: &P, d: &P::Device) -> u64 {
         library.new_function(OnFault::Die, &name).unwrap().unwrap()
     };
     let rounding = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
-    let functions = [
-        (0x21, first(UNRASTERIZED)),
-        (
-            0x22,
-            rounding
-                .new_function(OnFault::Die, "write_fragment")
-                .unwrap()
-                .unwrap(),
-        ),
-    ];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        Ok(functions
-            .iter()
-            .find(|(at, _)| *at == r)
-            .map(|(_, f)| f.clone_ref()))
-    };
-    // The vertex function at 0x21, the fragment function at 0x22, rasterization off, and colour
-    // 0 `BGRA8Unorm` (80), its array at 0x1c.
-    let blob: Vec<u8> = [
-        &[
-            4u8, 8, 4, 0x1c, 0, 0, 0, 1, 4, 0x21, 0, 0, 0, 2, 4, 0x22, 0, 0, 0,
-        ][..],
-        &[7, 4, 0, 0, 0, 0, 0, 0, 0],
-        &[
-            1, 0, 0, 0, 8, 0, 0, 0, 2, 0, 4, 0, 0, 0, 0, 1, 4, 80, 0, 0, 0,
-        ],
-    ]
-    .concat();
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap();
+    let (vertex, fragment) = (
+        first(UNRASTERIZED),
+        rounding
+            .new_function(OnFault::Die, "write_fragment")
+            .unwrap()
+            .unwrap(),
+    );
+    // Rasterization off, and colour 0 `BGRA8Unorm` (80).
     let state = d
-        .new_render_pipeline_state_from_descriptor(desc.as_ref(), 0)
-        .unwrap()
+        .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+            colors: vec![(
+                0,
+                ColorAttachmentDesc {
+                    pixel_format: 80,
+                    ..ColorAttachmentDesc::default()
+                },
+            )],
+            rasterization_enabled: false,
+            ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+        })
         .unwrap()
         .unwrap();
     let b = q.command_buffer(OnFault::Die).unwrap().unwrap();
@@ -1691,7 +1672,6 @@ fn this_platform_draws_through_a_device_pointer_into_a_read_only_buffer() {
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: BGRA8,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()

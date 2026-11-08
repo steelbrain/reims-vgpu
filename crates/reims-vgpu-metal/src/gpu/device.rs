@@ -10,8 +10,8 @@
 //!   none (the device's and a FIFO's setup, the GPU task's handshake and jobs, a display's
 //!   pipelines), and `On` for one sent both ways, whose caller says by its `OnFault` which way
 //!   each call is. A getter's raise ends the process at the call.
-//! - What core's trait hides is made here: the `dispatch_data_t`s and their destructors, the
-//!   no-copy deallocator block, the deserialization context.
+//! - What core's trait hides is made here: the `dispatch_data_t`s and their destructors and the
+//!   no-copy deallocator block.
 //! - **Our shader library** is the one creator whose result is kept: its source is compiled once
 //!   per device ([`super::shaders`]).
 
@@ -35,7 +35,7 @@ use reims_vgpu_core::platform::caps::{
     LINEAR_ALIGNMENT_FORMAT, Limits, SAMPLE_COUNTS, SDK_FAMILIES, SDK_PIXEL_FORMATS,
     SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS, TEXTURE_BUFFER_FORMATS, WRITE_ROUNDING_MODES,
 };
-use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
+use reims_vgpu_core::platform::device::{GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::types::{
     ArgumentLayout, MtlSize, NsErrorText, PixelFormatInfo, ResourceAddressRange, SizeAndAlign,
     TextureLevelInfo, TextureLevelQuery,
@@ -48,7 +48,6 @@ use reims_vgpu_core::platform::values::{
 use reims_vgpu_core::raise::death::DeathKind;
 use reims_vgpu_core::raise::{Kept, keep_forever};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::rt::Hold;
 use reims_vgpu_core::sync::Mutex;
 
 use super::rate_map::{MetalRateMap, MetalRateMapDescriptor};
@@ -59,9 +58,9 @@ use super::resource::{
 };
 use crate::gpu::command::MetalCommandQueue;
 use crate::gpu::desc::{
-    self, MetalBufferDescriptor, MetalComputePipelineDescriptor, MetalDepthStencilDescriptor,
-    MetalHeapDescriptor, MetalIcbDescriptor, MetalRenderPipelineDescriptor, MetalSamplerDescriptor,
-    MetalTextureDescriptor, MetalTileRenderPipelineDescriptor,
+    self, MetalBufferDescriptor, MetalDepthStencilDescriptor, MetalHeapDescriptor,
+    MetalIcbDescriptor, MetalRenderPipelineDescriptor, MetalSamplerDescriptor,
+    MetalTextureDescriptor,
 };
 use crate::gpu::event::{MetalEvent, MetalSharedEvent, MetalSharedEventHandle};
 use crate::gpu::icb::MetalIcb;
@@ -69,7 +68,6 @@ use crate::msg::encode::FromMtl;
 use crate::msg::{self, Policy};
 use crate::os::iosurface::MetalSurface;
 use crate::platform::{MetalPlatform, Obj, ns_error_text};
-use crate::spi::classes::DeserializationContext;
 use crate::spi::functions;
 use crate::spi::methods::{Deallocator, DeviceSpi};
 
@@ -165,22 +163,6 @@ fn ir_dispatch_data(data: Retained<NSData>) -> DispatchRetained<DispatchData> {
     // SAFETY: the bytes are the NSData's, which the block keeps alive until libdispatch runs
     // and releases it, after the data's last release.
     unsafe { data_with_block_destructor(bytes, length, &destructor) }
-}
-
-block2::global_block! {
-    /// The tile form's destructor, `^{}`: a global block, which libdispatch's `Block_copy` returns
-    /// as it is.
-    static TILE_DESTRUCTOR = || {}
-}
-
-/// The tile descriptor at the start of a `malloc`ed buffer of `buffer_length` bytes (the
-/// cursor's remaining bytes), in a `dispatch_data_t` spanning the descriptor alone whose
-/// destructor is an empty block: nothing ever frees the buffer.
-fn tile_descriptor_data(descriptor: &[u8], buffer_length: u64) -> DispatchRetained<DispatchData> {
-    let size = usize::try_from(buffer_length).unwrap_or(usize::MAX);
-    let buffer = malloc_copy(descriptor, size);
-    // SAFETY: the buffer is never freed, so it outlives the data.
-    unsafe { data_with_block_destructor(buffer.as_ptr(), descriptor.len(), &TILE_DESTRUCTOR) }
 }
 
 /// A creator with an `error:` out-parameter, which `call` passes where the method takes it:
@@ -279,61 +261,6 @@ unsafe fn made_or_error<T: Message>(
         None => match unsafe { ns_error_text(error) } {
             Some(e) => Err(e),
             None => Ok(None),
-        },
-    }
-}
-
-/// The three `new…PipelineDescriptorWithSerializedData:deserializationContext:` SPI calls.
-///
-/// The caller makes the data: for the compute and render forms a copy that libdispatch frees when
-/// the data goes, and for the tile form [`tile_descriptor_data`]. A fresh context holds `resolver`
-/// for the call; Metal calls it synchronously, on this thread, under `hold`, and its raise comes
-/// back as `Err`. A raise inside the call is the resolver's own throw when it made one (carried
-/// through Metal to the caller unchanged, and thrown again once Metal has unwound), otherwise
-/// Metal's.
-///
-/// Metal lets the resolver's throw through to the call: measured on the M3 Max, macOS 27.0.1
-/// (26A434), with a throw at each resolver call in turn of nine descriptor shapes (compute,
-/// render and tile; with linked, private, binary and grouped linked functions, which Metal does
-/// not resolve through the context), 5 runs, every throw reached the call, and Metal made
-/// nothing. Were Metal to catch one itself and answer, the throw would be lost, as the exception
-/// would be to Apple's framework: the call answers what Metal made, and what the raise carries
-/// lands in `hold`'s holder, where a catch would land it.
-///
-/// A death inside the resolver, in a refusal scope, is a Rust unwind to the scope, which never
-/// crosses Metal's frames: the context keeps it and raises through Metal in its place, and once
-/// Metal has returned the unwind goes on from here, so the scope refuses the same op as it would
-/// with no Metal frame between.
-///
-/// Every caller is a pipeline creation, which runs only under a handler (its creator's own sends
-/// are `Caught`): either raise is `Err`, the caller's to catch.
-fn deserialize<T: Message>(
-    hold: Hold<'_>,
-    d: &MetalDevice,
-    sel: &'static str,
-    data: DispatchRetained<DispatchData>,
-    resolver: FunctionResolver<'_, MetalPlatform>,
-    call: impl FnOnce(&ProtocolObject<dyn MTLDevice>, &DispatchData, &AnyObject) -> Option<Retained<T>>,
-) -> RaiseResult<Option<Obj<T>>> {
-    let context = msg::value("init", DeserializationContext::new);
-    let (device, data, any) = (d.get(), &*data, context.as_any());
-    // Metal's own assertions on a malformed blob end the process inside the call.
-    let made = context.with_resolver(hold, resolver, || {
-        msg::catch(sel, || call(device, data, any))
-    });
-    if let Some(unwound) = context.take_unwound() {
-        std::panic::resume_unwind(unwound)
-    }
-    match made {
-        Ok(made) => {
-            if let Some(lost) = context.take_thrown() {
-                hold.land(lost);
-            }
-            Ok(created(made))
-        }
-        Err(caught) => match context.take_thrown() {
-            Some(r) => Err(r),
-            None => caught.decide(Policy::Caught),
         },
     }
 }
@@ -464,46 +391,6 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         false
     }
 
-    fn deserialize_compute_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        context: FunctionResolver<'_, MetalPlatform>,
-    ) -> RaiseResult<Option<MetalComputePipelineDescriptor>> {
-        let sel = "newComputePipelineDescriptorWithSerializedData:deserializationContext:";
-        deserialize(
-            hold,
-            self,
-            sel,
-            DispatchData::from_bytes(data),
-            context,
-            |d, data, context| {
-                d.newComputePipelineDescriptorWithSerializedData_deserializationContext(
-                    data, context,
-                )
-            },
-        )
-    }
-
-    /// Reflection is nil; a nil descriptor is passed as it is.
-    fn new_compute_pipeline_state(
-        &self,
-        descriptor: Option<&MetalComputePipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<MetalComputePipeline>, NsErrorText>> {
-        let (d, descriptor) = (self.get(), descriptor.map(Obj::get));
-        // SAFETY: `create_or_error`'s out-parameter.
-        create_or_error(
-            Policy::Caught,
-            "newComputePipelineStateWithDescriptor:options:reflection:error:",
-            |error| unsafe {
-                DeviceSpi::newComputePipelineStateWithDescriptor_options_reflection_error(
-                    d, descriptor, options, error,
-                )
-            },
-        )
-    }
-
     fn new_compute_pipeline_state_for_function(
         &self,
         compute_function: Option<&MetalFunction>,
@@ -565,65 +452,6 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
             || d.newRasterizationRateMapWithDescriptor(descriptor),
         )
         .map(created)
-    }
-
-    fn deserialize_render_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        context: FunctionResolver<'_, MetalPlatform>,
-    ) -> RaiseResult<Option<MetalRenderPipelineDescriptor>> {
-        let sel = "newRenderPipelineDescriptorWithSerializedData:deserializationContext:";
-        deserialize(
-            hold,
-            self,
-            sel,
-            DispatchData::from_bytes(data),
-            context,
-            |d, data, context| {
-                d.newRenderPipelineDescriptorWithSerializedData_deserializationContext(
-                    data, context,
-                )
-            },
-        )
-    }
-
-    /// Reflection is nil; a nil descriptor is passed as it is.
-    fn new_render_pipeline_state_from_descriptor(
-        &self,
-        descriptor: Option<&MetalRenderPipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<MetalRenderPipeline>, NsErrorText>> {
-        let (d, descriptor) = (self.get(), descriptor.map(Obj::get));
-        // SAFETY: `create_or_error`'s out-parameter.
-        create_or_error(
-            Policy::Caught,
-            "newRenderPipelineStateWithDescriptor:options:reflection:error:",
-            |error| unsafe {
-                DeviceSpi::newRenderPipelineStateWithDescriptor_options_reflection_error(
-                    d, descriptor, options, error,
-                )
-            },
-        )
-    }
-
-    /// Reflection is nil; a nil descriptor is passed as it is.
-    fn new_tile_render_pipeline_state(
-        &self,
-        descriptor: Option<&MetalTileRenderPipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<MetalRenderPipeline>, NsErrorText>> {
-        let (d, descriptor) = (self.get(), descriptor.map(Obj::get));
-        // SAFETY: `create_or_error`'s out-parameter.
-        create_or_error(
-            Policy::Caught,
-            "newRenderPipelineStateWithTileDescriptor:options:reflection:error:",
-            |error| unsafe {
-                DeviceSpi::newRenderPipelineStateWithTileDescriptor_options_reflection_error(
-                    d, descriptor, options, error,
-                )
-            },
-        )
     }
 
     fn new_shared_event(&self) -> Option<MetalSharedEvent> {
@@ -695,22 +523,6 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
             || DeviceSpi::newTextureWithDescriptor_iosurface_plane(d, descriptor, surface, plane),
         )
         .map(created)
-    }
-
-    fn deserialize_tile_render_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        buffer_length: u64,
-        context: FunctionResolver<'_, MetalPlatform>,
-    ) -> RaiseResult<Option<MetalTileRenderPipelineDescriptor>> {
-        let sel = "newTileRenderPipelineDescriptorWithSerializedData:deserializationContext:";
-        let data = tile_descriptor_data(data, buffer_length);
-        deserialize(hold, self, sel, data, context, |d, data, context| {
-            d.newTileRenderPipelineDescriptorWithSerializedData_deserializationContext(
-                data, context,
-            )
-        })
     }
 
     fn reserve_resource_indices(&self, resource_type: u64, indices: &[u64]) -> RaiseResult<()> {
@@ -1330,16 +1142,14 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use objc2::msg_send;
     use objc2_foundation::NSString;
     use objc2_metal::{
-        MTLBuffer as _, MTLCommandQueue as _, MTLComputePipelineDescriptor, MTLFunction as _,
-        MTLGPUFamily, MTLHeap as _, MTLIndirectCommandBuffer as _, MTLLibrary as _, MTLPixelFormat,
+        MTLBuffer as _, MTLCommandQueue as _, MTLGPUFamily, MTLHeap as _,
+        MTLIndirectCommandBuffer as _, MTLLibrary as _, MTLPixelFormat,
         MTLRasterizationRateLayerDescriptor, MTLRasterizationRateMapDescriptor,
-        MTLRenderPipelineDescriptor, MTLSharedEvent as _, MTLSize as MtlSizeObjc, MTLStorageMode,
-        MTLTexture as _, MTLTextureDescriptor, MTLTileRenderPipelineDescriptor,
+        MTLSharedEvent as _, MTLSize as MtlSizeObjc, MTLStorageMode, MTLTexture as _,
+        MTLTextureDescriptor,
     };
-    use reims_vgpu_core::platform::Handle;
 
     use super::*;
     use reims_vgpu_core::host::HostPtr;
@@ -1857,7 +1667,6 @@ pub(crate) mod tests {
                 vertex: &v,
                 fragment: &f,
                 color0_pixel_format: MTLPixelFormat::BGRA8Unorm.0.to_u64(),
-                blend_over: false,
                 resource_index: None,
             })
             .unwrap();
@@ -2089,8 +1898,7 @@ vertex float4 vmain(uint v [[vertex_id]]) { return float4(0, 0, 0, 1); }
         );
     }
 
-    /// newComputePipelineStateWithFunction:error: and
-    /// newComputePipelineStateWithDescriptor:options:reflection:error
+    /// newComputePipelineStateWithFunction:error:
     #[test]
     fn compute_pipelines() {
         let d = dev();
@@ -2098,15 +1906,6 @@ vertex float4 vmain(uint v [[vertex_id]]) { return float4(0, 0, 0, 1); }
         let f = function(&lib, "BlitInRGB_2P_XR10_A8");
         assert!(
             d.new_compute_pipeline_state_for_function(Some(&f))
-                .unwrap()
-                .is_some()
-        );
-        let cd = MTLComputePipelineDescriptor::new();
-        cd.setComputeFunction(Some(f.get()));
-        let cd = Obj::from_retained(cd);
-        assert!(
-            d.new_compute_pipeline_state(Some(&cd), 0)
-                .unwrap()
                 .unwrap()
                 .is_some()
         );
@@ -2291,269 +2090,6 @@ vertex void vvoid(uint v [[vertex_id]]) {}
                 "fragment {has}"
             );
         }
-    }
-
-    fn render_descriptor(lib: &MetalLibrary) -> MetalRenderPipelineDescriptor {
-        let rd = MTLRenderPipelineDescriptor::new();
-        rd.setVertexFunction(Some(function(lib, "displayPresentVertex").get()));
-        rd.setFragmentFunction(Some(function(lib, "displayPresentFragment").get()));
-        // SAFETY: index 0 exists on every render pipeline descriptor.
-        unsafe { rd.colorAttachments().objectAtIndexedSubscript(0) }
-            .setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-        Obj::from_retained(rd)
-    }
-
-    /// newRenderPipelineStateWithDescriptor:options:reflection:error
-    #[test]
-    fn render_pipeline_with_reflection() {
-        let d = dev();
-        let lib = library(&d);
-        let rd = render_descriptor(&lib);
-        assert!(
-            d.new_render_pipeline_state_from_descriptor(Some(&rd), 0)
-                .unwrap()
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    /// The bytes of `-[_MTLDevice serialize…PipelineDescriptor:]` (test-only SPI).
-    fn serialize(d: &MetalDevice, sel: objc2::runtime::Sel, desc: &AnyObject) -> Vec<u8> {
-        // SAFETY: the device implements the selector (`@24@0:8@16`, measured); it returns a
-        // dispatch_data_t, retained for the read.
-        let p: *mut AnyObject =
-            unsafe { msg_send![d.get(), performSelector: sel, withObject: desc] };
-        assert!(!p.is_null());
-        // SAFETY: a dispatch_data_t is a dispatch object; `DispatchData` is its Rust type.
-        let data: &DispatchData = unsafe { &*p.cast::<DispatchData>() };
-        data.to_vec()
-    }
-
-    /// newComputePipelineDescriptorWithSerializedData:deserializationContext: calls the resolver
-    /// synchronously and rebuilds the descriptor with the function it answers
-    #[test]
-    fn compute_descriptor_from_serialized_data() {
-        let d = dev();
-        let lib = library(&d);
-        let f = function(&lib, "BlitInRGB_2P_XR10_A8");
-        let cd = MTLComputePipelineDescriptor::new();
-        cd.setComputeFunction(Some(f.get()));
-        let bytes = serialize(&d, objc2::sel!(serializeComputePipelineDescriptor:), &cd);
-        let mut refs = Vec::new();
-        let mut resolver = |_: Hold<'_>, r: u64| {
-            refs.push(r);
-            Ok(Some(f.clone_ref()))
-        };
-        let out = d
-            .deserialize_compute_pipeline_descriptor(Hold::NONE, &bytes, &mut resolver)
-            .unwrap()
-            .unwrap();
-        assert_eq!(refs, vec![0]);
-        assert_eq!(
-            out.get().computeFunction().unwrap().name().to_string(),
-            "BlitInRGB_2P_XR10_A8"
-        );
-    }
-
-    /// A throw inside the resolver leaves functionWithFunctionRef: as an Objective-C exception;
-    /// Metal lets it through, and the caller's scope gets the resolver's own throw back
-    #[test]
-    fn a_resolver_throw_reaches_the_caller_unchanged() {
-        let d = dev();
-        let lib = library(&d);
-        let f = function(&lib, "BlitInRGB_2P_XR10_A8");
-        let cd = MTLComputePipelineDescriptor::new();
-        cd.setComputeFunction(Some(f.get()));
-        let bytes = serialize(&d, objc2::sel!(serializeComputePipelineDescriptor:), &cd);
-        let mut resolver = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
-            Err(reims_vgpu_core::testkit::capture::raise(
-                OnFault::Return,
-                "resolver",
-                "boom",
-            ))
-        };
-        let hold = Hold::NONE;
-        let t = d
-            .deserialize_compute_pipeline_descriptor(hold, &bytes, &mut resolver)
-            .err()
-            .unwrap();
-        assert!(matches!(
-            t.origin(),
-            reims_vgpu_core::raise::Origin::Core(_)
-        ));
-        assert_eq!(t.detail(), Some("boom"));
-        assert_eq!((t.site().file, t.site().line), ("resolver", 0));
-    }
-
-    /// The resolver runs under a handler of its own, so its throw crosses Metal; once Metal has
-    /// unwound it is the caller's raise, which names the throw's own site
-    #[test]
-    fn a_resolver_throw_is_the_callers_after_metal() {
-        let d = dev();
-        let lib = library(&d);
-        let f = function(&lib, "BlitInRGB_2P_XR10_A8");
-        let cd = MTLComputePipelineDescriptor::new();
-        cd.setComputeFunction(Some(f.get()));
-        let bytes = serialize(&d, objc2::sel!(serializeComputePipelineDescriptor:), &cd);
-        let mut calls = 0u32;
-        let mut resolver = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
-            calls += 1;
-            Err(reims_vgpu_core::testkit::capture::raise(
-                OnFault::Return,
-                "resolver",
-                "boom",
-            ))
-        };
-        let site = d
-            .deserialize_compute_pipeline_descriptor(Hold::NONE, &bytes, &mut resolver)
-            .err()
-            .unwrap()
-            .site();
-        assert_eq!(calls, 1);
-        assert_eq!(
-            (site.kind, site.file, site.line),
-            (DeathKind::UnhandledRaise, "resolver", 0)
-        );
-    }
-
-    /// Were Metal to catch the resolver's throw itself and answer, the throw is lost, as the
-    /// exception would be to Apple's framework: the call answers what Metal made, and what the
-    /// raise carries lands in the hold's holder, not when the context goes
-    #[test]
-    fn a_throw_metal_catches_lands_in_the_hold() {
-        use std::panic::AssertUnwindSafe;
-        use std::sync::atomic::AtomicBool;
-
-        use objc2::runtime::NSObject;
-        use reims_vgpu_core::rt::Held;
-
-        struct Probe(Arc<AtomicBool>);
-        impl Drop for Probe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        let d = dev();
-        let released = Arc::new(AtomicBool::new(false));
-        let held = Held::new();
-        let carried = Probe(Arc::clone(&released));
-        let mut carried = Some(carried);
-        let mut resolver = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
-            let raise =
-                reims_vgpu_core::testkit::capture::raise(OnFault::Return, "resolver", "boom");
-            Err(raise.defer(carried.take().unwrap()))
-        };
-        // Metal's stand-in: one resolver call, whose throw it catches itself, then nil.
-        let made = deserialize(
-            Hold::of(&held),
-            &d,
-            "newComputePipelineDescriptorWithSerializedData:deserializationContext:",
-            DispatchData::from_bytes(&[]),
-            &mut resolver,
-            |_, _, context| {
-                let caught = objc2::exception::catch(AssertUnwindSafe(|| {
-                    // SAFETY: the context answers `functionWithFunctionRef:` (`@24@0:8Q16`).
-                    let f: *mut AnyObject =
-                        unsafe { msg_send![context, functionWithFunctionRef: 1u64] };
-                    f
-                }));
-                assert!(caught.is_err(), "the resolver threw");
-                None::<Retained<NSObject>>
-            },
-        );
-        assert!(matches!(made, Ok(None)), "{made:?}");
-        assert!(!released.load(Ordering::SeqCst));
-        drop(held);
-        assert!(released.load(Ordering::SeqCst));
-    }
-
-    /// A death in the resolver inside a refusal scope while Metal deserializes ends the scope's work
-    /// once Metal has returned: nothing after the deserialization runs, the resolver is called
-    /// once, and Metal deserializes again after
-    #[test]
-    fn a_death_in_the_resolver_ends_the_scope_after_metal() {
-        use reims_vgpu_core::raise::death::DeathSite;
-        use reims_vgpu_core::raise::refusals::refusing;
-
-        let d = dev();
-        let lib = library(&d);
-        let v = function(&lib, "displayPresentVertex");
-        let rd = render_descriptor(&lib);
-        let bytes = serialize(
-            &d,
-            objc2::sel!(serializeRenderPipelineDescriptor:),
-            rd.get(),
-        );
-        let mut calls = 0u32;
-        let mut dies = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
-            calls += 1;
-            reims_vgpu_core::fatal!(DeathSite {
-                kind: DeathKind::Abort,
-                file: "resolver.test",
-                line: 0,
-            })
-        };
-        let mut after = false;
-        let r = refusing(|| {
-            let _ = d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut dies);
-            after = true;
-        });
-        assert_eq!((r.is_err(), after, calls), (true, false, 1));
-        let mut resolver = |_: Hold<'_>, _r: u64| Ok(Some(v.clone_ref()));
-        assert!(
-            d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut resolver)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    /// newRenderPipelineDescriptorWithSerializedData:deserializationContext: (a resolver call per
-    /// function) and newTileRenderPipelineDescriptorWithSerializedData:… (none)
-    #[test]
-    fn render_and_tile_descriptors_from_serialized_data() {
-        let d = dev();
-        let lib = library(&d);
-        let rd = render_descriptor(&lib);
-        let bytes = serialize(
-            &d,
-            objc2::sel!(serializeRenderPipelineDescriptor:),
-            rd.get(),
-        );
-        let v = function(&lib, "displayPresentVertex");
-        let mut calls = 0u32;
-        let mut resolver = |_: Hold<'_>, _r: u64| {
-            calls += 1;
-            Ok(Some(v.clone_ref()))
-        };
-        assert!(
-            d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut resolver)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(calls, 2);
-        let td = MTLTileRenderPipelineDescriptor::new();
-        let bytes = serialize(&d, objc2::sel!(serializeTileRenderPipelineDescriptor:), &td);
-        let mut none = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
-            panic!("no function to resolve")
-        };
-        let tile = d
-            .deserialize_tile_render_pipeline_descriptor(
-                Hold::NONE,
-                &bytes,
-                bytes.len() as u64,
-                &mut none,
-            )
-            .unwrap()
-            .unwrap();
-        // A tile descriptor with no function: Metal's own assertion would abort the state
-        // creation, so only the descriptor's class is checked here.
-        let obj: &AnyObject = tile.get();
-        assert!(
-            obj.class()
-                .name()
-                .to_bytes()
-                .starts_with(b"MTLTileRenderPipelineDescriptor")
-        );
     }
 
     /// allowLibrariesFromOtherPlatforms and reserveResourceIndicesForResourceType:… (no raise; the
@@ -2773,41 +2309,6 @@ vertex void vvoid(uint v [[vertex_id]]) {}
             let (worker, label, _) = rx.recv_timeout(WAIT).unwrap();
             assert_ne!(worker, std::thread::current().id());
             assert_eq!(label, "com.apple.root.default-qos");
-        }
-
-        /// deserialize_tile_render_pipeline_descriptor's data spans the descriptor's
-        /// bytes at the start of its own `malloc(length)` buffer of the cursor's remaining bytes
-        /// (no second copy), its destructor is `^{}`, a global block (`Block_copy` allocates
-        /// nothing), and the whole buffer is still allocated after the data's last release: nothing
-        /// frees it
-        #[test]
-        fn the_tile_descriptor_leaks_its_malloc_copy() {
-            let data = tile_descriptor_data(b"tile descriptor", 0x1000);
-            let (p, n) = region(&data);
-            assert_eq!(n, 15);
-            // SAFETY: a query of a live pointer.
-            assert!(
-                unsafe { malloc_size(p) } >= 0x1000,
-                "malloc(length), not the descriptor's"
-            );
-            // SAFETY: the data's 15 bytes.
-            assert_eq!(
-                unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) },
-                b"tile descriptor"
-            );
-            // SAFETY: a query of a live pointer.
-            assert!(unsafe { malloc_size(p) } >= 15, "a malloc copy");
-            // SAFETY: a global block is an Objective-C object.
-            let class = unsafe {
-                std::ffi::CStr::from_ptr(objc2::ffi::object_getClassName(
-                    std::ptr::from_ref(&*TILE_DESTRUCTOR).cast(),
-                ))
-            };
-            assert_eq!(class.to_str().unwrap(), "__NSGlobalBlock__");
-            // The dispose runs here, synchronously; libdispatch only submits the empty block.
-            drop(data);
-            // SAFETY: a query of a pointer malloc still owns.
-            assert!(unsafe { malloc_size(p) } >= 15, "never freed");
         }
     }
 }

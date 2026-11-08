@@ -8,8 +8,8 @@
 //! Creators and encoders hand Metal much of what the guest sends as it is, so Metal's own
 //! validation, or the driver, ends the process at the op whose input breaks Metal's rules: a
 //! pipeline made from a nil or invalid function or with an unspecialized function constant, a
-//! malformed serialized descriptor, a texture descriptor Metal refuses, a second encoder over an
-//! open one, an encoder open at the commit, a nil indirect buffer. A method whose input can do so
+//! texture descriptor Metal refuses, a second encoder over an open one, an encoder open at the
+//! commit, a nil indirect buffer. A method whose input can do so
 //! says it on an `aborts:` line.
 
 use std::sync::Arc;
@@ -26,7 +26,6 @@ use super::values::{
 };
 use super::{Handle, Platform};
 use crate::raise::{OnFault, RaiseResult};
-use crate::rt::Hold;
 
 /// A deallocator Metal calls once when a no-copy buffer is freed (the
 /// `newBufferWithBytesNoCopy:…deallocator:` block). `None` is a nil block.
@@ -57,15 +56,6 @@ pub fn relaying_gaps<R>(create: impl FnOnce() -> R) -> (R, bool) {
     let relayed = RELAYED_GAP.with(|r| r.replace(outer | r.get()));
     (made, relayed)
 }
-
-/// The deserialization context's `functionWithFunctionRef:` (`MTLDeserializationContext`,
-/// PGResourceManagerDeserializationContext): runs synchronously on the calling thread, during the
-/// SPI call, once per function reference the blob names, under the hold the platform
-/// hands it (Metal's runs it under a handler of its own). `Err` is a throw inside the lookup (a
-/// task cursor or a creator raising), which the platform carries through Metal's send to the
-/// caller as the same raise.
-pub type FunctionResolver<'a, P> =
-    &'a mut dyn FnMut(Hold<'_>, u64) -> RaiseResult<Option<<P as Platform>::Function>>;
 
 /// `id<MTLDevice>` (`id<MTLDeviceSPI>`).
 pub trait GpuDevice<P: Platform>: Handle {
@@ -158,24 +148,6 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// [`BlitEncoder::copy_from_guest_ram`]: super::blit::BlitEncoder::copy_from_guest_ram
     /// [`BlitEncoder::copy_to_guest_ram`]: super::blit::BlitEncoder::copy_to_guest_ram
     fn copies_guest_ram(&self) -> bool;
-    /// sel: newComputePipelineDescriptorWithSerializedData:deserializationContext: SPI
-    /// `data` becomes a `dispatch_data_t` with core's destructor; `context` runs synchronously
-    /// during the call. aborts: a malformed or truncated blob, inside Metal's deserializer.
-    fn deserialize_compute_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        context: FunctionResolver<'_, P>,
-    ) -> RaiseResult<Option<P::ComputePipelineDescriptor>>;
-    /// sel: newComputePipelineStateWithDescriptor:options:reflection:error:
-    /// Core passes nil `reflection`; `Err` is the `NSError` (nil error with a nil state is
-    /// `Ok(None)`). The descriptor is nil when its serialized form deserializes to nil; core sends
-    /// it unchecked, and Metal answers nil with an error (testing.md 6.18).
-    fn new_compute_pipeline_state(
-        &self,
-        descriptor: Option<&P::ComputePipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<P::ComputePipeline>, NsErrorText>>;
     /// sel: newComputePipelineStateWithFunction:error:
     /// The function may be nil (a library with no such function); core asserts on nil in the
     /// service. No path reaches it under a handler: a raise inside it dies at the send.
@@ -200,28 +172,6 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// sel: newRasterizationRateMapWithDescriptor:
     /// aborts: the third layer on the suite's host (render_ratemap_three_layers).
     fn new_rate_map(&self, descriptor: &P::RateMapDescriptor) -> RaiseResult<Option<P::RateMap>>;
-    /// sel: newRenderPipelineDescriptorWithSerializedData:deserializationContext: SPI
-    /// As the compute form. aborts: malformed blobs.
-    fn deserialize_render_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        context: FunctionResolver<'_, P>,
-    ) -> RaiseResult<Option<P::RenderPipelineDescriptor>>;
-    /// sel: newRenderPipelineStateWithDescriptor:options:reflection:error:
-    /// Core passes nil `reflection`, and a nil descriptor unchecked, as the compute form.
-    fn new_render_pipeline_state_from_descriptor(
-        &self,
-        descriptor: Option<&P::RenderPipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<P::RenderPipeline>, NsErrorText>>;
-    /// sel: newRenderPipelineStateWithTileDescriptor:options:reflection:error:
-    /// Core passes nil `reflection`, and a nil descriptor unchecked, as the compute form.
-    fn new_tile_render_pipeline_state(
-        &self,
-        descriptor: Option<&P::TileRenderPipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<P::RenderPipeline>, NsErrorText>>;
     /// sel: newSharedEvent — One per FIFO. No path reaches it under a handler: a raise inside
     /// it dies at the send.
     fn new_shared_event(&self) -> Option<P::SharedEvent>;
@@ -252,25 +202,14 @@ pub trait GpuDevice<P: Platform>: Handle {
         descriptor: &P::TextureDescriptor,
     ) -> RaiseResult<Option<P::Texture>>;
     /// sel: newTextureWithDescriptor:iosurface:plane:
-    /// The texture retains the surface (guest-visible count). aborts: display opcode 8 with some
-    /// descriptors (testing.md 7.4).
+    /// The texture retains the surface (guest-visible count). aborts: Metal's validation on some
+    /// descriptors (measured).
     fn new_texture_on_surface(
         &self,
         descriptor: &P::TextureDescriptor,
         iosurface: Option<&P::Surface>,
         plane: u64,
     ) -> RaiseResult<Option<P::Texture>>;
-    /// sel: newTileRenderPipelineDescriptorWithSerializedData:deserializationContext: SPI
-    /// As the compute form, over core's buffer: `malloc(buffer_length)` (the cursor's remaining
-    /// bytes) holding `data` (the `descriptorLength` bytes read into it, which the data spans),
-    /// never freed. aborts: malformed blobs.
-    fn deserialize_tile_render_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        buffer_length: u64,
-        context: FunctionResolver<'_, P>,
-    ) -> RaiseResult<Option<P::TileRenderPipelineDescriptor>>;
     /// sel: reserveResourceIndicesForResourceType:indices:indexCount: SPI
     /// (types 0, 1 and 5). `indexCount` is `indices.len()`.
     fn reserve_resource_indices(&self, resource_type: u64, indices: &[u64]) -> RaiseResult<()>;

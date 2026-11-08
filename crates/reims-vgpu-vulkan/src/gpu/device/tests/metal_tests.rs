@@ -2746,170 +2746,73 @@ fn a_reservation_past_32_bits_leaves_it_to_the_next_call() {
     assert_eq!(ids::<VulkanPlatform>(&d, &texture), expected);
 }
 
-/// The blob of a state whose `attachment` (`colour`, `blended`, `depth`, `stencil` or
-/// `tile`) is pixel format `format`: a render blob's of vertex function 0x21 (and fragment
-/// function 0x22 with a colour attachment; `blended`'s with blending enabled, its factors and
-/// operations unset), or a tile blob's of tile function 0x31.
-fn attachment_blob(attachment: &str, format: u32) -> Vec<u8> {
-    use crate::gpu::serialized::tests::hex;
-    let colours = |entries: u8| format!("01000000 08000000 {entries:02x} 00 04 00000000 01 04");
-    let functions = "03 08 04 14000000 01 04 21000000 02 04 22000000 00";
-    let mut blob = hex(&match attachment {
-        "colour" => format!("{functions} {}", colours(2)),
-        "blended" => format!("{functions} {}", colours(3)),
-        "depth" => "02 01 04 21000000 09 04".to_owned(),
-        "stencil" => "02 01 04 21000000 0a 04".to_owned(),
-        _ => format!("02 03 04 10000000 01 04 31000000 000000 {}", colours(2)),
-    });
-    blob.extend(format.to_le_bytes());
-    if attachment == "blended" {
-        blob.extend(hex("02 04 01000000"));
-    }
-    blob
-}
-
-/// The state of [`attachment_blob`] on `d`: `v_plain` and `f_plain` of `refused.metallib`, or
-/// `slice_write` of `slice_write_repro.metallib` for a tile, by their refs.
+/// The state on `d` of `v_plain` and `f_plain` of `refused.metallib` whose `attachment`
+/// (`colour`, `blended`, `depth` or `stencil`) is pixel format `format`, the fragment function
+/// with a colour attachment alone; `blended`'s with blending enabled, its factors and operations
+/// Metal's defaults.
 fn attachment_state<P: reims_vgpu_core::platform::Platform>(
     d: &P::Device,
     attachment: &str,
     format: u32,
 ) -> Result<Option<P::RenderPipeline>, reims_vgpu_core::platform::types::NsErrorText> {
     use reims_vgpu_core::platform::resource::Library as _;
-    let library = |bytes: &[u8]| d.new_library(bytes).unwrap().unwrap().unwrap();
-    let refused = library(include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/refused.metallib"
-    )));
-    let slices = library(include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/slice_write_repro.metallib"
-    )));
-    let f = |l: &P::Library, name| l.new_function(OnFault::Return, name).unwrap().unwrap();
-    let functions = [
-        (0x21, f(&refused, "v_plain")),
-        (0x22, f(&refused, "f_plain")),
-        (0x31, f(&slices, "slice_write")),
-    ];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        Ok(functions
-            .iter()
-            .find(|(at, _)| *at == r)
-            .map(|(_, f)| f.clone_ref()))
+    use reims_vgpu_core::platform::values::FullRenderPipelineDesc;
+
+    use crate::gpu::device::tests::colours_of;
+    let refused = d
+        .new_library(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/refused.metallib"
+        )))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let f = |name| {
+        refused
+            .new_function(OnFault::Return, name)
+            .unwrap()
+            .unwrap()
     };
-    let blob = attachment_blob(attachment, format);
-    if attachment == "tile" {
-        let desc =
-            d.deserialize_tile_render_pipeline_descriptor(Hold::NONE, &blob, 0x100, &mut resolve);
-        d.new_tile_render_pipeline_state(desc.unwrap().as_ref(), 0)
-            .unwrap()
-    } else {
-        let desc = d.deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve);
-        d.new_render_pipeline_state_from_descriptor(desc.unwrap().as_ref(), 0)
-            .unwrap()
-    }
+    let (vertex, fragment) = (f("v_plain"), f("f_plain"));
+    let format = u64::from(format);
+    let desc = match attachment {
+        "colour" | "blended" => FullRenderPipelineDesc {
+            colors: colours_of(&[&[
+                (1, format.try_into().unwrap()),
+                (2, u32::from(attachment == "blended")),
+            ]]),
+            ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+        },
+        "depth" => FullRenderPipelineDesc {
+            depth_pixel_format: format,
+            ..FullRenderPipelineDesc::new(&vertex, None)
+        },
+        _ => FullRenderPipelineDesc {
+            stencil_pixel_format: format,
+            ..FullRenderPipelineDesc::new(&vertex, None)
+        },
+    };
+    d.new_render_pipeline_state_full(&desc)
 }
 
-/// A serialized descriptor's pixel format Metal makes the state of where the runtime refuses
-/// it dies as the state is made, named by Metal's description: a render descriptor's colour
-/// attachment of 501, 556 or 624, its depth attachment of `AnyDepth` or its stencil
-/// attachment of `AnyStencil` (the runtime has each, and refuses it there). A render
-/// descriptor's colour attachment of 576 to 579, or of a bfloat format (26, 66, 116)
-/// unblended, which the runtime makes, and a tile descriptor's of 576 to 579,
-/// 26 or `RGBA16Float_XR`, makes the state, as Metal's does. A render descriptor's bfloat
-/// colour attachment that blends (blending enabled, of one and zero), which Metal's
-/// validation refuses and the runtime refuses (`Unsupported` of `Format`), dies as the state
-/// is made, naming the runtime's refusal; Metal's is not made here. A value Metal describes
-/// no format for, which the runtime holds raw ([`crate::gpu::serialized::RawFormat`]),
-/// decodes, as Metal's deserializer takes it, and the state's creation dies as Metal's
-/// assertion: 2, 255, 262, 630 to 650 and 2000 at a render descriptor's attachments (the
-/// 24-bit depth formats, 255 and 262, at its depth and stencil attachments too, which the
-/// runtime stops alike), 255, 630 and 645 at a tile descriptor's (measured one case
-/// a process:
-/// [`crate::gpu::serialized::RawFormat`]'s docs; 630 to 645 at a render descriptor's colour
-/// attachment, measured on this host again by the runtime:
-/// `validateWithDevice:` line 5044, "not a valid MTLPixelFormat")
+/// A colour attachment of 576 to 579, or of a bfloat format (26, 66, 116) unblended, which the
+/// runtime makes, makes the state, as Metal's does. A bfloat colour attachment that blends
+/// (blending enabled, of one and zero), which Metal's validation refuses and the runtime
+/// refuses (`Unsupported` of `Format`), dies as the state is made, naming the runtime's
+/// refusal; Metal's is not made here
 #[test]
-fn raw_pipeline_formats_die_where_states_are_made() {
+fn pipeline_formats_the_runtime_makes_are_metals() {
     let d = dev();
     let md = reims_vgpu_metal::MetalPlatform::system_default_device();
-    let named = [
-        ("colour", 501),
-        ("colour", 556),
-        ("colour", 624),
-        ("depth", 651),
-        ("stencil", 652),
-    ];
-    let asserted = [
-        ("colour", 2000),
-        ("colour", 255),
-        ("colour", 2),
-        ("depth", 2000),
-        ("depth", 255),
-        ("depth", 262),
-        ("stencil", 255),
-        ("stencil", 262),
-        ("tile", 630),
-        ("tile", 645),
-        ("tile", 255),
-    ];
-    let undescribed = (630..=650).map(|format| ("colour", format));
-    for (attachment, format) in named.into_iter().chain(asserted).chain(undescribed) {
-        *crate::answer::LAST_LINE.lock() = None;
-        let ours = catch_death(|| {
-            attachment_state::<crate::platform::VulkanPlatform>(&d, attachment, format)
-                .map(|s| s.is_some())
-        });
-        let Err(site) = ours else {
-            panic!("{attachment} {format}: {ours:?}");
-        };
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        let sel = match attachment {
-            "tile" => "newRenderPipelineStateWithTileDescriptor:options:reflection:error:",
-            _ => "newRenderPipelineStateWithDescriptor:options:reflection:error:",
-        };
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-        if named.contains(&(attachment, format)) {
-            let name = crate::gpu::format_info::name(sel, u64::from(format));
-            let named = format!("pixel format {format} ({name}, Metal's");
-            assert!(line.contains(&named), "{line}");
-            assert!(line.contains("which the runtime refuses"), "{line}");
-            if let Some(md) = &md {
-                let state =
-                    attachment_state::<reims_vgpu_metal::MetalPlatform>(md, attachment, format);
-                assert!(matches!(state, Ok(Some(_))), "Metal: {attachment} {format}");
-            }
-        } else {
-            let what = format!("pixel format {format}, which Metal describes no format for");
-            assert!(
-                line.contains("Metal aborts at") && line.contains(&what),
-                "{line}"
-            );
-        }
-    }
-    for (attachment, format) in [
-        ("colour", 576),
-        ("colour", 577),
-        ("colour", 578),
-        ("colour", 579),
-        ("colour", 26),
-        ("colour", 66),
-        ("colour", 116),
-        ("tile", 576),
-        ("tile", 577),
-        ("tile", 578),
-        ("tile", 579),
-        ("tile", 26),
-        ("tile", 556),
-    ] {
-        let made = attachment_state::<crate::platform::VulkanPlatform>(&d, attachment, format);
-        assert!(matches!(made, Ok(Some(_))), "{attachment} {format}");
+    for format in [576, 577, 578, 579, 26, 66, 116] {
+        let made = attachment_state::<crate::platform::VulkanPlatform>(&d, "colour", format);
+        assert!(matches!(made, Ok(Some(_))), "colour {format}");
         if let Some(md) = &md {
-            let made = attachment_state::<reims_vgpu_metal::MetalPlatform>(md, attachment, format);
-            assert!(matches!(made, Ok(Some(_))), "Metal: {attachment} {format}");
+            let made = attachment_state::<reims_vgpu_metal::MetalPlatform>(md, "colour", format);
+            assert!(matches!(made, Ok(Some(_))), "Metal: colour {format}");
         }
     }
-    let sel = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
+    let sel = "newRenderPipelineStateWithDescriptor:error:";
     for format in [26, 66, 116] {
         *crate::answer::LAST_LINE.lock() = None;
         let ours = catch_death(|| {
@@ -2922,52 +2825,14 @@ fn raw_pipeline_formats_die_where_states_are_made() {
         };
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
         assert!(
-            line.contains("runtime refuses") && line.contains("feature: Format"),
+            line.contains("the Vulkan runtime refused it") && line.contains("feature: Format"),
             "blended {format}: {line}"
         );
     }
 }
 
-/// By default the states [`raw_pipeline_formats_die_where_states_are_made`] names, which Metal
-/// makes and the runtime refuses at an attachment it has the format of, are nil and the
-/// runtime's refusal as the `NSError`, each relayed as a gap at its creator and counted: the
-/// guest's creation fails, and the process goes on
-#[test]
-fn raw_pipeline_format_gaps_are_their_nserror_by_default() {
-    use crate::answer::{Inexact, RUNTIME_DOMAIN, inexact_counts, relaxed};
-    let counted = || {
-        (inexact_counts().into_iter())
-            .find(|&(k, _)| k == Inexact::RefusedCreate)
-            .map_or(0, |(_, n)| n)
-    };
-    let d = dev();
-    for (attachment, format) in [
-        ("colour", 501),
-        ("colour", 556),
-        ("colour", 624),
-        ("depth", 651),
-        ("stencil", 652),
-    ] {
-        let before = counted();
-        let made = relaxed(|| {
-            attachment_state::<crate::platform::VulkanPlatform>(&d, attachment, format)
-                .map(|s| s.is_some())
-        });
-        let Err(error) = made else {
-            panic!("{attachment} {format}: {made:?}");
-        };
-        assert_eq!((error.domain.as_str(), error.code), (RUNTIME_DOMAIN, 0));
-        assert!(
-            error.description.contains("feature: Format"),
-            "{attachment} {format}: {}",
-            error.description
-        );
-        assert_eq!(counted(), before + 1, "{attachment} {format}");
-    }
-}
-
 /// What a draw over 16 by 16 `ARGB8Unorm` (84) does on `p`'s device `d` under the state of
-/// a serialized descriptor whose colour attachment 0 is that format, blending zero over the
+/// a whole render value whose colour attachment 0 is that format, blending zero over the
 /// source colour and zero over the source alpha, adding (a multiply), of `v_plain` and
 /// `f_plain` of `refused.metallib`: the command buffer's status and error code once it
 /// completed.
@@ -2978,7 +2843,9 @@ fn rotated_blend_draw<P: reims_vgpu_core::platform::Platform>(p: &P, d: &P::Devi
     use reims_vgpu_core::platform::resource::Library as _;
     use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
 
-    use crate::gpu::serialized::tests::hex;
+    use reims_vgpu_core::platform::values::FullRenderPipelineDesc;
+
+    use crate::gpu::device::tests::colours_of;
     let library = d.new_library(include_bytes!(concat!(
         env!("OUT_DIR"),
         "/refused.metallib"
@@ -2990,23 +2857,16 @@ fn rotated_blend_draw<P: reims_vgpu_core::platform::Platform>(p: &P, d: &P::Devi
             .unwrap()
             .unwrap()
     };
-    let functions = [(0x21, f("v_plain")), (0x22, f("f_plain"))];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        Ok(functions
-            .iter()
-            .find(|(at, _)| *at == r)
-            .map(|(_, f)| f.clone_ref()))
-    };
+    let (vertex, fragment) = (f("v_plain"), f("f_plain"));
     // Colour 0: format 84, blending on, rgb source Zero, destination SourceColor, alpha
     // source Zero, destination SourceAlpha, both operations Add.
-    let blob = hex(
-        "03 08 04 14000000 01 04 21000000 02 04 22000000 00 01000000 08000000 07 \
-         00 04 00000000 01 04 54000000 02 04 01000000 03 04 00000000 04 04 02000000 \
-         06 04 00000000 07 04 04000000",
-    );
-    let desc = d.deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve);
-    let state = d.new_render_pipeline_state_from_descriptor(desc.unwrap().as_ref(), 0);
-    let state = state.unwrap().unwrap().unwrap();
+    let state = d
+        .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+            colors: colours_of(&[&[(1, 84), (2, 1), (3, 0), (4, 2), (6, 0), (7, 4)]]),
+            ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+        })
+        .unwrap()
+        .unwrap();
     let target = p.texture_descriptor(&TextureDesc {
         texture_type: 2,
         pixel_format: 84,

@@ -1,13 +1,12 @@
 //! Fake: the `platform/descriptor.rs` traits over the fake models (architecture 13.2).
 //!
-//! The descriptors core keeps as objects: the texture descriptor, the render pass descriptor and
-//! the serialized pipeline descriptors. Each holds a typed model of what was set on it: the
-//! texture descriptor a [`TexDesc`], the render pass a [`PassModel`] with its attachments'
-//! [`AttachmentModel`]s, which hold the textures they are given, so the textures go with the
-//! pass. The setters whose position Metal observes are logged (`setPixelFormat:`, which Metal
-//! checks, `setResourceOptions:`, which aliases the storage mode, and
-//! `setSamplePositions:count:`, which Metal checks); the others write the model, and the getters
-//! read it.
+//! The descriptors core keeps as objects: the texture descriptor and the render pass descriptor.
+//! Each holds a typed model of what was set on it: the texture descriptor a [`TexDesc`], the render
+//! pass a [`PassModel`] with its attachments' [`AttachmentModel`]s, which hold the textures they
+//! are given, so the textures go with the pass. The setters whose position Metal observes are
+//! logged (`setPixelFormat:`, which Metal checks, `setResourceOptions:`, which aliases the storage
+//! mode, and `setSamplePositions:count:`, which Metal checks); the others write the model, and the
+//! getters read it.
 
 use crate::testkit::script::Policy;
 use std::collections::BTreeMap;
@@ -395,36 +394,3 @@ impl RenderPassDescriptor<FakePlatform> for Fk<kind::RenderPassDescriptor> {
         self.stencil(AttachmentModel::state)
     }
 }
-
-/// A pipeline descriptor's model: the resource index set on it, and whether it is forced.
-#[derive(Debug, Default)]
-pub struct PipelineDescriptorModel {
-    /// `resourceIndex` and `forceResourceIndex` (SPI), when set.
-    pub resource_index: Option<(u64, bool)>,
-}
-
-impl PipelineDescriptorModel {
-    /// The index a pipeline made from this descriptor is forced to.
-    pub fn forced_index(&self) -> Option<u64> {
-        self.resource_index
-            .and_then(|(index, force)| force.then_some(index))
-    }
-}
-
-impl RenderPipelineDescriptor<FakePlatform> for Fk<kind::RenderPipelineDescriptor> {
-    fn set_resource_index(&self, resource_index: u64, force: bool) {
-        self.with_model_mut(|m: &mut PipelineDescriptorModel| {
-            m.resource_index = Some((resource_index, force));
-        });
-    }
-}
-
-impl ComputePipelineDescriptor<FakePlatform> for Fk<kind::ComputePipelineDescriptor> {
-    fn set_resource_index(&self, resource_index: u64, force: bool) {
-        self.with_model_mut(|m: &mut PipelineDescriptorModel| {
-            m.resource_index = Some((resource_index, force));
-        });
-    }
-}
-
-impl TileRenderPipelineDescriptor<FakePlatform> for Fk<kind::TileRenderPipelineDescriptor> {}

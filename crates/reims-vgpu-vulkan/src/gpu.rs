@@ -1,7 +1,6 @@
 //! The runtime's GPU objects: the device's queries and creators ([`device`]), capabilities
 //! ([`caps`]) and pixel format descriptions ([`format_info`]), resources and state objects
-//! ([`resource`]) and the guest's pages under them ([`backing`]), the descriptors ([`desc`]) and
-//! Apple's serialized pipeline descriptors ([`serialized`]), the
+//! ([`resource`]) and the guest's pages under them ([`backing`]), the descriptors ([`desc`]), the
 //! encoders, the indirect command buffers, rate maps, the command queue and buffer, and the
 //! events; Metal's GPU address space, which buffers and heaps are placed by ([`metal_space`]); the
 //! two-plane YCbCr formats ([`ycbcr`]) and the formats it makes no texture of
@@ -20,6 +19,9 @@
 pub mod backing;
 pub mod caps;
 pub mod command;
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod depth_denormals;
 pub mod desc;
 pub mod device;
 pub mod encode_blit;
@@ -40,7 +42,6 @@ pub mod resource;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod rgbx;
-pub mod serialized;
 pub mod shaders;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
@@ -131,10 +132,9 @@ pub(crate) fn runtime_pixel_format(raw: u64) -> Option<PixelFormat> {
 
 /// The runtime's format of a raw `MTLPixelFormat` Metal takes, or the raw value, where the runtime
 /// has no format of it or Metal describes none for it (`Depth24Unorm_Stencil8` and `X24_Stencil8`,
-/// which the runtime has), but `MTLPixelFormatInvalid`: a texture or a state of a raw value dies
-/// where it is made, or is nil, as Metal's ([`crate::gpu::desc::lacked`],
-/// [`crate::gpu::serialized::RawFormat`]). `sel` asks Metal's description
-/// ([`crate::gpu::format_info::described`]).
+/// which the runtime has), but `MTLPixelFormatInvalid`: a texture or a view of a raw value dies
+/// where it is made, or is nil, as Metal's ([`crate::gpu::desc::lacked`]). `sel` asks Metal's
+/// description ([`crate::gpu::format_info::described`]).
 pub(crate) fn held_format(sel: &'static str, raw: u64) -> Result<PixelFormat, u64> {
     held_by(raw, |raw| crate::gpu::format_info::described(sel, raw))
 }

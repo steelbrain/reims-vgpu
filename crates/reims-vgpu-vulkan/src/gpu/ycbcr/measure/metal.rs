@@ -441,7 +441,6 @@ pub(crate) fn drawn<P: Platform>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: 80,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()

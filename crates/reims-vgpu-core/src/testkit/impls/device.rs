@@ -11,12 +11,11 @@ use super::super::calllog::Arg;
 use super::super::guest_ram::{PAGE_SIZE, RawRegion};
 use super::super::objects::{DescDeallocator, FAKE_MAX_BYTES, Fk, HeapModel, Model, Space, kind};
 use super::super::platform::FakePlatform;
-use super::descriptor::PipelineDescriptorModel;
 use super::fatal;
 use super::icb::IcbModel;
 use super::rate_map::RateMapModel;
 use super::resource::{MeshLimits, PipelineModel};
-use super::{Backing, ResolveIds, common, new_buffer, new_state, new_texture};
+use super::{Backing, common, new_buffer, new_state, new_texture};
 use crate::num;
 use crate::platform::caps::{
     self, DeviceCaps, FormatAnswers, IdentityCaps, IdentityFlags, IdentitySizes,
@@ -33,7 +32,6 @@ use crate::platform::values::{
 };
 use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
-use crate::rt::Hold;
 
 /// The name the fake logs and scripts [`GpuDevice::new_command_queue_unshared`] under: no selector
 /// of Metal's names it.
@@ -195,60 +193,6 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         self.world().copies_guest_ram()
     }
 
-    fn deserialize_compute_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        context: FunctionResolver<'_, FakePlatform>,
-    ) -> RaiseResult<Option<<FakePlatform as Platform>::ComputePipelineDescriptor>> {
-        let step = self.call(
-            "newComputePipelineDescriptorWithSerializedData:deserializationContext:",
-            vec![Arg::Bytes(data.to_vec()), Arg::Block(true)],
-        );
-        step.throws(
-            Policy::Caught,
-            "newComputePipelineDescriptorWithSerializedData:deserializationContext:",
-        )?;
-        if let Some(ResolveIds(ids)) = step.get::<ResolveIds>() {
-            let mut resolved = Vec::new();
-            for id in ids {
-                resolved.push(Arg::Obj(context(hold, id)?.map(|f| f.id())));
-            }
-            self.world()
-                .log
-                .push(self.id(), "MTLDevice", "deserializationContext", resolved);
-        }
-        if step.is_nil() {
-            return Ok(None);
-        }
-        let d = self
-            .world()
-            .new_obj::<kind::ComputePipelineDescriptor>(Model::None);
-        d.state().device = self.owning_device();
-        Ok(Some(d))
-    }
-
-    fn new_compute_pipeline_state(
-        &self,
-        descriptor: Option<&<FakePlatform as Platform>::ComputePipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<<FakePlatform as Platform>::ComputePipeline>, NsErrorText>> {
-        let forced = descriptor.and_then(|d| d.with_model(PipelineDescriptorModel::forced_index));
-        self.make_or_error_for(
-            Policy::Caught,
-            "newComputePipelineStateWithDescriptor:options:reflection:error:",
-            vec![Arg::opt(descriptor), Arg::U64(options)],
-            descriptor.is_some(),
-            |w| {
-                Some(new_pipeline::<kind::ComputePipeline>(
-                    w,
-                    Space::COMPUTE_PIPELINE,
-                    forced,
-                ))
-            },
-        )
-    }
-
     fn new_compute_pipeline_state_for_function(
         &self,
         compute_function: Option<&<FakePlatform as Platform>::Function>,
@@ -324,80 +268,6 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                     mutability: desc.mutability.unwrap_or(0),
                     ..RateMapModel::default()
                 })))
-            },
-        )
-    }
-
-    fn deserialize_render_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        context: FunctionResolver<'_, FakePlatform>,
-    ) -> RaiseResult<Option<<FakePlatform as Platform>::RenderPipelineDescriptor>> {
-        let step = self.call(
-            "newRenderPipelineDescriptorWithSerializedData:deserializationContext:",
-            vec![Arg::Bytes(data.to_vec()), Arg::Block(true)],
-        );
-        step.throws(
-            Policy::Caught,
-            "newRenderPipelineDescriptorWithSerializedData:deserializationContext:",
-        )?;
-        if let Some(ResolveIds(ids)) = step.get::<ResolveIds>() {
-            let mut resolved = Vec::new();
-            for id in ids {
-                resolved.push(Arg::Obj(context(hold, id)?.map(|f| f.id())));
-            }
-            self.world()
-                .log
-                .push(self.id(), "MTLDevice", "deserializationContext", resolved);
-        }
-        if step.is_nil() {
-            return Ok(None);
-        }
-        let d = self
-            .world()
-            .new_obj::<kind::RenderPipelineDescriptor>(Model::None);
-        d.state().device = self.owning_device();
-        Ok(Some(d))
-    }
-
-    fn new_render_pipeline_state_from_descriptor(
-        &self,
-        descriptor: Option<&<FakePlatform as Platform>::RenderPipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<<FakePlatform as Platform>::RenderPipeline>, NsErrorText>> {
-        let forced = descriptor.and_then(|d| d.with_model(PipelineDescriptorModel::forced_index));
-        self.make_or_error_for(
-            Policy::Caught,
-            "newRenderPipelineStateWithDescriptor:options:reflection:error:",
-            vec![Arg::opt(descriptor), Arg::U64(options)],
-            descriptor.is_some(),
-            |w| {
-                Some(new_pipeline::<kind::RenderPipeline>(
-                    w,
-                    Space::RENDER_PIPELINE,
-                    forced,
-                ))
-            },
-        )
-    }
-
-    fn new_tile_render_pipeline_state(
-        &self,
-        descriptor: Option<&<FakePlatform as Platform>::TileRenderPipelineDescriptor>,
-        options: u64,
-    ) -> RaiseResult<Result<Option<<FakePlatform as Platform>::RenderPipeline>, NsErrorText>> {
-        self.make_or_error_for(
-            Policy::Caught,
-            "newRenderPipelineStateWithTileDescriptor:options:reflection:error:",
-            vec![Arg::opt(descriptor), Arg::U64(options)],
-            descriptor.is_some(),
-            |w| {
-                Some(new_pipeline::<kind::RenderPipeline>(
-                    w,
-                    Space::RENDER_PIPELINE,
-                    None,
-                ))
             },
         )
     }
@@ -503,45 +373,6 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
             vec![Arg::obj(descriptor), Arg::opt(iosurface), Arg::U64(plane)],
             |w| Some(new_texture(w, desc, Some(surface?), plane, None, false)),
         )
-    }
-
-    fn deserialize_tile_render_pipeline_descriptor(
-        &self,
-        hold: Hold<'_>,
-        data: &[u8],
-        buffer_length: u64,
-        context: FunctionResolver<'_, FakePlatform>,
-    ) -> RaiseResult<Option<<FakePlatform as Platform>::TileRenderPipelineDescriptor>> {
-        // Core's `malloc(length)` buffer, never freed: its size is recorded after the bytes.
-        let step = self.call(
-            "newTileRenderPipelineDescriptorWithSerializedData:deserializationContext:",
-            vec![
-                Arg::Bytes(data.to_vec()),
-                Arg::Block(true),
-                Arg::U64(buffer_length),
-            ],
-        );
-        step.throws(
-            Policy::Caught,
-            "newTileRenderPipelineDescriptorWithSerializedData:deserializationContext:",
-        )?;
-        if let Some(ResolveIds(ids)) = step.get::<ResolveIds>() {
-            let mut resolved = Vec::new();
-            for id in ids {
-                resolved.push(Arg::Obj(context(hold, id)?.map(|f| f.id())));
-            }
-            self.world()
-                .log
-                .push(self.id(), "MTLDevice", "deserializationContext", resolved);
-        }
-        if step.is_nil() {
-            return Ok(None);
-        }
-        let d = self
-            .world()
-            .new_obj::<kind::TileRenderPipelineDescriptor>(Model::None);
-        d.state().device = self.owning_device();
-        Ok(Some(d))
     }
 
     fn reserve_resource_indices(&self, resource_type: u64, indices: &[u64]) -> RaiseResult<()> {

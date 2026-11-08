@@ -11,8 +11,7 @@
 //!   they are given.
 //! - **The descriptors core keeps are typed handles.** A texture descriptor and a render pass
 //!   descriptor answer core's `TextureDescriptor` and `RenderPassDescriptor` traits, each method
-//!   one setter or getter (a render pass takes each record's `*Set` whole); the pipeline
-//!   descriptors Metal makes from serialized data take only their resource index.
+//!   one setter or getter (a render pass takes each record's `*Set` whole).
 //! - Setters and getters are `Fatal` sends: a raise inside one dies at the call ([`msg::get`]).
 //!   The attachment arrays' subscripts (`On` where the display's frame sets a colour attachment
 //!   with no handler and the decoder under one, `Caught` for the decoder's attachment state)
@@ -257,41 +256,11 @@ pub type MetalComputePassDescriptor = Obj<MTLComputePassDescriptor>;
 /// `MTLRenderPipelineDescriptor *`.
 pub type MetalRenderPipelineDescriptor = Obj<MTLRenderPipelineDescriptor>;
 
-impl reims_vgpu_core::platform::descriptor::RenderPipelineDescriptor<MetalPlatform>
-    for MetalRenderPipelineDescriptor
-{
-    fn set_resource_index(&self, resource_index: u64, force: bool) {
-        pipeline_resource_index(self.get(), resource_index, force);
-    }
-}
-
 /// `MTLComputePipelineDescriptor *`.
 pub type MetalComputePipelineDescriptor = Obj<MTLComputePipelineDescriptor>;
 
-impl reims_vgpu_core::platform::descriptor::ComputePipelineDescriptor<MetalPlatform>
-    for MetalComputePipelineDescriptor
-{
-    fn set_resource_index(&self, resource_index: u64, force: bool) {
-        let d = self.get();
-        msg::get("setResourceIndex:", || {
-            ResourceIndexDescriptorSpi::setResourceIndex(d, resource_index)
-        });
-        msg::get("setForceResourceIndex:", || {
-            ForceResourceIndexSpi::setForceResourceIndex(d, force)
-        });
-    }
-}
-
-/// `MTLTileRenderPipelineDescriptor *`.
-pub type MetalTileRenderPipelineDescriptor = Obj<MTLTileRenderPipelineDescriptor>;
-
 /// `MTLMeshRenderPipelineDescriptor *`.
 pub type MetalMeshRenderPipelineDescriptor = Obj<MTLMeshRenderPipelineDescriptor>;
-
-impl reims_vgpu_core::platform::descriptor::TileRenderPipelineDescriptor<MetalPlatform>
-    for MetalTileRenderPipelineDescriptor
-{
-}
 
 /// `MTLIndirectCommandBufferDescriptor *`.
 pub type MetalIcbDescriptor = Obj<MTLIndirectCommandBufferDescriptor>;
@@ -665,8 +634,8 @@ pub fn apply_compute_pass(desc: &ComputePassDesc, d: &MetalComputePassDescriptor
 
 /// Makes `d` hold `desc`. Order: label, vertex function, fragment function, then colour
 /// attachment 0's pixel format (`colorAttachments`, then `objectAtIndexedSubscript:`, whose raise
-/// dies at the send: no path reaches it under a handler) and, with `blend_over`, its blending,
-/// then the resource index and its force flag.
+/// dies at the send: no path reaches it under a handler), then the resource index and its force
+/// flag.
 pub fn apply_render_pipeline(
     desc: &RenderPipelineDesc<'_, MetalPlatform>,
     d: &MetalRenderPipelineDescriptor,
@@ -693,31 +662,10 @@ pub fn apply_render_pipeline(
             MTLPixelFormat(desc.color0_pixel_format.to_usize()),
         );
         msg::get("setPixelFormat:", || a.setPixelFormat(v));
-        if desc.blend_over {
-            blend_over(a);
-        }
     }
     if let Some((index, force)) = desc.resource_index {
         pipeline_resource_index(o, index, force);
     }
-}
-
-/// Has `a` blend each fragment, its colour premultiplied, over the target by its alpha
-/// (`RenderPipelineDesc::blend_over`).
-fn blend_over(a: &MTLRenderPipelineColorAttachmentDescriptor) {
-    msg::get("setBlendingEnabled:", || a.setBlendingEnabled(true));
-    msg::get("setSourceRGBBlendFactor:", || {
-        a.setSourceRGBBlendFactor(MTLBlendFactor::One);
-    });
-    msg::get("setDestinationRGBBlendFactor:", || {
-        a.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-    });
-    msg::get("setSourceAlphaBlendFactor:", || {
-        a.setSourceAlphaBlendFactor(MTLBlendFactor::One);
-    });
-    msg::get("setDestinationAlphaBlendFactor:", || {
-        a.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-    });
 }
 
 /// The highest index of a vertex or stage-input descriptor's layout and attribute arrays: Metal
@@ -1546,8 +1494,7 @@ mod tests {
 
     use objc2::runtime::AnyObject;
     use reims_vgpu_core::platform::descriptor::{
-        ComputePipelineDescriptor as _, RenderPassDescriptor as _, RenderPipelineDescriptor as _,
-        TextureDescriptor as _,
+        RenderPassDescriptor as _, TextureDescriptor as _,
     };
     use reims_vgpu_core::platform::device::GpuDevice as _;
     use reims_vgpu_core::platform::resource::Buffer as _;
@@ -1818,7 +1765,6 @@ mod tests {
                 vertex: &k.function,
                 fragment: &k.function,
                 color0_pixel_format: 80,
-                blend_over: false,
                 resource_index: Some((2, true)),
             },
             &x,
@@ -1839,40 +1785,6 @@ mod tests {
         let c = unsafe { a.objectAtIndexedSubscript(0) };
         assert_eq!(c.pixelFormat(), MTLPixelFormat(80));
         assert!(!c.isBlendingEnabled());
-    }
-
-    /// `blend_over` has colour attachment 0 blend the fragment, premultiplied, over by its alpha
-    #[test]
-    fn a_blended_pipeline_value_blends_over_by_alpha() {
-        let k = kit();
-        let x: MetalRenderPipelineDescriptor =
-            Obj::from_retained(MTLRenderPipelineDescriptor::new());
-        apply_render_pipeline(
-            &RenderPipelineDesc {
-                label: None,
-                vertex: &k.function,
-                fragment: &k.function,
-                color0_pixel_format: 80,
-                blend_over: true,
-                resource_index: None,
-            },
-            &x,
-        );
-        let a = x.get().colorAttachments();
-        // SAFETY: index 0 of the colour attachments.
-        let c = unsafe { a.objectAtIndexedSubscript(0) };
-        assert_eq!(c.pixelFormat(), MTLPixelFormat(80));
-        assert!(c.isBlendingEnabled());
-        assert_eq!(c.sourceRGBBlendFactor(), MTLBlendFactor::One);
-        assert_eq!(
-            c.destinationRGBBlendFactor(),
-            MTLBlendFactor::OneMinusSourceAlpha
-        );
-        assert_eq!(c.sourceAlphaBlendFactor(), MTLBlendFactor::One);
-        assert_eq!(
-            c.destinationAlphaBlendFactor(),
-            MTLBlendFactor::OneMinusSourceAlpha
-        );
     }
 
     /// The whole render value reaches the descriptor: every colour attachment it sets with its
@@ -2422,21 +2334,6 @@ mod tests {
         );
         let stencil = stencil_attachment_of(&d);
         assert_eq!(raw::<u32>(obj(&stencil), "clearStencil"), 7);
-    }
-
-    /// The pipeline descriptors force their resource index
-    #[test]
-    fn pipeline_descriptors_force_their_index() {
-        let r: MetalRenderPipelineDescriptor =
-            Obj::from_retained(MTLRenderPipelineDescriptor::new());
-        r.set_resource_index(9, true);
-        assert_eq!(raw_u64(obj(&r), "resourceIndex"), 9);
-        assert!(raw_bool(obj(&r), "forceResourceIndex"));
-        let c: MetalComputePipelineDescriptor =
-            Obj::from_retained(MTLComputePipelineDescriptor::new());
-        c.set_resource_index(5, true);
-        assert_eq!(raw_u64(obj(&c), "resourceIndex"), 5);
-        assert!(raw_bool(obj(&c), "forceResourceIndex"));
     }
 
     /// setSamplePositions:count: with 4 positions sets them; aborts: Metal's own assertion for a

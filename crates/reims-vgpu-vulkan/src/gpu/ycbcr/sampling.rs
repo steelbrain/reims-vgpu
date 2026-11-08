@@ -2200,9 +2200,8 @@ fn written_at<P: Platform<Surface = OsSurface>>(
         | Op::Masked
         | Op::Blended => {
             use reims_vgpu_core::platform::values::RenderPipelineDesc;
-            use reims_vgpu_core::rt::Hold;
 
-            use crate::gpu::serialized::tests::rounded_render_of;
+            use crate::gpu::device::tests::render_value;
             let pass = p.render_pass_descriptor();
             let color = ClearColor {
                 red: 0.25,
@@ -2229,8 +2228,8 @@ fn written_at<P: Platform<Surface = OsSurface>>(
             let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
             let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
             let (vertex, fragment) = (function("corner_vertex"), function("gradient_fragment"));
-            // The colour attachment's keys of a described state: its write mask of red and blue
-            // (`MTLColorWriteMask` 0xa), or its blend.
+            // The colour attachment's properties of a described state, as `colours_of` numbers
+            // them: its write mask of red and blue (`MTLColorWriteMask` 0xa), or its blend.
             let described = match op {
                 Op::Masked => Some(vec![(9, 0xa)]),
                 Op::Blended => Some(vec![(2, 1), (3, 2), (4, 3), (5, 0), (6, 2), (7, 3), (8, 0)]),
@@ -2238,22 +2237,10 @@ fn written_at<P: Platform<Surface = OsSurface>>(
             };
             let state = (!matches!(op, Op::Clear | Op::LoadUndrawn)).then(|| match described {
                 Some(keys) => {
-                    let functions = [&vertex, &fragment];
-                    let mut resolve = |_: Hold<'_>, r: u64| {
-                        let at = usize::try_from(r - 1).unwrap();
-                        Ok(Some(functions[at].clone_ref()))
-                    };
                     let mut colour = vec![(0, 0), (1, u32::try_from(format).unwrap())];
                     colour.extend(keys);
-                    let blob = rounded_render_of(&["02 04 02000000"], &[&colour], 0);
-                    let desc = d
-                        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-                        .unwrap()
-                        .unwrap();
-                    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-                        .unwrap()
-                        .unwrap()
-                        .unwrap()
+                    let desc = render_value::<P>((&vertex, &fragment), 1, &[&colour]);
+                    d.new_render_pipeline_state_full(&desc).unwrap().unwrap()
                 }
                 None => d
                     .new_render_pipeline_state(&RenderPipelineDesc {
@@ -2261,7 +2248,6 @@ fn written_at<P: Platform<Surface = OsSurface>>(
                         vertex: &vertex,
                         fragment: &fragment,
                         color0_pixel_format: format,
-                        blend_over: false,
                         resource_index: None,
                     })
                     .unwrap()
@@ -2327,7 +2313,6 @@ fn written_at<P: Platform<Surface = OsSurface>>(
                     vertex: &vertex,
                     fragment: &fragment,
                     color0_pixel_format: 80,
-                    blend_over: false,
                     resource_index: None,
                 })
                 .unwrap()

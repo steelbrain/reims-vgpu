@@ -9,6 +9,7 @@
 //! **Measured on one GPU.** Every answer here is an Apple M3 Max's (40-core GPU) under macOS 26.7
 //! (25G229). Other Apple GPU generations were not measured: an answer here may not hold on them.
 
+use reims_vgpu_core::platform::HostRange;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -18,15 +19,13 @@ use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
 use reims_vgpu_core::platform::resource::{Buffer as _, Library as _, Texture as _};
 use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize};
 use reims_vgpu_core::platform::values::{
-    ColorAttachmentSet, DepthAttachmentSet, DepthStencilDesc, StencilAttachmentSet, StencilDesc,
-    TextureDesc,
+    ColorAttachmentSet, DepthAttachmentSet, DepthStencilDesc, FullRenderPipelineDesc,
+    StencilAttachmentSet, StencilDesc, TextureDesc,
 };
-use reims_vgpu_core::platform::{Handle as _, HostRange};
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::rt::Hold;
 use reims_vgpu_metal::MetalPlatform;
 
-use crate::gpu::serialized::tests::{le, rounded_render_of};
+use crate::gpu::device::tests::colours_of;
 
 /// How many times each probe runs on Metal, each run on resources of its own: every answer
 /// recorded here was the same in each.
@@ -429,22 +428,6 @@ pub(super) fn masked_state<P: Platform>(
     let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
     let functions = [function("reach_vertex"), function("xr_constant_fragment")];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
-    let mut entries: Vec<String> = Vec::new();
-    if !colours.is_empty() {
-        entries.push("02 04 02000000".to_owned());
-    }
-    entries.push(format!("04 04 {}", le(u32::try_from(samples).unwrap())));
-    if let Some(f) = depth {
-        entries.push(format!("09 04 {}", le(u32::try_from(f).unwrap())));
-    }
-    if let Some(f) = stencil {
-        entries.push(format!("0a 04 {}", le(u32::try_from(f).unwrap())));
-    }
-    let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
     let elements: Vec<Vec<(u8, u32)>> = colours
         .iter()
         .enumerate()
@@ -458,15 +441,16 @@ pub(super) fn masked_state<P: Platform>(
         })
         .collect();
     let elements: Vec<&[(u8, u32)]> = elements.iter().map(Vec::as_slice).collect();
-    let blob = rounded_render_of(&entries, &elements, 0);
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap()
+    let fragment = (!colours.is_empty()).then_some(&functions[1]);
+    d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+        colors: colours_of(&elements),
+        depth_pixel_format: depth.unwrap_or(0),
+        stencil_pixel_format: stencil.unwrap_or(0),
+        raster_sample_count: samples,
+        ..FullRenderPipelineDesc::new(&functions[0], fragment)
+    })
+    .unwrap()
+    .unwrap()
 }
 
 /// A depth-stencil state that writes depth (`Always`, written) or stencil (`Always`, the

@@ -204,8 +204,8 @@ pub trait CommandBuffer<P: Platform>: Handle {
     /// sel: error — `None` for nil.
     fn error(&self) -> Option<NsErrorText>;
     /// sel: renderCommandEncoderWithDescriptor:
-    /// Core throws on nil. aborts: Metal's validation on some descriptors (render_pass_no_target,
-    /// testing.md 7.4).
+    /// Core throws on nil. aborts: Metal's validation on some descriptors (a pass with no render
+    /// target, measured).
     /// Reached both under a handler and with none: `on` says which this call is.
     fn render_encoder(
         &self,

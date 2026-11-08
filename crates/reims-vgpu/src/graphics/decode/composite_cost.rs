@@ -53,11 +53,11 @@ use reims_graphics::wire::{
     RgfxMsgHeader, RgfxQueueCreate,
 };
 use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::values::{RenderPipelineDesc, SamplerDesc, TextureDesc};
+use reims_vgpu_core::platform::values::{FullRenderPipelineDesc, SamplerDesc, TextureDesc};
 use reims_vgpu_core::raise::OnFault;
 use zerocopy::IntoBytes;
 
-use super::draw_cost::{counts, fixture, spread};
+use super::draw_cost::{counts, fixture, over, spread};
 use super::{GraphicsDecoder, ObjHandle};
 use crate::platform::ApiPlatform;
 
@@ -347,14 +347,14 @@ impl<P: ApiPlatform> Bench<P> {
             ..TextureDesc::default()
         });
         let target = device.new_texture(OnFault::Die, &target).unwrap().unwrap();
+        let (vertex, fragment) = (
+            fixture::<P>(&device, "render_vbuf"),
+            fixture::<P>(&device, "render_ftex"),
+        );
         let pipeline = device
-            .new_render_pipeline_state(&RenderPipelineDesc {
-                label: None,
-                vertex: &fixture::<P>(&device, "render_vbuf"),
-                fragment: &fixture::<P>(&device, "render_ftex"),
-                color0_pixel_format: BGRA8,
-                blend_over: true,
-                resource_index: None,
+            .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                colors: vec![(0, over(BGRA8))],
+                ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
             })
             .unwrap()
             .unwrap();

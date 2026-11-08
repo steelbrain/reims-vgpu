@@ -1859,32 +1859,17 @@ fn clears_and_bfloat_fills_are_metals() {
 }
 
 /// The state of `rounding.metal`'s `sweep_vertex` and `sweep_fragment` into colour attachment 0
-/// of `format` at `samples` samples, decoded from a guest's blob on `d`.
+/// of `format` at `samples` samples, made from the whole render value on `d`.
 fn sweep_state<P: Platform>(d: &P::Device, format: u64, samples: u64) -> P::RenderPipeline {
-    use reims_vgpu_core::platform::Handle as _;
-    use reims_vgpu_core::rt::Hold;
-
+    use crate::gpu::device::tests::render_value;
     use crate::gpu::encode_render::tests::ROUNDING;
-    use crate::gpu::serialized::tests::{le, rounded_render_of};
 
     let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
     let functions = [function("sweep_vertex"), function("sweep_fragment")];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
-    let samples = format!("04 04 {}", le(u32::try_from(samples).unwrap()));
     let colour: &[(u8, u32)] = &[(0, 0), (1, u32::try_from(format).unwrap())];
-    let blob = rounded_render_of(&["02 04 02000000", &samples], &[colour], 0);
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap()
+    let desc = render_value::<P>((&functions[0], &functions[1]), samples, &[colour]);
+    d.new_render_pipeline_state_full(&desc).unwrap().unwrap()
 }
 
 /// What a pass that clears a Private `side` by `side` texture of `format` (of `texel` bytes),

@@ -112,12 +112,6 @@ pub trait Platform: Sized + Send + Sync + 'static {
     type TextureDescriptor: descriptor::TextureDescriptor<Self>;
     /// `MTLRenderPassDescriptor *`.
     type RenderPassDescriptor: descriptor::RenderPassDescriptor<Self>;
-    /// `MTLRenderPipelineDescriptor *`.
-    type RenderPipelineDescriptor: descriptor::RenderPipelineDescriptor<Self>;
-    /// `MTLComputePipelineDescriptor *`.
-    type ComputePipelineDescriptor: descriptor::ComputePipelineDescriptor<Self>;
-    /// `MTLTileRenderPipelineDescriptor *`.
-    type TileRenderPipelineDescriptor: descriptor::TileRenderPipelineDescriptor<Self>;
     /// `MTLRasterizationRateMapDescriptor *`.
     type RateMapDescriptor: rate_map::RateMapDescriptor<Self>;
     /// `MTLRasterizationRateLayerDescriptor *`.

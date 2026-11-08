@@ -32,18 +32,12 @@ use super::objects::{
     AnyHandle, BufferModel, FAKE_MAX_BYTES, Fk, Kind, Model, ResourceCommon, Space, TexDesc,
     TextureModel, World, kind,
 };
-use super::script::{Policy, Step};
+use super::script::Policy;
 use crate::host::HostPtr;
 use crate::platform::Handle;
 use crate::platform::blit::ResourceRef;
 use crate::platform::types::NsErrorText;
 use crate::raise::RaiseResult;
-
-/// The function references a serialized pipeline blob asks its resolver for: a scripted
-/// `Step::value(ResolveIds(vec![…]))` on `new…DescriptorWithSerializedData:…` makes the fake call
-/// the resolver with each, in order, as Metal does during the call.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ResolveIds(pub Vec<u64>);
 
 /// The identity of a resource argument.
 pub fn res_id(r: &ResourceRef<'_, super::platform::FakePlatform>) -> crate::platform::ObjId {
@@ -138,29 +132,6 @@ impl<K: Kind> Fk<K> {
         init: impl FnOnce(&Arc<World>) -> Option<Fk<C>>,
     ) -> RaiseResult<Result<Option<Fk<C>>, NsErrorText>> {
         let step = self.call(sel, args);
-        let w = self.world().clone();
-        step.create_or_error(policy, sel, || init(&w).map(|c| self.adopt(c)))
-    }
-
-    /// A pipeline-state creator whose descriptor may be nil. With no script, a nil descriptor
-    /// gets nil and an `NSError`, as Metal answers an empty blob's nil descriptor (testing.md
-    /// 6.18); the error's text is the fake's own ([`NIL_DESCRIPTOR_ERROR`]).
-    pub fn make_or_error_for<C: Kind>(
-        &self,
-        policy: Policy,
-        sel: &'static str,
-        args: Vec<Arg>,
-        has_descriptor: bool,
-        init: impl FnOnce(&Arc<World>) -> Option<Fk<C>>,
-    ) -> RaiseResult<Result<Option<Fk<C>>, NsErrorText>> {
-        let step = self.call(sel, args);
-        if !has_descriptor && matches!(step, Step::Default) {
-            return Ok(Err(NsErrorText {
-                domain: String::new(),
-                code: 0,
-                description: NIL_DESCRIPTOR_ERROR.to_owned(),
-            }));
-        }
         let w = self.world().clone();
         step.create_or_error(policy, sel, || init(&w).map(|c| self.adopt(c)))
     }
@@ -299,10 +270,6 @@ pub fn new_texture(
 pub fn new_state<C: Kind>(w: &Arc<World>, index: Option<(Space, Option<u64>)>) -> Fk<C> {
     w.new_obj(Model::State(common(w, index)))
 }
-
-/// The fake's description of the error Metal returns for a nil pipeline descriptor (the text
-/// is not Metal's; tests compare against this constant).
-pub const NIL_DESCRIPTOR_ERROR: &str = "fake: nil pipeline descriptor";
 
 #[cfg(test)]
 mod tests {

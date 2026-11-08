@@ -9,15 +9,14 @@
 //!   holds it, then the variant's shader modules and layouts. The cache on disk is this
 //!   platform's `~/.cache/reims-vgpu-vulkan` ([`crate::platform`]), under a directory of each
 //!   runtime build: a new build of the runtime starts from an empty one. [`creation`] times each
-//!   creator: render, compute and tile states, from a descriptor (a guest's deserialized one too,
-//!   whose decoding it times as well) or a function, the display's present pipelines, the
-//!   predication step's pipeline, libraries and function lookups.
+//!   creator: render and compute states, from a descriptor or a function, the display's present
+//!   pipelines, the predication step's pipeline, libraries and function lookups.
 //! - **At a state's first use**: a render state's `VkPipeline` of each graphics key (the pass's
 //!   formats and samples, the draw's topology, the encoder state the pipeline takes statically)
-//!   is made by the first draw that needs it, a compute or tile state's of each region
-//!   specialization by the first dispatch, inside that command's runtime call on the encoding
-//!   thread, where MoltenVK makes the Metal pipeline under it. [`encoder_call`] writes an encoder
-//!   command that takes [`SLOW_CALL`] or more, naming the pipeline state set last.
+//!   is made by the first draw that needs it, a compute state's of each region specialization by
+//!   the first dispatch, inside that command's runtime call on the encoding thread, where MoltenVK
+//!   makes the Metal pipeline under it. [`encoder_call`] writes an encoder command that takes
+//!   [`SLOW_CALL`] or more, naming the pipeline state set last.
 //! - **At the commit**: the commands of the indirect command buffers a command buffer executes
 //!   are recorded then, on the committing thread, making the `VkPipeline`s they need; [`commit`]
 //!   writes a commit that takes [`SLOW_CALL`] or more. Those whose records the GPU may write are
@@ -177,7 +176,7 @@ pub fn creation<T>(
 /// What a render state leaves to its first use, as a creation line says it.
 pub const RENDER_LATER: &str = " (its VkPipelines are made at the draws that first need them)";
 
-/// What a compute or tile state leaves to its first use, as a creation line says it.
+/// What a compute state leaves to its first use, as a creation line says it.
 pub const DISPATCH_LATER: &str =
     " (its VkPipelines are made at the dispatches that first need them)";
 

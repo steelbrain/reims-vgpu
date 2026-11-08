@@ -38,7 +38,7 @@ use crate::sync::{Condvar, Mutex, MutexGuard};
 use super::calllog::{Arg, CallLog, Event, ReleaseContext};
 use super::clock::VirtualClock;
 use super::guest_ram::{PAGE_SIZE, RawRegion};
-use super::impls::descriptor::{PassModel, PipelineDescriptorModel, TextureDescriptorModel};
+use super::impls::descriptor::{PassModel, TextureDescriptorModel};
 use super::impls::device::DeviceModel;
 use super::impls::icb::{IcbCommandModel, IcbModel};
 use super::impls::rate_map::{RateMapDescriptorModel, RateMapModel};
@@ -110,9 +110,6 @@ pub mod kind {
         IndirectComputeCommand => "MTLIndirectComputeCommand",
         TextureDescriptor => "MTLTextureDescriptor",
         RenderPassDescriptor => "MTLRenderPassDescriptor",
-        RenderPipelineDescriptor => "MTLRenderPipelineDescriptor",
-        ComputePipelineDescriptor => "MTLComputePipelineDescriptor",
-        TileRenderPipelineDescriptor => "MTLTileRenderPipelineDescriptor",
         RateMapDescriptor => "MTLRasterizationRateMapDescriptor",
         RateMapLayerDescriptor => "MTLRasterizationRateLayerDescriptor",
         AddressRangeArray => "MTLResourceAddressRangeArray",
@@ -481,8 +478,6 @@ pub enum Model {
     Pass(Box<PassModel>),
     /// A rasterization rate map descriptor.
     RateMapDescriptor(RateMapDescriptorModel),
-    /// A pipeline descriptor Metal made from serialized data.
-    PipelineDescriptor(PipelineDescriptorModel),
 }
 
 /// A kind's typed model, as a [`Model`] holds it ([`Fk::with_model`], [`Fk::with_model_mut`]).
@@ -523,7 +518,6 @@ model_of! {
     TextureDescriptorModel => TextureDescriptor,
     PassModel => Pass,
     RateMapDescriptorModel => RateMapDescriptor,
-    PipelineDescriptorModel => PipelineDescriptor,
 }
 
 /// A buffer descriptor's deallocator block `(contents, length)`.

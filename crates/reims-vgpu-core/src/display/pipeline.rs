@@ -101,7 +101,6 @@ impl<P: Platform> DisplayPipelineCache<P> {
                     &self.fragment_function
                 },
                 color0_pixel_format: key.format,
-                blend_over: false,
                 resource_index: None,
             })
             .ok()
@@ -234,7 +233,6 @@ mod tests {
                     &c.fragment_function
                 },
                 color0_pixel_format: key.format,
-                blend_over: false,
                 resource_index: None,
             }
         }
