@@ -54,7 +54,6 @@ pub use crate::present::FrameSink;
 
 use crate::config::{WindowCallbacks, WindowConfig};
 use crate::native::{self, Surface};
-use crate::policy;
 
 /// The next window's id.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -216,12 +215,6 @@ pub struct Window {
     port: u64,
     /// The window's title.
     title: String,
-    /// The config's flag.
-    match_host_screen: bool,
-    /// The config's chosen mode.
-    chosen_mode: Option<(u16, u16)>,
-    /// The config's density for the chosen mode.
-    chosen_ppi: Option<f64>,
     /// The config's `keeps_its_size`.
     keeps_its_size: bool,
     /// The host's callbacks, until the window's end takes them out.
@@ -230,9 +223,6 @@ pub struct Window {
     guest: Mutex<GuestState>,
     /// The first mode the display offers the guest, once it offers one.
     offered: Mutex<Option<(u16, u16)>>,
-    /// The size in millimetres the display tells the guest, once it is known: what the guest's
-    /// scale follows ([`policy::guest_scale`]).
-    told_size: Mutex<Option<(f64, f64)>>,
     /// What draws the display's frames, once the display exists.
     sink: Mutex<Option<Arc<dyn FrameSink>>>,
     /// Set at the window's end.
@@ -280,14 +270,10 @@ impl Window {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             port,
             title,
-            match_host_screen: config.match_host_screen,
-            chosen_mode: config.mode,
-            chosen_ppi: config.mode_ppi,
             keeps_its_size: config.keeps_its_size,
             callbacks: Mutex::new(Some(config.callbacks)),
             guest: Mutex::new(GuestState::default()),
             offered: Mutex::new(None),
-            told_size: Mutex::new(None),
             sink: Mutex::new(None),
             closed: AtomicBool::new(false),
             attached: AtomicBool::new(false),
@@ -307,11 +293,6 @@ impl Window {
     /// The window's title.
     pub fn title(&self) -> &str {
         &self.title
-    }
-
-    /// Whether the config asked for modes and a density matching the host's screen.
-    pub fn match_host_screen(&self) -> bool {
-        self.match_host_screen
     }
 
     /// Opens the window over `sink`, the display's: its render thread starts, and the window
@@ -475,25 +456,9 @@ impl Window {
         *self.offered.lock()
     }
 
-    /// The config's chosen mode (`WindowConfig::mode`).
-    pub fn chosen_mode(&self) -> Option<(u16, u16)> {
-        self.chosen_mode
-    }
-
-    /// The config's density for its chosen mode (`WindowConfig::mode_ppi`).
-    pub fn chosen_ppi(&self) -> Option<f64> {
-        self.chosen_ppi
-    }
-
     /// Whether the window never resizes for the guest's mode (`WindowConfig::keeps_its_size`).
     pub fn keeps_its_size(&self) -> bool {
         self.keeps_its_size
-    }
-
-    /// The display tells the guest it is `size_in_millimeters`: the window opens and resizes at
-    /// a guest point per host point, the guest's scale for each mode following it.
-    pub fn told_size(&self, size_in_millimeters: (f64, f64)) {
-        *self.told_size.lock() = Some(size_in_millimeters);
     }
 }
 
@@ -564,14 +529,6 @@ impl Window {
     /// The guest's mode, once it has set one.
     pub(crate) fn mode(&self) -> Option<(u16, u16)> {
         self.guest.lock().mode
-    }
-
-    /// The scale the guest runs `mode` at: 2 or 1 by the size the display tells it
-    /// ([`policy::guest_scale`]), 1 before the display says.
-    pub(crate) fn guest_scale(&self, mode: (u16, u16)) -> u8 {
-        self.told_size
-            .lock()
-            .map_or(1, |size| policy::guest_scale(mode, size))
     }
 
     /// The sink, copied out of its lock, until the window's end.

@@ -22,9 +22,8 @@
 //! - what a window decides, with no AppKit in it, each unit-tested: [`geometry`] (the image's
 //!   rectangle and the pointer's position in it), [`keymap`] (macOS key codes to USB usages),
 //!   [`keys`] (modifiers and the keys held down), [`capture`] (who gets the keyboard, and where
-//!   the pointer may go), [`scroll`] (wheel and trackpad deltas to notches or smooth scrolling),
-//!   [`policy`] (the modes and density the guest is offered for a host screen) and
-//!   [`env`](mod@env) (the `REIMS_VGPU_WINDOW_*` variables);
+//!   the pointer may go), [`scroll`] (wheel and trackpad deltas to notches or smooth scrolling)
+//!   and [`env`](mod@env) (the `REIMS_VGPU_WINDOW_*` variables);
 //! - the host's screens ([`screens`]), as the OS lists them;
 //! - the window itself: [`handle`] (the [`Window`] the display holds), and its OS side
 //!   (`native`, one directory per OS behind one file). On macOS (`native/macos/`) that is the
@@ -49,7 +48,6 @@ pub mod handle;
 pub mod keymap;
 pub mod keys;
 mod native;
-pub mod policy;
 mod present;
 pub mod screens;
 pub mod scroll;
@@ -65,7 +63,6 @@ pub use config::{
     WindowConfig,
 };
 pub use handle::{DrawnCursor, FrameSink, Glyph, PixelRect, Window};
-pub use policy::{Density, OfferedMode};
 pub use present::{Drawn, Presenter, VulkanTarget};
 pub use screens::HostScreen;
 

@@ -119,22 +119,11 @@ impl std::fmt::Debug for WindowCallbacks {
 /// A display's window.
 #[derive(Clone, Debug, Default)]
 pub struct WindowConfig {
-    /// The library offers the guest modes, a size in millimetres and a scale factor matching the
-    /// host screen the window opens on (`policy`), in place of the display config's size and of
-    /// modes the host sets. A host's own `set_modes` still replaces the modes.
-    pub match_host_screen: bool,
-    /// With `match_host_screen`, the mode offered first in place of the screen's own, with the
-    /// standard sizes within it, at the screen's refresh rate and a 1× density, 110 ppi, or at
-    /// `mode_ppi`: at 110 the guest runs that mode at 1× (measured up to 3811 pixels wide), and
-    /// the window scales it on the GPU (`policy::modes_up_to`). `None` offers the screen's own
-    /// modes at its density. With no screen to match, the mode is offered at 60 Hz, and `None`
-    /// is `policy::UNMATCHED_MODE` at 1×.
+    /// The mode the display offers the guest first, `None` leaving it to the display. The
+    /// window does not read it: the display tells it the mode it offers
+    /// ([`Window::offered_mode`](crate::Window::offered_mode)), which the window opens sized for
+    /// until the guest sets one.
     pub mode: Option<(u16, u16)>,
-    /// With `mode`, the density the guest is told for it, in pixels per inch, in place of 110
-    /// (`policy::density_chosen`): where the guest reads it as 146.67 ppi or more, across the
-    /// width in whole centimetres (`policy::guest_scale`), it runs a HiDPI desktop at the mode's
-    /// pixels. `None` is 110. Ignored without `mode`.
-    pub mode_ppi: Option<f64>,
     /// The guest follows the window: the window keeps the size it opened at, or the person gave
     /// it, and never resizes for the guest's mode, whose image it fits between black bars as it
     /// does once the person has resized it. The reims-graphics display's window, whose guest

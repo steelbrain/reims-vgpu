@@ -4,12 +4,11 @@
 //! surface, its input, its end) is its [`os`]'s.
 //!
 //! **Opening.** A window opens on the screen [`crate::screens::screen_for_port`] picks for the
-//! display's port, else on the main screen, so the screen whose density the guest was told of is
-//! the one it opens on. Windowed (the default), its content is the guest's mode, else the first
-//! mode the display offers, else [`DEFAULT_MODE`], at one guest point per host point, shrunk to fit
-//! the screen ([`crate::geometry::initial_content_size`]), on whole pixels at the screen's scale,
-//! and never below [`MIN_CONTENT`]. Borderless (`REIMS_VGPU_WINDOW_BORDERLESS=1`), it fills its
-//! screen.
+//! display's port, else on the main screen. Windowed (the default), its content is the guest's
+//! mode, else the first mode the display offers, else [`DEFAULT_MODE`], at one guest pixel per
+//! host point, shrunk to fit the screen ([`crate::geometry::initial_content_size`]), on whole
+//! pixels at the screen's scale, and never below [`MIN_CONTENT`]. Borderless
+//! (`REIMS_VGPU_WINDOW_BORDERLESS=1`), it fills its screen.
 //!
 //! **Following the guest's mode.** Until the person resizes it (an edge, tiling, maximizing or
 //! zooming, full screen), a windowed window follows the guest's mode: each mode change resizes its

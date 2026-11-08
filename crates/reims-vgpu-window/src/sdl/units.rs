@@ -96,9 +96,9 @@ impl Units {
     }
 }
 
-/// The content size, in `units`, of a windowed window for a guest mode `mode` at `guest_scale`,
-/// on a screen whose usable bounds are `usable` in those units, where known: a guest point per
-/// host point ([`geometry::initial_content_size`]), shrunk to fit the usable bounds less
+/// The content size, in `units`, of a windowed window for a guest mode `mode`, on a screen whose
+/// usable bounds are `usable` in those units, where known: a guest pixel per host point
+/// ([`geometry::initial_content_size`]), shrunk to fit the usable bounds less
 /// `title_room` points, on whole pixels, made smaller where it takes that to come to a multiple
 /// of [`geometry::MODE_WIDTH_STEP`] pixels wide and of [`geometry::MODE_HEIGHT_STEP`] high, and
 /// at least [`MIN_CONTENT`] points. The guest is offered the window's pixels rounded down to
@@ -106,7 +106,6 @@ impl Units {
 /// no black beside it.
 pub(crate) fn windowed_size(
     mode: (u16, u16),
-    guest_scale: u8,
     usable: Option<(i32, i32)>,
     title_room: f64,
     units: Units,
@@ -118,7 +117,7 @@ pub(crate) fn windowed_size(
             f64::from(h) / per_point - title_room,
         )
     });
-    let (width, height) = geometry::initial_content_size(mode, f64::from(guest_scale.max(1)), room);
+    let (width, height) = geometry::initial_content_size(mode, room);
     let min = units.min_content();
     (
         units.aligned(
@@ -160,42 +159,42 @@ mod tests {
         // Wayland at 1×, and at 2×: points, the usable bounds in points.
         let wayland = Units::new(1.0, 1.0);
         assert_eq!(
-            windowed_size(fhd, 1, Some((2560, 1400)), ROOM, wayland),
+            windowed_size(fhd, Some((2560, 1400)), ROOM, wayland),
             (1920, 1080)
         );
         let wayland_2x = Units::new(2.0, 1.0);
         assert_eq!(
-            windowed_size((3840, 2160), 2, Some((1920, 1080)), ROOM, wayland_2x),
+            windowed_size(fhd, Some((1920, 1080)), ROOM, wayland_2x),
             (1832, 1032)
         );
         // Wayland at 150%: whole pixels, 1280 points of 1.5 pixels.
         let wayland_150 = Units::new(1.5, 1.0);
         assert_eq!(
-            windowed_size((1280, 800), 1, Some((1707, 960)), ROOM, wayland_150),
+            windowed_size((1280, 800), Some((1707, 960)), ROOM, wayland_150),
             (1280, 800)
         );
-        // X11 at a content scale of 2: pixels, two to the point; a 1× guest of 1920 × 1080
-        // shrinks to fit 1920 × 1008 points, 3584 × 2016 pixels.
+        // X11 at a content scale of 2: pixels, two to the point; 1920 × 1080 shrinks to fit
+        // 1920 × 1008 points, 3584 × 2016 pixels.
         let x11_2x = Units::new(1.0, 2.0);
         assert_eq!(
-            windowed_size(fhd, 1, Some((3840, 2112)), ROOM, x11_2x),
+            windowed_size(fhd, Some((3840, 2112)), ROOM, x11_2x),
             (3584, 2016)
         );
-        // A HiDPI guest there is a guest pixel per screen pixel.
+        // 1280 × 800 fits there whole, at 2560 × 1600 pixels.
         assert_eq!(
-            windowed_size((2560, 1600), 2, Some((3840, 2112)), ROOM, x11_2x),
+            windowed_size((1280, 800), Some((3840, 2112)), ROOM, x11_2x),
             (2560, 1600)
         );
         // X11 at 150%: 1280 × 800 points are 1920 × 1200 pixels.
         let x11_150 = Units::new(1.0, 1.5);
         assert_eq!(
-            windowed_size((1280, 800), 1, Some((2560, 1392)), ROOM, x11_150),
+            windowed_size((1280, 800), Some((2560, 1392)), ROOM, x11_150),
             (1920, 1200)
         );
         // The smallest content, 320 × 200 points, in pixels at 2.
         assert_eq!(x11_2x.min_content(), (640, 400));
         assert_eq!(wayland_2x.min_content(), (320, 200));
-        assert_eq!(windowed_size((400, 300), 2, None, ROOM, x11_2x), (640, 400));
+        assert_eq!(windowed_size((200, 150), None, ROOM, x11_2x), (640, 400));
     }
 
     /// At the fractional scales desktops offer, a window opens a multiple of 16 pixels wide and an
@@ -205,11 +204,11 @@ mod tests {
     fn a_window_opens_a_multiple_of_16_pixels_wide_at_fractional_scales() {
         const ROOM: f64 = 48.0;
         let modes = [
-            ((1920, 1080), 1),
-            ((2560, 1600), 1),
-            ((3840, 2160), 2),
-            ((1366, 768), 1),
-            ((1280, 800), 1),
+            (1920, 1080),
+            (2560, 1600),
+            (3840, 2160),
+            (1366, 768),
+            (1280, 800),
         ];
         for scale in [1.25_f32, 1.5, 1.75, 2.1] {
             // A 3840 × 2160 screen: its points on Wayland, its pixels on X11.
@@ -219,9 +218,9 @@ mod tests {
             );
             let wayland = Units::new(scale, 1.0);
             let x11 = Units::new(1.0, scale);
-            for (mode, guest_scale) in modes {
+            for mode in modes {
                 for (units, usable) in [(wayland, points), (x11, (3840, 2160))] {
-                    let size = windowed_size(mode, guest_scale, Some(usable), ROOM, units);
+                    let size = windowed_size(mode, Some(usable), ROOM, units);
                     let pixels = (units.pixels_of(size.0), units.pixels_of(size.1));
                     assert!(
                         pixels.0 % 16 == 0 && pixels.1 % 2 == 0,
@@ -233,7 +232,7 @@ mod tests {
         // Wayland at 2.1: 1570 points are 3297 pixels, and 1562 the next size down that comes to
         // a multiple of 16.
         let wayland_21 = Units::new(2.1, 1.0);
-        let size = windowed_size((2560, 1600), 1, Some((1829, 1029)), ROOM, wayland_21);
+        let size = windowed_size((2560, 1600), Some((1829, 1029)), ROOM, wayland_21);
         assert_eq!(size, (1562, 981));
         assert_eq!(
             (wayland_21.pixels_of(size.0), wayland_21.pixels_of(size.1)),
@@ -242,14 +241,14 @@ mod tests {
         // At 1.5: 2227 points are 3341 pixels (3340.5 rounded away from zero), 2208 are 3312.
         let wayland_15 = Units::new(1.5, 1.0);
         assert_eq!(
-            windowed_size((2560, 1600), 1, Some((2560, 1440)), ROOM, wayland_15),
+            windowed_size((2560, 1600), Some((2560, 1440)), ROOM, wayland_15),
             (2208, 1392)
         );
         assert_eq!(wayland_15.pixels_of(2208), 3312);
         // X11 at 2.1: 3660 × 2059 pixels, 3648 wide and one fewer high.
         let x11_21 = Units::new(1.0, 2.1);
         assert_eq!(
-            windowed_size((1920, 1080), 1, Some((3840, 2160)), ROOM, x11_21),
+            windowed_size((1920, 1080), Some((3840, 2160)), ROOM, x11_21),
             (3648, 2058)
         );
         // The ten sizes from 965 to 974 points are odd at 2.1 (2027 to 2045 pixels); 964 is even,

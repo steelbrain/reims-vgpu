@@ -437,11 +437,6 @@ impl DisplayView {
         self.ivars().window.mode()
     }
 
-    /// The scale the guest runs `mode` at (`Window::guest_scale`).
-    pub(crate) fn guest_scale(&self, mode: (u16, u16)) -> u8 {
-        self.ivars().window.guest_scale(mode)
-    }
-
     /// Whether the window never resizes for the guest's mode (`Window::keeps_its_size`).
     pub(crate) fn keeps_its_size(&self) -> bool {
         self.ivars().window.keeps_its_size()

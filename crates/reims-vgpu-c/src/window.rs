@@ -221,9 +221,7 @@ impl RvgWindowConfig {
         let mode = (self.mode_width != 0 && self.mode_height != 0)
             .then_some((self.mode_width, self.mode_height));
         WindowConfig {
-            match_host_screen: false,
             mode,
-            mode_ppi: None,
             keeps_its_size: false,
             callbacks,
         }

@@ -129,9 +129,9 @@ fn units_of(display: SDL_DisplayID) -> Units {
     Units::new(density, content)
 }
 
-/// The content size, in SDL's sizes, of a windowed window for a guest mode `mode` at
-/// `guest_scale`, on screen `display` (the module doc): at least `shell::MIN_CONTENT` points.
-fn windowed_size(display: SDL_DisplayID, mode: (u16, u16), guest_scale: u8) -> (i32, i32) {
+/// The content size, in SDL's sizes, of a windowed window for a guest mode `mode`, on screen
+/// `display` (the module doc): at least `shell::MIN_CONTENT` points.
+fn windowed_size(display: SDL_DisplayID, mode: (u16, u16)) -> (i32, i32) {
     let mut usable = SDL_Rect {
         x: 0,
         y: 0,
@@ -141,7 +141,7 @@ fn windowed_size(display: SDL_DisplayID, mode: (u16, u16), guest_scale: u8) -> (
     // SAFETY: SDL's video runs on this thread.
     let known = unsafe { SDL_GetDisplayUsableBounds(display, &mut usable) };
     let usable = known.then_some((usable.w, usable.h));
-    units::windowed_size(mode, guest_scale, usable, TITLE_ROOM, units_of(display))
+    units::windowed_size(mode, usable, TITLE_ROOM, units_of(display))
 }
 
 /// Makes and shows `window`'s SDL window (the module doc), and hands its render thread SDL's
@@ -153,7 +153,7 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
         |s| SDL_DisplayID(s.id),
     );
     let mode = window.mode().or(window.offered()).unwrap_or(DEFAULT_MODE);
-    let size = windowed_size(display, mode, window.guest_scale(mode));
+    let size = windowed_size(display, mode);
     let min = units_of(display).min_content();
     let title = c_string(window.title());
     let flags = SDL_WINDOW_VULKAN
@@ -194,7 +194,7 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, _taken: &[Frame]) -> 
 
 /// Resizes a window following the guest's mode for `mode`, as it would open on its screen.
 pub(crate) fn follow(shell: &mut Shell, mode: (u16, u16), _taken: &[Frame]) {
-    let size = windowed_size(shell.os.display, mode, shell.window.guest_scale(mode));
+    let size = windowed_size(shell.os.display, mode);
     if size != shell.asked {
         shell.asked = size;
         // SAFETY: the window is SDL's, on this thread.

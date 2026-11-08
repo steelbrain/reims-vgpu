@@ -166,13 +166,7 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, taken: &[Frame]) -> O
         appkit::screen_frame(screen.as_deref())
     } else {
         let mode = window.mode().or(window.offered()).unwrap_or(DEFAULT_MODE);
-        appkit::windowed_frame(
-            screen.as_deref(),
-            mode,
-            window.guest_scale(mode),
-            taken,
-            mtm,
-        )
+        appkit::windowed_frame(screen.as_deref(), mode, taken, mtm)
     };
     let title = c_string(window.title());
     let flags =
@@ -241,8 +235,7 @@ pub(crate) fn follow(shell: &mut Shell, mode: (u16, u16), taken: &[Frame]) {
     };
     let ns_window = &shell.os.ns_window;
     let frame = msg::get("frame", || ns_window.frame());
-    let resized =
-        appkit::followed_frame(ns_window, mode, shell.window.guest_scale(mode), taken, mtm);
+    let resized = appkit::followed_frame(ns_window, mode, taken, mtm);
     if resized != frame {
         msg::get("setFrame:display:", || {
             ns_window.setFrame_display(resized, true);
