@@ -1862,6 +1862,7 @@ getBinaryDataForKey: absent %old-only
 initMetalScriptWithArchive: absent %old-only
 newPipelineDescriptorAtIndex:pipelineType:error: absent %old-only
 recompilablePipelineCount absent %old-only
+recompileToArchive:error: absent %old-only
 [RgfxComputePipelineState]
 functionPointerHandleWithFunction: absent %old-only
 functionPointerHandlesWithFunctions:range: absent %old-only

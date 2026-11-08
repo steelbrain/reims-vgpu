@@ -6,8 +6,8 @@
 #
 # Made with tools/protocol_dump.m, run in each guest and on the Mac: for each protocol a class of
 # ours adopts, and its SPI counterpart, the members a guest's protocol has that the Mac's
-# protocol, with the protocols it adopts, lacks. Measured: macOS 11.7.11, 12.7.6, 13.7.8 and
-# 26.7.2 against macOS 27.0.1. A line whose member the Mac's protocol has fails, as it is walked
+# protocol, with the protocols it adopts, lacks. Measured: macOS 11.7.11, 12.7.6, 13.7.8,
+# 14.8.9, 15.8.2 and 26.7.2 against macOS 27.0.1. A line whose member the Mac's protocol has fails, as it is walked
 # already.
 
 MTLArgumentEncoderSPI setFunctionPointer:atIndex: required 11.7.11
@@ -23,9 +23,10 @@ MTLDeviceSPI supportsBinaryFunctionPointers required 11.7.11
 MTLBinaryArchiveSPI addArchiveEntry:forKey: required 12.7.6 13.7.8
 MTLBinaryArchiveSPI getArchiveDataForKey: required 12.7.6 13.7.8
 MTLBinaryArchiveSPI getArchiveIDWithError: required 13.7.8
-MTLBinaryArchiveSPI initMetalScriptWithArchive: required 13.7.8
-MTLBinaryArchiveSPI newPipelineDescriptorAtIndex:pipelineType:error: required 13.7.8
-MTLBinaryArchiveSPI recompilablePipelineCount required 13.7.8
+MTLBinaryArchiveSPI initMetalScriptWithArchive: required 13.7.8 14.8.9
+MTLBinaryArchiveSPI newPipelineDescriptorAtIndex:pipelineType:error: required 13.7.8 14.8.9
+MTLBinaryArchiveSPI recompilablePipelineCount required 13.7.8 14.8.9
+MTLBinaryArchiveSPI recompileToArchive:error: required 14.8.9
 MTLIndirectRenderCommandSPI drawMeshArguments required 13.7.8
 MTLIndirectRenderCommandSPI getMeshBufferAtIndex: required 13.7.8
 MTLIndirectRenderCommandSPI getObjectBufferAtIndex: required 13.7.8
