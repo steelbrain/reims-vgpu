@@ -308,9 +308,11 @@ pub struct VideoPlane<'a, P: Platform> {
     /// surface's view of its pages, or its block of the region (a copy block); `None` for a device
     /// cache, and for a buffer over memory of another kind.
     pub pages: Option<PlanePages>,
-    /// The identity of the device cache the buffer is, where `cached`, which lives as long as the
-    /// cache: what a device of the host's video makes of the cache's memory (an import of an
-    /// exportable cache's) is kept by it and let go of once it ends.
+    /// The identity of the device cache the buffer is, where `cached` and the cache's memory was
+    /// made for the host's video (exportable, or a dma-buf), which lives as long as the cache:
+    /// what a device of the host's video makes of the cache's memory (an import of it) is kept by
+    /// it and let go of once it ends. `None` for a cache made as any other buffer, which no
+    /// device of the host's video reaches in place.
     pub cache: Option<MemoryIdentity>,
 }
 

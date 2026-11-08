@@ -41,6 +41,10 @@ pub const UNSHARED_QUEUE: &str = "newCommandQueue (unshared)";
 /// under: no selector of Metal's names it.
 pub const PADDING_UNOBSERVED_BUFFER: &str = "newBufferWithLength:options: (padding unobserved)";
 
+/// The name the fake logs and scripts [`GpuDevice::new_dma_buf_buffer_of_length_padding_unobserved`]
+/// under: no selector of Metal's names it.
+pub const DMA_BUF_BUFFER: &str = "newBufferWithLength:options: (dma-buf, padding unobserved)";
+
 /// A device's model: its capabilities.
 #[derive(Debug)]
 pub struct DeviceModel {
@@ -189,6 +193,29 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         self.make(
             Policy::On(on),
             PADDING_UNOBSERVED_BUFFER,
+            vec![
+                Arg::U64(length),
+                Arg::U64(options),
+                Arg::U64(aligned_byte.unwrap_or(0)),
+            ],
+            |w| new_buffer(w, length, options, Backing::Fresh, None),
+        )
+    }
+
+    /// Logged and scripted under [`DMA_BUF_BUFFER`], as no selector of Metal's names it, with the
+    /// aligned byte after the length and options (0 for none); its buffer is
+    /// `newBufferWithLength:options:`'s, which exports nothing.
+    #[cfg(unix)]
+    fn new_dma_buf_buffer_of_length_padding_unobserved(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: Option<u64>,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
+        self.make(
+            Policy::On(on),
+            DMA_BUF_BUFFER,
             vec![
                 Arg::U64(length),
                 Arg::U64(options),

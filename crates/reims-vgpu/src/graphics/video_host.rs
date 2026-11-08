@@ -154,7 +154,8 @@ pub(crate) struct OutputPlane<P: Platform> {
     /// The memory the buffer lies in, as a device reaches it in place ([`VideoPlane::pages`]);
     /// `None` in a device cache, and in memory of another kind.
     pub(crate) pages: Option<PlanePages>,
-    /// The identity of the device cache the buffer is, where `cached` ([`VideoPlane::cache`]).
+    /// The identity of the device cache the buffer is, where `cached` and the cache's memory was
+    /// made for the host's video ([`VideoPlane::cache`]).
     pub(crate) cache: Option<MemoryIdentity>,
 }
 

@@ -519,7 +519,8 @@ impl<P: Platform> CacheTargets<P> {
     }
 
     /// What gives a decode of `codec` into `output` its picture's target: `None` where the
-    /// output's planes do not both lie in one device cache. Each reason a picture's target is not
+    /// output's planes do not both lie in one device cache made for the host's video
+    /// ([`OutputPlane::cache`]). Each reason a picture's target is not
     /// given then is logged once a session, in `said`.
     fn target_for(
         self: &Arc<Self>,

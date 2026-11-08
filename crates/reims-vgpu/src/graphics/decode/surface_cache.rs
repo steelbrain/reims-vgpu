@@ -292,9 +292,11 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// until it lands: a download or a release that copies nothing waits for it, as for an
     /// early copy, and so does a use that writes the cache, on the GPU.
     out: Option<OutCopy>,
-    /// The cache's life, as the host's video keeps what it makes of the cache's memory (an
-    /// import of an exportable cache's, [`SurfaceCaches::identity`]): it ends as the cache goes.
-    life: MemoryLife,
+    /// The cache's life, where its memory was made for the host's video (exportable, or a
+    /// dma-buf: [`SurfaceCaches::new_cache`]), as the host's video keeps what it makes of the
+    /// cache's memory (an import of it, [`SurfaceCaches::identity`]): it ends as the cache goes.
+    /// `None` for any other cache, whose memory no device of the host's video reaches.
+    life: Option<MemoryLife>,
 }
 
 /// A copy of a cache into its pages on the transfer queue ([`SurfaceCaches::write_back`]): the
@@ -1051,7 +1053,7 @@ impl<P: Platform> SurfaceCaches<P> {
             self.released(device, block, 0, None, None, Box::new(|| {}))?;
         }
         let aligned = layout.as_deref().and_then(aligned_byte);
-        let Some(cache) = self.new_cache(device, length, layout.is_some(), aligned)? else {
+        let Some((cache, life)) = self.new_cache(device, length, layout.is_some(), aligned)? else {
             return Ok(false);
         };
         let Some(pages) = pages()? else {
@@ -1084,7 +1086,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 deferred: None,
                 read_back: ReadBack::default(),
                 out: None,
-                life: MemoryLife::new(),
+                life,
             },
         );
         let pages = Pages {
@@ -1260,10 +1262,10 @@ impl<P: Platform> SurfaceCaches<P> {
             None
         };
         let zeroed = match &made {
-            Some(cache) => self.zero(device, cache, length)?,
+            Some((cache, _)) => self.zero(device, cache, length)?,
             None => None,
         };
-        let (Some(cache), Some(filled_at)) = (made, zeroed) else {
+        let (Some((cache, life)), Some(filled_at)) = (made, zeroed) else {
             self.counts.deferred_refused += 1;
             return Ok(false);
         };
@@ -1289,7 +1291,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 deferred: Some(block_size),
                 read_back: ReadBack::default(),
                 out: None,
-                life: MemoryLife::new(),
+                life,
             },
         );
         self.deferred_bytes += length;
@@ -1444,8 +1446,11 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// The identity of the cache of the block at `block`, which lives as long as the cache: the
     /// host's video keeps what it makes of the cache's memory by it ([`SurfaceCache::life`]).
+    /// `None` where the block has no cache, or one whose memory was not made for the host's
+    /// video.
     pub(crate) fn identity(&self, block: u64) -> Option<MemoryIdentity> {
-        self.by_block.get(&block).map(|c| c.life.identity())
+        let life = self.by_block.get(&block)?.life.as_ref()?;
+        Some(life.identity())
     }
 
     /// A new cache's buffer of `length` bytes, Private: exportable where the host's video
@@ -1460,20 +1465,21 @@ impl<P: Platform> SurfaceCaches<P> {
     /// planes lie in it rather than in copies of their own
     /// ([`GpuDevice::new_buffer_of_length_padding_unobserved`]); else as any other buffer. An
     /// exportable cache is made as the platform makes one, its first byte where the platform puts
-    /// it.
+    /// it. With the buffer, the cache's life where its memory was made for the host's video,
+    /// exportable or a dma-buf ([`SurfaceCache::life`]).
     fn new_cache(
         &mut self,
         device: &P::Device,
         length: u64,
         laid_out: bool,
         aligned: Option<u64>,
-    ) -> RaiseResult<Option<P::Buffer>> {
+    ) -> RaiseResult<Option<(P::Buffer, Option<MemoryLife>)>> {
         #[cfg(unix)]
         if self.exportable {
             let made = device.new_exportable_buffer_of_length(ON, length, STORAGE_PRIVATE)?;
             if let Some(cache) = made {
                 self.counts.exportable += 1;
-                return Ok(Some(cache));
+                return Ok(Some((cache, Some(MemoryLife::new()))));
             }
             self.counts.unexportable += 1;
         }
@@ -1490,11 +1496,11 @@ impl<P: Platform> SurfaceCaches<P> {
                 if aligned.is_some() {
                     self.counts.aligned += 1;
                 }
-                return Ok(Some(cache));
+                return Ok(Some((cache, Some(MemoryLife::new()))));
             }
             self.counts.no_dma_buf += 1;
         }
-        match laid_out {
+        let made = match laid_out {
             true => {
                 let made = device.new_buffer_of_length_padding_unobserved(
                     ON,
@@ -1505,10 +1511,11 @@ impl<P: Platform> SurfaceCaches<P> {
                 if aligned.is_some() && made.is_some() {
                     self.counts.aligned += 1;
                 }
-                Ok(made)
+                made
             }
-            false => device.new_buffer_of_length(ON, length, STORAGE_PRIVATE),
-        }
+            false => device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)?,
+        };
+        Ok(made.map(|cache| (cache, None)))
     }
 
     /// Whether the block at `block` has a cache.
@@ -6423,6 +6430,82 @@ mod tests {
             "no layout: as any other buffer"
         );
         assert_eq!(r.dec.caches().counts().aligned, 1);
+    }
+
+    /// Only a cache whose memory was made for the host's video gives the video its identity
+    /// (`VideoPlane::cache`), so that no decode takes for an import a cache the platform made as
+    /// any other buffer: where the host's video decodes into caches, a laid-out cache is made a
+    /// dma-buf and gives it; a deferred block's, whose ask carries no layout, is made as any
+    /// other buffer and gives none, as does a laid-out cache where the video decodes into none
+    #[cfg(unix)]
+    #[test]
+    fn only_a_cache_made_for_the_hosts_video_gives_it_its_identity() {
+        use reims_vgpu_graphics::wire::{
+            RGFX_STATUS_CACHE, RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout,
+        };
+        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
+        use reims_vgpu_vulkan::core::testkit::impls::device::DMA_BUF_BUFFER;
+        // NV12 as CoreVideo lays it in four pages: luma from 0x20, chroma after its rows.
+        let mut layout = RgfxSurfacePagesLayout {
+            plane_count: 2,
+            ..Default::default()
+        };
+        layout.planes[0] = RgfxSurfacePlaneLayout {
+            offset: 0x20,
+            bytes_per_row: 512,
+            row_bytes: 480,
+            rows: 16,
+        };
+        layout.planes[1] = RgfxSurfacePlaneLayout {
+            offset: 0x20 + 16 * 512,
+            bytes_per_row: 512,
+            row_bytes: 480,
+            rows: 8,
+        };
+        // Whether a laid-out cache was made a dma-buf, and whether it gives its identity.
+        let laid_out = |dma_buf: bool| {
+            let mut r = rig(16);
+            let page = r.page;
+            r.dec.set_unified_memory(true);
+            if dma_buf {
+                r.dec.set_dma_buf_caches();
+            }
+            let world = Arc::clone(r.p.world());
+            world.answer_surface_pages(PagesInPlace::No("off the device's alignment".into()));
+            let mark = r.p.call_log().mark();
+            assert_eq!(
+                r.pages_asking(BLOCK, &[(1, 4)], 4 * page, Some(layout)),
+                RGFX_STATUS_CACHE
+            );
+            assert_eq!(
+                r.pages_cached(BLOCK, &[(1, 4)], 4 * page, true),
+                RGFX_STATUS_OK
+            );
+            let made = r.p.call_log().sels_since(mark).contains(&DMA_BUF_BUFFER);
+            assert_eq!(r.dec.caches().len(), 1);
+            (made, r.dec.caches().identity(BLOCK).is_some())
+        };
+        assert_eq!(laid_out(true), (true, true), "a dma-buf cache: given");
+        assert_eq!(
+            laid_out(false),
+            (false, false),
+            "a cache as any other: none"
+        );
+
+        let mut r = deferring(8);
+        let page = r.page;
+        r.dec.set_dma_buf_caches();
+        let mark = r.p.call_log().mark();
+        assert_eq!(defer(&mut r, BLOCK, 2 * page), RGFX_STATUS_OK);
+        assert!(
+            !r.p.call_log().sels_since(mark).contains(&DMA_BUF_BUFFER),
+            "no layout: no dma-buf"
+        );
+        assert_eq!(r.dec.caches().counts().deferred, 1);
+        assert!(
+            r.dec.caches().identity(BLOCK).is_none(),
+            "a deferred cache: none"
+        );
     }
 
     /// A cache made for a block the device answered a cache with its surface's layout copies
