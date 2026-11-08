@@ -1473,8 +1473,7 @@ struct Reach {
     /// The buffers made resident with write usage, likewise.
     used_buffers: Vec<Bound>,
     /// Whether the pass's visibility result buffer lies over read-only memory the runtime imports
-    /// through a writable twin of its pages (a surface's, or a range core maps read-only): a mode
-    /// other than `Disabled` dies, as
+    /// through a writable twin of its pages (a surface's): a mode other than `Disabled` dies, as
     /// the pass writes a result at its offset, a draw after it or not
     /// ([`crate::gpu::writes::kept_write`]). One over read-only memory the runtime copies keeps
     /// nothing: the result is dropped, as Metal drops it.
@@ -5481,22 +5480,22 @@ pub(crate) mod tests {
 
     /// A draw of `read_only_beside_nested_vertex` and `read_only_beside_nested_fragment`
     /// ([`crate::gpu::writes::tests::PROBE`]), whose argument buffers' type the runtime refuses
-    /// the reflection of, through a buffer core makes over pages mapped read-only bound at both
-    /// functions' buffer slot 1, which they declare `const` and cannot store through, draws,
-    /// indexed: the
-    /// vertex function writes its words of slot 2 and the fragment function red. Bound at the
-    /// vertex function's slot 2 too, a `device` pointer, the draw dies where it is encoded: on
-    /// Linux the runtime imports a writable twin of the pages, which the write would reach
-    /// ([`crate::gpu::writes::kept_write`]). The pages stay zeros
+    /// the reflection of, through a buffer on a surface whose GPU writes never reach its memory
+    /// bound at both functions' buffer slot 1, which they declare `const` and cannot store
+    /// through, draws, indexed: the vertex function writes its words of slot 2 and the fragment
+    /// function red. Bound at the vertex function's slot 2 too, a `device` pointer, the draw dies
+    /// where it is encoded: on Linux the runtime imports a writable twin of the surface's
+    /// read-only alias, which the write would reach ([`crate::gpu::writes::kept_write`]). The
+    /// guest's page stays zeros
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_draw_through_read_only_pages_at_slots_it_cannot_write_draws_on_linux() {
+    fn a_draw_through_a_read_only_surface_at_slots_it_cannot_write_draws_on_linux() {
         use reims_vgpu_core::platform::os::vm::HostVm as _;
         use reims_vgpu_core::platform::resource::Library as _;
         use reims_vgpu_core::platform::values::RenderPipelineDesc;
 
         use crate::gpu::resource::VulkanRenderPipeline;
-        use crate::gpu::resource::tests::over_read_only_pages;
+        use crate::gpu::resource::tests::on_read_only_surface;
         use crate::os::{OsVm, PAGE};
 
         /// The state, `nested` at both functions' slot 0, `read_only` at their slot 1 and
@@ -5548,7 +5547,7 @@ pub(crate) mod tests {
             })
             .unwrap()
             .unwrap();
-        let (read_only, pages) = over_read_only_pages(1);
+        let (read_only, pages) = on_read_only_surface();
         let nested = buffer::<VulkanPlatform>(&d, 16, 0, &[0; 16]);
         let written = buffer::<VulkanPlatform>(&d, 16, 0, &[0; 16]);
         let indices = buffer::<VulkanPlatform>(&d, 8, 0, &[0, 0, 1, 0, 2, 0, 0, 0]);

@@ -199,11 +199,6 @@ impl ImportView {
         false
     }
 
-    /// Whether the import is a writable twin of read-only pages: never on macOS.
-    pub(crate) fn twinned(&self) -> bool {
-        false
-    }
-
     /// Whether the runtime is told the import's pages are writable: never on macOS, where it
     /// asks the kernel nothing of them either way.
     pub(crate) fn vouched(&self) -> bool {

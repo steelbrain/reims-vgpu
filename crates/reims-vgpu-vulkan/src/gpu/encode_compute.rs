@@ -588,21 +588,22 @@ mod tests {
         run(&cb, &e, encode);
     }
 
-    /// A dispatch through a buffer core makes over pages mapped read-only runs where its kernel
-    /// reads the buffer, at a `const` pointer, and dies where it is encoded where the kernel may
-    /// write it, by its slot writes, or the buffer is made resident for writing: on Linux the
-    /// runtime imports a writable twin of the pages, which the write would reach, where Metal's
-    /// GPU drops it ([`crate::gpu::writes::kept_write`]). The pages stay zeros
+    /// A dispatch through a buffer on a surface whose GPU writes never reach its memory runs
+    /// where its kernel reads the buffer, at a `const` pointer, and dies where it is encoded where
+    /// the kernel may write it, by its slot writes, or the buffer is made resident for writing: on
+    /// Linux the runtime imports a writable twin of the surface's read-only alias, which the write
+    /// would reach, where Metal's GPU drops it ([`crate::gpu::writes::kept_write`]). The guest's
+    /// page stays zeros
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_dispatch_through_read_only_pages_dies_on_linux() {
+    fn a_dispatch_through_a_read_only_surface_dies_on_linux() {
         use reims_vgpu_core::platform::os::vm::HostVm as _;
 
-        use crate::gpu::resource::tests::over_read_only_pages;
+        use crate::gpu::resource::tests::on_read_only_surface;
         use crate::os::{OsVm, PAGE};
 
         let add = pipeline(ADD, "add_one");
-        let (ro, pages) = over_read_only_pages(1);
+        let (ro, pages) = on_read_only_surface();
         let out = shared(16);
         let four = || ComputeCmd::DispatchThreads {
             threads_per_grid: MtlSize::new(4, 1, 1),

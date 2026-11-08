@@ -2410,11 +2410,12 @@ pub(crate) mod tests {
     use crate::platform::tests::platform;
 
     /// A no-copy buffer core makes over `pages` pages of zeros mapped read-only
-    /// (`newBufferWithBytesNoCopy`), which the runtime imports through a writable twin of them on
-    /// Linux ([`crate::gpu::backing::ImportSite::twins`]), and the pages' first byte, which the
-    /// caller frees once the buffer is gone.
+    /// (`newBufferWithBytesNoCopy`), which the runtime makes over a copy of them whose GPU writes
+    /// it drops on Linux (announcing `copied-host-pages`, which dies in strict mode, so it is made
+    /// under the default), and the pages' first byte, which the caller frees once the buffer is
+    /// gone.
     #[cfg(target_os = "linux")]
-    pub(crate) fn over_read_only_pages(pages: u64) -> (VulkanBuffer, HostPtr) {
+    fn over_read_only_pages(pages: u64) -> (VulkanBuffer, HostPtr) {
         use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
 
         use crate::os::{OsVm, PAGE};
@@ -2427,11 +2428,52 @@ pub(crate) mod tests {
         );
         // SAFETY: the pages outlive the buffer, which the caller drops before freeing them.
         let bytes = unsafe { HostRange::new(at, pages * PAGE) };
-        let b = dev()
-            .new_buffer_over_host_memory(OnFault::Return, bytes, 0, None)
-            .unwrap()
-            .expect("a buffer over read-only pages, as Metal makes");
+        let b = crate::answer::relaxed(|| {
+            dev().new_buffer_over_host_memory(OnFault::Return, bytes, 0, None)
+        })
+        .unwrap()
+        .expect("a buffer over read-only pages, as Metal makes");
         (b, at)
+    }
+
+    /// A buffer made on a surface whose GPU writes never reach its memory
+    /// (`kIOSurfaceClientDirection` 2) over a page of zeros of the guest's, which the runtime
+    /// imports through a writable twin of the surface's read-only alias on Linux
+    /// ([`crate::gpu::backing::ImportSite::twins`]), and the page's first byte, which the caller
+    /// frees once the buffer is gone.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn on_read_only_surface() -> (VulkanBuffer, HostPtr) {
+        use reims_vgpu_core::host::PhysicalMemoryRange;
+        use reims_vgpu_core::num::ToU64 as _;
+        use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
+
+        use crate::os::{OsSurfaces, PAGE, READ_ONLY_DIRECTION};
+
+        let guest = crate::os::allocate_aliasable(PAGE).unwrap();
+        let spec = SurfaceSpec {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            alloc_size: PAGE,
+            width: 16,
+            height: 16,
+            bytes_per_element: 4,
+            bytes_per_row: 64,
+            element_width: 1,
+            element_height: 1,
+            client_direction: Some(READ_ONLY_DIRECTION),
+            client_address_ranges: Some(vec![PhysicalMemoryRange {
+                physical_address: guest.addr().to_u64(),
+                physical_length: PAGE,
+            }]),
+            ..SurfaceSpec::default()
+        };
+        let surface = OsSurfaces::new().create(&spec).unwrap();
+        assert!(crate::os::gpu_read_only(&surface));
+        let b = dev()
+            .new_buffer_on_surface(Some(&surface))
+            .unwrap()
+            .expect("a buffer on the surface, as Metal makes");
+        assert!(crate::gpu::writes::buffer_kept(&b));
+        (b, guest)
     }
 
     /// `MTLResourceOptions` bit 24, which core sets on a read-only detached buffer or heap.
@@ -2489,13 +2531,13 @@ pub(crate) mod tests {
     }
 
     /// A no-copy buffer core makes over pages mapped read-only, made where Metal makes it,
-    /// answers its own address as its contents, and a GPU fill into it dies where it is encoded:
-    /// on Linux the runtime imports a writable twin of the pages, which the fill would reach,
-    /// where Metal drops the write (`os/linux/import.rs`, [`crate::gpu::writes::kept_write`]).
-    /// The rest of the command buffer runs, and the pages stay zeros
+    /// answers its own address as its contents and takes a GPU fill into it, the command buffer
+    /// completing with no error, and the pages stay zeros: on Linux the runtime makes it over a
+    /// copy of the pages whose GPU writes it drops, as Metal drops a fill (`os/linux/import.rs`,
+    /// `crate::gpu::writes`'s docs), so nothing of it is kept ([`crate::gpu::writes::Kept`])
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_fill_into_read_only_pages_dies_on_linux() {
+    fn a_fill_into_read_only_pages_is_dropped_on_linux() {
         use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
         use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
         use reims_vgpu_core::platform::os::vm::HostVm as _;
@@ -2505,8 +2547,8 @@ pub(crate) mod tests {
         use crate::os::{OsVm, PAGE};
 
         let (b, pages) = over_read_only_pages(2);
-        assert_eq!(b.contents(), pages, "its own address, not the twin's");
-        assert!(b.backing.twinned_now());
+        assert_eq!(b.contents(), pages, "its own address");
+        assert!(b.backing.read_only_now() && !crate::gpu::writes::buffer_kept(&b));
         let q = dev().new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
@@ -2515,11 +2557,7 @@ pub(crate) mod tests {
             range: NsRange::new(0x10, 0x20),
             value: 0xa5,
         };
-        let site = catch_death(|| e.encode(OnFault::Die, fill)).unwrap_err();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, "fillBuffer:range:value:")
-        );
+        e.encode(OnFault::Die, fill).unwrap();
         e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
@@ -2552,7 +2590,7 @@ pub(crate) mod tests {
         let (b, pages) = read_only_buffer(1);
         assert_eq!(b.contents(), pages);
         assert_eq!(b.backing.read_only_now(), crate::os::COPIES_READ_ONLY);
-        assert!(!b.backing.twinned_now() && !crate::gpu::writes::buffer_kept(&b));
+        assert!(!crate::gpu::writes::buffer_kept(&b));
         let d = dev();
         let source = d
             .new_buffer_of_length(OnFault::Die, 0x40, 0)

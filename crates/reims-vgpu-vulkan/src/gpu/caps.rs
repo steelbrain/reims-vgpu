@@ -146,16 +146,16 @@
 //! the runtime announces a typed kind for it, which then places it by its reach: none at the
 //! pinned runtime, which announces the layouts of a texture placed in a heap over no address
 //! ranges, whose bytes core copies to and from the guest's pages, that are not Metal's there
-//! (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`, relayed). On Linux, read-only
-//! memory core gives the runtime (a range core maps read-only, as the EFI framebuffer; a surface
-//! the GPU only reads) the runtime imports through a writable twin of its pages, as Linux
-//! drivers pin imported pages for writing: the GPU reads what Metal's reads, and its writes would
-//! reach the pages, where Metal drops them. Every command that may write through an object over
-//! such an import dies where it is encoded (`crate::gpu::writes::kept_write`; `resource`'s
-//! `a_fill_into_read_only_pages_dies_on_linux`), but a function's write through an address it
-//! loads into one not made resident for writing, which names nothing. The guest's read-only
-//! objects (a read-only replace, a heap or no-copy buffer made with bit 24) the runtime makes
-//! over a copy whose GPU writes it drops, announced (`copied-host-pages`), and what Metal answers
+//! (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`, relayed). On Linux, a surface
+//! the GPU only reads the runtime imports through a writable twin of its pages, as Linux drivers
+//! pin imported pages for writing: the GPU reads what Metal's reads, and its writes would reach
+//! the pages, where Metal drops them. Every command that may write through an object over such an
+//! import dies where it is encoded (`crate::gpu::writes::kept_write`; `encode_compute`'s
+//! `a_dispatch_through_a_read_only_surface_dies_on_linux`), but a function's write through an
+//! address it loads into one not made resident for writing, which names nothing. Other read-only
+//! memory (the guest's read-only objects, a read-only replace or a heap or no-copy buffer made
+//! with bit 24, and a no-copy buffer or heap over pages mapped read-only) the runtime makes over
+//! a copy whose GPU writes it drops, announced (`copied-host-pages`), and what Metal answers
 //! otherwise there is `crate::gpu::writes`'s.
 
 use std::sync::Arc;

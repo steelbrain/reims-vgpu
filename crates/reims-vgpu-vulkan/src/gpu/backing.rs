@@ -34,15 +34,11 @@
 //!   wrote, and a later command buffer the guest's bytes, as under a read-only replace on Metal
 //!   (blit fills, measured on both platforms by `tests/detach_backing.rs`; kernel stores are
 //!   dropped alike on Metal). On Linux the runtime makes the object over a copy of such an
-//!   alias's pages, or of a no-copy object's pages made with bit 24 or, but for a buffer core
-//!   makes over bytes, mapped read-only, whose GPU writes it drops, as the views' gate refuses
-//!   read-only pages (`crate::os::import_view`): a shader's, a blit's into a buffer and a
-//!   visibility result's are sent, and dropped as Metal's are, while a pass's store into the
-//!   object's memory and a write of a texture over it are answered where they are encoded
-//!   ([`Backing::read_only_now`], `crate::gpu::writes`). A buffer core makes over bytes it maps
-//!   read-only is imported through a writable twin of them instead, as a surface's read-only
-//!   alias is, whose writes die where they are encoded ([`Backing::twinned_now`],
-//!   [`ImportSite::twins`]).
+//!   alias's pages, or of a no-copy object's pages made with bit 24 or mapped read-only, whose
+//!   GPU writes it drops, as the views' gate refuses read-only pages (`crate::os::import_view`):
+//!   a shader's, a blit's into a buffer and a visibility result's are sent, and dropped as
+//!   Metal's are, while a pass's store into the object's memory and a write of a texture over it
+//!   are answered where they are encoded ([`Backing::read_only_now`], `crate::gpu::writes`).
 //! - **Detach** marks the object detached; its `contents` and its GPU address stay, as Metal's do
 //!   (measured: `contents` stays the alias of the last replace, still over its pages). A
 //!   submission of a command buffer that uses it fails while it is detached, as do those of
@@ -241,11 +237,6 @@ pub struct Backing {
     /// no-copy buffer or heap was made over, mapped read-only or made with bit 24; counted while it
     /// holds ([`crate::gpu::writes::set_kept`]).
     kept: AtomicBool,
-    /// Whether, of that, the runtime imports the memory through a writable twin of its pages,
-    /// whose GPU writes reach them ([`Backing::twinned_now`]): a buffer core made over bytes it
-    /// maps read-only, without bit 24 ([`ImportSite::twins`]); else it copies them, dropping the
-    /// GPU's writes.
-    twinned: AtomicBool,
     /// The guest's pages the object's memory is over, and whether a detach left it in no memory
     /// since its last replace, which work encoded reads without the object
     /// ([`crate::gpu::writes::Kept`]).
@@ -488,7 +479,6 @@ impl Backing {
             id: Some(id),
             alias: Mutex::new(Aliased::default()),
             kept: AtomicBool::new(false),
-            twinned: AtomicBool::new(false),
             pages: Arc::default(),
         }
     }
@@ -504,7 +494,6 @@ impl Backing {
             id: None,
             alias: Mutex::new(Aliased::default()),
             kept: AtomicBool::new(false),
-            twinned: AtomicBool::new(false),
             pages: Arc::default(),
         }
     }
@@ -590,7 +579,6 @@ impl Backing {
     pub(crate) fn made_over(&self, ranges: &[ResourceAddressRange], alias: Option<Arc<Alias>>) {
         let kept = crate::os::COPIES_READ_ONLY && alias.is_some() && self.read_only;
         self.alias.lock().last = alias;
-        self.twinned.store(false, Ordering::Release);
         crate::gpu::writes::set_kept(&self.kept, kept);
         self.pages.set(pages(ranges));
     }
@@ -602,47 +590,26 @@ impl Backing {
 
     /// The object, a no-copy buffer or heap, was made over memory of the caller's that is
     /// read-only where `read_only` (mapped so, [`crate::os::ImportView::read_only`], or made with
-    /// bit 24), and that the runtime imports through a writable twin of its pages where `twinned`
-    /// ([`crate::os::ImportView::twinned`], a buffer core makes over bytes without bit 24): its
-    /// memory is read-only then, and where it was made with bit 24
-    /// ([`Backing::read_only_now`]), twinned where both say so ([`Backing::twinned_now`]).
-    pub(crate) fn imported(&self, read_only: bool, twinned: bool) {
+    /// bit 24): its memory is read-only then, and where it was made with bit 24
+    /// ([`Backing::read_only_now`]).
+    pub(crate) fn imported(&self, read_only: bool) {
         let kept = crate::os::COPIES_READ_ONLY && (read_only || self.read_only);
-        let twinned = kept && twinned && !self.read_only;
-        self.twinned.store(twinned, Ordering::Release);
         crate::gpu::writes::set_kept(&self.kept, kept);
     }
 
     /// Whether the memory the object lies in now is read-only where the runtime does not import
-    /// read-only memory as it is mapped (on Linux, [`crate::os::COPIES_READ_ONLY`]): it imports
-    /// it through a writable twin ([`Backing::twinned_now`]), or makes the object over a copy of
-    /// it, dropping the GPU's writes, where Metal's GPU keeps them from the memory itself and
-    /// faults a pass that stores into it; not while it is detached, in no memory.
+    /// read-only memory as it is mapped (on Linux, [`crate::os::COPIES_READ_ONLY`]): it makes the
+    /// object over a copy of it, dropping the GPU's writes, where Metal's GPU keeps them from the
+    /// memory itself and faults a pass that stores into it; not while it is detached, in no
+    /// memory.
     pub(crate) fn read_only_now(&self) -> bool {
         self.kept.load(Ordering::Acquire) && !self.pages.zeroed()
-    }
-
-    /// Whether, of [`Backing::read_only_now`], the runtime imports the memory through a writable
-    /// twin of its pages, whose GPU writes reach them, where Metal drops them: every write
-    /// through the object dies where it is encoded (`crate::gpu::writes::kept_write`).
-    pub(crate) fn twinned_now(&self) -> bool {
-        self.twinned.load(Ordering::Acquire) && self.read_only_now()
     }
 
     /// [`Backing::read_only_now`], asked again as work that may write through a texture over the
     /// object is encoded ([`crate::gpu::writes::Kept`]).
     pub(crate) fn kept(&self) -> crate::gpu::writes::Kept {
         match self.read_only_now() {
-            true => crate::gpu::writes::Kept::Until(Arc::clone(&self.pages)),
-            false => crate::gpu::writes::Kept::No,
-        }
-    }
-
-    /// [`Backing::twinned_now`], asked again as work that may write through the object, a
-    /// buffer, is encoded ([`crate::gpu::writes::Kept`]): a buffer over read-only memory the
-    /// runtime copies keeps nothing, as its GPU writes are dropped, as Metal's are.
-    pub(crate) fn twin_kept(&self) -> crate::gpu::writes::Kept {
-        match self.twinned_now() {
             true => crate::gpu::writes::Kept::Until(Arc::clone(&self.pages)),
             false => crate::gpu::writes::Kept::No,
         }
@@ -703,7 +670,6 @@ impl Backing {
         let own = {
             let mut aliased = self.alias.lock();
             let kept = crate::os::COPIES_READ_ONLY && (read_only || self.read_only);
-            self.twinned.store(false, Ordering::Release);
             crate::gpu::writes::set_kept(&self.kept, kept);
             aliased.last = Some(alias);
             self.pages.set(pages(ranges));
@@ -1259,7 +1225,7 @@ impl Drop for Alias {
 /// Where host memory was handed to the runtime, as the trace names it ([`ImportTrace`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ImportSite {
-    /// A no-copy buffer over host memory core gives (`newBufferWithBytesNoCopy`: guest pages).
+    /// A no-copy buffer over host memory core gives (`newBufferWithBytesNoCopy`).
     NoCopyBytes,
     /// A no-copy buffer a descriptor names (a detached buffer).
     NoCopyDescriptor,
@@ -1276,26 +1242,17 @@ pub(crate) enum ImportSite {
 impl ImportSite {
     /// Whether read-only memory handed to the runtime here is imported through a writable twin
     /// of its pages where the runtime cannot import them as mapped ([`crate::os::import_view`]),
-    /// in place, its writes dying where they are encoded (`crate::gpu::writes::kept_write`):
-    /// - a buffer over a surface's alias, whose buffers then lie in one import of its pages, so a
-    ///   writer's GPU writes through another import reach its readers' reads, which a copy made
-    ///   at each commit would miss while that writer runs;
-    /// - a buffer core makes over bytes it maps read-only (`newBufferWithBytesNoCopy`), which
-    ///   only core's own work reaches and none of it writes through the GPU, so no death comes,
-    ///   where a copy costs every commit and completion a compare of all its bytes. Measured on
-    ///   the Radeon 780M (RADV), macOS 26.7.2 on apple-gfx at 1920 × 1080, 2026-11-07: 37 to 44
-    ///   such buffers of 29.5 MiB a boot, every read-only import of the six boots that named the
-    ///   site, three of them of 0x7e9000 bytes; copied rather than twinned, a Finder window's
-    ///   two drags drew 1.1 and 1.7 per cent fewer frames (27.35 and 35.7 frames a second over
-    ///   six boots, against 27.65 and 36.35 over four), QEMU took about 25 points of a core
-    ///   more, and Safari's scroll up a long page drew about 8 per cent fewer (four boots
-    ///   against two).
+    /// in place, its writes dying where they are encoded (`crate::gpu::writes::kept_write`): a
+    /// buffer over a surface's alias, whose buffers then lie in one import of its pages, so a
+    /// writer's GPU writes through another import reach its readers' reads, which a copy made at
+    /// each commit would miss while that writer runs.
     ///
     /// Elsewhere the runtime copies such memory, dropping the GPU's writes, as Metal drops them:
     /// the guest's read-only objects (a replace `readOnly:YES`, a heap over address ranges or a
-    /// no-copy buffer or heap made with bit 24).
+    /// no-copy buffer or heap made with bit 24), and a no-copy buffer or heap over pages mapped
+    /// read-only.
     pub(crate) fn twins(self) -> bool {
-        matches!(self, Self::Surface | Self::NoCopyBytes)
+        matches!(self, Self::Surface)
     }
 
     /// The site's number in the trace.

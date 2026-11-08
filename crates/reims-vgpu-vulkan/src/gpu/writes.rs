@@ -12,12 +12,11 @@
 //!
 //! Read-only memory ([`Memory::kept`]) is of two kinds on Linux, by what the runtime is given for
 //! it (`crate::gpu::backing::ImportSite::twins`):
-//! - **A surface's read-only alias, and a range core maps read-only and makes a buffer over**
-//!   ([`Kept::Always`], [`crate::os::TWINS_READ_ONLY`]; [`Kept::Until`] of a twinned buffer,
-//!   [`crate::gpu::backing::Backing::twinned_now`]), which the runtime imports through a writable
-//!   twin of its pages, in place, so a write through an object over it would reach those pages,
-//!   where Metal's GPU drops it or faults: the command that may make it dies where it is encoded,
-//!   at every extent ([`kept_write`]): a blit into such an object; a dispatch or a draw through one
+//! - **A surface's read-only alias** ([`Kept::Always`], [`crate::os::TWINS_READ_ONLY`]), which
+//!   the runtime imports through a writable twin of its pages, in place, so a write through an
+//!   object over it would reach those pages, where Metal's GPU drops it or faults: the command
+//!   that may make it dies where it is encoded, at every extent ([`kept_write`]): a blit into
+//!   such an object; a dispatch or a draw through one
 //!   bound at a slot its function may store through, by its slot writes (every slot they leave
 //!   undetermined), or made resident with write usage; and a pass whose attachment lies in one,
 //!   whatever its actions, or that resolves into one or keeps its visibility results in one
@@ -28,12 +27,9 @@
 //!   unmeasured for, which refuses the whole state's reflection, leaves every other slot answered.
 //!   A function's write through an address it loads (an argument buffer's, a pointer's) into such
 //!   an object not made resident for writing names nothing and is not seen: it reaches the pages.
-//!   Core's own work, the one writer of its ranges, never writes them through the GPU, so no death
-//!   comes there, and a copy would cost every commit and completion a compare of all their bytes
-//!   (measured in `ImportSite::twins`'s docs).
 //! - **The guest's read-only objects** (a read-only replace, a heap made with `MTLResourceOptions`
-//!   bit 24 over address ranges, a no-copy buffer or heap made with it or a descriptor's over pages
-//!   mapped read-only; [`Kept::Until`]; [`crate::os::COPIES_READ_ONLY`]), which the runtime makes
+//!   bit 24 over address ranges, a no-copy buffer or heap made with it or over pages mapped
+//!   read-only; [`Kept::Until`]; [`crate::os::COPIES_READ_ONLY`]), which the runtime makes
 //!   over a copy of the pages whose GPU writes it drops, as Metal's GPU drops them: a write through
 //!   a buffer over it is sent (a shader's store through a slot or a loaded address, a blit's fill
 //!   or copy into the buffer, a pass's visibility results), and so is a pass whose attachment lies
@@ -105,11 +101,9 @@ pub enum Kept {
     /// writable twin of its pages, so the GPU's writes through the object reach them
     /// ([`surface_kept`]).
     Always,
-    /// Until a detach leaves the buffer or heap in no memory: read-only memory the runtime
-    /// imports through a writable twin of its pages, a range core maps read-only and makes a
-    /// buffer over ([`crate::gpu::backing::Backing::twinned_now`]), or, for a texture over a
-    /// buffer or heap, makes the buffer or heap over a copy of, dropping the GPU's writes, where
-    /// what Metal does with a texture's writes is unmeasured
+    /// Until a detach leaves the buffer or heap in no memory: for a texture over a buffer or
+    /// heap, read-only memory the runtime makes the buffer or heap over a copy of, dropping the
+    /// GPU's writes, where what Metal does with a texture's writes is unmeasured
     /// ([`crate::gpu::backing::Backing::read_only_now`]); no replace gives it other memory while
     /// work encoded holds it, as the runtime refuses the replace (`crate::gpu::backing`). A
     /// buffer's own memory the runtime copies is never `Until`: the runtime drops its writes, as
@@ -231,7 +225,8 @@ fn surface_kept(surface: &OsSurface) -> bool {
 
 /// Whether the writes through `t` are not answered as Metal's GPU answers them, its memory being
 /// read-only ([`Memory::kept`]), as [`texture_memory`] answers, without the ranges: a surface's
-/// or a buffer's the runtime twins, or a buffer's or heap's the runtime copies.
+/// the runtime twins, `t`'s or that of the buffer `t` lies over, or a buffer's or heap's the
+/// runtime copies.
 pub fn texture_kept(t: &TextureObject) -> bool {
     match (&t.surface, &t.under) {
         (Some(s), _) => surface_kept(s),
@@ -242,8 +237,8 @@ pub fn texture_kept(t: &TextureObject) -> bool {
 }
 
 /// Whether the GPU's writes through `t` reach read-only memory through a writable twin of its
-/// pages: `t` lies on a surface whose memory the runtime twins, or over a buffer whose memory it
-/// twins ([`buffer_kept`]).
+/// pages: `t` lies on a surface whose memory the runtime twins, or over a buffer on one
+/// ([`buffer_kept`]).
 pub fn texture_twinned(t: &TextureObject) -> bool {
     match (&t.surface, &t.under) {
         (Some(s), _) => surface_kept(s),
@@ -253,20 +248,15 @@ pub fn texture_twinned(t: &TextureObject) -> bool {
 }
 
 /// Whether the writes through `b` are not answered as Metal's GPU answers them, its memory being
-/// read-only ([`Memory::kept`]), as [`buffer_memory`] answers, without the ranges: a surface's,
-/// or a range's core made it over, the runtime twins. A buffer over read-only memory the runtime
-/// copies is not: its GPU writes are dropped, as Metal's are.
+/// read-only ([`Memory::kept`]), as [`buffer_memory`] answers, without the ranges: a surface's
+/// the runtime twins. A buffer over read-only memory the runtime copies is not: its GPU writes
+/// are dropped, as Metal's are.
 pub fn buffer_kept(b: &BufferObject) -> bool {
-    match (&b.surface, &b.heap) {
-        (Some(s), _) => surface_kept(s),
-        (None, Some(_)) => false,
-        (None, None) => b.backing.twinned_now(),
-    }
+    b.surface.as_deref().is_some_and(surface_kept)
 }
 
 /// What a texture over `b` keeps of `b`'s memory ([`Memory::kept`]): a surface's twin, or the
-/// read-only memory the runtime imports `b` over a twin of, or makes `b`, or the heap it lies
-/// in, over a copy of.
+/// read-only memory the runtime makes `b`, or the heap it lies in, over a copy of.
 fn under_buffer_kept(b: &BufferObject) -> Kept {
     match (&b.surface, &b.heap) {
         (Some(s), _) => Kept::always(surface_kept(s)),
@@ -276,7 +266,7 @@ fn under_buffer_kept(b: &BufferObject) -> Kept {
 }
 
 /// How many objects [`texture_kept`] and [`buffer_kept`] may answer true through now: buffers
-/// and heaps over read-only memory the runtime twins or copies ([`set_kept`]), and surfaces whose
+/// and heaps over read-only memory the runtime copies ([`set_kept`]), and surfaces whose
 /// GPU writes never reach their memory where the runtime twins read-only memory (`Keeping`, on
 /// Linux). Each is counted before it answers true and uncounted once it no longer can, so none
 /// counted means they answer false for every object.
@@ -289,8 +279,8 @@ pub(crate) fn any_kept() -> bool {
     KEPT_NOW.load(Ordering::SeqCst) != 0
 }
 
-/// Sets `flag`, whether a buffer's or heap's memory is read-only memory the runtime twins or
-/// copies ([`crate::gpu::backing::Backing::read_only_now`]), to `kept`, keeping the count
+/// Sets `flag`, whether a buffer's or heap's memory is read-only memory the runtime copies
+/// ([`crate::gpu::backing::Backing::read_only_now`]), to `kept`, keeping the count
 /// ([`KEPT_NOW`]): counted before it becomes true, and uncounted once it becomes false.
 pub(crate) fn set_kept(flag: &AtomicBool, kept: bool) {
     if kept {
@@ -327,8 +317,8 @@ impl Drop for Keeping {
 
 /// Dies at `sel`, a command that may write `what` an object over read-only memory whose write
 /// this platform does not answer as Metal's GPU does ([`Memory::kept`]): a surface the GPU only
-/// reads, or a range core maps read-only, which the runtime imports through a writable twin of
-/// its pages, where the write would land in those pages, and later reads see it; or, for a
+/// reads, which the runtime imports through a writable twin of its pages, where the write would
+/// land in those pages, and later reads see it; or, for a
 /// texture's write, a resolve into one or a CPU write, read-only guest pages (a read-only replace
 /// or heap, a resource made with `MTLResourceOptions` bit 24) the runtime copies, dropping the
 /// write, where what Metal does is unmeasured. Metal's GPU drops a shader's store, a fill's or
@@ -340,8 +330,8 @@ pub(crate) fn kept_write(sel: &'static str, what: &str) -> ! {
     crate::answer::unrepresentable(
         sel,
         &format!(
-            "{what} read-only memory (a surface the GPU only reads or a guest range, which this \
-             host's runtime imports through a writable twin, so the write would reach it; or, \
+            "{what} read-only memory (a surface the GPU only reads, which this host's runtime \
+             imports through a writable twin, so the write would reach it; or, \
              for a texture, a read-only replace, heap or resource, whose copy drops it), where \
              Metal's GPU drops the write or faults, or what it does is unmeasured, and its CPU's \
              write through the read-only mapping ends the process"
@@ -421,25 +411,23 @@ pub fn buffer_bytes_memory(b: &BufferObject, bytes: Range<u64>) -> Memory {
         };
     }
     // Its writes into read-only memory the runtime copies are dropped, as Metal's GPU drops them:
-    // kept only where it twins them ([`Kept::Until`]).
-    let kept = b.backing.twin_kept();
+    // nothing kept.
     let paged = b.backing.in_pages(&bytes);
     if paged.is_some() || b.backing.kept_contents().is_some() {
-        return Memory::over(paged.unwrap_or_default(), kept);
+        return Memory::over(paged.unwrap_or_default(), Kept::No);
     }
     let contents = plain(|| b.raw.contents()).map(|first| {
         let first = first.as_ptr().addr().to_u64();
         std::iter::once(first.saturating_add(bytes.start)..first.saturating_add(bytes.end))
             .collect()
     });
-    Memory::over(contents.unwrap_or_default(), kept)
+    Memory::over(contents.unwrap_or_default(), Kept::No)
 }
 
-/// [`buffer_bound`] where it may decide what work through `b` asks: `b` lies on a surface, or
-/// over memory the runtime twins ([`buffer_kept`]); elsewhere, where its [`Bound`] holds no
-/// surface, no refused format and nothing kept, which a slot's bind keeps nothing of, the
-/// default one, of no memory, read without asking the runtime, as each draw binds its buffers
-/// anew.
+/// [`buffer_bound`] where it may decide what work through `b` asks: `b` lies on a surface;
+/// elsewhere, where its [`Bound`] holds no surface, no refused format and nothing kept, which a
+/// slot's bind keeps nothing of, the default one, of no memory, read without asking the runtime,
+/// as each draw binds its buffers anew.
 pub fn buffer_bind(b: &BufferObject) -> Bound {
     if buffer_bind_reads(b) {
         buffer_bound(b)
@@ -448,11 +436,11 @@ pub fn buffer_bind(b: &BufferObject) -> Bound {
     }
 }
 
-/// Whether [`buffer_bind`] reads `b`'s [`buffer_bound`]: `b` lies on a surface, or over memory
-/// the runtime twins. Else it answers the default one: a buffer over read-only memory the runtime
-/// copies keeps nothing either, as its GPU writes are dropped, as Metal's are.
+/// Whether [`buffer_bind`] reads `b`'s [`buffer_bound`]: `b` lies on a surface. Else it answers
+/// the default one: a buffer over read-only memory the runtime copies keeps nothing, as its GPU
+/// writes are dropped, as Metal's are.
 pub fn buffer_bind_reads(b: &BufferObject) -> bool {
-    b.surface.is_some() || buffer_kept(b)
+    b.surface.is_some()
 }
 
 /// [`texture_bound`] where it may decide what work through `t` asks, as [`buffer_bind`] reads a
@@ -496,12 +484,12 @@ fn buffer_bytes_bound(b: &BufferObject, bytes: Range<u64>) -> Bound {
             )
         };
     }
-    let kept = b.backing.twin_kept();
+    // Nothing kept, as `buffer_bytes_memory`'s.
     let paged = b.backing.meets_pages(&bytes);
     if paged.is_some() || b.backing.kept_contents().is_some() {
-        return Bound::over(paged.unwrap_or(false), kept);
+        return Bound::over(paged.unwrap_or(false), Kept::No);
     }
-    Bound::over(plain(|| b.raw.contents()).is_some(), kept)
+    Bound::over(plain(|| b.raw.contents()).is_some(), Kept::No)
 }
 
 /// [`heap_bytes_memory`]'s [`Bound`] of `h`'s bytes `bytes`, without collecting their ranges.
@@ -944,20 +932,20 @@ pub(crate) mod tests {
         let count = || KEPT_NOW.load(Ordering::SeqCst);
         assert!(!any_kept());
         let (a, b) = (Backing::fixed(), Backing::fixed());
-        a.imported(false, false);
+        a.imported(false);
         assert_eq!(count(), 0);
-        a.imported(true, false);
-        a.imported(true, false);
+        a.imported(true);
+        a.imported(true);
         assert_eq!(count(), 1);
         assert!(any_kept());
-        b.imported(true, false);
+        b.imported(true);
         assert_eq!(count(), 2);
-        a.imported(false, false);
-        a.imported(false, false);
+        a.imported(false);
+        a.imported(false);
         assert_eq!(count(), 1);
         drop(b);
         assert!(!any_kept());
-        a.imported(true, false);
+        a.imported(true);
         drop(a);
         assert!(!any_kept());
     }

@@ -1,27 +1,25 @@
 //! What the runtime imports for host memory on Linux: the memory itself, and for a surface's
-//! read-only alias, or a range core maps read-only and makes a buffer over, a writable twin of it.
+//! read-only alias, a writable twin of it.
 //!
 //! Linux drivers pin imported pages for writing, so the runtime imports no read-only memory
-//! (typed, `HostMemory`), where Metal reads it: the guest's ranges core maps read-only (the EFI
-//! framebuffer among them), aliases of a read-only replace or heap, and surfaces the GPU only
-//! reads. For aliases of a read-only replace or heap, and a no-copy buffer a descriptor names or a
-//! heap over bytes, over pages mapped read-only, the runtime is given the pages themselves: the
-//! views' gate refuses
-//! them ([`import_gate`]), and the runtime makes the buffer or heap over a copy of them whose GPU
-//! writes it drops, as Metal's GPU drops them (its `copied-host-pages`, a kind of
-//! `crate::answer::DIES`), so the GPU reads what Metal's reads and its writes reach nothing past
-//! the copy ([`ImportView::read_only`]); so does an object made with `MTLResourceOptions` bit 24,
-//! whatever its pages. What Metal answers otherwise than a dropped write there (a pass's store
-//! into such memory, a texture's writes) is `crate::gpu::writes`'s.
+//! (typed, `HostMemory`), where Metal reads it: the guest's ranges core maps read-only, aliases
+//! of a read-only replace or heap, and surfaces the GPU only reads. For aliases of a read-only
+//! replace or heap, and a no-copy buffer or heap over pages mapped read-only, the runtime is
+//! given the pages themselves: the views' gate refuses them ([`import_gate`]), and the runtime
+//! makes the buffer or heap over a copy of them whose GPU writes it drops, as Metal's GPU drops
+//! them (its `copied-host-pages`, a kind of `crate::answer::DIES`), so the GPU reads what Metal's
+//! reads and its writes reach nothing past the copy ([`ImportView::read_only`]); so does an
+//! object made with `MTLResourceOptions` bit 24, whatever its pages. What Metal answers otherwise
+//! than a dropped write there (a pass's store into such memory, a texture's writes) is
+//! `crate::gpu::writes`'s.
 //!
-//! A surface's read-only alias, and a buffer core makes over a range it maps read-only, are given
-//! a **twin** instead (`crate::gpu::backing::ImportSite::twins`): a second view of the same file
-//! pages, read and write, at an address of its own ([`import_view`]), imported in place, so a
-//! surface's buffers lie in one import of the pages, as a writer's GPU writes through another
-//! import reach its readers, where a copy would read them as they were at its commit, and core's
-//! ranges cost no compare of their bytes at each commit. The GPU then reads what Metal's reads,
-//! but its writes reach those pages, where Metal drops them: every command that may write
-//! through an object over such an import dies where it is encoded, naming it
+//! A surface's read-only alias is given a **twin** instead
+//! (`crate::gpu::backing::ImportSite::twins`): a second view of the same file pages, read and
+//! write, at an address of its own ([`import_view`]), imported in place, so a surface's buffers
+//! lie in one import of the pages, as a writer's GPU writes through another import reach its
+//! readers, where a copy would read them as they were at its commit. The GPU then reads what
+//! Metal's reads, but its writes reach those pages, where Metal drops them: every command that
+//! may write through an object over such an import dies where it is encoded, naming it
 //! (`crate::gpu::writes::kept_write`).
 //!
 //! The block of zeros a read-only alias maps past its ranges' pages is a file of zeros all such
@@ -457,6 +455,7 @@ impl ImportView {
 
     /// Whether the import is a writable twin of memory mapped read-only, the guest's pages or
     /// zeros, whose GPU writes reach them where Metal drops them (module docs).
+    #[cfg(test)]
     pub(crate) fn twinned(&self) -> bool {
         self.twin.is_some()
     }
