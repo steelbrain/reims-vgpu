@@ -805,10 +805,14 @@ RGFX_RESOURCE_SPI
 // how Metal refuses what its validation asserts at: the bundle answers nil, logged once for each
 // rule, as it does for the linear form's. A descriptor of more than one level the AMD and the
 // Intel GPU make, level 0 over the buffer's bytes and levels 1 and up in the GPU's own memory
-// (docs/graphics-kext/dgpu-oracle.md, Q11), which the host does not carry: the bundle answers nil,
-// logged once, and sends nothing. So it answers a type other than 2D, which those GPUs make of
-// every type their descriptor validation passes (`oracle_storage DEVICE lintypes tiled:TYPE`, Q11)
-// and whose refusal by the host's platform ends the host's process (resource.rs, new_texture).
+// (docs/graphics-kext/dgpu-oracle.md, Q11), as WindowServer asks under their feature profile (54 x
+// 54 and 64 x 60 BGRA8Unorm of 6 and 7 levels, over a 16384-byte Shared buffer at 256 bytes a
+// row), and so does the device: TEXTURE_FROM_BUFFER carries the levels, and the host's platform
+// makes them by its tiled form, level 0 kept in step with the buffer's bytes and levels 1 and up
+// its own (logged once a process, with the levels). A type other than 2D the bundle answers nil,
+// logged once, and sends nothing, which those GPUs make of every type their descriptor validation
+// passes (`oracle_storage DEVICE lintypes tiled:TYPE`, Q11) and whose refusal by the host's
+// platform ends the host's process (resource.rs, new_texture).
 - (id<MTLTexture>)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
                                          offset:(NSUInteger)offset
                                     bytesPerRow:(NSUInteger)bytesPerRow
@@ -833,16 +837,6 @@ RGFX_RESOURCE_SPI
 			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of storage %lu, not Shared, which "
 			      @"Metal's validation asserts at: answered nil",
 			      (unsigned long long)[self rgfxObjId], (unsigned long)[self storageMode]);
-		}
-		return nil;
-	}
-	if (descriptor.mipmapLevelCount > 1) {
-		static std::atomic<bool> logged{false};
-		if (!logged.exchange(true)) {
-			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of %lu mipmap levels, whose levels "
-			      @"1 and up the host does not carry: answered nil",
-			      (unsigned long long)[self rgfxObjId],
-			      (unsigned long)descriptor.mipmapLevelCount);
 		}
 		return nil;
 	}
@@ -879,12 +873,25 @@ RGFX_RESOURCE_SPI
 	// tiled form takes those its public form refuses (`oracle_storage AMD linalign`).
 	MTLTextureDescriptor *shared = [descriptor copy];
 	shared.storageMode = [self storageMode];
-	return [RgfxTexture textureWithDescriptor:shared
-	                                   buffer:self
-	                                   offset:offset
-	                              bytesPerRow:bytesPerRow
-	                                   device:self.device
-	                               serializer:[self serializer]];
+	RgfxTexture *texture = [RgfxTexture textureWithDescriptor:shared
+	                                                   buffer:self
+	                                                   offset:offset
+	                                              bytesPerRow:bytesPerRow
+	                                                   device:self.device
+	                                               serializer:[self serializer]];
+	if (descriptor.mipmapLevelCount > 1) {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			NSLog(@"RGFX: a tiled texture over buffer 0x%llx of %lu mipmap levels (%lu x %lu, "
+			      @"format %lu, offset %lu, %lu bytes a row): %@ (logged once a process)",
+			      (unsigned long long)[self rgfxObjId],
+			      (unsigned long)descriptor.mipmapLevelCount, (unsigned long)descriptor.width,
+			      (unsigned long)descriptor.height, (unsigned long)descriptor.pixelFormat,
+			      (unsigned long)offset, (unsigned long)bytesPerRow,
+			      texture != nil ? @"made" : @"answered nil");
+		}
+	}
+	return texture;
 }
 
 // A texture over the buffer's bytes as Metal's linear form makes one, which the host's platform

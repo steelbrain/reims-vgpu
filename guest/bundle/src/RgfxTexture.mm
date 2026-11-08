@@ -2034,14 +2034,15 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	};
 	uint8_t *caller = static_cast<uint8_t *>(bytes);
 
-	if (_buffer != nil) {
-		// Its one level lies in the buffer, rows _bufferBytesPerRow apart, and each slice of a 2D
-		// array (the linear form's) rgfxBufferSlicePitch after the one before.
+	if (_buffer != nil && level == 0) {
+		// Its first level lies in the buffer, rows _bufferBytesPerRow apart, and each slice of a
+		// 2D array (the linear form's) rgfxBufferSlicePitch after the one before. A tiled
+		// texture's other levels are the device's own, which a blit reaches (below).
 		uint8_t *contents = static_cast<uint8_t *>([_buffer contents]);
 		RgfxBlockShape b = rgfxBlockShapeOf(self.pixelFormat);
 		const uint64_t slices =
 		    rgfxSlicesOf(static_cast<MTLTextureType>(_desc.texture_type), _desc.array_length);
-		if (contents == nullptr || level != 0 || slice >= slices || shape.images != 1) {
+		if (contents == nullptr || slice >= slices || shape.images != 1) {
 			static std::atomic<bool> logged{false};
 			rgfxNoteCopyRefused(logged, @"a CPU copy of a texture over a buffer it cannot reach",
 			                    self);

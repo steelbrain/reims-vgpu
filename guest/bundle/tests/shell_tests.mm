@@ -1185,10 +1185,22 @@ void test_tiled_texture_over_backing()
 	while (fx.ring.next(&h, &bytes)) {
 	}
 
-	// More than one level answers nil, sending nothing: the host does not carry levels 1 and up.
+	// More than one level is made, as the AMD and the Intel GPU make it: the message carries the
+	// levels, level 0 over the buffer's bytes, and the CPU reaches level 0 there.
 	desc.mipmapLevelCount = 2;
-	CHECK([tiled newTiledTextureWithDescriptor:desc offset:tileOffset bytesPerRow:pitch] == nil);
+	id<MTLTexture> levels = [tiled newTiledTextureWithDescriptor:desc
+	                                                       offset:tileOffset
+	                                                  bytesPerRow:pitch];
+	CHECK(levels != nil && levels.mipmapLevelCount == 2 && levels.buffer == buf &&
+	      levels.bufferOffset == tileOffset && levels.bufferBytesPerRow == pitch);
+	auto mipmapped = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+	CHECK(mipmapped.desc.mipmap_level_count == 2 && mipmapped.offset == tileOffset &&
+	      mipmapped.bytes_per_row == pitch && mipmapped.buffer_obj_id == buf.rgfxObjId);
 	CHECK(ringEmpty(fx.ring));
+	std::memset(out, 0, sizeof(out));
+	[levels getBytes:out bytesPerRow:12 fromRegion:MTLRegionMake2D(0, 0, 3, 2) mipmapLevel:0];
+	CHECK(std::memcmp(&out[0], &memory[tileOffset], 12) == 0);
+	CHECK(std::memcmp(&out[12], &memory[tileOffset + pitch], 12) == 0);
 	desc.mipmapLevelCount = 1;
 	// So does a type other than 2D, which the AMD and the Intel GPU make and the host does not
 	// carry over a buffer.

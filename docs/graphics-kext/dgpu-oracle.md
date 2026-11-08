@@ -524,12 +524,14 @@ offset:bytesPerRow:`, which asks the buffer it makes for the second.
 
 *(class 2: the tiled forms are x86's alone.)* WindowServer's tiled backings use the buffer's SPI
 (RgfxBuffer.mm). Our stack: the public form ends the process at more than one level with
-Metal's words *(class 3)*, sending the host nothing; the tiled forms answer nil for one, logged
-once, until the host carries levels 1 and up. With the lane answering `featureProfile` 10002, an x86 Mac's, WindowServer asked
-the lane for a 7-level texture over a buffer, which the host's platform refused, and every later
-command buffer naming it faulted, so its composition stopped (boot ro1-p2, 11-02); answering 10
-it asked for none (ro1-p1 and its control). The x86 answer on that path is not one the host
-keeps cheaply: levels 1 and up live in the GPU's own memory, apart from the buffer's. Core Image made no texture over a buffer by any of the three forms, under 10 or 10002,
+Metal's words *(class 3)*, sending the host nothing; the tiled forms make one *(class 3)*:
+`TEXTURE_FROM_BUFFER` carries the levels, and the host's platform makes one image of every
+level, level 0 a copy of the buffer's bytes kept in step at command boundaries and levels 1 and
+up its own (metal2vulkan's `Buffer::new_tiled_texture`), the bundle logging the first of each
+process with its levels. Before the host made them, with the lane answering `featureProfile`
+10002, an x86 Mac's, WindowServer asked the lane for a 7-level texture over a buffer, which the
+host's platform refused, and every later command buffer naming it faulted, so its composition
+stopped (boot ro1-p2, 11-02); answering 10 it asked for none (ro1-p1 and its control). Core Image made no texture over a buffer by any of the three forms, under 10 or 10002,
 for blurs, scales and renders to a texture on the AMD and the Intel GPU. WindowServer on the
 oracle cannot be traced, being protected, so which framework reads the profile for it is not
 measured. The lane keeps the host's answer, 10 on every host so far *(class 2: the cheapest)*;
