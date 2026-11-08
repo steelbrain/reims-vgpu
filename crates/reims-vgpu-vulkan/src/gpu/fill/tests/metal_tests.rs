@@ -566,7 +566,12 @@ const UNPACKED_FORMATS: [u64; 19] = [
 /// bytes, but those of the calling thread's stack where its packing writes a colour in a format
 /// it packs ([`metals_leftover`]): sent right after a fill packed in RGBA32Uint, that fill's bytes,
 /// whatever the colour; sent right after the stack below was set to one byte, that byte. Each of
-/// [`LEFTOVER_FORMATS`] and of [`UNPACKED_FORMATS`]. This platform's colour fill writes the first
+/// [`LEFTOVER_FORMATS`] and of [`UNPACKED_FORMATS`], after a first pair that is not compared: the
+/// process's first such pair reads other bytes, the selector's address and a heap address, which
+/// the first send's own work left there (measured on the M3 Max under macOS 27.0.1, 2026-11-07:
+/// the first of four pairs in one process, where the other three read the earlier fill's bytes,
+/// and a pair that set the stack read its byte even first; which work leaves them is not
+/// established). This platform's colour fill writes the earlier fill's bytes
 /// (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`)
 #[test]
 fn metal_fills_a_colour_it_packs_none_in_with_its_stacks_bytes() {
@@ -574,6 +579,9 @@ fn metal_fills_a_colour_it_packs_none_in_with_its_stacks_bytes() {
         return;
     };
     let leftover = LEFTOVER_FORMATS.iter().map(|f| u64::from(f.as_raw()));
+    // The process's first pair, whose bytes are the first send's (the test's docs).
+    let first = u64::from(LEFTOVER_FORMATS[0].as_raw());
+    metals_leftover(&d, first, (123, 16, 1), 6, None);
     for (red, format) in (7u8..).zip(leftover.chain(UNPACKED_FORMATS)) {
         assert_eq!(
             metals_leftover(&d, format, (123, 16, 1), red, None),
