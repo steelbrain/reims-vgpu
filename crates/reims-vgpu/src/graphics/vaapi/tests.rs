@@ -416,9 +416,9 @@ fn land_both_ways(
     use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
     use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
     use reims_vgpu_vulkan::core::raise::OnFault;
-    use reims_vgpu_vulkan::os::OsVm;
+    use reims_vgpu_vulkan::remap::VulkanVm;
 
-    let vm = OsVm::new();
+    let vm = VulkanVm::new();
     let sample: u64 = if frame.bit_depth() > 8 { 2 } else { 1 };
     let (width, height) = (u64::from(frame.width()), u64::from(frame.height()));
     let luma_bytes = width * sample;
@@ -435,10 +435,14 @@ fn land_both_ways(
     // SAFETY: the pages stay mapped until the runtime lets go of them, when its deallocator
     // unmaps them, and nothing else reads or writes them meanwhile but the test's reads below.
     let bytes = unsafe { HostRange::new(at, len) };
-    // As a no-copy buffer's pages must be: mapped until the runtime lets go of them, which may be
-    // after the buffer's drop.
+    // The runtime runs the deallocator at the buffer's release, Metal's moment, and frees its
+    // import of the pages after it, on a handler thread where a command buffer held the release.
+    // The platform's VM leaves pages an import holds mapped until that free
+    // (`reims_vgpu_vulkan::remap`, "Unmaps an import waits for"); the OS's unmap would take them
+    // from under the import, and RADV, which hands every pointer import to each submission,
+    // would reject every submission of the device until the free (`-EFAULT`).
     let unmap: Box<dyn FnOnce() + Send> = Box::new(move || {
-        let _ = OsVm::new().deallocate(at, len);
+        let _ = VulkanVm::new().deallocate(at, len);
     });
     let buffer = (device.new_buffer_over_host_memory(OnFault::Return, bytes, 0, Some(unmap)))
         .expect("no raise")
