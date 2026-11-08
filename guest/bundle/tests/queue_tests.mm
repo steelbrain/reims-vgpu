@@ -87,6 +87,53 @@ int rgfxQueueTimings(int rounds);
 - (void)setResponsibleTaskIDs:(const int *)taskIDs count:(NSUInteger)count;
 @end
 
+// The command-queue SPI members the queue answers (RgfxCommandQueue, MTLCommandQueueSPI).
+@protocol QueueTestCommandQueueSPI
+- (NSUInteger)qosLevel;
+- (dispatch_queue_t)commitQueue;
+- (BOOL)commitSynchronously;
+- (BOOL)commitsWithQoS;
+- (BOOL)disableCrossQueueHazardTracking;
+- (BOOL)isOpenGLQueue;
+- (dispatch_queue_t)completionQueue;
+- (int)backgroundTrackingPID;
+- (void)setBackgroundTrackingPID:(int)pid;
+- (BOOL)executionEnabled;
+- (BOOL)skipRender;
+- (BOOL)isProfilingEnabled;
+- (void)setProfilingEnabled:(BOOL)enabled;
+- (BOOL)isStatEnabled;
+- (void)setStatOptions:(NSUInteger)options;
+- (void)setStatLocations:(NSUInteger)locations;
+- (NSUInteger)StatOptions;
+- (NSUInteger)getStatOptions;
+- (NSUInteger)StatLocations;
+- (NSUInteger)getStatLocations;
+- (NSUInteger)numRequestedCounters;
+- (void)setNumRequestedCounters:(NSUInteger)count;
+- (NSUInteger)numInternalSampleCounters;
+- (void)setNumInternalSampleCounters:(NSUInteger)count;
+- (NSMutableDictionary *)counterInfo;
+- (void)setCounterInfo:(NSMutableDictionary *)info;
+- (NSArray *)availableCounters;
+- (NSArray *)getRequestedCounters;
+- (int)requestCounters:(NSArray *)counters;
+- (NSArray *)subdivideCounterList:(NSArray *)list;
+- (void)dispatchAvailableCompletionNotifications;
+- (void)finish;
+@end
+
+// The setters of Metal's queue descriptor's internal subclass, which the Mac's descriptor is.
+@protocol QueueTestQueueDescriptorSPI
+- (void)setQosLevel:(NSUInteger)level;
+- (void)setCommitQueue:(dispatch_queue_t)queue;
+- (void)setCommitSynchronously:(BOOL)value;
+- (void)setCommitsWithQoS:(BOOL)value;
+- (void)setDisableCrossQueueHazardTracking:(BOOL)value;
+- (void)setIsOpenGLQueue:(BOOL)value;
+- (void)setCompletionQueue:(dispatch_queue_t)queue;
+@end
+
 namespace {
 
 const char *g_self = nullptr;
@@ -1671,6 +1718,135 @@ void test_command_buffer_spi_state()
 	}
 }
 
+// The SPI's state a queue keeps, as Metal's base queue keeps it, and what a fresh queue of the AMD
+// 5300M's and the Intel 630's answers; buffers made once the queue profiles profile, as Metal's
+// take the switch from their queue as they are made.
+void test_command_queue_spi_state()
+{
+	@autoreleasepool {
+		Queue q(true);
+		id<QueueTestCommandQueueSPI> spi = (id<QueueTestCommandQueueSPI>)q.queue;
+		CHECK(spi.qosLevel == 2 && spi.commitQueue == nil && !spi.commitSynchronously &&
+		      !spi.commitsWithQoS && !spi.disableCrossQueueHazardTracking && !spi.isOpenGLQueue);
+		CHECK(spi.backgroundTrackingPID == getpid() && spi.executionEnabled && !spi.skipRender);
+		CHECK(!spi.isProfilingEnabled && !spi.isStatEnabled && spi.StatOptions == 0 &&
+		      spi.getStatLocations == 0 && spi.numRequestedCounters == 0 &&
+		      spi.numInternalSampleCounters == 0 && spi.counterInfo == nil);
+		CHECK(spi.availableCounters != nil && spi.availableCounters.count == 0 &&
+		      spi.getRequestedCounters == nil && [spi requestCounters:@[ @"counter" ]] == -1);
+		NSArray *list = @[ @"a", @"b" ];
+		NSArray *lists = [spi subdivideCounterList:list];
+		CHECK(lists.count == 1 && lists[0] == list);
+		[spi dispatchAvailableCompletionNotifications];
+		spi.backgroundTrackingPID = 7;
+		[spi setStatOptions:3];
+		[spi setStatLocations:5];
+		spi.numRequestedCounters = 2;
+		spi.numInternalSampleCounters = 4;
+		NSMutableDictionary *info = [NSMutableDictionary dictionary];
+		spi.counterInfo = info;
+		CHECK(spi.backgroundTrackingPID == 7 && spi.StatOptions == 3 && spi.getStatOptions == 3 &&
+		      spi.StatLocations == 5 && spi.getStatLocations == 5 && spi.numRequestedCounters == 2 &&
+		      spi.numInternalSampleCounters == 4 && spi.counterInfo == info);
+		id<MTLCommandBuffer> before = [q.queue commandBuffer];
+		[spi setProfilingEnabled:YES];
+		id<MTLCommandBuffer> after = [q.queue commandBuffer];
+		CHECK(spi.isProfilingEnabled);
+		CHECK(![(id<QueueTestCommandBufferSPI>)before isProfilingEnabled] &&
+		      [(id<QueueTestCommandBufferSPI>)after isProfilingEnabled]);
+	}
+}
+
+// What a descriptor names beyond the command buffer count the queue takes, as Metal's base queue
+// does: its quality of service, its commit queue and switches, and its completion queue, where
+// its buffers' handlers then run.
+void test_queue_takes_its_descriptor()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		MTLCommandQueueDescriptor *descriptor = [MTLCommandQueueDescriptor new];
+		CHECK([descriptor respondsToSelector:@selector(setQosLevel:)] &&
+		      [descriptor respondsToSelector:@selector(setIsOpenGLQueue:)] &&
+		      [descriptor respondsToSelector:@selector(setCompletionQueue:)]);
+		id<QueueTestQueueDescriptorSPI> named = (id<QueueTestQueueDescriptorSPI>)descriptor;
+		dispatch_queue_t commits = dispatch_queue_create("queue-test.commits", DISPATCH_QUEUE_SERIAL);
+		dispatch_queue_t completions =
+		    dispatch_queue_create("queue-test.completions", DISPATCH_QUEUE_SERIAL);
+		static int completionsKey;
+		dispatch_queue_set_specific(completions, &completionsKey, &completionsKey, nullptr);
+		[named setQosLevel:4];
+		[named setCommitQueue:commits];
+		[named setCommitSynchronously:YES];
+		[named setCommitsWithQoS:YES];
+		[named setDisableCrossQueueHazardTracking:YES];
+		[named setIsOpenGLQueue:YES];
+		[named setCompletionQueue:completions];
+		[q.queue rgfxTakeDescriptor:descriptor];
+		id<QueueTestCommandQueueSPI> spi = (id<QueueTestCommandQueueSPI>)q.queue;
+		CHECK(spi.qosLevel == 4 && spi.commitQueue == commits && spi.commitSynchronously &&
+		      spi.commitsWithQoS && spi.disableCrossQueueHazardTracking && spi.isOpenGLQueue &&
+		      spi.completionQueue == completions);
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		std::atomic<bool> onIt{false};
+		std::atomic<bool> *onItp = &onIt;
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			onItp->store(dispatch_get_specific(&completionsKey) == &completionsKey);
+		}];
+		[cb commit];
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		hostComplete(q, *driven.kext, seqno, cb);
+		[cb waitUntilCompleted];
+		CHECK(onIt.load());
+	}
+}
+
+// finish returns once every buffer committed before it has completed and run its completed
+// handlers, as Metal's waits for its buffers; with none in flight, at once.
+void test_finish_waits_for_committed_buffers()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		id<QueueTestCommandQueueSPI> spi = (id<QueueTestCommandQueueSPI>)q.queue;
+		[spi finish];
+		std::atomic<int> ran{0};
+		std::atomic<int> *ranp = &ran;
+		id<MTLCommandBuffer> first = [q.queue commandBuffer];
+		id<MTLCommandBuffer> second = [q.queue commandBuffer];
+		for (id<MTLCommandBuffer> cb in @[ first, second ]) {
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> x) {
+				(void)x;
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				ranp->fetch_add(1);
+			}];
+			[cb commit];
+		}
+		const uint64_t firstSeqno = nextSeqno(q);
+		const uint64_t secondSeqno = nextSeqno(q);
+		std::atomic<bool> finished{false};
+		std::atomic<int> ranAtFinish{-1};
+		std::thread waiter([&] {
+			[spi finish];
+			ranAtFinish.store(ran.load());
+			finished.store(true);
+		});
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		CHECK(!finished.load());
+		hostScheduled(q, *driven.kext, firstSeqno, first);
+		hostComplete(q, *driven.kext, firstSeqno, first);
+		[first waitUntilCompleted];
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		CHECK(!finished.load());
+		hostScheduled(q, *driven.kext, secondSeqno, second);
+		hostComplete(q, *driven.kext, secondSeqno, second);
+		waiter.join();
+		CHECK(finished.load() && ranAtFinish.load() == 2);
+	}
+}
+
 } // namespace
 
 void rgfxQueueTests(const char *self)
@@ -1694,4 +1870,7 @@ void rgfxQueueTests(const char *self)
 	test_a_mid_buffer_signal_wakes_a_cpu_wait_before_the_buffer_ends();
 	test_async_waits_run_after_their_handlers();
 	test_command_buffer_spi_state();
+	test_command_queue_spi_state();
+	test_queue_takes_its_descriptor();
+	test_finish_waits_for_committed_buffers();
 }

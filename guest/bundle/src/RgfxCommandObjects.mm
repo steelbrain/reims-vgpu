@@ -49,6 +49,7 @@
 #import "RgfxIndirectCommandBuffer.h"
 #import "RgfxInterop.h"
 #import "RgfxMetalError.h"
+#import "RgfxMetalPrivate.h"
 #import "RgfxRenderPipelineState.h"
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
@@ -596,6 +597,9 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 /// How many barrier fences a queue has (QUEUE BARRIERS, above).
 constexpr uint32_t kRgfxBarrierFences = 8;
 
+/// The quality of service of a queue no descriptor names (qosLevel).
+constexpr NSUInteger kRgfxDefaultQosLevel = 2;
+
 /// An encoder's place among its queue's barrier fences: the fences, the one it takes, and how
 /// many of them encoders before it took. All fences 0 where the queue has none (no route).
 struct RgfxBarrierSlot {
@@ -639,6 +643,11 @@ struct RgfxBarrierSlot {
 - (std::vector<RgfxSurfaceOrderWait>)rgfxNameCommitOrder;
 /// A buffer of the queue went on its ring at `seqno` (RgfxCommitOrder::posted).
 - (void)rgfxNotePosted:(uint64_t)seqno;
+/// The group finish waits on: a buffer committed with a reader enters it, and leaves it once it
+/// has completed and run its handlers.
+- (dispatch_group_t)rgfxCommittedGroup;
+/// Whether its command buffers profile from their start (setProfilingEnabled:, MTLCommandQueueSPI).
+- (BOOL)isProfilingEnabled;
 @end
 
 @implementation RgfxCommandQueue {
@@ -699,6 +708,28 @@ struct RgfxBarrierSlot {
 	std::shared_ptr<RgfxCommitOrder> _commitOrder;
 	size_t _commitSlot;
 	RgfxCommitNamed _commitNamed;
+	// What Metal's base queue keeps for its SPI (MTLCommandQueueSPI, below): what its descriptor
+	// named (rgfxTakeDescriptor:), its switches, and the statistics' and counters' settings.
+	NSUInteger _qosLevel;
+	dispatch_queue_t _commitQueue;
+	BOOL _commitSynchronously;
+	BOOL _commitsWithQoS;
+	BOOL _disableCrossQueueHazardTracking;
+	BOOL _openGLQueue;
+	int _backgroundTrackingPID;
+	BOOL _executionEnabled;
+	BOOL _skipRender;
+	BOOL _profilingEnabled;
+	BOOL _statEnabled;
+	NSUInteger _statOptions;
+	NSUInteger _statLocations;
+	NSUInteger _numRequestedCounters;
+	NSUInteger _numInternalSampleCounters;
+	std::mutex _counterInfoLock;
+	NSMutableDictionary *_counterInfo; // under `_counterInfoLock`, as Metal's property is atomic
+	// finish's: each command buffer committed to it with a reader is in it until it has
+	// completed (RgfxCmdBuffer's commit and rgfxDeliverCompletion:).
+	dispatch_group_t _committedGroup;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -751,6 +782,14 @@ struct RgfxBarrierSlot {
 			[fences addObject:f];
 		}
 		q->_barrierFences = fences.count == kRgfxBarrierFences ? fences : @[];
+		// As Metal's base queue starts (read from code, _MTLCommandQueue, macOS 27.0.1): its
+		// process tracked for background work, its buffers run, and the quality of service of
+		// a queue no descriptor names, 2 (measured: the AMD 5300M's and the Intel 630's queues
+		// of newCommandQueue, macOS 26.7.1).
+		q->_qosLevel = kRgfxDefaultQosLevel;
+		q->_backgroundTrackingPID = getpid();
+		q->_executionEnabled = YES;
+		q->_committedGroup = dispatch_group_create();
 	}
 	return q;
 }
@@ -1180,20 +1219,243 @@ struct RgfxBarrierSlot {
 	return -1;
 }
 
-// Statistics: Metal takes the settings and answers nothing back; on is logged here, as its
-// statistics, whatever they are, are not gathered.
+// Statistics: Metal keeps the settings, which its getters answer back (MTLCommandQueueSPI,
+// below); on is logged here, as its statistics, whatever they are, are not gathered.
 - (void)setStatEnabled:(BOOL)enabled
 {
 	if (enabled)
 		RGFX_UNSUPPORTED("command statistics");
+	_statEnabled = enabled;
 }
 - (void)setStatLocations:(NSUInteger)locations
 {
-	(void)locations;
+	_statLocations = locations;
 }
 - (void)setStatOptions:(NSUInteger)options
 {
-	(void)options;
+	_statOptions = options;
+}
+
+// --- MTLCommandQueueSPI ----------------------------------------------------------------------
+// The members of Metal's command-queue SPI that the AMD 5300M's and the Intel 630's queues both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m),
+// answered as Metal's base queue, _MTLCommandQueue, answers them (read from code, macOS 27.0.1);
+// the getters of a fresh queue answer what those two GPUs' queues answer (measured:
+// oracle_spi_members answers).
+
+// What the descriptor the queue was made with names, as Metal's base queue takes it at its start:
+// its quality of service, commit and completion queues, and switches. A guest's descriptor that
+// lacks one of them leaves the queue's default.
+- (void)rgfxTakeDescriptor:(MTLCommandQueueDescriptor *)descriptor
+{
+	id<RgfxMetalQueueDescriptorInternals> spi = (id<RgfxMetalQueueDescriptorInternals>)descriptor;
+	if ([spi respondsToSelector:@selector(qosLevel)])
+		_qosLevel = [spi qosLevel];
+	if ([spi respondsToSelector:@selector(commitQueue)])
+		_commitQueue = [spi commitQueue];
+	if ([spi respondsToSelector:@selector(commitSynchronously)])
+		_commitSynchronously = [spi commitSynchronously];
+	if ([spi respondsToSelector:@selector(commitsWithQoS)])
+		_commitsWithQoS = [spi commitsWithQoS];
+	if ([spi respondsToSelector:@selector(disableCrossQueueHazardTracking)])
+		_disableCrossQueueHazardTracking = [spi disableCrossQueueHazardTracking];
+	if ([spi respondsToSelector:@selector(isOpenGLQueue)])
+		_openGLQueue = [spi isOpenGLQueue];
+	if ([spi respondsToSelector:@selector(completionQueue)]) {
+		dispatch_queue_t completion = [spi completionQueue];
+		if (completion != nil)
+			[self setCompletionQueue:completion];
+	}
+}
+
+- (NSUInteger)qosLevel
+{
+	return _qosLevel;
+}
+
+// The queue the descriptor named for Metal's commits, nil where none: the device's buffers post
+// on the thread that commits them, which the guest's results do not see.
+- (dispatch_queue_t)commitQueue
+{
+	return _commitQueue;
+}
+
+- (BOOL)commitSynchronously
+{
+	return _commitSynchronously;
+}
+
+- (BOOL)commitsWithQoS
+{
+	return _commitsWithQoS;
+}
+
+// Whether the descriptor asked for no tracking of hazards between queues: the device orders its
+// queues' buffers by their commits either way (RgfxCommitOrder.hpp), which Metal's tracking does
+// at most.
+- (BOOL)disableCrossQueueHazardTracking
+{
+	return _disableCrossQueueHazardTracking;
+}
+
+- (BOOL)isOpenGLQueue
+{
+	return _openGLQueue;
+}
+
+- (int)backgroundTrackingPID
+{
+	return _backgroundTrackingPID;
+}
+
+- (void)setBackgroundTrackingPID:(int)pid
+{
+	_backgroundTrackingPID = pid;
+}
+
+- (BOOL)executionEnabled
+{
+	return _executionEnabled;
+}
+
+// Metal's queue completes the buffers committed while execution is off without running them;
+// the device runs them.
+- (void)setExecutionEnabled:(BOOL)enabled
+{
+	if (!enabled)
+		RGFX_UNSUPPORTED("completing a queue's command buffers without running them");
+	_executionEnabled = enabled;
+}
+
+- (BOOL)skipRender
+{
+	return _skipRender;
+}
+
+// Metal's buffers take the switch from their queue as they are made; the device's render
+// passes run.
+- (void)setSkipRender:(BOOL)skip
+{
+	if (skip)
+		RGFX_UNSUPPORTED("skipping a queue's render work (setSkipRender:)");
+	_skipRender = skip;
+}
+
+- (BOOL)isProfilingEnabled
+{
+	return _profilingEnabled;
+}
+
+// Its command buffers made from now on profile (RgfxCmdBuffer's profilingResults), as Metal's
+// take the switch from their queue as they are made.
+- (void)setProfilingEnabled:(BOOL)enabled
+{
+	_profilingEnabled = enabled;
+}
+
+- (BOOL)isStatEnabled
+{
+	return _statEnabled;
+}
+
+- (NSUInteger)StatOptions
+{
+	return _statOptions;
+}
+
+- (NSUInteger)getStatOptions
+{
+	return _statOptions;
+}
+
+- (NSUInteger)StatLocations
+{
+	return _statLocations;
+}
+
+- (NSUInteger)getStatLocations
+{
+	return _statLocations;
+}
+
+- (NSUInteger)numRequestedCounters
+{
+	return _numRequestedCounters;
+}
+
+- (void)setNumRequestedCounters:(NSUInteger)count
+{
+	_numRequestedCounters = count;
+}
+
+- (NSUInteger)numInternalSampleCounters
+{
+	return _numInternalSampleCounters;
+}
+
+- (void)setNumInternalSampleCounters:(NSUInteger)count
+{
+	_numInternalSampleCounters = count;
+}
+
+- (NSMutableDictionary *)counterInfo
+{
+	std::lock_guard<std::mutex> hold(_counterInfoLock);
+	return _counterInfo;
+}
+
+- (void)setCounterInfo:(NSMutableDictionary *)info
+{
+	std::lock_guard<std::mutex> hold(_counterInfoLock);
+	_counterInfo = info;
+}
+
+// The counters the queue's statistics can gather: the device gathers none (setStatEnabled: YES
+// is unsupported) and samples none, where the AMD 5300M's and the Intel 630's queues list their
+// GPUs' own (measured).
+- (NSArray *)availableCounters
+{
+	return @[];
+}
+
+// The counters requested, none where none were: nil, as both GPUs' queues answer (measured).
+- (NSArray *)getRequestedCounters
+{
+	return nil;
+}
+
+// -1, as requestCounters:withIndex: answers for every list tried (measured: M3 Max, macOS 27):
+// the device samples no counters.
+- (int)requestCounters:(NSArray *)counters
+{
+	(void)counters;
+	return -1;
+}
+
+// The list in a list of its own, as Metal's base queue answers.
+- (NSArray *)subdivideCounterList:(NSArray *)list
+{
+	NSMutableArray *lists = [[NSMutableArray alloc] init];
+	[lists addObject:list];
+	return lists;
+}
+
+// Metal's base queue delivers its notifications as they come, and does nothing here; so does
+// this queue (rgfxDeliver:here:).
+- (void)dispatchAvailableCompletionNotifications
+{
+}
+
+// Returns once every command buffer committed to the queue before the call has completed and
+// run its completed handlers, as Metal's waits on its buffers' group.
+- (void)finish
+{
+	dispatch_group_wait(_committedGroup, DISPATCH_TIME_FOREVER);
+}
+
+- (dispatch_group_t)rgfxCommittedGroup
+{
+	return _committedGroup;
 }
 
 @end
@@ -1344,6 +1606,8 @@ enum RgfxStage : unsigned {
 	// says it was left, so a buffer whose completion never came leaves it at dealloc.
 	dispatch_group_t _done;
 	std::atomic<bool> _left;
+	// Its queue's group finish waits on (rgfxCommittedGroup), entered and left with `_done`.
+	dispatch_group_t _queueCommitted;
 	// Entered at commit with a reader, as `_done` is: `_submitted` is left once the buffer is
 	// submitted, `_scheduled` once its scheduled handlers have run, which is what
 	// commitAndWaitUntilSubmitted and waitUntilScheduled wait on. The buffer is submitted at its
@@ -1470,6 +1734,8 @@ enum RgfxStage : unsigned {
 		cb->_completedWaiters = [NSMutableArray array];
 		cb->_scheduledWaiters = [NSMutableArray array];
 		cb->_stageTimes[kRgfxStageCreation].store(mach_absolute_time());
+		// It profiles from its start where its queue does, as Metal's buffer takes the switch.
+		cb->_profilingEnabled.store([queue isProfilingEnabled]);
 		const uint32_t reserve = queue.rgfxMessageReserve;
 		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId, reserve);
 		// Past its ring, the message is built in a block of the queue's pool, the size of the
@@ -1487,8 +1753,10 @@ enum RgfxStage : unsigned {
 {
 	// A group released while entered ends the process: one whose completion never came
 	// (its reader went first) is left here.
-	if (_done != nil && !_left.exchange(true))
+	if (_done != nil && !_left.exchange(true)) {
 		dispatch_group_leave(_done);
+		dispatch_group_leave(_queueCommitted);
+	}
 	if (_submitted != nil && !_submittedLeft.exchange(true))
 		dispatch_group_leave(_submitted);
 	if (_scheduled != nil && !_scheduledLeft.exchange(true))
@@ -1757,6 +2025,9 @@ enum RgfxStage : unsigned {
 		_readerHold = [queue sharedReplyReader];
 		_done = dispatch_group_create();
 		dispatch_group_enter(_done);
+		// In its queue's group, which finish waits on, until it has completed (`_left`).
+		_queueCommitted = [queue rgfxCommittedGroup];
+		dispatch_group_enter(_queueCommitted);
 		_submitted = dispatch_group_create();
 		dispatch_group_enter(_submitted);
 		_scheduled = dispatch_group_create();
@@ -2198,8 +2469,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	// __waitUntilCompletedAsync: was given run between the two, as Metal's do.
 	_kept.clear();
 	[self rgfxRunWaiters:_completedWaiters done:&_completedWaitersDone];
-	if (_done != nil && !_left.exchange(true))
+	if (_done != nil && !_left.exchange(true)) {
 		dispatch_group_leave(_done);
+		dispatch_group_leave(_queueCommitted);
+	}
 }
 
 // The buffer is scheduled (its CB_SCHEDULED, or its completion where none came first), once:

@@ -36,6 +36,8 @@
 %spi-unmeasured an SPI member the oracle's objects were not asked (macOS 26.7.1's protocol has no such member); to be measured
 %cb-base Metal's base command buffer, _MTLCommandBuffer, and its IOAccel subclass, MTLIOAccelCommandBuffer (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, MTLCommandBufferSPI); that the AMD 5300M's and the Intel 630's buffers answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
 %cb-answers what a fresh buffer of the AMD 5300M's and of the Intel 630's answers (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
+%q-base Metal's base command queue, _MTLCommandQueue (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, MTLCommandQueueSPI); that the AMD 5300M's and the Intel 630's queues answer from it, not from their own classes, is to be measured with oracle_spi_members' answering class
+%q-answers what a fresh queue of the AMD 5300M's and of the Intel 630's answers (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
 %old-only a member only older guest releases' protocols carry (tests/protocol_members_releases.txt), with no public counterpart; no app pass on the releases that carry it showed a guest framework sending it to the bundle's objects (the bundle logs each selector it does not recognize, RGFX: unrecognized), so a call raises an unrecognized selector, as it did before
 %old-only-device a member only macOS 11's or 12's MTLDeviceSPI carries (tests/protocol_members_releases.txt): on those releases the device's IOGPU base answers it, the guest's own class (measured: macOS 11.7.11, the device answers it); on the Mac the base lacks it
 
@@ -1404,53 +1406,53 @@ useInternalResidencySets:count: pending %spi-unmeasured
 userDictionary implemented
 videoCommandEncoder absent %spi-differ (the AMD 5300M answers it)
 [RgfxCommandQueue]
-StatLocations pending %spi-both
-StatOptions pending %spi-both
+StatLocations implemented
+StatOptions implemented
 addPerfSampleHandler: metal Metal's queue never called the handler after a command buffer completed (measured: M3 Max, macOS 27), and nor does this
-availableCounters pending %spi-both
+availableCounters metal none: the device gathers no statistics (setStatEnabled: YES is unsupported) and samples no counters, where the AMD 5300M's and the Intel 630's queues list their GPUs' own (measured, %q-answers); Metal's base queue fails it as not implemented (read from code, %q-base)
 availableCountersAndDict absent %spi-differ (the Intel 630 answers it)
-backgroundTrackingPID pending %spi-both
-commitQueue pending %spi-both
-commitSynchronously pending %spi-both
-commitsWithQoS pending %spi-both
+backgroundTrackingPID implemented
+commitQueue implemented
+commitSynchronously implemented
+commitsWithQoS implemented
 completionQueue implemented
-counterInfo pending %spi-both
-disableCrossQueueHazardTracking pending %spi-both
-dispatchAvailableCompletionNotifications pending %spi-both
-executionEnabled pending %spi-both
-finish pending %spi-both
+counterInfo implemented
+disableCrossQueueHazardTracking implemented
+dispatchAvailableCompletionNotifications metal does nothing, as Metal's base queue does (read from code, %q-base): the queue delivers its records as they come (rgfxDeliver:here:)
+executionEnabled implemented
+finish implemented
 getBackgroundGPUPriority implemented
 getGPUPriority implemented
-getRequestedCounters pending %spi-both
-getStatLocations pending %spi-both
-getStatOptions pending %spi-both
-isOpenGLQueue pending %spi-both
-isProfilingEnabled pending %spi-both
-isStatEnabled pending %spi-both
+getRequestedCounters metal nil, as the AMD 5300M's and the Intel 630's queues answer (measured, %q-answers): the device samples no counters
+getStatLocations implemented
+getStatOptions implemented
+isOpenGLQueue implemented
+isProfilingEnabled implemented
+isStatEnabled implemented
 maxCommandBufferCount implemented
-numInternalSampleCounters pending %spi-both
-numRequestedCounters pending %spi-both
-qosLevel pending %spi-both
-requestCounters: pending %spi-both
+numInternalSampleCounters implemented
+numRequestedCounters implemented
+qosLevel implemented
+requestCounters: metal -1, as requestCounters:withIndex: answers for every list tried (measured: M3 Max, macOS 27): the device samples no counters; Metal's base queue fails it as not implemented (read from code, %q-base)
 requestCounters:withIndex: metal -1 for every list tried (nil, empty, one counter), as Metal's queue answers (measured: M3 Max, macOS 27)
 setBackgroundGPUPriority: implemented
 setBackgroundGPUPriority:offset: implemented
-setBackgroundTrackingPID: pending %spi-both
+setBackgroundTrackingPID: implemented
 setCompletionQueue: implemented
-setCounterInfo: pending %spi-both
-setExecutionEnabled: pending %spi-both
+setCounterInfo: implemented
+setExecutionEnabled: partial completing a queue's command buffers without running them, as Metal's queue does while execution is off (read from code, %q-base): the device runs them
 setGPUPriority: implemented
 setGPUPriority:offset: implemented
-setNumInternalSampleCounters: pending %spi-both
-setNumRequestedCounters: pending %spi-both
-setProfilingEnabled: pending %spi-both
-setSkipRender: pending %spi-both
+setNumInternalSampleCounters: implemented
+setNumRequestedCounters: implemented
+setProfilingEnabled: implemented
+setSkipRender: partial skipping a queue's render work: Metal's buffers take the switch from their queue as they are made (read from code, %q-base); what a GPU's driver skips with it is not read
 setStatEnabled: partial  command statistics
-setStatLocations: metal the device takes no command statistics (setStatEnabled: YES is unsupported), so where they would be taken changes nothing
-setStatOptions: metal the device takes no command statistics (setStatEnabled: YES is unsupported), so how they would be taken changes nothing
+setStatLocations: implemented
+setStatOptions: implemented
 setSubmissionQueue: implemented
-skipRender pending %spi-both
-subdivideCounterList: pending %spi-both
+skipRender implemented
+subdivideCounterList: implemented
 [RgfxComputeCommandEncoder]
 beginVirtualSubstream absent %spi-neither
 dispatchThreadsWithIndirectBuffer:indirectBufferOffset: absent %spi-neither

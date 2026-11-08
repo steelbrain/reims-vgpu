@@ -32,11 +32,16 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	return [self newCommandQueueWithMaxCommandBufferCount:0];
 }
 
-// A queue of the descriptor's command buffer count. The descriptor's log state can only be one
-// the device made, and it makes none (newLogStateWithDescriptor:error:).
+// A queue of the descriptor's command buffer count, which takes what else the descriptor names
+// (rgfxTakeDescriptor:). The descriptor's log state can only be one the device made, and it
+// makes none (newLogStateWithDescriptor:error:).
 - (nullable id<MTLCommandQueue>)newCommandQueueWithDescriptor:(MTLCommandQueueDescriptor *)descriptor
 {
-	return [self newCommandQueueWithMaxCommandBufferCount:descriptor.maxCommandBufferCount];
+	id<MTLCommandQueue> queue =
+	    [self newCommandQueueWithMaxCommandBufferCount:descriptor.maxCommandBufferCount];
+	if (queue != nil)
+		[(RgfxCommandQueue *)queue rgfxTakeDescriptor:descriptor];
+	return queue;
 }
 
 - (nullable id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:

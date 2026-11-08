@@ -99,6 +99,11 @@ NS_ASSUME_NONNULL_BEGIN
                        device:(nullable id<MTLDevice>)device
                    serializer:(nullable RgfxSerializer *)serializer NS_UNAVAILABLE;
 
+/// Takes what `descriptor`, the one the queue was made with, names beyond its command buffer
+/// count, as Metal's base queue does as it starts: its quality of service, its commit and
+/// completion queues, and its switches, each where the guest's descriptor answers it.
+- (void)rgfxTakeDescriptor:(MTLCommandQueueDescriptor *)descriptor;
+
 /// The reader of the completion ring this queue's command buffers wait on (borrowed by
 /// default). The queue's command buffers register their submission seqno with it on
 /// commit so their completion handlers fire and waitUntilCompleted wakes. Null in a unit

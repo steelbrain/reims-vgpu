@@ -238,6 +238,20 @@ NS_ASSUME_NONNULL_END
 - (BOOL)commitAndWaitUntilSubmitted;
 @end
 
+// read from code: macOS 27.0.1 Metal.framework — what Metal's base command queue reads off the
+// descriptor it is made with as it starts, the members of the descriptor's internal subclass
+// (`MTLCommandQueueDescriptorInternal`), which RgfxCommandQueue's rgfxTakeDescriptor: reads where
+// the guest's descriptor answers them.
+@protocol RgfxMetalQueueDescriptorInternals <NSObject>
+- (NSUInteger)qosLevel;
+- (nullable dispatch_queue_t)commitQueue;
+- (BOOL)commitSynchronously;
+- (BOOL)commitsWithQoS;
+- (BOOL)disableCrossQueueHazardTracking;
+- (BOOL)isOpenGLQueue;
+- (nullable dispatch_queue_t)completionQueue;
+@end
+
 // measured: macOS 27 Metal.framework — the initialisers of Metal's own IO command queue
 // (`_MTLIOCommandQueue`, `initWithDevice:descriptor:`, `@32@0:8@16@24`) and of its raw and
 // compressed file handles (`_MTLIOHandleRaw`, `initWithDevice:path:error:uncached:`,
