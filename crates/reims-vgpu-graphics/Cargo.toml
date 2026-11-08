@@ -15,6 +15,6 @@ workspace = true
 zerocopy.workspace = true
 # The region's mapping, the control thread's pipe and poll, and the monotonic clock.
 libc.workspace = true
-# The device's locks, reims-vgpu-core's (`sync`).
+# The device's locks, the Vulkan crate's core's (`core::sync`).
 parking_lot.workspace = true
 log.workspace = true

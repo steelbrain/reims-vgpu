@@ -13,7 +13,7 @@
 //! - [`backend`] is what a backend answers: the pixel formats it writes,
 //!   whether its device wrote a guest surface, and why it failed.
 
-// The library's lint set, reims-vgpu-core's and the codec crate's: no
+// The library's lint set, the Vulkan crate's core's and the codec crate's: no
 // unsafe code but what is marked, no indexing that can panic, and no silent
 // `as` conversion outside tests, where clippy.toml lets code unwrap, index
 // and panic.

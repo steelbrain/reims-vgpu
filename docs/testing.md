@@ -8,9 +8,10 @@ How the code is tested, and how a claim about Metal or the hardware says where i
 - **Unit tests** sit beside the code, in `mod tests`, named by the behaviour they hold.
   `cargo xtask check` runs every one with cargo-nextest, and the doc-tests: on a Mac on the
   Vulkan platform over MoltenVK, and on Linux on the host's Vulkan driver.
-- **Core's testkit** (`reims-vgpu-core`'s `testkit` feature) is a fake `Platform` that models
-  Metal's objects and logs the calls whose order Metal observes ([architecture.md](architecture.md)
-  13.2). Core's tests, and the tests of other crates that need no GPU, run on it.
+- **Core's testkit** (`core::testkit`, the Vulkan crate's `testkit` feature) is a fake `Platform`
+  that models Metal's objects and logs the calls whose order Metal observes
+  ([architecture.md](architecture.md) 13.2). Core's tests, and the tests of other crates that need
+  no GPU, run on it.
 - **The Vulkan platform's tests** run on the host's Vulkan device. On a Mac, its `metal_tests`
   modules compare what MoltenVK answers with Metal's answers, recorded from Metal on the M3 Max
   under macOS 27.0.1 into text files beside each test (`metal_answers/`, read by core's

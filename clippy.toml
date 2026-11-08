@@ -1,5 +1,5 @@
-# Architecture 17.4. reims-vgpu-core denies clippy::disallowed_types and
-# clippy::disallowed_methods; other crates see them as warnings.
+# Architecture 17.4. The Vulkan crate's core module denies clippy::disallowed_types and
+# clippy::disallowed_methods; other code sees them as warnings.
 
 disallowed-types = [
     { path = "std::sync::Mutex", reason = "use sync::Mutex (parking_lot) (7.1)" },

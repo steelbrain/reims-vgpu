@@ -50,13 +50,14 @@ The Makefile's header lists every target. README.md lists the requirements.
 
 | what | where |
 |---|---|
-| the Cargo workspace: eight crates and `xtask` | `Cargo.toml`, `crates/`, `xtask/` |
+| the Cargo workspace: seven crates and `xtask` | `Cargo.toml`, `crates/`, `xtask/` |
 | `reims-ctl`, the VM manager users run, and its installer | `crates/reims-ctl` (a workspace of its own, linking nothing of the library), `scripts/install-ctl.sh`; reims-util, which it runs to make an x86-64 VM's OpenCore image and download its installer, is pinned in `crates/reims-ctl/src/reims_util.rs` |
 | the C API | `crates/reims-vgpu-c/include/reims_vgpu.h`, specified in [docs/api.md](docs/api.md) |
 | the device: its wire, rings and transport | `crates/reims-vgpu-graphics`, whose `include/reims_graphics_wire.h` the guest's kexts and the option ROM compile; its design and protocol are [docs/graphics-kext](docs/graphics-kext) |
 | the device over the platform: the Metal-call decoder, the display and its window, the host's read-back | `crates/reims-vgpu/src/graphics.rs` and `graphics/` |
 | the display's shaders | `crates/reims-vgpu-vulkan/src/gpu/shaders.metal` |
 | the Vulkan platform | `crates/reims-vgpu-vulkan`, over metal2vulkan's runtime, at the commit of its public repository `Cargo.toml` names; what its defaults trade against Metal's answers is [docs/accuracy-ledger.md](docs/accuracy-ledger.md) |
+| core: the platform traits, the runtime, raises and deaths, the guest's RAM, the testkit | `crates/reims-vgpu-vulkan/src/core.rs` and `core/`, the Vulkan crate's module `core`; the testkit is its `testkit` feature |
 | the Vulkan platform's metallibs, which a build off a Mac copies | `crates/reims-vgpu-vulkan/metallibs`, written on a Mac by `cargo xtask metallibs` (README.md, Building) |
 | a display's own window, and the register of what it does | `crates/reims-vgpu-window`, its `features.md` and its manual walk on macOS, `scripts/internal/walk_window_macos.sh`; the wiring is `crates/reims-vgpu/src/window.rs` |
 | the reims-graphics device's video on the host, on NVDEC or VA-API | `crates/reims-vgpu-video`, in modules: `core` (what the arms share: their runtime, locks, a guest surface's memory and bounded waits), `codec` (the codecs above the hardware), and on Linux `vaapi` and `nvidia` (the hardware's); its subcrate `conformance` is the test streams' readers and writers; the arms are reims-vgpu's `crates/reims-vgpu/src/graphics/{nvidia,vaapi,video_choice,video_host}.rs`, on the runtime in `crates/reims-vgpu/src/video/runtime.rs` |
@@ -315,9 +316,10 @@ Three tiers:
   pointer authentication, and its binaries crash before `main`
   (`rust-toolchain.toml`).
   `cargo xtask check` on a Mac also clippy-checks the Linux target, and, where
-  Rosetta is installed, runs core's tests as `x86_64-apple-darwin`, for
-  the x86-64 guest's 4 KiB pages and instructions; it skips them, saying
-  so, where Rosetta is not. No x86-64 macOS binary ships.
+  Rosetta is installed, runs core's tests (the Vulkan crate's unit tests
+  below `core::`) as `x86_64-apple-darwin`, for the x86-64 guest's 4 KiB
+  pages and instructions; it skips them, saying so, where Rosetta is not.
+  No x86-64 macOS binary ships.
 - **Run `cargo xtask check` once before a branch that changes the library
   merges**, not before each commit (Checking a change).
 - **Stage explicit paths, and never commit build output.** Before each

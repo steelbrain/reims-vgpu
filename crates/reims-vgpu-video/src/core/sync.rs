@@ -1,5 +1,5 @@
-//! Locks: `parking_lot`'s, the same types reims-vgpu-core's `sync` re-exports, which every video
-//! crate locks with.
+//! Locks: `parking_lot`'s, the same types the Vulkan crate's `core::sync` re-exports, which every
+//! video crate locks with.
 //!
 //! None is poisoned: a lock a panicking thread held is the next locker's, as it was, so no caller
 //! handles poisoning. In the library a panic on its threads ends the process before anything

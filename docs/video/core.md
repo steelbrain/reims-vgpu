@@ -15,7 +15,7 @@ overview.
   makes virtual. `StdRuntime` is std's threads and clock, for the examples and the hardware
   tests. A `Bell` is the one place the video code waits on a condition variable with a
   deadline.
-- **`sync`**: the locks, `parking_lot`'s, the types reims-vgpu-core's `sync` re-exports.
+- **`sync`**: the locks, `parking_lot`'s, the types `reims_vgpu_vulkan::core::sync` re-exports.
 
 ## A guest surface's memory
 

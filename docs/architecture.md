@@ -67,7 +67,7 @@ table is retired and not reused.
 
 | # | decision | why |
 |---|---|---|
-| D1 | One Cargo workspace at the repository root: the library's crates (`reims-vgpu-core`, `-vulkan`, `-window`, `reims-vgpu-graphics`, `reims-vgpu`, `-c`), the host video crates (`reims-vgpu-video-*`), and `xtask`. `reims-vgpu-vulkan` is the library's `Platform`, over `metal2vulkan-runtime`, a Metal-shaped API on Vulkan: on Linux, and on macOS over MoltenVK, a build for development and tests (2.1, 2.2). | Each crate does one job the others cannot without breaking a rule below. |
+| D1 | One Cargo workspace at the repository root: the library's crates (`reims-vgpu-vulkan`, `-window`, `reims-vgpu-graphics`, `reims-vgpu`, `-c`), the host video crates (`reims-vgpu-video-*`), and `xtask`. `reims-vgpu-vulkan` is the library's `Platform`, over `metal2vulkan-runtime`, a Metal-shaped API on Vulkan: on Linux, and on macOS over MoltenVK, a build for development and tests; its module `core` is what the platform and the device share (2.1, 2.2). | Each crate does one job the others cannot without breaking a rule below. |
 | D2 | Modules by area and responsibility, not one file per Objective-C class. | The code is Rust; the contract binds behaviour, not file shape. |
 | D3 | Core is generic over one `P: Platform` whose associated types name every Metal object kind. `dyn` only for the host's callbacks, the display executor and the OS services. | A handle flows into another Metal call (a texture into an encoder) with its kind checked at compile time. |
 | D4 | One typed platform method per Metal method the library calls, and one enum variant per encoder and ICB command (`BlitCmd`, `ComputeCmd`, `RenderCmd`, `IcbRenderCmd`, `IcbComputeCmd`), with no table of ops between the caller and Metal. The platform's dispatch is one exhaustive `match` per command family, and it names each call by its selector and raise policy (4.3, 4.6). A call whose position the guest or host observes (a creation, release or retain, an aliasing setter, a command, a call with raw guest values) is sent where the caller makes it; a getter or device query is not ordered. | A send per guest operation, in order, with raw guest values: Metal's results, aborts and numbering follow the calls a process makes. |
@@ -111,10 +111,10 @@ D26, D28, D40 and D48.
 ```
 Cargo.toml Cargo.lock rust-toolchain.toml clippy.toml .cargo/config.toml
 crates/
-  reims-vgpu-core/      what the platforms and the device share, generic over P: Platform;
-                        links no Apple framework
-  reims-vgpu-vulkan/    Platform over metal2vulkan-runtime, the library's only one: on Linux, and
-                        over MoltenVK on macOS; its OS services; the library's shaders
+  reims-vgpu-vulkan/    core (src/core.rs, src/core/), what the platform and the device share,
+                        generic over P: Platform; Platform over metal2vulkan-runtime, the
+                        library's only one: on Linux, and over MoltenVK on macOS; its OS
+                        services; the library's shaders
   reims-vgpu-window/    the device's own window: AppKit or SDL3, input, the host's screens,
                         and features.md, the register of what the window does
   reims-vgpu-graphics/  the device's wire, its rings and control, and the C header the guest
@@ -140,7 +140,7 @@ preferences domain and no entitlement: the device's options are its config's fie
 ### 2.2 Crate graph
 
 ```
-reims-vgpu-core, metal2vulkan-runtime  <-  reims-vgpu-vulkan  <-  reims-vgpu-window  <-  reims-vgpu
+metal2vulkan-runtime  <-  reims-vgpu-vulkan  <-  reims-vgpu-window  <-  reims-vgpu
 reims-vgpu-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  QEMU
 ```
 
@@ -152,9 +152,11 @@ reims-vgpu-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  Q
   Linux `os/linux/` (a host VM over `mmap` of the guest RAM's files, and an IOSurface stand-in over
   that memory). It compiles the library's shaders (4.7). Where its answer differs from Metal's it logs the difference and goes on, and dies
   where Metal would or where the runtime cannot run the call ([accuracy-ledger.md](accuracy-ledger.md)).
-- **Core** depends on `parking_lot`, `zerocopy`, `bitflags` and `log` only. Its `testkit` feature
-  exposes `core::testkit` outside core's own tests; only dev-dependencies enable it, and
-  `cargo xtask testkit` checks that (D50).
+- **Core** (`reims_vgpu_vulkan::core`) uses `parking_lot`, `zerocopy` and `log`, and nothing else
+  of the Vulkan crate: the crate's platform implements core's traits, and core is generic over
+  them. The crate's `testkit` feature exposes `core::testkit` outside the crate's own unit tests;
+  only dev-dependencies enable it (the crate's own, for its integration tests), and `cargo xtask
+  testkit` checks that (D50).
 - **The window** (`reims-vgpu-window`) is the device's own window (D51), and knows nothing of
   devices. Its pure logic is unit-tested with no AppKit or SDL: `geometry` (the image's rectangle
   in the window, the pointer's position in the guest's mode, the buttons), `keymap` (key codes to
@@ -213,8 +215,9 @@ is built for it too.
 
 ## 3. Core's modules
 
-`crates/reims-vgpu-core/src/`, one file per module beside its directory (D44). Each module's `//!`
-doc holds its ordering contracts and the odd behaviours it keeps, each naming its test.
+`crates/reims-vgpu-vulkan/src/core/`, below its root `core.rs`, one file per module beside its
+directory (D44). Each module's `//!` doc holds its ordering contracts and the odd behaviours it
+keeps, each naming its test.
 
 | module | what it owns |
 |---|---|
@@ -781,7 +784,8 @@ tested features are every feature but the C API's `vulkan` (`TESTED_FEATURES` in
 `xtask/src/main.rs`), which makes the C API's platform the Vulkan one (11.1); on Linux, where the
 Vulkan platform is the only one, it is among them. On a Mac the check also runs clippy for
 `x86_64-unknown-linux-gnu`, which type-checks every Linux file with SDL left unbuilt, and, where
-Rosetta runs x86-64 code, core's tests as `x86_64-apple-darwin`.
+Rosetta runs x86-64 code, core's tests (the Vulkan crate's unit tests below `core::`) as
+`x86_64-apple-darwin`.
 
 ### 13.2 The testkit
 

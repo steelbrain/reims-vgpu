@@ -1337,8 +1337,7 @@ has a queue it hands the pool's first range out twice, so the host checks it wit
 a few plain textures and logs an error where one takes a guest id. Were the
 paravirt lane's device in the same process, on the same GPU, the graphics lane's
 reservation would win: it is made as the device is, before any guest runs, while
-the paravirt lane reserves its placed objects as each task starts
-(`crates/reims-vgpu-core/src/resources/manager/reserve.rs`), and Metal takes only
+the paravirt lane reserves its placed objects as each task starts, and Metal takes only
 a type's first reservation. That would not make the two safe together: both lanes'
 guests place textures in the device's one table, at ids each picks alone. So a
 process runs one lane's device on a GPU, and today a VM has one lane or the other.
@@ -1591,7 +1590,7 @@ completion rings.
 Our guest Metal GPU bundle is the host of Apple's Metal SPI: every Metal call
 an app makes lands in one of the bundle's objects, and the bundle serialises it
 into this stream. The host reads the stream and drives the library's `Platform`
-(Metal on the Mac, metal2vulkan on Linux), the same trait reims-vgpu-core
+(Metal on the Mac, metal2vulkan on Linux), the same trait core
 already drives from the Apple-lane command stream. So the host decoder is: wire
 message → handle-table lookup/insert → `Platform` call → completion. The
 bundle's serialiser is the mirror of that decoder.
@@ -1635,7 +1634,7 @@ buffer then completes as it would have. Where there is no stand-in (a message
 too short to name its queue, a queue the process does not hold), the error
 status is posted at once. Nothing in
 this lane ends the offending context or its process on malformed input. The
-host runs each op in a refusal scope (`reims_vgpu_core::raise::refusals`): a
+host runs each op in a refusal scope (`reims_vgpu_vulkan::core::raise::refusals`): a
 death at a platform call, where the platform refuses a create or an encode and
 the paravirt device ends the process, unwinds to the op's scope instead, and the
 op is refused there, logged once at WARN with the platform's reason. A panic in
@@ -2601,7 +2600,7 @@ command-buffer/queue descriptors and `errorOptions`; labels and debug groups
 answered guest-side; residency sets (`useResource`/`useHeap` are in);
 `MTLIOCommandQueue`; Metal 4.
 
-**Where the decoder lives.** In reims-vgpu-core, generic over `P: Platform`,
+**Where the decoder lives.** In reims-vgpu (`graphics::decode`), generic over `P: Platform`,
 beside the Apple-lane decode it mirrors (same handle machinery, descriptor
 structs and `Platform` calls). The reims-vgpu-graphics crate stays the transport
 (rings, region, registers); the decoder consumes ring bytes and drives

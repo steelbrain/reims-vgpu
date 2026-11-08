@@ -1,6 +1,6 @@
 //! The threads and the clock the video crates run on: [`Runtime`], which their host gives them.
 //!
-//! This crate is independent of reims-vgpu-core and of QEMU, so it does not link the library's
+//! This crate is independent of the library's crates and of QEMU, so it does not link the library's
 //! platform: it is handed a runtime of three calls instead, a thread's start, the monotonic
 //! clock's time and one timed wait, which each backend that starts a thread, waits or times a
 //! call keeps from its making.

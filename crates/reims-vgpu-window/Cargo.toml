@@ -11,8 +11,9 @@ license.workspace = true
 log.workspace = true
 # ash's Vulkan types for a window's surface (`present`): SDL's on Linux, the layer's on macOS.
 ash.workspace = true
-# The Vulkan crate's OS layer: its threads, and on macOS its clock and the message layer the
-# AppKit side sends through (`reims_vgpu_vulkan::os`).
+# The Vulkan crate: core's threads and holds (`reims_vgpu_vulkan::core`), and its OS layer: its
+# threads, and on macOS its clock and the message layer the AppKit side sends through
+# (`reims_vgpu_vulkan::os`).
 reims-vgpu-vulkan.workspace = true
 
 # The window on Linux (`sdl`): SDL3 for the window, its input and its Vulkan surface.

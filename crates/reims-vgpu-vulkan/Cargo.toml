@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-vulkan"
-description = "The library's platform: the Platform implementation over metal2vulkan-runtime, on Vulkan"
+description = "The library's platform: core, what the graphics device and its platform share, and the Platform implementation over metal2vulkan-runtime, on Vulkan"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -11,7 +11,7 @@ AGENTS.md                   the rules for working on the repository
 Cargo.toml                  the Cargo workspace, with Cargo.lock,
                             rust-toolchain.toml, clippy.toml and
                             .cargo/config.toml
-crates/                     its eight crates (below), and reims-ctl, a
+crates/                     its seven crates (below), and reims-ctl, a
                             workspace of its own that links none of them
 xtask/                      cargo xtask (below)
 firmware/                   the reims-graphics device's option ROM: its UEFI
@@ -88,8 +88,7 @@ doc holds its area's ordering contracts and the measured platform facts it relie
 
 | crate | path | role |
 |---|---|---|
-| `reims-vgpu-core` | `crates/reims-vgpu-core` | what the platforms and the device share, generic over `P: Platform`: the platform traits, the runtime, raises and deaths, the testkit; links no Apple framework |
-| `reims-vgpu-vulkan` | `crates/reims-vgpu-vulkan` | the `Platform` over metal2vulkan's runtime, the library's only one: on Linux, and on macOS over MoltenVK, a build for development and tests; its OS services (on macOS IOSurface, Mach VM, threads and the Objective-C message layer the window's AppKit side sends through), and the library's shaders (`src/gpu/shaders.metal`) |
+| `reims-vgpu-vulkan` | `crates/reims-vgpu-vulkan` | `core` (`src/core.rs`, `src/core/`), what the platform and the device share, generic over `P: Platform`: the platform traits, the runtime, raises and deaths, the testkit, using nothing else of the crate; and the `Platform` over metal2vulkan's runtime, the library's only one: on Linux, and on macOS over MoltenVK, a build for development and tests; its OS services (on macOS IOSurface, Mach VM, threads and the Objective-C message layer the window's AppKit side sends through), and the library's shaders (`src/gpu/shaders.metal`) |
 | `reims-vgpu-window` | `crates/reims-vgpu-window` | the device's own window: AppKit's or SDL3's on macOS, SDL3's on Linux, its input and the host's screens; knows nothing of devices or displays. `features.md` lists what the window does, each entry deliberate |
 | `reims-vgpu` | `crates/reims-vgpu` | the public Rust API: the reims-graphics device over the platform, its Metal-call decoder and its window; the process's platform |
 | `reims-vgpu-c` | `crates/reims-vgpu-c` | the C API (`rvg_*`, `include/reims_vgpu.h`), which QEMU links; `cdylib`, `staticlib` and `rlib` |
@@ -122,9 +121,9 @@ cargo xtask metallibs      # on a Mac: the Vulkan platform's metallibs and their
 
 `cargo xtask check` tests with every feature but `reims-vgpu-c/vulkan`, which puts the C API on the
 Vulkan platform, and lints with every feature too. On a Mac it also clippy-checks the Linux target,
-and, where Rosetta is installed, runs core's tests as `x86_64-apple-darwin`. Its cargo steps run
-in the environment it was started in, incremental as cargo's dev and test profiles are, so a check
-run again after a fix rebuilds what the fix changed.
+and, where Rosetta is installed, runs core's tests (the Vulkan crate's unit tests below `core::`)
+as `x86_64-apple-darwin`. Its cargo steps run in the environment it was started in, incremental as
+cargo's dev and test profiles are, so a check run again after a fix rebuilds what the fix changed.
 
 #### Building through kache
 
@@ -139,7 +138,7 @@ developer's builds take it up through `scripts/internal/dev-env.sh`, sourced fro
 root before each cargo command:
 
 ```sh
-. scripts/internal/dev-env.sh && cargo nextest run -p reims-vgpu-core
+. scripts/internal/dev-env.sh && cargo nextest run -p reims-vgpu-vulkan -E 'test(/^core::/)'
 ```
 
 which, where `kache` is on the PATH, sets `RUSTC_WRAPPER=kache`, `KACHE_LOCAL_ONLY=1` and
@@ -160,10 +159,11 @@ kache seeds only between target directories inside their worktrees, cargo's defa
 no `CARGO_TARGET_DIR`. It maps the compiler's working directory, the worktree's root, to one path
 (`-Zremap-cwd-prefix=/src`), and a target directory elsewhere puts a path of its own in the
 compiler's arguments, so each target's state is compatible with no other's. Measured on the M3 Max
-on 2026-11-03, the first edit of `reims-vgpu-core` after a build of the tree: with targets inside
-the worktrees, a second worktree's compile seeded from the first's state took 4.3 s, against 7.0 s
-for the first worktree's, which had no donor; with each target in a directory of its own under
-`~/.cache`, the two units' seed identities differed and the second took 5.7 s, against 6.0 s.
+on 2026-11-03, the first edit of core (then the crate `reims-vgpu-core`) after a build of the
+tree: with targets inside the worktrees, a second worktree's compile seeded from the first's state
+took 4.3 s, against 7.0 s for the first worktree's, which had no donor; with each target in a
+directory of its own under `~/.cache`, the two units' seed identities differed and the second took
+5.7 s, against 6.0 s.
 
 A unit is shared between worktrees when nothing it is built from names the worktree's path, and a
 build script's run when nothing it writes does. So the tests find the tree at run time: they read
@@ -298,7 +298,8 @@ Set in `Cargo.toml` (architecture 2.3):
   SDL3's window on macOS, which `REIMS_VGPU_WINDOW_IMPL=sdl` opens in place of AppKit's. Without it
   the macOS library has no SDL.
 - `reims-vgpu-window/sdl-no-link`: SDL left unbuilt, for the Linux target's clippy on a Mac.
-- `reims-vgpu-vulkan/testkit`: `core::testkit` for other crates' tests.
+- `reims-vgpu-vulkan/testkit`: `core::testkit` for other crates' tests and the Vulkan crate's
+  integration tests.
 - `reims-vgpu/testkit`: the same, through the public crate, and each handle's core object.
 
 [api.md](api.md) section 2 lists the device's settings and the environment variables the library

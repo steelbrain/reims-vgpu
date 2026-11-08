@@ -80,7 +80,7 @@ memchr = "2.8.3"
 # built from the crate's bundled source, with its symbols prefixed.
 tikv-jemallocator = "0.7.0"
 
-# Architecture 17.4. reims-vgpu-core adds its stricter set in lib.rs.
+# Architecture 17.4. reims-vgpu-vulkan's core module adds its stricter set in core.rs.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"

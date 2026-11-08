@@ -1,7 +1,7 @@
 # The environment a developer's builds run in. Source it from the worktree's root, which builds in
 # its own target/ (no CARGO_TARGET_DIR), before each cargo command:
 #
-#   . scripts/internal/dev-env.sh && cargo nextest run -p reims-vgpu-core
+#   . scripts/internal/dev-env.sh && cargo nextest run -p reims-vgpu-vulkan -E 'test(/^core::/)'
 #
 # Builds are incremental, as cargo's dev and test profiles are. Where kache is on the PATH, rustc
 # runs through it (RUSTC_WRAPPER=kache): a compiler cache that stores each unit's outputs on this
