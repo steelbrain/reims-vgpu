@@ -8,19 +8,22 @@
 
 use std::sync::Arc;
 
+use reims_vgpu_video_core::runtime::Runtime;
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 
 use super::decode::GraphicsVideo;
 
-/// The hardware video of `device`, from the first arm that takes it (module docs); `None` where
-/// none does.
+/// The hardware video of `device`, from the first arm that takes it (module docs), the host
+/// APIs' threads and waits `runtime`'s; `None` where none does.
 pub(crate) fn graphics_video(
     device: &VulkanDevice,
+    runtime: Arc<dyn Runtime>,
 ) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
     #[cfg(target_os = "linux")]
-    if let Some(video) = super::nvidia::open(device) {
+    if let Some(video) = super::nvidia::open(device, &runtime) {
         return Some(video);
     }
+    let _ = runtime;
     super::vulkan::graphics_video(device)
 }

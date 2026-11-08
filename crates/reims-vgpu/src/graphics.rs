@@ -121,9 +121,9 @@ mod nvidia;
 mod present;
 mod read;
 mod sink;
+mod video_host;
 #[cfg(vulkan_platform)]
 mod video_choice;
-mod video_host;
 #[cfg(vulkan_platform)]
 mod vulkan;
 
@@ -361,7 +361,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             // The host's hardware video, whose codecs the video caps after the device info list
             // for the guest's video driver.
-            if let Some(video) = platform.graphics_video(&gpu_device) {
+            let video_runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+            if let Some(video) = platform.graphics_video(&gpu_device, video_runtime) {
                 // Pictures land in device caches only where the kext makes them.
                 let cached = features & u64::from(RGFX_FEATURE_SURFACE_CACHE) != 0
                     && video.lands_in_device_caches();

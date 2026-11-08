@@ -272,6 +272,14 @@ impl<P: Platform> Landing<'_, P> {
         })
     }
 
+    /// [`Self::host`], for a backend whose CPU copies the picture into them itself: the landing is
+    /// counted as the CPU's.
+    pub(crate) fn host_for_cpu(&mut self) -> Result<HostPlanes<P>, BackendError> {
+        let planes = self.host()?;
+        self.by_cpu = true;
+        Ok(planes)
+    }
+
     /// Copies the picture's planes, `luma` and `chroma`, into the planes' host bytes
     /// ([`Self::host`]) by the CPU: each plane's rows of the picture's crop, the fewer of its
     /// source's and its own, each the fewer of their bytes, leaving the bytes past each row as

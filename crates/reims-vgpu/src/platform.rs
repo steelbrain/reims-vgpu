@@ -51,9 +51,14 @@ pub trait ApiPlatform: Platform {
     }
 
     /// The host's hardware video for a graphics device on `device`, the guest's video driver's
-    /// (`crate::GraphicsVideo`); `None` where the platform has none, and by default.
-    fn graphics_video(&self, device: &Self::Device) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
-        let _ = device;
+    /// (`crate::GraphicsVideo`), whose host APIs' threads and waits are `runtime`'s; `None` where
+    /// the platform has none, and by default.
+    fn graphics_video(
+        &self,
+        device: &Self::Device,
+        runtime: Arc<dyn reims_vgpu_video_core::runtime::Runtime>,
+    ) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
+        let _ = (device, runtime);
         None
     }
 }

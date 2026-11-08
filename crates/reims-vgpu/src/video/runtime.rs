@@ -26,24 +26,10 @@ use reims_vgpu_video_core::runtime::{MonoTime, Rings, Runtime, TimedOut};
 use reims_vgpu_video_core::sync::{Condvar, MutexGuard};
 
 /// `P` as a video crate's runtime (module doc).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the graphics device's video arms run their sessions on it"
-    )
-)]
 pub(crate) struct PlatformRuntime<P: Platform>(Arc<P>);
 
 impl<P: Platform> PlatformRuntime<P> {
     /// `platform`'s runtime, to hand a session or a backend.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the graphics device's video arms run their sessions on it"
-        )
-    )]
     pub(crate) fn of(platform: &Arc<P>) -> Arc<dyn Runtime> {
         Arc::new(PlatformRuntime(Arc::clone(platform)))
     }

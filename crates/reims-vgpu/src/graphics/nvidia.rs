@@ -41,7 +41,7 @@ use reims_graphics::wire::{
 };
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_video_core::runtime::{Runtime, StdRuntime};
+use reims_vgpu_video_core::runtime::Runtime;
 use reims_vgpu_video_nvidia::{
     AnnexBCodec, AnnexBDecoder, AnnexBPicture, ChromaFormat, DecodeCapabilities, Gpu, GpuSelector,
     MemoryPlane, NvdecCodec, ReadPlane, decode_capabilities,
@@ -69,10 +69,14 @@ const HEVC_TOP_LEVEL: u32 = 186;
 /// The video of each runtime device, by its registry ID, while one lives.
 type MadeVideos = Vec<(u64, Weak<NvidiaVideo>)>;
 
-/// NVDEC's video for `device`'s sessions: the one they share, made on first use; `None`, with a
-/// line at info, where the device is not an NVIDIA GPU CUDA opens, or NVDEC decodes neither H.264
+/// NVDEC's video for `device`'s sessions: the one they share, made on first use, the NVIDIA
+/// crate's threads and waits `runtime`'s unless its decoders made before took another's; `None`,
+/// with a line at info, where the device is not an NVIDIA GPU CUDA opens, or NVDEC decodes neither H.264
 /// nor HEVC there.
-pub(crate) fn open(device: &VulkanDevice) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
+pub(crate) fn open(
+    device: &VulkanDevice,
+    runtime: &Arc<dyn Runtime>,
+) -> Option<Arc<dyn GraphicsVideo<VulkanPlatform>>> {
     static MADE: LazyLock<Mutex<MadeVideos>> = LazyLock::new(|| Mutex::new(Vec::new()));
     let mut made = MADE.lock();
     made.retain(|(_, video)| video.strong_count() > 0);
@@ -82,7 +86,7 @@ pub(crate) fn open(device: &VulkanDevice) -> Option<Arc<dyn GraphicsVideo<Vulkan
     let video = match kept {
         Some(video) => video,
         None => {
-            let video = Arc::new(NvidiaVideo::new(device)?);
+            let video = Arc::new(NvidiaVideo::new(device, runtime)?);
             made.push((device.registry_id, Arc::downgrade(&video)));
             video
         }
@@ -107,7 +111,7 @@ struct NvidiaVideo {
 }
 
 impl NvidiaVideo {
-    fn new(device: &VulkanDevice) -> Option<Self> {
+    fn new(device: &VulkanDevice, runtime: &Arc<dyn Runtime>) -> Option<Self> {
         let properties = device.raw.properties();
         if properties.vendor_id != NVIDIA_VENDOR {
             log::info!(
@@ -192,7 +196,7 @@ impl NvidiaVideo {
             device: device.clone_ref(),
             h264,
             hevc,
-            runtime: StdRuntime::shared(),
+            runtime: Arc::clone(runtime),
         })
     }
 }
