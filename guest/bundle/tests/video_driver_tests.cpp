@@ -1347,14 +1347,16 @@ void checkH264SpsLayouts()
 	refused(third, neither, "a record fitting no layout");
 	refused(third, tooNarrow, "a surface a macroblock narrower than the SPS's size");
 	lands(third, on12, "12's record after two refused");
+	finish(third);
 	// AppleGVA's H.264 decoder reports no failed schedule, so a schedule waits for no verdict of
 	// the host's (RgfxVideoStatus.hpp).
+	void *fourth = session();
 	g_verdict = -1;
 	g_waits = 0;
-	lands(third, on12, "a picture the host fails");
+	lands(fourth, on12, "a picture the host fails");
 	CHECK(g_waits == 0, "an H.264 schedule waited for %d verdicts of the host's", g_waits);
 	g_verdict = 1;
-	finish(third);
+	finish(fourth);
 	CFRelease(surface);
 	CFRelease(narrower);
 }
