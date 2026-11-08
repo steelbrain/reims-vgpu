@@ -313,7 +313,7 @@ mod tests {
         let repo = std::env::temp_dir().join(format!("reims-ctl-kept-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::update::git_command(&repo)
                 .args([
                     "-c",
                     "user.name=t",
@@ -322,8 +322,6 @@ mod tests {
                     "-c",
                     "commit.gpgsign=false",
                 ])
-                .arg("-C")
-                .arg(&repo)
                 .args(args)
                 .output()
                 .unwrap();
@@ -346,7 +344,11 @@ mod tests {
         commit("crates/reims-ctl/src/main.rs");
         commit("docs/qemu.md");
         let kept = |build: &str| {
-            let out = std::process::Command::new("bash")
+            let mut bash = std::process::Command::new("bash");
+            for v in crate::update::GIT_REPOSITORY_ENV {
+                bash.env_remove(v);
+            }
+            let out = bash
                 .arg("-c")
                 .arg(format!("set -euo pipefail\n{function}kept_qemu \"$1\""))
                 .arg("kept")

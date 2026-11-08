@@ -74,7 +74,11 @@ pub fn update(channel: Option<Channel>) -> Result<()> {
     if !script.is_file() {
         bail!("{} is missing: was the checkout moved?", script.display());
     }
-    let status = Command::new("bash")
+    let mut bash = Command::new("bash");
+    for v in GIT_REPOSITORY_ENV {
+        bash.env_remove(v);
+    }
+    let status = bash
         .arg(&script)
         .arg("--update")
         .current_dir(&i.repo)
@@ -147,13 +151,30 @@ fn switch(repo: &Path, c: Channel) -> Result<()> {
     Ok(())
 }
 
+/// The variables through which git takes its repository from the environment, which a git hook
+/// and `git rebase -x` export to what they run. `git -C` does not override them, so each git and
+/// script reims-ctl runs on a checkout drops them, as it names the checkout itself.
+pub(crate) const GIT_REPOSITORY_ENV: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
+/// git on `repo` alone, whatever repository the environment names ([`GIT_REPOSITORY_ENV`]).
+pub(crate) fn git_command(repo: &Path) -> Command {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(repo);
+    for v in GIT_REPOSITORY_ENV {
+        c.env_remove(v);
+    }
+    c
+}
+
 fn git(repo: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .context("run git")?;
+    let status = git_command(repo).args(args).status().context("run git")?;
     if !status.success() {
         bail!("git {} failed", args.join(" "));
     }
@@ -162,12 +183,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<()> {
 
 /// `git args`' output, trimmed; None where it fails or prints nothing.
 fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
-    let o = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
+    let o = git_command(repo).args(args).output().ok()?;
     let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
     (o.status.success() && !out.is_empty()).then_some(out)
 }
@@ -233,9 +249,7 @@ mod tests {
     }
 
     fn run(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let ok = git_command(dir)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -244,6 +258,19 @@ mod tests {
             .status
             .success();
         assert!(ok, "git {}", args.join(" "));
+    }
+
+    #[test]
+    fn git_drops_every_variable_that_names_another_repository() {
+        let c = git_command(Path::new("/checkout"));
+        let dropped: Vec<_> = c
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k)
+            .collect();
+        for v in GIT_REPOSITORY_ENV {
+            assert!(dropped.contains(&std::ffi::OsStr::new(v)), "{v}");
+        }
     }
 
     #[test]
