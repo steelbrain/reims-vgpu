@@ -246,8 +246,12 @@ const CREATE_EXAMPLES: &str = r"
     # An installer of your own, such as a recovery image (BaseSystem.dmg)
     reims-ctl create mac --installer ~/Downloads/BaseSystem.dmg
 
-    # A disk that already has macOS installed (copied; see --disk-mode), with
-    # the OpenCore image it booted from, which keeps its Mac's identity
+    # A disk that already has macOS installed (copied; see --disk-mode): the
+    # new OpenCore image presents the Mac of the one beside it, opencore.qcow2,
+    # as another VM's directory holds them, so macOS sees no new Mac
+    reims-ctl create mac --disk ~/vms/old/disk.qcow2
+
+    # Or with the OpenCore image it booted from, copied, which keeps its Mac too
     reims-ctl create mac --disk ~/vms/mac.qcow2 --opencore ~/vms/OpenCore.qcow2";
 
 #[derive(Args)]
@@ -290,7 +294,8 @@ pub struct CreateArgs {
     #[arg(long)]
     pub installer: Option<PathBuf>,
     /// An OpenCore image of your own to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it
-    /// (default: a new one made for the VM, with OVMF and a Mac identity of its own)
+    /// (default: a new one made for the VM, with OVMF, presenting the Mac of the image beside
+    /// --disk, opencore.qcow2, where there is one, else a Mac identity of its own)
     #[arg(long)]
     pub opencore: Option<PathBuf>,
     /// The network card's MAC, such as 52:54:00:12:34:56 (default: a random one)

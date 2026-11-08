@@ -297,24 +297,35 @@ pub fn opencore_as(
     kexts: &[String],
     progress: &mut dyn FnMut(&str),
 ) -> Result<()> {
-    let mut args = vec![
-        "--model",
-        &id.model,
-        "--serial",
-        &id.serial,
-        "--mlb",
-        &id.mlb,
-        "--uuid",
-        &id.uuid,
-        "--rom",
-        &id.rom,
-        "--no-ovmf",
-    ];
+    let mut args = identity_args(id);
+    args.push("--no-ovmf");
     if show_picker {
         args.push("--show-picker");
     }
     args.extend(kexts.iter().map(String::as_str));
     make_opencore(image, &args, progress)
+}
+
+/// Makes an OpenCore image at `image` presenting the Mac `id`, with `OVMF_CODE.fd` and
+/// `OVMF_VARS.fd` beside it, for a new VM whose disk's macOS ran on that Mac; `kexts` adds kexts
+/// ([`kext_args`]).
+pub fn opencore_presenting(
+    image: &Path,
+    id: &Identity,
+    kexts: &[String],
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let mut args = identity_args(id);
+    args.extend(kexts.iter().map(String::as_str));
+    make_opencore(image, &args, progress)
+}
+
+/// The arguments that make reims-util's image present the Mac `id`.
+fn identity_args(id: &Identity) -> Vec<&str> {
+    vec![
+        "--model", &id.model, "--serial", &id.serial, "--mlb", &id.mlb, "--uuid", &id.uuid,
+        "--rom", &id.rom,
+    ]
 }
 
 fn make_opencore(image: &Path, args: &[&str], progress: &mut dyn FnMut(&str)) -> Result<()> {

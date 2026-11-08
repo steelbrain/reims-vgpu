@@ -2,17 +2,19 @@
 //!
 //! An x86-64 VM (`q35-x86_64`) boots OpenCore from an OpenCore image of its own, with its own
 //! OVMF code and variables: made for it by reims-util, holding the guest's kexts for
-//! reims-vgpu's own device where the VM is on it ([`reims_util::kext_args`]), or copies of an
-//! image given and the OVMF beside it ([`firmware_beside`]). Its disk is a new one or an
-//! existing one (copied, reflinked where the file system can, or used in place). A new disk
-//! needs an installer: one reims-util downloads from Apple (reims_util.rs), before the VM's
-//! directory is made, so a download stopped part way leaves no VM half made, or one given. An
-//! installer is used in place, except a DMG, which qemu-img converts to a raw image in the VM's
-//! directory ([`installer_media`]). A VM's settings name its graphics: reims-vgpu's own device
-//! unless the create chose another.
+//! reims-vgpu's own device where the VM is on it ([`reims_util::kext_args`]), and presenting the
+//! Mac an existing disk's macOS ran on where the image it booted from is beside it
+//! ([`disks_mac`]), or copies of an image given and the OVMF beside it ([`firmware_beside`]).
+//! Its disk is a new one or an existing one (copied, reflinked where the file system can, or used
+//! in place). A new disk needs an installer: one reims-util downloads from Apple (reims_util.rs),
+//! before the VM's directory is made, so a download stopped part way leaves no VM half made, or
+//! one given. An installer is used in place, except a DMG, which qemu-img converts to a raw image
+//! in the VM's directory ([`installer_media`]). A VM's settings name its graphics: reims-vgpu's
+//! own device unless the create chose another.
 
 use crate::host::{Host, Profile};
 use crate::install;
+use crate::opencore::{self, Identity};
 use crate::paths;
 use crate::reims_util::{self, Download};
 use crate::vm::*;
@@ -358,11 +360,12 @@ fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
     Ok(())
 }
 
-/// What a create that gives macOS on an existing disk a new OpenCore image says: the image
-/// presents a Mac of its own (a new serial number, MLB and UUID), so the disk's macOS boots on a
-/// Mac it has not run on, and runs Setup Assistant once at that boot. While Setup Assistant is
-/// open, macOS shuts down at neither the keys nor the power button [`crate::runtime::stop`]
-/// sends, so a stop then ends in a power-off at its timeout.
+/// What a create that gives macOS on an existing disk a new OpenCore image presenting a Mac of
+/// its own says, where no image the disk booted from is beside it ([`disks_mac`]): the image
+/// presents a new serial number, MLB and UUID, so the disk's macOS boots on a Mac it has not run
+/// on, and runs Setup Assistant once at that boot. While Setup Assistant is open, macOS shuts
+/// down at neither the keys nor the power button [`crate::runtime::stop`] sends, so a stop then
+/// ends in a power-off at its timeout.
 /// Measured with a macOS 26.7.2 (25G332) disk on a Radeon 780M host, 2026-11-07: on a new image,
 /// Setup Assistant (`-MiniBuddyYes`) ran from about 10 s after boot, and the guest ignored the
 /// keys and the button for 180 s, and System Events' `shut down` for 120 s, while `sudo shutdown
@@ -371,10 +374,63 @@ fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
 /// shut it down within 20 s. None where the disk is new, or an image is given.
 fn new_mac_note(spec: &Spec) -> Option<&'static str> {
     (matches!(spec.disk, Some(DiskSource::Existing { .. })) && spec.opencore.is_none()).then_some(
-        "macOS on this disk will boot on a new Mac (a new serial number and UUID), so it opens \
-         Setup Assistant once: finish it in the VM's window, since until then it does not shut \
-         down when asked. --opencore with the image the disk booted from keeps its Mac",
+        "macOS on this disk will boot on a new Mac (a new serial number and UUID), as the \
+         OpenCore image it booted from is not beside it (opencore.qcow2), so it opens Setup \
+         Assistant once: finish it in the VM's window, since until then it does not shut down \
+         when asked. --opencore with the image the disk booted from keeps its Mac",
     )
+}
+
+/// The OpenCore image beside an existing disk, as a VM's directory holds them, reims-ctl's or one
+/// reims-util made an image into: `opencore.qcow2`, else `opencore.img`, in the disk's directory.
+fn image_beside(disk: &Path) -> Option<PathBuf> {
+    let dir = disk.parent()?;
+    ["opencore.qcow2", "opencore.img"]
+        .into_iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+}
+
+/// The Mac macOS on an existing disk ran on, where the create is given no image: the one the
+/// image beside the disk presents ([`image_beside`]), with that image. The VM's image is made to
+/// present it, so the disk's macOS boots on the Mac it knows and opens no Setup Assistant, which
+/// would hold up its shutdowns ([`new_mac_note`]). `progress` hears why an image beside the disk
+/// is not taken.
+fn disks_mac(spec: &Spec, progress: &mut dyn FnMut(&str)) -> Option<(PathBuf, Identity)> {
+    let Some(DiskSource::Existing { path, .. }) = &spec.disk else {
+        return None;
+    };
+    if spec.opencore.is_some() {
+        return None;
+    }
+    let image = image_beside(path)?;
+    match ImageFormat::detect(&image)
+        .and_then(|f| opencore::Config::read(&image, f))
+        .and_then(|c| c.identity())
+    {
+        Ok(id) => Some((image, id)),
+        Err(e) => {
+            progress(&format!(
+                "could not read the Mac {} presents: {e:#}",
+                paths::tilde(&image)
+            ));
+            None
+        }
+    }
+}
+
+/// The network card address a Mac's ROM is (12 hex digits), as a Mac's ROM is its first network
+/// card's address: none for a multicast address, which no card has.
+fn mac_of_rom(rom: &str) -> Option<String> {
+    let b = (0..6)
+        .map(|i| u8::from_str_radix(rom.get(i * 2..i * 2 + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    (rom.len() == 12 && (b[0] & 1) == 0).then(|| {
+        b.iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    })
 }
 
 /// Makes an x86-64 VM on `graphics`, which its settings save by name.
@@ -409,15 +465,35 @@ fn make_q35(
         None => bail!("give the VM a disk: a new one's size, or an existing image"),
     };
 
-    // OpenCore and OVMF: made for the VM, or copies of what was given. A Mac's ROM is its first
-    // network card's address, so a made image's is the VM's.
-    let mac = spec.mac.clone().unwrap_or_else(random_mac);
+    // OpenCore and OVMF: made for the VM, or copies of what was given. A made image presents the
+    // Mac an existing disk's macOS ran on where the image it booted from is beside it, else a Mac
+    // of its own. A Mac's ROM is its first network card's address: a new Mac's ROM is the VM's
+    // card's, and a VM presenting the disk's Mac takes that Mac's ROM for its card, unless a MAC
+    // was given.
+    let kept = disks_mac(spec, progress);
+    let mac = spec
+        .mac
+        .clone()
+        .or_else(|| kept.as_ref().and_then(|(_, id)| mac_of_rom(&id.rom)))
+        .unwrap_or_else(random_mac);
     let (oc_name, oc_format) = match &spec.opencore {
         None => {
             let kexts = reims_util::kext_args(graphics)?;
-            reims_util::opencore(&dir.join("opencore.qcow2"), &mac, macos, &kexts, progress)?;
-            if let Some(note) = new_mac_note(spec) {
-                progress(note);
+            let image = dir.join("opencore.qcow2");
+            match &kept {
+                Some((beside, id)) => {
+                    progress(&format!(
+                        "presenting the Mac macOS on this disk ran on, which {} presents",
+                        paths::tilde(beside)
+                    ));
+                    reims_util::opencore_presenting(&image, id, &kexts, progress)?;
+                }
+                None => {
+                    reims_util::opencore(&image, &mac, macos, &kexts, progress)?;
+                    if let Some(note) = new_mac_note(spec) {
+                        progress(note);
+                    }
+                }
             }
             (PathBuf::from("opencore.qcow2"), ImageFormat::Qcow2)
         }
@@ -682,6 +758,115 @@ mod tests {
         );
         let new = Some(DiskSource::New { size_mib: 131_072 });
         assert_eq!(new_mac_note(&spec(new, None)), None);
+    }
+
+    /// A create given an existing disk and no image makes the VM an image presenting the Mac the
+    /// image beside the disk presents, the one its macOS ran on, with OVMF beside it, and gives
+    /// the VM's network card that Mac's ROM: macOS on the disk sees no new Mac, so it opens no
+    /// Setup Assistant, which held up every stop (`new_mac_note`). Where no image is beside the
+    /// disk, the image presents a Mac of its own, with the VM's card as its ROM, and the create
+    /// says what that does. A MAC given is the VM's either way.
+    #[test]
+    fn a_disk_keeps_the_mac_of_the_image_beside_it() {
+        use crate::host::{Arch, Os};
+        use crate::opencore::tests::{image, plist, qcow2};
+        use std::os::unix::fs::PermissionsExt;
+        let env = crate::testenv::Env::new("create-disks-mac");
+        let args = env.root.join("args");
+        let util = env.root.join("reims-util");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\n\
+             while [ \"$1\" != -o ]; do shift; done\necho made > \"$2\"\n\
+             echo '{{\"event\":\"done\",\"result\":{{}}}}'\n",
+            args = args.display(),
+        );
+        std::fs::write(&util, script).unwrap();
+        std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
+        env.set("REIMS_CTL_UTIL", &util);
+        let host = Host {
+            os: Os::Linux,
+            arch: Arch::X86_64,
+        };
+        // A VM's directory as another VM left it: its disk, and the image it booted from.
+        let old = env.root.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("disk.qcow2"), b"a disk").unwrap();
+        std::fs::write(
+            old.join("opencore.qcow2"),
+            qcow2(&image(plist("").as_bytes())),
+        )
+        .unwrap();
+        let alone = env.root.join("alone");
+        std::fs::create_dir_all(&alone).unwrap();
+        std::fs::write(alone.join("disk.img"), b"a disk").unwrap();
+        let create_from = |name: &str, disk: PathBuf, mac: Option<&str>| {
+            let mut spec = Spec::new(name);
+            spec.dir = Some(env.root.join("vms").join(name));
+            spec.disk = Some(DiskSource::Existing {
+                path: disk,
+                mode: ImportMode::Copy,
+            });
+            spec.mac = mac.map(String::from);
+            let mut said = Vec::new();
+            let vm = create(spec, host, &mut |s| said.push(s.to_string())).unwrap();
+            let given = std::fs::read_to_string(&args).unwrap();
+            let given: Vec<String> = given.lines().map(String::from).collect();
+            (vm, given, said.join("\n"))
+        };
+        let value = |given: &[String], flag: &str| {
+            given
+                .windows(2)
+                .find(|w| w[0] == flag)
+                .map(|w| w[1].clone())
+        };
+
+        let (vm, given, said) = create_from("kept", old.join("disk.qcow2"), None);
+        assert_eq!(value(&given, "--model").as_deref(), Some("iMac20,1"));
+        assert_eq!(value(&given, "--serial").as_deref(), Some("C02D40VEPN5T"));
+        assert_eq!(value(&given, "--mlb").as_deref(), Some("C02029100GU0000JA"));
+        assert_eq!(
+            value(&given, "--uuid").as_deref(),
+            Some("4A2B8C1D-0E3F-4A5B-8C6D-7E8F9A0B1C2D")
+        );
+        assert_eq!(value(&given, "--rom").as_deref(), Some("525400010203"));
+        assert!(!given.iter().any(|a| a == "--no-ovmf"), "{given:?}");
+        assert_eq!(vm.config.network.mac, "52:54:00:01:02:03");
+        assert!(!said.contains("Setup Assistant"), "{said}");
+        let q = vm.config.q35.as_ref().unwrap();
+        assert_eq!(q.opencore, Path::new("opencore.qcow2"));
+        assert!(vm.dir.join("opencore.qcow2").is_file());
+        // The image beside the disk is read, not used or changed.
+        assert_eq!(
+            std::fs::read(old.join("opencore.qcow2")).unwrap(),
+            qcow2(&image(plist("").as_bytes()))
+        );
+
+        let (vm, given, _) =
+            create_from("given", old.join("disk.qcow2"), Some("52:54:00:aa:bb:cc"));
+        assert_eq!(value(&given, "--serial").as_deref(), Some("C02D40VEPN5T"));
+        assert_eq!(value(&given, "--rom").as_deref(), Some("525400010203"));
+        assert_eq!(vm.config.network.mac, "52:54:00:aa:bb:cc");
+
+        let (vm, given, said) = create_from("new", alone.join("disk.img"), None);
+        assert_eq!(value(&given, "--serial"), None);
+        assert_eq!(value(&given, "--rom"), Some(vm.config.network.mac.clone()));
+        assert!(said.contains("Setup Assistant"), "{said}");
+    }
+
+    #[test]
+    fn a_roms_network_card_is_its_six_bytes_unless_multicast() {
+        assert_eq!(
+            mac_of_rom("525400010203").as_deref(),
+            Some("52:54:00:01:02:03")
+        );
+        assert_eq!(
+            mac_of_rom("A4B1C2D3E4F5").as_deref(),
+            Some("a4:b1:c2:d3:e4:f5")
+        );
+        assert_eq!(mac_of_rom("015400010203"), None);
+        assert_eq!(mac_of_rom("5254000102"), None);
+        assert_eq!(mac_of_rom("52540001020304"), None);
+        assert_eq!(mac_of_rom("52540001020G"), None);
     }
 
     #[test]

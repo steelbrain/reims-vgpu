@@ -78,10 +78,11 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    installers are ejected), and an interrupted one picks up where it stopped.
 
    Already have macOS on a disk? `--disk` uses it (copied, reflinked where the file system can, or
-   in place), and `--opencore` the OpenCore image it booted with, with OVMF beside it, which keeps
-   its Mac identity. Without `--opencore` the VM is a new Mac to that macOS, so it opens Setup
-   Assistant once at its first boot; finish it in the window, since it won't shut down until you
-   do. `--installer` takes an installer of your own.
+   in place). Where the OpenCore image it booted with sits beside it as `opencore.qcow2`, as in
+   another VM's folder, the VM's new image presents that same Mac; `--opencore` copies an image of
+   yours instead, with OVMF beside it, which keeps its Mac too. With neither, the VM is a new Mac
+   to that macOS, so it opens Setup Assistant once at its first boot; finish it in the window,
+   since it won't shut down until you do. `--installer` takes an installer of your own.
 
 ### Day to day
 
