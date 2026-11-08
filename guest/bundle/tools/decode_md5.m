@@ -1,16 +1,25 @@
 // decode_md5: decodes Annex B H.264 and HEVC files with VideoToolbox's hardware decoder, hashes
 // every decoded frame as the CPU reads it, and compares the hashes with a reference made off the
 // device (ffmpeg's MD5 of each frame's NV12 or P010 planes, one a line, beside the stream).
-//   decode_md5 [-l LOOPS] FILE...
+//   decode_md5 [-l LOOPS] [-f] FILE...
 //     FILE    NAME.264 (H.264) or NAME.265 (HEVC); its reference is NAME.md5 in the same
 //             directory, the frames' MD5s in any order.
 //     -l N    after the hashed pass, decodes the stream N more times without reading the frames on
 //             the CPU, and prints the frames decoded a second (default 0, none).
+//     -f      decodes every unit under one format description, of the stream's first parameter
+//             sets, the later ones dropped with the rest: what a client that misses a change of
+//             the sets hands VideoToolbox.
+// The stream's parameter sets go in format descriptions, never in the samples: a unit after a
+// VPS, SPS or PPS unlike the one before it of its kind is decoded under a new description of the
+// sets then current. The session takes it where VTDecompressionSessionCanAcceptFormatDescription
+// says it can; otherwise its frames are waited for and a new session is made with it.
 // A frame's MD5 is over its visible planes as ffmpeg writes them: the luma rows, then the
 // interleaved chroma rows, each cropped to the frame's width (two bytes a sample for 10-bit).
 // The comparison is of the sorted lists: the decoder's output order is not the file's order.
 // One line a file: "decode_md5: NAME OK frames=N lock_ms_mean=M [fps=F]", "decode_md5: NAME FAIL
-// why", or "decode_md5: NAME SKIP why" where the system has no hardware decoder for the codec.
+// why", or "decode_md5: NAME SKIP why" where the system has no hardware decoder for the codec. A
+// stream of more than one format description says so on its line: "formats=F sessions=S", the
+// descriptions and the sessions its hashed pass made.
 // A FAIL of the hashed pass's frames names them, by the access unit each was decoded from (its
 // place in the file, from 0, which the tool stamps as its presentation time in 1/30 s): on the
 // line, "wrong=U,..." (a frame whose MD5 is none of the reference's, or one more of an MD5 than
@@ -220,26 +229,10 @@ static NSArray<NSData *> *nalUnits(NSData *file)
 	return out;
 }
 
-// The stream's format, from its first parameter sets, and its access units as samples of
-// 4-byte-length NAL units. H.264: a slice whose first_mb_in_slice is 0, or an SEI, SPS, PPS or
-// AUD after a slice, starts an access unit, and only slices go in the samples. HEVC: a VCL unit
-// with first_slice_segment_in_pic_flag, or a parameter set, AUD, prefix SEI or reserved
-// non-VCL unit after a VCL one, starts an access unit, and parameter sets, AUDs and end units
-// stay out of the samples.
-static CMVideoFormatDescriptionRef split(NSArray<NSData *> *nals, BOOL hevc,
-                                         NSMutableArray<NSData *> *units)
+// A format description of the parameter sets `vps` (HEVC alone), `sps` and `pps`; NULL where the
+// system takes none of them.
+static CMVideoFormatDescriptionRef describe(NSData *vps, NSData *sps, NSData *pps, BOOL hevc)
 {
-	NSData *vps = nil, *sps = nil, *pps = nil;
-	for (NSData *d in nals) {
-		uint8_t b0 = ((const uint8_t *)d.bytes)[0];
-		int t = hevc ? (b0 >> 1) & 0x3f : b0 & 0x1f;
-		if (hevc ? t == 32 : NO)
-			vps = vps ?: d;
-		if (t == (hevc ? 33 : 7))
-			sps = sps ?: d;
-		if (t == (hevc ? 34 : 8))
-			pps = pps ?: d;
-	}
 	if (sps == nil || pps == nil || (hevc && vps == nil))
 		return NULL;
 	CMVideoFormatDescriptionRef fd = NULL;
@@ -253,33 +246,83 @@ static CMVideoFormatDescriptionRef split(NSArray<NSData *> *nals, BOOL hevc,
 		size_t sizes[2] = {sps.length, pps.length};
 		st = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, sets, sizes, 4, &fd);
 	}
-	if (st != noErr)
-		return NULL;
+	return st == noErr ? fd : NULL;
+}
+
+// The stream's access units as samples of 4-byte-length NAL units, into `units`, and the format
+// description each is decoded under, into `formats` (one an entry of `formats` names by its
+// index, `unitFormats`). H.264: a slice whose first_mb_in_slice is 0, or an SEI, SPS, PPS or AUD
+// after a slice, starts an access unit, and only slices go in the samples. HEVC: a VCL unit with
+// first_slice_segment_in_pic_flag, or a parameter set, AUD, prefix SEI or reserved non-VCL unit
+// after a VCL one, starts an access unit, and parameter sets, AUDs and end units stay out of the
+// samples. A unit's description is of the latest VPS, SPS and PPS before it; a set unlike the one
+// before it of its kind makes a new one for the units after it. With `firstOnly`, every unit is
+// under one description, of the stream's first sets. False where the system takes no description
+// a unit needs.
+static BOOL split(NSArray<NSData *> *nals, BOOL hevc, BOOL firstOnly, NSMutableArray<NSData *> *units,
+                  NSMutableArray *formats, NSMutableArray<NSNumber *> *unitFormats)
+{
+	NSData *set[3] = {nil, nil, nil}; // VPS, SPS, PPS: the latest of each
+	BOOL changed = YES;
+	if (firstOnly) {
+		for (NSData *d in nals) {
+			uint8_t b0 = ((const uint8_t *)d.bytes)[0];
+			int t = hevc ? (b0 >> 1) & 0x3f : b0 & 0x1f;
+			int k = hevc ? (t >= 32 && t <= 34 ? t - 32 : -1) : (t == 7 ? 1 : t == 8 ? 2 : -1);
+			if (k >= 0 && set[k] == nil)
+				set[k] = d;
+		}
+		CMVideoFormatDescriptionRef fd = describe(set[0], set[1], set[2], hevc);
+		if (fd == NULL)
+			return NO;
+		[formats addObject:(__bridge_transfer id)fd];
+		changed = NO;
+	}
 	NSMutableData *cur = nil;
 	BOOL picture = NO;
+	NSUInteger curFormat = 0;
 	for (NSData *d in nals) {
 		const uint8_t *b = d.bytes;
 		BOOL vcl, first, starts, keep;
+		int kind;
 		if (hevc) {
 			int t = (b[0] >> 1) & 0x3f;
 			vcl = t < 32;
 			first = vcl && d.length > 2 && (b[2] & 0x80);
 			starts = first || (t >= 32 && t <= 35) || t == 39 || (t >= 41 && t <= 44) || (t >= 48 && t <= 55);
 			keep = !(t >= 32 && t <= 37);
+			kind = t >= 32 && t <= 34 ? t - 32 : -1;
 		} else {
 			int t = b[0] & 0x1f;
 			vcl = t == 1 || t == 5;
 			first = vcl && d.length > 1 && (b[1] & 0x80);
 			starts = first || (t >= 6 && t <= 9);
 			keep = vcl;
+			kind = t == 7 ? 1 : t == 8 ? 2 : -1;
 		}
 		if (picture && starts) {
 			[units addObject:cur];
+			[unitFormats addObject:@(curFormat)];
 			cur = nil;
 			picture = NO;
 		}
+		if (kind >= 0 && !firstOnly && ![set[kind] isEqualToData:d]) {
+			set[kind] = d;
+			changed = YES;
+		}
 		if (!keep)
 			continue;
+		// A unit is under the description of the sets current at its first VCL unit.
+		if (vcl && !picture) {
+			if (changed) {
+				CMVideoFormatDescriptionRef fd = describe(set[0], set[1], set[2], hevc);
+				if (fd == NULL)
+					return NO;
+				[formats addObject:(__bridge_transfer id)fd];
+				changed = NO;
+			}
+			curFormat = formats.count - 1;
+		}
 		if (cur == nil)
 			cur = [NSMutableData data];
 		uint32_t len = CFSwapInt32HostToBig((uint32_t)d.length);
@@ -287,9 +330,11 @@ static CMVideoFormatDescriptionRef split(NSArray<NSData *> *nals, BOOL hevc,
 		[cur appendData:d];
 		picture = picture || vcl;
 	}
-	if (cur != nil && picture)
+	if (cur != nil && picture) {
 		[units addObject:cur];
-	return fd;
+		[unitFormats addObject:@(curFormat)];
+	}
+	return formats.count > 0 && units.count > 0;
 }
 
 // The pixel format the frames are asked in, the one ffmpeg's reference is of: 10-bit 4:2:0 for an
@@ -307,24 +352,58 @@ static OSType outputFormat(NSArray<NSData *> *nals, BOOL hevc)
 	return kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 }
 
-// Decodes every unit LOOPS times; returns the pass's wall time in ms, or a negative OSStatus.
-static double decodeAll(CMVideoFormatDescriptionRef fd, NSArray<NSData *> *units, int loops,
-                        OSType format, DecodePass *pass)
+// A decompression session of `fd` whose frames go to `pass`, into `out`; its OSStatus.
+static OSStatus openSession(CMVideoFormatDescriptionRef fd, OSType format, DecodePass *pass,
+                            VTDecompressionSessionRef *out)
 {
 	NSDictionary *attrs = @{(__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(format)};
 	NSDictionary *spec = @{
 		(__bridge NSString *)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES
 	};
 	VTDecompressionOutputCallbackRecord cb = {decoded, (__bridge void *)pass};
+	return VTDecompressionSessionCreate(NULL, fd, (__bridge CFDictionaryRef)spec,
+	                                    (__bridge CFDictionaryRef)attrs, &cb, out);
+}
+
+// Ends `session` once its frames are out.
+static void closeSession(VTDecompressionSessionRef session)
+{
+	VTDecompressionSessionWaitForAsynchronousFrames(session);
+	VTDecompressionSessionInvalidate(session);
+	CFRelease(session);
+}
+
+// Decodes every unit LOOPS times, each under its format description (split): a session takes a
+// new description where it says it can, else a new session is made for it once the last one's
+// frames are out. Returns the pass's wall time in ms, or a negative OSStatus; the sessions made
+// go in `sessions`.
+static double decodeAll(NSArray *formats, NSArray<NSData *> *units, NSArray<NSNumber *> *unitFormats,
+                        int loops, OSType format, DecodePass *pass, int *sessions)
+{
+	CMVideoFormatDescriptionRef current = (__bridge CMVideoFormatDescriptionRef)formats[0];
 	VTDecompressionSessionRef session = NULL;
-	OSStatus st = VTDecompressionSessionCreate(NULL, fd, (__bridge CFDictionaryRef)spec,
-	                                           (__bridge CFDictionaryRef)attrs, &cb, &session);
+	OSStatus st = openSession(current, format, pass, &session);
 	if (st != noErr)
 		return st < 0 ? st : -st;
+	*sessions = 1;
 	double t0 = nowMs();
 	int64_t i = 0;
 	for (int loop = 0; loop < loops && st == noErr; loop++) {
-		for (NSData *u in units) {
+		for (NSUInteger k = 0; k < units.count; k++) {
+			NSData *u = units[k];
+			CMVideoFormatDescriptionRef fd =
+			    (__bridge CMVideoFormatDescriptionRef)formats[unitFormats[k].unsignedIntegerValue];
+			if (fd != current) {
+				if (!VTDecompressionSessionCanAcceptFormatDescription(session, fd)) {
+					closeSession(session);
+					session = NULL;
+					st = openSession(fd, format, pass, &session);
+					if (st != noErr)
+						break;
+					++*sessions;
+				}
+				current = fd;
+			}
 			CMBlockBufferRef bb = NULL;
 			CMBlockBufferCreateWithMemoryBlock(NULL, NULL, u.length, NULL, NULL, 0, u.length,
 			                                   kCMBlockBufferAssureMemoryNowFlag, &bb);
@@ -341,16 +420,15 @@ static double decodeAll(CMVideoFormatDescriptionRef fd, NSArray<NSData *> *units
 				break;
 		}
 	}
-	VTDecompressionSessionWaitForAsynchronousFrames(session);
+	if (session != NULL)
+		closeSession(session);
 	double ms = nowMs() - t0;
-	VTDecompressionSessionInvalidate(session);
-	CFRelease(session);
 	if (st != noErr)
 		return st < 0 ? st : -st;
 	return ms;
 }
 
-static BOOL checkFile(NSString *path, int loops)
+static BOOL checkFile(NSString *path, int loops, BOOL firstOnly)
 {
 	NSString *name = path.lastPathComponent.stringByDeletingPathExtension;
 	NSString *ext = path.pathExtension.lowercaseString;
@@ -374,10 +452,11 @@ static BOOL checkFile(NSString *path, int loops)
 		if (line.length == 32)
 			[ref addObject:line.lowercaseString];
 	NSMutableArray<NSData *> *units = [NSMutableArray array];
+	NSMutableArray *formats = [NSMutableArray array];
+	NSMutableArray<NSNumber *> *unitFormats = [NSMutableArray array];
 	NSArray<NSData *> *nals = nalUnits(file);
 	OSType format = outputFormat(nals, hevc);
-	CMVideoFormatDescriptionRef fd = split(nals, hevc, units);
-	if (fd == NULL) {
+	if (!split(nals, hevc, firstOnly, units, formats, unitFormats)) {
 		printf("decode_md5: %s FAIL no parameter sets the system takes\n", n);
 		return NO;
 	}
@@ -386,10 +465,10 @@ static BOOL checkFile(NSString *path, int loops)
 	pass.md5s = [NSMutableArray array];
 	pass.outputs = [NSMutableArray array];
 	pass.failures = [NSMutableArray array];
-	double ms = decodeAll(fd, units, 1, format, pass);
+	int sessions = 0;
+	double ms = decodeAll(formats, units, unitFormats, 1, format, pass, &sessions);
 	if (ms < 0) {
 		printf("decode_md5: %s FAIL decoding: OSStatus %d\n", n, (int)ms);
-		CFRelease(fd);
 		return NO;
 	}
 	[ref sortUsingSelector:@selector(compare:)];
@@ -415,9 +494,12 @@ static BOOL checkFile(NSString *path, int loops)
 		                   pass.frames, (unsigned long)ref.count, common, pass.errors, fourcc(pass.format)];
 		nameFrames(n, ref, units, hevc, pass, line, detail);
 	}
+	if (formats.count > 1)
+		[line appendFormat:@" formats=%lu sessions=%d", (unsigned long)formats.count, sessions];
 	if (ok && loops > 0) {
 		DecodePass *timed = [DecodePass new];
-		double tms = decodeAll(fd, units, loops, format, timed);
+		int timedSessions = 0;
+		double tms = decodeAll(formats, units, unitFormats, loops, format, timed, &timedSessions);
 		if (tms > 0 && timed.errors == 0)
 			[line appendFormat:@" fps=%.1f timed_frames=%d", timed.frames * 1000.0 / tms, timed.frames];
 		else {
@@ -429,7 +511,6 @@ static BOOL checkFile(NSString *path, int loops)
 	printf("%s\n", line.UTF8String);
 	for (NSUInteger i = 0; i < detail.count && i < 100; i++)
 		printf("%s\n", detail[i].UTF8String);
-	CFRelease(fd);
 	return ok;
 }
 
@@ -437,18 +518,21 @@ int main(int argc, char **argv)
 {
 	@autoreleasepool {
 		int c, loops = 0;
-		while ((c = getopt(argc, argv, "l:")) != -1) {
+		BOOL firstOnly = NO;
+		while ((c = getopt(argc, argv, "l:f")) != -1) {
 			if (c == 'l')
 				loops = atoi(optarg);
+			else if (c == 'f')
+				firstOnly = YES;
 			else {
-				fprintf(stderr, "usage: decode_md5 [-l LOOPS] FILE...\n");
+				fprintf(stderr, "usage: decode_md5 [-l LOOPS] [-f] FILE...\n");
 				return 2;
 			}
 		}
 		setvbuf(stdout, NULL, _IOLBF, 0);
 		BOOL ok = YES;
 		for (int i = optind; i < argc; i++)
-			ok = checkFile(@(argv[i]), loops) && ok;
+			ok = checkFile(@(argv[i]), loops, firstOnly) && ok;
 		return ok ? 0 : 1;
 	}
 }
