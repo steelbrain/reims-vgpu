@@ -8,6 +8,7 @@ use super::display::{Display, Error};
 use super::ffi;
 use super::frame::Frame;
 use super::surface::{Rect, Surface, SurfaceFormat, SurfacePool, end_context};
+use super::target::TargetFor;
 use super::wait::{self, Deadline};
 use crate::codec::hevc::{
     self, Accelerator, Decoder, NalFormat, Output, OutputOrder, PictureParams, RpsMembership,
@@ -84,11 +85,27 @@ impl HevcDecoder {
     /// come out (see [`crate::codec::hevc::Decoder::decode`]). The decode may
     /// still be running on the GPU: a frame's readback waits for it.
     pub fn decode(&mut self, sample: &[u8], id: u64) -> Result<Vec<Frame>, Error> {
+        self.decode_into(sample, id, None)
+    }
+
+    /// [`Self::decode`], the access unit's picture decoded into the target `target_for` gives
+    /// where it gives one of the picture's shape (`super::target`): that picture's frame is then
+    /// in the target ([`Frame::is_in_target`]). A frame of another access unit, or one whose
+    /// target was not given or not taken, is in a surface of the decoder's own.
+    pub fn decode_into(
+        &mut self,
+        sample: &[u8],
+        id: u64,
+        target_for: Option<TargetFor>,
+    ) -> Result<Vec<Frame>, Error> {
         // One deadline for the call's driver calls and its frames' read
         // backs (`super::wait`).
         let deadline = Deadline::default();
-        let outputs = wait::by(&deadline, || self.inner.decode(sample, id))?;
-        Ok(outputs
+        self.inner.accelerator_mut().target_for = target_for;
+        let outputs = wait::by(&deadline, || self.inner.decode(sample, id));
+        // A target not asked for (an access unit of no picture) is let go of here.
+        self.inner.accelerator_mut().target_for = None;
+        Ok(outputs?
             .into_iter()
             .map(|output| frame_from_output(output, &deadline))
             .collect())
@@ -149,6 +166,8 @@ fn frame_from_output(output: Output<Surface>, deadline: &Deadline) -> Frame {
 struct VaHevc {
     display: Display,
     session: Option<Session>,
+    /// What gives the decode in hand its picture's target, taken as the picture is made.
+    target_for: Option<TargetFor>,
 }
 
 /// What one SPS's pictures are decoded with.
@@ -173,6 +192,7 @@ impl VaHevc {
         Self {
             display: display.clone_ref(),
             session: None,
+            target_for: None,
         }
     }
 
@@ -265,8 +285,18 @@ impl Accelerator for VaHevc {
         Ok(())
     }
 
+    /// The decode's target where it was handed one of the picture's shape, else a surface of the
+    /// pool.
     fn new_picture(&mut self) -> Result<Surface, Error> {
-        self.session()?.pool.get()
+        let target_for = self.target_for.take();
+        let pool = &self.session()?.pool;
+        let lent = target_for
+            .and_then(|target_for| target_for(pool.shape()))
+            .and_then(|target| pool.lend_target(target));
+        match lent {
+            Some(surface) => Ok(surface),
+            None => pool.get(),
+        }
     }
 
     fn decode_picture(

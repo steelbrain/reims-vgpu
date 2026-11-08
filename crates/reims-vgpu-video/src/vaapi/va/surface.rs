@@ -16,12 +16,14 @@ use std::time::Duration;
 use crate::core::runtime::MonoTime;
 use crate::core::sync::{Mutex, MutexGuard};
 
-use super::caps::Context;
+use super::caps::{Config, Context, Entrypoint, Profile};
 use super::display::{Display, Error, check};
 use super::export::{self, SurfaceExport};
 use super::ffi;
 use super::image::{self, Image};
 use super::readback::{self, Mappings, ReadbackTimes, ReadbackWay, Staging, copy_rect, copy_row};
+use super::target::{Target, TargetFormat, TargetShape};
+use super::vpp_ffi as vpp;
 use super::wait::{self, Unfinished, Work};
 
 /// The most surfaces a pool makes. A DPB holds 16 frames at most (A.3.1),
@@ -98,6 +100,9 @@ struct PoolInner {
     /// The image [`Surface::copy_to`] copies through, made on first use:
     /// `None` until then, `Some(None)` where the driver makes none.
     copy_image: Mutex<Option<Option<Image>>>,
+    /// The video-processing context [`Surface::copy_to`] copies a target through, made on first
+    /// use: `None` until then, `Some(None)` where the driver makes none.
+    processing: Mutex<Option<Option<Context>>>,
     /// The work the GPU did not finish by its deadline, once it has not
     /// (module docs).
     stalled: OnceLock<String>,
@@ -126,6 +131,8 @@ enum Readback {
 
 impl Drop for PoolInner {
     fn drop(&mut self) {
+        // The processing context goes before the surfaces it wrote into.
+        drop(self.processing.get_mut().take());
         let mut all = std::mem::take(&mut self.state.get_mut().all);
         if !all.is_empty() {
             let count = i32::try_from(all.len()).unwrap_or(0);
@@ -160,6 +167,7 @@ impl SurfacePool {
             readback: Mutex::new(Readback::Unknown),
             times: Mutex::new(ReadbackTimes::default()),
             copy_image: Mutex::new(None),
+            processing: Mutex::new(None),
             stalled: OnceLock::new(),
             exports: Mutex::new(Vec::new()),
         });
@@ -198,7 +206,32 @@ impl SurfacePool {
         Ok(Surface {
             id,
             pool: self.inner.clone(),
+            target: None,
         })
+    }
+
+    /// `target` lent as a surface of the pool, a decode's picture: `None` where it is not of the
+    /// pool's display, format and size, or the pool is stalled.
+    pub(crate) fn lend_target(&self, target: Target) -> Option<Surface> {
+        let inner = &self.inner;
+        let shape = target.shape();
+        let fits = target.is_on(&inner.display)
+            && shape.format == TargetFormat::of(inner.format)
+            && shape.coded == (inner.width, inner.height)
+            && inner.stalled().is_ok();
+        fits.then(|| Surface {
+            id: target.id(),
+            pool: Arc::clone(inner),
+            target: Some(target),
+        })
+    }
+
+    /// The format and coded size of its surfaces, which a decode's target is asked for.
+    pub(crate) fn shape(&self) -> TargetShape {
+        TargetShape {
+            format: TargetFormat::of(self.inner.format),
+            coded: (self.inner.width, self.inner.height),
+        }
     }
 }
 
@@ -284,15 +317,29 @@ fn create_surfaces(
     Ok(ids)
 }
 
-/// A surface on loan from its pool, back in the pool when dropped.
+/// A surface on loan from its pool, back in the pool when dropped; or a target over the caller's
+/// memory a decode was handed ([`SurfacePool::lend_target`]), which it holds, as the pool's
+/// surfaces are held, in the pool's name.
 pub(crate) struct Surface {
     id: ffi::VASurfaceID,
     pool: Arc<PoolInner>,
+    /// The target the surface is, where it is one.
+    target: Option<Target>,
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        self.pool.state.lock().free.push(self.id);
+        match self.target.take() {
+            None => self.pool.state.lock().free.push(self.id),
+            // A target of a stalled pool is kept, with its memory, until the GPU is done with it.
+            Some(target) if self.pool.stalled.get().is_some() => wait::keep(
+                &self.pool.display,
+                "a stalled decoder's target",
+                vec![Work::Surface(self.id)],
+                target,
+            ),
+            Some(_) => {}
+        }
     }
 }
 
@@ -435,6 +482,11 @@ impl Drop for SurfaceReadBack<'_> {
 impl Surface {
     pub(crate) fn id(&self) -> ffi::VASurfaceID {
         self.id
+    }
+
+    /// The target over the caller's memory the surface is, where it is one.
+    pub(crate) fn target(&self) -> Option<&Target> {
+        self.target.as_ref()
     }
 
     /// What the surface holds.
@@ -737,12 +789,76 @@ impl Surface {
     /// through an image of the pool's format: `vaGetImage`, then
     /// `vaPutImage`. `false`, with nothing copied, where the driver makes no
     /// such image.
+    ///
+    /// A target over the caller's memory is copied by one video-processing run instead, which
+    /// reads it on the GPU: the driver's CPU map of an import may fault (`super::target`), and the
+    /// caller may have written over the picture since (the copy then holds what the memory holds).
     pub(crate) fn copy_to(&self, to: &Surface) -> Result<bool, Error> {
         if !Arc::ptr_eq(&self.pool, &to.pool) {
             return Err(Error::Unsupported("a copy between pools".into()));
         }
-        let copied = self.copy_within_pool(to);
+        let copied = match self.target {
+            Some(_) => self.copy_by_processing(to),
+            None => self.copy_within_pool(to),
+        };
         self.stalled_if(copied)
+    }
+
+    /// [`Surface::copy_to`] of a target, by a video-processing run on the pool's context for it,
+    /// made at its first copy; `false` where the driver makes no such context.
+    fn copy_by_processing(&self, to: &Surface) -> Result<bool, Error> {
+        self.sync()?;
+        let pool = &self.pool;
+        let mut processing = pool.processing.lock();
+        let context = match &mut *processing {
+            Some(context) => context,
+            None => {
+                let made = Config::new(
+                    &pool.display,
+                    Profile::NONE,
+                    Entrypoint::VIDEO_PROC,
+                    &mut [],
+                )
+                .and_then(|config| {
+                    Context::new(&pool.display, config, pool.width, pool.height, &mut [])
+                });
+                match made {
+                    Ok(context) => processing.insert(Some(context)),
+                    Err(Error::Stalled(what)) => return Err(Error::Stalled(what)),
+                    Err(_) => processing.insert(None),
+                }
+            }
+        };
+        let Some(context) = context else {
+            return Ok(false);
+        };
+        let (Ok(width), Ok(height)) = (u16::try_from(pool.width), u16::try_from(pool.height))
+        else {
+            return Ok(false);
+        };
+        let whole = vpp::VARectangle {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut params = vpp::VAProcPipelineParameterBuffer::zeroed();
+        params.surface = self.id;
+        params.surface_region = &whole;
+        params.output_region = &whole;
+        // The same standard and range both sides: a plain copy.
+        params.surface_color_standard = vpp::VAProcColorStandardBT709;
+        params.output_color_standard = vpp::VAProcColorStandardBT709;
+        let buffer = super::buffer::Buffer::with_value(
+            &pool.display,
+            context.id,
+            vpp::VAProcPipelineParameterBufferType,
+            &params,
+        )?;
+        super::buffer::render_picture(&pool.display, context.id, to.id, &[&[&buffer]])?;
+        drop(processing);
+        to.sync()?;
+        Ok(true)
     }
 
     /// [`Surface::copy_to`] of a surface of the same pool.

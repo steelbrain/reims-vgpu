@@ -241,6 +241,11 @@ impl Display {
         }
     }
 
+    /// Whether `other` is a handle to this display.
+    pub(crate) fn is_same(&self, other: &Display) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// The runtime it was opened on.
     pub fn runtime(&self) -> &Arc<dyn Runtime> {
         &self.inner.runtime

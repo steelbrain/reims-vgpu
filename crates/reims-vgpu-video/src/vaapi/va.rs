@@ -28,6 +28,7 @@ mod readback;
 #[cfg(test)]
 mod spin;
 mod surface;
+mod target;
 #[cfg(test)]
 mod target_probe;
 mod vpp_ffi;
@@ -50,3 +51,4 @@ pub use hevc::HevcDecoder;
 pub use import_check::{ImportWrite, ImportWrites};
 pub use libva::LoadError;
 pub use readback::{ReadbackTimes, ReadbackWay, read_back_by};
+pub use target::{Target, TargetFor, TargetFormat, TargetPlane, TargetShape};

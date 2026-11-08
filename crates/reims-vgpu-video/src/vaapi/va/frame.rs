@@ -110,6 +110,13 @@ impl Frame {
         self.surface.readback_times()
     }
 
+    /// Whether the frame was decoded into the target its decode was handed
+    /// (`H264Decoder::decode_into`): its picture is then in the target's memory once it is
+    /// decoded ([`Frame::sync`]), and nothing is to be copied.
+    pub fn is_in_target(&self) -> bool {
+        self.surface.target().is_some()
+    }
+
     /// Waits until the frame is decoded.
     pub fn sync(&self) -> Result<(), Error> {
         wait::by(&self.deadline, || self.surface.sync())

@@ -15,6 +15,8 @@ pub use va::{
     SurfaceCapabilities, SurfaceExport, proc_filter_name, read_back_by, rt_format_names,
 };
 
+pub use va::{Target, TargetFor, TargetFormat, TargetPlane, TargetShape};
+
 pub use va::{
     EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, UploadMethod,
     VideoEncoder, encoder_support,
