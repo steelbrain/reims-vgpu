@@ -1,4 +1,5 @@
-//! [`KeyHasher`]: the fixed hasher of [`super::ListOrderMap`] and [`super::LookupMap`].
+//! [`KeyHasher`]: the fixed hasher of [`super::LookupMap`] and of the maps `reims-vgpu`'s
+//! decoder keys by the guest's IDs.
 //!
 //! A multiply-and-add hash of each integer written, rotated at the end so that the bits the
 //! table indexes by mix every input bit (the multiply moves entropy up, never down). It is

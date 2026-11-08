@@ -222,8 +222,8 @@ doc holds its ordering contracts and the odd behaviours it keeps, each naming it
 | `trace` | the Vulkan platform's timeline of the device's work, with `REIMS_VGPU_TRACE` |
 | `num` | integer operations std has no single spelling for (17.4) |
 | `collections` | the containers, named by the order they give (8) |
-| `rt` | `SerialQueue`, `BlockEnv`, `Pool`, `Held` and `Hold`, `CoalescingSignal`, `Timer`, `ProcessOnce`, named threads (7) |
-| `sync` | `parking_lot` re-exports, `WriterPrefRwLock`, `StagedMutex` (7) |
+| `rt` | `SerialQueue`, `BlockEnv`, `Pool`, `Held` and `Hold`, `CoalescingSignal`, `Timer`, named threads (7) |
+| `sync` | `parking_lot` re-exports, `WriterPrefRwLock` (7) |
 | `platform`, `platform/*` | the `Platform` trait, handle traits, the command enums, descriptor values, device caps, `HostRange`, the OS services (4) |
 | `host` | the executor the device's display jobs run on (`HostQueue`) and the host's opaque values |
 | `memory` | the guest's RAM as the host maps it (`MemoryMap`), mappings of it, and its descriptor reads |

@@ -1,14 +1,12 @@
-//! Locks: re-exports of `parking_lot::{Mutex, MutexGuard, Condvar, ReentrantMutex}`, the
-//! writer-preferring [`WriterPrefRwLock`] (`parking_lot::RwLock`) and the [`StagedMutex`].
+//! Locks: re-exports of `parking_lot::{Mutex, MutexGuard, Condvar, ReentrantMutex}` and the
+//! writer-preferring [`WriterPrefRwLock`] (`parking_lot::RwLock`).
 //!
 //! Every timed wait on a `Condvar` goes through the platform's `Clock` (`Clock::wait_until`) so
 //! tests run on virtual time (7.1).
 
 pub mod rwlock;
-pub mod staged;
 
 pub use rwlock::{ReadGuard, WriteGuard, WriterPrefRwLock};
-pub use staged::{Staged, StagedGuard, StagedMutex};
 
 pub use parking_lot::{
     Condvar, Mutex, MutexGuard, ReentrantMutex, ReentrantMutexGuard, WaitTimeoutResult,
