@@ -2262,6 +2262,19 @@ pub(crate) mod tests {
         DEVICE.clone_ref()
     }
 
+    /// Waits, up to a minute each, for the checks the device starts on threads of its own as it
+    /// is adopted: its in-place, queue-switch and submission checks. They make, import and submit
+    /// through the program's paths, the runtime counts their imports with the program's, and the
+    /// device's first makings and imports can wait behind them. A test that counts the device's
+    /// work, or waits for the runtime's thread, settles them first. Linux's, as are those tests.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn settle_device_checks(d: &VulkanDevice) {
+        let wait = std::time::Duration::from_secs(60);
+        let _ = d.raw.settle_in_place_checks(wait);
+        let _ = d.raw.settle_queue_switch_check(wait);
+        let _ = d.raw.settle_submit_checks(wait);
+    }
+
     /// The platform's device options with a shader cache of their own, as
     /// `metal_tests::device_with_own_cache` makes its device with.
     pub(crate) fn options_with_own_cache() -> (rt::DeviceOptions, OwnCache) {
@@ -2595,9 +2608,7 @@ pub(crate) mod tests {
         // The in-place check the device starts as it is adopted asks the kernel of its own
         // pages on another thread: it ends before the count is read, so only this test's
         // imports move it.
-        let _ = d
-            .raw
-            .settle_in_place_checks(std::time::Duration::from_secs(60));
+        settle_device_checks(&d);
         let vm = crate::os::OsVm::new();
         let at = crate::os::allocate_aliasable(2 * PAGE).unwrap();
         let queried = || d.raw.work_counts().host_mappings_queried;
@@ -2835,6 +2846,9 @@ pub(crate) mod tests {
             }) || done()
         };
         let d = dev();
+        // The device's own checks import pages of their own: they end before the counts are read,
+        // so only the surfaces' imports move them.
+        settle_device_checks(&d);
         let state = |metallib: &[u8], kernel: &str| {
             let library = d.new_library(metallib).unwrap().unwrap().unwrap();
             let function = library.new_function(OnFault::Die, kernel).unwrap().unwrap();
@@ -2880,13 +2894,17 @@ pub(crate) mod tests {
                 true,
             ),
         ];
-        // The device's imports of host memory now: by their pointer, and of dma-bufs of the pages
+        // The device's imports of host memory now: by their pointer, of dma-bufs of the pages
         // where the device refuses their pointer (RADV refuses any page with a file behind it, the
-        // surface's own memory among them: one chunk on the 7900 XTX and the 780M).
+        // surface's own memory among them: one chunk on the 7900 XTX and the 780M), and of the
+        // images the runtime lays over such a dma-buf.
         let imports = || {
             let counts = d.raw.work_counts();
-            let dma_bufs = counts.dma_buf_memories_live + counts.dma_buf_image_memories_live;
-            (counts.host_imports_live, dma_bufs)
+            (
+                counts.host_imports_live,
+                counts.dma_buf_memories_live,
+                counts.dma_buf_image_memories_live,
+            )
         };
         for (surface, cores) in surfaces {
             let base = surface.base_address();
@@ -2895,11 +2913,19 @@ pub(crate) mod tests {
                 .new_texture_on_surface(&bgra(64, 32, 0), Some(&surface), 0)
                 .unwrap()
                 .unwrap();
-            let (pointers, dma_bufs) = imports();
+            let (pointers, dma_bufs, images) = imports();
+            // The buffer standing for the surface imports its pages once, by their pointer or as
+            // a dma-buf. Where the runtime takes the texture in place over that dma-buf, its image
+            // imports the same pages a second time (a Radeon 780M, 2026-11-07), and where it does
+            // not, the image imports nothing.
             assert_eq!(
                 pointers + dma_bufs,
                 before.0 + before.1 + 1,
                 "imported (core's mapping: {cores})"
+            );
+            assert!(
+                images == before.2 || images == before.2 + 1,
+                "the texture's image imported at most once (core's mapping: {cores})"
             );
             // Whether the surface's memory is mapped, or the device no longer imports it by its
             // pointer: read in that order, as the runtime frees such an import before it lets the

@@ -298,7 +298,7 @@ mod tests {
     use super::super::import::imports_need_files;
     use super::super::vm::memfd;
     use super::super::{PAGE, lease_guest_memory};
-    use crate::gpu::device::tests::dev;
+    use crate::gpu::device::tests::{dev, settle_device_checks};
     use crate::os::GuestRamFile;
 
     const MIB: u64 = 1 << 20;
@@ -310,13 +310,19 @@ mod tests {
     /// RAM, and its buffers import their pages as before. Either way the bytes are the GPU's. The
     /// flag is the process's, which nextest runs this test alone in.
     ///
-    /// The runtime's own thread imports the RAM's first chunk as the device is handed the RAM,
-    /// ahead of any object over it, and a buffer made before that import ends is bound in an
-    /// import of its own run, waiting for none (metal2vulkan's `host_ram.rs`, "No object waits
-    /// for a chunk"). So the test waits for the chunk's import before it makes the buffers.
+    /// The runtime imports the chunk as the first object over it asks, where the RAM has a source
+    /// of dma-bufs (`/dev/udmabuf` opens), or on its own thread ahead of every object, where it has
+    /// none. An object made before the chunk's import ends is bound in an import of its own run,
+    /// waiting for none, but where the device's barriers do not order blits through two imports
+    /// of the same pages (ANV's, MoltenVK's), where it is bound in the chunk (metal2vulkan's
+    /// `host_ram.rs`, "No object waits for a chunk"). So the test makes the first buffer, waits
+    /// for the chunk's import, and makes the second, which lies in the chunk; the first is bound
+    /// once, in one of the two.
     #[test]
     fn a_buffer_over_one_run_of_the_ram_is_bound_in_its_chunk() {
         let device = dev();
+        // The device's own checks end first: the chunk's import and the counts wait for none.
+        settle_device_checks(&device);
         let length = 8 * MIB;
         let fd = memfd(length).unwrap();
         // SAFETY: a fresh shared mapping of the file, which the test unmaps after the lease and
@@ -349,20 +355,6 @@ mod tests {
             fd,
             offset: 0,
         }]);
-        if imports_need_files() {
-            // The RAM is one chunk (8 MiB): the runtime's thread is given 20 s to import it.
-            let imported = (0..4000).any(|_| {
-                let done = counts().0 > before.0;
-                if !done {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                done
-            });
-            assert!(
-                imported,
-                "the runtime's thread imported no chunk of the RAM"
-            );
-        }
         let over = |offset: u64, length: u64| {
             // SAFETY: pages of the test's RAM, mapped until after the buffer is dropped.
             let bytes =
@@ -372,12 +364,36 @@ mod tests {
                 .unwrap()
         };
         let a = over(MIB, 2 * PAGE);
+        let after_a = counts();
+        if imports_need_files() {
+            // The RAM is one chunk (8 MiB): its import is given 20 s to end.
+            let imported = (0..4000).any(|_| {
+                let done = counts().0 > before.0;
+                if !done {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                done
+            });
+            assert!(imported, "the runtime imported no chunk of the RAM");
+        }
+        let imported = counts();
         let b = over(3 * MIB, PAGE);
         let now = counts();
-        let made = (now.0 - before.0, now.1 - before.1, now.2 - before.2);
+        let first = (after_a.1 - before.1, after_a.2 - before.2);
+        let second = (now.0 - imported.0, now.1 - imported.1, now.2 - imported.2);
         match imports_need_files() {
-            true => assert_eq!(made, (1, 2, 0), "bound in one chunk"),
-            false => assert_eq!(made, (0, 0, 0), "no RAM handed"),
+            true => {
+                assert_eq!(now.0 - before.0, 1, "the chunk imported once");
+                assert!(
+                    first == (1, 0) || first == (0, 1),
+                    "the first buffer bound once, in the chunk or its run: {first:?}"
+                );
+                assert_eq!(second, (0, 1, 0), "the second bound in the chunk");
+            }
+            false => {
+                let made = (now.0 - before.0, now.1 - before.1, now.2 - before.2);
+                assert_eq!(made, (0, 0, 0), "no RAM handed");
+            }
         }
         let q = device.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
