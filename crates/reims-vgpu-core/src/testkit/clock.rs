@@ -4,7 +4,7 @@
 //! ms event waits and the display's system-clock wait run on virtual time: a test advances the
 //! clock past the deadline instead of sleeping. A timed wait returns only when its condvar is
 //! notified or virtual time reaches its deadline, never early on its own, so single waits stay
-//! single (a FIFO drain's one wait on its thread's exit returns on that exit's notify).
+//! single (a drain's one wait on its thread's exit returns on that exit's notify).
 //!
 //! A timed wait parks untimed on the caller's condvar, as `pthread_cond_timedwait` does, so a
 //! notify is never lost (`unsafe` allowed here, architecture 17.3). It first registers the

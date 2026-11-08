@@ -270,7 +270,7 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
 /// runtime announces such a kind once per device, its first occurrence, the only one the default
 /// writes: asked for each, a pipeline variant's notices reach the sink again at every draw's bind,
 /// a cost on the encoding thread (in a Finder drag on ms01's Iris Xe, 2026-10-18, the sink
-/// itself took 0.09 ms per frame of the FIFO thread's 16.3, measured).
+/// itself took 0.09 ms per frame of that thread's 16.3, measured).
 fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradation> {
     let dies: &[rt::Degradation] = if every_dies {
         &crate::answer::DIES

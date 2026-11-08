@@ -134,8 +134,8 @@ mod tests {
     #[test]
     fn a_block_enters_and_restores() {
         {
-            let _env = BlockEnv::block(vec![(7, "reims-vgpu.fifo-control")], true);
-            assert_eq!(current_label(), Some("reims-vgpu.fifo-control"));
+            let _env = BlockEnv::block(vec![(7, "reims-vgpu.test-queue")], true);
+            assert_eq!(current_label(), Some("reims-vgpu.test-queue"));
             assert!(is_our_thread());
         }
         assert_eq!(current_label(), None);

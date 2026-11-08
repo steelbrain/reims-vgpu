@@ -1,6 +1,7 @@
-//! `Threads` on Linux: `std::thread`s, detached, with the stack and name core asks for. A FIFO
-//! thread gives the scheduler its hints as it starts; every other thread started here drops the
-//! hints it inherited from the thread that started it ([`super::hints`]).
+//! `Threads` on Linux: `std::thread`s, detached, with the stack and name core asks for. Every
+//! thread started here drops the hints it inherited from the thread that started it; a thread that
+//! walks the guest's command buffers, which the platform does not start, gives itself the walk
+//! hints ([`Threads::give_walk_hints`], [`super::hints`]).
 //!
 //! No Objective-C runs on Linux, so the reason macOS starts plain pthreads (D35: no unwind
 //! handler at a thread's base for a foreign exception's search phase to find) does not apply. A
@@ -44,49 +45,31 @@ fn spawn_thread(name: &'static str, stack_size: usize, body: Box<dyn FnOnce() + 
 
 /// The process's threads, and its clock for timers.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct LinuxThreads {
-    /// Whether [`Threads::spawn`] starts threads that are not FIFO threads
-    /// ([`LinuxThreads::without_hints`]).
-    without_hints: bool,
-}
+pub struct LinuxThreads;
 
 impl LinuxThreads {
-    /// The process's Threads: [`Threads::spawn`] starts FIFO threads.
+    /// The process's Threads.
     pub fn new() -> LinuxThreads {
-        LinuxThreads::default()
-    }
-
-    /// Threads whose [`Threads::spawn`] starts a thread that is not a FIFO thread, and so gives
-    /// the scheduler no hint: a display window's.
-    pub fn without_hints() -> LinuxThreads {
-        LinuxThreads {
-            without_hints: true,
-        }
+        LinuxThreads
     }
 }
 
 impl Threads for LinuxThreads {
-    /// A FIFO thread, which gives the scheduler its hints before it runs `body`
-    /// ([`super::hints::hint_fifo_thread`]); from [`LinuxThreads::without_hints`], a thread that
-    /// drops the hints it inherited ([`super::hints::drop_inherited_hints`]).
+    /// A thread that drops the hints it inherited ([`super::hints::drop_inherited_hints`]): a
+    /// display window's.
     fn spawn(&self, name: &'static str, stack_size: usize, body: Box<dyn FnOnce() + Send>) {
-        let fifo = !self.without_hints;
         spawn_thread(
             name,
             stack_size,
             Box::new(move || {
-                if fifo {
-                    super::hints::hint_fifo_thread();
-                } else {
-                    super::hints::drop_inherited_hints();
-                }
+                super::hints::drop_inherited_hints();
                 body();
             }),
         );
     }
 
     /// A worker named after its queue, with a GCD worker's 512 KiB of stack, as on macOS. It drops
-    /// the hints it inherited ([`super::hints::drop_inherited_hints`]): a FIFO thread, or one of
+    /// the hints it inherited ([`super::hints::drop_inherited_hints`]): a walk thread, or one of
     /// the runtime's threads, may be the one that starts it.
     fn spawn_worker(&self, label: &'static str, body: Box<dyn FnOnce() + Send>) {
         spawn_thread(
@@ -99,10 +82,10 @@ impl Threads for LinuxThreads {
         );
     }
 
-    /// The FIFO thread's hints ([`super::hints::hint_fifo_thread`]), for a thread the platform
-    /// did not start.
-    fn give_fifo_hints(&self) {
-        super::hints::hint_fifo_thread();
+    /// The walk hints ([`super::hints::hint_walk_thread`]), for a thread the platform did not
+    /// start.
+    fn give_walk_hints(&self) {
+        super::hints::hint_walk_thread();
     }
 
     fn handle(&self) -> Arc<dyn Threads> {
@@ -142,7 +125,7 @@ mod tests {
     fn a_thread_is_named_and_sized() {
         let (tx, rx) = mpsc::channel();
         LinuxThreads::new().spawn(
-            "reims-vgpu.fifo",
+            "reims-vgpu.test",
             512 * 1024,
             Box::new(move || {
                 let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
@@ -157,7 +140,7 @@ mod tests {
             }),
         );
         let (name, size) = rx.recv_timeout(WAIT).unwrap();
-        assert_eq!(name, "reims-vgpu.fifo");
+        assert_eq!(name, "reims-vgpu.test");
         assert!(size >= 512 * 1024, "{size}");
         assert_eq!(kept_name("reims-vgpu.display-present"), "reims-vgpu.disp");
         assert_eq!(kept_name("reims-vgpu.é1234"), "reims-vgpu.é12");

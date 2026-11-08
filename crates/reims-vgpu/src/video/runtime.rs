@@ -4,8 +4,8 @@
 //! - **A thread** is a worker of the platform's ([`Threads::spawn_worker`]), as a serial queue's
 //!   is: a session's thread runs the messages of its queue one at a time, as a queue's worker
 //!   runs its blocks. It is named as the video crate asks, has a worker's 512 KiB of stack, and
-//!   takes the hints the platform gives a thread that is not a FIFO thread (on Linux it drops
-//!   those it inherited from the thread that started it). Its body runs marked as the
+//!   takes the hints the platform gives a queue's worker (on Linux it drops those it inherited
+//!   from the thread that started it). Its body runs marked as the
 //!   library's ([`enter_ours`]), so that a panic on it ends the process before anything
 //!   unwinds, as on every thread of the library's (architecture 6.5). The platform starts every
 //!   thread it is asked for, or ends the process, so a video crate never meets the refusal it

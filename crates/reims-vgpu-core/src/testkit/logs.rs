@@ -16,7 +16,7 @@
 //! run_the_op();
 //! assert_eq!(
 //!     logs.take(),
-//!     [(log::Level::Warn, "reims_vgpu::fifo".to_owned(), "stalled".to_owned())]
+//!     [(log::Level::Warn, "reims_vgpu::graphics".to_owned(), "stalled".to_owned())]
 //! );
 //! ```
 
@@ -102,16 +102,16 @@ mod tests {
     /// outside a capture
     #[test]
     fn a_capture_takes_its_lines_in_order() {
-        log::warn!(target: "reims_vgpu::fifo", "before");
+        log::warn!(target: "reims_vgpu::graphics", "before");
         let logs = capture();
-        log::warn!(target: "reims_vgpu::fifo", "stalled {}", 3);
+        log::warn!(target: "reims_vgpu::graphics", "stalled {}", 3);
         log::debug!(target: "reims_vgpu::tasks", "detail");
         assert_eq!(
             logs.take(),
             [
                 (
                     Level::Warn,
-                    "reims_vgpu::fifo".to_owned(),
+                    "reims_vgpu::graphics".to_owned(),
                     "stalled 3".to_owned()
                 ),
                 (
@@ -124,7 +124,7 @@ mod tests {
         assert!(logs.take().is_empty());
         drop(logs);
         assert_eq!(log::max_level(), LevelFilter::Off);
-        log::error!(target: "reims_vgpu::fifo", "after");
+        log::error!(target: "reims_vgpu::graphics", "after");
         assert!(capture().take().is_empty());
     }
 }

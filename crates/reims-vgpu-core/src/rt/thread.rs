@@ -11,10 +11,6 @@ use std::marker::PhantomData;
 
 use crate::platform::os::Threads;
 
-/// A named thread's stack: 576 KiB, a queue worker's
-/// [`WORKER_STACK`](crate::rt::queue::WORKER_STACK) and 64 KiB more.
-pub const FIFO_THREAD_STACK: usize = crate::rt::queue::WORKER_STACK + 64 * 1024;
-
 thread_local! {
     static OURS: Cell<bool> = const { Cell::new(false) };
 }
@@ -25,8 +21,8 @@ thread_local! {
     static CORE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Whether the current thread is one core started for its whole life (the FIFO thread, a
-/// queue's worker, a timer's thread).
+/// Whether the current thread is one core started for its whole life (a named thread, a queue's
+/// worker, a timer's thread).
 #[cfg(any(test, feature = "testkit"))]
 pub(crate) fn is_core_thread() -> bool {
     CORE.with(Cell::get)
@@ -169,14 +165,17 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    /// A named thread's stack in these tests: a queue worker's and 64 KiB more.
+    const STACK: usize = crate::rt::queue::WORKER_STACK + 64 * 1024;
+
     /// The spawned body is ours and named
     #[test]
     fn spawned_thread_is_ours() {
         let (tx, rx) = mpsc::channel();
         spawn_named(
             &StdThreads,
-            "reims-vgpu.fifo",
-            FIFO_THREAD_STACK,
+            "reims-vgpu.test",
+            STACK,
             Box::new(()),
             move || {
                 let name = std::thread::current().name().map(str::to_owned);
@@ -184,7 +183,7 @@ mod tests {
             },
         );
         let got = rx.recv().ok();
-        assert_eq!(got, Some((true, Some("reims-vgpu.fifo".to_string()))));
+        assert_eq!(got, Some((true, Some("reims-vgpu.test".to_string()))));
         assert!(!is_our_thread());
     }
 
@@ -205,8 +204,8 @@ mod tests {
         let t2 = tx.clone();
         spawn_named(
             &StdThreads,
-            "reims-vgpu.fifo",
-            FIFO_THREAD_STACK,
+            "reims-vgpu.test",
+            STACK,
             Box::new(Tell("target", tx)),
             move || {
                 let _ = t2.send(("body", is_our_thread()));
@@ -222,23 +221,17 @@ mod tests {
         struct Dies;
         impl Drop for Dies {
             fn drop(&mut self) {
-                crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "fifo")
+                crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "named")
             }
         }
         crate::testkit::capture::expect_death(
             crate::raise::death::DeathSite {
                 kind: crate::raise::death::DeathKind::Abort,
-                file: "fifo",
+                file: "named",
                 line: 0,
             },
             || {
-                spawn_named(
-                    &StdThreads,
-                    "reims-vgpu.fifo",
-                    FIFO_THREAD_STACK,
-                    Box::new(Dies),
-                    || {},
-                );
+                spawn_named(&StdThreads, "reims-vgpu.test", STACK, Box::new(Dies), || {});
                 loop {
                     std::thread::park();
                 }
@@ -268,17 +261,13 @@ mod tests {
         crate::testkit::capture::expect_death(
             crate::raise::death::DeathSite {
                 kind: crate::raise::death::DeathKind::Abort,
-                file: "fifo",
+                file: "named",
                 line: 0,
             },
             || {
-                spawn_named(
-                    &StdThreads,
-                    "reims-vgpu.fifo",
-                    FIFO_THREAD_STACK,
-                    Box::new(()),
-                    || crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "fifo"),
-                );
+                spawn_named(&StdThreads, "reims-vgpu.test", STACK, Box::new(()), || {
+                    crate::testkit::capture::die(crate::raise::death::DeathKind::Abort, "named")
+                });
                 loop {
                     std::thread::park();
                 }

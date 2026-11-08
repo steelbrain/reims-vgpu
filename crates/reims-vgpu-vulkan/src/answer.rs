@@ -914,7 +914,7 @@ pub fn created_or_decided<T>(
 ///   `VkPipeline` the driver was still making 4.5 s after its command buffer's commit ran nothing,
 ///   the command buffer running on, where Metal's draw renders and its dispatch writes: a cold
 ///   compile (seconds on MoltenVK with a cold Metal compiler service) then costs that command's
-///   work, not a stall past the guest's 10 s check of its FIFO. A strict process takes
+///   work, not a stall of every later command of its queue. A strict process takes
 ///   `PipelineWaitPolicy::Exact` ([`crate::platform`]'s device options), which waits until the
 ///   pipeline is made, so a strict run, this crate's tests among them, never dies of a slow
 ///   compile. Announced where the command is recorded: in the commit, or the command buffer's

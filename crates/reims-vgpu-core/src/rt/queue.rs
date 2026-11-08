@@ -20,8 +20,7 @@
 //!
 //! Running the sync block on the caller's thread is what orders it against the caller's next
 //! step: the caller goes on the moment the block returns, with no hand-back from another thread
-//! (lessons.md, "A dispatch_sync block runs on the caller's thread": a child FIFO's first
-//! interrupt otherwise overtakes the root's).
+//! (lessons.md, "A `dispatch_sync` block runs on the caller's thread").
 //!
 //! A worker releases its last-resort holder and pops its last-resort real pool, releasing what
 //! its blocks held or autoreleased outside any unit, once it has left the queue
@@ -30,8 +29,7 @@
 //! itself (lessons.md, "A queue worker's idle drain").
 //!
 //! A worker is woken only when it has something to do, and after the queue's lock is released:
-//! a submit or a sync never waits for a worker that holds the lock but has no CPU yet (a fault's
-//! interrupt block on the FIFO queue would otherwise fall behind the guest's next resume).
+//! a submit or a sync never waits for a worker that holds the lock but has no CPU yet.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -573,7 +571,7 @@ mod tests {
     /// Async blocks run in FIFO order
     #[test]
     fn async_fifo_order() {
-        let queue = q("reims-vgpu.fifo-control");
+        let queue = q("reims-vgpu.test-queue");
         let log = Arc::new(Mutex::new(Vec::new()));
         for i in 0..100u32 {
             let l = log.clone();
@@ -581,21 +579,21 @@ mod tests {
         }
         queue.sync(|| ());
         assert_eq!(*log.lock(), (0..100).collect::<Vec<_>>());
-        assert_eq!(queue.label(), "reims-vgpu.fifo-control");
-        assert!(format!("{queue:?}").contains("reims-vgpu.fifo-control"));
+        assert_eq!(queue.label(), "reims-vgpu.test-queue");
+        assert!(format!("{queue:?}").contains("reims-vgpu.test-queue"));
     }
 
     /// A queue starts its worker through the platform, by label
     #[test]
     fn a_queue_starts_its_worker() {
         let threads = FakeThreads::default();
-        let queue = SerialQueue::new(&threads, "reims-vgpu.fifo-control");
+        let queue = SerialQueue::new(&threads, "reims-vgpu.test-queue");
         let _r = SerialQueue::new(&threads, "reims-vgpu.reporting");
         assert_eq!(queue.sync(|| 7), 7);
         assert!(threads.spawned().is_empty());
         assert_eq!(
             threads.queues(),
-            vec!["reims-vgpu.fifo-control", "reims-vgpu.reporting"]
+            vec!["reims-vgpu.test-queue", "reims-vgpu.reporting"]
         );
     }
 
@@ -603,7 +601,7 @@ mod tests {
     /// the thread marked ours
     #[test]
     fn async_block_runs_on_the_worker_with_the_queue_current() {
-        let queue = q("reims-vgpu.fifo-control");
+        let queue = q("reims-vgpu.test-queue");
         let (tx, rx) = mpsc::channel();
         queue.exec_async(move || {
             let _ = tx.send(seen());
@@ -611,7 +609,7 @@ mod tests {
         let got = rx.recv_timeout(WAIT).ok();
         let got = got.as_ref();
         assert_ne!(got.map(|s| s.thread), Some(std::thread::current().id()));
-        assert_eq!(got.map(|s| s.label), Some(Some("reims-vgpu.fifo-control")));
+        assert_eq!(got.map(|s| s.label), Some(Some("reims-vgpu.test-queue")));
         assert_eq!(got.map(|s| s.ours), Some(true));
     }
 
@@ -698,11 +696,11 @@ mod tests {
     }
 
     /// Libdispatch runs a sync block on the caller's thread, idle queue or not
-    /// (`dispatch_sync(_fifoQueue, …)`)
+    /// (`dispatch_sync`)
     #[test]
     #[allow(clippy::disallowed_methods)] // test threads: no Objective-C runs here (4.5)
     fn sync_runs_on_callers_thread() {
-        let queue = q("reims-vgpu.fifo-control");
+        let queue = q("reims-vgpu.test-queue");
         let me = std::thread::current().id();
         assert_eq!(queue.sync(|| std::thread::current().id()), me);
         let (go_tx, go_rx) = mpsc::channel::<()>();
@@ -755,17 +753,17 @@ mod tests {
     /// Sync inside an async block onto another queue (the reporting hop) works
     #[test]
     fn sync_inside_async_onto_other_queue() {
-        let fifo = q("reims-vgpu.fifo-control");
+        let first = q("reims-vgpu.test-queue");
         let reporting = q("reims-vgpu.reporting");
         let (tx, rx) = mpsc::channel();
         let r2 = reporting.clone();
-        fifo.exec_async(move || {
+        first.exec_async(move || {
             let inner = r2.sync(|| (41, current_label())).0 + 1;
             let _ = tx.send((inner, current_label()));
         });
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5)).ok(),
-            Some((42, Some("reims-vgpu.fifo-control")))
+            Some((42, Some("reims-vgpu.test-queue")))
         );
     }
 

@@ -323,7 +323,7 @@ impl CallLog {
 /// What kind of thread an event happened on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadClass {
-    /// A thread core started with a name (`rt::thread::spawn_named`: the FIFO thread).
+    /// A thread core started with a name (`rt::thread::spawn_named`).
     Core,
     /// A serial queue's worker (`rt::queue`): a core thread with no name.
     Worker,

@@ -25,11 +25,11 @@
 //!   cores alone, and its walks took 13.4 ms of CPU a frame where two threads took 10.4 ms
 //!   (game_6000 at 92.7 against 105.6 fps, on a Core Ultra 9 275HX host with an RTX 5080 Laptop
 //!   GPU; measured).
-//! - **Hints.** Each thread gives the scheduler the FIFO thread's hints as it starts
-//!   ([`Threads::give_fifo_hints`]): a walk's speed is the frame rate, as a FIFO thread's is. On
-//!   Linux that is a utilization floor of the CPU's full capacity, which the kernel's
-//!   capacity-aware scheduling reads on a hybrid processor without SMT (the Vulkan platform's
-//!   `os/linux/hints.rs`). Started with nothing but its creator's settings, one walk thread of
+//! - **Hints.** Each thread gives the scheduler the walk hints as it starts
+//!   ([`Threads::give_walk_hints`]): a walk's speed is the frame rate. On Linux that is a
+//!   utilization floor of the CPU's full capacity, which the kernel's capacity-aware scheduling
+//!   reads on a hybrid processor without SMT (the Vulkan platform's `os/linux/hints.rs`).
+//!   Started with nothing but its creator's settings, one walk thread of
 //!   game_6000's queue ran on the efficiency cores alone in 5 of 19 runs, the second of car 13's
 //!   base's two among them, whose walks then ran 45% of their instructions on those cores where
 //!   car 11's two threads ran 37% (Core Ultra 9 275HX, the guest's eight vCPU threads busy on
@@ -66,8 +66,8 @@ pub(crate) type Job = Box<dyn FnOnce() + Send>;
 pub(crate) struct Budget {
     limit: usize,
     taken: AtomicUsize,
-    /// The platform's threads, whose FIFO hints each lane thread gives itself as it starts
-    /// ([`Threads::give_fifo_hints`]); none in the tests that make no platform.
+    /// The platform's threads, whose walk hints each lane thread gives itself as it starts
+    /// ([`Threads::give_walk_hints`]); none in the tests that make no platform.
     hints: Option<Arc<dyn Threads>>,
 }
 
@@ -83,7 +83,7 @@ impl std::fmt::Debug for Budget {
 
 impl Budget {
     /// A budget of twice the host's cores, as many as can run a walk each with as many waiting,
-    /// whose lanes' threads give themselves `threads`' FIFO hints.
+    /// whose lanes' threads give themselves `threads`' walk hints.
     pub(crate) fn of_host(threads: Arc<dyn Threads>) -> Arc<Budget> {
         let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
         Budget::with_hints(2 * cores, Some(threads))
@@ -95,7 +95,7 @@ impl Budget {
         Budget::with_hints(limit, None)
     }
 
-    /// A budget of `limit` threads, whose lanes' threads give themselves `hints`' FIFO hints.
+    /// A budget of `limit` threads, whose lanes' threads give themselves `hints`' walk hints.
     fn with_hints(limit: usize, hints: Option<Arc<dyn Threads>>) -> Arc<Budget> {
         Arc::new(Budget {
             limit,
@@ -297,13 +297,13 @@ impl Lane {
         }
     }
 
-    /// A lane thread: the FIFO thread's hints, then the jobs, in the order they came, until the
+    /// A lane thread: the walk hints, then the jobs, in the order they came, until the
     /// lane closes with none left or none comes for the lane's `idle_for`. It goes as one of the
     /// budget's where the lane has any, else as the lane's own, so the lane's own thread is the
     /// last to go.
     fn serve(&self) {
         if let Some(threads) = &self.budget.hints {
-            threads.give_fifo_hints();
+            threads.give_walk_hints();
         }
         let me = Arc::new(Idler::default());
         let mut state = self.state.lock();
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(running.load(Ordering::Acquire), 3 * QUEUES as usize);
     }
 
-    /// What the threads of [`each_thread_gives_itself_the_fifo_hints_before_its_first_job`] did,
+    /// What the threads of [`each_thread_gives_itself_the_walk_hints_before_its_first_job`] did,
     /// in order: a hint, or a job, with the thread it ran on.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Did {
@@ -615,7 +615,7 @@ mod tests {
         Job(std::thread::ThreadId),
     }
 
-    /// Threads that only note each [`Threads::give_fifo_hints`]: the lane starts its own.
+    /// Threads that only note each [`Threads::give_walk_hints`]: the lane starts its own.
     struct HintLog(Arc<Mutex<Vec<Did>>>);
 
     impl Threads for HintLog {
@@ -627,7 +627,7 @@ mod tests {
             unreachable!("a lane starts no worker")
         }
 
-        fn give_fifo_hints(&self) {
+        fn give_walk_hints(&self) {
             self.0.lock().push(Did::Hint(std::thread::current().id()));
         }
 
@@ -640,10 +640,10 @@ mod tests {
         }
     }
 
-    /// Each of a lane's threads, its own and the budget's, gives itself the FIFO thread's hints
-    /// before it runs its first job; a lane of a budget with no platform gives none.
+    /// Each of a lane's threads, its own and the budget's, gives itself the walk hints before it
+    /// runs its first job; a lane of a budget with no platform gives none.
     #[test]
-    fn each_thread_gives_itself_the_fifo_hints_before_its_first_job() {
+    fn each_thread_gives_itself_the_walk_hints_before_its_first_job() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let threads: Arc<dyn Threads> = Arc::new(HintLog(Arc::clone(&log)));
         let lane = Lane::new(6, Budget::with_hints(LANE_THREADS, Some(threads)));

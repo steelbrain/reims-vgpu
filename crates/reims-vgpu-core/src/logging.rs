@@ -2,7 +2,7 @@
 //! hook.
 //!
 //! The library writes its lines through the `log` crate's macros, each under its module's path as
-//! its target (`reims_vgpu_core::fifo::thread`). Where they go:
+//! its target (`reims_vgpu::graphics::decode`). Where they go:
 //!
 //! - a host that installed its own `log` logger gets them there, filtered as it filters;
 //! - otherwise nowhere, unless `REIMS_VGPU_LOG` is set or the host gave a hook ([`set_hook`]).
@@ -11,7 +11,7 @@
 //!   `reims-vgpu <LEVEL> <target>: <message>`.
 //!
 //! `REIMS_VGPU_LOG` is a level (`off`, `error`, `warn`, `info`, `debug` or `trace`), optionally
-//! followed by `,target=level` pairs: `warn,reims_vgpu_core::fifo=debug` ([`Filter::parse`]).
+//! followed by `,target=level` pairs: `warn,reims_vgpu::graphics=debug` ([`Filter::parse`]).
 //! When it is set, its filter decides which lines are written, to the hook too; when it isn't,
 //! the hook's own level does. A diagnostic whose own work costs the work it watches runs only
 //! where the variable names its target itself ([`names`]), not under a lone level.
@@ -61,7 +61,7 @@ impl Filter {
     ///
     /// - A lone level covers every target no pair names; without one, those are `off`.
     /// - A pair covers its target and the targets below it at a `::`: `reims_vgpu` covers
-    ///   `reims_vgpu::fifo`. The longest covering target decides, and among equal ones the
+    ///   `reims_vgpu::graphics`. The longest covering target decides, and among equal ones the
     ///   last.
     /// - An entry that is neither is ignored.
     pub fn parse(spec: &str) -> Filter {
@@ -334,16 +334,16 @@ mod tests {
     /// A lone level covers every target; pairs cover their target and those below it
     #[test]
     fn filters_read_a_level_and_target_pairs() {
-        let f = Filter::parse("warn,reims_vgpu::fifo=debug");
-        assert_eq!(f.level("reims_vgpu::fifo"), LevelFilter::Debug);
-        assert_eq!(f.level("reims_vgpu::fifo::thread"), LevelFilter::Debug);
-        assert_eq!(f.level("reims_vgpu::fifos"), LevelFilter::Warn);
+        let f = Filter::parse("warn,reims_vgpu::graphics=debug");
+        assert_eq!(f.level("reims_vgpu::graphics"), LevelFilter::Debug);
+        assert_eq!(f.level("reims_vgpu::graphics::decode"), LevelFilter::Debug);
+        assert_eq!(f.level("reims_vgpu::graphics_host"), LevelFilter::Warn);
         assert_eq!(f.level("reims_vgpu::device"), LevelFilter::Warn);
         assert_eq!(f.max(), LevelFilter::Debug);
 
         let f = Filter::parse(" INFO , reims_vgpu = error , reims_vgpu::tasks=trace ");
         assert_eq!(f.level("other"), LevelFilter::Info);
-        assert_eq!(f.level("reims_vgpu::fifo"), LevelFilter::Error);
+        assert_eq!(f.level("reims_vgpu::graphics"), LevelFilter::Error);
         assert_eq!(f.level("reims_vgpu::tasks"), LevelFilter::Trace);
         assert_eq!(f.max(), LevelFilter::Trace);
     }
@@ -352,8 +352,8 @@ mod tests {
     /// pairs decides
     #[test]
     fn filters_default_to_off_and_skip_what_they_cannot_read() {
-        let f = Filter::parse("reims_vgpu::fifo=info");
-        assert_eq!(f.level("reims_vgpu::fifo"), LevelFilter::Info);
+        let f = Filter::parse("reims_vgpu::graphics=info");
+        assert_eq!(f.level("reims_vgpu::graphics"), LevelFilter::Info);
         assert_eq!(f.level("reims_vgpu::device"), LevelFilter::Off);
         assert_eq!(Filter::parse(""), Filter::all(LevelFilter::Off));
         assert_eq!(
@@ -423,8 +423,8 @@ mod tests {
     #[test]
     fn stderr_lines_name_level_and_target() {
         assert_eq!(
-            stderr_line(Level::Warn, "reims_vgpu::fifo", "stalled 3"),
-            "reims-vgpu WARN reims_vgpu::fifo: stalled 3\n"
+            stderr_line(Level::Warn, "reims_vgpu::graphics", "stalled 3"),
+            "reims-vgpu WARN reims_vgpu::graphics: stalled 3\n"
         );
     }
 
@@ -445,15 +445,15 @@ mod tests {
             &mut l.hook.lock(),
             Some((LevelFilter::Info, Arc::from(hook))),
         );
-        assert!(enabled(&l, Level::Info, "reims_vgpu::fifo"));
-        assert!(!enabled(&l, Level::Debug, "reims_vgpu::fifo"));
-        write(&l, Level::Warn, "reims_vgpu::fifo", "kept");
-        write(&l, Level::Debug, "reims_vgpu::fifo", "dropped");
+        assert!(enabled(&l, Level::Info, "reims_vgpu::graphics"));
+        assert!(!enabled(&l, Level::Debug, "reims_vgpu::graphics"));
+        write(&l, Level::Warn, "reims_vgpu::graphics", "kept");
+        write(&l, Level::Debug, "reims_vgpu::graphics", "dropped");
         assert_eq!(
             *seen.lock(),
             [(
                 Level::Warn,
-                "reims_vgpu::fifo".to_owned(),
+                "reims_vgpu::graphics".to_owned(),
                 "kept".to_owned()
             )]
         );
@@ -465,7 +465,7 @@ mod tests {
             Some((LevelFilter::Trace, Arc::from(hook))),
         );
         assert_eq!(l.max_level(Some(LevelFilter::Trace)), LevelFilter::Debug);
-        write(&l, Level::Warn, "reims_vgpu::fifo", "dropped");
+        write(&l, Level::Warn, "reims_vgpu::graphics", "dropped");
         write(&l, Level::Debug, "reims_vgpu::tasks", "kept");
         assert_eq!(
             *seen.lock(),
@@ -542,7 +542,7 @@ mod tests {
             init();
             init();
             assert_eq!(log::max_level(), LevelFilter::Debug);
-            log::debug!(target: "reims_vgpu::fifo", "to stderr {}", 1);
+            log::debug!(target: "reims_vgpu::graphics", "to stderr {}", 1);
             log::debug!(target: "reims_vgpu::device", "filtered");
             log::info!(target: "reims_vgpu::device", "to stderr {}", 2);
             let (seen, hook) = recording_hook();
@@ -562,7 +562,7 @@ mod tests {
         }
         let out = child(
             "logging::tests::the_process_logger_writes_stderr_until_a_hook_takes_over",
-            Some("info,reims_vgpu::fifo=debug"),
+            Some("info,reims_vgpu::graphics=debug"),
         );
         assert!(out.status.success(), "{out:?}");
         let err = String::from_utf8_lossy(&out.stderr);
@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "reims-vgpu DEBUG reims_vgpu::fifo: to stderr 1",
+                "reims-vgpu DEBUG reims_vgpu::graphics: to stderr 1",
                 "reims-vgpu INFO reims_vgpu::device: to stderr 2",
                 "reims-vgpu ERROR reims_vgpu::tasks: to stderr 3",
             ],

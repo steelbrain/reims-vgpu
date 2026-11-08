@@ -41,7 +41,7 @@ pub fn set_capture_enabled(on: bool) {
 }
 
 /// Where the first death of one test's "process" is recorded: the slot follows the process's
-/// work onto every thread, so a death on a FIFO thread or in a queue's block lands in it.
+/// work onto every thread, so a death on a named thread or in a queue's block lands in it.
 #[derive(Default, Debug)]
 pub struct DeathSlot {
     site: Mutex<Option<DeathSite>>,

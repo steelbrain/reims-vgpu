@@ -1,5 +1,5 @@
-//! Runtime primitives: serial queues, sources, the timer, once, the FIFO thread, autorelease
-//! pools and holders (architecture 7).
+//! Runtime primitives: serial queues, sources, the timer, once, named threads, autorelease pools
+//! and holders (architecture 7).
 
 pub mod block_env;
 pub mod held;

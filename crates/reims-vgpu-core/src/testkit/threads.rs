@@ -132,22 +132,22 @@ mod tests {
         let th = FakeThreads::default();
         let (tx, rx) = mpsc::channel();
         th.spawn(
-            "reims-vgpu.fifo",
+            "reims-vgpu.test",
             512 * 1024,
             Box::new(move || {
                 let _ = tx.send(std::thread::current().name().map(str::to_owned));
             }),
         );
-        assert_eq!(rx.recv().unwrap(), Some("reims-vgpu.fifo".to_string()));
-        assert_eq!(th.spawned(), vec![("reims-vgpu.fifo", 512 * 1024)]);
+        assert_eq!(rx.recv().unwrap(), Some("reims-vgpu.test".to_string()));
+        assert_eq!(th.spawned(), vec![("reims-vgpu.test", 512 * 1024)]);
     }
 
     /// A queue's worker is recorded by label, not as a named spawn, and is unnamed
     #[test]
     fn queue_workers_are_recorded_by_label() {
         let th = FakeThreads::default();
-        let q = crate::rt::queue::SerialQueue::new(&th, "reims-vgpu.fifo-control");
-        assert_eq!(th.queues(), vec!["reims-vgpu.fifo-control"]);
+        let q = crate::rt::queue::SerialQueue::new(&th, "reims-vgpu.test-queue");
+        assert_eq!(th.queues(), vec!["reims-vgpu.test-queue"]);
         assert!(th.spawned().is_empty());
         let (tx, rx) = mpsc::channel();
         q.exec_async(move || {

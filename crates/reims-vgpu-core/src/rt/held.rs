@@ -7,14 +7,14 @@
 //! it to its own drop, which releases what it holds most recent first. Every other value drops
 //! where Rust's scoping puts it.
 //!
-//! Every public entry makes a holder on the host's thread, and each FIFO command and each service
-//! job one on theirs; a landing frame ([`Held::raising`]) makes one inside its unit. Code with no
+//! Every public entry makes a holder on the host's thread, and each unit of work one on its
+//! thread; a landing frame ([`Held::raising`]) makes one inside its unit. Code with no
 //! handle to its holder (a lookup's reference to the kernel task, a page-table read's load of the
 //! device) holds through a [`Hold`] ([`Hold::keep`]), which names the holder of its unit or of
 //! the landing frame it runs in.
 //!
 //! A hold with no holder ([`Hold::NONE`]: a queue's block, a thread's body, a drop) holds to the
-//! thread's last-resort holder: a thread core started (a queue's worker, the FIFO thread) keeps
+//! thread's last-resort holder: a thread core started (a queue's worker, a named thread) keeps
 //! one, released once the worker has left its queue ([`crate::rt::pool::drain_idle`]) and at the
 //! thread's end, just before its last-resort real pool pops. On any other thread (Metal's, a
 //! test's) the value drops there.
@@ -173,7 +173,7 @@ impl Hold<'static> {
 }
 
 impl<'u> Hold<'u> {
-    /// Into `held`: a unit of work's holder (a FIFO command's, a job's, an API entry's), or a
+    /// Into `held`: a unit of work's holder (a job's, an API entry's), or a
     /// landing frame's ([`Held::raising`]).
     pub fn of(held: &'u Held) -> Hold<'u> {
         Hold {

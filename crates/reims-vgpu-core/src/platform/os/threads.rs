@@ -1,4 +1,4 @@
-//! Threads: the platform starts the threads core runs on (the FIFO thread and each serial
+//! Threads: the platform starts the threads core runs on (its named threads and each serial
 //! queue's worker), and gives the clock timers wait on ([`TimerClock`]).
 
 use std::sync::Arc;
@@ -12,18 +12,18 @@ use crate::sync::{Condvar, MutexGuard};
 /// drops. The fake uses `std::thread` (no Objective-C runs there).
 pub trait Threads: Send + Sync {
     /// Starts a detached thread named `name`, with `stack_size` bytes of stack (rounded up to
-    /// whole pages), that runs `body`: the FIFO thread (`rt::thread::spawn_named`).
+    /// whole pages), that runs `body`: a named thread of core's (`rt::thread::spawn_named`), a
+    /// display window's.
     fn spawn(&self, name: &'static str, stack_size: usize, body: Box<dyn FnOnce() + Send>);
 
     /// Starts a detached worker thread for the serial queue `label` (`rt::SerialQueue`), as
     /// [`Threads::spawn`] starts one.
     fn spawn_worker(&self, label: &'static str, body: Box<dyn FnOnce() + Send>);
 
-    /// Gives the calling thread, one this service did not start, the hints the FIFO thread
-    /// [`Threads::spawn`] starts gives the scheduler: for a thread whose speed is the frame rate
-    /// as the FIFO thread's is, a walk thread of the graphics device's lanes. None where the
-    /// platform gives the FIFO thread none.
-    fn give_fifo_hints(&self) {}
+    /// Gives the calling thread, one this service did not start, the scheduling hints of a
+    /// thread whose speed is the frame rate: a walk thread of the graphics device's lanes, which
+    /// walks a command buffer's ops one after another. None where the platform gives none.
+    fn give_walk_hints(&self) {}
 
     /// An owned handle to this service: a queue keeps one to restart its worker.
     fn handle(&self) -> Arc<dyn Threads>;

@@ -5,8 +5,8 @@
 //! clock's time and one timed wait, which each backend that starts a thread, waits or times a
 //! call keeps from its making.
 //! - **The library's** is its platform's (reims-vgpu's `video/runtime.rs`): a backend's thread
-//!   is the platform's, named, with the scheduling hints the platform gives a thread that is not
-//!   a FIFO thread, and marked as the library's, so that a panic on it ends the process at once
+//!   is the platform's, named, with the scheduling hints the platform gives a queue's worker,
+//!   and marked as the library's, so that a panic on it ends the process at once
 //!   as on every thread of the library's (architecture 6.5); and every bound is kept, and every
 //!   time measured, on the platform's monotonic clock, which a test makes virtual.
 //! - **std's**, [`StdRuntime`], is the examples' and the fuzzers': std's threads, and a clock

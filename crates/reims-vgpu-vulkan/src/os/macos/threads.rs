@@ -144,7 +144,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (go_tx, go_rx) = mpsc::channel::<()>();
         MacThreads::new().spawn(
-            "reims-vgpu.fifo",
+            "reims-vgpu.test",
             512 * 1024 + 1,
             Box::new(move || {
                 // SAFETY: queries of the running thread.
@@ -159,7 +159,7 @@ mod tests {
             }),
         );
         let (name, me, size) = rx.recv_timeout(WAIT).unwrap();
-        assert_eq!(name, "reims-vgpu.fifo");
+        assert_eq!(name, "reims-vgpu.test");
         assert!(size >= 512 * 1024 + page, "{size}");
         // SAFETY: the thread is alive (it waits on `go`); a detached thread refuses the join
         // with EINVAL instead of blocking.
@@ -173,16 +173,16 @@ mod tests {
     fn a_worker_is_named_after_its_queue() {
         let (tx, rx) = mpsc::channel();
         MacThreads::new().spawn_worker(
-            "reims-vgpu.fifo-control",
+            "reims-vgpu.test-queue",
             Box::new(move || tx.send(current_name()).unwrap()),
         );
-        assert_eq!(rx.recv_timeout(WAIT).unwrap(), "reims-vgpu.fifo-control");
+        assert_eq!(rx.recv_timeout(WAIT).unwrap(), "reims-vgpu.test-queue");
     }
 
     /// An exception out of a block of core's, which has no frame that catches: the search phase
     /// finds no handler, so nothing unwinds (a capture's drop never
-    /// runs) and the process dies through the host's uncaught-exception handler. On the FIFO
-    /// thread, a queue's worker and the timer's handler.
+    /// runs) and the process dies through the host's uncaught-exception handler. On a named
+    /// thread, a queue's worker and a timer's handler.
     mod a_raising_block_dies_uncaught {
         use super::*;
         use reims_vgpu_core::rt::{SerialQueue, Timer};
@@ -249,13 +249,13 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "run by fifo_thread in a child process"]
+        #[ignore = "run by named_thread in a child process"]
         fn child_thread() {
             // SAFETY: a handler of the right signature, for the process's life.
             unsafe { NSSetUncaughtExceptionHandler(Some(uncaught)) };
             let tracer = Tracer;
             MacThreads::new().spawn(
-                "reims-vgpu.fifo",
+                "reims-vgpu.test",
                 512 * 1024,
                 Box::new(move || {
                     let _held = &tracer;
@@ -303,9 +303,9 @@ mod tests {
             eprintln!("SURVIVED");
         }
 
-        /// The FIFO thread's body.
+        /// A named thread's body.
         #[test]
-        fn fifo_thread() {
+        fn named_thread() {
             dies_uncaught("child_thread");
         }
 
@@ -315,7 +315,7 @@ mod tests {
             dies_uncaught("child_async");
         }
 
-        /// The EFI present timer's handler.
+        /// A timer's handler.
         #[test]
         fn timer_handler() {
             dies_uncaught("child_timer");

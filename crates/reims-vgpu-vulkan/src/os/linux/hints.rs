@@ -1,11 +1,10 @@
-//! The scheduling hints a FIFO thread gives Linux ([`hint_fifo_thread`]): the kernel still
-//! places it, on any CPU it may run on.
+//! The scheduling hints a thread that walks the guest's command buffers gives Linux
+//! ([`hint_walk_thread`]): the kernel still places it, on any CPU it may run on.
 //!
-//! A FIFO thread runs the guest's commands one after another, so wherever the GPU keeps up its
-//! speed is the frame rate. So does a walk thread of the graphics device's lanes, which walks a
-//! command buffer's ops one after another and gives itself the same hints as it starts
-//! (`Threads::give_fifo_hints`). Linux offers an unprivileged thread hints about itself, none of which
-//! binds it to a CPU:
+//! A walk thread of the graphics device's lanes walks a command buffer's ops one after another, so
+//! wherever the GPU keeps up its speed is the frame rate; it gives itself these hints as it starts
+//! (`Threads::give_walk_hints`). Linux offers an unprivileged thread hints about itself, none of
+//! which binds it to a CPU:
 //! - **A utilization floor** (`sched_setattr`'s `SCHED_FLAG_UTIL_CLAMP_MIN`, kernel docs
 //!   "Utilization Clamping"): the thread asks to be treated as needing the CPU's full capacity,
 //!   1024, while it runs, the most the floor can ask, as macOS's user-interactive QoS is the most
@@ -35,8 +34,8 @@
 //!
 //! A thread inherits its creator's floor, so every other thread the library starts on Linux, a
 //! queue's worker or a display window's thread, drops it as it starts ([`drop_inherited_hints`]):
-//! a FIFO thread restarts an idle queue's worker when it submits to the queue, and the runtime's
-//! completion threads, which give themselves the same floor, may too. `SCHED_FLAG_RESET_ON_FORK`
+//! a walk thread may be the one that restarts an idle queue's worker, and so may the runtime's
+//! completion threads, which give themselves the same floor. `SCHED_FLAG_RESET_ON_FORK`
 //! would not do it: `sched_setattr` takes the flag only with a policy, and the floor's request
 //! keeps the thread's (`SCHED_FLAG_KEEP_POLICY`). The thread asks for the kernel's own default
 //! floor (`sched_util_min` -1), which leaves a cgroup's `cpu.uclamp.min` as it applies to every
@@ -49,8 +48,8 @@
 //! run their CPUs' own P-state selection (`intel_pstate` and `amd-pstate-epp` in active mode).
 //! Only the 275HX, a hybrid without SMT, runs capacity-aware scheduling (its `cpu_capacity` 1024,
 //! 991 and 747, so its performance cores of 991 are a lesser fit); the i9-13900H, a hybrid with
-//! SMT, reads 1024 on every CPU, and there the FIFO thread that runs WindowServer's commands
-//! spent 43-61% of a Finder drag on the efficiency cores with the floor or without it. A kernel
+//! SMT, reads 1024 on every CPU, and there a thread that ran WindowServer's commands one after
+//! another spent 43-61% of a Finder drag on the efficiency cores with the floor or without it. A kernel
 //! without `CONFIG_UCLAMP_TASK` refuses the call, and the thread runs as it would have. The first
 //! hint's outcome is logged once; a dropped floor is not logged.
 
@@ -85,15 +84,15 @@ struct SchedAttr {
     sched_util_max: u32,
 }
 
-/// Gives the calling thread, a FIFO thread, its scheduling hints (the module docs), keeping its
+/// Gives the calling thread, a walk thread, its scheduling hints (the module docs), keeping its
 /// policy, nice and CPUs. The first call logs what the kernel took.
-pub(crate) fn hint_fifo_thread() {
+pub(crate) fn hint_walk_thread() {
     let line = match set_util_floor(FULL_CAPACITY) {
         Ok(()) => format!(
-            "FIFO threads ask the scheduler for a utilization floor of {FULL_CAPACITY} of 1024"
+            "walk threads ask the scheduler for a utilization floor of {FULL_CAPACITY} of 1024"
         ),
         Err(e) => {
-            format!("FIFO threads give the scheduler no hint: sched_setattr refused it ({e})")
+            format!("walk threads give the scheduler no hint: sched_setattr refused it ({e})")
         }
     };
     static LOGGED: AtomicBool = AtomicBool::new(false);
@@ -102,7 +101,7 @@ pub(crate) fn hint_fifo_thread() {
     }
 }
 
-/// Gives the calling thread, one the library starts that is not a FIFO thread, the kernel's
+/// Gives the calling thread, one the library starts, the kernel's
 /// default utilization floor in place of the one it inherited (the module docs), keeping its
 /// policy, nice and CPUs. A kernel that refuses it leaves the thread as it started; one without
 /// `CONFIG_UCLAMP_TASK` gave it no floor to inherit.
@@ -162,10 +161,10 @@ mod tests {
         attr
     }
 
-    /// The floor a FIFO thread reads back: the full capacity, or, on a kernel without
+    /// The floor a walk thread reads back: the full capacity, or, on a kernel without
     /// `CONFIG_UCLAMP_TASK` (which has no `sched_util_clamp_min` sysctl), which refuses the hint,
     /// none.
-    fn fifo_floor() -> u32 {
+    fn walk_floor() -> u32 {
         if std::path::Path::new("/proc/sys/kernel/sched_util_clamp_min").exists() {
             FULL_CAPACITY
         } else {
@@ -188,9 +187,9 @@ mod tests {
         }
     }
 
-    /// A FIFO thread runs with the floor, its policy, nice and CPUs its creator's
+    /// A walk thread runs with the floor, its policy, nice and CPUs its creator's
     #[test]
-    fn a_fifo_thread_keeps_its_policy_nice_and_cpus() {
+    fn a_walk_thread_keeps_its_policy_nice_and_cpus() {
         let creator = read_back();
         // SAFETY: a zeroed set, filled by the kernel for the calling thread.
         let mut creator_cpus: libc::cpu_set_t = unsafe { std::mem::zeroed() };
@@ -200,9 +199,10 @@ mod tests {
         assert_eq!(rc, 0);
         let (tx, rx) = mpsc::channel();
         LinuxThreads::new().spawn(
-            "reims-vgpu.fifo",
+            "reims-vgpu.walk",
             512 * 1024,
             Box::new(move || {
+                LinuxThreads::new().give_walk_hints();
                 // SAFETY: a zeroed set, filled by the kernel for the calling thread.
                 let mut cpus: libc::cpu_set_t = unsafe { std::mem::zeroed() };
                 // SAFETY: the calling thread's mask, into a set of the size given.
@@ -215,48 +215,49 @@ mod tests {
             }),
         );
         let (attr, same_cpus) = rx.recv_timeout(WAIT).unwrap();
-        assert_eq!(attr.sched_util_min, fifo_floor());
+        assert_eq!(attr.sched_util_min, walk_floor());
         assert_eq!(attr.sched_policy, creator.sched_policy);
         assert_eq!(attr.sched_nice, creator.sched_nice);
         assert_eq!(attr.sched_runtime, creator.sched_runtime);
         assert!(same_cpus);
     }
 
-    /// A queue's worker and a thread with no hints, each started from a FIFO thread, run with
-    /// the kernel's default floor and their creator's policy and nice, while the FIFO thread
-    /// keeps its floor
+    /// A queue's worker and a named thread, each started from a walk thread, run with the
+    /// kernel's default floor and their creator's policy and nice, while the walk thread keeps
+    /// its floor
     #[test]
-    fn a_thread_started_from_a_fifo_thread_drops_its_floor() {
+    fn a_thread_started_from_a_walk_thread_drops_its_floor() {
         let (tx, rx) = mpsc::channel();
         LinuxThreads::new().spawn(
-            "reims-vgpu.fifo",
+            "reims-vgpu.walk",
             512 * 1024,
             Box::new(move || {
-                let fifo = read_back();
+                LinuxThreads::new().give_walk_hints();
+                let walk = read_back();
                 let (worker_tx, plain_tx) = (tx.clone(), tx.clone());
                 LinuxThreads::new().spawn_worker(
                     "reims-vgpu.worker",
                     Box::new(move || worker_tx.send(("worker", read_back())).unwrap()),
                 );
-                LinuxThreads::without_hints().spawn(
+                LinuxThreads::new().spawn(
                     "reims-vgpu.ui",
                     512 * 1024,
                     Box::new(move || plain_tx.send(("plain", read_back())).unwrap()),
                 );
-                tx.send(("fifo", fifo)).unwrap();
+                tx.send(("walk", walk)).unwrap();
             }),
         );
         let mut seen: Vec<(&str, SchedAttr)> =
             (0..3).map(|_| rx.recv_timeout(WAIT).unwrap()).collect();
         seen.sort_by_key(|(who, _)| *who);
-        let [(_, fifo), (_, plain), (_, worker)] = seen[..] else {
+        let [(_, plain), (_, walk), (_, worker)] = seen[..] else {
             unreachable!()
         };
-        assert_eq!(fifo.sched_util_min, fifo_floor());
+        assert_eq!(walk.sched_util_min, walk_floor());
         for attr in [plain, worker] {
             assert_eq!(attr.sched_util_min, 0);
-            assert_eq!(attr.sched_policy, fifo.sched_policy);
-            assert_eq!(attr.sched_nice, fifo.sched_nice);
+            assert_eq!(attr.sched_policy, walk.sched_policy);
+            assert_eq!(attr.sched_nice, walk.sched_nice);
         }
     }
 }

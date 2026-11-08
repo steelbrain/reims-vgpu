@@ -9,7 +9,7 @@
 //! Metal autoreleased there after the catcher's report. With no real pool (the testkit) a `Pool`
 //! does nothing.
 //!
-//! The threads core starts (a queue's worker, the FIFO thread) also keep a last-resort pool, for
+//! The threads core starts (a queue's worker, a named thread) also keep a last-resort pool, for
 //! what is autoreleased on them outside any unit: [`drain_idle`] pops it and pushes the next once
 //! the worker has left its queue, and [`drain_thread_end`] pops it at the thread's end. The
 //! thread's last-resort holder ([`crate::rt::held`]) is released first at both points.
@@ -99,11 +99,11 @@ thread_local! {
     static LAST_RESORT: Cell<Option<*mut c_void>> = const { Cell::new(None) };
 }
 
-/// A thread core started (a queue's worker, the FIFO thread), outside any unit: releases the
+/// A thread core started (a queue's worker, a named thread), outside any unit: releases the
 /// thread's last-resort holder (what was held under a hold with no holder) and makes the next,
 /// then pops its last-resort real pool, releasing what Metal autoreleased on it outside any unit,
 /// and pushes the next. A worker calls it once it has left its queue (as libdispatch's pool
-/// around a worker's drain), the FIFO thread at its start.
+/// around a worker's drain), a named thread at its start.
 pub(crate) fn drain_idle() {
     crate::rt::held::release_last_resort(true);
     let Some(n) = native() else { return };

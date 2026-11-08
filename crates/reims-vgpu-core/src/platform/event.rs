@@ -3,8 +3,7 @@
 use super::{Handle, Platform};
 use crate::raise::RaiseResult;
 
-/// `id<MTLSharedEvent>`: the FIFO's event and the service's copy of it
-/// (`newSharedEventWithHandle:`).
+/// `id<MTLSharedEvent>`, and a copy of one made from its handle (`newSharedEventWithHandle:`).
 pub trait SharedEvent<P: Platform>: Handle {
     /// sel: newSharedEventHandle (+1, released after the send). No path reaches it under a
     /// handler: a raise inside it dies at the send.
@@ -38,7 +37,7 @@ pub trait SharedEvent<P: Platform>: Handle {
 pub type Notification = Box<dyn FnOnce() + Send>;
 
 /// The event a command buffer waits on or signals: core passes both kinds to
-/// `encodeWaitForEvent:value:` and `encodeSignalEvent:value:` (the paging `MTLEvent` and the FIFO's
+/// `encodeWaitForEvent:value:` and `encodeSignalEvent:value:` (an `MTLEvent` or an
 /// `MTLSharedEvent`).
 pub enum EventRef<'a, P: Platform> {
     /// An `id<MTLEvent>` (`-[MTLDevice newEvent]`).

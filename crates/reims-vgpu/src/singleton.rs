@@ -33,7 +33,7 @@ pub(crate) fn hook_message(info: &dyn std::fmt::Display) -> String {
 }
 
 /// Installs the panic hook of architecture 6.5, once per process. A panic is a bug, and a panic
-/// in the library's code (on the FIFO thread, in one of its queue blocks, in a Metal completion
+/// in the library's code (on one of its threads, in one of its queue blocks, in a Metal completion
 /// handler, inside a public entry point or a C export, each marked by `rt::enter_ours`) ends the
 /// process as a death does: one line on stderr, then `abort()`, before anything unwinds, so no
 /// panic crosses into the host's frames and no drop runs first. Inside a refusal scope (the

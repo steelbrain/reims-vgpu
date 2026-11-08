@@ -190,8 +190,8 @@ mod tests {
     #[test]
     fn strings_carry_their_text() {
         assert_eq!(
-            string_text(&NSString::from_str("reims-vgpu.fifo")),
-            "reims-vgpu.fifo"
+            string_text(&NSString::from_str("reims-vgpu.test")),
+            "reims-vgpu.test"
         );
         assert_eq!(string_text(&NSString::from_str("")), "");
     }
