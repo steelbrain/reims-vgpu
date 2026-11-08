@@ -23,7 +23,7 @@ use ash::vk;
 use metal2vulkan_runtime as rt;
 
 pub use clock::LinuxClock;
-pub use device_lend::{DeviceLend, LendRefusal, LentDmaBuf, lend_to_devices};
+pub use device_lend::{DeviceLend, LendRefusal, LentDmaBuf, dma_buf_of_host, lend_to_devices};
 pub use files::{GuestMemoryLease, lease_guest_memory};
 pub use surface::{LinuxSurface, LinuxSurfaces, attachment};
 pub use threads::LinuxThreads;

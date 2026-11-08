@@ -8,6 +8,11 @@ use reims_vgpu_vulkan::os::GuestRamFile;
 
 use super::*;
 
+#[cfg(target_os = "linux")]
+mod dma_buf;
+#[cfg(target_os = "linux")]
+pub(crate) use dma_buf::host_dma_buf;
+
 /// The platform over metal2vulkan's runtime (architecture 2.2): the runtime's devices.
 impl ApiPlatform for VulkanPlatform {
     fn process() -> Arc<VulkanPlatform> {

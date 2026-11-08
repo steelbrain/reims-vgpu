@@ -47,7 +47,9 @@ pub(crate) use host_os::{
 /// A surface's memory lent to a device outside the runtime, on Linux (`os/linux/device_lend.rs`),
 /// and what a host attaches to a surface for as long as it lives.
 #[cfg(target_os = "linux")]
-pub use host_os::{DeviceLend, LendRefusal, LentDmaBuf, attachment, lend_to_devices};
+pub use host_os::{
+    DeviceLend, LendRefusal, LentDmaBuf, attachment, dma_buf_of_host, lend_to_devices,
+};
 pub use host_os::{
     GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, RegionMemory,
     default_driver_sizes, default_gpu_core_count, default_registry_id, install_process_services,

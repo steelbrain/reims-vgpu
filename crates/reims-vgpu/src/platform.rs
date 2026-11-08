@@ -138,6 +138,10 @@ impl HostQueue for DisplayThread {
 mod metal;
 #[cfg(vulkan_platform)]
 mod vulkan;
+/// A dma-buf of host memory the Vulkan platform mapped from files, for a device to import
+/// (`platform/vulkan/lent_memory.rs`).
+#[cfg(all(vulkan_platform, target_os = "linux"))]
+pub(crate) use vulkan::host_dma_buf;
 
 #[cfg(any(test, feature = "testkit"))]
 mod fake {

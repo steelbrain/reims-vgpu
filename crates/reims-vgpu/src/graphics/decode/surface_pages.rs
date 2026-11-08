@@ -106,6 +106,8 @@ use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_video_core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
+#[cfg(all(vulkan_platform, target_os = "linux"))]
+use reims_vgpu_video_core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use reims_vgpu_video_core::surfaces::SurfaceError;
 
 use super::worker::{Settle, Worker};
@@ -181,6 +183,16 @@ impl<P: Platform> DeviceMemory for ViewMemory<P> {
 
     fn length(&self) -> usize {
         self.length
+    }
+
+    /// A dma-buf of the view's pages behind `ranges`: the guest's RAM pages the view maps, which
+    /// the Vulkan platform's backing table resolves to the files behind them, made by udmabuf
+    /// (`platform/vulkan/lent_memory.rs`). The view is mapped while this lives.
+    #[cfg(all(vulkan_platform, target_os = "linux"))]
+    fn dma_buf_of(&self, ranges: &[(usize, usize)]) -> Result<SurfaceDmaBuf, DmaBufError> {
+        let first = NonNull::new(self.base.as_ptr::<u8>())
+            .ok_or_else(|| DmaBufError::Refused("a view at no address".to_owned()))?;
+        crate::platform::host_dma_buf(first, self.length, ranges)
     }
 
     /// The whole mapping, the surface's first byte its first, held mapped by the view's mapping

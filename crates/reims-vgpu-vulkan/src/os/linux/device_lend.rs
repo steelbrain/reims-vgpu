@@ -156,28 +156,44 @@ impl DeviceLend {
     /// them share given once, in one piece (module docs). `Err` with udmabuf's refusal, its limits
     /// named where they are what refused.
     pub fn dma_buf_of(&self, ranges: &[(u64, u64)]) -> Result<LentDmaBuf, LendRefusal> {
-        let first = self.first.as_ptr().addr().to_u64();
-        let (pages, offsets) = pages_of(first, self.length, vm::page_size(), ranges)
-            .map_err(|why| LendRefusal::Refused(why.to_owned()))?;
-        let size = pages.iter().map(|&(_, length)| length).sum();
-        match dma_buf::of_ranges(&pages, &Zeros::default()) {
-            Ok(fd) => Ok(LentDmaBuf { fd, size, offsets }),
-            Err(
-                refusal @ Refusal::Limit {
-                    pieces,
-                    bytes,
-                    limits,
-                    ..
-                },
-            ) => Err(LendRefusal::TooLarge {
+        dma_buf_of_host(self.first, self.length, ranges)
+    }
+}
+
+/// A dma-buf of `ranges` of the `length` bytes from `first`, as [`DeviceLend::dma_buf_of`] makes
+/// one of a lend's: for memory the library mapped from files, or the host registered, that is
+/// lent to a device other than through a surface (the reims-graphics device's surface views and
+/// region blocks). Each range is an offset from `first` and a length, in ascending order and
+/// apart; the pages are resolved through the backing table, so `Err` where a byte of them has no
+/// file behind it, as well as udmabuf's refusal, its limits named where they are what refused.
+///
+/// The caller keeps the `length` bytes from `first` mapped for the call.
+pub fn dma_buf_of_host(
+    first: NonNull<u8>,
+    length: u64,
+    ranges: &[(u64, u64)],
+) -> Result<LentDmaBuf, LendRefusal> {
+    let first = first.as_ptr().addr().to_u64();
+    let (pages, offsets) = pages_of(first, length, vm::page_size(), ranges)
+        .map_err(|why| LendRefusal::Refused(why.to_owned()))?;
+    let size = pages.iter().map(|&(_, length)| length).sum();
+    match dma_buf::of_ranges(&pages, &Zeros::default()) {
+        Ok(fd) => Ok(LentDmaBuf { fd, size, offsets }),
+        Err(
+            refusal @ Refusal::Limit {
                 pieces,
                 bytes,
-                most_pieces: limits.pieces,
-                most_bytes: limits.bytes,
-                why: refusal.to_string(),
-            }),
-            Err(refusal) => Err(LendRefusal::Refused(refusal.to_string())),
-        }
+                limits,
+                ..
+            },
+        ) => Err(LendRefusal::TooLarge {
+            pieces,
+            bytes,
+            most_pieces: limits.pieces,
+            most_bytes: limits.bytes,
+            why: refusal.to_string(),
+        }),
+        Err(refusal) => Err(LendRefusal::Refused(refusal.to_string())),
     }
 }
 
@@ -395,6 +411,48 @@ mod tests {
         }
         drop((lend, s));
         free(at, 4 * page);
+    }
+
+    /// A dma-buf of a view the library mapped, made by its address rather than through a lend,
+    /// holds the pages the view shows there; memory no file is behind is refused
+    #[test]
+    fn a_dma_buf_of_host_memory_holds_the_pages_its_mapping_shows() {
+        let page = vm::page_size();
+        let (at, ranges) = scattered_pages(3);
+        let s = LinuxSurfaces::new().create(&over(&ranges, None)).unwrap();
+        let view = s.base_address().addr().to_u64() - 0x40;
+        let first =
+            NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(view.to_usize())).unwrap();
+        match dma_buf_of_host(first, 3 * page, &[(page + 0x80, 0x100)]) {
+            Ok(made) => {
+                assert_eq!((made.size, &made.offsets[..]), (page, &[0x80][..]));
+                // The view's page 1 shows file page 1, its pages being the guest's last first.
+                assert_eq!(through(&made, |bytes| bytes[0]), 1);
+            }
+            Err(why) => eprintln!("no dma-buf here, the rest checked: {why:?}"),
+        }
+        // SAFETY: a fresh private anonymous mapping, unmapped below.
+        let anonymous = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(anonymous, libc::MAP_FAILED);
+        let plain = NonNull::new(anonymous.cast::<u8>()).unwrap();
+        let refused = dma_buf_of_host(plain, page, &[(0, page)]);
+        assert!(
+            matches!(refused, Err(LendRefusal::Refused(_))),
+            "{refused:?}"
+        );
+        // SAFETY: the mapping made above, which nothing holds.
+        unsafe { libc::munmap(anonymous, page.to_usize()) };
+        drop(s);
+        free(at, 3 * page);
     }
 
     /// The pages of ranges: merged where two share or meet a page, each range's offset in the
