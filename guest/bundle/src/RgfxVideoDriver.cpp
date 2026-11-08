@@ -479,6 +479,9 @@ struct Context {
 	std::vector<uint8_t> sent;
 	// A decode of the session's failed on the host since its last failed schedule.
 	std::atomic<bool> failed_on_host{false};
+	// Where its HEVC pictures' frame records describe their surfaces, once a picture's has shown
+	// it (FrameDescription::packed), and 0 until then.
+	std::atomic<uint32_t> hevc_description{0};
 };
 
 // The live sessions, whose output textures go when AppleGVA frees its frames' pool.
@@ -660,23 +663,100 @@ IOSurfaceRef outputSurface(const Command *c)
 	return out ? (IOSurfaceRef)u64At(out, 0x10) : nullptr;
 }
 
-// The surface AppleGVA decodes an HEVC picture into. An HEVC decode command carries no output on
-// the command (c->output is null and there is no following transfer command, unlike H.264); the
-// output frame is named in the decode's parameters, in AppleGVA's own decoded-picture record. The
-// record pointer is at P+0x10, its current frame at the record's +0x08 (`field_08`), and that
-// frame's global IOSurface id at the frame's +0x88 (`field_88`). Measured on the RTX 5080
-// (2026-11-03): the id there is the IOSurface VideoToolbox hands back for the picture (picture 0
-// -> id 7, picture 1 -> id 27, matching the decoder's output). The returned surface is retained;
-// the caller releases it.
-IOSurfaceRef hevcOutputSurface(const uint8_t *P)
+// Where an HEVC frame record of AppleGVA's describes its surface (hevcOutputSurface). Every
+// release measured describes it with the same seven fields, in order: the surface's global id, a
+// size, its width, its height, a pitch, 8 bytes and its pixel format. Where the fields start in
+// the frame and how wide each is differ by release; each is read as a u32 at its start:
+// - fields of 8 bytes from +0x88 on macOS 26.7.2 (measured on the 780M, 2026-11-08: ids 14 and 22
+//   for 3840x2160 'x420' and 320x240 '420v' surfaces; and on the RTX 5080, 2026-11-03: the id is
+//   that of the IOSurface VideoToolbox hands back for the picture, 7 for picture 0, 27 for
+//   picture 1);
+// - fields of 8 bytes from +0x80 on macOS 14.8.9 (measured on the RTX 5080, 2026-11-08: ids 10
+//   and 33 for 3840x2160 'x420' and 320x240 '420v' surfaces);
+// - fields of 4 bytes from +0x80 on macOS 13.7.8 (measured on the 780M, 2026-11-08: ids 6, 7, 9
+//   and 15 for 6016x6016 and 1024x1024 '420f' and 320x240 '420v' surfaces).
+// So the driver finds the layout instead of listing them: every start from kDescriptionFirst to
+// kDescriptionLast in steps of 4, with fields of 4 or 8 bytes, the farthest read the pixel format
+// of 8-byte fields from kDescriptionLast, at +0xd0.
+struct FrameDescription {
+	uint32_t start, fieldBytes;
+	size_t field(size_t index) const { return start + index * fieldBytes; }
+	size_t id() const { return field(0); }
+	size_t width() const { return field(2); }
+	size_t height() const { return field(3); }
+	size_t format() const { return field(6); }
+	// As Context::hevc_description keeps it, never 0.
+	uint32_t packed() const { return start << 8 | fieldBytes; }
+	static FrameDescription unpacked(uint32_t p) { return {p >> 8, p & 0xff}; }
+};
+constexpr uint32_t kDescriptionFirst = 0x70, kDescriptionLast = 0xa0;
+constexpr uint32_t kFieldBytes[] = {4, 8};
+
+// The frame AppleGVA's decoded-picture record names for an HEVC picture: the record pointer is at
+// P+0x10 and its current frame at the record's +0x08 (`field_08`). Null where either is.
+const uint8_t *hevcFrame(const uint8_t *P)
 {
 	const uint8_t *record = (const uint8_t *)u64At(P, 0x10);
-	if (!record)
+	return record ? (const uint8_t *)u64At(record, 0x08) : nullptr;
+}
+
+// The surface description `d` of `frame` names, where it is one whose width, height and pixel
+// format `d` gives: retained, or null.
+IOSurfaceRef describedSurface(const uint8_t *frame, FrameDescription d)
+{
+	IOSurfaceRef surface = IOSurfaceLookup(u32At(frame, d.id()));
+	if (!surface)
 		return nullptr;
-	const uint8_t *frame = (const uint8_t *)u64At(record, 0x08);
+	if (IOSurfaceGetWidth(surface) == u32At(frame, d.width()) &&
+	    IOSurfaceGetHeight(surface) == u32At(frame, d.height()) &&
+	    IOSurfaceGetPixelFormat(surface) == u32At(frame, d.format()))
+		return surface;
+	CFRelease(surface);
+	return nullptr;
+}
+
+// Why an HEVC picture's frame record gave no output surface.
+enum class NoOutput { kNone, kMany, kNotInSessionLayout };
+
+// The surface AppleGVA decodes an HEVC picture into. An HEVC decode command carries no output on
+// the command (c->output is null and there is no following transfer command, unlike H.264); the
+// output frame is named in the decode's parameters, in AppleGVA's own decoded-picture record
+// (hevcFrame), which describes its surface (FrameDescription). The first picture of `context`'s
+// whose frame describes a surface in exactly one layout of the search window shows the session's
+// layout, which `context` keeps; a later picture's surface is the one its frame describes in that
+// layout. A frame that describes none, or describes one in more than one layout, gives none, and
+// *why says which. The returned surface is retained; the caller releases it.
+IOSurfaceRef hevcOutputSurface(Context *context, const uint8_t *P, NoOutput *why)
+{
+	*why = NoOutput::kNone;
+	const uint8_t *frame = hevcFrame(P);
 	if (!frame)
 		return nullptr;
-	return IOSurfaceLookup(u32At(frame, 0x88));
+	if (const uint32_t known = context->hevc_description.load(std::memory_order_relaxed)) {
+		IOSurfaceRef surface = describedSurface(frame, FrameDescription::unpacked(known));
+		if (!surface)
+			*why = NoOutput::kNotInSessionLayout;
+		return surface;
+	}
+	IOSurfaceRef only = nullptr;
+	FrameDescription found = {};
+	for (uint32_t bytes : kFieldBytes)
+		for (uint32_t start = kDescriptionFirst; start <= kDescriptionLast; start += 4) {
+			IOSurfaceRef surface = describedSurface(frame, {start, bytes});
+			if (!surface)
+				continue;
+			if (only) {
+				CFRelease(only);
+				CFRelease(surface);
+				*why = NoOutput::kMany;
+				return nullptr;
+			}
+			only = surface;
+			found = {start, bytes};
+		}
+	if (only)
+		context->hevc_description.store(found.packed(), std::memory_order_relaxed);
+	return only;
 }
 
 // Where in its output surface an HEVC picture lands, in luma samples: its tile's place in an HEIF
@@ -783,50 +863,63 @@ void *decodeHevcPicture(const Command *c)
 		notSent(said, "its parameter sets are refused");
 		return nullptr;
 	}
-	IOSurfaceRef output = hevcOutputSurface(P);
+	NoOutput why;
+	IOSurfaceRef output = hevcOutputSurface(context, P, &why);
+	if (!output) {
+		static_assert(kDescriptionFirst == 0x70 && kDescriptionLast == 0xa0,
+		              "the lines below name the search window");
+		static std::atomic<bool> none, many, session;
+		if (why == NoOutput::kMany)
+			notSent(many, "its frame record describes a surface in more than one layout "
+			              "from +0x70 to +0xa0");
+		else if (why == NoOutput::kNotInSessionLayout)
+			notSent(session, "its frame record describes no surface of its own "
+			                 "in its session's layout");
+		else
+			notSent(none, "its frame record describes no surface of its own "
+			              "from +0x70 to +0xa0");
+		return nullptr;
+	}
 	// A tile's place lies inside its canvas, of whole chroma samples, and the part of it that
 	// lands there is what the SPS's conformance window crops it to, which is what the host's copy
 	// lands.
 	const Place place = hevcTilePlace(P);
 	uint32_t width, height;
 	hevcPictureSize(*sps, &width, &height);
-	if (output) {
-		const uint32_t whole[2] = {width, height};
-		const size_t across = IOSurfaceGetWidth(output), down = IOSurfaceGetHeight(output);
-		if (place.x < across && place.y < down)
-			clipToSurface(place, across, down, &width, &height);
-		if (place.x % 2 || place.y % 2 || place.x >= across || place.y >= down || width == 0 ||
-		    height == 0) {
+	const uint32_t whole[2] = {width, height};
+	const size_t across = IOSurfaceGetWidth(output), down = IOSurfaceGetHeight(output);
+	if (place.x < across && place.y < down)
+		clipToSurface(place, across, down, &width, &height);
+	if (place.x % 2 || place.y % 2 || place.x >= across || place.y >= down || width == 0 ||
+	    height == 0) {
+		static std::atomic<bool> said;
+		notSent(said, "its place lies off its output surface");
+		CFRelease(output);
+		return nullptr;
+	}
+	// The SPS sent crops the picture to that part: its window grown on the right and the bottom,
+	// in chroma samples.
+	if (width != whole[0] || height != whole[1]) {
+		auto cropped = std::make_unique<rgfx::video::h265::Sps>(*sps);
+		if (!sps->conformance_window_flag) {
+			cropped->conformance_window_flag = 1;
+			cropped->conf_win_left_offset = cropped->conf_win_right_offset = 0;
+			cropped->conf_win_top_offset = cropped->conf_win_bottom_offset = 0;
+		}
+		cropped->conf_win_right_offset += (whole[0] - width) / 2;
+		cropped->conf_win_bottom_offset += (whole[1] - height) / 2;
+		sets.clear();
+		if (!rgfx::video::h265::writeSps(*cropped, sets) ||
+		    !rgfx::video::h265::writePps(*pps, sets)) {
 			static std::atomic<bool> said;
-			notSent(said, "its place lies off its output surface");
+			notSent(said, "its parameter sets are refused");
 			CFRelease(output);
 			return nullptr;
-		}
-		// The SPS sent crops the picture to that part: its window grown on the right and the
-		// bottom, in chroma samples.
-		if (width != whole[0] || height != whole[1]) {
-			auto cropped = std::make_unique<rgfx::video::h265::Sps>(*sps);
-			if (!sps->conformance_window_flag) {
-				cropped->conformance_window_flag = 1;
-				cropped->conf_win_left_offset = cropped->conf_win_right_offset = 0;
-				cropped->conf_win_top_offset = cropped->conf_win_bottom_offset = 0;
-			}
-			cropped->conf_win_right_offset += (whole[0] - width) / 2;
-			cropped->conf_win_bottom_offset += (whole[1] - height) / 2;
-			sets.clear();
-			if (!rgfx::video::h265::writeSps(*cropped, sets) ||
-			    !rgfx::video::h265::writePps(*pps, sets)) {
-				static std::atomic<bool> said;
-				notSent(said, "its parameter sets are refused");
-				CFRelease(output);
-				return nullptr;
-			}
 		}
 	}
 	void *work =
 	    commitPicture(context, sets, bytes + first, end - first, output, place, width, height);
-	if (output)
-		CFRelease(output);
+	CFRelease(output);
 	return work;
 }
 

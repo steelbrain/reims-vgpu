@@ -468,23 +468,39 @@ void checkUnsentDecode()
 	CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
 }
 
+// Where an output frame describes its surface: its fields' start and their width, the id at the
+// start, the width, height and pixel format the third, fourth and seventh fields. The three
+// releases measured: macOS 26's record (8-byte fields from +0x88), 14's (8 from +0x80) and 13's
+// (4 from +0x80).
+struct Described {
+	size_t start, fieldBytes;
+	size_t id() const { return start; }
+	size_t width() const { return start + 2 * fieldBytes; }
+	size_t height() const { return start + 3 * fieldBytes; }
+	size_t format() const { return start + 6 * fieldBytes; }
+};
+constexpr Described kMacOS26 = {0x88, 8}, kMacOS14 = {0x80, 8}, kMacOS13 = {0x80, 4};
+
 // An HEVC picture's parameters as AppleGVA lays them out, as far as the driver reads them: its
-// output frame's surface id (P+0x10, the record's +0x08, the frame's +0x88), its SPS and PPS
-// (P+0x18, P+0x20), its one slice segment in buffer 0 of its pool (P+0x28 and P+0x30, the
-// record's +0x08, +0x10 and +0x18) and its tile's place (P+0x58, P+0x5c).
+// output frame's description of its surface (P+0x10, the record's +0x08, then as `described`
+// places it), its SPS and PPS (P+0x18, P+0x20), its one slice segment in buffer 0 of its pool
+// (P+0x28 and P+0x30, the record's +0x08, +0x10 and +0x18) and its tile's place (P+0x58,
+// P+0x5c).
 struct HevcPicture {
-	uint8_t frame[0x90] = {};
+	// As far as the driver's search reads (to +0xd4).
+	uint8_t frame[0xd8] = {};
 	const uint8_t *record[2] = {nullptr, frame};
 	uint8_t slice[0x328] = {};
 	uint8_t parameters[0x60] = {};
 
 	HevcPicture(IOSurfaceRef output, const rgfx::video::h265::Sps &sps,
-	            const rgfx::video::h265::Pps &pps, uint32_t x, uint32_t y, uint32_t bytes)
+	            const rgfx::video::h265::Pps &pps, uint32_t x, uint32_t y, uint32_t bytes,
+	            const Described &described = kMacOS26)
 	{
-		const uint32_t id = IOSurfaceGetID(output), slices = 1, index = 0, offset = 0;
+		const uint32_t slices = 1, index = 0, offset = 0;
 		const void *at[3] = {record, &sps, &pps};
 		const uint8_t *segments = slice;
-		std::memcpy(frame + 0x88, &id, 4);
+		describe(output, described);
 		std::memcpy(slice + 0x08, &index, 4);
 		std::memcpy(slice + 0x10, &offset, 4);
 		std::memcpy(slice + 0x18, &bytes, 4);
@@ -493,6 +509,18 @@ struct HevcPicture {
 		std::memcpy(parameters + 0x30, &segments, 8);
 		std::memcpy(parameters + 0x58, &x, 4);
 		std::memcpy(parameters + 0x5c, &y, 4);
+	}
+
+	// Describes `output` in the frame as `described` places it.
+	void describe(IOSurfaceRef output, const Described &described)
+	{
+		const uint32_t id = IOSurfaceGetID(output), width = (uint32_t)IOSurfaceGetWidth(output),
+		               height = (uint32_t)IOSurfaceGetHeight(output),
+		               format = IOSurfaceGetPixelFormat(output);
+		std::memcpy(frame + described.id(), &id, 4);
+		std::memcpy(frame + described.width(), &width, 4);
+		std::memcpy(frame + described.height(), &height, 4);
+		std::memcpy(frame + described.format(), &format, 4);
 	}
 };
 
@@ -520,6 +548,24 @@ std::vector<uint8_t> setsOf(const rgfx::video::h265::Sps &sps, const rgfx::video
 	return sets;
 }
 
+// A surface of `width` by `height` samples of a byte each.
+IOSurfaceRef canvas(uint32_t width, uint32_t height)
+{
+	CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+	    nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	const int32_t values[3] = {(int32_t)width, (int32_t)height, 1};
+	const CFStringRef keys[3] = {kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement};
+	for (int i = 0; i < 3; i++) {
+		CFNumberRef n = CFNumberCreate(nullptr, kCFNumberSInt32Type, &values[i]);
+		CFDictionarySetValue(props, keys[i], n);
+		CFRelease(n);
+	}
+	IOSurfaceRef s = IOSurfaceCreate(props);
+	CFRelease(props);
+	CHECK(s != nullptr, "a %ux%u surface", width, height);
+	return s;
+}
+
 // Each HEVC tile of an HEIF grid lands at the place AppleGVA names (hevcTilePlace) in its canvas,
 // cropped to the canvas: a tile of the last column or row of a canvas of no whole number of tiles
 // is sent with an SPS whose conformance window crops it there, a canvas's odd remainder losing
@@ -537,21 +583,6 @@ void checkTileLanding()
 	std::memset((void *)bitstream, 0x5a, kBytes);
 	// A canvas of 2000x1400 for tiles of 512x512, as the RTX 5080 host's measured one; and one of
 	// an odd width.
-	auto canvas = [](uint32_t width, uint32_t height) {
-		CFMutableDictionaryRef props = CFDictionaryCreateMutable(
-		    nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-		const int32_t values[3] = {(int32_t)width, (int32_t)height, 1};
-		const CFStringRef keys[3] = {kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement};
-		for (int i = 0; i < 3; i++) {
-			CFNumberRef n = CFNumberCreate(nullptr, kCFNumberSInt32Type, &values[i]);
-			CFDictionarySetValue(props, keys[i], n);
-			CFRelease(n);
-		}
-		IOSurfaceRef s = IOSurfaceCreate(props);
-		CFRelease(props);
-		CHECK(s != nullptr, "a %ux%u surface", width, height);
-		return s;
-	};
 	IOSurfaceRef surface = canvas(2000, 1400), odd = canvas(2001, 1400);
 	static rgfx::video::h265::Sps sps, cropped, windowed, windowedCropped;
 	static rgfx::video::h265::Pps pps;
@@ -621,6 +652,104 @@ void checkTileLanding()
 	      "FreeBitstreamBufferPool");
 	CFRelease(surface);
 	CFRelease(odd);
+}
+
+// An HEVC picture's frame describes its surface where its release lays the description out
+// (hevcOutputSurface): the driver searches the frame for the one layout, of fields of 4 or 8 bytes
+// from +0x70 to +0xa0, that names its surface, and its session keeps the layout its first picture
+// shows. Each release's measured layout lands its picture in its surface, as do the window's
+// ends; a description from outside the window, or whose width, height or pixel format is not its
+// surface's, names none, before the session has a layout and after. A frame that describes its
+// surface in two layouts names none and shows its session no layout. A session keeps the layout
+// its first picture showed.
+void checkFrameDescriptions()
+{
+	g_sent.clear();
+	constexpr uint32_t kBytes = 0x1000;
+	const uint64_t bitstream = allocate(g_driver, 0, 0x10000);
+	CHECK(bitstream != 0, "the bitstream pool refused");
+	std::memset((void *)bitstream, 0x5a, kBytes);
+	IOSurfaceRef surface = canvas(512, 512);
+	static rgfx::video::h265::Sps sps;
+	static rgfx::video::h265::Pps pps;
+	sps.chroma_format_idc = 1;
+	sps.pic_width_in_luma_samples = sps.pic_height_in_luma_samples = 512;
+	auto session = [] {
+		std::vector<void *> contexts;
+		CHECK(makeContexts(1, contexts, kCodecHevc) == kOk, "a create of one HEVC decode");
+		return contexts.empty() ? nullptr : contexts[0];
+	};
+	auto finish = [](void *context) {
+		ContextDelete del = {1, 0, &context};
+		CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+	};
+	auto lands = [&](void *context, const HevcPicture &picture, const char *what) {
+		g_sent.clear();
+		CHECK(scheduleHevc(context, picture) == kOk, "%s not sent", what);
+		CHECK(g_sent.size() == 1 && g_sent[0].surface == IOSurfaceGetID(surface),
+		      "%s sent %zu times", what, g_sent.size());
+	};
+	auto refused = [&](void *context, const HevcPicture &picture, const char *what) {
+		g_sent.clear();
+		CHECK(scheduleHevc(context, picture) == kNotSent, "%s sent", what);
+		CHECK(g_sent.empty(), "%s reached the host", what);
+	};
+	char what[128];
+	for (const Described &described : {kMacOS26, kMacOS14, kMacOS13}) {
+		const size_t fields[] = {described.width(), described.height(), described.format()};
+		void *context = session();
+		for (int known = 0; known < 2; known++) {
+			for (size_t field : fields) {
+				HevcPicture wrong(surface, sps, pps, 0, 0, kBytes, described);
+				wrong.frame[field] ^= 1;
+				snprintf(what, sizeof what,
+				         "a description in %zu-byte fields from +0x%zx, its +0x%zx not its surface's, "
+				         "%s",
+				         described.fieldBytes, described.start, field,
+				         known ? "on its layout's session" : "first");
+				refused(context, wrong, what);
+			}
+			snprintf(what, sizeof what, "a picture described in %zu-byte fields from +0x%zx, %s",
+			         described.fieldBytes, described.start, known ? "again" : "first");
+			lands(context, HevcPicture(surface, sps, pps, 0, 0, kBytes, described), what);
+		}
+		finish(context);
+	}
+	for (const Described &described : {Described{0x70, 4}, Described{0x70, 8},
+	                                   Described{0xa0, 4}, Described{0xa0, 8}}) {
+		void *context = session();
+		snprintf(what, sizeof what, "a picture described in %zu-byte fields from +0x%zx",
+		         described.fieldBytes, described.start);
+		lands(context, HevcPicture(surface, sps, pps, 0, 0, kBytes, described), what);
+		finish(context);
+	}
+	for (const Described &described : {Described{0x6c, 8}, Described{0xa4, 4}}) {
+		void *context = session();
+		snprintf(what, sizeof what, "a picture described in %zu-byte fields from +0x%zx",
+		         described.fieldBytes, described.start);
+		refused(context, HevcPicture(surface, sps, pps, 0, 0, kBytes, described), what);
+		finish(context);
+	}
+	{
+		void *context = session();
+		HevcPicture twice(surface, sps, pps, 0, 0, kBytes, kMacOS14);
+		twice.describe(surface, Described{0x70, 4});
+		refused(context, twice, "a picture described in two layouts");
+		lands(context, HevcPicture(surface, sps, pps, 0, 0, kBytes, kMacOS13),
+		      "macOS 13's description after one in two layouts");
+		finish(context);
+	}
+	{
+		void *context = session();
+		lands(context, HevcPicture(surface, sps, pps, 0, 0, kBytes, kMacOS26),
+		      "macOS 26's description first");
+		refused(context, HevcPicture(surface, sps, pps, 0, 0, kBytes, kMacOS13),
+		        "macOS 13's description on a session of 26's layout");
+		finish(context);
+	}
+	CHECK(callOn(g_driver, kFreeBitstreamBufferPool, (const void *)0) == kOk,
+	      "FreeBitstreamBufferPool");
+	CFRelease(surface);
 }
 
 // The answers are the host's: each bitstream alignment its decoders' (256), and a frame's planes
@@ -912,6 +1041,7 @@ int main()
 	checkDelete();
 	checkUnsentDecode();
 	checkTileLanding();
+	checkFrameDescriptions();
 	checkNoZeroAnswers();
 	checkTileInfo();
 	checkTileInfoRefused();

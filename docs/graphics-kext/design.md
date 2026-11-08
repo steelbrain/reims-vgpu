@@ -673,13 +673,25 @@ Stages:
       carries the output surface; an HEVC decode is a bare decode command with
       no output on it and no transfer command. AppleGVA names the output frame
       in its own decoded-picture record instead: the record pointer at the
-      parameters' `+0x10`, its current frame at the record's `+0x08`, and that
-      frame's global IOSurface id at the frame's `+0x88`. The driver looks the
-      surface up there (`guest/bundle/src/RgfxVideoDriver.cpp`,
-      `hevcOutputSurface`; measured on the guest with the RTX 5080: the id is
-      that of the IOSurface VideoToolbox hands back for the picture, 7 for
-      picture 0 and 27 for picture 1, and an IDR with no references resolves
-      there too).
+      parameters' `+0x10`, its current frame at the record's `+0x08`, and in
+      that frame a description of its surface: the global IOSurface id, a
+      size, the width, the height, a pitch, 8 bytes, then the pixel format.
+      Where the fields start and how wide each is differ by release: on
+      macOS 26 fields of 8 bytes from the frame's `+0x88` (measured on the
+      guest with the RTX 5080: the id is that of the IOSurface VideoToolbox
+      hands back for the picture, 7 for picture 0 and 27 for picture 1, and
+      an IDR with no references resolves there too; and on 26.7.2 with the
+      780M), on macOS 14 fields of 8 bytes from `+0x80` (measured on 14.8.9
+      with the RTX 5080), on macOS 13 fields of 4 bytes from `+0x80`
+      (measured on 13.7.8 with the 780M). So the driver searches for the
+      layout rather than listing them: every start from `+0x70` to `+0xa0`
+      in steps of 4, with fields of 4 or 8 bytes, where the id names a live
+      surface whose width, height and pixel format the description gives.
+      The first picture of a session whose frame describes its surface in
+      exactly one layout shows the session's layout, which the session keeps;
+      a picture whose frame describes no surface, or one in more than one
+      layout, or none in its session's layout, is refused before it reaches
+      the host (`guest/bundle/src/RgfxVideoDriver.cpp`, `hevcOutputSurface`).
     - **A decode the driver cannot complete is a decode error, never a silent
       success.** AppleGVA reports a decode error only when scheduling the
       command fails: a schedule that answers 5 reaches the client as
