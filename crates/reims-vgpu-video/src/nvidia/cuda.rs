@@ -61,7 +61,11 @@ impl Cuda {
             _library: library,
         };
         // SAFETY: cuInit takes flags, which must be 0.
-        cuda.check("cuInit", unsafe { (cuda.f.cuInit)(0) })?;
+        let init = unsafe { (cuda.f.cuInit)(0) };
+        // As after the library's load (`Library::open`): what cuInit registered runs after the
+        // host's exit gate's handler.
+        super::wait::arm_exit();
+        cuda.check("cuInit", init)?;
         let mut version: c_int = 0;
         // SAFETY: the pointer is to a live c_int.
         cuda.check("cuDriverGetVersion", unsafe {

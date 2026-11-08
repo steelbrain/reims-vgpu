@@ -48,6 +48,18 @@ static RUNTIME: OnceLock<Arc<dyn Runtime>> = OnceLock::new();
 /// yet: the backend's opening calls it.
 pub(crate) fn use_runtime(runtime: &Arc<dyn Runtime>) {
     RUNTIME.get_or_init(|| Arc::clone(runtime));
+    // After the libraries loaded before it, as after each later ([`arm_exit`]).
+    arm_exit();
+}
+
+/// Registers the runtime's exit gate's handler again ([`Runtime::arm_exit`]), after a driver's
+/// library loaded or initialised (`super::dl::Library::open`, `cuInit`), so that it runs before
+/// what the library registered for the process's exit; nothing before the backend's opening
+/// made the runtime, which arms it then ([`use_runtime`]).
+pub(crate) fn arm_exit() {
+    if let Some(runtime) = RUNTIME.get() {
+        runtime.arm_exit();
+    }
 }
 
 /// The runtime the crate's waits run on.

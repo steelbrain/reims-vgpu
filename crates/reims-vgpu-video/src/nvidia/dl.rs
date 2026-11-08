@@ -91,6 +91,9 @@ impl Library {
         // initialisers, which for the driver's libraries register nothing
         // in this process's globals.
         let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
+        // The library may have registered exit-time destructors: the host's exit gate runs its
+        // handler before them (`Runtime::arm_exit`).
+        super::wait::arm_exit();
         match NonNull::new(handle) {
             Some(handle) => Ok(Self {
                 handle,

@@ -17,8 +17,9 @@
 //! - **A step** around a thread's job ([`Runtime::exit_step`]) is a step of the library's exit
 //!   gate ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for the calls into the
 //!   hardware's libraries in progress, and refuses the next. The gate's hook is registered again
-//!   as a video crate loads a driver ([`Runtime::arm_exit`]: a VA display's, as it opens), so it
-//!   runs before that driver's exit-time destructors.
+//!   as a video crate loads a driver ([`Runtime::arm_exit`]: a VA display's, as it opens, and the
+//!   NVIDIA arm's libraries, as each loads and as `cuInit` runs), so it runs before that driver's
+//!   exit-time destructors.
 
 use std::sync::Arc;
 
