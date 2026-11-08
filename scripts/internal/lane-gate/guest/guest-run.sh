@@ -66,15 +66,16 @@ run_info() {
 	*com.steelbrain.ReimsGraphics\ *) item kexts PASS "$kexts" ;;
 	*) item kexts FAIL "ReimsGraphics is not loaded: $kexts" ;;
 	esac
-	# The loader's log says whether every site of ReimsGraphics resolved: guest/loader's
-	# ReimsGraphicsLoader keeps it in LoaderLog, the older AppleParavirtGPULoader in ApvLoadLog.
-	local ld bind
-	ld=$({ ioreg -l -w0 -c ReimsGraphicsLoader; ioreg -l -w0 -c AppleParavirtGPULoader; } 2>/dev/null |
-		grep -o -E 'ReimsGraphics:[^"]{0,160}')
-	bind=$(echo "$ld" | grep -o -E 'ReimsGraphics: all [0-9]+ sites resolved.{0,40}' | head -1)
-	if [ -n "$bind" ]; then item loader-bind PASS "$bind"; else
-		item loader-bind FAIL "$(echo "$ld" | head -2 | tr '\n' ' ')"
-	fi
+	# Graft says whether it bound ReimsGraphics: the registry root's
+	# GraftClient.com.steelbrain.ReimsGraphics starts with "bound" once every site and vtable
+	# is written and its personalities are published, and names what it declined otherwise.
+	local bind
+	bind=$(ioreg -l -w0 -d1 2>/dev/null | grep -o -E '"GraftClient\.com\.steelbrain\.ReimsGraphics" = "[^"]{0,160}"' |
+		sed 's/^[^=]*= //')
+	case $bind in
+	'"bound'*) item graft-bind PASS "$bind" ;;
+	*) item graft-bind FAIL "${bind:-no GraftClient.com.steelbrain.ReimsGraphics on the registry root}" ;;
+	esac
 	local b=/Library/GPUBundles/reims-graphics.bundle
 	if codesign -v --strict "$b" 2>/dev/null; then
 		item bundle PASS "$(shasum "$b/Contents/MacOS/reims-graphics" | cut -c1-16) $(codesign -dvvv "$b" 2>&1 | grep -E '^CDHash=' | head -1)"

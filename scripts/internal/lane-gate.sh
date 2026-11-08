@@ -85,13 +85,13 @@
 # What it runs: the Mac builds the guest's side, and the lane host runs the rest as potluck jobs
 # (potluck's lease is the lock), dispatched from a throwaway commit of the run's own (do_ship):
 #   Mac:  the guest kexts, bundle and tools (lane-gate/guest: guest-run.sh's payload), and the
-#         loader built for the candidate's ReimsGraphics (lane-gate/mac-loader.sh). The Mac's
+#         kext set: guest/graft's Graft and the candidate's ReimsGraphics and RgfxGate. The Mac's
 #         checks (`make -C guest/kext check`, the kext's, bundle's and RgfxGate's tests, `cargo fmt
 #         --all --check` and the cargo tests the change reaches) do not run as potluck jobs yet:
 #         a gate runs with --skip mac;
 #   host: one job with no GPU (lane-gate/msi-job.sh build): the candidate's library dist, option
-#         ROMs and QEMU (lane-gate/msi-build.sh), and its SIP-on OpenCore image (the Mac's loader
-#         kexts and RgfxGate carrying its bundle, lane-gate/msi-image.sh), and publishing;
+#         ROMs and QEMU (lane-gate/msi-build.sh), and its SIP-on OpenCore image (the set's kexts,
+#         RgfxGate carrying its bundle, lane-gate/msi-image.sh), and publishing;
 #   boot: the correctness boot, which decides: one cold boot on overlays (lane-gate/msi-boot.sh,
 #         through lane-gate/msi-launch.sh), a job holding the 5080 and the whole host
 #         (--exclusive), after running builds end and the CPU package cools below 80 C, running
@@ -112,7 +112,7 @@
 # and never change the exit.
 #
 # Its state is under LANE_GATE_HOME (default ~/.cache/rgk-lane-gate): config.sh (this host's
-# paths: the KDK, the loader builder, the lane host's; config.sh's comments say what each is),
+# paths: the KDK, the lane host's; config.sh's comments say what each is),
 # tree/ (a worktree the gate checks commits out into, so builds there are incremental),
 # target/, runs/RUNID/ (steps/, artifacts/, results/, report.txt), baselines/SHA/runs/*.json
 # and LAST, and noise.json. One gate runs at a time on the Mac.
@@ -130,7 +130,7 @@ if [[ -z ${LANE_GATE_LOCKED:-} && " $* " != *" --bench-only "* && " $* " != *" -
   export LANE_GATE_LOCKED=1
   exec lockf -t 0 "$GH/lock" "$0" "$@"
 fi
-[[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK, loader builder and lane host"
+[[ -f $GH/config.sh ]] || die "no $GH/config.sh: it names this host's KDK and lane host"
 . "$GH/config.sh"
 
 shared_boot=0 record=0 landed=0 qemu_hook= bench_host_log= base_sha= resume= image= host_dir= load= skip= phases= bench_phases= boot_tag= host_log= capture=0 appload=1 appload_info= rev=HEAD bench=detach publish=0 probe_tip=0 keep_ws=0 boot_only=0 prio= post_probes= advance=
@@ -279,7 +279,7 @@ do_guest_build() {
   cp "$L/guest/"* "$P/"
   # RgfxGate's payload is the bundle it carries; its Makefile does not see the bundle change.
   make -C guest/rgfxgate clean
-  make -C guest/rgfxgate DEPS="$RGFXGATE_DEPS" BUNDLE_DIR="$TREE/guest/bundle/build/package/reims-graphics.bundle"
+  make -C guest/rgfxgate BUNDLE_DIR="$TREE/guest/bundle/build/package/reims-graphics.bundle"
   cp -R guest/kext/build/ReimsGraphics.kext guest/rgfxgate/build/RgfxGate.kext "$ART/"
   cp guest/bundle/build/reims-graphics.bundle.tgz "$ART/"
   # The codecs the candidate's device offers the guest where the host decodes them: H.264 where
@@ -301,9 +301,13 @@ do_guest_build() {
 
 # --- the Mac's checks -------------------------------------------------------------------------
 
+# The kext's imports and layout against the KDK, then the set linked into BOOT_KC with
+# OpenCore's linker, ReimsGraphics still bindable by Graft (guest/'s set-check).
 do_kext_check() {
   [[ -n $KDK && -n $KEXTINJECT && -n $BOOT_KC ]]
-  make -C "$TREE/guest/kext" check KDK="$KDK" KEXTINJECT="$KEXTINJECT" BOOT_KC="$BOOT_KC" | tee "$RES/kext-check.txt"
+  make -C "$TREE/guest/kext" check KDK="$KDK" | tee "$RES/kext-check.txt"
+  make -C "$TREE/guest" set OUT="$ART/set"
+  make -C "$TREE/guest" set-check SET="$ART/set" KEXTINJECT="$KEXTINJECT" BOOT_KC="$BOOT_KC" | tee -a "$RES/kext-check.txt"
   ! grep -q SKIPPED "$RES/kext-check.txt"
 }
 do_kext_test() { make -C "$TREE/guest/kext" test; }
@@ -487,11 +491,13 @@ pl_cleanup() {
   say "  potluck: released ${ws:-no workspace}; removed $SHIP_WT and $SHIP_BRANCH"
 }
 
-do_loader() {  # the loader that matches the candidate's ReimsGraphics, built here (mac-loader.sh)
+# The set's kexts but RgfxGate, which ships on its own: Graft, the committed build guest/graft
+# carries, and the candidate's ReimsGraphics, which its build stages for Graft to bind, as
+# `make -C guest set` stages them.
+do_set() {
   rm -rf "$ART/kexts"
-  bash "$L/mac-loader.sh" "$ART/ReimsGraphics.kext" "$ART/loader"
-  mv "$ART/loader/kexts" "$ART/kexts"
-  rm -rf "$ART/loader"
+  mkdir -p "$ART/kexts"
+  cp -R "$TREE/guest/graft/dist/Graft.kext" "$ART/ReimsGraphics.kext" "$ART/kexts/"
 }
 
 # The paths whose changes reach the image or the host build.
@@ -800,12 +806,12 @@ say "lane-gate: ${sha:0:12} ($subject), run $runid${BASE:+, baseline ${base_sha:
 skipped mac || die "the Mac's checks do not run as potluck jobs yet: run the gate with --skip mac"
 step tree do_tree || die "the tree could not be checked out"
 
-gb=0 loader_ok=0
+gb=0 set_ok=0
 step guest-build do_guest_build || gb=1
-if ((gb == 0)) && [[ -z $image ]]; then step loader do_loader && loader_ok=1 || true; fi
+if ((gb == 0)) && [[ -z $image ]]; then step set do_set && set_ok=1 || true; fi
 msi_ok=0 img_ok=0
 [[ -z $image ]] || img_ok=1
-if ((gb == 0)) && { [[ -n $image ]] || ((loader_ok)); }; then
+if ((gb == 0)) && { [[ -n $image ]] || ((set_ok)); }; then
   if step ship do_ship; then
     step host do_host || true
     for n in corpus stage msi-build image publish; do host_step "$n"; done
@@ -813,7 +819,7 @@ if ((gb == 0)) && { [[ -n $image ]] || ((loader_ok)); }; then
     [[ -n $image || -f $RUN/steps/image.ok ]] && img_ok=1 || img_ok=0
   fi
 else
-  say "  ship and host: not run (the guest build or the loader failed)"
+  say "  ship and host: not run (the guest build or the set failed)"
 fi
 if ((publish)); then
   if [[ -f $RUN/steps/publish.ok ]]; then

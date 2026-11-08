@@ -7,8 +7,8 @@
 #                 MSI_CORPUS_ODD, MSI_QEMU_SUBPROJECTS, MSI_QEMU_SEED)
 #   lg/bin/       the gate's host scripts (msi-*.sh and the rest), as the gate has them
 #   lg/post-probes/  the probes the correctness boot runs last (lane-gate.sh --post-probes), if any
-#   lg/ship/      what the Mac built: payload/ (guest-run.sh and its tools), kexts/ (the loader's
-#                 kexts), RgfxGate.kext, reims-graphics.bundle.tgz, and qemu.bundle (vendor/qemu's
+#   lg/ship/      what the Mac built: payload/ (guest-run.sh and its tools), kexts/ (Graft and
+#                 ReimsGraphics), RgfxGate.kext, reims-graphics.bundle.tgz, and qemu.bundle (vendor/qemu's
 #                 commits that MSI_QEMU_SEED lacks, a git bundle of refs/heads/lane-gate)
 # The candidate's own tree is not in the commit: its parent is the candidate, which the job takes
 # with `git archive` from the workspace's repository.

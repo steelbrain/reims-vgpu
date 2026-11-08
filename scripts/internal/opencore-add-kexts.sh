@@ -1,10 +1,10 @@
 #!/bin/bash
 # A copy of a VM's OpenCore image with kexts added: each bundle in
 # EFI/OC/Kexts, with a Kernel > Add entry made as reims-util makes its own
-# (from the image's first entry: x86_64, its executable and Info.plist, and the
-# Darwin bounds of the loader bridge's set, macOS 26.4 to 26.x). For iterating
-# on the guest display kext (guest/kext) and the loader that binds it, without
-# installing anything inside the guest.
+# (from the image's first entry where it has one: x86_64, its executable and
+# Info.plist, and no Darwin bounds, as guest/prebuilt's set has none). For
+# iterating on the guest kexts (guest/kext, guest/rgfxgate) and the Graft that
+# binds them, without installing anything inside the guest.
 #
 #   scripts/internal/opencore-add-kexts.sh SRC OUT KEXT...
 #
@@ -75,9 +75,9 @@ config_path, staged = sys.argv[1], sys.argv[2]
 with open(config_path, "rb") as f:
     config = plistlib.load(f)
 add = config["Kernel"]["Add"]
-if not add:
-    sys.exit("opencore-add-kexts: the image's Kernel > Add is empty: no entry to take keys from")
-template = add[0]
+# Every key OpenCore reads is set below; the first entry, where there is one,
+# carries any other key over.
+template = add[0] if add else {}
 
 kexts = []
 for path in sys.argv[3:]:
@@ -109,8 +109,8 @@ for name, info in ordered:
         "Comment": f"{name[:-5] if name.endswith('.kext') else name}, added for development",
         "Enabled": True,
         "ExecutablePath": f"Contents/MacOS/{executable}" if executable else "",
-        "MaxKernel": "25.99.99",
-        "MinKernel": "25.4.0",
+        "MaxKernel": "",
+        "MinKernel": "",
         "PlistPath": "Contents/Info.plist",
     })
     at = next((i for i, e in enumerate(add) if e.get("BundlePath") == name), None)
