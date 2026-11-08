@@ -5,7 +5,8 @@
 //! **Candidates.** The physical devices are those the window's probe lists, in the loader's order
 //! (`crate::os`'s `seen_devices`, read through the probe's one instance). A candidate is one the
 //! runtime makes a device of: at Vulkan 1.2 or later, with a queue family of graphics and compute
-//! work, and a `deviceUUID`, which names it to the runtime (its registry ID, [`registry_id`]).
+//! work, and a `deviceUUID`, which names it to the runtime: the registry ID the runtime answers
+//! for the physical device of that UUID names it ([`listed_registry_id`]).
 //!
 //! **The pick.**
 //! - Where the host's user picked a device, through `MESA_VK_DEVICE_SELECT` (with or without its
@@ -54,6 +55,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use ash::vk;
+use metal2vulkan_runtime as rt;
 
 use crate::core::platform::os::Clock as _;
 
@@ -96,9 +98,10 @@ pub(crate) struct Seen {
 }
 
 impl Seen {
-    /// Its registry ID ([`registry_id`] of its UUID), where it has a UUID.
+    /// Its registry ID, the runtime's for the physical device of its UUID
+    /// ([`listed_registry_id`]), where it has a UUID the runtime lists.
     pub(crate) fn registry_id(&self) -> Option<u64> {
-        self.uuid.as_ref().map(registry_id)
+        self.uuid.as_ref().and_then(listed_registry_id)
     }
 
     /// Whether the runtime makes a device of it (the module doc's candidates).
@@ -307,15 +310,12 @@ fn runtime_first(seen: &[Seen]) -> Option<usize> {
         .map(|(at, _)| at)
 }
 
-/// The registry ID to open the device `picked` of `seen` by, where the runtime's default device
-/// is another: `None` where nothing was picked, or the pick is the device the runtime makes its
-/// default device of anyway.
-fn to_open(seen: &[Seen], picked: Option<usize>) -> Option<u64> {
+/// The device `picked` of `seen` to open by its registry ID ([`Seen::registry_id`]), where the
+/// runtime's default device is another: `None` where nothing was picked, or the pick is the
+/// device the runtime makes its default device of anyway.
+fn to_open(seen: &[Seen], picked: Option<usize>) -> Option<usize> {
     let at = picked?;
-    if Some(at) == runtime_first(seen) {
-        return None;
-    }
-    seen.get(at)?.registry_id()
+    (Some(at) != runtime_first(seen) && at < seen.len()).then_some(at)
 }
 
 /// The first of [`SELECTION_VARIABLES`] `var` answers a value that is not empty for.
@@ -342,7 +342,8 @@ pub(crate) fn chosen() -> Option<u64> {
             |gpus| measured(seen, gpus, file.as_deref(), timing::time_on),
         );
         log_choice(seen, picked);
-        to_open(seen, picked.map(|(at, _)| at))
+        let at = to_open(seen, picked.map(|(at, _)| at))?;
+        seen.get(at)?.registry_id()
     });
     *CHOSEN
 }
@@ -363,17 +364,27 @@ fn log_choice(seen: &[Seen], picked: Option<(usize, Why)>) {
     }
 }
 
-/// The registry ID the runtime answers for a device whose `deviceUUID` is `uuid`, which
-/// `Device::with_registry_id` opens it by (`PhysicalDeviceIdentity::registry_id`, read from
-/// code): the UUID's two halves, little-endian, exclusive-ored, and 1 where that is 0. A test
-/// holds it to the runtime's answer for the device it makes.
-pub(crate) fn registry_id(uuid: &[u8; 16]) -> u64 {
-    let (low, high) = uuid.split_at(8);
-    let half = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap_or_default());
-    match half(low) ^ half(high) {
-        0 => 1,
-        id => id,
-    }
+/// The registry ID the runtime answers for the physical device whose `deviceUUID` is `uuid`,
+/// which `Device::with_registry_id` opens it by: that of the first of the runtime's identities of
+/// its physical devices (`Device::identities_with`, with [`crate::platform::device_options`], in
+/// its order) of that UUID. The identities are read once a process, at the first ask, which only
+/// a pick the runtime would not make its default device of, or a GPU's timing, makes: a host of
+/// one GPU never reads them. `None` where the runtime lists no physical device of the UUID, or
+/// refuses to list them, which is logged: such a device is not opened by ID.
+fn listed_registry_id(uuid: &[u8; 16]) -> Option<u64> {
+    static LISTED: LazyLock<Vec<rt::PhysicalDeviceIdentity>> = LazyLock::new(|| {
+        rt::Device::identities_with(crate::platform::device_options()).unwrap_or_else(|e| {
+            log::warn!(
+                target: TARGET,
+                "the runtime listed no identities of its physical devices ({e}): no device is \
+                 opened by its registry ID"
+            );
+            Vec::new()
+        })
+    });
+    (LISTED.iter())
+        .find(|identity| identity.device_uuid == *uuid)
+        .map(|identity| identity.registry_id)
 }
 
 #[cfg(test)]
@@ -442,7 +453,7 @@ pub(crate) mod tests {
         });
         assert_eq!(picked, Some((0, Why::Measured)));
         assert_eq!(asked, [0, 1]);
-        assert_eq!(to_open(&list, Some(0)), list[0].registry_id());
+        assert_eq!(to_open(&list, Some(0)), Some(0));
         assert_eq!(to_open(&list, Some(1)), None);
     }
 
@@ -484,7 +495,7 @@ pub(crate) mod tests {
         let list = [integrated(11, 1), discrete(24, 2), cpu(3)];
         let picked = choose(&list, Some("MESA_VK_DEVICE_SELECT"), unasked);
         assert_eq!(picked, Some((0, Why::UserChose("MESA_VK_DEVICE_SELECT"))));
-        assert_eq!(to_open(&list, Some(0)), list[0].registry_id());
+        assert_eq!(to_open(&list, Some(0)), Some(0));
         let not_usable = Seen {
             api_version: vk::API_VERSION_1_1,
             ..discrete(24, 9)
@@ -632,19 +643,57 @@ pub(crate) mod tests {
         assert!(!file.exists());
     }
 
-    /// The registry ID is the UUID's halves exclusive-ored, little-endian; 1 where they cancel
+    /// The registry ID the choice answered before it read the runtime's identities: the UUID's
+    /// two halves, little-endian, exclusive-ored, and 1 where that is 0.
+    fn folded(uuid: &[u8; 16]) -> u64 {
+        let (low, high) = uuid.split_at(8);
+        let half = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap_or_default());
+        match half(low) ^ half(high) {
+            0 => 1,
+            id => id,
+        }
+    }
+
+    /// The fold of the UUID the choice answered before: its halves exclusive-ored, little-endian;
+    /// 1 where they cancel
     #[test]
-    fn the_registry_id_folds_the_uuid() {
+    fn the_old_registry_id_folds_the_uuid() {
         let mut uuid = [0u8; 16];
         uuid[4] = 0xc5;
-        assert_eq!(registry_id(&uuid), 0xc5_0000_0000);
+        assert_eq!(folded(&uuid), 0xc5_0000_0000);
         uuid[12] = 0xc5;
-        assert_eq!(registry_id(&uuid), 1);
+        assert_eq!(folded(&uuid), 1);
         let uuid: [u8; 16] = std::array::from_fn(|i| i as u8);
-        assert_eq!(
-            registry_id(&uuid),
-            0x0706_0504_0302_0100 ^ 0x0f0e_0d0c_0b0a_0908
-        );
+        assert_eq!(folded(&uuid), 0x0706_0504_0302_0100 ^ 0x0f0e_0d0c_0b0a_0908);
+    }
+
+    /// Every device the probe lists that the choice can pick is named by the registry ID it was
+    /// named by before the choice read the runtime's identities (the fold of its UUID), which is
+    /// the ID of the runtime's identity of that UUID, and the device the runtime makes of that ID
+    /// answers it: the choice opens the device it opened before. The runtime lists every
+    /// candidate. The devices and their IDs are printed for the run's record
+    #[test]
+    fn each_candidate_keeps_its_registry_id() {
+        let seen = crate::os::seen_devices();
+        let options = crate::platform::device_options();
+        let identities = rt::Device::identities_with(options).unwrap_or_default();
+        for (n, s) in seen.iter().enumerate() {
+            eprintln!("device {n}: {s:?}");
+        }
+        for identity in &identities {
+            assert_eq!(
+                identity.registry_id,
+                folded(&identity.device_uuid),
+                "{identity:?}"
+            );
+        }
+        for s in seen.iter().filter(|s| s.candidate()) {
+            let uuid = s.uuid.expect("a candidate has a UUID");
+            assert_eq!(s.registry_id(), Some(folded(&uuid)), "{s:?}");
+            let id = s.registry_id().unwrap_or_default();
+            let device = crate::answer::unheard(|| rt::Device::with_registry_id(id, options));
+            assert_eq!(device.map(|d| d.registry_id()).ok(), Some(id), "{s:?}");
+        }
     }
 
     /// The process's default device is the one picked of the devices the probe lists, named by
