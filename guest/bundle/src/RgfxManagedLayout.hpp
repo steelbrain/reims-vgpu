@@ -8,7 +8,7 @@
  *   stencil, PVRTC and the three-component 8/16/32-bit formats have none: their textures keep
  *   no CPU copy.
  * - RgfxManagedLayout: where each level and slice lies in the copy. The host computes the same
- *   layout from the create's fields (crates/reims-graphics/src/managed.rs, whose test holds the
+ *   layout from the create's fields (crates/reims-vgpu-graphics/src/managed.rs, whose test holds the
  *   cases tests/shell_tests.mm does): every level in order; each level its slices (the array's
  *   elements, six faces a cube); each slice its images (the level's depth for a 3D texture,
  *   else one); each image its rows of blocks, each row's bytes rounded up to

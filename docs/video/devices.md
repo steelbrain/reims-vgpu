@@ -5,8 +5,8 @@ host's hardware. The guest's video driver, in our Metal bundle, is AppleGVA's ve
 ([docs/graphics-kext/design.md](../graphics-kext/design.md), "Decided", 16); it decodes, and
 sends no encode op yet. This file is the host's side: what it answers the guest, and what a
 decode and an encode do. The wire's records and their
-fields are documented where they are defined: `crates/reims-graphics/src/wire.rs` (the caps and
-the session) and `crates/reims-graphics/src/ops/video.rs` (the ops).
+fields are documented where they are defined: `crates/reims-vgpu-graphics/src/wire.rs` (the caps and
+the session) and `crates/reims-vgpu-graphics/src/ops/video.rs` (the ops).
 
 ## Which hardware
 

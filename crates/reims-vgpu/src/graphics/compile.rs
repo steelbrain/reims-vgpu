@@ -1,7 +1,7 @@
 //! Pipeline compiles off ring 0's threads: the [`CompilePool`] that runs them and the
 //! [`Pending`] pipelines a command buffer waits for.
 //!
-//! A pipeline create on ring 0 is prepared on its context's lane (`reims-graphics`' device, on one
+//! A pipeline create on ring 0 is prepared on its context's lane (`reims-vgpu-graphics`' device, on one
 //! of ring 0's threads, `reims-vgpu.graphics-ring0-*`), which then goes on with the context's later
 //! messages, and is compiled on one of the pool's threads, `reims-vgpu.graphics-compile-*`; its
 //! reply goes on ring 0's completion ring when the compile ends, keyed to the create by its seqno.
@@ -37,23 +37,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use reims_graphics::icb::{
+use reims_vgpu_core::platform::os::clock::MonoTime;
+use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_graphics::icb::{
     RGFX_ICB_OP_COMPUTE_PIPELINE, RGFX_ICB_OP_RENDER_PIPELINE, RGFX_ICB_SLOT_PIPELINE,
     RgfxIcbObject, RgfxIcbRecord, slot_bytes,
 };
-use reims_graphics::ops::compute::{
+use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
 };
-use reims_graphics::ops::render::{
+use reims_vgpu_graphics::ops::render::{
     RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, RgfxOpSetRenderPipelineState,
 };
-use reims_graphics::ops::{
+use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_BODY_OFFSET, RgfxCommandBuffer, RgfxOpHeader,
 };
-use reims_graphics::region::Region;
-use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbWrite};
-use reims_vgpu_core::platform::os::clock::MonoTime;
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
+    RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbWrite,
+};
 use zerocopy::FromBytes;
 
 /// The most compile threads a device runs.

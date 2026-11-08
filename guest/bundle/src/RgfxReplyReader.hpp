@@ -1,7 +1,7 @@
 /*
  * RgfxReplyReader: the guest's end of a host-to-guest completion ring — the consumer
- * mirror of the host producer in crates/reims-graphics/src/ring.rs (Producer) and
- * crates/reims-graphics/src/device.rs (ControlCompletionPoster). It reads the host's
+ * mirror of the host producer in crates/reims-vgpu-graphics/src/ring.rs (Producer) and
+ * crates/reims-vgpu-graphics/src/device.rs (ControlCompletionPoster). It reads the host's
  * reply messages off the ring and dispatches each to the wrapper that is waiting on
  * it:
  *   - RGFX_EVT_CB_SUBMITTED (RgfxCbSubmitted) -> the command buffer whose submission

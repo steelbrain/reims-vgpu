@@ -34,7 +34,7 @@
 //!   their waiters each. One that holds the op takes the order's lock once at its begin, and waits
 //!   only where the queues' threads took the buffers in another order than the guest posted them.
 //!
-//! [`RGFX_OP_COMMIT_ORDER`]: reims_graphics::ops::RGFX_OP_COMMIT_ORDER
+//! [`RGFX_OP_COMMIT_ORDER`]: reims_vgpu_graphics::ops::RGFX_OP_COMMIT_ORDER
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -214,16 +214,16 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use reims_graphics::ops::{
+    use reims_vgpu_core::sync::Mutex;
+    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_graphics::ops::{
         RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_COMMIT_ORDER, RGFX_OP_SUBMITTED, RgfxCommandBuffer,
         RgfxOpHeader, RgfxSurfaceOrderWait,
     };
-    use reims_graphics::wire::{
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
         RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxMsgHeader, RgfxObjectDestroy, RgfxQueueCreate,
     };
-    use reims_vgpu_core::sync::Mutex;
-    use reims_vgpu_core::testkit::FakePlatform;
     use zerocopy::IntoBytes;
 
     use super::super::{DecodeError, GraphicsDecoder};
@@ -251,7 +251,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let submitted = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&submitted);

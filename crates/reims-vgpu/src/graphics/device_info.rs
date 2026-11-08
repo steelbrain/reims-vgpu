@@ -9,21 +9,21 @@
 //!
 //! The decoder does not touch this: [`super::GraphicsDevice`] writes it once at
 //! the device's init into the region at
-//! [`RGFX_DEVICE_INFO_OFFSET`](reims_graphics::wire::RGFX_DEVICE_INFO_OFFSET),
+//! [`RGFX_DEVICE_INFO_OFFSET`](reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_OFFSET),
 //! and the guest bundle reads it there, not a guest command.
 
-use reims_graphics::wire::{
-    RGFX_DEVICE_ARCHITECTURE_NAME_LEN, RGFX_DEVICE_INFO_COUNTER_POINTS, RGFX_DEVICE_INFO_FAMILIES,
-    RGFX_DEVICE_INFO_FEATURE_SETS, RGFX_DEVICE_INFO_FORMATS, RGFX_DEVICE_INFO_IDENTITY_FLAGS,
-    RGFX_DEVICE_INFO_SIZES, RGFX_DEVICE_INFO_SPARSE_TILES, RGFX_DEVICE_INFO_VERSION,
-    RGFX_DEVICE_NAME_LEN, RgfxDeviceInfo, RgfxFormatAnswers,
-};
 use reims_vgpu_core::platform::caps::{
     COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, Flags, FormatAnswers,
     IdentityCaps, Limits, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
     feature_set_family,
 };
 use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_graphics::wire::{
+    RGFX_DEVICE_ARCHITECTURE_NAME_LEN, RGFX_DEVICE_INFO_COUNTER_POINTS, RGFX_DEVICE_INFO_FAMILIES,
+    RGFX_DEVICE_INFO_FEATURE_SETS, RGFX_DEVICE_INFO_FORMATS, RGFX_DEVICE_INFO_IDENTITY_FLAGS,
+    RGFX_DEVICE_INFO_SIZES, RGFX_DEVICE_INFO_SPARSE_TILES, RGFX_DEVICE_INFO_VERSION,
+    RGFX_DEVICE_NAME_LEN, RgfxDeviceInfo, RgfxFormatAnswers,
+};
 
 /// `MTLGPUFamilyMetal3`.
 const MTL_GPU_FAMILY_METAL3: i64 = 5001;
@@ -822,7 +822,7 @@ mod tests {
             identity.sizes.recommended_max_working_set_size.unwrap()
         );
         assert_eq!(
-            info.sizes[reims_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH],
+            info.sizes[reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH],
             identity.sizes.max_buffer_length.unwrap()
         );
         // maximum_concurrent_compilation_task_count is the device's compile threads.

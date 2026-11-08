@@ -16,7 +16,7 @@
 //!   a device of many busy queues holds one thread a busy lane and the budget's at most.
 //! - **Which thread takes a job.** A job goes to the lane's thread that went idle last, so the
 //!   jobs of a lane that needs one thread at a time stay on one thread, and a thread goes once it
-//!   has had no job for [`KEEP`](reims_graphics::keep::KEEP), 10 s: the threads a steady load runs
+//!   has had no job for [`KEEP`](reims_vgpu_graphics::keep::KEEP), 10 s: the threads a steady load runs
 //!   at once stay through its pauses, those only a burst of jobs made go 10 s after the burst, and
 //!   a burst after that grows the lane again as the first did. A thread that goes gives back the
 //!   budget's thread first, so the lane's own is the last to go. Woken in turn instead, the
@@ -167,8 +167,8 @@ pub(crate) struct Lane {
     /// The device's budget of extra threads.
     budget: Arc<Budget>,
     /// How long a thread of the lane's stays with no job before it goes:
-    /// [`KEEP`](reims_graphics::keep::KEEP), but in the tests.
-    idle_for: reims_graphics::keep::Keep,
+    /// [`KEEP`](reims_vgpu_graphics::keep::KEEP), but in the tests.
+    idle_for: reims_vgpu_graphics::keep::Keep,
     state: Mutex<State>,
     /// A turn passed.
     turned: Condvar,
@@ -183,16 +183,24 @@ impl std::fmt::Debug for Lane {
 impl Lane {
     /// The lane of queue `queue`, with no thread yet, its extra threads from `budget`.
     pub(crate) fn new(queue: u64, budget: Arc<Budget>) -> Arc<Lane> {
-        Lane::with_idle(queue, budget, reims_graphics::keep::KEEP)
+        Lane::with_idle(queue, budget, reims_vgpu_graphics::keep::KEEP)
     }
 
     /// The lane of queue `queue`, whose threads go after `idle_for` with no job.
     fn with_idle(queue: u64, budget: Arc<Budget>, idle_for: Duration) -> Arc<Lane> {
-        Lane::with_keep(queue, budget, reims_graphics::keep::Keep::new(idle_for))
+        Lane::with_keep(
+            queue,
+            budget,
+            reims_vgpu_graphics::keep::Keep::new(idle_for),
+        )
     }
 
     /// The lane of queue `queue`, whose threads go once they have waited `keep` with no job.
-    fn with_keep(queue: u64, budget: Arc<Budget>, keep: reims_graphics::keep::Keep) -> Arc<Lane> {
+    fn with_keep(
+        queue: u64,
+        budget: Arc<Budget>,
+        keep: reims_vgpu_graphics::keep::Keep,
+    ) -> Arc<Lane> {
         Arc::new(Lane {
             queue,
             budget,
@@ -798,7 +806,7 @@ mod tests {
     mod kept {
         use std::collections::HashSet;
 
-        use reims_graphics::keep::{KEEP, Keep, TestClock};
+        use reims_vgpu_graphics::keep::{KEEP, Keep, TestClock};
 
         use super::*;
 

@@ -69,7 +69,7 @@ SDK     ?= $(shell xcrun --sdk macosx --show-sdk-path)
 # the spaces before a `#`, and a trailing space breaks the object paths below.
 ARCH    ?= x86_64
 NATIVE  ?= $(shell uname -m)
-WIRE     = ../../crates/reims-graphics/include
+WIRE     = ../../crates/reims-vgpu-graphics/include
 BUILD    = build
 
 CXX      = xcrun clang++
@@ -419,7 +419,7 @@ $(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) $(VIDEO_OBJ_ARCH) Makefile
 
 PACKAGE    = $(BUILD)/package/reims-graphics.bundle
 PACKAGETGZ = $(BUILD)/reims-graphics.bundle.tgz
-WIRE_H       = ../../crates/reims-graphics/include/reims_graphics_wire.h
+WIRE_H       = ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h
 WIRE_VERSION = $(shell sed -n 's/^\#define RGFX_VERSION \([0-9][0-9]*\)$$/\1/p' $(WIRE_H))
 
 package: $(PACKAGETGZ)

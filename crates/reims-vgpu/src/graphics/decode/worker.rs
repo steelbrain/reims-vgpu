@@ -18,7 +18,7 @@
 //! `<name>-<i>`. A thread is started when a key's job finds none waiting, and ends once it has
 //! waited [`KEEP`] with nothing to do; a key's job wakes one waiting thread, never more, the one
 //! that went idle last, so the threads a steady load runs at once take its jobs and stay through
-//! its pauses, and those only a burst ran wait longest and go (`reims_graphics::keep`). A key
+//! its pauses, and those only a burst ran wait longest and go (`reims_vgpu_graphics::keep`). A key
 //! whose job finds every thread busy waits for the next free one, behind the keys that were
 //! waiting before it, and is counted (a cap hit, logged at debug); a thread runs a job of each
 //! waiting key in turn. Where no thread can be started, the job runs where it is handed over.
@@ -61,9 +61,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use reims_graphics::keep::{KEEP, Keep};
 use reims_vgpu_core::platform::os::MonoTime;
 use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_graphics::keep::{KEEP, Keep};
 
 /// The most threads a [`Worker`] runs.
 pub(crate) const POOL_THREADS: usize = 4;
@@ -532,7 +532,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use reims_graphics::keep::TestClock;
+    use reims_vgpu_graphics::keep::TestClock;
 
     use super::*;
 

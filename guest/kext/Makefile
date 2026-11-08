@@ -41,7 +41,7 @@ DTRACE  ?= 0
 
 ARCH = -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=26.0
 
-FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-graphics/include \
+FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-vgpu-graphics/include \
 	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' -DRGFX_FB_TRACE=$(TRACE) \
 	-Os -Wall -Wextra -Wshadow-all -Werror -Wno-unused-parameter \
 	-Wno-deprecated-declarations
@@ -71,7 +71,7 @@ OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 
 all: $(BINARY)
 
-$(BUILD)/obj/%.o: src/%.cpp $(HEADERS) ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
+$(BUILD)/obj/%.o: src/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ $(CXXFLAGS) -c $< -o $@
 
@@ -81,7 +81,7 @@ $(BUILD)/obj/%.o: src/%.c Makefile
 
 # The driver's source with its debug information, which check-layout.py reads
 # for the SDK's IOFramebuffer.
-$(BUILD)/obj/layout.o: src/ReimsGraphics.cpp src/ReimsGraphics.hpp ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
+$(BUILD)/obj/layout.o: src/ReimsGraphics.cpp src/ReimsGraphics.hpp ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ $(CXXFLAGS) -g -fstandalone-debug -c $< -o $@
 
@@ -115,9 +115,9 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/shared_event_ports_test $(BUILD)/tests/gl_surfaces_test \
 	$(BUILD)/tests/surface_rows_test
 
-$(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-graphics/include/reims_graphics_wire.h Makefile
+$(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
-	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -Isrc -I../../crates/reims-graphics/include $< -o $@
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
 
 test: $(TESTS)
 	@for t in $(TESTS); do $$t || exit 1; done

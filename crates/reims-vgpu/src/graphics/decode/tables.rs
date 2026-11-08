@@ -12,7 +12,7 @@
 //! named (a command buffer that names it fails at the op that names it first), one destroyed after
 //! it is named whole, and one made after it is not named. A command buffer's view is taken after
 //! ring 0 has carried out every message published before the buffer was taken off its ring
-//! (`reims_graphics`'s order), so it sees every create its process posted before it.
+//! (`reims_vgpu_graphics`'s order), so it sees every create its process posted before it.
 //!
 //! **What an entry is.** An object's handle, the region span it lies over, the CPU copy of a
 //! `Managed` one, where a texture over an IOSurface plane lies in its buffer, and a queue's counts:

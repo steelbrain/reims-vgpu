@@ -53,7 +53,7 @@ The Makefile's header lists every target. README.md lists the requirements.
 | the Cargo workspace: eight crates and `xtask` | `Cargo.toml`, `crates/`, `xtask/` |
 | `reims-ctl`, the VM manager users run, and its installer | `crates/reims-ctl` (a workspace of its own, linking nothing of the library), `scripts/install-ctl.sh`; reims-util, which it runs to make an x86-64 VM's OpenCore image and download its installer, is pinned in `crates/reims-ctl/src/reims_util.rs` |
 | the C API | `crates/reims-vgpu-c/include/reims_vgpu.h`, specified in [docs/api.md](docs/api.md) |
-| the device: its wire, rings and transport | `crates/reims-graphics`, whose `include/reims_graphics_wire.h` the guest's kexts and the option ROM compile; its design and protocol are [docs/graphics-kext](docs/graphics-kext) |
+| the device: its wire, rings and transport | `crates/reims-vgpu-graphics`, whose `include/reims_graphics_wire.h` the guest's kexts and the option ROM compile; its design and protocol are [docs/graphics-kext](docs/graphics-kext) |
 | the device over the platform: the Metal-call decoder, the display and its window, the host's read-back | `crates/reims-vgpu/src/graphics.rs` and `graphics/` |
 | the display's shaders | `crates/reims-vgpu-vulkan/src/gpu/shaders.metal` |
 | the Vulkan platform | `crates/reims-vgpu-vulkan`, over metal2vulkan's runtime, at the commit of its public repository `Cargo.toml` names; what its defaults trade against Metal's answers is [docs/accuracy-ledger.md](docs/accuracy-ledger.md) |
@@ -128,7 +128,7 @@ passes run again alone.
 | `xtask/` | `cargo test -p xtask`, rustfmt and clippy on it |
 | `crates/reims-ctl` | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it (`cargo xtask check` does not reach it); a change to the QEMU command it builds, or to `scripts/install-ctl.sh`, also needs an install and a VM boot on each host it touches |
 | `guest/` (kext, bundle, rgfxgate, loader) | `make -C guest test` on a Mac; a change to a source the set is built from also needs `make -C guest prebuilt KDK=<KDK Extensions dir>`, committing `guest/prebuilt` with it (`make -C guest prebuilt-check` fails otherwise) |
-| `firmware/`, the option ROM | build it (`make -C firmware`); a change not meant to alter what the guest's firmware sees keeps the ROM's bytes; a change to what `ReimsGraphics.rom` is built from (its sources, the Makefile, `crates/reims-graphics/include/reims_graphics_wire.h`) also runs `make -C firmware prebuilt` on a Mac, committing the ROM and record it writes |
+| `firmware/`, the option ROM | build it (`make -C firmware`); a change not meant to alter what the guest's firmware sees keeps the ROM's bytes; a change to what `ReimsGraphics.rom` is built from (its sources, the Makefile, `crates/reims-vgpu-graphics/include/reims_graphics_wire.h`) also runs `make -C firmware prebuilt` on a Mac, committing the ROM and record it writes |
 | `firmware/ambrosia` | build it (`make -C firmware/ambrosia bundle`); a change to what it does with the device also needs an arm64 guest's boot on Ambrosia with the device and the module ([docs/qemu.md](docs/qemu.md), "arm64 guests") |
 | `vendor/qemu` | build it (`make qemu`) and realize the device paused (`-S`); a change to `hw/display/reims-graphics-pci.c`, or to what QEMU calls, also needs a VM boot ([docs/lessons.md](docs/lessons.md), [docs/qemu.md](docs/qemu.md)) |
 | docs and comments | nothing |

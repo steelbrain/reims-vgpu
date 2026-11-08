@@ -14,13 +14,13 @@
 //! of any refused create does. A view of a pixel format the device describes none for is
 //! refused before the platform is asked, as Metal asserts there ([`super::described`]).
 
-use reims_graphics::wire::{
-    RGFX_TEXTURE_VIEW_SUBRANGE, RGFX_TEXTURE_VIEW_SWIZZLE, RgfxTextureView,
-};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::resource::Texture;
 use reims_vgpu_core::platform::types::{NsRange, Swizzle};
 use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_graphics::wire::{
+    RGFX_TEXTURE_VIEW_SUBRANGE, RGFX_TEXTURE_VIEW_SWIZZLE, RgfxTextureView,
+};
 
 use super::{DecodeError, GraphicsDecoder, ObjHandle, read};
 
@@ -99,12 +99,12 @@ fn swizzle(packed: u32) -> Swizzle {
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::wire::{
+    use reims_vgpu_core::testkit::{Arg, FakePlatform};
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_VIEW,
         RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxMsgHeader, RgfxResourceIdChunk,
         RgfxTextureCreate, RgfxTextureDescriptor,
     };
-    use reims_vgpu_core::testkit::{Arg, FakePlatform};
     use zerocopy::IntoBytes;
 
     use super::*;
@@ -122,7 +122,7 @@ mod tests {
     fn decoder() -> (Arc<FakePlatform>, GraphicsDecoder<FakePlatform>) {
         let p = Arc::new(FakePlatform::new());
         let size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(size as usize).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), region);
         let device = p.device();
         let chunk = RgfxResourceIdChunk {

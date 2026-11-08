@@ -35,7 +35,7 @@
 #   --boot-tag TAG  the correctness boot's tag on the lane host (default gate-RUNID-boot): a tag the
 #                 host's gpu-urgent file names passes its turnstile ahead of the exclusive waiters
 #   --host-log FILTER  the correctness boot's host log filter (REIMS_VGPU_LOG, default info), as
-#                 info,reims_graphics::room=debug to count a path's debug records
+#                 info,reims_vgpu_graphics::room=debug to count a path's debug records
 #   --bench-host-log FILTER  the bench boot's host log filter (default info), as
 #                 info,reims_vgpu::work=debug for the runtime's work counts each second, which
 #                 report.py rates the drags and WebGL by; their logger costs the numbers it rates
@@ -349,9 +349,9 @@ print(" ".join(sorted(out)))' "$changed"
 do_cargo() {
   cd "$TREE"
   . scripts/internal/dev-env.sh
-  local more expr pkgs=(-p reims-graphics -p reims-vgpu)
+  local more expr pkgs=(-p reims-vgpu-graphics -p reims-vgpu)
   more=$(reached)
-  expr="package(reims-graphics) | (package(reims-vgpu) & test(/graphics/))"
+  expr="package(reims-vgpu-graphics) | (package(reims-vgpu) & test(/graphics/))"
   for p in $more; do
     [[ $p == reims-ctl ]] && continue
     pkgs+=(-p "$p")

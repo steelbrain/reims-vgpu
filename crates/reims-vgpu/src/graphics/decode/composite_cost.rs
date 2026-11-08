@@ -34,7 +34,10 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use reims_graphics::ops::render::{
+use reims_vgpu_core::platform::device::GpuDevice as _;
+use reims_vgpu_core::platform::values::{FullRenderPipelineDesc, SamplerDesc, TextureDesc};
+use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_graphics::ops::render::{
     RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_MEMORY_BARRIER_WITH_SCOPE,
     RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
     RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, RGFX_OP_RENDER_SET_VERTEX_BUFFER,
@@ -42,19 +45,16 @@ use reims_graphics::ops::render::{
     RgfxOpSetFragmentTexture, RgfxOpSetRenderPipelineState, RgfxOpSetVertexBuffer,
     RgfxSamplerBinding,
 };
-use reims_graphics::ops::{
+use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END,
     RGFX_PASS_FLAG_RT_SIZE, RgfxCommandBuffer, RgfxOpHeader, RgfxRenderPassColorAttachment,
     RgfxRenderPassDesc,
 };
-use reims_graphics::wire::{
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE,
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxBufferOverHostMemory, RgfxCbComplete,
     RgfxMsgHeader, RgfxQueueCreate,
 };
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::values::{FullRenderPipelineDesc, SamplerDesc, TextureDesc};
-use reims_vgpu_core::raise::OnFault;
 use zerocopy::IntoBytes;
 
 use super::draw_cost::{counts, fixture, over, spread};
@@ -306,7 +306,7 @@ impl<P: ApiPlatform> Bench<P> {
         let device = platform.metal_device(None).unwrap();
         let chunk = (shape.quads() * QUAD).next_multiple_of(0x4000);
         let region_size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + chunk + RGFX_CURSOR_SPAN;
-        let region = reims_graphics::region::Region::new(region_size as usize).unwrap();
+        let region = reims_vgpu_graphics::region::Region::new(region_size as usize).unwrap();
         for quad in 0..shape.quads() {
             let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + quad * QUAD;
             assert!(region.write(at, quad_positions(shape, quad).as_bytes()));

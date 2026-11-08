@@ -438,16 +438,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reims-graphics"
-version = "0.1.0"
-dependencies = [
- "libc",
- "log",
- "parking_lot",
- "zerocopy",
-]
-
-[[package]]
 name = "reims-vgpu"
 version = "0.1.0"
 dependencies = [
@@ -458,8 +448,8 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "parking_lot",
- "reims-graphics",
  "reims-vgpu-core",
+ "reims-vgpu-graphics",
  "reims-vgpu-video",
  "reims-vgpu-vulkan",
  "reims-vgpu-window",
@@ -476,9 +466,9 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "parking_lot",
- "reims-graphics",
  "reims-vgpu",
  "reims-vgpu-core",
+ "reims-vgpu-graphics",
  "tikv-jemallocator",
 ]
 
@@ -488,6 +478,16 @@ version = "0.1.0"
 dependencies = [
  "log",
  "lzma-rs",
+ "parking_lot",
+ "zerocopy",
+]
+
+[[package]]
+name = "reims-vgpu-graphics"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
  "parking_lot",
  "zerocopy",
 ]

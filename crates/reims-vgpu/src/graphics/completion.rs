@@ -19,11 +19,11 @@
 //! host could not carry a command buffer out at all, so a guest blocked on it
 //! unblocks.
 
-use reims_graphics::wire::{
+use reims_vgpu_core::platform::types::NsErrorText;
+use reims_vgpu_graphics::wire::{
     RGFX_CB_ACCESS_REVOKED, RGFX_CB_INTERNAL, RGFX_CB_INVALID_RESOURCE, RGFX_CB_OK,
     RGFX_CB_PAGE_FAULT, RGFX_CB_TIMEOUT, RGFX_EVT_CB_COMPLETE, RgfxCbComplete, RgfxMsgHeader,
 };
-use reims_vgpu_core::platform::types::NsErrorText;
 
 /// `MTLCommandBufferErrorInternal`.
 const MTL_CB_ERROR_INTERNAL: i64 = 1;

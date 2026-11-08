@@ -1,7 +1,7 @@
 # The option ROM: the reims-graphics device's UEFI driver (src/), linked as an
 # x86-64 EFI boot-service driver and packaged as a PCI option ROM
 # (docs/graphics-kext/design.md), built on the host's wire protocol header in
-# ../crates/reims-graphics/include.
+# ../crates/reims-vgpu-graphics/include.
 #
 #   make           build/ReimsGraphics.{efi,rom}
 #   make prebuilt  on a Mac, also prebuilt/ReimsGraphics.rom, which reims-ctl carries, and
@@ -36,7 +36,7 @@ LDFLAGS = /nologo /nodefaultlib /dll /driver /base:0 /machine:x64 \
 	/opt:ref /align:32 /filealign:32 /Brepro
 
 GNAME = ReimsGraphics
-WIRE  = ../crates/reims-graphics/include
+WIRE  = ../crates/reims-vgpu-graphics/include
 
 # The ROM's PCI identity is the host wire header's. It is generated C, not
 # assembler, so its macro values are read with the preprocessor and passed to

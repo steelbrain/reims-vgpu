@@ -1,6 +1,6 @@
 /*
  * RgfxIcbSlotTable: an indirect command buffer's CPU encodes as slots in a block of the process's
- * region, where the host took ICB_SLOTS (crates/reims-graphics/src/icb.rs, "Slots"). Each command
+ * region, where the host took ICB_SLOTS (crates/reims-vgpu-graphics/src/icb.rs, "Slots"). Each command
  * has a slot of its own, `stride` bytes from the next; a setter writes its field there and sets
  * the field's bit in the slot's mask with an atomic OR, as a GPU's driver writes a command's
  * record into memory the GPU reads, and posts nothing. The flush (RgfxSerializer::flushIcbWrites)

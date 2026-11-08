@@ -69,8 +69,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use reims_graphics::Scanout;
-use reims_graphics::region::Region;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -85,6 +83,8 @@ use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::Scanout;
+use reims_vgpu_graphics::region::Region;
 use reims_vgpu_window::PixelRect;
 
 use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};
@@ -95,11 +95,11 @@ use super::color::DisplayColor;
 use super::{DisplayHold, DrawnPresents, Presented, Shown};
 use crate::entry::no_catch;
 use crate::platform::ApiPlatform;
-use reims_graphics::wire::{
-    RGFX_COLOR_MATRIX, RGFX_COLOR_PLANE_GAMMA, RGFX_COLOR_POST_GAMMA, RGFX_COLOR_PRE_GAMMA,
-};
 use reims_vgpu_core::platform::resource::Library as _;
 use reims_vgpu_core::platform::values::RenderPipelineDesc;
+use reims_vgpu_graphics::wire::{
+    RGFX_COLOR_MATRIX, RGFX_COLOR_PLANE_GAMMA, RGFX_COLOR_POST_GAMMA, RGFX_COLOR_PRE_GAMMA,
+};
 
 /// `MTLLoadActionClear`.
 const LOAD_ACTION_CLEAR: u64 = 2;
@@ -621,7 +621,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         let height = u64::from(scanout.height)
             .min(region.height)
             .min(texture_height - y);
-        // The scanout's offset and stride are multiples of 4 (`reims_graphics`'s `SET_SCANOUT`),
+        // The scanout's offset and stride are multiples of 4 (`reims_vgpu_graphics`'s `SET_SCANOUT`),
         // and its pages' import starts at a page.
         let read = ScanoutRead {
             buffer,
@@ -1362,7 +1362,7 @@ mod tests {
         width: 64,
         height: 32,
         stride: 256,
-        offset: reims_graphics::wire::RGFX_ALLOCATIONS_OFFSET,
+        offset: reims_vgpu_graphics::wire::RGFX_ALLOCATIONS_OFFSET,
     };
 
     /// A sink over a fresh region, showing a 64 × 32 scanout at the region's allocations, and a
@@ -1374,7 +1374,7 @@ mod tests {
         <FakePlatform as Platform>::Texture,
     ) {
         let platform = Arc::new(FakePlatform::new());
-        let region = Arc::new(Region::new(reims_graphics::REGION_SIZE as usize).unwrap());
+        let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
         let shown = Arc::new(Shown::default());
         *shown.scanout.lock() = Some(SCANOUT);
         let presented = Arc::new(Presented::<FakePlatform>::default());
@@ -2006,11 +2006,11 @@ mod tests {
 
     /// [`the_table_draws_what_the_pass_draws`]'s body, inside the library's entry.
     fn table_draws_what_the_pass_draws<P: ApiPlatform>(platform: &Arc<P>) {
-        use reims_graphics::wire::RGFX_ALLOCATIONS_OFFSET;
+        use reims_vgpu_graphics::wire::RGFX_ALLOCATIONS_OFFSET;
 
         const W: u32 = 3840;
         const H: u32 = 4;
-        let region = Arc::new(Region::new(reims_graphics::REGION_SIZE as usize).unwrap());
+        let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
         // Channel c of pixel (x, y) at `n` values: each takes every value along a row.
         let value = |c: u32, x: u32, y: u32, n: u32| match c {
             0 => x % n,

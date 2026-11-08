@@ -12,7 +12,12 @@
 //! argument buffer, or is a struct, names its layout by its index. A layout's members follow every
 //! member of the layouts before it, so the guest reads the records in one pass.
 
-use reims_graphics::wire::{
+use reims_vgpu_core::platform::Platform;
+use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::types::{ArgumentKind, ArgumentLayout};
+use reims_vgpu_core::platform::values::ArgumentDesc;
+use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_graphics::wire::{
     RGFX_ARGUMENT_ACCELERATION_STRUCTURE, RGFX_ARGUMENT_BUFFER, RGFX_ARGUMENT_COMPUTE_PIPELINE,
     RGFX_ARGUMENT_CONSTANT, RGFX_ARGUMENT_DEPTH_STENCIL, RGFX_ARGUMENT_INDIRECT_COMMAND_BUFFER,
     RGFX_ARGUMENT_INTERSECTION_FUNCTION_TABLE, RGFX_ARGUMENT_NO_LAYOUT,
@@ -23,11 +28,6 @@ use reims_graphics::wire::{
     RgfxArgumentLayoutQuery, RgfxArgumentLayoutRecord, RgfxArgumentLayoutReply,
     RgfxArgumentMemberRecord, RgfxMsgHeader,
 };
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::types::{ArgumentKind, ArgumentLayout};
-use reims_vgpu_core::platform::values::ArgumentDesc;
-use reims_vgpu_core::raise::RaiseResult;
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::{GraphicsDecoder, ObjHandle, constants_tail, read, specialised, str_tail};
@@ -218,13 +218,13 @@ impl<P: Platform> GraphicsDecoder<P> {
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::region::Region;
-    use reims_graphics::wire::{
+    use reims_vgpu_core::platform::device::GpuDevice;
+    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_graphics::region::Region;
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN,
         RgfxFunctionConstant,
     };
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::testkit::FakePlatform;
 
     use super::super::{GraphicsDecoder, ObjHandle};
     use super::*;

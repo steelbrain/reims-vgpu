@@ -67,7 +67,7 @@ table is retired and not reused.
 
 | # | decision | why |
 |---|---|---|
-| D1 | One Cargo workspace at the repository root: the library's crates (`reims-vgpu-core`, `-vulkan`, `-window`, `reims-graphics`, `reims-vgpu`, `-c`), the host video crates (`reims-vgpu-video-*`), and `xtask`. `reims-vgpu-vulkan` is the library's `Platform`, over `metal2vulkan-runtime`, a Metal-shaped API on Vulkan: on Linux, and on macOS over MoltenVK, a build for development and tests (2.1, 2.2). | Each crate does one job the others cannot without breaking a rule below. |
+| D1 | One Cargo workspace at the repository root: the library's crates (`reims-vgpu-core`, `-vulkan`, `-window`, `reims-vgpu-graphics`, `reims-vgpu`, `-c`), the host video crates (`reims-vgpu-video-*`), and `xtask`. `reims-vgpu-vulkan` is the library's `Platform`, over `metal2vulkan-runtime`, a Metal-shaped API on Vulkan: on Linux, and on macOS over MoltenVK, a build for development and tests (2.1, 2.2). | Each crate does one job the others cannot without breaking a rule below. |
 | D2 | Modules by area and responsibility, not one file per Objective-C class. | The code is Rust; the contract binds behaviour, not file shape. |
 | D3 | Core is generic over one `P: Platform` whose associated types name every Metal object kind. `dyn` only for the host's callbacks, the display executor and the OS services. | A handle flows into another Metal call (a texture into an encoder) with its kind checked at compile time. |
 | D4 | One typed platform method per Metal method the library calls, and one enum variant per encoder and ICB command (`BlitCmd`, `ComputeCmd`, `RenderCmd`, `IcbRenderCmd`, `IcbComputeCmd`), with no table of ops between the caller and Metal. The platform's dispatch is one exhaustive `match` per command family, and it names each call by its selector and raise policy (4.3, 4.6). A call whose position the guest or host observes (a creation, release or retain, an aliasing setter, a command, a call with raw guest values) is sent where the caller makes it; a getter or device query is not ordered. | A send per guest operation, in order, with raw guest values: Metal's results, aborts and numbering follow the calls a process makes. |
@@ -117,7 +117,7 @@ crates/
                         over MoltenVK on macOS; its OS services; the library's shaders
   reims-vgpu-window/    the device's own window: AppKit or SDL3, input, the host's screens,
                         and features.md, the register of what the window does
-  reims-graphics/       the device's wire, its rings and control, and the C header the guest
+  reims-vgpu-graphics/  the device's wire, its rings and control, and the C header the guest
                         compiles (include/reims_graphics_wire.h)
   reims-vgpu/           the Rust API: the graphics device over the platform, and its window
   reims-vgpu-c/         the C API (cdylib, staticlib, rlib) and include/reims_vgpu.h
@@ -141,7 +141,7 @@ preferences domain and no entitlement: the device's options are its config's fie
 
 ```
 reims-vgpu-core, metal2vulkan-runtime  <-  reims-vgpu-vulkan  <-  reims-vgpu-window  <-  reims-vgpu
-reims-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  QEMU
+reims-vgpu-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  QEMU
 ```
 
 - **The Vulkan platform** (`reims-vgpu-vulkan`) is the library's `Platform`, over
@@ -189,7 +189,7 @@ reims-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  QEMU
     theirs (`msg::catch`) and go on. Every `define_class!` method and every block posted to the
     main thread starts in `BlockEnv::foreign`, which marks the thread as the library's, so a panic
     there aborts before it unwinds into AppKit.
-- **The device** (`reims-graphics`) is the wire and the device's transport (9), with no platform:
+- **The device** (`reims-vgpu-graphics`) is the wire and the device's transport (9), with no platform:
   `reims-vgpu` drives the platform from what it carries.
 - **The API** (`reims-vgpu`) is where the device meets the platform: its types are generic over an
   `ApiPlatform`, the OS's default platform by default, so its unit tests run its forwarding on the
@@ -479,7 +479,7 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   (`reims-vgpu.graphics-surfaces-<i>`), ICB creation (`reims-vgpu.icb-create-<i>`), a closed
   process's releases (`reims-vgpu.graphics-closes-<i>`), video (`reims-vgpu.graphics-video-<i>`)
   and event waits (`reims-vgpu.graphics-event-waits`). How long a pool keeps an idle thread is
-  `reims-graphics`'s `keep`.
+  `reims-vgpu-graphics`'s `keep`.
 - A worker per serial queue while it has work (it ends after 5 s idle), the process's display
   thread among them.
 - Metal's completion threads, and the host's own threads inside a call that may call back (both
@@ -546,7 +546,7 @@ points inside or outside their locks.
 
 [graphics-kext/design.md](graphics-kext/design.md) is the device's design and wire protocol. In the
 code:
-- **`reims-graphics`** is the wire and the transport, with no platform: `wire` (the registers, the
+- **`reims-vgpu-graphics`** is the wire and the transport, with no platform: `wire` (the registers, the
   region's layout, the rings, the control commands and events, which cbindgen writes into
   `include/reims_graphics_wire.h` for the guest's kexts and the option ROM), `ops` (the command
   buffer op stream the guest's bundle serialises), `icb` (the CPU's encodes into an indirect
@@ -693,7 +693,7 @@ device for its displays and offers one mode: the preferred mode of the first con
 1920 × 1080 when there is none. The framebuffer is the region's memory from
 `RGFX_ALLOCATIONS_OFFSET`, and `SetMode` points the display at it with `SET_SCANOUT`. Firmware
 takes no interrupts: a command polls the completion ring for its answer. The registers, rings and
-commands are the wire's, from `crates/reims-graphics/include/reims_graphics_wire.h`.
+commands are the wire's, from `crates/reims-vgpu-graphics/include/reims_graphics_wire.h`.
 
 **The build.** `firmware/Makefile` compiles the C freestanding for `x86_64-unknown-windows`, whose
 default calling convention is the Microsoft x64 one UEFI uses, at `-Os` with `-Werror`; `lld-link`

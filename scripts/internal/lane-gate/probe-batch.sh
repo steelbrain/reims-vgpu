@@ -61,7 +61,7 @@
 # the host's load to settle under 4, runs them back to back and powers the guest off. --capture
 # also captures the boot as the gate's --capture-boot does (msi-boot.sh's CAPTURE: its scanout,
 # the guest's screenshots and the kext's log of the boot, in the round's capture/), the host's log
-# at info,reims_graphics=trace,reims_vgpu::graphics=debug; a round with --capture runs with no
+# at info,reims_vgpu_graphics=trace,reims_vgpu::graphics=debug; a round with --capture runs with no
 # probe too. --first NAME,... has the round consider those probes first, in that order, before the
 # others oldest first, and --only NAME,... takes those alone, in that order; --exclude NAME,...
 # leaves those in the queue (a probe that must come last in its own round); --catch-from-boot
@@ -131,10 +131,10 @@ PUB=$(cat "$GH/published-last")
 SHORT=${PUB:0:9}
 WAIT_N=3 WAIT_S=2700
 # The host's log filter in a probe boot: info, and the display's presents ("PRESENT_SURFACE of
-# transaction", reims_graphics at trace, about 23 lines a second at 120 Hz), so a probe's host.log
-# counts composites. reims_graphics has no other trace lines; at debug it logs SUBMIT_ROOM posts
-# (reims_graphics::room). Gate and bench boots log at info.
-PROBE_HOST_LOG=${host_log:-info,reims_graphics=trace}
+# transaction", reims_vgpu_graphics at trace, about 23 lines a second at 120 Hz), so a probe's host.log
+# counts composites. reims_vgpu_graphics has no other trace lines; at debug it logs SUBMIT_ROOM posts
+# (reims_vgpu_graphics::room). Gate and bench boots log at info.
+PROBE_HOST_LOG=${host_log:-info,reims_vgpu_graphics=trace}
 # The hold the probes get: the boot's own time to the desktop and the device check (about 90 s),
 # the longest load settle (180 s) and a margin come first.
 FIT_S=$(( HOLD_S - 90 - 180 - 60 ))

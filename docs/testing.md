@@ -19,7 +19,7 @@ How the code is tested, and how a claim about Metal or the hardware says where i
   so and [accuracy-ledger.md](accuracy-ledger.md) has the row.
 - **The C API's tests** (`crates/reims-vgpu-c/tests`): its exports, and a host in C built against
   the committed header and linked with the shared library.
-- **The wire's header** (`crates/reims-graphics/tests/header.rs`) compiles as the guest's kext and
+- **The wire's header** (`crates/reims-vgpu-graphics/tests/header.rs`) compiles as the guest's kext and
   option ROM compile it, as C11 and as C++17 with no warning, its records laid out as `wire`'s.
 - **The host video backends** have hardware tests and conformance runs of their own
   ([video/](video/)).

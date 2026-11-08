@@ -214,7 +214,7 @@ finish() {
   if [[ -f $B/launch.log ]]; then
     kv fatal_lines "$(grep -c 'reims-vgpu: fatal' "$B/launch.log")"
     # The host's records of paths a tip adds: queues made unshared (RGFX_QUEUE_UNSHARED),
-    # SUBMIT_ROOM records posted (reims_graphics::room at debug, HOST_LOG), and ICB_SLOTS messages
+    # SUBMIT_ROOM records posted (reims_vgpu_graphics::room at debug, HOST_LOG), and ICB_SLOTS messages
     # whose runs were not all carried out.
     kv queues_unshared "$(grep -c 'made unshared' "$B/launch.log")"
     kv submit_room_posted "$(grep -c 'SUBMIT_ROOM posted' "$B/launch.log")"

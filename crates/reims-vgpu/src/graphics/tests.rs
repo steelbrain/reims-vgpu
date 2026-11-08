@@ -1,8 +1,6 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use reims_graphics::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
-use reims_graphics::wire::*;
 use reims_vgpu_core::platform::ObjId;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::types::CommandBufferStatus;
@@ -10,6 +8,8 @@ use reims_vgpu_core::testkit::faults::Fault;
 use reims_vgpu_core::testkit::impls::device::FAKE_LINEAR_ROW_ALIGNMENT;
 use reims_vgpu_core::testkit::objects::CompleteOn;
 use reims_vgpu_core::testkit::{Arg, FakePlatform, HeldCall};
+use reims_vgpu_graphics::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
+use reims_vgpu_graphics::wire::*;
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
@@ -38,12 +38,12 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
 fn a_headless_device_answers_its_guest() {
     let raised = Arc::new(AtomicU32::new(0));
     let device = headless(&raised);
-    assert_eq!(device.region_size(), reims_graphics::REGION_SIZE);
+    assert_eq!(device.region_size(), reims_vgpu_graphics::REGION_SIZE);
     assert!(!device.region_base().is_null());
     assert_eq!(device.mmio_read(RGFX_REG_MAGIC.into()), RGFX_MAGIC);
     assert_eq!(
         device.mmio_read(RGFX_REG_REGION_SIZE_LO.into()),
-        (reims_graphics::REGION_SIZE & 0xffff_ffff) as u32
+        (reims_vgpu_graphics::REGION_SIZE & 0xffff_ffff) as u32
     );
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     // SAFETY: the region is the device's, mapped while it lives, and the rings' fields are at
@@ -380,7 +380,7 @@ fn command_buffer(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
 /// [`command_buffer`] with one op, `SUBMITTED`: a buffer that asks for its `CB_SUBMITTED`, as
 /// `commitAndWaitUntilSubmitted` commits it.
 fn asking(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
-    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
 
     let mut message = command_buffer(queue_obj_id, cb_obj_id);
     let submitted = RgfxOpHeader {
@@ -1049,7 +1049,7 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
 /// its message's length on the way, and it completes as one from the ring does.
 #[test]
 fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
-    use reims_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RgfxOpHeader};
+    use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RgfxOpHeader};
 
     let platform = Arc::new(FakePlatform::new());
     let config = GraphicsConfig {
@@ -1674,7 +1674,7 @@ fn an_asking_buffer_s_doorbell_to_its_cb_submitted_behind_a_walk() {
 #[ignore = "a measurement, run by hand"]
 #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
 fn a_lone_buffer_s_doorbell_to_its_cb_scheduled() {
-    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
     use std::time::Instant;
 
     const ROUNDS: usize = 2000;
@@ -2062,7 +2062,7 @@ fn the_sink_imports_only_the_scanout_s_pages() {
 
     const IMPORT: &str = "newBufferWithBytesNoCopy:length:options:deallocator:";
     let platform = Arc::new(FakePlatform::new());
-    let region = Arc::new(Region::new(reims_graphics::REGION_SIZE as usize).unwrap());
+    let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
     let shown = Arc::new(Shown::default());
     let presented = Arc::new(Presented::<FakePlatform>::default());
     let draw = sink::ScanoutDraw::new(Arc::clone(&platform), &region, &shown, &presented).unwrap();
@@ -2843,10 +2843,10 @@ fn compute_pipeline_create(obj_id: u64, library: u64) -> Vec<u8> {
 /// A `COMMAND_BUFFER` `cb_obj_id` on queue `queue_obj_id` whose one compute encoder sets compute
 /// pipeline `pipeline`.
 fn compute_command_buffer(queue_obj_id: u64, cb_obj_id: u64, pipeline: u64) -> Vec<u8> {
-    use reims_graphics::ops::compute::{
+    use reims_vgpu_graphics::ops::compute::{
         RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
     };
     let op = |tag: u16, body: &[u8]| {
@@ -3170,11 +3170,11 @@ fn sampler_answered(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, ob
 
 /// A command buffer whose compute pass binds the sampler `sampler` at index 0.
 fn sampler_command_buffer(queue_obj_id: u64, cb_obj_id: u64, sampler: u64) -> Vec<u8> {
-    use reims_graphics::ops::compute::{
+    use reims_vgpu_graphics::ops::compute::{
         RGFX_OP_COMPUTE_SET_SAMPLER_STATES, RgfxComputeOpSetSamplerStates,
         RgfxComputeSamplerBinding,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
     };
     let op = |tag: u16, body: &[u8]| {
@@ -3689,7 +3689,7 @@ fn a_queue_s_buffer_runs_beside_another_queue_s_walk() {
 /// `message`, a command buffer, with a `SUBMITTED` op after its ops: it asks for its
 /// `CB_SUBMITTED`, as `commitAndWaitUntilSubmitted` commits it.
 fn with_ask(mut message: Vec<u8>) -> Vec<u8> {
-    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
 
     let submitted = RgfxOpHeader {
         tag: RGFX_OP_SUBMITTED,
@@ -4038,7 +4038,7 @@ fn a_held_walk_answered_its_submitted_holds_only_its_process_s_later_commits() {
 /// whichever slot named it
 #[test]
 fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RGFX_OP_SURFACE_ORDER,
         RgfxSurfaceOrderWait,
     };
@@ -4128,7 +4128,7 @@ fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
 /// which signals what it waits for once the service thread goes on and the buffer is taken
 #[test]
 fn a_queue_s_buffers_are_waited_for_before_its_handle_is_made() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RGFX_OP_SURFACE_ORDER,
         RgfxSurfaceOrderWait,
     };
@@ -4227,7 +4227,7 @@ fn a_queue_s_buffers_are_waited_for_before_its_handle_is_made() {
 
 /// A command buffer with the ops `ops`, each a tag and its body, on queue `queue_obj_id`.
 fn command_buffer_of(queue_obj_id: u64, cb_obj_id: u64, ops: &[(u16, &[u8])]) -> Vec<u8> {
-    use reims_graphics::ops::RgfxOpHeader;
+    use reims_vgpu_graphics::ops::RgfxOpHeader;
 
     let mut stream = Vec::new();
     for &(tag, body) in ops {
@@ -4503,7 +4503,7 @@ const SIDE_ROUNDS: usize = 5;
 /// carried out whole first (the fake platform schedules each buffer at its commit)
 #[test]
 fn a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling() {
-    use reims_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+    use reims_vgpu_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
 
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, mut guest, mut ring) = one_queue(&raised);
@@ -4543,7 +4543,7 @@ fn a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_schedul
 /// and its failure comes after the first's completion
 #[test]
 fn a_video_buffer_is_walked_in_its_turn() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
         RgfxOpVideoPass,
     };
@@ -4587,7 +4587,7 @@ fn a_video_buffer_is_walked_in_its_turn() {
 /// the lane ([`a_video_buffer_is_walked_in_its_turn`])
 #[test]
 fn a_lone_video_buffer_is_walked_on_its_queue_s_service_thread() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
         RgfxOpVideoPass,
     };
@@ -4662,7 +4662,7 @@ fn walk_threads(
 /// behind its process's buffer on another queue answered its `CB_SUBMITTED` and still walked
 #[test]
 fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread() {
-    use reims_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
+    use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
 
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, _guest, mut ring) = one_queue(&raised);
@@ -4835,7 +4835,7 @@ fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the
 /// buffer would wait for nothing
 #[test]
 fn a_buffer_named_while_its_queue_s_later_buffer_is_walked_first_is_waited_for() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RGFX_OP_SURFACE_ORDER,
         RgfxSurfaceOrderWait,
     };
@@ -6515,11 +6515,11 @@ fn shared_event_create(obj_id: u64, initial_value: u64) -> Vec<u8> {
 /// A `COMMAND_BUFFER` `cb_obj_id` on queue `queue_obj_id` that signals shared event `event` to 4,
 /// draws with render pipeline `pipeline` in a pass of no attachments, and signals `event` to 5.
 fn render_command_buffer(queue_obj_id: u64, cb_obj_id: u64, pipeline: u64, event: u64) -> Vec<u8> {
-    use reims_graphics::ops::render::{
+    use reims_vgpu_graphics::ops::render::{
         RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
         RgfxOpDrawPrimitives, RgfxOpSetRenderPipelineState,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_OP_SIGNAL_EVENT,
         RGFX_PASS_FLAG_RT_SIZE, RgfxOpEvent, RgfxOpHeader, RgfxRenderPassDesc,
     };
@@ -6691,16 +6691,16 @@ fn op_of(tag: u16, body: &[u8]) -> (u16, Vec<u8>) {
 /// refused in turn, and its destroy lets the id go.
 #[test]
 fn what_names_a_refused_create_is_dropped_and_its_command_buffer_completes() {
-    use reims_graphics::ops::blit::{
+    use reims_vgpu_graphics::ops::blit::{
         RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
         RgfxBlitOpCopyTextureToBuffer, RgfxBlitOpFillBuffer,
     };
-    use reims_graphics::ops::render::{
+    use reims_vgpu_graphics::ops::render::{
         RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
         RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, RgfxOpDrawPrimitives, RgfxOpSetFragmentTexture,
         RgfxOpSetRenderPipelineState,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END,
         RGFX_OP_SIGNAL_EVENT, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_RT_SIZE,
         RGFX_RENDER_PASS_COLOR_OFFSET, RgfxOpEvent, RgfxRenderPassColorAttachment,
@@ -8211,15 +8211,15 @@ fn an_icb_is_written_through_slots_and_executed_through_the_rings() {
 /// An indirect command buffer made, its command 1 written by the CPU (as slots where `slots`, as
 /// records else), and executed by a command buffer posted after.
 fn icb_through_the_rings(slots: bool) {
-    use reims_graphics::icb::{
+    use reims_vgpu_graphics::icb::{
         RGFX_ICB_OP_DISPATCH_THREADGROUPS, RGFX_ICB_OP_KERNEL_BUFFER, RGFX_ICB_SLOT_ACTION,
         RGFX_ICB_SLOT_BUFFER_0, RgfxIcbBuffer, RgfxIcbComputeSlot, RgfxIcbDispatch, RgfxIcbRecord,
         RgfxIcbSlotBuffer,
     };
-    use reims_graphics::ops::compute::{
+    use reims_vgpu_graphics::ops::compute::{
         RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER, RgfxComputeOpExecuteCommandsInBuffer,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
     };
     let raised = Arc::new(AtomicU32::new(0));
@@ -9714,7 +9714,7 @@ fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
         };
         let read = device
             .read
-            .at_screen(Arc::new(reims_graphics::FixedScreen(mode)));
+            .at_screen(Arc::new(reims_vgpu_graphics::FixedScreen(mode)));
         for (name, messages, want) in &colours {
             if !messages.is_empty() {
                 for m in messages {
@@ -9844,7 +9844,7 @@ fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
         };
         let read = device
             .read
-            .at_screen(Arc::new(reims_graphics::FixedScreen(mode)));
+            .at_screen(Arc::new(reims_vgpu_graphics::FixedScreen(mode)));
         for (name, rows, swapped) in [
             ("no colour", identity, false),
             ("red and blue swapped", swap, true),
@@ -9926,7 +9926,7 @@ fn noting_raises(
 /// reach `value` and asks for its `CB_SUBMITTED`: its records go at its scheduling, from its
 /// submission handler.
 fn waiting_and_asking(queue_obj_id: u64, cb_obj_id: u64, event: u64, value: u64) -> Vec<u8> {
-    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RGFX_OP_WAIT_EVENT, RgfxOpEvent};
 
     let wait = RgfxOpEvent {
         event_obj_id: event,
@@ -10024,7 +10024,7 @@ fn a_foreign_commit_hands_a_decoder_buffer_s_records_to_its_queue_s_thread() {
 /// queue's service thread, which posts them, and raises, once the guest has made room
 #[test]
 fn a_read_of_the_display_calls_nothing_back_and_waits_for_no_full_ring() {
-    use reims_graphics::ops::{RGFX_OP_SIGNAL_EVENT, RgfxOpEvent};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SIGNAL_EVENT, RgfxOpEvent};
 
     const DATA: u32 = 0x1000;
     const SIGNALS: u64 = 150;

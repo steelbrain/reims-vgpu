@@ -62,7 +62,7 @@ SET = (
 # build reads (guest/kext, guest/bundle, guest/rgfxgate, guest/loader and the
 # wire header), and the files that build and stage it.
 INPUTS = (
-    "crates/reims-graphics/include",
+    "crates/reims-vgpu-graphics/include",
     "guest/Makefile",
     "guest/tools/prebuilt.py",
     "guest/kext/Makefile", "guest/kext/src",

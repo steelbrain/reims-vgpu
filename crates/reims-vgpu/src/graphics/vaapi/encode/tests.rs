@@ -1,4 +1,4 @@
-use reims_graphics::wire::RGFX_VIDEO_DECODE;
+use reims_vgpu_graphics::wire::RGFX_VIDEO_DECODE;
 use reims_vgpu_video::core::runtime::StdRuntime;
 use reims_vgpu_video::vaapi::{H264Decoder, HevcDecoder, encoder_support};
 

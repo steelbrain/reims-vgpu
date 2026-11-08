@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 
-use reims_graphics::ops::video::{RGFX_VIDEO_PICTURE_I, RGFX_VIDEO_PICTURE_P};
-use reims_graphics::wire::RGFX_VIDEO_CODEC_H264;
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::testkit::FakePlatform;
 use reims_vgpu_core::testkit::calllog::Arg;
 use reims_vgpu_core::testkit::objects::CompleteOn;
+use reims_vgpu_graphics::ops::video::{RGFX_VIDEO_PICTURE_I, RGFX_VIDEO_PICTURE_P};
+use reims_vgpu_graphics::wire::RGFX_VIDEO_CODEC_H264;
 use zerocopy::FromBytes;
 
 use super::super::super::decode::VideoPlane;

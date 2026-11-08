@@ -1,7 +1,7 @@
 /*
  * RgfxRingWriter: the guest's end of a submission ring (guest -> host) in the
  * device's BAR 2 region (docs/graphics-kext/design.md, "Stage 2 wire protocol"
- * and "Stage 3 wire protocol"; crates/reims-graphics/src/ring.rs is the host's
+ * and "Stage 3 wire protocol"; crates/reims-vgpu-graphics/src/ring.rs is the host's
  * mirror, whose test `Guest` is this write path).
  *
  * A ring is an RgfxRingHeader followed by a byte ring of `data_size` bytes (a

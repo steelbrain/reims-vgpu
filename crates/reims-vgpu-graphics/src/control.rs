@@ -340,7 +340,7 @@ fn present(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
         Some(command) if command.display == 0 => {
             if command.flags & RGFX_PRESENT_KEEP != 0 {
                 log::trace!(
-                    target: "reims_graphics",
+                    target: "reims_vgpu_graphics",
                     "PRESENT_SURFACE of transaction {}: the display keeps what it shows",
                     command.transaction_id
                 );
@@ -366,7 +366,10 @@ fn present(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> {
 /// names, or naming more than [`RGFX_COLOR_PART_ENTRIES`], is logged and dropped.
 fn display_color(shared: &Shared, message: &Message) {
     let Some(color) = read::<RgfxDisplayColor>(message) else {
-        log::warn!(target: "reims_graphics", "a DISPLAY_COLOR shorter than its fields was dropped");
+        log::warn!(
+            target: "reims_vgpu_graphics",
+            "a DISPLAY_COLOR shorter than its fields was dropped"
+        );
         return;
     };
     let fields = size_of::<RgfxDisplayColor>();
@@ -385,13 +388,13 @@ fn display_color(shared: &Shared, message: &Message) {
     match entries {
         Some(entries) if color.display == 0 => shared.host.display_color(&color, &entries),
         Some(_) => log::warn!(
-            target: "reims_graphics",
+            target: "reims_vgpu_graphics",
             "a DISPLAY_COLOR of display {} (transaction {}) was dropped: there is no such display",
             color.display,
             color.transaction_id
         ),
         None => log::warn!(
-            target: "reims_graphics",
+            target: "reims_vgpu_graphics",
             "a DISPLAY_COLOR of transaction {} naming {} entries was dropped: the message does \
              not carry them, or they are past {RGFX_COLOR_PART_ENTRIES}",
             color.transaction_id,
@@ -410,7 +413,7 @@ fn present_surface(
     epoch: u64,
 ) {
     log::trace!(
-        target: "reims_graphics",
+        target: "reims_vgpu_graphics",
         "PRESENT_SURFACE of transaction {}: IOSurface {}",
         command.transaction_id,
         command.iosurface_id

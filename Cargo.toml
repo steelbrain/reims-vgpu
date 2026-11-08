@@ -9,7 +9,7 @@ members = [
     "crates/reims-vgpu-vulkan",
     "crates/reims-vgpu-video",
     "crates/reims-vgpu-video/conformance",
-    "crates/reims-graphics",
+    "crates/reims-vgpu-graphics",
     "xtask",
 ]
 
@@ -28,7 +28,7 @@ reims-vgpu-window = { path = "crates/reims-vgpu-window", default-features = fals
 reims-vgpu = { path = "crates/reims-vgpu", default-features = false }
 reims-vgpu-vulkan = { path = "crates/reims-vgpu-vulkan" }
 # The reims-graphics device: its wire format and host side.
-reims-graphics = { path = "crates/reims-graphics" }
+reims-vgpu-graphics = { path = "crates/reims-vgpu-graphics" }
 # The reims-graphics device's video on the host: its runtime and memory (`crate::video` of
 # `reims-vgpu`), and, on Linux, VA-API through libva and NVDEC through CUDA, their libraries
 # loaded at run time (`graphics::vaapi` and `graphics::nvidia` of `reims-vgpu`).

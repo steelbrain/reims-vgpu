@@ -28,17 +28,6 @@
 
 use std::sync::{Arc, mpsc};
 
-use reims_graphics::ops::video::{
-    RGFX_VIDEO_ENCODE_FAILED, RGFX_VIDEO_ENCODE_OK, RGFX_VIDEO_ENCODE_OVERFLOW,
-    RGFX_VIDEO_ENCODED_KEYFRAME, RGFX_VIDEO_ENCODED_PARAMETER_SETS, RGFX_VIDEO_ENTROPY_CABAC,
-    RGFX_VIDEO_ENTROPY_CAVLC, RGFX_VIDEO_RATE_CBR, RGFX_VIDEO_RATE_CQP, RGFX_VIDEO_RATE_VBR,
-    RgfxVideoEncodeResult, RgfxVideoEncodeSettings,
-};
-use reims_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010,
-    RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN,
-    RGFX_VIDEO_HEVC_MAIN_10,
-};
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::Platform;
@@ -47,6 +36,17 @@ use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::raise::{Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::ops::video::{
+    RGFX_VIDEO_ENCODE_FAILED, RGFX_VIDEO_ENCODE_OK, RGFX_VIDEO_ENCODE_OVERFLOW,
+    RGFX_VIDEO_ENCODED_KEYFRAME, RGFX_VIDEO_ENCODED_PARAMETER_SETS, RGFX_VIDEO_ENTROPY_CABAC,
+    RGFX_VIDEO_ENTROPY_CAVLC, RGFX_VIDEO_RATE_CBR, RGFX_VIDEO_RATE_CQP, RGFX_VIDEO_RATE_VBR,
+    RgfxVideoEncodeResult, RgfxVideoEncodeSettings,
+};
+use reims_vgpu_graphics::wire::{
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010,
+    RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN,
+    RGFX_VIDEO_HEVC_MAIN_10,
+};
 use zerocopy::IntoBytes;
 
 use super::super::decode::{Decoded, GraphicsVideoSession, VideoDecode, VideoEncode, op_fault};

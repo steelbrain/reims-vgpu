@@ -18,7 +18,7 @@
 
 namespace {
 // A queue's submission and completion ring byte-ring sizes (each a power of two). The
-// host's ring loop (crates/reims-graphics/src/device.rs) posts this queue's command-
+// host's ring loop (crates/reims-vgpu-graphics/src/device.rs) posts this queue's command-
 // buffer completions on its own completion ring, so the queue reads that ring (not the
 // device's control completion ring); see newCommandQueue.
 constexpr uint32_t kQueueSubmitDataSize = 32768;

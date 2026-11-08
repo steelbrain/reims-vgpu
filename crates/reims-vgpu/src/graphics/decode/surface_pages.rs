@@ -118,10 +118,6 @@ use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use reims_graphics::wire::{
-    RGFX_SURFACE_PAGES_PLANES, RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages,
-    RgfxPageRun, RgfxSurfacePages, RgfxSurfacePagesLayout,
-};
 use reims_vgpu_core::host::{HostPtr, PhysRange};
 use reims_vgpu_core::memory::PAGE_SIZE as MAPPING_PAGE;
 use reims_vgpu_core::memory::map::MemoryMap;
@@ -133,6 +129,10 @@ use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, PagesPl
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::wire::{
+    RGFX_SURFACE_PAGES_PLANES, RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages,
+    RgfxPageRun, RgfxSurfacePages, RgfxSurfacePagesLayout,
+};
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
 #[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
@@ -555,7 +555,7 @@ impl<P: Platform> SurfaceViews<P> {
     /// Whether views can be made: a memory map, and a host page the guest's runs are whole
     /// pages of ([`GUEST_PAGE`]); the device's [`RGFX_FEATURE_SURFACE_PAGES`] says so.
     ///
-    /// [`RGFX_FEATURE_SURFACE_PAGES`]: reims_graphics::wire::RGFX_FEATURE_SURFACE_PAGES
+    /// [`RGFX_FEATURE_SURFACE_PAGES`]: reims_vgpu_graphics::wire::RGFX_FEATURE_SURFACE_PAGES
     pub(crate) fn available(&self, platform: &P) -> bool {
         self.memory.is_some()
             && platform.vm().page_size() == GUEST_PAGE
@@ -1462,8 +1462,12 @@ mod costs;
 
 #[cfg(test)]
 pub(super) mod tests {
-    use reims_graphics::region::Region;
-    use reims_graphics::wire::{
+    use reims_vgpu_core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
+    use reims_vgpu_core::platform::resource::Buffer as _;
+    use reims_vgpu_core::platform::values::PagesInPlace;
+    use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam};
+    use reims_vgpu_graphics::region::Region;
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_PAGES,
         RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_OBJECT_DESTROY,
         RGFX_CMD_SURFACE_PAGES, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
@@ -1474,10 +1478,6 @@ pub(super) mod tests {
         RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout, RgfxTextureDescriptor,
         RgfxTextureFromBuffer,
     };
-    use reims_vgpu_core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::platform::values::PagesInPlace;
-    use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam};
     use zerocopy::IntoBytes;
 
     use super::super::{DecodeError, GraphicsDecoder, no_raise};

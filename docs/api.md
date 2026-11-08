@@ -24,7 +24,7 @@ library's `reims-vgpu.ui` on Linux.
 | core | `reims-vgpu-core` | the platform traits, the runtime (threads, queues, holds), raises and deaths, the display's present pipeline, guest memory and the fake platform the tests run on |
 | platform | `reims-vgpu-vulkan` | core's `Platform`: `VulkanPlatform`, over metal2vulkan's runtime, on Linux, and on macOS over MoltenVK, a build for development and tests |
 | window | `reims-vgpu-window` | a display's own window (AppKit's or SDL3's on macOS, SDL3's on Linux), its input and the host's screens; it knows nothing of devices |
-| device | `reims-graphics` | the wire: the records, rings and registers the guest and the host share, and the C header the guest's kexts and the option ROM compile |
+| device | `reims-vgpu-graphics` | the wire: the records, rings and registers the guest and the host share, and the C header the guest's kexts and the option ROM compile |
 | Rust API | `reims-vgpu` | the graphics device over the platform: its rings, decoder, display and window, and owned Rust types for its config and callbacks |
 | C API | `reims-vgpu-c` | a thin FFI layer over the Rust API; cbindgen writes `include/reims_vgpu.h` from it |
 

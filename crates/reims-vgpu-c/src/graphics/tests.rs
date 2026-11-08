@@ -49,12 +49,12 @@ fn a_headless_graphics_device_lives_and_ends() {
     // SAFETY: a live device; the size is writable.
     let base = unsafe { rvg_graphics_device_region(device, &mut size) };
     assert!(!base.is_null() && base.addr() % 4096 == 0);
-    assert_eq!(size, reims_graphics::REGION_SIZE);
+    assert_eq!(size, reims_vgpu_graphics::REGION_SIZE);
     // SAFETY: a live device.
     unsafe {
         assert_eq!(
             rvg_graphics_device_mmio_read(device, 0),
-            reims_graphics::wire::RGFX_MAGIC
+            reims_vgpu_graphics::wire::RGFX_MAGIC
         );
         rvg_graphics_device_mmio_write_taking(device, 0x10, 1);
         assert_eq!(rvg_graphics_device_mmio_read(device, 0x10), 1);
@@ -256,8 +256,8 @@ fn command_buffer_copy_cost() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    use reims_graphics::region::Region;
-    use reims_graphics::wire::RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    use reims_vgpu_graphics::region::Region;
+    use reims_vgpu_graphics::wire::RGFX_CONTEXT_ALLOCATIONS_OFFSET;
 
     const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
     const SPAN: usize = 8 << 20;

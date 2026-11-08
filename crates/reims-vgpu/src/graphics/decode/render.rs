@@ -1,8 +1,8 @@
-//! The render-encoder op decoder: one arm per [`reims_graphics::ops::render`] op,
+//! The render-encoder op decoder: one arm per [`reims_vgpu_graphics::ops::render`] op,
 //! turning a wire op into a `RenderCmd` on the open `P::RenderEncoder`
 //! (docs/graphics-kext/design.md, "Stage 3 wire protocol"). The command-buffer
 //! walk ([`super::cmdbuf`]) routes every render-group op
-//! (`tag >> 12 == `[`RGFX_OP_GROUP_RENDER`](reims_graphics::ops::RGFX_OP_GROUP_RENDER))
+//! (`tag >> 12 == `[`RGFX_OP_GROUP_RENDER`](reims_vgpu_graphics::ops::RGFX_OP_GROUP_RENDER))
 //! here.
 //!
 //! Each arm reads its op's body with zerocopy, resolves its object references
@@ -27,7 +27,6 @@
 use std::cell::Cell;
 
 // The render-op tags and body structs (`Rgfx*`): the whole render group, so a glob.
-use reims_graphics::ops::render::*;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::ResourceRef;
 use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
@@ -36,6 +35,7 @@ use reims_vgpu_core::platform::types::{
     VertexAmplificationViewMapping,
 };
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_graphics::ops::render::*;
 use zerocopy::FromBytes;
 
 use super::refused::{self, Bound, Marks, Slot, Stage};
@@ -85,7 +85,7 @@ fn elems<T: FromBytes>(tag: u16, payload: &[u8], head: usize, count: usize) -> R
 }
 
 /// Resolves one resource-array element: `None` for 0, else the object its
-/// [kind](reims_graphics::ops::render::RGFX_RESOURCE_KIND_BUFFER) names (a miss or an
+/// [kind](reims_vgpu_graphics::ops::render::RGFX_RESOURCE_KIND_BUFFER) names (a miss or an
 /// unknown kind faults); `None` too for an object whose create the host refused, which no draw
 /// reads ([`refused`]).
 fn resolve_resource<'a, P: Platform>(
@@ -296,7 +296,7 @@ fn visibility_offset(pass: &PassFacts, mode: u64, offset: u64) -> u64 {
 }
 
 /// Decodes one render-encoder op: `tag` its op, `payload` its body (the bytes
-/// after the [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)). `objs` resolves
+/// after the [`RgfxOpHeader`](reims_vgpu_graphics::ops::RgfxOpHeader)). `objs` resolves
 /// object references, `enc` is the open render encoder, `pass` what its ops' checks read of
 /// its pass, and `on` says how an encode's raise is taken. `Ok(true)` when the op was handled,
 /// `Ok(false)` for an unknown tag (the walk then faults); a platform raise, a bad reference or
@@ -1843,17 +1843,17 @@ pub(crate) fn decode_op<P: Platform>(
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::wire::{
-        RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_FENCE_CREATE,
-        RGFX_CMD_HEAP_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate,
-        RgfxDepthStencilCreate, RgfxHeapCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxSamplerCreate,
-        RgfxTextureCreate, RgfxTextureDescriptor,
-    };
     use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
     use reims_vgpu_core::platform::device::GpuDevice;
     use reims_vgpu_core::platform::values::IcbDesc;
     use reims_vgpu_core::platform::{Handle, Platform};
     use reims_vgpu_core::testkit::{Arg, FakePlatform};
+    use reims_vgpu_graphics::wire::{
+        RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_FENCE_CREATE,
+        RGFX_CMD_HEAP_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate,
+        RgfxDepthStencilCreate, RgfxHeapCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxSamplerCreate,
+        RgfxTextureCreate, RgfxTextureDescriptor,
+    };
     use zerocopy::IntoBytes;
 
     use super::super::ObjHandle;
@@ -1901,7 +1901,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<Fp>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
 
         for id in [BUF_VERTEX, BUF_INDEX, BUF_INDIRECT, BUF_AUX] {

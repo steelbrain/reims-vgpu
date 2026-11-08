@@ -49,19 +49,19 @@
 //! A shared event's value only rises (docs/graphics-kext/design.md, "Shared events"), so a second
 //! signal of a value is harmless.
 //!
-//! [`RGFX_OP_SURFACE_ORDER`]: reims_graphics::ops::RGFX_OP_SURFACE_ORDER
+//! [`RGFX_OP_SURFACE_ORDER`]: reims_vgpu_graphics::ops::RGFX_OP_SURFACE_ORDER
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reims_graphics::ops::RgfxSurfaceOrderWait;
-use reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
+use reims_vgpu_graphics::ops::RgfxSurfaceOrderWait;
+use reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
 
 use super::commit_order;
 
@@ -716,19 +716,19 @@ mod tests {
 
     use std::sync::atomic::Ordering;
 
-    use reims_graphics::ops::{
-        RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
-        RgfxCommandBuffer, RgfxOpHeader,
-    };
-    use reims_graphics::wire::{
-        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
-        RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_EVT_CB_SUBMITTED, RgfxMsgHeader, RgfxObjectDestroy,
-        RgfxQueueCreate,
-    };
     use reims_vgpu_core::sync::Mutex;
     use reims_vgpu_core::testkit::calllog::{Arg, Call};
     use reims_vgpu_core::testkit::objects::CompleteOn;
     use reims_vgpu_core::testkit::{FakePlatform, Step};
+    use reims_vgpu_graphics::ops::{
+        RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
+        RgfxCommandBuffer, RgfxOpHeader,
+    };
+    use reims_vgpu_graphics::wire::{
+        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+        RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_EVT_CB_SUBMITTED, RgfxMsgHeader, RgfxObjectDestroy,
+        RgfxQueueCreate,
+    };
     use zerocopy::IntoBytes;
 
     use super::super::{DecodeError, GraphicsDecoder, refusing};
@@ -754,7 +754,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         for queue in [A, B] {
             let create = RgfxQueueCreate {
@@ -1260,7 +1260,7 @@ mod tests {
     /// behind it on the platform
     #[test]
     fn an_order_on_the_gpu_holds_back_no_record() {
-        use reims_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
+        use reims_vgpu_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
         const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
         const SCHED: u32 = RGFX_EVT_CB_SCHEDULED;
         const DONE: u32 = RGFX_EVT_CB_COMPLETE;
@@ -1362,8 +1362,8 @@ mod tests {
     /// scheduling, not at its commit
     #[test]
     fn an_event_wait_still_holds_its_queue_beside_an_order() {
-        use reims_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
-        use reims_graphics::wire::{
+        use reims_vgpu_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+        use reims_vgpu_graphics::wire::{
             RGFX_CMD_SHARED_EVENT_CREATE, RGFX_EVT_CB_SCHEDULED, RgfxSharedEventCreate,
         };
         const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
@@ -1431,7 +1431,7 @@ mod tests {
     /// take or commit posts them again; once the platform takes both, nothing is posted again.
     #[test]
     fn a_doorbell_answer_behind_an_order_posts_each_record_once_in_order() {
-        use reims_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
+        use reims_vgpu_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
         const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
         const SCHED: u32 = RGFX_EVT_CB_SCHEDULED;
         const DONE: u32 = RGFX_EVT_CB_COMPLETE;
@@ -1459,7 +1459,7 @@ mod tests {
             .decoders()
             .answer_at_doorbell(context(B), &next, move |bytes| {
                 // A CB_SUBMITTED or a CB_SCHEDULED, which share a layout.
-                let m = <reims_graphics::wire::RgfxCbScheduled as zerocopy::FromBytes>::read_from_bytes(
+                let m = <reims_vgpu_graphics::wire::RgfxCbScheduled as zerocopy::FromBytes>::read_from_bytes(
                     bytes,
                 )
                 .unwrap();

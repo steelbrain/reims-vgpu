@@ -32,7 +32,7 @@
 //! A present of a surface whose device cache holds an older CPU generation than the present's
 //! waits too for the fill the host commits for it on taking the present (`decode/surface_cache.rs`):
 //! it is shown once that fill has finished, which tells the queue ([`PresentQueue::filled`]), so
-//! the presents' lane that carries the present out (`reims-graphics`' device) waits for nothing on
+//! the presents' lane that carries the present out (`reims-vgpu-graphics`' device) waits for nothing on
 //! the GPU.
 //!
 //! **What a present holds.** A present holds its surface's region block from its taking
@@ -47,7 +47,7 @@
 //! transaction on its answer, and holds at most two unanswered (the kext's `RgfxDisplayPipe`),
 //! so the answer says the frame is on the display, as a display's flip completes at the vblank
 //! that latches it: it is given at the first refresh of the device's display (the refresh thread,
-//! [`reims_graphics::Host::refreshed`], after that refresh's `VBLANK`) once the window's draw of
+//! [`reims_vgpu_graphics::Host::refreshed`], after that refresh's `VBLANK`) once the window's draw of
 //! it has finished on the host's GPU, the copy out of the surface done, so the guest may draw
 //! into the surface again. A draw the window drops before its commit, or one that shows the
 //! scanout in place of a surface it cannot draw, answers its presents at the next refresh too.
@@ -73,18 +73,18 @@
 //! or its draw done past the first refresh after its take) from one the guest's compositor
 //! sent late in the refresh, which a guest's present latency alone does not.
 //!
-//! [`RgfxSurfaceWriters`]: reims_graphics::wire::RgfxSurfaceWriters
+//! [`RgfxSurfaceWriters`]: reims_vgpu_graphics::wire::RgfxSurfaceWriters
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_STATUS_OK, RgfxSurfaceWriter};
-use reims_graphics::{CompletionPoster, PresentAnswer};
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::os::clock::MonoTime;
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_STATUS_OK, RgfxSurfaceWriter};
+use reims_vgpu_graphics::{CompletionPoster, PresentAnswer};
 
 use super::color::ColorChange;
 use super::compile::Now;

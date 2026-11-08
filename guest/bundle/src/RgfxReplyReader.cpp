@@ -1,6 +1,6 @@
 /*
  * RgfxReplyReader: the guest completion-ring consumer (RgfxReplyReader.hpp). Mirrors
- * the host producer in crates/reims-graphics/src/ring.rs: the host writes a message,
+ * the host producer in crates/reims-vgpu-graphics/src/ring.rs: the host writes a message,
  * publishes `producer` with a release store and pads to the ring's end so a message
  * never wraps; this reads `producer` with an acquire load, walks whole messages from
  * its own `consumer` count skipping pads, and publishes `consumer` with a release

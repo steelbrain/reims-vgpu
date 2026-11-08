@@ -34,15 +34,15 @@
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Weak};
 
-use reims_graphics::wire::{
+use reims_vgpu_core::platform::Handle as _;
+use reims_vgpu_core::platform::Platform;
+use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_ENCODE,
     RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
     RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
     RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_video::core::backend::DeviceWrite;
 use reims_vgpu_video::core::device_memory::GuestTarget;
 use reims_vgpu_video::core::fourcc::FourCc;

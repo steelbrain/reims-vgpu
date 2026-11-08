@@ -1393,7 +1393,7 @@ impl Shared {
             // message in flight comes before it.
             self.lanes.wait_begun(self.epoch.load(Ordering::Acquire));
             self.host.device_reset();
-            log::info!(target: "reims_graphics", "the device was reset");
+            log::info!(target: "reims_vgpu_graphics", "the device was reset");
         }
     }
 
@@ -1514,7 +1514,7 @@ impl Shared {
                     }
                     Err(broken) => {
                         log::error!(
-                            target: "reims_graphics",
+                            target: "reims_vgpu_graphics",
                             "the control submission ring is broken ({broken}): it takes nothing \
                              more until the device is reset"
                         );
@@ -1581,7 +1581,7 @@ impl Shared {
             .spawn(move || serve_ring0(&lanes, &shared, index, key));
         if let Err(e) = started {
             log::warn!(
-                target: "reims_graphics",
+                target: "reims_vgpu_graphics",
                 "{} could not be started ({e}): the messages of {key:?}'s lane are carried out on \
                  the control thread",
                 lanes::thread_name(index)
@@ -1602,7 +1602,7 @@ impl Shared {
     /// Posts ring 0's `SUBMIT_ROOM` record on the control completion ring, for work begun at reset
     /// count `epoch`: the guest's posts waiting for room on ring 0 look again.
     fn post_room(&self, epoch: u64) {
-        log::debug!(target: "reims_graphics::room", "SUBMIT_ROOM posted for the control ring");
+        log::debug!(target: "reims_vgpu_graphics::room", "SUBMIT_ROOM posted for the control ring");
         self.post_waiting(&submit_room(), epoch);
     }
 
@@ -1643,7 +1643,7 @@ impl Shared {
                 Posted::NoRoom => return Post::NoRoom,
                 Posted::Broken(broken) => {
                     log::warn!(
-                        target: "reims_graphics",
+                        target: "reims_vgpu_graphics",
                         "the control completion ring is broken ({broken}): an event is dropped"
                     );
                     return Post::Dropped;
@@ -1701,7 +1701,7 @@ impl Shared {
             });
         }
         self.host.context_closed(context, answer);
-        log::info!(target: "reims_graphics", "context {context} closed");
+        log::info!(target: "reims_vgpu_graphics", "context {context} closed");
     }
 
     /// `BLOCK_GRANT`: the region keeps the block as its context's, where it lies in the
@@ -1717,7 +1717,7 @@ impl Shared {
             && !within(RGFX_ALLOCATIONS_OFFSET, RGFX_CONTEXT_ALLOCATIONS_OFFSET)
         {
             log::warn!(
-                target: "reims_graphics",
+                target: "reims_vgpu_graphics",
                 "a BLOCK_GRANT of {:#x} bytes at {:#x} lies outside the processes' blocks and the \
                  scanout: ignored",
                 grant.size, grant.offset
@@ -1736,7 +1736,7 @@ impl Shared {
             || share.offset.checked_add(share.size).is_none_or(|e| e > end)
         {
             log::warn!(
-                target: "reims_graphics",
+                target: "reims_vgpu_graphics",
                 "a {} of {:#x} bytes at {:#x} lies outside the processes' blocks: ignored",
                 if holds { "BLOCK_SHARE" } else { "BLOCK_UNSHARE" },
                 share.size, share.offset
@@ -1769,7 +1769,7 @@ impl Shared {
     ) -> Option<u32> {
         let Some(runs) = page_runs(&self.region, pages) else {
             log::warn!(
-                target: "reims_graphics",
+                target: "reims_vgpu_graphics",
                 "a SURFACE_PAGES of {} runs at {:#x} for the block of {:#x} bytes at {:#x} lies \
                  outside it: the block gets no view of its surface's pages",
                 pages.run_count, pages.runs_offset, pages.block_size, pages.block_offset
@@ -2074,7 +2074,7 @@ impl Shared {
         let refused_flags = flags & !self.queue_flags_allowed();
         if refused_flags != 0 {
             log::warn!(
-                target: "reims_graphics",
+                target: "reims_vgpu_graphics",
                 "queue {:#x}: it asks for flags {refused_flags:#x}, which the host does not \
                  carry out or whose feature the driver did not take, so it is refused", q.obj_id
             );
@@ -2082,7 +2082,7 @@ impl Shared {
         }
         let Some((submit_at, complete_at)) = self.validate_rings(q) else {
             log::warn!(
-                target: "reims_graphics",
+                target: "reims_vgpu_graphics",
                 "queue {:#x}: its ring parameters are refused (submit {:#x}/{}, complete \
                  {:#x}/{}; a ring must lie whole in one block of its process's)",
                 q.obj_id, q.submit_offset, q.submit_data_size, q.complete_offset,
@@ -2095,7 +2095,7 @@ impl Shared {
         };
         let Some(wake) = Wake::new() else {
             log::error!(
-                target: "reims_graphics",
+                target: "reims_vgpu_graphics",
                 "queue {:#x}: no wake pipe; it is refused", q.obj_id
             );
             return RGFX_STATUS_INVALID_ARGUMENT;
@@ -2165,7 +2165,7 @@ impl Shared {
         if started.is_err() {
             self.queues.lock().remove(&queue);
             log::error!(
-                target: "reims_graphics",
+                target: "reims_vgpu_graphics",
                 "queue {:#x}: no service thread; it is refused", q.obj_id
             );
             return RGFX_STATUS_INVALID_ARGUMENT;
@@ -2290,7 +2290,7 @@ impl Shared {
                 }
                 if let Err(broken) = &next {
                     log::error!(
-                        target: "reims_graphics",
+                        target: "reims_vgpu_graphics",
                         "queue {:#x}'s submission ring is broken ({broken}): it takes nothing \
                          more until the device is reset", queue.obj_id
                     );
@@ -2301,7 +2301,7 @@ impl Shared {
             // Told with nothing held, on the queue's completion ring.
             if room {
                 log::debug!(
-                    target: "reims_graphics::room",
+                    target: "reims_vgpu_graphics::room",
                     "SUBMIT_ROOM posted for queue {:#x}'s submission ring", queue.obj_id
                 );
                 self.post_queue_waiting(queue, &submit_room(), queue.epoch);
@@ -2318,7 +2318,7 @@ impl Shared {
                     // message rides ring 0, through the kext, which checks that its sender owns
                     // the object it names. Refused here, and the ring goes on.
                     log::warn!(
-                        target: "reims_graphics",
+                        target: "reims_vgpu_graphics",
                         "queue {:#x}'s submission ring carried a message of type {:#x} \
                          (seqno {}), which it may not carry: refused",
                         queue.obj_id, message.header.r#type, message.header.seqno
@@ -2399,7 +2399,7 @@ impl Shared {
                     Some(message) => message,
                     None => {
                         log::warn!(
-                            target: "reims_graphics",
+                            target: "reims_vgpu_graphics",
                             "queue {:#x}'s submission ring carried a COMMAND_BUFFER_IN_REGION \
                              (seqno {}) that names no whole COMMAND_BUFFER in a block of its \
                              process's: refused",
@@ -2530,7 +2530,7 @@ impl Shared {
                 Posted::NoRoom => return Post::NoRoom,
                 Posted::Broken(broken) => {
                     log::warn!(
-                        target: "reims_graphics",
+                        target: "reims_vgpu_graphics",
                         "queue {:#x}'s completion ring is broken ({broken}): an event is dropped",
                         queue.obj_id
                     );
@@ -2773,7 +2773,7 @@ impl Shared {
         {
             let waited = self.handed_wait_ns.swap(0, Ordering::Relaxed);
             log::info!(
-                target: "reims_graphics::handed",
+                target: "reims_vgpu_graphics::handed",
                 "{} completion records handed over to the queues' threads in all, from threads \
                  that may not post them; the longest wait for a thread to post one since the \
                  last line: {} us",

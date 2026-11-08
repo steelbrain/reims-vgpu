@@ -774,7 +774,7 @@ sit in BAR0 from 0x800.
 | 0x03c | `HOST_TIME_HI` | RO | its high 32 bits |
 
 **The wire's version.** `VERSION` reads `RGFX_VERSION`
-(`crates/reims-graphics/src/wire.rs`), the version of the wire the host
+(`crates/reims-vgpu-graphics/src/wire.rs`), the version of the wire the host
 speaks. The kext's framebuffer and accelerator, and the option ROM, each
 accept only the version they were built with. They read it right after
 `MAGIC`, before anything else of the device, and on any other version they
@@ -1070,7 +1070,7 @@ before it, is among them, as one posted before it is: the guest writes a
 surface a CPU lock holds only racing the lock. Every buffer waits for a message
 of any other type, which the host refuses. The queues' threads read
 ring 0 ahead of the control thread, each message once, and keep the count
-through each context's last message (`reims_graphics`'s `device::backlog`), so
+through each context's last message (`reims_vgpu_graphics`'s `device::backlog`), so
 a buffer behind another process's backlog on ring 0 is decoded at once.
 Tested by `a_command_buffer_waits_for_no_other_process_s_creates`,
 `a_command_buffer_waits_for_no_other_process_s_later_object_messages`,
@@ -1092,7 +1092,7 @@ at most in a boot on an RTX 5080 host) holds up only that process's later
 messages and command buffers. A message
 waits for another context's lane only where it reads what that lane's earlier
 messages change, and only for messages published before it
-(`reims_graphics`'s `device::lanes`):
+(`reims_vgpu_graphics`'s `device::lanes`):
 - a present waits for each lane's `TEXTURE_FROM_IOSURFACE` of its surface's
   plane 0, its destroy of a texture the host names the surface by, and the
   close of a context that holds one: the host shows the newest live texture
@@ -1122,7 +1122,7 @@ messages change, and only for messages published before it
   it; a `SURFACE_DOWNLOAD` waits for no other lane, as on the control thread
   before.
 
-`reims_graphics`'s `device::lanes` lists every message that names a block or
+`reims_vgpu_graphics`'s `device::lanes` lists every message that names a block or
 its pages by offset, and what orders each against the block's lane.
 
 A close's job on its lane is its table work: it lets go of the context's
@@ -1147,7 +1147,7 @@ Ring 0's threads (`reims-vgpu.graphics-ring0-<i>`) serve the lanes. A lane
 handed a message while it has no thread is given the thread that went idle
 last, or one made for it where none waits, and keeps it until it has no
 message left; the thread then waits for the next lane, and goes once it has
-waited 10 s for one (`reims_graphics`'s `keep`). So the device holds as many
+waited 10 s for one (`reims_vgpu_graphics`'s `keep`). So the device holds as many
 threads as it had lanes busy at once in the last 10 s, whichever contexts and
 blocks they were. With a thread of each lane's own, made as a message came to a
 lane with none and gone after 1 s with none, every new block's first
@@ -1188,7 +1188,7 @@ A queue's thread waiting for ring 0 before it hands a command buffer on is
 woken once the control thread has taken the messages the buffer waits for, and
 once its context's lane has carried out the context's among them, and by
 nothing else but a reset, its queue's end and the device's
-(`reims_graphics`'s `device::gate`): no other process's message wakes it.
+(`reims_vgpu_graphics`'s `device::gate`): no other process's message wakes it.
 Tested by `the_gate_wakes_each_waiter_once_what_it_waits_for_holds`, which
 moves the count and many contexts' lanes at random beside many waiting
 threads. Beside 75 other processes' queues each waiting on a held create, a
@@ -1305,7 +1305,7 @@ fails) it resets it again on the way out; the OS then draws into the
 firmware's framebuffer, which the firmware's scanout, kept through both
 resets, still shows. Tested by
 `a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows`
-(`reims-graphics`) and
+(`reims-vgpu-graphics`) and
 `a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window`
 (`graphics/tests.rs`).
 
@@ -2074,7 +2074,7 @@ shares the CPU's memory:
   texel block of its format (bytes, width, height). The host reads the copy
   where the buffer's contents lie: its block, its heap's bytes at its offset
   (over a block or over a pages block's guest RAM), or a pages block's view. Both sides compute the
-  copy's linear layout from it (`crates/reims-graphics/src/managed.rs`,
+  copy's linear layout from it (`crates/reims-vgpu-graphics/src/managed.rs`,
   `guest/bundle/src/RgfxManagedLayout.hpp`): levels in order, then slices,
   images and rows of blocks, each row rounded up to 256 bytes.
 - In the guest, `replaceRegion:` and `getBytes:` are memcpys of the block, and
@@ -2603,7 +2603,7 @@ answered guest-side; residency sets (`useResource`/`useHeap` are in);
 
 **Where the decoder lives.** In reims-vgpu-core, generic over `P: Platform`,
 beside the Apple-lane decode it mirrors (same handle machinery, descriptor
-structs and `Platform` calls). The reims-graphics crate stays the transport
+structs and `Platform` calls). The reims-vgpu-graphics crate stays the transport
 (rings, region, registers); the decoder consumes ring bytes and drives
 `Platform`.
 
@@ -2629,7 +2629,7 @@ commit. Each outcome the new design allows is one of those two:
   keeps naming its objects; the buffer took its context's drain before its
   view, so the close is answered after the buffer's completion handler. The
   begin comes after ring 0 has carried out every message of its context's
-  published before the buffer was taken (`reims_graphics`'s queue gate, "A
+  published before the buffer was taken (`reims_vgpu_graphics`'s queue gate, "A
   buffer's wait on ring 0"), so a buffer finds every create its process sent
   before it. Tested by
   `a_walk_names_what_its_table_held_at_its_begin`,
@@ -2875,7 +2875,7 @@ commit. Each outcome the new design allows is one of those two:
   finished (not for the fill itself: the fill is committed there, and the
   present waits for it in the present queue, shown at the fill's completion);
   and the device's reset, for every message in flight. A context's close waits for no
-  walk: `reims_graphics` fences each of its queues, which waits only for a take
+  walk: `reims_vgpu_graphics` fences each of its queues, which waits only for a take
   of the queue's submission ring or a post onto its completion ring under way,
   and the close is answered once its buffers have finished
   (`a_close_during_a_walk_holds_up_nothing_on_ring_0`). A doorbell's take tries
@@ -2895,7 +2895,7 @@ commit. Each outcome the new design allows is one of those two:
   `reims-graphics-pci` sends that write through `_mmio_write_taking` too.
 - **The answer at the doorbell.** A queue's doorbell write, on the guest's
   vCPU, may answer `CB_SUBMITTED` to the buffer at the head of the queue's ring
-  before the queue's thread wakes to take it (`reims_graphics`'s
+  before the queue's thread wakes to take it (`reims_vgpu_graphics`'s
   `Device::mmio_write_taking`), where the buffer would get it at its take and
   nothing need be waited for or allocated: the vCPU copies the message onto its
   stack, reads its ops where they lie, and tries every lock it takes. It reads
@@ -2938,7 +2938,7 @@ commit. Each outcome the new design allows is one of those two:
   A buffer the doorbell leaves to the queue's thread because ring 0 is behind
   (a create of its process's not yet carried out) is offered the same way on
   the lane's thread whose carrying out ends the queue's thread's wait, before
-  that thread is woken (`reims_graphics`'s queue gate, its offers), so its
+  that thread is woken (`reims_vgpu_graphics`'s queue gate, its offers), so its
   `CB_SUBMITTED` no longer waits for the queue's thread's wake
   (`a_buffer_behind_its_process_s_create_is_answered_on_the_lane_s_thread`).
   Tested by `a_doorbell_s_answer_allocates_nothing` and

@@ -1,7 +1,7 @@
 # The reims-graphics device's driver module for Ambrosia, the boot firmware of
 # arm64 macOS guests on QEMU's vmapple machine (ReimsGraphicsModule.c, and
 # AmbrosiaGraphics.h for the interface), built on the host's wire protocol
-# header in ../../crates/reims-graphics/include, and a configuration bundle
+# header in ../../crates/reims-vgpu-graphics/include, and a configuration bundle
 # that starts it.
 #
 #   make         build/ReimsGraphics.elf, the module
@@ -17,7 +17,7 @@ CC = clang
 LD = ld.lld
 
 BUILD = build
-WIRE  = ../../crates/reims-graphics/include
+WIRE  = ../../crates/reims-vgpu-graphics/include
 
 # Freestanding aarch64 code that runs at any address. The PCIe window, where
 # the device's BARs are, is device memory to the module, so no access may be

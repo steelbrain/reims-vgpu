@@ -52,12 +52,6 @@
 use std::ptr;
 use std::sync::Arc;
 
-use reims_graphics::managed::LinearLayout;
-use reims_graphics::wire::{
-    RGFX_MANAGED_TEXTURE_LINEAR, RgfxBufferDidModifyRange, RgfxBufferManagedAtOffset,
-    RgfxBufferOverHostMemory, RgfxManagedBufferCreate, RgfxManagedTextureCreate,
-    RgfxTextureReplaceRegion,
-};
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::device::GpuDevice;
@@ -66,6 +60,12 @@ use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
 use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_graphics::managed::LinearLayout;
+use reims_vgpu_graphics::wire::{
+    RGFX_MANAGED_TEXTURE_LINEAR, RgfxBufferDidModifyRange, RgfxBufferManagedAtOffset,
+    RgfxBufferOverHostMemory, RgfxManagedBufferCreate, RgfxManagedTextureCreate,
+    RgfxTextureReplaceRegion,
+};
 
 use super::tables::{Entry, GuestBytes};
 use super::{DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, texture_desc};
@@ -82,7 +82,7 @@ const TEXTURE_TYPE_2D: u32 = 2;
 const TEXTURE_TYPE_2D_ARRAY: u32 = 3;
 // The linear SPI lays a 2D array's slices at their rows' bytes rounded up to 128, which a CPU
 // copy's slices are where every row is a multiple of 128 ([`in_place_shape`]).
-const _: () = assert!(reims_graphics::wire::RGFX_MANAGED_ROW_ALIGN.is_multiple_of(128));
+const _: () = assert!(reims_vgpu_graphics::wire::RGFX_MANAGED_ROW_ALIGN.is_multiple_of(128));
 /// `MTLTextureType3D`.
 const TEXTURE_TYPE_3D: u64 = 7;
 
@@ -812,13 +812,15 @@ impl<P: Platform> GraphicsDecoder<P> {
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::ops::blit::{
+    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+    use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam, Step};
+    use reims_vgpu_graphics::ops::blit::{
         RGFX_BLIT_RESOURCE_BUFFER, RGFX_BLIT_RESOURCE_TEXTURE, RGFX_OP_BLIT_SYNCHRONIZE_RESOURCE,
         RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE, RgfxBlitOpSynchronizeResource,
         RgfxBlitOpSynchronizeTexture,
     };
-    use reims_graphics::region::Region;
-    use reims_graphics::wire::{
+    use reims_vgpu_graphics::region::Region;
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
         RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
         RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_MANAGED_BUFFER_CREATE,
@@ -827,8 +829,6 @@ mod tests {
         RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset, RgfxBufferOverPages,
         RgfxHeapOverHostMemory, RgfxMsgHeader, RgfxObjectDestroy, RgfxTextureDescriptor,
     };
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam, Step};
     use zerocopy::IntoBytes;
 
     use super::super::blit::decode_op;
@@ -1375,7 +1375,7 @@ mod tests {
     fn a_managed_texture_on_a_discrete_gpu_is_two_copies() {
         let mut r = rig(false);
         let at = BLOCKS + 0x1_0000;
-        // 100x60 RGBA8, three levels: 42240 bytes (reims_graphics::managed's case).
+        // 100x60 RGBA8, three levels: 42240 bytes (reims_vgpu_graphics::managed's case).
         assert_eq!(r.buffer(20, at, 42240, 0), Ok(()));
         assert_eq!(r.buffer(22, at + 0x2_0000, 42239, 0), Ok(()));
         assert_eq!(r.buffer(23, at + 0x3_0000, 42240, MANAGED), Ok(()));

@@ -39,15 +39,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use reims_graphics::wire::{
+use reims_vgpu_core::platform::event::SharedEvent as _;
+use reims_vgpu_core::platform::{Handle, Platform};
+use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::wire::{
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_EVT_EVENT_SIGNALLED, RGFX_EVT_SHARED_EVENT_VALUE,
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RgfxEventSignalled,
     RgfxMsgHeader, RgfxSharedEventImport, RgfxSharedEventName, RgfxSharedEventUnname,
     RgfxSharedEventValue,
 };
-use reims_vgpu_core::platform::event::SharedEvent as _;
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::sync::Mutex;
 
 use super::{Entry, GraphicsDecoder, ObjHandle, read};
 
@@ -700,7 +700,7 @@ mod tests {
     /// and an id or a listen queue of another context's, are refused, naming and making nothing.
     #[test]
     fn a_named_event_is_one_host_event_in_two_processes() {
-        use reims_graphics::wire::{
+        use reims_vgpu_graphics::wire::{
             RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
             RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_SET_VALUE,
             RGFX_CMD_SHARED_EVENT_UNNAME, RgfxObjectDestroy, RgfxSharedEventCreate,
@@ -711,7 +711,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let obj = |context: u64, n: u64| context << RGFX_CONTEXT_OBJ_ID_SHIFT | n;
         let header = |r#type: u32, size: usize| RgfxMsgHeader {

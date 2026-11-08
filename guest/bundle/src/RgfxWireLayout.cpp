@@ -1,7 +1,7 @@
 /*
  * RgfxWireLayout: the wire structs' sizes, asserted at the guest's own compile.
  *
- * reims_graphics_wire.h is generated from crates/reims-graphics/src/wire.rs and
+ * reims_graphics_wire.h is generated from crates/reims-vgpu-graphics/src/wire.rs and
  * drift-checked against it by `cargo xtask header --check`. wire.rs asserts every
  * struct's size in a `const _` block; this is the same wall on the C side, so a C
  * header that ever disagrees with the sizes the guest and host both rely on fails
@@ -128,7 +128,7 @@ static_assert(sizeof(RgfxOpUseResources) == 16, "RgfxOpUseResources render head"
 static_assert(sizeof(RgfxOpUseResourcesStages) == 24, "RgfxOpUseResourcesStages");
 
 // The compute-encoder op bodies (`RgfxComputeOp*`) and element records, from the
-// committed header (crates/reims-graphics/src/ops/compute.rs). These sizes are that
+// committed header (crates/reims-vgpu-graphics/src/ops/compute.rs). These sizes are that
 // file's `const _` asserts.
 static_assert(sizeof(RgfxComputeOpSetComputePipelineState) == 8, "compute pipeline state");
 static_assert(sizeof(RgfxComputeOpSetBufferOffset) == 16, "compute buffer offset");
@@ -177,7 +177,7 @@ static_assert(sizeof(RgfxComputeOpEncodeStartIf) == 32, "compute encode start if
 static_assert(sizeof(RgfxComputeOpEncodeStartWhile) == 32, "compute encode start while");
 
 // The blit-encoder op bodies (`RgfxBlitOp*`), from the committed header
-// (crates/reims-graphics/src/ops/blit.rs). These sizes are that file's asserts.
+// (crates/reims-vgpu-graphics/src/ops/blit.rs). These sizes are that file's asserts.
 static_assert(sizeof(RgfxBlitOpCopyBufferToBuffer) == 40, "blit copy b2b");
 static_assert(sizeof(RgfxBlitOpCopyBufferToTexture) == 104, "blit copy b2t");
 static_assert(sizeof(RgfxBlitOpCopyBufferToTextureOptions) == 112, "blit copy b2t options");

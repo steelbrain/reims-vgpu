@@ -150,7 +150,7 @@ post-ramp repetitions were few: ours 1748 fps (13), paravirt 1991 fps (6).
   - **Ours**: QEMU at 23-25%. But every drawable comes back with `presentedTime` 0, counted as
     dropped, and `nextDrawable` never throttles: the app submitted 254 and 320 frames a second
     at a 120 Hz display, with the GPU at 59-69% SM.
-  - With the present trace on (`REIMS_VGPU_LOG=info,reims_graphics=trace`), the host saw one
+  - With the present trace on (`REIMS_VGPU_LOG=info,reims_vgpu_graphics=trace`), the host saw one
     `PRESENT_SURFACE` in the 20 s window. So ours gives apps neither present feedback nor
     display-rate back pressure, and its displayed rate is unmeasured here. That is a lane bug,
     handed on to be fixed.

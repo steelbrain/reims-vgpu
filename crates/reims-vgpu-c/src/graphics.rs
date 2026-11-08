@@ -64,7 +64,7 @@ pub const RVG_GRAPHICS_DOORBELL_CONTROL: u32 = 0;
 pub const RVG_GRAPHICS_ALLOCATIONS_OFFSET: u64 = 0x40_0000;
 
 const _: () = {
-    use reims_graphics::wire;
+    use reims_vgpu_graphics::wire;
     assert!(RVG_GRAPHICS_PCI_VENDOR_ID == wire::RGFX_PCI_VENDOR_ID);
     assert!(RVG_GRAPHICS_PCI_DEVICE_ID == wire::RGFX_PCI_DEVICE_ID);
     assert!(RVG_GRAPHICS_PCI_CLASS == wire::RGFX_PCI_CLASS);

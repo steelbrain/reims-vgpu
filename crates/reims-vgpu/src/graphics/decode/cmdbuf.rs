@@ -1,5 +1,5 @@
 //! The command-buffer decoder: it carries out one
-//! [`RGFX_CMD_COMMAND_BUFFER`](reims_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
+//! [`RGFX_CMD_COMMAND_BUFFER`](reims_vgpu_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
 //! message (docs/graphics-kext/design.md, "Stage 3 wire protocol"). It resolves
 //! the queue the buffer runs on, opens a `P::CommandBuffer`, walks the op stream
 //! that follows the message, and at the end registers the completion path and
@@ -44,7 +44,7 @@
 //!
 //! **An answer on the doorbell's thread.** A buffer that gets its `CB_SUBMITTED` at its take may
 //! get it on the thread of the guest's doorbell write instead, before its queue's service thread
-//! takes it off its ring (`reims_graphics`'s `Device::mmio_write_taking`), where nothing need be
+//! takes it off its ring (`reims_vgpu_graphics`'s `Device::mmio_write_taking`), where nothing need be
 //! waited for or allocated there ([`Decoders::answer_at_doorbell`]): it waits for no copy of a
 //! device cache it uses, and every lock the answer takes is tried. Its turn in its queue's lane
 //! and its ticket in the commit order are taken there, in the order its begin would take them,
@@ -90,28 +90,6 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use reims_graphics::ops::render::{
-    RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_VERTEX_BUFFER, RgfxOpDrawPrimitives,
-    RgfxOpSetVertexBuffer,
-};
-use reims_graphics::ops::{
-    RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
-    RGFX_OP_COMMIT_ORDER, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
-    RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
-    RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER,
-    RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
-    RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT,
-    RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS,
-    RGFX_PASS_FLAG_VISIBILITY_RESULT, RGFX_PASS_MAX_SAMPLE_POSITIONS,
-    RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
-    RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
-    RgfxRenderPassDesc, RgfxRenderPassSamplePositions, RgfxRenderPassVisibility,
-    RgfxSurfaceOrderWait, op_group,
-};
-use reims_graphics::wire::{
-    RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
-    RgfxCbSubmitted, RgfxEventSignalled, RgfxMsgHeader,
-};
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
 use reims_vgpu_core::platform::command::{
@@ -131,6 +109,28 @@ use reims_vgpu_core::platform::values::{
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::ops::render::{
+    RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_VERTEX_BUFFER, RgfxOpDrawPrimitives,
+    RgfxOpSetVertexBuffer,
+};
+use reims_vgpu_graphics::ops::{
+    RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
+    RGFX_OP_COMMIT_ORDER, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
+    RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
+    RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER,
+    RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
+    RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT,
+    RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS,
+    RGFX_PASS_FLAG_VISIBILITY_RESULT, RGFX_PASS_MAX_SAMPLE_POSITIONS,
+    RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
+    RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
+    RgfxRenderPassDesc, RgfxRenderPassSamplePositions, RgfxRenderPassVisibility,
+    RgfxSurfaceOrderWait, op_group,
+};
+use reims_vgpu_graphics::wire::{
+    RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
+    RgfxCbSubmitted, RgfxEventSignalled, RgfxMsgHeader,
+};
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::super::completion::{cb_complete, cb_failed, cb_unlanded};
@@ -936,7 +936,7 @@ pub(crate) struct Answered {
 
 impl<P: Platform> Decoders<P> {
     /// A `SURFACE_DOWNLOAD` of the block at `block` on a doorbell's thread, the guest's vCPU
-    /// (`reims_graphics::Host::surface_downloaded`): whether it is carried out already, its
+    /// (`reims_vgpu_graphics::Host::surface_downloaded`): whether it is carried out already, its
     /// `SURFACE_PAGES` settled ([`super::worker::Unsettled`]) and the caches answering it at once
     /// with nothing to copy and nothing to wait for ([`super::surface_cache`]), as
     /// [`super::GraphicsDecoder::try_surface_download`] would; each lock tried. Allocates and
@@ -1168,7 +1168,7 @@ fn makes_sample_count(caps: &DeviceCaps, count: u32) -> bool {
 
 impl<P: Platform> GraphicsDecoder<P> {
     /// Carries out one `COMMAND_BUFFER` message (`decode`'s
-    /// [`RGFX_CMD_COMMAND_BUFFER`](reims_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
+    /// [`RGFX_CMD_COMMAND_BUFFER`](reims_vgpu_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
     /// arm): opens a command buffer on the named queue, walks the op stream, and
     /// commits with a completion handler, which holds `drain` (its context's) until it has run.
     /// The IOSurfaces whose device caches it uses (its `SURFACE_USE` ops) are filled first where
@@ -2655,7 +2655,15 @@ fn clear_color(bits: [u64; 4]) -> ClearColor {
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::ops::render::{
+    use reims_vgpu_core::platform::Handle;
+    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
+    use reims_vgpu_core::platform::values::AttachmentState;
+    use reims_vgpu_core::sync::Mutex;
+    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_core::testkit::Step;
+    use reims_vgpu_core::testkit::calllog::Arg;
+    use reims_vgpu_core::testkit::objects::CompleteOn;
+    use reims_vgpu_graphics::ops::render::{
         RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES, RGFX_OP_RENDER_DRAW_PRIMITIVES,
         RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
         RGFX_OP_RENDER_SET_SCISSOR_RECT, RGFX_OP_RENDER_SET_VERTEX_BUFFER,
@@ -2664,11 +2672,11 @@ mod tests {
         RgfxOpSetRenderPipelineState, RgfxOpSetScissorRect, RgfxOpSetVertexBuffer,
         RgfxOpSetViewport, RgfxOpSetVisibilityResultMode,
     };
-    use reims_graphics::ops::video::{
+    use reims_vgpu_graphics::ops::video::{
         RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RgfxVideoOpDecodeH264,
         RgfxVideoOpDecodeH265,
     };
-    use reims_graphics::wire::{
+    use reims_vgpu_graphics::wire::{
         RGFX_CB_INTERNAL, RGFX_CB_OK, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER,
         RGFX_CMD_EVENT_CREATE, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
         RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
@@ -2678,14 +2686,6 @@ mod tests {
         RgfxSharedEventSetValue, RgfxTextureCreate, RgfxTextureDescriptor,
         RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
     };
-    use reims_vgpu_core::platform::Handle;
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
-    use reims_vgpu_core::platform::values::AttachmentState;
-    use reims_vgpu_core::sync::Mutex;
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_core::testkit::Step;
-    use reims_vgpu_core::testkit::calllog::Arg;
-    use reims_vgpu_core::testkit::objects::CompleteOn;
     use reims_vgpu_video::core::device_memory::MemoryIdentity;
     use zerocopy::IntoBytes;
 
@@ -2720,7 +2720,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(size).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(size).unwrap()),
         );
 
         let queue = RgfxQueueCreate {
@@ -3144,7 +3144,7 @@ mod tests {
     }
 
     impl GraphicsVideo<FakePlatform> for FakeVideo {
-        fn caps(&self) -> Vec<reims_graphics::wire::RgfxVideoCodecCaps> {
+        fn caps(&self) -> Vec<reims_vgpu_graphics::wire::RgfxVideoCodecCaps> {
             Vec::new()
         }
         fn session(
@@ -3443,7 +3443,7 @@ mod tests {
     /// ends at the block's `BLOCK_RELEASE`, one for the block whichever decode names it.
     #[test]
     fn a_video_decode_s_planes_carry_their_block_s_memory() {
-        use reims_graphics::wire::{
+        use reims_vgpu_graphics::wire::{
             RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN,
             RgfxBufferOverHostMemory,
         };
@@ -3535,7 +3535,7 @@ mod tests {
     /// buffer has finished starts at once.
     #[test]
     fn a_video_decode_waits_for_the_buffers_its_command_buffer_runs_after() {
-        use reims_graphics::ops::{RGFX_OP_SURFACE_ORDER, RgfxSurfaceOrderWait};
+        use reims_vgpu_graphics::ops::{RGFX_OP_SURFACE_ORDER, RgfxSurfaceOrderWait};
 
         let (p, mut dec) = setup();
         let device = p.device();
@@ -3738,7 +3738,7 @@ mod tests {
     /// and textures 7 and 8 over its planes; and what the video is handed.
     fn cached_video() -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
         use super::super::surface_pages::tests::{BLOCK, rig};
-        use reims_graphics::wire::RGFX_STATUS_OK;
+        use reims_vgpu_graphics::wire::RGFX_STATUS_OK;
 
         let mut r = rig(8);
         let page = r.page;
@@ -3797,7 +3797,9 @@ mod tests {
     /// session 40.
     fn writes_cached_video(cb_obj_id: u64, seqno: u64, decodes: bool) -> Vec<u8> {
         use super::super::surface_pages::tests::BLOCK;
-        use reims_graphics::ops::{RGFX_OP_SURFACE_USE, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+        use reims_vgpu_graphics::ops::{
+            RGFX_OP_SURFACE_USE, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse,
+        };
 
         let surface_use = RgfxOpSurfaceUse {
             block_offset: BLOCK,
@@ -3856,7 +3858,7 @@ mod tests {
     #[test]
     fn a_decode_read_back_is_copied_out_behind_the_next_decode() {
         use super::super::surface_pages::tests::{BLOCK, Rig};
-        use reims_graphics::ops::{RGFX_OP_SURFACE_USE, RgfxOpSurfaceUse};
+        use reims_vgpu_graphics::ops::{RGFX_OP_SURFACE_USE, RgfxOpSurfaceUse};
         use std::sync::atomic::AtomicBool;
 
         const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
@@ -4920,19 +4922,19 @@ mod tests {
     fn a_later_commit_on_another_queue<P: crate::platform::ApiPlatform>() -> (bool, Vec<u8>) {
         use std::time::{Duration, Instant};
 
-        use reims_graphics::ops::blit::{
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
             RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
         };
-        use reims_graphics::wire::RgfxSharedEventSetValue;
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_graphics::wire::RgfxSharedEventSetValue;
         const LEN: u64 = 1 << 20;
         let _pool = reims_vgpu_core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let submitted = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&submitted);
@@ -5063,14 +5065,14 @@ mod tests {
     fn a_cpu_wait_for_a_mid_buffer_signal<P: crate::platform::ApiPlatform>() -> (bool, bool, bool) {
         use std::time::{Duration, Instant};
 
-        use reims_graphics::ops::blit::{RGFX_OP_BLIT_FILL_BUFFER, RgfxBlitOpFillBuffer};
+        use reims_vgpu_graphics::ops::blit::{RGFX_OP_BLIT_FILL_BUFFER, RgfxBlitOpFillBuffer};
         const LEN: u64 = 1 << 20;
         let _pool = reims_vgpu_core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
         let sink = Arc::clone(&posted);
@@ -5186,18 +5188,18 @@ mod tests {
     -> Vec<u8> {
         use std::time::{Duration, Instant};
 
-        use reims_graphics::ops::blit::{
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
             RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
         };
-        use reims_vgpu_core::platform::resource::Buffer as _;
         const LEN: u64 = 1 << 20;
         let _pool = reims_vgpu_core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let completed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&completed);
@@ -5332,19 +5334,19 @@ mod tests {
     -> (Vec<u32>, bool, Vec<u64>, Vec<u8>) {
         use std::time::{Duration, Instant};
 
-        use reims_graphics::ops::blit::{
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
             RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
         };
-        use reims_graphics::wire::RgfxSharedEventSetValue;
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_graphics::wire::RgfxSharedEventSetValue;
         const LEN: u64 = 1 << 20;
         let _pool = reims_vgpu_core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         // B's records, and every completion.
         let records = Arc::new(Mutex::new(Vec::new()));
@@ -5504,7 +5506,7 @@ mod tests {
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let completed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&completed);
@@ -5689,12 +5691,12 @@ mod tests {
         <reims_vgpu_vulkan::VulkanPlatform as Platform>::Device,
     ) {
         use crate::platform::ApiPlatform as _;
-        use reims_graphics::wire::RGFX_CONTEXT_VA_BASE;
+        use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
         let platform = reims_vgpu_vulkan::VulkanPlatform::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         dec.hold_resource_ids(0, 0);
         let queue = RgfxQueueCreate {
@@ -5740,7 +5742,7 @@ mod tests {
     /// buffer's bytes where it picks.
     #[test]
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
-        use reims_graphics::wire::RGFX_CONTEXT_VA_BASE;
+        use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
         let _pins = CONTEXT_RANGE_PINS.lock();
         let _pool = reims_vgpu_core::rt::Pool::here();
         let (mut dec, device) = decoder_with_a_texture_buffer();
@@ -5754,10 +5756,10 @@ mod tests {
     /// are made.
     #[test]
     fn on_vulkan_the_host_s_own_ranges_lie_below_every_unit() {
-        use reims_graphics::wire::{
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_graphics::wire::{
             RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END, RGFX_CONTEXT_VA_UNIT, RGFX_CONTEXT_VA_UNITS,
         };
-        use reims_vgpu_core::platform::resource::Buffer as _;
         let _pins = CONTEXT_RANGE_PINS.lock();
         let _pool = reims_vgpu_core::rt::Pool::here();
         let (mut dec, device) = decoder_with_a_texture_buffer();
@@ -6258,11 +6260,11 @@ mod tests {
     /// stands in for the GPU reaching the signal. So does a stand-in's signal before its wait.
     #[test]
     fn a_signal_before_more_of_its_buffer_goes_as_the_event_reaches_it() {
-        use reims_graphics::ops::compute::{
+        use reims_vgpu_core::platform::event::SharedEvent as _;
+        use reims_vgpu_graphics::ops::compute::{
             RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
         };
-        use reims_graphics::wire::RGFX_CB_INTERNAL;
-        use reims_vgpu_core::platform::event::SharedEvent as _;
+        use reims_vgpu_graphics::wire::RGFX_CB_INTERNAL;
         let (p, mut dec) = setup();
         let device = p.device();
         create_events(&p, &mut dec, 0);
@@ -6442,10 +6444,10 @@ mod tests {
     /// decoder holds has no stand-in.
     #[test]
     fn a_faulted_command_buffer_is_stood_in_for_by_its_event_ops() {
-        use reims_graphics::ops::compute::{
+        use reims_vgpu_graphics::ops::compute::{
             RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
         };
-        use reims_graphics::wire::RGFX_CB_INTERNAL;
+        use reims_vgpu_graphics::wire::RGFX_CB_INTERNAL;
         let (p, mut dec) = setup();
         let device = p.device();
         create_events(&p, &mut dec, 0);
@@ -6521,7 +6523,7 @@ mod tests {
     /// among them, so none is dropped with the ops the count leaves out.
     #[test]
     fn a_buffer_whose_op_bytes_are_short_is_refused_and_stood_in_for_by_all_its_events() {
-        use reims_graphics::wire::RGFX_CB_INTERNAL;
+        use reims_vgpu_graphics::wire::RGFX_CB_INTERNAL;
         let (p, mut dec) = setup();
         let device = p.device();
         create_events(&p, &mut dec, 0);
@@ -6569,7 +6571,7 @@ mod tests {
     /// queue's next buffer is committed and completes.
     #[test]
     fn a_commit_refused_after_its_handlers_were_added_fails_that_buffer_alone() {
-        use reims_graphics::wire::{RGFX_CB_INTERNAL, RGFX_CB_OK};
+        use reims_vgpu_graphics::wire::{RGFX_CB_INTERNAL, RGFX_CB_OK};
         for (step, death) in [
             (Step::crash(), true),
             (
@@ -6738,10 +6740,10 @@ mod tests {
     }
 
     fn destroy(obj_id: u64) -> Vec<u8> {
-        reims_graphics::wire::RgfxObjectDestroy {
+        reims_vgpu_graphics::wire::RgfxObjectDestroy {
             header: RgfxMsgHeader {
-                r#type: reims_graphics::wire::RGFX_CMD_OBJECT_DESTROY,
-                size: size_of::<reims_graphics::wire::RgfxObjectDestroy>() as u32,
+                r#type: reims_vgpu_graphics::wire::RGFX_CMD_OBJECT_DESTROY,
+                size: size_of::<reims_vgpu_graphics::wire::RgfxObjectDestroy>() as u32,
                 seqno: 0,
             },
             obj_id,
@@ -6985,10 +6987,10 @@ mod tests {
         let gate = Gate::on(&dec, 0);
         drop(dec);
         let range = |obj_id| {
-            reims_graphics::wire::RgfxBufferDidModifyRange {
+            reims_vgpu_graphics::wire::RgfxBufferDidModifyRange {
                 header: RgfxMsgHeader {
-                    r#type: reims_graphics::wire::RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
-                    size: size_of::<reims_graphics::wire::RgfxBufferDidModifyRange>() as u32,
+                    r#type: reims_vgpu_graphics::wire::RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+                    size: size_of::<reims_vgpu_graphics::wire::RgfxBufferDidModifyRange>() as u32,
                     seqno: 0,
                 },
                 obj_id,
@@ -7028,7 +7030,7 @@ mod tests {
                 other
                     .decode(
                         &device,
-                        &range((2 << reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT) | 2)
+                        &range((2 << reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT) | 2)
                     )
                     .unwrap(),
                 Err(DecodeError::BadReference)
@@ -7178,7 +7180,7 @@ mod tests {
                 (
                     RGFX_EVT_CB_COMPLETE,
                     301,
-                    reims_graphics::wire::RGFX_CB_PAGE_FAULT
+                    reims_vgpu_graphics::wire::RGFX_CB_PAGE_FAULT
                 )
             ]
         );
@@ -7339,7 +7341,7 @@ mod tests {
             [(
                 RGFX_EVT_CB_COMPLETE,
                 330,
-                reims_graphics::wire::RGFX_CB_INTERNAL
+                reims_vgpu_graphics::wire::RGFX_CB_INTERNAL
             )]
         );
         assert!(

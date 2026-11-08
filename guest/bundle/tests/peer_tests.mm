@@ -9,7 +9,7 @@
  * the doorbells, and the wake of the completion thread when the device's vector shows a record on
  * one of its queues' rings. The host is the library itself, on this Mac's GPU, with no window.
  *
- * It records what crosses the wire as lines of a trace, as crates/reims-graphics's FakeGuest does
+ * It records what crosses the wire as lines of a trace, as crates/reims-vgpu-graphics's FakeGuest does
  * (src/device/tests/peer.rs):
  *   - every register read and write, doorbells among them;
  *   - every record the guest publishes on the control ring and on a queue's submission ring;

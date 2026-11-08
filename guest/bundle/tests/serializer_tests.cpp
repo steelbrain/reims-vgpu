@@ -3,7 +3,7 @@
  * run on the Mac (guest/bundle/Makefile `test`). It builds a plain-buffer region,
  * a ring writer over it, and a serialiser, posts every message the slice covers,
  * and reads each back with a minimal host-side consumer (the mirror of
- * crates/reims-graphics/src/ring.rs), asserting the type, size and fields on the
+ * crates/reims-vgpu-graphics/src/ring.rs), asserting the type, size and fields on the
  * wire. No Metal, no device: this validates the serialiser's bytes alone.
  *
  * Exits 0 and prints a one-line summary when every check passes; aborts on the

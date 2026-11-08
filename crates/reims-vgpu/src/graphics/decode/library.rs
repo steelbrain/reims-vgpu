@@ -31,19 +31,19 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use reims_graphics::wire::{
+use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::{Handle, Platform};
+use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_EVT_COMPLETE,
     RGFX_LIBRARY_BYTES_OFFSET, RGFX_LIBRARY_FLAG_KEYED, RGFX_STATUS_INVALID_ARGUMENT,
     RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxComplete, RgfxLibraryCreate,
     RgfxLibraryFromRegion, RgfxLibraryLookup, RgfxMsgHeader,
 };
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::sync::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 
-use reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+use reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
 
 use super::tables::Entry;
 use super::{DecodeError, GraphicsDecoder, ObjHandle, read};

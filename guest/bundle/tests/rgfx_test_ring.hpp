@@ -2,7 +2,7 @@
  * rgfx_test_ring: the self-contained host-side consumer the bundle's user-space
  * checks read their wire bytes back through. It builds a ring in a plain buffer
  * (no BAR, no MMIO), counts doorbells, and walks messages back off the ring the
- * way crates/reims-graphics/src/ring.rs does, so a test can post through the real
+ * way crates/reims-vgpu-graphics/src/ring.rs does, so a test can post through the real
  * RgfxRingWriter/RgfxSerializer and assert the exact bytes that landed.
  *
  * Shared by the serialiser check (tests/serializer_tests.cpp, the 387 wire-byte
@@ -75,7 +75,7 @@ struct TestRing {
 
 	// --- the host-producer side (host -> guest rings, for RgfxReplyReader) --------
 	// A completion ring the reader drains: the test plays the host here, writing a
-	// reply message and publishing `producer`, mirroring crates/reims-graphics/src/
+	// reply message and publishing `producer`, mirroring crates/reims-vgpu-graphics/src/
 	// ring.rs Producer::post (pad to the end so a message never wraps). `msg` already
 	// holds its header (type, size, seqno). Returns false with nothing written when the
 	// ring has no room.

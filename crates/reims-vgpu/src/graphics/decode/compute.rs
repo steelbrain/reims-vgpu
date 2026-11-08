@@ -1,5 +1,5 @@
 //! The compute-encoder op decoder: one arm per
-//! [`reims_graphics::ops::compute`] op, turning a wire op into a `ComputeCmd` on
+//! [`reims_vgpu_graphics::ops::compute`] op, turning a wire op into a `ComputeCmd` on
 //! the open `P::ComputeEncoder` (docs/graphics-kext/design.md, "Stage 3 wire
 //! protocol"). The command-buffer walk ([`super::cmdbuf`]) routes every
 //! compute-group op (`tag >> 12 == `[`RGFX_OP_GROUP_COMPUTE`]) here.
@@ -8,15 +8,20 @@
 //! through the [object-resolution API](super) (`require_*`/`get_*`), and sends the
 //! matching [`ComputeCmd`] with [`ComputeEncoder::encode`]. A body too short for its
 //! op faults the exec ([`super::op_fault`]); a bad reference faults through the
-//! resolution API. The array-tailed ops ([`reims_graphics::ops::compute`], "Array-tailed
+//! resolution API. The array-tailed ops ([`reims_vgpu_graphics::ops::compute`], "Array-tailed
 //! ops") read a fixed head, then its `length`/`count` element records right after it.
 //!
 //! `endEncoding` has no arm here: the walk's `ENCODER_END` framing op ends the open
 //! compute encoder ([`super::cmdbuf`]).
 //!
-//! [`RGFX_OP_GROUP_COMPUTE`]: reims_graphics::ops::RGFX_OP_GROUP_COMPUTE
+//! [`RGFX_OP_GROUP_COMPUTE`]: reims_vgpu_graphics::ops::RGFX_OP_GROUP_COMPUTE
 
-use reims_graphics::ops::compute::{
+use reims_vgpu_core::platform::Platform;
+use reims_vgpu_core::platform::blit::ResourceRef;
+use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
+use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH,
     RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
     RGFX_OP_COMPUTE_DISPATCH_THREADS, RGFX_OP_COMPUTE_DISPATCH_THREADS_INDIRECT,
@@ -49,11 +54,6 @@ use reims_graphics::ops::compute::{
     RgfxComputeOpUseResources, RgfxComputeOpWaitForFence, RgfxComputeResourceRef,
     RgfxComputeSamplerBinding, RgfxComputeSamplerLodBinding, RgfxComputeTextureBinding,
 };
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::{FromBytes, Immutable};
 
 use super::refused::{self, Bound, Marks, Slot, Stage};
@@ -169,7 +169,7 @@ fn bind_each<'a, R, T>(
 }
 
 /// Decodes one compute-encoder op: `tag` its op, `payload` its body (the bytes
-/// after the [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)). `objs` resolves
+/// after the [`RgfxOpHeader`](reims_vgpu_graphics::ops::RgfxOpHeader)). `objs` resolves
 /// object references, `enc` is the open compute encoder, `marks` its slots that hold an object
 /// whose create the host refused, and `on` says how an encode's raise is taken. `Ok(true)` when
 /// the op was handled, `Ok(false)` for an unknown tag (the walk then faults); a platform raise
@@ -612,11 +612,6 @@ pub(crate) fn decode_op<P: Platform>(
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::wire::{
-        RGFX_CMD_BUFFER_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_QUEUE_CREATE,
-        RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate, RgfxMsgHeader, RgfxObjectCreate,
-        RgfxQueueCreate, RgfxTextureCreate, RgfxTextureDescriptor,
-    };
     use reims_vgpu_core::platform::Handle;
     use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
     use reims_vgpu_core::platform::device::GpuDevice;
@@ -624,6 +619,11 @@ mod tests {
     use reims_vgpu_core::raise::OnFault;
     use reims_vgpu_core::testkit::FakePlatform;
     use reims_vgpu_core::testkit::calllog::Arg;
+    use reims_vgpu_graphics::wire::{
+        RGFX_CMD_BUFFER_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_QUEUE_CREATE,
+        RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate, RgfxMsgHeader, RgfxObjectCreate,
+        RgfxQueueCreate, RgfxTextureCreate, RgfxTextureDescriptor,
+    };
     use zerocopy::IntoBytes;
 
     use super::*;
@@ -639,7 +639,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
 
         let queue = RgfxQueueCreate {

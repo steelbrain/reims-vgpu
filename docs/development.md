@@ -95,7 +95,7 @@ doc holds its area's ordering contracts and the measured platform facts it relie
 | `reims-vgpu-c` | `crates/reims-vgpu-c` | the C API (`rvg_*`, `include/reims_vgpu.h`), which QEMU links; `cdylib`, `staticlib` and `rlib` |
 | `reims-vgpu-video` | `crates/reims-vgpu-video` | the reims-graphics device's video on the host, independent of the library and QEMU: `core` (what the video arms share), `codec` (the codecs above the hardware, in plain Rust), and on Linux `vaapi` (VA-API through libva) and `nvidia` (NVDEC and NVENC over the CUDA driver API), their libraries loaded at run time |
 | `reims-vgpu-video-conformance` | `crates/reims-vgpu-video/conformance` | the test streams' readers and writers the video examples use: MP4 in and out, and frames hashed as ffmpeg's `framemd5` does |
-| `reims-graphics` | `crates/reims-graphics` | the reims-graphics device (1234:5247, `docs/graphics-kext/design.md`): its wire format, whose C header (`include/reims_graphics_wire.h`) the guest's kext and option ROM include, and its host side |
+| `reims-vgpu-graphics` | `crates/reims-vgpu-graphics` | the reims-graphics device (1234:5247, `docs/graphics-kext/design.md`): its wire format, whose C header (`include/reims_graphics_wire.h`) the guest's kext and option ROM include, and its host side |
 | `xtask` | `xtask` | `cargo xtask`, below |
 
 ### Build and test

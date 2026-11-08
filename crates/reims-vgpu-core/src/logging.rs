@@ -483,7 +483,7 @@ mod tests {
     /// debug line, from every walk thread at once.
     #[test]
     fn a_line_not_written_takes_no_lock() {
-        for env in [None, Some("info,reims_graphics=trace")] {
+        for env in [None, Some("info,reims_vgpu_graphics=trace")] {
             let l = logger(env);
             let (seen, hook) = recording_hook();
             l.keep(
@@ -514,7 +514,7 @@ mod tests {
             });
             assert!(seen.lock().is_empty(), "{env:?}");
             // A line the filter passes still reaches the hook.
-            write(&l, Level::Info, "reims_graphics", "kept");
+            write(&l, Level::Info, "reims_vgpu_graphics", "kept");
             assert_eq!(seen.lock().len(), 1, "{env:?}");
         }
     }

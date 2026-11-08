@@ -5,7 +5,7 @@
  * the host decoder it mirrors is crates/reims-vgpu/src/graphics/decode.rs).
  *
  * This is the first serialiser slice: the object lifecycle whose wire structs are
- * fixed in crates/reims-graphics/src/wire.rs (reims_graphics_wire.h) — command
+ * fixed in crates/reims-vgpu-graphics/src/wire.rs (reims_graphics_wire.h) — command
  * queue, heap, buffer, texture, sampler, depth/stencil, library, event, shared
  * event, fence, and OBJECT_DESTROY. The guest picks each ObjId, GPU address and
  * resource id (RgfxIdSpace); the host pins them. Lifecycle messages go on the

@@ -1,7 +1,7 @@
 /*
  * RgfxRingWriter: the guest producer's reserve-write-publish-doorbell step
  * (RgfxRingWriter.hpp). Mirrors the host consumer in
- * crates/reims-graphics/src/ring.rs.
+ * crates/reims-vgpu-graphics/src/ring.rs.
  */
 
 #include "RgfxRingWriter.hpp"

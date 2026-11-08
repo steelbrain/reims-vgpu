@@ -26,7 +26,7 @@ reims-vgpu-window.workspace = true
 # on Linux the arms' VA-API and NVDEC (`graphics::vaapi`, `graphics::nvidia`).
 reims-vgpu-video.workspace = true
 # The reims-graphics device's host side (`graphics`).
-reims-graphics.workspace = true
+reims-vgpu-graphics.workspace = true
 # Reads the reims-graphics device's wire messages into their records (`graphics::decode`).
 zerocopy.workspace = true
 # A library's content key, by which the reims-graphics device keeps the libraries it made

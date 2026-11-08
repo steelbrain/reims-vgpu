@@ -2,7 +2,7 @@
 //! `gpuResourceID`, and `ICB_WRITE`, the CPU's encodes into one.
 //!
 //! The platform's buffer is the one copy of the commands. The guest's CPU encodes reach it as
-//! records ([`reims_graphics::icb`]) on ring 0, which the guest posts before any command buffer
+//! records ([`reims_vgpu_graphics::icb`]) on ring 0, which the guest posts before any command buffer
 //! that may execute them, and a kernel's encodes write it on the GPU, through the
 //! `gpuResourceID` the guest's argument buffers hold. So a command buffer executes the commands
 //! as both sides last wrote them, as Metal's does.
@@ -19,8 +19,16 @@
 //! and dispatches are dropped until the guest resets it ([`Dropped`]). Nothing else of the
 //! buffer changes, and the command buffers that execute it go on.
 
-use reims_graphics::icb::*;
-use reims_graphics::wire::{
+use reims_vgpu_core::platform::Platform;
+use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::icb::{
+    IcbComputeCmd, IcbRenderCmd, IndirectCommandBuffer, IndirectComputeCommand,
+    IndirectRenderCommand,
+};
+use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+use reims_vgpu_core::platform::values::IcbDesc;
+use reims_vgpu_graphics::icb::*;
+use reims_vgpu_graphics::wire::{
     RGFX_EVT_ICB_STATE, RGFX_ICB_INHERIT_BLEND_COLOR, RGFX_ICB_INHERIT_BUFFERS,
     RGFX_ICB_INHERIT_CULL_MODE, RGFX_ICB_INHERIT_DEPTH_BIAS, RGFX_ICB_INHERIT_DEPTH_CLIP_MODE,
     RGFX_ICB_INHERIT_DEPTH_STENCIL_STATE, RGFX_ICB_INHERIT_DEPTH_TEST_BOUNDS,
@@ -31,14 +39,6 @@ use reims_graphics::wire::{
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxIcbCreate,
     RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbState, RgfxIcbWrite, RgfxMsgHeader,
 };
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::icb::{
-    IcbComputeCmd, IcbRenderCmd, IndirectCommandBuffer, IndirectComputeCommand,
-    IndirectRenderCommand,
-};
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
-use reims_vgpu_core::platform::values::IcbDesc;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1061,15 +1061,15 @@ fn slot_fields(
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::wire::{
-        RGFX_CMD_BUFFER_CREATE, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_WRITE, RgfxBufferCreate,
-    };
     use reims_vgpu_core::platform::Handle;
     use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
+    use reims_vgpu_graphics::wire::{
+        RGFX_CMD_BUFFER_CREATE, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_WRITE, RgfxBufferCreate,
+    };
     use zerocopy::{Immutable, IntoBytes};
 
-    use reims_graphics::region::Region;
-    use reims_graphics::wire::{
+    use reims_vgpu_graphics::region::Region;
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_ICB_SLOTS, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT,
         RGFX_CURSOR_SPAN, RGFX_ICB_SLOTS_COMPUTE,
     };

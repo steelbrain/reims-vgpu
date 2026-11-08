@@ -61,7 +61,7 @@
 //!   pages still in flight lands, and a `SURFACE_PAGES` over pages a release still copies into
 //!   (the kext made a new block of the surface before the release's answer) waits for the copy
 //!   before it is carried out ([`Caches::wait_copies_into`]), and for the release itself where
-//!   its context's lane has not carried it out yet (`reims_graphics`'s `device::lanes`).
+//!   its context's lane has not carried it out yet (`reims_vgpu_graphics`'s `device::lanes`).
 //! - **Early copy.** A surface the CPU reads back after each GPU write (a decoder's output, or a
 //!   pixel transfer's, that its client locks each frame to read) is copied into its pages as the
 //!   write ends, not at the lock that follows it ([`SurfaceCaches::early_copies`]). Once a
@@ -90,11 +90,11 @@
 //!   cache.
 //! - **Deferred blocks.** Where the guest took `RGFX_FEATURE_SURFACE_DEFERRED`, the kext names a
 //!   fresh surface only the GPU has touched with no pages
-//!   ([`RGFX_SURFACE_PAGES_DEFERRED`](reims_graphics::wire::RGFX_SURFACE_PAGES_DEFERRED)), as a
+//!   ([`RGFX_SURFACE_PAGES_DEFERRED`](reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_DEFERRED)), as a
 //!   GPU of its own memory keeps such a surface in that memory alone: its cache is made as zeros,
 //!   on the transfer queue before any use, at the CPU's generation 0, with no pages to fill from,
 //!   download into or watch. The kext names the pages at the first CPU lock that needs them
-//!   ([`RGFX_SURFACE_PAGES_ATTACH`](reims_graphics::wire::RGFX_SURFACE_PAGES_ATTACH)), and the
+//!   ([`RGFX_SURFACE_PAGES_ATTACH`](reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_ATTACH)), and the
 //!   cache takes them as they are, keeping its bytes, its generation and whether a buffer wrote
 //!   it, so the download that follows copies what the GPU wrote. A release of a block whose pages
 //!   were never named copies nothing. Pages the host makes no view of, or no buffer over, at that
@@ -139,7 +139,7 @@
 //! color attachment of the pass is linear; elsewhere it renders through a stand-in copied within
 //! the GPU's memory. Neither is measured on a discrete RADV or ANV device yet.
 //!
-//! [`RGFX_SURFACE_PAGES_CACHED`]: reims_graphics::wire::RGFX_SURFACE_PAGES_CACHED
+//! [`RGFX_SURFACE_PAGES_CACHED`]: reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_CACHED
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -147,11 +147,6 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use reims_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
-use reims_graphics::region::Region;
-use reims_graphics::wire::{
-    RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_BLOCK_RELEASE_UNHELD, RgfxBufferOverSurfacePages,
-};
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
@@ -164,6 +159,11 @@ use reims_vgpu_core::platform::values::PagesPlane;
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
+use reims_vgpu_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
+    RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_BLOCK_RELEASE_UNHELD, RgfxBufferOverSurfacePages,
+};
 use reims_vgpu_video::core::device_memory::{MemoryIdentity, MemoryLife};
 
 use super::refusing;
@@ -3549,19 +3549,19 @@ fn copy<P: Platform>(
 mod tests {
     use std::sync::atomic::AtomicBool;
 
-    use reims_graphics::ops::{
+    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_core::testkit::calllog::{Arg, Call};
+    use reims_vgpu_core::testkit::objects::CompleteOn;
+    use reims_vgpu_graphics::ops::{
         RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_USE, RgfxCommandBuffer,
         RgfxOpHeader,
     };
-    use reims_graphics::wire::{
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
         RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
         RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
         RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun, RgfxQueueCreate, RgfxSurfacePages,
     };
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_core::testkit::calllog::{Arg, Call};
-    use reims_vgpu_core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
     use super::super::surface_pages::tests::{BLOCK, RAM, Rig, rig};
@@ -4060,7 +4060,7 @@ mod tests {
     /// surface again before the host's copy
     #[test]
     fn an_unheld_release_drops_a_written_cache_uncopied() {
-        use reims_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD;
+        use reims_vgpu_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD;
         let release_written = |flags: u32, clients: u32| {
             let mut r = cached();
             let cache = cache_id(&r);
@@ -4124,7 +4124,7 @@ mod tests {
     /// an attached cache's is, and counts among the drops and their bytes
     #[test]
     fn every_unheld_release_is_counted_and_every_written_one_dropped() {
-        use reims_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD;
+        use reims_vgpu_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD;
         let unheld = RGFX_BLOCK_RELEASE_NO_CLIENT | RGFX_BLOCK_RELEASE_UNHELD;
         let released = |r: &Rig| {
             let done = Arc::new(AtomicBool::new(false));
@@ -4286,7 +4286,7 @@ mod tests {
                 }];
                 let m = RgfxSurfacePages {
                     header: RgfxMsgHeader {
-                        r#type: reims_graphics::wire::RGFX_CMD_SURFACE_PAGES,
+                        r#type: reims_vgpu_graphics::wire::RGFX_CMD_SURFACE_PAGES,
                         size: size_of::<RgfxSurfacePages>() as u32,
                         seqno: 0,
                     },
@@ -4330,7 +4330,7 @@ mod tests {
     /// waits for, so it reads the GPU's write; with none taken, nothing is copied
     #[test]
     fn an_unheld_release_copies_where_the_surface_is_taken_again_before_its_copy() {
-        use reims_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD;
+        use reims_vgpu_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD;
         for taken in [true, false] {
             let mut r = cached();
             let cache = cache_id(&r);
@@ -5649,8 +5649,8 @@ mod tests {
     #[test]
     fn a_download_of_a_laid_out_cache_leaves_the_bytes_between_rows() {
         use super::super::surface_pages::tests::one_plane;
-        use reims_graphics::wire::RGFX_STATUS_CACHE;
         use reims_vgpu_core::platform::values::PagesInPlace;
+        use reims_vgpu_graphics::wire::RGFX_STATUS_CACHE;
         let mut r = rig(16);
         let page = r.page;
         r.dec.set_unified_memory(true);

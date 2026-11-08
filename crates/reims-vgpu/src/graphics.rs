@@ -1,4 +1,4 @@
-//! [`GraphicsDevice`]: the reims-graphics device (PCI 1234:5247), `reims-graphics`'s host side
+//! [`GraphicsDevice`]: the reims-graphics device (PCI 1234:5247), `reims-vgpu-graphics`'s host side
 //! with its display shown in a window of the library's, made from a [`GraphicsConfig`].
 //!
 //! The device's region (BAR 2) is made here and shared: the device takes the guest's commands
@@ -43,9 +43,20 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::lock_api::ArcRwLockReadGuard;
 use parking_lot::{RawRwLock, RwLock};
-use reims_graphics::ops::RgfxCommandBuffer;
-use reims_graphics::region::Region;
-use reims_graphics::wire::{
+use reims_vgpu_core::host::HostQueue;
+use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
+use reims_vgpu_core::num::ToU64;
+use reims_vgpu_core::platform::command::CommandBuffer as _;
+use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::os::clock::Clock as _;
+use reims_vgpu_core::platform::resource::Texture;
+use reims_vgpu_core::platform::values::TextureDesc;
+use reims_vgpu_core::platform::{Handle, Platform};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::ops::RgfxCommandBuffer;
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_OVER_PAGES,
     RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
@@ -69,21 +80,10 @@ use reims_graphics::wire::{
     RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
     RgfxSamplerState, RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
-use reims_graphics::{
+use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
     Screen,
 };
-use reims_vgpu_core::host::HostQueue;
-use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
-use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::command::CommandBuffer as _;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::os::clock::Clock as _;
-use reims_vgpu_core::platform::resource::Texture;
-use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig, geometry};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -165,7 +165,7 @@ pub struct GraphicsCallbacks {
     /// Raises the device's interrupt. Without it the guest gets no interrupt.
     pub raise_interrupt: Option<GraphicsRaiseFn>,
     /// The guest set its cursor's image: its pixels as straight-alpha RGBA, which the guest
-    /// gave premultiplied BGRA (`reims-graphics`' `display`), and its hot spot.
+    /// gave premultiplied BGRA (`reims-vgpu-graphics`' `display`), and its hot spot.
     pub cursor_glyph: Option<CursorGlyphFn>,
     /// Whether the cursor shows changed, hidden until the first call: 1 once the guest has an
     /// image while it shows its cursor, 0 once it has none or hides it.
@@ -213,7 +213,7 @@ pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
     /// The window, which closes when the link drops: before the device.
     window: Option<WindowLink>,
     /// The device.
-    device: reims_graphics::Device,
+    device: reims_vgpu_graphics::Device,
     /// The guest's cursor as the host is told it.
     cursor: Arc<HostCursor>,
     /// The stage-3 decoder and the device handle it drives, shared with the device's [`Host`],
@@ -250,8 +250,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// refuses the region's memory, a pipe or a thread.
     pub fn with_platform(platform: Arc<P>, config: GraphicsConfig) -> Result<Self, Error> {
         entry::run(|_| {
-            let size =
-                usize::try_from(reims_graphics::REGION_SIZE).map_err(|_| Error::HostResources)?;
+            let size = usize::try_from(reims_vgpu_graphics::REGION_SIZE)
+                .map_err(|_| Error::HostResources)?;
             let region = platform
                 .graphics_region(size)
                 .or_else(|| Region::new(size))
@@ -470,7 +470,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 screen,
                 cursor: Arc::clone(&cursor),
             };
-            let device = reims_graphics::Device::new(region, host, Box::new(screen))
+            let device = reims_vgpu_graphics::Device::new(region, host, Box::new(screen))
                 .ok_or(Error::HostResources)?;
             Ok(GraphicsDevice {
                 window,
@@ -555,7 +555,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
 
     /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring may answer the
     /// queue's next command buffer on the calling thread, posting its `CB_SUBMITTED` there and
-    /// calling `raise_interrupt` inside this call (`reims-graphics`'s `Device::mmio_write_taking`),
+    /// calling `raise_interrupt` inside this call (`reims-vgpu-graphics`'s `Device::mmio_write_taking`),
     /// allocating nothing; the queue's thread then takes it as it takes any. A write of ring 0's
     /// may take and answer the control ring's next message there, where it is a
     /// `SURFACE_DOWNLOAD` whose pages hold the surface's device cache already
@@ -585,7 +585,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
 }
 
 impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
-    /// The window closes, then the device ends; neither waits (`reims-graphics`'s `device`).
+    /// The window closes, then the device ends; neither waits (`reims-vgpu-graphics`'s `device`).
     fn drop(&mut self) {
         entry::run(|_| {
             drop(self.window.take());
@@ -594,7 +594,7 @@ impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
 }
 
 /// The stage-3 decoder and the device handle it drives, shared by the device's [`Host`], which
-/// feeds it ring 0's object lifecycle on each context's lane (`reims-graphics`' device) and the
+/// feeds it ring 0's object lifecycle on each context's lane (`reims-vgpu-graphics`' device) and the
 /// command queues' own rings' messages on their service threads. Each message is carried out on a
 /// decoder of its own over the shared state ([`Decoders::sender`]), whose locks are each held for a
 /// short section (`decode`'s module doc): no thread holds one across a command buffer's walk, so a

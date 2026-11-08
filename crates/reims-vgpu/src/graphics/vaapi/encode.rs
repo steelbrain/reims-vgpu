@@ -21,17 +21,17 @@
 
 use std::sync::Arc;
 
-use reims_graphics::ops::video::{
+use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::ops::video::{
     RGFX_VIDEO_ENCODE_HARD_LIMIT, RGFX_VIDEO_ENTROPY_CABAC, RGFX_VIDEO_ENTROPY_CAVLC,
     RGFX_VIDEO_PICTURE_B, RGFX_VIDEO_PICTURE_I, RGFX_VIDEO_PICTURE_P, RGFX_VIDEO_RATE_CBR,
     RGFX_VIDEO_RATE_CQP, RGFX_VIDEO_RATE_VBR, RgfxVideoEncodeSettings,
 };
-use reims_graphics::wire::{
+use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_ENCODE, RGFX_VIDEO_FORMAT_NV12,
     RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN,
     RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_video::codec::encode::{
     ColourDescription, EncoderSettings, Entropy, FrameRate, FrameType, InputFrame, Plane,
     Profile as EncodeProfile, RateControl,

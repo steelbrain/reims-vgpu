@@ -26,22 +26,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use reims_graphics::ops::{
+use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::testkit::FakePlatform;
+use reims_vgpu_core::testkit::objects::CompleteOn;
+use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
     RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_OP_SUBMITTED, RGFX_PASS_FLAG_RT_SIZE,
     RgfxCommandBuffer, RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
 };
-use reims_graphics::region::Region;
-use reims_graphics::wire::{
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_EVT_CB_SCHEDULED, RgfxBufferCreate,
     RgfxCbScheduled, RgfxMsgHeader, RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate,
     RgfxTextureCreate, RgfxTextureDescriptor,
 };
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::testkit::FakePlatform;
-use reims_vgpu_core::testkit::objects::CompleteOn;
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::{DecodeError, GraphicsDecoder, ObjHandle, refusing};

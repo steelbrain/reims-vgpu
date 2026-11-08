@@ -1,7 +1,7 @@
 //! `cargo xtask header`: generate the C headers with cbindgen, each from its crate's
 //! `cbindgen.toml`, or, with `--check`, check that each committed header equals cbindgen's output:
 //! the C API's, `crates/reims-vgpu-c/include/reims_vgpu.h`, and the reims-graphics device's wire
-//! format, `crates/reims-graphics/include/reims_graphics_wire.h`, which the guest's kext and option
+//! format, `crates/reims-vgpu-graphics/include/reims_graphics_wire.h`, which the guest's kext and option
 //! ROM include.
 //!
 //! cbindgen is an external binary (`cargo install cbindgen --version 0.29.4`, or Homebrew's).
@@ -19,7 +19,7 @@ pub const CBINDGEN_VERSION: &str = "0.29.4";
 /// Each header's crate and file name.
 pub const HEADERS: [(&str, &str); 2] = [
     ("reims-vgpu-c", "reims_vgpu.h"),
-    ("reims-graphics", "reims_graphics_wire.h"),
+    ("reims-vgpu-graphics", "reims_graphics_wire.h"),
 ];
 
 /// A crate cbindgen reads.
@@ -126,7 +126,7 @@ mod tests {
         assert!(header_path(api, api_h).ends_with("crates/reims-vgpu-c/include/reims_vgpu.h"));
         assert!(
             header_path(wire, wire_h)
-                .ends_with("crates/reims-graphics/include/reims_graphics_wire.h")
+                .ends_with("crates/reims-vgpu-graphics/include/reims_graphics_wire.h")
         );
     }
 }

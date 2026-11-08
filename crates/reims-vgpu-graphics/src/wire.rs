@@ -2355,7 +2355,7 @@ pub const RGFX_MANAGED_TEXTURE_LINEAR: u32 = 1;
 /// image its rows of texel blocks. A level of `w` by `h` texels (the texture's halved `level`
 /// times, at least 1) has rows of `ceil(w / block_width) * bytes_per_block` bytes rounded up to
 /// [`RGFX_MANAGED_ROW_ALIGN`], and `ceil(h / block_height)` of them an image. The guest and the
-/// host each compute it from these fields alone (`reims_graphics::managed`).
+/// host each compute it from these fields alone (`reims_vgpu_graphics::managed`).
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,

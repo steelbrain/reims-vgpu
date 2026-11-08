@@ -23,7 +23,7 @@
  * render-encoder op bodies (`RgfxOp*`), the compute-encoder op bodies
  * (`RgfxComputeOp*`) and the blit-encoder op bodies (`RgfxBlitOp*`), together with
  * the pass and element records, all come from the committed header
- * (`reims_graphics_wire.h`), generated from the crates/reims-graphics/src/ops
+ * (`reims_graphics_wire.h`), generated from the crates/reims-vgpu-graphics/src/ops
  * modules. The
  * op structs carry a per-group prefix because several names (`UpdateFence`,
  * `WaitForFence`, `ExecuteCommandsInBuffer`, ...) recur across the render, compute

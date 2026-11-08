@@ -10,7 +10,7 @@
 //! A script's trace is kept in a file beside this one (`peer_wire2.trace` for the wire-2
 //! guest's). The test fails where the device's traffic differs from it. Where a change means
 //! to alter that traffic, the file is recorded again from its own build
-//! (`RVG_PEER_RECORD=1 cargo nextest run -p reims-graphics -E 'test(/peer/)'`), and its diff is
+//! (`RVG_PEER_RECORD=1 cargo nextest run -p reims-vgpu-graphics -E 'test(/peer/)'`), and its diff is
 //! reviewed with the change.
 //!
 //! The script fixes every choice the wire leaves to timing:

@@ -39,7 +39,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use reims_graphics::wire::{
+use reims_vgpu_core::raise::{Origin, Raise, RaiseResult};
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
     RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_PAGES,
     RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMPUTE_PIPELINE_CREATE,
@@ -51,7 +52,6 @@ use reims_graphics::wire::{
     RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
     RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE, RgfxObjectCreate,
 };
-use reims_vgpu_core::raise::{Origin, Raise, RaiseResult};
 
 use super::read;
 
@@ -448,7 +448,7 @@ mod tests {
     /// command buffer, do not.
     #[test]
     fn only_posted_creates_stand_refused() {
-        use reims_graphics::wire::{
+        use reims_vgpu_graphics::wire::{
             RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_QUEUE_CREATE, RgfxMsgHeader,
         };
         use zerocopy::IntoBytes;

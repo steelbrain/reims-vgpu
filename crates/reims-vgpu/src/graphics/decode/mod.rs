@@ -82,8 +82,28 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use reims_graphics::region::Region;
-use reims_graphics::wire::{
+use reims_vgpu_core::host::HostPtr;
+use reims_vgpu_core::memory::map::MemoryMap;
+use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_core::platform::device::GpuDevice;
+use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_core::platform::os::clock::{Clock as _, MonoTime};
+use reims_vgpu_core::platform::resource::{
+    Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
+};
+use reims_vgpu_core::platform::types::{MtlSize, Swizzle};
+use reims_vgpu_core::platform::values::{
+    AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
+    FullComputePipelineDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc,
+    LinkedFunctionsDesc, OptionSet, PagesInPlace, PagesPlane, PrivateRenderDesc, SamplerDesc,
+    StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix, SurfacePlane, TextureDesc,
+    VertexDesc,
+};
+use reims_vgpu_core::platform::{Handle, HostRange, Platform};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
+use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
     RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
     RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER,
@@ -132,26 +152,6 @@ use reims_graphics::wire::{
     RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
     RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::memory::map::MemoryMap;
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
-use reims_vgpu_core::platform::os::clock::{Clock as _, MonoTime};
-use reims_vgpu_core::platform::resource::{
-    Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
-};
-use reims_vgpu_core::platform::types::{MtlSize, Swizzle};
-use reims_vgpu_core::platform::values::{
-    AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
-    FullComputePipelineDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc,
-    LinkedFunctionsDesc, OptionSet, PagesInPlace, PagesPlane, PrivateRenderDesc, SamplerDesc,
-    StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix, SurfacePlane, TextureDesc,
-    VertexDesc,
-};
-use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_video::core::device_memory::MemoryLife;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -252,7 +252,7 @@ pub(crate) type ReflectionSink = Arc<dyn Fn(PipelineReply) + Send + Sync>;
 /// limits ([`RgfxMeshPipelineReflection`], at [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]), which
 /// no other reply carries.
 ///
-/// [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]: reims_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET
+/// [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]: reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PipelineReply {
     /// The record.
@@ -1023,7 +1023,7 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Whether `SURFACE_PAGES` makes views ([`RGFX_FEATURE_SURFACE_PAGES`]).
     ///
-    /// [`RGFX_FEATURE_SURFACE_PAGES`]: reims_graphics::wire::RGFX_FEATURE_SURFACE_PAGES
+    /// [`RGFX_FEATURE_SURFACE_PAGES`]: reims_vgpu_graphics::wire::RGFX_FEATURE_SURFACE_PAGES
     pub(crate) fn surface_pages_available(&self) -> bool {
         self.shared.surface_views.lock().available(&self.platform)
     }
@@ -1713,9 +1713,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// The block at `offset` was released, its `RGFX_BLOCK_RELEASE_*` `flags`: its surface view,
     /// if any, goes once the buffers over it have, and its device cache once the pages hold what
     /// a command buffer wrote of it, whether its surface had a client left or not
-    /// ([`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT), which
+    /// ([`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_vgpu_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT), which
     /// is only counted). Where nothing but the kext held the surface
-    /// ([`RGFX_BLOCK_RELEASE_UNHELD`](reims_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD)) the cache
+    /// ([`RGFX_BLOCK_RELEASE_UNHELD`](reims_vgpu_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD)) the cache
     /// goes uncopied. There is no wait here for a buffer still walked; `done` then, or `failed`
     /// where the platform raised at the copy ([`surface_cache`]). The block's holds of them are
     /// let go of on the surface worker, where either may be the last of an import or a mapping.
@@ -2376,7 +2376,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.close_worker.flush();
     }
 
-    /// The device's reset (`reims_graphics::Host::device_reset`): every context's objects dropped
+    /// The device's reset (`reims_vgpu_graphics::Host::device_reset`): every context's objects dropped
     /// as at its close ([`Self::drop_context`]), the lowest context first, then what the decoder
     /// keeps beside them for the guest's processes: the surfaces' names, the libraries' chunks,
     /// makes and cache, the blocks' views of their surfaces' pages and their device caches
@@ -2689,7 +2689,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 Ok(Ok(()))
             }
             RGFX_CMD_QUEUE_CREATE => {
-                use reims_graphics::wire::{
+                use reims_vgpu_graphics::wire::{
                     RGFX_QUEUE_CREATE_FLAGS_OFFSET, RGFX_QUEUE_UNSHARED, RgfxQueueCreateFlags,
                 };
                 let Some(m) = read::<RgfxQueueCreate>(message) else {
@@ -5263,11 +5263,11 @@ fn stencil(s: &RgfxStencilDescriptor) -> StencilDesc {
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::wire::{
+    use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_LIBRARY_BYTES_OFFSET, RGFX_RESOURCE_ID_CHUNKS,
         RgfxLibraryCreate, RgfxLibraryFromRegion, RgfxTextureView,
     };
-    use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
     use zerocopy::IntoBytes;
 
     use super::*;
@@ -5290,7 +5290,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let grant = RgfxResourceIdChunk {
             header: RgfxMsgHeader {
@@ -5496,7 +5496,7 @@ mod tests {
         // cursor's span.
         let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
         let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(size as usize).unwrap());
         let (staging, ack) = (blocks + 0x4000, blocks + 0x100);
         let air: Vec<u8> = (0..0x2345u32).map(|i| (i * 7) as u8).collect();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
@@ -5575,7 +5575,7 @@ mod tests {
         let device = p.device();
         let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
         let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(size as usize).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         let buffer = |obj_id: u64, region_offset: u64, length: u64| RgfxBufferOverHostMemory {
             header: RgfxMsgHeader {
@@ -5688,7 +5688,7 @@ mod tests {
         let device = p.device();
         let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
         let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(size as usize).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         region.grant(1, blocks, 0x2_0000);
         dec.set_context(Some(1));
@@ -5762,7 +5762,7 @@ mod tests {
         let device = p.device();
         let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
         let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(size as usize).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         region.grant(1, blocks, 0x2_0000);
         dec.set_context(Some(1));
@@ -5816,14 +5816,14 @@ mod tests {
     /// way, is refused, and stores and makes nothing more.
     #[test]
     fn an_unshared_queue_create_makes_the_platforms_unshared_queue() {
-        use reims_graphics::wire::{
+        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+        use reims_vgpu_graphics::wire::{
             RGFX_QUEUE_QUIET_SCHEDULED, RGFX_QUEUE_UNSHARED, RgfxQueueCreateFlags,
         };
-        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
 
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x1_0000).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         let create = |obj_id: u64, flags: Option<u32>| {
             let mut bytes = RgfxQueueCreate {
@@ -5909,7 +5909,7 @@ mod tests {
     fn a_sampler_create_answers_the_platforms_id() {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x1_0000).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         let create = |obj_id, seqno| RgfxSamplerCreate {
             header: RgfxMsgHeader {
@@ -5981,7 +5981,7 @@ mod tests {
     fn heap_texture_sizes_are_the_devices() {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x1_0000).unwrap());
         let dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         let query = RgfxHeapTextureSizeAndAlign {
             header: RgfxMsgHeader {
@@ -6069,7 +6069,7 @@ mod tests {
         use reims_vgpu_core::platform::device::GpuDevice as _;
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let region = Arc::new(reims_graphics::region::Region::new(0x10000).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), region);
         dec.set_context(Some(1));
         let fence = || ObjHandle::Fence(device.new_fence().unwrap().unwrap());
@@ -6129,7 +6129,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let obj = |context: u64, n: u64| context << RGFX_CONTEXT_OBJ_ID_SHIFT | n;
         let create = |ty: u32, obj_id: u64| {
@@ -6283,7 +6283,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
 
         let obj = |ty: u32, obj_id: u64| RgfxObjectCreate {
@@ -7203,7 +7203,7 @@ mod tests {
     /// texture's warning names the facts it carried.
     #[test]
     fn a_surface_texture_reads_its_facts_by_the_message_size() {
-        use reims_graphics::wire::{
+        use reims_vgpu_graphics::wire::{
             RGFX_SURFACE_FACTS_OFFSET, RGFX_YCBCR_MATRIX_ITU_R_2020, RgfxSurfaceFacts,
         };
         let p = Arc::new(FakePlatform::new());
@@ -7343,7 +7343,7 @@ mod tests {
     /// wire names no value for is malformed, and reaches no platform call.
     #[test]
     fn a_surface_texture_s_facts_reach_the_platform() {
-        use reims_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
+        use reims_vgpu_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
@@ -7530,13 +7530,13 @@ mod tests {
         Arc<reims_vgpu_core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
     ) {
         pipeline_decoder_over(Arc::new(
-            reims_graphics::region::Region::new(0x10000).unwrap(),
+            reims_vgpu_graphics::region::Region::new(0x10000).unwrap(),
         ))
     }
 
     /// [`pipeline_decoder`] over `region`.
     pub(super) fn pipeline_decoder_over(
-        region: Arc<reims_graphics::region::Region>,
+        region: Arc<reims_vgpu_graphics::region::Region>,
     ) -> (
         Arc<FakePlatform>,
         GraphicsDecoder<FakePlatform>,
@@ -7990,7 +7990,7 @@ lacks {part}"
             (100, RGFX_PIPELINE_OK, RGFX_PIPELINE_KIND_MESH)
         );
         let (limits, _) = RgfxMeshPipelineReflection::read_from_prefix(
-            &reply[reims_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
+            &reply[reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
         )
         .unwrap();
         assert_eq!(
@@ -8013,7 +8013,7 @@ lacks {part}"
         );
         let reply = replies.lock()[1].clone();
         let (limits, _) = RgfxMeshPipelineReflection::read_from_prefix(
-            &reply[reims_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
+            &reply[reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
         )
         .unwrap();
         assert_eq!(
@@ -8615,7 +8615,7 @@ lacks {part}"
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
@@ -8908,7 +8908,7 @@ lacks {part}"
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
@@ -9127,7 +9127,7 @@ lacks {part}"
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
@@ -9226,7 +9226,7 @@ lacks {part}"
     /// sends a function made with constant values that set none of its constants, or by a
     /// descriptor without them; then its constant, an `int` (`MTLDataTypeInt`) of 5.
     fn optional_constant_cases() -> [Vec<RgfxFunctionConstant>; 2] {
-        let mut value = [0; reims_graphics::wire::RGFX_FUNCTION_CONSTANT_VALUE_BYTES];
+        let mut value = [0; reims_vgpu_graphics::wire::RGFX_FUNCTION_CONSTANT_VALUE_BYTES];
         value[..4].copy_from_slice(&5i32.to_le_bytes());
         [
             Vec::new(),
@@ -9425,9 +9425,9 @@ lacks {part}"
         n: u64,
         desc: RgfxTextureDescriptor,
         bytes_per_row: u64,
-        facts: &reims_graphics::wire::RgfxSurfaceFacts,
+        facts: &reims_vgpu_graphics::wire::RgfxSurfaceFacts,
     ) -> Vec<u8> {
-        use reims_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
+        use reims_vgpu_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
         let m = RgfxTextureFromIOSurface {
             header: RgfxMsgHeader {
                 r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
@@ -9498,7 +9498,7 @@ lacks {part}"
     /// and by the IOSurface creator (`TEXTURE_FROM_IOSURFACE`, its facts saying no planes).
     fn surface_textures_without_planes<P: crate::platform::ApiPlatform>() -> Vec<[TextureAnswer; 2]>
     {
-        use reims_graphics::wire::RgfxSurfaceFacts;
+        use reims_vgpu_graphics::wire::RgfxSurfaceFacts;
         let (mut dec, device) = surface_decoder::<P>();
         buffer_holding(&mut dec, &device, 10, &pin_bytes());
         let answer = |dec: &GraphicsDecoder<P>, n: u64| {
@@ -9608,7 +9608,7 @@ lacks {part}"
     /// with the surface's facts in its `TEXTURE_FROM_IOSURFACE`; `None` where the create is
     /// refused.
     fn ycbcr_through_the_decoder<P: crate::platform::ApiPlatform>() -> Option<Vec<[f32; 4]>> {
-        use reims_graphics::wire::{RGFX_YCBCR_MATRIX_ITU_R_2020, RgfxSurfaceFacts};
+        use reims_vgpu_graphics::wire::{RGFX_YCBCR_MATRIX_ITU_R_2020, RgfxSurfaceFacts};
         let (mut dec, device) = surface_decoder::<P>();
         buffer_holding(&mut dec, &device, 10, &ycbcr_bytes());
         let facts = RgfxSurfaceFacts {
@@ -9846,7 +9846,7 @@ lacks {part}"
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
 
         let replies = Arc::new(Mutex::new(Vec::<RgfxPipelineReflection>::new()));

@@ -129,7 +129,7 @@ reads them once per process, and an unset or unparsable value is the default.
 
 | Variable | Effect |
 |---|---|
-| `REIMS_VGPU_LOG=info` | the library's log lines to stderr, filtered by a level and `target=level` pairs (`warn,reims_graphics=debug`); unset, nowhere. `reims-ctl set <vm> --log-level` sets it |
+| `REIMS_VGPU_LOG=info` | the library's log lines to stderr, filtered by a level and `target=level` pairs (`warn,reims_vgpu_graphics=debug`); unset, nowhere. `reims-ctl set <vm> --log-level` sets it |
 | `REIMS_VGPU_WINDOW=0` | QEMU stays headless under `-display none` (QEMU reads it, not the library) |
 | `REIMS_VGPU_WINDOW_BORDERLESS=1` | a borderless window that fills its screen |
 | `REIMS_VGPU_STRICT=1` | end the process at each difference from Metal's answer the Vulkan platform would otherwise log |
@@ -142,7 +142,7 @@ resize it. [docs/api.md](docs/api.md) section 2 lists every setting and variable
 ## What's here
 
 - The library: `crates/`. Core holds the behavior, generic over its platform; beside it are the
-  Vulkan platform, which runs on metal2vulkan, the reims-graphics device's host side (`crates/reims-graphics`), a display's window, host video on VA-API and NVDEC/NVENC,
+  Vulkan platform, which runs on metal2vulkan, the reims-graphics device's host side (`crates/reims-vgpu-graphics`), a display's window, host video on VA-API and NVDEC/NVENC,
   the Rust API and the C API ([docs/development.md](docs/development.md#crates)).
 - The guest's side: `guest/`, the kexts that drive the device and the Metal bundle that turns the
   guest's Metal calls into its command stream. `guest/prebuilt` holds the built set, which

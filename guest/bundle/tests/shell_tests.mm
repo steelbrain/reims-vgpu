@@ -8913,7 +8913,7 @@ void test_uncompleted_buffer_releases()
 
 } // namespace
 
-// The layout of a Managed texture's CPU copy, for the cases crates/reims-graphics/src/managed.rs
+// The layout of a Managed texture's CPU copy, for the cases crates/reims-vgpu-graphics/src/managed.rs
 // holds too: a 2D RGBA8 texture with three levels, a BC1 one whose sides are no multiple of its
 // blocks, a cube array, and a 3D one; and the blocks of a few formats.
 void test_managed_layout()

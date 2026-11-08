@@ -1,7 +1,7 @@
 //! The video encoders of the guest's command buffers (`tag >> 12 ==`
-//! [`RGFX_OP_GROUP_VIDEO`](reims_graphics::ops::RGFX_OP_GROUP_VIDEO)): the hardware video work of
+//! [`RGFX_OP_GROUP_VIDEO`](reims_vgpu_graphics::ops::RGFX_OP_GROUP_VIDEO)): the hardware video work of
 //! the guest's video driver, a picture a command buffer, on a session
-//! ([`RGFX_CMD_VIDEO_SESSION_CREATE`](reims_graphics::wire::RGFX_CMD_VIDEO_SESSION_CREATE)) the
+//! ([`RGFX_CMD_VIDEO_SESSION_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_VIDEO_SESSION_CREATE)) the
 //! platform's [`GraphicsVideo`] makes. The decoder resolves each op's objects (the bitstream's
 //! buffer, the buffers the output surface's planes lie in) and hands the work to the session,
 //! which starts it at once, as the host takes the committed buffer, after the session's earlier
@@ -23,21 +23,21 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use reims_graphics::ops::video::{
-    RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RGFX_OP_VIDEO_ENCODE_H264,
-    RGFX_OP_VIDEO_ENCODE_H265, RGFX_VIDEO_ENCODE_FORCE_KEYFRAME, RgfxVideoEncodeResult,
-    RgfxVideoEncodeSettings, RgfxVideoOpDecodeH264, RgfxVideoOpDecodeH265, RgfxVideoOpEncode,
-};
-use reims_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
-    RgfxVideoOutputLayout,
-};
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::PixelFormatInfo;
 use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_graphics::ops::video::{
+    RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RGFX_OP_VIDEO_ENCODE_H264,
+    RGFX_OP_VIDEO_ENCODE_H265, RGFX_VIDEO_ENCODE_FORCE_KEYFRAME, RgfxVideoEncodeResult,
+    RgfxVideoEncodeSettings, RgfxVideoOpDecodeH264, RgfxVideoOpDecodeH265, RgfxVideoOpEncode,
+};
+use reims_vgpu_graphics::wire::{
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
+    RgfxVideoOutputLayout,
+};
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
 #[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
@@ -71,7 +71,7 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>>;
     /// Whether a decode lands its picture in an output surface's device cache, where the
     /// surface's block has one, as well as in its pages
-    /// ([`RGFX_VIDEO_CAPS_OUTPUT_CACHED`](reims_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED)).
+    /// ([`RGFX_VIDEO_CAPS_OUTPUT_CACHED`](reims_vgpu_graphics::wire::RGFX_VIDEO_CAPS_OUTPUT_CACHED)).
     fn lands_in_device_caches(&self) -> bool {
         false
     }
@@ -246,7 +246,7 @@ pub struct VideoPlane<'a, P: Platform> {
     /// Its height in pixels.
     pub height: u64,
     /// Whether the buffer is the surface's device cache, in the GPU's own memory
-    /// ([`RGFX_FEATURE_SURFACE_CACHE`](reims_graphics::wire::RGFX_FEATURE_SURFACE_CACHE)), rather
+    /// ([`RGFX_FEATURE_SURFACE_CACHE`](reims_vgpu_graphics::wire::RGFX_FEATURE_SURFACE_CACHE)), rather
     /// than a buffer over its pages.
     pub cached: bool,
     /// The memory the buffer lies in, as a device of the host's video reaches it in place: the
@@ -331,14 +331,14 @@ struct RegionMemory {
     length: usize,
     /// The host's page.
     page: usize,
-    region: Arc<reims_graphics::region::Region>,
+    region: Arc<reims_vgpu_graphics::region::Region>,
 }
 
 impl RegionMemory {
     /// The block of `size` bytes at `block` in `region`, of life `identity`, in host pages of
     /// `page` bytes; `None` past it.
     fn new(
-        region: &Arc<reims_graphics::region::Region>,
+        region: &Arc<reims_vgpu_graphics::region::Region>,
         block: u64,
         size: u64,
         page: u64,
@@ -453,7 +453,7 @@ fn encode_codec(tag: u16) -> Option<u32> {
 }
 
 /// Decodes one video-encoder op: `tag` its op, `payload` its body (the bytes after its
-/// [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)), on `session`, and has `cb`'s later work
+/// [`RgfxOpHeader`](reims_vgpu_graphics::ops::RgfxOpHeader)), on `session`, and has `cb`'s later work
 /// wait for it, and its completion read whether its picture landed, from `landings`. `Ok(false)`
 /// for a tag the host does not know.
 pub(super) fn decode_op<P: Platform>(

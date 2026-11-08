@@ -9,7 +9,7 @@
  * encoding through one reaches it). The guest keeps no commands of its own: each CPU encode, a
  * setter or a draw on a command, reaches the host's buffer before the next command buffer the
  * process posts, so a command buffer sees every encode made before its commit, as on every Mac
- * (measured: M3 Max, AMD 5300M, Intel 630; docs in crates/reims-graphics/src/icb.rs). Where the
+ * (measured: M3 Max, AMD 5300M, Intel 630; docs in crates/reims-vgpu-graphics/src/icb.rs). Where the
  * device took ICB_SLOTS, an encode is written into the command's slot in a block of the
  * process's region, as a GPU's driver writes a command's record, and the flush before a commit
  * names the commands written (RgfxIcbSlotTable.hpp); else, and for a buffer whose shape a slot does

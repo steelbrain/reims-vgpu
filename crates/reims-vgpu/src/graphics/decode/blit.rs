@@ -1,4 +1,4 @@
-//! The blit-encoder op decoder: one arm per [`reims_graphics::ops::blit`] op,
+//! The blit-encoder op decoder: one arm per [`reims_vgpu_graphics::ops::blit`] op,
 //! turning a wire op into a `BlitCmd` on the open `P::BlitEncoder`
 //! (docs/graphics-kext/design.md, "Stage 3 wire protocol"). The command-buffer
 //! walk ([`super::cmdbuf`]) routes every blit-group op
@@ -14,14 +14,14 @@
 //! `ENCODER_END` (`endEncoding`, [`super::cmdbuf`]), so `BlitCmd::EndEncoding` has no
 //! arm here; every other `MTLBlitCommandEncoder` selector does.
 //!
-//! [`RGFX_OP_GROUP_BLIT`]: reims_graphics::ops::RGFX_OP_GROUP_BLIT
+//! [`RGFX_OP_GROUP_BLIT`]: reims_vgpu_graphics::ops::RGFX_OP_GROUP_BLIT
 
-use reims_graphics::ops::blit::*;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
 use reims_vgpu_core::platform::host_range::HostRange;
 use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_graphics::ops::blit::*;
 use zerocopy::FromBytes;
 
 use super::{GraphicsDecoder, op_fault};
@@ -44,7 +44,7 @@ fn short_body(tag: u16) -> Raise {
 }
 
 /// Decodes one blit-encoder op: `tag` its op, `payload` its body (the bytes after
-/// the [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)). `objs` resolves object
+/// the [`RgfxOpHeader`](reims_vgpu_graphics::ops::RgfxOpHeader)). `objs` resolves object
 /// references, `enc` is the open blit encoder, and `on` says how an encode's raise
 /// is taken. `Ok(true)` when the op was handled, `Ok(false)` for an unknown tag
 /// (the walk then faults); a platform raise propagates as `Err`.
@@ -530,17 +530,17 @@ fn clear_color(bits: [u64; 4]) -> ClearColor {
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::ops::{RGFX_OP_BODY_OFFSET, RgfxOpHeader};
-    use reims_graphics::wire::{
-        RGFX_CMD_BUFFER_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate,
-        RgfxMsgHeader, RgfxObjectCreate, RgfxTextureCreate, RgfxTextureDescriptor,
-    };
     use reims_vgpu_core::platform::Handle;
     use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
     use reims_vgpu_core::platform::device::GpuDevice;
     use reims_vgpu_core::platform::values::IcbDesc;
     use reims_vgpu_core::testkit::FakePlatform;
     use reims_vgpu_core::testkit::calllog::Arg;
+    use reims_vgpu_graphics::ops::{RGFX_OP_BODY_OFFSET, RgfxOpHeader};
+    use reims_vgpu_graphics::wire::{
+        RGFX_CMD_BUFFER_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate,
+        RgfxMsgHeader, RgfxObjectCreate, RgfxTextureCreate, RgfxTextureDescriptor,
+    };
     use zerocopy::IntoBytes;
 
     use super::super::ObjHandle;
@@ -558,7 +558,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
 
         for id in [2, 3] {

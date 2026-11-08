@@ -1,5 +1,5 @@
 //! The display pipe's colour: what the guest's display does to the pixels it shows, as the
-//! display pipe's transactions set it (`DISPLAY_COLOR`, `reims_graphics::wire`'s
+//! display pipe's transactions set it (`DISPLAY_COLOR`, `reims_vgpu_graphics::wire`'s
 //! [`RgfxDisplayColor`]). Four stages apply in order, after the surface's own colour: plane 0's
 //! gamma table, the pipe's gamma table before its colour matrix, the colour matrix, and the gamma
 //! table after it. Each is off (it passes its input through) until a transaction sets it, and keeps
@@ -35,7 +35,7 @@
 
 use std::sync::Arc;
 
-use reims_graphics::wire::{
+use reims_vgpu_graphics::wire::{
     RGFX_COLOR_MATRIX, RGFX_COLOR_MAX_ENTRIES, RgfxColorEntry, RgfxDisplayColor,
 };
 
@@ -184,7 +184,7 @@ impl ColorStaging {
 
 #[cfg(test)]
 mod tests {
-    use reims_graphics::wire::{RGFX_COLOR_POST_GAMMA, RGFX_COLOR_PRE_GAMMA};
+    use reims_vgpu_graphics::wire::{RGFX_COLOR_POST_GAMMA, RGFX_COLOR_PRE_GAMMA};
 
     use super::*;
 
