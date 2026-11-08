@@ -55,7 +55,12 @@
 //!   texels alone, each plane's rows' bytes ([`texel_spans`]): the bytes beside them, between
 //!   rows or outside the planes, are the guest's CPU's alone, as no texture's texel lies there
 //!   and the device makes no buffer over an IOSurface, so they stay as it wrote them, whatever a
-//!   render over the cache leaves in its own. A fill copies every byte in.
+//!   render over the cache leaves in its own. A fill copies every byte in. Nothing else reads
+//!   those bytes of the cache, so its buffer declares them unobserved
+//!   ([`GpuDevice::new_buffer_of_length_padding_unobserved`]): a texture over it whose rows lie
+//!   with bytes between them may hold and change them, and lies over the cache's memory where
+//!   the platform would otherwise make it a copy of its own (on the Vulkan platform, metal2vulkan's
+//!   shadow, which each command buffer copies in before its use and back after its write).
 //!   A download or a release copies nothing where, as its copy is made (at once, or in the
 //!   finish of a buffer begun before it), the CPU's generation in the block's header
 //!   ([`CPU_GEN_OFFSET`]) has moved past the cache's: the lock that asked gave up waiting for the
@@ -120,6 +125,7 @@
 //!   command buffer of its own, and a refused copy by runs encodes nothing in it.
 //!
 //! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
+//! [`GpuDevice::new_buffer_of_length_padding_unobserved`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_buffer_of_length_padding_unobserved
 //!
 //! What the guest observes is IOSurface's contract under its locks: a lock after a GPU write sees
 //! it, and a GPU use after a read-write lock sees the CPU's writes. A CPU write made without a
@@ -996,7 +1002,7 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             self.released(device, block, 0, None, None, Box::new(|| {}))?;
         }
-        let Some(cache) = self.new_cache(device, length)? else {
+        let Some(cache) = self.new_cache(device, length, layout.is_some())? else {
             return Ok(false);
         };
         let Some(pages) = pages()? else {
@@ -1112,7 +1118,7 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         let room = self.deferred_budget.saturating_sub(self.deferred_bytes);
         let made = if length <= room {
-            self.new_cache(device, length)?
+            self.new_cache(device, length, false)?
         } else {
             None
         };
@@ -1304,9 +1310,18 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// A new cache's buffer of `length` bytes, Private: exportable where the host's video
-    /// imports caches ([`Caches::set_exportable`]) and the platform makes one, else as any other
-    /// buffer.
-    fn new_cache(&mut self, device: &P::Device, length: u64) -> RaiseResult<Option<P::Buffer>> {
+    /// imports caches ([`Caches::set_exportable`]) and the platform makes one; else, where
+    /// `laid_out` (the kext's ask gave the surface's layout, so the cache's copies into the pages
+    /// take its texels alone: [`SurfaceCache::texels`]), one that declares the bytes between a
+    /// texture's rows unobserved, which a texture over the cache whose rows lie with bytes
+    /// between them may hold and change in place
+    /// ([`GpuDevice::new_buffer_of_length_padding_unobserved`]); else as any other buffer.
+    fn new_cache(
+        &mut self,
+        device: &P::Device,
+        length: u64,
+        laid_out: bool,
+    ) -> RaiseResult<Option<P::Buffer>> {
         #[cfg(unix)]
         if self.exportable {
             let made = device.new_exportable_buffer_of_length(ON, length, STORAGE_PRIVATE)?;
@@ -1316,7 +1331,10 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             self.counts.unexportable += 1;
         }
-        device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)
+        match laid_out {
+            true => device.new_buffer_of_length_padding_unobserved(ON, length, STORAGE_PRIVATE),
+            false => device.new_buffer_of_length(ON, length, STORAGE_PRIVATE),
+        }
     }
 
     /// Whether the block at `block` has a cache.
@@ -5815,6 +5833,49 @@ mod tests {
                 (2 * pitch, 2 * pitch, texels)
             ]
         );
+    }
+
+    /// A cache made for a block the device answered a cache with its surface's layout is a buffer
+    /// that declares the bytes between a texture's rows unobserved, as its copies into the pages
+    /// take the texels alone, so a texture over it whose rows lie with bytes between them lies in
+    /// place; a cache of a block named cached with no layout is made as any other buffer
+    #[test]
+    fn a_laid_out_caches_buffer_declares_the_bytes_between_rows_unobserved() {
+        use super::super::surface_pages::tests::one_plane;
+        use reims_vgpu_graphics::wire::RGFX_STATUS_CACHE;
+        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
+        use reims_vgpu_vulkan::core::testkit::impls::device::PADDING_UNOBSERVED_BUFFER;
+        const NEW_BUFFER: &str = "newBufferWithLength:options:";
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.set_unified_memory(true);
+        let world = Arc::clone(r.p.world());
+        world.answer_surface_pages(PagesInPlace::No("the rows end inside a line".into()));
+        let made = |r: &Rig, mark: u64| {
+            let calls = r.p.call_log().since(mark);
+            let count = |sel: &str| calls.iter().filter(|c| c.sel == sel).count();
+            (count(PADDING_UNOBSERVED_BUFFER), count(NEW_BUFFER))
+        };
+        let layout = one_plane(page, page - 48, 3);
+        assert_eq!(
+            r.pages_asking(BLOCK, &[(1, 4)], 4 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 4)], 4 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(made(&r, mark), (1, 0), "laid out: declared");
+
+        let other = BLOCK + 0x8000;
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_cached(other, &[(8, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.caches().has(other));
+        assert_eq!(made(&r, mark), (0, 1), "no layout: as any other buffer");
     }
 
     /// The (source offset, destination offset, size) of each copy in `calls`.

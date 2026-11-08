@@ -663,6 +663,36 @@ impl VulkanDevice {
         Some(self.texture_of(raw, None, 0, Arc::new(metal_space::Hold::NONE)))
     }
 
+    /// `newBufferWithLength:options:`'s buffer (`new_buffer_of_length`), declaring the bytes
+    /// between a texture's rows over it unobserved where `padding_unobserved`
+    /// (`new_buffer_of_length_padding_unobserved`).
+    fn buffer_of_length(
+        &self,
+        length: u64,
+        options: u64,
+        padding_unobserved: bool,
+    ) -> RaiseResult<Option<VulkanBuffer>> {
+        let sel = "newBufferWithLength:options:";
+        let options = crate::gpu::resource_options(sel, options);
+        let (placement, mut placing) = metal_space::placing(length, own_bytes(options), None);
+        let pool = pool_slot(sel, &self.raw, &mut placing)?;
+        let descriptor = rt::BufferDescriptor::new(length, options, rt::BufferContents::Zero)
+            .with_placement(placement);
+        let descriptor = match padding_unobserved {
+            true => descriptor.with_padding_unobserved(),
+            false => descriptor,
+        };
+        let descriptor = with_token(in_slot(descriptor, &pool), placing.token());
+        let made = create_buffer(
+            sel,
+            placed_nil(&placing, Nil::BufferLength),
+            placing.pin_refused(),
+            || self.raw.new_buffer_with_descriptor(descriptor),
+        );
+        metal_space::let_go(pool);
+        made.map(|b| b.map(|raw| self.buffer(raw, None)))
+    }
+
     /// The handle of a buffer this device made, over `surface` when it was made on one.
     pub(crate) fn buffer(&self, raw: rt::Buffer, surface: Option<Arc<OsSurface>>) -> VulkanBuffer {
         let id = raw.object_id();
@@ -1128,21 +1158,22 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         length: u64,
         options: u64,
     ) -> RaiseResult<Option<VulkanBuffer>> {
-        let sel = "newBufferWithLength:options:";
-        let options = crate::gpu::resource_options(sel, options);
-        let (placement, mut placing) = metal_space::placing(length, own_bytes(options), None);
-        let pool = pool_slot(sel, &self.raw, &mut placing)?;
-        let descriptor = rt::BufferDescriptor::new(length, options, rt::BufferContents::Zero)
-            .with_placement(placement);
-        let descriptor = with_token(in_slot(descriptor, &pool), placing.token());
-        let made = create_buffer(
-            sel,
-            placed_nil(&placing, Nil::BufferLength),
-            placing.pin_refused(),
-            || self.raw.new_buffer_with_descriptor(descriptor),
-        );
-        metal_space::let_go(pool);
-        made.map(|b| b.map(|raw| self.buffer(raw, None)))
+        self.buffer_of_length(length, options, false)
+    }
+
+    /// As `new_buffer_of_length`'s, with the runtime's declaration that the bytes between the
+    /// rows and slices of a texture over the buffer are unobserved
+    /// (`BufferDescriptor::with_padding_unobserved`): a texture whose rows lie with bytes between
+    /// them is then a linear image over the buffer's memory that holds them, where the device
+    /// lays one out at the texture's rows (`WorkCounts::unobserved_padding_aliases`), and not a
+    /// shadow (`TextureShadowReason::BytesBetweenRows`).
+    fn new_buffer_of_length_padding_unobserved(
+        &self,
+        _on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<VulkanBuffer>> {
+        self.buffer_of_length(length, options, true)
     }
 
     /// The runtime's exportable buffer (`new_exportable_buffer`): a block of its own, exportable
@@ -2513,6 +2544,73 @@ pub(crate) mod tests {
             );
             assert_eq!(at(0x4fff).read(), 0x5c);
             assert_eq!(at(0x5000).read(), 0, "past the buffer");
+        }
+    }
+
+    /// A texture whose rows lie with bytes between them, over a Private buffer that declares those
+    /// bytes unobserved (`new_buffer_of_length_padding_unobserved`, the graphics lane's laid-out
+    /// device caches), is an image over the buffer's memory that holds them, where the device's
+    /// own linear images lay their rows at the texture's pitch: the runtime counts it among the
+    /// images that do (`unobserved_padding_aliases`) and shadows nothing. Over a buffer made as
+    /// any other the same texture is a shadow (`BytesBetweenRows`), counted among the shadowed
+    /// textures. The rows lie as the guest's surfaces' do on a host that answers its linear row
+    /// alignment (`linear_row_alignment`): one texel past the alignment, a row of `BGRA8Unorm`
+    /// texels 4 bytes past it, in rows twice it apart. Where it is past Metal's 16 bytes the
+    /// device's images lay their rows at its multiples (the runtime's probe of them: 256 on
+    /// RADV), so at the texture's pitch. At 16 bytes a device may lay them tighter (ANV lays them
+    /// 4 bytes apart), its image of the texture lying at another pitch, and the texture is a
+    /// shadow over either buffer
+    #[test]
+    fn a_texture_over_a_buffer_with_padding_unobserved_lies_over_its_memory() {
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::values::TextureDesc;
+
+        use crate::platform::tests::platform;
+
+        const PRIVATE: u64 = 0x20;
+        let d = dev();
+        let align = d.linear_row_alignment();
+        assert!(align >= 16 && align.is_power_of_two(), "{align}");
+        let (width, height, pitch) = (align / 4 + 1, 8, 2 * align);
+        // The checks the device starts make images of their own: they end before the counts are
+        // read, so only this test's textures move them.
+        #[cfg(target_os = "linux")]
+        settle_device_checks(&d);
+        let desc = platform().texture_descriptor(&TextureDesc {
+            pixel_format: 80,
+            width,
+            height,
+            usage: 0x5,
+            resource_options: Some(PRIVATE),
+            ..TextureDesc::default()
+        });
+        let counts = || {
+            let counts = d.raw.work_counts();
+            (counts.unobserved_padding_aliases, counts.shadowed_textures)
+        };
+        let texture_over = |buffer: Option<VulkanBuffer>| {
+            let before = counts();
+            let texture = (buffer.expect("a buffer")).new_texture(OnFault::Return, &desc, 0, pitch);
+            assert!(matches!(texture, Ok(Some(_))), "a texture");
+            let after = counts();
+            (after.0 - before.0, after.1 - before.1)
+        };
+        let length = pitch * height;
+        let declared = d.new_buffer_of_length_padding_unobserved(OnFault::Return, length, PRIVATE);
+        let declared = texture_over(declared.unwrap());
+        let plain = texture_over(
+            d.new_buffer_of_length(OnFault::Return, length, PRIVATE)
+                .unwrap(),
+        );
+        assert_eq!(plain, (0, 1), "a shadow over a buffer made as any other");
+        if align > 16 {
+            assert_eq!(declared, (1, 0), "over the buffer's memory, at {align}");
+        } else {
+            assert!(
+                declared == (1, 0) || declared == (0, 1),
+                "over its memory or a shadow: {declared:?}"
+            );
         }
     }
 

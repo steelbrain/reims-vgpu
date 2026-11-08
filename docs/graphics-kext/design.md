@@ -573,7 +573,13 @@ Stages:
       into the pages copy the surface's texels alone, each plane's rows from
       the layout the ask gave, so the bytes between rows stay as the guest's
       CPU wrote them, whatever a render over the cache leaves in its own
-      (`decode/surface_cache.rs`, "Download"). A block asked with no
+      (`decode/surface_cache.rs`, "Download"). So the cache's buffer
+      declares the bytes between a texture's rows unobserved
+      (`GpuDevice::new_buffer_of_length_padding_unobserved`; metal2vulkan's
+      `BufferDescriptor::padding_unobserved`), and a texture over it whose
+      rows lie with bytes between them, the desktop's among them, is an
+      image over the cache's own memory that holds them, not another copy
+      of the texels. A block asked with no
       layout (an older bundle's) stays in place, as every block of such a
       host did before (`reims-vgpu`'s `graphics/decode/surface_pages.rs`,
       "Device caches where the pages cannot serve").

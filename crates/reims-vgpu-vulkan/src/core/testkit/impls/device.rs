@@ -37,6 +37,10 @@ use crate::core::raise::{OnFault, RaiseResult};
 /// of Metal's names it.
 pub const UNSHARED_QUEUE: &str = "newCommandQueue (unshared)";
 
+/// The name the fake logs and scripts [`GpuDevice::new_buffer_of_length_padding_unobserved`]
+/// under: no selector of Metal's names it.
+pub const PADDING_UNOBSERVED_BUFFER: &str = "newBufferWithLength:options: (padding unobserved)";
+
 /// A device's model: its capabilities.
 #[derive(Debug)]
 pub struct DeviceModel {
@@ -167,6 +171,22 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         self.make(
             Policy::On(on),
             "newBufferWithLength:options:",
+            vec![Arg::U64(length), Arg::U64(options)],
+            |w| new_buffer(w, length, options, Backing::Fresh, None),
+        )
+    }
+
+    /// Logged and scripted under [`PADDING_UNOBSERVED_BUFFER`], as no selector of Metal's names
+    /// it; its buffer is `newBufferWithLength:options:`'s.
+    fn new_buffer_of_length_padding_unobserved(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
+        self.make(
+            Policy::On(on),
+            PADDING_UNOBSERVED_BUFFER,
             vec![Arg::U64(length), Arg::U64(options)],
             |w| new_buffer(w, length, options, Backing::Fresh, None),
         )

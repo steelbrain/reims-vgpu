@@ -125,6 +125,23 @@ pub trait GpuDevice<P: Platform>: Handle {
         let _ = (on, length, options);
         Ok(None)
     }
+    /// No Metal counterpart: a buffer as [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s,
+    /// that declares the bytes between the rows (and slices) of a texture over it unobserved: a
+    /// texture whose rows lie with bytes of the buffer between them may hold those bytes in its
+    /// memory, and change them, and so lies over the buffer's memory where the platform would
+    /// otherwise make it a copy of its own. The graphics lane makes a device cache so where the
+    /// kext's ask gave its surface's layout, as its copies into the pages take the surface's
+    /// texels alone (`decode::surface_cache`). The default, for a platform with no such
+    /// declaration, makes the buffer as `new_buffer_of_length` does. Reached both under a handler
+    /// and with none: `on` says which this call is.
+    fn new_buffer_of_length_padding_unobserved(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<P::Buffer>> {
+        self.new_buffer_of_length(on, length, options)
+    }
     /// sel: newCommandQueue
     /// Never nil-checked. No path reaches it under a handler: a raise inside it dies at the send.
     fn new_command_queue(&self) -> Option<P::CommandQueue>;
