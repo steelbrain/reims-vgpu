@@ -107,6 +107,16 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
     fn export_memory(&self) -> Result<ExportedMemory, String> {
         Err("the platform exports no buffer's memory".to_owned())
     }
+    /// No Metal counterpart: says that another API wrote the buffer's exported memory
+    /// ([`Buffer::export_memory`]) and that the caller waited for those writes (a CUDA stream's
+    /// synchronize), so that the device's later reads of the buffer see them. Called once after
+    /// each such write, while no command buffer that uses the buffer is in flight. `Ok` by
+    /// default, for a platform whose devices need no acquire of memory another API wrote; `Err`
+    /// says why the platform's device will not read the writes.
+    #[cfg(unix)]
+    fn external_write_done(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A buffer's memory, exported for another API to import ([`Buffer::export_memory`]): an opaque

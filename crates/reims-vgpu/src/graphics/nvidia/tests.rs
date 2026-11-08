@@ -59,8 +59,9 @@ fn copy(
 
 /// Each picture of NVENC's H.264 and HEVC at 1080p lands in an exportable buffer of the runtime
 /// device's, imported once, by NVDEC's copy within the GPU, its rows alone at a pitch of their
-/// own: a copy of the buffer on the runtime's queue reads NVDEC's read back of the picture in
-/// each row, and the bytes past each row as the runtime's fill left them.
+/// own, and said written by another API (`Buffer::external_write_done`), as a landing says it: a
+/// copy of the buffer on the runtime's queue reads NVDEC's read back of the picture in each row,
+/// and the bytes past each row as the runtime's fill left them.
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
@@ -160,6 +161,7 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
                         )
                     };
                     written.expect("the decode").expect("the GPU's copy");
+                    cache.external_write_done().expect("the acquire");
                     copy(&queue, &cache, &read_back, len);
                     let read = picture.read_back((width, height)).expect("a read back");
                     // SAFETY: the Shared buffer's `len` bytes, which the copy above finished

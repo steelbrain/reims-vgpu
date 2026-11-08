@@ -1030,6 +1030,206 @@ mod tests {
         }
     }
 
+    /// A device cache the host's video writes from outside the runtime (NVDEC's copy within the
+    /// GPU, through CUDA's import of the cache's exported memory) reads each picture written
+    /// there through a texture over it: an exportable `Private` buffer, its memory imported into
+    /// a second `VkDevice` of the same physical device, which fills it with a new byte three
+    /// times, each fill waited for and said done (`external_write_done`), and a texture over it
+    /// laid as CoreVideo lays a frame's plane, 32 bytes in, which the runtime keeps as a shadow
+    /// of the bytes rather than a linear image over them, sampled by a kernel in a command buffer
+    /// of its own after each fill. Without the call the runtime's shadow kept what its first copy
+    /// in read, as it does where only its own commands write a buffer, and the kernel read the
+    /// first fill's byte after every later one. Linux's: MoltenVK exports no buffer's memory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_device_cache_another_api_writes_reads_each_write_through_a_texture_over_it() {
+        use ash::vk;
+        use std::os::fd::IntoRawFd as _;
+
+        use crate::core::platform::resource::Buffer as _;
+
+        const LENGTH: u64 = 64 * 1024;
+        const OFFSET: u64 = 32;
+        const WIDTH: u64 = 200;
+        const HEIGHT: u64 = 16;
+        const BYTES_PER_ROW: u64 = 256;
+        /// `MTLResourceStorageModePrivate`.
+        const PRIVATE: u64 = 2 << 4;
+        let d = dev();
+        let made = d.new_exportable_buffer_of_length(OnFault::Return, LENGTH, PRIVATE);
+        let cache = made.expect("no raise").expect("an exportable buffer");
+        let exported = cache.export_memory().expect("its memory");
+        // The export's memory type, which the import names: the runtime's own answer.
+        let memory_type_index = (cache.raw.export_memory_fd())
+            .expect("its memory")
+            .memory_type_index;
+        let desc = platform().texture_descriptor(&TextureDesc {
+            pixel_format: 10,
+            width: WIDTH,
+            height: HEIGHT,
+            usage: 1,
+            resource_options: Some(PRIVATE),
+            ..TextureDesc::default()
+        });
+        let texture = (cache.new_texture(OnFault::Return, &desc, OFFSET, BYTES_PER_ROW))
+            .expect("no raise")
+            .expect("an R8Unorm texture over the cache");
+        let sampler = {
+            let mut desc = SamplerDescriptor::default();
+            desc.s_address_mode = SamplerAddressMode::ClampToEdge;
+            desc.t_address_mode = SamplerAddressMode::ClampToEdge;
+            Obj::new(d.raw.new_sampler_state(&desc).unwrap())
+        };
+        let k = pipeline(SAMPLE, "sample_k");
+
+        // SAFETY: the handles are used while `d` lives; the second device is the test's own and
+        // destroyed below, after its work.
+        let handles = unsafe { d.raw.raw() };
+        let (instance, physical) = (handles.instance, handles.physical_device);
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut features12);
+        // SAFETY: the physical device is the instance's.
+        unsafe { instance.get_physical_device_features2(physical, &mut features) };
+        let device_address = features12.buffer_device_address == vk::TRUE;
+        let family = handles.queue_family;
+        let priorities = [1.0];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(family)
+            .queue_priorities(&priorities)];
+        let extensions = [ash::khr::external_memory_fd::NAME.as_ptr()];
+        let mut enabled12 =
+            vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(device_address);
+        let info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queues)
+            .enabled_extension_names(&extensions)
+            .push_next(&mut enabled12);
+        // SAFETY: the physical device is the instance's and lists the extension (the export ran).
+        let second = unsafe { instance.create_device(physical, &info, None) }.expect("a device");
+        // The buffer the import binds, made as the runtime makes an exportable one: a dedicated
+        // import names a buffer of the same parameters.
+        use vk::BufferUsageFlags as U;
+        let mut usage = U::TRANSFER_SRC
+            | U::TRANSFER_DST
+            | U::UNIFORM_BUFFER
+            | U::STORAGE_BUFFER
+            | U::UNIFORM_TEXEL_BUFFER
+            | U::STORAGE_TEXEL_BUFFER
+            | U::INDEX_BUFFER
+            | U::VERTEX_BUFFER
+            | U::INDIRECT_BUFFER;
+        if device_address {
+            usage |= U::SHADER_DEVICE_ADDRESS;
+        }
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(LENGTH)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external);
+        // SAFETY: the second device is live and the info valid for it.
+        let imported = unsafe { second.create_buffer(&buffer_info, None) }.expect("a buffer");
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
+            .fd(exported.fd.into_raw_fd());
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(imported);
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(exported.allocation_size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import);
+        if exported.dedicated {
+            allocate = allocate.push_next(&mut dedicated);
+        }
+        if device_address {
+            allocate = allocate.push_next(&mut flags);
+        }
+        // SAFETY: the descriptor is the export's, of the same physical device, its size and type
+        // the allocation's; the import owns it once made.
+        let memory = unsafe { second.allocate_memory(&allocate, None) }.expect("the import");
+        // SAFETY: the buffer and the memory are the second device's; the cache lies at the
+        // export's offset in the allocation.
+        unsafe { second.bind_buffer_memory(imported, memory, exported.offset) }.expect("bound");
+        // SAFETY: the family is the second device's, made with one queue.
+        let queue = unsafe { second.get_device_queue(family, 0) };
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(family)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        // SAFETY: as above.
+        let pool = unsafe { second.create_command_pool(&pool_info, None) }.expect("a pool");
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: as above.
+        let command = unsafe { second.allocate_command_buffers(&allocate_info) }.expect("one")[0];
+        // The second device fills the cache's bytes with `byte` and waits for it.
+        let fill = |byte: u8| {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            let commands = [command];
+            let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+            // SAFETY: the command buffer is the second device's, recorded and submitted here
+            // alone, its fill within the imported buffer; the queue is waited idle before the
+            // next recording.
+            unsafe {
+                second.begin_command_buffer(command, &begin).unwrap();
+                second.cmd_fill_buffer(command, imported, 0, LENGTH, u32::from(byte) * 0x0101_0101);
+                second.end_command_buffer(command).unwrap();
+                second
+                    .queue_submit(queue, &submit, vk::Fence::null())
+                    .unwrap();
+                second.queue_wait_idle(queue).unwrap();
+            }
+        };
+
+        // Each fill's byte, and the words the kernel sampled after it.
+        let mut read = Vec::new();
+        for byte in [0x11u8, 0x22, 0x33] {
+            fill(byte);
+            cache.external_write_done().expect("the acquire");
+            let out = shared(32);
+            run_serial(vec![
+                ComputeCmd::SetComputePipelineState { state: Some(&k) },
+                ComputeCmd::SetTexture {
+                    texture: Some(&texture),
+                    index: 0,
+                },
+                ComputeCmd::SetSamplerStates {
+                    samplers: &[Some(&sampler)],
+                    range: NsRange::new(0, 1),
+                },
+                ComputeCmd::SetBuffers {
+                    buffers: &[Some(&out)],
+                    offsets: &[0],
+                    range: NsRange::new(0, 1),
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: MtlSize::new(8, 1, 1),
+                    threads_per_threadgroup: MtlSize::new(8, 1, 1),
+                },
+            ]);
+            read.push((byte, words(&out)));
+        }
+        // SAFETY: the second device's objects, its queue idle; the cache outlives the import.
+        unsafe {
+            second.destroy_command_pool(pool, None);
+            second.destroy_buffer(imported, None);
+            second.free_memory(memory, None);
+            second.destroy_device(None);
+        }
+        // An R8Unorm texel sampled and packed as unorm4x8: the byte, zeros, and an alpha of one.
+        let wrong: Vec<_> = (read.iter())
+            .filter(|(byte, words)| words.iter().any(|&w| w != u32::from(*byte) | 0xff00_0000))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "(the byte written, the words sampled after it) on {}: {wrong:x?}",
+            d.raw.name()
+        );
+    }
+
     /// A nil pipeline, slices of another length than their range, a scope no Metal value is and
     /// a command after endEncoding, predication's too, die at their selectors
     #[test]

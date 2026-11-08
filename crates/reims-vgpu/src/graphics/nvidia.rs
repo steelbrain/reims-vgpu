@@ -31,7 +31,9 @@
 //!     in device caches (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`) and has the device's caches made
 //!     exportable as they are made, so the guest asks its outputs cached, and a picture is copied
 //!     within the GPU into the cache's memory, imported once a cache and let go of as the cache
-//!     goes ([`VideoPlane::cache`](super::decode::VideoPlane::cache)).
+//!     goes ([`VideoPlane::cache`](super::decode::VideoPlane::cache)). Once the copy is done, each
+//!     cache it wrote is said written by another API (`Buffer::external_write_done`), for the
+//!     device's later reads of it to see the picture.
 //!   - **In the output's pages**, where both planes lie in pages a device reaches in place
 //!     ([`PlanePages`](super::PlanePages)): their view registered with CUDA, once a mapping, and
 //!     written by DMA.
@@ -527,7 +529,16 @@ impl NvdecPicture {
             (self.picture).write_into_device(size, luma_plane, chroma_plane, Box::new(()))
         };
         match written? {
-            Ok(()) => Ok(true),
+            // The copies are done (the write waited for them): the device's reads of each cache
+            // see them once the platform acquired what CUDA wrote, said before the session's
+            // signal lets a command buffer read the picture.
+            Ok(()) => {
+                luma.buffer.external_write_done()?;
+                if chroma_cache.key() != luma_cache.key() {
+                    chroma.buffer.external_write_done()?;
+                }
+                Ok(true)
+            }
             Err(why) => {
                 self.decline(&why);
                 Ok(false)

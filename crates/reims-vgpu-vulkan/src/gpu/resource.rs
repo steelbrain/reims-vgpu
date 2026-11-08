@@ -1332,6 +1332,14 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
             dedicated: exported.dedicated,
         })
     }
+
+    /// The runtime's acquire of what another API wrote into the buffer's exported memory
+    /// (`external_write_done`), which the device's next submission records before its commands,
+    /// and after which a shadow of a texture over the buffer's bytes copies them in again at its
+    /// next use in a command buffer committed after the call.
+    fn external_write_done(&self) -> Result<(), String> {
+        plain(|| self.raw.external_write_done()).map_err(|error| error.to_string())
+    }
 }
 
 impl GpuResource<VulkanPlatform> for VulkanTexture {
