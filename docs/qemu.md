@@ -337,8 +337,16 @@ Measured on msi-5080 (CachyOS, Linux 7.2.8; transparent huge pages
   page, against 10.9 GiB (14.5 to 15.0 GiB at the end of the playback
   without prealloc).
 
+Through `reims-ctl`, installed by `scripts/install-ctl.sh` (macos-26.7.2,
+8 GiB, 8 vCPUs; 2026-11-08): on um870 (Radeon 780M) QEMU reached its first
+vCPU thread 0.53 s after its start and `reims-ctl start` returned in 0.8 s;
+on ms01 (Iris Xe) `start` returned in 8.9 s. Both reached the desktop with
+all of the guest's RAM in 2 MiB pages.
+
 A host without the free memory for a VM's RAM now refuses the VM as QEMU
-starts, where before it overcommitted.
+starts, where before it overcommitted: the kernel kills QEMU during the
+allocation, and `reims-ctl start` says what the VM needs and what the host
+has available (seen with an 8 GiB VM in a 3 GiB memory cgroup on um870).
 
 ### Linux hosts: `vm.max_map_count`
 
