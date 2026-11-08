@@ -361,11 +361,11 @@ fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
 }
 
 /// What a create that gives macOS on an existing disk a new OpenCore image presenting a Mac of
-/// its own says, where no image the disk booted from is beside it ([`disks_mac`]): the image
-/// presents a new serial number, MLB and UUID, so the disk's macOS boots on a Mac it has not run
-/// on, and runs Setup Assistant once at that boot. While Setup Assistant is open, macOS shuts
-/// down at neither the keys nor the power button [`crate::runtime::stop`] sends, so a stop then
-/// ends in a power-off at its timeout.
+/// its own says, where it keeps no Mac of the disk's ([`disks_mac`]): the image presents a new
+/// serial number, MLB and UUID, so the disk's macOS boots on a Mac it has not run on, and runs
+/// Setup Assistant once at that boot. While Setup Assistant is open, macOS shuts down at neither
+/// the keys nor the power button [`crate::runtime::stop`] sends, so a stop then ends in a
+/// power-off at its timeout.
 /// Measured with a macOS 26.7.2 (25G332) disk on a Radeon 780M host, 2026-11-07: on a new image,
 /// Setup Assistant (`-MiniBuddyYes`) ran from about 10 s after boot, and the guest ignored the
 /// keys and the button for 180 s, and System Events' `shut down` for 120 s, while `sudo shutdown
@@ -374,10 +374,9 @@ fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
 /// shut it down within 20 s. None where the disk is new, or an image is given.
 fn new_mac_note(spec: &Spec) -> Option<&'static str> {
     (matches!(spec.disk, Some(DiskSource::Existing { .. })) && spec.opencore.is_none()).then_some(
-        "macOS on this disk will boot on a new Mac (a new serial number and UUID), as the \
-         OpenCore image it booted from is not beside it (opencore.qcow2), so it opens Setup \
-         Assistant once: finish it in the VM's window, since until then it does not shut down \
-         when asked. --opencore with the image the disk booted from keeps its Mac",
+        "macOS on this disk will boot on a new Mac (a new serial number and UUID), so it opens \
+         Setup Assistant once: finish it in the VM's window, since until then it does not shut \
+         down when asked. --opencore with the image the disk booted from keeps its Mac",
     )
 }
 
@@ -394,16 +393,28 @@ fn image_beside(disk: &Path) -> Option<PathBuf> {
 /// The Mac macOS on an existing disk ran on, where the create is given no image: the one the
 /// image beside the disk presents ([`image_beside`]), with that image. The VM's image is made to
 /// present it, so the disk's macOS boots on the Mac it knows and opens no Setup Assistant, which
-/// would hold up its shutdowns ([`new_mac_note`]). `progress` hears why an image beside the disk
-/// is not taken.
+/// would hold up its shutdowns ([`new_mac_note`]). None for a copy of the disk of a VM reims-ctl
+/// has ([`vm_with_disk`]): that copy runs beside the VM, so it is a Mac of its own, as two VMs
+/// running as one Mac would be one Mac to Apple's services, which know a Mac by its serial
+/// number, MLB and ROM. A VM given that disk in place runs the VM's own macOS, never beside it
+/// (runtime.rs refuses a start on a disk another VM runs on), so it keeps the Mac. `progress`
+/// hears why an image beside the disk is not taken.
 fn disks_mac(spec: &Spec, progress: &mut dyn FnMut(&str)) -> Option<(PathBuf, Identity)> {
-    let Some(DiskSource::Existing { path, .. }) = &spec.disk else {
+    let Some(DiskSource::Existing { path, mode }) = &spec.disk else {
         return None;
     };
     if spec.opencore.is_some() {
         return None;
     }
     let image = image_beside(path)?;
+    if *mode == ImportMode::Copy
+        && let Some(vm) = vm_with_disk(path)
+    {
+        progress(&format!(
+            "this is a copy of {vm}'s disk, so it runs beside {vm} as a Mac of its own"
+        ));
+        return None;
+    }
     match ImageFormat::detect(&image)
         .and_then(|f| opencore::Config::read(&image, f))
         .and_then(|c| c.identity())
@@ -417,6 +428,16 @@ fn disks_mac(spec: &Spec, progress: &mut dyn FnMut(&str)) -> Option<(PathBuf, Id
             None
         }
     }
+}
+
+/// The VM of those reims-ctl has whose disk `disk` is, by name.
+fn vm_with_disk(disk: &Path) -> Option<String> {
+    let disk = std::fs::canonicalize(disk).ok()?;
+    Registry::load().ok()?.vms.iter().find_map(|e| {
+        let vm = Vm::load(&e.dir).ok()?;
+        let theirs = std::fs::canonicalize(vm.path(&vm.config.disk)).ok()?;
+        (theirs == disk).then(|| e.name.clone())
+    })
 }
 
 /// The network card address a Mac's ROM is (12 hex digits), as a Mac's ROM is its first network
@@ -765,7 +786,9 @@ mod tests {
     /// the VM's network card that Mac's ROM: macOS on the disk sees no new Mac, so it opens no
     /// Setup Assistant, which held up every stop (`new_mac_note`). Where no image is beside the
     /// disk, the image presents a Mac of its own, with the VM's card as its ROM, and the create
-    /// says what that does. A MAC given is the VM's either way.
+    /// says what that does. A MAC given is the VM's either way. A copy of the disk of a VM
+    /// reims-ctl has runs beside that VM, so it is a Mac of its own; given in place, that disk
+    /// keeps its Mac.
     #[test]
     fn a_disk_keeps_the_mac_of_the_image_beside_it() {
         use crate::host::{Arch, Os};
@@ -773,12 +796,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let env = crate::testenv::Env::new("create-disks-mac");
         let args = env.root.join("args");
+        let made = env.root.join("made.qcow2");
+        std::fs::write(&made, qcow2(&image(plist("").as_bytes()))).unwrap();
         let util = env.root.join("reims-util");
         let script = format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\n\
-             while [ \"$1\" != -o ]; do shift; done\necho made > \"$2\"\n\
+             while [ \"$1\" != -o ]; do shift; done\ncp '{made}' \"$2\"\n\
              echo '{{\"event\":\"done\",\"result\":{{}}}}'\n",
             args = args.display(),
+            made = made.display(),
         );
         std::fs::write(&util, script).unwrap();
         std::fs::set_permissions(&util, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -799,19 +825,19 @@ mod tests {
         let alone = env.root.join("alone");
         std::fs::create_dir_all(&alone).unwrap();
         std::fs::write(alone.join("disk.img"), b"a disk").unwrap();
-        let create_from = |name: &str, disk: PathBuf, mac: Option<&str>| {
+        let create_in = |name: &str, disk: PathBuf, mode: ImportMode, mac: Option<&str>| {
             let mut spec = Spec::new(name);
             spec.dir = Some(env.root.join("vms").join(name));
-            spec.disk = Some(DiskSource::Existing {
-                path: disk,
-                mode: ImportMode::Copy,
-            });
+            spec.disk = Some(DiskSource::Existing { path: disk, mode });
             spec.mac = mac.map(String::from);
             let mut said = Vec::new();
             let vm = create(spec, host, &mut |s| said.push(s.to_string())).unwrap();
             let given = std::fs::read_to_string(&args).unwrap();
             let given: Vec<String> = given.lines().map(String::from).collect();
             (vm, given, said.join("\n"))
+        };
+        let create_from = |name: &str, disk: PathBuf, mac: Option<&str>| {
+            create_in(name, disk, ImportMode::Copy, mac)
         };
         let value = |given: &[String], flag: &str| {
             given
@@ -851,6 +877,18 @@ mod tests {
         assert_eq!(value(&given, "--serial"), None);
         assert_eq!(value(&given, "--rom"), Some(vm.config.network.mac.clone()));
         assert!(said.contains("Setup Assistant"), "{said}");
+
+        // kept's disk, beside the image made for it, which presents the disk's Mac.
+        let kepts = env.root.join("vms/kept/disk.img");
+        let (_, given, said) = create_from("clone", kepts.clone(), None);
+        assert_eq!(value(&given, "--serial"), None);
+        assert!(
+            said.contains("copy of kept's disk") && said.contains("Setup Assistant"),
+            "{said}"
+        );
+        let (_, given, said) = create_in("same", kepts, ImportMode::InPlace, None);
+        assert_eq!(value(&given, "--serial").as_deref(), Some("C02D40VEPN5T"));
+        assert!(!said.contains("Setup Assistant"), "{said}");
     }
 
     #[test]

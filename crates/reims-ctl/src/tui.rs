@@ -1475,7 +1475,7 @@ impl App {
             Field::path("disk_path", "Disk image", "", "A qcow2 or raw image (Tab completes).").show_if("source", &["disk"]),
             Field::choice("disk_mode", "Use the disk by", opts(&[("copy", "Copying it (instant where the file system reflinks)"), ("in-place", "Using it in place")]), "copy", "A copy leaves the image as it was; in place, the VM writes the image itself.")
                 .show_if("source", &["disk"]),
-            Field::path("opencore", "OpenCore image", "", "Empty makes one for this VM, with OVMF, presenting the Mac of the image beside an existing disk (opencore.qcow2, as another VM's directory holds them), else a Mac identity of its own. Or an OpenCore image of yours to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it, such as the one a disk of macOS booted from, which keeps its Mac's identity.")
+            Field::path("opencore", "OpenCore image", "", "Empty makes one for this VM, with OVMF, presenting the Mac of the image beside an existing disk (opencore.qcow2, as a VM's directory holds them), unless the disk is copied from a VM reims-ctl has, else a Mac identity of its own. Or an OpenCore image of yours to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it, such as the one a disk of macOS booted from, which keeps its Mac's identity.")
                 .placeholder("made for this VM"),
         ]);
         fields.extend([
