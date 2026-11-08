@@ -204,8 +204,12 @@ pub struct RvgWindowConfig {
     pub struct_size: u32,
     /// NULL is a table with every callback absent.
     pub callbacks: *const RvgWindowCallbacks,
-    /// The size in pixels the window opens at, and the mode the guest is offered until the
-    /// window's own size is known; 0 in either is 1920 × 1080.
+    /// The size the window opens at, in the host screen's points, not pixels: on a screen of
+    /// scale 2 (Retina) its drawable is twice the size each way. The window is shrunk, its ratio
+    /// kept, to fit the screen's visible area less its title bar, on whole pixels, a multiple of
+    /// 16 wide and of 2 high; a borderless one fills its screen. Until the window's own size in
+    /// pixels is known, the guest is offered this size as its mode, its width rounded down to a
+    /// multiple of 16 and its height to even. 0 in either is 1920 × 1080.
     pub mode_width: u16,
     /// As `mode_width`.
     pub mode_height: u16,
