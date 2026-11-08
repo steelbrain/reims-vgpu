@@ -56,7 +56,9 @@ fn import(
     let (w, h) = (width as usize, height as usize);
     let pitch = (w * format.bytes_per_sample()).next_multiple_of(laid.row_align);
     let chroma_at = (laid.luma_at + pitch * h).next_multiple_of(256);
-    let len = (chroma_at + pitch * h.div_ceil(2)).next_multiple_of(PAGE);
+    // Room past the planes, as a driver may take the buffer for more rows than the surface's
+    // (a CPU mapping of the import past its end faults).
+    let len = (chroma_at + pitch * (h.div_ceil(2) + 64) + 16 * PAGE).next_multiple_of(PAGE);
     let memory = HostMemory::new(len)?;
     let mut descriptor = ffi::VADRMPRIMESurfaceDescriptor {
         fourcc: format.fourcc(),
@@ -336,11 +338,13 @@ fn imported_targets_and_their_references() {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        eprintln!("START {name}: the driver's surfaces");
         let reference = run(&display, stream, None, false);
         let known: Vec<u64> = reference.hashes.iter().map_while(|h| *h).collect();
         reference_pictures += known.len();
         let mut line = format!("{name}: {} pictures", known.len());
         for (i, &(what, laid, scribble)) in ways.iter().enumerate() {
+            eprintln!("START {name}: {what}");
             let got = run(&display, stream, Some(laid), scribble);
             let (same, other, ended, first) = &mut tally[i];
             let (mut stream_same, mut stream_other, mut first_other) = (0, 0, None);
