@@ -481,8 +481,9 @@ fn scattered(pages: &[u64]) -> Vec<Segment> {
         .collect()
 }
 
-/// A granule written after `since` by no one is passed over: none of its pages is read, and
-/// one written after it has its pages read and its written page shown
+/// A granule written after `since` by no one is passed over: none of its pages is read, one
+/// written after it has its pages read and its written page shown, and it is passed over again
+/// from the write's own stamp
 #[test]
 fn a_quiet_granule_reads_no_page() {
     let (log, _) = counted();
@@ -501,9 +502,13 @@ fn a_quiet_granule_reads_no_page() {
     assert_eq!(pages_read(&log) - before, 64, "the written granule alone");
     let before = pages_read(&log);
     assert_eq!(changed(&log, &imp, s2), vec![]);
-    assert_eq!(pages_read(&log) - before, 64, "its peak stays raised");
-    // Before any harvest, a fresh watch reads as written at every earlier stamp.
-    assert_eq!(changed(&log, &import(4 * GRANULE, P), 0), vec![0..P]);
+    assert_eq!(
+        pages_read(&log) - before,
+        0,
+        "quiet again from the write's own stamp"
+    );
+    // A granule no watch holds reads as written, its pages unread.
+    assert_eq!(changed(&log, &import(4 * GRANULE, P), s2), vec![0..P]);
 }
 
 /// A write on either side of a granule boundary shows, whether the segment holding it ends at
