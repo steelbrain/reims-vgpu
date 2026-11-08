@@ -22,6 +22,10 @@
 //!   reims-vgpu no longer has: they read as reims-vgpu's own device ([`Graphics::ReimsVgpu`]),
 //!   and its image, made for apple-gfx, lacks the device's kexts. The new image's save names the
 //!   device.
+//! - Migration 4 makes again the image of every x86-64 VM that lists Lilu, the old graphics
+//!   loader or one of its two shims, enabled or not, whatever its device: the guest's set now
+//!   loads through Graft. A VM on reims-vgpu's own device gets Graft and the set; one on another
+//!   device gets no kext.
 
 use crate::opencore::{self, Config};
 use crate::vm::{CONFIG_FILE, Graphics, Registry, Vm};
@@ -33,7 +37,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// The migrations this reims-ctl carries: 1 to this.
-pub const CURRENT: u32 = 3;
+pub const CURRENT: u32 = 4;
 
 /// The ported drivers older OpenCore images load, by bundle name: the seven kexts that run Apple's
 /// arm64 GPU driver on x86-64, which reims-util carried until its fe9bfe1.
@@ -106,6 +110,8 @@ enum Why {
     Ported(Graphics),
     /// Migration 3: its settings name apple-gfx.
     AppleGfx,
+    /// Migration 4: its image lists Lilu, the old graphics loader or one of its shims.
+    Graft,
 }
 
 /// Migration 1's plan for `vm`, `running` or not.
@@ -145,6 +151,26 @@ fn plan_3(vm: &Vm, running: bool, apple_gfx: bool) -> Plan {
     }
 }
 
+/// Migration 4's plan for `vm`, `running` or not, whose image lists `kexts` (disabled entries
+/// too): an x86-64 VM listing any of [`opencore::LEGACY_KEXTS`] has its image made again,
+/// whatever its device.
+fn plan_4(vm: &Vm, running: bool, kexts: &[String]) -> Plan {
+    if vm.config.profile != Profile::Q35X86_64
+        || !kexts.iter().any(|k| {
+            opencore::LEGACY_KEXTS
+                .iter()
+                .any(|old| k.eq_ignore_ascii_case(old))
+        })
+    {
+        return Plan::Skip;
+    }
+    if running {
+        Plan::Defer
+    } else {
+        Plan::Image(Why::Graft)
+    }
+}
+
 /// Whether `vm`'s settings, as saved, name apple-gfx: they read as reims-vgpu's own device.
 fn names_apple_gfx(vm: &Vm) -> bool {
     std::fs::read_to_string(vm.dir.join(CONFIG_FILE))
@@ -166,7 +192,23 @@ fn plan_of(n: u32, vm: &Vm, running: bool) -> Plan {
                 .unwrap_or_default();
             plan_2(vm, running, &kexts, names_apple_gfx(vm))
         }
-        _ => plan_3(vm, running, names_apple_gfx(vm)),
+        3 => plan_3(vm, running, names_apple_gfx(vm)),
+        4 => {
+            let kexts = vm
+                .config
+                .q35
+                .as_ref()
+                .and_then(|q| Config::read(&vm.path(&q.opencore), q.opencore_format).ok())
+                .map(|c| {
+                    c.configured_kexts()
+                        .iter()
+                        .map(|k| k.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            plan_4(vm, running, &kexts)
+        }
+        _ => Plan::Skip,
     }
 }
 
@@ -312,6 +354,9 @@ fn image(vm: &mut Vm, why: Why, n: u32) -> Result<String> {
         ),
         Why::AppleGfx => "moved from apple-gfx, which reims-vgpu no longer has, to reims-vgpu's \
                           own GPU device"
+            .to_string(),
+        Why::Graft => "its OpenCore image is made again without Lilu or the old graphics loader \
+                       and shims"
             .to_string(),
     };
     line.push_str("; ");
@@ -482,8 +527,8 @@ mod tests {
         let env = crate::testenv::Env::new("migrate-image");
         let made = env.root.join("made.img");
         let args = env.root.join("args");
-        // What reims-util makes: Lilu and the set's kexts (by name; the stand-in copies them).
-        let fresh = entry("Lilu.kext") + &entry("A.kext") + &entry("B.kext");
+        // What reims-util makes: the set's kexts (by name; the stand-in copies them).
+        let fresh = entry("A.kext") + &entry("B.kext");
         std::fs::write(&made, qcow2(&oc_image(plist(&fresh).as_bytes()))).unwrap();
         util(&env, &made, &args, false);
         let ported = entry("Lilu.kext") + &entry("AppleParavirtGPU.kext");
@@ -496,7 +541,7 @@ mod tests {
             "{line}"
         );
         assert!(
-            line.contains("without AppleParavirtGPU.kext and with A.kext, B.kext"),
+            line.contains("without Lilu.kext, AppleParavirtGPU.kext and with A.kext, B.kext"),
             "{line}"
         );
         assert!(
@@ -632,11 +677,7 @@ mod tests {
         let env = crate::testenv::Env::new("migrate-image-2");
         let made = env.root.join("made.img");
         let args = env.root.join("args");
-        std::fs::write(
-            &made,
-            qcow2(&oc_image(plist(&entry("Lilu.kext")).as_bytes())),
-        )
-        .unwrap();
+        std::fs::write(&made, qcow2(&oc_image(plist("").as_bytes()))).unwrap();
         util(&env, &made, &args, false);
         let dir = env.root.join("gfx");
         let mut v = vm(&dir, "q35-x86_64", Some("vmware-svga"), &ported());
@@ -647,9 +688,7 @@ mod tests {
             "{line}"
         );
         assert!(
-            line.contains(
-                "without 8 kexts (ReimsVgpu.kext, AppleParavirtGPULoader.kext and 6 more)"
-            ),
+            line.contains("without 9 kexts (Lilu.kext, ReimsVgpu.kext and 7 more)"),
             "{line}"
         );
         assert!(
@@ -682,7 +721,7 @@ mod tests {
         // After migration 1: migrations 2 and 3, on the VM whose image holds the ported drivers.
         util(&env, &made, &args, false);
         let mut reg = Registry::default();
-        for (name, kexts) in [("ported", ported()), ("fresh", entry("Lilu.kext"))] {
+        for (name, kexts) in [("ported", ported()), ("fresh", String::new())] {
             let dir = env.root.join(name);
             vm(&dir, "q35-x86_64", Some("vmware-svga"), &kexts);
             reg.add(name, &dir).unwrap();
@@ -721,7 +760,7 @@ mod tests {
         let env = crate::testenv::Env::new("migrate-apple");
         let made = env.root.join("made.img");
         let args = env.root.join("args");
-        let fresh = entry("Lilu.kext") + &entry("A.kext") + &entry("B.kext");
+        let fresh = entry("A.kext") + &entry("B.kext");
         std::fs::write(&made, qcow2(&oc_image(plist(&fresh).as_bytes()))).unwrap();
         util(&env, &made, &args, false);
         for g in [None, Some("reims-vgpu"), Some("vmware-svga")] {
@@ -742,7 +781,10 @@ mod tests {
             ),
             "{line}"
         );
-        assert!(line.contains(", with A.kext, B.kext"), "{line}");
+        assert!(
+            line.contains("without Lilu.kext and with A.kext, B.kext"),
+            "{line}"
+        );
         assert!(
             line.contains("kept as opencore.img.pre-migration-3"),
             "{line}"
@@ -755,6 +797,175 @@ mod tests {
         let saved = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
         assert!(saved.contains("graphics = \"reims-vgpu\""), "{saved}");
         assert_eq!(plan_of(3, &Vm::load(&dir).unwrap(), false), Plan::Skip);
+    }
+
+    #[test]
+    fn migration_4_finds_each_legacy_component_for_every_graphics_choice() {
+        let env = crate::testenv::Env::new("migrate-graft-plan");
+        for graphics in [None, Some("reims-vgpu"), Some("vmware-svga")] {
+            let v = vm(
+                &env.root.join(graphics.unwrap_or("none")),
+                "q35-x86_64",
+                graphics,
+                "",
+            );
+            for legacy in opencore::LEGACY_KEXTS {
+                let listed = names(&[&legacy.to_ascii_uppercase()]);
+                assert_eq!(plan_4(&v, false, &listed), Plan::Image(Why::Graft));
+                assert_eq!(plan_4(&v, true, &listed), Plan::Defer);
+            }
+            assert_eq!(
+                plan_4(
+                    &v,
+                    false,
+                    &names(&["Graft.kext", "RgfxGate.kext", "ReimsGraphics.kext"])
+                ),
+                Plan::Skip
+            );
+        }
+        let disabled = entry("Lilu.kext").replace("<true/>", "<false/>");
+        let v = vm(
+            &env.root.join("disabled"),
+            "q35-x86_64",
+            Some("vmware-svga"),
+            &disabled,
+        );
+        assert_eq!(plan_of(4, &v, false), Plan::Image(Why::Graft));
+    }
+
+    #[test]
+    fn migration_4_preserves_identity_and_graphics_and_replaces_the_legacy_image() {
+        let env = crate::testenv::Env::new("migrate-graft-image");
+        let made = env.root.join("made.img");
+        let args = env.root.join("args");
+        let legacy = opencore::LEGACY_KEXTS
+            .iter()
+            .map(|k| entry(k))
+            .collect::<String>();
+        for graphics in ["reims-vgpu", "vmware-svga"] {
+            let dir = env.root.join(graphics);
+            let mut v = vm(&dir, "q35-x86_64", Some(graphics), &legacy);
+            let before = std::fs::read(dir.join("opencore.img")).unwrap();
+            let identity = Config::read(&dir.join("opencore.img"), crate::vm::ImageFormat::Raw)
+                .unwrap()
+                .identity()
+                .unwrap();
+            let fresh = if graphics == "reims-vgpu" {
+                entry("Graft.kext") + &entry("RgfxGate.kext") + &entry("ReimsGraphics.kext")
+            } else {
+                String::new()
+            };
+            std::fs::write(&made, qcow2(&oc_image(plist(&fresh).as_bytes()))).unwrap();
+            util(&env, &made, &args, false);
+            let p = plan_of(4, &v, false);
+            let line = carry_out(&mut v, p, 4).unwrap();
+            assert!(
+                line.contains("without Lilu or the old graphics loader and shims"),
+                "{line}"
+            );
+            assert!(
+                line.contains("kept as opencore.img.pre-migration-4"),
+                "{line}"
+            );
+            let saved = Vm::load(&dir).unwrap();
+            assert_eq!(saved.config.graphics, v.config.graphics);
+            assert_eq!(
+                std::fs::read(dir.join("opencore.img.pre-migration-4")).unwrap(),
+                before
+            );
+            let q = saved.config.q35.as_ref().unwrap();
+            let after = Config::read(&saved.path(&q.opencore), q.opencore_format).unwrap();
+            assert_eq!(after.identity().unwrap(), identity);
+            let given = std::fs::read_to_string(&args).unwrap();
+            for value in [
+                &identity.model,
+                &identity.serial,
+                &identity.mlb,
+                &identity.uuid,
+                &identity.rom,
+            ] {
+                assert!(given.lines().any(|arg| arg == value), "{given}");
+            }
+            assert_eq!(given.contains("--add-kext"), graphics == "reims-vgpu");
+            assert_eq!(plan_of(4, &saved, false), Plan::Skip);
+            assert_eq!(
+                after.loaded_kexts(),
+                if graphics == "reims-vgpu" {
+                    vec!["Graft.kext", "RgfxGate.kext", "ReimsGraphics.kext"]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn migration_4_rejects_an_old_util_without_replacing_the_image() {
+        let env = crate::testenv::Env::new("migrate-graft-old-util");
+        let made = env.root.join("made.img");
+        let args = env.root.join("args");
+        let dir = env.root.join("old-util");
+        let mut v = vm(&dir, "q35-x86_64", Some("vmware-svga"), &entry("Lilu.kext"));
+        let before = std::fs::read(dir.join("opencore.img")).unwrap();
+        let settings = std::fs::read(dir.join(CONFIG_FILE)).unwrap();
+        for legacy in opencore::LEGACY_KEXTS {
+            let disabled = entry(legacy).replace("<true/>", "<false/>");
+            std::fs::write(&made, qcow2(&oc_image(plist(&disabled).as_bytes()))).unwrap();
+            util(&env, &made, &args, false);
+            let line = carry_out(&mut v, Plan::Image(Why::Graft), 4).unwrap();
+            assert!(
+                line.contains("still includes obsolete guest kexts"),
+                "{line}"
+            );
+            assert_eq!(std::fs::read(dir.join("opencore.img")).unwrap(), before);
+            assert_eq!(std::fs::read(dir.join(CONFIG_FILE)).unwrap(), settings);
+            assert!(!dir.join("opencore.img.pre-migration-4").exists());
+            assert!(!dir.join("opencore.new.qcow2").exists());
+        }
+    }
+
+    #[test]
+    fn migration_4_defers_a_running_vm_and_runs_at_its_next_start() {
+        let env = crate::testenv::Env::new("migrate-graft-running");
+        let dir = env.root.join("busy");
+        let mut v = vm(&dir, "q35-x86_64", Some("vmware-svga"), &entry("Lilu.kext"));
+        let before = std::fs::read(dir.join("opencore.img")).unwrap();
+        let made = env.root.join("made.img");
+        let args = env.root.join("args");
+        std::fs::write(&made, qcow2(&oc_image(plist("").as_bytes()))).unwrap();
+        util(&env, &made, &args, false);
+        let mut reg = Registry::default();
+        reg.add("busy", &dir).unwrap();
+        reg.save().unwrap();
+        save(&State {
+            done: 3,
+            deferred: vec![],
+        })
+        .unwrap();
+        let pidfile = crate::vm::pidfile_in(&dir);
+        let mut process = running_qemu(&pidfile);
+        let mut said = Vec::new();
+        run(&mut |line| said.push(line.to_string()));
+        assert!(
+            said.iter().any(|line| line.starts_with("busy is running")),
+            "{said:?}"
+        );
+        assert_eq!(load().deferred, vec![dir.clone()]);
+        assert_eq!(load().done, CURRENT);
+        assert_eq!(std::fs::read(dir.join("opencore.img")).unwrap(), before);
+        assert!(!args.exists());
+        process.kill().unwrap();
+        process.wait().unwrap();
+        std::fs::remove_file(pidfile).unwrap();
+        at_start(&mut v, &mut |_| {});
+        assert!(load().deferred.is_empty());
+        assert_eq!(plan_of(4, &v, false), Plan::Skip);
+        assert!(dir.join("opencore.img.pre-migration-4").exists());
+        assert!(
+            !std::fs::read_to_string(args)
+                .unwrap()
+                .contains("--add-kext")
+        );
     }
 
     #[test]
@@ -777,7 +988,7 @@ mod tests {
         let env = crate::testenv::Env::new("migrate-run");
         let made = env.root.join("made.img");
         let args = env.root.join("args");
-        let fresh = entry("Lilu.kext") + &entry("A.kext") + &entry("B.kext");
+        let fresh = entry("A.kext") + &entry("B.kext");
         std::fs::write(&made, qcow2(&oc_image(plist(&fresh).as_bytes()))).unwrap();
         util(&env, &made, &args, false);
         // No VMs: recorded, nothing said.
@@ -796,7 +1007,12 @@ mod tests {
             ("chosen", Some("vmware-svga")),
         ] {
             let dir = env.root.join(name);
-            vm(&dir, "q35-x86_64", graphics, &entry("Lilu.kext"));
+            let kexts = if graphics.is_some() {
+                String::new()
+            } else {
+                entry("Lilu.kext")
+            };
+            vm(&dir, "q35-x86_64", graphics, &kexts);
             reg.add(name, &dir).unwrap();
         }
         reg.save().unwrap();

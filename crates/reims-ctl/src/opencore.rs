@@ -19,6 +19,15 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+/// Lilu, the old graphics loader and its two shims, which the guest's set loaded through before
+/// Graft: an image reims-ctl makes lists none of them (migrate.rs, Migration 4).
+pub(crate) const LEGACY_KEXTS: [&str; 4] = [
+    "Lilu.kext",
+    "ReimsGraphicsLoader.kext",
+    "RgfxIOGraphicsFamilyBridge.kext",
+    "RgfxAppleGraphicsDeviceControlBridge.kext",
+];
+
 /// The Mac an OpenCore image presents: its config.plist's PlatformInfo > Generic, which
 /// reims-util takes as `--model`, `--serial`, `--mlb`, `--uuid` and `--rom`.
 #[derive(Clone, Debug, PartialEq)]
@@ -78,9 +87,7 @@ impl Config {
         })
     }
 
-    /// The kexts OpenCore loads, in its order: the bundle each enabled entry of Kernel > Add
-    /// names (its BundlePath, under EFI/OC/Kexts).
-    pub fn loaded_kexts(&self) -> Vec<&str> {
+    fn kext_entries(&self) -> impl Iterator<Item = &plist::Dictionary> {
         self.0
             .get("Kernel")
             .and_then(plist::Value::as_dictionary)
@@ -89,6 +96,19 @@ impl Config {
             .into_iter()
             .flatten()
             .filter_map(plist::Value::as_dictionary)
+    }
+
+    /// Every bundle listed in Kernel > Add, including disabled entries.
+    pub fn configured_kexts(&self) -> Vec<&str> {
+        self.kext_entries()
+            .filter_map(|e| e.get("BundlePath").and_then(plist::Value::as_string))
+            .collect()
+    }
+
+    /// The kexts OpenCore loads, in its order: the bundle each enabled entry of Kernel > Add
+    /// names (its BundlePath, under EFI/OC/Kexts).
+    pub fn loaded_kexts(&self) -> Vec<&str> {
+        self.kext_entries()
             .filter(|e| e.get("Enabled").and_then(plist::Value::as_boolean) == Some(true))
             .filter_map(|e| e.get("BundlePath").and_then(plist::Value::as_string))
             .collect()
@@ -287,9 +307,19 @@ pub fn renew(
     let dropped = holds_unused_guest_kexts(vm);
     let kexts = reims_util::kext_args(vm.config.graphics())?;
     let made = reims_util::opencore_as(&new, &id, picker, &kexts, progress).and_then(|()| {
+        let config = Config::read(&new, ImageFormat::Qcow2)
+            .context("read the new OpenCore image before replacing the old one")?;
+        ensure!(
+            !config
+                .configured_kexts()
+                .iter()
+                .any(|k| LEGACY_KEXTS.iter().any(|old| k.eq_ignore_ascii_case(old))),
+            "the installed reims-util still includes obsolete guest kexts: run reims-ctl update, \
+             which installs the reims-util it needs"
+        );
         // reims-util hides the picker unless --show-picker asks for it; an older one shows it.
         ensure!(
-            !Config::read(&new, ImageFormat::Qcow2).is_ok_and(|c| c.shows_picker() != picker),
+            config.shows_picker() == picker,
             "the installed reims-util did not {} OpenCore's picker: run reims-ctl update, which \
              installs the reims-util it needs",
             if picker { "show" } else { "hide" }
@@ -854,8 +884,8 @@ pub(crate) mod tests {
         let dir = env.root.join("vm");
         std::fs::create_dir_all(&dir).unwrap();
         let made = env.root.join("made.img");
-        std::fs::write(&made, image(plist("").as_bytes())).unwrap();
-        std::fs::copy(&made, dir.join("opencore.img")).unwrap();
+        std::fs::write(&made, qcow2(&image(plist("").as_bytes()))).unwrap();
+        std::fs::write(dir.join("opencore.img"), image(plist("").as_bytes())).unwrap();
         let config = |memory: u64| {
             format!(
                 r#"
@@ -909,7 +939,7 @@ pub(crate) mod tests {
         use std::os::unix::fs::PermissionsExt;
         let env = crate::testenv::Env::new("renew-outside");
         let made = env.root.join("made.img");
-        std::fs::write(&made, image(plist("").as_bytes())).unwrap();
+        std::fs::write(&made, qcow2(&image(plist("").as_bytes()))).unwrap();
         let util = env.root.join("reims-util");
         let script = format!(
             "#!/bin/sh\nwhile [ \"$1\" != -o ]; do shift; done\ncp '{}' \"$2\"\n\
@@ -923,7 +953,7 @@ pub(crate) mod tests {
             let dir = env.root.join(vm_dir);
             std::fs::create_dir_all(dir.join("sub")).unwrap();
             std::fs::create_dir_all(old.parent().unwrap()).unwrap();
-            std::fs::copy(&made, old).unwrap();
+            std::fs::write(old, image(plist("").as_bytes())).unwrap();
             let config = format!(
                 r#"
                 name = "{vm_dir}"
@@ -970,8 +1000,8 @@ pub(crate) mod tests {
         let dir = env.root.join("vm");
         std::fs::create_dir_all(&dir).unwrap();
         let made = env.root.join("made.img");
-        std::fs::write(&made, image(plist("").as_bytes())).unwrap();
-        std::fs::copy(&made, dir.join("opencore.img")).unwrap();
+        std::fs::write(&made, qcow2(&image(plist("").as_bytes()))).unwrap();
+        std::fs::write(dir.join("opencore.img"), image(plist("").as_bytes())).unwrap();
         let args = env.root.join("args");
         let util = env.root.join("reims-util");
         let script = format!(
@@ -1022,7 +1052,7 @@ pub(crate) mod tests {
         let a = added[0].split(',').next().unwrap();
         assert!(Path::new(a).join("Contents/MacOS/A").is_file());
         assert!(!given.contains(&"--no-kexts"), "{given:?}");
-        std::fs::copy(&made, dir.join("opencore.img")).unwrap();
+        std::fs::write(dir.join("opencore.img"), image(plist("").as_bytes())).unwrap();
         std::fs::write(
             dir.join(crate::vm::CONFIG_FILE),
             config("graphics = \"vmware-svga\""),
@@ -1099,7 +1129,7 @@ pub(crate) mod tests {
         };
         let lilu = entry("Lilu.kext");
         let made = env.root.join("made.img");
-        std::fs::write(&made, qcow2(&image(plist(&lilu).as_bytes()))).unwrap();
+        std::fs::write(&made, qcow2(&image(plist("").as_bytes()))).unwrap();
         let args = env.root.join("args");
         let util = env.root.join("reims-util");
         let script = format!(
@@ -1184,7 +1214,7 @@ pub(crate) mod tests {
         };
         let lilu = entry("Lilu.kext");
         let made = env.root.join("made.img");
-        std::fs::write(&made, qcow2(&image(plist(&lilu).as_bytes()))).unwrap();
+        std::fs::write(&made, qcow2(&image(plist("").as_bytes()))).unwrap();
         let args = env.root.join("args");
         let util = env.root.join("reims-util");
         let script = format!(
