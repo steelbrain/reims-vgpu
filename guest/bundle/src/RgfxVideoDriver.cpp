@@ -482,6 +482,9 @@ struct Context {
 	// Where its HEVC pictures' frame records describe their surfaces, once a picture's has shown
 	// it (FrameDescription::packed), and 0 until then.
 	std::atomic<uint32_t> hevc_description{0};
+	// The layout its H.264 pictures' parsed SPS comes in (rgfx::video::h264::SpsLayout), once a
+	// picture's has shown it, and 0 until then.
+	std::atomic<uint8_t> h264_sps_layout{0};
 };
 
 // The live sessions, whose output textures go when AppleGVA frees its frames' pool.
@@ -943,6 +946,38 @@ void *decodeHevcPicture(const Command *c)
 	return work;
 }
 
+// The SPS of an H.264 picture of `context`'s that AppleGVA decodes into a `width` x `height`
+// surface, its parsed form at `record` and its PPS's seq_parameter_set_id `ppsSps`, in `sps`: read
+// in the session's layout, or in the one layout it fits where the session has none yet
+// (rgfx::video::h264::chooseSpsLayout), which the session then keeps. False, logged, where it fits
+// no layout, more than one, or not the session's.
+bool h264Sps(Context *context, const uint8_t *record, uint32_t ppsSps, uint32_t width,
+             uint32_t height, rgfx::video::h264::Sps *sps)
+{
+	using namespace rgfx::video::h264;
+	const uint8_t kept = context->h264_sps_layout.load();
+	if (kept) {
+		*sps = spsIn(record, (SpsLayout)kept);
+		if (spsFits(*sps, ppsSps, width, height))
+			return true;
+		static std::atomic<bool> said;
+		notSent(said, "its SPS does not describe its picture in its session's layout");
+		return false;
+	}
+	SpsLayout layout;
+	NoLayout why;
+	if (chooseSpsLayout(record, ppsSps, width, height, &layout, sps, &why)) {
+		context->h264_sps_layout.store((uint8_t)layout);
+		return true;
+	}
+	static std::atomic<bool> none, many;
+	if (why == NoLayout::kMany)
+		notSent(many, "its SPS describes its picture in both layouts of AppleGVA's");
+	else
+		notSent(none, "its SPS describes its picture in no layout of AppleGVA's");
+	return false;
+}
+
 // Commits the H.264 picture `c` decodes on its context's session: its work on the host, or null
 // where it could not be sent.
 void *decodeH264Picture(const Command *c)
@@ -987,16 +1022,26 @@ void *decodeH264Picture(const Command *c)
 		return nullptr;
 	}
 	// The parameter sets, sent where they differ from the last ones.
-	std::vector<uint8_t> sets;
-	const auto *sps = (const rgfx::video::h264::Sps *)u64At(P, 0x260);
+	const uint8_t *spsRecord = (const uint8_t *)u64At(P, 0x260);
 	const auto *pps = (const rgfx::video::h264::Pps *)u64At(P, 0x268);
-	if (!sps || !pps || !rgfx::video::h264::writeSps(*sps, sets) ||
-	    !rgfx::video::h264::writePps(*pps, *sps, sets)) {
+	IOSurfaceRef output = outputSurface(c);
+	if (!spsRecord || !pps || !output) {
+		static std::atomic<bool> said;
+		notSent(said, "its picture record holds no SPS (+0x260) or no PPS (+0x268), or its "
+		              "command no output surface");
+		return nullptr;
+	}
+	rgfx::video::h264::Sps sps;
+	if (!h264Sps(context, spsRecord, pps->seq_parameter_set_id, (uint32_t)IOSurfaceGetWidth(output),
+	             (uint32_t)IOSurfaceGetHeight(output), &sps))
+		return nullptr;
+	std::vector<uint8_t> sets;
+	if (!rgfx::video::h264::writeSps(sps, sets) || !rgfx::video::h264::writePps(*pps, sps, sets)) {
 		static std::atomic<bool> said;
 		notSent(said, "its parameter sets are refused");
 		return nullptr;
 	}
-	return commitPicture(context, sets, bytes + first, end - first, outputSurface(c));
+	return commitPicture(context, sets, bytes + first, end - first, output);
 }
 
 // Commits the picture `c` decodes, of its context's codec.

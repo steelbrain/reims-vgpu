@@ -18,12 +18,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include "RgfxVideoChannel.hpp"
+#include "RgfxVideoH264.hpp"
 #include "RgfxVideoH265.hpp"
 
 extern "C" int AVD_CreateAVDAccelerator(void **out, const void *params, void *identity);
@@ -540,6 +542,75 @@ uint64_t scheduleHevc(void *context, const HevcPicture &picture)
 	return call(kSchedule, &cl, &tl);
 }
 
+// An H.264 picture's parameters as AppleGVA lays them out, as far as the driver reads them: its
+// parsed SPS and PPS (P+0x260, P+0x268), its one slice in buffer 0 of pool 0 (P+0x270, P+0x274;
+// the slice count at P+0x278 and the entries at P+0x290, each its size and offset), and its
+// command's output (its +0x20, whose +0x10 is the surface).
+struct H264Picture {
+	std::vector<uint8_t> sps;
+	rgfx::video::h264::Pps pps;
+	uint32_t entry[2] = {};
+	const uint32_t *entries[1] = {entry};
+	uint8_t parameters[0x298] = {};
+	uint8_t frame[0x18] = {};
+	uint8_t output[0x28] = {};
+
+	H264Picture(std::vector<uint8_t> record, const rgfx::video::h264::Pps &p, IOSurfaceRef surface,
+	            uint32_t bytes)
+	    : sps(std::move(record)), pps(p)
+	{
+		const uint32_t slices = 1;
+		const void *sets[2] = {sps.data(), &pps};
+		const void *list = entries, *outputAt = frame;
+		entry[0] = bytes;
+		std::memcpy(parameters + 0x260, sets, sizeof sets);
+		std::memcpy(parameters + 0x278, &slices, 4);
+		std::memcpy(parameters + 0x290, &list, 8);
+		std::memcpy(frame + 0x10, &surface, 8);
+		std::memcpy(output + 0x20, &outputAt, 8);
+	}
+};
+
+// Schedules the H.264 picture `picture` on `context`: Schedule's answer.
+uint64_t scheduleH264(void *context, const H264Picture &picture)
+{
+	Command c = {};
+	c.function_id = kFunctionDecode;
+	c.sub_id = kCodecH264;
+	c.context = context;
+	c.parameters = picture.parameters;
+	c.output = picture.output;
+	const Command *list[1] = {&c};
+	void *tokens[1] = {};
+	CommandList cl = {1, 0, list};
+	TokenList tl = {1, 0, tokens};
+	return call(kSchedule, &cl, &tl);
+}
+
+// The record of `s` as macOS 11's AppleGVA lays out its parsed SPS (as video_h264_tests' of the
+// same name): four constraint flags, one field of the four header bits after them, then Sps's
+// fields from level_idc on, 8 bytes earlier.
+std::vector<uint8_t> spsRecordOn11(const rgfx::video::h264::Sps &s)
+{
+	using rgfx::video::h264::Sps;
+	std::vector<uint8_t> r(sizeof(Sps), 0);
+	std::memcpy(r.data(), &s, 0x18);
+	const uint32_t bits =
+	    s.constraint_set_flag[4] << 3 | s.constraint_set_flag[5] << 2 | s.reserved_zero_2bits;
+	std::memcpy(r.data() + 0x18, &bits, 4);
+	std::memcpy(r.data() + 0x1c, reinterpret_cast<const uint8_t *>(&s) + offsetof(Sps, level_idc),
+	            sizeof(Sps) - offsetof(Sps, level_idc));
+	return r;
+}
+
+// The record of `s` as every later release measured lays it out.
+std::vector<uint8_t> spsRecordOn12(const rgfx::video::h264::Sps &s)
+{
+	std::vector<uint8_t> r(sizeof s);
+	std::memcpy(r.data(), &s, sizeof s);
+	return r;
+}
+
 // The SPS and PPS `sps` and `pps` as the driver sends them.
 std::vector<uint8_t> setsOf(const rgfx::video::h265::Sps &sps, const rgfx::video::h265::Pps &pps)
 {
@@ -1030,6 +1101,83 @@ void checkNoZeroAnswers()
 
 } // namespace
 
+// A session's H.264 pictures are read in the one layout of AppleGVA's parsed SPS in which the
+// first describes its picture, 11's or 12's, and their SPS is sent as the stream holds it; a
+// later picture in the other layout, a record that fits neither, and a surface the SPS's size
+// does not round up to are refused, and nothing of them reaches the host.
+void checkH264SpsLayouts()
+{
+	using namespace rgfx::video::h264;
+	constexpr uint32_t kBytes = 0x1000;
+	const uint64_t bitstream = allocate(g_driver, 0, 0x10000);
+	CHECK(bitstream != 0, "the bitstream pool refused");
+	std::memset((void *)bitstream, 0x5a, kBytes);
+	IOSurfaceRef surface = canvas(640, 480), narrower = canvas(624, 480);
+	// A 640x480 High stream's, as x264 writes it.
+	Sps sps = {};
+	sps.field_000 = 1;
+	sps.profile_idc = 100;
+	sps.level_idc = 30;
+	sps.chroma_format_idc = 1;
+	sps.log2_max_pic_order_cnt_lsb_minus4 = 2;
+	sps.max_num_ref_frames = 4;
+	sps.pic_width_in_mbs_minus1 = 39;
+	sps.pic_height_in_map_units_minus1 = 29;
+	sps.frame_mbs_only_flag = 1;
+	sps.direct_8x8_inference_flag = 1;
+	Pps pps = {};
+	pps.field_000 = 1;
+	pps.entropy_coding_mode_flag = 1;
+	pps.num_ref_idx_l0_default_active_minus1 = 2;
+	pps.weighted_pred_flag = 1;
+	pps.weighted_bipred_idc = 2;
+	pps.transform_8x8_mode_flag = 1;
+	std::vector<uint8_t> sets;
+	CHECK(writeSps(sps, sets) && writePps(pps, sps, sets), "the test's parameter sets refused");
+	Sps none = sps;
+	none.level_idc = 0;
+	const H264Picture on11(spsRecordOn11(sps), pps, surface, kBytes),
+	    on12(spsRecordOn12(sps), pps, surface, kBytes),
+	    neither(spsRecordOn12(none), pps, surface, kBytes),
+	    tooNarrow(spsRecordOn12(sps), pps, narrower, kBytes);
+	auto session = [] {
+		std::vector<void *> contexts;
+		CHECK(makeContexts(1, contexts) == kOk, "a create of one H.264 decode");
+		return contexts.empty() ? nullptr : contexts[0];
+	};
+	auto finish = [](void *context) {
+		ContextDelete del = {1, 0, &context};
+		CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+	};
+	auto lands = [&](void *context, const H264Picture &picture, const char *what) {
+		g_sent.clear();
+		CHECK(scheduleH264(context, picture) == kOk, "%s not sent", what);
+		CHECK(g_sent.size() == 1 && g_sent[0].surface == IOSurfaceGetID(surface) &&
+		          g_sent[0].sets == sets,
+		      "%s sent %zu times, or with other parameter sets", what, g_sent.size());
+	};
+	auto refused = [&](void *context, const H264Picture &picture, const char *what) {
+		g_sent.clear();
+		CHECK(scheduleH264(context, picture) == kNotSent, "%s sent", what);
+		CHECK(g_sent.empty(), "%s reached the host", what);
+	};
+	void *first = session();
+	lands(first, on11, "11's record");
+	refused(first, on12, "12's record on a session that read 11's");
+	finish(first);
+	void *second = session();
+	lands(second, on12, "12's record");
+	refused(second, on11, "11's record on a session that read 12's");
+	finish(second);
+	void *third = session();
+	refused(third, neither, "a record fitting no layout");
+	refused(third, tooNarrow, "a surface a macroblock narrower than the SPS's size");
+	lands(third, on12, "12's record after two refused");
+	finish(third);
+	CFRelease(surface);
+	CFRelease(narrower);
+}
+
 int main()
 {
 	void *table = nullptr;
@@ -1043,6 +1191,7 @@ int main()
 	checkUnsentDecode();
 	checkTileLanding();
 	checkFrameDescriptions();
+	checkH264SpsLayouts();
 	checkNoZeroAnswers();
 	checkTileInfo();
 	checkTileInfoRefused();

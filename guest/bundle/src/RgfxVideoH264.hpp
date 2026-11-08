@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace rgfx::video::h264 {
@@ -117,6 +118,41 @@ static_assert(offsetof(Pps, slice_group_change_rate_minus1) == 0x80, "PPS layout
 static_assert(offsetof(Pps, num_ref_idx_l0_default_active_minus1) == 0x90, "PPS layout");
 static_assert(offsetof(Pps, pic_scaling_matrix_present_flag) == 0xbc, "PPS layout");
 static_assert(offsetof(Pps, second_chroma_qp_index_offset) == 0x480, "PPS layout");
+
+// The layouts AppleGVA's parsed SPS comes in. Every release measured from 12 on lays it out as
+// Sps (kSixConstraintFlags). macOS 11's AppleGVA (108.7.2) parses the header of H.264's older
+// syntax: four constraint flags, then one field for the four bits after them, where later
+// releases hold constraint_set4_flag, constraint_set5_flag and reserved_zero_2bits. So from
+// level_idc on, every field of 11's record sits 8 bytes before Sps's (kFourConstraintFlags):
+// AppleGVA 108.7.2 reads level_idc at 0x1c, chroma_format_idc at 0x24, max_num_ref_frames at
+// 0x818 and frame_mbs_only_flag at 0x828 (read from its code), and on the guest (11.7.11, the
+// 780M host, 2026-11-08) a 640x480 x264 stream's record holds its level, size and reference
+// count there, and 12.7.6's, 13.7.8's and 26.7.2's where Sps holds them. A record does not say
+// its layout, so the driver takes the one layout in which the record describes the picture it
+// decodes (chooseSpsLayout). The parsed PPS is laid out as Pps on all four.
+enum class SpsLayout : uint8_t { kSixConstraintFlags = 1, kFourConstraintFlags = 2 };
+
+// The SPS a record of AppleGVA's holds in `layout`, as Sps. In kFourConstraintFlags the field
+// after the four flags holds the four header bits that follow them, constraint_set4_flag first;
+// they come back as constraint_set_flag[4] and [5] and reserved_zero_2bits, which writeSps
+// writes as the same bits.
+Sps spsIn(const uint8_t *record, SpsLayout layout);
+
+// Whether `sps` describes the picture AppleGVA decodes into a `width` x `height` surface with a
+// PPS of `ppsSps`, its seq_parameter_set_id: a profile_idc and a level_idc of H.264's, its own
+// seq_parameter_set_id that PPS's, and a coded size the surface's rounds up to (its width to
+// whole macroblocks, its height to whole macroblocks of a frame, or of a field pair where
+// frame_mbs_only_flag is 0).
+bool spsFits(const Sps &sps, uint32_t ppsSps, uint32_t width, uint32_t height);
+
+// Why chooseSpsLayout chose none.
+enum class NoLayout : uint8_t { kNone, kMany };
+
+// The one layout in which `record` fits (spsFits) the picture of a `width` x `height` surface with
+// a PPS of `ppsSps`, its SPS in that layout in `sps`; false, with `why`, where it fits in none or
+// in more than one.
+bool chooseSpsLayout(const uint8_t *record, uint32_t ppsSps, uint32_t width, uint32_t height,
+                     SpsLayout *layout, Sps *sps, NoLayout *why);
 
 // Appends the SPS (without its VUI) and the PPS, each as an Annex-B NAL unit with a four-byte
 // start code, to out. False, and out as it was, where a field is out of H.264's range or the

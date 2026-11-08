@@ -8,6 +8,7 @@
  * Exits 0 and prints a one-line summary when every check passes; aborts on the first failure.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -168,14 +169,153 @@ void checkRefusals()
 	CHECK(!writePps(p, c.sps, out) && out.size() == 2, "bipred 3 taken");
 }
 
+// The record of `s` as macOS 11's AppleGVA lays it out (SpsLayout::kFourConstraintFlags): its
+// four constraint flags, then the four header bits after them in one field, constraint_set4_flag
+// first, then Sps's fields from level_idc on, 8 bytes earlier. Both records are Sps's size, as
+// AppleGVA's run on past it (the VUI).
+std::vector<uint8_t> recordOn11(const Sps &s)
+{
+	std::vector<uint8_t> r(sizeof(Sps), 0);
+	std::memcpy(r.data(), &s, 0x18);
+	const uint32_t bits =
+	    s.constraint_set_flag[4] << 3 | s.constraint_set_flag[5] << 2 | s.reserved_zero_2bits;
+	std::memcpy(r.data() + 0x18, &bits, 4);
+	std::memcpy(r.data() + 0x1c, reinterpret_cast<const uint8_t *>(&s) + offsetof(Sps, level_idc),
+	            sizeof(Sps) - offsetof(Sps, level_idc));
+	return r;
+}
+
+// The record of `s` as every later release measured lays it out (SpsLayout::kSixConstraintFlags).
+std::vector<uint8_t> recordOn12(const Sps &s)
+{
+	std::vector<uint8_t> r(sizeof(Sps));
+	std::memcpy(r.data(), &s, sizeof s);
+	return r;
+}
+
+// The size of the pictures `s` describes, as the surface AppleGVA decodes them into holds them:
+// its coded size less its cropping, in 4:2:0's units.
+void shown(const Sps &s, uint32_t *width, uint32_t *height)
+{
+	const uint32_t fields = 2 - s.frame_mbs_only_flag;
+	*width = 16 * (s.pic_width_in_mbs_minus1 + 1) -
+	         2 * (s.frame_crop_left_offset + s.frame_crop_right_offset);
+	*height = 16 * fields * (s.pic_height_in_map_units_minus1 + 1) -
+	          2 * fields * (s.frame_crop_top_offset + s.frame_crop_bottom_offset);
+}
+
+bool same(const Sps &a, const Sps &b) { return std::memcmp(&a, &b, sizeof a) == 0; }
+
+// Each stream's SPS is read back whole from the record of either layout, and only in its own:
+// at its shown size and at its coded size, and at neither a macroblock smaller.
+void checkLayouts(const Case &c)
+{
+	uint32_t width, height;
+	shown(c.sps, &width, &height);
+	const uint32_t id = c.pps.seq_parameter_set_id;
+	const uint32_t coded[2] = {16 * (c.sps.pic_width_in_mbs_minus1 + 1),
+	                           16 * (2 - c.sps.frame_mbs_only_flag) *
+	                               (c.sps.pic_height_in_map_units_minus1 + 1)};
+	struct Record {
+		std::vector<uint8_t> bytes;
+		SpsLayout layout;
+	};
+	for (const Record &r : {Record{recordOn12(c.sps), SpsLayout::kSixConstraintFlags},
+	                        Record{recordOn11(c.sps), SpsLayout::kFourConstraintFlags}}) {
+		const char *on = r.layout == SpsLayout::kSixConstraintFlags ? "12's" : "11's";
+		CHECK(same(spsIn(r.bytes.data(), r.layout), c.sps), "%s: %s record read back", c.name, on);
+		const uint32_t whole[2] = {width, height};
+		for (const uint32_t *size : {whole, coded}) {
+			SpsLayout layout = {};
+			Sps sps = {};
+			NoLayout why = {};
+			CHECK(chooseSpsLayout(r.bytes.data(), id, size[0], size[1], &layout, &sps, &why) &&
+			          layout == r.layout && same(sps, c.sps),
+			      "%s: %s record at %ux%u", c.name, on, size[0], size[1]);
+		}
+		SpsLayout layout = {};
+		Sps sps = {};
+		NoLayout why = {};
+		CHECK(!chooseSpsLayout(r.bytes.data(), id, coded[0] - 16, height, &layout, &sps, &why) &&
+		          why == NoLayout::kNone,
+		      "%s: %s record fits a surface a macroblock narrower", c.name, on);
+		CHECK(!chooseSpsLayout(r.bytes.data(), id, width,
+		                       coded[1] - 16 * (2 - c.sps.frame_mbs_only_flag), &layout, &sps, &why) &&
+		          why == NoLayout::kNone,
+		      "%s: %s record fits a surface a macroblock shorter", c.name, on);
+		CHECK(!chooseSpsLayout(r.bytes.data(), id + 1, width, height, &layout, &sps, &why) &&
+		          why == NoLayout::kNone,
+		      "%s: %s record fits a PPS of another SPS", c.name, on);
+	}
+}
+
+// 11's field of four header bits comes back as constraint_set4_flag, constraint_set5_flag and
+// the two reserved bits, which the SPS written holds as the stream had them.
+void checkHeaderBits()
+{
+	Case c = case_high();
+	c.sps.constraint_set_flag[4] = 1;
+	c.sps.reserved_zero_2bits = 2;
+	const std::vector<uint8_t> record = recordOn11(c.sps);
+	const Sps s = spsIn(record.data(), SpsLayout::kFourConstraintFlags);
+	CHECK(s.constraint_set_flag[4] == 1 && s.constraint_set_flag[5] == 0 && s.reserved_zero_2bits == 2,
+	      "11's header bits read as %u %u %u", s.constraint_set_flag[4], s.constraint_set_flag[5],
+	      s.reserved_zero_2bits);
+	std::vector<uint8_t> ours, theirs;
+	CHECK(writeSps(s, ours) && writeSps(c.sps, theirs) && ours == theirs, "11's SPS written");
+}
+
+// A record that describes its picture in no layout, or in both, is refused, the reason said.
+void checkLayoutRefusals()
+{
+	Case c = case_high();
+	uint32_t width, height;
+	shown(c.sps, &width, &height);
+	SpsLayout layout = {};
+	Sps sps = {};
+	NoLayout why = {};
+	Sps s = c.sps;
+	s.level_idc = 0;
+	for (const std::vector<uint8_t> &r : {recordOn12(s), recordOn11(s)})
+		CHECK(!chooseSpsLayout(r.data(), 0, width, height, &layout, &sps, &why) &&
+		          why == NoLayout::kNone,
+		      "a record of level 0 taken");
+	s = c.sps;
+	s.profile_idc = 101;
+	CHECK(!chooseSpsLayout(recordOn12(s).data(), 0, width, height, &layout, &sps, &why) &&
+	          why == NoLayout::kNone,
+	      "a record of profile 101 taken");
+	// A 32x32 picture whose record reads as one in both layouts: 12's from its own fields, 11's
+	// from the words 8 bytes earlier (level_idc from constraint_set_flag[5], the size from
+	// max_num_ref_frames and the gaps flag, frame_mbs_only_flag from the width).
+	s = {};
+	s.profile_idc = 66;
+	s.level_idc = 30;
+	s.constraint_set_flag[5] = 30;
+	s.max_num_ref_frames = 1;
+	s.gaps_in_frame_num_value_allowed_flag = 1;
+	s.pic_width_in_mbs_minus1 = 1;
+	s.pic_height_in_map_units_minus1 = 1;
+	s.frame_mbs_only_flag = 1;
+	CHECK(spsFits(spsIn(recordOn12(s).data(), SpsLayout::kFourConstraintFlags), 0, 32, 32),
+	      "the twofold record fits not in 11's layout");
+	CHECK(!chooseSpsLayout(recordOn12(s).data(), 0, 32, 32, &layout, &sps, &why) &&
+	          why == NoLayout::kMany,
+	      "a record fitting both layouts taken");
+}
+
 } // namespace
 
 int main()
 {
-	for (auto make : kCases)
+	for (auto make : kCases) {
 		checkCase(make());
+		checkLayouts(make());
+	}
 	checkEscapes();
 	checkRefusals();
+	checkHeaderBits();
+	checkLayoutRefusals();
 	std::printf("video_h264_tests: %d checks passed over %zu streams\n", g_checks, kCases.size());
 	return 0;
 }

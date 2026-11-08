@@ -7,6 +7,8 @@
 
 #include "RgfxVideoBits.hpp"
 
+#include <cstring>
+
 namespace rgfx::video::h264 {
 namespace {
 
@@ -124,6 +126,69 @@ bool writeSps(const Sps &s, std::vector<uint8_t> &out)
 	w.flag(0); // vui_parameters_present_flag
 	w.appendNal({0x67}, out);
 	return true;
+}
+
+Sps spsIn(const uint8_t *record, SpsLayout layout)
+{
+	Sps s;
+	if (layout == SpsLayout::kSixConstraintFlags) {
+		memcpy(&s, record, sizeof s);
+		return s;
+	}
+	constexpr size_t kFlags = offsetof(Sps, constraint_set_flag) + 4 * sizeof(uint32_t);
+	constexpr size_t kShift = offsetof(Sps, level_idc) - (kFlags + sizeof(uint32_t));
+	static_assert(kFlags == 0x18 && kShift == 8, "11's record lacks two of Sps's header words");
+	memcpy(&s, record, kFlags);
+	uint32_t bits;
+	memcpy(&bits, record + kFlags, sizeof bits);
+	s.constraint_set_flag[4] = bits >> 3 & 1;
+	s.constraint_set_flag[5] = bits >> 2 & 1;
+	s.reserved_zero_2bits = bits & 3;
+	memcpy(reinterpret_cast<uint8_t *>(&s) + offsetof(Sps, level_idc), record + kFlags + sizeof bits,
+	       sizeof s - offsetof(Sps, level_idc));
+	return s;
+}
+
+bool spsFits(const Sps &s, uint32_t ppsSps, uint32_t width, uint32_t height)
+{
+	static constexpr uint32_t kProfiles[] = {44,  66,  77,  83,  86,  88,  100, 110,
+	                                         118, 122, 128, 134, 135, 138, 139, 244};
+	static constexpr uint32_t kLevels[] = {9,  10, 11, 12, 13, 20, 21, 22, 30, 31,
+	                                       32, 40, 41, 42, 50, 51, 52, 60, 61, 62};
+	auto in = [](uint32_t v, const auto &set) {
+		for (uint32_t x : set)
+			if (x == v)
+				return true;
+		return false;
+	};
+	if (!in(s.profile_idc, kProfiles) || !in(s.level_idc, kLevels) ||
+	    s.seq_parameter_set_id > 31 || s.seq_parameter_set_id != ppsSps ||
+	    s.frame_mbs_only_flag > 1 || s.pic_width_in_mbs_minus1 > 1023 ||
+	    s.pic_height_in_map_units_minus1 > 1023)
+		return false;
+	// The coded size, and the step it comes in: a surface of the picture's size rounds up to it.
+	const uint64_t across = 16 * ((uint64_t)s.pic_width_in_mbs_minus1 + 1);
+	const uint64_t step = 16 * (2 - (uint64_t)s.frame_mbs_only_flag);
+	const uint64_t down = step * ((uint64_t)s.pic_height_in_map_units_minus1 + 1);
+	return width <= across && width + 16 > across && height <= down && height + step > down;
+}
+
+bool chooseSpsLayout(const uint8_t *record, uint32_t ppsSps, uint32_t width, uint32_t height,
+                     SpsLayout *layout, Sps *sps, NoLayout *why)
+{
+	int found = 0;
+	for (SpsLayout l : {SpsLayout::kSixConstraintFlags, SpsLayout::kFourConstraintFlags}) {
+		const Sps s = spsIn(record, l);
+		if (spsFits(s, ppsSps, width, height)) {
+			found++;
+			*layout = l;
+			*sps = s;
+		}
+	}
+	if (found == 1)
+		return true;
+	*why = found ? NoLayout::kMany : NoLayout::kNone;
+	return false;
 }
 
 bool writePps(const Pps &p, const Sps &s, std::vector<uint8_t> &out)
