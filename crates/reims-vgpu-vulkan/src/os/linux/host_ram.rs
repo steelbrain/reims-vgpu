@@ -548,10 +548,6 @@ mod tests {
     /// runs' bytes are the buffer's, and every byte beside them, the guest CPU's, is as it was. One
     /// that does not copy the RAM refuses each copy, encoding nothing.
     #[test]
-    #[ignore = "metal2vulkan 9316c1aa3f refuses a run off whole 4 KiB pages (host_ram/copy.rs, \
-                Problem::HostRam); runs at once at the pin whose copies by runs take runs that \
-                start on 4 bytes and end at any byte (unfixed-bugs ledger, the laid-out caches' \
-                copies by runs)"]
     fn a_copy_by_runs_scatters_runs_inside_pages() {
         let device = dev();
         let length = 8 * MIB;
