@@ -1,0 +1,59 @@
+{
+  "architecture": "x86_64",
+  "bundle": {
+    "Contents/Info.plist": {
+      "mode": 420,
+      "sha256": "aa9221c62185214ffcc06ed53e074f4418009cb170dc02c7596cf3effb150cd9",
+      "size": 1433
+    },
+    "Contents/MacOS/Graft": {
+      "mode": 493,
+      "sha256": "3c15fa240ec9588d264be3cee67fc80d09e9f3c0c9cc40f2a3ecf29e41885c49",
+      "size": 70024
+    }
+  },
+  "format": 1,
+  "sources": {
+    "Makefile": "8550bc88f0a487567416042273280d9821a8154e1e9ef4f15d952f03930174d5",
+    "consumer/Start.cpp": "4b53211f0577bb202e2f185a9d200d541f516dd8c62ac0295801d34280b6a857",
+    "include/graft/Graft.h": "6ae58960edcfc6fe1ee6474958d75728f767335adc70d8cccd54f834ec2f8cfd",
+    "src/Binding.h": "fd17cf8ae7f2709414c34f80f260630685ecc005b8873b0fa810b60314e40845",
+    "src/Consumer.cpp": "b9f3b9f751439d596c0058bfff808916d348279668482e61fa48a391a56d7685",
+    "src/Consumer.h": "c8b6ffd3137840a649eafaef5c5076cbb16f5a69262fd1886ce0a334b81decc0",
+    "src/Fixup.h": "01a2da44f72fa78abe4b3951d42991ceb7aadd4cd545de1301a67e6af0acda67",
+    "src/Info.plist": "b3d1d3ef234971253994dda75cc1169b8801bddb578baa114e3ca9a570041241",
+    "src/KernelBinding.cpp": "e8f74fb8634cab7ff3d6ab2dc24c07b8cb9d5b661615718dbe6d45e1bb475758",
+    "src/KernelBinding.h": "cb61bc6fa15be43af05121c96576c4c12ff29d837c6a2955b36019d09cecb501",
+    "src/KernelWrite.cpp": "fa1f7a6f643b7cba27e6ff77c5271ce79c7bcfb2aa0c748410d7fba17a3e5a9c",
+    "src/KernelWrite.h": "09ab7ecc2dc6ed8fdc2ce63937d91be17f17c37c4de126183186d0a95024f7e0",
+    "src/Layout.h": "9f9d38830b07ed5a98c797c6f311e6d29b3c9f05fad2a0befa551b2ef3aa9596",
+    "src/Log.cpp": "660cdc12067e6e28eac9b3f01865676d685d54d1dbcd67854163346afccd09cf",
+    "src/Log.h": "947e6e7ed0a6f59efaa6aafe1f5d7446c345355877e305aa2ad6f0c444e9dfbb",
+    "src/MachO.h": "1818c512be67d022d2b604008f3e85a534d15569d06b666bbd396f3218f45a7b",
+    "src/Manifest.h": "62b1c9577d4059f85b51e910857b05e9c52d7a6b27a94ad8582d2ce4a15f2821",
+    "src/Memory.h": "6324f7df8fbb30378c81a58933d38646c59d1e67dc776c7d4fb4622f84b69183",
+    "src/Resolve.h": "f17ec90d053435f0ea8f3e4252192d62fc0fd7e852be466e54319d1c2404912b",
+    "src/Route.cpp": "5e23ac044880b888c5189b1eb6848645c9e45d4926de3d7975973f4341366427",
+    "src/Route.h": "2e254bfe93db54862708d9c2189b99f9f2cc55b313bfbdff9a4852201185d59d",
+    "src/RuntimeImage.cpp": "cd6b574540d75d8568a6979c6d782eead7de1b83032a732e0e81289aa4dd5636",
+    "src/RuntimeImage.h": "0de04670686dfaacb2d1ffa1158ba5e9ce949526e61892ce4717711e582621d7",
+    "src/Start.cpp": "d20a5092d0628d31880cc8d14d1b2a587479f9a81de8cc735182ff83e4d81596",
+    "src/Vtable.h": "7c5f395ea93c31f842680929d50dbf09cdc6d2c9f0d2b0fee0b9b5b16a5b8f3d",
+    "src/WritePlan.h": "250ebdd11fc2e069bb69ad2d86d0a1a5afe63093e28a352213d90acfd7336b49",
+    "src/X86Route.h": "9ca7b067b7e761a4d1ed8bded01f6eca5f9eeeb9ce915c00704a268b7781c123",
+    "tools/README.md": "e201b70ba6220b55d640f1b892f960445226dee56e60959688755f9d2c996eb5",
+    "tools/build_record.py": "dfb719d26a954328f0896c295c4f85e6497a30f0b5935b8b2e70a3d88e8d15b3",
+    "tools/consumer.mk": "2acce0fcefea8394e98c039aa1d1ed12a248370f4a81476867869ce436533674",
+    "tools/consumer.py": "06de2aa063412378dcb25a21c60710448e67f7c206e803e07e6ad19d41ed62b1",
+    "tools/graft_macho.py": "490ff319a4ec2efe985a8c2dea4b67f9c696766690c44ab3e1b91cdb01119415",
+    "tools/prelink.py": "314328e26c238ce461c76beacd4d4837cf56c77f1c8b7a784b0c8af518a9de62",
+    "tools/vendor.py": "be2c346a879dce37a9982444e98faa8db9bfcaa43a81ea2546889ee18b9bab16"
+  },
+  "toolchain": {
+    "compiler": "Apple clang version 21.0.0 (clang-2100.4.1.1)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix",
+    "linker": "@(#)PROGRAM:ld PROJECT:ld-27106.1\nBUILD 19:06:34 Oct 19 2026\nconfigured to support archs: armv6 armv7 armv7s arm64 arm64e arm64_32 i386 x86_64 x86_64h armv6m armv7k armv7m armv7em armv8m.main armv8.1m.main\nLTO support using: LLVM version 21.0.0 (static support for 30, runtime is 30)\nTAPI support using: Apple TAPI version 21.0.0 (tapi-2100.3.8.1)",
+    "sdk_build": "26B118",
+    "sdk_version": "27.2",
+    "xcode": "Xcode 27.2\nBuild version 27B52"
+  }
+}
