@@ -1167,6 +1167,27 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         made.map(|b| b.map(|raw| self.buffer(raw, None)))
     }
 
+    /// The runtime's exportable buffer (`new_exportable_buffer`): a block of its own, exportable
+    /// as an opaque file descriptor, its GPU address placed by the runtime rather than as Metal
+    /// places a new buffer's, as nothing of Metal's makes one. Any refusal (a device that exports
+    /// no buffer's memory, `RuntimeGap::ExportableMemory`, among them) answers `None`, logged at
+    /// debug, and the caller makes the buffer as any other.
+    fn new_exportable_buffer_of_length(
+        &self,
+        _on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<VulkanBuffer>> {
+        let options = crate::gpu::resource_options("newBufferWithLength:options:", options);
+        match plain(|| self.raw.new_exportable_buffer(length, options)) {
+            Ok(raw) => Ok(Some(self.buffer(raw, None))),
+            Err(error) => {
+                log::debug!("no exportable buffer of {length} bytes: {error}");
+                Ok(None)
+            }
+        }
+    }
+
     /// A queue of at most 64 uncompleted command buffers, as Metal's. A first use of Metal's
     /// device ([`metal_space::FirstUse::Queue`]).
     fn new_command_queue(&self) -> Option<VulkanCommandQueue> {

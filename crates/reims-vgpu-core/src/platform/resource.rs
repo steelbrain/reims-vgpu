@@ -89,6 +89,35 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
     /// sel: replaceBackingWithRanges:readOnly: SPI
     /// `false` makes core throw "Failed to replace buffer backing".
     fn replace_backing(&self, ranges: &P::AddressRangeArray, read_only: bool) -> RaiseResult<bool>;
+    /// No Metal counterpart: the buffer's memory as a new file descriptor another API imports,
+    /// with what the import names ([`ExportedMemory`]), where the buffer was made exportable
+    /// ([`GpuDevice::new_exportable_buffer_of_length`](super::device::GpuDevice::new_exportable_buffer_of_length)).
+    /// `Err` says why not: the default, and a buffer made as any other.
+    #[cfg(unix)]
+    fn export_memory(&self) -> Result<ExportedMemory, String> {
+        Err("the platform exports no buffer's memory".to_owned())
+    }
+}
+
+/// A buffer's memory, exported for another API to import ([`Buffer::export_memory`]): an opaque
+/// file descriptor of its allocation (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`), which
+/// CUDA's `cuImportExternalMemory` takes with the allocation's size and whether it is dedicated,
+/// and the buffer's place in it, which `cuExternalMemoryGetMappedBuffer` takes. The buffer must
+/// outlive what the importer reads or writes through it.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ExportedMemory {
+    /// A new descriptor, the caller's: an import that succeeds takes it, else dropping it closes
+    /// it.
+    pub fd: std::os::fd::OwnedFd,
+    /// The allocation's bytes.
+    pub allocation_size: u64,
+    /// The buffer's first byte in the allocation.
+    pub offset: u64,
+    /// The buffer's bytes.
+    pub length: u64,
+    /// Whether the allocation is the buffer's dedicated one, which an import names so.
+    pub dedicated: bool,
 }
 
 /// `MTLTexture` (with `MTLTextureSPI`).

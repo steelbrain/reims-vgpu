@@ -23,8 +23,8 @@ use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::ToUsize;
 use reims_vgpu_core::platform::resource::{
-    Buffer, ComputePipeline, DepthStencilState, GpuResource, Heap, Library, RenderPipeline,
-    SamplerState, Texture,
+    Buffer, ComputePipeline, DepthStencilState, ExportedMemory, GpuResource, Heap, Library,
+    RenderPipeline, SamplerState, Texture,
 };
 use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
 use reims_vgpu_core::platform::values::{SurfaceMatrix, SurfacePlane};
@@ -1287,6 +1287,19 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
                     }
                 })
             })
+    }
+
+    /// The runtime's export of the buffer's memory (`export_memory_fd`): a buffer the runtime
+    /// made exportable ([`VulkanDevice`]'s `new_exportable_buffer_of_length`), else refused.
+    fn export_memory(&self) -> Result<ExportedMemory, String> {
+        let exported = plain(|| self.raw.export_memory_fd()).map_err(|error| error.to_string())?;
+        Ok(ExportedMemory {
+            fd: exported.fd,
+            allocation_size: exported.allocation_size,
+            offset: exported.offset,
+            length: exported.length,
+            dedicated: exported.dedicated,
+        })
     }
 }
 

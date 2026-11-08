@@ -118,6 +118,23 @@ pub trait GpuDevice<P: Platform>: Handle {
         length: u64,
         options: u64,
     ) -> RaiseResult<Option<P::Buffer>>;
+    /// No Metal counterpart: a buffer as [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s,
+    /// in an allocation of its own whose memory another API imports
+    /// ([`Buffer::export_memory`](super::resource::Buffer::export_memory)): the host's video
+    /// writes its pictures into the IOSurface device caches so, on its own GPU work. `Ok(None)`
+    /// where the platform makes none (the default, and a device that exports no buffer's memory),
+    /// and the caller makes the buffer as any other. Reached both under a handler and with none:
+    /// `on` says which this call is.
+    #[cfg(unix)]
+    fn new_exportable_buffer_of_length(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+    ) -> RaiseResult<Option<P::Buffer>> {
+        let _ = (on, length, options);
+        Ok(None)
+    }
     /// sel: newCommandQueue
     /// Never nil-checked. No path reaches it under a handler: a raise inside it dies at the send.
     fn new_command_queue(&self) -> Option<P::CommandQueue>;
