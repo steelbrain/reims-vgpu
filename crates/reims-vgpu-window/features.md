@@ -21,16 +21,14 @@ them; its `manual` checks are on a Linux host's guest boot.
 | `REIMS_VGPU_WINDOW=0` | QEMU stays headless under `-display none` (QEMU reads it) |
 | `REIMS_VGPU_WINDOW_BORDERLESS=1` | borderless windows that fill their screens |
 | `REIMS_VGPU_WINDOW_SCREENS=1,0` | display i opens on the host screen the list's i-th entry names |
-| `REIMS_VGPU_WINDOW_REFRESH=120` | the refresh rate of the modes offered to the guest |
-| `resolution=2560x1600`, `resolution=2560x1600@200`, `resolution=host` | the guest's mode, and the density it is told (QEMU's apple-gfx property; 1920x1080 at 1× by default) |
+| `resolution=2560x1600` | the mode the window opens for, and the guest is offered until the window's pixels are known (QEMU's reims-graphics-pci property; 1920x1080 by default) |
 | `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS, built with the `macos-sdl` feature (on by default): SDL3's window in place of AppKit's ("On macOS through SDL3" below) |
 
 Unset or unparsable values give the defaults below.
 `test: env::unset_or_unparsable_values_are_the_defaults`,
 `test: env::the_window_is_appkits_unless_sdl_is_named`,
 `test: env::borderless_takes_the_usual_words`,
-`test: env::the_screen_list_is_all_or_nothing`,
-`test: env::the_refresh_rate_is_a_positive_rate_up_to_1000`
+`test: env::the_screen_list_is_all_or_nothing`
 
 ## Opening
 
@@ -41,18 +39,13 @@ Unset or unparsable values give the defaults below.
   Input. `manual`
 - The title is "Reims vGPU", with " (port N)" for a display on port N above
   0. `test: handle::a_window_s_title_is_reims_vgpu_and_its_port`
-- A new window shows a guest point per host point, shrunk to fit the
-  screen's visible area, on whole pixels, a multiple of 16 wide and even
-  high (the steps of the guest's modes, below): on a Retina
-  screen, a HiDPI guest one guest pixel per screen pixel, a 1× guest (the
-  default 1920×1080) scaled up on the GPU, not opened at half size. The guest's scale is the one a macOS 13.6 guest
-  picks from the size it is told: the width in whole millimetres to nearest,
-  then in whole centimetres rounded up, HiDPI from 146.67 ppi across it for
-  a mode at least 1920 pixels wide.
+- A new window shows its mode a guest pixel per host point, shrunk to fit
+  the screen's visible area, on whole pixels, a multiple of 16 wide and even
+  high (the steps of the guest's modes, below): on a Retina screen the
+  default 1920×1080 opens at 1920×1080 points, 3840×2160 pixels, where they
+  fit, not at half size.
   `test: geometry::a_new_window_shows_a_guest_point_per_host_point`,
-  `test: geometry::a_new_window_shrinks_to_the_visible_area`,
-  `test: policy::the_guest_scale_follows_the_told_density`,
-  `test: policy::the_guest_scale_follows_its_reading_in_whole_centimetres`
+  `test: geometry::a_new_window_shrinks_to_the_visible_area`
 - Display i opens on host screen i, or on the main screen when there is no
   screen i. `test: screens::display_i_opens_on_screen_i`,
   `test: screens::a_missing_screen_is_the_main_one`,
@@ -122,48 +115,14 @@ Unset or unparsable values give the defaults below.
 
 ## Matching the host's screen
 
-- By default the guest runs 1920×1080 at 1×, offered first with the standard
-  sizes within it, at the screen's refresh rate; the window scales it on the
-  GPU. A 4K HiDPI guest runs much slower. The screen's rate is the one it is
-  set to (its current mode's): a ProMotion screen set to 60 Hz gives the
-  guest 60, not the 120 it offers; where the current mode gives no rate, the
-  highest of the screen's modes of its size, else 60 Hz.
-  `test: policy::a_chosen_mode_comes_first_with_the_sizes_within_it`,
-  `test: policy::a_chosen_mode_is_1x`,
-  `test: screens::a_screen_runs_at_its_current_mode_s_rate`
-- With `resolution=<w>x<h>@<ppi>`, the chosen mode is told that density in
-  place of 1×. Where the guest reads it as 146.67 ppi or more (its width in
-  whole millimetres to nearest, then in whole centimetres rounded up:
-  2560x1600@148, 440.39 mm, reads 44 cm, 147.8 ppi), it runs a HiDPI
-  desktop at the mode's pixels (2560x1600@200 looks like 1280x800), which a
-  windowed window on a Retina screen shows one guest pixel per screen pixel
-  where half the mode fits; below that (@146 reads 45 cm, 144.5 ppi), and
-  for a mode narrower than 1920 pixels (1280x800@220 ran 1×), a 1× desktop
-  the window scales up on the GPU, not one shown at half size. A borderless
-  window fits either to its screen.
-  `test: policy::a_chosen_mode_at_a_chosen_ppi`,
-  `test: policy::a_chosen_density_tells_the_scale_the_guest_runs`,
-  `test: policy::the_guest_scale_follows_its_reading_in_whole_centimetres`,
-  `manual` (a VM boot)
-- With `resolution=host`, the guest is offered modes that fill the
-  window's screen: the largest 16:10, 16:9 and 4:3 sizes within its pixels,
-  16:10 first, then smaller standard sizes of each ratio, at the screen's
-  refresh rate. Their density follows the screen's scale: a Retina
-  screen gets a HiDPI (2×) guest desktop, a 1× screen a 1× one.
-  `test: policy::offered_modes_for_a_built_in_retina_screen`,
-  `test: policy::offered_modes_for_a_5k_screen`,
-  `test: policy::offered_modes_for_a_1080p_screen`,
-  `test: policy::offered_modes_are_whole_and_distinct`,
-  `test: policy::the_refresh_rate_can_be_overridden`,
-  `test: policy::the_density_is_the_screens`
-- With no host screen to match (as for a VM started from an ssh shell, with
-  no window system to reach), the guest is still offered the chosen mode and
-  the sizes within it, or 1920×1080 at 1× with `resolution=host`, at 60 Hz
-  or `REIMS_VGPU_WINDOW_REFRESH`'s rate, so it boots.
-  `test: policy::a_chosen_mode_without_a_screen_runs_at_60_hz`,
+- The guest's mode runs at the refresh rate of the screen the window opens
+  on, the one the screen is set to (its current mode's): a ProMotion screen
+  set to 60 Hz gives the guest 60, not the 120 it offers; where the current
+  mode gives no rate, the highest of the screen's modes of its size, else
+  60 Hz. With no host screen (as for a VM started from an ssh shell, with no
+  window system to reach), 60 Hz.
+  `test: screens::a_screen_runs_at_its_current_mode_s_rate`,
   `manual` (a VM boot from an ssh shell)
-- Modes the host sets (QEMU's `display-modes`) replace the offered ones.
-  `manual`
 
 ## Borderless
 
@@ -254,8 +213,8 @@ Unset or unparsable values give the defaults below.
 
 ## Scrolling
 
-Where the host takes smooth scrolling (QEMU's apple-gfx), and the guest's
-pointing device takes it (vmapple's `usb-vmapple-tablet`):
+Where the host takes smooth scrolling (QEMU's reims-graphics-pci), and the
+guest's pointing device takes it (vmapple's `usb-vmapple-tablet`):
 
 - Trackpads and the Magic Mouse scroll the guest as far as the host reports,
   event by event, with the gesture's phases and its momentum, so the guest
