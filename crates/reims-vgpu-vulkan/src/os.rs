@@ -70,6 +70,9 @@ pub use macos::msg;
 /// (`os/macos.rs`).
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::refusing_imports;
+/// Every physical device the host's loader lists, as the window's probe read it, which the
+/// library's choice of device reads (`crate::device_choice`).
+pub(crate) use wsi::seen_devices;
 pub use wsi::{add_window_extensions, present_fences};
 
 #[cfg(test)]

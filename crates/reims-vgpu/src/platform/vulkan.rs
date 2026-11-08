@@ -19,7 +19,8 @@ impl ApiPlatform for VulkanPlatform {
         crate::singleton::platform()
     }
 
-    /// The runtime's system default device (`MTLCreateSystemDefaultDevice()`), or the device
+    /// The process's default device (`MTLCreateSystemDefaultDevice()`, the GPU the platform's
+    /// choice of device picks where the host has more than one), or the device
     /// whose registry ID, as the platform answers it, is `id` (`Platform::open_device`): the
     /// default device answers Metal's `registryID` of the same GPU, which is what a host
     /// names it by, and any other device the runtime's own ID.

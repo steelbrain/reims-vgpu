@@ -141,12 +141,12 @@ impl VulkanPlatform {
         }
     }
 
-    /// The runtime's system default device (`MTLCreateSystemDefaultDevice`), for tests; `None`
+    /// The process's default device (`MTLCreateSystemDefaultDevice`, [`default_device`]): `None`
     /// where the runtime finds no Vulkan device it can use, or no Vulkan loader. Any other
     /// refusal dies here, naming it ([`made_devices`]).
     pub fn system_default_device() -> Option<VulkanDevice> {
         made_devices("MTLCreateSystemDefaultDevice()", || {
-            rt::Device::system_default_with(device_options()).map(|d| vec![d])
+            default_device().map(|d| vec![d])
         })
         .pop()
         .map(device::adopt)
@@ -178,9 +178,9 @@ const OPEN_DEVICE: &str = "MTLCopyAllDevices()";
 
 /// The device of registry ID `registry_id` ([`device::registry_id`]) that an open answers
 /// ([`Platform::open_device`]): the device of that ID the process adopted, where there is one,
-/// with no runtime call; else the runtime's system default device, of those `default` makes
-/// (none where the runtime refuses it, whose refusal `every` then decides), where its ID is
-/// `registry_id`; else the one of that ID among those `every` makes, the runtime's
+/// with no runtime call; else the process's default device ([`default_device`]), of those
+/// `default` makes (none where the runtime refuses it, whose refusal `every` then decides), where
+/// its ID is `registry_id`; else the one of that ID among those `every` makes, the runtime's
 /// `Device::all_with`, which makes a device of every physical device there is. Each found is
 /// adopted ([`device::adopt`]).
 ///
@@ -209,18 +209,16 @@ fn opened(
 /// A device of the process, for an answer every device gives alike, at the one macOS release
 /// whose Metal the runtime answers as (`rt::MACOS_RELEASE`): a pixel format's description and a
 /// texture level's layout ([`crate::gpu::format_info`]). The first device the platform adopted;
-/// asked before any is, the runtime's system default device, made for it, which dies as
-/// [`made_devices`] does where the runtime makes none, at `sel`, the call that asks. Kept once
-/// found, as the platform keeps every device it adopts.
+/// asked before any is, the process's default device ([`default_device`]), made for it, which
+/// dies as [`made_devices`] does where the runtime makes none, at `sel`, the call that asks. Kept
+/// once found, as the platform keeps every device it adopts.
 pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
     static DEVICE: OnceLock<rt::Device> = OnceLock::new();
     if let Some(kept) = DEVICE.get() {
         return kept;
     }
     let device = device::first_adopted().unwrap_or_else(|| {
-        let made = made_devices(sel, || {
-            rt::Device::system_default_with(device_options()).map(|d| vec![d])
-        });
+        let made = made_devices(sel, || default_device().map(|d| vec![d]));
         made.into_iter()
             .next()
             .unwrap_or_else(|| refused(sel, &rt::Error::NoDevice))
@@ -454,14 +452,35 @@ const SHADER_CACHE_CAPACITY: u64 = 1 << 30;
 #[cfg(test)]
 const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan-tests";
 
-/// The runtime's registry ID of its system default device, read once: `None` where it has none.
+/// The runtime's registry ID of the process's default device ([`default_device`]), read once:
+/// `None` where it has none.
 pub(crate) fn default_device_registry_id() -> Option<u64> {
-    static DEFAULT: LazyLock<Option<u64>> = LazyLock::new(|| {
-        rt::Device::system_default_with(device_options())
-            .ok()
-            .map(|d| d.registry_id())
-    });
+    static DEFAULT: LazyLock<Option<u64>> =
+        LazyLock::new(|| default_device().ok().map(|d| d.registry_id()));
     *DEFAULT
+}
+
+/// The process's default device, which every default open makes or finds
+/// ([`VulkanPlatform::system_default_device`], [`answering_device`],
+/// [`default_device_registry_id`] and [`Platform::open_device`]): the device of the physical
+/// device the library's choice names, by its registry ID ([`crate::device_choice::chosen`]),
+/// where that is not the runtime's system default device; else, or where the runtime refuses the
+/// one chosen, the runtime's system default device (`Device::system_default_with`), as on a host
+/// of one GPU. Both with [`device_options`], so a device of the physical device that lives is the
+/// one answered.
+pub(crate) fn default_device() -> Result<rt::Device, rt::Error> {
+    let options = device_options();
+    if let Some(id) = crate::device_choice::chosen() {
+        match rt::Device::with_registry_id(id, options) {
+            Ok(device) => return Ok(device),
+            Err(e) => log::warn!(
+                target: "reims_vgpu_vulkan::device_choice",
+                "the runtime refused the chosen Vulkan device, registry ID {id:#x} ({e}): the \
+                 runtime's system default device instead"
+            ),
+        }
+    }
+    rt::Device::system_default_with(options)
 }
 
 impl Platform for VulkanPlatform {
@@ -579,8 +598,7 @@ impl Platform for VulkanPlatform {
             registry_id,
             || {
                 made_devices(OPEN_DEVICE, || {
-                    let default = rt::Device::system_default_with(device_options());
-                    Ok(default.ok().into_iter().collect())
+                    Ok(default_device().ok().into_iter().collect())
                 })
             },
             || made_devices(OPEN_DEVICE, || rt::Device::all_with(device_options())),
@@ -804,15 +822,12 @@ pub(crate) mod tests {
     /// default device found is adopted, so an open of it again makes no runtime call at all
     #[test]
     fn an_open_of_the_default_device_makes_no_other() {
-        let raw = rt::Device::system_default_with(device_options()).unwrap();
+        let raw = default_device().unwrap();
         let id = device::registry_id(&raw);
         let every = || -> Vec<rt::Device> { panic!("every device was asked for") };
         let default = || {
             made_devices(OPEN_DEVICE, || {
-                Ok(rt::Device::system_default_with(device_options())
-                    .ok()
-                    .into_iter()
-                    .collect())
+                Ok(default_device().ok().into_iter().collect())
             })
         };
         let found = opened(id, default, every).unwrap();

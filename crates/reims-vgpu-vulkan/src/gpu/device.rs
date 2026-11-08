@@ -5,7 +5,8 @@
 //!   from it, have the same identity, as one `MTLDevice` does. The objects made from a device hold
 //!   its handle.
 //! - **Capabilities** are read once per device object ([`crate::gpu::caps`]) and shared.
-//! - **The registry ID** is Metal's default device's for the runtime's system default device,
+//! - **The registry ID** is Metal's default device's for the process's default device
+//!   (`crate::platform::default_device`),
 //!   asked of Metal at run time on macOS ([`registry_id`]), which is what a host names it by; the
 //!   runtime's own on Linux.
 //! - **A texture over an IOSurface** is a debug line under this module's target
@@ -213,7 +214,8 @@ pub(crate) fn unshared_queue(
     raw.new_command_queue_unshared(count)
 }
 
-/// The registry ID this platform answers for `raw`: for the runtime's system default device,
+/// The registry ID this platform answers for `raw`: for the process's default device
+/// ([`crate::platform::default_device`]),
 /// Metal's for its system default device, asked at run time on macOS
 /// ([`crate::os::default_registry_id`]), and the runtime's own for any other device, or where
 /// there is no Metal default device.
