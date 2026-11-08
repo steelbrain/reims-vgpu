@@ -47,6 +47,12 @@
 //!   ([`CLIENTS_OFFSET`]) drops the cache uncopied: no process holds the surface to read its
 //!   pages, which the kext frees or gives out again only once the release is answered, and the
 //!   kernel zero-fills what it gives out again.
+//!   A copy into the pages (a download's, a release's, an early copy) of a cache whose surface's
+//!   layout the kext's ask gave (on a GPU that shares the CPU's memory) copies the surface's
+//!   texels alone, each plane's rows' bytes ([`texel_spans`]): the bytes beside them, between
+//!   rows or outside the planes, are the guest's CPU's alone, as no texture's texel lies there
+//!   and the device makes no buffer over an IOSurface, so they stay as it wrote them, whatever a
+//!   render over the cache leaves in its own. A fill copies every byte in.
 //!   A download or a release copies nothing where, as its copy is made (at once, or in the
 //!   finish of a buffer begun before it), the CPU's generation in the block's header
 //!   ([`CPU_GEN_OFFSET`]) has moved past the cache's: the lock that asked gave up waiting for the
@@ -154,6 +160,7 @@ use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::NsRange;
+use reims_vgpu_core::platform::values::PagesPlane;
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
@@ -213,6 +220,11 @@ pub(crate) struct SurfaceCache<P: Platform> {
     pages: Option<CachePages<P>>,
     /// The surface's bytes.
     length: u64,
+    /// The bytes of the surface's texels, where the kext's ask laid the surface out (its
+    /// planes' rows, [`texel_spans`]): a copy out of the cache copies those alone, so the bytes
+    /// of the pages beside them, between rows or outside the planes, stay as the guest's CPU
+    /// wrote them, whatever the cache holds there. `None` copies all of the surface's bytes.
+    texels: Option<Vec<Range<u64>>>,
     /// The CPU's generation of the surface the cache holds; `None` until its first fill.
     generation: Option<u64>,
     /// The writes of the host's devices over the pages its last fill read ([`Watched::writes`]):
@@ -917,16 +929,19 @@ impl<P: Platform> SurfaceCaches<P> {
         view: &Arc<SurfaceView<P>>,
         host_pages: Vec<Range<u64>>,
         generation: u64,
+        layout: Option<Vec<PagesPlane>>,
     ) -> RaiseResult<bool> {
         let pages = || {
             buffer_over(device, view, 0, view.length(), 0, None).map(|b| b.map(CachePages::View))
         };
-        self.make_with(device, block, view.length(), host_pages, generation, pages)
+        let length = view.length();
+        self.make_with(device, block, length, host_pages, generation, layout, pages)
     }
 
     /// A cache for the block at `block`, named by its pages' runs with no view
     /// ([`super::surface_pages`]): `runs` in the surface's order, and `unmade`, which makes the
     /// view where the platform refuses a copy by them; else as [`Self::make`].
+    #[allow(clippy::too_many_arguments)] // make's, and the runs
     pub(crate) fn make_by_runs(
         &mut self,
         device: &P::Device,
@@ -935,14 +950,23 @@ impl<P: Platform> SurfaceCaches<P> {
         unmade: Arc<Unmade<P>>,
         host_pages: Vec<Range<u64>>,
         generation: u64,
+        layout: Option<Vec<PagesPlane>>,
     ) -> RaiseResult<bool> {
         let length = unmade.length();
-        self.make_with(device, block, length, host_pages, generation, || {
-            Ok(Some(CachePages::Runs { runs, unmade }))
-        })
+        self.make_with(
+            device,
+            block,
+            length,
+            host_pages,
+            generation,
+            layout,
+            || Ok(Some(CachePages::Runs { runs, unmade })),
+        )
     }
 
-    /// [`Self::make`] of a cache of `length` bytes whose copies' other end `pages` makes.
+    /// [`Self::make`] of a cache of `length` bytes whose copies' other end `pages` makes, its
+    /// surface laid out as `layout` where the kext's ask gave it.
+    #[allow(clippy::too_many_arguments)] // make's, and what makes the pages
     fn make_with(
         &mut self,
         device: &P::Device,
@@ -950,6 +974,7 @@ impl<P: Platform> SurfaceCaches<P> {
         length: u64,
         host_pages: Vec<Range<u64>>,
         generation: u64,
+        layout: Option<Vec<PagesPlane>>,
         pages: impl FnOnce() -> RaiseResult<Option<CachePages<P>>>,
     ) -> RaiseResult<bool> {
         if let Some(cache) = self.by_block.get(&block) {
@@ -979,6 +1004,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 device: cache,
                 pages: Some(pages),
                 length,
+                texels: layout.as_deref().map(texel_spans),
                 generation: None,
                 host_read: 0,
                 written: false,
@@ -1079,6 +1105,8 @@ impl<P: Platform> SurfaceCaches<P> {
                 device: cache,
                 pages: None,
                 length,
+                // A deferred block's ask carries no layout (no host offers both).
+                texels: None,
                 generation: Some(0),
                 host_read: 0,
                 written: false,
@@ -1938,26 +1966,11 @@ impl<P: Platform> SurfaceCaches<P> {
             let Some(blit) = cb.blit_encoder(ON)? else {
                 continue;
             };
-            match (view, &cache.pages) {
-                (Some(pages), _) => blit.encode(
-                    ON,
-                    BlitCmd::CopyBufferToBuffer {
-                        source_buffer: Some(&cache.device),
-                        source_offset: 0,
-                        destination_buffer: Some(pages),
-                        destination_offset: 0,
-                        size: cache.length,
-                    },
-                )?,
-                (None, Some(CachePages::Runs { runs, .. })) => {
-                    // A copy by runs the platform refuses encodes nothing: the download that
-                    // follows copies, through the view it makes then (`copy`).
-                    if !blit.copy_to_guest_ram(ON, &cache.device, 0, runs)? {
-                        blit.encode(ON, BlitCmd::EndEncoding)?;
-                        continue;
-                    }
-                }
-                (None, _) => continue,
+            // A copy by runs the platform refuses encodes nothing: the download that follows
+            // copies, through the view it makes then (`copy`).
+            if !encode_out::<P>(&blit, cache, view)? {
+                blit.encode(ON, BlitCmd::EndEncoding)?;
+                continue;
             }
             blit.encode(ON, BlitCmd::EndEncoding)?;
             let landing = Landing::new();
@@ -3146,10 +3159,11 @@ impl<P: Platform> Caches<P> {
         view: &Arc<SurfaceView<P>>,
         host_pages: Vec<Range<u64>>,
         generation: u64,
+        layout: Option<Vec<PagesPlane>>,
     ) -> RaiseResult<bool> {
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
-        state.make(device, block, view, host_pages, generation)
+        state.make(device, block, view, host_pages, generation, layout)
     }
 
     /// A cache of zeros for the deferred block at `block` ([`SurfaceCaches::make_deferred`]),
@@ -3182,6 +3196,7 @@ impl<P: Platform> Caches<P> {
     /// A cache for the block at `block` named by its runs ([`SurfaceCaches::make_by_runs`]),
     /// after every command buffer begun and not finished that may write the cache it had, and the
     /// copies of it asked.
+    #[allow(clippy::too_many_arguments)] // make's, and the runs
     pub(crate) fn make_by_runs(
         &self,
         device: &P::Device,
@@ -3190,10 +3205,11 @@ impl<P: Platform> Caches<P> {
         unmade: Arc<Unmade<P>>,
         host_pages: Vec<Range<u64>>,
         generation: u64,
+        layout: Option<Vec<PagesPlane>>,
     ) -> RaiseResult<bool> {
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
-        state.make_by_runs(device, block, runs, unmade, host_pages, generation)
+        state.make_by_runs(device, block, runs, unmade, host_pages, generation, layout)
     }
 
     /// The deferred block at `block`'s pages taken copied ([`SurfaceCaches::attach_copied`]),
@@ -3324,6 +3340,97 @@ enum Way {
     Out,
 }
 
+/// The bytes of a surface laid out as `planes` that its texels are: each plane's rows'
+/// `row_bytes` from each row's start, in the surface's order, merged where one ends where the
+/// next starts, so a plane whose rows follow on with no bytes between them is one span. The
+/// planes lie in the surface's bytes (`surface_pages::layout_planes`).
+pub(crate) fn texel_spans(planes: &[PagesPlane]) -> Vec<Range<u64>> {
+    let mut rows: Vec<Range<u64>> = Vec::new();
+    for p in planes {
+        for row in 0..p.rows {
+            let start = p.offset.saturating_add(row.saturating_mul(p.bytes_per_row));
+            rows.push(start..start.saturating_add(p.row_bytes));
+        }
+    }
+    rows.sort_by_key(|r| r.start);
+    let mut spans: Vec<Range<u64>> = Vec::new();
+    for r in rows.into_iter().filter(|r| !r.is_empty()) {
+        match spans.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => spans.push(r),
+        }
+    }
+    spans
+}
+
+/// The runs of `runs`, host addresses of a surface's bytes in its order, that its bytes `span`
+/// lie in, cut to them.
+fn runs_of(runs: &[Range<u64>], span: &Range<u64>) -> Vec<Range<u64>> {
+    let mut out = Vec::new();
+    let mut at = 0u64;
+    for run in runs {
+        let len = run.end.saturating_sub(run.start);
+        let (from, to) = (span.start.max(at), span.end.min(at.saturating_add(len)));
+        if from < to {
+            out.push(run.start + (from - at)..run.start + (to - at));
+        }
+        at = at.saturating_add(len);
+        if at >= span.end {
+            break;
+        }
+    }
+    out
+}
+
+/// Encodes on `blit` the copy of `cache` out into its pages: of its texels alone where its
+/// surface's layout is known ([`SurfaceCache::texels`]), else of all its bytes; into `view`
+/// where given, else by the pages' runs where the cache has them. False where the platform
+/// refuses the first copy by runs, with nothing encoded.
+fn encode_out<P: Platform>(
+    blit: &P::BlitEncoder,
+    cache: &SurfaceCache<P>,
+    view: Option<&P::Buffer>,
+) -> RaiseResult<bool> {
+    let whole = 0..cache.length;
+    let spans = (cache.texels.as_deref()).unwrap_or(std::slice::from_ref(&whole));
+    match (view, &cache.pages) {
+        (Some(pages), _) => {
+            for span in spans {
+                blit.encode(
+                    ON,
+                    BlitCmd::CopyBufferToBuffer {
+                        source_buffer: Some(&cache.device),
+                        source_offset: span.start,
+                        destination_buffer: Some(pages),
+                        destination_offset: span.start,
+                        size: span.end - span.start,
+                    },
+                )?;
+            }
+            Ok(true)
+        }
+        (None, Some(CachePages::Runs { runs, .. })) => {
+            for (i, span) in spans.iter().enumerate() {
+                let into = runs_of(runs, span);
+                if !blit.copy_to_guest_ram(ON, &cache.device, span.start, &into)? {
+                    // The platform refuses copies by these runs from the first; a later refusal
+                    // leaves that span uncopied, as a copy not made.
+                    if i == 0 {
+                        return Ok(false);
+                    }
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "a device cache's copy by runs of its bytes {span:?} was refused after \
+                         the platform took its first: those bytes are not copied"
+                    );
+                }
+            }
+            Ok(true)
+        }
+        (None, _) => Ok(false),
+    }
+}
+
 /// A copied cache's Shared buffer for one copy ([`CachePages::Copied`]), which lives until the
 /// copy's command buffer completes; for a copy out of the cache, with the pages its bytes go
 /// into then.
@@ -3366,9 +3473,7 @@ fn copy<P: Platform>(
         (Some(CachePages::Runs { runs, .. }), Way::In) => {
             blit.copy_from_guest_ram(ON, runs, &cache.device, 0)?
         }
-        (Some(CachePages::Runs { runs, .. }), Way::Out) => {
-            blit.copy_to_guest_ram(ON, &cache.device, 0, runs)?
-        }
+        (Some(CachePages::Runs { .. }), Way::Out) => encode_out::<P>(&blit, cache, None)?,
         (Some(CachePages::View(_) | CachePages::Copied(_)) | None, _) => false,
     };
     let mut staged = None;
@@ -3392,20 +3497,23 @@ fn copy<P: Platform>(
             }
         }
         if let Some(CachePages::View(pages)) = &cache.pages {
-            let (from, to) = match way {
-                Way::In => (pages, &cache.device),
-                Way::Out => (&cache.device, pages),
-            };
-            blit.encode(
-                ON,
-                BlitCmd::CopyBufferToBuffer {
-                    source_buffer: Some(from),
-                    source_offset: 0,
-                    destination_buffer: Some(to),
-                    destination_offset: 0,
-                    size: cache.length,
-                },
-            )?;
+            match way {
+                // A fill copies all of the surface's bytes: those beside its texels are the
+                // cache's own to change.
+                Way::In => blit.encode(
+                    ON,
+                    BlitCmd::CopyBufferToBuffer {
+                        source_buffer: Some(pages),
+                        source_offset: 0,
+                        destination_buffer: Some(&cache.device),
+                        destination_offset: 0,
+                        size: cache.length,
+                    },
+                )?,
+                Way::Out => {
+                    encode_out::<P>(&blit, cache, Some(pages))?;
+                }
+            }
         }
         if let Some(CachePages::Copied(copied)) = &cache.pages
             && let Some(buffer) = device.new_buffer_of_length(ON, cache.length, STORAGE_SHARED)?
@@ -5531,6 +5639,116 @@ mod tests {
             (3, 1, 1),
             "the make's fill by runs, then two"
         );
+    }
+
+    /// A cache made for a block the device answered a cache with its surface's layout copies
+    /// out its texels alone: a download of a surface whose rows hold bytes between them copies
+    /// each row's texels into the pages, so the pages' bytes between rows, and those past the
+    /// last row, stay as the guest's CPU wrote them however the cache's own were scribbled; a
+    /// fill still copies all of the surface's bytes in
+    #[test]
+    fn a_download_of_a_laid_out_cache_leaves_the_bytes_between_rows() {
+        use super::super::surface_pages::tests::one_plane;
+        use reims_graphics::wire::RGFX_STATUS_CACHE;
+        use reims_vgpu_core::platform::values::PagesInPlace;
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.set_unified_memory(true);
+        let world = Arc::clone(r.p.world());
+        world.answer_surface_pages(PagesInPlace::No("the rows end inside a line".into()));
+        // Three rows a page apart of 48 bytes fewer texels, in four pages.
+        let (pitch, texels) = (page, page - 48);
+        let layout = one_plane(pitch, texels, 3);
+        assert_eq!(
+            r.pages_asking(BLOCK, &[(1, 4)], 4 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 4)], 4 * page, true),
+            RGFX_STATUS_OK
+        );
+        let fill: Vec<(u64, u64, u64)> = offsets(&r.p.call_log().since(mark));
+        assert_eq!(fill, [(0, 0, 4 * page)], "the fill copies every byte in");
+        queues(&mut r);
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let mark = r.p.call_log().mark();
+        r.dec
+            .surface_download(&r.device, BLOCK, Box::new(|| {}), no_raise());
+        let calls = r.p.call_log().since(mark);
+        let out = copies(&calls);
+        assert!(!out.is_empty() && out.iter().all(|&(from, _)| from == cache));
+
+        // The pages as the copies leave them: the CPU's bytes (1) where no copy lands, the
+        // cache's (0xee, every byte of it scribbled) where one does.
+        let mut pages = vec![1u8; (4 * page).to_usize()];
+        for (from, to, size) in offsets(&calls) {
+            assert_eq!(from, to, "each byte into its own place");
+            pages[from.to_usize()..(from + size).to_usize()].fill(0xee);
+        }
+        for row in 0..4u64 {
+            let at = (row * pitch).to_usize();
+            let (texel, rest) = pages[at..at + pitch.to_usize()].split_at(texels.to_usize());
+            let want = if row < 3 { 0xee } else { 1 };
+            assert!(texel.iter().all(|&b| b == want), "row {row}'s texels");
+            assert!(
+                rest.iter().all(|&b| b == 1),
+                "the bytes after row {row}'s texels"
+            );
+        }
+        assert_eq!(
+            offsets(&calls),
+            [
+                (0, 0, texels),
+                (pitch, pitch, texels),
+                (2 * pitch, 2 * pitch, texels)
+            ]
+        );
+    }
+
+    /// The (source offset, destination offset, size) of each copy in `calls`.
+    fn offsets(calls: &[Call]) -> Vec<(u64, u64, u64)> {
+        (calls.iter())
+            .filter(|c| c.sel == COPY)
+            .map(|c| {
+                let at = |i: usize| c.args[i].as_u64().unwrap_or(u64::MAX);
+                (at(1), at(3), at(4))
+            })
+            .collect()
+    }
+
+    /// The bytes of each plane's rows' texels, merged where rows follow on, in the surface's
+    /// order: two planes of rows with bytes between, one whose rows follow on, and rows of no
+    /// texels
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // spans of one range
+    fn texel_spans_are_each_plane_s_rows() {
+        let plane = |offset, bytes_per_row, row_bytes, rows| PagesPlane {
+            offset,
+            bytes_per_row,
+            row_bytes,
+            rows,
+        };
+        assert_eq!(
+            texel_spans(&[plane(4096, 64, 48, 2), plane(0, 256, 200, 2)]),
+            [0..200, 256..456, 4096..4144, 4160..4208]
+        );
+        assert_eq!(texel_spans(&[plane(0, 64, 64, 4)]), [0..256]);
+        assert_eq!(texel_spans(&[plane(0, 64, 0, 4)]), []);
+    }
+
+    /// The runs a span of a surface's bytes lies in, cut to it
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // spans of one range
+    fn runs_of_a_span_are_cut_to_it() {
+        let runs = [0x1000..0x2000, 0x8000..0x9000, 0x4000..0x5000];
+        assert_eq!(
+            runs_of(&runs, &(0x800..0x1800)),
+            [0x1800..0x2000, 0x8000..0x8800]
+        );
+        assert_eq!(runs_of(&runs, &(0x2000..0x2100)), [0x4000..0x4100]);
+        assert_eq!(runs_of(&runs, &(0..0x1000)), [0x1000..0x2000]);
     }
 
     /// A copy out of a cache by runs that the platform refuses, at a download, makes the block's

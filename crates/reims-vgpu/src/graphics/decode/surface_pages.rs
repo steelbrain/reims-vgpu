@@ -501,6 +501,9 @@ pub(crate) struct SurfaceViews<P: Platform> {
     by_runs: HashMap<u64, ByRuns<P>>,
     /// Each pages block's view, by block offset.
     private: HashMap<u64, Private<P>>,
+    /// The layout of each block answered that it needs a device cache, by block offset, until
+    /// the block's cached `SURFACE_PAGES` takes it for its cache ([`Self::take_layout`]).
+    laid_out: HashMap<u64, Vec<PagesPlane>>,
     /// The views made or taken last, the latest at the back.
     cache: VecDeque<Cached<P>>,
     counts: ViewCounts,
@@ -541,6 +544,7 @@ impl<P: Platform> SurfaceViews<P> {
             teardown,
             by_block: HashMap::new(),
             by_runs: HashMap::new(),
+            laid_out: HashMap::new(),
             private: HashMap::new(),
             cache: VecDeque::new(),
             counts: ViewCounts::default(),
@@ -897,6 +901,18 @@ impl<P: Platform> SurfaceViews<P> {
         }
     }
 
+    /// The block at `block` was answered that it needs a device cache, its surface laid out as
+    /// `planes`, which its cached `SURFACE_PAGES` takes for the cache ([`Self::take_layout`]).
+    pub(crate) fn laid_out(&mut self, block: u64, planes: Vec<PagesPlane>) {
+        self.laid_out.insert(block, planes);
+    }
+
+    /// The layout the block at `block` was answered a device cache with ([`Self::laid_out`]),
+    /// taken; `None` for a block no such answer laid out.
+    pub(crate) fn take_layout(&mut self, block: u64) -> Option<Vec<PagesPlane>> {
+        self.laid_out.remove(&block)
+    }
+
     /// The device's resets so far ([`Settle`]).
     pub(crate) fn resets(&self) -> u64 {
         self.resets
@@ -1075,6 +1091,7 @@ impl<P: Platform> SurfaceViews<P> {
         let view = self.by_block.remove(&offset).map(|(view, _)| view);
         let private = self.private.remove(&offset);
         let by_runs = self.by_runs.remove(&offset);
+        self.laid_out.remove(&offset);
         (view.is_some() || private.is_some() || by_runs.is_some()).then_some(Released {
             _view: view,
             _private: private,
@@ -1105,6 +1122,7 @@ impl<P: Platform> SurfaceViews<P> {
         let private = std::mem::take(&mut self.private);
         let cache = std::mem::take(&mut self.cache);
         self.by_runs.clear();
+        self.laid_out.clear();
         if let Err(refusal) = refusals::refusing(move || drop((views, private, cache))) {
             log::warn!(
                 target: "reims_vgpu::graphics",
@@ -1829,7 +1847,11 @@ pub(super) mod tests {
     }
 
     /// A surface of one plane of `rows` rows of `row_bytes` texel bytes `bytes_per_row` apart.
-    fn one_plane(bytes_per_row: u64, row_bytes: u64, rows: u64) -> RgfxSurfacePagesLayout {
+    pub(crate) fn one_plane(
+        bytes_per_row: u64,
+        row_bytes: u64,
+        rows: u64,
+    ) -> RgfxSurfacePagesLayout {
         let mut layout = RgfxSurfacePagesLayout {
             plane_count: 1,
             ..Default::default()

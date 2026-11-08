@@ -566,7 +566,11 @@ Stages:
       place. Where they do not, it answers `RGFX_STATUS_CACHE`, its view of
       the pages left in its cache of views, and the kext makes the surface's
       device cache and posts the block again cached, which takes that view
-      and the host's cache, kept from then on as above. A block asked with no
+      and the host's cache, kept from then on as above. Such a cache's copies
+      into the pages copy the surface's texels alone, each plane's rows from
+      the layout the ask gave, so the bytes between rows stay as the guest's
+      CPU wrote them, whatever a render over the cache leaves in its own
+      (`decode/surface_cache.rs`, "Download"). A block asked with no
       layout (an older bundle's) stays in place, as every block of such a
       host did before (`reims-vgpu`'s `graphics/decode/surface_pages.rs`,
       "Device caches where the pages cannot serve").

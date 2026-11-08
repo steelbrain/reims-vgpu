@@ -1487,12 +1487,13 @@ impl<P: Platform> GraphicsDecoder<P> {
             self.uncache_surface(device, block);
             return;
         }
-        let (view, by_runs, pages) = {
-            let views = self.shared.surface_views.lock();
+        let (view, by_runs, pages, layout) = {
+            let mut views = self.shared.surface_views.lock();
             (
                 views.view(block),
                 views.by_runs(block),
                 views.host_runs(runs),
+                views.take_layout(block),
             )
         };
         // The CPU's generation the kext wrote into the block's header as it cached the block, or
@@ -1500,7 +1501,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let generation = surface_cache::cpu_generation(&self.shared.region, block).unwrap_or(0);
         let (made, length) = match (view, by_runs) {
             (Some(view), _) => (
-                (self.surface_caches).make(device, block, &view, pages, generation),
+                (self.surface_caches).make(device, block, &view, pages, generation, layout),
                 view.length(),
             ),
             (None, Some((runs, unmade))) => {
@@ -1512,6 +1513,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Arc::clone(&unmade),
                     pages,
                     generation,
+                    layout,
                 );
                 if !matches!(made, Ok(true)) {
                     self.view_by_runs(device, block, &unmade);
@@ -1564,6 +1566,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             PagesInPlace::No(why) => {
                 v.asked(surface_pages::Asked::Cache);
                 let released = v.released(block);
+                // The cache the block's cached `SURFACE_PAGES` makes copies out the texels alone.
+                v.laid_out(block, planes.to_vec());
                 drop(v);
                 drop(released);
                 log::debug!(
