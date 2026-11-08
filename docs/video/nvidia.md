@@ -147,7 +147,10 @@ where it is NVIDIA's and CUDA opens it (`graphics/video_choice.rs`).
 - **Surfaces.** A picture holds its decode surface until it lands; the decoder
   has `AnnexBDecoder::SPARE_PICTURES` (2) beyond its references and the
   picture being decoded, and the session holds no more pictures unlanded than
-  that. Pictures land on the session's landing thread, in decode order.
+  that. Pictures land on the session's landing thread, in decode order, while
+  the next is decoded: a copy out holds the decoder's handle only for its map,
+  copies and unmap, and each ask after its decode's status, so NVDEC decodes
+  the next picture meanwhile (`nvdec::decoder`).
 
 ## The decoders
 

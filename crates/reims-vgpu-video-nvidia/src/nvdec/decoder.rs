@@ -954,8 +954,10 @@ impl Picture {
     /// Waits for the picture's decode, maps it, gives `plan` where `crop` of
     /// it lies on the GPU, makes the copies `plan` gives (the luma's, then
     /// the chroma's) and waits for them, and unmaps it, on every path. The
-    /// decoder's handle is held throughout, with the GPU's
-    /// context pushed. Each wait asks after its work until `deadline`
+    /// decoder's handle is held, with the GPU's context pushed, for each ask
+    /// after the decode alone, so that the decoder's next picture reaches
+    /// NVDEC while this one decodes, and then from the map to the unmap.
+    /// Each wait asks after its work until `deadline`
     /// (module docs): copies into pageable memory are made on the
     /// call thread, and their answer waited for, the rest queued on the
     /// decoder's stream, and the stream asked after. The outer `Err` is the
@@ -977,19 +979,29 @@ impl Picture {
         plan: impl FnOnce(&Mapped) -> (Copies, T),
     ) -> Result<Result<T, Error>, Missed> {
         let inner = &self.inner;
-        let mut target = inner.calls.lock();
-        inner.check_not_stalled()?;
-        let _current = inner.gpu.push()?;
         let deadline = deadline.at();
-        // The decode is asked after here, so that the map finds it done.
-        let status = wait::poll(deadline, || match decode_status(inner, self.index) {
-            Some(ffi::cuvidDecodeStatus_InProgress) => None,
-            status => Some(status),
+        // The decode is asked after first, so that the map finds it done, with the handle held
+        // for each ask alone: the decoder's next picture goes to NVDEC meanwhile, and decodes
+        // while this one is copied.
+        let status = wait::poll(deadline, || {
+            let asked = (|| {
+                let _calls = inner.calls.lock();
+                inner.check_not_stalled()?;
+                let _current = inner.gpu.push()?;
+                Ok::<_, Error>(decode_status(inner, self.index))
+            })();
+            match asked {
+                Ok(Some(ffi::cuvidDecodeStatus_InProgress)) => None,
+                asked => Some(asked),
+            }
         });
         let Some(status) = status else {
             return Err(self.stalled(Waiting::Decode, None));
         };
-        check_status(status)?;
+        check_status(status?)?;
+        let mut target = inner.calls.lock();
+        inner.check_not_stalled()?;
+        let _current = inner.gpu.push()?;
         let size = self.size();
         if *target != size {
             inner.reconfigure(size)?;
