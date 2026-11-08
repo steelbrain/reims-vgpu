@@ -1,7 +1,6 @@
-//! The guest's RAM that the host's own devices write, outside any guest GPU work: the video
-//! devices' frames, written into an IOSurface's pages by a CPU lend
-//! ([`crate::video::MappedSurface`]'s `write`) or by a device of the host (the decoders' zero
-//! copy, the scaler's GPU in place).
+//! The guest's RAM that the host's own devices write, outside any guest GPU work: the frames the
+//! graphics device's video arms decode into an IOSurface's pages, by the CPU or by a device of the
+//! host.
 //!
 //! A graphics device keeps the GPU's copy of an IOSurface in its GPU's memory where the kext asks
 //! (`graphics/decode/surface_cache.rs`), filled from the pages only when the guest's CPU
@@ -10,8 +9,7 @@
 //! use fills it from the pages, and no download copies it over them.
 //!
 //! The pages are named by their host addresses in the mapping of the guest's RAM the host gave
-//! the devices' memory maps: the IOSurface device keeps them for each guest page of a surface,
-//! and a graphics device reaches the same addresses through its own map of the RAM. A watcher is
+//! the device's memory map, which a graphics device reaches through its own map of the RAM. A watcher is
 //! called on the writer's thread once the write is in the pages, before the guest is told of it.
 //! The list's lock is a leaf: watchers are called after it is let go.
 
@@ -24,6 +22,10 @@ use reims_vgpu_core::sync::Mutex;
 pub(crate) trait Watcher: Send + Sync {
     /// The host's devices wrote `runs`, host addresses in the guest's RAM, in address order and
     /// apart ([`sorted`]).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the graphics device's video arms write the guest's pages")
+    )]
     fn wrote(&self, runs: &[Range<u64>]);
 }
 
@@ -38,6 +40,10 @@ pub(crate) fn watch(watcher: &Arc<dyn Watcher>) {
 }
 
 /// A device of the host wrote `runs`, [`sorted`] (module docs): each live watcher is told.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the graphics device's video arms write the guest's pages")
+)]
 pub(crate) fn wrote(runs: &[Range<u64>]) {
     if runs.is_empty() {
         return;

@@ -1,6 +1,5 @@
 //! What macOS's window asks of the graphics display's Vulkan sink ([`FrameSink`]): it presents
-//! itself, through a presenter over a swapchain of the window's `CAMetalLayer`, as the Vulkan
-//! platform's display sink does (`crate::window`'s `vulkan/macos.rs`).
+//! itself, through a presenter over a swapchain of the window's `CAMetalLayer`.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;

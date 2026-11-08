@@ -12,9 +12,8 @@
 //!   handles from std's threads.
 //! - **The clock** is the platform's monotonic clock, and a wait is the platform's
 //!   [`Clock::wait_until`] on a deadline on it: a bound counts the time the host sleeps, as the
-//!   platform's own bounds do, and a test's virtual clock is a session's too. A backend the
-//!   device opens waits for its GPU on the same clock, so a test on a virtual clock opens none
-//!   (`VideoDevice::without_backend`), and one that opens the host's gives it std's runtime.
+//!   platform's own bounds do, and a test's virtual clock is a session's too. A backend waits
+//!   for its GPU on the same clock, so a test on a virtual clock opens none.
 
 use std::sync::Arc;
 
@@ -27,10 +26,24 @@ use reims_vgpu_video_core::runtime::{MonoTime, Rings, Runtime, TimedOut};
 use reims_vgpu_video_core::sync::{Condvar, MutexGuard};
 
 /// `P` as a video crate's runtime (module doc).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the graphics device's video arms run their sessions on it"
+    )
+)]
 pub(crate) struct PlatformRuntime<P: Platform>(Arc<P>);
 
 impl<P: Platform> PlatformRuntime<P> {
     /// `platform`'s runtime, to hand a session or a backend.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the graphics device's video arms run their sessions on it"
+        )
+    )]
     pub(crate) fn of(platform: &Arc<P>) -> Arc<dyn Runtime> {
         Arc::new(PlatformRuntime(Arc::clone(platform)))
     }

@@ -1,8 +1,7 @@
 //! A graphics display's window sink on the Vulkan platform, on either OS: [`VulkanScanoutSink`]
-//! makes a presenter over a swapchain of the window's surface, as the Vulkan platform's display
-//! sink does (`crate::window`'s `vulkan`), and each draw blits the scanout into the swapchain's
-//! next image (its usage takes transfers) and presents it. What each OS's window asks of the
-//! sink is its own (`linux.rs`, `macos.rs`).
+//! makes a presenter over a swapchain of the window's surface, and each draw blits the scanout
+//! into the swapchain's next image (its usage takes transfers) and presents it. What each OS's
+//! window asks of the sink is its own (`linux.rs`, `macos.rs`).
 
 use std::sync::Arc;
 
@@ -15,8 +14,8 @@ use reims_vgpu_window::{Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, Vul
 
 use super::sink::ScanoutDraw;
 use super::{Presented, Shown};
-use crate::display::no_catch;
 use crate::entry;
+use crate::entry::no_catch;
 
 #[cfg(target_os = "linux")]
 mod linux;

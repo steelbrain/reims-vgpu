@@ -6,7 +6,7 @@
 //! texture of the display's mode, the size the guest is told (the window's size in pixels, or
 //! 1920 × 1080 without a window), placed and clipped as in a drawable of that size. Where the
 //! guest has no scanout and presents no surface the display shows black, and so does the read.
-//! The texture is BGRA8, shared, a render target, as a frame target is (`frame`), and is read
+//! The texture is BGRA8, shared, a render target, and is read
 //! once the draw has finished on the GPU: rows of `width * 4` bytes, B, G, R and A in memory.
 //!
 //! **What it touches.** Nothing the guest or the window sees. Its draws go on a queue of their
@@ -32,10 +32,12 @@ use reims_vgpu_window::PixelRect;
 
 use super::sink::ScanoutDraw;
 use super::{Presented, Shown};
-use crate::display::no_catch;
+use crate::entry::no_catch;
 use crate::error::Error;
-use crate::frame::MAX_FRAME_TARGET_SIZE;
 use crate::platform::ApiPlatform;
+
+/// The largest width or height of a read's texture.
+const MAX_READ_SIZE: u32 = 16384;
 
 /// `MTLPixelFormatBGRA8Unorm`.
 const BGRA8_UNORM: u64 = 80;
@@ -123,9 +125,7 @@ impl<P: ApiPlatform> DisplayRead<P> {
             .and_then(|h| h.checked_mul(row))
             .ok_or(Error::InvalidArgument)?;
         let dst = dst.get_mut(..length).ok_or(Error::InvalidArgument)?;
-        if !(1..=MAX_FRAME_TARGET_SIZE).contains(&width)
-            || !(1..=MAX_FRAME_TARGET_SIZE).contains(&height)
-        {
+        if !(1..=MAX_READ_SIZE).contains(&width) || !(1..=MAX_READ_SIZE).contains(&height) {
             return Err(Error::Metal);
         }
         let draw = self

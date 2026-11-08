@@ -17,7 +17,6 @@
 
 use std::sync::{Arc, Once, OnceLock};
 
-use reims_vgpu_core::platform::os::Preferences;
 use reims_vgpu_core::rt::is_our_thread;
 use reims_vgpu_core::tasks::isolation::TaskThreads;
 #[cfg(target_os = "macos")]
@@ -61,26 +60,6 @@ pub fn vulkan_platform() -> Arc<VulkanPlatform> {
             Arc::new(VulkanPlatform::new(Box::new(TaskThreads::new())))
         })
         .clone()
-}
-
-/// The process's settings reader, for [`crate::DisplayConfig::apply_preferences`] and
-/// [`crate::DisplayMode::with_preferences`]: every key is absent, as the library reads no
-/// preferences domain.
-pub fn preferences() -> &'static dyn Preferences {
-    &NoPreferences
-}
-
-/// A reader with no settings.
-struct NoPreferences;
-
-impl Preferences for NoPreferences {
-    fn app_bool(&self, _key: &str) -> (bool, bool) {
-        (false, false)
-    }
-
-    fn any_user_f32(&self, _key: &str) -> Option<f32> {
-        None
-    }
 }
 
 /// The line the hook writes before it aborts.

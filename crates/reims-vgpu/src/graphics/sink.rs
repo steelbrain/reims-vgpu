@@ -92,7 +92,7 @@ use reims_vgpu_core::platform::types::MtlViewport;
 
 use super::color::DisplayColor;
 use super::{DisplayHold, DrawnPresents, Presented, Shown};
-use crate::display::no_catch;
+use crate::entry::no_catch;
 use crate::platform::ApiPlatform;
 use reims_graphics::wire::{
     RGFX_COLOR_MATRIX, RGFX_COLOR_PLANE_GAMMA, RGFX_COLOR_POST_GAMMA, RGFX_COLOR_PRE_GAMMA,

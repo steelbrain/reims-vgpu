@@ -36,12 +36,9 @@ reims-vgpu = { path = "crates/reims-vgpu", default-features = false }
 reims-vgpu-vulkan = { path = "crates/reims-vgpu-vulkan" }
 # The reims-graphics device: its wire format and host side.
 reims-graphics = { path = "crates/reims-graphics" }
-# The VideoToolbox device's host side (`crate::video` of `reims-vgpu`).
+# The video crates' runtime and memory, which the reims-graphics device's video arms share
+# (`crate::video` of `reims-vgpu`).
 reims-vgpu-video-core = { path = "crates/reims-vgpu-video-core" }
-# Its decoders on the host's GPU through libva, on Linux.
-reims-vgpu-video-vaapi = { path = "crates/reims-vgpu-video-vaapi" }
-# Its decoders and encoders on an NVIDIA GPU through NVDEC and NVENC, on Linux, loaded at run time.
-reims-vgpu-video-nvidia = { path = "crates/reims-vgpu-video-nvidia" }
 # Its decoders, encoders and scaler on VideoToolbox, on macOS.
 reims-vgpu-video-videotoolbox = { path = "crates/reims-vgpu-video-videotoolbox" }
 # The reims-graphics device's hardware video on the Vulkan platform: Vulkan Video on the runtime's

@@ -74,7 +74,7 @@
 //!   waits for it on the GPU, on the cache's own event ([`Caches`]): no begin of a buffer, no
 //!   present and no ring-0 copy waits on the CPU for another queue's walk.
 //! - **The host's own writes.** A device of the host that writes a surface's pages itself (a
-//!   video device's frame, [`crate::device_writes`]) moves no generation, so each cache's pages
+//!   video arm's frame, [`crate::device_writes`]) moves no generation, so each cache's pages
 //!   are watched: a write over them makes the cache's next use fill it whatever its generation,
 //!   and a download or a release before that copies nothing, the pages being newer than the
 //!   cache.

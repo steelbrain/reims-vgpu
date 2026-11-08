@@ -1,7 +1,6 @@
 //! `VulkanPlatform` as an `ApiPlatform` (`cfg(vulkan_platform)`): the runtime's devices, on macOS
 //! over MoltenVK, with the `vulkan` feature, and on Linux natively, always.
 
-use reims_vgpu_core::memory::dirty::DirtyLog;
 use reims_vgpu_core::num::ToU64 as _;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_vulkan::VulkanPlatform;
@@ -9,11 +8,7 @@ use reims_vgpu_vulkan::os::GuestRamFile;
 
 use super::*;
 
-#[cfg(target_os = "linux")]
-mod lent_memory;
-
-/// The platform over metal2vulkan's runtime (architecture 2.2): the runtime's devices, and on
-/// macOS windows whose frames Metal copies from the runtime's (`window::window_sink`).
+/// The platform over metal2vulkan's runtime (architecture 2.2): the runtime's devices.
 impl ApiPlatform for VulkanPlatform {
     fn process() -> Arc<VulkanPlatform> {
         crate::singleton::vulkan_platform()
@@ -59,14 +54,8 @@ impl ApiPlatform for VulkanPlatform {
     /// (`reims_vgpu_vulkan::os::lease_guest_memory`): on Linux the platform makes its views of the
     /// guest's pages of them. A range without a file is not registered, and a view of its pages
     /// is refused as a failed remap is. On macOS nothing is registered, since Mach makes a view
-    /// by remapping addresses. Each range carries its guest physical address, and with the
-    /// device's dirty log the platform finds the guest pages behind an import and the log they
-    /// stamp (`reims_vgpu_vulkan::os::dirty`).
-    fn guest_memory(
-        &self,
-        map: &MemoryMap,
-        dirty: Option<Arc<DirtyLog>>,
-    ) -> Box<dyn Any + Send + Sync> {
+    /// by remapping addresses.
+    fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
         let ranges = map.ranges().iter().zip(map.files());
         let files = ranges.filter_map(|(range, file)| {
             let file = file.as_ref()?;
@@ -78,26 +67,7 @@ impl ApiPlatform for VulkanPlatform {
                 offset: file.offset,
             })
         });
-        Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files, dirty))
-    }
-
-    /// Each plane the surface was made with (`reims_vgpu_vulkan::os::plane_layout`): on Linux
-    /// the stand-in's record of its spec, on macOS IOSurface's per-plane getters.
-    fn surface_planes(
-        &self,
-        surface: &<Self as Platform>::Surface,
-    ) -> Vec<crate::video::SurfacePlane> {
-        use reims_vgpu_core::platform::os::surface::Surface as _;
-        (0..surface.plane_count())
-            .map_while(|i| reims_vgpu_vulkan::os::plane_layout(surface, i))
-            .map(|p| crate::video::SurfacePlane {
-                offset: p.offset,
-                width: p.width,
-                height: p.height,
-                bytes_per_element: p.bytes_per_element,
-                bytes_per_row: p.bytes_per_row,
-            })
-            .collect()
+        Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files, None))
     }
 
     /// Vulkan Video on the device's video-decode queue (`graphics::vulkan::video`).
@@ -106,33 +76,5 @@ impl ApiPlatform for VulkanPlatform {
         device: &<Self as Platform>::Device,
     ) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
         crate::graphics::vulkan_graphics_video(device)
-    }
-
-    fn lend_surface_bytes(
-        &self,
-        surface: &<Self as Platform>::Surface,
-        write: &mut dyn FnMut(&mut [u8]),
-    ) -> Result<(), &'static str> {
-        reims_vgpu_vulkan::os::lend_surface_bytes(surface, write)
-    }
-
-    fn lend_surface_bytes_for_reading(
-        &self,
-        surface: &<Self as Platform>::Surface,
-        read: &mut dyn FnMut(&[u8]),
-    ) -> Result<(), &'static str> {
-        reims_vgpu_vulkan::os::lend_surface_bytes_for_reading(surface, read)
-    }
-
-    /// On Linux, the bytes `lend_surface_bytes` lends, as a dma-buf of their pages made by
-    /// udmabuf and as the surface's view of them, with an identity attached to the surface
-    /// (`platform/vulkan/lent_memory.rs`). On macOS none: there the Metal platform lends a
-    /// surface's IOSurface to VideoToolbox (`platform/metal/lent_memory.rs`).
-    #[cfg(target_os = "linux")]
-    fn surface_device_memory(
-        &self,
-        surface: &<Self as Platform>::Surface,
-    ) -> Result<Box<dyn DeviceMemory>, &'static str> {
-        lent_memory::lent_memory(surface).map(|lent| Box::new(lent) as Box<dyn DeviceMemory>)
     }
 }

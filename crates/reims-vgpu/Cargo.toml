@@ -29,7 +29,7 @@ vulkan = [
 [dependencies]
 reims-vgpu-core.workspace = true
 reims-vgpu-window.workspace = true
-# The video device's host session (`video`).
+# The video crates' runtime, which the reims-graphics device's video arms run on (`video`).
 reims-vgpu-video-core.workspace = true
 # The reims-graphics device's host side (`graphics`).
 reims-graphics.workspace = true
@@ -38,21 +38,17 @@ zerocopy.workspace = true
 # A library's content key, by which the reims-graphics device keeps the libraries it made
 # (`graphics::decode::library`).
 sha2.workspace = true
-# A window frame that fails, or a window that gets no sink (`window::vulkan`).
+# A window frame that fails, or a window that gets no sink (`graphics::sink`).
 log.workspace = true
 # The reims-graphics decoder's lock, which a doorbell's thread takes and its queue's service thread
 # lets go (`graphics`'s take on a doorbell): `arc_lock`'s owned guard, and `send_guard`, which lets
 # it cross threads.
 parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
-# KVM's dirty-log ioctls, in a host's dirty source's harvest (`dirty`); on Linux, the guest's RAM
-# as a host maps it, a shared mapping of a file (`platform::tests`).
+# The host's page size, which the window's import of the scanout's pages is aligned to
+# (`graphics::sink`); on Linux, the guest's RAM as a host maps it in the tests (`platform::tests`).
 libc.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# The video device's backends on Linux (`video::backend_choice`): VA-API, on libva and libva-drm;
-# NVIDIA's NVDEC and NVENC, whose libraries it loads at run time.
-reims-vgpu-video-vaapi.workspace = true
-reims-vgpu-video-nvidia.workspace = true
 # The Vulkan platform, the library's only one on Linux: the dependencies of the `vulkan` feature,
 # which on macOS are optional (below).
 reims-vgpu-vulkan.workspace = true
@@ -62,11 +58,9 @@ reims-vgpu-video-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
 ash.workspace = true
 
-# The Metal platform, the product on macOS, and its window's drawable (`window::metal::MetalSink`,
-# `window::vulkan`'s macOS sink).
+# The Metal platform, the product on macOS, and its window's drawable (`graphics::metal`,
+# `graphics::vulkan`'s macOS sink).
 [target.'cfg(target_os = "macos")'.dependencies]
-# The video and scaler devices' backend on macOS: VideoToolbox (`video::backend_choice`).
-reims-vgpu-video-videotoolbox.workspace = true
 reims-vgpu-metal.workspace = true
 objc2.workspace = true
 objc2-metal.workspace = true
@@ -80,23 +74,10 @@ ash = { workspace = true, optional = true }
 
 [dev-dependencies]
 reims-vgpu-core = { workspace = true, features = ["testkit"] }
-# The scaler's conformance suite, which the scaler backend's tests run (`scaler::gpu`).
-reims-vgpu-video-conformance = { path = "../reims-vgpu-video-conformance" }
 
-# A swapchain over a layer of the test's own on macOS, its surface made with ash's types
-# (`window::vulkan`'s tests).
+# The decoder's tests of Metal's own stitched functions and arrays (`graphics::decode`).
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-ash.workspace = true
-# The scaler's kernel beside the Mac's own scalers (`scaler::gpu`'s `native` bench).
 objc2-foundation.workspace = true
-objc2-io-surface.workspace = true
-objc2-core-foundation = { workspace = true, features = ["CFCGTypes"] }
-objc2-quartz-core = { workspace = true, features = [
-    "CALayer",
-    "CAMetalLayer",
-    "objc2-core-foundation",
-    "objc2-metal",
-] }
 
 [lints]
 workspace = true

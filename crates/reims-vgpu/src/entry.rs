@@ -12,7 +12,13 @@
 //!   buffer) goes at the pool's pop, so no uncommitted buffer outlives the call and holds one of
 //!   its queue's 64 slots.
 
+use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::rt::{Held, Hold, Pool, enter_ours};
+
+/// A raise that reaches an entry point: nothing catches it there, so it ends the process.
+pub(crate) fn no_catch<T>(r: RaiseResult<T>) -> T {
+    r.unwrap_or_else(|raised| raised.fatal())
+}
 
 /// Runs one entry's `body` marked as ours, inside a real pool and with a holder; `body` gets a
 /// hold of that holder. The holder releases what it holds when `body` returns, then the pool pops

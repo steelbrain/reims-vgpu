@@ -18,8 +18,8 @@ use reims_vgpu_window::{DrawnCursor, FrameSink, PixelRect};
 
 use super::sink::ScanoutDraw;
 use super::{Presented, Shown};
-use crate::display::no_catch;
 use crate::entry;
+use crate::entry::no_catch;
 
 /// The sink of a graphics display on Metal, over `region`; `None` where Metal refuses a queue.
 pub(super) fn sink(

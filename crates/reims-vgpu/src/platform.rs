@@ -1,29 +1,12 @@
 //! What the API needs of a platform beyond core's [`Platform`] ([`ApiPlatform`]), and the state
 //! it keeps once per platform instance, which in the product is once per process: the display
-//! thread and the frame queues.
+//! thread.
 //!
-//! **The display thread.** Every display is given one executor in place of a host's dispatch
-//! queue: a core [`SerialQueue`] made at the process's first display (docs/api.md section 5).
-//! Core queues onto it exactly the jobs it queued onto the host's queue, at the same points, so
-//! every display callback of the process runs one at a time in the order they were queued, as
-//! they did on the main queue QEMU and the runner gave every display. A graphics device queues
-//! its host's cursor callbacks onto it too (`graphics`' `HostCursor`), made at the first device
-//! whose host takes them where no display made it. The queue's worker exits
-//! after [`reims_vgpu_core::rt::queue::IDLE_EXIT`] idle and the next job starts another. It is
-//! not a dispatch queue, so core models the new-frame source with its `CoalescingSignal`. The
-//! library never waits for it: no core path `sync`s onto a display's queue, and a queue's drop
-//! joins nothing.
-//!
-//! **The frame queues.** One command queue per Metal device, made the first time a device is
-//! created on that Metal device, before core builds the device, and kept for the life of the
-//! process. Every frame's command buffer comes from it, a window's among them.
-//!
-//! **Windows.** A window display's host screen and what draws its frames are chosen by the
-//! platform's type (`window::host_screen`, `window::window_sink`): `MetalPlatform` answers from
-//! the host's screens and with a sink over Metal; the Vulkan platform (`cfg(vulkan_platform)`),
-//! from the host's screens and, on macOS, with a sink that has Metal copy the runtime's frames
-//! into the window; the testkit's platform, a fixed screen (`FAKE_HOST_SCREEN`) and no sink, so
-//! its window displays never open a window. So the trait below names no Objective-C type.
+//! **The display thread.** A graphics device queues its host's cursor callbacks onto one core
+//! [`SerialQueue`], made at the process's first device whose host takes them (`graphics`'
+//! `HostCursor`), so every display callback of the process runs one at a time in the order it
+//! was queued. The queue's worker exits after [`reims_vgpu_core::rt::queue::IDLE_EXIT`] idle and
+//! the next job starts another. The library never waits for it, and a queue's drop joins nothing.
 //!
 //! **By platform.** Each platform's `ApiPlatform` is a file of its own: `platform/metal.rs`
 //! (macOS) and `platform/vulkan.rs` (Linux, and macOS with the `vulkan` feature).
@@ -32,17 +15,14 @@ use std::any::Any;
 use std::sync::{Arc, OnceLock, Weak};
 
 use reims_vgpu_core::host::HostQueue;
-use reims_vgpu_core::memory::dirty::DirtyLog;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::{Handle, ObjId, Platform};
+use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::rt::{Executor, Job, SerialQueue};
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_video_core::device_memory::DeviceMemory;
 
-use crate::device::MemoryMap;
+use crate::memory::MemoryMap;
 
-/// What the API asks of a platform beyond core's: the process's instance, the Metal device a
-/// config names, a frame target's pixels, and what it holds of the guest's RAM.
+/// What the API asks of a platform beyond core's: the process's instance, its GPU device, a
+/// texture's pixels, what it holds of the guest's RAM, a graphics device's region and its video.
 pub trait ApiPlatform: Platform {
     /// The process's platform, made on first use.
     fn process() -> Arc<Self>;
@@ -55,17 +35,10 @@ pub trait ApiPlatform: Platform {
     /// `bytes_per_row` after the last. The caller has checked that `dst` holds them.
     fn read_pixels(&self, texture: &Self::Texture, dst: &mut [u8], bytes_per_row: usize);
 
-    /// What the platform holds of the guest's RAM while a device made over `map` lives: the
-    /// device takes it as it is created and drops it after core's teardown. `dirty` is the
-    /// device's dirty log, for a device with a dirty source: where the platform keeps copies of
-    /// guest memory of its own, it asks the log which pages changed, and stamps there what it
-    /// writes into the guest's RAM itself. Nothing by default.
-    fn guest_memory(
-        &self,
-        map: &MemoryMap,
-        dirty: Option<Arc<DirtyLog>>,
-    ) -> Box<dyn Any + Send + Sync> {
-        let _ = (map, dirty);
+    /// What the platform holds of the guest's RAM while a graphics device made over `map` lives:
+    /// the views of the surfaces' pages made through the map hold it. Nothing by default.
+    fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
+        let _ = map;
         Box::new(())
     }
 
@@ -83,68 +56,14 @@ pub trait ApiPlatform: Platform {
         let _ = device;
         None
     }
-
-    /// The planes of `surface`, in order: what a video device's codecs read of a guest pixel
-    /// buffer's layout beyond core's `Surface`. Empty for a surface without planes, whose layout
-    /// is the surface's own, and by default, for a platform that does not say.
-    fn surface_planes(&self, surface: &Self::Surface) -> Vec<crate::video::SurfacePlane> {
-        let _ = surface;
-        Vec::new()
-    }
-
-    /// Lends `surface`'s bytes, from its first byte to the end of its allocation, to `write`:
-    /// what a video device's decoders write a guest pixel buffer's frames through, in place where
-    /// they can be. `Err` with why where they cannot be lent, and by default, for a platform that
-    /// lends none.
-    fn lend_surface_bytes(
-        &self,
-        surface: &Self::Surface,
-        write: &mut dyn FnMut(&mut [u8]),
-    ) -> Result<(), &'static str> {
-        let _ = (surface, write);
-        Err("this platform lends no surface's bytes")
-    }
-
-    /// Lends `surface`'s bytes, laid out as [`ApiPlatform::lend_surface_bytes`] lends them, to
-    /// `read`: what a video device's scaler and encoders read a guest pixel buffer through,
-    /// writing nothing back, so a surface the guest made read-only for its clients is lent too.
-    /// `Err` with why where they cannot be lent, and by default, for a platform that lends none.
-    fn lend_surface_bytes_for_reading(
-        &self,
-        surface: &Self::Surface,
-        read: &mut dyn FnMut(&[u8]),
-    ) -> Result<(), &'static str> {
-        let _ = (surface, read);
-        Err("this platform lends no surface's bytes")
-    }
-
-    /// What a video device's decoders lend a device of `surface`'s memory, so that the device
-    /// writes a guest pixel buffer's frames into it with no copy by the CPU: the bytes
-    /// [`ApiPlatform::lend_surface_bytes`] lends, on Linux as a dma-buf of their pages and as a
-    /// view of them in the host's memory, on macOS as the surface's own IOSurface, and an
-    /// identity that lives as long as the surface does, so that a device's imports of them go
-    /// with it. The caller holds the surface while it uses them. `Err` with why where none is
-    /// lent: a protected surface, one the guest made read-only for its clients, and by default,
-    /// for a platform that lends none.
-    fn surface_device_memory(
-        &self,
-        surface: &Self::Surface,
-    ) -> Result<Box<dyn DeviceMemory>, &'static str> {
-        let _ = surface;
-        Err("this platform lends no surface's memory to devices")
-    }
 }
 
 /// The API's state for one platform instance.
 pub(crate) struct ApiState<P: Platform> {
-    /// The display thread, made at the first display.
+    /// The display thread, made at the first device whose host takes the cursor.
     display_thread: Mutex<Option<DisplayThread>>,
-    /// The frame queue of each Metal device a device was created on, by the device's identity
-    /// (`None`: Metal made none). Unshared ([`new_command_queue_unshared`]): it draws the
-    /// displays' frames, a host's and a window's, so no other queue's work holds them back.
-    ///
-    /// [`new_command_queue_unshared`]: reims_vgpu_core::platform::device::GpuDevice::new_command_queue_unshared
-    frame_queues: Mutex<Vec<(ObjId, Option<P::CommandQueue>)>>,
+    /// The platform the state is of.
+    platform: std::marker::PhantomData<fn() -> P>,
 }
 
 /// A platform instance's state, found by the platform's identity: the platform, held weakly,
@@ -170,7 +89,7 @@ pub(crate) fn api_state<P: Platform>(platform: &Arc<P>) -> Arc<ApiState<P>> {
     }
     let state = Arc::new(ApiState::<P> {
         display_thread: Mutex::new(None),
-        frame_queues: Mutex::new(Vec::new()),
+        platform: std::marker::PhantomData,
     });
     let weak: Weak<dyn Any + Send + Sync> = Arc::downgrade(platform) as Weak<dyn Any + Send + Sync>;
     states.push((weak, state.clone() as Arc<dyn Any + Send + Sync>));
@@ -178,8 +97,8 @@ pub(crate) fn api_state<P: Platform>(platform: &Arc<P>) -> Arc<ApiState<P>> {
 }
 
 impl<P: Platform> ApiState<P> {
-    /// The display thread, made now if this is the process's first display, or its first
-    /// graphics device whose host takes the cursor.
+    /// The display thread, made now if this is the process's first graphics device whose host
+    /// takes the cursor.
     pub(crate) fn display_thread(&self, platform: &P) -> Arc<dyn HostQueue> {
         let mut slot = self.display_thread.lock();
         let thread = slot.get_or_insert_with(|| {
@@ -187,26 +106,13 @@ impl<P: Platform> ApiState<P> {
         });
         Arc::new(thread.clone())
     }
-
-    /// The frame queue for `device`, made now if none was made for it.
-    pub(crate) fn frame_queue(&self, device: &P::Device) -> Option<P::CommandQueue> {
-        let id = device.id();
-        let mut queues = self.frame_queues.lock();
-        if let Some((_, q)) = queues.iter().find(|(d, _)| *d == id) {
-            return q.as_ref().map(Handle::clone_ref);
-        }
-        let queue = device.new_command_queue_unshared();
-        let found = queue.as_ref().map(Handle::clone_ref);
-        queues.push((id, queue));
-        found
-    }
 }
 
 /// The display thread's label: a diagnostic.
 pub const DISPLAY_THREAD_LABEL: &str = "reims-vgpu.display";
 
-/// The executor every display is given in place of a host's queue: one serial queue for the
-/// process. Another handle is the same queue.
+/// The executor the cursor callbacks run on: one serial queue for the process. Another handle is
+/// the same queue.
 #[derive(Clone, Debug)]
 struct DisplayThread(SerialQueue);
 
@@ -217,7 +123,7 @@ impl Executor for DisplayThread {
 }
 
 impl HostQueue for DisplayThread {
-    /// Another handle to the same queue: a display holds it until its unplug.
+    /// Another handle to the same queue.
     fn dispatch_retain(&self) -> Arc<dyn HostQueue> {
         Arc::new(self.clone())
     }
@@ -240,18 +146,8 @@ mod fake {
         static PLATFORM: Arc<FakePlatform> = Arc::new(FakePlatform::new());
     }
 
-    /// The host screen of the testkit's platform, whatever the port: a Retina screen of 3024 by
-    /// 1964 pixels at 2 pixels a point, at 120 Hz.
-    pub const FAKE_HOST_SCREEN: reims_vgpu_window::HostScreen = reims_vgpu_window::HostScreen {
-        id: 1,
-        pixels: (3024, 1964),
-        scale: 2.0,
-        refresh_hz: 120.0,
-    };
-
     /// The testkit's platform: a process per test thread, its one device (registry ID
-    /// [`FAKE_REGISTRY_ID`]), pixels that read as zero, one host screen
-    /// ([`FAKE_HOST_SCREEN`]) and no window sink, so a window display's window is never opened.
+    /// [`FAKE_REGISTRY_ID`]), and pixels that read as zero.
     impl ApiPlatform for FakePlatform {
         fn process() -> Arc<FakePlatform> {
             PLATFORM.with(Arc::clone)
@@ -274,9 +170,6 @@ mod fake {
         }
     }
 }
-
-#[cfg(any(test, feature = "testkit"))]
-pub use fake::FAKE_HOST_SCREEN;
 
 #[cfg(test)]
 mod tests {
@@ -322,6 +215,7 @@ mod tests {
     #[cfg(vulkan_platform)]
     #[test]
     fn vulkan_devices_by_registry_id() {
+        use reims_vgpu_core::platform::Handle as _;
         use reims_vgpu_core::tasks::isolation::TaskThreads;
         use reims_vgpu_vulkan::VulkanPlatform;
 
@@ -346,7 +240,7 @@ mod tests {
         use reims_vgpu_vulkan::VulkanPlatform;
         use reims_vgpu_vulkan::os::OsVm;
 
-        use crate::device::MemoryFile;
+        use crate::memory::MemoryFile;
 
         const LEN: u64 = 0x4000;
         let p = VulkanPlatform::new(Box::new(TaskThreads::new()));
@@ -399,7 +293,7 @@ mod tests {
         // SAFETY: the guest's RAM, mapped writable above.
         unsafe { ram.as_ptr::<u8>().add(0x10).write_volatile(0x5a) };
         assert_eq!(view(ram), None, "no file is known before the lease");
-        let lease = p.guest_memory(&map, None);
+        let lease = p.guest_memory(&map);
         assert_eq!(view(ram), Some(0x5a));
         assert_eq!(view(plain), None, "a range without a file");
         drop(lease);
@@ -408,22 +302,5 @@ mod tests {
         // SAFETY: the mapping made above, which nothing uses any more.
         assert_eq!(unsafe { libc::munmap(ram.as_ptr(), LEN as usize) }, 0);
         assert!(vm.deallocate(plain, LEN).is_success());
-    }
-
-    /// One frame queue per Metal device, made once, and unshared
-    #[test]
-    fn one_frame_queue_per_device() {
-        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
-        let p = Arc::new(FakePlatform::new());
-        let s = api_state(&p);
-        let d = p.device();
-        let q1 = s.frame_queue(&d).unwrap();
-        let q2 = s.frame_queue(&d).unwrap();
-        assert_eq!(q1.id(), q2.id());
-        let log = p.call_log();
-        assert_eq!(log.count(UNSHARED_QUEUE), 1);
-        assert_eq!(log.count("newCommandQueue"), 0);
-        assert_eq!(p.metal_device(Some(0)).map(|d| d.id()), None);
-        assert_eq!(p.metal_device(None).map(|d| d.id()), Some(d.id()));
     }
 }

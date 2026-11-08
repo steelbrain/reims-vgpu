@@ -64,7 +64,7 @@ use zerocopy::IntoBytes;
 
 use super::super::{GraphicsDecoder, no_raise};
 use super::{GUEST_PAGE, Lease, SurfaceView, buffer_over};
-use crate::device::MemoryMap;
+use crate::memory::MemoryMap;
 use crate::platform::ApiPlatform;
 
 /// The block every surface's messages name, one at a time.
@@ -253,7 +253,7 @@ fn guest_ram(length: u64, touched: bool) -> Ram {
             // SAFETY: advice on the mapping just made.
             unsafe { libc::madvise(at, length.to_usize(), libc::MADV_HUGEPAGE) };
         }
-        let file = crate::device::MemoryFile { fd, offset: 0 };
+        let file = crate::memory::MemoryFile { fd, offset: 0 };
         (at.cast::<u8>(), file)
     };
     #[cfg(not(target_os = "linux"))]
@@ -316,7 +316,7 @@ fn measure<P: ApiPlatform>(label: &str) {
     let iters = env_u64("RGK_BENCH_ITERS", 40);
     let only = std::env::var("RGK_BENCH_CASES").ok();
     let ram = guest_ram(ram_bytes, true);
-    let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
+    let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
     let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
     let size = BLOCK + 0x10_0000 + RGFX_CURSOR_SPAN;
     let region = Arc::new(Region::new(size.to_usize()).expect("a region"));
@@ -510,7 +510,7 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
         }
         // Fresh RAM, a lease and a decoder of their own an order, as a booted guest's.
         let ram = guest_ram(ram_bytes, false);
-        let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
+        let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
         let core =
             CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
         let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
@@ -660,7 +660,7 @@ fn measure_large_takes<P: ApiPlatform>(label: &str) {
             continue;
         }
         let ram = guest_ram(ram_bytes, false);
-        let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
+        let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
         let core =
             CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
         let size = BLOCK + takes * block_size + 0x10_0000 + RGFX_CURSOR_SPAN;
@@ -752,7 +752,7 @@ fn map_only<P: ApiPlatform>(label: &str) {
     let iters = env_u64("RGK_BENCH_ITERS", 40);
     let only = std::env::var("RGK_BENCH_CASES").ok();
     let ram = guest_ram(ram_bytes, true);
-    let lease: Lease = Arc::from(platform.guest_memory(&ram.map, None));
+    let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
     let core = CoreMemoryMap::new(Arc::clone(&platform), &ram.map.to_core()).expect("a memory map");
     let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
     for case in cases(page) {

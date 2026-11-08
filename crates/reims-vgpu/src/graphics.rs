@@ -85,9 +85,9 @@ use reims_vgpu_window::{FrameSink, Window, WindowConfig, geometry};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::DefaultPlatform;
-use crate::device::{GuestMemoryLease, MemoryMap};
-use crate::display::{CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn, no_catch};
+use crate::cursor::{CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn};
 use crate::entry;
+use crate::entry::no_catch;
 use crate::error::Error;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
@@ -103,6 +103,7 @@ use crate::graphics::decode::{
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
+use crate::memory::{GuestMemoryLease, MemoryMap};
 use crate::platform::{ApiPlatform, api_state};
 use crate::window::WindowLink;
 
@@ -280,7 +281,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // The platform's lease on the guest's RAM, held by the views of the surfaces' pages
             // made through the map, so it outlives the last of them.
             if let Some(map) = &config.memory_map {
-                let lease: GuestMemoryLease = Arc::from(platform.guest_memory(map, None));
+                let lease: GuestMemoryLease = Arc::from(platform.guest_memory(map));
                 let memory = CoreMemoryMap::new(Arc::clone(&platform), &map.to_core())
                     .ok_or(Error::InvalidArgument)?;
                 decoder.set_guest_memory(memory, lease);
