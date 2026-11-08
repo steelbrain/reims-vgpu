@@ -141,6 +141,8 @@ impl Alias {
 struct VmState {
     areas: Vec<Area>,
     aliases: Vec<Alias>,
+    /// What [`HostVm::idle_view_mappings`] answers ([`FakeVm::set_idle_view_mappings`]).
+    idle_view_mappings: Option<u64>,
 }
 
 impl VmState {
@@ -178,6 +180,12 @@ impl FakeVm {
             log,
             script,
         }
+    }
+
+    /// Has [`HostVm::idle_view_mappings`] answer `mappings` from now on (`None` at first, as
+    /// Mach's).
+    pub fn set_idle_view_mappings(&self, mappings: Option<u64>) {
+        self.state.lock().idle_view_mappings = mappings;
     }
 
     /// The same address space with its own, discarded log and an empty script: the host's (QEMU's)
@@ -446,6 +454,11 @@ impl HostVm for FakeVm {
             }
         }
         KernReturn::SUCCESS
+    }
+
+    /// As set ([`FakeVm::set_idle_view_mappings`]); unlogged, as no Mach call answers it.
+    fn idle_view_mappings(&self) -> Option<u64> {
+        self.state.lock().idle_view_mappings
     }
 }
 

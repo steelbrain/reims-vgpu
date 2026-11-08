@@ -74,8 +74,12 @@ impl Registration {
                 CU_MEMHOSTREGISTER_PORTABLE,
             )
         };
-        cuda.check("cuMemHostRegister", result)
-            .map_err(|error| format!("CUDA refused to register the buffer: {error}"))?;
+        cuda.check("cuMemHostRegister", result).map_err(|error| {
+            format!(
+                "CUDA refused to register the buffer, {:#x} bytes at {:p}: {error}",
+                view.size, view.first
+            )
+        })?;
         log::debug!(
             "a guest buffer registered: {} bytes, its first {} into its first page",
             view.size,

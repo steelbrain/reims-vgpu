@@ -1164,10 +1164,10 @@ impl<P: Platform> GraphicsDecoder<P> {
         {
             log::info!(
                 target: "reims_vgpu::graphics",
-                "IOSurface pages in place: {} views made, {} taken from the cache; {} pages \
-                 blocks' views made; {} named by their runs; refused: {} for bad runs, {} not \
-                 mapped",
-                c.made, c.reused, c.private, c.by_runs, c.bad_runs, c.not_mapped
+                "IOSurface pages in place: {} views made, {} taken from the cache, {} let go of \
+                 from it unheld for their mappings; {} pages blocks' views made; {} named by \
+                 their runs; refused: {} for bad runs, {} not mapped",
+                c.made, c.reused, c.idle_returned, c.private, c.by_runs, c.bad_runs, c.not_mapped
             );
             if d.made != 0 {
                 log::info!(
