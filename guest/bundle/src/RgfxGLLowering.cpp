@@ -44,7 +44,8 @@ struct Libraries {
 	unsigned long long (*constIntValue)(Ref value) = nullptr;
 	Ref (*isConstantInt)(Ref value) = nullptr;
 	Ref (*namedFunction)(Ref module, const char *name) = nullptr;
-	Ref (*globalValueType)(Ref global) = nullptr;
+	Ref (*globalValueType)(Ref global) = nullptr; // null where the system's LLVM lacks it
+	Ref (*typeOf)(Ref value) = nullptr;
 	Ref (*returnType)(Ref function) = nullptr;
 	unsigned (*paramCount)(Ref function) = nullptr;
 	void (*paramTypes)(Ref function, Ref *dest) = nullptr;
@@ -110,7 +111,7 @@ Libraries &libraries()
 		    !symbol(llvm, "LLVMConstIntGetZExtValue", libs.constIntValue, why) ||
 		    !symbol(llvm, "LLVMIsAConstantInt", libs.isConstantInt, why) ||
 		    !symbol(llvm, "LLVMGetNamedFunction", libs.namedFunction, why) ||
-		    !symbol(llvm, "LLVMGlobalGetValueType", libs.globalValueType, why) ||
+		    !symbol(llvm, "LLVMTypeOf", libs.typeOf, why) ||
 		    !symbol(llvm, "LLVMGetReturnType", libs.returnType, why) ||
 		    !symbol(llvm, "LLVMCountParamTypes", libs.paramCount, why) ||
 		    !symbol(llvm, "LLVMGetParamTypes", libs.paramTypes, why) ||
@@ -125,6 +126,8 @@ Libraries &libraries()
 		    !symbol(llvm, "LLVMCreateMemoryBufferWithMemoryRangeCopy", libs.bufferCopy, why) ||
 		    !symbol(llvm, "LLVMParseIRInContext", libs.parseIR, why))
 			return;
+		// Optional: GPUCompiler 31001's LLVM does not export it (functionType).
+		libs.globalValueType = reinterpret_cast<Ref (*)(Ref)>(dlsym(llvm, "LLVMGlobalGetValueType"));
 		void *plugin = dlopen(pluginPath.c_str(), RTLD_NOW | RTLD_LOCAL);
 		if (plugin == nullptr) {
 			why = "no " + pluginPath;
@@ -157,7 +160,15 @@ std::vector<Ref> firstNode(const Libraries &l, Ref module, const char *name)
 
 
 // LLVM-C's LLVMTypeKind values the signature names (llvm-c/Core.h; the enum only grows).
-enum : int { kHalfKind = 1, kFloatKind = 2, kIntegerKind = 8, kStructKind = 10, kVectorKind = 13 };
+enum : int {
+	kHalfKind = 1,
+	kFloatKind = 2,
+	kIntegerKind = 8,
+	kFunctionKind = 9,
+	kStructKind = 10,
+	kPointerKind = 12,
+	kVectorKind = 13
+};
 
 // The Metal name of an LLVM type, as `metal` writes it in air.arg_type_name: "float", "half4",
 // "uint2", "bool"; integers unsigned, the signedness LLVM's types do not hold. "" for any other.
@@ -205,13 +216,33 @@ std::string metalTypeName(const Libraries &l, Ref type)
 	return name;
 }
 
+// A function's type. The system's LLVM answers it where it exports LLVMGlobalGetValueType, as macOS
+// 26.7.2's GPUCompiler 32023 does. macOS 11.7.11's, 12.7.6's and 13.7.8's GPUCompiler 31001 does
+// not (measured on x86 guests), and without the call every GL shader variant was refused there: the
+// renderer fell back to software processing and a triangle left the clear color behind (measured: a
+// GL 4.1 core draw into an IOSurface). Where it lacks it, the function's type is the pointee of its
+// value's type: the generator's LLVM types its pointers, as its modules show (`<4 x float>
+// addrspace(2)*`, above). Null where neither answers a function type.
+Ref functionType(const Libraries &l, Ref function)
+{
+	if (l.globalValueType != nullptr)
+		return l.globalValueType(function);
+	Ref pointer = l.typeOf(function);
+	if (pointer == nullptr || l.typeKind(pointer) != kPointerKind)
+		return nullptr;
+	Ref type = l.elementType(pointer);
+	return type != nullptr && l.typeKind(type) == kFunctionKind ? type : nullptr;
+}
+
 RgfxGLSignature signatureOf(const Libraries &l, Ref module, const std::string &entry)
 {
 	RgfxGLSignature s;
 	Ref function = l.namedFunction(module, entry.c_str());
 	if (function == nullptr)
 		return s;
-	Ref type = l.globalValueType(function);
+	Ref type = functionType(l, function);
+	if (type == nullptr)
+		return s;
 	Ref result = l.returnType(type);
 	if (l.typeKind(result) == kStructKind) {
 		std::vector<Ref> members(l.structCount(result));
