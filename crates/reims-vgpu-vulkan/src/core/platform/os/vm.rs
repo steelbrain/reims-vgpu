@@ -117,6 +117,14 @@ pub trait HostVm: Send + Sync {
     fn idle_view_mappings(&self) -> Option<u64> {
         None
     }
+    /// No Mach counterpart: how many more kernel mappings views of guest pages may take, now,
+    /// before the platform maps a view another way than a mapping a run (through dma-bufs, which
+    /// a device that pins a view's pages cannot import) or refuses one, where each run of a view
+    /// ([`HostVm::remap_runs_shared_overwrite`]) takes a mapping of its own and the process has a
+    /// budget of them. `None`, the default, where views take none that is counted (Mach's).
+    fn view_room(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(test)]

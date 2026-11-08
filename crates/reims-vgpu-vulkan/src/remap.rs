@@ -445,6 +445,10 @@ impl HostVm for VulkanVm {
         self.vm.idle_view_mappings()
     }
 
+    fn view_room(&self) -> Option<u64> {
+        self.vm.view_room()
+    }
+
     fn deallocate(&self, addr: HostAddr, len: u64) -> KernReturn {
         // At the unmap (module docs).
         let pages = self.changed(pages(addr, len, self.page_size()));

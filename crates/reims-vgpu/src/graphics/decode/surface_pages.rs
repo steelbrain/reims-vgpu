@@ -25,7 +25,29 @@
 //! kept every one, ended sessions' among them, so the process's mappings only grew, from 3,220 at
 //! the desktop to 43,949, past the headroom.
 //!
+//! That bound holds once a view is cached, and the views of a session that just ended keep their
+//! mappings until then, so before a view is made, where the platform's room for views' mappings
+//! ([`HostVm::view_room`]; on Linux the views' budget's room short of its headroom, past which
+//! a view is mapped through dma-bufs that a device pinning its pages cannot import) is less than
+//! the view adds, a mapping a run and one at each end, the oldest cached views no block holds go
+//! first, until their runs cover what it lacks. Their mappings are torn down where their last
+//! holds go ([`Cached::let_go_now`]): on the surface worker where nothing else holds them, else
+//! on the runtime's thread that frees their import or the thread that drops a device's import of
+//! them, and the view waits for that room, [`ROOM_WAIT_STEPS`] steps of [`ROOM_WAIT_STEP`] at
+//! most, before it is mapped; a pages block's view alike. So a view a block needs is not mapped
+//! another way while an unheld one holds the room. **Measured** 2026-11-08 on the same host and
+//! guest, at 3648 x 2052, with NVDEC's pictures made to land in their pages (a diagnostic build:
+//! they land in device caches, which take no view): a 4K HEVC session's views took about 19,000
+//! mappings at once (6 to 7 NV12 surfaces of about 3,041 runs), and the views it left kept about
+//! 19,000 more until the next view was made. With one such session running and two more run one
+//! after the other beside it, room was made 11 times, a view let go of each time: its mappings
+//! were never gone at once, gone in 1.1 to 5.1 ms in 8, and not within 50 ms in 3. The two
+//! running sessions' live views, which no block lets go of, still passed the headroom: one NV12
+//! surface of each later session was mapped through dma-bufs, and its pictures copied by the CPU
+//! (200 of 1,200, and 1,500 of 9,000).
+//!
 //! [`HostVm::idle_view_mappings`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::idle_view_mappings
+//! [`HostVm::view_room`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_room
 //!
 //! The runs are the guest's: each must be whole pages of the guest's (4 KiB) and of the host's
 //! from a page, lie in guest RAM, and the runs must sum to the surface's length; else the block
@@ -117,6 +139,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_vgpu_graphics::wire::{
     RGFX_SURFACE_PAGES_PLANES, RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages,
@@ -179,18 +202,29 @@ pub(crate) struct SurfaceView<P: Platform> {
 }
 
 /// A view's mapping: the runs mapped in order, and the platform's hold on the guest's RAM, kept
-/// until the last hold goes, then let go of on the surface worker ([`TEARDOWN`]).
+/// until the last hold goes, then let go of on the surface worker ([`TEARDOWN`]), or where the
+/// last hold goes once the cache let go of the view to make room ([`Cached::let_go_now`]).
 struct MappingHold<P: Platform> {
     /// Taken as it goes.
     held: Option<(Arc<Mapping<P>>, Lease)>,
     /// Where `held` is let go of; `None` where it goes where the hold does (the costs' runs).
     teardown: Option<Arc<Worker>>,
+    /// Whether `held` goes where the last hold does, whatever `teardown` says: a view the cache
+    /// let go of to make room, whose room a view being made waits for, never on ring 0's
+    /// threads, as no ring holds such a view.
+    here: AtomicBool,
 }
 
 impl<P: Platform> Drop for MappingHold<P> {
     fn drop(&mut self) {
-        if let (Some(held), Some(worker)) = (self.held.take(), self.teardown.take()) {
-            worker.drop_later(TEARDOWN, 0, held);
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        match self.teardown.take() {
+            Some(worker) if !self.here.load(Ordering::Acquire) => {
+                worker.drop_later(TEARDOWN, 0, held);
+            }
+            _ => drop(held),
         }
     }
 }
@@ -253,6 +287,7 @@ impl<P: Platform> SurfaceView<P> {
             held: Arc::new(MappingHold {
                 held: Some((mapping, lease)),
                 teardown,
+                here: AtomicBool::new(false),
             }),
             life: MemoryLife::new(),
         }
@@ -415,6 +450,36 @@ struct Cached<P: Platform> {
     view: Arc<SurfaceView<P>>,
     import: P::Buffer,
 }
+
+impl<P: Platform> Cached<P> {
+    /// Whether the cache alone holds the view: its own hold and its import's, whose deallocator
+    /// holds the view (`buffer_over`). Under the views' lock, which every new hold of a cached
+    /// view takes, such a view stays so until the lock is let go.
+    fn idle(&self) -> bool {
+        Arc::strong_count(&self.view) <= 2
+    }
+
+    /// Lets go of the view and its import, to make room ([`SurfaceViews::make_room_for`]), with
+    /// the view's mapping torn down where its last hold goes rather than on the surface worker:
+    /// here, where the platform frees the import at once and no device's import of the view's
+    /// memory holds it; else on the runtime's thread that frees the import once the command
+    /// buffers that use it completed, or on the thread that drops a device's import as the
+    /// view's life ends (a CUDA registration's reaper). The view being made waits for the room
+    /// on a surface worker's thread, which none of those needs.
+    fn let_go_now(self) {
+        let Cached { view, import, .. } = self;
+        view.held.here.store(true, Ordering::Release);
+        drop((import, view));
+    }
+}
+
+/// How many steps a view being made waits at most for the room the cached views let go of for it
+/// give back ([`SurfaceViews::make_room_for`]): 20 ms in all, four times the longest such wait
+/// that gave the room back (the module doc).
+const ROOM_WAIT_STEPS: u32 = 100;
+
+/// One step of that wait.
+const ROOM_WAIT_STEP: std::time::Duration = std::time::Duration::from_micros(200);
 
 /// A pages block (the module doc): its runs, and the view its `BUFFER_OVER_PAGES` buffers lie
 /// over.
@@ -615,6 +680,7 @@ impl<P: Platform> SurfaceViews<P> {
                 teardown,
                 key,
             } => {
+                Self::make_room_for(views, platform, key.len());
                 match make_view(
                     platform, device, pages, runs, &memory, lease, teardown, &key,
                 )? {
@@ -861,16 +927,12 @@ impl<P: Platform> SurfaceViews<P> {
             }
         }
         if let Some(bound) = idle_mappings {
-            // Held by the cache alone: its own hold and its import's, whose deallocator holds the
-            // view (`buffer_over`). Under the views' lock, which every new hold of a cached view
-            // takes, such a view stays so until the lock is let go.
-            let idle = |c: &Cached<P>| Arc::strong_count(&c.view) <= 2;
             let mut mappings: u64 = (self.cache.iter())
-                .filter(|c| idle(c))
+                .filter(|c| c.idle())
                 .map(|c| c.runs.len().to_u64())
                 .sum();
             while mappings > bound {
-                let Some(at) = self.cache.iter().position(&idle) else {
+                let Some(at) = self.cache.iter().position(Cached::idle) else {
                     break;
                 };
                 let Some(old) = self.cache.remove(at) else {
@@ -880,6 +942,51 @@ impl<P: Platform> SurfaceViews<P> {
                 self.counts.idle_returned += 1;
                 evicted.push(old);
             }
+        }
+        evicted
+    }
+
+    /// Room in `platform`'s mappings for a view of `runs` runs, made before the view is (the
+    /// module doc): where the room the platform answers is less than the most the view adds, a
+    /// mapping a run and one at each end, the oldest cached views no block holds let go of on
+    /// this thread, a surface worker's, until their runs cover what it lacks.
+    fn make_room_for(views: &Mutex<SurfaceViews<P>>, platform: &P, runs: usize) {
+        let needed = runs.to_u64().saturating_add(2);
+        let Some(room) = platform.vm().view_room().filter(|&room| room < needed) else {
+            return;
+        };
+        let evicted = views.lock().make_room(needed - room);
+        if evicted.is_empty() {
+            return;
+        }
+        for cached in evicted {
+            cached.let_go_now();
+        }
+        // Their mappings go here, or a little later on the threads that hold them last.
+        for _ in 0..ROOM_WAIT_STEPS {
+            if platform.vm().view_room().is_none_or(|room| room >= needed) {
+                break;
+            }
+            std::thread::sleep(ROOM_WAIT_STEP);
+        }
+    }
+
+    /// The oldest views no block holds, out of the cache, until their runs, a mapping each, add
+    /// up to `short` mappings or none is left (the module doc), counted as let go of for their
+    /// mappings; for the caller to let go of with no lock held ([`Cached::let_go_now`]).
+    fn make_room(&mut self, short: u64) -> Vec<Cached<P>> {
+        let mut evicted = Vec::new();
+        let mut freed: u64 = 0;
+        while freed < short {
+            let Some(at) = self.cache.iter().position(Cached::idle) else {
+                break;
+            };
+            let Some(old) = self.cache.remove(at) else {
+                break;
+            };
+            freed = freed.saturating_add(old.runs.len().to_u64());
+            self.counts.idle_returned += 1;
+            evicted.push(old);
         }
         evicted
     }
@@ -959,10 +1066,12 @@ impl<P: Platform> SurfaceViews<P> {
     /// where `None`, the decoder's own tests) and holds the `block_size` bytes a message names:
     /// made with its import on `device` the first time, the module doc, with `views` unlocked,
     /// so a message that asks of the views meanwhile does not wait for the mapping or the
-    /// import. `None` where the block is no such pages block, or the view or its import is not
-    /// made, which is counted, or the block went while it was made.
+    /// import, after room is made in `platform`'s mappings for it. `None` where the block is no
+    /// such pages block, or the view or its import is not made, which is counted, or the block
+    /// went while it was made.
     pub(crate) fn private_view(
         views: &Mutex<SurfaceViews<P>>,
+        platform: &P,
         device: &P::Device,
         block: u64,
         block_size: u64,
@@ -992,6 +1101,7 @@ impl<P: Platform> SurfaceViews<P> {
                 length,
             )
         };
+        Self::make_room_for(views, platform, runs.len());
         let made = match map_view(&memory, lease, teardown, &runs, length) {
             Ok(view) => match buffer_over(device, &view, 0, view.length(), 0, None)? {
                 Some(import) => Ok((view, import)),
@@ -1349,6 +1459,7 @@ impl<P: Platform> super::GraphicsDecoder<P> {
         self.settle_surface(m.block_offset);
         let view = SurfaceViews::private_view(
             &self.shared.surface_views,
+            &*self.platform,
             device,
             m.block_offset,
             m.block_size,
@@ -1410,6 +1521,7 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             Some(run) => Some(run),
             None => SurfaceViews::private_view(
                 &self.shared.surface_views,
+                &*self.platform,
                 device,
                 m.block_offset,
                 m.block_size,
@@ -1844,6 +1956,117 @@ pub(super) mod tests {
         let views = r.dec.views_of_surfaces();
         assert_eq!(views.counts().idle_returned, 1);
         assert_eq!(views.len(), (2, 4));
+    }
+
+    /// Where the platform has too little room for a new view's mappings, the oldest cached views
+    /// no block holds go before it is made, until their runs, a mapping each, cover what it
+    /// lacks, and their mappings are torn down before the new view is mapped, one of them on the
+    /// thread of a device's import that held it last, so it is mapped as any other; a view its
+    /// block holds stays, however old. With no unheld view left, the view is made all the same,
+    /// as the platform maps it; a pages block's view makes room alike
+    #[test]
+    fn a_view_short_of_room_lets_the_oldest_unheld_cached_views_go_first() {
+        let mut r = rig(64);
+        let page = r.page;
+        let block = |i: u64| BLOCK + i * 0x8000;
+        // The oldest, of three runs, its block held throughout.
+        assert_eq!(
+            r.pages(block(0), &[(0, 1), (2, 1), (4, 1)], 3 * page),
+            RGFX_STATUS_OK
+        );
+        let held = Arc::downgrade(&r.view(block(0)));
+        // Three more, of two runs each, whose blocks go.
+        let sets: [&[(u64, u64)]; 3] =
+            [&[(6, 1), (8, 1)], &[(10, 1), (12, 1)], &[(14, 1), (16, 1)]];
+        let mut unheld = Vec::new();
+        for (at, runs) in (1u64..).map(block).zip(sets) {
+            assert_eq!(r.pages(at, runs, 2 * page), RGFX_STATUS_OK);
+            unheld.push(Arc::downgrade(&r.view(at)));
+            r.dec
+                .block_released(&r.device, at, 0, Box::new(|| ()), no_raise());
+        }
+        // The oldest unheld view's memory, held by a device that lets go of it on a thread of
+        // its own a little after the view's life ends, as a CUDA registration's reaper does.
+        let memory = unheld[0]
+            .upgrade()
+            .and_then(|v| v.memory())
+            .expect("a view's memory");
+        memory.identity().when_gone(move || {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                drop(memory);
+            });
+        });
+        // The blocks' holds go on the surface worker.
+        r.dec.surface_worker().flush();
+        assert!(unheld.iter().all(|v| v.upgrade().is_some()), "cached");
+
+        // A view of three runs adds up to five mappings, with room for two: the two oldest
+        // unheld views go, four runs, and their mappings before the view is mapped, the
+        // device's hold let go of first.
+        r.p.fake_vm().set_view_room(Some(2));
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages(block(4), &[(20, 1), (22, 1), (24, 1)], 3 * page),
+            RGFX_STATUS_OK
+        );
+        assert!(held.upgrade().is_some(), "the view its block holds stays");
+        assert!(
+            unheld[..2].iter().all(|v| v.upgrade().is_none()),
+            "the oldest unheld views went"
+        );
+        assert!(unheld[2].upgrade().is_some(), "the rest stay");
+        let sels = r.p.call_log().sels_since(mark);
+        let made_at = sels.iter().position(|&s| s == "mach_vm_allocate");
+        let torn_down = (sels.iter().enumerate())
+            .filter(|&(_, &s)| s == "mach_vm_deallocate")
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert_eq!(torn_down.len(), 2, "{sels:?}");
+        assert!(
+            torn_down.iter().all(|&i| Some(i) < made_at),
+            "the mappings went before the view was mapped: {sels:?}"
+        );
+        assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 2);
+
+        // No room at all: the last unheld view goes, the held ones stay, and the view is made.
+        r.dec
+            .block_released(&r.device, block(4), 0, Box::new(|| ()), no_raise());
+        r.dec.surface_worker().flush();
+        r.p.fake_vm().set_view_room(Some(0));
+        assert_eq!(r.pages(block(5), &[(30, 1)], page), RGFX_STATUS_OK);
+        assert!(held.upgrade().is_some(), "the view its block holds stays");
+        assert!(unheld[2].upgrade().is_none(), "the oldest unheld view went");
+        let views = r.dec.views_of_surfaces();
+        // Three mappings short: the view of block 4, unheld since, went after it.
+        assert_eq!(views.counts().idle_returned, 4);
+        assert_eq!(views.len(), (2, 2));
+        drop(views);
+
+        // A pages block's view makes room the same way.
+        let last = Arc::downgrade(&r.view(block(5)));
+        r.dec
+            .block_released(&r.device, block(5), 0, Box::new(|| ()), no_raise());
+        r.dec.surface_worker().flush();
+        let pages = block(6);
+        assert_eq!(
+            r.pages_flagged(
+                pages,
+                0,
+                &[(40, 1), (42, 1)],
+                2 * page,
+                RGFX_SURFACE_PAGES_PRIVATE
+            ),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.pages_buffer(10, 0x1_0000_0000, pages, 0, 2 * page),
+            Ok(())
+        );
+        assert!(r.has_private_view(pages));
+        assert!(last.upgrade().is_none(), "the unheld view went");
+        assert!(held.upgrade().is_some(), "the view its block holds stays");
+        assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 5);
     }
 
     /// A surface of one plane of `rows` rows of `row_bytes` texel bytes `bytes_per_row` apart.

@@ -170,6 +170,21 @@ pub(super) fn held() -> u64 {
         .saturating_add(OWN_MAPPINGS.load(Ordering::Relaxed))
 }
 
+/// The mappings the views may still take, now: short of the headroom where a device of the
+/// process needs imported pages mapped from their files, past which a view is mapped through
+/// dma-bufs, which such a device cannot import ([`claim`], [`Reach::ShortOfHeadroom`]); else short
+/// of the budget, past which a view is refused ([`admit`]). Less the mappings held and claimed,
+/// at the limit as last read.
+pub(super) fn room() -> u64 {
+    let kept = if super::import::imports_need_files() {
+        HEADROOM
+    } else {
+        0
+    };
+    let held = held().saturating_add(CLAIMED.load(Ordering::Acquire));
+    budget(limit()).saturating_sub(kept).saturating_sub(held)
+}
+
 /// Whether the views may add `adding` mappings to those they hold and those claimed within the
 /// budget less `kept`, at the limit read again where they would pass it as last read: the
 /// mappings held and claimed, and the limit, where they may not.

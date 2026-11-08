@@ -1222,6 +1222,12 @@ impl HostVm for LinuxVm {
     fn idle_view_mappings(&self) -> Option<u64> {
         Some(budget::HEADROOM)
     }
+
+    /// The views' budget's room ([`budget::room`]): short of its headroom where a device of the
+    /// process pins imported pages, as a view past it is mapped through dma-bufs there.
+    fn view_room(&self) -> Option<u64> {
+        Some(budget::room())
+    }
 }
 
 #[cfg(test)]
