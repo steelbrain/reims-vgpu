@@ -6874,9 +6874,9 @@ pub(crate) mod tests {
         use reims_vgpu_core::platform::values::IcbDesc;
 
         const VERT: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/vert.metallib");
+            include_bytes!("../../../../tests/shaders/vert.metallib");
         const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/frag.metallib");
+            include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -6985,9 +6985,9 @@ pub(crate) mod tests {
         };
 
         const TESS: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/render_tess.metallib");
+            include_bytes!("../../../../tests/shaders/render_tess.metallib");
         const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/frag.metallib");
+            include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -7192,9 +7192,9 @@ pub(crate) mod tests {
         use reims_vgpu_core::platform::values::IcbDesc;
 
         const VERT: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/vert.metallib");
+            include_bytes!("../../../../tests/shaders/vert.metallib");
         const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/frag.metallib");
+            include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -7376,9 +7376,9 @@ pub(crate) mod tests {
         use reims_vgpu_core::platform::values::IcbDesc;
 
         const VERT: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/vert.metallib");
+            include_bytes!("../../../../tests/shaders/vert.metallib");
         const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/frag.metallib");
+            include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -7521,9 +7521,9 @@ pub(crate) mod tests {
         };
 
         const VERT: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/vert.metallib");
+            include_bytes!("../../../../tests/shaders/vert.metallib");
         const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/mutdec_fwrite.metallib");
+            include_bytes!("../../../../tests/shaders/mutdec_fwrite.metallib");
         /// `MTLPixelFormatDepth32Float`, `MTLCompareFunctionAlways`.
         const DEPTH32F: u64 = 252;
         const ALWAYS: u64 = 7;

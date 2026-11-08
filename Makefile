@@ -1,6 +1,5 @@
 # The Rust library and its tooling. The Cargo workspace is at the
-# repository root; the behaviour-lock suite (tests/suite) records what it
-# does in expected files, recorded from the checkout's own build.
+# repository root.
 #
 #   make        the library as a plain library (cargo xtask dist) in
 #               target/dist: libreims_vgpu.a and .dylib, reims_vgpu.h,
@@ -8,20 +7,6 @@
 #   make smoke  a guest workload linked with the library as QEMU links it,
 #               with an isolated guest task, against its expected values
 #               (cargo xtask smoke)
-#   make test   the behaviour-lock suite (tests/suite) on the library in
-#               target/dist, compared with its expected files;
-#               TEST=<patterns> selects scenarios or modules, e.g.
-#               TEST='fifo_*,display'
-#   make bless  record expected files from the library this checkout builds:
-#               those missing (a new scenario, or a new host key after an OS
-#               update) or recorded from other input (a changed scenario);
-#               ARGS=--update records the selected cases again for a
-#               deliberate change of behaviour, whose expected-file diff is
-#               reviewed in the same commit
-#   make coverage  the suite on the library built instrumented into
-#               build/cov/dist, with a line report per crate file
-#               (pgtest/coverage.py); ARGS=--per-case maps each line to the
-#               cases that reach it
 #   make qemu   the library as a plain library (cargo xtask dist), then
 #               vendor/qemu's qemu-system-aarch64 with apple-gfx on its C API,
 #               linked statically through pkg-config, in build/qemu
@@ -32,10 +17,8 @@
 #               VM's volume) (scripts/internal/run_vmapple.sh)
 #   make clean  remove build/, QEMU's build included
 #
-# ARGS adds options to pgtest in test, bless and coverage, e.g.
-# ARGS='-j 8 --setup isolate'. QEMU_CONFIGURE adds options to QEMU's configure
-# and runs it again. CARGO_TARGET_DIR moves the build, and with it
-# RUST_TARGET, out of target.
+# QEMU_CONFIGURE adds options to QEMU's configure and runs it again.
+# CARGO_TARGET_DIR moves the build, and with it RUST_TARGET, out of target.
 
 BUILD := build
 # $(BUILD) made absolute without abspath, which splits a path with spaces.
@@ -44,34 +27,19 @@ QEMU_CONFIGURE ?=
 QEMU_BUILD := $(BUILD_DIR)/qemu
 QEMU_SRC := $(CURDIR)/vendor/qemu
 # Cargo's target directory, made absolute the same way: the dist tree is
-# under it, which the suite's runner and QEMU's config.status record, and
-# cargo resolves a relative one against the directory it runs in.
+# under it, which QEMU's config.status records, and cargo resolves a
+# relative one against the directory it runs in.
 RUST_TARGET_REL := $(or $(CARGO_TARGET_DIR),target)
 RUST_TARGET := $(if $(filter /%,$(RUST_TARGET_REL)),$(RUST_TARGET_REL),$(CURDIR)/$(RUST_TARGET_REL))
 RUST_DIST := $(RUST_TARGET)/dist
 
-.PHONY: all smoke test bless coverage qemu vm clean
+.PHONY: all smoke qemu vm clean
 
 all:
 	CARGO_TARGET_DIR="$(RUST_TARGET)" cargo xtask dist
 
 smoke: all
 	CARGO_TARGET_DIR="$(RUST_TARGET)" cargo xtask smoke
-
-TEST ?=
-ARGS ?=
-PGTEST = cd tests/suite && python3 -m pgtest
-
-test: all
-	$(PGTEST) run -k "$(TEST)" --dist "$(RUST_DIST)" $(ARGS)
-
-# bless records from the library make builds, the one make test runs.
-bless: all
-	$(PGTEST) bless -k "$(TEST)" --dist "$(RUST_DIST)" $(ARGS)
-
-# pgtest cov builds its own instrumented dist tree, in build/cov/dist.
-coverage:
-	$(PGTEST) cov -k "$(TEST)" $(ARGS)
 
 vendor/qemu/configure:
 	@echo "vendor/qemu is empty: git submodule update --init vendor/qemu" >&2

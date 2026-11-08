@@ -1,9 +1,0 @@
-{"expected": "suspend_blob_fresh", "host": null, "input": "45586bbaec7200cfb4e0d5daf674c71d56f2292c355a0b7059eb6ee8f4eb463b", "setup": "isolate"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "isolate"}
-{"ev": "device", "i": 0, "ok": 1}
-{"ev": "api", "i": 1, "name": "willSuspend"}
-{"blob_pgsd": {"info": [], "info_max_key": 1, "len": 108, "magic": "0x53475652", "state": [[1, "0x0"], [2, "0x0"], [3, "0x0"], [4, "0x0"], [5, "0x0"], [6, "0x0"], [7, "0x0"], [8, "0x0"], [9, "0x0"], [10, "0x0"], [11, "0x0"], [12, "0x0"], [13, "0x0"], [14, "0x0"], [15, "0x0"], [16, "0x0"], [17, "0x0"], [18, "0x1"], [19, "0x0"], [21, "0x0"]], "version": 1}, "ev": "api", "i": 2, "name": "finishSuspend", "ok": 1}
-{"ev": "events", "i": 3, "irqs": 0, "label": "end"}
-{"ev": "teardown", "i": 3}
-{"ev": "end", "i": 3}
-{"ev": "outcome", "kind": "completed"}

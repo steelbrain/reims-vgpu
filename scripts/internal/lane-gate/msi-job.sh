@@ -81,7 +81,7 @@ do_corpus() {  # the decode streams and references, copied again wherever their 
 }
 do_stage() {  # the candidate's tree, and vendor/qemu's source where the host has none yet
   rm -rf "$MSI_GATE/stage" && mkdir -p "$MSI_GATE/stage"
-  git -C "$WS" archive --format=tar "$SHA" -- . ':(exclude)tests/suite/expected' | tar -C "$MSI_GATE/stage" -xmf -
+  git -C "$WS" archive --format=tar "$SHA" -- . | tar -C "$MSI_GATE/stage" -xmf -
   local Q=$MSI_GATE/qemu/$QC G=$MSI_GATE/qemu-git
   if [[ ! -f $Q/src/configure ]]; then
     # A bare clone sharing MSI_QEMU_SEED's objects, with the commits it lacks from the bundle.

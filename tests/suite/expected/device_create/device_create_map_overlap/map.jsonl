@@ -1,5 +1,0 @@
-{"expected": "device_create_map_overlap", "host": null, "input": "fdc0a73cedee77d788e7fa3d5e4d25b18ef130bdcb67b4638e1180e6aa17c979", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_MEMORY_MAP"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

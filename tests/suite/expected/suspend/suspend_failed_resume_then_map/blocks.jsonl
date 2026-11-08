@@ -1,6 +1,0 @@
-{"expected": "suspend_failed_resume_then_map", "host": null, "input": "0c22206ce138a5faf07d182a88490651779867647844a8cb74510678589f7390", "setup": "blocks"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "blocks"}
-{"ev": "device", "i": 0, "ok": 1}
-{"ev": "mmio_w", "i": 1, "off": "0x1034", "val": "0xf5"}
-{"error": {"code": 5}, "ev": "api", "i": 2, "label": "port count 3", "name": "willResume", "ok": false}
-{"after": 2, "ev": "outcome", "kind": "died"}

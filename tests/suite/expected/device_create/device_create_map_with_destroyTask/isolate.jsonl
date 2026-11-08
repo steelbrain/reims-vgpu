@@ -1,5 +1,0 @@
-{"expected": "device_create_map_with_destroyTask", "host": null, "input": "daa0be22ebb2a938a990bdbf1411c77a3f621e560ce314fd8fc3c8d2323702b0", "setup": "isolate"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "isolate"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_MEMORY_CONFLICT"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

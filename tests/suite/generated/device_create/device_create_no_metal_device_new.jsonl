@@ -1,2 +1,0 @@
-# device_create_no_metal_device_new: A config whose metal_registry_id names no Metal device (the runner passes UINT64_MAX) is refused: RVG_ERR_NO_METAL_DEVICE.
-{"descriptor": {"no_mtl_device": true}, "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}

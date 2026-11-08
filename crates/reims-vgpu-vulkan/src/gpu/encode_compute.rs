@@ -522,11 +522,11 @@ mod tests {
     const ICB_ENCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icb_encode.metallib"));
 
     const ADD: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_add.metallib");
+        include_bytes!("../../../../tests/shaders/compute_add.metallib");
     const TGMEM: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_tgmem.metallib");
+        include_bytes!("../../../../tests/shaders/compute_tgmem.metallib");
     const SAMPLE: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_sample.metallib");
+        include_bytes!("../../../../tests/shaders/compute_sample.metallib");
 
     /// `MTLCommandBufferStatusCompleted`.
     const COMPLETED: u64 = 4;

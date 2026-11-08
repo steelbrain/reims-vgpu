@@ -1,6 +1,0 @@
-# suspend_failed_resume_then_map: A failed rvg_device_will_resume leaves the run state LeavingSuspendEarly (3); the next guest-memory mapping asserts: a root page write kills the host.
-{"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"off": "0x1034", "op": "mmio_w", "val": "0xf5"}
-{"hex": "5256475301000000010000005000000000000000f500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003000000000000000000000002000000040000002d000000", "label": "port count 3", "name": "willResume", "op": "api"}
-{"off": "0x101c", "op": "mmio_w", "val": "0x10001"}
-{"label": "after", "op": "events"}

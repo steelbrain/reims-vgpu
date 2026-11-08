@@ -1,5 +1,0 @@
-{"expected": "device_create_map_same_start", "host": null, "input": "38a15df00006a9fa4f72b7c85fdc5e3264c72e3f52e4ed158068be01ae417126", "setup": "isolate"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "isolate"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_MEMORY_MAP"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

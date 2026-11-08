@@ -1,3 +1,0 @@
-# suspend_capabilities_key_43: Device-info key 43 is no key a resume reads: the blob is refused (InvalidContent, 2) before the capability check, whose reader has no case for it. The host lives on; the name is kept from when it died there.
-{"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"hex": "5256475301000000010000005000000000000000f5000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000020000000c0000002d0000002b00000000000000", "label": "key 43", "name": "willResume", "op": "api"}

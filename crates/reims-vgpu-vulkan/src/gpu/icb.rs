@@ -1828,7 +1828,7 @@ mod tests {
     use crate::gpu::resource::{VulkanBuffer, VulkanComputePipeline};
 
     const ADD: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_add.metallib");
+        include_bytes!("../../../../tests/shaders/compute_add.metallib");
 
     /// `MTLCommandBufferStatusCompleted`.
     const COMPLETED: u64 = 4;

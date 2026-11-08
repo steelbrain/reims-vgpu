@@ -6,13 +6,13 @@ use reims_vgpu_metal::MetalPlatform;
 use super::*;
 
 const TGSTATIC: &[u8] =
-    include_bytes!("../../../../../../tests/suite/fixtures/shaders/compute_tgstatic.metallib");
+    include_bytes!("../../../../../../tests/shaders/compute_tgstatic.metallib");
 
 const CONSTANT: &[u8] =
-    include_bytes!("../../../../../../tests/suite/fixtures/shaders/fc.metallib");
+    include_bytes!("../../../../../../tests/shaders/fc.metallib");
 
 const TRUNCATED: &[u8] =
-    include_bytes!("../../../../../../tests/suite/fixtures/shaders/kernel_trunc.metallib");
+    include_bytes!("../../../../../../tests/shaders/kernel_trunc.metallib");
 
 /// A pipeline's answers, in the trait's order but the ID: ID, imageblock length of 8×8,
 /// largest threadgroup, resource index, static threadgroup memory, ICB support, execution

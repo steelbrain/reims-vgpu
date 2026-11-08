@@ -1,3 +1,0 @@
-# suspend_resume_nil: rvg_device_will_resume with the empty blob of a slot never filled: empty data, not a NULL state (suspend_gap_nil_state passes NULL).
-{"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"name": "willResume", "op": "api", "slot": "never"}

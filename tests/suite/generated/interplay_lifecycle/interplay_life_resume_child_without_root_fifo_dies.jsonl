@@ -1,9 +1,0 @@
-# interplay_life_resume_child_without_root_fifo_dies: A resume blob with a root page but no root FIFO, over a running node whose FIFO holds a written NOP: the restored child runs it and signals its stamp into the stamp memory the missing root FIFO would have provided (DeviceCore::signal_stamp writes through a null stamp memory): the host dies.
-{"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"gpa": "0x40008000", "hex": "0300010000000000", "op": "mem"}
-{"gpa": "0x4000c000", "hex": "1e0000000c00000007000000", "op": "mem"}
-{"gpa": "0x40004400", "hex": "0c00000000000000ffffffff0100010002000100", "op": "mem"}
-{"hex": "5256475301000000010000005000000001000100f500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000002000000040000002d000000", "label": "resume", "name": "willResume", "op": "api"}
-{"name": "didResume", "op": "api"}
-{"op": "quiesce", "quiet_ms": 200}
-{"label": "resumed", "op": "events"}

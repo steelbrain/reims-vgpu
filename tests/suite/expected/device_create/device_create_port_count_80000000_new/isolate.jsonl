@@ -1,5 +1,0 @@
-{"expected": "device_create_port_count_80000000_new", "host": null, "input": "6bfcd2a95356f716ee02d11b160916608528748335570f0c86686fdcfc8099b0", "setup": "isolate"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "isolate"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_DISPLAY_PORT_COUNT"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

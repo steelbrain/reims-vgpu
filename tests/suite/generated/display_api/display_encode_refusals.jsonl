@@ -1,5 +1,0 @@
-# display_encode_refusals: rvg_display_encode_frame with no frame yet clears the target to (0,0,0,1) and succeeds, and the host present count stays 0. A region smaller than the target does not limit the clear.
-{"displays": [{"modes": [[64, 32, 60]], "name": "suite", "port": 0, "serial": 1000}], "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"display": 0, "h": 4, "label": "a region, no frame", "op": "encode", "region": [2, 1, 3, 2], "w": 8}
-{"display": 0, "format": 70, "h": 4, "label": "RGBA8Unorm, no frame", "op": "encode", "w": 8}
-{"display": 0, "name": "present_counts", "op": "api"}

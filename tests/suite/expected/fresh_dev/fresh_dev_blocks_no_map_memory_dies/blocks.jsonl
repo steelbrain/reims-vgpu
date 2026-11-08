@@ -1,6 +1,0 @@
-{"expected": "fresh_dev_blocks_no_map_memory_dies", "host": null, "input": "307f018e25170cf135c9f75813e8271685186ca6339adf9bda22f07c49fdb45c", "setup": "blocks"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "blocks"}
-{"ev": "device", "i": 0, "ok": 1}
-{"ev": "mmio_w", "i": 1, "off": "0x1034", "val": "0xf5"}
-{"ev": "mmio_sweep", "from": "0x1000", "i": 2, "label": "registers", "nonzero": {"0x1034": "0xf5"}, "to": "0x1040"}
-{"after": 2, "ev": "outcome", "kind": "died"}

@@ -15,7 +15,7 @@ use crate::os::OsSurface;
 fn kernel_states<P: Platform>(d: &P::Device) -> [(bool, u64, u64); 2] {
     use reims_vgpu_core::platform::resource::{ComputePipeline as _, Library as _};
     use reims_vgpu_core::rt::Hold;
-    let kernel = include_bytes!("../../../../../../tests/suite/fixtures/shaders/kernel.metallib");
+    let kernel = include_bytes!("../../../../../../tests/shaders/kernel.metallib");
     let library = d.new_library(kernel).unwrap().unwrap().unwrap();
     let name = library.function_names()[0].clone();
     let f = library

@@ -345,8 +345,8 @@ mod tests {
     use crate::gpu::device::tests::dev;
     use crate::gpu::resource::VulkanRenderPipeline;
 
-    const VERT: &[u8] = include_bytes!("../../../../../tests/suite/fixtures/shaders/vert.metallib");
-    const FRAG: &[u8] = include_bytes!("../../../../../tests/suite/fixtures/shaders/frag.metallib");
+    const VERT: &[u8] = include_bytes!("../../../../../tests/shaders/vert.metallib");
+    const FRAG: &[u8] = include_bytes!("../../../../../tests/shaders/frag.metallib");
 
     /// `tri_vert` and `tri_frag` into `BGRA8Unorm`, with indirect command buffer support: its
     /// vertex function writes no `[[point_size]]`, of no input primitive topology class.

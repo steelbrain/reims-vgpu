@@ -1121,7 +1121,7 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     macro_rules! shader {
         ($name:literal) => {
             &include_bytes!(concat!(
-                "../../../../../../tests/suite/fixtures/shaders/",
+                "../../../../../../tests/shaders/",
                 $name,
                 ".metallib"
             ))[..]
@@ -1321,7 +1321,7 @@ fn unrasterized_states_are_metals() {
     macro_rules! shader {
         ($name:literal) => {
             &include_bytes!(concat!(
-                "../../../../../../tests/suite/fixtures/shaders/",
+                "../../../../../../tests/shaders/",
                 $name,
                 ".metallib"
             ))[..]
@@ -1401,7 +1401,7 @@ fn an_input_no_vertex_output_writes_is_metals() {
     macro_rules! shader {
         ($name:literal) => {
             &include_bytes!(concat!(
-                "../../../../../../tests/suite/fixtures/shaders/",
+                "../../../../../../tests/shaders/",
                 $name,
                 ".metallib"
             ))[..]

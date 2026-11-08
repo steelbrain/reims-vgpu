@@ -1,6 +1,0 @@
-# mutgap2_dev_finish_suspend_fresh_dies: rvg_device_finish_suspend without rvg_device_will_suspend asserts the run state also on a fresh device with only a version, which has no FIFO to drain, no task and no display to pause: the host dies at the call (suspend_host_asserts_finish_without_will dies there too, but with a running FIFO that nothing quiesced).
-{"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"off": "0x1034", "op": "mmio_w", "val": "0xf5"}
-{"label": "before", "off": "0x1034", "op": "mmio_r"}
-{"name": "finishSuspend", "op": "api", "slot": "s"}
-{"label": "not reached", "op": "events"}

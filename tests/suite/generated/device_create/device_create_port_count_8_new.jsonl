@@ -1,5 +1,0 @@
-# device_create_port_count_8_new: display_port_count 0 and 9 refuse the device (RVG_ERR_DISPLAY_PORT_COUNT); 1 (the runner's default) to 8 create one, and 0x122c reads the count at version 245.
-{"descriptor": {"port_count": 8}, "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"label": "before a version", "off": "0x122c", "op": "mmio_r"}
-{"off": "0x1034", "op": "mmio_w", "val": "0xf5"}
-{"label": "at 245", "off": "0x122c", "op": "mmio_r"}

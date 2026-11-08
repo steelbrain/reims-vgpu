@@ -1,7 +1,0 @@
-# What running the suite leaves behind.
-bin/
-out/
-__pycache__/
-*.air
-cov/
-*.profraw

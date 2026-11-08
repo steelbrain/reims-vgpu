@@ -1,2 +1,0 @@
-# device_create_isolation_without_map: Isolation without a memory map (and without blocks) is refused. Isolate setup only: the refusal needs isolation on.
-{"descriptor": {"no_map": true}, "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}

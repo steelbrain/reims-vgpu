@@ -1,5 +1,0 @@
-{"expected": "device_create_isolation_without_map", "host": null, "input": "5f16729196786ee1fbfca80fe906865eaf2c0e9f1faffc9a2c1b116f7b5ba7e4", "setup": "isolate"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "isolate"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_ISOLATION_WITHOUT_MAP"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

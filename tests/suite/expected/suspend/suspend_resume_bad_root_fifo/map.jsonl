@@ -1,5 +1,0 @@
-{"expected": "suspend_resume_bad_root_fifo", "host": null, "input": "279a7089d1d2e66bc228df35726ae8bd1d72e5817dd9e88b5a737fd0453b20f1", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 1}
-{"ev": "api", "i": 1, "label": "resume", "name": "willResume", "ok": true}
-{"after": 1, "ev": "outcome", "kind": "died"}

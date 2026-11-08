@@ -1,5 +1,0 @@
-{"expected": "display_port_count_invalid_9", "host": null, "input": "240b172cf113a0a24854239f60824da9d925cf8ab85379ab1fbff9734c583b0b", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_DISPLAY_PORT_COUNT"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

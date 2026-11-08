@@ -1,5 +1,0 @@
-{"expected": "device_create_map_with_unmapMemory", "host": null, "input": "e14ef96c3d7c5b50238ec652cc8b76bfbd5034ecc32d71b557d97272a1fb490b", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_MEMORY_CONFLICT"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

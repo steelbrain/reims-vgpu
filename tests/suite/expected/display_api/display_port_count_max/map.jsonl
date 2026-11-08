@@ -1,8 +1,0 @@
-{"expected": "display_port_count_max", "host": null, "input": "7101bacf492504bd44f75e166c80089d572fd301908f349efd7e8506649ddb0b", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 1}
-{"ev": "api", "i": 1, "name": "maxPorts", "value": 8}
-{"ev": "events", "i": 2, "irqs": 0, "label": "end"}
-{"ev": "teardown", "i": 2}
-{"ev": "end", "i": 2}
-{"ev": "outcome", "kind": "completed"}

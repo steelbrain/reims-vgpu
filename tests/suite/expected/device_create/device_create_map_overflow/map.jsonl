@@ -1,5 +1,0 @@
-{"expected": "device_create_map_overflow", "host": null, "input": "9e95b933b7a815d6ea5306fe1a5a07a19a51a2c38776cbbc550c20e39231f2cd", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_MEMORY_MAP"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

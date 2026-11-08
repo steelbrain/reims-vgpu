@@ -2399,9 +2399,9 @@ pub(crate) mod tests {
             .expect("CARGO_MANIFEST_DIR: run the tests with cargo or nextest")
     }
 
-    /// The directory of the suite's shader fixtures, `tests/suite/fixtures/shaders`.
+    /// The directory of the test shaders, `tests/shaders`.
     pub(crate) fn fixture_shaders() -> std::path::PathBuf {
-        crate_dir().join("../../tests/suite/fixtures/shaders")
+        crate_dir().join("../../tests/shaders")
     }
 
     /// The build script's `OUT_DIR`, which cargo and nextest give a test process of a package
@@ -3334,7 +3334,7 @@ pub(crate) mod tests {
         assert!(
             dev()
                 .new_library(include_bytes!(
-                    "../../../../tests/suite/fixtures/shaders/kernel.metallib"
+                    "../../../../tests/shaders/kernel.metallib"
                 ))
                 .unwrap()
                 .unwrap()
@@ -3351,7 +3351,7 @@ pub(crate) mod tests {
         let d = dev();
         let library = d
             .new_library(include_bytes!(
-                "../../../../tests/suite/fixtures/shaders/kernel.metallib"
+                "../../../../tests/shaders/kernel.metallib"
             ))
             .unwrap()
             .unwrap()
@@ -3483,7 +3483,7 @@ pub(crate) mod tests {
             (12, Some("ab"))
         );
         let vert = fixture_function(include_bytes!(
-            "../../../../tests/suite/fixtures/shaders/vert.metallib"
+            "../../../../tests/shaders/vert.metallib"
         ));
         let refused = |blob| {
             d.new_compute_pipeline_state(Some(&descriptor(&vert, blob)), 0)
@@ -3519,7 +3519,7 @@ pub(crate) mod tests {
         use crate::gpu::serialized::tests::{Resolve, fixture_function, hex};
         let d = dev();
         let vert = fixture_function(include_bytes!(
-            "../../../../tests/suite/fixtures/shaders/vert.metallib"
+            "../../../../tests/shaders/vert.metallib"
         ));
         let mut resolve = Resolve::answering(Some(vert));
         let desc = d

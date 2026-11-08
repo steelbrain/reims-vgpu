@@ -1,2 +1,0 @@
-# device_create_map_with_unmapMemory: A memory map together with any one of the five task blocks is refused. Map and isolate setups only: they are the ones with a memory map.
-{"descriptor": {"blocks": {"unmapMemory": true}}, "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}

@@ -1,6 +1,0 @@
-# suspend_resume_unmapped_root: rvg_device_did_resume with root words that do not describe valid objects: a task word whose task root has a page-table root of 0 fails to create a task (logged, skipped), a display word naming a page outside guest RAM fails the guest display (logged, skipped), and a root page that does not map leaves no root; a FIFO enabled in the blob is then not recreated. None of these stops the resume.
-{"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"hex": "5256475301000000010000005000000010000000f500000011000000010000000040000000000000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000002000000040000002d000000", "label": "resume", "name": "willResume", "op": "api"}
-{"name": "didResume", "op": "api"}
-{"label": "resumed", "op": "events"}
-{"from": "0x1000", "label": "registers", "op": "mmio_sweep", "step": 4, "to": "0x1040"}

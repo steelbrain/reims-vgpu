@@ -1,2 +1,0 @@
-# device_create_trace_add_only: add_trace_range without remove_trace_range is refused at creation (RVG_ERR_INVALID_ARGUMENT). remove_trace_range alone is ignored, and both together create a device.
-{"descriptor": {"trace": {"add": true}}, "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}

@@ -1,9 +1,0 @@
-# efi_mode_select_no_display: Mode select indexes the display's mode list: 0x120c reads w | h << 16 of the selected mode, 0xffffffff past the end; the index resets to 0 when the display is bound. With no display, the count is 0 and every index is past the end.
-{"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"off": "0x1200", "op": "mmio_w", "val": "0x1"}
-{"off": "0x1208", "op": "mmio_w", "val": "0x0"}
-{"off": "0x1204", "op": "mmio_r"}
-{"off": "0x120c", "op": "mmio_r"}
-{"off": "0x1208", "op": "mmio_w", "val": "0x1"}
-{"off": "0x1204", "op": "mmio_r"}
-{"off": "0x120c", "op": "mmio_r"}

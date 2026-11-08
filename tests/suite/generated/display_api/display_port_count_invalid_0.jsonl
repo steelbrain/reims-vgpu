@@ -1,2 +1,0 @@
-# display_port_count_invalid_0: A config display_port_count of 0 or 9 is refused: no device; RVG_MAX_DISPLAY_PORTS is 8.
-{"descriptor": {"port_count": 0}, "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}

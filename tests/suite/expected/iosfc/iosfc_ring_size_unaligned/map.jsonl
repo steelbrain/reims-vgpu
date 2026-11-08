@@ -1,6 +1,0 @@
-{"expected": "iosfc_ring_size_unaligned", "host": null, "input": "764938842b9fa4fd7241fcc2d9d2b37dd8f9435b3ed932184869e630126be0aa", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "iosfc", "i": 0, "ok": 1}
-{"ev": "device", "i": 0, "ok": 1}
-{"ev": "iosfc_w", "i": 1, "off": "0x1000", "val": "0x40008000"}
-{"after": 1, "ev": "outcome", "kind": "died"}

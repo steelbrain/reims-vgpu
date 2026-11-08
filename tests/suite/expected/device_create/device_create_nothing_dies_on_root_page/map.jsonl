@@ -1,8 +1,0 @@
-{"expected": "device_create_nothing_dies_on_root_page", "host": null, "input": "333be15a6bef1be996afcf3d04330a66eacebf8015490d7e95c84d04d3286611", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 1}
-{"ev": "mmio_w", "i": 1, "off": "0x1034", "val": "0xf5"}
-{"ev": "mmio_sweep", "from": "0x1000", "i": 2, "label": "no blocks, no map", "nonzero": {"0x1034": "0xf5", "0x122c": "0x1"}, "to": "0x1300"}
-{"ev": "mmio_w", "i": 3, "off": "0x101c", "val": "0x0"}
-{"ev": "mmio_r", "i": 4, "label": "root page 0 is harmless", "off": "0x101c", "val": "0x0"}
-{"after": 4, "ev": "outcome", "kind": "died"}

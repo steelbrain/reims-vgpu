@@ -1,5 +1,0 @@
-{"expected": "device_create_no_metal_device_new", "host": null, "input": "bbdcbe38d8459376e33590c2fd9ea4f1d6d9646cf3470ead9379665163572481", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_NO_METAL_DEVICE"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

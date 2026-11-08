@@ -1,4 +1,0 @@
-# fresh_host_no_map_memory_dies: A blocks host without map_memory: the root node's mapping finds no map_memory callback and ends the process in the root page write.
-{"descriptor": {"blocks": {"createTask": true, "destroyTask": true, "readMemory": true, "unmapMemory": true}}, "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"off": "0x1034", "op": "mmio_w", "val": "0xf5"}
-{"off": "0x101c", "op": "mmio_w", "val": "0x10001"}

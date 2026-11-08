@@ -1,5 +1,0 @@
-{"expected": "device_create_map_with_readMemory", "host": null, "input": "e338143aaa9411b08561a9f0c8ed0573c0f772dfb4f4b3d96bf1c6b0febf8c75", "setup": "isolate"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "isolate"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_MEMORY_CONFLICT"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

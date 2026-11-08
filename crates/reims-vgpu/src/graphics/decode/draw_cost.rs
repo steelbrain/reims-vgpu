@@ -507,20 +507,20 @@ fn command_buffer(shape: Shape, cb: usize, cb_obj_id: u64) -> Vec<u8> {
     message
 }
 
-/// The suite's committed shaders, `tests/suite/fixtures/shaders`, under the manifest directory
+/// The committed test shaders, `tests/shaders`, under the manifest directory
 /// cargo or nextest gives the test as it runs, which a run of a nextest archive on another host
 /// remaps to that host's tree.
-pub(super) fn suite_shaders() -> std::path::PathBuf {
+pub(super) fn test_shaders() -> std::path::PathBuf {
     std::path::PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR")
             .expect("CARGO_MANIFEST_DIR: run the tests with cargo or nextest"),
     )
-    .join("../../tests/suite/fixtures/shaders")
+    .join("../../tests/shaders")
 }
 
 /// A function of the suite's fixture `name`.
 pub(super) fn fixture<P: Platform>(d: &P::Device, name: &str) -> P::Function {
-    let path = suite_shaders().join(format!("{name}.metallib"));
+    let path = test_shaders().join(format!("{name}.metallib"));
     let library = d
         .new_library(&std::fs::read(path).unwrap())
         .unwrap()

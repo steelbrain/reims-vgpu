@@ -1,5 +1,0 @@
-{"expected": "device_create_trace_add_only", "host": null, "input": "afb0ecf79f579a99a676c9a60973f6f4b3a0aee472a3dbf4d3a49572ef1e4876", "setup": "blocks"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "blocks"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_INVALID_ARGUMENT"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

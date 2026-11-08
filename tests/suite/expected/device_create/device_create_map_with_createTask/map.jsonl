@@ -1,5 +1,0 @@
-{"expected": "device_create_map_with_createTask", "host": null, "input": "1dc9ed7f12eca83645a846fcda2d7fdfd372f9bde164d2364a10ae075ee63d45", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_MEMORY_CONFLICT"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

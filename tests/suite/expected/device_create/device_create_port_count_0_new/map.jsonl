@@ -1,5 +1,0 @@
-{"expected": "device_create_port_count_0_new", "host": null, "input": "b52172404c97802be091633cf55ef6f4fbbc9ca90c08f071bd32d9f5c2cbec0a", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_DISPLAY_PORT_COUNT"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

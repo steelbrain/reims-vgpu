@@ -1,5 +1,0 @@
-{"expected": "device_create_blocks_with_map", "host": null, "input": "e675633ffe0906c1384bb386deaedfd48f744d97512269b62c26b126e3f278f7", "setup": "blocks"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "blocks"}
-{"ev": "device", "i": 0, "ok": 0, "status": "RVG_ERR_MEMORY_CONFLICT"}
-{"ev": "end", "i": 0}
-{"ev": "outcome", "kind": "completed"}

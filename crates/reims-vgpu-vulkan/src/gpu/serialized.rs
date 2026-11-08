@@ -1602,9 +1602,9 @@ pub(crate) mod tests {
     }
 
     pub(crate) const KERNEL: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/kernel.metallib");
+        include_bytes!("../../../../tests/shaders/kernel.metallib");
     pub(crate) const STAGEIN: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_stagein.metallib");
+        include_bytes!("../../../../tests/shaders/compute_stagein.metallib");
 
     /// A resolver answering `f` for every ref, and the refs it was asked for.
     pub(crate) struct Resolve {

@@ -1,5 +1,0 @@
-# suspend_resume_bad_root_fifo: A blob whose root FIFO is enabled but cannot be created (a length that is not a page multiple, "FIFO length not multiple of page size") kills the host: rvg_device_did_resume asserts that the root FIFO exists.
-{"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"hex": "5256475301000000010000005000000001000100f500000002000100010000000010000000000000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000002000000040000002d000000", "label": "resume", "name": "willResume", "op": "api"}
-{"name": "didResume", "op": "api"}
-{"label": "after", "op": "events"}

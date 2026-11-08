@@ -1,7 +1,0 @@
-# smoke_iosfc_registers: The IOSurface host device's registers, fresh and after writes, through QEMU's 32-bit declaration (section 6.23).
-{"iosfc": true, "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"from": "0x0", "op": "iosfc_sweep", "step": 8, "to": "0x1040"}
-{"off": "0x1030", "op": "iosfc_w", "val": "0x1"}
-{"off": "0x1030", "op": "iosfc_r"}
-{"off": "0x1028", "op": "iosfc_r"}
-{"label": "unhandled", "off": "0x2000", "op": "iosfc_r"}

@@ -1939,7 +1939,7 @@ pub(crate) mod tests {
                 .starts_with("Error Domain=MTLLibraryErrorDomain"),
             "{e:?}"
         );
-        let bytes = include_bytes!("../../../../tests/suite/fixtures/shaders/kernel.metallib");
+        let bytes = include_bytes!("../../../../tests/shaders/kernel.metallib");
         let lib = d.new_library(bytes).unwrap().unwrap().unwrap();
         assert_eq!(lib.get().functionNames().count(), 1);
     }

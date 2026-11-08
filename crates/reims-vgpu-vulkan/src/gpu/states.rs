@@ -1394,10 +1394,10 @@ mod tests {
         use crate::gpu::serialized::tests::fixture_function;
         (
             fixture_function(include_bytes!(
-                "../../../../tests/suite/fixtures/shaders/render_vdesc.metallib"
+                "../../../../tests/shaders/render_vdesc.metallib"
             )),
             fixture_function(include_bytes!(
-                "../../../../tests/suite/fixtures/shaders/render_color.metallib"
+                "../../../../tests/shaders/render_color.metallib"
             )),
         )
     }
@@ -1946,10 +1946,10 @@ mod tests {
         use crate::gpu::serialized::tests::fixture_function;
         (
             fixture_function(include_bytes!(
-                "../../../../tests/suite/fixtures/shaders/vert.metallib"
+                "../../../../tests/shaders/vert.metallib"
             )),
             fixture_function(include_bytes!(
-                "../../../../tests/suite/fixtures/shaders/frag.metallib"
+                "../../../../tests/shaders/frag.metallib"
             )),
         )
     }

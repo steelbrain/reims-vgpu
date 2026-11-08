@@ -1,5 +1,0 @@
-# fresh_dev_blocks_no_map_memory_dies: A blocks-setup host that leaves map_memory absent: the device is created and its registers work, but the first root-page write (DeviceCore::set_root_page) creates the root task (create_task) and maps the root node into it, where DeviceCore::root_task_mapping finds no map_memory and ends the process (DeviceDeath::NilBlock): the host dies at that write. Blocks setup only, as fresh_dev_blocks_no_destroy_task_reset_dies.
-{"descriptor": {"blocks": {"createTask": true, "destroyTask": true, "readMemory": true, "unmapMemory": true}}, "op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"off": "0x1034", "op": "mmio_w", "val": "0xf5"}
-{"from": "0x1000", "label": "registers", "op": "mmio_sweep", "step": 4, "to": "0x1040"}
-{"off": "0x101c", "op": "mmio_w", "val": "0x10001"}

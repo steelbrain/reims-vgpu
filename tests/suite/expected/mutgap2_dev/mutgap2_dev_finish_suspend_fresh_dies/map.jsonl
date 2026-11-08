@@ -1,6 +1,0 @@
-{"expected": "mutgap2_dev_finish_suspend_fresh_dies", "host": null, "input": "6e245276a050cbc1972bab78196ff43af1eaac29d548e5a330850856f7b652ee", "setup": "map"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "map"}
-{"ev": "device", "i": 0, "ok": 1}
-{"ev": "mmio_w", "i": 1, "off": "0x1034", "val": "0xf5"}
-{"ev": "mmio_r", "i": 2, "label": "before", "off": "0x1034", "val": "0xf5"}
-{"after": 2, "ev": "outcome", "kind": "died"}

@@ -1,6 +1,0 @@
-{"expected": "interplay_life_resume_child_without_root_fifo_dies", "host": null, "input": "ea68af4abdc87183834d166c352121d3fcedaf13c0c9378712961a5fc124afaa", "setup": "isolate"}
-{"ev": "binding", "i": 0, "library": "<build>", "setup": "isolate"}
-{"ev": "device", "i": 0, "ok": 1}
-{"ev": "api", "i": 4, "label": "resume", "name": "willResume", "ok": true}
-{"ev": "api", "i": 5, "name": "didResume"}
-{"after": 5, "ev": "outcome", "kind": "died"}

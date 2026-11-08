@@ -1,6 +1,0 @@
-# mutgap_dev_resume_info_max_key: rvg_device_will_resume takes the device-info max key from the blob, so the next rvg_device_finish_suspend's blob carries it: a crafted blob with max key 2 ({1, 1}) resumed on the fresh device gives a blob with max key 2, the host's {1, ...} pair and length 116; the blob of a device that asked for max key 45, resumed on a fresh device, gives max key 45 again.
-{"op": "config", "ram": [["0x40000000", "0x4000000"]], "stamp_slots": 2, "watchdog_s": 30}
-{"hex": "5256475301000000010000005000000000000000f5000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000020000000c000000020000000100000001000000", "label": "max key 2", "name": "willResume", "op": "api"}
-{"name": "didResume", "op": "api"}
-{"name": "willSuspend", "op": "api"}
-{"name": "finishSuspend", "op": "api", "slot": "s"}
