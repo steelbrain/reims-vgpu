@@ -136,8 +136,9 @@ pub(crate) struct PlanePlace {
     pub(crate) offset: u64,
     /// Bytes from one of its rows to the next.
     pub(crate) bytes_per_row: u64,
-    /// The bytes of one of its rows: its width in its format's blocks (`blockBytes`), at most
-    /// `bytes_per_row` where the format's size is unknown.
+    /// The bytes of one of its rows ([`row_bytes`]): its width in its format's texels, or in its
+    /// blocks for a format of blocks, at most `bytes_per_row`, which it is where the format's size
+    /// is unknown.
     pub(crate) row_bytes: u64,
     /// Its width in pixels.
     pub(crate) width: u64,
@@ -145,15 +146,25 @@ pub(crate) struct PlanePlace {
     pub(crate) height: u64,
 }
 
-/// The bytes of a row `width` pixels wide of a texture of the format `info` describes, its blocks
-/// across; `bytes_per_row` where the format's blocks are unknown (no size), and at most that.
+/// `MTLPixelFormatInfo`'s flags bit of a format of blocks (the compressed formats, `GBGR422` and
+/// `BGRG422`), whose words from +0x18 are its block's bytes, width, height and depth. Any other
+/// format's are its texel's bytes, a packed word and two more (R8Unorm `[1, 257, 1, 1]`,
+/// RG16Unorm `[4, 514, 4, 4]`, metal2vulkan's table of Metal's answers on the M3 Max).
+const BLOCKS: u64 = 0x400;
+
+/// The bytes of a row `width` pixels wide of a texture of the format `info` describes: its texels
+/// across, or its blocks across for a format of blocks ([`BLOCKS`]); `bytes_per_row` where the
+/// format's size is unknown (no size, or a block of no width), and at most that.
 pub(crate) fn row_bytes(info: &PixelFormatInfo, width: u32, bytes_per_row: u64) -> u64 {
-    if info.block_bytes == 0 || info.block_width == 0 {
+    let across = match (info.flags & BLOCKS != 0, info.block_width) {
+        (true, 0) => return bytes_per_row,
+        (true, block_width) => u64::from(width).div_ceil(block_width),
+        (false, _) => u64::from(width),
+    };
+    if info.block_bytes == 0 {
         return bytes_per_row;
     }
-    (u64::from(width).div_ceil(info.block_width))
-        .saturating_mul(info.block_bytes)
-        .min(bytes_per_row)
+    across.saturating_mul(info.block_bytes).min(bytes_per_row)
 }
 
 /// One plane of a picture's output: `height` rows of `width` pixels, `row_bytes` each,
@@ -387,27 +398,56 @@ impl<P: Platform> GraphicsDecoder<P> {
 mod tests {
     use super::*;
 
-    fn info(block_bytes: u64, block_width: u64) -> PixelFormatInfo {
+    /// Metal's answer for a format, its flags and its four words from +0x18, as metal2vulkan's
+    /// table of the M3 Max's answers holds them.
+    fn info(
+        flags: u64,
+        [block_bytes, block_width, block_height, block_depth]: [u64; 4],
+    ) -> PixelFormatInfo {
         PixelFormatInfo {
             name: None,
-            flags: 0,
+            flags,
             cast_class: 0,
             block_bytes,
             block_width,
-            block_height: 1,
-            block_depth: 1,
+            block_height,
+            block_depth,
         }
     }
 
-    /// A row's bytes are its whole blocks across, at most its pitch, and its pitch where the
-    /// format's blocks are unknown: the luma (R8Unorm) and chroma (RG16Unorm) of a tile 512
-    /// wide, a compressed format of 4-pixel blocks, and a format of no size.
+    /// R8Unorm, R16Unorm, RG8Unorm and RG16Unorm: a video plane's formats.
+    const R8: (u64, [u64; 4]) = (0x0703_019f, [1, 257, 1, 1]);
+    const R16: (u64, [u64; 4]) = (0x0703_019f, [2, 513, 2, 2]);
+    const RG8: (u64, [u64; 4]) = (0x0503_019f, [2, 258, 2, 2]);
+    const RG16: (u64, [u64; 4]) = (0x0703_019f, [4, 514, 4, 4]);
+    /// GBGR422, a format of 2-by-1 blocks; BC1_RGBA, of 4-by-4 blocks of 8 bytes (blocks' flag
+    /// alone, which is what the row reads).
+    const GBGR422: (u64, [u64; 4]) = (0x0003_4405, [4, 2, 1, 1]);
+    const BC1: (u64, [u64; 4]) = (BLOCKS, [8, 4, 4, 1]);
+
+    /// A plain format's row is its texels across, whatever its second word (R8Unorm's 257, which a
+    /// read of it as a block width made 8 bytes of a 1920-pixel luma row): the luma and chroma of
+    /// 8-bit and 10-bit pictures at 1080p and 4K, and at most the pitch.
     #[test]
-    fn a_row_is_its_blocks_across() {
-        assert_eq!(row_bytes(&info(1, 1), 512, 2048), 512);
-        assert_eq!(row_bytes(&info(4, 1), 256, 2048), 1024);
-        assert_eq!(row_bytes(&info(8, 4), 6, 2048), 16);
-        assert_eq!(row_bytes(&info(4, 1), 1024, 2048), 2048);
-        assert_eq!(row_bytes(&info(0, 0), 512, 2048), 2048);
+    fn a_plain_formats_row_is_its_texels_across() {
+        let row = |(flags, words), width, pitch| row_bytes(&info(flags, words), width, pitch);
+        assert_eq!(row(R8, 1920, 2048), 1920);
+        assert_eq!(row(RG8, 960, 2048), 1920);
+        assert_eq!(row(R16, 3840, 8192), 7680);
+        assert_eq!(row(RG16, 1920, 8192), 7680);
+        assert_eq!(row(R8, 3840, 2048), 2048);
+    }
+
+    /// A format of blocks has its whole blocks across, at most its pitch, and its pitch where its
+    /// size is unknown: a 2-by-1 format, a compressed one of 4-pixel blocks over a partial block,
+    /// a block of no width, and a format of no size.
+    #[test]
+    fn a_block_formats_row_is_its_blocks_across() {
+        let row = |(flags, words), width, pitch| row_bytes(&info(flags, words), width, pitch);
+        assert_eq!(row(GBGR422, 511, 2048), 1024);
+        assert_eq!(row(BC1, 6, 2048), 16);
+        assert_eq!(row(BC1, 1024, 2048), 2048);
+        assert_eq!(row((BLOCKS, [8, 0, 4, 1]), 6, 2048), 2048);
+        assert_eq!(row((0, [0; 4]), 512, 2048), 2048);
     }
 }

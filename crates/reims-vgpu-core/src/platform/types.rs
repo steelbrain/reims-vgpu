@@ -259,7 +259,10 @@ pub struct ResourceAddressRange {
 
 /// `MTLPixelFormatInfo`: what `MTLPixelFormatGetInfoForDevice` returns (0x38 bytes; names are
 /// Metal's metadata's). From +0x18 Metal has a union, and these are its compressed form's names;
-/// copies the four words at +0x18 whole as a plane, so all four are kept raw.
+/// copies the four words at +0x18 whole as a plane, so all four are kept raw. They are a block's
+/// only for a format of blocks (flags bit `0x400`: the compressed formats, `GBGR422` and
+/// `BGRG422`); any other format's are its texel's bytes, a packed word and two more (R8Unorm's
+/// `[1, 257, 1, 1]`), so `block_width` is no width there.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct PixelFormatInfo {
     /// `name` (+0x00): Metal's C string, `None` for NULL. Diagnostics only (the blit decoder's
