@@ -21,6 +21,7 @@
 #include "RgfxBundlePaths.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
+#include "RgfxPciClass.hpp"
 #include "RgfxSurfaceRows.hpp"
 #include "RgfxTrace.hpp"
 #include "RgfxVideoCodecs.hpp"
@@ -392,6 +393,12 @@ bool RgfxAccelerator::start(IOService *provider)
 			pci->setProperty("model", data);
 			data->release();
 		}
+	}
+	// The GPU's class, as a Mac's GPU states it (RgfxPciClass.hpp): `class-code` on the PCI
+	// device, where software in the guest lists the Mac's GPUs.
+	if (OSData *data = OSData::withBytes(kRgfxMacGpuClassCode, sizeof(kRgfxMacGpuClassCode))) {
+		pci->setProperty("class-code", data);
+		data->release();
 	}
 	nameProviderForVideo();
 	// AppleGVA reads the video codecs off this service once Metal's matching sees it, after

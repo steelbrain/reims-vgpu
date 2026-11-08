@@ -817,7 +817,10 @@ same formats. All values are little-endian.
 
 **PCI.** Class 0x0380 (display controller, other). The vendor:device ID is
 the owner's call (Open); development uses the placeholder `1234:5247`.
-Apple's paravirt kext matches only `106b:eeee`.
+Apple's paravirt kext matches only `106b:eeee`. In the guest's registry the
+kext states the class an x86 Mac's GPU states, 0x030000, as the PCI device's
+`class-code`, which software that lists the Mac's GPUs reads
+(`guest/kext/src/RgfxPciClass.hpp`); configuration space keeps 0x0380.
 
 **BAR0: registers**, 4 KiB of MMIO, 32-bit accesses. The MSI-X table and PBA
 sit in BAR0 from 0x800.
