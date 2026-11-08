@@ -632,16 +632,15 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
             // QEMU wrote its pid file and exited, or never wrote it.
             std::thread::sleep(Duration::from_millis(200));
             if pid(vm).is_none() {
-                let note = vm
-                    .config
-                    .profile
-                    .memfd_ram(host)
-                    .then(|| mem_available_mib(Path::new("/proc/meminfo")))
-                    .flatten()
-                    .and_then(|a| memory_note(vm.name(), vm.config.memory_mib, a))
-                    .map(|n| format!("\n{n}"))
-                    .unwrap_or_default();
-                bail!("QEMU exited:\n{}{note}", tail(&vm.qemu_log(), 15));
+                let log = tail(&vm.qemu_log(), 15);
+                let silent = log.lines().last().is_some_and(|l| l.trim() == "----");
+                let note = match mem_available_mib(Path::new("/proc/meminfo")) {
+                    Some(a) if silent && vm.config.profile.memfd_ram(host) => {
+                        format!("\n{}", memory_note(vm.name(), vm.config.memory_mib, a))
+                    }
+                    _ => String::new(),
+                };
+                bail!("QEMU exited:\n{log}{note}");
             }
         }
         if Instant::now() > deadline {
@@ -768,24 +767,23 @@ pub fn mem_available_mib(file: &Path) -> Option<u64> {
         .map(|kib| kib / 1024)
 }
 
-/// What a start that QEMU did not survive adds where the VM's RAM, which QEMU allocates whole as it
-/// starts on Linux (`qemu`'s module doc), is more than the host has available: the kernel ends a
-/// QEMU it cannot give that memory, which leaves no error of QEMU's own in its log. None where
-/// the RAM fits.
-pub fn memory_note(name: &str, memory_mib: u64, available_mib: u64) -> Option<String> {
+/// What a start adds where QEMU ended with no error of its own after the command reims-ctl logged
+/// (the log's last line is that command's `----`), as when the kernel ends a process it cannot
+/// give memory: QEMU allocates the VM's RAM whole as it starts on Linux (`qemu`'s module doc), so
+/// a host without that much free memory ends it there.
+pub fn memory_note(name: &str, memory_mib: u64, available_mib: u64) -> String {
     let gib = |mib: u64| match mib % 1024 {
         0 => format!("{} GiB", mib / 1024),
         _ => format!("{:.1} GiB", mib as f64 / 1024.0),
     };
-    (memory_mib > available_mib).then(|| {
-        format!(
-            "{name} needs {} of free memory to start: QEMU allocates all of its RAM as it starts, \
-             and this host has {} available. Free some, or give it less with reims-ctl set \
-             {name} --memory SIZE",
-            gib(memory_mib),
-            gib(available_mib)
-        )
-    })
+    format!(
+        "QEMU ended without an error of its own, as the kernel ends a process it cannot give \
+         memory: {name} needs {} of free memory to start, since QEMU allocates all of its RAM \
+         as it starts, and this host has {} available now. Free some, or give it less with \
+         reims-ctl set {name} --memory SIZE",
+        gib(memory_mib),
+        gib(available_mib)
+    )
 }
 
 /// The last `n` lines of a text file.
@@ -850,10 +848,10 @@ mod tests {
         assert!(note.contains("vm.max_map_count=8388608"), "{note}");
     }
 
-    /// A start QEMU did not survive names the memory a VM's RAM needs only where the host has
-    /// less available, read from `MemAvailable` as the kernel writes it.
+    /// A start QEMU did not survive, with no error of its own, names the memory the VM's RAM
+    /// needs and what the host has available, read from `MemAvailable` as the kernel writes it.
     #[test]
-    fn a_vm_whose_ram_is_more_than_the_host_has_is_told_what_it_needs() {
+    fn a_vm_whose_qemu_ends_silently_is_told_what_its_ram_needs() {
         let env = crate::testenv::Env::new("meminfo");
         let file = env.root.join("meminfo");
         assert_eq!(mem_available_mib(&file), None);
@@ -863,11 +861,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mem_available_mib(&file), Some(3072));
-        assert_eq!(memory_note("mac", 3072, 3072), None);
-        let note = memory_note("mac", 8192, 3584).unwrap();
+        let note = memory_note("mac", 8192, 3584);
         assert!(
-            note.starts_with("mac needs 8 GiB of free memory to start")
-                && note.contains("this host has 3.5 GiB available")
+            note.starts_with("QEMU ended without an error of its own")
+                && note.contains("mac needs 8 GiB of free memory to start")
+                && note.contains("this host has 3.5 GiB available now")
                 && note.contains("reims-ctl set mac --memory SIZE"),
             "{note}"
         );
