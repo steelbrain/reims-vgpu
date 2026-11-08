@@ -164,10 +164,13 @@ where it is NVIDIA's and CUDA opens it (`graphics/video_choice.rs`).
 - **A picture that does not land is a decode error.** A picture whose planes
   the session refuses, or whose decode NVDEC failed once it ran, still
   signals the decode's value, so its command buffer completes, failed with
-  Metal's internal error; the guest's video driver fails its session's next
-  schedule for it (`kVTVideoDecoderMalfunctionErr`), one picture late. A
-  stream's last such picture has no later schedule, and reaches the guest as
-  a decoded frame (AppleGVA's queries carry no error).
+  Metal's internal error. For HEVC the guest's video driver fails the
+  session's next schedule for it (`kVTVideoDecoderMalfunctionErr`), which
+  AppleGVA then reports for every frame after; it schedules a picture before
+  it queries the one before, so the failed picture and the next reach the
+  guest as decoded frames. AppleGVA's H.264 decoder reports no failure a
+  driver can answer, so an H.264 picture that does not land reaches the guest
+  as a decoded frame (`guest/bundle/src/RgfxVideoStatus.hpp`).
 - **Surfaces.** A picture holds its decode surface until it lands; the decoder
   has `AnnexBDecoder::SPARE_PICTURES` (2) beyond its references and the
   picture being decoded, and the session holds no more pictures unlanded than

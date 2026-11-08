@@ -1105,13 +1105,14 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			const rgfx::video::QueryReport report = rgfx::video::queryReport(status);
 			if (report.hostFailed && !t->failed && t->context) {
 				t->failed = true;
-				failed.push_back(t->context);
+				if (rgfx::video::failsLaterSchedule(t->context->sub_id == kCodecHevc))
+					failed.push_back(t->context);
 			}
 			q.status = report.status;
 			q.field_14 = 0;
 		}
-		// The sessions of decodes that failed on the host, where they still are, fail their
-		// next schedule.
+		// The HEVC sessions of decodes that failed on the host, where they still are, fail their
+		// next schedule (RgfxVideoStatus.hpp).
 		if (!failed.empty()) {
 			std::lock_guard<std::mutex> hold(g_sessionLock);
 			for (Context *context : failed)

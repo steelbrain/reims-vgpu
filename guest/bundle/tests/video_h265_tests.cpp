@@ -263,9 +263,10 @@ void checkRefusals()
 }
 
 // What the driver answers AppleGVA for a decode it could not complete (RgfxVideoStatus.hpp): the
-// schedule of a command it did not send fails, and so does a session's next schedule after a
-// failure on the host, the one answer AppleGVA reports; a decoded or still-running command is
-// answered as it always was.
+// schedule of a command it did not send fails, and so does an HEVC session's next schedule after
+// a failure on the host, the one answer AppleGVA's HEVC decoder reports; an H.264 session's fails
+// none, as AppleGVA's H.264 decoder reports none; a decoded or still-running command is answered
+// as it always was.
 void checkStatus()
 {
 	using rgfx::video::queryReport;
@@ -283,6 +284,8 @@ void checkStatus()
 	CHECK(scheduleFails(false, false), "a command not sent is scheduled");
 	CHECK(scheduleFails(true, true), "a schedule after a failure on the host succeeds");
 	CHECK(scheduleFails(false, true), "a command not sent after a failure is scheduled");
+	CHECK(rgfx::video::failsLaterSchedule(true), "an HEVC failure on the host fails no schedule");
+	CHECK(!rgfx::video::failsLaterSchedule(false), "an H.264 failure on the host fails a schedule");
 	CHECK(rgfx::video::kNotSent != 0, "the schedule's failure is no success");
 }
 
