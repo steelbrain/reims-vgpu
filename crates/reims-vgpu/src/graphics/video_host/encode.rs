@@ -494,6 +494,10 @@ fn finish_frames<P: Platform>(
     name: &'static str,
 ) {
     for job in jobs {
+        // A step of the exit gate's, as a picture's landing is (`land_pictures`).
+        let Some(_step) = reims_vgpu_vulkan::exit_gate::step() else {
+            reims_vgpu_vulkan::exit_gate::stay()
+        };
         let Job {
             value,
             frame,

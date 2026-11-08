@@ -123,6 +123,17 @@ then `abort()`, for:
 Every export is `extern "C"`: nothing unwinds out of one into the host
 (`crates/reims-vgpu-c/src/ffi.rs`).
 
+### The process's exit
+
+A device's create registers an exit handler of the library's, once the GPU's driver is loaded,
+and the library registers it again as its work goes on (`reims_vgpu_vulkan::exit_gate`). As the
+process exits (`exit`, or the end of `main`), the handler waits for the library's work in progress
+on other threads than the exiting one, at most 2 s, or 60 s while a pipeline compile is among it,
+and then the exit goes on. Work that would begin once it ran, on the library's threads or in a
+call of the host's on another thread, parks that thread for good instead, so no work of the
+library's runs beside the GPU driver's destructors. A call on the exiting thread, from a later exit
+handler, runs as before. The host does nothing for it: QEMU's quit waits for it.
+
 ## 2. The C header
 
 The header has the ten functions, every type, callback typedef and constant, with the thread and

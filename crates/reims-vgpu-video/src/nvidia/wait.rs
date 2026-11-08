@@ -35,7 +35,9 @@ use std::time::Duration;
 
 pub(crate) use crate::core::device_wait::Unfinished;
 use crate::core::device_wait::{self, DEVICE_WAIT, Lingering};
-use crate::core::runtime::{Answer, Bell, MonoTime, Runtime, StdRuntime, Unanswered, answer};
+use crate::core::runtime::{
+    Answer, Bell, MonoTime, Runtime, StdRuntime, Unanswered, answer, park_for_good,
+};
 use crate::core::sync::Mutex;
 
 /// The runtime the crate's waits run on: the first the backend was opened
@@ -178,7 +180,12 @@ fn run_calls(shared: &CallsShared) {
             }
         });
         match call {
-            Some(Some(call)) => call(),
+            Some(Some(call)) => {
+                let Some(_step) = runtime().exit_step() else {
+                    park_for_good()
+                };
+                call();
+            }
             Some(None) | None => return,
         }
     }

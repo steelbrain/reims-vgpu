@@ -11,6 +11,13 @@
 //! - what Metal autoreleases on the host's thread (a `+0` result, such as a frame's command
 //!   buffer) goes at the pool's pop, so no uncommitted buffer outlives the call and holds one of
 //!   its queue's 64 slots.
+//!
+//! An entry is also a step of the exit gate ([`reims_vgpu_vulkan::exit_gate`]), since any may
+//! call the GPU's driver: the C API's calls, the device's callbacks on its threads and on the
+//! host's, and the jobs of its lanes, compile threads and surface workers, which run inside one.
+//! The process's exit waits for the entries in progress, and an entry begun after it began on any
+//! thread but the exiting one parks its thread for good before its body runs, so no work of the
+//! library's runs beside the driver's destructors. An entry inside another is part of it.
 
 use reims_vgpu_vulkan::core::raise::RaiseResult;
 use reims_vgpu_vulkan::core::rt::{Held, Hold, Pool, enter_ours};
@@ -23,8 +30,12 @@ pub(crate) fn no_catch<T>(r: RaiseResult<T>) -> T {
 /// Runs one entry's `body` marked as ours, inside a real pool and with a holder; `body` gets a
 /// hold of that holder. The holder releases what it holds when `body` returns, then the pool pops
 /// (module doc). An entry reached inside another (a release of the last reference inside a call)
-/// makes its own.
+/// makes its own. Once the process's exit began, an entry on any thread but the exiting one
+/// parks its thread for good instead (module doc).
 pub(crate) fn run<T>(body: impl for<'u> FnOnce(Hold<'u>) -> T) -> T {
+    let Some(_step) = reims_vgpu_vulkan::exit_gate::step() else {
+        reims_vgpu_vulkan::exit_gate::stay()
+    };
     let _ours = enter_ours();
     let pool = Pool::here();
     let held = Held::new();

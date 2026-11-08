@@ -37,7 +37,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::core::runtime::{Bell, MonoTime, Runtime};
+use crate::core::runtime::{Bell, MonoTime, Runtime, park_for_good};
 use crate::core::sync::Mutex;
 
 /// How long a backend waits for its device to finish one frame's work: 5 s
@@ -215,7 +215,16 @@ impl Lingering {
 /// clock, and ends once none is kept.
 fn run(shared: &Mutex<LingeringState>, runtime: &dyn Runtime) {
     let pauses = Bell::new();
-    while !sweep(shared, runtime) {
+    loop {
+        // Each sweep asks the devices: a step of the host's exit gate.
+        let Some(step) = runtime.exit_step() else {
+            park_for_good()
+        };
+        let none_kept = sweep(shared, runtime);
+        drop(step);
+        if none_kept {
+            break;
+        }
         // No one rings it: the wait ends at its deadline.
         pauses.wait_until(runtime, runtime.deadline_in(LINGER_POLL), || None::<()>);
     }

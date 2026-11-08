@@ -299,13 +299,17 @@ pub(crate) fn first_adopted() -> Option<rt::Device> {
 /// over the pipeline records earlier processes kept ([`crate::records`]), in the background. Its
 /// work counts go to the log where its filter names their target ([`crate::work_log`]), its
 /// GPU is kept awake while the guest draws ([`crate::awake`]), and the runtime's check of
-/// textures over host pages starts ([`start_in_place_checks`]).
+/// textures over host pages starts ([`start_in_place_checks`]). The exit gate's hook is
+/// registered, after the device's driver was loaded ([`crate::exit_gate`]): every process that
+/// holds a device of the process's, a test's or a host's, waits at its exit for the library's
+/// GPU work in progress.
 pub fn adopt(raw: rt::Device) -> VulkanDevice {
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
     if let Some((_, kept)) = devices.iter().find(|(at, _)| *at == id) {
         return kept.clone_ref();
     }
+    crate::exit_gate::arm();
     metal_space::count_sampler_ids(&raw);
     crate::answer::native::device_made(raw.properties());
     #[cfg(target_os = "linux")]

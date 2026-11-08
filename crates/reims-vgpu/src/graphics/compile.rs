@@ -31,6 +31,11 @@
 //! asks the pending set under the lock of the table the pipeline goes in, and the destroy cancels
 //! it before it removes from that table. A table's lock is taken before the pending set's wherever
 //! both are held, and a waiter holds only the pending set's.
+//!
+//! **At the exit.** Each compile a thread runs is a making of the exit gate's
+//! ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for those in progress, and a
+//! thread that takes its next compile once the exit began parks for good without running it, so
+//! no compile of the pool's is inside the driver's compiler as the driver's destructors run.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -56,6 +61,7 @@ use reims_vgpu_graphics::wire::{
 };
 use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::exit_gate;
 use zerocopy::FromBytes;
 
 /// The most compile threads a device runs.
@@ -246,8 +252,11 @@ impl CompilePool {
         (self.shared.now)()
     }
 
-    /// A pool of `threads` threads, those the host starts.
+    /// A pool of `threads` threads, those the host starts, with the exit gate's hook registered
+    /// first, the device's driver loaded: the process's exit waits for a compile in progress,
+    /// and no thread starts one once it began (the module doc, "At the exit").
     fn with_threads(threads: usize, now: Now) -> CompilePool {
+        exit_gate::arm();
         let shared = Arc::new(Shared {
             state: Mutex::new(PoolState::default()),
             waiting: Condvar::new(),
@@ -266,6 +275,11 @@ impl CompilePool {
                     while let Some(queued) = next_compile(&shared) {
                         #[cfg(test)]
                         gate.pass();
+                        // A making of the exit gate's: the exit waits for it, and one taken
+                        // after the exit began parks the thread, its compile not run.
+                        let Some(_making) = exit_gate::making() else {
+                            exit_gate::stay()
+                        };
                         run(&shared, queued);
                     }
                 });
@@ -756,6 +770,44 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("{n} compiles did not start");
+    }
+
+    /// The process's exit waits for a compile in progress, and the pool starts no compile once
+    /// it began: a child exits 300 ms before its one thread's first compile ends, with a second
+    /// queued behind it, which never runs (the module doc, "At the exit"). The second's thread
+    /// parks, so the exit's status is the child's own
+    #[test]
+    fn an_exit_mid_compile_waits_for_it_and_starts_no_other() {
+        const TEST: &str =
+            "graphics::compile::tests::an_exit_mid_compile_waits_for_it_and_starts_no_other";
+        let say = |line: &str| {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{line}");
+        };
+        if std::env::var("RVG_EXIT_CHILD").as_deref() == Ok(TEST) {
+            let pool = pool(1);
+            let (began, at_begin) = mpsc::channel();
+            let first: CompileJob = Box::new(move || {
+                began.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                say("the first compile ended");
+            });
+            let second: CompileJob = Box::new(move || say("the second compile ran"));
+            let of = |n| CompileOf::new(CompileKind::Pipeline, obj(1, n));
+            assert!(pool.submit(of(1), first).is_ok());
+            assert!(pool.submit(of(2), second).is_ok());
+            at_begin.recv().unwrap();
+            std::process::exit(7);
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env("RVG_EXIT_CHILD", TEST)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(7), "{out:?}");
+        assert!(stderr.contains("the first compile ended"), "{stderr}");
+        assert!(!stderr.contains("the second compile ran"), "{stderr}");
     }
 
     /// One context's backlog holds no other context's create: with four threads busy on context

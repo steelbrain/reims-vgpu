@@ -39,6 +39,7 @@ use objc2_metal::MTLPixelFormat;
 use objc2_quartz_core::CAMetalLayer;
 use reims_vgpu_vulkan::core::rt::spawn_named;
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::exit_gate;
 use reims_vgpu_vulkan::os::OsThreads;
 use reims_vgpu_vulkan::os::msg;
 
@@ -274,6 +275,11 @@ fn run(window: &Window) {
     let mut presenting = Presenting::default();
     let mut retry = None;
     while let Some(work) = surface.next(layer.is_none(), retry.take()) {
+        // A frame is a step of the exit gate's: the process's exit waits for the frame in
+        // progress, and the next one parks the thread for good.
+        let Some(_step) = exit_gate::step() else {
+            exit_gate::stay()
+        };
         if work.layer.is_some() {
             layer = work.layer;
         }

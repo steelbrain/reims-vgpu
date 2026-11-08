@@ -2146,16 +2146,18 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
     }
 
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
-        self.control
-            .present_surface(iosurface_id, generation, answer);
+        stepped(|| {
+            self.control
+                .present_surface(iosurface_id, generation, answer);
+        });
     }
 
     fn present_keep(&self, answer: PresentAnswer) {
-        self.control.present_kept(answer);
+        stepped(|| self.control.present_kept(answer));
     }
 
     fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
-        self.control.display_color(color, entries);
+        stepped(|| self.control.display_color(color, entries));
     }
 
     fn surface_textures(&self, iosurface_id: u32) -> Vec<u64> {
@@ -2163,23 +2165,23 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
     }
 
     fn refreshed(&self) {
-        self.control.presented.refreshed();
+        stepped(|| self.control.presented.refreshed());
     }
 
     fn context_closed(&self, context: u32, answer: CompleteAnswer) {
-        self.control.close_context(context, answer);
+        stepped(|| self.control.close_context(context, answer));
     }
 
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
-        self.control.release_block(release, answer);
+        stepped(|| self.control.release_block(release, answer));
     }
 
     fn block_unshared(&self, unshare: &RgfxBlockGrant) {
-        self.control.unshare_block(unshare);
+        stepped(|| self.control.unshare_block(unshare));
     }
 
     fn device_reset(&self) {
-        self.control.reset();
+        stepped(|| self.control.reset());
     }
 
     fn features(&self) -> u64 {
@@ -2198,12 +2200,14 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         layout: Option<RgfxSurfacePagesLayout>,
         answer: CompleteAnswer,
     ) {
-        self.control
-            .start_surface_pages(*pages, runs, flags, layout, answer);
+        stepped(|| {
+            self.control
+                .start_surface_pages(*pages, runs, flags, layout, answer);
+        });
     }
 
     fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {
-        self.control.download_surface(block_offset, answer);
+        stepped(|| self.control.download_surface(block_offset, answer));
     }
 
     fn try_surface_download(
@@ -2211,20 +2215,22 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         block_offset: u64,
         answer: CompleteAnswer,
     ) -> Result<(), CompleteAnswer> {
-        self.control.try_download_surface(block_offset, answer)
+        stepped(|| self.control.try_download_surface(block_offset, answer))
     }
 
     fn surface_downloaded(&self, block_offset: u64) -> bool {
-        self.control.downloaded_at_doorbell(block_offset)
+        stepped(|| self.control.downloaded_at_doorbell(block_offset))
     }
 
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
-        self.control
-            .handle_stage3(completion, Cow::Borrowed(message), None);
+        stepped(|| {
+            self.control
+                .handle_stage3(completion, Cow::Borrowed(message), None);
+        });
     }
 
     fn queue_made(&self, completion: &CompletionPoster) {
-        self.control.queue_made(completion);
+        stepped(|| self.control.queue_made(completion));
     }
 
     fn command_buffer(
@@ -2233,12 +2239,23 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         message: Vec<u8>,
         claim: &mut QueueClaim<'_>,
     ) {
-        (self.control).handle_stage3(completion, Cow::Owned(message), Some(claim));
+        stepped(|| (self.control).handle_stage3(completion, Cow::Owned(message), Some(claim)));
     }
 
     fn answer_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> bool {
-        self.control.answer_command_buffer(completion, message)
+        stepped(|| self.control.answer_command_buffer(completion, message))
     }
+}
+
+/// Runs `f`, a callback of the device's that may call the GPU's driver, as a step of the exit
+/// gate's ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for it, and one called
+/// once the exit began parks its thread for good, on any thread but the exiting one (as an entry
+/// does, [`entry`]'s module doc).
+fn stepped<T>(f: impl FnOnce() -> T) -> T {
+    let Some(_step) = reims_vgpu_vulkan::exit_gate::step() else {
+        reims_vgpu_vulkan::exit_gate::stay()
+    };
+    f()
 }
 
 /// Posts a command buffer's `CB_SUBMITTED` or `CB_SCHEDULED` `record` through `poster`: at once,

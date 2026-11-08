@@ -48,22 +48,16 @@
 //!   suspends as the host's policy has it.
 //! - **At the process's exit** the threads make no Vulkan call. The driver's destructors run
 //!   then, on the exiting thread, while every other thread goes on, and a call into what they
-//!   freed ends the process. The runtime's exit guard waits only for its own calls
-//!   (`rt::process_exiting`). Measured on the RTX 5080 Laptop GPU (NVIDIA 615.71.09), before the
-//!   gate below, the workspace's tests logged 79 segfaults of this thread in a six-minute run, in
+//!   freed ends the process. Measured on the RTX 5080 Laptop GPU (NVIDIA 615.71.09), before the
+//!   gate, the workspace's tests logged 79 segfaults of this thread in a six-minute run, in
 //!   processes whose tests had passed, at an instruction pointer equal to the faulting address
-//!   (`0xcaf0003c` to `0xcaf00082`, 14 bytes apart, or 0).
-//!   - **The gate.** Each Vulkan step of a thread (its toucher's making, a touch, the toucher's
-//!     end) runs holding [`STOPPED`], and only where neither the process's exit stopped the steps
-//!     nor the runtime's guard closed. An exit handler ([`at_exit`]) takes the lock, so it waits
-//!     out a step in progress, and stops the steps. A thread stopped keeps its toucher,
-//!     undestroyed, and parks until the process ends.
-//!   - **Its order.** The C library runs exit handlers in the reverse order of their
-//!     registration, the libraries' own destructors last, so the handler runs before every
-//!     destructor registered before it. It is registered (`atexit`) as a thread starts, after its
-//!     device was made, and again after each of the thread's first [`FIRST_TOUCHES`] touches,
-//!     after what the driver registered at the toucher's first calls. A destructor the driver
-//!     registers later, at another thread's call, runs before it.
+//!   (`0xcaf0003c` to `0xcaf00082`, 14 bytes apart, or 0). Each Vulkan step of a thread (its
+//!   toucher's making, a touch, the toucher's end) is a step of the library's exit gate
+//!   ([`crate::exit_gate`]), whose hook waits out a step in progress and refuses the next: a
+//!   thread refused keeps its toucher, undestroyed, and parks until the process ends. The thread
+//!   registers the hook as it starts, after its device was made, and again after each of its
+//!   first [`FIRST_TOUCHES`] touches, after what the driver registered at the toucher's first
+//!   calls.
 //! - **Devices the process adopts** ([`crate::gpu::device::adopt`]) have the thread. A device
 //!   made for a test alone has [`Awake::default`], which counts and keeps nothing.
 
@@ -73,7 +67,6 @@ use std::thread::Thread;
 use std::time::Duration;
 
 use crate::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
-use crate::core::sync::{Mutex, MutexGuard};
 use ash::vk;
 use metal2vulkan_runtime as rt;
 
@@ -91,43 +84,11 @@ const LEAST_LOOK: Duration = Duration::from_millis(50);
 /// The log target of the thread's lines.
 const TARGET: &str = "reims_vgpu_vulkan::awake";
 
-/// Whether the process's exit stopped the threads' Vulkan steps ([`at_exit`]); held for each step
-/// (the module docs).
-static STOPPED: Mutex<bool> = Mutex::new(false);
-
-/// The lock of one Vulkan step of a thread, where the steps go on: neither the process's exit
-/// ([`at_exit`]) nor the runtime's exit guard (`rt::process_exiting`) stopped them.
-fn step() -> Option<MutexGuard<'static, bool>> {
-    let stopped = STOPPED.lock();
-    (!*stopped && !rt::process_exiting()).then_some(stopped)
-}
-
-/// The exit handler: stops the threads' Vulkan steps, once the step in progress ended. It makes
-/// no Vulkan call, and running it again changes nothing.
-extern "C" fn at_exit() {
-    *STOPPED.lock() = true;
-}
-
-unsafe extern "C" {
-    /// The C library's `atexit`.
-    fn atexit(f: extern "C" fn()) -> i32;
-}
-
-/// Registers [`at_exit`] (the module docs), after every exit handler registered so far.
-fn register_at_exit() {
-    // SAFETY: `at_exit` is a plain function that never unwinds.
-    if unsafe { atexit(at_exit) } != 0 {
-        log::warn!(target: TARGET, "atexit refused: a touch may run beside the driver's exit");
-    }
-}
-
 /// Ends a thread's Vulkan steps for good, the process exiting: its toucher is never destroyed (the
 /// process's end frees it) and the thread parks until the process ends, keeping its device.
 fn stay(toucher: Option<Toucher>) -> ! {
     std::mem::forget(toucher);
-    loop {
-        std::thread::park();
-    }
+    crate::exit_gate::stay()
 }
 
 /// A device's keeping awake (the module docs): what its commits count, and its thread.
@@ -153,7 +114,7 @@ impl Awake {
 
     /// Starts `device`'s thread, looking every `look`, parked until the device's first commit.
     fn looking(device: &rt::Device, look: Duration) -> Awake {
-        register_at_exit();
+        crate::exit_gate::arm();
         let shared = Arc::new(Shared::default());
         let (device, kept) = (device.clone(), Arc::clone(&shared));
         let spawned = std::thread::Builder::new()
@@ -263,7 +224,7 @@ fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
         match keep.look(shared.work.load(Ordering::SeqCst), now) {
             Look::Busy => {}
             Look::Touch => {
-                let Some(held) = step() else {
+                let Some(held) = crate::exit_gate::step() else {
                     stay(toucher);
                 };
                 let touched = match &mut toucher {
@@ -279,7 +240,7 @@ fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
                 drop(held);
                 if touches < FIRST_TOUCHES {
                     touches += 1;
-                    register_at_exit();
+                    crate::exit_gate::arm();
                 }
             }
             Look::Rest => {
@@ -295,7 +256,7 @@ fn keep(device: &rt::Device, shared: &Shared, look: Duration) {
     }
 }
 
-/// The touches after each of which a thread registers [`at_exit`] again: the first makes the
+/// The touches after each of which a thread registers the exit gate's hook again: the first makes the
 /// toucher and submits, and the next two reach its fence's status and reset.
 const FIRST_TOUCHES: u32 = 3;
 
@@ -552,8 +513,8 @@ mod tests {
     }
 
     /// A process that exits amid its thread's touches ends with its exit's status: the exit
-    /// handler stops the touches before the driver's destructors run (the module docs, "At the
-    /// process's exit"). Each child looks every millisecond, so its thread touches the GPU
+    /// gate's hook stops the touches before the driver's destructors run (the module docs, "At
+    /// the process's exit"). Each child looks every millisecond, so its thread touches the GPU
     /// throughout its exit.
     #[test]
     fn an_exit_amid_touches_ends_with_its_status() {

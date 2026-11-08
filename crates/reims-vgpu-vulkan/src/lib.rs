@@ -30,6 +30,7 @@ pub mod api;
 pub(crate) mod awake;
 pub mod core;
 pub(crate) mod device_choice;
+pub mod exit_gate;
 pub mod gpu;
 #[cfg(target_os = "linux")]
 pub mod host_gpus;

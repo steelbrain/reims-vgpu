@@ -36,7 +36,7 @@ use std::sync::{Arc, Weak};
 
 use crate::core::backend::PixelFormat;
 use crate::core::num::ToU64;
-use crate::core::runtime::Runtime;
+use crate::core::runtime::{Runtime, park_for_good};
 use crate::core::surfaces::{PlaneLayout, SurfaceError, SurfaceLayout};
 use crate::core::sync::Mutex;
 
@@ -550,12 +550,17 @@ impl<T: Send + Sync + 'static> DeviceImports<T> {
         let (send, receive) = mpsc::channel::<Reap>();
         let shared = Arc::downgrade(&self.shared);
         let name = self.name;
+        let runtime = Arc::clone(&self.runtime);
         let started = self.runtime.spawn(
             REAPER_THREAD_NAME,
             Box::new(move || {
                 while let Ok(Reap::Gone(key)) = receive.recv() {
                     let Some(shared) = shared.upgrade() else {
                         return;
+                    };
+                    // The imports' drops call their driver: a step of the host's exit gate.
+                    let Some(_step) = runtime.exit_step() else {
+                        park_for_good()
                     };
                     let dropped: Vec<Arc<T>> = {
                         let mut state = shared.state.lock();

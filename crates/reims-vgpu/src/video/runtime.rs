@@ -14,10 +14,13 @@
 //!   [`Clock::wait_until`] on a deadline on it: a bound counts the time the host sleeps, as the
 //!   platform's own bounds do, and a test's virtual clock is a session's too. A backend waits
 //!   for its GPU on the same clock, so a test on a virtual clock opens none.
+//! - **A step** around a thread's job ([`Runtime::exit_step`]) is a step of the library's exit
+//!   gate ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for the calls into the
+//!   hardware's libraries in progress, and refuses the next.
 
 use std::sync::Arc;
 
-use reims_vgpu_video::core::runtime::{MonoTime, Rings, Runtime, TimedOut};
+use reims_vgpu_video::core::runtime::{ExitStep, MonoTime, Rings, Runtime, TimedOut};
 use reims_vgpu_video::core::sync::{Condvar, MutexGuard};
 use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::core::platform::os::{Clock as _, Deadline, MonoTime as CoreTime};
@@ -49,6 +52,11 @@ impl<P: Platform> Runtime for PlatformRuntime<P> {
 
     fn now(&self) -> MonoTime {
         MonoTime::from_nanos(self.0.clock().now_mono().as_nanos())
+    }
+
+    fn exit_step(&self) -> Option<ExitStep> {
+        let step = reims_vgpu_vulkan::exit_gate::step()?;
+        Some(ExitStep::of(Box::new(step)))
     }
 
     fn wait_until(

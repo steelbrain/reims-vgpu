@@ -73,7 +73,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::core::runtime::{Bell, MonoTime, Runtime};
+use crate::core::runtime::{Bell, MonoTime, Runtime, park_for_good};
 use crate::core::sync::{Mutex, RwLock};
 
 use super::ffi::VADisplay;
@@ -298,6 +298,9 @@ fn run(shared: &Arc<Shared>) {
         });
         let Some(Some(order)) = order else { return };
         {
+            let Some(_step) = shared.runtime.exit_step() else {
+                park_for_good()
+            };
             let _gate = shared.gate.write();
             order(shared.raw.0);
         }

@@ -103,6 +103,46 @@ pub trait Runtime: Send + Sync {
     fn deadline_in(&self, d: Duration) -> MonoTime {
         self.now().saturating_add(d)
     }
+
+    /// A step of the host's exit gate around one job of a thread of the crate's that calls the
+    /// hardware's libraries (a call made on a display's or a context's thread, a sweep of work a
+    /// device did not finish, a drop of imports whose surfaces went): `None` once the process's
+    /// exit began, and the thread then parks for good before the job ([`park_for_good`]), so no
+    /// call of the crate's runs beside the libraries' destructors as the process exits. The step
+    /// ends as what it returns drops, on the thread. By default a step that guards nothing, for
+    /// a runtime with no exit gate ([`StdRuntime`]).
+    fn exit_step(&self) -> Option<ExitStep> {
+        Some(ExitStep::default())
+    }
+}
+
+/// A step of the host's exit gate ([`Runtime::exit_step`]), ended as it drops, on its thread.
+#[derive(Default)]
+pub struct ExitStep(Option<Box<dyn std::any::Any>>);
+
+impl ExitStep {
+    /// The step `guard` holds until it drops.
+    pub fn of(guard: Box<dyn std::any::Any>) -> Self {
+        Self(Some(guard))
+    }
+}
+
+impl std::fmt::Debug for ExitStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "ExitStep"
+        } else {
+            "ExitStep(none)"
+        })
+    }
+}
+
+/// Parks this thread for good: its runtime refused a step, the process exiting
+/// ([`Runtime::exit_step`]).
+pub fn park_for_good() -> ! {
+    loop {
+        std::thread::park();
+    }
 }
 
 /// What a timed wait waits on: rung by each thread that changes what its waiters wait for, after

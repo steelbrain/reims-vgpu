@@ -26,6 +26,7 @@ use std::sync::Arc;
 use ash::vk;
 use reims_vgpu_vulkan::core::rt::spawn_named;
 use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::exit_gate;
 use reims_vgpu_vulkan::os::OsThreads;
 use sdl3_sys::everything::{SDL_Vulkan_CreateSurface, SDL_Window};
 
@@ -221,6 +222,11 @@ fn run(window: &Window) {
     let mut presenting = Presenting::default();
     let mut retry = None;
     while let Some(work) = surface.next(retry.take()) {
+        // A frame is a step of the exit gate's: the process's exit waits for the frame in
+        // progress, and the next one parks the thread for good.
+        let Some(_step) = exit_gate::step() else {
+            exit_gate::stay()
+        };
         if presenting.needs_presenter() {
             // The sink is copied out of the window's lock: none is held while it answers.
             let Some(sink) = window.sink() else {

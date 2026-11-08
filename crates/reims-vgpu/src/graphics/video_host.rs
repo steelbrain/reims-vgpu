@@ -806,6 +806,11 @@ fn land_pictures<P: Platform>(
     name: &'static str,
 ) {
     for job in jobs {
+        // A step of the exit gate's: the process's exit waits for the picture landing, and one
+        // after the exit began parks the thread before the hardware's calls.
+        let Some(_step) = reims_vgpu_vulkan::exit_gate::step() else {
+            reims_vgpu_vulkan::exit_gate::stay()
+        };
         let Job {
             value,
             picture,
