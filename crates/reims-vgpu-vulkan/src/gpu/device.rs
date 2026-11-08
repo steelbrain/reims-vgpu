@@ -56,7 +56,7 @@ use crate::gpu::command::{QueueObject, VulkanCommandQueue};
 use crate::gpu::desc::{
     Maker, TextureFields, VulkanTextureDescriptor, created_format_refused, format_refused,
 };
-use crate::gpu::event::{VulkanEvent, VulkanSharedEvent, VulkanSharedEventHandle};
+use crate::gpu::event::{VulkanEvent, VulkanSharedEvent};
 use crate::gpu::icb::VulkanIcb;
 use crate::gpu::metal_space::{self, PinRefused, Placing, SurfacePlace, TextureKind};
 use crate::gpu::rate_map::{VulkanRateMap, VulkanRateMapDescriptor};
@@ -1286,19 +1286,6 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     fn new_shared_event(&self) -> Option<VulkanSharedEvent> {
         Some(Obj::new(get("newSharedEvent", || {
             self.raw.new_shared_event()
-        })))
-    }
-
-    /// The event of a handle of this process (the runtime's handles cross no process). The
-    /// runtime has no nil handle: a nil one dies here.
-    fn open_shared_event(
-        &self,
-        shared_event_handle: Option<&VulkanSharedEventHandle>,
-    ) -> Option<VulkanSharedEvent> {
-        let sel = "newSharedEventWithHandle:";
-        let handle = shared_event_handle.unwrap_or_else(|| unrepresentable(sel, "a nil handle"));
-        Some(Obj::new(get(sel, || {
-            self.raw.new_shared_event_with_handle(handle)
         })))
     }
 
@@ -3339,11 +3326,9 @@ pub(crate) mod tests {
         assert_eq!(a.clone_ref().unique_identifier(), a.unique_identifier());
     }
 
-    /// The creators of queues, events and fences each make a new object of the device; a shared
-    /// event's handle opens the same event, and a nil handle dies
+    /// The creators of queues, events and fences each make a new object of the device
     #[test]
     fn creators_make_objects_of_the_device() {
-        use reims_vgpu_core::platform::event::SharedEvent as _;
         let d = dev();
         d.allow_foreign_libraries();
         let (a, b) = (
@@ -3355,13 +3340,6 @@ pub(crate) mod tests {
         let e = d.new_event(OnFault::Return).unwrap().unwrap();
         assert_ne!(e.id(), d.new_event(OnFault::Die).unwrap().unwrap().id());
         assert!(d.new_fence().unwrap().is_some());
-        let shared = d.new_shared_event().unwrap();
-        shared.set_signaled_value(7).unwrap();
-        let handle = shared.new_shared_event_handle().unwrap();
-        let opened = d.open_shared_event(Some(&handle)).unwrap();
-        assert_eq!(opened.signaled_value(), 7);
-        let site = catch_death(|| d.open_shared_event(None)).unwrap_err();
-        assert_eq!(site.file, "newSharedEventWithHandle:");
     }
 
     /// An unshared queue runs a command buffer as `newCommandQueue`'s does, and its maker passes

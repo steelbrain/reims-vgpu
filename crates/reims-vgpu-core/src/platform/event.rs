@@ -3,7 +3,7 @@
 use super::{Handle, Platform};
 use crate::raise::RaiseResult;
 
-/// `id<MTLSharedEvent>`, and a copy of one made from its handle (`newSharedEventWithHandle:`).
+/// `id<MTLSharedEvent>`.
 pub trait SharedEvent<P: Platform>: Handle {
     /// sel: newSharedEventHandle (+1, released after the send). No path reaches it under a
     /// handler: a raise inside it dies at the send.

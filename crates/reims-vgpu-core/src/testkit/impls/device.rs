@@ -213,10 +213,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
 
     fn new_event(&self, on: OnFault) -> RaiseResult<Option<<FakePlatform as Platform>::Event>> {
         self.make(Policy::On(on), "newEvent", vec![], |w| {
-            Some(w.new_obj::<kind::Event>(Model::Event {
-                value: 0,
-                root: None,
-            }))
+            Some(w.new_obj::<kind::Event>(Model::Event { value: 0 }))
         })
     }
 
@@ -274,33 +271,8 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
 
     fn new_shared_event(&self) -> Option<<FakePlatform as Platform>::SharedEvent> {
         fatal(self.make(Policy::Fatal, "newSharedEvent", vec![], |w| {
-            Some(w.new_obj::<kind::SharedEvent>(Model::Event {
-                value: 0,
-                root: None,
-            }))
+            Some(w.new_obj::<kind::SharedEvent>(Model::Event { value: 0 }))
         }))
-    }
-
-    fn open_shared_event(
-        &self,
-        shared_event_handle: Option<&<FakePlatform as Platform>::SharedEventHandle>,
-    ) -> Option<<FakePlatform as Platform>::SharedEvent> {
-        let root = shared_event_handle.and_then(|h| match &h.state().model {
-            Model::Target(t) => Some(t.clone_ref()),
-            _ => None,
-        });
-        fatal(self.make(
-            Policy::Fatal,
-            "newSharedEventWithHandle:",
-            vec![Arg::opt(shared_event_handle)],
-            |w| {
-                let r = root?;
-                Some(w.new_obj::<kind::SharedEvent>(Model::Event {
-                    value: 0,
-                    root: Some(r),
-                }))
-            },
-        ))
     }
 
     fn new_shared_texture(

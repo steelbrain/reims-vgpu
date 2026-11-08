@@ -443,12 +443,10 @@ pub enum Model {
     Heap(HeapModel),
     /// A command buffer.
     CommandBuffer(CommandBufferModel),
-    /// An `MTLEvent` or `MTLSharedEvent`: its signalled value, or the event it shares.
+    /// An `MTLEvent` or `MTLSharedEvent`: its signalled value.
     Event {
-        /// The signalled value (unused when `root` is set).
+        /// The signalled value.
         value: u64,
-        /// The event this one was made from with `newSharedEventWithHandle:`.
-        root: Option<AnyHandle>,
     },
     /// A sampler or depth-stencil state: its common state.
     State(ResourceCommon),
@@ -931,8 +929,8 @@ pub struct World {
     /// Whether the next commit, on whichever thread, first takes the held work
     /// ([`World::release_submissions_at_next_commit`]).
     release_at_commit: AtomicBool,
-    /// The shared events' notifications not yet due, each with its event (the root of a shared
-    /// copy) and value ([`notify_event`]), in the order asked for.
+    /// The shared events' notifications not yet due, each with its event and value
+    /// ([`notify_event`]), in the order asked for.
     notifications: Mutex<Vec<(ObjId, u64, Notification)>>,
     /// Whether a command buffer's `split` commits it as a part and answers the next
     /// ([`World::split_command_buffers`]).
@@ -1340,39 +1338,25 @@ impl World {
     }
 }
 
-/// Sets an event's value (following a shared copy to its root), wakes its waiters, then runs the
-/// notifications it reached, on this thread, in the order they were asked for ([`notify_event`]).
+/// Sets an event's value, wakes its waiters, then runs the notifications it reached, on this
+/// thread, in the order they were asked for ([`notify_event`]).
 pub fn signal_event(ev: &Arc<FakeObj>, v: u64) {
-    let root = match &ev.state.lock().model {
-        Model::Event { root: Some(r), .. } => Some(r.obj().clone()),
-        _ => None,
-    };
-    let target = root.as_ref().unwrap_or(ev);
-    if let Model::Event { value, .. } = &mut target.state.lock().model {
+    if let Model::Event { value } = &mut ev.state.lock().model {
         *value = v;
     }
-    target.cv.notify_all();
-    run_due(target);
+    ev.cv.notify_all();
+    run_due(ev);
 }
 
-/// Runs `block` once the event `ev` (following a shared copy to its root) reaches `v`: at once, on
-/// this thread, where it has, else on the thread whose signal or set raises it there
-/// ([`signal_event`]). One never reached stays with the world.
+/// Runs `block` once the event `ev` reaches `v`: at once, on this thread, where it has, else on
+/// the thread whose signal or set raises it there ([`signal_event`]). One never reached stays
+/// with the world.
 pub fn notify_event(ev: &Arc<FakeObj>, v: u64, block: Notification) {
-    let root = match &ev.state.lock().model {
-        Model::Event { root: Some(r), .. } => Some(r.obj().clone()),
-        _ => None,
-    };
-    let target = root.as_ref().unwrap_or(ev);
-    target
-        .world
-        .notifications
-        .lock()
-        .push((target.id, v, block));
-    run_due(target);
+    ev.world.notifications.lock().push((ev.id, v, block));
+    run_due(ev);
 }
 
-/// Runs the notifications of the root event `target` whose value it reached, with no lock held.
+/// Runs the notifications of the event `target` whose value it reached, with no lock held.
 fn run_due(target: &Arc<FakeObj>) {
     let value = event_value(target);
     let due: Vec<(ObjId, u64, Notification)> = {
@@ -1388,23 +1372,17 @@ fn run_due(target: &Arc<FakeObj>) {
     }
 }
 
-/// An event's value (following a shared copy to its root).
+/// An event's value.
 pub fn event_value(ev: &Arc<FakeObj>) -> u64 {
-    let root = match &ev.state.lock().model {
-        Model::Event { root: Some(r), .. } => Some(r.obj().clone()),
-        Model::Event { value, .. } => return *value,
-        _ => return 0,
-    };
-    root.map(|r| event_value(&r)).unwrap_or(0)
+    match &ev.state.lock().model {
+        Model::Event { value } => *value,
+        _ => 0,
+    }
 }
 
 /// Waits on the virtual clock until `ev` reaches `v` or `ms` virtual milliseconds pass.
 pub fn wait_event(ev: &Arc<FakeObj>, v: u64, ms: u64) -> bool {
-    let root = match &ev.state.lock().model {
-        Model::Event { root: Some(r), .. } => Some(r.obj().clone()),
-        _ => None,
-    };
-    let target = root.as_ref().unwrap_or(ev);
+    let target = ev;
     let clock = &target.world.clock;
     let deadline = Deadline::Mono(
         clock
@@ -1414,7 +1392,7 @@ pub fn wait_event(ev: &Arc<FakeObj>, v: u64, ms: u64) -> bool {
     let mut g = target.state.lock();
     loop {
         let cur = match &g.model {
-            Model::Event { value, .. } => *value,
+            Model::Event { value } => *value,
             _ => 0,
         };
         if cur >= v {
@@ -1422,7 +1400,7 @@ pub fn wait_event(ev: &Arc<FakeObj>, v: u64, ms: u64) -> bool {
         }
         if clock.wait_until(&target.cv, &mut g, deadline).timed_out() {
             let cur = match &g.model {
-                Model::Event { value, .. } => *value,
+                Model::Event { value } => *value,
                 _ => 0,
             };
             return cur >= v;
@@ -1724,10 +1702,7 @@ mod tests {
         let w = World::new();
         let cb: Fk<kind::CommandBuffer> =
             w.new_obj(Model::CommandBuffer(CommandBufferModel::default()));
-        let ev: Fk<kind::SharedEvent> = w.new_obj(Model::Event {
-            value: 0,
-            root: None,
-        });
+        let ev: Fk<kind::SharedEvent> = w.new_obj(Model::Event { value: 0 });
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s2 = seen.clone();
         if let Model::CommandBuffer(m) = &mut cb.state().model {
@@ -1828,21 +1803,14 @@ mod tests {
         assert_eq!(w.complete_all(CompleteOn::Caller), 0);
     }
 
-    /// Event waits on virtual time; a shared copy follows its root
+    /// Event waits on virtual time
     #[test]
     fn event_waits() {
         let w = World::new();
-        let ev: Fk<kind::SharedEvent> = w.new_obj(Model::Event {
-            value: 0,
-            root: None,
-        });
-        let copy: Fk<kind::SharedEvent> = w.new_obj(Model::Event {
-            value: 0,
-            root: Some(ev.erase()),
-        });
-        signal_event(copy.obj(), 3);
+        let ev: Fk<kind::SharedEvent> = w.new_obj(Model::Event { value: 0 });
+        signal_event(ev.obj(), 3);
         assert_eq!(event_value(ev.obj()), 3);
-        assert!(wait_event(copy.obj(), 3, 5000));
+        assert!(wait_event(ev.obj(), 3, 5000));
         let o = ev.obj().clone();
         let h = std::thread::Builder::new()
             .spawn(move || wait_event(&o, 4, 5000))

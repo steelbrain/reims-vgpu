@@ -175,12 +175,6 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// sel: newSharedEvent — No path reaches it under a handler: a raise inside it dies at the
     /// send.
     fn new_shared_event(&self) -> Option<P::SharedEvent>;
-    /// sel: newSharedEventWithHandle: — Opens the event of a handle, which may be nil. No path
-    /// reaches it under a handler: a raise inside it dies at the send.
-    fn open_shared_event(
-        &self,
-        shared_event_handle: Option<&P::SharedEventHandle>,
-    ) -> Option<P::SharedEvent>;
     /// sel: newSharedTextureWithDescriptor:
     fn new_shared_texture(
         &self,
