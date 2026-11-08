@@ -200,6 +200,19 @@ NSNumber *privateValue(MTLRenderPipelineDescriptor *d, NSString *key)
 	return [v isKindOfClass:[NSNumber class]] ? v : nil;
 }
 
+// A pipeline stage's linked functions, where the descriptor has the getter. MTLLinkedFunctions
+// reached the render and mesh descriptors after macOS 11 (vertexLinkedFunctions and its siblings),
+// and sending one of those getters to a descriptor that lacks it raises an unrecognized-selector
+// exception that ends the process; CoreDisplay creates a render pipeline for its display on macOS
+// 11 (CreateMetalDevice), which read it there. Answer nil where the getter is absent, so the
+// create goes on with no linked functions, as that descriptor carries none.
+MTLLinkedFunctions *stageLinkedFunctions(id descriptor, SEL getter)
+{
+	if (![descriptor respondsToSelector:getter])
+		return nil;
+	return [descriptor valueForKey:NSStringFromSelector(getter)];
+}
+
 // The private state of `d` that Apple's OpenGL renderer sets (RgfxRenderPipelinePrivateState),
 // each property Metal's default where the descriptor does not answer it: a sample mask of all
 // ones, a coverage of 1, logic operation 0 and the flags off.
@@ -317,10 +330,11 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 	// Each stage's linked functions; one another device's library made names no library the
 	// host holds, so the create is refused rather than sent.
 	RgfxLinkedFunctionList vertexLinked, fragmentLinked;
-	id<MTLFunction> foreignLinked =
-	    RgfxCollectLinkedFunctions(descriptor.vertexLinkedFunctions, vertexLinked);
+	id<MTLFunction> foreignLinked = RgfxCollectLinkedFunctions(
+	    stageLinkedFunctions(descriptor, @selector(vertexLinkedFunctions)), vertexLinked);
 	if (foreignLinked == nil)
-		foreignLinked = RgfxCollectLinkedFunctions(descriptor.fragmentLinkedFunctions, fragmentLinked);
+		foreignLinked = RgfxCollectLinkedFunctions(
+		    stageLinkedFunctions(descriptor, @selector(fragmentLinkedFunctions)), fragmentLinked);
 	if (foreignLinked != nil) {
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: linked function %@ (%@) is not from a library of this device",
@@ -513,12 +527,14 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 	}
 
 	RgfxLinkedFunctionList objectLinked, meshLinked, fragmentLinked;
-	id<MTLFunction> foreignLinked =
-	    RgfxCollectLinkedFunctions(descriptor.objectLinkedFunctions, objectLinked);
+	id<MTLFunction> foreignLinked = RgfxCollectLinkedFunctions(
+	    stageLinkedFunctions(descriptor, @selector(objectLinkedFunctions)), objectLinked);
 	if (foreignLinked == nil)
-		foreignLinked = RgfxCollectLinkedFunctions(descriptor.meshLinkedFunctions, meshLinked);
+		foreignLinked = RgfxCollectLinkedFunctions(
+		    stageLinkedFunctions(descriptor, @selector(meshLinkedFunctions)), meshLinked);
 	if (foreignLinked == nil)
-		foreignLinked = RgfxCollectLinkedFunctions(descriptor.fragmentLinkedFunctions, fragmentLinked);
+		foreignLinked = RgfxCollectLinkedFunctions(
+		    stageLinkedFunctions(descriptor, @selector(fragmentLinkedFunctions)), fragmentLinked);
 	if (foreignLinked != nil) {
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: linked function %@ (%@) is not from a library of this device",
