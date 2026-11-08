@@ -914,11 +914,20 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
   `REIMS_VGPU_LOG=info`, and forwards SSH from port 10090 (`-p`). Under TCG
   the guest's RAM is a shared memfd, as `reims-ctl` gives its VMs on Linux:
   `-machine vmapple,...,memory-backend=ram,dump-guest-core=off` and
-  `-object memory-backend-memfd,id=ram,size=8G,share=on`, so the GPU uses an
-  IOSurface's own pages in place ("The reims-graphics device", above); in
-  plain RAM on Linux, QEMU warns `guest RAM is not a shared memfd in pages
-  of the host's size: IOSurfaces are copied for the GPU`. Under HVF the RAM
+  `-object memory-backend-memfd,id=ram,size=8G,share=on`. Under HVF the RAM
   stays QEMU's own.
+- **The guest's RAM on `vmapple` is not all memfd.** The device gives the
+  library the guest's RAM map only where every RAM range of the machine's
+  address space has a shared file behind it ("The reims-graphics device",
+  above), and `vmapple` has two RAM regions besides the guest's RAM that
+  have none: `firmware` (1 MiB at 0x100000, where Ambrosia runs) and
+  `VMApple Config` (64 KiB at 0x400000), each made by
+  `memory_region_init_ram`. So even with the memfd QEMU warns `guest RAM is
+  not a shared memfd in pages of the host's size: IOSurfaces are copied for
+  the GPU`, and the GPU works on copies of an IOSurface's pages, not the
+  pages themselves. No command-line option gives those two regions a file:
+  ending the copies takes a change to the device (a map of the ranges that
+  have a file) or to `vmapple`.
 - **The checks**, each a line with PASS or FAIL and what it found, then the
   verdict; the script's header says what each one reads. `firmware`:
   Ambrosia entered the kernel; where it stops the boot, its line, and QEMU
@@ -990,3 +999,30 @@ and then stops the boot with `boot failed: KextsNotPlaced`.
   QEMU's own high-water mark 9.5 GiB.
 - **Time**: the script's limits are 300 s to SSH and 180 s more for the
   desktop; a boot with the module's bundle alone took 5 min 20 s.
+
+**Measured** on `homelab-um870-1` under TCG on 2026-11-08, with our QEMU at
+`bc378624` built there as above on the library of the same tree, Ambrosia
+0.1.0's released image (`ea2987b`), the module's bundle alone (`make
+bundle`), and reflink clones of the guests in `~/.cache/rvg-vms`. Each boot
+gave the six checks HVF gives and failed the three that need kexts, as it
+must: `kexts` (none of the three loaded), `windowserver-metal` (WindowServer
+up with no Dock or Finder after 180 s, `bench -l` listing no Metal device, no
+IOSurface shown) and `metal-app` (not run, with no Metal device):
+- 26.6.2 (25G83), the guest's RAM plain: `ssh` at 112.1 s. WindowServer
+  restarted every 20 to 30 s while the script waited for a desktop, 7 pids
+  in 180 s.
+- 27.0.1 (26A434), the guest's RAM plain: `ssh` at 101.2 s; WindowServer
+  kept its pid.
+- 27.0.1, the guest's RAM a shared memfd (the script as it is): `ssh` at
+  114.7 s; WindowServer restarted once. Ambrosia found RAM at 4 GiB as
+  before (`RAM 0x100000000-0x300000000`), QEMU mapped the guest's RAM from
+  its `memory-backend-memfd`, and QEMU still warned that IOSurfaces are
+  copied (above). `info mtree -f` listed the address space's RAM as
+  `firmware`, `VMApple Config`, the device's region and `ram`.
+
+In each, Ambrosia logged `reims-graphics at 00:05.0: 1920x1080, framebuffer
+0x80400000` and started its console there; the screendump showed its log
+and the kernel's progress bar. QEMU logged no `reims-vgpu: fatal` line.
+Each job peaked at 11.5 to 11.8 GiB by `potluck why`, page cache included,
+and at 9.4 to 9.5 GiB of anonymous and shared memory; QEMU's own high-water
+mark was 9.5 to 9.6 GiB. Each boot took about 5 min 20 s.

@@ -24,8 +24,10 @@
 #
 # The guest runs with 8 GiB and 4 CPUs, as Ambrosia's tested boots do, with QEMU's
 # REIMS_VGPU_WINDOW=0 (no window on the host) and REIMS_VGPU_LOG=info, as the lane gate runs it.
-# Under TCG, for a Linux member, its RAM is a shared memfd, as reims-ctl's VMs on Linux have it, so
-# the GPU uses an IOSurface's own pages in place; in plain RAM the device copies each surface.
+# Under TCG, for a Linux member, its RAM is a shared memfd, as reims-ctl's VMs on Linux have it. The
+# device still copies each IOSurface for the GPU there: vmapple's firmware and configuration regions
+# are RAM with no file behind them (docs/qemu.md, "arm64 guests: the boot check of our
+# configuration").
 # Nothing is typed or clicked in the guest. The checks log in over SSH as GUEST_USER, password
 # GUEST_PASS (default aneesiqbal, as every owner VM), and copy the probes into ~/ambrosia-check.
 #
