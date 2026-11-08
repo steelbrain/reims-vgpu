@@ -1,5 +1,22 @@
 # Working on this repository
 
+> **apple-gfx is being deleted (owner, 2026-11-07).** apple-gfx and all of
+> Apple's paravirt are going: the PCI `106b:eeee` and vmapple MMIO devices,
+> the paravirt VideoToolbox (`106b:1a03`) and M2 scaler (`106b:1a0b`)
+> devices, the IOSurface mapper, their C API and protocol (core's FIFO,
+> tasks, isolation and guest ABI), the KVM dirty source and dirty log, the
+> behaviour-lock suite and its pins, apple-gfx's option ROM, reims-ctl's
+> apple-gfx and arm64/vmapple options, and arm64 boots. What stays is our
+> own API and protocol, the reims-graphics device (`crates/reims-graphics`,
+> `vendor/qemu/hw/display/reims-graphics-pci.c`), our kexts (`guest/`), the
+> window, the Metal and Vulkan platforms, and host video on VA-API and
+> NVDEC/NVENC for our device. Until the rewrite of this file lands, every
+> rule below that protects apple-gfx's contract no longer binds the paravirt
+> parts. That covers additive-only C API changes, the suite and its expected
+> files, the pins, "unread is not dead" for the paravirt features, and the
+> boots of apple-gfx or arm64 guests. Our kexts are to work on every x86-64
+> macOS release from 11.0 to 26's last.
+
 This repository builds `libreims_vgpu`, a Rust library that is the host
 side of the paravirtualized GPU macOS guests drive (PCI `106b:eeee`, and
 vmapple's MMIO device), in place of Apple's
