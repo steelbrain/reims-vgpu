@@ -15,7 +15,7 @@
 //! pictures' limits, the key frames ([`gop::KeyFrames`]) and the decode
 //! times ([`gop::DecodeTimes`]) from here.
 
-mod bits;
+pub(crate) mod bits;
 pub mod encoder;
 pub mod gop;
 pub mod h264;
