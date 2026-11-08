@@ -1268,7 +1268,28 @@ pub fn created_or_decided<T>(
 ///   import gate, `crate::gpu::writes`), which each commit fills from the pages and each
 ///   completion writes back: a CPU write the GPU reads mid-command-buffer, or a GPU write the CPU
 ///   reads before the batch completes, is not seen, where Metal's GPU uses the pages themselves.
-///   Announced inside the call that makes it, which dies at its selector.
+///   Announced inside the call that makes it, which dies at its selector;
+/// - `SurfaceTexelsTail`: a colour texture over a plane of a surface with planes whose texels run
+///   past the buffer standing for the surface, or a colour 2D array of more than one slice over
+///   such a plane, whose texels past the surface (the array's slices past its first) lie in a
+///   tail of the texture's own, zero when made, which every path reads and writes alike, where
+///   Metal lays them out in no one place: its blits read zeros there, its kernels zeros and,
+///   32 KiB past the plane, the plane's rows again, and its writes change no byte of the surface
+///   (the runtime's `probes/surface_texture_envelope.m` on the M3 Max). Announced inside the
+///   creator of the texture over the surface, which dies at its selector;
+/// - `SurfaceTexelsApart`: a colour 2D texture of more than one level, a 3D texture or a 2D
+///   multisample one over a plane of a surface with planes, made in memory of its own, zero when
+///   made, which no byte of the surface reaches, where Metal lays out its texels, its first
+///   level's and slice's among them, in no one place on the M3 Max, and the x86 Macs keep its
+///   first level and slice over the plane. Announced inside the creator of the texture over the
+///   surface, which dies at its selector;
+/// - `HeapOnePlaneLayout`: a heap's texture of one of the one-plane YCbCr formats the runtime
+///   holds for copies alone, a 2D texture or array of more than one row whose row is under 16
+///   bytes, laid one packed row apart where Metal's blits lay its rows 16 bytes apart, or a
+///   mipmapped or 3D texture, laid apart from the heap's bytes where Metal lays its texels at
+///   bytes that differ by path: its size answers are Metal's and its copies read what they
+///   wrote, but a buffer over the heap meets its texels at other bytes than on Metal. Announced
+///   inside the heap's creator of the texture, which dies at its selector.
 ///
 /// Every kind not listed here or in [`HEARD`] is relayed, those the guest sees included, each for
 /// one of the reasons the module's docs give: logged once per device and not dying. Each relayed
@@ -1277,7 +1298,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 140] = [
+pub const DIES: [rt::Degradation; 143] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1416,6 +1437,9 @@ pub const DIES: [rt::Degradation; 140] = [
     rt::Degradation::PredicationWordPastBuffer,
     rt::Degradation::HeapTwoPlaneLayout,
     rt::Degradation::CopiedHostPages,
+    rt::Degradation::SurfaceTexelsTail,
+    rt::Degradation::SurfaceTexelsApart,
+    rt::Degradation::HeapOnePlaneLayout,
     rt::Degradation::CoverageReadsRoundedAlpha,
     rt::Degradation::UnmeasuredFetchBlend,
 ];
