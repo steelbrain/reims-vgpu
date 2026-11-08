@@ -1,11 +1,19 @@
 // decode_md5: decodes Annex B H.264 and HEVC files with VideoToolbox's hardware decoder, hashes
 // every decoded frame as the CPU reads it, and compares the hashes with a reference made off the
 // device (ffmpeg's MD5 of each frame's NV12 or P010 planes, one a line, beside the stream).
-//   decode_md5 [-l LOOPS] [-f] FILE...
+//   decode_md5 [-l LOOPS] [-f] [-i t|b] [-a] FILE...
 //     FILE    NAME.264 (H.264) or NAME.265 (HEVC); its reference is NAME.md5 in the same
 //             directory, the frames' MD5s in any order.
 //     -l N    after the hashed pass, decodes the stream N more times without reading the frames on
 //             the CPU, and prints the frames decoded a second (default 0, none).
+//     -a      lets VideoToolbox pick any decoder, hardware where it can, as a player does: a
+//             stream the hardware refuses at its session's create goes to the software decoder,
+//             and the line says which one decoded: "decoder=hardware" or "decoder=software" as
+//             the session answers kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+//             "decoder=unknown" where it answers nothing (VideoToolbox's software H.264 decoder
+//             does not, measured on an x86-64 Mac on macOS 26.7.1 and an Apple-silicon one on 27).
+//     -i t|b  makes each format description name two fields, top (t) or bottom (b) first, as a
+//             QuickTime file's 'fiel' atom does for interlaced video; the line says "fields=2".
 //     -f      decodes every unit under one format description, of the stream's first parameter
 //             sets, the later ones dropped with the rest: what a client that misses a change of
 //             the sets hands VideoToolbox.
@@ -229,50 +237,240 @@ static NSArray<NSData *> *nalUnits(NSData *file)
 	return out;
 }
 
-// A format description of the parameter sets `vps` (HEVC alone), `sps` and `pps`; NULL where the
-// system takes none of them.
-static CMVideoFormatDescriptionRef describe(NSData *vps, NSData *sps, NSData *pps, BOOL hevc)
+// With -a, sessions take any decoder VideoToolbox picks, hardware where it can (else only the
+// hardware one); g_hardware is whether the first session's is hardware (-1 not known).
+static BOOL g_anyDecoder;
+static int g_hardware = -1;
+
+// With -i t or -i b, each format description names two fields, top or bottom first (0: as
+// CoreMedia makes it from the parameter sets).
+static int g_fields;
+
+// A format description of the parameter sets `sets` holds (VPS, SPS and PPS, each by its id: HEVC's
+// the latest of each kind, H.264's every SPS and PPS by seq_ and pic_parameter_set_id, as an avcC
+// record holds them); NULL where the system takes none of them.
+static CMVideoFormatDescriptionRef describe(NSDictionary<NSNumber *, NSData *> *const sets[3], BOOL hevc)
 {
-	if (sps == nil || pps == nil || (hevc && vps == nil))
-		return NULL;
-	CMVideoFormatDescriptionRef fd = NULL;
-	OSStatus st;
-	if (hevc) {
-		const uint8_t *sets[3] = {vps.bytes, sps.bytes, pps.bytes};
-		size_t sizes[3] = {vps.length, sps.length, pps.length};
-		st = CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, sets, sizes, 4, NULL, &fd);
-	} else {
-		const uint8_t *sets[2] = {sps.bytes, pps.bytes};
-		size_t sizes[2] = {sps.length, pps.length};
-		st = CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, sets, sizes, 4, &fd);
+	NSMutableArray<NSData *> *list = [NSMutableArray array];
+	for (int k = hevc ? 0 : 1; k < 3; k++) {
+		if (sets[k].count == 0)
+			return NULL;
+		for (NSNumber *id in [sets[k].allKeys sortedArrayUsingSelector:@selector(compare:)])
+			[list addObject:sets[k][id]];
 	}
-	return st == noErr ? fd : NULL;
+	const uint8_t *bytes[600];
+	size_t sizes[600];
+	if (list.count > 600)
+		return NULL;
+	for (NSUInteger i = 0; i < list.count; i++) {
+		bytes[i] = list[i].bytes;
+		sizes[i] = list[i].length;
+	}
+	CMVideoFormatDescriptionRef fd = NULL;
+	OSStatus st = hevc ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, list.count, bytes, sizes, 4,
+	                                                                         NULL, &fd)
+	                   : CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, list.count, bytes, sizes, 4,
+	                                                                         &fd);
+	if (st != noErr)
+		return NULL;
+	if (g_fields == 0)
+		return fd;
+	// The description a QuickTime file's 'fiel' atom of two fields gives, top or bottom first.
+	NSMutableDictionary *ext = [(__bridge NSDictionary *)CMFormatDescriptionGetExtensions(fd) mutableCopy];
+	ext[(__bridge NSString *)kCMFormatDescriptionExtension_FieldCount] = @2;
+	ext[(__bridge NSString *)kCMFormatDescriptionExtension_FieldDetail] =
+	    (__bridge NSString *)(g_fields == 't' ? kCMFormatDescriptionFieldDetail_TemporalTopFirst
+	                                          : kCMFormatDescriptionFieldDetail_TemporalBottomFirst);
+	const CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(fd);
+	CMVideoFormatDescriptionRef fields = NULL;
+	st = CMVideoFormatDescriptionCreate(NULL, CMFormatDescriptionGetMediaSubType(fd), dims.width,
+	                                    dims.height, (__bridge CFDictionaryRef)ext, &fields);
+	CFRelease(fd);
+	return st == noErr ? fields : NULL;
+}
+
+// The field count a format description names (its FieldCount extension), 0 for none.
+static int descriptionFields(CMVideoFormatDescriptionRef fd)
+{
+	NSNumber *n = (__bridge NSNumber *)CMFormatDescriptionGetExtension(fd, kCMFormatDescriptionExtension_FieldCount);
+	return [n isKindOfClass:NSNumber.class] ? n.intValue : 0;
+}
+
+// Bits of an H.264 NAL unit's RBSP: the bytes after its header, emulation prevention removed.
+typedef struct {
+	uint8_t b[64];
+	size_t n, bit;
+	BOOL over;
+} Bits;
+
+static void rbspHead(NSData *nal, Bits *r)
+{
+	const uint8_t *b = nal.bytes;
+	r->n = r->bit = 0;
+	r->over = NO;
+	int zeros = 0;
+	for (size_t i = 1; i < nal.length && r->n < sizeof r->b; i++) {
+		if (zeros >= 2 && b[i] == 3) {
+			zeros = 0;
+			continue;
+		}
+		zeros = b[i] == 0 ? zeros + 1 : 0;
+		r->b[r->n++] = b[i];
+	}
+}
+
+static uint32_t bitsU(Bits *r, int k)
+{
+	uint32_t v = 0;
+	for (int i = 0; i < k; i++) {
+		if (r->bit >= r->n * 8) {
+			r->over = YES;
+			return 0;
+		}
+		v = v << 1 | ((r->b[r->bit / 8] >> (7 - r->bit % 8)) & 1);
+		r->bit++;
+	}
+	return v;
+}
+
+static uint32_t bitsUe(Bits *r)
+{
+	int zeros = 0;
+	while (!r->over && bitsU(r, 1) == 0)
+		if (++zeros > 31) {
+			r->over = YES;
+			return 0;
+		}
+	return (uint32_t)((1ull << zeros) - 1 + bitsU(r, zeros));
+}
+
+static int32_t bitsSe(Bits *r)
+{
+	const uint32_t k = bitsUe(r);
+	return k & 1 ? (int32_t)((k + 1) / 2) : -(int32_t)(k / 2);
+}
+
+// What an H.264 slice header's start needs of its SPS (7.3.2.1.1), by seq_parameter_set_id.
+typedef struct {
+	BOOL valid, frameMbsOnly, separateColourPlane;
+	uint32_t log2MaxFrameNum;
+} SpsHead;
+
+static void readSps(NSData *nal, SpsHead sps[32])
+{
+	Bits r;
+	rbspHead(nal, &r);
+	const uint32_t profile = bitsU(&r, 8);
+	bitsU(&r, 16);
+	const uint32_t id = bitsUe(&r);
+	SpsHead s = {NO, YES, NO, 4};
+	if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 ||
+	    profile == 83 || profile == 86 || profile == 118 || profile == 128 || profile == 138 ||
+	    profile == 139 || profile == 134 || profile == 135) {
+		const uint32_t chroma = bitsUe(&r);
+		if (chroma == 3)
+			s.separateColourPlane = bitsU(&r, 1);
+		bitsUe(&r);
+		bitsUe(&r);
+		bitsU(&r, 1);
+		if (bitsU(&r, 1))
+			for (int i = 0; i < (chroma != 3 ? 8 : 12) && !r.over; i++)
+				if (bitsU(&r, 1)) {
+					int32_t last = 8, next = 8;
+					for (int j = 0; j < (i < 6 ? 16 : 64) && !r.over; j++) {
+						if (next != 0)
+							next = (last + bitsSe(&r) + 256) % 256;
+						last = next == 0 ? last : next;
+					}
+				}
+	}
+	s.log2MaxFrameNum = bitsUe(&r) + 4;
+	const uint32_t pocType = bitsUe(&r);
+	if (pocType == 0) {
+		bitsUe(&r);
+	} else if (pocType == 1) {
+		bitsU(&r, 1);
+		bitsSe(&r);
+		bitsSe(&r);
+		const uint32_t cycle = bitsUe(&r);
+		for (uint32_t i = 0; i < cycle && !r.over; i++)
+			bitsSe(&r);
+	}
+	bitsUe(&r);
+	bitsU(&r, 1);
+	bitsUe(&r);
+	bitsUe(&r);
+	s.frameMbsOnly = bitsU(&r, 1);
+	s.valid = !r.over && id < 32 && s.log2MaxFrameNum <= 16;
+	if (s.valid)
+		sps[id] = s;
+}
+
+// Whether the H.264 slice `nal` is of a field picture, and its parity and frame_num (7.3.3), by
+// the SPS its PPS names (`ppsSps`, by pic_parameter_set_id; 0xff for none yet). False where the
+// header names no SPS read, or ends early.
+static BOOL sliceField(NSData *nal, const SpsHead sps[32], const uint8_t ppsSps[256], BOOL *field,
+                       BOOL *bottom, uint32_t *frameNum)
+{
+	Bits r;
+	rbspHead(nal, &r);
+	bitsUe(&r);
+	bitsUe(&r);
+	const uint32_t pps = bitsUe(&r);
+	if (r.over || pps > 255 || ppsSps[pps] >= 32 || !sps[ppsSps[pps]].valid)
+		return NO;
+	const SpsHead *s = &sps[ppsSps[pps]];
+	if (s->separateColourPlane)
+		bitsU(&r, 2);
+	*frameNum = bitsU(&r, (int)s->log2MaxFrameNum);
+	*field = !s->frameMbsOnly && bitsU(&r, 1);
+	*bottom = *field && bitsU(&r, 1);
+	return !r.over;
+}
+
+// The id a parameter set of `kind` (0 VPS, 1 SPS, 2 PPS) is kept by: H.264's seq_ or
+// pic_parameter_set_id; 0 for HEVC's, whose latest of each kind is kept.
+static NSNumber *setId(NSData *d, int kind, BOOL hevc)
+{
+	if (hevc)
+		return @0;
+	Bits r;
+	rbspHead(d, &r);
+	if (kind == 1)
+		bitsU(&r, 24);
+	return @(bitsUe(&r));
 }
 
 // The stream's access units as samples of 4-byte-length NAL units, into `units`, and the format
 // description each is decoded under, into `formats` (one an entry of `formats` names by its
 // index, `unitFormats`). H.264: a slice whose first_mb_in_slice is 0, or an SEI, SPS, PPS or AUD
-// after a slice, starts an access unit, and only slices go in the samples. HEVC: a VCL unit with
+// after a slice, starts an access unit, and only slices go in the samples; the second field of a
+// field pair (a field picture of the other parity and the same frame_num as a field alone in the
+// sample before it) goes in its first field's sample, as a QuickTime or MP4 file holds the two
+// fields of a frame in one sample (ffmpeg's muxers write them so). HEVC: a VCL unit with
 // first_slice_segment_in_pic_flag, or a parameter set, AUD, prefix SEI or reserved non-VCL unit
 // after a VCL one, starts an access unit, and parameter sets, AUDs and end units stay out of the
-// samples. A unit's description is of the latest VPS, SPS and PPS before it; a set unlike the one
-// before it of its kind makes a new one for the units after it. With `firstOnly`, every unit is
-// under one description, of the stream's first sets. False where the system takes no description
-// a unit needs.
+// samples. A unit's description is of the latest VPS, SPS and PPS before it (for H.264, the
+// latest SPS and PPS of each id); a set unlike the one before it of its kind and id makes a new one
+// for the units after it. With `firstOnly`, every unit is under one description, of the stream's
+// first sets. False where the system takes no description a unit needs.
 static BOOL split(NSArray<NSData *> *nals, BOOL hevc, BOOL firstOnly, NSMutableArray<NSData *> *units,
                   NSMutableArray *formats, NSMutableArray<NSNumber *> *unitFormats)
 {
-	NSData *set[3] = {nil, nil, nil}; // VPS, SPS, PPS: the latest of each
+	// VPS, SPS, PPS: the latest of each by its id (setId).
+	NSMutableDictionary<NSNumber *, NSData *> *set[3] = {[NSMutableDictionary dictionary],
+	                                                    [NSMutableDictionary dictionary],
+	                                                    [NSMutableDictionary dictionary]};
 	BOOL changed = YES;
 	if (firstOnly) {
 		for (NSData *d in nals) {
 			uint8_t b0 = ((const uint8_t *)d.bytes)[0];
 			int t = hevc ? (b0 >> 1) & 0x3f : b0 & 0x1f;
 			int k = hevc ? (t >= 32 && t <= 34 ? t - 32 : -1) : (t == 7 ? 1 : t == 8 ? 2 : -1);
-			if (k >= 0 && set[k] == nil)
-				set[k] = d;
+			if (k >= 0 && set[k][setId(d, k, hevc)] == nil)
+				set[k][setId(d, k, hevc)] = d;
 		}
-		CMVideoFormatDescriptionRef fd = describe(set[0], set[1], set[2], hevc);
+		CMVideoFormatDescriptionRef fd = describe(set, hevc);
 		if (fd == NULL)
 			return NO;
 		[formats addObject:(__bridge_transfer id)fd];
@@ -281,6 +479,13 @@ static BOOL split(NSArray<NSData *> *nals, BOOL hevc, BOOL firstOnly, NSMutableA
 	NSMutableData *cur = nil;
 	BOOL picture = NO;
 	NSUInteger curFormat = 0;
+	// H.264's fields: the SPSs and PPSs read, and the last sample's field where it holds one alone
+	// (its parity, -1 for none) and its frame_num.
+	SpsHead spsHeads[32] = {{NO, YES, NO, 4}};
+	uint8_t ppsSps[256];
+	memset(ppsSps, 0xff, sizeof ppsSps);
+	int loneField = -1;
+	uint32_t loneFrameNum = 0;
 	for (NSData *d in nals) {
 		const uint8_t *b = d.bytes;
 		BOOL vcl, first, starts, keep;
@@ -299,6 +504,15 @@ static BOOL split(NSArray<NSData *> *nals, BOOL hevc, BOOL firstOnly, NSMutableA
 			starts = first || (t >= 6 && t <= 9);
 			keep = vcl;
 			kind = t == 7 ? 1 : t == 8 ? 2 : -1;
+			if (t == 7) {
+				readSps(d, spsHeads);
+			} else if (t == 8) {
+				Bits r;
+				rbspHead(d, &r);
+				const uint32_t pps = bitsUe(&r), sps = bitsUe(&r);
+				if (!r.over && pps < 256 && sps < 32)
+					ppsSps[pps] = (uint8_t)sps;
+			}
 		}
 		if (picture && starts) {
 			[units addObject:cur];
@@ -306,8 +520,25 @@ static BOOL split(NSArray<NSData *> *nals, BOOL hevc, BOOL firstOnly, NSMutableA
 			cur = nil;
 			picture = NO;
 		}
-		if (kind >= 0 && !firstOnly && ![set[kind] isEqualToData:d]) {
-			set[kind] = d;
+		BOOL field = NO, bottom = NO;
+		uint32_t frameNum = 0;
+		if (!hevc && first && sliceField(d, spsHeads, ppsSps, &field, &bottom, &frameNum)) {
+			if (field && loneField >= 0 && (int)bottom != loneField && frameNum == loneFrameNum &&
+			    units.count > 0) {
+				// The second field of the last sample's.
+				cur = [units.lastObject mutableCopy];
+				curFormat = unitFormats.lastObject.unsignedIntegerValue;
+				[units removeLastObject];
+				[unitFormats removeLastObject];
+				picture = YES;
+				loneField = -1;
+			} else {
+				loneField = field ? (int)bottom : -1;
+				loneFrameNum = frameNum;
+			}
+		}
+		if (kind >= 0 && !firstOnly && ![set[kind][setId(d, kind, hevc)] isEqualToData:d]) {
+			set[kind][setId(d, kind, hevc)] = d;
 			changed = YES;
 		}
 		if (!keep)
@@ -315,7 +546,7 @@ static BOOL split(NSArray<NSData *> *nals, BOOL hevc, BOOL firstOnly, NSMutableA
 		// A unit is under the description of the sets current at its first VCL unit.
 		if (vcl && !picture) {
 			if (changed) {
-				CMVideoFormatDescriptionRef fd = describe(set[0], set[1], set[2], hevc);
+				CMVideoFormatDescriptionRef fd = describe(set, hevc);
 				if (fd == NULL)
 					return NO;
 				[formats addObject:(__bridge_transfer id)fd];
@@ -358,11 +589,21 @@ static OSStatus openSession(CMVideoFormatDescriptionRef fd, OSType format, Decod
 {
 	NSDictionary *attrs = @{(__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(format)};
 	NSDictionary *spec = @{
-		(__bridge NSString *)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES
+		(__bridge NSString *)(g_anyDecoder ? kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder
+		                                   : kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder): @YES
 	};
 	VTDecompressionOutputCallbackRecord cb = {decoded, (__bridge void *)pass};
-	return VTDecompressionSessionCreate(NULL, fd, (__bridge CFDictionaryRef)spec,
-	                                    (__bridge CFDictionaryRef)attrs, &cb, out);
+	OSStatus st = VTDecompressionSessionCreate(NULL, fd, (__bridge CFDictionaryRef)spec,
+	                                           (__bridge CFDictionaryRef)attrs, &cb, out);
+	CFBooleanRef hw = NULL;
+	if (st == noErr && g_hardware < 0 &&
+	    VTSessionCopyProperty(*out, kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder, NULL,
+	                          &hw) == noErr &&
+	    hw != NULL) {
+		g_hardware = CFBooleanGetValue(hw) ? 1 : 0;
+		CFRelease(hw);
+	}
+	return st;
 }
 
 // Ends `session` once its frames are out.
@@ -383,8 +624,10 @@ static double decodeAll(NSArray *formats, NSArray<NSData *> *units, NSArray<NSNu
 	CMVideoFormatDescriptionRef current = (__bridge CMVideoFormatDescriptionRef)formats[0];
 	VTDecompressionSessionRef session = NULL;
 	OSStatus st = openSession(current, format, pass, &session);
-	if (st != noErr)
+	if (st != noErr) {
+		*sessions = 0;
 		return st < 0 ? st : -st;
+	}
 	*sessions = 1;
 	double t0 = nowMs();
 	int64_t i = 0;
@@ -434,7 +677,8 @@ static BOOL checkFile(NSString *path, int loops, BOOL firstOnly)
 	NSString *ext = path.pathExtension.lowercaseString;
 	BOOL hevc = [ext isEqualToString:@"265"] || [ext isEqualToString:@"hevc"];
 	const char *n = name.UTF8String;
-	if (!VTIsHardwareDecodeSupported(hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264)) {
+	g_hardware = -1;
+	if (!g_anyDecoder && !VTIsHardwareDecodeSupported(hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264)) {
 		printf("decode_md5: %s SKIP no hardware %s decoder\n", n, hevc ? "HEVC" : "H.264");
 		return YES;
 	}
@@ -468,7 +712,8 @@ static BOOL checkFile(NSString *path, int loops, BOOL firstOnly)
 	int sessions = 0;
 	double ms = decodeAll(formats, units, unitFormats, 1, format, pass, &sessions);
 	if (ms < 0) {
-		printf("decode_md5: %s FAIL decoding: OSStatus %d\n", n, (int)ms);
+		printf("decode_md5: %s FAIL %s: OSStatus %d\n", n, sessions ? "decoding" : "creating its session",
+		       (int)ms);
 		return NO;
 	}
 	[ref sortUsingSelector:@selector(compare:)];
@@ -496,6 +741,10 @@ static BOOL checkFile(NSString *path, int loops, BOOL firstOnly)
 	}
 	if (formats.count > 1)
 		[line appendFormat:@" formats=%lu sessions=%d", (unsigned long)formats.count, sessions];
+	if (g_anyDecoder)
+		[line appendFormat:@" decoder=%s", g_hardware == 1 ? "hardware" : g_hardware == 0 ? "software" : "unknown"];
+	if (descriptionFields((__bridge CMVideoFormatDescriptionRef)formats[0]) != 0)
+		[line appendFormat:@" fields=%d", descriptionFields((__bridge CMVideoFormatDescriptionRef)formats[0])];
 	if (ok && loops > 0) {
 		DecodePass *timed = [DecodePass new];
 		int timedSessions = 0;
@@ -519,13 +768,17 @@ int main(int argc, char **argv)
 	@autoreleasepool {
 		int c, loops = 0;
 		BOOL firstOnly = NO;
-		while ((c = getopt(argc, argv, "l:f")) != -1) {
-			if (c == 'l')
+		while ((c = getopt(argc, argv, "l:fi:a")) != -1) {
+			if (c == 'a')
+				g_anyDecoder = YES;
+			else if (c == 'l')
 				loops = atoi(optarg);
 			else if (c == 'f')
 				firstOnly = YES;
+			else if (c == 'i' && (optarg[0] == 't' || optarg[0] == 'b'))
+				g_fields = optarg[0];
 			else {
-				fprintf(stderr, "usage: decode_md5 [-l LOOPS] [-f] FILE...\n");
+				fprintf(stderr, "usage: decode_md5 [-l LOOPS] [-f] [-i t|b] [-a] FILE...\n");
 				return 2;
 			}
 		}
