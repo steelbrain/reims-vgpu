@@ -5,17 +5,17 @@ of work around them, and [architecture.md](architecture.md) section 17
 repeats the ones code cites.
 
 - **Names say what things mean**: `Raise`, `Held`, `SerialQueue`,
-  `define_task`, `present_mapped_surface`.
+  `HostRange`.
   - No `PG` prefixes, no Objective-C class names, no
     `dealloc`/`init_with_*` names, and no selector-keyword method names.
   - No `_locked`/public pairs unless both are called.
   - The threads, queues and Metal object labels the library makes are
-    `reims-vgpu.<role>` (`reims-vgpu.fifo`, `reims-vgpu.display-present`).
+    `reims-vgpu.<role>` (`reims-vgpu.graphics-control`,
+    `reims-vgpu.display-present`).
     They are diagnostics: no host or guest reads them.
-- **Modules** are named by responsibility (`device/lifecycle.rs`,
-  `tasks/shared.rs`, `remote/device_link.rs`, `gpu_task/`), never after
-  `-init`, `PGBaseTask` or a delegate class. One module style: `foo.rs`
-  beside `foo/` (D44).
+- **Modules** are named by responsibility (`graphics/decode/cmdbuf.rs`,
+  `memory/mapping.rs`, `display/pipeline.rs`), never after `-init` or an
+  Objective-C class. One module style: `foo.rs` beside `foo/` (D44).
 - **Code for one OS** goes in files of its own (the window crate's
   `native/macos/` and `native/linux/`, the Vulkan crate's `os/macos.rs`
   and `os/linux.rs`, the C API's `ffi/catch/{macos,linux}.rs`), which the
@@ -36,9 +36,9 @@ repeats the ones code cites.
     `VK_NV_linear_color_attachment`.
   - **Stalls are fixed on the Vulkan side**: in this crate (caches, their
     keys, when states are made) and in the runtime (translation speed,
-    sharing, making ahead), never by making core or the FIFO non-blocking,
-    or by deferring or reordering their waits, since the guest sees where
-    they wait. Compiles run concurrently only inside the synchronous wait
+    sharing, making ahead), never by making core or the device's lanes
+    non-blocking, or by deferring or reordering their waits, since the guest
+    sees where they wait. Compiles run concurrently only inside the synchronous wait
     that needs them, which joins every one before it returns: nothing
     compiles in the background, and nothing is deferred or released early.
     Nothing the guest sees (IDs, addresses, stamps, reflection order, shared
@@ -51,9 +51,9 @@ repeats the ones code cites.
   - **A workaround for the OS or a driver** lives in the runtime's code that
     calls it, never in core or the library's threads: a compile the system
     runs at its caller's priority is raised by the runtime, not by raising
-    the FIFO thread's.
+    the library's threads'.
   - **What Metal does is the runtime's to build**, its private API
-    included; what only the paravirtual device has is this crate's. A gap
+    included; what only our device has is this crate's. A gap
     in the runtime goes to it with a repro (the call, its descriptor or
     arguments, the error or the difference from Metal, the device) rather
     than being patched around here.
@@ -66,8 +66,7 @@ repeats the ones code cites.
     the Metal product's too, and stable there.
 - **Closed internal value sets are enums**, converted with `TryFrom<u32>` at
   the guest edge. A raw integer is kept only where the guest can write any
-  value. There are no `pub mod x { pub const … }` integer-enum modules: the
-  device's `RunState`, for one, is an enum in an `AtomicU8`-backed cell.
+  value. There are no `pub mod x { pub const … }` integer-enum modules.
 - **Refcounts**: a type whose drop has an observable effect (a Metal object,
   an IOSurface, a host block, a device or display handle) never implements
   `Clone`. Another reference is taken with `.clone_ref()`, everywhere, API
@@ -78,16 +77,14 @@ repeats the ones code cites.
 - **Never guess a name** for guest records, the wire and copies of Metal
   structs. A field whose meaning nothing states is `field_xx` (its byte
   offset in lowercase hex), and a name that is ours carries
-  `// name is ours: <evidence>`. Guest-ABI names follow
-  [docs/testing.md](testing.md) section 6.
+  `// name is ours: <evidence>`.
 - **An odd behaviour** the guest or host can see carries a doc comment at
   the code that says what it is, and a test named for the behaviour
-  (`teardown_with_a_doorbell_owed_dies`). It is kept as it is: changing it
-  is a deliberate change of behaviour, which re-records what it alters
-  (architecture 13).
+  (`denormal_depths_store_and_compare_as_metals`). It is kept as it is:
+  changing it is a deliberate change of behaviour, in a commit of its own
+  that changes its test.
 - **Comments** say why, in terms of what the guest or host observes ("the
-  stamp is in guest memory before its interrupt"), and may name a scenario
-  or test.
+  stamp is in guest memory before its interrupt"), and may name a test.
 - Tests sit in `mod tests` beside the code and are named by behaviour.
 - **Integers**: std spells wrapping, overflowing, widening and sign
   reinterpretation (`wrapping_add`, `overflowing_mul`, `u64::from`,
@@ -107,7 +104,7 @@ repeats the ones code cites.
 - Default rustfmt. A lint is lowered with `#[expect(lint, reason = "…")]` on
   the narrowest item, in place of an `allow` with a comment.
 - **The option ROM's C** (`firmware/`) follows EDK2's style and the UEFI
-  specification's names instead (architecture 11.4). Its register macros
-  carry the device's names (`REIMS_VGPU_REG_EFI_ENABLE`, `EfiEnable`).
+  specification's names instead (architecture 11.4). Its registers carry
+  the wire header's names (`RGFX_REG_DOORBELL`).
 - Branches are prefixed `steelbrain/`. Commits follow AGENTS.md (emoji
   prefix, imperative, 72-column subject, body wrapped at 80 explaining why).

@@ -11,13 +11,18 @@ AGENTS.md                   the rules for working on the repository
 Cargo.toml                  the Cargo workspace, with Cargo.lock,
                             rust-toolchain.toml, clippy.toml and
                             .cargo/config.toml
-crates/                     its thirteen crates (below), and reims-ctl, a
+crates/                     its eleven crates (below), and reims-ctl, a
                             workspace of its own that links none of them
 xtask/                      cargo xtask (below)
-firmware/                   the option ROM: the PCI device's UEFI driver,
-                            in C
+firmware/                   the reims-graphics device's option ROM: its UEFI
+                            driver, in C, and the prebuilt ROM reims-ctl
+                            carries
+guest/                      the guest's kexts, loader and Metal bundle, and
+                            the prebuilt kext set reims-ctl carries
 tests/
-  suite/                    the behaviour-lock suite (its README)
+  shaders/                  the tests' metallibs and their sources
+  suite/fixtures/shaders    a link to tests/shaders, which guest/bundle's
+                            build and tools name
 scripts/                    what a person installing reims-ctl runs
   install-ctl.sh            builds and installs reims-ctl and its QEMU (and
                             reims-util, on Linux)
@@ -26,8 +31,11 @@ scripts/internal/           what developing the project runs
                             other projects' runs share
   dev-env.sh                the environment a developer's builds run in,
                             through kache where it is installed (below)
-  new-worktree.sh           a new worktree, its tests/suite cloned from the
-                            main checkout's
+  new-worktree.sh           a new worktree on a new branch
+  lane-gate.sh, lane-gate/  the graphics lane's landing gate
+  opencore-add-kexts.sh     a copy of a VM's OpenCore image with kexts added
+  guest-minibuddy-off.sh    keeps Setup Assistant's panes from a guest's
+                            next login
   run_vmapple.sh            boots a macOS VM on make qemu's QEMU
   vm_drive.py, vm_ocr.swift drive a VM through a fixed tour
   walk_window_macos.sh      the manual walk of a display's window on macOS
@@ -38,15 +46,19 @@ docs/
   conventions.md            the conventions the code follows
   development.md            this file: the layout, the tests, the crates
                             and their commands
-  testing.md                the suite's specification, and the guest ABI
+  testing.md                how the code is tested, and the tags a claim
+                            about Metal carries
   qemu.md                   QEMU on the library: its build, VM boots and
                             what they measured
-  lessons.md                traps the suite and reviews found
+  lessons.md                traps that tests, reviews and boots found
   accuracy-ledger.md        what the Vulkan platform's defaults trade
                             against Metal's answers, and the switches
+  graphics-kext/            the reims-graphics device: its design, the dGPU
+                            oracle and the benchmark
   video/                    the video devices: their contract, core, the
                             backends, hardening and the open bugs
-vendor/qemu/                QEMU with apple-gfx on reims-vgpu (submodule)
+vendor/qemu/                QEMU with the reims-graphics device on
+                            reims-vgpu (submodule)
 assets/readme/              the README's screenshots
 LICENSE                     the license, and LICENSES/ its texts (README.md, License)
 ```
@@ -55,35 +67,30 @@ LICENSE                     the license, and LICENSES/ its texts (README.md, Lic
 
 - **`cargo xtask check`** runs the lints, rustfmt, clippy and every unit test. Run it once before a
   branch that changes code merges.
-- **`make smoke`** (`cargo xtask smoke`) links a guest program with the library the way QEMU links
-  it and runs an isolated guest task.
-- **The behaviour-lock suite** (`tests/suite`, `make test`) plays the hypervisor and the guest, and
-  compares what the guest and the host observe with its expected files.
-  [testing.md](testing.md) specifies the suite and the guest ABI it is written against, and
-  [tests/suite/README.md](../tests/suite/README.md) is its user's guide.
-- **The pins**: `crates/reims-vgpu-c/tests/pins`, a C host against the C API, which
-  `cargo xtask check` runs with the other tests.
+- **Unit tests** sit beside the code. A test of the Metal or the Vulkan platform runs on the host's
+  GPU, and on a Mac the Vulkan platform's tests compare its answers with Metal's
+  ([testing.md](testing.md)).
+- **VM boots** are the only check of what a guest's frameworks choose and of QEMU's side of the C
+  API ([qemu.md](qemu.md), "Booting a guest to check a change").
 
-Expected files and pin files are recorded from the checkout's own build. A change that means to
-alter behaviour records them again in the same commit (`make bless TEST=<patterns> ARGS=--update`,
-`RVG_PINS_RECORD=1 cargo test -p reims-vgpu-c --test pins`), so the diff shows exactly what changed
-for the guest and the host.
+A change that means to alter behaviour changes the tests that hold it in the same commit, so the
+diff shows exactly what changed for the guest and the host.
 
 ## The Rust library
 
 [architecture.md](architecture.md) describes the crates, threads and locks, the raise and death
-model, the platform boundary, isolated tasks, the APIs, the option ROM and QEMU. Each module's `//!`
+model, the platform boundary, the APIs, the option ROM and QEMU. Each module's `//!`
 doc holds its area's ordering contracts and the measured platform facts it relies on.
 
 ### Crates
 
 | crate | path | role |
 |---|---|---|
-| `reims-vgpu-core` | `crates/reims-vgpu-core` | all behaviour, generic over `P: Platform`; links no Apple framework |
+| `reims-vgpu-core` | `crates/reims-vgpu-core` | what the platforms and the device share, generic over `P: Platform`: the platform traits, the runtime, raises and deaths, the testkit; links no Apple framework |
 | `reims-vgpu-metal` | `crates/reims-vgpu-metal` | the `Platform` over Metal, IOSurface, Mach VM and threads, and the library's shaders (`src/gpu/shaders.metal`) |
 | `reims-vgpu-vulkan` | `crates/reims-vgpu-vulkan` | the `Platform` over metal2vulkan's runtime: the library on Linux, and on macOS behind the `vulkan` features, on MoltenVK |
-| `reims-vgpu-window` | `crates/reims-vgpu-window` | a display's own window: AppKit's or SDL3's on macOS, SDL3's on Linux, its input and the host's screens; knows nothing of devices or displays. `features.md` lists what the window does, each entry deliberate |
-| `reims-vgpu` | `crates/reims-vgpu` | the public Rust API; the process's platform; a display's window over the window crate |
+| `reims-vgpu-window` | `crates/reims-vgpu-window` | the device's own window: AppKit's or SDL3's on macOS, SDL3's on Linux, its input and the host's screens; knows nothing of devices or displays. `features.md` lists what the window does, each entry deliberate |
+| `reims-vgpu` | `crates/reims-vgpu` | the public Rust API: the reims-graphics device over the platform, its Metal-call decoder and its window; the process's platform |
 | `reims-vgpu-c` | `crates/reims-vgpu-c` | the C API (`rvg_*`, `include/reims_vgpu.h`), which QEMU links; `cdylib`, `staticlib` and `rlib` |
 | `reims-vgpu-video-core` | `crates/reims-vgpu-video-core` | the VideoToolbox and M2 scaler devices' behaviour as the guest sees it, over the backends' traits; independent of host, driver and QEMU |
 | `reims-vgpu-video-codec` | `crates/reims-vgpu-video-codec` | the codecs' syntax and the decoding and encoding processes above the hardware, for every backend, in plain Rust |
@@ -103,9 +110,9 @@ Run from the repository root. `cargo xtask` is an alias for `cargo run --package
 cargo build --workspace
 cargo nextest run --workspace
 cargo xtask check          # the lints, rustfmt, clippy and every test; run it once before a merge
-cargo xtask dist           # target/dist: the library, its header, reims-vgpu.pc and
-                           # the option ROM, for a host that links it through pkg-config
-cargo xtask smoke          # a guest linked with the library as QEMU links it (make smoke)
+cargo xtask dist           # target/dist: the library, its header and reims-vgpu.pc, for
+                           # a host that links it through pkg-config
+cargo xtask metallibs      # on a Mac: the Vulkan platform's metallibs and their record
 ```
 
 | command | what it does |
@@ -113,8 +120,8 @@ cargo xtask smoke          # a guest linked with the library as QEMU links it (m
 | `testkit` | core's `testkit` module is gated, and only dev-dependencies turn its feature on (D50) |
 | `header [--check]` | `include/reims_vgpu.h` from cbindgen; `--check` fails when the committed header drifts from cbindgen's output |
 | `dist` | the library as a plain library, below |
-| `smoke` | the arm64 smoke of the library, below |
-| `check` | `testkit`, `header --check`, rustfmt, clippy and the tests ([architecture.md](architecture.md) 13.1); `--no-cargo` skips the cargo steps |
+| `metallibs` | the Vulkan platform's metallibs and their record, `metallibs.toml`, compiled on a Mac into `crates/reims-vgpu-vulkan/metallibs`, which a build elsewhere takes them from |
+| `check` | `testkit`, `header --check`, the records of the prebuilt option ROM and kext set, rustfmt, clippy and the tests ([architecture.md](architecture.md) 13.1); `--no-cargo` skips the cargo steps |
 
 `cargo xtask check` tests with every feature but `reims-vgpu-c/vulkan`, which puts the C API on the
 Vulkan platform, and lints with every feature too. On a Mac it also clippy-checks the Linux target,
@@ -255,46 +262,16 @@ target/dist/
   lib/libreims_vgpu.a                    the staticlib
   lib/libreims_vgpu.dylib                the cdylib, @rpath/libreims_vgpu.dylib, signed ad hoc
   lib/pkgconfig/reims-vgpu.pc            the package
-  share/reims-vgpu/ReimsVgpu.rom         the EFI option ROM, built from firmware/
   share/doc/reims-vgpu/                  the license: LICENSE and LICENSES/, as in the repository
 ```
 
 `reims-vgpu.pc` takes its prefix from its own path, so the tree can move. Its `Libs.private` lists
-the system frameworks and libraries a static link needs, and its `optionrom` variable names the
-ROM, which QEMU installs as `apple-gfx-pci`'s default `romfile`. QEMU and the smoke link
-`libreims_vgpu.a`, so the library is part of their binaries; the suite's runner links
-`libreims_vgpu.dylib` with an `LC_RPATH` at the tree's `lib`.
+the system frameworks and libraries a static link needs. QEMU links `libreims_vgpu.a`, so the
+library is part of its binary; the C API's tests link the shared library.
 
 `--platform vulkan` builds the C API on the Vulkan platform into `target/dist-vulkan`, laid out the
-same; the smoke (`--dist`) and the suite (`pgtest run --dist`) take either tree. On Linux `dist`
-builds that platform alone, with `libreims_vgpu.so` in place of the dylib (architecture 11.3).
-`CARGO_TARGET_DIR` moves every output, the dist tree included, out of `target`.
-
-#### Smoke
-
-```sh
-cargo xtask dist
-cargo xtask smoke           # --dist DIR for another tree
-```
-
-It runs arm64 only: a guest program (`xtask/src/smoke_guest.m`), linked statically with the dist
-tree's library, that brings up a device and runs an isolated task, whose facts must equal the
-library's expected values (`GUEST_EXPECTED` in `xtask/src/smoke.rs`). `make smoke` builds the tree
-and runs it.
-
-#### The behaviour suite
-
-The suite (`tests/suite`) runs against the library, by default the checkout's dist tree
-(`target/dist`):
-
-```sh
-make test                   # the dist tree, then the suite
-cd tests/suite && python3 -m pgtest run -j 32   # the same, with pgtest's options
-make bless TEST=<patterns>  # record new or changed scenarios from the checkout's build
-make bless TEST=<patterns> ARGS=--update   # record them again after a deliberate change
-```
-
-[testing.md](testing.md) 5.7 and [tests/suite/README.md](../tests/suite/README.md) have the rest.
+same. On Linux `dist` builds that platform alone, with `libreims_vgpu.so` in place of the dylib
+(architecture 11.3). `CARGO_TARGET_DIR` moves every output, the dist tree included, out of `target`.
 
 ### Profiles
 
@@ -305,7 +282,7 @@ Set in `Cargo.toml` (architecture 2.3):
 | `dev` | `panic = "unwind"`, overflow checks on, `debug = "line-tables-only"`, dependencies without debuginfo | an unannotated arithmetic slip dies in tests. Line tables keep a backtrace's files and lines, at a fraction of full debuginfo's build time and disk |
 | `debugging` | `dev` with full debuginfo, dependencies' too | a debugger session's build (`--profile debugging`), whose variables and types lldb shows |
 | `release` | `panic = "unwind"`, overflow checks off, `debug = "line-tables-only"`, thin LTO | the product. Wrapping is explicit where the guest's values wrap (D19), so the checks add nothing |
-| `checked` | `release` plus overflow checks and debug assertions | a second pass of the suite: a death here is an arithmetic site review missed |
+| `checked` | `release` plus overflow checks and debug assertions | a second pass of the tests: a death here is an arithmetic site review missed |
 
 - **`panic = "unwind"` everywhere** (D9). objc2's `exception::catch` needs it. It is not a way to
   survive a panic: `reims-vgpu`'s singleton installs a hook that aborts before anything unwinds, so
