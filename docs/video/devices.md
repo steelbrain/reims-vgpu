@@ -1,9 +1,10 @@
 # The graphics device's video
 
-The reims-graphics device (PCI 1234:5247) decodes the guest's H.264 and HEVC on the host's
-hardware. The guest's video driver, in our Metal bundle, is AppleGVA's vendor driver
-([docs/graphics-kext/design.md](../graphics-kext/design.md), "Decided", 16). This file is the
-host's side: what it answers the guest, and what a decode does. The wire's records and their
+The reims-graphics device (PCI 1234:5247) decodes and encodes the guest's H.264 and HEVC on the
+host's hardware. The guest's video driver, in our Metal bundle, is AppleGVA's vendor driver
+([docs/graphics-kext/design.md](../graphics-kext/design.md), "Decided", 16); it decodes, and
+sends no encode op yet. This file is the host's side: what it answers the guest, and what a
+decode and an encode do. The wire's records and their
 fields are documented where they are defined: `crates/reims-graphics/src/wire.rs` (the caps and
 the session) and `crates/reims-graphics/src/ops/video.rs` (the ops).
 
@@ -12,8 +13,8 @@ the session) and `crates/reims-graphics/src/ops/video.rs` (the ops).
 On Linux, the device's video runs on the first of the host's two video arms that takes the
 runtime device (reims-vgpu's `graphics/video_choice.rs`):
 
-1. NVDEC, where the device is an NVIDIA GPU that CUDA opens (`graphics/nvidia.rs`,
-   [nvidia.md](nvidia.md)).
+1. NVIDIA's, decoding on NVDEC and encoding on NVENC, where the device is an NVIDIA GPU that
+   CUDA opens (`graphics/nvidia.rs`, [nvidia.md](nvidia.md)).
 2. VA-API, on the device's render node, whatever its vendor (`graphics/vaapi.rs`,
    [vaapi.md](vaapi.md)).
 
@@ -39,7 +40,13 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
 - **The layouts**: an `RgfxVideoOutputLayout` per entry, which says how a surface is laid out
   to take a picture's whole coded rows and columns in place. An arm that lands every picture by
   a copy of its crop answers zero, and every entry's is zero where the flag is set, since a
-  picture lands in place only in a surface's pages.
+  picture lands in place only in a surface's pages. For an encode entry it would say how a
+  source is laid out to be read in place; both arms read every source by a copy, and answer
+  zero.
+- **What an encode entry takes**: an `RgfxVideoEncodeCaps` per entry (`encode`): the rate
+  controls (a bit each of CQP, CBR and VBR, as the arm's API lists them for the codec's
+  profiles) and the most consecutive B pictures, 0 on both arms, whose encoders keep frames in
+  display order.
 
 ## Sessions
 
@@ -75,6 +82,37 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   driver cannot complete is a decode error").
 - **A picture the stream's random access skips** lands nothing, and its command buffer
   completes as any other.
+
+## An encode
+
+An encode is an op (`ENCODE_H264` 0x4002, `ENCODE_H265` 0x4003) in a video encoder of a command
+buffer of an encode session's process (reims-vgpu's `graphics/video_host/encode.rs`):
+
+- **The op is checked** as the command buffer is taken: the settings it carries (a session's
+  first encode carries them, and each change after), the source's size against them and the
+  entry's sizes, and the buffers the access unit and its result go in. A refusal faults the
+  command buffer.
+- **A change of settings** that makes a new sequence (the size, format, profile, level,
+  entropy coder, B pictures, keyframe interval or colour) makes the arm a new encoder, whose
+  first access unit is a keyframe;
+  a change of the bitrates, QPs or frame rate goes to the encoder from the next frame.
+  `min_qp`, `max_qp` and a change of `quality` alone are not taken.
+- **The frame is encoded** on the session's encode thread (`reims-vgpu.graphics-video-encode`),
+  in the order the encodes were taken, once the command buffer's waits are done: its two planes
+  are read as host bytes, in the surface's pages, or, for a plane in a device cache, in a staging
+  buffer the GPU copies it into first.
+- **The access unit is written** in Annex-B form into the bitstream buffer, a keyframe's with
+  its parameter sets first, and the frame's `RgfxVideoEncodeResult` after it. One past the
+  capacity is not written (`RGFX_VIDEO_ENCODE_OVERFLOW`, with the bytes it needed), and the
+  next frame is made a keyframe; a frame the hardware fails gets `RGFX_VIDEO_ENCODE_FAILED`.
+  Either way the command buffer completes as any other.
+- **The command buffer's later work, and its completion, wait** for the session's event to
+  reach the value the encode signals once its result is written.
+
+| arm | encoder | its access unit |
+|---|---|---|
+| NVENC | `NvencEncoder` ([nvidia.md](nvidia.md)); `quality` picks the presets P1 to P7 at the high-quality tuning, and the keyframe interval is the GOP (`graphics/nvidia/encode.rs`) | Annex B as NVENC writes it, its parameter sets before each IDR picture |
+| VA-API | `VideoEncoder` ([vaapi.md](vaapi.md)), on `EncSlice`, else `EncSliceLP`; `quality` maps onto the driver's quality levels (`graphics/vaapi/encode.rs`) | the encoder's length-prefixed sample, written as Annex B, a keyframe's parameter sets first from its configuration record |
 
 ## How each arm lands a picture
 

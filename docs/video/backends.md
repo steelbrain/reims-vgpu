@@ -24,7 +24,9 @@ reims-vgpu's `graphics` module holds the arms themselves: `graphics/nvidia.rs` a
   device caches by importing their memory (`lands_in_device_caches`, `imports_device_caches`).
 - **`GraphicsVideoSession`** is one session: its shared event, its codec, and a decode
   (`VideoDecode`: the op's access unit and parameter sets, and the output's two planes, each in
-  pages or in a device cache), which answers the event's value the decode signals.
+  pages or in a device cache) or an encode (`VideoEncode`: the op's settings, the source's two
+  planes, and the buffers its access unit and result go in), each of which answers the event's
+  value it signals.
 - **`HostVideoSession`** (`graphics/video_host.rs`) is both arms' session, as no runtime queue
   carries their work. The arm gives a `HostDecoder`, which starts the
   hardware's work, and a `HostPicture` for each picture, which writes it into its output. The
@@ -32,11 +34,17 @@ reims-vgpu's `graphics` module holds the arms themselves: `graphics/nvidia.rs` a
   (`reims-vgpu.graphics-video-land`), copies a plane the arm staged in host bytes into its
   device cache on a runtime queue, and signals each decode's value once its picture is there. It holds no
   more pictures unlanded than the decoder spares (`HostDecoder::most_unlanded`).
+- **`HostEncodeSession`** (`graphics/video_host/encode.rs`) is both arms' encode session. The
+  arm gives a `HostEncoder`, which checks the settings and takes each frame, and a
+  `HostEncodedFrame` for each, which encodes it from the source's host bytes into the
+  bitstream buffer. The session finishes the frames in order on a thread of its own
+  (`reims-vgpu.graphics-video-encode`), stages a source plane in a device cache in host bytes
+  first, writes each frame's result, and signals its encode's value.
 
 ## Picking an arm
 
 `graphics_video` (`graphics/video_choice.rs`) asks each arm in turn for the runtime device:
-NVDEC, then VA-API. Each that declines says why in one line at info, and costs no more than
+NVIDIA's (NVDEC and NVENC), then VA-API. Each that declines says why in one line at info, and costs no more than
 asking: a GPU that is not NVIDIA's loads no CUDA. Both are built on Linux alone.
 
 ## Tests
