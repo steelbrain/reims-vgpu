@@ -4,18 +4,18 @@
 // limit 0 and ends the process at its first check of one. WindowServer is that process, so the
 // guest has no desktop.
 //
-// The host answers its own Metal device's profile, or the M3 Max's (10) where no Metal device
-// stands for its GPU (the Vulkan platform). The device keeps that answer wherever the guest's
-// Metal knows it (docs/graphics-kext/dgpu-oracle.md, Q11, says why it is not the x86 Macs' 10002
-// there). Metal of macOS 12 does not know 10: the device answers 10001 there, as 12's drivers for
-// the oracle's two GPUs do (AMDRadeonX6000's, the Radeon Pro 5300M's, and AppleIntelKBLGraphics',
-// the UHD 630's; read from 12.7.6's drivers), and 12's Metal has limits for it. macOS 11's Metal
-// is taken to be 12's here: its boots stop in the kernel before WindowServer (Graft's to fix).
+// The device answers the x86 Macs' profile, which the guest's Metal knows, on every host. Under
+// macOS 26.7.1 both of the oracle's GPUs answer 10002 (the Radeon Pro 5300M and the UHD 630;
+// measured, docs/graphics-kext/dgpu-oracle.md, Q11), and under macOS 12 both of their drivers
+// answer 10001 (AMDRadeonX6000's and AppleIntelKBLGraphics'; read from 12.7.6's drivers), which
+// 12's Metal has limits for (it has none for the M3 Max's 10: 12.7.6's WindowServer ends at
+// device creation under it). macOS 11's Metal is taken to be 12's here: its boots stop in the
+// kernel before WindowServer (Graft's to fix).
 //
-// Whether the guest's Metal knows the host's profile is told by what it has, not by its version:
-// Metal that has the MTLArchitecture class (macOS 13 and later) knows 10 (13.7.8, 14.8.9 and
-// 26.7.2 boot to their desktops with it), and Metal without it (macOS 11 and 12) does not (12.7.6's
-// WindowServer ends at device creation with it).
+// Which of the two the guest's Metal knows is told by what it has, not by its version: Metal that
+// has the MTLArchitecture class (macOS 13 and later) gets 10002, under which 26.7.2 boots to its
+// desktop, and Metal without it (macOS 11 and 12) gets 10001. Under 10002, macOS 26's WindowServer
+// asks for tiled textures of 6 and 7 levels over a buffer, which the host makes (RgfxBuffer.mm).
 
 #ifndef RGFX_FEATURE_PROFILE_HPP
 #define RGFX_FEATURE_PROFILE_HPP
@@ -25,13 +25,16 @@
 namespace rgfx_profile {
 
 // The profile macOS 11 and 12's x86 GPU drivers answer.
-constexpr uint64_t kX86Mac = 10001;
+constexpr uint64_t kX86Mac12 = 10001;
 
-// The profile the device answers: the host's where the guest's Metal knows it (it has the
-// MTLArchitecture class), else the x86 Macs' that Metal knows.
-constexpr uint64_t forGuest(uint64_t host, bool metalHasArchitecture)
+// The profile macOS 26's x86 GPU drivers answer.
+constexpr uint64_t kX86Mac = 10002;
+
+// The profile the device answers: the x86 Macs' that the guest's Metal knows, 10002 where it has
+// the MTLArchitecture class, else 10001.
+constexpr uint64_t forGuest(bool metalHasArchitecture)
 {
-	return metalHasArchitecture ? host : kX86Mac;
+	return metalHasArchitecture ? kX86Mac : kX86Mac12;
 }
 
 } // namespace rgfx_profile

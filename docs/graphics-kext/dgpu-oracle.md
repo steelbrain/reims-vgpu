@@ -456,7 +456,7 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 | sparse tile sizes | 0x0x0 | n/r | 64x64 and up | 64x64 and up |
 | families | Mac2, Common1-3, Metal3; no Apple | the same | Apple1-9, Metal4 too | as AMD |
 | `supportsFeatureSet:(10002)` | 1 | 0 | 0 | 0 |
-| `featureProfile` (SPI) | 10002 | 10002 | 10 | 10, the M3's (Q11); 10001 where the guest's Metal has no limits for 10 (macOS 11 and 12) |
+| `featureProfile` (SPI) | 10002 | 10002 | 10 | 10002, the x86 Macs' (Q11); 10001 where the guest's Metal lacks the MTLArchitecture class (macOS 11 and 12) |
 | `heapTextureSizeAndAlign` alignment | 65536 | 4096 | 128 | |
 
 Formats (`F` lines): both x86 GPUs make every uncompressed color format but B5G6R5, A1BGR5,
@@ -534,15 +534,17 @@ host's platform refused, and every later command buffer naming it faulted, so it
 stopped (boot ro1-p2, 11-02); answering 10 it asked for none (ro1-p1 and its control). Core Image made no texture over a buffer by any of the three forms, under 10 or 10002,
 for blurs, scales and renders to a texture on the AMD and the Intel GPU. WindowServer on the
 oracle cannot be traced, being protected, so which framework reads the profile for it is not
-measured. The lane keeps the host's answer, 10 on every host so far *(class 2: the cheapest)*;
-the frontend makes the same bytes under either (Q10).
+measured. The lane answers the x86 Macs' 10002 on every host *(class 2)*, since the host makes
+the levels; the frontend makes the same bytes under either (Q10).
 
 Rechecked on 26.7.2 over the Vulkan platform (a Radeon 780M, boots 7395 and its control 7407,
 11-07), one variable apart: answering 10002, WindowServer asked for a tiled texture over a buffer
 of 6 mipmap levels, which the device answered nil, and the desktop still composed; answering 10,
-it asked for none. The request is still there, so 26 keeps 10. Where the guest's Metal has no
-limits for 10 (macOS 11 and 12, whose Metal ends WindowServer at device creation under it), the
-device answers 10001, the profile both of 12's x86 GPU drivers answer (RgfxFeatureProfile.hpp).
+it asked for none. With the host making the levels (boot 7666, 11-08, a 780M), WindowServer's
+6-level texture was made and 26.7.2 composed its desktop under 10002, so the device answers 10002
+where the guest's Metal has the MTLArchitecture class. Where it lacks it (macOS 11 and 12, whose
+Metal ends WindowServer at device creation under 10), the device answers 10001, the profile both
+of 12's x86 GPU drivers answer (RgfxFeatureProfile.hpp).
 
 **Types and arrays over a buffer.** Probes: `oracle_storage DEVICE lintypes FORM:TYPE`, a texture
 of one `MTLTextureType` over a Shared buffer at offset 0, rows 256 bytes apart, 64 x 4 BGRA8 (64

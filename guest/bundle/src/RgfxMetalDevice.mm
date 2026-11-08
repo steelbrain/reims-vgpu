@@ -1625,22 +1625,20 @@ RGFX_LOG_UNRECOGNIZED
 // SkyLight, Core Image and MPS send these; each answers what Metal's device answers, measured
 // on the M3 Max (macOS 27), unless it says otherwise.
 
-// The host's answers, from the device info: its Metal device's own, or, where no Metal device
-// stands for its GPU, the M3 Max's (the Vulkan platform's), and 0 for a Metal device that does
-// not respond to one. Measured on the M3 Max (macOS 27): feature profile 10, FP configs 0xe
-// (half), 0x54 (single) and 0 (double), 40 cores. The feature profile is the host's only where
-// the guest's Metal knows it (RgfxFeatureProfile.hpp).
+// The feature profile is the x86 Macs' that the guest's Metal knows (RgfxFeatureProfile.hpp), on
+// every host. The others are the host's answers, from the device info: its Metal device's own,
+// or, where no Metal device stands for its GPU, the M3 Max's (the Vulkan platform's), and 0 for a
+// Metal device that does not respond to one. Measured on the M3 Max (macOS 27): FP configs 0xe
+// (half), 0x54 (single) and 0 (double), 40 cores.
 - (NSUInteger)featureProfile
 {
 	static const bool metalHasArchitecture = objc_getClass("MTLArchitecture") != Nil;
-	const uint64_t host = _caps.size(kRgfxSizeFeatureProfile);
-	const uint64_t profile = rgfx_profile::forGuest(host, metalHasArchitecture);
+	const uint64_t profile = rgfx_profile::forGuest(metalHasArchitecture);
 	static std::atomic<bool> logged{false};
 	if (!logged.exchange(true)) {
-		NSLog(@"RGFX: feature profile %llu: the host's is %llu, and the guest's Metal %s the "
-		      @"MTLArchitecture class (logged once a process)",
-		      (unsigned long long)profile, (unsigned long long)host,
-		      metalHasArchitecture ? "has" : "lacks");
+		NSLog(@"RGFX: feature profile %llu: the guest's Metal %s the MTLArchitecture class "
+		      @"(logged once a process)",
+		      (unsigned long long)profile, metalHasArchitecture ? "has" : "lacks");
 	}
 	return profile;
 }
