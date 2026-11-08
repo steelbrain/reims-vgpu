@@ -348,8 +348,10 @@ fn addr_of(at: NonNull<u8>) -> u64 {
 /// here), would fail there. A device
 /// imports such a view by its dma-bufs where it imports none by pointer (RADV), and refuses it
 /// where it pins the pointer's pages and imports no foreign dma-buf (NVIDIA's 615 driver, measured
-/// 2026-10-27, `super::vm`'s module docs, "Imports of views"). Nothing is learned where the view is
-/// not mapped through dma-bufs (udmabuf not the process's): no import then needs it.
+/// 2026-10-27, `super::vm`'s module docs, "Imports of views"). Either way the device is handed
+/// the guest's RAM then (`super::host_ram`). Nothing is learned where the view is not mapped
+/// through dma-bufs (udmabuf not the process's): no import then needs it, and the device takes no
+/// RAM.
 pub(crate) fn learn_view_imports(device: &rt::Device) {
     use crate::core::platform::os::vm::HostVm as _;
     if IMPORTS_NEED_FILES.load(Ordering::Relaxed) {
@@ -414,8 +416,10 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         if !through_dma_bufs {
             IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
             budget::warn_if_imports_short();
-            super::host_ram::device_needs_ram(device);
         }
+        // Either way the device copies by runs of the guest's RAM: one whose views are mapped
+        // from their files takes objects over the RAM too (`super::host_ram`).
+        super::host_ram::hand_ram_to(device);
     }
     let _ = vm.deallocate(view, length);
     let _ = vm.deallocate(src, length);

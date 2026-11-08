@@ -1,8 +1,9 @@
-//! The guest's RAM handed to a device whole, where the device takes no view of the guest's pages
-//! through dma-bufs (`super::import`'s `imports_need_files`, NVIDIA's 615 driver): the runtime
+//! The guest's RAM handed to a device whole. Where the device takes no view of the guest's pages
+//! through dma-bufs (`super::import`'s `imports_need_files`, NVIDIA's 615 driver), the runtime
 //! imports it itself, in chunks, as objects over it are made, and takes each no-copy object's
 //! pages as runs of that RAM ([`runs`]) instead of an import of the object's own view, so such an
-//! object takes no kernel mapping a page.
+//! object takes no kernel mapping a page. Where it takes views through dma-bufs (RADV), the RAM
+//! serves copies by runs alone: objects keep the imports of their own views.
 //!
 //! - **By pointer or as dma-bufs.** Where `/dev/udmabuf` opens, the RAM has a source of dma-bufs
 //!   of its pages ([`dma_bufs`]): udmabuf's, through the backing table, as a no-copy import's
@@ -13,22 +14,28 @@
 //!   by its pointer otherwise, and where the source refuses. Without udmabuf, by pointer alone.
 //!   **Measured** 2026-11-07, an x86-64 macOS 26 guest on the reims-vgpu device: CachyOS's
 //!   7.3.1 kernels answer `size_limit_mb` 2147483647 as they boot, and its 7.2.8 kernel the
-//!   default 64. Only the devices handed the RAM (below) use the source, and NVIDIA's driver
-//!   never asks it: on an RTX 5080 (7.2.8), whose held pointer imports cost a submission
-//!   nothing, the runtime took a 16 GiB guest's RAM by pointer, in 64 MiB chunks. A device that
-//!   takes views through dma-bufs (RADV) is not handed the RAM, as a chunk's dma-bufs pin its
-//!   pages, which then stay resident: handed the RAM, a Radeon 780M (RADV, 7.3.1) took a 16 GiB
-//!   guest's RAM in chunks of about 2.5 to 3 GiB, and 12.3 GiB of it was resident by the desktop
-//!   and at the end, where views alone kept 7.9 to 8.0 GiB by the desktop and 10.4 to 10.8 GiB at
-//!   the end.
+//!   default 64. NVIDIA's driver never asks the source: on an RTX 5080 (7.2.8), whose held
+//!   pointer imports cost a submission nothing, the runtime took a 16 GiB guest's RAM by
+//!   pointer, in 64 MiB chunks.
+//! - **Lists of runs.** With it, the RAM has a source of one dma-buf of a list of runs of its
+//!   pages ([`dma_bufs_of_runs`], `rt::HostRam::with_dma_buf_of_runs`), as many runs a list as
+//!   udmabuf's `list_limit` takes. The runtime calls it only for a copy by runs on a device whose
+//!   held imports cost every submission (RADV): the copy imports its own pages, in lists, held
+//!   until its command buffer completes, and the RAM's chunks are never imported. A chunk's
+//!   import would pin its pages, which then stay resident: before the lists, a Radeon 780M
+//!   (RADV, 7.3.1) handed the RAM took a 16 GiB guest's RAM in chunks of about 2.5 to 3 GiB for
+//!   its copies, and 12.3 GiB of it was resident by the desktop and at the end, where views alone
+//!   kept 7.9 to 8.0 GiB by the desktop and 10.4 to 10.8 GiB at the end.
 //!
 //! - **What is handed.** Each lease's ranges of the guest's RAM (`super::files`'s
 //!   `lease_guest_memory`): the host's own shared mappings of the files it named, writable, mapped
 //!   while the lease lives. Nothing else: read-only memory, files of zeros, twins and the library's
 //!   own memory answer no runs, and keep the imports they have.
-//! - **To whom.** Every device that needs imported pages mapped from their files, as each such
-//!   device is learned ([`device_needs_ram`]) and as each lease is made ([`lease`]): a device made
-//!   after a lease gets its RAM then, and a lease made after the device gets it at once.
+//! - **To whom.** Every device whose imports of views were learned (`super::import`'s
+//!   `learn_view_imports`), as each is learned ([`hand_ram_to`]) and as each lease is made
+//!   ([`lease`]): a device made after a lease gets its RAM then, and a lease made after the device
+//!   gets it at once. One that takes views through dma-bufs takes the RAM where udmabuf opens
+//!   alone, as its views do, so its copies by runs always have the source of lists.
 //! - **For how long.** A device's use of a lease's RAM goes with the lease ([`LeasedRam`]'s drop),
 //!   which drops after core's teardown released every object over the RAM; the runtime frees the
 //!   RAM's imports once no command buffer holds them.
@@ -108,9 +115,9 @@ pub(crate) fn lease(ranges: &[(u64, u64)]) -> Arc<LeasedRam> {
     ram
 }
 
-/// Hands `device`, which needs imported pages mapped from their files, every lease's RAM alive
-/// now, and every one made after.
-pub(crate) fn device_needs_ram(device: &rt::Device) {
+/// Hands `device`, whose imports of views were learned (`super::import`'s `learn_view_imports`),
+/// every lease's RAM alive now, and every one made after.
+pub(crate) fn hand_ram_to(device: &rt::Device) {
     let leases: Vec<Arc<LeasedRam>> = {
         let mut registry = REGISTRY.lock();
         registry.devices.push(device.clone());
@@ -147,12 +154,55 @@ fn runtime_ram(ranges: &[(u64, u64)]) -> Option<rt::HostRam> {
             return None;
         }
     };
-    Some(match dma_bufs() {
-        Some(source) => {
-            (ram.with_dma_buf(source)).with_largest_dma_buf(super::dma_buf::limits().bytes)
+    Some(match (dma_bufs(), dma_bufs_of_runs()) {
+        (Some(source), Some(lists)) => {
+            let limits = super::dma_buf::limits();
+            (ram.with_dma_buf(source))
+                .with_largest_dma_buf(limits.bytes)
+                .with_dma_buf_of_runs(lists, limits.pieces.try_into().unwrap_or(usize::MAX))
         }
-        None => ram,
+        _ => ram,
     })
+}
+
+/// The RAM's source of one dma-buf of a list of runs of its pages
+/// (`rt::HostRam::with_dma_buf_of_runs`), where `/dev/udmabuf` opens: each list answered by
+/// [`ram_dma_buf_of_runs`].
+fn dma_bufs_of_runs() -> Option<rt::DmaBufRunsSource> {
+    if !super::dma_buf::opens() {
+        return None;
+    }
+    let zeros = super::dma_buf::Zeros::default();
+    Some(Arc::new(move |requests: &[rt::DmaBufRequest]| {
+        let ranges: Vec<(u64, u64)> = (requests.iter())
+            .map(|r| (r.start.as_ptr().addr().to_u64(), r.length))
+            .collect();
+        ram_dma_buf_of_runs(&ranges, &zeros)
+    }))
+}
+
+/// The dma-buf [`dma_bufs_of_runs`]'s source answers for `ranges` of the RAM's pages, each a host
+/// address and a length, whole pages by address and apart: those pages one after another,
+/// resolved through the backing table (`super::dma_buf::of_ranges`). A refusal (a page the table
+/// resolves to no file, a limit, udmabuf's own) answers an error, which leaves the copy to what it
+/// takes without the source. The RAM's pages are never the block of zeros', so `zeros` stays
+/// empty.
+fn ram_dma_buf_of_runs(
+    ranges: &[(u64, u64)],
+    zeros: &super::dma_buf::Zeros,
+) -> std::io::Result<rt::DmaBufChunk> {
+    let length = ranges.iter().map(|&(_, n)| n).sum();
+    match super::dma_buf::of_ranges(ranges, zeros) {
+        Ok(fd) => Ok(rt::DmaBufChunk { fd, length }),
+        Err(refusal) => {
+            log::debug!(
+                target: "reims_vgpu_vulkan::os",
+                "no dma-buf of {} runs of the guest's RAM, {length:#x} bytes: {refusal}",
+                ranges.len()
+            );
+            Err(std::io::Error::other(refusal.to_string()))
+        }
+    }
 }
 
 /// The RAM's source of dma-bufs of its pages (`rt::HostRam::with_dma_buf`), where `/dev/udmabuf`
@@ -311,9 +361,9 @@ mod tests {
     /// Where the device needs imported pages mapped from their files (NVIDIA's), it uses the
     /// guest's RAM whole: a no-copy buffer over one run of it is bound in the RAM's chunk, which
     /// the device imports once, a second buffer in the chunk importing nothing more, and the GPU's
-    /// fill through each reaches the RAM. A device that takes views through dma-bufs is handed no
-    /// RAM, and its buffers import their pages as before. Either way the bytes are the GPU's. The
-    /// flag is the process's, which nextest runs this test alone in.
+    /// fill through each reaches the RAM. A device that takes views through dma-bufs is handed the
+    /// RAM for its copies by runs alone, and its buffers import their pages as before. Either way
+    /// the bytes are the GPU's. The flag is the process's, which nextest runs this test alone in.
     ///
     /// The runtime imports the chunk as the first object over it asks, where the RAM has a source
     /// of dma-bufs (`/dev/udmabuf` opens), or on its own thread ahead of every object, where it has
@@ -397,7 +447,7 @@ mod tests {
             }
             false => {
                 let made = (now.0 - before.0, now.1 - before.1, now.2 - before.2);
-                assert_eq!(made, (0, 0, 0), "no RAM handed");
+                assert_eq!(made, (0, 0, 0), "the RAM serves copies alone");
             }
         }
         let q = device.new_command_queue().unwrap();
@@ -1248,6 +1298,117 @@ mod tests {
         // SAFETY: the mappings made above, which nothing uses any more.
         unsafe {
             assert_eq!(libc::munmap(anonymous, (2 * MIB).to_usize()), 0);
+            assert_eq!(libc::munmap(start, length.to_usize()), 0);
+        }
+    }
+
+    /// The RAM's source of lists of runs ([`super::dma_bufs_of_runs`]) is there where
+    /// `/dev/udmabuf` opens, and answers a list of runs of the RAM's pages
+    /// ([`super::ram_dma_buf_of_runs`]) with one dma-buf of those pages one after another, its
+    /// length theirs: what the CPU wrote through the RAM reads through it, and what is written
+    /// through it reaches the RAM, in each run's own pages. A list with pages no file is behind
+    /// (anonymous memory, not the RAM's) is refused with an error, which leaves the copy to what
+    /// it takes without the source.
+    #[test]
+    fn the_rams_source_of_lists_answers_one_dma_buf_of_the_runs_in_order() {
+        let opens = super::super::dma_buf::opens();
+        assert_eq!(super::dma_bufs_of_runs().is_some(), opens);
+        if !opens {
+            eprintln!("skipped: /dev/udmabuf does not open on this host");
+            return;
+        }
+        let length = 8 * MIB;
+        let fd = memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, which the test unmaps after the lease and
+        // the dma-buf over it.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        let at = start.addr().to_u64();
+        let lease = lease_guest_memory([GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            fd,
+            offset: 0,
+        }]);
+        let ram =
+            |offset: u64| std::ptr::with_exposed_provenance_mut::<u8>((at + offset).to_usize());
+        // Three runs, by address and apart: pages 1 and 2, page 5, and the page 7 MiB in.
+        let runs = [
+            (at + PAGE, 2 * PAGE),
+            (at + 5 * PAGE, PAGE),
+            (at + 7 * MIB, PAGE),
+        ];
+        // SAFETY: bytes of the RAM, mapped readable and writable until the end of the test.
+        unsafe {
+            ram(PAGE + 3).write_volatile(0x11);
+            ram(5 * PAGE).write_volatile(0x22);
+            ram(7 * MIB + PAGE - 1).write_volatile(0x33);
+        }
+        let zeros = super::super::dma_buf::Zeros::default();
+        let chunk = super::ram_dma_buf_of_runs(&runs, &zeros).unwrap();
+        assert_eq!(chunk.length, 4 * PAGE, "the runs' pages, no more");
+        // SAFETY: a fresh shared mapping of the dma-buf, unmapped below.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                chunk.length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                chunk.fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+        let bytes = mapped.cast::<u8>();
+        // SAFETY: the dma-buf's mapping, four pages long; then a byte of the RAM, mapped readable.
+        unsafe {
+            assert_eq!(
+                bytes.add((PAGE + 3).to_usize()).read_volatile(),
+                0,
+                "page 2's"
+            );
+            assert_eq!(bytes.add(3).read_volatile(), 0x11, "page 1's, first");
+            assert_eq!(bytes.add((2 * PAGE).to_usize()).read_volatile(), 0x22);
+            assert_eq!(bytes.add((4 * PAGE - 1).to_usize()).read_volatile(), 0x33);
+            bytes.add((3 * PAGE + 8).to_usize()).write_volatile(0x44);
+            assert_eq!(libc::munmap(mapped, chunk.length.to_usize()), 0);
+            assert_eq!(
+                ram(7 * MIB + 8).read_volatile(),
+                0x44,
+                "into the last run's page"
+            );
+        }
+        // Anonymous memory is no file's: the source refuses a list with it.
+        // SAFETY: a fresh private anonymous mapping, unmapped below.
+        let anonymous = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                PAGE.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(anonymous, libc::MAP_FAILED);
+        let mut with = vec![(anonymous.addr().to_u64(), PAGE)];
+        with.extend_from_slice(&runs);
+        with.sort_unstable();
+        assert!(super::ram_dma_buf_of_runs(&with, &zeros).is_err());
+        drop((chunk, lease));
+        // SAFETY: the mappings made above, which nothing uses any more.
+        unsafe {
+            assert_eq!(libc::munmap(anonymous, PAGE.to_usize()), 0);
             assert_eq!(libc::munmap(start, length.to_usize()), 0);
         }
     }
