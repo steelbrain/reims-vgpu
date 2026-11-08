@@ -123,6 +123,11 @@ streams=(
 kvazaar_streams=(
   "kvz-720p-tiles|1280x720|60|testsrc2|--preset medium --gop 8 --level 4.1 --tiles 3x3"
   "kvz-720p-tiles-explicit|1280x720|60|testsrc2|--preset fast --gop 8 --level 4.1 --tiles-width-split 256,640,960 --tiles-height-split 128,512"
+  # Under the Main profiles' bounds (H.265 A.3.2 and A.3.3), which the
+  # codec crate takes but for columns under 128 (MIN_TILE_COLUMN_WIDTH):
+  # a column of 192 samples, then rows of 704 and 16.
+  "kvz-720p-tiles-narrow|1280x720|10|testsrc2|--preset fast --gop 8 --level 4.1 --tiles-width-split 256,448,960"
+  "kvz-720p-tiles-short|1280x720|10|testsrc2|--preset fast --gop 8 --level 4.1 --tiles-height-split 704"
   "kvz-1080p-tiles-slices|1920x1080|30|testsrc2|--preset fast --gop 8 --level 5.1 --tiles 2x2 --slices tiles"
   "kvz-1366x766-tiles|1366x766|30|testsrc2|--preset fast --gop 8 --level 4.1 --tiles 2x3 --slices tiles"
   "kvz-4k-tiles-slices|3840x2160|20|mandelbrot|--preset ultrafast --gop 8 --level 5.1 --tiles 4x4 --slices tiles"
@@ -303,15 +308,15 @@ bits_of() {
 # What the decoder refuses, cleanly, before any slice reaches the GPU:
 # x265's name|size|frames|bits|chroma|options, and kvazaar's
 # name|size|frames|source filter|options|what the refusal says. kvazaar
-# takes a tile column of 192 samples, which Main does not (H.265 A.3.2:
-# 256 at least), and the codec crate's PPS bounds refuse it.
+# takes tile columns of 64 samples, one CTB, which radeonsi decodes wrongly
+# with no error, and the codec crate refuses columns under 128.
 refusals=(
   "main422-10|640x360|10|10|422|--preset fast --profile main422-10"
   "main444-8|640x360|10|8|444|--preset fast --profile main444-8"
   "main12|640x360|10|12|420|--preset fast --profile main12"
 )
 kvazaar_refusals=(
-  "kvz-720p-tiles-narrow|1280x720|10|testsrc2|--preset fast --gop 8 --level 4.1 --tiles-width-split 256,448,960|ColumnWidthInLumaSamples is out of range"
+  "kvz-720p-tiles-col64|1280x720|10|testsrc2|--preset fast --gop 8 --level 5.1 --tiles-width-split 64,128,1216|ColumnWidthInLumaSamples is out of range"
 )
 # A stream whose pictures name more than 8 current references from its
 # tenth on, where va.h says the sets hold 8 at most and radeonsi decodes

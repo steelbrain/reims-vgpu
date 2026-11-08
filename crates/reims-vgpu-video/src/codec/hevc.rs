@@ -27,8 +27,8 @@ mod tests;
 
 pub use crate::codec::h264::{NalFormat, OutputOrder};
 pub use decoder::{
-    Accelerator, Decoder, Output, PictureParams, ReferencePicture, RpsMembership, SliceParams,
-    check_supported,
+    Accelerator, Decoder, MIN_TILE_COLUMN_WIDTH, Output, PictureParams, ReferencePicture,
+    RpsMembership, SliceParams, check_supported,
 };
 
 /// Why a stream could not be read or decoded.

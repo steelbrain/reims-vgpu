@@ -175,7 +175,7 @@ fn pps_values_past_what_their_sps_allows_are_refused() {
 }
 
 #[test]
-fn tiles_under_256_luma_samples_across_or_64_down_are_refused() {
+fn tile_columns_under_128_luma_samples_are_refused_and_rows_of_any_height_taken() {
     let sized = |width, height| SpsSpec {
         size: (width, height),
         ..SpsSpec::default()
@@ -184,21 +184,20 @@ fn tiles_under_256_luma_samples_across_or_64_down_are_refused() {
         tiles: Some((columns, rows)),
         ..PpsSpec::default()
     };
-    // CTBs of 16: 496 across is 31 CTBs, so two columns of 15 and 16, 240
-    // and 256 samples; 112 down is 7, so two rows of 3 and 4, 48 and 64.
+    // CTBs of 16: 240 across is 15 CTBs, so two columns of 7 and 8, 112
+    // and 128 samples; 256 is two of 128; 496 is two of 240 and 256, under
+    // the Main profiles' 256 (A.3.2). 112 down is two rows of 48 and 64,
+    // under their 64 (A.3.3), and 48 is three rows of 16.
     for (sps_spec, pps_spec, refusal) in [
         (
-            sized(496, 128),
+            sized(240, 128),
             tiles(2, 1),
             out_of_range("ColumnWidthInLumaSamples"),
         ),
-        (sized(512, 128), tiles(2, 1), None),
-        (
-            sized(512, 112),
-            tiles(1, 2),
-            out_of_range("RowHeightInLumaSamples"),
-        ),
-        (sized(512, 128), tiles(1, 2), None),
+        (sized(256, 128), tiles(2, 1), None),
+        (sized(496, 128), tiles(2, 1), None),
+        (sized(512, 112), tiles(1, 2), None),
+        (sized(512, 48), tiles(1, 3), None),
         (sized(512, 128), tiles(2, 2), None),
     ] {
         let decoded = usize::from(refusal.is_none());

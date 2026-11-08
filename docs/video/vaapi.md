@@ -889,6 +889,15 @@ are refused with `OutOfRange`, or the variant that names what they break
 (`TooManyReferences`, `OverlappingSliceSegments` and the like), as bad
 data.
 
+A PPS with a tile column narrower than `MIN_TILE_COLUMN_WIDTH`, 128 luma
+samples, is refused with `OutOfRange("ColumnWidthInLumaSamples")`. Main
+allows none under 256, nor rows under 64 (H.265 A.3.2 to A.3.4); the
+hardware decodes columns of 128 and 192 and rows of 16 on every frame, and
+radeonsi decodes a column of one CTB of 64 wrongly with no error
+(kvazaar's streams on a Radeon 780M, an Iris Xe and an x86-64 Mac's Intel
+and AMD GPUs, 2026-11-08; the constant's doc). Rows of any height are
+taken.
+
 A picture whose current reference sets hold more than 8 pictures together
 is refused by the VA accelerator with `Error::Unsupported`, before any of
 it reaches the driver: va.h says `NumPocTotalCurr` "should be equal to or
@@ -1378,9 +1387,11 @@ set, and every frame's MD5 over packed NV12 or P010 must match. Then:
   24 frames;
 - a switch from Main 720p to Main 10 1080p at an IDR picture, mid-stream;
 - Main 4:2:2 10, Main 4:4:4 and Main 12, which must be refused;
-- kvazaar's kvz-720p-tiles-narrow, whose tile column of 192 samples Main
-  does not allow (H.265 A.3.2: 256 at least), which the PPS's bounds must
-  refuse;
+- kvazaar's kvz-720p-tiles-narrow and kvz-720p-tiles-short, whose tile
+  column of 192 samples and row of 16 Main does not allow (H.265 A.3.2 and
+  A.3.3: 256 and 64 at least), which must match on every frame;
+- kvazaar's kvz-720p-tiles-col64, whose tile columns of 64 samples the
+  decoder's bound ("What it refuses") must refuse at its PPS;
 - kvazaar's kvz-720p-ref15, whose tenth picture names 9 current
   references ("The HEVC decoder", "What it refuses"): its first 9 frames
   must match, and that picture must be refused before it reaches the GPU.

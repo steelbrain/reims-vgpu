@@ -806,29 +806,39 @@ fn check_pps_supported(pps: &Pps, sps: &Sps) -> Result<(), Error> {
     if u32::from(pps.log2_parallel_merge_level_minus2) + 2 > sps.ctb_log2_size() {
         return Err(Error::OutOfRange("log2_parallel_merge_level_minus2"));
     }
-    // A.3.2 to A.3.4: tiles of 256 luma samples across and 64 down at
-    // least, in the Main profiles.
+    // Tile columns of [`MIN_TILE_COLUMN_WIDTH`] luma samples across at
+    // least; rows of any height.
     if pps.tiles_enabled_flag {
         let ctb = 1u32 << sps.ctb_log2_size();
-        // A size whose samples pass 32 bits is past either bound.
-        let below = |ctbs: u32, bound: u32| ctbs.checked_mul(ctb).is_some_and(|size| size < bound);
-        if pps
-            .column_widths(sps)?
-            .iter()
-            .any(|&width| below(width, 256))
-        {
+        // A width whose samples pass 32 bits is past the bound.
+        if pps.column_widths(sps)?.iter().any(|&width| {
+            width
+                .checked_mul(ctb)
+                .is_some_and(|size| size < MIN_TILE_COLUMN_WIDTH)
+        }) {
             return Err(Error::OutOfRange("ColumnWidthInLumaSamples"));
-        }
-        if pps
-            .row_heights(sps)?
-            .iter()
-            .any(|&height| below(height, 64))
-        {
-            return Err(Error::OutOfRange("RowHeightInLumaSamples"));
         }
     }
     Ok(())
 }
+
+/// The narrowest tile column [`Decoder`] takes, in luma samples
+/// (`ColumnWidthInLumaSamples`, a column's CTBs times their size), below
+/// the 256 the Main profiles allow (A.3.2), and the tile rows of any height
+/// below their 64 (A.3.3), as the hardware decodes them. kvazaar 2.3.2's
+/// streams of CTBs of 64 with columns of 128 and 192 samples and rows of 16
+/// and 64 decoded to every frame of ffmpeg's decode, which kvazaar's MD5
+/// SEI and its reconstruction confirmed, on radeonsi (a Radeon 780M, Mesa
+/// 26.2.6), iHD (an Iris Xe, intel-media-driver 26.3.5) and NVDEC (an RTX
+/// 5080 Laptop GPU, driver 615.71.09), and on Apple's decoders of an x86-64
+/// Mac (macOS 26.7.1: an Intel UHD 630, and AMD's driver on a Radeon Pro
+/// 5300M); columns of 64, one CTB, came out wrong on every frame, with no
+/// error, on radeonsi and on AMD's driver, and right on iHD, NVDEC and the
+/// Intel GPU (**measured**, 2026-11-08). No API reports the
+/// bound, so it is the same on every driver. The reims-graphics device
+/// gives it to the guest, whose video driver refuses a narrower column
+/// before it schedules the picture.
+pub const MIN_TILE_COLUMN_WIDTH: u32 = 128;
 
 #[cfg(test)]
 mod tests {
