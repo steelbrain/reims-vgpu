@@ -149,12 +149,14 @@ pub(crate) const NV_ENC_LEVEL_AUTOSELECT: u32 = 0;
 pub(crate) mod caps {
     use super::NV_ENC_CAPS;
     pub(crate) const NUM_MAX_BFRAMES: NV_ENC_CAPS = 0;
+    pub(crate) const SUPPORTED_RATECONTROL_MODES: NV_ENC_CAPS = 1;
     pub(crate) const SUPPORT_CABAC: NV_ENC_CAPS = 7;
     pub(crate) const WIDTH_MAX: NV_ENC_CAPS = 16;
     pub(crate) const HEIGHT_MAX: NV_ENC_CAPS = 17;
     pub(crate) const SUPPORT_10BIT_ENCODE: NV_ENC_CAPS = 39;
     pub(crate) const WIDTH_MIN: NV_ENC_CAPS = 45;
     pub(crate) const HEIGHT_MIN: NV_ENC_CAPS = 46;
+    pub(crate) const SUPPORT_MULTIPLE_REF_FRAMES: NV_ENC_CAPS = 47;
 }
 
 /// `NV_ENC_CAPS`' names without their `NV_ENC_CAPS_` prefix, by value,

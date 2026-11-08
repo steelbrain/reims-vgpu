@@ -650,6 +650,10 @@ fn nvenc_checks(checks: &mut Checks) {
             enc::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED,
         ),
         ("NV_ENC_CAPS_NUM_MAX_BFRAMES", enc::caps::NUM_MAX_BFRAMES),
+        (
+            "NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES",
+            enc::caps::SUPPORTED_RATECONTROL_MODES,
+        ),
         ("NV_ENC_CAPS_SUPPORT_CABAC", enc::caps::SUPPORT_CABAC),
         ("NV_ENC_CAPS_WIDTH_MAX", enc::caps::WIDTH_MAX),
         ("NV_ENC_CAPS_HEIGHT_MAX", enc::caps::HEIGHT_MAX),
@@ -659,6 +663,10 @@ fn nvenc_checks(checks: &mut Checks) {
         ),
         ("NV_ENC_CAPS_WIDTH_MIN", enc::caps::WIDTH_MIN),
         ("NV_ENC_CAPS_HEIGHT_MIN", enc::caps::HEIGHT_MIN),
+        (
+            "NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES",
+            enc::caps::SUPPORT_MULTIPLE_REF_FRAMES,
+        ),
     ] {
         checks.constant(name, value.into());
     }

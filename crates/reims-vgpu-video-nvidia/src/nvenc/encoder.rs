@@ -456,7 +456,21 @@ pub struct EncodeProfileSupport {
     /// The most B pictures in a row (`NV_ENC_CAPS_NUM_MAX_BFRAMES`); 0 for
     /// none, and always 0 for H.264 Baseline.
     pub max_b_frames: u32,
+    /// Whether NVENC holds a stream to a constant bitrate
+    /// (`NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES` lists CBR). A constant QP
+    /// is the mode numbered 0, which the mask cannot list: it is always
+    /// taken.
+    pub constant_bit_rate: bool,
+    /// Whether it holds one to a variable bitrate (the mask lists VBR).
+    pub variable_bit_rate: bool,
+    /// The most frames a picture references: 7, the most `numRefL0` names
+    /// (`NV_ENC_NUM_REF_FRAMES_7`), where NVENC takes several
+    /// (`NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES`); 1 where it does not.
+    pub max_references: u32,
 }
+
+/// The most reference frames `numRefL0` names (`NV_ENC_NUM_REF_FRAMES_7`).
+const MOST_REFERENCES: u32 = 7;
 
 /// The profiles NVENC on `gpu` encodes, as its session lists them: each
 /// codec's profile GUIDs, with 10 bits only where the codec's caps say so.
@@ -486,6 +500,8 @@ pub fn encode_profiles(gpu: Arc<Gpu>) -> Result<Vec<EncodeProfileSupport>, Error
         if profile.bit_depth() > 8 && cap(ffi::caps::SUPPORT_10BIT_ENCODE)? == 0 {
             continue;
         }
+        // The modes' own values, bits past CONSTQP's 0, ORed.
+        let rate_modes = cap(ffi::caps::SUPPORTED_RATECONTROL_MODES)?;
         supported.push(EncodeProfileSupport {
             profile,
             min_width: cap(ffi::caps::WIDTH_MIN)?,
@@ -496,6 +512,13 @@ pub fn encode_profiles(gpu: Arc<Gpu>) -> Result<Vec<EncodeProfileSupport>, Error
                 cap(ffi::caps::NUM_MAX_BFRAMES)?
             } else {
                 0
+            },
+            constant_bit_rate: rate_modes & ffi::NV_ENC_PARAMS_RC_CBR.cast_unsigned() != 0,
+            variable_bit_rate: rate_modes & ffi::NV_ENC_PARAMS_RC_VBR.cast_unsigned() != 0,
+            max_references: if cap(ffi::caps::SUPPORT_MULTIPLE_REF_FRAMES)? != 0 {
+                MOST_REFERENCES
+            } else {
+                1
             },
         });
     }
