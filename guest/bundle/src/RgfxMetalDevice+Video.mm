@@ -404,6 +404,21 @@ int rgfx::video::tokenStatus(void *token)
 	}
 }
 
+int rgfx::video::waitToken(void *token)
+{
+	if (token == nullptr)
+		return -1;
+	[(__bridge id<MTLCommandBuffer>)token waitUntilCompleted];
+	return tokenStatus(token) == 1 ? 1 : -1;
+}
+
+void *rgfx::video::retainToken(void *token)
+{
+	if (token != nullptr)
+		CFRetain(token);
+	return token;
+}
+
 void rgfx::video::releaseToken(void *token)
 {
 	if (token != nullptr)

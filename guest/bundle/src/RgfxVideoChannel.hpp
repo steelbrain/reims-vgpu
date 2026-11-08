@@ -93,6 +93,12 @@ void *decode(Session *session, const Decode &decode);
 /// Where the work `token` names is: 0 running, 1 done, -1 failed.
 int tokenStatus(void *token);
 
+/// Waits until the work `token` names is done, and says how it went: 1 done, -1 failed.
+int waitToken(void *token);
+
+/// Holds `token` once more, until a releaseToken of it: `token` (null: nothing).
+void *retainToken(void *token);
+
 /// Lets go of `token` (null: nothing).
 void releaseToken(void *token);
 

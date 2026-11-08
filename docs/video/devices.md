@@ -67,9 +67,9 @@ The guest's video driver checks an HEVC picture against these before it schedule
 entry's, whose PPS has a tile column narrower than `decode`'s, or whose first slice segment's
 header names more current references than `max_references` fails its schedule, and VideoToolbox
 reports `kVTVideoDecoderMalfunctionErr` for it and every picture after it. Sent, the host would
-refuse it, and AppleGVA would take it and the next picture for decoded ([bugs.md](bugs.md),
-D25). AppleGVA's H.264 decoder delivers a picture whose schedule failed, so H.264 has no such
-check.
+refuse it after it took it, and the schedule would fail only once the host's verdict came back.
+AppleGVA's H.264 decoder delivers a picture whose schedule failed, so H.264 has no such check
+([bugs.md](bugs.md), D25).
 
 ## Sessions
 
@@ -101,8 +101,9 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   waits for the picture, as for any GPU write.
 - **A picture that fails to land** still signals its value, and the command buffer completes
   failed, with Metal's internal error. The guest's video driver answers that as a decode error:
-  the session's next schedule fails (`kVTVideoDecoderMalfunctionErr`, design.md, "A decode the
-  driver cannot complete is a decode error").
+  an HEVC picture's schedule waits for its verdict and fails (`kVTVideoDecoderMalfunctionErr`,
+  design.md, "A decode the driver cannot complete is a decode error"); an H.264 picture reaches
+  the guest as decoded, as AppleGVA's H.264 decoder reports no failure ([bugs.md](bugs.md), D25).
 - **A picture the stream's random access skips** lands nothing, and its command buffer
   completes as any other.
 

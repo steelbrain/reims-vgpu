@@ -306,6 +306,16 @@ void *decode(Session *, const Decode &d)
 	return &g_work;
 }
 int tokenStatus(void *) { return 1; }
+// The host's verdict on each decode a schedule waits for, and how many verdicts schedules waited
+// for since a check cleared the count.
+int g_verdict = 1;
+int g_waits;
+int waitToken(void *)
+{
+	g_waits++;
+	return g_verdict;
+}
+void *retainToken(void *token) { return token; }
 void releaseToken(void *) {}
 
 } // namespace rgfx::video
@@ -847,6 +857,48 @@ void checkHostBounds()
 	CFRelease(surface);
 }
 
+// The schedule of an HEVC picture waits for the host's verdict on it, and fails where the host
+// failed it, the one failure AppleGVA's HEVC decoder reports for the picture itself
+// (RgfxVideoStatus.hpp): a picture the host decodes is scheduled, one it fails is not, and the
+// session's next picture is scheduled again; each was sent, and its verdict waited for once.
+void checkHostVerdict()
+{
+	g_opened.clear();
+	std::vector<void *> contexts;
+	CHECK(makeContexts(1, contexts, kCodecHevc) == kOk, "a create of one HEVC decode");
+	const uint64_t bitstream = allocate(g_driver, 0, 0x10000);
+	CHECK(bitstream != 0, "the bitstream pool refused");
+	std::memset((void *)bitstream, 0x5a, 0x100);
+	IOSurfaceRef surface = canvas(1280, 720);
+	static rgfx::video::h265::Sps sps;
+	static rgfx::video::h265::Pps pps;
+	sps = {};
+	pps = {};
+	sps.chroma_format_idc = 1;
+	sps.log2_diff_max_min_luma_coding_block_size = 3; // CTBs of 64
+	sps.pic_width_in_luma_samples = 1280;
+	sps.pic_height_in_luma_samples = 720;
+	auto schedule = [&](int verdict) {
+		g_verdict = verdict;
+		g_waits = 0;
+		g_sent.clear();
+		const uint64_t answer = scheduleHevc(contexts[0], HevcPicture(surface, sps, pps, 0, 0, 0x100));
+		CHECK(g_sent.size() == 1 && g_waits == 1, "%zu decodes sent and %d verdicts waited for",
+		      g_sent.size(), g_waits);
+		return answer;
+	};
+	CHECK(schedule(1) == kOk, "a picture the host decoded not scheduled");
+	CHECK(schedule(-1) == kNotSent, "a picture the host failed scheduled");
+	CHECK(schedule(1) == kOk, "the picture after a failed one not scheduled");
+	g_verdict = 1;
+
+	ContextDelete del = {1, 0, &contexts[0]};
+	CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+	CHECK(callOn(g_driver, kFreeBitstreamBufferPool, (const void *)0) == kOk,
+	      "FreeBitstreamBufferPool");
+	CFRelease(surface);
+}
+
 // An HEVC picture's frame describes its surface where its release lays the description out
 // (hevcOutputSurface): the driver searches the frame for the one layout, of fields of 4 or 8 bytes
 // from +0x60 to +0xa0, that names its surface, and its session keeps the layout its first picture
@@ -1225,7 +1277,8 @@ void checkNoZeroAnswers()
 // A session's H.264 pictures are read in the one layout of AppleGVA's parsed SPS in which the
 // first describes its picture, 11's or 12's, and their SPS is sent as the stream holds it; a
 // later picture in the other layout, a record that fits neither, and a surface the SPS's size
-// does not round up to are refused, and nothing of them reaches the host.
+// does not round up to are refused, and nothing of them reaches the host. A picture the host
+// fails is scheduled, its schedule waiting for no verdict.
 void checkH264SpsLayouts()
 {
 	using namespace rgfx::video::h264;
@@ -1294,6 +1347,13 @@ void checkH264SpsLayouts()
 	refused(third, neither, "a record fitting no layout");
 	refused(third, tooNarrow, "a surface a macroblock narrower than the SPS's size");
 	lands(third, on12, "12's record after two refused");
+	// AppleGVA's H.264 decoder reports no failed schedule, so a schedule waits for no verdict of
+	// the host's (RgfxVideoStatus.hpp).
+	g_verdict = -1;
+	g_waits = 0;
+	lands(third, on12, "a picture the host fails");
+	CHECK(g_waits == 0, "an H.264 schedule waited for %d verdicts of the host's", g_waits);
+	g_verdict = 1;
 	finish(third);
 	CFRelease(surface);
 	CFRelease(narrower);
@@ -1312,6 +1372,7 @@ int main()
 	checkUnsentDecode();
 	checkTileLanding();
 	checkHostBounds();
+	checkHostVerdict();
 	checkFrameDescriptions();
 	checkH264SpsLayouts();
 	checkNoZeroAnswers();

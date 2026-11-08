@@ -477,8 +477,6 @@ struct Context {
 	uint32_t height;
 	rgfx::video::Session *session;
 	std::vector<uint8_t> sent;
-	// A decode of the session's failed on the host since its last failed schedule.
-	std::atomic<bool> failed_on_host{false};
 	// Where its HEVC pictures' frame records describe their surfaces, once a picture's has shown
 	// it (FrameDescription::packed), and 0 until then.
 	std::atomic<uint32_t> hevc_description{0};
@@ -572,8 +570,6 @@ void freePool(BitstreamBuffers &b)
 struct Token {
 	uint64_t seqno;
 	void *work;
-	bool failed;      // not sent, or answered failed on the host
-	Context *context; // its decode's session, or null
 };
 constexpr size_t kTokens = 1024;
 std::mutex g_tokenLock;
@@ -606,8 +602,7 @@ uint32_t bitstreamAlignment(uint64_t sub)
 // plane's pitch and size stay within 32 bits.
 constexpr uint32_t kMaxFrameSide = 16384;
 
-// Deletes `context`: its session closed and out of the live ones, and no token naming it, so a
-// later context at its address is never taken for it.
+// Deletes `context`: its session closed and out of the live ones.
 void deleteContext(Context *context)
 {
 	if (context && context->session) {
@@ -618,12 +613,6 @@ void deleteContext(Context *context)
 					g_sessions.erase(it);
 					break;
 				}
-		}
-		{
-			std::lock_guard<std::mutex> hold(g_tokenLock);
-			for (Token &t : g_tokens)
-				if (t.context == context)
-					t.context = nullptr;
 		}
 		rgfx::video::closeSession(context->session);
 	}
@@ -1280,28 +1269,39 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		TokenList *tl = (TokenList *)a2;
 		if (!cl || !tl || cl->count != tl->count || !tl->tokens)
 			return kBadArgument;
-		// One list at a time, so pictures reach their sessions in AppleGVA's order.
-		std::lock_guard<std::mutex> hold(g_scheduleLock);
-		for (uint32_t i = 0; i < cl->count; i++) {
-			const Command *decode = decodeCommand(cl->commands[i]);
-			Context *context = decode ? (Context *)decode->context : nullptr;
-			// A failure on the host since this session's last failed schedule fails this one,
-			// as AppleGVA hears of no failure at its query (RgfxVideoStatus.hpp).
-			const bool hostFailed = context && context->failed_on_host.exchange(false);
-			void *work = decode && !hostFailed ? decodePicture(decode) : nullptr;
-			{
-				std::lock_guard<std::mutex> tokens(g_tokenLock);
-				const uint64_t n = g_seqno++;
-				Token *t = &g_tokens[n % kTokens];
-				rgfx::video::releaseToken(t->work);
-				*t = {n, work, decode && !work, context};
-				tl->tokens[i] = t;
+		// The work of the list's HEVC decodes, held for the schedule to wait on its verdict
+		// (RgfxVideoStatus.hpp).
+		std::vector<void *> verdicts;
+		bool sent = true;
+		{
+			// One list at a time, so pictures reach their sessions in AppleGVA's order.
+			std::lock_guard<std::mutex> hold(g_scheduleLock);
+			for (uint32_t i = 0; i < cl->count && sent; i++) {
+				const Command *decode = decodeCommand(cl->commands[i]);
+				const Context *context = decode ? (const Context *)decode->context : nullptr;
+				void *work = decode ? decodePicture(decode) : nullptr;
+				{
+					std::lock_guard<std::mutex> tokens(g_tokenLock);
+					const uint64_t n = g_seqno++;
+					Token *t = &g_tokens[n % kTokens];
+					rgfx::video::releaseToken(t->work);
+					*t = {n, work};
+					tl->tokens[i] = t;
+				}
+				sent = !decode || work;
+				if (work && context && rgfx::video::waitsForHost(context->sub_id == kCodecHevc))
+					verdicts.push_back(rgfx::video::retainToken(work));
 			}
-			if (decode && rgfx::video::scheduleFails(work != nullptr, hostFailed)) {
-				scheduleFailed(hostFailed ? "an earlier decode of its session failed on the host"
-				                          : "the driver could not send it");
-				return rgfx::video::kNotSent;
-			}
+		}
+		// Out of the lock, so other sessions' pictures go to the host meanwhile.
+		bool hostFailed = false;
+		for (void *work : verdicts) {
+			hostFailed = rgfx::video::waitToken(work) == -1 || hostFailed;
+			rgfx::video::releaseToken(work);
+		}
+		if (rgfx::video::scheduleFails(sent, hostFailed)) {
+			scheduleFailed(sent ? "the host failed its decode" : "the driver could not send it");
+			return rgfx::video::kNotSent;
 		}
 		return kOk;
 	}
@@ -1309,7 +1309,6 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		QueryList *ql = (QueryList *)a1;
 		if (!ql || !ql->queries)
 			return kBadArgument;
-		std::vector<Context *> failed;
 		for (uint32_t i = 0; i < ql->count; i++) {
 			Query &q = ql->queries[i];
 			Token *t = (Token *)q.token;
@@ -1321,23 +1320,8 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 				rgfx::video::releaseToken(t->work);
 				t->work = nullptr;
 			}
-			const rgfx::video::QueryReport report = rgfx::video::queryReport(status);
-			if (report.hostFailed && !t->failed && t->context) {
-				t->failed = true;
-				if (rgfx::video::failsLaterSchedule(t->context->sub_id == kCodecHevc))
-					failed.push_back(t->context);
-			}
-			q.status = report.status;
+			q.status = rgfx::video::queryStatus(status);
 			q.field_14 = 0;
-		}
-		// The HEVC sessions of decodes that failed on the host, where they still are, fail their
-		// next schedule (RgfxVideoStatus.hpp).
-		if (!failed.empty()) {
-			std::lock_guard<std::mutex> hold(g_sessionLock);
-			for (Context *context : failed)
-				for (Context *open : g_sessions)
-					if (open == context)
-						context->failed_on_host = true;
 		}
 		return kOk;
 	}

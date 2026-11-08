@@ -117,9 +117,9 @@ pub fn cb_complete(
 /// the GPU times `gpu_start_ns` and `gpu_end_ns`, one of whose video decodes' pictures did not land
 /// (its planes refused, or a decode the hardware failed once it ran): Metal's internal error,
 /// with its code, as Metal reports a failure that fits none of its codes. The guest's video
-/// driver reads the failed buffer as a decode that failed on the host, and fails its session's
-/// next schedule (docs/graphics-kext/design.md, "A decode the driver cannot complete is a decode
-/// error").
+/// driver reads the failed buffer as a decode that failed on the host, and fails the schedule of
+/// an HEVC picture, which waits for it (docs/graphics-kext/design.md, "A decode the driver cannot
+/// complete is a decode error").
 pub fn cb_unlanded(
     cb_obj_id: u64,
     seqno: u64,

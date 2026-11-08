@@ -743,22 +743,26 @@ Stages:
     - **A decode the driver cannot complete is a decode error, never a silent
       success.** AppleGVA reports a decode error only when scheduling the
       command fails: a schedule that answers 5 reaches the client as
-      `kVTVideoDecoderMalfunctionErr` (-12911). It ignores every failure a
-      status query can answer, a detail word, a failed query call, and the
-      statuses 0 and 3 alike, and takes the picture for decoded (measured on
-      the guest with the RTX 5080). So a command the driver cannot resolve or
-      send (no output surface, refused parameter sets, no command buffer)
-      fails its own schedule, and logs one line. A failure the host reports
-      for a picture the driver sent is known only when the picture's status
-      is queried: the driver marks its session, and an HEVC session's next
-      schedule fails, the picture after the next being the first AppleGVA
-      reports, as it schedules one picture ahead of its queries
-      (`guest/bundle/src/RgfxVideoStatus.hpp`, `queryReport`, `scheduleFails`
-      and `failsLaterSchedule`). AppleGVA's H.264 decoder reports no failure,
-      neither a failed schedule nor any query answer tried, and a picture whose
-      schedule failed is not decoded at all, so an H.264 session's failures on
-      the host fail no schedule (measured on the guest with the RTX 5080,
-      2026-11-07). The host reports one as the
+      `kVTVideoDecoderMalfunctionErr` (-12911). It takes every query of a
+      decode for its completion, reading neither its status nor its error
+      word (read from AppleGVA's code on macOS 26.7.1), and a detail word, a
+      failed query call, and the statuses 0 and 3 alike deliver the picture
+      as decoded (measured on the guest with the RTX 5080). So a command the
+      driver cannot resolve or send (no output surface, refused parameter
+      sets, no command buffer) fails its own schedule, and logs one line. The
+      schedule of an HEVC picture the driver sent waits for the host's
+      verdict on it, out of the lock that orders the sessions' pictures, and
+      fails where the host failed it: AppleGVA reports the error from that
+      picture on, and no frame of it reaches the client
+      (`guest/bundle/src/RgfxVideoStatus.hpp`, `waitsForHost` and
+      `scheduleFails`). AppleGVA's H.264 decoder reports no failure, neither
+      a failed schedule nor any query answer tried, and a picture whose
+      schedule failed is not decoded at all (measured on the guest with the
+      RTX 5080, 2026-11-07); its pipelines schedule their commands one at a
+      time and keep no decode's result (read from its code). So an H.264
+      schedule waits for no verdict, and an H.264 picture the host fails
+      reaches the client as decoded ([D25](../video/bugs.md)). The host
+      reports a failure as the
       picture's command buffer failing: an op it cannot carry out faults the
       buffer, and a picture it took but could not land (its planes refused,
       or a decode the hardware failed once it ran) still signals the

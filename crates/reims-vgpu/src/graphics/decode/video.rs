@@ -15,8 +15,9 @@
 //! A picture the session fails to land after its decode was taken (its planes refused, or a
 //! decode the hardware failed once it ran) still signals its value, so the buffer completes; the
 //! buffer completes failed, Metal's internal error ([`Landed`]), which the guest's video driver
-//! answers as a decode error: the session's next schedule fails (`kVTVideoDecoderMalfunctionErr`,
-//! docs/graphics-kext/design.md, "A decode the driver cannot complete is a decode error").
+//! answers as a decode error: an HEVC picture's schedule, waiting for the buffer, fails
+//! (`kVTVideoDecoderMalfunctionErr`, docs/graphics-kext/design.md, "A decode the driver cannot
+//! complete is a decode error").
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
