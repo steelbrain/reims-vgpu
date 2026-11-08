@@ -1,12 +1,9 @@
 //! An x86-64 VM's OpenCore image: the Mac it presents, and making the VM a new one.
 //!
-//! reims-util makes a VM's image when the VM is made (reims_util.rs). A newer reims-util's
-//! image can carry what an older one's lacks, such as Lilu and ReimsVgpu.kext, which on macOS
-//! 26 let WindowServer run a display wider than 2048 pixels on apple-gfx and Chrome draw on the
-//! GPU (docs/qemu.md, "x86-64 macOS guests: displays wider than 2048 pixels"); and a VM on
-//! reims-vgpu's own GPU device needs the guest's kexts this reims-ctl carries
-//! ([`crate::prebuilt`]), which an image made for apple-gfx, or by an older reims-ctl, lacks or
-//! holds other builds of ([`missing_guest_kexts`]). [`renew`] replaces a VM's image with one the
+//! reims-util makes a VM's image when the VM is made (reims_util.rs). A VM on reims-vgpu's own
+//! GPU device needs the guest's kexts this reims-ctl carries ([`crate::prebuilt`]), which an
+//! image of the user's own, or one an older reims-ctl made, may lack or hold other builds of
+//! ([`missing_guest_kexts`]). [`renew`] replaces a VM's image with one the
 //! installed reims-util makes for the VM's graphics, presenting the same Mac, so macOS sees no
 //! new machine. reims-ctl keeps no copy of that identity: it is read from the old image's
 //! config.plist.
@@ -97,11 +94,6 @@ impl Config {
             .collect()
     }
 
-    /// Whether OpenCore loads ReimsVgpu.kext: an enabled entry of Kernel > Add names it.
-    pub fn loads_reims_vgpu(&self) -> bool {
-        self.loaded_kexts().contains(&"ReimsVgpu.kext")
-    }
-
     /// Whether OpenCore shows its boot picker at each start: Misc > Boot > ShowPicker. Hidden,
     /// it boots the default entry, macOS's startup disk.
     pub fn shows_picker(&self) -> bool {
@@ -123,22 +115,6 @@ pub fn shows_picker(vm: &Vm) -> Option<bool> {
     Config::read(&vm.path(&q.opencore), q.opencore_format)
         .ok()
         .map(|c| c.shows_picker())
-}
-
-/// What to tell of an x86-64 VM whose OpenCore image does not load ReimsVgpu.kext, made by an
-/// older reims-util; None where it does, or where the image cannot be read.
-pub fn missing_kext(vm: &Vm) -> Option<String> {
-    let q = vm.config.q35.as_ref()?;
-    let config = Config::read(&vm.path(&q.opencore), q.opencore_format).ok()?;
-    (!config.loads_reims_vgpu()).then(|| {
-        format!(
-            "Its OpenCore image has no ReimsVgpu.kext, which macOS 26 needs for a display wider \
-             than 2048 pixels (WindowServer crashes on one without it) and for GPU-accelerated \
-             Chrome. To make it a new image that has it, presenting the same Mac, press U in \
-             reims-ctl or run reims-ctl update-opencore {}.",
-            vm.name()
-        )
-    })
 }
 
 /// How an image holds the guest's kexts for reims-vgpu's own device.
@@ -349,12 +325,7 @@ pub fn renew(
         id.serial,
         if picker { "on" } else { "off" }
     );
-    if Config::read(&image, ImageFormat::Qcow2).is_ok_and(|c| !c.loads_reims_vgpu()) {
-        s.push_str(
-            "; the installed reims-util put no ReimsVgpu.kext in it: run reims-ctl update, \
-             which installs the reims-util it needs, and make it again",
-        );
-    } else if missing_guest_kexts(vm).is_some() {
+    if missing_guest_kexts(vm).is_some() {
         s.push_str(
             "; the installed reims-util did not put reims-vgpu's macOS drivers in it as given: \
              run reims-ctl update, which installs the reims-util it needs, and make it again",
@@ -991,7 +962,7 @@ pub(crate) mod tests {
     }
 
     /// The image of a VM is made for its graphics: on reims-vgpu with the guest's kexts the
-    /// tests carry, in their order, written to the data directory; on apple-gfx with none.
+    /// tests carry, in their order, written to the data directory; on VMware SVGA with none.
     #[test]
     fn renew_makes_the_image_for_the_vms_graphics() {
         use std::os::unix::fs::PermissionsExt;
@@ -1050,16 +1021,11 @@ pub(crate) mod tests {
         assert!(added[1].ends_with("/B.kext"), "{added:?}");
         let a = added[0].split(',').next().unwrap();
         assert!(Path::new(a).join("Contents/MacOS/A").is_file());
-        assert!(
-            !given
-                .iter()
-                .any(|a| ["--no-kexts", "--no-apv-arm64-port", "--no-video"].contains(a)),
-            "{given:?}"
-        );
+        assert!(!given.contains(&"--no-kexts"), "{given:?}");
         std::fs::copy(&made, dir.join("opencore.img")).unwrap();
         std::fs::write(
             dir.join(crate::vm::CONFIG_FILE),
-            config("graphics = \"apple-gfx\""),
+            config("graphics = \"vmware-svga\""),
         )
         .unwrap();
         let mut vm = Vm::load(&dir).unwrap();
@@ -1068,9 +1034,9 @@ pub(crate) mod tests {
         assert!(!given.contains("--add-kext"), "{given}");
     }
 
-    /// A VM on apple-gfx or VMware SVGA whose image loads a kext of the guest's set, as one made
-    /// for reims-vgpu does, has its image made for other graphics; one whose image loads none
-    /// does not. On reims-vgpu, an image lacking them is made for other graphics.
+    /// A VM on VMware SVGA whose image loads a kext of the guest's set, as one made for
+    /// reims-vgpu does, has its image made for other graphics; one whose image loads none does
+    /// not. On reims-vgpu, an image lacking them is made for other graphics.
     #[test]
     fn an_image_follows_the_graphics_by_the_guest_kexts_it_loads() {
         let env = crate::testenv::Env::new("follow");
@@ -1105,26 +1071,18 @@ pub(crate) mod tests {
         };
         let lilu = entry("Lilu.kext");
         let ours = lilu.clone() + &entry("A.kext") + &entry("B.kext");
-        for g in ["apple-gfx", "vmware-svga"] {
-            let v = vm(g, &ours);
-            assert!(
-                holds_unused_guest_kexts(&v) && made_for_other_graphics(&v),
-                "{g}"
-            );
-            let v = vm(g, &lilu);
-            assert!(
-                !holds_unused_guest_kexts(&v) && !made_for_other_graphics(&v),
-                "{g}"
-            );
-        }
+        let v = vm("vmware-svga", &ours);
+        assert!(holds_unused_guest_kexts(&v) && made_for_other_graphics(&v));
+        let v = vm("vmware-svga", &lilu);
+        assert!(!holds_unused_guest_kexts(&v) && !made_for_other_graphics(&v));
         let v = vm("reims-vgpu", &ours);
         assert!(!holds_unused_guest_kexts(&v));
         let v = vm("reims-vgpu", &lilu);
         assert!(!holds_unused_guest_kexts(&v) && made_for_other_graphics(&v));
     }
 
-    /// A start of a VM on apple-gfx whose image loads the guest's kexts, as one made for
-    /// reims-vgpu does, makes it a new image for apple-gfx, without them, first, telling of the
+    /// A start of a VM on VMware SVGA whose image loads the guest's kexts, as one made for
+    /// reims-vgpu does, makes it a new image for VMware SVGA, without them, first, telling of the
     /// AppleGVA setting they left in its guest; a start on reims-vgpu leaves an image lacking
     /// them be, which its warnings tell of.
     #[test]
@@ -1178,7 +1136,7 @@ pub(crate) mod tests {
         // Its guest keeps what RgfxGate wrote, which the new image's note tells of.
         crate::macos::tests::gva_disk(&dir.join("disk.img"));
         let mut v = vm(
-            "apple-gfx",
+            "vmware-svga",
             &(lilu.clone() + &entry("A.kext") + &entry("B.kext")),
         );
         let mut said = Vec::new();
@@ -1324,21 +1282,6 @@ pub(crate) mod tests {
                 rom: "525400010203".into(),
             }
         );
-    }
-
-    #[test]
-    fn reims_vgpu_loads_where_an_enabled_entry_names_it() {
-        let entry = |bundle: &str, enabled: bool| {
-            format!(
-                "<dict><key>BundlePath</key><string>{bundle}</string>\
-                 <key>Enabled</key><{enabled}/></dict>"
-            )
-        };
-        assert!(!config("").loads_reims_vgpu());
-        assert!(!config(&entry("ReimsVgpu.kext", false)).loads_reims_vgpu());
-        assert!(!config(&entry("Lilu.kext", true)).loads_reims_vgpu());
-        let both = entry("Lilu.kext", true) + &entry("ReimsVgpu.kext", true);
-        assert!(config(&both).loads_reims_vgpu());
     }
 
     #[test]

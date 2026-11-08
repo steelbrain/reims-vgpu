@@ -8,11 +8,8 @@
 //! needs an installer: one reims-util downloads from Apple (reims_util.rs), before the VM's
 //! directory is made, so a download stopped part way leaves no VM half made, or one given. An
 //! installer is used in place, except a DMG, which qemu-img converts to a raw image in the VM's
-//! directory ([`installer_media`]).
-//!
-//! An arm64 VM (`vmapple-arm64`) is one Virtualization.framework made: installed here from an
-//! IPSW (vz.rs), or imported from macosvm's or tart's directory (an APFS clone of its disk and
-//! auxiliary storage, or used in place).
+//! directory ([`installer_media`]). A VM's settings name its graphics: reims-vgpu's own device
+//! unless the create chose another.
 
 use crate::host::{Host, Profile};
 use crate::install;
@@ -56,7 +53,7 @@ pub struct Spec {
     pub cpus: Option<u32>,
     pub memory_mib: Option<u64>,
     pub disk: Option<DiskSource>,
-    /// The graphics device; none for the profile's default ([`Graphics::default_for`]).
+    /// The graphics device; none for the default, reims-vgpu's own.
     pub graphics: Option<Graphics>,
     pub display: Display,
     pub gpu: Gpu,
@@ -69,11 +66,6 @@ pub struct Spec {
     pub macos: Option<Download>,
     pub opencore: Option<PathBuf>,
     pub installer: Option<PathBuf>,
-    // vmapple
-    pub ipsw: Option<String>,
-    pub bundle: Option<PathBuf>,
-    pub bundle_mode: ImportMode,
-    pub ecid: Option<u64>,
 }
 
 impl Spec {
@@ -95,10 +87,6 @@ impl Spec {
             macos: None,
             opencore: None,
             installer: None,
-            ipsw: None,
-            bundle: None,
-            bundle_mode: ImportMode::Copy,
-            ecid: None,
         }
     }
 }
@@ -169,29 +157,16 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     }
     let profile = match spec.profile {
         Some(p) => p,
-        None => host
-            .default_profile()
-            .with_context(|| format!("reims-ctl runs no VMs on {host} yet"))?,
+        None => host.default_profile().context(crate::host::UNSUPPORTED)?,
     };
     if !Profile::supported_on(host).contains(&profile) {
-        bail!("{host} cannot run {profile} VMs");
+        bail!("{}", crate::host::UNSUPPORTED);
     }
-    let graphics = spec
-        .graphics
-        .unwrap_or_else(|| Graphics::default_for(profile));
-    if graphics == Graphics::ReimsVgpu {
-        if profile != Profile::Q35X86_64 {
-            bail!(
-                "reims-vgpu's own GPU device is for x86-64 VMs: an arm64 macOS guest drives only \
-                 apple-gfx"
-            );
-        }
-        let d = &spec.display;
-        check_reims_vgpu_display(Some(d.count), Some(&d.resolution), Some(d.hidpi), d.refresh)?;
-        // The image reims-util makes holds them.
-        if spec.opencore.is_none() {
-            crate::prebuilt::set()?;
-        }
+    let graphics = spec.graphics.unwrap_or_default();
+    spec.display.check()?;
+    // The image reims-util makes holds them.
+    if graphics == Graphics::ReimsVgpu && spec.opencore.is_none() {
+        crate::prebuilt::set()?;
     }
     let dir = spec.dir.clone().unwrap_or_else(|| default_dir(&spec.name));
     // Checked here, before a download, and again as the directory is taken, after it (claim).
@@ -207,73 +182,40 @@ pub fn create(spec: Spec, host: Host, progress: &mut dyn FnMut(&str)) -> Result<
     let mut spec = spec;
     // The macOS version, where an installer was downloaded for it.
     let mut macos = None;
-    // The macOS the VM will run, where reims-ctl knows it: the download's, or the given disk's.
-    let mut found = Vec::new();
-    if profile == Profile::Q35X86_64 {
-        if spec.macos.is_some() && spec.installer.is_some() {
-            bail!("give macOS to download or an installer, not both");
-        }
-        if let Some(i) = &spec.installer
-            && !i.exists()
-        {
-            bail!("the installer {} does not exist", i.display());
-        }
-        match &spec.opencore {
-            Some(oc) => {
-                own_firmware(oc)?;
-            }
-            // reims-util makes one, after the disk's copy.
-            None => {
-                reims_util::binary()?;
-            }
-        }
-        if spec.macos.is_none()
-            && spec.installer.is_none()
-            && matches!(spec.disk, Some(DiskSource::New { .. }))
-        {
-            bail!(
-                "a new disk needs macOS installed on it: give the macOS to download \
-                 (--macos tahoe), or an installer"
-            );
-        }
-        if let Some(d) = spec.macos.take() {
-            let i = reims_util::installer(&d, progress)?;
-            spec.installer = Some(i.image);
-            found.push(crate::macos::Macos {
-                version: i.version.clone(),
-                build: i.build,
-            });
-            macos = Some(i.version);
-        } else if let Some(DiskSource::Existing { path, .. }) = &spec.disk {
-            match ImageFormat::detect(path).and_then(|f| crate::macos::on_disk(path, f)) {
-                Ok(f) => found = f,
-                Err(e) => progress(&format!(
-                    "reims-ctl can't tell which macOS {} holds ({e:#}): it runs on {}",
-                    path.display(),
-                    graphics.id()
-                )),
-            }
-        }
-    } else if spec.macos.is_some() {
-        bail!("an arm64 VM installs macOS from an IPSW (--ipsw latest)");
+    if spec.macos.is_some() && spec.installer.is_some() {
+        bail!("give macOS to download or an installer, not both");
     }
-    // A VM whose settings name no graphics runs the device for its macOS, saved by name where
-    // reims-ctl knows the macOS, and otherwise decided at the first start that finds macOS on
-    // its disk (macos.rs).
-    let saved = match profile {
-        Profile::Q35X86_64 => spec.graphics.or_else(|| crate::macos::graphics_for(&found)),
-        Profile::VmappleArm64 => Some(graphics),
-    };
-    let graphics = saved.unwrap_or(graphics);
-    if let Some(note) =
-        crate::macos::create_note(&spec.name, &found, graphics, spec.graphics.is_some())
+    if let Some(i) = &spec.installer
+        && !i.exists()
     {
-        progress(&note);
+        bail!("the installer {} does not exist", i.display());
+    }
+    match &spec.opencore {
+        Some(oc) => {
+            own_firmware(oc)?;
+        }
+        // reims-util makes one, after the disk's copy.
+        None => {
+            reims_util::binary()?;
+        }
+    }
+    if spec.macos.is_none()
+        && spec.installer.is_none()
+        && matches!(spec.disk, Some(DiskSource::New { .. }))
+    {
+        bail!(
+            "a new disk needs macOS installed on it: give the macOS to download \
+             (--macos tahoe), or an installer"
+        );
+    }
+    if let Some(d) = spec.macos.take() {
+        let i = reims_util::installer(&d, progress)?;
+        spec.installer = Some(i.image);
+        macos = Some(i.version);
     }
     let made = claim(&dir)?;
     let result = match profile {
-        Profile::Q35X86_64 => make_q35(&spec, saved, graphics, &dir, macos.as_deref(), progress),
-        Profile::VmappleArm64 => make_vmapple(&spec, host, &dir, progress),
+        Profile::Q35X86_64 => make_q35(&spec, graphics, &dir, macos.as_deref(), progress),
     };
     let vm = match result {
         Ok(vm) => vm,
@@ -341,11 +283,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
         disk_format,
         stop_timeout_secs: 90,
         extra_args: vec![],
-        graphics: Some(
-            spec.graphics
-                .unwrap_or_else(|| Graphics::default_for(profile)),
-        ),
-        video_acceleration: true,
+        graphics: Some(spec.graphics.unwrap_or_default()),
         display: spec.display.clone(),
         gpu: spec.gpu.clone(),
         audio: Audio {
@@ -362,7 +300,6 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
             ..Logs::default()
         },
         q35: None,
-        vmapple: None,
         extra_env: BTreeMap::new(),
         usb: vec![],
     }
@@ -421,11 +358,9 @@ fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
     Ok(())
 }
 
-/// Makes an x86-64 VM on `graphics`, which its settings save as `saved`: none where they name
-/// no graphics.
+/// Makes an x86-64 VM on `graphics`, which its settings save by name.
 fn make_q35(
     spec: &Spec,
-    saved: Option<Graphics>,
     graphics: Graphics,
     dir: &Path,
     macos: Option<&str>,
@@ -494,7 +429,7 @@ fn make_q35(
         None => None,
     };
     let mut c = base_config(spec, Profile::Q35X86_64, disk, disk_format);
-    c.graphics = saved;
+    c.graphics = Some(graphics);
     c.network.mac = mac;
     c.q35 = Some(Q35 {
         opencore: oc_name,
@@ -643,203 +578,6 @@ fn own_firmware(opencore: &Path) -> Result<(PathBuf, PathBuf)> {
     })
 }
 
-fn make_vmapple(spec: &Spec, host: Host, dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Vm> {
-    if let Some(bundle) = &spec.bundle {
-        let b = Bundle::read(bundle)?;
-        let ecid = spec
-            .ecid
-            .or(b.ecid)
-            .context("the bundle's machine identifier was not found: give its ECID (--ecid)")?;
-        let (disk, aux) = match spec.bundle_mode {
-            ImportMode::InPlace => (b.disk.clone(), b.aux.clone()),
-            ImportMode::Copy => {
-                progress(
-                    "cloning the disk and auxiliary storage (APFS clones where the volume allows)",
-                );
-                copy_file(&b.disk, &dir.join("disk.img"))?;
-                copy_file(&b.aux, &dir.join("aux.img"))?;
-                (PathBuf::from("disk.img"), PathBuf::from("aux.img"))
-            }
-        };
-        let mut c = base_config(spec, Profile::VmappleArm64, disk, ImageFormat::Raw);
-        if spec.cpus.is_none()
-            && let Some(n) = b.cpus
-        {
-            c.cpus = n;
-        }
-        if spec.memory_mib.is_none()
-            && let Some(m) = b.memory_mib
-        {
-            c.memory_mib = m;
-        }
-        c.vmapple = Some(Vmapple { aux, ecid });
-        let vm = Vm {
-            dir: dir.to_path_buf(),
-            config: c,
-        };
-        crate::runtime::ensure_aux_trimmed(&vm)?;
-        return Ok(vm);
-    }
-    if let Some(ipsw) = &spec.ipsw {
-        let size = match &spec.disk {
-            Some(DiskSource::New { size_mib }) => *size_mib,
-            None => 64 * 1024,
-            Some(DiskSource::Existing { .. }) => {
-                bail!("an IPSW installs onto a new disk: give its size, not an image")
-            }
-        };
-        let mut c = base_config(
-            spec,
-            Profile::VmappleArm64,
-            "disk.img".into(),
-            ImageFormat::Raw,
-        );
-        let ecid = crate::vz::install(ipsw, dir, size, c.cpus, c.memory_mib, progress)?;
-        c.vmapple = Some(Vmapple {
-            aux: "aux.img".into(),
-            ecid,
-        });
-        let vm = Vm {
-            dir: dir.to_path_buf(),
-            config: c,
-        };
-        crate::runtime::ensure_aux_trimmed(&vm)?;
-        let _ = host;
-        return Ok(vm);
-    }
-    bail!(
-        "an arm64 VM is installed from an IPSW (--ipsw PATH, or --ipsw latest), or imported from a Virtualization.framework VM's directory (--bundle)"
-    )
-}
-
-// ---------------------------------------------------------------- Virtualization.framework VMs
-
-/// A Virtualization.framework VM's files, as macosvm or tart keep them.
-#[derive(Clone, Debug)]
-pub struct Bundle {
-    pub disk: PathBuf,
-    pub aux: PathBuf,
-    pub ecid: Option<u64>,
-    pub cpus: Option<u32>,
-    pub memory_mib: Option<u64>,
-}
-
-impl Bundle {
-    pub fn read(dir: &Path) -> Result<Bundle> {
-        let dir = std::fs::canonicalize(dir)
-            .with_context(|| format!("{} does not exist", dir.display()))?;
-        let disk = dir.join("disk.img");
-        if !disk.is_file() {
-            bail!(
-                "{} has no disk.img: not a macosvm or tart VM",
-                dir.display()
-            );
-        }
-        // macosvm: vm.json, aux.img; its machineId is the identifier's data, in base64.
-        let vm_json = dir.join("vm.json");
-        if vm_json.is_file() && dir.join("aux.img").is_file() {
-            let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&vm_json)?)?;
-            let ecid = j
-                .get("machineId")
-                .and_then(|v| v.as_str())
-                .and_then(|b| ecid_from_identifier_base64(b).ok());
-            let cpus = j.get("cpus").and_then(|v| v.as_u64()).map(|n| n as u32);
-            let memory_mib = j
-                .get("ram")
-                .and_then(|v| v.as_u64())
-                .map(|b| b / (1024 * 1024));
-            return Ok(Bundle {
-                disk,
-                aux: dir.join("aux.img"),
-                ecid,
-                cpus,
-                memory_mib,
-            });
-        }
-        // tart: config.json with "ecid" (the identifier's data, in base64), nvram.bin.
-        let config = dir.join("config.json");
-        if config.is_file() && dir.join("nvram.bin").is_file() {
-            let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config)?)?;
-            let ecid = j
-                .get("ecid")
-                .and_then(|v| v.as_str())
-                .and_then(|b| ecid_from_identifier_base64(b).ok());
-            let cpus = j.get("cpuCount").and_then(|v| v.as_u64()).map(|n| n as u32);
-            let memory_mib = j
-                .get("memorySize")
-                .and_then(|v| v.as_u64())
-                .map(|b| b / (1024 * 1024));
-            return Ok(Bundle {
-                disk,
-                aux: dir.join("nvram.bin"),
-                ecid,
-                cpus,
-                memory_mib,
-            });
-        }
-        if dir.join("aux.img").is_file() {
-            return Ok(Bundle {
-                disk,
-                aux: dir.join("aux.img"),
-                ecid: None,
-                cpus: None,
-                memory_mib: None,
-            });
-        }
-        bail!(
-            "{} has a disk.img but no aux.img (macosvm) or nvram.bin (tart)",
-            dir.display()
-        )
-    }
-}
-
-/// The ECID in a `VZMacMachineIdentifier`'s data representation (a property list), given in
-/// base64.
-pub fn ecid_from_identifier_base64(b64: &str) -> Result<u64> {
-    let data = base64_decode(b64)?;
-    ecid_from_identifier(&data)
-}
-
-pub fn ecid_from_identifier(data: &[u8]) -> Result<u64> {
-    let mut child = Command::new("plutil")
-        .args(["-extract", "ECID", "raw", "-o", "-", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("run plutil")?;
-    use std::io::Write;
-    child.stdin.take().unwrap().write_all(data)?;
-    let out = child.wait_with_output()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    s.parse()
-        .with_context(|| format!("no ECID in the machine identifier ({s:?})"))
-}
-
-pub fn base64_decode(s: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    let mut acc: u32 = 0;
-    let mut bits = 0;
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' | b'\n' | b'\r' | b' ' => continue,
-            _ => bail!("not base64"),
-        } as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,9 +602,9 @@ mod tests {
         let config = |spec: &Spec| {
             base_config(
                 spec,
-                Profile::VmappleArm64,
-                "disk.img".into(),
-                ImageFormat::Raw,
+                Profile::Q35X86_64,
+                "disk.qcow2".into(),
+                ImageFormat::Qcow2,
             )
         };
         spec.ssh_port = Some(0);
@@ -965,11 +703,5 @@ mod tests {
         std::fs::remove_file(d.join(CREATING)).unwrap();
         assert!(!claim(&d).unwrap());
         std::fs::remove_dir_all(&d).unwrap();
-    }
-
-    #[test]
-    fn base64() {
-        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
-        assert_eq!(base64_decode("aGVsbG8gd29ybGQ").unwrap(), b"hello world");
     }
 }

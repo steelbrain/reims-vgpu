@@ -217,17 +217,6 @@ impl Form {
         }
     }
 
-    pub fn set_help(&mut self, key: &str, help: &str) {
-        if let Some(f) = self.fields.iter_mut().find(|f| f.key == key) {
-            f.help = help.into();
-        }
-    }
-
-    #[cfg(test)]
-    pub fn help(&self, key: &str) -> &str {
-        self.field(key).map(|f| f.help.as_str()).unwrap_or_default()
-    }
-
     #[cfg(test)]
     pub fn focused_key(&self) -> &'static str {
         self.fields[self.focus].key
@@ -640,8 +629,7 @@ mod tests {
 
     #[test]
     fn a_field_shows_in_a_form_without_the_field_it_follows() {
-        // As an arm64 VM's displays do: its edit form has no Graphics field.
-        let field = Field::text("displays", "Displays", "1", "").show_if("graphics", &["x"]);
-        assert_eq!(Form::new("t", "save", vec![field]).text("displays"), "1");
+        let field = Field::text("resolution", "Resolution", "1", "").show_if("graphics", &["x"]);
+        assert_eq!(Form::new("t", "save", vec![field]).text("resolution"), "1");
     }
 }

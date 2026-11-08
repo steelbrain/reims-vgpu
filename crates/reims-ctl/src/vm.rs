@@ -30,19 +30,11 @@ pub struct VmConfig {
     pub stop_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
-    /// The guest's graphics device ([`VmConfig::graphics`]). None, as settings saved before the
-    /// choice of three have it, is the profile's default ([`Graphics::default_for`]) until the
-    /// first start that finds macOS on the VM's disk saves the device for that macOS by name
-    /// (macos.rs): an x86-64 VM saved then, which ran apple-gfx, runs reims-vgpu's own device
-    /// on macOS 26.4 and later, and stays on apple-gfx on an older macOS. A create saves it by
-    /// name where it knows the macOS, apple-gfx too.
+    /// The guest's graphics device ([`VmConfig::graphics`]): None, as settings an older
+    /// reims-ctl saved may have it, is reims-vgpu's own device, the default. A create saves it
+    /// by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphics: Option<Graphics>,
-    /// The host's video decode, encode and scaling for the guest, on apple-gfx: the
-    /// VideoToolbox and M2 scaler devices (`qemu`'s module doc). Off, the VM has neither, and
-    /// the guest does all three in software. On unless its settings say off.
-    #[serde(default = "on", skip_serializing_if = "is_on")]
-    pub video_acceleration: bool,
     #[serde(default)]
     pub display: Display,
     #[serde(default)]
@@ -55,8 +47,6 @@ pub struct VmConfig {
     pub logs: Logs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub q35: Option<Q35>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vmapple: Option<Vmapple>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_env: BTreeMap<String, String>,
     /// The host's USB devices the guest is given while the VM runs (usb.rs), x86-64 VMs'.
@@ -66,14 +56,6 @@ pub struct VmConfig {
 
 fn default_stop_timeout() -> u64 {
     DEFAULT_STOP_TIMEOUT.as_secs()
-}
-
-fn on() -> bool {
-    true
-}
-
-fn is_on(b: &bool) -> bool {
-    *b
 }
 
 /// How long `stop` waits for the guest by default.
@@ -111,32 +93,28 @@ impl ImageFormat {
 }
 
 /// The guest's graphics device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Graphics {
-    /// reims-vgpu's own GPU device, QEMU's `reims-graphics-pci`, on an x86-64 VM: the guest
-    /// drives it with reims-vgpu's kexts, which reims-ctl puts in the VM's OpenCore image
-    /// ([`crate::prebuilt`]), on one display in a window of the library's. The default on x86-64.
+    /// reims-vgpu's own GPU device, QEMU's `reims-graphics-pci`: the guest drives it with
+    /// reims-vgpu's kexts, which reims-ctl puts in the VM's OpenCore image
+    /// ([`crate::prebuilt`]), on one display in a window of the library's. The default. Settings
+    /// an older reims-ctl saved for apple-gfx, Apple's paravirtualized GPU, which reims-vgpu no
+    /// longer has, read as it ([`crate::migrate`] makes their OpenCore image again for it).
+    #[default]
+    #[serde(alias = "apple-gfx")]
     ReimsVgpu,
-    /// apple-gfx on the library: the device Apple's paravirtualized graphics drivers drive,
-    /// each display in a window of the library's. The only device an arm64 VM has.
-    AppleGfx,
-    /// QEMU's VMware SVGA II, on an x86-64 VM: one display, the firmware's framebuffer, with no
-    /// GPU acceleration (macOS has no driver for the device), in QEMU's own window.
+    /// QEMU's VMware SVGA II: one display, the firmware's framebuffer, with no GPU acceleration
+    /// (macOS has no driver for the device), in QEMU's own window.
     VmwareSvga,
 }
 
 impl Graphics {
-    pub const ALL: [Graphics; 3] = [
-        Graphics::ReimsVgpu,
-        Graphics::AppleGfx,
-        Graphics::VmwareSvga,
-    ];
+    pub const ALL: [Graphics; 2] = [Graphics::ReimsVgpu, Graphics::VmwareSvga];
 
     pub fn id(self) -> &'static str {
         match self {
             Graphics::ReimsVgpu => "reims-vgpu",
-            Graphics::AppleGfx => "apple-gfx",
             Graphics::VmwareSvga => "vmware-svga",
         }
     }
@@ -145,7 +123,6 @@ impl Graphics {
     pub fn name(self) -> &'static str {
         match self {
             Graphics::ReimsVgpu => "reims-vgpu",
-            Graphics::AppleGfx => "apple-gfx",
             Graphics::VmwareSvga => "VMware SVGA",
         }
     }
@@ -154,7 +131,6 @@ impl Graphics {
     pub fn describe(self) -> &'static str {
         match self {
             Graphics::ReimsVgpu => "reims-vgpu, its own GPU device and macOS drivers",
-            Graphics::AppleGfx => "apple-gfx, Apple's paravirtualized GPU",
             Graphics::VmwareSvga => "VMware SVGA, no GPU acceleration",
         }
     }
@@ -163,68 +139,13 @@ impl Graphics {
         Graphics::ALL
             .into_iter()
             .find(|g| g.id() == s.trim())
-            .with_context(|| format!("graphics is reims-vgpu, apple-gfx or vmware-svga, not {s:?}"))
+            .with_context(|| format!("graphics is reims-vgpu or vmware-svga, not {s:?}"))
     }
 
-    /// The device a VM of `profile` has where its settings name none, and its macOS is not known
-    /// yet: reims-vgpu's own on x86-64, apple-gfx, the only one, on arm64. An x86-64 VM on a
-    /// macOS reims-vgpu's kexts don't load on runs apple-gfx ([`crate::macos::graphics_for`]).
-    pub fn default_for(profile: Profile) -> Graphics {
-        match profile {
-            Profile::Q35X86_64 => Graphics::ReimsVgpu,
-            Profile::VmappleArm64 => Graphics::AppleGfx,
-        }
-    }
-
-    /// Whether the library runs the device, and draws its displays in its windows.
+    /// Whether the library runs the device, and draws its display in its window.
     pub fn library(self) -> bool {
         self != Graphics::VmwareSvga
     }
-}
-
-/// Refuses a display setting reims-vgpu's device does not honor, each given for a VM on it:
-/// the device has one display, whose window opens at the resolution's size
-/// ([`Display::window_size`]) and keeps the size the person gives it, which the guest follows,
-/// at the refresh rate of the host screen it is on; the guest starts a HiDPI desktop by itself
-/// in a window at least 3840 pixels wide, and offers one in its Displays settings from 2880 (the
-/// kext's HiDPI modes, whose pixels halve exactly: the guest is offered the window's pixels
-/// rounded down to even). A refresh of 0 is none, as `set` takes it. Settings saved for
-/// apple-gfx are not given: they stay for it, and of them reims-vgpu takes the resolution alone,
-/// as its window's first size.
-pub fn check_reims_vgpu_display(
-    count: Option<u32>,
-    resolution: Option<&str>,
-    hidpi: Option<bool>,
-    refresh: Option<u32>,
-) -> Result<()> {
-    const APPLE: &str = "choose apple-gfx (--graphics apple-gfx)";
-    if let Some(n) = count.filter(|&n| n != 1) {
-        bail!("reims-vgpu has one display, not {n}: for more, {APPLE}");
-    }
-    if let Some(r) = resolution {
-        let r = r.trim();
-        if r == "host" {
-            bail!(
-                "reims-vgpu's display follows its window, which opens at a size you give, such as \
-                 2560x1440, not at the host screen's modes: for host, {APPLE}"
-            );
-        }
-        parse_resolution(r)?;
-    }
-    if hidpi == Some(true) {
-        bail!(
-            "on reims-vgpu the guest picks HiDPI itself (it starts HiDPI in a window at least \
-             3840 pixels wide, and offers it in its Displays settings from 2880): turn HiDPI \
-             off, or {APPLE}"
-        );
-    }
-    if let Some(r) = refresh.filter(|&r| r != 0) {
-        bail!(
-            "reims-vgpu's display runs at the host screen's refresh rate, not {r} Hz: leave the \
-             refresh rate empty, or {APPLE}"
-        );
-    }
-    Ok(())
 }
 
 /// The controller an x86-64 VM's system disk is on, which its settings choose.
@@ -270,96 +191,51 @@ impl DiskController {
     }
 }
 
+/// reims-vgpu's one display: its window opens at the resolution's size
+/// ([`Display::window_size`]) and keeps the size the person gives it, which the guest follows, at
+/// the refresh rate of the host screen it is on. The guest starts a HiDPI desktop by itself in a
+/// window at least 3840 pixels wide, and offers one in its Displays settings from 2880 (the
+/// kext's HiDPI modes, whose pixels halve exactly: the guest is offered the window's pixels
+/// rounded down to even). Settings an older reims-ctl saved for apple-gfx's displays (their
+/// count, HiDPI and refresh rate) are read past, and left out of the next save.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Display {
-    /// The guest's display ports, 1 to 8, each with a window of its own.
-    pub count: u32,
-    /// The mode the guest runs first, `<width>x<height>`, or `host` for the host screen's own
-    /// modes at its density.
+    /// The size the window opens at, `<width>x<height>`.
     pub resolution: String,
-    /// Whether the guest is told a density at which it runs a HiDPI desktop at the mode's pixels
-    /// (3840x2160 then looks like 1920x1080).
-    pub hidpi: bool,
-    /// Borderless windows that fill their screens.
+    /// A borderless window that fills its screen.
     pub borderless: bool,
-    /// The refresh rate of the modes offered to the guest; the host screen's by default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh: Option<u32>,
 }
 
 impl Default for Display {
     fn default() -> Display {
         Display {
-            count: 1,
             resolution: "1920x1080".into(),
-            hidpi: false,
             borderless: false,
-            refresh: None,
         }
     }
 }
 
 impl Display {
-    /// The `resolution` property apple-gfx takes, checked as QEMU checks it.
-    pub fn qemu_resolution(&self) -> Result<String> {
-        let r = self.resolution.trim();
-        if r == "host" {
-            if self.hidpi {
-                bail!("resolution host takes the host screen's own density: turn HiDPI off");
-            }
-            return Ok("host".into());
-        }
-        let (w, h) = parse_resolution(r)?;
-        if !self.hidpi {
-            return Ok(format!("{w}x{h}"));
-        }
-        match hidpi_ppi(w) {
-            Some(ppi) => Ok(format!("{w}x{h}@{ppi}")),
-            None => bail!(
-                "a HiDPI desktop needs a mode at least 1920 pixels wide (it looks half that size), \
-                 not {w}x{h}"
-            ),
-        }
-    }
-
     /// The size reims-vgpu's window opens at, the resolution's, in the host's points (a guest
     /// point per host point), shrunk to fit the screen, which its guest takes in pixels and
     /// follows: measured on a Linux desktop at 2.1x, 1280x720 opened 1280x720 points and the
-    /// guest ran 2688x1512. None for the device's own, 1920x1080, and for `host`, which names no
-    /// size.
+    /// guest ran 2688x1512. None for the device's own, 1920x1080.
     pub fn window_size(&self) -> Option<(u32, u32)> {
         parse_resolution(self.resolution.trim())
             .ok()
             .filter(|&size| size != (1920, 1080))
     }
 
-    /// The size a HiDPI desktop looks like, half the mode's pixels, where it runs one.
-    pub fn looks_like(&self) -> Option<(u32, u32)> {
-        if !self.hidpi {
-            return None;
-        }
-        let (w, h) = parse_resolution(self.resolution.trim()).ok()?;
-        hidpi_ppi(w).map(|_| (w / 2, h / 2))
-    }
-
     pub fn check(&self) -> Result<()> {
-        if !(1..=8).contains(&self.count) {
-            bail!("displays must be 1 to 8, not {}", self.count);
-        }
-        if let Some(r) = self.refresh
-            && !(1..=1000).contains(&r)
-        {
-            bail!("refresh must be 1 to 1000 Hz, not {r}");
-        }
-        self.qemu_resolution().map(|_| ())
+        parse_resolution(self.resolution.trim()).map(|_| ())
     }
 }
 
 pub fn parse_resolution(s: &str) -> Result<(u32, u32)> {
     let (w, h) = s
         .split_once(['x', 'X'])
-        .with_context(|| format!("resolution must be <width>x<height> or host, not {s:?}"))?;
+        .with_context(|| format!("resolution must be <width>x<height>, not {s:?}"))?;
     let w: u32 = w
         .trim()
         .parse()
@@ -372,44 +248,6 @@ pub fn parse_resolution(s: &str) -> Result<(u32, u32)> {
         bail!("each side of a resolution is 1 to 65535 pixels, not {s:?}");
     }
     Ok((w, h))
-}
-
-/// The millimetres a guest is told for `width` pixels at `ppi`, as apple-gfx computes them
-/// (`apple_gfx_guest_millimeters`): in single precision, rounded.
-fn guest_millimeters(width: u32, ppi: u32) -> u64 {
-    let mm = width as f32 / (ppi as f64 / 25.46) as f32;
-    (mm as f64 + 0.5) as u64
-}
-
-/// The whole centimetres the guest reads them as, rounded up.
-fn guest_centimeters(width: u32, ppi: u32) -> u64 {
-    guest_millimeters(width, ppi).div_ceil(10)
-}
-
-/// apple-gfx's `apple_gfx_guest_scale_unknown`: whether the scale a macOS guest runs a mode at
-/// is not known from the density it is told, which QEMU refuses.
-fn guest_scale_unknown(width: u32, ppi: u32) -> bool {
-    let cm = guest_centimeters(width, ppi);
-    let w = width as u64;
-    if cm == 0 || guest_millimeters(width, ppi) > u16::MAX as u64 {
-        return true;
-    }
-    if w * 35 >= 2021 * cm {
-        return width < 1920 || cm < 29;
-    }
-    width > 3811 || w * 66 > 3811 * cm
-}
-
-/// A density at which the guest runs `width` HiDPI: about 29.5 cm across, so it reads 30 cm and
-/// at least 146.667 ppi, where apple-gfx knows the scale (widths of 1920 and more).
-pub fn hidpi_ppi(width: u32) -> Option<u32> {
-    if width < 1920 {
-        return None;
-    }
-    let ppi = (width as f64 * 25.46 / 295.0).round() as u32;
-    let cm = guest_centimeters(width, ppi);
-    let hidpi = width as u64 * 35 >= 2021 * cm;
-    (hidpi && !guest_scale_unknown(width, ppi)).then_some(ppi)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -430,7 +268,7 @@ pub struct Gpu {
 #[serde(default)]
 pub struct Audio {
     pub enabled: bool,
-    /// QEMU's audio backend (`coreaudio`, `pipewire`, `pa`, `alsa`, `none`); the host's best
+    /// QEMU's audio backend (`pipewire`, `pa`, `alsa`, `none`); the host's best
     /// by default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -618,15 +456,6 @@ pub fn parse_usb_port(p: &str) -> Option<(u32, &str)> {
     Some((bus.parse().ok()?, ports))
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Vmapple {
-    /// The auxiliary storage Virtualization.framework made, relative to the VM's directory. QEMU
-    /// boots a copy without its first 16 KiB block (`aux.img.trimmed`).
-    pub aux: PathBuf,
-    /// The machine identifier's ECID, which `-M vmapple,uuid=` takes.
-    pub ecid: u64,
-}
-
 impl VmConfig {
     pub fn check(&self) -> Result<()> {
         check_name(&self.name)?;
@@ -642,40 +471,15 @@ impl VmConfig {
         }
         check_mac(&self.network.mac)?;
         self.check_usb()?;
-        if self.profile != Profile::Q35X86_64 {
-            match self.graphics() {
-                Graphics::AppleGfx => {}
-                Graphics::ReimsVgpu => bail!(
-                    "{}: reims-vgpu's own GPU device is for x86-64 VMs: an arm64 macOS guest \
-                     drives only apple-gfx (reims-ctl set {} --graphics apple-gfx)",
-                    self.name,
-                    self.name
-                ),
-                Graphics::VmwareSvga => bail!(
-                    "{}: VMware SVGA is for x86-64 VMs: an arm64 macOS guest drives only apple-gfx",
-                    self.name
-                ),
-            }
+        if self.q35.is_none() {
+            bail!("{}: no [q35] settings", self.name);
         }
-        match self.profile {
-            Profile::Q35X86_64 if self.q35.is_none() => bail!("{}: no [q35] settings", self.name),
-            Profile::VmappleArm64 if self.vmapple.is_none() => {
-                bail!("{}: no [vmapple] settings", self.name)
-            }
-            _ => Ok(()),
-        }
+        Ok(())
     }
 
-    /// Refuses USB devices the VM cannot be given: on an arm64 VM, whose host is a Mac, any
-    /// ([`crate::usb::MAC_HOST`]); more than [`USB_DEVICES_MAX`]; one named twice, which QEMU
-    /// would refuse by its id; and an ID or port that names no device.
+    /// Refuses USB devices the VM cannot be given: more than [`USB_DEVICES_MAX`]; one named
+    /// twice, which QEMU would refuse by its id; and an ID or port that names no device.
     fn check_usb(&self) -> Result<()> {
-        if self.usb.is_empty() {
-            return Ok(());
-        }
-        if self.profile != Profile::Q35X86_64 {
-            bail!("{}: {}", self.name, crate::usb::MAC_HOST);
-        }
         if self.usb.len() > USB_DEVICES_MAX {
             bail!(
                 "{}: a VM takes {USB_DEVICES_MAX} USB devices at most, not {}",
@@ -703,30 +507,18 @@ impl VmConfig {
         stop_timeout(self.stop_timeout_secs)
     }
 
-    /// The guest's graphics device: the settings', else the profile's default.
+    /// The guest's graphics device: the settings', else reims-vgpu's own.
     pub fn graphics(&self) -> Graphics {
-        self.graphics
-            .unwrap_or_else(|| Graphics::default_for(self.profile))
-    }
-
-    /// The displays the guest has: apple-gfx's, or reims-vgpu's or VMware SVGA's one.
-    pub fn display_count(&self) -> u32 {
-        match self.graphics() {
-            Graphics::AppleGfx => self.display.count,
-            Graphics::ReimsVgpu | Graphics::VmwareSvga => 1,
-        }
+        self.graphics.unwrap_or_default()
     }
 }
 
 impl VmConfig {
     /// What in these settings the VM's guest does not work with, each a sentence to show the
-    /// user; empty for an arm64 VM. For an x86-64 VM: audio off, without which Safari's
-    /// streaming players fail (docs/qemu.md, "x86-64 macOS guests: audio").
+    /// user: audio off, without which Safari's streaming players fail (docs/qemu.md, "x86-64
+    /// macOS guests: audio").
     pub fn incompatibilities(&self) -> Vec<String> {
         let mut w = Vec::new();
-        if self.profile != Profile::Q35X86_64 {
-            return w;
-        }
         if !self.audio.enabled {
             w.push(format!(
                 "Audio is off, and without an audio device an x86-64 macOS guest's Safari can't \
@@ -910,16 +702,12 @@ impl Vm {
     }
 
     /// The files the VM runs on, wherever they are: its disk, and its OpenCore image, firmware
-    /// and installer, or its auxiliary storage and the trimmed copy QEMU boots.
+    /// and installer.
     pub fn files(&self) -> Vec<PathBuf> {
         let mut v = vec![self.disk()];
         if let Some(q) = &self.config.q35 {
             v.extend([&q.opencore, &q.firmware_code, &q.firmware_vars].map(|p| self.path(p)));
             v.extend(q.installer.as_deref().map(|p| self.path(p)));
-        }
-        if let Some(a) = &self.config.vmapple {
-            v.push(self.path(&a.aux));
-            v.extend(self.aux_trimmed());
         }
         v
     }
@@ -932,15 +720,6 @@ impl Vm {
             &paths::runtime_dir(),
             &paths::short_runtime_dir(),
         )
-    }
-
-    /// The trimmed auxiliary storage QEMU boots (vmapple).
-    pub fn aux_trimmed(&self) -> Option<PathBuf> {
-        let v = self.config.vmapple.as_ref()?;
-        let aux = self.path(&v.aux);
-        let mut name = aux.file_name()?.to_os_string();
-        name.push(".trimmed");
-        Some(aux.with_file_name(name))
     }
 }
 
@@ -1046,63 +825,22 @@ impl Registry {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hidpi_densities_are_ones_qemu_accepts() {
-        for w in [1920, 2048, 2560, 2880, 3024, 3456, 3840, 5120, 6016] {
-            let ppi = hidpi_ppi(w).unwrap_or_else(|| panic!("no density for {w}"));
-            assert!(!guest_scale_unknown(w, ppi), "{w}@{ppi}");
-            let cm = guest_centimeters(w, ppi);
-            assert!(
-                w as f64 / cm as f64 * 2.54 >= 146.667,
-                "{w}@{ppi} is not HiDPI ({cm} cm)"
-            );
-        }
-        assert_eq!(hidpi_ppi(1280), None);
-    }
-
-    #[test]
-    fn densities_match_apple_gfx_examples() {
-        // docs/qemu.md: 2560x1600@200 runs HiDPI; @148 reads 44 cm, @146 45 cm.
-        assert_eq!(guest_centimeters(2560, 148), 44);
-        assert_eq!(guest_centimeters(2560, 146), 45);
-        assert!(!guest_scale_unknown(2560, 200));
-    }
-
-    #[test]
-    fn resolution_property() {
-        let mut d = Display::default();
-        assert_eq!(d.qemu_resolution().unwrap(), "1920x1080");
-        d.hidpi = true;
-        d.resolution = "3840x2160".into();
-        assert!(d.qemu_resolution().unwrap().starts_with("3840x2160@"));
-        assert_eq!(d.looks_like(), Some((1920, 1080)));
-        d.resolution = "1280x800".into();
-        assert!(d.qemu_resolution().is_err());
-        assert_eq!(d.looks_like(), None);
-        d.resolution = "host".into();
-        assert!(d.qemu_resolution().is_err());
-        d.hidpi = false;
-        assert_eq!(d.qemu_resolution().unwrap(), "host");
-        d.resolution = "19x".into();
-        assert!(d.qemu_resolution().is_err());
-    }
-
-    /// reims-vgpu's window opens at the resolution's size, HiDPI or not; the device's own
-    /// 1920x1080 and `host` name none.
+    /// A resolution is the window's first size, `<width>x<height>`; reims-vgpu's window opens
+    /// at it, and the device's own 1920x1080 names none.
     #[test]
     fn reims_vgpu_s_window_opens_at_the_resolution_s_size() {
-        let d = |resolution: &str, hidpi| {
-            Display {
-                resolution: resolution.into(),
-                hidpi,
-                ..Default::default()
-            }
-            .window_size()
+        let d = |resolution: &str| Display {
+            resolution: resolution.into(),
+            ..Default::default()
         };
-        assert_eq!(d("2560x1440", false), Some((2560, 1440)));
-        assert_eq!(d("3840x2160", true), Some((3840, 2160)));
-        assert_eq!(d("1920x1080", false), None);
-        assert_eq!(d("host", false), None);
+        assert_eq!(d("2560x1440").window_size(), Some((2560, 1440)));
+        assert_eq!(d(" 3840x2160").window_size(), Some((3840, 2160)));
+        assert_eq!(d("1920x1080").window_size(), None);
+        assert!(d("2560x1600").check().is_ok());
+        for bad in ["host", "2560", "19x", "0x1080", "70000x10"] {
+            assert!(d(bad).check().is_err(), "{bad}");
+            assert_eq!(d(bad).window_size(), None, "{bad}");
+        }
     }
 
     #[test]
@@ -1241,7 +979,6 @@ mod tests {
             stop_timeout_secs: 90,
             extra_args: vec!["-boot".into(), "menu=on".into()],
             graphics: None,
-            video_acceleration: true,
             display: Display::default(),
             gpu: Gpu {
                 driver_file: Some("/usr/share/vulkan/icd.d/nvidia_icd.json".into()),
@@ -1266,7 +1003,6 @@ mod tests {
                 disk_controller: DiskController::Nvme,
                 disk_port: 3,
             }),
-            vmapple: None,
             extra_env: BTreeMap::from([("A".into(), "b".into())]),
             usb: vec![],
         }
@@ -1341,21 +1077,6 @@ mod tests {
         }
         assert_eq!(parse_usb_port("3-2.1"), Some((3, "2.1")));
         assert_eq!(parse_usb_port("1-10"), Some((1, "10")));
-        // An arm64 VM, which runs on a Mac, takes none.
-        c.usb = vec![u("1050:0407", None)];
-        c.profile = Profile::VmappleArm64;
-        c.q35 = None;
-        c.vmapple = Some(Vmapple {
-            aux: "aux.img".into(),
-            ecid: 1,
-        });
-        assert!(
-            refused(&c).contains("needs a Linux host"),
-            "{}",
-            refused(&c)
-        );
-        c.usb.clear();
-        assert!(c.check().is_ok());
     }
 
     #[test]
@@ -1374,93 +1095,29 @@ mod tests {
         }
     }
 
-    /// A VM whose settings name no graphics, as every VM on apple-gfx saved before there were
-    /// three had them, runs its profile's default: reims-vgpu's own device on x86-64, apple-gfx
-    /// on arm64. One on apple-gfx is saved by name, so it stays there.
+    /// A VM whose settings name no graphics runs reims-vgpu's own device. Settings an older
+    /// reims-ctl saved for apple-gfx read as reims-vgpu, and save naming it; the names parse
+    /// back to their devices.
     #[test]
-    fn a_vm_naming_no_graphics_runs_its_profiles_default() {
+    fn a_vm_naming_no_graphics_or_apple_gfx_runs_reims_vgpu() {
         let mut c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(!text.contains("graphics"), "{text}");
         let loaded = toml::from_str::<VmConfig>(&text).unwrap();
         assert_eq!(loaded.graphics(), Graphics::ReimsVgpu);
         assert_eq!(toml::to_string_pretty(&loaded).unwrap(), text);
-        c.graphics = Some(Graphics::AppleGfx);
-        let apple = toml::to_string_pretty(&c).unwrap();
-        assert!(apple.contains("graphics = \"apple-gfx\"\n"), "{apple}");
-        assert_eq!(
-            toml::from_str::<VmConfig>(&apple).unwrap().graphics(),
-            Graphics::AppleGfx
-        );
-        c.graphics = None;
-        c.profile = Profile::VmappleArm64;
-        assert_eq!(c.graphics(), Graphics::AppleGfx);
-        assert_eq!(
-            Graphics::default_for(Profile::Q35X86_64),
-            Graphics::ReimsVgpu
-        );
-    }
-
-    /// reims-vgpu's own device is an x86-64 VM's: an arm64 VM given it is refused, saying what
-    /// it runs instead.
-    #[test]
-    fn reims_vgpu_is_for_x86_64_vms() {
-        let mut c = x86_64_config();
         c.graphics = Some(Graphics::ReimsVgpu);
-        assert!(c.check().is_ok());
-        c.profile = Profile::VmappleArm64;
-        c.q35 = None;
-        c.vmapple = Some(Vmapple {
-            aux: "aux.img".into(),
-            ecid: 1,
-        });
-        let e = format!("{:#}", c.check().unwrap_err());
-        assert!(e.contains("--graphics apple-gfx"), "{e}");
-        c.graphics = None;
-        assert!(c.check().is_ok());
-        assert_eq!(c.display_count(), 1);
-        c.display.count = 2;
-        assert_eq!(c.display_count(), 2);
+        let ours = toml::to_string_pretty(&c).unwrap();
+        let apple = ours.replace("graphics = \"reims-vgpu\"", "graphics = \"apple-gfx\"");
+        assert_ne!(apple, ours);
+        let loaded = toml::from_str::<VmConfig>(&apple).unwrap();
+        assert_eq!(loaded.graphics, Some(Graphics::ReimsVgpu));
+        assert_eq!(toml::to_string_pretty(&loaded).unwrap(), ours);
         for g in Graphics::ALL {
             assert_eq!(Graphics::parse(g.id()).unwrap(), g);
         }
-        assert!(Graphics::parse("vga").is_err());
-    }
-
-    /// reims-vgpu takes the display settings its device honors, given for it, and refuses the
-    /// rest, saying what to do instead.
-    #[test]
-    fn reims_vgpu_refuses_display_settings_it_does_not_honor() {
-        assert!(check_reims_vgpu_display(None, None, None, None).is_ok());
-        assert!(
-            check_reims_vgpu_display(Some(1), Some(" 1920x1080"), Some(false), Some(0)).is_ok()
-        );
-        // Its window opens at the size given.
-        assert!(check_reims_vgpu_display(None, Some("2560x1600"), None, None).is_ok());
-        assert!(check_reims_vgpu_display(None, Some("2560"), None, None).is_err());
-        for (refused, says) in [
-            (
-                check_reims_vgpu_display(Some(2), None, None, None),
-                "one display",
-            ),
-            (
-                check_reims_vgpu_display(None, Some("host"), None, None),
-                "for host",
-            ),
-            (
-                check_reims_vgpu_display(None, None, Some(true), None),
-                "2880",
-            ),
-            (
-                check_reims_vgpu_display(None, None, None, Some(120)),
-                "not 120 Hz",
-            ),
-        ] {
-            let e = format!("{:#}", refused.unwrap_err());
-            assert!(
-                e.contains(says) && e.contains("--graphics apple-gfx"),
-                "{e}"
-            );
+        for gone in ["apple-gfx", "vga"] {
+            assert!(Graphics::parse(gone).is_err(), "{gone}");
         }
     }
 
@@ -1485,20 +1142,20 @@ mod tests {
         }
     }
 
-    /// A VM whose settings don't name video acceleration has it on, and saves as it did before
-    /// the switch existed; one with it off saves it off.
+    /// What an older reims-ctl saved for apple-gfx alone (video acceleration, the displays'
+    /// count, HiDPI and refresh rate) is read past, and left out of the next save.
     #[test]
-    fn video_acceleration_is_on_unless_the_settings_say_off() {
-        let mut c = x86_64_config();
+    fn apple_gfx_s_settings_are_read_past() {
+        let c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
-        assert!(!text.contains("video_acceleration"), "{text}");
-        let loaded = toml::from_str::<VmConfig>(&text).unwrap();
-        assert!(loaded.video_acceleration);
+        let old = text.replace(
+            "[display]\n",
+            "video_acceleration = false\n\n[display]\ncount = 2\nhidpi = true\nrefresh = 120\n",
+        );
+        assert_ne!(old, text);
+        let loaded = toml::from_str::<VmConfig>(&old).unwrap();
+        assert_eq!(loaded, c);
         assert_eq!(toml::to_string_pretty(&loaded).unwrap(), text);
-        c.video_acceleration = false;
-        let off = toml::to_string_pretty(&c).unwrap();
-        assert!(off.contains("video_acceleration = false\n"), "{off}");
-        assert_eq!(toml::from_str::<VmConfig>(&off).unwrap(), c);
     }
 
     /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`
@@ -1518,30 +1175,22 @@ mod tests {
         assert_eq!(toml::from_str::<VmConfig>(&none).unwrap(), c);
     }
 
+    /// A VM is an x86-64 one, with its [q35] settings; VMware SVGA is one of its devices.
     #[test]
-    fn vmware_svga_is_an_x86_64_vms_one_display() {
+    fn a_vm_has_its_q35_settings() {
         let mut c = x86_64_config();
-        c.display.count = 2;
         c.graphics = Some(Graphics::parse("vmware-svga").unwrap());
         assert!(c.check().is_ok());
-        assert_eq!(c.display_count(), 1);
-        c.profile = Profile::VmappleArm64;
         c.q35 = None;
-        c.vmapple = Some(Vmapple {
-            aux: "aux.img".into(),
-            ecid: 1,
-        });
-        assert!(c.check().is_err());
-        c.graphics = Some(Graphics::AppleGfx);
-        assert!(c.check().is_ok());
-        assert_eq!(c.display_count(), 2);
+        let e = format!("{:#}", c.check().unwrap_err());
+        assert!(e.contains("no [q35] settings"), "{e}");
     }
 
     #[test]
     fn incompatibilities_are_an_x86_64_vms_silence() {
         let mut c = x86_64_config();
         assert!(c.incompatibilities().is_empty());
-        // Wide displays are the OpenCore image's ReimsVgpu.kext's (runtime::warnings).
+        // A wide window is none.
         c.display.resolution = "2560x1600".into();
         assert!(c.incompatibilities().is_empty());
         c.audio.enabled = false;
@@ -1551,7 +1200,5 @@ mod tests {
             w[0].contains("reims-ctl set t --audio-backend none"),
             "{w:?}"
         );
-        c.profile = Profile::VmappleArm64;
-        assert!(c.incompatibilities().is_empty());
     }
 }

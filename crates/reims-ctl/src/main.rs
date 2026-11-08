@@ -1,4 +1,4 @@
-//! reims-ctl: creates, boots and manages macOS VMs on QEMU's apple-gfx, on the QEMU
+//! reims-ctl: creates, boots and manages x86-64 macOS VMs on Linux, on the QEMU
 //! scripts/install-ctl.sh builds with reims-vgpu. With no command it opens its interactive
 //! interface.
 
@@ -25,7 +25,6 @@ mod update;
 mod usb;
 mod view;
 mod vm;
-mod vz;
 
 use clap::Parser;
 

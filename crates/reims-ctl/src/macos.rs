@@ -1,257 +1,16 @@
-//! Which macOS an x86-64 VM runs, and the graphics that follows from it.
+//! What reims-ctl reads of the macOS on an x86-64 VM's disk: AppleGVA's setting that
+//! reims-vgpu's kexts leave in the guest ([`gva_note`]).
 //!
-//! reims-vgpu's own GPU device has a driver only in the guest's kexts reims-ctl carries
-//! ([`crate::prebuilt`]), which OpenCore loads on the Darwin versions their MinKernel and MaxKernel
-//! bound: macOS 26.4 and later releases of macOS 26. On an older macOS the device has no driver,
-//! and the guest no GPU, where Apple's own driver in the guest drives apple-gfx. So a VM whose
-//! settings name no graphics runs the device for the macOS it holds ([`graphics_for`]):
-//! - at create, the macOS of the installer reims-util downloaded, or of the disk given;
-//! - else at the first start that finds macOS on its disk ([`settle`]), which saves it by name, so
-//!   that it no longer changes with the guest: an update of the guest to macOS 26.4 leaves it on
-//!   apple-gfx, which still runs it, until its settings choose reims-vgpu.
-//!
-//! The disk tells its macOS through its APFS container's Preboot volume, which holds for each
-//! install, in a directory named by its volume group's UUID (before volume groups, by its system
-//! volume's), `System/Library/CoreServices/SystemVersion.plist`, a copy of the system's. Read from
-//! an x86-64 macOS 26.7.2 (25G332) guest's disk: the file is 604 bytes, uncompressed, and its
-//! directory is named by the volume group's UUID; the system volume itself is sealed, its tree
-//! hashed. The reader follows Apple's File System Reference: the latest checkpoint's container
-//! superblock, the container's object map, each volume's superblock, and the Preboot volume's
-//! object map and file-system tree. It reads what macOS writes there and nothing else: no
-//! encrypted volume, no compressed file, and no checkpoint area kept as a tree.
+//! The reader follows Apple's File System Reference: the latest checkpoint's container
+//! superblock, the container's object map, each volume's superblock, and a volume's object map
+//! and file-system tree. It reads what macOS writes there and nothing else: no encrypted volume,
+//! no compressed file, and no checkpoint area kept as a tree. Read from an x86-64 macOS 26.7.2
+//! (25G332) guest's disk: the system volume is sealed, its tree hashed, and the Data volume holds
+//! the user's files.
 
-use crate::host::Profile;
 use crate::opencore::{Disk, le16, le32, le64};
-use crate::prebuilt;
 use crate::vm::{Graphics, Vm};
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::BTreeSet;
-use std::path::Path;
-
-/// A macOS release.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Macos {
-    /// Its version, "26.7.2"; for an online installer only its macOS's number, "26", since its
-    /// Reinstall macOS installs the newest release of it.
-    pub version: String,
-    /// Its build, "25G332", where known.
-    pub build: Option<String>,
-}
-
-impl Macos {
-    /// The Darwin version it runs, major and minor. A build names it: its number is Darwin's
-    /// major version, and its letter the minor, A for 0 (25G332 runs Darwin 25.6). Without one,
-    /// as an online installer's, only the major follows, from the macOS's number (macOS 26 and
-    /// later run Darwin one below it, 11 to 15 nine above, and 10.Y Y + 4), and the minor is
-    /// taken as 99: the newest release, as OpenCore's bound 25.99.99 stands for every release of
-    /// Darwin 25.
-    pub fn darwin(&self) -> Option<(u32, u32)> {
-        if let Some(d) = self.build.as_deref().and_then(build_darwin) {
-            return Some(d);
-        }
-        let mut parts = self.version.trim().split('.');
-        let major: u32 = parts.next()?.parse().ok()?;
-        let darwin = match major {
-            10 => parts.next()?.parse::<u32>().ok()? + 4,
-            11..=15 => major + 9,
-            26.. => major - 1,
-            _ => return None,
-        };
-        Some((darwin, 99))
-    }
-
-    /// What to call it: "macOS 26.7.2 (25G332)".
-    pub fn describe(&self) -> String {
-        match &self.build {
-            Some(b) => format!("macOS {} ({b})", self.version),
-            None => format!("macOS {}", self.version),
-        }
-    }
-}
-
-/// The Darwin version a build names: 25G332 is 25.6.
-fn build_darwin(build: &str) -> Option<(u32, u32)> {
-    let digits = build.bytes().take_while(u8::is_ascii_digit).count();
-    let major = build[..digits].parse().ok()?;
-    let letter = *build.as_bytes().get(digits)?;
-    letter
-        .is_ascii_uppercase()
-        .then(|| (major, u32::from(letter - b'A')))
-}
-
-/// The macOS release that runs Darwin `major`.`minor`, as [`Macos::darwin`] maps them: "26.4"
-/// for 25.4.
-fn release_of(major: u32, minor: u32) -> String {
-    match major {
-        25.. => format!("{}.{minor}", major + 1),
-        20..=24 => format!("{}.{minor}", major - 9),
-        _ => format!("10.{}", major.saturating_sub(4)),
-    }
-}
-
-/// The graphics a VM whose settings name none runs, for `found`, each macOS its disk holds or the
-/// one its installer installs: reims-vgpu's own device where the guest's kexts load on each,
-/// apple-gfx where they don't load on one, and None where nothing is found, or reims-ctl carries
-/// no kexts.
-pub fn graphics_for(found: &[Macos]) -> Option<Graphics> {
-    if found.is_empty() {
-        return None;
-    }
-    let mut runs = true;
-    for m in found {
-        runs &= prebuilt::loads_on(m.darwin()?)?;
-    }
-    Some(if runs {
-        Graphics::ReimsVgpu
-    } else {
-        Graphics::AppleGfx
-    })
-}
-
-/// Why reims-vgpu's device has no driver on `m`, a macOS its kexts don't load on: "older than
-/// macOS 26.4, the first release reims-vgpu's macOS drivers run on".
-pub fn too_old_or_new(m: &Macos) -> String {
-    let (min, max) = prebuilt::bounds().unwrap_or(((0, 0), (u32::MAX, u32::MAX)));
-    match m.darwin() {
-        Some(d) if d > max => format!(
-            "newer than macOS {}, the last release reims-vgpu's macOS drivers run on",
-            release_of(max.0, max.1).trim_end_matches(".99")
-        ),
-        _ => format!(
-            "older than macOS {}, the first release reims-vgpu's macOS drivers run on",
-            release_of(min.0, min.1)
-        ),
-    }
-}
-
-/// What a create that chose `graphics` for the VM `name` tells of it, after its name, where its
-/// macOS, `found`, decided it, or where the reims-vgpu given has no driver on it.
-pub fn create_note(name: &str, found: &[Macos], graphics: Graphics, given: bool) -> Option<String> {
-    let old = found
-        .iter()
-        .find(|m| m.darwin().and_then(prebuilt::loads_on) == Some(false))?;
-    match (graphics, given) {
-        (Graphics::AppleGfx, false) => Some(format!(
-            "{} is {}, so it runs on apple-gfx",
-            old.describe(),
-            too_old_or_new(old)
-        )),
-        (Graphics::ReimsVgpu, true) => Some(format!(
-            "its {} is {}: on reims-vgpu macOS has no driver for its GPU, and draws without one. \
-             To run it on apple-gfx, run reims-ctl set {name} --graphics apple-gfx.",
-            old.describe(),
-            too_old_or_new(old)
-        )),
-        _ => None,
-    }
-}
-
-/// What to tell of a VM on reims-vgpu whose guest, `m`, has no driver for its device.
-fn no_driver(name: &str, m: &Macos) -> String {
-    format!(
-        "{name} runs on reims-vgpu, but its {} is {}: macOS has no driver for its GPU, and draws \
-         without one. To run it on apple-gfx, run reims-ctl set {name} --graphics apple-gfx.",
-        m.describe(),
-        too_old_or_new(m)
-    )
-}
-
-/// What a start does first for a stopped x86-64 VM on reims-vgpu: the macOS its disk holds.
-#[derive(Debug, PartialEq)]
-pub enum Settled {
-    /// Nothing to tell: another device, no macOS on the disk yet, or a macOS that runs the
-    /// device.
-    Kept,
-    /// Its settings named no graphics, and now name the one for its macOS, apple-gfx: what to
-    /// tell of it, after its name.
-    Saved(String),
-    /// A warning: the device has no driver on its macOS, which its settings chose; or reims-ctl
-    /// can't read its disk, and it runs the default.
-    Warn(String),
-}
-
-/// For a stopped x86-64 VM on reims-vgpu, the macOS its disk holds: where its settings name no
-/// graphics, the device for it is saved in them by name ([`graphics_for`]), and where they name
-/// reims-vgpu on a macOS it has no driver on, that is a warning. A disk reims-ctl can't read is a
-/// warning where the VM runs the default.
-pub fn settle(vm: &mut Vm) -> Result<Settled> {
-    if vm.config.profile != Profile::Q35X86_64 || vm.config.graphics() != Graphics::ReimsVgpu {
-        return Ok(Settled::Kept);
-    }
-    let name = vm.name().to_string();
-    let found = match on_disk(&vm.disk(), vm.config.disk_format) {
-        Ok(f) => f,
-        Err(e) if vm.config.graphics.is_none() => {
-            return Ok(Settled::Warn(format!(
-                "reims-ctl can't tell which macOS {name}'s disk holds ({e:#}), so it runs on \
-                 reims-vgpu, whose macOS drivers need macOS {} or later. If it has an older \
-                 macOS, run reims-ctl set {name} --graphics apple-gfx.",
-                prebuilt::bounds()
-                    .map(|(min, _)| release_of(min.0, min.1))
-                    .unwrap_or_default()
-            )));
-        }
-        Err(_) => return Ok(Settled::Kept),
-    };
-    let Some(graphics) = graphics_for(&found) else {
-        return Ok(Settled::Kept);
-    };
-    if vm.config.graphics.is_some() {
-        return Ok(match graphics {
-            Graphics::ReimsVgpu => Settled::Kept,
-            _ => match found
-                .iter()
-                .find(|m| m.darwin().and_then(prebuilt::loads_on) == Some(false))
-            {
-                Some(m) => Settled::Warn(no_driver(&name, m)),
-                None => Settled::Kept,
-            },
-        });
-    }
-    // Saved in the settings as they are now, which another reims-ctl may have changed.
-    let mut now = Vm::load(&vm.dir)?;
-    if now.config.graphics.is_some() {
-        *vm = now;
-        return Ok(Settled::Kept);
-    }
-    now.config.graphics = Some(graphics);
-    now.save()?;
-    *vm = now;
-    Ok(match graphics {
-        Graphics::ReimsVgpu => Settled::Kept,
-        _ => {
-            let m = found
-                .iter()
-                .find(|m| m.darwin().and_then(prebuilt::loads_on) == Some(false))
-                .unwrap_or(&found[0]);
-            Settled::Saved(format!(
-                "its disk holds {}, which is {}, so it runs on apple-gfx, now saved in its \
-                 settings. Once its macOS is updated to {} or later, reims-ctl set {name} \
-                 --graphics reims-vgpu moves it to reims-vgpu's own GPU device.",
-                m.describe(),
-                too_old_or_new(m),
-                prebuilt::bounds()
-                    .map(|(min, _)| format!("macOS {}", release_of(min.0, min.1)))
-                    .unwrap_or_default()
-            ))
-        }
-    })
-}
-
-/// The VM as a start would run it: where its settings name no graphics, on the device
-/// [`settle`] would save for the macOS its disk holds. For what `reims-ctl command`, `show` and
-/// `list` print.
-pub fn as_started(vm: &Vm) -> Vm {
-    let mut v = vm.clone();
-    if v.config.profile == Profile::Q35X86_64
-        && v.config.graphics.is_none()
-        && !crate::runtime::running(vm)
-        && let Ok(found) = on_disk(&vm.disk(), vm.config.disk_format)
-    {
-        v.config.graphics = graphics_for(&found);
-    }
-    v
-}
 
 /// AppleGVA's gvaForceAMDKE as a VM's macOS keeps it, in
 /// /Library/Preferences/com.apple.AppleGVA.plist on its Data volume. RgfxGate, a kext of the
@@ -293,7 +52,7 @@ fn gva_forced(vm: &Vm) -> Option<usize> {
 /// where the guest keeps no such setting.
 pub fn gva_note(vm: &Vm) -> Option<String> {
     let graphics = vm.config.graphics();
-    if vm.config.profile != Profile::Q35X86_64 || graphics == Graphics::ReimsVgpu {
+    if graphics == Graphics::ReimsVgpu {
         return None;
     }
     let others = gva_forced(vm)?;
@@ -318,17 +77,6 @@ pub fn gva_note(vm: &Vm) -> Option<String> {
 
 /// AppleGVA's preferences, from the Data volume's root.
 const GVA_PREFERENCES: &str = "Library/Preferences/com.apple.AppleGVA.plist";
-
-/// Each macOS the disk image at `path` holds: none where it has no GPT, no APFS container, or no
-/// macOS installed on one yet.
-pub fn on_disk(path: &Path, format: crate::vm::ImageFormat) -> Result<Vec<Macos>> {
-    let disk = Disk::open(path, format)?;
-    let mut found = Vec::new();
-    for start in crate::opencore::partitions(&disk, &APFS_TYPE)? {
-        found.extend(Container::open(&disk, start)?.macos()?);
-    }
-    Ok(found)
-}
 
 /// An APFS partition's type GUID, 7C3457EF-0000-11AA-AA11-00306543ECAC, as GPT stores it.
 const APFS_TYPE: [u8; 16] = [
@@ -360,7 +108,6 @@ const APFS_INCOMPAT_CASE_INSENSITIVE: u64 = 1;
 const APFS_INCOMPAT_NORMALIZATION_INSENSITIVE: u64 = 8;
 /// `apfs_fs_flags`.
 const APFS_FS_UNENCRYPTED: u64 = 1;
-const APFS_VOL_ROLE_PREBOOT: u16 = 0x10;
 const APFS_VOL_ROLE_DATA: u16 = 0x40;
 /// A file-system record's type, the top four bits of its key's first word.
 const APFS_TYPE_INODE: u8 = 3;
@@ -524,61 +271,6 @@ impl<'a> Container<'a> {
         }
         Ok(out)
     }
-
-    /// Each macOS its Preboot volumes hold, for an install whose volumes are in the container.
-    fn macos(&self) -> Result<Vec<Macos>> {
-        let volumes = self.volumes()?;
-        // The UUIDs an install's Preboot directory may be named by.
-        let ids: BTreeSet<String> = volumes
-            .iter()
-            .flat_map(|sb| [uuid(&sb[240..256]), uuid(&sb[1008..1024])])
-            .filter(|u| u != "00000000-0000-0000-0000-000000000000")
-            .collect();
-        let mut found = Vec::new();
-        for sb in volumes.iter().filter(|sb| {
-            le16(sb, 964) == APFS_VOL_ROLE_PREBOOT && le64(sb, 264) & APFS_FS_UNENCRYPTED != 0
-        }) {
-            let fs = Volume::open(self, sb)?;
-            for (name, dir) in fs.children(ROOT_DIR_INO_NUM)? {
-                if !ids.contains(&name.to_ascii_uppercase()) {
-                    continue;
-                }
-                if let Some(file) =
-                    fs.lookup(dir, "System/Library/CoreServices/SystemVersion.plist")?
-                {
-                    found.push(parse_version(&fs.read(file)?)?);
-                }
-            }
-        }
-        Ok(found)
-    }
-}
-
-/// A UUID's 16 bytes as text, as a Preboot directory names it: upper case, in groups.
-fn uuid(b: &[u8]) -> String {
-    let hex: String = b.iter().map(|x| format!("{x:02X}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    )
-}
-
-/// SystemVersion.plist's ProductVersion and ProductBuildVersion.
-fn parse_version(bytes: &[u8]) -> Result<Macos> {
-    let v = plist::Value::from_reader(std::io::Cursor::new(bytes))
-        .context("read SystemVersion.plist")?;
-    let d = v
-        .as_dictionary()
-        .context("SystemVersion.plist holds no dictionary")?;
-    let text = |k: &str| d.get(k).and_then(plist::Value::as_string).map(String::from);
-    Ok(Macos {
-        version: text("ProductVersion").context("SystemVersion.plist has no ProductVersion")?,
-        build: text("ProductBuildVersion"),
-    })
 }
 
 /// A B-tree node: its entries' table of contents, keys and values.
@@ -878,7 +570,7 @@ fn checksum_ok(b: &[u8]) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::vm::ImageFormat;
+    use std::path::Path;
 
     const BS: usize = 4096;
 
@@ -1079,19 +771,14 @@ pub(crate) mod tests {
         img
     }
 
-    /// A Preboot volume holding SystemVersion.plist's `installs`, each in the directory named.
-    fn preboot<'a>(installs: &[(&'a str, &'a [u8])]) -> (Vol<'a>, Vec<String>) {
-        let paths: Vec<String> = installs
-            .iter()
-            .map(|(d, _)| format!("{d}/System/Library/CoreServices/SystemVersion.plist"))
-            .collect();
-        let vol = Vol {
-            role: APFS_VOL_ROLE_PREBOOT,
+    /// An empty Preboot volume, as an install's container holds beside its Data volume.
+    fn preboot<'a>() -> Vol<'a> {
+        Vol {
+            role: 0x10,
             uuid: [0; 16],
             group: [0; 16],
             files: Vec::new(),
-        };
-        (vol, paths)
+        }
     }
 
     /// A data volume of the volume group [`GROUP`], holding `files`.
@@ -1100,8 +787,11 @@ pub(crate) mod tests {
     pub(crate) fn gva_disk(path: &Path) {
         let pref = br#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>gvaForceAMDKE</key><true/></dict></plist>"#;
-        let (pre, _) = preboot(&[]);
-        std::fs::write(path, disk(&[pre, data(vec![(GVA_PREFERENCES, pref)])])).unwrap();
+        std::fs::write(
+            path,
+            disk(&[preboot(), data(vec![(GVA_PREFERENCES, pref)])]),
+        )
+        .unwrap();
     }
 
     fn data<'a>(files: Vec<(&'a str, &'a [u8])>) -> Vol<'a> {
@@ -1113,62 +803,10 @@ pub(crate) mod tests {
         }
     }
 
-    fn system_version(version: &str, build: &str) -> Vec<u8> {
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-  <key>ProductBuildVersion</key><string>{build}</string>
-  <key>ProductName</key><string>macOS</string>
-  <key>ProductVersion</key><string>{version}</string>
-</dict></plist>"#
-        )
-        .into_bytes()
-    }
-
     const GROUP: [u8; 16] = [
         0xd3, 0x6e, 0x3c, 0x34, 0xbd, 0xaf, 0x44, 0xaa, 0xbe, 0x65, 0x17, 0xc5, 0xdd, 0x68, 0x6b,
         0xc1,
     ];
-
-    fn read(img: &[u8], name: &str) -> Result<Vec<Macos>> {
-        let d = std::env::temp_dir().join(format!("reims-ctl-macos-{name}-{}", std::process::id()));
-        std::fs::write(&d, img).unwrap();
-        let r = on_disk(&d, ImageFormat::Raw);
-        std::fs::remove_file(&d).unwrap();
-        r
-    }
-
-    /// The macOS of an install whose Preboot directory names its volume group, read from its
-    /// SystemVersion.plist; a directory naming no volume of the container, as an install
-    /// removed leaves, is none.
-    #[test]
-    fn a_disk_tells_the_macos_its_preboot_volume_holds() {
-        let ours = system_version("15.6.1", "24G90");
-        let stale = system_version("14.0", "23A344");
-        let installs = [
-            ("D36E3C34-BDAF-44AA-BE65-17C5DD686BC1", &ours[..]),
-            ("00112233-4455-6677-8899-AABBCCDDEEFF", &stale[..]),
-        ];
-        let (mut pre, paths) = preboot(&installs);
-        pre.files = paths
-            .iter()
-            .zip(&installs)
-            .map(|(p, (_, b))| (p.as_str(), *b))
-            .collect();
-        let img = disk(&[pre, data(Vec::new())]);
-        let found = read(&img, "one").unwrap();
-        assert_eq!(
-            found,
-            [Macos {
-                version: "15.6.1".into(),
-                build: Some("24G90".into())
-            }]
-        );
-        // A damaged object, the Preboot volume's tree, is an error, not a disk without macOS.
-        let mut bad = img.clone();
-        bad[40 * 512 + 6 * BS + 100] ^= 1;
-        assert!(read(&bad, "bad").is_err());
-    }
 
     /// A guest whose Data volume's AppleGVA preferences set gvaForceAMDKE, as RgfxGate leaves
     /// them, is told, with the file's other keys counted; one without the key, or without the
@@ -1197,7 +835,7 @@ pub(crate) mod tests {
             memory_mib = 4096
             disk = "disk.img"
             disk_format = "raw"
-            graphics = "apple-gfx"
+            graphics = "vmware-svga"
             [q35]
             opencore = "opencore.img"
             firmware_code = "OVMF_CODE.fd"
@@ -1208,8 +846,7 @@ pub(crate) mod tests {
         let vm = Vm::load(&dir).unwrap();
         let note = || gva_note(&vm).unwrap_or_default();
         let with = |files: Vec<(&str, &[u8])>| {
-            let (pre, _) = preboot(&[]);
-            std::fs::write(dir.join("disk.img"), disk(&[pre, data(files)])).unwrap();
+            std::fs::write(dir.join("disk.img"), disk(&[preboot(), data(files)])).unwrap();
             gva_forced(&vm)
         };
         assert_eq!(with(vec![(GVA_PREFERENCES, &forced)]), Some(0));
@@ -1226,80 +863,5 @@ pub(crate) mod tests {
             None
         );
         assert_eq!(with(Vec::new()), None);
-    }
-
-    /// A disk with no GPT, as a new one is, or no APFS container, holds no macOS.
-    #[test]
-    fn a_new_disk_holds_no_macos() {
-        assert_eq!(read(&vec![0u8; 1 << 16], "empty").unwrap(), []);
-        let (pre, _) = preboot(&[]);
-        let mut img = disk(&[pre, data(Vec::new())]);
-        assert_eq!(read(&img, "no-install").unwrap(), []);
-        img[1024] ^= 0xff;
-        assert_eq!(read(&img, "no-apfs").unwrap(), []);
-    }
-
-    /// The Darwin version of a release: its build's number and letter, else its macOS's number's
-    /// major and the newest minor.
-    #[test]
-    fn a_release_runs_the_darwin_version_its_build_names() {
-        let m = |v: &str, b: Option<&str>| Macos {
-            version: v.into(),
-            build: b.map(String::from),
-        };
-        assert_eq!(m("26.7.2", Some("25G332")).darwin(), Some((25, 6)));
-        assert_eq!(m("26.4", Some("25E246")).darwin(), Some((25, 4)));
-        assert_eq!(m("26.4", Some("25E5207k")).darwin(), Some((25, 4)));
-        assert_eq!(m("26", None).darwin(), Some((25, 99)));
-        assert_eq!(m("15", None).darwin(), Some((24, 99)));
-        assert_eq!(m("15.6.1", None).darwin(), Some((24, 99)));
-        assert_eq!(m("10.15", None).darwin(), Some((19, 99)));
-        assert_eq!(m("tahoe", None).darwin(), None);
-        assert_eq!(release_of(25, 4), "26.4");
-        assert_eq!(release_of(24, 6), "15.6");
-    }
-
-    /// reims-vgpu where the guest's kexts load on every macOS found, which the tests' set bounds
-    /// to Darwin 25.4.0 to 25.99.99; apple-gfx where they don't load on one; none for nothing
-    /// found.
-    #[test]
-    fn the_graphics_follow_the_guests_macos() {
-        let m = |v: &str, b: &str| Macos {
-            version: v.into(),
-            build: Some(b.into()),
-        };
-        let online = |v: &str| Macos {
-            version: v.into(),
-            build: None,
-        };
-        assert_eq!(graphics_for(&[]), None);
-        assert_eq!(
-            graphics_for(&[m("26.4", "25E246")]),
-            Some(Graphics::ReimsVgpu)
-        );
-        assert_eq!(graphics_for(&[online("26")]), Some(Graphics::ReimsVgpu));
-        assert_eq!(
-            graphics_for(&[m("26.3.1", "25D2128")]),
-            Some(Graphics::AppleGfx)
-        );
-        assert_eq!(graphics_for(&[online("15")]), Some(Graphics::AppleGfx));
-        assert_eq!(
-            graphics_for(&[m("26.7.2", "25G332"), m("15.6.1", "24G90")]),
-            Some(Graphics::AppleGfx)
-        );
-        assert_eq!(graphics_for(&[online("27")]), Some(Graphics::AppleGfx));
-        let note = create_note("t", &[m("15.6.1", "24G90")], Graphics::AppleGfx, false).unwrap();
-        assert!(
-            note.starts_with("macOS 15.6.1 (24G90) is older than macOS 26.4"),
-            "{note}"
-        );
-        assert_eq!(
-            create_note("t", &[m("26.4", "25E246")], Graphics::ReimsVgpu, false),
-            None
-        );
-        let given = create_note("t", &[online("15")], Graphics::ReimsVgpu, true).unwrap();
-        assert!(given.contains("--graphics apple-gfx"), "{given}");
-        let newer = create_note("t", &[online("27")], Graphics::AppleGfx, false).unwrap();
-        assert!(newer.contains("newer than macOS 26,"), "{newer}");
     }
 }

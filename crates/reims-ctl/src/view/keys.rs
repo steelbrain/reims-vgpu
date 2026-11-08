@@ -289,7 +289,7 @@ pub fn point(x: u16, y: u16, pixel: Option<(u16, u16)>, p: Place) -> (f64, f64, 
 }
 
 /// The tablet's position at a fraction of the way across and down the display: the pixel there
-/// times 0x7fff over the display's size, as apple-gfx's own window sends it.
+/// times 0x7fff over the display's size, as QEMU's own windows send it.
 pub fn abs(fx: f64, fy: f64) -> Ev {
     let axis = |f: f64| (f.clamp(0.0, 1.0) * 32767.0).round() as u16;
     Ev::Abs(axis(fx), axis(fy))

@@ -18,7 +18,6 @@
 //! - QEMU opens the device's file, `/dev/bus/usb/BBB/DDD`, which only root may write unless a
 //!   udev rule says otherwise: scripts/install-ctl.sh adds one ([`UDEV_RULE`]), which gives USB
 //!   devices other than hubs to the kvm group and to the user at the host's screen.
-//! - A macOS host has none ([`MAC_HOST`]).
 
 use crate::vm::{UsbDevice, Vm, parse_usb_port};
 use crate::{qmp, runtime};
@@ -26,15 +25,6 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-/// Why a macOS host passes no USB device through: macOS's IOKit gives a USB device that one of
-/// its drivers holds, which is almost every device, to another process only when that process
-/// runs as root or holds `com.apple.vm.device-access`, an entitlement Apple grants VM apps with
-/// a provisioning profile (libusb's `darwin_detach_kernel_driver`), which no QEMU built here
-/// can hold.
-pub const MAC_HOST: &str = "USB passthrough needs a Linux host: macOS gives a USB device that \
-    one of its drivers holds, almost any device, only to a program running as root or holding an \
-    entitlement Apple grants VM apps, and QEMU here can't hold it";
 
 /// The udev rule scripts/install-ctl.sh writes, and where: USB devices other than hubs to the
 /// kvm group (over SSH too) and to the user at the host's screen (`uaccess`, which needs a file

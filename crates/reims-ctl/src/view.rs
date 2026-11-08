@@ -6,10 +6,10 @@
 //! Everything goes through the VM's QMP socket, so it works on any running VM:
 //! - A frame is QMP's `screendump` of the display's console: a PPM, written into a directory of
 //!   the viewer's own under `$XDG_RUNTIME_DIR` (or `/dev/shm`, or the temporary directory),
-//!   removed when it ends, or by the next viewer where it was killed (`FrameDir`). For
-//!   it, apple-gfx draws the guest's newest frame into the console's surface
-//!   (vendor/qemu hw/display/apple-gfx.c, `apple_gfx_fb_update_display`), rendering and reading
-//!   it back only when the guest has presented a frame since the last.
+//!   removed when it ends, or by the next viewer where it was killed (`FrameDir`). For it,
+//!   reims-graphics-pci reads back what its display shows from the library at each of the
+//!   console's updates (vendor/qemu hw/display/reims-graphics-pci.c,
+//!   `rvg_graphics_device_read_display`).
 //! - Input is `input-send-event`: the USB tablet's absolute position and buttons, and the USB
 //!   keyboard's keys (keys.rs).
 //!
@@ -37,7 +37,6 @@ mod term;
 
 pub use term::Protocol;
 
-use crate::host::Profile;
 use crate::qmp::Qmp;
 use crate::runtime;
 use crate::vm::Vm;
@@ -67,8 +66,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct Options {
-    /// The display, from 1.
-    pub display: u32,
     /// The most frames a second.
     pub fps: u32,
     /// How to draw frames; asked of the terminal when `None`.
@@ -78,7 +75,6 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Options {
         Options {
-            display: 1,
             fps: 15,
             protocol: None,
         }
@@ -105,7 +101,7 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
     if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
         bail!("reims-ctl view draws in a terminal: run it in one");
     }
-    let target = Target::for_vm(vm, opts.display)?;
+    let target = Target::for_vm(vm);
     let dir = FrameDir::new()?;
     let file = dir.0.join("frame.ppm");
     // A screendump before the terminal is taken, so that what stops one shows plainly.
@@ -172,7 +168,6 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
 
     let mut v = View {
         name,
-        display: opts.display,
         proto,
         caps,
         blocks: None,
@@ -194,40 +189,21 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
 /// Where QMP finds the display.
 struct Target {
     socket: PathBuf,
-    /// The display device's id and the display's head. vmapple's apple-gfx-mmio has no id; its
-    /// first display is console 0, QMP's default.
-    device: Option<(&'static str, u32)>,
+    /// The display device's id: qemu.rs gives reims-graphics-pci or vmware-svga the id gfx.
+    device: &'static str,
 }
 
 impl Target {
-    fn for_vm(vm: &Vm, display: u32) -> Result<Target> {
-        let count = vm.config.display_count();
-        if display == 0 || display > count {
-            bail!(
-                "{} has {count} display{}: --display takes 1 to {count}",
-                vm.name(),
-                if count == 1 { "" } else { "s" }
-            );
-        }
-        let device = match vm.config.profile {
-            // qemu.rs gives reims-graphics-pci, apple-gfx-pci or vmware-svga the id gfx.
-            Profile::Q35X86_64 => Some(("gfx", display - 1)),
-            Profile::VmappleArm64 if display == 1 => None,
-            Profile::VmappleArm64 => {
-                bail!("a vmapple VM's displays past the first have no name QMP can take")
-            }
-        };
-        Ok(Target {
+    fn for_vm(vm: &Vm) -> Target {
+        Target {
             socket: vm.qmp_socket(),
-            device,
-        })
+            device: "gfx",
+        }
     }
 
     fn with_device(&self, mut v: Value) -> Value {
-        if let Some((d, head)) = self.device {
-            v["device"] = json!(d);
-            v["head"] = json!(head);
-        }
+        v["device"] = json!(self.device);
+        v["head"] = json!(0);
         v
     }
 
@@ -448,7 +424,6 @@ enum Ui {
 
 struct View {
     name: String,
-    display: u32,
     proto: Protocol,
     caps: term::Caps,
     /// Half blocks on the screen, where they draw the frame.
@@ -623,14 +598,14 @@ fn toolbar(name: &str, latch: Mods) -> (Line<'static>, Vec<(u16, u16, Mods)>) {
 }
 
 fn status(v: &View) -> Line<'static> {
-    let mut s = format!(" display {}", v.display);
+    let mut s;
     if let Some(Shown {
         frame: (fw, fh),
         sent: (sw, sh),
         bytes,
     }) = v.frame
     {
-        s.push_str(&format!(" · {fw}×{fh}"));
+        s = format!(" {fw}×{fh}");
         match v.proto {
             Protocol::Blocks => s.push_str(" · half blocks"),
             p => s.push_str(&format!(" · {} {sw}×{sh}", p.name())),
@@ -640,7 +615,7 @@ fn status(v: &View) -> Line<'static> {
             s.push_str(&format!(" · {} KB a frame", bytes.div_ceil(1024)));
         }
     } else {
-        s.push_str(&format!(" · {}", v.proto.name()));
+        s = format!(" {}", v.proto.name());
     }
     let mut spans = vec![Span::styled(s, BAR)];
     if let Some((n, at)) = &v.note

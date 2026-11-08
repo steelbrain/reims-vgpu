@@ -6,8 +6,6 @@
 //! drives several GPUs, the PCI device ID (`VK_LOADER_DEVICE_ID_FILTER`). The list comes from
 //! asking each manifest's driver in a child process (`reims-ctl __vulkan-probe`), so a driver
 //! that hangs or crashes costs only that one.
-//!
-//! On macOS the library runs on the system's default Metal device; there is nothing to choose.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

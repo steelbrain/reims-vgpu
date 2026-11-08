@@ -15,9 +15,7 @@ use crate::form::{self, Field, Form, opts};
 use crate::gpu::GpuInfo;
 use crate::host::{Host, Os, Profile};
 use crate::update::Channel;
-use crate::vm::{
-    DiskController, Graphics, Registry, Vm, format_mib, parse_resolution, parse_size_mib,
-};
+use crate::vm::{DiskController, Graphics, Registry, Vm, format_mib, parse_size_mib};
 use crate::{install, logs, opencore, paths, reims_util, runtime, update, usb};
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
@@ -557,10 +555,7 @@ impl App {
         }
         match self.overlay.take() {
             Some(Overlay::Form(kind, mut f)) => match f.handle_key(k) {
-                form::Event::None => {
-                    display_help(&mut f);
-                    self.overlay = Some(Overlay::Form(kind, f))
-                }
+                form::Event::None => self.overlay = Some(Overlay::Form(kind, f)),
                 form::Event::Cancel => {
                     if let Some((id, _)) = f.busy {
                         self.closed_forms.insert(id, (kind, f));
@@ -1111,12 +1106,11 @@ impl App {
             title: format!("Make {name} a new OpenCore image?"),
             body: format!(
                 "reims-util makes it a new OpenCore image for its graphics, {}, with what it \
-                 carries now, such as ReimsVgpu.kext, which macOS 26 needs for a display wider \
-                 than 2048 pixels and for GPU-accelerated Chrome on apple-gfx, and on reims-vgpu \
-                 the macOS drivers of its GPU device that this reims-ctl carries. It presents the \
-                 same Mac, a {} with serial {}, and the VM keeps its OVMF variables, which hold \
-                 its boot entries, and its boot selection (e changes it).\n\nThe image it \
-                 replaces is deleted, with anything else changed in it.",
+                 carries now, and on reims-vgpu the macOS drivers of its GPU device that this \
+                 reims-ctl carries. It presents the same Mac, a {} with serial {}, and the VM \
+                 keeps its OVMF variables, which hold its boot entries, and its boot selection \
+                 (e changes it).\n\nThe image it replaces is deleted, with anything else \
+                 changed in it.",
                 vm.config.graphics().id(),
                 id.model,
                 id.serial
@@ -1440,67 +1434,50 @@ impl App {
 
     fn open_create(&mut self) {
         let Some(profile) = self.host.default_profile() else {
-            self.say(
-                &format!("reims-ctl runs no VMs on {} yet", self.host),
-                Level::Error,
-            );
+            self.say(crate::host::UNSUPPORTED, Level::Error);
             return;
         };
-        let name = match profile {
-            Profile::Q35X86_64 => Field::text(
+        let mut fields = vec![
+            Field::text(
                 "name",
                 "Name",
                 "",
                 "Letters, digits, '-', '_' and '.'. Empty names a VM of downloaded macOS after it.",
             )
             .placeholder("the macOS version's, such as tahoe"),
-            Profile::VmappleArm64 => {
-                Field::text("name", "Name", "", "Letters, digits, '-', '_' and '.'.")
-            }
-        };
-        let mut fields = vec![name];
-        match profile {
-            Profile::Q35X86_64 => {
-                if !matches!(self.macos_versions, Some(Ok(_))) {
-                    self.macos_versions =
-                        Some(reims_util::versions().map_err(|e| format!("{e:#}")));
-                }
-                let (options, version_help) = match &self.macos_versions {
-                    Some(Ok(list)) if !list.is_empty() => (
-                        list.iter()
-                            .map(|v| (v.slug.clone(), v.name.clone()))
-                            .collect(),
-                        "The macOS to download from Apple. x86-64 macOS 26 is the one we've tested.".to_string(),
-                    ),
-                    Some(Ok(_)) => (opts(&[("", "none")]), "reims-util lists no versions.".to_string()),
-                    Some(Err(e)) => (opts(&[("", "unavailable")]), e.clone()),
-                    None => (opts(&[("", "unavailable")]), String::new()),
-                };
-                let first = options.first().map(|o| o.0.clone()).unwrap_or_default();
-                fields.extend([
-                    Field::choice("source", "macOS from", opts(&[("download", "Download it from Apple"), ("installer", "An installer image of my own"), ("disk", "A disk that has macOS already")]), "download", "reims-ctl downloads the installer, makes the VM's OpenCore image and a new disk, and the VM boots into the installer."),
-                    Field::choice("macos", "macOS version", options, &first, &version_help).show_if("source", &["download"]),
-                    Field::choice("installer_kind", "Installer", opts(&[("online", "Online, about 1 GB"), ("offline", "Offline, 13 to 20 GB")]), "online", "Online is Apple's recovery image: macOS downloads the newest release as it installs. Offline holds one release whole, and installs with no network (macOS 11 and later). Either is kept for the next VM, and a stopped download picks up where it stopped.").show_if("source", &["download"]),
-                    Field::text("release", "Release", "", "Optional: an exact release of that macOS, such as 26.6.2; empty for the newest. reims-util offline-installer list lists them.").placeholder("the newest").show_if("installer_kind", &["offline"]),
-                    Field::path("installer", "Installer image", "", "An installer to boot (Tab completes): a raw image, such as a recovery image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory. Eject it once macOS is installed (e).").show_if("source", &["installer"]),
-                    Field::text("disk_size", "Disk size", "128G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["download", "installer"]),
-                    Field::path("disk_path", "Disk image", "", "A qcow2 or raw image (Tab completes).").show_if("source", &["disk"]),
-                    Field::choice("disk_mode", "Use the disk by", opts(&[("copy", "Copying it (instant where the file system reflinks)"), ("in-place", "Using it in place")]), "copy", "A copy leaves the image as it was; in place, the VM writes the image itself.")
-                        .show_if("source", &["disk"]),
-                    Field::path("opencore", "OpenCore image", "", "Empty makes one for this VM, with OVMF and a Mac identity of its own. Or an OpenCore image of yours to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it, such as the one a disk of macOS booted from, which keeps its Mac's identity.")
-                        .placeholder("made for this VM"),
-                ]);
-            }
-            Profile::VmappleArm64 => {
-                fields.extend([
-                    Field::choice("source", "macOS from", opts(&[("ipsw", "Install from an IPSW"), ("import", "Import a Virtualization.framework VM")]), "ipsw", "Install a fresh macOS, or bring a VM made with macosvm or tart."),
-                    Field::path("ipsw", "IPSW", "latest", "An .ipsw restore image (Tab completes), or latest to download the newest this Mac supports (about 15 GB).").show_if("source", &["ipsw"]),
-                    Field::text("disk_size", "Disk size", "64G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["ipsw"]),
-                    Field::path("bundle", "VM directory", "", "macosvm's directory (disk.img, aux.img, vm.json) or tart's (disk.img, nvram.bin, config.json).").show_if("source", &["import"]),
-                    Field::choice("bundle_mode", "Use it by", opts(&[("copy", "Cloning it (instant on the same APFS volume)"), ("in-place", "Using it in place")]), "copy", "A clone leaves the original as it was.").show_if("source", &["import"]),
-                ]);
-            }
+        ];
+        if !matches!(self.macos_versions, Some(Ok(_))) {
+            self.macos_versions = Some(reims_util::versions().map_err(|e| format!("{e:#}")));
         }
+        let (options, version_help) = match &self.macos_versions {
+            Some(Ok(list)) if !list.is_empty() => (
+                list.iter()
+                    .map(|v| (v.slug.clone(), v.name.clone()))
+                    .collect(),
+                "The macOS to download from Apple. x86-64 macOS 26 is the one we've tested."
+                    .to_string(),
+            ),
+            Some(Ok(_)) => (
+                opts(&[("", "none")]),
+                "reims-util lists no versions.".to_string(),
+            ),
+            Some(Err(e)) => (opts(&[("", "unavailable")]), e.clone()),
+            None => (opts(&[("", "unavailable")]), String::new()),
+        };
+        let first = options.first().map(|o| o.0.clone()).unwrap_or_default();
+        fields.extend([
+            Field::choice("source", "macOS from", opts(&[("download", "Download it from Apple"), ("installer", "An installer image of my own"), ("disk", "A disk that has macOS already")]), "download", "reims-ctl downloads the installer, makes the VM's OpenCore image and a new disk, and the VM boots into the installer."),
+            Field::choice("macos", "macOS version", options, &first, &version_help).show_if("source", &["download"]),
+            Field::choice("installer_kind", "Installer", opts(&[("online", "Online, about 1 GB"), ("offline", "Offline, 13 to 20 GB")]), "online", "Online is Apple's recovery image: macOS downloads the newest release as it installs. Offline holds one release whole, and installs with no network (macOS 11 and later). Either is kept for the next VM, and a stopped download picks up where it stopped.").show_if("source", &["download"]),
+            Field::text("release", "Release", "", "Optional: an exact release of that macOS, such as 26.6.2; empty for the newest. reims-util offline-installer list lists them.").placeholder("the newest").show_if("installer_kind", &["offline"]),
+            Field::path("installer", "Installer image", "", "An installer to boot (Tab completes): a raw image, such as a recovery image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory. Eject it once macOS is installed (e).").show_if("source", &["installer"]),
+            Field::text("disk_size", "Disk size", "128G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["download", "installer"]),
+            Field::path("disk_path", "Disk image", "", "A qcow2 or raw image (Tab completes).").show_if("source", &["disk"]),
+            Field::choice("disk_mode", "Use the disk by", opts(&[("copy", "Copying it (instant where the file system reflinks)"), ("in-place", "Using it in place")]), "copy", "A copy leaves the image as it was; in place, the VM writes the image itself.")
+                .show_if("source", &["disk"]),
+            Field::path("opencore", "OpenCore image", "", "Empty makes one for this VM, with OVMF and a Mac identity of its own. Or an OpenCore image of yours to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it, such as the one a disk of macOS booted from, which keeps its Mac's identity.")
+                .placeholder("made for this VM"),
+        ]);
         fields.extend([
             Field::path(
                 "dir",
@@ -1528,9 +1505,7 @@ impl App {
                 ),
             ),
         ]);
-        if profile == Profile::Q35X86_64 {
-            fields.push(graphics_field(Graphics::default_for(profile)));
-        }
+        fields.push(graphics_field(Graphics::default()));
         if profile.gpu_choice(self.host) {
             fields.push(
                 self.gpu_field(&crate::vm::Gpu::default())
@@ -1538,16 +1513,8 @@ impl App {
             );
         }
         fields.extend([
-            Field::text(
-                "displays",
-                "Displays",
-                "1",
-                "1 to 8, each in a window of its own.",
-            )
-            .show_if("graphics", APPLE_GFX),
             Field::text("resolution", "Resolution", "1920x1080", RESOLUTION_HELP)
                 .show_if("graphics", LIBRARY),
-            Field::toggle("hidpi", "HiDPI", false, HIDPI_HELP).show_if("graphics", APPLE_GFX),
             Field::toggle(
                 "logs",
                 "Logs",
@@ -1562,8 +1529,7 @@ impl App {
             )
             .placeholder("optional"),
         ]);
-        let mut form = Form::new("New VM", "create", fields);
-        display_help(&mut form);
+        let form = Form::new("New VM", "create", fields);
         self.overlay = Some(Overlay::Form(FormKind::Create, form));
     }
 
@@ -1579,19 +1545,9 @@ impl App {
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
         ];
-        // The displays' and video acceleration's fields are apple-gfx's, and borderless and the
-        // GPU's the library's devices'; an arm64 VM has no other than apple-gfx.
-        if c.profile == Profile::Q35X86_64 {
-            fields.push(graphics_field(c.graphics()));
-        }
+        // The resolution's, borderless's and the GPU's fields are reims-vgpu's.
+        fields.push(graphics_field(c.graphics()));
         fields.extend([
-            Field::text(
-                "displays",
-                "Displays",
-                &c.display.count.to_string(),
-                "1 to 8, each in a window of its own.",
-            )
-            .show_if("graphics", APPLE_GFX),
             Field::text(
                 "resolution",
                 "Resolution",
@@ -1599,42 +1555,24 @@ impl App {
                 RESOLUTION_HELP,
             )
             .show_if("graphics", LIBRARY),
-            Field::toggle("hidpi", "HiDPI", c.display.hidpi, HIDPI_HELP)
-                .show_if("graphics", APPLE_GFX),
             Field::toggle(
                 "borderless",
                 "Borderless",
                 c.display.borderless,
-                "Windows without borders that fill their screens.",
+                "A window without borders that fills its screen.",
             )
             .show_if("graphics", LIBRARY),
-            Field::text(
-                "refresh",
-                "Refresh rate",
-                &c.display.refresh.map(|r| r.to_string()).unwrap_or_default(),
-                "Hz offered to the guest; empty for the host screen's.",
-            )
-            .placeholder("the host screen's")
-            .show_if("graphics", APPLE_GFX),
         ]);
         if c.profile.gpu_choice(self.host) {
             fields.push(self.gpu_field(&c.gpu).show_if("graphics", LIBRARY));
         }
         fields.extend([
             Field::toggle(
-                "video_acceleration",
-                "Video acceleration",
-                c.video_acceleration,
-                "The guest decodes, encodes and scales video on the host's hardware. Off, it \
-                 does all of that in software.",
-            )
-            .show_if("graphics", APPLE_GFX),
-            Field::toggle(
                 "audio",
                 "Audio",
                 c.audio.enabled,
-                "A virtio sound device on the host's sound, with a microphone (on x86-64, also \
-                 the HDA controller OpenCore's boot chime plays on).",
+                "A virtio sound device on the host's sound, with a microphone, and the HDA \
+                 controller OpenCore's boot chime plays on.",
             ),
             Field::toggle(
                 "logs",
@@ -1742,8 +1680,7 @@ impl App {
         } else {
             ""
         };
-        let mut form = Form::new(&format!("Edit {}{note}", c.name), "save", fields);
-        display_help(&mut form);
+        let form = Form::new(&format!("Edit {}{note}", c.name), "save", fields);
         self.overlay = Some(Overlay::Form(FormKind::Edit(c.name.clone()), form));
     }
 
@@ -1757,8 +1694,6 @@ impl App {
                     let vm = create::create(spec, host, p)?;
                     let next = if runtime::install_steps(&vm).is_some() {
                         "; its details say how to install macOS"
-                    } else if runtime::needs_error_mode(&vm) {
-                        "; set Metal's error mode in its macOS if it isn't (README)"
                     } else {
                         ""
                     };
@@ -1872,45 +1807,14 @@ impl App {
                 }
                 s.opencore = opt_path("opencore");
             }
-            Some(Profile::VmappleArm64) => {
-                if f.choice("source") == "ipsw" {
-                    let i = f.text("ipsw");
-                    if i.is_empty() {
-                        bail!("give an IPSW, or latest");
-                    }
-                    s.ipsw = Some(if i == "latest" {
-                        i
-                    } else {
-                        paths::absolute(&i).to_string_lossy().into_owned()
-                    });
-                    s.disk = Some(DiskSource::New {
-                        size_mib: parse_size_mib(&f.text("disk_size")).context("disk size")?,
-                    });
-                } else {
-                    s.bundle = Some(opt_path("bundle").context("give the VM's directory")?);
-                    s.bundle_mode = ImportMode::parse(&f.choice("bundle_mode"))?;
-                }
-            }
-            None => bail!("this host runs no VMs"),
+            None => bail!(crate::host::UNSUPPORTED),
         }
-        // The default, as the form offers it, is none given: the VM runs the device for its
-        // macOS (macos.rs), the default where its macOS runs it.
         if f.is_shown("graphics") {
-            let g = Graphics::parse(&f.choice("graphics"))?;
-            s.graphics = self
-                .host
-                .default_profile()
-                .is_none_or(|p| g != Graphics::default_for(p))
-                .then_some(g);
+            s.graphics = Some(Graphics::parse(&f.choice("graphics"))?);
         }
-        // Hidden on reims-vgpu, whose one display follows its window: the defaults, which it
-        // honors. The resolution is its window's first size there.
+        // Hidden on VMware SVGA, which opens at the firmware's resolution: the default.
         if f.is_shown("resolution") {
             s.display.resolution = f.text("resolution");
-        }
-        if f.is_shown("displays") {
-            s.display.count = f.text("displays").parse().context("displays: a number")?;
-            s.display.hidpi = f.toggle("hidpi");
         }
         s.display.check()?;
         s.logs = f.toggle("logs");
@@ -2290,8 +2194,8 @@ fn vm_menu(row: &VmRow, all: bool, host: Host) -> Vec<(VmCommand, &'static str)>
 /// Whether the VM can be given the host's USB devices: an x86-64 VM on a Linux host. Else why
 /// not, to say.
 fn usb_available(host: Host, vm: &Vm) -> Result<(), String> {
-    if host.os != Os::Linux {
-        return Err(usb::MAC_HOST.into());
+    if host.default_profile().is_none() {
+        return Err(crate::host::UNSUPPORTED.into());
     }
     if vm.config.q35.is_none() {
         return Err(format!(
@@ -2336,16 +2240,15 @@ fn gpu_from_choice(id: &str, list: &[GpuInfo]) -> crate::vm::Gpu {
     }
 }
 
-const RESOLUTION_HELP: &str = "apple-gfx: the guest's first mode, WIDTHxHEIGHT, or host for the \
-     host screen's own modes and density. reims-vgpu: the size its window opens at, \
-     WIDTHxHEIGHT in the desktop's points, shrunk to fit the screen; the guest takes the \
-     window's size in pixels, and follows it as you resize it.";
+const RESOLUTION_HELP: &str = "The size the window opens at, WIDTHxHEIGHT in the desktop's \
+     points, shrunk to fit the screen; the guest takes the window's size in pixels, and follows \
+     it as you resize it. It starts a HiDPI desktop by itself in a window at least 3840 pixels \
+     wide.";
 
-/// The graphics field's values that show a field of apple-gfx's alone, and one of the library's.
-const APPLE_GFX: &[&str] = &["apple-gfx"];
-const LIBRARY: &[&str] = &["reims-vgpu", "apple-gfx"];
+/// The graphics field's values that show a field of the library's.
+const LIBRARY: &[&str] = &["reims-vgpu"];
 
-/// The graphics choice of an x86-64 VM, at `current`.
+/// The graphics choice of a VM, at `current`.
 fn graphics_field(current: Graphics) -> Field {
     let options = Graphics::ALL.map(|g| (g.id().to_string(), g.describe().to_string()));
     Field::choice(
@@ -2355,45 +2258,10 @@ fn graphics_field(current: Graphics) -> Field {
         current.id(),
         "reims-vgpu is its own GPU device, which macOS drives with the drivers reims-ctl puts in \
          the VM's OpenCore image (after a change to it, U makes the image again): one display, \
-         in a window whose size the guest follows. apple-gfx is Apple's paravirtualized GPU, \
-         with up to 8 displays and the host's video hardware. VMware SVGA is QEMU's: one \
+         in a window whose size the guest follows. VMware SVGA is QEMU's: one \
          display at the firmware's resolution, with no GPU acceleration (macOS has no driver \
          for it), in QEMU's own window.",
     )
-}
-
-const HIDPI_HELP: &str = "Run the mode at twice the density, as a Retina screen does: the desktop \
-     looks like half the mode, so a larger mode makes everything smaller (3840x2160 looks like \
-     1920x1080, 3200x1800 like 1600x900, 2560x1440 like 1280x720). Needs a mode at least 1920 \
-     pixels wide.";
-
-/// The resolution's and HiDPI's help, each ending with what the desktop looks like at the
-/// values the form holds now.
-fn display_help(f: &mut Form) {
-    if !f.is_shown("resolution") || !f.is_shown("hidpi") {
-        return;
-    }
-    let resolution = f.text("resolution");
-    let hidpi = f.toggle("hidpi");
-    let looks_like = |hidpi| {
-        crate::vm::Display {
-            resolution: resolution.clone(),
-            hidpi,
-            ..Default::default()
-        }
-        .looks_like()
-    };
-    let now = match (parse_resolution(&resolution), looks_like(true)) {
-        _ if resolution == "host" && hidpi => {
-            "host takes the host screen's own density: turn HiDPI off.".to_string()
-        }
-        (Ok(_), Some((w, h))) if hidpi => format!("Now {resolution} looks like {w}x{h}."),
-        (Ok(_), Some((w, h))) => format!("At HiDPI, {resolution} would look like {w}x{h}."),
-        (Ok((w, _)), None) if hidpi => format!("{w} pixels wide is narrower than 1920."),
-        _ => String::new(),
-    };
-    f.set_help("resolution", &format!("{RESOLUTION_HELP} {now}"));
-    f.set_help("hidpi", &format!("{HIDPI_HELP} {now}"));
 }
 
 /// The VM's installer as the edit form shows it: its full path, or empty.
@@ -2445,36 +2313,19 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     let c = &mut vm.config;
     c.cpus = f.text("cpus").parse().context("CPU cores: a number")?;
     c.memory_mib = parse_size_mib(&f.text("memory")).context("memory")?;
-    // A VM whose settings name no graphics keeps none where the choice stays the default it
-    // runs, which its first start may decide from its macOS (macos.rs).
     if f.is_shown("graphics") {
-        let g = Graphics::parse(&f.choice("graphics"))?;
-        if c.graphics.is_some() || g != c.graphics() {
-            c.graphics = Some(g);
-        }
+        c.graphics = Some(Graphics::parse(&f.choice("graphics"))?);
     }
     if f.is_shown("disk_controller")
         && let Some(q) = &mut c.q35
     {
         q.disk_controller = DiskController::parse(&f.choice("disk_controller"))?;
     }
-    // Hidden on reims-vgpu and VMware SVGA, the displays' settings stay as they were for
-    // apple-gfx; the resolution, its window's first size, and borderless are reims-vgpu's too.
+    // Hidden on VMware SVGA, the resolution, the window's first size, and borderless stay as
+    // they were.
     if f.is_shown("resolution") {
         c.display.resolution = f.text("resolution");
-        if c.graphics() == Graphics::ReimsVgpu {
-            crate::vm::check_reims_vgpu_display(None, Some(&c.display.resolution), None, None)?;
-        }
-    }
-    if f.is_shown("displays") {
-        c.display.count = f.text("displays").parse().context("displays: a number")?;
-        c.display.hidpi = f.toggle("hidpi");
-        let r = f.text("refresh");
-        c.display.refresh = if r.is_empty() {
-            None
-        } else {
-            Some(r.parse().context("refresh rate: a number")?)
-        };
+        c.display.check()?;
     }
     if f.is_shown("borderless") {
         c.display.borderless = f.toggle("borderless");
@@ -2484,10 +2335,6 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
         if id != gpu_id(&c.gpu) {
             c.gpu = gpu_from_choice(&id, gpus.unwrap_or(&[]));
         }
-    }
-    // Hidden on reims-vgpu and VMware SVGA, which have no video devices, it stays as it was.
-    if f.is_shown("video_acceleration") {
-        c.video_acceleration = f.toggle("video_acceleration");
     }
     c.audio.enabled = f.toggle("audio");
     c.logs.enabled = f.toggle("logs");
@@ -2608,16 +2455,15 @@ fn copy_to_clipboard(s: &str) -> Option<&'static str> {
 }
 
 const HELP: &str = "\
-reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in windows of their own.
-An x86-64 VM runs reims-vgpu's own GPU device on macOS 26.4 and later, and apple-gfx on an older
-macOS, unless its settings choose another (e, graphics).
+reims-ctl runs x86-64 macOS VMs on QEMU with reims-vgpu: each VM's display opens in a window of
+its own. A VM runs reims-vgpu's own GPU device unless its settings choose another (e, graphics).
 
   ↑ ↓ / j k   choose a VM, or click it
   Enter       open its menu: what can be done with it now, each with its key. A right
               click on a VM opens its menu too. Hold Ctrl as you press Enter or right click
               for a menu of everything, whether it can be done now or not (Ctrl-Enter needs
               a terminal that tells it from Enter, such as kitty, foot or Ghostty on a Mac)
-  n           create a VM. On Linux, choose a macOS version: reims-ctl downloads its
+  n           create a VM. Choose a macOS version: reims-ctl downloads its
               installer from Apple and makes the VM's OpenCore image and disk, and the VM
               boots into the installer; its details then say how to install macOS. The form
               stays open until the VM is made, and shows what failed, to fix and create again;
@@ -2626,19 +2472,16 @@ macOS, unless its settings choose another (e, graphics).
   x           stop it: the guest is asked to shut down, and powered off if it has not
               when its shutdown timeout ends (edit e to change it)
   K           kill it: power it off at once
-  e           edit its settings: CPUs, memory, displays, resolution, HiDPI, borderless,
-              GPU, video acceleration (the host's hardware video decode, encode and
-              scaling), audio, network, logs, extra QEMU arguments (they apply at its next
-              start), and on x86-64 its disk controller (SATA, or NVMe once macOS is
-              installed), its installer image, its boot selection (OpenCore's picker, which
-              makes it a new OpenCore image) and graphics: reims-vgpu, its own GPU device,
-              on one display in a window whose size the guest follows, with the macOS
-              drivers reims-ctl puts in its OpenCore image (made again on a change); apple-gfx,
-              Apple's paravirtualized GPU, with up to 8 displays and the host's video
-              hardware; or QEMU's VMware SVGA, one display with no GPU acceleration, in
-              QEMU's own window. Displays, resolution, HiDPI, refresh rate and video
-              acceleration are apple-gfx's
-  p           give it this host's USB devices (Linux): Space gives the selected one to
+  e           edit its settings: CPUs, memory, resolution, borderless, GPU, audio,
+              network, logs, extra QEMU arguments (they apply at its next start), its disk
+              controller (SATA, or NVMe once macOS is installed), its installer image, its
+              boot selection (OpenCore's picker, which makes it a new OpenCore image) and
+              graphics: reims-vgpu, its own GPU device, on one display in a window whose
+              size the guest follows, with the macOS drivers reims-ctl puts in its OpenCore
+              image (made again on a change); or QEMU's VMware SVGA, one display with no GPU
+              acceleration, in QEMU's own window. Resolution, borderless and GPU are
+              reims-vgpu's
+  p           give it this host's USB devices: Space gives the selected one to
               the guest or takes it back, at once while the VM runs; a device you gave it
               joins the guest when it is plugged in. More in reims-ctl usb --help
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
@@ -2651,12 +2494,10 @@ macOS, unless its settings choose another (e, graphics).
   b           write a bug report: its logs, settings, command and this host's details,
               zipped into your Downloads folder
   d           delete it
-  U           make it a new OpenCore image (x86-64) with the installed reims-util, presenting
-              the same Mac, for its graphics: on reims-vgpu with the macOS drivers of its GPU
-              device that this reims-ctl carries, which an image made for apple-gfx or by an
-              older reims-ctl lacks; on apple-gfx with ReimsVgpu.kext, which an older image
-              lacks and macOS 26 needs for displays wider than 2048 pixels and GPU-accelerated
-              Chrome
+  U           make it a new OpenCore image with the installed reims-util, presenting the
+              same Mac, for its graphics: on reims-vgpu with the macOS drivers of its GPU
+              device that this reims-ctl carries, which an image an older reims-ctl made
+              lacks
   u           update reims-ctl and QEMU from your reims-vgpu checkout
   r           reload the list
   ?           this help
@@ -3036,8 +2877,8 @@ mod tests {
         assert!(key_hints().width() <= 80);
     }
 
-    /// A stopped VM's row, x86-64 or arm64, whose files do not exist.
-    fn vm_row(name: &str, q35: bool) -> VmRow {
+    /// A stopped VM's row, whose files do not exist.
+    fn vm_row(name: &str) -> VmRow {
         let config = format!(
             r#"
             name = "{name}"
@@ -3052,14 +2893,10 @@ mod tests {
             "#
         );
         let dir = std::env::temp_dir().join(format!("reims-ctl-tui-{}-{name}", std::process::id()));
-        let mut vm = Vm {
+        let vm = Vm {
             dir: dir.clone(),
             config: toml::from_str(&config).unwrap(),
         };
-        if !q35 {
-            vm.config.profile = Profile::VmappleArm64;
-            vm.config.q35 = None;
-        }
         VmRow {
             name: name.into(),
             dir,
@@ -3120,8 +2957,8 @@ mod tests {
         };
         let every = [ShowCommand, ToggleLogs, ViewLogs, Report];
         let stopped = [&[Start, Edit, Usb][..], &every, &[UpdateOpencore, Delete]].concat();
-        assert_eq!(commands(&vm_row("t", true)), stopped);
-        let mut running = vm_row("t", true);
+        assert_eq!(commands(&vm_row("t")), stopped);
+        let mut running = vm_row("t");
         running.pid = Some(1);
         let running_menu = [&[View, Stop, PowerOff, Edit, Usb][..], &every].concat();
         assert_eq!(commands(&running), running_menu);
@@ -3131,27 +2968,24 @@ mod tests {
             arch: Arch::Aarch64,
         };
         assert!(
-            !vm_menu(&vm_row("t", true), false, mac)
+            !vm_menu(&vm_row("t"), false, mac)
                 .iter()
                 .any(|it| it.0 == Usb)
         );
-        // Only x86-64 VMs boot OpenCore.
-        let arm64 = [&[Start, Edit][..], &every, &[Delete]].concat();
-        assert_eq!(commands(&vm_row("t", false)), arm64);
         let broken = VmRow {
             vm: Err("parse vm.toml".into()),
-            ..vm_row("t", true)
+            ..vm_row("t")
         };
         assert_eq!(commands(&broken), [Delete]);
 
-        let mut row = vm_row("t", true);
+        let mut row = vm_row("t");
         assert!(vm_menu(&row, false, LINUX).contains(&(ToggleLogs, "Turn logs on")));
         row.vm.as_mut().unwrap().config.logs.enabled = true;
         assert!(vm_menu(&row, false, LINUX).contains(&(ToggleLogs, "Turn logs off")));
 
         // The menu of everything holds every command, whatever the VM's state.
         let each = VmCommand::ALL.map(|c| c.0);
-        for row in [&vm_row("t", true), &running, &vm_row("t", false), &broken] {
+        for row in [&vm_row("t"), &running, &broken] {
             let all = vm_menu(row, true, LINUX);
             assert_eq!(all.iter().map(|it| it.0).collect::<Vec<_>>(), each);
             // Each item is labelled as in the menu of what can be done now.
@@ -3170,7 +3004,7 @@ mod tests {
         let env = crate::testenv::Env::new("tui-usb");
         let dir = env.root.join("vms/t");
         std::fs::create_dir_all(&dir).unwrap();
-        let mut vm = vm_row("t", true).vm.unwrap();
+        let mut vm = vm_row("t").vm.unwrap();
         vm.dir = dir.clone();
         vm.config.usb = vec![crate::vm::UsbDevice {
             id: "fffe:0001".into(),
@@ -3189,7 +3023,7 @@ mod tests {
         app.reload().unwrap();
         press(&mut app, [KeyCode::Char('p')]);
         assert!(app.overlay.is_none());
-        assert!(app.status.as_ref().unwrap().0.contains("Linux host"));
+        assert_eq!(app.status.as_ref().unwrap().0, crate::host::UNSUPPORTED);
 
         let mut app = App::with(LINUX);
         app.reload().unwrap();
@@ -3234,15 +3068,15 @@ mod tests {
         assert!(app.overlay.is_none());
     }
 
-    /// An x86-64 VM's edit form offers its disk's controller as its settings have it, and saves
-    /// the one picked; an arm64 VM's form has none.
+    /// A VM's edit form offers its disk's controller as its settings have it, and saves the one
+    /// picked.
     #[test]
-    fn the_edit_form_picks_an_x86_64_vms_disk_controller() {
-        let mut nvme = vm_row("n", true);
+    fn the_edit_form_picks_a_vms_disk_controller() {
+        let mut nvme = vm_row("n");
         let q = nvme.vm.as_mut().unwrap().config.q35.as_mut().unwrap();
         q.disk_controller = DiskController::Nvme;
-        let mut app = test_app(vec![vm_row("t", true), vm_row("a", false), nvme]);
-        app.table.select(Some(2));
+        let mut app = test_app(vec![vm_row("t"), nvme]);
+        app.table.select(Some(1));
         app.open_edit();
         assert_eq!(form(&app).choice("disk_controller"), "nvme");
         app.overlay = None;
@@ -3256,92 +3090,26 @@ mod tests {
             press(&mut app, [KeyCode::Down]);
         }
         press(&mut app, [KeyCode::Right]);
-        let mut vm = vm_row("t", true).vm.unwrap();
+        let mut vm = vm_row("t").vm.unwrap();
         apply_edit(&mut vm, form(&app), None).unwrap();
         assert_eq!(vm.config.q35.unwrap().disk_controller, DiskController::Nvme);
-
-        app.overlay = None;
-        app.table.select(Some(1));
-        app.open_edit();
-        assert!(!form(&app).is_shown("disk_controller"));
     }
 
-    /// The edit form turns video acceleration off on apple-gfx, on either kind of VM, and has no
-    /// such field on reims-vgpu or VMware SVGA, which have no video devices, whose setting stays
-    /// as it was.
+    /// A VM's edit form shows the resolution and borderless on reims-vgpu, and hides them on
+    /// VMware SVGA, whose settings keep them as they were.
     #[test]
-    fn the_edit_form_turns_video_acceleration_off() {
-        let mut apple = vm_row("t", true);
-        apple.vm.as_mut().unwrap().config.graphics = Some(Graphics::AppleGfx);
-        let mut svga = vm_row("s", true);
-        let c = &mut svga.vm.as_mut().unwrap().config;
-        c.graphics = Some(Graphics::VmwareSvga);
-        c.video_acceleration = false;
-        let mut arm64 = vm_row("a", false);
-        arm64.vm.as_mut().unwrap().config.vmapple = Some(crate::vm::Vmapple {
-            aux: "aux.img".into(),
-            ecid: 1234,
-        });
-        let mut reims = vm_row("r", true);
-        reims.vm.as_mut().unwrap().config.video_acceleration = false;
-        let mut app = test_app(vec![apple, arm64, svga, reims]);
-        for row in [0, 1] {
-            app.overlay = None;
-            app.table.select(Some(row));
-            app.open_edit();
-            assert!(form(&app).toggle("video_acceleration"));
-            for _ in 0..form(&app).fields.len() {
-                if form(&app).focused_key() == "video_acceleration" {
-                    break;
-                }
-                press(&mut app, [KeyCode::Down]);
-            }
-            press(&mut app, [KeyCode::Right]);
-            let mut vm = app.rows[row].vm.as_ref().unwrap().clone();
-            apply_edit(&mut vm, form(&app), None).unwrap();
-            assert!(!vm.config.video_acceleration);
-        }
-
-        for row in [2, 3] {
-            app.overlay = None;
-            app.table.select(Some(row));
-            app.open_edit();
-            assert!(!form(&app).is_shown("video_acceleration"));
-            let mut vm = app.rows[row].vm.as_ref().unwrap().clone();
-            vm.config.video_acceleration = true;
-            apply_edit(&mut vm, form(&app), None).unwrap();
-            assert!(
-                vm.config.video_acceleration,
-                "a hidden field changes nothing"
-            );
-        }
-    }
-
-    /// An x86-64 VM whose settings name no graphics is on reims-vgpu, whose edit form shows
-    /// the resolution and borderless alone of the displays' settings, the rest staying as they
-    /// were for apple-gfx; saved as it is, it still names none, and choosing apple-gfx shows
-    /// them, and saves it by name.
-    #[test]
-    fn the_edit_form_shows_reims_vgpu_its_display_settings_alone() {
-        let mut row = vm_row("t", true);
+    fn the_edit_form_shows_reims_vgpu_its_display_settings() {
+        let mut row = vm_row("t");
         let c = &mut row.vm.as_mut().unwrap().config;
-        c.display.count = 3;
-        c.display.hidpi = true;
+        c.graphics = None;
         c.display.resolution = "3840x2160".into();
         let mut app = test_app(vec![row]);
         app.open_edit();
         assert_eq!(form(&app).choice("graphics"), "reims-vgpu");
-        for hidden in ["displays", "hidpi", "refresh"] {
-            assert!(!form(&app).is_shown(hidden), "{hidden}");
-        }
         assert!(form(&app).is_shown("borderless") && form(&app).is_shown("resolution"));
         let mut vm = app.rows[0].vm.as_ref().unwrap().clone();
         apply_edit(&mut vm, form(&app), None).unwrap();
-        assert_eq!(vm.config.graphics, None);
-        assert_eq!(
-            (vm.config.display.count, vm.config.display.hidpi),
-            (3, true)
-        );
+        assert_eq!(vm.config.graphics, Some(Graphics::ReimsVgpu));
         for _ in 0..form(&app).fields.len() {
             if form(&app).focused_key() == "graphics" {
                 break;
@@ -3349,16 +3117,20 @@ mod tests {
             press(&mut app, [KeyCode::Down]);
         }
         press(&mut app, [KeyCode::Right]);
-        assert_eq!(form(&app).choice("graphics"), "apple-gfx");
-        assert!(form(&app).is_shown("displays") && form(&app).is_shown("hidpi"));
+        assert_eq!(form(&app).choice("graphics"), "vmware-svga");
+        assert!(!form(&app).is_shown("borderless") && !form(&app).is_shown("resolution"));
+        vm.config.display.resolution = "1280x720".into();
         apply_edit(&mut vm, form(&app), None).unwrap();
-        assert_eq!(vm.config.graphics, Some(Graphics::AppleGfx));
-        assert_eq!(vm.config.display.count, 3);
+        assert_eq!(vm.config.graphics, Some(Graphics::VmwareSvga));
+        assert_eq!(
+            vm.config.display.resolution, "1280x720",
+            "a hidden field changes nothing"
+        );
     }
 
     #[test]
     fn ctrl_with_enter_or_a_right_click_opens_the_menu_of_everything() {
-        let mut app = test_app(vec![vm_row("alpha", true), vm_row("beta", false)]);
+        let mut app = test_app(vec![vm_row("alpha"), vm_row("beta")]);
         app.rows[0].pid = Some(1);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
@@ -3381,21 +3153,28 @@ mod tests {
         let said = app.status.as_ref().map(|s| s.0.as_str());
         assert_eq!(said, Some("alpha is running: stop it first"));
 
-        // A Ctrl right click: an arm64 VM's menu holds the OpenCore image's item too. A right
-        // click without Ctrl, on the same VM, opens its menu of what can be done now.
+        // A Ctrl right click: a stopped VM's menu holds a running VM's items too. A right click
+        // without Ctrl, on the same VM, opens its menu of what can be done now.
         let mut ctrl_click = mouse(MouseEventKind::Down(MouseButton::Right), beta);
         ctrl_click.modifiers = KeyModifiers::CONTROL;
         app.mouse(ctrl_click);
         assert!(matches!(&app.overlay, Some(Overlay::Menu { vm, all: true, .. }) if vm == "beta"));
         let screen = draw(&mut app);
-        assert!(find(&screen, app.menu_area, "Make a new OpenCore image…").is_some());
+        assert!(find(&screen, app.menu_area, "View screen in terminal").is_some());
         app.mouse(mouse(MouseEventKind::Down(MouseButton::Right), beta));
         assert!(matches!(&app.overlay, Some(Overlay::Menu { vm, all: false, .. }) if vm == "beta"));
+        let screen = draw(&mut app);
+        assert_eq!(
+            find(&screen, app.menu_area, "View screen in terminal"),
+            None
+        );
     }
 
     #[test]
     fn a_right_click_or_enter_opens_a_vms_menu_whose_items_do_their_commands() {
-        let mut app = test_app(vec![vm_row("alpha", true), vm_row("beta", false)]);
+        let mut app = test_app(vec![vm_row("alpha"), vm_row("beta")]);
+        // A running VM's menu has no OpenCore image item.
+        app.rows[1].pid = Some(1);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         let mut draw = |app: &mut App| {
@@ -3499,13 +3278,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let config = r#"
             name = "t"
-            profile = "vmapple-arm64"
+            profile = "q35-x86_64"
             cpus = 2
             memory_mib = 4096
-            disk = "disk.img"
-            [vmapple]
-            aux = "aux.img"
-            ecid = 1
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
         "#;
         std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
         let mut reg = Registry::default();
@@ -3520,41 +3300,5 @@ mod tests {
         let saved = Vm::load(&dir).unwrap().config;
         assert!(saved.logs.enabled);
         assert_eq!(saved.memory_mib, 8192);
-    }
-
-    #[test]
-    fn display_help_says_what_the_desktop_looks_like() {
-        let now = |resolution: &str, hidpi: bool| {
-            let mut f = Form::new(
-                "t",
-                "save",
-                vec![
-                    Field::text("resolution", "Resolution", resolution, RESOLUTION_HELP),
-                    Field::toggle("hidpi", "HiDPI", hidpi, HIDPI_HELP),
-                ],
-            );
-            display_help(&mut f);
-            assert_eq!(
-                f.help("resolution").strip_prefix(RESOLUTION_HELP),
-                f.help("hidpi").strip_prefix(HIDPI_HELP)
-            );
-            f.help("hidpi")[HIDPI_HELP.len()..].trim().to_string()
-        };
-        assert_eq!(now("3200x1800", true), "Now 3200x1800 looks like 1600x900.");
-        assert_eq!(
-            now("3840x2160", false),
-            "At HiDPI, 3840x2160 would look like 1920x1080."
-        );
-        assert_eq!(
-            now("1280x800", true),
-            "1280 pixels wide is narrower than 1920."
-        );
-        assert_eq!(now("1280x800", false), "");
-        assert_eq!(
-            now("host", true),
-            "host takes the host screen's own density: turn HiDPI off."
-        );
-        assert_eq!(now("host", false), "");
-        assert_eq!(now("19x", true), "");
     }
 }

@@ -38,12 +38,5 @@ toml = "1.1.2"
 # needs no Vulkan to start.
 ash = { version = "0.38", default-features = false, features = ["std", "loaded"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# Installs macOS from an IPSW into a new VM (vz.rs): only Virtualization.framework restores one.
-block2 = "0.6.2"
-objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSData", "NSProgress", "NSObject", "NSArray", "NSRunLoop", "NSDate"] }
-objc2-virtualization = "0.3.2"
-
 [profile.release]
 debug = "line-tables-only"

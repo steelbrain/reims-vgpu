@@ -103,7 +103,7 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
     let c = &vm.config;
     c.check()?;
     if !crate::host::Profile::supported_on(host).contains(&c.profile) {
-        bail!("{} is a {} VM, which {host} cannot run", c.name, c.profile);
+        bail!("{}", crate::host::UNSUPPORTED);
     }
     let need = |p: &Path, what: &str| -> Result<()> {
         if !p.exists() {
@@ -129,14 +129,6 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
                 );
             }
         }
-        Profile::VmappleArm64 => {
-            need(
-                Path::new(qemu::AVPBOOTER),
-                "Virtualization.framework's boot ROM",
-            )?;
-            let v = c.vmapple.as_ref().unwrap();
-            need(&vm.path(&v.aux), "the auxiliary storage")?;
-        }
     }
     if host.os == Os::Linux {
         let kvm = std::fs::OpenOptions::new()
@@ -151,16 +143,6 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The reminder where an x86-64 VM on apple-gfx gets its macOS installed ([`needs_error_mode`]).
-pub const SET_METAL_ERROR_MODE: &str = "set Metal's error mode once macOS is installed (README)";
-
-/// Whether the VM's macOS needs Metal's error mode set (README; docs/qemu.md, "x86-64 macOS guests:
-/// Metal's error mode"): an x86-64 VM on apple-gfx, whose icon service otherwise ends as it starts.
-/// On reims-vgpu's own device a 26.7.2 guest without it comes up with its Dock and icon services.
-pub fn needs_error_mode(vm: &Vm) -> bool {
-    vm.config.q35.is_some() && vm.config.graphics() == Graphics::AppleGfx
 }
 
 /// The host's `vm.max_map_count` (Linux).
@@ -346,10 +328,6 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
         "pick Reinstall macOS"
     };
     let name = vm.name();
-    let error_mode = match needs_error_mode(vm) {
-        true => " and set Metal's error mode (README)",
-        false => "",
-    };
     let first = match q.disk_controller {
         DiskController::Ahci => String::new(),
         DiskController::Nvme => format!(
@@ -362,7 +340,7 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
         "{first}To install macOS, start {name}: OpenCore boots its installer into macOS \
          Recovery. If the VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK Media) as \
          APFS and quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
-         (reims-ctl eject {name}){error_mode}."
+         (reims-ctl eject {name})."
     ))
 }
 
@@ -377,69 +355,12 @@ pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
     if graphics == Graphics::ReimsVgpu {
         w.extend(crate::opencore::missing_guest_kexts(vm));
     }
-    if graphics == Graphics::AppleGfx && vm.config.profile == Profile::Q35X86_64 {
-        w.extend(crate::opencore::missing_kext(vm));
-        // docs/qemu.md, "x86-64 macOS guests: Metal's error mode": without it, macOS 26's icon
-        // service ends as it starts, again and again, and the library logs each command it left
-        // queued, which QEMU's log keeps with logs off too. From Recovery, the `cd` expands the
-        // Data volume's name, and `defaults` leaves the file at mode 0600, which the user's
-        // processes cannot read.
-        let n = emptied_entry_lines(&vm.qemu_log());
-        if n >= 3 {
-            w.push(format!(
-                "QEMU's latest log has {n} lines on GPU work left by crashed macOS processes. On \
-                 x86-64 macOS 26 that's most likely its icon service, crashing because Metal's \
-                 error mode isn't set: the desktop can stay on its wallpaper with no menu bar, or \
-                 come up gray with a menu bar but no Dock. To set it, turn its boot selection \
-                 on (press e in reims-ctl, or run reims-ctl update-opencore {} --boot-selection), \
-                 boot Recovery from OpenCore's picker, open Utilities > Terminal and run: cd \
-                 /Volumes/*Data/Library/Preferences && defaults write \"$PWD/.GlobalPreferences\" \
-                 METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot",
-                vm.name()
-            ));
-        }
-    }
     if host.os == Os::Linux
         && let Some(problem) = udmabuf_problem()
     {
         w.push(problem);
     }
     w
-}
-
-/// How many lines of a QEMU log, since the guest's last reset, name an object entry the guest
-/// had emptied: the library logs them at its warn level when a command of a guest process that
-/// has ended runs, and `device reset` at its info level; reims-ctl turns both on with logs off
-/// too. The TUI asks at every draw, so the count carries on from the bytes already read while the
-/// file is the same (by inode) and has not shrunk.
-fn emptied_entry_lines(log: &Path) -> usize {
-    use std::os::unix::fs::MetadataExt;
-    const EMPTIED: &[u8] = b"has an empty entry";
-    static READ: std::sync::Mutex<(std::path::PathBuf, u64, u64, usize)> =
-        std::sync::Mutex::new((std::path::PathBuf::new(), 0, 0, 0));
-    let Ok(mut f) = std::fs::File::open(log) else {
-        return 0;
-    };
-    let Ok(meta) = f.metadata() else { return 0 };
-    let mut r = READ.lock().unwrap_or_else(|e| e.into_inner());
-    if r.0 != log || r.1 != meta.ino() || r.2 > meta.len() {
-        *r = (log.to_path_buf(), meta.ino(), 0, 0);
-    }
-    let mut buf = Vec::new();
-    if f.seek(SeekFrom::Start(r.2)).is_ok() {
-        let _ = f.take(meta.len() - r.2).read_to_end(&mut buf);
-    }
-    // Whole lines only: the rest is read again once its line ends.
-    let end = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    for l in buf[..end].split(|&b| b == b'\n') {
-        if l.ends_with(b"device reset") {
-            r.3 = 0;
-        } else if l.windows(EMPTIED.len()).any(|w| w == EMPTIED) {
-            r.3 += 1;
-        }
-    }
-    r.2 += end as u64;
-    r.3
 }
 
 /// Keeps the last five of a log: `x.log` becomes `x.1.log`, and so on.
@@ -452,26 +373,6 @@ fn rotate(path: &Path) {
         let _ = std::fs::rename(nth(n), nth(n + 1));
     }
     let _ = std::fs::rename(path, nth(1));
-}
-
-/// Writes the trimmed auxiliary storage a vmapple VM boots, if missing: the image without its
-/// first 16 KiB block (docs/system/arm/vmapple.rst in vendor/qemu).
-pub fn ensure_aux_trimmed(vm: &Vm) -> Result<()> {
-    let Some(trimmed) = vm.aux_trimmed() else {
-        return Ok(());
-    };
-    if trimmed.exists() {
-        return Ok(());
-    }
-    let aux = vm.path(&vm.config.vmapple.as_ref().unwrap().aux);
-    let mut src = std::fs::File::open(&aux).with_context(|| format!("open {}", aux.display()))?;
-    src.seek(SeekFrom::Start(0x4000))?;
-    let tmp = trimmed.with_extension("trimmed.tmp");
-    let mut dst = std::fs::File::create(&tmp)?;
-    std::io::copy(&mut src, &mut dst)?;
-    dst.sync_all()?;
-    std::fs::rename(&tmp, &trimmed)?;
-    Ok(())
 }
 
 pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
@@ -617,10 +518,8 @@ fn private_dir(d: &Path) -> Result<()> {
 }
 
 /// What a start of a stopped VM does to its settings and OpenCore image first, before [`start`]:
-/// an update's change that waited while it ran ([`crate::migrate::at_start`]); for an x86-64 VM
-/// on reims-vgpu, its disk's macOS ([`crate::macos::settle`]), which may save
-/// the graphics its settings named none of; then a new image ([`crate::opencore::renew`]) for
-/// one on another device whose image loads reims-vgpu's guest kexts, as an image made for
+/// an update's change that waited while it ran ([`crate::migrate::at_start`]); then a new image
+/// ([`crate::opencore::renew`]) for one on another device whose image loads reims-vgpu's guest kexts, as an image made for
 /// reims-vgpu does after a change of graphics, without them; and for one on reims-vgpu whose
 /// image holds other builds of them, as one an older reims-ctl made does after an update, with
 /// this reims-ctl's ([`crate::opencore::holds_other_guest_kexts`]). An image reims-vgpu's kexts
@@ -634,12 +533,6 @@ pub fn prepare(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Vec<String> {
     }
     // An update's change that waited while the VM ran (crate::migrate).
     crate::migrate::at_start(vm, progress);
-    match crate::macos::settle(vm) {
-        Ok(crate::macos::Settled::Kept) => {}
-        Ok(crate::macos::Settled::Saved(note)) => progress(&note),
-        Ok(crate::macos::Settled::Warn(s)) => w.push(s),
-        Err(e) => w.push(format!("{e:#}")),
-    }
     let name = vm.name().to_string();
     if crate::opencore::holds_unused_guest_kexts(vm) {
         let graphics = vm.config.graphics().name();
@@ -685,9 +578,6 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         );
     }
     preflight(vm, host)?;
-    if vm.config.profile == Profile::VmappleArm64 {
-        ensure_aux_trimmed(vm)?;
-    }
     let ctx = context(vm, host)?;
     let inv = qemu::invocation(vm, &ctx)?;
     let sock = prepare_run(vm)?;
@@ -757,7 +647,7 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
 
 /// Stops the VM: macOS's Control-Option-Command-Power on the USB keyboard ("quit all apps,
 /// then shut down", which asks about unsaved documents), then, a third of `timeout` in, the
-/// machine's power button (ACPI's on q35, a GPIO on vmapple), and at `timeout` a power-off; with
+/// machine's power button (ACPI's on q35), and at `timeout` a power-off; with
 /// `force`, the power-off at once. With no `timeout` it waits until the guest shuts down, the
 /// button a third of [`DEFAULT_STOP_TIMEOUT`] in, and never powers the VM off: where neither the
 /// keys nor the button reach the guest, it ends with an error instead. `progress` hears each
@@ -994,13 +884,14 @@ mod tests {
             let config = format!(
                 r#"
                 name = "{name}"
-                profile = "vmapple-arm64"
+                profile = "q35-x86_64"
                 cpus = 2
                 memory_mib = 4096
                 disk = "{}"
-                [vmapple]
-                aux = "aux.img"
-                ecid = 1
+                [q35]
+                opencore = "opencore.qcow2"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
                 "#,
                 disk.display()
             );
@@ -1027,13 +918,14 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let config = r#"
             name = "t"
-            profile = "vmapple-arm64"
+            profile = "q35-x86_64"
             cpus = 2
             memory_mib = 4096
             disk = "disk.img"
-            [vmapple]
-            aux = "aux.img"
-            ecid = 1
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
         "#;
         let vm = Vm {
             dir: d.clone(),
@@ -1111,14 +1003,15 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let config = r#"
             name = "t"
-            profile = "vmapple-arm64"
+            profile = "q35-x86_64"
             cpus = 2
             memory_mib = 4096
             disk = "disk.img"
             stop_timeout_secs = 0
-            [vmapple]
-            aux = "aux.img"
-            ecid = 1
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
         "#;
         let vm = Vm {
             dir: d.clone(),
@@ -1164,46 +1057,6 @@ mod tests {
         assert!(e.ends_with("a forced stop powers it off"), "{e}");
     }
 
-    #[test]
-    fn emptied_entry_lines_count_on_from_what_was_read() {
-        let d = std::env::temp_dir().join(format!("reims-ctl-emptied-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let log = d.join("qemu.log");
-        let fault = "reims-vgpu WARN reims_vgpu_core::tasks::local::exec: task 2: exec faulted: \
-                     resource 3 not found: object 3 has an empty entry\n";
-        let append = |s: &str| {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log)
-                .unwrap();
-            f.write_all(s.as_bytes()).unwrap();
-        };
-        assert_eq!(emptied_entry_lines(&log), 0);
-        append("reims-ctl 0.1.0 started t\n");
-        append(fault);
-        assert_eq!(emptied_entry_lines(&log), 1);
-        // A line still being written counts once it ends.
-        append(&fault[..40]);
-        assert_eq!(emptied_entry_lines(&log), 1);
-        append(&fault[40..]);
-        append(fault);
-        assert_eq!(emptied_entry_lines(&log), 3);
-        // The guest's reboot in the same run (as after setting the key from Recovery) counts
-        // from the device's reset.
-        append("reims-vgpu INFO reims_vgpu_core::device::lifecycle: device reset\n");
-        assert_eq!(emptied_entry_lines(&log), 0);
-        append(fault);
-        assert_eq!(emptied_entry_lines(&log), 1);
-        // A start's rotation leaves a new file, counted from its start.
-        std::fs::rename(&log, d.join("qemu.1.log")).unwrap();
-        append(&"x".repeat(4096));
-        append("\n");
-        append(fault);
-        assert_eq!(emptied_entry_lines(&log), 1);
-        std::fs::remove_dir_all(&d).unwrap();
-    }
-
     /// An x86-64 VM with an installer has install steps, which for a disk on NVMe first say to
     /// move it to SATA.
     #[test]
@@ -1238,10 +1091,9 @@ mod tests {
         assert_eq!(install_steps(&vm), None);
     }
 
-    /// An x86-64 VM's install steps say to set Metal's error mode on apple-gfx alone: reims-vgpu's
-    /// own device, the default, needs none.
+    /// An x86-64 VM's install steps end with ejecting the installer.
     #[test]
-    fn install_steps_name_the_error_mode_on_apple_gfx_alone() {
+    fn install_steps_end_with_ejecting_the_installer() {
         let config = r#"
             name = "t"
             profile = "q35-x86_64"
@@ -1254,22 +1106,14 @@ mod tests {
             firmware_vars = "OVMF_VARS.fd"
             installer = "installer.img"
         "#;
-        let mut vm = Vm {
+        let vm = Vm {
             dir: "/vms/t".into(),
             config: toml::from_str(config).unwrap(),
         };
-        assert!(!needs_error_mode(&vm));
         let steps = install_steps(&vm).unwrap();
         assert!(
             steps.ends_with("eject the installer (reims-ctl eject t).")
                 && !steps.contains("error mode"),
-            "{steps}"
-        );
-        vm.config.graphics = Some(Graphics::AppleGfx);
-        assert!(needs_error_mode(&vm));
-        let steps = install_steps(&vm).unwrap();
-        assert!(
-            steps.ends_with("(reims-ctl eject t) and set Metal's error mode (README)."),
             "{steps}"
         );
     }

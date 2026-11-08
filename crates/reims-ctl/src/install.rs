@@ -5,7 +5,7 @@
 //! the link, so a running VM's binary is never written.
 //!
 //! `REIMS_CTL_QEMU` names a QEMU binary to use instead (a build tree's, such as `make qemu`'s
-//! `build/qemu/qemu-system-aarch64`); `qemu-img` is taken from beside it.
+//! `build/qemu/qemu-system-x86_64`); `qemu-img` is taken from beside it.
 
 use crate::host::Profile;
 use crate::paths;
@@ -146,24 +146,14 @@ pub fn has_device(qemu: &Path, name: &'static str) -> Option<bool> {
 
 /// The audio backend to use where the VM names none: the host's native one, among those built.
 pub fn default_audio_backend(available: &[String]) -> String {
-    let wanted: &[&str] = if cfg!(target_os = "macos") {
-        &["coreaudio"]
-    } else {
-        &["pipewire", "pa", "alsa", "sdl"]
-    };
-    for w in wanted {
+    for w in ["pipewire", "pa", "alsa", "sdl"] {
         if available.iter().any(|a| a == w) {
-            return (*w).into();
+            return w.into();
         }
     }
     if available.is_empty() {
         // QEMU could not be asked (not installed yet): its usual choice.
-        return if cfg!(target_os = "macos") {
-            "coreaudio"
-        } else {
-            "pipewire"
-        }
-        .into();
+        return "pipewire".into();
     }
     "none".into()
 }
@@ -201,7 +191,9 @@ mod tests {
 
     /// The installer's prune keeps a build older than the newest three while a QEMU runs from
     /// it, started as reims-ctl starts it, through `qemu/current`, which a newer build then
-    /// took; and removes the old builds nothing runs.
+    /// took; and removes the old builds nothing runs. The installer runs on Linux alone, whose
+    /// /proc names each process's executable.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_installers_prune_keeps_a_build_a_running_qemu_executes() {
         // The crate's directory, which cargo and nextest give a test process: read at run time, so
@@ -275,7 +267,8 @@ mod tests {
     }
 
     /// The installer's --skip-qemu keeps the installed QEMU: with none installed it ends at
-    /// once, before it builds or installs anything, saying what to do.
+    /// once, before it builds or installs anything, saying what to do. On a host other than
+    /// Linux on x86-64 it ends before that, saying where reims-ctl runs VMs.
     #[test]
     fn the_installer_skips_qemu_only_where_one_is_installed() {
         let dir = std::env::var_os("CARGO_MANIFEST_DIR")
@@ -289,24 +282,27 @@ mod tests {
             .arg("--skip-qemu")
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_CACHE_HOME", root.join("cache"))
-            .env_remove("GPU_ARM")
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&root);
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{err}");
-        assert!(
-            err.contains("--skip-qemu keeps the installed QEMU, and none is installed")
-                && err.contains("run this without --skip-qemu, which builds it"),
-            "{err}"
-        );
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert!(
+                err.contains("--skip-qemu keeps the installed QEMU, and none is installed")
+                    && err.contains("run this without --skip-qemu, which builds it"),
+                "{err}"
+            );
+        } else {
+            assert!(err.contains(crate::host::UNSUPPORTED), "{err}");
+        }
     }
 
     /// What the installer says of the QEMU build --skip-qemu keeps: nothing where it was built
     /// from what this checkout builds it from, which a change to reims-ctl alone leaves as it
-    /// was; else that QEMU or the library changed since its commit, that the checkout lacks
-    /// that commit, or that it runs on the other GPU arm.
+    /// was; else that QEMU or the library changed since its commit, or that the checkout lacks
+    /// that commit.
     #[test]
     fn the_installer_says_when_the_qemu_it_keeps_is_not_this_checkouts() {
         let dir = std::env::var_os("CARGO_MANIFEST_DIR")
@@ -349,38 +345,24 @@ mod tests {
         let built = commit("crates/reims-vgpu/src/lib.rs");
         commit("crates/reims-ctl/src/main.rs");
         commit("docs/qemu.md");
-        let kept = |build: &str, arm_suffix: &str, gpu_arm: &str| {
+        let kept = |build: &str| {
             let out = std::process::Command::new("bash")
                 .arg("-c")
                 .arg(format!("set -euo pipefail\n{function}kept_qemu \"$1\""))
                 .arg("kept")
                 .arg(format!("/data/reims-ctl/qemu/{build}"))
                 .env("ROOT", &repo)
-                .env("ARM_SUFFIX", arm_suffix)
-                .env("GPU_ARM", gpu_arm)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "{out:?}");
             String::from_utf8(out.stdout).unwrap()
         };
-        let this = kept(&format!("20261107-120000-{built}"), "", "vulkan");
-        let on_vulkan = kept(
-            &format!("20261107-120000-{built}-vulkan"),
-            "-vulkan",
-            "vulkan",
-        );
-        let other_arm = kept(&format!("20261107-120000-{built}"), "-vulkan", "vulkan");
-        let unknown = kept("20261107-120000-0000000", "", "vulkan");
+        let this = kept(&format!("20261107-120000-{built}"));
+        let unknown = kept("20261107-120000-0000000");
         commit("crates/reims-vgpu/src/lib.rs");
-        let changed = kept(&format!("20261107-120000-{built}"), "", "vulkan");
+        let changed = kept(&format!("20261107-120000-{built}"));
         let _ = std::fs::remove_dir_all(&repo);
         assert_eq!(this, "");
-        assert_eq!(on_vulkan, "");
-        assert_eq!(
-            other_arm,
-            "the installed QEMU runs on Metal, not GPU_ARM=vulkan: run this without --skip-qemu \
-             to build it on vulkan\n"
-        );
         assert_eq!(
             unknown,
             "the installed QEMU was built at 0000000, which this checkout does not have: run this \
@@ -398,18 +380,11 @@ mod tests {
     #[test]
     fn audio_backend_prefers_the_native_one() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                default_audio_backend(&v(&["none", "coreaudio"])),
-                "coreaudio"
-            );
-        } else {
-            assert_eq!(
-                default_audio_backend(&v(&["none", "alsa", "pa", "pipewire"])),
-                "pipewire"
-            );
-            assert_eq!(default_audio_backend(&v(&["none", "alsa"])), "alsa");
-        }
+        assert_eq!(
+            default_audio_backend(&v(&["none", "alsa", "pa", "pipewire"])),
+            "pipewire"
+        );
+        assert_eq!(default_audio_backend(&v(&["none", "alsa"])), "alsa");
         assert_eq!(default_audio_backend(&v(&["none", "dbus"])), "none");
     }
 }

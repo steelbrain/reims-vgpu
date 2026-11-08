@@ -1,9 +1,9 @@
 //! reims-util (<https://github.com/steelbrain/reims-util>) makes what a new x86-64 VM boots from:
 //! an OpenCore image, with OVMF's code and variables beside it, and a macOS installer, downloaded
 //! from Apple and checked against Apple's chunklists. It also makes an existing VM a new OpenCore
-//! image presenting the same Mac (opencore.rs). An image holds Lilu and ReimsVgpu.kext, which
-//! reims-util adds itself, and, for a VM on reims-vgpu's own device, the guest's kexts reims-ctl
-//! carries, each given by `--add-kext` in the set's order ([`kext_args`]). reims-ctl runs it
+//! image presenting the same Mac (opencore.rs). An image holds Lilu, which reims-util adds
+//! itself, and, for a VM on reims-vgpu's own device, the guest's kexts reims-ctl carries, each
+//! given by `--add-kext` in the set's order ([`kext_args`]). reims-ctl runs it
 //! with `--json`: each line on its stdout is an event, `step`, `progress` or `note`, and the last
 //! is `done`, with what it made, or `error`.
 //!
@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 pub const REPO: &str = "https://github.com/steelbrain/reims-util";
 /// The commit [`install`] installs.
-pub const REV: &str = "fe9bfe1a622ae1be8d254effa74b5354bd098e43";
+pub const REV: &str = "5ca3b10683be28938c01f977b89af5ffa8685754";
 
 /// The reims-util binary: `REIMS_CTL_UTIL`, else the one beside reims-ctl, where both are
 /// installed, else the first on PATH.
@@ -164,8 +164,6 @@ pub struct Installer {
     /// Its macOS's version: the macOS's number ("26") for an online installer, the release
     /// ("26.6.2") for an offline one.
     pub version: String,
-    /// An offline installer's build ("25G83"); none for an online one.
-    pub build: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -183,8 +181,6 @@ struct OfflineResult {
 #[derive(Deserialize)]
 struct OfflineRelease {
     version: String,
-    #[serde(default)]
-    build: Option<String>,
 }
 
 /// Downloads `d`'s installer into the installers directory, or continues its download, or
@@ -214,14 +210,12 @@ pub fn installer(d: &Download, progress: &mut dyn FnMut(&str)) -> Result<Install
         Installer {
             image: o.image,
             version: o.installer.version,
-            build: o.installer.build.filter(|b| !b.trim().is_empty()),
         }
     } else {
         let o: OnlineResult = serde_json::from_value(r).context("read reims-util's result")?;
         Installer {
             image: o.image,
             version: o.title.rsplit(' ').next().unwrap_or_default().to_string(),
-            build: None,
         }
     })
 }
@@ -237,8 +231,8 @@ struct Smbios {
     serial: String,
 }
 
-/// The arguments that add kexts to the OpenCore image of a VM on `graphics`, beyond Lilu and
-/// ReimsVgpu.kext, which reims-util adds itself: on reims-vgpu's own device, each of the guest's
+/// The arguments that add kexts to the OpenCore image of a VM on `graphics`, beyond Lilu, which
+/// reims-util adds itself: on reims-vgpu's own device, each of the guest's
 /// kexts ([`prebuilt::guest_kexts`], written to the data directory first), in the set's order,
 /// which is the order OpenCore loads them in; none on another.
 pub fn kext_args(graphics: Graphics) -> Result<Vec<String>> {
@@ -597,7 +591,6 @@ mod tests {
         );
         let comma = vec![PathBuf::from("/d,e/A.kext")];
         assert!(add_kexts(&SET[..1], &comma).is_err());
-        assert!(kext_args(Graphics::AppleGfx).unwrap().is_empty());
         assert!(kext_args(Graphics::VmwareSvga).unwrap().is_empty());
     }
 
