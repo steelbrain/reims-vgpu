@@ -1991,11 +1991,18 @@ pub(super) mod tests {
             .upgrade()
             .and_then(|v| v.memory())
             .expect("a view's memory");
+        let threads = r.p.threads().handle();
         memory.identity().when_gone(move || {
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                drop(memory);
-            });
+            reims_vgpu_vulkan::core::rt::spawn_named(
+                &*threads,
+                "reims-vgpu.test",
+                512 * 1024,
+                Box::new(()),
+                move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    drop(memory);
+                },
+            );
         });
         // The blocks' holds go on the surface worker.
         r.dec.surface_worker().flush();
