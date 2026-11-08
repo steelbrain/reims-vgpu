@@ -91,6 +91,12 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     fn imports_device_caches(&self) -> bool {
         false
     }
+    /// Whether its hardware decodes a picture straight into a device cache, through an import of
+    /// the cache's memory as a dma-buf, where the cache was made so: the device's laid-out caches
+    /// are then made with their memory a dma-buf ([`VideoPlane::cache`]).
+    fn decodes_into_device_caches(&self) -> bool {
+        false
+    }
 }
 
 /// What the video crate's codec decoders refuse of `codec` beyond its entry
@@ -672,6 +678,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`GraphicsVideo::imports_device_caches`]): once, at the device's make, before any cache.
     pub(crate) fn set_exportable_caches(&self) {
         self.shared.surface_caches.set_exportable();
+    }
+
+    /// Makes the device's laid-out caches dma-bufs from now on, for the host's video to decode
+    /// into ([`GraphicsVideo::decodes_into_device_caches`]): once, at the device's make, before
+    /// any cache.
+    pub(crate) fn set_dma_buf_caches(&self) {
+        self.shared.surface_caches.set_dma_buf();
     }
 
     /// A hold of the session `id` names; an exec fault where it names none, and a refused

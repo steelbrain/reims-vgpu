@@ -703,6 +703,10 @@ pub(crate) struct CacheCounts {
     /// platform made none for, made as any other buffer.
     pub(crate) exportable: u64,
     pub(crate) unexportable: u64,
+    /// Caches made with their memory exported as a dma-buf, for the host's video to decode into
+    /// ([`SurfaceCaches::new_cache`]), and those the platform made none for, made as before.
+    pub(crate) dma_buf: u64,
+    pub(crate) no_dma_buf: u64,
     /// Caches made with their surface's first plane on a multiple of 256 bytes of their memory
     /// ([`SurfaceCaches::new_cache`]).
     pub(crate) aligned: u64,
@@ -802,6 +806,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The blocks of the begins answered before the fills they make ([`Caches::before_answering`]),
     /// from the answer until those fills are made: no other begin counts a use of one meanwhile.
     answering: HashSet<u64>,
+    /// Whether laid-out caches are made with their memory a dma-buf, for the host's video to
+    /// decode into ([`Caches::set_dma_buf`]).
+    dma_buf: bool,
 }
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
@@ -953,6 +960,7 @@ impl<P: Platform> SurfaceCaches<P> {
             exportable: false,
             owed: HashSet::new(),
             answering: HashSet::new(),
+            dma_buf: false,
         }
     }
 
@@ -1442,6 +1450,8 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// A new cache's buffer of `length` bytes, Private: exportable where the host's video
     /// imports caches ([`Caches::set_exportable`]) and the platform makes one; else, where
+    /// `laid_out` and the host's video decodes into caches ([`Caches::set_dma_buf`]), one whose
+    /// memory is also a dma-buf, laid as the next is, where the platform makes one; else, where
     /// `laid_out` (the kext's ask gave the surface's layout, so the cache's copies into the pages
     /// take its texels alone: [`SurfaceCache::texels`]), one that declares the bytes between a
     /// texture's rows unobserved, which a texture over the cache whose rows lie with bytes
@@ -1466,6 +1476,23 @@ impl<P: Platform> SurfaceCaches<P> {
                 return Ok(Some(cache));
             }
             self.counts.unexportable += 1;
+        }
+        #[cfg(unix)]
+        if self.dma_buf && laid_out {
+            let made = device.new_dma_buf_buffer_of_length_padding_unobserved(
+                ON,
+                length,
+                STORAGE_PRIVATE,
+                aligned,
+            )?;
+            if let Some(cache) = made {
+                self.counts.dma_buf += 1;
+                if aligned.is_some() {
+                    self.counts.aligned += 1;
+                }
+                return Ok(Some(cache));
+            }
+            self.counts.no_dma_buf += 1;
         }
         match laid_out {
             true => {
@@ -3022,6 +3049,13 @@ impl<P: Platform> Caches<P> {
     /// at the device's make, before any cache, where the device's video imports caches.
     pub(crate) fn set_exportable(&self) {
         self.state.lock().exportable = true;
+    }
+
+    /// Makes each laid-out cache from now on with its memory a dma-buf where the platform makes
+    /// one, for the host's video to decode its pictures into (`graphics::vaapi`): set once, at the
+    /// device's make, before any cache, where the device's video decodes into caches.
+    pub(crate) fn set_dma_buf(&self) {
+        self.state.lock().dma_buf = true;
     }
 
     /// Sets the bytes deferred blocks' caches may hold at once (the device's `DEFERRED_BUDGET`,

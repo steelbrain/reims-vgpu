@@ -126,7 +126,11 @@ impl HostDecoder<P> for Decoder {
         Ok(())
     }
 
-    fn decode(&mut self, au: &[u8]) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError> {
+    fn decode(
+        &mut self,
+        au: &[u8],
+        _output: &DecodeOutput<P>,
+    ) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError> {
         (self.log.lock()).push(Seen::Unit(au.as_ptr().addr(), au.len()));
         self.decoded += 1;
         let answer = (self.answers.pop_front())
@@ -412,7 +416,7 @@ fn values_are_signalled_in_decode_order_once_landed() {
     go.send(()).unwrap();
     assert!(event_of(&s).wait_until_signaled_value(3, 10_000));
     assert_eq!(s.counts.lock().skipped, 1);
-    assert_eq!(s.counts.lock().landed, [2, 0, 0, 0, 0]);
+    assert_eq!(s.counts.lock().landed, [2, 0, 0, 0, 0, 0]);
 }
 
 /// A decode that would have the session hold more pictures unlanded than its decoder spares
@@ -538,7 +542,7 @@ fn a_plane_holds_the_output_rows_that_lie_in_its_buffer() {
     let bitstream = buffer(&p, 4096, STORAGE_SHARED);
     let mut d = decode(&bitstream, &[], planes(&pages, &pages, 96));
     d.output_rows = 68;
-    let output = Output::of(&d).unwrap();
+    let output = DecodeOutput::of(&d).unwrap();
     assert_eq!((output.luma.rows_held, output.chroma.rows_held), (68, 34));
 }
 

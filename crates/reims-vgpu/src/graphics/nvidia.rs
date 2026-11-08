@@ -72,8 +72,8 @@ use reims_vgpu_vulkan::gpu::resource::VulkanBuffer;
 
 use super::decode::{GraphicsVideo, GraphicsVideoSession, PlanePages};
 use super::video_host::{
-    BackendError, HostDecoder, HostEncodeSession, HostPicture, HostVideoSession, Landing,
-    OutputPlane, SourcePlane,
+    BackendError, DecodeOutput, HostDecoder, HostEncodeSession, HostPicture, HostVideoSession,
+    Landing, OutputPlane, SourcePlane,
 };
 
 mod encode;
@@ -432,6 +432,7 @@ impl HostDecoder<VulkanPlatform> for NvdecDecoder {
     fn decode(
         &mut self,
         au: &[u8],
+        _output: &DecodeOutput<VulkanPlatform>,
     ) -> Result<Option<Box<dyn HostPicture<VulkanPlatform>>>, BackendError> {
         let picture = self.decoder.decode(au)?;
         Ok(picture.map(|picture| {

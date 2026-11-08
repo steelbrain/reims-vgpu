@@ -377,6 +377,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
                 if cached && video.imports_device_caches() {
                     decoder.set_exportable_caches();
+                } else if cached && video.decodes_into_device_caches() {
+                    decoder.set_dma_buf_caches();
                 }
                 decoder.set_video(video);
             }

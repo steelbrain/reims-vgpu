@@ -1213,8 +1213,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                      asked; {} fills made behind the command buffers they followed, {} waits on \
                      the CPU for other command buffers' uses; at a doorbell, {} buffers using a \
                      cache waited for no copy of it, {} for one; {} made exportable for the \
-                     host's video, {} not; {} made with their surface's first plane on 256 bytes \
-                     of their memory",
+                     host's video, {} not; {} made a dma-buf for the host's video to decode \
+                     into, {} not; {} made with their surface's first plane on 256 bytes of \
+                     their memory",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.decode_firsts,
                     d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
@@ -1224,7 +1225,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     d.by_runs, d.runs_refused,
                     self.shared.slow_answers.load(Ordering::Relaxed), SLOW_ANSWER.as_millis(),
                     d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits,
-                    d.exportable, d.unexportable, d.aligned
+                    d.exportable, d.unexportable, d.dma_buf, d.no_dma_buf, d.aligned
                 );
             }
         }

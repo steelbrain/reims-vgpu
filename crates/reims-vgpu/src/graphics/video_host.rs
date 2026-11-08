@@ -98,7 +98,14 @@ pub(crate) trait HostDecoder<P: Platform>: Send + 'static {
     /// until the picture answered has landed ([`HostPicture::land`] returned), or, where none is
     /// answered, until the session signals the decode's value: the hardware may read them there
     /// after this returns.
-    fn decode(&mut self, au: &[u8]) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError>;
+    ///
+    /// `output` is the decode's output, where the picture lands; a decoder whose hardware writes
+    /// the picture straight into it reads it here (`super::vaapi`).
+    fn decode(
+        &mut self,
+        au: &[u8],
+        output: &DecodeOutput<P>,
+    ) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError>;
 
     /// The most pictures it lets its session hold unlanded, queued for the landing thread or
     /// landing, beside its references and the picture being decoded: a picture holds the
@@ -208,6 +215,9 @@ pub(crate) struct Landing<'a, P: Platform> {
     staged: Option<Staged>,
     /// Whether the CPU copied the picture.
     by_cpu: bool,
+    /// Whether the hardware decoded the picture straight into the output's planes
+    /// ([`Landing::decoded_there`]).
+    decoded: bool,
 }
 
 /// Where the planes in a device cache are staged in the staging buffer: each one's first byte.
@@ -218,6 +228,12 @@ struct Staged {
 }
 
 impl<P: Platform> Landing<'_, P> {
+    /// Says that the hardware decoded the picture straight into the output's planes, so that
+    /// nothing was copied (`super::vaapi`).
+    pub(crate) fn decoded_there(&mut self) {
+        self.decoded = true;
+    }
+
     /// The host bytes the picture's planes land in: each plane's own in the surface's pages, and,
     /// for a plane in a device cache, the session's staging buffer at the plane's pitch, which the
     /// session copies into the cache once the landing returns.
@@ -463,12 +479,12 @@ fn plane_end(at: u64, bytes_per_row: u64, height: u64, row_bytes: u64) -> Option
 }
 
 /// A decode's output: its planes.
-struct Output<P: Platform> {
-    luma: OutputPlane<P>,
-    chroma: OutputPlane<P>,
+pub(crate) struct DecodeOutput<P: Platform> {
+    pub(crate) luma: OutputPlane<P>,
+    pub(crate) chroma: OutputPlane<P>,
 }
 
-impl<P: Platform> Output<P> {
+impl<P: Platform> DecodeOutput<P> {
     /// The output of `decode`'s planes, which it holds; a fault for a plane past its buffer, or
     /// in pages with no host bytes.
     fn of(decode: &VideoDecode<'_, P>) -> RaiseResult<Self> {
@@ -585,7 +601,7 @@ fn decode_fault(what: impl std::fmt::Display) -> Raise {
 struct Job<P: Platform> {
     value: u64,
     picture: Option<Box<dyn HostPicture<P>>>,
-    output: Output<P>,
+    output: DecodeOutput<P>,
     _bitstream: P::Buffer,
     /// Whether its picture landed, for the command buffer that waits for `value` ([`Landed`]).
     landed: Arc<Landed>,
@@ -600,6 +616,8 @@ enum Way {
     PagesByCpu,
     /// In a device cache, by the backend's hardware there.
     Cache,
+    /// In a device cache, decoded there by the backend's hardware, with no copy.
+    Decoded,
     /// In a device cache, through the staging buffer the backend's hardware wrote, and a copy.
     Staged,
     /// In a device cache, through the staging buffer the CPU wrote, and a copy.
@@ -607,10 +625,11 @@ enum Way {
 }
 
 impl Way {
-    const ALL: [Way; 5] = [
+    const ALL: [Way; 6] = [
         Way::Pages,
         Way::PagesByCpu,
         Way::Cache,
+        Way::Decoded,
         Way::Staged,
         Way::StagedByCpu,
     ];
@@ -630,6 +649,7 @@ impl Way {
             Way::Pages => "in the surface's pages, by the hardware",
             Way::PagesByCpu => "in the surface's pages, by a CPU copy",
             Way::Cache => "in a device cache, by the hardware",
+            Way::Decoded => "in a device cache, decoded there by the hardware",
             Way::Staged => "in a device cache, staged by the hardware and copied",
             Way::StagedByCpu => "in a device cache, staged by a CPU copy and copied",
         }
@@ -640,7 +660,7 @@ impl Way {
 #[derive(Debug, Default)]
 struct Counts {
     /// Pictures landed, by [`Way`] (its index in [`Way::ALL`]).
-    landed: [u64; 5],
+    landed: [u64; 6],
     /// Decodes that answered no picture.
     skipped: u64,
     /// Pictures that failed to land.
@@ -726,14 +746,14 @@ impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
     }
 
     fn decode(&self, decode: &VideoDecode<'_, P>) -> RaiseResult<Decoded> {
-        let output = Output::of(decode)?;
+        let output = DecodeOutput::of(decode)?;
         let au = access_unit(decode)?;
         let mut state = self.state.lock();
         if !decode.parameter_sets.is_empty() {
             (state.decoder.parameter_sets(decode.parameter_sets))
                 .map_err(|error| decode_fault(format_args!("its parameter sets: {error}")))?;
         }
-        let picture = state.decoder.decode(au).map_err(decode_fault)?;
+        let picture = state.decoder.decode(au, &output).map_err(decode_fault)?;
         let skipped = picture.is_none();
         let value = state.value + 1;
         let landed = Arc::new(Landed::default());
@@ -853,7 +873,7 @@ fn land_pictures<P: Platform>(
 /// how.
 fn land<P: Platform>(
     picture: Box<dyn HostPicture<P>>,
-    output: &Output<P>,
+    output: &DecodeOutput<P>,
     stage: &mut Stage<P>,
 ) -> Result<Way, BackendError> {
     let mut landing = Landing {
@@ -862,11 +882,13 @@ fn land<P: Platform>(
         stage,
         staged: None,
         by_cpu: false,
+        decoded: false,
     };
     picture.land(&mut landing)?;
     let Landing {
         staged,
         by_cpu,
+        decoded,
         stage,
         ..
     } = landing;
@@ -875,6 +897,9 @@ fn land<P: Platform>(
         stage.copy_into_caches(&output.luma, &output.chroma, staged)?;
     }
     let cached = output.luma.cached || output.chroma.cached;
+    if decoded && cached && !is_staged && !by_cpu {
+        return Ok(Way::Decoded);
+    }
     Ok(Way::of(is_staged, cached, by_cpu))
 }
 

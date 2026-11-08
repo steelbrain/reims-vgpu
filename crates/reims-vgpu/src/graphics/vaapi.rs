@@ -16,8 +16,17 @@
 //! - **A decode** hands the access unit to the decoder (`H264Decoder`, `HevcDecoder` on Annex B,
 //!   in decode order), which starts the hardware's work and answers the access unit's frame: one,
 //!   or none for parameter sets and for a picture the stream's random access skips.
-//! - **A picture lands** in the output's planes one of three ways, each the fallback at the last's
-//!   refusal, the session counting each:
+//! - **A picture is decoded into its output's device cache** where it can be ([`CacheTargets`]):
+//!   where both planes lie in one cache whose memory the platform made a dma-buf
+//!   (`decodes_into_device_caches`), the driver's check passed the codec and format (the VA
+//!   crate's `TargetChecks`, kept under `device-checks/va-targets` in the platform's cache
+//!   directory), the planes' rows and starts lie on multiples of 256 bytes of the memory, and
+//!   they hold the coded picture's rows. The cache's memory is exported once, and imported as the
+//!   decode's render target once a cache, a new import made while the decoder still holds the
+//!   last (a reference's). The picture is then there once its decode is done, and nothing is
+//!   copied. Each reason a session's pictures are not, of a cache made so, is logged once.
+//! - **Otherwise a picture lands** in the output's planes one of three ways, each the fallback at
+//!   the last's refusal, the session counting each:
 //!   1. **In the surface's pages, by the driver's video processing** (the VA crate's
 //!      `Frame::write_to_guest`): a run from the decode surface into a linear VA surface
 //!      imported over a dma-buf of the planes' pages, at their own pitches. It is taken where
@@ -45,7 +54,8 @@
 //!   even rows and columns, and the alignment the import check found for the codec's formats;
 //!   all zero where it found none.
 
-use std::path::Path;
+use std::os::fd::{AsFd as _, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Weak};
 
 use reims_vgpu_graphics::wire::{
@@ -55,17 +65,21 @@ use reims_vgpu_graphics::wire::{
     RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
 use reims_vgpu_video::core::backend::DeviceWrite;
-use reims_vgpu_video::core::device_memory::GuestTarget;
+use reims_vgpu_video::core::device_memory::{DeviceImports, GuestTarget, MemoryIdentity};
 use reims_vgpu_video::core::fourcc::FourCc;
 use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::vaapi::{
     Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
     H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile,
-    encoder_support,
+    TARGET_ALIGNMENT, Target, TargetChecks, TargetCodec, TargetFor, TargetFormat, TargetPlane,
+    TargetShape, encoder_support,
 };
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::decode::{GraphicsVideo, GraphicsVideoSession, PlanePages};
@@ -73,8 +87,8 @@ use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 
 use super::video_host::{
-    BackendError, HostDecoder, HostEncodeSession, HostPicture, HostPlane, HostVideoSession,
-    Landing, OutputPlane,
+    BackendError, DecodeOutput, HostDecoder, HostEncodeSession, HostPicture, HostPlane,
+    HostVideoSession, Landing, OutputPlane,
 };
 
 mod encode;
@@ -112,19 +126,30 @@ pub(crate) fn open_on(
         return None;
     };
     let copies: Arc<dyn GpuCopies<VulkanPlatform>> = Arc::new(gpu_copy::RuntimeCopies::new(device));
-    open::<VulkanPlatform>(device, device.registry_id, &node, runtime, Some(copies))
+    let checks = reims_vgpu_vulkan::platform::cache_directory()
+        .map(|dir| dir.join("device-checks").join("va-targets"));
+    open::<VulkanPlatform>(
+        device,
+        device.registry_id,
+        &node,
+        runtime,
+        Some(copies),
+        checks,
+    )
 }
 
 /// The VA-API video of `device`'s GPU, on its render node `node`, its decoders' threads and waits
-/// on `runtime`, its pictures copied by the GPU through `copies` where given; one per device while
-/// it lives, by `registry_id`. `None`, logged at `info` with why, where libva does not load, the
-/// node opens no display, or the driver decodes neither H.264 nor HEVC.
+/// on `runtime`, its pictures copied by the GPU through `copies` where given, the driver's check
+/// of decodes into device caches kept in `checks` where given; one per device while it lives, by
+/// `registry_id`. `None`, logged at `info` with why, where libva does not load, the node opens no
+/// display, or the driver decodes neither H.264 nor HEVC.
 pub(crate) fn open<P: Platform>(
     device: &P::Device,
     registry_id: u64,
     node: &Path,
     runtime: Arc<dyn Runtime>,
     copies: Option<Arc<dyn GpuCopies<P>>>,
+    checks: Option<PathBuf>,
 ) -> Option<Arc<dyn GraphicsVideo<P>>> {
     type Made = Vec<(u64, Weak<dyn std::any::Any + Send + Sync>)>;
     static MADE: LazyLock<Mutex<Made>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -136,7 +161,7 @@ pub(crate) fn open<P: Platform>(
     if let Some(video) = kept {
         return Some(video);
     }
-    let video = match VaapiVideo::<P>::new(device, node, runtime, copies) {
+    let video = match VaapiVideo::<P>::new(device, node, runtime, copies, checks.as_deref()) {
         Ok(video) => Arc::new(video),
         Err(why) => {
             log::info!("hardware video: no VA-API at {}: {why}", node.display());
@@ -162,6 +187,9 @@ struct VaapiVideo<P: Platform> {
     imports: Arc<GuestWrites>,
     /// What makes each session's GPU copies of its pictures (the module doc's second way).
     copies: Option<Arc<dyn GpuCopies<P>>>,
+    /// What decodes pictures straight into device caches, where the platform makes caches of
+    /// dma-bufs and the driver's check passed any codec.
+    targets: Option<Arc<CacheTargets<P>>>,
 }
 
 impl<P: Platform> VaapiVideo<P> {
@@ -170,6 +198,7 @@ impl<P: Platform> VaapiVideo<P> {
         node: &Path,
         runtime: Arc<dyn Runtime>,
         copies: Option<Arc<dyn GpuCopies<P>>>,
+        checks: Option<&Path>,
     ) -> Result<Self, String> {
         let started = runtime.now();
         let display = Display::open(node, Arc::clone(&runtime)).map_err(|e| e.to_string())?;
@@ -192,6 +221,7 @@ impl<P: Platform> VaapiVideo<P> {
             writes_imports.p010(),
         );
         let imports = Arc::new(GuestWrites::new(&display));
+        let targets = CacheTargets::new(device, &display, &runtime, checks).map(Arc::new);
         Ok(Self {
             display,
             device: device.clone_ref(),
@@ -200,6 +230,7 @@ impl<P: Platform> VaapiVideo<P> {
             writes_imports,
             imports,
             copies,
+            targets,
         })
     }
 
@@ -231,6 +262,12 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         true
     }
 
+    /// Where the platform makes caches of dma-bufs and the driver's check passed a codec: the
+    /// module doc's first way.
+    fn decodes_into_device_caches(&self) -> bool {
+        self.targets.is_some()
+    }
+
     fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>> {
         let entry = (self.caps.iter()).find(|c| c.codec == codec && c.direction == direction)?;
         if direction == RGFX_VIDEO_ENCODE {
@@ -259,6 +296,7 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
             imports: Arc::clone(&self.imports),
             copier: self.copier(),
             said: Arc::new(Mutex::new(Vec::new())),
+            targets: self.targets.clone(),
         };
         let session = HostVideoSession::new(&self.device, codec, NAME, Box::new(decoder))?;
         Some(Arc::new(session))
@@ -395,6 +433,212 @@ pub(crate) fn layout(codec: &RgfxVideoCodecCaps, writes: &ImportWrites) -> RgfxV
     }
 }
 
+/// The bytes of the cache the open makes to learn whether the platform makes caches of dma-bufs:
+/// a 4K NV12 picture's.
+const PROBE_BYTES: u64 = 3840 * 2160 * 3 / 2;
+
+/// `MTLStorageModePrivate`, a device cache's storage.
+const STORAGE_PRIVATE: u64 = 2 << 4;
+
+/// The most device caches whose memory is kept exported at once: a few decoders' output pools.
+const MOST_CACHES: usize = 64;
+
+/// What decodes the video's pictures straight into their outputs' device caches (module doc):
+/// the driver's check's answers, and each cache's memory as a dma-buf, by the cache's identity,
+/// while the cache lives.
+struct CacheTargets<P: Platform> {
+    display: Display,
+    checks: TargetChecks,
+    memories: DeviceImports<CacheMemory<P>>,
+}
+
+/// A device cache's memory, exported as a dma-buf, and the last target imported over it.
+struct CacheMemory<P: Platform> {
+    dma_buf: OwnedFd,
+    /// The allocation's bytes, and the cache's first byte in it.
+    size: u64,
+    offset: u64,
+    /// The cache's buffer, which every import of its memory holds.
+    buffer: P::Buffer,
+    /// The last target imported over it, at its planes, handed again while no decoder holds it.
+    last: Mutex<Option<(Target, [TargetPlane; 2])>>,
+}
+
+impl<P: Platform> CacheTargets<P> {
+    /// Where `device`'s platform makes caches of dma-bufs, as a cache of a 4K picture's bytes made
+    /// so and exported shows, the answers of the driver's check (kept in `checks` where given),
+    /// where any passed; `None` otherwise, logged at `info` with why.
+    fn new(
+        device: &P::Device,
+        display: &Display,
+        runtime: &Arc<dyn Runtime>,
+        checks: Option<&Path>,
+    ) -> Option<Self> {
+        let declined = |why: &str| {
+            log::info!("hardware video: {NAME}: no picture is decoded into a device cache: {why}");
+            None
+        };
+        let made = device.new_dma_buf_buffer_of_length_padding_unobserved(
+            OnFault::Return,
+            PROBE_BYTES,
+            STORAGE_PRIVATE,
+            None,
+        );
+        let probe = match made {
+            Ok(Some(buffer)) => buffer,
+            Ok(None) => return declined("the platform makes no cache of a dma-buf"),
+            Err(raise) => return declined(&format!("a cache of a dma-buf's make: {raise}")),
+        };
+        if let Err(why) = probe.export_dma_buf() {
+            return declined(&format!("a cache's dma-buf: {why}"));
+        }
+        drop(probe);
+        let checks = TargetChecks::of(display, checks);
+        let passed = [
+            (TargetCodec::H264, TargetFormat::Nv12),
+            (TargetCodec::Hevc, TargetFormat::Nv12),
+            (TargetCodec::Hevc, TargetFormat::P010),
+        ]
+        .into_iter()
+        .any(|(codec, format)| checks.passed(codec, format).is_ok());
+        if !passed {
+            return declined(&format!("the driver's check: {}", checks.summary()));
+        }
+        log::info!(
+            "hardware video: {NAME}: pictures are decoded into device caches where the driver's \
+             check passed: {}",
+            checks.summary()
+        );
+        Some(Self {
+            display: display.clone_ref(),
+            checks,
+            memories: DeviceImports::new(runtime, "VA-API's device caches", MOST_CACHES),
+        })
+    }
+
+    /// What gives a decode of `codec` into `output` its picture's target: `None` where the
+    /// output's planes do not both lie in one device cache. Each reason a picture's target is not
+    /// given then is logged once a session, in `said`.
+    fn target_for(
+        self: &Arc<Self>,
+        codec: TargetCodec,
+        output: &DecodeOutput<P>,
+        said: &Arc<Mutex<Vec<String>>>,
+    ) -> Option<TargetFor> {
+        let (luma, chroma) = (&output.luma, &output.chroma);
+        let (Some(cache), Some(other)) = (&luma.cache, &chroma.cache) else {
+            return None;
+        };
+        if cache.key() != other.key() {
+            say(
+                said,
+                "the output's planes lie in two device caches".to_owned(),
+            );
+            return None;
+        }
+        let planes = [
+            (Room::of(luma), luma.offset, luma.rows_held),
+            (Room::of(chroma), chroma.offset, chroma.rows_held),
+        ];
+        let (targets, cache, buffer, said) = (
+            Arc::clone(self),
+            cache.clone(),
+            luma.buffer.clone_ref(),
+            Arc::clone(said),
+        );
+        Some(Box::new(move |shape| {
+            let made = targets.target(codec, shape, &cache, &buffer, planes);
+            made.map_err(|why| say(&said, why)).ok()
+        }))
+    }
+
+    /// The target of a picture of `shape` and `codec` in the cache `cache` (`buffer`), whose
+    /// planes lie at `planes` (each its room, first byte and rows held); `Err` says why there is
+    /// none.
+    fn target(
+        &self,
+        codec: TargetCodec,
+        shape: TargetShape,
+        cache: &MemoryIdentity,
+        buffer: &P::Buffer,
+        planes: [(Room, u64, u64); 2],
+    ) -> Result<Target, String> {
+        (self.checks.passed(codec, shape.format)).map_err(|why| {
+            format!(
+                "the driver's check of {codec:?} into {:?}: {why}",
+                shape.format
+            )
+        })?;
+        let (width, height) = shape.coded;
+        let row = u64::from(width) * shape.format.bytes_per_sample();
+        let rows = [u64::from(height), u64::from(height.div_ceil(2))];
+        for (n, ((room, _, rows_held), needed)) in planes.iter().zip(rows).enumerate() {
+            if *rows_held < needed || room.bytes_per_row < row {
+                return Err(format!(
+                    "plane {n} holds {rows_held} rows of {} bytes, not the coded {width}x{height} \
+                     picture's {needed} of {row}",
+                    room.bytes_per_row
+                ));
+            }
+        }
+        let memory = self.memories.get_or_make(
+            cache,
+            0,
+            || {
+                let exported = buffer.export_dma_buf()?;
+                Ok(CacheMemory {
+                    dma_buf: exported.fd,
+                    size: exported.allocation_size,
+                    offset: exported.offset,
+                    buffer: buffer.clone_ref(),
+                    last: Mutex::new(None),
+                })
+            },
+            || "the cache went".to_owned(),
+        )?;
+        let laid = planes.map(|(room, offset, _)| TargetPlane {
+            offset: memory.offset + offset,
+            bytes_per_row: room.bytes_per_row,
+        });
+        if let Some(off) = (laid.iter())
+            .find(|p| p.offset % TARGET_ALIGNMENT != 0 || p.bytes_per_row % TARGET_ALIGNMENT != 0)
+        {
+            return Err(format!(
+                "a plane at byte {} of the cache's memory, rows of {}, not on {TARGET_ALIGNMENT}",
+                off.offset, off.bytes_per_row
+            ));
+        }
+        let mut last = memory.last.lock();
+        if let Some((target, at)) = &*last
+            && !target.is_held()
+            && target.shape() == shape
+            && *at == laid
+        {
+            return Ok(target.clone());
+        }
+        let target = Target::import(
+            &self.display,
+            memory.dma_buf.as_fd(),
+            memory.size,
+            shape,
+            laid,
+            Box::new(memory.buffer.clone_ref()),
+        )
+        .map_err(|e| format!("the import of the cache's memory: {e}"))?;
+        *last = Some((target.clone(), laid));
+        Ok(target)
+    }
+}
+
+/// Logs `why` once in `said`'s session: why a picture was not decoded into its cache.
+fn say(said: &Mutex<Vec<String>>, why: String) {
+    let mut said = said.lock();
+    if !said.contains(&why) {
+        log::info!("hardware video: {NAME}: a picture not decoded into its device cache: {why}");
+        said.push(why);
+    }
+}
+
 /// A session's decoder.
 enum Codec {
     H264(H264Decoder),
@@ -409,17 +653,25 @@ struct VaDecoder<P: Platform> {
     imports: Arc<GuestWrites>,
     /// The session's GPU copies of its pictures, or why it has none.
     copier: SessionCopier<P>,
-    /// The reasons the session's pictures were copied by the CPU, each logged once.
+    /// The reasons the session's pictures were copied by the CPU, or not decoded into their
+    /// caches, each logged once.
     said: Arc<Mutex<Vec<String>>>,
+    /// What decodes its pictures straight into their caches, where the video does.
+    targets: Option<Arc<CacheTargets<P>>>,
 }
 
 impl<P: Platform> VaDecoder<P> {
-    fn frames(&mut self, au: &[u8]) -> Result<Vec<Frame>, BackendError> {
+    /// The frames of `au`, its picture decoded into a target `target_for` gives where given.
+    fn frames(
+        &mut self,
+        au: &[u8],
+        target_for: Option<TargetFor>,
+    ) -> Result<Vec<Frame>, BackendError> {
         let id = self.next_id;
         self.next_id += 1;
         let frames = match &mut self.codec {
-            Codec::H264(decoder) => decoder.decode(au, id),
-            Codec::Hevc(decoder) => decoder.decode(au, id),
+            Codec::H264(decoder) => decoder.decode_into(au, id, target_for),
+            Codec::Hevc(decoder) => decoder.decode_into(au, id, target_for),
         };
         Ok(frames?)
     }
@@ -427,14 +679,24 @@ impl<P: Platform> VaDecoder<P> {
 
 impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
     fn parameter_sets(&mut self, sets: &[u8]) -> Result<(), BackendError> {
-        match self.frames(sets)?.len() {
+        match self.frames(sets, None)?.len() {
             0 => Ok(()),
             n => Err(format!("parameter sets answered {n} pictures").into()),
         }
     }
 
-    fn decode(&mut self, au: &[u8]) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError> {
-        let mut frames = self.frames(au)?;
+    fn decode(
+        &mut self,
+        au: &[u8],
+        output: &DecodeOutput<P>,
+    ) -> Result<Option<Box<dyn HostPicture<P>>>, BackendError> {
+        let codec = match self.codec {
+            Codec::H264(_) => TargetCodec::H264,
+            Codec::Hevc(_) => TargetCodec::Hevc,
+        };
+        let target_for = (self.targets.as_ref())
+            .and_then(|targets| targets.target_for(codec, output, &self.said));
+        let mut frames = self.frames(au, target_for)?;
         let frame = match (frames.pop(), frames.len()) {
             (None, _) => return Ok(None),
             (Some(frame), 0) => frame,
@@ -485,6 +747,12 @@ impl<P: Platform> VaPicture<P> {
 
 impl<P: Platform> HostPicture<P> for VaPicture<P> {
     fn land(self: Box<Self>, to: &mut Landing<'_, P>) -> Result<(), BackendError> {
+        // Decoded into its output's cache: there once its decode is done.
+        if self.frame.is_in_target() {
+            self.frame.sync()?;
+            to.decoded_there();
+            return Ok(());
+        }
         let declined = match in_place(to.luma, to.chroma, self.frame.bit_depth()) {
             Ok((layout, pages)) => {
                 let target = GuestTarget::new(&layout, &*pages.memory);

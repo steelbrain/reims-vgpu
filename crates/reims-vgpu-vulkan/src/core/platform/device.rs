@@ -149,6 +149,25 @@ pub trait GpuDevice<P: Platform>: Handle {
         let _ = aligned_byte;
         self.new_buffer_of_length(on, length, options)
     }
+    /// No Metal counterpart: a buffer as
+    /// [`new_buffer_of_length_padding_unobserved`](GpuDevice::new_buffer_of_length_padding_unobserved)'s,
+    /// whose memory the platform also exports as a dma-buf
+    /// ([`Buffer::export_dma_buf`](super::resource::Buffer::export_dma_buf)): the host's video
+    /// decodes its pictures into the IOSurface device caches so, its hardware writing the cache's
+    /// memory. `Ok(None)` where the platform makes none (the default, and a device that exports no
+    /// dma-buf of a buffer's memory), and the caller makes the buffer as before. Reached both under
+    /// a handler and with none: `on` says which this call is.
+    #[cfg(unix)]
+    fn new_dma_buf_buffer_of_length_padding_unobserved(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: Option<u64>,
+    ) -> RaiseResult<Option<P::Buffer>> {
+        let _ = (on, length, options, aligned_byte);
+        Ok(None)
+    }
     /// sel: newCommandQueue
     /// Never nil-checked. No path reaches it under a handler: a raise inside it dies at the send.
     fn new_command_queue(&self) -> Option<P::CommandQueue>;

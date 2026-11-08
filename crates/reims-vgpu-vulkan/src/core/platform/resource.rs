@@ -107,6 +107,14 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
     fn export_memory(&self) -> Result<ExportedMemory, String> {
         Err("the platform exports no buffer's memory".to_owned())
     }
+    /// No Metal counterpart: the buffer's memory as a new dma-buf of its allocation, with what an
+    /// import names ([`ExportedMemory`], its `fd` a dma-buf), where the buffer was made so
+    /// ([`GpuDevice::new_dma_buf_buffer_of_length_padding_unobserved`](super::device::GpuDevice::new_dma_buf_buffer_of_length_padding_unobserved)).
+    /// `Err` says why not: the default, and a buffer made as any other.
+    #[cfg(unix)]
+    fn export_dma_buf(&self) -> Result<ExportedMemory, String> {
+        Err("the platform exports no buffer's memory as a dma-buf".to_owned())
+    }
     /// No Metal counterpart: says that another API wrote the buffer's exported memory
     /// ([`Buffer::export_memory`]) and that the caller waited for those writes (a CUDA stream's
     /// synchronize), so that the device's later reads of the buffer see them. Called once after
@@ -119,11 +127,13 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
     }
 }
 
-/// A buffer's memory, exported for another API to import ([`Buffer::export_memory`]): an opaque
-/// file descriptor of its allocation (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`), which
-/// CUDA's `cuImportExternalMemory` takes with the allocation's size and whether it is dedicated,
-/// and the buffer's place in it, which `cuExternalMemoryGetMappedBuffer` takes. The buffer must
-/// outlive what the importer reads or writes through it.
+/// A buffer's memory, exported for another API to import: from [`Buffer::export_memory`], an
+/// opaque file descriptor of its allocation (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`),
+/// which CUDA's `cuImportExternalMemory` takes with the allocation's size and whether it is
+/// dedicated, and the buffer's place in it, which `cuExternalMemoryGetMappedBuffer` takes; from
+/// [`Buffer::export_dma_buf`], a dma-buf of the allocation, which VA-API imports with the planes'
+/// offsets in it (the buffer's own offset added). The buffer must outlive what the importer reads
+/// or writes through it.
 #[cfg(unix)]
 #[derive(Debug)]
 pub struct ExportedMemory {

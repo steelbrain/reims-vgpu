@@ -460,8 +460,9 @@ const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan-tests";
 
 /// The library's cache directory, [`SHADER_CACHE`] under `HOME`: the shader cache's, whose sweep
 /// touches only its `v1` (the runtime's), and the device checks' `device-checks` beside it
-/// (`crate::device_choice`'s verdict). `None` where `HOME` is not set.
-pub(crate) fn cache_directory() -> Option<PathBuf> {
+/// (`crate::device_choice`'s verdict, and the host video's checks of its driver). `None` where
+/// `HOME` is not set.
+pub fn cache_directory() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("HOME")?).join(SHADER_CACHE))
 }
 
