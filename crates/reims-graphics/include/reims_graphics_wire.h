@@ -1234,6 +1234,7 @@
 // the kernel's own. A host offers it only where its platform makes such pipelines. A host
 // without it reads the flag as no flag, so the guest sends the flag only where it took the bit.
 #define RGFX_FEATURE_OPENCL_MODE (1 << 27)
+
 // `FEATURES_LO` bit 28, `PRIVATE_RENDER_STATE`, which the guest takes through
 // [`RGFX_REG_DRIVER_FEATURES_LO`]: a [`RgfxRenderPipelineCreate`] may carry
 // [`RGFX_RENDER_PIPELINE_PRIVATE_STATE`] and, after its head, the

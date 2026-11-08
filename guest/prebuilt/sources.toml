@@ -14,7 +14,7 @@ clang = "Apple clang version 21.0.0 (clang-2100.4.1.1)"
 "../Kernels/kernel" = "7004ebc1020a5c7e3f075c631507f31fdc0ce3fe02e9f01f42dce1d178770a08"
 
 [sources]
-"crates/reims-graphics/include/reims_graphics_wire.h" = "0b4e53e15eda53a581f6d3e2273e4770993f029a706c22c3db01139be1167f71"
+"crates/reims-graphics/include/reims_graphics_wire.h" = "e61554c767b66ee836b11803f8bc61c7e0e34c761b76dcbf9c892965f7f327df"
 "guest/Makefile" = "e5340a9656bdcdad8b166391634ea1a94b2b81af5f44726bb5cafb40eadf8f37"
 "guest/bundle/Info.plist" = "eb22780c5ed1da8871f709d31818af04c47cdb4c75fbe1c437e192dd1bc0956f"
 "guest/bundle/Makefile" = "6544e40030d608d603687227de35e07313178d757bb2d9453bb7c573d1e5bbbe"
