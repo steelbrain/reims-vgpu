@@ -1,14 +1,14 @@
 # Graft's consumer files beside this record, copied from Graft's repository
 # by its tools/vendor.py. Replace the directory and this record together;
 # do not edit either.
-commit = "9ac50f69780de14b1f97baac7150318cd05a2a17"
+commit = "68955bb93702ddcd1e150ae8f2bcfea129e9edf6"
 
 [files]
 "consumer/Start.cpp" = "4b53211f0577bb202e2f185a9d200d541f516dd8c62ac0295801d34280b6a857"
 "dist/Graft.kext/Contents/Info.plist" = "aa9221c62185214ffcc06ed53e074f4418009cb170dc02c7596cf3effb150cd9"
-"dist/Graft.kext/Contents/MacOS/Graft" = "3c15fa240ec9588d264be3cee67fc80d09e9f3c0c9cc40f2a3ecf29e41885c49"
-"dist/build.json" = "f461124105de72b268298cd1387703e88350ff00b3033936e62b1e404c2343f4"
-"include/graft/Graft.h" = "6ae58960edcfc6fe1ee6474958d75728f767335adc70d8cccd54f834ec2f8cfd"
+"dist/Graft.kext/Contents/MacOS/Graft" = "ea1bdfe43c94d20c8aae085f11dc53b55f7f03329cabf7dd4bb5baea883cbf21"
+"dist/build.json" = "6eee7957521440cd4c026c7aabb1f578a856295bec9c360e5bd5b5cfd3cd96bb"
+"include/graft/Graft.h" = "e4edc7c618d9be43f580fffd24ce0a859ff93cb2680287769af8fa46b1bf0270"
 "tools/README.md" = "e201b70ba6220b55d640f1b892f960445226dee56e60959688755f9d2c996eb5"
 "tools/consumer.mk" = "2acce0fcefea8394e98c039aa1d1ed12a248370f4a81476867869ce436533674"
 "tools/consumer.py" = "06de2aa063412378dcb25a21c60710448e67f7c206e803e07e6ad19d41ed62b1"
