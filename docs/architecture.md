@@ -124,7 +124,8 @@ crates/
   reims-vgpu-video-*/   the host's video decoders and encoders (docs/video)
   reims-ctl/            the VM manager, a workspace of its own
 xtask/                  testkit, header, dist, metallibs, check
-firmware/               the device's option ROM: its UEFI driver, in C, and the prebuilt ROM (11.4)
+firmware/               the device's option ROM: its UEFI driver, in C, and the prebuilt ROM (11.4);
+                        firmware/ambrosia, its driver module for Ambrosia, the arm64 guests' firmware (11.5)
 guest/                  the guest's kexts, loader and Metal bundle, and the prebuilt kext set
 tests/shaders/          the tests' metallibs and their sources
 scripts/                install-ctl.sh: installs reims-ctl and its QEMU
@@ -707,6 +708,44 @@ run, fails where a file the record names has changed.
 `gBS`, `IN` and `OUT`), not the Rust conventions of section 17. `Uefi.h` declares only what the
 driver calls, and keeps every table's offsets by declaring the services it does not call as opaque
 pointers.
+
+### 11.5 The driver module for Ambrosia
+
+`firmware/ambrosia/` is the device's driver module for Ambrosia, the boot firmware of arm64 macOS
+guests on QEMU's `vmapple` machine: what the option ROM is to an x86-64 guest's firmware. Ambrosia
+loads the module from its configuration bundle, whose `config.plist` names it (`Graphics` >
+`Driver`), and calls its entry point once, before it reads the guest's disks. It draws its log on
+the framebuffer the module returns, as an early console, and hands the framebuffer to the kernel in
+the boot arguments, whose console draws there in turn. The interface is revision 1 of Ambrosia's
+graphics driver interface, which `AmbrosiaGraphics.h` declares; Ambrosia's own repository
+documents it.
+
+```
+Makefile                 clang and lld: the module, build/ReimsGraphics.elf, and a bundle that starts it,
+                         build/ReimsGraphics.cpio (make bundle)
+ReimsGraphicsModule.c    the entry point: the device's BARs, its control ring and its mode
+AmbrosiaGraphics.h       Ambrosia's graphics driver interface, revision 1
+config.plist             the bundle's configuration, which names the module
+```
+
+**What the module does.** It finds the device on bus 0, gives BAR 0 an address at the start of the
+PCIe window Ambrosia names and BAR 2 the first address after it aligned to its size, where the
+guest's kernel keeps them, and turns memory decoding on. Then it does what the option ROM's `Start`
+and `SetMode` do: it resets the device, adopts the control rings' counters, asks for the displays,
+takes the preferred mode of the first connected display, or 1920 × 1080, with rows a multiple of
+256 bytes, and points the display at the region's memory from `RGFX_ALLOCATIONS_OFFSET` with
+`SET_SCANOUT`, polling the completion ring for each answer. That memory is the framebuffer it
+returns. It turns on neither bus mastering nor MSI-X, and leaves the scanout set, for the kernel.
+It returns 1 where bus 0 has no device, and 2, saying why in Ambrosia's log, where the device can't
+be driven; Ambrosia then boots with no console but the UART.
+
+**The build.** The module is an ELF64 aarch64 static PIE, the format Ambrosia loads: clang compiles
+the C freestanding for `aarch64-unknown-none-elf`, position-independent and with strict alignment,
+and `ld.lld -pie --no-dynamic-linker -z text` links it with no `PT_INTERP`, no relocations but
+`R_AARCH64_RELATIVE` ones, and the entry point as its `e_entry`. The PCIe window is device memory
+to the module, so it reads and writes the rings 8 bytes at a time with plain loads and stores
+ordered by `dmb sy`, where the option ROM uses acquire and release atomics. Its C follows the option
+ROM's style, on `stdint.h`'s types, since it has no UEFI.
 
 ---
 

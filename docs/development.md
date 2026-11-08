@@ -16,7 +16,9 @@ crates/                     its eight crates (below), and reims-ctl, a
 xtask/                      cargo xtask (below)
 firmware/                   the reims-graphics device's option ROM: its UEFI
                             driver, in C, and the prebuilt ROM reims-ctl
-                            carries
+                            carries; in firmware/ambrosia, the device's
+                            driver module for Ambrosia, arm64 guests'
+                            firmware
 guest/                      the guest's kexts, loader and Metal bundle, and
                             the prebuilt kext set reims-ctl carries
 tests/

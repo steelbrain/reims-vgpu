@@ -152,7 +152,9 @@ resize it. [docs/api.md](docs/api.md) section 2 lists every setting and variable
   `reims-graphics-pci` in C on the C API, which finds the library through pkg-config and links it
   statically.
 - The option ROM: `firmware/`, the device's UEFI driver, in C, which the guest's firmware runs.
-  `firmware/prebuilt` holds the built ROM, which reims-ctl gives the device.
+  `firmware/prebuilt` holds the built ROM, which reims-ctl gives the device. `firmware/ambrosia`
+  is the device's driver module for Ambrosia, which gives an arm64 guest's firmware an early
+  console on the device.
 - The Vulkan platform's runtime: metal2vulkan's public repository, at the commit the workspace's
   `Cargo.toml` names.
 - VMs: `reims-ctl` (`crates/reims-ctl`) creates, boots and manages them.
@@ -188,7 +190,8 @@ it needs itself; working on the code needs the following.
   (`xcodebuild -downloadComponent MetalToolchain`), and Homebrew's `vulkan-loader` and
   `molten-vk`, the Vulkan the library runs on there. The guest's kexts build with Xcode and a
   macOS 26 KDK (`guest/Makefile`).
-- clang and lld for the option ROM (`firmware/`; on a Mac, Homebrew's `lld`).
+- clang and lld for the option ROM and the Ambrosia module (`firmware/`; on a Mac, Homebrew's
+  `lld`).
 - For `make qemu`: the `vendor/qemu` submodule (`git submodule update --init vendor/qemu`) and
   QEMU's build dependencies (`meson`, `ninja`, `pkg-config`, `glib`, `pixman` and so on).
 
@@ -205,6 +208,7 @@ make qemu         # qemu-system-x86_64 with reims-graphics-pci on the library, i
 make clean        # remove build/
 make -C guest test     # the guest side's tests, on a Mac
 make -C firmware       # the option ROM, in firmware/build
+make -C firmware/ambrosia bundle   # the Ambrosia module and a bundle that starts it, in firmware/ambrosia/build
 ```
 
 The Makefile's header describes every target and its variables. `make` runs `cargo`, which you can

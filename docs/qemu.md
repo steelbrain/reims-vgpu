@@ -830,3 +830,56 @@ or TCG on Ambrosia, our own arm64 firmware, which enters macOS's kernel
 itself. Virtualization.framework's firmware, AVPBooter, does not boot on the
 machine's layout now. The branch's commits for it ("What vendor/qemu
 carries", above) say what each one changes and why.
+
+### arm64 guests: the device on Ambrosia
+
+`firmware/ambrosia` is the device's driver module for Ambrosia
+([architecture.md](architecture.md) 11.5), which gives an arm64 guest an
+early console on the device. `make qemu` builds no `qemu-system-aarch64`,
+and runs configure again when its build directory holds an `aarch64-softmmu`
+build, so one with the device is configured by hand in a directory of its
+own, on the same dist tree, with `make qemu`'s options and `vmapple`'s:
+
+```sh
+make                                    # cargo xtask dist: target/dist-vulkan
+mkdir -p build/qemu-aarch64 && cd build/qemu-aarch64
+PKG_CONFIG_PATH=$PWD/../../target/dist-vulkan/lib/pkgconfig ../../vendor/qemu/configure \
+  --target-list=aarch64-softmmu --enable-hvf --enable-reims-vgpu --enable-gnutls \
+  --disable-docs --disable-bsd-user --disable-linux-user --disable-tools
+make qemu-system-aarch64
+```
+
+configure's summary says `reims-vgpu support: YES` and `HVF support: YES`,
+and QEMU's build signs the binary with the hypervisor entitlement. A guest
+boots on Ambrosia as `vendor/qemu`'s `docs/system/arm/vmapple.rst` says,
+with the device and a configuration bundle that names the module
+(`make -C firmware/ambrosia bundle`) added; `REIMS_VGPU_WINDOW=0` keeps the
+library's window shut, and QMP's `screendump` shows the display:
+
+```
+-device reims-graphics-pci
+-device loader,file=firmware/ambrosia/build/ReimsGraphics.cpio,addr=0x120000000,force-raw=on
+```
+
+**Measured** on the M3 Max under HVF on 2026-11-08, with `vendor/qemu` at
+`aef8a7cf` configured as above on the library of `61b1aac9e`, Ambrosia's
+`44f0dac` and APFS clones of a macOS 26.6.2 (25G83) guest's disks:
+- With the module, in each of two boots, Ambrosia logged `reims-graphics
+  at 00:05.0: 1920x1080, framebuffer 0x80400000, registers 0x50000000` and
+  started its console there. The screendumps showed its log from the
+  console's start to the kernel's entry, and the kernel's progress bar
+  beneath it, advancing; the guest has no driver for the device (our kexts
+  are x86-64), so that is all the display showed. The guest answered SSH
+  12 s after QEMU started, with System Integrity Protection enabled and
+  `kern.bootargs` empty, and QEMU logged no `reims-vgpu: fatal` line. Once
+  the second boot answered SSH, QEMU's `info pci` had BAR 0 at 0x50000000
+  and BAR 2 at 0x80000000, where the module put them, and the other
+  devices' BARs from 0x50001000 up, where the kernel put them.
+- With the device and no module, the guest answered SSH 11 s after QEMU
+  started, with SIP enabled and no boot arguments; the display stayed
+  black, and `info pci` listed both of the device's BARs as not mapped.
+- The device as it was before `7aee20f4`, with the scanout's dirty log
+  (`c7909d60`'s `reims-graphics-pci.c`, on the library of `a851db6a7`),
+  stopped QEMU under HVF as soon as the module set the scanout:
+  `accel/hvf/hvf-all.c:74:do_hv_vm_protect: assertion failed:
+  (!(size & ~page_mask))`.

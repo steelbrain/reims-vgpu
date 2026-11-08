@@ -9,7 +9,9 @@ drivers drive in x86-64 macOS guests:
   which reims-ctl adds to an x86-64 VM's OpenCore image as a prebuilt set.
   They are to work on every x86-64 macOS release from 11.0 to 26's last;
 - the option ROM (`firmware/`), the device's UEFI driver in C, which an
-  x86-64 guest's firmware runs;
+  x86-64 guest's firmware runs, and its driver module for Ambrosia
+  (`firmware/ambrosia`), which gives an arm64 guest's firmware an early
+  console on the device;
 - QEMU's `reims-graphics-pci` (`vendor/qemu`), in C on that API, which finds
   the library through pkg-config and links it statically;
 - `reims-ctl` (`crates/reims-ctl`), the VM manager users run.
@@ -62,6 +64,7 @@ The Makefile's header lists every target. README.md lists the requirements.
 | the guest's kexts, loader and Metal bundle | `guest/`, and the prebuilt set reims-ctl carries, `guest/prebuilt` |
 | the dist tree QEMU links | `xtask/src/dist.rs` (`cargo xtask dist`) |
 | the option ROM reims-ctl gives the device | `firmware/`, and the prebuilt ROM, `firmware/prebuilt/ReimsGraphics.rom`, described in [docs/architecture.md](docs/architecture.md) section 11.4 |
+| the device's driver module for Ambrosia, the arm64 guests' firmware | `firmware/ambrosia`, described in [docs/architecture.md](docs/architecture.md) section 11.5; how a guest boots with it is [docs/qemu.md](docs/qemu.md), "arm64 guests" |
 | `cargo xtask` | `xtask/` |
 | the tests' metallibs and their sources | `tests/shaders` (`tests/suite/fixtures/shaders` links to it, for `guest/bundle`'s build and tools) |
 | QEMU and VM boots | `vendor/qemu`, `vendor/qemu/hw/display/reims-graphics-pci.c`, [docs/qemu.md](docs/qemu.md) |
@@ -125,7 +128,8 @@ passes run again alone.
 | `xtask/` | `cargo test -p xtask`, rustfmt and clippy on it |
 | `crates/reims-ctl` | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it (`cargo xtask check` does not reach it); a change to the QEMU command it builds, or to `scripts/install-ctl.sh`, also needs an install and a VM boot on each host it touches |
 | `guest/` (kext, bundle, rgfxgate, loader) | `make -C guest test` on a Mac; a change to a source the set is built from also needs `make -C guest prebuilt KDK=<KDK Extensions dir>`, committing `guest/prebuilt` with it (`make -C guest prebuilt-check` fails otherwise) |
-| `firmware/` | build it (`make -C firmware`); a change not meant to alter what the guest's firmware sees keeps the ROM's bytes; a change to what `ReimsGraphics.rom` is built from (its sources, the Makefile, `crates/reims-graphics/include/reims_graphics_wire.h`) also runs `make -C firmware prebuilt` on a Mac, committing the ROM and record it writes |
+| `firmware/`, the option ROM | build it (`make -C firmware`); a change not meant to alter what the guest's firmware sees keeps the ROM's bytes; a change to what `ReimsGraphics.rom` is built from (its sources, the Makefile, `crates/reims-graphics/include/reims_graphics_wire.h`) also runs `make -C firmware prebuilt` on a Mac, committing the ROM and record it writes |
+| `firmware/ambrosia` | build it (`make -C firmware/ambrosia bundle`); a change to what it does with the device also needs an arm64 guest's boot on Ambrosia with the device and the module ([docs/qemu.md](docs/qemu.md), "arm64 guests") |
 | `vendor/qemu` | build it (`make qemu`) and realize the device paused (`-S`); a change to `hw/display/reims-graphics-pci.c`, or to what QEMU calls, also needs a VM boot ([docs/lessons.md](docs/lessons.md), [docs/qemu.md](docs/qemu.md)) |
 | docs and comments | nothing |
 
