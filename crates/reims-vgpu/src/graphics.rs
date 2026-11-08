@@ -121,9 +121,9 @@ mod nvidia;
 mod present;
 mod read;
 mod sink;
-mod video_host;
 #[cfg(vulkan_platform)]
 mod video_choice;
+mod video_host;
 #[cfg(vulkan_platform)]
 mod vulkan;
 
