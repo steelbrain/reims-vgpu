@@ -20,6 +20,13 @@
 //! sample the surface in its own format (WindowServer's display surfaces are 10-bit,
 //! `BGR10A2Unorm`) and write the drawable's. The first surface of each format is logged.
 //!
+//! **Clears.** A draw clears the drawable to black first only where what it draws does not cover
+//! all of it: a pass whose draw covers the drawable writes each of its pixels, so it loads none
+//! of the drawable's old ones ([`pass_load`]), and its pixels are those it would draw after a
+//! clear. On a Radeon 780M (RADV), a 3840 x 2160 surface of WindowServer's at 30 frames a second,
+//! the pass took 0.78 ms of the GPU's time with its clear and 0.80 ms without (measured
+//! 2026-11-08, the median of about 330 draws each): the clear there costs nothing measurable.
+//!
 //! **The display's colour.** While any stage of the display pipe's colour is on (`color`: gamma
 //! tables and a colour matrix a transaction set), the draw puts what the display shows through it:
 //! a presented surface is drawn into the drawable by the colour's fragment function
@@ -101,10 +108,29 @@ use reims_vgpu_graphics::wire::{
 use reims_vgpu_vulkan::core::platform::resource::Library as _;
 use reims_vgpu_vulkan::core::platform::values::RenderPipelineDesc;
 
+/// `MTLLoadActionDontCare`.
+const LOAD_ACTION_DONT_CARE: u64 = 0;
 /// `MTLLoadActionClear`.
 const LOAD_ACTION_CLEAR: u64 = 2;
 /// `MTLStoreActionStore`.
 const STORE_ACTION_STORE: u64 = 1;
+
+/// The load action of a render pass that draws over `at` of `texture`, clipped to it: none where
+/// `at` covers every pixel of it, which the draw then writes (no fragment function of the
+/// display's discards, and none blends), else a clear to black first (the module doc, "Clears").
+fn pass_load<P: Platform>(texture: &P::Texture, at: PixelRect) -> u64 {
+    let whole = PixelRect {
+        x: 0,
+        y: 0,
+        width: texture.width(),
+        height: texture.height(),
+    };
+    if at == whole && at.width > 0 && at.height > 0 {
+        LOAD_ACTION_DONT_CARE
+    } else {
+        LOAD_ACTION_CLEAR
+    }
+}
 
 /// What a graphics display's window sink draws with (the module doc).
 pub(crate) struct ScanoutDraw<P: Platform> {
@@ -601,7 +627,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
 
     /// A command buffer of the sink's queue with the scanout drawn into `texture` at `region`
     /// through `color` (the module doc), clipped as [`Self::encode_scanout`] clips its blit, after
-    /// a clear of the drawable to black; not committed. `None` where the guest has no scanout, or
+    /// a clear of the drawable to black where that does not cover it; not committed. `None` where the guest has no scanout, or
     /// the platform refuses its pages, the colour's pipeline or buffers.
     fn encode_scanout_colored(
         &self,
@@ -648,8 +674,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
     }
 
     /// A command buffer of the sink's queue with the presented `surface` drawn into `texture` at
-    /// `region` through `color` (the module doc), after a clear of the drawable to black; not
-    /// committed. `None`, with nothing committed, where the platform refuses the colour's
+    /// `region` through `color` (the module doc), after a clear of the drawable to black where
+    /// `region` does not cover it; not committed. `None`, with nothing committed, where the platform refuses the colour's
     /// pipeline or buffers.
     fn encode_colored(
         &self,
@@ -785,8 +811,9 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
         Some(buffer)
     }
 
-    /// Encodes into `command_buffer` a render pass that clears `texture` to black and draws
-    /// `read` over `at` through `color`, the colour of `changes` changes: through the colour's
+    /// Encodes into `command_buffer` a render pass that clears `texture` to black where `at` does
+    /// not cover it ([`pass_load`]) and draws `read` over `at` through `color`, the colour of
+    /// `changes` changes: through the colour's
     /// table where it has one for them (the module doc), drawn first where it is not yet, else by
     /// the colour's pass; `None`, with no pass encoded, where the platform refuses the colour's
     /// pipeline or buffers.
@@ -974,8 +1001,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             .as_ref()
     }
 
-    /// Encodes into `command_buffer` a render pass that clears `texture` to black and draws
-    /// `read` over `at`, through `table`, the colour's table, where it is given, else through
+    /// Encodes into `command_buffer` a render pass that clears `texture` to black where `at` does
+    /// not cover it ([`pass_load`]) and draws `read` over `at`, through `table`, the colour's table, where it is given, else through
     /// `color`, the colour of `changes` changes, by the colour's pass; `None`, with no pass
     /// encoded, where the platform refuses the colour's pipeline or buffers.
     #[expect(
@@ -1018,7 +1045,7 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             0,
             &ColorAttachmentSet {
                 texture: Some(Some(texture)),
-                load_action: Some(LOAD_ACTION_CLEAR),
+                load_action: Some(pass_load::<P>(texture, at)),
                 store_action: Some(STORE_ACTION_STORE),
                 clear_color: Some(ClearColor {
                     red: 0.0,
@@ -1227,7 +1254,8 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
 
     /// A command buffer of the sink's queue with the presented `surface` drawn into `texture` at
     /// `region` by the display's present shaders, which convert its format to the drawable's,
-    /// after a clear of the drawable to black; not committed. `None`, with nothing committed,
+    /// after a clear of the drawable to black where `region` does not cover it ([`pass_load`]);
+    /// not committed. `None`, with nothing committed,
     /// where the converter or a pipeline for the drawable's format is refused.
     fn encode_converted(
         &self,
@@ -1241,13 +1269,24 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             gamma: false,
         })?;
         let command_buffer = no_catch(self.queue.command_buffer(OnFault::Die))?;
+        let (texture_width, texture_height) = (texture.width(), texture.height());
+        let x = region.x.min(texture_width);
+        let y = region.y.min(texture_height);
+        let width = region.width.min(texture_width - x);
+        let height = region.height.min(texture_height - y);
+        let at = PixelRect {
+            x,
+            y,
+            width,
+            height,
+        };
         let pass = self.platform.render_pass_descriptor();
         no_catch(pass.set_color_attachment(
             OnFault::Die,
             0,
             &ColorAttachmentSet {
                 texture: Some(Some(texture)),
-                load_action: Some(LOAD_ACTION_CLEAR),
+                load_action: Some(pass_load::<P>(texture, at)),
                 store_action: Some(STORE_ACTION_STORE),
                 clear_color: Some(ClearColor {
                     red: 0.0,
@@ -1262,11 +1301,6 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
             no_catch(command_buffer.render_encoder(OnFault::Die, &pass))?,
             end_render::<P>,
         );
-        let (texture_width, texture_height) = (texture.width(), texture.height());
-        let x = region.x.min(texture_width);
-        let y = region.y.min(texture_height);
-        let width = region.width.min(texture_width - x);
-        let height = region.height.min(texture_height - y);
         #[expect(clippy::as_conversions, reason = "pixel counts far below 2^52")]
         let viewport = MtlViewport {
             origin_x: x as f64,
@@ -2193,6 +2227,186 @@ mod tests {
                             .any(|(a, b)| a[..3] != b[..3]),
                     "{name}, colour {i}: the pass changed nothing"
                 );
+            }
+        }
+    }
+
+    /// A pass whose draw covers the drawable loads none of its old pixels, and one whose draw
+    /// covers part of it, a guest mode smaller than the drawable, clears the rest to black first
+    /// ([`pass_load`]): drawn over a drawable that held one value in every pixel and over one that
+    /// held another, the drawable reads the same, with black outside the guest's image. A
+    /// presented 10-bit surface through the present shaders, through a colour's table and through
+    /// a colour's pass, and the scanout through a colour, at odd sizes and at a mode the display
+    /// offers in each (its width down to a multiple of 16, its height to even)
+    #[test]
+    fn on_vulkan_a_pass_that_skips_its_clear_writes_every_pixel_of_the_drawable() {
+        let platform = Arc::new(reims_vgpu_vulkan::VulkanPlatform::new());
+        crate::entry::run(|_| a_pass_writes_every_pixel(&platform));
+    }
+
+    /// [`on_vulkan_a_pass_that_skips_its_clear_writes_every_pixel_of_the_drawable`]'s body, inside
+    /// the library's entry.
+    fn a_pass_writes_every_pixel<P: ApiPlatform>(platform: &Arc<P>) {
+        use reims_vgpu_graphics::wire::RGFX_ALLOCATIONS_OFFSET;
+
+        let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
+        let new_texture = |format: u64, usage: u64, (width, height): (u32, u32)| {
+            let descriptor = platform.texture_descriptor(&TextureDesc {
+                pixel_format: format,
+                width: u64::from(width),
+                height: u64::from(height),
+                usage,
+                resource_options: Some(0),
+                ..TextureDesc::default()
+            });
+            (platform.metal_device(None).unwrap())
+                .new_texture(OnFault::Die, &descriptor)
+                .unwrap()
+                .unwrap()
+        };
+        let fill = |texture: &P::Texture, bytes: &[u8], (width, height): (u32, u32)| {
+            let length = bytes.len() as u64;
+            // SAFETY: the bytes live across the call, which copies them out.
+            let range =
+                unsafe { HostRange::new(HostPtr::from_ptr(bytes.as_ptr().cast_mut()), length) };
+            texture
+                .replace_region(
+                    MtlRegion {
+                        origin: MtlOrigin::new(0, 0, 0),
+                        size: MtlSize::new(u64::from(width), u64::from(height), 1),
+                    },
+                    0,
+                    0,
+                    range,
+                    u64::from(width) * 4,
+                    length,
+                )
+                .unwrap();
+        };
+        let swap: Table = Arc::from(vec![
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ]);
+        let gamma: Table = Arc::from(vec![[0.0, 0.0, 0.0, 0.0], [1.0, 0.5, 0.25, 0.0]]);
+        let colours: [(&str, [Option<Table>; 4]); 3] = [
+            ("no colour", [None, None, None, None]),
+            ("a table", [Some(gamma), None, None, None]),
+            ("a matrix", [None, None, Some(swap), None]),
+        ];
+        let mut changes = 0;
+        for drawable in [(1001_u32, 7_u32), (67, 33), (17, 5), (64, 32)] {
+            let modes = [drawable, (drawable.0 / 16 * 16, drawable.1 / 2 * 2)];
+            for (i, mode) in modes.into_iter().enumerate() {
+                if i == 1 && mode == drawable {
+                    continue;
+                }
+                let (width, height) = mode;
+                let pixels = |pixel: &dyn Fn((u32, u32)) -> [u8; 4]| -> Vec<u8> {
+                    (0..height)
+                        .flat_map(|y| (0..width).map(move |x| (x, y)))
+                        .flat_map(pixel)
+                        .collect()
+                };
+                let scanout = pixels(&|(x, y)| {
+                    [
+                        (x % 256) as u8,
+                        (y * 7 % 256) as u8,
+                        ((x + y) % 256) as u8,
+                        255,
+                    ]
+                });
+                // SAFETY: the scanout lies inside the region, mapped while it lives.
+                unsafe {
+                    let base = region.base().add(RGFX_ALLOCATIONS_OFFSET as usize);
+                    std::ptr::copy_nonoverlapping(scanout.as_ptr(), base, scanout.len());
+                }
+                let shown = Arc::new(Shown::default());
+                *shown.scanout.lock() = Some(Scanout {
+                    width,
+                    height,
+                    stride: width * 4,
+                    offset: RGFX_ALLOCATIONS_OFFSET,
+                });
+                let ten = pixels(&|(x, y)| {
+                    ((x % 1024)
+                        | ((y * 13 % 1024) << 10)
+                        | (((x * 3 + y) % 1024) << 20)
+                        | (3 << 30))
+                        .to_le_bytes()
+                });
+                let surface = new_texture(94, 0x1, mode);
+                fill(&surface, &ten, mode);
+                let presented = Arc::new(Presented::<P>::default());
+                let draw =
+                    ScanoutDraw::new(Arc::clone(platform), &region, &shown, &presented).unwrap();
+                let image = PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: u64::from(width),
+                    height: u64::from(height),
+                };
+                let read = |held: [u8; 4]| -> Vec<u8> {
+                    let target = new_texture(80, 0x1 | 0x4, drawable);
+                    let old: Vec<u8> = (0..drawable.0 * drawable.1).flat_map(|_| held).collect();
+                    fill(&target, &old, drawable);
+                    let expected = if mode == drawable {
+                        LOAD_ACTION_DONT_CARE
+                    } else {
+                        LOAD_ACTION_CLEAR
+                    };
+                    assert_eq!(
+                        pass_load::<P>(&target, image),
+                        expected,
+                        "{drawable:?} {mode:?}"
+                    );
+                    let (command_buffer, hold) = draw.encode_shown(&target, image).unwrap();
+                    command_buffer.commit(OnFault::Die).unwrap();
+                    command_buffer.wait_until_completed(OnFault::Die).unwrap();
+                    drop(hold);
+                    let mut bytes = vec![0; (drawable.0 * drawable.1 * 4) as usize];
+                    platform.read_pixels(&target, &mut bytes, (drawable.0 * 4) as usize);
+                    bytes
+                };
+                for (source, colour) in [
+                    ("the surface", 0),
+                    ("the surface", 1),
+                    ("the surface", 2),
+                    ("the scanout", 2),
+                ] {
+                    *presented.texture.lock() = (source == "the surface").then(|| ShownTexture {
+                        texture: Handle::clone_ref(&surface),
+                        hold: Arc::new(DisplayHold {
+                            span: None,
+                            answers: Mutex::default(),
+                        }),
+                    });
+                    changes += 1;
+                    let (name, stages) = &colours[colour];
+                    *presented.color.lock() = (
+                        changes,
+                        Arc::new(DisplayColor {
+                            stages: stages.clone(),
+                        }),
+                    );
+                    let case = format!("{source}, {name}, mode {mode:?} in {drawable:?}");
+                    let first = read([0x11, 0x22, 0x33, 0x44]);
+                    let second = read([0xee, 0xdd, 0xcc, 0xbb]);
+                    let differ = (first.chunks(4).zip(second.chunks(4))).position(|(a, b)| a != b);
+                    assert_eq!(
+                        differ,
+                        None,
+                        "{case}: pixel {:?} kept what the drawable held: {:?} and {:?}",
+                        differ.map(|d| (d % drawable.0 as usize, d / drawable.0 as usize)),
+                        differ.map(|d| &first[d * 4..d * 4 + 4]),
+                        differ.map(|d| &second[d * 4..d * 4 + 4]),
+                    );
+                    let outside = (first.chunks(4).enumerate()).find(|(p, px)| {
+                        let (x, y) = (*p as u32 % drawable.0, *p as u32 / drawable.0);
+                        (x >= width || y >= height) && *px != [0, 0, 0, 255]
+                    });
+                    assert_eq!(outside, None, "{case}: not black outside the image");
+                }
             }
         }
     }
