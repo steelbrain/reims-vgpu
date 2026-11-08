@@ -1,8 +1,7 @@
 //! The stage-3 Metal-call decoder: it reads the guest bundle's serialised Metal
 //! calls off a command queue's ring and drives the library's `Platform`
 //! (docs/graphics-kext/design.md, "Stage 3 wire protocol"). It is generic over
-//! the platform, so it drives Metal on macOS and the Vulkan platform on Linux,
-//! the same trait the Apple lane's deserializer drives.
+//! the platform, so it drives Metal on macOS and the Vulkan platform on Linux.
 //!
 //! The decoder keeps an `obj_id` → handle table: a create ([`GpuDevice`] and the
 //! resource creators) inserts the new handle, a destroy drops it (handles are

@@ -6,10 +6,9 @@
 //! - **A creator returns what Metal made**, at `+1` (`new…`), nil as `None`, and an `error:`
 //!   out-parameter's `NSError` as `Err`. A raise inside a creator is the caller's to catch; its
 //!   send's policy says where core sends it: `Caught` for one sent only under a handler (the
-//!   resource manager's creators, the capability queries), `Fatal` for one sent only with
-//!   none (the device's and a FIFO's setup, the GPU task's handshake and jobs, a display's
-//!   pipelines), and `On` for one sent both ways, whose caller says by its `OnFault` which way
-//!   each call is. A getter's raise ends the process at the call.
+//!   resource manager's creators, the capability queries), `Fatal` for one sent only with none (the
+//!   device's setup, a display's pipelines), and `On` for one sent both ways, whose caller says by
+//!   its `OnFault` which way each call is. A getter's raise ends the process at the call.
 //! - What core's trait hides is made here: the `dispatch_data_t`s and their destructors and the
 //!   no-copy deallocator block.
 //! - **Our shader library** is the one creator whose result is kept: its source is compiled once

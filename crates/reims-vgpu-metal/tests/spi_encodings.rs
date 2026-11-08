@@ -8,9 +8,7 @@
 //! texture, heap …), or the object `+new` makes for a descriptor class. The types compare as
 //! objc2's `verify_sel` compares them.
 //!
-//! The render-encoder SPI the host's Metal does not implement ([`UNIMPLEMENTED_ON_HOST`]) must
-//! stay unimplemented: the render decoder raises for those records without a send. The negative
-//! cases show that the check is live: a wrong width or a wrong struct tag fails it.
+//! The negative cases show that the check is live: a wrong width or a wrong struct tag fails it.
 //!
 //! The check sends nothing. A mistyped send inside a live render encoder panics in objc2's check,
 //! the panic unwinds past `endEncoding`, and the encoder's dealloc then hits Metal's assertion
@@ -652,17 +650,6 @@ fn check_method(row: &Row, m: &Method) -> Result<(), String> {
     Ok(())
 }
 
-/// The `MTLRenderCommandEncoderSPI` selectors the render decoder raises for without a send
-/// (`deserializer/render/state.rs`), because the host's AGX render encoder does not implement them
-/// (measured: `class_getInstanceMethod` is NULL on macOS 26.6).
-const UNIMPLEMENTED_ON_HOST: &[&str] = &[
-    "setClipPlane:p2:p3:p4:atIndex:",
-    "setFragmentSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:",
-    "setTransformFeedbackState:",
-    "setTriangleFrontFillMode:backFillMode:",
-    "setVertexSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:",
-];
-
 /// Every method `spi` declares matches the runtime's method on each of its receivers (D41)
 #[test]
 fn every_spi_declaration_matches_the_runtime() {
@@ -687,20 +674,6 @@ fn every_spi_declaration_matches_the_runtime() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert_eq!(rows.len(), 255);
-}
-
-/// The render-encoder SPI the host's AGX render encoder does not implement stays unimplemented
-#[test]
-fn unimplemented_render_spi_stays_unimplemented() {
-    let live = runtime_classes();
-    let cls = class_named("MTLRenderCommandEncoder", &live);
-    for selector in UNIMPLEMENTED_ON_HOST {
-        let sel = Sel::register(&CString::new(*selector).unwrap());
-        assert!(
-            cls.instance_method(sel).is_none(),
-            "{selector}: now implemented"
-        );
-    }
 }
 
 /// The check is live: a row with a wrong width or a wrong struct tag fails against the runtime

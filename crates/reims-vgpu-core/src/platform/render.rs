@@ -9,9 +9,7 @@
 //! of such a method says why. A C array passed with a count or a range is a slice whose length is
 //! that count or `range.length`; its elements are `Option` because they are filled from lookups
 //! that return nil. An SPI selector the encoder does not implement raises
-//! (`NSInvalidArgumentException`), which the render decoder's `@catch` turns into an exec fault,
-//! so every SPI method returns `RaiseResult`. The five records whose selectors the host's encoder
-//! does not implement raise the same themselves, without the send (`deserializer/render/state.rs`).
+//! (`NSInvalidArgumentException`), so every SPI method returns `RaiseResult`.
 
 // One method per selector and one argument per keyword (D4): the patch draws take nine.
 #![allow(clippy::too_many_arguments)]

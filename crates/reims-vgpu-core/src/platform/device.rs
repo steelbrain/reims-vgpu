@@ -172,12 +172,11 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// sel: newRasterizationRateMapWithDescriptor:
     /// aborts: the third layer on the suite's host (render_ratemap_three_layers).
     fn new_rate_map(&self, descriptor: &P::RateMapDescriptor) -> RaiseResult<Option<P::RateMap>>;
-    /// sel: newSharedEvent — One per FIFO. No path reaches it under a handler: a raise inside
-    /// it dies at the send.
+    /// sel: newSharedEvent — No path reaches it under a handler: a raise inside it dies at the
+    /// send.
     fn new_shared_event(&self) -> Option<P::SharedEvent>;
-    /// sel: newSharedEventWithHandle: — Opens the FIFO
-    /// event the host sent; the handle may be nil (decoded from the wire). No path reaches it
-    /// under a handler: a raise inside it dies at the send.
+    /// sel: newSharedEventWithHandle: — Opens the event of a handle, which may be nil. No path
+    /// reaches it under a handler: a raise inside it dies at the send.
     fn open_shared_event(
         &self,
         shared_event_handle: Option<&P::SharedEventHandle>,
