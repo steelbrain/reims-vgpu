@@ -62,7 +62,6 @@ repeats the ones code cites.
     proposed upstream, and the workaround lives here or in the runtime. A
     mark in the runtime that pays off only once upstream takes a fix stays
     if it changes nothing on the stock release.
-  - **Core changes as little as the Vulkan and Linux work allows.**
 - **Closed internal value sets are enums**, converted with `TryFrom<u32>` at
   the guest edge. A raw integer is kept only where the guest can write any
   value. There are no `pub mod x { pub const … }` integer-enum modules.
