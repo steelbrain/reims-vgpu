@@ -268,10 +268,10 @@ fn overwrite<T>(
     Ok(made)
 }
 
-/// What a released hold's drop does between deciding its unmaps and making them, for tests:
-/// the drop's thread's own.
 #[cfg(test)]
 thread_local! {
+    /// What a released hold's drop does between deciding its unmaps and making them, for tests:
+    /// the drop's thread's own.
     static BEFORE_UNMAPS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -649,15 +649,24 @@ mod tests {
         // making them until it is told to go on.
         let (stopped, at_stop) = mpsc::channel();
         let (go_on, until_told) = mpsc::channel::<()>();
-        let dropper = std::thread::spawn(move || {
-            BEFORE_UNMAPS.with(|step| {
-                *step.borrow_mut() = Some(Box::new(move || {
-                    stopped.send(()).unwrap();
-                    until_told.recv().unwrap();
-                }));
-            });
-            drop(hold);
-        });
+        let (dropped, until_dropped) = mpsc::channel();
+        let threads = crate::core::rt::thread::test_threads::StdThreads;
+        crate::core::rt::thread::spawn_named(
+            &threads,
+            "reims-vgpu.test",
+            1 << 20,
+            Box::new(()),
+            move || {
+                BEFORE_UNMAPS.with(|step| {
+                    *step.borrow_mut() = Some(Box::new(move || {
+                        stopped.send(()).unwrap();
+                        until_told.recv().unwrap();
+                    }));
+                });
+                drop(hold);
+                let _ = dropped.send(());
+            },
+        );
         at_stop
             .recv_timeout(Duration::from_secs(10))
             .expect("the drop decided its unmaps");
@@ -670,16 +679,24 @@ mod tests {
         // A remap of one page over `other`, on a thread of its own, so a wait fails the test
         // rather than hanging it.
         let (answer, answered) = mpsc::channel();
-        std::thread::spawn(move || {
-            let vm = VulkanVm {
-                vm: OsVm::new(),
-                report: |_, _| {},
-            };
-            let _ = answer.send(vm.remap_shared_overwrite(other, src, page).is_ok());
-        });
+        crate::core::rt::thread::spawn_named(
+            &threads,
+            "reims-vgpu.test",
+            1 << 20,
+            Box::new(()),
+            move || {
+                let vm = VulkanVm {
+                    vm: OsVm::new(),
+                    report: |_, _| {},
+                };
+                let _ = answer.send(vm.remap_shared_overwrite(other, src, page).is_ok());
+            },
+        );
         let landed = answered.recv_timeout(Duration::from_secs(10));
         go_on.send(()).unwrap();
-        dropper.join().unwrap();
+        until_dropped
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the drop made its unmaps");
         assert!(
             being_made,
             "the unmap was being made, its pages still mapped"
