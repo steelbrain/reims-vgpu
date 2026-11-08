@@ -758,6 +758,40 @@ RTX 5080 Laptop GPU host:
 or OpenCore's `UEFI > Output > Resolution`), whether a larger one fits the
 device's default 16 MiB of VRAM, and the window on GNOME or under X11.
 
+### x86-64 macOS guests: a test base whose apps never open
+
+A guest's disk whose user home carries the BSD flag `restricted`
+(SF_RESTRICTED, the flag System Integrity Protection guards) boots and
+answers SSH, but no sandboxed app opens a window: Safari, Preview and Maps
+start and show nothing. The user's containermanagerd cannot make
+`~/Library/Containers` or set its ACLs there ("Failed creating working
+directories: Operation not permitted", "Failed to create deathrow"),
+exits, and launchd starts it again every 10 s, while the apps wait on it.
+Nothing of ours takes part: the same disk does this with no kexts of ours
+loaded.
+
+Spot it with `ls -lOd ~ ~/Library`: the flags column reads `restricted`
+where a user's own directories show `-`. The owner can be right, the user
+itself, all the same. With SIP on, nothing clears the flag: `sudo chown -R`
+fails with EPERM, and `diskutil resetUserPermissions / 501` reports success
+and leaves it.
+
+The repair runs on a copy, never the base. Boot the copy once behind an
+OpenCore image with SIP off and no kexts (`reims-util opencore
+--disable-sip`; an image with none of the set's kexts in it, reims-ctl
+starts the VM on as it is), run `sudo chflags -R norestricted ~` and `sudo
+chown -R <user>:staff ~`, and power it off. Then boot it again on its own
+image, SIP on, and check that the apps open. SIP's state is in the VM's
+NVRAM, not on its disk, so the repaired disk boots with SIP on as before.
+
+**Measured** on 2026-11-08 with the macOS 13.7.8 (22H730) test base, whose
+copies on Linux hosts with a Radeon 780M and with an RTX 5080 Laptop GPU
+came from one disk: its home and `~/Library` read `restricted`,
+containermanagerd exited every 10 s, and Safari, Preview and Maps opened no
+window, with our kexts and without them. After the repair, on a Radeon 780M
+host, with SIP on, the three apps opened windows (Safari 5, Preview 4,
+Maps 5) and containermanagerd did not exit in 3 minutes.
+
 ## Signing
 
 On a Mac, QEMU's build adds entitlements only to an emulator whose target
