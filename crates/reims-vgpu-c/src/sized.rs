@@ -1,5 +1,5 @@
 //! Reading a struct the host wrote, headed by `uint32_t struct_size` (docs/api.md section 1):
-//! - a size below the struct's first version's is `RVG_ERR_INVALID_ARGUMENT`;
+//! - a size below the struct's is `RVG_ERR_INVALID_ARGUMENT`;
 //! - fields past `struct_size` read as zero;
 //! - a size above the library's is accepted when every byte past the library's size is zero,
 //!   and is `RVG_ERR_UNSUPPORTED` otherwise.

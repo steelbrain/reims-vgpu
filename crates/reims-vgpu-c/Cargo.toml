@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-c"
-description = "The C API (rvg_*) over reims-vgpu; adds no behaviour"
+description = "The C API (rvg_*) of the reims-graphics device over reims-vgpu; adds no behaviour"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,8 @@ publish.workspace = true
 license.workspace = true
 
 [lib]
-# cdylib: the dist tree's lib/libreims_vgpu.dylib (@rpath/libreims_vgpu.dylib), which the suite's
-# runner links; staticlib: lib/libreims_vgpu.a, which QEMU and the smoke link; rlib so Rust tests
-# link it.
+# cdylib: the dist tree's lib/libreims_vgpu.dylib (@rpath/libreims_vgpu.dylib), which the C
+# harness links; staticlib: lib/libreims_vgpu.a, which QEMU links; rlib so Rust tests link it.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
@@ -28,11 +27,11 @@ vulkan = ["reims-vgpu/vulkan"]
 reims-vgpu.workspace = true
 # The graphics device's wire constants, which the C API's PCI constants are checked against.
 reims-graphics.workspace = true
-# The platform trait's associated types (the unit tests' testkit platform stands where
-# MetalPlatform stands in the product), and the log hook.
+# The death of a NULL handle, and the mark of the library's threads (the unit tests' testkit
+# platform stands where MetalPlatform stands in the product).
 reims-vgpu-core.workspace = true
+# A refusal of a memory map's files.
 log.workspace = true
-parking_lot.workspace = true
 # `fstat` and the host's page size, for the files behind a memory map's ranges.
 libc.workspace = true
 
@@ -47,6 +46,8 @@ objc2.workspace = true
 [dev-dependencies]
 reims-vgpu = { workspace = true, features = ["testkit"] }
 reims-vgpu-core = { workspace = true, features = ["testkit"] }
+# The window tests' recorder.
+parking_lot.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # The exceptions `ffi`'s tests throw as a host would (`ffi/tests/macos.rs`).

@@ -12,13 +12,13 @@ use std::sync::Arc;
 
 use reims_vgpu::{GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn};
 
-use crate::device::{RvgMemoryMap, RvgMemoryRangeFile, memory_map};
-use crate::display::{
+use crate::cursor::{
     RvgCursorGlyphFn, RvgCursorMoveFn, RvgCursorShowFn, RvgDisplayCoord, cursor_glyph, cursor_move,
     cursor_show,
 };
 use crate::ffi;
 use crate::handle;
+use crate::memory::{RvgMemoryMap, RvgMemoryRangeFile, memory_map};
 use crate::sized::{self, HostStruct};
 use crate::status::{RVG_ERR_INVALID_ARGUMENT, RVG_OK, RvgStatus, status};
 use crate::table::{RvgDestroyFn, Table, WithTable};
@@ -35,7 +35,8 @@ pub const RVG_GRAPHICS_PCI_DEVICE_ID: u16 = 0x5247;
 pub const RVG_GRAPHICS_PCI_CLASS: u16 = 0x0380;
 
 /// The BAR of the graphics device's registers: 32-bit MMIO accesses, which the host sends to
-/// rvg_graphics_device_mmio_read and rvg_graphics_device_mmio_write, below the MSI-X table.
+/// rvg_graphics_device_mmio_read and rvg_graphics_device_mmio_write_taking, below the MSI-X
+/// table.
 pub const RVG_GRAPHICS_PCI_BAR_REGISTERS: u32 = 0;
 
 /// The size of BAR 0.
@@ -119,7 +120,7 @@ pub type RvgGraphicsScanoutWrittenFn =
 ///
 /// The cursor's three tell the host the guest's cursor on the device's display, for a host that
 /// draws it (QEMU's console, for its SPICE, VNC, GTK and D-Bus displays); the device's window
-/// shows it either way. Thread, and what they may call: as RvgModeChangeFn's, on the display
+/// shows it either way. Thread, and what they may call: as RvgCursorGlyphFn's, on the display
 /// thread, one at a time with every display callback of the process, in the order the device
 /// took the guest's cursor commands and resets. The guest sees nothing of whether the host gives
 /// them.
@@ -152,15 +153,7 @@ pub struct RvgGraphicsCallbacks {
 }
 
 // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
-unsafe impl HostStruct for RvgGraphicsCallbacks {
-    /// The first version ends at `scanout_written`: a host built against it passes 40, and is
-    /// told nothing of the cursor.
-    const V1_SIZE: usize = 40;
-}
-
-const _: () = assert!(
-    std::mem::offset_of!(RvgGraphicsCallbacks, cursor_glyph) == RvgGraphicsCallbacks::V1_SIZE
-);
+unsafe impl HostStruct for RvgGraphicsCallbacks {}
 
 /// The graphics device's config.
 #[repr(C)]
@@ -171,36 +164,30 @@ pub struct RvgGraphicsDeviceConfig {
     /// NULL is a table with every callback absent.
     pub callbacks: *const RvgGraphicsCallbacks,
     /// NULL is no window: the display offers 1920 x 1080 at 60 Hz and shows nothing. Otherwise
-    /// the library opens a window for the display, as for a display's (RvgDisplayConfig.window),
-    /// with its input as the window's callbacks; its flags are ignored, and it opens sized for
-    /// its mode (1920 x 1080 where it has none). The window keeps its size: the display offers
-    /// the guest one mode, the window's size in pixels at the refresh rate of the host screen it
-    /// opens on, and tells the guest when the person resizes it. The guest's scanout is blitted
-    /// out of the region into the window's drawables on the GPU, at the screen's rate, where
-    /// scanout_written says the guest wrote it.
+    /// the library opens a window for the display, with its input as the window's callbacks,
+    /// sized for its mode (1920 x 1080 where it has none). The window keeps its size: the
+    /// display offers the guest one mode, the window's size in pixels at the refresh rate of the
+    /// host screen it opens on, and tells the guest when the person resizes it. The guest's
+    /// scanout is blitted out of the region into the window's drawables on the GPU, at the
+    /// screen's rate, where scanout_written says the guest wrote it.
     pub window: *const RvgWindowConfig,
     /// The guest's RAM, or NULL. With it, where the host's page is the guest's 4 KiB, the GPU uses
-    /// an IOSurface's own pages in place, through views of them made as a device's memory map
-    /// makes its views (RvgDeviceConfig.memory_map); without it each surface's GPU view is a copy
-    /// of its pages in the region. The map's pages stay the guest's RAM while the device lives:
-    /// a host that discards guest RAM (a balloon, virtio-mem, hot-unplug) passes NULL.
+    /// an IOSurface's own pages in place, through views of them; without it each surface's GPU
+    /// view is a copy of its pages in the region. The map's pages stay the guest's RAM while the
+    /// device lives: a host that discards guest RAM (a balloon, virtio-mem, hot-unplug) passes
+    /// NULL. Its ranges may not overlap.
     pub memory_map: *const RvgMemoryMap,
-    /// With `memory_map`: the files behind its ranges, checked and duplicated as
-    /// RvgDeviceConfig.memory_files are, with the same refusals; NULL for none. Files without a
-    /// map are refused (RVG_ERR_INVALID_ARGUMENT).
+    /// With `memory_map`: the files behind its ranges, NULL for none, one entry per range, each
+    /// duplicated during the create. Refused (RVG_ERR_INVALID_ARGUMENT), in this order: files
+    /// without a map; an entry whose `fd` is below -1 or whose `flags` are not 0; for an `fd` of
+    /// 0 or more, a file `fstat` cannot read, one holding fewer than its `offset` and the range's
+    /// length in bytes, or an `offset` that is not a multiple of the host's page size; a file that
+    /// cannot be duplicated. A refusal logs a line saying which.
     pub memory_files: *const RvgMemoryRangeFile,
 }
 
 // SAFETY: repr(C), a u32 first; pointers.
-unsafe impl HostStruct for RvgGraphicsDeviceConfig {
-    /// The first version ends at `window`: a host built against it passes 24, and has no
-    /// `memory_map`.
-    const V1_SIZE: usize = 24;
-}
-
-const _: () = assert!(
-    std::mem::offset_of!(RvgGraphicsDeviceConfig, memory_map) == RvgGraphicsDeviceConfig::V1_SIZE
-);
+unsafe impl HostStruct for RvgGraphicsDeviceConfig {}
 
 /// The graphics device.
 pub struct RvgGraphicsDevice {
@@ -400,40 +387,23 @@ pub unsafe extern "C" fn rvg_graphics_device_mmio_read(
 /// A 32-bit write of BAR 0 at `offset`, below RVG_GRAPHICS_MSIX_OFFSET: STATUS, and DOORBELL
 /// where the host's ioeventfd did not take the write; other offsets are ignored. A write of 0 to
 /// STATUS resets the device, and waits for the command the device is taking, which waits for
-/// nothing of the host's. On any thread, the vCPU's included. Calls back: never.
+/// nothing of the host's.
 ///
-/// # Safety
-/// `device` is a live graphics device handle.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvg_graphics_device_mmio_write(
-    device: *mut RvgGraphicsDevice,
-    offset: u64,
-    value: u32,
-) {
-    ffi::export(|| {
-        // SAFETY: the caller's contract.
-        unsafe { live(device, "rvg_graphics_device_mmio_write") }
-            .device
-            .mmio_write(offset, value);
-    })
-}
-
-/// rvg_graphics_device_mmio_write, but a write to RVG_GRAPHICS_REG_DOORBELL of a command queue's
-/// ring (any value but RVG_GRAPHICS_DOORBELL_CONTROL) may answer the queue's next command buffer
-/// on the calling thread, ahead of the queue's own thread, posting the event that says it is
-/// submitted there: raise_interrupt is then called on the calling thread, inside this call, after
-/// that event is published. The host's raise_interrupt must therefore not wait for a lock the host
-/// holds while it calls this. A buffer is answered only where nothing need be waited for (each
-/// lock the answer needs is tried, and the queue's thread holds none of the queue's messages), and
-/// the answer allocates nothing; the queue's thread then takes the buffer, as it takes any, and
-/// the write wakes it, as rvg_graphics_device_mmio_write does. A write of
-/// RVG_GRAPHICS_DOORBELL_CONTROL may likewise take the control ring's next message on the calling
-/// thread and answer it there, raising the interrupt inside the call, where it is a surface
-/// download whose pages hold the surface's GPU copy already and the control thread sleeps with
-/// every earlier message carried out (each lock tried, nothing allocated); else the control
-/// thread takes it. What the guest sees is the same either way but for when the event comes. It
-/// waits for nothing rvg_graphics_device_mmio_write does not. On any thread, the vCPU's included.
-/// Calls back: raise_interrupt, as above.
+/// A write to RVG_GRAPHICS_REG_DOORBELL of a command queue's ring (any value but
+/// RVG_GRAPHICS_DOORBELL_CONTROL) wakes the queue's thread, and may answer the queue's next
+/// command buffer on the calling thread, ahead of the queue's own thread, posting the event that
+/// says it is submitted there: raise_interrupt is then called on the calling thread, inside this
+/// call, after that event is published. The host's raise_interrupt must therefore not wait for a
+/// lock the host holds while it calls this. A buffer is answered only where nothing need be
+/// waited for (each lock the answer needs is tried, and the queue's thread holds none of the
+/// queue's messages), and the answer allocates nothing; the queue's thread then takes the
+/// buffer, as it takes any. A write of RVG_GRAPHICS_DOORBELL_CONTROL may likewise take the
+/// control ring's next message on the calling thread and answer it there, raising the interrupt
+/// inside the call, where it is a surface download whose pages hold the surface's GPU copy
+/// already and the control thread sleeps with every earlier message carried out (each lock
+/// tried, nothing allocated); else the control thread takes it. What the guest sees is the same
+/// either way but for when the event comes. On any thread, the vCPU's included. Calls back:
+/// raise_interrupt, as above.
 ///
 /// # Safety
 /// `device` is a live graphics device handle.

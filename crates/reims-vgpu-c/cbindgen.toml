@@ -11,30 +11,21 @@ cpp_compat = true
 sys_includes = ["stdbool.h", "stddef.h", "stdint.h"]
 no_includes = true
 header = """/*
- * reims_vgpu.h: the C API of reims-vgpu, the host side of a paravirtualized GPU driven by
- * macOS guests' drivers (the PCI device 106b:eeee, or vmapple's MMIO device).
+ * reims_vgpu.h: the C API of reims-vgpu, the host side of the reims-graphics device (PCI
+ * 1234:5247), the GPU reims-vgpu's own guest drivers drive.
  *
- * Handles. RvgDevice, RvgDisplay, RvgIOSurfaceDevice, RvgVideoDevice, RvgScalerDevice,
- * RvgFrameTarget, RvgFrame and RvgTraceRangeHandler are opaque. A create function makes one: it
- * returns an RvgStatus and, on RVG_OK only, writes the handle through its last argument. The
- * caller owns that handle and ends it with the matching release. RvgFrameTarget and
- * RvgTraceRangeHandler also have a retain, since hosts hand them between threads. A release of
- * NULL does nothing. Every other function needs a live handle: NULL is RVG_ERR_INVALID_ARGUMENT
- * from a function that returns an RvgStatus, and ends the process from any other.
- *
- * Lifetimes. A display keeps its device alive. A frame keeps its display and its target alive
- * until it completes or, uncommitted, is released. The device's teardown runs at the last
- * release of the device and of everything that keeps it alive, on the thread that makes that
- * release, and may block there. A frame target keeps only its Metal texture, and may outlive
- * the device it was made on.
+ * Handles. RvgGraphicsDevice is opaque. rvg_graphics_device_create makes one: it returns an
+ * RvgStatus and, on RVG_OK only, writes the handle through its last argument. The caller owns
+ * that handle and ends it with rvg_graphics_device_release; a release of NULL does nothing.
+ * Every other function needs a live handle: NULL is RVG_ERR_INVALID_ARGUMENT from a function
+ * that returns an RvgStatus, and ends the process from any other.
  *
  * Configs. Every config struct, callback table and struct the library hands out starts with
  * `struct_size`: the size of the struct as the writer was compiled. For a struct the host
- * writes, a size below the first version's is RVG_ERR_INVALID_ARGUMENT; fields past
- * `struct_size` read as zero; a size above the library's is accepted when every byte past
- * the library's size is zero, and is RVG_ERR_UNSUPPORTED otherwise. Zero is each field's
- * default, except `display_port_count`, where 0 is refused. Configs and everything they point
- * to are borrowed for the call: the library copies what it keeps.
+ * writes, a size below the library's is RVG_ERR_INVALID_ARGUMENT; a size above the library's
+ * is accepted when every byte past the library's size is zero, and is RVG_ERR_UNSUPPORTED
+ * otherwise. Zero is each field's default. Configs and everything they point to are borrowed
+ * for the call: the library copies what it keeps.
  *
  * Callbacks. A callback table carries one `ctx` for its functions and one optional
  * `destroy(ctx)`. A NULL function is a callback the host does not give; the library then does
@@ -44,13 +35,11 @@ header = """/*
  * create that refuses returns. A create given no config, or a config or table it refuses for
  * its `struct_size`, has not read the table, and runs no destroy. Each callback type says the
  * thread it arrives on, what it is serialized with, and which functions of this header it may
- * call. The library never waits for the display thread. It does wait for its FIFO and worker
- * threads, where the device callbacks run, so a device callback must not wait for a host
- * thread that is inside a call on the same device.
+ * call. The library never waits for the display thread.
  *
- * Deaths. Where the guest's input is invalid, or the host breaks a rule this header says ends
- * the process, the process ends at that operation: a line on stderr, then abort(). No function
- * unwinds into its caller: an exception a callback throws ends the process at that callback.
+ * Deaths. Where the host breaks a rule this header says ends the process, the process ends at
+ * that operation: a line on stderr, then abort(). No function unwinds into its caller: an
+ * exception a callback throws ends the process at that callback.
  */"""
 
 [parse]

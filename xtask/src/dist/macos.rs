@@ -491,7 +491,7 @@ mod tests {
     /// `nm --defined-only -P`'s listing of the localized archive: its member, the C API's
     /// functions, then static symbols, SDL's and a renamed class among them.
     const LOCALIZED_ARCHIVE: &str = "libreims_vgpu.a[reims_vgpu.o]:\n\
-        _rvg_device_create T 1000 20\n_rvg_status_message T 1020 8\n\
+        _rvg_graphics_device_create T 1000 20\n_rvg_status_message T 1020 8\n\
         _SDL_Init t 2000 40\n_OBJC_CLASS_$_RVGSDL3Window s 3000 28\n";
 
     /// The programs as `dist` runs them: each call recorded; `libtool` writes the archive it
@@ -650,7 +650,7 @@ mod tests {
     fn dist_fails_where_the_archive_keeps_another_global() {
         let (root, target, header, firmware) = built("leak");
         let o = parse_args(&[], &target).unwrap();
-        let leaky = "libreims_vgpu.a[reims_vgpu.o]:\n_rvg_device_create T 1000 20\n\
+        let leaky = "libreims_vgpu.a[reims_vgpu.o]:\n_rvg_graphics_device_create T 1000 20\n\
                      _SDL_Init T 2000 40\n";
         let mut tools = Programs::new(leaky);
         let e = dist(&mut tools, &o, &target, &header, &firmware).unwrap_err();
@@ -666,7 +666,7 @@ mod tests {
         let o = parse_args(&[], &target).unwrap();
         for class in ["SDL3Window", "Cocoa_PasteboardDataProvider", "SDL4Window"] {
             let named = format!(
-                "libreims_vgpu.a[reims_vgpu.o]:\n_rvg_device_create T 1000 20\n\
+                "libreims_vgpu.a[reims_vgpu.o]:\n_rvg_graphics_device_create T 1000 20\n\
                  _OBJC_CLASS_$_{class} s 3000 28\n"
             );
             let mut tools = Programs::new(&named);

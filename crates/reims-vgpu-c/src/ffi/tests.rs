@@ -98,22 +98,26 @@ unsafe extern "C-unwind" fn panicking_destroy(_ctx: *mut std::ffi::c_void) {
 #[test]
 fn a_panic_in_a_callback_of_the_first_export_ends_in_the_hook() {
     if std::env::var_os("RVG_FFI_CALLBACK_CHILD").is_some() {
-        let callbacks = crate::device::RvgHostCallbacks {
-            struct_size: crate::sized::size_u32::<crate::device::RvgHostCallbacks>(),
+        let callbacks = crate::graphics::RvgGraphicsCallbacks {
+            struct_size: crate::sized::size_u32::<crate::graphics::RvgGraphicsCallbacks>(),
             ctx: std::ptr::null_mut(),
             destroy: Some(panicking_destroy),
-            create_task: None,
-            destroy_task: None,
-            map_memory: None,
-            unmap_memory: None,
-            read_memory: None,
             raise_interrupt: None,
-            add_trace_range: None,
-            remove_trace_range: None,
+            scanout_written: None,
+            cursor_glyph: None,
+            cursor_show: None,
+            cursor_move: None,
         };
-        let config = crate::testkit::config(1, &callbacks);
+        let config = crate::graphics::RvgGraphicsDeviceConfig {
+            struct_size: crate::sized::size_u32::<crate::graphics::RvgGraphicsDeviceConfig>(),
+            callbacks: &callbacks,
+            window: std::ptr::null(),
+            memory_map: std::ptr::null(),
+            memory_files: std::ptr::null(),
+        };
         // SAFETY: a live config; a NULL out-pointer, which the create refuses.
-        let _ = unsafe { crate::device::rvg_device_create(&config, std::ptr::null_mut()) };
+        let _ =
+            unsafe { crate::graphics::rvg_graphics_device_create(&config, std::ptr::null_mut()) };
         return;
     }
     let out = child(

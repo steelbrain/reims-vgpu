@@ -386,11 +386,11 @@ mod tests {
     }
 
     /// `nm -P`'s listing of the linked object: the C API's functions, Rust's and SDL's.
-    const OBJECT: &str = "rvg_device_create T 1000 20\nrvg_status_message T 1020 8\n\
+    const OBJECT: &str = "rvg_graphics_device_create T 1000 20\nrvg_status_message T 1020 8\n\
                           SDL_Init T 2000 40\n_ZN4core3fmt5write17h0E W 3000 10\n";
     /// `nm -P`'s listing of the localized archive: its member, then the C API's functions.
     const LOCALIZED_ARCHIVE: &str = "libreims_vgpu.a[reims_vgpu.o]:\n\
-                                     rvg_device_create T 1000 20\nrvg_status_message T 1020 8\n";
+                                     rvg_graphics_device_create T 1000 20\nrvg_status_message T 1020 8\n";
 
     #[test]
     fn dist_writes_the_tree_with_rustcs_libraries() {
@@ -418,7 +418,7 @@ mod tests {
         let keep = work.join("keep-global-symbols");
         assert_eq!(
             std::fs::read_to_string(&keep).unwrap(),
-            "rvg_device_create\nrvg_status_message\n"
+            "rvg_graphics_device_create\nrvg_status_message\n"
         );
         let object = work.join("reims_vgpu.o");
         let archive = out.join("lib/libreims_vgpu.a");
@@ -477,7 +477,7 @@ mod tests {
     fn dist_fails_where_the_archive_keeps_another_global() {
         let (root, target, header, firmware) = built("leak");
         let o = options(&[], &target);
-        let leaky = "libreims_vgpu.a[reims_vgpu.o]:\nrvg_device_create T 1000 20\n\
+        let leaky = "libreims_vgpu.a[reims_vgpu.o]:\nrvg_graphics_device_create T 1000 20\n\
                      SDL_Init T 2000 40\n";
         let mut tools = Programs::new(OBJECT, leaky);
         let e = dist(&mut tools, &o, &target, &header, &firmware).unwrap_err();
@@ -507,7 +507,7 @@ mod tests {
     fn defined_globals_reads_nms_names() {
         assert_eq!(
             defined_globals(LOCALIZED_ARCHIVE),
-            strs(&["rvg_device_create", "rvg_status_message"])
+            strs(&["rvg_graphics_device_create", "rvg_status_message"])
         );
         assert_eq!(defined_globals(""), Vec::<String>::new());
     }

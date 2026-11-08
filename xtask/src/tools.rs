@@ -1,12 +1,9 @@
-//! What `dist` and `smoke` share: the external programs they run ([`Tools`]), Cargo's profiles
-//! and target directory, and the deployment target.
+//! What `dist` and `check` share: the external programs they run ([`Tools`]), Cargo's profiles
+//! and target directory.
 
 use std::path::PathBuf;
 
 use crate::util::{Res, repo_root};
-
-/// The deployment target: Xcode 26.6's SDK. The smoke's guest and the suite's runner use it.
-pub const MIN_MACOS: &str = "26.6";
 
 /// A Cargo profile.
 #[derive(Debug, Clone, PartialEq, Eq)]

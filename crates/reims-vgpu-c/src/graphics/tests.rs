@@ -57,7 +57,7 @@ fn a_headless_graphics_device_lives_and_ends() {
             rvg_graphics_device_mmio_read(device, 0),
             reims_graphics::wire::RGFX_MAGIC
         );
-        rvg_graphics_device_mmio_write(device, 0x10, 1);
+        rvg_graphics_device_mmio_write_taking(device, 0x10, 1);
         assert_eq!(rvg_graphics_device_mmio_read(device, 0x10), 1);
         rvg_graphics_device_reset(device);
         assert_eq!(rvg_graphics_device_mmio_read(device, 0x10), 0);
@@ -149,39 +149,18 @@ fn refused_graphics_configs() {
     assert!(device.is_null());
 }
 
-/// A host built against the first version passes a config that ends at `window`: it makes a
-/// device with no memory map
-#[test]
-fn a_first_version_graphics_config_makes_a_device() {
-    let cb = callbacks();
-    let mut c = config(&cb);
-    c.struct_size = RvgGraphicsDeviceConfig::V1_SIZE as u32;
-    // Past the first version's size, as a host built against it leaves its memory.
-    c.memory_files = std::ptr::dangling();
-    let mut device = std::ptr::null_mut();
-    // SAFETY: a live config and out-pointer; the device is released.
-    unsafe {
-        assert_eq!(rvg_graphics_device_create(&c, &mut device), RVG_OK);
-        assert!(!device.is_null());
-        rvg_graphics_device_release(device);
-    }
-}
-
 static MOVES: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C-unwind" fn cursor_moved(_ctx: *mut c_void) {
     MOVES.fetch_add(1, Ordering::SeqCst);
 }
 
-/// A host built against the first version of the callbacks passes a table that ends at
-/// `scanout_written`: it is told nothing of the cursor, whatever follows its table in memory.
-/// The second version's host is told of each move, a reset's among them, and reads where the
-/// hot spot is
+/// The host is told of each move of the cursor, a reset's among them, and reads where the hot
+/// spot is
 #[test]
-fn a_first_version_graphics_callbacks_tells_no_cursor() {
-    let moves = |struct_size: usize| {
+fn the_host_is_told_of_the_cursor_s_moves() {
+    let moves = || {
         let cb = RvgGraphicsCallbacks {
-            struct_size: struct_size as u32,
             destroy: None,
             cursor_move: Some(cursor_moved),
             ..callbacks()
@@ -208,9 +187,7 @@ fn a_first_version_graphics_callbacks_tells_no_cursor() {
         assert_eq!(at, RvgDisplayCoord { x: 0, y: 0 });
         MOVES.load(Ordering::SeqCst) - before
     };
-    assert_eq!(RvgGraphicsCallbacks::V1_SIZE, 40);
-    assert_eq!(moves(RvgGraphicsCallbacks::V1_SIZE), 0);
-    assert_eq!(moves(size_of::<RvgGraphicsCallbacks>()), 1);
+    assert_eq!(moves(), 1);
 }
 
 /// The read of the display: with no buffer it is refused, with the mode's size given, 1920 x

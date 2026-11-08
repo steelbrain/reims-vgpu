@@ -105,7 +105,7 @@ fn c_harness_calls_every_function() {
             Some(&rest[..end])
         })
         .collect();
-    assert_eq!(declared.len(), 58, "{declared:?}");
+    assert_eq!(declared.len(), 10, "{declared:?}");
     let missing: Vec<&str> = declared
         .iter()
         .copied()
@@ -131,7 +131,7 @@ fn header_compiles_as_cxx_and_objc() {
             .and_then(|mut c| {
                 use std::io::Write as _;
                 c.stdin.take().unwrap().write_all(
-                    b"#include \"reims_vgpu.h\"\nint main(void) { return RVG_MAX_DISPLAY_PORTS == 8 ? 0 : 1; }\n",
+                    b"#include \"reims_vgpu.h\"\nint main(void) { return RVG_GRAPHICS_MSIX_VECTORS == 1 ? 0 : 1; }\n",
                 )?;
                 c.wait_with_output()
             })

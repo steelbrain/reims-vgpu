@@ -4,9 +4,6 @@
 #   make        the library as a plain library (cargo xtask dist) in
 #               target/dist: libreims_vgpu.a and .dylib, reims_vgpu.h,
 #               reims-vgpu.pc and the option ROM
-#   make smoke  a guest workload linked with the library as QEMU links it,
-#               with an isolated guest task, against its expected values
-#               (cargo xtask smoke)
 #   make qemu   the library as a plain library (cargo xtask dist), then
 #               vendor/qemu's qemu-system-aarch64 with apple-gfx on its C API,
 #               linked statically through pkg-config, in build/qemu
@@ -33,13 +30,10 @@ RUST_TARGET_REL := $(or $(CARGO_TARGET_DIR),target)
 RUST_TARGET := $(if $(filter /%,$(RUST_TARGET_REL)),$(RUST_TARGET_REL),$(CURDIR)/$(RUST_TARGET_REL))
 RUST_DIST := $(RUST_TARGET)/dist
 
-.PHONY: all smoke qemu vm clean
+.PHONY: all qemu vm clean
 
 all:
 	CARGO_TARGET_DIR="$(RUST_TARGET)" cargo xtask dist
-
-smoke: all
-	CARGO_TARGET_DIR="$(RUST_TARGET)" cargo xtask smoke
 
 vendor/qemu/configure:
 	@echo "vendor/qemu is empty: git submodule update --init vendor/qemu" >&2

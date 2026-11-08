@@ -1,5 +1,5 @@
-//! Windows: [`RvgWindowConfig`] and [`RvgWindowCallbacks`], a display's own window
-//! (`RvgDisplayConfig::window`).
+//! Windows: [`RvgWindowConfig`] and [`RvgWindowCallbacks`], the graphics device's display's own
+//! window (`RvgGraphicsDeviceConfig.window`).
 //!
 //! A window's callbacks run one at a time across every window of the process: on macOS on the
 //! process's main thread, where AppKit runs, and on Linux on the library's thread
@@ -16,14 +16,6 @@ use reims_vgpu::{
 use crate::ffi;
 use crate::sized::{self, HostStruct};
 use crate::table::{RvgDestroyFn, Table};
-
-/// The library offers the guest modes, a size in millimetres and a scale factor that match the
-/// host screen the window opens on, in place of the config's size; rvg_display_set_modes still
-/// replaces the modes. With RvgWindowConfig's `mode_width` and `mode_height`, the modes are that
-/// mode and the standard sizes within it, at a 1× density or `mode_pixels_per_inch`'s; without,
-/// the screen's own, at its density. With no screen to match (as with no window system to
-/// reach), they are those of the config's mode, or of 1920 × 1080 at 1× without one, at 60 Hz.
-pub const RVG_WINDOW_MATCH_HOST_SCREEN: u32 = 1;
 
 /// The left button, in an RvgWindowPointerFn's `buttons`.
 pub const RVG_WINDOW_BUTTON_LEFT: u32 = 1;
@@ -79,7 +71,7 @@ pub type RvgWindowKeyFn =
     Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, usage: u16, down: bool)>;
 
 /// `close(ctx)`: the person closed the window, or chose Quit. The window stays open: the host
-/// ends the VM, and its release of the display closes the window.
+/// ends the VM, and its release of the device closes the window.
 ///
 /// Thread, and what it may call: as RvgWindowPointerFn. Without it, closing the window does
 /// nothing, and Quit is ignored.
@@ -162,7 +154,7 @@ pub struct RvgWindowCallbacks {
     /// sizeof(RvgWindowCallbacks) as the host was compiled.
     pub struct_size: u32,
     pub ctx: *mut c_void,
-    /// Runs once after the display's release has closed the window, when no callback of the
+    /// Runs once after the device's release has closed the window, when no callback of the
     /// table runs again.
     pub destroy: RvgDestroyFn,
     pub pointer: RvgWindowPointerFn,
@@ -173,14 +165,7 @@ pub struct RvgWindowCallbacks {
 }
 
 // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
-unsafe impl HostStruct for RvgWindowCallbacks {
-    /// The first version ends at `close`: a host built against it passes 56, and has no
-    /// `scroll`.
-    const V1_SIZE: usize = 56;
-}
-
-const _: () =
-    assert!(std::mem::offset_of!(RvgWindowCallbacks, scroll) == RvgWindowCallbacks::V1_SIZE);
+unsafe impl HostStruct for RvgWindowCallbacks {}
 
 /// `phase`'s RVG_WINDOW_SCROLL_PHASE_*.
 fn phase_value(phase: ScrollPhase) -> u32 {
@@ -204,85 +189,41 @@ fn momentum_value(momentum: MomentumPhase) -> u32 {
     }
 }
 
-/// A display's window (RvgDisplayConfig's `window`).
+/// The graphics device's window (RvgGraphicsDeviceConfig's `window`).
 ///
-/// The library opens a window for the display on one of the host's screens, and draws each
-/// frame the guest presents into it, in one pass on the GPU. Its keyboard, pointer and wheel go
-/// to `callbacks`. On macOS the window opens once the process's main thread runs its run loop
-/// (CFRunLoopRun, or NSApplication's), and on Linux on the library's thread reims-vgpu.ui, which
-/// needs nothing of the main thread; the library never waits for the main thread. The
-/// environment picks the screen and the style (REIMS_VGPU_WINDOW_SCREENS,
-/// REIMS_VGPU_WINDOW_BORDERLESS).
-///
-/// A display with a window has all five display callbacks as the guest reads them (a cursor
-/// glyph size limit of 256, and each cursor callback), and calls the host's where it gives
-/// them. A frame the window has in flight keeps the display alive until it completes, as an
-/// RvgFrame does, so the display's last release may run on a library thread.
+/// The library opens a window for the display on one of the host's screens, and draws the
+/// guest's scanout into it on the GPU. Its keyboard, pointer and wheel go to `callbacks`. On
+/// macOS the window opens once the process's main thread runs its run loop (CFRunLoopRun, or
+/// NSApplication's), and on Linux on the library's thread reims-vgpu.ui, which needs nothing of
+/// the main thread; the library never waits for the main thread. The environment picks the
+/// screen and the style (REIMS_VGPU_WINDOW_SCREENS, REIMS_VGPU_WINDOW_BORDERLESS).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RvgWindowConfig {
     /// sizeof(RvgWindowConfig) as the host was compiled.
     pub struct_size: u32,
-    /// RVG_WINDOW_* flags; 0 for none.
-    pub flags: u32,
     /// NULL is a table with every callback absent.
     pub callbacks: *const RvgWindowCallbacks,
-    /// With RVG_WINDOW_MATCH_HOST_SCREEN, the mode the display offers first, in place of the
-    /// host screen's own: it and the standard sizes within it, at the screen's refresh rate (the
-    /// rate it is set to), with a size in millimetres at 110 pixels per inch and a scale factor
-    /// of 1, so the guest runs a 1× desktop at that mode (measured up to 3811 pixels wide; 5832
-    /// ran HiDPI) and the window scales it to its size on the GPU; `mode_pixels_per_inch` tells
-    /// another density. 0 in either is none: the screen's own modes, at its density. Ignored
-    /// without the flag. With no screen to match, the mode is offered at 60 Hz, and none is
-    /// 1920 × 1080 at 1×.
+    /// The size in pixels the window opens at, and the mode the guest is offered until the
+    /// window's own size is known; 0 in either is 1920 × 1080.
     pub mode_width: u16,
     /// As `mode_width`.
     pub mode_height: u16,
-    /// With a mode, the density the guest is told for it, in pixels per inch, in place of 110:
-    /// the size in millimetres is the mode's pixels at it. A macOS 13.6 guest reads the width in
-    /// whole centimetres (rounded to whole millimetres, then up) and runs a HiDPI desktop at the
-    /// mode's pixels where that comes to 146.67 ppi or more: 2560 × 1600 at 148 ppi reads as 44
-    /// cm, 147.8 ppi, and runs HiDPI, and at 146 as 45 cm, 144.5 ppi, and runs 1×. The scale
-    /// factor told is that scale, and a windowed window is sized a guest point per host point
-    /// by it, so on a 2× screen with room for half the mode a HiDPI guest's pixel is a screen
-    /// pixel.
-    /// A mode narrower than 1920 pixels may stay 1× (1280 × 800 did at 216.7 ppi), and the
-    /// window takes it as 1×. The guest's scale was not measured between 146.666 and 146.667
-    /// ppi, nor below that for a mode wider than 3811 pixels, where it may run HiDPI; the window
-    /// takes both as 1×. Nor was HiDPI measured across less than 29 cm, where the window takes a
-    /// mode at least 1920 pixels wide as HiDPI by its density. 0, or a value that is not a
-    /// positive finite number, is 110. Ignored without a mode.
-    pub mode_pixels_per_inch: f64,
 }
 
-// SAFETY: repr(C), a u32 first; integers, a float and a pointer.
-unsafe impl HostStruct for RvgWindowConfig {
-    /// The first version ends at `callbacks`.
-    const V1_SIZE: usize = 16;
-}
-
-const _: () =
-    assert!(std::mem::offset_of!(RvgWindowConfig, mode_width) == RvgWindowConfig::V1_SIZE);
-
-/// The second version ends at `mode_height`, padded to 24 bytes: the density starts past it, so
-/// a host built against that version passes 24 and has none.
-const V2_SIZE: usize = 24;
-
-const _: () = assert!(std::mem::offset_of!(RvgWindowConfig, mode_pixels_per_inch) == V2_SIZE);
+// SAFETY: repr(C), a u32 first; integers and a pointer.
+unsafe impl HostStruct for RvgWindowConfig {}
 
 impl RvgWindowConfig {
-    /// The Rust API's window config over `callbacks`, the table's closures:
-    /// RVG_WINDOW_MATCH_HOST_SCREEN is `match_host_screen`, and other bits are ignored; the mode
-    /// is `mode`, `None` where either side is 0; the density is `mode_ppi`, `None` where it is
-    /// not a positive finite number.
+    /// The Rust API's window config over `callbacks`, the table's closures: the mode is `mode`,
+    /// `None` where either side is 0.
     pub(crate) fn to_config(self, callbacks: WindowCallbacks) -> WindowConfig {
         let mode = (self.mode_width != 0 && self.mode_height != 0)
             .then_some((self.mode_width, self.mode_height));
-        let ppi = self.mode_pixels_per_inch;
         WindowConfig {
-            match_host_screen: self.flags & RVG_WINDOW_MATCH_HOST_SCREEN != 0,
+            match_host_screen: false,
             mode,
-            mode_ppi: (ppi.is_finite() && ppi > 0.0).then_some(ppi),
+            mode_ppi: None,
             keeps_its_size: false,
             callbacks,
         }

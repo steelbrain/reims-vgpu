@@ -7,7 +7,6 @@ mod dist;
 mod header;
 mod lint;
 mod metallibs;
-mod smoke;
 mod tools;
 mod util;
 
@@ -44,11 +43,6 @@ const COMMANDS: &[Command] = &[
         name: "metallibs",
         about: "the Vulkan platform's metallibs and their record, metallibs.toml, compiled on a Mac into crates/reims-vgpu-vulkan/metallibs, which a build elsewhere takes them from, or into <dir> (RVG_METALLIB_DIR=<dir>)",
         run: metallibs::cmd_metallibs,
-    },
-    Command {
-        name: "smoke",
-        about: "a guest workload linked statically with the dist tree's library, as QEMU links it, against its expected values; --dist <dir>",
-        run: smoke::cmd_smoke,
     },
     Command {
         name: "check",
