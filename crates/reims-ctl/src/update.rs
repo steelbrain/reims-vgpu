@@ -236,6 +236,17 @@ mod tests {
         let bin = d.join("sleeper");
         std::fs::copy("/bin/sleep", &bin).unwrap();
         let mut child = Command::new(&bin).arg("30").spawn().unwrap();
+        // spawn returns once the child's exec lets go of this process's memory, which the kernel
+        // does a moment before it names the new binary as the child's exe: wait for that name.
+        let exe = format!("/proc/{}/exe", child.id());
+        let start = std::time::Instant::now();
+        while std::fs::read_link(&exe).ok().as_deref() != Some(bin.as_path()) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the sleeper never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         // cargo install --force: the new binary written beside, then renamed over the old.
         let new = d.join("sleeper.new");
         std::fs::copy("/bin/sleep", &new).unwrap();
