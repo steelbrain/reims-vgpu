@@ -275,6 +275,8 @@ impl Spirv {
 /// A spin on the GPU of one render node.
 pub(crate) struct Spin {
     gpu: Arc<Gpu>,
+    /// When the shader was last queued, which its hold's [`HELD_AT_MOST`] counts from.
+    queued: Mutex<Option<crate::core::runtime::MonoTime>>,
 }
 
 /// The device, the shader's pipeline and the flag, freed once the shader
@@ -521,7 +523,10 @@ impl Spin {
         let gpu = Self::on(entry, instance, (major, minor), ring)?;
         LIVE.fetch_add(1, Ordering::SeqCst);
         watch();
-        Ok(Spin { gpu: Arc::new(gpu) })
+        Ok(Spin {
+            gpu: Arc::new(gpu),
+            queued: Mutex::new(None),
+        })
     }
 
     /// The device and the shader on `instance`'s device of the render node
@@ -893,6 +898,7 @@ impl Spin {
                 .map_err(failed("vkQueueSubmit"))?;
         }
         gpu.submitted.store(true, Ordering::SeqCst);
+        *self.queued.lock() = Some(StdRuntime.now());
         let held = Arc::clone(gpu);
         StdRuntime::thread("test-spin-release", move || {
             let start = StdRuntime.now();
@@ -906,6 +912,16 @@ impl Spin {
         })
         .map_err(|e| format!("no thread lets the spin go: {e}"))?;
         Ok(())
+    }
+
+    /// How much of its hold the shader last queued has left at least: [`HELD_AT_MOST`] from its
+    /// queueing, past which a thread of its own lets it go (a timed one holds to [`SPUN_AT_MOST`]
+    /// from its start, which is later); none where none was queued. A host under load can spend
+    /// it before a test's timed call is made, which then measures nothing.
+    pub(crate) fn left(&self) -> Duration {
+        (*self.queued.lock()).map_or(Duration::ZERO, |at| {
+            HELD_AT_MOST.saturating_sub(StdRuntime.elapsed_since(at))
+        })
     }
 
     /// Lets the shader end; a timed one ends by its own bound.
@@ -1016,9 +1032,26 @@ mod tests {
                 }
                 made => made.expect("a spin"),
             };
-            spin.hold().expect("held");
-            let start = StdRuntime.now();
-            std::thread::sleep(Duration::from_millis(300));
+            // A host under load can sleep through the hold's whole bound, which then says nothing
+            // of the spin: such an attempt is made again, once the spin it held has ended.
+            let mut attempts = 0;
+            let start = loop {
+                attempts += 1;
+                spin.hold().expect("held");
+                let start = StdRuntime.now();
+                std::thread::sleep(Duration::from_millis(300));
+                let left = spin.left();
+                if left > Duration::from_millis(100) {
+                    break start;
+                }
+                eprintln!("{ring:?}: {left:?} of the hold left after the sleep, so again");
+                assert!(
+                    attempts < 3,
+                    "{ring:?}: no attempt of 3 slept within the hold"
+                );
+                spin.release();
+                assert!(spin.ended(Duration::from_secs(2)), "{ring:?}: not ended");
+            };
             assert!(!spin.ended(Duration::ZERO), "{ring:?}: ended unasked");
             spin.release();
             assert!(spin.ended(Duration::from_secs(2)), "{ring:?}: not ended");
