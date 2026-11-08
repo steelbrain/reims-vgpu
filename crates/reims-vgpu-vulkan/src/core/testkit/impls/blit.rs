@@ -21,8 +21,8 @@ use crate::core::testkit::script::Policy;
 pub const GUEST_RAM_TO_BUFFER: &str = "copyFromGuestRam:toBuffer:destinationOffset: (no Metal)";
 
 /// The name the fake logs and scripts [`BlitEncoder::copy_to_guest_ram`] under, with the source,
-/// its offset and the runs, as [`GUEST_RAM_TO_BUFFER`].
-pub const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:sourceOffset:toGuestRam: (no Metal)";
+/// each run's byte of it, in order, and the runs, as [`GUEST_RAM_TO_BUFFER`] logs them.
+pub const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:toGuestRamRuns: (no Metal)";
 
 /// The runs as the fake logs them: each run's start and end, in order.
 fn runs_arg(runs: &[Range<u64>]) -> Arg {
@@ -50,11 +50,11 @@ impl BlitEncoder<FakePlatform> for Fk<kind::BlitEncoder> {
         &self,
         on: OnFault,
         source: &<FakePlatform as crate::core::platform::Platform>::Buffer,
-        source_offset: u64,
-        runs: &[Range<u64>],
+        runs: &[(u64, Range<u64>)],
     ) -> RaiseResult<bool> {
         let copies = self.world().copies_guest_ram();
-        let args = vec![Arg::obj(source), Arg::U64(source_offset), runs_arg(runs)];
+        let (at, runs): (Vec<u64>, Vec<Range<u64>>) = runs.iter().cloned().unzip();
+        let args = vec![Arg::obj(source), Arg::U64s(at), runs_arg(&runs)];
         self.thr(Policy::On(on), BUFFER_TO_GUEST_RAM, args, || copies)
     }
 

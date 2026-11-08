@@ -229,12 +229,15 @@ pub(crate) fn copies(device: &rt::Device) -> bool {
 
 /// The RAM `device` uses whose ranges hold every one of `runs`, host addresses: what a copy by
 /// the RAM's runs goes through. `None` where no lease's RAM the device uses holds them all.
-pub(crate) fn ram_over(device: &rt::Device, runs: &[Range<u64>]) -> Option<Arc<rt::HostRam>> {
+pub(crate) fn ram_over<'a>(
+    device: &rt::Device,
+    runs: impl Iterator<Item = &'a Range<u64>> + Clone,
+) -> Option<Arc<rt::HostRam>> {
     let id = device.registry_id();
     live_leases().into_iter().find_map(|l| {
         let ram = l.ram.as_ref()?;
         let used = l.users.lock().contains(&id);
-        (used && runs.iter().all(|r| l.holds(r))).then(|| Arc::clone(ram))
+        (used && runs.clone().all(|r| l.holds(r))).then(|| Arc::clone(ram))
     })
 }
 
@@ -260,16 +263,16 @@ fn refused(error: rt::Error) -> RunsCopyRefused {
     RunsCopyRefused
 }
 
-/// The runtime's copy of `source` from `source_offset` into `runs` of `ram`, on `encoder`, as
-/// [`copy_from_host_ram`] copies the other way.
+/// The runtime's copy of `source` into `runs` of `ram`, each a byte of `source` and a run of
+/// host addresses that takes the bytes from that byte on, on `encoder`: one call however many
+/// runs, as [`copy_from_host_ram`] copies the other way.
 pub(crate) fn copy_to_host_ram(
     encoder: &mut rt::BlitCommandEncoder,
     source: &rt::Buffer,
-    source_offset: u64,
     ram: &rt::HostRam,
-    runs: &[Range<u64>],
+    runs: &[(u64, Range<u64>)],
 ) -> Result<(), RunsCopyRefused> {
-    (encoder.copy_to_host_ram(source, source_offset, ram, runs)).map_err(refused)
+    (encoder.copy_runs_to_host_ram(source, ram, runs)).map_err(refused)
 }
 
 /// The runs of the guest's RAM behind `length` bytes from `start`, which the runtime asks of a
@@ -517,7 +520,14 @@ mod tests {
         }
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
-        let scatter = e.copy_to_guest_ram(OnFault::Die, &from, 0, &runs).unwrap();
+        let mut next = 0;
+        let into: Vec<(u64, std::ops::Range<u64>)> = (runs.iter())
+            .map(|run| {
+                next += run.end - run.start;
+                (next - (run.end - run.start), run.clone())
+            })
+            .collect();
+        let scatter = e.copy_to_guest_ram(OnFault::Die, &from, &into).unwrap();
         e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
@@ -547,12 +557,13 @@ mod tests {
     /// A device that copies the RAM by its runs scatters a buffer into runs that start and end
     /// inside pages, as a laid-out device cache's copy out does (`reims-vgpu`'s
     /// `graphics/decode/surface_cache.rs`, `texel_spans`): each of its surface's rows' texels
-    /// alone, cut to the pages they lie in. Here a plane of 2-byte texels 1,023 wide, from byte 16
-    /// at a pitch of 2,048 bytes, over four pages out of order: each row starts on 16 bytes (the
-    /// guest aligns a plane's offset and pitch to its linear texture alignment, never less) and
-    /// ends 2,046 bytes on, off a 4-byte word, some rows crossing from one page into another. The
-    /// runs' bytes are the buffer's, and every byte beside them, the guest CPU's, is as it was. One
-    /// that does not copy the RAM refuses each copy, encoding nothing.
+    /// alone, cut to the pages they lie in, all of them in one copy, each run from its own byte of
+    /// the buffer. Here a plane of 2-byte texels 1,023 wide, from byte 16 at a pitch of 2,048
+    /// bytes, over four pages out of order: each row starts on 16 bytes (the guest aligns a
+    /// plane's offset and pitch to its linear texture alignment, never less) and ends 2,046 bytes
+    /// on, off a 4-byte word, some rows crossing from one page into another. The runs' bytes are
+    /// the buffer's, and every byte beside them, the guest CPU's, is as it was. One that does not
+    /// copy the RAM refuses the copy, encoding nothing.
     #[test]
     fn a_copy_by_runs_scatters_runs_inside_pages() {
         let device = dev();
@@ -624,11 +635,17 @@ mod tests {
         let copies = super::copies(&device.raw);
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let mut into = Vec::new();
         for span in &spans {
-            let runs = runs_of(span.clone());
-            let scattered = (e.copy_to_guest_ram(OnFault::Die, &from, span.start, &runs)).unwrap();
-            assert_eq!(scattered, copies, "the row's runs {runs:x?}");
+            let mut s = span.start;
+            for run in runs_of(span.clone()) {
+                let n = run.end - run.start;
+                into.push((s, run));
+                s += n;
+            }
         }
+        let scattered = (e.copy_to_guest_ram(OnFault::Die, &from, &into)).unwrap();
+        assert_eq!(scattered, copies, "every row's runs in one copy");
         e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();

@@ -3448,20 +3448,24 @@ pub(crate) fn aligned_byte(planes: &[PagesPlane]) -> Option<u64> {
 /// (`BufferDescriptor::with_aligned_byte`).
 const ALIGNED_BYTE_MULTIPLE: u64 = 256;
 
-/// The runs of `runs`, host addresses of a surface's bytes in its order, that its bytes `span`
-/// lie in, cut to them.
-fn runs_of(runs: &[Range<u64>], span: &Range<u64>) -> Vec<Range<u64>> {
+/// The runs of `runs`, host addresses of a surface's bytes in its order, that its bytes `spans`
+/// lie in, cut to them, each with its first byte of the surface: in one pass, `spans` ascending
+/// and apart, as [`texel_spans`] makes them.
+fn runs_at(runs: &[Range<u64>], spans: &[Range<u64>]) -> Vec<(u64, Range<u64>)> {
     let mut out = Vec::new();
-    let mut at = 0u64;
-    for run in runs {
-        let len = run.end.saturating_sub(run.start);
-        let (from, to) = (span.start.max(at), span.end.min(at.saturating_add(len)));
-        if from < to {
-            out.push(run.start + (from - at)..run.start + (to - at));
-        }
-        at = at.saturating_add(len);
-        if at >= span.end {
-            break;
+    let (mut next, mut at) = (0, 0u64);
+    for span in spans {
+        while let Some(run) = runs.get(next) {
+            let end = at.saturating_add(run.end.saturating_sub(run.start));
+            let (from, to) = (span.start.max(at), span.end.min(end));
+            if from < to {
+                out.push((from, run.start + (from - at)..run.start + (to - at)));
+            }
+            if end > span.end {
+                // The run goes on past the span, into the next one's bytes.
+                break;
+            }
+            (next, at) = (next + 1, end);
         }
     }
     out
@@ -3469,8 +3473,8 @@ fn runs_of(runs: &[Range<u64>], span: &Range<u64>) -> Vec<Range<u64>> {
 
 /// Encodes on `blit` the copy of `cache` out into its pages: of its texels alone where its
 /// surface's layout is known ([`SurfaceCache::texels`]), else of all its bytes; into `view`
-/// where given, else by the pages' runs where the cache has them. False where the platform
-/// refuses the first copy by runs, with nothing encoded.
+/// where given, else by the pages' runs where the cache has them, in one copy. False where the
+/// platform refuses the copy by runs, with nothing encoded.
 fn encode_out<P: Platform>(
     blit: &P::BlitEncoder,
     cache: &SurfaceCache<P>,
@@ -3495,22 +3499,7 @@ fn encode_out<P: Platform>(
             Ok(true)
         }
         (None, Some(CachePages::Runs { runs, .. })) => {
-            for (i, span) in spans.iter().enumerate() {
-                let into = runs_of(runs, span);
-                if !blit.copy_to_guest_ram(ON, &cache.device, span.start, &into)? {
-                    // The platform refuses copies by these runs from the first; a later refusal
-                    // leaves that span uncopied, as a copy not made.
-                    if i == 0 {
-                        return Ok(false);
-                    }
-                    log::warn!(
-                        target: "reims_vgpu::graphics",
-                        "a device cache's copy by runs of its bytes {span:?} was refused after \
-                         the platform took its first: those bytes are not copied"
-                    );
-                }
-            }
-            Ok(true)
+            blit.copy_to_guest_ram(ON, &cache.device, &runs_at(runs, spans))
         }
         (None, _) => Ok(false),
     }
@@ -5716,7 +5705,11 @@ mod tests {
             .find(|c| c.sel == BUFFER_TO_GUEST_RAM)
             .unwrap();
         assert_eq!(out.args[0].as_obj().map(|o| o.0), Some(cache));
-        assert_eq!(out.args[1].as_u64(), Some(0));
+        assert_eq!(
+            out.args[1],
+            Arg::U64s(vec![0, page, 3 * page]),
+            "one copy, each run from its byte of the cache"
+        );
         let written: Vec<u8> = (0..4 * page).map(|i| (i * 3 + 1) as u8).collect();
         scatter(&downloads[0], &written);
         // The fake's views copy the RAM at their mapping, and take its writes at a sync.
@@ -5949,6 +5942,58 @@ mod tests {
         );
     }
 
+    /// A laid-out cache on a device that copies the guest's RAM by its runs copies its rows'
+    /// texels out in one copy: each row cut to the runs its bytes lie in, a run two rows lie in
+    /// cut for each, every one from its own byte of the cache
+    #[test]
+    fn a_laid_out_cache_by_runs_copies_its_rows_out_in_one_copy() {
+        use super::super::surface_pages::tests::one_plane;
+        use reims_vgpu_graphics::wire::RGFX_STATUS_CACHE;
+        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
+        use reims_vgpu_vulkan::core::testkit::impls::blit::BUFFER_TO_GUEST_RAM;
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.set_unified_memory(true);
+        r.p.world().copy_guest_ram(true);
+        let world = Arc::clone(r.p.world());
+        world.answer_surface_pages(PagesInPlace::No("the rows end inside a line".into()));
+        // Three rows a page apart of 48 bytes fewer texels, in SCATTERED's four pages.
+        let (pitch, texels) = (page, page - 48);
+        let layout = one_plane(pitch, texels, 3);
+        assert_eq!(
+            r.pages_asking(BLOCK, &SCATTERED, 4 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        assert_eq!(
+            r.pages_cached(BLOCK, &SCATTERED, 4 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let mark = r.p.call_log().mark();
+        r.dec
+            .surface_download(&r.device, BLOCK, Box::new(|| {}), no_raise());
+        let calls = r.p.call_log().since(mark);
+        assert!(copies(&calls).is_empty(), "no copy through a view");
+        let out: Vec<&Call> = (calls.iter())
+            .filter(|c| c.sel == BUFFER_TO_GUEST_RAM)
+            .collect();
+        assert_eq!(out.len(), 1, "one copy for every row");
+        assert_eq!(out[0].args[0].as_obj().map(|o| o.0), Some(cache));
+        assert_eq!(out[0].args[1], Arg::U64s(vec![0, pitch, 2 * pitch]));
+        // Row 0 in RAM page 5, rows 1 and 2 in pages 1 and 2, one run of the RAM.
+        let host = |p: u64| r.ram.host_addr(RAM + p * page).unwrap().addr().to_u64();
+        assert_eq!(
+            copied_runs(&calls, BUFFER_TO_GUEST_RAM, 2),
+            [vec![
+                host(5)..host(5) + texels,
+                host(1)..host(1) + texels,
+                host(2)..host(2) + texels,
+            ]]
+        );
+    }
+
     /// A cache made for a block the device answered a cache with its surface's layout is a buffer
     /// that declares the bytes between a texture's rows unobserved, as its copies into the pages
     /// take the texels alone, so a texture over it whose rows lie with bytes between them lies in
@@ -6023,17 +6068,36 @@ mod tests {
         assert_eq!(texel_spans(&[plane(0, 64, 0, 4)]), []);
     }
 
-    /// The runs a span of a surface's bytes lies in, cut to it
+    /// The runs the spans of a surface's bytes lie in, cut to them, each with its first byte of
+    /// the surface: a run that two spans lie in is cut for each, and a run no span reaches is left
+    /// out
     #[test]
     #[allow(clippy::single_range_in_vec_init)] // spans of one range
-    fn runs_of_a_span_are_cut_to_it() {
+    fn runs_at_spans_are_cut_to_them() {
         let runs = [0x1000..0x2000, 0x8000..0x9000, 0x4000..0x5000];
         assert_eq!(
-            runs_of(&runs, &(0x800..0x1800)),
-            [0x1800..0x2000, 0x8000..0x8800]
+            runs_at(&runs, &[0x800..0x1800]),
+            [(0x800, 0x1800..0x2000), (0x1000, 0x8000..0x8800)]
         );
-        assert_eq!(runs_of(&runs, &(0x2000..0x2100)), [0x4000..0x4100]);
-        assert_eq!(runs_of(&runs, &(0..0x1000)), [0x1000..0x2000]);
+        assert_eq!(
+            runs_at(&runs, &[0x2000..0x2100]),
+            [(0x2000, 0x4000..0x4100)]
+        );
+        assert_eq!(runs_at(&runs, &[0..0x1000]), [(0, 0x1000..0x2000)]);
+        assert_eq!(
+            runs_at(&runs, &[0x100..0x200, 0x300..0x1100, 0x2f00..0x3000]),
+            [
+                (0x100, 0x1100..0x1200),
+                (0x300, 0x1300..0x2000),
+                (0x1000, 0x8000..0x8100),
+                (0x2f00, 0x4f00..0x5000),
+            ]
+        );
+        assert_eq!(
+            runs_at(&runs, &[0x2f00..0x3100]),
+            [(0x2f00, 0x4f00..0x5000)]
+        );
+        assert_eq!(runs_at(&runs, &[]), []);
     }
 
     /// A copy out of a cache by runs that the platform refuses, at a download, makes the block's

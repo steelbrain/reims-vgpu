@@ -301,7 +301,7 @@ const GUEST_RAM_TO_BUFFER: &str = "copyFromGuestRam:toBuffer:destinationOffset: 
 
 /// What they name [`BlitEncoder::copy_to_guest_ram`] by.
 #[cfg(target_os = "linux")]
-const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:sourceOffset:toGuestRam: (no Metal)";
+const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:toGuestRamRuns: (no Metal)";
 
 /// A raw `MTLBlitOption` of a copy between a buffer and a texture, sent with `sel`: none, depth
 /// or stencil of a combined texture, or a PVRTC texture's blocks row by row. The runtime copies
@@ -658,7 +658,7 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         {
             let device = &destination.device.raw;
             let Some(ram) = (crate::os::copies_guest_ram(device))
-                .then(|| crate::os::ram_over(device, runs))
+                .then(|| crate::os::ram_over(device, runs.iter()))
                 .flatten()
             else {
                 return Ok(false);
@@ -681,27 +681,26 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         &self,
         _on: OnFault,
         source: &VulkanBuffer,
-        source_offset: u64,
-        runs: &[std::ops::Range<u64>],
+        runs: &[(u64, std::ops::Range<u64>)],
     ) -> RaiseResult<bool> {
         #[cfg(target_os = "linux")]
         {
             let device = &source.device.raw;
             let Some(ram) = (crate::os::copies_guest_ram(device))
-                .then(|| crate::os::ram_over(device, runs))
+                .then(|| crate::os::ram_over(device, runs.iter().map(|(_, run)| run)))
                 .flatten()
             else {
                 return Ok(false);
             };
             metal_space::first_use(FirstUse::BlitCommand);
             let copied = self.with(BUFFER_TO_GUEST_RAM, |e| {
-                crate::os::copy_to_host_ram(e, &source.raw, source_offset, &ram, runs)
+                crate::os::copy_to_host_ram(e, &source.raw, &ram, runs)
             });
             Ok(copied.is_ok())
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (source, source_offset, runs);
+            let _ = (source, runs);
             Ok(false)
         }
     }
