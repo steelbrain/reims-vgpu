@@ -1,0 +1,38 @@
+# built
+
+This directory holds Graft's latest release, built and ready to install:
+
+- `Graft.kext`: the kext bundle, x86-64, for macOS 11 and later.
+- `build.json`: what went into it. That covers the version, the SHA-256 of
+  every source file the build reads (`Makefile`, `src/`, `sdk/include/`), the
+  Xcode toolchain, and each bundle file's SHA-256, size and mode.
+
+It changes only when a release is made, so between releases the sources
+move on and this directory stays put.
+
+## Checking a release
+
+```sh
+make check-built
+```
+
+The check takes the sources at the release's tag (`v` and the version, such as
+`v1.0.0`) into a scratch directory, builds them with Xcode, and requires the
+result to match `Graft.kext` byte for byte. It needs the toolchain
+`build.json` names, because another Xcode produces different bytes. It
+fetches nothing.
+
+## Making a release
+
+1. Set `VERSION` in the `Makefile` and add the release to `CHANGELOG.md`.
+2. Run `make built`. It builds from a snapshot of the checkout's sources and
+   rewrites this directory. It refuses a version that already has a tag.
+3. Commit the version, the changelog and this directory together, and tag
+   that commit `v` plus the version.
+4. Run `make check-built` to confirm the tag rebuilds what you committed.
+
+## Using a release in another repository
+
+`tools/vendor.py DEST` copies the release from its tag into a consumer's
+tree: this directory, `sdk/` and the license, plus a `source.toml` recording
+the version, the commit and every file's SHA-256. See `sdk/README.md`.

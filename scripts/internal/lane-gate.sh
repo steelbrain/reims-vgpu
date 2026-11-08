@@ -497,7 +497,7 @@ pl_cleanup() {
 do_set() {
   rm -rf "$ART/kexts"
   mkdir -p "$ART/kexts"
-  cp -R "$TREE/guest/graft/dist/Graft.kext" "$ART/ReimsGraphics.kext" "$ART/kexts/"
+  cp -R "$TREE/guest/graft/built/Graft.kext" "$ART/ReimsGraphics.kext" "$ART/kexts/"
 }
 
 # The paths whose changes reach the image or the host build.

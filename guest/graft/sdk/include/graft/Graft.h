@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
 // Private interface for our guest kexts. Kernel/Boot-KC imports remain the
 // boot linker's responsibility; these services operate on the running kernel.
 #pragma once
@@ -23,7 +24,8 @@ bool graft_kernel_symbol(const char *identifier, const char *symbol, uint64_t *a
 // Graft publishes the outcome as the client's state: "routed", or "refused"
 // naming the route and the reason.
 bool graft_route_kernel(const char *identifier, const graft_route_request *requests, size_t count);
-void graft_client_log(const char *identifier, const char *format, ...) __attribute__((format(printf, 2, 3)));
+void graft_client_log(const char *identifier, const char *format, ...)
+        __attribute__((format(printf, 2, 3)));
 void graft_client_state(const char *identifier, const char *state, const char *reason);
 #ifdef __cplusplus
 }

@@ -1,16 +1,21 @@
-# Graft's consumer files beside this record, copied from Graft's repository
-# by its tools/vendor.py. Replace the directory and this record together;
-# do not edit either.
-commit = "68955bb93702ddcd1e150ae8f2bcfea129e9edf6"
+# Graft 1.0.0, copied from its release tag v1.0.0 by Graft's tools/vendor.py.
+# Replace the directory and this record together; do not edit either.
+version = "1.0.0"
+commit = "6d53a3bbfc0413f3d715c1ded17cf71cb45cfd60"
 
 [files]
-"consumer/Start.cpp" = "4b53211f0577bb202e2f185a9d200d541f516dd8c62ac0295801d34280b6a857"
-"dist/Graft.kext/Contents/Info.plist" = "aa9221c62185214ffcc06ed53e074f4418009cb170dc02c7596cf3effb150cd9"
-"dist/Graft.kext/Contents/MacOS/Graft" = "ea1bdfe43c94d20c8aae085f11dc53b55f7f03329cabf7dd4bb5baea883cbf21"
-"dist/build.json" = "6eee7957521440cd4c026c7aabb1f578a856295bec9c360e5bd5b5cfd3cd96bb"
-"include/graft/Graft.h" = "e4edc7c618d9be43f580fffd24ce0a859ff93cb2680287769af8fa46b1bf0270"
-"tools/README.md" = "e201b70ba6220b55d640f1b892f960445226dee56e60959688755f9d2c996eb5"
-"tools/consumer.mk" = "2acce0fcefea8394e98c039aa1d1ed12a248370f4a81476867869ce436533674"
-"tools/consumer.py" = "06de2aa063412378dcb25a21c60710448e67f7c206e803e07e6ad19d41ed62b1"
-"tools/graft_macho.py" = "490ff319a4ec2efe985a8c2dea4b67f9c696766690c44ab3e1b91cdb01119415"
-"tools/prelink.py" = "314328e26c238ce461c76beacd4d4837cf56c77f1c8b7a784b0c8af518a9de62"
+"LICENSE" = "aa03754de05115e6218873f65ec1a6a4c95c550742dafca7ce8d4c4b627e50e3"
+"LICENSES/GPL-2.0-or-later.txt" = "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+"LICENSES/GPL-3.0-or-later.txt" = "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+"LICENSES/LGPL-3.0-or-later.txt" = "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118"
+"built/Graft.kext/Contents/Info.plist" = "aa9221c62185214ffcc06ed53e074f4418009cb170dc02c7596cf3effb150cd9"
+"built/Graft.kext/Contents/MacOS/Graft" = "0a29c2d26219d87941104bd4aef3de836fedcc6824d831bb5de8f8993b16898e"
+"built/README.md" = "2b898f0b491aa87b836f762eaa4654f3a1d424d4e833017fa9e3c70e53bc8b76"
+"built/build.json" = "98dc9220582eb97dc2fb7fb7d920b07c6b5cb0cd38f3e90d14bd5d803d8337f3"
+"sdk/README.md" = "e94c7a642bf5423f3dd91de63964be6cfa397ae185339c77b5e26fae9961f50f"
+"sdk/Start.cpp" = "d442ab1f6403ec72b952f595463e7fc479362414c39dad5effec71332ccb9055"
+"sdk/consumer.mk" = "111a412bc859c95e924fccdbf7d3e2d2c1a5de62292d09d4e00e8923c402fd44"
+"sdk/consumer.py" = "f0188c97168cf7980dc1953675faa3706814880cbfe6e73e4cd9782665f61663"
+"sdk/graft_macho.py" = "253cac99eaa5bd1b5f209dca9319eb7e92a8ed6ba55d9976df089c942a6a3618"
+"sdk/include/graft/Graft.h" = "7ce3819e34aab2c8772ced30df2d5f79af495637905d0095cc722a9ec7802602"
+"sdk/prelink.py" = "88f4d5efe16414a424c4481ab326308cc99aace6f7ebd27f714d3b546975e272"

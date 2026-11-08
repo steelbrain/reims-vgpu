@@ -253,7 +253,7 @@ Stages:
     Boot-collection symbols, but a display kext uses IOGraphicsFamily and
     AppleGraphicsDeviceControl, which are in the System collection. So
     ReimsGraphics is built with Graft's consumer rules
-    (`guest/graft/tools/consumer.mk`): its System-collection imports point at
+    (`guest/graft/sdk/consumer.mk`): its System-collection imports point at
     placeholders inside the kext, and it carries a manifest
     (`__DATA,__graft`) of every imported site and of the library classes it
     derives from, with no personalities and no System-collection

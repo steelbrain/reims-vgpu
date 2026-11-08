@@ -35,7 +35,7 @@ FLAGS = -arch x86_64 -mmacosx-version-min=11.0 -isysroot $(SDK) -mkernel -nostdl
 CXXFLAGS = $(FLAGS) -MMD -MP -std=c++17 -fapple-kext -fno-rtti -fno-exceptions \
 	-DKERNEL -DKERNEL_PRIVATE -nostdinc -isystem $(KHEADERS) \
 	-DGRAFT_CLIENT_ID=com.steelbrain.RgfxGate -DGRAFT_CLIENT_VERSION=\"$(VERSION)\" \
-	-I$(GEN) -Isrc -I$(GRAFT)/include
+	-I$(GEN) -Isrc -I$(GRAFT)/sdk/include
 
 OBJS = $(BUILD)/obj/RgfxGate.o $(BUILD)/obj/RgfxGateHooks.o \
 	$(BUILD)/obj/RgfxGateInstall.o $(BUILD)/obj/RgfxGatePrefs.o $(BUILD)/obj/GraftStart.o
@@ -80,7 +80,7 @@ $(BUILD)/obj/RgfxGatePrefs.o: src/RgfxGatePrefs.cpp src/RgfxGatePrefs.hpp src/Rg
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/obj/GraftStart.o: $(GRAFT)/consumer/Start.cpp
+$(BUILD)/obj/GraftStart.o: $(GRAFT)/sdk/Start.cpp
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 

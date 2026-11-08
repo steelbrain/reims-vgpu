@@ -2,12 +2,12 @@
 # Prelink the committed Graft set with OpenCore's linker, in user space, in
 # Kernel > Add order; check every kext injects and every name resolves, then
 # that each dormant consumer (a kext carrying a Graft manifest) stays
-# bindable in the prelinked collection (guest/graft/tools/prelink.py).
+# bindable in the prelinked collection (guest/graft/sdk/prelink.py).
 # Outputs remain local.
 # Usage: oc-link-set.sh KEXTINJECT BOOT_KC SET OUT
 set -euo pipefail
 
-prelink=$(cd "$(dirname "$0")/../graft/tools" && pwd)/prelink.py
+prelink=$(cd "$(dirname "$0")/../graft/sdk" && pwd)/prelink.py
 
 ki=${1:-} kc=${2:-} set=${3:-} out=${4:-}
 if [ -z "$ki" ] || [ -z "$kc" ]; then

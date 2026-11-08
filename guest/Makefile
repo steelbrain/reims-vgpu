@@ -47,7 +47,7 @@ set:
 	$(MAKE) -C kext BUILD=$(WORK)/kext
 	$(MAKE) -C bundle BUILD=$(WORK)/bundle package
 	$(MAKE) -C rgfxgate BUILD=$(WORK)/rgfxgate BUNDLE_DIR=$(BUNDLE)
-	ditto graft/dist/Graft.kext $(WORK)/Graft.kext
+	ditto graft/built/Graft.kext $(WORK)/Graft.kext
 	python3 -I -B tools/prebuilt.py stage $(OUT) $(WORK)
 
 prebuilt:

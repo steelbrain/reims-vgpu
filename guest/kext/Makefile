@@ -3,7 +3,7 @@
 # (src/ReimsGraphics.hpp; the protocol is docs/graphics-kext/design.md).
 # Builds on a Mac with Xcode's clang and ld, against the macOS SDK's
 # Kernel.framework, for macOS 11 and later, and stages it with Graft's
-# consumer rules (../graft/tools/consumer.mk, src/graft.json): dormant, for
+# consumer rules (../graft/sdk/consumer.mk, src/graft.json): dormant, for
 # Graft to bind against the System kernel collection's libraries.
 #
 #   make        build/ReimsGraphics.kext
@@ -83,7 +83,7 @@ $(BUILD)/obj/layout.o: src/ReimsGraphics.cpp src/ReimsGraphics.hpp ../../crates/
 	xcrun clang++ $(CXXFLAGS) -g -fstandalone-debug -c $< -o $@
 
 # Graft owns the two-pass link and dormant staging of this consumer.
-include ../graft/tools/consumer.mk
+include ../graft/sdk/consumer.mk
 
 check: $(BINARY) $(BUILD)/obj/layout.o
 	bash tools/check-imports.sh "$(KDK)" $(KEXT)

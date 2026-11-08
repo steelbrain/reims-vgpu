@@ -118,7 +118,7 @@ def stage(out, work):
     dependencies = infos["ReimsGraphics.kext"].get("OSBundleLibraries", {})
     if {"com.apple.iokit.IOGraphicsFamily", "com.apple.AppleGraphicsDeviceControl"} & set(dependencies):
         raise SystemExit("prebuilt: dormant ReimsGraphics still names System-KC dependencies")
-    if sha256(work / "Graft.kext/Contents/MacOS/Graft") != sha256(ROOT / "guest/graft/dist/Graft.kext/Contents/MacOS/Graft"):
+    if sha256(work / "Graft.kext/Contents/MacOS/Graft") != sha256(ROOT / "guest/graft/built/Graft.kext/Contents/MacOS/Graft"):
         raise SystemExit("prebuilt: Graft differs from the vendored build")
     # Each kext after those of the set it names.
     ids = [infos[k.name]["CFBundleIdentifier"] for k, _ in kexts]
