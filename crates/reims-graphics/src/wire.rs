@@ -3215,6 +3215,27 @@ pub struct RgfxVideoOutputLayout {
     pub reserved_0c: u32,
 }
 
+/// What the host's hardware takes of one encode codec beside its [`RgfxVideoCodecCaps`], by the
+/// same index ([`RgfxVideoCaps::encode`]). All zero for a decode entry, and from a host older
+/// than these: a guest reads an encode entry whose `rate_controls` is 0 as no encoder.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVideoEncodeCaps {
+    /// The rate controls taken, a bit `1 << RGFX_VIDEO_RATE_*` each
+    /// ([`RGFX_VIDEO_RATE_CQP`](crate::ops::video::RGFX_VIDEO_RATE_CQP)), as the host's API lists
+    /// them for the codec's profiles.
+    pub rate_controls: u32,
+    /// The most consecutive B pictures an encode takes
+    /// ([`RgfxVideoEncodeSettings::b_frames`](crate::ops::video::RgfxVideoEncodeSettings)).
+    pub max_b_frames: u32,
+    /// Zero: reserved for intra refresh and the like.
+    pub flags: u32,
+    /// Zero.
+    pub reserved_0c: u32,
+}
+
 /// The video caps the host writes at the device's init, at [`RGFX_VIDEO_CAPS_OFFSET`]: one
 /// [`RgfxVideoCodecCaps`] for each codec and direction its hardware takes, which the guest's
 /// video driver lists, and none for the rest, which the guest's software codecs serve.
@@ -3234,8 +3255,13 @@ pub struct RgfxVideoCaps {
     /// Zero.
     pub reserved_30c: u32,
     /// How each of `codecs` lands its pictures in place, by its index there; all zero for a codec
-    /// whose pictures land by a copy, and from a host older than them.
+    /// whose pictures land by a copy, and from a host older than them. For an encode entry, what a
+    /// source must be laid out as to be read in place, by the GPU in one pass: its planes' first
+    /// bytes and rows at multiples of `alignment`, in units of `granularity`; a source of other
+    /// pitches still encodes, through a copy by the CPU.
     pub layouts: [RgfxVideoOutputLayout; RGFX_VIDEO_CAPS_CODECS],
+    /// What each encode entry of `codecs` takes beyond them, by its index there.
+    pub encode: [RgfxVideoEncodeCaps; RGFX_VIDEO_CAPS_CODECS],
 }
 
 /// `VIDEO_SESSION_CREATE`: a video session.
@@ -3868,10 +3894,15 @@ const _: () = {
     assert!(size_of::<RgfxVideoOutputLayout>() == 16);
     assert!(
         size_of::<RgfxVideoCaps>()
-            == 8 + 48 * RGFX_VIDEO_CAPS_CODECS + 8 + 16 * RGFX_VIDEO_CAPS_CODECS
+            == 8 + 48 * RGFX_VIDEO_CAPS_CODECS
+                + 8
+                + 16 * RGFX_VIDEO_CAPS_CODECS
+                + 16 * RGFX_VIDEO_CAPS_CODECS
     );
     assert!(core::mem::offset_of!(RgfxVideoCaps, reserved_30c) == 0x30c);
     assert!(core::mem::offset_of!(RgfxVideoCaps, layouts) == 0x310);
+    assert!(size_of::<RgfxVideoEncodeCaps>() == 16);
+    assert!(core::mem::offset_of!(RgfxVideoCaps, encode) == 0x410);
     assert!(RGFX_VIDEO_CAPS_OFFSET == RGFX_DEVICE_INFO_OFFSET + size_of::<RgfxDeviceInfo>() as u64);
     assert!(RGFX_VIDEO_CAPS_OFFSET.is_multiple_of(8));
     assert!(

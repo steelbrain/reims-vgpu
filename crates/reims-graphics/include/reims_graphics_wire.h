@@ -906,6 +906,93 @@
 // Where a `DECODE_H265` op's parameter sets start: right after its body.
 #define RGFX_VIDEO_DECODE_H265_PARAMETER_SETS_OFFSET 48
 
+// Op `ENCODE_H264` ([`RgfxVideoOpEncode`], then an [`RgfxVideoEncodeSettings`] where the
+// settings changed): encode one frame as one H.264 access unit, on a session made in the
+// encode direction
+// ([`RGFX_VIDEO_ENCODE`](crate::wire::RGFX_VIDEO_ENCODE)).
+//
+// The frame is the IOSurface of two planes `source_luma_texture_obj_id` (plane 0: `R8Unorm`, or
+// `R16Unorm` at 10 bits) and `source_chroma_texture_obj_id` (plane 1: `RG8Unorm`, or
+// `RG16Unorm`) lie over (`TEXTURE_FROM_IOSURFACE`), at their origin, the settings' width by
+// height. The host reads it from the surface's pages, or from its device cache where its block
+// has one, as a decode's picture lands; the command buffer names the surface it reads with
+// `SURFACE_USE`, as any GPU read does.
+//
+// The host writes the access unit, in Annex-B form (each NAL unit after a start code), at
+// `bitstream_offset` in the Shared buffer `bitstream_buffer_obj_id`, at most
+// `bitstream_capacity` bytes, and then the frame's [`RgfxVideoEncodeResult`] at
+// `result_offset` in the Shared buffer `result_buffer_obj_id`, which may be the same buffer;
+// both before the command buffer completes. A keyframe's access unit carries the parameter sets
+// before its slices (SPS and PPS), and its result says so
+// ([`RGFX_VIDEO_ENCODED_PARAMETER_SETS`]).
+//
+// An access unit past the capacity is not written: the result's status is
+// [`RGFX_VIDEO_ENCODE_OVERFLOW`], with the bytes it needed, and the session's next access unit is
+// a keyframe, since the frame is already among the encoder's references. No access unit is
+// longer than `width * height * bytes_per_sample * 3 / 2 + 1 MiB`, so a capacity of that never
+// overflows. A frame the hardware fails gets [`RGFX_VIDEO_ENCODE_FAILED`]. Both complete the
+// command buffer as any other. A reference to no such object, a source of another size than the
+// settings', an odd width or height, a size past the caps, a capacity of 0, a result not at a
+// multiple of 8 or past its buffer, or a first encode with no settings faults the command buffer.
+#define RGFX_OP_VIDEO_ENCODE_H264 16386
+
+// Op `ENCODE_H265` ([`RgfxVideoOpEncode`], then an [`RgfxVideoEncodeSettings`] where the
+// settings changed): encode one frame as one HEVC access unit, as [`RGFX_OP_VIDEO_ENCODE_H264`]
+// does, its keyframes' parameter sets the VPS, SPS and PPS; a 10-bit profile's source is P010's
+// planes.
+#define RGFX_OP_VIDEO_ENCODE_H265 16387
+
+// [`RgfxVideoOpEncode::flags`]: the frame is a keyframe (an IDR picture, or HEVC's IRAP).
+#define RGFX_VIDEO_ENCODE_FORCE_KEYFRAME (1 << 0)
+
+// [`RgfxVideoEncodeSettings::rate_control`]: a constant QP a picture type (`qp_i`, `qp_p`,
+// `qp_b`).
+#define RGFX_VIDEO_RATE_CQP 1
+
+// [`RgfxVideoEncodeSettings::rate_control`]: a constant bitrate, `average_bitrate`.
+#define RGFX_VIDEO_RATE_CBR 2
+
+// [`RgfxVideoEncodeSettings::rate_control`]: a variable bitrate around `average_bitrate`,
+// under `max_bitrate`.
+#define RGFX_VIDEO_RATE_VBR 3
+
+// [`RgfxVideoEncodeSettings::flags`]: `max_bitrate` over `max_bitrate_window_ms` is a hard
+// limit (VideoToolbox's `DataRateLimits`), not the rate control's peak alone.
+#define RGFX_VIDEO_ENCODE_HARD_LIMIT (1 << 0)
+
+// [`RgfxVideoEncodeSettings::entropy`]: H.264's CAVLC.
+#define RGFX_VIDEO_ENTROPY_CAVLC 1
+
+// [`RgfxVideoEncodeSettings::entropy`]: H.264's CABAC, which Constrained Baseline does not have.
+#define RGFX_VIDEO_ENTROPY_CABAC 2
+
+// [`RgfxVideoEncodeResult::status`]: the access unit was written.
+#define RGFX_VIDEO_ENCODE_OK 0
+
+// [`RgfxVideoEncodeResult::status`]: the access unit did not fit the capacity, and was not
+// written; `bitstream_size` is the bytes it needed.
+#define RGFX_VIDEO_ENCODE_OVERFLOW 1
+
+// [`RgfxVideoEncodeResult::status`]: the hardware did not encode the frame.
+#define RGFX_VIDEO_ENCODE_FAILED 2
+
+// [`RgfxVideoEncodeResult::flags`]: the access unit is a keyframe (an IDR picture, or HEVC's
+// IRAP).
+#define RGFX_VIDEO_ENCODED_KEYFRAME (1 << 0)
+
+// [`RgfxVideoEncodeResult::flags`]: the access unit carries the parameter sets before its
+// slices.
+#define RGFX_VIDEO_ENCODED_PARAMETER_SETS (1 << 1)
+
+// [`RgfxVideoEncodeResult::picture_type`]: an I picture.
+#define RGFX_VIDEO_PICTURE_I 1
+
+// [`RgfxVideoEncodeResult::picture_type`]: a P picture.
+#define RGFX_VIDEO_PICTURE_P 2
+
+// [`RgfxVideoEncodeResult::picture_type`]: a B picture.
+#define RGFX_VIDEO_PICTURE_B 3
+
 // The device's PCI vendor ID: a placeholder until the owner picks the device's own.
 #define RGFX_PCI_VENDOR_ID 4660
 
@@ -6591,6 +6678,23 @@ typedef struct {
   uint32_t reserved_0c;
 } RgfxVideoOutputLayout;
 
+// What the host's hardware takes of one encode codec beside its [`RgfxVideoCodecCaps`], by the
+// same index ([`RgfxVideoCaps::encode`]). All zero for a decode entry, and from a host older
+// than these: a guest reads an encode entry whose `rate_controls` is 0 as no encoder.
+typedef struct {
+  // The rate controls taken, a bit `1 << RGFX_VIDEO_RATE_*` each
+  // ([`RGFX_VIDEO_RATE_CQP`](crate::ops::video::RGFX_VIDEO_RATE_CQP)), as the host's API lists
+  // them for the codec's profiles.
+  uint32_t rate_controls;
+  // The most consecutive B pictures an encode takes
+  // ([`RgfxVideoEncodeSettings::b_frames`](crate::ops::video::RgfxVideoEncodeSettings)).
+  uint32_t max_b_frames;
+  // Zero: reserved for intra refresh and the like.
+  uint32_t flags;
+  // Zero.
+  uint32_t reserved_0c;
+} RgfxVideoEncodeCaps;
+
 // The video caps the host writes at the device's init, at [`RGFX_VIDEO_CAPS_OFFSET`]: one
 // [`RgfxVideoCodecCaps`] for each codec and direction its hardware takes, which the guest's
 // video driver lists, and none for the rest, which the guest's software codecs serve.
@@ -6606,9 +6710,95 @@ typedef struct {
   // Zero.
   uint32_t reserved_30c;
   // How each of `codecs` lands its pictures in place, by its index there; all zero for a codec
-  // whose pictures land by a copy, and from a host older than them.
+  // whose pictures land by a copy, and from a host older than them. For an encode entry, what a
+  // source must be laid out as to be read in place, by the GPU in one pass: its planes' first
+  // bytes and rows at multiples of `alignment`, in units of `granularity`; a source of other
+  // pitches still encodes, through a copy by the CPU.
   RgfxVideoOutputLayout layouts[RGFX_VIDEO_CAPS_CODECS];
+  // What each encode entry of `codecs` takes beyond them, by its index there.
+  RgfxVideoEncodeCaps encode[RGFX_VIDEO_CAPS_CODECS];
 } RgfxVideoCaps;
+
+// What became of one encode, which the host writes at the op's `result_offset` before its
+// command buffer completes.
+typedef struct {
+  // `RGFX_VIDEO_ENCODE_OK`, `_OVERFLOW` or `_FAILED`.
+  uint32_t status;
+  // `RGFX_VIDEO_ENCODED_*`.
+  uint32_t flags;
+  // The bytes written at `bitstream_offset`; for an overflow, the bytes the access unit
+  // needed.
+  uint64_t bitstream_size;
+  // The frame the access unit holds, by its op's `frame_index`: the op's own while the
+  // session has no B-frames.
+  uint64_t frame_index;
+  // `RGFX_VIDEO_PICTURE_*`; 0 for a frame not encoded.
+  uint32_t picture_type;
+  // Zero.
+  uint32_t reserved_1c;
+} RgfxVideoEncodeResult;
+
+// An encode session's settings, after an [`RgfxVideoOpEncode`] whose `settings_size` says so.
+// A change of the size, format, profile, level, entropy, B-frames, keyframe interval or colour
+// starts a new sequence: the next access unit is a keyframe with its parameter sets. The
+// bitrates, QPs, quality and frame rate apply from the next frame, with no keyframe.
+typedef struct {
+  // The coded picture's width, the sources' size: even.
+  uint32_t width;
+  // The coded picture's height: even.
+  uint32_t height;
+  // The sources' format: [`RGFX_VIDEO_FORMAT_NV12`](crate::wire::RGFX_VIDEO_FORMAT_NV12) or
+  // [`RGFX_VIDEO_FORMAT_P010`](crate::wire::RGFX_VIDEO_FORMAT_P010).
+  uint32_t format;
+  // One `RGFX_VIDEO_<codec>_*` profile bit.
+  uint32_t profile;
+  // The codec's level as it numbers it (H.264's `level_idc`, HEVC's `general_level_idc`); 0
+  // for the host's pick, the lowest that fits.
+  uint32_t level;
+  // `RGFX_VIDEO_RATE_*`.
+  uint32_t rate_control;
+  // Bits a second, for CBR and VBR; the host saturates it to its API's range.
+  uint64_t average_bitrate;
+  // VBR's peak, in bits a second over `max_bitrate_window_ms`; 0 for none.
+  uint64_t max_bitrate;
+  // The window of `max_bitrate`, and the HRD buffer's length, in milliseconds; 0 for a
+  // second.
+  uint32_t max_bitrate_window_ms;
+  // The expected frame rate's numerator; 0, with a 0 denominator, where it is unknown.
+  uint32_t frame_rate_num;
+  // The expected frame rate's denominator.
+  uint32_t frame_rate_den;
+  // The most frames from one keyframe to the next; 0 for the host's pick.
+  uint32_t key_frame_interval;
+  // CQP's QP of I pictures.
+  uint32_t qp_i;
+  // CQP's QP of P pictures.
+  uint32_t qp_p;
+  // CQP's QP of B pictures.
+  uint32_t qp_b;
+  // The least QP rate control picks; 0 for none.
+  uint32_t min_qp;
+  // The greatest QP rate control picks; 0 for none.
+  uint32_t max_qp;
+  // Consecutive B pictures, at most the caps' `max_b_frames`.
+  uint32_t b_frames;
+  // H.264's entropy coder: 0 for the profile's (CABAC for Main and High, CAVLC for
+  // Baseline), or `RGFX_VIDEO_ENTROPY_*`; 0 for HEVC.
+  uint32_t entropy;
+  // The speed and quality trade, 0 the fastest to 100 the best, which the host maps onto its
+  // API's presets.
+  uint32_t quality;
+  // `RGFX_VIDEO_ENCODE_*` settings bits: [`RGFX_VIDEO_ENCODE_HARD_LIMIT`].
+  uint32_t flags;
+  // The VUI's `colour_primaries` (ITU-T H.273), in the SPS the host packs.
+  uint8_t color_primaries;
+  // The VUI's `transfer_characteristics`.
+  uint8_t transfer;
+  // The VUI's `matrix_coefficients`.
+  uint8_t matrix;
+  // The VUI's `video_full_range_flag`: 1 for full range.
+  uint8_t full_range;
+} RgfxVideoEncodeSettings;
 
 // The body of [`RGFX_OP_VIDEO_DECODE_H264`], followed by its parameter sets.
 typedef struct {
@@ -6651,6 +6841,34 @@ typedef struct {
   // As [`RgfxVideoOpDecodeH264::output_rows`].
   uint32_t output_rows;
 } RgfxVideoOpDecodeH265;
+
+// The body of [`RGFX_OP_VIDEO_ENCODE_H264`] and [`RGFX_OP_VIDEO_ENCODE_H265`], followed by
+// `settings_size` bytes of [`RgfxVideoEncodeSettings`] where the settings changed since the
+// session's last encode, its first included.
+typedef struct {
+  // The texture over the source surface's plane 0.
+  uint64_t source_luma_texture_obj_id;
+  // The texture over the source surface's plane 1.
+  uint64_t source_chroma_texture_obj_id;
+  // The Shared buffer the host writes the access unit into.
+  uint64_t bitstream_buffer_obj_id;
+  // Where the access unit's first byte goes in it.
+  uint64_t bitstream_offset;
+  // The most bytes the host may write there.
+  uint64_t bitstream_capacity;
+  // The Shared buffer the host writes the [`RgfxVideoEncodeResult`] into; it may be the
+  // bitstream's.
+  uint64_t result_buffer_obj_id;
+  // Where the result goes in it: a multiple of 8.
+  uint64_t result_offset;
+  // The frame's place in display order, from 0; the result says which frame its access unit
+  // holds.
+  uint64_t frame_index;
+  // `RGFX_VIDEO_ENCODE_*`: [`RGFX_VIDEO_ENCODE_FORCE_KEYFRAME`].
+  uint32_t flags;
+  // The bytes of [`RgfxVideoEncodeSettings`] after this body; 0 where they are unchanged.
+  uint32_t settings_size;
+} RgfxVideoOpEncode;
 
 // `VIDEO_SESSION_CREATE`: a video session.
 typedef struct {
