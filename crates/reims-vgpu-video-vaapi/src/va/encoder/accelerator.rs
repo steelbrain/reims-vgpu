@@ -11,8 +11,15 @@
 //! with its coded buffer, context and surfaces, is kept until the GPU is
 //! done with the coded buffer and the display's call thread with what it
 //! has (an upload's map of a derived image is made there).
+//!
+//! A dropped encoder's session that coded a picture is kept open, in
+//! [`KEPT`], until a later session on the same render node is about to
+//! submit a picture after its first: then it is destroyed, its close
+//! followed on the VCN by that picture. radeonsi's VCN hangs otherwise
+//! ([`super`]'s docs).
 
 use reims_vgpu_video_core::runtime::MonoTime;
+use reims_vgpu_video_core::sync::Mutex;
 
 use super::super::buffer::{Buffer, render_picture};
 use super::super::caps::{Config, Context, Entrypoint, Profile};
@@ -29,6 +36,23 @@ use crate::encode::{EncoderSettings, FrameType, InputFrame, RateControl};
 /// Surfaces beyond the references and B pictures in flight, so that one
 /// is always free.
 const SPARE_SURFACES: usize = 1;
+
+/// The sessions of dropped encoders kept open, each with its display's
+/// render node (module docs).
+static KEPT: Mutex<Vec<(String, Session)>> = Mutex::new(Vec::new());
+
+/// Destroys the kept sessions on render node `node`.
+fn retire(node: &str) {
+    let retired: Vec<(String, Session)> = {
+        let mut kept = KEPT.lock();
+        let (retired, left) = std::mem::take(&mut *kept)
+            .into_iter()
+            .partition(|(n, _)| n == node);
+        *kept = left;
+        retired
+    };
+    drop(retired);
+}
 
 /// What one stream's pictures are encoded with.
 struct Session {
@@ -50,6 +74,9 @@ struct Session {
     /// The reconstruction of the picture last encoded and not yet kept,
     /// which a try of the same picture codes into again.
     attempt: Option<Lent>,
+    /// Whether a picture was coded: the driver began the session on the
+    /// device.
+    coded: bool,
 }
 
 impl Session {
@@ -165,6 +192,15 @@ fn rate_control_mode(rate_control: RateControl) -> u32 {
     }
 }
 
+impl Drop for VaAccelerator {
+    /// Keeps the session open where it coded a picture (module docs).
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take().filter(|s| s.coded) {
+            KEPT.lock().push((self.display.path().to_owned(), session));
+        }
+    }
+}
+
 impl Accelerator for VaAccelerator {
     type Input = Lent;
     type Error = Error;
@@ -247,6 +283,7 @@ impl Accelerator for VaAccelerator {
             intra_period: stream.intra_period,
             picture_qp: stream.picture_qp,
             attempt: None,
+            coded: false,
         });
         Ok(())
     }
@@ -274,6 +311,9 @@ impl Accelerator for VaAccelerator {
             .session
             .as_mut()
             .ok_or_else(|| Error::Unsupported("encoding before the stream is configured".into()))?;
+        if session.coded {
+            retire(self.display.path());
+        }
         // A picture coded again codes into its last try's surface, on the
         // same context: Mesa keeps its DPB by surface.
         let reconstructed = match session.attempt.take() {
@@ -292,6 +332,7 @@ impl Accelerator for VaAccelerator {
             Ok(coded) => {
                 if let Some(session) = self.session.as_mut() {
                     session.attempt = Some(reconstructed);
+                    session.coded = true;
                 }
                 Ok(coded)
             }

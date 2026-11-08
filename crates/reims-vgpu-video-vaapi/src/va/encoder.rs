@@ -2,6 +2,21 @@
 //! parameter sets and slice headers ours, as packed headers.
 //! [`VideoEncoder`] is [`crate::encode`]'s core over
 //! [`accelerator::VaAccelerator`].
+//!
+//! A dropped encoder's session stays open until a later encoder on the
+//! render node has coded a picture and is about to code its next
+//! (`accelerator`'s docs). On radeonsi, an encode session begun on the VCN
+//! after the last one was closed, with none open between, hangs the VCN at
+//! its first picture, faulting on a write to an address not mapped, and the
+//! kernel resets the ring, or the whole GPU where that fails. A pause of 3 s
+//! after the close does not avoid it, nor does a display of the new
+//! session's own while the process holds another display of the GPU, whose
+//! address space it shares. Sessions never closed, or each closed once the
+//! next has coded its first picture, do not hang. (Measured with a libva
+//! program of our own, Mesa 26.2.6, Linux 7.3.1: the hang on a Radeon 780M
+//! of Phoenix and one of Hawk Point, within 2 to 4 sessions; 40 sessions in
+//! a row each way without it on the Phoenix one.) iHD (Iris Xe) codes 90
+//! sessions in a row, each closed before the next.
 
 mod accelerator;
 mod caps;
@@ -292,5 +307,65 @@ impl VideoEncoder {
     /// Uploads frames by `method` from now on.
     pub fn force_upload_method(&mut self, method: UploadMethod) {
         self.inner.accelerator_mut().force_upload_method(method);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reims_vgpu_video_core::runtime::StdRuntime;
+
+    use super::*;
+    use crate::encode::Plane;
+
+    /// On the driver, 24 encoders made from one display one after another, each dropped before
+    /// the next, the profiles the driver encodes in turn, code each of their 4 frames: a dropped
+    /// encoder's session is closed only once the next one has coded a picture (module docs).
+    #[test]
+    #[ignore = "needs a VA-API GPU: run on the VA-API host"]
+    fn encoders_made_one_after_another_from_one_display_code_every_frame() {
+        let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        let display = Display::open(&node, Arc::new(StdRuntime)).expect("a VA display");
+        let profiles: Vec<encode::Profile> = (encoder_support(&display).into_iter())
+            .map(|s| s.profile)
+            .collect();
+        assert!(!profiles.is_empty(), "the driver encodes nothing");
+        let (width, height) = (320, 192);
+        for made in 0..24 {
+            let profile = profiles[made % profiles.len()];
+            let settings = EncoderSettings::new(profile, width, height);
+            let mut encoder = VideoEncoder::new(&display, settings)
+                .unwrap_or_else(|e| panic!("encoder {made} ({profile:?}): {e}"));
+            let row = width as usize * profile.input_format().bytes_per_sample();
+            let luma = vec![0x40; row * height as usize];
+            let chroma = vec![0x80; row * height as usize / 2];
+            let mut coded = Vec::new();
+            for id in 0..4 {
+                let frame = InputFrame {
+                    planes: [
+                        Plane {
+                            data: &luma,
+                            bytes_per_row: row,
+                        },
+                        Plane {
+                            data: &chroma,
+                            bytes_per_row: row,
+                        },
+                    ],
+                    pts: 3000 * id as i64,
+                    duration: 3000,
+                    force_key_frame: false,
+                    id,
+                };
+                let out = (encoder.encode(&frame))
+                    .unwrap_or_else(|e| panic!("encoder {made} ({profile:?}) frame {id}: {e}"));
+                coded.extend(out);
+            }
+            coded.extend(encoder.flush());
+            let samples = (coded.into_iter())
+                .map(|c| c.map_err(|f| (f.id, f.error.map(|e| e.to_string()))))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_else(|e| panic!("encoder {made} ({profile:?}): {e:?}"));
+            assert_eq!(samples.len(), 4, "encoder {made} ({profile:?})");
+        }
     }
 }
