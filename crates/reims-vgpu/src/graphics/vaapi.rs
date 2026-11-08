@@ -1,6 +1,7 @@
 //! The reims-graphics device's hardware video on VA-API ([`open`]): H.264 and HEVC decode on the
 //! render node of the runtime device's GPU, whatever its vendor, through the VA-API crate's own
-//! decoders, in a [`HostVideoSession`] whose event the host signals.
+//! decoders, in a [`HostVideoSession`] whose event the host signals; and H.264 and HEVC encode
+//! there, in a [`HostEncodeSession`] (`encode`'s module doc).
 //!
 //! - **What it answers** ([`caps_of`]) is the driver's: the VLD profiles it lists, with the
 //!   formats its configs' `VAConfigAttribRTFormat` names, and the sizes its configs and their
@@ -34,9 +35,10 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, Weak};
 
 use reims_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_FORMAT_NV12,
-    RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN,
-    RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoOutputLayout,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_ENCODE,
+    RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
+    RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
+    RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::Platform;
@@ -47,8 +49,8 @@ use reims_vgpu_video_core::fourcc::FourCc;
 use reims_vgpu_video_core::runtime::Runtime;
 use reims_vgpu_video_core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video_vaapi::{
-    Capabilities, ConfigCapabilities, Display, Entrypoint, Frame, GuestWrites, H264Decoder,
-    HevcDecoder, ImportWrites, PlaneRows, Profile,
+    Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
+    H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, encoder_support,
 };
 
 use super::decode::{GraphicsVideo, GraphicsVideoSession, PlanePages};
@@ -56,8 +58,11 @@ use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 
 use super::video_host::{
-    BackendError, HostDecoder, HostPicture, HostPlane, HostVideoSession, Landing, OutputPlane,
+    BackendError, HostDecoder, HostEncodeSession, HostPicture, HostPlane, HostVideoSession,
+    Landing, OutputPlane,
 };
+
+mod encode;
 
 /// The backend's name in the session's log lines.
 const NAME: &str = "VA-API";
@@ -124,6 +129,8 @@ struct VaapiVideo<P: Platform> {
     /// The device the sessions' events are made on.
     device: P::Device,
     caps: Vec<RgfxVideoCodecCaps>,
+    /// The profiles the driver encodes, which the encode entries of `caps` list.
+    encoders: Arc<[EncoderSupport]>,
     /// What the driver's video processing writes into imports, as the display's check found it.
     writes_imports: ImportWrites,
     /// The imports of the outputs' memory, which the sessions share.
@@ -134,9 +141,12 @@ impl<P: Platform> VaapiVideo<P> {
     fn new(device: &P::Device, node: &Path, runtime: Arc<dyn Runtime>) -> Result<Self, String> {
         let started = runtime.now();
         let display = Display::open(node, Arc::clone(&runtime)).map_err(|e| e.to_string())?;
-        let caps = caps_of(&display.capabilities().map_err(|e| e.to_string())?);
+        let capabilities = display.capabilities().map_err(|e| e.to_string())?;
+        let encoders: Arc<[EncoderSupport]> = encoder_support(&display).into();
+        let mut caps = caps_of(&capabilities);
+        caps.extend(encode::encode_caps_of(&encoders, &capabilities));
         if caps.is_empty() {
-            return Err("the driver decodes neither H.264 nor HEVC".to_owned());
+            return Err("the driver decodes and encodes neither H.264 nor HEVC".to_owned());
         }
         let writes_imports = display.import_writes();
         log::info!(
@@ -154,6 +164,7 @@ impl<P: Platform> VaapiVideo<P> {
             display,
             device: device.clone_ref(),
             caps,
+            encoders,
             writes_imports,
             imports,
         })
@@ -169,8 +180,25 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         layout(codec, &self.writes_imports)
     }
 
+    fn encode_caps(&self, codec: &RgfxVideoCodecCaps) -> RgfxVideoEncodeCaps {
+        encode::encode_caps(codec, &self.encoders)
+    }
+
     fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>> {
-        if direction != RGFX_VIDEO_DECODE || !self.caps.iter().any(|c| c.codec == codec) {
+        let entry = (self.caps.iter()).find(|c| c.codec == codec && c.direction == direction)?;
+        if direction == RGFX_VIDEO_ENCODE {
+            let caps = encode::encode_caps(entry, &self.encoders);
+            let encoder = encode::VaEncoder::new(
+                &self.display,
+                codec,
+                Arc::clone(&self.encoders),
+                entry,
+                &caps,
+            );
+            let session = HostEncodeSession::new(&self.device, codec, NAME, Box::new(encoder))?;
+            return Some(Arc::new(session));
+        }
+        if direction != RGFX_VIDEO_DECODE {
             return None;
         }
         let decoder = match codec {
@@ -283,8 +311,12 @@ fn hevc_caps(caps: &Capabilities) -> Option<RgfxVideoCodecCaps> {
 }
 
 /// How `codec`'s decode lands in place (module doc): granularity [2, 2], at the largest of the
-/// alignments the import check found for the codec's formats; all zero where it found none.
+/// alignments the import check found for the codec's formats; all zero where it found none, and
+/// for an encode, whose sources the CPU reads.
 pub(crate) fn layout(codec: &RgfxVideoCodecCaps, writes: &ImportWrites) -> RgfxVideoOutputLayout {
+    if codec.direction != RGFX_VIDEO_DECODE {
+        return RgfxVideoOutputLayout::default();
+    }
     let alignments = [
         (RGFX_VIDEO_FORMAT_NV12, writes.nv12()),
         (RGFX_VIDEO_FORMAT_P010, writes.p010()),

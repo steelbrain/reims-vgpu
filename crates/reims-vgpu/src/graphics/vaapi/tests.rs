@@ -119,6 +119,7 @@ fn a_profile_whose_config_decodes_none_of_its_formats_is_left_out() {
 fn the_layout_is_the_import_check_s_alignment() {
     let hevc = RgfxVideoCodecCaps {
         codec: RGFX_VIDEO_CODEC_HEVC,
+        direction: RGFX_VIDEO_DECODE,
         formats: RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010,
         ..RgfxVideoCodecCaps::default()
     };
@@ -138,6 +139,12 @@ fn the_layout_is_the_import_check_s_alignment() {
     let p010_only = ImportWrites::of_answers(Err("refused".to_owned()), Ok(ImportWrite::at(128)));
     assert_eq!(layout(&hevc, &p010_only).alignment, 128);
     assert_eq!(layout(&h264, &p010_only), RgfxVideoOutputLayout::default());
+    // An encode's sources are read by the CPU: no layout is asked of them.
+    let encode = RgfxVideoCodecCaps {
+        direction: RGFX_VIDEO_ENCODE,
+        ..hevc
+    };
+    assert_eq!(layout(&encode, &writes), RgfxVideoOutputLayout::default());
 }
 
 fn place(

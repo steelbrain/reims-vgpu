@@ -356,6 +356,12 @@ impl EncoderSettings {
         (size, (size / 4).saturating_mul(3))
     }
 
+    /// Holds the stream to its peak and buffer as a hard limit where `hard`, as
+    /// `DataRateLimits` does; to a peak alone otherwise.
+    pub fn set_hard_limit(&mut self, hard: bool) {
+        self.hard_limit = hard;
+    }
+
     /// The input format frames come in.
     pub fn input_format(&self) -> InputFormat {
         self.profile.input_format()
