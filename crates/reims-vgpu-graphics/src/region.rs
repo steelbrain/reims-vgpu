@@ -2,13 +2,15 @@
 //! at fixed offsets and the guest's allocations after them (`wire`).
 //!
 //! It is memory of the host's process: the platform's own where it gives the device some
-//! ([`Region::over`]; on Linux a shared mapping of a memfd of the library's, which every GPU
-//! imports, RADV through dma-bufs of its pages), else private anonymous memory (`mmap` with
-//! `MAP_PRIVATE | MAP_ANONYMOUS`, [`Region::new`]). Either is handed out zeroed and commits a page
-//! only when something first touches it, so a page neither the guest nor the host has used costs
-//! no host memory; a GPU import that pins the region commits what it pins. The host maps it into
-//! the guest once, at the device's start, and it stays mapped, at the same address, until the
-//! device's end.
+//! ([`Region::over`]; the Vulkan platform's, which it frees once the runtime holds no import of
+//! its pages: on Linux a shared mapping of a memfd of the library's, which every GPU imports,
+//! RADV through dma-bufs of its pages, and on macOS, or where the host gives no memfd, private
+//! memory of the library's), else private anonymous memory (`mmap` with
+//! `MAP_PRIVATE | MAP_ANONYMOUS`, [`Region::new`]), which its drop unmaps. Either is handed out
+//! zeroed and commits a page only when something first touches it, so a page neither the guest
+//! nor the host has used costs no host memory; a GPU import that pins the region commits what it
+//! pins. The host maps it into the guest once, at the device's start, and it stays mapped, at the
+//! same address, until the device's end.
 //!
 //! **Guest writes.** The guest writes the region while the host reads it. The host reads the
 //! rings' counters and flags with atomic loads and stores at their offsets, and copies out what a

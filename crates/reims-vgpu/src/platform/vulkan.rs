@@ -31,17 +31,30 @@ impl ApiPlatform for VulkanPlatform {
         }
     }
 
-    /// On Linux a shared mapping of a memfd of the library's
+    /// Memory of the library's own, which it frees through the platform's VM as the region
+    /// drops, so the unmap waits until the runtime has freed every import of its pages: the
+    /// region's last reference can go in a no-copy buffer's deallocator, which the runtime runs
+    /// before it frees the buffer's import. On Linux a shared mapping of a memfd
     /// (`reims_vgpu_vulkan::os::RegionMemory`): RADV takes no pointer to it and imports dma-bufs
     /// of its pages, which spares each of the device's submissions the walk of every page amdgpu
-    /// makes of a userptr import; a device that takes the pointer imports it as before. None on
-    /// macOS.
+    /// makes of a userptr import; a device that takes the pointer imports it as before. Where the
+    /// host gives no such mapping, and on macOS, private memory
+    /// (`reims_vgpu_vulkan::os::PrivateMemory`), which every GPU imports by its pointer.
     fn graphics_region(&self, len: usize) -> Option<reims_vgpu_graphics::region::Region> {
-        let memory = reims_vgpu_vulkan::os::RegionMemory::new(u64::try_from(len).ok()?)?;
+        let length = u64::try_from(len).ok()?;
+        if let Some(memory) = reims_vgpu_vulkan::os::RegionMemory::new(length) {
+            let base = memory.base();
+            // SAFETY: the memory's `len` bytes from its page-aligned first byte are fresh zeros of
+            // a mapping of its own, read and write, which nothing else reaches and which it unmaps
+            // only as it drops, after the region's last use.
+            return unsafe {
+                reims_vgpu_graphics::region::Region::over(base, len, Box::new(memory))
+            };
+        }
+        let memory = reims_vgpu_vulkan::os::PrivateMemory::new(length)?;
         let base = memory.base();
-        // SAFETY: the memory's `len` bytes from its page-aligned first byte are fresh zeros of a
-        // mapping of its own, read and write, which nothing else reaches and which it unmaps only
-        // as it drops, after the region's last use.
+        // SAFETY: as above: the memory's own fresh zeros, read and write, from its page-aligned
+        // first byte, deallocated only as it drops.
         unsafe { reims_vgpu_graphics::region::Region::over(base, len, Box::new(memory)) }
     }
 

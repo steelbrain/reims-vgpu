@@ -29,6 +29,8 @@ use macos as host_os;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
+use crate::core::platform::os::vm::{HostAddr, HostVm as _};
+
 /// Learns whether a device imports views of guest pages mapped through dma-bufs, on Linux
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]
@@ -104,6 +106,49 @@ pub struct GuestRamFile {
     pub offset: u64,
 }
 
+/// Pages of the library's own, private and zero-filled: the OS VM's allocation anywhere (Mach's on
+/// macOS, an anonymous mapping on Linux), which commits a page only when something first touches
+/// it, and which Metal and MoltenVK import in place, as RADV and ANV import it by its pointer.
+/// Its drop deallocates the pages through the platform's VM ([`crate::remap::VulkanVm`]), so the
+/// unmap waits until the runtime has freed every import of them ([`crate::remap::UnmapHold`]):
+/// the runtime runs a no-copy buffer's deallocator at Metal's moment and frees the buffer's import
+/// after it, and the deallocator may drop the memory's last holder, as a graphics device's region
+/// goes with the last reference its sink's deallocators hold.
+#[derive(Debug)]
+pub struct PrivateMemory {
+    /// The first byte.
+    first: HostAddr,
+    /// The length in bytes, whole pages.
+    length: u64,
+}
+
+impl PrivateMemory {
+    /// `len` bytes of zeros, rounded up to whole pages; `None` for none, or where the host gives
+    /// no address space.
+    pub fn new(len: u64) -> Option<PrivateMemory> {
+        let vm = OsVm::new();
+        let length = len.checked_next_multiple_of(vm.page_size())?;
+        if length == 0 {
+            return None;
+        }
+        let first = vm.allocate_anywhere(length).ok()?;
+        Some(PrivateMemory { first, length })
+    }
+
+    /// Its first byte.
+    pub fn base(&self) -> *mut u8 {
+        self.first.as_ptr()
+    }
+}
+
+impl Drop for PrivateMemory {
+    /// Deallocates the pages through the platform's VM, which leaves those an import holds mapped
+    /// until its hold goes.
+    fn drop(&mut self) {
+        let _ = crate::remap::VulkanVm::new().deallocate(self.first, self.length);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::core::platform::os::vm::HostVm as _;
@@ -116,6 +161,44 @@ pub(crate) mod tests {
     #[test]
     fn the_tests_page_is_the_hosts() {
         assert_eq!(OsVm::new().page_size(), PAGE);
+    }
+
+    /// Private memory whose pages a device's import holds stays mapped past its drop, until the
+    /// import's hold goes, as a graphics device's region does whose last reference goes in a
+    /// no-copy buffer's deallocator, before the runtime frees the buffer's import
+    #[test]
+    fn private_memory_an_import_holds_is_unmapped_once_its_hold_goes() {
+        let memory = PrivateMemory::new(2 * PAGE).unwrap();
+        let at = HostAddr::from_ptr(memory.base());
+        let held = at.wrapping_add(PAGE);
+        let hold = crate::remap::UnmapHold::new(
+            std::ptr::NonNull::new(held.as_ptr::<u8>()).unwrap(),
+            PAGE,
+        );
+        // SAFETY: a byte of the memory's second page, mapped read and write.
+        unsafe { held.as_ptr::<u8>().write_volatile(0x5a) };
+        drop(memory);
+        assert!(crate::remap::unmap_waits(at, 2 * PAGE), "the unmap waits");
+        // SAFETY: the held page stays mapped while the hold lives.
+        let byte = unsafe { held.as_ptr::<u8>().read_volatile() };
+        assert_eq!(byte, 0x5a, "the held page stays mapped");
+        drop(hold);
+        assert!(!crate::remap::unmap_waits(at, 2 * PAGE), "unmapped");
+    }
+
+    /// Private memory is whole pages of zeros, and none for no bytes
+    #[test]
+    fn private_memory_is_whole_pages_of_zeros() {
+        use crate::core::num::{ToU64 as _, ToUsize as _};
+
+        assert!(PrivateMemory::new(0).is_none());
+        let memory = PrivateMemory::new(PAGE + 1).unwrap();
+        assert_eq!(memory.length, 2 * PAGE);
+        let at = HostAddr::from_ptr(memory.base());
+        assert_eq!(at.addr().to_u64() % PAGE, 0, "page-aligned");
+        // SAFETY: the memory's two pages, mapped read and write.
+        let bytes = unsafe { std::slice::from_raw_parts(memory.base(), (2 * PAGE).to_usize()) };
+        assert!(bytes.iter().all(|&b| b == 0));
     }
 
     /// Each call takes whole pages as Mach's does, which this checks on macOS (measured on the M3

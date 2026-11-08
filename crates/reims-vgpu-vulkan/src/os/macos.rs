@@ -181,8 +181,9 @@ pub fn lease_guest_memory(_: impl IntoIterator<Item = super::GuestRamFile>) -> G
     GuestMemoryLease
 }
 
-/// A graphics device's region in memory of the platform's own: none on macOS, where the region's
-/// private anonymous memory is what Metal and MoltenVK import in place. Uninhabited.
+/// A graphics device's region in a mapping of a file in memory: none on macOS, where the region is
+/// private memory of the library's ([`super::PrivateMemory`]), which Metal and MoltenVK import in
+/// place. Uninhabited.
 #[derive(Debug)]
 pub enum RegionMemory {}
 
