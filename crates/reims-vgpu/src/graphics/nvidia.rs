@@ -1,13 +1,13 @@
 //! The reims-graphics device's hardware video on an NVIDIA GPU ([`open`]): NVDEC, through the
 //! NVIDIA crate's decoder of whole access units (`reims_vgpu_video_nvidia::AnnexBDecoder`), in
 //! the host's video sessions (`super::video_host`), whose event the host signals once a picture
-//! has landed.
+//! has landed; and NVENC, in the host's encode sessions (`encode`'s module doc).
 //!
 //! - **Which GPU.** The runtime device's own, by its PCI address, where the device is NVIDIA's
 //!   and CUDA opens the GPU there. Anywhere else the arm declines, with one line at info, and the
 //!   device's video goes to the next arm (`super::video_choice`). One video a runtime device,
 //!   shared by its sessions while one lives.
-//! - **The caps** are NVDEC's own answers (`cuvidGetDecoderCaps`): H.264's Baseline, Main and
+//! - **The decode caps** are NVDEC's own answers (`cuvidGetDecoderCaps`): H.264's Baseline, Main and
 //!   High where NVDEC decodes H.264 at 8 bits, and HEVC's Main where it decodes HEVC at 8 bits
 //!   and Main 10 where it does at 10, each into its format (NV12, P010), at the least of their
 //!   sizes. NVDEC answers no level, so the codec's top one: H.264's 6.2 and HEVC's 6.2.
@@ -43,9 +43,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 
 use reims_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_FORMAT_NV12,
-    RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN,
-    RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_ENCODE,
+    RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
+    RGFX_VIDEO_H264_MAIN, RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
+    RgfxVideoEncodeCaps,
 };
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::device::GpuDevice as _;
@@ -55,8 +56,9 @@ use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_video_core::device_memory::{DeviceImports, MemoryIdentity};
 use reims_vgpu_video_core::runtime::Runtime;
 use reims_vgpu_video_nvidia::{
-    AnnexBCodec, AnnexBDecoder, AnnexBPicture, ChromaFormat, DecodeCapabilities, DevicePlane, Gpu,
-    GpuSelector, ImportedBuffer, MemoryPlane, NvdecCodec, ReadPlane, decode_capabilities,
+    AnnexBCodec, AnnexBDecoder, AnnexBPicture, ChromaFormat, DecodeCapabilities, DevicePlane,
+    EncodeProfileSupport, Gpu, GpuSelector, ImportedBuffer, MemoryPlane, NvdecCodec, ReadPlane,
+    decode_capabilities, encode_profiles,
 };
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
@@ -64,14 +66,20 @@ use reims_vgpu_vulkan::gpu::resource::VulkanBuffer;
 
 use super::decode::{GraphicsVideo, GraphicsVideoSession, PlanePages};
 use super::video_host::{
-    BackendError, HostDecoder, HostPicture, HostVideoSession, Landing, OutputPlane, SourcePlane,
+    BackendError, HostDecoder, HostEncodeSession, HostPicture, HostVideoSession, Landing,
+    OutputPlane, SourcePlane,
 };
+
+mod encode;
 
 /// The PCI vendor ID of NVIDIA's GPUs.
 const NVIDIA_VENDOR: u32 = 0x10de;
 
 /// What the log calls the arm.
 const NAME: &str = "NVDEC";
+
+/// What the log calls its encode.
+const ENCODE_NAME: &str = "NVENC";
 
 /// H.264's top level, 6.2 (`level_idc`).
 const H264_TOP_LEVEL: u32 = 62;
@@ -94,8 +102,8 @@ type MadeVideos = Vec<(u64, Weak<NvidiaVideo>)>;
 
 /// NVDEC's video for `device`'s sessions: the one they share, made on first use, the NVIDIA
 /// crate's threads and waits `runtime`'s unless its decoders made before took another's; `None`,
-/// with a line at info, where the device is not an NVIDIA GPU CUDA opens, or NVDEC decodes neither H.264
-/// nor HEVC there.
+/// with a line at info, where the device is not an NVIDIA GPU CUDA opens, or NVDEC decodes and
+/// NVENC encodes neither H.264 nor HEVC there.
 pub(crate) fn open(
     device: &VulkanDevice,
     runtime: &Arc<dyn Runtime>,
@@ -129,6 +137,9 @@ struct NvidiaVideo {
     h264: Option<RgfxVideoCodecCaps>,
     /// The caps of HEVC's decode; `None` where NVDEC has none.
     hevc: Option<RgfxVideoCodecCaps>,
+    /// The profiles NVENC encodes, and the encode entries they give (`encode`'s module doc).
+    encoders: Vec<EncodeProfileSupport>,
+    encode: Vec<RgfxVideoCodecCaps>,
     /// The video crates' runtime: the threads and the clock of the NVIDIA crate's waits.
     runtime: Arc<dyn Runtime>,
     /// CUDA's imports of the device caches pictures land in, by each cache's identity; `None`
@@ -202,9 +213,18 @@ impl NvidiaVideo {
                 }
             })
         };
-        if h264.is_none() && hevc.is_none() {
+        let encoders = match encode_profiles(Arc::clone(&gpu)) {
+            Ok(encoders) => encoders,
+            Err(error) => {
+                log::info!("hardware video: no {ENCODE_NAME} at {address}: {error}");
+                Vec::new()
+            }
+        };
+        let encode = encode::encode_caps_of(&encoders);
+        if h264.is_none() && hevc.is_none() && encode.is_empty() {
             log::info!(
-                "hardware video: not on {NAME}: it decodes neither H.264 nor HEVC at {address}"
+                "hardware video: not on {NAME}: it decodes and {ENCODE_NAME} encodes neither \
+                 H.264 nor HEVC at {address}"
             );
             return None;
         }
@@ -218,12 +238,30 @@ impl NvidiaVideo {
                 None => "no",
             },
         );
+        let encodes = |codec| {
+            (encode.iter()).find(|c| c.codec == codec).map_or_else(
+                || "no".to_owned(),
+                |c| {
+                    format!(
+                        "profiles {:#x} up to {}x{}",
+                        c.profiles, c.max_size[0], c.max_size[1]
+                    )
+                },
+            )
+        };
+        log::info!(
+            "hardware video: {ENCODE_NAME} at {address}: H.264 {}, HEVC {}",
+            encodes(RGFX_VIDEO_CODEC_H264),
+            encodes(RGFX_VIDEO_CODEC_HEVC),
+        );
         let imports = imports_caches(device, &gpu, runtime);
         Some(Self {
             gpu,
             device: device.clone_ref(),
             h264,
             hevc,
+            encoders,
+            encode,
             runtime: Arc::clone(runtime),
             imports,
         })
@@ -323,7 +361,12 @@ fn decode_caps(codec: u32, answered: &[DecodeCapabilities]) -> RgfxVideoCodecCap
 
 impl GraphicsVideo<VulkanPlatform> for Shared {
     fn caps(&self) -> Vec<RgfxVideoCodecCaps> {
-        self.0.h264.into_iter().chain(self.0.hevc).collect()
+        let decode = self.0.h264.into_iter().chain(self.0.hevc);
+        decode.chain(self.0.encode.iter().copied()).collect()
+    }
+
+    fn encode_caps(&self, codec: &RgfxVideoCodecCaps) -> RgfxVideoEncodeCaps {
+        encode::encode_caps(codec, &self.0.encoders)
     }
 
     fn session(
@@ -332,6 +375,15 @@ impl GraphicsVideo<VulkanPlatform> for Shared {
         direction: u32,
     ) -> Option<Arc<dyn GraphicsVideoSession<VulkanPlatform>>> {
         let video = &self.0;
+        if direction == RGFX_VIDEO_ENCODE {
+            let entry = (video.encode.iter()).find(|c| c.codec == codec)?;
+            let caps = encode::encode_caps(entry, &video.encoders);
+            let encoder =
+                encode::NvencHostEncoder::new(&video.gpu, codec, &video.encoders, entry, &caps);
+            let session =
+                HostEncodeSession::new(&video.device, codec, ENCODE_NAME, Box::new(encoder))?;
+            return Some(Arc::new(session));
+        }
         let annex_b = match codec {
             _ if direction != RGFX_VIDEO_DECODE => return None,
             RGFX_VIDEO_CODEC_H264 if video.h264.is_some() => AnnexBCodec::H264,

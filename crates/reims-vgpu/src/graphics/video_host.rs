@@ -873,7 +873,7 @@ fn land<P: Platform>(
 
 mod encode;
 
-// The arms' side of an encode session, which the VA-API arm alone drives.
+// The arms' side of an encode session, which the VA-API and NVENC arms drive.
 #[cfg(target_os = "linux")]
 pub(crate) use encode::{
     EncodeFrame, EncodeSource, Encoded, HostEncodeSession, HostEncodedFrame, HostEncoder,
