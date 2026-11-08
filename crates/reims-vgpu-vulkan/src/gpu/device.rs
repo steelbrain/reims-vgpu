@@ -1271,7 +1271,16 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 send(sel, Policy::Dies, || {
                     match self.raw.new_library_with_data(data) {
                         Ok(raw) => Ok(Ok(raw)),
-                        Err(rt::Error::Compile(metal2vulkan::error::Error::InvalidInput(_))) => {
+                        Err(
+                            e @ rt::Error::Compile(metal2vulkan::error::Error::InvalidInput(_)),
+                        ) => {
+                            // Metal's NSError names no cause; the runtime's names its check and
+                            // the offset in the file.
+                            log::info!(
+                                target: "reims_vgpu_vulkan::gpu",
+                                "{sel} refused {} bytes as no metallib: {e}",
+                                data.len()
+                            );
                             Ok(Err(invalid_library_file()))
                         }
                         Err(e) if relay_gap(sel, &e, None) => Ok(Err(error_text(&e))),
