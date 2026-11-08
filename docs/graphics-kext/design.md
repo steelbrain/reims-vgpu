@@ -1491,8 +1491,12 @@ enabled, the host sends `VBLANK` at each refresh of the window's screen.
 **Refresh times.** The host stamps each `VBLANK` with its refresh's time on
 the display's grid, a period after the one before, on its monotonic clock. It
 answers a `PRESENT_SURFACE` in the refresh that shows its surface, right after
-that refresh's `VBLANK`. The kext maps each `VBLANK`'s host time into the
-guest's `mach_absolute_time` by the clocks' offset
+that refresh's `VBLANK`: the first refresh after the command buffers that write
+the surface have finished, whether or not the host's window has drawn it yet.
+An answer frees the surfaces of the presents before it, never its own, so the
+host holds it only while a window draw still running may read one of those
+(`crates/reims-vgpu/src/graphics/present.rs`). The kext maps each `VBLANK`'s
+host time into the guest's `mach_absolute_time` by the clocks' offset
 (`guest/kext/src/RgfxVblankClock.hpp`). Where it took `HOST_TIME`, it reads
 the host's clock at each `VBLANK`, `HOST_TIME_LO` between two reads of its
 own, and maps by the reading whose round trip bounds the offset closest, that

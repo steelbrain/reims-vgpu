@@ -695,8 +695,9 @@ pub(crate) enum Shows<P: Platform> {
 
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
 /// the decoder made over it, which the window's sink draws into the next drawable (`sink`), and
-/// the presents' answers, given at the first refresh of the device's display after that draw has
-/// finished ([`PresentAnswers`]). The window draws a present when it is made, and again where the
+/// the presents' answers, given at the first refresh of the device's display after their show,
+/// once no draw of the window still running may read the surface of a present before them
+/// ([`PresentAnswers`]). The window draws a present when it is made, and again where the
 /// window needs a frame (a new layout, the cursor): each present is the guest's own, and none is
 /// batched or repeated by the GPU's work. The texture's block is held until the next present, the
 /// device's reset or the device's end, and each draw of it until it has finished
@@ -902,8 +903,8 @@ impl<P: Platform> Presented<P> {
         }
     }
 
-    /// The window draws the latest present: the presents shown so far, answered once the draw has
-    /// finished, or once it is dropped undone ([`DrawnPresents`]).
+    /// The window draws the latest present: the presents shown after it are answered once the
+    /// draw has finished, or once it is dropped undone ([`DrawnPresents`]).
     pub(crate) fn drawn(self: &Arc<Self>) -> DrawnPresents<P> {
         DrawnPresents {
             presented: Arc::clone(self),
@@ -955,14 +956,14 @@ impl<P: Platform> Presented<P> {
     }
 }
 
-/// The presents a window's draw shows: answered at the refresh after the draw has finished on the
-/// GPU ([`DrawnPresents::after`]), or after the draw is dropped before its commit, once every
-/// present shown before them is ([`PresentAnswers::refreshed`]); and the hold of the block of the
-/// surface it draws, let go of then too.
+/// What a window's draw holds of the presents until it has finished on the GPU
+/// ([`DrawnPresents::after`]), or is dropped before its commit: the answers of the presents shown
+/// after the latest one when it began, whose surface it may read ([`PresentAnswers::drawn`]),
+/// and the hold of the block of the surface it draws, let go of then too.
 pub(crate) struct DrawnPresents<P: Platform> {
     /// Where they are answered.
     presented: Arc<Presented<P>>,
-    /// The presents the draw took.
+    /// The presents the draw took, and the answers it holds.
     drawing: Drawing,
     /// The hold of the block of the surface the draw reads, where it reads one.
     hold: Option<Arc<DisplayHold>>,
@@ -974,9 +975,9 @@ impl<P: Platform> DrawnPresents<P> {
         self.hold = Some(hold);
     }
 
-    /// The presents are answered, and the surface's block let go of, after `command_buffer`, the
+    /// The answers it holds, and the surface's block, are let go of after `command_buffer`, the
     /// draw, has finished: its completed handler holds them. Called before its commit; where the
-    /// handler is refused, or the buffer is never committed, they are answered as if it had
+    /// handler is refused, or the buffer is never committed, they are let go of as if it had
     /// finished.
     pub(crate) fn after(self, command_buffer: &P::CommandBuffer) {
         if self.drawing.is_empty() && self.hold.is_none() {

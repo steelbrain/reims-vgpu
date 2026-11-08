@@ -46,25 +46,27 @@
 //! [`PresentAnswers`]: when a shown present is answered. The guest's display pipe completes a
 //! transaction on its answer, and holds at most two unanswered (the kext's `RgfxDisplayPipe`),
 //! so the answer says the frame is on the display, as a display's flip completes at the vblank
-//! that latches it: it is given at the first refresh of the device's display (the refresh thread,
-//! [`reims_vgpu_graphics::Host::refreshed`], after that refresh's `VBLANK`) once the window's draw of
-//! it has finished on the host's GPU, the copy out of the surface done, so the guest may draw
-//! into the surface again. A draw the window drops before its commit, or one that shows the
-//! scanout in place of a surface it cannot draw, answers its presents at the next refresh too.
-//! A present the window has not drawn by the second refresh after it was shown (the window is
-//! hidden, or takes no drawable) is answered there: the device's display shows it whether or not
-//! the host's window does, and the guest's compositor must not wait on the window. A guest that
-//! presents once a vblank so never meets its limit of two: a frame drawn as it is made is
-//! answered at the next vblank, and one the window does not draw at the second.
+//! that latches it: it is given at the first refresh of the device's display after its show (the
+//! refresh thread, [`reims_vgpu_graphics::Host::refreshed`], after that refresh's `VBLANK`),
+//! whether or not the host's window has drawn it yet: the device's display shows it from that
+//! refresh on, whatever the window does, and the guest's compositor must not wait on the window.
+//! A guest that presents once a vblank so never meets its limit of two: each frame is answered at
+//! the vblank after its show, as a Mac's display answers a flip at the vblank that latches it.
 //!
-//! The answers go in the order the presents were shown, none while the window's draw of an
-//! earlier present still runs: the guest completes its transactions oldest first, so a later
-//! present's answer completes every earlier one too and frees its surface for the guest's
-//! compositor to draw into, while the window's draw may still be copying out of it. Answered
-//! out of order, a present the window had not drawn by its second refresh freed the surface
-//! of a draw still running on the GPU; the compositor's next frame then landed in it under the
-//! copy, and the window showed that newer frame, then the older one it had presented between,
-//! then the newer again.
+//! What an answer frees is the surface of every present before it, never its own: the guest
+//! completes its transactions oldest first, and a transaction's completion tells its compositor
+//! that the surface it showed is on the display, and that the surfaces shown before it are not,
+//! so the compositor draws into those again, as it would on a Mac whose display scans the shown
+//! surface out until the next flip. So the answers go in the order the presents were shown, and
+//! none while the window's draw of an earlier present still runs, which may still be copying out
+//! of that present's surface; a present whose own draw still runs is answered, and holds the
+//! answers after it until its draw has finished. Answered out of order, a present the window had
+//! not drawn freed the surface of a draw still running on the GPU; the compositor's next frame
+//! then landed in it under the copy, and the window showed that newer frame, then the older one
+//! it had presented between, then the newer again. Waiting for a present's own draw instead held
+//! its answer a refresh where the draw ended past the first refresh after its show (an RTX 5080
+//! Laptop GPU at 30 frames a second: the show 6.0 ms after a 120 Hz refresh, the draw done 5.2 ms
+//! later), which the guest saw as a frame a refresh late.
 //!
 //! **Where a present's time goes.** Each answer is logged at debug, on [`TIMING`]'s target:
 //! how long after the device's last refresh its `PRESENT_SURFACE` was taken, how long it waited
@@ -423,16 +425,17 @@ struct AnswersState<A> {
     /// The presents shown and not yet answered, in the order shown, their numbers counting up
     /// from the front's.
     owed: VecDeque<Owed<A>>,
+    /// The window's draws that have not finished, each by the number of the latest present shown
+    /// when it began: it may read that present's surface, or a later one's, and no earlier one's.
+    reading: Vec<u64>,
 }
 
 /// A present shown and not yet answered.
 struct Owed<A> {
     answer: A,
-    /// The refresh count at its show.
-    shown_at: u64,
-    /// Where the window's draw of it is.
-    draw: Draw,
-    /// When it was taken, shown, and its draw finished (or was dropped).
+    /// Whether a window draw has taken it ([`PresentAnswers::drawn`]), for its timing line.
+    taken_by_draw: bool,
+    /// When it was taken, shown, and the first draw that took it finished (or was dropped).
     taken: Taken,
     shown: MonoTime,
     drawn: Option<MonoTime>,
@@ -456,6 +459,8 @@ pub(crate) struct Taken {
 struct Timing {
     taken: Taken,
     shown: MonoTime,
+    /// Whether a window draw had taken it by its answer, and when that draw finished.
+    taken_by_draw: bool,
     drawn: Option<MonoTime>,
     /// The refresh that answered it, and when.
     refresh: u64,
@@ -471,9 +476,12 @@ impl Timing {
             Some(since) => format!("{} us after refresh {}", since.as_micros(), taken.refreshes),
             None => "before the first refresh".to_owned(),
         };
-        let drawn = match self.drawn {
-            Some(drawn) => format!("its draw done {} us after its show", us(self.shown, drawn)),
-            None => "undrawn".to_owned(),
+        let drawn = match (self.drawn, self.taken_by_draw) {
+            (Some(drawn), _) => {
+                format!("its draw done {} us after its show", us(self.shown, drawn))
+            }
+            (None, true) => "its draw running".to_owned(),
+            (None, false) => "undrawn".to_owned(),
         };
         log::debug!(
             target: TIMING,
@@ -487,26 +495,20 @@ impl Timing {
     }
 }
 
-/// Where the window's draw of a present is.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Draw {
-    /// The window has not taken it.
-    Not,
-    /// A draw took it and has not finished.
-    Running,
-    /// Its draw finished on the GPU, or will not come.
-    Done,
+/// What a draw of the window holds in [`PresentAnswers`] ([`PresentAnswers::drawn`]), which it
+/// hands back once it has finished or will not ([`PresentAnswers::done`]): the presents it took,
+/// by their numbers, for their timing lines, and the number of the latest present shown when it
+/// began, whose surface or a later one's it may read, where any was.
+#[derive(Debug, Default)]
+pub(crate) struct Drawing {
+    took: std::ops::Range<u64>,
+    reads: Option<u64>,
 }
 
-/// The presents a draw of the window took ([`PresentAnswers::drawn`]), by their numbers, which
-/// it hands back once it has finished or will not ([`PresentAnswers::done`]).
-#[derive(Debug, Default)]
-pub(crate) struct Drawing(std::ops::Range<u64>);
-
 impl Drawing {
-    /// Whether the draw took no present.
+    /// Whether the draw took no present and holds no answer: none was shown when it began.
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.took.is_empty() && self.reads.is_none()
     }
 }
 
@@ -519,6 +521,7 @@ impl<A> PresentAnswers<A> {
                 last_refresh: None,
                 next: 0,
                 owed: VecDeque::new(),
+                reading: Vec::new(),
             }),
             now,
         }
@@ -549,59 +552,70 @@ impl<A: Answer> PresentAnswers<A> {
     pub(crate) fn shown(&self, answer: A, taken: Taken) {
         let shown = (self.now)();
         let mut state = self.state.lock();
-        let shown_at = state.refreshes;
         state.next += 1;
         state.owed.push_back(Owed {
             answer,
-            shown_at,
-            draw: Draw::Not,
+            taken_by_draw: false,
             taken,
             shown,
             drawn: None,
         });
     }
 
-    /// The window draws the latest present: every present shown so far that no draw took, which
-    /// the draw hands back to [`Self::done`] once it has finished or will not.
+    /// The window draws the latest present: it takes every present shown so far that no draw
+    /// took, and, until it hands its [`Drawing`] back to [`Self::done`], holds the answer of every
+    /// present shown after the latest one now, whose surface it may read.
     pub(crate) fn drawn(&self) -> Drawing {
         let mut state = self.state.lock();
         let end = state.next;
         let mut first = end;
         for (owed, number) in state.owed.iter_mut().rev().zip((0..end).rev()) {
-            if owed.draw != Draw::Not {
+            if owed.taken_by_draw {
                 break;
             }
-            owed.draw = Draw::Running;
+            owed.taken_by_draw = true;
             first = number;
         }
-        Drawing(first..end)
+        let reads = end.checked_sub(1);
+        if let Some(latest) = reads {
+            state.reading.push(latest);
+        }
+        Drawing {
+            took: first..end,
+            reads,
+        }
     }
 
-    /// The draw that took `drawing`'s presents has finished on the GPU, or will not come: they
-    /// are answered at the next refresh, once every present shown before them is.
+    /// The draw `drawing` has finished on the GPU, or will not come: the presents after the one
+    /// it may read are no longer held by it.
     pub(crate) fn done(&self, drawing: Drawing) {
         if drawing.is_empty() {
             return;
         }
         let drawn = (self.now)();
         let mut state = self.state.lock();
+        if let Some(reads) = drawing.reads
+            && let Some(i) = state.reading.iter().position(|&r| r == reads)
+        {
+            state.reading.swap_remove(i);
+        }
         let front = state.next - state.owed.len().to_u64();
-        for number in drawing.0 {
+        for number in drawing.took {
             if let Some(owed) = number
                 .checked_sub(front)
                 .and_then(|i| state.owed.get_mut(i.to_usize()))
+                && owed.drawn.is_none()
             {
-                owed.draw = Draw::Done;
                 owed.drawn = Some(drawn);
             }
         }
     }
 
-    /// A refresh of the device's display: the presents whose draw has finished are answered, and
-    /// those no draw took by the second refresh after their show, oldest first, up to the first
-    /// whose draw still runs or that is not yet due. The guest completes its transactions oldest
-    /// first, so an answer frees every earlier present's surface for the guest to draw into: none
-    /// is given while the window's draw of an earlier one still reads its surface.
+    /// A refresh of the device's display: the presents shown before it are answered, oldest
+    /// first, but those after one whose surface a window draw still running may read. The guest
+    /// completes its transactions oldest first, and an answer frees the surfaces of the presents
+    /// before it for the guest to draw into, never its own: none is given while the window may
+    /// still read one of those surfaces.
     pub(crate) fn refreshed(&self) {
         let at = (self.now)();
         let timed = log::log_enabled!(target: TIMING, log::Level::Debug);
@@ -611,21 +625,17 @@ impl<A: Answer> PresentAnswers<A> {
             state.refreshes += 1;
             state.last_refresh = Some(at);
             let now = state.refreshes;
+            // The latest present a running draw may read: those after it wait for the draw.
+            let held_after = state.reading.iter().copied().min();
+            let mut number = state.next - state.owed.len().to_u64();
             let mut answers = Vec::new();
-            while let Some(front) = state.owed.front() {
-                let due = match front.draw {
-                    Draw::Done => true,
-                    Draw::Not => front.shown_at + 2 <= now,
-                    Draw::Running => false,
-                };
-                if !due {
-                    break;
-                }
+            while !state.owed.is_empty() && held_after.is_none_or(|r| number <= r) {
                 if let Some(owed) = state.owed.pop_front() {
                     if timed {
                         timings.push(Timing {
                             taken: owed.taken,
                             shown: owed.shown,
+                            taken_by_draw: owed.taken_by_draw,
                             drawn: owed.drawn,
                             refresh: now,
                             at,
@@ -633,6 +643,7 @@ impl<A: Answer> PresentAnswers<A> {
                     }
                     answers.push(owed.answer);
                 }
+                number += 1;
             }
             answers
         };
@@ -729,33 +740,98 @@ mod tests {
         (waited, answered)
     }
 
-    /// A guest presenting once a vblank never waits on its limit of two: a frame the window draws
-    /// as it is shown is answered at the next refresh, one whose draw finishes a refresh late at
-    /// the one after, and one a hidden window never draws at the second
+    /// A guest presenting once a vblank never waits on its limit of two: each frame is answered
+    /// at the refresh after its show, whether the window's draw of it finishes before that
+    /// refresh, only after it, or never comes (a hidden window), as a Mac's display completes a
+    /// flip at the vblank that latches it
     #[test]
-    fn a_present_is_answered_at_the_vblank_it_is_first_shown() {
-        for (window, delay) in [
-            (Window::Draws, 1u64),
-            (Window::DrawsLate, 2),
-            (Window::Hidden, 2),
-        ] {
+    fn a_present_is_answered_at_the_vblank_after_its_show() {
+        for window in [Window::Draws, Window::DrawsLate, Window::Hidden] {
             let (waited, answered) = guest_at_the_limit(window, 12);
             assert!(
                 waited.is_empty(),
                 "the guest waited on its limit at {waited:?}"
             );
-            assert_eq!(answered.len() as u64, 12 - delay, "a frame went unanswered");
+            assert_eq!(answered.len(), 11, "a frame went unanswered");
             for (frame, shown, at) in answered {
-                assert_eq!(at, shown + delay, "frame {frame}'s answer");
+                assert_eq!(at, shown + 1, "frame {frame}'s answer");
             }
         }
     }
 
-    /// No present is answered while one shown before it waits for its draw to finish: the guest
-    /// completes its transactions oldest first, so a later present's answer would free the
-    /// earlier one's surface for the guest to draw into while the window's draw still reads it
+    /// What an answer frees is the surface of every present before it, never its own: a guest
+    /// that draws into a surface again only once the answer of a present after the one that last
+    /// showed it has come never draws into a surface a window draw still reads, however slow the
+    /// window's draws are, each reading the latest surface shown and running up to four refreshes
     #[test]
-    fn a_late_answer_never_overtakes_a_draw_still_running() {
+    fn the_guest_never_draws_into_a_surface_a_window_draw_still_reads() {
+        // The compositor's surfaces, which its frames take in turn.
+        const SURFACES: usize = 3;
+        for slow in [0u64, 1, 2, 4] {
+            let answers = PresentAnswers::<Recorded>::default();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let refresh = Arc::new(Mutex::new(0u64));
+            // The window's draws still running: the surface each reads, the refresh it finishes
+            // just before, and what it holds.
+            let mut running: Vec<(usize, u64, Drawing)> = Vec::new();
+            let mut frames = 0usize;
+            let mut writes = 0usize;
+            for r in 1..=80u64 {
+                let (finished, still): (Vec<_>, Vec<_>) =
+                    running.into_iter().partition(|(_, end, _)| *end <= r);
+                running = still;
+                for (_, _, drawing) in finished {
+                    answers.done(drawing);
+                }
+                *refresh.lock() = r;
+                answers.refreshed();
+                let answered = log.lock().len();
+                // Frame f draws into surface f % SURFACES, which frame f - SURFACES showed last:
+                // free once a present after that one is answered, with at most two unanswered.
+                let freed = frames < SURFACES || frames - SURFACES + 2 <= answered;
+                if !freed || frames - answered >= 2 {
+                    continue;
+                }
+                let surface = frames % SURFACES;
+                assert!(
+                    running.iter().all(|(read, _, _)| *read != surface),
+                    "slow {slow}: at refresh {r} frame {frames} draws into surface {surface}, \
+                     which a window draw still reads"
+                );
+                writes += 1;
+                answers.shown(
+                    Recorded {
+                        frame: frames,
+                        log: Arc::clone(&log),
+                        refresh: Arc::clone(&refresh),
+                    },
+                    answers.taken(),
+                );
+                frames += 1;
+                // The window draws the frame just shown, finishing `slow` refreshes on.
+                running.push((surface, r + 1 + slow, answers.drawn()));
+            }
+            assert!(
+                writes >= (80 / (slow + 2)) as usize,
+                "slow {slow}: the guest drew only {writes} frames in 80 refreshes"
+            );
+            if slow == 0 {
+                for &(frame, at) in log.lock().iter() {
+                    assert!(
+                        at <= frame as u64 + 2,
+                        "frame {frame} answered at refresh {at}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// No present after one whose surface a window draw still reads is answered until that draw
+    /// finishes, however many refreshes it takes: the later present's answer would free that
+    /// surface for the guest to draw into under the copy. The present whose surface the draw
+    /// reads is answered at the refresh after its show
+    #[test]
+    fn a_later_answer_waits_for_a_draw_of_an_earlier_surface() {
         let answers = PresentAnswers::<Recorded>::default();
         let log = Arc::new(Mutex::new(Vec::new()));
         let refresh = Arc::new(Mutex::new(0u64));
@@ -772,19 +848,19 @@ mod tests {
             *refresh.lock() = r;
             answers.refreshed();
         }
-        assert!(
-            log.lock().is_empty(),
-            "frame 1 answered while frame 0's draw runs: {:?}",
-            log.lock()
+        assert_eq!(
+            *log.lock(),
+            [(0, 1)],
+            "frame 1 answered while frame 0's draw runs"
         );
         answers.done(drawing);
         *refresh.lock() = 4;
         answers.refreshed();
-        assert_eq!(*log.lock(), [(0, 4), (1, 4)]);
+        assert_eq!(*log.lock(), [(0, 1), (1, 4)]);
     }
 
-    /// A later draw that finishes, or is dropped, first waits for the earlier one still running:
-    /// both are answered at the refresh after the earlier finishes, in order
+    /// A later draw that finishes, or is dropped, first does not let go of what an earlier one
+    /// still running holds: the presents after the earlier one's surface wait for it
     #[test]
     fn a_later_draw_done_first_waits_for_the_earlier() {
         let answers = PresentAnswers::<Recorded>::default();
@@ -799,25 +875,31 @@ mod tests {
         let first = answers.drawn();
         answers.shown(rec(1), answers.taken());
         let second = answers.drawn();
+        answers.shown(rec(2), answers.taken());
         answers.done(second);
         for r in 1..=3 {
             *refresh.lock() = r;
             answers.refreshed();
         }
-        assert!(log.lock().is_empty(), "answered: {:?}", log.lock());
+        assert_eq!(
+            *log.lock(),
+            [(0, 1)],
+            "answered past the earlier draw's surface"
+        );
         answers.done(first);
         *refresh.lock() = 4;
         answers.refreshed();
-        assert_eq!(*log.lock(), [(0, 4), (1, 4)]);
+        assert_eq!(*log.lock(), [(0, 1), (1, 4), (2, 4)]);
     }
 
-    /// A present is never answered before the window's draw of it has finished, while the
-    /// window draws: a draw still running at the second refresh holds its answers
+    /// A draw that began before any present was shown reads the scanout, and holds no answer
     #[test]
-    fn a_drawn_present_waits_for_its_draw() {
+    fn a_draw_before_any_present_holds_none() {
         let answers = PresentAnswers::<Recorded>::default();
         let log = Arc::new(Mutex::new(Vec::new()));
         let refresh = Arc::new(Mutex::new(0u64));
+        let drawing = answers.drawn();
+        assert!(drawing.is_empty());
         answers.shown(
             Recorded {
                 frame: 0,
@@ -826,21 +908,14 @@ mod tests {
             },
             answers.taken(),
         );
-        let drawing = answers.drawn();
-        for r in 1..=3 {
-            *refresh.lock() = r;
-            answers.refreshed();
-        }
-        assert!(log.lock().is_empty());
-        answers.done(drawing);
-        assert!(log.lock().is_empty(), "answered before the refresh");
-        *refresh.lock() = 4;
+        *refresh.lock() = 1;
         answers.refreshed();
-        assert_eq!(*log.lock(), [(0, 4)]);
+        assert_eq!(*log.lock(), [(0, 1)]);
+        answers.done(drawing);
     }
 
     /// Each answer logs at debug where its present's time went: the refresh it was taken after,
-    /// its draw's end, and the refresh that answered it, counted from its take
+    /// where the window's draw of it was, and the refresh that answered it, counted from its take
     #[test]
     fn each_answer_logs_its_timing_at_debug() {
         let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
@@ -861,10 +936,14 @@ mod tests {
         let drawing = answers.drawn();
         answers.done(drawing);
         answers.refreshed();
-        // Taken after refresh 1, never drawn: answered at the second refresh after its show.
+        // Taken after refresh 1, never drawn: answered at the next refresh.
         answers.shown(rec(1), answers.taken());
         answers.refreshed();
+        // Taken after refresh 2, its draw still running at the next.
+        answers.shown(rec(2), answers.taken());
+        let drawing = answers.drawn();
         answers.refreshed();
+        answers.done(drawing);
         let lines: Vec<String> = (logs.take().into_iter())
             .filter(|(level, target, _)| *level == log::Level::Debug && target == TIMING)
             .map(|(_, _, line)| line)
@@ -876,10 +955,12 @@ mod tests {
                  done 100 us after its show, answered at refresh 1 (1 after its take), 300 us \
                  after its take",
                 "a present taken 100 us after refresh 1: shown 100 us after its take, undrawn, \
-                 answered at refresh 3 (2 after its take), 300 us after its take",
+                 answered at refresh 2 (1 after its take), 200 us after its take",
+                "a present taken 100 us after refresh 2: shown 100 us after its take, its draw \
+                 running, answered at refresh 3 (1 after its take), 200 us after its take",
             ]
         );
         drop(logs);
-        assert_eq!(log.lock().len(), 2, "both answered");
+        assert_eq!(log.lock().len(), 3, "all answered");
     }
 }
