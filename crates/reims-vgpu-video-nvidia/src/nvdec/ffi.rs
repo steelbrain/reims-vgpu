@@ -1,6 +1,6 @@
 //! NVDEC's declarations (libnvcuvid's decoder half, `cuviddec.h`), the
 //! subset this crate uses: capabilities, the decoder, picture parameters
-//! for H.264, HEVC, VP9 and AV1, mapping and status. NVIDIA's parser
+//! for H.264 and HEVC, mapping and status. NVIDIA's parser
 //! (`nvcuvid.h`) is not used: our own parsers fill the picture parameters.
 //!
 //! Field names are the header's, so that `crate::layout`'s test can check
@@ -320,151 +320,6 @@ pub(crate) struct CUVIDHEVCPICPARAMS {
     pub(crate) ScalingListDCCoeff32x32: [u8; 2],
 }
 
-/// `CUVIDVP9PICPARAMS`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CUVIDVP9PICPARAMS {
-    pub(crate) width: c_uint,
-    pub(crate) height: c_uint,
-    pub(crate) LastRefIdx: u8,
-    pub(crate) GoldenRefIdx: u8,
-    pub(crate) AltRefIdx: u8,
-    pub(crate) colorSpace: u8,
-    /// `profile` to `reserved2Bits`: [`bits::vp9_frame`]. Name is ours.
-    pub(crate) frame_word: c_ushort,
-    pub(crate) reserved16Bits: c_ushort,
-    pub(crate) refFrameSignBias: [u8; 4],
-    pub(crate) bitDepthMinus8Luma: u8,
-    pub(crate) bitDepthMinus8Chroma: u8,
-    pub(crate) loopFilterLevel: u8,
-    pub(crate) loopFilterSharpness: u8,
-    pub(crate) modeRefLfEnabled: u8,
-    pub(crate) log2_tile_columns: u8,
-    pub(crate) log2_tile_rows: u8,
-    /// `segmentEnabled` to `reserved4Bits`: [`bits::vp9_segment`]. Name is
-    /// ours.
-    pub(crate) segment_word: u8,
-    pub(crate) segmentFeatureEnable: [[u8; 4]; 8],
-    pub(crate) segmentFeatureData: [[c_short; 4]; 8],
-    pub(crate) mb_segment_tree_probs: [u8; 7],
-    pub(crate) segment_pred_probs: [u8; 3],
-    pub(crate) reservedSegment16Bits: [u8; 2],
-    pub(crate) qpYAc: c_int,
-    pub(crate) qpYDc: c_int,
-    pub(crate) qpChDc: c_int,
-    pub(crate) qpChAc: c_int,
-    pub(crate) activeRefIdx: [c_uint; 3],
-    pub(crate) resetFrameContext: c_uint,
-    pub(crate) mcomp_filter_type: c_uint,
-    pub(crate) mbRefLfDelta: [c_uint; 4],
-    pub(crate) mbModeLfDelta: [c_uint; 2],
-    pub(crate) frameTagSize: c_uint,
-    pub(crate) offsetToDctParts: c_uint,
-    pub(crate) reserved128Bits: [c_uint; 4],
-}
-
-/// One entry of `CUVIDAV1PICPARAMS::ref_frame`. Name is ours: an anonymous
-/// struct in the header.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CuvidAv1RefFrame {
-    pub(crate) width: c_uint,
-    pub(crate) height: c_uint,
-    pub(crate) index: u8,
-    pub(crate) reserved24Bits: [u8; 3],
-}
-
-/// One entry of `CUVIDAV1PICPARAMS::global_motion`. Name is ours: an
-/// anonymous struct in the header.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct CuvidAv1GlobalMotion {
-    /// `invalid : 1`, `wmtype : 2`, `reserved5Bits : 5`:
-    /// [`bits::av1_global_motion`]. Name is ours.
-    pub(crate) flags: u8,
-    pub(crate) reserved24Bits: [i8; 3],
-    pub(crate) wmmat: [c_int; 6],
-}
-
-/// `CUVIDAV1PICPARAMS`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CUVIDAV1PICPARAMS {
-    pub(crate) width: c_uint,
-    pub(crate) height: c_uint,
-    pub(crate) frame_offset: c_uint,
-    pub(crate) decodePicIdx: c_int,
-    /// The sequence header's flags: [`bits::av1_sequence`]. Name is ours.
-    pub(crate) sequence_word: c_uint,
-    /// The frame header's flags: [`bits::av1_frame`]. Name is ours.
-    pub(crate) frame_word: c_uint,
-    /// `num_tile_cols : 8`, `num_tile_rows : 8`,
-    /// `context_update_tile_id : 16`: [`bits::av1_tiling`]. Name is ours.
-    pub(crate) tiling_word: c_uint,
-    pub(crate) tile_widths: [c_ushort; 64],
-    pub(crate) tile_heights: [c_ushort; 64],
-    /// `cdef_damping_minus_3 : 2`, `cdef_bits : 2`: [`bits::av1_cdef`].
-    /// Name is ours.
-    pub(crate) cdef_word: u8,
-    pub(crate) cdef_y_strength: [u8; 8],
-    pub(crate) cdef_uv_strength: [u8; 8],
-    /// `SkipModeFrame0 : 4`, `SkipModeFrame1 : 4`:
-    /// [`bits::av1_skip_mode`]. Name is ours.
-    pub(crate) skip_mode_word: u8,
-    pub(crate) base_qindex: u8,
-    pub(crate) qp_y_dc_delta_q: i8,
-    pub(crate) qp_u_dc_delta_q: i8,
-    pub(crate) qp_v_dc_delta_q: i8,
-    pub(crate) qp_u_ac_delta_q: i8,
-    pub(crate) qp_v_ac_delta_q: i8,
-    pub(crate) qm_y: u8,
-    pub(crate) qm_u: u8,
-    pub(crate) qm_v: u8,
-    /// The segmentation flags: [`bits::av1_segmentation`]. Name is ours.
-    pub(crate) segmentation_word: u8,
-    pub(crate) segmentation_feature_data: [[c_short; 8]; 8],
-    pub(crate) segmentation_feature_mask: [u8; 8],
-    pub(crate) loop_filter_level: [u8; 2],
-    pub(crate) loop_filter_level_u: u8,
-    pub(crate) loop_filter_level_v: u8,
-    pub(crate) loop_filter_sharpness: u8,
-    pub(crate) loop_filter_ref_deltas: [i8; 8],
-    pub(crate) loop_filter_mode_deltas: [i8; 2],
-    /// The loop filter's delta flags: [`bits::av1_loop_filter`]. Name is
-    /// ours.
-    pub(crate) loop_filter_word: u8,
-    pub(crate) lr_unit_size: [u8; 3],
-    pub(crate) lr_type: [u8; 3],
-    pub(crate) primary_ref_frame: u8,
-    pub(crate) ref_frame_map: [u8; 8],
-    /// `temporal_layer_id : 4`, `spatial_layer_id : 4`:
-    /// [`bits::av1_layer`]. Name is ours.
-    pub(crate) layer_word: u8,
-    pub(crate) reserved5_32bits: [u8; 4],
-    pub(crate) ref_frame: [CuvidAv1RefFrame; 7],
-    pub(crate) global_motion: [CuvidAv1GlobalMotion; 7],
-    /// The film grain flags: [`bits::av1_film_grain`]. Name is ours.
-    pub(crate) film_grain_word: c_ushort,
-    pub(crate) num_y_points: u8,
-    pub(crate) scaling_points_y: [[u8; 2]; 14],
-    pub(crate) num_cb_points: u8,
-    pub(crate) scaling_points_cb: [[u8; 2]; 10],
-    pub(crate) num_cr_points: u8,
-    pub(crate) scaling_points_cr: [[u8; 2]; 10],
-    pub(crate) reserved7_8bits: u8,
-    pub(crate) random_seed: c_ushort,
-    pub(crate) ar_coeffs_y: [c_short; 24],
-    pub(crate) ar_coeffs_cb: [c_short; 25],
-    pub(crate) ar_coeffs_cr: [c_short; 25],
-    pub(crate) cb_mult: u8,
-    pub(crate) cb_luma_mult: u8,
-    pub(crate) cb_offset: c_short,
-    pub(crate) cr_mult: u8,
-    pub(crate) cr_luma_mult: u8,
-    pub(crate) cr_offset: c_short,
-    pub(crate) reserved: [c_int; 7],
-}
-
 /// `CUVIDPICPARAMS::CodecSpecific`. Name is ours: an anonymous union in the
 /// header.
 #[repr(C)]
@@ -472,8 +327,6 @@ pub(crate) struct CUVIDAV1PICPARAMS {
 pub(crate) union CuvidCodecSpecific {
     pub(crate) h264: CUVIDH264PICPARAMS,
     pub(crate) hevc: CUVIDHEVCPICPARAMS,
-    pub(crate) vp9: CUVIDVP9PICPARAMS,
-    pub(crate) av1: CUVIDAV1PICPARAMS,
     pub(crate) CodecReserved: [c_uint; 1024],
 }
 
@@ -576,149 +429,6 @@ pub(crate) mod bits {
         use super::{Bits, b};
         pub(crate) const mb_adaptive_frame_field_flag: Bits = b(0, 2);
     }
-
-    /// `CUVIDVP9PICPARAMS`'s frame flags (an `unsigned short`).
-    pub(crate) mod vp9_frame {
-        use super::{Bits, b};
-        pub(crate) const profile: Bits = b(0, 3);
-        pub(crate) const frameContextIdx: Bits = b(3, 2);
-        pub(crate) const frameType: Bits = b(5, 1);
-        pub(crate) const showFrame: Bits = b(6, 1);
-        pub(crate) const errorResilient: Bits = b(7, 1);
-        pub(crate) const frameParallelDecoding: Bits = b(8, 1);
-        pub(crate) const subSamplingX: Bits = b(9, 1);
-        pub(crate) const subSamplingY: Bits = b(10, 1);
-        pub(crate) const intraOnly: Bits = b(11, 1);
-        pub(crate) const allow_high_precision_mv: Bits = b(12, 1);
-        pub(crate) const refreshEntropyProbs: Bits = b(13, 1);
-    }
-
-    /// `CUVIDVP9PICPARAMS`'s segmentation flags (an `unsigned char`).
-    pub(crate) mod vp9_segment {
-        use super::{Bits, b};
-        pub(crate) const segmentEnabled: Bits = b(0, 1);
-        pub(crate) const segmentMapUpdate: Bits = b(1, 1);
-        pub(crate) const segmentMapTemporalUpdate: Bits = b(2, 1);
-        pub(crate) const segmentFeatureMode: Bits = b(3, 1);
-    }
-
-    /// `CUVIDAV1PICPARAMS`'s sequence header flags.
-    pub(crate) mod av1_sequence {
-        use super::{Bits, b};
-        pub(crate) const profile: Bits = b(0, 3);
-        pub(crate) const use_128x128_superblock: Bits = b(3, 1);
-        pub(crate) const subsampling_x: Bits = b(4, 1);
-        pub(crate) const subsampling_y: Bits = b(5, 1);
-        pub(crate) const mono_chrome: Bits = b(6, 1);
-        pub(crate) const bit_depth_minus8: Bits = b(7, 4);
-        pub(crate) const enable_filter_intra: Bits = b(11, 1);
-        pub(crate) const enable_intra_edge_filter: Bits = b(12, 1);
-        pub(crate) const enable_interintra_compound: Bits = b(13, 1);
-        pub(crate) const enable_masked_compound: Bits = b(14, 1);
-        pub(crate) const enable_dual_filter: Bits = b(15, 1);
-        pub(crate) const enable_order_hint: Bits = b(16, 1);
-        pub(crate) const order_hint_bits_minus1: Bits = b(17, 3);
-        pub(crate) const enable_jnt_comp: Bits = b(20, 1);
-        pub(crate) const enable_superres: Bits = b(21, 1);
-        pub(crate) const enable_cdef: Bits = b(22, 1);
-        pub(crate) const enable_restoration: Bits = b(23, 1);
-        pub(crate) const enable_fgs: Bits = b(24, 1);
-    }
-
-    /// `CUVIDAV1PICPARAMS`'s frame header flags.
-    pub(crate) mod av1_frame {
-        use super::{Bits, b};
-        pub(crate) const frame_type: Bits = b(0, 2);
-        pub(crate) const show_frame: Bits = b(2, 1);
-        pub(crate) const disable_cdf_update: Bits = b(3, 1);
-        pub(crate) const allow_screen_content_tools: Bits = b(4, 1);
-        pub(crate) const force_integer_mv: Bits = b(5, 1);
-        pub(crate) const coded_denom: Bits = b(6, 3);
-        pub(crate) const allow_intrabc: Bits = b(9, 1);
-        pub(crate) const allow_high_precision_mv: Bits = b(10, 1);
-        pub(crate) const interp_filter: Bits = b(11, 3);
-        pub(crate) const switchable_motion_mode: Bits = b(14, 1);
-        pub(crate) const use_ref_frame_mvs: Bits = b(15, 1);
-        pub(crate) const disable_frame_end_update_cdf: Bits = b(16, 1);
-        pub(crate) const delta_q_present: Bits = b(17, 1);
-        pub(crate) const delta_q_res: Bits = b(18, 2);
-        pub(crate) const using_qmatrix: Bits = b(20, 1);
-        pub(crate) const coded_lossless: Bits = b(21, 1);
-        pub(crate) const use_superres: Bits = b(22, 1);
-        pub(crate) const tx_mode: Bits = b(23, 2);
-        pub(crate) const reference_mode: Bits = b(25, 1);
-        pub(crate) const allow_warped_motion: Bits = b(26, 1);
-        pub(crate) const reduced_tx_set: Bits = b(27, 1);
-        pub(crate) const skip_mode: Bits = b(28, 1);
-    }
-
-    /// `CUVIDAV1PICPARAMS`'s tiling word.
-    pub(crate) mod av1_tiling {
-        use super::{Bits, b};
-        pub(crate) const num_tile_cols: Bits = b(0, 8);
-        pub(crate) const num_tile_rows: Bits = b(8, 8);
-        pub(crate) const context_update_tile_id: Bits = b(16, 16);
-    }
-
-    /// `CUVIDAV1PICPARAMS`'s CDEF byte.
-    pub(crate) mod av1_cdef {
-        use super::{Bits, b};
-        pub(crate) const cdef_damping_minus_3: Bits = b(0, 2);
-        pub(crate) const cdef_bits: Bits = b(2, 2);
-    }
-
-    /// `CUVIDAV1PICPARAMS`'s skip mode byte.
-    pub(crate) mod av1_skip_mode {
-        use super::{Bits, b};
-        pub(crate) const SkipModeFrame0: Bits = b(0, 4);
-        pub(crate) const SkipModeFrame1: Bits = b(4, 4);
-    }
-
-    /// `CUVIDAV1PICPARAMS`'s segmentation byte.
-    pub(crate) mod av1_segmentation {
-        use super::{Bits, b};
-        pub(crate) const segmentation_enabled: Bits = b(0, 1);
-        pub(crate) const segmentation_update_map: Bits = b(1, 1);
-        pub(crate) const segmentation_update_data: Bits = b(2, 1);
-        pub(crate) const segmentation_temporal_update: Bits = b(3, 1);
-    }
-
-    /// `CUVIDAV1PICPARAMS`'s loop filter byte.
-    pub(crate) mod av1_loop_filter {
-        use super::{Bits, b};
-        pub(crate) const loop_filter_delta_enabled: Bits = b(0, 1);
-        pub(crate) const loop_filter_delta_update: Bits = b(1, 1);
-        pub(crate) const delta_lf_present: Bits = b(2, 1);
-        pub(crate) const delta_lf_res: Bits = b(3, 2);
-        pub(crate) const delta_lf_multi: Bits = b(5, 1);
-    }
-
-    /// `CUVIDAV1PICPARAMS`'s layer byte.
-    pub(crate) mod av1_layer {
-        use super::{Bits, b};
-        pub(crate) const temporal_layer_id: Bits = b(0, 4);
-        pub(crate) const spatial_layer_id: Bits = b(4, 4);
-    }
-
-    /// `CUVIDAV1PICPARAMS::global_motion`'s flags byte.
-    pub(crate) mod av1_global_motion {
-        use super::{Bits, b};
-        pub(crate) const invalid: Bits = b(0, 1);
-        pub(crate) const wmtype: Bits = b(1, 2);
-    }
-
-    /// `CUVIDAV1PICPARAMS`'s film grain word (an `unsigned short`).
-    pub(crate) mod av1_film_grain {
-        use super::{Bits, b};
-        pub(crate) const apply_grain: Bits = b(0, 1);
-        pub(crate) const overlap_flag: Bits = b(1, 1);
-        pub(crate) const scaling_shift_minus8: Bits = b(2, 2);
-        pub(crate) const chroma_scaling_from_luma: Bits = b(4, 1);
-        pub(crate) const ar_coeff_lag: Bits = b(5, 2);
-        pub(crate) const ar_coeff_shift_minus6: Bits = b(7, 2);
-        pub(crate) const grain_scale_shift: Bits = b(9, 2);
-        pub(crate) const clip_to_restricted_range: Bits = b(11, 1);
-    }
 }
 
 functions! {
@@ -758,10 +468,6 @@ unsafe impl Zeroed for CUVIDH264PICPARAMS {}
 // SAFETY: as above.
 unsafe impl Zeroed for CUVIDHEVCPICPARAMS {}
 // SAFETY: as above.
-unsafe impl Zeroed for CUVIDVP9PICPARAMS {}
-// SAFETY: as above.
-unsafe impl Zeroed for CUVIDAV1PICPARAMS {}
-// SAFETY: as above.
 unsafe impl Zeroed for CUVIDPROCPARAMS {}
 // SAFETY: as above.
 unsafe impl Zeroed for CUVIDGETDECODESTATUS {}
@@ -777,8 +483,6 @@ const _: () = {
     assert!(size_of::<CUVIDDECODECREATEINFO>() == 176);
     assert!(size_of::<CUVIDH264PICPARAMS>() == 984);
     assert!(size_of::<CUVIDHEVCPICPARAMS>() == 1484);
-    assert!(size_of::<CUVIDVP9PICPARAMS>() == 220);
-    assert!(size_of::<CUVIDAV1PICPARAMS>() == 1024);
     assert!(size_of::<CUVIDPICPARAMS>() == 4280);
     assert!(size_of::<CUVIDPROCPARAMS>() == 264);
     assert!(size_of::<CUVIDGETDECODESTATUS>() == 192);
@@ -787,19 +491,19 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    use super::bits::{av1_tiling, h264, vp9_frame};
+    use super::bits::{Bits, h264};
 
     #[test]
     fn a_bit_field_is_set_alone_and_cut_to_its_width() {
-        // `num_tile_cols : 8`, `num_tile_rows : 8`, at the word's bottom.
-        let word = av1_tiling::num_tile_rows.put(av1_tiling::num_tile_cols.put(0, 4), 2);
+        // Two 8-bit fields at the word's bottom.
+        let low = Bits { shift: 0, width: 8 };
+        let high = Bits { shift: 8, width: 8 };
+        let word = high.put(low.put(0, 4), 2);
         assert_eq!(word, 0x0204);
-        assert_eq!(av1_tiling::num_tile_cols.put(word, 7), 0x0207);
+        assert_eq!(low.put(word, 7), 0x0207);
         // A value wider than its field keeps to it.
-        assert_eq!(h264::mb_adaptive_frame_field_flag.put(!3_u32, 5), !2);
-        assert_eq!(
-            vp9_frame::profile.mask().count_ones(),
-            vp9_frame::profile.width
-        );
+        let flag = h264::mb_adaptive_frame_field_flag;
+        assert_eq!(flag.put(!3_u32, 5), !2);
+        assert_eq!(flag.mask().count_ones(), flag.width);
     }
 }

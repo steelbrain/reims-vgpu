@@ -23,10 +23,6 @@
     clippy::multiple_unsafe_ops_per_block,
     clippy::missing_safety_doc
 )]
-// The reims-graphics device's NVIDIA video decodes on NVDEC's decoder, its accelerators, CUDA's
-// copies, the bounded waits and zero copy (`annex_b`); AV1's bindings, CUDA's device memory and
-// some helpers of the decoders are not called.
-#![expect(dead_code, reason = "AV1's bindings and helpers nothing calls")]
 
 mod annex_b;
 mod cuda;
@@ -54,14 +50,6 @@ pub use nvenc::encoder::{
 };
 pub use nvenc::max_api_version;
 pub use probe::{EncodeCodecReport, EncoderReport, encoder_report};
-
-/// `value` as a `usize`, which holds every `u32` on the 64-bit hosts the
-/// crate runs on (asserted below).
-pub(crate) fn usize_of(value: u32) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
-}
-
-const _: () = assert!(usize::BITS >= u32::BITS);
 
 /// The host's NVIDIA GPUs, as CUDA lists them; an error where the host has
 /// no NVIDIA driver.

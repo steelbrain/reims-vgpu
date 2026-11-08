@@ -14,8 +14,6 @@
 //! on, so that their end is asked after rather than waited for.
 
 pub(crate) mod ffi;
-#[cfg(test)]
-pub(crate) mod spin;
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::marker::PhantomData;
@@ -483,57 +481,6 @@ impl Drop for Pinned {
         // SAFETY: allocated by cuMemHostAlloc, freed once.
         let result = unsafe { (cuda.f.cuMemFreeHost)(self.at.cast::<c_void>()) };
         if let Err(e) = cuda.check("cuMemFreeHost", result) {
-            log::warn!("{e}");
-        }
-    }
-}
-
-/// Device memory of CUDA's (`cuMemAlloc`), freed as it drops.
-pub(crate) struct DeviceMemory {
-    gpu: Arc<Gpu>,
-    address: ffi::CUdeviceptr,
-    len: usize,
-}
-
-impl DeviceMemory {
-    /// `len` bytes of `gpu`'s memory, uninitialised.
-    pub(crate) fn new(gpu: &Arc<Gpu>, len: usize) -> Result<Self, Error> {
-        let cuda = gpu.cuda();
-        let _current = gpu.push()?;
-        let mut address: ffi::CUdeviceptr = 0;
-        // SAFETY: the out pointer is live; the GPU's context is current.
-        cuda.check("cuMemAlloc", unsafe {
-            (cuda.f.cuMemAlloc_v2)(&raw mut address, len.max(1))
-        })?;
-        Ok(Self {
-            gpu: Arc::clone(gpu),
-            address,
-            len,
-        })
-    }
-
-    /// Its address on the GPU.
-    pub(crate) fn address(&self) -> ffi::CUdeviceptr {
-        self.address
-    }
-
-    /// Its length in bytes.
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-}
-
-impl Drop for DeviceMemory {
-    fn drop(&mut self) {
-        let cuda = self.gpu.cuda();
-        let Ok(_current) = self.gpu.push() else {
-            log::warn!("device memory is left allocated: its GPU's context is not to be had");
-            return;
-        };
-        // SAFETY: allocated by cuMemAlloc, freed once; its owner drops it
-        // only once no work queued on the GPU uses it.
-        let result = unsafe { (cuda.f.cuMemFree_v2)(self.address) };
-        if let Err(e) = cuda.check("cuMemFree", result) {
             log::warn!("{e}");
         }
     }

@@ -92,7 +92,7 @@ functions! {
         cuDevicePrimaryCtxRelease: fn(CUdevice) -> CUresult = c"cuDevicePrimaryCtxRelease";
         cuCtxPushCurrent_v2: fn(CUcontext) -> CUresult = c"cuCtxPushCurrent_v2";
         cuCtxPopCurrent_v2: fn(*mut CUcontext) -> CUresult = c"cuCtxPopCurrent_v2";
-        cuMemAlloc_v2: fn(*mut CUdeviceptr, usize) -> CUresult = c"cuMemAlloc_v2";
+        #[expect(dead_code, reason = "the frees of device memory another API imports")]
         cuMemFree_v2: fn(CUdeviceptr) -> CUresult = c"cuMemFree_v2";
         cuMemHostAlloc: fn(*mut *mut c_void, usize, c_uint) -> CUresult = c"cuMemHostAlloc";
         cuMemFreeHost: fn(*mut c_void) -> CUresult = c"cuMemFreeHost";

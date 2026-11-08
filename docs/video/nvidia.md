@@ -35,7 +35,6 @@ on CachyOS) unless they say otherwise.
 | Its decode check of every stream in a directory with a reference beside it ("Decode") | `tools/decode-check.sh` |
 | Zero copy: frames copied by the GPU into the guest's pages ("Zero copy") | `src/zero_copy.rs` |
 | The waits on the GPU, each bounded ("How a session waits for the GPU") | `src/wait.rs`, `src/nvenc/locks.rs`, `src/nvdec/decoder.rs` |
-| A GPU that does not finish, for the tests of the waits | `src/cuda/spin.rs` |
 | The reims-graphics device's decode on NVDEC: whole access units in place, each picture copied into the output's planes by the GPU ("The reims-graphics device") | `src/annex_b.rs`; reims-vgpu's `src/graphics/nvidia.rs`, `src/graphics/video_host.rs` |
 
 ## The binding

@@ -86,11 +86,8 @@ pub(crate) fn surface_count(pictures: usize) -> u32 {
 /// takes them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Slices<'a> {
-    /// Each slice's start: H.264's slices, HEVC's slice segments, VP9's
-    /// one frame.
+    /// Each slice's start: H.264's slices, HEVC's slice segments.
     Starts(&'a [u32]),
-    /// Each tile's start and end: AV1's.
-    Tiles(&'a [[u32; 2]]),
 }
 
 impl Slices<'_> {
@@ -103,11 +100,6 @@ impl Slices<'_> {
                 starts.len(),
                 starts.as_ptr(),
                 starts.iter().all(|&start| start <= len),
-            ),
-            Slices::Tiles(tiles) => (
-                tiles.len(),
-                tiles.as_ptr().cast::<u32>(),
-                tiles.iter().all(|&[start, end]| start <= end && end <= len),
             ),
         };
         if !within {
@@ -124,7 +116,6 @@ impl Slices<'_> {
     fn to_vec(self) -> Vec<u32> {
         match self {
             Slices::Starts(starts) => starts.to_vec(),
-            Slices::Tiles(tiles) => tiles.iter().flatten().copied().collect(),
         }
     }
 }
@@ -432,12 +423,6 @@ impl Decoder {
         (self.inner.spec.width, self.inner.spec.height)
     }
 
-    /// `Err` where an earlier picture's work was not done by its deadline,
-    /// as every later decode then fails ([`Error::Stalled`]).
-    pub(crate) fn check_not_stalled(&self) -> Result<(), Error> {
-        self.inner.check_not_stalled()
-    }
-
     /// A free surface for a new picture of the spec's size.
     pub(crate) fn picture(&self) -> Result<Picture, Error> {
         self.picture_of_size(self.size())
@@ -447,8 +432,7 @@ impl Decoder {
     /// the spec's: a VP9 or AV1 frame of another size than the decoder's.
     /// NVDEC decodes it at its own size into the surface, and scales it to
     /// the decoder's target size when it is mapped, so it is mapped with
-    /// the decoder reconfigured to `size` ([`Picture::read_back`]). An AV1
-    /// frame's size is known only at its decode: [`Picture::set_size`].
+    /// the decoder reconfigured to `size` ([`Picture::read_back`]).
     pub(crate) fn picture_of_size(&self, size: (u32, u32)) -> Result<Picture, Error> {
         let index = self.inner.free.lock().pop().ok_or(Error::OutOfSurfaces)?;
         Ok(Picture {
@@ -803,26 +787,6 @@ impl PictureReadBack<'_> {
             (bytes, plane.row_bytes, plane.rows)
         })
     }
-
-    /// Copies the read back crop into `luma` and `chroma`, as much as fits,
-    /// as [`copy_plane`] copies out of a mapped surface: the CPU's copy
-    /// alone.
-    pub(crate) fn copy_to(&self, luma: HostPlane<'_>, chroma: HostPlane<'_>) {
-        for (plane, to) in self.planes.into_iter().zip([luma, chroma]) {
-            let from = &self.staging.bytes()[plane.offset..plane.offset + plane.len()];
-            let width = plane.row_bytes.min(to.bytes_per_row);
-            let rows = rows_that_fit(
-                plane.rows.min(to.rows),
-                width,
-                to.bytes.len(),
-                to.bytes_per_row,
-            );
-            for row in 0..rows {
-                let source = &from[row * plane.row_bytes..][..width];
-                to.bytes[row * to.bytes_per_row..][..width].copy_from_slice(source);
-            }
-        }
-    }
 }
 
 impl Picture {
@@ -861,11 +825,6 @@ impl Picture {
         *self.size.lock()
     }
 
-    /// Sets the size it is mapped at, before its decode.
-    pub(crate) fn set_size(&self, size: (u32, u32)) {
-        *self.size.lock() = size;
-    }
-
     /// Bytes a sample of the output: 1 for NV12, 2 for P016.
     pub(crate) fn bytes_per_sample(&self) -> usize {
         if self.inner.output == SurfaceFormat::P016 {
@@ -879,9 +838,9 @@ impl Picture {
     /// decoder's staging memory: luma, then chroma (interleaved Cb and Cr,
     /// half as tall), each row packed. Every call into the driver a copy
     /// needs is made here: the map, the copies and the unmap, each wait
-    /// bounded (module docs). What it returns copies the crop on the CPU
-    /// alone ([`PictureReadBack::copy_to`]), and holds the staging memory
-    /// until dropped. A decode NVDEC reports as failed is
+    /// bounded (module docs). What it returns holds the crop for the CPU's
+    /// copies alone ([`PictureReadBack::planes`]), and holds the staging
+    /// memory until dropped. A decode NVDEC reports as failed is
     /// [`Error::DecodeFailed`]. Work not done by `deadline` is
     /// [`Error::Stalled`], and the staging memory, which its copies may
     /// still write, is kept with it.
@@ -1716,12 +1675,6 @@ pub(crate) mod tests {
     fn slices_lie_within_their_bitstream() {
         assert_eq!(Slices::Starts(&[0, 5, 10]).offsets(10).map(|o| o.0), Ok(3));
         assert!(Slices::Starts(&[0, 11]).offsets(10).is_err());
-        assert_eq!(
-            Slices::Tiles(&[[0, 4], [4, 10]]).offsets(10).map(|o| o.0),
-            Ok(2)
-        );
-        assert!(Slices::Tiles(&[[0, 11]]).offsets(10).is_err());
-        assert!(Slices::Tiles(&[[6, 4]]).offsets(10).is_err());
     }
 
     #[test]
