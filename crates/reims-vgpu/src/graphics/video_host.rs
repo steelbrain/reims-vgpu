@@ -59,6 +59,7 @@ use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::CommandBufferStatus;
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_video_core::device_memory::MemoryIdentity;
 
 use super::decode::{
     Decoded, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoPlane, op_fault,
@@ -146,6 +147,8 @@ pub(crate) struct OutputPlane<P: Platform> {
     /// The memory the buffer lies in, as a device reaches it in place ([`VideoPlane::pages`]);
     /// `None` in a device cache, and in memory of another kind.
     pub(crate) pages: Option<PlanePages>,
+    /// The identity of the device cache the buffer is, where `cached` ([`VideoPlane::cache`]).
+    pub(crate) cache: Option<MemoryIdentity>,
 }
 
 /// One plane's host bytes, which a picture lands in ([`Landing::host`]).
@@ -485,6 +488,7 @@ fn output_plane<P: Platform>(plane: &VideoPlane<'_, P>, rows: u64) -> RaiseResul
         cached: plane.cached,
         host,
         pages: plane.pages.clone(),
+        cache: plane.cache.clone(),
     })
 }
 

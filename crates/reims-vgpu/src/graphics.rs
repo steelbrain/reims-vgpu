@@ -390,6 +390,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 }
                 debug_assert!(caps.codec_count as usize <= RGFX_VIDEO_CAPS_CODECS);
                 region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
+                if cached && video.imports_device_caches() {
+                    decoder.set_exportable_caches();
+                }
                 decoder.set_video(video);
             }
             let clock = Arc::clone(&platform);

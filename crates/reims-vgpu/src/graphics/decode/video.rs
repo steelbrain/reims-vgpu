@@ -68,6 +68,12 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     fn lands_in_device_caches(&self) -> bool {
         false
     }
+    /// Whether it writes a picture into a device cache by its own GPU work, through an import of
+    /// the cache's memory, where the cache was made exportable: the device's caches are then made
+    /// so ([`VideoPlane::cache`]).
+    fn imports_device_caches(&self) -> bool {
+        false
+    }
 }
 
 /// A hold of a video session, the object table's or an open video encoder's. Its drop lets go of
@@ -232,6 +238,10 @@ pub struct VideoPlane<'a, P: Platform> {
     /// surface's view of its pages, or its block of the region (a copy block); `None` for a device
     /// cache, and for a buffer over memory of another kind.
     pub pages: Option<PlanePages>,
+    /// The identity of the device cache the buffer is, where `cached`, which lives as long as the
+    /// cache: what a device of the host's video makes of the cache's memory (an import of an
+    /// exportable cache's) is kept by it and let go of once it ends.
+    pub cache: Option<MemoryIdentity>,
 }
 
 /// The memory a plane's buffer lies in, as the host's video devices take it
@@ -484,6 +494,7 @@ pub(super) fn decode_op<P: Platform>(
             pages: (luma_cache.is_none())
                 .then(|| objs.plane_pages(luma_place.buffer_obj_id, luma))
                 .flatten(),
+            cache: luma_cache.and_then(|block| objs.surface_caches.identity(block)),
         },
         chroma: VideoPlane {
             buffer: chroma,
@@ -496,6 +507,7 @@ pub(super) fn decode_op<P: Platform>(
             pages: (chroma_cache.is_none())
                 .then(|| objs.plane_pages(chroma_place.buffer_obj_id, chroma))
                 .flatten(),
+            cache: chroma_cache.and_then(|block| objs.surface_caches.identity(block)),
         },
         output_rows: m.output_rows,
     };
@@ -513,6 +525,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     pub(crate) fn set_video(&mut self, video: Arc<dyn GraphicsVideo<P>>) {
         // Set once, at the device's make.
         let _ = self.shared.video.set(video);
+    }
+
+    /// Makes the device's caches exportable from now on, for the host's video to import
+    /// ([`GraphicsVideo::imports_device_caches`]): once, at the device's make, before any cache.
+    pub(crate) fn set_exportable_caches(&self) {
+        self.shared.surface_caches.set_exportable();
     }
 
     /// A hold of the session `id` names; an exec fault where it names none, and a refused

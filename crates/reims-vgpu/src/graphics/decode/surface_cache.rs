@@ -153,6 +153,7 @@ use reims_vgpu_core::platform::types::NsRange;
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
+use reims_vgpu_video_core::device_memory::{MemoryIdentity, MemoryLife};
 
 use super::refusing;
 use super::surface_pages::{SurfaceView, Unmade, buffer_over};
@@ -238,6 +239,9 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// until it lands: a download or a release that copies nothing waits for it, as for an
     /// early copy, and so does a use that writes the cache, on the GPU.
     out: Option<OutCopy>,
+    /// The cache's life, as the host's video keeps what it makes of the cache's memory (an
+    /// import of an exportable cache's, [`SurfaceCaches::identity`]): it ends as the cache goes.
+    life: MemoryLife,
 }
 
 /// A copy of a cache into its pages on the transfer queue ([`SurfaceCaches::write_back`]): the
@@ -638,6 +642,10 @@ pub(crate) struct CacheCounts {
     /// one, left to their queue's thread.
     pub(crate) doorbell_free: u64,
     pub(crate) doorbell_waits: u64,
+    /// Caches made exportable for the host's video ([`SurfaceCaches::new_cache`]), and those the
+    /// platform made none for, made as any other buffer.
+    pub(crate) exportable: u64,
+    pub(crate) unexportable: u64,
 }
 
 /// One cache's pages, host addresses in the guest's RAM, and how many times a device of the host
@@ -721,6 +729,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The copies of caches into pages asked and not yet landed ([`Self::copies_into`]), those
     /// landed let go of as each is added.
     into_pages: Vec<IntoPages>,
+    /// Whether caches are made exportable, for the host's video to import
+    /// ([`Caches::set_exportable`]), kept across [`Caches::set_on`].
+    exportable: bool,
 }
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
@@ -870,6 +881,7 @@ impl<P: Platform> SurfaceCaches<P> {
             deferred_budget: 0,
             deferred_bytes: 0,
             into_pages: Vec::new(),
+            exportable: false,
         }
     }
 
@@ -949,7 +961,7 @@ impl<P: Platform> SurfaceCaches<P> {
             }
             self.released(device, block, 0, None, None, Box::new(|| {}))?;
         }
-        let Some(cache) = device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)? else {
+        let Some(cache) = self.new_cache(device, length)? else {
             return Ok(false);
         };
         let Some(pages) = pages()? else {
@@ -975,6 +987,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 deferred: None,
                 read_back: ReadBack::default(),
                 out: None,
+                life: MemoryLife::new(),
             },
         );
         let pages = Pages {
@@ -1048,7 +1061,7 @@ impl<P: Platform> SurfaceCaches<P> {
         }
         let room = self.deferred_budget.saturating_sub(self.deferred_bytes);
         let made = if length <= room {
-            device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)?
+            self.new_cache(device, length)?
         } else {
             None
         };
@@ -1077,6 +1090,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 deferred: Some(block_size),
                 read_back: ReadBack::default(),
                 out: None,
+                life: MemoryLife::new(),
             },
         );
         self.deferred_bytes += length;
@@ -1227,6 +1241,28 @@ impl<P: Platform> SurfaceCaches<P> {
     /// The cache of the block at `block`, which its buffers are.
     pub(crate) fn buffer(&self, block: u64) -> Option<&P::Buffer> {
         self.by_block.get(&block).map(|c| &c.device)
+    }
+
+    /// The identity of the cache of the block at `block`, which lives as long as the cache: the
+    /// host's video keeps what it makes of the cache's memory by it ([`SurfaceCache::life`]).
+    pub(crate) fn identity(&self, block: u64) -> Option<MemoryIdentity> {
+        self.by_block.get(&block).map(|c| c.life.identity())
+    }
+
+    /// A new cache's buffer of `length` bytes, Private: exportable where the host's video
+    /// imports caches ([`Caches::set_exportable`]) and the platform makes one, else as any other
+    /// buffer.
+    fn new_cache(&mut self, device: &P::Device, length: u64) -> RaiseResult<Option<P::Buffer>> {
+        #[cfg(unix)]
+        if self.exportable {
+            let made = device.new_exportable_buffer_of_length(ON, length, STORAGE_PRIVATE)?;
+            if let Some(cache) = made {
+                self.counts.exportable += 1;
+                return Ok(Some(cache));
+            }
+            self.counts.unexportable += 1;
+        }
+        device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)
     }
 
     /// Whether the block at `block` has a cache.
@@ -2661,6 +2697,11 @@ impl<P: Platform> Caches<P> {
         self.state.lock()
     }
 
+    /// The identity of the cache of the block at `block` ([`SurfaceCaches::identity`]).
+    pub(crate) fn identity(&self, block: u64) -> Option<MemoryIdentity> {
+        self.state.lock().identity(block)
+    }
+
     /// Whether the block at `block` has a cache.
     pub(crate) fn has(&self, block: u64) -> bool {
         self.state.lock().has(block)
@@ -2691,9 +2732,17 @@ impl<P: Platform> Caches<P> {
     /// budget stays.
     pub(crate) fn set_on(&self, on: bool) {
         let mut state = self.state.lock();
-        let budget = state.deferred_budget;
+        let (budget, exportable) = (state.deferred_budget, state.exportable);
         *state = SurfaceCaches::new(on, Arc::clone(&self.on_fill_done));
         state.deferred_budget = budget;
+        state.exportable = exportable;
+    }
+
+    /// Makes each cache from now on exportable where the platform makes one, for the host's video
+    /// to import and write its pictures into on its own GPU work (`graphics::nvidia`): set once,
+    /// at the device's make, before any cache, where the device's video imports caches.
+    pub(crate) fn set_exportable(&self) {
+        self.state.lock().exportable = true;
     }
 
     /// Sets the bytes deferred blocks' caches may hold at once (the device's `DEFERRED_BUDGET`,

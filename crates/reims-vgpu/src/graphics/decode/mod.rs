@@ -1185,7 +1185,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      refused; {} downloads or releases answered {} ms or more after they were \
                      asked; {} fills made behind the command buffers they followed, {} waits on \
                      the CPU for other command buffers' uses; at a doorbell, {} buffers using a \
-                     cache waited for no copy of it, {} for one",
+                     cache waited for no copy of it, {} for one; {} made exportable for the \
+                     host's video, {} not",
                     d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
                     d.unheld_released, d.unheld, d.unheld_bytes >> 20, d.retaken, d.behind,
@@ -1193,7 +1194,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     d.early, d.early_bytes >> 20, d.early_aside, d.early_read, d.early_unread,
                     d.by_runs, d.runs_refused,
                     self.shared.slow_answers.load(Ordering::Relaxed), SLOW_ANSWER.as_millis(),
-                    d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits
+                    d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits,
+                    d.exportable, d.unexportable
                 );
             }
         }

@@ -143,13 +143,23 @@ where it is NVIDIA's and CUDA opens it (`graphics/video_choice.rs`).
   are gathered into one buffer. NVDEC copies the bitstream within
   `cuvidDecodePicture`, so the guest's buffer is read there alone. A session
   logs at its end how many of its pictures went each way.
-- **The picture, by one GPU copy.** Where the output's planes lie in pages a
-  device reaches in place (the surface's view of the guest's RAM, or a copy
-  block of the device's region), their view is registered with CUDA once a
-  mapping, as "Zero copy" registers a guest buffer's, and each picture is one
-  `cuMemcpy2D` a plane from the mapped surface into the plane at its pitch,
-  its crop's rows alone, waited for before the session signals the decode's
-  value. Any pitch is taken, so the device asks no layout of the guest.
+- **The picture, by one GPU copy**, `cuMemcpy2D` a plane from the mapped
+  surface into the plane at its pitch, its crop's rows alone, waited for
+  before the session signals the decode's value. Any pitch is taken, so the
+  device asks no layout of the guest.
+  - **Into the output's device caches**, where CUDA imports the runtime
+    device's exportable buffers, which the arm learns once as the video opens
+    (a buffer of a 4K picture's bytes made exportable and imported, logged
+    with the make's time). The caps then ask the guest for cached outputs
+    (`RGFX_VIDEO_CAPS_OUTPUT_CACHED`), the device makes each cache exportable
+    as it makes it, and the picture is copied within the GPU into the cache's
+    memory, imported once a cache (`src/external.rs`) and let go of as the
+    cache goes.
+  - **Into the output's pages**, where its planes lie in pages a device
+    reaches in place (the surface's view of the guest's RAM, or a copy block
+    of the device's region): their view is registered with CUDA once a
+    mapping, as "Zero copy" registers a guest buffer's, and written by DMA.
+
   Elsewhere the picture is read back and copied by the CPU.
 - **A picture that does not land is a decode error.** A picture whose planes
   the session refuses, or whose decode NVDEC failed once it ran, still
