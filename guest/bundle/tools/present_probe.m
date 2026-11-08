@@ -17,7 +17,7 @@
 //                   presentedTime, gave 0, or had not run by the end;
 //   presented_fps   presented frames a second, from the span of their presentedTimes;
 //   gap_ms_p50/max  between consecutive presentedTimes;
-//   latency_ms_p50  from a frame's commit to its presentedTime;
+//   latency_ms_p10/p50/p90  from a frame's commit to its presentedTime;
 //   at_ms_p05/p50/p95  with -a, from the time asked for to the presentedTime (0 without);
 //   wait_ms_p50/max how long nextDrawable blocked;
 //   link_hz         CVDisplayLink callbacks a second, link_period_ms the period it states;
@@ -232,7 +232,7 @@ static NSString *run(void)
 		result = [NSString
 		    stringWithFormat:@"OK mode=%@ size=%.0fx%.0f sync=%d drawables=%d submitted_fps=%.1f presented=%lu "
 		                     @"dropped=%d unanswered=%d presented_fps=%.1f gap_ms_p50=%.2f gap_ms_max=%.2f "
-		                     @"latency_ms_p50=%.2f at_ms_p05=%.2f at_ms_p50=%.2f at_ms_p95=%.2f wait_ms_p50=%.2f wait_ms_max=%.2f nil_drawables=%d "
+		                     @"latency_ms_p10=%.2f latency_ms_p50=%.2f latency_ms_p90=%.2f at_ms_p05=%.2f at_ms_p50=%.2f at_ms_p95=%.2f wait_ms_p50=%.2f wait_ms_max=%.2f nil_drawables=%d "
 		                     @"link_hz=%.1f link_period_ms=%.3f vsync_ms_p05=%.3f vsync_ms_p50=%.3f vsync_ms_p95=%.3f "
 		                     @"vsync_ms_absmax=%.3f "
 		                     @"screen_max_fps=%ld seconds=%.0f",
@@ -240,7 +240,8 @@ static NSString *run(void)
 		                     layer.drawableSize.height, gSync, gCount, submitted / gSeconds,
 		                     (unsigned long)ts.count, atomic_load(&dropped), submitted - atomic_load(&answered),
 		                     span > 0 ? (double)(ts.count - 1) / span : 0, percentile(gaps, 0.5),
-		                     percentile(gaps, 1), percentile(latency, 0.5), percentile(late, 0.05),
+		                     percentile(gaps, 1), percentile(latency, 0.1), percentile(latency, 0.5),
+		                     percentile(latency, 0.9), percentile(late, 0.05),
 		                     percentile(late, 0.5), percentile(late, 0.95), percentile(waits, 0.5),
 		                     percentile(waits, 1), nils, linkTicks / gSeconds,
 		                     atomic_load(&gLinkPeriodNs) / 1e6, percentile(offs, 0.05), percentile(offs, 0.5),
