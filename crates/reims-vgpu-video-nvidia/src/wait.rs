@@ -11,13 +11,13 @@
 //! | a VP9 picture's decode | its `cuvidDecodePicture`, which returns once the picture is decoded, made on the decoder's call thread (`nvdec::decoder`) | the same call on the caller's thread |
 //! | its map and copies | `cuStreamQuery` of the decoder's own stream, which the map's post-processing and the two `cuMemcpy2DAsync` run on | `cuMemcpy2D`, which returns once its copy is done |
 //! | copies into pageable staging memory | the two `cuMemcpy2DAsync`, which return once copied into pageable memory, made on the decoder's call thread, then the stream | the same copies on the caller's thread |
-//! | an encode, a motion estimate | the waiting `nvEncLockBitstream`, made on the session's call thread, whose answer is waited for (`nvenc::locks`, which says why `doNotWait` does not serve) | the same lock on the caller's thread |
+//! | an encode | the waiting `nvEncLockBitstream`, made on the session's call thread, whose answer is waited for (`nvenc::locks`, which says why `doNotWait` does not serve) | the same lock on the caller's thread |
 //!
 //! A decode call's waits share one deadline ([`Deadline`]): its VP9
 //! decodes', and those of the read backs of the frames it gives, which core
 //! makes before it answers the call's sample.
 //!
-//! What a decoder, an encoder or an estimator does once a wait of its has
+//! What a decoder or an encoder does once a wait of its has
 //! passed its deadline: that frame fails as a malfunction, and each later
 //! call on it fails at once the same way ([`crate::Error::Stalled`]), so
 //! that the guest hears of each frame without a wait of its own; NVDEC's

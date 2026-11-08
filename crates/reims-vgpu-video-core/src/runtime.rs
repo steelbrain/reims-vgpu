@@ -257,7 +257,7 @@ impl<T> fmt::Debug for Answer<T> {
     }
 }
 
-/// std's threads and clock: the runtime of the stand-in guest, the examples and the fuzzers
+/// std's threads and clock: the runtime of the examples, the hardware tests and the fuzzers
 /// (module doc), never the library's. Its threads are std's, named as asked, with std's default
 /// stack; its clock is std's `Instant`, from the first time a `StdRuntime` reads it.
 #[derive(Clone, Copy, Debug, Default)]

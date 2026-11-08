@@ -66,19 +66,9 @@
 //! **What the gate costs** is the driver's lock's: a call that waits holds
 //! the gate as long as Mesa held its lock for it (`vlVaGetImage` and
 //! `vlVaMapBuffer2` map under `drv->mutex`, **read** in Mesa 26.2.4). So
-//! the backend makes none on radeonsi where it can help it: the decoders'
+//! the crate makes none on radeonsi where it can help it: the decoders'
 //! frames are written into host memory of ours and read there
-//! (`super::readback`). **Measured** on the
-//! RX 7900 XTX and the Radeon 780M (2026-10-26), beside a thread decoding
-//! 4K JPEGs, a 4K H.264 decode on the same display waited for the gate
-//! 330 to 393 times a run of 720 `decode` calls, behind as many derived
-//! maps of 1.1 to 8.7 ms at the mean and 1.3 to 34 ms at the 99th
-//! percentile, while the engine read its outputs through them; reading
-//! host memory, the call thread made no call and the decode never waited
-//! (docs/video/vaapi.md, "What the gate costs"). Past udmabuf's 64 MiB,
-//! the engine reads its output in strips of host memory, and makes no such
-//! call either. Where it cannot write host memory at all, it maps, and
-//! those maps hold the gate (docs/video/bugs.md, B90).
+//! (`super::readback`; docs/video/vaapi.md, "What the gate costs").
 
 use std::collections::VecDeque;
 use std::sync::Arc;

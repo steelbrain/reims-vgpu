@@ -51,9 +51,8 @@ pub enum Error {
     SkippedLeadingPicture(String),
     /// Every decode surface is held by frames not yet released.
     OutOfSurfaces,
-    /// Work on the GPU was not done by its deadline, or a decoder's,
-    /// encoder's or estimator's earlier work was not (`crate::wait`): what,
-    /// in words. The guest is told so as the backend's malfunction.
+    /// Work on the GPU was not done by its deadline, or a decoder's or
+    /// encoder's earlier work was not (`crate::wait`): what, in words.
     Stalled(String),
     /// A destination or source plane is too small for the frame.
     PlaneTooSmall(&'static str),

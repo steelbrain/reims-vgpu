@@ -1,6 +1,6 @@
-//! The host's GPUs as a video backend picks its own: the one the library's GPU device runs on,
-//! and every hardware GPU the host's Vulkan drivers show, each with its PCI address and DRM render node, which the video
-//! backends open a GPU by.
+//! The host's GPUs, each with its PCI address and DRM render node, which the video arms open a
+//! GPU by (reims-vgpu's `graphics::vaapi` takes the runtime device's node): the one the
+//! library's GPU device runs on, and every hardware GPU the host's Vulkan drivers show.
 //!
 //! - **The GPU device's GPU** ([`gpu_device_gpu`]) is the physical device the runtime makes its
 //!   system default device of with this platform's options ([`crate::platform::device_options`]),
@@ -26,9 +26,7 @@
 //!   two drivers show is listed once, by the first. No file of sysfs states a GPU's kind, which
 //!   that ranking needs, so the list is the drivers'. The runtime lists the physical devices of
 //!   its own loader environment alone, so this instance is the module's own
-//!   (docs/video/bugs.md, U18); `video::backend_choice` asks for the list, and so makes the
-//!   instance, only where the GPU device's GPU is a software rasterizer, has no backend with any
-//!   part, or is none, and never where that GPU serves.
+//!   (docs/video/bugs.md, U18), made only once the list is asked for.
 //!
 //! Each is read once a process. The drivers this module loads stay loaded for the process's life,
 //! as the runtime keeps its own (`Device::system_default_with`): a driver unloaded and loaded

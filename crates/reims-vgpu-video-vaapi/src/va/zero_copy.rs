@@ -44,11 +44,9 @@
 //!   samples, row padding included, stayed as it was.
 //!
 //! Strips write what one run does, measured on the same GPUs (2026-10-25,
-//! udmabuf at its stock limits): through the stand-in guest every frame of
-//! 21 streams, H.264, HEVC, VP9 and AV1 at 720p, 1080p and 4K, 8 and 10
-//! bits, sync and async, matched its reference, written in up to five
-//! strips, and the guest's messages were the same as with the CPU copying
-//! every frame. The session's threads used 0.4 to 1.4 ms of the CPU a 4K
+//! udmabuf at its stock limits): every frame of 21 test streams at 720p,
+//! 1080p and 4K, 8 and 10 bits, matched its reference, written in up to
+//! five strips, and the decoding threads used 0.4 to 1.4 ms of the CPU a 4K
 //! frame, against 1.3 to 3.4 ms with the CPU copying. Each strip's run has
 //! a cost of its own, so the strips are as few as the limits allow
 //! (docs/video/vaapi.md, "What it saves").

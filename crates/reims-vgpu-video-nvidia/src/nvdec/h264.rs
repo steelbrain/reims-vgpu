@@ -1,6 +1,6 @@
 //! H.264 on NVDEC: the codec crate's decoder over an accelerator that
 //! fills `CUVIDH264PICPARAMS` from the parsed SPS, PPS, slice headers and
-//! DPB, as the VA-API backend fills libva's buffers, and hands NVDEC the
+//! DPB, as the VA-API crate fills libva's buffers, and hands NVDEC the
 //! picture's slices. NVIDIA's own parser is not used.
 //!
 //! The slices go to NVDEC as an Annex B stream, each NAL unit after a

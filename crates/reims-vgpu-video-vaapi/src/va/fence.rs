@@ -18,9 +18,9 @@
 //! 26.2.4, Linux 7.2.9, 2026-10-25), 4K runs into a guest's buffer and into
 //! the staged copy back's memory: the wait moved into the poll whole,
 //! `vaSyncSurface` taking 0.0 to 0.3 ms after it, and with decoding ahead
-//! the backend's `decode` took 0.3 to 0.9 ms a frame where it had taken 0.9
-//! to 5.0 ms, the stand-in guest's asynchronous sessions 8% to 59% faster
-//! with the CPU copying (docs/video/vaapi.md, "The driver's lock"). A
+//! the decoder's `decode` took 0.3 to 0.9 ms a frame where it had taken 0.9
+//! to 5.0 ms, with the CPU copying (docs/video/vaapi.md, "The driver's
+//! lock"). A
 //! driver that adds no fence leaves the poll nothing to wait for, and the
 //! sync waits as before: it stays the wait the frame's correctness rests
 //! on. The poll ends at the frame's deadline, and the sync after it then

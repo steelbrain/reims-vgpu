@@ -257,9 +257,8 @@ impl Display {
 
     /// What of an import of `format` the driver's video processing writes
     /// right, as the display's check found it: the staged copy back's
-    /// ([`super::readback`]), zero copy's ([`super::zero_copy`]) and the JPEG
-    /// engine's host surfaces' memory. `Err` says why the driver is lent no
-    /// such import.
+    /// ([`super::readback`]) and zero copy's ([`super::zero_copy`]) memory.
+    /// `Err` says why the driver is lent no such import.
     pub(crate) fn writes_imports(&self, format: SurfaceFormat) -> Result<ImportWrite, String> {
         match self.inner.import_writes.get() {
             Some(writes) => writes.of(format),

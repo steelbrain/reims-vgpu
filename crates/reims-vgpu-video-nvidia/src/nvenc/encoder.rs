@@ -627,7 +627,7 @@ fn set_rate_control(rc: &mut ffi::NV_ENC_RC_PARAMS, params: &EncodeParams) {
     }
     // The VBV buffer holds as long at the peak as the session asks, a
     // second unless a hard limit needs less, and starts three quarters
-    // full, as the VA-API backend sizes its HRD buffer, for the same
+    // full, as the VA-API crate sizes its HRD buffer, for the same
     // streams on either. NVENC's VBR runs its first second near its peak
     // whatever the buffer: peaking at 1.5 times the average, with NVENC's
     // default buffer, a second's or half a second's, it came to 1.45 to

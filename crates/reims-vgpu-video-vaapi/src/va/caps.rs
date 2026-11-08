@@ -275,7 +275,7 @@ const ATTRIBUTES: [ffi::VAConfigAttribType; 8] = [
 ];
 
 /// Every attribute any query of this crate asks of a pair: [`ATTRIBUTES`],
-/// the decoders' and the JPEG decoder's, and the encoders' (`encoder::caps`),
+/// the decoders', and the encoders' (`encoder::caps`),
 /// so that [`Display::prime`] has the answer to each before a session asks.
 const ASKED_ATTRIBUTES: [ffi::VAConfigAttribType; 18] = [
     ffi::VAConfigAttribRTFormat,

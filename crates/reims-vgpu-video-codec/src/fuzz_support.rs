@@ -411,7 +411,7 @@ fn thread_peak() -> isize {
 }
 
 static HOOK: Once = Once::new();
-/// Set by a panic on any thread: a host session's own threads too.
+/// Set by a panic on any thread: a decoder's own threads too.
 static PANICKED: AtomicBool = AtomicBool::new(false);
 static PANIC_MESSAGE: Mutex<String> = Mutex::new(String::new());
 

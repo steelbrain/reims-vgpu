@@ -473,7 +473,7 @@ impl Pinned {
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as above; `&mut self` makes this the only borrow. The
         // GPU's copies into it run inside that borrow (as
-        // `nvdec::decoder`'s and `jpeg`'s read backs make them).
+        // `nvdec::decoder`'s read backs make them).
         unsafe { std::slice::from_raw_parts_mut(self.at, self.len) }
     }
 }

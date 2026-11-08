@@ -1,4 +1,4 @@
-//! The NVIDIA backend: decode on NVDEC and encode on NVENC, over the CUDA
+//! NVIDIA's video: decode on NVDEC and encode on NVENC, over the CUDA
 //! driver API, with nothing above them.
 //!
 //! The driver's libraries (libcuda, libnvcuvid, libnvidia-encode) are
