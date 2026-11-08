@@ -7,15 +7,11 @@
 //!   How each OS builds and names them is its own module's: `macos`, `linux`.
 //! - `include/reims_vgpu.h`, the committed header.
 //! - `lib/pkgconfig/reims-vgpu.pc`. Its `Libs.private` names every library a static link of the
-//!   archive needs; its `optionrom` variable names the ROM below.
-//! - `share/reims-vgpu/ReimsVgpu.rom`: the EFI option ROM, the driver in [`FIRMWARE`] built by
-//!   its own Makefile (clang and lld) into `<target>/firmware`. QEMU's `apple-gfx-pci` loads it
-//!   as its default `romfile`.
+//!   archive needs.
 //! - `share/doc/reims-vgpu/`: the license, `LICENSE` and the texts in `LICENSES/` it points at,
 //!   copied from the repository under the same names ([`install_license`]).
 //!
-//! QEMU (`make qemu`) and the smoke link the archive; the suite's runner links the dylib, and
-//! loads it from the tree when it runs.
+//! QEMU (`make qemu`) links the archive; the C API's tests link the shared library.
 //!
 //! `--platform vulkan` builds the library on the Vulkan platform instead (`reims-vgpu-c`'s
 //! `vulkan` feature, architecture 2.2), into `<target>/dist-vulkan` unless `--out` says
@@ -42,12 +38,6 @@ pub const LIB: &str = "reims_vgpu";
 pub const PACKAGE: &str = "reims-vgpu";
 /// The header, under the name it is committed and installed with.
 pub const HEADER: &str = "reims_vgpu.h";
-/// The option ROM's file name: the firmware's build output, and its name in `share/reims-vgpu`
-/// and in QEMU's data directory.
-pub const ROM: &str = "ReimsVgpu.rom";
-/// The EFI driver the option ROM packages, in the repository, and the directory under the target
-/// dir it is built into.
-pub const FIRMWARE: &str = "firmware";
 /// The file that states the license, in the repository and in the tree's [`doc_dir`].
 pub const LICENSE: &str = "LICENSE";
 /// The directory of the license's texts, `<SPDX identifier>.txt` each, in the repository and in
@@ -146,15 +136,6 @@ pub fn c_api_args(o: &Options) -> Vec<String> {
     args
 }
 
-/// The `make` arguments that build the option ROM from `firmware`, the driver's directory, into
-/// `build`.
-pub fn firmware_args(firmware: &Path, build: &Path) -> Vec<String> {
-    let mut args = strs_with(&["-C"], firmware);
-    args.push(format!("BUILD={}", build.display()));
-    args.push("rom".to_owned());
-    args
-}
-
 /// `reims-vgpu.pc`. Its prefix is the file's grandparent directory (`${pcfiledir}`), so the tree
 /// can be moved.
 pub fn pc_file(version: &str, libs_private: &[String]) -> String {
@@ -163,11 +144,9 @@ pub fn pc_file(version: &str, libs_private: &[String]) -> String {
          prefix=${{pcfiledir}}/../..\n\
          libdir=${{prefix}}/lib\n\
          includedir=${{prefix}}/include\n\
-         # The EFI option ROM for the PCI device, 106b:eeee.\n\
-         optionrom=${{prefix}}/share/{PACKAGE}/{ROM}\n\
          \n\
          Name: {PACKAGE}\n\
-         Description: The host side of the paravirtualized GPU that macOS guests drive\n\
+         Description: The host side of the reims-graphics device, the GPU macOS guests drive\n\
          Version: {version}\n\
          Libs: -L${{libdir}} -l{LIB}\n\
          Libs.private: {}\n\
@@ -177,14 +156,13 @@ pub fn pc_file(version: &str, libs_private: &[String]) -> String {
 }
 
 /// The files `dist` writes under its output directory, relative to it: the archive, the shared
-/// library (`native::SHARED_LIBRARY_EXTENSION`), the package, the header and the ROM.
-pub fn layout() -> [String; 5] {
+/// library (`native::SHARED_LIBRARY_EXTENSION`), the package and the header.
+pub fn layout() -> [String; 4] {
     [
         format!("lib/lib{LIB}.a"),
         format!("lib/lib{LIB}.{}", native::SHARED_LIBRARY_EXTENSION),
         format!("lib/pkgconfig/{PACKAGE}.pc"),
         format!("include/{HEADER}"),
-        format!("share/{PACKAGE}/{ROM}"),
     ]
 }
 
@@ -231,8 +209,7 @@ pub fn cmd_dist(args: &[String]) -> Res<bool> {
     let target = target_dir(&mut System)?;
     let o = parse_args(args, &target)?;
     let header = repo_root().join("crates/reims-vgpu-c/include").join(HEADER);
-    let firmware = repo_root().join(FIRMWARE);
-    let out = native::dist(&mut System, &o, &target, &header, &firmware)?;
+    let out = native::dist(&mut System, &o, &target, &header)?;
     let license = install_license(&repo_root(), &out)?;
     for p in layout().into_iter().chain(license) {
         println!("dist: {}", out.join(p).display());
@@ -384,21 +361,12 @@ mod tests {
     }
 
     #[test]
-    fn firmware_args_build_the_rom_into_the_build_dir() {
-        assert_eq!(
-            firmware_args(Path::new("/r/firmware"), Path::new("/t/firmware")).join(" "),
-            "-C /r/firmware BUILD=/t/firmware rom"
-        );
-    }
-
-    #[test]
-    fn pc_file_links_the_library_and_names_the_rom() {
+    fn pc_file_links_the_library() {
         let pc = pc_file("1.2.3", &strs(&["-framework", "Metal", "-lobjc"]));
         for line in [
             "prefix=${pcfiledir}/../..",
             "libdir=${prefix}/lib",
             "includedir=${prefix}/include",
-            "optionrom=${prefix}/share/reims-vgpu/ReimsVgpu.rom",
             "Name: reims-vgpu",
             "Version: 1.2.3",
             "Libs: -L${libdir} -lreims_vgpu",
@@ -489,10 +457,12 @@ mod tests {
     #[test]
     fn layout_matches_what_the_pc_file_names() {
         let pc = pc_file("0", &[]);
-        let [archive, _shared, pcpath, header, rom] = layout();
+        let [archive, _shared, pcpath, header] = layout();
         assert_eq!(archive, "lib/libreims_vgpu.a");
         assert_eq!(pcpath, "lib/pkgconfig/reims-vgpu.pc");
         assert_eq!(header, "include/reims_vgpu.h");
-        assert!(pc.contains(&format!("${{prefix}}/{rom}")));
+        assert!(
+            pc.contains("libdir=${prefix}/lib\n") && pc.contains("includedir=${prefix}/include\n")
+        );
     }
 }

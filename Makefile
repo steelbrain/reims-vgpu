@@ -2,8 +2,8 @@
 # repository root.
 #
 #   make        the library as a plain library (cargo xtask dist) in
-#               target/dist: libreims_vgpu.a and .dylib, reims_vgpu.h,
-#               reims-vgpu.pc and the option ROM
+#               target/dist: libreims_vgpu.a and .dylib, reims_vgpu.h and
+#               reims-vgpu.pc
 #   make qemu   the library as a plain library (cargo xtask dist), then
 #               vendor/qemu's qemu-system-aarch64 with apple-gfx on its C API,
 #               linked statically through pkg-config, in build/qemu

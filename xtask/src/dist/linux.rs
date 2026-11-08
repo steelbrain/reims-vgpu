@@ -1,8 +1,7 @@
 //! `cargo xtask dist` on Linux: the library on the Vulkan platform, the only one Linux builds.
 //! The shared library is `lib/libreims_vgpu.so`, whose soname is its own name; nothing is signed
 //! and nothing has an install name. `Libs.private` is what rustc prints for linking the archive
-//! (`--print native-static-libs`). The ROM is built here, by the host's clang, so its bytes are
-//! that compiler's, not the Mac's: `dist` prints its sha256 and the clang that built it.
+//! (`--print native-static-libs`).
 //!
 //! The library's shaders are metallibs that only a Mac compiles: the build copies those the
 //! repository holds (`crates/reims-vgpu-vulkan/metallibs`), or those in the directory
@@ -20,10 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{
-    FIRMWARE, LIB, Options, Platform, ROM, c_api_args, firmware_args, install, layout, pc_file,
-    strs, strs_with, write,
-};
+use super::{LIB, Options, Platform, c_api_args, install, layout, pc_file, strs, strs_with, write};
 use crate::tools::Tools;
 use crate::util::Res;
 
@@ -85,15 +81,9 @@ pub fn native_static_libs(cargo: &str) -> Res<Vec<String>> {
     Ok(libs)
 }
 
-/// Builds and writes the tree with `tools`; `header` is the committed header and `firmware` the
-/// option ROM's driver. Returns the output directory.
-pub fn dist(
-    tools: &mut dyn Tools,
-    o: &Options,
-    target_dir: &Path,
-    header: &Path,
-    firmware: &Path,
-) -> Res<PathBuf> {
+/// Builds and writes the tree with `tools`; `header` is the committed header. Returns the output
+/// directory.
+pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path) -> Res<PathBuf> {
     if o.platform == Platform::Metal {
         return Err(
             "--platform metal: the Metal platform is macOS only; on Linux the library is built \
@@ -101,15 +91,10 @@ pub fn dist(
                 .to_owned(),
         );
     }
-    // The ROM first: it takes a second, and a host without lld fails before the library builds.
-    let firmware_build = target_dir.join(FIRMWARE);
-    tools
-        .run("make", &firmware_args(firmware, &firmware_build))
-        .map_err(|e| format!("{e}: the option ROM did not build (it needs clang and lld)"))?;
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     tools.run(&cargo, &cargo_args(o))?;
     let built = target_dir.join(o.profile.dir());
-    let [archive, shared, pc, include, rom] = layout().map(|p| o.out.join(p));
+    let [archive, shared, pc, include] = layout().map(|p| o.out.join(p));
 
     localize(
         tools,
@@ -123,8 +108,6 @@ pub fn dist(
     // in the target dir, not the one installed.
     let libs = native_static_libs(&tools.output(&cargo, &static_libs_args(o))?)?;
     write(&pc, &pc_file(env!("CARGO_PKG_VERSION"), &libs))?;
-    install(&firmware_build.join(ROM), &rom, 0o644)?;
-    println!("{}", rom_line(tools, &rom)?);
     Ok(o.out.clone())
 }
 
@@ -220,19 +203,6 @@ fn set_mode(file: &Path, mode: u32) -> Res<()> {
         .map_err(|e| format!("{}: {e}", file.display()))
 }
 
-/// The line that names the ROM a boot used: its sha256 and the clang that built it. The ROM's
-/// bytes depend on the compiler, so a ROM built here differs from the Mac's, and from one an
-/// earlier clang built.
-fn rom_line(tools: &mut dyn Tools, rom: &Path) -> Res<String> {
-    let sha = tools.output("sha256sum", &strs_with(&[], rom))?;
-    let clang = tools.output("clang", &strs(&["--version"]))?;
-    Ok(format!(
-        "dist: {ROM} sha256 {}, built by {}",
-        sha.split_whitespace().next().unwrap_or_default(),
-        clang.lines().next().unwrap_or_default()
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::parse_args;
@@ -307,41 +277,19 @@ mod tests {
     }
 
     #[test]
-    fn rom_line_names_the_roms_hash_and_compiler() {
-        struct Answers;
-        impl Tools for Answers {
-            fn run(&mut self, _: &str, _: &[String]) -> Res<()> {
-                Ok(())
-            }
-            fn output(&mut self, program: &str, _: &[String]) -> Res<String> {
-                Ok(match program {
-                    "sha256sum" => "9b4d4a9d  /t/ReimsVgpu.rom".to_owned(),
-                    _ => "clang version 23.1.1\nTarget: x86_64-pc-linux-gnu".to_owned(),
-                })
-            }
-        }
-        assert_eq!(
-            rom_line(&mut Answers, Path::new("/t/ReimsVgpu.rom")).unwrap(),
-            "dist: ReimsVgpu.rom sha256 9b4d4a9d, built by clang version 23.1.1"
-        );
-    }
-
-    #[test]
     fn layout_names_the_shared_object() {
         assert_eq!(layout()[1], "lib/libreims_vgpu.so");
     }
 
-    /// A tree the build would write: the libraries Cargo built, the header and the ROM.
-    fn built(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    /// A tree the build would write: the libraries Cargo built and the header.
+    fn built(name: &str) -> (PathBuf, PathBuf, PathBuf) {
         let root = tmp(name);
         let target = root.join("target");
         put(&target.join("release/libreims_vgpu_c.a"), "archive");
         put(&target.join("release/libreims_vgpu_c.so"), "shared");
         let header = root.join("reims_vgpu.h");
         put(&header, "header");
-        // What the firmware's make writes.
-        put(&target.join("firmware/ReimsVgpu.rom"), "rom");
-        (root.clone(), target, header, root.join("firmware"))
+        (root.clone(), target, header)
     }
 
     /// The programs as `dist` runs them: each call recorded; `ar` writes the archive it names,
@@ -378,8 +326,6 @@ mod tests {
             Ok(match program {
                 "nm" if last.ends_with(".o") => self.object.clone(),
                 "nm" => self.archive.clone(),
-                "sha256sum" => "9b4d4a9d  ReimsVgpu.rom".to_owned(),
-                "clang" => "clang version 23.1.1".to_owned(),
                 _ => answer,
             })
         }
@@ -394,26 +340,24 @@ mod tests {
 
     #[test]
     fn dist_writes_the_tree_with_rustcs_libraries() {
-        let (root, target, header, firmware) = built("tree");
+        let (root, target, header) = built("tree");
         let o = options(&[], &target);
         // A previous tree's files are replaced.
         put(&o.out.join("lib/libreims_vgpu.so"), "old");
         put(&o.out.join("lib/libreims_vgpu.a"), "old");
         let mut tools = Programs::new(OBJECT, LOCALIZED_ARCHIVE);
-        let out = dist(&mut tools, &o, &target, &header, &firmware).unwrap();
+        let out = dist(&mut tools, &o, &target, &header).unwrap();
         assert_eq!(out, target.join("dist-vulkan"));
         let read = |p: &str| std::fs::read_to_string(out.join(p)).unwrap();
         assert_eq!(read("lib/libreims_vgpu.a"), "localized");
         assert_eq!(read("lib/libreims_vgpu.so"), "shared");
         assert_eq!(read("include/reims_vgpu.h"), "header");
-        assert_eq!(read("share/reims-vgpu/ReimsVgpu.rom"), "rom");
         assert!(
             read("lib/pkgconfig/reims-vgpu.pc")
                 .contains("Libs.private: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc\n")
         );
         assert_eq!(mode(&out.join("lib/libreims_vgpu.so")), 0o755);
         assert_eq!(mode(&out.join("lib/libreims_vgpu.a")), 0o644);
-        assert_eq!(mode(&out.join("share/reims-vgpu/ReimsVgpu.rom")), 0o644);
         let work = target.join("dist-localized");
         let keep = work.join("keep-global-symbols");
         assert_eq!(
@@ -423,21 +367,13 @@ mod tests {
         let object = work.join("reims_vgpu.o");
         let archive = out.join("lib/libreims_vgpu.a");
         let calls = tools.log.lines();
-        assert_eq!(
-            calls[0],
-            format!(
-                "make -C {} BUILD={} rom",
-                firmware.display(),
-                target.join("firmware").display()
-            )
-        );
         assert!(
-            calls[1].ends_with(" -- -C link-arg=-Wl,-soname,libreims_vgpu.so"),
+            calls[0].ends_with(" -- -C link-arg=-Wl,-soname,libreims_vgpu.so"),
             "{}",
-            calls[1]
+            calls[0]
         );
         assert_eq!(
-            calls[2..7],
+            calls[1..6],
             [
                 format!(
                     "ld -r --whole-archive {} -o {}",
@@ -455,32 +391,23 @@ mod tests {
             ]
         );
         assert!(
-            calls[7].ends_with(" -- --print native-static-libs"),
+            calls[6].ends_with(" -- --print native-static-libs"),
             "{}",
-            calls[7]
+            calls[6]
         );
-        assert_eq!(
-            calls[8..],
-            [
-                format!(
-                    "sha256sum {}",
-                    out.join("share/reims-vgpu/ReimsVgpu.rom").display()
-                ),
-                "clang --version".to_owned(),
-            ]
-        );
+        assert_eq!(calls.len(), 7, "{calls:?}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A global the archive still defines besides the C API's fails the dist, naming it
     #[test]
     fn dist_fails_where_the_archive_keeps_another_global() {
-        let (root, target, header, firmware) = built("leak");
+        let (root, target, header) = built("leak");
         let o = options(&[], &target);
         let leaky = "libreims_vgpu.a[reims_vgpu.o]:\nrvg_graphics_device_create T 1000 20\n\
                      SDL_Init T 2000 40\n";
         let mut tools = Programs::new(OBJECT, leaky);
-        let e = dist(&mut tools, &o, &target, &header, &firmware).unwrap_err();
+        let e = dist(&mut tools, &o, &target, &header).unwrap_err();
         assert!(e.contains("1 global symbols besides the C API's"), "{e}");
         assert!(e.contains("SDL_Init"), "{e}");
         std::fs::remove_dir_all(&root).unwrap();
@@ -489,10 +416,10 @@ mod tests {
     /// An object with no `rvg_` function is refused before anything is made local
     #[test]
     fn dist_refuses_an_archive_without_the_c_api() {
-        let (root, target, header, firmware) = built("noapi");
+        let (root, target, header) = built("noapi");
         let o = options(&[], &target);
         let mut tools = Programs::new("SDL_Init T 2000 40\n", LOCALIZED_ARCHIVE);
-        let e = dist(&mut tools, &o, &target, &header, &firmware).unwrap_err();
+        let e = dist(&mut tools, &o, &target, &header).unwrap_err();
         assert!(e.contains("defines no rvg_ function"), "{e}");
         assert!(
             !tools.log.lines().iter().any(|l| l.starts_with("objcopy")),
@@ -514,29 +441,13 @@ mod tests {
 
     #[test]
     fn dist_refuses_metal_before_building() {
-        let (root, target, header, firmware) = built("refusals");
+        let (root, target, header) = built("refusals");
         let mut log = Log::default();
         let metal = options(&["--platform", "metal"], &target);
-        let e = dist(&mut log, &metal, &target, &header, &firmware).unwrap_err();
+        let e = dist(&mut log, &metal, &target, &header).unwrap_err();
         assert!(e.contains("--platform metal"), "{e}");
         assert!(log.calls.is_empty(), "{:?}", log.calls);
         assert!(!metal.out.exists());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn dist_stops_before_the_library_when_the_rom_does_not_build() {
-        let (root, target, header, firmware) = built("norom");
-        let o = options(&[], &target);
-        let mut log = Log {
-            fail: Some("make"),
-            ..Log::default()
-        };
-        let e = dist(&mut log, &o, &target, &header, &firmware).unwrap_err();
-        assert!(e.contains("make failed"), "{e}");
-        assert!(e.contains("clang and lld"), "{e}");
-        assert_eq!(log.calls.len(), 1, "{:?}", log.calls);
-        assert!(!o.out.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -36,7 +36,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "dist",
-        about: "the library as a plain library in target/dist: libreims_vgpu.a and .dylib, reims_vgpu.h, reims-vgpu.pc and the option ROM built from firmware/; --profile <p>, --out DIR, --platform vulkan (the proof of concept, in target/dist-vulkan)",
+        about: "the library as a plain library in target/dist: libreims_vgpu.a and .dylib, reims_vgpu.h and reims-vgpu.pc; --profile <p>, --out DIR, --platform vulkan (the proof of concept, in target/dist-vulkan)",
         run: dist::cmd_dist,
     },
     Command {

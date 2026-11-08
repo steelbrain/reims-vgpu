@@ -3,18 +3,10 @@
   3.0, UEFI specification 14.4.2): the EFI expansion ROM header, the PCI data
   structure, the image itself, and 0xFF padding to a multiple of 512 bytes.
 
-  The Makefile assembles this with EFI_IMAGE set to the linked image's path
-  and flattens the result to raw bytes. It is the apple-gfx-pci device's ROM
-  unless an including file defines ROM_VENDOR_ID, ROM_DEVICE_ID and
-  ROM_CLASS_CODE for another device first.
+  The Makefile assembles it, through ReimsGraphicsRom.S, with EFI_IMAGE set to
+  the linked image's path and ROM_VENDOR_ID, ROM_DEVICE_ID and ROM_CLASS_CODE
+  to the device's PCI identity, and flattens the result to raw bytes.
 **/
-
-#ifndef ROM_VENDOR_ID
-#include "ReimsVgpu.h"
-#define ROM_VENDOR_ID   REIMS_VGPU_VENDOR_ID
-#define ROM_DEVICE_ID   REIMS_VGPU_DEVICE_ID
-#define ROM_CLASS_CODE  REIMS_VGPU_CLASS_CODE
-#endif
 
 #define ROM_BLOCKS  ((RomEnd - RomStart) / 512)
 
