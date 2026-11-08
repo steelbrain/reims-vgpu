@@ -1284,14 +1284,6 @@ pub fn created_or_decided<T>(
 ///   them, and whose later levels lie apart from the heap's bytes, a 1D array's GPU reads reading
 ///   each texel, where Metal's paths address those texels at bytes that differ by path. Announced
 ///   inside the heap's creator of the texture, which dies at its selector;
-/// - `ReadOnlyPagesWritten`: a no-copy buffer, heap or rebind over pages the process maps
-///   read-only, imported as dma-bufs of its pages, whose GPU writes reach the pages, where after
-///   Metal's the CPU reads them as they were. Announced inside the call that makes it, which dies
-///   at its selector. On Linux this platform gives the runtime a writable twin of a surface's
-///   read-only alias and of a range core maps read-only, whose writes die where they are
-///   encoded, and every other read-only page as it is, which the views' gate refuses, so the
-///   runtime copies it (`CopiedHostPages`): no call here reaches it where the runtime asks the
-///   gate, every import by pointer (`crate::os`'s import);
 /// - `CopiedHostPages`: a no-copy buffer, heap or rebind made over a copy of the guest's pages in
 ///   memory of the device's own, as their import failed (out of memory, or a driver out of the
 ///   mappings the host's kernel allows), or the views' gate refused it on Linux, where mapping the
@@ -1311,7 +1303,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 141] = [
+pub const DIES: [rt::Degradation; 140] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1449,7 +1441,6 @@ pub const DIES: [rt::Degradation; 141] = [
     rt::Degradation::DeviceSubpixelSnap,
     rt::Degradation::PredicationWordPastBuffer,
     rt::Degradation::HeapTwoPlaneLayout,
-    rt::Degradation::ReadOnlyPagesWritten,
     rt::Degradation::CopiedHostPages,
     rt::Degradation::CoverageReadsRoundedAlpha,
     rt::Degradation::UnmeasuredFetchBlend,
