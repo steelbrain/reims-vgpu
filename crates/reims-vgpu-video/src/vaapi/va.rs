@@ -14,6 +14,7 @@ mod calls;
 mod caps;
 mod display;
 mod encoder;
+mod export;
 mod fence;
 mod ffi;
 mod frame;
@@ -40,7 +41,8 @@ pub use encoder::{
     EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, UploadMethod,
     VideoEncoder, encoder_support,
 };
-pub use frame::{Frame, GuestWrites, PlaneRows, ReadBack};
+pub use export::{ExportedPlane, SurfaceExport};
+pub use frame::{Frame, FrameHold, GuestWrites, PlaneRows, ReadBack};
 pub use h264::H264Decoder;
 pub use hevc::HevcDecoder;
 pub use import_check::{ImportWrite, ImportWrites};

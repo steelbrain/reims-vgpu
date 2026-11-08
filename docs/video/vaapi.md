@@ -32,7 +32,7 @@ Intel runs were made on the Iris Xe of an i9-13900H on iHD. Paths are
 | A frame written in place into a caller's pages ("Zero copy"), and the wait for a run's writes outside the driver's lock | `src/vaapi/va/zero_copy.rs`, `src/vaapi/va/fence.rs` |
 | The bounded waits ("Waiting for the GPU"), and their tests on a held GPU | `src/vaapi/va/wait.rs`, `src/vaapi/va/wait/`, `src/vaapi/va/spin.rs` |
 | The encoders: `VideoEncoder` and its accelerator | `src/vaapi/va/encoder.rs`, `src/vaapi/va/encoder/`, `src/vaapi/va/ffi/encode.rs` |
-| The reims-graphics device's decode on VA-API: each picture written in place by the driver's video processing, or copied by the CPU ("The reims-graphics device") | reims-vgpu's `src/graphics/vaapi.rs`, `src/graphics/video_host.rs` |
+| The reims-graphics device's decode on VA-API: each picture written in place by the driver's video processing, copied by the runtime device's GPU, or copied by the CPU ("The reims-graphics device") | reims-vgpu's `src/graphics/vaapi.rs`, `src/graphics/vaapi/gpu_copy.rs`, `src/graphics/video_host.rs`; the decode surface's export, `src/vaapi/va/export.rs`; the Vulkan platform's copy, `os/linux/plane_copy.rs` |
 | `vaapi-probe`, which stands in for `vainfo`; `vaapi-encode-probe`, the encoders' attributes | `examples/vaapi-probe.rs`, `examples/vaapi-encode-probe.rs` |
 | H.264's hardware check and its tools | `tools/h264-check.sh`, `examples/h264-framemd5/`, `examples/h264-info.rs`, `examples/h264-poc1.rs`, `examples/h264-craft.rs` |
 | HEVC's hardware check and its tools | `tools/hevc-check.sh`, `examples/hevc-framemd5.rs`, `examples/hevc-info.rs`, `examples/hevc-cut.rs`, `examples/hevc-craft.rs` |
@@ -328,11 +328,12 @@ starts a multiple of its alignment, and, where it writes whole rows alone
 as iHD does, the luma plane at a page's first byte and the chroma plane
 whole rows of the luma's pitch after it ([bugs.md](bugs.md), U26). Frames
 of an odd width or height are declined on every driver. A declined frame
-takes the CPU's copy. The graphics device asks the guest for planes at the
-check's alignment ([devices.md](devices.md), "How each arm lands a
-picture"), but the frames VideoToolbox hands the guest's decoder have
-CoreVideo's own layout, which neither driver's processing writes
-([bugs.md](bugs.md), B93).
+takes the runtime device's GPU copy, and the CPU's where that declines too
+("The reims-graphics device"). The graphics device asks the guest for
+planes at the check's alignment ([devices.md](devices.md), "How each arm
+lands a picture"), but the frames VideoToolbox hands the guest's decoder
+have CoreVideo's own layout, each plane 32 bytes into its page, which
+neither driver's processing writes and the GPU's copy does.
 
 **What udmabuf takes.** The kernel's `udmabuf` puts at most `list_limit`
 runs of pages and `size_limit_mb` MiB in one dma-buf: 1,024 and 64 at its
@@ -414,22 +415,40 @@ the render node of the runtime device's own GPU, whatever its vendor
   decode order. It starts the hardware's work and answers the access
   unit's picture: one, or none for parameter sets and for a picture that
   random access skips.
-- **A picture lands** in the output's planes one of two ways, the second
-  where the first refuses:
+- **A picture lands** in the output's planes one of three ways, each
+  where those before it refuse:
   1. by the driver's video processing, in place, into the planes' pages
      ("Zero copy"): where both planes lie in one memory a dma-buf is made
      of, and the import check's answer for the frame's format takes their
      layout;
-  2. by the CPU: the frame read back ("The copy back") and copied into the
+  2. by the runtime device's GPU, into the buffer each plane lies in, the
+     surface's pages or its device cache, at the plane's offset and rows:
+     the decode surface's export as dma-bufs (`Frame::export`,
+     `vaExportSurfaceHandle` with each plane a layer of its own, kept with
+     the surface's pool), each plane imported once as an image of its
+     format and DRM format modifier, and copied out with
+     `vkCmdCopyImageToBuffer` on a queue of the session's copier
+     (reims-vgpu's `src/graphics/vaapi/gpu_copy.rs`, the Vulkan
+     platform's `PlaneCopier`). It writes the crop the CPU's copy writes,
+     and nothing past it (`crop_extent`), once the decode is done, and the
+     session signals the decode once the copy is done on the GPU. A device
+     that lists none of the dma-buf image extensions, an export not of a
+     layer a plane, or a plane in a buffer whose GPU writes do not reach
+     its memory, declines it;
+  3. by the CPU: the frame read back ("The copy back") and copied into the
      planes' host bytes, or into the session's staging where a plane lies
      in a device cache.
 
-  A session logs the first reason its pictures take the second way, as
+  A session logs each reason its pictures take the third way once, as
   `a picture copied by the CPU: rows of 1920 bytes: the driver imports
-  rows of a multiple of 256 bytes alone`, and its counts at its end, as
-  `a session ended after 300 decodes: landed 300 in the surface's pages,
-  by a CPU copy; 0 skipped, 0 failed`. A picture that does not land fails
-  its decode's command buffer ([devices.md](devices.md), "A decode").
+  rows of a multiple of 256 bytes alone; and the GPU's copy: …` (`; and
+  no GPU copy: …` where the device made the session no copier), its GPU
+  copies at its end, as `a session's pictures copied by the GPU into their
+  outputs: 300, 0.812 ms of GPU time each, 1.204 ms at most (300 timed)`,
+  and its counts, as `a session ended after 300 decodes: landed 300 in the
+  surface's pages, by the hardware; 0 skipped, 0 failed`. A picture that
+  does not land fails its decode's command buffer ([devices.md](devices.md),
+  "A decode").
 - **Surfaces.** A picture holds its decode surface until it lands, and
   the session holds no more pictures unlanded than the decoder's spare
   surfaces (`SPARE_FRAMES`, 2), so a decode always finds a free surface.
@@ -453,7 +472,34 @@ CPU. The frames VideoToolbox hands the guest's decoder have CoreVideo's
 own layout, each plane 32 bytes into its page and rows of the width
 rounded up a little, 1376 bytes at 1366. Neither driver's video
 processing writes that: radeonsi wants rows and planes 256 bytes apart,
-iHD the luma plane at a page's first byte ([bugs.md](bugs.md), B93).
+iHD the luma plane at a page's first byte. The runtime device's GPU
+copies them there instead (above).
+
+**Measured** in cold boots of an x86-64 macOS 26.7.2 guest at 3648x2038
+(2026-11-08), Safari playing 4K 60 fps HEVC clips, 8-bit then 10-bit, then
+two and three at once, 20 s each, the arm with the GPU's copy and the arm
+before it back to back on the same host and GPU:
+
+| GPU, drivers | pictures copied by the CPU | by the GPU, GPU time each | presented fps, one clip | two at once | three at once (frames dropped) |
+|---|---|---|---|---|---|
+| Radeon 780M, radeonsi and RADV (Mesa 26.2.6), before | 9979 | none | 55.9, 55.4 | 53.0, 55.0 | 50.0, 50.3, 52.0 (10, 11, 5) |
+| the same, with the GPU's copy | 0 | 10000, 1.01 ms (2.97 at most) | 56.2, 57.2 | 57.3, 53.2 | 53.2, 53.7, 52.5 (3, 2, 0) |
+| Iris Xe, iHD 26.3.5 and ANV (Mesa 26.2.6), before | 9899 | none | 56.0, 54.3 | 52.5, 54.6 | 52.3, 51.7, 53.5 (71, 74, 1) |
+| the same, with the GPU's copy | 0 | 10040, 0.52 ms (1.13 at most) | 56.8, 56.8 | 56.5, 56.3 | 53.8, 54.2, 56.4 (4, 3, 0) |
+
+No boot logged a `reims-vgpu: fatal` line. The runtime's shadows of the
+guest's textures over the planes are as they were either way: about 11 M
+texels copied in a frame of one clip on the 780M, 0.3 M on the Iris.
+
+**The GPU's copy against the CPU's**: the ignored test
+`a_picture_copied_by_the_gpu_is_the_cpus_copy_byte_for_byte` (reims-vgpu's
+`src/graphics/vaapi/tests.rs`) decodes the conformance scripts' Annex B
+streams (`RVG_VA_STREAMS`, their `build/h264-check` and `build/hevc-check`,
+`:`-separated), lands each picture both ways into CoreVideo's layout, 32
+bytes into host pages a no-copy buffer lies over, at two pitches, and
+compares every byte, the padding included. `RVG_VAAPI_NODE` names the GPU
+the runtime's default device must be on. **Measured** (2026-11-08): 4849
+pictures of 79 streams equal on the Radeon 780M, 4951 on the Iris Xe.
 
 ## Waiting for the GPU
 

@@ -12,7 +12,7 @@
 //! - **A decode** hands the access unit to the decoder (`H264Decoder`, `HevcDecoder` on Annex B,
 //!   in decode order), which starts the hardware's work and answers the access unit's frame: one,
 //!   or none for parameter sets and for a picture the stream's random access skips.
-//! - **A picture lands** in the output's planes one of two ways, each the fallback at the last's
+//! - **A picture lands** in the output's planes one of three ways, each the fallback at the last's
 //!   refusal, the session counting each:
 //!   1. **In the surface's pages, by the driver's video processing** (the VA crate's
 //!      `Frame::write_to_guest`): a run from the decode surface into a linear VA surface
@@ -22,11 +22,21 @@
 //!      frame's format right, at the alignment the planes' rows and starts are a multiple of,
 //!      and in whole rows where it writes them so. The run writes the planes' whole even width
 //!      and height within the coded picture, which [`layout`] tells the guest to make room for.
-//!   2. **By the CPU**: the frame read back (staged, or `vaGetImage`, the VA crate's way back),
+//!      CoreVideo's planes, 32 bytes into their pages, are written so by no driver: radeonsi
+//!      imports planes 256 bytes apart alone, iHD writes a plane only at its dma-buf's first byte
+//!      (`docs/video/bugs.md`, U26).
+//!   2. **By the runtime device's GPU** (`gpu_copy`): the decode surface exported as dma-bufs and
+//!      each plane copied into the plane's buffer, the guest's pages or the surface's device
+//!      cache, at its own rows and offset, the crop alone as the CPU's copy writes it
+//!      ([`crop_extent`]). It is taken wherever the open made a copier on the runtime device
+//!      ([`open_on`]), the device imports the driver's surfaces as images, and the planes'
+//!      buffer is their memory.
+//!   3. **By the CPU**: the frame read back (staged, or `vaGetImage`, the VA crate's way back),
 //!      and copied into the planes' host bytes, or into the session's staging for a plane in a
 //!      device cache.
 //!
-//!   The first reason a session's pictures take the second way is logged once.
+//!   Each reason a session's pictures take the third way is logged once, the GPU's copy's
+//!   refusal with the in-place write's: the copier's own where the session has none.
 //! - **The layout** ([`layout`]) is granularity [2, 2], so that each plane holds the crop's
 //!   even rows and columns, and the alignment the import check found for the codec's formats;
 //!   all zero where it found none.
@@ -63,6 +73,7 @@ use super::video_host::{
 };
 
 mod encode;
+mod gpu_copy;
 
 /// The backend's name in the session's log lines.
 const NAME: &str = "VA-API";
@@ -88,18 +99,20 @@ pub(crate) fn open_on(
         log::info!("hardware video: no VA-API: the device's GPU has no render node");
         return None;
     };
-    open::<VulkanPlatform>(device, device.registry_id, &node, runtime)
+    let copies: Arc<dyn GpuCopies<VulkanPlatform>> = Arc::new(gpu_copy::RuntimeCopies::new(device));
+    open::<VulkanPlatform>(device, device.registry_id, &node, runtime, Some(copies))
 }
 
 /// The VA-API video of `device`'s GPU, on its render node `node`, its decoders' threads and waits
-/// on `runtime`; one per device while it lives, by `registry_id`. `None`, logged at `info` with
-/// why, where libva does not load, the node opens no display, or the driver decodes neither H.264
-/// nor HEVC.
+/// on `runtime`, its pictures copied by the GPU through `copies` where given; one per device while
+/// it lives, by `registry_id`. `None`, logged at `info` with why, where libva does not load, the
+/// node opens no display, or the driver decodes neither H.264 nor HEVC.
 pub(crate) fn open<P: Platform>(
     device: &P::Device,
     registry_id: u64,
     node: &Path,
     runtime: Arc<dyn Runtime>,
+    copies: Option<Arc<dyn GpuCopies<P>>>,
 ) -> Option<Arc<dyn GraphicsVideo<P>>> {
     type Made = Vec<(u64, Weak<dyn std::any::Any + Send + Sync>)>;
     static MADE: LazyLock<Mutex<Made>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -111,7 +124,7 @@ pub(crate) fn open<P: Platform>(
     if let Some(video) = kept {
         return Some(video);
     }
-    let video = match VaapiVideo::<P>::new(device, node, runtime) {
+    let video = match VaapiVideo::<P>::new(device, node, runtime, copies) {
         Ok(video) => Arc::new(video),
         Err(why) => {
             log::info!("hardware video: no VA-API at {}: {why}", node.display());
@@ -135,10 +148,17 @@ struct VaapiVideo<P: Platform> {
     writes_imports: ImportWrites,
     /// The imports of the outputs' memory, which the sessions share.
     imports: Arc<GuestWrites>,
+    /// What makes each session's GPU copies of its pictures (the module doc's second way).
+    copies: Option<Arc<dyn GpuCopies<P>>>,
 }
 
 impl<P: Platform> VaapiVideo<P> {
-    fn new(device: &P::Device, node: &Path, runtime: Arc<dyn Runtime>) -> Result<Self, String> {
+    fn new(
+        device: &P::Device,
+        node: &Path,
+        runtime: Arc<dyn Runtime>,
+        copies: Option<Arc<dyn GpuCopies<P>>>,
+    ) -> Result<Self, String> {
         let started = runtime.now();
         let display = Display::open(node, Arc::clone(&runtime)).map_err(|e| e.to_string())?;
         let capabilities = display.capabilities().map_err(|e| e.to_string())?;
@@ -167,7 +187,16 @@ impl<P: Platform> VaapiVideo<P> {
             encoders,
             writes_imports,
             imports,
+            copies,
         })
+    }
+
+    /// A session's GPU copier; `Err` with why where the video makes none or the device refuses
+    /// it, which the session's CPU copies log.
+    fn copier(&self) -> SessionCopier<P> {
+        let copies = (self.copies.as_ref()).ok_or("the platform makes no GPU copies")?;
+        let copier = copies.copier()?;
+        Ok(Arc::new(Mutex::new(copier)))
     }
 }
 
@@ -210,6 +239,7 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
             codec: decoder,
             next_id: 0,
             imports: Arc::clone(&self.imports),
+            copier: self.copier(),
             said: Arc::new(Mutex::new(Vec::new())),
         };
         let session = HostVideoSession::new(&self.device, codec, NAME, Box::new(decoder))?;
@@ -342,16 +372,18 @@ enum Codec {
 }
 
 /// A session's decoder, and what its pictures land through.
-struct VaDecoder {
+struct VaDecoder<P: Platform> {
     codec: Codec,
     /// The id the next access unit is tagged with.
     next_id: u64,
     imports: Arc<GuestWrites>,
+    /// The session's GPU copies of its pictures, or why it has none.
+    copier: SessionCopier<P>,
     /// The reasons the session's pictures were copied by the CPU, each logged once.
     said: Arc<Mutex<Vec<String>>>,
 }
 
-impl VaDecoder {
+impl<P: Platform> VaDecoder<P> {
     fn frames(&mut self, au: &[u8]) -> Result<Vec<Frame>, BackendError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -363,7 +395,7 @@ impl VaDecoder {
     }
 }
 
-impl<P: Platform> HostDecoder<P> for VaDecoder {
+impl<P: Platform> HostDecoder<P> for VaDecoder<P> {
     fn parameter_sets(&mut self, sets: &[u8]) -> Result<(), BackendError> {
         match self.frames(sets)?.len() {
             0 => Ok(()),
@@ -383,6 +415,7 @@ impl<P: Platform> HostDecoder<P> for VaDecoder {
         Ok(Some(Box::new(VaPicture {
             frame,
             imports: Arc::clone(&self.imports),
+            copier: self.copier.clone(),
             said: Arc::clone(&self.said),
         })))
     }
@@ -397,14 +430,19 @@ impl<P: Platform> HostDecoder<P> for VaDecoder {
     }
 }
 
-/// A decoded frame, landed in its output by the driver's video processing or by the CPU.
-struct VaPicture {
+/// A decoded frame, landed in its output by the driver's video processing, the runtime device's
+/// GPU or the CPU.
+struct VaPicture<P: Platform> {
     frame: Frame,
     imports: Arc<GuestWrites>,
+    copier: SessionCopier<P>,
     said: Arc<Mutex<Vec<String>>>,
 }
 
-impl VaPicture {
+/// A session's GPU copier, its pictures' to share, or why it has none.
+type SessionCopier<P> = Result<Arc<Mutex<Box<dyn GpuCopier<P>>>>, String>;
+
+impl<P: Platform> VaPicture<P> {
     /// Logs, once a session, why a picture was copied by the CPU.
     fn copied_because(&self, why: String) {
         let mut said = self.said.lock();
@@ -415,7 +453,7 @@ impl VaPicture {
     }
 }
 
-impl<P: Platform> HostPicture<P> for VaPicture {
+impl<P: Platform> HostPicture<P> for VaPicture<P> {
     fn land(self: Box<Self>, to: &mut Landing<'_, P>) -> Result<(), BackendError> {
         let declined = match in_place(to.luma, to.chroma, self.frame.bit_depth()) {
             Ok((layout, pages)) => {
@@ -430,6 +468,13 @@ impl<P: Platform> HostPicture<P> for VaPicture {
                 }
             }
             Err(why) => why,
+        };
+        let declined = match &self.copier {
+            Ok(copier) => match copier.lock().copy(&self.frame, to.luma, to.chroma)? {
+                DeviceWrite::Written => return Ok(()),
+                DeviceWrite::Declined(why) => format!("{declined}; and the GPU's copy: {why}"),
+            },
+            Err(why) => format!("{declined}; and no GPU copy: {why}"),
         };
         self.copied_because(declined);
         let back = self.frame.read_back()?;
@@ -457,6 +502,70 @@ impl<P: Platform> HostPicture<P> for VaPicture {
         back.copy_into(rows(&planes.luma)?, rows(&planes.chroma)?)?;
         Ok(())
     }
+}
+
+/// What makes the GPU copies of a video's sessions (the module doc's second way): one copier a
+/// session.
+pub(crate) trait GpuCopies<P: Platform>: Send + Sync {
+    /// A session's copier; `Err` with why where the device makes none.
+    fn copier(&self) -> Result<Box<dyn GpuCopier<P>>, String>;
+}
+
+/// One session's GPU copies of its pictures into their outputs.
+pub(crate) trait GpuCopier<P: Platform>: Send {
+    /// Writes `frame` into `luma` and `chroma` where they lie, its crop as the CPU's copy writes
+    /// it ([`crop_extent`]), once its decode is done, and returns once the GPU wrote it;
+    /// [`DeviceWrite::Declined`] with why, nothing written, where it cannot. `Err` where the
+    /// decode failed, or the copy failed once on the GPU, which may write the planes still.
+    fn copy(
+        &mut self,
+        frame: &Frame,
+        luma: &OutputPlane<P>,
+        chroma: &OutputPlane<P>,
+    ) -> Result<DeviceWrite, BackendError>;
+}
+
+/// What one output plane holds of a picture, as the CPU's copy fits a picture to it: the bytes of
+/// its rows, the bytes from one row to the next, and its rows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Room {
+    pub(crate) row_bytes: u64,
+    pub(crate) bytes_per_row: u64,
+    pub(crate) rows: u64,
+}
+
+impl Room {
+    /// What `plane` holds: its row's bytes and pitch, and its crop's rows.
+    pub(crate) fn of<P: Platform>(plane: &OutputPlane<P>) -> Room {
+        Room {
+            row_bytes: plane.row_bytes,
+            bytes_per_row: plane.bytes_per_row,
+            rows: plane.height,
+        }
+    }
+}
+
+/// The columns and rows of a picture of `size`, of `sample`-byte samples, that the CPU's copy
+/// writes into planes of `luma` and `chroma` room (the VA crate's `ReadBack::copy_into`): as many
+/// as the picture, each plane's rows and its rows' bytes hold, the chroma plane's columns in whole
+/// pairs; `None` for none. The chroma plane takes half of each, rounded up, from half the crop's
+/// origin.
+pub(crate) fn crop_extent(
+    size: (u32, u32),
+    sample: u64,
+    luma: Room,
+    chroma: Room,
+) -> Option<(u32, u32)> {
+    let fit = |bytes: u64| u32::try_from(bytes / sample.max(1)).unwrap_or(u32::MAX);
+    let rows = |rows: u64| u32::try_from(rows).unwrap_or(u32::MAX);
+    let chroma_columns = fit(chroma.row_bytes.min(chroma.bytes_per_row)) & !1;
+    let width = (size.0)
+        .min(fit(luma.row_bytes.min(luma.bytes_per_row)))
+        .min(chroma_columns.max(1));
+    let height = (size.1)
+        .min(rows(luma.rows))
+        .min(rows(chroma.rows).saturating_mul(2));
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 /// The layout of a frame of `bit_depth` written in place in the planes `luma` and `chroma`, and

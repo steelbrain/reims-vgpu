@@ -119,7 +119,7 @@ buffer of an encode session's process (reims-vgpu's `graphics/video_host/encode.
 | arm | access unit in place | a picture lands | layout asked of the guest |
 |---|---|---|---|
 | NVDEC | at any place and length | by one CUDA copy a plane: into the output's device caches, through CUDA's import of their memory, where the flag is set; into the pages, where CUDA registers their view; else read back and copied by the CPU | none |
-| VA-API | at any place and length | by the driver's video processing into the pages, where the import check passed for the format and the planes meet its alignment; else read back and copied by the CPU | granularity [2, 2], the import check's alignment |
+| VA-API | at any place and length | by the driver's video processing into the pages, where the import check passed for the format and the planes meet its alignment; else by the runtime device's GPU, a copy of each plane of the decode surface's export as dma-bufs into the pages or the device caches, where it imports them; else read back and copied by the CPU | granularity [2, 2], the import check's alignment |
 
 Both run in reims-vgpu's host video session (`graphics/video_host.rs`, [backends.md](backends.md),
 "The traits"): a plane in a device cache the arm does not write itself takes its picture staged

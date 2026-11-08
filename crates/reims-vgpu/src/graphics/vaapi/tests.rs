@@ -197,3 +197,250 @@ fn an_in_place_layout_holds_the_crop_s_even_rows_and_columns() {
     assert_eq!((layout.width, layout.height), (640, 361));
     assert!(in_place_layout(luma, chroma, 12).is_err());
 }
+
+fn room(row_bytes: u64, bytes_per_row: u64, rows: u64) -> Room {
+    Room {
+        row_bytes,
+        bytes_per_row,
+        rows,
+    }
+}
+
+/// The GPU's copy takes the columns and rows the CPU's copy writes: the crop where the planes
+/// hold it, else as much as each plane's rows and their bytes hold, the chroma plane's columns in
+/// whole pairs
+#[test]
+fn the_gpu_copy_takes_the_crop_the_cpu_copy_writes() {
+    // CoreVideo's 4K NV12 frame: rows of 3840 bytes, 2160 luma rows and 1080 chroma.
+    let (luma, chroma) = (room(3840, 3840, 2160), room(3840, 3840, 1080));
+    assert_eq!(
+        crop_extent((3840, 2160), 1, luma, chroma),
+        Some((3840, 2160))
+    );
+    // P010: two bytes a sample.
+    let (luma, chroma) = (room(7680, 7680, 2160), room(7680, 7680, 1080));
+    assert_eq!(
+        crop_extent((3840, 2160), 2, luma, chroma),
+        Some((3840, 2160))
+    );
+    // An odd crop, 641x361, in planes of its size: its chroma's last pair and row taken whole.
+    let (luma, chroma) = (room(641, 704, 361), room(642, 704, 181));
+    assert_eq!(crop_extent((641, 361), 1, luma, chroma), Some((641, 361)));
+    // Planes smaller than the picture take its top left, as much as fits.
+    let (luma, chroma) = (room(1280, 1280, 720), room(1280, 1280, 360));
+    assert_eq!(
+        crop_extent((1920, 1080), 1, luma, chroma),
+        Some((1280, 720))
+    );
+    // A chroma plane narrower than the luma's bounds the width in whole pairs.
+    let (luma, chroma) = (room(1920, 1920, 1080), room(1001, 1024, 540));
+    assert_eq!(
+        crop_extent((1920, 1080), 1, luma, chroma),
+        Some((1000, 1080))
+    );
+    assert_eq!(
+        crop_extent((1920, 1080), 1, room(0, 64, 1080), chroma),
+        None
+    );
+    assert_eq!(
+        crop_extent((1920, 1080), 1, luma, room(1920, 1920, 0)),
+        None
+    );
+}
+
+/// The conformance suite's streams, through the arm's decoders, each picture landed by the GPU's
+/// copy into planes laid out as CoreVideo lays a frame's (32 bytes into their pages), and by the
+/// CPU's copy into the same layout: every byte of the two must be equal, the bytes before, between
+/// and past the planes' rows included. The planes' rows are the frame's bytes for one picture and
+/// 64 bytes past a multiple of 64 for the next, so rows with bytes past them are copied too. The
+/// pages are host memory a no-copy buffer lies over, as a surface's in the guest's RAM do.
+///
+/// The runtime's default device must be of the GPU `RVG_VAAPI_NODE` names, where it is set.
+/// `RVG_VA_STREAMS` names the directories, `:`-separated, whose Annex B streams (`*.264`,
+/// `*.265`, but `*.part.*`) are decoded: the conformance scripts' `build/h264-check` and
+/// `build/hevc-check`. A stream the decoder refuses (as the suite has it refuse some) is decoded up
+/// to its refusal; a leading picture random access skips is skipped.
+#[test]
+#[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
+fn a_picture_copied_by_the_gpu_is_the_cpus_copy_byte_for_byte() {
+    use reims_vgpu_video::codec::{h264, hevc};
+
+    let dirs = std::env::var("RVG_VA_STREAMS").expect("RVG_VA_STREAMS: the streams' directories");
+    let mut streams: Vec<std::path::PathBuf> = (dirs.split(':'))
+        .flat_map(|dir| std::fs::read_dir(dir).expect("a streams directory"))
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| {
+            let name = path.to_string_lossy();
+            (name.ends_with(".264") || name.ends_with(".265")) && !name.contains(".part.")
+        })
+        .collect();
+    streams.sort();
+    assert!(!streams.is_empty(), "no streams in {dirs}");
+    let platform = Arc::new(VulkanPlatform::new());
+    crate::entry::run(|_| {
+        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
+        if let Ok(asked) = std::env::var("RVG_VAAPI_NODE") {
+            let canonical = |p: &std::path::Path| std::fs::canonicalize(p).expect("a node");
+            assert_eq!(
+                canonical(&node),
+                canonical(std::path::Path::new(&asked)),
+                "the runtime device is not of the GPU RVG_VAAPI_NODE names"
+            );
+        }
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
+        let copies = gpu_copy::RuntimeCopies::new(&device);
+        let mut copier = copies.copier().expect("a GPU copier on the device");
+        let (mut pictures, mut refused) = (0usize, Vec::new());
+        for stream in &streams {
+            let file = std::fs::read(stream).expect("a stream");
+            let (units, mut decoder) = if stream.to_string_lossy().ends_with(".265") {
+                let decoder = HevcDecoder::new_annex_b(&display);
+                (hevc::nal::access_units(&file), Codec::Hevc(decoder))
+            } else {
+                let decoder = H264Decoder::new_annex_b(&display);
+                (h264::nal::access_units(&file), Codec::H264(decoder))
+            };
+            for (id, unit) in units.iter().enumerate() {
+                let id = u64::try_from(id).expect("an id");
+                let decoded = match &mut decoder {
+                    Codec::H264(d) => d.decode(unit, id),
+                    Codec::Hevc(d) => d.decode(unit, id),
+                };
+                match decoded {
+                    Ok(frames) => {
+                        for frame in &frames {
+                            land_both_ways(&mut *copier, &device, frame, pictures, stream);
+                            pictures += 1;
+                        }
+                    }
+                    // A leading picture random access skips: no picture, and the stream goes on.
+                    Err(reims_vgpu_video::vaapi::Error::HevcBitstream(
+                        hevc::Error::SkippedLeadingPicture,
+                    )) => {}
+                    Err(error) => {
+                        refused.push(format!("{}: {error}", stream.display()));
+                        break;
+                    }
+                }
+            }
+            let flushed = match &mut decoder {
+                Codec::H264(d) => d.flush(),
+                Codec::Hevc(d) => d.flush(),
+            };
+            for frame in &flushed.unwrap_or_default() {
+                land_both_ways(&mut *copier, &device, frame, pictures, stream);
+                pictures += 1;
+            }
+        }
+        eprintln!(
+            "{pictures} pictures of {} streams copied by the GPU as by the CPU; refused: {refused:?}",
+            streams.len()
+        );
+        assert!(pictures > 0);
+    });
+}
+
+/// Lands `frame`, the `n`th picture of the run, by `copier` into planes laid out as CoreVideo
+/// lays a frame's, in host pages a buffer of `device` lies over, and by the CPU's copy into the
+/// same layout in memory of its own; panics where a byte of the two differs.
+fn land_both_ways(
+    copier: &mut dyn GpuCopier<VulkanPlatform>,
+    device: &VulkanDevice,
+    frame: &Frame,
+    n: usize,
+    stream: &std::path::Path,
+) {
+    use reims_vgpu_vulkan::core::platform::HostRange;
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+    use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
+    use reims_vgpu_vulkan::core::raise::OnFault;
+    use reims_vgpu_vulkan::os::OsVm;
+
+    let vm = OsVm::new();
+    let sample: u64 = if frame.bit_depth() > 8 { 2 } else { 1 };
+    let (width, height) = (u64::from(frame.width()), u64::from(frame.height()));
+    let luma_bytes = width * sample;
+    let chroma_bytes = width.div_ceil(2) * 2 * sample;
+    let pitch = if n % 2 == 0 {
+        luma_bytes.max(chroma_bytes)
+    } else {
+        luma_bytes.max(chroma_bytes).next_multiple_of(64) + 64
+    };
+    let chroma_rows = height.div_ceil(2);
+    let (luma_at, chroma_at) = (0x20, 0x20 + pitch * height);
+    let len = (chroma_at + pitch * chroma_rows).next_multiple_of(vm.page_size());
+    let at = vm.allocate_anywhere(len).expect("host pages");
+    // SAFETY: the pages stay mapped until the runtime lets go of them, when its deallocator
+    // unmaps them, and nothing else reads or writes them meanwhile but the test's reads below.
+    let bytes = unsafe { HostRange::new(at, len) };
+    // As a no-copy buffer's pages must be: mapped until the runtime lets go of them, which may be
+    // after the buffer's drop.
+    let unmap: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let _ = OsVm::new().deallocate(at, len);
+    });
+    let buffer = (device.new_buffer_over_host_memory(OnFault::Return, bytes, 0, Some(unmap)))
+        .expect("no raise")
+        .expect("a buffer over the pages");
+    // SAFETY: the pages' `len` bytes, which no GPU work reaches yet.
+    unsafe { std::ptr::write_bytes(at.as_ptr::<u8>(), UNTOUCHED, usize_of(len)) };
+    let plane = |offset: u64, row_bytes: u64, w: u64, h: u64| OutputPlane {
+        buffer: buffer.clone_ref(),
+        offset,
+        bytes_per_row: pitch,
+        row_bytes,
+        width: w,
+        height: h,
+        rows_held: h,
+        cached: false,
+        host: Some(at.wrapping_add(offset)),
+        pages: None,
+        cache: None,
+    };
+    let luma = plane(luma_at, luma_bytes, width, height);
+    let chroma = plane(chroma_at, chroma_bytes, width.div_ceil(2), chroma_rows);
+    match copier.copy(frame, &luma, &chroma).expect("the GPU's copy") {
+        DeviceWrite::Written => {}
+        DeviceWrite::Declined(why) => panic!("{}: declined: {why}", stream.display()),
+    }
+    let mut cpu = vec![UNTOUCHED; usize_of(len)];
+    let (y, uv) = cpu.split_at_mut(usize_of(chroma_at));
+    (frame.read_back().expect("the read back"))
+        .copy_into(
+            plane_rows(&mut y[usize_of(luma_at)..], pitch, height, luma_bytes),
+            plane_rows(uv, pitch, chroma_rows, chroma_bytes),
+        )
+        .expect("the CPU's copy");
+    // SAFETY: the pages' `len` bytes, which the GPU's copy finished writing before it returned,
+    // and which nothing writes meanwhile.
+    let gpu = unsafe { std::slice::from_raw_parts(at.as_ptr::<u8>(), usize_of(len)) };
+    if let Some(first) = (0..gpu.len()).find(|&i| gpu[i] != cpu[i]) {
+        panic!(
+            "{} picture {n}, {width}x{height} at {sample}-byte samples, rows of {pitch}: byte \
+             {first} is {:#x} by the GPU's copy and {:#x} by the CPU's (luma at {luma_at}, chroma \
+             at {chroma_at})",
+            stream.display(),
+            gpu[first],
+            cpu[first]
+        );
+    }
+    drop((luma, chroma, buffer));
+}
+
+/// What the GPU's copies leave as it was: every byte past the planes' rows.
+const UNTOUCHED: u8 = 0xee;
+
+fn usize_of(n: u64) -> usize {
+    usize::try_from(n).expect("a size")
+}
+
+/// `rows` rows of `row_bytes` in `bytes`, `pitch` apart, for the CPU's copy.
+fn plane_rows(bytes: &mut [u8], pitch: u64, rows: u64, row_bytes: u64) -> PlaneRows<'_> {
+    PlaneRows {
+        bytes,
+        bytes_per_row: usize_of(pitch),
+        rows: usize_of(rows),
+        row_bytes: usize_of(row_bytes),
+    }
+}

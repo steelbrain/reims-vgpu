@@ -149,8 +149,8 @@ reims-vgpu-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  Q
   public repository `Cargo.toml` names, on the host's Vulkan driver, or MoltenVK on a Mac (a build
   for development and tests). Its OS services are its own: on macOS over the system's (`os/macos/`:
   IOSurfaces, Mach VM, the clock, threads, the autorelease pool, and the message layer, 4.6); on
-  Linux `os/linux/` (a host VM over `mmap` of the guest RAM's files, and an IOSurface stand-in over
-  that memory). It compiles the library's shaders (4.7). Where its answer differs from Metal's it logs the difference and goes on, and dies
+  Linux `os/linux/` (a host VM over `mmap` of the guest RAM's files, an IOSurface stand-in over
+  that memory, and the GPU's copies of a video driver's planes in dma-bufs into a runtime buffer). It compiles the library's shaders (4.7). Where its answer differs from Metal's it logs the difference and goes on, and dies
   where Metal would or where the runtime cannot run the call ([accuracy-ledger.md](accuracy-ledger.md)).
 - **Core** (`reims_vgpu_vulkan::core`) uses `parking_lot`, `zerocopy` and `log`, and nothing else
   of the Vulkan crate: the crate's platform implements core's traits, and core is generic over

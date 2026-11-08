@@ -18,6 +18,7 @@ use crate::core::sync::{Mutex, MutexGuard};
 
 use super::caps::Context;
 use super::display::{Display, Error, check};
+use super::export::{self, SurfaceExport};
 use super::ffi;
 use super::image::{self, Image};
 use super::readback::{self, Mappings, ReadbackTimes, ReadbackWay, Staging, copy_rect, copy_row};
@@ -100,6 +101,9 @@ struct PoolInner {
     /// The work the GPU did not finish by its deadline, once it has not
     /// (module docs).
     stalled: OnceLock<String>,
+    /// Each surface's export as dma-bufs, made at its first frame asked
+    /// so ([`Surface::export`]) and kept while the pool lives.
+    exports: Mutex<Vec<(ffi::VASurfaceID, Arc<SurfaceExport>)>>,
 }
 
 struct PoolState {
@@ -157,6 +161,7 @@ impl SurfacePool {
             times: Mutex::new(ReadbackTimes::default()),
             copy_image: Mutex::new(None),
             stalled: OnceLock::new(),
+            exports: Mutex::new(Vec::new()),
         });
         let made = create_surfaces(display, format, width, height, count)?;
         {
@@ -419,6 +424,19 @@ impl Surface {
     /// The display it is on.
     pub(crate) fn display(&self) -> &Display {
         &self.pool.display
+    }
+
+    /// The surface as dma-bufs, for another device to read its planes (`super::export`):
+    /// exported at its first ask and kept with its pool; none from a stalled pool.
+    pub(crate) fn export(&self) -> Result<Arc<SurfaceExport>, Error> {
+        self.pool.stalled()?;
+        let mut exports = self.pool.exports.lock();
+        if let Some((_, kept)) = exports.iter().find(|(id, _)| *id == self.id) {
+            return Ok(Arc::clone(kept));
+        }
+        let made = Arc::new(export::export(self.display(), self.id, self.size())?);
+        exports.push((self.id, Arc::clone(&made)));
+        Ok(made)
     }
 
     /// Waits for the surface's decode to finish, until the deadline of the

@@ -46,6 +46,10 @@ pub(crate) use host_os::{
     dma_buf_refusal, host_memory, host_memory_vouched, import_view, plane_shape, shown_at,
     surface_memory_hold,
 };
+/// Copies by the GPU of planes another driver wrote into dma-bufs into a runtime buffer, on Linux
+/// (`os/linux/plane_copy.rs`).
+#[cfg(target_os = "linux")]
+pub use host_os::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
 pub use host_os::{
     GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, RegionMemory,
     default_driver_sizes, default_gpu_core_count, default_registry_id, install_process_services,

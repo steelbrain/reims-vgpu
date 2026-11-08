@@ -8,6 +8,7 @@ use crate::core::backend::DeviceWrite;
 use crate::core::device_memory::GuestTarget;
 
 use super::display::{Display, Error};
+use super::export::SurfaceExport;
 use super::readback::ReadbackTimes;
 use super::surface::{Rect, Surface, SurfaceFormat, SurfaceReadBack};
 use super::wait::{self, Deadline};
@@ -64,6 +65,28 @@ impl Frame {
     /// The decoded size before cropping.
     pub fn coded_size(&self) -> (u32, u32) {
         self.coded_size
+    }
+
+    /// Where the crop starts in the decoded picture: its first column and row, in luma samples
+    /// (even, as 4:2:0's crops are), [`Frame::width`] by [`Frame::height`] from there.
+    pub fn crop_origin(&self) -> (u32, u32) {
+        (self.rect.x, self.rect.y)
+    }
+
+    /// The frame's surface as dma-bufs, for another device to read its planes
+    /// (`super::export`): its pool's export of the surface, made at the surface's first ask.
+    /// It reads the decode only once [`Frame::sync`] returned.
+    pub fn export(&self) -> Result<Arc<SurfaceExport>, Error> {
+        self.surface.export()
+    }
+
+    /// A hold of the frame's surface, which keeps it out of its pool, so that no later frame is
+    /// decoded into it, while the hold lives: for another device's read of the surface that may
+    /// outlast the frame.
+    pub fn hold(&self) -> FrameHold {
+        FrameHold {
+            _surface: Arc::clone(&self.surface),
+        }
     }
 
     /// Whether the samples use the full range (0 to 255 at 8 bits) rather
@@ -126,6 +149,12 @@ impl Frame {
     ) -> Result<(), Error> {
         self.read_back()?.copy_p010_to(y, y_stride, uv, uv_stride)
     }
+}
+
+/// A hold of a frame's surface ([`Frame::hold`]): the surface goes back to its pool once the
+/// frame and every hold are dropped.
+pub struct FrameHold {
+    _surface: Arc<Surface>,
 }
 
 /// A frame read back where the CPU reaches it ([`Frame::read_back`]), kept

@@ -1,8 +1,9 @@
 //! The OS services on Linux: the clocks ([`LinuxClock`]), threads ([`LinuxThreads`]), Mach VM's
 //! calls over `mmap` ([`LinuxVm`]), whose views of the guest's pages map the files the backing
-//! table names (`files`), IOSurface's stand-in over that memory ([`LinuxSurface`]), and what the
+//! table names (`files`), IOSurface's stand-in over that memory ([`LinuxSurface`]), what the
 //! window system's Vulkan extensions take here (`crate::os`'s `wsi`: the surface extensions and
-//! the loader). No Objective-C runs here: core pushes no autorelease pool where none is
+//! the loader), and the GPU's copies of another driver's planes in dma-bufs into a runtime buffer
+//! ([`PlaneCopier`]). No Objective-C runs here: core pushes no autorelease pool where none is
 //! installed.
 
 mod budget;
@@ -13,6 +14,7 @@ mod files;
 mod hints;
 mod host_ram;
 mod import;
+mod plane_copy;
 mod surface;
 mod threads;
 mod vm;
@@ -25,6 +27,7 @@ use metal2vulkan_runtime as rt;
 pub use clock::LinuxClock;
 pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host};
 pub use files::{GuestMemoryLease, lease_guest_memory};
+pub use plane_copy::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
 pub use surface::{LinuxSurface, LinuxSurfaces};
 pub use threads::LinuxThreads;
 pub use vm::{LinuxVm, RegionMemory};
