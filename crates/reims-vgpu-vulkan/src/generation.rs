@@ -77,7 +77,7 @@ impl Generation {
         for _ in 0..TAKES {
             let device = generation_serving(queue.device());
             // SAFETY: the closure keeps no handle and calls nothing.
-            let (vk_queue, family) = unsafe { queue.with_vk_queue(|q, family| (q, family)) };
+            let (vk_queue, family) = unsafe { queue.with_vk_queue(|_, q, family| (q, family)) };
             let handle = handle_of(&device);
             if handle_of(&generation_serving(queue.device())) == handle {
                 return Ok(Generation {
@@ -141,7 +141,7 @@ impl Generation {
         submit: impl FnOnce(vk::Queue) -> R,
     ) -> Option<R> {
         // SAFETY: the caller's.
-        unsafe { queue.with_vk_queue(|q, _| (q == self.queue).then(|| submit(q))) }
+        unsafe { queue.with_vk_queue(|_, q, _| (q == self.queue).then(|| submit(q))) }
     }
 }
 
