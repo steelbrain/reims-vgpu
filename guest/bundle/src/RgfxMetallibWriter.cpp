@@ -161,11 +161,17 @@ bool RgfxMetallibOfClLibrary(const uint8_t *bytes, size_t length, std::vector<ui
 	size_t tableSize = 0, modulesSize = 0;
 	if (!section(0, &table, &tableSize) || !section(3, &modules, &modulesSize) || tableSize < 12)
 		return false;
-	// The table's first u16 differs by release (8, then 9) and is not read.
-	const uint16_t head[3] = {2, 1, 1};
-	for (int i = 0; i < 3; i++)
-		if ((table[2 + 2 * i] | table[3 + 2 * i] << 8) != head[i])
-			return false;
+	// The table's first u16 differs by release (3, 8, then 9) and is not read; the next three are
+	// 2, 1 and 1, or 2, 3 and 2 in macOS 11's container.
+	const auto headIs = [&](const uint16_t (&head)[3]) {
+		for (int i = 0; i < 3; i++)
+			if ((table[2 + 2 * i] | table[3 + 2 * i] << 8) != head[i])
+				return false;
+		return true;
+	};
+	static const uint16_t kHead[3] = {2, 1, 1}, kHeadMacOS11[3] = {2, 3, 2};
+	if (!headIs(kHead) && !headIs(kHeadMacOS11))
+		return false;
 	const uint32_t count = le32(table + 8);
 	if (count == 0)
 		return false;
@@ -181,7 +187,7 @@ bool RgfxMetallibOfClLibrary(const uint8_t *bytes, size_t length, std::vector<ui
 			return false;
 		at += 4 * kEntryWords + nameLength + 1;
 		const uint32_t stage = le32(entry), module = le32(entry + 16);
-		if (stage != static_cast<uint32_t>(RgfxMetallibStage::Kernel) || module > modulesSize ||
+		if (stage > static_cast<uint32_t>(RgfxMetallibStage::Kernel) || module > modulesSize ||
 		    modulesSize - module < 4)
 			return false;
 		const uint32_t moduleSize = le32(modules + module);
@@ -194,7 +200,7 @@ bool RgfxMetallibOfClLibrary(const uint8_t *bytes, size_t length, std::vector<ui
 			return false;
 		RgfxMetallibFunction f;
 		f.name.assign(reinterpret_cast<const char *>(name), nameLength);
-		f.stage = RgfxMetallibStage::Kernel;
+		f.stage = static_cast<RgfxMetallibStage>(stage);
 		f.bitcode = bitcode;
 		f.bitcodeLength = bitcodeLength;
 		functions.push_back(f);

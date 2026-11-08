@@ -469,7 +469,7 @@ void test_cl_library()
 	CHECK(broken(0x10, static_cast<uint32_t>(container.size()))); // the table past the end
 	CHECK(broken(table, 0x00030008));                      // the table's head
 	CHECK(broken(table + 8, 0));                           // no functions
-	CHECK(broken(table + 12, 1));                          // a stage not a kernel
+	CHECK(broken(table + 12, 3));                          // a stage past a kernel
 	CHECK(broken(table + 12 + 16, 0x7fffffff));            // a module past the section
 	CHECK(broken(modules, 0x7fffffff));                    // a module's size past the section
 	CHECK(broken(modules + 4, 0x12345678));                // no wrapper
@@ -479,6 +479,21 @@ void test_cl_library()
 	std::vector<uint8_t> c9 = container, out9;
 	set32(c9, table, 0x00020009);
 	CHECK(RgfxMetallibOfClLibrary(c9.data(), c9.size(), out9) && out9 == out);
+	// macOS 11's container: the head 3, then 2, 3 and 2, read alike.
+	std::vector<uint8_t> c11 = container, out11;
+	set32(c11, table, 0x00020003);
+	set32(c11, table + 4, 0x00020003);
+	CHECK(RgfxMetallibOfClLibrary(c11.data(), c11.size(), out11) && out11 == out);
+	// Another head after the first u16 stays refused.
+	CHECK(broken(table + 4, 0x00020001));
+	// A vertex and a fragment stage (macOS 11's render functions) carry into the .metallib's TYPE.
+	std::vector<uint8_t> cs = container, outs;
+	set32(cs, table + 12, 0);
+	set32(cs, table + 12 + 28 + kernels[0].name.size() + 1, 1);
+	std::vector<RgfxMetallibFunction> staged = kernels;
+	staged[0].stage = RgfxMetallibStage::Vertex;
+	staged[1].stage = RgfxMetallibStage::Fragment;
+	CHECK(RgfxMetallibOfClLibrary(cs.data(), cs.size(), outs) && outs == RgfxWriteMetallib(staged));
 
 	// This Mac's own container, where its Metal compiles OpenCL C (two kernels, one program).
 	NSArray<NSString *> *names = nil;

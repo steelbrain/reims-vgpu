@@ -67,7 +67,8 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 } // namespace
 
 // Every library-from-bytes entry point funnels through here. The bytes Metal's compiler answers for
-// OpenCL C source, which are no .metallib, are taken as the .metallib of their kernels
+// OpenCL C source (and, on macOS 11, for Metal source), which are no .metallib, are taken as the
+// .metallib of their functions
 // (RgfxMetallibOfClLibrary). A .metallib (or a fat file's AIR slice) is first looked up by its
 // content key, which finds a library the device made for any
 // process with no bytes sent; otherwise the bytes go as one LIBRARY_CREATE (waiting for room

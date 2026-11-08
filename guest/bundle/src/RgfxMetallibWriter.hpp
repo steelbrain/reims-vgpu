@@ -1,8 +1,9 @@
 /*
  * RgfxMetallibWriter: a .metallib of functions, written from their AIR bitcode, as the device's
  * GL functions make their libraries (RgfxGLFunction.h): the bitcode the GL code generator lowers a
- * shader to goes to the host as any other library does. It also reads the kernels out of the bytes
- * Metal's compiler answers for OpenCL C source, which are no .metallib (RgfxReadClLibrary).
+ * shader to goes to the host as any other library does. It also reads the functions out of the bytes
+ * Metal's compiler answers for OpenCL C source (and, on macOS 11, for Metal source), which are
+ * no .metallib (RgfxMetallibOfClLibrary).
  *
  * The layout is the one `metal -mmacosx-version-min=11.0` writes for one function (read from
  * such a file; tools/gld_lower.m's `wrap` checks it against Metal's own loader), with each
@@ -53,21 +54,27 @@ std::vector<uint8_t> RgfxWriteMetallib(const std::vector<RgfxMetallibFunction> &
 /// The .metallib of `f` alone.
 std::vector<uint8_t> RgfxWriteMetallib(const RgfxMetallibFunction &f);
 
-/// The .metallib of the kernels in `bytes`, in `out`, where `bytes` are the container Metal's
+/// The .metallib of the functions in `bytes`, in `out`, where `bytes` are the container Metal's
 /// compiler answers (libraryDataContents) for a library of OpenCL C source (MTLCompileOptions'
-/// sourceLanguage 1, as the GL renderer compiles a compute program): each kernel's module under
-/// its name, in the container's order, and the writer's VERS (the container states no versions;
-/// the host compiles from each module's own metadata, read from metal2vulkan's code at the pin).
+/// sourceLanguage 1, as the GL renderer compiles a compute program), and, on macOS 11, for a
+/// library of Metal source too (newLibraryWithSource:, as Core Image compiles its kernels at run
+/// time): each function's module under its name and stage, in the container's order, and the
+/// writer's VERS (the container states no versions; the host compiles from each module's own
+/// metadata, read from metal2vulkan's code at the pin).
 /// False, with `out` untouched, where `bytes` are not that container or do not read whole. The
 /// layout (measured: macOS 26.7.1, the Intel UHD 630's and the AMD Radeon Pro 5300M's devices, 15
-/// programs of our own of one or two kernels; macOS 27, the M3 Max's, two of them):
+/// programs of our own of one or two kernels; macOS 27, the M3 Max's, two of them; macOS 11.7.11
+/// on the device, the Metal source of a test program of our own of a kernel, a vertex and a
+/// fragment function, and Core Image's kernels of one):
 ///   - the u32 1, then 12 zero bytes;
 ///   - from 0x10, ten pairs of a u32 offset and a u32 size, of which the first places the
 ///     function table and the fourth the modules (the others are not read: the second holds 8
 ///     zero bytes a function, the sixth "default.metallib", the seventh a u32 count and the names);
-///   - the function table: a u16 (8 on macOS 26.7.1, 9 on macOS 27; not read), the u16s 2, 1
-///     and 1, a u32 count, then each function's seven u32s
-///     and its NUL-terminated name. The first u32 is the stage (2, a kernel, the only one seen),
+///   - the function table: a u16 (3 on macOS 11.7.11, 8 on macOS 26.7.1, 9 on macOS 27; not
+///     read), the u16s 2, 1 and 1 (2, 3 and 2 on macOS 11.7.11), a u32 count, then each
+///     function's seven u32s and its NUL-terminated name. The first u32 is the stage, as TYPE
+///     holds it (0 a vertex, 1 a fragment and 2 a kernel function; the first two seen on macOS
+///     11.7.11),
 ///     the third the function's offset in the second section, the fifth its module's offset from
 ///     the fourth's; the second, fourth and sixth were 0 and the seventh 0xfc (field_04, field_0c,
 ///     field_14, field_18: not read);
