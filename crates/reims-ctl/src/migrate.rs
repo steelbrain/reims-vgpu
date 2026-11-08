@@ -381,6 +381,29 @@ mod tests {
     use crate::opencore::tests::{image as oc_image, plist, qcow2};
     use std::os::unix::fs::PermissionsExt;
 
+    /// A stand-in for a running VM's QEMU: a shell whose command line names `pidfile`, as QEMU's
+    /// does, and which writes its own pid there, as QEMU does. Only then can runtime::pid_at take
+    /// it for running: until then its pid holds the test's command line, then `sh`'s, which may
+    /// exec another shell, and none during each exec. It loops, since a shell may exec a lone
+    /// command in its own place, dropping `pidfile` from its command line. It is returned once
+    /// runtime::pid_at sees it.
+    fn running_qemu(pidfile: &Path) -> std::process::Child {
+        let child = std::process::Command::new("sh")
+            .args(["-c", r#"echo $$ > "$1"; while :; do sleep 1; done"#, "sh"])
+            .arg(pidfile)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while runtime::pid_at(pidfile).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in never wrote its pidfile"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child
+    }
+
     fn entry(bundle: &str) -> String {
         format!(
             "<dict><key>BundlePath</key><string>{bundle}</string>\
@@ -777,14 +800,8 @@ mod tests {
             reg.add(name, &dir).unwrap();
         }
         reg.save().unwrap();
-        // A process whose command line names the pidfile, as QEMU's does (runtime::pid_at).
         let pidfile = crate::vm::pidfile_in(&env.root.join("busy"));
-        let mut qemu = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .arg(&pidfile)
-            .spawn()
-            .unwrap();
-        std::fs::write(&pidfile, qemu.id().to_string()).unwrap();
+        let mut qemu = running_qemu(&pidfile);
         let mut said = Vec::new();
         run(&mut |s| said.push(s.to_string()));
         assert!(said[0].starts_with("reims-ctl is updated"), "{said:?}");
