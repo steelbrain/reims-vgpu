@@ -268,9 +268,9 @@ Stages:
     registry root's `GraftClient.com.steelbrain.ReimsGraphics`, and the
     guest boots on. The image carries the set `make -C guest set` builds,
     in this order: Graft.kext, ReimsGraphics.kext and RgfxGate.kext.
-    OpenCore injects it from Darwin 23 (macOS 14) for now, the releases
-    whose x86-64 matrix row passes in full (`MIN_KERNEL` in
-    guest/tools/prebuilt.py); an older release joins once its row passes.
+    OpenCore injects it from Darwin 20 (macOS 11), the releases whose
+    x86-64 matrix row passes in full (`MIN_KERNEL` in
+    guest/tools/prebuilt.py); a release joins once its row passes.
     Nothing of the guest OS is patched or hooked beyond what Graft does for
     these two.
     - Iterating: patch a copy of a VM's OpenCore image directly

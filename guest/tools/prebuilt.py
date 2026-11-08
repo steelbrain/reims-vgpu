@@ -29,10 +29,10 @@ GRAFT_RECORD = "source.toml"
 MANIFEST = "set.toml"
 FORMAT = 1
 # The Darwin releases OpenCore injects the set on: those whose row of the x86-64 matrix
-# passes in full, from macOS 14 (Darwin 23) for now. Graft decides from what the running
-# system has, never from a version; this bound keeps the set off releases where the display
-# or Metal is not ready yet, and an older release joins in its own commit once its row passes.
-MIN_KERNEL, MAX_KERNEL = "23.0.0", ""
+# passes in full, from macOS 11 (Darwin 20). Graft decides from what the running system has,
+# never from a version; this bound keeps the set off releases where the display or Metal is
+# not ready, and a release joins in its own commit once its row passes.
+MIN_KERNEL, MAX_KERNEL = "20.0.0", ""
 SET = (
     ("Graft.kext", "Binds and routes the owned guest kexts"),
     ("kext/ReimsGraphics.kext", "The reims-graphics display, accelerator and device control"),
