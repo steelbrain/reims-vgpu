@@ -538,6 +538,121 @@ mod tests {
         assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
     }
 
+    /// A device that copies the RAM by its runs scatters a buffer into runs that start and end
+    /// inside pages, as a laid-out device cache's copy out does (`reims-vgpu`'s
+    /// `graphics/decode/surface_cache.rs`, `texel_spans`): each of its surface's rows' texels
+    /// alone, cut to the pages they lie in. Here a plane of 2-byte texels 1,023 wide, from byte 16
+    /// at a pitch of 2,048 bytes, over four pages out of order: each row starts on 16 bytes (the
+    /// guest aligns a plane's offset and pitch to its linear texture alignment, never less) and
+    /// ends 2,046 bytes on, off a 4-byte word, some rows crossing from one page into another. The
+    /// runs' bytes are the buffer's, and every byte beside them, the guest CPU's, is as it was. One
+    /// that does not copy the RAM refuses each copy, encoding nothing.
+    #[test]
+    #[ignore = "metal2vulkan 9316c1aa3f refuses a run off whole 4 KiB pages (host_ram/copy.rs, \
+                Problem::HostRam); runs at once at the pin whose copies by runs take runs that \
+                start on 4 bytes and end at any byte (unfixed-bugs ledger, the laid-out caches' \
+                copies by runs)"]
+    fn a_copy_by_runs_scatters_runs_inside_pages() {
+        let device = dev();
+        let length = 8 * MIB;
+        let fd = memfd(length).unwrap();
+        // SAFETY: a fresh shared mapping of the file, which the test unmaps after the lease and
+        // every buffer over it.
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length.to_usize(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(start, libc::MAP_FAILED);
+        let at = start.addr().to_u64();
+        let lease = lease_guest_memory([GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            fd,
+            offset: 0,
+        }]);
+        // SAFETY: the RAM's first pages, mapped until the end, which no GPU work uses now.
+        let ram =
+            unsafe { std::slice::from_raw_parts_mut(start.cast::<u8>(), (8 * PAGE).to_usize()) };
+        for (i, b) in ram.iter_mut().enumerate() {
+            *b = (i * 7 + i / PAGE.to_usize()) as u8;
+        }
+        let before = ram.to_vec();
+        // The surface's pages, in its order: page 5, then 1, 2 and 0 of the RAM.
+        let pages = [5u64, 1, 2, 0];
+        let (offset, pitch, row_bytes, rows) = (16u64, 2048u64, 2046u64, 7u64);
+        // Each row's texels as runs of the RAM, cut where the surface's pages end.
+        let runs_of = |span: std::ops::Range<u64>| -> Vec<std::ops::Range<u64>> {
+            let mut out = Vec::new();
+            let mut s = span.start;
+            while s < span.end {
+                let (page, within) = (s / PAGE, s % PAGE);
+                let n = (PAGE - within).min(span.end - s);
+                let host = at + pages[page.to_usize()] * PAGE + within;
+                out.push(host..host + n);
+                s += n;
+            }
+            out
+        };
+        let spans: Vec<std::ops::Range<u64>> = (0..rows)
+            .map(|r| offset + r * pitch..offset + r * pitch + row_bytes)
+            .collect();
+        assert!(
+            spans.iter().any(|s| runs_of(s.clone()).len() == 2),
+            "a row crosses from one page into another"
+        );
+        let total = 4 * PAGE;
+        let q = device.new_command_queue().unwrap();
+        let from = (device.new_buffer_of_length(OnFault::Die, total, 0))
+            .unwrap()
+            .unwrap();
+        // SAFETY: the buffer's Shared contents, `total` bytes, written before the GPU uses it.
+        let src = unsafe {
+            std::slice::from_raw_parts_mut(from.contents().as_ptr::<u8>(), total.to_usize())
+        };
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i * 13 + 1) as u8;
+        }
+        let copies = super::copies(&device.raw);
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for span in &spans {
+            let runs = runs_of(span.clone());
+            let scattered = (e.copy_to_guest_ram(OnFault::Die, &from, span.start, &runs)).unwrap();
+            assert_eq!(scattered, copies, "the row's runs {runs:x?}");
+        }
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        let mut want = before.clone();
+        if copies {
+            for span in &spans {
+                let mut s = span.start;
+                for run in runs_of(span.clone()) {
+                    let n = run.end - run.start;
+                    let into = (run.start - at).to_usize();
+                    want[into..into + n.to_usize()]
+                        .copy_from_slice(&src[s.to_usize()..(s + n).to_usize()]);
+                    s += n;
+                }
+            }
+        }
+        assert!(
+            ram == want.as_slice(),
+            "the rows' texels in their runs; every byte beside them as it was"
+        );
+        drop((cb, e, q, from, lease));
+        // SAFETY: the mapping made above, which nothing uses any more.
+        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
+    }
+
     /// What a slab of guest RAM costs on this device (arch-shared-mem's design): placement heaps
     /// over one 2 MiB run of the leased RAM each, 4 KiB buffers placed in one of them, heaps over
     /// views of 2 and 32 runs apart, and a command buffer's round trip with one heap alive and with
