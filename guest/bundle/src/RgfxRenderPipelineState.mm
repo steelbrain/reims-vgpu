@@ -468,7 +468,12 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		[failed appendString:@"meshFunction must not be nil.\n"];
 	if (descriptor.fragmentFunction == nil && descriptor.isRasterizationEnabled)
 		[failed appendString:@"fragmentFunction must not be nil.\n"];
-	if (descriptor.supportIndirectCommandBuffers)
+	// supportIndirectCommandBuffers reached the mesh descriptor in macOS 14; before it a mesh
+	// pipeline cannot ask for indirect command buffers, so there is nothing to refuse.
+	BOOL meshSupportsIcb =
+	    [descriptor respondsToSelector:@selector(supportIndirectCommandBuffers)] &&
+	    descriptor.supportIndirectCommandBuffers;
+	if (meshSupportsIcb)
 		[failed appendString:@"Use of mesh shader pipelines in indirect command buffers is not "
 		                     @"supported by this device.\n"];
 	if (failed.length != 0)
@@ -569,7 +574,9 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		flags |= RGFX_RENDER_PIPELINE_ALPHA_TO_ONE;
 	if (descriptor.isRasterizationEnabled)
 		flags |= RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED;
-	if (descriptor.supportIndirectCommandBuffers)
+	// The mesh descriptor gained supportIndirectCommandBuffers in macOS 14; off before it.
+	if ([descriptor respondsToSelector:@selector(supportIndirectCommandBuffers)] &&
+	    descriptor.supportIndirectCommandBuffers)
 		flags |= RGFX_RENDER_PIPELINE_SUPPORT_ICB;
 	if (descriptor.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth)
 		flags |= RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH;
@@ -582,8 +589,13 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 	p.max_total_threadgroups_per_mesh_grid = wire32(descriptor.maxTotalThreadgroupsPerMeshGrid);
 	p.payload_memory_length = wire32(descriptor.payloadMemoryLength);
 	p.max_vertex_amplification_count = wire32(descriptor.maxVertexAmplificationCount);
-	fillSize(p.required_threads_per_object_threadgroup, descriptor.requiredThreadsPerObjectThreadgroup);
-	fillSize(p.required_threads_per_mesh_threadgroup, descriptor.requiredThreadsPerMeshThreadgroup);
+	// requiredThreads* reached the mesh descriptor in macOS 26; before it they are unset (0,0,0).
+	if ([descriptor respondsToSelector:@selector(requiredThreadsPerObjectThreadgroup)]) {
+		fillSize(p.required_threads_per_object_threadgroup,
+		         descriptor.requiredThreadsPerObjectThreadgroup);
+		fillSize(p.required_threads_per_mesh_threadgroup,
+		         descriptor.requiredThreadsPerMeshThreadgroup);
+	}
 
 	RgfxCreated created = serializer->createMeshRenderPipeline(p);
 	if (!created.posted) {
@@ -600,14 +612,17 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 	                                                                         device:device
 	                                                                     serializer:serializer];
 	if (state != nil) {
-		state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
+		if ([descriptor respondsToSelector:@selector(supportIndirectCommandBuffers)])
+			state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
 		state->_mesh = YES;
 		state->_objectAir = stageArguments(descriptor.objectFunction);
 		state->_meshAir = stageArguments(descriptor.meshFunction);
 		state->_fragmentAir = stageArguments(descriptor.fragmentFunction);
 		state->_vertexAir = stageArguments(nil);
-		state->_requiredObject = descriptor.requiredThreadsPerObjectThreadgroup;
-		state->_requiredMesh = descriptor.requiredThreadsPerMeshThreadgroup;
+		if ([descriptor respondsToSelector:@selector(requiredThreadsPerObjectThreadgroup)]) {
+			state->_requiredObject = descriptor.requiredThreadsPerObjectThreadgroup;
+			state->_requiredMesh = descriptor.requiredThreadsPerMeshThreadgroup;
+		}
 	}
 	return state;
 }

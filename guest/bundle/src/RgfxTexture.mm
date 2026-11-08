@@ -1269,7 +1269,10 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		return;
 	}
 	_allowGPUOptimizedContents = descriptor.allowGPUOptimizedContents;
-	_compressionType = descriptor.compressionType;
+	// compressionType reached MTLTextureDescriptor in macOS 12.5; before it, the default lossless
+	// (set in init) stands, as the descriptor carries no other value there.
+	if ([descriptor respondsToSelector:@selector(compressionType)])
+		_compressionType = descriptor.compressionType;
 	_framebufferOnly = [descriptor respondsToSelector:@selector(framebufferOnly)] &&
 	                   [(id<RgfxMetalTextureDescriptor>)descriptor framebufferOnly];
 }

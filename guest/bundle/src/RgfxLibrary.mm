@@ -900,9 +900,13 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	id<MTLFunction> fn = [self newFunctionWithName:descriptor.name
 	                                constantValues:descriptor.constantValues
 	                                         error:error];
+	// binaryArchives reached MTLFunctionDescriptor in macOS 12; before it there are none to miss.
+	NSArray<id<MTLBinaryArchive>> *archives = nil;
+	if ([descriptor respondsToSelector:@selector(binaryArchives)])
+		archives = descriptor.binaryArchives;
 	NSError *miss = [RgfxBinaryArchive rgfxMissOfFunction:(RgfxFunction *)fn
 	                                              options:descriptor.options
-	                                             archives:descriptor.binaryArchives];
+	                                             archives:archives];
 	if (miss != nil) {
 		if (error)
 			*error = miss;

@@ -66,15 +66,19 @@ RgfxIcbCreate RgfxIcbCreateOf(MTLIndirectCommandBufferDescriptor *d, NSUInteger 
 	uint32_t f = 0;
 	f |= d.inheritPipelineState ? RGFX_ICB_INHERIT_PIPELINE_STATE : 0;
 	f |= d.inheritBuffers ? RGFX_ICB_INHERIT_BUFFERS : 0;
-	f |= d.supportRayTracing ? RGFX_ICB_SUPPORT_RAY_TRACING : 0;
-	f |= d.supportDynamicAttributeStride ? RGFX_ICB_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE : 0;
-	f |= d.supportColorAttachmentMapping ? RGFX_ICB_SUPPORT_COLOR_ATTACHMENT_MAPPING : 0;
-	f |= d.inheritDepthStencilState ? RGFX_ICB_INHERIT_DEPTH_STENCIL_STATE : 0;
-	f |= d.inheritDepthBias ? RGFX_ICB_INHERIT_DEPTH_BIAS : 0;
-	f |= d.inheritDepthClipMode ? RGFX_ICB_INHERIT_DEPTH_CLIP_MODE : 0;
-	f |= d.inheritCullMode ? RGFX_ICB_INHERIT_CULL_MODE : 0;
-	f |= d.inheritFrontFacingWinding ? RGFX_ICB_INHERIT_FRONT_FACING_WINDING : 0;
-	f |= d.inheritTriangleFillMode ? RGFX_ICB_INHERIT_TRIANGLE_FILL_MODE : 0;
+	// Each property newer than the 10.14 descriptor through spi(), which answers the fallback where
+	// the release lacks the selector: supportRayTracing reached it in macOS 13, the dynamic
+	// attribute stride in 14, and the colour-attachment mapping and the inherit* below in 26. A
+	// property the release lacks keeps its default (off here, or the base bind counts below).
+	f |= spi(d, "supportRayTracing", NO) ? RGFX_ICB_SUPPORT_RAY_TRACING : 0;
+	f |= spi(d, "supportDynamicAttributeStride", NO) ? RGFX_ICB_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE : 0;
+	f |= spi(d, "supportColorAttachmentMapping", NO) ? RGFX_ICB_SUPPORT_COLOR_ATTACHMENT_MAPPING : 0;
+	f |= spi(d, "inheritDepthStencilState", NO) ? RGFX_ICB_INHERIT_DEPTH_STENCIL_STATE : 0;
+	f |= spi(d, "inheritDepthBias", NO) ? RGFX_ICB_INHERIT_DEPTH_BIAS : 0;
+	f |= spi(d, "inheritDepthClipMode", NO) ? RGFX_ICB_INHERIT_DEPTH_CLIP_MODE : 0;
+	f |= spi(d, "inheritCullMode", NO) ? RGFX_ICB_INHERIT_CULL_MODE : 0;
+	f |= spi(d, "inheritFrontFacingWinding", NO) ? RGFX_ICB_INHERIT_FRONT_FACING_WINDING : 0;
+	f |= spi(d, "inheritTriangleFillMode", NO) ? RGFX_ICB_INHERIT_TRIANGLE_FILL_MODE : 0;
 	f |= spi(d, "inheritStencilReferenceValues", YES) ? RGFX_ICB_INHERIT_STENCIL_REFERENCE_VALUES
 	                                                   : 0;
 	f |= spi(d, "inheritDepthTestBounds", YES) ? RGFX_ICB_INHERIT_DEPTH_TEST_BOUNDS : 0;
@@ -85,10 +89,12 @@ RgfxIcbCreate RgfxIcbCreateOf(MTLIndirectCommandBufferDescriptor *d, NSUInteger 
 	m.max_vertex_buffer_bind_count = u32(d.maxVertexBufferBindCount);
 	m.max_fragment_buffer_bind_count = u32(d.maxFragmentBufferBindCount);
 	m.max_kernel_buffer_bind_count = u32(d.maxKernelBufferBindCount);
-	m.max_kernel_threadgroup_memory_bind_count = u32(d.maxKernelThreadgroupMemoryBindCount);
-	m.max_object_buffer_bind_count = u32(d.maxObjectBufferBindCount);
-	m.max_mesh_buffer_bind_count = u32(d.maxMeshBufferBindCount);
-	m.max_object_threadgroup_memory_bind_count = u32(d.maxObjectThreadgroupMemoryBindCount);
+	// The object and mesh bind counts reached the descriptor in macOS 14; spi answers 0 before it.
+	m.max_kernel_threadgroup_memory_bind_count = u32(spi(d, "maxKernelThreadgroupMemoryBindCount", 0));
+	m.max_object_buffer_bind_count = u32(spi(d, "maxObjectBufferBindCount", 0));
+	m.max_mesh_buffer_bind_count = u32(spi(d, "maxMeshBufferBindCount", 0));
+	m.max_object_threadgroup_memory_bind_count =
+	    u32(spi(d, "maxObjectThreadgroupMemoryBindCount", 0));
 	m.max_scissor_rect_count = u32(spi(d, "maxScissorRectCount", 1));
 	m.max_viewport_count = u32(spi(d, "maxViewportCount", 1));
 	m.allow_override_render_states = spi(d, "allowOverrideRenderStates", NO) ? 1 : 0;
