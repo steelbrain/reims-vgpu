@@ -2313,11 +2313,14 @@ carry out has no `CB_SCHEDULED`, and its `CB_COMPLETE` stands for both; so does 
 bit 2; every host sets it). A command buffer committed by `commitAndWaitUntilSubmitted` carries a
 `SUBMITTED` op, and the host posts its `CB_SUBMITTED` record (the command-buffer `ObjId`, at the
 buffer's seqno; 24 bytes) once, ahead of its `CB_SCHEDULED` and `CB_COMPLETE`: as soon as the
-host takes it, before it walks the buffer's ops, where the buffer waits for no event (its
-`WAIT_EVENT` ops), the host fills no device cache it uses first (decided at the take from its
-`SURFACE_USE` ops, which lead the stream; a fill not yet done counts), it follows no copy of one
-asked before it and not yet made ("What a walk sees", "Device caches") and no buffer before it on
-its queue waits for one and is not yet scheduled; else at its scheduling. The call returns
+host takes it, before it walks the buffer's ops and before the fills of device caches it makes
+at the take, where the buffer waits for no event (its `WAIT_EVENT` ops), it follows no copy of a
+device cache asked before it and not yet made, nor needs a fill of one that must wait for buffers
+begun before it (decided at the take from its `SURFACE_USE` ops, which lead the stream; "What a
+walk sees", "Device caches"), and no buffer before it on its queue waits for one and is not yet
+scheduled; else at its scheduling. A fill made at once at the take, or one made before and not
+yet done, holds back nothing, as a wait for another queue's buffer does not ("Surface order"):
+it waits for nothing of the guest's to come. The call returns
 there. A guest whose bundle sends no such op never sees the event,
 and a bundle sends it only where the bit is set, which it reads in the device info's
 `features_lo`. What Metal does, on the M3, the 5300M and the 630
@@ -2339,7 +2342,14 @@ and a bundle sends it only where the bit is set, which it reads in the device in
   the time the call returns. Ours is the cheapest: still `Committed`, the handlers at its
   `CB_SCHEDULED`, as on an idle queue on all three.
 - Loose (later than Metal, inside the envelope): a buffer that waits for an event already
-  reached is answered at its scheduling, not at its take.
+  reached is answered at its scheduling, not at its take; so is one that follows a deferred copy
+  of a device cache, which Metal has none of.
+- Loose (inside the envelope): a buffer whose take fills a device cache at once is answered
+  before the fill, as Metal, which has no fill, answers it at once. The host takes its ticket in
+  the commit order first and holds the caches it uses from the answer until it has made their
+  fills, so no other begin counts a use of one between and defers a fill decided at once. The
+  answer comes at the take, not at the doorbell: a doorbell cannot know the fill will be made at
+  once, as another queue's begin before the take may count a use of the cache.
 - Loose (what "submitted" means on the host): Metal answers once it has submitted the buffer;
   ours once the host has taken the message, before it encodes the buffer on its platform, which
   the guest cannot tell apart, as nothing the guest sends after the answer is carried out
@@ -2353,8 +2363,9 @@ and a bundle sends it only where the bit is set, which it reads in the device in
   nothing of the guest's is ordered by a buffer's scheduling but its later commits, which the
   ticket orders, and what the GPU reads and writes, which a present, a CPU lock and another
   queue's or process's buffer wait for from the commit or the post on, not from the scheduling
-  (§14, "CPU locks"; "Surface order", below). A buffer that waits on an event or a fill, or is
-  behind one that does, is `Scheduled` at its scheduling, past its waits, as on a Mac.
+  (§14, "CPU locks"; "Surface order", below). A buffer that waits on an event or a deferred copy
+  of a device cache, or is behind one that does, is `Scheduled` at its scheduling, past its
+  waits, as on a Mac.
 - Inside the envelope (a fault): a buffer whose ops the host cannot carry out after it was
   answered fails at its `CB_COMPLETE`, as Metal reports a command buffer's errors at its
   completion, not at its commit.
@@ -2616,9 +2627,9 @@ committed in. The bundle names the order instead, as it posts each buffer:
   platform holds a wait for a shared event's value on the host until it is
   reached). So does every buffer committed behind it on its queue while the
   platform holds it, and each buffer's records still go in its queue's order. A
-  buffer that waits for an event, or for the host's fill of a device cache or a
-  copy of one it follows, or is behind one, keeps its records at its
-  scheduling.
+  buffer that waits for an event, or for a deferred copy of a device cache it
+  follows, or is behind one, keeps its records at its scheduling; a fill the
+  host makes at once holds back none of them.
 - Work the host starts off a buffer's own GPU timeline waits for the same
   buffers on the CPU first: a video session's decode runs on a queue of its own
   as the host walks the buffer, so its output lands only after the reads and
@@ -2800,7 +2811,7 @@ commit. Each outcome the new design allows is one of those two:
   asked is ordered after it on the GPU instead: it waits for the cache's own
   event, which the copy's command buffer signals to the copy's number, where it
   reads what the copy writes (a fill) or may write what the copy reads (any
-  copy), and it holds its queue, as a buffer that waits for a fill does; its
+  copy), and it holds its queue, as a buffer that waits for an event does; its
   marks of the cache and its end value are kept apart until the copy is made, so
   the copy follows none of them. A buffer finished before a copy it follows is
   made stays counted among the users of every cache it used until it is: the
@@ -2854,8 +2865,8 @@ commit. Each outcome the new design allows is one of those two:
   run in the order they are committed, and metal2vulkan resolves barriers,
   layouts and fences at submit, in commit order. Four things a buffer does
   before its commit are seen beyond it, and each keeps the lock's order:
-  - its hold of its queue: a buffer that waits for an event, or for the host's
-    fill of a device cache or a copy of one it follows, holds its queue from its
+  - its hold of its queue: a buffer that waits for an event, or for a deferred
+    copy of a device cache it follows, holds its queue from its
     begin, not its commit, so a buffer after it that asks for its `CB_SUBMITTED`
     is answered at its scheduling, as behind one already committed;
   - a video encoder's work, which its session starts as it is walked: a buffer

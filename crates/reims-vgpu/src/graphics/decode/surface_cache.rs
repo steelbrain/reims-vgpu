@@ -691,7 +691,7 @@ pub(crate) struct CacheCounts {
     pub(crate) fills_deferred: u64,
     /// Waits on the CPU, of a command buffer's begin or a decode of the host's, for other command
     /// buffers' uses of a cache: each where the platform made no event to wait on the GPU with
-    /// ([`Caches::before`]), or a decode's for a deferred fill ([`Caches::wait_filled`]).
+    /// ([`Caches::before_answering`]), or a decode's for a deferred fill ([`Caches::wait_filled`]).
     pub(crate) cpu_waits: u64,
     /// Command buffers that use a cache and ask for their `CB_SUBMITTED`, looked at on a
     /// doorbell's thread with the caches' lock free ([`Caches::waits_for_nothing`]): those that
@@ -799,6 +799,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     exportable: bool,
     /// The blocks whose caches owe their first fill ([`SurfaceCache::first_fill`]).
     owed: HashSet<u64>,
+    /// The blocks of the begins answered before the fills they make ([`Caches::before_answering`]),
+    /// from the answer until those fills are made: no other begin counts a use of one meanwhile.
+    answering: HashSet<u64>,
 }
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
@@ -949,6 +952,7 @@ impl<P: Platform> SurfaceCaches<P> {
             into_pages: Vec::new(),
             exportable: false,
             owed: HashSet::new(),
+            answering: HashSet::new(),
         }
     }
 
@@ -1616,7 +1620,7 @@ impl<P: Platform> SurfaceCaches<P> {
     /// still reading the cache. `cb` waits on the GPU for the cache's last fill not yet done, and
     /// for the last deferred copy of the cache the use follows: the last fill, which it reads,
     /// and, where it may write the cache, the last copy out too, which must not copy its write.
-    /// It waits for that copy on the cache's event, which [`Caches::before`] gave the cache
+    /// It waits for that copy on the cache's event, which [`Caches::before_answering`] gave the cache
     /// before counting the use, or, where the platform made none, waited for the copy instead.
     /// Whether `cb` waits on the GPU for a copy of the cache; and the number of the deferred copy
     /// it follows ([`SurfaceCache::asked`]).
@@ -2767,7 +2771,8 @@ impl<P: Platform> SurfaceCaches<P> {
 ///   after it on the GPU: its command buffer waits for the cache's event, which the copy's
 ///   command buffer signals to the copy's number ([`SurfaceCache::event`]), where the use reads
 ///   what the copy writes (a fill), or may write what the copy reads (any copy). It holds its
-///   queue as a buffer that waits for a fill does. Its marks of the cache (written) and its end
+///   queue, as a buffer that waits for an event does, where a fill made at once holds nothing
+///   ([`Caches::before_answering`]). Its marks of the cache (written) and its end
 ///   value are kept apart until the copy is made ([`Since`]), so the copy follows none of them.
 ///   A use that only reads follows no copy out, which leaves the cache as it is.
 /// - **A buffer finished before a copy it follows is made** stays counted among the users of
@@ -2780,7 +2785,7 @@ impl<P: Platform> SurfaceCaches<P> {
 /// queues' end events order it on the GPU after the buffers committed before it
 /// ([`SurfaceCaches::after`]); the cache's event orders the buffers committed before it after it.
 /// A buffer's uses are counted together, after those of every buffer begun before it
-/// ([`Self::before`]); a copy follows only buffers begun before it was asked, and a buffer waits
+/// ([`Self::before_answering`]); a copy follows only buffers begun before it was asked, and a buffer waits
 /// only for copies asked before it was begun, and is let go of only once they are made, so no
 /// two wait for each other, on the CPU or on the GPU, and the transfer queue runs its copies in
 /// an order that waits for nothing committed after them. No begin, no present and no ring-0
@@ -2795,8 +2800,29 @@ pub(crate) struct Caches<P: Platform> {
     on_fill_done: Arc<OnceLock<FillHook>>,
 }
 
+/// The blocks a begin answered before its fills holds ([`Caches::before_answering`]), let go of as
+/// it is dropped, with the caches' lock not held, and the begins waiting for them woken.
+struct Answering<'a, P: Platform> {
+    caches: &'a Caches<P>,
+    blocks: Vec<u64>,
+}
+
+impl<P: Platform> Drop for Answering<'_, P> {
+    fn drop(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let mut state = self.caches.state.lock();
+        for block in &self.blocks {
+            state.answering.remove(block);
+        }
+        drop(state);
+        self.caches.moved.notify_all();
+    }
+}
+
 /// What a command buffer's work reaches of the device caches besides the uses it names
-/// ([`Caches::before`]).
+/// ([`Caches::before_answering`]).
 #[derive(Debug, Default)]
 pub(crate) struct Reach {
     /// The context it was committed in.
@@ -3014,6 +3040,20 @@ impl<P: Platform> Caches<P> {
         }
     }
 
+    /// The tests' [`Self::before_answering`] with no answer: whether `cb` waits on the GPU for a
+    /// copy of a cache, and its uses.
+    #[cfg(test)]
+    pub(crate) fn before(
+        self: &Arc<Self>,
+        device: &P::Device,
+        cb: &P::CommandBuffer,
+        uses: &[RgfxOpSurfaceUse],
+        reach: &Reach,
+    ) -> RaiseResult<(bool, Option<Uses<P>>)> {
+        let (waits, _, uses) = self.before_answering(device, cb, uses, reach, None)?;
+        Ok((waits, uses))
+    }
+
     /// The blocks `uses` names that have caches, before command buffer `cb` runs, and its count
     /// among their users ([`SurfaceCaches::before_one`]): each filled where it needs it
     /// ([`SurfaceCaches::needs_fill`]), at once or after every command buffer begun and not
@@ -3032,17 +3072,69 @@ impl<P: Platform> Caches<P> {
     /// fills its context's caches owe made, and waits for them on the GPU
     /// ([`SurfaceCaches::fill_reached`]); a use of a block its decodes write whole takes the first
     /// fill as met ([`SurfaceCaches::before_one`]).
-    pub(crate) fn before(
+    ///
+    /// It answers too whether `cb` follows a deferred copy of a cache ([`Uses`]'s `follows`),
+    /// which holds its queue; and, where `answer` is given and `cb` would follow none, `answer` is
+    /// called first, before the fills the begin makes, with no lock held: so a buffer's
+    /// `CB_SUBMITTED` is posted before the host copies its surfaces' pages into their caches (a
+    /// new surface's first fill, at its first use, takes milliseconds), as a fill made at once
+    /// waits on the GPU for nothing of the guest's still to come. A copy follows `cb` only where
+    /// it waits for buffers begun before it ([`SurfaceCaches::follows_deferred`]); from the answer
+    /// until the fills are made, the blocks of `cb`'s uses are held ([`SurfaceCaches::answering`])
+    /// and another begin that names one waits for them, so none counts a use of one between and
+    /// turns a fill decided at once into one that waits for its buffer. A buffer that follows a
+    /// deferred copy is not answered here: its copy waits for buffers begun before it, which may
+    /// wait for the guest.
+    pub(crate) fn before_answering(
         self: &Arc<Self>,
         device: &P::Device,
         cb: &P::CommandBuffer,
         uses: &[RgfxOpSurfaceUse],
         reach: &Reach,
-    ) -> RaiseResult<(bool, Option<Uses<P>>)> {
+        answer: Option<&mut dyn FnMut()>,
+    ) -> RaiseResult<(bool, bool, Option<Uses<P>>)> {
         if uses.is_empty() && !reach.work {
-            return Ok((false, None));
+            if let Some(answer) = answer {
+                answer();
+            }
+            return Ok((false, false, None));
         }
         let mut state = self.state.lock();
+        while (uses.iter()).any(|u| state.answering.contains(&u.block_offset)) {
+            self.moved.wait(&mut state);
+        }
+        // Let go of as the begin ends, however it ends (a raise, or a panic its caller catches),
+        // so no later begin waits for good.
+        let mut answered = Answering {
+            caches: self,
+            blocks: Vec::new(),
+        };
+        if let Some(answer) = answer {
+            let picked = by_block(&state, uses);
+            if !picked.iter().any(|u| state.follows_deferred(u)) {
+                answered.blocks = picked.iter().map(|u| u.block_offset).collect();
+                state.answering.extend(answered.blocks.iter().copied());
+                drop(state);
+                answer();
+                state = self.state.lock();
+            }
+        }
+        let before = self.before_locked(state, device, cb, uses, reach);
+        drop(answered);
+        let (waits, uses) = before?;
+        let follows = uses.as_ref().is_some_and(|u| !u.follows.is_empty());
+        Ok((waits, follows, uses))
+    }
+
+    /// [`Self::before_answering`] from its lock on, `state`, which it lets go of.
+    fn before_locked<'a>(
+        self: &'a Arc<Self>,
+        mut state: MutexGuard<'a, SurfaceCaches<P>>,
+        device: &P::Device,
+        cb: &P::CommandBuffer,
+        uses: &[RgfxOpSurfaceUse],
+        reach: &Reach,
+    ) -> RaiseResult<(bool, Option<Uses<P>>)> {
         let reached = match reach.work {
             true => state.fill_reached(device, cb, reach.context)?,
             false => false,
@@ -3132,7 +3224,7 @@ impl<P: Platform> Caches<P> {
     }
 
     /// Whether a command buffer whose `SURFACE_USE` ops are `uses` waits for no copy of a cache
-    /// at its begin ([`Self::before`]), so it gets its `CB_SUBMITTED` at its take: no block of
+    /// at its begin ([`Self::before_answering`]), so it gets its `CB_SUBMITTED` at its take: no block of
     /// them that has a cache needs a fill ([`SurfaceCaches::needs_fill`]), or follows a copy of
     /// its cache asked and not yet made ([`SurfaceCaches::follow`]), and each one's last fill is
     /// done. Answered waiting for nothing and allocating nothing (a doorbell's thread), each lock
@@ -4254,24 +4346,25 @@ mod tests {
         assert_eq!(r.dec.caches().counts().fills, 2, "1's, the first, and 3's");
     }
 
-    /// A buffer that asks for its `CB_SUBMITTED` and uses a cache the host fills first waits for
-    /// the fill, so it gets it at its scheduling, after its commit (the fake schedules a buffer as
-    /// it is committed), not as the host takes it; once the fill is done, a buffer of the same
-    /// generation waits for nothing and gets it as it is taken, before its commit.
+    /// A buffer that asks for its `CB_SUBMITTED` and uses a cache its begin fills at once (no
+    /// buffer begun and not finished uses it, no copy of it waits) gets it as the host takes it,
+    /// before the fill's copy and its own commit: the fill waits for nothing of the guest's to
+    /// come. Once the fill is done, a buffer of the same generation fills nothing and gets it as
+    /// it is taken too.
     #[test]
-    fn a_buffer_behind_a_fill_is_submitted_at_its_scheduling() {
+    fn a_buffer_whose_begin_fills_a_cache_is_submitted_before_the_fill() {
         let mut r = cached();
         let at = Arc::new(Mutex::new(Vec::new()));
         let (log, marks) = (Arc::clone(&r.p), Arc::clone(&at));
         r.dec.set_submitted_sink(Arc::new(move |m| {
             marks.lock().push((m.cb_obj_id, log.call_log().mark()));
         }));
-        // The buffer's own commit, the last of those since `from`.
-        let commit = |r: &Rig, from| {
+        // The first call to `sel` since `from`.
+        let first = |r: &Rig, from, sel: &str| {
             (r.p.call_log().since(from).iter())
-                .filter(|c| c.sel == "commit")
+                .filter(|c| c.sel == sel)
                 .map(|c| c.seq)
-                .max()
+                .min()
                 .unwrap()
         };
         let mark = r.p.call_log().mark();
@@ -4279,14 +4372,100 @@ mod tests {
         assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1, "a fill");
         let (cb, posted) = at.lock()[0];
         assert_eq!(cb, 0x100);
-        assert!(posted > commit(&r, mark), "at its scheduling");
+        assert!(posted <= first(&r, mark, COPY), "before the fill");
+        assert!(posted <= first(&r, mark, "commit"), "as it is taken");
         r.p.world().complete_all(CompleteOn::Caller);
         let mark = r.p.call_log().mark();
         use_surfaces_asking(&mut r, 1, 0x101, &[(BLOCK, 1, false)], true);
         assert!(copies(&r.p.call_log().since(mark)).is_empty());
         let (cb, posted) = at.lock()[1];
         assert_eq!(cb, 0x101);
-        assert!(posted <= commit(&r, mark), "as it is taken");
+        assert!(posted <= first(&r, mark, "commit"), "as it is taken");
+    }
+
+    /// A buffer that asks for its `CB_SUBMITTED` and needs a fill of a cache that a buffer begun
+    /// and not finished uses follows the fill, deferred to that buffer's finish
+    /// ([`SurfaceCaches::defer_fill`]), which may wait for the guest: it gets its `CB_SUBMITTED`
+    /// at its scheduling, after its commit, not as the host takes it.
+    #[test]
+    fn a_buffer_behind_a_deferred_fill_is_submitted_at_its_scheduling() {
+        let mut r = cached();
+        let at = Arc::new(Mutex::new(Vec::new()));
+        let (log, marks) = (Arc::clone(&r.p), Arc::clone(&at));
+        r.dec.set_submitted_sink(Arc::new(move |m| {
+            marks.lock().push((m.cb_obj_id, log.call_log().mark()));
+        }));
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, false)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let queue = r.device.new_command_queue().unwrap();
+        let reader = queue.command_buffer(ON).unwrap().unwrap();
+        let (_, uses) = (r.dec.surface_caches)
+            .before(&r.device, &reader, &reading(BLOCK, 1), &NO_REACH)
+            .unwrap();
+        let mark = r.p.call_log().mark();
+        use_surfaces_asking(&mut r, 1, 0x101, &[(BLOCK, 2, false)], true);
+        let calls = r.p.call_log().since(mark);
+        assert!(copies(&calls).is_empty(), "the fill deferred");
+        let commit = (calls.iter())
+            .filter(|c| c.sel == "commit")
+            .map(|c| c.seq)
+            .max()
+            .unwrap();
+        drop(uses);
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(r.dec.caches().counts().fills_deferred, 1);
+        let (cb, posted) = at.lock()[0];
+        assert_eq!(cb, 0x101);
+        assert!(posted > commit, "at its scheduling");
+    }
+
+    /// A begin answered before its fills holds its uses' blocks from the answer until the fills
+    /// are made: another begin over one of them waits meanwhile, so it counts no use the answered
+    /// begin's fill, decided at once, would then wait for. It goes on once they are made, and
+    /// waits for the fill on the GPU, which is made once.
+    #[test]
+    fn a_begin_waits_while_another_answered_before_its_fills_makes_them() {
+        let r = cached();
+        let caches = Arc::clone(&r.dec.surface_caches);
+        let queue = r.device.new_command_queue().unwrap();
+        let answered = queue.command_buffer(ON).unwrap().unwrap();
+        let other = queue.command_buffer(ON).unwrap().unwrap();
+        std::thread::scope(|scope| {
+            let mut begin = None;
+            let mut answer = || {
+                begin = Some(scope.spawn(|| {
+                    (caches.before(&r.device, &other, &reading(BLOCK, 1), &NO_REACH))
+                        .map(|(waits, uses)| (waits, uses.is_some()))
+                        .map_err(|_| ())
+                }));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(
+                    !begin.as_ref().unwrap().is_finished(),
+                    "a begin counted a use of a block answered before its fill"
+                );
+            };
+            let (waits, follows, uses) = (caches)
+                .before_answering(
+                    &r.device,
+                    &answered,
+                    &reading(BLOCK, 1),
+                    &NO_REACH,
+                    Some(&mut answer as &mut dyn FnMut()),
+                )
+                .unwrap();
+            assert!(begin.is_some(), "answered");
+            assert!(
+                waits && !follows && uses.is_some(),
+                "waits for its fill alone"
+            );
+            assert_eq!(
+                begin.unwrap().join().unwrap(),
+                Ok((true, true)),
+                "counted after the fill, waiting for it"
+            );
+        });
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.fills, counts.fills_deferred), (1, 0));
     }
 
     /// A wait for a cache's fill, as a decode that writes the cache outside a command buffer

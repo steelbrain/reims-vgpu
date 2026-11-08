@@ -20,33 +20,38 @@
 //! finishes, and always ahead of its completion record ([`Signals`]); a buffer that
 //! waits is watched, and named in the log where it waits long ([`super::waits`]).
 //!
-//! **Submission.** A buffer committed by `commitAndWaitUntilSubmitted` asks for its
-//! `CB_SUBMITTED` (`SUBMITTED`), at which that call returns in the guest. Metal's returns once the
-//! buffer is submitted (measured on the 5300M, the 630 and the M3: about 0.3 ms behind a 100 ms
-//! buffer, the buffer then `Committed` or `Scheduled` by a race, and at the signal for a buffer
-//! that waits on an event or is behind one on its queue; docs/graphics-kext/dgpu-oracle.md, Q7).
-//! The host posts it as soon as it takes a buffer that waits for no event, needs no fill of a
-//! device cache and has none before it on its queue that waits for one and is not yet scheduled
-//! ([`Held`]), before it walks the buffer's ops ([`Take`]); a GPU wait for a buffer of another
-//! queue ([`super::surface_order`]) holds back neither its `CB_SUBMITTED` nor its `CB_SCHEDULED`,
-//! which then goes at its commit ([`Line`]), as a Mac's order of IOSurface accesses holds back no
-//! record (Q16). Its ticket in the commit order is issued first ([`super::sequencer`]), so every
-//! command buffer its process sends after it, on any queue, is committed after the buffer's
-//! commit, and the platform orders the process's later work after it as it orders by commit;
-//! another process's buffers wait for no ticket of its, as they name none of its tracked
-//! resources. A buffer whose walk then faults has its failure at its completion, as Metal reports
-//! a command buffer's errors. Any other buffer gets it at its scheduling, once the waits are
-//! satisfied: Metal orders a tracked resource across queues behind what it has
-//! submitted, not behind a buffer its queue holds (measured on the M3 through the decoder, a
-//! later commit on another queue ran first), and the host's fills of device caches are waits
-//! too. Either way it goes once, ahead of the buffer's `CB_SCHEDULED` and `CB_COMPLETE`
-//! ([`Submitted`]).
+//! **Submission.** A buffer committed by `commitAndWaitUntilSubmitted` asks for its `CB_SUBMITTED`
+//! (`SUBMITTED`), at which that call returns in the guest. Metal's returns once the buffer is
+//! submitted (measured on the 5300M, the 630 and the M3: about 0.3 ms behind a 100 ms buffer, the
+//! buffer then `Committed` or `Scheduled` by a race, and at the signal for a buffer that waits on
+//! an event or is behind one on its queue; docs/graphics-kext/dgpu-oracle.md, Q7). The host posts
+//! it as soon as it takes a buffer that waits for no event, follows no deferred copy of a device
+//! cache and has none before it on its queue that waits for one and is not yet scheduled
+//! ([`Held`]), before it walks the buffer's ops ([`Take`]) and before the fills of device caches
+//! its begin makes at once; a GPU wait for a buffer of another queue ([`super::surface_order`])
+//! holds back neither its `CB_SUBMITTED` nor its `CB_SCHEDULED`, which then goes at its commit
+//! ([`Line`]), as a Mac's order of IOSurface accesses holds back no record (Q16), and nor does a
+//! fill made at once, which waits for nothing of the guest's to come (a new surface's first fill,
+//! at its first use, takes milliseconds: WindowServer's capture of a window list for Dock waited
+//! about 4 ms in `commitAndWaitUntilSubmitted` for one on the 780M host, 11-08). Its ticket in the
+//! commit order is issued first ([`super::sequencer`]), so every command buffer its process sends
+//! after it, on any queue, is committed after the buffer's commit, and the platform orders the
+//! process's later work after it as it orders by commit; another process's buffers wait for no
+//! ticket of its, as they name none of its tracked resources. A buffer whose walk then faults has
+//! its failure at its completion, as Metal reports a command buffer's errors. Any other buffer gets
+//! it at its scheduling, once the waits are satisfied: Metal orders a tracked resource across
+//! queues behind what it has submitted, not behind a buffer its queue holds (measured on the M3
+//! through the decoder, a later commit on another queue ran first), and a deferred copy of a device
+//! cache waits for buffers begun before it, which may wait so. Either way it goes once, ahead of
+//! the buffer's `CB_SCHEDULED` and `CB_COMPLETE` ([`Submitted`]).
 //!
 //! **An answer on the doorbell's thread.** A buffer that gets its `CB_SUBMITTED` at its take may
 //! get it on the thread of the guest's doorbell write instead, before its queue's service thread
 //! takes it off its ring (`reims_vgpu_graphics`'s `Device::mmio_write_taking`), where nothing need be
 //! waited for or allocated there ([`Decoders::answer_at_doorbell`]): it waits for no copy of a
-//! device cache it uses, and every lock the answer takes is tried. Its turn in its queue's lane
+//! device cache it uses, and every lock the answer takes is tried. One whose begin fills a cache
+//! is answered at its take, before the fill: a doorbell cannot know the fill will be made at once,
+//! as another queue's begin before the take may count a use of the cache, which defers it. Its turn in its queue's lane
 //! and its ticket in the commit order are taken there, in the order its begin would take them,
 //! and kept on its queue with its mark in that order ([`Answered`]), then its `CB_SUBMITTED` is
 //! posted. Its begin, on the service thread, takes them in place of its own
@@ -379,8 +384,9 @@ type Records = (Option<Arc<Submitted>>, Arc<Scheduled>);
 /// event on the host until its value is reached), and the buffers behind it on its queue with it.
 /// So such a buffer gets its `CB_SUBMITTED` at its take, as one that waits for nothing does, and
 /// its `CB_SCHEDULED` there too where it gets that, else at its commit; so does every buffer of
-/// its queue committed while one of them is not yet taken by the platform. A buffer that waits for an event, or for the host's fill of a device cache, or is
-/// behind one on its queue, keeps its records at its scheduling ([`Held`]).
+/// its queue committed while one of them is not yet taken by the platform. A buffer that waits for
+/// an event, or follows a deferred copy of a device cache, or is behind one on its queue, keeps
+/// its records at its scheduling ([`Held`]).
 ///
 /// The records of a queue go in its commit order: a buffer whose records go at its commit first
 /// posts those of every buffer committed before it on its queue not yet posted, whose order on the
@@ -575,8 +581,9 @@ impl<P: Platform> Begun<P> {
     }
 
     /// Its `CB_SUBMITTED`, where it gets it at its take: it asks for one, waits for no event and
-    /// no fill of a device cache (a GPU wait for a buffer of another queue holds back nothing,
-    /// [`Line`]), and no buffer before it on its queue holds the queue. Any other gets it at its
+    /// follows no deferred copy of a device cache (a GPU wait for a buffer of another queue holds
+    /// back nothing, [`Line`], and nor does a fill made at its begin: it gets it before the
+    /// fill), and no buffer before it on its queue holds the queue. Any other gets it at its
     /// scheduling.
     pub(crate) fn submitted_at_take(&self) -> Option<&Arc<Submitted>> {
         (self.submitted.as_ref()).filter(|_| self.held.is_none() && !self.behind)
@@ -696,8 +703,8 @@ fn submission_handler(
 }
 
 /// Whether the queue whose counts are `counts` is held, a buffer of it begun before that waits for
-/// an event and is not yet scheduled; and, where the buffer begun now `waits` for an event (the
-/// host's fill of a device cache among them), its own hold of the queue, counted from now, which
+/// an event and is not yet scheduled; and, where the buffer begun now `waits` for an event (a
+/// deferred copy of a device cache among them), its own hold of the queue, counted from now, which
 /// keeps it and the queue's later buffers from being submitted before it is scheduled, as Metal
 /// submits a queue's buffers in order. It is counted at the buffer's begin, not its commit, so a
 /// buffer of the queue begun before this one commits (its lane walks several at once,
@@ -1190,8 +1197,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// The IOSurfaces whose device caches it uses (its `SURFACE_USE` ops) are filled first where
     /// they hold an older generation, and it signals its queue's end event for their later copies
     /// ([`super::surface_cache`]). A buffer that asks for its `CB_SUBMITTED` and waits for nothing
-    /// gets it before the walk, and its `CB_SCHEDULED` there too where none begun before it on its
-    /// queue owes its own ([`Begun::post_at_take`]); any other at its scheduling.
+    /// but fills made at its begin gets it before them and the walk, and its `CB_SCHEDULED` there
+    /// too where none begun before it on its queue owes its own ([`Begun::post_at_take`]); any
+    /// other at its scheduling.
     pub(super) fn decode_command_buffer(
         &self,
         device: &P::Device,
@@ -1202,10 +1210,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(begun) => begun,
             Err(e) => return Ok(Err(e)),
         };
-        // Submitted and scheduled at once where it asks, unless it waits (for an event, or for the
-        // host's fill of a device cache) or a buffer before it on its queue does: then at its
+        // Submitted and scheduled at once where it asks, unless it waits (for an event, or for a
+        // deferred copy of a device cache) or a buffer before it on its queue does: then at its
         // scheduling; and scheduled at its take only where no buffer before it on its queue owes
-        // its scheduling.
+        // its scheduling. Its begin posted them before its fills where it gets them here.
         // Its ticket in the commit order is issued first, so a buffer its process sends after the
         // answer is committed after this one ([`super::sequencer`]).
         if begun.posts_at_take() {
@@ -1352,8 +1360,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// command buffer on the named queue, readies the device caches its `SURFACE_USE` ops use
     /// (filling each that holds an older generation), has it wait on the GPU for the buffers of
     /// other queues its `SURFACE_ORDER` names that have not finished, and makes its
-    /// `CB_SUBMITTED` and, where it waits for an event or a fill, its hold of its queue
-    /// ([`Begun`]).
+    /// `CB_SUBMITTED` and, where it waits for an event or a deferred copy of a cache, its hold of
+    /// its queue ([`Begun`]); where it gets its records at its take, they are posted before its
+    /// fills, its ticket in the commit order issued first
+    /// ([`super::surface_cache::Caches::before_answering`]).
     pub(crate) fn begin_command_buffer(
         &self,
         device: &P::Device,
@@ -1428,7 +1438,30 @@ impl<P: Platform> GraphicsDecoder<P> {
                 false => self.decoded_whole(&take.decodes),
             },
         };
-        let (fill_waits, uses) = (self.surface_caches).before(device, &cb, &take.uses, &reach)?;
+        let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
+        // Owed by its queue from now until it is posted, after every buffer begun before it.
+        let (scheduled, first) = self
+            .scheduled(m.cb_obj_id, m.header.seqno, Some(&counts.line))
+            .map_or((None, false), |(s, first)| (Some(s), first));
+        // Where it gets its records at its take, they are posted before the fills its uses need,
+        // once its ticket in the commit order is issued: a fill the host makes at once waits for
+        // nothing of the guest's to come, so it holds back none of them, as a GPU wait for a
+        // buffer of another queue does not ([`Begun::submitted_at_take`]). Only a buffer that
+        // follows a deferred copy of a cache waits for buffers begun before it, which may wait
+        // for the guest; the caches answer no such buffer here.
+        let early = submitted.is_some() && !take.waits && counts.held.load(Ordering::Acquire) == 0;
+        let mut answer = || {
+            self.issue_ticket();
+            if let Some(submitted) = &submitted {
+                submitted.post();
+            }
+            if first && let Some(scheduled) = &scheduled {
+                scheduled.post();
+            }
+        };
+        let answer = early.then_some(&mut answer as &mut dyn FnMut());
+        let (_, follows, uses) =
+            (self.surface_caches).before_answering(device, &cb, &take.uses, &reach, answer)?;
         // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
         // off it (`surface_order`).
         let order_waits = match &take.order {
@@ -1439,13 +1472,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         };
         let waits_for_order = !order_waits.is_empty();
         *self.order_waits.borrow_mut() = order_waits;
-        let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
-        // Owed by its queue from now until it is posted, after every buffer begun before it.
-        let (scheduled, first) = self
-            .scheduled(m.cb_obj_id, m.header.seqno, Some(&counts.line))
-            .map_or((None, false), |(s, first)| (Some(s), first));
-        // Those GPU waits hold back none of its records, nor its queue ([`Line`]).
-        let (behind, held) = hold(counts, fill_waits || take.waits);
+        // Those GPU waits hold back none of its records, nor its queue ([`Line`]), and nor do the
+        // fills of caches made at its begin: only an event's wait, or a deferred copy's, does.
+        let (behind, held) = hold(counts, follows || take.waits);
         Ok(Ok(Begun {
             queue_obj_id: m.queue_obj_id,
             queue: (take.video && uses.is_some()).then(|| queue.clone_ref()),
