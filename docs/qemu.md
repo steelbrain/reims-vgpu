@@ -306,6 +306,40 @@ Measured on msi-5080 (macos-26, 16 GiB, a drag and a UFO test,
 2026-10-27): KVM maps about 10 GiB of the guest at 2 MiB, none
 before, and the vCPUs' time a frame falls 6-7% at the same frame rate.
 
+### Linux hosts: guest RAM resident from the start
+
+`reims-ctl` has QEMU allocate the guest's RAM whole as it starts
+(`prealloc=on` on the memfd backend), with as many threads as the guest has
+vCPUs (`prealloc-threads`). Without it, the guest's first touch of a page
+faults on a vCPU, and KVM resolves the fault through `get_user_pages`, which
+holds the process's mmap lock for read. Where the host backs the memfd with
+transparent huge pages (above), that fault allocates a 2 MiB page, and with
+`defrag` at `madvise` (the kernel's default) and QEMU's `MADV_HUGEPAGE` it
+reclaims and compacts memory for it inside the fault. On a host whose free
+memory is fragmented, compaction mostly fails and can take over a second. A
+thread that asks for the lock for write meanwhile (glibc growing a heap by
+`mprotect`, a view's `mmap`) waits behind the fault, and every later reader
+waits behind it, the other vCPUs' faults among them.
+
+Measured on msi-5080 (CachyOS, Linux 7.2.8; transparent huge pages
+`enabled` always, `defrag` madvise, `shmem_enabled` advise;
+`compaction_proactiveness` 0; macos-26, 16 GiB, 8 vCPUs; Safari playing the
+4K HEVC clips one, two and three at once; 2026-11-08), two boots each way:
+- without prealloc, vCPUs stood in uninterruptible sleep, waiting for the
+  lock, for 15 and 22 s of the boot in all, up to 1.0 s at a time; vCPUs'
+  faults held it for up to 1.8 s, and 94 and 95% of the boot's direct
+  compactions failed; the clips presented 1.1 to 57 frames a second and
+  dropped up to 1,570 frames each;
+- with prealloc, no vCPU took the mmap lock, the longest hold of it was
+  1.9 ms, and the clips presented 50 to 58 frames a second, dropping 0 to 4;
+- QEMU took 5.3 and 6.5 s from its start to its first vCPU thread, against
+  0.05 s, and the process held 17.1 to 17.2 GiB at the guest's first Safari
+  page, against 10.9 GiB (14.5 to 15.0 GiB at the end of the playback
+  without prealloc).
+
+A host without the free memory for a VM's RAM now refuses the VM as QEMU
+starts, where before it overcommitted.
+
 ### Linux hosts: `vm.max_map_count`
 
 On Linux the library's views of guest memory take kernel mappings, which

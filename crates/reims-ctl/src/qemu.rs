@@ -20,7 +20,11 @@
 //!   serial console and timestamps; with logs off its warnings alone ([`LOGS_OFF`]).
 //!
 //! The machine, `q35-x86_64`, follows the command line the x86-64 guests were measured on
-//! (docs/qemu.md): RAM as a shared memfd, which the library on Linux requires; the keyboard and
+//! (docs/qemu.md): RAM as a shared memfd, which the library on Linux requires, allocated whole as
+//! QEMU starts (`prealloc`), so no guest-RAM fault runs on a vCPU: where the host backs shmem with
+//! transparent huge pages, such a fault allocates a huge page, compacting memory for it under the
+//! process's mmap lock, and stalled vCPUs for up to 1.8 s, the others queued behind it ("Linux
+//! hosts: guest RAM resident from the start" there); the keyboard and
 //! tablet on a qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's
 //! interrupt transfers under GPU load and its input freezes, with the host's USB devices the VM's
 //! settings give it beside them ([`crate::usb`]); fixed PCI addresses (the AHCI controller, which
@@ -175,10 +179,13 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     }
     push(&["-machine", &machine]);
     if c.profile.memfd_ram(ctx.host) {
-        push(&[
-            "-object",
-            &format!("memory-backend-memfd,id=ram,size={mem},share=on"),
-        ]);
+        // Resident from the start, made by as many threads as the guest has vCPUs (the module
+        // doc).
+        let backend = format!(
+            "memory-backend-memfd,id=ram,size={mem},share=on,prealloc=on,prealloc-threads={}",
+            c.cpus
+        );
+        push(&["-object", &backend]);
     }
     push(&["-accel", c.profile.accel(), "-m", &mem]);
     let mut cpu = format!(
@@ -509,7 +516,7 @@ mod tests {
             ][..],
             &[
                 "-object",
-                "memory-backend-memfd,id=ram,size=12288M,share=on",
+                "memory-backend-memfd,id=ram,size=12288M,share=on,prealloc=on,prealloc-threads=6",
             ],
             &["-accel", "kvm", "-m", "12288M"],
             &["-smp", "6,sockets=1,cores=6,threads=1"],
