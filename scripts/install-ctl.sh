@@ -176,21 +176,21 @@ if [[ -r /etc/os-release ]]; then
   # shellcheck disable=SC1091
   distro_like="$(. /etc/os-release && echo "${ID_LIKE:-}")"
 fi
-# The library (cargo xtask dist: clang, lld and binutils for the option ROM;
-# CMake and the X11, Wayland, xkbcommon and EGL headers for SDL3's video,
-# which it builds from source), and QEMU (glib, pixman, libslirp; GTK 3 for
+# The library (cargo xtask dist: binutils's ld, nm, objcopy and ar for the
+# archive it installs; CMake and the X11, Wayland, xkbcommon and EGL headers
+# for SDL3's video, which it builds from source), and QEMU (glib, pixman, libslirp; GTK 3 for
 # its own window, which a VM on VMware SVGA shows its display in; pipewire,
 # pulse and ALSA for its audio backends; libusb for USB passthrough; the
 # SPICE server for -spice; bzip2 unpacks its firmware). A new x86-64 VM's
 # OVMF comes from reims-util, with its OpenCore image.
 apt_pkgs=(build-essential git curl ca-certificates pkg-config python3 python3-venv ninja-build
-  flex bison bzip2 cmake clang lld binutils libglib2.0-dev libpixman-1-dev libslirp-dev
+  flex bison bzip2 cmake binutils libglib2.0-dev libpixman-1-dev libslirp-dev
   zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libusb-1.0-0-dev
   libspice-server-dev libvulkan1
   libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev
   libxtst-dev libxkbcommon-dev libwayland-dev libwayland-bin libdecor-0-dev
   libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libgtk-3-dev)
-pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake clang lld
+pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake
   glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb spice vulkan-icd-loader
   libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
   wayland libdecor mesa libdrm dbus systemd-libs gtk3)
