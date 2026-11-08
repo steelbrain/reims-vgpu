@@ -24,11 +24,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reims_graphics::ops::video::{
-    RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RgfxVideoOpDecodeH264,
-    RgfxVideoOpDecodeH265,
+    RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RGFX_OP_VIDEO_ENCODE_H264,
+    RGFX_OP_VIDEO_ENCODE_H265, RGFX_VIDEO_ENCODE_FORCE_KEYFRAME, RgfxVideoEncodeResult,
+    RgfxVideoEncodeSettings, RgfxVideoOpDecodeH264, RgfxVideoOpDecodeH265, RgfxVideoOpEncode,
 };
 use reims_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxVideoCodecCaps, RgfxVideoOutputLayout,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
+    RgfxVideoOutputLayout,
 };
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::command::CommandBuffer as _;
@@ -58,6 +60,11 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     /// output surfaces' planes; all zero where it lands them by a copy alone.
     fn layout(&self, _codec: &RgfxVideoCodecCaps) -> RgfxVideoOutputLayout {
         RgfxVideoOutputLayout::default()
+    }
+    /// What an encode of `codec`, one of [`Self::caps`] in the encode direction, takes beyond
+    /// it; all zero for a decode entry, which is what a backend that encodes nothing answers.
+    fn encode_caps(&self, _codec: &RgfxVideoCodecCaps) -> RgfxVideoEncodeCaps {
+        RgfxVideoEncodeCaps::default()
     }
     /// A session of `codec` (`RGFX_VIDEO_CODEC_*`) in `direction` (`RGFX_VIDEO_DECODE` or
     /// `RGFX_VIDEO_ENCODE`); `None` where the hardware has no such codec.
@@ -143,6 +150,14 @@ pub trait GraphicsVideoSession<P: Platform>: Send + Sync {
     /// picture may still fail to land after it, what it came to ([`Decoded`]). An `Err` faults the
     /// command buffer, and starts nothing.
     fn decode(&self, decode: &VideoDecode<'_, P>) -> RaiseResult<Decoded>;
+
+    /// Starts the encode of `encode`'s frame, after the session's earlier work, and answers the
+    /// value [`Self::event`] reaches once the frame's access unit and its result are in the
+    /// guest's buffers, whatever the result says. An `Err` faults the command buffer, and starts
+    /// nothing; a session that does not encode faults every encode.
+    fn encode(&self, _encode: &VideoEncode<'_, P>) -> RaiseResult<u64> {
+        Err(op_fault("a video encode on a session that does not encode"))
+    }
 }
 
 /// A decode the session took ([`GraphicsVideoSession::decode`]).
@@ -280,6 +295,31 @@ pub struct VideoDecode<'a, P: Platform> {
     pub output_rows: u32,
 }
 
+/// One frame to encode, of the session's codec: H.264's ([`RGFX_OP_VIDEO_ENCODE_H264`]) or
+/// HEVC's ([`RGFX_OP_VIDEO_ENCODE_H265`]).
+pub struct VideoEncode<'a, P: Platform> {
+    /// The source's luma plane (`R8`, or `R16` at 10 bits).
+    pub luma: VideoPlane<'a, P>,
+    /// The source's chroma plane (`RG8`, or `RG16`).
+    pub chroma: VideoPlane<'a, P>,
+    /// The Shared buffer the access unit goes in.
+    pub bitstream: &'a P::Buffer,
+    /// Where its first byte goes in it.
+    pub bitstream_offset: u64,
+    /// The most bytes it may take there: at least one, inside the buffer.
+    pub bitstream_capacity: u64,
+    /// The Shared buffer the [`RgfxVideoEncodeResult`] goes in.
+    pub result: &'a P::Buffer,
+    /// Where it goes in it: a multiple of 8, the whole result inside the buffer.
+    pub result_offset: u64,
+    /// The frame's place in display order.
+    pub frame_index: u64,
+    /// Whether the frame must be a keyframe.
+    pub force_keyframe: bool,
+    /// The settings from this frame on, where they changed since the session's last encode.
+    pub settings: Option<RgfxVideoEncodeSettings>,
+}
+
 /// A block of the region as the host's video devices take memory ([`PlanePages`]): its bytes in
 /// the region's mapping, which stays mapped while the region lives, held by the host view, and
 /// the block's life, which its `BLOCK_RELEASE` ends ([`GraphicsDecoder::block_released`]).
@@ -403,6 +443,15 @@ impl DecodeOp {
     }
 }
 
+/// The session codec of an encode op `tag`; `None` for a tag that is no encode.
+fn encode_codec(tag: u16) -> Option<u32> {
+    match tag {
+        RGFX_OP_VIDEO_ENCODE_H264 => Some(RGFX_VIDEO_CODEC_H264),
+        RGFX_OP_VIDEO_ENCODE_H265 => Some(RGFX_VIDEO_CODEC_HEVC),
+        _ => None,
+    }
+}
+
 /// Decodes one video-encoder op: `tag` its op, `payload` its body (the bytes after its
 /// [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)), on `session`, and has `cb`'s later work
 /// wait for it, and its completion read whether its picture landed, from `landings`. `Ok(false)`
@@ -415,6 +464,10 @@ pub(super) fn decode_op<P: Platform>(
     cb: &P::CommandBuffer,
     landings: &mut Vec<Arc<Landed>>,
 ) -> RaiseResult<bool> {
+    if let Some(codec) = encode_codec(tag) {
+        encode_op(tag, codec, payload, objs, session, cb)?;
+        return Ok(true);
+    }
     let Some(read) = DecodeOp::read(tag, payload) else {
         return Ok(false);
     };
@@ -446,69 +499,14 @@ pub(super) fn decode_op<P: Platform>(
             m.bitstream_size, m.bitstream_offset
         )));
     }
-    let (luma_place, luma) = objs.plane_of(m.luma_texture_obj_id)?;
-    let (chroma_place, chroma) = objs.plane_of(m.chroma_texture_obj_id)?;
-    // The block of a plane in its surface's device cache.
-    let cache_of = |buffer_obj_id| {
-        (objs.span_of(buffer_obj_id))
-            .map(|(block, _)| block)
-            .filter(|&block| objs.surface_settled(block) && objs.surface_caches.has(block))
-    };
-    let (luma_cache, chroma_cache) = (
-        cache_of(luma_place.buffer_obj_id),
-        cache_of(chroma_place.buffer_obj_id),
-    );
-    // An output in a device cache the host is filling for this buffer (a CPU wrote the
-    // surface since): the picture lands once the fill is done, so the fill's older bytes
-    // never land over it.
-    // So too an output whose last picture the host is still copying into the surface's pages
-    // (an early copy, its surface read back): the picture lands once the copy is done, so the
-    // copy never reads it.
-    for block in luma_cache.into_iter().chain(chroma_cache) {
-        if !objs.surface_caches.wait_filled(block, FILL_WAIT) {
-            return Err(op_fault(format_args!(
-                "video op {tag:#06x}: its output's device cache was not filled within \
-                 {FILL_WAIT:?}"
-            )));
-        }
-        if !objs.surface_caches.wait_copied_out(block, FILL_WAIT) {
-            return Err(op_fault(format_args!(
-                "video op {tag:#06x}: its output's last picture was not copied into its pages \
-                 within {FILL_WAIT:?}"
-            )));
-        }
-    }
+    let (luma, chroma) = objs.video_planes(tag, m.luma_texture_obj_id, m.chroma_texture_obj_id)?;
     let decode = VideoDecode {
         bitstream,
         offset: m.bitstream_offset,
         size: m.bitstream_size,
         parameter_sets: sets,
-        luma: VideoPlane {
-            buffer: luma,
-            offset: luma_place.offset,
-            bytes_per_row: luma_place.bytes_per_row,
-            row_bytes: luma_place.row_bytes,
-            width: luma_place.width,
-            height: luma_place.height,
-            cached: luma_cache.is_some(),
-            pages: (luma_cache.is_none())
-                .then(|| objs.plane_pages(luma_place.buffer_obj_id, luma))
-                .flatten(),
-            cache: luma_cache.and_then(|block| objs.surface_caches.identity(block)),
-        },
-        chroma: VideoPlane {
-            buffer: chroma,
-            offset: chroma_place.offset,
-            bytes_per_row: chroma_place.bytes_per_row,
-            row_bytes: chroma_place.row_bytes,
-            width: chroma_place.width,
-            height: chroma_place.height,
-            cached: chroma_cache.is_some(),
-            pages: (chroma_cache.is_none())
-                .then(|| objs.plane_pages(chroma_place.buffer_obj_id, chroma))
-                .flatten(),
-            cache: chroma_cache.and_then(|block| objs.surface_caches.identity(block)),
-        },
+        luma,
+        chroma,
         output_rows: m.output_rows,
     };
     // After the buffers of other queues its command buffer runs after: the reads of the
@@ -518,6 +516,86 @@ pub(super) fn decode_op<P: Platform>(
     cb.encode_wait(Some(session.event()), done.value)?;
     landings.extend(done.landed);
     Ok(true)
+}
+
+/// Decodes one encode op, `tag` of `codec`, its body at the front of `payload` and its settings
+/// after it where it has them, on `session`, and has `cb`'s later work wait for it.
+fn encode_op<P: Platform>(
+    tag: u16,
+    codec: u32,
+    payload: &[u8],
+    objs: &GraphicsDecoder<P>,
+    session: &Arc<dyn GraphicsVideoSession<P>>,
+    cb: &P::CommandBuffer,
+) -> RaiseResult<()> {
+    let fault =
+        |what: std::fmt::Arguments<'_>| op_fault(format_args!("video op {tag:#06x}: {what}"));
+    let (m, rest) = RgfxVideoOpEncode::read_from_prefix(payload)
+        .map_err(|_| fault(format_args!("body too short")))?;
+    if codec != session.codec() {
+        return Err(fault(format_args!(
+            "an encode of codec {codec} on a session of codec {}",
+            session.codec()
+        )));
+    }
+    let settings = match m.settings_size {
+        0 => None,
+        size => {
+            let bytes = usize::try_from(size).ok().and_then(|n| rest.get(..n));
+            let settings = bytes.and_then(|b| RgfxVideoEncodeSettings::read_from_prefix(b).ok());
+            match settings {
+                Some((settings, _)) => Some(settings),
+                None => {
+                    return Err(fault(format_args!(
+                        "settings of {size} bytes: past its end, or fewer than {}",
+                        size_of::<RgfxVideoEncodeSettings>()
+                    )));
+                }
+            }
+        }
+    };
+    let bitstream = objs.require_buffer(m.bitstream_buffer_obj_id)?;
+    let in_bitstream = (m.bitstream_offset.checked_add(m.bitstream_capacity))
+        .is_some_and(|end| m.bitstream_capacity > 0 && end <= bitstream.length());
+    if !in_bitstream {
+        return Err(fault(format_args!(
+            "a capacity of {} bytes at {} past its buffer, or none",
+            m.bitstream_capacity, m.bitstream_offset
+        )));
+    }
+    let result = objs.require_buffer(m.result_buffer_obj_id)?;
+    let result_bytes = size_of::<RgfxVideoEncodeResult>() as u64;
+    let in_result = m.result_offset.is_multiple_of(8)
+        && (m.result_offset.checked_add(result_bytes)).is_some_and(|end| end <= result.length());
+    if !in_result {
+        return Err(fault(format_args!(
+            "a result at {} past its buffer, or not at a multiple of 8",
+            m.result_offset
+        )));
+    }
+    let (luma, chroma) = objs.video_planes(
+        tag,
+        m.source_luma_texture_obj_id,
+        m.source_chroma_texture_obj_id,
+    )?;
+    let encode = VideoEncode {
+        luma,
+        chroma,
+        bitstream,
+        bitstream_offset: m.bitstream_offset,
+        bitstream_capacity: m.bitstream_capacity,
+        result,
+        result_offset: m.result_offset,
+        frame_index: m.frame_index,
+        force_keyframe: m.flags & RGFX_VIDEO_ENCODE_FORCE_KEYFRAME != 0,
+        settings,
+    };
+    // After the buffers of other queues its command buffer runs after: the writes of the
+    // source among them.
+    objs.wait_for_order_on_cpu();
+    let value = session.encode(&encode)?;
+    cb.encode_wait(Some(session.event()), value)?;
+    Ok(())
 }
 
 impl<P: Platform> GraphicsDecoder<P> {
@@ -541,6 +619,62 @@ impl<P: Platform> GraphicsDecoder<P> {
             Some(ObjHandle::Refused(r)) => Err(r.reference(id)),
             _ => Err(bad_reference()),
         }
+    }
+
+    /// The planes of the IOSurface textures `luma_id` and `chroma_id` lie over, for a video op
+    /// `tag`: each where it lies, in its surface's device cache where its block has one, else in
+    /// its pages. A cache the host is filling, or copying a picture out of into the pages, is
+    /// waited for first, so a picture never lands over a fill's older bytes and a copy never
+    /// reads a picture landing, and a read finds the cache whole.
+    fn video_planes(
+        &self,
+        tag: u16,
+        luma_id: u64,
+        chroma_id: u64,
+    ) -> RaiseResult<(VideoPlane<'_, P>, VideoPlane<'_, P>)> {
+        let (luma_place, luma) = self.plane_of(luma_id)?;
+        let (chroma_place, chroma) = self.plane_of(chroma_id)?;
+        // The block of a plane in its surface's device cache.
+        let cache_of = |buffer_obj_id| {
+            (self.span_of(buffer_obj_id))
+                .map(|(block, _)| block)
+                .filter(|&block| self.surface_settled(block) && self.surface_caches.has(block))
+        };
+        let (luma_cache, chroma_cache) = (
+            cache_of(luma_place.buffer_obj_id),
+            cache_of(chroma_place.buffer_obj_id),
+        );
+        for block in luma_cache.into_iter().chain(chroma_cache) {
+            if !self.surface_caches.wait_filled(block, FILL_WAIT) {
+                return Err(op_fault(format_args!(
+                    "video op {tag:#06x}: its surface's device cache was not filled within \
+                     {FILL_WAIT:?}"
+                )));
+            }
+            if !self.surface_caches.wait_copied_out(block, FILL_WAIT) {
+                return Err(op_fault(format_args!(
+                    "video op {tag:#06x}: its surface's last picture was not copied into its \
+                     pages within {FILL_WAIT:?}"
+                )));
+            }
+        }
+        let plane = |place: PlanePlace, buffer, cache: Option<u64>| VideoPlane {
+            buffer,
+            offset: place.offset,
+            bytes_per_row: place.bytes_per_row,
+            row_bytes: place.row_bytes,
+            width: place.width,
+            height: place.height,
+            cached: cache.is_some(),
+            pages: (cache.is_none())
+                .then(|| self.plane_pages(place.buffer_obj_id, buffer))
+                .flatten(),
+            cache: cache.and_then(|block| self.surface_caches.identity(block)),
+        };
+        Ok((
+            plane(luma_place, luma, luma_cache),
+            plane(chroma_place, chroma, chroma_cache),
+        ))
     }
 
     /// The memory the buffer `obj_id`, `buffer`, lies in, as the host's video devices take it

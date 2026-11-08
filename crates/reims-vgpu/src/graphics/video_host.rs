@@ -366,35 +366,59 @@ impl<P: Platform> Stage<P> {
         chroma: &OutputPlane<P>,
         staged: Staged,
     ) -> Result<(), BackendError> {
+        self.copy_with_caches(luma, chroma, staged, true)
+    }
+
+    /// Copies each plane `staged` says is staged between the staging buffer and its device
+    /// cache, into the cache where `into`, else out of it, on the session's queue, and waits for
+    /// the copy.
+    fn copy_with_caches(
+        &mut self,
+        luma: &OutputPlane<P>,
+        chroma: &OutputPlane<P>,
+        staged: Staged,
+        into: bool,
+    ) -> Result<(), BackendError> {
+        let way = if into { "into" } else { "out of" };
         let fault =
-            |what: &str, raise: Raise| format!("the copy into a device cache: {what}: {raise}");
+            |what: &str, raise: Raise| format!("the copy {way} a device cache: {what}: {raise}");
         let Some(buffer) = self.buffer.as_ref() else {
-            return Err("the copy into a device cache: no staging buffer".into());
+            return Err(format!("the copy {way} a device cache: no staging buffer").into());
         };
         if self.queue.is_none() {
             let queue = (self.device.new_command_queue())
-                .ok_or("the copy into a device cache: no command queue")?;
+                .ok_or_else(|| format!("the copy {way} a device cache: no command queue"))?;
             queue.set_label("reims-vgpu.graphics-video-copy");
             self.queue = Some(queue);
         }
         let Some(queue) = self.queue.as_ref() else {
-            return Err("the copy into a device cache: no command queue".into());
+            return Err(format!("the copy {way} a device cache: no command queue").into());
         };
         let cb = (queue.command_buffer(OnFault::Return))
             .map_err(|r| fault("its command buffer", r))?
-            .ok_or("the copy into a device cache: no command buffer")?;
+            .ok_or_else(|| format!("the copy {way} a device cache: no command buffer"))?;
         let blit = (cb.blit_encoder(OnFault::Return))
             .map_err(|r| fault("its blit encoder", r))?
-            .ok_or("the copy into a device cache: no blit encoder")?;
+            .ok_or_else(|| format!("the copy {way} a device cache: no blit encoder"))?;
         for (plane, at) in [(luma, staged.luma), (chroma, staged.chroma)] {
             let Some(at) = at else { continue };
-            for (from, to, size) in plane_copies(at, plane) {
-                let copy = BlitCmd::CopyBufferToBuffer {
-                    source_buffer: Some(buffer),
-                    source_offset: from,
-                    destination_buffer: Some(&plane.buffer),
-                    destination_offset: to,
-                    size,
+            for (staged_at, cache_at, size) in plane_copies(at, plane) {
+                let copy = if into {
+                    BlitCmd::CopyBufferToBuffer {
+                        source_buffer: Some(buffer),
+                        source_offset: staged_at,
+                        destination_buffer: Some(&plane.buffer),
+                        destination_offset: cache_at,
+                        size,
+                    }
+                } else {
+                    BlitCmd::CopyBufferToBuffer {
+                        source_buffer: Some(&plane.buffer),
+                        source_offset: cache_at,
+                        destination_buffer: Some(buffer),
+                        destination_offset: staged_at,
+                        size,
+                    }
                 };
                 blit.encode(OnFault::Return, copy)
                     .map_err(|r| fault("a copy", r))?;
@@ -406,7 +430,7 @@ impl<P: Platform> Stage<P> {
         (cb.wait_until_completed(OnFault::Return)).map_err(|r| fault("its wait", r))?;
         if cb.status() != CommandBufferStatus::COMPLETED {
             let error = cb.error().map(|e| format!("{e:?}")).unwrap_or_default();
-            return Err(format!("the copy into a device cache failed {error}").into());
+            return Err(format!("the copy {way} a device cache failed {error}").into());
         }
         Ok(())
     }
@@ -485,6 +509,48 @@ fn output_plane<P: Platform>(plane: &VideoPlane<'_, P>, rows: u64) -> RaiseResul
         width: plane.width,
         height: plane.height,
         rows_held,
+        cached: plane.cached,
+        host,
+        pages: plane.pages.clone(),
+        cache: plane.cache.clone(),
+    })
+}
+
+/// The plane of an encode's source `plane`, its first `rows` rows of `row_bytes` each, which it
+/// holds; `Err` with why where the plane holds fewer rows or narrower ones, or lies past its
+/// buffer, or in pages with no host bytes.
+fn output_plane_of<P: Platform>(
+    plane: &VideoPlane<'_, P>,
+    rows: u64,
+    row_bytes: u64,
+) -> Result<OutputPlane<P>, String> {
+    if plane.height < rows || plane.row_bytes < row_bytes {
+        return Err(format!(
+            "a source plane of {} rows of {} bytes, for {rows} rows of {row_bytes}",
+            plane.height, plane.row_bytes
+        ));
+    }
+    let end = plane_end(plane.offset, plane.bytes_per_row, rows, row_bytes);
+    if !end.is_some_and(|end| end <= plane.buffer.length()) {
+        return Err("a source plane past its buffer".to_owned());
+    }
+    let host = if plane.cached {
+        None
+    } else {
+        let contents = plane.buffer.contents();
+        if contents.is_null() {
+            return Err("a source plane in pages with no host bytes".to_owned());
+        }
+        Some(contents.wrapping_add(plane.offset))
+    };
+    Ok(OutputPlane {
+        buffer: plane.buffer.clone_ref(),
+        offset: plane.offset,
+        bytes_per_row: plane.bytes_per_row,
+        row_bytes,
+        width: plane.width,
+        height: rows,
+        rows_held: rows,
         cached: plane.cached,
         host,
         pages: plane.pages.clone(),
@@ -804,6 +870,14 @@ fn land<P: Platform>(
     let cached = output.luma.cached || output.chroma.cached;
     Ok(Way::of(is_staged, cached, by_cpu))
 }
+
+mod encode;
+
+// The arms' side of an encode session, which the VA-API arm alone drives.
+#[cfg(target_os = "linux")]
+pub(crate) use encode::{
+    EncodeFrame, EncodeSource, Encoded, HostEncodeSession, HostEncodedFrame, HostEncoder,
+};
 
 #[cfg(test)]
 mod tests;

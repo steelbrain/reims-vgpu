@@ -379,12 +379,16 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 };
                 // A picture lands in place only in a surface's pages: none where the guest asks
                 // its outputs cached.
-                for ((slot, layout), codec) in
-                    (caps.codecs.iter_mut().zip(&mut caps.layouts)).zip(video.caps())
-                {
+                let slots = caps
+                    .codecs
+                    .iter_mut()
+                    .zip(&mut caps.layouts)
+                    .zip(&mut caps.encode);
+                for (((slot, layout), encode), codec) in slots.zip(video.caps()) {
                     if !cached {
                         *layout = video.layout(&codec);
                     }
+                    *encode = video.encode_caps(&codec);
                     *slot = codec;
                     caps.codec_count += 1;
                 }

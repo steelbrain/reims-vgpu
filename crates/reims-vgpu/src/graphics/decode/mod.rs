@@ -196,7 +196,8 @@ mod work;
 pub(crate) mod worker;
 
 pub use video::{
-    Decoded, GraphicsVideo, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoPlane,
+    Decoded, GraphicsVideo, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoEncode,
+    VideoPlane,
 };
 
 pub(crate) use cmdbuf::Begun;
