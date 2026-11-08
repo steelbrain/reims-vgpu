@@ -98,7 +98,8 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 
 The branch's other commits are the apple-gfx work `eb36a099` removes, and
 `cbb749d421`, an HVF workaround that `481e881b5c` reverts, upstream having
-fixed the same assertion. `docs/system/arm/vmapple.rst` describes the
+fixed the same assertion, and `75723e48` and `bc378624`, which correct
+comments and the machine's guide. `docs/system/arm/vmapple.rst` describes the
 machine and how to run it on Ambrosia.
 
 ## The reims-graphics device
