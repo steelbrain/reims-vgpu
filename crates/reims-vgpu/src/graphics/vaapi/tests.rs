@@ -1,5 +1,5 @@
 use reims_vgpu_video::vaapi::{ImportWrite, SurfaceCapabilities};
-use reims_vgpu_vulkan::gpu::resource::VulkanBuffer;
+use reims_vgpu_vulkan::gpu::resource::{VulkanBuffer, VulkanTexture};
 
 use super::*;
 
@@ -433,21 +433,23 @@ fn a_copy_after_the_devices_recovery_is_the_cpus_copy_byte_for_byte() {
 
 /// A picture the driver decodes straight into a buffer the platform made as a dma-buf device
 /// cache (`new_dma_buf_buffer_of_length_padding_unobserved`), its memory exported and imported as
-/// the decode's target as the arm imports a cache's ([`CacheTargets`]), reads back through the
-/// runtime device's GPU, once the platform acquired what the driver wrote
+/// the decode's target as the arm imports a cache's ([`CacheTargets`]), reads through textures
+/// over the cache's planes in a kernel, once the platform was told what the driver wrote
 /// (`Buffer::external_write_done`), as the CPU's copy of the same picture decoded into a surface
-/// of the decoder's own, row for row of the crop: the first [`PICTURES`] pictures of each H.264
-/// stream in `RVG_VA_STREAMS`'s first directory, their references in such caches too. The planes
-/// lie as CoreVideo lays a frame's in the guest's caches, 32 bytes into their pages, the first on
-/// 256 bytes of the cache's memory, so the chroma plane lies past a gap
-/// (`docs/video/bugs.md`, U28). A stream the decoder refuses is left at its refusal. Where the
-/// driver's check refuses H.264 into NV12 targets the arm decodes into no cache, and the test
-/// says so and ends.
+/// of the decoder's own, texel for texel of the crop: the first [`PICTURES`] pictures of each
+/// H.264 stream in `RVG_VA_STREAMS`'s first directory, their references in such caches too. Each
+/// texture is read once before the decode writes its cache, as a guest's texture over a pool's
+/// surface is used before a decode lands in it, so a shadow the runtime keeps of a texture over
+/// the cache's bytes was copied in from the cache's zeros, and only a copy in again after the
+/// driver's write reads the picture. The planes lie as CoreVideo lays a frame's in the guest's
+/// caches, 32 bytes into their pages, the first on 256 bytes of the cache's memory, so the chroma
+/// plane lies past a gap (`docs/video/bugs.md`, U28). A stream the decoder refuses is left at its
+/// refusal. Where the driver's check refuses H.264 into NV12 targets the arm decodes into no
+/// cache, and the test says so and ends.
 #[test]
 #[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
-fn a_picture_decoded_into_a_dma_buf_cache_reads_back_as_the_cpus_copy() {
+fn a_picture_decoded_into_a_dma_buf_cache_reads_through_its_textures_as_the_cpus_copy() {
     use reims_vgpu_video::codec::h264;
-    use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
     use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 
     /// The pictures of each stream decoded into caches.
@@ -473,8 +475,16 @@ fn a_picture_decoded_into_a_dma_buf_cache_reads_back_as_the_cpus_copy() {
             eprintln!("the driver's check refuses H.264 into NV12 targets: {why}");
             return;
         }
-        let queue = device.new_command_queue().expect("a queue");
+        // The checks the device starts make textures of their own: they end before the runtime's
+        // counts of shadows are read.
+        let wait = std::time::Duration::from_secs(60);
+        let _ = device.raw.settle_in_place_checks(wait);
+        let _ = device.raw.settle_queue_switch_check(wait);
+        let _ = device.raw.settle_submit_checks(wait);
+        let reader = Arc::new(PlaneReader::new(&device));
         let (mut pictures, mut refused) = (0usize, Vec::new());
+        // The planes' textures over the caches' memory, and those that are shadows.
+        let (mut in_place, mut shadows) = (0usize, 0usize);
         'streams: for stream in &streams {
             let file = std::fs::read(stream).expect("a stream");
             let mut ours = H264Decoder::new_annex_b(&display);
@@ -483,7 +493,7 @@ fn a_picture_decoded_into_a_dma_buf_cache_reads_back_as_the_cpus_copy() {
             for (id, unit) in h264::nal::access_units(&file).iter().enumerate() {
                 let id = u64::try_from(id).expect("an id");
                 let made = Arc::new(Mutex::new(None));
-                let target_for = cache_target(&device, &display, Arc::clone(&made));
+                let target_for = cache_target(&platform, &reader, &display, Arc::clone(&made));
                 let (decoded, reference) = match (
                     ours.decode_into(unit, id, Some(target_for)),
                     theirs.decode(unit, id),
@@ -506,7 +516,10 @@ fn a_picture_decoded_into_a_dma_buf_cache_reads_back_as_the_cpus_copy() {
                     };
                     frame.sync().expect("the decode");
                     cache.buffer.external_write_done().expect("the acquire");
-                    compare_cache(&device, &queue, &cache, reference, stream, id);
+                    compare_cache(&reader, &cache, reference, stream, id);
+                    let shadowed = cache.planes.iter().filter(|(_, _, shadowed)| *shadowed);
+                    let shadowed = shadowed.count();
+                    (shadows, in_place) = (shadows + shadowed, in_place + 2 - shadowed);
                     pictures += 1;
                     landed += 1;
                 }
@@ -516,28 +529,32 @@ fn a_picture_decoded_into_a_dma_buf_cache_reads_back_as_the_cpus_copy() {
             }
         }
         eprintln!(
-            "{pictures} pictures of {} streams decoded into dma-buf caches as by the CPU; \
-             refused: {refused:?}",
+            "{pictures} pictures of {} streams decoded into dma-buf caches read through textures \
+             as by the CPU, the planes' textures {in_place} over the caches' memory and {shadows} \
+             shadows, as over caches made as any other; refused: {refused:?}",
             streams.len()
         );
         assert!(pictures > 0);
     });
 }
 
-/// A cache [`cache_target`] made: its buffer, and where its planes lie in it.
+/// A cache [`cache_target`] made: its buffer, its planes' rows' pitch, and a texture over each
+/// plane, luma's then chroma's, of the coded picture's texels, with its width and height and
+/// whether the runtime made it a shadow of the cache's bytes.
 struct MadeCache {
     buffer: VulkanBuffer,
-    luma_at: u64,
-    chroma_at: u64,
     pitch: u64,
-    len: u64,
+    planes: [(VulkanTexture, (u64, u64), bool); 2],
 }
 
-/// What gives a decode its picture's target in a new dma-buf cache of `device` laid out for the
-/// picture's shape, as [`a_picture_decoded_into_a_dma_buf_cache_reads_back_as_the_cpus_copy`]
-/// lays it, the cache kept in `made`; no target where the platform makes or exports none.
+/// What gives a decode its picture's target in a new dma-buf cache of `reader`'s device laid out
+/// for the picture's shape, as
+/// [`a_picture_decoded_into_a_dma_buf_cache_reads_through_its_textures_as_the_cpus_copy`] lays
+/// it, with a texture over each plane, read once by `reader` before the decode, the cache kept in
+/// `made`; no target where the platform makes or exports none.
 fn cache_target(
-    device: &VulkanDevice,
+    platform: &Arc<VulkanPlatform>,
+    reader: &Arc<PlaneReader>,
     display: &Display,
     made: Arc<Mutex<Option<MadeCache>>>,
 ) -> TargetFor {
@@ -546,18 +563,29 @@ fn cache_target(
     use reims_vgpu_vulkan::core::platform::Handle as _;
     use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
     use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
     use reims_vgpu_vulkan::core::raise::OnFault;
 
     const PAGE: u64 = 4096;
-    let (device, display) = (device.clone_ref(), display.clone_ref());
+    /// `MTLPixelFormatR8Unorm`, `RG8Unorm`, `R16Unorm` and `RG16Unorm`.
+    const R8: u64 = 10;
+    const RG8: u64 = 30;
+    const R16: u64 = 20;
+    const RG16: u64 = 60;
+    let (platform, reader, display) = (
+        Arc::clone(platform),
+        Arc::clone(reader),
+        display.clone_ref(),
+    );
     Box::new(move |shape: TargetShape| {
         let (width, height) = shape.coded;
-        let row = u64::from(width) * shape.format.bytes_per_sample();
+        let sample = shape.format.bytes_per_sample();
+        let row = u64::from(width) * sample;
         let pitch = row.next_multiple_of(TARGET_ALIGNMENT);
         let luma_at = 0x20;
         let chroma_at = (luma_at + pitch * u64::from(height)).next_multiple_of(PAGE) + 0x20;
         let len = (chroma_at + pitch * u64::from(height.div_ceil(2))).next_multiple_of(PAGE);
-        let buffer = device
+        let buffer = (reader.device)
             .new_dma_buf_buffer_of_length_padding_unobserved(
                 OnFault::Return,
                 len,
@@ -566,8 +594,60 @@ fn cache_target(
             )
             .expect("no raise")
             .expect("a dma-buf cache");
+        let (formats, extents) = (
+            if sample == 2 { [R16, RG16] } else { [R8, RG8] },
+            [
+                (u64::from(width), u64::from(height)),
+                (u64::from(width.div_ceil(2)), u64::from(height.div_ceil(2))),
+            ],
+        );
+        // A twin of the cache made as any other laid-out cache, its memory exported nowhere: a
+        // plane's texture over it takes the route the runtime is to take for the cache's, a shadow
+        // of the bytes or an image over the memory, which the runtime announces in its count of
+        // shadows, as an export changes no texture's route.
+        let twin = (reader.device)
+            .new_buffer_of_length_padding_unobserved(
+                OnFault::Return,
+                len,
+                STORAGE_PRIVATE,
+                Some(luma_at),
+            )
+            .expect("no raise")
+            .expect("a cache made as any other");
+        let shadows = || reader.device.raw.work_counts().shadowed_textures;
+        let route = |shadowed: bool| ["over its memory", "a shadow"][usize::from(shadowed)];
+        let planes = [0, 1].map(|n| {
+            let descriptor = platform.texture_descriptor(&TextureDesc {
+                pixel_format: formats[n],
+                width: extents[n].0,
+                height: extents[n].1,
+                resource_options: Some(STORAGE_PRIVATE),
+                ..TextureDesc::default()
+            });
+            let at = [luma_at, chroma_at][n];
+            let over = |cache: &VulkanBuffer| {
+                let before = shadows();
+                let texture = (cache.new_texture(OnFault::Return, &descriptor, at, pitch))
+                    .expect("no raise")
+                    .expect("a texture over the cache's plane");
+                (texture, shadows() > before)
+            };
+            let (_, twin_shadowed) = over(&twin);
+            let (texture, shadowed) = over(&buffer);
+            assert_eq!(
+                shadowed,
+                twin_shadowed,
+                "plane {n} of a {width}x{height} picture: its texture is {} over the dma-buf \
+                 cache, {} over a cache made as any other",
+                route(shadowed),
+                route(twin_shadowed)
+            );
+            // Read before the decode writes the cache: what a shadow of it holds is copied in.
+            let _ = reader.read(&texture, extents[n]);
+            (texture, extents[n], shadowed)
+        });
         let exported = buffer.export_dma_buf().expect("the cache's dma-buf");
-        let planes = [luma_at, chroma_at].map(|at| TargetPlane {
+        let laid = [luma_at, chroma_at].map(|at| TargetPlane {
             offset: exported.offset + at,
             bytes_per_row: pitch,
         });
@@ -576,71 +656,127 @@ fn cache_target(
             exported.fd.as_fd(),
             exported.allocation_size,
             shape,
-            planes,
+            laid,
             Box::new(buffer.clone_ref()),
         )
         .expect("the import of the cache's memory");
         *made.lock() = Some(MadeCache {
             buffer,
-            luma_at,
-            chroma_at,
             pitch,
-            len,
+            planes,
         });
         Some(target)
     })
 }
 
-/// Panics where a byte of `reference`'s crop, copied by the CPU, differs from the cache's, read
-/// back by a blit on `queue` into a Shared buffer: the cache holds the coded picture, the crop at
-/// its origin.
+/// What reads a texture's texels in a kernel, as a guest's shader reads a texture over a cache's
+/// plane: the Vulkan crate's `read_texels_float` (its `ycbcr_probe.metal`), on a queue of the
+/// device's own.
+struct PlaneReader {
+    device: VulkanDevice,
+    state: <VulkanPlatform as Platform>::ComputePipeline,
+    queue: <VulkanPlatform as Platform>::CommandQueue,
+}
+
+/// The Vulkan crate's metallib of the readers of a texture (its `ycbcr_probe.metal`), which a
+/// host without Metal takes as a Mac does.
+const READERS: &[u8] =
+    include_bytes!("../../../../reims-vgpu-vulkan/metallibs/ycbcr_probe.metallib");
+
+impl PlaneReader {
+    /// The reader on `device`.
+    fn new(device: &VulkanDevice) -> Self {
+        use reims_vgpu_vulkan::core::platform::Handle as _;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Library as _;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+
+        let library = (device.new_library(READERS))
+            .expect("no raise")
+            .expect("the readers' library")
+            .expect("a library");
+        let function = (library.new_function(OnFault::Return, "read_texels_float"))
+            .expect("no raise")
+            .expect("the reader");
+        let state = (device.new_compute_pipeline_state_for_function(Some(&function)))
+            .expect("the reader's pipeline")
+            .expect("a pipeline");
+        Self {
+            device: device.clone_ref(),
+            state,
+            queue: device.new_command_queue().expect("a queue"),
+        }
+    }
+
+    /// What `texture` reads of its `width` by `height` texels, each its four components as
+    /// floats, in rows: one dispatch in a command buffer of its own, waited for.
+    fn read(&self, texture: &VulkanTexture, (width, height): (u64, u64)) -> Vec<[f32; 4]> {
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
+        use reims_vgpu_vulkan::core::raise::OnFault;
+
+        let length = width * height * 16;
+        let out = (self.device.new_buffer_of_length(OnFault::Return, length, 0))
+            .expect("no raise")
+            .expect("a buffer for the texels");
+        let cb = (self.queue.command_buffer(OnFault::Return))
+            .expect("no raise")
+            .expect("a command buffer");
+        let encoder = (cb.compute_encoder(OnFault::Return))
+            .expect("no raise")
+            .expect("a compute encoder");
+        let buffers = [Some(&out)];
+        for cmd in [
+            ComputeCmd::SetComputePipelineState {
+                state: Some(&self.state),
+            },
+            ComputeCmd::SetTexture {
+                texture: Some(texture),
+                index: 0,
+            },
+            ComputeCmd::SetBuffers {
+                buffers: &buffers,
+                offsets: &[0],
+                range: NsRange::new(0, 1),
+            },
+            ComputeCmd::DispatchThreads {
+                threads_per_grid: MtlSize::new(width, height, 1),
+                threads_per_threadgroup: MtlSize::new(8, 8, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            encoder.encode(OnFault::Return, cmd).expect("the read");
+        }
+        cb.commit(OnFault::Return).expect("the commit");
+        cb.wait_until_completed(OnFault::Return).expect("the wait");
+        assert_eq!(cb.status(), CommandBufferStatus::COMPLETED, "the read");
+        // SAFETY: the Shared buffer's `length` bytes, which the kernel finished writing before
+        // its command buffer completed, and which nothing writes meanwhile.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), usize_of(length)) };
+        let (texels, _) = bytes.as_chunks::<16>();
+        (texels.iter())
+            .map(|t| {
+                std::array::from_fn(|i| f32::from_le_bytes(t[i * 4..][..4].try_into().unwrap()))
+            })
+            .collect()
+    }
+}
+
+/// Panics where a byte of `reference`'s crop, copied by the CPU, differs from what the cache's
+/// textures read in `reader`'s kernel: the cache holds the coded picture, the crop at its origin,
+/// each texel's components its samples as unorms of their bits.
 fn compare_cache(
-    device: &VulkanDevice,
-    queue: &<VulkanPlatform as Platform>::CommandQueue,
+    reader: &PlaneReader,
     cache: &MadeCache,
     reference: &Frame,
     stream: &std::path::Path,
     id: u64,
 ) {
-    use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
-    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
-    use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
-    use reims_vgpu_vulkan::core::raise::OnFault;
-
-    let MadeCache {
-        buffer,
-        luma_at,
-        chroma_at,
-        pitch,
-        len,
-    } = cache;
-    let back = (device.new_buffer_of_length(OnFault::Return, *len, 0))
-        .expect("no raise")
-        .expect("a buffer to read the cache back into");
-    let cb = (queue.command_buffer(OnFault::Return))
-        .expect("no raise")
-        .expect("a command buffer");
-    let blit = (cb.blit_encoder(OnFault::Return))
-        .expect("no raise")
-        .expect("a blit encoder");
-    let copy = BlitCmd::CopyBufferToBuffer {
-        source_buffer: Some(buffer),
-        source_offset: 0,
-        destination_buffer: Some(&back),
-        destination_offset: 0,
-        size: *len,
-    };
-    blit.encode(OnFault::Return, copy).expect("the copy back");
-    blit.encode(OnFault::Return, BlitCmd::EndEncoding)
-        .expect("its end");
-    cb.commit(OnFault::Return).expect("the commit");
-    cb.wait_until_completed(OnFault::Return).expect("the wait");
-    assert_eq!(cb.status(), CommandBufferStatus::COMPLETED, "the copy back");
-    // SAFETY: the read-back buffer's `len` bytes, which the blit finished writing before its
-    // command buffer completed, and which nothing writes meanwhile.
-    let gpu = unsafe { std::slice::from_raw_parts(back.contents().as_ptr::<u8>(), usize_of(*len)) };
+    let MadeCache { pitch, planes, .. } = cache;
     let sample: u64 = if reference.bit_depth() > 8 { 2 } else { 1 };
     let (width, height) = (u64::from(reference.width()), u64::from(reference.height()));
     let (luma_bytes, chroma_bytes) = (width * sample, width.div_ceil(2) * 2 * sample);
@@ -656,33 +792,43 @@ fn compare_cache(
         .expect("the CPU's copy");
     let (x, top) = reference.crop_origin();
     let (x, top) = (u64::from(x), u64::from(top));
-    let planes = [
-        (
-            "luma",
-            *luma_at + top * pitch + x * sample,
-            0,
-            height,
-            luma_bytes,
-        ),
+    // Each plane: its name, its components a texel, its crop's first texel, the CPU's copy's
+    // first byte, rows and bytes a row.
+    let compared = [
+        ("luma", 1, (x, top), 0, height, luma_bytes),
         (
             "chroma",
-            *chroma_at + top / 2 * pitch + x / 2 * 2 * sample,
+            2,
+            (x / 2, top / 2),
             luma_len,
             chroma_rows,
             chroma_bytes,
         ),
     ];
-    for (plane, at, from, rows, row_bytes) in planes {
+    let most = if sample == 2 { 65535.0 } else { 255.0 };
+    for ((plane, components, (left, first_row), from, rows, row_bytes), (texture, extent, _)) in
+        compared.into_iter().zip(planes)
+    {
+        let texels = reader.read(texture, *extent);
         for r in 0..rows {
-            let ours = &gpu[usize_of(at + r * pitch)..][..usize_of(row_bytes)];
+            let row = &texels[usize_of((first_row + r) * extent.0 + left)..];
+            let ours: Vec<u8> = (row.iter())
+                .flat_map(|texel| &texel[..components])
+                .flat_map(|&v| {
+                    let bits = (v * most).round() as u16;
+                    let bytes = bits.to_le_bytes();
+                    bytes[..usize_of(sample)].to_vec()
+                })
+                .take(usize_of(row_bytes))
+                .collect();
             let theirs = &cpu[usize_of(from + r * pitch)..][..usize_of(row_bytes)];
-            if let Some(first) = (0..ours.len()).find(|&i| ours[i] != theirs[i]) {
+            if let Some(first) = (0..theirs.len()).find(|&i| ours.get(i) != Some(&theirs[i])) {
                 panic!(
                     "{} picture {id} decoded into a cache, {width}x{height} at {sample}-byte \
-                     samples, rows of {pitch}: {plane} row {r} byte {first} is {:#x} in the \
-                     cache and {:#x} by the CPU's copy",
+                     samples, rows of {pitch}: {plane} row {r} byte {first} reads {:#x?} \
+                     through its texture and is {:#x} by the CPU's copy",
                     stream.display(),
-                    ours[first],
+                    ours.get(first),
                     theirs[first]
                 );
             }
