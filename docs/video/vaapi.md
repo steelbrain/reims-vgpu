@@ -748,7 +748,12 @@ Before anything reaches the GPU:
   `--fake-interlaced` streams among them;
 - with `Error::Bitstream(h264::Error::Unsupported(..))`, chroma other than
   4:2:0, bit depths other than 8, and lossless macroblocks;
-- the same, for FMO, data partitioning, and SP and SI slices.
+- the same, for FMO, data partitioning, and SP and SI slices;
+- with `Error::Unsupported`, a picture of more than 65,535 macroblocks
+  (`H264_MAX_MACROBLOCKS`), past which iHD and radeonsi decode nothing of
+  it while answering success ([bugs.md](bugs.md), U28), and a size past
+  the driver's largest. The graphics device answers H.264's largest size
+  under the same bound, the driver's 4096x4096 as 4096x4080.
 
 The Extended profile's pictures that use none of its own tools decode as
 Main's (VA's Main profile, else High), as Apple's AVC decoder on an x86-64

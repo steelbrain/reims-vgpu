@@ -94,6 +94,27 @@ fn the_caps_are_the_driver_s_answers() {
     );
 }
 
+/// H.264's largest size keeps its pictures to `H264_MAX_MACROBLOCKS`, the height lowered: a driver
+/// answering 4096x4096, which decodes nothing at that size (bugs.md, U28), is answered 4096x4080;
+/// sizes within the bound are the driver's
+#[test]
+fn h264_s_largest_size_stays_under_the_macroblocks_the_drivers_decode() {
+    let largest = |max| {
+        caps_of(&driver(vec![config(
+            Profile::H264_HIGH,
+            RT_YUV420,
+            max,
+            None,
+        )]))[0]
+            .max_size
+    };
+    assert_eq!(largest((4096, 4096)), [4096, 4080]);
+    assert_eq!(largest((4096, 2304)), [4096, 2304]);
+    assert_eq!(largest((4080, 4096)), [4080, 4096]);
+    let [width, height] = largest((4096, 4096));
+    assert!((width / 16) * (height / 16) <= H264_MAX_MACROBLOCKS);
+}
+
 /// A profile whose config decodes no format of its own is left out, and a codec of none goes
 /// unanswered: Main 10 that decodes only 8-bit, Baseline on ConstrainedBaseline alone
 #[test]

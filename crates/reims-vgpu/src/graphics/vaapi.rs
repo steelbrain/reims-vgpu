@@ -61,7 +61,8 @@ use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
 use reims_vgpu_video::vaapi::{
     Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
-    H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, encoder_support,
+    H264_MAX_MACROBLOCKS, H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile,
+    encoder_support,
 };
 use reims_vgpu_vulkan::core::platform::Handle as _;
 use reims_vgpu_vulkan::core::platform::Platform;
@@ -303,7 +304,9 @@ fn decode_caps(codec: u32, configs: &[&ConfigCapabilities]) -> Option<RgfxVideoC
 
 /// H.264 decode: Baseline where a config of ConstrainedBaseline, Main or High decodes 4:2:0, as
 /// the decoder runs a Baseline stream on the first of those the driver has; Main on Main or High;
-/// High on High. NV12 out.
+/// High on High. NV12 out. The largest size is the driver's, its height lowered where its width
+/// would make a picture of more than `H264_MAX_MACROBLOCKS`, which the decoder refuses: 4096x4096
+/// is answered as 4096x4080, keeping 4096-wide pictures.
 fn h264_caps(caps: &Capabilities) -> Option<RgfxVideoCodecCaps> {
     let of = |profile| vld(caps, profile, RT_YUV420);
     let (baseline, main, high) = (
@@ -313,6 +316,8 @@ fn h264_caps(caps: &Capabilities) -> Option<RgfxVideoCodecCaps> {
     );
     let configs: Vec<&ConfigCapabilities> = [baseline, main, high].into_iter().flatten().collect();
     let mut entry = decode_caps(RGFX_VIDEO_CODEC_H264, &configs)?;
+    let columns = entry.max_size[0].div_ceil(16).max(1);
+    entry.max_size[1] = entry.max_size[1].min(H264_MAX_MACROBLOCKS / columns * 16);
     for (bit, on) in [
         (RGFX_VIDEO_H264_BASELINE, !configs.is_empty()),
         (RGFX_VIDEO_H264_MAIN, main.is_some() || high.is_some()),

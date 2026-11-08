@@ -18,6 +18,12 @@ use crate::codec::h264::{
 /// a frame the caller still holds does not stall the next decode.
 const SPARE_SURFACES: usize = 2;
 
+/// The most macroblocks of an H.264 picture the decoder takes: iHD and
+/// radeonsi answer 4096x4096 as their largest H.264 decode, yet decode
+/// nothing of a picture of 65,536 (256 by 256), every call answering
+/// success (docs/video/bugs.md, U28).
+pub const H264_MAX_MACROBLOCKS: u32 = 65_535;
+
 /// An H.264 decoder on a VA display.
 ///
 /// Samples are access units: length-prefixed NAL units with the `avcC`
@@ -189,6 +195,13 @@ fn profile_candidates(sps: &Sps) -> &'static [Profile] {
 /// The first candidate profile the driver decodes at `sps`'s size.
 fn select_profile(display: &Display, sps: &Sps) -> Result<Profile, Error> {
     let (width, height) = (sps.coded_width(), sps.coded_height());
+    let macroblocks = u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16));
+    if macroblocks > u64::from(H264_MAX_MACROBLOCKS) {
+        return Err(Error::Unsupported(format!(
+            "H.264 at {width}x{height}: {macroblocks} macroblocks, past the \
+             {H264_MAX_MACROBLOCKS} the drivers decode"
+        )));
+    }
     for &profile in profile_candidates(sps) {
         if !display.supports(profile, Entrypoint::VLD) {
             continue;
