@@ -965,6 +965,14 @@ RGFX_RESOURCE_SPI
 	return nullptr;
 }
 
+// No surface for the Neural Engine: null, as Metal's IOAccel buffer answers, which neither x86
+// Mac's buffer overrides (read from code; measured on the AMD 5300M and the Intel 630,
+// %spi-answers).
+- (IOSurfaceRef)_aneIOSurface
+{
+	return nullptr;
+}
+
 - (MTLBufferSparseTier)sparseBufferTier
 {
 	return MTLBufferSparseTierNone; // the device makes no placement-sparse buffer

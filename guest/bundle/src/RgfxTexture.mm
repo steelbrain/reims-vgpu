@@ -2219,6 +2219,52 @@ RGFX_RESOURCE_SPI
 	return _number;
 }
 
+// --- MTLTextureSPI ------------------------------------------------------------------------
+// The members of Metal's texture SPI that the AMD 5300M's and the Intel 630's textures both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// Metal's IOAccel texture answers gpuResourceID with gpuHandle (read from code,
+// MTLIOAccelTexture, macOS 27.0.1), and both x86 Macs' fresh texture answers one value as its
+// handle, its resource index and its identifier (measured: macOS 26.7.1, oracle_spi_members
+// answers): the handle and the index are gpuResourceID's value, the id the host numbered the
+// texture by.
+- (uint64_t)gpuHandle
+{
+	return [self gpuResourceID]._impl;
+}
+
+- (uint64_t)resourceIndex
+{
+	return [self gpuResourceID]._impl;
+}
+
+// Six faces for a cube texture and a cube array's, one for any other, as Metal's IOAccel texture
+// counts them (read from code, MTLIOAccelTexture's initializers, macOS 27.0.1; measured: 1 for a
+// 2D texture, macOS 26.7.1).
+- (NSUInteger)numFaces
+{
+	const MTLTextureType type = [self textureType];
+	return type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray ? 6 : 1;
+}
+
+// No colour space conversion and no compression: the base answers 0 for each (read from code,
+// _MTLResource and MTLIOAccelTexture, macOS 27.0.1), and so do both x86 Macs' textures (measured:
+// macOS 26.7.1, oracle_spi_members answers).
+- (uint64_t)colorSpaceConversionMatrix
+{
+	return 0;
+}
+
+- (NSInteger)compressionFeedback
+{
+	return 0;
+}
+
+- (NSUInteger)compressionFootprint
+{
+	return 0;
+}
+
 // The device's textures are no drawable's, and are shown unrotated: Metal answers NO and 0 for
 // every texture an app makes (private, shared, IOSurface and views).
 - (BOOL)isDrawable

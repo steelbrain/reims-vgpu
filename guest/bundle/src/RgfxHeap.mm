@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <dlfcn.h>
 #include <memory>
 #include <mutex>
 
@@ -466,6 +467,64 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 - (NSUInteger)allocatedSize
 {
 	return static_cast<NSUInteger>(_size);
+}
+
+// --- MTLHeapSPI ----------------------------------------------------------------------
+
+// The heap's memory pool: 0, as Metal's base heap answers, which neither x86 Mac's heap overrides
+// (read from code; measured on the AMD 5300M and the Intel 630, %spi-answers).
+- (uint64_t)memoryPoolId
+{
+	return 0;
+}
+
+// Metal's base heap raises an unrecognized selector here, sending itself
+// doesNotRecognizeSelector:, and neither x86 Mac's heap overrides it (read from code).
+- (BOOL)detachBacking
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return NO;
+}
+
+- (BOOL)replaceBackingWithRanges:(id)ranges readOnly:(BOOL)readOnly
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return NO;
+}
+
+// The description Metal's base heap gives, which neither x86 Mac's heap overrides (read from
+// code): the object's own description, then each field on a line of its own, indented by
+// `indent` + 4 spaces. The hazard tracking mode and the options are worded by Metal's own
+// MTLHazardTrackingModeString and MTLResourceOptionsString, where the guest's Metal has them, and
+// given as numbers where it does not.
+- (NSString *)formattedDescription:(NSUInteger)indent
+{
+	using Words = NSString *(*)(NSUInteger);
+	static const Words hazardWords =
+	    reinterpret_cast<Words>(dlsym(RTLD_DEFAULT, "MTLHazardTrackingModeString"));
+	static const Words optionWords =
+	    reinterpret_cast<Words>(dlsym(RTLD_DEFAULT, "MTLResourceOptionsString"));
+	NSString *pad = [@"\n" stringByPaddingToLength:indent + 4 withString:@" " startingAtIndex:0];
+	NSString *type = _type == MTLHeapTypeAutomatic   ? @"MTLHeapTypeAutomatic"
+	                 : _type == MTLHeapTypePlacement ? @"MTLHeapTypePlacement"
+	                                                 : @"Invalid";
+	const MTLCPUCacheMode cache = self.cpuCacheMode;
+	NSString *cacheWords = cache == MTLCPUCacheModeDefaultCache    ? @"MTLCPUCacheModeDefaultCache"
+	                       : cache == MTLCPUCacheModeWriteCombined ? @"MTLCPUCacheModeWriteCombined"
+	                                                               : @"Invalid";
+	// Metal's base heap words only a Private heap's mode.
+	NSString *storage = self.storageMode == MTLStorageModePrivate ? @"MTLStorageModePrivate" : @"Invalid";
+	const MTLHazardTrackingMode hazard = self.hazardTrackingMode;
+	const MTLResourceOptions options = self.resourceOptions;
+	NSString *hazardText = hazardWords != nullptr ? hazardWords(hazard) : @(hazard).stringValue;
+	NSString *optionText = optionWords != nullptr ? optionWords(options) : @(options).stringValue;
+	NSArray *fields = @[
+		pad, @"label =", self.label ?: @"<none>", pad, @"type =", type, pad, @"size =", @(self.size), pad,
+		@"usedSize =", @(self.usedSize), pad, @"cpuCacheMode =", cacheWords, pad, @"storageMode =",
+		storage, pad, @"hazardTrackingMode =", hazardText ?: @"", pad, @"resourceOptions =",
+		optionText ?: @""
+	];
+	return [NSString stringWithFormat:@"%@%@", [super description], [fields componentsJoinedByString:@" "]];
 }
 
 // --- unsupported: the device makes no acceleration structure ------------------------

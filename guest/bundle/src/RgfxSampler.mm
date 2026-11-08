@@ -102,4 +102,18 @@ RgfxSamplerParams RgfxSamplerParamsOf(MTLSamplerDescriptor *d)
 	return _resourceId;
 }
 
+// Metal's base sampler answers gpuResourceID with gpuHandle and gpuHandle with uniqueIdentifier
+// (read from code, _MTLSamplerState, macOS 27.0.1), and both x86 Macs' fresh sampler answers its
+// identifier as its resource index too (measured: macOS 26.7.1, oracle_spi_members answers): each
+// is the id the host numbered the sampler by.
+- (uint64_t)gpuHandle
+{
+	return [self uniqueIdentifier];
+}
+
+- (uint64_t)resourceIndex
+{
+	return [self uniqueIdentifier];
+}
+
 @end

@@ -128,6 +128,43 @@ void test_heap_answers()
 		CHECK([priv setPurgeableState:MTLPurgeableStateKeepCurrent] ==
 		      MTLPurgeableStateNonVolatile);
 
+		// Metal's heap SPI: memory pool 0; a backing is neither detached nor replaced (each raises an
+		// unrecognized selector); the description is Metal's base heap's, field by field.
+		auto raises = [](void (^body)(void)) {
+			@try {
+				body();
+			} @catch (NSException *e) {
+				return [e.reason containsString:@"unrecognized selector"];
+			}
+			return false;
+		};
+		CHECK(((uint64_t (*)(id, SEL))objc_msgSend)(priv, NSSelectorFromString(@"memoryPoolId")) == 0);
+		CHECK(raises(^{
+			((BOOL (*)(id, SEL))objc_msgSend)(priv, NSSelectorFromString(@"detachBacking"));
+		}));
+		CHECK(raises(^{
+			((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(
+			    priv, NSSelectorFromString(@"replaceBackingWithRanges:readOnly:"), @[], NO);
+		}));
+		priv.label = @"heap";
+		auto described = [](id heap, NSUInteger indent) {
+			return ((NSString * (*)(id, SEL, NSUInteger)) objc_msgSend)(
+			    heap, NSSelectorFromString(@"formattedDescription:"), indent);
+		};
+		NSString *text = described(priv, 0);
+		NSString *pad = @"\n   "; // a line break, padded to indent + 4
+		NSString *fields = [NSString
+		    stringWithFormat:@"%@ label = heap %@ type = MTLHeapTypePlacement %@ size = %lu %@ usedSize = 0 "
+		                     @"%@ cpuCacheMode = MTLCPUCacheModeDefaultCache %@ storageMode = "
+		                     @"MTLStorageModePrivate %@ hazardTrackingMode = ",
+		                     pad, pad, pad, (unsigned long)priv.size, pad, pad, pad, pad];
+		NSString *head = [NSString stringWithFormat:@"<RgfxHeap: %p>%@", priv, fields];
+		CHECK([text hasPrefix:head]);
+		CHECK([text containsString:[pad stringByAppendingString:@" resourceOptions = "]]);
+		CHECK([described(shared, 2) containsString:@"\n      label = <none> \n      type = MTLHeapTypeAutomatic"]);
+		// A heap Metal's base words no storage mode of: Shared.
+		CHECK([described(shared, 0) containsString:@"storageMode = Invalid"]);
+
 		// No acceleration structure: nil, logged, nothing posted.
 		drainRing(fx.ring);
 		CHECK([internals(priv) newAccelerationStructureWithSize:0x1000 resourceIndex:0] == nil);
@@ -234,6 +271,8 @@ void test_buffer_answers()
 		const uint64_t id0 = [internals(plain) allocationID], id1 = [internals(priv) allocationID];
 		CHECK(id0 != 0 && id1 != 0 && id0 != id1);
 		CHECK([internals(plain) resourceSize] == 0x1000 && [internals(plain) iosurface] == nullptr);
+		CHECK(((void *(*)(id, SEL))objc_msgSend)(plain, NSSelectorFromString(@"_aneIOSurface")) ==
+		      nullptr);
 		CHECK(plain.contents != nullptr && [internals(plain) virtualAddress] == plain.contents);
 		CHECK([internals(priv) virtualAddress] == nullptr);
 
@@ -673,11 +712,30 @@ void test_texture_answers()
 		CHECK([internals(managed) uniqueIdentifier] == first + 3);
 		const uint64_t a0 = [internals(priv) allocationID], a1 = [internals(shared) allocationID];
 		CHECK(a0 != 0 && a1 != 0 && a0 != a1);
+		// Metal's texture SPI: the handle and the index are gpuResourceID's value; one face but for
+		// a cube texture's six; no colour space conversion and no compression.
+		auto u64 = [](id object, NSString *name) {
+			return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		for (id t in @[ priv, shared, managed ]) {
+			CHECK(u64(t, @"gpuHandle") == [(id<MTLTexture>)t gpuResourceID]._impl &&
+			      u64(t, @"resourceIndex") == [(id<MTLTexture>)t gpuResourceID]._impl);
+			CHECK(u64(t, @"numFaces") == 1 && u64(t, @"colorSpaceConversionMatrix") == 0 &&
+			      u64(t, @"compressionFeedback") == 0 && u64(t, @"compressionFootprint") == 0);
+		}
 
 		// A view, at any level and slice, answers its texture's, under a number of its own, and
 		// keeps a purgeable state of its own.
 		id<MTLTexture> view = [priv newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
 		CHECK(view != nil && [internals(view) uniqueIdentifier] == first + 4);
+		CHECK(u64(view, @"gpuHandle") == view.gpuResourceID._impl && u64(view, @"numFaces") == 1);
+		MTLTextureDescriptor *cd =
+		    [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                          size:16
+		                                                     mipmapped:NO];
+		cd.storageMode = MTLStorageModePrivate;
+		RgfxTexture *cube = device(cd);
+		CHECK(cube != nil && u64(cube, @"numFaces") == 6);
 		CHECK([internals(view) gpuAddress] == [internals(priv) gpuAddress]);
 		CHECK([internals(view) allocationID] == a0);
 		CHECK([internals(view) resourceSize] == [internals(priv) resourceSize]);
@@ -981,6 +1039,12 @@ void test_sampler_answers()
 		CHECK([ai uniqueIdentifier] == 2 && [bi uniqueIdentifier] == 2 && [ci uniqueIdentifier] == 3);
 		CHECK([ai uniqueIdentifier] == a.gpuResourceID._impl &&
 		      [ci uniqueIdentifier] == c.gpuResourceID._impl);
+		// Metal's sampler SPI: the handle and the index are its identifier.
+		for (RgfxSampler *x in @[ a, c ])
+			CHECK(((uint64_t (*)(id, SEL))objc_msgSend)(x, NSSelectorFromString(@"gpuHandle")) ==
+			          x.gpuResourceID._impl &&
+			      ((uint64_t (*)(id, SEL))objc_msgSend)(x, NSSelectorFromString(@"resourceIndex")) ==
+			          x.gpuResourceID._impl);
 		CHECK([ai gpuAddress] == 0 && [ci gpuAddress] == 0);
 		CHECK([ai pixelFormat] == MTLPixelFormatInvalid && [ci pixelFormat] == MTLPixelFormatInvalid);
 		CHECK(ringEmpty(fx.ring)); // asked, and the members post nothing
@@ -1374,6 +1438,14 @@ void test_shared_event_answers()
 		CHECK(ringEmpty(fx.ring));
 		RgfxEvent *plain = [RgfxEvent eventWithDevice:nil serializer:&fx.ser];
 		CHECK(plain != nil && ![plain respondsToSelector:@selector(IOSurfaceSharedEvent)]);
+		// Metal's event SPI: a wait is a barrier until set otherwise; no event rolls back.
+		auto flag = [](id object, NSString *name) {
+			return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		CHECK(flag(plain, @"enableBarrier") && !flag(plain, @"supportsRollback"));
+		((void (*)(id, SEL, BOOL))objc_msgSend)(plain, NSSelectorFromString(@"setEnableBarrier:"), NO);
+		CHECK(!flag(plain, @"enableBarrier"));
+		CHECK(!flag(ev, @"supportsRollback"));
 	}
 	drainRing(fx.ring);
 }

@@ -6,6 +6,8 @@
 #import "RgfxRenderPipelineState.h"
 #import "RgfxUnsupported.h"
 
+#import <objc/message.h>
+
 #include <cstring>
 #include <vector>
 
@@ -241,6 +243,15 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 
 } // namespace
 
+// The device's makers of function tables of no stage (MTLDeviceSPI), which Metal's base render
+// pipeline asks for each stage's (RgfxMetalDevice.mm, RgfxMetalDevice+Unsupported.mm).
+@protocol RgfxDeviceFunctionTables
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor;
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor;
+@end
+
 @implementation RgfxRenderPipelineState {
 	uint64_t _seqno;
 	// What the descriptor asked that the pipeline answers.
@@ -269,6 +280,7 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 	RgfxPipelineKey _key;
 	BOOL _deferred;
 	RgfxPipelineAnswer _answer;
+	NSInteger _textureWriteRoundingMode; // the descriptor's (MTLRenderPipelineDescriptorSPI)
 }
 
 // The host drops the pipeline as the app lets it go, after any command buffer that names it (each
@@ -434,6 +446,7 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 	                                                                     serializer:serializer];
 	if (state != nil) {
 		state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
+		[state rgfxTakeRoundingOf:descriptor];
 		state->_vertexAir = stageArguments(descriptor.vertexFunction);
 		state->_fragmentAir = stageArguments(descriptor.fragmentFunction);
 		if (post.deferred) {
@@ -615,6 +628,7 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		if ([descriptor respondsToSelector:@selector(supportIndirectCommandBuffers)])
 			state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
 		state->_mesh = YES;
+		[state rgfxTakeRoundingOf:descriptor];
 		state->_objectAir = stageArguments(descriptor.objectFunction);
 		state->_meshAir = stageArguments(descriptor.meshFunction);
 		state->_fragmentAir = stageArguments(descriptor.fragmentFunction);
@@ -625,6 +639,19 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 		}
 	}
 	return state;
+}
+
+// How the pipeline's texture writes round floats, which Metal's render and mesh descriptors keep
+// (0, their default, where the guest's Metal has no such member) and its pipeline answers. The
+// host rounds as its default.
+- (void)rgfxTakeRoundingOf:(id)descriptor
+{
+	SEL rounding = sel_registerName("textureWriteRoundingMode");
+	if ([descriptor respondsToSelector:rounding])
+		_textureWriteRoundingMode = ((NSInteger (*)(id, SEL))objc_msgSend)(descriptor, rounding);
+	if (_textureWriteRoundingMode != 0)
+		RgfxLogUnsupported([self class], rounding,
+		                   "a texture write rounding mode other than the default (none on the wire)");
 }
 
 - (void)rgfxTakeKnown:(const RgfxPipelineReflection &)known
@@ -883,6 +910,439 @@ RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
 - (MTLSize)requiredThreadsPerMeshThreadgroup
 {
 	return _mesh ? _requiredMesh : MTLSizeMake(0, 0, 0);
+}
+
+// --- MTLRenderPipelineStateSPI -------------------------------------------------------------
+// The members of Metal's render-pipeline SPI that the AMD 5300M's and the Intel 630's pipelines
+// both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m),
+// each as Metal's base pipeline, _MTLRenderPipelineState, answers it (read from code, macOS
+// 27.0.1), and as a fresh pipeline of both x86 Macs answers those that take no argument (measured:
+// macOS 26.7.1, tools/oracle/oracle_spi_members.m answers).
+
+// The debug info of the pipeline's vertex and fragment shaders: the device keeps none, so they
+// answer nil.
+- (nullable id)newVertexShaderDebugInfo
+{
+	RGFX_UNSUPPORTED("a shader's debug info");
+	return nil;
+}
+
+- (nullable id)newFragmentShaderDebugInfo
+{
+	RGFX_UNSUPPORTED("a shader's debug info");
+	return nil;
+}
+
+// Metal's base pipeline answers gpuResourceID with gpuHandle, and gpuHandle with resourceIndex: so
+// these answer gpuResourceID's value, the one the host numbered the pipeline by.
+- (uint64_t)resourceIndex
+{
+	return [self gpuResourceID]._impl;
+}
+
+- (uint64_t)gpuHandle
+{
+	return [self resourceIndex];
+}
+
+// The low 32 bits of uniqueIdentifier, as the base and the AMD 5300M's pipeline answer (the
+// Intel 630's answers 0).
+- (uint32_t)getVertexShaderTelemetryID
+{
+	return static_cast<uint32_t>([self uniqueIdentifier]);
+}
+
+- (uint32_t)getFragmentShaderTelemetryID
+{
+	return static_cast<uint32_t>([self uniqueIdentifier]);
+}
+
+// No debug instrumentation or global constants for any stage, no binaries and no explicit
+// visibility group: the device instruments no shader.
+
+- (id)vertexDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)vertexGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)vertexGlobalConstantsSize
+{
+	return 0;
+}
+
+- (id)fragmentDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)fragmentGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)fragmentGlobalConstantsSize
+{
+	return 0;
+}
+
+- (id)tileDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)tileGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)tileGlobalConstantsSize
+{
+	return 0;
+}
+
+- (id)meshDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)meshGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)meshGlobalConstantsSize
+{
+	return 0;
+}
+
+- (id)objectDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)objectGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)objectGlobalConstantsSize
+{
+	return 0;
+}
+
+- (NSDictionary *)pipelineBinaries
+{
+	return @{};
+}
+
+- (uint32_t)explicitVisibilityGroupID
+{
+	return 0;
+}
+
+// MTLShaderValidationDisabled, as shaderValidation answers.
+- (NSInteger)shaderValidationState
+{
+	return MTLShaderValidationDisabled;
+}
+
+// The descriptor's rounding of floats on texture writes, as the base keeps it.
+- (NSInteger)textureWriteRoundingMode
+{
+	return _textureWriteRoundingMode;
+}
+
+// The base raises an unrecognized selector for these (it sends itself doesNotRecognizeSelector:),
+// and so does this.
+- (id)functionReflectionWithFunctionDescriptor:(id)descriptor stage:(NSUInteger)stage
+{
+	(void)descriptor;
+	(void)stage;
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (id)reflectionForFunctionDescriptor:(id)descriptor
+{
+	(void)descriptor;
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+// A stage's function handle: function pointers, as functionHandleWithFunction:stage:.
+
+- (id)vertexFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id)fragmentFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id)tileFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id)meshFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id)objectFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+// A stage's function tables, which the base asks its device for, as these do
+// (RgfxDeviceFunctionTables).
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromVertexStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newVertexIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromFragmentStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newFragmentIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromTileStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newTileIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromMeshStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newMeshIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromObjectStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newObjectIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+// A tile pipeline with more binary functions: binary functions, as
+// newRenderPipelineStateWithAdditionalBinaryFunctions:error:.
+- (id)newTileRenderPipelineStateWithAdditionalBinaryFunctions:(id)functions
+                                                        error:(__autoreleasing NSError **)error
+{
+	(void)functions;
+	RGFX_UNSUPPORTED_ERROR(error, "binary functions");
+	return nil;
+}
+
+// Metal's emulation of mesh shaders on a GPU without them, which its own device sets up for the
+// pipelines it makes so: the device carries mesh draws to the host, which draws them, so no
+// pipeline of it emulates, and each answers as one that does not, 0, nil and NO (the base
+// answers from emulation properties that only its setters make). The flag
+// setUsesMeshShaderEmulation: sets is one the base's usesMeshShaderEmulation does not read.
+- (BOOL)usesMeshShaderEmulation
+{
+	return NO;
+}
+
+- (void)setUsesMeshShaderEmulation:(BOOL)uses
+{
+	(void)uses;
+}
+
+- (id)emulationMeshShaderPSO
+{
+	return nil;
+}
+
+- (id)emulationObjectShaderPSO
+{
+	return nil;
+}
+
+- (id)emulationMeshPrefixSum1PSO
+{
+	return nil;
+}
+
+- (id)emulationMeshPrefixSum2PSO
+{
+	return nil;
+}
+
+- (id)emulationMeshPrefixSum3PSO
+{
+	return nil;
+}
+
+- (id)emulationNoObjectPrefixSumPSO
+{
+	return nil;
+}
+
+- (id)emulationObjectPrefixSumPSO
+{
+	return nil;
+}
+
+- (NSUInteger)emulationMeshSize
+{
+	return 0;
+}
+
+- (NSUInteger)emulationMeshMaxVertexCount
+{
+	return 0;
+}
+
+- (NSUInteger)emulationMeshMaxPrimitiveCount
+{
+	return 0;
+}
+
+- (NSUInteger)emulationObjectShaderIntermediateBufferSlot
+{
+	return 0;
+}
+
+- (NSUInteger)emulationMeshShaderIntermediateBufferSlot
+{
+	return 0;
+}
+
+- (NSUInteger)emulationVertexShaderIntermediateBufferSlot
+{
+	return 0;
+}
+
+- (NSUInteger)emulationPrimitiveTopology
+{
+	return 0;
+}
+
+- (NSUInteger)emulationPayloadMemoryLength
+{
+	return 0;
+}
+
+// Setting up an emulation, which the device's pipelines never are.
+
+- (void)setEmulationMeshShaderPSO:(id)pipeline
+{
+	(void)pipeline;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationObjectShaderPSO:(id)pipeline
+{
+	(void)pipeline;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationMeshSize:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationMeshMaxVertexCount:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationMeshMaxPrimitiveCount:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationObjectShaderIntermediateBufferSlot:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationMeshShaderIntermediateBufferSlot:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationVertexShaderIntermediateBufferSlot:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationPrimitiveTopology:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationPayloadMemoryLength:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
 }
 
 // --- not on the wire ------------------------------------------------------------------

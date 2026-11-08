@@ -535,4 +535,15 @@ NSArray<MTLArgumentDescriptor *> *RgfxDescriptorsOfArguments(MTLStructType *type
 	                                        serializer:[self serializer]];
 }
 
+// --- MTLArgumentEncoderSPI ------------------------------------------------------------
+
+// Metal's layout object of the encoder's arguments, which both x86 Macs' encoders answer (their
+// driver's layout class, %spi-answers): nil, logged, since the encoder's layout is the host's and
+// the device makes no layout object (newIndirectArgumentBufferLayoutWithStructType:).
+- (id)layout
+{
+	RGFX_UNSUPPORTED("argument buffers of a layout object");
+	return nil;
+}
+
 @end

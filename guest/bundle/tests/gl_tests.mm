@@ -37,6 +37,7 @@
 #include <vector>
 
 #import "RgfxGLFunction.h"
+#import "RgfxUnsupported.h"
 #import "RgfxLibrary.h"
 #import "RgfxPipelineReflection.h"
 
@@ -682,6 +683,39 @@ void test_gl_function_answers()
 	                                     inputsDescription:nil
 	                                                device:metal];
 	CHECK(v.functionType == MTLFunctionTypeVertex && v.rgfxInputsDescription == nil);
+
+	// Metal's function SPI, as Metal's function of GL IR answers it: no arguments, bindings,
+	// return type, debug data, file, line, imports or render target array index type; its
+	// relocations as set; the IR after its length word as its bitcode; a hash of the IR, the same
+	// for the same IR and another for other IR; no reflection, logged.
+	auto obj = [](id object, NSString *name) {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+	};
+	auto u64 = [](id object, NSString *name) {
+		return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+	};
+	for (NSString *member in @[ @"arguments", @"bindings", @"returnType", @"debugInstrumentationData",
+	                            @"filePath", @"unpackedFilePath", @"importedLibraries", @"importedSymbols",
+	                            @"relocations" ])
+		CHECK(obj(f, member) == nil);
+	CHECK(u64(f, @"lineNumber") == 0 && u64(f, @"renderTargetArrayIndexType") == 0);
+	NSArray *relocations = @[ @1 ];
+	((void (*)(id, SEL, id))objc_msgSend)(f, NSSelectorFromString(@"setRelocations:"), relocations);
+	CHECK(obj(f, @"relocations") == relocations);
+	NSData *bitcode = (NSData *)obj(f, @"bitcodeData");
+	const uint8_t payload[6] = {3, 0, 0, 0, 0x81, 0};
+	CHECK(bitcode.length == 6 && memcmp(bitcode.bytes, payload, 6) == 0);
+	auto hash = [](id object) {
+		return ((const uint8_t *(*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(@"bitCodeHash"));
+	};
+	CHECK(hash(f) != nullptr && hash(v) != nullptr && memcmp(hash(f), hash(v), 32) != 0); // ir[8] changed
+	RgfxGLFunction *same = [[RgfxGLFunction alloc] initWithIR:ir
+	                                             functionType:MTLFunctionTypeVertex
+	                                        inputsDescription:nil
+	                                                   device:metal];
+	CHECK(memcmp(hash(same), hash(v), 32) == 0);
+	CHECK(((id (*)(id, SEL, NSUInteger))objc_msgSend)(f, NSSelectorFromString(@"reflectionWithOptions:"), 0) == nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxGLFunction class], NSSelectorFromString(@"reflectionWithOptions:")));
 
 	// The return data a variant keeps.
 	CHECK(RgfxGLPluginReturnData(f) == nil && RgfxGLPluginReturnData(nil) == nil);

@@ -19,6 +19,7 @@
 #import "RgfxMetalPrivate.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <map>
@@ -341,9 +342,32 @@ std::shared_ptr<const FunctionTable> functionTableOf(const uint8_t *bytes, size_
 	return table;
 }
 
+// What Metal's library keeps past its protocol for its tools and its compiler (MTLLibrarySPI): an
+// override of the target triple, a copy of the one set (nil until set), and whether shader
+// validation is on (NO until set), each answered as set (measured: M3 Max, macOS 27, a library
+// made from bytes, from a URL and of a function array).
+struct LibraryToolState {
+	std::mutex lock; // guards overrideTriple
+	NSString *overrideTriple = nil;
+	std::atomic<bool> shaderValidation{false};
+
+	NSString *triple()
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		return overrideTriple;
+	}
+	void setTriple(NSString *triple)
+	{
+		NSString *copy = [triple copy];
+		std::lock_guard<std::mutex> hold(lock);
+		overrideTriple = copy;
+	}
+};
+
 } // namespace
 
 @implementation RgfxLibrary {
+	LibraryToolState _tools; // MTLLibrarySPI's triple and validation switch
 	// The .metallib's function list, shared by every library of its content key (functionTableOf).
 	std::shared_ptr<const FunctionTable> _table;
 	std::mutex _shadowLock;                   // guards the three below
@@ -1123,6 +1147,46 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	return nil;
 }
 
+// --- MTLLibrarySPI: what Metal's library keeps for its tools ---------------------------------
+// As Metal's own library answers each (measured: M3 Max, macOS 27, libraries made from bytes,
+// from a URL and of a function array; the AMD 5300M and the Intel 630, macOS 26.7.1, one made from
+// source): the triple and the validation switch as set, nil and NO until set. The host compiles a
+// library's functions for its own GPU, whatever the triple, and the device validates no shader.
+
+// Metal answers nil for a library made from bytes or from a URL (measured: macOS 27), as every
+// library of the device is, and a UUID for one it compiled from source (measured: macOS 26.7.1):
+// the shadow of one Metal compiled, linked or stitched, Metal's own library, answers it, as for
+// bitcodeData.
+- (id)libraryIdentifier
+{
+	id<MTLLibrary> shadow = nil;
+	{
+		std::lock_guard<std::mutex> hold(_shadowLock);
+		shadow = _shadow;
+	}
+	return [shadow respondsToSelector:_cmd] ? ((id (*)(id, SEL))objc_msgSend)(shadow, _cmd) : nil;
+}
+
+- (NSString *)overrideTriple
+{
+	return _tools.triple();
+}
+
+- (void)setOverrideTriple:(NSString *)overrideTriple
+{
+	_tools.setTriple(overrideTriple);
+}
+
+- (BOOL)shaderValidationEnabled
+{
+	return _tools.shaderValidation.load();
+}
+
+- (void)setShaderValidationEnabled:(BOOL)enabled
+{
+	_tools.shaderValidation.store(enabled);
+}
+
 @end
 
 NSArray<id<MTLFunction>> *RgfxShadowFunctions(NSArray<id<MTLFunction>> *functions, NSError **error)
@@ -1240,6 +1304,7 @@ id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, i
 
 @implementation RgfxFunctionArrayLibrary {
 	NSArray<id<MTLFunction>> *_functions; // in the order given
+	LibraryToolState _tools;              // MTLLibrarySPI's triple and validation switch
 }
 
 + (instancetype)libraryOfFunctions:(NSArray<id<MTLFunction>> *)functions
@@ -1378,7 +1443,22 @@ id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, i
 	return nil;
 }
 
+// nil, as Metal's library of a function array answers (measured: M3 Max, macOS 27).
 - (NSArray<NSString *> *)externFunctionNames
+{
+	return nil;
+}
+
+// The function given of that name, as Metal's library of a function array answers, and nil for a
+// name none has (measured: M3 Max, macOS 27).
+- (id<MTLFunction>)newExternFunctionWithName:(NSString *)name
+{
+	return [self rgfxGiven:name];
+}
+
+// No bitcode of its own, as Metal's library of a function array answers (measured: M3 Max, macOS
+// 27): its functions keep theirs.
+- (id)bitcodeData
 {
 	return nil;
 }
@@ -1392,6 +1472,37 @@ id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, i
 		               code:MTLLibraryErrorUnsupported
 		           userInfo:@{NSLocalizedDescriptionKey : @"MTLLibrary is not formatted as a MetalLib file."}];
 	return NO;
+}
+
+// --- MTLLibrarySPI: what Metal's library keeps for its tools ---------------------------------
+// As Metal's own library of a function array answers each (measured: M3 Max, macOS 27): no
+// identifier, and the triple and the validation switch as set, nil and NO until set. The host
+// compiles a library's functions for its own GPU, whatever the triple, and the device validates
+// no shader.
+
+- (id)libraryIdentifier
+{
+	return nil;
+}
+
+- (NSString *)overrideTriple
+{
+	return _tools.triple();
+}
+
+- (void)setOverrideTriple:(NSString *)overrideTriple
+{
+	_tools.setTriple(overrideTriple);
+}
+
+- (BOOL)shaderValidationEnabled
+{
+	return _tools.shaderValidation.load();
+}
+
+- (void)setShaderValidationEnabled:(BOOL)enabled
+{
+	_tools.shaderValidation.store(enabled);
 }
 
 @end

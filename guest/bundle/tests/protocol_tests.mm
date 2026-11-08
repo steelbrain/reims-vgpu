@@ -1466,6 +1466,32 @@ void test_pipeline_state_members()
 	CHECK(u64(cs, @"uniqueIdentifier") == reinterpret_cast<uintptr_t>((__bridge void *)cs));
 	CHECK(u64(cs, @"uniqueIdentifier") == u64(cs, @"uniqueIdentifier"));
 	CHECK(u64(cs, @"uniqueIdentifier") != u64(plain, @"uniqueIdentifier"));
+	// Metal's compute-pipeline SPI, as its base pipeline answers it: the resource index and the
+	// handle are gpuResourceID's value, the telemetry ID uniqueIdentifier's low 32 bits; no debug
+	// instrumentation, global constants or binaries; validation disabled; the descriptor's texture
+	// write rounding; and an unrecognized selector for a function's reflection.
+	auto obj = [](id object, NSString *name) {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+	};
+	CHECK(u64(cs, @"resourceIndex") == cs.gpuResourceID._impl &&
+	      u64(cs, @"gpuHandle") == u64(cs, @"resourceIndex"));
+	CHECK(((uint32_t (*)(id, SEL))objc_msgSend)(cs, NSSelectorFromString(@"getComputeKernelTelemetryID")) ==
+	      static_cast<uint32_t>(u64(cs, @"uniqueIdentifier")));
+	CHECK(obj(cs, @"debugInstrumentationData") == nil && u64(cs, @"globalConstantsBase") == 0 &&
+	      u64(cs, @"globalConstantsSize") == 0);
+	NSDictionary *binaries = obj(cs, @"pipelineBinaries");
+	CHECK(binaries != nil && binaries.count == 0);
+	CHECK(u64(cs, @"shaderValidationState") == static_cast<uint64_t>(MTLShaderValidationDisabled));
+	CHECK(u64(cs, @"textureWriteRoundingMode") == 0 && u64(plain, @"textureWriteRoundingMode") == 0);
+	bool computeRaised = false;
+	@try {
+		(void)((id (*)(id, SEL, id))objc_msgSend)(
+		    cs, NSSelectorFromString(@"functionReflectionWithFunctionDescriptor:"),
+		    [MTLFunctionDescriptor functionDescriptor]);
+	} @catch (NSException *e) {
+		computeRaised = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(computeRaised);
 
 	// --- render ---
 	MTLRenderPipelineDescriptor *rd = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1490,6 +1516,60 @@ void test_pipeline_state_members()
 	CHECK(rs.requiredThreadsPerMeshThreadgroup.width == 0);
 	CHECK(u64(rs, @"gpuAddress") == 0);
 	CHECK(u64(rs, @"uniqueIdentifier") == reinterpret_cast<uintptr_t>((__bridge void *)rs));
+	// Metal's render-pipeline SPI, as its base pipeline answers it: the resource index and the
+	// handle are gpuResourceID's value, the telemetry IDs uniqueIdentifier's low 32 bits; for each
+	// stage no debug instrumentation, global constants or function handle, and its function tables
+	// the device's (none); no binaries or visibility group; validation disabled; the descriptor's
+	// texture write rounding; no mesh shader emulation, whatever is set; and an unrecognized
+	// selector for a function's reflection.
+	CHECK(u64(rs, @"resourceIndex") == rs.gpuResourceID._impl &&
+	      u64(rs, @"gpuHandle") == u64(rs, @"resourceIndex"));
+	for (NSString *member in @[ @"getVertexShaderTelemetryID", @"getFragmentShaderTelemetryID" ])
+		CHECK(((uint32_t (*)(id, SEL))objc_msgSend)(rs, NSSelectorFromString(member)) ==
+		      static_cast<uint32_t>(u64(rs, @"uniqueIdentifier")));
+	for (NSString *stage in @[ @"vertex", @"fragment", @"tile", @"mesh", @"object" ]) {
+		NSString *Stage = [stage capitalizedString];
+		CHECK(obj(rs, [stage stringByAppendingString:@"DebugInstrumentationData"]) == nil);
+		CHECK(u64(rs, [stage stringByAppendingString:@"GlobalConstantsBase"]) == 0 &&
+		      u64(rs, [stage stringByAppendingString:@"GlobalConstantsSize"]) == 0);
+		CHECK(((id (*)(id, SEL, id))objc_msgSend)(
+		          rs, NSSelectorFromString([stage stringByAppendingString:@"FunctionHandleWithFunction:"]),
+		          vfn) == nil);
+		NSString *visible =
+		    [NSString stringWithFormat:@"newVisibleFunctionTableFrom%@StageWithDescriptor:", Stage];
+		NSString *intersection =
+		    [NSString stringWithFormat:@"new%@IntersectionFunctionTableWithDescriptor:", Stage];
+		CHECK(((id (*)(id, SEL, id))objc_msgSend)(
+		          rs, NSSelectorFromString(visible),
+		          [MTLVisibleFunctionTableDescriptor visibleFunctionTableDescriptor]) == nil);
+		CHECK(((id (*)(id, SEL, id))objc_msgSend)(
+		          rs, NSSelectorFromString(intersection),
+		          [MTLIntersectionFunctionTableDescriptor intersectionFunctionTableDescriptor]) == nil);
+	}
+	CHECK(((NSDictionary *)obj(rs, @"pipelineBinaries")).count == 0 && obj(rs, @"pipelineBinaries") != nil);
+	CHECK(obj(rs, @"newVertexShaderDebugInfo") == nil && obj(rs, @"newFragmentShaderDebugInfo") == nil);
+	CHECK(((uint32_t (*)(id, SEL))objc_msgSend)(rs, NSSelectorFromString(@"explicitVisibilityGroupID")) == 0);
+	CHECK(u64(rs, @"shaderValidationState") == static_cast<uint64_t>(MTLShaderValidationDisabled));
+	CHECK(u64(rs, @"textureWriteRoundingMode") == 0);
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(rs, NSSelectorFromString(@"setEmulationMeshSize:"), 64);
+	((void (*)(id, SEL, BOOL))objc_msgSend)(rs, NSSelectorFromString(@"setUsesMeshShaderEmulation:"), YES);
+	CHECK(!((BOOL (*)(id, SEL))objc_msgSend)(rs, NSSelectorFromString(@"usesMeshShaderEmulation")));
+	CHECK(u64(rs, @"emulationMeshSize") == 0 && obj(rs, @"emulationMeshShaderPSO") == nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxRenderPipelineState class],
+	                               NSSelectorFromString(@"setEmulationMeshSize:")));
+	err = nil;
+	CHECK(((id (*)(id, SEL, id, NSError **))objc_msgSend)(
+	          rs, NSSelectorFromString(@"newTileRenderPipelineStateWithAdditionalBinaryFunctions:error:"),
+	          @[], &err) == nil &&
+	      err != nil);
+	bool renderRaised = false;
+	@try {
+		(void)((id (*)(id, SEL, id))objc_msgSend)(rs, NSSelectorFromString(@"reflectionForFunctionDescriptor:"),
+		                                          [MTLFunctionDescriptor functionDescriptor]);
+	} @catch (NSException *e) {
+		renderRaised = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(renderRaised);
 	// The two members a compute pipeline declares, which Metal's render pipelines answer too.
 	id<MTLComputePipelineState> asCompute = (id<MTLComputePipelineState>)rs;
 	MTLSize rsRequired = asCompute.requiredThreadsPerThreadgroup;
@@ -1520,6 +1600,16 @@ void test_pipeline_state_members()
 	}
 	CHECK(raised);
 	CHECK(!RgfxUnsupportedWasLogged([RgfxDepthStencilState class], @selector(gpuResourceID)));
+	// Nor an index or an identifier.
+	for (NSString *member in @[ @"resourceIndex", @"uniqueIdentifier" ]) {
+		bool stateRaised = false;
+		@try {
+			(void)((uint64_t (*)(id, SEL))objc_msgSend)(ds, NSSelectorFromString(member));
+		} @catch (NSException *e) {
+			stateRaised = [e.name isEqualToString:NSInvalidArgumentException];
+		}
+		CHECK(stateRaised);
+	}
 	} // @autoreleasepool
 }
 
@@ -1677,6 +1767,9 @@ void test_argument_encoder_members()
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(!control.next(&h, &bytes)); // an encoder makes nothing on the device
+	// Metal's encoder SPI: no layout object of the device's, logged.
+	CHECK(((id (*)(id, SEL))objc_msgSend)(enc, NSSelectorFromString(@"layout")) == nil);
+	CHECK(RgfxUnsupportedWasLogged(c, NSSelectorFromString(@"layout")));
 
 	// No argument buffer: nothing to write into.
 	[enc setBuffer:nil offset:0 atIndex:4];

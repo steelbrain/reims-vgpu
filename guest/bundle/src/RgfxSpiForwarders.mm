@@ -32,8 +32,11 @@
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
-// The MTLFunctionSPI member RgfxFunction.mm answers.
+// The MTLFunctionSPI member RgfxFunction.mm and RgfxGLFunction.mm answer.
 @interface RgfxFunction (RgfxSpiReflection)
+- (id)reflectionWithOptions:(NSUInteger)options;
+@end
+@interface RgfxGLFunction (RgfxSpiReflection)
 - (id)reflectionWithOptions:(NSUInteger)options;
 @end
 
@@ -199,6 +202,30 @@
 {
 	(void)binaryArchives;
 	return [self newArgumentEncoderWithBufferIndex:bufferIndex reflection:reflection];
+}
+
+- (id)reflectionWithOptions:(NSUInteger)options pipelineLibrary:(uintptr_t)pipelineLibrary
+{
+	(void)pipelineLibrary;
+	return [self reflectionWithOptions:options];
+}
+
+- (id)reflectionWithOptions:(NSUInteger)options binaryArchives:(uintptr_t)binaryArchives
+{
+	(void)binaryArchives;
+	return [self reflectionWithOptions:options];
+}
+
+// reflectionWithOptions:'s answer, handed to `completionHandler` on the creation queue, as the
+// library's asynchronous makers hand theirs (RgfxRunCreation).
+- (void)reflectionWithOptions:(NSUInteger)options completionHandler:(void (^)(id _Nullable))completionHandler
+{
+	completionHandler = [completionHandler copy];
+	RgfxRunCreation(^{
+		id reflection = [self reflectionWithOptions:options];
+		if (completionHandler)
+			completionHandler(reflection);
+	});
 }
 
 @end

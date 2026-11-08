@@ -394,6 +394,14 @@ bool rgfxSendRightOnly(mach_port_t port)
 	return [[MTLSharedEventHandle alloc] initWithSharedEvent:self];
 }
 
+// NO: the event's value is never rolled back, as Metal's base shared event answers, which
+// neither x86 Mac's overrides (read from code; measured on the AMD 5300M and the Intel 630,
+// %spi-answers).
+- (BOOL)supportsRollback
+{
+	return NO;
+}
+
 // --- NSSecureCoding: through an NSXPCCoder alone, as Metal's (measured, oracle_events coding:
 // a keyed archiver's encode and decode each raise, and the convenience archiver answers
 // NSCocoaErrorDomain 4866) ------------------------------------------------------------------

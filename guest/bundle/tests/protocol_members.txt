@@ -30,6 +30,7 @@
 %spi-no-pipeline-libraries the IOGPU base answers NO, the lane's answer: it makes no pipeline libraries (newPipelineLibraryWithFilePath:error: is RGFX_UNSUPPORTED), where Metal's devices answer YES
 %spi-no-shared-textures the IOGPU base answers NO, the lane's answer: it makes no shared textures or handles (RGFX_UNSUPPORTED), where Metal's devices answer YES
 %gl-function Metal's own function of GL IR answers it, the same for every shader (measured: macOS 26.7.1, the Intel 630's device: the name __main, MTLPatchTypeNone, a control point count of 0, no vertex or stage input attributes, no function constants, no options)
+%gl-spi Metal's function of GL IR answers it, the same for both shaders asked (measured: macOS 26.7.1, the Intel 630's device, tools/gl_probe.m -s, the functions of a vertex and a fragment shader; each is a function of a library, _MTLFunctionInternal)
 %spi-both an SPI member the AMD 5300M's and the Intel 630's objects of the kind both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), which the guest's frameworks may send without asking; to be answered as Metal's
 %spi-neither an SPI member neither the AMD 5300M's nor the Intel 630's objects of the kind answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
 %spi-differ an SPI member one of the AMD 5300M's and the Intel 630's objects of the kind answers and the other does not (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
@@ -38,6 +39,8 @@
 %cb-answers what a fresh buffer of the AMD 5300M's and of the Intel 630's answers (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
 %q-base Metal's base command queue, _MTLCommandQueue (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, MTLCommandQueueSPI); that the AMD 5300M's and the Intel 630's queues answer from it, not from their own classes, is to be measured with oracle_spi_members' answering class
 %q-answers what a fresh queue of the AMD 5300M's and of the Intel 630's answers (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
+%pipe-base Metal's base pipelines, _MTLComputePipelineState and _MTLRenderPipelineState (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxComputePipelineState.mm and src/RgfxRenderPipelineState.mm, their SPI sections); that the AMD 5300M's and the Intel 630's pipelines answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
+%spi-answers what a fresh object of the kind of the AMD 5300M's and of the Intel 630's answers, for a member that takes no argument (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
 %old-only a member only older guest releases' protocols carry (tests/protocol_members_releases.txt), with no public counterpart; no app pass on the releases that carry it showed a guest framework sending it to the bundle's objects (the bundle logs each selector it does not recognize, RGFX: unrecognized), so a call raises an unrecognized selector, as it did before
 %old-only-device a member only macOS 11's or 12's MTLDeviceSPI carries (tests/protocol_members_releases.txt): on those releases the device's IOGPU base answers it, the guest's own class (measured: macOS 11.7.11, the device answers it); on the Mac the base lacks it
 
@@ -1295,25 +1298,25 @@ width implemented
 # to its libraries. The forwarders are src/RgfxSpiForwarders.mm.
 
 [RgfxArgumentEncoder]
-layout pending %spi-both
+layout unsupported argument buffers of a layout object
 [RgfxBinaryArchive]
 addComputePipelineFunctionsWithDescriptor:options:error: implemented
 addMeshRenderPipelineFunctionsWithDescriptor:options:error: implemented
 addRenderPipelineFunctionsWithDescriptor:options:error: implemented
 addTileRenderPipelineFunctionsWithDescriptor:options:error: implemented
-archiveFunctionIds pending %spi-both
-enumerateArchivesFromBackingFile: pending %spi-both
-enumerateArchivesFromPipelineCollection: pending %spi-both
-formattedDescription: pending %spi-both
+archiveFunctionIds unsupported an archive's function IDs
+enumerateArchivesFromBackingFile: unsupported Metal's archive backing files
+enumerateArchivesFromPipelineCollection: unsupported Metal's archive backing files
+formattedDescription: implemented
 keys implemented
 options implemented
-pipelineCollection pending %spi-both
-recompileToArchiveWithURL:error: pending %spi-both
+pipelineCollection metal null: the archive keeps no pipeline collection of Metal's, as a fresh archive of both x86 Macs answers (%spi-answers)
+recompileToArchiveWithURL:error: unsupported recompiling an archive for another target
 serializeToURL:options:error: implemented
-storeComputePipelineDescriptor: pending %spi-both
-storeMeshRenderPipelineDescriptor: pending %spi-both
-storeRenderPipelineDescriptor: pending %spi-both
-storeTileRenderPipelineDescriptor: pending %spi-both
+storeComputePipelineDescriptor: unsupported Metal's archive pipeline collections
+storeMeshRenderPipelineDescriptor: unsupported Metal's archive pipeline collections
+storeRenderPipelineDescriptor: unsupported Metal's archive pipeline collections
+storeTileRenderPipelineDescriptor: unsupported Metal's archive pipeline collections
 [RgfxBlitCommandEncoder]
 copyFromTensor:sourceSlice:toTensor:destinationSlice: pending %spi-both
 copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:options: absent %spi-differ (the Intel 630 answers it)
@@ -1328,7 +1331,7 @@ invalidateCompressedTexture:slice:level: pending %spi-both
 optimizeContentsForTexture:readAccessPattern:readAccessor: pending %spi-both
 optimizeContentsForTexture:readAccessPattern:readAccessor:slice:level: pending %spi-both
 [RgfxBuffer]
-_aneIOSurface pending %spi-both
+_aneIOSurface metal null, as Metal's IOAccel buffer answers (read from code, MTLIOAccelBuffer, macOS 27.0.1; %spi-answers)
 allocationID implemented
 detachBacking absent %spi-neither
 doesAliasAllResources:count: implemented
@@ -1483,41 +1486,41 @@ useResourceGroup:usage: absent %spi-neither
 waitForProgress: absent %spi-neither
 waitForVirtualSubstream: absent %spi-neither
 [RgfxComputePipelineState]
-debugInstrumentationData pending %spi-both
-functionReflectionWithFunctionDescriptor: pending %spi-both
-getComputeKernelTelemetryID pending %spi-both
-globalConstantsBase pending %spi-both
-globalConstantsSize pending %spi-both
+debugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+functionReflectionWithFunctionDescriptor: metal raises an unrecognized selector, as Metal's base pipeline does: it sends itself doesNotRecognizeSelector: (read from code, %pipe-base)
+getComputeKernelTelemetryID metal the low 32 bits of uniqueIdentifier, as Metal's base pipeline and the AMD 5300M's answer (read from code, %pipe-base; %spi-answers; the Intel 630's answers 0)
+globalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+globalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
 gpuAddress metal 0 for every pipeline, one that supports indirect command buffers too, as Metal's answer (measured: M3 Max, macOS 27)
-gpuHandle pending %spi-both
+gpuHandle metal resourceIndex, as Metal's base pipeline answers (read from code, %pipe-base; %spi-answers)
 newComputePipelineStateWithAdditionalBinaryFunctions:resourceIndices:error: unsupported  binary functions
-pipelineBinaries pending %spi-both
-resourceIndex pending %spi-both
-shaderValidationState pending %spi-both
-textureWriteRoundingMode pending %spi-both
+pipelineBinaries metal an empty dictionary, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+resourceIndex metal gpuResourceID's value: Metal's base pipeline answers gpuResourceID with gpuHandle, and gpuHandle with resourceIndex (read from code, %pipe-base)
+shaderValidationState metal MTLShaderValidationDisabled, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers) and shaderValidation answers (%no-validation)
+textureWriteRoundingMode implemented
 uniqueIdentifier implemented
 [RgfxDepthStencilState]
 readsDepth metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
 readsStencil metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
-resourceIndex pending %spi-both
-uniqueIdentifier pending %spi-both
+resourceIndex metal raises an unrecognized selector, as Metal's base state does (read from code, _MTLDepthStencilState, macOS 27.0.1), which ends the process on both x86 Macs (%spi-answers); as gpuResourceID
+uniqueIdentifier metal raises an unrecognized selector, as Metal's base state does (read from code, _MTLDepthStencilState, macOS 27.0.1), which ends the process on both x86 Macs (%spi-answers); as gpuResourceID
 writesDepth metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
 writesStencil metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
 [RgfxEvent]
-enableBarrier pending %spi-both
-setEnableBarrier: pending %spi-both
-supportsRollback pending %spi-both
+enableBarrier implemented
+setEnableBarrier: implemented
+supportsRollback metal NO (%spi-answers): the device's events are never rolled back
 [RgfxFunction]
 arguments implemented
 bindings implemented
 bitCodeHash implemented
 bitcodeData implemented
-debugInstrumentationData pending %spi-both
-filePath pending %spi-both
-functionHandle pending %spi-both
+debugInstrumentationData implemented
+filePath implemented
+functionHandle metal ends the process with Metal's words, as Metal's base function does: Driver needs to override this (read from code, _MTLFunction, macOS 27.0.1; %spi-answers: a fresh function of either x86 Mac ends the process at it)
 importedLibraries implemented
-importedSymbols pending %spi-both
-lineNumber pending %spi-both
+importedSymbols implemented
+lineNumber implemented
 newArgumentEncoderWithBufferIndex:pipelineLibrary: implemented
 newArgumentEncoderWithBufferIndex:reflection:binaryArchives: implemented
 newArgumentEncoderWithBufferIndex:reflection:pipelineLibrary: implemented
@@ -1526,70 +1529,64 @@ reflectionWithOptions: implemented
 reflectionWithOptions:binaryArchives: implemented
 reflectionWithOptions:completionHandler: implemented
 reflectionWithOptions:pipelineLibrary: implemented
-relocations pending %spi-both
-renderTargetArrayIndexType pending %spi-both
+relocations implemented
+renderTargetArrayIndexType implemented
 returnType implemented
-setRelocations: pending %spi-both
-unpackedFilePath pending %spi-both
+setRelocations: implemented
+unpackedFilePath implemented
 [RgfxFunctionArrayLibrary]
-bitcodeData pending %spi-both
-externFunctionNames gap nil; what Metal answers for a library of functions given to it is not measured
-libraryIdentifier pending %spi-both
-newExternFunctionWithName: pending %spi-both
+bitcodeData metal nil, as Metal's library of a function array answers (measured: M3 Max, macOS 27): its functions keep their bitcode
+externFunctionNames metal nil, as Metal's library of a function array answers (measured: M3 Max, macOS 27)
+libraryIdentifier metal nil, as Metal's library answers for one made from bytes, from a URL and of a function array (measured: M3 Max, macOS 27)
+newExternFunctionWithName: implemented
 newFunctionWithDescriptor:destinationArchive:error: implemented
 newFunctionWithName:constantValues:functionCache:error: implemented
 newFunctionWithName:constantValues:pipelineLibrary:completionHandler: implemented
 newFunctionWithName:constantValues:pipelineLibrary:error: implemented
-overrideTriple pending %spi-both
+overrideTriple implemented
 serializeToURL:error: implemented
-setOverrideTriple: pending %spi-both
-setShaderValidationEnabled: pending %spi-both
-shaderValidationEnabled pending %spi-both
+setOverrideTriple: implemented
+setShaderValidationEnabled: implemented
+shaderValidationEnabled implemented
 [RgfxGLFunction]
-arguments pending %spi-both
-bindings pending %spi-both
-bitCodeHash pending %spi-both
-bitcodeData pending %spi-both
-debugInstrumentationData pending %spi-both
-filePath pending %spi-both
-functionHandle pending %spi-both
-importedLibraries pending %spi-both
-importedSymbols pending %spi-both
-lineNumber pending %spi-both
+arguments metal nil (%gl-spi)
+bindings metal nil (%gl-spi)
+bitCodeHash implemented
+bitcodeData implemented
+debugInstrumentationData metal nil (%gl-spi)
+filePath metal nil (%gl-spi)
+functionHandle metal ends the process with Metal's words, as Metal's base function does: Driver needs to override this (read from code, _MTLFunction, macOS 27.0.1); Metal's function of GL IR answers it from the base (%gl-spi)
+importedLibraries metal nil (%gl-spi)
+importedSymbols metal nil (%gl-spi)
+lineNumber metal 0 (%gl-spi)
 newArgumentEncoderWithBufferIndex:pipelineLibrary: implemented
 newArgumentEncoderWithBufferIndex:reflection:binaryArchives: implemented
 newArgumentEncoderWithBufferIndex:reflection:pipelineLibrary: implemented
 newFunctionWithPluginData:bitcodeType: implemented
-reflectionWithOptions: pending %spi-both
-reflectionWithOptions:binaryArchives: pending %spi-both
-reflectionWithOptions:completionHandler: pending %spi-both
-reflectionWithOptions:pipelineLibrary: pending %spi-both
-relocations pending %spi-both
-renderTargetArrayIndexType pending %spi-both
-returnType pending %spi-both
-setRelocations: pending %spi-both
-unpackedFilePath pending %spi-both
+reflectionWithOptions: unsupported the reflection of a function of GL IR
+reflectionWithOptions:binaryArchives: implemented
+reflectionWithOptions:completionHandler: implemented
+reflectionWithOptions:pipelineLibrary: implemented
+relocations implemented
+renderTargetArrayIndexType metal 0 (%gl-spi)
+returnType metal nil (%gl-spi)
+setRelocations: implemented
+unpackedFilePath metal nil (%gl-spi)
 [RgfxHeap]
-detachBacking pending %spi-both
-formattedDescription: pending %spi-both
+detachBacking metal raises an unrecognized selector, as Metal's base heap does: it sends itself doesNotRecognizeSelector: (read from code, _MTLHeap, macOS 27.0.1)
+formattedDescription: implemented
 gpuAddress implemented
-memoryPoolId pending %spi-both
+memoryPoolId metal 0, as Metal's base heap answers (read from code, _MTLHeap, macOS 27.0.1; %spi-answers)
 newAccelerationStructureWithSize:offset:resourceIndex: unsupported  ray tracing
 newAccelerationStructureWithSize:resourceIndex: unsupported  ray tracing
-replaceBackingWithRanges:readOnly: pending %spi-both
+replaceBackingWithRanges:readOnly: metal raises an unrecognized selector, as Metal's base heap does: it sends itself doesNotRecognizeSelector: (read from code, _MTLHeap, macOS 27.0.1)
 unfilteredResourceOptions implemented
 [RgfxIOSurfaceTexture]
 canGenerateMipmapLevels absent %spi-neither
-colorSpaceConversionMatrix pending %spi-both
-compressionFeedback pending %spi-both
-compressionFootprint pending %spi-both
-compressionMetadata pending %spi-unmeasured
+compressionMetadata absent %spi-neither (asked, tools/oracle/oracle_spi_members.m ask)
 generateMipmapLevel:slice: absent %spi-neither
 gpuAddress implemented
-gpuHandle pending %spi-both
 newCompressedTextureViewWithPixelFormat:textureType:level:slice: absent %spi-neither
-numFaces pending %spi-both
-resourceIndex pending %spi-both
 sparseSurfaceDefaultValue absent %spi-neither
 writeAccessPattern absent %spi-neither
 [RgfxIndirectCommandBuffer]
@@ -1665,17 +1662,17 @@ setViewports:count: pending %spi-both
 [RgfxLibrary]
 bitcodeData implemented
 externFunctionNames implemented
-libraryIdentifier pending %spi-both
+libraryIdentifier implemented
 newExternFunctionWithName: implemented
 newFunctionWithDescriptor:destinationArchive:error: implemented
 newFunctionWithName:constantValues:functionCache:error: implemented
 newFunctionWithName:constantValues:pipelineLibrary:completionHandler: implemented
 newFunctionWithName:constantValues:pipelineLibrary:error: implemented
-overrideTriple pending %spi-both
+overrideTriple implemented
 serializeToURL:error: partial  serializing a library Metal's own does not hold
-setOverrideTriple: pending %spi-both
-setShaderValidationEnabled: pending %spi-both
-shaderValidationEnabled pending %spi-both
+setOverrideTriple: implemented
+setShaderValidationEnabled: implemented
+shaderValidationEnabled implemented
 [RgfxParallelRenderCommandEncoder]
 endEncodingAndRetrieveProgramAddressTable pending %spi-both
 insertSplit pending %spi-both
@@ -1732,108 +1729,108 @@ useResidencySet: partial  residency sets
 useResidencySets:count: partial  residency sets
 useResourceGroup:usage:stages: absent %spi-neither
 [RgfxRenderPipelineState]
-emulationMeshMaxPrimitiveCount pending %spi-both
-emulationMeshMaxVertexCount pending %spi-both
-emulationMeshPrefixSum1PSO pending %spi-both
-emulationMeshPrefixSum2PSO pending %spi-both
-emulationMeshPrefixSum3PSO pending %spi-both
-emulationMeshShaderIntermediateBufferSlot pending %spi-both
-emulationMeshShaderPSO pending %spi-both
-emulationMeshSize pending %spi-both
-emulationNoObjectPrefixSumPSO pending %spi-both
-emulationObjectPrefixSumPSO pending %spi-both
-emulationObjectShaderIntermediateBufferSlot pending %spi-both
-emulationObjectShaderPSO pending %spi-both
-emulationPayloadMemoryLength pending %spi-both
-emulationPrimitiveTopology pending %spi-both
-emulationVertexShaderIntermediateBufferSlot pending %spi-both
-explicitVisibilityGroupID pending %spi-both
-fragmentDebugInstrumentationData pending %spi-both
-fragmentFunctionHandleWithFunction: pending %spi-both
-fragmentGlobalConstantsBase pending %spi-both
-fragmentGlobalConstantsSize pending %spi-both
-functionReflectionWithFunctionDescriptor:stage: pending %spi-both
-getFragmentShaderTelemetryID pending %spi-both
-getVertexShaderTelemetryID pending %spi-both
+emulationMeshMaxPrimitiveCount metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshMaxVertexCount metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshPrefixSum1PSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshPrefixSum2PSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshPrefixSum3PSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshShaderIntermediateBufferSlot metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshShaderPSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshSize metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationNoObjectPrefixSumPSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationObjectPrefixSumPSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationObjectShaderIntermediateBufferSlot metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationObjectShaderPSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationPayloadMemoryLength metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationPrimitiveTopology metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationVertexShaderIntermediateBufferSlot metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+explicitVisibilityGroupID metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers); the device makes no visibility groups
+fragmentDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+fragmentFunctionHandleWithFunction: unsupported function pointers
+fragmentGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+fragmentGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+functionReflectionWithFunctionDescriptor:stage: metal raises an unrecognized selector, as Metal's base pipeline does: it sends itself doesNotRecognizeSelector: (read from code, %pipe-base)
+getFragmentShaderTelemetryID metal the low 32 bits of uniqueIdentifier, as Metal's base pipeline and the AMD 5300M's answer (read from code, %pipe-base; %spi-answers; the Intel 630's answers 0)
+getVertexShaderTelemetryID metal the low 32 bits of uniqueIdentifier, as Metal's base pipeline and the AMD 5300M's answer (read from code, %pipe-base; %spi-answers; the Intel 630's answers 0)
 gpuAddress metal 0 for every pipeline, one that supports indirect command buffers too, as Metal's answer (measured: M3 Max, macOS 27)
-gpuHandle pending %spi-both
-meshDebugInstrumentationData pending %spi-both
-meshFunctionHandleWithFunction: pending %spi-both
-meshGlobalConstantsBase pending %spi-both
-meshGlobalConstantsSize pending %spi-both
-newFragmentIntersectionFunctionTableWithDescriptor: pending %spi-both
-newFragmentShaderDebugInfo pending %spi-both
-newMeshIntersectionFunctionTableWithDescriptor: pending %spi-both
-newObjectIntersectionFunctionTableWithDescriptor: pending %spi-both
+gpuHandle metal resourceIndex, as Metal's base pipeline answers (read from code, %pipe-base; %spi-answers)
+meshDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+meshFunctionHandleWithFunction: unsupported function pointers
+meshGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+meshGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+newFragmentIntersectionFunctionTableWithDescriptor: implemented
+newFragmentShaderDebugInfo unsupported a shader's debug info
+newMeshIntersectionFunctionTableWithDescriptor: implemented
+newObjectIntersectionFunctionTableWithDescriptor: implemented
 newRenderPipelineStateWithAdditionalBinaryFunctions:fragmentAdditionalBinaryFunctions:error: unsupported  binary functions
-newTileIntersectionFunctionTableWithDescriptor: pending %spi-both
-newTileRenderPipelineStateWithAdditionalBinaryFunctions:error: pending %spi-both
-newVertexIntersectionFunctionTableWithDescriptor: pending %spi-both
-newVertexShaderDebugInfo pending %spi-both
-newVisibleFunctionTableFromFragmentStageWithDescriptor: pending %spi-both
-newVisibleFunctionTableFromMeshStageWithDescriptor: pending %spi-both
-newVisibleFunctionTableFromObjectStageWithDescriptor: pending %spi-both
-newVisibleFunctionTableFromTileStageWithDescriptor: pending %spi-both
-newVisibleFunctionTableFromVertexStageWithDescriptor: pending %spi-both
-objectDebugInstrumentationData pending %spi-both
-objectFunctionHandleWithFunction: pending %spi-both
-objectGlobalConstantsBase pending %spi-both
-objectGlobalConstantsSize pending %spi-both
-pipelineBinaries pending %spi-both
-reflectionForFunctionDescriptor: pending %spi-both
-resourceIndex pending %spi-both
-setEmulationMeshMaxPrimitiveCount: pending %spi-both
-setEmulationMeshMaxVertexCount: pending %spi-both
-setEmulationMeshShaderIntermediateBufferSlot: pending %spi-both
-setEmulationMeshShaderPSO: pending %spi-both
-setEmulationMeshSize: pending %spi-both
-setEmulationObjectShaderIntermediateBufferSlot: pending %spi-both
-setEmulationObjectShaderPSO: pending %spi-both
-setEmulationPayloadMemoryLength: pending %spi-both
-setEmulationPrimitiveTopology: pending %spi-both
-setEmulationVertexShaderIntermediateBufferSlot: pending %spi-both
-setUsesMeshShaderEmulation: pending %spi-both
-shaderValidationState pending %spi-both
-textureWriteRoundingMode pending %spi-both
-tileDebugInstrumentationData pending %spi-both
-tileFunctionHandleWithFunction: pending %spi-both
-tileGlobalConstantsBase pending %spi-both
-tileGlobalConstantsSize pending %spi-both
+newTileIntersectionFunctionTableWithDescriptor: implemented
+newTileRenderPipelineStateWithAdditionalBinaryFunctions:error: unsupported binary functions
+newVertexIntersectionFunctionTableWithDescriptor: implemented
+newVertexShaderDebugInfo unsupported a shader's debug info
+newVisibleFunctionTableFromFragmentStageWithDescriptor: implemented
+newVisibleFunctionTableFromMeshStageWithDescriptor: implemented
+newVisibleFunctionTableFromObjectStageWithDescriptor: implemented
+newVisibleFunctionTableFromTileStageWithDescriptor: implemented
+newVisibleFunctionTableFromVertexStageWithDescriptor: implemented
+objectDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+objectFunctionHandleWithFunction: unsupported function pointers
+objectGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+objectGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+pipelineBinaries metal an empty dictionary, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+reflectionForFunctionDescriptor: metal raises an unrecognized selector, as Metal's base pipeline does: it sends itself doesNotRecognizeSelector: (read from code, %pipe-base)
+resourceIndex metal gpuResourceID's value: Metal's base pipeline answers gpuResourceID with gpuHandle, and gpuHandle with resourceIndex (read from code, %pipe-base); both x86 Macs' fresh pipeline answers its uniqueIdentifier (%spi-answers)
+setEmulationMeshMaxPrimitiveCount: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationMeshMaxVertexCount: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationMeshShaderIntermediateBufferSlot: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationMeshShaderPSO: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationMeshSize: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationObjectShaderIntermediateBufferSlot: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationObjectShaderPSO: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationPayloadMemoryLength: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationPrimitiveTopology: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationVertexShaderIntermediateBufferSlot: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setUsesMeshShaderEmulation: metal does nothing: Metal's base pipeline stores a flag its usesMeshShaderEmulation does not read, answering from its emulation properties instead (read from code, %pipe-base)
+shaderValidationState metal MTLShaderValidationDisabled, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers) and shaderValidation answers (%no-validation)
+textureWriteRoundingMode implemented
+tileDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+tileFunctionHandleWithFunction: unsupported function pointers
+tileGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+tileGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
 uniqueIdentifier implemented
-usesMeshShaderEmulation pending %spi-both
-vertexDebugInstrumentationData pending %spi-both
-vertexFunctionHandleWithFunction: pending %spi-both
-vertexGlobalConstantsBase pending %spi-both
-vertexGlobalConstantsSize pending %spi-both
+usesMeshShaderEmulation metal NO, as both x86 Macs' fresh pipeline answers (%spi-answers): the device carries mesh draws to the host, so no pipeline of it emulates mesh shaders
+vertexDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+vertexFunctionHandleWithFunction: unsupported function pointers
+vertexGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+vertexGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
 [RgfxResource]
 protectionOptions metal the content protection the resource was made with: the device protects no content and no call sets it, so none
 responsibleProcess implemented
 setResponsibleProcess: implemented
 [RgfxSampler]
 gpuAddress metal no GPU address, whatever the descriptor, as Metal's sampler answers (measured: M3 Max, macOS 27)
-gpuHandle pending %spi-both
+gpuHandle implemented
 pixelFormat metal no pixel format, whatever the descriptor, as Metal's sampler answers (measured: M3 Max, macOS 27)
-resourceIndex pending %spi-both
+resourceIndex implemented
 uniqueIdentifier implemented
 [RgfxSharedEvent]
 IOSurfaceSharedEvent implemented
-enableBarrier pending %spi-unmeasured
-setEnableBarrier: pending %spi-unmeasured
-supportsRollback pending %spi-both
+enableBarrier absent %spi-neither (asked, tools/oracle/oracle_spi_members.m ask)
+setEnableBarrier: absent %spi-neither (asked, tools/oracle/oracle_spi_members.m ask)
+supportsRollback metal NO, as Metal's base shared event answers (read from code, _MTLSharedEvent, macOS 27.0.1; %spi-answers)
 [RgfxTexture]
 allocationID implemented
 canGenerateMipmapLevels absent %spi-neither
-colorSpaceConversionMatrix pending %spi-both
-compressionFeedback pending %spi-both
-compressionFootprint pending %spi-both
-compressionMetadata pending %spi-unmeasured
+colorSpaceConversionMatrix metal 0, as Metal's base resource answers (read from code, _MTLResource, macOS 27.0.1) and both x86 Macs' textures answer (%spi-answers): the device converts no colour space
+compressionFeedback metal 0, as Metal's IOAccel texture answers (read from code, MTLIOAccelTexture, macOS 27.0.1) and both x86 Macs' textures answer (%spi-answers): the device compresses no texture
+compressionFootprint metal 0, as Metal's base resource answers (read from code, _MTLResource, macOS 27.0.1) and both x86 Macs' textures answer (%spi-answers): the device compresses no texture
+compressionMetadata absent %spi-neither (asked, tools/oracle/oracle_spi_members.m ask)
 didModifyData implemented
 doesAliasAllResources:count: implemented
 doesAliasAnyResources:count: implemented
 doesAliasResource: implemented
 generateMipmapLevel:slice: absent %spi-neither
 gpuAddress implemented
-gpuHandle pending %spi-both
+gpuHandle implemented
 isComplete metal YES, as Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
 isCompressed implemented
 isDrawable metal the device's textures are no drawable's: Metal answers NO for every texture an app makes (private, shared, IOSurface and views)
@@ -1843,8 +1840,8 @@ newCompressedTextureViewWithPixelFormat:textureType:level:slice: absent %spi-nei
 newTextureViewWithPixelFormat:resourceIndex: implemented
 newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex: implemented
 newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex: implemented
-numFaces pending %spi-both
-resourceIndex pending %spi-both
+numFaces implemented
+resourceIndex implemented
 rotation metal the device's textures are shown unrotated: Metal answers 0 for every texture an app makes (private, shared, IOSurface and views)
 sparseSurfaceDefaultValue absent %spi-neither
 swizzleKey implemented

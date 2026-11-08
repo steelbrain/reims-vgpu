@@ -125,6 +125,8 @@ bool isRendererPluginData(NSData *data)
 	BOOL _reflectedHere;                            // whether the two above are the answers
 	std::shared_ptr<const RgfxClBindings> _cl;      // a kernel's function of OpenCL mode's
 	NSData *_pluginData;                            //   bindings, and its plugin data
+	std::mutex _relocationsLock;                    // guards _relocations
+	NSArray *_relocations;                          // what -relocations answers, as set
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -416,6 +418,21 @@ bool isRendererPluginData(NSData *data)
 	return ((id (*)(id, SEL))objc_msgSend)(shadow, cmd);
 }
 
+// The shadow's answer to `cmd`, a member answering an integer, as rgfxShadowAnswer: asks one
+// answering an object; 0, logged, where there is none to ask.
+- (uint64_t)rgfxShadowScalar:(SEL)cmd
+{
+	id<MTLFunction> shadow = [self rgfxShadowOrMake];
+	if (![shadow respondsToSelector:cmd]) {
+		RgfxLogUnsupported([self class], cmd,
+		                   "no function of Metal's own answers it (one of a library Metal's own "
+		                   "does not hold, or that Metal's own library made none of)");
+		return 0;
+	}
+	logAnsweredByShadow([self class], cmd);
+	return ((uint64_t (*)(id, SEL))objc_msgSend)(shadow, cmd);
+}
+
 // --- MTLFunctionSPI, as Metal's own function answers it -----------------------------------
 // Core Image and MPS read these. Metal's answers depend on the function (measured: macOS 27):
 // nil arguments, imported libraries and return type for a plain library function, the bindings
@@ -483,6 +500,65 @@ bool isRendererPluginData(NSData *data)
 - (id)bitcodeData
 {
 	return [self rgfxShadowAnswer:_cmd];
+}
+
+// What Metal's own function reads from its library for its tools: the source file and line of the
+// entry point and the path of the library's unpacked sources (from a library built with them),
+// its debug instrumentation, the symbols it imports and the type of the render target array index
+// a vertex function writes (0 where it writes none). The shadow answers each, Metal's own function
+// of the same entry point over the same bytes (measured: M3 Max, macOS 27, nil and 0 for a function
+// of a library built without them).
+- (id)filePath
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (id)unpackedFilePath
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (id)debugInstrumentationData
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (id)importedSymbols
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (NSInteger)lineNumber
+{
+	return static_cast<NSInteger>([self rgfxShadowScalar:_cmd]);
+}
+
+- (NSUInteger)renderTargetArrayIndexType
+{
+	return static_cast<NSUInteger>([self rgfxShadowScalar:_cmd]);
+}
+
+// The relocations a link applies to the function: nil until set, then the array set itself, as
+// Metal's function keeps it (measured: M3 Max, macOS 27).
+- (NSArray *)relocations
+{
+	std::lock_guard<std::mutex> hold(_relocationsLock);
+	return _relocations;
+}
+
+- (void)setRelocations:(NSArray *)relocations
+{
+	std::lock_guard<std::mutex> hold(_relocationsLock);
+	_relocations = relocations;
+}
+
+// Metal's base function ends the process here, a failure Metal reports ("Driver needs to override
+// this"; read from code, _MTLFunction, macOS 27.0.1), which neither x86 Mac's function overrides:
+// a fresh one of the AMD 5300M's and of the Intel 630's ends the process at it (measured, macOS
+// 26.7.1, oracle_spi_members answers). So does this.
+- (id)functionHandle
+{
+	RgfxMetalAssertionFailed("-[_MTLFunction functionHandle]", @"Driver needs to override this");
 }
 
 // Metal answers nil for a function specialised by values (measured).

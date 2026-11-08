@@ -14,6 +14,12 @@
 //     -c CLASS the device class -x and -X wrap (default RgfxMetalDevice), such as another Mac's
 //              Metal device class under gl_redirect.
 //     -n N     frames the timed loop of each context draws (default 200).
+//     -s       with -x, each of the first two functions the device answers is also asked the
+//              members of Metal's function SPI (MTLFunctionSPI) a function of a library answers
+//              (respondsToSelector:, with the first class of its chain whose own methods have it),
+//              and each that takes no argument and returns a value is called, but functionHandle,
+//              at which Metal's base function ends the process: "  IR N: SPI SELECTOR yes|no
+//              [OWNER] [= VALUE]".
 // It prints:
 //   - each IOAccelerator service: its class, registry ID, IOGLBundleName and MetalPluginName;
 //   - each Metal device: its name and registry ID, and its answers to what the GL renderer asks
@@ -125,9 +131,72 @@ static id wrap_plugin(id self, SEL cmd, NSData *data, NSUInteger bitcodeType) {
 	return v;
 }
 
+static BOOL g_askSpi;
+
+// -s: what the function answers to Metal's function SPI.
+static void ask_function_spi(id f, int n) {
+	static const char *const members[] = {
+	    "arguments", "bindings", "bitCodeHash", "bitcodeData", "debugInstrumentationData",
+	    "filePath", "functionHandle", "importedLibraries", "importedSymbols", "lineNumber",
+	    "reflectionWithOptions:", "reflectionWithOptions:binaryArchives:",
+	    "reflectionWithOptions:completionHandler:", "reflectionWithOptions:pipelineLibrary:",
+	    "relocations", "renderTargetArrayIndexType", "returnType", "setRelocations:",
+	    "unpackedFilePath"};
+	for (size_t i = 0; i < sizeof members / sizeof members[0]; i++) {
+		SEL sel = sel_registerName(members[i]);
+		if (![f respondsToSelector:sel]) {
+			printf("  IR %d: SPI %s no\n", n, members[i]);
+			continue;
+		}
+		const char *owner = "-";
+		for (Class c = object_getClass(f); c && owner[0] == '-'; c = class_getSuperclass(c)) {
+			unsigned count = 0;
+			Method *list = class_copyMethodList(c, &count);
+			for (unsigned k = 0; k < count; k++)
+				if (sel_isEqual(method_getName(list[k]), sel)) owner = class_getName(c);
+			free(list);
+		}
+		Method m = class_getInstanceMethod([f class], sel);
+		const char *types = m ? method_getTypeEncoding(m) : "";
+		char rt = types[0];
+		while (rt == 'r' || rt == 'n' || rt == 'N' || rt == 'o' || rt == 'O' || rt == 'R' || rt == 'V')
+			rt = *(++types);
+		if (strchr(members[i], ':') || !strcmp(members[i], "functionHandle")) {
+			printf("  IR %d: SPI %s yes %s\n", n, members[i], owner);
+			continue;
+		}
+		IMP imp = method_getImplementation(m);
+		fflush(stdout);
+		switch (rt) {
+		case '@': {
+			id v = ((id (*)(id, SEL))imp)(f, sel);
+			NSString *d = v ? [[v description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "] : @"nil";
+			if (d.length > 160) d = [[d substringToIndex:160] stringByAppendingString:@"..."];
+			printf("  IR %d: SPI %s yes %s = %s %s\n", n, members[i], owner,
+			       v ? class_getName([v class]) : "-", d.UTF8String);
+			break;
+		}
+		case 'c': case 'B': case 'C':
+			printf("  IR %d: SPI %s yes %s = %d\n", n, members[i], owner, (int)((BOOL (*)(id, SEL))imp)(f, sel));
+			break;
+		case 'q': case 'Q': case 'l': case 'L': case 'i': case 'I':
+			printf("  IR %d: SPI %s yes %s = %llu\n", n, members[i], owner,
+			       (unsigned long long)((unsigned long long (*)(id, SEL))imp)(f, sel));
+			break;
+		case '^': case '*':
+			printf("  IR %d: SPI %s yes %s = %s\n", n, members[i], owner,
+			       ((void *(*)(id, SEL))imp)(f, sel) ? "non-null" : "null");
+			break;
+		default:
+			printf("  IR %d: SPI %s yes %s (%s, not called)\n", n, members[i], owner, types);
+		}
+	}
+}
+
 static void note_function(id f, int n) {
 	printf("    function: %s\n", f ? class_getName([f class]) : "nil");
 	if (!f) return;
+	if (g_askSpi && n < 2) ask_function_spi(f, n);
 	objc_setAssociatedObject(f, &kIrKey, @(n), OBJC_ASSOCIATION_RETAIN);
 	SEL sel = sel_registerName("newFunctionWithPluginData:bitcodeType:");
 	if (!g_origPlugin && [f respondsToSelector:sel]) {
@@ -566,7 +635,7 @@ static void run_profile(const char *name, CGLOpenGLProfile profile, BOOL acceler
 int main(int argc, char **argv) {
 	@autoreleasepool {
 		int frames = 200, c;
-		while ((c = getopt(argc, argv, "x:X:n:c:")) != -1) {
+		while ((c = getopt(argc, argv, "x:X:n:c:s")) != -1) {
 			if (c == 'x' || c == 'X') {
 				g_dumpDir = @(optarg);
 				g_stubFunctions = c == 'X';
@@ -574,8 +643,10 @@ int main(int argc, char **argv) {
 				g_dumpClass = optarg;
 			} else if (c == 'n') {
 				frames = atoi(optarg);
+			} else if (c == 's') {
+				g_askSpi = YES;
 			} else {
-				fprintf(stderr, "usage: gl_probe [-x DIR | -X DIR] [-c CLASS] [-n FRAMES]\n");
+				fprintf(stderr, "usage: gl_probe [-x DIR | -X DIR] [-c CLASS] [-n FRAMES] [-s]\n");
 				return 2;
 			}
 		}

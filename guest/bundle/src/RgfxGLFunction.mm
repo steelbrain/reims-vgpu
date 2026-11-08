@@ -12,11 +12,13 @@
 #import "RgfxGLFunction.h"
 #import "RgfxInterop.h"
 #import "RgfxMetalError.h"
+#import "RgfxUnsupported.h"
 
 #include "RgfxGLLowering.hpp"
 
 #import <objc/runtime.h>
 
+#include <CommonCrypto/CommonDigest.h>
 #include <mutex>
 #include <set>
 #include <string>
@@ -53,7 +55,9 @@ void RgfxGLSetPluginReturnData(id<MTLFunction> function, NSData *data)
 	id<MTLDevice> _device;
 	MTLFunctionType _functionType;
 	NSString *_label;
-	std::mutex _labelLock;
+	std::mutex _labelLock;    // guards _label and _relocations
+	NSArray *_relocations;    // relocations
+	uint8_t _irHash[32];      // bitCodeHash: SHA-256 of _rgfxIR
 }
 RGFX_LOG_UNRECOGNIZED
 
@@ -72,6 +76,7 @@ RGFX_LOG_UNRECOGNIZED
 	if ((self = [super init]) == nil)
 		return nil;
 	_rgfxIR = [NSData dataWithBytes:ir length:sizeof(uint32_t) + length];
+	CC_SHA256(_rgfxIR.bytes, static_cast<CC_LONG>(_rgfxIR.length), _irHash);
 	_functionType = functionType;
 	_rgfxInputsDescription = inputsDescription;
 	_device = device;
@@ -183,6 +188,110 @@ RGFX_LOG_UNRECOGNIZED
 {
 	(void)reflection;
 	return [self newArgumentEncoderWithBufferIndex:bufferIndex];
+}
+
+// --- MTLFunctionSPI ----------------------------------------------------------------------
+// What Metal's function of GL IR answers (measured: macOS 26.7.1, the Intel 630's device, the
+// functions of a vertex and a fragment shader the renderer gave it; tools/gl_probe.m -s): it is a
+// function of a library, _MTLFunctionInternal, with no arguments, bindings, return type, debug
+// instrumentation, file, line, imports, relocations or render target array index type.
+
+- (NSArray *)arguments
+{
+	return nil;
+}
+
+- (NSArray *)bindings
+{
+	return nil;
+}
+
+- (id)returnType
+{
+	return nil;
+}
+
+- (NSData *)debugInstrumentationData
+{
+	return nil;
+}
+
+- (NSString *)filePath
+{
+	return nil;
+}
+
+- (NSString *)unpackedFilePath
+{
+	return nil;
+}
+
+- (NSInteger)lineNumber
+{
+	return 0;
+}
+
+- (NSArray *)importedLibraries
+{
+	return nil;
+}
+
+- (NSArray *)importedSymbols
+{
+	return nil;
+}
+
+- (NSUInteger)renderTargetArrayIndexType
+{
+	return 0;
+}
+
+// Its relocations: none until set, then the same object, as Metal's function keeps them.
+- (NSArray *)relocations
+{
+	std::lock_guard<std::mutex> hold(_labelLock);
+	return _relocations;
+}
+
+- (void)setRelocations:(NSArray *)relocations
+{
+	std::lock_guard<std::mutex> hold(_labelLock);
+	_relocations = relocations;
+}
+
+// The IR's bytes after its length word, as Metal's function answers them (measured: 810 and 628
+// bytes, the two shaders' IR lengths).
+- (dispatch_data_t)bitcodeData
+{
+	const uint8_t *payload = nullptr;
+	size_t length = 0;
+	RgfxGLIRPayload(_rgfxIR.bytes, &payload, &length);
+	return dispatch_data_create(payload, length, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+}
+
+// A hash of the function's IR, its length word with it: never null, as Metal's (measured), and the
+// same for the same IR.
+- (const void *)bitCodeHash
+{
+	return _irHash;
+}
+
+// Metal's base function ends the process here ("Driver needs to override this"; read from code,
+// _MTLFunction, macOS 27.0.1), as its function of GL IR does, which answers it from the base
+// (measured: the member's owner), and so does this.
+- (id)functionHandle
+{
+	RgfxMetalAssertionFailed("-[_MTLFunction functionHandle]", @"Driver needs to override this");
+}
+
+// The reflection of a function of GL IR: the renderer takes a variant's from its pipeline's
+// (newFunctionWithPluginData:bitcodeType:), so none is made of the function itself. Its forms that
+// take an archive, a pipeline library or a handler are src/RgfxSpiForwarders.mm's.
+- (id)reflectionWithOptions:(NSUInteger)options
+{
+	(void)options;
+	RGFX_UNSUPPORTED("the reflection of a function of GL IR");
+	return nil;
 }
 
 @end

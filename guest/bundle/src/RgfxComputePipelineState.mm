@@ -5,6 +5,8 @@
 
 #import "RgfxComputePipelineState.h"
 
+#import <objc/message.h>
+
 #include <string>
 #include <vector>
 
@@ -97,6 +99,7 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 	RgfxPipelineKey _key;
 	BOOL _deferred;
 	RgfxPipelineAnswer _answer;
+	NSInteger _textureWriteRoundingMode; // the descriptor's (MTLComputePipelineDescriptorSPI)
 }
 
 // The host drops the pipeline as the app lets it go, after any command buffer that names it (each
@@ -283,6 +286,15 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 		_requiredThreadsPerThreadgroup = descriptor.requiredThreadsPerThreadgroup;
 	if ([descriptor respondsToSelector:@selector(forwardProgressUsage)])
 		_forwardProgressUsage = static_cast<NSInteger>(descriptor.forwardProgressUsage);
+	// How the pipeline's texture writes round floats, which Metal's descriptor keeps (0, its
+	// default, where the guest's Metal has no such member) and its pipeline answers. The host
+	// rounds as its default.
+	SEL rounding = sel_registerName("textureWriteRoundingMode");
+	if ([descriptor respondsToSelector:rounding])
+		_textureWriteRoundingMode = ((NSInteger (*)(id, SEL))objc_msgSend)(descriptor, rounding);
+	if (_textureWriteRoundingMode != 0)
+		RgfxLogUnsupported([self class], rounding,
+		                   "a texture write rounding mode other than the default (none on the wire)");
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -442,6 +454,73 @@ NSError *foreignFunctionError(NSString *what, id<MTLFunction> fn)
 - (uint64_t)uniqueIdentifier
 {
 	return static_cast<uint64_t>(reinterpret_cast<uintptr_t>((__bridge void *)self));
+}
+
+// --- MTLComputePipelineStateSPI ------------------------------------------------------------
+// The members of Metal's compute-pipeline SPI that the AMD 5300M's and the Intel 630's pipelines
+// both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m),
+// each as Metal's base pipeline, _MTLComputePipelineState, answers it (read from code, macOS
+// 27.0.1).
+
+// Metal's base pipeline answers gpuResourceID with gpuHandle, and gpuHandle with resourceIndex: so
+// these answer gpuResourceID's value, the one the host numbered the pipeline by.
+- (uint64_t)resourceIndex
+{
+	return [self gpuResourceID]._impl;
+}
+
+- (uint64_t)gpuHandle
+{
+	return [self resourceIndex];
+}
+
+// The low 32 bits of uniqueIdentifier.
+- (uint32_t)getComputeKernelTelemetryID
+{
+	return static_cast<uint32_t>([self uniqueIdentifier]);
+}
+
+// No debug instrumentation, global constants or binaries: the device instruments no shader, and
+// the base answers these for every pipeline.
+- (id)debugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)globalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)globalConstantsSize
+{
+	return 0;
+}
+
+- (NSDictionary *)pipelineBinaries
+{
+	return @{};
+}
+
+// MTLShaderValidationDisabled, as shaderValidation answers.
+- (NSInteger)shaderValidationState
+{
+	return MTLShaderValidationDisabled;
+}
+
+// The descriptor's rounding of floats on texture writes, as the base keeps it.
+- (NSInteger)textureWriteRoundingMode
+{
+	return _textureWriteRoundingMode;
+}
+
+// The base raises an unrecognized selector for this (it sends itself doesNotRecognizeSelector:),
+// and so does this.
+- (id)functionReflectionWithFunctionDescriptor:(id)descriptor
+{
+	(void)descriptor;
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
 }
 
 // --- not on the wire ------------------------------------------------------------------

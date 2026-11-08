@@ -91,4 +91,20 @@ RgfxStencilDescriptor RgfxStencilOf(MTLStencilDescriptor *s)
 	return rid;
 }
 
+// Nor an index or an identifier: Metal's base state raises an unrecognized selector for each (it
+// sends itself doesNotRecognizeSelector:; read from code, _MTLDepthStencilState, macOS 27.0.1),
+// which ends the process on both x86 Macs (measured: macOS 26.7.1, oracle_spi_members answers),
+// and so does this.
+- (uint64_t)resourceIndex
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+- (uint64_t)uniqueIdentifier
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
 @end

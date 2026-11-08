@@ -4222,6 +4222,22 @@ void test_function_array_library_holds_the_functions()
 	CHECK([ours reflectionForFunctionWithName:@"stitch_add"] == nil);
 	CHECK(ours.type == MTLLibraryTypeExecutable && ours.installName == nil && ours.label == nil);
 	CHECK([ours externFunctionNames] == nil);
+	// Its SPI, as Metal's library of a function array answers: the function given as an extern one,
+	// no bitcode and no identifier, and the triple and the validation switch as set.
+	auto ask = [](id object, NSString *member) {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	SEL externNamed = NSSelectorFromString(@"newExternFunctionWithName:");
+	CHECK(((id (*)(id, SEL, id))objc_msgSend)(ours, externNamed, @"stitch_mul") == mul);
+	CHECK(((id (*)(id, SEL, id))objc_msgSend)(ours, externNamed, @"nope") == nil);
+	CHECK(ask(ours, @"bitcodeData") == nil && ask(ours, @"libraryIdentifier") == nil);
+	CHECK(ask(ours, @"overrideTriple") == nil);
+	((void (*)(id, SEL, id))objc_msgSend)(ours, NSSelectorFromString(@"setOverrideTriple:"), @"air64");
+	CHECK([ask(ours, @"overrideTriple") isEqualToString:@"air64"]);
+	SEL validation = NSSelectorFromString(@"shaderValidationEnabled");
+	CHECK(!((BOOL (*)(id, SEL))objc_msgSend)(ours, validation));
+	((void (*)(id, SEL, BOOL))objc_msgSend)(ours, NSSelectorFromString(@"setShaderValidationEnabled:"), YES);
+	CHECK(((BOOL (*)(id, SEL))objc_msgSend)(ours, validation));
 	err = nil;
 	NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory()
 	                                        stringByAppendingPathComponent:@"rgfx-array.metallib"]];
@@ -5233,7 +5249,37 @@ void test_function_members_from_shadow()
 		                        dispatch_data_get_size((dispatch_data_t)metalAir));
 		CHECK([fn rgfxShadow] != nil && ![(id)[fn rgfxShadow] isKindOfClass:[RgfxFunction class]]);
 		CHECK(ask(fn, @"pluginData") == nil);
+		// What Metal's own function reads from its library for its tools, as it answers.
+		for (NSString *member in @[ @"filePath", @"unpackedFilePath", @"debugInstrumentationData",
+		                            @"importedSymbols" ]) {
+			id ours = ask(fn, member), metals = ask(theirs, member);
+			CHECK((ours == nil) == (metals == nil) && (ours == nil || [ours isEqual:metals]));
+		}
+		auto number = [](id object, NSString *member) {
+			return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+		};
+		CHECK(number(fn, @"lineNumber") == number(theirs, @"lineNumber"));
+		CHECK(number(fn, @"renderTargetArrayIndexType") == number(theirs, @"renderTargetArrayIndexType"));
+		// The relocations a link applies: nil until set, then the array set itself.
+		CHECK(ask(fn, @"relocations") == nil);
+		NSArray *relocations = @[ @"relocation" ];
+		((void (*)(id, SEL, id))objc_msgSend)(fn, NSSelectorFromString(@"setRelocations:"), relocations);
+		CHECK(ask(fn, @"relocations") == relocations);
 	}
+
+	// What the library keeps for Metal's tools: no identifier, and the triple (a copy) and the
+	// validation switch as set.
+	CHECK(ask(lib, @"libraryIdentifier") == nil && ask(lib, @"overrideTriple") == nil);
+	NSMutableString *triple = [NSMutableString stringWithString:@"air64-apple-macosx14.0.0"];
+	((void (*)(id, SEL, id))objc_msgSend)(lib, NSSelectorFromString(@"setOverrideTriple:"), triple);
+	[triple appendString:@"-changed"];
+	CHECK([ask(lib, @"overrideTriple") isEqualToString:@"air64-apple-macosx14.0.0"]);
+	((void (*)(id, SEL, id))objc_msgSend)(lib, NSSelectorFromString(@"setOverrideTriple:"), nil);
+	CHECK(ask(lib, @"overrideTriple") == nil);
+	SEL validation = NSSelectorFromString(@"shaderValidationEnabled");
+	CHECK(!((BOOL (*)(id, SEL))objc_msgSend)(lib, validation));
+	((void (*)(id, SEL, BOOL))objc_msgSend)(lib, NSSelectorFromString(@"setShaderValidationEnabled:"), YES);
+	CHECK(((BOOL (*)(id, SEL))objc_msgSend)(lib, validation));
 	CHECK(((NSArray *)ask([lib newFunctionWithName:@"stitch_add"], @"arguments")).count == 2);
 	CHECK(ask([lib newFunctionWithName:@"stitch_add"], @"returnType") != nil);
 	CHECK(ask([lib newFunctionWithName:@"stitch_caller"], @"returnType") == nil);

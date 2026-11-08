@@ -15,9 +15,18 @@
 //     kAsserts and stop there. Run it once, never in a loop through its aborts: forty runs, each
 //     ending on one of Metal's assertions, most likely wedged the oracle's GPU stack in its
 //     kernel (2026-11-08: ioreg's accelerator queries hung after them).
+//   oracle_spi_members ask FILE [answers]  asks only the members FILE lists, one "KIND SELECTOR"
+//     a line, whatever the Mac's protocols list: "DEVICE KIND SELECTOR asked yes OWNER|no" for
+//     each, then, with answers, what each answered getter returns, as above (formattedDescription:
+//     is called with an indent of 0, its line breaks printed as \n). The kind MTLIOSurfaceTexture
+//     is a Managed texture over a 16 x 16 BGRA IOSurface.
+//   oracle_spi_members devices  what each device answers to a few getters, and nothing else: a
+//     check that the Mac's GPU stack answers before any object is made.
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #include <ctype.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,9 +177,42 @@ static void answersOf(const char *dev, const char *kind, id obj, Protocol *p, NS
 	free(a);
 }
 
+// ask's list: the selectors to ask of each kind.
+static NSDictionary<NSString *, NSArray<NSString *> *> *g_ask;
+
+static void ask(const char *dev, const char *kind, id obj, NSArray<NSString *> *list) {
+	for (NSString *s in list) {
+		SEL sel = NSSelectorFromString(s);
+		if ([obj respondsToSelector:sel])
+			printf("%s %s %s asked yes %s\n", dev, kind, s.UTF8String, owner(obj, sel));
+		else
+			printf("%s %s %s asked no\n", dev, kind, s.UTF8String);
+	}
+	fflush(stdout);
+	if (!g_answers) return;
+	for (NSString *s in list) {
+		SEL sel = NSSelectorFromString(s);
+		if (![s isEqualToString:@"formattedDescription:"]) {
+			answer(dev, kind, obj, sel);
+			continue;
+		}
+		if (![obj respondsToSelector:sel]) continue;
+		printf("C %s %s %s\n", dev, kind, s.UTF8String);
+		fflush(stdout);
+		NSString *v = ((NSString * (*)(id, SEL, NSUInteger))objc_msgSend)(obj, sel, 0);
+		v = [v stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
+		printf("A %s %s %s @ %s\n", dev, kind, s.UTF8String, v ? v.UTF8String : "nil");
+	}
+}
+
 static void check(const char *dev, const char *proto, id obj) {
+	if (g_ask && g_ask[@(proto)].count == 0) return;
 	if (!obj) { printf("%s %s (no object)\n", dev, proto); return; }
 	printf("# %s %s class %s\n", dev, proto, class_getName([obj class]));
+	if (g_ask) {
+		ask(dev, proto, obj, g_ask[@(proto)]);
+		return;
+	}
 	NSMutableSet<NSString *> *seen = [NSMutableSet set];
 	walk(dev, obj, objc_getProtocol(proto), seen);
 	walk(dev, obj, objc_getProtocol([@(proto) stringByAppendingString:@"SPI"].UTF8String), seen);
@@ -191,10 +233,33 @@ static NSString *const kSource =
 
 int main(int argc, char **argv) {
 	@autoreleasepool {
-		g_answers = argc > 1 && !strcmp(argv[1], "answers");
+		const BOOL devices = argc > 1 && !strcmp(argv[1], "devices");
+		if (argc > 2 && !strcmp(argv[1], "ask")) {
+			NSString *text = [NSString stringWithContentsOfFile:@(argv[2]) encoding:NSUTF8StringEncoding error:nil];
+			if (!text) { fprintf(stderr, "oracle_spi_members: cannot read %s\n", argv[2]); return 2; }
+			NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *lists = [NSMutableDictionary dictionary];
+			for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+				NSArray<NSString *> *w = [line componentsSeparatedByString:@" "];
+				if (w.count != 2 || [line hasPrefix:@"#"]) continue;
+				if (!lists[w[0]]) lists[w[0]] = [NSMutableArray array];
+				[lists[w[0]] addObject:w[1]];
+			}
+			g_ask = lists;
+			g_answers = argc > 3 && !strcmp(argv[3], "answers");
+		} else {
+			g_answers = argc > 1 && !strcmp(argv[1], "answers");
+		}
 		for (id<MTLDevice> d in MTLCopyAllDevices()) {
 			NSString *name = [d.name stringByReplacingOccurrencesOfString:@" " withString:@"_"];
 			const char *dev = name.UTF8String;
+			if (devices) {
+				printf("%s class %s registryID 0x%llx location %lu lowPower %d headless %d removable %d "
+				       "unified %d workingSet %llu allocated %lu\n",
+				       dev, class_getName([(id)d class]), d.registryID, (unsigned long)d.location, d.lowPower,
+				       d.headless, d.removable, d.hasUnifiedMemory, d.recommendedMaxWorkingSetSize,
+				       (unsigned long)d.currentAllocatedSize);
+				continue;
+			}
 			printf("# device %s class %s\n", dev, class_getName([(id)d class]));
 			check(dev, "MTLDevice", d);
 			NSError *e = nil;
@@ -216,6 +281,16 @@ int main(int argc, char **argv) {
 			td.storageMode = MTLStorageModePrivate;
 			id<MTLTexture> tex = [d newTextureWithDescriptor:td];
 			check(dev, "MTLTexture", tex);
+			if (g_ask[@"MTLIOSurfaceTexture"].count) {
+				IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef) @{
+					(id)kIOSurfaceWidth : @16, (id)kIOSurfaceHeight : @16, (id)kIOSurfaceBytesPerElement : @4,
+					(id)kIOSurfacePixelFormat : @((uint32_t)'BGRA')});
+				MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:16 height:16 mipmapped:NO];
+				sd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+				sd.storageMode = MTLStorageModeManaged;
+				check(dev, "MTLIOSurfaceTexture", surface ? [d newTextureWithDescriptor:sd iosurface:surface plane:0] : nil);
+				if (surface) CFRelease(surface);
+			}
 			id<MTLBuffer> buf = [d newBufferWithLength:4096 options:MTLResourceStorageModeShared];
 			check(dev, "MTLBuffer", buf);
 			MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
