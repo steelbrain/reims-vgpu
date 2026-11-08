@@ -1,82 +1,73 @@
 # Running QEMU on the library
 
-`vendor/qemu` is QEMU with `apple-gfx` in C on this library's C API, and
-with the `vmapple` machine working on a macOS 26 host. `make qemu` builds
-its `qemu-system-aarch64` on the checkout's library, linked statically
-through pkg-config, and `make vm` boots a macOS guest on it. On Linux the
-same `apple-gfx` builds for KVM, where x86-64 macOS guests drive
-`apple-gfx-pci`. This file says how QEMU is built and uses the library, how
-a VM is run and driven, and the measured facts QEMU's side relies on.
+`vendor/qemu` is QEMU with `reims-graphics-pci`, the GPU device our own
+kexts drive (`guest/`), in C on this library's C API. `make qemu` builds
+its `qemu-system-x86_64` on the checkout's library, linked statically
+through pkg-config. On Linux it runs x86-64 macOS guests under KVM, and
+users run them with `reims-ctl`, whose installer,
+`scripts/install-ctl.sh`, builds the same QEMU on the library's Vulkan
+platform. This file says how QEMU is built and uses the library, and the
+measured facts QEMU's side and the guests rely on.
 
-The suite never runs QEMU, so a VM boot is the only check of QEMU's side of
-the API ([lessons.md](lessons.md)). Each measurement below names its host
-and guest. Anything not measured is marked **unknown**.
+arm64 macOS guests, on QEMU's `vmapple` machine, are not built now: their
+display was Apple's paravirtualized GPU, which this tree no longer has.
+They come back with Ambrosia, our own arm64 firmware ("arm64 guests",
+below).
+
+No test runs QEMU, so a VM boot is the only check of QEMU's side of the
+API ([lessons.md](lessons.md)). Each measurement below names its host and
+guest. Anything not measured is marked **unknown**.
 
 ## The QEMU build
 
 ```sh
-make qemu          # cargo xtask dist, then build/qemu/qemu-system-aarch64
+make qemu          # cargo xtask dist, then build/qemu/qemu-system-x86_64
 ```
 
-`make qemu` runs `cargo xtask dist`, which writes the library into
-`<target>/dist` (`target/dist`, or under `CARGO_TARGET_DIR`;
-[architecture.md](architecture.md) 11.3), then configures `vendor/qemu` out
-of tree in `build/qemu`:
+`make qemu` runs `cargo xtask dist`, which writes the library into the dist
+tree: `<target>/dist` on a Mac, where the library runs on Metal, and
+`<target>/dist-vulkan` on Linux, where it runs on Vulkan (`target`, or
+`CARGO_TARGET_DIR`). Then it configures `vendor/qemu` out of tree in
+`build/qemu`, on Linux:
 
 ```sh
-PKG_CONFIG_PATH=$PWD/target/dist/lib/pkgconfig vendor/qemu/configure \
-  --target-list=aarch64-softmmu --enable-hvf --enable-pvg --enable-gnutls \
-  --disable-docs
+PKG_CONFIG_PATH=$PWD/target/dist-vulkan/lib/pkgconfig vendor/qemu/configure \
+  --target-list=x86_64-softmmu --enable-reims-vgpu --disable-docs
 ```
 
-`--enable-gnutls` gives QEMU the AES ciphers `vmapple`'s AES engine needs,
-and stops configure where gnutls is missing ("A QEMU without a crypto
-library", below). It configures once, and again whenever `QEMU_CONFIGURE`
-(extra configure options) is set, or `config.status` came from another
-source or another `PKG_CONFIG_PATH`, or names `--apple-gfx-backend` or
-`--pvg-framework`, which vendor/qemu's configure does not take, or the dist
-tree's `reims-vgpu.pc` differs from the copy it keeps of the one it
-configured with (`build/qemu/reims-vgpu.pc.configured`). Then it builds
-`qemu-system-aarch64`, which QEMU's build signs ad hoc with
-`accel/hvf/entitlements.plist` (`com.apple.security.hypervisor`) and no
-hardened runtime. configure fetches meson subprojects (`dtc`,
+It configures once, and again whenever `QEMU_CONFIGURE` (extra configure
+options) is set, or `config.status` came from another source or another
+`PKG_CONFIG_PATH`, or names an option vendor/qemu's configure no longer
+takes (`--enable-pvg`, `--apple-gfx-backend`, `--pvg-framework`) or the
+`aarch64-softmmu` target an earlier `make qemu` built, or the dist tree's
+`reims-vgpu.pc` differs from the copy it keeps of the one it configured
+with (`build/qemu/reims-vgpu.pc.configured`). Then it builds
+`qemu-system-x86_64`. configure fetches meson subprojects (`dtc`,
 `keycodemapdb`, ...) into the source's `subprojects/`, which its own
 `.gitignore` covers.
 
 - **The library.** configure records `PKG_CONFIG_PATH` in `config.status`,
   and meson keeps it as its `pkg_config_path`, so ninja's own reconfigures
-  find the package too. The `pvg` dependency (`--enable-pvg`) is
-  `dependency('reims-vgpu', method: 'pkg-config', static: true)`, so QEMU
-  links `libreims_vgpu.a` and the system frameworks its `Libs.private`
-  names, and records no path to the library: dyld loads nothing of it.
-  meson warns that `-lSystem`, `-liconv` and `-lobjc` have no static
-  archive; they stay the system's dylibs.
+  find the package too. The `reims_vgpu` dependency (`--enable-reims-vgpu`)
+  is `dependency('reims-vgpu', method: 'pkg-config', static: true)`, looked
+  for on Linux and macOS hosts, so QEMU links `libreims_vgpu.a` and what its
+  `Libs.private` names, and records no path to the library: nothing of it
+  is loaded from a file at run time.
 - **The package's flags are configure's.** meson reads `reims-vgpu.pc` at
   configure and keeps what it read, so a build configured against an older
-  package relinks a newer archive without the frameworks it added to
+  package relinks a newer archive without the libraries it added to
   `Libs.private`, and fails to link; hence the reconfigure when the package
   changes ([lessons.md](lessons.md)).
-- **The option ROM.** meson installs the file the package's `optionrom`
-  variable names into QEMU's data directory as `ReimsVgpu.rom`,
-  `apple-gfx-pci`'s default `romfile`, and configure links it into
-  `build/qemu/qemu-bundle`, where a QEMU run from the build tree finds it.
-  `make qemu` fails if it is not there. A package that names no such file
-  gets a warning from meson, and `apple-gfx-pci` then needs `romfile=` to
-  realize.
-- **The machines.** `hw/display/meson.build` builds `apple-gfx.c` with
-  `apple-gfx-pci.c` (`CONFIG_MAC_PVG_PCI`) or with `apple-gfx-mmio.c`
-  (`CONFIG_MAC_PVG_MMIO`, Arm targets only). `hw/vmapple/vmapple.c`
-  creates `apple-gfx-mmio`, and the machine depends on `MAC_PVG`
-  (`hw/vmapple/Kconfig`), so a build without `apple-gfx` leaves it out.
-- **Linux hosts.** configure looks for the package on Linux too, and sets
-  `MAC_PVG` for the targets KVM runs, as it does for HVF's on macOS: on an
-  x86-64 host that is `apple-gfx-pci`. `apple-gfx-activity.m` is macOS's;
-  Linux builds its stub, `apple-gfx-activity-stub.c`.
-
-A predecessor's QEMU, for a pair of boots ("Running the vmapple VM on
-reims-vgpu", below), is `make qemu` in a worktree of its own. That worktree
-gets its own clone of `vendor/qemu`, never a `git submodule update` of the
-main checkout's module ([lessons.md](lessons.md)).
+- **The device.** Where the library is found, `CONFIG_REIMS_GRAPHICS` is
+  set for every target, whatever its accelerator, and
+  `hw/display/meson.build` builds `reims-graphics-pci.c`
+  (`CONFIG_REIMS_GRAPHICS_PCI`). configure's summary says whether it found
+  reims-vgpu. The device has no default option ROM: `reims-ctl` gives it
+  `firmware/prebuilt/ReimsGraphics.rom` as its `romfile`.
+- **Hosts.** On Linux the guest runs under KVM. On a Mac the same
+  `qemu-system-x86_64` runs it under TCG, on the Metal platform, which
+  realizes the device and checks it paused ("The reims-graphics device",
+  below).
 
 ## What vendor/qemu carries
 
@@ -87,221 +78,26 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 
 | what | commits |
 |---|---|
-| `vmapple` on a macOS 26 host: patches 1 to 6 of the RFC v7 series "vmapple: make it work on the latest macOS release" (Mohamed Mediouni); patch 7, which needs SIP disabled, is left out | `e181197cc2` |
-| HVF: emulate the data aborts that report ISV=0 (load and store pairs, SIMD&FP, indexed loads and stores), which macOS 13 and later guests make at MMIO during early boot | `663b9b9c0b` |
-| HVF: place the in-kernel vGIC at the machine's own GIC bases, so `kernel-irqchip=on` works for `vmapple` | `4a2e2b3967` |
-| `vmapple` depends on `MAC_PVG`, so it is built only with `apple-gfx` | `f7a1765826` |
-| `apple-gfx` in C on the library's C API (`hw/display/apple-gfx.c`, `apple-gfx-mmio.c`, `apple-gfx-pci.c`), found through pkg-config, in place of upstream's `apple-gfx` on ParavirtualizedGraphics | `a97f7aee42`, `acdcc169e9`, `e4fedf2708` |
-| `apple-gfx-pci`'s default `romfile`, `ReimsVgpu.rom`, installed from the package's `optionrom` | `08d0d0aca7`, `27c55651b3` |
-| the thread pool keeps at least one thread when a job finished before `thread_pool_submit_immediate` resized it: a backport of upstream's `2566b6e902`, which the merge of upstream master brings too ("MMIO", below) | `850b5a4bb4` |
-| `apple-gfx`'s `displays` property: up to 8 displays a device, one console each; the cursor callbacks' work through one ordered queue and one BH | `b8842e1a50` |
-| window mode: under `-display none`, each display gets a window of the library's, whose input reaches the guest's USB tablet and keyboard; closing it powers the VM off ("Window mode", below); the guest's mode 1920x1080 by default; `resolution=<w>x<h>@<ppi>` tells the guest that density for the mode, and a density at which the guest's scale is not known from it, or a width told over 65535 mm, fails the realize ("A chosen density's boundary", below) | `54fd32d1c3`, `4ec8f35655`, `ffb8ae8b17`, `c720eb298d`, `e4228ee079`, `c1e0d866ba`, `1dc0b093c9`, `ffbf1f3cee` |
-| `vmapple` builds on upstream master: the aarch64 machine interface upstream removed is gone from it | `450e03eed2` |
-| `vmapple`'s secondary CPUs start with the pointer authentication keys of the CPU that powers them on (an opt-in Arm CPU property, `cpu-on-copies-pauth-keys`, which `vmapple` sets), so a macOS guest runs on every vCPU ("Every vCPU of the guest", below) | `f116a9d560`, `c912618391` |
-| `apple-gfx`'s dirty source under KVM: the VM's fd and four callbacks (start the RAM's log, flush the vCPUs' page-modification logs through `CPUState.kvm_run_seq`, walk the logged slots, take QEMU's own writes from its `DIRTY_MEMORY_VGA` bitmap), with which the library reads and clears the guest RAM's dirty log itself ("Linux hosts: the dirty source", below) | `01650c7f08` |
-| smooth scrolling: the input layer's `scroll` events (`qemu_input_queue_scroll`, `qemu_input_scrolls_smoothly`, QMP `input-send-event`); `usb-vmapple-tablet`, Virtualization.framework's USB pointing device, which a macOS guest scrolls as a trackpad; `vmapple`'s `tablet` property, `usb-vmapple-tablet` by default; the windows' scroll callback sent as smooth scroll events, or as notches to a device without them ("Measured facts about driving it", below) | `840feb5ced`, `c2f5832f32`, `674af72fe2`, `3dd8c62445`, `da640879f0`, `e0ce93da92`, `d46ebaa252`, `61f7de5fc1`, `fc46f8bf02`, `797c366c0f` |
-| vmapple boots macOS 14 and later guests, with no option: when iBoot enters the kernel, which the machine sees through `hvf_arm_exec_fault`, a hook HVF calls on an instruction fetch's stage 2 fault, it takes the kernel's waits on failed pointer authentication hypercalls out of its code, and adds `/filesystems` with `DoNotUseSEP` to a device tree that has no `/filesystems` ("macOS 14 and later guests", below); `vmapple.rst`'s "Guest versions" | `a24c8eadfa`, `e1c37ea4d4` |
-| `apple-gfx` names each display "Reims vGPU" to the guest, which saw "QEMU display" before | `3ca83dca38` |
+| the reims-graphics device's transport, for the library's own guest driver: `reims-graphics-pci` (1234:5247, class 0x0380), on the library's graphics device (`rvg_graphics_device_*`); BAR 0 its registers with MSI-X from 0x800, the doorbell an ioeventfd, BAR 2 the library's region as RAM, its allocations dirty-logged for the scanout; built for every target where the library is found (`CONFIG_REIMS_GRAPHICS`), x86-64 under TCG on a Mac among them ("The reims-graphics device", below) | `77ee6c6b`, `bf69f959` |
+| the device gives the library the guest RAM's map and the files behind it | `abb94a98` |
+| the device raises its interrupt through an irqfd where KVM's in-kernel irqchip takes MSI-X through one | `36deb281` |
+| a command buffer is taken, and answered, on the vCPU that rings its queue's doorbell, with the plain register write | `f2c7e2a5`, `67cc08ad`, `5f459785` |
+| the console shows the display (`rvg_graphics_device_read_display`), so QMP's `screendump` saves the guest's frame, and has the guest's cursor | `70a9a466`, `c119b802` |
+| the device's realize warns where BAR 2 would get no address: on a PC machine with RAM at 1 GiB ("The reims-graphics device", below) | `22ae1fd1` |
+| the window opens at the `resolution` property's size, 1920x1080 without it | `93fb0692` |
 | file-backed guest RAM (the memfd of `reims-ctl`'s VMs) mapped 2 MiB-aligned on Linux, as anonymous RAM is, so transparent huge pages can back it where the host allows them ("Linux hosts: huge pages for guest RAM", below) | `1b41f5f5db` |
-| `apple-gfx` builds on Linux hosts, for KVM: each range of the device's memory map has its own host address (q35's RAM above 4 GiB is an alias partway into its block) and names the file behind it, which the realize requires on Linux; the trace lists each range, and configure's summary says whether it found reims-vgpu ("apple-gfx on reims-vgpu", below). Its MMIO accesses call the library on the vCPU's thread, with no hop to the device's pool, and the GPU device's region takes them without the BQL under KVM ("MMIO", below). It reads each frame's pixels on the pool thread, and renders the console's surface only while a display change listener shows it, or when the display system asks ("Frames", below). It holds a user-initiated activity from its realize to its finalize, so App Nap never slows a VM whose window is hidden or behind another application's (`hw/display/apple-gfx-activity.m`; "App Nap", below) | `a771139e82` |
-| the library's repository name in `vmapple.rst` and `meson.build` | `f16664ed10` |
-| `apple-gfx-pci`'s BAR 2, a window onto the EFI framebuffer: one alias of the machine's RAM, moved as the guest writes the framebuffer's start, so that a macOS installer or recovery image, which has no driver of the device's own, takes the boot framebuffer over (the `efi-framebuffer-bar` property, on by default; "BAR 2" in "apple-gfx on reims-vgpu", and "x86-64 macOS guests: installers and recovery", below) | `1a72df9849` |
 | `isa-applesmc` answers GET_KEY_BY_INDEX, listing its keys by name and 0xb8 past the last, so the key walk macOS 15.4 and later make at boot ends ("x86-64 macOS guests: the SMC", below) | `8d795445f2` |
-| vmapple boots macOS 27 guests: `vmapple-virtio-blk-pci` links its capabilities in address order and carries Apple's vendor capability, and `virtio-net-pci` links them in address order with `x-ascending-capabilities`, which `vmapple` turns on (Jesus Martínez, co-author; "macOS 27 guests", below) | `d235e51310`, `fbda9c8b28` |
-| the IOSurface device over PCI for x86-64 guests that run Apple's arm64 GPU driver: `apple-gfx-iosurface-pci` (106b:eeef, ours), whose presence is the only switch: `apple-gfx-pci` isolates a task, and offers argument buffers, only while the guest's mapper has a descriptor table, and has no option for either; and a reset of the IOSurface device's registers ("The IOSurface device over PCI", below) | `bd95509aa3` |
-| the VideoToolbox device's transport for macOS guests' AppleVideoToolboxParavirtualization: `apple-videotoolbox-pci` (106b:1a03, Apple's IDs; subsystem 106b:1a03 and class 0x120000 ours), modern virtio, two queues, on the library's video device (`rvg_video_device_*`), its IOSurfaces resolved through the process's latest IOSurface device, with no properties: the library picks what it decodes and encodes with, on the GPU its GPU device runs on; the guest-to-host queue holds 1024 descriptors, where Apple's hold 256, so that an x86-64 guest's largest message fits; a readable part over 16 MiB is answered -12904 before it is copied; each of its elements answered on a worker thread of the device's, in the guest's order, each status before the messages sent while it was answered ("The VideoToolbox device", below) | `4895365e5b` |
-| the M2 scaler device's transport for macOS guests' AppleM2ScalerParavirtDriver: `apple-m2scaler-pci` (106b:1a0b, subsystem 106b:1a0b and class 0x1200, Apple's), modern virtio, one queue, on the library's scaler device (`rvg_scaler_device_*`), the guest's memory reached through the device's DMA address space, with no properties, as the VideoToolbox device; realized on every host, it refuses the guest's features where the host has no GPU for it; a readable part over 64 KiB is a needs-reset before it is copied; each element answered on a worker thread of the device's, in the guest's order ("The M2 scaler device", below) | `4895365e5b` |
-| the reims-graphics device's transport, for the library's own guest driver: `reims-graphics-pci` (1234:5247, class 0x0380), on the library's graphics device (`rvg_graphics_device_*`); BAR 0 its registers with MSI-X from 0x800, the doorbell an ioeventfd, BAR 2 the library's region as RAM, its allocations dirty-logged for the scanout; built for every target where the library is found (`CONFIG_REIMS_GRAPHICS`), x86-64 under TCG on a Mac among them ("The reims-graphics device", below) | `77ee6c6b` |
-| `vmapple`'s AES engine refuses to realize in a QEMU built with no crypto library, which has no AES: QEMU stops at start with an error that names what the build lacks, where a macOS guest would hang as it mounted its root volume ("A QEMU without a crypto library", below) | `c7a4f0700f` |
 | QMP's `screendump` in PPM, its default format, writes rows of width × 3 bytes. Upstream's wrote each row with its line buffer's stride, which pixman rounds up to 4 bytes, so a display whose width is not a multiple of 4 (a window of 3662 × 2039 pixels) read back sheared, its colours rotating from row to row; PNG's rows were right. `tests/qtest/display-screendump-test.c` dumps `bochs-display` at widths of 64, 66 and 67 | `23198e4b79` |
+| the input layer's smooth `scroll` events (`qemu_input_queue_scroll`, `qemu_input_scrolls_smoothly`, QMP `input-send-event`); a device without them (`usb-tablet`, which every x86-64 VM has) gets the event's wheel notches | `840feb5ced` |
+| the thread pool keeps at least one thread when a job finished before `thread_pool_submit_immediate` resized it: a backport of upstream's `2566b6e902`, which the merge of upstream master brings too | `850b5a4bb4` |
+| QMP's `x-query-virtio-status` and HMP's `info virtio-status` no longer crash on a virtio device: a patch from upstream's list (Vladimir Sementsov-Ogievskiy) that fixes upstream's `1ee0bc0c9bf0` | `d151bcd9` |
+| `vmapple`, not built now ("arm64 guests", below): patches 1 to 6 of the RFC v7 series "vmapple: make it work on the latest macOS release" (Mohamed Mediouni), and the branch's commits for HVF's ISV=0 data aborts and in-kernel vGIC, the secondary CPUs' pointer authentication keys, macOS 14 and later and macOS 27 guests, the AES engine's refusal without a crypto library, and `usb-vmapple-tablet`, Virtualization.framework's USB pointing device | `e181197cc2`, `663b9b9c0b`, `4a2e2b3967`, `450e03eed2`, `f116a9d560`, `c912618391`, `c2f5832f32`, `674af72fe2`, `da640879f0`, `e0ce93da92`, `d46ebaa252`, `61f7de5fc1`, `fc46f8bf02`, `a24c8eadfa`, `e1c37ea4d4`, `d235e51310`, `fbda9c8b28`, `c7a4f0700f` |
+| apple-gfx, Apple's paravirtualized GPU device on the library, with its windows, its option ROM, its IOSurface device and the VideoToolbox and M2 scaler devices, removed: `vmapple` stays in the tree but is not built, since its display was `apple-gfx-mmio` and its Kconfig depends on `MAC_PVG`, which nothing sets now; the option that finds the library is `reims_vgpu` (`--enable-reims-vgpu`) | `eb36a099` |
 
-The branch's other commits are earlier ways of building `apple-gfx`
-(`3a04f9e0b5`, `7e2d0fa93e`, `53c555c179`), which `a97f7aee42` and
-`acdcc169e9` replace, and `cbb749d421`, an HVF workaround that `481e881b5c`
-reverts, upstream having fixed the same assertion.
-
-QEMU does not release the device at its exit: the release waits for the
-guest's FIFO work, which never completes once the vCPUs have stopped, so a
-QMP `quit` of a running guest would not exit.
-
-`docs/system/arm/vmapple.rst` says how to build QEMU with `apple-gfx` on
-the library, and describes the `displays` property and window mode.
-
-**Measured** on the M3 Max, paused (`-S`, no guest code run) and headless
-(`REIMS_VGPU_WINDOW=0`):
-- `vmapple` with blank aux and root images realizes `apple-gfx-mmio`, its
-  memory map one range (0x70000000, 4 GiB, no file); HMP `xp` reads the GPU
-  device's registers and the IOSurface registers 0x30211000 and 0x30211008
-  as 0.
-- `virt` with `apple-gfx-pci` realizes it as 106b:eeee with BAR 0 (16 KiB),
-  BAR 2 (64 MiB, 32-bit, prefetchable) and the ROM's BAR 6, and without
-  BAR 2 under `efi-framebuffer-bar=off`. `displays=9`, `resolution=12x` and
-  `resolution=1280x800@220` each fail the realize with its message.
-- Each resets at `system_reset` and exits 0 at QMP `quit`.
-
-`scripts/internal/qtest_iosurface_pci.py` checks `apple-gfx-iosurface-pci`,
-and `apple-gfx-pci`'s IDs, through QEMU's qtest accelerator with no guest;
-its header lists the checks and how to run them. Its checks of the realize
-without a `gpu` link, of `apple-gfx-pci`'s missing isolation properties and
-of the reset have not run yet; the others pass on a Linux host with the
-library on lavapipe (**measured**).
-
-## The VideoToolbox device
-
-`apple-videotoolbox-pci` (`hw/display/apple-videotoolbox-pci.c`) is the
-transport of the paravirtualized VideoToolbox device, 106b:1a03, which a
-macOS guest's AppleVideoToolboxParavirtualization drives; the library's
-video device (`rvg_video_device_*`, `crates/reims-vgpu/src/video.rs`) is
-its host side, whose session is reims-vgpu-video-core's host session
-(`crates/reims-vgpu-video-core`). The device has no properties: the
-library picks what it decodes and encodes with
-([video/backends.md](video/backends.md), "Picking a backend"). On macOS
-that is VideoToolbox. On Linux it is the GPU the library's GPU device
-(`apple-gfx-pci`) runs on, the one the Vulkan loader's environment picks:
-NVIDIA's NVDEC and NVENC on an NVIDIA GPU where CUDA opens it, else VA-API
-on its render node, and the host's first hardware GPU that offers video,
-discrete ones first, where that GPU is a software rasterizer or offers
-none. The library logs its choice and why; where no backend opens, the
-guest is offered no codec and decodes in software. A VM takes it as
-`-device apple-videotoolbox-pci`; reims-ctl gives every VM on reims-vgpu
-one, an x86-64 VM's at slot 8, unless its settings turn video
-acceleration off, which leaves out this device and the M2 scaler.
-Queue 0's elements go to `rvg_video_device_deliver`, gathered across
-descriptors, and its status is scattered into the writable part; one whose
-readable part is over 16 MiB (`RVG_VIDEO_MAX_MESSAGE_SIZE`) is answered
-`RVG_VIDEO_ALLOCATION_FAILED`, -12904, from its descriptors' sizes and is
-never copied, as the library answers it, since a guest's descriptors may
-add up to many times the host's memory. Queue 1
-takes the session's messages from a ring as the guest posts buffers.
-DRIVER_OK starts the session, and a reset ends it.
-`REIMS_VGPU_LOG=warn,reims_vgpu::video=debug` shows each message both ways.
-
-- **The worker.** The library answers each element on a thread of the
-  device's own, as Apple's host answers them on the device's own queue,
-  so the main loop runs through it: a `jdec` waits for its JPEG decode,
-  and a session's end for the session's thread, 10 s at most each. As the
-  scaler's worker does ("The M2 scaler device", below), the notification
-  pops one element and hands it over, and a bottom half writes the status
-  back on the main loop and only then pops the next, so the elements are
-  answered one at a time, in the guest's order. The ring of host messages
-  is not drained while an element is with the worker, so a message the
-  session sends while answering one reaches the guest after that
-  element's status, as Apple's replies, queued behind the handler on the
-  device's queue, do. A reset and the unrealize wait, under the BQL, for
-  the element with the worker, and discard its status; the worker never
-  takes the BQL, and neither `send_to_guest` nor the IOSurface device's
-  queue waits for anything that holds it.
-
-The guest's kext waits for its IOSurface mapper's service before it sets
-DRIVER_OK, so on q35 the device needs `apple-gfx-iosurface-pci`.
-
-Queue 0 holds 1024 descriptors, QEMU's most (`VIRTQUEUE_MAX_SIZE`), and
-queue 1 holds 256. Apple's device holds 256 on each, the most its virtio
-base takes. The guest's AppleVirtIO sends each message as a direct chain,
-one descriptor per physical segment, sizes the queue by what the device
-reports, and refuses a message of more segments than that with
-kIOReturnBadArgument, so the message never reaches the device.
-VideoToolbox cuts a sample into messages of up to 0x200000 bytes: 128 of
-an arm64 guest's 16 KiB pages, but 512 of an x86-64 guest's 4 KiB, where
-256 descriptors carry 1 MiB at worst. Queue 1's buffers are 0x4000 bytes,
-so it keeps Apple's size.
-
-Realized paused on q35 under KVM, the device is 106b:1a03, class
-0x120000, subsystem 106b:1a03, with BAR 1 (4 KiB, MSI-X, 3 vectors) and
-BAR 4 (16 KiB, 64-bit prefetchable: common, ISR, device and notify at 0x0
-to 0x3000), its capabilities linked 0x40 to 0x98 in ascending order, and
-it offers `VERSION_1` and no device feature (**measured**).
-
-**Measured** with x86-64 macOS 26.7.1 guests running the x86-64 port of
-the guest's kext, on an RX 7900 XTX:
-- with 256 descriptors on queue 0, AV1 samples of 1.9 to 2.1 MB failed in
-  the guest with -536870206 (0xe00002c2, kIOReturnBadArgument) and never
-  reached the device; with 1024, every AV1, H.264 and HEVC stream tried
-  decoded in hardware and matched its reference frame for frame, a
-  2,101,248-byte sample arriving as a fragment of 0x200000 bytes (flags
-  0x10) and a last part of 4,512;
-- the first JPEG decode after the GPU has idled takes about 0.9 s on that
-  host. Answered on the main loop, it left QMP's `query-status`
-  unanswered that long; on the worker, no exchange during the decodes
-  takes over 3.3 ms.
-
-## The M2 scaler device
-
-`apple-m2scaler-pci` (`hw/display/apple-m2scaler-pci.c`) is the transport
-of the paravirtualized M2 scaler device, 106b:1a0b, which a macOS guest's
-AppleM2ScalerParavirtDriver drives for IOSurfaceAccelerator; the library's
-scaler device (`rvg_scaler_device_*`, `crates/reims-vgpu/src/scaler.rs`)
-is its host side, over reims-vgpu-video-core's scaler, transforming with
-the library's own kernel on the GPU it draws with: Metal's on macOS, the
-Vulkan platform's on Linux, any GPU ([video/scaler.md](video/scaler.md),
-"The kernel"). It has no properties. Where that opens no device, or the
-device refuses the kernel, the device is realized all the same, so a VM
-given it starts on every host: `rvg_scaler_device_scales` answers false,
-and the device's `validate_features` refuses the guest's features
-(`-ENOTSUP`, traced as `apple_m2scaler_features_refused`), so FEATURES_OK
-stays unset. The guest kext reads its status back, fails its start before
-DRIVER_OK, writes FAILED and registers no service, and the guest's
-IOSurfaceAccelerator does without it ([video/scaler.md](video/scaler.md),
-"A host without a GPU"). A VM takes it as `-device apple-m2scaler-pci`;
-reims-ctl gives every VM on reims-vgpu one, an x86-64 VM's at slot 9,
-unless its settings turn video acceleration off.
-Each queue element's readable part, at most 64 KiB, is copied into one
-buffer for `rvg_scaler_device_process`, which answers in place. A longer
-one is a needs-reset before anything is allocated or copied, as the
-library refuses it too (`scaler::MAX_REQUEST_SIZE`); Apple's host copies
-any size, and the bound is ours, so that a guest's descriptors cannot have
-QEMU allocate and copy gigabytes. The guest kext's largest request is 0x608
-bytes. A reply goes into the writable part with a used length of its size;
-a needs-reset is `virtio_error`, with the element detached and no reply; an
-end of the VM aborts, as Apple's host ends its process. DRIVER_OK starts
-the device and a reset resets it.
-`REIMS_VGPU_LOG=info,reims_vgpu::scaler=debug,reims_vgpu_video_core::scaler=debug`
-logs each request and transform.
-
-- **The worker.** The library answers each element on a thread of the
-  device's own, so the main loop runs through a transform: a 16384x16384
-  turn takes 3 to 4 s of the GPU. The notification pops one element and
-  hands it over; a bottom half returns the worker's answer on the main
-  loop and only then pops the next, so the elements are answered one at a
-  time, in the guest's order, as Apple's handler answers them. A
-  needs-reset is set from that bottom half; an end of the VM aborts on the
-  worker. A reset and the unrealize wait, under the BQL, for the element
-  with the worker, and discard its answer; the worker never takes the BQL.
-- **The guest's memory.** The capabilities' address and the side
-  buffers' lists are guest-physical. The device answers the library's
-  `is_ram`, `read` and `write` on the worker, on `VirtIODevice.dma_as`:
-  each piece of the range mapped with a `MemoryRegionCache`, every one
-  RAM and not a RAM device or none of it, and the bytes copied through
-  the same caches, so the check and the copy see the same memory and no
-  access dispatches to a region that would take the BQL. At most eight
-  pieces, and a range whose end wraps is refused before the walk, which
-  only adds what each cache took and subtracts it from what is left, so a
-  guest's 64-bit length cannot overflow it. An
-  IOMMU's address space is not translated by the caches: behind one every
-  request naming the guest's memory would be refused; the guests have
-  none.
-- **A needs-reset at DRIVER_OK.** `virtio_set_status` writes the status
-  after the device's `set_status` returns, so a `virtio_error` from inside
-  it is overwritten and lost. Where the start fails, a bottom half sets
-  DEVICE_NEEDS_RESET once the status is written; the reset cancels it.
-- **The virtio ID** is QEMU's alone: `VIRTIO_ID_VIDEO_ENCODER`, one
-  `hw/virtio/virtio-qmp.c` lists (an ID it does not list reaches its
-  `g_assert_not_reached`), with Apple's PCI IDs written over the one
-  virtio-pci derives, as `apple-videotoolbox-pci` does with
-  `VIRTIO_ID_VIDEO_DECODER`.
-
-The guest kext waits for its IOSurface mapper's service, as the video
-kext does, so on q35 the device needs `apple-gfx-iosurface-pci`. The
-guest's IOSurfaceAccelerator looks the kext up by its own class only
-where `kern.hv_vmm_present` reads 1, and by Apple's hardware scaler's,
-`AppleM2ScalerCSCDriver`, where an OpenCore hides the VM (reims-util's
-default). The kext's x86-64 port answers to both names, so either guest
-uses the device; Apple's build of it is bound and unused in a guest that
-hides its VM.
-
-Realized paused on q35 under KVM, the device is 106b:1a0b, class
-0x120000, subsystem 106b:1a0b, with BAR 1 (4 KiB, MSI-X) and BAR 4
-(16 KiB, 64-bit prefetchable) (**measured**).
+The branch's other commits are the apple-gfx work `eb36a099` removes, and
+`cbb749d421`, an HVF workaround that `481e881b5c` reverts, upstream having
+fixed the same assertion. `docs/system/arm/vmapple.rst` describes the
+machine as it last ran here, and says it is not built.
 
 ## The reims-graphics device
 
@@ -334,25 +130,25 @@ is its transport:
 - **The guest's RAM**: where every range of it is a shared file in pages of
   the host's size (the memfd of `reims-ctl`'s VMs), the library gets the
   RAM's map and the files behind it, and the GPU uses an IOSurface's own
-  pages in place. The graphics device takes no dirty source: resolving the
-  pages behind each IOSurface's import cost its thread about 5 ms a command
-  buffer on a discrete GPU, more than the whole copies it saved.
+  pages in place. QEMU gives it no dirty log of the guest's RAM: with one
+  (`2243023e`, which `926401c4` reverts), resolving the pages behind each
+  IOSurface's import cost its thread about 5 ms a command buffer on a
+  discrete GPU, more than the whole copies it saved.
 - An interrupt the library raises, on a thread of its own, is written to
   the vector's irqfd where KVM's in-kernel irqchip injects MSI-X through one
   and MSI-X is enabled, and KVM injects it on the raising thread; elsewhere
   (HVF, TCG) a BH sends it under the BQL. Neither waits for a lock.
 - Under `-display none` the library opens a window for the display, unless
-  `REIMS_VGPU_WINDOW` is `0`, as `apple-gfx` does. It opens at the
-  `resolution` property's size, `<width>x<height>` (1920x1080 without it),
-  a guest point per host point, shrunk to fit the screen; then the window
-  keeps the size the person gives it, and the display offers the guest that
-  size in pixels at the host screen's rate. On a KDE Wayland desktop of
-  3840x2160 at 2.1x, 1829x1029 points, `resolution=1280x720` opened the
-  window at 1280x720 points, and a macOS 26.7.2 guest ran 2688x1512;
-  `2560x1440` and the default opened it shrunk to 1744x981 points, the
-  guest at 3662x2039 (**measured**). Its input is queued for a BH and reaches the
-  guest's tablet and keyboard through the device's console. Closing the
-  window powers the VM off.
+  `REIMS_VGPU_WINDOW` is `0`. It opens at the `resolution` property's size,
+  `<width>x<height>` (1920x1080 without it), a guest point per host point,
+  shrunk to fit the screen; then the window keeps the size the person gives
+  it, and the display offers the guest that size in pixels at the host
+  screen's rate. On a KDE Wayland desktop of 3840x2160 at 2.1x, 1829x1029
+  points, `resolution=1280x720` opened the window at 1280x720 points, and a
+  macOS 26.7.2 guest ran 2688x1512; `2560x1440` and the default opened it
+  shrunk to 1744x981 points, the guest at 3662x2039 (**measured**). Its
+  input is queued for a BH and reaches the guest's tablet and keyboard
+  through the device's console. Closing the window powers the VM off.
 - **The console** shows what the display shows, with a window or without
   one: at each of its updates (a display change listener's refresh, or a
   screendump) a thread of the device's pool reads it back from the library
@@ -371,8 +167,8 @@ is its transport:
   (`qemu_console_set_mouse`). The library gives the hot spot's place
   (`rvg_graphics_device_cursor_position`), and the console takes the image's
   top-left corner, as virtio-gpu gives it, so the device takes the hot spot
-  off. QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw the cursor from it,
-  as they draw `apple-gfx`'s. The image the console reads back has no
+  off. QEMU's own displays (SPICE, VNC, GTK, D-Bus) draw the cursor from it.
+  The image the console reads back has no
   cursor, and under `-display none` the console has no display: the window
   shows the cursor as the host's pointer.
 - It has no default option ROM: `romfile=` names one.
@@ -390,10 +186,8 @@ is its transport:
   RAM at 1 GiB.
 
 `CONFIG_REIMS_GRAPHICS` is set for every target when the library is found,
-not only the HVF and KVM targets `MAC_PVG` is limited to. A Mac builds it
-into `qemu-system-x86_64` with
-`make qemu QEMU_CONFIGURE='--target-list=aarch64-softmmu,x86_64-softmmu'`
-and `make -C build/qemu qemu-system-x86_64`.
+whatever its accelerator, so `make qemu` on a Mac builds the device into
+`qemu-system-x86_64` too, where it runs under TCG.
 
 **Measured** on the M3 Max, under TCG on q35, paused (`-S`), when the region
 was 256 MiB:
@@ -485,377 +279,11 @@ on such an image:
 - `log show --last boot --predicate 'eventMessage CONTAINS
   "OSBundleForceDTraceInit"'` prints no line.
 
-## apple-gfx on reims-vgpu
+## Linux hosts
 
-`vendor/qemu`'s `apple-gfx` is three C files, `hw/display/apple-gfx.c`,
-`apple-gfx-mmio.c` and `apple-gfx-pci.c`, on the library's C API,
-`reims_vgpu.h`. They use no Objective-C, Metal, IOSurface, dispatch, blocks
-or autorelease pools, and call 22 of the header's 48 functions. Beside them,
-`apple-gfx-activity.m` holds Foundation's activity against App Nap while a
-device is realized, and calls nothing of the library ("App Nap", below).
-How it uses the API:
-
-- **Realize** fills an `RvgDeviceConfig`: the `displays` property's port
-  count (1 to 8, default 1; any other value fails the realize), the
-  system's default Metal device (`metal_registry_id` 0) and the guest's
-  memory map, walked from the flat view into an array freed after the
-  create, since the library copies it. The map is the flat view at the
-  realize: RAM mapped later is not in it. The PCI variant gives
-  `raise_interrupt`, and always sets `use_iosurface_mapper`,
-  `process_isolation` and `process_isolation_follows_guest`; it has no
-  option for them. An `apple-gfx-iosurface-pci` makes the IOSurface host
-  device, and without one every task runs in process ("The IOSurface
-  device over PCI", below). The MMIO one sets the first two always,
-  and makes the IOSurface host device after the device, from a second walk. Display i takes port i, the next serial
-  number, "Reims vGPU", 400 x 300 mm and a callback table, then the modes
-  (the `display-modes` property, or 1920 x 1080, 1440 x 1080 and 1280 x
-  1024 at 60 Hz), and console head i. A refused create fails the realize
-  with `rvg_status_message`'s text, after releasing the displays made so
-  far and the device. A migration blocker stands in for suspend and resume,
-  which QEMU does not call.
-- **The files behind guest RAM.** Each range of the map also names the file
-  behind it (`RvgDeviceConfig.memory_files`), where its RAM is a shared
-  mapping of a file in pages of the host's size: the RAM block's descriptor,
-  and the range's offset in the block plus the block's offset in the file.
-  On Linux the library builds its views of guest pages from these files, and
-  a range without one fails the realize, which says to back the machine's
-  RAM with `-object memory-backend-memfd,share=on,id=<id>` and `-machine
-  memory-backend=<id>`, without hugetlb. On macOS QEMU passes the files only
-  where every range has one, and the library checks them without using
-  them; `vmapple`'s anonymous RAM has none. The `apple_gfx_memory_range`
-  trace lists each range with its host address, descriptor and offset.
-- **Frames.** A mode change makes an `RvgFrameTarget` of the surface's size
-  in BGRA8, the byte order of pixman's x8r8g8b8. A render retains the
-  target, and a pool job encodes the display's frame into it, waits, and
-  reads the target's pixels into a buffer of the job's own with
-  `rvg_frame_target_read_pixels`; a bottom half then copies them into the
-  surface, if the size is unchanged. The read stays off the main loop,
-  where a slow read starves the guest's other devices: a 1920 x 1080 read
-  took 1.7 s on average on an RTX 5080 Laptop GPU host, and made in the
-  bottom half it starved the guest's AHCI disk (**measured**). A display
-  renders one frame at a time.
-- **Callbacks** come on the library's display thread, one at a time in the
-  guest's order: a mode change takes the BQL and sets the mode
-  synchronously, and a new frame schedules a bottom half. The cursor
-  callbacks queue their work, with the show value and a copy of the glyph's
-  pixels and hot spot, on the device's event queue, which one bottom half
-  runs under the BQL in the order it was queued; one-shot bottom halves
-  scheduled together run in the reverse order, and let a cursor glyph be
-  replaced by the one set before it. Without window mode, the console's
-  surface follows the guest's frames only while a display change listener
-  (VNC) or a screendump asked for it within the last 6 s, twice the slowest
-  refresh: one render at a time, of the newest frame, the frames presented
-  meanwhile skipped. Otherwise nothing is rendered at a present, and the
-  surface is drawn when the display system asks for it (`gfx_update`), if
-  the guest presented a frame since the last render began or the mode
-  changed; that render's completion signals the update done, so a
-  screendump reads the newest frame.
-- **MMIO.** The vCPU's thread calls the library for the reads and writes of
-  both MMIO regions, and waits only on the library's threads, which never
-  wait on QEMU: the device's one callback, `raise_interrupt`, schedules a
-  bottom half and returns, even on the vCPU's thread inside the access, and
-  `mode_change`, the one callback that takes the BQL, runs on the display
-  thread, which no access waits for. The GPU device's region is lockless
-  (`memory_region_enable_lockless_io`): under KVM a vCPU makes its access
-  without the BQL; HVF takes the BQL at every exit, and TCG at every access to
-  I/O, so under them the accesses run one at a time. The one access that
-  takes the BQL itself is a write to 0x1210 on `apple-gfx-pci`, after the
-  library's call has returned ("BAR 2", below). An access never hops to a
-  pool thread while the vCPU waits: that wait, in `AIO_WAIT_WHILE` under the
-  BQL, lost its wakeup once and hung a vmapple boot for good
-  ([lessons.md](lessons.md)). The pool runs only the renders, which it
-  takes with `thread_pool_submit_immediate`. That call needs upstream's
-  `2566b6e902`, which vendor/qemu has: without it, a job that completed
-  before the call resized the pool to the work left let the pool be resized
-  to 0 threads, and QEMU aborted on `thread_pool_set_max_threads`'s
-  `assert(max_threads > 0)`. `apple-gfx-mmio`'s IOSurface registers are read
-  and written as 32 bits: values zero-extend and truncate, where the
-  library's functions take and return 64 bits. `apple-gfx-iosurface-pci`
-  passes an 8-byte access whole, and a 4-byte one as `apple-gfx-mmio` does.
-- **Reset.** Each bus front-end's reset calls `rvg_device_reset` in its hold
-  phase. It may call back, and the device's one callback, `raise_interrupt`,
-  only schedules a bottom half.
-- **BAR 2** (`apple-gfx-pci`, with its `efi-framebuffer-bar` property, on by
-  default): a 64 MiB, 32-bit, prefetchable window onto the EFI framebuffer,
-  for guests with no driver of the device's own ("x86-64 macOS guests:
-  installers and recovery", below). It holds one alias of the machine's RAM,
-  disabled at realize. After the library has taken a guest write to 0x1210
-  (the framebuffer's start), `apple_gfx_write` calls the PCI variant's
-  `mmio_written` hook, which takes the BQL (under KVM the access came without
-  it) and reads the start back from the library, since vCPUs' hooks may reach
-  the BQL in another order than their writes reached the library. It looks the
-  start up in the system memory's flat view, in the library's pages
-  (`APV_PAGE_SHIFT`: 4 KiB on an x86-64 host, 16 KiB otherwise). Where the
-  machine's RAM is there, BAR 2 shows the run of it from the start, up to
-  64 MiB, at the BAR's offset 0: only RAM the guest reaches at those addresses
-  then, so the window ends where SMRAM, a ROM or a device's region lies over
-  the RAM. A start of 0, or anything else there (a device's region, a NUMA
-  node's memory), disables the alias. The update is done before the access
-  returns, since the option ROM reads its buffer back through BAR 2 right
-  after its writes, and a repeated start changes nothing. Only 0x1210 writes
-  and a reset change BAR 2, so it shows the framebuffer from the ROM's write
-  until the next one or a reset: after EFI goes off the kernel's draws to its
-  boot framebuffer still land in RAM. QEMU leaves BAR 2 out where the machine
-  has no RAM region, or its RAM is a guest_memfd's, which KVM refuses a second
-  memory slot onto. The library never sees BAR 2: the ROM writes the RAM page
-  as before, and only the address its Graphics Output Protocol gives is
-  BAR 2's ([architecture.md](architecture.md) 11.4).
-- **The IOSurface device over PCI** (`apple-gfx-iosurface-pci`): the
-  device `apple-gfx-mmio` has as its second region, for x86-64 guests that
-  run Apple's arm64 GPU driver, ported (`AppleParavirtGPUIOGPUFamily`). That
-  driver's start waits for the mapper driver's service with no timeout, and
-  makes every texture over an IOSurface a mapper texture (object type 11).
-  The mapper driver takes memory index 0 and interrupt index 0, which the
-  GPU's function, with its one MSI vector, cannot give it beside the GPU
-  driver, so it is a PCI device of its own:
-  - vendor 0x106b, device 0xeeef (ours: no Apple device has it), class
-    0x0880 (system peripheral);
-  - BAR 0, 64 KiB of 32-bit memory, with the IOSurface host device's
-    registers at 0x1000 to 0x1030, as in vmapple's region; an 8-byte
-    access passes whole, since the ring's and the descriptor table's bases
-    are guest physical addresses that may lie above 4 GiB;
-  - one MSI vector, notified from a bottom half the IOSurface device's
-    worker schedules once per completed command, while the guest has MSI
-    on.
-
-  Its `gpu` link names the `apple-gfx-pci` it maps IOSurfaces for, which
-  must come before it on the command line. Unset, it is the machine's only
-  `apple-gfx-pci`, and realize refuses when there is none before it or
-  more than one. Realize refuses a second instance, since a device maps
-  through the process's latest IOSurface device
-  (`rvg_iosurface_device_create`). It makes the IOSurface device from the
-  flat view, as `apple-gfx-mmio` does, after the GPU's device. The
-  IOSurface device's config has no files: on Linux the library maps guest
-  pages from the process's backing table, where the GPU's device
-  registered the files behind guest RAM
-  (`crates/reims-vgpu-vulkan/src/os/linux/files.rs`). The library has no
-  reset of the IOSurface device. A reset of `apple-gfx-iosurface-pci`
-  writes 0 to its registers through the library's MMIO writes, as a guest
-  would: the ring base (which unmaps the ring), the descriptor enable and
-  the descriptor table base (which tear every surface down and drop the
-  table), the ring size, and the read and write counters, in that order.
-  The library ignores a ring size of 0, so that register keeps its last
-  size, which maps nothing until a guest writes a base and a size again; a
-  write counter's doorbell with no ring runs nothing. A guest that reboots
-  into Apple's x86-64 driver so finds no descriptor table left from the
-  port. A PCI reset also turns MSI off, and the guest's mapper writes every
-  register again at its start. Adding the device is the only switch:
-
-  ```sh
-  -device apple-gfx-pci,id=gpu0 -device apple-gfx-iosurface-pci
-  ```
-
-  Isolation is the setup in which the library writes info replies into
-  guest memory: in process each one ends QEMU ([testing.md](testing.md)
-  7.4), and Apple's arm64 driver sends them from binary version 101 (it
-  asks for 245). `apple-gfx-pci` isolates a task only when, as the guest
-  defines it, the `apple-gfx-iosurface-pci` it maps through has a
-  descriptor table base other than 0 (`process_isolation_follows_guest`);
-  otherwise the task runs in process, and each task made says which in an
-  info line (`task N runs isolated` or `runs in process`, with the
-  reason). Device info offers argument buffers, which only isolated tasks
-  serve, by the same rule, read when the guest asks, and logs one line
-  each time its answer changes (`device info: argument buffers on` or
-  `off`, with the reason). The port's mapper
-  driver writes the base at its start, and Apple's arm64 driver, ported,
-  waits for the mapper's service before it makes a task. Apple's x86-64
-  AppleParavirtGPU never touches 106b:eeef, and references IOSurfaces
-  through ref textures, whose backing is in task 0, which an isolated task
-  does not serve ([testing.md](testing.md) 6.20). With every task
-  isolated, macOS 26.7.1 (25G241) under that driver has each such task end
-  at `gpu_task.unsupported.backing_for_id`, every later command on it
-  fault, and the guest's GPU hang through its restarts, with WindowServer
-  crashing; with isolation off the same boot passes (**measured** on a
-  Radeon 780M). The driver asks for binary version 6 there. Under
-  reims-util's route (Lilu and ReimsVgpu.kext) it asks for 245 and still
-  makes ref textures, and isolated it fails the same way. So the version
-  cannot tell the drivers apart,
-  and the mapper can: Apple's x86-64 driver runs in process, stock or
-  patched, and Apple's arm64 one, ported, isolated. On an x86-64 host the IOSurface
-  device offers only the first descriptor form at 0x1028
-  ([testing.md](testing.md) 6.23), which the mapper driver needs on 4 KiB
-  pages. A VM with no `apple-gfx-iosurface-pci` runs every task in process
-  and is told no argument buffers.
-- **Not used**, since QEMU's deployment target is 26.0: the task list and
-  the memory callbacks macOS before 15.4 needed. QEMU gives the device
-  `raise_interrupt` and a memory map only. The PCI IDs, BAR 0 and MSI count
-  come from the header (`RVG_PCI_*`); BAR 2 is QEMU's own, and so are the
-  IOSurface device's PCI ID, BAR and MSI count.
-
-### Window mode
-
-Under `-display none` on macOS, QEMU runs its main loop on a thread named
-`qemu_main` and leaves the main thread in `CFRunLoopRun()`, where the
-library can run AppKit (`reims-vgpu-window`'s `native/macos/main_thread.rs`).
-`apple-gfx` then has the library open a window for each of its displays:
-
-- **When.** At realize, when `query-display-options` gives the display type
-  none and QEMU's environment does not set `REIMS_VGPU_WINDOW=0`. The type
-  is none under `-display none` and `-nographic`, and under `-vnc` without
-  `-display`. QEMU says so once, on stderr: `apple-gfx: -display none: each
-  display opens a window of its own; REIMS_VGPU_WINDOW=0 keeps QEMU
-  headless`. Any other display type, or `REIMS_VGPU_WINDOW=0`, keeps
-  `apple-gfx` headless.
-- **Modes.** Each display is offered 1920x1080 at 1x, then the standard
-  sizes within it, at the rate the host screen is set to
-  (`RVG_WINDOW_MATCH_HOST_SCREEN` with a mode), and the window scales the
-  guest's frames to its size on the GPU. The `resolution` property picks
-  another mode; `<w>x<h>@<ppi>` also tells the guest that density, and the
-  guest runs a HiDPI desktop at the mode's pixels where it reads 146.667
-  ppi or more across the width in whole centimetres, the told millimetres
-  rounded to nearest and then up (`2560x1600@200`, the display `macosvm`
-  gave the guest in its `vm.json`, looks like 1280x800; `@148` reads 44 cm,
-  147.8 ppi, and `@146` 45 cm, 144.5 ppi, a 1x desktop). A windowed window
-  on a Retina screen shows a HiDPI guest one guest pixel per screen pixel
-  where half the mode fits. QEMU refuses a density that does not tell the
-  guest's scale for the mode, the only one it checks ("A chosen density's
-  boundary", below); or `host` for the host screen's own modes at its
-  density:
-  `-global apple-gfx-mmio.resolution=2560x1600` on `vmapple`, or
-  `-device apple-gfx-pci,resolution=host`; `run_vmapple.sh` passes
-  `RESOLUTION=`. A malformed value fails the realize. `apple-gfx` sets no
-  modes of its own; with the `display-modes` property, it passes no flag
-  and sets those. The library's `REIMS_VGPU_WINDOW_*` variables pick each
-  window's screen and style and the offered modes' rate ([docs/api.md](api.md)
-  section 2, and `crates/reims-vgpu-window/features.md`). With
-  `resolution=host` on the M3 Max's built-in Retina screen the macOS 13.6
-  guest boots to a HiDPI desktop, 3456x2160 looking like 1728x1080: it
-  picks that from the size in millimetres, read in whole centimetres, and
-  not from the scale factor (`crates/reims-vgpu-window/src/policy.rs` has
-  the measurements). At that mode it boots much slower than at 1920x1080,
-  which is why 1920x1080 is the default.
-- **Several displays.** `-global apple-gfx-mmio.displays=N` on `vmapple`,
-  or `-device apple-gfx-pci,displays=N`, gives the device N display ports,
-  up to 8, each with a display, a console and, in window mode, a window of
-  its own.
-- **The windows.** Each opens once QEMU's main thread runs its run loop,
-  titled "Reims vGPU", with " (port N)" for port N above 0; the guest sees
-  each display named "Reims vGPU". QEMU makes no
-  `NSApplication`, so the library makes one and runs it on the main thread
-  for good: a Dock icon, a ⌘Tab entry and a menu named after the process.
-  A window is windowed by default, sized at one guest point per host point
-  (a 1x guest's pixel is a point, scaled on the GPU; a HiDPI guest's is a
-  screen pixel) for the first mode the display offers, then for each mode
-  the guest sets until the person sizes it, and windows on one screen open
-  24 points apart; `REIMS_VGPU_WINDOW_BORDERLESS=1` makes each cover its
-  screen, the image below a built-in screen's camera housing.
-  [docs/api.md](api.md) section 2 describes a window, and
-  `crates/reims-vgpu-window/features.md` lists what it does for the person
-  at the host.
-- **Frames.** The library draws the guest's frames into the windows; QEMU
-  does not render each frame into its console's surface. It draws the
-  surface only when its display system asks: a `screendump`, or a listener
-  such as VNC. Where the guest presented nothing since the last render
-  began, and the mode is unchanged, the surface has the newest frame, and
-  the update is done at once without a render
-  (`apple_gfx_render_new_frame`). Otherwise it renders the display's
-  current frame once, and is done whether or not the render drew, so a
-  screendump never waits for a frame that will not come, and one before the
-  guest's first mode returns at once.
-- **Input.** The window callbacks come on the main thread on macOS, and on
-  the library's `reims-vgpu.ui` thread on Linux, without the BQL, and queue
-  their events on the same event queue as the cursor's work, with the
-  display's console as the source. On `vmapple` they reach the USB tablet
-  and keyboard the machine adds: the pointer as absolute X and Y clamped to
-  the mode, with the left, right, middle and both side buttons; each scroll
-  event as smooth scroll events, the distance in 1/256 point with the
-  gesture's phases, where the tablet takes them (the machine's default
-  `usb-vmapple-tablet`), and else as wheel button presses and releases, one
-  per notch (`tablet=usb-tablet`, which has no horizontal wheel, so
-  horizontal notches go nowhere on it); each key's USB usage mapped to
-  QEMU's Linux key codes and sent at once.
-- **Closing a window**, or choosing Quit, powers the VM off: a host-UI
-  shutdown request with the power-off action, as closing QEMU's own windows
-  does, and QEMU exits.
-
-`scripts/internal/run_vmapple.sh` runs QEMU with `-display none` and
-`REIMS_VGPU_WINDOW=0`, so its runs stay headless for `vm_drive.py`'s tours;
-`WINDOW=1` opens the windows ("Steps", below).
-
-**Measured** on the M3 Max with the macOS 13.6 guest ("The guest", below):
-- **With the host's screen locked**, the window reports itself hidden and
-  draws nothing, and `capture-app`, a window capture tool on the host,
-  cannot capture any window.
-- **A chosen density's boundary.** The guest's scale, read from its menu
-  bar's height in a screendump (24 pixels at 1x, 48 at HiDPI), follows the
-  told width in the whole centimetres the guest reads (the millimetres
-  rounded to nearest, then up), and turns HiDPI between 146.666 and 146.667
-  ppi across them: `2560x1600@146` (446.42 mm, 45 cm, 144.5 ppi) runs 1x,
-  and `2560x1600@148` (440.39 mm, 44 cm from 440 mm, 147.8 ppi) HiDPI. From
-  1920 to 3811 pixels wide the width's reading alone decides, whatever the
-  height: `3456x2160@149` reads 148.3 ppi down its 37 cm and runs 1x. A
-  much wider or narrower mode does not follow it: 5832x3645 ran HiDPI at
-  128.8 ppi, and 1280x800 1x at 216.7; where between those widths, or
-  whether the 1280x800's 15 cm rather than its pixels decided it, is
-  **unknown**. The module doc of `crates/reims-vgpu-window/src/policy.rs`
-  lists every density measured, and its `guest_scale` says what the window
-  takes the guest to run at each. apple-gfx refuses the densities these leave
-  unknown, and a told width over 65535 mm, more than the settings page's 16
-  bits hold (`hw/display/apple-gfx.c`, `apple_gfx_guest_scale_unknown`).
-- **Two displays** (`-global apple-gfx-mmio.displays=2`, `WINDOW=1`): both
-  windows open, and port 1's stays black while port 0 shows the desktop.
-  The guest's boot firmware sets binary version 62 (it writes `0x3e` to
-  0x1034 before the kernel runs, and nothing writes 0x1034 again), and below
-  version 245 the port count at 0x122c reads 1 (`supportsMultipleDisplays`;
-  docs/testing.md 6.21), so port 1 never gets a mode. The x86-64 macOS
-  26.7.2 guest on `apple-gfx-pci,displays=2` does the same (um790, 11-07):
-  at each boot it asks for binary version 0, reads 0x122c while that
-  version is stored (1, logged at debug by `reims_vgpu_core::device::mmio`),
-  and only then asks for 245; it makes one guest display, on port 0, its
-  IORegistry holds one `AppleParavirtFramebuffer`, and port 1's window
-  stays black at 640x480.
-- **The rate.** The guest's modes run at the host screen's rate
-  (`crates/reims-vgpu-window/features.md`, "Matching the host's screen").
-  With um790's 3840x2160 screen set to 50 Hz (11-07, x86-64 26.7.2 on
-  `apple-gfx-pci`), `CGDisplayModeGetRefreshRate` reads 50.00 for every
-  mode, and system_profiler "1920 x 1080 @ 50.00Hz", through SDL's Wayland
-  driver and through its X11 one on Xwayland. Set to 60 Hz, both read 0.00
-  and system_profiler gives no rate: the guest shows a 60 Hz mode as one of
-  no stated rate.
-
-### Isolated tasks
-
-`apple-gfx-mmio` sets `process_isolation`, and so does `apple-gfx-pci`,
-with `process_isolation_follows_guest`: there a task is isolated when the
-guest defines it while its `apple-gfx-iosurface-pci` has a descriptor
-table ("The IOSurface device over PCI", above). The library then runs each
-isolated guest task on threads of its own in QEMU's process
-([architecture.md](architecture.md) 5.1). QEMU starts no other process: an
-isolated task's CPU, and the Metal lines it logs, are QEMU's.
-
-### Linux hosts: the dirty source
-
-Where the Vulkan runtime keeps a copy of guest memory in GPU memory (a
-discrete GPU's texture copies, and the shadows of a GPU whose driver cannot
-use the guest's pages in place), it copies again only the pages written
-since its last copy. Under KVM, `apple-gfx` gives the device a dirty source
-(api.md, `RvgDirtySource`): the VM's fd and four callbacks, none of which
-takes the BQL. The library's thread `reims-vgpu.dirty` runs each harvest:
-it has every vCPU inside `KVM_RUN` leave it once where `kvm_intel`'s `pml`
-is on (KVM's `KVM_GET_DIRTY_LOG` kicks the vCPUs but does not wait, so a
-write logged in a vCPU's page-modification log could reach the bitmap after
-the read), then, per logged slot, one `KVM_GET_DIRTY_LOG` and one
-`KVM_CLEAR_DIRTY_LOG` of exactly the watched pages it shows written, then
-takes QEMU's own DMA (the M2 scaler's output, virtio) from QEMU's bitmap.
-Only watched pages are cleared, so a page no copy reads costs the guest
-nothing. The RAM is logged from the first harvest on, since KVM maps a
-logged slot 4 KiB at a time. A source needs KVM's initially-set manual
-dirty-log protection, no dirty ring, no global dirty tracking and 4 KiB
-pages; without one the runtime copies whole, as before.
-`REIMS_VGPU_DIRTY_PAGE_TRACKING=0` turns it off.
-
-Measured on msi-5080 (RTX 5080 Laptop GPU, x86-64 macOS 26 guest, a Finder
-window dragged for 20 s, PCIe traffic by `nvidia-smi dmon`, 2026-10-28),
-against the library and runtime before it:
-
-| guest mode | without | with |
-|---|---|---|
-| 1680x1050 | 56.2 fps, 182 MB a frame host to GPU, SM 65% | 55.7 fps, 98 MB, SM 46% |
-| 3840x2160 | 18.0 fps, 938 MB a frame, SM 91% | 26.1 fps, 439 MB, SM 79% |
-
-At 1680x1050 the copies do not bound the drag, and the source turns into
-headroom; at 3840x2160 they do. The same build with the source off moves
-what the build before it moved.
+`reims-ctl` runs its VMs on Linux x86-64 hosts, under KVM, with the library
+on its Vulkan platform. These are the facts of such hosts the library and
+QEMU rely on.
 
 ### Linux hosts: huge pages for guest RAM
 
@@ -867,12 +295,9 @@ before, the guest ran on 4 KiB pages alone. Whether huge pages back it now
 is the host's choice: `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
 at `advise` (CachyOS ships it), with QEMU's `MADV_HUGEPAGE`, or at `always`
 or `within_size`; at `never` or `deny`, upstream's default, nothing changes.
-KVM maps a slot under the dirty log 4 KiB at a time, so where the dirty
-source runs (above) the guest keeps its huge pages only until the first
-harvest.
 
-Measured on msi-5080 (macos-26, 16 GiB, a drag and a UFO test, no dirty
-source, 2026-10-27): KVM maps about 10 GiB of the guest at 2 MiB, none
+Measured on msi-5080 (macos-26, 16 GiB, a drag and a UFO test,
+2026-10-27): KVM maps about 10 GiB of the guest at 2 MiB, none
 before, and the vCPUs' time a frame falls 6-7% at the same frame rate.
 
 ### Linux hosts: `vm.max_map_count`
@@ -909,62 +334,23 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
     the budget (`budget.rs`, `HEADROOM`), and through dma-bufs past that. Any
     other import of a view's pages (a no-copy buffer's, a heap's or a
     rebind's) maps them from their files while they fit short of those 8,192
-    mappings too, as does the writable twin an import of a surface's
-    read-only alias, or of a range core maps read-only, needs. Past that line
-    the library's import gate refuses the pages, and
+    mappings too, as does the writable twin an import of read-only pages
+    needs. Past that line the library's import gate refuses the pages, and
     the runtime makes the object over a copy of them, which takes no mapping
     (metal2vulkan's `HostMemory::with_import_gate`, announced
     `copied-host-pages`; with `REIMS_VGPU_STRICT=1` it ends the process). The
     copy lies in host-cached system memory, compared whole on the CPU at each
     commit and each completion, and it reads the pages with the CPU, which
     reads pages left in views through dma-bufs too.
-  - Measured on the RTX 5080 Laptop host at the kernel's default of 65,530
-    (2026-10-29), at metal2vulkan 0dfdbcd59d, before both: the copy's first
-    read went through the kernel (`process_vm_readv`), which cannot read
-    pages left in views through dma-bufs, so the runtime refused the buffer.
-    A 16 GiB x86-64 macOS 26 guest at 3840x2160 HiDPI died about 17 s into
-    its boot, before the desktop, where a 63.3 MiB surface past the headroom
-    (16,202 mappings) went to the copy and the texture made over it was
-    refused (`newTextureWithDescriptor:iosurface:plane:`); at 1,048,576 the
-    same guest ran a Finder drag at 50-59 fps. At metal2vulkan daf1bf625f,
-    with the RAM handed over whole, the same guest at 65,530 reached its
-    desktop about 80 s into its boot and ran Finder, Safari, Mission
-    Control, the Apps stack and Photos for 12 minutes with no fatal line, but
-    slowly: by the end 1,024 buffers and heaps (551 MiB) and 64 more over
-    read-only pages (13 MiB) were copies, a Finder drag ran at a median of
-    5 fps and the rest at a median under one frame a second, with frames up
-    to 15 s apart. At metal2vulkan f4f88dad89, whose copies compare a page at
-    a time and only the pages the dirty log reports written, the same boot
-    had its desktop by 30 s and ran the same workload for 9 minutes with no
-    fatal line and more copies (2,048 buffers and heaps, 1,079 MiB, and 256
-    over read-only pages, 50 MiB): medians of 29 fps for the Finder drag, 19
-    for a Safari drag, 5 for a Safari scroll and 8 for the Apps stack, while
-    Mission Control stayed under one frame a second.
-  - Read-only pages twinned or copied, measured on the Radeon 780M host
-    (RADV) at metal2vulkan 023ed62d8c, 2026-11-07: a macOS 26.7.2 guest on
-    apple-gfx at 1920x1080, each boot on a fresh overlay of one prepared
-    disk, ten boots alternating in one job. Every read-only import of each
-    boot was a buffer core made over a range it maps read-only (37 to 44 of
-    them, 29.5 MiB, three of 0x7e9000 bytes), and no guest object made with
-    bit 24 or replaced read-only came. Copied rather than twinned, a Finder
-    window's two 10 s drags drew 27.35 and 35.7 fps (six boots) against
-    27.65 and 36.35 (four), QEMU took 260-279% of a core in the second drag
-    against 240-251%, and Safari scrolling up a long page drew 34.5-35.6 fps
-    (four boots) against 37.0 and 39.4 (two); so core's ranges stay twinned
-    (`backing.rs`, `ImportSite::twins`).
-  - A device lend (the video device's decoder writing a frame into the
-    guest's buffer) maps its pages from their files only short of those
-    8,192: past them the decoder declines the frame, and the session copies
-    it into the guest's buffer on the CPU, the same bytes.
 - **Before anything would die or be refused at the whole budget**, the
   library folds back into dma-bufs the views' pages mapped from their files
   that no live import a device may pin holds, and weighs again (`vm.rs`,
   "Folding back"). Only where that frees too little is a view or an import
   refused. A buffer's or heap's import short of the headroom folds the same
   way before it is copied, where the views grew or an import was freed since
-  the last such fold. A map the kernel itself refuses at `vm.max_map_count`, when the
-  rest of the process holds more than the 16,384 kept for it, folds the same
-  way and is tried once more.
+  the last such fold. A map the kernel itself refuses at `vm.max_map_count`,
+  when the rest of the process holds more than the 16,384 kept for it, folds
+  the same way and is tried once more.
 - **What is refused for want of mappings** answers as the same call does on
   the Metal platform when memory runs out: a remap of guest pages, or a range
   a view is made of, answers `KERN_NO_SPACE` with nothing mapped, an
@@ -1025,92 +411,6 @@ a Radeon 780M at those defaults the same guest cold-boots to its desktop, and
 Safari loads wikipedia.org and quits, with none of 5,119 dma-buf requests
 refused: 5,095 took one dma-buf, and the rest 2 to 16.
 
-### Linux hosts: a 4K display on a Radeon 780M
-
-At a 3840 × 2160 display, at the builds below, an x86-64 macOS guest on a
-Radeon 780M drops about a quarter of a 30 fps video's frames: its
-WindowServer's command buffers take about 25 ms of the GPU a frame, two
-thirds of it in metal2vulkan's shadow copies of guest surfaces and its
-conversion of the video's frames, and the frames do not fit. At 1920 × 1080
-they take 12 ms, and about 1% of the frames drop. B73 in
-[video/bugs.md](video/bugs.md) holds what the runtime has changed since,
-what is left, and whose it is.
-
-Measured on homelab-gem10 on 2026-10-26 (Linux 7.2.9, RADV of Mesa 26.2.4),
-with x86-64 macOS 26.7.1 (25G241) guests of 4 vCPUs, headless
-(`display-modes`; at 3840 × 2160 the guest looks like 1920 × 1080), each a
-cold boot from fresh overlays: 60 s after login, the Aerial screen saver for
-120 s, its 3840 × 2160 HEVC Main 10 video decoded on VA-API at both display
-sizes, counted by its layer's CoreMedia statistics in 6 s periods.
-
-| reims-vgpu, metal2vulkan | display | enqueued | displayed | dropped | over 16 ms late | presents a second | GPU busy |
-|---|---|---|---|---|---|---|---|
-| f9c7a5811, 67c64f99d8 | 3840 × 2160 | 3,628 | 2,905 | 688 | 879 | 24.5 | 60% |
-| f9c7a5811, 67c64f99d8 | 1920 × 1080 | 3,630 | 3,563 | 47 | 990 | 30.0 | not sampled |
-| 221176d06, 27935d575e | 3840 × 2160 | 3,630 | 2,742 | 853 | 950 | 23.0 | 54% |
-| 221176d06, 27935d575e | 1920 × 1080 | 3,628 | 3,562 | 45 | 929 | 30.0 | 35% |
-| 73e48ad5a, 6c9cad047a | 3840 × 2160 | 3,628 | 2,785 | 810 | 1,014 | 23.0 | not sampled |
-
-Boots of 60 s under reims-vgpu's trace (`REIMS_VGPU_TRACE`), which costs some
-frames of its own, at 221176d06 and 27935d575e. Two switches in a copy of the
-runtime, not committed, measure what its copies cost: the first skips the copy
-in of every shadow of a million texels or more over a buffer's bytes, the
-second also skips the YCbCr conversion, so the guest shows stale texels.
-WindowServer's GPU time is the sum of its command buffers' GPU legs between two
-presents (median, then p90); "starts" is its first commit after the last
-present, at the median.
-
-| boot | enqueued | dropped | over 16 ms late | presents a second | WindowServer's GPU time | starts | GPU busy |
-|---|---|---|---|---|---|---|---|
-| 3840 × 2160 | 1,826 | 416 | 497 | 23.0 | 25.2, 27.5 ms | 21.4 ms | 54% |
-| without the large shadows' copies | 1,826 | 137 | 807 | 28.0 | 16.8, 19.8 ms | 29.1 ms | 43% |
-| without those and the conversion | 1,826 | 39 | 38 | 30.0 | 8.1, 10.1 ms | 24.0 ms | 28% |
-| 1920 × 1080 | 1,826 | 100 | 454 | 30.0 | 12.0, 14.3 ms | 22.5 ms | 40% |
-| 3840 × 2160, at 73e48ad5a and 6c9cad047a | 1,826 | 413 | 511 | 23.4 | 24.8, 27.2 ms | 21.7 ms | not sampled |
-
-At 67c64f99d8 the first three took 27.2, 16.8 and 8.2 ms. So of a 4K frame's
-25.2 ms, the shadows take 8.4 and the conversion 8.7.
-
-The boots at 73e48ad5a and 6c9cad047a ran a build that logs the runtime's
-`WorkCounts` every 5 s, otherwise as above. Over the 120 s of the 4K screen
-saver every texel copied in from those surfaces was an encoder's first copy
-in of its texture: 68.7 billion, 572 million a second, and none of a texture
-an earlier encoder of the same command buffer copied in, or after the
-surface changed (B73).
-
-- **What the copies are.** WindowServer commits three command buffers a frame
-  on one task thread, the second the longest (18 ms at 4K). In a build
-  counting the runtime's work at 67c64f99d8, 115 s of the 4K screen saver
-  copied in 500 million texels a second of surfaces of a million texels or
-  more, about two and a half 3840 × 2160 surfaces a frame, kept 333 million
-  for 40 merges a second, and refreshed 20 YCbCr textures a second; at 1920 ×
-  1080, 186 million, 124 million for 60 merges, and 30. How the runtime
-  shadows a guest surface's texture, and converts a two-plane YCbCr one, is
-  in B26 and B73 ([video/bugs.md](video/bugs.md)).
-- **Not the library's.** In the 4K boot at 27935d575e QEMU's threads took:
-  the vCPUs 38 to 51% of a CPU each, the main threads 10.1%, the task threads
-  3.1% in all, the FIFO threads 0.7%, the video device's 3.0% and the
-  runtime's scheduler 2.3%. The swap presented 0.17 ms after the frame's last
-  command buffer completed at the median, 0.26 ms at p99.
-- **No waits in the kernel.** `perf record` of the GPU scheduler's and
-  amdgpu's tracepoints, read only, for 8 s from 25 s into the traced screen
-  savers: QEMU's graphics jobs, 69 a second at 4K and 65 at 1080p, ran 0.01 ms
-  after their submission at the median, 0.67 and 0.02 ms at p90, 3.6 and 0.65
-  ms at the most. QEMU unmapped 13 and 4 buffers (`amdgpu_vm_bo_unmap`), and 4
-  graphics jobs at 4K waited on the page-table updates after them. DRM's
-  fdinfo gave QEMU's graphics work 554 ms of each second at 4K and 339 at
-  1080p, its decodes on VCN 235 to 237 ms, and VA-API's compute work 84 to 85
-  ms.
-- **The clock.** The 780M's shader clock (`pp_dpm_sclk`: 800, 1100 and 2700
-  MHz, `power_dpm_force_performance_level` `auto`) read 800 MHz in 107 of 110
-  one-second samples of the 4K screen saver, at 54% busy
-  (`gpu_busy_percent`), and in all 114 at 1080p. In an earlier boot it rose to
-  2.2 to 2.5 GHz only at 84% busy, as the guest shut down. The boots left the
-  host's power policy as users have it.
-
-**Unknown**: a window (`-display` other than `none`), where the host draws
-each presented frame through a texture over the surface too, and other GPUs.
-
 ### Linux hosts: Intel GPUs without a shared last-level cache
 
 Arrow Lake-S's iGPU (`deviceID` 0x7d67, Xe-LPG; ANV of Mesa 26.2.4 on i915,
@@ -1136,228 +436,10 @@ with the driver's own cache on or off, in one cache or twelve, and destroying
 a cache gives none of it back. Only fewer bytes help: smaller shaders, fewer
 pipelines per state.
 
-### x86-64 macOS guests: Metal's error mode
+## x86-64 macOS guests
 
-An x86-64 macOS guest on `apple-gfx-pci` needs one setting, made once inside
-the guest. One on `reims-graphics-pci` does not: a macOS 26.7.2 guest on it
-without the key comes up with its Dock, `iconservicesagent` and
-`iconservicesd` running and no crash report (measured on a Radeon 780M host,
-2026-11-07), and `reims-ctl` names the setting for apple-gfx VMs alone
-(`runtime::needs_error_mode`). On a desktop that comes up:
-
-```sh
-sudo defaults write /Library/Preferences/.GlobalPreferences METAL_ERROR_MODE -int 5
-```
-
-A new install's desktop does not come up without it, so there it is made
-from macOS Recovery (OpenCore's Recovery entry, then Utilities > Terminal),
-on the Data volume, followed by `reboot`:
-
-```sh
-cd /Volumes/*Data/Library/Preferences
-defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5
-chmod 644 .GlobalPreferences.plist
-```
-
-Without it the guest's icon service ends as it starts, again and again:
-apps wait minutes for their icons, and a guest with no icon cache yet, as a
-new install has, shows only its wallpaper. Mode 5, the same as
-`MTL_ERROR_MODE=nslog`, has Metal log an error report and go on rather than
-end the process. Every process of every user reads the key, root's
-included, from its next launch on, so a boot needs nothing else.
-`sudo defaults delete /Library/Preferences/.GlobalPreferences
-METAL_ERROR_MODE` undoes it.
-
-Recovery boots on BAR 2 ("x86-64 macOS guests: installers and recovery",
-below), with the Data volume at `/Volumes/<name> - Data` and no password
-asked. The commands take that form for two reasons. `defaults write` on a
-path with the glob in it expands nothing, since no file has that name
-without `.plist`: it makes a literal `/Volumes/* - Data` in Recovery's RAM
-disk and writes the key there, where the `cd` expands the glob through the
-directory. And `defaults` leaves the file at mode 0600, where the user's
-processes read no key (`defaults read` as the user finds no such pair, as
-root it finds 5), so the icon service goes on ending until `chmod 644`. A
-Dock icon asked for while the icon service was failing can stay blank after
-the fix, also after `killall Dock`; deleting the user's
-`com.apple.dock.iconcache` and then `killall Dock` brings it back.
-
-**Measured** with macOS 26.6.1 guests on an RTX 5080 Laptop GPU host and an
-RTX 3090 host:
-- The guest's Metal plugin for the PCI device answers `nil` for the
-  device's `targetDeviceArchitecture`. Loading a binary archive asks for the
-  device's slice (`+[MTLLoader sliceIDForDevice:...]`), and Metal reports
-  "Target device architecture is nil", twice for each load. With no error
-  mode set, the report ends the process.
-- iconservicesagent (root's and the user's), Spotlight and
-  `com.apple.dock.extra` load IconRendering's binary archive, so each ends
-  as it starts. launchd spaces out the restarts, doubling the wait up to
-  320 s.
-- An app's first icon request waits on its main thread, with no timeout,
-  for iconservicesagent's reply. Calendar's launch waited 102.7 s, and the
-  icons came back blank (error 4097) in Calendar, System Settings and the
-  Dock. With no icon caches (`/Library/Caches/com.apple.iconservices.store`,
-  and the user's `com.apple.dock.iconcache`, `com.apple.dock.extra`,
-  `com.apple.iconservices` and `com.apple.iconservicesagent` under `getconf
-  DARWIN_USER_CACHE_DIR`), the desktop stays at the wallpaper, with no menu
-  bar, Dock or widgets: the Dock's main thread waits in `-[ISConcreteIcon
-  generateImageWithDescriptor:]`, in
-  `xpc_connection_send_message_with_reply_sync` to iconservicesagent.
-- With the key, the report is logged and the load goes on. No slice
-  matches, so the archive is empty, and each pipeline compiles from
-  IconRendering's own library. The icons are correct, nothing ends, and
-  Calendar launches in 0.41 s. The report is the only Metal error report any
-  process logs.
-- Nothing of the archive reaches the host: QEMU's log has no line of it,
-  with or without the key.
-
-No value the host supplies decides any of this, so Apple's own host would
-end an x86-64 macOS 26 guest's icon service the same way. Read from the
-guest's binaries and registry, and from the x86-64 code of macOS 26.7:
-- The PCI device (`106b:eeee`) matches `AppleParavirtGPU.kext`, which names
-  the `AppleParavirtGPUMetal` plugin (`MetalPluginName` in the registry).
-  That plugin's device has no `targetDeviceArchitecture` of its own, so it
-  answers Metal's base `nil`, which it answers for every device. The
-  IOGPU-family plugin, which has one, is matched only by vmapple's
-  device-tree node, never by a PCI device, and its kext is not in x86-64
-  macOS 26.6.2's kernel collections.
-- Nothing reaches the answer from the host: the device info the plugin
-  fetches (method 261, synchronously, as its device is made) feeds only its
-  shader compiler. That device info comes from the same builder as Apple's
-  x86-64 framework's, key for key, in the same order; only the family keys
-  differ from what an Intel Mac would send, since they carry the host GPU's
-  families: key 28's bit 0 (Apple5), key 37 (1009 here, 1005 on a GPU of no
-  Apple family) and key 44 (Apple5 to Apple9, none on an Intel or AMD GPU).
-  The archive's path reads none of them. RenderBox asks the device's
-  families for other choices (its depth buffer default, framebuffer reads);
-  which of them follow from these keys is not traced.
-- Nothing on the path asks the device first. IconRendering attaches its
-  archive whenever the file is in its bundle, RenderBox makes it the first
-  time one of IconRendering's functions is used, asking the device nothing
-  (no family, no `supportsBinaryArchives`), and Metal's base
-  `newBinaryArchiveWithDescriptor:` loads it without asking
-  `supportsBinaryArchives` (which this device answers NO). RenderBox's
-  `RB_USE_BINARY_ARCHIVE` covers only RenderBox's own library.
-  IconRendering's archive holds only Apple GPU slices, so a device that did
-  answer an architecture would miss them too and compile from the library.
-- Metal takes its error mode from `METAL_ERROR_MODE` in the environment,
-  then from the defaults (arguments, the app's domain, the global domain),
-  then from `MTL_ERROR_MODE`. With none set it is a constant 6, which logs
-  and asserts. No build variant, SIP, boot-args or AMFI condition changes
-  it, and nothing a host or OpenCore supplies is among the sources.
-- A command buffer's error report, which a GPU channel restart makes, never
-  ends the process, in any error mode.
-
-**Unknown**: the key's effect on guests before macOS 26.
-
-Without the key, the aborts also fault the GPU. **Measured** with macOS
-26.6.1 and 26.6.2 guests on an RTX 5080 Laptop GPU host:
-- An icon service process aborts 40-150 ms after it starts, with a command
-  buffer it committed still queued on the host or being decoded. The host
-  runs that exec (opcode 55) after the process has gone, and the guest has
-  emptied the task's object list in place: at the fault the whole list
-  reads as type 0 with offset all ones, through the host's mapping and a
-  fresh page-table walk alike, the list's pages unmoved. Execs run on child
-  FIFO 1 and object deletes (opcode 40) on child FIFO 2, the deletes with no
-  barriers, and an exec whose pipelines compile cold takes 20-80 ms, so
-  FIFO 1 reaches a process's last exec after its end. The host's lookup of
-  an emptied entry fails ("object N has an empty entry"); objects the task
-  had cached before still resolve.
-- The guest answers each such fault with a channel restart ("Fault on
-  channel: Exec", "GPU hang"), a `gpuRestart` report and a tailspin, 0.5-10
-  ms after the process ended. A guest whose key is on the disk before login
-  has no such fault; one whose key is written only after login faults at
-  that login, and not after.
-- The host makes an object the first time a command names it, from the
-  entry it reads then (section 6.11 of docs/testing.md), as Apple's
-  framework does. So Apple's host faults the same way whenever it runs the
-  exec after the guest's teardown. A host that decoded faster would only
-  narrow the window: some faulting execs start after their process has
-  ended.
-- Such an exec makes its pipelines from the emptied entries too. A
-  function whose entry is empty raises ("pipeline function N not found:
-  object N has an empty entry"), so the exec faults like the others, where
-  a nil function would have Metal abort at a render descriptor with no
-  vertex function, ending QEMU (docs/testing.md, section 6.18). So does a
-  resource whose entry is empty in a concurrent compute encoder's
-  UseResources, where Metal ends the process at a nil entry; the other
-  resource lists take it as nil, which Metal skips (section 6.16).
-
-reims-ctl counts these faults' lines in QEMU's log, and from the third tells
-the user to set the key from Recovery.
-
-### x86-64 macOS guests: WebGPU render bundles
-
-**Measured** with a macOS 26 guest on an RTX 5080 Laptop GPU host: opening
-Safari's WebGPU renderBundles sample ended QEMU. The host read the records
-of a render pipeline's two functions, could not copy either function's IR
-("the function's IR is not in task memory", which did not yet say why),
-handed Metal both as nil, and Metal ended the process at a render
-descriptor with no vertex function. In the 9.5 s before it the guest sent
-no exec (67), and the host committed no command buffer in the last 4.5 s;
-the guest sent 1,700 to 2,900 info indirects (69) and 1,000 to 2,000
-DiscardResources (63) a second, and the host's trace ends 0.14 ms after the
-last info indirect.
-
-**Read**, from the guest's Metal driver and kext:
-- A render pipeline holds its vertex and fragment functions' IR buffers.
-  Every command stream that names the pipeline adds those buffers to its
-  resource list: a render encoder's setRenderPipelineState, and an info
-  encoder's queries of the pipeline.
-- The kext commits a listed buffer's pages to the task's page table as it
-  prepares the stream's resource list.
-
-So why the copy failed is not settled: IR whose pages the guest had not yet
-committed, or a range past the task's end. The host now logs which. IR over
-a hole raises the function lookup's failure ("function N not made: its IR
-... is not mapped: a hole in the page table"), so the exec or info faults
-where Metal would end the process, as for an empty entry (section 6.18 of
-docs/testing.md, `mutgap_svc_function_over_hole`). Nothing is cached, so a
-lookup once the guest has mapped the IR makes the function. IR past the
-task's end is still nil to Metal, as Apple's framework answers it
-(`compute_death_function_data_out_of_range`, measured). Whether the sample
-draws with this is not yet measured.
-
-### x86-64 macOS guests: thumbnail extensions
-
-On an x86-64 macOS 26 guest, Quick Look's image and video thumbnail
-extensions end when they first enumerate Metal's devices, and Finder shows
-the file type's icon where the thumbnail would be. No setting inside the
-guest avoids it, `METAL_ERROR_MODE` included, and nothing the host supplies
-takes part.
-
-**Measured** with a macOS 26.6.1 guest on an RTX 5080 Laptop GPU host:
-`ImageThumbnailExtension` (under ImageIO's JPEG decode) and
-`AudiovisualThumbnailExtension` (under VideoToolbox) make the PCI device's
-`AppleParavirtGPUMetal` device, which asks the kext for the device info:
-method 261 of the shared user client. The kernel's sandbox refuses it
-(`deny(1) iokit-external-method AppleParavirtSharedUserClient 261`), the
-plugin logs "Failed to get device info: e00002e2" (`kIOReturnNotPermitted`),
-goes on without the info, and its own assertion on the info's shader version
-aborts the process. The thumbnail agent answers "Could not generate a
-thumbnail" for each file the process held. Across the app inventory (Safari,
-Photos, Preview, QuickTime, Messages, Mail and the rest) no other process had
-method 261 refused, and the host's log has no line at that time.
-
-Read from the guest's binaries and sandbox profiles:
-- The extensions' profile, `quicklook-thumbnail-secure`, lets a user
-  client of class `IOAccelSharedUserClient2`, which AppleParavirtGPU's
-  shared user client is, call only methods 0 1 4 7 8 9 10 12 259 268. The
-  kext's own methods are 256 to 262. `blastdoor`, `airlock`,
-  `com.apple.CoreGraphics.CGPDFService` and
-  `com.apple.audio.AudioConverterService.Hardened` carry the same list, so
-  a process under one of them that enumerates Metal's devices ends the same
-  way.
-- The kernel applies the sandbox's filter before it calls the driver
-  (XNU's `is_io_connect_method`), so the refused call reaches neither the
-  kext nor the host, and Apple's own host ends these extensions the same
-  way. The assertion is not `MTLReportFailure`, so Metal's error mode does
-  not cover it.
-- The profiles are on the sealed system volume. Letting the methods
-  through means unsealing it, and the plugin would need 256 to 262 there,
-  not 261 alone.
-
-**Unknown**: Quick Look's preview panel for images and videos, and image
-types whose decode does not reach Metal.
+What `reims-ctl`'s q35 command gives an x86-64 macOS guest, and why
+(`crates/reims-ctl/src/qemu.rs`).
 
 ### x86-64 macOS guests: USB input on xHCI
 
@@ -1383,11 +465,12 @@ so QEMU has nowhere to put the device's reports, though it completed the
 transfer and raised the interrupt, which the guest took and cleared. The
 port stays enabled, the controller keeps running, and the other device keeps
 working. Input comes back only when the device is unplugged and plugged
-again (QMP `device_del`, then `device_add`) or the guest restarts. This
-library's device shares no interrupt with EHCI: `apple-gfx-pci` raises only
-MSI (`msi_notify`). On xHCI the guest binds `AppleUSBXHCIPCI`, on MSI, the
-driver of every Mac that runs macOS 26, and the same load gave no freeze in
-20 min (**measured**, macOS 26.6.1 guest, RTX 5080 Laptop GPU host).
+again (QMP `device_del`, then `device_add`) or the guest restarts. The GPU
+device shares no interrupt with EHCI: `reims-graphics-pci` raises only MSI-X
+(`msix_notify`, or its vector's irqfd). On xHCI the guest binds
+`AppleUSBXHCIPCI`, on MSI, the driver of every Mac that runs macOS 26, and
+the same load gave no freeze in 20 min (**measured**, macOS 26.6.1 guest,
+RTX 5080 Laptop GPU host).
 
 **Unknown**: guests before macOS 26 on `qemu-xhci`.
 
@@ -1424,10 +507,6 @@ hw/usb/host-libusb.c):
   again comes back. A device it fails to open three times (`libusb_open:
   -3 [ACCESS]` in QEMU's log, where the user may not write its file in
   `/dev/bus/usb`) is tried again only once it is unplugged.
-- On a macOS host, libusb takes a device from the macOS driver holding it
-  only as root or with `com.apple.vm.device-access`, an entitlement Apple
-  grants VM apps through a provisioning profile; reims-ctl offers no
-  passthrough there.
 
 **Measured** on a CachyOS host (kernel 7.3.1) with a macOS 26.7.2 (25G332)
 guest on reims-graphics-pci, given a USB stick the host's kernel makes
@@ -1455,45 +534,33 @@ Give an x86-64 macOS guest no ACPI S3:
 -global ICH9-LPC.disable_s3=1
 ```
 
-A guest that enters S3 does not come back with its display. **Measured**
-with a macOS 26.6.1 guest (ReimsVgpu.kext, binary version 245) on an RX 7900
-XTX host:
-- `pmset sleepnow` puts the guest in S3 about 30 s later, and so does idle
-  sleep: QMP's `query-status` says `suspended`, and the window shows black.
-  macOS schedules RTC alarms of its own before it sleeps
-  (`MaintenanceWakeCalendarDate`).
-- No input wakes it. Mouse and key events through the window, and through
-  QMP's `input-send-event`, leave it suspended: in QEMU only PS/2 input
-  requests a system wakeup (`hw/input/ps2.c`); the USB keyboard and tablet
-  on `qemu-xhci` do not.
-- A wake (QMP `system_wakeup`, as an RTC alarm would) resets every device
-  (`pc_machine_wakeup`, `RESET_TYPE_WAKEUP`): the library logs `device
-  reset` and the guest display's destruction. The guest's kernel logs
-  `ACPI S3 WAKE` and only unpauses the GPU's configuration space
-  (`kConfigOpUnpaused`, `setPCIPowerState(2->2)`): its driver restores
-  none of the device's state, asks for no binary version, and creates no
-  guest display. `IOAccelEventMachine2::waitForStamp` then waits for good,
-  the window stays black, and SSH times out in its banner exchange.
+**Read** from QEMU's code: a guest in S3 wakes only on PS/2 input
+(`hw/input/ps2.c`), not on the USB keyboard and tablet on `qemu-xhci`, nor
+on input through the window, and a wake (QMP `system_wakeup`, or an RTC
+alarm, which macOS schedules before it sleeps) resets every device
+(`pc_machine_wakeup`, `RESET_TYPE_WAKEUP`), the GPU among them. Whether our
+kexts bring the display back after that reset is **unknown**. A guest of
+Apple's paravirtualized GPU driver, which the tree had before, never did:
+its window stayed black and WindowServer waited on the GPU for good.
 
 With S3 disabled, the DSDT has no `\_S3`. `pmset sleepnow` stops at a dark
 wake (`sleepASAP 1`): the display turns off (`IODisplayWrangler` power state
 1) and the VM keeps running; idle sleep stops at the same dark wake. Input
-through the window turns the display on again (power state 4). While the
-display is off the window keeps the last frame: the x86-64 guest sends no
-sleep command (opcode 9), and WindowServer still presents the occasional
-frame.
+through the window turns the display on again (power state 4). **Measured**
+with a macOS 26.6.1 guest on an RX 7900 XTX host, on that earlier GPU;
+on `reims-graphics-pci` it is **unknown**.
 
 ### x86-64 macOS guests: audio
 
-reims-ctl gives every macOS guest, x86-64 and arm64, a virtio sound device,
-with one output and one input stream:
+reims-ctl gives every VM a virtio sound device, with one output and one
+input stream:
 
 ```sh
 -audiodev pipewire,id=snd0 -device virtio-sound-pci,audiodev=snd0,addr=0x7
 ```
 
 macOS's `AppleVirtIO` kext has `AppleVirtIOSound`, matching virtio device
-0x19: arm64's (read from macOS 27's `Info.plist`) and x86-64's. **Measured**
+0x19. **Measured**
 with a macOS 26.7.2 (25G332) x86-64 guest on reims-ctl's q35 command, on a
 Radeon 780M host:
 - `AppleVirtIOPCITransport` binds the device (`pci1af4,1059`), with
@@ -1507,7 +574,6 @@ Radeon 780M host:
 - Safari's Media Source player plays H.264 with AAC (fragmented MP4) and
   VP9 with Opus (WebM) to the end, and their audio reaches QEMU.
 
-How an arm64 guest runs on QEMU's device is not measured.
 
 `pa` in place of `pipewire` uses PulseAudio, and `none` gives the guest a
 working output whose samples QEMU drops. macOS 26 for x86-64 ships no
@@ -1537,39 +603,6 @@ sound device):
 - A plain MP4 file plays, without sound.
 - With `usb-audio` the guest lists "QEMU" as its default output, and the
   same YouTube video plays.
-
-### x86-64 macOS guests: installers and recovery
-
-A macOS installer or recovery image boots to its Recovery UI on
-`apple-gfx-pci` because BAR 2 shows the EFI framebuffer ("BAR 2" in
-"apple-gfx on reims-vgpu", above, and [architecture.md](architecture.md)
-11.4). The image ships no AppleParavirtGPU, so the one driver that binds the
-device (106b:eeee, class 0x0380) is IOGraphics' generic
-`IONDRVFramebuffer`, which takes the EFI boot framebuffer over only when it
-lies inside one of the device's memory BARs. Without BAR 2 the kernel's boot
-framebuffer is the option ROM's buffer in RAM: the console logs `S20: Not
-usable`, then `newUserClient failed: 0 0xe00002be ... IONDRVFramebuffer`
-over and over, WindowServer aborts and launchd starts it again and again,
-and the screen stays on the Apple logo's progress bar.
-
-**Measured** with an x86-64 macOS 26.6.2 BaseSystem (25G83) on an RTX 5080
-Laptop GPU host (an Intel Core Ultra 9 275HX, KVM, `q35` with OVMF and
-OpenCore, headless):
-- OVMF puts BAR 2 at 0x80000000. From the ROM's write on, `info mtree`
-  shows the alias as 0x80000000-0x8212bfff onto the RAM at
-  0x7ded4000-0x7fffffff: 33 MiB, from the framebuffer to the end of the RAM
-  below 4 GiB, since this OVMF turns on neither TSEG nor the SMBASE window.
-- The installer's kernel takes `initialize_screen: b=80000000`, launchd
-  starts WindowServer once, and the Recovery UI is up 65 s after QEMU
-  starts, 45 s of it OpenCore's picker's wait.
-- An installed macOS 26 guest also boots on BAR 2 (`b=80000000`), to its
-  desktop. With `-d invalid_mem` QEMU logs no access to BAR 2: the guest's
-  draws to its boot framebuffer after EFI goes off land in RAM. With
-  `efi-framebuffer-bar=off` the device has no BAR 2, the ROM gives the RAM
-  address (`b=7DED4000`), and the same guest reaches the same desktop.
-
-**Unknown**: an installation run to its end, and installers and guests
-before macOS 26.
 
 ### x86-64 macOS guests: the CPU model
 
@@ -1622,9 +655,8 @@ an OpenCore that leaves leaf 1 as it is.
 (`/sys/module/kvm_intel/parameters/nested`) reads `Y` or `1`, Linux's
 default since 4.20. With it the guest's Hypervisor.framework works, so the
 guest can run VMs of its own (Docker, UTM). AMD's KVM offers SVM instead,
-which macOS does not drive, and HVF offers neither (`hvf_get_supported_cpuid`
-masks VMX out, read from code), so there the command is unchanged and
-`check` has nothing to drop. QEMU's CPU models leave VMX off, though they
+which macOS does not drive, so there the command is unchanged and `check`
+has nothing to drop. QEMU's CPU models leave VMX off, though they
 carry its capability MSRs for when it is on. A VM's `-vmx` or `vmx=off` in
 `cpu_flags` takes it away: QEMU applies `name=value` flags in order, as
 global properties when the vCPU is made, and `+` and `-` ones after them,
@@ -1685,73 +717,11 @@ sends no length byte after GET_KEY_BY_INDEX's index, nor after
 GET_KEY_TYPE's key: a device that waits for one leaves AppleSMC reading the
 status port about 33,000 times a second until its timeout.
 
-### x86-64 macOS guests: displays wider than 2048 pixels
-
-Without ReimsVgpu.kext, an x86-64 macOS guest's WindowServer dies at boot,
-often enough to matter, on a display wider than 2048 pixels. The guest then
-comes up at the login window instead of logging in on its own, and later
-shows "WindowServer quit unexpectedly". METAL_ERROR_MODE (above) does not
-change it.
-
-The OpenCore image reims-util makes carries ReimsVgpu.kext, which loads on
-macOS 26 alone. Among its patches, it stops the plugin refusing the tiles
-below (its guard in `-[AppleParavirtTexture initTiledWithBuffer:...]`), and
-the host accepts them by the bytes they read: the slices before the last at
-full strides, and the last to its furthest mip's last pixel, not a full
-stride past it (`slice_footprint_fits` in core's
-`resources/texture/dimension.rs`). Apple's framework counts full strides, as
-the plugin does, so a guest with the kext on it would still die. An image
-from an older reims-util has no kext: reims-ctl says so in the VM's details,
-and `reims-ctl update-opencore` (`U` in its interface) replaces it with a new
-one presenting the same Mac.
-
-The cause is in the guest, between its WindowServer and its Metal plugin for
-the PCI device, read from the code of macOS 26.6.1's (25G76) x86-64
-SkyLight and plugin:
-- SkyLight draws a window of at least 1024 × 1024 pixels' area in tiles of
-  1024 × 1024 pixels, from the left and the top. Each tile is a texture
-  made with `newTiledTextureWithDescriptor:offset:bytesPerRow:` over a
-  no-copy buffer of the window's pixels, the buffer ending within a page of
-  the window's last row. Its client storage debug option, off by default,
-  would make private textures instead; arm64 SkyLight makes private
-  textures.
-- The plugin counts a tile's bytes as its offset plus its rows times the
-  window's bytes per row, and refuses a tile that ends past the buffer. So
-  every tile of the bottom row but the first is refused: the count runs
-  past the buffer's end by the tile's offset in the row.
-- SkyLight keeps the textures it got in a list, skipping the refused ones,
-  and draws tile *n* with the list's *n*th entry, unchecked. With two tiles
-  across (2048 pixels or narrower) the one missing entry falls inside the
-  list's allocation; with three or more, the reads land past it, and
-  WindowServer dies on a texture pointer into freed memory, in the plugin's
-  `IOAccelResourceListAddResource`. Where its first command buffer is still
-  queued, the guest kernel frees WindowServer's objects under it, and the
-  host logs `task 1: exec faulted: resource 14 not found`, then sees a GPU
-  restart; a death before it leaves no line on the host.
-
-No answer of the host's reaches the plugin's count, so a guest on Apple's
-framework would meet it too (not measured).
-
-**Measured** with a macOS 26.6.1 guest, from fresh overlays. WindowServer's
-log holds the plugin's refusal at each boot: at 2560 × 1600, allocations of
-16388096 and 16392192 bytes against a buffer of 16384000 (the bottom row's
-second and third tiles); at 1920 × 1080, one of 8298496 against 8294400.
-Without the kext, 2560 × 1600 died at 4 boots of 4 windowed on an RTX 3090
-(1 of 3 headless) and at 13 of 29 on an Iris Xe, 2304 × 1440 at 2 of 2, and
-2176 × 1360, 2048 × 1280 and 1920 × 1080 at none. With the kext, on an RTX
-5080 Laptop GPU, a host counting full strides refused 530 tiles and
-WindowServer died; on the real extent it refuses none, and WindowServer ran
-13 minutes with no crash report.
-
-**Unknown**: what the guest shows of a refused tile at 2048 pixels or
-narrower without the kext (the bottom-right tile of a large window), and an
-x86-64 guest older than macOS 26, which the kext does not load on.
-
 ### x86-64 macOS guests: VMware SVGA
 
 reims-ctl runs an x86-64 VM with `graphics = "vmware-svga"` on QEMU's VMware
-SVGA II in apple-gfx's slot, which the library takes no part in, in QEMU's
-own window:
+SVGA II in the slot `reims-graphics-pci` takes otherwise, which the
+library takes no part in, in QEMU's own window:
 
 ```sh
 -vga none -device vmware-svga,id=gfx,bus=pcie.0,addr=0x4 -display gtk
@@ -1763,8 +733,7 @@ until `reims-ctl update` builds one.
 Where the environment names no Wayland compositor or X server, GTK's window
 ends QEMU as it starts, so reims-ctl gives such a VM `-display none` there.
 Closing the window ends QEMU at once (`gd_window_close`, `qmp_quit`), as
-closing the library's does (apple-gfx's `apple_gfx_input_close`,
-`qemu_system_shutdown_request`).
+closing the library's window powers the VM off.
 
 **Measured** with a macOS 26.6.1 guest on reims-ctl's command line, on an
 RTX 5080 Laptop GPU host:
@@ -1783,55 +752,20 @@ RTX 5080 Laptop GPU host:
 or OpenCore's `UEFI > Output > Resolution`), whether a larger one fits the
 device's default 16 MiB of VRAM, and the window on GNOME or under X11.
 
-### App Nap
-
-macOS naps an application none of whose windows the person sees: QEMU's
-window behind another application's, or hidden. While an `apple-gfx` device
-is realized, QEMU holds a user-initiated activity, which keeps App Nap away
-(`hw/display/apple-gfx-activity.m`, `a771139e82`). The first device's
-realize begins it and the last device's finalize ends it. Its options are
-`NSActivityUserInitiatedAllowingIdleSystemSleep`, not
-`NSActivityUserInitiated`, which would also keep the host from idle sleep
-for as long as QEMU runs ([lessons.md](lessons.md)). In window mode the
-library holds an activity of its own for the process's life
-(`reims-vgpu-window`'s `native/macos/app.rs`). Under `-display cocoa`, or any display
-whose windows are QEMU's, nothing else holds one.
-
-**Measured** on the M3 Max under `-display cocoa`, with the Vulkan platform
-and macOS 13.6 to 26.6.2 guests. Without an activity, RunningBoard naps
-QEMU 30 to 50 s after it last lost the focus (`Set AppNap state: <...
-active:Y ...>` in runningboardd's log), and the next focus (`SETFRONT:
-pid=<QEMU's>`) ends the nap within the millisecond. Napped, every named QEMU
-thread runs at priority 4 or below, the vCPUs, `qemu_main` and the library's
-FIFO, display and task threads among them, and Metal's compiler service runs
-QEMU's compiles at 0 to 4. A 26.6.2 guest booted with the Vulkan platform's
-shader cache empty and its window in the background reached its desktop at
-215 s, its longest gap between frames 46.5 s, with 10 GPU Timeouts. With the
-activity the same boot, in the background throughout, was never napped and
-reached its desktop at 53 s, as a boot kept in front does, its longest gap
-between frames 7.4 s, with no GPU Timeout.
-[lessons.md](lessons.md) says how to read a run's nap state from the host's
-log.
-
 ## Signing
 
-QEMU's build signs `qemu-system-aarch64` ad hoc with
-`com.apple.security.hypervisor` and no hardened runtime. The library is
-linked into it statically, so that signature covers it, and dyld loads
-nothing of the library from a file. Isolated tasks run in QEMU's process,
-under the same signature.
+On a Mac, QEMU's build adds entitlements only to an emulator whose target
+has HVF (`accel/hvf/entitlements.plist`), which `qemu-system-x86_64` on an
+arm64 Mac has not, so the binary carries the linker's ad hoc signature
+alone. The library is linked into it statically, so that signature covers
+it. `cargo xtask dist` signs `libreims_vgpu.dylib` ad hoc, for hosts that
+link it.
 
-- `cargo xtask dist` signs `libreims_vgpu.dylib` ad hoc, for hosts that link
-  it (the suite's runner). An ad hoc signature is enough for a process
-  without library validation. A host under the hardened runtime that loads
-  the dylib by an `@rpath` name is **not measured**.
-- Apple's own GPU task service carries a private entitlement for protected
-  content, `com.apple.private.ggdsw.GPUProcessProtectedContent`, which only
-  Apple's signature can carry: a trivial ad hoc binary signed with it is
-  killed at exec (SIGKILL, exit 137; **measured** on the M3 Max).
-  QEMU enables no protected content.
-- Every Rust binary is arm64, as QEMU is ([architecture.md](architecture.md)
-  D32).
+Apple's own GPU task service carries a private entitlement for protected
+content, `com.apple.private.ggdsw.GPUProcessProtectedContent`, which only
+Apple's signature can carry: a trivial ad hoc binary signed with it is
+killed at exec (SIGKILL, exit 137; **measured** on the M3 Max). QEMU's
+signature carries none, so Metal makes no protected content for it.
 
 ## Booting a guest to check a change
 
@@ -1842,20 +776,18 @@ that what it shows is the change's:
 - **GPU work holds first.** Before the boot starts, everyone who may run
   GPU work is told to hold it until the boot ends: any test that opens a
   Metal or Vulkan device, and, when the boot's timings are compared with
-  another's, local builds too. A cold boot compiles its pipelines on the
-  CPU: a macOS 15.6.1 guest reached its desktop in 74 s beside other
-  builds, and in 32 s alone (**measured** on the M3 Max).
+  another's, local builds too, since a cold boot compiles its pipelines on
+  the CPU.
 - **Copies only.** A boot runs on an APFS clone, a copy or a `snapshot=on`
   overlay of the guest's disk, and a step that changes the guest's state (a
   `defaults write`, an app relaunched with new settings, a file written)
   runs only there; a harness refuses it on a guest's own disk, naming the
   disk. On a persistent disk such a step can leave a fault the guest never
   repairs: an x86-64 macOS 26 guest whose Dock was relaunched with new
-  settings while its icon service was failing ("x86-64 macOS guests:
-  Metal's error mode", above) saved an icon cache of blank icons, and its
-  Dock never came back. A damaged disk is copied again from its source.
-  Before blaming the guest or the platform for a broken disk, read what our
-  own steps did on it.
+  settings while its icon service was failing saved an icon cache of blank
+  icons, and its Dock never came back. A damaged disk is copied again from
+  its source. Before blaming the guest or the platform for a broken disk,
+  read what our own steps did on it.
 - **The screen is checked.** Each boot checks a screendump of its desktop:
   the Dock shown, the wallpaper not flat, the menu bar there, and a fixed
   alert's corners and background against a known-good one. A boot can pass
@@ -1867,9 +799,9 @@ that what it shows is the change's:
   capture of the host's screen, which reaches into the session of the
   person at the host: a single-instance screen recorder's command line
   attaches to the recorder already running and ends its recording.
-- **A Metal control.** On a Mac, a guest that misbehaves on the Vulkan
-  platform boots beside a Metal-platform control of the same guest and
-  build, so the difference is known to be the platform's.
+- **A control.** A guest that misbehaves boots beside a control that
+  changes one thing back (the library of the branch's base, or the last
+  good kext set), so the difference is known to be the change's.
 - **The steps cover what the change reaches.** A change to pixel formats
   boots to the desktop and plays video in Safari; the window's walk
   (resize, zoom, full screen, minimise, close) runs once for a change to
@@ -1886,599 +818,15 @@ that what it shows is the change's:
   teardown after the run's work is done (exit 139), which is QEMU's own,
   and a lone GPU hang the driver reports (an NVIDIA Xid) that the same boot
   run again does not show. A crash while the guest runs is in scope.
-- **A known class, counted apart**: on `apple-gfx-pci`, the `exec faulted`
-  warnings of a guest without Metal's error mode key, from icon services
-  that end as they start ("x86-64 macOS guests: Metal's error mode"): 4 in
-  a 26.7.2 guest's first 126 s on a Radeon 780M, each with a `gpuRestart`
-  report, and none in 98 s once the key was set (2026-11-07). A boot that
-  needs a quiet log writes the key in its own overlay.
 
-## Running a vmapple VM
+## arm64 guests
 
-What the machine needs (`docs/system/arm/vmapple.rst` in vendor/qemu):
-
-- **A guest**: a VM installed with Virtualization.framework, for example with
-  `macosvm`: its `disk.img`, its `aux.img` trimmed of its first 16 KiB block
-  (`dd if=aux.img of=aux.img.trimmed bs=$((0x4000)) skip=1`), and the ECID
-  from the base64 `machineId` plist in `vm.json` (`contrib/vmapple/uuid.sh`),
-  which `-M vmapple,uuid=` takes in decimal. macOS 13 boots with
-  `663b9b9c0b` (a boot without it is **unknown**), and macOS 14 and later
-  boot too: the machine changes their kernel's memory and device tree as
-  iBoot enters the kernel ("macOS 14 and later guests", below).
-- **Boot ROM**: `-bios
-  /System/Library/Frameworks/Virtualization.framework/Resources/AVPBooter.vmapple2.bin`,
-  Virtualization.framework's, not this library's.
-- **Interrupts**: `-accel hvf,kernel-irqchip=on`, which `4a2e2b3967` makes
-  work. `kernel-irqchip=off` (the default) is **unknown**.
-- **Option ROM**: none. `vmapple`'s `apple-gfx-mmio` has no ROM; the
-  `ReimsVgpu.rom` QEMU installs is `apple-gfx-pci`'s, an EFI option ROM
-  holding an x86-64 boot-service driver (`file`: "BIOS (ia32) ROM Ext.
-  (11*512)"), built from `firmware/` ([architecture.md](architecture.md)
-  11.4).
-
-### The guest
-
-The measurements of this file at `vmapple` name a guest by its version.
-"The macOS 13.6 guest" is **macOS 13.6 Ventura, 22G120**, set up with
-`macosvm` at 2560x1600: its System volume's `SystemVersion.plist` says
-`ProductVersion 13.6`, `ProductBuildVersion 22G120`, and About This Mac in
-the booted guest says "macOS Ventura 13.6", "Apple M1 (Virtual)", "Apple
-Virtual Machine 1". It has finished Setup Assistant and logs its owner's
-account in automatically. Its `hardwareModel` says `PlatformVersion 2`,
-minimum OS 12.0.0. It is `/Users/aneesiqbal/Projects/macos-gpu-re/guest-13`
-(`disk.img`, `aux.img`, `vm.json`), beside the 14.6.1, 15.6.1 and 26.6.2
-guests in `guest-14`, `guest-15` and `guest-26`. `vm_drive.py`'s default
-`GUEST` still names the directory it was in before, `guest`, which this
-host no longer has: give a run its guest with `--vm`.
-
-### Driving a guest over SSH
-
-The first time something run over SSH controls an app (Apple Events:
-`osascript`, System Events, UI scripting, screen actions), macOS shows a
-privacy prompt on the guest's own screen, "sshd-keygen-wrapper wants access
-to control <app>", with Don't Allow and OK (or Allow). The command blocks,
-or fails, until the prompt is answered, and SSH cannot answer it. It comes
-once per controlled app (System Events, Finder, Safari, ...), on every
-guest version, x86 and arm64 alike, and again on a fresh clone. Answer it on
-the screen through QMP: `send-key` `ret` when OK is the default button, or
-an absolute pointer move and click on it (`input-send-event` through the
-tablet), then take a screendump to see it gone. Where `open -a <App>` or
-`open <URL>` does the job, use it: it sends no Apple Events and raises no
-prompt. A script that drives a guest polls for the prompt after each
-first-use call; an unanswered prompt shows only as a step that stalls.
-
-### Steps
-
-```sh
-# 1. QEMU, on the checkout's library
-make qemu
-
-# 2. the VM: APFS-clones disk.img and aux.img into the clone directory (the
-#    VM's own files are never written), trims aux, reads the ECID, and runs
-#    QEMU with no DYLD variable
-FRESH=1 scripts/internal/run_vmapple.sh path/to/macosvm-vm /tmp/vm
-# or: make vm VM=path/to/macosvm-vm CLONE=/tmp/vm
-# or, with a window for each guest display (window mode):
-# WINDOW=1 scripts/internal/run_vmapple.sh path/to/macosvm-vm /tmp/vm
-# in another shell, while it runs:
-echo 'screendump /tmp/shot.png -f png' | nc -U /tmp/vm/monitor.sock
-```
-
-`make vm` builds QEMU first, then runs the script
-(`scripts/internal/run_vmapple.sh`'s header has the details). It runs
-`build/qemu/qemu-system-aarch64`, which holds the checkout's library.
-`QEMU=` runs another build, such as a predecessor's. The script refuses a
-QEMU that links `ParavirtualizedGraphics` at all, and one that neither
-links the library by name nor defines `rvg_device_create`. The clone
-directory must be on the VM's volume, for the APFS clones.
-
-The script's header lists its options: `FRESH=1` re-clones, `PRINT_LIBS=1`
-sets `DYLD_PRINT_LIBRARIES` for QEMU, `DISPLAY_OPT=cocoa` opens QEMU's own
-window, and `MEM`, `CPUS` and `ACCEL` set the rest (default 16 GiB, 8 vCPUs,
-`hvf,kernel-irqchip=on`); `RESOLUTION=` sets the guest's mode in window
-mode ("Window mode", above). `WINDOW=1` has the library open a window for each
-guest display under the default `-display none` ("Window mode", above);
-otherwise the script runs QEMU with `REIMS_VGPU_WINDOW=0`, and a run stays
-headless, as `vm_drive.py`'s tours need (it starts QEMU only through the
-script). The library's `REIMS_VGPU_WINDOW_*` variables pass through. It
-writes the serial console to `serial.log`, QEMU's stderr with the
-`apple_gfx*` trace to `qemu.log`, and opens an HMP monitor
-(`monitor.sock`) and QMP (`qmp.sock`), in `OUT` (default the clone
-directory).
-
-Measured facts about driving it (on the M3 Max):
-- **The pointer** is a USB tablet, which takes absolute events only: QMP
-  `input-send-event` with `abs` axes (0 to 32767) moves and clicks it, and
-  HMP's `mouse_move`, which sends relative motion, does nothing. HMP
-  `sendkey` reaches the USB keyboard.
-- **Scrolling** (macOS 13.6 guest, the machine's default
-  `usb-vmapple-tablet`, QMP `input-send-event` as the window's callbacks
-  send it, read by an AppKit window in the guest logging its scroll events
-  and its scroll offset). macOS binds its
-  AppleVirtualPlatformHIDEventDriver to the device and turns its smooth
-  scrolling on (feature report 3 set to 1). A swipe of 30 events of 6
-  points at 120 Hz with its phases, then 40 momentum events, arrives as 73
-  precise scroll events at 121 per second, with the gesture's and the
-  momentum's phases, and moves a text view 284 points for the host's 269,
-  a median 6 points every 8.4 ms; horizontally, 291 points in 58 steps.
-  The same swipe as the notches `usb-tablet` gets, one per 40 points, gives
-  6 wheel events, offset jumps of 1 to 33.5 points 50 to 183 ms apart,
-  97.5 points in all, and no momentum. Wheel notches scroll 20 points each
-  (`usb-tablet`: 5.5 to 38.5, as macOS accelerates them). Dragging is the
-  same on both, about one drag event per move.
-- **The first report after a reset**, and the first report after a scroll
-  report that returns the scroll fields to 0, are scrolls to macOS, whose
-  pointer and buttons it ignores: `usb-vmapple-tablet` sends a report of
-  nothing first, and a report that returns the fields to 0 before a pointer
-  report. Without them, the pointer's first move after the guest starts, or
-  a click right after a scroll, was lost.
-- **`DYLD_PRINT_LIBRARIES`** has to be set on QEMU's own exec: set in the
-  calling shell it is dropped, since the script runs under `/bin/bash`, a
-  platform binary, which starts with `DYLD_*` variables removed from its
-  environment (`DYLD_PRINT_LIBRARIES=1 FOO=1 /bin/bash -c env` prints `FOO`
-  alone).
-- **Beside the suite.** A VM never runs beside the behaviour-lock suite. The
-  suite's cases fault the GPU and crash processes on purpose, and a VM beside
-  them gives spoiled results. Two VMs can run at once: they do not disturb
-  each other.
-
-### Running the vmapple VM on reims-vgpu
-
-`scripts/internal/vm_drive.py` boots the guest from fresh APFS clones and
-drives it through a fixed tour on its own, with nothing else on the GPU
-("Beside the suite", above). Clicks go through QMP `input-send-event` at text
-Vision finds on the screendump (`scripts/internal/vm_ocr.swift`), or at the
-Dock's icons. Keys go through HMP `sendkey`. The tour has 22 steps:
-
-- the desktop, reached by auto-login;
-- Keyboard Setup Assistant's Quit;
-- Launchpad;
-- Maps: its "What's New" and notifications sheets, the map of Estonia, the
-  globe (ten Cmd-minus), a 200x60 drag, two Cmd-equals, two Cmd-minus, each
-  left 15 s to load tiles;
-- Photos and its "What's New";
-- Safari's start page;
-- System Settings, searched for Displays, then 1920x1080 and back to
-  1440x1080;
-- a Finder window dragged by its toolbar;
-- Mission Control.
-
-Each step is timed, and counts the frames (`apple_gfx_new_frame`), doorbells
-and interrupts in QEMU's trace. The step waits for what it expects on
-screen. If the screen stays still with no new frame for 180 s, or for the
-whole of its timeout, that is a hang, and the driver saves `sample` of
-QEMU, the trace's tail and a screendump under `hang/`. QEMU's os_log lines
-are collected by its PID: they are the system frameworks' (Metal's among
-them), since the library logs through the `log` crate and writes none there.
-Crash reports are matched by the PID in the report.
-
-`scripts/internal/vm_drive.py run --out DIR [--label L]` boots one VM. `pair
---out-base DIR --index I LABEL[=QEMU] LABEL[=QEMU]` boots two
-at once, each into `DIR/LABEL-I` and each driven on its own: a change's QEMU
-against its predecessor's. A QEMU defaults to `make qemu`'s build; a
-predecessor's comes from `make qemu` in a worktree of its own ("The QEMU
-build", above). A run's label (default: `vm`) names it in
-`result.json`, and `summary`, `perf` and `logdiff` tell runs apart by it;
-`perf`, given runs of two labels, compares them. `compare DIR_A DIR_B`
-diffs two runs' screendumps step by step: the pixels that differ by more
-than 16 in any channel below the menu bar, and Maps' placeholder grid in
-each settled Maps frame. For example:
-
-```sh
-scripts/internal/vm_drive.py pair --out-base /tmp/vm-pairs --index 1 --perf \
-  change parent=/tmp/parent-wt/build/qemu/qemu-system-aarch64
-scripts/internal/vm_drive.py compare /tmp/vm-pairs/change-1 /tmp/vm-pairs/parent-1
-scripts/internal/vm_drive.py perf /tmp/vm-pairs/change-* /tmp/vm-pairs/parent-*
-```
-
-**`--perf`** adds `perf_tour` after the tour, bursts of interactive input:
-
-- a Finder window dragged by its toolbar in two circles (pointer events at
-  60 Hz for 3 s, three times), then resized from its bottom-right corner,
-  300x200 px in and out three times;
-- Mission Control in and out six times (Ctrl-Up every 0.9 s);
-- Launchpad: three swipes each way, 0.6 s apart (Launchpad has one page on
-  this guest, so each swipe rubber-bands), then a search typed and erased
-  and the Other folder opened and closed;
-- Safari on a long page served from the host: `long_page`, 400 sections of
-  text over gradient blocks with shadows, at `http://10.0.2.2:<port>/`
-  through QEMU's user network, so it needs no Internet. It is scrolled by
-  150 wheel clicks at 60 Hz down and back up, twice, then by ten Space and
-  ten Shift-Space at 0.3 s;
-- Maps, reopened on the tour's globe: six 300 px pans at 60 Hz, 20 wheel
-  clicks in and out at 60 Hz, twice, and its zoom buttons four times each
-  way.
-
-Each burst records the wall-clock time of its first and last input. The
-continuous bursts (the drags, the resize, the scrolls, the pans and the
-wheel zooms) send pointer events at 60 Hz, and every event should bring a
-frame. The keyed ones (Mission Control, Launchpad, Space, the zoom buttons)
-leave the screen still between animations.
-
-A `--perf` run also records:
-- QEMU's trace with `-msg timestamp=on`, which prefixes every `apple_gfx*`
-  line with an ISO 8601 UTC time in microseconds (`util/log.c`,
-  `qemu_log_trylock_with_context`); the trace backend is `log`, which
-  prints no time of its own. QEMU runs with `-name
-  vm-MODE,debug-threads=on`, which names its threads ("CPU 0/HVF",
-  "qemu_main", "worker"; the library's are `reims-vgpu.*`).
-- CPU three ways: QEMU's `rusage` at exit (`wait4`); the CPU of each live
-  thread of QEMU just before quit (libproc `PROC_PIDTHREADINFO`), which
-  separates the vCPU threads, QEMU's own and the library's; and `ps -o
-  time` of QEMU every 2 s.
-- QEMU's os_log lines, by PID (ndjson), and the guest's network traffic
-  (`filter-dump`).
-
-### How the figures are defined
-
-`vm_drive.py perf` reads each run with `analyse`:
-
-- *Doorbell to interrupt.* A FIFO doorbell is a write of `n` to 0x1020,
-  which wakes child FIFO `n` (1 to 4 on this guest). The host publishes a
-  stamp by setting bit `stampIndex` in the read-to-clear mask at 0x1018 and
-  raising the interrupt. After every interrupt the guest's handler reads
-  0x1018, 0x1014 and 0x102c. The guest gives child `n` stamp index `n`, so
-  every bit it reads belongs to a FIFO it rang.
-
-  The rule: a doorbell of FIFO `n` is matched to the first read of 0x1018
-  after its line with bit `n` set. Its latency ends at the last
-  `apple_gfx_raise_irq` before that read. Doorbells rung again before the
-  match share it.
-
-  QEMU prints a write's line only after `rvg_device_mmio_write` has
-  returned (`apple_gfx_write`, on the vCPU's thread), while a FIFO's thread
-  may raise the interrupt, and print its line, before that. So the
-  interrupt can be printed before the doorbell it completes, when the host
-  finished first. Two rules handle that:
-  - *lenient* (the default figures): such a doorbell counts 0. The trace has
-    no stamp values, so this is the time to the next stamp the host
-    publishes for that FIFO, which may be the FIFO's earlier work. It is a
-    lower bound.
-  - *strict*: such a doorbell waits for an interrupt printed after its own
-    line. This is an upper bound, and its tail is an artifact: a FIFO that
-    goes idle leaves the doorbell waiting for its next work, seconds later.
-
-  "From the desktop" figures count only the doorbells after the boot step
-  reached the desktop.
-- *Frame interval.* The time between consecutive `apple_gfx_new_frame`
-  events inside a burst, from its first input to its last. The event comes
-  from the new-frame handler of display 0, the only display. Launchpad's
-  swipes pause, so they count with the keyed bursts.
-- *Host silent* (a stall). A doorbell of FIFO `n` followed, for more than
-  100 ms, by no interrupt at all and no read with bit `n`. Overlapping
-  intervals are merged. Each is listed with its tour step, the trace events
-  inside it and QEMU's os_log events within 0.5 s. A *slow FIFO* interval
-  is one where the matched latency exceeds 100 ms while other FIFOs may
-  progress.
-- *MMIO round trip.* The spacing of adjacent trace lines that the guest
-  issues back to back: two doorbells in a row (the guest rings a batch), and
-  0x1018 then 0x1014 then 0x102c in the interrupt handler. The guest's own
-  instructions between the two accesses are the same whatever the build, so
-  a difference between two builds is the host's MMIO path and its return to
-  the vCPU.
-- *Quiet seconds.* The guest downloads on its own ("What the guest does on
-  its own", below), which loads the guest and QEMU whatever the build. The
-  *quiet* figures keep only the seconds, ±2 s, in which neither guest of the
-  pair moved more than 1 MB. The pcap has its own clock (QEMU's virtual
-  clock plus a start time, `net/dump.c`); it is put on the wall clock by the
-  guest's first connection to the page server, which the driver makes at a
-  known time.
-- *Statistics.* The per-boot values of two labels are compared with an
-  exact two-sided Mann-Whitney test over the boots. For the pooled doorbell
-  latencies, a 95 % bootstrap interval of the difference resamples whole
-  boots, 400 times.
-
-### What the guest does on its own
-
-**Measured** on the macOS 13.6 guest over about 50 of the tour's boots, of
-several builds. None of these is the build's doing: each came on more than
-one build, or with the order two QEMUs started in.
-
-- **Frames that differ between any two boots**: the desktop's first frame
-  (the wallpaper not yet drawn, the Dock still rising); Ventura's wallpaper,
-  the day picture on one VM and the dusk one on the other until the switch
-  to 1920x1080 redraws it; Software Update's badge on System Settings' Dock
-  icon (about 406 to 410 px), which comes to one VM before the other;
-  Launchpad's live icons (Calendar, Clock) and its search field's caret;
-  Keyboard Setup Assistant's Quit button highlight; Safari's scroll position
-  in a burst's screendump; and Maps' globe, whose tiles stream in at
-  different levels of detail and which sits a few pixels apart after the
-  zoom keys. Two boots of one build differ in 18 137 to 162 278 pixels at
-  `maps-globe-loaded`.
-- **Maps' placeholder grid.** On 13.6 Maps draws a tile it has no data for
-  as a grid: a cream fill (249, 245, 237), fine lines of (236, 232, 224) and
-  black meridians. `vm_drive.py` counts those colours in the map area of
-  each settled Maps frame. Every frame whose map drew held 1 001 or fewer;
-  a gap is 5 000 or more. A globe drawn all in placeholder
-  held 284 097, in the stall below.
-- **A stall with the host idle**, in 1 of 20 boots of one build. After ten
-  Cmd-minus the globe came up all grid, and nothing on screen changed
-  again: in the next 122 s the trace counted no `apple_gfx_new_frame`, no
-  FIFO doorbell (`apple_gfx_write offset=0x1020`) and no interrupt, and the
-  menu bar clock stopped. The guest was alive: it went on ringing the
-  display doorbell (`offset=0x1220`) with `apple_gfx_cursor_move` as the
-  pointer moved. The trace's last GPU exchange was a normal one: the guest
-  woke FIFOs 0 and 1, QEMU raised the interrupt, and the guest read the
-  stamp mask (stamp 3), the display mask (0) and the fault flag (0). On the
-  host every FIFO thread was waiting for guest bytes in its read of the
-  ring, so the host had processed everything the guest had queued. The same
-  signature, no frame and no FIFO doorbell while the cursor still moves,
-  came in Setup Assistant on a macOS 12 guest, on another build. What the
-  guest waits on is **unknown**.
-- **Software Update.** The guest runs it in the background (DNS for `gdmf`,
-  `mesu`, `swscan` and `swcdn.apple.com`), and at a random time starts
-  fetching about 8 GB from Apple's CDN (`cdn-h3.g.aaplimg.com`,
-  `get-bx.g.aaplimg.com`), at about 40 MB/s, in about half the boots. It
-  loads the guest and QEMU (slirp in `qemu_main`, the block layer's
-  "worker" threads, vCPU 0): QEMU's CPU besides the vCPUs was 108 to 120 s
-  in the boots of one build that downloaded and 61 to 71 s in those that
-  did not.
-- **A log line of the second QEMU.** When two QEMUs start together, the one
-  that reaches Metal's shader cache second logs `list file already locked
-  (<private>)` (libCoreFSCache, no subsystem), 2 to 6 ms after Metal opens
-  the cache: in every pair, and never in a QEMU started alone. `logdiff`
-  shows it for whichever VM of a pair started second.
-
-### Every vCPU of the guest
-
-A `vmapple` secondary vCPU starts with the pointer authentication keys of
-the CPU that powers it on: `f116a9d560` gives Arm CPUs an opt-in property,
-`cpu-on-copies-pauth-keys`, under which a CPU powered on through PSCI
-CPU_ON starts with the caller's AP*Key registers instead of the reset value,
-read after the caller's state is synchronized, when it makes the call; and
-`c912618391` sets it on `vmapple`'s CPUs. Without it a macOS guest runs on
-vCPU 0 alone, and vCPUs 1 to 7 each spin a host core for the whole run
-(**measured** with the macOS 13.6 guest at `-smp 8`, `-accel
-hvf,kernel-irqchip=on`, on the M3 Max):
-- `AVPBooter.vmapple2.bin` writes all ten AP*Key registers on the boot
-  vCPU only, with one 32-bit value repeated (its `msr`s at `0x102ff8` to
-  `0x10304c`). The value differs between QEMU processes and survives HMP
-  `system_reset`. XNU on vmapple never writes them, so the secondaries keep
-  QEMU's reset zeros, though SCTLR_EL1 enables all four keys on every vCPU.
-- On a secondary, the `retaa` that ends `machine_load_context()` then fails
-  to authenticate the `thread_continue` that `machine_stack_attach()` signed
-  on CPU 0 with the IA key, and FEAT_PAuth2 corrupts the pointer (the host
-  has FEAT_FPAC but not FEAT_FPACCOMBINE, so `retaa` does not trap). CPU 1
-  panics and parks in XNU's exception-stack check (`b.lt .`, DAIF masked),
-  and CPUs 2 to 7 wait in `ldxr; wfe` behind it, loops that never exit to
-  QEMU.
-
-**Hypervisor.framework answers vmapple's PAC calls itself.** A probe (one
-vCPU at EL1, MMU off, `hvc #0` then a store to an unmapped IPA, so a call
-HVF answers itself shows only as the store's data abort, with the registers
-as HVF left them) measured, under the public API:
-- `hv_vcpu_run()` does not return for an `hvc #0` with x0 in `0xC1000000`
-  to `0xC10000FF`.
-- The PAC calls (`0xC1000000` to `0xC1000006`, and also `0xC1000007` and
-  `0xC10000FF`) return x0 = `0xffffffff`. They change neither x1 to x5 nor
-  any AP*Key register.
-- `PAC_NOP` (`0xC10000F0`) returns 0.
-- It also answers Apple's OEM UID (`0x8300FF01`, which returns the UUID
-  `3B878185-AA62-4E1F-9DC9-D6799CBB6EBB` in x0 to x3) and REVISION
-  (`0x8300FF03`, 1.0).
-- OEM FEATURES (`0x8300FEFF`), `GET_MABS_OFFSET` (`0xC3000003`),
-  `0x8100FF01` and PSCI exit to the VMM.
-
-So QEMU cannot implement XNU's paravirtualized PAC interface
-(`doc/vmapple_pac.md` and `osfmk/arm64/hv_hvc.h` at xnu-8796.141.3), and
-only Hypervisor.framework's private mode, which needs an Apple-private
-entitlement, provides the calls. Measure it again after a macOS update. The
-per-process B keys and the EL0 diversifier have no effect, and the kernel
-and every process share the firmware's one set of keys.
-
-With the keys copied, the guest's `hw.activecpu` is 8 where it was 2, its
-idle vCPU threads use 2% or less of a host core each where seven used
-100%, and eight shell busy loops in the guest run each vCPU thread at
-100%; the desktop came 7 s after QEMU started where it took 18, and QEMU's
-CPU over a `vm_drive.py run --perf` fell from 3 056 s to 247 s. HMP
-`system_reset` and a restart from the guest's Apple menu each bring all
-eight CPUs back up in one QEMU process, with the keys equal on every vCPU.
-The CPU that powers a secondary on is not always vCPU 0: in one boot vCPU 3
-started vCPU 7, which then shared the keys. XNU made no PSCI CPU_OFF in any
-of these boots, idle or loaded.
-
-**Unknowns.**
-- A PSCI CPU_OFF followed by CPU_ON under HVF. `arm_set_cpu_on()` resets
-  the target's `CPUARMState` but marks nothing dirty, so the reset state,
-  keys included, may not reach HVF when the vCPU's state was not dirty.
-- Guests other than macOS 13.6, and `-smp` values other than 1 and 8.
-- What holds back eight `yes > /dev/null` in the guest: each vCPU thread
-  gets only about 39% of a host core, although the guest's `top` shows each
-  `yes` at 99%. The eight write to one vnode.
-
-### macOS 14 and later guests
-
-Without vendor/qemu's `e1c37ea4d4`, macOS 14 and later guests stop in their
-kernel's first instructions, in a loop that the public Hypervisor.framework
-API gives QEMU no way to end. With it, macOS 13.6, 14.6.1 (23G93), 15.6.1
-(24G90) and 26.6.2 (25G83) guests installed with `macosvm` reach their
-desktops (**measured** on the M3 Max, SIP enabled). The hardware model is
-not the cause.
-
-**How it fails.** `serial.log` ends at `End of iBootStage2 serial output`,
-as the 13.6 guest's does, whose kernel writes nothing to the serial console.
-vCPU 0 then uses a whole host core and never exits, the other vCPUs stay
-powered off, and the display stays at "Guest has not initialized the
-display (yet)". HMP `info registers` and `xp /i` show vCPU 0 at the `cbnz`,
-with x0 = `0xffffffff` and the MMU still off:
-
-```
-msr  vbar_el1, x0
-mov  x0, #0xc1000000
-hvc  #0
-cbnz x0, .
-```
-
-**Why.** `0xC1000000` is SET_INITIAL_STATE, the first of vmapple's
-paravirtualized PAC calls, which Hypervisor.framework answers itself, with
-x0 = `0xffffffff` and no exit ("Every vCPU of the guest", above). The
-vmapple kernel of 14.6.1 (`kernelcache.release.vma2`) checks the result of
-every PAC call and spins if it fails, at 19 `hvc #0; cbnz x0, .` sites:
-SET_INITIAL_STATE in every CPU's start code; GET_DEFAULT_KEYS
-(`0xC1000001`), inlined 8 times behind a once-only flag; SET_B_KEYS
-(`0xC1000003`) and SET_EL0_DIVERSIFIER (`0xC1000004`) in the context
-switch, when the incoming thread's key differs from the CPU's; and
-SET_EL0_DIVERSIFIER_AT_EL1 (`0xC1000005`) in the helpers that enable and
-disable the user JOP key. The 13.6 (22G120) kernel checks none of its 18,
-and runs on whatever keys each CPU holds.
-- **Nothing gates the calls.** No site reads a device-tree property, an ID
-  register, a `vmapple-cfg` field or a boot-arg, and the
-  `DeviceTree.vma2macosap` template has no PAC property.
-- **The hardware model does not decide it.** Every guest runs the same
-  `AVPBooter.vmapple2.bin`, the only macOS booter Virtualization.framework
-  ships, and iBoot names the same platform on each (`vma2ap`, board 0x20,
-  CPID FE00). 13.6's and 14.6.1's `hardwareModel` and `aux.img` header
-  match but for the minimum OS, and 15.6.1 and 26.6.2, of a newer
-  `DataRepresentationVersion`, stop at the same spin. Virtualization.framework
-  boots all of them, so it gets the calls answered; **how** is **unknown**.
-- **The public API cannot answer them** (measured with probes).
-  `_hv_vm_config_set_isa()`, a private export, with 2, 3 or 4 makes
-  `hv_vm_create()` fail with `HV_DENIED` (`0xfae94007`) under
-  `com.apple.security.hypervisor`; the RFC series' "enable private ISA"
-  patch, marked not for merging, uses ISA 3 with
-  `com.apple.private.hypervisor`, which only Apple-signed binaries hold, so
-  it needs SIP disabled and AMFI bypassed. With EL2 enabled, HVF still
-  answers an EL1 `hvc #0` that carries a PAC function ID, while other HVCs
-  reach the guest's EL2 (EC 0x16). `smc #0` with a PAC function ID exits to
-  the VMM (EC 0x17), and `_hv_vcpu_config_set_vmkey()` changes nothing.
-
-**Booting them.** `e1c37ea4d4` makes two changes to every vmapple guest
-when iBoot enters the kernel, with no option to turn them on or off. QEMU
-catches that moment by keeping guest RAM non-executable from reset: each
-page iBoot runs is made executable on its first fetch, until a fetch lands
-between the boot arguments' `physBase` and `topOfKernelData` with x0 at
-those boot arguments, as iBoot enters the kernel.
-- Every `cbnz x0, .` that follows an `hvc #0` in that range becomes a
-  `nop`: 19 on 14.6.1, 15.6.1 and 26.6.2, none on 13.6. The guests then run
-  on the firmware's keys, as 13.6 does: every process and the kernel share
-  them, the per-process B keys and the EL0 diversifier have no effect, and
-  GET_DEFAULT_KEYS leaves the kernel the caller's x2 and x3.
-- If the device tree that the boot arguments point to has no `/filesystems`
-  node, the machine appends one, holding `DoNotUseSEP` = 1, as the root's
-  last child. 15.6.1 and 26.6.2 need it. Without it, each panics with
-  `"unencrypted data volume is not allowed" @apfs_vfsops.c:2292` (2372 on
-  26.6.2) within 3 s of QEMU's start, before its display is initialized,
-  then resets and boots again, over and over. 13.6's tree has a
-  `/filesystems` node, without the property, and is left as it is; 14.6.1's,
-  15.6.1's and 26.6.2's have none.
-- The node, 96 bytes, goes in the zeroes after the tree within its last
-  16 KiB page; the machine walks the tree to find where it ends. On 13.6,
-  14.6.1 and 15.6.1 the boot arguments' `deviceTreeLength` ends where the
-  tree does, and grows by the node. On 26.6.2 it is rounded up to the page,
-  0x8c000 for a tree that ends at 0x89c8c, and the page after it holds
-  data: the node goes inside that length, which stays as it was. The guests
-  boot with `/chosen/memory-map`'s `DeviceTree` entry left at the old
-  length.
-
-**Unknowns.**
-- Whether ISA 3 boots these guests under QEMU. It needs SIP disabled, so it
-  was not tried.
-- What else in the guest relies on the per-process PAC keys that the
-  `nop`s leave it without, or on the Secure Enclave that `DoNotUseSEP` tells
-  APFS is absent.
-- Whether macOS 12 guests still boot. The changes apply to every guest, and
-  none was tried.
-- What a VM exit per PAC call would cost. A context switch makes the
-  SET_B_KEYS and SET_EL0_DIVERSIFIER calls only when the key changes, and
-  14.6.1 makes about 1 400 context switches a second at an idle desktop,
-  and about 240 000 under `yes | cat > /dev/null` (`top -c d -stats csw`).
-
-### macOS 27 guests
-
-macOS 27 guests boot on `vmapple` with vendor/qemu's `d235e51310` and
-`fbda9c8b28`: a macOS 27.0.1 (26A434) guest, installed by reims-ctl and
-booted with its command, reaches Setup Assistant, then its login window, on
-the library's Metal platform, and without them shows a black screen
-(**measured** on the M3 Max on macOS 27). A macOS 26 guest reaches its
-desktop either way.
-
-**How it fails.** The kernel starts, with the machine's changes for macOS
-14 and later ("macOS 14 and later guests", above) at the same 19 sites.
-Upstream QEMU links each virtio device's capabilities from high offsets to
-low (MSI-X at 0x98, then 0x84, 0x70 and on down), and each of the guest's
-virtio devices, both disks and the network card, reads the PCI_CFG
-capability at 0x84, then the notify capability at 0x70 and a byte of BAR 4,
-then starts over, about 100 000 config reads a second, for as long as the
-VM runs. No device's status leaves 0, and the kernel never reaches its GPU
-driver; `page-per-vq=on` changes nothing. macOS 26 walks the same list once
-and goes on. The change's co-author found why (not measured here): macOS
-27's virtio PCI transport has a cached and a fallback capability lookup,
-which disagree on a list linked from high offsets to low.
-
-**Booting them.** `d235e51310` relinks the capabilities in ascending
-address order, keeping each one's offset and contents: always on
-`vmapple-virtio-blk-pci`, and on `virtio-net-pci` when its
-`x-ascending-capabilities` property is on. `fbda9c8b28` turns that property
-on in `vmapple`'s defaults, so a VM's command line needs no option.
-`vmapple-virtio-blk-pci` also gains Apple's vendor capability: virtio
-cfg_type 9, vendor 0x106b, 14 bytes, with its transport encryption disabled
-flag set. The co-author found a root disk without FileVault needs it.
-
-**Unknowns.**
-- Whether the vendor capability is needed beyond the order: it was not
-  tried apart from it.
-- The co-author's patch also mapped an AES device at 0x30240000 and a stub
-  it names RRTC at 0x30260000, and widened `vmapple-cfg`'s window to 1 MiB.
-  vendor/qemu carries none of them: the guest boots without them, and
-  macOS 26 makes the same accesses to those addresses.
-
-### A QEMU without a crypto library
-
-A QEMU whose configure found no crypto library (gnutls, nettle or
-libgcrypt) has no AES, and a macOS guest on its `vmapple` hangs as it
-mounts its root volume. With vendor/qemu's `c7a4f070` such a QEMU stops at
-start instead, and scripts/install-ctl.sh and `make qemu` build QEMU with
-gnutls (**measured** with reims-ctl's macOS 26 guest, booted with its
-command on snapshot overlays, on an Apple M2 Pro on macOS 27.2 and on the
-M3 Max on macOS 27.0.1).
-
-**How it fails.** `serial.log` ends at `End of iBootStage2`. The kernel
-powers its secondary CPUs on, takes the virtio devices to DRIVER_OK and
-reads about 760 requests from the root disk, then sends `vmapple`'s AES
-engine a KEY command (builtin key 3, AES-256-CBC, encrypt), a zero IV and a
-DATA command of 16 bytes. QEMU fails the DATA command (with `-d
-guest_errors` it logs `cmd_data: Failed to create cipher object`), which
-stays at the head of the engine's FIFO with every command after it, the
-FLAG that raises the guest's interrupt among them, and the engine never
-says it failed. Every vCPU then idles in WFI, the root disk sees no more
-I/O, and the display never gets a mode. A QEMU built with gnutls encrypts
-the same 16 bytes there, and the guest goes on to its desktop.
-
-**Why.** Upstream QEMU's `crypto/cipher.c` uses `cipher-stub.c.inc` when
-configure finds no crypto library, and the stub refuses every cipher. The
-engine runs its DATA commands on QEMU's ciphers. Configure takes a crypto
-library only where it finds one, so without `--enable-gnutls` whether QEMU
-has AES depends on what else the host's Homebrew holds.
-
-**The fix.**
-- `c7a4f070` has the engine check at realize that AES-128, -192 and -256
-  work in ECB and CBC mode, the key lengths and modes its KEY command
-  selects. A QEMU without them stops before the guest starts: `apple-aes
-  needs aes-128 in ecb mode, which this QEMU lacks: build it with a crypto
-  library (gnutls, nettle or libgcrypt)`.
-- install-ctl.sh installs Homebrew's `gnutls` with the other formulas, and
-  it and `make qemu` configure QEMU with `--enable-gnutls`, so configure
-  stops where gnutls is missing.
-
-## Unknowns
-
-- A VM workload that reaches an isolated task's XR10 blit pipelines, a
-  two-plane XR10+A8 texture, which the library's own shaders draw.
-- Whether an isolated task fails a guest request when Maps opens. An
-  earlier form of isolation, and the system framework, logged `Failed to
-  create Fence` there, 3 to 12 times a boot, and the guest resumed a
-  faulted child FIFO as many times. Which guest request fails is
-  **unknown**, and so is whether it matters to what Maps draws.
-- The stall in "What the guest does on its own" (above): what the guest
-  waits on.
-- On `vmapple`, guests other than macOS 13.6 under the tour, and workloads
-  heavier than the tour `scripts/internal/vm_drive.py` drives.
-- `kernel-irqchip=off`, and a boot without vendor/qemu's `663b9b9c0b`.
-- Several displays: the macOS 13.6 guest does not drive port 1 at version
-  62 ("Window mode", above), nor does the x86-64 26.7.2 guest, which reads
-  0x122c before it asks for 245. Whether a guest that negotiates 245 before
-  it reads 0x122c drives port 1, and whether the one USB tablet's pointer
-  reaches a second display.
-- The `manual` entries of `crates/reims-vgpu-window/features.md` that
-  "Window mode" does not record as measured, the guest's input, capture
-  and the system's hot keys among them.
+arm64 macOS guests ran on QEMU's `vmapple` machine on an Apple silicon Mac,
+and the machine's display was Apple's paravirtualized GPU. That device is
+gone from the library and from QEMU, so `vmapple` is not built now:
+`make qemu` builds no `qemu-system-aarch64`, and `reims-ctl` makes no arm64
+VMs. The machine's sources stay in `vendor/qemu` with the branch's commits
+for it ("What vendor/qemu carries", above), whose messages say what each
+one changes and why. arm64 guests come back with
+Ambrosia, our own arm64 firmware, which brings `vmapple` back without
+Apple's device.
