@@ -166,11 +166,29 @@ pub(crate) fn surface_pages_in_place(
     }
     let report = plain(|| raw.in_place_check_report());
     let line = plain(|| raw.in_place_check_line());
+    match verdicts(&report, line, start, class, planes) {
+        Err(why) => PagesInPlace::No(why),
+        Ok(true) => PagesInPlace::Pending,
+        Ok(false) => PagesInPlace::Yes,
+    }
+}
+
+/// The verdicts `report` gives textures over pages of `class` whose first byte lies at `start`,
+/// laid out as `planes`, on a device whose lines of memory are `line` bytes: why they do not lie
+/// in place, for the first plane and access whose verdict failed or went unchecked; else whether
+/// one is pending.
+fn verdicts(
+    report: &[String],
+    line: u64,
+    start: u64,
+    class: Class,
+    planes: &[PagesPlane],
+) -> Result<bool, String> {
     let mut pending = false;
     for (i, plane) in planes.iter().enumerate() {
         let on_lines = on_lines(start, plane, line);
         for access in Access::ALL {
-            let refused = match verdict(&report, class, access, on_lines) {
+            let refused = match verdict(report, class, access, on_lines) {
                 Verdict::Passed => continue,
                 Verdict::Pending => {
                     pending = true;
@@ -179,7 +197,7 @@ pub(crate) fn surface_pages_in_place(
                 Verdict::Failed => "found a byte beside the texels changed by",
                 Verdict::Unchecked => "made no image for",
             };
-            return PagesInPlace::No(format!(
+            return Err(format!(
                 "plane {i}: the device's check {refused} {} over {}, for rows that {} the device's \
                  lines of {line} bytes",
                 access.words(),
@@ -192,10 +210,39 @@ pub(crate) fn surface_pages_in_place(
             ));
         }
     }
-    match pending {
-        true => PagesInPlace::Pending,
-        false => PagesInPlace::Yes,
+    Ok(pending)
+}
+
+/// The bytes of a page of the guest's, from whose first byte a surface's pages, and the view
+/// that maps them, start.
+const GUEST_PAGE: u64 = 4096;
+
+/// Why textures over an IOSurface's own pages, laid out as `planes` from a page's first byte,
+/// would lie in place over no import of them `raw` makes, asked before any is made (module docs):
+/// whichever class the import takes, by their pointer or as dma-bufs, a plane's verdict for some
+/// access failed or went unchecked, and a copy of the pages holds no texture in place either. So
+/// [`surface_pages_in_place`] answers no over any buffer of them: it gives a buffer over pages of
+/// either class the verdicts of its class, after, for dma-bufs, a check that only adds refusals,
+/// and a view of the pages starts on a page's first byte, where the device's lines start too.
+/// `None` where some class's verdicts all passed or are pending, or the device's lines do not
+/// divide a page: the pages' import decides.
+pub(crate) fn surface_pages_never_in_place(
+    raw: &rt::Device,
+    planes: &[PagesPlane],
+) -> Option<String> {
+    let report = plain(|| raw.in_place_check_report());
+    let line = plain(|| raw.in_place_check_line());
+    never_in_place(&report, line, planes)
+}
+
+/// [`surface_pages_never_in_place`] from the device's `report` and `line`.
+fn never_in_place(report: &[String], line: u64, planes: &[PagesPlane]) -> Option<String> {
+    if line == 0 || !GUEST_PAGE.is_multiple_of(line) {
+        return None;
     }
+    let pointer = verdicts(report, line, 0, Class::Pointer, planes).err()?;
+    let dma_buf = verdicts(report, line, 0, Class::DmaBuf, planes).err()?;
+    Some(format!("{pointer}; {dma_buf}"))
 }
 
 #[cfg(test)]
@@ -260,5 +307,55 @@ mod tests {
             on_lines(0, &plane(0, 4000, 4000, 1), 1),
             "lines of one byte"
         );
+    }
+
+    /// Before any import, a surface's pages are answered as lying in place over none exactly
+    /// where the verdicts of both classes an import of them takes refuse them: wherever a buffer
+    /// over a view of them (which starts on a page's first byte) imported by their pointer, or as
+    /// dma-bufs, would be answered in place or pending, the answer before the import leaves it to
+    /// the import, so a surface kept in place before is kept in place still; and wherever both
+    /// would be answered no, so is the answer before. Every verdict of every access of both
+    /// classes, for rows that end inside the device's lines and for rows on them; and lines that
+    /// do not divide a page, or none, leave it to the import whatever the verdicts
+    #[test]
+    fn pages_lie_in_place_over_no_import_exactly_where_both_classes_refuse_them() {
+        let words = ["Pending", "Passed", "Failed", "Unchecked"];
+        let classes = [Class::Pointer, Class::DmaBuf];
+        let line = 64;
+        let entries: Vec<(Class, Access)> = (classes.iter())
+            .flat_map(|&c| Access::ALL.map(move |a| (c, a)))
+            .collect();
+        for plane in [plane(0, 4032, 4000, 600), plane(64, 4032, 4032, 600)] {
+            let planes = std::slice::from_ref(&plane);
+            let lines = if on_lines(0, &plane, line) {
+                ", rows on lines"
+            } else {
+                ""
+            };
+            for combo in 0..4usize.pow(entries.len() as u32) {
+                let report: Vec<String> = (entries.iter().enumerate())
+                    .map(|(k, (class, access))| {
+                        let word = words[combo / 4usize.pow(k as u32) % 4];
+                        format!("{}{}{lines}: {word}", class.name(), access.name())
+                    })
+                    .collect();
+                let never = never_in_place(&report, line, planes);
+                for start in [0, 7 * GUEST_PAGE] {
+                    let kept = (classes.iter())
+                        .any(|&c| verdicts(&report, line, start, c, planes).is_ok());
+                    assert_eq!(never.is_none(), kept, "{report:?}, a view at {start:#x}");
+                }
+            }
+        }
+        let refused: Vec<String> = (entries.iter())
+            .map(|(class, access)| format!("{}{}: Failed", class.name(), access.name()))
+            .collect();
+        let planes = [plane(0, 4032, 4000, 600)];
+        assert!(never_in_place(&refused, line, &planes).is_some());
+        assert!(
+            never_in_place(&refused, 96, &planes).is_none(),
+            "lines across a page's end"
+        );
+        assert!(never_in_place(&refused, 0, &planes).is_none(), "no lines");
     }
 }

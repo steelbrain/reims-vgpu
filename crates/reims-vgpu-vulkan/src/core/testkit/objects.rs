@@ -944,6 +944,11 @@ pub struct World {
     ///
     /// [`GpuDevice::surface_pages_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_in_place
     surface_pages: Mutex<(PagesInPlace, Vec<Vec<PagesPlane>>)>,
+    /// What the devices' [`GpuDevice::surface_pages_never_in_place`] answers
+    /// ([`World::answer_surface_pages_unmade`]).
+    ///
+    /// [`GpuDevice::surface_pages_never_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_never_in_place
+    never_in_place: Mutex<Option<String>>,
 }
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
@@ -983,6 +988,7 @@ impl World {
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
             surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
+            never_in_place: Mutex::new(None),
         })
     }
 
@@ -1002,6 +1008,24 @@ impl World {
         let mut state = self.surface_pages.lock();
         state.1.push(planes.to_vec());
         state.0.clone()
+    }
+
+    /// Has the devices answer `why` to [`GpuDevice::surface_pages_never_in_place`] from now on:
+    /// textures over pages no buffer of which is made yet lie in place over none, for that reason;
+    /// `None` at first, leaving it to [`GpuDevice::surface_pages_in_place`] over a buffer of them.
+    ///
+    /// [`GpuDevice::surface_pages_never_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_never_in_place
+    /// [`GpuDevice::surface_pages_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_in_place
+    pub fn answer_surface_pages_unmade(&self, why: Option<String>) {
+        *self.never_in_place.lock() = why;
+    }
+
+    /// What the devices answer to [`GpuDevice::surface_pages_never_in_place`]
+    /// ([`World::answer_surface_pages_unmade`]).
+    ///
+    /// [`GpuDevice::surface_pages_never_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_never_in_place
+    pub fn surface_pages_never_in_place(&self, _planes: &[PagesPlane]) -> Option<String> {
+        self.never_in_place.lock().clone()
     }
 
     /// The planes each call of [`GpuDevice::surface_pages_in_place`] was asked of, in order.

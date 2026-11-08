@@ -160,6 +160,16 @@ pub trait GpuDevice<P: Platform>: Handle {
         let _ = (pages, planes);
         PagesInPlace::Yes
     }
+    /// No Metal counterpart: why textures over an IOSurface's own pages, laid out as `planes`
+    /// from a page's first byte, would lie in place over no buffer of them this device makes,
+    /// asked before any is made: whatever the platform imports them as,
+    /// [`Self::surface_pages_in_place`] would answer no over a buffer over a view of them. `None`
+    /// where that answer may be other than no, and so is asked over the view. Asked only of a
+    /// device whose GPU shares the CPU's memory, as that is. The default is `None`.
+    fn surface_pages_never_in_place(&self, planes: &[PagesPlane]) -> Option<String> {
+        let _ = planes;
+        None
+    }
     /// No Metal counterpart: the bytes the device aligns the rows of a linear BGRA8 image to, to
     /// make one over host pages in place there, as the platform answers; 0 where it does not. On
     /// a device whose GPU shares the CPU's memory the graphics lane has the guest align its

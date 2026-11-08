@@ -108,15 +108,21 @@
 //! that copy goes back and forth at every command buffer. Such a surface takes a device cache
 //! instead, which is copied only at the CPU's locks and unlocks, as on a GPU of its own memory. A
 //! block in place asks for it at its `SURFACE_PAGES` (`RGFX_SURFACE_PAGES_ASK_CACHE`), with its
-//! surface's planes, which must lie in its bytes ([`layout_planes`]): its view is made as any
-//! block's, and the device asked whether textures over it lie in place
-//! ([`GpuDevice::surface_pages_in_place`]). Where they do, or where the device's verdict is not
-//! known yet, the block keeps its view and its buffers lie over its pages, as a block that asks
-//! nothing; where they do not, the block is answered `RGFX_STATUS_CACHE` with no view, its view
-//! left in the cache of views, and the kext posts it again marked cached, which takes that view
-//! and a device cache ([`super::surface_cache`]). The counts keep how each ask was answered.
+//! surface's planes, which must lie in its bytes ([`layout_planes`]). Where the device answers
+//! first that textures over the surface would lie in place over no buffer of its pages, whatever
+//! it imports them as ([`GpuDevice::surface_pages_never_in_place`]), the block is answered
+//! `RGFX_STATUS_CACHE` at once, with no view made ([`SurfaceViews::cache_unmade`]), where its runs
+//! pass a view's checks. Otherwise its view is made as any block's, and the device asked whether
+//! textures over it lie in place ([`GpuDevice::surface_pages_in_place`]). Where they do, or where
+//! the device's verdict is not known yet, the block keeps its view and its buffers lie over its
+//! pages, as a block that asks nothing; where they do not, the block is answered
+//! `RGFX_STATUS_CACHE` with no view, its view left in the cache of views. Either way the kext then
+//! posts the block again marked cached, which takes a device cache ([`super::surface_cache`]),
+//! and a view where it is not named by its runs, the one left in the cache where there is one.
+//! The counts keep how each ask was answered.
 //!
 //! [`GpuDevice::surface_pages_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_in_place
+//! [`GpuDevice::surface_pages_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_never_in_place
 //!
 //! **Off ring 0's threads.** A view costs a kernel mapping per run, and the runtime's import of
 //! them: real surfaces' runs are single 4 KiB pages, most laid right below the run before (measured
@@ -716,6 +722,47 @@ impl<P: Platform> SurfaceViews<P> {
             }
             Err(why) => Err(v.refused(why)),
         }))
+    }
+
+    /// An ask whether the block `pages` names needs a device cache (`RGFX_SURFACE_PAGES_ASK_CACHE`),
+    /// answered that it does before any view of `runs` is made, the device's textures lying in
+    /// place over no buffer of its pages ([`GpuDevice::surface_pages_never_in_place`]), so a view
+    /// made for the ask would be left at once: where the runs pass a view's checks and lie in the
+    /// guest RAM's mapping, any view or naming the block had goes, once the lock is let go, as at
+    /// such an answer over a view, the ask is counted, and its layout `planes` kept for the block's
+    /// cached `SURFACE_PAGES` ([`Self::take_layout`]): `Some(true)`. `Some(false)`, with nothing
+    /// changed, where the runs fail them, for the view's path to refuse them as before; `None`
+    /// where the device was reset since `settle` began it.
+    ///
+    /// [`GpuDevice::surface_pages_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_never_in_place
+    pub(crate) fn cache_unmade(
+        views: &Mutex<SurfaceViews<P>>,
+        platform: &P,
+        pages: &RgfxSurfacePages,
+        runs: &[RgfxPageRun],
+        planes: &[PagesPlane],
+        settle: &Settle,
+    ) -> Option<bool> {
+        let old = {
+            let mut v = views.lock();
+            if v.resets != settle.resets {
+                return None;
+            }
+            let Ok(key) = v.checked_runs(platform, pages, runs) else {
+                return Some(false);
+            };
+            let in_ram =
+                (v.memory.as_ref()).is_some_and(|(memory, _)| in_order(memory, &key).is_some());
+            if !in_ram {
+                return Some(false);
+            }
+            let old = v.released(pages.block_offset);
+            v.asked(Asked::Cache);
+            v.laid_out(pages.block_offset, planes.to_vec());
+            old
+        };
+        drop(old);
+        Some(true)
     }
 
     /// `SURFACE_PAGES` of a deferred block (`RGFX_SURFACE_PAGES_DEFERRED`), which has no pages
@@ -2255,6 +2302,78 @@ pub(super) mod tests {
         assert!(r.dec.views_of_surfaces().view(fourth).is_none());
         assert!(!r.dec.caches().has(fourth));
         assert_eq!(world.surface_pages_asked().len(), asked);
+    }
+
+    /// Where the device answers, before any view of a block's pages, that textures over them
+    /// would lie in place over no buffer of them, a block that asks whether it needs a device
+    /// cache is answered `RGFX_STATUS_CACHE` with no view made and nothing asked over one,
+    /// counted as answered a cache, its layout kept for its cached `SURFACE_PAGES`, which gets a
+    /// device cache. An ask whose runs fail a view's checks is refused as before. Where the device
+    /// leaves it to the view, the block is asked over its view and kept in place where the device
+    /// answers so, as before
+    #[test]
+    fn a_block_in_place_over_no_buffer_is_answered_a_cache_with_no_view() {
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.set_unified_memory(true);
+        let world = Arc::clone(r.p.world());
+        let layout = one_plane(page, page - 16, 2);
+        let planes = vec![PagesPlane {
+            offset: 0,
+            bytes_per_row: page,
+            row_bytes: page - 16,
+            rows: 2,
+        }];
+        world.answer_surface_pages(PagesInPlace::Yes);
+        world.answer_surface_pages_unmade(Some("no import's rows lie on its lines".into()));
+
+        let made = r.dec.views_of_surfaces().counts().made;
+        assert_eq!(
+            r.pages_asking(BLOCK, &[(1, 2)], 2 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        {
+            let mut views = r.dec.views_of_surfaces();
+            assert_eq!(views.counts().made, made, "no view made");
+            assert_eq!(views.counts().asked_cache, 1);
+            assert!(views.view(BLOCK).is_none());
+            let kept = views.take_layout(BLOCK);
+            assert_eq!(kept.as_ref(), Some(&planes), "the layout, for the cache");
+            views.laid_out(BLOCK, planes.clone());
+        }
+        assert!(
+            world.surface_pages_asked().is_empty(),
+            "nothing asked over a view"
+        );
+        assert!(!r.dec.caches().has(BLOCK));
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.caches().has(BLOCK));
+        assert!(
+            r.dec.views_of_surfaces().take_layout(BLOCK).is_none(),
+            "taken by the cache"
+        );
+
+        // Runs past guest RAM: refused, as the view's path refuses them.
+        let second = BLOCK + 0x8000;
+        assert_eq!(
+            r.pages_asking(second, &[(100, 2)], 2 * page, Some(layout)),
+            RGFX_STATUS_REFUSED
+        );
+        assert_eq!(r.dec.views_of_surfaces().counts().asked_cache, 1);
+
+        // Left to the view: asked over it, and in place.
+        world.answer_surface_pages_unmade(None);
+        let third = BLOCK + 0x10000;
+        assert_eq!(
+            r.pages_asking(third, &[(5, 2)], 2 * page, Some(layout)),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(world.surface_pages_asked(), vec![planes]);
+        assert!(r.dec.views_of_surfaces().view(third).is_some());
+        assert!(!r.dec.caches().has(third));
     }
 
     /// Runs that are not whole pages, that do not sum to the surface's length, or that lie
