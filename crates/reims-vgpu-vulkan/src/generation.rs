@@ -71,15 +71,16 @@ fn handle_of(generation: &rt::Device) -> vk::Device {
 impl Generation {
     /// The generation of `queue`'s device that serves, with the `VkQueue` `queue` submits to there
     /// and its family; `Err` where the device recovered each time the two were taken
-    /// ([`TAKES`]). The generation is taken before the queue and again after it: where both are
-    /// the same, the queue's place is on it.
+    /// ([`TAKES`]). The generation is taken before the queue, which `with_vk_queue` hands out with
+    /// the `VkDevice` it belongs to: where that is the generation's, the queue's place is on it.
     pub(crate) fn serving(queue: &rt::CommandQueue) -> Result<Generation, String> {
         for _ in 0..TAKES {
             let device = generation_serving(queue.device());
-            // SAFETY: the closure keeps no handle and calls nothing.
-            let (vk_queue, family) = unsafe { queue.with_vk_queue(|_, q, family| (q, family)) };
             let handle = handle_of(&device);
-            if handle_of(&generation_serving(queue.device())) == handle {
+            // SAFETY: the closure keeps no handle and calls nothing.
+            let (on, vk_queue, family) =
+                unsafe { queue.with_vk_queue(|d, q, family| (d.handle(), q, family)) };
+            if on == handle {
                 return Ok(Generation {
                     device,
                     handle,
