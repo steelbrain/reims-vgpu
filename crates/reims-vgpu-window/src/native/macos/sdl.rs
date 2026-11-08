@@ -201,6 +201,9 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, taken: &[Frame]) -> O
     msg::get("setFrame:display:", || {
         ns_window.setFrame_display(frame, false);
     });
+    if !borderless {
+        appkit::step_resizes(&ns_window);
+    }
     let Some(metal_view) = attach_layer(window, sdl) else {
         destroy();
         return None;

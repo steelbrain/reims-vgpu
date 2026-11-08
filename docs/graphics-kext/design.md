@@ -1400,8 +1400,13 @@ stage 2.
 | 0x102 | `DISPLAY_CHANGED` | display u32; the guest asks `GET_DISPLAYS` again |
 | 0x103 | `VBLANK` | display u32, count u64, host time in ns u64 |
 
-**Display.** The modes offered are the host window's size and its screen's
-refresh rate (the guest runs at the host screen's rate). The host presents the
+**Display.** The modes offered are the host window's size, its width rounded
+down to a multiple of 16 pixels and its height to even, and its screen's
+refresh rate (the guest runs at the host screen's rate). 16 BGRA8 pixels are a
+64-byte line of the GPU's memory: a guest surface of the mode's width over the
+guest's RAM, as the desktop's are, starts and ends each row on a line, which
+Intel's Vulkan driver needs to draw it in place (the window crate's
+`geometry`). The host presents the
 scanout buffer to the display's window at each refresh while the window shows
 no presented surface, with no dirty log: the scanout shows only at boot and in
 recovery, where its full cost is paid for the simpler design (owner,

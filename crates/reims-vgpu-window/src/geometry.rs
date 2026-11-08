@@ -10,6 +10,17 @@
 //! fall on whole pixels, and [`Layout::image`] is that pixel rectangle again in points. The
 //! pointer is mapped through the same rectangle, so the guest pixel under the host's pointer is
 //! the one drawn there.
+//!
+//! **The guest's modes are a multiple of 16 pixels wide** ([`MODE_WIDTH_STEP`], [`offered_mode`]).
+//! The guest's desktop surfaces are its mode's width in BGRA8 pixels, 4 bytes each, and a
+//! surface over the guest's RAM is drawn in place only where each of its rows starts and ends on
+//! a line of the GPU's memory: on Intel's Vulkan driver (ANV) a render pass writes back whole
+//! 64-byte lines, so the bytes past a row's last pixel on its last line would be written too.
+//! 16 pixels are 64 bytes. Measured by metal2vulkan's lane on homelab-ms01's Iris Xe
+//! (2026-11-07): the guest's 3662-pixel desktop surface, 14648 bytes a row (ending 56 bytes
+//! into a line), stayed a copy of the guest's pages, 2.54 ms of the GPU's time a plain frame and
+//! 3.94 ms a frame that reads its own pixels. Padding a row's bytes alone does not help: the
+//! row's last line still holds bytes past its last pixel.
 
 use crate::config::{BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE};
 use crate::handle::PixelRect;
@@ -133,26 +144,50 @@ pub fn layout(bounds: (f64, f64), scale: f64, insets: Insets, guest: Option<(u16
     }
 }
 
+/// The pixels the width of every mode offered the guest is a multiple of: 16 BGRA8 pixels are
+/// a 64-byte line of the GPU's memory, so each row of a guest surface of the mode's width starts
+/// and ends on a line (the module doc).
+pub const MODE_WIDTH_STEP: u64 = 16;
+
+/// The pixels the height of every mode offered the guest is a multiple of: the guest kext
+/// offers a mode HiDPI only where its pixels halve exactly (guest/kext's `RgfxMode::hiDpi`).
+pub const MODE_HEIGHT_STEP: u64 = 2;
+
 /// The guest mode a window that keeps its size offers the guest, for a drawable of `drawable`
-/// pixels: those pixels rounded down to even each way (and 1 where the drawable is 1). The
-/// guest kext offers a mode HiDPI only where its pixels halve exactly (guest/kext's
-/// `RgfxMode::hiDpi`), and at a fractional scale a window's pixels are often odd: a borderless
-/// window on a 3840 × 2160 screen at 2.1 is the screen's 1828.57 × 1028.57 points rounded to
-/// 1829 × 1029, which SDL's Wayland backend makes 3841 × 2161 pixels (points times the scale,
-/// rounded), and is offered 3840 × 2160, the screen's own pixels.
+/// pixels: its width rounded down to a multiple of [`MODE_WIDTH_STEP`] and its height to a
+/// multiple of [`MODE_HEIGHT_STEP`] (a side below its step is kept). Both halve exactly, as a
+/// HiDPI mode's pixels must. A window's pixels are often neither: a resize of the person's, or a
+/// borderless window at a fractional scale, as on a 3840 × 2160 screen at 2.1, the screen's
+/// 1828.57 × 1028.57 points rounded to 1829 × 1029, which SDL's Wayland backend makes 3841 × 2161
+/// pixels (points times the scale, rounded), offered 3840 × 2160, the screen's own pixels. The
+/// layout draws that mode a guest pixel to a pixel at the drawable's top left ([`fit`]).
 pub fn offered_mode(drawable: (u64, u64)) -> (u64, u64) {
-    let even = |pixels: u64| if pixels >= 2 { pixels & !1 } else { pixels };
-    (even(drawable.0), even(drawable.1))
+    let down = |pixels: u64, step: u64| {
+        if pixels >= step {
+            pixels - pixels % step
+        } else {
+            pixels
+        }
+    };
+    (
+        down(drawable.0, MODE_WIDTH_STEP),
+        down(drawable.1, MODE_HEIGHT_STEP),
+    )
 }
 
 /// The largest rectangle of `guest`'s ratio in `area`, on whole pixels, centred (to within half
 /// a pixel). One side fills the area; the other is the ratio's, rounded, at least 1. A guest
-/// mode of the area's pixels, or at most one fewer each way, is drawn a guest pixel to a pixel,
-/// at the area's top left: that is the mode a window of odd pixels offers ([`offered_mode`]),
-/// which shows whole and unscaled, beside a column or row of black.
+/// mode of the area's pixels, or fewer by less than a step each way ([`MODE_WIDTH_STEP`],
+/// [`MODE_HEIGHT_STEP`]), is drawn a guest pixel to a pixel, at the area's top left: that is the
+/// mode a window offers for its pixels ([`offered_mode`]), which shows whole and unscaled,
+/// beside up to 15 columns and a row of black.
 fn fit(area: PixelRect, guest: (u16, u16)) -> PixelRect {
     let (gw, gh) = (u64::from(guest.0), u64::from(guest.1));
-    if gw <= area.width && gh <= area.height && area.width - gw <= 1 && area.height - gh <= 1 {
+    if gw <= area.width
+        && gh <= area.height
+        && area.width - gw < MODE_WIDTH_STEP
+        && area.height - gh < MODE_HEIGHT_STEP
+    {
         return PixelRect {
             x: area.x,
             y: area.y,
@@ -431,14 +466,25 @@ mod tests {
         assert_eq!(l.drawable, (1, 1));
     }
 
-    /// The mode offered for a drawable is its pixels rounded down to even, and a guest at that
-    /// mode is drawn a guest pixel to a pixel, at the top left, beside a column or row of black
+    /// The mode offered for a drawable is its width rounded down to a multiple of 16 pixels and
+    /// its height to even, and a guest at that mode is drawn a guest pixel to a pixel, at the top
+    /// left, beside up to 15 columns and a row of black
     #[test]
-    fn an_odd_drawable_offers_an_even_mode_drawn_unscaled() {
+    fn a_drawable_offers_a_mode_a_multiple_of_16_wide_drawn_unscaled() {
         assert_eq!(offered_mode((3841, 2161)), (3840, 2160));
-        assert_eq!(offered_mode((3662, 2039)), (3662, 2038));
+        assert_eq!(offered_mode((3662, 2039)), (3648, 2038));
+        assert_eq!(offered_mode((3663, 2040)), (3648, 2040));
         assert_eq!(offered_mode((3840, 2160)), (3840, 2160));
+        assert_eq!(offered_mode((1366, 768)), (1360, 768));
+        assert_eq!(offered_mode((15, 9)), (15, 8));
         assert_eq!(offered_mode((1, 1)), (1, 1));
+        // Every mode a wide drawable offers starts each BGRA8 row on a 64-byte line, and halves
+        // exactly.
+        for width in 16..4000 {
+            let (w, h) = offered_mode((width, width / 2 + 1));
+            assert_eq!((w * 4) % 64, 0, "{width}");
+            assert!(width - w < MODE_WIDTH_STEP && h % 2 == 0 && (w / 2) % 8 == 0);
+        }
         // Borderless on a 3840 × 2160 screen at 2.1: 1829 × 1029 points, 3841 × 2161 pixels,
         // which show the 3840 × 2160 offered whole.
         let l = layout(
@@ -455,12 +501,15 @@ mod tests {
             height,
         };
         assert_eq!(l.pixels, whole(3840, 2160));
-        // A window of 3662 × 2039 pixels shows 3662 × 2038 whole.
-        let l = layout((3662.0, 2039.0), 1.0, NO_INSETS, Some((3662, 2038)));
-        assert_eq!(l.pixels, whole(3662, 2038));
-        // A guest two pixels narrower and lower is fitted as any other: scaled to fill a side.
-        let l = layout((3842.0, 2162.0), 1.0, NO_INSETS, Some((3840, 2160)));
-        assert_eq!(l.pixels.width, 3842);
+        // A window of 3662 × 2039 pixels shows 3648 × 2038 whole, beside 14 columns and a row.
+        let l = layout((3662.0, 2039.0), 1.0, NO_INSETS, Some((3648, 2038)));
+        assert_eq!(l.pixels, whole(3648, 2038));
+        // A guest 16 pixels narrower, or 2 lower, is fitted as any other: centred, filling a side.
+        let l = layout((3856.0, 2160.0), 1.0, NO_INSETS, Some((3840, 2160)));
+        assert_eq!(l.pixels.height, 2160);
+        assert_ne!(l.pixels, whole(3840, 2160));
+        let l = layout((3850.0, 2162.0), 1.0, NO_INSETS, Some((3840, 2160)));
+        assert_eq!(l.pixels.height, 2162);
     }
 
     /// With no guest mode yet, the image is the whole area inside the insets

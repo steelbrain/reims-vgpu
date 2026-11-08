@@ -195,8 +195,8 @@ impl DiskController {
 /// ([`Display::window_size`]) and keeps the size the person gives it, which the guest follows, at
 /// the refresh rate of the host screen it is on. The guest starts a HiDPI desktop by itself in a
 /// window at least 3840 pixels wide, and offers one in its Displays settings from 2880 (the
-/// kext's HiDPI modes, whose pixels halve exactly: the guest is offered the window's pixels
-/// rounded down to even). Settings an older reims-ctl saved for apple-gfx's displays (their
+/// kext's HiDPI modes, whose pixels halve exactly: the guest is offered the window's pixels, the
+/// width rounded down to a multiple of 16 and the height to even). Settings an older reims-ctl saved for apple-gfx's displays (their
 /// count, HiDPI and refresh rate) are read past, and left out of the next save.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

@@ -427,9 +427,10 @@ struct Sizing {
 
 impl Sizing {
     /// The content of a frame at most `room`: one guest point per host point, shrunk with its
-    /// ratio kept where it does not fit ([`geometry::initial_content_size`]), on an even number
-    /// of whole pixels, so the drawable is the content exactly and the mode the guest is offered
-    /// for it ([`geometry::offered_mode`]) is the whole drawable.
+    /// ratio kept where it does not fit ([`geometry::initial_content_size`]), on whole pixels, a
+    /// multiple of [`geometry::MODE_WIDTH_STEP`] wide and of [`geometry::MODE_HEIGHT_STEP`]
+    /// high, so the drawable is the content exactly and the mode the guest is offered for it
+    /// ([`geometry::offered_mode`]) is the whole drawable.
     fn content(&self, room: NSSize) -> NSSize {
         let (width, height) = geometry::initial_content_size(
             self.mode,
@@ -439,16 +440,19 @@ impl Sizing {
                 room.height - self.chrome.height,
             ),
         );
-        let whole = |points: f64| {
-            let pixels = (points * self.scale).floor();
-            let even = if pixels >= 2.0 {
-                pixels - pixels % 2.0
+        let whole = |points: f64, step: u64| {
+            let (pixels, step) = ((points * self.scale).floor(), step as f64);
+            let aligned = if pixels >= step {
+                pixels - pixels % step
             } else {
                 pixels
             };
-            (even / self.scale).max(1.0)
+            (aligned / self.scale).max(1.0)
         };
-        NSSize::new(whole(width), whole(height))
+        NSSize::new(
+            whole(width, geometry::MODE_WIDTH_STEP),
+            whole(height, geometry::MODE_HEIGHT_STEP),
+        )
     }
 
     /// The frame around `content`.
@@ -610,7 +614,37 @@ fn windowed(
     msg::get("setFrame:display:", || {
         window.setFrame_display(frame, false)
     });
+    step_resizes(&window);
     window
+}
+
+/// The content resize increments of a windowed window at backing scale `scale`: a step of the
+/// guest's modes each way ([`geometry::MODE_WIDTH_STEP`], [`geometry::MODE_HEIGHT_STEP`]) in
+/// points. A window opens on such steps ([`Sizing::content`]), and the person's drag of an edge
+/// changes its content by whole steps, so the mode the guest is offered for it
+/// ([`geometry::offered_mode`]) stays the whole drawable, with no black beside it. AppKit's zoom,
+/// full screen and tiling take no increments, and neither does a move to a screen of another
+/// scale: a content of whole steps at 2× can be 8 pixels off a step at 1×, whatever the
+/// increments there.
+fn resize_increments(scale: f64) -> NSSize {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    NSSize::new(
+        geometry::MODE_WIDTH_STEP as f64 / scale,
+        geometry::MODE_HEIGHT_STEP as f64 / scale,
+    )
+}
+
+/// Sets windowed `window`'s content resize increments for its backing scale as it opens
+/// ([`resize_increments`]).
+pub(crate) fn step_resizes(window: &NSWindow) {
+    let scale = msg::get("backingScaleFactor", || window.backingScaleFactor());
+    msg::get("setContentResizeIncrements:", || {
+        window.setContentResizeIncrements(resize_increments(scale));
+    });
 }
 
 /// `rect`, in AppKit's screen coordinates (y up), in [`geometry`]'s (y down).
@@ -1020,7 +1054,7 @@ mod tests {
         // The fit: 368x229 of content, centred.
         let first = rect((16.0, 0.0), (368.0, 259.0));
         let second = cascade(first, &sizing, visible, &[first]);
-        assert_eq!(second, rect((40.0, 1.0), (328.0, 234.0)));
+        assert_eq!(second, rect((40.0, 1.0), (320.0, 234.0)));
         // A third would have 289x181 of content, below the smallest.
         assert_eq!(cascade(first, &sizing, visible, &[first, second]), second);
         for frame in [first, second] {
@@ -1032,7 +1066,7 @@ mod tests {
 
     /// A window that fills the visible area does not open over another such window: it opens 24
     /// points right and down, made smaller from there, its content keeping the guest's ratio on
-    /// an even number of whole pixels
+    /// whole pixels, a multiple of 16 wide and even high
     #[test]
     fn a_cascaded_window_shrinks_rather_than_overlap() {
         let visible = rect((0.0, 100.0), (1728.0, 1110.0));
@@ -1046,10 +1080,34 @@ mod tests {
         assert_eq!(content, NSSize::new(1728.0, 1080.0));
         let first = NSRect::new(visible.origin, sizing.frame(content));
         assert_eq!(first, visible);
-        // 1689.6x1056 of content, on an even number of whole pixels: 3378x2112.
+        // 1689.6x1056 of content, on whole pixels a multiple of 16 wide: 3376x2112.
         let second = cascade(first, &sizing, visible, &[first]);
-        assert_eq!(second, rect((24.0, 100.0), (1689.0, 1086.0)));
+        assert_eq!(second, rect((24.0, 100.0), (1688.0, 1086.0)));
         let third = cascade(first, &sizing, visible, &[first, second]);
-        assert_eq!(third, rect((48.0, 100.0), (1651.0, 1062.0)));
+        assert_eq!(third, rect((48.0, 100.0), (1648.0, 1062.0)));
+    }
+
+    /// A windowed window's edges move by a step of the guest's modes in pixels: 16 wide and 2
+    /// high, in points at its scale
+    #[test]
+    fn a_windowed_window_resizes_by_a_mode_s_steps() {
+        assert_eq!(resize_increments(2.0), NSSize::new(8.0, 1.0));
+        assert_eq!(resize_increments(1.0), NSSize::new(16.0, 2.0));
+        assert_eq!(resize_increments(f64::NAN), NSSize::new(16.0, 2.0));
+        // A content on those steps stays on them at any count of steps.
+        let sizing = Sizing {
+            mode: (3456, 2160),
+            guest_scale: 2.0,
+            scale: 2.0,
+            chrome: NSSize::new(0.0, 30.0),
+        };
+        let content = sizing.content(NSSize::new(1700.0, 1100.0));
+        let step = resize_increments(2.0);
+        for n in 0..40 {
+            let width = (content.width - f64::from(n) * step.width) * 2.0;
+            let height = (content.height - f64::from(n) * step.height) * 2.0;
+            let drawable = (width as u64, height as u64);
+            assert_eq!(geometry::offered_mode(drawable), drawable, "{n}");
+        }
     }
 }
