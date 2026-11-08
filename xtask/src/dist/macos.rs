@@ -336,7 +336,7 @@ fn check_archive(nm: &str, archive: &Path) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::super::testing::{Log, mode, put, tmp};
-    use super::super::{parse_args, strs};
+    use super::super::{DEFAULT_OUT, parse_args, strs};
     use super::*;
     use crate::tools::Profile;
 
@@ -515,7 +515,7 @@ mod tests {
         put(&o.out.join("lib/libreims_vgpu.a"), "old");
         let mut tools = Programs::new(LOCALIZED_ARCHIVE);
         let out = dist(&mut tools, &o, &target, &header).unwrap();
-        assert_eq!(out, target.join("dist"));
+        assert_eq!(out, target.join(DEFAULT_OUT));
         let read = |p: &str| std::fs::read_to_string(out.join(p)).unwrap();
         assert_eq!(read("lib/libreims_vgpu.a"), "localized");
         assert_eq!(read("lib/libreims_vgpu.dylib"), "dylib");
