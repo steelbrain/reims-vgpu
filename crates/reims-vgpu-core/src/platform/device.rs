@@ -160,6 +160,13 @@ pub trait GpuDevice<P: Platform>: Handle {
         let _ = (pages, planes);
         PagesInPlace::Yes
     }
+    /// No Metal counterpart: the bytes the device aligns the rows of a linear BGRA8 image to, to
+    /// make one over host pages in place there, as the platform answers; 0 where it does not. On
+    /// a device whose GPU shares the CPU's memory the graphics lane has the guest align its
+    /// surfaces' rows to it. The default is 0.
+    fn linear_row_alignment(&self) -> u64 {
+        0
+    }
     /// sel: newComputePipelineStateWithFunction:error:
     /// The function may be nil (a library with no such function); core asserts on nil in the
     /// service. No path reaches it under a handler: a raise inside it dies at the send.

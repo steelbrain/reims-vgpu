@@ -19,6 +19,8 @@
 
 #include "RgfxBundlePaths.hpp"
 #include "RgfxFeatures.hpp"
+#include "RgfxIOSurfaceKPI.hpp"
+#include "RgfxSurfaceRows.hpp"
 #include "RgfxTrace.hpp"
 #include "RgfxVideoCodecs.hpp"
 
@@ -71,6 +73,8 @@ constexpr UInt32 kBundleRegisterWaitMs = 5000;
 // looks.
 constexpr UInt32 kGatePassWaitMs = 5000;
 constexpr UInt32 kGatePassLookMs = 10;
+// How long the start waits for IOSurfaceRoot to align the rows it lays out.
+constexpr uint64_t kSurfaceRootWaitNs = 10ull * 1000 * 1000 * 1000;
 
 enum : UInt32 {
 	// The check repeats.
@@ -392,6 +396,8 @@ bool RgfxAccelerator::start(IOService *provider)
 	// AppleGVA reads the video codecs off this service once Metal's matching sees it, after
 	// registerService.
 	publishVideoCodecs();
+	// Before any process that lays out a surface: WindowServer starts after the kernel's boot.
+	alignSurfaceRows();
 	// Name this accelerator on the framebuffer, if it has started already (else the display
 	// pipe's first association does).
 	OSSafeReleaseNULL(fb);
@@ -682,6 +688,36 @@ void RgfxAccelerator::nameProviderForVideo()
 		}
 	}
 	pci->setName("GFX0");
+}
+
+void RgfxAccelerator::alignSurfaceRows()
+{
+	const void *info = nullptr;
+	IOMemoryMap *map = mapDeviceInfo(kRgfxSurfaceRowsEnd, &info);
+	if (!map)
+		return;
+	const uint32_t align =
+	    rgfxSurfaceRowAlignmentFrom(static_cast<const uint8_t *>(info) + kRgfxSurfaceRowsFirst);
+	map->release();
+	if (align <= kRgfxSurfaceRowsLeast)
+		return;
+	// IOSurfaceRoot starts with IOSurface.kext, which a GPU's accelerator waits for as well.
+	OSDictionary *matching = IOService::serviceMatching("IOSurfaceRoot");
+	IOService *root =
+	    matching ? IOService::waitForMatchingService(matching, kSurfaceRootWaitNs) : nullptr;
+	OSSafeReleaseNULL(matching);
+	if (!root) {
+		IOLog("RgfxAccelerator: no IOSurfaceRoot: surfaces' rows stay at IOSurface's alignment, "
+		      "not the host GPU's %u bytes\n",
+		      align);
+		return;
+	}
+	rgfxIOSurfaceRootUpdateLimits(root, 0, align - 1, kRgfxIOSurfaceNoLimit, kRgfxIOSurfaceNoLimit,
+	                              kRgfxIOSurfaceNoLimit);
+	root->release();
+	IOLog("RgfxAccelerator: IOSurface aligns the bytes per row it works out to %u, as the host's "
+	      "GPU takes rows in place\n",
+	      align);
 }
 
 void RgfxAccelerator::publishVideoCodecs()

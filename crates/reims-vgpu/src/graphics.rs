@@ -359,6 +359,13 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             decoder.set_deferred_budget(deferred_budget);
             // The processes read the features from the device info, as no register is theirs.
             info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
+            // A host whose surfaces lie in place in their pages has the guest align their rows as
+            // its GPU's images take them in place; one that keeps them in device caches leaves the
+            // guest's rows as they were.
+            if decoder.surface_pages_available() && unified_memory {
+                info.linear_row_alignment =
+                    u32::try_from(gpu_device.linear_row_alignment()).unwrap_or_default();
+            }
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             // The host's hardware video, whose codecs the video caps after the device info list
             // for the guest's video driver.

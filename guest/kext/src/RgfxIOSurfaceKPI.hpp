@@ -151,6 +151,24 @@ IOReturn rgfxIOSurfaceSetValue(OSObject *surface, const char *key, const OSMetaC
     __asm__("__ZN9IOSurface8setValueEPKcPK15OSMetaClassBasePj");
 }
 
+// The rows IOSurface lays out (RgfxSurfaceRows.hpp), as a GPU's accelerator has IOSurface lay
+// them out at its start (read from the code of IOSurface and IOAcceleratorFamily2 in macOS 26.7's
+// KDK, 25G241): IOSurfaceRoot keeps two masks, one it aligns a surface's plane offsets to and one
+// it aligns the bytes per row it works out for a surface to, each the cache line's bytes less one
+// until an accelerator ORs more bits in, and answers both to IOSurfaceGetPropertyAlignment.
+extern "C" {
+// IOSurfaceRoot::updateLimits(unsigned int, unsigned int, unsigned int, unsigned int, unsigned
+// int): ORs `planeMask` into the plane offsets' mask and `rowMask` into the bytes per row's, and
+// lowers the root's three other limits to `a`, `b` and `c` where those are less
+// (kRgfxIOSurfaceNoLimit leaves each as it is).
+void rgfxIOSurfaceRootUpdateLimits(void *root, uint32_t planeMask, uint32_t rowMask, uint32_t a,
+                                   uint32_t b, uint32_t c)
+    __asm__("__ZN13IOSurfaceRoot12updateLimitsEjjjjj");
+}
+
+// What IOSurfaceRoot starts its three other limits at, which updateLimits lowers no further.
+constexpr uint32_t kRgfxIOSurfaceNoLimit = 0x7fffffff;
+
 // IOSurface's kIOSurfaceLockReadOnly.
 constexpr uint32_t kRgfxIOSurfaceLockReadOnly = 1;
 

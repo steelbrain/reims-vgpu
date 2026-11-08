@@ -247,6 +247,7 @@ CHECK(sizeof(RgfxSamplerCreate) + sizeof(RgfxSamplerCreateExt) == 80);
 CHECK(offsetof(RgfxSamplerCreateExt, lod_bias_bits) == 4);
 CHECK(offsetof(RgfxDeviceInfo, features_lo) == 0x451);
 CHECK(offsetof(RgfxDeviceInfo, sampler_reduction_support) == 0x452);
+CHECK(offsetof(RgfxDeviceInfo, linear_row_alignment) == 0x454);
 int main(void) { return 0; }
 "#;
 

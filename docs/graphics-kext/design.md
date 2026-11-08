@@ -570,6 +570,19 @@ Stages:
       layout (an older bundle's) stays in place, as every block of such a
       host did before (`reims-vgpu`'s `graphics/decode/surface_pages.rs`,
       "Device caches where the pages cannot serve").
+      The guest lays its surfaces' rows out as the GPU's images take them
+      in place: where the host's GPU aligns a linear image's rows to more
+      than IOSurface's 64 bytes (256 on RADV), the host says so in the
+      device info's `linear_row_alignment`, and the kext has IOSurface align
+      the bytes per row it works out for a surface to it, at the
+      accelerator's start, as a GPU's accelerator does
+      (`IOSurfaceRoot::updateLimits`; `guest/kext/src/RgfxSurfaceRows.hpp`).
+      IOSurfaceGetPropertyAlignment answers it to the processes that work
+      out their own. Macs answer 64 bytes there (Intel) and 128 (the M3),
+      and an Intel Mac's GPUs answer 256 for
+      `minimumLinearTextureAlignmentForPixelFormat:`, so rows at 256 bytes
+      lie inside what Macs do. A host whose GPU has memory of its own
+      answers 0, its guest's rows as they were.
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:

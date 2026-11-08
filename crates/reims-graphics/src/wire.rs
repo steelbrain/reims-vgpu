@@ -3192,7 +3192,13 @@ pub struct RgfxDeviceInfo {
     /// No host writes it yet.
     pub sampler_reduction_support: u8,
     /// Zero.
-    pub reserved_453: [u8; 5],
+    pub reserved_453: u8,
+    /// The bytes the host's GPU aligns the rows of a linear BGRA8 image to, to make one over
+    /// host pages in place there, where the host's surfaces lie in place in their pages (its GPU
+    /// shares the CPU's memory) and its platform answers; else 0, as from a host older than the
+    /// field, which wrote it as zero. The kext has IOSurface align the bytes per row it works
+    /// out for a surface to a multiple of it, and of 64.
+    pub linear_row_alignment: u32,
     /// The device `name`, UTF-8, `name_len` bytes used, the rest 0.
     pub name: [u8; RGFX_DEVICE_NAME_LEN],
     /// The device's `architecture.name`, UTF-8, `architecture_name_len` bytes
@@ -3972,6 +3978,7 @@ const _: () = {
     assert!(core::mem::offset_of!(RgfxDeviceInfo, name) == 1112);
     assert!(core::mem::offset_of!(RgfxDeviceInfo, features_lo) == 0x451);
     assert!(core::mem::offset_of!(RgfxDeviceInfo, sampler_reduction_support) == 0x452);
+    assert!(core::mem::offset_of!(RgfxDeviceInfo, linear_row_alignment) == 0x454);
     // The device-info blob sits past the completion ring and before the allocations.
     assert!(
         RGFX_DEVICE_INFO_OFFSET

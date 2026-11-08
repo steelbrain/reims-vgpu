@@ -417,6 +417,11 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         FAKE_OWN_MEMORY
     }
 
+    /// [`FAKE_LINEAR_ROW_ALIGNMENT`], unlogged.
+    fn linear_row_alignment(&self) -> u64 {
+        FAKE_LINEAR_ROW_ALIGNMENT
+    }
+
     /// No: the fake device makes no pipeline of OpenCL mode, unlogged.
     fn makes_opencl_mode_pipelines(&self) -> bool {
         false
@@ -777,6 +782,10 @@ pub fn fake_caps() -> DeviceCaps {
 /// The fake device's `recommendedMaxWorkingSetSize`, which it answers as its own memory's budget
 /// too ([`GpuDevice::own_memory_budget`]).
 pub const FAKE_OWN_MEMORY: u64 = 0xcf5c_2c000;
+
+/// The fake device's alignment of a linear BGRA8 image's rows ([`GpuDevice::linear_row_alignment`]):
+/// 256 bytes, as the Vulkan platform's runtime answers on Mesa's RADV, apart from Metal's 16.
+pub const FAKE_LINEAR_ROW_ALIGNMENT: u64 = 256;
 
 /// The fake device's identity answers: those of an Apple M3 Max under macOS 27 (measured with
 /// `guest/bundle/tools/metal_enum.m`), whose families are Apple1 to Apple9, Mac1 and Mac2, the

@@ -415,7 +415,9 @@ const METAL_LINEAR_ALIGNMENT: u64 = 16;
 /// (the module's table): [`METAL_LINEAR_ALIGNMENT`] for each format the runtime's query answers,
 /// and the runtime's refusal of the others (`Invalid`, `BufferTextureProblem::NotLinear`: a
 /// compressed, depth or stencil format, or one Metal describes none of, at which Metal's query
-/// asserts). The runtime's own answer, the device's, is not taken.
+/// asserts). The runtime's own answer, the device's, is not taken here: the guest's IOSurface
+/// aligns the rows of the surfaces it lays out to it instead, where they lie in place in their
+/// pages (`GpuDevice::linear_row_alignment`).
 pub(crate) fn linear_alignment(device: &rt::Device, pf: PixelFormat) -> Result<u64, rt::Error> {
     device
         .minimum_linear_texture_alignment_for_pixel_format(pf)

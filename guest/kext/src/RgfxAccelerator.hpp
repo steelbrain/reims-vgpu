@@ -568,6 +568,10 @@ private:
 	// Publishes the host's hardware video that AppleGVA reads from the accelerator, from the
 	// video caps the host wrote (RgfxVideoCodecs.hpp): HEVC decode, where the host has it.
 	void publishVideoCodecs();
+	// Has IOSurface align the bytes per row it works out for a surface as the host's GPU takes
+	// such rows in place, from the host's device info (RgfxSurfaceRows.hpp), as a GPU's
+	// accelerator does at its start; a no-op where the host asks no more than IOSurface's own.
+	void alignSurfaceRows();
 	// A fresh block in place's SURFACE_PAGES (RgfxAcceleratorContexts.cpp): its `count` runs of
 	// the surface's `length` bytes written at `size` bytes into the block of `total` bytes at
 	// `offset`, and posted for context `context`, its block cached where `cached`, else asking

@@ -1201,6 +1201,19 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         crate::gpu::pages_in_place::surface_pages_in_place(&self.raw, &pages.raw, planes)
     }
 
+    /// The runtime's alignment of a BGRA8 texture's offset and rows in a buffer at which the
+    /// device's images hold it in place (`rt::Device::minimum_linear_texture_alignment_for_pixel_format`,
+    /// the device's own answer, which the guest's `minimumLinearTextureAlignmentForPixelFormat:`
+    /// does not take: `caps::linear_alignment`).
+    fn linear_row_alignment(&self) -> u64 {
+        let pf = metal2vulkan::metal::PixelFormat::BGRA8Unorm;
+        plain(|| {
+            self.raw
+                .minimum_linear_texture_alignment_for_pixel_format(pf)
+        })
+        .unwrap_or(0)
+    }
+
     /// Every refusal dies but the compile's of a function or descriptor it finds wrong, which is
     /// the `NSError`: an unspecialized function constant dies, as Metal aborts for one
     /// (measured), and so does a nil function, which the runtime has no form for.

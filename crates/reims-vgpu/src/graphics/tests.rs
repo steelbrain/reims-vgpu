@@ -7,6 +7,7 @@ use reims_vgpu_core::platform::ObjId;
 use reims_vgpu_core::platform::device::GpuDevice;
 use reims_vgpu_core::platform::types::CommandBufferStatus;
 use reims_vgpu_core::testkit::faults::Fault;
+use reims_vgpu_core::testkit::impls::device::FAKE_LINEAR_ROW_ALIGNMENT;
 use reims_vgpu_core::testkit::objects::CompleteOn;
 use reims_vgpu_core::testkit::{Arg, FakePlatform, HeldCall};
 use zerocopy::{FromBytes, IntoBytes};
@@ -393,6 +394,17 @@ fn asking(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
     message
 }
 
+/// The device-info caps blob `device` wrote into its region at [`RGFX_DEVICE_INFO_OFFSET`].
+fn device_info_of(device: &GraphicsDevice<FakePlatform>) -> RgfxDeviceInfo {
+    // SAFETY: the region is the device's, mapped while it lives, and the blob lies in the
+    // completion ring span's unused tail the wire names.
+    let bytes = unsafe {
+        let p = device.region_base().add(RGFX_DEVICE_INFO_OFFSET as usize);
+        std::slice::from_raw_parts(p, size_of::<RgfxDeviceInfo>()).to_vec()
+    };
+    RgfxDeviceInfo::read_from_bytes(&bytes).unwrap()
+}
+
 /// The device-info caps blob is written into the region at [`RGFX_DEVICE_INFO_OFFSET`] at init,
 /// mirroring the GPU device's caps and features the guest bundle reads before it makes any queue;
 /// on the fake (an M3 Max's answers) it answers no Apple family and no iOS feature set, as an
@@ -401,13 +413,7 @@ fn asking(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
 fn device_info_is_written_into_the_region_at_init() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
-    // SAFETY: the region is the device's, mapped while it lives, and the blob lies in the
-    // completion ring span's unused tail the wire names.
-    let bytes = unsafe {
-        let p = device.region_base().add(RGFX_DEVICE_INFO_OFFSET as usize);
-        std::slice::from_raw_parts(p, size_of::<RgfxDeviceInfo>()).to_vec()
-    };
-    let info = RgfxDeviceInfo::read_from_bytes(&bytes).unwrap();
+    let info = device_info_of(&device);
     let caps = platform.device().caps();
     assert_eq!(info.version, RGFX_DEVICE_INFO_VERSION);
     assert_eq!(
@@ -7535,7 +7541,9 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// slots in the region (`ICB_SLOTS`), lets the guest read the clock its VBLANKs are stamped on
 /// (`HOST_TIME`), and shows the display pipe's colour (`DISPLAY_COLOR`). The fake's GPU shares
 /// the CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a device cache
-/// (`SURFACE_CACHE_REFUSED`), and keeps none of the rest
+/// (`SURFACE_CACHE_REFUSED`), keeps none of the rest, and has the guest align the surfaces' rows
+/// as its GPU's images take them in place (the device info's `linear_row_alignment`), which a
+/// device of no surface pages leaves as they were
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_core::testkit::GuestRam;
@@ -7589,8 +7597,19 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     // The fake's GPU shares the CPU's memory: no deferred blocks, so no budget.
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
+    let aligned = want & RGFX_FEATURE_SURFACE_PAGES != 0;
+    assert_eq!(
+        u64::from(device_info_of(&device).linear_row_alignment),
+        if aligned {
+            FAKE_LINEAR_ROW_ALIGNMENT
+        } else {
+            0
+        },
+        "the rows of the surfaces that lie in place in their pages"
+    );
 
     let (device, _) = headless_on(&Arc::new(AtomicU32::new(0)));
+    assert_eq!(device_info_of(&device).linear_row_alignment, 0);
     assert_eq!(
         device.mmio_read(RGFX_REG_FEATURES_LO.into()),
         RGFX_FEATURE_CB_SUBMITTED
