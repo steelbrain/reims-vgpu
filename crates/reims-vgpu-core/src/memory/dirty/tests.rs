@@ -463,3 +463,215 @@ fn ranges_sharing_a_chunk() {
     );
     assert_eq!(changed(&log, &imp, s), vec![0x10_0000..0x18_0000]);
 }
+
+/// The page stamps the queries read so far.
+fn pages_read(log: &DirtyLog) -> u64 {
+    log.pages_read.load(Ordering::Relaxed)
+}
+
+/// One segment of one page for each guest page of `pages`, in order: an import over scattered
+/// guest pages, as a copy past the views' gate sees them.
+fn scattered(pages: &[u64]) -> Vec<Segment> {
+    (pages.iter().enumerate())
+        .map(|(i, &page)| Segment {
+            offset: i.to_u64() * P,
+            length: P,
+            guest: Some(page * P),
+        })
+        .collect()
+}
+
+/// A granule written after `since` by no one is passed over: none of its pages is read, and
+/// one written after it has its pages read and its written page shown
+#[test]
+fn a_quiet_granule_reads_no_page() {
+    let (log, _) = counted();
+    let imp = import(0, 4 * GRANULE);
+    log.watch(&[0..4 * GRANULE]);
+    let s1 = harvest(&log, &[]);
+    let before = pages_read(&log);
+    assert_eq!(changed(&log, &imp, s1), vec![]);
+    assert_eq!(pages_read(&log) - before, 0, "four quiet granules");
+    let s2 = harvest(&log, &[2 * GRANULE + 5 * P..2 * GRANULE + 6 * P]);
+    let before = pages_read(&log);
+    assert_eq!(
+        changed(&log, &imp, s1),
+        vec![2 * GRANULE + 5 * P..2 * GRANULE + 6 * P]
+    );
+    assert_eq!(pages_read(&log) - before, 64, "the written granule alone");
+    let before = pages_read(&log);
+    assert_eq!(changed(&log, &imp, s2), vec![]);
+    assert_eq!(pages_read(&log) - before, 64, "its peak stays raised");
+    // Before any harvest, a fresh watch reads as written at every earlier stamp.
+    assert_eq!(changed(&log, &import(4 * GRANULE, P), 0), vec![0..P]);
+}
+
+/// A write on either side of a granule boundary shows, whether the segment holding it ends at
+/// the boundary, starts at it, or spans it, and the quiet side of each stays passed over
+#[test]
+fn a_write_at_a_granule_boundary_shows() {
+    let (log, _) = counted();
+    // Pages 63 and 64 (the last of granule 0, the first of granule 1), then 127, 128 and 191:
+    // scattered, out of guest order.
+    let imp = scattered(&[64, 63, 191, 128, 127]);
+    log.watch(&[0..4 * GRANULE]);
+    let s1 = harvest(&log, &[]);
+    log.wrote(64 * P..64 * P + 1);
+    assert_eq!(
+        changed(&log, &imp, s1),
+        vec![0..P],
+        "page 64, the first segment"
+    );
+    let s2 = harvest(&log, &[63 * P..64 * P]);
+    assert_eq!(changed(&log, &imp, s1), vec![0..2 * P]);
+    assert_eq!(changed(&log, &imp, s2), vec![]);
+    log.wrote(127 * P..129 * P);
+    assert_eq!(changed(&log, &imp, s2), vec![3 * P..5 * P]);
+    // One segment across the boundary of granules 1 and 2, written at its far side's first page.
+    let across = import(120 * P, 16 * P);
+    let s3 = harvest(&log, &[]);
+    let before = pages_read(&log);
+    log.wrote(128 * P..128 * P + 8);
+    assert_eq!(changed(&log, &across, s3), vec![8 * P..9 * P]);
+    assert_eq!(
+        pages_read(&log) - before,
+        8,
+        "granule 1's eight pages passed over"
+    );
+}
+
+/// The writers' answers are unchanged past the peaks: a granule only a writer wrote is read and
+/// left out for it, another writer's write in it shows, and a lasting write shows in a granule
+/// whose peak is quiet
+#[test]
+fn named_and_lasting_writes_past_the_peaks() {
+    let (log, _) = counted();
+    let imp = import(0, 2 * GRANULE);
+    log.watch(&[0..2 * GRANULE]);
+    let s1 = harvest(&log, &[]);
+    log.wrote_as(3 * P..4 * P, W1);
+    assert_eq!(changed_except(&log, &imp, s1, W1), vec![]);
+    assert_eq!(changed_except(&log, &imp, s1, W2), vec![3 * P..4 * P]);
+    log.wrote_as(5 * P..6 * P, W2);
+    assert_eq!(changed_except(&log, &imp, s1, W1), vec![5 * P..6 * P]);
+    let s2 = harvest(&log, &[]);
+    let before = pages_read(&log);
+    assert_eq!(changed_except(&log, &imp, s2, W1), vec![]);
+    assert_eq!(pages_read(&log) - before, 0, "both granules quiet since s2");
+    let id = log.begin_write(GRANULE + 7 * P..GRANULE + 8 * P);
+    assert_eq!(
+        changed(&log, &imp, s2),
+        vec![GRANULE + 7 * P..GRANULE + 8 * P],
+        "a lasting write in a quiet granule"
+    );
+    log.end_write(id);
+    assert_eq!(
+        changed(&log, &imp, s2),
+        vec![GRANULE + 7 * P..GRANULE + 8 * P]
+    );
+}
+
+/// A granule watched again after its last watch ended is quiet again once a harvest passes its
+/// fresh stamp: its peak comes down with its stamps
+#[test]
+fn a_rewatched_granule_comes_quiet() {
+    let (log, _) = counted();
+    let imp = import(0, GRANULE);
+    log.watch(&[0..GRANULE]);
+    harvest(&log, &[0..P]);
+    log.unwatch(&[0..GRANULE]);
+    let s = harvest(&log, &[]);
+    assert_eq!(
+        changed(&log, &imp, s),
+        vec![0..GRANULE],
+        "not watched: written"
+    );
+    log.watch(&[0..GRANULE]);
+    assert_eq!(
+        changed(&log, &imp, s),
+        vec![0..GRANULE],
+        "fresh: written at s"
+    );
+    let s2 = harvest(&log, &[]);
+    let before = pages_read(&log);
+    assert_eq!(changed(&log, &imp, s2), vec![]);
+    assert_eq!(pages_read(&log) - before, 0);
+    log.wrote(9 * P..10 * P);
+    assert_eq!(changed(&log, &imp, s2), vec![9 * P..10 * P]);
+}
+
+/// Beside a harvester and a second writer on threads of their own, every host write a query
+/// follows shows in it, for any stamp from before the write: a passed-over granule never hides
+/// one
+#[test]
+fn a_query_beside_harvests_sees_every_write_before_it() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    const GRANULES: u64 = 16;
+    /// Stops the other threads however the scope ends, a failed assertion included.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let (log, _) = counted();
+    let log = &log;
+    // Every fourth page of 16 granules, as scattered segments.
+    let pages: Vec<u64> = (0..GRANULES * 64).step_by(4).collect();
+    let imp = scattered(&pages);
+    log.watch(&[0..GRANULES * GRANULE]);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _stop = Stop(&done);
+        let (tx, rx) = mpsc::channel::<(DirtyStamp, usize)>();
+        // The harvester: each harvest writes a page of its own choosing, or none.
+        scope.spawn(|| {
+            let mut n = 0u64;
+            while !done.load(Ordering::SeqCst) {
+                let page = (n * 37) % (GRANULES * 64);
+                let mut watched = Vec::new();
+                if let Some(stamp) = log.begin(&mut watched) {
+                    let written = if n % 3 == 0 {
+                        vec![]
+                    } else {
+                        vec![page * P..page * P + P]
+                    };
+                    assert!(log.end(stamp, &words(&watched, &written)));
+                }
+                n += 1;
+            }
+        });
+        // A second writer, named, over pages the query does not ask about.
+        scope.spawn(|| {
+            let mut n = 0u64;
+            while !done.load(Ordering::SeqCst) {
+                let page = ((n * 13) % (GRANULES * 16)) * 4 + 1;
+                log.wrote_as(page * P..page * P + P, W2);
+                n += 1;
+            }
+        });
+        let count = pages.len();
+        let written = pages.clone();
+        scope.spawn(move || {
+            for k in 0..20_000usize {
+                let i = (k * 7919) % count;
+                let since = log.started.load(Ordering::SeqCst);
+                log.wrote(written[i] * P..written[i] * P + 1);
+                tx.send((since, i)).unwrap();
+            }
+        });
+        let mut checked = 0;
+        for (since, i) in rx {
+            let shown = changed(log, &imp, since);
+            let at = i.to_u64() * P;
+            assert!(
+                shown.iter().any(|r| r.start <= at && at < r.end),
+                "page {} written after stamp {since} not shown",
+                pages[i]
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 20_000);
+    });
+}

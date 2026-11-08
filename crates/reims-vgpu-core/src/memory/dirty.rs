@@ -61,6 +61,30 @@
 //! **Only "after".** A page keeps only its latest stamps, so the log answers which pages changed
 //! after a stamp, never which changed within a window.
 //!
+//! **Peaks.** Each granule keeps a peak, above none of its pages' stamps, and a query passes over
+//! a granule whose peak is not above its `since` and that no lasting write covers, reading none of
+//! its pages. The copies past the views' gate are guest pages scattered 4 KiB apart, each page a
+//! segment, and a query per commit read all of them: 512 copies of 385 MB in all, whose queries
+//! were 65% of the command thread's time and held each commit about 6 ms on the RTX 5080 Laptop
+//! GPU's host, Core Ultra 9 275HX, at 1920 x 1080 and `vm.max_map_count` 65,530 (**measured**
+//! 2026-11-07, m3-max-5561, perf at 499 Hz). Why a passed-over granule holds no page written
+//! after `since`:
+//! - a writer's answer reads the page's stamp or `others`, never above the stamp, so a peak above
+//!   every stamp is above every answer, the writers' included;
+//! - every raise of a stamp ([`DirtyLog::end`]'s, a host write's, a named write's) raises the
+//!   granule's peak to it first, and both are sequentially consistent: a query whose read of the
+//!   peak comes after a stamp's raise in their single order sees a peak at least as high, and one
+//!   whose read comes before it is a query the raise did not precede, which could as well have
+//!   read the page before the raise. The waits and the host writes' fences that order a write
+//!   before a query (above) order the peak's raise before it too;
+//! - a peak comes down only where a watch first stamps its granule, from no stamp to the next
+//!   harvest's number, under the state lock, which a harvest takes to begin: until the lock is let
+//!   go, every load of `started` that numbers a write answers what the watch loaded, so no stamp
+//!   above that number is raised, and the peak, set to it after the pages, is not below any of
+//!   them; no query's `since` reaches that number before a later harvest publishes. A granule's
+//!   last unwatch raises its peak to no stamp before it drops the pages' stamps;
+//! - a lasting write's range is asked as before, its granules never passed over.
+//!
 //! **Waits never hang.** The harvester needs the host (QEMU's needs the BQL), and the threads a
 //! wait runs on are waited on by guest MMIO accesses. So a wait is bounded ([`WAIT_TIMEOUT`]),
 //! and false means "take everything":
@@ -71,9 +95,9 @@
 //!   publication.
 //!
 //! **Memory.** The table is a slot per 2 MiB of the guest's RAM (16 bytes a slot), and a chunk of
-//! 512 page stamps (8 bytes a page) allocated at the first watch of one of its granules, kept
-//! until the log drops so reads never lock: 8 bytes a page ever watched, 16 more where a named
-//! writer wrote.
+//! 512 page stamps (8 bytes a page) and 8 granule peaks allocated at the first watch of one of its
+//! granules, kept until the log drops so reads never lock: 8 bytes a page ever watched and 64 a
+//! chunk, 16 more a page where a named writer wrote.
 //!
 //! The state lock is a leaf apart from the named lock, taken under it; the host's hook is called
 //! under a lock of its own that only [`DirtyLog::retire`] also takes, so no call reaches the host
@@ -157,6 +181,8 @@ struct Chunk {
     /// The guest page number of the chunk's first page.
     first_page: u64,
     stamps: [AtomicU64; CHUNK_PAGES],
+    /// Each granule's peak: no page stamp of the granule is above it (module docs, "Peaks").
+    peaks: [AtomicU64; CHUNK_GRANULES],
     /// The watches of each granule, changed under the state lock.
     watches: [AtomicU32; CHUNK_GRANULES],
     /// The side table, set once under the named lock.
@@ -166,6 +192,22 @@ struct Chunk {
 impl Chunk {
     fn named(&self) -> Option<&Named> {
         self.named.get().map(|n| &**n)
+    }
+
+    /// Raises to `stamp` the peaks of the granules that pages `pages` (indices in the chunk)
+    /// touch: before their stamps are raised (module docs, "Peaks").
+    fn raise_peaks(&self, pages: Range<usize>, stamp: DirtyStamp) {
+        if pages.end <= pages.start {
+            return;
+        }
+        let last = pages.end.saturating_sub(1) >> GRANULE_SHIFT;
+        for peak in self
+            .peaks
+            .get(pages.start >> GRANULE_SHIFT..=last)
+            .unwrap_or(&[])
+        {
+            peak.fetch_max(stamp, Ordering::SeqCst);
+        }
     }
 }
 
@@ -216,6 +258,9 @@ pub struct DirtyLog {
     /// The times the named lock was taken, for the tests.
     #[cfg(test)]
     named_takes: AtomicU64,
+    /// The page stamps the queries read, for the tests.
+    #[cfg(test)]
+    pages_read: AtomicU64,
     wanted: Mutex<Option<HarvestWanted>>,
 }
 
@@ -300,6 +345,8 @@ impl DirtyLog {
             named_lock: Mutex::new(()),
             #[cfg(test)]
             named_takes: AtomicU64::new(0),
+            #[cfg(test)]
+            pages_read: AtomicU64::new(0),
             wanted: Mutex::new(Some(wanted)),
         }
     }
@@ -342,6 +389,7 @@ impl DirtyLog {
             Box::new(Chunk {
                 first_page: first & !((1 << CHUNK_SHIFT) - 1),
                 stamps: std::array::from_fn(|_| AtomicU64::new(UNKNOWN)),
+                peaks: std::array::from_fn(|_| AtomicU64::new(UNKNOWN)),
                 watches: std::array::from_fn(|_| AtomicU32::new(0)),
                 named: OnceLock::new(),
             })
@@ -517,8 +565,12 @@ impl DirtyLog {
         });
     }
 
-    /// Sets every page stamp of granule `g` of `c` to `stamp`, and drops its named writes.
+    /// Sets every page stamp of granule `g` of `c` to `stamp`, and drops its named writes; under
+    /// the state lock. The peak is raised to `stamp` before the pages and set to it after them
+    /// (module docs, "Peaks").
     fn set_granule(&self, c: &Chunk, g: usize, stamp: DirtyStamp) {
+        let Some(peak) = c.peaks.get(g) else { return };
+        peak.fetch_max(stamp, Ordering::SeqCst);
         let pages =
             g.saturating_mul(GRANULE_PAGES)..g.saturating_add(1).saturating_mul(GRANULE_PAGES);
         if let Some(named) = c.named() {
@@ -534,6 +586,7 @@ impl DirtyLog {
                 st.store(stamp, Ordering::SeqCst);
             }
         }
+        peak.store(stamp, Ordering::SeqCst);
     }
 
     /// Appends to `out` the bytes of the runs `segments` names (an import's) whose pages were
@@ -588,25 +641,47 @@ impl DirtyLog {
                 };
                 let named = writer.and_then(|w| c.named().map(|n| (w, n)));
                 let _n = named.map(|_| self.lock_named());
-                for p in first..end {
-                    let i = (p.saturating_sub(c.first_page)).to_usize();
-                    let Some(st) = c.stamps.get(i) else { continue };
-                    let mut stamp = st.load(Ordering::SeqCst);
-                    if let Some((w, n)) = named
-                        && stamp != UNKNOWN
-                        && n.writer
-                            .get(i)
-                            .is_some_and(|x| x.load(Ordering::SeqCst) == w.get())
-                    {
-                        stamp = n
-                            .others
-                            .get(i)
-                            .map_or(UNKNOWN, |o| o.load(Ordering::SeqCst));
-                    }
-                    if stamp <= since && !pending.iter().any(|r| r.contains(&p)) {
+                // A granule at a time: one whose peak is not above `since` and that no lasting
+                // write covers holds no page written after it (module docs, "Peaks").
+                let mut p = first;
+                while p < end {
+                    let g = (p.saturating_sub(c.first_page) >> GRANULE_SHIFT).to_usize();
+                    let to = end.min(
+                        c.first_page
+                            .saturating_add((g.saturating_add(1) << GRANULE_SHIFT).to_u64()),
+                    );
+                    let quiet = c
+                        .peaks
+                        .get(g)
+                        .is_some_and(|k| k.load(Ordering::SeqCst) <= since)
+                        && !pending.iter().any(|r| r.start < to && p < r.end);
+                    if quiet {
+                        p = to;
                         continue;
                     }
-                    push_joined(out, at(p)..at(p.saturating_add(1)));
+                    for q in p..to {
+                        #[cfg(test)]
+                        self.pages_read.fetch_add(1, Ordering::Relaxed);
+                        let i = (q.saturating_sub(c.first_page)).to_usize();
+                        let Some(st) = c.stamps.get(i) else { continue };
+                        let mut stamp = st.load(Ordering::SeqCst);
+                        if let Some((w, n)) = named
+                            && stamp != UNKNOWN
+                            && n.writer
+                                .get(i)
+                                .is_some_and(|x| x.load(Ordering::SeqCst) == w.get())
+                        {
+                            stamp = n
+                                .others
+                                .get(i)
+                                .map_or(UNKNOWN, |o| o.load(Ordering::SeqCst));
+                        }
+                        if stamp <= since && !pending.iter().any(|r| r.contains(&q)) {
+                            continue;
+                        }
+                        push_joined(out, at(q)..at(q.saturating_add(1)));
+                    }
+                    p = to;
                 }
             });
         }
@@ -670,6 +745,11 @@ impl DirtyLog {
             // lock-free stamp fences after its raise and before it looks for the side table
             // (module docs, "Writers").
             fence(Ordering::SeqCst);
+            let lo = (first.saturating_sub(c.first_page)).to_usize();
+            let hi = (end.saturating_sub(c.first_page))
+                .to_usize()
+                .min(CHUNK_PAGES);
+            c.raise_peaks(lo..hi, stamp);
             for p in first..end {
                 let i = (p.saturating_sub(c.first_page)).to_usize();
                 let (Some(st), Some(w), Some(o)) =
@@ -722,6 +802,7 @@ impl DirtyLog {
         let hi = (end.saturating_sub(c.first_page))
             .to_usize()
             .min(CHUNK_PAGES);
+        c.raise_peaks(lo..hi, stamp);
         // A raise even where the stamp is later already: it is the modification the fence
         // orders before the look for the side table (module docs, "Writers"). Under the lock no
         // named write runs between the two, and the look sees every side table published.
