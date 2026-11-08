@@ -228,8 +228,7 @@ pub(super) fn pinned() -> Vec<std::ops::Range<u64>> {
 /// Whether a device of the process imports by pointer only pages mapped from their files: learned
 /// of each device as it is made ([`learn_view_imports`]), and set where any refuses a view through
 /// dma-bufs. From then on views are mapped from their files (`super::vm`'s module docs, "Imports
-/// of views"), and an import of a view made through dma-bufs before maps its pages from their
-/// files ([`pages_from_files`]).
+/// of views").
 static IMPORTS_NEED_FILES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -336,26 +335,6 @@ fn gate(first: u64, end: u64) -> bool {
 /// The address of `at`.
 fn addr_of(at: NonNull<u8>) -> u64 {
     at.as_ptr().addr().to_u64()
-}
-
-/// Maps what of the whole pages of a device lend's `length` bytes at `at` lies in a view through
-/// dma-bufs from their files, which a device given their address pins as they are mapped (a
-/// mapping of a dma-buf it cannot pin), for as long as the view lives (`super::vm::unfold`), short
-/// of the headroom of the views' budget (`super::budget`'s `claim`, `Reach::ShortOfHeadroom`),
-/// which stays for what has no other way. Past it the pages stay as they are: the
-/// device refuses to register them, declines the frame, and the session copies it into the guest's
-/// buffer on the CPU instead (`super::device_lend`), so the guest's buffer holds the same bytes.
-/// The record of the pages the device may pin ([`Pinned`]), which the caller holds while the
-/// device may.
-pub(crate) fn pages_from_files(at: NonNull<u8>, length: u64) -> Pinned {
-    let page = vm::page_size();
-    let start = addr_of(at);
-    let end = start.saturating_add(length.max(1)).next_multiple_of(page);
-    let first = start - start % page;
-    let pinned = Pinned::of(first, end);
-    // Past the headroom the lend's way out is the CPU's copy, so nothing is counted or refused.
-    let _ = vm::unfold(first, end);
-    pinned
 }
 
 /// Learns whether `device` imports a view mapped through dma-bufs as it is mapped, as the

@@ -23,9 +23,9 @@ use ash::vk;
 use metal2vulkan_runtime as rt;
 
 pub use clock::LinuxClock;
-pub use device_lend::{DeviceLend, LendRefusal, LentDmaBuf, dma_buf_of_host, lend_to_devices};
+pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host};
 pub use files::{GuestMemoryLease, lease_guest_memory};
-pub use surface::{LinuxSurface, LinuxSurfaces, attachment};
+pub use surface::{LinuxSurface, LinuxSurfaces};
 pub use threads::LinuxThreads;
 pub use vm::{LinuxVm, RegionMemory};
 
@@ -39,8 +39,7 @@ pub(crate) use import::{
     host_memory_vouched, import_view, learn_view_imports, shown_at,
 };
 pub(crate) use surface::{
-    base_views_pages, own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold,
-    ycbcr_matrix,
+    own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix,
 };
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]

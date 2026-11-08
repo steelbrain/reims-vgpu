@@ -31,10 +31,6 @@
 //!   reference: the retain count stays the objects'. Measured on an Iris Xe (Mesa 26.2.4's ANV,
 //!   i915): ANV puts every live import in each execbuffer, and one whose pages are unmapped
 //!   fails it with `EFAULT`, which ANV answers as the device lost.
-//! - **Attachments.** What a host attaches to a surface ([`attachment`]) lives as long as the
-//!   surface does, every object over it, its lookups among them, and goes with its last object:
-//!   the video device keys a device's imports of the surface's memory by it, so that they go with
-//!   the surface, and a surface mapped again is a new one (`super::device_lend`).
 //! - **What it answers** is the spec's: its planes, rows and sizes, its allocation size exactly
 //!   as given. It holds no values (`IOSurfaceCopyValue`): nothing in the process sets one.
 //!   `lock` and `unlock` do nothing.
@@ -62,8 +58,6 @@
 //! byte per element and rows of its width rounded up to 128 bytes (measured on the M3 Max:
 //! widths 16, 17, 32 and 65535).
 
-use std::any::Any;
-use std::fmt;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -128,8 +122,6 @@ struct Data {
     memory: Arc<Memory>,
     /// What it was made over ([`crate::os::surface_memory`] and the helpers beside it).
     made: Mutex<MadeOver>,
-    /// What the host attached to it ([`attachment`]).
-    attached: Attached,
     /// For a surface whose GPU writes never reach its memory, its count among the objects whose
     /// GPU writes may reach read-only memory ([`crate::gpu::writes::any_kept`]).
     _kept: Option<crate::gpu::writes::Keeping>,
@@ -168,8 +160,7 @@ pub(crate) fn surface_memory_hold(surface: &LinuxSurface) -> impl Send + 'static
 /// What makes holds on the memory a surface mapped ([`surface_memory_hold`]), the surface gone or
 /// not: the memory, and for a surface over a single range of the guest's pages the range's first
 /// byte and its allocation's size. Itself a hold: the memory stays mapped while it lives. It
-/// keeps no reference of the surface, nor the surface's record, so its attachments go with the
-/// surface's last object as ever.
+/// keeps no reference of the surface, nor the surface's record.
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryHolder {
     memory: Arc<Memory>,
@@ -209,33 +200,6 @@ impl MemoryHolder {
             .map(|(first, length)| crate::remap::UnmapHold::new(first, length));
         (Arc::clone(&self.memory), cores_unmap)
     }
-}
-
-/// What the host attached to a surface ([`attachment`]): a value of one type, made at the first
-/// ask, dropped with the surface's record.
-#[derive(Default)]
-struct Attached(Mutex<Option<Box<dyn Any + Send + Sync>>>);
-
-impl fmt::Debug for Attached {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let attached = self.0.lock().is_some();
-        f.debug_tuple("Attached").field(&attached).finish()
-    }
-}
-
-/// `read` of the value of type `T` the host attached to `surface`, which `make` makes at the
-/// first ask (module docs, "Attachments"): it lives as long as the surface does, every object
-/// over it, its lookups among them, and goes with the last. `None` where a value of another type
-/// is attached. `make` and `read` run under the record's lock, so they must call nothing that
-/// reaches the surface.
-pub fn attachment<T: Any + Send + Sync, R>(
-    surface: &LinuxSurface,
-    make: impl FnOnce() -> T,
-    read: impl FnOnce(&T) -> R,
-) -> Option<R> {
-    let mut attached = surface.data().attached.0.lock();
-    let value = attached.get_or_insert_with(|| Box::new(make()));
-    value.downcast_ref::<T>().map(read)
 }
 
 impl LinuxSurface {
@@ -555,15 +519,6 @@ pub(crate) fn own_alias(surface: &LinuxSurface) -> Option<Alias> {
     Some(Alias::borrowing(at, length, Arc::clone(memory)))
 }
 
-/// Whether `surface`'s base address lies in its own view of the guest's pages it was made over
-/// ([`view`]), as one of several ranges of them has, rather than in the pages themselves: the
-/// view maps the pages, so the CPU's reads through it read them and its writes, where it is not
-/// read-only ([`crate::os::gpu_read_only`]), reach them. Its bytes from the base address to the
-/// allocation's end lie in the view's pages, never in the zeros past them.
-pub(crate) fn base_views_pages(surface: &LinuxSurface) -> bool {
-    surface.data().memory.view.is_some()
-}
-
 /// IOSurface's creation on Linux (module docs).
 #[derive(Debug, Default)]
 pub struct LinuxSurfaces;
@@ -648,7 +603,6 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 view: view_made,
             }),
             made: Mutex::new(made),
-            attached: Attached::default(),
             _kept: kept,
         }))
     }
@@ -695,7 +649,6 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 view: None,
             }),
             made: Mutex::new(MadeOver::default()),
-            attached: Attached::default(),
             _kept: None,
         }))
     }

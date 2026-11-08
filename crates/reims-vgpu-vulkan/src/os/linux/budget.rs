@@ -25,9 +25,7 @@
 //! or heap made over a copy (`super::vm`'s module docs, "Imports of views"), as a rebind's is.
 //! What has no other way has the headroom to itself: a view through dma-bufs, a range, a
 //! stand-in, and a twin where no device needs imported pages mapped from their files
-//! ([`Reach::Whole`]). A device lend's pages are mapped from their files only short of the
-//! headroom: past it the device declines the frame, which the CPU copies instead
-//! (`super::import`'s `pages_from_files`).
+//! ([`Reach::Whole`]).
 //!
 //! What would pass the budget first folds the views' runs mapped from their files that no import
 //! a device may pin holds back into dma-bufs (`super::vm::fold_idle`), a mapping per 4 MiB of

@@ -44,17 +44,15 @@ pub(crate) use host_os::{
     dma_buf_refusal, host_memory, host_memory_vouched, import_view, plane_shape, shown_at,
     surface_memory_hold,
 };
-/// A surface's memory lent to a device outside the runtime, on Linux (`os/linux/device_lend.rs`),
-/// and what a host attaches to a surface for as long as it lives.
-#[cfg(target_os = "linux")]
-pub use host_os::{
-    DeviceLend, LendRefusal, LentDmaBuf, attachment, dma_buf_of_host, lend_to_devices,
-};
 pub use host_os::{
     GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, RegionMemory,
     default_driver_sizes, default_gpu_core_count, default_registry_id, install_process_services,
     lease_guest_memory,
 };
+/// Dma-bufs of host memory lent to a device outside the runtime, on Linux
+/// (`os/linux/device_lend.rs`).
+#[cfg(target_os = "linux")]
+pub use host_os::{LendRefusal, LentDmaBuf, dma_buf_of_host};
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
 /// The guest's RAM a device copies by runs of it, on Linux (`os/linux/host_ram.rs`).
@@ -66,7 +64,6 @@ pub(crate) use macos::MATRIX_KEY;
 /// (`os/macos.rs`).
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::refusing_imports;
-pub use surface::{PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout};
 /// The loader's instance extensions, read in one call where they fit (`wsi.rs`), for
 /// `crate::host_gpus`'s own instances.
 #[cfg(target_os = "linux")]

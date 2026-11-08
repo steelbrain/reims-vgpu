@@ -430,15 +430,6 @@ pub(crate) fn own_alias(_surface: &MetalSurface) -> Option<crate::gpu::backing::
     None
 }
 
-/// Whether `surface`'s base address lies in a view of the guest's pages the CPU may write through
-/// as it writes the pages (`crate::os::lend_surface_bytes`): never here. IOSurface's own mapping
-/// of several pages takes the CPU's writes under IOSurface's lock (reims-vgpu-metal's
-/// `os/surface_bytes.rs`), which a lend here does not take, and is read-only for a surface made
-/// read-only for its clients (`crate::os::gpu_read_only`).
-pub(crate) fn base_views_pages(_surface: &MetalSurface) -> bool {
-    false
-}
-
 /// The surface's key that names its YCbCr matrix (`kIOSurfaceYCbCrMatrix`).
 pub(crate) const MATRIX_KEY: &str = "IOSurfaceYCbCrMatrix";
 
@@ -576,7 +567,6 @@ impl ClientPages {
                 offset,
                 gpu_read_only,
                 alias: Weak::new(),
-                lent: false,
             },
         );
     }

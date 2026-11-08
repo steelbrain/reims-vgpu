@@ -1,6 +1,5 @@
-//! The host's GPUs as the video device picks its own (reims-vgpu's
-//! `video::backend_choice`): the one the library's GPU device runs on, and every hardware GPU
-//! the host's Vulkan drivers show, each with its PCI address and DRM render node, which the video
+//! The host's GPUs as a video backend picks its own: the one the library's GPU device runs on,
+//! and every hardware GPU the host's Vulkan drivers show, each with its PCI address and DRM render node, which the video
 //! backends open a GPU by.
 //!
 //! - **The GPU device's GPU** ([`gpu_device_gpu`]) is the physical device the runtime makes its

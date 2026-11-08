@@ -78,9 +78,7 @@
 //! holds folded back first where that may free some ([`fold_short_due`]); past it the gate
 //! refuses them, and the runtime makes the buffer or heap over a copy of them, which takes no
 //! mapping (`super::import`'s `import_gate`); a rebind's alike, which the runtime then makes over
-//! a copy too. A device lend's maps them short of the headroom alone: past it the device declines
-//! the frame, which the CPU copies into the guest's buffer instead (`super::import`'s
-//! `pages_from_files`).
+//! a copy too.
 //!
 //! **Folding back.** At the views' budget, before anything is refused, the views' runs mapped
 //! from their files that no import a device may pin holds (`super::import`'s `Pinned`) are mapped
@@ -904,7 +902,7 @@ fn through(
 /// those bytes by their pointer (module docs, "Imports of views"); refused maps are logged, and
 /// leave those bytes as they were. Where the mappings would come within the headroom of the
 /// views' budget ([`budget::claim`]), nothing is mapped, and the answer is how many they are: the
-/// views' gate then refuses the import, or a lend's device declines it. One at a time, so two
+/// views' gate then refuses the import. One at a time, so two
 /// imports of the same pages map them once.
 pub(crate) fn unfold(first: u64, end: u64) -> Result<(), u64> {
     reclaiming(|| unfold_once(first, end))

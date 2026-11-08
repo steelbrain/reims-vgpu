@@ -10,9 +10,7 @@
 //! `$OUT_DIR/vertex_ids.metallib`, the kernel that reaches a buffer through an address it loads,
 //! `src/gpu/reach.metal`, into `$OUT_DIR/reach.metallib`, and those that write a sweep of values
 //! through textures, `src/gpu/rounding.metal`, into `$OUT_DIR/rounding.metallib`, and again
-//! with fast math off (`-fno-fast-math`) into `$OUT_DIR/rounding_safe.metallib`, the scaler
-//! device's kernel, the metal crate's `src/gpu/scaler.metal`, with fast math off into
-//! `$OUT_DIR/scaler.metallib`, which `src/gpu/scaler.rs` includes, the tests'
+//! with fast math off (`-fno-fast-math`) into `$OUT_DIR/rounding_safe.metallib`, the tests'
 //! kernels that read YCbCr textures, `src/gpu/ycbcr_probe.metal`, into
 //! `$OUT_DIR/ycbcr_probe.metallib`, the tests' functions Metal's compiler refuses,
 //! `src/gpu/refused.metal`, into `$OUT_DIR/refused.metallib`, those that use SIMD-group
@@ -174,11 +172,6 @@ fn steps(manifest: &Path) -> Vec<Step> {
         gpu.join("rounding.metal"),
         &COMPILE_SAFE,
     ));
-    steps.push(one(
-        "scaler",
-        manifest.join("../reims-vgpu-metal/src/gpu/scaler.metal"),
-        &COMPILE_SAFE,
-    ));
     steps.push(Step {
         files: vec!["ci_kernel.metallib".to_owned()],
         commands: format!("{} | {}", CI_KERNEL.join(" "), CI_KERNEL_LIBRARY.join(" ")),
@@ -289,11 +282,6 @@ fn compile(manifest: &Path, out: &Path) -> Result<(), String> {
         out.join("rounding_safe.air"),
         out.join("rounding_safe.metallib"),
     );
-    xcrun(&COMPILE_SAFE, &source, &air)?;
-    xcrun(&["metallib"], &air, &metallib)?;
-    // The scaler device's kernel, with fast math off, as the Metal platform compiles it.
-    let source = manifest.join("../reims-vgpu-metal/src/gpu/scaler.metal");
-    let (air, metallib) = (out.join("scaler.air"), out.join("scaler.metallib"));
     xcrun(&COMPILE_SAFE, &source, &air)?;
     xcrun(&["metallib"], &air, &metallib)?;
     // The tests' Core Image kernel library.

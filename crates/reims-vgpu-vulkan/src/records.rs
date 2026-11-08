@@ -387,11 +387,9 @@ mod tests {
             recording.pipeline_records = hook(path.clone());
             let device = rt::Device::system_default_with(&recording).unwrap();
             let library = device
-                .new_library_with_data(crate::gpu::scaler::METALLIB)
+                .new_library_with_data(crate::gpu::spin::SPIN)
                 .unwrap();
-            let function = library
-                .new_function_with_name(crate::gpu::scaler::KERNELS[0])
-                .unwrap();
+            let function = library.new_function_with_name("spin").unwrap();
             let state = device
                 .new_compute_pipeline_state_with_function(
                     &function,

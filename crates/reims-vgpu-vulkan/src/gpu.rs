@@ -40,14 +40,13 @@ pub mod resource;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod rgbx;
-pub mod scaler;
 pub mod serialized;
 pub mod shaders;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod slice_write_repro;
 #[cfg(test)]
-mod spin;
+pub(crate) mod spin;
 pub mod states;
 pub mod timing;
 #[cfg(test)]

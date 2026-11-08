@@ -547,23 +547,18 @@ impl reims_vgpu_core::platform::os::surface::IoSurfaces<MetalPlatform> for Metal
     }
 
     /// `IOSurfaceCreate((CFDictionaryRef)dictionary)`: over the dictionary
-    /// [`surface_dictionary`] builds. NULL is `None`, the caller's `kIOReturnBadArgument`. What a
-    /// lend of the surface's bytes needs of the spec is recorded
-    /// ([`crate::os::surface_bytes`]).
+    /// [`surface_dictionary`] builds. NULL is `None`, the caller's `kIOReturnBadArgument`.
     fn create(&self, spec: &SurfaceSpec) -> Option<<MetalPlatform as Platform>::Surface> {
         let dictionary = surface_dictionary(spec);
         // SAFETY: a live dictionary (toll-free bridged with CFDictionaryRef); the result is +1
         // or NULL.
         let ptr = unsafe { IOSurfaceCreate(&dictionary) };
         // SAFETY: IOSurfaceCreate's +1 reference, handed over.
-        let made = NonNull::new(ptr).map(|p| unsafe { MetalSurface::from_retained(p) })?;
-        crate::os::surface_bytes::record(&made, Some(spec));
-        Some(made)
+        NonNull::new(ptr).map(|p| unsafe { MetalSurface::from_retained(p) })
     }
 
     /// `[[IOSurface alloc] initWithProperties:properties]`, not checked for nil. A raise there has
-    /// no handler to reach in the contract (`Option`), so it is a death at the send. The record of
-    /// a surface gone that had the new one's ID is dropped ([`crate::os::surface_bytes`]).
+    /// no handler to reach in the contract (`Option`), so it is a death at the send.
     fn create_backing(
         &self,
         spec: &BackingSurfaceSpec,
@@ -578,10 +573,7 @@ impl reims_vgpu_core::platform::os::surface::IoSurfaces<MetalPlatform> for Metal
         let raw = Retained::into_raw(surface?);
         // SAFETY: an `IOSurface *` is toll-free bridged with `IOSurfaceRef`; `into_raw` hands
         // over the init's +1 reference.
-        let made = NonNull::new(raw.cast::<IOSurfaceRef>())
-            .map(|p| unsafe { MetalSurface::from_retained(p) })?;
-        crate::os::surface_bytes::record(&made, None);
-        Some(made)
+        NonNull::new(raw.cast::<IOSurfaceRef>()).map(|p| unsafe { MetalSurface::from_retained(p) })
     }
 }
 
