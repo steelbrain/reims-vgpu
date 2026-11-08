@@ -31,10 +31,11 @@
 //! - **Its order.** The C library runs exit handlers in the reverse order of their registration,
 //!   so the hook runs before every destructor registered before it. It is registered as a device
 //!   is adopted (`crate::gpu::device`) and as a compile pool starts, after the driver was loaded;
-//!   again as each making ends, after what the driver's compiler registered at its first use of a
-//!   path, as the runtime's guard does for its own makings; and again as each thread's count of
-//!   its steps ended reaches each power of two, for what a later call registered, at most 64 times
-//!   a thread. A run of an
+//!   again as the video crate loads a driver (`reims-vgpu`'s video runtime's `arm_exit`); again
+//!   as each making ends, after what the driver's compiler registered at its first use of a path,
+//!   as the runtime's guard does for its own makings; and again as each thread's count of its
+//!   steps ended reaches each power of two, for what a later call registered, at most 64 times a
+//!   thread. A run of an
 //!   earlier registration finds the gate closed and does nothing. Left open: a destructor
 //!   registered by a call still in progress as the exit begins, or by a call after the hook's last
 //!   registration, which runs before the hook.

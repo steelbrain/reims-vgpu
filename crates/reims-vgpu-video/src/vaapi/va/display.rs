@@ -191,6 +191,10 @@ impl Display {
         let (mut major, mut minor) = (0, 0);
         // SAFETY: `raw` is a display, and the out-pointers are valid.
         let status = unsafe { ffi::vaInitialize(raw, &mut major, &mut minor) };
+        // vaInitialize loaded the driver, which may have registered exit-time destructors: the
+        // host's exit gate runs its handler before them (`Runtime::arm_exit`), and so after
+        // every call of the display's still in progress (`super::calls`).
+        runtime.arm_exit();
         if let Err(e) = check("vaInitialize", status) {
             // SAFETY: vaTerminate also frees a display that failed to
             // initialise, as libva's own tools do.

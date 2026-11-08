@@ -63,6 +63,19 @@
 //! The thread starts with the first order, and ends after the display's
 //! last, `vaTerminate`.
 //!
+//! **The process's exit.** Every call, on the call thread and on its
+//! caller's alike, runs as a step of the host's exit gate
+//! ([`Runtime::exit_step`]): once the process's exit began, the thread parks
+//! for good before the call, and the gate's handler, registered again as
+//! each display's driver loads (`Display::open`), waits out a call in
+//! progress before the driver's own exit-time destructors run. So no call
+//! of ours, a display's last `vaTerminate` among them, runs beside them:
+//! **measured** on the Iris Xe of an i9-13900H (intel-media-driver 26.3.5,
+//! 2026-11-08), a device's display let go as a test process exited, its
+//! `vaTerminate` on the device's thread while the main thread ran the exit's
+//! handlers, aborted in iHD's frees ("double free or corruption (out)",
+//! "free(): invalid pointer") in 2 of 90 runs of the workspace's tests.
+//!
 //! **What the gate costs** is the driver's lock's: a call that waits holds
 //! the gate as long as Mesa held its lock for it (`vlVaGetImage` and
 //! `vlVaMapBuffer2` map under `drv->mutex`, **read** in Mesa 26.2.4). So
@@ -73,7 +86,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::core::runtime::{Bell, MonoTime, Runtime, park_for_good};
+use crate::core::runtime::{Bell, ExitStep, MonoTime, Runtime, park_for_good};
 use crate::core::sync::{Mutex, RwLock};
 
 use super::ffi::VADisplay;
@@ -173,6 +186,7 @@ impl Calls {
         if shared.queue.lock().idle()
             && let Some(_gate) = shared.gate.try_read()
         {
+            let _step = exit_step(shared);
             return Ok(call(shared.raw.0));
         }
         let deadline = deadline();
@@ -182,6 +196,7 @@ impl Calls {
         idle.ok_or(Late::NotMade)?;
         let left = deadline.saturating_duration_since(shared.runtime.now());
         let _gate = shared.gate.try_read_for(left).ok_or(Late::NotMade)?;
+        let _step = exit_step(shared);
         Ok(call(shared.raw.0))
     }
 
@@ -193,6 +208,7 @@ impl Calls {
             return None;
         }
         let _gate = shared.gate.try_read()?;
+        let _step = exit_step(shared);
         Some(call(shared.raw.0))
     }
 
@@ -230,6 +246,7 @@ impl Calls {
         let shared = &*self.shared;
         let now = shared.queue.lock().idle();
         if now && let Some(_gate) = shared.gate.try_read() {
+            let _step = exit_step(shared);
             release(shared.raw.0);
             return;
         }
@@ -247,6 +264,7 @@ impl Calls {
                 Thread::None => {
                     drop(queue);
                     let _gate = shared.gate.write();
+                    let _step = exit_step(shared);
                     order(shared.raw.0);
                     return false;
                 }
@@ -269,6 +287,7 @@ impl Calls {
                 );
                 shared.queue.lock().thread = Thread::None;
                 let _gate = shared.gate.write();
+                let _step = exit_step(shared);
                 order(shared.raw.0);
                 return false;
             }
@@ -298,15 +317,22 @@ fn run(shared: &Arc<Shared>) {
         });
         let Some(Some(order)) = order else { return };
         {
-            let Some(_step) = shared.runtime.exit_step() else {
-                park_for_good()
-            };
+            let _step = exit_step(shared);
             let _gate = shared.gate.write();
             order(shared.raw.0);
         }
         shared.queue.lock().running = false;
         shared.bell.ring();
     }
+}
+
+/// A step of the host's exit gate around one call (module docs), on this
+/// thread: once the process's exit began, the thread parks for good here.
+fn exit_step(shared: &Shared) -> ExitStep {
+    let Some(step) = shared.runtime.exit_step() else {
+        park_for_good()
+    };
+    step
 }
 
 impl Drop for Calls {
@@ -392,7 +418,7 @@ impl<T> Slot<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -581,5 +607,137 @@ mod tests {
         assert_eq!(shared.strong_count(), 1, "the thread ended in its call");
         release.send(()).expect("the call waits");
         assert!(within_5_s(|| shared.strong_count() == 0));
+    }
+
+    /// The child's role in [`no_call_runs_beside_a_drivers_exit_time_destructors`].
+    const EXIT_CHILD: &str = "RVG_TEST_CALLS_EXIT_CHILD";
+
+    /// A runtime with an exit gate of its own, as the host's is
+    /// (`reims_vgpu_vulkan::exit_gate`, shaped as that gate is): its hook,
+    /// registered by [`Runtime::arm_exit`], closes the gate and waits out
+    /// the steps in progress, at most 2 s; a step after that is refused.
+    struct GatedRuntime;
+
+    static CLOSED: AtomicBool = AtomicBool::new(false);
+    static IN_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+
+    struct InProgress;
+
+    impl Drop for InProgress {
+        fn drop(&mut self) {
+            IN_PROGRESS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    extern "C" fn close_the_gate() {
+        CLOSED.store(true, Ordering::SeqCst);
+        for _ in 0..2000 {
+            if IN_PROGRESS.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    impl Runtime for GatedRuntime {
+        fn spawn(&self, name: &'static str, body: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+            StdRuntime.spawn(name, body)
+        }
+
+        fn now(&self) -> MonoTime {
+            StdRuntime.now()
+        }
+
+        fn wait_until(
+            &self,
+            cv: &crate::core::sync::Condvar,
+            rings: &mut crate::core::sync::MutexGuard<'_, crate::core::runtime::Rings>,
+            deadline: MonoTime,
+        ) -> crate::core::runtime::TimedOut {
+            StdRuntime.wait_until(cv, rings, deadline)
+        }
+
+        fn exit_step(&self) -> Option<ExitStep> {
+            IN_PROGRESS.fetch_add(1, Ordering::SeqCst);
+            if CLOSED.load(Ordering::SeqCst) {
+                IN_PROGRESS.fetch_sub(1, Ordering::SeqCst);
+                return None;
+            }
+            Some(ExitStep::of(Box::new(InProgress)))
+        }
+
+        fn arm_exit(&self) {
+            // SAFETY: a plain function that never unwinds.
+            assert_eq!(unsafe { libc::atexit(close_the_gate) }, 0);
+        }
+    }
+
+    /// Set by the stand-in for a driver's exit-time destructors.
+    static DESTROYED: AtomicBool = AtomicBool::new(false);
+    /// The calls that reached the stand-in for the driver.
+    static MADE: AtomicUsize = AtomicUsize::new(0);
+
+    /// A driver's exit-time destructors, as one registers them as libva
+    /// loads it: before the display's open arms the gate. Each call that
+    /// reaches the driver after this would use what it freed.
+    extern "C" fn destroy_the_driver() {
+        if MADE.load(Ordering::SeqCst) == 0 {
+            // SAFETY: ends the process at once, which is the point.
+            unsafe { libc::_exit(4) };
+        }
+        DESTROYED.store(true, Ordering::SeqCst);
+        // Room for a call made beside the destructors to show.
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    /// A call of the stand-in driver's: one that would use what the
+    /// destructors freed ends the process with 3.
+    fn into_the_driver(_raw: VADisplay) {
+        if DESTROYED.load(Ordering::SeqCst) {
+            // SAFETY: ends the process at once, which is the point.
+            unsafe { libc::_exit(3) };
+        }
+        MADE.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_micros(200));
+    }
+
+    /// A display let go on another thread as the process exits, as a
+    /// device's is when its host exits right after releasing it: the
+    /// display's releases and calls, made at once on that thread, keep on
+    /// as the main thread runs the exit's handlers. With the gate armed as
+    /// the driver loads, its hook runs before the driver's destructors and
+    /// waits out the call in progress, and the next parks its thread: no
+    /// call reaches the driver after its destructors began. Run in a child
+    /// process of its own, which exits.
+    #[test]
+    fn no_call_runs_beside_a_drivers_exit_time_destructors() {
+        if std::env::var_os(EXIT_CHILD).is_some() {
+            // SAFETY: a plain function that never unwinds.
+            assert_eq!(unsafe { libc::atexit(destroy_the_driver) }, 0);
+            let runtime: Arc<dyn Runtime> = Arc::new(GatedRuntime);
+            runtime.arm_exit();
+            let calls = Calls::new(std::ptr::null_mut(), runtime);
+            std::thread::spawn(move || {
+                loop {
+                    calls.release(into_the_driver);
+                    let _ = calls.call(soon, into_the_driver);
+                    let _ = calls.try_call(into_the_driver);
+                }
+            });
+            assert!(within_5_s(|| MADE.load(Ordering::SeqCst) > 10));
+            std::process::exit(0);
+        }
+        let name = "vaapi::va::calls::tests::no_call_runs_beside_a_drivers_exit_time_destructors";
+        for _ in 0..20 {
+            let status = std::process::Command::new(std::env::current_exe().expect("the test"))
+                .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                .env(EXIT_CHILD, "1")
+                .status()
+                .expect("a child");
+            assert!(
+                status.success(),
+                "a call reached the driver beside its destructors (3), or none before (4): {status:?}"
+            );
+        }
     }
 }

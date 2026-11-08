@@ -114,6 +114,14 @@ pub trait Runtime: Send + Sync {
     fn exit_step(&self) -> Option<ExitStep> {
         Some(ExitStep::default())
     }
+
+    /// Registers the host's exit gate's exit handler again ([`Runtime::exit_step`]), after the
+    /// crate loaded a hardware library that may register exit-time destructors of its own (a VA
+    /// display's driver, which `vaInitialize` loads): the C library runs exit handlers in the
+    /// reverse order of their registration, so the gate then closes, and waits out the steps in
+    /// progress, before those destructors run. By default nothing, for a runtime with no exit
+    /// gate ([`StdRuntime`]).
+    fn arm_exit(&self) {}
 }
 
 /// A step of the host's exit gate ([`Runtime::exit_step`]), ended as it drops, on its thread.
