@@ -734,6 +734,7 @@ impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
                 .map_err(|error| decode_fault(format_args!("its parameter sets: {error}")))?;
         }
         let picture = state.decoder.decode(au).map_err(decode_fault)?;
+        let skipped = picture.is_none();
         let value = state.value + 1;
         let landed = Arc::new(Landed::default());
         let job = Job {
@@ -750,6 +751,7 @@ impl<P: Platform> GraphicsVideoSession<P> for HostVideoSession<P> {
         state.value = value;
         Ok(Decoded {
             value,
+            skipped,
             landed: Some(landed),
         })
     }

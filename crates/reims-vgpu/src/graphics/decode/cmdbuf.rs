@@ -139,7 +139,7 @@ use super::lane::{Lane, Turn};
 use super::sequencer::Ticket;
 use super::shares::FanOut;
 use super::split::{Parts, SplitHold};
-use super::surface_cache::Uses;
+use super::surface_cache::{Reach, Uses};
 use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
 use super::{
@@ -778,6 +778,10 @@ struct Take {
     commit_after: Vec<RgfxSurfaceOrderWait>,
     /// The stream holds a video encoder, whose session's work starts as it is walked.
     video: bool,
+    /// The stream holds a render, compute or blit encoder, or an op of one.
+    work: bool,
+    /// The luma and chroma textures of each of its decodes, in stream order.
+    decodes: Vec<(u64, u64)>,
 }
 
 /// Whether the op stream `ops` ends in a `SUBMITTED`, where the bundle puts it: appended as the
@@ -824,7 +828,19 @@ fn take(mut ops: &[u8]) -> Take {
                 out.commit_after = Glance::order_waits(body).collect();
             }
             RGFX_OP_ENCODER_BEGIN_VIDEO => out.video = true,
-            _ => {}
+            RGFX_OP_ENCODER_BEGIN_RENDER
+            | RGFX_OP_ENCODER_BEGIN_COMPUTE
+            | RGFX_OP_ENCODER_BEGIN_BLIT => out.work = true,
+            tag => match op_group(tag) {
+                RGFX_OP_GROUP_RENDER | RGFX_OP_GROUP_COMPUTE | RGFX_OP_GROUP_BLIT => {
+                    out.work = true;
+                }
+                RGFX_OP_GROUP_VIDEO => {
+                    let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
+                    out.decodes.extend(video::decode_textures(tag, body));
+                }
+                _ => {}
+            },
         }
         ops = &ops[len..];
     }
@@ -1402,7 +1418,17 @@ impl<P: Platform> GraphicsDecoder<P> {
         for u in &take.uses {
             self.settle_surface(u.block_offset);
         }
-        let (fill_waits, uses) = (self.surface_caches).before(device, &cb, &take.uses)?;
+        // What its work reaches of the caches beyond its uses: a decode's new output takes its
+        // first fill as met, where the buffer holds no other work ([`Reach`]).
+        let reach = Reach {
+            context: self.context,
+            work: take.work,
+            decoded: match take.work {
+                true => Vec::new(),
+                false => self.decoded_whole(&take.decodes),
+            },
+        };
+        let (fill_waits, uses) = (self.surface_caches).before(device, &cb, &take.uses, &reach)?;
         // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
         // off it (`surface_order`).
         let order_waits = match &take.order {
@@ -3129,6 +3155,8 @@ mod tests {
         ended_on: Mutex<Vec<Option<String>>>,
         /// Each decode's picture fails to land, as its session finds once the decode ran.
         unlanded: std::sync::atomic::AtomicBool,
+        /// Each decode answers no picture, as for one the stream's random access skips.
+        skipped: std::sync::atomic::AtomicBool,
     }
 
     /// A fake host's video of H.264 and HEVC decode, recording into its [`VideoSeen`]; each of
@@ -3216,6 +3244,7 @@ mod tests {
             }
             Ok(Decoded {
                 value: self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1,
+                skipped: self.seen.skipped.load(Ordering::Relaxed),
                 landed: Some(landed),
             })
         }
@@ -3823,6 +3852,210 @@ mod tests {
             ops.extend(op(RGFX_OP_ENCODER_END, &[]));
         }
         command_buffer_message(cb_obj_id, seqno, &ops)
+    }
+
+    /// [`cached_video`]'s rig with its textures 7 and 8 made again, each over the whole of its
+    /// plane of a two-plane 4:2:0 surface 64 by 16 pixels (its message's facts): a decoder's
+    /// output, whose planes' rows are the surface's bytes 32 to 1568. The block's cache owes its
+    /// first fill, its zeros done.
+    fn cached_video_whole() -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
+        use reims_vgpu_graphics::wire::{
+            RGFX_SURFACE_FACTS_OFFSET, RGFX_YCBCR_MATRIX_ITU_R_709_2, RgfxSurfaceFacts,
+        };
+
+        let (mut r, seen) = cached_video();
+        let facts = RgfxSurfaceFacts {
+            surface_pixel_format: u32::from_be_bytes(*b"420v"),
+            plane_count: 2,
+            width: 64,
+            height: 16,
+            chroma_offset: 32 + 64 * 16,
+            chroma_bytes_per_row: 64,
+            ycbcr_matrix: RGFX_YCBCR_MATRIX_ITU_R_709_2,
+            reserved_24: 0,
+        };
+        for mut t in [
+            surface_plane_texture(7, 0, 10, 32, 64, 16),
+            surface_plane_texture(8, 1, 30, 32 + 64 * 16, 32, 8),
+        ] {
+            let at = RGFX_SURFACE_FACTS_OFFSET as usize;
+            t.header.size = (at + size_of::<RgfxSurfaceFacts>()) as u32;
+            let mut message = t.as_bytes().to_vec();
+            message.resize(at, 0);
+            message.extend_from_slice(facts.as_bytes());
+            assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        }
+        // The make's zeros done, which a decode waits for on the CPU.
+        r.p.world().complete_all(CompleteOn::Caller);
+        (r, seen)
+    }
+
+    /// The copies into `cache` since `mark`, and the copies out of it: each one's source offset
+    /// and size, from the platform's buffer copies.
+    fn cache_copies(
+        r: &super::super::surface_pages::tests::Rig,
+        mark: u64,
+        cache: u64,
+    ) -> (usize, Vec<(u64, u64)>) {
+        const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
+        let calls = r.p.call_log().since(mark);
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        let into = (calls.iter())
+            .filter(|c| c.sel == COPY && id(&c.args[2]) == cache)
+            .count();
+        let out = (calls.iter())
+            .filter(|c| c.sel == COPY && id(&c.args[0]) == cache)
+            .map(|c| {
+                (
+                    c.args[1].as_u64().unwrap_or(0),
+                    c.args[4].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        (into, out)
+    }
+
+    /// The id of [`cached_video`]'s block's cache.
+    fn video_cache(r: &super::super::surface_pages::tests::Rig) -> u64 {
+        use super::super::surface_pages::tests::BLOCK;
+        Arg::obj(r.dec.caches().buffer(BLOCK).unwrap())
+            .as_obj()
+            .unwrap()
+            .0
+    }
+
+    /// A decoder's new output, a command buffer of a decode alone whose textures are the whole of
+    /// the surface's two planes, takes no fill of its cache: the cache made as zeros, the decode
+    /// waits for those, its picture lands over them, and nothing is copied in from the pages. The
+    /// lock's download that follows copies the planes' rows alone into the pages, the bytes 32 to
+    /// 1568, so every other byte of the pages, the surface's header among them, stays as the
+    /// guest's CPU wrote it
+    #[test]
+    fn a_decoders_new_output_takes_no_fill_and_copies_out_its_planes_alone() {
+        use super::super::surface_pages::tests::BLOCK;
+
+        let (mut r, seen) = cached_video_whole();
+        let cache = video_cache(&r);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(*seen.cached.lock(), [[true, true]], "into the cache");
+        let (into, _) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 0, "no fill");
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.fills, counts.made_fills, counts.decode_firsts),
+            (0, 0, 1)
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let done = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        r.dec.surface_download(
+            &r.device,
+            BLOCK,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            super::super::no_raise(),
+        );
+        let (into, out) = cache_copies(&r, mark, cache);
+        assert_eq!((into, out), (0, vec![(32, 1536)]), "the planes' rows alone");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// A decoder's new output whose picture fails to land holds the cache's zeros where the
+    /// picture did not write, and no byte of the pages or of any other memory: its cache was made
+    /// zeros, the whole of it, before the decode, and nothing was copied into it. The command
+    /// buffer completes failed, and the lock's download copies the planes' rows alone
+    #[test]
+    fn a_failed_landing_into_a_new_output_leaves_zeros_and_no_host_bytes() {
+        use super::super::surface_pages::tests::BLOCK;
+
+        let (mut r, seen) = cached_video_whole();
+        let cache = video_cache(&r);
+        let page = r.page;
+        // The make's zeros, from the rig's start.
+        let zeroes: Vec<_> = (r.p.call_log().calls().iter())
+            .filter(|c| c.sel == "fillBuffer:range:value:")
+            .filter(|c| c.args[0].as_obj().map(|o| o.0) == Some(cache))
+            .map(|c| (c.args[1].clone(), c.args[2].clone()))
+            .collect();
+        assert_eq!(
+            zeroes,
+            [(
+                Arg::val(&reims_vgpu_vulkan::core::platform::types::NsRange::new(
+                    0,
+                    2 * page
+                )),
+                Arg::U8(0)
+            )],
+            "the whole cache made zeros"
+        );
+        seen.unlanded.store(true, Ordering::Relaxed);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let done = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        r.dec.surface_download(
+            &r.device,
+            BLOCK,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            super::super::no_raise(),
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let (into, out) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 0, "nothing copied into the cache");
+        assert_eq!(out, [(32, 1536)], "the planes' rows alone copied out");
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// A decode into a new output that answers no picture (one the stream's random access skips)
+    /// makes the cache's first fill before anything reads it: in the finish of its command
+    /// buffer, which still uses the cache, so a use after it waits for the fill
+    #[test]
+    fn a_skipped_picture_fills_its_new_output() {
+        let (mut r, seen) = cached_video_whole();
+        let cache = video_cache(&r);
+        seen.skipped.store(true, Ordering::Relaxed);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        let (into, _) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 1, "the first fill");
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (
+                counts.made_fills,
+                counts.decode_firsts,
+                counts.fills_deferred
+            ),
+            (1, 1, 1)
+        );
+        // A later decode's picture lands over the fill: nothing more is copied in.
+        seen.skipped.store(false, Ordering::Relaxed);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(101, 2, true))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(cache_copies(&r, mark, cache).0, 0);
     }
 
     /// A video output whose surface's block has a device cache is handed to the session as in

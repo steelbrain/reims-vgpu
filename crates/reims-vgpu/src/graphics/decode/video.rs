@@ -29,8 +29,8 @@ use reims_vgpu_graphics::ops::video::{
     RgfxVideoEncodeSettings, RgfxVideoOpDecodeH264, RgfxVideoOpDecodeH265, RgfxVideoOpEncode,
 };
 use reims_vgpu_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
-    RgfxVideoOutputLayout,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxSurfaceFacts, RgfxVideoCodecCaps,
+    RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
 #[cfg(target_os = "linux")]
@@ -41,6 +41,7 @@ use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
 use reims_vgpu_vulkan::core::platform::event::EventRef;
 use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
+use reims_vgpu_vulkan::core::platform::values::PagesPlane;
 use reims_vgpu_vulkan::core::raise::RaiseResult;
 use zerocopy::FromBytes;
 
@@ -164,6 +165,8 @@ pub trait GraphicsVideoSession<P: Platform>: Send + Sync {
 pub struct Decoded {
     /// The value the session's event reaches once it is done.
     pub value: u64,
+    /// The stream's random access skips its picture, and the output gets nothing.
+    pub skipped: bool,
     /// Whether its picture landed, known once the event reaches `value`; `None` where the session
     /// lands every picture it takes, or faults the decode.
     pub landed: Option<Arc<Landed>>,
@@ -205,6 +208,27 @@ pub(crate) struct PlanePlace {
     pub(crate) width: u64,
     /// Its height in pixels.
     pub(crate) height: u64,
+    /// The plane of its surface it shows whole, where it does ([`whole_plane`]).
+    pub(crate) whole: Option<u32>,
+}
+
+/// The plane `plane` of a surface whose facts are `facts` that a texture `width` by `height`
+/// pixels over it shows whole: plane 0 or 1 of a surface of two planes whose second is half the
+/// first's size each way, rounded up (a 4:2:0 picture's luma and chroma), the texture of its
+/// plane's size; `None` for any other texture, and where the texture's message gave no facts.
+pub(crate) fn whole_plane(
+    facts: Option<&RgfxSurfaceFacts>,
+    plane: u32,
+    width: u32,
+    height: u32,
+) -> Option<u32> {
+    let f = facts.filter(|f| f.plane_count == 2)?;
+    let size = match plane {
+        0 => (f.width, f.height),
+        1 => (f.width.div_ceil(2), f.height.div_ceil(2)),
+        _ => return None,
+    };
+    (size == (width, height)).then_some(plane)
 }
 
 /// `MTLPixelFormatInfo`'s flags bit of a format of blocks (the compressed formats, `GBGR422` and
@@ -443,6 +467,13 @@ impl DecodeOp {
     }
 }
 
+/// The luma and chroma textures a decode op `tag` of body `payload` writes; `None` for a tag
+/// that is no decode, or a body too short.
+pub(super) fn decode_textures(tag: u16, payload: &[u8]) -> Option<(u64, u64)> {
+    let (m, _) = DecodeOp::read(tag, payload)?.ok()?;
+    Some((m.luma_texture_obj_id, m.chroma_texture_obj_id))
+}
+
 /// The session codec of an encode op `tag`; `None` for a tag that is no encode.
 fn encode_codec(tag: u16) -> Option<u32> {
     match tag {
@@ -513,6 +544,13 @@ pub(super) fn decode_op<P: Platform>(
     // output it would land over among them.
     objs.wait_for_order_on_cpu();
     let done = session.decode(&decode)?;
+    // A decoder's new output whose first fill the buffer's begin took as met holds the cache's
+    // zeros: a picture lands over them, and none makes the fill, before anything reads the cache
+    // (`surface_cache`, "Fill").
+    let device = done.skipped.then(|| cb.device()).flatten();
+    for block in objs.decode_blocks(m.luma_texture_obj_id, m.chroma_texture_obj_id) {
+        (objs.surface_caches).decoded(device.as_ref(), block, !done.skipped)?;
+    }
     cb.encode_wait(Some(session.event()), done.value)?;
     landings.extend(done.landed);
     Ok(true)
@@ -708,6 +746,50 @@ impl<P: Platform> GraphicsDecoder<P> {
             memory,
             buffer_offset,
         })
+    }
+
+    /// The blocks of the surfaces the textures `luma_id` and `chroma_id` of a decode lie over,
+    /// each once, in that order.
+    fn decode_blocks(&self, luma_id: u64, chroma_id: u64) -> Vec<u64> {
+        let block = |id| {
+            let place = self.entry(id)?.place?;
+            self.span_of(place.buffer_obj_id).map(|(block, _)| block)
+        };
+        let mut blocks: Vec<u64> = [block(luma_id), block(chroma_id)]
+            .into_iter()
+            .flatten()
+            .collect();
+        blocks.dedup();
+        blocks
+    }
+
+    /// The blocks whose surfaces the decodes `decodes` (each one's luma and chroma textures)
+    /// write whole, each with the two planes, as laid out in the surface's bytes
+    /// ([`Reach::decoded`](super::surface_cache::Reach::decoded)): those whose luma texture
+    /// shows plane 0 whole and chroma texture plane 1 whole ([`PlanePlace::whole`]), both in
+    /// the same buffer over the block.
+    pub(super) fn decoded_whole(&self, decodes: &[(u64, u64)]) -> Vec<(u64, [PagesPlane; 2])> {
+        let place = |id| match self.entry(id) {
+            Some(e) if matches!(e.handle, ObjHandle::Texture(_)) => e.place,
+            _ => None,
+        };
+        let plane = |p: PlanePlace| PagesPlane {
+            offset: p.offset,
+            bytes_per_row: p.bytes_per_row,
+            row_bytes: p.row_bytes,
+            rows: p.height,
+        };
+        (decodes.iter())
+            .filter_map(|&(luma, chroma)| {
+                let (luma, chroma) = (place(luma)?, place(chroma)?);
+                let whole = luma.whole == Some(0) && chroma.whole == Some(1);
+                if !whole || luma.buffer_obj_id != chroma.buffer_obj_id {
+                    return None;
+                }
+                let (block, _) = self.span_of(luma.buffer_obj_id)?;
+                Some((block, [plane(luma), plane(chroma)]))
+            })
+            .collect()
     }
 
     /// Where texture `id`, one over an IOSurface plane, lies, and the buffer it lies in; an exec

@@ -14,17 +14,30 @@
 //! textures over the pages did. The surface's pages are the other end of each copy, through their
 //! view ([`super::surface_pages`]) or by their runs (below).
 //!
-//! - **Fill.** A cache is filled from the pages as it is made, its fill committed once the
-//!   block's `SURFACE_PAGES` is answered, before the block settles
-//!   ([`SurfaceCaches::fill_first`]): the kext's wait for the answer takes no fill, and every
-//!   message that reaches the cache waits for the block to settle, so finds the fill made. The
-//!   fill is as of the CPU's generation of the surface in the block's header: the kext's count of the surface's read-write locks, which
-//!   IOSurface marks at the lock. So a texture over the surface that a command buffer reaches
-//!   with no use named (through an argument buffer, with no `useResource:`, which Metal leaves the
-//!   app to make resident) reads the pages as they were then, not a cache never filled. A command
+//! - **Fill.** A cache is made as zeros, on the transfer queue before any use, and owes its first
+//!   fill from the pages, as of the CPU's generation of the surface in the block's header as it
+//!   is made: the kext's count of the surface's read-write locks, which IOSurface marks at the
+//!   lock. The first thing that reads the cache makes the fill before it reads
+//!   ([`SurfaceCaches::fill_owed`]): a use a command buffer names, a present, a command buffer of
+//!   render, compute or blit work in the process that made the first buffer over the block, and
+//!   a buffer over the block made by any other. So a texture over the surface that a command
+//!   buffer reaches with no use named (through an argument buffer, with no `useResource:`, which
+//!   Metal leaves the app to make resident) reads the pages, not zeros, as only a process with a
+//!   buffer over the block reaches it. A command buffer whose work is decodes alone, whose decode
+//!   writes the whole of both planes of the surface (a decoder's new output), takes the fill as
+//!   met instead, and none is made ([`SurfaceCaches::before_one`]): the picture lands over the
+//!   zeros, and the cache's copies into the pages copy those planes' rows alone from then on
+//!   (Download, below), so every byte of the pages beside them stays as the guest's CPU wrote it
+//!   (CoreVideo's header among them). A decode that answers no picture (one the stream's random
+//!   access skips) makes the fill, before anything reads the cache. A picture that fails to land,
+//!   or lands short of the planes, leaves the texels it did not write zero, where a fill would
+//!   have left the pages' bytes: Metal leaves a failed decode's output undefined, and a new
+//!   surface's texels are the kernel's zero-filled pages unless its client wrote them first,
+//!   which a read-write lock does and the use's newer generation then fills (below); no other
+//!   memory's bytes reach the guest, the cache made as zeros. A command
 //!   buffer names each cached surface it uses (`RGFX_OP_SURFACE_USE`), with the CPU's generation
-//!   of the surface when it was committed. Where the cache holds an older generation, the cache
-//!   is filled from the pages again before the buffer's work; a buffer of the same generation
+//!   of the surface when it was committed. Where the cache holds an older generation, or none,
+//!   the cache is filled from the pages before the buffer's work; a buffer of the same generation
 //!   decoded later waits for that fill, on any queue. A block named again over the same pages
 //!   keeps its cache, filled from the pages again as it is named, as of the generation in the
 //!   block's header then, as a new cache is: a texture over it that a command buffer reaches
@@ -51,7 +64,8 @@
 //!   pages, which the kext frees or gives out again only once the release is answered, and the
 //!   kernel zero-fills what it gives out again.
 //!   A copy into the pages (a download's, a release's, an early copy) of a cache whose surface's
-//!   layout the kext's ask gave (on a GPU that shares the CPU's memory) copies the surface's
+//!   layout the kext's ask gave (on a GPU that shares the CPU's memory), or whose first fill a
+//!   decode took as met (Fill, above, the layout its planes' textures give), copies the surface's
 //!   texels alone, each plane's rows' bytes ([`texel_spans`]): the bytes beside them, between
 //!   rows or outside the planes, are the guest's CPU's alone, as no texture's texel lies there
 //!   and the device makes no buffer over an IOSurface, so they stay as it wrote them, whatever a
@@ -244,9 +258,19 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// The transfer event's value at which the cache's last fill is done; 0 for none.
     filled_at: u64,
     /// The CPU's generation of the surface the cache's first fill is of, owed from the cache's
-    /// make until its `SURFACE_PAGES` is answered ([`SurfaceCaches::fill_first`]); `None` once
-    /// that fill is made, and for a deferred block's cache, which is made filled.
+    /// make, which made it zeros, until the first fill of the cache or a decode that takes it as
+    /// met (the module doc, "Fill"); `None` then, and for a deferred block's cache, which owes
+    /// none.
     first_fill: Option<u64>,
+    /// The context of the first buffer over the block while its first fill is owed (`Some(None)`
+    /// for one of no context): a command buffer of its with work that may reach the cache with no
+    /// use named makes the fill ([`SurfaceCaches::fill_reached`]), as does a buffer over the
+    /// block of any other context.
+    owner: Option<Option<u32>>,
+    /// The cache holds its make's zeros where a decode's picture is to land: a decode took its
+    /// first fill as met ([`SurfaceCaches::before_one`]), and has not yet answered its picture
+    /// ([`SurfaceCaches::decoded`]), which a decode that answers none makes.
+    zeros: bool,
     /// Each queue whose command buffers used the cache since its last copy, with the value of the
     /// queue's end event the latest of them signals.
     users: HashMap<u64, u64>,
@@ -606,9 +630,13 @@ impl FillWait {
 pub(crate) struct CacheCounts {
     /// Caches made.
     pub(crate) made: u64,
-    /// Of the fills, those of a cache as it was made, or as its block was named again over the
-    /// same pages ([`SurfaceCaches::fill_made`], [`SurfaceCaches::fill_named_again`]).
+    /// Of the fills, a cache's first, owed since its make ([`SurfaceCaches::fill_owed`]), and
+    /// those as its block was named again over the same pages
+    /// ([`SurfaceCaches::fill_named_again`]).
     pub(crate) made_fills: u64,
+    /// First fills a decode took as met, its picture landing over the cache's zeros
+    /// ([`SurfaceCaches::before_one`]).
+    pub(crate) decode_firsts: u64,
     /// Fills, and their bytes.
     pub(crate) fills: u64,
     pub(crate) filled_bytes: u64,
@@ -769,6 +797,8 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// Whether caches are made exportable, for the host's video to import
     /// ([`Caches::set_exportable`]).
     exportable: bool,
+    /// The blocks whose caches owe their first fill ([`SurfaceCache::first_fill`]).
+    owed: HashSet<u64>,
 }
 
 /// The command buffers begun and not finished that use one block's cache, by the number each was
@@ -918,6 +948,7 @@ impl<P: Platform> SurfaceCaches<P> {
             deferred_bytes: 0,
             into_pages: Vec::new(),
             exportable: false,
+            owed: HashSet::new(),
         }
     }
 
@@ -929,9 +960,11 @@ impl<P: Platform> SurfaceCaches<P> {
     /// A cache for the block at `block`, whose surface's pages `view` maps: `Ok(false)` where
     /// the platform made no buffer for it, and the block keeps its view. `host_pages` are the
     /// pages' host addresses in the guest's RAM, [`device_writes::sorted`], which the host's
-    /// devices' writes are watched over. A new cache is filled from the pages as of `generation`,
-    /// the CPU's generation of the surface in the block's header ([`Self::fill_made`]), once its
-    /// `SURFACE_PAGES` is answered ([`Self::fill_first`]).
+    /// devices' writes are watched over. A new cache is made as zeros on the transfer queue, and
+    /// owes its first fill from the pages as of `generation`, the CPU's generation of the surface
+    /// in the block's header (the module doc, "Fill"); `Ok(false)` too where the platform made no
+    /// command buffer for the zeros, as for no buffer: no cache holds what the GPU's memory held
+    /// before.
     ///
     /// A block that has a cache keeps it where its pages are the same, filled again from them as
     /// of `generation` ([`Self::fill_named_again`]), as the kext's generations of the surface may
@@ -1012,6 +1045,9 @@ impl<P: Platform> SurfaceCaches<P> {
         let Some(pages) = pages()? else {
             return Ok(false);
         };
+        let Some(filled_at) = self.zero(device, &cache, length)? else {
+            return Ok(false);
+        };
         if matches!(pages, CachePages::Runs { .. }) {
             self.counts.by_runs += 1;
         }
@@ -1025,8 +1061,10 @@ impl<P: Platform> SurfaceCaches<P> {
                 generation: None,
                 host_read: 0,
                 written: false,
-                filled_at: 0,
+                filled_at,
                 first_fill: Some(generation),
+                owner: None,
+                zeros: false,
                 users: HashMap::new(),
                 asked: 0,
                 made: 0,
@@ -1042,56 +1080,28 @@ impl<P: Platform> SurfaceCaches<P> {
             writes: 0,
         };
         self.watched.0.lock().insert(block, pages);
+        self.owed.insert(block);
         self.counts.made += 1;
         Ok(true)
     }
 
-    /// The first fill of the block at `block`'s new cache, owed since its make
-    /// ([`SurfaceCache::first_fill`]), made once the block's `SURFACE_PAGES` is answered and
-    /// before the block settles: the guest's kext waits for the answer, not for the fill's
-    /// encode and commit, and every message that names the block, which is what reaches the
-    /// cache (a `BUFFER_OVER_SURFACE_PAGES`, a command buffer's use, a present, a
-    /// `SURFACE_DOWNLOAD`, its release), waits for the block to settle, so it finds the fill
-    /// made, its value in [`SurfaceCache::filled_at`]: a use waits for it on the GPU, on the
-    /// transfer event, as for any fill, and a copy into the pages runs after it on the transfer
-    /// queue. Whether a fill was owed: nothing where none is, or the block has no cache.
-    fn fill_first(&mut self, device: &P::Device, block: u64) -> RaiseResult<bool> {
-        let Some(generation) = (self.by_block.get_mut(&block)).and_then(|c| c.first_fill.take())
-        else {
-            return Ok(false);
+    /// The first fill the block at `block`'s cache owes since its make
+    /// ([`SurfaceCache::first_fill`]), made before what reads the cache next, as of the
+    /// generation it was made at: at once where no command buffer begun and not finished uses the
+    /// cache and no copy of it waits, else in the finish of the last of them
+    /// ([`Self::defer_fill`]). Nothing where none is owed, or the block has no cache.
+    fn fill_owed(&mut self, device: &P::Device, block: u64) -> RaiseResult<()> {
+        let Some(generation) = (self.by_block.get(&block)).and_then(|c| c.first_fill) else {
+            return Ok(());
         };
-        self.fill_made(device, block, generation)?;
-        Ok(true)
+        self.fill_whole(device, block, generation)
     }
 
-    /// The new cache of the block at `block` filled from its pages, as of CPU generation
-    /// `generation`, on the transfer queue, as the first use of that generation would fill it:
-    /// so a use the guest names no `RGFX_OP_SURFACE_USE` of (a texture over the surface reached
-    /// through an argument buffer with no `useResource:`, which Metal leaves the app to make
-    /// resident) reads the pages as the fill found them, not a cache never filled, and the first
-    /// named use of the generation fills nothing, waiting for this fill
-    /// where it has not finished. A use of a newer generation fills again, as before. Nothing
-    /// uses a new cache yet, so the fill waits for no command buffer.
-    fn fill_made(&mut self, device: &P::Device, block: u64, generation: u64) -> RaiseResult<()> {
-        self.fill(device, block, generation)?;
-        self.counts.made_fills += 1;
-        Ok(())
-    }
-
-    /// The cache of the block at `block`, named again over the same pages, filled from them as of
-    /// CPU generation `generation`, as a new cache is ([`Self::fill_made`]), after the copy of
-    /// what a buffer wrote of it into them: a use the guest names no `RGFX_OP_SURFACE_USE` of
-    /// reads the pages as they were then, not what the cache held before the naming. The kext's
-    /// generations of the surface may count anew, so the cache holds none but this fill's, and a
-    /// named use of a newer generation fills again. Filled at once where no command buffer begun
-    /// and not finished uses the cache and no copy of it waits, else in the finish of the last of
-    /// them ([`Self::defer_fill`]), as a use's fill is.
-    fn fill_named_again(
-        &mut self,
-        device: &P::Device,
-        block: u64,
-        generation: u64,
-    ) -> RaiseResult<()> {
+    /// The cache of the block at `block` filled from its pages as of CPU generation
+    /// `generation`, its first fill or one as a new cache's, whatever it holds: at once where no
+    /// command buffer begun and not finished uses it and no copy of it waits, else in the finish
+    /// of the last of them ([`Self::defer_fill`]), as a use's fill is.
+    fn fill_whole(&mut self, device: &P::Device, block: u64, generation: u64) -> RaiseResult<()> {
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.generation = None;
         }
@@ -1100,8 +1110,119 @@ impl<P: Platform> SurfaceCaches<P> {
         } else {
             self.fill(device, block, generation)?;
         }
-        self.counts.made_fills += 1;
         Ok(())
+    }
+
+    /// A fill of the block at `block`'s cache asked ([`Self::fill`], [`Self::defer_fill`]): it
+    /// copies the whole surface before anything later reads the cache, so no first fill is owed
+    /// any more; one that was is counted made ([`CacheCounts::made_fills`]).
+    fn owes_none(&mut self, block: u64) {
+        if let Some(cache) = self.by_block.get_mut(&block) {
+            if cache.first_fill.take().is_some() {
+                self.counts.made_fills += 1;
+            }
+            cache.owner = None;
+            cache.zeros = false;
+        }
+        self.owed.remove(&block);
+    }
+
+    /// The first fills owed of the caches whose first buffer context `context` made
+    /// ([`SurfaceCache::owner`]), before a command buffer of its with render, compute or blit
+    /// work, which may reach a texture over the surface with no use named.
+    /// `cb` waits on the GPU for each fill; whether it waits for one.
+    fn fill_reached(
+        &mut self,
+        device: &P::Device,
+        cb: &P::CommandBuffer,
+        context: Option<u32>,
+    ) -> RaiseResult<bool> {
+        if self.owed.is_empty() {
+            return Ok(false);
+        }
+        let reached: Vec<u64> = (self.owed.iter())
+            .copied()
+            .filter(|block| (self.by_block.get(block)).is_some_and(|c| c.owner == Some(context)))
+            .collect();
+        let mut waits = false;
+        for block in reached {
+            self.fill_owed(device, block)?;
+            waits |= self.wait_last_fill(cb, block)?;
+        }
+        Ok(waits)
+    }
+
+    /// A buffer over the block at `block` made in `context` (`BUFFER_OVER_SURFACE_PAGES`), its
+    /// cache the buffer: the first such context, while the cache owes its first fill, is the
+    /// cache's owner ([`SurfaceCache::owner`]); another context's buffer makes the fill at
+    /// once, as that context may reach the cache in ways a decode of the owner's does not order.
+    fn buffer_made(
+        &mut self,
+        device: &P::Device,
+        block: u64,
+        context: Option<u32>,
+    ) -> RaiseResult<()> {
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return Ok(());
+        };
+        if cache.first_fill.is_none() {
+            return Ok(());
+        }
+        match cache.owner {
+            None => cache.owner = Some(context),
+            Some(owner) if owner == context => {}
+            Some(_) => return self.fill_owed(device, block),
+        }
+        Ok(())
+    }
+
+    /// The picture of a decode into the block at `block`'s surface answered (`picture`), or none
+    /// (a picture the stream's random access skips): where a decode took the cache's first fill
+    /// as met ([`SurfaceCache::zeros`]), a picture lands over the zeros, and none makes the fill,
+    /// before what reads the cache next, as [`Self::fill_owed`] makes one, on `device`; where
+    /// none is given (the platform's command buffer named none), it is logged and not made.
+    fn decoded(
+        &mut self,
+        device: Option<&P::Device>,
+        block: u64,
+        picture: bool,
+    ) -> RaiseResult<()> {
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return Ok(());
+        };
+        if !std::mem::take(&mut cache.zeros) || picture {
+            return Ok(());
+        }
+        let Some(device) = device else {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: a decode into its new device cache answered \
+                 no picture, and its command buffer named no device to fill the cache on: it \
+                 holds zeros"
+            );
+            return Ok(());
+        };
+        // The first fill it took as met is owed again, and made now.
+        let generation = cache.generation.unwrap_or(0);
+        cache.first_fill = Some(generation);
+        self.fill_whole(device, block, generation)
+    }
+
+    /// The cache of the block at `block`, named again over the same pages, filled from them as of
+    /// CPU generation `generation`, as a new cache's first fill is ([`Self::fill_owed`]), after
+    /// the copy of what a buffer wrote of it into them: a use the guest names no
+    /// `RGFX_OP_SURFACE_USE` of reads the pages as they were then, not what the cache held before
+    /// the naming. The kext's generations of the surface may count anew, so the cache holds none
+    /// but this fill's, and a named use of a newer generation fills again. Filled as a use's fill
+    /// is ([`Self::fill_whole`]).
+    fn fill_named_again(
+        &mut self,
+        device: &P::Device,
+        block: u64,
+        generation: u64,
+    ) -> RaiseResult<()> {
+        self.counts.made_fills += 1;
+        self.fill_whole(device, block, generation)
     }
 
     /// A cache of zeros for the deferred block at `block` (the module doc), of `length` bytes,
@@ -1147,6 +1268,8 @@ impl<P: Platform> SurfaceCaches<P> {
                 written: false,
                 filled_at,
                 first_fill: None,
+                owner: None,
+                zeros: false,
                 users: HashMap::new(),
                 asked: 0,
                 made: 0,
@@ -1421,13 +1544,23 @@ impl<P: Platform> SurfaceCaches<P> {
     /// ([`Self::needs_fill`]): at once where no command buffer begun and not finished uses it and
     /// no copy of it waits, else in the finish of the last command buffer begun before it that
     /// uses it ([`Self::defer_fill`]), the use waiting for it on the GPU.
+    ///
+    /// Where `decoded` gives the planes the buffer's decodes write whole of the block's surface
+    /// ([`Reach::decoded`]), the first fill the cache owes is taken as met instead, where it is of
+    /// the use's generation or a newer one and no device of the host wrote the pages since the
+    /// make ([`Self::take_decoded`]): the use reads nothing of the cache, which the picture
+    /// lands over.
     fn before_one(
         &mut self,
         device: &P::Device,
         cb: &P::CommandBuffer,
         u: &RgfxOpSurfaceUse,
+        decoded: Option<&[PagesPlane; 2]>,
     ) -> (Option<Count>, RaiseResult<(bool, Option<u64>)>) {
         let block = u.block_offset;
+        if let Some(planes) = decoded {
+            self.take_decoded(block, u.cpu_gen, planes);
+        }
         let Some((held, host)) = self.will_hold(block) else {
             return (None, Ok((false, None)));
         };
@@ -1447,6 +1580,34 @@ impl<P: Platform> SurfaceCaches<P> {
         let count = self.hold(block, u.flags & RGFX_SURFACE_USE_WRITES != 0);
         let follows = filled.and_then(|()| self.follow(cb, count));
         (Some(count), follows)
+    }
+
+    /// The first fill the block at `block`'s cache owes taken as met by a decode that writes the
+    /// whole of `planes`, the surface's two (the module doc, "Fill"), named by a use of CPU
+    /// generation `generation`: where the fill owed is of that generation or a newer one, and no
+    /// device of the host wrote the pages since the make. The cache holds that generation, its
+    /// zeros until the picture lands ([`SurfaceCache::zeros`]), and copies into the pages only
+    /// the planes' rows where the kext's ask gave no layout ([`SurfaceCache::texels`]).
+    fn take_decoded(&mut self, block: u64, generation: u64, planes: &[PagesPlane; 2]) {
+        let host = self.watched.writes(block);
+        let Some(cache) = self.by_block.get_mut(&block) else {
+            return;
+        };
+        let Some(owed) = cache.first_fill.filter(|&owed| generation <= owed) else {
+            return;
+        };
+        if host > cache.host_read {
+            return;
+        }
+        cache.generation = Some(owed);
+        cache.first_fill = None;
+        cache.owner = None;
+        cache.zeros = true;
+        if cache.texels.is_none() {
+            cache.texels = Some(texel_spans(planes));
+        }
+        self.owed.remove(&block);
+        self.counts.decode_firsts += 1;
     }
 
     /// The use `count` of the block's cache, just counted, before command buffer `cb` runs: a use
@@ -1694,6 +1855,7 @@ impl<P: Platform> SurfaceCaches<P> {
             filled: Arc::clone(&filled),
         };
         self.defer(device, block, false, fill);
+        self.owes_none(block);
         self.counts.fills_deferred += 1;
         filled
     }
@@ -2134,6 +2296,7 @@ impl<P: Platform> SurfaceCaches<P> {
             cache.filled_at = value;
             cache.users.clear();
         }
+        self.owes_none(block);
         self.counts.fills += 1;
         self.counts.filled_bytes += length;
         Ok(Some(value))
@@ -2309,6 +2472,7 @@ impl<P: Platform> SurfaceCaches<P> {
             self.write_back(device, block, done)?;
         }
         let gone = self.by_block.remove(&block);
+        self.owed.remove(&block);
         if let Some(cache) = gone.as_ref().filter(|c| c.deferred.is_some()) {
             self.deferred_bytes = self.deferred_bytes.saturating_sub(cache.length);
             if cache.pages.is_none() {
@@ -2552,6 +2716,7 @@ impl<P: Platform> SurfaceCaches<P> {
             self.forget(&parked.counts);
         }
         self.gone.clear();
+        self.owed.clear();
         self.deferred_bytes = 0;
         self.watched.0.lock().clear();
         // What waits for a deferred copy, on the GPU or for a present, waits for it no more.
@@ -2628,6 +2793,21 @@ pub(crate) struct Caches<P: Platform> {
     moved: Condvar,
     /// What each fill tells as it finishes ([`Self::on_fill_done`]).
     on_fill_done: Arc<OnceLock<FillHook>>,
+}
+
+/// What a command buffer's work reaches of the device caches besides the uses it names
+/// ([`Caches::before`]).
+#[derive(Debug, Default)]
+pub(crate) struct Reach {
+    /// The context it was committed in.
+    pub(crate) context: Option<u32>,
+    /// It holds render, compute or blit work, which may reach a texture over a surface with no
+    /// use named (through an argument buffer).
+    pub(crate) work: bool,
+    /// Where its work is decodes alone: the blocks of the surfaces its decodes write whole, each
+    /// with the two planes they write, its luma's and its chroma's, as laid out in the surface's
+    /// bytes.
+    pub(crate) decoded: Vec<(u64, [PagesPlane; 2])>,
 }
 
 /// A command buffer's count among the users of the blocks it uses ([`Caches`]), until its finish
@@ -2847,16 +3027,29 @@ impl<P: Platform> Caches<P> {
     /// other. First, with nothing counted, each cache whose deferred copy the buffer would follow
     /// gets its event, made with the lock let go; where the platform makes none, the copy is
     /// waited for on the CPU, counted ([`CacheCounts::cpu_waits`]).
+    ///
+    /// Before any of that, a buffer whose `reach` holds render, compute or blit work has the first
+    /// fills its context's caches owe made, and waits for them on the GPU
+    /// ([`SurfaceCaches::fill_reached`]); a use of a block its decodes write whole takes the first
+    /// fill as met ([`SurfaceCaches::before_one`]).
     pub(crate) fn before(
         self: &Arc<Self>,
         device: &P::Device,
         cb: &P::CommandBuffer,
         uses: &[RgfxOpSurfaceUse],
+        reach: &Reach,
     ) -> RaiseResult<(bool, Option<Uses<P>>)> {
-        if uses.is_empty() {
+        if uses.is_empty() && !reach.work {
             return Ok((false, None));
         }
         let mut state = self.state.lock();
+        let reached = match reach.work {
+            true => state.fill_reached(device, cb, reach.context)?,
+            false => false,
+        };
+        if uses.is_empty() {
+            return Ok((reached, None));
+        }
         let picked: Vec<RgfxOpSurfaceUse> = by_block(&state, uses).into_iter().copied().collect();
         let mut spare = Vec::new();
         let mut no_event = HashSet::new();
@@ -2901,10 +3094,13 @@ impl<P: Platform> Caches<P> {
             blocks: Vec::new(),
             follows: Vec::new(),
         };
-        let mut waits = false;
+        let mut waits = reached;
         let mut raised = None;
         for u in &picked {
-            let (count, follows) = state.before_one(device, cb, u);
+            let decoded = (reach.decoded.iter())
+                .find(|(block, _)| *block == u.block_offset)
+                .map(|(_, planes)| planes);
+            let (count, follows) = state.before_one(device, cb, u, decoded);
             // Counted at once, so a later copy of the block follows this buffer.
             held.blocks.extend(count);
             match follows {
@@ -3276,11 +3472,27 @@ impl<P: Platform> Caches<P> {
         state.make_by_runs(device, block, runs, unmade, host_pages, generation, layout)
     }
 
-    /// The first fill of the block at `block`'s new cache, once its `SURFACE_PAGES` is answered
-    /// ([`SurfaceCaches::fill_first`]), where one is owed. Nothing uses a new cache before it,
-    /// so it waits for no command buffer.
-    pub(crate) fn fill_first(&self, device: &P::Device, block: u64) -> RaiseResult<bool> {
-        self.state.lock().fill_first(device, block)
+    /// A buffer over the block at `block` made in `context`, its cache the buffer
+    /// ([`SurfaceCaches::buffer_made`]): the first fill the cache owes is made now where another
+    /// context than its owner's made it.
+    pub(crate) fn buffer_made(
+        &self,
+        device: &P::Device,
+        block: u64,
+        context: Option<u32>,
+    ) -> RaiseResult<()> {
+        self.state.lock().buffer_made(device, block, context)
+    }
+
+    /// A decode into the block at `block`'s surface answered its picture (`picture`) or none
+    /// ([`SurfaceCaches::decoded`]), the fill for none made on `device`.
+    pub(crate) fn decoded(
+        &self,
+        device: Option<&P::Device>,
+        block: u64,
+        picture: bool,
+    ) -> RaiseResult<()> {
+        self.state.lock().decoded(device, block, picture)
     }
 
     /// The deferred block at `block`'s pages taken copied ([`SurfaceCaches::attach_copied`]),
@@ -3645,6 +3857,12 @@ mod tests {
     const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
     const WAIT: &str = "encodeWaitForEvent:value:";
     const SIGNAL: &str = "encodeSignalEvent:value:";
+    /// A command buffer's begin that reaches nothing beyond the uses it names.
+    const NO_REACH: Reach = Reach {
+        context: None,
+        work: false,
+        decoded: Vec::new(),
+    };
 
     /// A rig whose block at [`BLOCK`] is two pages of a surface, marked cached, with command
     /// queues 1 and 2.
@@ -3777,13 +3995,21 @@ mod tests {
         assert_eq!(r.dec.caches().len(), 2, "a GPU of the CPU's memory");
     }
 
-    /// A cache is filled from its pages as it is made, as of the CPU's generation in the block's
-    /// header, on the transfer queue: a command buffer that reaches the surface with no use named
-    /// (a texture in an argument buffer with no `useResource:`) reads the pages, not a cache never
-    /// filled. The first named use of that generation fills nothing more and waits for the fill
-    /// not yet done; one of a newer generation fills again, once
+    /// The zero fills in `calls`: each one's buffer, and the range it zeroes.
+    fn zeroed(calls: &[Call]) -> Vec<(u64, Arg)> {
+        (calls.iter())
+            .filter(|c| c.sel == "fillBuffer:range:value:" && c.args[2] == Arg::U8(0))
+            .map(|c| (c.args[0].as_obj().map_or(0, |o| o.0), c.args[1].clone()))
+            .collect()
+    }
+
+    /// A new cache is made as zeros, the whole of it, on the transfer queue, and copies nothing
+    /// from the pages at its make: its first fill, as of the CPU's generation in the block's
+    /// header, is owed. The first named use of that generation makes it, and waits for it on the
+    /// GPU; a use of that generation after it fills nothing more, and one of a newer generation
+    /// fills again, once
     #[test]
-    fn a_cache_is_filled_from_its_pages_as_it_is_made() {
+    fn a_new_cache_is_zeros_until_its_first_use_fills_it() {
         let mut r = rig(8);
         let page = r.page;
         queues(&mut r);
@@ -3800,41 +4026,48 @@ mod tests {
         );
         let cache = cache_id(&r);
         let calls = r.p.call_log().since(mark);
-        let filled = copies(&calls);
-        assert_eq!(filled.len(), 1, "a fill as it is made");
-        assert_eq!(filled[0].1, cache, "into the cache");
+        assert!(copies(&calls).is_empty(), "no fill at the make");
+        assert_eq!(
+            zeroed(&calls),
+            [(cache, Arg::val(&NsRange::new(0, 2 * page)))],
+            "the whole cache made zeros"
+        );
         assert!(
             calls.iter().any(|c| c.sel == "commit"),
-            "committed as the naming is answered"
+            "committed before the naming is answered"
         );
-        let transfer = events(&calls, SIGNAL)[0];
         let counts = r.dec.caches().counts();
-        assert_eq!((counts.fills, counts.made_fills), (1, 1));
-        // The first named use, of the header's generation: no second fill, and a wait for the
-        // fill, which has not finished.
+        assert_eq!((counts.fills, counts.made_fills), (0, 0));
+        // The first named use, of the header's generation: the owed fill, waited for.
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 2, false)]);
         let calls = r.p.call_log().since(mark);
-        assert!(copies(&calls).is_empty(), "the generation the cache holds");
+        let filled = copies(&calls);
+        assert_eq!(filled.len(), 1, "the first fill");
+        assert_eq!(filled[0].1, cache, "into the cache");
+        let transfer = events(&calls, SIGNAL)[0];
         assert!(
             events(&calls, WAIT).contains(&transfer),
-            "the buffer waits for the fill made at the make"
+            "the buffer waits for its fill"
         );
-        // A newer generation fills again.
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.fills, counts.made_fills), (1, 1));
+        // The same generation again fills nothing; a newer one fills again.
         let mark = r.p.call_log().mark();
-        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 3, false)]);
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 2, false)]);
+        assert!(copies(&r.p.call_log().since(mark)).is_empty());
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 3, false)]);
         assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1);
         assert_eq!(r.dec.caches().counts().fills, 2);
     }
 
-    /// A new cache's first fill is made once its `SURFACE_PAGES` is answered, not before it, so
-    /// the kext's wait for the answer takes no fill, and before the block settles: a command
-    /// buffer that uses the surface, issued right after the answer, waits for the block to settle
-    /// before it is decoded, then fills nothing more and waits on the GPU for that fill, on the
-    /// transfer event, so it reads the filled cache. Had it been decoded before the fill, it would
-    /// have filled the cache itself, and the first fill again after it
+    /// The answer of a new cache's `SURFACE_PAGES` takes no fill, and the kext's wait for it only
+    /// the zeros' commit: a command buffer that uses the surface, issued right after the answer,
+    /// waits for the block to settle before it is decoded, then makes the first fill and waits
+    /// for it on the GPU, on the transfer event, so it reads the pages, not zeros
     #[test]
-    fn a_use_right_after_the_answer_waits_for_the_first_fill() {
+    fn a_use_right_after_the_answer_makes_the_first_fill() {
         let mut r = rig(8);
         let page = r.page;
         queues(&mut r);
@@ -3883,7 +4116,6 @@ mod tests {
                     .is_err(),
                 "the use waits for the block to settle"
             );
-            r.dec.surface_pages_answered(&r.device, BLOCK, &settle);
             drop(settle);
             assert_eq!(rx.recv().unwrap(), Ok(()), "decoded once the block settled");
         });
@@ -3891,18 +4123,109 @@ mod tests {
         let filled = copies(&calls);
         assert_eq!(filled.len(), 1, "the first fill alone");
         assert_eq!(filled[0].1, cache_id(&r), "into the cache");
-        let transfer = events(&calls, SIGNAL)[0];
+        // The transfer event's signals: the make's zeros, then the fill.
+        let signals = events(&calls, SIGNAL);
+        let fill = *signals.iter().rfind(|s| s.0 == signals[0].0).unwrap();
+        assert_eq!(fill.1, 2, "the fill after the zeros");
         assert!(
-            events(&calls, WAIT).contains(&transfer),
+            events(&calls, WAIT).contains(&fill),
             "the use waits on the GPU for the first fill"
         );
         let counts = r.dec.caches().counts();
         assert_eq!((counts.fills, counts.made_fills), (1, 1));
     }
 
-    /// A use of a newer generation than the cache's (its make's, 0) fills the cache from the
-    /// pages; one of the generation the cache holds, or an older one, fills nothing. A buffer
-    /// behind a fill that has not finished waits for it
+    /// The `COMMAND_BUFFER` `cb_obj_id` on queue 1 that names no use and holds an empty blit
+    /// encoder: work that may reach a texture over a surface with no use named.
+    fn blit_work(cb_obj_id: u64) -> Vec<u8> {
+        let mut ops = Vec::new();
+        for tag in [
+            reims_vgpu_graphics::ops::RGFX_OP_ENCODER_BEGIN_BLIT,
+            reims_vgpu_graphics::ops::RGFX_OP_ENCODER_END,
+        ] {
+            let header = RgfxOpHeader {
+                tag,
+                flags: 0,
+                len: 8,
+            };
+            ops.extend_from_slice(header.as_bytes());
+        }
+        let m = RgfxCommandBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_COMMAND_BUFFER,
+                size: (RGFX_COMMAND_BUFFER_OPS_OFFSET as usize + ops.len()) as u32,
+                seqno: cb_obj_id,
+            },
+            queue_obj_id: 1,
+            cb_obj_id,
+            op_bytes: ops.len() as u64,
+        };
+        let mut message = m.as_bytes().to_vec();
+        message.extend_from_slice(&ops);
+        message
+    }
+
+    /// A command buffer of blit work that names no use, in the context of the first buffer over a
+    /// new cache, makes the cache's first fill and waits for it on the GPU, as its work may reach
+    /// a texture over the surface through an argument buffer; one before any buffer over the
+    /// block, which no context reaches yet, fills nothing
+    #[test]
+    fn work_in_the_context_of_a_new_cache_s_buffer_fills_it() {
+        let mut r = cached();
+        let page = r.page;
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, &blit_work(0x100)).unwrap(), Ok(()));
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "no buffer over it yet"
+        );
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, &blit_work(0x101)).unwrap(), Ok(()));
+        let calls = r.p.call_log().since(mark);
+        let filled = copies(&calls);
+        assert_eq!(filled.len(), 1, "the first fill");
+        assert_eq!(filled[0].1, cache_id(&r), "into the cache");
+        let transfer = events(&calls, SIGNAL)[0];
+        assert!(
+            events(&calls, WAIT).contains(&transfer),
+            "the buffer waits for the fill"
+        );
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.dec.decode(&r.device, &blit_work(0x102)).unwrap(), Ok(()));
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "filled once"
+        );
+        assert_eq!(r.dec.caches().counts().made_fills, 1);
+    }
+
+    /// A buffer over a new cache made in another context than the first's makes the cache's
+    /// first fill at once, as that context may reach it in ways the first's decodes do not
+    /// order; one made again in the first's fills nothing
+    #[test]
+    fn a_buffer_over_a_new_cache_in_another_context_fills_it() {
+        let mut r = cached();
+        let page = r.page;
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        let caches = Arc::clone(&r.dec.surface_caches);
+        let mark = r.p.call_log().mark();
+        caches.buffer_made(&r.device, BLOCK, None).unwrap();
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "the same context"
+        );
+        caches.buffer_made(&r.device, BLOCK, Some(7)).unwrap();
+        let filled = copies(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1, "another context's");
+        assert_eq!(filled[0].1, cache_id(&r), "into the cache");
+        assert_eq!(r.dec.caches().counts().made_fills, 1);
+    }
+
+    /// A use of a newer generation than the cache's, or of any where it holds none (a new cache,
+    /// owing its first fill), fills the cache from the pages; one of the generation the cache
+    /// holds, or an older one, fills nothing. A buffer behind a fill that has not finished waits
+    /// for it
     #[test]
     fn a_use_fills_the_cache_once_a_generation() {
         let mut r = cached();
@@ -3914,7 +4237,7 @@ mod tests {
         assert_eq!(filled.len(), 1);
         assert_eq!(filled[0].1, cache, "into the cache");
         let transfer = events(&calls, SIGNAL)[0];
-        assert_eq!(transfer.1, 2, "after the make's fill");
+        assert_eq!(transfer.1, 2, "after the make's zeros");
         assert!(
             events(&calls, WAIT).contains(&transfer),
             "the buffer waits for its fill"
@@ -3928,7 +4251,7 @@ mod tests {
                 "generation {generation}"
             );
         }
-        assert_eq!(r.dec.caches().counts().fills, 3, "the make's, 1's and 3's");
+        assert_eq!(r.dec.caches().counts().fills, 2, "1's, the first, and 3's");
     }
 
     /// A buffer that asks for its `CB_SUBMITTED` and uses a cache the host fills first waits for
@@ -4416,7 +4739,7 @@ mod tests {
             ..reading(BLOCK, 0)[0]
         }];
         let (_, uses) = (r.dec.surface_caches)
-            .before(&r.device, &writer, &writes)
+            .before(&r.device, &writer, &writes, &NO_REACH)
             .unwrap();
         let released = release(&r, BLOCK);
         assert!(!released.load(Ordering::SeqCst), "behind the writer");
@@ -4490,7 +4813,7 @@ mod tests {
                 ..reading(BLOCK, 0)[0]
             }];
             let (_, uses) = (r.dec.surface_caches)
-                .before(&r.device, &writer, &writes)
+                .before(&r.device, &writer, &writes, &NO_REACH)
                 .unwrap();
             let released = Arc::new(AtomicBool::new(false));
             let set = Arc::clone(&released);
@@ -4542,7 +4865,8 @@ mod tests {
     /// is named, as of the generation in the block's header, once what a buffer wrote of the cache
     /// went into them: the next use of that generation fills nothing more, and one of a newer
     /// generation fills again. One named over other pages, or not cached, loses it, what a buffer
-    /// wrote of it going into its pages first. Nothing else is copied
+    /// wrote of it going into its pages first, and the new cache over other pages owes its first
+    /// fill, which its first use makes. Nothing else is copied
     #[test]
     fn a_block_named_again_keeps_its_cache_filled_from_its_pages() {
         let mut r = cached();
@@ -4596,12 +4920,19 @@ mod tests {
         assert_ne!(other, cache, "a new cache");
         assert_eq!(
             back.len(),
-            2,
-            "the old cache copied out, the new one filled"
+            1,
+            "the old cache copied out, the new one owing its first fill"
         );
         assert_eq!(back[0].0, cache, "the old cache, into its pages");
-        assert_eq!(back[1].1, other, "the new cache, filled from its pages");
+        let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x103, &[(BLOCK, 1, true)]);
+        let filled = copies(&r.p.call_log().since(mark));
+        assert_eq!(
+            filled.len(),
+            1,
+            "the new cache's first fill, at its first use"
+        );
+        assert_eq!(filled[0].1, other, "the new cache, filled from its pages");
         r.p.world().complete_all(CompleteOn::Caller);
 
         let mark = r.p.call_log().mark();
@@ -4615,7 +4946,8 @@ mod tests {
         assert_eq!(
             (counts.made, counts.made_fills, counts.downloads),
             (2, 4, 3),
-            "two made, each filled, and filled at the two namings; three copies out"
+            "two made, each filled at its first use, and filled at the two namings; three \
+             copies out"
         );
     }
 
@@ -4631,7 +4963,7 @@ mod tests {
         let queue = r.device.new_command_queue().unwrap();
         let reader = queue.command_buffer(ON).unwrap().unwrap();
         let (_, uses) = (r.dec.surface_caches)
-            .before(&r.device, &reader, &reading(BLOCK, 0))
+            .before(&r.device, &reader, &reading(BLOCK, 0), &NO_REACH)
             .unwrap();
         let mark = r.p.call_log().mark();
         assert_eq!(
@@ -4804,13 +5136,13 @@ mod tests {
         let queue = r.device.new_command_queue().unwrap();
         let reader = queue.command_buffer(ON).unwrap().unwrap();
         let (_, uses) = (r.dec.surface_caches)
-            .before(&r.device, &reader, &reading(BLOCK, 1))
+            .before(&r.device, &reader, &reading(BLOCK, 1), &NO_REACH)
             .unwrap();
         assert!(uses.is_some(), "counted among its users");
         let filler = queue.command_buffer(ON).unwrap().unwrap();
         let mark = r.p.call_log().mark();
         let (waits, filling) = (r.dec.surface_caches)
-            .before(&r.device, &filler, &reading(BLOCK, 2))
+            .before(&r.device, &filler, &reading(BLOCK, 2), &NO_REACH)
             .unwrap();
         assert!(waits, "waits for the fill");
         assert!(filling.is_some());
@@ -4855,7 +5187,7 @@ mod tests {
                 ..reading(BLOCK, 1)[0]
             }];
             let (_, walking) = (r.dec.surface_caches)
-                .before(&r.device, &long, &use_of)
+                .before(&r.device, &long, &use_of, &NO_REACH)
                 .unwrap();
             let caches = Arc::clone(&r.dec.surface_caches);
             let (asking, taking) = (
@@ -4865,8 +5197,8 @@ mod tests {
             let mark = r.p.call_log().mark();
             let (begun_at_once, asked, taken) = std::thread::scope(|scope| {
                 let begin = scope.spawn(|| {
-                    let asked = caches.before(&r.device, &asking, &reading(BLOCK, 2));
-                    let taken = caches.before(&r.device, &taking, &reading(BLOCK, 2));
+                    let asked = caches.before(&r.device, &asking, &reading(BLOCK, 2), &NO_REACH);
+                    let taken = caches.before(&r.device, &taking, &reading(BLOCK, 2), &NO_REACH);
                     (asked.map_err(|_| ()), taken.map_err(|_| ()))
                 });
                 let mut at_once = false;
@@ -4933,7 +5265,7 @@ mod tests {
         let queue = r.device.new_command_queue().unwrap();
         let reader = queue.command_buffer(ON).unwrap().unwrap();
         let (_, uses) = (r.dec.surface_caches)
-            .before(&r.device, &reader, &reading(BLOCK, 1))
+            .before(&r.device, &reader, &reading(BLOCK, 1), &NO_REACH)
             .unwrap();
         let mark = r.p.call_log().mark();
         let wait = (r.dec.surface_caches)
@@ -4973,7 +5305,7 @@ mod tests {
         };
         let first = queue.command_buffer(ON).unwrap().unwrap();
         let (_, first_uses) = (r.dec.surface_caches)
-            .before(&r.device, &first, &writes(1))
+            .before(&r.device, &first, &writes(1), &NO_REACH)
             .unwrap();
         let downloaded = download(&r, BLOCK);
         let (reader, writer) = (
@@ -4982,12 +5314,12 @@ mod tests {
         );
         let mark = r.p.call_log().mark();
         let (reads, read_uses) = (r.dec.surface_caches)
-            .before(&r.device, &reader, &reading(BLOCK, 1))
+            .before(&r.device, &reader, &reading(BLOCK, 1), &NO_REACH)
             .unwrap();
         assert!(!reads, "a reader waits for the download");
         assert!(events(&r.p.call_log().since(mark), WAIT).is_empty());
         let (written, write_uses) = (r.dec.surface_caches)
-            .before(&r.device, &writer, &writes(1))
+            .before(&r.device, &writer, &writes(1), &NO_REACH)
             .unwrap();
         assert!(written, "a writer waits for the download");
         let event = event_id(&r);
@@ -5049,7 +5381,7 @@ mod tests {
         // A long walk reads the block's cache.
         let long = long_queue.command_buffer(ON).unwrap().unwrap();
         let (_, walking) = (r.dec.surface_caches)
-            .before(&r.device, &long, &reading(BLOCK, 1))
+            .before(&r.device, &long, &reading(BLOCK, 1), &NO_REACH)
             .unwrap();
         // A buffer reads a newer generation of it, whose fill waits for the long walk, and writes
         // the other block's cache, whose download is asked behind it.
@@ -5062,7 +5394,7 @@ mod tests {
             },
         ];
         let (waits, using) = (r.dec.surface_caches)
-            .before(&r.device, &buffer, &uses)
+            .before(&r.device, &buffer, &uses, &NO_REACH)
             .unwrap();
         assert!(waits, "waits for the fill");
         let downloaded = download(&r, other);
@@ -5100,12 +5432,13 @@ mod tests {
     /// A buffer that uses a device cache is answered `CB_SUBMITTED` at its doorbell, before its
     /// queue's thread takes it, where it would get it at its take: its cache's last fill is done,
     /// it needs no fill, and no copy asked of the cache is one it follows (R184, R224: it was
-    /// refused for using a cache at all). Not while the make's fill runs, nor where the buffer's
-    /// generation is newer than the cache's, nor for a writer behind a download that waits for
-    /// another writer, which a reader is not behind; nor while the caches' lock is busy.
+    /// refused for using a cache at all). Not while the cache owes its first fill, nor while that
+    /// fill runs, nor where the buffer's generation is newer than the cache's, nor for a writer
+    /// behind a download that waits for another writer, which a reader is not behind; nor while
+    /// the caches' lock is busy.
     #[test]
     fn a_buffer_using_a_cache_is_answered_at_its_doorbell_where_it_waits_for_no_copy() {
-        let r = cached();
+        let mut r = cached();
         let answered = |r: &Rig, message: &[u8]| {
             let yes = (r.dec.decoders()).answer_at_doorbell(0, message, |_| true);
             // What the answer took, let go of, as a begin would take it.
@@ -5122,7 +5455,10 @@ mod tests {
         };
         let reads = |cb, generation| surfaces_message(1, cb, &[(BLOCK, generation, false)], true);
         let writes = |cb, generation| surfaces_message(1, cb, &[(BLOCK, generation, true)], true);
-        assert!(!answered(&r, &reads(0x300, 0)), "the make's fill runs");
+        assert!(!answered(&r, &reads(0x300, 0)), "the first fill owed");
+        // Its begin makes the fill.
+        assert_eq!(r.dec.decode(&r.device, &reads(0x300, 0)).unwrap(), Ok(()));
+        assert!(!answered(&r, &reads(0x2ff, 0)), "the first fill runs");
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(
             answered(&r, &reads(0x301, 0)),
@@ -5141,7 +5477,7 @@ mod tests {
             ..reading(BLOCK, 0)[0]
         }];
         let (_, uses) = (r.dec.surface_caches)
-            .before(&r.device, &writer, &use_of)
+            .before(&r.device, &writer, &use_of, &NO_REACH)
             .unwrap();
         let downloaded = download(&r, BLOCK);
         assert!(
@@ -5167,7 +5503,7 @@ mod tests {
         let counts = r.dec.caches().counts();
         assert_eq!(
             (counts.doorbell_free, counts.doorbell_waits),
-            (4, 3),
+            (4, 4),
             "the looks with the lock free"
         );
     }
@@ -5190,7 +5526,7 @@ mod tests {
             ..reading(BLOCK, 1)[0]
         }];
         let (_, uses) = (r.dec.surface_caches)
-            .before(&r.device, &writer, &writes)
+            .before(&r.device, &writer, &writes, &NO_REACH)
             .unwrap();
         let downloaded = Arc::new(AtomicBool::new(false));
         let released = Arc::new(AtomicBool::new(false));
@@ -5217,7 +5553,7 @@ mod tests {
         assert!(!downloaded.load(Ordering::SeqCst) && !released.load(Ordering::SeqCst));
         let later = queue.command_buffer(ON).unwrap().unwrap();
         let (waits, reading_uses) = (r.dec.surface_caches)
-            .before(&r.device, &later, &reading(BLOCK, 1))
+            .before(&r.device, &later, &reading(BLOCK, 1), &NO_REACH)
             .unwrap();
         assert!(
             !waits && reading_uses.is_some(),
@@ -5260,7 +5596,7 @@ mod tests {
             ..reading(BLOCK, 1)[0]
         }];
         let (_, uses) = (r.dec.surface_caches)
-            .before(&r.device, &writer, &writes)
+            .before(&r.device, &writer, &writes, &NO_REACH)
             .unwrap();
         let caches = Arc::clone(&r.dec.surface_caches);
         let reader = queue.command_buffer(ON).unwrap().unwrap();
@@ -5281,7 +5617,7 @@ mod tests {
             });
             committing.recv().unwrap();
             let begin = scope.spawn(|| {
-                (caches.before(&r.device, &reader, &reading(BLOCK, 1)))
+                (caches.before(&r.device, &reader, &reading(BLOCK, 1), &NO_REACH))
                     .map(|(_, uses)| uses.is_some())
                     .map_err(|_| ())
             });
@@ -5299,7 +5635,7 @@ mod tests {
             );
             let downloaded = download(&r, BLOCK);
             let fill = scope.spawn(|| {
-                (caches.before(&r.device, &filler, &reading(BLOCK, 2)))
+                (caches.before(&r.device, &filler, &reading(BLOCK, 2), &NO_REACH))
                     .map(|_| ())
                     .map_err(|_| ())
             });
@@ -5397,8 +5733,8 @@ mod tests {
         let counts = r.dec.caches().counts();
         assert_eq!(
             (counts.fills, counts.downloads, counts.host_writes),
-            (3, 0, 3),
-            "the make's fill, generation 1's and the host's write's"
+            (2, 0, 3),
+            "generation 1's, the first, and the host's write's"
         );
     }
 
@@ -5477,7 +5813,7 @@ mod tests {
                 ..reading(BLOCK, 0)[0]
             }];
             let (_, uses) = (r.dec.surface_caches)
-                .before(&r.device, &writer, &writes)
+                .before(&r.device, &writer, &writes, &NO_REACH)
                 .unwrap();
             (writer, uses.unwrap())
         };
@@ -5543,7 +5879,7 @@ mod tests {
             ..reading(BLOCK, 1)[0]
         }];
         let (_, uses) = (r.dec.surface_caches)
-            .before(&r.device, &writer, &writes)
+            .before(&r.device, &writer, &writes, &NO_REACH)
             .unwrap();
         let mark = r.p.call_log().mark();
         let downloaded = download(&r, BLOCK);
@@ -5724,8 +6060,8 @@ mod tests {
         let counts = r.dec.caches().counts();
         assert_eq!(
             (counts.fills, counts.downloads, counts.runs_refused),
-            (2, 1, 0),
-            "the make's fill and generation 1's"
+            (1, 1, 0),
+            "generation 1's, the first"
         );
     }
 
@@ -5791,8 +6127,8 @@ mod tests {
         let counts = r.dec.caches().counts();
         assert_eq!(
             (counts.fills, counts.downloads, counts.runs_refused),
-            (3, 1, 1),
-            "the make's fill by runs, then two"
+            (2, 1, 1),
+            "the first fill, refused by runs and made through the view, then generation 2's"
         );
     }
 
@@ -5903,11 +6239,20 @@ mod tests {
             r.pages_cached(BLOCK, &[(1, 4)], 4 * page, true),
             RGFX_STATUS_OK
         );
-        let fill: Vec<(u64, u64, u64)> = offsets(&r.p.call_log().since(mark));
-        assert_eq!(fill, [(0, 0, 4 * page)], "the fill copies every byte in");
+        assert!(
+            offsets(&r.p.call_log().since(mark)).is_empty(),
+            "its fill owed"
+        );
         queues(&mut r);
         let cache = cache_id(&r);
+        let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let fill: Vec<(u64, u64, u64)> = offsets(&r.p.call_log().since(mark));
+        assert_eq!(
+            fill,
+            [(0, 0, 4 * page)],
+            "the first fill copies every byte in"
+        );
         let mark = r.p.call_log().mark();
         r.dec
             .surface_download(&r.device, BLOCK, Box::new(|| {}), no_raise());
@@ -6671,7 +7016,7 @@ mod tests {
             ..reading(BLOCK, 0)[0]
         }];
         let caches = &r.dec.surface_caches;
-        let (_, uses) = caches.before(&r.device, &cb, &writes).unwrap();
+        let (_, uses) = caches.before(&r.device, &cb, &writes, &NO_REACH).unwrap();
         (caches.finish(&r.device, id, Some(queue), &cb, uses.unwrap(), || {
             cb.commit(ON)
         }))
@@ -6831,7 +7176,7 @@ mod tests {
             ..reading(BLOCK, 0)[0]
         }];
         let caches = &r.dec.surface_caches;
-        let (_, uses) = caches.before(&r.device, &cb, &writes).unwrap();
+        let (_, uses) = caches.before(&r.device, &cb, &writes, &NO_REACH).unwrap();
         // The download as the decoder asks it ([`download`]), on a thread of its own: the
         // decoder is not shared between threads, the caches are.
         let region = Arc::clone(&r.dec.shared.region);
@@ -7119,7 +7464,7 @@ mod tests {
             ..reading(BLOCK, 0)[0]
         }];
         let caches = &r.dec.surface_caches;
-        let (_, uses) = caches.before(&r.device, &cb, &writes).unwrap();
+        let (_, uses) = caches.before(&r.device, &cb, &writes, &NO_REACH).unwrap();
         let mark = r.p.call_log().mark();
         let (asked, done) = try_download(&r, BLOCK);
         assert!(asked, "made in the writer's finish");

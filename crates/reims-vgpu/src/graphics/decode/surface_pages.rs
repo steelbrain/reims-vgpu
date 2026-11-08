@@ -163,8 +163,9 @@
 //! it would have right after the `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only
 //! checks its runs, is carried out
 //! there too, in its order with the rest. The guest's kext names a block only after the answer, so
-//! in its order nothing waits but for the block's device cache's first fill, made after the
-//! answer and before the block settles (`surface_cache`, "Fill"). A pages block's view, which its first `BUFFER_OVER_PAGES` or
+//! in its order nothing waits but for the worker to let go of the block once it answered; a new
+//! device cache's first fill is made as what reads the cache first comes (`surface_cache`,
+//! "Fill"). A pages block's view, which its first `BUFFER_OVER_PAGES` or
 //! `HEAP_OVER_PAGES` makes, is made on the worker as well (`GraphicsControl::start_over_pages`):
 //! neither message has an answer, so its context's later messages, its block's release and its
 //! context's close wait for it instead, and none of its context's command buffers is answered at
@@ -1585,7 +1586,12 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             .map(|c| c.clone_ref())
         };
         let buffer = match (cache, view) {
-            (Some(cache), _) => cache,
+            (Some(cache), _) => {
+                // The first buffer over a new cache names the context that owns its first fill;
+                // another context's makes it (`SurfaceCaches::buffer_made`).
+                (self.surface_caches).buffer_made(device, m.block_offset, self.context)?;
+                cache
+            }
             (None, Some(view)) => {
                 match buffer_over(device, &view, 0, m.length, m.options.into(), None)? {
                     Some(buffer) => buffer,

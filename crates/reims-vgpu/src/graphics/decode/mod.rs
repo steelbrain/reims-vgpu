@@ -1055,9 +1055,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.wait_copies_into(pages.block_offset, runs);
         let settle = self.begin_surface_pages(pages.block_offset);
         let status = self.carry_out_surface_pages(device, pages, runs, flags, layout, &settle);
-        if status.is_some() {
-            self.surface_pages_answered(device, pages.block_offset, &settle);
-        }
+        drop(settle);
         status.unwrap_or(RGFX_STATUS_REFUSED)
     }
 
@@ -1200,8 +1198,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             if d.made != 0 {
                 log::info!(
                     target: "reims_vgpu::graphics",
-                    "IOSurface device caches: {} made; {} fills of {} MiB ({} as made or named \
-                     again), {} downloads of {} MiB, {} asked of a cache nothing wrote; {} fills or \
+                    "IOSurface device caches: {} made; {} fills of {} MiB ({} first fills or as \
+                     named again), {} first fills a decode wrote over instead, {} downloads of \
+                     {} MiB, {} asked of a cache nothing wrote; {} fills or \
                      downloads the host's devices' writes changed; {} written caches copied at a \
                      release with no client left; {} released held by the kext alone, as the \
                      kext counts them: {} of them written since their last copy, dropped \
@@ -1216,7 +1215,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      cache waited for no copy of it, {} for one; {} made exportable for the \
                      host's video, {} not; {} made with their surface's first plane on 256 bytes \
                      of their memory",
-                    d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.downloads,
+                    d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.decode_firsts,
+                    d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
                     d.unheld_released, d.unheld, d.unheld_bytes >> 20, d.retaken, d.behind,
                     d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
@@ -1229,38 +1229,6 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         Some(status)
-    }
-
-    /// The `SURFACE_PAGES` of the block at `block` that `settle` began, carried out
-    /// ([`Self::carry_out_surface_pages`]) and answered: the first fill of the device cache it
-    /// made the block, owed since the cache's make, is made now, before the block settles
-    /// ([`surface_cache::Caches::fill_first`]). Nothing where the device was reset since `settle`
-    /// began it.
-    pub(crate) fn surface_pages_answered(
-        &self,
-        device: &P::Device,
-        block: u64,
-        settle: &worker::Settle,
-    ) {
-        if self.shared.surface_views.lock().resets() != settle.resets {
-            return;
-        }
-        let clock = self.platform.clock();
-        let start = clock.now_mono();
-        match self.surface_caches.fill_first(device, block) {
-            Ok(true) => log::debug!(
-                target: "reims_vgpu::graphics::surface_pages",
-                "SURFACE_PAGES of the block at {block:#x} answered: its device cache's first fill \
-                 committed in {} us",
-                clock.now_mono().saturating_duration_since(start).as_micros()
-            ),
-            Ok(false) => {}
-            Err(raise) => log::warn!(
-                target: "reims_vgpu::graphics",
-                "the IOSurface block at {block:#x}: the platform raised at its device cache's \
-                 first fill ({raise:?})"
-            ),
-        }
     }
 
     /// [`Self::carry_out_surface_pages`] of a block with pages, which it maps.
@@ -2134,9 +2102,8 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Waits for the block at `block` to be as its `SURFACE_PAGES` left it, where the surface
     /// worker is still carrying one out ([`worker::Unsettled`]), and logs the wait: the guest's
-    /// kext names a block only once it is answered, so a wait is a message the guest posted before,
-    /// or after the answer while the block's new device cache's first fill is made
-    /// ([`Self::surface_pages_answered`]).
+    /// kext names a block only once it is answered, so a wait is a message the guest posted before
+    /// the answer, or one right after it while the worker lets go of the block.
     fn settle_surface(&self, block: u64) {
         if !self.shared.unsettled.any(std::iter::once(block)) {
             return;
@@ -3267,6 +3234,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                             row_bytes: video::row_bytes(&info, m.desc.width, m.bytes_per_row),
                             width: u64::from(m.desc.width),
                             height: u64::from(m.desc.height),
+                            whole: video::whole_plane(
+                                facts.as_ref(),
+                                m.plane,
+                                m.desc.width,
+                                m.desc.height,
+                            ),
                         });
                         self.store(m.obj_id, entry);
                         if m.plane == 0 {

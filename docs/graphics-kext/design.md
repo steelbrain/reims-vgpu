@@ -404,11 +404,20 @@ Stages:
       (`RGFX_OP_SURFACE_USE`) with the kext's count of the surface's
       read-write locks when it was committed; the host fills the cache from
       the pages before the first buffer of a newer count, on its own transfer
-      queue, after every buffer that used the cache before. It also fills a
-      cache as it is made, and as its block is named again over the same
-      pages, as of the count in the block's header then, so a texture that a
-      buffer reaches through an argument buffer with no `useResource:` (which
-      no `RGFX_OP_SURFACE_USE` names) reads the pages as they were. The pages
+      queue, after every buffer that used the cache before. A new cache is
+      made as zeros and owes its first fill from the pages, as of the count in
+      the block's header then, which the first thing that reads it makes: a
+      named use, a present, a buffer of render, compute or blit work in the
+      process that made the block's first buffer, and a buffer over the block
+      in any other, so a texture that a buffer reaches through an argument
+      buffer with no `useResource:` (which no `RGFX_OP_SURFACE_USE` names)
+      reads the pages. A buffer of decodes alone that writes the whole of both
+      planes of a new two-plane 4:2:0 surface (a decoder's new output) takes
+      the fill as met instead: its picture lands over the zeros, and the
+      cache's copies into the pages copy those planes' rows alone from then
+      on, so the pages' other bytes (CoreVideo's header) stay as the CPU wrote
+      them; a decode that answers no picture makes the fill. A block named
+      again over the same pages is filled again, as of the count then. The pages
       are written from the cache only at `SURFACE_DOWNLOAD`, which the kext asks
       at a CPU lock that follows a GPU write, and at the block's
       `BLOCK_RELEASE`, and only where a buffer that may write the surface was
@@ -439,7 +448,13 @@ Stages:
         since a fill waits for it; a buffer of an older count taken after a
         fill of a newer one (two queues' buffers committed apart and taken in
         the other order) reads the newer bytes; a download of a cache nothing
-        wrote since its last copy copies nothing; and a host whose GPU shares
+        wrote since its last copy copies nothing; a decoder's new output whose
+        picture fails to land, or lands short of its planes, reads zeros where
+        the picture did not write, where the pages would give their bytes
+        (Metal leaves a failed decode's output undefined, and a new surface's
+        texels are the kernel's zero-filled pages unless its client wrote them
+        under a lock, which moves the count and has the decode's use fill the
+        cache); and a host whose GPU shares
         the CPU's memory keeps a cache only of a surface whose textures
         cannot lie in place over its pages (below), the rest in place as
         above.
