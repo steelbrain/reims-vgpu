@@ -22,6 +22,8 @@ the crate's unless they name another.
 | A display on a render node, its capabilities, configs and contexts | `src/va/display.rs`, `src/va/caps.rs` |
 | HEVC syntax and the decoding process above the slice data: NAL units, `hvcC`, SPS/PPS, scaling lists, short- and long-term sets, slice segment headers, order counts, the DPB, lists and bumping. Plain Rust, behind its own `Accelerator` trait | the codec crate's `src/hevc.rs`, `src/hevc/`, re-exported as `hevc`; the bumping process H.264 shares, `src/dpb.rs` |
 | NV12 and P010 surface pools, a frame on one, and the readback into caller planes | `src/va/surface.rs`, `src/va/frame.rs` |
+| What the driver's video processing writes into an imported surface, tried at each display's open ("The import check") | `src/va/import_check.rs` |
+| The reims-graphics device's decode on VA-API: each picture written in place by the driver's video processing, or copied by the CPU ("The reims-graphics device") | reims-vgpu's `src/graphics/vaapi.rs`, `src/graphics/video_host.rs` |
 | VA buffers and a picture's begin, render and end, for every codec | `src/va/buffer.rs` |
 | The H.264 accelerator, `H264Decoder` and `Frame` | `src/va/h264.rs` |
 | The HEVC accelerator and `HevcDecoder` | `src/va/hevc.rs` |
@@ -154,6 +156,59 @@ Both report the same, but for AV1 decode:
   driver only as a dma-buf import ("Zero copy"), and is otherwise copied
   into ("The copy back").
 
+## The import check
+
+Both ways the backend has a driver's video processing write memory
+imported as a linear surface, the staged copy back and zero copy, rest on
+what the driver does with such an import, and a driver may take the
+import and its run, answer success, and write the wrong bytes or none
+([bugs.md](bugs.md), U16, U26). So each display learns it as it opens, on
+the opening thread, from a trial run of each of the decoders' formats,
+NV12 and P010 (`src/va/import_check.rs`, `learn`):
+- a picture holding every sample value of its format, 328x64, is put
+  into a surface of the decoders' kind by `vaPutImage`;
+- one video-processing run copies it into memory of the check's own,
+  imported as zero copy imports a guest's buffer (one dma-buf of both
+  planes);
+- every byte of that memory is compared: each plane's samples, and every
+  byte around them, the rows' padding included, left as it was.
+
+It tries rows and plane starts 64, 128 and 256 bytes apart, in turn. Each
+pitch is an odd multiple of its alignment and each plane starts an odd
+multiple of it into its page, so a driver that takes only a larger
+alignment refuses the import or misplaces the picture. Where a run
+answers success and writes the picture wrongly, a second run at that
+alignment tries rows of whole alignments, the luma plane at the dma-buf's
+first byte and the chroma plane whole rows after it. The first that
+passes is the format's `ImportWrite`: its alignment, and whether it
+writes whole rows alone. Where none passes, the driver is lent no import
+of that format, and its frames come back through `vaGetImage` ("The copy
+back"). The display's open logs both answers, as `in place: NV12
+Ok(ImportWrite { alignment: 256, whole_rows: false }), P010 ...`.
+
+What the drivers answered (**measured**, libva 2.24.1, 2026-11-07):
+
+| driver, GPU | NV12 and P010 |
+|---|---|
+| radeonsi (Mesa 26.2.6), Radeon 780M (Phoenix, 1002:15bf and 1002:1900) and RX 7900 XTX | 256 bytes |
+| iHD 26.3.5, Iris Xe of an i9-13900H | 64 bytes, whole rows ([bugs.md](bugs.md), U26) |
+
+The check has not run on NVIDIA's VA-API driver, which wrote nothing
+into an import and answered success (U16); its byte comparison fails
+such a driver.
+
+**What it costs**, at each open (`examples/vaapi-probe`, three runs a
+GPU): on the Radeon 780M 12.6 to 18 ms at the process's first open, of an
+open of 28.6 to 128.9 ms, and 10.3 to 12.7 ms at a second; on the RX 7900
+XTX 17.3 to 38.4 ms; on the Iris Xe 9.9 to 36.4 ms, of opens of 11.8 to
+104.4 ms.
+
+**The sweep**, `the_check_lends_no_way_a_decoder_shape_comes_out_wrong_through`
+(ignored: it needs a VA-API GPU), puts each of the decoders' shapes, at
+every pitch a guest's buffer may have, through each layout the check can
+answer, and fails where a layout the answer lends comes out wrong. It
+passed on the three radeonsi GPUs and the Iris Xe (2026-11-07).
+
 ## The copy back
 
 Each decoded frame is copied out of the driver's surface into the guest's
@@ -166,23 +221,26 @@ over PCIe. The pool's surfaces come back one of four ways
   against shrinking, makes it a dma-buf with udmabuf, maps it
   (`src/va/host_memory.rs`), and imports the dma-buf as a linear VA
   surface of the pool's format (`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`,
-  one object, rows rounded up to 256 bytes, the chroma plane at a 4096
-  boundary), with a video-processing context (`VAProfileNone`,
+  one object, rows rounded up to 256 bytes, each plane at a 4096 boundary
+  that is also whole rows of the luma's pitch from the first byte,
+  `HostFormat::layout`), with a video-processing context (`VAProfileNone`,
   `VAEntrypointVideoProc`) on it. Each frame: the decode surface's sync
   (the *wait*), one processing run into the import, a `poll` on the
   dma-buf for its writes and its sync (the *transfer*: the GPU writes
   system memory; "Zero copy", "The driver's lock", "Waiting for the
   GPU"), then a copy of the cropped rectangle out of cached memory into
   the guest's planes (the *copy*). Every frame of every check is bit-exact
-  through it, on both GPUs (below). Only radeonsi copies back so
-  (`Display::writes_imports`, `src/va/display.rs`): NVIDIA's VA-API driver
+  through it, on both GPUs (below). A driver copies back so only where
+  the import check passed on it at its display's open ("The import
+  check", `Display::writes_imports` in `src/va/display.rs`), since a
+  driver says nothing of what it gets wrong here: NVIDIA's VA-API driver
   (libva-nvidia-driver 0.0.18 on the RTX 5080, 2026-10-25) took the import
   and the run, answered success, and every frame that came back was wrong,
-  the 120 of main-720p one MD5 ([bugs.md](bugs.md), U16). A driver says
-  nothing of what it gets wrong here, so every other driver's frames come
-  back through `vaGetImage`, with a line in the log saying why, until the
-  codec checks and the zero copy check ("Zero copy") pass on it and its
-  name joins `DRIVERS_WRITING_IMPORTS`.
+  the 120 of main-720p one MD5 ([bugs.md](bugs.md), U16). Where the check
+  passed on neither of a driver's formats, its frames come back through
+  `vaGetImage`, with a line in the log saying why. The planes' layout
+  serves both ways the check passes, planes at an alignment or in whole
+  rows, so iHD, which writes whole rows alone, copies back so too.
 - **`vaGetImage`** into one image per pool, mapped, then the same copy:
   the fallback where the import or the context cannot be made, with a
   line in the log saying why, as with no `/dev/udmabuf` the process may
@@ -278,9 +336,10 @@ pages in the order the bytes lie in
 (`crates/reims-vgpu-vulkan/src/os/linux/device_lend.rs`, `dma_buf_of`).
 The backend imports the buffer once per mapping, frame size and format,
 in strips of the frame's rows ("What udmabuf takes", below): each strip an
-even number of rows, a linear VA surface over two dma-bufs, one of its
-luma rows and one of its chroma rows, at the guest's own offsets and
-pitches (`DRM_PRIME_2`, an object a plane, `DRM_FORMAT_MOD_LINEAR`). The
+even number of rows, a linear VA surface over one dma-buf of its luma and
+chroma rows, at the guest's own offsets and pitches (`DRM_PRIME_2`, one
+object of two planes, `DRM_FORMAT_MOD_LINEAR`), as the import check
+imports its memory. The
 strips share one video-processing context, and the import is kept by the
 mapping's identity until the mapping goes (at most 96 at once, the one
 used longest ago dropped first). Each frame is then one run a strip, from
@@ -317,9 +376,14 @@ imports rows of a multiple of 256 bytes alone`. The stand-in guest's pool
 pads each row by 256 bytes more (`ROW_PADDING`, so that its checks see the
 stride), which leaves a row a multiple of 256 where the guest's is and not
 where it is not: its 1080p rows of 2176 bytes, 360p of 896 and 1366-wide
-of 1664 were declined, its 4K and 720p written. Only radeonsi is lent guest
-buffers at all (`Display::writes_imports`); on NVIDIA's VA-API driver the
-import and the run answered success and the frames were wrong (above).
+of 1664 were declined, its 4K and 720p written. A driver is lent guest
+buffers only where the import check passed on it, and only buffers of the
+layout it passed at (`Display::writes_imports`): rows and plane starts a
+multiple of its alignment, and, where it writes whole rows alone as iHD
+does, the luma plane at a page's first byte and the chroma plane whole
+rows of the luma's pitch after it ([bugs.md](bugs.md), U26). On NVIDIA's
+VA-API driver the import and the run answered success and the frames
+were wrong (above).
 
 **What udmabuf takes.** The kernel's `udmabuf` puts at most `list_limit`
 runs of pages and `size_limit_mb` MiB in one dma-buf: 1,024 and 64 at its
@@ -463,6 +527,69 @@ for f in build/host-session-check/*.sequence; do
 done
 $t/perf-check.sh /dev/dri/renderD128                        # and with RVGV_ZERO_COPY=off
 ```
+
+## The reims-graphics device
+
+The reims-graphics device's H.264 and HEVC decode runs on this backend
+where its GPU is not one NVDEC opens: the device's video chooser
+(reims-vgpu's `src/graphics/video_choice.rs`) tries NVDEC, then VA-API on
+the render node of the runtime device's own GPU, whatever its vendor
+(`host_gpus::render_node_of`), then Vulkan Video. The arm
+(`src/graphics/vaapi.rs`) runs the crate's `H264Decoder` and
+`HevcDecoder` in a host video session of reims-vgpu's
+(`src/graphics/video_host.rs`), whose event the host signals.
+
+- **What it answers** is the driver's: the VLD profiles it lists, the
+  formats its configs name, and the sizes its configs and surfaces give.
+  VA has no level limit or DPB bound of its own, so the levels are each
+  codec's top and the DPB its structures' bound. The access unit is copied
+  into VA's slice buffers, so it is read at any place and length.
+- **A decode** hands the guest's Annex B access unit to the decoder, in
+  decode order. It starts the hardware's work and answers the access
+  unit's picture: one, or none for parameter sets and for a picture that
+  random access skips.
+- **A picture lands** in the output's planes one of two ways, the second
+  where the first refuses:
+  1. by the driver's video processing, in place, into the planes' pages
+     imported as zero copy imports a guest buffer ("Zero copy"): where both
+     planes lie in one memory a dma-buf is made of, and the import check's
+     answer for the frame's format takes their layout;
+  2. by the CPU: the frame read back ("The copy back") and copied into the
+     planes' host bytes, or into the session's staging where a plane lies
+     in a device cache.
+
+  A session logs the first reason its pictures take the second way, as
+  `a picture copied by the CPU: rows of 1920 bytes: the driver imports
+  rows of a multiple of 256 bytes alone`, and its counts at its end, as
+  `a session ended after 300 decodes: landed 300 in the surface's pages,
+  by a CPU copy; 0 skipped, 0 failed`. A picture that does not land fails
+  its decode's command buffer, as on NVDEC ([nvidia.md](nvidia.md), "The
+  reims-graphics device").
+- **Surfaces.** A picture holds its decode surface until it lands, and
+  the session holds no more pictures unlanded than the decoder's spare
+  surfaces (`SPARE_FRAMES`, 2), so a decode always finds a free surface.
+- **The display** opens once per runtime device and logs its driver, the
+  open's time and thread, and the import check's answers.
+
+**Measured** in cold boots of an x86-64 macOS guest (2026-11-07):
+decode_md5 decoded H.264 and HEVC at 8 and 10 bits, up to 4K, at odd
+sizes and through a soak, each picture checked against its reference.
+
+| GPU, driver | decodes right, wrong | H.264 1080p | H.264 2160p | HEVC 1080p | HEVC Main 10 1080p | HEVC 4K | HEVC Main 10 4K |
+|---|---|---|---|---|---|---|---|
+| Radeon 780M, radeonsi (Mesa 26.2.6) | 440, 0 | 1163.7 fps | 265.6 | 983.9 | 521.1 | 249.5 | 116.7 |
+| Iris Xe, iHD 26.3.5 | 688, 0 | 331.6 | 92.7 | 383.7 | 328.4 | 106.8 | 85.5 |
+
+An earlier boot on the same 780M, of the arm before the staged copy
+back's planes moved to whole rows, decoded 843 right and none wrong, at
+1172.9 fps for H.264 1080p and 985.5 for HEVC 1080p. No boot logged a
+`reims-vgpu: fatal` line, and in each every picture was copied by the
+CPU. The frames VideoToolbox hands the guest's
+decoder have CoreVideo's own layout, each plane 32 bytes into its page
+and rows of the width rounded up a little, 1376 bytes at 1366. Neither
+driver's video processing writes that: radeonsi wants rows and planes
+256 bytes apart, iHD the luma plane at a page's first byte
+([bugs.md](bugs.md), B93).
 
 ## Waiting for the GPU
 
@@ -1313,8 +1440,8 @@ driver has no JPEG decoder.
   its map, or `vaCreateImage` and `vaGetImage` where the driver cannot
   derive, made on the display's call thread by the decode's deadline
   ("The display's calls"); past it the decode fails, with no other way
-  tried. So on a driver whose writes into imports are not measured right,
-  every driver but radeonsi (`Display::writes_imports`, "The copy back");
+  tried. So on a driver whose writes into imports the import check did not
+  pass (`Display::writes_imports`, "The import check");
   where no host surface can be made, as with no `/dev/udmabuf` the
   process may open; for an output past udmabuf's limit with no strips, on
   a driver with no video processing, or a 4:2:2 copy where the trial at
