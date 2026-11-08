@@ -836,6 +836,15 @@ mod tests {
             ran.lock().unwrap()
         }
 
+        /// `lane`'s counts (waiting, made, gone) once they are `settled`, waited for as [`until`]
+        /// waits, else as they are then. The job's thread sets what [`one_job`] waits for before
+        /// it is among the waiting again, and a thread past [`KEEP`] goes once its own wait ends,
+        /// so a read just after [`one_job`] may meet the threads halfway.
+        fn settled_counts(lane: &Lane, settled: (usize, usize, usize)) -> (usize, usize, usize) {
+            until(|| lane.counts() == settled);
+            lane.counts()
+        }
+
         /// Jobs one at a time, each after a pause longer than a lane's thread was once kept
         /// (1 s), run on the one thread the first made, which the lane keeps through the pauses
         /// and lets go once it has had no job for [`KEEP`].
@@ -850,7 +859,8 @@ mod tests {
                 clock.advance(Duration::from_secs(2));
             }
             assert_eq!(ran_on.len(), 1, "one thread ran the jobs");
-            assert_eq!(lane.counts(), (1, 1, 0), "(waiting, made, gone)");
+            let counts = settled_counts(&lane, (1, 1, 0));
+            assert_eq!(counts, (1, 1, 0), "(waiting, made, gone)");
             clock.advance(KEEP);
             assert!(until(|| lane.threads() == 0), "the idle thread stayed");
             assert_eq!(lane.counts(), (0, 1, 1));
@@ -871,7 +881,8 @@ mod tests {
             for n in 1..pauses {
                 clock.advance(Duration::from_secs(2));
                 ran_on.insert(one_job(&lane, 3));
-                assert_eq!(lane.counts(), (3, 3, 0), "{} s after the burst", 2 * n);
+                let counts = settled_counts(&lane, (3, 3, 0));
+                assert_eq!(counts, (3, 3, 0), "{} s after the burst", 2 * n);
             }
             assert_eq!(
                 ran_on.len(),
@@ -880,7 +891,8 @@ mod tests {
             );
             clock.advance(Duration::from_secs(2));
             one_job(&lane, 1);
-            assert_eq!(lane.counts(), (1, 3, 2), "(waiting, made, gone)");
+            let counts = settled_counts(&lane, (1, 3, 2));
+            assert_eq!(counts, (1, 3, 2), "(waiting, made, gone)");
             assert_eq!(budget.taken(), 0, "the lane's own thread is the one left");
             clock.advance(KEEP);
             assert!(until(|| lane.threads() == 0), "the last thread stayed");
