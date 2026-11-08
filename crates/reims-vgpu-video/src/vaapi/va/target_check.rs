@@ -26,8 +26,11 @@
 //! of 256 bytes at or past the rows' samples), the luma plane 256 bytes into the dma-buf, and the
 //! chroma plane 256 bytes past the next multiple of 256 after the luma's rows, at the coded size
 //! a picture is written in, the last row of the HEVC stream's coding tree blocks half in the
-//! picture. A caller imports only memory of that kind: rows and planes on multiples of 256 bytes
-//! of the dma-buf ([`ALIGNMENT`]), each plane's rows holding the coded picture's.
+//! picture. The gap before the chroma plane has each target imported taller than the picture, its
+//! luma plane declared over the gap and into the chroma plane (`super::target`, "The import"), as
+//! a caller's outputs with CoreVideo's gap between their planes are. A caller imports only memory
+//! of that kind: rows and planes on multiples of 256 bytes of the dma-buf ([`ALIGNMENT`]), each
+//! plane's rows holding the coded picture's.
 //!
 //! **The answer is kept** in one file the caller names, under a key of the driver's vendor string,
 //! the render node's PCI IDs, libva's version and the kernel's release, so only the first display
