@@ -2587,7 +2587,8 @@ pub(crate) mod tests {
     /// A no-copy buffer over pages the table shows mapped writable is imported with the runtime
     /// told so, which asks the kernel nothing of them (its count of the mappings it asked about
     /// stays); once one of the pages is protected read-only, the next buffer over them imports
-    /// a twin with no vouch, and the runtime asks again
+    /// a twin with no vouch, and the runtime asks again. The device's in-place check, which
+    /// asks the kernel of its own pages, is settled first
     #[cfg(target_os = "linux")]
     #[test]
     fn a_buffer_is_vouched_for_while_its_pages_are_writable() {
@@ -2595,6 +2596,10 @@ pub(crate) mod tests {
 
         const PAGE: u64 = 0x1000;
         let d = dev();
+        // The in-place check the device starts as it is adopted asks the kernel of its own
+        // pages on another thread: it ends before the count is read, so only this test's
+        // imports move it.
+        let _ = d.raw.settle_in_place_checks(std::time::Duration::from_secs(60));
         let vm = crate::os::OsVm::new();
         let at = crate::os::allocate_aliasable(2 * PAGE).unwrap();
         let queried = || d.raw.work_counts().host_mappings_queried;
