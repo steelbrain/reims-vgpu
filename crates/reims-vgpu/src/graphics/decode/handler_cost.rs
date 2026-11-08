@@ -1,19 +1,18 @@
 //! How long after a command buffer's GPU end the host's threads learn of it: through the
 //! platform's completion-seen handler, which runs on the thread that saw the completion, and
-//! through its completed handler, which on the Vulkan platform runs on a handler thread the
-//! runtime wakes after that. The device caches answer a download as the first sees its copy done
-//! and tell a fill's waiters there; this measures what that saves against the second.
+//! through its completed handler, which runs on a handler thread the runtime wakes after that. The
+//! device caches answer a download as the first sees its copy done and tell a fill's waiters there;
+//! this measures what that saves against the second.
 //!
 //! A run commits [`ROUNDS`] command buffers of one 4 KiB blit fill each, one at a time, with the
 //! host's threads asleep for 2 ms before each, as between a client's frames, after [`WARM`] to
 //! warm up. Each buffer carries both handlers, which read the host's clock. Printed: p50, p90
 //! and p99 in microseconds of the GPU's start after the commit call began, of each handler's
-//! time after the buffer's GPU end, which both platforms count on the host's clock
+//! time after the buffer's GPU end, which the platform counts on the host's clock
 //! (`CLOCK_UPTIME_RAW` on macOS, `mach_absolute_time`'s; `CLOCK_MONOTONIC_RAW` on Linux), and of
-//! the completed handler's after the completion-seen one's. On Metal the two run on Metal's one
-//! handler thread, the completion-seen one first. A measurement, run by hand in a release build
-//! holding the host's GPU (`cargo test --release -p reims-vgpu --lib [--features vulkan]
-//! handler_cost -- --ignored --nocapture`).
+//! the completed handler's after the completion-seen one's. A measurement, run by hand in a
+//! release build holding the host's GPU (`cargo test --release -p reims-vgpu --lib handler_cost
+//! -- --ignored --nocapture`).
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -30,7 +29,7 @@ use crate::platform::ApiPlatform;
 const ROUNDS: usize = 2000;
 const WARM: usize = 100;
 
-/// The host's clock, in nanoseconds: the one both platforms give GPU times in.
+/// The host's clock, in nanoseconds: the one the platform gives GPU times in.
 fn host_ns() -> u64 {
     #[cfg(target_os = "macos")]
     let clock = libc::CLOCK_UPTIME_RAW;

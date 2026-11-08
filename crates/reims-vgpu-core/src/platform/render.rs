@@ -765,9 +765,9 @@ impl<'a, P: Platform> VertexDraw<'a, P> {
     }
 }
 
-/// [`RenderEncoder::encode_draws`] as each platform's but the one that takes them its own way
-/// sends them: each draw's two commands through [`RenderEncoder::encode`], in order, up to the
-/// first that raises.
+/// [`RenderEncoder::encode_draws`] as the trait's default sends them, and the Vulkan platform's
+/// where it does not take them its own way: each draw's two commands through
+/// [`RenderEncoder::encode`], in order, up to the first that raises.
 pub fn encode_each<P: Platform, E: RenderEncoder<P> + ?Sized>(
     enc: &E,
     on: OnFault,

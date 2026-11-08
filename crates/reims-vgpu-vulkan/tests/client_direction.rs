@@ -1,5 +1,5 @@
 //! Writes through a surface made over the guest's pages with `kIOSurfaceClientDirection` 2, as
-//! core makes one the guest described read-only, on both platforms.
+//! core makes one the guest described read-only, on this crate's platform.
 //!
 //! Measured on Metal, one case per process ([`sweep`]): the GPU drops a fill of a buffer on the
 //! surface, a copy into one from another buffer, a kernel's stores into one, plain or by an atomic

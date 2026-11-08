@@ -255,10 +255,9 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
 /// where later, so a queue's command buffers do not overlap) and its `GPUEndTime` the host time
 /// the runtime saw it complete. On MoltenVK 1.4.1 the runtime answers so whatever the option, as
 /// its timestamps wait for every queue's (the runtime's `TimestampsWaitForEveryQueue`). A
-/// completed handler learns them (core's `CompletedInfo::gpu_times_ns`), and the graphics lane
-/// posts them to its guest, whose bundle answers the run's length from them; this platform's
-/// debug lines read them too ([`crate::gpu::timing`]). The apple-gfx lane's host sees none. The
-/// timestamps cost latency:
+/// completed handler learns them (core's `CompletedInfo::gpu_times_ns`), and the reims-graphics
+/// device posts them to its guest, whose bundle answers the run's length from them; this
+/// platform's debug lines read them too ([`crate::gpu::timing`]). The timestamps cost latency:
 /// measured on the M3 Max (a release build, under a load average of 34), a command buffer of one
 /// blit fill completed a median of 283 to 309 us after its commit, against 356 to 399 us with
 /// them (`timing`'s `gpu_times_from_host_latency`).

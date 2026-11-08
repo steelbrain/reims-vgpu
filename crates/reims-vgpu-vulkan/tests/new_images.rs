@@ -1,4 +1,4 @@
-//! Textures made while the GPU runs earlier work, on both platforms.
+//! Textures made while the GPU runs earlier work, on this crate's platform.
 //!
 //! Metal makes a texture with no GPU work: a texture over an IOSurface (as a guest display's
 //! mapped present makes one) and a texture of memory of its own come back while a committed

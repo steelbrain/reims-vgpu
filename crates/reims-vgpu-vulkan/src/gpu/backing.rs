@@ -32,13 +32,14 @@
 //!   (measured: current and maximum protection read). The GPU's writes never reach such pages,
 //!   and the command buffer completes: later commands of the same command buffer read what it
 //!   wrote, and a later command buffer the guest's bytes, as under a read-only replace on Metal
-//!   (blit fills, measured on both platforms by `tests/detach_backing.rs`; kernel stores are
-//!   dropped alike on Metal). On Linux the runtime makes the object over a copy of such an
-//!   alias's pages, or of a no-copy object's pages made with bit 24 or mapped read-only, whose
-//!   GPU writes it drops, as the views' gate refuses read-only pages (`crate::os::import_view`):
-//!   a shader's, a blit's into a buffer and a visibility result's are sent, and dropped as
-//!   Metal's are, while a pass's store into the object's memory and a write of a texture over it
-//!   are answered where they are encoded ([`Backing::read_only_now`], `crate::gpu::writes`).
+//!   (blit fills, measured on Metal, which `tests/detach_backing.rs` holds this platform to;
+//!   kernel stores are dropped alike on Metal). On Linux the runtime makes the object over a copy
+//!   of such an alias's pages, or of a no-copy object's pages made with bit 24 or mapped read-only,
+//!   whose GPU writes it drops, as the views' gate refuses read-only pages
+//!   (`crate::os::import_view`): a shader's, a blit's into a buffer and a visibility result's are
+//!   sent, and dropped as Metal's are, while a pass's store into the object's memory and a write of
+//!   a texture over it are answered where they are encoded ([`Backing::read_only_now`],
+//!   `crate::gpu::writes`).
 //! - **Detach** marks the object detached; its `contents` and its GPU address stay, as Metal's do
 //!   (measured: `contents` stays the alias of the last replace, still over its pages). A
 //!   submission of a command buffer that uses it fails while it is detached, as do those of
@@ -79,31 +80,30 @@
 //!   so too: a detached buffer, used or not, replaced or not, and a buffer placed in a detached
 //!   heap, reached through an indirect command's buffer address or a loaded pointer, read 0 and
 //!   drop the write, the command buffer completing with no error (measured on the M3 Max, macOS
-//!   26.7: through a loaded pointer on both platforms in `tests/detach_backing.rs`'s
-//!   `detached_reach` and `never_replaced`, and through an indirect command's buffer address by a
-//!   probe outside the tree). No memory is imported for it, so nothing the GPU writes there is
-//!   kept on any host. A texture over the object's bytes stays, and presents a stand-in of its
-//!   image's plan, zero bytes, until they lie in pages again (after Metal's
-//!   answer measured on an M4: such a texture reads zero bytes and drops its writes). Where a
-//!   texture over the bytes has no exact stand-in (a multisample or multi-planar one, or one with
-//!   a depth or decoded twin) or is being made, the runtime refuses the detach, and the process
-//!   ends there ([`refused_detach`]). `contents` stays what it was: the alias of the last
-//!   replace, or of the ranges a heap was made over, or the memory a no-copy buffer was made over
-//!   ([`Own`]), which the detach does not free: Metal runs a no-copy buffer's deallocator at its
-//!   first replace, inside the call, or as it is destroyed, never at a detach, so the run the
-//!   runtime hands over as it lets go of the memory at the detach waits until then ([`Held`]). A
-//!   buffer neither replaced nor made over memory of the caller's by `newBufferWithDescriptor:`
-//!   (one of the device's own memory, one made on a surface, one `newBufferWithBytesNoCopy:`
-//!   made) dies at the detach, where what Metal's `contents` answers and when it runs the
-//!   deallocator are not measured; core detaches none. A replace's rebind ends the use too, as
-//!   Metal's replace does, so after it such a command reads 0 and drops the write until a command
-//!   buffer uses the object again, and then reaches its new pages (measured on Metal so: a buffer
-//!   or a heap used, detached and replaced; both platforms in `tests/detach_backing.rs`). A
-//!   command buffer not yet committed that used the object, its encoder ended or still open,
-//!   leaves the detach as it is: it fails with code 8 as it is submitted, and a command that
-//!   reaches the object unnamed meanwhile reads 0, as on Metal (measured,
-//!   `tests/detach_backing.rs`'s `held`). The runtime resolves what a command buffer reaches
-//!   unnamed as it is first submitted, so one committed before the detach and
+//!   26.7: through a loaded pointer in `tests/detach_backing.rs`'s `detached_reach` and
+//!   `never_replaced`, which hold this platform to it, and through an indirect command's buffer
+//!   address by a probe outside the tree). No memory is imported for it, so nothing the GPU writes
+//!   there is kept on any host. A texture over the object's bytes stays, and presents a stand-in of
+//!   its image's plan, zero bytes, until they lie in pages again (after Metal's answer measured on
+//!   an M4: such a texture reads zero bytes and drops its writes). Where a texture over the bytes
+//!   has no exact stand-in (a multisample or multi-planar one, or one with a depth or decoded twin)
+//!   or is being made, the runtime refuses the detach, and the process ends there
+//!   ([`refused_detach`]). `contents` stays what it was: the alias of the last replace, or of the
+//!   ranges a heap was made over, or the memory a no-copy buffer was made over ([`Own`]), which the
+//!   detach does not free: Metal runs a no-copy buffer's deallocator at its first replace, inside
+//!   the call, or as it is destroyed, never at a detach, so the run the runtime hands over as it
+//!   lets go of the memory at the detach waits until then ([`Held`]). A buffer neither replaced nor
+//!   made over memory of the caller's by `newBufferWithDescriptor:` (one of the device's own
+//!   memory, one made on a surface, one `newBufferWithBytesNoCopy:` made) dies at the detach, where
+//!   what Metal's `contents` answers and when it runs the deallocator are not measured; core
+//!   detaches none. A replace's rebind ends the use too, as Metal's replace does, so after it such
+//!   a command reads 0 and drops the write until a command buffer uses the object again, and then
+//!   reaches its new pages (measured on Metal so: a buffer or a heap used, detached and replaced;
+//!   `tests/detach_backing.rs` holds this platform to it). A command buffer not yet committed that
+//!   used the object, its encoder ended or still open, leaves the detach as it is: it fails with
+//!   code 8 as it is submitted, and a command that reaches the object unnamed meanwhile reads 0, as
+//!   on Metal (measured, `tests/detach_backing.rs`'s `held`). The runtime resolves what a command
+//!   buffer reaches unnamed as it is first submitted, so one committed before the detach and
 //!   submitted after it reads 0 there too, and one submitted before it keeps the pages it reached
 //!   until it completed, as Metal's does.
 //! - **In flight.** Metal answers NO to a detach, and the object stays attached, while a command

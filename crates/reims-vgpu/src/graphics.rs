@@ -286,22 +286,21 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // command buffers across its queues in the order it names, makes a queue the
             // kext asks unshared (WindowServer's) on the platform's unshared queue, and tells a
             // guest producer waiting for room on a submission ring that the device took from it
-            // (the device carries SUBMIT_ROOM out). Both platforms make indirect command buffers,
-            // so every host decodes their messages, slots included. Every host reads a `Managed`
-            // texture's or buffer's CPU copy where its Shared buffer's contents lie, so the guest
-            // may lay the copies in its slabs. Every host takes the texture resource ids' grants
-            // in small chunks (`RESOURCE_ID_SMALL_CHUNK`). Every host lets the guest read the
-            // clock its VBLANKs are stamped on (the device answers HOST_TIME).
-            // A host that maps the guest's pages maps a process's own pages too, for its no-copy
-            // buffers (`BUFFER_OVER_PAGES`) and the heaps of its buffers' slabs
-            // (`HEAP_OVER_PAGES`). Every host carries the display pipe's colour out
-            // (`DISPLAY_COLOR`), its window drawing through it, and names the shared events one
-            // process hands another (`SHARED_EVENT_NAMES`). A host whose GPU answers Metal3
-            // makes mesh render pipelines and draws them (`MESH_PIPELINES`). A host whose device
-            // makes compute pipelines of OpenCL mode links an OpenCL kernel's function the
-            // bundle names so (`OPENCL_MODE`). A host whose device takes the private render
-            // state Apple's OpenGL renderer sets makes the guest's render pipelines with it
-            // (`PRIVATE_RENDER_STATE`).
+            // (the device carries SUBMIT_ROOM out). The platform makes indirect command buffers on
+            // every host, so every host decodes their messages, slots included. Every host reads a
+            // `Managed` texture's or buffer's CPU copy where its Shared buffer's contents lie, so
+            // the guest may lay the copies in its slabs. Every host takes the texture resource ids'
+            // grants in small chunks (`RESOURCE_ID_SMALL_CHUNK`). Every host lets the guest read
+            // the clock its VBLANKs are stamped on (the device answers HOST_TIME). A host that maps
+            // the guest's pages maps a process's own pages too, for its no-copy buffers
+            // (`BUFFER_OVER_PAGES`) and the heaps of its buffers' slabs (`HEAP_OVER_PAGES`). Every
+            // host carries the display pipe's colour out (`DISPLAY_COLOR`), its window drawing
+            // through it, and names the shared events one process hands another
+            // (`SHARED_EVENT_NAMES`). A host whose GPU answers Metal3 makes mesh render pipelines
+            // and draws them (`MESH_PIPELINES`). A host whose device makes compute pipelines of
+            // OpenCL mode links an OpenCL kernel's function the bundle names so (`OPENCL_MODE`). A
+            // host whose device takes the private render state Apple's OpenGL renderer sets makes
+            // the guest's render pipelines with it (`PRIVATE_RENDER_STATE`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
                 | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);

@@ -13,7 +13,7 @@
 //! - `bytes <length> <FNV-1a 128 digest> <first 32 bytes in hex>`: a byte buffer, or an answer's
 //!   raw bytes ([`Raw`]), so a change of a `Debug` form never touches it;
 //! - `hex <length> <every byte in hex>`: a byte buffer a test compares within a tolerance, where
-//!   this library's answer on the Metal platform's Mac (MoltenVK) was not Metal's;
+//!   this library's answer on the Mac (MoltenVK) was not Metal's;
 //! - `xz <length> <offset>`: the same, longer than [`HEX_LIMIT`] bytes, at `offset` in the bytes
 //!   that the test's `.xz` file next to its text file holds.
 

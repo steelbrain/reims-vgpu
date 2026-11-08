@@ -1,7 +1,7 @@
-//! What the library's platforms and the reims-graphics device share, generic over one
+//! What the reims-graphics device and the platform under it share, generic over one
 //! `P: Platform` (D3): the platform traits, the runtime (threads, queues, holds), raises and
-//! deaths, the guest's RAM as the host maps it, and the testkit's fake platform. Links no Apple
-//! framework.
+//! deaths, the guest's RAM as the host maps it, and the testkit's fake platform, which the tests
+//! run in the Vulkan platform's place. Links no Apple framework.
 
 // The crate root denies `unsafe_code` (D43): `forbid` cannot be lowered by the per-module
 // `#![allow(unsafe_code)]` that 17.3 grants `testkit/guest_ram.rs` (E0453).

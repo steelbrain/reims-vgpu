@@ -6,7 +6,7 @@
  * refusals, the files behind its memory map's ranges, and each table's one destroy.
  *
  * Every rvg_ function the header declares is called at least once (tests/c_harness.rs checks
- * that). The device checks need a GPU: a Metal device, or with the vulkan feature a Vulkan one.
+ * that). The device checks need a GPU the Vulkan platform runs on (over MoltenVK on a Mac).
  *
  * Usage: harness             run every check; exit 0 on success
  *        harness die-null    a NULL device given to a function without a status (the process

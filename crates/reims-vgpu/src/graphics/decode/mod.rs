@@ -1,13 +1,13 @@
 //! The stage-3 Metal-call decoder: it reads the guest bundle's serialised Metal
 //! calls off a command queue's ring and drives the library's `Platform`
 //! (docs/graphics-kext/design.md, "Stage 3 wire protocol"). It is generic over
-//! the platform, so it drives Metal on macOS and the Vulkan platform on Linux.
+//! the platform: the Vulkan platform in the library, the testkit's fake one in tests.
 //!
 //! The decoder keeps an `obj_id` → handle table: a create ([`GpuDevice`] and the
 //! resource creators) inserts the new handle, a destroy drops it (handles are
 //! refcounted, so the drop releases the object). Everything the decoder drives is
-//! the library's `Platform` directly — this lane keeps no resource manager of the
-//! Apple lane's; the handle table is the whole of an object's host lifetime.
+//! the library's `Platform` directly, with no resource manager between them: the
+//! handle table is the whole of an object's host lifetime.
 //!
 //! What this covers:
 //! - the descriptor-free **state objects** (events, fences, shared events,
@@ -22,12 +22,12 @@
 //! - the **object-resolution API** (the `require_*`/`get_*` methods below) the
 //!   encoder-op decoders call to turn a wire `obj_id` into a host handle.
 //!
-//! The decoder runs under a live raise handler, as the Apple lane's command
-//! processing does: a platform raise propagates out of [`GraphicsDecoder::decode`]
-//! for the caller to catch. An op-stream reference the host cannot honour faults
-//! the exec the same way ([`bad_reference`], [`op_fault`]), but for one of an object
-//! whose posted create the host refused, whose uses are dropped and whose command
-//! buffers go on ([`refused`]).
+//! The decoder runs under a live raise handler: a platform raise propagates out
+//! of [`GraphicsDecoder::decode`] for the caller to catch. An op-stream
+//! reference the host cannot honour faults the exec the same way
+//! ([`bad_reference`], [`op_fault`]), but for one of an object whose posted
+//! create the host refused, whose uses are dropped and whose command buffers go
+//! on ([`refused`]).
 //!
 //! [`super::GraphicsControl`] drives it from the device's threads: ring 0's messages on their
 //! context's lane (the presents on the presents' lane, a block's pages and downloads on the

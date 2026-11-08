@@ -1,5 +1,5 @@
-//! What the Rust API (`reims-vgpu`, on Linux and with its `vulkan` feature) asks of this platform
-//! beyond core's `Platform`: a frame target's pixels ([`read_pixels`]).
+//! What the Rust API (`reims-vgpu`) asks of this platform beyond core's `Platform`: a frame
+//! target's pixels ([`read_pixels`]).
 
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::num::ToU64;

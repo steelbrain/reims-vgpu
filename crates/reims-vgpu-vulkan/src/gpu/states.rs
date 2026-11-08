@@ -24,10 +24,10 @@
 //!   more with constexpr samplers, whose order Metal itself does not decide, and a function a
 //!   table can hold whose samplers the runtime cannot read, among them. One linked function
 //!   alone, of `functions` or `privateFunctions`, called or not, is numbered as Metal numbers it.
-//!   The paravirtualized device's guest forms link none; the graphics wire's pipelines link the
-//!   functions the guest lists (`reims-vgpu`'s decoder). This platform's libraries, functions and
-//!   states hold the runtime's exactly as long as the guest's handles to them live, so its sampler
-//!   IDs are Metal's (`tests::sampler_ids_follow_pipeline_holders_as_metals`).
+//!   The graphics wire's pipelines link the functions the guest lists (`reims-vgpu`'s decoder).
+//!   This platform's libraries, functions and states hold the runtime's exactly as long as the
+//!   guest's handles to them live, so its sampler IDs are Metal's
+//!   (`tests::sampler_ids_follow_pipeline_holders_as_metals`).
 //! - **A pipeline's refusals** that Metal answers with an `NSError` are one here
 //!   ([`pipeline_error`]): what the compile finds wrong with the functions or the descriptor, a
 //!   vertex function writing a point size under a line or triangle topology, a function Metal's

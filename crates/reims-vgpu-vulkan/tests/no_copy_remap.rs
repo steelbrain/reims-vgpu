@@ -165,7 +165,8 @@ fn not_seen(old: u8) -> [[u8; 2]; 3] {
 /// The GPU reads the new pages, and fills them, which the range and the new mapping show.
 const SEEN: [[u8; 2]; 3] = [[0xe5; 2], [0x7c; 2], [0x7c; 2]];
 
-/// What every order of [`every_order`] answers on both platforms: the old pages.
+/// What every order of [`every_order`] answers, on Metal and on this crate's platform: the old
+/// pages.
 fn kept() -> [[[u8; 2]; 3]; 3] {
     [not_seen(0), not_seen(0xa1), not_seen(0xc3)]
 }

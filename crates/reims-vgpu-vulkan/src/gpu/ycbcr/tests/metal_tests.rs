@@ -131,7 +131,7 @@ fn answers<P: Platform>(
 
 /// A descriptor takes each two-plane format and answers it; every creator but the IOSurface
 /// one answers nil of one Metal's validation passes, and the heap's size query 0 bytes at
-/// Metal's alignment, on both platforms, whatever the creator's own checks would refuse
+/// Metal's alignment, on Metal and on this platform, whatever the creator's own checks would refuse
 /// (`framebufferOnly`, a rotation, an offset or rows off their alignment, bytes past the end,
 /// a storage mode other than the heap's): 505 and 543, and each the runtime has, 500 among
 /// them
@@ -194,7 +194,7 @@ fn textures_but_over_a_surface_are_nil_as_metals_are() {
     for format in two_plane_formats() {
         for (what, change) in nil {
             let desc = ycbcr(format, change);
-            // A heap of storage mode 1 (managed) is refused on both platforms.
+            // A heap of storage mode 1 (managed) is refused, on Metal and on this platform.
             let storage = match desc.resource_options {
                 Some(0) => 0,
                 _ => 2,

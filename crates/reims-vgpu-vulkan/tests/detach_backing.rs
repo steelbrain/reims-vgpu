@@ -9,7 +9,8 @@
 //! and one in the next command buffer the pages. Measured on
 //! `AppleM3Max-40c-25G229`.
 //!
-//! Command buffers that use a detached buffer or heap ([`detached_use`]): both platforms fail
+//! Command buffers that use a detached buffer or heap ([`detached_use`]): Metal and this crate's
+//! platform both fail
 //! the submission that uses it, run the command buffer's other submissions, decide a submission
 //! behind an event wait as they submit it, and fail a use through a texture over a buffer or
 //! placed in a heap released detached. A command buffer committed behind an event wait whose
@@ -797,7 +798,7 @@ const MARKER: u32 = 0xc0de_5eed;
 
 /// A buffer, and a buffer placed in a heap, over the guest's pages and used, reached through an
 /// address a kernel loads, attached, then detached, then replaced by new pages, before and after
-/// a use: what each platform does where nothing names the buffer.
+/// a use: what the platform does where nothing names the buffer.
 fn detached_reach<P: Platform>(p: &P, dev: &P::Device) -> Steps {
     let mut steps: Steps = Vec::new();
     let queue = dev.new_command_queue().unwrap();
@@ -877,11 +878,11 @@ fn detached_reach<P: Platform>(p: &P, dev: &P::Device) -> Steps {
     steps
 }
 
-/// What both platforms do in [`detached_reach`]: attached, the kernel reads the guest's word
-/// and its write lands there; detached, it reads 0 and its write is dropped, the command buffer
-/// completing with no error; `contents` stays. Replaced after the detach, the kernel reads 0
-/// and its write lands neither in the new pages nor in the old, until a command buffer uses the
-/// buffer, or a resource of its heap, again; then it reads and writes the new pages.
+/// What Metal and this crate's platform do in [`detached_reach`]: attached, the kernel reads the
+/// guest's word and its write lands there; detached, it reads 0 and its write is dropped, the
+/// command buffer completing with no error; `contents` stays. Replaced after the detach, the kernel
+/// reads 0 and its write lands neither in the new pages nor in the old, until a command buffer uses
+/// the buffer, or a resource of its heap, again; then it reads and writes the new pages.
 fn expected_reach() -> Steps {
     vec![
         ("a buffer", vec![4, 0, 4, 0, 0xa1a1_a1a1, 1, 4, 0, 0, 0, 1]),
@@ -979,7 +980,7 @@ fn placed_detach<P: Platform>(p: &P, dev: &P::Device) -> Steps {
     steps
 }
 
-/// What both platforms do in [`placed_detach`].
+/// What Metal and this crate's platform do in [`placed_detach`].
 fn expected_placed() -> Steps {
     vec![
         (
@@ -1002,7 +1003,7 @@ fn vm_free(at: HostPtr, length: u64) -> bool {
     OsVm::new().deallocate(at, length).is_success()
 }
 
-/// What both platforms do in [`detached_use`].
+/// What Metal and this crate's platform do in [`detached_use`].
 fn expected_use() -> Steps {
     vec![
         ("one submission", vec![5, 8, 0, 1, 1, 5, 8]),
@@ -1018,7 +1019,7 @@ fn expected_use() -> Steps {
     ]
 }
 
-/// What both platforms do ([`buffer_life`], [`heap_life`], [`edges`]).
+/// What Metal and this crate's platform do ([`buffer_life`], [`heap_life`], [`edges`]).
 fn expected() -> Vec<Steps> {
     vec![
         vec![

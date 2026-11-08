@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-core"
-description = "What the platforms and the graphics device share, generic over the platform; links no Apple framework"
+description = "What the graphics device and its platform share, generic over the platform; links no Apple framework"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

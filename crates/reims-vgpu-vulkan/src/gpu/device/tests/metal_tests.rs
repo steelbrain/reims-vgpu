@@ -2174,7 +2174,7 @@ fn textures_over_planes_a_surface_lacks_are_metals() {
 /// of textures 5 and 40 has Metal give out IDs 1 to 4, then 1 again (measured here, Metal's
 /// side read first, before MoltenVK makes objects of its own on Metal's device). Each
 /// texture's `uniqueIdentifier` is its ID here, and Metal's are compared. Each test runs in a
-/// process of its own, so both platforms' IDs start fresh
+/// process of its own, so its IDs start fresh, as Metal's did
 #[test]
 fn a_texture_takes_a_live_ones_id_where_metal_gives_it() {
     use reims_vgpu_core::platform::Platform;

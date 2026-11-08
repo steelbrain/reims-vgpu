@@ -1,4 +1,4 @@
-//! A `Depth32Float` texture's denormal depths, stored and compared on both platforms: what the
+//! A `Depth32Float` texture's denormal depths, stored and compared as Metal does: what the
 //! runtime announces as `depth-denormals` on this host's MoltenVK is measured against Metal here.
 
 use reims_vgpu_core::platform::Platform;

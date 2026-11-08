@@ -32,7 +32,7 @@ impl CommandQueue<FakePlatform> for Fk<kind::CommandQueue> {
 }
 
 impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
-    /// As Metal's platforms do: the read of the buffer and `block` run in the refusal scope the
+    /// As the Vulkan platform does: the read of the buffer and `block` run in the refusal scope the
     /// handler was added in, where it was added in one (`run_completed`), so a read that dies
     /// ([`World::complete_dying_read`]) hands `block` the buffer refused there.
     ///

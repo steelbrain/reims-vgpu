@@ -2621,8 +2621,8 @@ fn mipmaps_on<P: reims_vgpu_core::platform::Platform>(
 /// where the exact sum missed the M3 Max's code by one at a field
 /// four times whose sum lay a hair from a half. The textures are [`TWO_BIT_TIES`]' chains of
 /// two levels, whose first levels are the runtime's designs over random colours, and at each
-/// designed texel both platforms store the code an M4 stored; and chains of every level from
-/// 64 by 64 and 45 by 29 texels of random bytes, whose levels the runtime takes from the M3
+/// designed texel Metal and this platform store the code an M4 stored; and chains of every level
+/// from 64 by 64 and 45 by 29 texels of random bytes, whose levels the runtime takes from the M3
 /// Max's passes
 #[test]
 fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
@@ -2660,7 +2660,7 @@ fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
                 ));
             }
         }
-        // The alpha each platform stored at the designed texels of the first computed level.
+        // The alpha this platform stored at the designed texels of the first computed level.
         let width = extent[0] / 2;
         let alpha = |level: &[u8], [x, y]: [u64; 2]| {
             level[usize::try_from((y * width + x) * 4 + 3).unwrap()] >> 6

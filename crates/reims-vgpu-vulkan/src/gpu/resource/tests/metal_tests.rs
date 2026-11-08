@@ -955,7 +955,7 @@ fn lossless_mipmapped_heap_texture_sizes_are_metals() {
     }
 }
 
-/// The depth and stencil shapes the device tests below ask of both platforms: a name, texture
+/// The depth and stencil shapes the device tests below ask of the platform: a name, texture
 /// type, levels (0 for the full chain), slices and samples. Each is but a 2D or multisample one
 /// of one slice and level ([`heap_depth_stencil_sizes_with_optimized_contents_off`]'s).
 const DEPTH_SHAPES: [(&str, u64, u64, u64, u64); 10] = [
@@ -1950,7 +1950,7 @@ fn surface_references<P: Platform<Surface = OsSurface>>(
 /// is back to 1 at once. A kernel's read of a view of the texture holds the IOSurface too;
 /// Metal's view takes a reference of its own, 3 while the command buffer runs where this
 /// platform's view shares its texture's, 2. Either way unmap answers Busy until the command
-/// buffer completed. Neither platform's command buffer changes the use count
+/// buffer completed. Neither Metal's command buffer nor this platform's changes the use count
 ///
 /// On this platform the kernel's read through the argument buffer made resident dies at the
 /// dispatch naming `half-texel-conversion` ([`crate::answer::DIES`]): the runtime announces the
