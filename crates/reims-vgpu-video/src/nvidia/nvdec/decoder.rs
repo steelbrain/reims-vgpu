@@ -14,6 +14,28 @@
 //! with the GPU's context pushed: the decoder is made without NVDEC's
 //! context lock (`vidLock`).
 //!
+//! **A decoder is kept once its last user goes**, for the next decoder of
+//! its shape to take instead of making one ([`Decoder::new`]). Making one
+//! costs NVDEC's capabilities query and `cuvidCreateDecoder`: 46-103 ms a
+//! 4K HEVC session on the RTX 5080 Laptop GPU, and 2.2 s once beside two
+//! running decoders, where a guest's player makes a session for each clip
+//! and for each probe of a stream's format. A 4K HEVC decoder made alone
+//! takes 29-36 ms whether it has 1, 8 or 20 surfaces, so the cost is the
+//! session's, not its surfaces'. The capabilities are asked once per GPU,
+//! codec, chroma format and bit depth, and kept. A kept decoder keeps its
+//! handle, its surfaces, its stream and its GPU's context, and nothing of
+//! its pictures:
+//! NVDEC's decoder holds no stream state between pictures (each
+//! `cuvidDecodePicture` names its references), and the decoder that takes
+//! it starts with every surface free. One taken has the same codec, chroma
+//! format, bit depth and size, and surfaces enough; it is reconfigured to a
+//! picture's size as one made would be ([`Decoder::picture_of_size`]), and
+//! is taken on the GPU it was made on, by its context. A
+//! decoder whose work missed its deadline is destroyed, never kept. The
+//! kept decoders hold at most [`KEPT_BYTES`] of decode surfaces between
+//! them, the one kept longest destroyed first past it, and the rest stay for
+//! the process: a decoder costs nothing while kept but its memory.
+//!
 //! **Its waits are bounded** (`crate::nvidia::wait`). A picture's decode is asked
 //! after with `cuvidGetDecodeStatus` until it is no longer in progress,
 //! before the map, which then finds it done; the map's post-processing and
@@ -42,6 +64,7 @@
 
 use std::any::Any;
 use std::ffi::{c_int, c_ulong, c_ulonglong, c_void};
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -49,7 +72,9 @@ use crate::core::runtime::{Answer, Unanswered};
 use crate::core::sync::Mutex;
 
 use super::ffi::{self, CUvideodecoder, Zeroed};
-use super::{ChromaFormat, Nvdec, NvdecCodec, SurfaceFormat, decode_capabilities};
+use super::{
+    ChromaFormat, DecodeCapabilities, Nvdec, NvdecCodec, SurfaceFormat, decode_capabilities,
+};
 use crate::nvidia::cuda::ffi::{CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST, CUDA_MEMCPY2D, CUstream};
 use crate::nvidia::cuda::{Gpu, Pinned, Stream};
 use crate::nvidia::error::Error;
@@ -138,8 +163,9 @@ struct Inner {
     /// picture read back into it is copied out.
     staging: Mutex<Staging>,
     /// The stream a picture's map and copies are queued on, asked after
-    /// rather than waited for (ours).
-    stream: Stream,
+    /// rather than waited for (ours); kept with the handle, or dropped after
+    /// it, as the decoder goes.
+    stream: ManuallyDrop<Stream>,
     /// Set once a picture's work was not done by its deadline: every later
     /// call fails at once.
     stalled: AtomicBool,
@@ -233,20 +259,181 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let _current = match self.gpu.push() {
-            Ok(current) => current,
-            Err(e) => {
-                log::warn!("an NVDEC decoder is left undestroyed: {e}");
-                return;
-            }
+        // SAFETY: the stream is taken once, here, as the decoder goes.
+        let stream = unsafe { ManuallyDrop::take(&mut self.stream) };
+        let made = Made {
+            gpu: Arc::clone(&self.gpu),
+            nvdec: self.nvdec,
+            spec: self.spec,
+            output: self.output,
+            target: *self.calls.lock(),
+            handle: self.handle(),
+            stream,
         };
-        // SAFETY: the handle was made by cuvidCreateDecoder and is
-        // destroyed once, when no picture holds it.
-        let result = unsafe { (self.nvdec.f.cuvidDestroyDecoder)(self.handle()) };
-        if let Err(e) = self.gpu.cuda().check("cuvidDestroyDecoder", result) {
-            log::warn!("{e}");
+        // No picture holds the decoder: its work is done, or missed its
+        // deadline, which leaves the handle in no state to take again.
+        if self.stalled.load(Ordering::Acquire) {
+            made.destroy();
+        } else {
+            keep(made);
         }
     }
+}
+
+/// A decoder's handle, with what a decoder taking it needs: kept as its last
+/// user goes ([`keep`]), or destroyed.
+struct Made {
+    gpu: Arc<Gpu>,
+    nvdec: &'static Nvdec,
+    spec: DecoderSpec,
+    output: SurfaceFormat,
+    /// The size its post-processing writes a mapped frame at, last set.
+    target: (u32, u32),
+    handle: CUvideodecoder,
+    stream: Stream,
+}
+
+// SAFETY: as `Inner`'s: no call is made on a kept handle until a decoder
+// takes it, on whichever thread.
+unsafe impl Send for Made {}
+
+impl Made {
+    /// Destroys the handle, then the stream.
+    fn destroy(self) {
+        {
+            let _current = match self.gpu.push() {
+                Ok(current) => current,
+                Err(e) => {
+                    log::warn!("an NVDEC decoder is left undestroyed: {e}");
+                    return;
+                }
+            };
+            // SAFETY: the handle was made by cuvidCreateDecoder and is
+            // destroyed once, when no picture holds it and no decoder took it.
+            let result = unsafe { (self.nvdec.f.cuvidDestroyDecoder)(self.handle) };
+            if let Err(e) = self.gpu.cuda().check("cuvidDestroyDecoder", result) {
+                log::warn!("{e}");
+            }
+        }
+        drop(self.stream);
+    }
+
+    /// The bytes of its decode surfaces, as the budget counts them.
+    fn bytes(&self) -> u64 {
+        surface_bytes(&self.spec)
+    }
+}
+
+/// The decoders kept for the next decoder of their shape (module docs), the
+/// one kept longest first.
+static KEPT: Mutex<Vec<Made>> = Mutex::new(Vec::new());
+
+/// The decode surfaces the kept decoders hold at most between them: two 4K
+/// 10-bit HEVC decoders of 9 surfaces (224 MiB each), or four at 8 bits.
+pub(crate) const KEPT_BYTES: u64 = 512 << 20;
+
+/// What NVDEC answered each GPU, by its PCI address, for each codec, chroma
+/// format and bit depth asked ([`capabilities`]).
+static CAPABILITIES: Mutex<Vec<(String, DecodeCapabilities)>> = Mutex::new(Vec::new());
+
+/// Decoders taken from the kept ones and made, process-wide, for the tests.
+#[cfg(test)]
+pub(crate) static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bytes of `spec`'s decode surfaces: 4:2:0 at one byte a sample, two
+/// past 8 bits.
+fn surface_bytes(spec: &DecoderSpec) -> u64 {
+    let samples = u64::from(spec.width) * u64::from(spec.height) * 3 / 2;
+    let bytes = if spec.bit_depth > 8 { 2 } else { 1 };
+    u64::from(spec.surfaces) * samples * bytes
+}
+
+/// Whether a kept decoder of `kept` serves `want`, its surfaces clamped as
+/// a made one's would be: the same codec, chroma format, bit depth and size,
+/// and surfaces enough.
+fn serves(kept: &DecoderSpec, want: &DecoderSpec) -> bool {
+    kept.codec == want.codec
+        && kept.chroma == want.chroma
+        && kept.bit_depth == want.bit_depth
+        && (kept.width, kept.height) == (want.width, want.height)
+        && kept.surfaces >= want.surfaces.clamp(1, MAX_SURFACES)
+}
+
+/// Of `kept`, the one to take for `want`: the fewest surfaces that serve it,
+/// the one kept longest among those.
+fn pick(kept: impl Iterator<Item = DecoderSpec>, want: &DecoderSpec) -> Option<usize> {
+    kept.enumerate()
+        .filter(|(_, spec)| serves(spec, want))
+        .min_by_key(|(i, spec)| (spec.surfaces, *i))
+        .map(|(i, _)| i)
+}
+
+/// How many of `bytes`, oldest first, go for the rest to fit `budget`.
+fn over_budget(bytes: &[u64], budget: u64) -> usize {
+    let mut total: u64 = bytes.iter().sum();
+    bytes
+        .iter()
+        .take_while(|b| {
+            let over = total > budget;
+            total -= **b;
+            over
+        })
+        .count()
+}
+
+/// Keeps `made`, and destroys the kept decoders longest kept past the budget.
+fn keep(made: Made) {
+    let gone: Vec<Made> = {
+        let mut kept = KEPT.lock();
+        kept.push(made);
+        let bytes: Vec<u64> = kept.iter().map(Made::bytes).collect();
+        let over = over_budget(&bytes, KEPT_BYTES);
+        kept.drain(..over).collect()
+    };
+    for made in gone {
+        made.destroy();
+    }
+}
+
+/// A kept decoder that serves `spec` on `gpu`, taken: one made in its
+/// context, which the kept decoder's own GPU keeps retained.
+fn take_kept(gpu: &Gpu, spec: &DecoderSpec) -> Option<Made> {
+    let mut kept = KEPT.lock();
+    let on_gpu = |made: &Made| made.gpu.context() == gpu.context();
+    let at = pick(
+        kept.iter().map(|made| {
+            if on_gpu(made) {
+                made.spec
+            } else {
+                DecoderSpec {
+                    surfaces: 0,
+                    ..made.spec
+                }
+            }
+        }),
+        spec,
+    )?;
+    Some(kept.remove(at))
+}
+
+/// NVDEC's capabilities on `gpu` for `codec`, `chroma` and `bit_depth`, asked
+/// once and kept.
+fn capabilities(
+    gpu: &Arc<Gpu>,
+    codec: NvdecCodec,
+    chroma: ChromaFormat,
+    bit_depth: u32,
+) -> Result<DecodeCapabilities, Error> {
+    let on = &gpu.info().pci_bus_id;
+    let same = |(at, caps): &&(String, DecodeCapabilities)| {
+        at == on && (caps.codec, caps.chroma, caps.bit_depth) == (codec, chroma, bit_depth)
+    };
+    if let Some((_, caps)) = CAPABILITIES.lock().iter().find(same) {
+        return Ok(caps.clone());
+    }
+    let caps = decode_capabilities(gpu, codec, chroma, bit_depth)?;
+    CAPABILITIES.lock().push((on.clone(), caps.clone()));
+    Ok(caps)
 }
 
 /// An NVDEC decoder.
@@ -259,8 +446,13 @@ impl Decoder {
     /// codec at 4:2:0 and the bit depth, within its sizes and macroblock
     /// count.
     pub(crate) fn new(gpu: Arc<Gpu>, spec: &DecoderSpec) -> Result<Self, Error> {
+        if let Some(made) = take_kept(&gpu, spec) {
+            #[cfg(test)]
+            TAKEN.fetch_add(1, Ordering::Relaxed);
+            return Ok(Self::of(made));
+        }
         let nvdec = Nvdec::get()?;
-        let caps = decode_capabilities(&gpu, spec.codec, spec.chroma, spec.bit_depth)?;
+        let caps = capabilities(&gpu, spec.codec, spec.chroma, spec.bit_depth)?;
         if !caps.supported {
             return Err(Error::Unsupported(format!(
                 "NVDEC does not decode {:?} at {:?}, {} bits",
@@ -330,24 +522,46 @@ impl Decoder {
             let result = unsafe { (nvdec.f.cuvidCreateDecoder)(&raw mut handle, &raw mut info) };
             gpu.cuda().check("cuvidCreateDecoder", result)?;
         }
-        let surface_count = c_int::try_from(surfaces).unwrap_or(1);
-        Ok(Self {
+        Ok(Self::of(Made {
+            gpu,
+            nvdec,
+            spec: DecoderSpec { surfaces, ..*spec },
+            output,
+            target: (spec.width, spec.height),
+            handle,
+            stream,
+        }))
+    }
+
+    /// The decoder over `made`, made or kept: every surface free.
+    fn of(made: Made) -> Self {
+        let Made {
+            gpu,
+            nvdec,
+            spec,
+            output,
+            target,
+            handle,
+            stream,
+        } = made;
+        let surface_count = c_int::try_from(spec.surfaces).unwrap_or(1);
+        Self {
             inner: Arc::new(Inner {
                 gpu,
                 nvdec,
                 handle,
-                spec: DecoderSpec { surfaces, ..*spec },
+                spec,
                 output,
-                calls: Mutex::new((spec.width, spec.height)),
+                calls: Mutex::new(target),
                 free: Mutex::new((0..surface_count).rev().collect()),
                 staging: Mutex::new(Staging::None),
-                stream,
+                stream: ManuallyDrop::new(stream),
                 stalled: AtomicBool::new(false),
                 caller: OnceLock::new(),
                 #[cfg(test)]
                 in_flight: AtomicBool::new(false),
             }),
-        })
+        }
     }
 
     /// The size every surface has: the spec's.
@@ -1579,5 +1793,122 @@ pub(crate) mod tests {
     fn a_surface_past_the_address_space_is_an_error_not_a_wrap() {
         assert!(Mapped::of(u64::MAX - 10, 4096, (64, 64), crop(0, 0, 64, 64), 1).is_err());
         assert!(Mapped::of(0, u32::MAX, (u32::MAX, u32::MAX), crop(0, 0, 1, 1), 2).is_ok());
+    }
+
+    /// A 4K HEVC decoder's spec at `bit_depth` with `surfaces`.
+    fn hevc_4k(bit_depth: u32, surfaces: u32) -> DecoderSpec {
+        DecoderSpec {
+            codec: NvdecCodec::Hevc,
+            chroma: ChromaFormat::Yuv420,
+            bit_depth,
+            width: 3840,
+            height: 2160,
+            surfaces,
+        }
+    }
+
+    /// A kept decoder serves a new one of its codec, chroma format, bit depth and size whose
+    /// surfaces, clamped as a made one's are, it has, and no other.
+    #[test]
+    fn a_kept_decoder_serves_only_its_shape_with_surfaces_enough() {
+        let kept = hevc_4k(10, 9);
+        assert!(serves(&kept, &hevc_4k(10, 9)));
+        assert!(serves(&kept, &hevc_4k(10, 8)), "fewer surfaces");
+        assert!(serves(&kept, &hevc_4k(10, 0)), "none asked: one, clamped");
+        assert!(!serves(&kept, &hevc_4k(10, 10)), "more surfaces");
+        assert!(!serves(&kept, &hevc_4k(8, 9)), "another bit depth");
+        let (mut narrower, mut h264, mut monochrome) = (kept, kept, kept);
+        narrower.width = 1920;
+        h264.codec = NvdecCodec::H264;
+        monochrome.chroma = ChromaFormat::Monochrome;
+        assert!(!serves(&kept, &narrower), "another size");
+        assert!(!serves(&kept, &h264), "another codec");
+        assert!(!serves(&kept, &monochrome), "another chroma format");
+        let most = hevc_4k(8, MAX_SURFACES);
+        assert!(
+            serves(&most, &hevc_4k(8, MAX_SURFACES + 4)),
+            "asked past the most: clamped"
+        );
+    }
+
+    /// Of the kept decoders that serve a new one, the one with the fewest surfaces is taken, the
+    /// one kept longest among equals; none where none serves.
+    #[test]
+    fn the_kept_decoder_taken_has_the_fewest_surfaces_that_serve() {
+        let kept = [
+            hevc_4k(8, 20),
+            hevc_4k(10, 9),
+            hevc_4k(8, 9),
+            hevc_4k(8, 9),
+            hevc_4k(8, 6),
+        ];
+        assert_eq!(pick(kept.into_iter(), &hevc_4k(8, 8)), Some(2));
+        assert_eq!(pick(kept.into_iter(), &hevc_4k(8, 12)), Some(0));
+        assert_eq!(pick(kept.into_iter(), &hevc_4k(10, 9)), Some(1));
+        assert_eq!(pick(kept.into_iter(), &hevc_4k(10, 10)), None);
+        assert_eq!(pick(std::iter::empty(), &hevc_4k(8, 8)), None);
+    }
+
+    /// Past the budget, the decoders kept longest go first, until the rest fit; a decoder alone
+    /// past it goes too.
+    #[test]
+    fn the_decoders_kept_longest_go_past_the_budget() {
+        assert_eq!(over_budget(&[100, 100, 100], 300), 0);
+        assert_eq!(over_budget(&[100, 100, 100], 250), 1);
+        assert_eq!(over_budget(&[100, 100, 100], 150), 2);
+        assert_eq!(over_budget(&[400], 300), 1);
+        assert_eq!(over_budget(&[], 300), 0);
+        // Two 4K 10-bit decoders of 9 surfaces fit, a third does not.
+        let ten = surface_bytes(&hevc_4k(10, 9));
+        assert_eq!(ten, 9 * 3840 * 2160 * 3);
+        assert_eq!(over_budget(&[ten, ten], KEPT_BYTES), 0);
+        assert_eq!(over_budget(&[ten, ten, ten], KEPT_BYTES), 1);
+    }
+
+    /// A decoder made after one of its shape went takes that one's handle, every surface free,
+    /// and decodes its pictures as a made one does; one of another bit depth is made.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
+    fn a_decoder_of_a_kept_shape_takes_the_kept_one() {
+        use crate::nvidia::cuda::GpuSelector;
+        let gpu = Arc::new(Gpu::open(&GpuSelector::First).expect("an NVIDIA GPU"));
+        // A size no other test decodes, which no decoder kept in the process has.
+        let spec = DecoderSpec {
+            width: 1344,
+            height: 768,
+            ..hevc_4k(8, 8)
+        };
+        let first = Decoder::new(Arc::clone(&gpu), &spec).expect("a decoder made");
+        let handle = first.inner.handle;
+        let held = first.picture().expect("a surface");
+        drop(first);
+        let taken = TAKEN.load(Ordering::Relaxed);
+        let while_held = Decoder::new(Arc::clone(&gpu), &spec).expect("a decoder made");
+        assert_ne!(
+            while_held.inner.handle, handle,
+            "a picture still holds the first"
+        );
+        drop((held, while_held));
+        let again = Decoder::new(Arc::clone(&gpu), &spec).expect("a decoder taken");
+        assert_eq!(TAKEN.load(Ordering::Relaxed), taken + 1, "taken, not made");
+        assert_eq!(
+            again.inner.handle, handle,
+            "the one kept longest of the two"
+        );
+        assert_eq!(again.inner.free.lock().len(), 8, "every surface free");
+        let other = Decoder::new(
+            Arc::clone(&gpu),
+            &DecoderSpec {
+                bit_depth: 10,
+                ..spec
+            },
+        )
+        .expect("a decoder made");
+        assert_eq!(
+            TAKEN.load(Ordering::Relaxed),
+            taken + 1,
+            "another depth is made"
+        );
+        drop((again, other));
     }
 }
