@@ -503,8 +503,8 @@ fn one_plane_copies<P: Platform>(
 /// blit from a buffer, copied by a blit into another texture, and read back by a blit
 /// ([`one_plane_copies`]). A pass that renders into one dies where it is made
 /// (`renderCommandEncoderWithDescriptor:`), at the runtime's refusal of the format. Measured on
-/// the M3 Max under macOS 27.0.1, 2026-11-07. A function's read of one is left out: the runtime
-/// reads it as its neutral texture (`one_plane_reads_are_metals`)
+/// the M3 Max under macOS 27.0.1, 2026-11-07. A function's read of one dies at its dispatch
+/// ([`one_plane_reads_die_at_the_dispatch`])
 #[test]
 fn one_plane_textures_are_made_and_copied_as_metals() {
     use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -583,14 +583,12 @@ fn one_plane_textures_are_made_and_copied_as_metals() {
 }
 
 /// A kernel's read of a texture of each one-plane YCbCr format the runtime holds for copies
-/// alone ([`one_plane_copies_only`]), written by `replaceRegion:`, reads Metal's values. Off:
-/// the runtime reads such a texture as its neutral texture, every texel zero, its command buffer
-/// completing with nothing announced (measured on the M3 Max under macOS 27.0.1 on MoltenVK,
-/// 2026-11-07), where its own docs keep every read of one refused; metal2vulkan is asked to
-/// refuse the read (docs/accuracy-ledger.md, "The runtime's answers passed on")
+/// alone ([`one_plane_copies_only`]), written by `replaceRegion:`, dies at its dispatch, named
+/// by the runtime's refusal of its bind state (`Unsupported` of `Format`), where Metal's reads
+/// the texture's texels: the runtime refuses a dispatch or draw that reads such a texture, as it
+/// refuses a pass that renders into one
 #[test]
-#[ignore = "the runtime reads a texture it holds for copies alone as its neutral texture, zeros; metal2vulkan asked to refuse the read; ledger: one-plane reads"]
-fn one_plane_reads_are_metals() {
+fn one_plane_reads_die_at_the_dispatch() {
     fn read<P: Platform>(d: &P::Device, desc: &P::TextureDescriptor, bytes: u64) -> Vec<u8> {
         use reims_vgpu_core::platform::HostRange;
         use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -650,9 +648,24 @@ fn one_plane_reads_are_metals() {
     let p = platform();
     for (format, bytes) in one_plane_copies_only() {
         let desc = ycbcr(format, |d| d.resource_options = Some(0));
-        let ours = read::<crate::VulkanPlatform>(&d, &p.texture_descriptor(&desc), bytes);
+        let ours = p.texture_descriptor(&desc);
+        *crate::answer::LAST_LINE.lock() = None;
+        let site = catch_death(|| read::<crate::VulkanPlatform>(&d, &ours, bytes)).unwrap_err();
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert_eq!(
+            (site.kind, site.file),
+            (DeathKind::Abort, "dispatchThreads:threadsPerThreadgroup:"),
+            "{format}: {line}"
+        );
+        assert!(
+            line.contains("the bind state was refused") && line.contains("feature: Format"),
+            "{format}: {line}"
+        );
         let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-        let theirs = read::<MetalPlatform>(&md, &metal, bytes);
-        assert!(ours == theirs, "{format}");
+        assert_eq!(
+            read::<MetalPlatform>(&md, &metal, bytes).len(),
+            16 * 16 * 16,
+            "{format}"
+        );
     }
 }

@@ -128,15 +128,4 @@ Where the runtime answers otherwise than Metal and the difference is the runtime
 platform passes its answer on, as it passes on every refusal of the runtime's: it adds no fallback
 or death of its own until the pin carries the runtime's fix. Nothing logs these. Each has a test
 that compares the cases with Metal's answers; its ignore reason names the runtime commit with the
-fix, and it is un-ignored at the pin that carries that commit.
-
-Two are open at the pinned commit, both of the one-plane YCbCr formats the runtime holds for
-copies alone (501, 504, 521, 524, 560, 562, 563, 590 and 607: metal2vulkan's
-`metal::format::copies_only`, a footprint of one plane's rows), whose textures it makes at every
-creator Metal makes them at and whose copies move their bytes as Metal's do. An entry says what
-the guest gets instead of Metal's answer, the runtime's fix, and its test.
-
-| What the guest gets instead of Metal's answer | The runtime's fix | Its test |
-|---|---|---|
-| A function's read of such a texture reads the runtime's neutral texture, every texel zero, its command buffer completing with nothing announced, where Metal reads the texture's texels (the runtime's docs keep every read of one refused `NotImplemented(Format)`). Measured on the M3 Max, macOS 27.0.1, on MoltenVK, 2026-11-07: a kernel's `read()` of each of 501, 504, 521, 524 and 560 written by `replaceRegion:` (probe jobs m3-max-4981 and m3-max-4985) | Asked of metal2vulkan, 2026-11-07: refuse a bind, dispatch or draw of such a texture `NotImplemented(Format)`, as it refuses a pass that renders into one. No commit yet | `gpu::ycbcr`'s `one_plane_reads_are_metals` (ignored) |
-| Such a texture placed in a heap has its texels laid in the heap's bytes in the runtime's tiles, announced `shadowed-texture` ("Metal tiles its elements in the heap's bytes"), where Metal lays them as rows, those copied in: the heap's bytes over it, read through a buffer over the heap as core reads its legacy heap's, and the texels read after other bytes are copied there both differ from Metal's. Measured on the M3 Max, macOS 27.0.1, on MoltenVK, 2026-11-07: each of the nine formats, 64 by 64, 16 by 16 and 8 by 8 texels, `ShaderRead` and `PixelFormatView` usage, every shape differing (probe jobs m3-max-4955 and m3-max-4970) | Asked of metal2vulkan, 2026-11-07: lay such a texture's texels in a heap's bytes as rows, as its footprint of one plane counts them. No commit yet | `gpu::resource`'s `legacy_heap_one_plane_textures_are_metals` (ignored); `legacy_heap_textures_are_metals_where_metal_keeps_them_plain` leaves the nine formats out |
+fix, and it is un-ignored at the pin that carries that commit. None is open at the pinned commit.
