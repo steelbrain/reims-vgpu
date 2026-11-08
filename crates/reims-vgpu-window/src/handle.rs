@@ -50,7 +50,7 @@ use std::time::Duration;
 use reims_vgpu_core::platform::os::MonoTime;
 use reims_vgpu_core::sync::Mutex;
 
-pub use crate::native::FrameSink;
+pub use crate::present::FrameSink;
 
 use crate::config::{WindowCallbacks, WindowConfig};
 use crate::native::{self, Surface};

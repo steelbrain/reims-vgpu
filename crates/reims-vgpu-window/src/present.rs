@@ -58,6 +58,26 @@ pub trait Presenter: Send {
     ) -> Drawn;
 }
 
+/// What draws a display's current frame into a window: `reims-vgpu`'s, over the display. It holds
+/// the display weakly: a window never keeps its display alive, except for a frame in flight, as
+/// any frame does. It draws through a presenter of its own over the window's Vulkan surface
+/// ([`FrameSink::presenter`]): of SDL's window on Linux, of the window's `CAMetalLayer` on macOS,
+/// whose swapchain takes the layer's drawables and sets the layer up for them.
+pub trait FrameSink: Send + Sync {
+    /// A presenter over `target`, the window: one that makes the window's Vulkan surface on the
+    /// sink's instance and a swapchain over it. `None` where there is none (the display has ended,
+    /// or this host has no swapchain): the window then stays empty.
+    fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>>;
+
+    /// The guest's cursor position, in its mode's pixels, as the display reads it now: `None`
+    /// once the display has ended, without a guest display, while it is paused, and for a sink
+    /// that cannot tell. Asked on the thread of the display's callbacks
+    /// ([`Window::cursor_moved`](crate::Window::cursor_moved)).
+    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
+        None
+    }
+}
+
 /// What makes a window's Vulkan surface, on its render thread: on Linux SDL's window, on macOS
 /// the window's `CAMetalLayer`.
 pub trait VulkanTarget {

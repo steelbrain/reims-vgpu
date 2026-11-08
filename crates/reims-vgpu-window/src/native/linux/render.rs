@@ -1,6 +1,6 @@
 //! A window's render thread, which draws the display's current frame into the window's swapchain
 //! when there is something new to show, the [`Surface`] it shares with the window and the UI
-//! thread, and what the display's sink gives it ([`FrameSink`]).
+//! thread, and what the display's sink gives it ([`FrameSink`](crate::FrameSink)).
 //!
 //! One thread per window (`reims-vgpu.window`), started when the window attaches. It waits until
 //! there is something to draw: a new guest frame, a new layout (the window resized, or moved to a
@@ -8,9 +8,9 @@
 //! the guest's cursor where the window draws it ([`Window::drawn_cursor`], which each draw hands
 //! the presenter). It draws only
 //! while the window is shown, once SDL's window and the layout exist, through a presenter the sink
-//! makes over the window ([`FrameSink::presenter`]), which makes the window's Vulkan surface
-//! ([`VulkanTarget`]), as `crate::present` says: made at the first draw, tried again after
-//! [`RETRY`] where no image came in time, made again where one ends.
+//! makes over the window ([`FrameSink::presenter`](crate::FrameSink::presenter)), which makes the
+//! window's Vulkan surface ([`VulkanTarget`]), as `crate::present` says: made at the first draw,
+//! tried again after [`RETRY`] where no image came in time, made again where one ends.
 //!
 //! Requests that come while it draws fold into one: it draws the latest frame once more. It
 //! copies the sink out of the window's lock before asking it, and holds no lock of the window's
@@ -31,27 +31,10 @@ use sdl3_sys::everything::{SDL_Vulkan_CreateSurface, SDL_Window};
 
 use crate::geometry::Layout;
 use crate::handle::Window;
-use crate::present::{Presenter, Presenting, RETRY, VulkanTarget};
+use crate::present::{Presenting, RETRY, VulkanTarget};
 
 /// The render thread's stack.
 const STACK: usize = 512 * 1024;
-
-/// What draws a display's current frame into a window: `reims-vgpu`'s, over the display, which it
-/// holds weakly.
-pub trait FrameSink: Send + Sync {
-    /// A presenter over `target`'s window: one that makes the window's surface on the sink's
-    /// Vulkan instance and a swapchain over it. `None` where there is none (the display has
-    /// ended, or this host has no swapchain): the window then stays empty.
-    fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>>;
-
-    /// The guest's cursor position, in its mode's pixels, as the display reads it now: `None`
-    /// once the display has ended, without a guest display, while it is paused, and for a sink
-    /// that cannot tell. Asked on the thread of the display's callbacks
-    /// ([`Window::cursor_moved`](crate::Window::cursor_moved)).
-    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
-        None
-    }
-}
 
 /// SDL's window, as its render thread holds it: only to make the window's Vulkan surface of it.
 #[derive(Clone, Copy, Debug)]

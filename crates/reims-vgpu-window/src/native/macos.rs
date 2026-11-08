@@ -3,8 +3,8 @@
 //! (`main_thread`); its render thread draws into the view's `CAMetalLayer` (`render`), through
 //! the sink's presenter over a Vulkan surface of the layer (`metal_surface`, `crate::present`).
 //! This file is what the shared window code asks of it: what draws into the layer
-//! ([`FrameSink`]), the window's opening, changes and end, the host's screens (`screens`, from
-//! CoreGraphics) and the keyboard's kind (`iso`, from Carbon).
+//! ([`FrameSink`](crate::FrameSink)), the window's opening, changes and end, the host's screens
+//! (`screens`, from CoreGraphics) and the keyboard's kind (`iso`, from Carbon).
 //!
 //! With `REIMS_VGPU_WINDOW_IMPL=sdl`, in a build with the `macos-sdl` feature, the window is
 //! SDL3's (`sdl`), in the same application, drawn by the same render thread into its Metal view's
@@ -47,28 +47,7 @@ pub(crate) use render::Surface;
 
 use crate::env::WindowImpl;
 use crate::handle::Window;
-use crate::present::{Presenter, VulkanTarget};
 use main_thread::post_main;
-
-/// What draws a display's current frame into a window's layer: `reims-vgpu`'s, over the display.
-/// It holds the display weakly: a window never keeps its display alive, except for a frame in
-/// flight, as any frame does. It draws through a presenter of its own over a Vulkan surface of
-/// the layer ([`FrameSink::presenter`]), whose swapchain takes the layer's drawables and sets the
-/// layer up for them.
-pub trait FrameSink: Send + Sync {
-    /// A presenter over `target`, the window's layer: one that makes a Vulkan surface of the
-    /// layer on the sink's instance and a swapchain over it. `None` where there is none (the
-    /// display has ended, or this host has no swapchain): the window then stays empty.
-    fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>>;
-
-    /// The guest's cursor position, in its mode's pixels, as the display reads it now: `None`
-    /// once the display has ended, without a guest display, while it is paused, and for a sink
-    /// that cannot tell. Asked on the thread of the display's callbacks
-    /// ([`Window::cursor_moved`](crate::Window::cursor_moved)).
-    fn guest_cursor_position(&self) -> Option<(u16, u16)> {
-        None
-    }
-}
 
 /// Whether `REIMS_VGPU_WINDOW_IMPL` names SDL3's window.
 fn sdl_named() -> bool {

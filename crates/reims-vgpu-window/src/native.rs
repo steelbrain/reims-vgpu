@@ -1,5 +1,5 @@
-//! The window's OS side, one file per OS: what draws into the window and where it opens
-//! ([`FrameSink`], `Surface`), the window's opening, changes and end on the OS's UI thread, the
+//! The window's OS side, one file per OS: the render thread and what it draws on (`Surface`), the
+//! window's opening, changes and end on the OS's UI thread, the
 //! host's screens, and the keyboard's kind.
 //!
 //! - **macOS** (`native/macos.rs`): AppKit, on the main thread but for the render thread; or,
@@ -17,13 +17,9 @@ mod linux;
 mod macos;
 
 #[cfg(target_os = "linux")]
-pub use linux::FrameSink;
-#[cfg(target_os = "linux")]
 pub(crate) use linux::{
     Surface, close, cursor_changed, guest_mode_changed, host_screens, now, open, sdl as sdl_os,
 };
-#[cfg(target_os = "macos")]
-pub use macos::FrameSink;
 #[cfg(all(target_os = "macos", feature = "macos-sdl"))]
 pub(crate) use macos::sdl as sdl_os;
 #[cfg(target_os = "macos")]

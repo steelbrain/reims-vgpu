@@ -1,6 +1,6 @@
-//! A Vulkan surface of a window's `CAMetalLayer` ([`LayerTarget`]), which a sink that presents
-//! itself (the Vulkan platform's) makes its swapchain over (`crate::present`): on the render
-//! thread, with `VK_EXT_metal_surface`, on the instance the sink gives.
+//! A Vulkan surface of a window's `CAMetalLayer` ([`LayerTarget`]), which the display's sink makes
+//! its swapchain over (`crate::present`): on the render thread, with `VK_EXT_metal_surface`, on
+//! the instance the sink gives.
 //!
 //! AppKit's window and SDL's alike: each window has its layer already, AppKit's view's or SDL's
 //! Metal view's (`sdl::attach_layer`), which the render thread holds, so one target serves both.
