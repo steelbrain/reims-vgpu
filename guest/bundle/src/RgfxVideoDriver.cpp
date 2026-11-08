@@ -667,17 +667,23 @@ IOSurfaceRef outputSurface(const Command *c)
 // release measured describes it with the same seven fields, in order: the surface's global id, a
 // size, its width, its height, a pitch, 8 bytes and its pixel format. Where the fields start in
 // the frame and how wide each is differ by release; each is read as a u32 at its start:
-// - fields of 8 bytes from +0x88 on macOS 26.7.2 (measured on the 780M, 2026-11-08: ids 14 and 22
-//   for 3840x2160 'x420' and 320x240 '420v' surfaces; and on the RTX 5080, 2026-11-03: the id is
-//   that of the IOSurface VideoToolbox hands back for the picture, 7 for picture 0, 27 for
-//   picture 1);
+// - fields of 4 bytes from +0x70 on macOS 11.7.10 and 11.7.11, from +0x78 on 12.7.6 and from
+//   +0x80 on 13.7.8 (measured on 11 and 12 on the RTX 5080, 2026-11-08, for 1024x1024 '420f' and
+//   320x240 '420v' surfaces; on 13.7.8 on the 780M, ids 6, 7, 9 and 15 for 6016x6016 and
+//   1024x1024 '420f' and 320x240 '420v' surfaces);
 // - fields of 8 bytes from +0x80 on macOS 14.8.9 (measured on the RTX 5080, 2026-11-08: ids 10
 //   and 33 for 3840x2160 'x420' and 320x240 '420v' surfaces);
-// - fields of 4 bytes from +0x80 on macOS 13.7.8 (measured on the 780M, 2026-11-08: ids 6, 7, 9
-//   and 15 for 6016x6016 and 1024x1024 '420f' and 320x240 '420v' surfaces).
+// - fields of 8 bytes from +0x88 on macOS 15.8.2 and 26.7.2 (measured on the RTX 5080 and the
+//   780M, 2026-11-08: ids 14 and 22 on 26.7.2 for 3840x2160 'x420' and 320x240 '420v'
+//   surfaces; and on the RTX 5080, 2026-11-03: the id is that of the IOSurface VideoToolbox hands
+//   back for the picture, 7 for picture 0, 27 for picture 1).
 // So the driver finds the layout instead of listing them: every start from kDescriptionFirst to
 // kDescriptionLast in steps of 4, with fields of 4 or 8 bytes, the farthest read the pixel format
-// of 8-byte fields from kDescriptionLast, at +0xd0.
+// of 8-byte fields from kDescriptionLast, at +0xd0. The window starts two 8-byte steps below the
+// lowest start measured (11's +0x70), for the 11 releases before 11.7.10, which no base boots. In
+// the frames of every release measured, no start and width but the release's own reads the
+// surface's width, height and pixel format (their words from +0x60 to +0xdc, read on each release
+// above but 11.7.10).
 struct FrameDescription {
 	uint32_t start, fieldBytes;
 	size_t field(size_t index) const { return start + index * fieldBytes; }
@@ -689,7 +695,7 @@ struct FrameDescription {
 	uint32_t packed() const { return start << 8 | fieldBytes; }
 	static FrameDescription unpacked(uint32_t p) { return {p >> 8, p & 0xff}; }
 };
-constexpr uint32_t kDescriptionFirst = 0x70, kDescriptionLast = 0xa0;
+constexpr uint32_t kDescriptionFirst = 0x60, kDescriptionLast = 0xa0;
 constexpr uint32_t kFieldBytes[] = {4, 8};
 
 // The frame AppleGVA's decoded-picture record names for an HEVC picture: the record pointer is at
@@ -866,18 +872,18 @@ void *decodeHevcPicture(const Command *c)
 	NoOutput why;
 	IOSurfaceRef output = hevcOutputSurface(context, P, &why);
 	if (!output) {
-		static_assert(kDescriptionFirst == 0x70 && kDescriptionLast == 0xa0,
+		static_assert(kDescriptionFirst == 0x60 && kDescriptionLast == 0xa0,
 		              "the lines below name the search window");
 		static std::atomic<bool> none, many, session;
 		if (why == NoOutput::kMany)
 			notSent(many, "its frame record describes a surface in more than one layout "
-			              "from +0x70 to +0xa0");
+			              "from +0x60 to +0xa0");
 		else if (why == NoOutput::kNotInSessionLayout)
 			notSent(session, "its frame record describes no surface of its own "
 			                 "in its session's layout");
 		else
 			notSent(none, "its frame record describes no surface of its own "
-			              "from +0x70 to +0xa0");
+			              "from +0x60 to +0xa0");
 		return nullptr;
 	}
 	// A tile's place lies inside its canvas, of whole chroma samples, and the part of it that

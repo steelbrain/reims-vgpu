@@ -469,9 +469,9 @@ void checkUnsentDecode()
 }
 
 // Where an output frame describes its surface: its fields' start and their width, the id at the
-// start, the width, height and pixel format the third, fourth and seventh fields. The three
-// releases measured: macOS 26's record (8-byte fields from +0x88), 14's (8 from +0x80) and 13's
-// (4 from +0x80).
+// start, the width, height and pixel format the third, fourth and seventh fields. The releases
+// measured: macOS 26's and 15's record (8-byte fields from +0x88), 14's (8 from +0x80), 13's (4
+// from +0x80), 12's (4 from +0x78) and 11's (4 from +0x70).
 struct Described {
 	size_t start, fieldBytes;
 	size_t id() const { return start; }
@@ -479,7 +479,8 @@ struct Described {
 	size_t height() const { return start + 3 * fieldBytes; }
 	size_t format() const { return start + 6 * fieldBytes; }
 };
-constexpr Described kMacOS26 = {0x88, 8}, kMacOS14 = {0x80, 8}, kMacOS13 = {0x80, 4};
+constexpr Described kMacOS26 = {0x88, 8}, kMacOS14 = {0x80, 8}, kMacOS13 = {0x80, 4},
+                    kMacOS12 = {0x78, 4}, kMacOS11 = {0x70, 4};
 
 // An HEVC picture's parameters as AppleGVA lays them out, as far as the driver reads them: its
 // output frame's description of its surface (P+0x10, the record's +0x08, then as `described`
@@ -656,7 +657,7 @@ void checkTileLanding()
 
 // An HEVC picture's frame describes its surface where its release lays the description out
 // (hevcOutputSurface): the driver searches the frame for the one layout, of fields of 4 or 8 bytes
-// from +0x70 to +0xa0, that names its surface, and its session keeps the layout its first picture
+// from +0x60 to +0xa0, that names its surface, and its session keeps the layout its first picture
 // shows. Each release's measured layout lands its picture in its surface, as do the window's
 // ends; a description from outside the window, or whose width, height or pixel format is not its
 // surface's, names none, before the session has a layout and after. A frame that describes its
@@ -695,7 +696,7 @@ void checkFrameDescriptions()
 		CHECK(g_sent.empty(), "%s reached the host", what);
 	};
 	char what[128];
-	for (const Described &described : {kMacOS26, kMacOS14, kMacOS13}) {
+	for (const Described &described : {kMacOS26, kMacOS14, kMacOS13, kMacOS12, kMacOS11}) {
 		const size_t fields[] = {described.width(), described.height(), described.format()};
 		void *context = session();
 		for (int known = 0; known < 2; known++) {
@@ -715,7 +716,7 @@ void checkFrameDescriptions()
 		}
 		finish(context);
 	}
-	for (const Described &described : {Described{0x70, 4}, Described{0x70, 8},
+	for (const Described &described : {Described{0x60, 4}, Described{0x60, 8},
 	                                   Described{0xa0, 4}, Described{0xa0, 8}}) {
 		void *context = session();
 		snprintf(what, sizeof what, "a picture described in %zu-byte fields from +0x%zx",
@@ -723,7 +724,7 @@ void checkFrameDescriptions()
 		lands(context, HevcPicture(surface, sps, pps, 0, 0, kBytes, described), what);
 		finish(context);
 	}
-	for (const Described &described : {Described{0x6c, 8}, Described{0xa4, 4}}) {
+	for (const Described &described : {Described{0x5c, 8}, Described{0xa4, 4}}) {
 		void *context = session();
 		snprintf(what, sizeof what, "a picture described in %zu-byte fields from +0x%zx",
 		         described.fieldBytes, described.start);
