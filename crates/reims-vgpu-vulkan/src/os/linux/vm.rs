@@ -564,11 +564,16 @@ impl OwnMemory {
 }
 
 impl Drop for OwnMemory {
-    /// Drops the registration, then the mapping.
+    /// Drops the registration, then the mapping, through the platform's VM: pages a device's
+    /// import still holds stay mapped until the runtime has freed it, as Vulkan requires of
+    /// imported host memory (`VK_EXT_external_memory_host`), and go as the import's hold does
+    /// ([`crate::remap::UnmapHold`]). A region's last reference may go in a no-copy buffer's
+    /// deallocator (the scanout's, `reims-vgpu`'s `graphics::sink`), which the runtime runs at the
+    /// buffer's release, before it frees the buffer's import of the region's pages.
     fn drop(&mut self) {
         drop(self.registration.take());
-        // SAFETY: the mapping this made, which nothing uses once its holder lets go of it.
-        let _ = unsafe { libc::munmap(ptr(self.first), self.length.to_usize()) };
+        let at = HostAddr::from_addr(self.first.to_usize());
+        let _ = crate::remap::VulkanVm::new().deallocate(at, self.length);
         budget::own_hold(1, false);
     }
 }
@@ -1292,6 +1297,26 @@ pub(crate) mod tests {
             }
         }
         false
+    }
+
+    /// Memory of the library's own whose pages a device's import holds stays mapped past its
+    /// drop, until the import's hold goes, as a region's whose last reference goes in a no-copy
+    /// buffer's deallocator, before the runtime frees the buffer's import
+    #[test]
+    fn own_memory_an_import_holds_is_unmapped_once_its_hold_goes() {
+        let memory = OwnMemory::new(2 * page()).unwrap();
+        let at = HostAddr::from_addr(memory.first().to_usize());
+        let held = at.wrapping_add(page());
+        let hold = crate::remap::UnmapHold::new(
+            std::ptr::NonNull::new(held.as_ptr::<u8>()).unwrap(),
+            page(),
+        );
+        write(held, 0, 0x5a);
+        drop(memory);
+        assert!(crate::remap::unmap_waits(at, 2 * page()), "the unmap waits");
+        assert_eq!(read(held, 0), 0x5a, "the held page stays mapped");
+        drop(hold);
+        assert!(!crate::remap::unmap_waits(at, 2 * page()), "unmapped");
     }
 
     /// Whether the page at `at` is mapped at all (`mincore` refuses an unmapped one).
