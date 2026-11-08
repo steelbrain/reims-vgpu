@@ -17,6 +17,10 @@ and runs macOS VMs for you.
 
 *x86_64 macOS 26 Tahoe guest on a Linux host.*
 
+![reims-vgpu running an arm64 macOS 26 Tahoe guest desktop on an Apple Silicon host](assets/readme/reims-vgpu-macos-arm64-desktop.png)
+
+*arm64 macOS 26 Tahoe guest on an Apple Silicon host.*
+
 ## Getting started
 
 We don't ship disk images: macOS comes straight from Apple. `reims-ctl` downloads the installer
