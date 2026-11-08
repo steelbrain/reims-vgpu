@@ -10,6 +10,7 @@
  * new variant.
  */
 #import "RgfxGLFunction.h"
+#import "RgfxInterop.h"
 #import "RgfxMetalError.h"
 
 #include "RgfxGLLowering.hpp"
@@ -54,6 +55,7 @@ void RgfxGLSetPluginReturnData(id<MTLFunction> function, NSData *data)
 	NSString *_label;
 	std::mutex _labelLock;
 }
+RGFX_LOG_UNRECOGNIZED
 
 @synthesize rgfxIR = _rgfxIR;
 @synthesize rgfxInputsDescription = _rgfxInputsDescription;

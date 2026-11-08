@@ -4,6 +4,7 @@
  */
 
 #import "RgfxIndirectCommandBuffer.h"
+#import "RgfxInterop.h"
 
 #import "RgfxResource.h" // RgfxResolveHazardTracking
 #import "RgfxMetalError.h"
@@ -449,6 +450,7 @@ inline void action(RgfxIndirectCommandBuffer *icb, RgfxIcbSlotTable *slots, uint
 } // namespace
 
 @implementation RgfxIndirectRenderCommand
+RGFX_LOG_UNRECOGNIZED
 
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)pipelineState
 {
@@ -658,6 +660,7 @@ inline void action(RgfxIndirectCommandBuffer *icb, RgfxIcbSlotTable *slots, uint
 @end
 
 @implementation RgfxIndirectComputeCommand
+RGFX_LOG_UNRECOGNIZED
 
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)pipelineState
 {

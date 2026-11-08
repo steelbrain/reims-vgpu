@@ -103,6 +103,15 @@
 @implementation TestHandle
 @end
 
+// MTLLibrarySPI's form of newFunctionWithName:constantValues:error:, which macOS 13's Maps
+// (VectorKit) sends to the libraries it makes without asking respondsToSelector: first.
+@protocol RgfxTestLibrarySPI
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name
+                        constantValues:(MTLFunctionConstantValues *)constantValues
+                       pipelineLibrary:(id)pipelineLibrary
+                                 error:(NSError **)error;
+@end
+
 // A drawable that records how it was presented: "now", "at T" or "after D", in order.
 @interface TestDrawable : NSObject <MTLDrawable>
 @property(nonatomic) NSMutableArray<NSString *> *presents;
@@ -3939,6 +3948,16 @@ void test_stitch_over_specialised_functions()
 	CHECK(err == nil);
 	id<MTLFunction> bias = [lib newFunctionWithName:@"bias" constantValues:bv error:&err];
 	CHECK(err == nil);
+	// Its SPI form with a pipeline library answers as it does: macOS 13's Maps ended on an
+	// unrecognized selector there.
+	CHECK([lib respondsToSelector:@selector(newFunctionWithName:constantValues:pipelineLibrary:error:)]);
+	RgfxFunction *spiBias = (RgfxFunction *)[(id<RgfxTestLibrarySPI>)lib newFunctionWithName:@"bias"
+	                                                                        constantValues:bv
+	                                                                       pipelineLibrary:nil
+	                                                                                 error:&err];
+	CHECK(err == nil && spiBias != nil && [spiBias.name isEqualToString:bias.name] &&
+	      spiBias.rgfxLibraryObjId == lib.rgfxObjId &&
+	      [spiBias rgfxConstantCount] == [(RgfxFunction *)bias rgfxConstantCount]);
 	id<MTLFunction> add1 = [lib newFunctionWithDescriptor:named error:&err];
 	CHECK(err == nil && scaled != nil && bias != nil && add1 != nil);
 	if (scaled == nil || bias == nil || add1 == nil)
