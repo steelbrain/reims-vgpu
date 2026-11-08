@@ -717,13 +717,14 @@ mod tests {
             let runtime: Arc<dyn Runtime> = Arc::new(GatedRuntime);
             runtime.arm_exit();
             let calls = Calls::new(std::ptr::null_mut(), runtime);
-            std::thread::spawn(move || {
+            StdRuntime::thread("test-exit-calls", move || {
                 loop {
                     calls.release(into_the_driver);
                     let _ = calls.call(soon, into_the_driver);
                     let _ = calls.try_call(into_the_driver);
                 }
-            });
+            })
+            .expect("a thread");
             assert!(within_5_s(|| MADE.load(Ordering::SeqCst) > 10));
             std::process::exit(0);
         }
