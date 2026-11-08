@@ -324,8 +324,8 @@ public:
 	void unnameSharedEvent(UInt64 name);
 
 	// The framebuffer on our PCI device (ReimsGraphics), retained for the caller, or nullptr
-	// before it has started. The first lookup that finds it names this accelerator on it
-	// (IOAccelTypes), as a display pipe's accelerator does.
+	// before it has started. A lookup that finds it names this accelerator on it by its path as
+	// it stands (IOAccelTypes), as a display pipe's accelerator does.
 	ReimsGraphics *copyFramebuffer();
 
 	// The bundle (RgfxAccelerator.cpp, "The bundle"): the accelerator registers only once the

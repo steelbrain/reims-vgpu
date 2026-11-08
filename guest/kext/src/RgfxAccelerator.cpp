@@ -17,6 +17,7 @@
 #include <kern/thread_call.h>
 #include <sys/vnode.h>
 
+#include "RgfxAccelTypes.hpp"
 #include "RgfxBundlePaths.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
@@ -599,11 +600,17 @@ ReimsGraphics *RgfxAccelerator::copyFramebuffer()
 		}
 		clients->release();
 	}
-	if (found && !found->getProperty("IOAccelTypes")) {
+	// Named by this accelerator's path as it stands (RgfxAccelTypes.hpp): the framebuffer, started
+	// first, named it through the PCI device's name before nameProviderForVideo renamed the device
+	// GFX0, a path that no longer leads anywhere.
+	if (found) {
 		char path[512];
 		int length = sizeof(path);
-		if (getPath(path, &length, gIOServicePlane))
-			found->setProperty("IOAccelTypes", path);
+		if (getPath(path, &length, gIOServicePlane)) {
+			OSString *named = OSDynamicCast(OSString, found->getProperty("IOAccelTypes"));
+			if (rgfxAccelTypesStale(named ? named->getCStringNoCopy() : nullptr, path))
+				found->setProperty("IOAccelTypes", path);
+		}
 	}
 	return found;
 }

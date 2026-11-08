@@ -1245,7 +1245,9 @@ bool ReimsGraphics::start(IOService *provider)
 	// The display's accelerator and pipe, which the wrangler, CoreDisplay and IOPresentment read
 	// off the framebuffer when it is published: our one display is pipe 0 of the accelerator on
 	// the same PCI device, named by its service-plane path, which is the PCI device's path and
-	// the accelerator's class name whichever of the two starts first.
+	// the accelerator's class name whichever of the two starts first. An accelerator that starts
+	// after renames the PCI device (GFX0) and names itself again by its new path
+	// (RgfxAccelerator::copyFramebuffer).
 	{
 		char path[512];
 		int length = sizeof(path) - sizeof("/RgfxAccelerator");
