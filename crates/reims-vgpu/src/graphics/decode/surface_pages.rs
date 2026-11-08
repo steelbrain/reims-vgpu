@@ -119,7 +119,17 @@
 //! `RGFX_STATUS_CACHE` with no view, its view left in the cache of views. Either way the kext then
 //! posts the block again marked cached, which takes a device cache ([`super::surface_cache`]),
 //! and a view where it is not named by its runs, the one left in the cache where there is one.
-//! The counts keep how each ask was answered.
+//! The counts keep how each ask was answered. **Measured** 2026-11-08 on the Iris Xe host,
+//! macOS 26.7.2 guest, Safari scrolling a 96,482 px page down to its end and back at 60 wheel
+//! clicks a second (jobs m3-max-8402 and m3-max-8403): each 7264 KiB WebKit tile (1,815 runs)
+//! asked and was answered a cache. With a view made for each ask and the cache's first fill
+//! committed before the cached naming was answered, the ask took 7.66 ms and the naming 2.12 ms
+//! on the kext's wait (210 tiles in 16.7 s); with the answer before any view and the fill after
+//! the naming's answer ([`super::surface_cache`]), 0.11 ms and 0.23 ms (294 tiles), the fill
+//! 1.43 ms on the surface worker, which 292 messages naming the blocks waited for, 1.2 ms on
+//! average and 9.1 ms at the 99th percentile. The surface workers' time in a second of 20 or more
+//! namings went from 223 ms to 58 ms, and the page's `requestAnimationFrame` callbacks over the 5 s
+//! of the scroll down from 80 to 199.
 //!
 //! [`GpuDevice::surface_pages_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_in_place
 //! [`GpuDevice::surface_pages_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_never_in_place
@@ -724,15 +734,16 @@ impl<P: Platform> SurfaceViews<P> {
         }))
     }
 
-    /// An ask whether the block `pages` names needs a device cache (`RGFX_SURFACE_PAGES_ASK_CACHE`),
-    /// answered that it does before any view of `runs` is made, the device's textures lying in
-    /// place over no buffer of its pages ([`GpuDevice::surface_pages_never_in_place`]), so a view
-    /// made for the ask would be left at once: where the runs pass a view's checks and lie in the
-    /// guest RAM's mapping, any view or naming the block had goes, once the lock is let go, as at
-    /// such an answer over a view, the ask is counted, and its layout `planes` kept for the block's
-    /// cached `SURFACE_PAGES` ([`Self::take_layout`]): `Some(true)`. `Some(false)`, with nothing
-    /// changed, where the runs fail them, for the view's path to refuse them as before; `None`
-    /// where the device was reset since `settle` began it.
+    /// An ask whether the block `pages` names needs a device cache
+    /// (`RGFX_SURFACE_PAGES_ASK_CACHE`), answered that it does before any view of `runs` is made,
+    /// the device's textures lying in place over no buffer of its pages
+    /// ([`GpuDevice::surface_pages_never_in_place`]), so a view made for the ask would be left at
+    /// once: where the runs pass a view's checks and lie in the guest RAM's mapping, any view or
+    /// naming the block had goes, once the lock is let go, as at such an answer over a view, the
+    /// ask is counted, and its layout `planes` kept for the block's cached `SURFACE_PAGES`
+    /// ([`Self::take_layout`]): `Some(true)`. `Some(false)`, with nothing changed, where the runs
+    /// fail them, for the view's path to refuse them as before; `None` where the device was reset
+    /// since `settle` began it.
     ///
     /// [`GpuDevice::surface_pages_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_never_in_place
     pub(crate) fn cache_unmade(
