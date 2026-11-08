@@ -7533,7 +7533,9 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// unshared queue (`UNSHARED_QUEUES`), tells a producer waiting for room on a full submission
 /// ring of the device's takes (`SUBMIT_ROOM`), reads indirect command buffers' CPU encodes from
 /// slots in the region (`ICB_SLOTS`), lets the guest read the clock its VBLANKs are stamped on
-/// (`HOST_TIME`), and shows the display pipe's colour (`DISPLAY_COLOR`)
+/// (`HOST_TIME`), and shows the display pipe's colour (`DISPLAY_COLOR`). The fake's GPU shares
+/// the CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a device cache
+/// (`SURFACE_CACHE_REFUSED`), and keeps none of the rest
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_core::testkit::GuestRam;
@@ -7559,7 +7561,10 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let want = if platform.vm().page_size() == 4096 {
-        RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_HEAP_OVER_PAGES
+        RGFX_FEATURE_SURFACE_PAGES
+            | RGFX_FEATURE_PAGES_BUFFERS
+            | RGFX_FEATURE_HEAP_OVER_PAGES
+            | RGFX_FEATURE_SURFACE_CACHE_REFUSED
     } else {
         0
     };
@@ -7581,7 +7586,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_SHARED_EVENT_NAMES
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
-    // The fake's GPU shares the CPU's memory: no caches, so no deferred blocks and no budget.
+    // The fake's GPU shares the CPU's memory: no deferred blocks, so no budget.
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
 

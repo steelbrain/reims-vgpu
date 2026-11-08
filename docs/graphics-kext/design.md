@@ -437,7 +437,9 @@ Stages:
         fill of a newer one (two queues' buffers committed apart and taken in
         the other order) reads the newer bytes; a download of a cache nothing
         wrote since its last copy copies nothing; and a host whose GPU shares
-        the CPU's memory keeps no cache, its surfaces in place as above.
+        the CPU's memory keeps a cache only of a surface whose textures
+        cannot lie in place over its pages (below), the rest in place as
+        above.
       - *Which surfaces are cached:* the guest's choice, and the host's
         invalidation. The bundle asks every block in place cached, of any
         planes and format, as a GPU of its own memory keeps a copy of each
@@ -542,6 +544,32 @@ Stages:
         blocks fit the host's budget (`DEFERRED_BUDGET_LO` and `_HI`), held
         and dormant, and dormant ones are let go past half of it, the oldest
         first (`guest/kext/src/RgfxSurfaceBlocks.hpp`).
+    - **Device caches on a GPU that shares the CPU's memory:** there a
+      surface's textures use its pages in place, but not every surface's
+      can. The runtime makes a texture over pages it cannot place one over
+      (rows that end inside the line of memory the GPU writes back whole, on
+      an Intel GPU; more pieces than one dma-buf takes, on RADV) its own copy,
+      a shadow, which every command buffer copies in before its first use
+      and merges back after a write. Such a surface takes a device cache
+      instead, copied only at CPU locks and unlocks, as on a GPU of its own
+      memory: IOSurface's own protocol, with no tracking of its own, while
+      every other surface stays in place. The host offers
+      `RGFX_FEATURE_SURFACE_CACHE_REFUSED` and not `SURFACE_CACHE`, and
+      decides surface by surface: the kext asks at a new cacheable block in
+      place (`RGFX_SURFACE_PAGES_ASK_CACHE`), with the surface's planes as
+      the bundle gives them (each plane's offset, rows, row pitch and the
+      bytes of a row's texels), and the host maps the pages and asks its
+      platform whether textures over them, for any access (a read, a render,
+      a shader's write), lie in place (`GpuDevice::surface_pages_in_place`;
+      the Vulkan platform's `gpu/pages_in_place.rs`). Where they do, or where
+      the runtime's verdict is not known yet, it answers OK, the block in
+      place. Where they do not, it answers `RGFX_STATUS_CACHE`, its view of
+      the pages left in its cache of views, and the kext makes the surface's
+      device cache and posts the block again cached, which takes that view
+      and the host's cache, kept from then on as above. A block asked with no
+      layout (an older bundle's) stays in place, as every block of such a
+      host did before (`reims-vgpu`'s `graphics/decode/surface_pages.rs`,
+      "Device caches where the pages cannot serve").
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:
@@ -903,6 +931,15 @@ only where no negotiation can carry it.
   stencil. It does alpha test, two-sided colour and the point sprite origin
   in its shaders. A host offers it where its platform takes that state. The
   Vulkan platform always does, filling metal2vulkan's `PrivateRenderState`.
+- Bit 29 is `SURFACE_CACHE_REFUSED`: the host's GPU shares the CPU's memory,
+  and it keeps a device cache only of the surfaces whose pages its textures
+  cannot use in place, which it answers surface by surface (Decided 14,
+  "Device caches on a GPU that shares the CPU's memory"). The kext asks at a
+  new cacheable block in place (`RGFX_SURFACE_PAGES_ASK_CACHE`, with the
+  surface's `RgfxSurfacePagesLayout` after the cache part), and posts the
+  block again cached where the host answers `RGFX_STATUS_CACHE`. A host
+  offers it where it offers `SURFACE_PAGES` and its GPU shares the CPU's
+  memory, where it offers neither `SURFACE_CACHE` nor `SURFACE_DEFERRED`.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1654,7 +1691,11 @@ ask answers `kIOReturnUnsupported`, so the process copies the surface. Where
 the device has `RGFX_FEATURE_SURFACE_CACHE`, 0x109's fifth and sixth inputs
 (the surface's IOSurfaceID, and 1 where the process asks it cached) have the
 kext mark a block it makes cached in its `SURFACE_PAGES`, and a fifth output
-answers whether the block is, whichever ask made it. The kext then writes the
+answers whether the block is, whichever ask made it. Where the device has
+`RGFX_FEATURE_SURFACE_CACHE_REFUSED` instead, a struct input with the six
+(`RgfxSurfacePagesLayout`) is the surface's layout, with which the kext asks
+the device whether the block needs a cache, and marks it cached only where
+the device answers so. The kext then writes the
 surface's CPU generation at offset 16 of the block, and asks `SURFACE_DOWNLOAD`
 (block offset) at a CPU lock that follows a GPU write, answered once the
 surface's pages hold the host's device cache (Decided 14, "The device cache").

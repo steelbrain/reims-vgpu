@@ -60,14 +60,14 @@ use reims_graphics::wire::{
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
     RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SHARED_EVENT_NAMES,
     RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
-    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
-    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState,
-    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxSharedEventName,
-    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER,
+    RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
+    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
+    RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
+    RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
+    RgfxSamplerState, RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -282,7 +282,10 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 decoder.set_guest_memory(memory, lease);
             }
             // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks, and
-            // places its `Managed` buffers' CPU copies in the guest's heaps. Every host answers a
+            // places its `Managed` buffers' CPU copies in the guest's heaps; a GPU that shares the
+            // CPU's memory keeps them only for the surfaces whose pages its textures cannot use
+            // in place, which it answers the kext surface by surface (`SURFACE_CACHE_REFUSED`,
+            // `decode::surface_pages`). Every host answers a
             // command buffer's ask for its submission, orders command buffers of different queues
             // over the IOSurfaces they share where the guest names the order, commits a process's
             // command buffers across its queues in the order it names, makes a queue the
@@ -341,7 +344,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 }
                 | match (decoder.surface_pages_available(), unified_memory) {
                     (false, _) => 0,
-                    (true, true) => in_place,
+                    // A host whose GPU shares the CPU's memory keeps a device cache only of the
+                    // surfaces whose pages its textures cannot use in place, where the kext asks.
+                    (true, true) => in_place | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED),
                     // A host that keeps caches keeps fresh surfaces in them alone where the kext
                     // defers their pages.
                     (true, false) => {
