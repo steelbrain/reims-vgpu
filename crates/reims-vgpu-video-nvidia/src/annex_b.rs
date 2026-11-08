@@ -8,23 +8,21 @@
 //!   access unit's own bytes. Where they lie in it as one run, after start
 //!   codes with nothing but zeros between them, NVDEC is given that run of
 //!   the access unit, with no copy; otherwise the slices are gathered into
-//!   one stream, as the paravirt device's decoders gather theirs
-//!   (`nvdec::decoder::one_run`). NVDEC reads the bitstream within
+//!   one stream (`nvdec::decoder::one_run`). NVDEC reads the bitstream within
 //!   `cuvidDecodePicture`. [`AnnexBDecoder::bitstreams`] counts both.
 //! - **A picture is written by the GPU** into memory the host's device
 //!   reaches in place ([`MemoryPlane`]): the memory's view registered with
-//!   CUDA once per mapping, as the paravirt device's zero copy registers a
-//!   guest buffer's (`crate::zero_copy`), and one `cuMemcpy2D` a plane from
-//!   the mapped picture into it ([`AnnexBPicture::write_into`]). Where the
-//!   memory is not to be had so, the picture is read back into the
-//!   decoder's staging memory for the CPU to copy
+//!   CUDA once per mapping (`crate::zero_copy`), and one `cuMemcpy2D` a
+//!   plane from the mapped picture into it ([`AnnexBPicture::write_into`]).
+//!   Where the memory is not to be had so, the picture is read back into
+//!   the decoder's staging memory for the CPU to copy
 //!   ([`AnnexBPicture::read_back`]). Into the GPU's own memory, another
 //!   API's buffer imported on the picture's GPU (`crate::external`), the
 //!   copy is within the GPU ([`AnnexBPicture::write_into_device`]).
 //! - **A picture NVDEC fails** fails its write or read back, as bad data
 //!   ([`Error::DecodeFailed`]), and the decoder then fails each picture
-//!   after it until an I picture (H.264) or an IRAP picture (HEVC) decodes,
-//!   as the paravirt device's decoders do (`crate::decode`'s `Failures`).
+//!   after it until an I picture (H.264) or an IRAP picture (HEVC) decodes
+//!   (`crate::decode`'s `Failures`).
 //! - **A picture holds its decode surface** until it drops: the decoder has
 //!   [`AnnexBDecoder::SPARE_PICTURES`] surfaces beyond its references and
 //!   the picture being decoded, and a decode with none free is
