@@ -229,7 +229,8 @@ DPB names it follows NVIDIA's parser, measured on 2026-10-24:
   ([bugs.md](bugs.md), D14).
 - An HEVC picture with more than 8 pictures in one of its current
   reference sets, as unsupported: `CUVIDHEVCPICPARAMS` holds 8 a set
-  (`current_set`, `src/nvidia/nvdec/hevc.rs`, "NVDEC takes 8").
+  (`current_set`, `src/nvidia/nvdec/hevc.rs`, "NVDEC takes 8"). The caps answer 8 current references
+  in all, which every picture decodes with.
 
 ## The encoder
 

@@ -7,8 +7,12 @@
 //!   formats its configs' `VAConfigAttribRTFormat` names, and the sizes its configs and their
 //!   surfaces give. VA knows no level limit and no DPB bound of its own, so the levels are each
 //!   codec's top and the DPB its picture structures' bounds (H.264 `ReferenceFrames[16]`, HEVC
-//!   `ReferencePics[15]`). The access unit is copied into VA's slice buffers by the decoder, as
-//!   every VA client's is, so it is read at any place and length (`bitstream_alignment` 1).
+//!   `ReferenceFrames[15]`). A picture references as many as H.264's lists name, 16 frames, and
+//!   for HEVC the 8 its current reference sets hold together at most (va.h's `NumPocTotalCurr`,
+//!   the VA-API crate's `MAX_CURRENT_REFERENCES`), which the guest's video driver checks each
+//!   picture against before it schedules it. The access unit is copied into VA's slice buffers by
+//!   the decoder, as every VA client's is, so it is read at any place and length
+//!   (`bitstream_alignment` 1).
 //! - **A decode** hands the access unit to the decoder (`H264Decoder`, `HevcDecoder` on Annex B,
 //!   in decode order), which starts the hardware's work and answers the access unit's frame: one,
 //!   or none for parameter sets and for a picture the stream's random access skips.
@@ -342,7 +346,9 @@ fn hevc_caps(caps: &Capabilities) -> Option<RgfxVideoCodecCaps> {
     }
     entry.max_level = HEVC_TOP_LEVEL;
     entry.max_dpb_pictures = 16;
-    entry.max_references = 15;
+    // The current reference sets' pictures together (the module doc): a picture of more is
+    // refused, and radeonsi decodes one wrongly.
+    entry.max_references = 8;
     Some(entry)
 }
 

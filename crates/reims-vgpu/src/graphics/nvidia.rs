@@ -12,7 +12,11 @@
 //!   and Main 10 where it does at 10, each into its format (NV12, P010), at the least of their
 //!   sizes. NVDEC answers no level, so the codec's top one: H.264's 6.2 and HEVC's 6.2.
 //!   The DPB is the codecs' own bound, 16 references and the current picture for H.264, 15 and
-//!   the current picture for HEVC.
+//!   the current picture for HEVC. A picture references as many as H.264's lists name, 16
+//!   frames; an HEVC one 8 in its current reference sets together, the most with which every
+//!   picture decodes, as `CUVIDHEVCPICPARAMS` holds 8 in each of them (the `nvidia` module's
+//!   "NVDEC takes 8"), which the guest's video driver checks each picture against before it
+//!   schedules it.
 //! - **The access unit is read in place** at any place and length (`bitstream_alignment` 1):
 //!   the codec crate parses it where it lies in the guest's buffer, and NVDEC is handed the run of
 //!   it that holds the picture's slices where they are one run, and copies it within
@@ -208,7 +212,7 @@ impl NvidiaVideo {
                     formats,
                     max_level: HEVC_TOP_LEVEL,
                     max_dpb_pictures: 16,
-                    max_references: 15,
+                    max_references: 8,
                     ..decode_caps(RGFX_VIDEO_CODEC_HEVC, &answered)
                 }
             })

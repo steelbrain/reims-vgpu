@@ -90,7 +90,7 @@ fn the_caps_are_the_driver_s_answers() {
     assert_eq!((hevc.min_size, hevc.max_size), ([128, 128], [8192, 4352]));
     assert_eq!(
         (hevc.max_level, hevc.max_dpb_pictures, hevc.max_references),
-        (186, 16, 15)
+        (186, 16, 8)
     );
 }
 
