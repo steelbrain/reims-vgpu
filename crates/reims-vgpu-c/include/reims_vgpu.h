@@ -142,7 +142,7 @@
 #define RVG_GRAPHICS_DOORBELL_CONTROL 0
 
 // Where the guest's allocations start in the region, the scanout among them: below it are the
-// control rings, which the host's dirty log need not cover.
+// control rings.
 #define RVG_GRAPHICS_ALLOCATIONS_OFFSET 4194304
 
 // The graphics device.
@@ -177,19 +177,6 @@ typedef void (*RvgDestroyFn)(void *ctx);
 // the rvg_graphics_device_* functions, except the release of its own device. Without it the
 // guest gets no interrupt.
 typedef void (*RvgGraphicsRaiseFn)(void *ctx, uint32_t vector);
-
-// `scanout_written(ctx, offset, length)`: whether the guest wrote any of the `length` bytes at
-// `offset` in the region since the last call, which starts the next span: the host's dirty log
-// of the guest's writes to that range, taken and cleared (QEMU: memory_region_set_log on the
-// region, and memory_region_snapshot_and_clear_dirty). The range lies at or past
-// RVG_GRAPHICS_ALLOCATIONS_OFFSET. The display shows the scanout again only where it answers
-// true.
-//
-// Thread: the device's refresh thread (`reims-vgpu.graphics-refresh`), at each refresh of the
-// display, never inside a call of the host's into the library, and with no lock of the
-// library's held: it may wait for a lock the host holds while it calls the device (QEMU's BQL).
-// May call: as raise_interrupt. Without it, every refresh shows the scanout again.
-typedef bool (*RvgGraphicsScanoutWrittenFn)(void *ctx, uint64_t offset, uint64_t length);
 
 // A position or size in pixels.
 typedef struct {
@@ -247,7 +234,6 @@ typedef struct {
   // one of them, after rvg_graphics_device_release has returned.
   RvgDestroyFn destroy;
   RvgGraphicsRaiseFn raise_interrupt;
-  RvgGraphicsScanoutWrittenFn scanout_written;
   // The guest set its cursor's image: `rgba` holds its pixels as straight-alpha RGBA (the
   // guest gives them premultiplied, BGRA), each side 1 to 256 pixels, the hot spot inside.
   // Followed by `cursor_show` where whether the cursor shows changed.
@@ -406,8 +392,8 @@ typedef struct {
   // sized for its mode (1920 x 1080 where it has none). The window keeps its size: the
   // display offers the guest one mode, the window's size in pixels at the refresh rate of the
   // host screen it opens on, and tells the guest when the person resizes it. The guest's
-  // scanout is blitted out of the region into the window's drawables on the GPU, at the
-  // screen's rate, where scanout_written says the guest wrote it.
+  // scanout is blitted out of the region into the window's drawables on the GPU at each of the
+  // display's refreshes, at the screen's rate, while the display shows no presented surface.
   const RvgWindowConfig *window;
   // The guest's RAM, or NULL. With it, where the host's page is the guest's 4 KiB, the GPU uses
   // an IOSurface's own pages in place, through views of them; without it each surface's GPU

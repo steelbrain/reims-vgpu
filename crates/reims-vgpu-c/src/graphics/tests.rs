@@ -17,7 +17,6 @@ fn callbacks() -> RvgGraphicsCallbacks {
         ctx: std::ptr::null_mut(),
         destroy: Some(destroy),
         raise_interrupt: Some(raise),
-        scanout_written: None,
         cursor_glyph: None,
         cursor_show: None,
         cursor_move: None,

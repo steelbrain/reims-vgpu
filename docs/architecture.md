@@ -494,12 +494,11 @@ API, and its order, is, and the header names the thread each callback arrives on
 
 ### 7.2 Locks around the host's callbacks
 
-The device calls `raise_interrupt` and `scanout_written` with no lock held that one of its
-functions waits for, directly or through a thread of the library's, so a host may take its own lock
-(QEMU's BQL) in either; api.md section 5, "The locks around `raise_interrupt`", lists the locks of
-the library's it may run under. No `ReentrantMutex` is held across `SerialQueue::sync`: the sync
-block runs on the caller's thread, so a block that takes a recursive lock its caller holds would
-re-enter it.
+The device calls `raise_interrupt` with no lock held that one of its functions waits for, directly
+or through a thread of the library's, so a host may take its own lock (QEMU's BQL) in it; api.md
+section 5, "The locks around `raise_interrupt`", lists the locks of the library's it may run under.
+No `ReentrantMutex` is held across `SerialQueue::sync`: the sync block runs on the caller's thread,
+so a block that takes a recursive lock its caller holds would re-enter it.
 
 ### 7.3 Threads
 

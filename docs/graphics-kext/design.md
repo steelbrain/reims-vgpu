@@ -1403,9 +1403,10 @@ stage 2.
 
 **Display.** The modes offered are the host window's size and its screen's
 refresh rate (the guest runs at the host screen's rate). The host presents the
-scanout buffer to the display's window at the host's refresh rate, only when
-the guest wrote it, which it learns from KVM's dirty log over the scanout range
-(QEMU's VGA devices do the same). The GPU reads the buffer in place: the host
+scanout buffer to the display's window at each refresh while the window shows
+no presented surface, with no dirty log: the scanout shows only at boot and in
+recovery, where its full cost is paid for the simpler design (owner,
+2026-11-07). The GPU reads the buffer in place: the host
 pages under the scanout are imported at its first draw, and again only when
 the guest moves the scanout or changes its size, so no copy is made on the way
 to the window, and no other page of the region is pinned for it. While vblank is

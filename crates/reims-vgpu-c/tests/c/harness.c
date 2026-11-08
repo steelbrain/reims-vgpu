@@ -78,13 +78,6 @@ static void on_graphics_raise(void *ctx, uint32_t vector) {
     }
 }
 
-static bool on_graphics_scanout_written(void *ctx, uint64_t offset, uint64_t length) {
-    (void)ctx;
-    (void)offset;
-    (void)length;
-    return true;
-}
-
 static _Atomic int graphics_moved;
 
 static void on_graphics_cursor_move(void *ctx) {
@@ -101,7 +94,6 @@ static void check_graphics(void) {
                                &graphics_destroyed,
                                on_graphics_destroy,
                                on_graphics_raise,
-                               on_graphics_scanout_written,
                                NULL,
                                NULL,
                                on_graphics_cursor_move};

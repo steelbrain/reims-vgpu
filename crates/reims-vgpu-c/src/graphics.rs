@@ -60,7 +60,7 @@ pub const RVG_GRAPHICS_REG_DOORBELL: u32 = 0x020;
 pub const RVG_GRAPHICS_DOORBELL_CONTROL: u32 = 0;
 
 /// Where the guest's allocations start in the region, the scanout among them: below it are the
-/// control rings, which the host's dirty log need not cover.
+/// control rings.
 pub const RVG_GRAPHICS_ALLOCATIONS_OFFSET: u64 = 0x40_0000;
 
 const _: () = {
@@ -102,20 +102,6 @@ const _: () = {
 /// guest gets no interrupt.
 pub type RvgGraphicsRaiseFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, vector: u32)>;
 
-/// `scanout_written(ctx, offset, length)`: whether the guest wrote any of the `length` bytes at
-/// `offset` in the region since the last call, which starts the next span: the host's dirty log
-/// of the guest's writes to that range, taken and cleared (QEMU: memory_region_set_log on the
-/// region, and memory_region_snapshot_and_clear_dirty). The range lies at or past
-/// RVG_GRAPHICS_ALLOCATIONS_OFFSET. The display shows the scanout again only where it answers
-/// true.
-///
-/// Thread: the device's refresh thread (`reims-vgpu.graphics-refresh`), at each refresh of the
-/// display, never inside a call of the host's into the library, and with no lock of the
-/// library's held: it may wait for a lock the host holds while it calls the device (QEMU's BQL).
-/// May call: as raise_interrupt. Without it, every refresh shows the scanout again.
-pub type RvgGraphicsScanoutWrittenFn =
-    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, offset: u64, length: u64) -> bool>;
-
 /// The graphics device's callbacks.
 ///
 /// The cursor's three tell the host the guest's cursor on the device's display, for a host that
@@ -138,7 +124,6 @@ pub struct RvgGraphicsCallbacks {
     /// one of them, after rvg_graphics_device_release has returned.
     pub destroy: RvgDestroyFn,
     pub raise_interrupt: RvgGraphicsRaiseFn,
-    pub scanout_written: RvgGraphicsScanoutWrittenFn,
     /// The guest set its cursor's image: `rgba` holds its pixels as straight-alpha RGBA (the
     /// guest gives them premultiplied, BGRA), each side 1 to 256 pixels, the hot spot inside.
     /// Followed by `cursor_show` where whether the cursor shows changed.
@@ -168,8 +153,8 @@ pub struct RvgGraphicsDeviceConfig {
     /// sized for its mode (1920 x 1080 where it has none). The window keeps its size: the
     /// display offers the guest one mode, the window's size in pixels at the refresh rate of the
     /// host screen it opens on, and tells the guest when the person resizes it. The guest's
-    /// scanout is blitted out of the region into the window's drawables on the GPU, at the
-    /// screen's rate, where scanout_written says the guest wrote it.
+    /// scanout is blitted out of the region into the window's drawables on the GPU at each of the
+    /// display's refreshes, at the screen's rate, while the display shows no presented surface.
     pub window: *const RvgWindowConfig,
     /// The guest's RAM, or NULL. With it, where the host's page is the guest's 4 KiB, the GPU uses
     /// an IOSurface's own pages in place, through views of them; without it each surface's GPU
@@ -293,18 +278,9 @@ unsafe fn create(
         });
         raise
     });
-    let scanout_written = callbacks.scanout_written.map(|f| {
-        let t = table.clone();
-        let written: reims_vgpu::ScanoutWrittenFn = Arc::new(move |offset, length| {
-            // SAFETY: the host's function over its ctx.
-            ffi::host_call("scanout_written", || unsafe { f(t.ctx(), offset, length) })
-        });
-        written
-    });
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt,
-            scanout_written,
             cursor_glyph: cursor_glyph(&table, callbacks.cursor_glyph),
             cursor_show: cursor_show(&table, callbacks.cursor_show),
             cursor_move: cursor_move(&table, callbacks.cursor_move),

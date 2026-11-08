@@ -17,6 +17,12 @@ impl WindowLink {
     pub(crate) fn new(window: Arc<Window>) -> WindowLink {
         WindowLink { window }
     }
+
+    /// The window, for the tests' look at it.
+    #[cfg(test)]
+    pub(crate) fn window(&self) -> &Window {
+        &self.window
+    }
 }
 
 impl Drop for WindowLink {

@@ -104,7 +104,7 @@ refusal logs a line saying which, and no file is duplicated until every entry ha
 
 | inside | may call |
 |---|---|
-| `raise_interrupt`, `scanout_written` | `rvg_status_message` and the `rvg_graphics_device_*` functions, except the release of its own device |
+| `raise_interrupt` | `rvg_status_message` and the `rvg_graphics_device_*` functions, except the release of its own device |
 | `cursor_glyph`, `cursor_show`, `cursor_move` | every function: the library never waits for the display thread |
 | a window callback (`pointer`, `wheel`, `key`, `close`, `scroll`) | every function; it must not block (section 5) |
 | a `destroy` | nothing |
@@ -212,7 +212,6 @@ returns. The library logs through the `log` crate; a Rust host installs its own 
 | callback | thread | serialized with | order |
 |---|---|---|---|
 | `raise_interrupt` | the thread that posts the event it raises for: the device's control thread, `reims-vgpu.graphics-control`; one of ring 0's threads, `reims-vgpu.graphics-ring0-<i>`, which carry out a guest process's control messages, its presents and a block's pages and downloads, each on its lane; its refresh thread, `reims-vgpu.graphics-refresh`; a command queue's service thread, `reims-vgpu.graphics-queue-<id>`, or one of its lane's threads, which walk and commit its command buffers, `reims-vgpu.graphics-lane-<id>`; a pipeline compile's thread, `reims-vgpu.graphics-compile-<n>`; a thread that makes IOSurfaces' and pages blocks' views, `reims-vgpu.graphics-surfaces-<i>`; a thread that makes indirect command buffers, `reims-vgpu.icb-create-<i>`; a thread that lets go of a closed process's objects and answers its close, `reims-vgpu.graphics-closes-<i>`; or the platform's thread that runs a command buffer's scheduled or completed handler; or the host's own, inside `rvg_graphics_device_mmio_write_taking`. Never inside another call of the host's | nothing: they may call at once | each after the completion ring's message it raises for is published |
-| `scanout_written` | the device's refresh thread, `reims-vgpu.graphics-refresh`, once a refresh while the guest has a scanout; never inside a call of the host's, and with no lock of the library's held | the refreshes: one at a time | the refreshes' |
 | `cursor_glyph`, `cursor_show`, `cursor_move` | the display thread: one serial worker for the whole process (after 5 s idle it exits, and the next callback starts a new one) | every display callback of the process: one at a time | the order the device's control thread took the guest's cursor commands, and its resets |
 | a window's `pointer`, `wheel`, `key`, `close`, `scroll` | on macOS the process's main thread, where AppKit runs; on Linux the library's thread `reims-vgpu.ui`; never inside a call of the host's | every window callback of the process: one at a time | the order the events arrived |
 | `destroy` (each table) | the device's: once its threads have ended, after their last callback, possibly on one of them after the release has returned; the window's: once the release has closed the window, on the releasing thread or, while a window callback runs, the window's thread once it returns; either, on the caller's thread, in a refused create | nothing | once, after every call of its table |
@@ -227,8 +226,8 @@ A queue's worker, the display thread among them, has core's `WORKER_STACK`, 512 
 
 The device's callbacks may wait for a lock the host holds while it calls the device (QEMU's BQL):
 no function of the device waits for its threads, and the library calls them with no lock held that
-one of its functions waits for, directly or through a thread of the library's. `scanout_written`
-runs with none of the library's locks held. `raise_interrupt` may run under these:
+one of its functions waits for, directly or through a thread of the library's. `raise_interrupt`
+may run under these:
 - a command queue's claim on its next message, on the queue's service thread and inside
   `rvg_graphics_device_mmio_write_taking`;
 - there, at a command buffer's `CB_SUBMITTED` answered on the calling thread, the decoder's

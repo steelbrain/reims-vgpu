@@ -237,7 +237,6 @@ public:
 		callbacks.struct_size = sizeof(callbacks);
 		callbacks.ctx = this;
 		callbacks.raise_interrupt = &Kext::raise;
-		callbacks.scanout_written = &Kext::scanoutWritten;
 		RvgGraphicsDeviceConfig config = {};
 		config.struct_size = sizeof(config);
 		config.callbacks = &callbacks;
@@ -672,8 +671,6 @@ private:
 		k->m_raised++;
 		k->m_changed.notify_all();
 	}
-
-	static bool scanoutWritten(void *, uint64_t, uint64_t) { return false; }
 
 	void armControl()
 	{

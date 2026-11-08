@@ -103,7 +103,6 @@ fn a_panic_in_a_callback_of_the_first_export_ends_in_the_hook() {
             ctx: std::ptr::null_mut(),
             destroy: Some(panicking_destroy),
             raise_interrupt: None,
-            scanout_written: None,
             cursor_glyph: None,
             cursor_show: None,
             cursor_move: None,

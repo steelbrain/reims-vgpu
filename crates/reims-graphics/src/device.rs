@@ -22,11 +22,11 @@
 //! The replies (a pipeline's reflection, a `COMPLETE`) come back on the control completion ring.
 //! Every other ring is a command queue's own (below), so each ring keeps a single producer and a
 //! single consumer, and their `consumer_idle` handshakes never race.
-//! `reims-vgpu.graphics-refresh` runs at the display's refresh rate
-//! ([`Screen::mode`]): at each refresh it asks the host whether the guest wrote the scanout
-//! ([`Host::scanout_written`]) and has the screen show it where it did, sends `VBLANK` while the
-//! guest has it on, stamped with the refresh's time on its grid (`RefreshGrid`) as a panel's
-//! hardware stamps its vblank (dropping one the completion ring has no room for), sends
+//! `reims-vgpu.graphics-refresh` runs at the display's refresh rate ([`Screen::mode`]): at each
+//! refresh it has the screen show the scanout again while the guest has one
+//! ([`Screen::present`]), sends `VBLANK` while the guest has it on, stamped with the refresh's
+//! time on its grid (`RefreshGrid`) as a panel's hardware stamps its vblank (dropping one the
+//! completion ring has no room for), sends
 //! `DISPLAY_CHANGED` once the display's mode is not the one the guest was last told, and then
 //! tells the host of the refresh ([`Host::refreshed`]), which answers there the presents the
 //! display first shows at it.
@@ -315,11 +315,6 @@ pub trait Host: Send + Sync + 'static {
     /// (`reims-vgpu`'s decoder, at a command buffer's `CB_SUBMITTED` posted as the buffer is
     /// answered or taken).
     fn raise_interrupt(&self, vector: u32);
-
-    /// Whether the guest wrote any of the `length` bytes at `offset` in the region since the last
-    /// time this asked, which starts the next span: the host's dirty log of the range, taken and
-    /// cleared. On the refresh thread.
-    fn scanout_written(&self, offset: u64, length: u64) -> bool;
 
     /// Context `context` was closed (its process closed the device or died): the host drops every
     /// object whose id lies in the context's range (`context << RGFX_CONTEXT_OBJ_ID_SHIFT` and up,
@@ -2575,9 +2570,7 @@ impl Shared {
                 display.changed,
             )
         };
-        if let Some(scanout) = scanout
-            && self.host.scanout_written(scanout.offset, scanout.span())
-        {
+        if scanout.is_some() {
             self.screen.present();
         }
         if let Some(count) = vblank {

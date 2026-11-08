@@ -65,12 +65,9 @@ enum Seen {
     },
 }
 
-/// A host that counts its interrupts and answers whether the scanout was written as the test
-/// sets it.
+/// A host that counts its interrupts and records the presents and refreshes it is told of.
 struct TestHost {
     interrupts: Arc<AtomicU32>,
-    written: Arc<AtomicBool>,
-    asked: Arc<Mutex<Vec<(u64, u64)>>>,
     presented: Presented,
     refreshes: Arc<AtomicU32>,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -83,10 +80,6 @@ impl Host for TestHost {
     fn raise_interrupt(&self, vector: u32) {
         assert_eq!(vector, 0);
         self.interrupts.fetch_add(1, Ordering::SeqCst);
-    }
-    fn scanout_written(&self, offset: u64, length: u64) -> bool {
-        self.asked.lock().push((offset, length));
-        self.written.load(Ordering::SeqCst)
     }
     fn refreshed(&self) {
         self.refreshes.fetch_add(1, Ordering::SeqCst);
@@ -120,8 +113,6 @@ struct Rig {
     mode: Arc<Mutex<Mode>>,
     told: Arc<Mutex<Vec<Told>>>,
     interrupts: Arc<AtomicU32>,
-    written: Arc<AtomicBool>,
-    asked: Arc<Mutex<Vec<(u64, u64)>>>,
     presented: Presented,
     /// The refreshes the host was told of.
     refreshes: Arc<AtomicU32>,
@@ -143,23 +134,17 @@ const MODE: Mode = Mode {
 impl Rig {
     fn new() -> Rig {
         let interrupts = Arc::new(AtomicU32::new(0));
-        let written = Arc::new(AtomicBool::new(false));
-        let asked = Arc::new(Mutex::new(Vec::new()));
         let presented = Arc::new(Mutex::new(Vec::new()));
         let refreshes = Arc::new(AtomicU32::new(0));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let host = TestHost {
             interrupts: Arc::clone(&interrupts),
-            written: Arc::clone(&written),
-            asked: Arc::clone(&asked),
             presented: Arc::clone(&presented),
             refreshes: Arc::clone(&refreshes),
             seen: Arc::clone(&seen),
         };
         let mut rig = Rig::with_host(Box::new(host));
         rig.interrupts = interrupts;
-        rig.written = written;
-        rig.asked = asked;
         rig.presented = presented;
         rig.refreshes = refreshes;
         rig.seen = seen;
@@ -176,8 +161,6 @@ impl Rig {
         let mode = Arc::new(Mutex::new(MODE));
         let told = Arc::new(Mutex::new(Vec::new()));
         let interrupts = Arc::new(AtomicU32::new(0));
-        let written = Arc::new(AtomicBool::new(false));
-        let asked = Arc::new(Mutex::new(Vec::new()));
         let presented = Arc::new(Mutex::new(Vec::new()));
         let region = Arc::new(Region::new(REGION_SIZE as usize).unwrap());
         let device = Device::with_lanes(
@@ -195,8 +178,6 @@ impl Rig {
             mode,
             told,
             interrupts,
-            written,
-            asked,
             presented,
             refreshes: Arc::new(AtomicU32::new(0)),
             seen: Arc::new(Mutex::new(Vec::new())),
@@ -524,9 +505,6 @@ impl Host for ResettingHost {
             self.resets.fetch_add(1, Ordering::SeqCst);
         }
     }
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
-    }
     fn present_surface(&self, _iosurface_id: u32, _generation: Option<u64>, answer: PresentAnswer) {
         answer.answer(RGFX_STATUS_OK);
     }
@@ -851,22 +829,19 @@ fn refresh_times_keep_to_their_grid_under_a_late_wake() {
     );
 }
 
-/// A refresh shows the scanout where the host's log says the guest wrote it, asking for the
-/// scanout's range; `VBLANK` carries the refresh count while it is on; the host is told of each
+/// A refresh shows nothing again before the guest has a scanout, and the scanout at each refresh
+/// once it has one; `VBLANK` carries the refresh count while it is on; the host is told of each
 /// refresh
 #[test]
-fn a_refresh_presents_written_pixels_and_sends_vblank() {
+fn a_refresh_presents_the_scanout_and_sends_vblank() {
     let mut rig = Rig::new();
     rig.start();
-    let alloc = RGFX_ALLOCATIONS_OFFSET;
-    rig.send(scanout(16, 4, 128, alloc));
-    rig.complete();
-    rig.told();
     rig.refresh();
     assert_eq!(rig.told(), []);
-    assert_eq!(*rig.asked.lock(), [(alloc, 128 * 3 + 64)]);
     assert_eq!(rig.refreshes.load(Ordering::SeqCst), 1);
-    rig.written.store(true, Ordering::SeqCst);
+    rig.send(scanout(16, 4, 128, RGFX_ALLOCATIONS_OFFSET));
+    rig.complete();
+    rig.told();
     rig.refresh();
     assert_eq!(rig.told(), [Told::Present]);
     let s = rig.send(vblank(1));
@@ -971,13 +946,11 @@ fn a_reset_puts_the_device_back_as_new() {
 fn a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows() {
     let mut rig = Rig::new();
     let alloc = RGFX_ALLOCATIONS_OFFSET;
-    let span = 64 * 3 + 16 * 4;
     // The firmware's scanout.
     rig.start();
     rig.send(scanout(16, 4, 64, alloc));
     rig.complete();
     rig.told();
-    rig.written.store(true, Ordering::SeqCst);
     let restart = |rig: &mut Rig| {
         (rig.produced, rig.consumed, rig.seqno) = (0, 0, 0);
         rig.start();
@@ -994,10 +967,17 @@ fn a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows() {
         !rig.told().iter().any(|t| matches!(t, Told::Scanout(_))),
         "a reset told the screen of the scanout"
     );
-    rig.asked.lock().clear();
     rig.refresh();
     assert_eq!(rig.told(), [Told::Present]);
-    assert_eq!(*rig.asked.lock(), [(alloc, span)]);
+    assert_eq!(
+        rig.device
+            .shared
+            .display
+            .lock()
+            .scanout
+            .map(|s| (s.offset, s.span())),
+        Some((alloc, 64 * 3 + 16 * 4))
+    );
 
     // The guest's next driver sets another scanout, and then blanks the display.
     restart(&mut rig);
@@ -1007,10 +987,17 @@ fn a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows() {
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     rig.told();
-    rig.asked.lock().clear();
     rig.refresh();
     assert_eq!(rig.told(), [Told::Present]);
-    assert_eq!(*rig.asked.lock(), [(alloc + 0x1000, 64 + 8 * 4)]);
+    assert_eq!(
+        rig.device
+            .shared
+            .display
+            .lock()
+            .scanout
+            .map(|s| (s.offset, s.span())),
+        Some((alloc + 0x1000, 64 + 8 * 4))
+    );
     restart(&mut rig);
     rig.send(scanout(0, 0, 0, 0));
     rig.complete();
@@ -1018,10 +1005,8 @@ fn a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows() {
     rig.device
         .mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     rig.told();
-    rig.asked.lock().clear();
     rig.refresh();
     assert_eq!(rig.told(), []);
-    assert_eq!(*rig.asked.lock(), []);
 }
 
 /// The host's doorbell file wakes the control thread as a `DOORBELL` write does
@@ -1204,9 +1189,6 @@ impl QueueTestSeen {
 impl Host for QueueTestHost {
     fn raise_interrupt(&self, vector: u32) {
         self.vectors.lock().push(vector);
-    }
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
     }
     fn context_closed(&self, context: u32, answer: crate::device::CompleteAnswer) {
         self.closed.lock().push(context);
@@ -1818,9 +1800,6 @@ impl HoldsHost {
 
 impl Host for HoldsHost {
     fn raise_interrupt(&self, _vector: u32) {}
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
-    }
     fn context_closed(&self, context: u32, answer: CompleteAnswer) {
         self.seen.lock().push((RGFX_CMD_CONTEXT_CLOSE, context, 0));
         answer.answer(RGFX_STATUS_OK);
@@ -2324,9 +2303,6 @@ const RESET_TOLD: u32 = u32::MAX;
 
 impl Host for ResetTellingHost {
     fn raise_interrupt(&self, _vector: u32) {}
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
-    }
     fn stage3_message(&self, _completion: &CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
         self.0.lock().push((header.r#type, thread_name()));
@@ -2494,9 +2470,6 @@ fn the_deferred_budget_reads_as_the_host_gives_it() {
     struct Budget;
     impl Host for Budget {
         fn raise_interrupt(&self, _vector: u32) {}
-        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-            false
-        }
         fn features(&self) -> u64 {
             u64::from(RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_SURFACE_DEFERRED)
         }
@@ -2537,9 +2510,6 @@ fn the_driver_takes_private_render_state_where_offered() {
     struct Private;
     impl Host for Private {
         fn raise_interrupt(&self, _vector: u32) {}
-        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-            false
-        }
         fn features(&self) -> u64 {
             u64::from(RGFX_FEATURE_PRIVATE_RENDER_STATE)
         }
@@ -2563,9 +2533,6 @@ fn the_driver_takes_opencl_mode_where_offered() {
     struct OpenCl;
     impl Host for OpenCl {
         fn raise_interrupt(&self, _vector: u32) {}
-        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-            false
-        }
         fn features(&self) -> u64 {
             u64::from(RGFX_FEATURE_OPENCL_MODE)
         }
@@ -2589,9 +2556,6 @@ fn the_host_time_reads_the_vblank_clock_once_taken() {
     struct Clock;
     impl Host for Clock {
         fn raise_interrupt(&self, _vector: u32) {}
-        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-            false
-        }
         fn features(&self) -> u64 {
             u64::from(RGFX_FEATURE_HOST_TIME)
         }
@@ -2639,9 +2603,6 @@ fn surface_pages_hand_the_host_their_runs() {
     struct Pages(Seen);
     impl Host for Pages {
         fn raise_interrupt(&self, _vector: u32) {}
-        fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-            false
-        }
         fn features(&self) -> u64 {
             u64::from(RGFX_FEATURE_SURFACE_PAGES) | (1 << 40)
         }
@@ -2842,9 +2803,6 @@ fn cb_complete(seqno: u64, cb_obj_id: u64) -> RgfxCbComplete {
 impl Host for TakingHost {
     fn raise_interrupt(&self, vector: u32) {
         self.0.raised.lock().push((vector, thread_name()));
-    }
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
     }
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
@@ -3445,9 +3403,6 @@ impl OrderHost {
 
 impl Host for OrderHost {
     fn raise_interrupt(&self, _vector: u32) {}
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
-    }
     fn context_closed(&self, _context: u32, answer: CompleteAnswer) {
         self.record(RGFX_CMD_CONTEXT_CLOSE);
         answer.answer(RGFX_STATUS_OK);

@@ -28,8 +28,6 @@ fn ns_exception() -> Retained<AnyObject> {
 fn a_host_raise_is_fatal_at_the_call() {
     let d = catch_death(|| host_call("raise_interrupt", || throw(ns_exception())));
     assert_eq!(d.unwrap_err(), host_raised("raise_interrupt"));
-    let d = catch_death(|| host_call("scanout_written", || throw(ns_exception())));
-    assert_eq!(d.unwrap_err(), host_raised("scanout_written"));
     let d = catch_death(|| host_call("cursor_move", || throw(NSObject::new().into_super())));
     assert_eq!(d.unwrap_err(), host_raised("cursor_move"));
 }

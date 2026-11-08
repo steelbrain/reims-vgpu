@@ -14,11 +14,13 @@
 //! its render thread last drew into it, rounded down to even (a window of odd pixels shows the
 //! guest's mode unscaled, beside a column or row of black), at the refresh rate of the host screen
 //! it opened on; when that size changes (the person resized the window) the device tells the guest
-//! (`DISPLAY_CHANGED`). The guest's scanout shows in the window at once and then whenever the
-//! host's dirty log says the guest wrote it, at the screen's rate; the window draws it at the
-//! screen's pace. The guest's cursor image is the host's cursor over the image, shown while the
-//! guest shows its cursor; the guest's cursor position moves nothing, since the host's pointer
-//! moves the guest's (the window never draws the cursor into the image itself).
+//! (`DISPLAY_CHANGED`). The guest's scanout shows in the window at once and then again at each of
+//! the display's refreshes, at the screen's rate, while no presented surface shows in its place;
+//! the window draws it at the screen's pace. While a surface shows, a refresh draws nothing: the
+//! guest's presents draw it ([`Presented`]). The guest's cursor image is the host's cursor over
+//! the image, shown while the guest shows its cursor; the guest's cursor position moves nothing,
+//! since the host's pointer moves the guest's (the window never draws the cursor into the image
+//! itself).
 //!
 //! **Without a window** the display offers 1920 × 1080 at 60 Hz and shows nothing.
 //!
@@ -136,13 +138,9 @@ pub use decode::{GraphicsVideo, GraphicsVideoSession, PlanePages, VideoDecode, V
 
 /// Raises MSI-X vector `vector`: the device's interrupt.
 pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;
-/// Whether the guest wrote any of the `length` bytes at `offset` in the region since the last
-/// ask: the host's dirty log over the scanout, taken and cleared.
-pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 
-/// A graphics device's callbacks. `scanout_written` is called on the device's refresh thread
-/// (`reims-vgpu.graphics-refresh`), and `raise_interrupt` on the thread that posts the event it
-/// raises for: the device's control thread (`reims-vgpu.graphics-control`), one of ring 0's
+/// A graphics device's callbacks. `raise_interrupt` is called on the thread that posts the event
+/// it raises for: the device's control thread (`reims-vgpu.graphics-control`), one of ring 0's
 /// threads (`reims-vgpu.graphics-ring0-<i>`), which carry out a guest process's control messages,
 /// its presents and a block's pages and downloads, each on its lane, its refresh thread, a command
 /// queue's service thread (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
@@ -152,11 +150,10 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 /// a closed process's objects and answers its close (`reims-vgpu.graphics-closes-<i>`), or the
 /// platform's thread that runs a command buffer's scheduled or completed handler; or the host's
 /// own, inside [`GraphicsDevice::mmio_write_taking`].
-/// Each is called never inside another call of the host's into the device, and with no lock held
+/// It is called never inside another call of the host's into the device, and with no lock held
 /// that a function of the device's waits for, directly or through a thread of the library's, so
-/// they may call it at once. `scanout_written` runs with no lock of the library's held.
-/// `raise_interrupt` may run under these: a command queue's claim on its next message, on the
-/// queue's service thread and inside `mmio_write_taking`; there, at a command buffer's
+/// it may call it at once. It may run under these: a command queue's claim on its next message,
+/// on the queue's service thread and inside `mmio_write_taking`; there, at a command buffer's
 /// `CB_SUBMITTED` answered on the calling thread, the decoder's contexts' lock, the buffer's
 /// context's table read, its queue's answer slot and the reset gate read; the device caches'
 /// lock, with the download's answer slot, at a `SURFACE_DOWNLOAD` answered at once; a command
@@ -173,9 +170,6 @@ pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 pub struct GraphicsCallbacks {
     /// Raises the device's interrupt. Without it the guest gets no interrupt.
     pub raise_interrupt: Option<GraphicsRaiseFn>,
-    /// The host's dirty log over the scanout, on the refresh thread. Without it the guest's
-    /// scanout is taken as written at every refresh.
-    pub scanout_written: Option<ScanoutWrittenFn>,
     /// The guest set its cursor's image: its pixels as straight-alpha RGBA, which the guest
     /// gave premultiplied BGRA (`reims-graphics`' `display`), and its hot spot.
     pub cursor_glyph: Option<CursorGlyphFn>,
@@ -907,6 +901,11 @@ impl<P: Platform> Presented<P> {
             drawing: self.answers.drawn(),
             hold: None,
         }
+    }
+
+    /// Whether the display shows a presented surface's texture in place of the scanout.
+    fn shows_surface(&self) -> bool {
+        self.texture.lock().is_some()
     }
 
     /// The texture shown, and the hold of its block, for a window draw of it; `None` for the
@@ -2111,7 +2110,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 
 /// The host's callbacks and its stage-3 decoder as the device's [`Host`].
 struct CallbackHost<P: ApiPlatform> {
-    /// The host's interrupt and dirty-log callbacks.
+    /// The host's callbacks: the device raises its interrupt through them.
     callbacks: GraphicsCallbacks,
     /// The `RGFX_FEATURE_*` the decoder carries out, fixed at the device's make: the guest reads
     /// them on a vCPU, which takes no lock of the decoder's.
@@ -2128,13 +2127,6 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         if let Some(f) = &self.callbacks.raise_interrupt {
             f(vector);
         }
-    }
-
-    fn scanout_written(&self, offset: u64, length: u64) -> bool {
-        self.callbacks
-            .scanout_written
-            .as_ref()
-            .is_none_or(|f| f(offset, length))
     }
 
     fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
@@ -2295,6 +2287,8 @@ pub(crate) struct WindowScreen {
     window: Arc<Window>,
     /// What it shows.
     shown: Arc<Shown>,
+    /// Whether it shows a presented surface in place of the scanout ([`Presented`]).
+    shows_surface: Box<dyn Fn() -> bool + Send + Sync>,
     /// The refresh rate of the host screen it opened on, in thousandths of a hertz.
     refresh_mhz: u32,
     /// The guest's cursor, as last told.
@@ -2515,9 +2509,11 @@ impl WindowScreen {
             // Presents wait for the window's draw only where it has a sink to draw them.
             let _ = presented.window.set(Arc::clone(&window));
         }
+        let presented = Arc::clone(presented);
         let screen = WindowScreen {
             window: Arc::clone(&window),
             shown,
+            shows_surface: Box::new(move || presented.shows_surface()),
             refresh_mhz,
             cursor: Mutex::new(CursorState {
                 image: false,
@@ -2626,8 +2622,12 @@ impl Screen for WindowScreen {
         self.window.new_frame();
     }
 
+    /// The window draws the scanout again where it shows it; while it shows a presented surface,
+    /// a refresh draws nothing, and the guest's presents draw it ([`Presented`]).
     fn present(&self) {
-        self.window.new_frame();
+        if !(self.shows_surface)() {
+            self.window.new_frame();
+        }
     }
 
     /// The host's cursor over the image takes the guest's image; with none, nothing shows

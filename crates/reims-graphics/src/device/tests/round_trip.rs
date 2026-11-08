@@ -11,9 +11,6 @@ struct AnswerHost;
 
 impl Host for AnswerHost {
     fn raise_interrupt(&self, _vector: u32) {}
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
-    }
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
         if header.r#type == RGFX_CMD_RENDER_PIPELINE_CREATE {
@@ -174,9 +171,6 @@ struct HoldingHost {
 
 impl Host for HoldingHost {
     fn raise_interrupt(&self, _vector: u32) {}
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
-    }
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
         match header.r#type {

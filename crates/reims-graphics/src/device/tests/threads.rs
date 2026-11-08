@@ -53,9 +53,6 @@ impl GateHost {
 
 impl Host for GateHost {
     fn raise_interrupt(&self, _vector: u32) {}
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
-    }
     fn stage3_message(&self, _completion: &CompletionPoster, message: &[u8]) {
         let (header, _) = RgfxMsgHeader::read_from_prefix(message).unwrap();
         let mut gated = self.0.state.lock();

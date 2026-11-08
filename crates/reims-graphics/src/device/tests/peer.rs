@@ -67,9 +67,6 @@ impl Host for PeerHost {
         self.raised.vectors.lock().push_back(vector);
         self.raised.moved.notify_all();
     }
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
-    }
     fn features(&self) -> u64 {
         self.features
     }

@@ -244,6 +244,8 @@ pub struct Window {
     open_posted: AtomicBool,
     /// A cursor refresh is posted to the UI thread and has not run yet.
     cursor_posted: AtomicBool,
+    /// How many frames the window was asked to draw ([`Window::new_frame`]).
+    frames_asked: AtomicU64,
     /// What the render thread draws with.
     surface: Surface,
     /// What it posts to the UI thread.
@@ -291,6 +293,7 @@ impl Window {
             attached: AtomicBool::new(false),
             open_posted: AtomicBool::new(false),
             cursor_posted: AtomicBool::new(false),
+            frames_asked: AtomicU64::new(0),
             surface: Surface::new(),
             posts,
         })
@@ -340,7 +343,14 @@ impl Window {
 
     /// The guest presented a frame: the window draws it.
     pub fn new_frame(&self) {
+        self.frames_asked.fetch_add(1, Ordering::Relaxed);
         self.surface.request_draw();
+    }
+
+    /// How many frames the window was asked to draw ([`Window::new_frame`]) since it was made,
+    /// whether it drew each or took several in one draw.
+    pub fn frames_asked(&self) -> u64 {
+        self.frames_asked.load(Ordering::Relaxed)
     }
 
     /// The display offers the guest `width` by `height` first: the window opens sized for it

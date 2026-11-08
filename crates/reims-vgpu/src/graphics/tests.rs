@@ -22,7 +22,6 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
                 assert_eq!(vector, 0);
                 raised.fetch_add(1, Ordering::SeqCst);
             })),
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -108,7 +107,6 @@ fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<Fa
                 assert_eq!(vector, 0);
                 raised.fetch_add(1, Ordering::SeqCst);
             })),
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -160,7 +158,6 @@ fn on_metal_guest_texture_ids_are_kept_from_the_host_s() {
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -970,7 +967,6 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: Some(Arc::new(move |vector| vrec.lock().push(vector))),
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -1054,7 +1050,6 @@ fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -1145,7 +1140,6 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
                 let name = std::thread::current().name().map(str::to_owned);
                 record.lock().push((vector, name));
             })),
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -1244,7 +1238,6 @@ fn a_doorbell_s_answer_allocates_nothing() {
             raise_interrupt: Some(Arc::new(move |_| {
                 count.fetch_add(1, Ordering::SeqCst);
             })),
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -1366,7 +1359,6 @@ fn a_landed_download_s_answer_at_its_doorbell_allocates_nothing() {
                     count.fetch_add(1, Ordering::SeqCst);
                 }
             })),
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -1445,7 +1437,6 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: Some(Arc::new(|_| {})),
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -1820,7 +1811,6 @@ fn calling_back(ring: u64) -> (Arc<GraphicsDevice<FakePlatform>>, Returned) {
                 let name = std::thread::current().name().map(str::to_owned);
                 record.lock().push(name);
             })),
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -2120,24 +2110,13 @@ fn the_sink_imports_only_the_scanout_s_pages() {
     assert_eq!(platform.call_log().count(IMPORT), 3);
 }
 
-/// The regions the host's dirty log was asked about, in order.
-type Asked = Arc<Mutex<Vec<(u64, u64)>>>;
-
-/// A graphics device on the testkit's platform with a display window, whose dirty log answers
-/// every ask written, recording it in `asked`. The platform draws no sink, so the window never
-/// opens: the test draws what it shows through a sink of its own ([`windowed_draw`]).
-fn windowed(asked: &Asked) -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
+/// A graphics device on the testkit's platform with a display window. The platform draws no
+/// sink, so the window never opens: the test draws what it shows through a sink of its own
+/// ([`windowed_draw`]), and counts the frames it is asked for ([`frames_asked`]).
+fn windowed() -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
     let platform = Arc::new(FakePlatform::new());
-    let asked = Arc::clone(asked);
     let config = GraphicsConfig {
-        callbacks: GraphicsCallbacks {
-            raise_interrupt: None,
-            scanout_written: Some(Arc::new(move |offset, length| {
-                asked.lock().push((offset, length));
-                true
-            })),
-            ..GraphicsCallbacks::default()
-        },
+        callbacks: GraphicsCallbacks::default(),
         window: Some(WindowConfig::default()),
         memory_map: None,
     };
@@ -2210,27 +2189,30 @@ fn draws_the_scanout(
     blit.args[1..3] == [Arg::U64(0), Arg::U64(stride)]
 }
 
-/// Waits about 2 s for the refresh thread to ask the host's dirty log about `range`.
-fn asked_about(asked: &Asked, range: (u64, u64)) -> bool {
-    for _ in 0..2000 {
-        if asked.lock().contains(&range) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
+/// The frames `device`'s window was asked to draw so far.
+fn frames_asked(device: &GraphicsDevice<FakePlatform>) -> u64 {
+    device
+        .window
+        .as_ref()
+        .expect("a window")
+        .window()
+        .frames_asked()
+}
+
+/// Waits ([`eventually`]) for `device`'s window to be asked for `count` frames past `from`.
+fn frames_asked_past(device: &GraphicsDevice<FakePlatform>, from: u64, count: u64) -> bool {
+    eventually(|| frames_asked(device) >= from + count)
 }
 
 /// The guest's driver fails after it took the device, as the kext does where the device lists no
 /// usable display or `IOFramebuffer`'s start fails: the firmware sets its scanout, the kext resets
 /// the device to take it, starts it and asks `GET_DISPLAYS`, and resets it on the way out. The
 /// window keeps the firmware's scanout, so the frames the OS then draws into the firmware's
-/// framebuffer reach it: the refresh thread asks the host's dirty log over that scanout again,
-/// showing it where the guest wrote it, and the window's draw blits it out of the region
+/// framebuffer reach it: each refresh asks the window to draw that scanout again, and the
+/// window's draw blits it out of the region
 #[test]
 fn a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window() {
-    let asked = Asked::default();
-    let (device, platform) = windowed(&asked);
+    let (device, platform) = windowed();
     let (draw, drawable) = windowed_draw(&device, &platform, 64, 32);
     let scanout = Scanout {
         width: 64,
@@ -2287,7 +2269,7 @@ fn a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window() {
     std::thread::sleep(Duration::from_millis(50));
 
     // The OS draws its next frame into the firmware's framebuffer.
-    asked.lock().clear();
+    let frames = frames_asked(&device);
     // SAFETY: the scanout lies in the device's region, mapped while the device lives.
     unsafe {
         std::ptr::write_bytes(
@@ -2297,8 +2279,8 @@ fn a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window() {
         );
     }
     assert!(
-        asked_about(&asked, (scanout.offset, scanout.span())),
-        "no refresh asked about the firmware's scanout after the failure"
+        frames_asked_past(&device, frames, 2),
+        "no refresh drew the firmware's scanout after the failure"
     );
     let shown = device.shown.as_ref().unwrap();
     assert_eq!(*shown.scanout.lock(), Some(scanout));
@@ -2314,8 +2296,7 @@ fn a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window() {
 /// its surface
 #[test]
 fn a_reset_shows_the_scanout_in_place_of_the_surface_shown() {
-    let asked = Asked::default();
-    let (device, platform) = windowed(&asked);
+    let (device, platform) = windowed();
     let (draw, drawable) = windowed_draw(&device, &platform, 64, 32);
     let (mut guest, _ring) = surface_and_queue(&device);
     let scanout = RgfxSetScanout {
@@ -2361,6 +2342,70 @@ fn a_reset_shows_the_scanout_in_place_of_the_surface_shown() {
     let status = answered(&device, &mut guest, present_surface(0x77));
     assert_eq!(status, RGFX_STATUS_OK);
     assert_eq!(shown_width(&device), Some(64));
+}
+
+/// While the window shows the guest's scanout, each refresh asks it to draw the scanout again,
+/// as the guest may have written it since; before the guest sets one, a refresh asks for nothing
+#[test]
+fn a_refresh_draws_the_scanout_again_while_no_surface_shows() {
+    let (device, _platform) = windowed();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    // Six refreshes at the window's 60 Hz.
+    let frames = frames_asked(&device);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        frames_asked(&device),
+        frames,
+        "a refresh with no scanout asked for a frame"
+    );
+
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(64, 32, 256)),
+        RGFX_STATUS_OK
+    );
+    let frames = frames_asked(&device);
+    assert!(
+        frames_asked_past(&device, frames, 3),
+        "the refreshes drew the scanout {} times",
+        frames_asked(&device) - frames
+    );
+}
+
+/// While the window shows a presented surface, a refresh asks it for no frame: the guest's
+/// presents alone draw it. Once the guest presents the scanout again, each refresh draws it
+#[test]
+fn a_refresh_draws_nothing_while_a_presented_surface_shows() {
+    let (device, _platform) = windowed();
+    let (mut guest, _ring) = surface_and_queue(&device);
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(64, 32, 256)),
+        RGFX_STATUS_OK
+    );
+    assert!(frames_asked_past(&device, frames_asked(&device), 2));
+
+    // With no window open, the present is answered as it is shown.
+    let status = answered(&device, &mut guest, present_surface(0x77));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+    // Past a refresh that found the scanout shown before the present.
+    std::thread::sleep(Duration::from_millis(20));
+    let frames = frames_asked(&device);
+    // Six refreshes at the window's 60 Hz.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        frames_asked(&device),
+        frames,
+        "a refresh asked for a frame while the surface showed"
+    );
+
+    let status = answered(&device, &mut guest, present_surface(0));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), None);
+    assert!(
+        frames_asked_past(&device, frames, 2),
+        "no refresh drew the scanout presented again"
+    );
 }
 
 /// The display pipe's present: a surface the decoder holds no texture over is answered invalid
@@ -9312,7 +9357,6 @@ fn on_metal_an_identity_colour_matrix_reads_as_no_colour() {
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -9508,7 +9552,6 @@ fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,
@@ -9826,7 +9869,6 @@ fn one_queue_raising(
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: Some(raise),
-            scanout_written: None,
             ..GraphicsCallbacks::default()
         },
         window: None,

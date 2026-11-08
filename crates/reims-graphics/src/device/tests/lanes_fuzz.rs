@@ -76,9 +76,6 @@ impl FuzzHost {
 
 impl Host for FuzzHost {
     fn raise_interrupt(&self, _vector: u32) {}
-    fn scanout_written(&self, _offset: u64, _length: u64) -> bool {
-        false
-    }
     fn context_closed(&self, context: u32, answer: CompleteAnswer) {
         self.carry_out(answer.seqno, |seen| {
             for textures in seen.named.values_mut() {
