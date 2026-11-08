@@ -2679,7 +2679,7 @@ pub(crate) mod tests {
         // pages on another thread: it ends before the count is read, so only this test's
         // imports move it.
         settle_device_checks(&d);
-        let vm = crate::os::OsVm::new();
+        let vm = crate::remap::VulkanVm::new();
         let at = crate::os::allocate_aliasable(2 * PAGE).unwrap();
         let queried = || d.raw.work_counts().host_mappings_queried;
         let buffer = |at: HostPtr| {
@@ -2708,8 +2708,10 @@ pub(crate) mod tests {
         let checked = buffer(HostPtr::from_ptr(anon.cast::<u8>()));
         assert!(queried() > before, "not vouched for: the runtime asked");
         drop(checked);
-        // SAFETY: the mapping made above, which the buffer over it no longer uses.
-        assert_eq!(unsafe { libc::munmap(anon, (2 * PAGE).to_usize()) }, 0);
+        assert!(
+            vm.deallocate(HostPtr::from_ptr(anon.cast::<u8>()), 2 * PAGE)
+                .is_success()
+        );
         assert!(vm.deallocate(at, 2 * PAGE).is_success());
     }
 

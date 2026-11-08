@@ -1768,7 +1768,7 @@ fn a_write_through_a_buffer_on_the_surface_shows_in_the_same_command_buffer() {
         fill_noise(&s, size, 13);
         let read = p(&s);
         drop(s);
-        crate::os::OsVm::new().deallocate(pages, length);
+        crate::remap::VulkanVm::new().deallocate(pages, length);
         read
     };
     let all = [Before::Dispatch, Before::Encoder, Before::CommandBuffer];

@@ -146,7 +146,7 @@ fn files_by_pointer(dev: &Device) -> bool {
     let (buffer, gone, path) = no_copy(dev, va);
     drop(buffer);
     released(&[gone]);
-    assert!(OsVm::new().deallocate(va, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(va, LEN).is_success());
     path == Some(Path::Pointer)
 }
 
@@ -241,8 +241,11 @@ fn remapped(
     };
     drop(buffer);
     released(&[gone]);
+    // The remap above is the OS's VM's on purpose, which tells the runtime nothing; the unmaps
+    // go through the platform's, which leaves pages an import holds mapped until the runtime
+    // frees the import, after the deallocator ran.
     for mapping in [va, new] {
-        assert!(vm.deallocate(mapping, LEN).is_success());
+        assert!(VulkanVm::new().deallocate(mapping, LEN).is_success());
     }
     seen
 }
@@ -289,7 +292,7 @@ fn made_after(dev: &Device, va: HostPtr, remap: impl FnOnce() -> HostPtr) -> ([[
     let seen = [gpu_read_then_fill(dev, &b, 0x7c), ends(va), ends(new)];
     drop((b, a));
     released(&[b_gone, a_gone]);
-    assert!(OsVm::new().deallocate(new, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(new, LEN).is_success());
     (seen, path.unwrap())
 }
 
@@ -301,7 +304,7 @@ fn made_after_a_remap(dev: &Device, vm: &dyn HostVm) -> ([[u8; 2]; 3], Path) {
         vm.remap_shared_overwrite(va, new, LEN).unwrap();
         new
     });
-    assert!(vm.deallocate(va, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(va, LEN).is_success());
     seen
 }
 

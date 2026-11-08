@@ -404,7 +404,11 @@ pub(crate) mod tests {
 
     /// The pages of [`bgra_surface_over_at`], freed.
     pub(crate) fn free(pages: HostPtr, length: u64) {
-        assert!(OsVm::new().deallocate(pages, length).is_success());
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, length)
+                .is_success()
+        );
     }
 
     /// A lookup of a surface (`lookup_by_port`), a reference

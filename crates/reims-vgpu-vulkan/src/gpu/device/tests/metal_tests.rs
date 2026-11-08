@@ -1183,7 +1183,7 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
             let key = format!("{format} {op:?}");
             assert!(crate::metal_matches_raw!(key, ours), "{key}");
         }
-        let vm = crate::os::OsVm::new();
+        let vm = crate::remap::VulkanVm::new();
         let other = b3a8(size, rows, 22);
         let (s, pages, length) = b3a8_read_only(size, rows, 23);
         let ours = written(&p, &d, Op::Replace, format, (&s, &other), size);
@@ -2553,7 +2553,7 @@ fn an_unmeasured_rotated_blend_dies_on_a_native_device() {
 /// second, 4 leaves both read-only.
 fn no_copy_made<P: crate::core::platform::Platform>(d: &P::Device, case: u8) -> bool {
     use crate::core::platform::os::vm::VmProt;
-    let vm = OsVm::new();
+    let vm = crate::remap::VulkanVm::new();
     let page = vm.page_size();
     let at = vm.allocate_anywhere(2 * page).unwrap();
     let second = at.wrapping_add(page);

@@ -41,6 +41,7 @@ use reims_vgpu_vulkan::core::platform::types::NsRange;
 use reims_vgpu_vulkan::core::platform::{HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::os::OsVm;
+use reims_vgpu_vulkan::remap::VulkanVm;
 
 const LEN: u64 = 0x8000;
 
@@ -137,8 +138,11 @@ fn remapped<P: Platform>(
         Ok(()),
         "the buffer's deallocator ran"
     );
+    // The remap above is the OS's VM's on purpose, which tells the runtime nothing; the unmaps
+    // go through the platform's, which leaves pages an import holds mapped until the runtime
+    // frees the import, after the deallocator ran.
     for mapping in [va, new] {
-        assert!(vm.deallocate(mapping, LEN).is_success());
+        assert!(VulkanVm::new().deallocate(mapping, LEN).is_success());
     }
     seen
 }
@@ -224,7 +228,7 @@ fn made_after<P: Platform>(
     let seen = [gpu_read_then_fill::<P>(dev, &b, 0x7c), ends(va), ends(new)];
     drop((b, a));
     released(&[b_gone, a_gone]);
-    assert!(OsVm::new().deallocate(new, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(new, LEN).is_success());
     seen
 }
 
@@ -236,7 +240,7 @@ fn made_after_a_remap<P: Platform>(dev: &P::Device, vm: &dyn HostVm) -> [[u8; 2]
         vm.remap_shared_overwrite(va, new, LEN).unwrap();
         new
     });
-    assert!(vm.deallocate(va, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(va, LEN).is_success());
     seen
 }
 

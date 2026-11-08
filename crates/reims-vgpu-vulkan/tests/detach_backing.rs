@@ -69,13 +69,13 @@ use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize, NsRange, Reso
 use reims_vgpu_vulkan::core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
 use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_vulkan::core::raise::OnFault;
-use reims_vgpu_vulkan::os::OsVm;
+use reims_vgpu_vulkan::remap::VulkanVm;
 
 const PAGE: u64 = 0x4000;
 
 /// Fresh pages of the host, each byte `byte`.
 fn pages(count: u64, byte: u8) -> HostPtr {
-    let at = OsVm::new().allocate_anywhere(count * PAGE).unwrap();
+    let at = VulkanVm::new().allocate_anywhere(count * PAGE).unwrap();
     // SAFETY: the pages were just allocated, readable and writable.
     unsafe {
         std::ptr::write_bytes(
@@ -205,7 +205,7 @@ fn buffer_life<P: Platform>(p: &P, dev: &P::Device) -> Steps {
             no_copy: true,
             deallocator: Some(Box::new(move |at, length| {
                 let _ = ran.send(at == dummy);
-                let _ = OsVm::new().deallocate(at, length);
+                let _ = VulkanVm::new().deallocate(at, length);
             })),
         })
         .unwrap()
@@ -332,7 +332,7 @@ fn buffer_life<P: Platform>(p: &P, dev: &P::Device) -> Steps {
 fn heap_life<P: Platform>(p: &P, dev: &P::Device) -> Steps {
     let mut steps: Steps = Vec::new();
     let size = 2 * PAGE;
-    let vm = OsVm::new();
+    let vm = VulkanVm::new();
     let dummy = pages(2, 0);
     let array = p.new_address_range_array(&[range(dummy, 0, size)]).unwrap();
     let made = dev
@@ -488,7 +488,7 @@ fn detached_buffer<P: Platform>(dev: &P::Device, count: u64) -> P::Buffer {
             contents: Some(contents),
             no_copy: true,
             deallocator: Some(Box::new(|at, length| {
-                let _ = OsVm::new().deallocate(at, length);
+                let _ = VulkanVm::new().deallocate(at, length);
             })),
         })
         .unwrap()
@@ -1000,7 +1000,7 @@ fn expected_placed() -> Steps {
 
 /// Frees `length` bytes of the test's pages at `at`.
 fn vm_free(at: HostPtr, length: u64) -> bool {
-    OsVm::new().deallocate(at, length).is_success()
+    VulkanVm::new().deallocate(at, length).is_success()
 }
 
 /// What Metal and this crate's platform do in [`detached_use`].
@@ -1329,7 +1329,7 @@ fn a_dispatch_behind_a_wait_on_vulkan() {
 /// Two fresh pages of the host after `case`: 0 leaves them readable and writable, 1 takes all
 /// access from the second, 2 from both, 3 unmaps the second, 4 leaves both read-only.
 fn pages_after(case: u8) -> HostPtr {
-    let vm = OsVm::new();
+    let vm = VulkanVm::new();
     let at = pages(2, 0x5a);
     let second = at.wrapping_add(PAGE);
     match case {
@@ -1356,7 +1356,7 @@ fn heap_options(read_only: bool) -> Vec<OptionSet> {
 /// heap's memory by them, read-only or not; 1 for each made, by case.
 fn without_access<P: Platform>(p: &P, dev: &P::Device) -> Steps {
     let cases = [0, 1, 2, 3, 4];
-    let vm = OsVm::new();
+    let vm = VulkanVm::new();
     let mut steps: Steps = Vec::new();
     for read_only in [false, true] {
         let heaps = cases.map(|case| {
@@ -1466,7 +1466,7 @@ fn expected_without_access() -> Steps {
 /// of a page each, with the second readable and writable, without access, and unmapped (its
 /// cases 0, 1 and 3), and a first range followed by a NULL one; 1 for each made.
 fn past_the_size<P: Platform>(p: &P, dev: &P::Device) -> Steps {
-    let vm = OsVm::new();
+    let vm = VulkanVm::new();
     let mut steps: Steps = Vec::new();
     for read_only in [false, true] {
         let mut made = Vec::new();
@@ -2403,7 +2403,7 @@ fn never_replaced<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> Steps {
                 no_copy: true,
                 deallocator: Some(Box::new(move |at, length| {
                     let _ = ran.send(at == dummy);
-                    let _ = OsVm::new().deallocate(at, length);
+                    let _ = VulkanVm::new().deallocate(at, length);
                 })),
             })
             .unwrap()

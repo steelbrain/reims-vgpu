@@ -5494,7 +5494,7 @@ pub(crate) mod tests {
 
         use crate::gpu::resource::VulkanRenderPipeline;
         use crate::gpu::resource::tests::on_read_only_surface;
-        use crate::os::{OsVm, PAGE};
+        use crate::os::PAGE;
 
         /// The state, `nested` at both functions' slot 0, `read_only` at their slot 1 and
         /// `written` at the vertex function's slot 2, then an indexed triangle of `indices`.
@@ -5580,7 +5580,11 @@ pub(crate) mod tests {
         let first = unsafe { pages.as_ptr::<u32>().read_volatile() };
         assert_eq!(first, 0);
         drop((cb, e, state, read_only));
-        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
     }
 
     /// `MTLLoadActionDontCare`, `MTLLoadActionLoad`, `MTLStoreActionDontCare`,
@@ -5606,7 +5610,7 @@ pub(crate) mod tests {
         use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
-        use crate::os::{OsVm, PAGE};
+        use crate::os::PAGE;
 
         let (p, d) = (platform(), dev());
         let (ro, pages) = read_only_buffer(1);
@@ -5642,7 +5646,11 @@ pub(crate) mod tests {
         let zeros = host_bytes_at(pages, 16 * 64).iter().all(|&b| b == 0);
         let answer = (cb.status().0, cb.error().map(|e| e.code), zeros);
         drop((cb, e, pass, target, ro));
-        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
         answer
     }
 
@@ -5716,7 +5724,7 @@ pub(crate) mod tests {
         use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::{bgra_over, read_only_buffer};
-        use crate::os::{OsVm, PAGE};
+        use crate::os::PAGE;
 
         /// `MTLTextureType2DMultisample`.
         const MULTISAMPLE: u64 = 4;
@@ -5754,7 +5762,11 @@ pub(crate) mod tests {
         let site = catch_death(|| cb.render_encoder(OnFault::Die, &pass)).unwrap_err();
         assert_eq!(site.file, "renderCommandEncoderWithDescriptor:");
         drop((cb, pass, samples, target, ro));
-        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
     }
 
     /// An indirect strip of 200,000 16- or 32-bit indices that restarts at the setter's index
@@ -7278,7 +7290,7 @@ pub(crate) mod tests {
         ] {
             c.encode(cmd).unwrap();
         }
-        let vm = crate::os::OsVm::new();
+        let vm = crate::remap::VulkanVm::new();
         let page = vm.page_size();
         let guest = crate::os::allocate_aliasable(page).unwrap();
         let spec = SurfaceSpec {

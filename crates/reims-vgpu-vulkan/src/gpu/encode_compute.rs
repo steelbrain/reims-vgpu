@@ -600,7 +600,7 @@ mod tests {
         use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::on_read_only_surface;
-        use crate::os::{OsVm, PAGE};
+        use crate::os::PAGE;
 
         let add = pipeline(ADD, "add_one");
         let (ro, pages) = on_read_only_surface();
@@ -657,7 +657,11 @@ mod tests {
         let first = unsafe { pages.as_ptr::<u32>().read_volatile() };
         assert_eq!(first, 0);
         drop((cb, e, ro));
-        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
     }
 
     /// A dispatch whose kernel stores into a guest's read-only buffer (made with bit 24,
@@ -670,7 +674,7 @@ mod tests {
         use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::{host_bytes_at, read_only_buffer};
-        use crate::os::{OsVm, PAGE};
+        use crate::os::PAGE;
 
         let add = pipeline(ADD, "add_one");
         let (ro, pages) = read_only_buffer(1);
@@ -705,7 +709,11 @@ mod tests {
         ]);
         assert!(host_bytes_at(pages, 16).iter().all(|&b| b == 0), "dropped");
         drop((ro, source, out));
-        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
     }
 
     /// Prints how long 512 one-thread dispatches take to encode after one `useResources` of 0,

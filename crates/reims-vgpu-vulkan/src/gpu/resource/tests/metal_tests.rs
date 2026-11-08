@@ -588,7 +588,7 @@ fn buffers_on_offset_surfaces_read_as_metals() {
         let metals = crate::metal_matches_raw!(key, (ours, words));
         assert!(metals, "{offset:#x}: Metal's");
         drop(s);
-        crate::os::OsVm::new().deallocate(pages, length);
+        crate::remap::VulkanVm::new().deallocate(pages, length);
     }
 }
 
@@ -1384,7 +1384,7 @@ fn written_swizzles_over_read_only_memory_are_refused() {
     use crate::core::platform::os::vm::HostVm as _;
     use crate::core::platform::types::Swizzle;
     use crate::os::OsSurface;
-    let vm = crate::os::OsVm::new();
+    let vm = crate::remap::VulkanVm::new();
     let page = vm.page_size();
     let guest = vm.allocate_anywhere(page).unwrap();
     let surface = read_only_surface(guest, page);
@@ -1459,7 +1459,7 @@ fn written_swizzles_over_read_only_memory_are_refused() {
 #[test]
 fn usage_bits_over_read_only_surfaces_are_answered_as_metals() {
     use crate::core::platform::os::vm::HostVm as _;
-    let vm = crate::os::OsVm::new();
+    let vm = crate::remap::VulkanVm::new();
     let page = vm.page_size();
     let guest = vm.allocate_anywhere(page).unwrap();
     let surface = read_only_surface(guest, page);

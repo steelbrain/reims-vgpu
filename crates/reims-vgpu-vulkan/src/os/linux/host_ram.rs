@@ -291,6 +291,7 @@ mod tests {
     use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
     use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::os::vm::HostVm as _;
     use crate::core::platform::resource::Buffer as _;
     use crate::core::platform::types::NsRange;
     use crate::core::raise::OnFault;
@@ -300,6 +301,7 @@ mod tests {
     use super::super::{PAGE, lease_guest_memory};
     use crate::gpu::device::tests::{dev, settle_device_checks};
     use crate::os::GuestRamFile;
+    use crate::remap::VulkanVm;
 
     const MIB: u64 = 1 << 20;
 
@@ -428,8 +430,10 @@ mod tests {
         ];
         assert_eq!(b_bytes, [0, 0xa5, 0xa5]);
         drop((cb, e, q, a, b, lease));
-        // SAFETY: the mapping made above, which nothing uses any more.
-        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
+        // Through the platform's VM, which leaves pages a device's import still holds mapped
+        // until the runtime has freed it: the device lives on past the lease.
+        let start_at = HostPtr::from_ptr(start.cast::<u8>());
+        assert!(VulkanVm::new().deallocate(start_at, length).is_success());
     }
     /// A device that copies the RAM by its runs ([`super::copies`]) gathers runs of it into a
     /// buffer, and scatters a buffer back into them, byte for byte in the runs' order, scattered
@@ -534,8 +538,10 @@ mod tests {
             "the buffer, in the runs' order; the rest as it was"
         );
         drop((cb, e, q, into, from, lease));
-        // SAFETY: the mapping made above, which nothing uses any more.
-        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
+        // Through the platform's VM, which leaves pages a device's import still holds mapped
+        // until the runtime has freed it: the device lives on past the lease.
+        let start_at = HostPtr::from_ptr(start.cast::<u8>());
+        assert!(VulkanVm::new().deallocate(start_at, length).is_success());
     }
 
     /// A device that copies the RAM by its runs scatters a buffer into runs that start and end
@@ -645,8 +651,10 @@ mod tests {
             "the rows' texels in their runs; every byte beside them as it was"
         );
         drop((cb, e, q, from, lease));
-        // SAFETY: the mapping made above, which nothing uses any more.
-        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
+        // Through the platform's VM, which leaves pages a device's import still holds mapped
+        // until the runtime has freed it: the device lives on past the lease.
+        let start_at = HostPtr::from_ptr(start.cast::<u8>());
+        assert!(VulkanVm::new().deallocate(start_at, length).is_success());
     }
 
     /// What a slab of guest RAM costs on this device (arch-shared-mem's design): placement heaps
@@ -899,8 +907,10 @@ mod tests {
         };
         assert_eq!(byte, 0x5a, "the fill reached the RAM");
         drop((q, placed, keep, lease));
-        // SAFETY: the mapping made above, which nothing uses any more.
-        assert_eq!(unsafe { libc::munmap(start, length.to_usize()) }, 0);
+        // Through the platform's VM, which leaves pages a device's import still holds mapped
+        // until the runtime has freed it: the device lives on past the lease.
+        let start_at = HostPtr::from_ptr(start.cast::<u8>());
+        assert!(VulkanVm::new().deallocate(start_at, length).is_success());
     }
 
     /// What a slab's buffers cost as no-copy buffers over its pages, each at an offset of a buffer

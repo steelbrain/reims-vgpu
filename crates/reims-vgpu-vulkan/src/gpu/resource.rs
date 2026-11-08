@@ -2575,7 +2575,7 @@ pub(crate) mod tests {
         use crate::core::platform::resource::Buffer as _;
         use crate::core::platform::types::NsRange;
 
-        use crate::os::{OsVm, PAGE};
+        use crate::os::PAGE;
 
         let (b, pages) = over_read_only_pages(2);
         assert_eq!(b.contents(), pages, "its own address");
@@ -2597,7 +2597,11 @@ pub(crate) mod tests {
         let read = |at: u64| unsafe { pages.wrapping_add(at).as_ptr::<u8>().read_volatile() };
         assert_eq!((read(0x10), read(0x2f)), (0, 0));
         drop((cb, e, b));
-        assert!(OsVm::new().deallocate(pages, 2 * PAGE).is_success());
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, 2 * PAGE)
+                .is_success()
+        );
     }
 
     /// A guest's read-only buffer (a no-copy buffer made with bit 24, [`read_only_buffer`])
@@ -2616,7 +2620,7 @@ pub(crate) mod tests {
         use crate::core::platform::resource::Buffer as _;
         use crate::core::platform::types::{MtlSize, NsRange};
 
-        use crate::os::{OsVm, PAGE};
+        use crate::os::PAGE;
 
         let (b, pages) = read_only_buffer(1);
         assert_eq!(b.contents(), pages);
@@ -2672,7 +2676,11 @@ pub(crate) mod tests {
         assert!(cb.error().is_none(), "{:?}", cb.error());
         assert!(host_bytes_at(pages, 0x200).iter().all(|&byte| byte == 0));
         drop((cb, e, texture, b));
-        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
     }
 
     /// A CPU write of a texture over a guest's read-only buffer ([`read_only_buffer`]) dies at
@@ -2685,7 +2693,7 @@ pub(crate) mod tests {
         use crate::core::platform::resource::Texture as _;
         use crate::core::platform::types::{MtlRegion, MtlSize};
 
-        use crate::os::{OsVm, PAGE};
+        use crate::os::PAGE;
 
         let (b, pages) = read_only_buffer(1);
         let texture = bgra_over(&b, 0x1);
@@ -2702,7 +2710,11 @@ pub(crate) mod tests {
         );
         assert!(host_bytes_at(pages, 64).iter().all(|&byte| byte == 0));
         drop((texture, b));
-        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
     }
 
     /// A host range is copied whole into memory of the platform's own, which later writes to the
