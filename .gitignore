@@ -2,8 +2,9 @@
 /build/
 
 # The option ROM's build, when make runs in firmware/ (cargo xtask dist builds
-# it under the target directory).
+# it under the target directory), and the Ambrosia module's.
 /firmware/build/
+/firmware/ambrosia/build/
 
 # The guest display kext's build.
 /guest/kext/build/
