@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_video_core::runtime::Runtime;
+use reims_vgpu_video::core::runtime::Runtime;
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 

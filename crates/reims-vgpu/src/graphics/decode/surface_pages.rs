@@ -115,10 +115,10 @@ use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_video_core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
+use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity, MemoryLife};
 #[cfg(all(vulkan_platform, target_os = "linux"))]
-use reims_vgpu_video_core::device_memory::{DmaBufError, SurfaceDmaBuf};
-use reims_vgpu_video_core::surfaces::SurfaceError;
+use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
+use reims_vgpu_video::core::surfaces::SurfaceError;
 
 use super::worker::{Settle, Worker};
 

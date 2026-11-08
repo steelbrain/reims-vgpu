@@ -28,8 +28,6 @@ reims-vgpu-metal.workspace = true
 # guest pages over the memory map's files, and IOSurface's stand-in.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
-# The driver manifests the host's GPUs are read through (`host_gpus.rs`), as the loader reads them.
-serde_json.workspace = true
 
 # The hashes of the metallibs' sources, which a metallib built elsewhere is checked by (build.rs).
 [build-dependencies]

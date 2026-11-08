@@ -56,7 +56,7 @@ pub trait ApiPlatform: Platform {
     fn graphics_video(
         &self,
         device: &Self::Device,
-        runtime: Arc<dyn reims_vgpu_video_core::runtime::Runtime>,
+        runtime: Arc<dyn reims_vgpu_video::core::runtime::Runtime>,
     ) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
         let _ = (device, runtime);
         None

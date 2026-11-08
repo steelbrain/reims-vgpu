@@ -1,18 +1,19 @@
 # Core
 
-`crates/reims-vgpu-video-core` is what the host's video arms share, independent of the host,
-the driver and QEMU. It links nothing of the library's: the library hands it a runtime instead.
-Each module's doc says what it holds; this file is the overview.
+`crates/reims-vgpu-video`'s `core` module (`src/core.rs`) is what the host's video arms
+share, independent of the host, the driver and QEMU. It links nothing of the library's: the
+library hands it a runtime instead. Each module's doc says what it holds; this file is the
+overview.
 
 ## The runtime and the locks
 
-- **`runtime`**: the threads and the clock the video crates run on, a `Runtime` of three calls
+- **`runtime`**: the threads and the clock the video code runs on, a `Runtime` of three calls
   (a thread's start, the monotonic clock's time, one timed wait). The library's is its
   platform's (reims-vgpu's `video/runtime.rs`, `PlatformRuntime`): a thread is a worker of the
-  platform's, named as the crate asks and marked as the library's, so that a panic on it ends
+  platform's, named as the video code asks and marked as the library's, so that a panic on it ends
   the process at once, and every bound is kept on the platform's monotonic clock, which a test
   makes virtual. `StdRuntime` is std's threads and clock, for the examples and the hardware
-  tests. A `Bell` is the one place a video crate waits on a condition variable with a
+  tests. A `Bell` is the one place the video code waits on a condition variable with a
   deadline.
 - **`sync`**: the locks, `parking_lot`'s, the types reims-vgpu-core's `sync` re-exports.
 

@@ -22,8 +22,8 @@ use reims_vgpu_core::platform::os::{Clock as _, Deadline, MonoTime as CoreTime};
 #[cfg(doc)]
 use reims_vgpu_core::platform::os::{Clock, Threads};
 use reims_vgpu_core::rt::enter_ours;
-use reims_vgpu_video_core::runtime::{MonoTime, Rings, Runtime, TimedOut};
-use reims_vgpu_video_core::sync::{Condvar, MutexGuard};
+use reims_vgpu_video::core::runtime::{MonoTime, Rings, Runtime, TimedOut};
+use reims_vgpu_video::core::sync::{Condvar, MutexGuard};
 
 /// `P` as a video crate's runtime (module doc).
 pub(crate) struct PlatformRuntime<P: Platform>(Arc<P>);
@@ -68,7 +68,7 @@ mod tests {
 
     use reims_vgpu_core::rt::is_our_thread;
     use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_video_core::runtime::{Bell, StdRuntime, Unanswered, answer};
+    use reims_vgpu_video::core::runtime::{Bell, StdRuntime, Unanswered, answer};
 
     use super::*;
 

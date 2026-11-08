@@ -32,9 +32,6 @@ use std::sync::Arc;
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::learn_view_imports;
-/// The loader the runtime opens, for `crate::host_gpus`'s own instances.
-#[cfg(target_os = "linux")]
-pub(crate) use host_os::open_loader;
 /// Whether a view of several runs of pages made now is mapped through dma-bufs, on Linux
 /// (`os/linux/import.rs`).
 #[cfg(all(test, target_os = "linux"))]
@@ -64,10 +61,6 @@ pub(crate) use macos::MATRIX_KEY;
 /// (`os/macos.rs`).
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::refusing_imports;
-/// The loader's instance extensions, read in one call where they fit (`wsi.rs`), for
-/// `crate::host_gpus`'s own instances.
-#[cfg(target_os = "linux")]
-pub(crate) use wsi::instance_extensions;
 pub use wsi::{add_window_extensions, present_fences};
 
 #[cfg(test)]

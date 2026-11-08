@@ -2686,7 +2686,7 @@ mod tests {
     use reims_vgpu_core::testkit::Step;
     use reims_vgpu_core::testkit::calllog::Arg;
     use reims_vgpu_core::testkit::objects::CompleteOn;
-    use reims_vgpu_video_core::device_memory::MemoryIdentity;
+    use reims_vgpu_video::core::device_memory::MemoryIdentity;
     use zerocopy::IntoBytes;
 
     use super::super::split::SPLIT_AFTER;

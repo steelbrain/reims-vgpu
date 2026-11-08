@@ -27,8 +27,9 @@ vulkan = [
 [dependencies]
 reims-vgpu-core.workspace = true
 reims-vgpu-window.workspace = true
-# The video crates' runtime, which the reims-graphics device's video arms run on (`video`).
-reims-vgpu-video-core.workspace = true
+# The reims-graphics device's host video: its runtime, which the video arms run on (`video`), and
+# on Linux the arms' VA-API and NVDEC (`graphics::vaapi`, `graphics::nvidia`).
+reims-vgpu-video.workspace = true
 # The reims-graphics device's host side (`graphics`).
 reims-graphics.workspace = true
 # Reads the reims-graphics device's wire messages into their records (`graphics::decode`).
@@ -51,11 +52,6 @@ libc.workspace = true
 # which on macOS are optional (below).
 reims-vgpu-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
-# The reims-graphics device's hardware video on the host's own video APIs: VA-API on libva and
-# libva-drm (`graphics::vaapi`), and NVIDIA's NVDEC, whose libraries it loads at run time
-# (`graphics::nvidia`).
-reims-vgpu-video-vaapi.workspace = true
-reims-vgpu-video-nvidia.workspace = true
 
 # The Metal platform, the product on macOS, and its window's drawable (`graphics::metal`,
 # `graphics::vulkan`'s macOS sink).

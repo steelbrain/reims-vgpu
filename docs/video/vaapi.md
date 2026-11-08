@@ -1,52 +1,52 @@
 # VA-API
 
-`crates/reims-vgpu-video-vaapi`: the host's H.264 and HEVC decoders and
-encoders through libva, with no FFmpeg, GStreamer or other codec layer in
+`crates/reims-vgpu-video`'s `vaapi` module: the host's H.264 and HEVC
+decoders and encoders through libva, with no FFmpeg, GStreamer or other codec layer in
 between, and the reims-graphics device's video arm over them
-([devices.md](devices.md)). This doc says what the crate does, what the
+([devices.md](devices.md)). This doc says what the module does, what the
 drivers answer, and how the decoders and encoders are tested. Every
 measured fact names its run: what, how, where and when.
 
 The AMD runs were made on one Linux host with two GPUs on radeonsi (Mesa
 26.2.4 unless said), "the AMD GPUs" in the section names: an RX 7900 XTX
 (Navi 31, `renderD128`) and a Radeon 780M (Phoenix, `renderD129`). The
-Intel runs were made on the Iris Xe of an i9-13900H on iHD. Paths are the
-crate's unless they name another.
+Intel runs were made on the Iris Xe of an i9-13900H on iHD. Paths are
+`crates/reims-vgpu-video`'s unless they name another.
 
 ## What is here
 
 | what | where |
 |---|---|
-| H.264 syntax and the decoding process above the slice data: NAL units, `avcC`, SPS/PPS/scaling lists, slice headers, order counts, the DPB's marking, lists and bumping. Plain Rust on every host, behind an `Accelerator` trait | the codec crate's `src/h264.rs`, `src/h264/` (`crates/reims-vgpu-video-codec`), re-exported as `h264`; the bumping process HEVC shares, `src/dpb.rs` |
-| HEVC syntax and the decoding process above the slice data: NAL units, `hvcC`, VPS/SPS/PPS, scaling lists, short- and long-term sets, slice segment headers, order counts, the DPB, lists and bumping. Plain Rust, behind its own `Accelerator` trait | the codec crate's `src/hevc.rs`, `src/hevc/`, re-exported as `hevc` |
-| The encoders' portable half: settings, GOP, parameter sets, slice headers, configuration records and rate control | the codec crate's `src/encode.rs`, `src/encode/`, re-exported as `encode` ("The encoders") |
-| libva's binding, written by hand for the subset used | `src/va/ffi.rs`, checked by `src/va/ffi_layout.c`; video processing's `src/va/vpp_ffi.rs`, checked by `src/va/vpp_ffi_layout.c` |
-| libva and libva-drm, loaded at run time, and a wrapper of each function the binding calls | `src/va/libva.rs` |
-| A display on a render node, its capabilities, configs and contexts | `src/va/display.rs`, `src/va/caps.rs` |
-| The display's call thread and gate ("The display's calls") | `src/va/calls.rs` |
-| VA buffers and a picture's begin, render and end | `src/va/buffer.rs` |
-| The H.264 accelerator and `H264Decoder` | `src/va/h264.rs` |
-| The HEVC accelerator and `HevcDecoder` | `src/va/hevc.rs` |
-| NV12 and P010 surface pools, a frame on one, and the ways back into caller planes | `src/va/surface.rs`, `src/va/frame.rs`, `src/va/readback.rs`, `src/va/host_memory.rs` |
-| What the driver's video processing writes into an imported surface, tried at each display's open ("The import check") | `src/va/import_check.rs` |
-| A frame written in place into a caller's pages ("Zero copy"), and the wait for a run's writes outside the driver's lock | `src/va/zero_copy.rs`, `src/va/fence.rs` |
-| The bounded waits ("Waiting for the GPU"), and their tests on a held GPU | `src/va/wait.rs`, `src/va/wait/`, `src/va/spin.rs` |
-| The encoders: `VideoEncoder` and its accelerator | `src/va/encoder.rs`, `src/va/encoder/`, `src/va/ffi/encode.rs` |
+| H.264 syntax and the decoding process above the slice data: NAL units, `avcC`, SPS/PPS/scaling lists, slice headers, order counts, the DPB's marking, lists and bumping. Plain Rust on every host, behind an `Accelerator` trait | `src/codec/h264.rs`, `src/codec/h264/`; the bumping process HEVC shares, `src/codec/dpb.rs` |
+| HEVC syntax and the decoding process above the slice data: NAL units, `hvcC`, VPS/SPS/PPS, scaling lists, short- and long-term sets, slice segment headers, order counts, the DPB, lists and bumping. Plain Rust, behind its own `Accelerator` trait | `src/codec/hevc.rs`, `src/codec/hevc/` |
+| The encoders' portable half: settings, GOP, parameter sets, slice headers, configuration records and rate control | `src/codec/encode.rs`, `src/codec/encode/` ("The encoders") |
+| libva's binding, written by hand for the subset used | `src/vaapi/va/ffi.rs`, checked by `src/vaapi/va/ffi_layout.c`; video processing's `src/vaapi/va/vpp_ffi.rs`, checked by `src/vaapi/va/vpp_ffi_layout.c` |
+| libva and libva-drm, loaded at run time, and a wrapper of each function the binding calls | `src/vaapi/va/libva.rs` |
+| A display on a render node, its capabilities, configs and contexts | `src/vaapi/va/display.rs`, `src/vaapi/va/caps.rs` |
+| The display's call thread and gate ("The display's calls") | `src/vaapi/va/calls.rs` |
+| VA buffers and a picture's begin, render and end | `src/vaapi/va/buffer.rs` |
+| The H.264 accelerator and `H264Decoder` | `src/vaapi/va/h264.rs` |
+| The HEVC accelerator and `HevcDecoder` | `src/vaapi/va/hevc.rs` |
+| NV12 and P010 surface pools, a frame on one, and the ways back into caller planes | `src/vaapi/va/surface.rs`, `src/vaapi/va/frame.rs`, `src/vaapi/va/readback.rs`, `src/vaapi/va/host_memory.rs` |
+| What the driver's video processing writes into an imported surface, tried at each display's open ("The import check") | `src/vaapi/va/import_check.rs` |
+| A frame written in place into a caller's pages ("Zero copy"), and the wait for a run's writes outside the driver's lock | `src/vaapi/va/zero_copy.rs`, `src/vaapi/va/fence.rs` |
+| The bounded waits ("Waiting for the GPU"), and their tests on a held GPU | `src/vaapi/va/wait.rs`, `src/vaapi/va/wait/`, `src/vaapi/va/spin.rs` |
+| The encoders: `VideoEncoder` and its accelerator | `src/vaapi/va/encoder.rs`, `src/vaapi/va/encoder/`, `src/vaapi/va/ffi/encode.rs` |
 | The reims-graphics device's decode on VA-API: each picture written in place by the driver's video processing, or copied by the CPU ("The reims-graphics device") | reims-vgpu's `src/graphics/vaapi.rs`, `src/graphics/video_host.rs` |
 | `vaapi-probe`, which stands in for `vainfo`; `vaapi-encode-probe`, the encoders' attributes | `examples/vaapi-probe.rs`, `examples/vaapi-encode-probe.rs` |
 | H.264's hardware check and its tools | `tools/h264-check.sh`, `examples/h264-framemd5/`, `examples/h264-info.rs`, `examples/h264-poc1.rs`, `examples/h264-craft.rs` |
 | HEVC's hardware check and its tools | `tools/hevc-check.sh`, `examples/hevc-framemd5.rs`, `examples/hevc-info.rs`, `examples/hevc-cut.rs`, `examples/hevc-craft.rs` |
 | The encoders' tool | `examples/vaapi-encode/` |
 
-`src/va` is Linux's alone (lib.rs picks it with `cfg`). Every `unsafe`
-block of the crate is there, each with its reason. On Linux the library
+`src/vaapi.rs` and `src/vaapi/` are Linux's alone (lib.rs picks them with `cfg`). Every
+`unsafe` block of the module is there, each with its reason. On Linux the library
 links neither `libva` nor `libva-drm`: it loads them when its first
 display opens ("Loading libva").
 
 ### Loading libva
 
 The binding's 37 functions come from `dlopen` and `dlsym`
-(`src/va/libva.rs`), as the nvidia crate loads NVIDIA's libraries, so a
+(`src/vaapi/va/libva.rs`), as the nvidia crate loads NVIDIA's libraries, so a
 QEMU built with the library starts on a host without libva.
 - Each function has a wrapper of the same name and signature, which
   `ffi` and `ffi::encode` re-export, so no call site names the loaded
@@ -65,7 +65,7 @@ QEMU built with the library starts on a host without libva.
 
 A display keeps the driver's first answer to every query a session makes:
 the profiles, each one's entrypoints, every pair's config attributes and
-surface attributes, and the image formats (`src/va/caps.rs`, `Answers`).
+surface attributes, and the image formats (`src/vaapi/va/caps.rs`, `Answers`).
 `Display::open` asks them all on the thread that opens it
 (`Display::prime`), for every pair the driver lists and for the union of
 the attributes the decoders and the encoders ask (`ASKED_ATTRIBUTES`). A
@@ -119,7 +119,7 @@ Both report the same for the codecs the crate drives:
   surfaces NV12, YV12, I420, P010, P016, P012, Y800, UYVY, YUY2, 422V,
   444P, RGBA, ABGR, BGRA, RGBX, BGRX, ARGB, AB30, AR30, XB30, XR30 up to
   16384x16384. `vaQueryVideoProcFilters` lists one filter: Deinterlacing.
-  The crate's runs (the staged copy back's, zero copy's) use the
+  The module's runs (the staged copy back's, zero copy's) use the
   pipeline's own copy, no filter.
 - **Image formats** (`vaQueryImageFormats`): NV12, P010, P012, P016, I420,
   YV12, YUYV, YUY2, UYVY, Y800, 444P, 422V, RGBP, BGRA, RGBA, ABGR, ARGB,
@@ -138,7 +138,7 @@ driver does with such an import, and a driver may take the import and its
 run, answer success, and write the wrong bytes or none ([bugs.md](bugs.md),
 U16, U26). So each display learns it as it opens, on the opening thread,
 from a trial run of each of the decoders' formats, NV12 and P010
-(`src/va/import_check.rs`, `learn`):
+(`src/vaapi/va/import_check.rs`, `learn`):
 - a picture holding every sample value of its format, 328x64, is put
   into a surface of the decoders' kind by `vaPutImage`;
 - one video-processing run copies it into memory of the check's own,
@@ -190,12 +190,12 @@ Each decoded frame the device does not write in place is copied out of
 the driver's surface into the caller's planes. A decode surface is in
 video memory and tiled on both AMD GPUs, so the CPU cannot read it as it
 is laid out, and reads it uncached over PCIe. The pool's surfaces come
-back one of four ways (`src/va/surface.rs`, `Readback`;
-`src/va/readback.rs`):
+back one of four ways (`src/vaapi/va/surface.rs`, `Readback`;
+`src/vaapi/va/readback.rs`):
 
 - **Staged**, the default. The pool makes a memfd of its own, sealed
   against shrinking, makes it a dma-buf with udmabuf, maps it
-  (`src/va/host_memory.rs`), and imports the dma-buf as a linear VA
+  (`src/vaapi/va/host_memory.rs`), and imports the dma-buf as a linear VA
   surface of the pool's format (`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`,
   one object, rows rounded up to 256 bytes, each plane at a 4096 boundary
   that is also whole rows of the luma's pitch from the first byte,
@@ -207,7 +207,7 @@ back one of four ways (`src/va/surface.rs`, `Readback`;
   of the cropped rectangle out of cached memory into the caller's planes
   (the *copy*). A driver copies back so only where the import check passed
   on it at its display's open ("The import check", `Display::writes_imports`
-  in `src/va/display.rs`), since a driver says nothing of what it gets
+  in `src/vaapi/va/display.rs`), since a driver says nothing of what it gets
   wrong here: NVIDIA's VA-API driver (libva-nvidia-driver 0.0.18 on the
   RTX 5080, 2026-10-25) took the import and the run, answered success,
   and every frame that came back was wrong ([bugs.md](bugs.md), U16).
@@ -284,7 +284,7 @@ PCIe 4.0 x4 link (downgraded): its staged transfer of a 4K P010 frame,
 
 Where the driver can take the caller's pages, a decoded frame is written
 into them by the staged copy back's processing run, aimed at those pages
-instead of ours, and the CPU copies nothing (`src/va/zero_copy.rs`,
+instead of ours, and the CPU copies nothing (`src/vaapi/va/zero_copy.rs`,
 `Frame::write_to_guest`). The caller hands the pages as a `GuestTarget`
 over core's `DeviceMemory` ([core.md](core.md), "A guest surface's
 memory"). The graphics device's are its output planes' pages in the
@@ -366,7 +366,7 @@ thread waited there for its run, the next decode on the display waited
 behind it: a 4K frame's `decode` took 0.9 to 5.0 ms with decoding ahead,
 against 0.3 to 1.0 ms one frame at a time. The crate waits for a run's
 writes with no lock held first, by `poll` for writing on the dma-bufs the
-run writes (`src/va/fence.rs`): the kernel puts the run's fence on each
+run writes (`src/vaapi/va/fence.rs`): the kernel puts the run's fence on each
 of them, so the poll returns once the run is done, and `vaSyncSurface`
 then finds the fence signalled. Zero copy's runs and the staged copy
 back's both wait so. Measured on both AMD GPUs (2026-10-25):
@@ -401,7 +401,7 @@ where its GPU is not one NVDEC opens: the device's video chooser
 (reims-vgpu's `src/graphics/video_choice.rs`) tries NVDEC, then VA-API on
 the render node of the runtime device's own GPU, whatever its vendor
 (`host_gpus::render_node_of`). The arm
-(`src/graphics/vaapi.rs`) runs the crate's `H264Decoder` and
+(`src/graphics/vaapi.rs`) runs the module's `H264Decoder` and
 `HevcDecoder` in a host video session of reims-vgpu's
 (`src/graphics/video_host.rs`), whose event the host signals.
 
@@ -457,10 +457,10 @@ iHD the luma plane at a page's first byte ([bugs.md](bugs.md), B93).
 
 ## Waiting for the GPU
 
-Every wait of the crate's on the GPU is bounded, by core's deadline,
+Every wait of the module's on the GPU is bounded, by core's deadline,
 `DEVICE_WAIT`, 5 s from a frame's first wait ([core.md](core.md), "Bounded
 waits"), asked after every 100 µs for its first 50 ms and every
-millisecond after (core's `device_wait`, `src/va/wait.rs`). A frame's
+millisecond after (core's `device_wait`, `src/vaapi/va/wait.rs`). A frame's
 waits share that one deadline (`wait::Deadline`): a decoder's call and
 the read backs of the frames it gives, or an encoder's call, with every
 wait among them for the display's calls ("The display's calls"), so that
@@ -492,7 +492,7 @@ with a timeout of 0 among them. **Measured** on both GPUs (Mesa 26.2.4,
 libva 2.24.1, 2026-10-26), each call timed on a thread of its own on 4K
 NV12 surfaces, with the graphics ring held, or 16 compute queues, by a
 compute shader of the tests' own that spins until let go
-(`src/va/spin.rs`):
+(`src/vaapi/va/spin.rs`):
 
 | call | the graphics ring held | the compute rings held |
 |---|---|---|
@@ -519,7 +519,7 @@ the decoder's session and waits for it (**read** in Mesa 26.2.4,
 `si_video_dec.c`; [bugs.md](bugs.md), U24), so it waits as long as that
 job does, behind a destroy's update as the copies are (B92).
 
-So the crate makes three kinds of call (`src/va/calls.rs`):
+So the crate makes three kinds of call (`src/vaapi/va/calls.rs`):
 - **A call that may wait for the GPU** (the table's above) is made on the
   display's call thread, `reims-vgpu-video.va-calls`, with the display's
   gate held exclusively, and its caller waits for its answer until the
@@ -557,7 +557,7 @@ back through derived maps waited for the gate 330 to 393 times a run of
 1.3 to 34 ms at the 99th percentile; with those reads moved to host memory
 of ours, the call thread made no call and the decode never waited.
 
-**Past the deadline** the frame fails as the crate's malfunction
+**Past the deadline** the frame fails as the module's malfunction
 (`Error::Stalled`), which the graphics device answers as a decode that did
 not land ([devices.md](devices.md), "A decode"). A frame whose zero copy
 runs passed it fails so too, and is not declined to the CPU's copy, which
@@ -568,12 +568,12 @@ asked after with the same questions ([core.md](core.md), "Bounded
 waits"):
 - a decoder's: its pool, every surface of it and the staged copy back's
   surface and memory, and its context once the decoder lets it go,
-  destroyed first (`src/va/surface.rs`); for zero copy, the pages' import
+  destroyed first (`src/vaapi/va/surface.rs`); for zero copy, the pages' import
   and the caller's hold on them, so that the pages stay in use until each
-  strip is done (`src/va/zero_copy.rs`);
+  strip is done (`src/vaapi/va/zero_copy.rs`);
 - an encoder's: its session, with the coded buffer, the context and both
   pools of surfaces, until the coded buffer is done
-  (`src/va/encoder/accelerator.rs`).
+  (`src/vaapi/va/encoder/accelerator.rs`).
 
 An answer that is an error keeps the work, and a GPU that never finishes
 keeps it until the process ends.
@@ -601,7 +601,7 @@ each, every frame matching its reference. A decode's wait ends up to one
 pause, 100 µs, after the decode does.
 
 **Its tests.** On the VA-API host, ignored elsewhere, on the render node
-`RVG_VAAPI_NODE` names, one test at a time. In `src/va/wait/gpu.rs`, each
+`RVG_VAAPI_NODE` names, one test at a time. In `src/vaapi/va/wait/gpu.rs`, each
 asked after with no time left, or 4 ms for an encode, so that the work is
 still running at its deadline, on the GPU's own work: a 4K H.264 decode
 fails as stalled, the frame's later wait and the decoder's next decode
@@ -609,7 +609,7 @@ fail at once, and its pool, then its context, are kept until the GPU is
 done and then let go; a decoded frame's staged copy back fails the same
 way, with no other way back tried; and a 4K H.264 encode fails its
 picture and the next frame at once, its session kept until the coded
-buffer is done. In `src/va/wait/held.rs`, with a ring held by the spin,
+buffer is done. In `src/vaapi/va/wait/held.rs`, with a ring held by the spin,
 each frame's wait 50 ms: the `vaGetImage` way back, the concealment copy,
 a wait in `vaSyncSurface` on a driver without `vaSyncSurface2`
 (`vaSyncSurface2` answered as one answers), and an encode whose upload
@@ -644,7 +644,7 @@ comparison only, waits for the GPU in `DMA_BUF_IOCTL_SYNC`.
 Every slice's lists are built and checked before anything reaches the
 accelerator, so a sample with an error submits nothing.
 
-The VA accelerator (`src/va/h264.rs`) turns that into libva's buffers:
+The VA accelerator (`src/vaapi/va/h264.rs`) turns that into libva's buffers:
 - one picture parameter buffer and one IQ matrix buffer;
 - a slice parameter buffer and a slice data buffer per slice.
 
@@ -734,7 +734,7 @@ has the length size asked for:
   after them (reserved type, a slice of noise, or one with the forbidden
   bit).
 
-`--check` decodes the MP4 through this crate's decoder over a stand-in
+`--check` decodes the MP4 through this module's decoder over a stand-in
 accelerator. For each sample it prints what would reach the GPU, the
 copies made for lost frames, and any error. A damaged stream goes to a
 GPU only once this shows whole pictures of valid slices alone.
@@ -778,7 +778,7 @@ H.264's does:
 Every picture's lists are built and checked before anything reaches the
 accelerator.
 
-The VA accelerator (`src/va/hevc.rs`) fills, per picture, one
+The VA accelerator (`src/vaapi/va/hevc.rs`) fills, per picture, one
 `VAPictureParameterBufferHEVC`, a `VAIQMatrixBufferHEVC` when scaling
 lists are on, and per slice segment a `VASliceParameterBufferHEVC` (the
 long one) with its data. The conventions, each from va_dec_hevc.h unless
@@ -852,24 +852,24 @@ H.264 (Constrained Baseline, Main, High) and HEVC (Main, Main 10) on
 handed to the driver as packed headers. The driver writes the slice data,
 and on radeonsi the parameter sets as well (below).
 
-The portable half is the codec crate's (`crates/reims-vgpu-video-codec`),
-re-exported as `encode`; the rest is this crate's.
+The portable half is the codec module's (`src/codec/encode.rs`); the rest
+is the `vaapi` module's.
 
 | what | where |
 |---|---|
-| Settings, input frames, samples, profiles and rate control. Plain Rust | the codec crate's `src/encode.rs` |
-| SPS/VUI/PPS/slice headers, `avcC`, levels (Table A-1) | the codec crate's `src/encode/h264.rs` |
-| VPS/SPS/VUI/PPS/slice segment headers, `hvcC`, levels (Tables A.8, A.9) | the codec crate's `src/encode/hevc.rs` |
-| Picture types and order, references, decode times | the codec crate's `src/encode/gop.rs` |
-| Our rate control under a hard limit (below) | the codec crate's `src/encode/limit_rate.rs` |
-| The core over an `Accelerator` trait, as `h264::Decoder` is | the codec crate's `src/encode/encoder.rs` |
-| libva's encode binding, checked against the headers | `src/va/ffi/encode.rs`, `src/va/ffi/encode_layout.c` |
-| The driver's encoder attributes, and `vaapi-encode-probe` | `src/va/encoder/caps.rs`, `examples/vaapi-encode-probe.rs` |
-| The VA accelerator: config, context, surfaces, buffers, coded buffer | `src/va/encoder/accelerator.rs`, `params.rs`, `surfaces.rs` |
-| `VideoEncoder` | `src/va/encoder.rs` |
+| Settings, input frames, samples, profiles and rate control. Plain Rust | `src/codec/encode.rs` |
+| SPS/VUI/PPS/slice headers, `avcC`, levels (Table A-1) | `src/codec/encode/h264.rs` |
+| VPS/SPS/VUI/PPS/slice segment headers, `hvcC`, levels (Tables A.8, A.9) | `src/codec/encode/hevc.rs` |
+| Picture types and order, references, decode times | `src/codec/encode/gop.rs` |
+| Our rate control under a hard limit (below) | `src/codec/encode/limit_rate.rs` |
+| The core over an `Accelerator` trait, as `h264::Decoder` is | `src/codec/encode/encoder.rs` |
+| libva's encode binding, checked against the headers | `src/vaapi/va/ffi/encode.rs`, `src/vaapi/va/ffi/encode_layout.c` |
+| The driver's encoder attributes, and `vaapi-encode-probe` | `src/vaapi/va/encoder/caps.rs`, `examples/vaapi-encode-probe.rs` |
+| The VA accelerator: config, context, surfaces, buffers, coded buffer | `src/vaapi/va/encoder/accelerator.rs`, `params.rs`, `surfaces.rs` |
+| `VideoEncoder` | `src/vaapi/va/encoder.rs` |
 | The checks' tool | `examples/vaapi-encode/` |
 
-The codec crate's half names no libva type: the headers, the levels, the
+The codec module's half names no libva type: the headers, the levels, the
 GOP planning (`KeyFrames`, `DecodeTimes`) and the rate control are plain
 Rust, tested on any host.
 
@@ -923,7 +923,7 @@ picture: the first sample carries the record it belongs with, and
   after an IDR picture at the latest. So a picture's place in display
   order from its IDR picture is at most 2^30 - 1, and its order count,
   twice that in H.264 and that in HEVC, within the 32 bits H.264 8.2.1 and
-  HEVC 8.3.1 allow (`MAX_ORDER` in the codec crate's `src/encode/gop.rs`).
+  HEVC 8.3.1 allow (`MAX_ORDER` in `src/codec/encode/gop.rs`).
   H.264 Main and High put B pictures between references, one by default
   (`DEFAULT_B_FRAMES`) and at most 4, L0 two references and L1 one. A run
   of B pictures is closed with a P before an IDR. HEVC and Constrained
@@ -977,9 +977,9 @@ entropy coder and VA-API's quality level.
 
 ### Testing
 
-On any host, the codec crate's unit tests (`cargo nextest run -p
-reims-vgpu-video-codec`; `cargo xtask check` runs them with the rest) test
-the portable half: headers parsed back with the crate's own H.264 parsers
+On any host, the codec module's unit tests (`cargo nextest run -p
+reims-vgpu-video -E 'test(/^codec::/)'`; `cargo xtask check` runs them with the rest) test
+the portable half: headers parsed back with the module's own H.264 parsers
 and bit readers, GOP planning, and the core on a fake accelerator.
 
 On both AMD GPUs, a script not in this repository encoded ffmpeg's
@@ -1035,7 +1035,7 @@ Run 2026-10-24 on both AMD GPUs, Mesa 26.2.4, 40 cases on each node:
 ### The bitrate floor
 
 No rate under 32,000 bit/s reaches the driver (`MIN_BITS_PER_SECOND` in
-`src/va/encoder/params.rs`, ours). An average, a peak or a constant rate
+`src/vaapi/va/encoder/params.rs`, ours). An average, a peak or a constant rate
 under it is raised to it, and with it the HRD buffer, which is a second at
 the peak, or half a second under a limit. Without it, an average of 1
 would reach radeonsi as a VBR of 1 bit/s, with a buffer of 1 bit, three
@@ -1085,8 +1085,8 @@ A hard limit holds a stream to a number of bytes over any window of decode
 time (`EncoderSettings::hard_limit`). radeonsi's VBR and CBR pass the HRD
 buffer they are given, and no parameter the driver reads holds them to it
 but a minimum QP picked for the content (below; [bugs.md](bugs.md), U14),
-so a stream held to a limit is not given to them. Ours (the codec crate's
-`src/encode/limit_rate.rs`, driven by `src/encode/encoder.rs`'s
+so a stream held to a limit is not given to them. Ours (the codec module's
+`src/codec/encode/limit_rate.rs`, driven by `src/codec/encode/encoder.rs`'s
 `encode_planned`):
 
 - **The driver runs a constant QP.** The config asks for `VA_RC_CQP`, and
@@ -1201,8 +1201,8 @@ frame.copy_p010_to(y, y_stride, uv, uv_stride)?;          // 2 bytes a sample; t
 
 ### On any host
 
-The codec crate's unit tests (`cargo nextest run -p
-reims-vgpu-video-codec`) test the portable layer. The streams for them are
+The codec module's unit tests (`cargo nextest run -p
+reims-vgpu-video -E 'test(/^codec::/)'`) test the portable layer. The streams for them are
 written in the tests from the standard's syntax. They cover what x264 does
 not write:
 - order count type 1 with non-reference pictures;
@@ -1218,20 +1218,20 @@ host session's on the fake platform (`video_host`'s tests).
 
 ### On a VA-API GPU
 
-The crate's ignored tests need a VA-API GPU and the installed headers:
+The module's ignored tests need a VA-API GPU and the installed headers:
 the binding's layouts against libva's headers, the import check's sweep,
 and the bounded waits ("Waiting for the GPU", "Its tests"):
 
 ```sh
-cargo nextest run -p reims-vgpu-video-vaapi --run-ignored only
+cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^vaapi::/)'
 ```
 
 The hardware checks, from the checkout's root on a Linux host with libva
 and the oracles below:
 
 ```sh
-crates/reims-vgpu-video-vaapi/tools/h264-check.sh /dev/dri/renderD128
-crates/reims-vgpu-video-vaapi/tools/hevc-check.sh /dev/dri/renderD128
+crates/reims-vgpu-video/tools/h264-check.sh /dev/dri/renderD128
+crates/reims-vgpu-video/tools/hevc-check.sh /dev/dri/renderD128
 ```
 
 Streams, references and logs go to `build/h264-check/` and
@@ -1287,8 +1287,8 @@ become flat lists and none of its frames matches.
 
 ### Testing HEVC
 
-**On any host**, the codec crate's unit tests (`cargo nextest run -p
-reims-vgpu-video-codec`) test the HEVC layer, whose streams the tests
+**On any host**, the codec module's unit tests (`cargo nextest run -p
+reims-vgpu-video -E 'test(/^codec::/)'`) test the HEVC layer, whose streams the tests
 write from the standard's syntax (a 64x48 picture, CTB 16, cropped to
 64x46). They cover what x265 does not write, the first three of which no
 encoder the checks use writes (kvazaar's streams, below, reach dependent
@@ -1453,7 +1453,7 @@ reference is long-term: x265's main-720p-ref1 (`--ref 1 --bframes 0
 list the nearer, and kvazaar's kvz-1080p-ref1 (`--gop 0 --ref 1
 --no-tmvp`) the one before each B picture, in both its lists.
 
-`--check` decodes the source and the output through the codec crate's
+`--check` decodes the source and the output through the codec module's
 decoder over a stand-in accelerator. It fails unless every picture has the
 source's order count, reference picture set (each picture's order count,
 set and marking; one made long-term may move from `StCurrBefore` or

@@ -1,6 +1,6 @@
 /*
  * video_h265_cases: the parameter sets of eleven HEVC streams x265 4.3 encoded from ffmpeg's
- * test sources, three of them rewritten by hevc-craft (crates/reims-vgpu-video-vaapi/examples),
+ * test sources, three of them rewritten by hevc-craft (crates/reims-vgpu-video/examples),
  * each as the fields AppleGVA's parsed form holds, each scaling list and short-term set derived,
  * and the NAL units the encoder wrote, with the bits the test compares to (the NAL header's first
  * bit is bit 0). The fields were read with ffmpeg's trace_headers. The streams:

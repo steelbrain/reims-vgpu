@@ -80,7 +80,7 @@ impl ApiPlatform for VulkanPlatform {
     fn graphics_video(
         &self,
         device: &<Self as Platform>::Device,
-        runtime: Arc<dyn reims_vgpu_video_core::runtime::Runtime>,
+        runtime: Arc<dyn reims_vgpu_video::core::runtime::Runtime>,
     ) -> Option<Arc<dyn crate::GraphicsVideo<Self>>> {
         crate::graphics::vulkan_graphics_video(device, runtime)
     }

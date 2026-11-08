@@ -65,7 +65,7 @@ priority = 50
 filter = 'binary_id(reims-vgpu-vulkan) & test(=awake::tests::an_exit_amid_touches_ends_with_its_status)'
 priority = 50
 
-# The VA-API backend's tests of the GPU held (`va::spin`, `va::wait::gpu`, `va::wait::held`),
+# The `vaapi` module's tests of the GPU held (`vaapi::va::spin`, `va::wait::gpu`, `va::wait::held`),
 # opt-in (`#[ignore]`) and run on the VA-API host with `--run-ignored only`, each alone. Each
 # holds the GPU's ring with a spin of its own and times the display's calls against it, so a
 # test made beside another's spin waits for that spin too: run together (nextest's default), a
@@ -73,5 +73,5 @@ priority = 50
 # m3-max-4299, m3-max-4303, 2026-11-07).
 [[profile.default.overrides]]
 platform = 'cfg(target_os = "linux")'
-filter = 'binary_id(reims-vgpu-video-vaapi) & test(/^va::(spin|wait::(gpu|held))::/)'
+filter = 'binary_id(reims-vgpu-video) & test(/^vaapi::va::(spin|wait::(gpu|held))::/)'
 threads-required = "num-test-threads"

@@ -153,7 +153,7 @@ use reims_vgpu_core::platform::types::NsRange;
 use reims_vgpu_core::platform::{Handle, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
-use reims_vgpu_video_core::device_memory::{MemoryIdentity, MemoryLife};
+use reims_vgpu_video::core::device_memory::{MemoryIdentity, MemoryLife};
 
 use super::refusing;
 use super::surface_pages::{SurfaceView, Unmade, buffer_over};

@@ -1,4 +1,4 @@
-use reims_vgpu_video_vaapi::{ImportWrite, SurfaceCapabilities};
+use reims_vgpu_video::vaapi::{ImportWrite, SurfaceCapabilities};
 
 use super::*;
 

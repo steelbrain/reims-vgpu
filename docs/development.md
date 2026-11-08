@@ -11,7 +11,7 @@ AGENTS.md                   the rules for working on the repository
 Cargo.toml                  the Cargo workspace, with Cargo.lock,
                             rust-toolchain.toml, clippy.toml and
                             .cargo/config.toml
-crates/                     its eleven crates (below), and reims-ctl, a
+crates/                     its nine crates (below), and reims-ctl, a
                             workspace of its own that links none of them
 xtask/                      cargo xtask (below)
 firmware/                   the reims-graphics device's option ROM: its UEFI
@@ -55,8 +55,8 @@ docs/
                             against Metal's answers, and the switches
   graphics-kext/            the reims-graphics device: its design, the dGPU
                             oracle and the benchmark
-  video/                    the video devices: their contract, core, the
-                            backends, hardening and the open bugs
+  video/                    the device's host video: what it answers, its
+                            arms, the video crate and the open bugs
 vendor/qemu/                QEMU with the reims-graphics device on
                             reims-vgpu (submodule)
 assets/readme/              the README's screenshots
@@ -92,12 +92,8 @@ doc holds its area's ordering contracts and the measured platform facts it relie
 | `reims-vgpu-window` | `crates/reims-vgpu-window` | the device's own window: AppKit's or SDL3's on macOS, SDL3's on Linux, its input and the host's screens; knows nothing of devices or displays. `features.md` lists what the window does, each entry deliberate |
 | `reims-vgpu` | `crates/reims-vgpu` | the public Rust API: the reims-graphics device over the platform, its Metal-call decoder and its window; the process's platform |
 | `reims-vgpu-c` | `crates/reims-vgpu-c` | the C API (`rvg_*`, `include/reims_vgpu.h`), which QEMU links; `cdylib`, `staticlib` and `rlib` |
-| `reims-vgpu-video-core` | `crates/reims-vgpu-video-core` | the VideoToolbox and M2 scaler devices' behaviour as the guest sees it, over the backends' traits; independent of host, driver and QEMU |
-| `reims-vgpu-video-codec` | `crates/reims-vgpu-video-codec` | the codecs' syntax and the decoding and encoding processes above the hardware, for every backend, in plain Rust |
-| `reims-vgpu-video-vaapi` | `crates/reims-vgpu-video-vaapi` | the VA-API backend (Linux), through libva alone |
-| `reims-vgpu-video-nvidia` | `crates/reims-vgpu-video-nvidia` | the NVIDIA backend (Linux): NVDEC and NVENC over the CUDA driver API, loaded at run time |
-| `reims-vgpu-video-videotoolbox` | `crates/reims-vgpu-video-videotoolbox` | the VideoToolbox backend (macOS) |
-| `reims-vgpu-video-conformance` | `crates/reims-vgpu-video-conformance` | the conformance suite every backend runs: a stand-in guest drives core's devices on it |
+| `reims-vgpu-video` | `crates/reims-vgpu-video` | the reims-graphics device's video on the host, independent of the library and QEMU: `core` (what the video arms share), `codec` (the codecs above the hardware, in plain Rust), and on Linux `vaapi` (VA-API through libva) and `nvidia` (NVDEC and NVENC over the CUDA driver API), their libraries loaded at run time |
+| `reims-vgpu-video-conformance` | `crates/reims-vgpu-video/conformance` | the test streams' readers and writers the video examples use: MP4 in and out, and frames hashed as ffmpeg's `framemd5` does |
 | `reims-graphics` | `crates/reims-graphics` | the reims-graphics device (1234:5247, `docs/graphics-kext/design.md`): its wire format, whose C header (`include/reims_graphics_wire.h`) the guest's kext and option ROM include, and its host side |
 | `xtask` | `xtask` | `cargo xtask`, below |
 

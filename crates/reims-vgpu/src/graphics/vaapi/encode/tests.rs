@@ -1,6 +1,6 @@
 use reims_graphics::wire::RGFX_VIDEO_DECODE;
-use reims_vgpu_video_core::runtime::StdRuntime;
-use reims_vgpu_video_vaapi::{H264Decoder, HevcDecoder, encoder_support};
+use reims_vgpu_video::core::runtime::StdRuntime;
+use reims_vgpu_video::vaapi::{H264Decoder, HevcDecoder, encoder_support};
 
 use super::*;
 
@@ -57,7 +57,7 @@ fn hvcc(units: &[(u8, &[u8])]) -> Vec<u8> {
 #[test]
 fn a_sample_becomes_annex_b_its_keyframe_s_parameter_sets_first() {
     let (sps, pps) = ([0x67, 0x64, 0x00, 0x1f], [0x68, 0xee, 0x3c]);
-    let record = reims_vgpu_video_vaapi::encode::h264::avcc(&sps, &pps);
+    let record = reims_vgpu_video::codec::encode::h264::avcc(&sps, &pps);
     let slices = sample(&[&[0x65, 0x88, 0x84], &[0x06, 0x05]]);
     let au = annex_b(RGFX_VIDEO_CODEC_H264, Some(&record), &slices).unwrap();
     let want: Vec<u8> = [

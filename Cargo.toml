@@ -8,11 +8,8 @@ members = [
     "crates/reims-vgpu",
     "crates/reims-vgpu-c",
     "crates/reims-vgpu-vulkan",
-    "crates/reims-vgpu-video-core",
-    "crates/reims-vgpu-video-codec",
-    "crates/reims-vgpu-video-vaapi",
-    "crates/reims-vgpu-video-nvidia",
-    "crates/reims-vgpu-video-conformance",
+    "crates/reims-vgpu-video",
+    "crates/reims-vgpu-video/conformance",
     "crates/reims-graphics",
     "xtask",
 ]
@@ -34,15 +31,10 @@ reims-vgpu = { path = "crates/reims-vgpu", default-features = false }
 reims-vgpu-vulkan = { path = "crates/reims-vgpu-vulkan" }
 # The reims-graphics device: its wire format and host side.
 reims-graphics = { path = "crates/reims-graphics" }
-# The video crates' runtime and memory, which the reims-graphics device's video arms share
-# (`crate::video` of `reims-vgpu`).
-reims-vgpu-video-core = { path = "crates/reims-vgpu-video-core" }
-# The reims-graphics device's hardware video on the host's GPU through libva, on Linux
-# (`graphics::vaapi` of `reims-vgpu`).
-reims-vgpu-video-vaapi = { path = "crates/reims-vgpu-video-vaapi" }
-# Its hardware video on an NVIDIA GPU through NVDEC, on Linux, its libraries loaded at run time
-# (`graphics::nvidia` of `reims-vgpu`).
-reims-vgpu-video-nvidia = { path = "crates/reims-vgpu-video-nvidia" }
+# The reims-graphics device's video on the host: its runtime and memory (`crate::video` of
+# `reims-vgpu`), and, on Linux, VA-API through libva and NVDEC through CUDA, their libraries
+# loaded at run time (`graphics::vaapi` and `graphics::nvidia` of `reims-vgpu`).
+reims-vgpu-video = { path = "crates/reims-vgpu-video" }
 # The Vulkan platform's proof of concept (architecture D1): a Metal-shaped API on Vulkan, from
 # metal2vulkan's public repository at the commit both name.
 metal2vulkan-runtime = { git = "https://github.com/steelbrain/metal2vulkan", rev = "eac9da30c7e6df2cddec724643546c1f2a401c87" }
@@ -84,12 +76,9 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std"] }
 mach2 = "0.7"
 libc = "0.2.180"
-# The codecs' Annex B start-code scan (reims-vgpu-video-codec's h264::nal), at the version the
+# The codecs' Annex B start-code scan (reims-vgpu-video's codec::h264::nal), at the version the
 # lock already holds for the regex crates.
 memchr = "2.8.3"
-# The Vulkan driver manifests the video devices' GPUs are read through
-# (reims-vgpu-vulkan/src/host_gpus.rs), at the version the runtime's translator takes.
-serde_json = "1.0.151"
 # The library's allocator on the targets that ship (reims-vgpu-c's global allocator): jemalloc,
 # built from the crate's bundled source, with its symbols prefixed.
 tikv-jemallocator = "0.7.0"

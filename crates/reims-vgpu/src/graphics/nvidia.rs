@@ -1,5 +1,5 @@
 //! The reims-graphics device's hardware video on an NVIDIA GPU ([`open`]): NVDEC, through the
-//! NVIDIA crate's decoder of whole access units (`reims_vgpu_video_nvidia::AnnexBDecoder`), in
+//! NVIDIA crate's decoder of whole access units (`reims_vgpu_video::nvidia::AnnexBDecoder`), in
 //! the host's video sessions (`super::video_host`), whose event the host signals once a picture
 //! has landed; and NVENC, in the host's encode sessions (`encode`'s module doc).
 //!
@@ -53,9 +53,9 @@ use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_video_core::device_memory::{DeviceImports, MemoryIdentity};
-use reims_vgpu_video_core::runtime::Runtime;
-use reims_vgpu_video_nvidia::{
+use reims_vgpu_video::core::device_memory::{DeviceImports, MemoryIdentity};
+use reims_vgpu_video::core::runtime::Runtime;
+use reims_vgpu_video::nvidia::{
     AnnexBCodec, AnnexBDecoder, AnnexBPicture, ChromaFormat, DecodeCapabilities, DevicePlane,
     EncodeProfileSupport, Gpu, GpuSelector, ImportedBuffer, MemoryPlane, NvdecCodec, ReadPlane,
     decode_capabilities, encode_profiles,

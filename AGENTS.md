@@ -58,8 +58,8 @@ The Makefile's header lists every target. README.md lists the requirements.
 | the Vulkan platform | `crates/reims-vgpu-vulkan`, over metal2vulkan's runtime, at the commit of its public repository `Cargo.toml` names; what its defaults trade against Metal's answers is [docs/accuracy-ledger.md](docs/accuracy-ledger.md) |
 | the Vulkan platform's metallibs, which a build off a Mac copies | `crates/reims-vgpu-vulkan/metallibs`, written on a Mac by `cargo xtask metallibs` (README.md, Building) |
 | a display's own window, and the register of what it does | `crates/reims-vgpu-window`, its `features.md` and its manual walk on macOS, `scripts/internal/walk_window_macos.sh`; the wiring is `crates/reims-vgpu/src/window.rs` |
-| the reims-graphics device's video on the host, on NVDEC or VA-API | `crates/reims-vgpu-video-*`: `core` (what the arms share: their runtime, locks, a guest surface's memory and bounded waits), `codec` (the codecs above the hardware), `vaapi` and `nvidia` (the hardware's), and `conformance` (the test streams' readers and writers); the arms are reims-vgpu's `crates/reims-vgpu/src/graphics/{nvidia,vaapi,video_choice,video_host}.rs`, on the runtime in `crates/reims-vgpu/src/video/runtime.rs` |
-| the video docs | [docs/video](docs/video): `devices.md` is what the device answers and what a decode does, `backends.md` the arms, their crates and the conformance suite (`crates/reims-vgpu-video-vaapi/tools/h264-check.sh` and `hevc-check.sh`), `core.md`, `vaapi.md` and `nvidia.md` the crates, `bugs.md` what is wrong or put off |
+| the reims-graphics device's video on the host, on NVDEC or VA-API | `crates/reims-vgpu-video`, in modules: `core` (what the arms share: their runtime, locks, a guest surface's memory and bounded waits), `codec` (the codecs above the hardware), and on Linux `vaapi` and `nvidia` (the hardware's); its subcrate `conformance` is the test streams' readers and writers; the arms are reims-vgpu's `crates/reims-vgpu/src/graphics/{nvidia,vaapi,video_choice,video_host}.rs`, on the runtime in `crates/reims-vgpu/src/video/runtime.rs` |
+| the video docs | [docs/video](docs/video): `devices.md` is what the device answers and what a decode does, `backends.md` the arms, the crate and the conformance suite (`crates/reims-vgpu-video/tools/h264-check.sh` and `hevc-check.sh`), `core.md`, `vaapi.md` and `nvidia.md` its modules, `bugs.md` what is wrong or put off |
 | the guest's kexts, loader and Metal bundle | `guest/`, and the prebuilt set reims-ctl carries, `guest/prebuilt` |
 | the dist tree QEMU links | `xtask/src/dist.rs` (`cargo xtask dist`) |
 | the option ROM reims-ctl gives the device | `firmware/`, and the prebuilt ROM, `firmware/prebuilt/ReimsGraphics.rom`, described in [docs/architecture.md](docs/architecture.md) section 11.4 |
@@ -122,7 +122,7 @@ passes run again alone.
 | the library (`crates/`), the C API or its header | `cargo xtask check` |
 | what the Vulkan platform ends the process on, or what device info, GPU families or feature queries answer | the library's checks, and a cold boot of each guest the change can reach before it merges ("A boot is the only check", below) |
 | a `.metal` source of the Vulkan crate, or the metal crate's `shaders.metal` | `cargo xtask metallibs` on a Mac, committing the metallibs it writes with the change; then the library's checks |
-| the video crates (`crates/reims-vgpu-video-*`), or their arms in `reims-vgpu` | `cargo xtask check` on a Mac; the Linux tests on a VA-API host and on an NVIDIA host; and, where the VA-API crate's decoders change, the conformance suite on a VA-API host ("The video crates' checks", below) |
+| the video crate (`crates/reims-vgpu-video`), or its arms in `reims-vgpu` | `cargo xtask check` on a Mac; the Linux tests on a VA-API host and on an NVIDIA host; and, where the `vaapi` module's decoders change, the conformance suite on a VA-API host ("The video crates' checks", below) |
 | `xtask/` | `cargo test -p xtask`, rustfmt and clippy on it |
 | `crates/reims-ctl` | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it (`cargo xtask check` does not reach it); a change to the QEMU command it builds, or to `scripts/install-ctl.sh`, also needs an install and a VM boot on each host it touches |
 | `guest/` (kext, bundle, rgfxgate, loader) | `make -C guest test` on a Mac; a change to a source the set is built from also needs `make -C guest prebuilt KDK=<KDK Extensions dir>`, committing `guest/prebuilt` with it (`make -C guest prebuilt-check` fails otherwise) |
@@ -143,14 +143,14 @@ The video crates' checks:
   ulimit -c 0
   scripts/internal/gpu-locks.sh --all -- cargo nextest run --workspace --no-fail-fast \
     --features reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan
-  scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video-vaapi --run-ignored only   # the VA-API host
-  scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video-nvidia --run-ignored only  # the NVIDIA host
+  scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^vaapi::/)'   # the VA-API host
+  scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^nvidia::/)'  # the NVIDIA host
   ```
   The features are `cargo xtask check`'s on Linux. The ignored tests check
   the bindings against libva's and NVIDIA's headers, and the hardware's own
   answers on the GPU.
-- **The conformance suite**, where the VA-API crate's decoders change:
-  `crates/reims-vgpu-video-vaapi/tools/h264-check.sh NODE` and
+- **The conformance suite**, where the `vaapi` module's decoders change:
+  `crates/reims-vgpu-video/tools/h264-check.sh NODE` and
   `hevc-check.sh NODE` on each render node
   ([docs/video/backends.md](docs/video/backends.md), "The conformance
   suite"). Each script takes its GPU's locks itself.

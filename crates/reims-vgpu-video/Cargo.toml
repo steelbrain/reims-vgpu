@@ -1,0 +1,31 @@
+[package]
+name = "reims-vgpu-video"
+description = "The reims-graphics device's video on the host: the codecs above the hardware, and VA-API and NVDEC/NVENC under them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"
+log = "0.4"
+# The locks the video code takes, reims-vgpu-core's (`core::sync`).
+parking_lot.workspace = true
+# The Annex B start-code scan (`codec::h264::nal`), a vectorized substring search.
+memchr.workspace = true
+
+[dev-dependencies]
+# The examples' stream readers and writers, and their frame hashes.
+reims-vgpu-video-conformance = { path = "conformance" }
+# The fuzzers' harness (`codec::fuzz_support`) bounds each input by its CPU time, which
+# `clock_gettime` reads.
+libc.workspace = true
+
+# The tests of VA-API's bounded waits hold the GPU with a compute shader of their own, on Vulkan
+# (`src/vaapi/va/spin.rs`).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+ash.workspace = true

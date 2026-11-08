@@ -7,8 +7,8 @@ use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
 use reims_vgpu_core::platform::types::CommandBufferStatus;
-use reims_vgpu_video_core::device_memory::MemoryLife;
-use reims_vgpu_video_nvidia::{
+use reims_vgpu_video::core::device_memory::MemoryLife;
+use reims_vgpu_video::nvidia::{
     EncodeParams, EncodeProfile, EncodeRateControl, NvencEncoder, RawFrame, Tuning,
 };
 

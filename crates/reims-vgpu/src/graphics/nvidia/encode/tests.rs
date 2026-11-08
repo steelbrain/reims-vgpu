@@ -9,8 +9,8 @@ use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::testkit::FakePlatform;
-use reims_vgpu_video_core::runtime::{Runtime, StdRuntime};
-use reims_vgpu_video_nvidia::{AnnexBCodec, AnnexBDecoder, GpuSelector, encode_profiles};
+use reims_vgpu_video::core::runtime::{Runtime, StdRuntime};
+use reims_vgpu_video::nvidia::{AnnexBCodec, AnnexBDecoder, GpuSelector, encode_profiles};
 use zerocopy::FromBytes;
 
 use super::super::super::decode::{GraphicsVideoSession, VideoEncode, VideoPlane};

@@ -37,7 +37,7 @@ use reims_graphics::wire::{
     RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_video_nvidia::{
+use reims_vgpu_video::nvidia::{
     EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl, Gpu, NvencEncoder,
     PictureType, RawFrame, Tuning,
 };

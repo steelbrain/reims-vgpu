@@ -38,10 +38,10 @@ use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::PixelFormatInfo;
 use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_video_core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
+use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
 #[cfg(all(vulkan_platform, target_os = "linux"))]
-use reims_vgpu_video_core::device_memory::{DmaBufError, SurfaceDmaBuf};
-use reims_vgpu_video_core::surfaces::SurfaceError;
+use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
+use reims_vgpu_video::core::surfaces::SurfaceError;
 use zerocopy::FromBytes;
 
 use super::worker::Worker;

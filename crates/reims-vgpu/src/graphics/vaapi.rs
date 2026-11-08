@@ -43,12 +43,12 @@ use reims_graphics::wire::{
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_video_core::backend::DeviceWrite;
-use reims_vgpu_video_core::device_memory::GuestTarget;
-use reims_vgpu_video_core::fourcc::FourCc;
-use reims_vgpu_video_core::runtime::Runtime;
-use reims_vgpu_video_core::surfaces::{PlaneLayout, SurfaceLayout};
-use reims_vgpu_video_vaapi::{
+use reims_vgpu_video::core::backend::DeviceWrite;
+use reims_vgpu_video::core::device_memory::GuestTarget;
+use reims_vgpu_video::core::fourcc::FourCc;
+use reims_vgpu_video::core::runtime::Runtime;
+use reims_vgpu_video::core::surfaces::{PlaneLayout, SurfaceLayout};
+use reims_vgpu_video::vaapi::{
     Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
     H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, encoder_support,
 };

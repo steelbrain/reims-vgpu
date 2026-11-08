@@ -150,7 +150,7 @@ use reims_vgpu_core::platform::values::{
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_video_core::device_memory::MemoryLife;
+use reims_vgpu_video::core::device_memory::MemoryLife;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Metal's page on Apple silicon, to which a Shared heap's memory is rounded up: the guest's

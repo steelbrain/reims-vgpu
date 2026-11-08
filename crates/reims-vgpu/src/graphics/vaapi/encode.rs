@@ -32,11 +32,11 @@ use reims_graphics::wire::{
     RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps, RgfxVideoEncodeCaps,
 };
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_video_vaapi::encode::{
+use reims_vgpu_video::codec::encode::{
     ColourDescription, EncoderSettings, Entropy, FrameRate, FrameType, InputFrame, Plane,
     Profile as EncodeProfile, RateControl,
 };
-use reims_vgpu_video_vaapi::{Capabilities, Display, EncoderSupport, VideoEncoder};
+use reims_vgpu_video::vaapi::{Capabilities, Display, EncoderSupport, VideoEncoder};
 
 use super::super::video_host::{
     BackendError, EncodeFrame, EncodeSource, Encoded, HostEncodedFrame, HostEncoder, SourcePlane,
@@ -502,13 +502,13 @@ pub(super) fn annex_b(
     let mut au = Vec::with_capacity(sample.len() + 256);
     if let Some(record) = configuration {
         let sets: Vec<&[u8]> = if codec == RGFX_VIDEO_CODEC_H264 {
-            let config = reims_vgpu_video_vaapi::h264::avcc::DecoderConfiguration::parse(record)
+            let config = reims_vgpu_video::codec::h264::avcc::DecoderConfiguration::parse(record)
                 .map_err(|e| format!("the encoder's avcC: {e:?}"))?;
             (config.sequence_parameter_sets.into_iter())
                 .chain(config.picture_parameter_sets)
                 .collect()
         } else {
-            let config = reims_vgpu_video_vaapi::hevc::hvcc::DecoderConfiguration::parse(record)
+            let config = reims_vgpu_video::codec::hevc::hvcc::DecoderConfiguration::parse(record)
                 .map_err(|e| format!("the encoder's hvcC: {e:?}"))?;
             config.nal_units
         };
