@@ -455,7 +455,7 @@ fn lower_first(s: &str) -> String {
 }
 
 /// "6 MB", "1.1 GB".
-fn size(bytes: u64) -> String {
+pub(crate) fn size(bytes: u64) -> String {
     if bytes < 1_000_000_000 {
         format!("{} MB", bytes.div_ceil(1_000_000))
     } else {

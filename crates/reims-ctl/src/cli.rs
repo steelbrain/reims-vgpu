@@ -278,7 +278,8 @@ pub struct CreateArgs {
     /// An existing disk image
     #[arg(long, conflicts_with = "disk_size")]
     pub disk: Option<PathBuf>,
-    /// How an existing disk is used: copy (a reflink or clone where it can) or in-place
+    /// How an existing disk is used: copy (instant, a reflink, where the disk and the VM's
+    /// directory are on one file system that makes them, else a full copy) or in-place
     #[arg(long, default_value = "copy")]
     pub disk_mode: String,
     /// Download this macOS from Apple to install: a name (tahoe), a number (26) or latest; with

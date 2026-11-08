@@ -77,13 +77,15 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    `~/.local/share/reims-ctl/installers` (delete them there to get the space back, once your VMs'
    installers are ejected), and an interrupted one picks up where it stopped.
 
-   Already have macOS on a disk? `--disk` uses it (copied, reflinked where the file system can, or
-   in place). Where the OpenCore image it booted with sits beside it as `opencore.qcow2`, as in
-   a VM's folder, the VM's new image presents that same Mac; `--opencore` copies an image of
-   yours instead, with OVMF beside it, which keeps its Mac too. With neither, or when you copy the
-   disk of one of your reims-ctl VMs, which can then run beside it, the VM is a new Mac to that
-   macOS, so it opens Setup Assistant once at its first boot; finish it in the window, since it
-   won't shut down until you do. `--installer` takes an installer of your own.
+   Already have macOS on a disk? `--disk` uses it, copied or in place. The copy is instant where the
+   disk and the VM's folder are on one file system that makes reflinks, such as btrfs or XFS;
+   otherwise reims-ctl copies it in full, and says so, with its size, before it starts. Where the
+   OpenCore image it booted with sits beside it as `opencore.qcow2`, as in a VM's folder, the VM's
+   new image presents that same Mac; `--opencore` copies an image of yours instead, with OVMF beside
+   it, which keeps its Mac too. With neither, or when you copy the disk of one of your reims-ctl
+   VMs, which can then run beside it, the VM is a new Mac to that macOS, so it opens Setup Assistant
+   once at its first boot; finish it in the window, since it won't shut down until you do.
+   `--installer` takes an installer of your own.
 
 ### Day to day
 

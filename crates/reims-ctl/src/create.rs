@@ -1,17 +1,18 @@
 //! Making a VM: its directory, disks, firmware and `vm.toml`, then its registry entry.
 //!
-//! An x86-64 VM (`q35-x86_64`) boots OpenCore from an OpenCore image of its own, with its own
-//! OVMF code and variables: made for it by reims-util, holding the guest's kexts for
-//! reims-vgpu's own device where the VM is on it ([`reims_util::kext_args`]), and presenting the
-//! Mac an existing disk's macOS ran on where the image it booted from is beside it
-//! ([`disks_mac`]), or copies of an image given and the OVMF beside it ([`firmware_beside`]).
-//! Its disk is a new one or an existing one (copied, reflinked where the file system can, or used
-//! in place). A new disk needs an installer: one reims-util downloads from Apple (reims_util.rs),
-//! before the VM's directory is made, so a download stopped part way leaves no VM half made, or
-//! one given. An installer is used in place, except a DMG, which qemu-img converts to a raw image
-//! in the VM's directory ([`installer_media`]). A VM's settings name its graphics: reims-vgpu's
-//! own device unless the create chose another.
+//! An x86-64 VM (`q35-x86_64`) boots OpenCore from an OpenCore image of its own, with its own OVMF
+//! code and variables: made for it by reims-util, holding the guest's kexts for reims-vgpu's own
+//! device where the VM is on it ([`reims_util::kext_args`]), and presenting the Mac an existing
+//! disk's macOS ran on where the image it booted from is beside it ([`disks_mac`]), or copies of an
+//! image given and the OVMF beside it ([`firmware_beside`]). Its disk is a new one or an existing
+//! one, copied (a reflink where the file system can make one, else a full copy, which says so
+//! first: copy.rs) or used in place. A new disk needs an installer: one reims-util downloads from
+//! Apple (reims_util.rs), before the VM's directory is made, so a download stopped part way leaves
+//! no VM half made, or one given. An installer is used in place, except a DMG, which qemu-img
+//! converts to a raw image in the VM's directory ([`installer_media`]). A VM's settings name its
+//! graphics: reims-vgpu's own device unless the create chose another.
 
+use crate::copy;
 use crate::host::{Host, Profile};
 use crate::install;
 use crate::opencore::{self, Identity};
@@ -25,7 +26,9 @@ use std::process::Command;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportMode {
-    /// A copy in the VM's directory: reflinked (btrfs, XFS) or cloned (APFS) where it can be.
+    /// A copy in the VM's directory: a reflink (btrfs, XFS) or clone (APFS) where the image and
+    /// the directory are on one file system that makes them, else a full copy, which says so
+    /// first where it is long ([`copy`]).
     Copy,
     /// The image itself.
     InPlace,
@@ -313,38 +316,6 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Copies `src` to `dst`: a clone on APFS, a reflink where Linux's file system can, else a
-/// sparse copy.
-pub fn copy_file(src: &Path, dst: &Path) -> Result<()> {
-    let ok = if cfg!(target_os = "macos") {
-        Command::new("cp")
-            .arg("-c")
-            .arg(src)
-            .arg(dst)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-            || Command::new("cp")
-                .arg(src)
-                .arg(dst)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-    } else {
-        Command::new("cp")
-            .args(["--reflink=auto", "--sparse=always"])
-            .arg(src)
-            .arg(dst)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    };
-    if !ok {
-        bail!("could not copy {} to {}", src.display(), dst.display());
-    }
-    Ok(())
-}
-
 fn qemu_img(profile: Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
     let img = install::qemu_img(profile)?;
     let out = Command::new(&img)
@@ -529,7 +500,7 @@ fn make_q35(
                     "img"
                 }
             );
-            copy_file(src, &dir.join(&name))?;
+            copy::file(src, &dir.join(&name), progress)?;
             (PathBuf::from(name), format)
         }
     };
@@ -537,8 +508,8 @@ fn make_q35(
     if let Some(src) = &spec.opencore {
         let (code, vars) = own_firmware(src)?;
         progress("copying the firmware");
-        copy_file(&code, &dir.join("OVMF_CODE.fd"))?;
-        copy_file(&vars, &dir.join("OVMF_VARS.fd"))?;
+        copy::file(&code, &dir.join("OVMF_CODE.fd"), progress)?;
+        copy::file(&vars, &dir.join("OVMF_VARS.fd"), progress)?;
     }
     // A read-only source's copy is read-only too; the variables are written.
     let _ = make_writable(&dir.join("OVMF_VARS.fd"));
@@ -589,17 +560,14 @@ fn import_disk(
     Ok(match mode {
         ImportMode::InPlace => (src, format),
         ImportMode::Copy => {
-            progress(&format!(
-                "copying {} (a reflink or clone where the file system can)",
-                file_name(&src)
-            ));
+            progress(&format!("copying {}", file_name(&src)));
             let ext = if format == ImageFormat::Qcow2 {
                 "qcow2"
             } else {
                 "img"
             };
             let name = format!("{stem}.{ext}");
-            copy_file(&src, &dir.join(&name))?;
+            copy::file(&src, &dir.join(&name), progress)?;
             let _ = make_writable(&dir.join(&name));
             (PathBuf::from(name), format)
         }

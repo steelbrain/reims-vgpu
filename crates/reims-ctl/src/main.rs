@@ -3,6 +3,7 @@
 //! interface.
 
 mod cli;
+mod copy;
 mod create;
 mod form;
 mod gpu;
