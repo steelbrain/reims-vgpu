@@ -5,6 +5,8 @@
 
 #include "RgfxCaps.hpp"
 
+#include "../../kext/src/RgfxUserClientABI.hpp"
+
 #include <algorithm>
 
 #include <cstring>
@@ -70,12 +72,12 @@ bool RgfxCaps::load(const RgfxDeviceInfo &info)
 	return true;
 }
 
-void RgfxCaps::takeFeatures(int kr, uint64_t word, uint64_t kext)
+bool RgfxCaps::takeFeatures(int kr, uint32_t count, const uint64_t words[3])
 {
-	constexpr uint64_t kOffered =
-	    RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_CB_SUBMITTED;
-	m_features = kr == 0 ? word : featuresLo() & kOffered;
-	m_kextFeatures = kr == 0 ? kext : 0;
+	const bool ours = kr == 0 && count == 3 && words[2] == kRgfxSelectorMap;
+	m_features = ours ? words[0] : 0;
+	m_kextFeatures = ours ? words[1] : 0;
+	return ours;
 }
 
 bool RgfxCaps::supportsFamily(int64_t family) const

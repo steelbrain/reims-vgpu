@@ -270,12 +270,13 @@ public:
 	uint64_t registryId() const { return m_info.registry_id; }
 	/// FEATURES_LO's low byte (RGFX_FEATURE_*), as the host wrote it; 0 from an older host.
 	uint8_t featuresLo() const { return m_valid ? m_info.features_lo : 0; }
-	/// Takes the kext's answer to the features call (the accelerator's Features selector): `kr`
-	/// its return, 0 for success, `word` the device's feature word and `kext` the kext's own. A
-	/// kext older than the call answers kIOReturnUnsupported; on that, or any failure, the device's
-	/// word is `featuresLo()`'s bits 0 to 2, the ones the host acts on as it offers them, and the
-	/// kext's is 0.
-	void takeFeatures(int kr, uint64_t word, uint64_t kext);
+	/// Takes the kext's answer to the features call (kRgfxAccelMethodFeatures): `kr` its return,
+	/// 0 for success, and the `count` words it gave: the device's feature word, the kext's own and
+	/// the kext's selector map. True where it gave all three and the map is this bundle's
+	/// (kRgfxSelectorMap); else both words are 0, and the bundle has no device: a kext of another
+	/// map numbers its calls otherwise, and one of the map before it answers kIOReturnUnsupported
+	/// here, its features call having had another number (RgfxUserClientABI.hpp).
+	bool takeFeatures(int kr, uint32_t count, const uint64_t words[3]);
 	/// The RGFX_FEATURE_* bits this process works by: bits 0 to 2 as the host offers them, and
 	/// from bit 3 the ones the kext took for its bundle (takeFeatures); 0 before takeFeatures.
 	uint64_t features() const { return m_features; }

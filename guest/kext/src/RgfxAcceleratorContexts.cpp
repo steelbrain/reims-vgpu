@@ -923,7 +923,8 @@ void RgfxAccelerator::parkClose(const void *client, int32_t late)
 
 // MARK: - Resource ids
 
-IOReturn RgfxAccelerator::takeIdChunk(const void *owner, UInt32 context, UInt64 *firstId)
+IOReturn RgfxAccelerator::takeIdChunk(const void *owner, UInt32 context, UInt64 *firstId,
+                                     UInt64 *ids)
 {
 	if (!contextLock)
 		return kIOReturnNotReady;
@@ -954,6 +955,7 @@ IOReturn RgfxAccelerator::takeIdChunk(const void *owner, UInt32 context, UInt64 
 		return r;
 	}
 	*firstId = g.firstId;
+	*ids = static_cast<UInt64>(g.units) * RGFX_RESOURCE_ID_SMALL_CHUNK;
 	return kIOReturnSuccess;
 }
 

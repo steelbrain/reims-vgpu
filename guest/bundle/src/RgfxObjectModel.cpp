@@ -47,11 +47,26 @@ uint64_t RgfxIdSpace::allocResourceId()
 	// Every id the process holds is in use: one more chunk. The source is called
 	// with the lock held, so two threads that run out at once take one chunk.
 	const uint64_t pool = uint64_t{RGFX_RESOURCE_ID_SMALL_CHUNKS} * RGFX_RESOURCE_ID_SMALL_CHUNK;
-	const uint64_t size = m_chunkIds;
+	uint64_t size = m_chunkIds;
 	uint64_t first = 0;
 	if (m_chunkSource != nullptr) {
-		if (!m_chunkSource(m_chunkSourceContext, &first))
+		uint64_t granted = 0;
+		if (!m_chunkSource(m_chunkSourceContext, &first, &granted))
 			return 0;
+		// The chunk holds the ids its grant says, whatever size this process took the
+		// device's features to give: a process whose features query a sandbox refused took
+		// chunks of 64 where the kext granted 16, and named ids no chunk of its held
+		// (measured: Safari's WebContent on macOS 12.7.6, BadResourceId at the host).
+		if (granted != 0) {
+			if (granted % RGFX_RESOURCE_ID_SMALL_CHUNK != 0 || granted > RGFX_RESOURCE_ID_CHUNK) {
+				os_log_error(OS_LOG_DEFAULT,
+				             "RGFX: a resource-id chunk of %llu ids from the kext is no chunk; "
+				             "no texture",
+				             (unsigned long long)granted);
+				return 0;
+			}
+			size = granted;
+		}
 	} else {
 		if ((uint64_t{m_nextLocalChunk} + 1) * size > pool)
 			return 0;

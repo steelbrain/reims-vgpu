@@ -54,10 +54,13 @@ static const RgfxObjId RGFX_OBJ_NONE = 0;
 class RgfxIdSpace {
 public:
 	/// A source of chunks of texture resource ids: it hands `*first_id`, the
-	/// first id of a chunk of the source's size (setResourceIdSource) the
-	/// process holds from now on (the accelerator kext's), or answers false
-	/// where none is left. Called with `context`.
-	typedef bool (*ResourceIdChunkFn)(void *context, uint64_t *first_id);
+	/// first id of a chunk the process holds from now on (the accelerator
+	/// kext's), and `*ids`, how many ids the chunk holds, or leaves `*ids` 0 for
+	/// a chunk of the source's size (setResourceIdSource); or it answers false
+	/// where none is left. Called with `context`. The grant's own size is the
+	/// chunk's, so a process names only the ids the kext granted it whatever it
+	/// took the device's features to be.
+	typedef bool (*ResourceIdChunkFn)(void *context, uint64_t *first_id, uint64_t *ids);
 
 	/// A space whose GPU addresses are the `address_span` bytes from
 	/// `address_base`. Object ids start at 1 (0 is [`RGFX_OBJ_NONE`]). Until a
@@ -79,9 +82,11 @@ public:
 	void freeResourceId(uint64_t id);
 
 	/// Where new chunks of texture resource ids come from from now on, each of
-	/// `chunk_ids` ids: RGFX_RESOURCE_ID_SMALL_CHUNK, or RGFX_RESOURCE_ID_CHUNK.
-	/// A chunk whose first id is not a multiple of its size past 1, or that
-	/// holds an id the process holds or one past the pool, is no chunk.
+	/// `chunk_ids` ids where the source does not say how many its chunk holds:
+	/// RGFX_RESOURCE_ID_SMALL_CHUNK, or RGFX_RESOURCE_ID_CHUNK. A chunk whose
+	/// first id is not a multiple of its size past 1, whose size is not whole
+	/// small chunks of at most RGFX_RESOURCE_ID_CHUNK ids, or that holds an id
+	/// the process holds or one past the pool, is no chunk.
 	void setResourceIdSource(ResourceIdChunkFn source, void *context,
 	                         uint64_t chunk_ids = RGFX_RESOURCE_ID_CHUNK);
 

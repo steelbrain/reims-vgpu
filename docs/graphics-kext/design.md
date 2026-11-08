@@ -885,19 +885,20 @@ only where no negotiation can carry it.
   (`INVALID_ARGUMENT`).
 - New ops and messages are decoded wherever the host offers their bit, as
   `RGFX_OP_SUBMITTED` is.
-- The accelerator answers its processes' `Features` call (selector 0x10f) with
-  two words: the device's, which they work by (bits 0-2 as offered, and from
-  bit 3 the bits taken), and the kext's own (below, "The accelerator's user
-  client"). `QueueCreate` (0x103) takes a seventh input, the flags the process
-  wants, and answers a second output, the flags granted: those whose feature
-  the device's word holds. A kext older than the call answers
-  `kIOReturnUnsupported`, and the bundle then works by the device info's
-  `features_lo` bits 0-2, with no kext feature.
+- The accelerator answers its processes' `Features` call (selector 3) with
+  three words: the device's, which they work by (bits 0-2 as offered, and from
+  bit 3 the bits taken), the kext's own, and the kext's selector map (below,
+  "The accelerator's user client"). `QueueCreate` (0x103) takes a seventh
+  input, the flags the process wants, and answers a second output, the flags
+  granted: those whose feature the device's word holds. A kext whose map is
+  not the bundle's, one of the map before it (whose `Features` was 0x10f)
+  among them, and a sandbox that refuses the call, leave the process with no
+  Metal device, logged: the bundle works by no guess at the words.
 - Bits 3-8 are named (`QUIET_SCHEDULED`, `CONSUMED_DOORBELL`, `QUEUE_BARRIER`,
   `CB_PARTS`, `PAGES_BUFFERS`, `QUEUE_VECTORS`; `wire.rs`), and bits 9-12 are
   reserved. Of them the host offers bit 7, `PAGES_BUFFERS`, where it offers
   `SURFACE_PAGES`, and the kext takes it: a process's no-copy buffers lie over
-  its own pages, wired by the kext in a pages block (selector 0x10e, "The
+  its own pages, wired by the kext in a pages block (selector 4, "The
   accelerator's user client"; `BUFFER_OVER_PAGES`). No host offers the others
   yet, the kext takes none of them, and the host carries out none of their
   queue flags: each lands with its feature, which says what it changes.
@@ -1769,7 +1770,7 @@ plane 0, which a process presents through its own CPU mapping of the plane
 block, whatever id it claims. The kext wires those pages while the process holds the block,
 posts `BLOCK_SHARE` (context, offset, size) for each holder before the process
 learns of the block, and `BLOCK_UNSHARE` as a holder other than the last lets
-it go (selector 0x10a, or its close). The last holder's let-go frees the block
+it go (selector 8, or its close). The last holder's let-go frees the block
 as a free does, and its `BLOCK_RELEASE` ends every hold; a cached block in
 place instead sleeps, its last holder's `BLOCK_UNSHARE` posted, until an ask of
 its surface holds it again with a `BLOCK_SHARE` alone or the kext lets it go
@@ -1795,7 +1796,7 @@ A command buffer that writes surfaces' shared blocks is named to the kext
 after it is posted and before its commit returns (selector 0x10c: the queue,
 the buffer's seqno, and a pair of the block's offset and the surface's
 IOSurfaceID for each surface), and its completion retires the queue's writes
-up to it once any copy is written back (selector 0x10d). Only a holder of a
+up to it once any copy is written back (selector 9). Only a holder of a
 block names it, only for one of its own queues, and the kext keeps a block's
 surface only where the surface's memory holds the block's pages, so no
 process makes another's locks wait (§14, "CPU locks").
@@ -2389,10 +2390,10 @@ event that gave it is gone, while the port is held.
   in `com.apple.kpi.private` alone), so the bundle opens a connection of its own
   type on the accelerator for each event it hands out
   (`RgfxSharedEventUserClient`, user-client type 'RGSE'), and its send right is
-  the event's `eventPort`. Its `Export` (0x113) has the kext name the event
+  the event's `eventPort`. Its `Export` (10) has the kext name the event
   device-wide: `SHARED_EVENT_NAME`, a name from 1 the kext never gives again,
   answered `COMPLETE`; the kext answers the bundle only then, so an import that
-  follows finds the name. Its `Import` (0x114), by any process that holds the
+  follows finds the name. Its `Import` (11), by any process that holds the
   port, has the kext make the caller's new event of the name:
   `SHARED_EVENT_IMPORT`, answered `SHARED_EVENT_VALUE` with the host event's
   value, which the new event starts at. A call on the port proves the caller
@@ -3235,42 +3236,72 @@ the bundle's wire handshake opens them with `IOServiceOpen` /
 `IOConnectCallStructMethod` / `IOConnectCallScalarMethod`.
 
 **The accelerator's user client: its numbers.** This table gives out every
-number of the 'RGFX' user client. A new selector takes the next free number
-here first. A selector or a flag that a kext may lack gets a kext feature bit,
-which the kext sets in the second word `Features` answers once it carries it
-out, and the bundle uses it only where that word holds the bit. The numbers
-and the kext feature bits are in `guest/kext/src/RgfxUserClientABI.hpp`, which
-the kext and the bundle include.
+number of the 'RGFX' user client and of a shared event's port. A new selector
+takes the next free number here first, among the numbers below. A selector or
+a flag that a kext may lack gets a kext feature bit, which the kext sets in
+the second word `Features` answers once it carries it out, and the bundle uses
+it only where that word holds the bit. The numbers and the kext feature bits
+are in `guest/kext/src/RgfxUserClientABI.hpp`, which the kext and the bundle
+include.
+
+Every number is one that every WebKit web-content sandbox lets its process
+call on an IOAccelerator connection, on every release from 11 to 26. WebKit's
+web-content profile (`com.apple.WebProcess.sb`, its
+`IOAcceleratorMessageFilter`) lists numbers on macOS 12 alone and refuses any
+other there before the kext sees it: from Safari 15.1 to 17.6 (WebKit 612.2 to
+7618.3) every list holds 0-13, 15-18, 22-24, 28-31, 40, 42, 48, 256-265, 267,
+268 and 512, the numbers Apple's own drivers take (17.6's adds 41, 43, 46, 49,
+266, 269 and 513). On macOS 11 and from 13 on it lists none, and allows every
+number; its asynchronous methods (0 and 47 on 12) and traps the bundle makes
+none of. Read from WebKit's source at each release branch, and on 11.7.11,
+12.7.6 and 13.7.8 guests. `user_client_words_test` holds the set, checks every
+number here against it, and checks that every `IOConnectCall*Method` in the
+bundle's sources names one of these selectors.
+
+The numbers move only with the set: the bundle and the kext ship together. A
+move takes the next selector map number (`kRgfxSelectorMap`), which `Features`
+answers third, at a number it keeps in every map. A bundle whose map is not
+the kext's has no Metal device in its process, logged, rather than call a
+number that means another call there. Map 0, before the number, had
+`SurfaceBlockRelease` at 0x10a, `SurfaceRetire` at 0x10d, `PagesBlock` at
+0x10e, `Features` at 0x10f, `TakeAnswers` at 0x112 and the port's selectors at
+0x113 and 0x114, outside the numbers above: macOS 12's web content process
+could not call `Features`, took 64-id chunks where the kext granted 16, and had
+its textures past each chunk's first 16 ids refused (`BadResourceId`). A kext of map 1 gives
+none of those numbers a meaning, so a bundle of map 0 is refused at each.
+
+Map 1:
 
 | number | name | kext feature bit | what |
 |---|---|---|---|
-| doorbell 0 | `Doorbell` | | writes a ring's id to `DOORBELL` |
-| doorbell 1 | `Consumed` | 1 << 3 `ConsumedDoorbell` | reserved: a completion ring's room doorbell (`CONSUMED`) |
+| 0 | `Doorbell` | | writes a ring's id to `DOORBELL` |
+| 1 | `Consumed` | 1 << 3 `ConsumedDoorbell` | reserved: a completion ring's room doorbell (`CONSUMED`) |
+| 2 | | | given to none: the IOGPU base's device-info call on its own client type, so a trace names one call per number |
+| 3 | `Features` | | the device's feature word, the kext's and the selector map; at 3 in every map |
+| 4 | `PagesBlock` | 1 << 0 `PagesBlock` | a block of the runs of a process's own pages, wired, for its no-copy buffers |
+| 5 | `SubmitBatch` | 1 << 1 `SubmitBatch` | reserved: lifecycle messages in one call |
+| 6 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
+| 7 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
+| 8 | `SurfaceBlockRelease` | | lets go of a shared block |
+| 9 | `SurfaceRetire` | | a queue's writes up to a seqno retire |
+| 10 | `Export`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | names the caller's shared event for other processes ("Shared events across processes") |
+| 11 | `Import`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | makes the caller's new shared event of the one the port names |
 | 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output) | the context and its window; five outputs, or six with its GPU addresses' span |
 | 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
 | 0x102 | `Free` | | frees a block |
 | 0x103 | `QueueCreate` | | a command queue; 6 inputs, or 7 with the flags wanted |
 | 0x104 | `QueueDestroy` | | closes a queue |
 | 0x105 | `Submit` | 1 << 4 `DeferredAnswers` (its deferred flag) | one lifecycle message onto ring 0 |
-| 0x106 | `ResourceIds` | | a chunk of texture resource ids |
+| 0x106 | `ResourceIds` | | a chunk of texture resource ids, and with a second output its size |
 | 0x107 | `WaitCompletions` | | waits for the client's completions |
 | 0x108 | `SurfaceScanout` | | the scanout an IOAccel surface is drawn into |
 | 0x109 | `SurfaceBlock` | | an IOSurface plane's shared block |
-| 0x10a | `SurfaceBlockRelease` | | lets go of a shared block |
 | 0x10b | `DeviceInfo` | | the device info and video caps |
 | 0x10c | `SurfaceWrites` | | the surfaces a command buffer writes |
-| 0x10d | `SurfaceRetire` | | a queue's writes up to a seqno retire |
-| 0x10e | `PagesBlock` | 1 << 0 `PagesBlock` | a block of the runs of a process's own pages, wired, for its no-copy buffers |
-| 0x10f | `Features` | | the device's feature word and the kext's |
-| 0x110 | `SubmitBatch` | 1 << 1 `SubmitBatch` | reserved: lifecycle messages in one call |
-| 0x111 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
-| 0x112 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
-| 0x113 | `Export`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | names the caller's shared event for other processes ("Shared events across processes") |
-| 0x114 | `Import`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | makes the caller's new shared event of the one the port names |
 
 A shared event's port is a connection of a second type, 'RGSE' (0x52475345), on
-the accelerator, which the bundle opens for each event it hands out: 0x113 and
-0x114 are its own selectors, numbered past the accelerator's own so that a call
+the accelerator, which the bundle opens for each event it hands out: 10 and 11
+are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
 The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents` and 1 << 7 `WriteCombined`; no other bit yet.

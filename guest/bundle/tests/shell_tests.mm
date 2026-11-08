@@ -2700,7 +2700,7 @@ void test_texture_routing()
 
 // One chunk of texture resource ids (ids 1 + 4 * 64 to 64 + 4 * 64), as the kext would hand
 // it, and none after it.
-bool oneChunk(void *context, uint64_t *first_id)
+bool oneChunk(void *context, uint64_t *first_id, uint64_t *ids)
 {
 	int *calls = static_cast<int *>(context);
 	if ((*calls)++ != 0)

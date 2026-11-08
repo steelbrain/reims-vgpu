@@ -151,7 +151,7 @@ bool rgfxKextAwaitAnswer(void *context, uint64_t seqno)
 }
 
 // Whether the kext keeps a deferred pipeline create's answer for later: its feature word
-// (Features, 0x10f) has kRgfxKextFeatureDeferredAnswers. An older kext's word is 0.
+// (kRgfxAccelMethodFeatures) has kRgfxKextFeatureDeferredAnswers.
 bool rgfxKextDefersAnswers(const RgfxCaps &caps)
 {
 	return (caps.kextFeatures() & kRgfxKextFeatureDeferredAnswers) != 0;
@@ -240,12 +240,18 @@ bool rgfxRegionReclaim(void *context)
 
 // The kext's chunks of texture resource ids, as RgfxIdSpace's chunk source; `context` is the
 // user client's connect. False once every chunk of the guest's pool is held.
-bool rgfxKextResourceIds(void *context, uint64_t *first_id)
+bool rgfxKextResourceIds(void *context, uint64_t *first_id, uint64_t *ids)
 {
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
-	uint32_t outCount = 1;
-	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodResourceIds, nullptr, 0, first_id,
-	                                 &outCount) == KERN_SUCCESS;
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	if (IOConnectCallScalarMethod(conn, kRgfxAccelMethodResourceIds, nullptr, 0, out,
+	                              &outCount) != KERN_SUCCESS ||
+	    outCount != 2)
+		return false;
+	*first_id = out[0];
+	*ids = out[1];
+	return true;
 }
 
 // The completion thread's wait: the kext returns once a completion ring of the process's holds
@@ -600,7 +606,12 @@ RGFX_LOG_UNRECOGNIZED
 {
 	self = [super initWithAcceleratorPort:port];
 	if (self == nil) {
-		return nil; // Apple's base declined (or the port is not ours)
+		// Apple's IOGPU base declined the accelerator: its own device calls (RgfxIOGPUReplies.hpp)
+		// failed in this process, or its sandbox refused them.
+		os_log_error(OS_LOG_DEFAULT,
+		             "RGFX: the IOGPU base declined the accelerator; no Metal device in this "
+		             "process");
+		return nil;
 	}
 	_acceleratorPort = port;
 	_conn = IO_OBJECT_NULL;
@@ -610,60 +621,75 @@ RGFX_LOG_UNRECOGNIZED
 	_mapBase = 0;
 	_mapSize = 0;
 
-	// Wire transport handshake: open our own user client on the accelerator, read the caps blob
-	// the host wrote, open the process's context, whose window is where its part of the device
-	// region (BAR 2) lies in this task, and build the region allocator over the window and the
-	// device submission ring (RgfxSerializer) + device completion ring (RgfxReplyReader). With
-	// these non-null the resource / command-queue / command-buffer categories route over our
-	// wire instead of falling back to the IOGPUMetalDevice base (Apple's IOGPU kernel ABI). Any
-	// failure leaves the transport stubbed (the getters answer from defaults) rather than
-	// crashing.
+	// Wire transport handshake: open our own user client on the accelerator, take the kext's
+	// features and selector map, read the caps blob the host wrote, open the process's context,
+	// whose window is where its part of the device region (BAR 2) lies in this task, and build the
+	// region allocator over the window and the device submission ring (RgfxSerializer) + device
+	// completion ring (RgfxReplyReader); the resource / command-queue / command-buffer categories
+	// route over our wire. A step that fails refuses the device, logged: the process has no Metal
+	// device, the answer every Metal client handles, where a device that works by guesses fails
+	// later and elsewhere (a texture's id the kext never granted, a call another kext numbers
+	// otherwise).
 	kern_return_t kr = IOServiceOpen(port, mach_task_self(), kRgfxAccelUserClientType, &_conn);
 	if (kr != KERN_SUCCESS) {
 		os_log_error(OS_LOG_DEFAULT,
-		             "RGFX: IOServiceOpen(type=%u) failed kr=0x%x; transport stubbed",
+		             "RGFX: IOServiceOpen(type=%u) failed kr=0x%x; no Metal device in this "
+		             "process",
 		             kRgfxAccelUserClientType, kr);
-		return self;
+		_conn = IO_OBJECT_NULL;
+		return nil;
+	}
+
+	// The device's feature word, the kext's own and the kext's selector map, first: a kext of
+	// another map, or a sandbox that refuses the call, leaves no number of this bundle's sure to
+	// mean its call there (RgfxUserClientABI.hpp).
+	uint64_t features[3] = {};
+	uint32_t featuresCount = 3;
+	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodFeatures, nullptr, 0, features,
+	                               &featuresCount);
+	if (!_caps.takeFeatures(kr, featuresCount, features)) {
+		os_log_error(OS_LOG_DEFAULT,
+		             "RGFX: the features call (selector %u) answered kr=0x%x, %u words, selector "
+		             "map %llu, where this bundle's map is %u: a kext of another selector map, or "
+		             "a sandbox that refuses the call; no Metal device in this process",
+		             (unsigned)kRgfxAccelMethodFeatures, kr, featuresCount,
+		             (unsigned long long)features[2], (unsigned)kRgfxSelectorMap);
+		IOServiceClose(_conn);
+		_conn = IO_OBJECT_NULL;
+		return nil;
 	}
 
 	// The caps blob the host wrote (read once at init), which the kext reads for us: its page
-	// is no process's to map.
-	// The video caps follow it, where the kext reads them too; a kext older than them reads the
-	// device info alone, and the device then has no video codec.
+	// is no process's to map. The video caps follow it; where the host wrote them in another
+	// version, the device has no video codec.
 	struct {
 		RgfxDeviceInfo info;
 		RgfxVideoCaps video;
 	} blob = {};
 	static_assert(offsetof(decltype(blob), video) == sizeof(RgfxDeviceInfo), "no padding");
-	RgfxDeviceInfo &info = blob.info;
 	size_t infoSize = sizeof(blob);
 	kr = IOConnectCallStructMethod(_conn, kRgfxAccelMethodDeviceInfo, nullptr, 0, &blob,
 	                               &infoSize);
-	if (kr != KERN_SUCCESS) {
-		blob = {};
-		infoSize = sizeof(info);
-		kr = IOConnectCallStructMethod(_conn, kRgfxAccelMethodDeviceInfo, nullptr, 0, &info,
-		                               &infoSize);
-	} else if (infoSize == sizeof(blob) && blob.video.version == RGFX_VIDEO_CAPS_VERSION) {
+	if (kr != KERN_SUCCESS || infoSize != sizeof(blob) || !_caps.load(blob.info)) {
+		os_log_error(OS_LOG_DEFAULT,
+		             "RGFX: the device info was not read (kr=0x%x, %zu of %zu bytes) or is of "
+		             "version %u, where this bundle reads %u; no Metal device in this process",
+		             kr, infoSize, sizeof(blob), (unsigned)blob.info.version,
+		             (unsigned)RGFX_DEVICE_INFO_VERSION);
+		IOServiceClose(_conn);
+		_conn = IO_OBJECT_NULL;
+		return nil;
+	}
+	if (blob.video.version == RGFX_VIDEO_CAPS_VERSION) {
 		_videoCaps = blob.video;
 		if (_videoCaps.codec_count > RGFX_VIDEO_CAPS_CODECS)
 			_videoCaps.codec_count = RGFX_VIDEO_CAPS_CODECS;
-		infoSize = sizeof(info);
 	} else {
-		infoSize = sizeof(info);
-	}
-	if (kr != KERN_SUCCESS || infoSize != sizeof(info) || !_caps.load(info))
 		os_log_error(OS_LOG_DEFAULT,
-		             "RGFX: caps blob not read (kr=0x%x) or invalid; using defaults", kr);
-	// The device's feature word and the kext's own, from the kext; a kext older than the call
-	// leaves the blob's bits 0 to 2 and no kext feature (RgfxCaps::takeFeatures).
-	uint64_t features[2] = {};
-	uint32_t featuresCount = 2;
-	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodFeatures, nullptr, 0, features,
-	                               &featuresCount);
-	if (kr == KERN_SUCCESS && featuresCount != 2)
-		kr = kIOReturnBadArgument;
-	_caps.takeFeatures(kr, features[0], features[1]);
+		             "RGFX: the host's video caps are of version %u, where this bundle reads %u; "
+		             "this process's device has no video codec",
+		             (unsigned)blob.video.version, (unsigned)RGFX_VIDEO_CAPS_VERSION);
+	}
 	// Where the host orders command buffers of different queues over the surfaces they share,
 	// this process names each one's order (rgfxIOSurfaceNameOrder).
 	rgfxIOSurfaceSetOrder((_caps.features() & RGFX_FEATURE_SURFACE_ORDER) != 0);
@@ -694,12 +720,12 @@ RGFX_LOG_UNRECOGNIZED
 	if (kr != KERN_SUCCESS || ctxCount != ctxWanted || ctx[3] == 0 ||
 	    ctx[4] < RGFX_ALLOCATIONS_OFFSET || ctx[5] == 0) {
 		os_log_error(OS_LOG_DEFAULT,
-		             "RGFX: OPEN_CONTEXT failed kr=0x%x (window 0x%llx, %llu bytes); transport "
-		             "stubbed",
+		             "RGFX: OPEN_CONTEXT failed kr=0x%x (window 0x%llx, %llu bytes); no Metal "
+		             "device in this process",
 		             kr, (unsigned long long)ctx[3], (unsigned long long)ctx[4]);
 		IOServiceClose(_conn);
 		_conn = IO_OBJECT_NULL;
-		return self;
+		return nil;
 	}
 	const mach_vm_address_t addr = ctx[3];
 	const mach_vm_size_t mapSize = ctx[4];

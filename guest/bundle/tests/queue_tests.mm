@@ -930,7 +930,7 @@ struct Blocks {
 };
 
 // The process's one chunk of resource ids, for the textures a test makes.
-bool oneIdChunk(void *context, uint64_t *first)
+bool oneIdChunk(void *context, uint64_t *first, uint64_t *ids)
 {
 	int *calls = static_cast<int *>(context);
 	if ((*calls)++ != 0)

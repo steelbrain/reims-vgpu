@@ -96,15 +96,19 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	case kRgfxAccelMethodDeviceInfo:
 		return deviceInfoMethod(a);
 	case kRgfxAccelMethodResourceIds: {
-		if (a->scalarOutputCount != 1)
+		// The chunk's first id, and, where asked, how many ids it holds.
+		if (a->scalarOutputCount != 1 && a->scalarOutputCount != 2)
 			return kIOReturnBadArgument;
 		// An ask, so a chunk is never taken for a context releaseContext has closed: no grant
 		// follows its CONTEXT_CLOSE, and no chunk outlives its freeIdChunks.
 		UInt32 ctx = 0;
 		Ask ask = {this, beginAsk(&ctx)};
-		UInt64 first = 0;
-		IOReturn r = ask.begun ? owner->takeIdChunk(this, ctx, &first) : kIOReturnBadArgument;
+		UInt64 first = 0, ids = 0;
+		IOReturn r =
+		    ask.begun ? owner->takeIdChunk(this, ctx, &first, &ids) : kIOReturnBadArgument;
 		out[0] = first;
+		if (a->scalarOutputCount == 2)
+			out[1] = ids;
 		return r;
 	}
 	case kRgfxAccelMethodAlloc: {
@@ -311,10 +315,11 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		owner->retireSurfaceWrites(in[0], in[1]);
 		return kIOReturnSuccess;
 	case kRgfxAccelMethodFeatures:
-		if (a->scalarInputCount != 0 || a->scalarOutputCount != 2)
+		if (a->scalarInputCount != 0 || a->scalarOutputCount != 3)
 			return kIOReturnBadArgument;
 		out[0] = owner->featureWord();
 		out[1] = kRgfxKextFeatureWord;
+		out[2] = kRgfxSelectorMap;
 		return kIOReturnSuccess;
 	default:
 		return kIOReturnUnsupported;

@@ -22,6 +22,7 @@
 #include "RgfxArgumentLayout.hpp"
 #include "RgfxBinaryArchiveFile.hpp"
 #include "RgfxCaps.hpp"
+#include "../../kext/src/RgfxUserClientABI.hpp"
 #include <utility>
 #include "RgfxEncoder.hpp"
 #include "RgfxFeatureProfile.hpp"
@@ -169,22 +170,84 @@ void test_address_picks()
 	CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
 }
 
-// A chunk source standing in for the kext: it hands each first id of `firsts` in turn, then
-// answers none left, and counts its calls (the user-client calls a create would make).
+// A chunk source standing in for the kext: it hands each first id of `firsts` in turn, with
+// the grant's size from `sizes` where it holds one for it (else none, the space's own size),
+// then answers none left, and counts its calls (the user-client calls a create would make).
 struct FakeChunks {
 	std::vector<uint64_t> firsts;
+	std::vector<uint64_t> sizes;
 	size_t next = 0;
 	int calls = 0;
 };
 
-bool fakeChunk(void *context, uint64_t *first_id)
+bool fakeChunk(void *context, uint64_t *first_id, uint64_t *ids)
 {
 	FakeChunks *f = static_cast<FakeChunks *>(context);
 	f->calls++;
 	if (f->next == f->firsts.size())
 		return false;
+	if (f->next < f->sizes.size())
+		*ids = f->sizes[f->next];
 	*first_id = f->firsts[f->next++];
 	return true;
+}
+
+// The kext's grant says how many ids its chunk holds, and the space takes that many, whatever
+// size it was set up for: a process whose features query a sandbox refused set chunks of 64
+// up, while the kext granted 16 (Safari's WebContent on macOS 12.7.6), and named ids past its
+// chunk that the device refused.
+void test_resource_id_chunk_size_is_the_grant_s()
+{
+	const uint64_t small = RGFX_RESOURCE_ID_SMALL_CHUNK;
+	const uint64_t chunk = RGFX_RESOURCE_ID_CHUNK;
+
+	// Set up for chunks of 64; the kext grants small chunk 29 (ids 465 to 480), then small
+	// chunk 3 (ids 49 to 64): 16 ids each, and the 17th id takes the next grant.
+	FakeChunks f;
+	f.firsts = {1 + 29 * small, 1 + 3 * small};
+	f.sizes = {small, small};
+	RgfxIdSpace ids;
+	ids.setResourceIdSource(&fakeChunk, &f, chunk);
+	for (uint64_t id = 465; id <= 480; id++)
+		CHECK(ids.allocResourceId() == id);
+	CHECK(f.calls == 1);
+	CHECK(ids.allocResourceId() == 49);
+	CHECK(f.calls == 2);
+	for (uint64_t id = 50; id <= 64; id++)
+		CHECK(ids.allocResourceId() == id);
+	CHECK(ids.allocResourceId() == 0);
+	CHECK(f.calls == 3);
+	// Ids next to the grants, which a chunk of 64 would have held, are no chunk's.
+	ids.freeResourceId(481);
+	ids.freeResourceId(65);
+	CHECK(ids.allocResourceId() == 0);
+
+	// Set up for small chunks; the kext grants a chunk of 64 (ids 129 to 192): all 64 are the
+	// process's.
+	FakeChunks big;
+	big.firsts = {1 + 2 * chunk};
+	big.sizes = {chunk};
+	RgfxIdSpace bigIds;
+	bigIds.setResourceIdSource(&fakeChunk, &big, small);
+	for (uint64_t id = 129; id <= 192; id++)
+		CHECK(bigIds.allocResourceId() == id);
+	CHECK(big.calls == 1);
+
+	// A grant of a size that is not whole small chunks, or more than a chunk, is no chunk; one
+	// whose first id is not a multiple of its own size past 1 is none either; one of 32 at a
+	// multiple of 32 is two small chunks.
+	FakeChunks bad;
+	bad.firsts = {1 + 2 * small, 1 + 2 * chunk, 1 + small, 1 + 2 * small};
+	bad.sizes = {small + 1, 2 * chunk, 2 * small, 2 * small};
+	RgfxIdSpace badIds;
+	badIds.setResourceIdSource(&fakeChunk, &bad, chunk);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(badIds.allocResourceId() == 0);
+	for (uint64_t id = 33; id <= 64; id++)
+		CHECK(badIds.allocResourceId() == id);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(bad.calls == 5);
 }
 
 // The kext's small chunks (RGFX_FEATURE_SMALL_ID_CHUNKS): 16 ids each, from the same pool as
@@ -402,32 +465,41 @@ static_assert(offsetof(RgfxDeviceInfo, features_lo) == 0x451 &&
                   offsetof(RgfxDeviceInfo, sampler_reduction_support) == 0x452,
               "the device info's feature and reduction bytes");
 
-// The feature words: the kext's where it answers the call, and where it answers
-// kIOReturnUnsupported (a kext older than the call) or fails otherwise, the blob's bits 0 to 2
-// and no kext feature.
+// The features call's answer: taken where the kext gave its three words and its selector map is
+// this bundle's, as they are, bits from 3 and 32 among them; refused, with both words 0, where it
+// answered kIOReturnUnsupported (a kext of the map before, whose features call had another
+// number), failed otherwise, gave fewer words, or named another map. The device info's offered
+// bits stand in for none of them.
 void test_caps_features()
 {
 	RgfxCaps caps;
-	caps.takeFeatures(kIOReturnUnsupported, 0, 0);
-	CHECK(caps.features() == 0 && caps.kextFeatures() == 0); // no blob: nothing
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0); // nothing before the call
+	const uint64_t word = RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_CB_PARTS | (1ull << 40);
+	const uint64_t ours[3] = {word, 1ull << 4, kRgfxSelectorMap};
+	CHECK(caps.takeFeatures(KERN_SUCCESS, 3, ours));
+	CHECK(caps.features() == word && caps.kextFeatures() == 1ull << 4);
+
+	CHECK(!caps.takeFeatures(kIOReturnUnsupported, 3, ours));
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
+	CHECK(caps.takeFeatures(KERN_SUCCESS, 3, ours));
+	CHECK(!caps.takeFeatures(kIOReturnBadArgument, 3, ours));
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
+	CHECK(!caps.takeFeatures(KERN_SUCCESS, 2, ours));
+	const uint64_t before[3] = {word, 1ull << 4, kRgfxSelectorMap - 1};
+	const uint64_t after[3] = {word, 1ull << 4, kRgfxSelectorMap + 1};
+	CHECK(!caps.takeFeatures(KERN_SUCCESS, 3, before));
+	CHECK(!caps.takeFeatures(KERN_SUCCESS, 3, after));
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
 
 	RgfxDeviceInfo info = {};
 	info.version = RGFX_DEVICE_INFO_VERSION;
 	info.features_lo = RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED |
-	                   RGFX_FEATURE_QUIET_SCHEDULED; // bit 3 offered, but taken by no kext
+	                   RGFX_FEATURE_QUIET_SCHEDULED;
 	CHECK(caps.load(info));
-	CHECK(caps.features() == 0); // nothing before the probe
-	caps.takeFeatures(kIOReturnUnsupported, 0xffff, 0x1f);
-	CHECK(caps.features() == (RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED));
-	CHECK(caps.kextFeatures() == 0);
-	caps.takeFeatures(kIOReturnBadArgument, 0xffff, 0x1f);
-	CHECK(caps.features() == (RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED));
-	CHECK(caps.kextFeatures() == 0);
-	// A kext that answers gives both words as they are, bits from 3 and 32 among them.
-	const uint64_t word = RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_CB_PARTS | (1ull << 40);
-	caps.takeFeatures(KERN_SUCCESS, word, 1ull << 4);
-	CHECK(caps.features() == word && caps.kextFeatures() == 1ull << 4);
-	caps.takeFeatures(KERN_SUCCESS, 0, 0);
+	CHECK(!caps.takeFeatures(kIOReturnUnsupported, 0, ours));
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
+	const uint64_t none[3] = {0, 0, kRgfxSelectorMap};
+	CHECK(caps.takeFeatures(KERN_SUCCESS, 3, none));
 	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
 }
 
@@ -2964,6 +3036,7 @@ int main()
 	test_address_picks();
 	test_resource_id_chunks();
 	test_small_resource_id_chunks();
+	test_resource_id_chunk_size_is_the_grant_s();
 	test_caps();
 	test_spi_features();
 	test_family_names();
