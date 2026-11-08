@@ -162,7 +162,7 @@ reims-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  QEMU
   gestures' phases), `policy` (the modes and density offered for a host screen) and `env` (the
   `REIMS_VGPU_WINDOW_*` variables). `handle.rs` is the `Window` the device holds, `Send` and `Sync`
   with no AppKit object in it, and `FrameSink`, the trait it draws through; `present.rs` the
-  presenter both OSes' render threads draw through on the Vulkan platform.
+  presenter both OSes' render threads draw through.
   - **On macOS** (`native/macos/`) the AppKit side runs on the main thread (7.3), its state in
     statics only that thread reaches (`main_thread::MainOnly`): `main_thread.rs` posts work to the
     main run loop in order, and the application's start, alone; `app.rs` is the application, its
@@ -492,10 +492,9 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   never posts to the main dispatch queue (`main_thread.rs`'s doc has the measurement).
 - A render thread per window (`reims-vgpu.window`, 512 KiB, started by the platform), from the
   window's attach. It waits on the window's surface for a new frame, a new layout or the window
-  showing again, and draws only while the window is at least partly visible: into the layer's next
-  drawable on Metal, or the swapchain's next image on the Vulkan platform, through the window's
-  sink (10). The drawable or the image is its pacing. The thread ends at the window's end, and
-  nothing joins it.
+  showing again, and draws only while the window is at least partly visible: into the swapchain's
+  next image, through the window's sink (10). The image is its pacing. The thread ends at the
+  window's end, and nothing joins it.
 - On Linux, in place of the main thread, the library's UI thread (`reims-vgpu.ui`, 1 MiB), started
   with the first window or the first look at the host's screens, where SDL's video is initialized
   and every SDL call but a render thread's Vulkan surface is made: the window's opening, changes and

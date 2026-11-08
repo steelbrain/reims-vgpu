@@ -1,7 +1,6 @@
 //! A graphics display's window sink on the Vulkan platform, on either OS: [`VulkanScanoutSink`]
 //! makes a presenter over a swapchain of the window's surface, and each draw blits the scanout
-//! into the swapchain's next image (its usage takes transfers) and presents it. What each OS's
-//! window asks of the sink is its own (`linux.rs`, `macos.rs`).
+//! into the swapchain's next image (its usage takes transfers) and presents it.
 
 use std::sync::Arc;
 
@@ -16,11 +15,6 @@ use super::sink::ScanoutDraw;
 use super::{Presented, Shown};
 use crate::entry;
 use crate::entry::no_catch;
-
-#[cfg(target_os = "linux")]
-mod linux;
-#[cfg(target_os = "macos")]
-mod macos;
 
 /// The sink of a graphics display on the Vulkan platform, over `region`; `None` where the
 /// runtime refuses a queue.
@@ -42,10 +36,10 @@ pub(super) struct VulkanScanoutSink {
     draw: Arc<ScanoutDraw<VulkanPlatform>>,
 }
 
-impl VulkanScanoutSink {
+impl FrameSink for VulkanScanoutSink {
     /// The window's surface on the runtime's instance and a swapchain over it, on the sink's
     /// queue's device; none where either is refused, which is logged.
-    fn make_presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>> {
+    fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>> {
         // SAFETY: the target makes the surface on the instance it is given, and hands it over.
         let made = entry::run(|_| unsafe {
             Swapchain::over(&self.draw.queue, |get_instance_proc_addr, instance| {

@@ -3,11 +3,10 @@
 //! guest's cursor over the image. Main thread only.
 //!
 //! **The layer.** The view is layer-hosting: its `CAMetalLayer` is set before the view wants a
-//! layer, so AppKit never draws into it. The layer draws with the Metal device the window's sink
-//! gives, in BGRA8, tagged sRGB (with no colour space, Core Animation shows the pixels in the
-//! screen's own gamut, oversaturated on a P3 screen), opaque on black, at the window's backing
-//! scale. Its drawables are framebuffer-only, but for a sink that copies frames into them
-//! ([`crate::FrameSink::render_target_only`]).
+//! layer, so AppKit never draws into it. The layer is BGRA8, tagged sRGB (with no colour space,
+//! Core Animation shows the pixels in the screen's own gamut, oversaturated on a P3 screen),
+//! opaque on black, at the window's backing scale, its drawables not framebuffer-only, as the
+//! swapchain's images take transfers; the swapchain sets its device.
 //!
 //! **The layout.** The view is flipped, so its points run y down as [`geometry`]'s do. Whenever
 //! its size, its window's backing scale, its screen or the guest's mode changes, it lays the
@@ -65,7 +64,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
@@ -75,7 +73,6 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize};
-use objc2_metal::MTLDevice;
 use objc2_quartz_core::CAMetalLayer;
 use reims_vgpu_core::rt::BlockEnv;
 use reims_vgpu_vulkan::os::msg;
@@ -338,18 +335,14 @@ pub(crate) fn pass(sel: &'static str, send: impl FnOnce()) {
 }
 
 impl DisplayView {
-    /// The view of `window`, `size` points, with a `CAMetalLayer` on `device` (none when the
-    /// display has ended: the layer then gives no drawables), whose drawables are
-    /// framebuffer-only where `framebuffer_only` says ([`crate::FrameSink::render_target_only`]).
+    /// The view of `window`, `size` points, with a `CAMetalLayer` (module doc).
     pub(crate) fn new(
         mtm: MainThreadMarker,
         window: Arc<Window>,
         borderless: bool,
         size: NSSize,
-        device: Option<&ProtocolObject<dyn MTLDevice>>,
-        framebuffer_only: bool,
     ) -> Retained<DisplayView> {
-        let layer = new_layer(device, framebuffer_only);
+        let layer = new_layer();
         let input = InputState::new(Arc::clone(&window));
         let ivars = ViewIvars {
             window,
@@ -756,14 +749,10 @@ pub(crate) fn key_view_takes(event: &NSEvent, mtm: MainThreadMarker) -> bool {
     key_view(mtm).is_some_and(|view| view.app_send_event(event))
 }
 
-/// A new `CAMetalLayer` drawing with `device` (module doc), its drawables framebuffer-only where
-/// `framebuffer_only` says.
-fn new_layer(
-    device: Option<&ProtocolObject<dyn MTLDevice>>,
-    framebuffer_only: bool,
-) -> Retained<CAMetalLayer> {
+/// A new `CAMetalLayer`, set up for the window (module doc).
+fn new_layer() -> Retained<CAMetalLayer> {
     let layer = msg::get("new", CAMetalLayer::new);
-    configure_layer(&layer, device, framebuffer_only);
+    configure_layer(&layer);
     layer
 }
 
@@ -803,15 +792,13 @@ mod tests {
 
     use super::*;
 
-    /// A layer is BGRA8 and opaque, and its drawables are framebuffer-only unless its sink copies
-    /// frames into them
+    /// A layer is BGRA8 and opaque, and its drawables are not framebuffer-only: the swapchain's
+    /// images take transfers
     #[test]
-    fn a_layer_is_framebuffer_only_unless_its_sink_copies() {
-        for framebuffer_only in [true, false] {
-            let layer = new_layer(None, framebuffer_only);
-            assert_eq!(layer.framebufferOnly(), framebuffer_only);
-            assert_eq!(layer.pixelFormat(), MTLPixelFormat::BGRA8Unorm);
-            assert!(layer.isOpaque());
-        }
+    fn a_layer_is_bgra8_opaque_and_takes_transfers() {
+        let layer = new_layer();
+        assert!(!layer.framebufferOnly());
+        assert_eq!(layer.pixelFormat(), MTLPixelFormat::BGRA8Unorm);
+        assert!(layer.isOpaque());
     }
 }

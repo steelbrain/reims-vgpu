@@ -1,11 +1,10 @@
 //! The window on macOS: AppKit and Core Animation. The window's AppKit side (the application,
 //! its `NSWindow`, view and cursor) lives on the main thread, reached through work posted there
-//! (`main_thread`); its render thread draws into the view's `CAMetalLayer` (`render`): into each
-//! drawable the layer gives, or, where the sink presents itself (the Vulkan platform's), through
-//! a presenter over a Vulkan surface of the layer (`metal_surface`, `crate::present`). This file
-//! is what the shared window code asks of it: what draws into the layer ([`FrameSink`]), the
-//! window's opening, changes and end, the host's screens (`screens`, from CoreGraphics) and the
-//! keyboard's kind (`iso`, from Carbon).
+//! (`main_thread`); its render thread draws into the view's `CAMetalLayer` (`render`), through
+//! the sink's presenter over a Vulkan surface of the layer (`metal_surface`, `crate::present`).
+//! This file is what the shared window code asks of it: what draws into the layer
+//! ([`FrameSink`]), the window's opening, changes and end, the host's screens (`screens`, from
+//! CoreGraphics) and the keyboard's kind (`iso`, from Carbon).
 //!
 //! With `REIMS_VGPU_WINDOW_IMPL=sdl`, in a build with the `macos-sdl` feature, the window is
 //! SDL3's (`sdl`), in the same application, drawn by the same render thread into its Metal view's
@@ -38,11 +37,7 @@ use sdl_off as sdl;
 use std::sync::Arc;
 
 use objc2::MainThreadMarker;
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{NSEvent, NSEventMask};
-use objc2_metal::MTLDevice;
-use objc2_quartz_core::CAMetalDrawable;
 use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
 use reims_vgpu_vulkan::os::OsClock;
 
@@ -51,60 +46,20 @@ pub(crate) use self::screens::host_screens;
 pub(crate) use render::Surface;
 
 use crate::env::WindowImpl;
-use crate::handle::{DrawnCursor, PixelRect, Window};
+use crate::handle::Window;
 use crate::present::{Presenter, VulkanTarget};
 use main_thread::post_main;
 
-/// What draws a display's current frame into a window's drawable: `reims-vgpu`'s, over the
-/// display. It holds the display weakly: a window never keeps its display alive, except for a
-/// frame in flight, as any frame does.
-///
-/// A sink draws in one of two ways, which [`FrameSink::presents`] tells: into each drawable the
-/// render thread takes of the layer ([`FrameSink::draw`]), or through a
-/// presenter of its own over a Vulkan surface of the layer ([`FrameSink::presenter`], the Vulkan
-/// platform's, whose swapchain takes the layer's drawables and sets the layer up for them).
+/// What draws a display's current frame into a window's layer: `reims-vgpu`'s, over the display.
+/// It holds the display weakly: a window never keeps its display alive, except for a frame in
+/// flight, as any frame does. It draws through a presenter of its own over a Vulkan surface of
+/// the layer ([`FrameSink::presenter`]), whose swapchain takes the layer's drawables and sets the
+/// layer up for them.
 pub trait FrameSink: Send + Sync {
-    /// The Metal device the window's layer must use: the one the sink writes the drawables
-    /// with. `None` once the display has ended, and for a sink that presents itself, whose
-    /// swapchain sets the layer's device.
-    fn device(&self) -> Option<Retained<ProtocolObject<dyn MTLDevice>>>;
-
-    /// Draws the display's current frame into `drawable`'s texture over `region`, clearing the
-    /// rest of it, with `cursor` over it where the window draws the guest's cursor, and has the
-    /// drawable presented, waiting for nothing. False when nothing was
-    /// drawn (the display has ended, or refused the encode): the drawable is then dropped
-    /// unpresented. A sink that finishes the frame after it returns (one that copies a frame
-    /// drawn elsewhere into the drawable once it completes) may still drop the drawable
-    /// unpresented where that later step fails, after answering true: the window then shows its
-    /// last image until its next draw.
-    fn draw(
-        &self,
-        drawable: &ProtocolObject<dyn CAMetalDrawable>,
-        region: PixelRect,
-        cursor: Option<&DrawnCursor>,
-    ) -> bool;
-
-    /// Whether the sink writes a drawable's texture only as a render target, so that the layer's
-    /// drawables can be framebuffer-only. A sink that copies a frame into the drawable answers
-    /// false, and the layer's drawables then take copies too.
-    fn render_target_only(&self) -> bool {
-        true
-    }
-
-    /// Whether the sink presents through a presenter of its own ([`FrameSink::presenter`])
-    /// rather than drawing into the drawables the render thread takes ([`FrameSink::draw`]).
-    fn presents(&self) -> bool {
-        false
-    }
-
-    /// For a sink that presents itself, a presenter over `target`, the window's layer: one that
-    /// makes a Vulkan surface of the layer on the sink's instance and a swapchain over it.
-    /// `None` where there is none (the display has ended, or this host has no swapchain), as for
-    /// any other sink: the window then stays empty.
-    fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>> {
-        let _ = target;
-        None
-    }
+    /// A presenter over `target`, the window's layer: one that makes a Vulkan surface of the
+    /// layer on the sink's instance and a swapchain over it. `None` where there is none (the
+    /// display has ended, or this host has no swapchain): the window then stays empty.
+    fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>>;
 
     /// The guest's cursor position, in its mode's pixels, as the display reads it now: `None`
     /// once the display has ended, without a guest display, while it is paused, and for a sink

@@ -810,30 +810,6 @@ mod tests {
     /// A sink that answers only the guest's cursor position, as the test sets it.
     struct PositionSink(Mutex<Option<(u16, u16)>>);
 
-    #[cfg(target_os = "macos")]
-    impl FrameSink for PositionSink {
-        fn device(
-            &self,
-        ) -> Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>>
-        {
-            None
-        }
-
-        fn draw(
-            &self,
-            _drawable: &objc2::runtime::ProtocolObject<dyn objc2_quartz_core::CAMetalDrawable>,
-            _region: PixelRect,
-            _cursor: Option<&DrawnCursor>,
-        ) -> bool {
-            false
-        }
-
-        fn guest_cursor_position(&self) -> Option<(u16, u16)> {
-            *self.0.lock()
-        }
-    }
-
-    #[cfg(target_os = "linux")]
     impl FrameSink for PositionSink {
         fn presenter(
             &self,

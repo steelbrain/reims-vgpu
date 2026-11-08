@@ -457,7 +457,6 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
- "objc2-quartz-core",
  "parking_lot",
  "reims-graphics",
  "reims-vgpu-core",

@@ -66,7 +66,6 @@ objc2-quartz-core = { workspace = true, features = [
     "CALayer",
     "CAMediaTiming",
     "CAMetalLayer",
-    "CATransaction",
     "objc2-core-foundation",
     "objc2-core-graphics",
     "objc2-metal",

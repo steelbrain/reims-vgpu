@@ -116,14 +116,9 @@ fn restyle(window: &NSWindow, style: NSWindowStyleMask) {
     }
 }
 
-/// Makes SDL's Metal view in `sdl`, sets its layer up for `window`'s sink, and hands the render
-/// thread the layer. `None` where SDL makes no view.
+/// Makes SDL's Metal view in `sdl`, sets its layer up, and hands `window`'s render thread the
+/// layer. `None` where SDL makes no view.
 fn attach_layer(window: &Window, sdl: *mut SDL_Window) -> Option<SDL_MetalView> {
-    let sink = window.sink();
-    let device = sink.as_ref().and_then(|sink| sink.device());
-    let framebuffer_only = sink.as_ref().is_none_or(|sink| sink.render_target_only());
-    // Let go of the sink as soon as it has answered, as AppKit's window does.
-    drop(sink);
     // SAFETY: SDL's window, made with `SDL_WINDOW_METAL`, on the main thread.
     let view = unsafe { SDL_Metal_CreateView(sdl) };
     if view.is_null() {
@@ -139,7 +134,7 @@ fn attach_layer(window: &Window, sdl: *mut SDL_Window) -> Option<SDL_MetalView> 
         unsafe { SDL_Metal_DestroyView(view) };
         return None;
     };
-    configure_layer(layer, device.as_deref(), framebuffer_only);
+    configure_layer(layer);
     window.surface().set_layer(LayerRef::new(layer));
     Some(view)
 }

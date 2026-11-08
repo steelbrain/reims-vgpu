@@ -9,22 +9,12 @@
 //! the sink). It draws only while the window is at least partly visible, once its layer and
 //! layout exist.
 //!
-//! Where the sink presents itself ([`FrameSink::presents`], the Vulkan platform's), each draw
-//! goes through the sink's presenter over a Vulkan surface of the layer
+//! Each draw goes through the sink's presenter over a Vulkan surface of the layer
 //! ([`super::metal_surface::LayerTarget`]), as on Linux (`crate::present`): made at the first
 //! draw, tried again after [`RETRY`] where no image came in time, made again where one ends.
 //! Its swapchain sizes the layer's drawables (from the layer's bounds and scale, which the view
 //! keeps), and takes them. The presenter goes before the thread lets its reference to the layer
-//! go. Otherwise each draw:
-//! - sets the layer's `drawableSize` when the layout's changed, in a transaction of its own with
-//!   actions off, so the change does not animate. The layer never follows a resize by itself: its
-//!   `drawableSize` stays at the old size until it is set (measured, macOS 26.7);
-//! - takes the layer's next drawable, inside an autorelease pool. When frames come faster than
-//!   the screen shows them, that blocks for up to a refresh: it is the pacing, at the screen's
-//!   own rate (120 Hz on ProMotion), and nothing else throttles. With no drawable (the layer's
-//!   one second timeout) it skips;
-//! - has the sink draw the current frame into it and have it presented ([`FrameSink::draw`]),
-//!   waiting for nothing.
+//! go.
 //!
 //! Requests that come while it draws fold into one: it draws the latest frame once more. It
 //! copies the sink out of the window's lock before a draw, and holds no lock of the window's
@@ -36,21 +26,17 @@
 //! reference may go here.
 //!
 //! **The layer off the main thread.** objc2 does not make a `CAMetalLayer` `Send`. This thread
-//! uses only its `nextDrawable`, `drawableSize` and `setDrawableSize:`, which Core Animation
-//! lets any thread call (Apple's Metal samples render on a thread of their own), and a
-//! transaction of its own around the size; or, through a presenter, a Vulkan surface of it,
-//! whose driver retains it and sets it up as any thread may (`metal_surface`). Its reference to
-//! the layer is released on the main thread, as the view's is ([`LayerRef`]).
+//! only has a presenter make a Vulkan surface of it, whose driver retains it and sets it up as
+//! any thread may (`metal_surface`). Its reference to the layer is released on the main thread,
+//! as the view's is ([`LayerRef`]).
 
 use std::sync::Arc;
 
 use objc2::Message;
-use objc2::rc::{Retained, autoreleasepool};
-use objc2::runtime::ProtocolObject;
-use objc2_core_foundation::CGSize;
+use objc2::rc::Retained;
 use objc2_core_graphics::{CGColor, CGColorSpace, kCGColorBlack, kCGColorSpaceSRGB};
-use objc2_metal::{MTLDevice, MTLPixelFormat};
-use objc2_quartz_core::{CAMetalLayer, CATransaction};
+use objc2_metal::MTLPixelFormat;
+use objc2_quartz_core::CAMetalLayer;
 use reims_vgpu_core::rt::spawn_named;
 use reims_vgpu_core::sync::{Condvar, Mutex};
 use reims_vgpu_vulkan::os::OsThreads;
@@ -59,7 +45,7 @@ use reims_vgpu_vulkan::os::msg;
 use super::main_thread::post_main;
 use super::metal_surface::LayerTarget;
 use crate::geometry::Layout;
-use crate::handle::{DrawnCursor, FrameSink, PixelRect, Window};
+use crate::handle::Window;
 use crate::present::{Presenting, RETRY};
 
 /// The render thread's stack.
@@ -72,11 +58,9 @@ const STACK: usize = 512 * 1024;
 /// thread posts its own there as it ends.
 pub(crate) struct LayerRef(Retained<CAMetalLayer>);
 
-// SAFETY: the render thread calls only the layer's `nextDrawable`, `drawableSize` and
-// `setDrawableSize:`, which Core Animation lets any thread call, and retains it, or makes a
-// Vulkan surface of it, whose driver retains it and sets it up as any thread may, and lets its
-// retain go before the layer's last (`metal_surface`); every release of a `LayerRef` is on the
-// main thread (above).
+// SAFETY: the render thread only retains the layer and makes a Vulkan surface of it, whose driver
+// retains it and sets it up as any thread may, and lets its retain go before the layer's last
+// (`metal_surface`); every release of a `LayerRef` is on the main thread (above).
 unsafe impl Send for LayerRef {}
 
 impl LayerRef {
@@ -96,18 +80,11 @@ impl LayerRef {
     }
 }
 
-/// Sets up `layer` to draw with `device`, in BGRA8, tagged sRGB, opaque on black, its drawables
-/// framebuffer-only where `framebuffer_only` says ([`FrameSink::render_target_only`]): with no
-/// colour space, Core Animation shows the pixels in the screen's own gamut, oversaturated on a P3
-/// screen. On the main thread, before the render thread has the layer.
-pub(crate) fn configure_layer(
-    layer: &CAMetalLayer,
-    device: Option<&ProtocolObject<dyn MTLDevice>>,
-    framebuffer_only: bool,
-) {
-    if let Some(device) = device {
-        msg::get("setDevice:", || layer.setDevice(Some(device)));
-    }
+/// Sets up `layer` in BGRA8, tagged sRGB, opaque on black, its drawables not framebuffer-only,
+/// as the swapchain's images take transfers: with no colour space, Core Animation shows the
+/// pixels in the screen's own gamut, oversaturated on a P3 screen. The swapchain sets the layer's
+/// device. On the main thread, before the render thread has the layer.
+pub(crate) fn configure_layer(layer: &CAMetalLayer) {
     msg::get("setPixelFormat:", || {
         layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
     });
@@ -120,9 +97,7 @@ pub(crate) fn configure_layer(
         layer.setBackgroundColor(black.as_deref());
     });
     msg::get("setOpaque:", || layer.setOpaque(true));
-    msg::get("setFramebufferOnly:", || {
-        layer.setFramebufferOnly(framebuffer_only);
-    });
+    msg::get("setFramebufferOnly:", || layer.setFramebufferOnly(false));
 }
 
 /// What the render thread draws with, shared with the window and its view.
@@ -296,7 +271,6 @@ pub(crate) fn start(window: Arc<Window>) {
 fn run(window: &Window) {
     let surface = window.surface();
     let mut layer: Option<LayerRef> = None;
-    let mut drawable_size = None;
     let mut presenting = Presenting::default();
     let mut retry = None;
     while let Some(work) = surface.next(layer.is_none(), retry.take()) {
@@ -311,57 +285,18 @@ fn run(window: &Window) {
             continue;
         };
         let cursor = window.drawn_cursor();
-        if sink.presents() {
-            if presenting.needs_presenter() {
-                presenting.make(|| sink.presenter(&LayerTarget(layer)));
-            }
-            if presenting.draw(work.layout.drawable, work.layout.pixels, cursor.as_ref()) {
-                retry = Some(work.layout);
-            }
-            continue;
+        if presenting.needs_presenter() {
+            presenting.make(|| sink.presenter(&LayerTarget(layer)));
         }
-        if drawable_size != Some(work.layout.drawable) {
-            set_drawable_size(&layer.0, work.layout.drawable);
-            drawable_size = Some(work.layout.drawable);
+        if presenting.draw(work.layout.drawable, work.layout.pixels, cursor.as_ref()) {
+            retry = Some(work.layout);
         }
-        draw(&layer.0, &*sink, work.layout.pixels, cursor.as_ref());
     }
     // The swapchain and the surface go before the layer under them.
     drop(presenting);
     if let Some(layer) = layer {
         post_main(move |_| drop(layer));
     }
-}
-
-/// Sets `layer`'s drawable size to `(width, height)` pixels, in a transaction of its own with
-/// actions off.
-fn set_drawable_size(layer: &CAMetalLayer, (width, height): (u64, u64)) {
-    let size = CGSize::new(width as f64, height as f64);
-    msg::get("begin", CATransaction::begin);
-    msg::get("setDisableActions:", || {
-        CATransaction::setDisableActions(true)
-    });
-    msg::get("setDrawableSize:", || layer.setDrawableSize(size));
-    msg::get("commit", CATransaction::commit);
-}
-
-/// Draws the current frame into `layer`'s next drawable over `region`, with `cursor` over it,
-/// inside a pool of its own: nothing when the layer gives no drawable. A drawable the sink draws
-/// nothing into is dropped unpresented.
-fn draw(
-    layer: &CAMetalLayer,
-    sink: &dyn FrameSink,
-    region: PixelRect,
-    cursor: Option<&DrawnCursor>,
-) {
-    autoreleasepool(|_| {
-        let Some(drawable) = msg::get("nextDrawable", || layer.nextDrawable()) else {
-            log::debug!("no drawable: the frame is skipped");
-            return;
-        };
-        let drew = sink.draw(&drawable, region, cursor);
-        log::trace!("drawn into a drawable over {region:?}: {drew}");
-    });
 }
 
 #[cfg(test)]

@@ -47,19 +47,15 @@ libc.workspace = true
 reims-vgpu-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
 
-# The window's drawable on macOS, a `CAMetalLayer`'s, which the Vulkan sink presents into
-# (`graphics::vulkan`'s macOS side); `entry`'s tests read retain counts with `objc2`.
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2.workspace = true
-objc2-metal.workspace = true
-objc2-quartz-core = { workspace = true, features = ["CAMetalLayer", "objc2-metal"] }
-
 [dev-dependencies]
 reims-vgpu-core = { workspace = true, features = ["testkit"] }
 
-# The decoder's tests of Metal's own stitched functions (`graphics::decode`).
+# The decoder's tests of Metal's own stitched functions (`graphics::decode`); `entry`'s tests read
+# retain counts with `objc2`.
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2.workspace = true
 objc2-foundation.workspace = true
+objc2-metal.workspace = true
 
 [lints]
 workspace = true

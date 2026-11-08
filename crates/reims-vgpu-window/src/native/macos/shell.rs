@@ -821,25 +821,12 @@ pub(crate) fn open(window: &Arc<Window>, mtm: MainThreadMarker) {
             mtm,
         )
     };
-    let sink = window.sink();
-    let device = sink.as_ref().and_then(|sink| sink.device());
-    let framebuffer_only = sink.as_ref().is_none_or(|sink| sink.render_target_only());
-    // Let go of the sink as soon as it has answered: when a release races the opening, this may
-    // be the sink's last reference, released on the main thread outside an entry.
-    drop(sink);
     let frame = msg::get("frame", || ns_window.frame());
     let bounds = msg::get("contentRectForFrameRect:", || {
         ns_window.contentRectForFrameRect(frame)
     })
     .size;
-    let view = DisplayView::new(
-        mtm,
-        Arc::clone(window),
-        borderless,
-        bounds,
-        device.as_deref(),
-        framebuffer_only,
-    );
+    let view = DisplayView::new(mtm, Arc::clone(window), borderless, bounds);
     msg::get("setContentView:", || ns_window.setContentView(Some(&view)));
     let delegate = WindowDelegate::new(mtm, view.clone(), borderless);
     msg::get("setDelegate:", || {

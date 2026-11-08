@@ -13,7 +13,7 @@
 //!
 //! The crate knows nothing of devices or displays. `reims-vgpu` makes a [`Window`] for a display
 //! created with a [`WindowConfig`], tells it what the guest does (a new frame, a mode, the cursor)
-//! and gives it a [`FrameSink`] that draws the display's current frame into a drawable. On macOS
+//! and gives it a [`FrameSink`] that presents the display's current frame in it. On macOS
 //! the window opens once the process's main thread runs its run loop, as QEMU's does under
 //! `-display none`: nothing here waits for the main thread. On Linux it opens on the library's
 //! UI thread, and the process's main thread is never used.
