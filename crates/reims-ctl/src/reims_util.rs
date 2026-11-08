@@ -1,11 +1,11 @@
 //! reims-util (<https://github.com/steelbrain/reims-util>) makes what a new x86-64 VM boots from:
 //! an OpenCore image, with OVMF's code and variables beside it, and a macOS installer, downloaded
 //! from Apple and checked against Apple's chunklists. It also makes an existing VM a new OpenCore
-//! image presenting the same Mac (opencore.rs). An image holds Lilu, which reims-util adds
-//! itself, and, for a VM on reims-vgpu's own device, the guest's kexts reims-ctl carries, each
-//! given by `--add-kext` in the set's order ([`kext_args`]). reims-ctl runs it
-//! with `--json`: each line on its stdout is an event, `step`, `progress` or `note`, and the last
-//! is `done`, with what it made, or `error`.
+//! image presenting the same Mac (opencore.rs). For a VM on reims-vgpu's own device, an image
+//! holds the guest's kext set reims-ctl carries (Graft, ReimsGraphics and RgfxGate), each given
+//! by `--add-kext` in the set's order ([`kext_args`]); for one on another device, no kext.
+//! reims-ctl runs it with `--json`: each line on its stdout is an event, `step`, `progress` or
+//! `note`, and the last is `done`, with what it made, or `error`.
 //!
 //! It is installed beside reims-ctl, at [`REV`], by `cargo install` from its repository
 //! ([`install`]). `reims-ctl __record-install`, which scripts/install-ctl.sh runs last, installs
@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 pub const REPO: &str = "https://github.com/steelbrain/reims-util";
 /// The commit [`install`] installs.
-pub const REV: &str = "0b9c3780a3ec2aa312a448b09b18320e5a2c9251";
+pub const REV: &str = "84e5c98ae7fa6b0b68e7be690525dda29697ab34";
 
 /// The reims-util binary: `REIMS_CTL_UTIL`, else the one beside reims-ctl, where both are
 /// installed, else the first on PATH.
@@ -231,10 +231,9 @@ struct Smbios {
     serial: String,
 }
 
-/// The arguments that add kexts to the OpenCore image of a VM on `graphics`, beyond Lilu, which
-/// reims-util adds itself: on reims-vgpu's own device, each of the guest's
-/// kexts ([`prebuilt::guest_kexts`], written to the data directory first), in the set's order,
-/// which is the order OpenCore loads them in; none on another.
+/// The arguments that add kexts to the OpenCore image of a VM on `graphics`: on reims-vgpu's own
+/// device, each of the guest's kexts ([`prebuilt::guest_kexts`], written to the data directory
+/// first), in the set's order, which is the order OpenCore loads them in; none on another.
 pub fn kext_args(graphics: Graphics) -> Result<Vec<String>> {
     if graphics != Graphics::ReimsVgpu {
         return Ok(Vec::new());
