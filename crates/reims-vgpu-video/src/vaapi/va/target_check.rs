@@ -289,15 +289,26 @@ impl Laid {
             }
         }
         let wrong = (0..bytes.len()).find(|&i| !padding[i] && bytes[i] != expected[i]);
-        match wrong {
-            None => Ok(()),
-            Some(at) => Err(format!(
-                "{what}: byte {at} of the memory is {:#04x}, not {:#04x} ({})",
-                bytes[at],
-                expected[at],
-                self.place(at)
-            )),
-        }
+        let Some(at) = wrong else {
+            return Ok(());
+        };
+        // Where each plane's first row's samples are in the memory, if anywhere: the layout the
+        // driver wrote, for the log.
+        let found = self.rows().map(|(first, _, row, _)| {
+            let want = &expected[first..first + row.min(32)];
+            (bytes.windows(want.len()))
+                .position(|w| w == want)
+                .map_or_else(|| "nowhere".to_owned(), |p| format!("at byte {p}"))
+        });
+        Err(format!(
+            "{what}: byte {at} of the memory is {:#04x}, not {:#04x} ({}); the luma's first row \
+             is {}, the chroma's {}",
+            bytes[at],
+            expected[at],
+            self.place(at),
+            found[0],
+            found[1]
+        ))
     }
 
     /// Where byte `at` of the memory lies, for the log.
