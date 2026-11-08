@@ -3,12 +3,17 @@
 // cannot pass for one that is carried out. A member of a protocol a class of ours adopts that
 // the register does not name fails here until someone classifies it, and so does a new member a
 // macOS adds to a protocol.
-//   protocol_members_tests BUNDLE REGISTER SRCDIR [--propose]
+//   protocol_members_tests BUNDLE REGISTER RELEASES SRCDIR [--propose]
 //     loads BUNDLE, the device's x86-64 bundle (run under Rosetta, as the guest runs it), walks
 //     through the Objective-C runtime every MTL* protocol each class whose name starts with Rgfx
-//     adopts (with the protocols those adopt), every instance member, required and optional, and
-//     reads the members' bodies from SRCDIR's .mm files. --propose prints a register line for
-//     each member the register lacks, with the kind the code suggests, and fails as without it.
+//     adopts (with the protocols those adopt), and each one's SPI counterpart, MTLFooSPI for
+//     MTLFoo, which Metal's own objects adopt and the guest's frameworks send without asking
+//     respondsToSelector: (macOS 13's Maps sends MTLLibrarySPI's
+//     newFunctionWithName:constantValues:pipelineLibrary:error: to every library), every instance
+//     member, required and optional, adds the members RELEASES lists (those the guest's macOS
+//     releases carry in a protocol the Mac's Metal does not), and reads the members' bodies from
+//     SRCDIR's .mm files. --propose prints a register line for each member the register lacks,
+//     with the kind the code suggests, and fails as without it.
 //
 // The register's kinds, one line "selector kind text" per member under its class's [Class]
 // heading (a member a subclass inherits from a class of ours is listed under the class that
@@ -28,10 +33,20 @@
 //                says why.
 //   absent       no class answers it, so a call raises an unrecognized selector (or goes where
 //                the class forwards it); the text says why.
+//   pending      no class answers it yet, and what it should answer is not yet decided: an SPI
+//                member whose answer is still to be taken from Metal's own devices (the text
+//                gives their verdict). Checked as absent.
 // A line "%name text" names a reason; an entry's text "%name" gives it.
 //
+// RELEASES (tests/protocol_members_releases.txt): one line per member that some guest macOS from
+// 11 to 26 carries in an MTL* protocol and the Mac's Metal does not, "Protocol selector
+// required|optional releases"; its header says how the list is made. Each class of ours that
+// adopts the protocol (or its public counterpart) has the member, which the register classifies
+// as any other.
+//
 // It fails on: a member the register does not list; a register line no class has; a kind the
-// code contradicts (above); a kind other than implemented with no text.
+// code contradicts (above); a kind other than implemented with no text; a RELEASES line whose
+// member the Mac's protocol has (it is walked already), or whose protocol the Mac's Metal lacks.
 #import <Foundation/Foundation.h>
 
 #include <dlfcn.h>
@@ -42,6 +57,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -447,6 +463,8 @@ bool isOurs(const char *name)
 	return strncmp(name, "Rgfx", 4) == 0;
 }
 
+Member memberOf(Class cls, SEL sel, const std::string &protocol, bool required);
+
 void walkProtocol(Class cls, Protocol *p, std::set<std::string> &seen,
                   std::map<std::string, Member> &out)
 {
@@ -458,21 +476,7 @@ void walkProtocol(Class cls, Protocol *p, std::set<std::string> &seen,
 			unsigned n = 0;
 			objc_method_description *ds = protocol_copyMethodDescriptionList(p, required, YES, &n);
 			for (unsigned i = 0; i < n; i++) {
-				const SEL sel = ds[i].name;
-				const Class def = definingClass(cls, sel);
-				Member m;
-				m.protocol = pname;
-				m.required = required;
-				if (def != Nil && isOurs(class_getName(def))) {
-					m.state = "ours";
-					m.definer = class_getName(def);
-					m.key = m.definer + " " + sel_getName(sel);
-					m.imp = method_getImplementation(class_getInstanceMethod(def, sel));
-				} else {
-					m.state = def != Nil ? "base" : "absent";
-					m.definer = def != Nil ? class_getName(def) : "";
-					m.key = std::string(class_getName(cls)) + " " + sel_getName(sel);
-				}
+				const Member m = memberOf(cls, ds[i].name, pname, required);
 				auto it = out.find(m.key);
 				if (it == out.end() || (m.required && !it->second.required))
 					out[m.key] = m;
@@ -485,6 +489,96 @@ void walkProtocol(Class cls, Protocol *p, std::set<std::string> &seen,
 	for (unsigned i = 0; i < n; i++)
 		walkProtocol(cls, adopted[i], seen, out);
 	free(adopted);
+	// Its SPI counterpart, which Metal's own objects of the protocol adopt.
+	const std::string spi = pname + "SPI";
+	if (pname.compare(0, 3, "MTL") == 0 && pname.size() > 3 &&
+	    pname.compare(pname.size() - 3, 3, "SPI") != 0) {
+		if (Protocol *counterpart = objc_getProtocol(spi.c_str()))
+			walkProtocol(cls, counterpart, seen, out);
+	}
+}
+
+// The member `sel` of `cls`, from `protocol`, as walkProtocol makes it.
+Member memberOf(Class cls, SEL sel, const std::string &protocol, bool required)
+{
+	const Class def = definingClass(cls, sel);
+	Member m;
+	m.protocol = protocol;
+	m.required = required;
+	if (def != Nil && isOurs(class_getName(def))) {
+		m.state = "ours";
+		m.definer = class_getName(def);
+		m.key = m.definer + " " + sel_getName(sel);
+		m.imp = method_getImplementation(class_getInstanceMethod(def, sel));
+	} else {
+		m.state = def != Nil ? "base" : "absent";
+		m.definer = def != Nil ? class_getName(def) : "";
+		m.key = std::string(class_getName(cls)) + " " + sel_getName(sel);
+	}
+	return m;
+}
+
+// The members RELEASES lists, added to each class of ours whose walked protocols (`walked`, by
+// class) hold the line's protocol or its public counterpart.
+void addReleaseMembers(const std::string &path,
+                       const std::map<std::string, std::set<std::string>> &walked,
+                       std::map<std::string, Member> &out)
+{
+	NSString *raw = [NSString stringWithContentsOfFile:@(path.c_str())
+	                                          encoding:NSUTF8StringEncoding
+	                                             error:nil];
+	if (raw == nil) {
+		fail("cannot read the releases' members " + path);
+		return;
+	}
+	int lineNo = 0;
+	std::set<std::string> lines;
+	for (NSString *ns in [raw componentsSeparatedByString:@"\n"]) {
+		lineNo++;
+		const std::string line = trim(ns.UTF8String);
+		const std::string where = path + ":" + std::to_string(lineNo);
+		if (line.empty() || line[0] == '#')
+			continue;
+		std::istringstream in(line);
+		std::string protocol, sel, required, releases;
+		in >> protocol >> sel >> required;
+		std::getline(in, releases);
+		if (sel.empty() || (required != "required" && required != "optional") ||
+		    trim(releases).empty()) {
+			fail(where + ": not 'Protocol selector required|optional releases'");
+			continue;
+		}
+		if (!lines.insert(protocol + " " + sel).second)
+			fail(where + ": " + protocol + " " + sel + " is listed twice");
+		Protocol *p = objc_getProtocol(protocol.c_str());
+		if (p == nullptr) {
+			fail(where + ": the Mac's Metal has no protocol " + protocol);
+			continue;
+		}
+		const SEL s = sel_registerName(sel.c_str());
+		const bool onMac = protocol_getMethodDescription(p, s, YES, YES).name != nullptr ||
+		                   protocol_getMethodDescription(p, s, NO, YES).name != nullptr;
+		if (onMac) {
+			fail(where + ": the Mac's " + protocol + " has " + sel + ": drop the line");
+			continue;
+		}
+		const std::string base =
+		    protocol.size() > 3 && protocol.compare(protocol.size() - 3, 3, "SPI") == 0 ?
+		        protocol.substr(0, protocol.size() - 3) :
+		        protocol;
+		int adopters = 0;
+		for (const auto &[cls, names] : walked) {
+			if (names.count(protocol) == 0 && names.count(base) == 0)
+				continue;
+			adopters++;
+			const Member m = memberOf(objc_getClass(cls.c_str()), s, protocol, required == "required");
+			auto it = out.find(m.key);
+			if (it == out.end() || (m.required && !it->second.required))
+				out[m.key] = m;
+		}
+		if (adopters == 0)
+			fail(where + ": no class of ours adopts " + protocol + " or " + base);
+	}
 }
 
 // --- the register -------------------------------------------------------------------------------
@@ -495,7 +589,7 @@ struct Entry {
 };
 
 const std::set<std::string> kKinds = {"implemented", "partial", "unsupported", "metal",
-                                      "gap",         "base",    "absent"};
+                                      "gap",         "base",    "absent",      "pending"};
 
 // The register's members by "Class selector". A line "%name text" names a reason that an entry's
 // text can give as "%name" (with more text after it, or none).
@@ -633,11 +727,12 @@ bool isCreatorName(const std::string &sel)
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
-		if (argc < 4) {
-			fprintf(stderr, "usage: protocol_members_tests BUNDLE REGISTER SRCDIR [--propose]\n");
+		if (argc < 5) {
+			fprintf(stderr,
+			        "usage: protocol_members_tests BUNDLE REGISTER RELEASES SRCDIR [--propose]\n");
 			return 2;
 		}
-		const bool propose = argc > 4 && strcmp(argv[4], "--propose") == 0;
+		const bool propose = argc > 5 && strcmp(argv[5], "--propose") == 0;
 		if (dlopen(argv[1], RTLD_NOW) == nullptr) {
 			printf("FAIL: cannot load %s: %s\n", argv[1], dlerror());
 			return 1;
@@ -646,11 +741,11 @@ int main(int argc, char **argv)
 		std::map<std::string, Body> bodies;
 		std::map<std::string, std::string> sources; // each file's source, by name
 		NSArray<NSString *> *files =
-		    [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@(argv[3]) error:nil];
+		    [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@(argv[4]) error:nil];
 		for (NSString *f in [files sortedArrayUsingSelector:@selector(compare:)]) {
 			if (![f hasSuffix:@".mm"])
 				continue;
-			const std::string path = std::string(argv[3]) + "/" + f.UTF8String;
+			const std::string path = std::string(argv[4]) + "/" + f.UTF8String;
 			readBodies(path, bodies);
 			NSString *text = [NSString stringWithContentsOfFile:@(path.c_str())
 			                                           encoding:NSUTF8StringEncoding
@@ -659,6 +754,7 @@ int main(int argc, char **argv)
 		}
 
 		std::map<std::string, Member> members;
+		std::map<std::string, std::set<std::string>> walkedBy; // the protocols, by class
 		unsigned count = 0;
 		Class *classes = objc_copyClassList(&count);
 		int walked = 0;
@@ -673,9 +769,11 @@ int main(int argc, char **argv)
 					walkProtocol(classes[i], ps[j], seen, members);
 				free(ps);
 			}
+			walkedBy[class_getName(classes[i])] = seen;
 			walked++;
 		}
 		free(classes);
+		addReleaseMembers(argv[3], walkedBy, members);
 
 		std::map<std::string, std::string> reasons;
 		const std::map<std::string, Entry> reg = readRegister(argv[2], reasons);
@@ -718,8 +816,8 @@ int main(int argc, char **argv)
 			const Entry &e = it->second;
 			kinds[e.kind]++;
 			const std::string as = what + " is listed '" + e.kind + "'";
-			if (e.kind == "base" || e.kind == "absent") {
-				if (m.state != e.kind)
+			if (e.kind == "base" || e.kind == "absent" || e.kind == "pending") {
+				if (m.state != (e.kind == "pending" ? "absent" : e.kind))
 					fail(as + ", but " +
 					     (m.state == "ours" ? "a class of ours answers it" :
 					      m.state == "base" ? "the base " + m.definer + " answers it" :

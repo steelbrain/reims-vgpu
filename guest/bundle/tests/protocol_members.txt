@@ -1,15 +1,16 @@
 # The register of the Metal protocol members the bundle's classes answer, and how each is
 # answered: tests/protocol_members_tests.mm walks every member of every MTL* protocol a class of
-# ours adopts, through the Objective-C runtime, and fails on a member this file does not list, a
-# line no class has, or a kind the code contradicts. Its header says what each kind means and
-# what is checked of it. A new member (a new macOS, a new class or protocol) fails the test until
-# it is listed here; the test's --propose prints a line for each, with the kind the code suggests.
+# ours adopts, and of each one's SPI counterpart (MTLFooSPI), through the Objective-C runtime, and
+# fails on a member this file does not list, a line no class has, or a kind the code contradicts.
+# Its header says what each kind means and what is checked of it. A new member (a new macOS, a
+# new class or protocol) fails the test until it is listed here; the test's --propose prints a
+# line for each, with the kind the code suggests.
 #
 # One line per member, "selector kind text", under the [Class] that answers it: a member a
 # subclass inherits from a class of ours is listed under that class, and one only a base that is
 # not ours answers, or no class answers, under the class that adopts the protocol. The protocols
-# are those of the Mac the test runs on (its Metal.framework), which the guest's macOS may differ
-# from by a few members.
+# are those of the Mac the test runs on (its Metal.framework), with the members the guest's
+# releases carry and the Mac's lacks (tests/protocol_members_releases.txt).
 #
 # The reasons several lines share:
 
@@ -29,6 +30,12 @@
 %spi-no-pipeline-libraries the IOGPU base answers NO, the lane's answer: it makes no pipeline libraries (newPipelineLibraryWithFilePath:error: is RGFX_UNSUPPORTED), where Metal's devices answer YES
 %spi-no-shared-textures the IOGPU base answers NO, the lane's answer: it makes no shared textures or handles (RGFX_UNSUPPORTED), where Metal's devices answer YES
 %gl-function Metal's own function of GL IR answers it, the same for every shader (measured: macOS 26.7.1, the Intel 630's device: the name __main, MTLPatchTypeNone, a control point count of 0, no vertex or stage input attributes, no function constants, no options)
+%spi-both an SPI member the AMD 5300M's and the Intel 630's objects of the kind both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), which the guest's frameworks may send without asking; to be answered as Metal's
+%spi-neither an SPI member neither the AMD 5300M's nor the Intel 630's objects of the kind answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
+%spi-differ an SPI member one of the AMD 5300M's and the Intel 630's objects of the kind answers and the other does not (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
+%spi-unmeasured an SPI member the oracle's objects were not asked (macOS 26.7.1's protocol has no such member); to be measured
+%old-only a member only older guest releases' protocols carry (tests/protocol_members_releases.txt), with no public counterpart; no app pass on the releases that carry it showed a guest framework sending it to the bundle's objects (the bundle logs each selector it does not recognize, RGFX: unrecognized), so a call raises an unrecognized selector, as it did before
+%old-only-device a member only macOS 11's or 12's MTLDeviceSPI carries (tests/protocol_members_releases.txt): on those releases the device's IOGPU base answers it, the guest's own class (measured: macOS 11.7.11, the device answers it); on the Mac the base lacks it
 
 [RgfxArgumentEncoder]
 alignment implemented
@@ -1277,3 +1284,606 @@ tailSizeInBytes metal %no-sparse
 textureType implemented
 usage implemented
 width implemented
+
+# --- the SPI counterparts' members (MTLFooSPI for each MTLFoo a class adopts) --------------------
+# Metal's own objects adopt them, and the guest's frameworks send their members without asking:
+# macOS 13's Maps sends MTLLibrarySPI's newFunctionWithName:constantValues:pipelineLibrary:error:
+# to its libraries. The forwarders are src/RgfxSpiForwarders.mm.
+
+[RgfxArgumentEncoder]
+layout pending %spi-both
+[RgfxBinaryArchive]
+addComputePipelineFunctionsWithDescriptor:options:error: implemented
+addMeshRenderPipelineFunctionsWithDescriptor:options:error: implemented
+addRenderPipelineFunctionsWithDescriptor:options:error: implemented
+addTileRenderPipelineFunctionsWithDescriptor:options:error: implemented
+archiveFunctionIds pending %spi-both
+enumerateArchivesFromBackingFile: pending %spi-both
+enumerateArchivesFromPipelineCollection: pending %spi-both
+formattedDescription: pending %spi-both
+keys implemented
+options implemented
+pipelineCollection pending %spi-both
+recompileToArchiveWithURL:error: pending %spi-both
+serializeToURL:options:error: implemented
+storeComputePipelineDescriptor: pending %spi-both
+storeMeshRenderPipelineDescriptor: pending %spi-both
+storeRenderPipelineDescriptor: pending %spi-both
+storeTileRenderPipelineDescriptor: pending %spi-both
+[RgfxBlitCommandEncoder]
+copyFromTensor:sourceSlice:toTensor:destinationSlice: pending %spi-both
+copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:options: absent %spi-differ (the Intel 630 answers it)
+endEncodingAndRetrieveProgramAddressTable pending %spi-both
+fillBuffer:range:pattern4: pending %spi-both
+fillTexture:level:slice:region:bytes:length: pending %spi-both
+fillTexture:level:slice:region:color: pending %spi-both
+fillTexture:level:slice:region:color:pixelFormat: pending %spi-both
+insertSplit pending %spi-both
+invalidateCompressedTexture: pending %spi-both
+invalidateCompressedTexture:slice:level: pending %spi-both
+optimizeContentsForTexture:readAccessPattern:readAccessor: pending %spi-both
+optimizeContentsForTexture:readAccessPattern:readAccessor:slice:level: pending %spi-both
+[RgfxBuffer]
+_aneIOSurface pending %spi-both
+allocationID implemented
+detachBacking absent %spi-neither
+doesAliasAllResources:count: implemented
+doesAliasAnyResources:count: implemented
+doesAliasResource: implemented
+iosurface metal the device makes no buffer over an IOSurface, as neither x86 Mac does (newBufferWithIOSurface:), so the buffer lies in none, as a buffer made from a length or bytes answers none (measured: M3 Max, macOS 27)
+isComplete metal YES, as Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+isPurgeable implemented
+isWriteComplete metal YES, as Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage: implemented
+newTiledTextureWithDescriptor:offset:bytesPerRow: implemented
+parentGPUAddress absent %spi-neither
+parentGPUSize absent %spi-neither
+replaceBackingWithBytesNoCopy:length:deallocator: absent %spi-neither
+replaceBackingWithRanges:readOnly: absent %spi-neither
+resourceIndex absent %spi-differ (the Intel 630 answers it)
+setParentGPUAddress: absent %spi-neither
+setParentGPUSize: absent %spi-neither
+unfilteredResourceOptions implemented
+waitUntilComplete metal returns at once, as Metal's resources do (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+[RgfxCmdBuffer]
+__waitUntilCompletedAsync: pending %spi-both
+__waitUntilScheduledAsync: pending %spi-both
+addPurgedHeap: pending %spi-both
+addPurgedResource: pending %spi-both
+commitAndHold implemented
+commitAndWaitUntilSubmitted implemented
+commitAndWaitUntilSubmittedWithDeadline: pending %spi-both
+commitWithDeadline: pending %spi-both
+computeCommandEncoderWithDispatchType:substreamCount: absent %spi-neither
+configWithCommandBufferDescriptor: pending %spi-both
+deadlineProfile pending %spi-both
+debugBufferContentsWithLength: pending %spi-both
+debugCommandEncoder absent %spi-neither
+doCorruptCBSPI: pending %spi-both
+dropResourceGroups:count: absent %spi-neither
+encodeCacheHintFinalize:resourceGroups:count: absent %spi-neither
+encodeCacheHintTag:resourceGroups:count: absent %spi-neither
+encodeConditionalAbortEvent: pending %spi-both
+encodeDashboardFinalizeForResourceGroup:dashboard:value:forIndex: pending %spi-both
+encodeDashboardFinalizeForResourceGroup:dashboard:values:indices:count: pending %spi-both
+encodeDashboardTagForResourceGroup: pending %spi-both
+encodeSignalEvent:value:agentMask: implemented
+encodeSignalEventScheduled:value: absent %spi-neither
+encodeWaitForEvent:value:timeout: implemented
+getListIndex pending %spi-both
+globalTraceObjectID implemented
+isProfilingEnabled pending %spi-both
+presentDrawable:options: implemented
+privateData pending %spi-both
+privateDataOffset pending %spi-both
+privateLoggingBuffer pending %spi-both
+profilingResults pending %spi-both
+protectionOptions implemented
+sampledAccelerationStructureCommandEncoder:capacity: pending %spi-both
+sampledAccelerationStructureCommandEncoderWithDescriptor:programInfoBuffer:capacity: pending %spi-both
+sampledBlitCommandEncoder:capacity: pending %spi-both
+sampledBlitCommandEncoderWithDescriptor:programInfoBuffer:capacity: pending %spi-both
+sampledComputeCommandEncoderWithDescriptor:programInfoBuffer:capacity: pending %spi-both
+sampledComputeCommandEncoderWithDispatchType:programInfoBuffer:capacity: pending %spi-both
+sampledComputeCommandEncoderWithProgramInfoBuffer:capacity: pending %spi-both
+sampledRenderCommandEncoderWithDescriptor:programInfoBuffer:capacity: pending %spi-both
+setLogs: pending %spi-both
+setPrivateData: pending %spi-both
+setPrivateDataOffset: pending %spi-both
+setPrivateLoggingBuffer: pending %spi-both
+setProfilingEnabled: pending %spi-both
+setProtectionOptions: implemented
+setResourceGroups:count: absent %spi-neither
+setResponsibleTaskIDs:count: pending %spi-both
+setSharedIndirectionTable: pending %spi-both
+sharedIndirectionTable pending %spi-both
+useInternalResidencySet: pending %spi-unmeasured
+useInternalResidencySets:count: pending %spi-unmeasured
+userDictionary implemented
+videoCommandEncoder absent %spi-differ (the AMD 5300M answers it)
+[RgfxCommandQueue]
+StatLocations pending %spi-both
+StatOptions pending %spi-both
+addPerfSampleHandler: metal Metal's queue never called the handler after a command buffer completed (measured: M3 Max, macOS 27), and nor does this
+availableCounters pending %spi-both
+availableCountersAndDict absent %spi-differ (the Intel 630 answers it)
+backgroundTrackingPID pending %spi-both
+commitQueue pending %spi-both
+commitSynchronously pending %spi-both
+commitsWithQoS pending %spi-both
+completionQueue implemented
+counterInfo pending %spi-both
+disableCrossQueueHazardTracking pending %spi-both
+dispatchAvailableCompletionNotifications pending %spi-both
+executionEnabled pending %spi-both
+finish pending %spi-both
+getBackgroundGPUPriority implemented
+getGPUPriority implemented
+getRequestedCounters pending %spi-both
+getStatLocations pending %spi-both
+getStatOptions pending %spi-both
+isOpenGLQueue pending %spi-both
+isProfilingEnabled pending %spi-both
+isStatEnabled pending %spi-both
+maxCommandBufferCount implemented
+numInternalSampleCounters pending %spi-both
+numRequestedCounters pending %spi-both
+qosLevel pending %spi-both
+requestCounters: pending %spi-both
+requestCounters:withIndex: metal -1 for every list tried (nil, empty, one counter), as Metal's queue answers (measured: M3 Max, macOS 27)
+setBackgroundGPUPriority: implemented
+setBackgroundGPUPriority:offset: implemented
+setBackgroundTrackingPID: pending %spi-both
+setCompletionQueue: implemented
+setCounterInfo: pending %spi-both
+setExecutionEnabled: pending %spi-both
+setGPUPriority: implemented
+setGPUPriority:offset: implemented
+setNumInternalSampleCounters: pending %spi-both
+setNumRequestedCounters: pending %spi-both
+setProfilingEnabled: pending %spi-both
+setSkipRender: pending %spi-both
+setStatEnabled: partial  command statistics
+setStatLocations: metal the device takes no command statistics (setStatEnabled: YES is unsupported), so where they would be taken changes nothing
+setStatOptions: metal the device takes no command statistics (setStatEnabled: YES is unsupported), so how they would be taken changes nothing
+setSubmissionQueue: implemented
+skipRender pending %spi-both
+subdivideCounterList: pending %spi-both
+[RgfxComputeCommandEncoder]
+beginVirtualSubstream absent %spi-neither
+dispatchThreadsWithIndirectBuffer:indirectBufferOffset: absent %spi-neither
+enableNullBufferBinds: absent %spi-neither
+encodeEndDoWhile:offset:comparison:referenceValue: pending %spi-both
+encodeEndIf pending %spi-both
+encodeEndWhile metal NO: Metal answers NO with no loop open, and no loop is ever open here (encodeStartWhile: is unsupported)
+encodeStartDoWhile pending %spi-both
+encodeStartElse pending %spi-both
+encodeStartIf:offset:comparison:referenceValue: pending %spi-both
+encodeStartWhile:offset:comparison:referenceValue: unsupported  GPU-side loops (none on the wire)
+endEncodingAndRetrieveProgramAddressTable pending %spi-both
+endVirtualSubstream absent %spi-neither
+insertCompressedTextureReinterpretationFlush absent %spi-neither
+insertSplit pending %spi-both
+insertUncompressedToCompressedFlush absent %spi-neither
+newKernelDebugInfo pending %spi-both
+nextVirtualSubstream absent %spi-neither
+setSubstream: absent %spi-neither
+setThreadgroupDistributionMode: pending %spi-both
+setThreadgroupDistributionModeWithClusterGroupIndex: pending %spi-both
+setThreadgroupPackingDisabled: pending %spi-both
+setToolsDispatchBufferSPI:atIndex: pending %spi-both
+signalProgress: absent %spi-neither
+useResidencySet: partial  residency sets
+useResidencySets:count: partial  residency sets
+useResourceGroup:usage: absent %spi-neither
+waitForProgress: absent %spi-neither
+waitForVirtualSubstream: absent %spi-neither
+[RgfxComputePipelineState]
+debugInstrumentationData pending %spi-both
+functionReflectionWithFunctionDescriptor: pending %spi-both
+getComputeKernelTelemetryID pending %spi-both
+globalConstantsBase pending %spi-both
+globalConstantsSize pending %spi-both
+gpuAddress metal 0 for every pipeline, one that supports indirect command buffers too, as Metal's answer (measured: M3 Max, macOS 27)
+gpuHandle pending %spi-both
+newComputePipelineStateWithAdditionalBinaryFunctions:resourceIndices:error: unsupported  binary functions
+pipelineBinaries pending %spi-both
+resourceIndex pending %spi-both
+shaderValidationState pending %spi-both
+textureWriteRoundingMode pending %spi-both
+uniqueIdentifier implemented
+[RgfxDepthStencilState]
+readsDepth metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
+readsStencil metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
+resourceIndex pending %spi-both
+uniqueIdentifier pending %spi-both
+writesDepth metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
+writesStencil metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
+[RgfxEvent]
+enableBarrier pending %spi-both
+setEnableBarrier: pending %spi-both
+supportsRollback pending %spi-both
+[RgfxFunction]
+arguments implemented
+bindings implemented
+bitCodeHash implemented
+bitcodeData implemented
+debugInstrumentationData pending %spi-both
+filePath pending %spi-both
+functionHandle pending %spi-both
+importedLibraries implemented
+importedSymbols pending %spi-both
+lineNumber pending %spi-both
+newArgumentEncoderWithBufferIndex:pipelineLibrary: implemented
+newArgumentEncoderWithBufferIndex:reflection:binaryArchives: implemented
+newArgumentEncoderWithBufferIndex:reflection:pipelineLibrary: implemented
+newFunctionWithPluginData:bitcodeType: implemented
+reflectionWithOptions: implemented
+reflectionWithOptions:binaryArchives: implemented
+reflectionWithOptions:completionHandler: implemented
+reflectionWithOptions:pipelineLibrary: implemented
+relocations pending %spi-both
+renderTargetArrayIndexType pending %spi-both
+returnType implemented
+setRelocations: pending %spi-both
+unpackedFilePath pending %spi-both
+[RgfxFunctionArrayLibrary]
+bitcodeData pending %spi-both
+externFunctionNames gap nil; what Metal answers for a library of functions given to it is not measured
+libraryIdentifier pending %spi-both
+newExternFunctionWithName: pending %spi-both
+newFunctionWithDescriptor:destinationArchive:error: implemented
+newFunctionWithName:constantValues:functionCache:error: implemented
+newFunctionWithName:constantValues:pipelineLibrary:completionHandler: implemented
+newFunctionWithName:constantValues:pipelineLibrary:error: implemented
+overrideTriple pending %spi-both
+serializeToURL:error: implemented
+setOverrideTriple: pending %spi-both
+setShaderValidationEnabled: pending %spi-both
+shaderValidationEnabled pending %spi-both
+[RgfxGLFunction]
+arguments pending %spi-both
+bindings pending %spi-both
+bitCodeHash pending %spi-both
+bitcodeData pending %spi-both
+debugInstrumentationData pending %spi-both
+filePath pending %spi-both
+functionHandle pending %spi-both
+importedLibraries pending %spi-both
+importedSymbols pending %spi-both
+lineNumber pending %spi-both
+newArgumentEncoderWithBufferIndex:pipelineLibrary: implemented
+newArgumentEncoderWithBufferIndex:reflection:binaryArchives: implemented
+newArgumentEncoderWithBufferIndex:reflection:pipelineLibrary: implemented
+newFunctionWithPluginData:bitcodeType: implemented
+reflectionWithOptions: pending %spi-both
+reflectionWithOptions:binaryArchives: pending %spi-both
+reflectionWithOptions:completionHandler: pending %spi-both
+reflectionWithOptions:pipelineLibrary: pending %spi-both
+relocations pending %spi-both
+renderTargetArrayIndexType pending %spi-both
+returnType pending %spi-both
+setRelocations: pending %spi-both
+unpackedFilePath pending %spi-both
+[RgfxHeap]
+detachBacking pending %spi-both
+formattedDescription: pending %spi-both
+gpuAddress implemented
+memoryPoolId pending %spi-both
+newAccelerationStructureWithSize:offset:resourceIndex: unsupported  ray tracing
+newAccelerationStructureWithSize:resourceIndex: unsupported  ray tracing
+replaceBackingWithRanges:readOnly: pending %spi-both
+unfilteredResourceOptions implemented
+[RgfxIOSurfaceTexture]
+canGenerateMipmapLevels absent %spi-neither
+colorSpaceConversionMatrix pending %spi-both
+compressionFeedback pending %spi-both
+compressionFootprint pending %spi-both
+compressionMetadata pending %spi-unmeasured
+generateMipmapLevel:slice: absent %spi-neither
+gpuAddress implemented
+gpuHandle pending %spi-both
+newCompressedTextureViewWithPixelFormat:textureType:level:slice: absent %spi-neither
+numFaces pending %spi-both
+resourceIndex pending %spi-both
+sparseSurfaceDefaultValue absent %spi-neither
+writeAccessPattern absent %spi-neither
+[RgfxIndirectCommandBuffer]
+allocationID pending %spi-unmeasured
+doesAliasAllResources:count: pending %spi-unmeasured
+doesAliasAnyResources:count: pending %spi-unmeasured
+doesAliasResource: pending %spi-unmeasured
+getHeader:headerSize: pending %spi-both
+gpuAddress pending %spi-both
+gpuHandle pending %spi-both
+isComplete pending %spi-unmeasured
+isPurgeable pending %spi-unmeasured
+isWriteComplete pending %spi-unmeasured
+resourceIndex pending %spi-both
+unfilteredResourceOptions pending %spi-unmeasured
+uniqueIdentifier pending %spi-both
+waitUntilComplete pending %spi-unmeasured
+[RgfxIndirectComputeCommand]
+dispatchThreadgroupsArguments pending %spi-both
+dispatchThreadsArguments pending %spi-both
+getCommandType pending %spi-both
+getImageBlockSize pending %spi-both
+getKernelAttributeStrideAtIndex: pending %spi-both
+getKernelBufferAddressAtIndex: pending %spi-both
+getKernelBufferAtIndex: pending %spi-both
+getOptimizedStatus pending %spi-both
+getPipelineStateUniqueIdentifier pending %spi-both
+getStageInRegion pending %spi-both
+getThreadgroupMemoryLengthAtIndex: pending %spi-both
+hasBarrier pending %spi-both
+setToolsDispatchBufferSPI:atIndex: absent %spi-neither
+[RgfxIndirectRenderCommand]
+drawArguments pending %spi-both
+drawIndexedArguments pending %spi-both
+drawIndexedPatchesArguments pending %spi-both
+drawMeshThreadgroupsArguments pending %spi-both
+drawMeshThreadsArguments pending %spi-both
+drawPatchesArguments pending %spi-both
+getBlendColor pending %spi-both
+getCommandType pending %spi-both
+getCullMode pending %spi-both
+getDepthBiasInfo pending %spi-both
+getDepthClipMode pending %spi-both
+getDepthStencilState pending %spi-both
+getDepthStencilStateUniqueIdentifier pending %spi-both
+getDepthTestBounds pending %spi-both
+getFragmentBufferAddressAtIndex: pending %spi-both
+getFragmentBufferAtIndex: pending %spi-both
+getFrontFacingWinding pending %spi-both
+getMeshBufferAddressAtIndex: pending %spi-both
+getObjectBufferAddressAtIndex: pending %spi-both
+getObjectThreadgroupMemoryLengthAtIndex: pending %spi-both
+getOptimizedStatus pending %spi-both
+getPipelineStateUniqueIdentifier pending %spi-both
+getScissorRects pending %spi-both
+getStencilReferenceValues pending %spi-both
+getTessellationFactorArguments pending %spi-both
+getTriangleFillMode pending %spi-both
+getVertexAttributeStrideAtIndex: pending %spi-both
+getVertexBufferAddressAtIndex: pending %spi-both
+getVertexBufferAtIndex: pending %spi-both
+getViewports pending %spi-both
+hasBarrier pending %spi-both
+setBlendColorRed:green:blue:alpha: pending %spi-both
+setDepthTestMinBound:maxBound: pending %spi-both
+setScissorRect: pending %spi-both
+setScissorRects:count: pending %spi-both
+setStencilFrontReferenceValue:backReferenceValue: pending %spi-both
+setStencilReferenceValue: pending %spi-both
+setToolsDispatchBufferSPI:atIndex:stages: pending %spi-both
+setViewport: pending %spi-both
+setViewports:count: pending %spi-both
+[RgfxLibrary]
+bitcodeData implemented
+externFunctionNames implemented
+libraryIdentifier pending %spi-both
+newExternFunctionWithName: implemented
+newFunctionWithDescriptor:destinationArchive:error: implemented
+newFunctionWithName:constantValues:functionCache:error: implemented
+newFunctionWithName:constantValues:pipelineLibrary:completionHandler: implemented
+newFunctionWithName:constantValues:pipelineLibrary:error: implemented
+overrideTriple pending %spi-both
+serializeToURL:error: partial  serializing a library Metal's own does not hold
+setOverrideTriple: pending %spi-both
+setShaderValidationEnabled: pending %spi-both
+shaderValidationEnabled pending %spi-both
+[RgfxParallelRenderCommandEncoder]
+endEncodingAndRetrieveProgramAddressTable pending %spi-both
+insertSplit pending %spi-both
+sampledRenderCommandEncoderWithProgramInfoBuffer:capacity: pending %spi-both
+separateCommits pending %spi-both
+setSeparateCommits: pending %spi-both
+[RgfxRenderCommandEncoder]
+addSplitHandler: pending %spi-both
+dispatchThreadsPerTile:inRegion: unsupported  tile dispatches over a region
+dispatchThreadsPerTile:inRegion:withRenderTargetArrayIndex: absent %spi-neither
+dispatchThreadsPerTile:inRegion:withRenderTargetArrayIndex:withCondition: absent %spi-neither
+dispatchThreadsPerTile:withCondition: absent %spi-neither
+enableNullBufferBinds: absent %spi-neither
+endEncodingAndRetrieveProgramAddressTable pending %spi-both
+insertSplit pending %spi-both
+isMemorylessRender pending %spi-both
+resetTileCondition absent %spi-neither
+setAlphaTestReferenceValue: absent %spi-neither
+setClipPlane:p2:p3:p4:atIndex: absent %spi-neither
+setColorResolveTexture:slice:depthPlane:level:atIndex: absent %spi-neither
+setColorResolveTexture:slice:depthPlane:level:yInvert:atIndex: absent %spi-neither
+setCommandDataCorruptModeSPI: absent %spi-neither
+setDepthCleared gap what Metal's encoder does with it is not established; this does nothing
+setDepthClipModeSPI: pending %spi-both
+setDepthResolveTexture:slice:depthPlane:level: absent %spi-neither
+setDepthResolveTexture:slice:depthPlane:level:yInvert: absent %spi-neither
+setFragmentSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex: absent %spi-neither
+setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex: implemented
+setLineWidth: implemented
+setMeshAccelerationStructure:atBufferIndex: pending %spi-both
+setMeshIntersectionFunctionTable:atBufferIndex: pending %spi-both
+setMeshIntersectionFunctionTables:withBufferRange: pending %spi-both
+setMeshVisibleFunctionTable:atBufferIndex: pending %spi-both
+setMeshVisibleFunctionTables:withBufferRange: pending %spi-both
+setObjectAccelerationStructure:atBufferIndex: pending %spi-both
+setObjectIntersectionFunctionTable:atBufferIndex: pending %spi-both
+setObjectIntersectionFunctionTables:withBufferRange: pending %spi-both
+setObjectVisibleFunctionTable:atBufferIndex: pending %spi-both
+setObjectVisibleFunctionTables:withBufferRange: pending %spi-both
+setPointSize: absent %spi-neither
+setPrimitiveRestartEnabled: absent %spi-neither
+setPrimitiveRestartEnabled:index: absent %spi-differ (the Intel 630 answers it)
+setProvokingVertexMode: absent %spi-differ (the Intel 630 answers it)
+setStencilCleared gap what Metal's encoder does with it is not established; this does nothing
+setStencilResolveTexture:slice:depthPlane:level: absent %spi-neither
+setStencilResolveTexture:slice:depthPlane:level:yInvert: absent %spi-neither
+setToolsDispatchBufferSPI:atIndex:stages: pending %spi-both
+setTransformFeedbackState: absent %spi-neither
+setTriangleFrontFillMode:backFillMode: absent %spi-neither
+setVertexAmplificationMode:value: pending %spi-both
+setVertexSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex: absent %spi-neither
+setViewportTransformEnabled: absent %spi-neither
+useResidencySet: partial  residency sets
+useResidencySets:count: partial  residency sets
+useResourceGroup:usage:stages: absent %spi-neither
+[RgfxRenderPipelineState]
+emulationMeshMaxPrimitiveCount pending %spi-both
+emulationMeshMaxVertexCount pending %spi-both
+emulationMeshPrefixSum1PSO pending %spi-both
+emulationMeshPrefixSum2PSO pending %spi-both
+emulationMeshPrefixSum3PSO pending %spi-both
+emulationMeshShaderIntermediateBufferSlot pending %spi-both
+emulationMeshShaderPSO pending %spi-both
+emulationMeshSize pending %spi-both
+emulationNoObjectPrefixSumPSO pending %spi-both
+emulationObjectPrefixSumPSO pending %spi-both
+emulationObjectShaderIntermediateBufferSlot pending %spi-both
+emulationObjectShaderPSO pending %spi-both
+emulationPayloadMemoryLength pending %spi-both
+emulationPrimitiveTopology pending %spi-both
+emulationVertexShaderIntermediateBufferSlot pending %spi-both
+explicitVisibilityGroupID pending %spi-both
+fragmentDebugInstrumentationData pending %spi-both
+fragmentFunctionHandleWithFunction: pending %spi-both
+fragmentGlobalConstantsBase pending %spi-both
+fragmentGlobalConstantsSize pending %spi-both
+functionReflectionWithFunctionDescriptor:stage: pending %spi-both
+getFragmentShaderTelemetryID pending %spi-both
+getVertexShaderTelemetryID pending %spi-both
+gpuAddress metal 0 for every pipeline, one that supports indirect command buffers too, as Metal's answer (measured: M3 Max, macOS 27)
+gpuHandle pending %spi-both
+meshDebugInstrumentationData pending %spi-both
+meshFunctionHandleWithFunction: pending %spi-both
+meshGlobalConstantsBase pending %spi-both
+meshGlobalConstantsSize pending %spi-both
+newFragmentIntersectionFunctionTableWithDescriptor: pending %spi-both
+newFragmentShaderDebugInfo pending %spi-both
+newMeshIntersectionFunctionTableWithDescriptor: pending %spi-both
+newObjectIntersectionFunctionTableWithDescriptor: pending %spi-both
+newRenderPipelineStateWithAdditionalBinaryFunctions:fragmentAdditionalBinaryFunctions:error: unsupported  binary functions
+newTileIntersectionFunctionTableWithDescriptor: pending %spi-both
+newTileRenderPipelineStateWithAdditionalBinaryFunctions:error: pending %spi-both
+newVertexIntersectionFunctionTableWithDescriptor: pending %spi-both
+newVertexShaderDebugInfo pending %spi-both
+newVisibleFunctionTableFromFragmentStageWithDescriptor: pending %spi-both
+newVisibleFunctionTableFromMeshStageWithDescriptor: pending %spi-both
+newVisibleFunctionTableFromObjectStageWithDescriptor: pending %spi-both
+newVisibleFunctionTableFromTileStageWithDescriptor: pending %spi-both
+newVisibleFunctionTableFromVertexStageWithDescriptor: pending %spi-both
+objectDebugInstrumentationData pending %spi-both
+objectFunctionHandleWithFunction: pending %spi-both
+objectGlobalConstantsBase pending %spi-both
+objectGlobalConstantsSize pending %spi-both
+pipelineBinaries pending %spi-both
+reflectionForFunctionDescriptor: pending %spi-both
+resourceIndex pending %spi-both
+setEmulationMeshMaxPrimitiveCount: pending %spi-both
+setEmulationMeshMaxVertexCount: pending %spi-both
+setEmulationMeshShaderIntermediateBufferSlot: pending %spi-both
+setEmulationMeshShaderPSO: pending %spi-both
+setEmulationMeshSize: pending %spi-both
+setEmulationObjectShaderIntermediateBufferSlot: pending %spi-both
+setEmulationObjectShaderPSO: pending %spi-both
+setEmulationPayloadMemoryLength: pending %spi-both
+setEmulationPrimitiveTopology: pending %spi-both
+setEmulationVertexShaderIntermediateBufferSlot: pending %spi-both
+setUsesMeshShaderEmulation: pending %spi-both
+shaderValidationState pending %spi-both
+textureWriteRoundingMode pending %spi-both
+tileDebugInstrumentationData pending %spi-both
+tileFunctionHandleWithFunction: pending %spi-both
+tileGlobalConstantsBase pending %spi-both
+tileGlobalConstantsSize pending %spi-both
+uniqueIdentifier implemented
+usesMeshShaderEmulation pending %spi-both
+vertexDebugInstrumentationData pending %spi-both
+vertexFunctionHandleWithFunction: pending %spi-both
+vertexGlobalConstantsBase pending %spi-both
+vertexGlobalConstantsSize pending %spi-both
+[RgfxResource]
+protectionOptions metal the content protection the resource was made with: the device protects no content and no call sets it, so none
+responsibleProcess implemented
+setResponsibleProcess: implemented
+[RgfxSampler]
+gpuAddress metal no GPU address, whatever the descriptor, as Metal's sampler answers (measured: M3 Max, macOS 27)
+gpuHandle pending %spi-both
+pixelFormat metal no pixel format, whatever the descriptor, as Metal's sampler answers (measured: M3 Max, macOS 27)
+resourceIndex pending %spi-both
+uniqueIdentifier implemented
+[RgfxSharedEvent]
+IOSurfaceSharedEvent implemented
+enableBarrier pending %spi-unmeasured
+setEnableBarrier: pending %spi-unmeasured
+supportsRollback pending %spi-both
+[RgfxTexture]
+allocationID implemented
+canGenerateMipmapLevels absent %spi-neither
+colorSpaceConversionMatrix pending %spi-both
+compressionFeedback pending %spi-both
+compressionFootprint pending %spi-both
+compressionMetadata pending %spi-unmeasured
+didModifyData implemented
+doesAliasAllResources:count: implemented
+doesAliasAnyResources:count: implemented
+doesAliasResource: implemented
+generateMipmapLevel:slice: absent %spi-neither
+gpuAddress implemented
+gpuHandle pending %spi-both
+isComplete metal YES, as Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+isCompressed implemented
+isDrawable metal the device's textures are no drawable's: Metal answers NO for every texture an app makes (private, shared, IOSurface and views)
+isPurgeable implemented
+isWriteComplete metal YES, as Metal's resources answer even while a command buffer that writes them is in flight (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+newCompressedTextureViewWithPixelFormat:textureType:level:slice: absent %spi-neither
+newTextureViewWithPixelFormat:resourceIndex: implemented
+newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex: implemented
+newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex: implemented
+numFaces pending %spi-both
+resourceIndex pending %spi-both
+rotation metal the device's textures are shown unrotated: Metal answers 0 for every texture an app makes (private, shared, IOSurface and views)
+sparseSurfaceDefaultValue absent %spi-neither
+swizzleKey implemented
+unfilteredResourceOptions implemented
+uniqueIdentifier implemented
+waitUntilComplete metal returns at once, as Metal's resources do (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
+writeAccessPattern absent %spi-neither
+
+# The members only older guest releases' protocols carry (tests/protocol_members_releases.txt).
+[RgfxArgumentEncoder]
+setFunctionPointer:atIndex: absent %old-only
+setFunctionPointers:withRange: absent %old-only
+[RgfxBinaryArchive]
+addArchiveEntry:forKey: absent %old-only
+addBinaryEntry:forKey: absent %old-only
+getArchiveDataForKey: absent %old-only
+getArchiveIDWithError: absent %old-only
+getBinaryDataForKey: absent %old-only
+initMetalScriptWithArchive: absent %old-only
+newPipelineDescriptorAtIndex:pipelineType:error: absent %old-only
+recompilablePipelineCount absent %old-only
+[RgfxComputePipelineState]
+functionPointerHandleWithFunction: absent %old-only
+functionPointerHandlesWithFunctions:range: absent %old-only
+setGlobalConstantsBase: absent %old-only
+setGlobalConstantsSize: absent %old-only
+[RgfxIndirectRenderCommand]
+drawMeshArguments absent %old-only
+getMeshBufferAtIndex: absent %old-only
+getObjectBufferAtIndex: absent %old-only
+[RgfxRenderPipelineState]
+setFragmentGlobalConstantsBase: absent %old-only
+setFragmentGlobalConstantsSize: absent %old-only
+setMeshGlobalConstantsBase: absent %old-only
+setMeshGlobalConstantsSize: absent %old-only
+setObjectGlobalConstantsBase: absent %old-only
+setObjectGlobalConstantsSize: absent %old-only
+setTileGlobalConstantsBase: absent %old-only
+setTileGlobalConstantsSize: absent %old-only
+setVertexGlobalConstantsBase: absent %old-only
+setVertexGlobalConstantsSize: absent %old-only
+[RgfxMetalDevice]
+isBinaryFunctionPointersSupported absent %old-only-device
+requiresIABEmulation absent %old-only-device
+setResourcesPurgeableState:newState:oldState:count: absent %old-only-device
+supportsBinaryFunctionPointers absent %old-only-device

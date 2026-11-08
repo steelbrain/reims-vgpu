@@ -24,7 +24,8 @@
 #                   check (x86_64, under Rosetta), which loads the bundle
 #                   (tests/inherited_tests.mm), the protocol members' check against
 #                   their register (x86_64, under Rosetta, which loads the bundle:
-#                   tests/protocol_members_tests.mm, tests/protocol_members.txt), and the
+#                   tests/protocol_members_tests.mm, tests/protocol_members.txt,
+#                   tests/protocol_members_releases.txt), and the
 #                   video driver's H.264 and HEVC parameter-set checks and its entry
 #                   points' check (x86_64, under Rosetta, tests/video_h264_tests.cpp,
 #                   tests/video_h265_tests.cpp, tests/video_driver_tests.cpp).
@@ -314,8 +315,10 @@ $(INHERIT_TESTBIN): tests/inherited_tests.mm Makefile
 		-o $@
 
 # --- the protocol members' check (x86_64, Rosetta) ----------------------------
-# Loads the bundle and checks every member of every Metal protocol its classes adopt against
-# the register tests/protocol_members.txt, reading the members' bodies from src/: a member the
+# Loads the bundle and checks every member of every Metal protocol its classes adopt, with each
+# one's SPI counterpart and the members only older guests' protocols carry
+# (tests/protocol_members_releases.txt), against the register tests/protocol_members.txt,
+# reading the members' bodies from src/: a member the
 # register does not list, or one listed as carried out whose body does nothing or answers a
 # constant, fails (tests/protocol_members_tests.mm).
 
@@ -359,7 +362,8 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_REFLECTED) $
 		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
 		RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
-	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt src
+	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt \
+		tests/protocol_members_releases.txt src
 	arch -$(ARCH) $(VIDEO_TESTBIN)
 	arch -$(ARCH) $(VIDEO_H265_TESTBIN)
 	arch -$(ARCH) $(VIDEO_DRIVER_TESTBIN)

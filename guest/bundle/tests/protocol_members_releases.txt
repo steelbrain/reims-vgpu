@@ -1,0 +1,43 @@
+# The members some guest macOS from 11 to 26 carries in an MTL* protocol that the Mac's Metal
+# (the one tests/protocol_members_tests.mm runs on) does not: one line per member,
+# "Protocol selector required|optional releases". The test adds each to every class of ours that
+# adopts the protocol or its public counterpart, and the register classifies it as any other, so a
+# member a release's frameworks may send stays answered after the Mac's Metal drops it.
+#
+# Made with tools/protocol_dump.m, run in each guest and on the Mac: for each protocol a class of
+# ours adopts, and its SPI counterpart, the members a guest's protocol has that the Mac's
+# protocol, with the protocols it adopts, lacks. Measured: macOS 11.7.11, 12.7.6, 13.7.8 and
+# 26.7.2 against macOS 27.0.1. A line whose member the Mac's protocol has fails, as it is walked
+# already.
+
+MTLArgumentEncoderSPI setFunctionPointer:atIndex: required 11.7.11
+MTLArgumentEncoderSPI setFunctionPointers:withRange: required 11.7.11
+MTLBinaryArchiveSPI addBinaryEntry:forKey: required 11.7.11 12.7.6 13.7.8
+MTLBinaryArchiveSPI getBinaryDataForKey: required 11.7.11 12.7.6 13.7.8
+MTLComputePipelineStateSPI functionPointerHandleWithFunction: required 11.7.11
+MTLComputePipelineStateSPI functionPointerHandlesWithFunctions:range: required 11.7.11
+MTLDeviceSPI isBinaryFunctionPointersSupported required 11.7.11
+MTLDeviceSPI requiresIABEmulation required 11.7.11
+MTLDeviceSPI setResourcesPurgeableState:newState:oldState:count: required 11.7.11 12.7.6
+MTLDeviceSPI supportsBinaryFunctionPointers required 11.7.11
+MTLBinaryArchiveSPI addArchiveEntry:forKey: required 12.7.6 13.7.8
+MTLBinaryArchiveSPI getArchiveDataForKey: required 12.7.6 13.7.8
+MTLBinaryArchiveSPI getArchiveIDWithError: required 13.7.8
+MTLBinaryArchiveSPI initMetalScriptWithArchive: required 13.7.8
+MTLBinaryArchiveSPI newPipelineDescriptorAtIndex:pipelineType:error: required 13.7.8
+MTLBinaryArchiveSPI recompilablePipelineCount required 13.7.8
+MTLIndirectRenderCommandSPI drawMeshArguments required 13.7.8
+MTLIndirectRenderCommandSPI getMeshBufferAtIndex: required 13.7.8
+MTLIndirectRenderCommandSPI getObjectBufferAtIndex: required 13.7.8
+MTLComputePipelineStateSPI setGlobalConstantsBase: required 26.7.2
+MTLComputePipelineStateSPI setGlobalConstantsSize: required 26.7.2
+MTLRenderPipelineStateSPI setFragmentGlobalConstantsBase: required 26.7.2
+MTLRenderPipelineStateSPI setFragmentGlobalConstantsSize: required 26.7.2
+MTLRenderPipelineStateSPI setMeshGlobalConstantsBase: required 26.7.2
+MTLRenderPipelineStateSPI setMeshGlobalConstantsSize: required 26.7.2
+MTLRenderPipelineStateSPI setObjectGlobalConstantsBase: required 26.7.2
+MTLRenderPipelineStateSPI setObjectGlobalConstantsSize: required 26.7.2
+MTLRenderPipelineStateSPI setTileGlobalConstantsBase: required 26.7.2
+MTLRenderPipelineStateSPI setTileGlobalConstantsSize: required 26.7.2
+MTLRenderPipelineStateSPI setVertexGlobalConstantsBase: required 26.7.2
+MTLRenderPipelineStateSPI setVertexGlobalConstantsSize: required 26.7.2
