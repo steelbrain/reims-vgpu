@@ -997,7 +997,13 @@ impl<P: Platform> SurfaceViews<P> {
     fn make_room(&mut self, short: u64, held: impl Fn(&SurfaceView<P>) -> u64) -> Vec<Cached<P>> {
         let mut idle: Vec<(usize, u64, bool)> = (self.cache.iter().enumerate())
             .filter(|(_, c)| c.idle())
-            .map(|(at, c)| (at, held(c.view.as_ref()), Arc::strong_count(&c.view.held) > 1))
+            .map(|(at, c)| {
+                (
+                    at,
+                    held(c.view.as_ref()),
+                    Arc::strong_count(&c.view.held) > 1,
+                )
+            })
             .collect();
         // Stable: the oldest first among each.
         idle.sort_by_key(|&(_, _, shared)| shared);
@@ -2064,7 +2070,10 @@ pub(super) mod tests {
             unheld[1..].iter().all(|v| v.upgrade().is_none()),
             "the unheld views no device holds went"
         );
-        assert!(unheld[0].upgrade().is_some(), "the one a device holds stays");
+        assert!(
+            unheld[0].upgrade().is_some(),
+            "the one a device holds stays"
+        );
         assert_eq!(torn_down(&r, mark), [true, true]);
         assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 2);
 
@@ -2077,7 +2086,10 @@ pub(super) mod tests {
         let mark = r.p.call_log().mark();
         assert_eq!(r.pages(block(5), &[(30, 1)], page), RGFX_STATUS_OK);
         assert!(held.upgrade().is_some(), "the view its block holds stays");
-        assert!(unheld[0].upgrade().is_some(), "the one a device holds stays");
+        assert!(
+            unheld[0].upgrade().is_some(),
+            "the one a device holds stays"
+        );
         assert_eq!(torn_down(&r, mark), [true]);
         assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 3);
 
@@ -2116,7 +2128,10 @@ pub(super) mod tests {
         r.dec.surface_worker().flush();
         let mark = r.p.call_log().mark();
         assert_eq!(r.pages(block(8), &[(60, 1)], page), RGFX_STATUS_OK);
-        assert!(other.upgrade().is_some(), "the view mapped another way stays");
+        assert!(
+            other.upgrade().is_some(),
+            "the view mapped another way stays"
+        );
         assert!(r.dec.views_of_surfaces().view(block(8)).is_some());
         assert_eq!(torn_down(&r, mark), Vec::<bool>::new());
         assert_eq!(r.dec.views_of_surfaces().counts().idle_returned, 5);

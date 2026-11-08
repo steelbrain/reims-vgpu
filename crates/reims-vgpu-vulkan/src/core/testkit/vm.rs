@@ -503,7 +503,9 @@ impl HostVm for FakeVm {
         let region = &g.areas.get(i)?.region;
         let end = off.saturating_add(len);
         let meets = |a: &&Alias| {
-            Arc::ptr_eq(&a.dst, region) && a.dst_off < end && off < a.dst_off.saturating_add(a.len())
+            Arc::ptr_eq(&a.dst, region)
+                && a.dst_off < end
+                && off < a.dst_off.saturating_add(a.len())
         };
         Some(g.aliases.iter().filter(meets).count().to_u64())
     }
