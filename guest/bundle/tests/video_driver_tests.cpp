@@ -225,6 +225,10 @@ struct SentDecode {
 };
 std::vector<SentDecode> g_sent;
 int g_work;
+// The host's verdict on each decode a schedule waits for, and how many verdicts schedules waited
+// for since a check cleared the count.
+int g_verdict = 1;
+int g_waits;
 
 } // namespace
 
@@ -306,10 +310,6 @@ void *decode(Session *, const Decode &d)
 	return &g_work;
 }
 int tokenStatus(void *) { return 1; }
-// The host's verdict on each decode a schedule waits for, and how many verdicts schedules waited
-// for since a check cleared the count.
-int g_verdict = 1;
-int g_waits;
 int waitToken(void *)
 {
 	g_waits++;
