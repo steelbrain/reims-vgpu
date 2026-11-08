@@ -14,8 +14,11 @@
 //! textures over the pages did. The surface's pages are the other end of each copy, through their
 //! view ([`super::surface_pages`]) or by their runs (below).
 //!
-//! - **Fill.** A cache is filled from the pages as it is made, as of the CPU's generation of the
-//!   surface in the block's header: the kext's count of the surface's read-write locks, which
+//! - **Fill.** A cache is filled from the pages as it is made, its fill committed once the
+//!   block's `SURFACE_PAGES` is answered, before the block settles
+//!   ([`SurfaceCaches::fill_first`]): the kext's wait for the answer takes no fill, and every
+//!   message that reaches the cache waits for the block to settle, so finds the fill made. The
+//!   fill is as of the CPU's generation of the surface in the block's header: the kext's count of the surface's read-write locks, which
 //!   IOSurface marks at the lock. So a texture over the surface that a command buffer reaches
 //!   with no use named (through an argument buffer, with no `useResource:`, which Metal leaves the
 //!   app to make resident) reads the pages as they were then, not a cache never filled. A command
@@ -234,6 +237,10 @@ pub(crate) struct SurfaceCache<P: Platform> {
     written: bool,
     /// The transfer event's value at which the cache's last fill is done; 0 for none.
     filled_at: u64,
+    /// The CPU's generation of the surface the cache's first fill is of, owed from the cache's
+    /// make until its `SURFACE_PAGES` is answered ([`SurfaceCaches::fill_first`]); `None` once
+    /// that fill is made, and for a deferred block's cache, which is made filled.
+    first_fill: Option<u64>,
     /// Each queue whose command buffers used the cache since its last copy, with the value of the
     /// queue's end event the latest of them signals.
     users: HashMap<u64, u64>,
@@ -913,9 +920,9 @@ impl<P: Platform> SurfaceCaches<P> {
     /// A cache for the block at `block`, whose surface's pages `view` maps: `Ok(false)` where
     /// the platform made no buffer for it, and the block keeps its view. `host_pages` are the
     /// pages' host addresses in the guest's RAM, [`device_writes::sorted`], which the host's
-    /// devices' writes are watched over. A new cache is filled from the pages at once, as of
-    /// `generation`, the CPU's generation of the surface in the block's header
-    /// ([`Self::fill_made`]).
+    /// devices' writes are watched over. A new cache is filled from the pages as of `generation`,
+    /// the CPU's generation of the surface in the block's header ([`Self::fill_made`]), once its
+    /// `SURFACE_PAGES` is answered ([`Self::fill_first`]).
     ///
     /// A block that has a cache keeps it where its pages are the same, filled again from them as
     /// of `generation` ([`Self::fill_named_again`]), as the kext's generations of the surface may
@@ -1009,6 +1016,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 host_read: 0,
                 written: false,
                 filled_at: 0,
+                first_fill: Some(generation),
                 users: HashMap::new(),
                 asked: 0,
                 made: 0,
@@ -1025,6 +1033,23 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         self.watched.0.lock().insert(block, pages);
         self.counts.made += 1;
+        Ok(true)
+    }
+
+    /// The first fill of the block at `block`'s new cache, owed since its make
+    /// ([`SurfaceCache::first_fill`]), made once the block's `SURFACE_PAGES` is answered and
+    /// before the block settles: the guest's kext waits for the answer, not for the fill's
+    /// encode and commit, and every message that names the block, which is what reaches the
+    /// cache (a `BUFFER_OVER_SURFACE_PAGES`, a command buffer's use, a present, a
+    /// `SURFACE_DOWNLOAD`, its release), waits for the block to settle, so it finds the fill
+    /// made, its value in [`SurfaceCache::filled_at`]: a use waits for it on the GPU, on the
+    /// transfer event, as for any fill, and a copy into the pages runs after it on the transfer
+    /// queue. Whether a fill was owed: nothing where none is, or the block has no cache.
+    fn fill_first(&mut self, device: &P::Device, block: u64) -> RaiseResult<bool> {
+        let Some(generation) = (self.by_block.get_mut(&block)).and_then(|c| c.first_fill.take())
+        else {
+            return Ok(false);
+        };
         self.fill_made(device, block, generation)?;
         Ok(true)
     }
@@ -1033,8 +1058,8 @@ impl<P: Platform> SurfaceCaches<P> {
     /// `generation`, on the transfer queue, as the first use of that generation would fill it:
     /// so a use the guest names no `RGFX_OP_SURFACE_USE` of (a texture over the surface reached
     /// through an argument buffer with no `useResource:`, which Metal leaves the app to make
-    /// resident) reads the pages as they were when the block was cached, not a cache never
-    /// filled, and the first named use of the generation fills nothing, waiting for this fill
+    /// resident) reads the pages as the fill found them, not a cache never filled, and the first
+    /// named use of the generation fills nothing, waiting for this fill
     /// where it has not finished. A use of a newer generation fills again, as before. Nothing
     /// uses a new cache yet, so the fill waits for no command buffer.
     fn fill_made(&mut self, device: &P::Device, block: u64, generation: u64) -> RaiseResult<()> {
@@ -1111,6 +1136,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 host_read: 0,
                 written: false,
                 filled_at,
+                first_fill: None,
                 users: HashMap::new(),
                 asked: 0,
                 made: 0,
@@ -3212,6 +3238,13 @@ impl<P: Platform> Caches<P> {
         state.make_by_runs(device, block, runs, unmade, host_pages, generation, layout)
     }
 
+    /// The first fill of the block at `block`'s new cache, once its `SURFACE_PAGES` is answered
+    /// ([`SurfaceCaches::fill_first`]), where one is owed. Nothing uses a new cache before it,
+    /// so it waits for no command buffer.
+    pub(crate) fn fill_first(&self, device: &P::Device, block: u64) -> RaiseResult<bool> {
+        self.state.lock().fill_first(device, block)
+    }
+
     /// The deferred block at `block`'s pages taken copied ([`SurfaceCaches::attach_copied`]),
     /// which copies nothing, so waits for no command buffer.
     pub(crate) fn attach_copied(
@@ -3731,7 +3764,7 @@ mod tests {
         assert_eq!(filled[0].1, cache, "into the cache");
         assert!(
             calls.iter().any(|c| c.sel == "commit"),
-            "committed at the make"
+            "committed as the naming is answered"
         );
         let transfer = events(&calls, SIGNAL)[0];
         let counts = r.dec.caches().counts();
@@ -3751,6 +3784,79 @@ mod tests {
         use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 3, false)]);
         assert_eq!(copies(&r.p.call_log().since(mark)).len(), 1);
         assert_eq!(r.dec.caches().counts().fills, 2);
+    }
+
+    /// A new cache's first fill is made once its `SURFACE_PAGES` is answered, not before it, so
+    /// the kext's wait for the answer takes no fill, and before the block settles: a command
+    /// buffer that uses the surface, issued right after the answer, waits for the block to settle
+    /// before it is decoded, then fills nothing more and waits on the GPU for that fill, on the
+    /// transfer event, so it reads the filled cache. Had it been decoded before the fill, it would
+    /// have filled the cache itself, and the first fill again after it
+    #[test]
+    fn a_use_right_after_the_answer_waits_for_the_first_fill() {
+        let mut r = rig(8);
+        let page = r.page;
+        queues(&mut r);
+        let runs = [RgfxPageRun {
+            address: RAM + page,
+            length: 2 * page,
+        }];
+        let m = RgfxSurfacePages {
+            header: RgfxMsgHeader {
+                r#type: reims_vgpu_graphics::wire::RGFX_CMD_SURFACE_PAGES,
+                size: size_of::<RgfxSurfacePages>() as u32,
+                seqno: 0,
+            },
+            context: 0,
+            run_count: 1,
+            block_offset: BLOCK,
+            block_size: 0x2000,
+            runs_offset: BLOCK + 0x1000,
+            length: 2 * page,
+        };
+        let mark = r.p.call_log().mark();
+        let settle = r.dec.begin_surface_pages(BLOCK);
+        let status = (r.dec).carry_out_surface_pages(
+            &r.device,
+            &m,
+            &runs,
+            RGFX_SURFACE_PAGES_CACHED,
+            None,
+            &settle,
+        );
+        assert_eq!(status, Some(RGFX_STATUS_OK), "the answer");
+        assert_eq!(r.dec.caches().len(), 1, "the cache made before the answer");
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "no fill before the answer"
+        );
+        let message = surfaces_message(1, 0x100, &[(BLOCK, 0, false)], false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            // A lane's decoder, as the context's own messages take.
+            let mut dec = r.dec.sender(None, super::super::Sinks::default());
+            let device = r.device.clone_ref();
+            scope.spawn(move || tx.send(dec.decode(&device, &message).unwrap()).unwrap());
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "the use waits for the block to settle"
+            );
+            r.dec.surface_pages_answered(&r.device, BLOCK, &settle);
+            drop(settle);
+            assert_eq!(rx.recv().unwrap(), Ok(()), "decoded once the block settled");
+        });
+        let calls = r.p.call_log().since(mark);
+        let filled = copies(&calls);
+        assert_eq!(filled.len(), 1, "the first fill alone");
+        assert_eq!(filled[0].1, cache_id(&r), "into the cache");
+        let transfer = events(&calls, SIGNAL)[0];
+        assert!(
+            events(&calls, WAIT).contains(&transfer),
+            "the use waits on the GPU for the first fill"
+        );
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.fills, counts.made_fills), (1, 1));
     }
 
     /// A use of a newer generation than the cache's (its make's, 0) fills the cache from the

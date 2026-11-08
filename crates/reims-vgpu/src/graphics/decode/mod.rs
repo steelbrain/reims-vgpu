@@ -1054,8 +1054,11 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) -> u32 {
         self.wait_copies_into(pages.block_offset, runs);
         let settle = self.begin_surface_pages(pages.block_offset);
-        self.carry_out_surface_pages(device, pages, runs, flags, layout, &settle)
-            .unwrap_or(RGFX_STATUS_REFUSED)
+        let status = self.carry_out_surface_pages(device, pages, runs, flags, layout, &settle);
+        if status.is_some() {
+            self.surface_pages_answered(device, pages.block_offset, &settle);
+        }
+        status.unwrap_or(RGFX_STATUS_REFUSED)
     }
 
     /// Waits, before the `SURFACE_PAGES` of the block at `block` over `runs` is begun, for every
@@ -1225,6 +1228,38 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         Some(status)
+    }
+
+    /// The `SURFACE_PAGES` of the block at `block` that `settle` began, carried out
+    /// ([`Self::carry_out_surface_pages`]) and answered: the first fill of the device cache it
+    /// made the block, owed since the cache's make, is made now, before the block settles
+    /// ([`surface_cache::Caches::fill_first`]). Nothing where the device was reset since `settle`
+    /// began it.
+    pub(crate) fn surface_pages_answered(
+        &self,
+        device: &P::Device,
+        block: u64,
+        settle: &worker::Settle,
+    ) {
+        if self.shared.surface_views.lock().resets() != settle.resets {
+            return;
+        }
+        let clock = self.platform.clock();
+        let start = clock.now_mono();
+        match self.surface_caches.fill_first(device, block) {
+            Ok(true) => log::debug!(
+                target: "reims_vgpu::graphics::surface_pages",
+                "SURFACE_PAGES of the block at {block:#x} answered: its device cache's first fill \
+                 committed in {} us",
+                clock.now_mono().saturating_duration_since(start).as_micros()
+            ),
+            Ok(false) => {}
+            Err(raise) => log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: the platform raised at its device cache's \
+                 first fill ({raise:?})"
+            ),
+        }
     }
 
     /// [`Self::carry_out_surface_pages`] of a block with pages, which it maps.
@@ -2050,7 +2085,9 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Waits for the block at `block` to be as its `SURFACE_PAGES` left it, where the surface
     /// worker is still carrying one out ([`worker::Unsettled`]), and logs the wait: the guest's
-    /// kext names a block only once it is answered, so a wait is a message the guest posted before.
+    /// kext names a block only once it is answered, so a wait is a message the guest posted before,
+    /// or after the answer while the block's new device cache's first fill is made
+    /// ([`Self::surface_pages_answered`]).
     fn settle_surface(&self, block: u64) {
         if !self.shared.unsettled.any(std::iter::once(block)) {
             return;

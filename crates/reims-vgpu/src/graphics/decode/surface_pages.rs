@@ -131,7 +131,8 @@
 //! it would have right after the `SURFACE_PAGES`; a pages block's `SURFACE_PAGES`, which only
 //! checks its runs, is carried out
 //! there too, in its order with the rest. The guest's kext names a block only after the answer, so
-//! in its order nothing waits. A pages block's view, which its first `BUFFER_OVER_PAGES` or
+//! in its order nothing waits but for the block's device cache's first fill, made after the
+//! answer and before the block settles (`surface_cache`, "Fill"). A pages block's view, which its first `BUFFER_OVER_PAGES` or
 //! `HEAP_OVER_PAGES` makes, is made on the worker as well (`GraphicsControl::start_over_pages`):
 //! neither message has an answer, so its context's later messages, its block's release and its
 //! context's close wait for it instead, and none of its context's command buffers is answered at

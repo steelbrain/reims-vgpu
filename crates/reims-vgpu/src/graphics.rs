@@ -1147,7 +1147,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// surface worker (`decode::surface_pages`), so ring 0 goes on meanwhile, under the reset
     /// gate, held shared recursively, as a queue that holds it may wait for the block. Answered
     /// there once the block's view and device cache are made, before the block settles, so a
-    /// message that names the block and waited for it is answered after it.
+    /// message that names the block and waited for it is answered after it; the cache's first
+    /// fill is made after the answer, again under the gate, and before the block settles
+    /// (`GraphicsDecoder::surface_pages_answered`).
     fn start_surface_pages(
         self: &Arc<Self>,
         pages: RgfxSurfacePages,
@@ -1172,6 +1174,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             // Nothing is owed where the device was reset since.
             if let Some(status) = status {
                 answer.answer(status);
+                let _carried = me.reset_gate.read_recursive();
+                (me.decoder()).surface_pages_answered(&me.device, pages.block_offset, &settle);
             }
             drop(settle);
         };
