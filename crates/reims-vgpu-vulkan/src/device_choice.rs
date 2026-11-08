@@ -13,18 +13,49 @@
 //!   candidate: Mesa's device-select layer and the loader list the device those name first. The
 //!   runtime alone ranks the candidates by kind first, so it opened a discrete GPU even where the
 //!   user's variable listed an integrated one first without its `!`.
-//! - Otherwise the runtime's own order: discrete GPUs, then integrated, virtual and CPU ones, each
-//!   kind in the loader's order (`Device::system_default_with`, read from code).
+//! - Otherwise, where one candidate is a GPU (any kind but a CPU implementation such as
+//!   llvmpipe), that GPU, never timed.
+//! - Where several are, the one that ran a fixed workload fastest ([`measured`]): the display's
+//!   composite at a fixed size and one pass over textures in host memory, timed on a device made
+//!   for each GPU and torn down after (`timing.rs`). The verdict is kept in the library's cache
+//!   directory, under a key of every timed GPU's UUID and driver version (`verdict.rs`), so only
+//!   the first open after a GPU or driver change times them; a verdict that does not read times
+//!   them again. Where the runtime refuses any GPU's workload, nothing is kept and the runtime's
+//!   own order stands.
+//! - A CPU implementation is picked only where no GPU is a candidate, and never timed. The
+//!   runtime's own order: discrete GPUs, then integrated, virtual and CPU ones, each kind in the
+//!   loader's order (`Device::system_default_with`, read from code).
+//!
+//! No vendor or device ID takes part: what a device reports picks the GPUs to time, and their
+//! times pick among them. The kind, the memory heaps and the PCIe link do not tell a GPU's speed
+//! for the guest's work (an integrated GPU runs from 2 compute units to 40, and a discrete one of
+//! 4 GiB may be a GTX 1650 or an RX 550), so where they cannot decide alone, a measurement does.
+//!
+//! **Measured** on 2026-11-08 (Mesa 26.2.6, loader 1.4.363), the workload's two timed frames:
+//! - um790: the Radeon 780M took 30 ms and the RX 550 40 ms, so the 780M is picked. The runtime's
+//!   order opened the RX 550, which composites a 3840x2400 frame in 40.4 ms to the 780M's 24.4 ms
+//!   (reims-vgpu's `composite_cost`).
+//! - gem10: the RX 7900 XTX took 9 ms and the Radeon 780M 29 ms, so the XTX stays the pick.
+//! - The measurement took 197 ms in all on um790 and about 180 ms on gem10, once; a first open
+//!   that reads the kept verdict took 39 to 45 ms on either.
 //!
 //! **Unchanged hosts.** Where the pick is the device the runtime would make its default device of
 //! anyway, it is made as before, by `Device::system_default_with` ([`chosen`] answers `None`). The
-//! choice is logged once, at info: every device seen, then the one picked and why.
+//! choice is logged once, at info: every device seen, each GPU's time and what its measurement
+//! cost in all, then the one picked and why.
+
+mod timing;
+mod verdict;
 
 use std::ffi::OsString;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use ash::vk;
+
+use crate::core::platform::os::Clock as _;
 
 /// The log target of the choice's lines.
 const TARGET: &str = "reims_vgpu_vulkan::device_choice";
@@ -73,6 +104,11 @@ impl Seen {
     /// Whether the runtime makes a device of it (the module doc's candidates).
     pub(crate) fn candidate(&self) -> bool {
         self.api_version >= vk::API_VERSION_1_2 && self.graphics_compute && self.uuid.is_some()
+    }
+
+    /// Whether it is a GPU: any kind but a CPU implementation.
+    fn gpu(&self) -> bool {
+        self.kind != vk::PhysicalDeviceType::CPU
     }
 
     /// The device as its log line names it.
@@ -124,8 +160,14 @@ fn gib(bytes: u64) -> f64 {
 pub(crate) enum Why {
     /// It is the only candidate.
     Only,
+    /// It is the only GPU among the candidates, the others CPU implementations.
+    OnlyGpu,
     /// The host's user picked it through this variable: the loader's first candidate.
     UserChose(&'static str),
+    /// It ran the workload fastest, timed now.
+    Measured,
+    /// It ran the workload fastest when the same GPUs on the same drivers were timed before.
+    Cached,
     /// It is first in the runtime's own order.
     RuntimeOrder,
 }
@@ -135,6 +177,11 @@ impl Why {
     fn describe(self) -> String {
         match self {
             Why::Only => "the only device the runtime can use".to_owned(),
+            Why::OnlyGpu => "the only GPU the runtime can use, beside CPU devices".to_owned(),
+            Why::Measured => "the fastest of the GPUs at the choice's workload".to_owned(),
+            Why::Cached => "the fastest of the GPUs at the choice's workload, as measured \
+                            before on the same GPUs and drivers"
+                .to_owned(),
             Why::UserChose(var) => {
                 format!("{var} is set, so the loader's first device, as the host's user picked")
             }
@@ -146,17 +193,100 @@ impl Why {
 }
 
 /// The device of `seen` (the loader's order) the library opens, and why: the first candidate
-/// where `user` names the variable the host's user picked a device through, else the first of the
-/// runtime's own order (the module doc). `None` where no device is a candidate.
-pub(crate) fn choose(seen: &[Seen], user: Option<&'static str>) -> Option<(usize, Why)> {
-    let mut candidates = seen.iter().enumerate().filter(|(_, s)| s.candidate());
+/// where `user` names the variable the host's user picked a device through; else the one GPU
+/// among the candidates; else, of several GPUs, the one `measure` answers for them (their
+/// indices in `seen`), or the first of the runtime's own order where it answers none (the module
+/// doc). `measure` is asked only of two GPUs or more. `None` where no device is a candidate.
+pub(crate) fn choose(
+    seen: &[Seen],
+    user: Option<&'static str>,
+    measure: impl FnOnce(&[usize]) -> Option<(usize, Why)>,
+) -> Option<(usize, Why)> {
+    let candidates: Vec<usize> = (seen.iter().enumerate())
+        .filter(|(_, s)| s.candidate())
+        .map(|(at, _)| at)
+        .collect();
     if let Some(var) = user {
-        return candidates.next().map(|(at, _)| (at, Why::UserChose(var)));
+        return candidates.first().map(|&at| (at, Why::UserChose(var)));
     }
-    if candidates.count() == 1 {
+    if candidates.len() == 1 {
         return runtime_first(seen).map(|at| (at, Why::Only));
     }
-    runtime_first(seen).map(|at| (at, Why::RuntimeOrder))
+    let gpus: Vec<usize> = (candidates.iter().copied())
+        .filter(|&at| seen.get(at).is_some_and(Seen::gpu))
+        .collect();
+    match gpus.as_slice() {
+        [only] => Some((*only, Why::OnlyGpu)),
+        [_, _, ..] => measure(&gpus),
+        [] => None,
+    }
+    .or_else(|| runtime_first(seen).map(|at| (at, Why::RuntimeOrder)))
+}
+
+/// Of the GPUs `gpus` (indices in `seen`), the one that ran the workload fastest: the verdict kept
+/// at `cache` for them, where it reads (`verdict.rs`), else the fastest of the times `time` answers
+/// for each, kept at `cache` for the next process; `None` where `time` answers none for any of
+/// them, and then nothing is kept (the module doc). The times and what they cost in all are
+/// logged.
+pub(crate) fn measured(
+    seen: &[Seen],
+    gpus: &[usize],
+    cache: Option<&Path>,
+    mut time: impl FnMut(usize, &Seen) -> Option<Duration>,
+) -> Option<(usize, Why)> {
+    let timed: Vec<(usize, &Seen)> = (gpus.iter())
+        .map(|&at| Some((at, seen.get(at)?)))
+        .collect::<Option<_>>()?;
+    let key = verdict::key(&timed.iter().map(|(_, s)| *s).collect::<Vec<_>>())?;
+    let kept = cache.and_then(|path| verdict::read(path, &key));
+    if let Some(&(at, _)) = timed.iter().find(|(_, s)| kept.is_some() && s.uuid == kept) {
+        return Some((at, Why::Cached));
+    }
+    let clock = crate::os::OsClock::new();
+    let start = clock.now_mono();
+    let mut times = Vec::with_capacity(timed.len());
+    for &(at, device) in &timed {
+        let Some(took) = time(at, device) else {
+            log::warn!(
+                target: TARGET,
+                "the choice's workload failed on Vulkan device {at}: the runtime's own order \
+                 stands, and no verdict is kept"
+            );
+            return None;
+        };
+        times.push((at, device, took));
+    }
+    let &(fastest, device, _) = times.iter().min_by_key(|(_, _, took)| *took)?;
+    log::info!(
+        target: TARGET,
+        "timed {} GPUs for the choice in {:.1} ms in all",
+        times.len(),
+        timing::millis(clock.now_mono().saturating_duration_since(start))
+    );
+    if let (Some(path), Some(pick)) = (cache, device.uuid) {
+        let rows: Vec<([u8; 16], Duration)> = (times.iter())
+            .filter_map(|(_, s, took)| Some((s.uuid?, *took)))
+            .collect();
+        if let Err(e) = verdict::write(path, &key, &pick, &rows) {
+            log::warn!(
+                target: TARGET,
+                "the choice's verdict was not kept at {} ({e}): the next process times the GPUs \
+                 again",
+                path.display()
+            );
+        }
+    }
+    Some((fastest, Why::Measured))
+}
+
+/// The file the measured pick's verdict is kept in: `device-checks/gpu-choice` under the library's
+/// cache directory (`crate::platform::cache_directory`); none where there is no such directory.
+fn verdict_file() -> Option<PathBuf> {
+    Some(
+        crate::platform::cache_directory()?
+            .join("device-checks")
+            .join("gpu-choice"),
+    )
 }
 
 /// The candidate of `seen` the runtime alone makes its default device of: the first of its order
@@ -202,18 +332,23 @@ fn user_selection(var: impl Fn(&str) -> Option<OsString>) -> Option<&'static str
 pub(crate) fn chosen() -> Option<u64> {
     static CHOSEN: LazyLock<Option<u64>> = LazyLock::new(|| {
         let seen = crate::os::seen_devices();
-        let picked = choose(seen, user_selection(|name| std::env::var_os(name)));
+        for (at, device) in seen.iter().enumerate() {
+            log::info!(target: TARGET, "Vulkan device {at}: {}", device.describe());
+        }
+        let file = verdict_file();
+        let picked = choose(
+            seen,
+            user_selection(|name| std::env::var_os(name)),
+            |gpus| measured(seen, gpus, file.as_deref(), timing::time_on),
+        );
         log_choice(seen, picked);
         to_open(seen, picked.map(|(at, _)| at))
     });
     *CHOSEN
 }
 
-/// Logs every device of `seen` and the one `picked`, with why, at info.
+/// Logs the device of `seen` `picked`, with why, at info.
 fn log_choice(seen: &[Seen], picked: Option<(usize, Why)>) {
-    for (at, device) in seen.iter().enumerate() {
-        log::info!(target: TARGET, "Vulkan device {at}: {}", device.describe());
-    }
     match picked.and_then(|(at, why)| Some((at, seen.get(at)?, why))) {
         Some((at, device, why)) => log::info!(
             target: TARGET,
@@ -290,35 +425,64 @@ pub(crate) mod tests {
         seen("llvmpipe", vk::PhysicalDeviceType::CPU, 29 * GIB, id)
     }
 
-    /// Without a selection variable the pick is the runtime's own: a discrete GPU before an
-    /// integrated one wherever the loader lists it, then llvmpipe; so nothing is opened by ID
+    /// A `measure` that must not be asked.
+    fn unasked(gpus: &[usize]) -> Option<(usize, Why)> {
+        panic!("measured {gpus:?}")
+    }
+
+    /// Of several GPUs, the one the measurement answers, asked of the GPUs alone and never of
+    /// llvmpipe; by ID where the runtime alone would make another
     #[test]
-    fn without_a_selection_the_runtimes_order_stands() {
+    fn several_gpus_are_measured_and_the_cpu_never() {
         let list = [integrated(11, 1), discrete(4, 2), cpu(3)];
-        assert_eq!(choose(&list, None), Some((1, Why::RuntimeOrder)));
+        let mut asked = Vec::new();
+        let picked = choose(&list, None, |gpus| {
+            asked = gpus.to_vec();
+            Some((0, Why::Measured))
+        });
+        assert_eq!(picked, Some((0, Why::Measured)));
+        assert_eq!(asked, [0, 1]);
+        assert_eq!(to_open(&list, Some(0)), list[0].registry_id());
         assert_eq!(to_open(&list, Some(1)), None);
-        let list = [cpu(1), integrated(2, 2)];
-        assert_eq!(choose(&list, None), Some((1, Why::RuntimeOrder)));
+    }
+
+    /// Where the measurement answers nothing, the runtime's own order stands: a discrete GPU
+    /// before an integrated one wherever the loader lists it, opened as before
+    #[test]
+    fn an_unmeasured_choice_keeps_the_runtimes_order() {
+        let list = [integrated(11, 1), discrete(4, 2), cpu(3)];
+        assert_eq!(choose(&list, None, |_| None), Some((1, Why::RuntimeOrder)));
         assert_eq!(to_open(&list, Some(1)), None);
+    }
+
+    /// One GPU beside llvmpipe is picked unmeasured, as the runtime picks it, and two CPU devices
+    /// keep the runtime's order unmeasured
+    #[test]
+    fn one_gpu_is_never_measured() {
+        let list = [cpu(1), discrete(16, 2)];
+        assert_eq!(choose(&list, None, unasked), Some((1, Why::OnlyGpu)));
+        assert_eq!(to_open(&list, Some(1)), None);
+        let list = [cpu(1), cpu(2)];
+        assert_eq!(choose(&list, None, unasked), Some((0, Why::RuntimeOrder)));
     }
 
     /// A host of one candidate opens it as the runtime does, with nothing to open by ID
     #[test]
     fn one_candidate_is_opened_as_before() {
         for list in [vec![discrete(4, 1)], vec![integrated(2, 1)], vec![cpu(1)]] {
-            assert_eq!(choose(&list, None), Some((0, Why::Only)));
+            assert_eq!(choose(&list, None, unasked), Some((0, Why::Only)));
             assert_eq!(to_open(&list, Some(0)), None);
         }
-        assert_eq!(choose(&[], None), None);
+        assert_eq!(choose(&[], None, unasked), None);
         assert_eq!(to_open(&[], None), None);
     }
 
-    /// Where the host's user picked a device, the loader's first candidate is opened: by ID where
-    /// the runtime alone would make another
+    /// Where the host's user picked a device, the loader's first candidate is opened, unmeasured:
+    /// by ID where the runtime alone would make another
     #[test]
     fn the_users_pick_is_the_loaders_first() {
         let list = [integrated(11, 1), discrete(24, 2), cpu(3)];
-        let picked = choose(&list, Some("MESA_VK_DEVICE_SELECT"));
+        let picked = choose(&list, Some("MESA_VK_DEVICE_SELECT"), unasked);
         assert_eq!(picked, Some((0, Why::UserChose("MESA_VK_DEVICE_SELECT"))));
         assert_eq!(to_open(&list, Some(0)), list[0].registry_id());
         let not_usable = Seen {
@@ -326,7 +490,8 @@ pub(crate) mod tests {
             ..discrete(24, 9)
         };
         let list = [not_usable, discrete(4, 2), integrated(11, 1)];
-        assert_eq!(choose(&list, Some("DRI_PRIME")).map(|(at, _)| at), Some(1));
+        let picked = choose(&list, Some("DRI_PRIME"), unasked);
+        assert_eq!(picked.map(|(at, _)| at), Some(1));
         assert_eq!(to_open(&list, Some(1)), None);
     }
 
@@ -378,9 +543,93 @@ pub(crate) mod tests {
             ..discrete(24, 3)
         };
         let list = [old, no_queue, no_id, integrated(2, 4)];
-        assert_eq!(choose(&list, None), Some((3, Why::Only)));
+        assert_eq!(choose(&list, None, unasked), Some((3, Why::Only)));
         assert_eq!(runtime_first(&list), Some(3));
-        assert_eq!(choose(&list[..3], None), None);
+        assert_eq!(choose(&list[..3], None, unasked), None);
+    }
+
+    /// A timer of fixed times, in milliseconds by index in `seen`, counting its calls; a time of
+    /// 0 fails.
+    fn timer(
+        ms: &[u64],
+        calls: &std::cell::Cell<usize>,
+    ) -> impl FnMut(usize, &Seen) -> Option<Duration> {
+        move |at, _| {
+            calls.set(calls.get() + 1);
+            let ms = *ms.get(at)?;
+            (ms > 0).then(|| Duration::from_millis(ms))
+        }
+    }
+
+    /// The fastest GPU is picked and its verdict kept; the next choice of the same GPUs on the
+    /// same drivers reads it and times nothing
+    #[test]
+    fn the_fastest_gpu_is_picked_and_kept() {
+        let scratch = verdict::tests::Scratch::new("kept");
+        let file = scratch.file();
+        let list = [integrated(11, 1), discrete(4, 2)];
+        let calls = std::cell::Cell::new(0);
+        let picked = measured(&list, &[0, 1], Some(&file), timer(&[24, 40], &calls));
+        assert_eq!((picked, calls.get()), (Some((0, Why::Measured)), 2));
+        let again = measured(&list, &[0, 1], Some(&file), timer(&[99, 1], &calls));
+        assert_eq!((again, calls.get()), (Some((0, Why::Cached)), 2));
+        let fast_discrete = measured(
+            &[discrete(24, 3), integrated(11, 1)],
+            &[0, 1],
+            None,
+            timer(&[5, 25], &calls),
+        );
+        assert_eq!(fast_discrete, Some((0, Why::Measured)));
+    }
+
+    /// A driver change, another GPU or a corrupt verdict times the GPUs again, and the new verdict
+    /// is kept in place of the old
+    #[test]
+    fn a_changed_host_or_a_corrupt_verdict_is_measured_again() {
+        let scratch = verdict::tests::Scratch::new("changed");
+        let file = scratch.file();
+        let list = [integrated(11, 1), discrete(4, 2)];
+        let calls = std::cell::Cell::new(0);
+        measured(&list, &[0, 1], Some(&file), timer(&[24, 40], &calls));
+        let updated = [
+            integrated(11, 1),
+            Seen {
+                driver_version: 2,
+                ..discrete(4, 2)
+            },
+        ];
+        let picked = measured(&updated, &[0, 1], Some(&file), timer(&[24, 12], &calls));
+        assert_eq!((picked, calls.get()), (Some((1, Why::Measured)), 4));
+        let read = measured(&updated, &[0, 1], Some(&file), timer(&[1, 99], &calls));
+        assert_eq!((read, calls.get()), (Some((1, Why::Cached)), 4));
+        let another = [integrated(11, 1), discrete(24, 3)];
+        let picked = measured(&another, &[0, 1], Some(&file), timer(&[24, 5], &calls));
+        assert_eq!((picked, calls.get()), (Some((1, Why::Measured)), 6));
+        std::fs::write(&file, "reims-vgpu gpu choice 1\nkey \u{0}").unwrap();
+        let picked = measured(&another, &[0, 1], Some(&file), timer(&[3, 5], &calls));
+        assert_eq!((picked, calls.get()), (Some((0, Why::Measured)), 8));
+        let read = measured(&another, &[0, 1], Some(&file), timer(&[9, 1], &calls));
+        assert_eq!((read, calls.get()), (Some((0, Why::Cached)), 8));
+    }
+
+    /// Where any GPU's workload fails, nothing is picked and nothing kept, so the runtime's own
+    /// order stands and the next process times them again
+    #[test]
+    fn a_failed_measurement_picks_and_keeps_nothing() {
+        let scratch = verdict::tests::Scratch::new("failed");
+        let file = scratch.file();
+        let list = [integrated(11, 1), discrete(4, 2)];
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(
+            measured(&list, &[0, 1], Some(&file), timer(&[24, 0], &calls)),
+            None
+        );
+        assert!(!file.exists());
+        let picked = choose(&list, None, |gpus| {
+            measured(&list, gpus, Some(&file), timer(&[0, 40], &calls))
+        });
+        assert_eq!(picked, Some((1, Why::RuntimeOrder)));
+        assert!(!file.exists());
     }
 
     /// The registry ID is the UUID's halves exclusive-ored, little-endian; 1 where they cancel
@@ -399,20 +648,34 @@ pub(crate) mod tests {
     }
 
     /// The process's default device is the one picked of the devices the probe lists, named by
-    /// the registry ID the runtime answers for it. The list and the pick are printed for the
-    /// run's record
+    /// the registry ID the runtime answers for it: on a host of several GPUs, the verdict the
+    /// process's choice kept, read back here. The list and the pick are printed for the run's
+    /// record, with how long the process's first open took, the choice's included, and the
+    /// verdict kept
     #[test]
     fn the_default_device_is_the_pick() {
+        let clock = crate::os::OsClock::new();
+        let start = clock.now_mono();
         let Ok(device) = crate::platform::default_device() else {
             return;
         };
+        let first_open = clock.now_mono().saturating_duration_since(start);
+        eprintln!("first open: {:.1} ms", timing::millis(first_open));
         let seen = crate::os::seen_devices();
-        let picked = choose(seen, user_selection(|name| std::env::var_os(name)));
+        let file = verdict_file();
+        let picked = choose(
+            seen,
+            user_selection(|name| std::env::var_os(name)),
+            |gpus| measured(seen, gpus, file.as_deref(), |_, _| None),
+        );
         for (n, s) in seen.iter().enumerate() {
             eprintln!("device {n}: {s:?}");
         }
         let (at, why) = picked.expect("a candidate, where the runtime made a device");
         eprintln!("picked device {at}: {}", why.describe());
+        if let Some(text) = file.and_then(|path| std::fs::read_to_string(path).ok()) {
+            eprintln!("verdict kept:\n{text}");
+        }
         assert_eq!(
             seen.get(at).and_then(Seen::registry_id),
             Some(device.registry_id()),

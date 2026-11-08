@@ -452,6 +452,13 @@ const SHADER_CACHE_CAPACITY: u64 = 1 << 30;
 #[cfg(test)]
 const SHADER_CACHE: &str = ".cache/reims-vgpu-vulkan-tests";
 
+/// The library's cache directory, [`SHADER_CACHE`] under `HOME`: the shader cache's, whose sweep
+/// touches only its `v1` (the runtime's), and the device checks' `device-checks` beside it
+/// (`crate::device_choice`'s verdict). `None` where `HOME` is not set.
+pub(crate) fn cache_directory() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(SHADER_CACHE))
+}
+
 /// The runtime's registry ID of the process's default device ([`default_device`]), read once:
 /// `None` where it has none.
 pub(crate) fn default_device_registry_id() -> Option<u64> {

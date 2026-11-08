@@ -1736,11 +1736,11 @@ pub fn hearing<T>(call: impl FnOnce() -> T) -> (T, Vec<rt::Degradation>) {
 }
 
 /// Runs `call`, a probe of the device's own outside any guest's work (`crate::os`'s
-/// `learn_view_imports`), with what the runtime announces on this thread inside it heard by no
-/// one: neither relayed, counted, kept nor dying. A kind the runtime announces once per device
-/// is announced at every occurrence where a probe may meet it ([`crate::platform`]'s
-/// `announced_each`), so that the probe's takes no later occurrence's line.
-#[cfg(target_os = "linux")]
+/// `learn_view_imports`, on Linux), or a device's own made and dropped for one
+/// (`crate::device_choice`'s timing), with what the runtime announces on this thread inside it
+/// heard by no one: neither relayed, counted, kept nor dying. A kind the runtime announces once
+/// per device is announced at every occurrence where a probe of the process's device may meet it
+/// ([`crate::platform`]'s `announced_each`), so that the probe's takes no later occurrence's line.
 pub(crate) fn unheard<T>(call: impl FnOnce() -> T) -> T {
     /// Puts back the outer state on drop, an unwinding call's included.
     struct Restore(bool);
