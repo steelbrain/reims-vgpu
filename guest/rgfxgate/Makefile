@@ -1,9 +1,8 @@
-# RgfxGate: a Lilu plugin kext (docs/graphics-kext). It lets macOS load exactly
+# RgfxGate: a Graft client kext (docs/graphics-kext). It lets macOS load exactly
 # our reims-graphics Metal bundle with SIP fully on and installs that bundle
-# itself at first boot. Builds on a Mac with Xcode's clang/ld against a DEBUG
-# Lilu (its plugin headers and plugin_start.cpp) and MacKernelSDK, both in
-# build/deps (tools/fetch-lilu.sh fetches them, pinned). Output under build/,
-# never committed.
+# itself at first boot. Builds on a Mac with Xcode's clang/ld against the SDK's
+# Kernel.framework and Graft's header and start glue (../graft), with nothing
+# fetched. Output under build/, never committed.
 #
 #   make BUNDLE_DIR=<signed reims-graphics.bundle dir>   build/RgfxGate.kext
 #   make test                                            native tests of the matching and preference logic,
@@ -20,29 +19,32 @@
 NAME    = RgfxGate
 VERSION = 1.0.0
 SDK    ?= $(shell xcrun --sdk macosx --show-sdk-path)
-DEPS   ?= build/deps
-RES     = $(DEPS)/Lilu.kext/Contents/Resources
-KSDK    = $(DEPS)/MacKernelSDK
+GRAFT   = ../graft
+KHEADERS = $(SDK)/System/Library/Frameworks/Kernel.framework/Headers
 BUILD  ?= build
 GEN     = $(BUILD)/gen
 KEXT    = $(BUILD)/$(NAME).kext
 BIN     = $(KEXT)/Contents/MacOS/$(NAME)
+PLIST   = $(KEXT)/Contents/Info.plist
 PAYLOAD = $(GEN)/RgfxGatePayload.h
 BUNDLE_DIR ?=
 BUNDLE_STAMP = $(GEN)/bundle-dir
 
-FLAGS = -arch x86_64 -mkernel -nostdlib -fno-builtin -fno-stack-protector \
+FLAGS = -arch x86_64 -mmacosx-version-min=11.0 -isysroot $(SDK) -mkernel -nostdlib -fno-builtin -fno-stack-protector \
 	-mno-red-zone -Os -Wall -Wextra -Werror -Wno-unused-parameter
-CXXFLAGS = $(FLAGS) -std=c++17 -fapple-kext -fno-rtti -fno-exceptions \
-	-DKERNEL -DKERNEL_PRIVATE -DLILU_KEXTPATCH_SUPPORT \
-	-DPRODUCT_NAME=$(NAME) -DMODULE_VERSION=$(VERSION) \
-	-I$(GEN) -Isrc -isystem $(RES) -isystem $(KSDK)/Headers
+CXXFLAGS = $(FLAGS) -MMD -MP -std=c++17 -fapple-kext -fno-rtti -fno-exceptions \
+	-DKERNEL -DKERNEL_PRIVATE -nostdinc -isystem $(KHEADERS) \
+	-DGRAFT_CLIENT_ID=com.steelbrain.RgfxGate -DGRAFT_CLIENT_VERSION=\"$(VERSION)\" \
+	-I$(GEN) -Isrc -I$(GRAFT)/include
 
 OBJS = $(BUILD)/obj/RgfxGate.o $(BUILD)/obj/RgfxGateHooks.o \
-	$(BUILD)/obj/RgfxGateInstall.o $(BUILD)/obj/RgfxGatePrefs.o $(BUILD)/obj/plugin_start.o
+	$(BUILD)/obj/RgfxGateInstall.o $(BUILD)/obj/RgfxGatePrefs.o $(BUILD)/obj/GraftStart.o
 
 .PHONY: all clean test FORCE
-all: $(KEXT)
+all: $(PLIST)
+
+-include $(OBJS:.o=.d)
+$(OBJS): Makefile
 
 # A payload over another bundle than the one given would gate-tag a bundle that is not
 # installed, and the given one would load untagged. So the payload is packed again whenever
@@ -58,7 +60,6 @@ endif
 
 $(PAYLOAD):
 	@test -n "$(BUNDLE_DIR)" || { echo "set BUNDLE_DIR=<signed reims-graphics.bundle dir>" >&2; exit 2; }
-	@test -d "$(DEPS)/Lilu.kext" && test -d "$(KSDK)" || bash tools/fetch-lilu.sh "$(DEPS)"
 	@mkdir -p $(GEN)
 	python3 -I tools/pack-payload.py "$(BUNDLE_DIR)" $(PAYLOAD)
 	@echo '$(BUNDLE_KEY)' > $(BUNDLE_STAMP)
@@ -71,15 +72,15 @@ $(BUILD)/obj/RgfxGateHooks.o: src/RgfxGateHooks.cpp src/RgfxGate.hpp src/rgfx_ma
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/obj/RgfxGateInstall.o: src/RgfxGateInstall.cpp src/RgfxGate.hpp src/RgfxGatePrefs.hpp src/rgfx_tree.h $(PAYLOAD)
+$(BUILD)/obj/RgfxGateInstall.o: src/RgfxGateInstall.cpp src/RgfxGate.hpp src/RgfxGatePrefs.hpp src/RgfxGateFile.hpp src/rgfx_tree.h $(PAYLOAD)
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/obj/RgfxGatePrefs.o: src/RgfxGatePrefs.cpp src/RgfxGatePrefs.hpp src/rgfx_gva_pref.h
+$(BUILD)/obj/RgfxGatePrefs.o: src/RgfxGatePrefs.cpp src/RgfxGatePrefs.hpp src/RgfxGateFile.hpp src/rgfx_gva_pref.h
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
-$(BUILD)/obj/plugin_start.o: $(RES)/Library/plugin_start.cpp
+$(BUILD)/obj/GraftStart.o: $(GRAFT)/consumer/Start.cpp
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ $(CXXFLAGS) -c $< -o $@
 
@@ -87,7 +88,9 @@ $(BIN): $(OBJS)
 	@mkdir -p $(KEXT)/Contents/MacOS
 	xcrun --sdk macosx ld -arch x86_64 -kext -undefined dynamic_lookup $(OBJS) -o $(BIN)
 
-$(KEXT): $(BIN) Info.plist
+$(KEXT): $(PLIST)
+
+$(PLIST): $(BIN) Info.plist Makefile
 	sed 's/@VERSION@/$(VERSION)/g' Info.plist > $(KEXT)/Contents/Info.plist
 	@nm $(BIN) | grep ' _kmod_info$$' > /dev/null || { echo "no _kmod_info in $(BIN): OpenCore refuses it" >&2; exit 1; }
 	@echo "built $(KEXT)"

@@ -1,17 +1,16 @@
-# The reims-graphics display kext for x86-64 macOS 26 guests: ReimsGraphics,
-# an IOFramebuffer on the device's PCI function (src/ReimsGraphics.hpp; the
-# protocol is docs/graphics-kext/design.md). Builds on a Mac with Xcode's
-# clang and ld, against the macOS SDK's Kernel.framework, for macOS 26.
+# The reims-graphics display kext for x86-64 macOS 11 to 26 guests:
+# ReimsGraphics, an IOFramebuffer on the device's PCI function
+# (src/ReimsGraphics.hpp; the protocol is docs/graphics-kext/design.md).
+# Builds on a Mac with Xcode's clang and ld, against the macOS SDK's
+# Kernel.framework, for macOS 11 and later, and stages it with Graft's
+# consumer rules (../graft/tools/consumer.mk, src/graft.json): dormant, for
+# Graft to bind against the System kernel collection's libraries.
 #
 #   make        build/ReimsGraphics.kext
-#   make check  check its imports and IOFramebuffer's layout against the
-#               guest's KDK, and link it with OpenCore's own linker in user
-#               space (tools/check-imports.sh, tools/check-layout.py,
-#               tools/oc-link-check.sh):
+#   make check  check its imports and IOFramebuffer's layout against a
+#               guest's KDK (tools/check-imports.sh, tools/check-layout.py):
 #                 KDK=<the guest release's KDK's Extensions directory>
-#                 KEXTINJECT=<OpenCorePkg's TestKextInject binary>
-#                 BOOT_KC=<the guest's x86_64 BootKernelExtensions.kc>
-#               Without KEXTINJECT and BOOT_KC the link is skipped, saying so.
+#               The OpenCore link of the whole set is guest/'s set-check.
 #   make test   build and run the native tests of the kext's own rules
 #               (tests/*.cpp, against the headers they test)
 #   make DTRACE=1 BUILD=build/dtrace
@@ -33,13 +32,11 @@ KEXT     = $(BUILD)/$(NAME).kext
 BINARY   = $(KEXT)/Contents/MacOS/$(NAME)
 
 KDK        ?=
-KEXTINJECT ?=
-BOOT_KC    ?=
 
 TRACE   ?= 0
 DTRACE  ?= 0
 
-ARCH = -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=26.0
+ARCH = -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=11.0
 
 FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-vgpu-graphics/include \
 	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' -DRGFX_FB_TRACE=$(TRACE) \
@@ -85,17 +82,12 @@ $(BUILD)/obj/layout.o: src/ReimsGraphics.cpp src/ReimsGraphics.hpp ../../crates/
 	@mkdir -p $(@D)
 	xcrun clang++ $(CXXFLAGS) -g -fstandalone-debug -c $< -o $@
 
-$(BINARY): $(OBJECTS) src/Info.plist
-	@mkdir -p $(@D)
-	xcrun clang++ $(ARCH) -nostdlib -Xlinker -kext $(OBJECTS) -lcc_kext -o $@
-	sed 's/@VERSION@/$(VERSION)/g' src/Info.plist > $(KEXT)/Contents/Info.plist
-	$(if $(filter 1,$(DTRACE)),plutil -insert OSBundleForceDTraceInit -bool YES $(KEXT)/Contents/Info.plist)
-	plutil -lint $(KEXT)/Contents/Info.plist > /dev/null
+# Graft owns the two-pass link and dormant staging of this consumer.
+include ../graft/tools/consumer.mk
 
 check: $(BINARY) $(BUILD)/obj/layout.o
 	bash tools/check-imports.sh "$(KDK)" $(KEXT)
 	python3 -I tools/check-layout.py "$(KDK)/IOGraphicsFamily.kext.dSYM" $(BUILD)/obj/layout.o
-	bash tools/oc-link-check.sh "$(KEXTINJECT)" "$(BOOT_KC)" "$(KDK)" $(KEXT) $(BUILD)/oc-link
 
 # The native tests: header-only rules of the kext's, built for this Mac.
 TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surface_blocks_test \

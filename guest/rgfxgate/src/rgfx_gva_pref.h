@@ -1,5 +1,5 @@
 // Pure editing logic of the AppleGVA preference RgfxGate keeps set, shared by
-// the kext (RgfxGatePrefs.cpp) and the native tests. No kernel or Lilu
+// the kext (RgfxGatePrefs.cpp) and the native tests. No kernel or Graft
 // dependency.
 //
 // AppleGVA picks the vendor video driver of a Mac with AMD graphics only where

@@ -38,10 +38,6 @@
 		<string>20.0.0</string>
 		<key>com.apple.kpi.mach</key>
 		<string>20.0.0</string>
-		<key>com.steelbrain.RgfxAppleGraphicsDeviceControlBridge</key>
-		<string>1.0.0</string>
-		<key>com.steelbrain.RgfxIOGraphicsFamilyBridge</key>
-		<string>1.0.0</string>
 	</dict>
 	<key>OSBundleRequired</key>
 	<string>Root</string>

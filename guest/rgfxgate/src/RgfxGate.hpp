@@ -1,4 +1,4 @@
-// RgfxGate: a Lilu plugin kext that lets macOS load exactly our reims-graphics
+// RgfxGate: a Graft client kext that lets macOS load exactly our reims-graphics
 // Metal driver bundle with SIP fully on, and installs that bundle itself at
 // first boot. The installer writes the bundle to /Library/GPUBundles and gives
 // it the GPU-bundle SIP storage class a stock host carries there, so the
@@ -12,14 +12,17 @@
 #include <mach/mach_types.h>
 #include <sys/kernel_types.h>
 
-struct KernelPatcher; // Lilu
+#include <graft/Graft.h>
+
 
 namespace rgfxgate {
+
+static constexpr const char *kClientID = "com.steelbrain.RgfxGate";
 
 // mach/vm_prot.h value; only an executable mapping concerns the sandbox wall.
 static constexpr int kVmProtExecute = 0x04;
 
-// Resolved once at patcher load (csfg_get_cdhash is not a KPI symbol).
+// Resolved once at client initialization (csfg_get_cdhash is not a KPI symbol).
 // Returns a pointer to the mapped file's cdhash, or nullptr; *size is its length.
 using t_csfg_get_cdhash = uint8_t *(*)(void *fg, uint64_t offset, size_t *size);
 extern t_csfg_get_cdhash gCsfgGetCdhash;
@@ -32,9 +35,8 @@ extern thread_t gInstallThread;
 // True when the fileglob's cdhash is the embedded bundle executable's.
 bool cdhashIsOurs(void *fg, uint64_t offset);
 
-// Install the hooks (library validation, mmap, vnode create/unlink) on the
-// kernel. Called from the patcher-load callback.
-void installHooks(KernelPatcher &patcher);
+// Install all six kernel hooks atomically, or leave the gate disabled.
+bool installHooks();
 
 // Run once at boot: wait for the Data volume, then install/replace the bundle
 // in kernel context if missing or different. No-op in the installer/Recovery.

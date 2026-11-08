@@ -6,7 +6,7 @@
 // stage into that root and swap it in as the live bundle, the old file with
 // it. The walk here reads the directories themselves instead.
 //
-// No kernel or Lilu dependency: the walk takes the file system as a parameter,
+// No kernel or Graft dependency: the walk takes the file system as a parameter,
 // which the kext gives its VNOP calls and the native tests (tests/tree_test.cpp)
 // a real directory, so the tests run the exact code the kext runs.
 #pragma once

@@ -6,12 +6,12 @@
 #  - a bundle rebuilt in place (a new executable, signed again) is packed again;
 #  - another BUNDLE_DIR is packed again, though its files are older than the payload;
 #  - a make with no BUNDLE_DIR keeps the payload made last.
-# SCRATCH is removed first and at the end. DEPS is a stand-in, so nothing is fetched.
+# SCRATCH is removed first and at the end. Nothing is fetched.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 S=$1
 rm -rf "$S"
-mkdir -p "$S/deps/Lilu.kext" "$S/deps/MacKernelSDK"
+mkdir -p "$S"
 trap 'rm -rf "$S"' EXIT
 fails=0
 
@@ -40,7 +40,7 @@ cdhash() {
 }
 
 payload() {
-	make -s BUILD="$S/build" DEPS="$S/deps" "$@" "$S/build/gen/RgfxGatePayload.h" > /dev/null
+	make -s BUILD="$S/build" "$@" "$S/build/gen/RgfxGatePayload.h" > /dev/null
 	sed -n 's/^static const uint8_t kExecCDHash\[20\] = {\(.*\)};$/\1/p' "$S/build/gen/RgfxGatePayload.h"
 }
 

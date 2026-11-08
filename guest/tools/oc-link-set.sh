@@ -1,52 +1,29 @@
 #!/bin/bash
-# Links Lilu and the kext set into the guest's Boot KC with OpenCore's own
-# linker, in user space, as OpenCore's Kernel > Add does at boot: OpenCorePkg's
-# Utilities/TestKextInject, which runs OcAppleKernelLib's injection on a KC file
-# and writes the KC it made to out.bin. Each kext is linked against the Boot KC
-# and those injected before it, in set.toml's order after Lilu, as the image's
-# entries are.
-#
-#   guest/tools/oc-link-set.sh KEXTINJECT BOOT_KC LILU SET TABLE OUT
-#
-# LILU is the RELEASE Lilu.kext the image carries, SET a directory with
-# set.toml and its bundles (guest/prebuilt, or make set's OUT), TABLE the
-# loader's fixup table for SET's ReimsGraphics (make set writes it to
-# build/set-work/loader/staged/ReimsGraphics.bridge/fixups.json). Fails unless
-# every kext is injected, every name each one imports resolves, none to 0,
-# and every site of ReimsGraphics holds its shim's placeholder
-# (guest/loader/tools/oc-link-check.py), which is what the loader checks before
-# it binds. So the set needs nothing in the image but Lilu and the Boot KC.
-#
-# Skipped, exit 0 and a line saying so, without KEXTINJECT or BOOT_KC.
-# Everything lands in OUT; out.bin is read, never booted.
+# Prelink the committed Graft set with OpenCore's linker, in user space, in
+# Kernel > Add order; check every kext injects and every name resolves, then
+# that each dormant consumer (a kext carrying a Graft manifest) stays
+# bindable in the prelinked collection (guest/graft/tools/prelink.py).
+# Outputs remain local.
+# Usage: oc-link-set.sh KEXTINJECT BOOT_KC SET OUT
 set -euo pipefail
 
-ki=${1:-} kc=${2:-} lilu=${3:-} set=${4:-} table=${5:-} out=${6:-}
+prelink=$(cd "$(dirname "$0")/../graft/tools" && pwd)/prelink.py
+
+ki=${1:-} kc=${2:-} set=${3:-} out=${4:-}
 if [ -z "$ki" ] || [ -z "$kc" ]; then
 	echo "oc-link-set: SKIPPED: give KEXTINJECT and BOOT_KC to link with OpenCore's linker"
 	exit 0
 fi
 [ -x "$ki" ] || { echo "oc-link-set: $ki is not an executable" >&2; exit 2; }
 [ -f "$kc" ] || { echo "oc-link-set: no Boot KC at $kc" >&2; exit 2; }
-[ -f "$lilu/Contents/MacOS/Lilu" ] || { echo "oc-link-set: no Lilu.kext at '$lilu' (LILU=)" >&2; exit 2; }
 [ -f "$set/set.toml" ] || { echo "oc-link-set: no set.toml in '$set'" >&2; exit 2; }
-[ -f "$table" ] || { echo "oc-link-set: no fixup table at '$table' (make set writes it)" >&2; exit 2; }
-[ -n "$out" ] || { echo "usage: guest/tools/oc-link-set.sh KEXTINJECT BOOT_KC LILU SET TABLE OUT" >&2; exit 2; }
-tools=$(cd "$(dirname "$0")/../loader/tools" && pwd)
+[ -n "$out" ] || { echo "usage: guest/tools/oc-link-set.sh KEXTINJECT BOOT_KC SET OUT" >&2; exit 2; }
+
 abs() { (cd "$(dirname "$1")" && echo "$PWD/$(basename "$1")"); }
-ki=$(abs "$ki") kc=$(abs "$kc") lilu=$(abs "$lilu") set=$(abs "$set") table=$(abs "$table")
+ki=$(abs "$ki") kc=$(abs "$kc") set=$(abs "$set")
 rm -rf "$out"
 mkdir -p "$out/run"
 out=$(abs "$out")
-
-# The table must describe the set's own ReimsGraphics.
-python3 -I - "$table" "$set/ReimsGraphics.kext/Contents/MacOS/ReimsGraphics" << 'EOF'
-import hashlib, json, sys
-table, binary = sys.argv[1:]
-want = json.load(open(table))["consumer_sha256"]
-if hashlib.sha256(open(binary, "rb").read()).hexdigest() != want:
-    sys.exit(f"oc-link-set: {table} was made from another ReimsGraphics than {binary}")
-EOF
 
 # The bundles in set.toml's order, each "BundlePath ExecutablePath".
 entries=$(python3 -I - "$set/set.toml" << 'EOF'
@@ -60,12 +37,16 @@ for line in open(sys.argv[1]):
         bundle = None
 EOF
 )
-args=("$lilu/Contents/MacOS/Lilu" "$lilu/Contents/Info.plist")
-binaries=("$lilu/Contents/MacOS/Lilu")
-ids=(as.vit9696.Lilu)
+args=()
+binaries=()
+consumers=()
+ids=()
 while read -r bundle exe; do
 	args+=("$set/$bundle/$exe" "$set/$bundle/Contents/Info.plist")
 	binaries+=("$set/$bundle/$exe")
+	if otool -l "$set/$bundle/$exe" | grep -q 'sectname __graft$'; then
+		consumers+=("$set/$bundle")
+	fi
 	ids+=("$(plutil -extract CFBundleIdentifier raw "$set/$bundle/Contents/Info.plist")")
 done <<< "$entries"
 
@@ -91,15 +72,20 @@ for i in "${!binaries[@]}"; do
 done
 grep -q -F '[OK] Prelink inject complete success' "$log" ||
 	{ echo "oc-link-set: the injection did not complete; see $log" >&2; status=1; }
-# A name only a vtable slot uses resolves to 0 when no library exports it,
-# and the slot stays empty: a failure for the set's kexts. Lilu, which every
-# image carries as it is, resolves two reserved IOService slots to 0.
-for id in "${ids[@]:1}"; do
+# Every imported name must resolve to a nonzero address.
+for id in "${ids[@]}"; do
 	if grep -E "was resolved for kext $id to 0\$|was unresolved for kext $id\$" "$log" >&2; then
 		echo "oc-link-set: the names above did not resolve for $id; see $log" >&2
 		status=1
 	fi
 done
-python3 -I -B "$tools/oc-link-check.py" "$log" "$out/run/out.bin" "$table" com.steelbrain.ReimsGraphics || status=1
+
+if [ "${#consumers[@]}" = 0 ]; then
+	echo "oc-link-set: no kext in the set carries a Graft manifest" >&2
+	status=1
+elif ! python3 -I -B "$prelink" "$out/run/out.bin" "${consumers[@]}"; then
+	status=1
+fi
+
 [ "$status" = 0 ] || { echo "oc-link-set: FAILED" >&2; exit 1; }
-echo "oc-link-set: OK: Lilu and the set's $((${#ids[@]} - 1)) kexts linked into $(basename "$kc")"
+echo "oc-link-set: OK: the set's ${#ids[@]} kexts linked into $(basename "$kc")"

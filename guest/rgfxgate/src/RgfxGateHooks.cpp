@@ -1,9 +1,7 @@
-// The kernel hooks RgfxGate installs. Each is a Lilu route of an XNU MAC
+// The kernel hooks RgfxGate installs. Each is a Graft route of an XNU MAC
 // dispatcher; every one short-circuits only for our embedded bundle (by its
 // code-directory hash) or, for the install writes, only for our own install
 // thread on the bundle path. Everything else calls the original unchanged.
-#include <Headers/kern_patcher.hpp>
-#include <Headers/kern_util.hpp>
 
 #include <libkern/libkern.h>
 #include <sys/vnode.h>
@@ -19,7 +17,7 @@ volatile bool gInstalling = false;
 thread_t gInstallThread = nullptr;
 
 // csblob_get_cdhash(struct cs_blob *) -> the blob's CS_CDHASH_LEN-byte cdhash.
-// Resolved once at patcher load; it is not a KPI symbol.
+// Resolved once at client initialization; it is not a KPI symbol.
 using t_csblob_get_cdhash = const uint8_t *(*)(void *cs_blob);
 static t_csblob_get_cdhash gCsblobGetCdhash = nullptr;
 
@@ -68,19 +66,19 @@ static bool installWriteAllowed(vnode_t vp) {
 // int mac_file_check_library_validation(proc, fileglob, off_t slice_offset,
 //                                       user_long_t error_message, size_t len)
 using t_lib_val = int (*)(void *, void *, off_t, uint64_t, size_t);
-static t_lib_val orgLibVal;
+static void *orgLibVal;
 static int wrapLibVal(void *proc, void *fg, off_t slice_offset,
                       uint64_t error_message, size_t error_message_size) {
 	if (cdhashIsOurs(fg, (uint64_t)slice_offset))
 		return 0; // our bundle is valid to load into a library-validated process
-	return orgLibVal(proc, fg, slice_offset, error_message, error_message_size);
+	return reinterpret_cast<t_lib_val>(orgLibVal)(proc, fg, slice_offset, error_message, error_message_size);
 }
 
 // --- file-map-executable (wall C) ------------------------------------------
 // int mac_file_check_mmap(cred, fileglob, int prot, int flags,
 //                         uint64_t file_pos, int *maxprot)
 using t_mmap = int (*)(void *, void *, int, int, uint64_t, int *);
-static t_mmap orgMmap;
+static void *orgMmap;
 static int wrapMmap(void *cred, void *fg, int prot, int flags,
                     uint64_t file_pos, int *maxprot) {
 	if ((prot & kVmProtExecute) && cdhashIsOurs(fg, file_pos)) {
@@ -91,7 +89,7 @@ static int wrapMmap(void *cred, void *fg, int prot, int flags,
 			*maxprot &= prot;
 		return 0; // the GPU process may map our driver executable
 	}
-	return orgMmap(cred, fg, prot, flags, file_pos, maxprot);
+	return reinterpret_cast<t_mmap>(orgMmap)(cred, fg, prot, flags, file_pos, maxprot);
 }
 
 // --- code-signature trust (wall B, the gate before library validation) -----
@@ -113,10 +111,10 @@ static int wrapMmap(void *cred, void *fg, int prot, int flags,
 // own.
 using t_vsig = int (*)(vnode_t, void *, void *, unsigned int *, unsigned int *,
                        int, unsigned int);
-static t_vsig orgVSig;
+static void *orgVSig;
 static int wrapVSig(vnode_t vp, void *cs_blob, void *imgp, unsigned int *cs_flags,
                     unsigned int *signer_type, int flags, unsigned int platform) {
-	int r = orgVSig(vp, cs_blob, imgp, cs_flags, signer_type, flags, platform);
+	int r = reinterpret_cast<t_vsig>(orgVSig)(vp, cs_blob, imgp, cs_flags, signer_type, flags, platform);
 	if (r == 0)
 		return 0; // already trusted; leave everything to the real policies
 	const uint8_t *cd = (gCsblobGetCdhash && cs_blob) ? gCsblobGetCdhash(cs_blob) : nullptr;
@@ -129,76 +127,52 @@ static int wrapVSig(vnode_t vp, void *cs_blob, void *imgp, unsigned int *cs_flag
 // --- install writes (wall P) -----------------------------------------------
 // int mac_vnode_check_create(ctx, dvp, componentname, vnode_attr)
 using t_vcreate = int (*)(vfs_context_t, vnode_t, struct componentname *, struct vnode_attr *);
-static t_vcreate orgVCreate;
+static void *orgVCreate;
 static int wrapVCreate(vfs_context_t ctx, vnode_t dvp,
                        struct componentname *cnp, struct vnode_attr *vap) {
 	if (installWriteAllowed(dvp))
 		return 0;
-	return orgVCreate(ctx, dvp, cnp, vap);
+	return reinterpret_cast<t_vcreate>(orgVCreate)(ctx, dvp, cnp, vap);
 }
 
 // int mac_vnode_check_open(ctx, vp, int acc_mode)
 using t_vopen = int (*)(vfs_context_t, vnode_t, int);
-static t_vopen orgVOpen;
+static void *orgVOpen;
 static int wrapVOpen(vfs_context_t ctx, vnode_t vp, int acc_mode) {
 	if (installWriteAllowed(vp))
 		return 0;
-	return orgVOpen(ctx, vp, acc_mode);
+	return reinterpret_cast<t_vopen>(orgVOpen)(ctx, vp, acc_mode);
 }
 
 // int mac_vnode_check_truncate(ctx, kauth_cred_t file_cred, vp)
 using t_vtrunc = int (*)(vfs_context_t, void *, vnode_t);
-static t_vtrunc orgVTrunc;
+static void *orgVTrunc;
 static int wrapVTrunc(vfs_context_t ctx, void *file_cred, vnode_t vp) {
 	if (installWriteAllowed(vp))
 		return 0;
-	return orgVTrunc(ctx, file_cred, vp);
+	return reinterpret_cast<t_vtrunc>(orgVTrunc)(ctx, file_cred, vp);
 }
 
-void installHooks(KernelPatcher &patcher) {
-	// Resolve the two cdhash accessors the hooks need; neither is a KPI symbol.
-	// csfg_get_cdhash gives a fileglob's cdhash (library validation, mmap);
-	// csblob_get_cdhash gives a cs_blob's (the signature check).
-	auto csfg = patcher.solveSymbol(KernelPatcher::KernelID, "_csfg_get_cdhash");
-	if (csfg == 0) {
-		SYSLOG("rgfxgate", "could not resolve _csfg_get_cdhash; gate disabled");
-		patcher.clearError();
-		return;
-	}
-	gCsfgGetCdhash = reinterpret_cast<t_csfg_get_cdhash>(csfg);
-	auto csblob = patcher.solveSymbol(KernelPatcher::KernelID, "_csblob_get_cdhash");
-	if (csblob != 0)
-		gCsblobGetCdhash = reinterpret_cast<t_csblob_get_cdhash>(csblob);
-	else
-		patcher.clearError();
-
-	// Build the routes. The signature hook is useful only with
-	// csblob_get_cdhash: without it wrapVSig cannot know our blob and would just
-	// pass every signature check through. Where that symbol did not resolve (a
-	// future macOS renames or drops it), leave the signature hook out and say so
-	// loudly: our bundle then fails the signature wall and WindowServer
-	// crash-loops with no GPU, so the inert gate is named in the log rather than
-	// left a silent brick, exactly as the csfg miss disables the whole gate.
-	KernelPatcher::RouteRequest reqs[] = {
-		{"_mac_file_check_library_validation", wrapLibVal, orgLibVal},
-		{"_mac_file_check_mmap", wrapMmap, orgMmap},
-		{"_mac_vnode_check_create", wrapVCreate, orgVCreate},
-		{"_mac_vnode_check_open", wrapVOpen, orgVOpen},
-		{"_mac_vnode_check_truncate", wrapVTrunc, orgVTrunc},
-		{"_mac_vnode_check_signature", wrapVSig, orgVSig}, // last: dropped below if no csblob
-	};
-	size_t count = arrsize(reqs);
-	if (gCsblobGetCdhash == nullptr) {
-		SYSLOG("rgfxgate", "could not resolve _csblob_get_cdhash; signature gate "
-		                   "inert, our bundle will not load");
-		count -= 1; // drop the trailing signature route
-	}
-	if (!patcher.routeMultiple(KernelPatcher::KernelID, reqs, count, 0, 0, true, true)) {
-		SYSLOG("rgfxgate", "routeMultiple failed (err %d)", patcher.getError());
-		patcher.clearError();
-		return;
-	}
-	DBGLOG("rgfxgate", "hooks installed");
+bool installHooks() {
+    uint64_t csfg = 0, csblob = 0;
+    if (!graft_kernel_symbol(kClientID, "_csfg_get_cdhash", &csfg) ||
+        !graft_kernel_symbol(kClientID, "_csblob_get_cdhash", &csblob))
+        return false;
+    gCsfgGetCdhash = reinterpret_cast<t_csfg_get_cdhash>(csfg);
+    gCsblobGetCdhash = reinterpret_cast<t_csblob_get_cdhash>(csblob);
+    const graft_route_request requests[] = {
+        {"_mac_file_check_library_validation", reinterpret_cast<void *>(wrapLibVal), &orgLibVal},
+        {"_mac_file_check_mmap", reinterpret_cast<void *>(wrapMmap), &orgMmap},
+        {"_mac_vnode_check_create", reinterpret_cast<void *>(wrapVCreate), &orgVCreate},
+        {"_mac_vnode_check_open", reinterpret_cast<void *>(wrapVOpen), &orgVOpen},
+        {"_mac_vnode_check_truncate", reinterpret_cast<void *>(wrapVTrunc), &orgVTrunc},
+        {"_mac_vnode_check_signature", reinterpret_cast<void *>(wrapVSig), &orgVSig},
+    };
+    if (!graft_route_kernel(kClientID, requests, sizeof(requests) / sizeof(requests[0]))) {
+        return false;
+    }
+    graft_client_log(kClientID, "hooks installed");
+    return true;
 }
 
 } // namespace rgfxgate

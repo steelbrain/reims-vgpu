@@ -36,8 +36,8 @@
 	</dict>
 	<key>OSBundleLibraries</key>
 	<dict>
-		<key>as.vit9696.Lilu</key>
-		<string>1.7.2</string>
+		<key>com.steelbrain.Graft</key>
+		<string>1.0.0</string>
 		<key>com.apple.kpi.bsd</key>
 		<string>12.0.0</string>
 		<key>com.apple.kpi.iokit</key>

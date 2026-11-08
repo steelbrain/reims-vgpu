@@ -1,5 +1,5 @@
 // Pure matching logic shared by the kext hooks and the native tests.
-// No kernel or Lilu dependency: the two decisions that gate RgfxGate are a
+// No kernel or Graft dependency: the two decisions that gate RgfxGate are a
 // code-directory-hash membership test (which bundle executable may bypass
 // library validation / file-map-executable) and a path-prefix test (which
 // directory the boot-time install may write). Keeping them here lets the

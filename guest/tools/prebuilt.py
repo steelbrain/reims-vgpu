@@ -1,28 +1,14 @@
 #!/usr/bin/env python3
-"""The kext set an x86-64 macOS guest's OpenCore image injects for the
-reims-graphics device, and the record of what a copy of it was built from
-(guest/Makefile, `make set` and `make prebuilt`).
+"""Stage/check the SDK-only Graft set and its source/output hashes.
 
     python3 -I -B guest/tools/prebuilt.py stage OUT WORK
-    python3 -I -B guest/tools/prebuilt.py record OUT KDK
+    python3 -I -B guest/tools/prebuilt.py record OUT
     python3 -I -B guest/tools/prebuilt.py check [DIR]
 
-stage: copies the set's bundles from WORK, where guest/Makefile built each
-part, into OUT, which it starts empty, in OpenCore's Kernel > Add order, and
-writes OUT/set.toml, the entries in that order. It refuses a set whose loader
-was made from another ReimsGraphics, whose ReimsGraphics still carries its
-personalities or names a library the loader does not bind, or whose kexts
-name one of the set's own kexts that comes after them.
-
-record: writes OUT/sources.toml: the SHA-256 of each source the set is built
-from ([sources], INPUTS below, as git tracks them), of each file in OUT
-([outputs]), and, for the reader, the KDK's files the loader's tables were
-read from and the toolchain.
-
-check: hashes only, and builds nothing, so it runs on any host: fails unless
-the tree's sources and DIR's files (default guest/prebuilt) are the ones
-DIR/sources.toml records. `make -C guest prebuilt-check` and `cargo xtask
-check` run it. Ours.
+The set includes the vendored Graft build, dormant ReimsGraphics and RgfxGate.
+No kernel-range gate, KDK, loader, shim or downloaded build input is used.
+check also verifies guest/graft against the record Graft's tools/vendor.py
+wrote beside it.
 """
 
 import hashlib
@@ -38,28 +24,19 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 PREBUILT = ROOT / "guest/prebuilt"
 RECORD = "sources.toml"
+GRAFT = ROOT / "guest/graft"
+GRAFT_RECORD = "source.toml"
 MANIFEST = "set.toml"
 FORMAT = 1
-# The Darwin releases the set is injected on: macOS 26.4 to 26.x. The loader
-# also refuses a release whose library classes are laid out otherwise than
-# the KDK it was built from (guest/loader/README.md).
-MIN_KERNEL, MAX_KERNEL = "25.4.0", "25.99.99"
-# The set, in Kernel > Add order (after Lilu, which the image carries first):
-# each bundle's place in WORK, and its entry's comment.
+# No kernel-range gates: Graft validates the running providers by name/layout.
+MIN_KERNEL, MAX_KERNEL = "", ""
 SET = (
-    ("loader/ReimsGraphicsLoader.kext",
-     "Binds ReimsGraphics to IOGraphicsFamily and AppleGraphicsDeviceControl"),
-    ("loader/staged/RgfxIOGraphicsFamilyBridge.kext",
-     "IOGraphicsFamily placeholders ReimsGraphics links against"),
-    ("loader/staged/RgfxAppleGraphicsDeviceControlBridge.kext",
-     "AppleGraphicsDeviceControl placeholders ReimsGraphics links against"),
-    ("loader/staged/ReimsGraphics.kext",
-     "The reims-graphics display, accelerator and device control"),
-    ("rgfxgate/RgfxGate.kext",
-     "Installs the reims-graphics Metal bundle and lets macOS load it"),
+    ("Graft.kext", "Binds and routes the owned guest kexts"),
+    ("kext/ReimsGraphics.kext", "The reims-graphics display, accelerator and device control"),
+    ("rgfxgate/RgfxGate.kext", "Installs the reims-graphics Metal bundle and admits it"),
 )
 # What the set is built from, below the repository's root: what each part's
-# build reads (guest/kext, guest/bundle, guest/rgfxgate, guest/loader and the
+# build reads (guest/kext, guest/bundle, guest/rgfxgate, guest/graft and the
 # wire header), and the files that build and stage it.
 INPUTS = (
     "crates/reims-vgpu-graphics/include",
@@ -69,13 +46,7 @@ INPUTS = (
     "guest/bundle/Makefile", "guest/bundle/Info.plist", "guest/bundle/src",
     "guest/rgfxgate/Makefile", "guest/rgfxgate/Info.plist", "guest/rgfxgate/src",
     "guest/rgfxgate/tools",
-    "guest/loader/Makefile", "guest/loader/src", "guest/loader/tools",
-)
-# The KDK's files the loader's tables and shims are made from, below KDK.
-KDK_FILES = (
-    "IOGraphicsFamily.kext/IOGraphicsFamily",
-    "AppleGraphicsControl.kext/Contents/PlugIns/AppleGraphicsDeviceControl.kext/Contents/MacOS/AppleGraphicsDeviceControl",
-    "../Kernels/kernel",
+    "guest/graft",
 )
 IGNORED = (".DS_Store", "__pycache__")
 
@@ -101,10 +72,12 @@ def files_under(top):
 
 
 def sources():
-    """{path: sha256} of INPUTS' files, as git tracks them (their contents in
-    the work tree); every file below them where git cannot list them."""
+    """{path: sha256} of INPUTS' files that git tracks or would add (their
+    contents in the work tree); every file below them where git cannot list
+    them."""
     try:
-        listed = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--", *INPUTS],
+        listed = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "--cached", "--others",
+                                 "--exclude-standard", "--", *INPUTS],
                                 capture_output=True, check=True).stdout.decode().split("\0")
         paths = sorted(p for p in listed if p)
     except (OSError, subprocess.CalledProcessError):
@@ -137,18 +110,13 @@ def stage(out, work):
         if not exe.is_file():
             raise SystemExit(f"prebuilt: {kext} has no executable {exe.name}")
         infos[kext.name] = info
-    # The loader binds exactly this ReimsGraphics, through exactly these shims.
-    staged = work / "loader/staged"
-    table = json.loads((staged / "ReimsGraphics.bridge/fixups.json").read_text())
-    graphics = staged / "ReimsGraphics.kext"
-    if table["consumer_sha256"] != sha256(graphics / "Contents/MacOS/ReimsGraphics"):
-        raise SystemExit("prebuilt: the loader's table was made from another ReimsGraphics")
     if infos["ReimsGraphics.kext"].get("IOKitPersonalities"):
-        raise SystemExit("prebuilt: the staged ReimsGraphics carries personalities")
-    shims = {p["shim"] for p in table["providers"]}
-    bound = {infos[k.name]["CFBundleIdentifier"] for k, _ in kexts if k.name.endswith("Bridge.kext")}
-    if shims != bound:
-        raise SystemExit(f"prebuilt: the loader binds {sorted(shims)}, the set carries {sorted(bound)}")
+        raise SystemExit("prebuilt: dormant ReimsGraphics carries personalities")
+    dependencies = infos["ReimsGraphics.kext"].get("OSBundleLibraries", {})
+    if {"com.apple.iokit.IOGraphicsFamily", "com.apple.AppleGraphicsDeviceControl"} & set(dependencies):
+        raise SystemExit("prebuilt: dormant ReimsGraphics still names System-KC dependencies")
+    if sha256(work / "Graft.kext/Contents/MacOS/Graft") != sha256(ROOT / "guest/graft/dist/Graft.kext/Contents/MacOS/Graft"):
+        raise SystemExit("prebuilt: Graft differs from the vendored build")
     # Each kext after those of the set it names.
     ids = [infos[k.name]["CFBundleIdentifier"] for k, _ in kexts]
     for i, (kext, _) in enumerate(kexts):
@@ -157,7 +125,7 @@ def stage(out, work):
             raise SystemExit(f"prebuilt: {kext.name} names {sorted(later)}, which come at or after it")
     lines = [
         f"# The kexts an x86-64 macOS guest's OpenCore image injects for the reims-graphics",
-        f"# device: one [[kext]] per Kernel > Add entry, in order, after Lilu's, each the bundle",
+        f"# device: one [[kext]] per Kernel > Add entry, in order, each the bundle",
         f"# beside this file named by BundlePath. Written by `make -C guest prebuilt`; do not edit.",
         f"# The keys are OpenCore's, but sha256, the SHA-256 of the entry's executable.",
         f"format = {FORMAT}",
@@ -190,26 +158,16 @@ def tool(*cmd):
         return "unknown"
 
 
-def record(out, kdk):
-    kdk = Path(kdk)
-    version = kdk.parent / "SystemVersion.plist"
-    release = "unknown"
-    if version.is_file():
-        v = plistlib.loads(version.read_bytes())
-        release = f"macOS {v.get('ProductVersion')} ({v.get('ProductBuildVersion')})"
+def record(out):
     lines = [
         "# What the kexts beside this file were built from: written by `make -C guest prebuilt`,",
         "# and checked by `make -C guest prebuilt-check` and `cargo xtask check`, which fail",
         "# when a source or an output differs from its SHA-256 here (guest/tools/prebuilt.py).",
-        "# [built] and [kdk] are for the reader: the KDK and the toolchain are not in the tree.",
+        "# [built] records the local toolchain; every input is in the tree.",
         "[built]",
-        f"kdk = {quote(release)}",
         f"xcode = {quote(' '.join(tool('xcodebuild', '-version').split()))}",
         f"sdk = {quote(Path(tool('xcrun', '--sdk', 'macosx', '--show-sdk-path')).name)}",
         f"clang = {quote(tool('xcrun', 'clang', '--version').splitlines()[0])}",
-        "",
-        "[kdk]",
-        *(f"{quote(f)} = {quote(sha256(kdk / f))}" for f in KDK_FILES),
         "",
         "[sources]",
         *(f"{quote(p)} = {quote(h)}" for p, h in sources().items()),
@@ -221,11 +179,13 @@ def record(out, kdk):
     print(f"prebuilt: {out / RECORD}")
 
 
-def read_record(path):
-    """sources.toml's tables: {section: {key: value}}. Its own subset of
-    TOML: `[section]` headers, and `key = "value"` lines whose key is bare
-    or a string."""
-    tables, section = {}, None
+def read_record(path, top_level=False):
+    """A record's tables: {section: {key: value}}. Its own subset of TOML:
+    `[section]` headers, and `key = "value"` lines whose key is bare or a
+    string. With top_level, lines before the first header are table ""."""
+    tables, section = {}, ({} if top_level else None)
+    if top_level:
+        tables[""] = section
     for n, line in enumerate(path.read_text().splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -239,6 +199,25 @@ def read_record(path):
     return tables
 
 
+def check_graft():
+    """Errors where guest/graft differs from the record of the Graft commit
+    it was copied from."""
+    path = GRAFT / GRAFT_RECORD
+    if not path.is_file():
+        return [f"no guest/graft/{GRAFT_RECORD}: copy Graft with its tools/vendor.py"]
+    tables = read_record(path, top_level=True)
+    if not re.fullmatch(r"[0-9a-f]{40}", tables.get("", {}).get("commit", "")):
+        return [f"guest/graft/{GRAFT_RECORD}: records no Graft commit"]
+    want, present = tables.get("files", {}), set(files_under(GRAFT)) - {GRAFT_RECORD}
+    errors = [f"guest/graft/{p}: missing" for p in sorted(want.keys() - present)]
+    errors += [f"guest/graft/{p}: not the file Graft's record names" for p in sorted(want.keys() & present)
+               if sha256(GRAFT / p) != want[p]]
+    errors += [f"guest/graft/{p}: not in Graft's record" for p in sorted(present - want.keys())]
+    if not want:
+        errors.append(f"guest/graft/{GRAFT_RECORD}: records no files")
+    return errors
+
+
 def check(top):
     path = top / RECORD
     rel = top.relative_to(ROOT) if top.is_relative_to(ROOT) else top
@@ -246,7 +225,7 @@ def check(top):
         print(f"prebuilt: no {rel / RECORD}", file=sys.stderr)
         return 1
     tables = read_record(path)
-    errors = []
+    errors = check_graft()
     want, have = tables.get("sources", {}), sources()
     errors += [f"source changed since the set was built: {p}" for p in sorted(want.keys() & have.keys())
                if want[p] != have[p]]
@@ -264,8 +243,7 @@ def check(top):
     for e in errors:
         print(f"prebuilt: {e}", file=sys.stderr)
     if errors:
-        print(f"prebuilt: {rel} is stale: on a Mac, `make -C guest prebuilt KDK=<a macOS 26 KDK's "
-              f"Extensions directory>` builds it again; commit {rel} with the change",
+        print(f"prebuilt: {rel} is stale: on a Mac, `make -C guest prebuilt` builds it again; commit {rel} with the change",
               file=sys.stderr)
         return 1
     print(f"prebuilt: {rel}: {len(outputs)} files, built from the tree's {len(have)} sources")
@@ -276,8 +254,8 @@ def main(argv):
     args = argv[1:]
     if len(args) == 3 and args[0] == "stage":
         stage(Path(args[1]), Path(args[2]))
-    elif len(args) == 3 and args[0] == "record":
-        record(Path(args[1]), args[2])
+    elif len(args) == 2 and args[0] == "record":
+        record(Path(args[1]))
     elif args == ["check"]:
         return check(PREBUILT)
     elif len(args) == 2 and args[0] == "check":

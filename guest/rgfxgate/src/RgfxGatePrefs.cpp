@@ -12,8 +12,7 @@
 // binary one must read back so (rgfx_gva_pref_binary_kept), or nothing is
 // written. The write runs in kernel context, as root, through the ordinary VFS
 // path: /Library/Preferences is no SIP-restricted path.
-#include <Headers/kern_file.hpp>
-#include <Headers/kern_util.hpp>
+#include "RgfxGateFile.hpp"
 
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSBoolean.h>
@@ -84,18 +83,18 @@ void keepVideoPreference() {
 		vnode_put(vp);
 	vfs_context_rele(ctx);
 	if (found != 0 && found != ENOENT) {
-		SYSLOG("rgfxgate", "AppleGVA preferences: lookup failed (%d); left", found);
+		graft_client_log(kClientID, "AppleGVA preferences: lookup failed (%d); left", found);
 		return;
 	}
 
 	uint8_t *file = nullptr;
 	size_t size = 0;
 	if (found == 0) {
-		file = FileIO::readFileToBuffer(kGvaPrefPath, size);
+		file = readFile(kGvaPrefPath, size, kMaxPrefBytes);
 		if (file == nullptr || size > kMaxPrefBytes) {
-			SYSLOG("rgfxgate", "AppleGVA preferences unreadable (%zu bytes); left", size);
+			graft_client_log(kClientID, "AppleGVA preferences unreadable (%zu bytes); left", size);
 			if (file != nullptr)
-				Buffer::deleter(file);
+				IOFree(file, size);
 			return;
 		}
 	}
@@ -116,18 +115,18 @@ void keepVideoPreference() {
 	}
 	switch (verdict) {
 	case kRgfxGvaPrefSet:
-		DBGLOG("rgfxgate", "AppleGVA preferences already set");
+		graft_client_log(kClientID, "AppleGVA preferences already set");
 		break;
 	case kRgfxGvaPrefBinary:
-		SYSLOG("rgfxgate", "AppleGVA preferences are a binary plist the edit cannot take; left");
+		graft_client_log(kClientID, "AppleGVA preferences are a binary plist the edit cannot take; left");
 		break;
 	case kRgfxGvaPrefUnreadable:
-		SYSLOG("rgfxgate", "AppleGVA preferences are no XML plist with a dict; left");
+		graft_client_log(kClientID, "AppleGVA preferences are no XML plist with a dict; left");
 		break;
 	case kRgfxGvaPrefWrite:
 		if (binary ? !rgfx_gva_pref_binary_kept(file, size, reinterpret_cast<uint8_t *>(out), outLen)
 		           : !editKept(before, out, outLen)) {
-			SYSLOG("rgfxgate", "AppleGVA preferences edit does not read back; left");
+			graft_client_log(kClientID, "AppleGVA preferences edit does not read back; left");
 			break;
 		}
 		{
@@ -138,20 +137,20 @@ void keepVideoPreference() {
 			const char *what = found == 0 ? "edit" : "create";
 			char tmp[sizeof(kGvaPrefPath) + 8];
 			if (!rgfx_sibling_path(kGvaPrefPath, ".rgfxtmp", tmp, sizeof(tmp))) {
-				SYSLOG("rgfxgate", "AppleGVA preferences temp path too long; left");
+				graft_client_log(kClientID, "AppleGVA preferences temp path too long; left");
 				break;
 			}
-			int err = FileIO::writeBufferToFile(tmp, out, outLen,
+			int err = writeFile(tmp, out, outLen,
 			                                    O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW, 0644);
 			if (err != 0) {
-				SYSLOG("rgfxgate", "AppleGVA preferences %s FAILED (%d)", what, err);
+				graft_client_log(kClientID, "AppleGVA preferences %s FAILED (%d)", what, err);
 				break;
 			}
 			vfs_context_t wctx = vfs_context_create(nullptr);
 			bool renamed = wctx != nullptr && rgfxRenameNode(tmp, kGvaPrefPath, false, wctx);
 			if (wctx != nullptr)
 				vfs_context_rele(wctx);
-			SYSLOG("rgfxgate", "AppleGVA preferences %s %s", what,
+			graft_client_log(kClientID, "AppleGVA preferences %s %s", what,
 			       renamed ? "written" : "rename FAILED; left");
 		}
 		break;
@@ -161,7 +160,7 @@ void keepVideoPreference() {
 	if (out != nullptr)
 		IOFree(out, cap);
 	if (file != nullptr)
-		Buffer::deleter(file);
+		IOFree(file, size);
 }
 
 } // namespace rgfxgate
