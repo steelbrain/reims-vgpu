@@ -408,7 +408,9 @@ public:
 	// the block mapped in its window from its first ask until its hold ends, which takes it
 	// back before the block can go to anyone else.
 	// A block in place made for an ask with `surfaceId` and `cacheable` is cached where the
-	// device has RGFX_FEATURE_SURFACE_CACHE (kRgfxAccelMethodSurfaceBlock).
+	// device has RGFX_FEATURE_SURFACE_CACHE, and where the device answers which surfaces need a
+	// cache (RGFX_FEATURE_SURFACE_CACHE_REFUSED), where it answers so for the surface laid out as
+	// `layout` says (kRgfxAccelMethodSurfaceBlock).
 	struct SurfaceBlock {
 		UInt64 offset;
 		UInt64 size;
@@ -418,7 +420,8 @@ public:
 	};
 	IOReturn acquireSurfaceBlock(RgfxAcceleratorUserClient *client, UInt32 context, task_t task,
 	                             UInt64 address, UInt64 length, UInt64 size, bool inPlace,
-	                             uint32_t surfaceId, bool cacheable, SurfaceBlock *block);
+	                             uint32_t surfaceId, bool cacheable,
+	                             const RgfxSurfacePagesLayout *layout, SurfaceBlock *block);
 	// A dormant block's surface asked it to go (RgfxAcceleratorLocks.cpp): the release thread
 	// lets it go (RgfxAcceleratorContexts.cpp). From any thread, under no lock of the kext's.
 	void wakeReleases();
@@ -567,17 +570,22 @@ private:
 	void publishVideoCodecs();
 	// A fresh block in place's SURFACE_PAGES (RgfxAcceleratorContexts.cpp): its `count` runs of
 	// the surface's `length` bytes written at `size` bytes into the block of `total` bytes at
-	// `offset`, and posted for context `context`, its block cached where `cached`; true where
-	// the device answered OK.
+	// `offset`, and posted for context `context`, its block cached where `cached`, else asking
+	// whether it needs a device cache with `layout` where given; true where the device answered
+	// OK, its status in `*status` where it answered and that is asked for.
 	bool postSurfacePages(UInt32 context, UInt64 offset, UInt64 total, UInt64 size,
-	                      UInt64 length, const RgfxPageRun *runs, UInt32 count, bool cached);
+	                      UInt64 length, const RgfxPageRun *runs, UInt32 count, bool cached,
+	                      const RgfxSurfacePagesLayout *layout = nullptr,
+	                      UInt32 *status = nullptr);
 	// SURFACE_PAGES of the block of `total` bytes at `offset` made for context `context`: its
 	// `count` runs of `length` bytes at region offset `runsOffset`, already written, with
-	// `flags` (RGFX_SURFACE_PAGES_*, none sent where 0). kIOReturnSuccess where the device
-	// answered OK, kIOReturnUnsupported where it answered otherwise, its status in `*status`
-	// where asked for, else why it did not answer.
+	// `flags` (RGFX_SURFACE_PAGES_*, none sent where 0) and `layout` after them where given
+	// (RGFX_SURFACE_PAGES_ASK_CACHE). kIOReturnSuccess where the device answered OK,
+	// kIOReturnUnsupported where it answered otherwise, its status in `*status` where asked for,
+	// else why it did not answer.
 	IOReturn postPages(UInt32 context, UInt64 offset, UInt64 total, UInt64 runsOffset,
-	                   UInt64 length, UInt32 count, UInt32 flags, UInt32 *status = nullptr);
+	                   UInt64 length, UInt32 count, UInt32 flags, UInt32 *status = nullptr,
+	                   const RgfxSurfacePagesLayout *layout = nullptr);
 	// The new deferred block of entry `e`, pending, held by its asker of context `context` alone,
 	// `total` bytes with its runs' room: makes its surface's device cache and reads the surface
 	// (rgfxSurfaceLocksDefer); fresh, asks the host to defer it; not fresh, refused or with no

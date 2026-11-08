@@ -833,6 +833,43 @@ pub struct SurfaceFacts {
     pub ycbcr_matrix: Option<SurfaceMatrix>,
 }
 
+/// One plane of an IOSurface as its pages hold it, for
+/// [`crate::platform::device::GpuDevice::surface_pages_in_place`]: where its rows of elements lie
+/// from the surface's first byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PagesPlane {
+    /// The plane's first byte, from the surface's.
+    pub offset: u64,
+    /// Bytes from one of its rows to the next.
+    pub bytes_per_row: u64,
+    /// The bytes of a row's texels (its elements').
+    pub row_bytes: u64,
+    /// Its rows of elements.
+    pub rows: u64,
+}
+
+impl PagesPlane {
+    /// The byte past its last texel, from the surface's first byte; `None` where it overflows.
+    pub fn end(&self) -> Option<u64> {
+        let last = self.rows.checked_sub(1)?.checked_mul(self.bytes_per_row)?;
+        self.offset.checked_add(last)?.checked_add(self.row_bytes)
+    }
+}
+
+/// What a device answers of textures over an IOSurface's own pages
+/// ([`crate::platform::device::GpuDevice::surface_pages_in_place`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagesInPlace {
+    /// Every texture over them, for any access, lies in place in the pages.
+    Yes,
+    /// The device's verdict for an access over such pages is not known yet: a texture made now
+    /// waits for nothing, is the platform's copy meanwhile, and lies in place once the verdict
+    /// passes (staying the copy where it does not).
+    Pending,
+    /// A texture over them would not lie in place for some access: why, in words.
+    No(String),
+}
+
 /// An IOSurface's `kIOSurfaceYCbCrMatrix` value: one of the strings CoreVideo names
 /// (`kCVImageBufferYCbCrMatrix_*`), or any other value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

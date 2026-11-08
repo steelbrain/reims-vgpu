@@ -70,7 +70,12 @@
 //  - OPENCL_MODE (bit 27): the bundle makes the GL renderer's OpenCL kernels' pipelines of OpenCL
 //    mode (RGFX_COMPUTE_PIPELINE_OPENCL_MODE), which needs nothing of the kext;
 //  - PRIVATE_RENDER_STATE (bit 28): the bundle's render pipeline creates carry their descriptors'
-//    private state (RGFX_RENDER_PIPELINE_PRIVATE_STATE), which needs nothing of the kext.
+//    private state (RGFX_RENDER_PIPELINE_PRIVATE_STATE), which needs nothing of the kext;
+//  - SURFACE_CACHE_REFUSED (bit 29), which a host whose GPU shares the CPU's memory offers: the
+//    kext asks the host, at a new cacheable block in place, whether its surface needs a device
+//    cache (RGFX_SURFACE_PAGES_ASK_CACHE, with the layout the bundle gives with its ask), and
+//    makes the block cached where the host answers RGFX_STATUS_CACHE, its cached blocks then kept
+//    as SURFACE_CACHE's are (RgfxSurfaceCaches.hpp).
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -100,7 +105,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_HOST_TIME | RGFX_FEATURE_MANAGED_TEXTURE_SLABS |
     RGFX_FEATURE_MANAGED_BUFFER_SLABS | RGFX_FEATURE_SMALL_ID_CHUNKS | RGFX_FEATURE_DISPLAY_COLOR |
     RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES | RGFX_FEATURE_OPENCL_MODE |
-    RGFX_FEATURE_PRIVATE_RENDER_STATE;
+    RGFX_FEATURE_PRIVATE_RENDER_STATE | RGFX_FEATURE_SURFACE_CACHE_REFUSED;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)

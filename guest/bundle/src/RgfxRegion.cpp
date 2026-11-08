@@ -98,14 +98,16 @@ void RgfxRegion::setSurfacePagesSource(SurfacePagesFn acquire, uint64_t alignmen
 
 RgfxRegion::SurfaceBlock RgfxRegion::acquireSurfacePages(const void *base, uint64_t length,
                                                          uint64_t size, uint32_t surfaceId,
-                                                         bool cacheable, PagesAnswer *answer)
+                                                         bool cacheable,
+                                                         const RgfxSurfacePagesLayout *layout,
+                                                         PagesAnswer *answer)
 {
 	SurfaceBlock out = {};
 	uint64_t offset = 0, serial = 0;
 	bool fresh = false, cached = false;
 	auto ask = [&] {
-		return m_pagesAcquire(m_pagesContext, base, length, size, surfaceId, cacheable, &offset,
-		                      &serial, &fresh, &cached);
+		return m_pagesAcquire(m_pagesContext, base, length, size, surfaceId, cacheable, layout,
+		                      &offset, &serial, &fresh, &cached);
 	};
 	*answer = m_pagesAcquire == nullptr ? kPagesUnsupported : ask();
 	if (*answer == kPagesNoRoom && reclaimed()) {

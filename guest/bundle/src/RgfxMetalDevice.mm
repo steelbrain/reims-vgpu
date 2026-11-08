@@ -300,12 +300,14 @@ bool rgfxKextSurfaceBlock(void *context, const void *plane, uint64_t length, uin
 // The kext's shared blocks of surfaces in place, as RgfxRegion's surface pages source: the
 // block every process that holds the surface gets, found by the whole allocation it maps at
 // `base`, the device's GPU using those pages, and cached where the kext made it so (six inputs,
-// the surface's IOSurfaceID and whether it may be cached; a fifth output). Unsupported where the
-// device lacks the feature or refused the pages; no room where the kext had none, in the region
-// (kIOReturnNoSpace) or its tables (kIOReturnNoResources); refused for any other answer, among
-// them a kext that takes fewer inputs.
+// the surface's IOSurfaceID and whether it may be cached; a fifth output), the surface's layout
+// its struct input where given. Unsupported where the device lacks the feature or refused the
+// pages; no room where the kext had none, in the region (kIOReturnNoSpace) or its tables
+// (kIOReturnNoResources); refused for any other answer, among them a kext that takes fewer
+// inputs.
 RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, uint64_t length,
                                              uint64_t size, uint32_t surfaceId, bool cacheable,
+                                             const RgfxSurfacePagesLayout *layout,
                                              uint64_t *offset, uint64_t *serial, bool *fresh,
                                              bool *cached)
 {
@@ -314,8 +316,9 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, ui
 	                  cacheable ? 1u : 0u};
 	uint64_t out[5] = {};
 	uint32_t outCount = 5;
-	kern_return_t kr =
-	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 6, out, &outCount);
+	kern_return_t kr = IOConnectCallMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 6, layout,
+	                                       layout != nullptr ? sizeof(*layout) : 0, out,
+	                                       &outCount, nullptr, nullptr);
 	if (kr == kIOReturnUnsupported)
 		return RgfxRegion::kPagesUnsupported;
 	if (kr == kIOReturnNoSpace || kr == kIOReturnNoResources)

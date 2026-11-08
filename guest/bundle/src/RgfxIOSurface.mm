@@ -183,6 +183,29 @@ bool placeInPlace(IOSurfaceRef s, std::vector<ShadowPlane> *planes, uint64_t ali
 	return true;
 }
 
+/// The layout of `s` whose planes lie in its own memory as `planes` places them (placeInPlace),
+/// as an ask whether its block needs a device cache sends it (RgfxSurfacePagesLayout): each plane's
+/// offset and rows, and the bytes of a row's elements, its width over its elements' rounded up,
+/// at most its rows' pitch. A surface of more planes than the layout holds sends none.
+bool pagesLayout(IOSurfaceRef s, const std::vector<ShadowPlane> &planes,
+                 RgfxSurfacePagesLayout *out)
+{
+	if (planes.empty() || planes.size() > RGFX_SURFACE_PAGES_PLANES) {
+		return false;
+	}
+	*out = {};
+	out->plane_count = static_cast<uint32_t>(planes.size());
+	const bool flat = IOSurfaceGetPlaneCount(s) == 0;
+	for (size_t k = 0; k < planes.size(); k++) {
+		const ShadowPlane &p = planes[k];
+		const uint64_t width = flat ? IOSurfaceGetWidth(s) : IOSurfaceGetWidthOfPlane(s, k);
+		const uint64_t ew = std::max<uint64_t>(p.shape.elementWidth, 1);
+		const uint64_t texels = (width + ew - 1) / ew * p.shape.bytesPerElement;
+		out->planes[k] = {p.offset, p.pitch, std::min(texels, p.pitch), p.shape.rows};
+	}
+	return true;
+}
+
 /// The surface's facts for a log line: its id, OSType, size, allocation and each plane's size
 /// and rows.
 std::string describe(IOSurfaceRef s)
@@ -939,10 +962,15 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 			// writes stays in its memory as a window does (design.md, "The device cache"). The
 			// outputs of the bundle's own video decoder ask none where the host lands no picture
 			// in a cache (RgfxAskUncachedScope), its decode writing their pages.
+			// Its layout goes with the ask, by which a host whose GPU shares the CPU's memory
+			// keeps a device cache only of a surface its textures cannot use in place.
 			const bool cacheable = tAskUncached == 0;
+			RgfxSurfacePagesLayout layout = {};
+			const bool laidOut = pagesLayout(surface, own, &layout);
 			RgfxRegion::PagesAnswer answer = RgfxRegion::kPagesRefused;
 			sharedBlock = region->acquireSurfacePages(IOSurfaceGetBaseAddress(surface), ownLength,
-			                                          ownSize, surfaceId, cacheable, &answer);
+			                                          ownSize, surfaceId, cacheable,
+			                                          laidOut ? &layout : nullptr, &answer);
 			if (sharedBlock.block.ok) {
 				shadow->inPlace = true;
 				// Whoever made the block decided: a block another holder made cached is cached

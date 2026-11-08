@@ -3,8 +3,12 @@
 //!
 //! A GPU that does not share the CPU's memory keeps the GPU's copy of an IOSurface in its own
 //! memory, the surface's device cache, and moves bytes between it and the surface's pages only
-//! where IOSurface's locking asks it to. Where the host's GPU is such a GPU, a block the kext marks
-//! cached ([`RGFX_SURFACE_PAGES_CACHED`]) gets one here: a Private buffer of the surface's bytes in
+//! where IOSurface's locking asks it to. A block the kext marks cached
+//! ([`RGFX_SURFACE_PAGES_CACHED`]) gets one here: on a host whose GPU is such a GPU, any surface's
+//! block the kext caches; on one whose GPU shares the CPU's memory, only a block the device
+//! answered needs one, its textures unable to lie in place over its pages
+//! ([`super::surface_pages`], "Device caches where the pages cannot serve"). A cache is a Private
+//! buffer of the surface's bytes in
 //! the pages' own layout, which every `BUFFER_OVER_SURFACE_PAGES` buffer of the block is, so every
 //! texture over the surface, of any shape, plane or format, lies over the same bytes, as the
 //! textures over the pages did. The surface's pages are the other end of each copy, through their
@@ -684,8 +688,13 @@ impl Watcher for Watched {
 
 /// The device caches of the blocks the kext marked cached, by block offset.
 pub(crate) struct SurfaceCaches<P: Platform> {
-    /// Whether the device keeps caches: its GPU does not share the CPU's memory.
-    on: bool,
+    /// Whether the transfer queue and the end events are made with the command queues
+    /// ([`Caches::queue_made`]): on a host whose GPU has memory of its own, where the kext caches
+    /// every surface it may; not on one whose GPU shares the CPU's memory, where a surface takes a
+    /// cache only where its textures cannot lie in place over its pages, and the first copy
+    /// makes them ([`Self::make_transfer`], [`Self::after`]), so a guest none of whose surfaces
+    /// takes one costs no queue.
+    early: bool,
     by_block: HashMap<u64, SurfaceCache<P>>,
     transfer: Option<Transfer<P>>,
     /// Each command queue's end event, by the queue's id, and the last value signalled: made with
@@ -720,17 +729,17 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// A deferred fill made nothing, and the presents waiting for one are to be told
     /// ([`Self::take_tell`]).
     tell: bool,
-    /// What a fill tells as it finishes, the [`Caches`]' own, kept across [`Caches::set_on`].
+    /// What a fill tells as it finishes, the [`Caches`]' own.
     on_fill_done: Arc<OnceLock<FillHook>>,
-    /// The bytes deferred blocks' caches may hold at once (the device's `DEFERRED_BUDGET`), kept
-    /// across [`Caches::set_on`], and the bytes they hold.
+    /// The bytes deferred blocks' caches may hold at once (the device's `DEFERRED_BUDGET`), and the
+    /// bytes they hold.
     deferred_budget: u64,
     deferred_bytes: u64,
     /// The copies of caches into pages asked and not yet landed ([`Self::copies_into`]), those
     /// landed let go of as each is added.
     into_pages: Vec<IntoPages>,
     /// Whether caches are made exportable, for the host's video to import
-    /// ([`Caches::set_exportable`]), kept across [`Caches::set_on`].
+    /// ([`Caches::set_exportable`]).
     exportable: bool,
 }
 
@@ -857,14 +866,13 @@ impl DeferredFill {
 }
 
 impl<P: Platform> SurfaceCaches<P> {
-    /// No caches; `on` keeps them where the kext asks, each fill telling `on_fill_done` as it
-    /// finishes.
-    fn new(on: bool, on_fill_done: Arc<OnceLock<FillHook>>) -> Self {
+    /// No caches, each fill telling `on_fill_done` as it finishes.
+    fn new(on_fill_done: Arc<OnceLock<FillHook>>) -> Self {
         let watched = Arc::new(Watched::default());
         let watcher: Arc<dyn Watcher> = Arc::clone(&watched) as Arc<dyn Watcher>;
         device_writes::watch(&watcher);
         SurfaceCaches {
-            on,
+            early: true,
             by_block: HashMap::new(),
             transfer: None,
             ends: HashMap::new(),
@@ -883,11 +891,6 @@ impl<P: Platform> SurfaceCaches<P> {
             into_pages: Vec::new(),
             exportable: false,
         }
-    }
-
-    /// Whether the device keeps caches.
-    pub(crate) fn on(&self) -> bool {
-        self.on
     }
 
     /// What the caches did so far.
@@ -1042,9 +1045,9 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// A cache of zeros for the deferred block at `block` (the module doc), of `length` bytes,
     /// at the CPU's generation 0, its block `block_size` bytes: zeroed on the transfer queue,
-    /// whose fill every use of it waits for. `Ok(false)`, with no cache, where the device keeps
-    /// none, the deferred caches' budget has no room for it, or the platform made no buffer or
-    /// no transfer queue for it. A cache the block had goes first, as at a release
+    /// whose fill every use of it waits for. `Ok(false)`, with no cache, where the deferred
+    /// caches' budget has no room for it, or the platform made no buffer or no transfer queue for
+    /// it. A cache the block had goes first, as at a release
     /// ([`SurfaceCaches::released`]).
     pub(crate) fn make_deferred(
         &mut self,
@@ -1053,9 +1056,6 @@ impl<P: Platform> SurfaceCaches<P> {
         length: u64,
         block_size: u64,
     ) -> RaiseResult<bool> {
-        if !self.on {
-            return Ok(false);
-        }
         if self.by_block.contains_key(&block) {
             self.released(device, block, 0, None, None, Box::new(|| {}))?;
         }
@@ -2592,14 +2592,21 @@ fn by_block<'u>(
 }
 
 impl<P: Platform> Caches<P> {
-    /// No caches; `on` keeps them where the kext asks.
-    pub(crate) fn new(on: bool) -> Self {
+    /// No caches.
+    pub(crate) fn new() -> Self {
         let on_fill_done = Arc::default();
         Caches {
-            state: Mutex::new(SurfaceCaches::new(on, Arc::clone(&on_fill_done))),
+            state: Mutex::new(SurfaceCaches::new(Arc::clone(&on_fill_done))),
             moved: Condvar::new(),
             on_fill_done,
         }
+    }
+
+    /// Whether the transfer queue and the end events are made with the command queues
+    /// ([`Self::queue_made`]): not where the host's GPU shares the CPU's memory, whose first copy
+    /// makes them.
+    pub(crate) fn set_early(&self, early: bool) {
+        self.state.lock().early = early;
     }
 
     /// Has each fill tell `hook` as it finishes, after the threads waiting for it are woken: the
@@ -2608,24 +2615,25 @@ impl<P: Platform> Caches<P> {
         let _ = self.on_fill_done.set(hook);
     }
 
-    /// Command queue `queue` was made: where the device keeps caches, its end event is made now,
-    /// and the transfer queue too where there is none yet, each with no lock held. A command
-    /// buffer's begin and finish, under the caches' lock, then make neither
-    /// ([`SurfaceCaches::after`], [`SurfaceCaches::make_transfer`]): every other queue's buffers
-    /// that use a cache would wait for the creation, which the platform's other threads' work on
-    /// the device's memory and semaphores can stretch to milliseconds (measured on the RTX 5080
-    /// Laptop GPU host: 0.5 to 3 ms an end event at a queue's first buffer in a guest's boot,
-    /// against 0.1 ms where no other thread makes or frees the device's memory or semaphores).
+    /// Command queue `queue` was made: its end event is made now, and the transfer queue too
+    /// where there is none yet, each with no lock held, where they are made early
+    /// ([`Self::set_early`]). A command buffer's begin and finish, under the caches' lock, then
+    /// make neither ([`SurfaceCaches::after`], [`SurfaceCaches::make_transfer`]): every other
+    /// queue's buffers that use a cache would wait for the creation, which the platform's other
+    /// threads' work on the device's memory and semaphores can stretch to milliseconds (measured
+    /// on the RTX 5080 Laptop GPU host: 0.5 to 3 ms an end event at a queue's first buffer in a
+    /// guest's boot, against 0.1 ms where no other thread makes or frees the device's memory or
+    /// semaphores).
     pub(crate) fn queue_made(&self, device: &P::Device, queue: u64) -> RaiseResult<()> {
-        let (on, transfer, read_back) = {
+        let (early, transfer, read_back) = {
             let state = self.state.lock();
             (
-                state.on,
+                state.early,
                 state.transfer.is_some(),
                 state.ends.contains_key(&READ_BACK),
             )
         };
-        if !on {
+        if !early {
             return Ok(());
         }
         let mut end = device.new_event(ON)?;
@@ -2642,22 +2650,20 @@ impl<P: Platform> Caches<P> {
             let mut state = self.state.lock();
             // A queue of the same id is the queue's again, whose event it takes on.
             state.gone.remove(&queue);
-            // Kept only where the caches are still on, and where no buffer's begin or finish made
-            // the same meanwhile; else let go of below.
-            if state.on {
-                for (key, made_end) in [(queue, &mut end), (READ_BACK, &mut read_back_end)] {
-                    if let Some(event) = made_end.take() {
-                        match state.ends.entry(key) {
-                            Entry::Vacant(slot) => {
-                                slot.insert((event, 0));
-                            }
-                            Entry::Occupied(_) => *made_end = Some(event),
+            // Kept only where no buffer's begin or finish made the same meanwhile; else let go of
+            // below.
+            for (key, made_end) in [(queue, &mut end), (READ_BACK, &mut read_back_end)] {
+                if let Some(event) = made_end.take() {
+                    match state.ends.entry(key) {
+                        Entry::Vacant(slot) => {
+                            slot.insert((event, 0));
                         }
+                        Entry::Occupied(_) => *made_end = Some(event),
                     }
                 }
-                if state.transfer.is_none() {
-                    state.transfer = made.take();
-                }
+            }
+            if state.transfer.is_none() {
+                state.transfer = made.take();
             }
             // And the gone queues' events no cache names any more ([`SurfaceCaches::sweep_gone`]).
             state.sweep_gone()
@@ -2726,16 +2732,6 @@ impl<P: Platform> Caches<P> {
         if tell && let Some(hook) = self.on_fill_done.get() {
             hook();
         }
-    }
-
-    /// Starts again with no caches; `on` keeps them where the kext asks. The deferred caches'
-    /// budget stays.
-    pub(crate) fn set_on(&self, on: bool) {
-        let mut state = self.state.lock();
-        let (budget, exportable) = (state.deferred_budget, state.exportable);
-        *state = SurfaceCaches::new(on, Arc::clone(&self.on_fill_done));
-        state.deferred_budget = budget;
-        state.exportable = exportable;
     }
 
     /// Makes each cache from now on exportable where the platform makes one, for the host's video
@@ -3574,8 +3570,8 @@ mod tests {
         Arg::obj(cache).as_obj().unwrap().0
     }
 
-    /// A block marked cached gets a device cache, which each of its buffers is; a block not
-    /// marked, or any block of a GPU that shares the CPU's memory, gets none
+    /// A block marked cached gets a device cache, which each of its buffers is, on a GPU of its
+    /// own memory or one that shares the CPU's alike; a block not marked gets none
     #[test]
     fn a_cached_blocks_buffers_are_its_device_cache() {
         let mut r = cached();
@@ -3596,7 +3592,7 @@ mod tests {
             r.pages_cached(BLOCK + 0x10000, &[(4, 1)], page, true),
             RGFX_STATUS_OK
         );
-        assert_eq!(r.dec.caches().len(), 0, "a GPU of the CPU's memory");
+        assert_eq!(r.dec.caches().len(), 2, "a GPU of the CPU's memory");
     }
 
     /// A cache is filled from its pages as it is made, as of the CPU's generation in the block's
@@ -5919,8 +5915,8 @@ mod tests {
         assert!(!r.dec.caches().has(third));
     }
 
-    /// A deferred block the budget has no room for, or whose cache the platform does not make,
-    /// or on a device that keeps no caches, is refused and leaves nothing behind, so the kext's
+    /// A deferred block the budget has no room for, or whose cache the platform does not make, is
+    /// refused and leaves nothing behind, so the kext's
     /// `SURFACE_PAGES` of its pages that follows makes its cache as any block's. A release gives
     /// its room back
     #[test]
@@ -5953,10 +5949,6 @@ mod tests {
         );
         assert_eq!(r.dec.caches().counts().deferred_refused, 2);
 
-        let fourth = BLOCK + 0x18000;
-        r.dec.set_unified_memory(true);
-        r.dec.set_deferred_budget(8 * page);
-        assert_eq!(defer(&mut r, fourth, page), refused, "no caches");
         let mut none = deferring(0);
         assert_eq!(defer(&mut none, BLOCK, page), refused, "no budget");
     }

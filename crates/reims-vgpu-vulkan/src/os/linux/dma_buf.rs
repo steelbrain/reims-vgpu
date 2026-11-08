@@ -373,6 +373,45 @@ pub(crate) fn of_ranges(ranges: &[(u64, u64)], zeros: &Zeros) -> Result<OwnedFd,
     create(device, &runs)
 }
 
+/// Whether one dma-buf takes the whole pages of the `length` bytes from `first`, as the runtime
+/// asks an import's source for a texture's own pages, at a granule of their length
+/// (`super::import`'s `host_memory`): refused, with udmabuf's limits named, where they are more
+/// runs of file pages, or more bytes, than one takes, and where the backing table resolves a byte
+/// to no file. It counts the runs as [`add_runs`] makes them, and makes nothing: each piece of the
+/// block of zeros counts as a run of its own, as a file of zeros of the import's own holds it.
+pub(crate) fn fits_one(first: u64, length: u64) -> Result<(), Refusal> {
+    let page = vm::page_size();
+    let start = first & !(page - 1);
+    let end = first.saturating_add(length).next_multiple_of(page);
+    let resolved = files::pieces(start, end - start).ok_or(Refusal::Unresolved)?;
+    let of_zeros = super::import::of_zeros(&resolved);
+    let mut pieces: u64 = 0;
+    // The file and the offset past the last run's end.
+    let mut last: Option<(&Arc<OwnedFd>, u64)> = None;
+    for (piece, of_zeros) in resolved.iter().zip(of_zeros) {
+        let follows = matches!(
+            last,
+            Some((fd, end)) if !of_zeros && Arc::ptr_eq(fd, &piece.backing.fd)
+                && end == piece.backing.offset
+        );
+        if !follows {
+            pieces += 1;
+        }
+        last = (!of_zeros).then(|| (&piece.backing.fd, piece.backing.offset + piece.length));
+    }
+    let limits = limits();
+    let bytes = end - start;
+    if pieces > limits.pieces || bytes > limits.bytes {
+        return Err(Refusal::Limit {
+            pieces,
+            bytes,
+            granule: bytes,
+            limits,
+        });
+    }
+    Ok(())
+}
+
 /// Dma-bufs of the `length` bytes from `first`, whole pages, each resolved through the backing
 /// table, which in order are those bytes ([`add_runs`]), cut into chunks within udmabuf's limits
 /// at multiples of `granule` from `first` (module docs).

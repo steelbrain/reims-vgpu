@@ -36,6 +36,7 @@ pub mod icb;
 pub mod identity;
 pub mod metal_space;
 pub mod no_texture;
+mod pages_in_place;
 pub mod predication;
 pub mod rate_map;
 pub mod resource;

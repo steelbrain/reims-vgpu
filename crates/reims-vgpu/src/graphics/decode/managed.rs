@@ -159,8 +159,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// with no, the two copies, which hold Metal's contract on any GPU.
     pub(crate) fn set_unified_memory(&mut self, unified: bool) {
         (self.shared.unified_memory).store(unified, std::sync::atomic::Ordering::Release);
-        // A GPU of its own memory keeps IOSurfaces' device caches (`surface_cache`).
-        self.surface_caches.set_on(!unified);
+        // A GPU of its own memory caches every surface the kext may (`surface_cache`): its
+        // transfer queue is made with the first command queue.
+        self.surface_caches.set_early(!unified);
     }
 
     /// Whether `Managed` resources are one copy ([`Self::set_unified_memory`]).

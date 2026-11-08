@@ -114,7 +114,10 @@ enum {
 	// RGFX_FEATURE_SURFACE_CACHE, the block that ask makes is cached (RgfxSurfaceCaches.hpp), and
 	// its header holds the surface's CPU generation at kRgfxSurfaceCpuGenOffset and its clients at
 	// kRgfxSurfaceClientsOffset. A fifth output, where asked, is 1 where the block is cached, else
-	// 0.
+	// 0. With six inputs, a struct input of exactly sizeof(RgfxSurfacePagesLayout) is the
+	// surface's planes as its memory holds them: where the device answers which surfaces need a
+	// device cache (RGFX_FEATURE_SURFACE_CACHE_REFUSED), a new cacheable block asks it with them,
+	// and is cached only where it answers so; with none, it stays in place.
 	kRgfxAccelMethodSurfaceBlock = 0x109,
 	// Lets go of one ask of the shared block at the region offset scalarInput[0]; the block goes
 	// once no process holds it, through its BLOCK_RELEASE.

@@ -21,8 +21,8 @@ use super::types::{
 };
 use super::values::{
     ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
-    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc,
-    RenderPipelineDesc, SamplerDesc,
+    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, PagesInPlace,
+    PagesPlane, RenderPipelineDesc, SamplerDesc,
 };
 use super::{Handle, Platform};
 use crate::raise::{OnFault, RaiseResult};
@@ -148,6 +148,18 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// [`BlitEncoder::copy_from_guest_ram`]: super::blit::BlitEncoder::copy_from_guest_ram
     /// [`BlitEncoder::copy_to_guest_ram`]: super::blit::BlitEncoder::copy_to_guest_ram
     fn copies_guest_ram(&self) -> bool;
+    /// No Metal counterpart: whether textures over an IOSurface's own pages, which `pages`, a
+    /// no-copy buffer of this device over all of them from the surface's first byte, lies over,
+    /// its planes laid out as `planes` gives, lie in place in those pages for every access a
+    /// texture over the surface may take (sampled or read, rendered, written by a shader), as the
+    /// platform makes a texture over such a buffer; where one would be the platform's copy of
+    /// them instead (a shadow), why. Asked only of a device whose GPU shares the CPU's memory,
+    /// where the graphics lane gives a surface a device cache only where its textures cannot lie
+    /// in place. The default is yes.
+    fn surface_pages_in_place(&self, pages: &P::Buffer, planes: &[PagesPlane]) -> PagesInPlace {
+        let _ = (pages, planes);
+        PagesInPlace::Yes
+    }
     /// sel: newComputePipelineStateWithFunction:error:
     /// The function may be nil (a library with no such function); core asserts on nil in the
     /// service. No path reaches it under a handler: a raise inside it dies at the send.

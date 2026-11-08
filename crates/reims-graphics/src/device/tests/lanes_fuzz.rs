@@ -93,6 +93,7 @@ impl Host for FuzzHost {
         _pages: &RgfxSurfacePages,
         _runs: Vec<RgfxPageRun>,
         _flags: u32,
+        _layout: Option<RgfxSurfacePagesLayout>,
         answer: CompleteAnswer,
     ) {
         self.carry_out(answer.seqno, |_| {});

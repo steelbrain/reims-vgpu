@@ -66,6 +66,24 @@
 //!
 //! [`GpuDevice::copies_guest_ram`]: reims_vgpu_core::platform::device::GpuDevice::copies_guest_ram
 //!
+//! **Device caches where the pages cannot serve** (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`). On a
+//! device whose GPU shares the CPU's memory a surface's textures lie in its pages, but not every
+//! surface's can: the platform takes its own copy of the pages instead (a shadow) where the GPU
+//! cannot place a texture over them as the guest laid them out (rows that end inside the cache
+//! line the GPU writes back by, on an Intel GPU; more pieces than a dma-buf takes, on RADV), and
+//! that copy goes back and forth at every command buffer. Such a surface takes a device cache
+//! instead, which is copied only at the CPU's locks and unlocks, as on a GPU of its own memory. A
+//! block in place asks for it at its `SURFACE_PAGES` (`RGFX_SURFACE_PAGES_ASK_CACHE`), with its
+//! surface's planes, which must lie in its bytes ([`layout_planes`]): its view is made as any
+//! block's, and the device asked whether textures over it lie in place
+//! ([`GpuDevice::surface_pages_in_place`]). Where they do, or where the device's verdict is not
+//! known yet, the block keeps its view and its buffers lie over its pages, as a block that asks
+//! nothing; where they do not, the block is answered `RGFX_STATUS_CACHE` with no view, its view
+//! left in the cache of views, and the kext posts it again marked cached, which takes that view
+//! and a device cache ([`super::surface_cache`]). The counts keep how each ask was answered.
+//!
+//! [`GpuDevice::surface_pages_in_place`]: reims_vgpu_core::platform::device::GpuDevice::surface_pages_in_place
+//!
 //! **Off ring 0's threads.** A view costs a kernel mapping per run, and the runtime's import of
 //! them: real surfaces' runs are single 4 KiB pages, most laid right below the run before (measured
 //! on the msi 5080 host, macOS 26 guest, Safari scrolling: every run one page, 74% of them
@@ -101,8 +119,8 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use reims_graphics::wire::{
-    RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxPageRun,
-    RgfxSurfacePages,
+    RGFX_SURFACE_PAGES_PLANES, RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages,
+    RgfxPageRun, RgfxSurfacePages, RgfxSurfacePagesLayout,
 };
 use reims_vgpu_core::host::{HostPtr, PhysRange};
 use reims_vgpu_core::memory::PAGE_SIZE as MAPPING_PAGE;
@@ -111,7 +129,7 @@ use reims_vgpu_core::memory::mapping::Mapping;
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::os::clock::Clock as _;
-use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet};
+use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, PagesPlane};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{RaiseResult, refusals};
 use reims_vgpu_core::sync::Mutex;
@@ -304,6 +322,55 @@ pub(crate) struct ViewCounts {
     pub(crate) idle_returned: u64,
     /// Cached blocks named by their runs, with no view (the module doc).
     pub(crate) by_runs: u64,
+    /// Blocks that asked whether they need a device cache and stay in place (the module doc,
+    /// "Device caches where the pages cannot serve"), the device's verdict known, which
+    /// `asked_pending` does not count.
+    pub(crate) asked_in_place: u64,
+    /// Such blocks kept in place while the device's verdict for their pages was pending.
+    pub(crate) asked_pending: u64,
+    /// Such blocks answered `RGFX_STATUS_CACHE`.
+    pub(crate) asked_cache: u64,
+}
+
+/// How a block that asked whether it needs a device cache was answered, for the counts
+/// ([`SurfaceViews::asked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Asked {
+    /// In place: the device's textures lie in place over its pages.
+    InPlace,
+    /// In place, the device's verdict for its pages pending.
+    Pending,
+    /// A device cache.
+    Cache,
+}
+
+/// The planes of the surface `layout` gives ([`RgfxSurfacePagesLayout`]), where it has 1 to
+/// [`RGFX_SURFACE_PAGES_PLANES`] planes, each of at least one row of texels, its rows apart by
+/// at least a row's texels where it has more than one, and its texels in the surface's `length`
+/// bytes; `None` otherwise.
+pub(crate) fn layout_planes(
+    layout: &RgfxSurfacePagesLayout,
+    length: u64,
+) -> Option<Vec<PagesPlane>> {
+    let count = usize::try_from(layout.plane_count).ok()?;
+    if !(1..=RGFX_SURFACE_PAGES_PLANES as usize).contains(&count) {
+        return None;
+    }
+    let planes: Vec<PagesPlane> = (layout.planes[..count].iter())
+        .map(|p| PagesPlane {
+            offset: p.offset,
+            bytes_per_row: p.bytes_per_row,
+            row_bytes: p.row_bytes,
+            rows: p.rows,
+        })
+        .collect();
+    let lies = |p: &PagesPlane| {
+        p.rows != 0
+            && p.row_bytes != 0
+            && (p.rows == 1 || p.row_bytes <= p.bytes_per_row)
+            && p.end().is_some_and(|end| end <= length)
+    };
+    planes.iter().all(lies).then_some(planes)
 }
 
 /// How a surface's runs lie in guest RAM, for the log: each run takes a kernel mapping of its own
@@ -346,7 +413,7 @@ struct Cached<P: Platform> {
     /// The runs the view maps, in order.
     runs: Vec<(u64, u64)>,
     view: Arc<SurfaceView<P>>,
-    _import: P::Buffer,
+    import: P::Buffer,
 }
 
 /// A pages block (the module doc): its runs, and the view its `BUFFER_OVER_PAGES` buffers lie
@@ -779,7 +846,7 @@ impl<P: Platform> SurfaceViews<P> {
         self.cache.push_back(Cached {
             runs: key,
             view: Arc::clone(view),
-            _import: import,
+            import,
         });
         let mut evicted = Vec::new();
         let mut bytes: u64 = self.cache.iter().map(|c| c.view.length()).sum();
@@ -811,6 +878,23 @@ impl<P: Platform> SurfaceViews<P> {
             }
         }
         evicted
+    }
+
+    /// The buffer over the whole of the view of the block at `block` that holds its import, one
+    /// more reference to it, where the block has a view the cache of views keeps.
+    pub(crate) fn import_of(&self, block: u64) -> Option<P::Buffer> {
+        let (view, _) = self.by_block.get(&block)?;
+        let cached = self.cache.iter().find(|c| Arc::ptr_eq(&c.view, view))?;
+        Some(cached.import.clone_ref())
+    }
+
+    /// A block that asked whether it needs a device cache was answered `how`, counted.
+    pub(crate) fn asked(&mut self, how: Asked) {
+        match how {
+            Asked::InPlace => self.counts.asked_in_place += 1,
+            Asked::Pending => self.counts.asked_pending += 1,
+            Asked::Cache => self.counts.asked_cache += 1,
+        }
     }
 
     /// The device's resets so far ([`Settle`]).
@@ -1365,13 +1449,16 @@ pub(super) mod tests {
         RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_PAGES,
         RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_OBJECT_DESTROY,
         RGFX_CMD_SURFACE_PAGES, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
-        RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-        RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset,
-        RgfxBufferOverHostMemory, RgfxMsgHeader, RgfxObjectDestroy, RgfxTextureDescriptor,
+        RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN, RGFX_STATUS_CACHE,
+        RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+        RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_PRIVATE,
+        RgfxBufferAtOffset, RgfxBufferOverHostMemory, RgfxMsgHeader, RgfxObjectDestroy,
+        RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout, RgfxTextureDescriptor,
         RgfxTextureFromBuffer,
     };
     use reims_vgpu_core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
     use reims_vgpu_core::platform::resource::Buffer as _;
+    use reims_vgpu_core::platform::values::PagesInPlace;
     use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam};
     use zerocopy::IntoBytes;
 
@@ -1459,6 +1546,33 @@ pub(super) mod tests {
             length: u64,
             flags: u32,
         ) -> u32 {
+            self.pages_laid_out(block, context, runs, length, flags, None)
+        }
+
+        /// A `SURFACE_PAGES` for the block at `block` of `runs` (as [`Self::pages`]) over
+        /// `length` bytes that asks whether it needs a device cache, with the layout `layout`; its
+        /// answer.
+        pub(crate) fn pages_asking(
+            &mut self,
+            block: u64,
+            runs: &[(u64, u64)],
+            length: u64,
+            layout: Option<RgfxSurfacePagesLayout>,
+        ) -> u32 {
+            let flags = RGFX_SURFACE_PAGES_ASK_CACHE;
+            self.pages_laid_out(block, 0, runs, length, flags, layout)
+        }
+
+        /// [`Self::pages_flagged`], the message carrying `layout`.
+        fn pages_laid_out(
+            &mut self,
+            block: u64,
+            context: u32,
+            runs: &[(u64, u64)],
+            length: u64,
+            flags: u32,
+            layout: Option<RgfxSurfacePagesLayout>,
+        ) -> u32 {
             let runs: Vec<RgfxPageRun> = runs
                 .iter()
                 .map(|&(at, n)| RgfxPageRun {
@@ -1475,7 +1589,7 @@ pub(super) mod tests {
                 runs_offset: block + 0x1000,
                 length,
             };
-            self.dec.surface_pages(&self.device, &m, &runs, flags)
+            (self.dec).surface_pages_laid_out(&self.device, &m, &runs, flags, layout)
         }
 
         /// A `BUFFER_OVER_SURFACE_PAGES` of `length` bytes over the block at `block`.
@@ -1712,6 +1826,121 @@ pub(super) mod tests {
         let views = r.dec.views_of_surfaces();
         assert_eq!(views.counts().idle_returned, 1);
         assert_eq!(views.len(), (2, 4));
+    }
+
+    /// A surface of one plane of `rows` rows of `row_bytes` texel bytes `bytes_per_row` apart.
+    fn one_plane(bytes_per_row: u64, row_bytes: u64, rows: u64) -> RgfxSurfacePagesLayout {
+        let mut layout = RgfxSurfacePagesLayout {
+            plane_count: 1,
+            ..Default::default()
+        };
+        layout.planes[0] = RgfxSurfacePlaneLayout {
+            offset: 0,
+            bytes_per_row,
+            row_bytes,
+            rows,
+        };
+        layout
+    }
+
+    /// A block in place that asks whether it needs a device cache, on a host whose GPU shares the
+    /// CPU's memory, takes the device's answer for its view and its planes. Where the device
+    /// answers that every texture over them lies in place, or that its verdict is pending, the
+    /// block keeps its view in place with no cache, as a block that asks nothing does, and its
+    /// buffers lie over the pages. Where it answers no, the block is answered `RGFX_STATUS_CACHE`
+    /// and keeps no view, the view staying in the cache of views; the block's cached
+    /// `SURFACE_PAGES` that follows takes that view, mapping nothing again, and gets a device
+    /// cache, which its buffers are. A layout that does not lie in the surface's bytes, an ask
+    /// with no layout, or an ask of a cached block, is refused and makes nothing
+    #[test]
+    fn a_block_asking_for_a_device_cache_takes_the_devices_answer() {
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.set_unified_memory(true);
+        let world = Arc::clone(r.p.world());
+        let layout = one_plane(page, page - 16, 2);
+        let planes = vec![PagesPlane {
+            offset: 0,
+            bytes_per_row: page,
+            row_bytes: page - 16,
+            rows: 2,
+        }];
+
+        // In place: a view, no cache, and the buffers over the pages.
+        let made = r.dec.views_of_surfaces().counts().made;
+        assert_eq!(
+            r.pages_asking(BLOCK, &[(1, 2)], 2 * page, Some(layout)),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(world.surface_pages_asked(), vec![planes.clone()]);
+        assert!(r.dec.views_of_surfaces().view(BLOCK).is_some());
+        assert!(!r.dec.caches().has(BLOCK));
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        assert_eq!(r.buffer_at(10).1, r.view(BLOCK).base(), "over the pages");
+
+        // A verdict not known yet: in place too, counted apart.
+        let second = BLOCK + 0x8000;
+        world.answer_surface_pages(PagesInPlace::Pending);
+        assert_eq!(
+            r.pages_asking(second, &[(3, 2)], 2 * page, Some(layout)),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.views_of_surfaces().view(second).is_some());
+        assert!(!r.dec.caches().has(second));
+
+        // Not in place: answered a cache, with no view of its own; its cached SURFACE_PAGES
+        // takes the view made for the ask.
+        let third = BLOCK + 0x10000;
+        world.answer_surface_pages(PagesInPlace::No("the rows end inside a line".into()));
+        assert_eq!(
+            r.pages_asking(third, &[(5, 2)], 2 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        assert!(r.dec.views_of_surfaces().view(third).is_none());
+        assert!(!r.dec.caches().has(third));
+        assert_eq!(r.dec.views_of_surfaces().counts().made, made + 3);
+        assert_eq!(
+            r.pages_cached(third, &[(5, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(
+            r.dec.views_of_surfaces().counts().made,
+            made + 3,
+            "the cached block takes the ask's view"
+        );
+        assert!(r.dec.caches().has(third));
+        let mark = r.p.call_log().mark();
+        assert_eq!(r.buffer(11, third, 2 * page), Ok(()));
+        assert!(
+            r.p.call_log().sels_since(mark).is_empty(),
+            "no buffer made: it is the cache"
+        );
+        let c = r.dec.views_of_surfaces().counts();
+        assert_eq!(
+            (c.asked_in_place, c.asked_pending, c.asked_cache),
+            (1, 1, 1)
+        );
+
+        // Refused, nothing made or asked.
+        world.answer_surface_pages(PagesInPlace::Yes);
+        let asked = world.surface_pages_asked().len();
+        let fourth = BLOCK + 0x18000;
+        let past = one_plane(page, page, 3);
+        let none = one_plane(page, 0, 2);
+        for layout in [Some(past), Some(none), None] {
+            assert_eq!(
+                r.pages_asking(fourth, &[(7, 2)], 2 * page, layout),
+                RGFX_STATUS_INVALID_ARGUMENT
+            );
+        }
+        let flags = RGFX_SURFACE_PAGES_ASK_CACHE | RGFX_SURFACE_PAGES_CACHED;
+        assert_eq!(
+            r.pages_flagged(fourth, 0, &[(7, 2)], 2 * page, flags),
+            RGFX_STATUS_INVALID_ARGUMENT
+        );
+        assert!(r.dec.views_of_surfaces().view(fourth).is_none());
+        assert!(!r.dec.caches().has(fourth));
+        assert_eq!(world.surface_pages_asked().len(), asked);
     }
 
     /// Runs that are not whole pages, that do not sum to the surface's length, or that lie

@@ -112,22 +112,23 @@ use reims_graphics::wire::{
     RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_PRIVATE_STATE,
     RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED, RGFX_RENDER_PIPELINE_SUPPORT_ICB,
     RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT, RGFX_RESOURCE_ID_SMALL_CHUNK,
-    RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+    RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
     RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS,
-    RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
-    RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
-    RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
-    RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
-    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages,
-    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc,
-    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
-    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign,
-    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMeshPipelineReflection,
-    RgfxMeshRenderPipelineCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
-    RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
-    RgfxRenderPipelinePrivateState, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
-    RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
-    RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate,
+    RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED,
+    RGFX_SURFACE_PAGES_DEFERRED, RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3,
+    RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
+    RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
+    RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
+    RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
+    RgfxCbSubmitted, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
+    RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
+    RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer,
+    RgfxLinkedFunction, RgfxMeshPipelineReflection, RgfxMeshRenderPipelineCreate, RgfxMsgHeader,
+    RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
+    RgfxRenderPipelineCreate, RgfxRenderPipelinePrivateState, RgfxResourceIdChunk,
+    RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue,
+    RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfacePages,
+    RgfxSurfacePagesLayout, RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate,
     RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
     RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
@@ -144,8 +145,9 @@ use reims_vgpu_core::platform::types::{MtlSize, Swizzle};
 use reims_vgpu_core::platform::values::{
     AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
     FullComputePipelineDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc,
-    LinkedFunctionsDesc, OptionSet, PrivateRenderDesc, SamplerDesc, StageInputDesc, StencilDesc,
-    SurfaceFacts, SurfaceMatrix, SurfacePlane, TextureDesc, VertexDesc,
+    LinkedFunctionsDesc, OptionSet, PagesInPlace, PagesPlane, PrivateRenderDesc, SamplerDesc,
+    StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix, SurfacePlane, TextureDesc,
+    VertexDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
@@ -904,7 +906,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             surface_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-surfaces")),
             close_worker: worker::Worker::new("reims-vgpu.graphics-closes"),
             video_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-video")),
-            surface_caches: Arc::new(Caches::new(true)),
+            surface_caches: Arc::new(Caches::new()),
             sequencer: Arc::default(),
             split_gate: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
@@ -1014,9 +1016,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Whether a cached block on `device` is named by its runs, with no view: the device copies
-    /// the guest's RAM by them and keeps caches (`surface_pages`, "By runs").
+    /// the guest's RAM by them (`surface_pages`, "By runs").
     fn copies_by_runs(&self, device: &P::Device) -> bool {
-        device.copies_guest_ram() && self.surface_caches.lock().on()
+        device.copies_guest_ram()
     }
 
     /// Whether `SURFACE_PAGES` makes views ([`RGFX_FEATURE_SURFACE_PAGES`]).
@@ -1036,9 +1038,23 @@ impl<P: Platform> GraphicsDecoder<P> {
         runs: &[RgfxPageRun],
         flags: u32,
     ) -> u32 {
+        self.surface_pages_laid_out(device, pages, runs, flags, None)
+    }
+
+    /// [`Self::surface_pages`] of a message that carries its surface's `layout` (an ask whether
+    /// its block needs a device cache, [`RGFX_SURFACE_PAGES_ASK_CACHE`]).
+    #[cfg(test)]
+    pub(crate) fn surface_pages_laid_out(
+        &self,
+        device: &P::Device,
+        pages: &RgfxSurfacePages,
+        runs: &[RgfxPageRun],
+        flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
+    ) -> u32 {
         self.wait_copies_into(pages.block_offset, runs);
         let settle = self.begin_surface_pages(pages.block_offset);
-        self.carry_out_surface_pages(device, pages, runs, flags, &settle)
+        self.carry_out_surface_pages(device, pages, runs, flags, layout, &settle)
             .unwrap_or(RGFX_STATUS_REFUSED)
     }
 
@@ -1107,15 +1123,18 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `BUFFER_OVER_PAGES` and its buffers' alone, with no device cache ([`surface_pages`]); else
     /// one marked [`RGFX_SURFACE_PAGES_CACHED`] may be given a device cache, and with it one
     /// marked [`RGFX_SURFACE_PAGES_DEFERRED`] or [`RGFX_SURFACE_PAGES_ATTACH`] is a deferred
-    /// block or its pages ([`Self::deferred_surface_pages`]). A summary of what the views did is
-    /// logged every [`VIEWS_LOGGED_EVERY`], and at the first [`VIEWS_LOGGED_AFTER`] after the
-    /// last ([`views_log_due`]).
+    /// block or its pages ([`Self::deferred_surface_pages`]); and one marked
+    /// [`RGFX_SURFACE_PAGES_ASK_CACHE`], with its surface's `layout`, asks whether it needs one
+    /// ([`Self::asks_cache`]). A summary of what the views did is logged every
+    /// [`VIEWS_LOGGED_EVERY`], and at the first [`VIEWS_LOGGED_AFTER`] after the last
+    /// ([`views_log_due`]).
     pub(crate) fn carry_out_surface_pages(
         &self,
         device: &P::Device,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
         flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
         settle: &worker::Settle,
     ) -> Option<u32> {
         let clock = self.platform.clock();
@@ -1125,7 +1144,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let status = if flags & (RGFX_SURFACE_PAGES_DEFERRED | RGFX_SURFACE_PAGES_ATTACH) != 0 {
             self.deferred_surface_pages(device, pages, runs, flags, settle)?
         } else {
-            self.view_surface_pages(device, pages, runs, flags, settle)?
+            self.view_surface_pages(device, pages, runs, flags, layout.as_ref(), settle)?
         };
         log::debug!(
             target: "reims_vgpu::graphics::surface_pages",
@@ -1142,6 +1161,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 ", a deferred block's pages"
             } else if flags & RGFX_SURFACE_PAGES_CACHED != 0 {
                 ", cached"
+            } else if flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0 {
+                ", asking whether it needs a device cache"
             } else {
                 ""
             },
@@ -1167,8 +1188,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                 target: "reims_vgpu::graphics",
                 "IOSurface pages in place: {} views made, {} taken from the cache, {} let go of \
                  from it unheld for their mappings; {} pages blocks' views made; {} named by \
-                 their runs; refused: {} for bad runs, {} not mapped",
-                c.made, c.reused, c.idle_returned, c.private, c.by_runs, c.bad_runs, c.not_mapped
+                 their runs; refused: {} for bad runs, {} not mapped; asked whether they need a \
+                 device cache: {} in place, {} in place while the device's verdict was pending, \
+                 {} answered a cache",
+                c.made, c.reused, c.idle_returned, c.private, c.by_runs, c.bad_runs, c.not_mapped,
+                c.asked_in_place, c.asked_pending, c.asked_cache
             );
             if d.made != 0 {
                 log::info!(
@@ -1210,10 +1234,42 @@ impl<P: Platform> GraphicsDecoder<P> {
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
         flags: u32,
+        layout: Option<&RgfxSurfacePagesLayout>,
         settle: &worker::Settle,
     ) -> Option<u32> {
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
         let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
+        // An ask whether the block needs a device cache is a block in place's, with a layout
+        // that lies in the surface's bytes.
+        let ask = flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0;
+        let planes = match (ask, layout) {
+            (false, _) => None,
+            (true, Some(layout)) if !cached && !private => {
+                match surface_pages::layout_planes(layout, pages.length) {
+                    Some(planes) => Some(planes),
+                    None => {
+                        log::warn!(
+                            target: "reims_vgpu::graphics",
+                            "the IOSurface block at {:#x}: asked whether it needs a device cache \
+                             with a layout of {} planes that does not lie in its {:#x} bytes: \
+                             refused",
+                            pages.block_offset, layout.plane_count, pages.length
+                        );
+                        return Some(RGFX_STATUS_INVALID_ARGUMENT);
+                    }
+                }
+            }
+            (true, _) => {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "the IOSurface block at {:#x}: asked whether it needs a device cache with \
+                     flags {flags:#x}{}: refused",
+                    pages.block_offset,
+                    if layout.is_none() { " and no layout" } else { "" }
+                );
+                return Some(RGFX_STATUS_INVALID_ARGUMENT);
+            }
+        };
         let by_runs = cached && self.copies_by_runs(device);
         let views = &self.shared.surface_views;
         let made = if private {
@@ -1241,10 +1297,15 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.uncache_surface(device, pages.block_offset);
                 RGFX_STATUS_OK
             }
-            Ok(Some(Ok(()))) => {
-                self.cache_surface(device, pages.block_offset, runs, cached);
-                RGFX_STATUS_OK
-            }
+            Ok(Some(Ok(()))) => match planes {
+                Some(planes) if !self.asks_cache(device, pages.block_offset, &planes) => {
+                    RGFX_STATUS_CACHE
+                }
+                _ => {
+                    self.cache_surface(device, pages.block_offset, runs, cached);
+                    RGFX_STATUS_OK
+                }
+            },
             Ok(Some(Err(why))) => {
                 self.uncache_surface(device, pages.block_offset);
                 log::warn!(
@@ -1274,8 +1335,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`surface_cache`]):
     /// - a deferred block, with no runs, gets a device cache of zeros and no view, any view it had
     ///   going: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with no cache and no view, where
-    ///   the device keeps no caches, the deferred caches' budget has no room or the platform made
-    ///   none, and the kext then names the block's pages as any block's;
+    ///   the deferred caches' budget has no room or the platform made none, and the kext then
+    ///   names the block's pages as any block's;
     /// - its pages, found by the block whatever context sends them (the maker's may have closed),
     ///   get a view, which the cache takes, keeping its bytes: [`RGFX_STATUS_OK`]. Where the host
     ///   makes no view of them, or no buffer over it, the cache takes them copied, through the
@@ -1419,11 +1480,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Gives the block at `block`, whose view of `runs` was just made, or which is named by its
-    /// runs, a device cache where the kext marked it `cached` and the device keeps caches
-    /// ([`surface_cache`]); else the block keeps its view alone, and its buffers lie over the
-    /// pages. A block named by its runs that gets no cache takes its view now.
+    /// runs, a device cache where the kext marked it `cached` ([`surface_cache`]); else the block
+    /// keeps its view alone, and its buffers lie over the pages. A block named by its runs that gets no cache takes its view now.
     fn cache_surface(&self, device: &P::Device, block: u64, runs: &[RgfxPageRun], cached: bool) {
-        if !cached || !self.surface_caches.lock().on() {
+        if !cached {
             self.uncache_surface(device, block);
             return;
         }
@@ -1472,6 +1532,46 @@ impl<P: Platform> GraphicsDecoder<P> {
                 "the IOSurface block at {block:#x}: the platform raised at its device cache \
                  ({raise:?}); its buffers lie over its pages"
             ),
+        }
+    }
+
+    /// Whether the block at `block`, just given its view in place, stays in place, its surface's
+    /// planes laid out as `planes` ([`RGFX_SURFACE_PAGES_ASK_CACHE`]): where the device answers
+    /// that a texture over the view would not lie in place for some access
+    /// ([`GpuDevice::surface_pages_in_place`]), the block's view is taken back, the cache of
+    /// views keeping it for the block's cached `SURFACE_PAGES` to come, and false is returned,
+    /// for the answer [`RGFX_STATUS_CACHE`]; the device's verdict not known yet keeps it in place,
+    /// counted apart.
+    ///
+    /// [`GpuDevice::surface_pages_in_place`]: reims_vgpu_core::platform::device::GpuDevice::surface_pages_in_place
+    fn asks_cache(&self, device: &P::Device, block: u64, planes: &[PagesPlane]) -> bool {
+        let views = &self.shared.surface_views;
+        let Some(import) = views.lock().import_of(block) else {
+            return true;
+        };
+        let answer = device.surface_pages_in_place(&import, planes);
+        drop(import);
+        let mut v = views.lock();
+        match answer {
+            PagesInPlace::Yes => {
+                v.asked(surface_pages::Asked::InPlace);
+                true
+            }
+            PagesInPlace::Pending => {
+                v.asked(surface_pages::Asked::Pending);
+                true
+            }
+            PagesInPlace::No(why) => {
+                v.asked(surface_pages::Asked::Cache);
+                let released = v.released(block);
+                drop(v);
+                drop(released);
+                log::debug!(
+                    target: "reims_vgpu::graphics::surface_pages",
+                    "the IOSurface block at {block:#x} needs a device cache: {why}"
+                );
+                false
+            }
         }
     }
 

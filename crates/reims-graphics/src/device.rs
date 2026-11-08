@@ -246,7 +246,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 28.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 29.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -273,7 +273,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_MESH_PIPELINES
     | RGFX_FEATURE_SHARED_EVENT_NAMES
     | RGFX_FEATURE_OPENCL_MODE
-    | RGFX_FEATURE_PRIVATE_RENDER_STATE) as u64;
+    | RGFX_FEATURE_PRIVATE_RENDER_STATE
+    | RGFX_FEATURE_SURFACE_CACHE_REFUSED) as u64;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -399,9 +400,12 @@ pub trait Host: Send + Sync + 'static {
     /// [`RGFX_FEATURE_SURFACE_CACHE`] gives the block a device cache, which its buffers are, and
     /// with it [`RGFX_SURFACE_PAGES_DEFERRED`], no runs and a cache of zeros alone, or
     /// [`RGFX_SURFACE_PAGES_ATTACH`], the runs of such a block's pages
-    /// ([`RGFX_FEATURE_SURFACE_DEFERRED`]); and [`RGFX_SURFACE_PAGES_PRIVATE`], where the block is a process's pages block, whose view a
+    /// ([`RGFX_FEATURE_SURFACE_DEFERRED`]); [`RGFX_SURFACE_PAGES_PRIVATE`], where the block is a process's pages block, whose view a
     /// host that carries out [`RGFX_FEATURE_PAGES_BUFFERS`] keeps for its `BUFFER_OVER_PAGES`
-    /// buffers alone. The host gives `answer` from any thread once it has carried the message
+    /// buffers alone; and [`RGFX_SURFACE_PAGES_ASK_CACHE`], with the surface's `layout`, where a
+    /// host that carries out [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`] answers
+    /// [`RGFX_STATUS_CACHE`] for a surface whose pages its textures cannot use in place. The host
+    /// gives `answer` from any thread once it has carried the message
     /// out, and carries out every later message that names the block as if after it. Called on
     /// the block's lane (on one of ring 0's threads), in ring order, after the messages of
     /// its context's published before it that name the block. The default maps nothing, and
@@ -411,9 +415,10 @@ pub trait Host: Send + Sync + 'static {
         pages: &RgfxSurfacePages,
         runs: Vec<RgfxPageRun>,
         flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
         answer: CompleteAnswer,
     ) {
-        let _ = (pages, runs, flags);
+        let _ = (pages, runs, flags, layout);
         answer.answer(RGFX_STATUS_REFUSED);
     }
 
@@ -1752,11 +1757,13 @@ impl Shared {
     /// for the host ([`Host::surface_pages`]), which answers it, where the block lies in the
     /// processes' blocks and its runs, whole, in the block, and `None`; else logged and
     /// [`RGFX_STATUS_INVALID_ARGUMENT`], with no view. `flags`: the message's
-    /// `RGFX_SURFACE_PAGES_*`, 0 for one without them.
+    /// `RGFX_SURFACE_PAGES_*`, 0 for one without them; `layout`: the surface's, where the message
+    /// asks whether its block needs a device cache.
     pub(crate) fn surface_pages(
         &self,
         pages: &RgfxSurfacePages,
         flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
         seqno: u64,
         epoch: u64,
     ) -> Option<u32> {
@@ -1769,7 +1776,8 @@ impl Shared {
             );
             return Some(RGFX_STATUS_INVALID_ARGUMENT);
         };
-        (self.host).surface_pages(pages, runs, flags, self.complete_answer(seqno, epoch));
+        let answer = self.complete_answer(seqno, epoch);
+        (self.host).surface_pages(pages, runs, flags, layout, answer);
         None
     }
 

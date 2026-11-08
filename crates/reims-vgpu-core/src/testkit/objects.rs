@@ -33,6 +33,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+use crate::platform::values::{PagesInPlace, PagesPlane};
 use crate::sync::{Condvar, Mutex, MutexGuard};
 
 use super::calllog::{Arg, CallLog, Event, ReleaseContext};
@@ -938,6 +939,11 @@ pub struct World {
     ///
     /// [`GpuDevice::copies_guest_ram`]: crate::platform::device::GpuDevice::copies_guest_ram
     guest_ram_copies: AtomicBool,
+    /// What the devices' [`GpuDevice::surface_pages_in_place`] answers
+    /// ([`World::answer_surface_pages`]), and the planes each call was asked of, in order.
+    ///
+    /// [`GpuDevice::surface_pages_in_place`]: crate::platform::device::GpuDevice::surface_pages_in_place
+    surface_pages: Mutex<(PagesInPlace, Vec<Vec<PagesPlane>>)>,
 }
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
@@ -976,7 +982,33 @@ impl World {
             notifications: Mutex::new(Vec::new()),
             splits: AtomicBool::new(false),
             guest_ram_copies: AtomicBool::new(false),
+            surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
         })
+    }
+
+    /// Has the devices answer `answer` to [`GpuDevice::surface_pages_in_place`] from now on;
+    /// [`PagesInPlace::Yes`] at first.
+    ///
+    /// [`GpuDevice::surface_pages_in_place`]: crate::platform::device::GpuDevice::surface_pages_in_place
+    pub fn answer_surface_pages(&self, answer: PagesInPlace) {
+        self.surface_pages.lock().0 = answer;
+    }
+
+    /// What the devices answer to [`GpuDevice::surface_pages_in_place`] asked of `planes`, the
+    /// call recorded ([`World::surface_pages_asked`]).
+    ///
+    /// [`GpuDevice::surface_pages_in_place`]: crate::platform::device::GpuDevice::surface_pages_in_place
+    pub fn surface_pages_in_place(&self, planes: &[PagesPlane]) -> PagesInPlace {
+        let mut state = self.surface_pages.lock();
+        state.1.push(planes.to_vec());
+        state.0.clone()
+    }
+
+    /// The planes each call of [`GpuDevice::surface_pages_in_place`] was asked of, in order.
+    ///
+    /// [`GpuDevice::surface_pages_in_place`]: crate::platform::device::GpuDevice::surface_pages_in_place
+    pub fn surface_pages_asked(&self) -> Vec<Vec<PagesPlane>> {
+        self.surface_pages.lock().1.clone()
     }
 
     /// From now on a command buffer's `split` commits it as a part of the command buffer, as a

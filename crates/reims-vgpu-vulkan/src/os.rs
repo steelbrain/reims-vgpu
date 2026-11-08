@@ -33,6 +33,10 @@ use std::sync::Arc;
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::learn_view_imports;
+/// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, on
+/// Linux (`os/linux/dma_buf.rs`).
+#[cfg(target_os = "linux")]
+pub(crate) use host_os::one_dma_buf_fits;
 /// Whether a view of several runs of pages made now is mapped through dma-bufs, on Linux
 /// (`os/linux/import.rs`).
 #[cfg(all(test, target_os = "linux"))]

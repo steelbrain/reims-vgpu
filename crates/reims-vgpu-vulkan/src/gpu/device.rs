@@ -39,7 +39,7 @@ use reims_vgpu_core::platform::types::{
 use reims_vgpu_core::platform::values::{
     ArgumentDesc, BufferDeallocator, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
     FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
-    RenderPipelineDesc, SamplerDesc,
+    PagesInPlace, PagesPlane, RenderPipelineDesc, SamplerDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange};
 use reims_vgpu_core::raise::{Kept, OnFault, RaiseResult, keep_forever};
@@ -1194,6 +1194,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         {
             false
         }
+    }
+
+    /// The runtime's verdicts for textures over the buffer's pages (`crate::gpu::pages_in_place`).
+    fn surface_pages_in_place(&self, pages: &VulkanBuffer, planes: &[PagesPlane]) -> PagesInPlace {
+        crate::gpu::pages_in_place::surface_pages_in_place(&self.raw, &pages.raw, planes)
     }
 
     /// Every refusal dies but the compile's of a function or descriptor it finds wrong, which is

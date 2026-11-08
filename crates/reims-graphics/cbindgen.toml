@@ -302,6 +302,8 @@ include = [
     "RgfxSurfaceOrderWait",
     "RgfxSurfacePages",
     "RgfxSurfacePagesCache",
+    "RgfxSurfacePagesLayout",
+    "RgfxSurfacePlaneLayout",
     "RgfxSurfaceWriter",
     "RgfxSurfaceWriters",
     "RgfxTextureBinding",

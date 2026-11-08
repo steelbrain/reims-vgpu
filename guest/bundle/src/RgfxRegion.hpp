@@ -184,13 +184,16 @@ public:
 	/// `surfaceId` whose whole allocation, `length` bytes, this process maps at `base`, the
 	/// device's GPU using those pages in place. Where `cacheable`, the block may be made cached,
 	/// its GPU copy kept in a device cache on the host; `*cached` says whether the block is,
-	/// whoever made it. Its blocks go back through the surface source's release
-	/// (releaseSurface). `alignment` is what the host's textures over the pages ask of each
-	/// plane's offset and rows (0: none known). Called with `context`, from any thread.
+	/// whoever made it. `layout`, where not null, is the surface's planes as its memory holds
+	/// them, by which a host whose GPU shares the CPU's memory decides whether the block needs a
+	/// device cache (RGFX_FEATURE_SURFACE_CACHE_REFUSED). Its blocks go back through the surface
+	/// source's release (releaseSurface). `alignment` is what the host's textures over the pages
+	/// ask of each plane's offset and rows (0: none known). Called with `context`, from any
+	/// thread.
 	typedef PagesAnswer (*SurfacePagesFn)(void *context, const void *base, uint64_t length,
 	                                      uint64_t size, uint32_t surfaceId, bool cacheable,
-	                                      uint64_t *offset, uint64_t *serial, bool *fresh,
-	                                      bool *cached);
+	                                      const RgfxSurfacePagesLayout *layout, uint64_t *offset,
+	                                      uint64_t *serial, bool *fresh, bool *cached);
 	void setSurfacePagesSource(SurfacePagesFn acquire, uint64_t alignment, void *context);
 
 	/// Where the kext learns of command buffers' writes of surfaces' shared blocks, so a CPU lock
@@ -219,11 +222,12 @@ public:
 	uint64_t surfacePagesAlignment() const { return m_pagesAlignment; }
 
 	/// The shared block in place of `size` bytes for the surface `surfaceId` of `length` bytes
-	/// at `base`, the one every process that holds the surface gets, asked cached where
-	/// `cacheable` (SurfacePagesFn); `*answer` says how the ask ended, and `block.ok` is true
-	/// only where it is kPagesGiven.
+	/// at `base`, laid out as `layout` says, the one every process that holds the surface gets,
+	/// asked cached where `cacheable` (SurfacePagesFn); `*answer` says how the ask ended, and
+	/// `block.ok` is true only where it is kPagesGiven.
 	SurfaceBlock acquireSurfacePages(const void *base, uint64_t length, uint64_t size,
-	                                 uint32_t surfaceId, bool cacheable, PagesAnswer *answer);
+	                                 uint32_t surfaceId, bool cacheable,
+	                                 const RgfxSurfacePagesLayout *layout, PagesAnswer *answer);
 
 	/// Where pages blocks come from (the kext's PagesBlock, RGFX_FEATURE_PAGES_BUFFERS): `acquire`
 	/// answers the block of the runs of the pages that hold the `length` bytes at `address` in the

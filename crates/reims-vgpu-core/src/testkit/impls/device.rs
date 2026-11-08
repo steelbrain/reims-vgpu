@@ -28,7 +28,7 @@ use crate::platform::types::{
 use crate::platform::values::{
     ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
     FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
-    RenderPipelineDesc, SamplerDesc,
+    PagesInPlace, PagesPlane, RenderPipelineDesc, SamplerDesc,
 };
 use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
@@ -191,6 +191,17 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     /// [`World::copy_guest_ram`]: crate::testkit::objects::World::copy_guest_ram
     fn copies_guest_ram(&self) -> bool {
         self.world().copies_guest_ram()
+    }
+
+    /// Unlogged, as the world answers it: [`World::answer_surface_pages`].
+    ///
+    /// [`World::answer_surface_pages`]: crate::testkit::objects::World::answer_surface_pages
+    fn surface_pages_in_place(
+        &self,
+        _pages: &<FakePlatform as Platform>::Buffer,
+        planes: &[PagesPlane],
+    ) -> PagesInPlace {
+        self.world().surface_pages_in_place(planes)
     }
 
     fn new_compute_pipeline_state_for_function(

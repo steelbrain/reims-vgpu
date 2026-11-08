@@ -14003,16 +14003,21 @@ void test_iosurface_in_place()
 		uint64_t length = 0, size = 0;
 		uint32_t surfaceId = 0;
 		bool cacheable = false;
+		bool laidOut = false;
+		RgfxSurfacePagesLayout layout = {};
 		int asked = 0, copies = 0;
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *base, uint64_t length,
 		                                     uint64_t size, uint32_t surfaceId, bool cacheable,
+		                                     const RgfxSurfacePagesLayout *layout,
 		                                     uint64_t *offset, uint64_t *serial, bool *fresh,
 		                                     bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
 			src->surfaceId = surfaceId;
 			src->cacheable = cacheable;
+			src->laidOut = layout != nullptr;
+			src->layout = layout != nullptr ? *layout : RgfxSurfacePagesLayout{};
 			*cached = false;
 			src->base = base;
 			src->length = length;
@@ -14089,8 +14094,14 @@ void test_iosurface_in_place()
 		RgfxIOSurfaceTexture *t = overPlane(flat, MTLPixelFormatBGRA8Unorm, 16, 16, 0);
 		CHECK(t != nil && src.asked == 1 && src.copies == 0 && blocks.allocated.empty());
 		CHECK(src.base == pixels && src.length == allocBytes(flat) && src.size == 0x1000);
-		// One plane, no YCbCr: asked cached, by its IOSurfaceID.
+		// One plane, no YCbCr: asked cached, by its IOSurfaceID, with its one plane's layout:
+		// 16 rows of 64 bytes of texels, its rows apart as IOSurface laid them.
 		CHECK(src.surfaceId == IOSurfaceGetID(flat) && src.cacheable);
+		CHECK(src.laidOut && src.layout.plane_count == 1 && src.layout.reserved_04 == 0);
+		CHECK(src.layout.planes[0].offset == 0 && src.layout.planes[0].bytes_per_row == rowBytes &&
+		      src.layout.planes[0].row_bytes == 64 && src.layout.planes[0].rows == 16);
+		CHECK(src.layout.planes[1].offset == 0 && src.layout.planes[1].bytes_per_row == 0 &&
+		      src.layout.planes[1].row_bytes == 0 && src.layout.planes[1].rows == 0);
 		auto buffer =
 		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
 		CHECK(buffer.obj_id != 0 && buffer.block_offset == src.offset &&
@@ -14175,8 +14186,14 @@ void test_iosurface_in_place()
 		RgfxIOSurfaceTexture *luma = overPlane(surface, MTLPixelFormatR16Unorm, 64, 48, 0);
 		CHECK(luma != nil && src.asked == 2 && src.copies == 0 && blocks.allocated.empty());
 		CHECK(src.base == base && src.length == allocBytes(surface) && src.size == 0x1000);
-		// Two planes: asked cached, as every surface is.
+		// Two planes: asked cached, as every surface is, with each plane's layout: luma's 48
+		// rows of 64 two-byte elements, chroma's 24 rows of 32 four-byte ones, both 128 apart.
 		CHECK(src.surfaceId == IOSurfaceGetID(surface) && src.cacheable);
+		const RgfxSurfacePlaneLayout &y = src.layout.planes[0], &c = src.layout.planes[1];
+		CHECK(src.laidOut && src.layout.plane_count == 2);
+		CHECK(y.offset == 0 && y.bytes_per_row == 128 && y.row_bytes == 128 && y.rows == 48);
+		CHECK(c.offset == kChroma && c.bytes_per_row == 128 && c.row_bytes == 128 &&
+		      c.rows == 24);
 		auto buffer =
 		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
 		CHECK(buffer.block_offset == src.offset && buffer.length == allocBytes(surface));
@@ -14257,8 +14274,9 @@ void test_iosurface_keep()
 		size_t roomAt = 0;
 		int noRoom = 0;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t, uint32_t,
-		                                     bool, uint64_t *offset, uint64_t *serial,
-		                                     bool *fresh, bool *cached)
+		                                     bool, const RgfxSurfacePagesLayout *,
+		                                     uint64_t *offset, uint64_t *serial, bool *fresh,
+		                                     bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
 			if (src->full && src->released.size() < src->roomAt) {
@@ -14538,7 +14556,8 @@ void test_iosurface_in_place_fallback()
 		int asked = 0, copies = 0;
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t, uint32_t,
-		                                     bool, uint64_t *, uint64_t *, bool *, bool *)
+		                                     bool, const RgfxSurfacePagesLayout *, uint64_t *,
+		                                     uint64_t *, bool *, bool *)
 		{
 			Source *src = static_cast<Source *>(c);
 			src->asked++;
@@ -14649,6 +14668,7 @@ void test_iosurface_in_place_core_image_set()
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *base, uint64_t length,
 		                                     uint64_t size, uint32_t surfaceId, bool cacheable,
+		                                     const RgfxSurfacePagesLayout *,
 		                                     uint64_t *offset, uint64_t *serial, bool *fresh,
 		                                     bool *cached)
 		{
@@ -14842,7 +14862,8 @@ void test_iosurface_cached()
 		uint64_t revive = 0;
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t size,
-		                                     uint32_t surfaceId, bool cacheable, uint64_t *offset,
+		                                     uint32_t surfaceId, bool cacheable,
+		                                     const RgfxSurfacePagesLayout *, uint64_t *offset,
 		                                     uint64_t *serial, bool *fresh, bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
@@ -15134,7 +15155,8 @@ void test_iosurface_nil_is_logged()
 	RgfxRegion region(mem.data(), mem.size());
 	struct Source {
 		static RgfxRegion::PagesAnswer pages(void *, const void *, uint64_t, uint64_t, uint32_t,
-		                                     bool, uint64_t *, uint64_t *, bool *, bool *)
+		                                     bool, const RgfxSurfacePagesLayout *, uint64_t *,
+		                                     uint64_t *, bool *, bool *)
 		{
 			return RgfxRegion::kPagesUnsupported;
 		}

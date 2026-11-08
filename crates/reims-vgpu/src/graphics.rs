@@ -67,7 +67,7 @@ use reims_graphics::wire::{
     RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
     RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState,
     RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxSharedEventName,
-    RgfxSurfacePages, RgfxVideoCaps,
+    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -1137,6 +1137,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         pages: RgfxSurfacePages,
         runs: Vec<RgfxPageRun>,
         flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
         answer: CompleteAnswer,
     ) {
         // After the no-copy buffers being made over the block it describes again, which see it as
@@ -1149,7 +1150,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let job = move |settle| {
             let status = {
                 let _carried = me.reset_gate.read_recursive();
-                (me.decoder()).carry_out_surface_pages(&me.device, &pages, &runs, flags, &settle)
+                (me.decoder())
+                    .carry_out_surface_pages(&me.device, &pages, &runs, flags, layout, &settle)
             };
             // Nothing is owed where the device was reset since.
             if let Some(status) = status {
@@ -2172,10 +2174,11 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         pages: &RgfxSurfacePages,
         runs: Vec<RgfxPageRun>,
         flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
         answer: CompleteAnswer,
     ) {
         self.control
-            .start_surface_pages(*pages, runs, flags, answer);
+            .start_surface_pages(*pages, runs, flags, layout, answer);
     }
 
     fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {

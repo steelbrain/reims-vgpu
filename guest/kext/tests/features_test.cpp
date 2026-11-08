@@ -15,6 +15,13 @@ static_assert(RGFX_REG_DEFERRED_BUDGET_LO == 0x030, "DEFERRED_BUDGET_LO");
 static_assert(RGFX_REG_DEFERRED_BUDGET_HI == 0x034, "DEFERRED_BUDGET_HI");
 static_assert(RGFX_SURFACE_PAGES_DEFERRED == (1u << 2), "SURFACE_PAGES_DEFERRED");
 static_assert(RGFX_SURFACE_PAGES_ATTACH == (1u << 3), "SURFACE_PAGES_ATTACH");
+static_assert(RGFX_SURFACE_PAGES_ASK_CACHE == (1u << 4), "SURFACE_PAGES_ASK_CACHE");
+static_assert(RGFX_FEATURE_SURFACE_CACHE_REFUSED == (1u << 29), "SURFACE_CACHE_REFUSED is bit 29");
+static_assert(RGFX_STATUS_CACHE == 7, "STATUS_CACHE");
+static_assert(RGFX_SURFACE_PAGES_LAYOUT_OFFSET ==
+                  RGFX_SURFACE_PAGES_CACHE_OFFSET + sizeof(RgfxSurfacePagesCache),
+              "the layout follows the cache's part");
+static_assert(sizeof(RgfxSurfacePagesLayout) == 136, "SURFACE_PAGES' layout");
 static_assert(offsetof(RgfxRingHeader, producer_waiting) == 0x10, "producer_waiting");
 static_assert(offsetof(RgfxRingHeader, raise_all) == 0xc4, "raise_all");
 static_assert(RGFX_QUEUE_CREATE_FLAGS_OFFSET == sizeof(RgfxQueueCreate), "the tail's offset");
@@ -71,10 +78,13 @@ constexpr uint64_t kMesh = RGFX_FEATURE_MESH_PIPELINES;
 constexpr uint64_t kShares = RGFX_FEATURE_SHARED_EVENT_NAMES;
 constexpr uint64_t kOpenCL = RGFX_FEATURE_OPENCL_MODE;
 constexpr uint64_t kPrivate = RGFX_FEATURE_PRIVATE_RENDER_STATE;
+// The kext asks a host whose GPU shares the CPU's memory whether a new cacheable block in place
+// needs a device cache, with the layout its bundle gives.
+constexpr uint64_t kCacheRefused = RGFX_FEATURE_SURFACE_CACHE_REFUSED;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
                               kBufferSlabs | kSmallIds | kColor | kMesh | kShares | kOpenCL |
-                              kPrivate;
+                              kPrivate | kCacheRefused;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -85,12 +95,14 @@ int main()
 	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM,
 	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, MANAGED_TEXTURE_SLABS,
 	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, MESH_PIPELINES,
-	// SHARED_EVENT_NAMES, OPENCL_MODE and PRIVATE_RENDER_STATE, and writes each only where offered.
+	// SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE and SURFACE_CACHE_REFUSED, and writes
+	// each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
 	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, "
-	      "MESH_PIPELINES, SHARED_EVENT_NAMES, OPENCL_MODE and PRIVATE_RENDER_STATE from bit 3");
+	      "MESH_PIPELINES, SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE and "
+	      "SURFACE_CACHE_REFUSED from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -163,6 +175,13 @@ int main()
 	      "PRIVATE_RENDER_STATE offered, written");
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kPrivate, 0) == kRgfxOfferedFeatures,
 	      "PRIVATE_RENDER_STATE offered but not taken is not in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kCacheRefused) == kCacheRefused,
+	      "SURFACE_CACHE_REFUSED offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kCacheRefused, 0) == kRgfxOfferedFeatures,
+	      "SURFACE_CACHE_REFUSED offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kCacheRefused, kCacheRefused) ==
+	          (kRgfxOfferedFeatures | kCacheRefused),
+	      "SURFACE_CACHE_REFUSED taken is in the word");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
 	      "every other bit offered, none written");

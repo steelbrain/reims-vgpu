@@ -967,7 +967,8 @@ void test_in_place_writes_retire_at_the_take()
 		IOSurfaceRef copied = nullptr;
 		std::vector<uint8_t> copiedAtRetire;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t,
-		                                     uint32_t surfaceId, bool, uint64_t *offset,
+		                                     uint32_t surfaceId, bool,
+		                                     const RgfxSurfacePagesLayout *, uint64_t *offset,
 		                                     uint64_t *serial, bool *fresh, bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);

@@ -1036,8 +1036,8 @@
 // [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`],
 // [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`],
 // [`RGFX_FEATURE_MESH_PIPELINES`], [`RGFX_FEATURE_SHARED_EVENT_NAMES`],
-// [`RGFX_FEATURE_OPENCL_MODE`] and [`RGFX_FEATURE_PRIVATE_RENDER_STATE`]). Bits 9 and 10 are
-// reserved.
+// [`RGFX_FEATURE_OPENCL_MODE`], [`RGFX_FEATURE_PRIVATE_RENDER_STATE`] and
+// [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`]). Bits 9 and 10 are reserved.
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63.
@@ -1243,6 +1243,19 @@
 // it only where its platform takes that state. A host without it reads the flag as no flag and
 // the record as tail no offset names, so the guest sends them only where it took the bit.
 #define RGFX_FEATURE_PRIVATE_RENDER_STATE (1 << 28)
+
+// `FEATURES_LO` bit 29, `SURFACE_CACHE_REFUSED`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_LO`], beside [`RGFX_FEATURE_SURFACE_PAGES`]: the host's GPU shares
+// the CPU's memory, and keeps a device cache only of the IOSurfaces whose pages its textures
+// cannot use in place, which it answers surface by surface. A kext that took it asks a new block
+// in place with [`RGFX_SURFACE_PAGES_ASK_CACHE`] and the surface's layout
+// ([`RgfxSurfacePagesLayout`]); the host answers [`RGFX_STATUS_CACHE`] where its textures over
+// those pages, for any access a texture over the surface may take, would not lie in place, and
+// the kext then names the block cached ([`RGFX_SURFACE_PAGES_CACHED`]), the host keeping its
+// device cache as [`RGFX_FEATURE_SURFACE_CACHE`] says. Every other block stays in place as on a
+// host without it. A host offers it where it offers `SURFACE_PAGES` and its GPU shares the CPU's
+// memory, and offers neither `SURFACE_CACHE` nor [`RGFX_FEATURE_SURFACE_DEFERRED`] there.
+#define RGFX_FEATURE_SURFACE_CACHE_REFUSED (1 << 29)
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1479,6 +1492,12 @@
 // bytes now say how many it needs ([`RgfxArgumentLayoutReply::needed`]); nothing else was
 // written.
 #define RGFX_STATUS_TOO_SMALL 6
+
+// `COMPLETE`'s status, to a `SURFACE_PAGES` that asks whether its block needs a device cache
+// ([`RGFX_SURFACE_PAGES_ASK_CACHE`]): the host's textures over the surface's pages would not lie
+// in place for every access, so the kext names the block cached
+// ([`RGFX_SURFACE_PAGES_CACHED`]) before any process holds it; the block has no view meanwhile.
+#define RGFX_STATUS_CACHE 7
 
 // Scanout pixels: 32-bit BGRA8, `kIO32BGRAPixelFormat`, the one format there is.
 #define RGFX_SCANOUT_BYTES_PER_PIXEL 4
@@ -1811,6 +1830,13 @@
 // pages unwired meanwhile. Its first CPU lock that needs the pages posts a second `SURFACE_PAGES`
 // of the block, [`RGFX_SURFACE_PAGES_ATTACH`], with the runs, and the host takes them for the
 // cache, which keeps its bytes and the CPU's generation it holds.
+//
+// Where the guest took [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`], a block not cached may ask
+// whether it needs a device cache ([`RGFX_SURFACE_PAGES_ASK_CACHE`]), with the surface's layout
+// after the cache part ([`RgfxSurfacePagesLayout`] at [`RGFX_SURFACE_PAGES_LAYOUT_OFFSET`]). The
+// host maps the pages, and answers [`RGFX_STATUS_OK`], the block in place as any, or
+// [`RGFX_STATUS_CACHE`], with no view kept for the block, where its textures over the pages
+// would not lie in place: the kext then posts the block's `SURFACE_PAGES` again, cached.
 #define RGFX_CMD_SURFACE_PAGES 758
 
 // `SURFACE_DOWNLOAD` ([`RgfxSurfaceDownload`]), on ring 0 from the accelerator kext, where the
@@ -2030,6 +2056,21 @@
 // so the `SURFACE_DOWNLOAD` that follows copies what the GPU wrote. Answered
 // [`RGFX_STATUS_INVALID_ARGUMENT`] for a block with no deferred cache.
 #define RGFX_SURFACE_PAGES_ATTACH (1 << 3)
+
+// [`RgfxSurfacePagesCache::flags`], without [`RGFX_SURFACE_PAGES_CACHED`], where the guest took
+// [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`]: the kext asks whether the block's surface needs a
+// device cache. The message carries the surface's layout ([`RgfxSurfacePagesLayout`] at
+// [`RGFX_SURFACE_PAGES_LAYOUT_OFFSET`]); a message too short for it is
+// [`RGFX_STATUS_INVALID_ARGUMENT`]. Answered [`RGFX_STATUS_OK`], the block in place, or
+// [`RGFX_STATUS_CACHE`] (the command's doc).
+#define RGFX_SURFACE_PAGES_ASK_CACHE (1 << 4)
+
+// Where a `SURFACE_PAGES` message's [`RgfxSurfacePagesLayout`] starts: right after its
+// [`RgfxSurfacePagesCache`].
+#define RGFX_SURFACE_PAGES_LAYOUT_OFFSET 64
+
+// The most planes an [`RgfxSurfacePagesLayout`] holds.
+#define RGFX_SURFACE_PAGES_PLANES 4
 
 // [`RgfxIcbCreate`] `flags`: `inheritPipelineState`.
 #define RGFX_ICB_INHERIT_PIPELINE_STATE (1 << 0)
@@ -6433,11 +6474,40 @@ typedef struct {
 // [`RGFX_SURFACE_PAGES_CACHE_OFFSET`].
 typedef struct {
   // `RGFX_SURFACE_PAGES_*`: [`RGFX_SURFACE_PAGES_CACHED`], [`RGFX_SURFACE_PAGES_PRIVATE`],
-  // [`RGFX_SURFACE_PAGES_DEFERRED`] and [`RGFX_SURFACE_PAGES_ATTACH`].
+  // [`RGFX_SURFACE_PAGES_DEFERRED`], [`RGFX_SURFACE_PAGES_ATTACH`] and
+  // [`RGFX_SURFACE_PAGES_ASK_CACHE`].
   uint32_t flags;
   // Zero.
   uint32_t reserved_04;
 } RgfxSurfacePagesCache;
+
+// One plane of an IOSurface as its pages hold it ([`RgfxSurfacePagesLayout`]), from the
+// surface's first byte.
+typedef struct {
+  // The plane's first byte, from the surface's.
+  uint64_t offset;
+  // Bytes from one of the plane's rows to the next (`IOSurfaceGetBytesPerRowOfPlane`).
+  uint64_t bytes_per_row;
+  // The bytes of a row's texels: its elements' (`IOSurfaceGetWidthOfPlane` over
+  // `IOSurfaceGetElementWidthOfPlane`, rounded up, times `IOSurfaceGetBytesPerElementOfPlane`).
+  uint64_t row_bytes;
+  // The plane's rows of elements (`IOSurfaceGetHeightOfPlane` over
+  // `IOSurfaceGetElementHeightOfPlane`, rounded up).
+  uint64_t rows;
+} RgfxSurfacePlaneLayout;
+
+// The layout of an IOSurface whose block asks whether it needs a device cache
+// ([`RGFX_SURFACE_PAGES_ASK_CACHE`]), after the [`RgfxSurfacePagesCache`] at
+// [`RGFX_SURFACE_PAGES_LAYOUT_OFFSET`]: its planes, as every texture over it lies over them.
+typedef struct {
+  // The planes `planes` holds, 1 to [`RGFX_SURFACE_PAGES_PLANES`]: 1 for a surface without
+  // planes.
+  uint32_t plane_count;
+  // Zero.
+  uint32_t reserved_04;
+  // The planes in plane order; those past `plane_count` zero.
+  RgfxSurfacePlaneLayout planes[RGFX_SURFACE_PAGES_PLANES];
+} RgfxSurfacePagesLayout;
 
 // One command queue's latest command buffer that writes a surface plane's
 // copy: the queue's id and the buffer's `seqno` on the queue's submission ring.
