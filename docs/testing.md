@@ -6,18 +6,15 @@ How the code is tested, and how a claim about Metal or the hardware says where i
 ## The tests
 
 - **Unit tests** sit beside the code, in `mod tests`, named by the behaviour they hold.
-  `cargo xtask check` runs every one with cargo-nextest, and the doc-tests, with the host's
-  features: on a Mac the Metal platform's and, behind the `vulkan` features, the Vulkan
-  platform's on MoltenVK; on Linux the Vulkan platform's alone.
+  `cargo xtask check` runs every one with cargo-nextest, and the doc-tests: on a Mac on the
+  Vulkan platform over MoltenVK, and on Linux on the host's Vulkan driver.
 - **Core's testkit** (`reims-vgpu-core`'s `testkit` feature) is a fake `Platform` that models
   Metal's objects and logs the calls whose order Metal observes ([architecture.md](architecture.md)
   13.2). Core's tests, and the tests of other crates that need no GPU, run on it.
-- **The Metal platform's tests** run on the Mac's GPU. Its `tests/` hold golden checks of its
-  message layer (every Objective-C call inside the layer's catch), of its SPI declarations against
-  the runtime's methods (`spi_encodings.rs`), and of the references Metal's constructors take of
-  a surface (`retain_audit.rs`).
 - **The Vulkan platform's tests** run on the host's Vulkan device. On a Mac, its `metal_tests`
-  modules make the same calls on MoltenVK and on Metal and compare what each answers: Metal's
+  modules compare what MoltenVK answers with Metal's answers, recorded from Metal on the M3 Max
+  under macOS 27.0.1 into text files beside each test (`metal_answers/`, read by core's
+  `testkit::metal_answers`), which are never rewritten from this library's own output: Metal's
   answer is the reference, and where this platform answers otherwise on purpose, the test says
   so and [accuracy-ledger.md](accuracy-ledger.md) has the row.
 - **The C API's tests** (`crates/reims-vgpu-c/tests`): its exports, and a host in C built against

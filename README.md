@@ -142,8 +142,7 @@ resize it. [docs/api.md](docs/api.md) section 2 lists every setting and variable
 ## What's here
 
 - The library: `crates/`. Core holds the behavior, generic over its platform; beside it are the
-  Vulkan platform, which runs on metal2vulkan, the Metal platform, the reims-graphics device's
-  host side (`crates/reims-graphics`), a display's window, host video on VA-API and NVDEC/NVENC,
+  Vulkan platform, which runs on metal2vulkan, the reims-graphics device's host side (`crates/reims-graphics`), a display's window, host video on VA-API and NVDEC/NVENC,
   the Rust API and the C API ([docs/development.md](docs/development.md#crates)).
 - The guest's side: `guest/`, the kexts that drive the device and the Metal bundle that turns the
   guest's Metal calls into its command stream. `guest/prebuilt` holds the built set, which
@@ -164,19 +163,19 @@ The reims-graphics device (PCI `1234:5247`) and everything on both sides of it a
 guest, our kexts drive the device, and our Metal bundle turns macOS's Metal calls into the
 device's command stream. On the host, QEMU's `reims-graphics-pci` hands that stream to the
 library, which runs it on Vulkan through [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan)
-and draws the guest's display into a window of its own. The library also builds on Metal on a
-Mac, where the guest's side is built; VMs run on Linux.
+and draws the guest's display into a window of its own. The library also builds on a Mac, over
+MoltenVK, for development and tests, and the guest's side is built there; VMs run on Linux.
 
 The library's C API (`crates/reims-vgpu-c/include/reims_vgpu.h`, specified in
 [docs/api.md](docs/api.md)) is its interface to QEMU: `cargo xtask dist` writes the library, the
-header and a pkg-config package into `target/dist` (`target/dist-vulkan` for the Vulkan platform),
-which QEMU links. [AGENTS.md](AGENTS.md) has the rules for changing the code.
-`scripts/install-ctl.sh` installs what it needs itself; working on the code needs the following.
+header and a pkg-config package into `target/dist-vulkan`, which QEMU links.
+[AGENTS.md](AGENTS.md) has the rules for changing the code. `scripts/install-ctl.sh` installs what
+it needs itself; working on the code needs the following.
 
 ### Requirements
 
-- A Linux host on x86-64 for the library on Vulkan and for VMs, and an Apple silicon Mac for the
-  Metal platform, the metallibs and the guest's kexts. Every Rust binary built on the Mac is arm64
+- A Linux host on x86-64 for the library and for VMs, and an Apple silicon Mac for the metallibs
+  and the guest's kexts. Every Rust binary built on the Mac is arm64
   (`aarch64-apple-darwin`): rustc's arm64e target has no pointer authentication, and its binaries
   crash before `main` (`rust-toolchain.toml`).
 - The toolchain `rust-toolchain.toml` pins: nightly-2026-11-03 with rustfmt and clippy, for rustc's
@@ -184,11 +183,11 @@ which QEMU links. [AGENTS.md](AGENTS.md) has the rules for changing the code.
 - `cargo-nextest`, which runs the tests in `cargo xtask check`
   (`cargo install --locked cargo-nextest`).
 - cbindgen 0.29.4, for `cargo xtask header` (`cargo install --locked cbindgen --version 0.29.4`).
-- On the Mac, Xcode's clang, for objc2's exception helper (which the `cc` crate builds). The library
-  compiles its shaders from source at run time, so `make` needs no Metal toolchain; the Vulkan
-  platform's crate, which `cargo build --workspace` and `cargo xtask check` build, does
-  (`xcodebuild -downloadComponent MetalToolchain`). The guest's kexts build with Xcode and a macOS
-  26 KDK (`guest/Makefile`).
+- On the Mac, Xcode's clang, for objc2's exception helper (which the `cc` crate builds), Xcode's
+  Metal toolchain, with which the Vulkan platform's crate compiles its metallibs as it builds
+  (`xcodebuild -downloadComponent MetalToolchain`), and Homebrew's `vulkan-loader` and
+  `molten-vk`, the Vulkan the library runs on there. The guest's kexts build with Xcode and a
+  macOS 26 KDK (`guest/Makefile`).
 - clang and lld for the option ROM (`firmware/`; on a Mac, Homebrew's `lld`).
 - For `make qemu`: the `vendor/qemu` submodule (`git submodule update --init vendor/qemu`) and
   QEMU's build dependencies (`meson`, `ninja`, `pkg-config`, `glib`, `pixman` and so on).
@@ -201,7 +200,7 @@ jemalloc, the allocator the library uses, which the build also compiles.
 ### Building
 
 ```sh
-make              # the library (cargo xtask dist): target/dist on a Mac, target/dist-vulkan on Linux
+make              # the library (cargo xtask dist), in target/dist-vulkan
 make qemu         # qemu-system-x86_64 with reims-graphics-pci on the library, in build/qemu
 make clean        # remove build/
 make -C guest test     # the guest side's tests, on a Mac
@@ -217,7 +216,6 @@ If you have [kache](https://github.com/kunobi-ninja/kache) installed, run
 what other worktrees on your machine already compiled. It's optional: without kache, builds are
 cargo's own. See "Building through kache" in docs/development.md for the setup.
 
-On Linux, `cargo xtask dist` builds the library on the Vulkan platform into `target/dist-vulkan`.
 The Vulkan platform's shaders are metallibs, which only Apple's compiler makes. A Mac compiles its
 own as it builds; any other host copies those a Mac compiled, committed in
 `crates/reims-vgpu-vulkan/metallibs`, once their `metallibs.toml` names each with the sha256 of the
@@ -229,7 +227,7 @@ cargo xtask metallibs         # on a Mac: compile them into crates/reims-vgpu-vu
 cargo xtask metallibs <dir>   # the same into <dir>, for RVG_METALLIB_DIR
 ```
 
-A change to a `.metal` source of the Vulkan crate, or to the metal crate's `shaders.metal`, commits
+A change to a `.metal` source of the Vulkan crate, `shaders.metal` among them, commits
 the metallibs `cargo xtask metallibs` writes with it: until then a test of `cargo xtask check` fails
 on the Mac (`the_committed_metallibs_are_this_trees`), and the build fails on Linux.
 

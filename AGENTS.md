@@ -15,9 +15,9 @@ drivers drive in x86-64 macOS guests:
 - `reims-ctl` (`crates/reims-ctl`), the VM manager users run.
 
 The guest's Metal bundle serialises its Metal calls onto the device's rings,
-and the library carries them out on the host's GPU: on Metal on macOS, and
-on Linux on the Vulkan platform (`crates/reims-vgpu-vulkan`), over
-metal2vulkan's Metal-shaped runtime, which a Mac can also build on MoltenVK.
+and the library carries them out on the host's GPU, on the Vulkan platform
+(`crates/reims-vgpu-vulkan`), over metal2vulkan's Metal-shaped runtime: on
+Linux, and on a Mac over MoltenVK, a build for development and tests.
 The device's video decodes run on the host's VA-API or NVDEC.
 
 [README.md](README.md) says what the project is, and
@@ -36,9 +36,8 @@ old behaviour in the same commit, and the diff is reviewed with the change.
 ## Start here
 
 ```sh
-make                # the library in its dist tree (cargo xtask dist): target/dist on a Mac,
-                    # target/dist-vulkan on Linux: libreims_vgpu.a and the shared library,
-                    # reims_vgpu.h and reims-vgpu.pc
+make                # the library in its dist tree (cargo xtask dist), target/dist-vulkan:
+                    # libreims_vgpu.a and the shared library, reims_vgpu.h and reims-vgpu.pc
 make qemu           # then QEMU's qemu-system-x86_64 with reims-graphics-pci, in build/qemu
 cargo xtask check   # lints, rustfmt, clippy and every test: run it once before a branch merges
 ```
@@ -49,12 +48,12 @@ The Makefile's header lists every target. README.md lists the requirements.
 
 | what | where |
 |---|---|
-| the Cargo workspace: eleven crates and `xtask` | `Cargo.toml`, `crates/`, `xtask/` |
+| the Cargo workspace: eight crates and `xtask` | `Cargo.toml`, `crates/`, `xtask/` |
 | `reims-ctl`, the VM manager users run, and its installer | `crates/reims-ctl` (a workspace of its own, linking nothing of the library), `scripts/install-ctl.sh`; reims-util, which it runs to make an x86-64 VM's OpenCore image and download its installer, is pinned in `crates/reims-ctl/src/reims_util.rs` |
 | the C API | `crates/reims-vgpu-c/include/reims_vgpu.h`, specified in [docs/api.md](docs/api.md) |
 | the device: its wire, rings and transport | `crates/reims-graphics`, whose `include/reims_graphics_wire.h` the guest's kexts and the option ROM compile; its design and protocol are [docs/graphics-kext](docs/graphics-kext) |
 | the device over the platform: the Metal-call decoder, the display and its window, the host's read-back | `crates/reims-vgpu/src/graphics.rs` and `graphics/` |
-| the display's shaders | `crates/reims-vgpu-metal/src/gpu/shaders.metal` |
+| the display's shaders | `crates/reims-vgpu-vulkan/src/gpu/shaders.metal` |
 | the Vulkan platform | `crates/reims-vgpu-vulkan`, over metal2vulkan's runtime, at the commit of its public repository `Cargo.toml` names; what its defaults trade against Metal's answers is [docs/accuracy-ledger.md](docs/accuracy-ledger.md) |
 | the Vulkan platform's metallibs, which a build off a Mac copies | `crates/reims-vgpu-vulkan/metallibs`, written on a Mac by `cargo xtask metallibs` (README.md, Building) |
 | a display's own window, and the register of what it does | `crates/reims-vgpu-window`, its `features.md` and its manual walk on macOS, `scripts/internal/walk_window_macos.sh`; the wiring is `crates/reims-vgpu/src/window.rs` |
@@ -121,7 +120,7 @@ passes run again alone.
 |---|---|
 | the library (`crates/`), the C API or its header | `cargo xtask check` |
 | what the Vulkan platform ends the process on, or what device info, GPU families or feature queries answer | the library's checks, and a cold boot of each guest the change can reach before it merges ("A boot is the only check", below) |
-| a `.metal` source of the Vulkan crate, or the metal crate's `shaders.metal` | `cargo xtask metallibs` on a Mac, committing the metallibs it writes with the change; then the library's checks |
+| a `.metal` source of the Vulkan crate, `shaders.metal` among them | `cargo xtask metallibs` on a Mac, committing the metallibs it writes with the change; then the library's checks |
 | the video crate (`crates/reims-vgpu-video`), or its arms in `reims-vgpu` | `cargo xtask check` on a Mac; the Linux tests on a VA-API host and on an NVIDIA host; and, where the `vaapi` module's decoders change, the conformance suite on a VA-API host ("The video crates' checks", below) |
 | `xtask/` | `cargo test -p xtask`, rustfmt and clippy on it |
 | `crates/reims-ctl` | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it (`cargo xtask check` does not reach it); a change to the QEMU command it builds, or to `scripts/install-ctl.sh`, also needs an install and a VM boot on each host it touches |
@@ -305,12 +304,13 @@ Three tiers:
   the guest or host observes. They do not cite the earlier ports, which
   stay at their tags (`byte-exact-parity`, `rust-port-parity`,
   `native-parity`).
-- **arm64 on the Mac.** Every Rust binary built for macOS is arm64
-  (`aarch64-apple-darwin`). rustc's arm64e target has no pointer
-  authentication, and its binaries crash before `main`
-  (`rust-toolchain.toml`). On Linux the library ships as
-  `x86_64-unknown-linux-gnu`, built there.
-  `cargo xtask check` on a Mac also clippy-checks that target, and, where
+- **Linux ships; the Mac builds arm64.** The library ships for Linux
+  alone, as `x86_64-unknown-linux-gnu`, built there. On a Mac it builds
+  over MoltenVK for development and tests, and every Rust binary built for
+  macOS is arm64 (`aarch64-apple-darwin`): rustc's arm64e target has no
+  pointer authentication, and its binaries crash before `main`
+  (`rust-toolchain.toml`).
+  `cargo xtask check` on a Mac also clippy-checks the Linux target, and, where
   Rosetta is installed, runs core's tests as `x86_64-apple-darwin`, for
   the x86-64 guest's 4 KiB pages and instructions; it skips them, saying
   so, where Rosetta is not. No x86-64 macOS binary ships.

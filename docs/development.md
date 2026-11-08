@@ -11,7 +11,7 @@ AGENTS.md                   the rules for working on the repository
 Cargo.toml                  the Cargo workspace, with Cargo.lock,
                             rust-toolchain.toml, clippy.toml and
                             .cargo/config.toml
-crates/                     its nine crates (below), and reims-ctl, a
+crates/                     its eight crates (below), and reims-ctl, a
                             workspace of its own that links none of them
 xtask/                      cargo xtask (below)
 firmware/                   the reims-graphics device's option ROM: its UEFI
@@ -87,8 +87,7 @@ doc holds its area's ordering contracts and the measured platform facts it relie
 | crate | path | role |
 |---|---|---|
 | `reims-vgpu-core` | `crates/reims-vgpu-core` | what the platforms and the device share, generic over `P: Platform`: the platform traits, the runtime, raises and deaths, the testkit; links no Apple framework |
-| `reims-vgpu-metal` | `crates/reims-vgpu-metal` | the `Platform` over Metal, IOSurface, Mach VM and threads, and the library's shaders (`src/gpu/shaders.metal`) |
-| `reims-vgpu-vulkan` | `crates/reims-vgpu-vulkan` | the `Platform` over metal2vulkan's runtime: the library on Linux, and on macOS behind the `vulkan` features, on MoltenVK |
+| `reims-vgpu-vulkan` | `crates/reims-vgpu-vulkan` | the `Platform` over metal2vulkan's runtime, the library's only one: on Linux, and on macOS over MoltenVK, a build for development and tests; its OS services (on macOS IOSurface, Mach VM, threads and the Objective-C message layer the window's AppKit side sends through), and the library's shaders (`src/gpu/shaders.metal`) |
 | `reims-vgpu-window` | `crates/reims-vgpu-window` | the device's own window: AppKit's or SDL3's on macOS, SDL3's on Linux, its input and the host's screens; knows nothing of devices or displays. `features.md` lists what the window does, each entry deliberate |
 | `reims-vgpu` | `crates/reims-vgpu` | the public Rust API: the reims-graphics device over the platform, its Metal-call decoder and its window; the process's platform |
 | `reims-vgpu-c` | `crates/reims-vgpu-c` | the C API (`rvg_*`, `include/reims_vgpu.h`), which QEMU links; `cdylib`, `staticlib` and `rlib` |
@@ -106,8 +105,8 @@ Run from the repository root. `cargo xtask` is an alias for `cargo run --package
 cargo build --workspace
 cargo nextest run --workspace
 cargo xtask check          # the lints, rustfmt, clippy and every test; run it once before a merge
-cargo xtask dist           # target/dist: the library, its header and reims-vgpu.pc, for
-                           # a host that links it through pkg-config
+cargo xtask dist           # target/dist-vulkan: the library, its header and reims-vgpu.pc,
+                           # for a host that links it through pkg-config
 cargo xtask metallibs      # on a Mac: the Vulkan platform's metallibs and their record
 ```
 
@@ -244,19 +243,19 @@ frees nothing, so kache keeps it until that target directory is gone.
 #### Dist
 
 ```sh
-cargo xtask dist                   # release, into target/dist
+cargo xtask dist                   # release, into target/dist-vulkan
 cargo xtask dist --profile checked --out /tmp/reims-vgpu
-cargo xtask dist --platform vulkan # the Vulkan platform, into target/dist-vulkan
 ```
 
 `cargo xtask dist` builds `reims-vgpu-c` and writes the library for a host that links it the way it
 links its other dependencies, through pkg-config:
 
 ```text
-target/dist/
+target/dist-vulkan/
   include/reims_vgpu.h                   the committed header
   lib/libreims_vgpu.a                    the staticlib
-  lib/libreims_vgpu.dylib                the cdylib, @rpath/libreims_vgpu.dylib, signed ad hoc
+  lib/libreims_vgpu.so                   the cdylib (on a Mac libreims_vgpu.dylib,
+                                         @rpath/libreims_vgpu.dylib, signed ad hoc)
   lib/pkgconfig/reims-vgpu.pc            the package
   share/doc/reims-vgpu/                  the license: LICENSE and LICENSES/, as in the repository
 ```
@@ -265,9 +264,9 @@ target/dist/
 the system frameworks and libraries a static link needs. QEMU links `libreims_vgpu.a`, so the
 library is part of its binary; the C API's tests link the shared library.
 
-`--platform vulkan` builds the C API on the Vulkan platform into `target/dist-vulkan`, laid out the
-same. On Linux `dist` builds that platform alone, with `libreims_vgpu.so` in place of the dylib
-(architecture 11.3). `CARGO_TARGET_DIR` moves every output, the dist tree included, out of `target`.
+The library is built on the Vulkan platform, its only one (architecture 11.3); `--platform vulkan`
+names it for the builds that pass it, and any other platform is refused. `CARGO_TARGET_DIR` moves
+every output, the dist tree included, out of `target`.
 
 ### Profiles
 
@@ -286,15 +285,13 @@ Set in `Cargo.toml` (architecture 2.3):
 - **objc2's debug assertions are on in `dev`** and off in `checked`
   (`[profile.checked.package.objc2]`, D36). They panic on a message to nil, a missing method and an
   encoding the runtime disagrees with, which the library never sends, so the tests that send to
-  real Metal check each send. Declarations are also checked with `AnyClass::verify_sel` in
-  `reims-vgpu-metal/tests/spi_encodings.rs`.
+  real Metal check each send.
 - objc2's `exception` feature is always on, and `catch-all` never.
 
 ### Features
 
-- `reims-vgpu/vulkan` and `reims-vgpu-c/vulkan`: on macOS, the Vulkan platform as the API's, and
-  the C API's, platform, off by default. On Linux the Vulkan platform is the only one, with or
-  without them: they change nothing there, and a build with no features is the Linux library.
+- `reims-vgpu/vulkan` and `reims-vgpu-c/vulkan`: they change nothing, as the Vulkan platform is
+  the library's only one, and stay for the builds that name them.
 - `macos-sdl` (`reims-vgpu-window`, forwarded by `reims-vgpu` and `reims-vgpu-c`), on by default:
   SDL3's window on macOS, which `REIMS_VGPU_WINDOW_IMPL=sdl` opens in place of AppKit's. Without it
   the macOS library has no SDL.

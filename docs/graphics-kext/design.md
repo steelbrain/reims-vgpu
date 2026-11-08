@@ -902,8 +902,7 @@ only where no negotiation can carry it.
   It sets `depthStencilWriteDisabled` on a pipeline that writes no depth or
   stencil. It does alpha test, two-sided colour and the point sprite origin
   in its shaders. A host offers it where its platform takes that state. The
-  Metal platform does where its descriptors answer every setter. The Vulkan
-  platform always does, filling metal2vulkan's `PrivateRenderState`.
+  Vulkan platform always does, filling metal2vulkan's `PrivateRenderState`.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2800,8 +2799,7 @@ commit. Each outcome the new design allows is one of those two:
   completion, as one whose walk faults whole; the parts committed before the
   fault ran, as the encoders before a fault of Metal's GPU run. The Vulkan
   platform keeps a buffer whole where a part would answer otherwise than the
-  whole (`gpu/command.rs`, "A command buffer in parts"); the Metal platform
-  keeps every buffer whole, as Metal's commit starts the GPU at once. Tested
+  whole (`gpu/command.rs`, "A command buffer in parts"). Tested
   by `a_buffer_walked_long_is_committed_in_parts_with_one_outcome`,
   `a_buffer_is_committed_whole_where_its_parts_would_wait`,
   `another_queue_s_commit_waits_for_a_buffer_s_last_part` and

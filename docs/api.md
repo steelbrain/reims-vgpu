@@ -22,7 +22,7 @@ library's `reims-vgpu.ui` on Linux.
 | layer | crate | what it is |
 |---|---|---|
 | core | `reims-vgpu-core` | the platform traits, the runtime (threads, queues, holds), raises and deaths, the display's present pipeline, guest memory and the fake platform the tests run on |
-| platform | `reims-vgpu-metal`, `reims-vgpu-vulkan` | core's `Platform`: `MetalPlatform`, over Metal, IOSurface and the OS, on macOS; `VulkanPlatform`, over metal2vulkan's runtime, on Linux, and on macOS with the `vulkan` features |
+| platform | `reims-vgpu-vulkan` | core's `Platform`: `VulkanPlatform`, over metal2vulkan's runtime, on Linux, and on macOS over MoltenVK, a build for development and tests |
 | window | `reims-vgpu-window` | a display's own window (AppKit's or SDL3's on macOS, SDL3's on Linux), its input and the host's screens; it knows nothing of devices |
 | device | `reims-graphics` | the wire: the records, rings and registers the guest and the host share, and the C header the guest's kexts and the option ROM compile |
 | Rust API | `reims-vgpu` | the graphics device over the platform: its rings, decoder, display and window, and owned Rust types for its config and callbacks |
@@ -143,10 +143,10 @@ Everything a host can set that shapes what the library does, beside the guest's 
 - **The config**: the device's callbacks, its window (its callbacks and the mode it opens at) and
   the guest's RAM with the files behind it, which let the GPU use an IOSurface's own pages in place.
   Zero is every field's default (section 1).
-- **Cargo features**, for a host that builds the library: `vulkan` (`reims-vgpu`, `reims-vgpu-c`)
-  puts the API on the Vulkan platform on macOS (on Linux the Vulkan platform is the API's whatever
-  the features say), and `macos-sdl` (on by default) builds SDL3's window into the macOS library
-  ([development.md](development.md)).
+- **Cargo features**, for a host that builds the library: `macos-sdl` (on by default) builds
+  SDL3's window into the macOS library ([development.md](development.md)). `vulkan`
+  (`reims-vgpu`, `reims-vgpu-c`) changes nothing: the Vulkan platform is the API's only one, and
+  the feature stays for the builds that name it.
 - **The environment.** The library reads these once per process; an unset or unparsable value is
   the default.
 
@@ -177,7 +177,7 @@ Rust enum; the handle is a Rust struct cbindgen emits as opaque; the configs are
 
 `reims-vgpu` is the device; the C API wraps it one to one. Its rustdoc is the reference:
 - `GraphicsDevice<P = DefaultPlatform>`, made by `GraphicsDevice::new(GraphicsConfig)` on the
-  default platform (`MetalPlatform` on macOS, `VulkanPlatform` on Linux) or `with_platform`, so its
+  default platform (`VulkanPlatform`) or `with_platform`, so its
   forwarding is unit-tested on core's fake platform;
 - `GraphicsConfig`: `GraphicsCallbacks` (closures, `Arc<dyn Fn … + Send + Sync>`, each optional),
   an optional `WindowConfig`, and an optional `MemoryMap` with its `MemoryFile`s;

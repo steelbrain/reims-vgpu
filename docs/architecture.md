@@ -67,10 +67,10 @@ table is retired and not reused.
 
 | # | decision | why |
 |---|---|---|
-| D1 | One Cargo workspace at the repository root: the library's crates (`reims-vgpu-core`, `-metal`, `-vulkan`, `-window`, `reims-graphics`, `reims-vgpu`, `-c`), the host video crates (`reims-vgpu-video-*`), and `xtask`. `reims-vgpu-vulkan` is a second `Platform`, over `metal2vulkan-runtime`, a Metal-shaped API on Vulkan: the library's platform on Linux, and on macOS one the API's `vulkan` features select, the Metal platform staying the default there (2.1, 2.2). | Each crate does one job the others cannot without breaking a rule below. |
+| D1 | One Cargo workspace at the repository root: the library's crates (`reims-vgpu-core`, `-vulkan`, `-window`, `reims-graphics`, `reims-vgpu`, `-c`), the host video crates (`reims-vgpu-video-*`), and `xtask`. `reims-vgpu-vulkan` is the library's `Platform`, over `metal2vulkan-runtime`, a Metal-shaped API on Vulkan: on Linux, and on macOS over MoltenVK, a build for development and tests (2.1, 2.2). | Each crate does one job the others cannot without breaking a rule below. |
 | D2 | Modules by area and responsibility, not one file per Objective-C class. | The code is Rust; the contract binds behaviour, not file shape. |
 | D3 | Core is generic over one `P: Platform` whose associated types name every Metal object kind. `dyn` only for the host's callbacks, the display executor and the OS services. | A handle flows into another Metal call (a texture into an encoder) with its kind checked at compile time. |
-| D4 | One typed platform method per Metal method the library calls, and one enum variant per encoder and ICB command (`BlitCmd`, `ComputeCmd`, `RenderCmd`, `IcbRenderCmd`, `IcbComputeCmd`), with no table of ops between the caller and Metal. The metal crate's dispatch is one exhaustive `match` per command family, and it names each send by its selector and raise policy (4.3, 4.6). A call whose position the guest or host observes (a creation, release or retain, an aliasing setter, a command, a call with raw guest values) is sent where the caller makes it; a getter or device query is not ordered. | A send per guest operation, in order, with raw guest values: Metal's results, aborts and numbering follow the calls a process makes. |
+| D4 | One typed platform method per Metal method the library calls, and one enum variant per encoder and ICB command (`BlitCmd`, `ComputeCmd`, `RenderCmd`, `IcbRenderCmd`, `IcbComputeCmd`), with no table of ops between the caller and Metal. The platform's dispatch is one exhaustive `match` per command family, and it names each call by its selector and raise policy (4.3, 4.6). A call whose position the guest or host observes (a creation, release or retain, an aliasing setter, a command, a call with raw guest values) is sent where the caller makes it; a getter or device query is not ordered. | A send per guest operation, in order, with raw guest values: Metal's results, aborts and numbering follow the calls a process makes. |
 | D5 | A descriptor the library only fills in and hands to a creator is a value (`platform/values.rs`), which the platform applies to a fresh Metal descriptor inside the creator, sending its setters in the order the value's type states. A descriptor Metal checks when it is set (the texture descriptor's pixel format, the render pass's sample positions, the rate map's layers), or whose attachments retain what they are given (the render pass), stays a Metal object behind a handle (4.3). | Metal folds some properties and aliases others, so the platform sends the raw values to a real descriptor in a fixed order rather than model them; an object stays where Metal's check at the setter, or a retain, is observable. |
 | D6 | Handles are not `Clone`. Another reference is `.clone_ref()`; `Drop` is the release. | An IOSurface's retain count is visible, so no retain is taken that the count would show. |
 | D7 | The raise channel is a value (`Raise`, `RaiseResult`), decided at the raise by its site: `Err` where a handler is always live, a death where none ever is, before any `Drop` runs, and the caller's `OnFault` where both are reached (6.2). There is no real `NSException` throw per raise. | The runtime's two-phase unwinder: with no handler, phase 1 fails and the process ends before any cleanup. Which frames handle a raise is fixed by the code's paths, so each site knows it. |
@@ -78,19 +78,19 @@ table is retired and not reused.
 | D9 | `panic = "unwind"` in every profile. The API's singleton installs a panic hook that aborts before unwinding. A death is `abort()`. | objc2's `exception::catch` needs unwind; an unintended panic still dies at its op with no side effects (6.5). |
 | D14 | Containers are std's, each named by the order it gives (8). | Nothing depends on a hash table's order. |
 | D16 | Queues, threads, locks, condition variables and signals are ours (7.1). A lock keeps the scope, and a race the outcome, that decides what crosses the API. No runtime lock-order checker. | A checker that panics would turn the hangs the API shows into deaths. |
-| D17 | One platform instance per process (`MetalPlatform`, `VulkanPlatform`), a singleton in production (`reims-vgpu/src/singleton.rs`). | Process-wide where the platform holds one state per process (its devices by registry ID, its compiled shaders); every test hermetic. |
+| D17 | One platform instance per process (`VulkanPlatform`), a singleton in production (`reims-vgpu/src/singleton.rs`). | Process-wide where the platform holds one state per process (its devices by registry ID, its compiled shaders); every test hermetic. |
 | D18 | The guest's RAM is reached only through the host's mapping of it, by copies and the platform's imports; there is never a Rust reference into guest memory (15.1). | The guest writes concurrently; a Rust reference into memory another writer changes is undefined behaviour. |
 | D19 | Integer widths and wrap points are visible: std's `wrapping_*`, `overflowing_*`, `checked_*`, `From`/`TryFrom`, and `num::` for the few with odd semantics (17.4). | Widths and wrap points are behaviour. |
 | D22 | Values drop where Rust's scoping puts them. Each unit of work (a command, an API entry) pushes a real pool (`rt::Pool`) for what Metal autoreleases, and a release that crosses the API is held to its point in the API's order by a holder (`rt::Held`) (7.4). | Metal's autoreleased returns must be drained (the 65th command buffer); the host's callbacks and IOSurface counts are observable, the lifetime of the library's own values is not. |
-| D24 | The display's present shaders are the library's own, in Metal Shading Language (`metal/src/gpu/shaders.metal`), compiled from source at run time once per Metal device (4.7); the Vulkan platform loads a metallib built from the same source. | No shader of Apple's is read at run time or committed, and the Metal platform's build needs no Metal toolchain. |
+| D24 | The display's present shaders are the library's own, in Metal Shading Language (`vulkan/src/gpu/shaders.metal`), which the Vulkan platform loads as a metallib built from that source, once per device (4.7). | No shader of Apple's is read at run time or committed. |
 | D27 | The C API: prefix `rvg_`; an opaque handle; one config struct per object, headed by `struct_size`; one callback table per object, with one `ctx` and one `destroy` (the window's from its own config); a status from every call that can fail; no Objective-C types, dispatch queues or blocks; a cbindgen header (11). | A C host calls it with nothing of Objective-C, as QEMU's `reims-graphics-pci` does. |
 | D29 | QEMU's `reims-graphics-pci` is C on the C API, and links the library statically through pkg-config (12). | |
 | D32 | arm64 only, for every Rust binary built for macOS (`aarch64-apple-darwin`); on Linux, `x86_64-unknown-linux-gnu`. | rustc's arm64e target has no pointer authentication, and its binaries crash before `main` (`rust-toolchain.toml` has the measurement). |
 | D33 | A path no guest or host input reaches stays unreached: it is not brought to life. | |
-| D34 | Nothing with a `Drop` is live in a frame an Objective-C exception can unwind: a Metal call runs in a closure that borrows its receiver and arguments (a `Retained` result exists only once the method has returned), and a foreign boundary's body runs in an inner function (4.6). | A foreign unwind runs landing pads; a value dropped there is a release at a point the code never chose (`metal/src/msg.rs`). |
-| D35 | Every Objective-C call catches its own exception where it starts: a call into Metal or Foundation runs in the message layer (`metal/src/msg.rs`; `metal/tests/message_layer.rs` keeps them there), and a call into host code under `host_call` (6.7). No Rust unwind handler sits below the library's Rust code that sends Objective-C messages either: the queues' workers and the device's threads are pthreads the platform starts (`Threads`) with an `extern "C-unwind"` start routine. Every `rvg_` function is `extern "C"` (6.5). | An exception out of a call ends the process at that call, before any frame of the library's unwinds (D34), whatever the caller holds. |
-| D36 | objc2's debug checks are on in dev builds and off in `checked` (`[profile.checked.package.objc2] debug-assertions = false`); release has none. The methods `metal/src/spi/` declares are also verified against the runtime by `metal/tests/spi_encodings.rs`. | The checks panic on a message to nil, a missing method and an encoding the runtime disagrees with; the tests that send to real Metal check every send they make. |
-| D41 | Platform types follow the runtime's encodings: `ResourceAddressRange` is `{MTLAddressRange=QQ}`, the tile dispatch's render target array index is `u32`. | The runtime's `method_getTypeEncoding` gives these types, and objc2's checks compare each send with it (`metal/tests/spi_encodings.rs`). |
+| D34 | Nothing with a `Drop` is live in a frame an Objective-C exception can unwind: a Metal call runs in a closure that borrows its receiver and arguments (a `Retained` result exists only once the method has returned), and a foreign boundary's body runs in an inner function (4.6). | A foreign unwind runs landing pads; a value dropped there is a release at a point the code never chose (`vulkan/src/os/macos/msg.rs`). |
+| D35 | Every Objective-C call catches its own exception where it starts: a call into AppKit, Foundation or IOSurface runs in the macOS message layer (`vulkan/src/os/macos/msg.rs`), and a call into host code under `host_call` (6.7). No Rust unwind handler sits below the library's Rust code that sends Objective-C messages either: the queues' workers and the device's threads are pthreads the platform starts (`Threads`) with an `extern "C-unwind"` start routine. Every `rvg_` function is `extern "C"` (6.5). | An exception out of a call ends the process at that call, before any frame of the library's unwinds (D34), whatever the caller holds. |
+| D36 | objc2's debug checks are on in dev builds and off in `checked` (`[profile.checked.package.objc2] debug-assertions = false`); release has none. | The checks panic on a message to nil, a missing method and an encoding the runtime disagrees with; the tests that send to real Metal check every send they make. |
+| D41 | Platform types follow the runtime's encodings: `ResourceAddressRange` is `{MTLAddressRange=QQ}`, the tile dispatch's render target array index is `u32`. | The runtime's `method_getTypeEncoding` gives these types. |
 | D43 | Core denies `unsafe_code` at its root; the modules of 17.3 allow it. | `forbid` cannot be lowered per module. |
 | D44 | One module style: `foo.rs` beside `foo/` (`clippy::mod_module_files`). `reims-vgpu-c` is a `cdylib`, `staticlib` and `rlib`. | The `rlib` lets tests link the C API. |
 | D46 | A line goes through the `log` crate's macros under its module's path, on the caller's thread (14). | Diagnostics are outside the contract, so a line needs no fixed site or text. Formatting is paid only by a line a logger takes. |
@@ -113,8 +113,8 @@ Cargo.toml Cargo.lock rust-toolchain.toml clippy.toml .cargo/config.toml
 crates/
   reims-vgpu-core/      what the platforms and the device share, generic over P: Platform;
                         links no Apple framework
-  reims-vgpu-metal/     Platform over Metal, IOSurface, Mach VM and threads; the library's shaders
-  reims-vgpu-vulkan/    Platform over metal2vulkan-runtime: the library on Linux, an option on macOS
+  reims-vgpu-vulkan/    Platform over metal2vulkan-runtime, the library's only one: on Linux, and
+                        over MoltenVK on macOS; its OS services; the library's shaders
   reims-vgpu-window/    the device's own window: AppKit or SDL3, input, the host's screens,
                         and features.md, the register of what the window does
   reims-graphics/       the device's wire, its rings and control, and the C header the guest
@@ -132,37 +132,28 @@ scripts/internal/       the developer's scripts (development.md)
 vendor/qemu             QEMU, whose reims-graphics-pci is C on the C API
 ```
 
-`cargo xtask dist` writes `target/dist` (11.3, D47): the static library and the shared library,
+`cargo xtask dist` writes `target/dist-vulkan` (11.3, D47): the static library and the shared library,
 the header and `reims-vgpu.pc`. The library compiles its own shaders (D24), and reads no
 preferences domain and no entitlement: the device's options are its config's fields.
 
 ### 2.2 Crate graph
 
 ```
-reims-vgpu-core  <-  reims-vgpu-metal  <-  reims-vgpu-window  <-  reims-vgpu  <-  reims-vgpu-c
-reims-graphics, reims-vgpu-video-*  <-  reims-vgpu
-reims-vgpu-c  <-  QEMU
-reims-vgpu-core, reims-vgpu-metal (macOS), metal2vulkan-runtime  <-  reims-vgpu-vulkan
-reims-vgpu-vulkan  <-  reims-vgpu-window, reims-vgpu, reims-vgpu-c  (on Linux always; on macOS
-                                                     their `vulkan` feature, off by default)
+reims-vgpu-core, metal2vulkan-runtime  <-  reims-vgpu-vulkan  <-  reims-vgpu-window  <-  reims-vgpu
+reims-graphics, reims-vgpu-video-*  <-  reims-vgpu  <-  reims-vgpu-c  <-  QEMU
 ```
 
-- **The Vulkan platform** (`reims-vgpu-vulkan`) is a second `Platform` over
+- **The Vulkan platform** (`reims-vgpu-vulkan`) is the library's `Platform`, over
   `metal2vulkan-runtime`, the Metal-shaped API on Vulkan of metal2vulkan, at the commit of its
-  public repository `Cargo.toml` names, on the host's Vulkan driver, or MoltenVK on a Mac. On macOS
-  it takes its OS services (IOSurfaces, Mach VM, the clock, threads) from the metal crate; on Linux
-  it has its own (`os/linux/`: a host VM over `mmap` of the guest RAM's files, and an IOSurface
-  stand-in over that memory). On Linux it is the library's only platform, with or without any
-  feature: `reims-vgpu`'s build script sets `cfg(vulkan_platform)` there. On macOS the API's and
-  the C API's `vulkan` features take it, and `cargo xtask dist --platform vulkan` builds a tree on
-  it (11.3). Where its answer differs from Metal's it logs the difference and goes on, and dies
+  public repository `Cargo.toml` names, on the host's Vulkan driver, or MoltenVK on a Mac (a build
+  for development and tests). Its OS services are its own: on macOS over the system's (`os/macos/`:
+  IOSurfaces, Mach VM, the clock, threads, the autorelease pool, and the message layer, 4.6); on
+  Linux `os/linux/` (a host VM over `mmap` of the guest RAM's files, and an IOSurface stand-in over
+  that memory). It compiles the library's shaders (4.7). Where its answer differs from Metal's it logs the difference and goes on, and dies
   where Metal would or where the runtime cannot run the call ([accuracy-ledger.md](accuracy-ledger.md)).
 - **Core** depends on `parking_lot`, `zerocopy`, `bitflags` and `log` only. Its `testkit` feature
   exposes `core::testkit` outside core's own tests; only dev-dependencies enable it, and
   `cargo xtask testkit` checks that (D50).
-- **Metal** implements `Platform` and compiles the library's shaders (4.7). It holds every
-  `#[link]` but the window crate's two, and every call into Metal, Foundation or IOSurface runs in
-  its message layer (4.6). It depends on core for its traits and value types only.
 - **The window** (`reims-vgpu-window`) is the device's own window (D51), and knows nothing of
   devices. Its pure logic is unit-tested with no AppKit or SDL: `geometry` (the image's rectangle
   in the window, the pointer's position in the guest's mode, the buttons), `keymap` (key codes to
@@ -191,7 +182,8 @@ reims-vgpu-vulkan  <-  reims-vgpu-window, reims-vgpu, reims-vgpu-c  (on Linux al
     ISO keyboard check) and AppKit's (the `NSApp` global). SkyLight's hot-key functions are looked
     up with `dlsym`, since the package's link line cannot name a private framework.
   - **Exceptions and panics** (D35, 6.5). Every send to AppKit, Foundation, QuartzCore or Metal
-    runs in the metal crate's message layer, nearly all through `msg::get`, so an exception ends
+    runs in the Vulkan crate's macOS message layer (`reims_vgpu_vulkan::os::msg`), nearly all
+    through `msg::get`, so an exception ends
     the process at its send. An event passed on to AppKit and `setPresentationOptions:` catch
     theirs (`msg::catch`) and go on. Every `define_class!` method and every block posted to the
     main thread starts in `BlockEnv::foreign`, which marks the thread as the library's, so a panic
@@ -250,8 +242,8 @@ reaches them directly.
 `platform.rs` defines `Platform`, with one associated type per Metal object kind the library
 touches (device, queues, command buffers, the three encoders, buffers, textures, heaps, state
 objects, pipelines, libraries, events, ICBs and their commands, rate maps, descriptors) and the OS
-services (4.5). Three implementations: `reims_vgpu_metal::MetalPlatform`,
-`reims_vgpu_vulkan::VulkanPlatform` and the testkit's `FakePlatform`. There is no table of ops
+services (4.5). Two implementations: `reims_vgpu_vulkan::VulkanPlatform` and the testkit's
+`FakePlatform`. There is no table of ops
 between them and their callers: each Metal method the library calls is a typed method (4.3).
 
 - **`Handle`**: every object handle. `clone_ref()` is a retain, `Drop` a release, `id()` its
@@ -286,7 +278,7 @@ calls it.
 - **A descriptor the library only fills in** is a value (`platform/values.rs`: buffer, heap,
   sampler, depth-stencil, ICB, compute pass, the render and compute pipelines, and the texture and
   rate map values a made descriptor starts from). Each type's doc states the order its setters are
-  sent in, which the metal crate's `apply_*` functions (`gpu/desc.rs`) and the fake follow. The
+  sent in, which the Vulkan platform (`gpu/desc.rs`) and the fake follow. The
   storage properties that alias one another (`resourceOptions`, `storageMode`,
   `hazardTrackingMode`) are an ordered `OptionSet` list, applied in the order they were recorded.
 - **A descriptor the library keeps** is a Metal object (`platform/descriptor.rs`, D5): the texture
@@ -314,63 +306,38 @@ calls it.
 
 `platform/os/`: `clock` (monotonic and wall time, `wait_until`), `threads` (the threads the library
 runs on and the timers' clock), `autorelease` (the real pool), `surface` (IOSurface creation,
-getters and retain counts), `vm` (allocate, remap, protect, deallocate). The metal crate implements
-each over the system, the Vulkan crate over Linux's on Linux; the testkit models each (13.2).
+getters and retain counts), `vm` (allocate, remap, protect, deallocate). The Vulkan crate implements
+each over the system: macOS's on macOS, Linux's on Linux; the testkit models each (13.2).
 
-### 4.6 The metal crate's message layer
+### 4.6 The answer layer and the macOS message layer
 
-Metal is called the Rust way: objc2-metal's typed methods, with objc2's `Retained` ownership. What
-objc2-metal does not declare, or declares in a way that cannot carry what the library passes, is
-declared in `metal/src/spi/`:
-- `spi/methods.rs`: extension traits of the objects that answer them (`DeviceSpi`,
-  `RenderEncoderSpi`, `TextureDescriptorSpi`, …), one `msg_send!` per method, typed from the
-  runtime's encoding. They hold the private selectors, and the public ones whose objc2-metal
-  signature would change a value: a nil the header marks nonnull, a nil or NULL result objc2-metal
-  types as nonnull, and an `error:` out-parameter Metal may leave nil. A re-declared public
-  selector keeps objc2-metal's name, so a call names its trait.
-- `spi/classes.rs`: the private classes (`MTLBufferDescriptor`, `MTLResourceAddressRangeArray`,
-  the `_MTLIndirect*Arguments`) with `extern_methods!`; `spi/functions.rs`: Metal's C functions.
+Every runtime call the Vulkan platform makes for core runs in its answer layer (`answer.rs`),
+named by the Metal selector it stands for, which a raise and a death name: the call's `Policy`
+decides what the runtime's typed error becomes, an `Err(Raise)` for the caller to catch, a nil, or
+a death at the call, where Metal raises, answers nil or ends the process
+([accuracy-ledger.md](accuracy-ledger.md)).
 
-`metal/src/msg.rs` runs every call the library asks for, named by its selector:
-- `msg::send(sel, policy, || call)`, whose `Policy` labels the call where the platform method
-  returns `RaiseResult`: `Caught` where no path reaches it without a handler, `Fatal` where its
-  raise dies whatever handler is live, `On(on)` in a method reached both ways, whose caller passes
-  its `OnFault`; `msg::get(sel, || call)` for a call whose raise always dies (a getter, a property
-  setter, a C function); `msg::catch(sel, || call)` for a call whose raise is answered in place;
-- the call runs inside objc2's `exception::catch`, so a raise inside Metal stops at the call before
-  any Rust frame unwinds, and the label alone decides it: `Caught` (and `On(Return)`) answers
-  `Err(Raise::platform(sel))`, the caller's to catch; `Fatal` (and `On(Die)`) dies at the call;
-- the closure borrows its receiver and arguments and owns nothing with a `Drop` (D34); a raw guest
-  value goes as objc2-metal's newtype over the same word (`MTLPixelFormat(v)`), unvalidated;
-- a `new…` result is adopted at `+1`, and objc2 retains a `+0` object result: either way the
-  handle holds one reference of its own and puts none in the thread's pool. An optimized build
-  elides Metal's own autorelease of a `+0` result where the runtime's return handshake succeeds; a
-  dev build cannot, and that reference stays in the thread's pool until the pool pops (7.4);
-- an `iosurface` getter's surface takes exactly one retain, the handle's (D6).
-
-`tests/message_layer.rs` checks that `objc_msgSend` stands only in `msg/` and `msg_send!` only in
-`spi/`; `tests/spi_encodings.rs` checks each method `spi/` declares against the runtime. Foundation
-and IOSurface sends go through `fatal_send`, which catches a raise in one and dies at the send, and
-a send that only makes or reads a value through `value`.
+On macOS the Objective-C sends the library makes itself (the window's AppKit side, IOSurface's
+creation) run in the message layer, `os/macos/msg.rs` of the Vulkan crate, named by their
+selector: `msg::get(sel, || call)` for a call whose raise dies at the call (a getter, a property
+setter, a C function), `msg::catch(sel, || call)` for one whose exception is the caller's to
+decide, and `fatal_send` and `value` for Foundation and IOSurface sends, which die at the send. The
+call runs inside objc2's `exception::catch`, so an exception stops at the call before any Rust
+frame unwinds, and the closure borrows its receiver and arguments and owns nothing with a `Drop`
+(D34).
 
 ### 4.7 The library's shaders
 
-`metal/src/gpu/shaders.metal` holds the library's own shaders, in Metal Shading Language: the
-display's present functions (`displayPresentVertex`, `displayPresentFragment`,
-`displayPresentFragmentWithGammaTableAndColorMatrix`), the display pipe's colour stages
-(`displayPipeColor*`, `displayPipeLut*`) and the XR10 two-plane kernels. What each computes is
-written beside it in the source, and `gpu/shaders.rs`'s tests check it on known pixels.
+`crates/reims-vgpu-vulkan/src/gpu/shaders.metal` holds the library's own shaders, in Metal Shading
+Language: the display's present functions (`displayPresentVertex`, `displayPresentFragment`,
+`displayPresentFragmentWithGammaTableAndColorMatrix`) and the display pipe's colour stages
+(`displayPipeColor*`, `displayPipeLut*`). What each computes is written beside it in the source.
 
-`gpu/shaders.rs` compiles the source with `newLibraryWithSource:options:error:` once per Metal
-device, the first time it is asked for, and every later ask answers the same library. Devices are
-told apart by registry ID. A compiled library stays for the life of the process; one that fails to
-compile is not kept, and the next ask compiles again.
-
-The Vulkan platform runs the same source as a metallib: `cargo xtask metallibs` compiles it, and
-the Vulkan crate's other `.metal` sources, with Apple's tools on a Mac into
-`crates/reims-vgpu-vulkan/metallibs`, which a build off a Mac copies (development.md). Its
-`gpu/shaders.rs` loads the metallib with the runtime's `new_library_with_data` once per device, by
-registry ID.
+`cargo xtask metallibs` compiles it, and the Vulkan crate's other `.metal` sources, with Apple's
+tools on a Mac into `crates/reims-vgpu-vulkan/metallibs`, which a build off a Mac copies
+(development.md); a build on a Mac compiles its own. `gpu/shaders.rs` loads the metallib with the
+runtime's `new_library_with_data` once per device, the first time it is asked for, by registry ID,
+and every later ask answers the same library.
 
 ---
 
@@ -418,8 +385,9 @@ Never converted into one another, with no `From` between them (D8):
 
 ### 6.3 Raises inside Metal
 
-Caught at the call by the message layer (4.6) and decided by the op's policy. No Objective-C raise
-of the library's crosses foreign frames (D34).
+Decided at the call by the answer layer (4.6), by the op's policy; an Objective-C send of the
+library's own is caught at the send by the macOS message layer. No Objective-C raise of the
+library's crosses foreign frames (D34).
 
 ### 6.4 Deaths
 
@@ -536,7 +504,7 @@ so a block that takes a recursive lock its caller holds would re-enter it.
   keeps apart from the guest's queues where the device has one to spare.
 
 No thread of the library's that runs Rust code sending Objective-C messages has a Rust unwind
-handler at its base (D35): the platform starts them as pthreads (`metal/src/os/threads.rs`).
+handler at its base (D35): the platform starts them as pthreads (`vulkan/src/os/macos/threads.rs`).
 
 ### 7.4 Autorelease pools and release points
 
@@ -621,16 +589,15 @@ The Rust API is owned Rust types over the device, which the C API wraps one to o
   (`platform.rs`, D49): core's `HostQueue` over one `SerialQueue` made at the process's first device
   whose host takes the cursor.
 - **The process's platform.** `singleton.rs` makes the one platform on first use: it installs the
-  panic hook (6.5), then the stderr logger if `REIMS_VGPU_LOG` asks for it (14). On Linux, and on
-  macOS with the `vulkan` feature, `VulkanPlatform` is an `ApiPlatform` too, made the same way.
+  panic hook (6.5), then the stderr logger if `REIMS_VGPU_LOG` asks for it (14). The platform is
+  `VulkanPlatform`, an `ApiPlatform`.
 - **Entries.** Every public method, and every release of a handle, runs inside `entry::run`: the
   thread is marked as the library's (6.5), and a real pool and a holder are open (7.4), so what the
   call held or Metal autoreleased on the thread is released before it returns.
 - **The window** (`window.rs`, D51). A `WindowConfig` makes the device's `Window` (the window
   crate's), which keeps its size: the device offers the guest the window's size in pixels as its
   one mode, and tells the guest when the person resizes it. Once the device exists the window gets
-  its sink. On `MetalPlatform` the sink blits the scanout into a drawable in a command buffer of its
-  own queue, presents it and commits. On `VulkanPlatform`, `graphics/vulkan`'s sink makes a
+  its sink. `graphics/vulkan`'s sink makes a
   presenter over a swapchain of the window's surface (on macOS one of its `CAMetalLayer`), which
   draws into the swapchain's next image, commits, and presents the image on the swapchain's
   presenting queue once the runtime has scheduled the command buffer. Neither waits for the GPU.
@@ -658,10 +625,9 @@ docs/api.md is the C API's specification; the header repeats each rule where it 
 - A call that can fail answers an `RvgStatus` (`status.rs`), a plain `u32`, and
   `rvg_status_message` describes each.
 - Every call of a host function runs in `ffi::host_call` (6.7).
-- The exports are written over `Plat`: `MetalPlatform` in the product on macOS, the testkit's
-  `FakePlatform` in the crate's unit tests, which then run the product's code. On Linux it is
-  `VulkanPlatform`, and on macOS the crate's `vulkan` feature (off by default) makes it so; nothing
-  else of the C API changes, the header included.
+- The exports are written over `Plat`: `VulkanPlatform`, and the testkit's `FakePlatform` in the
+  crate's unit tests, which then run the product's code. The crate's `vulkan` feature changes
+  nothing, and stays for the builds that name it.
 
 ### 11.2 The header
 
@@ -671,7 +637,8 @@ against it.
 
 ### 11.3 The dist tree
 
-`cargo xtask dist` (D47) builds `reims-vgpu-c` and writes `target/dist`:
+`cargo xtask dist` (D47) builds `reims-vgpu-c` on the Vulkan platform and writes
+`target/dist-vulkan`:
 
 ```
 include/reims_vgpu.h                   the committed header
@@ -685,10 +652,10 @@ share/doc/reims-vgpu/                  the license: LICENSE and LICENSES/, as in
 `reims-vgpu.pc` takes its prefix from its own path, so the tree can move. Its `Libs.private` lists
 the frameworks and libraries a static link of the archive needs. A host that reads the package once,
 as meson does at configure, must read it again when it changes (`make qemu` does; lessons.md).
-`CARGO_TARGET_DIR` moves the tree with the rest of the build. `--platform vulkan` builds the crate
-with its `vulkan` feature (11.1) into `target/dist-vulkan`, laid out the same.
+`CARGO_TARGET_DIR` moves the tree with the rest of the build. `--platform vulkan` names the only
+platform, for the builds that pass it; any other is refused.
 
-On Linux `dist` builds on the Vulkan platform alone, into `target/dist-vulkan`, with `Libs.private`
+On Linux `dist` writes `Libs.private`
 as rustc prints it for the archive. The archive bundles SDL3, which draws the window there (2.2),
 so it is installed as one object (`ld -r` of the built archive's members) whose only global symbols
 are the C API's `rvg_*` functions, every other made local (`objcopy --keep-global-symbols`): a host
@@ -782,8 +749,8 @@ Rosetta runs x86-64 code, core's tests as `x86_64-apple-darwin`.
 `core::testkit`, under `cfg(any(test, feature = "testkit"))`:
 - **`FakePlatform`**: every platform trait over small object models, logging each call whose
   position is observable (4.3) and scripted by `Faults` (nil, error, raise or crash at the nth call
-  of a selector on a class). A scripted raise is decided as the metal crate decides the same send
-  (4.6), by a `Policy` with the same labels. A free call answers from the model and is not logged.
+  of a selector on a class). A scripted raise is decided as the platform's answer layer decides
+  the same call (4.6), by a `Policy` with the same labels. A free call answers from the model and is not logged.
   Its models keep what the contract sees: fresh numbering, command buffers retaining what they
   reference until completion, counted IOSurfaces.
 - **Memory**: `GuestRam`, a VM model with remap aliasing and maximum protection, `VirtualClock`
@@ -800,14 +767,10 @@ line is the point of the test (14).
 
 ### 13.3 The real platform
 
-`reims-vgpu-metal/tests/`: `spi_encodings` (each method `spi/` declares against the runtime),
-`message_layer` (every send goes through the message layer), `retain_audit`, `numbering`
-(fresh-process Metal numbering), `golden_coalescing` (`CoalescingSignal` against dispatch sources),
-`golden_shared_mutex` (`WriterPrefRwLock` against libc++'s `std::shared_mutex`). The metal crate's
-unit tests send each platform method to Metal, apply each descriptor value to a Metal descriptor
-and read it back, and check the library's shaders on known pixels. The Vulkan crate's tests run its
-platform on the host's device, and on a Mac compare its answers with Metal's own for the same
-calls; they run strict.
+The Vulkan crate's tests run its platform on the host's device, strict. On a Mac they compare its
+answers with Metal's for the same calls, recorded from Metal on the M3 Max under macOS 27.0.1 into
+text files beside each test (`metal_answers/`, read by core's `testkit::metal_answers`), never
+rewritten from the library's own output.
 
 ### 13.5 The C API's harness
 
@@ -869,11 +832,11 @@ crosses the API, or the platform under it, forces them.
 
 | mechanism | where | forced by |
 |---|---|---|
-| a real autorelease pool around each unit of work, and a last-resort one on the library's threads | `rt/pool.rs`, `rt/queue.rs`, `reims-vgpu/src/entry.rs`, `metal/src/os/autorelease.rs` | Metal: what it autoreleases (an uncommitted command buffer in a dev build, its encoders) must go at the unit's end, or the queue's 65th `-commandBuffer` hangs |
+| a real autorelease pool around each unit of work, and a last-resort one on the library's threads | `rt/pool.rs`, `rt/queue.rs`, `reims-vgpu/src/entry.rs`, `vulkan/src/os/macos/autorelease.rs` | Metal: what it autoreleases (an uncommitted command buffer in a dev build, its encoders) must go at the unit's end, or the queue's 65th `-commandBuffer` hangs |
 | named release points for a drop that crosses the API (`Held`, `Hold::keep`) | `rt/held.rs` | the order of host callbacks and IOSurface retain counts against the rest of the API (7.4) |
 | a label at each raise site: `Err`, a death at the raise, or the caller's `OnFault` | `raise.rs`, `raise/on_fault.rs` | where a run dies: a raise no frame handles ends the process at the raise, before any drop (6.2) |
-| every Objective-C call inside a catch: the message layer around Metal and Foundation, `host_call` around every host call | `metal/src/msg.rs`, `metal/tests/message_layer.rs`, `reims-vgpu-c/src/ffi.rs` | an exception out of Metal, Foundation or host code ends the process at the call (D35, 6.7) |
-| one typed call per Metal method, each ordered call where its caller makes it, with raw guest values; descriptor values applied to real descriptors in a stated order | `platform/`, `metal/src/msg.rs`, `metal/src/spi/`, `metal/src/gpu/` | Metal's results, aborts and numbering (resource indices, GPU addresses) follow the calls a process makes (D4, D5) |
+| every Objective-C call inside a catch: the message layer around AppKit, Foundation and IOSurface, `host_call` around every host call | `vulkan/src/os/macos/msg.rs`, `reims-vgpu-c/src/ffi.rs` | an exception out of Metal, Foundation or host code ends the process at the call (D35, 6.7) |
+| one typed call per Metal method, each ordered call where its caller makes it, with raw guest values; descriptor values applied to real descriptors in a stated order | `platform/`, `vulkan/src/answer.rs`, `vulkan/src/gpu/` | Metal's results, aborts and numbering (resource indices, GPU addresses) follow the calls a process makes (D4, D5) |
 | one display thread per process for the cursor callbacks | `reims-vgpu/src/platform.rs` | the order of the cursor callbacks across devices (D49) |
 | a window that closes at the device's release first, and waits for nothing, the main thread included | `reims-vgpu/src/window.rs`, `reims-vgpu-window/src/handle.rs` | where the tables' `destroy`s land, and a host whose main thread creates the device before it runs its run loop (D51) |
 | `extern "C"` exports, each inside `ffi::export`, and the library's panic hook | `reims-vgpu-c/src/ffi.rs`, `singleton.rs` | the header: nothing unwinds into the caller, and a panic of the library's ends the process before any drop (6.5) |
@@ -906,7 +869,7 @@ Core denies `unsafe_code` at its root (D43). It is allowed, with a `// SAFETY:` 
 - the testkit (`clock.rs`, `guest_ram.rs`, `death.rs`: `mmap` over live pages, async-signal-safe
   handlers and `_exit`).
 
-The metal crate, the Vulkan crate, the window crate, the API and the C API use `unsafe` at their
+The Vulkan crate, the window crate, the API and the C API use `unsafe` at their
 FFI edges and where they make a no-copy buffer over memory they hold mapped.
 
 ### 17.4 Lints and integers

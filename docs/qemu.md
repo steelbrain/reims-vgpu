@@ -25,9 +25,8 @@ make qemu          # cargo xtask dist, then build/qemu/qemu-system-x86_64
 ```
 
 `make qemu` runs `cargo xtask dist`, which writes the library into the dist
-tree: `<target>/dist` on a Mac, where the library runs on Metal, and
-`<target>/dist-vulkan` on Linux, where it runs on Vulkan (`target`, or
-`CARGO_TARGET_DIR`). Then it configures `vendor/qemu` out of tree in
+tree, `<target>/dist-vulkan` (`target`, or `CARGO_TARGET_DIR`): on Linux on
+Vulkan, and on a Mac over MoltenVK. Then it configures `vendor/qemu` out of tree in
 `build/qemu`, on Linux:
 
 ```sh
@@ -65,9 +64,8 @@ with (`build/qemu/reims-vgpu.pc.configured`). Then it builds
   reims-vgpu. The device has no default option ROM: `reims-ctl` gives it
   `firmware/prebuilt/ReimsGraphics.rom` as its `romfile`.
 - **Hosts.** On Linux the guest runs under KVM. On a Mac the same
-  `qemu-system-x86_64` runs it under TCG, on the Metal platform, which
-  realizes the device and checks it paused ("The reims-graphics device",
-  below).
+  `qemu-system-x86_64` runs it under TCG, over MoltenVK, which realizes the
+  device and checks it paused ("The reims-graphics device", below).
 
 ## What vendor/qemu carries
 
@@ -353,7 +351,7 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
   when the rest of the process holds more than the 16,384 kept for it, folds
   the same way and is tried once more.
 - **What is refused for want of mappings** answers as the same call does on
-  the Metal platform when memory runs out: a remap of guest pages, or a range
+  Metal when memory runs out: a remap of guest pages, or a range
   a view is made of, answers `KERN_NO_SPACE` with nothing mapped, an
   IOSurface stand-in's memory is none, an import's twin is none, and a buffer
   over a surface or a heap over address ranges is nil. Each is counted and

@@ -995,11 +995,9 @@ What our stack does:
   (`bc_textures_over_a_surface_s_rows_are_made`). The bundle's own CPU access takes the same rows
   (`test_iosurface_block_compressed_textures_are_made`). Until then the bundle answered nil for
   every block-compressed texture over a surface, as the runtime made none.
-- *(outside the envelope, the host's limit)* The Metal platform answers nil for a BC texture over
-  a surface's plane: it makes the texture over the buffer that stands for the surface, and Metal's
-  buffer creator answers nil for BC1 and BC7, as the M3's own IOSurface creator does
-  (`bc_textures_over_a_surface_s_plane_are_metals`, measured on the M3 under macOS 27). The
-  guest's texture of one is then a refused create there (`refused.rs`).
+- *(outside the envelope, the host's limit)* Metal's buffer creator answers nil for a BC1 or BC7
+  texture over the buffer that stands for a surface's plane, as the M3's own IOSurface creator
+  does (measured on the M3 under macOS 27).
 - What the x86 Macs make, the Vulkan runtime still refuses in places, as its
   `NotImplemented(SurfacePlaneShape)` at stack 34, where the three GPUs lay the texels out no one
   way: over a planar surface's plane, a texture wider than its rows, a mipmapped one, a 2DArray of
@@ -1347,11 +1345,11 @@ What our stack does with an object whose posted create the host refused (`decode
 - *(class 3, and class 2 the AMD's)* A binding of a buffer, texture or sampler of one binds nil,
   and the encoder's draws and dispatches run, as with nil bound. Nil is the platform's: on the
   Vulkan platform metal2vulkan's neutral image, sampler and zero buffer, which read zero and
-  sample by the default sampler, as the AMD; on the Metal platform, Metal's own. Until 11-05 they
+  sample by the default sampler, as the AMD. Until 11-05 they
   were dropped while such a slot was bound.
 - *(class 4)* A render pass with an attachment of one is skipped whole, where both Macs run it
   without it: an assertion in the host's Metal at a pass with no attachment would end the host's
-  process, and the Metal platform was not measured there. A pipeline state of one is not set, and
+  process, and the host's platform was not measured there. A pipeline state of one is not set, and
   the draws are dropped until another is, and a blit from or to one is dropped, where both Macs
   end the process at nil: the bundle does not know the create was refused, so cannot end it.
 - A use list's entry of one is nil, as the Intel goes on.
