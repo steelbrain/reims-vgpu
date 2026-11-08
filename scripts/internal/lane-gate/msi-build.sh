@@ -45,7 +45,7 @@ cd "$Q/build"
 if [[ ! -f build.ninja ]]; then
   PKG_CONFIG_PATH=$CARGO_TARGET_DIR/dist-vulkan/lib/pkgconfig "$Q/src/configure" \
     --target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp \
-    --enable-libusb --enable-pvg --disable-docs --disable-tests --disable-werror > configure.log 2>&1 ||
+    --enable-libusb --enable-reims-vgpu --disable-docs --disable-tests --disable-werror > configure.log 2>&1 ||
     { tail -30 configure.log >&2; exit 1; }
 fi
 # The library links in statically, and ninja does not see the archive change: relink each time.

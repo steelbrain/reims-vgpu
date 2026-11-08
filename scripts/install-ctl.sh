@@ -481,7 +481,7 @@ if [[ $SKIP_QEMU == 0 ]]; then
   mkdir -p "$BUILD"
   # No docs and no test suite: users run QEMU, not its tests.
   CONFIGURE=("$ROOT/vendor/qemu/configure" --prefix="$PREFIX" "${QEMU_CONFIGURE[@]}"
-    --enable-pvg --disable-docs --disable-tests --disable-werror)
+    --enable-reims-vgpu --disable-docs --disable-tests --disable-werror)
   CONFIGURED="PKG_CONFIG_PATH=$PC ${CONFIGURE[*]}"
   # Configure again when the source, the options, the package's directory, or
   # the package itself changed: meson keeps the package's flags from configure
@@ -505,7 +505,7 @@ if [[ $SKIP_QEMU == 0 ]]; then
   rm -rf "$STAGE"
   DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null
   [[ -x "$STAGE$PREFIX/bin/$QEMU_BINARY" ]] || die "QEMU's install has no bin/$QEMU_BINARY"
-  find "$STAGE$PREFIX" -name ReimsVgpu.rom -type f | grep -q . || die "QEMU's install has no ReimsVgpu.rom: was it configured with reims-vgpu?"
+  "$STAGE$PREFIX/bin/$QEMU_BINARY" -device help 2>/dev/null | grep -q '"reims-graphics-pci"' || die "QEMU's install has no reims-graphics-pci: was it configured with reims-vgpu?"
   if [[ $OS == Darwin ]] && ! codesign -d --entitlements - "$STAGE$PREFIX/bin/$QEMU_BINARY" 2>/dev/null | grep -q com.apple.security.hypervisor; then
     codesign -s - -f --entitlements "$ROOT/vendor/qemu/accel/hvf/entitlements.plist" "$STAGE$PREFIX/bin/$QEMU_BINARY"
   fi
