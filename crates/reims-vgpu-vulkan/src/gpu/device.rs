@@ -668,13 +668,15 @@ impl VulkanDevice {
     }
 
     /// `newBufferWithLength:options:`'s buffer (`new_buffer_of_length`), declaring the bytes
-    /// between a texture's rows over it unobserved where `padding_unobserved`
+    /// between a texture's rows over it unobserved where `padding_unobserved`, and its byte
+    /// `aligned_byte` on a multiple of 256 bytes of its memory where given
     /// (`new_buffer_of_length_padding_unobserved`).
     fn buffer_of_length(
         &self,
         length: u64,
         options: u64,
         padding_unobserved: bool,
+        aligned_byte: Option<u64>,
     ) -> RaiseResult<Option<VulkanBuffer>> {
         let sel = "newBufferWithLength:options:";
         let options = crate::gpu::resource_options(sel, options);
@@ -685,6 +687,10 @@ impl VulkanDevice {
         let descriptor = match padding_unobserved {
             true => descriptor.with_padding_unobserved(),
             false => descriptor,
+        };
+        let descriptor = match aligned_byte {
+            Some(byte) => descriptor.with_aligned_byte(byte),
+            None => descriptor,
         };
         let descriptor = with_token(in_slot(descriptor, &pool), placing.token());
         let made = create_buffer(
@@ -1153,16 +1159,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         }))
     }
 
-    /// Nil for a length of 0 or past the device's largest buffer, and for memory the device
-    /// cannot allocate, as Metal answers. At the address Metal's space gives it
-    /// ([`metal_space`]), so made through the runtime's descriptor, which takes an address.
+    /// [`VulkanDevice::buffer_of_length`]'s, with neither of its declarations.
     fn new_buffer_of_length(
         &self,
         _on: OnFault,
         length: u64,
         options: u64,
     ) -> RaiseResult<Option<VulkanBuffer>> {
-        self.buffer_of_length(length, options, false)
+        self.buffer_of_length(length, options, false, None)
     }
 
     /// As `new_buffer_of_length`'s, with the runtime's declaration that the bytes between the
@@ -1170,14 +1174,17 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// (`BufferDescriptor::with_padding_unobserved`): a texture whose rows lie with bytes between
     /// them is then a linear image over the buffer's memory that holds them, where the device
     /// lays one out at the texture's rows (`WorkCounts::unobserved_padding_aliases`), and not a
-    /// shadow (`TextureShadowReason::BytesBetweenRows`).
+    /// shadow (`TextureShadowReason::BytesBetweenRows`). Its byte `aligned_byte`, where given, lies
+    /// on a multiple of 256 bytes of its memory (`BufferDescriptor::with_aligned_byte`), which
+    /// takes at most 255 bytes more of it.
     fn new_buffer_of_length_padding_unobserved(
         &self,
         _on: OnFault,
         length: u64,
         options: u64,
+        aligned_byte: Option<u64>,
     ) -> RaiseResult<Option<VulkanBuffer>> {
-        self.buffer_of_length(length, options, true)
+        self.buffer_of_length(length, options, true, aligned_byte)
     }
 
     /// The runtime's exportable buffer (`new_exportable_buffer`): a block of its own, exportable
@@ -2601,7 +2608,8 @@ pub(crate) mod tests {
             (after.0 - before.0, after.1 - before.1)
         };
         let length = pitch * height;
-        let declared = d.new_buffer_of_length_padding_unobserved(OnFault::Return, length, PRIVATE);
+        let declared =
+            d.new_buffer_of_length_padding_unobserved(OnFault::Return, length, PRIVATE, None);
         let declared = texture_over(declared.unwrap());
         let plain = texture_over(
             d.new_buffer_of_length(OnFault::Return, length, PRIVATE)

@@ -131,15 +131,22 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// memory, and change them, and so lies over the buffer's memory where the platform would
     /// otherwise make it a copy of its own. The graphics lane makes a device cache so where the
     /// kext's ask gave its surface's layout, as its copies into the pages take the surface's
-    /// texels alone (`decode::surface_cache`). The default, for a platform with no such
-    /// declaration, makes the buffer as `new_buffer_of_length` does. Reached both under a handler
-    /// and with none: `on` says which this call is.
+    /// texels alone (`decode::surface_cache`). Where `aligned_byte` is given, that byte of the
+    /// buffer lies on a multiple of 256 bytes of its memory, so that a texture whose texels start
+    /// there, or a multiple of 256 bytes past it, lies in its memory as one over its first byte
+    /// does: for a cache whose surface's planes start off such a multiple, as CoreVideo's start
+    /// 32 bytes into their surface. Its length and the answers of its own are
+    /// `new_buffer_of_length`'s. The default, for a platform with neither declaration, makes the
+    /// buffer as `new_buffer_of_length` does. Reached both under a handler and with none: `on`
+    /// says which this call is.
     fn new_buffer_of_length_padding_unobserved(
         &self,
         on: OnFault,
         length: u64,
         options: u64,
+        aligned_byte: Option<u64>,
     ) -> RaiseResult<Option<P::Buffer>> {
+        let _ = aligned_byte;
         self.new_buffer_of_length(on, length, options)
     }
     /// sel: newCommandQueue

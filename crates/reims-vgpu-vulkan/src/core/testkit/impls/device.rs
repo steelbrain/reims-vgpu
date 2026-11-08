@@ -177,17 +177,23 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
     }
 
     /// Logged and scripted under [`PADDING_UNOBSERVED_BUFFER`], as no selector of Metal's names
-    /// it; its buffer is `newBufferWithLength:options:`'s.
+    /// it, with the aligned byte after the length and options (0 for none); its buffer is
+    /// `newBufferWithLength:options:`'s, its memory starting where the fake's starts.
     fn new_buffer_of_length_padding_unobserved(
         &self,
         on: OnFault,
         length: u64,
         options: u64,
+        aligned_byte: Option<u64>,
     ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
         self.make(
             Policy::On(on),
             PADDING_UNOBSERVED_BUFFER,
-            vec![Arg::U64(length), Arg::U64(options)],
+            vec![
+                Arg::U64(length),
+                Arg::U64(options),
+                Arg::U64(aligned_byte.unwrap_or(0)),
+            ],
             |w| new_buffer(w, length, options, Backing::Fresh, None),
         )
     }
