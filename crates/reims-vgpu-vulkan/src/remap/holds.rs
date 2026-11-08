@@ -18,6 +18,9 @@ pub(super) struct Holds {
     lengths: BTreeMap<u64, usize>,
     /// The unmaps that wait, no two sharing a page: each made whole once no hold meets it.
     waiting: Vec<Range<u64>>,
+    /// The unmaps released holds are making now, taken out of [`Self::waiting`]: an overwrite
+    /// that meets one waits until it is made (`super::UnmapHold`'s drop).
+    unmapping: Vec<Range<u64>>,
 }
 
 impl Holds {
@@ -28,6 +31,7 @@ impl Holds {
             held: BTreeMap::new(),
             lengths: BTreeMap::new(),
             waiting: Vec::new(),
+            unmapping: Vec::new(),
         }
     }
 
@@ -95,10 +99,26 @@ impl Holds {
         !self.waiting.is_empty()
     }
 
-    /// Whether an unmap of a page of `pages` waits.
+    /// Whether an unmap of a page of `pages` waits, or is being made.
     #[cfg(test)]
     pub(super) fn waits(&self, pages: &Range<u64>) -> bool {
         (self.waiting.iter()).any(|waiting| waiting.start < pages.end && pages.start < waiting.end)
+            || self.unmapping_meets(pages)
+    }
+
+    /// `unmaps`, which [`Self::release`] answered, are being made from now on.
+    pub(super) fn unmapping(&mut self, unmaps: &[Range<u64>]) {
+        self.unmapping.extend_from_slice(unmaps);
+    }
+
+    /// `unmaps`, which [`Self::unmapping`] took, are made.
+    pub(super) fn unmapped(&mut self, unmaps: &[Range<u64>]) {
+        self.unmapping.retain(|making| !unmaps.contains(making));
+    }
+
+    /// Whether an unmap being made meets `pages`.
+    pub(super) fn unmapping_meets(&self, pages: &Range<u64>) -> bool {
+        (self.unmapping.iter()).any(|making| making.start < pages.end && pages.start < making.end)
     }
 
     /// The hold `id` on the pages from `first` goes: the unmaps no live hold meets any more,
@@ -238,6 +258,31 @@ mod tests {
             let longest = live.iter().map(|(held, _)| held.end - held.start).max();
             assert_eq!(h.longest(), longest.unwrap_or(0), "step {step}");
         }
+    }
+
+    /// An unmap a release answered meets pages while it is being made, and no more once made;
+    /// those of another release stay
+    #[test]
+    fn a_released_unmap_meets_pages_until_it_is_made() {
+        let mut h = Holds::new();
+        let (a, b) = (h.hold(pages(0, 4)), h.hold(pages(10, 2)));
+        assert!(h.unmap(pages(0, 4)) && h.unmap(pages(10, 2)));
+        let first = h.release(0, a);
+        assert_eq!(first, vec![pages(0, 4)]);
+        h.unmapping(&first);
+        let second = h.release(10 * PAGE, b);
+        h.unmapping(&second);
+        assert!(h.unmapping_meets(&pages(3, 2)) && h.waits(&pages(3, 1)));
+        assert!(!h.unmapping_meets(&pages(4, 6)), "between them");
+        assert!(!h.unmaps_wait(), "none waits: both are being made");
+        h.unmapped(&first);
+        assert!(!h.unmapping_meets(&pages(0, 4)) && !h.waits(&pages(0, 4)));
+        assert!(
+            h.unmapping_meets(&pages(11, 1)),
+            "the other is still being made"
+        );
+        h.unmapped(&second);
+        assert!(!h.unmapping_meets(&pages(0, 20)));
     }
 
     /// Pages mapped anew, or unmapped now, under a waiting unmap leave it: what of it they cover

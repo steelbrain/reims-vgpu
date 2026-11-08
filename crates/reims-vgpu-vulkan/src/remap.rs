@@ -81,9 +81,16 @@
 //! - **What it keeps.** The pages stay mapped, at their address, until the hold goes: the kernel
 //!   gives no range over them meanwhile. Core deallocates only whole ranges it made and never
 //!   reaches again, so nothing maps over a waiting unmap but a fixed overwrite, which takes those
-//!   pages out of it (`Holds::replaced`). A released hold's unmaps run from the decision to the
-//!   unmap in one order with the fixed overwrites ([`OVERWRITES`]), so an overwrite never lands
-//!   between them, to be unmapped with the pages that waited there.
+//!   pages out of it (`Holds::replaced`). A released hold decides its unmaps in one order with
+//!   the fixed overwrites ([`OVERWRITES`]) and marks them as being made, then makes them outside
+//!   that order: an overwrite that meets them waits until they are made, so none lands between
+//!   the decision and the unmap, to be unmapped with the pages that waited there, and an
+//!   overwrite of other pages goes on meanwhile. A view of the guest's scattered pages mapped
+//!   from their files is a mapping a 4 KiB run: in that order, the map of a view of one page
+//!   waited 11.7 and 26.4 ms through the unmap of a 29.7 MB view's 7,261 runs, made on the
+//!   runtime's handler thread as a command buffer that read it completed (**measured** on the
+//!   Iris Xe host, ANV, a macOS 26.7.2 guest's Mission Control, 2026-11-08), and the guest's
+//!   texture over that page, and every later message of its process, waited with it.
 //! - **What is not ours to unmap**: memory a no-copy buffer lies in whose unmap is the system's,
 //!   which no hold defers: on macOS an IOSurface's memory that a buffer over it at no offset
 //!   imports as it is. There the deallocator (the surface's release) may unmap the pages before the free, in the same release, or, where
@@ -124,7 +131,7 @@ use std::ptr::NonNull;
 use crate::core::host::HostPtr;
 use crate::core::num::{ToU64, ToUsize};
 use crate::core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
-use crate::core::sync::Mutex;
+use crate::core::sync::{Condvar, Mutex};
 
 use crate::os::OsVm;
 
@@ -225,24 +232,48 @@ impl GuestMappings {
 static HOLDS: Mutex<Holds> = Mutex::new(Holds::new());
 
 /// The order of [`VulkanVm`]'s fixed overwrites, each with the waiting unmaps it takes its pages
-/// out of, and a released hold's unmaps, each from the decision to the unmap (module docs, "What
-/// it keeps"): an overwrite between those would be unmapped with the pages that waited. Taken
-/// before [`HOLDS`], around the OS's calls alone; a hold's release with no unmap waiting skips it.
+/// out of, and a released hold's decision of the unmaps it frees, which it marks as being made
+/// (`Holds::unmapping`) before it lets this go (module docs, "What it keeps"): an overwrite
+/// between the decision and the unmap would be unmapped with the pages that waited, so one that
+/// meets them waits for [`UNMAPPED`] first, and one of other pages goes on while they are made.
+/// Taken before [`HOLDS`], around the OS's calls alone; a hold's release with no unmap waiting
+/// skips it.
 static OVERWRITES: Mutex<()> = Mutex::new(());
 
+/// Raised as a released hold's unmaps are made, under [`HOLDS`], for the overwrites that wait for
+/// them ([`after_unmaps`]).
+static UNMAPPED: Condvar = Condvar::new();
+
+/// Waits, in [`OVERWRITES`]' order, while a released hold's unmap being made meets `pages`, so
+/// an overwrite of them lands after it rather than under it.
+fn after_unmaps(pages: &Range<u64>) {
+    let mut holds = HOLDS.lock();
+    while holds.unmapping_meets(pages) {
+        UNMAPPED.wait(&mut holds);
+    }
+}
+
 /// `call`, a fixed overwrite of the `length` pages at `at`, then what waited to be unmapped there
-/// taken out of the waiting unmaps, in [`OVERWRITES`]' order.
+/// taken out of the waiting unmaps, in [`OVERWRITES`]' order, after any unmap being made there.
 fn overwrite<T>(
     (at, length): (HostPtr, u64),
     call: impl FnOnce() -> Result<T, KernReturn>,
 ) -> Result<T, KernReturn> {
     let _order = OVERWRITES.lock();
-    let made = call()?;
     let first = at.addr().to_u64();
-    HOLDS
-        .lock()
-        .replaced(&(first..first.saturating_add(length)));
+    let pages = first..first.saturating_add(length);
+    after_unmaps(&pages);
+    let made = call()?;
+    HOLDS.lock().replaced(&pages);
     Ok(made)
+}
+
+/// What a released hold's drop does between deciding its unmaps and making them, for tests:
+/// the drop's thread's own.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_UNMAPS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// A hold on the host pages a runtime import covers, which the runtime is given in a no-copy
@@ -269,8 +300,9 @@ impl UnmapHold {
 }
 
 impl Drop for UnmapHold {
-    /// Unmaps what waited for this hold and no other, in [`OVERWRITES`]' order where an unmap
-    /// waits, calling nothing else.
+    /// Unmaps what waited for this hold and no other, calling nothing else: decided in
+    /// [`OVERWRITES`]' order where an unmap waits, and made outside it, marked as being made
+    /// meanwhile, so an overwrite of other pages never waits for them.
     fn drop(&mut self) {
         {
             let mut holds = HOLDS.lock();
@@ -279,19 +311,32 @@ impl Drop for UnmapHold {
                 return;
             }
         }
-        let _order = OVERWRITES.lock();
-        let free = HOLDS.lock().release(self.first, self.id);
+        let free = {
+            let _order = OVERWRITES.lock();
+            let mut holds = HOLDS.lock();
+            let free = holds.release(self.first, self.id);
+            holds.unmapping(&free);
+            free
+        };
+        if free.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(step) = BEFORE_UNMAPS.with(|step| step.borrow_mut().take()) {
+            step();
+        }
         let vm = OsVm::new();
-        for pages in free {
+        for pages in &free {
             let at = HostPtr::from_addr(pages.start.to_usize());
             let _ = vm.deallocate(at, pages.end - pages.start);
         }
+        HOLDS.lock().unmapped(&free);
+        UNMAPPED.notify_all();
     }
 }
 
-/// Whether an unmap of a page of the `length` bytes at `at` waits for a hold, for tests: read in
-/// [`OVERWRITES`]' order, so a hold whose release has begun has unmapped what waited for it
-/// before this answers `false` (its drop takes the unmaps out of [`HOLDS`], then makes them).
+/// Whether an unmap of a page of the `length` bytes at `at` waits for a hold, or is being made,
+/// for tests: `false` once a released hold's drop has unmapped what waited for it there.
 #[cfg(test)]
 pub(crate) fn unmap_waits(at: HostPtr, length: u64) -> bool {
     let _order = OVERWRITES.lock();
@@ -400,9 +445,10 @@ impl HostVm for VulkanVm {
         Ok(at)
     }
 
-    /// The OS's view of the runs at once, reported as their remaps one at a time are: the pages
-    /// of the runs it mapped, the runs before a refusal's, taken out of the waiting unmaps in
-    /// [`OVERWRITES`]' order and then reported changed.
+    /// The OS's view of the runs at once, reported as their remaps one at a time are: made after
+    /// any unmap being made over the view's pages, then the pages of the runs it mapped, the runs
+    /// before a refusal's, taken out of the waiting unmaps in [`OVERWRITES`]' order and reported
+    /// changed.
     fn remap_runs_shared_overwrite(
         &self,
         dst: HostAddr,
@@ -410,6 +456,12 @@ impl HostVm for VulkanVm {
     ) -> Result<(), (usize, KernReturn)> {
         let page = self.page_size();
         let order = OVERWRITES.lock();
+        let whole = (runs.iter()).fold(0u64, |sum, &(_, len)| {
+            sum.saturating_add(len.saturating_add(page - 1) & !(page - 1))
+        });
+        let (target, length) = length_pages(dst, whole, page);
+        let target = target.addr().to_u64();
+        after_unmaps(&(target..target.saturating_add(length)));
         let made = self.vm.remap_runs_shared_overwrite(dst, runs);
         let done = match made {
             Ok(()) => runs.len(),
@@ -559,6 +611,93 @@ mod tests {
         assert_eq!(refused.is_err(), cfg!(target_os = "linux"));
         for (range, length) in [(view, 2 * page), (at, 2 * page), (anonymous, page)] {
             assert!(vm.deallocate(range, length).is_success());
+        }
+    }
+
+    /// A released hold makes its unmaps outside the overwrites' order, marked as being made
+    /// meanwhile: a fixed overwrite of other pages lands while they are being made, as the map of
+    /// a view of one page while another view's unmap of thousands of mappings runs, where views
+    /// of scattered pages are mapped from their files; one that met them would wait for the mark
+    /// (`after_unmaps`). Unmapped pages may be mapped again at once by another test's thread, so
+    /// the unmap shows as pages unmapped or no longer holding the bytes written there.
+    #[test]
+    fn an_overwrite_of_other_pages_lands_while_a_released_hold_unmaps() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let vm = VulkanVm {
+            vm: OsVm::new(),
+            report: seen,
+        };
+        let page = vm.page_size();
+        let held = vm.allocate_anywhere(4 * page).unwrap();
+        let other = vm.allocate_anywhere(page).unwrap();
+        let src = crate::os::allocate_aliasable(page).unwrap();
+        // SAFETY: pages this test just mapped, readable and writable.
+        unsafe {
+            src.as_ptr::<u8>().write_volatile(0x5a);
+            std::ptr::write_bytes(held.as_ptr::<u8>(), 0xa5, (4 * page).to_usize());
+        }
+        let gone = |p: HostPtr| {
+            // SAFETY: a read of a page that is mapped, the first test's.
+            !crate::os::mapped(p) || unsafe { p.as_ptr::<u8>().read_volatile() } != 0xa5
+        };
+        let hold = UnmapHold::new(NonNull::new(held.as_ptr::<u8>()).unwrap(), 4 * page);
+        assert!(vm.deallocate(held, 4 * page).is_success());
+        assert!(unmap_waits(held, 4 * page));
+        let _ = take();
+        // The hold goes on a thread of its own, which stops between deciding its unmaps and
+        // making them until it is told to go on.
+        let (stopped, at_stop) = mpsc::channel();
+        let (go_on, until_told) = mpsc::channel::<()>();
+        let dropper = std::thread::spawn(move || {
+            BEFORE_UNMAPS.with(|step| {
+                *step.borrow_mut() = Some(Box::new(move || {
+                    stopped.send(()).unwrap();
+                    until_told.recv().unwrap();
+                }));
+            });
+            drop(hold);
+        });
+        at_stop
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the drop decided its unmaps");
+        // Not through `unmap_waits`, whose wait for the overwrites' order would hang the test
+        // where a release held that order through its unmaps.
+        let being_made = {
+            let first = held.wrapping_add(page).addr().to_u64();
+            HOLDS.lock().waits(&(first..first + page))
+        } && !gone(held);
+        // A remap of one page over `other`, on a thread of its own, so a wait fails the test
+        // rather than hanging it.
+        let (answer, answered) = mpsc::channel();
+        std::thread::spawn(move || {
+            let vm = VulkanVm {
+                vm: OsVm::new(),
+                report: |_, _| {},
+            };
+            let _ = answer.send(vm.remap_shared_overwrite(other, src, page).is_ok());
+        });
+        let landed = answered.recv_timeout(Duration::from_secs(10));
+        go_on.send(()).unwrap();
+        dropper.join().unwrap();
+        assert!(
+            being_made,
+            "the unmap was being made, its pages still mapped"
+        );
+        assert_eq!(
+            landed,
+            Ok(true),
+            "the remap of other pages landed meanwhile"
+        );
+        // SAFETY: the page the remap mapped, which shows the source's.
+        assert_eq!(unsafe { other.as_ptr::<u8>().read_volatile() }, 0x5a);
+        assert!(!unmap_waits(held, 4 * page), "made");
+        assert!(
+            (0..4).all(|i| gone(held.wrapping_add(i * page))),
+            "unmapped"
+        );
+        for (p, length) in [(other, page), (src, page)] {
+            assert!(OsVm::new().deallocate(p, length).is_success());
         }
     }
 
