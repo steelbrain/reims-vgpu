@@ -285,6 +285,30 @@ void test_buffer_answers()
 	@autoreleasepool {
 		RgfxIndirectCommandBuffer *icb = fx.make(renderDescriptor(), 16);
 		CHECK(icb != nil && icb.size == 16 && icb.gpuResourceID._impl == 7);
+		// Metal's buffer SPI: the index, the handle and the identifier are gpuResourceID's value; no
+		// GPU address the guest sees.
+		for (NSString *member in @[ @"resourceIndex", @"gpuHandle", @"uniqueIdentifier" ])
+			CHECK(((uint64_t (*)(id, SEL))objc_msgSend)(icb, NSSelectorFromString(member)) == 7);
+		CHECK(((uint64_t (*)(id, SEL))objc_msgSend)(icb, NSSelectorFromString(@"gpuAddress")) == 0);
+		// No driver header of the buffer in the guest.
+		void *header = &fx;
+		uint64_t headerSize = 1;
+		((void (*)(id, SEL, void **, uint64_t *))objc_msgSend)(
+		    icb, NSSelectorFromString(@"getHeader:headerSize:"), &header, &headerSize);
+		CHECK(header == nullptr && headerSize == 0);
+		((void (*)(id, SEL, void **, uint64_t *))objc_msgSend)(
+		    icb, NSSelectorFromString(@"getHeader:headerSize:"), nullptr, nullptr);
+		// The resource SPI: an allocation of its own, aliasing nothing; complete, written and not
+		// purgeable; its options as asked.
+		auto u64 = [](id object, NSString *name) {
+			return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		auto flag = [](id object, NSString *name) {
+			return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		CHECK(flag(icb, @"isComplete") && flag(icb, @"isWriteComplete") && !flag(icb, @"isPurgeable"));
+		CHECK(u64(icb, @"unfilteredResourceOptions") == 0);
+		((void (*)(id, SEL))objc_msgSend)(icb, NSSelectorFromString(@"waitUntilComplete"));
 		CHECK(icb.resourceOptions == 0x200 && icb.storageMode == MTLStorageModeShared &&
 		      icb.cpuCacheMode == MTLCPUCacheModeDefaultCache &&
 		      icb.hazardTrackingMode == MTLHazardTrackingModeTracked);
@@ -299,6 +323,9 @@ void test_buffer_answers()
 		                                          MTLResourceStorageModePrivate);
 		CHECK(priv.gpuResourceID._impl == 8 && priv.resourceOptions == 0x220 &&
 		      priv.storageMode == MTLStorageModePrivate && priv.allocatedSize == 65536);
+		CHECK(u64(icb, @"allocationID") != 0 && u64(icb, @"allocationID") != u64(priv, @"allocationID"));
+		CHECK(!((BOOL (*)(id, SEL, id))objc_msgSend)(icb, NSSelectorFromString(@"doesAliasResource:"), priv));
+		CHECK(u64(priv, @"unfilteredResourceOptions") == MTLResourceStorageModePrivate);
 		CHECK(fx.make(renderDescriptor(), 4, MTLResourceHazardTrackingModeUntracked)
 		          .resourceOptions == 0x100);
 		CHECK(fx.make(renderDescriptor(), 4, MTLResourceCPUCacheModeWriteCombined)
@@ -351,6 +378,63 @@ void test_command_lookups()
 		CHECK([empty indirectRenderCommandAtIndex:0] == nil &&
 		      [empty indirectComputeCommandAtIndex:0] == nil);
 		CHECK(ringEmpty(fx.ring)); // a lookup sends nothing
+
+		// Metal's command SPI: what reads back what a command was given answers a fresh
+		// command's, logged; what Metal's base render command raises for raises; nothing is sent.
+		auto obj = [](id object, NSString *name) {
+			return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		auto u64 = [](id object, NSString *name) {
+			return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		auto at = [](id object, NSString *name) {
+			return ((uint64_t (*)(id, SEL, NSUInteger))objc_msgSend)(object, NSSelectorFromString(name), 0);
+		};
+		auto flag = [](id object, NSString *name) {
+			return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		for (NSString *member in @[ @"drawArguments", @"drawIndexedArguments", @"drawPatchesArguments",
+		                            @"drawIndexedPatchesArguments", @"getTessellationFactorArguments" ])
+			CHECK(obj(a, member) == nil);
+		CHECK(u64(a, @"getCommandType") == 0 && u64(a, @"getOptimizedStatus") == 0 &&
+		      u64(a, @"getPipelineStateUniqueIdentifier") == 0 && !flag(a, @"hasBarrier"));
+		for (NSString *member in @[ @"getVertexBufferAtIndex:", @"getVertexBufferAddressAtIndex:",
+		                            @"getVertexAttributeStrideAtIndex:", @"getFragmentBufferAtIndex:",
+		                            @"getFragmentBufferAddressAtIndex:" ])
+			CHECK(at(a, member) == 0);
+		CHECK(RgfxUnsupportedWasLogged([RgfxIndirectRenderCommand class], NSSelectorFromString(@"getCommandType")));
+		auto raises = [](void (^body)(void)) {
+			@try {
+				body();
+			} @catch (NSException *e) {
+				return [e.reason containsString:@"unrecognized selector"];
+			}
+			return false;
+		};
+		CHECK(raises(^{
+			(void)u64(a, @"getCullMode");
+		}));
+		CHECK(raises(^{
+			(void)obj(a, @"getViewports");
+		}));
+		CHECK(raises(^{
+			(void)at(a, @"getMeshBufferAddressAtIndex:");
+		}));
+		CHECK(raises(^{
+			((void (*)(id, SEL, MTLScissorRect))objc_msgSend)(a, NSSelectorFromString(@"setScissorRect:"),
+			                                                  MTLScissorRect{0, 0, 1, 1});
+		}));
+		id<MTLIndirectComputeCommand> k = [compute indirectComputeCommandAtIndex:0];
+		for (NSString *member in @[ @"dispatchThreadgroupsArguments", @"dispatchThreadsArguments",
+		                            @"getImageBlockSize" ])
+			CHECK(obj(k, member) == nil);
+		CHECK(u64(k, @"getCommandType") == 0 && u64(k, @"getPipelineStateUniqueIdentifier") == 0 &&
+		      !flag(k, @"hasBarrier"));
+		for (NSString *member in @[ @"getKernelBufferAtIndex:", @"getKernelBufferAddressAtIndex:",
+		                            @"getKernelAttributeStrideAtIndex:", @"getThreadgroupMemoryLengthAtIndex:" ])
+			CHECK(at(k, member) == 0);
+		CHECK(RgfxUnsupportedWasLogged([RgfxIndirectComputeCommand class], NSSelectorFromString(@"getCommandType")));
+		CHECK(ringEmpty(fx.ring));
 	}
 	drainRing(fx.ring);
 }

@@ -39,6 +39,7 @@ constexpr uint64_t kPageBytes = 4096;
 // creators end the process at one that supports them, as the x86 Macs' Metal does (measured:
 // guest/bundle/tools/oracle/oracle_mesh on the AMD 5300M and the Intel 630, macOS 26.7.1).
 constexpr const char *kMesh = "mesh shading in indirect command buffers (no mesh pipeline supports them)";
+constexpr const char *kReadBack = "reading back what an indirect command was given";
 
 // The SPI member `name` of `d` where it answers it, else `fallback`.
 NSUInteger spi(MTLIndirectCommandBufferDescriptor *d, const char *name, NSUInteger fallback)
@@ -293,6 +294,47 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 	return rid;
 }
 
+// Metal's IOAccel buffer answers gpuResourceID and gpuHandle with resourceIndex (read from code,
+// MTLIOAccelIndirectCommandBuffer, macOS 27.0.1), and both x86 Macs' fresh buffer answers one
+// value as its handle, its resource index and its identifier (measured: macOS 26.7.1,
+// oracle_spi_members answers): each is the id the host numbered the buffer by.
+- (uint64_t)resourceIndex
+{
+	return _resourceId;
+}
+
+- (uint64_t)gpuHandle
+{
+	return [self resourceIndex];
+}
+
+- (uint64_t)uniqueIdentifier
+{
+	return [self resourceIndex];
+}
+
+// The buffer's commands live on the host, so the guest sees no GPU address of them: 0, where both
+// x86 Macs answer their buffer's (measured: macOS 26.7.1, oracle_spi_members answers). A shader
+// reaches a buffer of the device's by its gpuResourceID.
+- (uint64_t)gpuAddress
+{
+	return 0;
+}
+
+// Metal's IOAccel buffer answers a pointer to its driver's header of the buffer and the header's
+// size (read from code, MTLIOAccelIndirectCommandBuffer, macOS 27.0.1): the buffer's commands live
+// on the host, which keeps no such header in the guest, so these answer none, of size 0.
+- (void)getHeader:(void **)header headerSize:(uint64_t *)headerSize
+{
+	RGFX_UNSUPPORTED("an indirect command buffer's driver header");
+	if (header != nullptr) {
+		*header = nullptr;
+	}
+	if (headerSize != nullptr) {
+		*headerSize = 0;
+	}
+}
+
 // Every command of the range loses what it was given, on the host's buffer: in its slots, or a
 // reset of each kind of command the buffer has.
 - (void)resetWithRange:(NSRange)range
@@ -348,6 +390,19 @@ NSRange RgfxIcbClamp(id icb, NSRange range)
 {
 	return RgfxResolveHazardTracking(_options, MTLResourceHazardTrackingModeTracked);
 }
+
+// The options as asked, as both x86 Macs' buffers answer (0 for a buffer made with none; measured:
+// macOS 26.7.1, oracle_spi_members ask answers).
+- (MTLResourceOptions)unfilteredResourceOptions
+{
+	return _options;
+}
+
+// The resource SPI a buffer and a texture answer (RgfxResource.h), which both x86 Macs' buffers
+// answer too, from Metal's IOAccel resource and indirect command buffer (measured with
+// respondsToSelector:, macOS 26.7.1, oracle_spi_members ask): a fresh one is complete, written and
+// not purgeable (measured: its answers).
+RGFX_RESOURCE_SPI
 
 - (MTLStorageMode)storageMode
 {
@@ -657,6 +712,262 @@ RGFX_LOG_UNRECOGNIZED
 	[self doesNotRecognizeSelector:_cmd];
 }
 
+// --- Metal's indirect render command SPI that reads back what was encoded: both x86 Macs'
+// commands answer what each holds (measured: macOS 26.7.1, tools/oracle/oracle_icb.m spi: the
+// command type, the pipeline's identifier, each buffer's GPU address and the draw's arguments,
+// none of them after a reset). A command here keeps what it was given in its buffer's slots or
+// on the host, not where these could read it back, so each answers what a fresh command of the
+// Intel 630's answers, logged, which a fresh one of the AMD 5300M's does too but where noted.
+
+// nil (the AMD 5300M's fresh command answers an object of zeros).
+- (nullable id)drawArguments
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return nil;
+}
+
+- (nullable id)drawIndexedArguments
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return nil;
+}
+
+- (nullable id)drawPatchesArguments
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return nil;
+}
+
+- (nullable id)drawIndexedPatchesArguments
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return nil;
+}
+
+- (nullable id)getTessellationFactorArguments
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return nil;
+}
+
+- (uint64_t)getCommandType
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+- (uint64_t)getOptimizedStatus
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+// 0 (the AMD 5300M's fresh command answers ~0).
+- (uint64_t)getPipelineStateUniqueIdentifier
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+// NO, as the AMD 5300M's fresh command answers (the Intel 630's raises an unrecognized selector).
+- (BOOL)hasBarrier
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return NO;
+}
+
+- (void *)getVertexBufferAtIndex:(NSUInteger)index
+{
+	(void)index;
+	RGFX_UNSUPPORTED(kReadBack);
+	return nullptr;
+}
+
+- (uint64_t)getVertexBufferAddressAtIndex:(NSUInteger)index
+{
+	(void)index;
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+// 0, as the AMD 5300M's fresh command answers (the Intel 630's answers ~0).
+- (uint64_t)getVertexAttributeStrideAtIndex:(NSUInteger)index
+{
+	(void)index;
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+- (void *)getFragmentBufferAtIndex:(NSUInteger)index
+{
+	(void)index;
+	RGFX_UNSUPPORTED(kReadBack);
+	return nullptr;
+}
+
+- (uint64_t)getFragmentBufferAddressAtIndex:(NSUInteger)index
+{
+	(void)index;
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+// --- Metal's indirect render command SPI that its base command raises an unrecognized selector
+// for (it sends itself doesNotRecognizeSelector:; read from code, _MTLIndirectRenderCommand, macOS
+// 27.0.1), which neither x86 Mac's command overrides, and the mesh ones, whose draws no command
+// here makes: so do these -------------------------------------------------------------------
+
+- (nullable id)getBlendColor
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (uint64_t)getCullMode
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+- (nullable id)getDepthBiasInfo
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (uint64_t)getDepthClipMode
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+- (nullable id)getDepthStencilState
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (uint64_t)getDepthStencilStateUniqueIdentifier
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+- (nullable id)getDepthTestBounds
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (uint64_t)getFrontFacingWinding
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+- (nullable id)getScissorRects
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (nullable id)getStencilReferenceValues
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (uint64_t)getTriangleFillMode
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+- (nullable id)getViewports
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (nullable id)drawMeshThreadgroupsArguments
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (nullable id)drawMeshThreadsArguments
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (uint64_t)getMeshBufferAddressAtIndex:(NSUInteger)index
+{
+	(void)index;
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+- (uint64_t)getObjectBufferAddressAtIndex:(NSUInteger)index
+{
+	(void)index;
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+- (uint64_t)getObjectThreadgroupMemoryLengthAtIndex:(NSUInteger)index
+{
+	(void)index;
+	[self doesNotRecognizeSelector:_cmd];
+	return 0;
+}
+
+- (void)setBlendColorRed:(float)red green:(float)green blue:(float)blue alpha:(float)alpha
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (void)setDepthTestMinBound:(float)minBound maxBound:(float)maxBound
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (void)setScissorRect:(MTLScissorRect)rect
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (void)setScissorRects:(const MTLScissorRect *)scissorRects count:(NSUInteger)count
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (void)setStencilReferenceValue:(uint32_t)referenceValue
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (void)setStencilFrontReferenceValue:(uint32_t)frontReferenceValue
+                   backReferenceValue:(uint32_t)backReferenceValue
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (void)setToolsDispatchBufferSPI:(NSUInteger)buffer atIndex:(NSUInteger)index stages:(NSUInteger)stages
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (void)setViewport:(MTLViewport)viewport
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (void)setViewports:(const MTLViewport *)viewports count:(NSUInteger)count
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
 @end
 
 @implementation RgfxIndirectComputeCommand
@@ -766,4 +1077,87 @@ RGFX_LOG_UNRECOGNIZED
 	record(_icb, RGFX_ICB_OP_STAGE_IN_REGION, _index, body);
 }
 
+
+// --- Metal's indirect compute command SPI that reads back what was encoded: both x86 Macs'
+// commands answer what each holds (measured: macOS 26.7.1, tools/oracle/oracle_icb.m spi). As the
+// render command's (above), a command here answers what a fresh command answers, logged: the AMD
+// 5300M's, where the two differ.
+
+// nil (the Intel 630's fresh command answers an object of zeros).
+- (nullable id)dispatchThreadgroupsArguments
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return nil;
+}
+
+- (nullable id)dispatchThreadsArguments
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return nil;
+}
+
+- (nullable id)getImageBlockSize
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return nil;
+}
+
+- (uint64_t)getCommandType
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+- (uint64_t)getOptimizedStatus
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+// 0, as the Intel 630's fresh command answers (the AMD 5300M's answers ~0).
+- (uint64_t)getPipelineStateUniqueIdentifier
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+- (BOOL)hasBarrier
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return NO;
+}
+
+- (MTLRegion)getStageInRegion
+{
+	RGFX_UNSUPPORTED(kReadBack);
+	return MTLRegionMake3D(0, 0, 0, 0, 0, 0);
+}
+
+- (void *)getKernelBufferAtIndex:(NSUInteger)index
+{
+	(void)index;
+	RGFX_UNSUPPORTED(kReadBack);
+	return nullptr;
+}
+
+- (uint64_t)getKernelBufferAddressAtIndex:(NSUInteger)index
+{
+	(void)index;
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+- (uint64_t)getKernelAttributeStrideAtIndex:(NSUInteger)index
+{
+	(void)index;
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
+
+- (uint64_t)getThreadgroupMemoryLengthAtIndex:(NSUInteger)index
+{
+	(void)index;
+	RGFX_UNSUPPORTED(kReadBack);
+	return 0;
+}
 @end

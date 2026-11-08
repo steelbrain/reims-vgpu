@@ -26,6 +26,12 @@
 //               encode draws, execution GPU time
 //   freed       buffers the commands name released before an execute, a heap's among them
 //   resets      what a command's reset and resetWithRange: keep of a command's pipeline state
+//   spi         what a render and a compute command answer to Metal's indirect command SPI
+//               (MTLIndirectRenderCommandSPI, MTLIndirectComputeCommandSPI) fresh, once encoded
+//               and after a reset: each getter that takes no argument or an index, by its value,
+//               an object's by its class and properties; one that raises, "raises" (caught).
+//               Not asked: the getters Metal's base command raises an unrecognized selector for
+//               and neither GPU's command overrides, and the mesh ones.
 // Render results print as the 8 cells of a 64x8 target, each the hex digit of the color index
 // found there ('.' where nothing drew, '?' where something unexpected did).
 // Build: see README.md.
@@ -1885,6 +1891,200 @@ static double commit_ms(void)
 	return oracle_now_ms() - t0;
 }
 
+// --- spi ---------------------------------------------------------------------------------------
+
+static void spi_props(id v)
+{
+	for (Class k = [v class]; k && k != [NSObject class]; k = class_getSuperclass(k)) {
+		unsigned n = 0;
+		objc_property_t *ps = class_copyPropertyList(k, &n);
+		for (unsigned i = 0; i < n; i++) {
+			const char *pn = property_getName(ps[i]);
+			@try {
+				id pv = [v valueForKey:@(pn)];
+				printf(" %s=%s", pn, pv ? [[pv description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "].UTF8String : "nil");
+			} @catch (NSException *e) {
+				printf(" %s=(raises)", pn);
+			}
+		}
+		free(ps);
+	}
+}
+
+// Asks `c` the getter `name` (an index getter with `index`), by the return type its method has.
+static void spi_ask(id c, const char *name, NSUInteger index)
+{
+	SEL sel = sel_registerName(name);
+	if (![c respondsToSelector:sel]) {
+		printf("    %-40s not answered\n", name);
+		return;
+	}
+	Method m = class_getInstanceMethod([c class], sel);
+	const char rt = method_getTypeEncoding(m)[0];
+	const BOOL indexed = strchr(name, ':') != NULL;
+	char label[64];
+	snprintf(label, sizeof label, indexed ? "%s%lu" : "%s", name, (unsigned long)index);
+	fflush(stdout);
+	@try {
+		switch (rt) {
+		case '@': {
+			id v = ((id (*)(id, SEL))objc_msgSend)(c, sel);
+			printf("    %-40s %s", label, v ? class_getName([v class]) : "nil");
+			if (v) spi_props(v);
+			printf("\n");
+			break;
+		}
+		case 'B': case 'c':
+			printf("    %-40s %d\n", label, (int)((BOOL (*)(id, SEL))objc_msgSend)(c, sel));
+			break;
+		case 'Q': case 'q':
+			printf("    %-40s 0x%llx\n", label, indexed
+			       ? (unsigned long long)((uint64_t (*)(id, SEL, NSUInteger))objc_msgSend)(c, sel, index)
+			       : (unsigned long long)((uint64_t (*)(id, SEL))objc_msgSend)(c, sel));
+			break;
+		case '^': {
+			void *p = indexed ? ((void *(*)(id, SEL, NSUInteger))objc_msgSend)(c, sel, index)
+			                  : ((void *(*)(id, SEL))objc_msgSend)(c, sel);
+			printf("    %-40s %p\n", label, p);
+			break;
+		}
+		case '{': {
+#if defined(__x86_64__)
+			// A struct of 48 bytes comes back through memory: objc_msgSend_stret on x86-64.
+			MTLRegion r = ((MTLRegion (*)(id, SEL))objc_msgSend_stret)(c, sel);
+#else
+			MTLRegion r = ((MTLRegion (*)(id, SEL))objc_msgSend)(c, sel);
+#endif
+			printf("    %-40s origin %lu,%lu,%lu size %lu,%lu,%lu\n", label,
+			       (unsigned long)r.origin.x, (unsigned long)r.origin.y, (unsigned long)r.origin.z,
+			       (unsigned long)r.size.width, (unsigned long)r.size.height, (unsigned long)r.size.depth);
+			break;
+		}
+		default:
+			printf("    %-40s (%s, not asked)\n", label, method_getTypeEncoding(m));
+		}
+	} @catch (NSException *e) {
+		printf("    %-40s raises %s\n", label, e.name.UTF8String);
+	}
+}
+
+static void spi_render(id c)
+{
+	static const char *const objects[] = {"drawArguments", "drawIndexedArguments",
+	    "drawPatchesArguments", "drawIndexedPatchesArguments", "getTessellationFactorArguments"};
+	for (size_t i = 0; i < sizeof objects / sizeof objects[0]; i++)
+		spi_ask(c, objects[i], 0);
+	spi_ask(c, "getCommandType", 0);
+	spi_ask(c, "getOptimizedStatus", 0);
+	spi_ask(c, "getPipelineStateUniqueIdentifier", 0);
+	spi_ask(c, "hasBarrier", 0);
+	spi_ask(c, "getVertexBufferAtIndex:", 0);
+	spi_ask(c, "getVertexBufferAddressAtIndex:", 0);
+	spi_ask(c, "getVertexAttributeStrideAtIndex:", 0);
+	spi_ask(c, "getFragmentBufferAtIndex:", 0);
+	spi_ask(c, "getFragmentBufferAddressAtIndex:", 0);
+}
+
+static void spi_compute(id c)
+{
+	spi_ask(c, "dispatchThreadgroupsArguments", 0);
+	spi_ask(c, "dispatchThreadsArguments", 0);
+	spi_ask(c, "getImageBlockSize", 0);
+	spi_ask(c, "getCommandType", 0);
+	spi_ask(c, "getOptimizedStatus", 0);
+	spi_ask(c, "getPipelineStateUniqueIdentifier", 0);
+	spi_ask(c, "hasBarrier", 0);
+	spi_ask(c, "getStageInRegion", 0);
+	for (NSUInteger i = 0; i < 2; i++) {
+		spi_ask(c, "getKernelBufferAtIndex:", i);
+		spi_ask(c, "getKernelBufferAddressAtIndex:", i);
+		spi_ask(c, "getKernelAttributeStrideAtIndex:", i);
+		spi_ask(c, "getThreadgroupMemoryLengthAtIndex:", i);
+	}
+}
+
+static void spi_object(const char *what, id o)
+{
+	SEL uid = sel_registerName("uniqueIdentifier");
+	printf("  %s %p", what, (__bridge void *)o);
+	if ([o respondsToSelector:@selector(gpuAddress)])
+		printf(" gpuAddress 0x%llx", (unsigned long long)[(id<MTLBuffer>)o gpuAddress]);
+	if ([o respondsToSelector:@selector(contents)])
+		printf(" contents %p", [(id<MTLBuffer>)o contents]);
+	if ([o respondsToSelector:@selector(gpuResourceID)])
+		printf(" gpuResourceID 0x%llx", (unsigned long long)[(id<MTLRenderPipelineState>)o gpuResourceID]._impl);
+	if ([o respondsToSelector:uid])
+		printf(" uniqueIdentifier 0x%llx", (unsigned long long)((uint64_t (*)(id, SEL))objc_msgSend)(o, uid));
+	printf("\n");
+}
+
+static void case_spi(void)
+{
+	printf("spi (render):\n");
+	spi_object("pipeline", gDraw);
+	spi_object("vertex buffer (offset 16)", gRects);
+	spi_object("fragment buffer (offset 32)", gColors);
+	MTLIndirectCommandBufferDescriptor *d = rdesc(MTLIndirectCommandTypeDraw | MTLIndirectCommandTypeDrawIndexed, NO, NO);
+	id<MTLIndirectCommandBuffer> b = icb(d, 2);
+	if (!b)
+		return;
+	id<MTLIndirectRenderCommand> c = [b indirectRenderCommandAtIndex:0];
+	printf("  fresh:\n");
+	spi_render(c);
+	[c setRenderPipelineState:gDraw];
+	[c setVertexBuffer:gRects offset:16 atIndex:0];
+	[c setFragmentBuffer:gColors offset:32 atIndex:0];
+	[c drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:3 vertexCount:4 instanceCount:2 baseInstance:1];
+	printf("  a draw (vertexStart 3, vertexCount 4, instanceCount 2, baseInstance 1):\n");
+	spi_render(c);
+	// No setBarrier on a render command: the AMD 5300M faults at it (SIGILL), the Intel 630 raises.
+	id<MTLIndirectRenderCommand> c1 = [b indirectRenderCommandAtIndex:1];
+	[c1 setRenderPipelineState:gDraw];
+	[c1 drawIndexedPrimitives:MTLPrimitiveTypeTriangleStrip indexCount:4 indexType:MTLIndexTypeUInt16
+	              indexBuffer:gIdx16 indexBufferOffset:4 instanceCount:1 baseVertex:2 baseInstance:0];
+	printf("  command 1, an indexed draw (indexCount 4, UInt16 at offset 4, baseVertex 2):\n");
+	spi_object("index buffer", gIdx16);
+	spi_render(c1);
+	[c reset];
+	printf("  command 0 after its reset:\n");
+	spi_render(c);
+
+	printf("spi (compute):\n");
+	spi_object("pipeline", gAdd);
+	id<MTLBuffer> out = buf(4096), vals = buf(256);
+	spi_object("kernel buffer 0 (offset 64)", out);
+	spi_object("kernel buffer 1 (offset 8)", vals);
+	id<MTLIndirectCommandBuffer> cb = icb(cdesc(MTLIndirectCommandTypeConcurrentDispatch, NO, NO), 1);
+	if (!cb)
+		return;
+	id<MTLIndirectComputeCommand> k = [cb indirectComputeCommandAtIndex:0];
+	printf("  fresh:\n");
+	spi_compute(k);
+	[k setComputePipelineState:gAdd];
+	[k setKernelBuffer:out offset:64 atIndex:0];
+	[k setKernelBuffer:vals offset:8 atIndex:1];
+	[k setThreadgroupMemoryLength:64 atIndex:0];
+	[k concurrentDispatchThreadgroups:MTLSizeMake(2, 3, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+	printf("  a dispatch of 2x3x1 threadgroups of 32x1x1, threadgroup memory 64 at 0:\n");
+	spi_compute(k);
+	[k setBarrier];
+	printf("  then setBarrier:\n");
+	spi_ask(k, "hasBarrier", 0);
+	id<MTLIndirectCommandBuffer> tb = icb(cdesc(MTLIndirectCommandTypeConcurrentDispatchThreads, NO, NO), 1);
+	if (tb) {
+		id<MTLIndirectComputeCommand> t = [tb indirectComputeCommandAtIndex:0];
+		[t setComputePipelineState:gAdd];
+		[t concurrentDispatchThreads:MTLSizeMake(60, 2, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+		printf("  a dispatch of 60x2x1 threads, 32x1x1 a threadgroup:\n");
+		spi_ask(t, "getCommandType", 0);
+		spi_ask(t, "dispatchThreadsArguments", 0);
+		spi_ask(t, "dispatchThreadgroupsArguments", 0);
+	}
+	[k reset];
+	printf("  after its reset:\n");
+	spi_compute(k);
+}
+
 static void case_timing(void)
 {
 	printf("timing:\n");
@@ -1988,6 +2188,8 @@ static int run_case(int argc, char **argv)
 		case_freed();
 	else if (!strcmp(argv[0], "resets"))
 		case_resets();
+	else if (!strcmp(argv[0], "spi"))
+		case_spi();
 	else
 		return 2;
 	return 0;
@@ -2053,7 +2255,7 @@ int main(int argc, char **argv)
 	const BOOL validate = getenv("ORACLE_VALIDATE") && *getenv("ORACLE_VALIDATE") == '1';
 	static const char *const all[] = {"info",   "types",   "limits", "descriptor", "setters",
 	                                  "render", "patches", "ranges", "reset",      "order",
-	                                  "compute", "gpu",    "residency", "timing", "freed",      "resets"};
+	                                  "compute", "gpu",    "residency", "timing", "freed",      "resets", "spi"};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 && strcmp(argv[2], all[i]))
 			continue;

@@ -29,10 +29,12 @@
 
 #import "RgfxBuffer.h"
 #import "RgfxCommandObjects.h"
+#import "RgfxFunction.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
 #import "RgfxResource.h"
 #import "RgfxSharedEvent.h"
+#import "RgfxUnsupported.h"
 
 #include "RgfxCompletionThread.hpp"
 #include "RgfxObjectModel.hpp"
@@ -60,6 +62,17 @@ int rgfxQueueTimings(int rounds);
 @implementation QueueTestHandle
 @end
 
+// A handle that answers its pixel format, as a fill from a color asks the texture's.
+@interface QueueTestFormatHandle : QueueTestHandle
+@end
+
+@implementation QueueTestFormatHandle
+- (MTLPixelFormat)pixelFormat
+{
+	return MTLPixelFormatBGRA8Unorm;
+}
+@end
+
 // The command-buffer SPI the guest's frameworks send (MTLCommandBufferSPI), as the AMD 5300M's and
 // the Intel 630's buffers answer it.
 @protocol QueueTestCommandBufferSPI
@@ -85,6 +98,8 @@ int rgfxQueueTimings(int rounds);
                                                capacity:(NSUInteger)capacity;
 - (void)configWithCommandBufferDescriptor:(MTLCommandBufferDescriptor *)descriptor;
 - (void)setResponsibleTaskIDs:(const int *)taskIDs count:(NSUInteger)count;
+- (void)useInternalResidencySet:(id)residencySet;
+- (void)useInternalResidencySets:(const id _Nonnull[_Nonnull])residencySets count:(NSUInteger)count;
 @end
 
 // The command-queue SPI members the queue answers (RgfxCommandQueue, MTLCommandQueueSPI).
@@ -132,6 +147,79 @@ int rgfxQueueTimings(int rounds);
 - (void)setDisableCrossQueueHazardTracking:(BOOL)value;
 - (void)setIsOpenGLQueue:(BOOL)value;
 - (void)setCompletionQueue:(dispatch_queue_t)queue;
+@end
+
+// The members of Metal's encoders' SPI the bundle's encoders answer (src/RgfxCommandObjects.mm).
+@protocol QueueTestEncoderSPI
+- (id)endEncodingAndRetrieveProgramAddressTable;
+- (void)insertSplit;
+@end
+@protocol QueueTestRenderEncoderSPI <QueueTestEncoderSPI>
+- (void)addSplitHandler:(void (^)(void))handler;
+- (void)setToolsDispatchBufferSPI:(NSUInteger)buffer
+                          atIndex:(NSUInteger)index
+                           stages:(NSUInteger)stages;
+- (void)setVertexAmplificationMode:(NSUInteger)mode value:(NSUInteger)value;
+@end
+@protocol QueueTestComputeEncoderSPI <QueueTestEncoderSPI>
+- (void)encodeStartIf:(id<MTLBuffer>)buffer
+                offset:(NSUInteger)offset
+            comparison:(MTLCompareFunction)comparison
+        referenceValue:(uint32_t)referenceValue;
+- (void)encodeStartElse;
+- (BOOL)encodeEndIf;
+- (void)encodeStartDoWhile;
+- (BOOL)encodeEndDoWhile:(id<MTLBuffer>)buffer
+                  offset:(NSUInteger)offset
+              comparison:(MTLCompareFunction)comparison
+          referenceValue:(uint32_t)referenceValue;
+- (void)setThreadgroupDistributionMode:(NSInteger)mode;
+- (void)setThreadgroupDistributionModeWithClusterGroupIndex:(uint32_t)index;
+- (void)setThreadgroupPackingDisabled:(BOOL)disabled;
+- (void)setToolsDispatchBufferSPI:(NSUInteger)buffer atIndex:(NSUInteger)index;
+- (id)newKernelDebugInfo;
+@end
+@protocol QueueTestBlitEncoderSPI <QueueTestEncoderSPI>
+- (void)invalidateCompressedTexture:(id<MTLTexture>)texture;
+- (void)invalidateCompressedTexture:(id<MTLTexture>)texture
+                              slice:(NSUInteger)slice
+                              level:(NSUInteger)level;
+- (void)optimizeContentsForTexture:(id<MTLTexture>)texture
+                 readAccessPattern:(NSInteger)readAccessPattern
+                      readAccessor:(NSInteger)readAccessor;
+- (void)optimizeContentsForTexture:(id<MTLTexture>)texture
+                 readAccessPattern:(NSInteger)readAccessPattern
+                      readAccessor:(NSInteger)readAccessor
+                             slice:(NSUInteger)slice
+                             level:(NSUInteger)level;
+- (void)fillBuffer:(id<MTLBuffer>)buffer range:(NSRange)range pattern4:(uint32_t)pattern;
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              bytes:(const void *)bytes
+             length:(NSUInteger)length;
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              color:(MTLClearColor)color;
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              color:(MTLClearColor)color
+        pixelFormat:(MTLPixelFormat)pixelFormat;
+@end
+@protocol QueueTestParallelEncoderSPI <QueueTestEncoderSPI>
+- (id)sampledRenderCommandEncoderWithProgramInfoBuffer:(void *)programInfoBuffer
+                                               capacity:(NSUInteger)capacity;
+- (BOOL)separateCommits;
+- (void)setSeparateCommits:(BOOL)separateCommits;
+@end
+// The function SPI member every x86 Mac's function ends the process at.
+@protocol QueueTestFunctionSPI
+- (id)functionHandle;
 @end
 
 namespace {
@@ -343,6 +431,163 @@ void test_encoder_keeps_its_buffer_until_it_ends()
 	CHECK(weakCB == nil);
 }
 
+// Whether `body` raises an unrecognized selector, as Metal's base encoders do for the SPI members
+// they leave to their subclasses.
+bool raisesUnrecognized(void (^body)(void))
+{
+	@try {
+		body();
+	} @catch (NSException *e) {
+		return [e.name isEqualToString:NSInvalidArgumentException] &&
+		       [e.reason containsString:@"unrecognized selector"];
+	}
+	return false;
+}
+
+// The encoders' SPI members (src/RgfxCommandObjects.mm): what Metal's base encoders raise an
+// unrecognized selector for, these raise; the ones that end an encoding end it, answering no
+// program address table, and so release the buffer, as endEncoding does; the conditionals and
+// loops the GPU would evaluate close as none was open; a split handler is never called; and a
+// parallel pass makes no sampling sub-encoder.
+void test_encoder_spi_members()
+{
+	Queue q;
+	auto ends = [&](id (^make)(id<MTLCommandBuffer>)) {
+		__weak id<MTLCommandBuffer> weakCB = nil;
+		id enc = nil;
+		@autoreleasepool {
+			id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+			weakCB = cb;
+			enc = make(cb);
+		}
+		CHECK(weakCB != nil);
+		id table = @"not asked";
+		@autoreleasepool {
+			table = [(id<QueueTestEncoderSPI>)enc endEncodingAndRetrieveProgramAddressTable];
+		}
+		CHECK(table == nil);
+		CHECK(weakCB == nil);
+	};
+	ends(^id(id<MTLCommandBuffer> cb) {
+		return [cb renderCommandEncoderWithDescriptor:pass()];
+	});
+	ends(^id(id<MTLCommandBuffer> cb) {
+		return [cb computeCommandEncoder];
+	});
+	ends(^id(id<MTLCommandBuffer> cb) {
+		return [cb blitCommandEncoder];
+	});
+	ends(^id(id<MTLCommandBuffer> cb) {
+		return [cb parallelRenderCommandEncoderWithDescriptor:pass()];
+	});
+
+	@autoreleasepool {
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		id<QueueTestRenderEncoderSPI> render =
+		    (id<QueueTestRenderEncoderSPI>)[cb renderCommandEncoderWithDescriptor:pass()];
+		__block bool called = false;
+		[render addSplitHandler:^{
+			called = true;
+		}];
+		CHECK(raisesUnrecognized(^{
+			[render insertSplit];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[render setToolsDispatchBufferSPI:0 atIndex:0 stages:1];
+		}));
+		[render setVertexAmplificationMode:1 value:2];
+		[(id<MTLRenderCommandEncoder>)render endEncoding];
+		CHECK(!called);
+
+		id<QueueTestComputeEncoderSPI> compute =
+		    (id<QueueTestComputeEncoderSPI>)[cb computeCommandEncoder];
+		[compute encodeStartIf:handle(7) offset:0 comparison:MTLCompareFunctionEqual referenceValue:1];
+		[compute encodeStartElse];
+		CHECK(![compute encodeEndIf]);
+		[compute encodeStartDoWhile];
+		CHECK(![compute encodeEndDoWhile:handle(7)
+		                          offset:0
+		                      comparison:MTLCompareFunctionEqual
+		                  referenceValue:1]);
+		[compute setThreadgroupDistributionMode:1];
+		[compute setThreadgroupDistributionModeWithClusterGroupIndex:2];
+		CHECK(raisesUnrecognized(^{
+			[compute setThreadgroupPackingDisabled:YES];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[compute setToolsDispatchBufferSPI:0 atIndex:0];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[compute insertSplit];
+		}));
+		CHECK([compute newKernelDebugInfo] == nil);
+		[(id<MTLComputeCommandEncoder>)compute endEncoding];
+
+		id<QueueTestBlitEncoderSPI> blit = (id<QueueTestBlitEncoderSPI>)[cb blitCommandEncoder];
+		id<MTLTexture> texture = (id<MTLTexture>)handle(42);
+		CHECK(raisesUnrecognized(^{
+			[blit invalidateCompressedTexture:texture];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit invalidateCompressedTexture:texture slice:0 level:0];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit optimizeContentsForTexture:texture readAccessPattern:0 readAccessor:0];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit optimizeContentsForTexture:texture readAccessPattern:0 readAccessor:0 slice:0 level:0];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit insertSplit];
+		}));
+		// Each fill raises, those from a color at the fill from bytes they come to.
+		const MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
+		const uint32_t word = 0;
+		CHECK(raisesUnrecognized(^{
+			[blit fillBuffer:(id<MTLBuffer>)handle(43) range:NSMakeRange(0, 4) pattern4:7];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit fillTexture:texture level:0 slice:0 region:region bytes:&word length:4];
+		}));
+		id<MTLTexture> formatted = (id<MTLTexture>)[[QueueTestFormatHandle alloc] initWithObjId:44
+		                                                                                 device:nil
+		                                                                             serializer:nullptr];
+		for (int withFormat = 0; withFormat < 2; withFormat++) {
+			NSString *reason = nil;
+			@try {
+				if (withFormat)
+					[blit fillTexture:formatted
+					            level:0
+					            slice:0
+					           region:region
+					            color:MTLClearColorMake(1, 0, 0, 1)
+					      pixelFormat:MTLPixelFormatBGRA8Unorm];
+				else
+					[blit fillTexture:formatted
+					            level:0
+					            slice:0
+					           region:region
+					            color:MTLClearColorMake(1, 0, 0, 1)];
+			} @catch (NSException *e) {
+				reason = e.reason;
+			}
+			CHECK([reason containsString:@"fillTexture:level:slice:region:bytes:length:"]);
+		}
+		[(id<MTLBlitCommandEncoder>)blit endEncoding];
+
+		id<QueueTestParallelEncoderSPI> parallel =
+		    (id<QueueTestParallelEncoderSPI>)[cb parallelRenderCommandEncoderWithDescriptor:pass()];
+		CHECK([parallel sampledRenderCommandEncoderWithProgramInfoBuffer:nullptr capacity:0] == nil);
+		CHECK(![parallel separateCommits]);
+		[parallel setSeparateCommits:YES];
+		CHECK(![parallel separateCommits]);
+		CHECK(raisesUnrecognized(^{
+			[parallel insertSplit];
+		}));
+		[(id<MTLParallelRenderCommandEncoder>)parallel endEncoding];
+	}
+}
+
 // Runs the case `name` of rgfxQueueDiesCase in a process of its own: it must end the process
 // (SIGABRT) with `words` on stderr.
 void checkDies(const char *name, const char *words)
@@ -408,6 +653,9 @@ void test_handlers_after_commit_end_the_process()
 	checkDies("scheduled-after-commit", scheduled);
 	checkDies("scheduled-after-completion", scheduled);
 	checkDies("present-after-commit", scheduled);
+	// A function's functionHandle, as Metal's base function's on every x86 Mac.
+	checkDies("function-handle",
+	          "-[_MTLFunction functionHandle]: failed assertion `Driver needs to override this'");
 
 	// Added before the commit, each runs once, in the order added.
 	Queue q(true);
@@ -1397,6 +1645,12 @@ int rgfxQueueDiesCase(const char *name)
 {
 	signal(SIGABRT, [](int) { _exit(kAborted); });
 	@autoreleasepool {
+		if (std::strcmp(name, "function-handle") == 0) {
+			// It ends the process before anything of the function is read.
+			id function = [RgfxFunction alloc];
+			[(id<QueueTestFunctionSPI>)function functionHandle];
+			return 0;
+		}
 		Queue q(true);
 		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
 		if (std::strcmp(name, "enqueue-twice") == 0) {
@@ -1693,6 +1947,12 @@ void test_command_buffer_spi_state()
 		[spi configWithCommandBufferDescriptor:[MTLCommandBufferDescriptor new]];
 		const int tasks[] = {1, 2};
 		[spi setResponsibleTaskIDs:tasks count:2];
+		// Metal's own residency sets are used as the caller's: none, and nothing logged.
+		[spi useInternalResidencySet:nil];
+		id noSets[1] = {nil};
+		[spi useInternalResidencySets:noSets count:0];
+		CHECK(!RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(useResidencySet:)) &&
+		      !RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(useResidencySets:count:)));
 		[spi setProfilingEnabled:YES];
 		CHECK(spi.isProfilingEnabled);
 		[cb commit];
@@ -1853,6 +2113,7 @@ void rgfxQueueTests(const char *self)
 {
 	g_self = self;
 	test_encoder_keeps_its_buffer_until_it_ends();
+	test_encoder_spi_members();
 	test_handlers_after_commit_end_the_process();
 	test_handlers_of_queues_wait_for_each_other();
 	test_handlers_run_on_the_completion_queue();

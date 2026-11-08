@@ -3226,6 +3226,21 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	return nil;
 }
 
+// A residency set of Metal's own: Metal's base buffer uses it as one of the caller's
+// (useResidencySet:, useResidencySets:count:; read from code, _MTLCommandBuffer, macOS 27.0.1),
+// which both x86 Macs' buffers answer (measured with respondsToSelector:, macOS 26.7.1,
+// tools/oracle/oracle_spi_members.m ask), and so does this.
+- (void)useInternalResidencySet:(id<MTLResidencySet>)residencySet
+{
+	[self useResidencySet:residencySet];
+}
+
+- (void)useInternalResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
+                           count:(NSUInteger)count
+{
+	[self useResidencySets:residencySets count:count];
+}
+
 @end
 
 // =============================================================================
@@ -4670,6 +4685,132 @@ RGFX_LOG_UNRECOGNIZED
 		RGFX_UNSUPPORTED("function pointers");
 }
 
+// --- MTLRenderCommandEncoderSPI -----------------------------------------------------------
+// The members of Metal's render-encoder SPI that the AMD 5300M's and the Intel 630's encoders both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// The object and mesh stages' acceleration structures and function tables, as the vertex,
+// fragment and tile stages' (above): none bound is nothing to carry out.
+- (void)setObjectAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
+                         atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (accelerationStructure != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setObjectIntersectionFunctionTable:
+            (nullable id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                             atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (intersectionFunctionTable != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setObjectIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                            withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setObjectVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)functionTable
+                        atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (functionTable != nil)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setObjectVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])functionTables
+                       withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setMeshAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
+                       atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (accelerationStructure != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setMeshIntersectionFunctionTable:
+            (nullable id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                           atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (intersectionFunctionTable != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setMeshIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                          withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setMeshVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)functionTable
+                      atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (functionTable != nil)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setMeshVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])functionTables
+                     withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("function pointers");
+}
+
+// The depth clip mode, as setDepthClipMode: sets it: Metal's IOAccel encoder sends itself that
+// (read from code, MTLIOAccelRenderCommandEncoder, macOS 27.0.1).
+- (void)setDepthClipModeSPI:(MTLDepthClipMode)depthClipMode
+{
+	[self setDepthClipMode:depthClipMode];
+}
+
+// NO, as Metal's IOAccel encoder answers (read from code, MTLIOAccelRenderCommandEncoder, macOS
+// 27.0.1).
+- (BOOL)isMemorylessRender
+{
+	return NO;
+}
+
+// Ends the encoding and answers no program address table, as Metal's base encoder does (read
+// from code, _MTLCommandEncoder, macOS 27.0.1).
+- (nullable id)endEncodingAndRetrieveProgramAddressTable
+{
+	[self endEncoding];
+	return nil;
+}
+
+// Metal's base encoder raises an unrecognized selector for these (it sends itself
+// doesNotRecognizeSelector:; read from code, _MTLCommandEncoder and MTLIOAccelRenderCommandEncoder,
+// macOS 27.0.1), and so does this.
+- (void)setToolsDispatchBufferSPI:(NSUInteger)buffer
+                          atIndex:(NSUInteger)index
+                           stages:(NSUInteger)stages
+{
+	(void)buffer;
+	(void)index;
+	(void)stages;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)insertSplit
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+// A mode of vertex amplification beyond setVertexAmplificationCount:viewMappings:'s: none on the
+// wire, so it is refused, and the draws amplify as that set them.
+- (void)setVertexAmplificationMode:(NSUInteger)mode value:(NSUInteger)value
+{
+	(void)mode;
+	(void)value;
+	RGFX_UNSUPPORTED("a vertex amplification mode");
+}
+
+// A handler to call where the encoder's pass is split into several on the GPU: the device sends
+// the pass to the host whole, so it reports no split and never calls one.
+- (void)addSplitHandler:(void (^)(void))handler
+{
+	(void)handler;
+}
+
 // --- what QuartzCore, SkyLight and MPS send a render encoder beyond its protocol -----
 
 // A fragment texture and its sampler, set together.
@@ -5172,11 +5313,108 @@ RGFX_LOG_UNRECOGNIZED
 	return NO;
 }
 
+// --- MTLComputeCommandEncoderSPI ----------------------------------------------------------
+// The members of Metal's compute-encoder SPI that the AMD 5300M's and the Intel 630's encoders
+// both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// A conditional the GPU evaluates on a value in `buffer`, and a loop that runs again while one
+// compares true: none on the wire, so they are refused, as encodeStartWhile: is; the work of both
+// branches runs, and a loop's once.
+- (void)encodeStartIf:(id<MTLBuffer>)buffer
+                offset:(NSUInteger)offset
+            comparison:(MTLCompareFunction)comparison
+        referenceValue:(uint32_t)referenceValue
+{
+	(void)buffer;
+	(void)offset;
+	(void)comparison;
+	(void)referenceValue;
+	RGFX_UNSUPPORTED("GPU-side conditionals (none on the wire)");
+}
+- (void)encodeStartElse
+{
+	RGFX_UNSUPPORTED("GPU-side conditionals (none on the wire)");
+}
+- (void)encodeStartDoWhile
+{
+	RGFX_UNSUPPORTED("GPU-side loops (none on the wire)");
+}
+- (BOOL)encodeEndDoWhile:(id<MTLBuffer>)buffer
+                  offset:(NSUInteger)offset
+              comparison:(MTLCompareFunction)comparison
+          referenceValue:(uint32_t)referenceValue
+{
+	(void)buffer;
+	(void)offset;
+	(void)comparison;
+	(void)referenceValue;
+	RGFX_UNSUPPORTED("GPU-side loops (none on the wire)");
+	return NO;
+}
+// NO, as for encodeEndWhile: no conditional is ever open here.
+- (BOOL)encodeEndIf
+{
+	return NO;
+}
+
+// How the GPU spreads a dispatch's threadgroups over its cores: Metal's base encoder does
+// nothing with either (read from code, _MTLCommandEncoder, macOS 27.0.1), and nor does this; the
+// host's GPU spreads them.
+- (void)setThreadgroupDistributionMode:(NSInteger)mode
+{
+	(void)mode;
+}
+- (void)setThreadgroupDistributionModeWithClusterGroupIndex:(uint32_t)index
+{
+	(void)index;
+}
+
+// Metal's base encoder raises an unrecognized selector for these (it sends itself
+// doesNotRecognizeSelector:; read from code, _MTLCommandEncoder and MTLIOAccelComputeCommandEncoder,
+// macOS 27.0.1), and so does this.
+- (void)setThreadgroupPackingDisabled:(BOOL)disabled
+{
+	(void)disabled;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)setToolsDispatchBufferSPI:(NSUInteger)buffer atIndex:(NSUInteger)index
+{
+	(void)buffer;
+	(void)index;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)insertSplit
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+// The debug info of the encoder's kernels: the device keeps none, so it answers nil.
+- (nullable id)newKernelDebugInfo
+{
+	RGFX_UNSUPPORTED("a shader's debug info");
+	return nil;
+}
+
+// Ends the encoding and answers no program address table, as Metal's base encoder does (read
+// from code, _MTLCommandEncoder, macOS 27.0.1).
+- (nullable id)endEncodingAndRetrieveProgramAddressTable
+{
+	[self endEncoding];
+	return nil;
+}
+
 @end
 
 // =============================================================================
 // RgfxBlitCommandEncoder
 // =============================================================================
+
+// Metal's tensor slice (MTLBlitCommandEncoderSPI's copyFromTensor:sourceSlice:toTensor:
+// destinationSlice:), which the device never reads: two objects, by its type encoding.
+struct RgfxTensorSlice {
+	__unsafe_unretained id field_00;
+	__unsafe_unretained id field_08;
+};
 
 @implementation RgfxBlitCommandEncoder {
 	RgfxEncoder *_enc;
@@ -5518,6 +5756,126 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	rgfxWaitForEarlierEncoders(_barrier, [&](RgfxObjId fence) { _enc->blitWaitForFence(fence); });
 }
 
+// --- MTLBlitCommandEncoderSPI -------------------------------------------------------------
+// The members of Metal's blit-encoder SPI that the AMD 5300M's and the Intel 630's encoders both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// A copy between slices of tensors: the device makes no tensor, as for the copies above.
+- (void)copyFromTensor:(id)sourceTensor
+           sourceSlice:(RgfxTensorSlice)sourceSlice
+              toTensor:(id)destinationTensor
+      destinationSlice:(RgfxTensorSlice)destinationSlice
+{
+	(void)sourceTensor;
+	(void)sourceSlice;
+	(void)destinationTensor;
+	(void)destinationSlice;
+	RGFX_UNSUPPORTED("tensors");
+}
+
+// Metal's base encoder raises an unrecognized selector for these (it sends itself
+// doesNotRecognizeSelector:; read from code, _MTLCommandEncoder, macOS 27.0.1), and so does this.
+- (void)invalidateCompressedTexture:(id<MTLTexture>)texture
+{
+	(void)texture;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)invalidateCompressedTexture:(id<MTLTexture>)texture
+                              slice:(NSUInteger)slice
+                              level:(NSUInteger)level
+{
+	(void)texture;
+	(void)slice;
+	(void)level;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)optimizeContentsForTexture:(id<MTLTexture>)texture
+                 readAccessPattern:(NSInteger)readAccessPattern
+                      readAccessor:(NSInteger)readAccessor
+{
+	(void)texture;
+	(void)readAccessPattern;
+	(void)readAccessor;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)optimizeContentsForTexture:(id<MTLTexture>)texture
+                 readAccessPattern:(NSInteger)readAccessPattern
+                      readAccessor:(NSInteger)readAccessor
+                             slice:(NSUInteger)slice
+                             level:(NSUInteger)level
+{
+	(void)texture;
+	(void)readAccessPattern;
+	(void)readAccessor;
+	(void)slice;
+	(void)level;
+	[self doesNotRecognizeSelector:_cmd];
+}
+// The fills of Metal's IOAccel blit encoder, which both x86 Macs' encoders are (read from code,
+// MTLIOAccelBlitCommandEncoder, macOS 27.0.1): a buffer's and a texture's from bytes raise an
+// unrecognized selector (it sends itself doesNotRecognizeSelector:), and a texture's from a color
+// fills it from the color packed in the texture's own format, or in `pixelFormat`, which then
+// raises. So do these; the bytes passed on are never read.
+- (void)fillBuffer:(id<MTLBuffer>)buffer range:(NSRange)range pattern4:(uint32_t)pattern
+{
+	(void)buffer;
+	(void)range;
+	(void)pattern;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              bytes:(const void *)bytes
+             length:(NSUInteger)length
+{
+	(void)texture;
+	(void)level;
+	(void)slice;
+	(void)region;
+	(void)bytes;
+	(void)length;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              color:(MTLClearColor)color
+{
+	[self fillTexture:texture
+	            level:level
+	            slice:slice
+	           region:region
+	            color:color
+	      pixelFormat:texture.pixelFormat];
+}
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              color:(MTLClearColor)color
+        pixelFormat:(MTLPixelFormat)pixelFormat
+{
+	(void)color;
+	(void)pixelFormat;
+	const uint8_t packed[16] = {};
+	[self fillTexture:texture level:level slice:slice region:region bytes:packed length:sizeof packed];
+}
+- (void)insertSplit
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+// Ends the encoding and answers no program address table, as Metal's base encoder does (read
+// from code, _MTLCommandEncoder, macOS 27.0.1).
+- (nullable id)endEncodingAndRetrieveProgramAddressTable
+{
+	[self endEncoding];
+	return nil;
+}
+
 @end
 
 // =============================================================================
@@ -5716,6 +6074,50 @@ RGFX_LOG_UNRECOGNIZED
 	rgfxWaitForEarlierEncoders(_barrier, [&](RgfxObjId fence) {
 		_enc->renderWaitForFence(fence, kRgfxBarrierRenderStages);
 	});
+}
+
+// --- MTLParallelRenderCommandEncoderSPI ---------------------------------------------------
+// The members of Metal's parallel-encoder SPI that the AMD 5300M's and the Intel 630's encoders
+// both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// A sub-encoder that samples the GPU's counters into `programInfoBuffer`: Metal's base parallel
+// encoder asks its command buffer's sampledRenderCommandEncoderWithDescriptor:programInfoBuffer:
+// capacity: for it (read from code, _MTLParallelRenderCommandEncoder, macOS 27.0.1), which
+// answers nil on the device, which samples no counters; so does this.
+- (nullable id)sampledRenderCommandEncoderWithProgramInfoBuffer:(void *)programInfoBuffer
+                                                        capacity:(NSUInteger)capacity
+{
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+// Whether each sub-encoder's work is committed on its own: NO, and a set does nothing, as Metal's
+// IOAccel parallel encoder answers (read from code, MTLIOAccelParallelRenderCommandEncoder, macOS
+// 27.0.1). The sub-encoders' work goes to the host in the command buffer's.
+- (BOOL)separateCommits
+{
+	return NO;
+}
+- (void)setSeparateCommits:(BOOL)separateCommits
+{
+	(void)separateCommits;
+}
+
+// Metal's base parallel encoder raises an unrecognized selector for this (it sends itself
+// doesNotRecognizeSelector:; read from code, _MTLParallelRenderCommandEncoder, macOS 27.0.1), and
+// so does this.
+- (void)insertSplit
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+// Ends the encoding and answers no program address table, as Metal's base parallel encoder does
+// (read from code, _MTLParallelRenderCommandEncoder, macOS 27.0.1).
+- (nullable id)endEncodingAndRetrieveProgramAddressTable
+{
+	[self endEncoding];
+	return nil;
 }
 
 @end
