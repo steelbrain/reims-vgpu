@@ -65,8 +65,8 @@
 //! surface's. One the compositor reports out of date or suboptimal is made again at the next
 //! draw. Making a new one waits for the old one's frames to complete, then passes the old one as
 //! `oldSwapchain` and retires it (below). A swapchain the surface refuses for now (it has no
-//! pixels, as a minimized window's may) is tried again at the next draw; only a lost surface
-//! ends the swapchain's draws ([`Acquired::Failed`]).
+//! pixels, as a minimized window's may) is tried again at the next draw; only a lost surface, or
+//! the device's recovery (below), ends the swapchain's draws ([`Acquired::Failed`]).
 //!
 //! **Retiring one, with no wait on the queue.** A retired swapchain, its images' textures and
 //! their semaphores are destroyed once nothing uses them: its frames' command buffers have
@@ -106,6 +106,18 @@
 //! the loader's terminator, which finds the device by that word: it is called with the word put
 //! back too (`rt::Device::with_loader_word`).
 //!
+//! **Across the device's recoveries.** The swapchain's objects (the swapchain itself, its
+//! images' semaphores, its fences, the commands looked up) are of the generation of the device
+//! they were made on (`crate::generation`), and the runtime's textures over its images are too.
+//! Once the runtime has made its `VkDevice` again, the next take ends the swapchain's draws
+//! ([`Acquired::Failed`]): the window's render thread lets it go, which destroys its objects on
+//! the old `VkDevice`, and makes a new one, on the new `VkDevice`, at its next draw. A frame
+//! encoded on the new `VkDevice` signals no semaphore of the old one, and a present whose queue a
+//! recovery moved presents nothing. Before the new `VkDevice` serves, the runtime's recovery has
+//! waited for each of the old one's queues to idle, each under its lock, so a present made there
+//! is taken as complete as after any wait for the queue to idle (metal2vulkan's `device/line.rs`,
+//! read from its code).
+//!
 //! **What the runtime announces.** Each batch that uses an image moves it from
 //! `PRESENT_SRC_KHR`, its layout between batches, into `GENERAL` and back: two whole-image
 //! barriers per frame, which the runtime announces once as a degradation of its own.
@@ -118,6 +130,7 @@ use std::time::Duration;
 use crate::core::platform::Handle as _;
 use crate::core::platform::os::Clock as _;
 use crate::core::sync::{Mutex, MutexGuard};
+use crate::generation::Generation;
 use ash::{khr, vk};
 use metal2vulkan::metal::{PixelFormat, TextureUsage};
 use metal2vulkan_runtime as rt;
@@ -313,7 +326,8 @@ pub enum Acquired {
     /// No image yet: the compositor has not given one back in time, or the swapchain was made
     /// again. The draw is tried again.
     Retry,
-    /// No image, nor will there be: the surface is lost, or the device.
+    /// No image, nor will there be: the surface is lost, or the device, or the device recovered
+    /// on a new `VkDevice` (the module doc).
     Failed,
 }
 
@@ -450,6 +464,9 @@ impl Presents {
 pub struct Swapchain {
     /// The presenting queue, whose `VkQueue` presents (the module doc).
     present: rt::CommandQueue,
+    /// The generation of the device the swapchain's objects are made on, with the presenting
+    /// queue's `VkQueue` there (the module doc, "Across the device's recoveries").
+    generation: Generation,
     /// The queue's device, whose textures the images are.
     device: VulkanDevice,
     /// The runtime's logical device.
@@ -614,38 +631,50 @@ impl Swapchain {
         surface: vk::SurfaceKHR,
     ) -> Result<Swapchain, Refused> {
         let device = queue.device.clone_ref();
-        // SAFETY: the handles are the runtime's, used only while `device` lives, which the
-        // swapchain holds; nothing here destroys them.
-        let raw = unsafe { device.raw.raw() };
-        let surface_api = khr::surface::Instance::new(raw.entry, raw.instance);
-        let (vk, physical) = (raw.device.clone(), raw.physical_device);
-        let families = raw.queue_families.to_vec();
-        let Some(swapchain_api) = SwapchainFns::load(&device.raw) else {
+        let surface_api = {
+            // SAFETY: the instance's commands, of the instance every generation of the device
+            // shares, used only while `device` lives, which the swapchain holds; nothing here
+            // destroys them.
+            let raw = unsafe { device.raw.raw() };
+            khr::surface::Instance::new(raw.entry, raw.instance)
+        };
+        let unmade = |reason: Refused| {
             let _wsi = WSI.lock();
             // SAFETY: the surface is this call's, and nothing was made of it.
             unsafe { surface_api.destroy_surface(surface, None) };
-            return Err(Refused(
-                "the device has no swapchain commands (no VK_KHR_swapchain)".to_owned(),
-            ));
+            reason
         };
-        let drawables = crate::os::Drawables::load(&device.raw);
         let present = match device.raw.new_command_queue_for_presenting() {
             Ok(present) => present,
-            Err(e) => {
-                let _wsi = WSI.lock();
-                // SAFETY: the surface is this call's, and nothing was made of it.
-                unsafe { surface_api.destroy_surface(surface, None) };
-                return Err(Refused(format!("no presenting queue: {e}")));
-            }
+            Err(e) => return Err(unmade(Refused(format!("no presenting queue: {e}")))),
         };
+        let generation = match Generation::serving(&present) {
+            Ok(generation) => generation,
+            Err(e) => return Err(unmade(Refused(format!("no presenting queue: {e}")))),
+        };
+        let (vk, physical, families) = {
+            // SAFETY: the handles are the generation's, used only while it lives, which the
+            // swapchain holds; nothing here destroys them.
+            let raw = unsafe { generation.raw() };
+            (
+                raw.device.clone(),
+                raw.physical_device,
+                raw.queue_families.to_vec(),
+            )
+        };
+        let Some(swapchain_api) = SwapchainFns::load(generation.device()) else {
+            return Err(unmade(Refused(
+                "the device has no swapchain commands (no VK_KHR_swapchain)".to_owned(),
+            )));
+        };
+        let drawables = crate::os::Drawables::load(generation.device());
         let wsi = WSI.lock();
         let destroy = |reason: Refused| {
             // SAFETY: the surface is this call's, and nothing was made of it.
             unsafe { surface_api.destroy_surface(surface, None) };
             reason
         };
-        // SAFETY: the closure only reads the family; it submits nothing.
-        let family = unsafe { present.with_vk_queue(|_, family| family) };
+        let family = generation.family();
         // SAFETY: `surface` and `physical` are live, of one instance.
         let presents =
             unsafe { surface_api.get_physical_device_surface_support(physical, family, surface) }
@@ -679,6 +708,7 @@ impl Swapchain {
             crate::os::present_fences(crate::platform::device_options()).then(Fences::default);
         Ok(Swapchain {
             present,
+            generation,
             device,
             vk,
             physical,
@@ -752,6 +782,13 @@ impl Swapchain {
     pub fn acquire(&mut self, size: (u64, u64)) -> Acquired {
         if size.0 == 0 || size.1 == 0 {
             return Acquired::Retry;
+        }
+        if !self.generation.serves(&self.present) {
+            log::warn!(
+                target: "reims_vgpu_vulkan::swapchain",
+                "the device recovered: the window's swapchain is made again on its new VkDevice"
+            );
+            return Acquired::Failed;
         }
         let current = self.chain.as_ref().map(|c| c.size);
         if self.stale || current != Some(size) {
@@ -890,10 +927,15 @@ impl Swapchain {
 
     /// Encodes in `command_buffer` the signal of `frame`'s semaphore, after what it encoded:
     /// false where the runtime refuses it.
+    /// False too where the command buffer is of another generation of the device than the
+    /// swapchain's (the module doc, "Across the device's recoveries").
     pub fn encode_ready(&self, frame: Frame, command_buffer: &VulkanCommandBuffer) -> bool {
         let Some(image) = self.image(frame) else {
             return false;
         };
+        if !self.generation.is_of(command_buffer.raw.device()) {
+            return false;
+        }
         // SAFETY: the semaphore is a binary semaphore of the command buffer's device, which
         // lives until the swapchain's end, after every frame's completion; its present consumes
         // the signal.
@@ -950,15 +992,25 @@ impl Swapchain {
         let api = &self.swapchain_api;
         let wsi = WSI.lock();
         // SAFETY: the present is the only submission inside, on the presenting queue's own
-        // `VkQueue`; the image was taken from this swapchain and its semaphore's signal is
-        // submitted. A fence is chained only where the device enabled `swapchainMaintenance1`
-        // ([`crate::os::present_fences`]), and is unsignalled with nothing pending on it.
+        // `VkQueue`, of the swapchain's generation; the image was taken from this swapchain and
+        // its semaphore's signal is submitted. A fence is chained only where the device enabled
+        // `swapchainMaintenance1` ([`crate::os::present_fences`]), and is unsignalled with nothing
+        // pending on it.
         let presented = unsafe {
-            self.present
-                .with_vk_queue(|q, _| api.queue_present(q, &info))
+            self.generation
+                .with_queue(&self.present, |q| api.queue_present(q, &info))
         };
         drop(wsi);
         image.last = Some(command_buffer);
+        let Some(presented) = presented else {
+            // A recovery moved the queue: nothing was presented, and the next take ends the
+            // swapchain's draws (the module doc, "Across the device's recoveries").
+            if let (Some(fences), Some(fence)) = (self.fences.as_mut(), fence) {
+                fences.free.push(fence);
+            }
+            self.stale = true;
+            return;
+        };
         // Numbered whatever the compositor answers: a present it rejects still waits on its
         // semaphore (the module doc).
         image.presented = self.presents.make();
@@ -1069,12 +1121,15 @@ impl Swapchain {
             target: "reims_vgpu_vulkan::swapchain",
             "waiting for the presenting queue to idle: {why}"
         );
-        // SAFETY: the wait submits nothing; the queue is the swapchain's presenting queue.
+        // SAFETY: the wait submits nothing; the queue is the swapchain's presenting queue, the
+        // one the generation was taken with.
         let idle = unsafe {
-            self.present
-                .with_vk_queue(|q, _| self.vk.queue_wait_idle(q))
+            self.generation
+                .with_queue(&self.present, |q| self.vk.queue_wait_idle(q))
         };
-        if let Err(e) = idle {
+        // `None`: a recovery moved the queue, after it waited for the old one to idle (the
+        // module doc, "Across the device's recoveries").
+        if let Some(Err(e)) = idle {
             log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkQueueWaitIdle: {e}");
         }
         self.presents.idle();
@@ -1268,9 +1323,12 @@ impl Swapchain {
             // in UNDEFINED until its first frame, and it outlives the texture, which is dropped
             // before the swapchain is destroyed ([`Swapchain::destroy`]).
             let texture = match unsafe {
-                self.device
-                    .raw
-                    .new_texture_with_vk_image(&descriptor, raw, &info, layouts)
+                (self.generation.device()).new_texture_with_vk_image(
+                    &descriptor,
+                    raw,
+                    &info,
+                    layouts,
+                )
             } {
                 Ok(texture) => texture,
                 Err(e) => {
@@ -1280,6 +1338,15 @@ impl Swapchain {
                     ));
                 }
             };
+            // A recovery as the texture was made puts it on the new `VkDevice`, over an image of
+            // the old one.
+            if !self.generation.is_of(texture.device()) {
+                drop(texture);
+                return Err(undo(
+                    images,
+                    Refused("the device recovered as the swapchain was made".to_owned()),
+                ));
+            }
             // SAFETY: a valid create info, on the runtime's live device.
             let ready = match unsafe {
                 self.vk

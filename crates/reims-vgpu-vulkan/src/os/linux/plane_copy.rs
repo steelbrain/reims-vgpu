@@ -28,6 +28,11 @@
 //! - **Refusals** ([`CopyError::Refused`]) are made before anything is submitted, so the caller
 //!   lands the planes another way; a failure once submitted ([`CopyError::Failed`]) is not, since
 //!   the GPU may still write the buffer.
+//! - **Across the device's recoveries.** The copier's objects and imports are of the generation
+//!   of the device they were made on (`crate::generation`). Where the runtime has made its
+//!   `VkDevice` again since, a copy first destroys them on the old one and makes them on the new
+//!   one. A buffer made before the recovery is refused, and so is a copy whose queue a recovery
+//!   moved as it was submitted, with nothing submitted.
 //!
 //! **Measured** with a libva and Vulkan program written from scratch (2026-11-08), surfaces filled
 //! by `vaPutImage`, each plane copied into a buffer at 0x20 with rows of the frame's bytes, every
@@ -46,6 +51,7 @@ use ash::vk;
 use metal2vulkan_runtime as rt;
 
 use crate::core::platform::Handle as _;
+use crate::generation::Generation;
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::resource::VulkanBuffer;
 
@@ -167,9 +173,19 @@ struct Pending {
 
 /// The copies of one caller, a decode session's (module docs).
 pub struct PlaneCopier {
-    device: rt::Device,
     queue: rt::CommandQueue,
-    family: u32,
+    /// The objects, on the generation of the device they were made on; `None` where their making
+    /// after a recovery was refused, until a later copy makes them.
+    objects: Option<Objects>,
+    /// The generations the copier made its objects on: one more at each making after the first.
+    generations: u64,
+}
+
+/// A copier's objects on one generation of the runtime's device (`crate::generation`), made with
+/// its handles and destroyed with them, at the copier's end or once a recovery moved the device
+/// to a new `VkDevice`.
+struct Objects {
+    generation: Generation,
     memory_fd: ash::khr::external_memory_fd::Device,
     pool: vk::CommandPool,
     buffer: vk::CommandBuffer,
@@ -188,44 +204,100 @@ impl PlaneCopier {
     /// A copier on `device`'s runtime device, with a queue of its own; `Err` with why where the
     /// device imports no dma-buf as an image or refuses the copier's objects.
     pub fn new(device: &VulkanDevice) -> Result<PlaneCopier, String> {
-        let device = device.raw.clone();
-        let queue = (device.new_command_queue()).map_err(|e| format!("no queue ({e:?})"))?;
-        // SAFETY: the closure keeps no handle and calls nothing.
-        let family = unsafe { queue.with_vk_queue(|_, family| family) };
-        // SAFETY: the handles are used while `device`, which the copier holds, lives; the objects
-        // made of them are the copier's own, destroyed at its end.
-        let handles = unsafe { device.raw() };
-        let (vk_device, instance) = (handles.device, handles.instance);
-        // SAFETY: the physical device is the device's own.
-        let (families, extensions) = unsafe {
-            (
-                instance.get_physical_device_queue_family_properties(handles.physical_device),
-                instance.enumerate_device_extension_properties(handles.physical_device),
-            )
-        };
-        let listed = |name: &std::ffi::CStr| {
-            (extensions.iter().flatten()).any(|e| e.extension_name_as_c_str() == Ok(name))
-        };
-        let needed = [
-            ash::khr::external_memory_fd::NAME,
-            ash::ext::external_memory_dma_buf::NAME,
-            ash::ext::image_drm_format_modifier::NAME,
-            ash::ext::queue_family_foreign::NAME,
-        ];
-        if let Some(missing) = needed.iter().find(|name| !listed(name)) {
-            return Err(format!("the device lists no {}", missing.to_string_lossy()));
-        }
-        let family_props = usize::try_from(family).ok().and_then(|at| families.get(at));
-        let timestamped = family_props.is_some_and(|f| f.timestamp_valid_bits > 0);
-        // SAFETY: the physical device is the device's own.
-        let period = unsafe { instance.get_physical_device_properties(handles.physical_device) }
-            .limits
-            .timestamp_period;
-        let memory_fd = ash::khr::external_memory_fd::Device::new(instance, vk_device);
-        let mut copier = PlaneCopier {
-            device: device.clone(),
+        let queue = (device.raw.new_command_queue()).map_err(|e| format!("no queue ({e:?})"))?;
+        let objects = Objects::new(&queue)?;
+        Ok(PlaneCopier {
             queue,
-            family,
+            objects: Some(objects),
+            generations: 1,
+        })
+    }
+
+    /// Copies each of `copies` (module docs) and waits up to `wait` for the GPU: `Ok` with the
+    /// copies' GPU time where the queue measures it, once every plane is in its buffer. Past the
+    /// wait the copy is kept with `hold`, which keeps the sources unwritten, until its fence
+    /// signals ([`CopyError::Failed`]). Where the device recovered since the copier's objects
+    /// were made, they are destroyed and made again on its new `VkDevice` first.
+    pub fn copy(
+        &mut self,
+        copies: &[PlaneCopy<'_>],
+        wait: Duration,
+        hold: Box<dyn Any + Send>,
+    ) -> Result<Option<Duration>, CopyError> {
+        if rt::process_exiting() {
+            return Err(CopyError::Refused("the process is exiting".to_owned()));
+        }
+        let serves = (self.objects.as_ref()).is_some_and(|o| o.generation.serves(&self.queue));
+        if !serves {
+            // The old objects go first, on the `VkDevice` they were made on.
+            self.objects = None;
+            let objects = Objects::new(&self.queue).map_err(|why| {
+                CopyError::Refused(format!("its objects after the device's recovery: {why}"))
+            })?;
+            self.generations += 1;
+            log::info!(
+                "a plane copier's objects were made again on the device's new VkDevice, after \
+                 its recovery ({} generations)",
+                self.generations
+            );
+            self.objects = Some(objects);
+        }
+        let Some(objects) = self.objects.as_mut() else {
+            return Err(CopyError::Refused("the copier has no objects".to_owned()));
+        };
+        objects.copy(&self.queue, copies, wait, hold)
+    }
+
+    /// The generations of the device the copier made its objects on: 1, and one more each time
+    /// a recovery moved the device to a new `VkDevice` before a copy.
+    pub fn generations(&self) -> u64 {
+        self.generations
+    }
+}
+
+impl Objects {
+    /// The objects on the generation of `queue`'s device that serves; `Err` with why where the
+    /// device imports no dma-buf as an image or refuses them.
+    fn new(queue: &rt::CommandQueue) -> Result<Objects, String> {
+        let generation = Generation::serving(queue)?;
+        let family = generation.family();
+        let (vk_device, timestamped, period, memory_fd) = {
+            // SAFETY: the handles are used while `generation`, which the objects hold, lives; the
+            // objects made of them are their own, destroyed at their end.
+            let handles = unsafe { generation.raw() };
+            let instance = handles.instance;
+            // SAFETY: the physical device is the device's own.
+            let (families, extensions) = unsafe {
+                (
+                    instance.get_physical_device_queue_family_properties(handles.physical_device),
+                    instance.enumerate_device_extension_properties(handles.physical_device),
+                )
+            };
+            let listed = |name: &std::ffi::CStr| {
+                (extensions.iter().flatten()).any(|e| e.extension_name_as_c_str() == Ok(name))
+            };
+            let needed = [
+                ash::khr::external_memory_fd::NAME,
+                ash::ext::external_memory_dma_buf::NAME,
+                ash::ext::image_drm_format_modifier::NAME,
+                ash::ext::queue_family_foreign::NAME,
+            ];
+            if let Some(missing) = needed.iter().find(|name| !listed(name)) {
+                return Err(format!("the device lists no {}", missing.to_string_lossy()));
+            }
+            let family_props = usize::try_from(family).ok().and_then(|at| families.get(at));
+            let timestamped = family_props.is_some_and(|f| f.timestamp_valid_bits > 0);
+            // SAFETY: the physical device is the device's own.
+            let period =
+                unsafe { instance.get_physical_device_properties(handles.physical_device) }
+                    .limits
+                    .timestamp_period;
+            let memory_fd = ash::khr::external_memory_fd::Device::new(instance, handles.device);
+            (handles.device.clone(), timestamped, period, memory_fd)
+        };
+        let device = generation.device().clone();
+        let mut objects = Objects {
+            generation,
             memory_fd,
             pool: vk::CommandPool::null(),
             buffer: vk::CommandBuffer::null(),
@@ -236,11 +308,11 @@ impl PlaneCopier {
             copies: 0,
             pending: None,
         };
-        // An object made before a refusal is destroyed by the copier's end.
+        // An object made before a refusal is destroyed by the objects' end.
         device
-            .with_loader_word(|| copier.make(vk_device, timestamped, f64::from(period)))
+            .with_loader_word(|| objects.make(&vk_device, timestamped, f64::from(period)))
             .map_err(|e| format!("its objects were refused ({e})"))?;
-        Ok(copier)
+        Ok(objects)
     }
 
     /// Makes the copier's command pool, buffer, fence and, where `timestamped`, its query pool of
@@ -253,7 +325,7 @@ impl PlaneCopier {
     ) -> Result<(), vk::Result> {
         let pool_info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-            .queue_family_index(self.family);
+            .queue_family_index(self.generation.family());
         // SAFETY: the infos are valid, and every object is this copier's.
         unsafe {
             self.pool = vk_device.create_command_pool(&pool_info, None)?;
@@ -273,21 +345,16 @@ impl PlaneCopier {
         Ok(())
     }
 
-    /// Copies each of `copies` (module docs) and waits up to `wait` for the GPU: `Ok` with the
-    /// copies' GPU time where the queue measures it, once every plane is in its buffer. Past the
-    /// wait the copy is kept with `hold`, which keeps the sources unwritten, until its fence
-    /// signals ([`CopyError::Failed`]).
-    pub fn copy(
+    /// [`PlaneCopier::copy`] with these objects, on `queue`, the copier's.
+    fn copy(
         &mut self,
+        queue: &rt::CommandQueue,
         copies: &[PlaneCopy<'_>],
         wait: Duration,
         hold: Box<dyn Any + Send>,
     ) -> Result<Option<Duration>, CopyError> {
-        if rt::process_exiting() {
-            return Err(CopyError::Refused("the process is exiting".to_owned()));
-        }
-        let device = self.device.clone();
-        // SAFETY: the handles are used while the device lives.
+        let device = self.generation.device().clone();
+        // SAFETY: the handles are used while the generation, which `device` holds, lives.
         let vk_device = unsafe { device.raw() }.device;
         if self.pending.is_some() {
             let fence = self.fence;
@@ -315,7 +382,7 @@ impl PlaneCopier {
         }
         let mut targets = Vec::with_capacity(copies.len());
         for copy in copies {
-            targets.push(destination(copy)?);
+            targets.push(destination(copy, &self.generation)?);
         }
         self.let_go_of_gone(vk_device);
         self.copies += 1;
@@ -331,10 +398,15 @@ impl PlaneCopier {
         let fence = self.fence;
         // SAFETY: the submission is the closure's only call, keeps no handle and waits for
         // nothing; the buffer is executable and not pending (no copy is pending), and the fence
-        // is unsignalled.
+        // is unsignalled. The queue is the one the generation was taken with.
         let submitted = unsafe {
-            self.queue
-                .with_vk_queue(|queue, _| vk_device.queue_submit(queue, &submit, fence))
+            self.generation
+                .with_queue(queue, |queue| vk_device.queue_submit(queue, &submit, fence))
+        };
+        let Some(submitted) = submitted else {
+            return Err(CopyError::Refused(
+                "the device recovered as the copy was submitted: nothing was submitted".to_owned(),
+            ));
         };
         submitted.map_err(|e| CopyError::Refused(format!("its submission was refused ({e})")))?;
         let pending = |hold: Box<dyn Any + Send>| Pending {
@@ -374,7 +446,7 @@ impl PlaneCopier {
         let (pool, period) = self.timestamps?;
         let mut ticks = [0u64; 2];
         // SAFETY: the pool is this copier's, its two queries written by the copy waited for.
-        let read = self.device.with_loader_word(|| unsafe {
+        let read = self.generation.device().with_loader_word(|| unsafe {
             vk_device.get_query_pool_results(pool, 0, &mut ticks, vk::QueryResultFlags::TYPE_64)
         });
         read.ok()?;
@@ -396,7 +468,7 @@ impl PlaneCopier {
         if imports.is_empty() {
             return;
         }
-        self.device.with_loader_word(|| {
+        self.generation.device().with_loader_word(|| {
             for import in imports {
                 // SAFETY: the import's objects are this copier's, and no copy in flight uses
                 // them: every copy that did was waited for.
@@ -437,7 +509,7 @@ impl PlaneCopier {
             let import = self.imports.swap_remove(oldest);
             self.destroy(vk_device, vec![import]);
         }
-        let device = self.device.clone();
+        let device = self.generation.device().clone();
         let (image, memory) = device
             .with_loader_word(|| self.make_import(vk_device, plane))
             .map_err(|why| CopyError::Refused(format!("the plane's import: {why}")))?;
@@ -454,8 +526,8 @@ impl PlaneCopier {
     /// `Ok` where the device imports a dma-buf of `plane`'s modifier as an image of its format
     /// that copies out; `Err` with why otherwise.
     fn importable(&self, plane: &DmaBufPlane<'_>) -> Result<(), String> {
-        // SAFETY: the handles are used while the device lives.
-        let handles = unsafe { self.device.raw() };
+        // SAFETY: the handles are used while the generation lives.
+        let handles = unsafe { self.generation.raw() };
         let mut modifier = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
             .drm_format_modifier(plane.modifier)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -625,7 +697,7 @@ impl PlaneCopier {
                 vk::ImageLayout::GENERAL,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             );
-            let (foreign, ours) = (vk::QUEUE_FAMILY_FOREIGN_EXT, self.family);
+            let (foreign, ours) = (vk::QUEUE_FAMILY_FOREIGN_EXT, self.generation.family());
             let b = vk::ImageMemoryBarrier::default()
                 .image(image)
                 .subresource_range(color);
@@ -733,11 +805,21 @@ impl PlaneCopier {
     }
 }
 
-/// The `VkBuffer` `copy` writes and its byte there: `Err` where its buffer's bytes are not its
-/// memory, or the copy lies past the buffer or off its texels' alignment (module docs).
-fn destination(copy: &PlaneCopy<'_>) -> Result<(vk::Buffer, u64), CopyError> {
+/// The `VkBuffer` `copy` writes and its byte there: `Err` where its buffer is of another
+/// generation of the device than the copier's `generation` (made before the device's recovery),
+/// its bytes are not its memory, or the copy lies past the buffer or off its texels' alignment
+/// (module docs).
+fn destination(
+    copy: &PlaneCopy<'_>,
+    generation: &Generation,
+) -> Result<(vk::Buffer, u64), CopyError> {
     let refused = |why: String| CopyError::Refused(why);
     let buffer = &copy.to.raw;
+    if !generation.is_of(buffer.device()) {
+        return Err(refused(
+            "the buffer was made on the device's VkDevice before its recovery".to_owned(),
+        ));
+    }
     if copy.to.gpu_read_only {
         return Err(refused("the buffer drops the GPU's writes".to_owned()));
     }
@@ -801,10 +883,11 @@ fn destination(copy: &PlaneCopy<'_>) -> Result<(vk::Buffer, u64), CopyError> {
     Ok((vk_buffer, at))
 }
 
-impl Drop for PlaneCopier {
+impl Drop for Objects {
     fn drop(&mut self) {
-        let device = self.device.clone();
-        // SAFETY: the handles are used while the device lives.
+        let device = self.generation.device().clone();
+        // SAFETY: the handles are used while the generation, which `device` holds, lives: its
+        // `VkDevice`, on which every object here was made, whether or not it still serves.
         let vk_device = unsafe { device.raw() }.device;
         let fence = self.fence;
         if self.pending.is_some() {
@@ -824,7 +907,7 @@ impl Drop for PlaneCopier {
         let imports = std::mem::take(&mut self.imports);
         self.destroy(vk_device, imports);
         let (pool, timestamps) = (self.pool, self.timestamps);
-        self.device.with_loader_word(|| {
+        device.with_loader_word(|| {
             // SAFETY: the objects are this copier's, and no copy in flight uses them.
             unsafe {
                 if let Some((query, _)) = timestamps {
@@ -834,5 +917,56 @@ impl Drop for PlaneCopier {
                 vk_device.destroy_command_pool(pool, None);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `VkDevice` of a copier's objects.
+    fn made_on(copier: &PlaneCopier) -> vk::Device {
+        let objects = copier.objects.as_ref().expect("the copier's objects");
+        // SAFETY: only the handle is read, while the generation lives.
+        unsafe { objects.generation.raw() }.device.handle()
+    }
+
+    /// A copy after the device's recovery is made with objects of its new `VkDevice`: the
+    /// copier destroys its objects on the old one and makes them again on the new one, and the
+    /// copy (of no plane, so no dma-buf is needed) runs on the GPU there. Under the test hook's
+    /// recovery the old `VkDevice` is not lost, so a copy with the old objects would run too: the
+    /// objects' device is what tells the two apart. A device that imports no dma-buf as an
+    /// image makes no copier: the test says so and checks nothing.
+    #[test]
+    fn a_copy_after_the_devices_recovery_is_made_on_its_new_device() {
+        // A device of its own, as the recovery moves every user of the device.
+        let device =
+            crate::gpu::device::adopt(rt::Device::system_default().expect("a runtime device"));
+        let mut copier = match PlaneCopier::new(&device) {
+            Ok(copier) => copier,
+            Err(why) if why.starts_with("the device lists no ") => {
+                eprintln!("skipped: {why}");
+                return;
+            }
+            Err(why) => panic!("no copier: {why}"),
+        };
+        let wait = Duration::from_secs(5);
+        assert!(copier.copy(&[], wait, Box::new(())).is_ok());
+        let first = made_on(&copier);
+        assert_eq!(copier.generations(), 1);
+
+        device.raw.recover_for_test().expect("the recovery");
+        assert!(copier.copy(&[], wait, Box::new(())).is_ok());
+        assert_eq!(copier.generations(), 2);
+        assert_ne!(
+            made_on(&copier),
+            first,
+            "the objects are the new VkDevice's"
+        );
+        let objects = copier.objects.as_ref().expect("the copier's objects");
+        assert!(objects.generation.serves(&copier.queue));
+        assert!(objects.generation.is_of(device.raw.new_fence().device()));
+        assert!(copier.copy(&[], wait, Box::new(())).is_ok());
+        assert_eq!(copier.generations(), 2, "made again once");
     }
 }

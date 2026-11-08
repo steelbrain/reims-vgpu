@@ -46,6 +46,10 @@
 //!   as the program's GPU work, so a texture's host shadow read before it is read again after.
 //! - **A failed submission** (a lost device) ends the thread, with one warning, and the GPU
 //!   suspends as the host's policy has it.
+//! - **A recovered device.** The objects are of the generation of the device they were made on
+//!   (`crate::generation`): where the runtime has made its `VkDevice` again since, a touch first
+//!   destroys them on the old one and makes them, with a new queue, on the new one; a touch whose
+//!   queue a recovery moved as it was submitted submits nothing.
 //! - **At the process's exit** the threads make no Vulkan call. The driver's destructors run
 //!   then, on the exiting thread, while every other thread goes on, and a call into what they
 //!   freed ends the process. Measured on the RTX 5080 Laptop GPU (NVIDIA 615.71.09), before the
@@ -67,6 +71,7 @@ use std::thread::Thread;
 use std::time::Duration;
 
 use crate::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
+use crate::generation::Generation;
 use ash::vk;
 use metal2vulkan_runtime as rt;
 
@@ -263,10 +268,12 @@ const FIRST_TOUCHES: u32 = 3;
 /// How long the toucher's end waits for its last submission.
 const LAST_WAIT: Duration = Duration::from_secs(1);
 
-/// The thread's submission (the module docs): its queue and its raw objects.
+/// The thread's submission (the module docs): its queue and its raw objects, on the generation
+/// of the device they were made on.
 struct Toucher {
     device: rt::Device,
     queue: rt::CommandQueue,
+    generation: Generation,
     pool: vk::CommandPool,
     buffer: vk::CommandBuffer,
     timestamps: vk::QueryPool,
@@ -282,23 +289,28 @@ impl Toucher {
         let queue = device
             .new_command_queue()
             .map_err(|e| format!("no queue ({e:?})"))?;
-        // SAFETY: the closure keeps no handle and calls nothing.
-        let family = unsafe { queue.with_vk_queue(|_, family| family) };
-        // SAFETY: the handles are used while `device`, which this object holds, lives; the
-        // objects made of them are this object's own, destroyed at its end.
-        let handles = unsafe { device.raw() };
-        let (vk_device, instance) = (handles.device, handles.instance);
-        // SAFETY: the physical device is the device's own.
-        let families = unsafe {
-            instance.get_physical_device_queue_family_properties(handles.physical_device)
+        let generation = Generation::serving(&queue)?;
+        let family = generation.family();
+        let (vk_device, timestamped) = {
+            // SAFETY: the handles are used while the generation, which this object holds, lives;
+            // the objects made of them are this object's own, destroyed at its end.
+            let handles = unsafe { generation.raw() };
+            // SAFETY: the physical device is the device's own.
+            let families = unsafe {
+                (handles.instance)
+                    .get_physical_device_queue_family_properties(handles.physical_device)
+            };
+            let timestamped = usize::try_from(family)
+                .ok()
+                .and_then(|at| families.get(at))
+                .is_some_and(|f| f.timestamp_valid_bits > 0);
+            (handles.device.clone(), timestamped)
         };
-        let timestamped = usize::try_from(family)
-            .ok()
-            .and_then(|at| families.get(at))
-            .is_some_and(|f| f.timestamp_valid_bits > 0);
+        let made_on = generation.device().clone();
         let mut toucher = Toucher {
             device: device.clone(),
             queue,
+            generation,
             pool: vk::CommandPool::null(),
             buffer: vk::CommandBuffer::null(),
             timestamps: vk::QueryPool::null(),
@@ -308,8 +320,8 @@ impl Toucher {
         // The device's commands with the runtime's loader word put back, as the loader's own and
         // a layer's need (`rt::Device::with_loader_word`). An object made before a refusal is
         // destroyed by the toucher's end.
-        device
-            .with_loader_word(|| toucher.make(vk_device, family, timestamped))
+        made_on
+            .with_loader_word(|| toucher.make(&vk_device, family, timestamped))
             .map_err(|e| format!("its objects were refused ({e})"))?;
         Ok(toucher)
     }
@@ -350,14 +362,25 @@ impl Toucher {
     }
 
     /// Submits the buffer, where its last submission completed; where it is still pending, the
-    /// GPU has work ahead of it on its queue, and nothing is submitted.
+    /// GPU has work ahead of it on its queue, and nothing is submitted. Where the device
+    /// recovered since the objects were made, they are made again on its new `VkDevice` first.
     fn touch(&mut self) -> Result<(), String> {
-        // SAFETY: the handles are used while the device lives.
-        let vk_device = unsafe { self.device.raw() }.device;
+        if !self.generation.serves(&self.queue) {
+            // The old objects go once the new ones are made, on the `VkDevice` they were made on.
+            *self = Toucher::new(&self.device)
+                .map_err(|e| format!("after the device's recovery: {e}"))?;
+            log::debug!(
+                target: TARGET,
+                "the toucher's objects were made again on the device's new VkDevice"
+            );
+        }
+        let made_on = self.generation.device().clone();
+        // SAFETY: the handles are used while the generation, which `made_on` holds, lives.
+        let vk_device = unsafe { made_on.raw() }.device;
         let (buffer, fence) = (self.buffer, self.fence);
         if self.pending {
             // SAFETY: the fence is this toucher's.
-            let done = self.device.with_loader_word(|| unsafe {
+            let done = made_on.with_loader_word(|| unsafe {
                 let done = vk_device.get_fence_status(fence)?;
                 if done {
                     vk_device.reset_fences(&[fence])?;
@@ -374,10 +397,16 @@ impl Toucher {
         let submit = [vk::SubmitInfo::default().command_buffers(&buffers)];
         // SAFETY: the submission is the closure's only call, keeps no handle and waits for
         // nothing; the buffer is executable and not pending (its fence signalled), and the fence
-        // is unsignalled.
+        // is unsignalled. The queue is the one the generation was taken with.
         let submitted = unsafe {
-            self.queue
-                .with_vk_queue(|queue, _| vk_device.queue_submit(queue, &submit, fence))
+            self.generation.with_queue(&self.queue, |queue| {
+                vk_device.queue_submit(queue, &submit, fence)
+            })
+        };
+        // A recovery moved the queue as it was submitted to: the next touch makes the objects
+        // again.
+        let Some(submitted) = submitted else {
+            return Ok(());
         };
         submitted.map_err(|e| format!("its submission was refused ({e})"))?;
         self.pending = true;
@@ -387,11 +416,13 @@ impl Toucher {
 
 impl Drop for Toucher {
     fn drop(&mut self) {
-        // SAFETY: the handles are used while the device lives.
-        let vk_device = unsafe { self.device.raw() }.device;
+        let made_on = self.generation.device().clone();
+        // SAFETY: the handles are used while the generation, which `made_on` holds, lives: its
+        // `VkDevice`, on which every object here was made, whether or not it still serves.
+        let vk_device = unsafe { made_on.raw() }.device;
         let pending = self.pending;
         let (pool, timestamps, fence) = (self.pool, self.timestamps, self.fence);
-        self.device.with_loader_word(|| {
+        made_on.with_loader_word(|| {
             // SAFETY: the objects are this toucher's; its last submission completed or is given
             // up on after the wait, on a device that answers no more.
             unsafe {
@@ -510,6 +541,40 @@ mod tests {
             });
             assert_eq!(waited, Ok(()));
         }
+    }
+
+    /// A touch after the device's recovery runs on its new `VkDevice`: the toucher's objects are
+    /// made again there, and its fence signals.
+    #[test]
+    fn a_touch_after_the_devices_recovery_runs_on_its_new_device() {
+        // A device of its own, as the recovery moves every user of the device.
+        let device = rt::Device::system_default().expect("a runtime device");
+        let mut toucher = Toucher::new(&device).unwrap();
+        let wait = |toucher: &Toucher| {
+            // SAFETY: the handles are used while the toucher's generation lives.
+            let vk_device = unsafe { toucher.generation.raw() }.device;
+            // SAFETY: the fence is the toucher's, on its generation's device.
+            let waited = toucher.generation.device().with_loader_word(|| unsafe {
+                vk_device.wait_for_fences(&[toucher.fence], true, 5_000_000_000)
+            });
+            assert_eq!(waited, Ok(()));
+        };
+        toucher.touch().unwrap();
+        assert!(toucher.pending);
+        wait(&toucher);
+        // SAFETY: only the handle is read, while the generation lives.
+        let first = unsafe { toucher.generation.raw() }.device.handle();
+
+        device.recover_for_test().expect("the recovery");
+        for _ in 0..2 {
+            toucher.touch().unwrap();
+            assert!(toucher.pending);
+            wait(&toucher);
+        }
+        // SAFETY: as above.
+        let second = unsafe { toucher.generation.raw() }.device.handle();
+        assert_ne!(first, second, "the objects are the new VkDevice's");
+        assert!(toucher.generation.serves(&toucher.queue));
     }
 
     /// A process that exits amid its thread's touches ends with its exit's status: the exit

@@ -342,6 +342,66 @@ fn a_picture_copied_by_the_gpu_is_the_cpus_copy_byte_for_byte() {
     });
 }
 
+/// A copy after the runtime made its device's `VkDevice` again lands as the CPU's copy, byte for
+/// byte: the copier made before the recovery makes its objects again on the new `VkDevice`
+/// (`reims_vgpu_vulkan::os::PlaneCopier`), and copies into buffers made there. Six pictures of
+/// the first H.264 stream in `RVG_VA_STREAMS`'s first directory, three each side of the recovery,
+/// each landed as [`land_both_ways`] lands it.
+#[test]
+#[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
+fn a_copy_after_the_devices_recovery_is_the_cpus_copy_byte_for_byte() {
+    use reims_vgpu_video::codec::h264;
+
+    const EACH_SIDE: usize = 3;
+    let dirs = std::env::var("RVG_VA_STREAMS").expect("RVG_VA_STREAMS: the streams' directories");
+    let dir = dirs.split(':').next().expect("a streams directory");
+    let mut streams: Vec<std::path::PathBuf> = (std::fs::read_dir(dir).expect("a directory"))
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| {
+            let name = path.to_string_lossy();
+            name.ends_with(".264") && !name.contains(".part.")
+        })
+        .collect();
+    streams.sort();
+    let platform = Arc::new(VulkanPlatform::new());
+    crate::entry::run(|_| {
+        let device = VulkanPlatform::system_default_device().expect("a Vulkan device");
+        let node = reims_vgpu_vulkan::host_gpus::render_node_of(&device.raw).expect("a node");
+        let runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+        let display = Display::open(&node, runtime).expect("a VA display on the device's GPU");
+        let copies = gpu_copy::RuntimeCopies::new(&device);
+        let mut copier = copies.copier().expect("a GPU copier on the device");
+        let mut n = 0;
+        'streams: for stream in &streams {
+            let file = std::fs::read(stream).expect("a stream");
+            let mut decoder = H264Decoder::new_annex_b(&display);
+            for (id, unit) in h264::nal::access_units(&file).iter().enumerate() {
+                let Ok(frames) = decoder.decode(unit, u64::try_from(id).expect("an id")) else {
+                    continue 'streams;
+                };
+                for frame in &frames {
+                    if n == EACH_SIDE {
+                        device
+                            .raw
+                            .recover_for_test()
+                            .expect("the device's recovery");
+                    }
+                    land_both_ways(&mut *copier, &device, frame, n, stream);
+                    n += 1;
+                    if n == 2 * EACH_SIDE {
+                        break 'streams;
+                    }
+                }
+            }
+        }
+        assert_eq!(n, 2 * EACH_SIDE, "pictures in {dir}");
+        eprintln!(
+            "{} pictures copied by the GPU as by the CPU, {EACH_SIDE} after the device's recovery",
+            2 * EACH_SIDE
+        );
+    });
+}
+
 /// Lands `frame`, the `n`th picture of the run, by `copier` into planes laid out as CoreVideo
 /// lays a frame's, in host pages a buffer of `device` lies over, and by the CPU's copy into the
 /// same layout in memory of its own; panics where a byte of the two differs.

@@ -8,9 +8,9 @@
 //! has the presenter draw the current frame into its next image and present it
 //! ([`Presenter::draw`]): taking the image is the pacing, at the screen's own rate. Where no image
 //! came in time the render thread tries again after [`RETRY`]. A presenter that can draw no more
-//! ([`Drawn::Ended`]: its surface is lost) is let go, and the next draw asks the sink for a new
-//! one, up to [`RENEWALS`] times in a row without a frame presented; the window then stays as it
-//! is.
+//! ([`Drawn::Ended`]: its surface is lost, or its GPU device recovered) is let go, and the next
+//! draw asks the sink for a new one, up to [`RENEWALS`] times in a row without a frame presented;
+//! the window then stays as it is.
 
 use std::time::Duration;
 
