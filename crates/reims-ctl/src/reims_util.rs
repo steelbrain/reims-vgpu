@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 pub const REPO: &str = "https://github.com/steelbrain/reims-util";
 /// The commit [`install`] installs.
-pub const REV: &str = "5ca3b10683be28938c01f977b89af5ffa8685754";
+pub const REV: &str = "25777776f7b3c92663a82a8f50e11b049eb72005";
 
 /// The reims-util binary: `REIMS_CTL_UTIL`, else the one beside reims-ctl, where both are
 /// installed, else the first on PATH.
