@@ -1547,9 +1547,33 @@ asynchronous results whose words IOAccelerator's notification callbacks read
 (`guest/kext/src/RgfxDisplayPipeUserClient.cpp`, `completeLocked` and `sendVbl`,
 which build them with `RgfxPipeNotifications.hpp`; `tests/user_client_words_test.cpp`
 pins them).
-A transaction's completion is exactly 11 words: the transaction's cookie in word
-0, its id in the high half of word 1 (the low half 0), the time it was shown in
-word 3, and the action 1 in word 8, the rest 0. The callback reads it as follows:
+A transaction's completion holds the transaction's cookie in word 0, its id in
+the high half of word 1 (the low half 0), the time it was shown in word 3, and,
+where it has nine words or more, the action 1 in word 8, the rest 0. Its word
+count is the one the client's IOAccelerator expects, which differs by release,
+so the kext picks it for each pipe client at the client's first submit
+(`rgfxPipeCompletionCount`):
+- 8 for a client that submits 0x108-byte transactions, as macOS 11.7.11's
+  WindowServer does: the 0x118-byte layout without its last 16 bytes, which
+  12.7.6's and 26's WindowServers send as zeros. The kext reads it as 0x118
+  bytes with zeros past its end;
+- for a client that submits 0x118-byte transactions, 11 where
+  IOAcceleratorFamily2 exports
+  `IOAccelMemoryMap::getAssignedGPUVirtualAddressLength() const`, and 9 where it
+  does not. The kernel collections of macOS 13.7.8 to 26.7.2 export it, and
+  those of 11.7.10 to 12.7.6 do not (read). ReimsGraphics references the symbol
+  weakly, through its `OSBundleLibraries` and its Graft declaration
+  (`guest/kext/src/graft.json`, where the family is verified through its class
+  IOAccelMemoryMap, which the KCs of 11.7.11 to 26.7.2 define), never calls
+  it, and reads at its start whether its binder resolved it
+  (`ReimsGraphics::assignedLengthExported`).
+
+Each count was measured by booting the kext with the others: with any other
+count, WindowServer aborts at its first completion (on 11.7.11 its crash report
+names a failed assertion in IOAccelerator's transaction callback that the
+argument count equals its notification's), and with its own it completes every
+transaction: 8 on 11.7.11, 9 on 12.7.6, 11 on 13.7.8, 14.8.9, 15.7.9 and 26.
+The callback reads a completion as follows:
 - it refuses any other word count;
 - it takes word 0 as the completion block the client registered with the
   transaction, so a completion with no cookie is not sent (a null word 0 ends the

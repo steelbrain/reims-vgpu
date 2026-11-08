@@ -17,6 +17,7 @@
 #include <kern/task_ref.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+#include <libkern/OSKextLib.h>
 
 #include "RgfxTrace.hpp"
 
@@ -1079,6 +1080,12 @@ IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt3
 	return r;
 }
 
+// IOAcceleratorFamily2's IOAccelMemoryMap::getAssignedGPUVirtualAddressLength() const,
+// referenced weakly and never called (assignedLengthExported). A binder that cannot resolve it
+// binds it to gOSKextUnresolved, as the kernel's linker does, or to 0: either reads as absent.
+extern "C" void rgfxAssignedGPUVirtualAddressLength()
+    __asm("__ZNK16IOAccelMemoryMap34getAssignedGPUVirtualAddressLengthEv") __attribute__((weak_import));
+
 bool ReimsGraphics::start(IOService *provider)
 {
 	pci = OSDynamicCast(IOPCIDevice, provider);
@@ -1103,6 +1110,8 @@ bool ReimsGraphics::start(IOService *provider)
 	hostTime = false;
 	roomStats = {};
 	roomRecords = 0;
+	assignedLength = &rgfxAssignedGPUVirtualAddressLength != nullptr &&
+	                 OSKextSymbolIsResolved(rgfxAssignedGPUVirtualAddressLength);
 
 	pci->setMemoryEnable(true);
 	// setBusMasterEnable, which the SDK deprecates in favour of setBusLeadEnable: it is virtual, so

@@ -136,8 +136,9 @@ private:
 	// Held across a submit, which may wait for the control ring's room with `lock` let go: the
 	// submits keep their order. The work loop never takes it.
 	IOLock *submitLock;
-	// Under lock: the transaction registration, the VBL requests waiting, the transaction begun
-	// and the last completed.
+	// Under lock: the transaction registration, the VBL requests waiting, the transaction begun,
+	// the last completed, and the words of a completion, set at the first submit (0 before it;
+	// RgfxPipeNotifications.hpp).
 	IOLock *lock;
 	bool registered;
 	OSAsyncReference64 transactionRef;
@@ -146,6 +147,7 @@ private:
 	UInt32 nextTransaction;
 	UInt32 begun;
 	UInt32 completed;
+	UInt32 completionWords;
 	UInt32 logged;
 	UInt32 unnotifiedLogged;
 	Transactions transactions;

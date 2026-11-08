@@ -179,6 +179,10 @@ public:
 	// DISPLAY_COLOR parts, in order, each waiting for room as post does: thread context only,
 	// with no lock of the work loop's held. The host stages them for the next PRESENT_SURFACE.
 	bool displayColor() const { return displayColorTaken; }
+	// Whether IOAcceleratorFamily2 exports IOAccelMemoryMap::getAssignedGPUVirtualAddressLength()
+	// const, which ReimsGraphics references weakly and never calls; read once at start. It picks
+	// a display pipe client's completion word count (RgfxPipeNotifications.hpp).
+	bool assignedLengthExported() const { return assignedLength; }
 	IOReturn postDisplayColor(UInt32 transactionId, UInt32 stage, UInt32 count,
 	                          const UInt8 *entries);
 	// A pipe client's transaction posts its colour, then its present, holding the presents lock
@@ -422,6 +426,9 @@ private:
 	// loop took (atomic), for the log line waitForRoom writes at most every kRoomLogMs.
 	RgfxRingRoomStats roomStats;
 	UInt64 roomRecords;
+
+	// assignedLengthExported, set at start.
+	bool assignedLength;
 
 	// The display pipe's presents (lockPresents), taken before stateLock where both are.
 	IOLock *presentsLock;

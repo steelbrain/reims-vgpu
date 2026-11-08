@@ -5,6 +5,10 @@
     },
     {
       "id": "com.apple.AppleGraphicsDeviceControl"
+    },
+    {
+      "id": "com.apple.iokit.IOAcceleratorFamily2",
+      "anchor": "IOAccelMemoryMap"
     }
   ],
   "classes": [
@@ -40,5 +44,10 @@
       "header": "RgfxDeviceControl.hpp",
       "parent": 2
     }
-  ]
+  ],
+  "imports": {
+    "__ZNK16IOAccelMemoryMap34getAssignedGPUVirtualAddressLengthEv": {
+      "library": 2
+    }
+  }
 }

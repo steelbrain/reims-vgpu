@@ -22,7 +22,7 @@ namespace {
 
 // The argument structures' sizes.
 constexpr UInt32 kNotifySize = 0x18;
-constexpr UInt32 kTransactionSize = 0x118;
+constexpr UInt32 kTransactionSize = kRgfxPipeTransactionBytes;
 constexpr UInt32 kWaitSize = 0xc;
 constexpr UInt32 kScalerSize = 24;
 
@@ -115,6 +115,7 @@ bool RgfxDisplayPipeUserClient::initWithTask(task_t owningTask, void *securityID
 	nextTransaction = 0;
 	begun = 0;
 	completed = 0;
+	completionWords = 0;
 	logged = 0;
 	unnotifiedLogged = 0;
 	transactions = Transactions();
@@ -207,7 +208,7 @@ IOReturn RgfxDisplayPipeUserClient::externalMethod(uint32_t selector,
 		/* 5 */ { nullptr, 0, 0, 0, 0 },
 		/* 6 */ { nullptr, 0, 0, 0, 0 },
 		/* 7 */ { &RgfxDisplayPipeUserClient::sSeven, 0, 0, 0, 0 },
-		/* 8 */ { &RgfxDisplayPipeUserClient::sSubmit, 0, kTransactionSize, 0, 0 },
+		/* 8 */ { &RgfxDisplayPipeUserClient::sSubmit, 0, kIOUCVariableStructureSize, 0, 0 },
 		/* 9 */ { &RgfxDisplayPipeUserClient::sWait, 0, kWaitSize, 0, 0 },
 	};
 	if (logged < kLogFirst) {
@@ -512,10 +513,32 @@ IOReturn RgfxDisplayPipeUserClient::sSubmit(OSObject *target, void *, IOExternal
 	RgfxDisplayPipeUserClient *self = OSDynamicCast(RgfxDisplayPipeUserClient, target);
 	if (!self || !self->associated || !self->framebuffer)
 		return kIOReturnNotAttached;
-	UInt8 buf[kTransactionSize];
-	const UInt8 *t = structIn(a, buf, kTransactionSize);
-	if (!t)
+	// 0x118 bytes, or macOS 11's 0x108 (RgfxPipeNotifications.hpp), read as 0x118 with zeros past
+	// its end.
+	const UInt32 bytes = a->structureInput ? a->structureInputSize
+	                     : a->structureInputDescriptor
+	                         ? static_cast<UInt32>(a->structureInputDescriptor->getLength())
+	                         : 0;
+	if (bytes != kTransactionSize && bytes != kRgfxPipeTransactionBytesShort)
 		return kIOReturnBadArgument;
+	UInt8 buf[kTransactionSize] = {};
+	const UInt8 *in = structIn(a, buf, bytes);
+	if (!in)
+		return kIOReturnBadArgument;
+	if (in != buf)
+		memcpy(buf, in, bytes);
+	const UInt8 *t = buf;
+	// The client's completions take the count its first transaction's size and the family pick.
+	IOLockLock(self->lock);
+	if (!self->completionWords) {
+		self->completionWords =
+		    rgfxPipeCompletionCount(bytes, self->framebuffer->assignedLengthExported());
+		IOLog("RGFX pipe: %u-byte transactions, family %s the assigned length: completions of %u "
+		      "words\n",
+		      bytes, self->framebuffer->assignedLengthExported() ? "exports" : "lacks",
+		      self->completionWords);
+	}
+	IOLockUnlock(self->lock);
 	UInt32 id = rd32(t, kTxnId);
 	UInt32 planeType = rd32(t, kTxnPlane0 + kPlaneType);
 	UInt32 surface = rd32(t, kTxnPlane0 + kPlaneSurface);
@@ -730,10 +753,10 @@ void RgfxDisplayPipeUserClient::completeLocked(const Transactions::Completion &c
 {
 	if (c.id > completed)
 		completed = c.id;
-	if (c.notified && registered) {
-		io_user_reference_t words[kRgfxPipeCompletionWords];
-		rgfxPipeCompletionWords(words, c.cookie, c.id, time);
-		sendAsyncResult64(transactionRef, kIOReturnSuccess, words, kRgfxPipeCompletionWords);
+	if (c.notified && registered && completionWords) {
+		io_user_reference_t words[kRgfxPipeCompletionWordsMax];
+		rgfxPipeCompletionWords(words, completionWords, c.cookie, c.id, time);
+		sendAsyncResult64(transactionRef, kIOReturnSuccess, words, completionWords);
 	}
 	IOLockWakeup(lock, &completed, false);
 }

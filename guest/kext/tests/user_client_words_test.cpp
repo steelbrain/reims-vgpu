@@ -1,5 +1,5 @@
 // What the kext's user clients answer, word for word, built natively: the display pipe's VBL and
-// completion notifications (RgfxPipeNotifications.hpp), the replies to the IOGPU base's device
+// completion notifications and the completions' count (RgfxPipeNotifications.hpp), the replies to the IOGPU base's device
 // calls and which calls it answers (RgfxIOGPUReplies.hpp), and the user-client protocol the
 // bundle shares (RgfxUserClientABI.hpp): its type, its context selectors without a gap, and the
 // features call with the kext's own feature bits.
@@ -43,23 +43,41 @@ static void vbl()
 	CHECK(w[6] == 0xa5a5a5a5a5a5a5a5); // nothing past the answer
 }
 
-// A completion: every one of its words written, the cookie, the id in word 1's high half, the
-// time and the action, the rest 0.
+// A completion of each count: every one of its words written, the cookie, the id in word 1's
+// high half, the time and, from nine words, the action, the rest 0, and nothing past its count.
 static void completion()
 {
-	uint64_t w[kRgfxPipeCompletionWords + 1];
-	for (uint64_t &x : w)
-		x = 0xa5a5a5a5a5a5a5a5;
-	rgfxPipeCompletionWords(w, 0x6000002de3a0, 4461, 0x0000001234567890);
-	CHECK(kRgfxPipeCompletionWords == 11);
-	CHECK(w[0] == 0x6000002de3a0);
-	CHECK(w[1] == (uint64_t(4461) << 32));
-	CHECK(w[3] == 0x0000001234567890);
-	CHECK(w[8] == 1);
-	const int zero[] = {2, 4, 5, 6, 7, 9, 10};
-	for (int i : zero)
-		CHECK(w[i] == 0);
-	CHECK(w[11] == 0xa5a5a5a5a5a5a5a5);
+	CHECK(kRgfxPipeCompletionWordsMax == 11);
+	const uint32_t counts[] = {8, 9, 11};
+	for (uint32_t count : counts) {
+		uint64_t w[kRgfxPipeCompletionWordsMax + 1];
+		for (uint64_t &x : w)
+			x = 0xa5a5a5a5a5a5a5a5;
+		rgfxPipeCompletionWords(w, count, 0x6000002de3a0, 4461, 0x0000001234567890);
+		CHECK(w[0] == 0x6000002de3a0);
+		CHECK(w[1] == (uint64_t(4461) << 32));
+		CHECK(w[3] == 0x0000001234567890);
+		const uint32_t zero[] = {2, 4, 5, 6, 7, 9, 10};
+		for (uint32_t i : zero)
+			if (i < count)
+				CHECK(w[i] == 0);
+		if (count > 8)
+			CHECK(w[8] == 1);
+		for (uint32_t i = count; i <= kRgfxPipeCompletionWordsMax; i++)
+			CHECK(w[i] == 0xa5a5a5a5a5a5a5a5);
+	}
+}
+
+// The count a client's completions take: 8 after a 0x108-byte transaction (macOS 11), and after a
+// 0x118-byte one, 11 where the family exports the assigned length (macOS 13 on) and 9 where it
+// does not (macOS 12).
+static void completionCount()
+{
+	CHECK(kRgfxPipeTransactionBytes == 0x118 && kRgfxPipeTransactionBytesShort == 0x108);
+	CHECK(rgfxPipeCompletionCount(0x108, false) == 8);
+	CHECK(rgfxPipeCompletionCount(0x108, true) == 8);
+	CHECK(rgfxPipeCompletionCount(0x118, false) == 9);
+	CHECK(rgfxPipeCompletionCount(0x118, true) == 11);
 }
 
 // The IOGPU base's two device calls are answered at their exact shapes only, and the replies
@@ -163,6 +181,7 @@ int main()
 {
 	vbl();
 	completion();
+	completionCount();
 	iogpu();
 	protocol();
 	features();
