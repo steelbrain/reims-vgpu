@@ -18,7 +18,8 @@ metal2vulkan's `docs/FAST-PATHS.md` at the pinned commit. Costs are the RTX 5080
 cold, from that file: the making of the big glass pipelines (A2X, Xgc14, Xgc15), then GPU time
 per draw.
 
-Two runtime defaults are not taken, and have no switch: completion and heap compression. Every
+Three runtime defaults are not taken, and have no switch: completion, heap compression and
+in-place YCbCr reads. Every
 device takes `CompletionPolicy::Exact`, each command buffer in a kernel submission of its own and
 seen complete at its own end, as Metal's, where the runtime's default (`Grouped`) on Mesa's drivers
 sends up to four ready together and sees each but the last complete only once the last completed.
@@ -41,6 +42,13 @@ it was until the guests boot with the new one. A write through a buffer or textu
 may also leave the compressed image's texels as they were (`HeapTextureCompressed`). The compressed
 image cleared a 2048x2048 `RGBA8Unorm` render target in a `Private` heap in 26.9 us against 676 us
 on the Iris Xe, and copied into another in 648-649 us against 674-693 us.
+
+Every device also takes `YCbCrInPlacePolicy::Exact`: a function that reads a `YCBCR8_420_2P`
+(500) or `YCBCR10_420_2P` (505) texture's planes in place, on a device whose memory is the host's
+(MoltenVK, the Iris Xe, the Radeon 780M), converts and filters every tap as Metal does. The
+runtime's default (`Model`) samples by Vulkan's Y'CbCr model in the device's arithmetic, which
+reads outside the bounds `gpu::ycbcr::sampling`'s tests hold to Metal's answers (constexpr
+samplers, the default filter, `YCBCR10_420_2P` under every mode).
 
 | Fast default | Accurate switch | Bound of the fast form | Cost of the accurate form (5080) |
 |---|---|---|---|

@@ -380,7 +380,12 @@ pub const EXACT_ALL: &str = "all";
 /// `heapTextureSizeAndAlignWithDescriptor:` answers the guest (on the Iris Xe, 0x4100 bytes at
 /// 0x10000 for a 64x64 `BGRA8Unorm` texture, where the uncompressed one answers 0x4080 at 0x1000,
 /// and Metal 0x4080 at 0x80), and a write through a buffer or texture over its bytes may not show
-/// in its texels. Each field of [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated
+/// in its texels. Its in-place YCbCr reads are always the exact form as well, with no switch: a
+/// function that reads a `YCBCR8_420_2P` or `YCBCR10_420_2P` texture's planes in place, on a
+/// device whose memory is the host's, converts and filters every tap as Metal does
+/// (`YCbCrInPlacePolicy::Exact`), where the runtime's default samples by Vulkan's Y'CbCr model in
+/// the device's arithmetic, outside the bound of Metal's answers `gpu::ycbcr::sampling`'s tests
+/// hold. Each field of [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated
 /// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form:
 /// `batch_order`'s barriers between batches, `host_page_textures`' copies of each sampled texture
 /// over the guest's pages at each command buffer's first use, and `half_chains`' rounding at
@@ -393,11 +398,12 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
         ExtendedRangeBlitPolicy, HalfChainPolicy, HeapCompressionPolicy, HostPageTexturePolicy,
-        PipelineWaitPolicy, QueueSharingPolicy, WideLinePolicy,
+        PipelineWaitPolicy, QueueSharingPolicy, WideLinePolicy, YCbCrInPlacePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
     policy.heap_compression = HeapCompressionPolicy::Uncompressed;
+    policy.ycbcr_in_place_reads = YCbCrInPlacePolicy::Exact;
     for name in (exact.unwrap_or_default().split(',').map(str::trim)).filter(|n| !n.is_empty()) {
         match name {
             EXACT_ALL => policy = policy.exact_answers(),
@@ -696,24 +702,26 @@ pub(crate) mod tests {
     }
 
     /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms,
-    /// but for its exact completion and uncompressed heap textures, which every device takes and
-    /// no name selects; each name of `EXACT_FORMS` takes that field's exact form alone, in any
-    /// order, spaces around a name ignored; `all` takes the runtime's `exact_answers()`, every
-    /// one; another name, `completion`, `heap_compression` and `sampling` among them, changes
-    /// nothing
+    /// but for its exact completion, uncompressed heap textures and exact in-place YCbCr reads,
+    /// which every device takes and no name selects; each name of `EXACT_FORMS` takes that
+    /// field's exact form alone, in any order, spaces around a name ignored; `all` takes the
+    /// runtime's `exact_answers()`, every one; another name, `completion`, `heap_compression`,
+    /// `ycbcr_in_place_reads` and `sampling` among them, changes nothing
     #[test]
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DevicePolicy, DontCareColorPolicy,
             ExtendedRangeBlitPolicy, HalfChainPolicy, HeapCompressionPolicy, HostPageTexturePolicy,
-            PipelineWaitPolicy, QueueSharingPolicy, WideLinePolicy,
+            PipelineWaitPolicy, QueueSharingPolicy, WideLinePolicy, YCbCrInPlacePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
         assert_eq!(runtimes.heap_compression, HeapCompressionPolicy::Compressed);
+        assert_eq!(runtimes.ycbcr_in_place_reads, YCbCrInPlacePolicy::Model);
         let mut fast = runtimes;
         fast.completion = CompletionPolicy::Exact;
         fast.heap_compression = HeapCompressionPolicy::Uncompressed;
+        fast.ycbcr_in_place_reads = YCbCrInPlacePolicy::Exact;
         assert_eq!(fast.batch_order, BatchOrderPolicy::Ends);
         assert_eq!(fast.host_page_textures, HostPageTexturePolicy::InPlace);
         assert_eq!(fast.half_chains, HalfChainPolicy::AtExits);
@@ -730,6 +738,7 @@ pub(crate) mod tests {
             Some("padded_reads"),
             Some("completion"),
             Some("heap_compression"),
+            Some("ycbcr_in_place_reads"),
             Some("sampling"),
         ] {
             assert_eq!(exact_policy(unchanged), fast, "{unchanged:?}");
