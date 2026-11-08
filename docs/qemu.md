@@ -78,7 +78,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 
 | what | commits |
 |---|---|
-| the reims-graphics device's transport, for the library's own guest driver: `reims-graphics-pci` (1234:5247, class 0x0380), on the library's graphics device (`rvg_graphics_device_*`); BAR 0 its registers with MSI-X from 0x800, the doorbell an ioeventfd, BAR 2 the library's region as RAM, its allocations dirty-logged for the scanout; built for every target where the library is found (`CONFIG_REIMS_GRAPHICS`), x86-64 under TCG on a Mac among them ("The reims-graphics device", below) | `77ee6c6b`, `bf69f959` |
+| the reims-graphics device's transport, for the library's own guest driver: `reims-graphics-pci` (1234:5247, class 0x0380), on the library's graphics device (`rvg_graphics_device_*`); BAR 0 its registers with MSI-X from 0x800, the doorbell an ioeventfd, BAR 2 the library's region as RAM; built for every target where the library is found (`CONFIG_REIMS_GRAPHICS`), x86-64 under TCG on a Mac among them ("The reims-graphics device", below) | `77ee6c6b`, `bf69f959` |
 | the device gives the library the guest RAM's map and the files behind it | `abb94a98` |
 | the device raises its interrupt through an irqfd where KVM's in-kernel irqchip takes MSI-X through one | `36deb281` |
 | a command buffer is taken, and answered, on the vCPU that rings its queue's doorbell, with the plain register write | `f2c7e2a5`, `67cc08ad`, `5f459785` |
@@ -94,6 +94,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | `vmapple` ("arm64 guests", below): patches 1 to 6 of the RFC v7 series "vmapple: make it work on the latest macOS release" (Mohamed Mediouni), and the branch's commits for HVF's ISV=0 data aborts and in-kernel vGIC, the secondary CPUs' pointer authentication keys, macOS 14 and later and macOS 27 guests, the AES engine's refusal without a crypto library, and `usb-vmapple-tablet`, Virtualization.framework's USB pointing device | `e181197cc2`, `663b9b9c0b`, `4a2e2b3967`, `450e03eed2`, `f116a9d560`, `c912618391`, `c2f5832f32`, `674af72fe2`, `da640879f0`, `e0ce93da92`, `d46ebaa252`, `61f7de5fc1`, `fc46f8bf02`, `a24c8eadfa`, `e1c37ea4d4`, `d235e51310`, `fbda9c8b28`, `c7a4f0700f` |
 | apple-gfx, Apple's paravirtualized GPU device on the library, with its windows, its option ROM, its IOSurface device and the VideoToolbox and M2 scaler devices, removed: `vmapple`, whose display was `apple-gfx-mmio`, stayed in the tree unbuilt until the next row's commits; the option that finds the library is `reims_vgpu` (`--enable-reims-vgpu`) | `eb36a099` |
 | `vmapple` for Ambrosia, built by default in an `aarch64-softmmu` build again: the machine without apple-gfx's display; no kernel-entry hook (the firmware makes macOS's kernel-entry changes, so AVPBooter boots only macOS 12 and 13 guests); RAM at 4 GiB, with the PCIe MMIO window from 0x50000000 below it for 1 GiB BARs (AVPBooter does not boot on this layout); TCG with the `max` CPU and a 24 MHz generic timer; the guest's write to its DMA configuration doorbell at 0x4ffff8 ignored, which panicked a macOS 27.0.1 kernel under TCG; and `virtio-net-pci` without its control queue in the machine's defaults, since one boot in four to six of a macOS 26 or 27 guest missed the completion of its first control command and never started DHCP | `15989559`, `cd2ecf44`, `bd408aea`, `a52f4a20`, `58a6f887`, `c7909d60` |
+| BAR 2 is one RAM region with no dirty log and no `scanout_written` callback: the library's window draws the scanout again at each refresh while it shows no presented surface | `7aee20f4` |
 
 The branch's other commits are the apple-gfx work `eb36a099` removes, and
 `cbb749d421`, an HVF workaround that `481e881b5c` reverts, upstream having
@@ -122,12 +123,11 @@ is its transport:
 - **BAR 2**, 64-bit and prefetchable: the library's region
   (`rvg_graphics_device_region`), 1 GiB of memory of QEMU's process (on
   Linux a shared mapping of a memfd of the library's, on macOS private
-  anonymous memory), as two RAM regions over the one mapping: the control
-  rings, below `RVG_GRAPHICS_ALLOCATIONS_OFFSET` (0x400000), and the guest's
-  allocations from there. Only the allocations are dirty-logged
-  (`DIRTY_MEMORY_VGA`), where the guest's scanout lies; the library asks at
-  each refresh whether the guest wrote the scanout (`scanout_written`),
-  which takes the BQL to snapshot and clear that log.
+  anonymous memory), as one RAM region over the mapping: the control rings,
+  below `RVG_GRAPHICS_ALLOCATIONS_OFFSET` (0x400000), and the guest's
+  allocations from there. It has no dirty log: the library's window draws
+  the guest's scanout again at each of the display's refreshes while it
+  shows no presented surface.
 - **The guest's RAM**: where every range of it is a shared file in pages of
   the host's size (the memfd of `reims-ctl`'s VMs), the library gets the
   RAM's map and the files behind it, and the GPU uses an IOSurface's own
