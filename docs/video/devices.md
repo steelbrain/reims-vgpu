@@ -31,12 +31,20 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   profiles, its highest level, its smallest and largest coded pictures, its DPB and reference
   bounds, its output formats, and the alignment at which it reads an access unit in place.
   Each answer is the arm's video API's own (the arms' docs).
-- **The flags**: `RGFX_VIDEO_CAPS_OUTPUT_CACHED` where the kext makes device caches
-  (`RGFX_FEATURE_SURFACE_CACHE`) and the arm lands pictures in them by its own GPU work: NVDEC,
-  where CUDA imports the device's exportable buffers ([nvidia.md](nvidia.md)). The device's
-  caches are then made exportable as they are made, and the guest's video driver asks its
-  output surfaces cached (`guest/bundle/src/RgfxMetalDevice+Video.mm`); elsewhere it asks them
-  uncached. VA-API never sets the flag.
+- **The flags**: `RGFX_VIDEO_CAPS_OUTPUT_CACHED` where the kext makes device caches, of every
+  surface it asks one for (`RGFX_FEATURE_SURFACE_CACHE`, a GPU of its own memory) or of those
+  whose textures would not lie in place in their pages (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`, a
+  GPU that shares the CPU's memory), and the arm lands pictures in them: NVDEC by its own GPU
+  work, where CUDA imports the device's exportable buffers ([nvidia.md](nvidia.md)), the
+  device's caches then made exportable as they are made; VA-API by the runtime device's copy
+  of the decode surface, or the CPU's through the session's staging ([vaapi.md](vaapi.md)).
+  The guest's video driver then asks its output surfaces cached
+  (`guest/bundle/src/RgfxMetalDevice+Video.mm`), with their layout, as for any other surface,
+  and on a GPU that shares the CPU's memory the device keeps a cache of those it answers so;
+  elsewhere it asks them uncached. A cache made for a surface whose first plane starts off a
+  multiple of 256 bytes, as CoreVideo's 32 bytes into their surface, lays that byte on a multiple
+  of 256 bytes of its memory, so textures over the planes lie in the cache rather than in the
+  runtime's shadows (`surface_cache::aligned_byte`).
 - **The layouts**: an `RgfxVideoOutputLayout` per entry, which says how a surface is laid out
   to take a picture's whole coded rows and columns in place. An arm that lands every picture by
   a copy of its crop answers zero, and every entry's is zero where the flag is set, since a

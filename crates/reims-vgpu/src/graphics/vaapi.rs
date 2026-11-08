@@ -213,6 +213,12 @@ impl<P: Platform> GraphicsVideo<P> for VaapiVideo<P> {
         encode::encode_caps(codec, &self.encoders)
     }
 
+    /// Every host's: a picture lands in an output's device cache by the GPU's copy, or by the
+    /// CPU's into the session's staging and the staging's copy into the cache (module docs).
+    fn lands_in_device_caches(&self) -> bool {
+        true
+    }
+
     fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>> {
         let entry = (self.caps.iter()).find(|c| c.codec == codec && c.direction == direction)?;
         if direction == RGFX_VIDEO_ENCODE {

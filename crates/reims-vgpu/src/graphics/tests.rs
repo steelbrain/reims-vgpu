@@ -10303,3 +10303,71 @@ fn a_handed_over_record_s_cost() {
     stats("commit to CB_SCHEDULED, handed over", &scheduled_us[0]);
     stats("commit to CB_SCHEDULED, inline", &scheduled_us[1]);
 }
+
+/// A host's hardware video for [`video_caps`]: one HEVC decode, landing its pictures in place at
+/// a layout of its own, and in device caches where `cached`.
+struct CapsVideo {
+    cached: bool,
+}
+
+impl GraphicsVideo<FakePlatform> for CapsVideo {
+    fn caps(&self) -> Vec<RgfxVideoCodecCaps> {
+        vec![RgfxVideoCodecCaps {
+            codec: RGFX_VIDEO_CODEC_HEVC,
+            direction: RGFX_VIDEO_DECODE,
+            ..RgfxVideoCodecCaps::default()
+        }]
+    }
+
+    fn layout(&self, _codec: &RgfxVideoCodecCaps) -> RgfxVideoOutputLayout {
+        RgfxVideoOutputLayout {
+            granularity: [2, 2],
+            alignment: 256,
+            reserved_0c: 0,
+        }
+    }
+
+    fn session(
+        &self,
+        _codec: u32,
+        _direction: u32,
+    ) -> Option<Arc<dyn GraphicsVideoSession<FakePlatform>>> {
+        None
+    }
+
+    fn lands_in_device_caches(&self) -> bool {
+        self.cached
+    }
+}
+
+/// A video that lands pictures in device caches has the guest ask its outputs cached, with no
+/// layout in place, on a device whose kext makes caches of every surface it asks one for
+/// (`SURFACE_CACHE`) and on one whose GPU shares the CPU's memory and keeps caches of the surfaces
+/// whose textures would not lie in place (`SURFACE_CACHE_REFUSED`); a device that makes no cache,
+/// or a video that lands none, answers the layout its pictures land in place at
+#[test]
+fn outputs_are_cached_where_the_kext_makes_caches_and_the_video_lands_in_them() {
+    let refused = u64::from(RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE_REFUSED);
+    let all = u64::from(RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE);
+    let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES);
+    for (features, lands, cached) in [
+        (refused, true, true),
+        (all, true, true),
+        (in_place, true, false),
+        (0, true, false),
+        (refused, false, false),
+        (all, false, false),
+    ] {
+        let caps = video_caps(features, &CapsVideo { cached: lands });
+        let what = format!("features {features:#x}, landing in caches: {lands}");
+        assert_eq!(caps.codec_count, 1, "{what}");
+        assert_eq!(caps.codecs[0].codec, RGFX_VIDEO_CODEC_HEVC, "{what}");
+        if cached {
+            assert_eq!(caps.flags, RGFX_VIDEO_CAPS_OUTPUT_CACHED, "{what}");
+            assert_eq!(caps.layouts[0], RgfxVideoOutputLayout::default(), "{what}");
+        } else {
+            assert_eq!(caps.flags, 0, "{what}");
+            assert_eq!(caps.layouts[0].alignment, 256, "{what}");
+        }
+    }
+}

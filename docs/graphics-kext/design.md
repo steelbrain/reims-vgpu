@@ -454,7 +454,12 @@ Stages:
         the bus into the pages. The outputs of the bundle's own video driver
         ask no cache where the host lands no picture in one (no
         `RGFX_VIDEO_CAPS_OUTPUT_CACHED`, item 16), its decode writing their
-        pages: their textures ask under `RgfxAskUncachedScope`. Correctness
+        pages: their textures ask under `RgfxAskUncachedScope`. A host
+        whose hardware video lands pictures in device caches says the flag
+        wherever the kext makes them, on a GPU of its own memory
+        (`SURFACE_CACHE`) or one that shares the CPU's
+        (`SURFACE_CACHE_REFUSED`), where the outputs then ask with their
+        layout as any other surface does. Correctness
         does not rest on that choice:
         a surface a host-side device writes (the M2 scaler, the VideoToolbox
         decoder) may be cached all the same, and the host invalidates the

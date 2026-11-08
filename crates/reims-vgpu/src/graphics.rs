@@ -371,33 +371,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // for the guest's video driver.
             let video_runtime = crate::video::runtime::PlatformRuntime::of(&platform);
             if let Some(video) = platform.graphics_video(&gpu_device, video_runtime) {
-                // Pictures land in device caches only where the kext makes them.
-                let cached = features & u64::from(RGFX_FEATURE_SURFACE_CACHE) != 0
-                    && video.lands_in_device_caches();
-                let mut caps = RgfxVideoCaps {
-                    version: RGFX_VIDEO_CAPS_VERSION,
-                    flags: if cached {
-                        RGFX_VIDEO_CAPS_OUTPUT_CACHED
-                    } else {
-                        0
-                    },
-                    ..RgfxVideoCaps::default()
-                };
-                // A picture lands in place only in a surface's pages: none where the guest asks
-                // its outputs cached.
-                let slots = caps
-                    .codecs
-                    .iter_mut()
-                    .zip(&mut caps.layouts)
-                    .zip(&mut caps.encode);
-                for (((slot, layout), encode), codec) in slots.zip(video.caps()) {
-                    if !cached {
-                        *layout = video.layout(&codec);
-                    }
-                    *encode = video.encode_caps(&codec);
-                    *slot = codec;
-                    caps.codec_count += 1;
-                }
+                let caps = video_caps(features, &*video);
+                let cached = caps.flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED != 0;
                 debug_assert!(caps.codec_count as usize <= RGFX_VIDEO_CAPS_CODECS);
                 region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
                 if cached && video.imports_device_caches() {
@@ -2710,6 +2685,43 @@ fn scanout_sink<P: ApiPlatform>(
     }
     let _ = (any, presented_any, region, shown);
     None
+}
+
+/// The video caps of the host's hardware video `video` on a device of `features`: its codecs,
+/// each with what an encode takes beyond it, and either the layout a decode lands its pictures in
+/// place in, or `RGFX_VIDEO_CAPS_OUTPUT_CACHED` and no layout, where the guest asks its outputs
+/// cached. Pictures land in device caches only where the kext makes them: of every surface it
+/// asks one for (`SURFACE_CACHE`), or of those whose textures would not lie in place in their
+/// pages, where the GPU shares the CPU's memory (`SURFACE_CACHE_REFUSED`), and where `video` lands
+/// pictures in them. The guest's decoder then asks a cache for its outputs with their layout, as
+/// for any other surface, and a picture lands in place only in a surface's pages.
+fn video_caps<P: Platform>(features: u64, video: &dyn GraphicsVideo<P>) -> RgfxVideoCaps {
+    let caches =
+        u64::from(RGFX_FEATURE_SURFACE_CACHE) | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED);
+    let cached = features & caches != 0 && video.lands_in_device_caches();
+    let mut caps = RgfxVideoCaps {
+        version: RGFX_VIDEO_CAPS_VERSION,
+        flags: if cached {
+            RGFX_VIDEO_CAPS_OUTPUT_CACHED
+        } else {
+            0
+        },
+        ..RgfxVideoCaps::default()
+    };
+    let slots = caps
+        .codecs
+        .iter_mut()
+        .zip(&mut caps.layouts)
+        .zip(&mut caps.encode);
+    for (((slot, layout), encode), codec) in slots.zip(video.caps()) {
+        if !cached {
+            *layout = video.layout(&codec);
+        }
+        *encode = video.encode_caps(&codec);
+        *slot = codec;
+        caps.codec_count += 1;
+    }
+    caps
 }
 
 #[cfg(test)]

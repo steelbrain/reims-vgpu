@@ -439,6 +439,17 @@ the render node of the runtime device's own GPU, whatever its vendor
      planes' host bytes, or into the session's staging where a plane lies
      in a device cache.
 
+  Its outputs lie in device caches wherever the kext makes them: the arm
+  lands pictures in them (`lands_in_device_caches`), so the device answers
+  `RGFX_VIDEO_CAPS_OUTPUT_CACHED` on every host that makes caches, a GPU of
+  its own memory or one that shares the CPU's ([devices.md](devices.md),
+  "The flags"), and the guest's decoder asks its outputs cached. On a GPU
+  that shares the CPU's memory, an output whose textures would not lie in
+  place in its pages, or whose view has no room for its mappings, takes a
+  cache, which the GPU's copy writes, its first plane on a multiple of 256
+  bytes of the cache's memory; one whose textures lie in place stays in its
+  pages.
+
   A session logs each reason its pictures take the third way once, as
   `a picture copied by the CPU: rows of 1920 bytes: the driver imports
   rows of a multiple of 256 bytes alone; and the GPU's copy: …` (`; and
