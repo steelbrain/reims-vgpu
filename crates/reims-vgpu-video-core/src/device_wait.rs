@@ -1,25 +1,20 @@
 //! How long a backend waits for its device, and what it keeps of work its
 //! device has not finished by then.
 //!
-//! A decode, an encode, a motion estimate or a copy runs on the device
-//! after the driver call that submits it returns, and the backend waits
-//! for it before it reads what the device wrote. No such wait has a bound
-//! of its own: a driver's blocking wait (NVDEC's map, NVENC's lock, CUDA's
-//! synchronous copy, VA-API's sync) returns when the device is done, and a
-//! device that never finishes would hold the session's thread for good. So
-//! each backend waits by asking the driver's own non-blocking question
-//! until the work is done or [`DEVICE_WAIT`] has passed ([`poll_until`]).
+//! A decode, an encode or a copy runs on the device after the driver call
+//! that submits it returns, and the backend waits for it before it reads
+//! what the device wrote. No such wait has a bound of its own: a driver's
+//! blocking wait (NVDEC's map, NVENC's lock, CUDA's synchronous copy,
+//! VA-API's sync) returns when the device is done, and a device that never
+//! finishes would hold the caller's thread for good. So each backend waits
+//! by asking the driver's own non-blocking question until the work is done
+//! or [`DEVICE_WAIT`] has passed ([`poll_until`]).
 //!
-//! **What the guest sees past it.** The frame fails as the backend's
-//! malfunction ([`crate::backend::BackendError::Malfunction`]), the status
-//! Apple's host gives a frame its hardware fails: a decoded frame is
-//! emitted with kVTVideoDecoderMalfunctionErr (-12911) and no image, its
-//! buffer named in a `Dfub`; an encoded frame with
-//! kVTVideoEncoderMalfunctionErr (-12912) and no sample; a motion estimate
-//! with -17691 and no vectors (docs/video/backends.md, "How errors reach
-//! the guest"). A backend whose device missed a deadline fails each later
-//! call on the same decoder, encoder or estimator at once, the same way,
-//! so that no later frame waits its own deadline behind it.
+//! **Past it**, the work fails as the backend's malfunction
+//! ([`crate::backend::BackendError::Malfunction`]). A backend whose device
+//! missed a deadline fails each later call on the same decoder or encoder
+//! at once, the same way, so that no later frame waits its own deadline
+//! behind it.
 //!
 //! **What is kept.** The device may still be writing, so nothing it may
 //! write is handed back or used again until it is done:
@@ -28,28 +23,22 @@
 //!   backend gives to [`Lingering`] with its question;
 //! - a guest buffer a device writes itself (zero copy): its hold
 //!   ([`GuestHold`], from [`crate::device_memory::GuestTarget::hold`]),
-//!   which the backend keeps with the rest. While a hold lives the session
-//!   sends no `rels` for the buffer, so the guest sees it in use and its
-//!   pages are neither reused nor unmapped (the mapper answers an unmap of
-//!   a held surface Busy). Once the last of the hold goes, the device's
-//!   write is told of ([`GuestHold::report_late_write`]), so that a copy
-//!   of the pages the host keeps elsewhere is not left stale.
+//!   which the backend keeps with the rest. While a hold lives the
+//!   buffer's pages are neither reused nor unmapped. Once the last of the
+//!   hold goes, the device's write is told of
+//!   ([`GuestHold::report_late_write`]), so that a copy of the pages the
+//!   host keeps elsewhere is not left stale.
 //!
 //! [`Lingering`]'s thread asks each kept work's question every
 //! [`LINGER_POLL`], and drops it once the device is done: its memory is
-//! freed, its handle destroyed and its guest buffer let go, whose `rels`
-//! the session's next sweep sends. Work a device never finishes is kept
-//! until the process ends: that is what is leaked, on purpose, since
-//! freeing it would hand memory the device may still write to the host's
-//! allocator or back to the guest.
+//! freed, its handle destroyed and its guest buffer let go. Work a device
+//! never finishes is kept until the process ends: that is what is leaked,
+//! on purpose, since freeing it would hand memory the device may still
+//! write to the host's allocator or back to the guest.
 //!
-//! What stays bounded: the session's thread answers the guest
-//! [`DEVICE_WAIT`] after the work was due at most, and so the session's
-//! end, which waits for the message in hand 10 s at most
-//! (`crate::host::session_thread`), is not left waiting on a stuck call.
-//! A device reset ends the host session with work still kept: its guest
-//! buffers stay held by this host, though the guest's driver has let them
-//! go with the reset.
+//! What stays bounded: the caller's thread is answered [`DEVICE_WAIT`]
+//! after the work was due at most, and so is not left waiting on a stuck
+//! call.
 
 use std::any::Any;
 use std::fmt;
@@ -65,11 +54,7 @@ use crate::sync::Mutex;
 /// The slowest frame measured on any of the hosts' GPUs is the first decode
 /// after an RX 7900 XTX has idled 5 s, 0.88 s, most of it the GPU waking
 /// from runtime suspend (docs/video/bugs.md, B61). Five seconds is over
-/// five times that. It stays under the guest's own wait for a codec
-/// operation, 10 s (`kVTParavirtualizationCodecOperationReplyTimeout`, the
-/// wait of a synchronous `dfrm` and of a `Demt`), so that the guest hears
-/// the malfunction before its wait runs out, and under the 10 s a session's
-/// end waits for the message in hand.
+/// five times that.
 pub const DEVICE_WAIT: Duration = Duration::from_secs(5);
 
 /// The pause between two of a poll's questions while the work may be
@@ -131,10 +116,10 @@ pub fn deadline(runtime: &dyn Runtime) -> MonoTime {
     runtime.deadline_in(DEVICE_WAIT)
 }
 
-/// Keeps a guest buffer held while it lives, as a session's own use of it
-/// does: no `rels` goes for the buffer, so the guest sees it in use, and
-/// its pages are neither reused nor unmapped (module docs). Made by core
-/// for each buffer it lends a device ([`crate::device_memory::GuestTarget::hold`]).
+/// Keeps a guest buffer held while it lives, as the host's own use of it
+/// does: its pages are neither reused nor unmapped (module docs). Made by
+/// the host for each buffer it lends a device
+/// ([`crate::device_memory::GuestTarget::hold`]).
 ///
 /// **A write past the deadline.** A device that missed its deadline may
 /// still write the buffer, after the call that lent it has answered the
@@ -174,7 +159,7 @@ impl GuestHold {
         })))
     }
 
-    /// A hold of nothing: a target a test makes over memory no session
+    /// A hold of nothing: a target a test makes over memory no host
     /// holds.
     pub fn nothing() -> Self {
         Self(None)

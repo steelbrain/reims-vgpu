@@ -7,8 +7,7 @@
 //! | wait | asked with | in place of |
 //! |---|---|---|
 //! | a decode | `vaSyncSurface2` of its surface, with a timeout of 0, until it answers other than `VA_STATUS_ERROR_TIMEDOUT` (`super::surface`) | `vaSyncSurface` |
-//! | a video-processing run: the staged copy back's, zero copy's, the JPEG engine's conversions, the trial runs at start | for the copy back, zero copy and a JPEG conversion's last run, into host memory, a `poll` of the dma-bufs it writes until the deadline (`super::fence`); then `vaSyncSurface2` of its target, as a decode's | the poll for 1 s, then `vaSyncSurface` |
-//! | a JPEG decode | into host memory, a `poll` of its dma-buf until the deadline, then `vaSyncSurface2` of its surface; into the driver's surface, `vaSyncSurface2` alone (`super::jpeg`) | `vaSyncSurface` |
+//! | a video-processing run: the staged copy back's, zero copy's, the trial runs at start | for the copy back and zero copy, into host memory, a `poll` of the dma-bufs it writes until the deadline (`super::fence`); then `vaSyncSurface2` of its target, as a decode's | the poll for 1 s, then `vaSyncSurface` |
 //! | an encode | `vaSyncBuffer` of its coded buffer, with a timeout of 0 (`super::encoder`) | `vaSyncBuffer` with `VA_TIMEOUT_INFINITE` |
 //! | a driver call that may wait for the GPU itself: `vaGetImage`, `vaMapBuffer` of a derived image, `vaSyncSurface` where the driver has no `vaSyncSurface2`, a decoder's first `vaEndPicture` (`super::buffer`) | its answer, the call made on the display's call thread (`super::calls`) | the call on the caller's thread |
 //! | every other driver call, while one of those is in the driver | the display's gate, held exclusively by the call thread meanwhile (`super::calls`) | the driver's own lock, which a call that waits holds while it does |
@@ -25,29 +24,25 @@
 //! 14 ms at the median and 26 ms at most. Which calls wait inside the
 //! driver is measured in `super::calls`.
 //!
-//! **One deadline a frame.** A session's call (a decode, an encode, a JPEG
-//! decode) and the read backs of the frames a decode gives share one
-//! deadline ([`Deadline`]), [`DEVICE_WAIT`] from the first of their waits,
-//! a wait for the display's gate or call thread among them: each is made
-//! by the deadline of the frame in hand on its thread ([`by`],
-//! [`current`]). So a frame is answered within one deadline of its first
+//! **One deadline a frame.** A session's call (a decode, an encode) and the
+//! read backs of the frames a decode gives share one deadline
+//! ([`Deadline`]), [`DEVICE_WAIT`] from the first of their waits, a wait
+//! for the display's gate or call thread among them: each is made by the
+//! deadline of the frame in hand on its thread ([`by`], [`current`]). So a frame is answered within one deadline of its first
 //! wait, however many calls and questions it makes: for a decoder's first
 //! frame, its first `vaEndPicture`, whose answer is waited for. A question
 //! asked past the deadline is asked once: work done by then is done.
 //!
-//! What a decoder, an encoder or the JPEG engine does once a wait
-//! of its has passed its deadline: that frame fails as a malfunction
-//! ([`Error::Stalled`]), and each later call on it fails at once the same
-//! way, so that the guest hears of each frame without a wait of its own: a
-//! decoder's or an encoder's for as long as it lives, the JPEG engine's
-//! until what was kept is let go ([`LetGo`]), since it outlives the
-//! sessions it serves.
+//! What a decoder or an encoder does once a wait of its has passed its
+//! deadline: that frame fails as a malfunction ([`Error::Stalled`]), and
+//! each later call on it fails at once the same way, for as long as it
+//! lives, so that each frame is answered without a wait of its own.
 //! Nothing of the work is destroyed until the GPU is done with it: a
 //! decoder's surfaces, its staged copy back's memory and its context, an
-//! encoder's session, the JPEG engine's surfaces and contexts, and a guest
-//! buffer zero copy writes, with the session's hold on it. Nothing a call
-//! left on the call thread uses is destroyed before it returns: the
-//! display's releases are made behind it there (`super::calls`).
+//! encoder's session, and a guest buffer zero copy writes, with the host's
+//! hold on it. Nothing a call left on the call thread uses is destroyed
+//! before it returns: the display's releases are made behind it there
+//! (`super::calls`).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -253,25 +248,6 @@ pub(crate) fn keep_work(display: &Display, what: impl Into<String>, work: Box<dy
     #[cfg(test)]
     tests::KEPT_EVER.fetch_add(1, Ordering::SeqCst);
     Lingering::process(display.runtime()).keep(what, work);
-}
-
-/// Sets its flag as it drops: the last of a holding [`keep`] keeps, so that
-/// the flag says the work is let go. An engine that outlives the sessions
-/// it serves (the JPEG decoder) gives the GPU work again once it is set.
-pub(crate) struct LetGo(Arc<AtomicBool>);
-
-impl LetGo {
-    /// A flag not yet set, and what sets it.
-    pub(crate) fn new() -> (Arc<AtomicBool>, LetGo) {
-        let flag = Arc::new(AtomicBool::new(false));
-        (Arc::clone(&flag), LetGo(flag))
-    }
-}
-
-impl Drop for LetGo {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
 }
 
 /// Work [`keep`] keeps: dropped in field order, what it holds first.

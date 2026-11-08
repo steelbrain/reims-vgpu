@@ -195,23 +195,13 @@ pub(crate) struct Mapping<'i> {
 }
 
 impl Mapping<'_> {
-    /// The image mapped.
-    pub(crate) fn image(&self) -> &Image {
-        self.image
-    }
-
-    /// The mapped bytes.
-    pub(crate) fn bytes(&self) -> &[u8] {
+    /// The mapped bytes, for writing.
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: a mapped image buffer is `data_size` bytes, readable and
         // writable, until vaUnmapBuffer (va.h, VAImage), which runs only
         // as this drops; `data` is not null, and the image is borrowed
-        // mutably for the mapping's life, so nothing else maps it.
-        unsafe { core::slice::from_raw_parts(self.data, self.len) }
-    }
-
-    /// The mapped bytes, for writing.
-    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as in `bytes`, and borrowed mutably through `self`.
+        // mutably for the mapping's life, so nothing else maps it; and the
+        // bytes are borrowed mutably through `self`.
         unsafe { core::slice::from_raw_parts_mut(self.data, self.len) }
     }
 }

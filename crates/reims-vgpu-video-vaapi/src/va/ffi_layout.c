@@ -368,10 +368,6 @@ int main(void)
     C(DRM_FORMAT_MOD_LINEAR);
     C(DRM_FORMAT_NV12);
     C(DRM_FORMAT_P010);
-    C(DRM_FORMAT_YUYV);
-    C(DRM_FORMAT_YUV444);
-    C(DRM_FORMAT_R8);
-    C(DRM_FORMAT_ARGB8888);
     C(VAGenericValueTypeInteger);
     C(VAGenericValueTypePointer);
     C(VAPictureParameterBufferType);

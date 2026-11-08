@@ -111,7 +111,7 @@ macro_rules! from_codec {
     )*};
 }
 
-from_codec!(h264, av1, vp9);
+from_codec!(h264);
 
 /// An HEVC error: as `from_codec`'s, and a RASL picture skipped is no
 /// malformed stream.

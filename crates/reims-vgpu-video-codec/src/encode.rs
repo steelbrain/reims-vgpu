@@ -11,10 +11,9 @@
 //!
 //! The slice data is the hardware's: the VA-API backend's encoder hands
 //! the driver these headers packed ([`encoder`]), and turns its output
-//! into [`EncodedSample`]s. NVENC writes its own headers, and takes the
-//! session ([`session`]), the B pictures' limits, the key frames
-//! ([`gop::KeyFrames`]) and the decode times ([`gop::DecodeTimes`]) from
-//! here.
+//! into [`EncodedSample`]s. NVENC writes its own headers, and takes the B
+//! pictures' limits, the key frames ([`gop::KeyFrames`]) and the decode
+//! times ([`gop::DecodeTimes`]) from here.
 
 mod bits;
 pub mod encoder;
@@ -23,7 +22,6 @@ pub mod h264;
 pub mod hevc;
 pub mod limit_rate;
 pub mod nal;
-pub mod session;
 
 use std::num::NonZeroU32;
 use std::sync::Arc;

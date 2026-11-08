@@ -1,26 +1,23 @@
 //! The crate's waits past their deadlines on a GPU (`super`): a decode, a
-//! staged copy back's run, an encode and a JPEG decode into host memory,
-//! each asked after with no time to run at all, so that each is still
-//! running at its deadline. Run on the VA-API host, on the render node
+//! staged copy back's run and an encode, each asked after with no time to
+//! run at all, so that each is still running at its deadline. Run on the VA-API host, on the render node
 //! `RVG_VAAPI_NODE` names (`/dev/dri/renderD128` where it is unset).
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use reims_vgpu_video_core::jpeg::{
-    JpegDecode, JpegDecoder, JpegError, JpegOutputFormat, JpegSubsampling, PixelRect,
-};
 use reims_vgpu_video_core::runtime::{Runtime, StdRuntime};
-use reims_vgpu_video_core::surfaces::PlaneDestination;
 
-use super::kept;
 use super::tests::{KEPT_EVER, WAIT, within_5_s};
+use super::{Work, current, kept, wait_for};
 use crate::encode::{EncoderSettings, InputFrame, Plane, Profile};
+use crate::va::caps::{self, Config, Context, Entrypoint};
 use crate::va::display::{Display, Error};
 use crate::va::encoder::VideoEncoder;
 use crate::va::frame::Frame;
 use crate::va::h264::H264Decoder;
-use crate::va::jpeg::VaapiJpegDecoder;
+use crate::va::readback::copy;
+use crate::va::surface::{Surface, SurfaceFormat, SurfacePool};
 
 /// The size the tests decode and encode at: a 4K frame takes the GPU
 /// milliseconds.
@@ -132,133 +129,57 @@ pub(super) fn stalled<T>(result: &Result<T, Error>) -> bool {
     matches!(result, Err(Error::Stalled(_)))
 }
 
-/// The size of the tests' JPEGs, whose scan a build of the tests walks in
-/// milliseconds.
-pub(super) const JPEG_SIZE: (u32, u32) = (1920, 1080);
-
-/// A baseline 4:2:0 JPEG of `width` by `height`, every sample mid-grey:
-/// one quantization table of ones, Annex K's Huffman tables (none in the
-/// stream), and each MCU four luma blocks and two chroma ones of a DC
-/// difference of 0 and an end of block.
-fn grey_jpeg(width: u16, height: u16) -> Vec<u8> {
-    let mut out = vec![0xff, 0xd8];
-    let segment = |out: &mut Vec<u8>, marker: u8, payload: &[u8]| {
-        out.extend([0xff, marker]);
-        out.extend(u16::try_from(payload.len() + 2).unwrap_or(0).to_be_bytes());
-        out.extend(payload);
-    };
-    let mut dqt = vec![0u8];
-    dqt.extend([1u8; 64]);
-    segment(&mut out, 0xdb, &dqt);
-    let mut sof = vec![8];
-    sof.extend(height.to_be_bytes());
-    sof.extend(width.to_be_bytes());
-    sof.extend([3, 1, 0x22, 0, 2, 0x11, 0, 3, 0x11, 0]);
-    segment(&mut out, 0xc0, &sof);
-    segment(&mut out, 0xda, &[3, 1, 0x00, 2, 0x11, 3, 0x11, 0, 63, 0]);
-    let mcus = usize::from(width.div_ceil(16)) * usize::from(height.div_ceil(16));
-    for _ in 0..mcus {
-        // Luma: DC "00", AC EOB "1010", four times; chroma: DC "00", AC EOB
-        // "00", twice.
-        out.extend([0x28, 0xa2, 0x8a, 0x00]);
-    }
-    out.extend([0xff, 0xd9]);
-    out
+/// A video-processing run of the whole of one NV12 surface of the
+/// driver's at [`SIZE`] into another, as the staged copy back's and zero
+/// copy's are ([`copy`]), waited for by its target ([`wait_for`]).
+pub(super) struct Run {
+    display: Display,
+    /// Destroyed before the surfaces it renders into: the fields drop in
+    /// their order.
+    context: Context,
+    from: Surface,
+    to: Surface,
 }
 
-/// A [`JPEG_SIZE`] decode into `format` at 1/`scale`: at full size into
-/// `420f`, the decode writes the output itself; scaled or into `BGRA`, a
-/// processing run does (`crate::va::jpeg`).
-pub(super) struct Jpeg {
-    decoder: VaapiJpegDecoder,
-    data: Vec<u8>,
-    format: JpegOutputFormat,
-    scale: u32,
-    luma: Vec<u8>,
-    chroma: Vec<u8>,
-}
-
-impl Jpeg {
-    pub(super) fn new(display: &Display, format: JpegOutputFormat, scale: u32) -> Self {
-        let (width, height) = JPEG_SIZE;
-        let pixels = width as usize * height as usize;
+impl Run {
+    pub(super) fn new(display: &Display) -> Self {
+        let pool =
+            SurfacePool::new(display, SurfaceFormat::Nv12, SIZE.0, SIZE.1, 2).expect("a pool");
+        let from = pool.get().expect("a surface");
+        let to = pool.get().expect("a surface");
+        let context = Config::new(
+            display,
+            caps::Profile::NONE,
+            Entrypoint::VIDEO_PROC,
+            &mut [],
+        )
+        .and_then(|config| Context::new(display, config, SIZE.0, SIZE.1, &mut [to.id()]))
+        .expect("a video-processing context");
         Self {
-            decoder: VaapiJpegDecoder::new(display.clone_ref()).expect("a JPEG decoder"),
-            data: grey_jpeg(
-                u16::try_from(width).expect("a JPEG's width"),
-                u16::try_from(height).expect("a JPEG's height"),
-            ),
-            format,
-            scale,
-            luma: vec![0; pixels * 4],
-            chroma: vec![0; pixels / 2],
+            display: display.clone_ref(),
+            context,
+            from,
+            to,
         }
     }
 
-    /// Has the next decodes made at 1/`scale`.
-    pub(super) fn scale_by(&mut self, scale: u32) {
-        self.scale = scale;
+    /// The run, waited for until the deadline of the frame in hand on this
+    /// thread ([`current`]).
+    pub(super) fn run(&self) -> Result<(), Error> {
+        copy(
+            &self.display,
+            &self.context,
+            self.from.id(),
+            self.to.id(),
+            None,
+        )?;
+        wait_for(
+            &self.display,
+            Work::Surface(self.to.id()),
+            current(&self.display),
+            "a video-processing run in time",
+        )
     }
-
-    pub(super) fn decode(&mut self) -> Result<(), JpegError> {
-        let (width, height) = JPEG_SIZE;
-        let request = JpegDecode {
-            data: &self.data,
-            width,
-            height,
-            subsampling: JpegSubsampling::Yuv420,
-            region: PixelRect {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            },
-            scale: self.scale,
-            format: self.format,
-        };
-        let (out_width, out_height) = request.output_size();
-        let row = out_width as usize;
-        let rows = out_height as usize;
-        let mut planes = match self.format {
-            JpegOutputFormat::Bgra => vec![PlaneDestination {
-                bytes: &mut self.luma,
-                bytes_per_row: row * 4,
-                rows: out_height,
-            }],
-            _ => vec![
-                PlaneDestination {
-                    bytes: &mut self.luma[..row * rows],
-                    bytes_per_row: row,
-                    rows: out_height,
-                },
-                PlaneDestination {
-                    bytes: &mut self.chroma,
-                    bytes_per_row: row,
-                    rows: out_height.div_ceil(2),
-                },
-            ],
-        };
-        self.decoder.decode(&request, &mut planes)
-    }
-}
-
-pub(super) fn malfunction(result: &Result<(), JpegError>) -> bool {
-    matches!(result, Err(JpegError::Malfunction(_)))
-}
-
-/// A decode of `jpeg` once what its engine kept has left core's count:
-/// asked again within 5 s, since core stops counting a work as it starts
-/// to let it go (`device_wait`), and a decode made before the last of it
-/// is dropped fails at once as stalled, of an earlier decode. The last
-/// answer.
-pub(super) fn decodes_again(display: &Display, jpeg: &mut Jpeg) -> Result<(), JpegError> {
-    assert!(within_5_s(|| kept(display) == 0), "still kept");
-    let mut last = Ok(());
-    within_5_s(|| {
-        last = jpeg.decode();
-        last.is_ok()
-    });
-    last
 }
 
 /// A decode still running at its deadline fails as stalled; the frame's
@@ -329,33 +250,6 @@ fn a_copy_back_still_running_at_its_deadline_is_kept_until_it_is_done() {
         return;
     }
     panic!("every copy back was done before it was asked after, in {TRIES} tries");
-}
-
-/// A JPEG decode into host memory of ours (at full size into `420f`, its
-/// output written by the decode itself) still running at its deadline
-/// fails as a malfunction, and the surface it writes, with its context, is
-/// kept until the GPU is done; then the engine decodes again.
-#[test]
-#[ignore = "needs a VA-API GPU: run on the VA-API host"]
-fn a_jpeg_decode_still_running_at_its_deadline_is_kept_until_it_is_done() {
-    let display = display();
-    let mut jpeg = Jpeg::new(&display, JpegOutputFormat::Biplanar420, 1);
-    jpeg.decode().expect("a decode, given the time");
-    for _ in 0..TRIES {
-        let kept_before = KEPT_EVER.load(Ordering::SeqCst);
-        WAIT.set(Some(Duration::ZERO));
-        let missed = jpeg.decode();
-        WAIT.set(None);
-        if missed.is_ok() {
-            continue;
-        }
-        assert!(malfunction(&missed), "{missed:?}");
-        let ever = KEPT_EVER.load(Ordering::SeqCst);
-        assert_eq!(ever, kept_before + 1, "the surface and its context");
-        decodes_again(&display, &mut jpeg).expect("a decode, the GPU done");
-        return;
-    }
-    panic!("every JPEG decode was done before it was asked after, in {TRIES} tries");
 }
 
 /// An encode still running at its deadline fails its picture as stalled;

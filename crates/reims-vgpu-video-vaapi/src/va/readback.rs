@@ -16,13 +16,6 @@
 //! `RVGV_VAAPI_READBACK`). `mapped`, which is only for that, maps the decode
 //! surface's own dma-buf and reads it with streaming loads.
 //!
-//! The JPEG engine reads its outputs from [`HostSurface`]s too, the
-//! decode's own or a conversion's last run's, and an output past what one
-//! takes a strip of rows at a time, each copied into one by the staged
-//! copy's run aimed at a band ([`copy`], `super::jpeg`), a YUY2 output's
-//! from an [`Alias`] of its memory as BGRA; a check that asks for a way
-//! back other than staged has it read the driver's images.
-
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -211,22 +204,13 @@ fn copy_streaming_sse41(dst: &mut [u8], src: &[u8]) {
     dst[i..len].copy_from_slice(&src[i..len]);
 }
 
-/// A format a [`HostSurface`] is laid out in: the decoders' two, and what
-/// the JPEG engine reads (`super::jpeg`).
+/// A format a [`HostSurface`] is laid out in: the decoders' two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostFormat {
     /// `VA_FOURCC_NV12`: luma, then the chroma pairs.
     Nv12,
     /// `VA_FOURCC_P010`: as NV12, 16 bits a sample.
     P010,
-    /// `VA_FOURCC_YUY2`: one plane of 4:2:2, Y0 Cb Y1 Cr.
-    Yuy2,
-    /// `VA_FOURCC_444P`: luma, Cb and Cr planes, each whole.
-    Yuv444,
-    /// `VA_FOURCC_Y800`: luma alone.
-    Y800,
-    /// `VA_FOURCC_BGRA`: one plane, blue, green, red and alpha.
-    Bgra,
 }
 
 impl HostFormat {
@@ -240,7 +224,6 @@ impl HostFormat {
 
     /// Its VA fourcc, render-target format and DRM format.
     fn codes(self) -> (u32, core::ffi::c_uint, u32) {
-        use super::ffi::jpeg as j;
         match self {
             Self::Nv12 => (
                 ffi::VA_FOURCC_NV12,
@@ -252,32 +235,7 @@ impl HostFormat {
                 ffi::VA_RT_FORMAT_YUV420_10,
                 ffi::DRM_FORMAT_P010,
             ),
-            Self::Yuy2 => (
-                j::VA_FOURCC_YUY2,
-                j::VA_RT_FORMAT_YUV422,
-                ffi::DRM_FORMAT_YUYV,
-            ),
-            Self::Yuv444 => (
-                j::VA_FOURCC_444P,
-                j::VA_RT_FORMAT_YUV444,
-                ffi::DRM_FORMAT_YUV444,
-            ),
-            Self::Y800 => (
-                j::VA_FOURCC_Y800,
-                j::VA_RT_FORMAT_YUV400,
-                ffi::DRM_FORMAT_R8,
-            ),
-            Self::Bgra => (
-                vpp::VA_FOURCC_BGRA,
-                vpp::VA_RT_FORMAT_RGB32,
-                ffi::DRM_FORMAT_ARGB8888,
-            ),
         }
-    }
-
-    /// Its VA fourcc.
-    pub(crate) fn fourcc(self) -> u32 {
-        self.codes().0
     }
 
     /// Where each plane of a [`HostSurface`] of `width` by `height` is, its
@@ -297,12 +255,6 @@ impl HostFormat {
         Some((planes, size))
     }
 
-    /// The bytes of a [`HostSurface`] of `width` by `height`; `None` past
-    /// the address space.
-    pub(crate) fn bytes(self, width: u32, height: u32) -> Option<usize> {
-        self.layout(width, height).map(|(_, size)| size)
-    }
-
     /// The bytes a row and the rows of each of its planes, for a surface of
     /// `width` by `height`; `None` past the address space.
     fn planes(self, width: u32, height: u32) -> Option<Vec<(usize, usize)>> {
@@ -311,24 +263,17 @@ impl HostFormat {
         Some(match self {
             Self::Nv12 => vec![(w, h), (half(w) * 2, half(h))],
             Self::P010 => vec![(w.checked_mul(2)?, h), (half(w).checked_mul(4)?, half(h))],
-            Self::Yuy2 => vec![(half(w).checked_mul(4)?, h)],
-            Self::Yuv444 => vec![(w, h); 3],
-            Self::Y800 => vec![(w, h)],
-            Self::Bgra => vec![(w.checked_mul(4)?, h)],
         })
     }
 }
 
 /// A linear VA surface over host memory of ours ([`HostMemory`]), which
-/// the GPU writes and the CPU reads cached: the staged copy back's, and
-/// the JPEG engine's outputs (`super::jpeg`). Each plane's rows are
-/// 256-byte aligned, as AMD's linear surfaces need, and each plane starts
-/// at a page.
+/// the GPU writes and the CPU reads cached: the staged copy back's. Each
+/// plane's rows are 256-byte aligned, as AMD's linear surfaces need, and
+/// each plane starts at a page.
 pub(crate) struct HostSurface {
     display: Display,
     surface: ffi::VASurfaceID,
-    format: HostFormat,
-    size: (u32, u32),
     /// The surface's bytes: its planes at `planes`' offsets and pitches.
     memory: HostMemory,
     planes: Vec<(usize, usize)>,
@@ -360,21 +305,9 @@ impl HostSurface {
         Ok(Self {
             display: display.clone_ref(),
             surface,
-            format,
-            size: (width, height),
             memory,
             planes,
         })
-    }
-
-    /// The surface.
-    pub(crate) fn surface(&self) -> ffi::VASurfaceID {
-        self.surface
-    }
-
-    /// Its format, and its width and height.
-    pub(crate) fn shape(&self) -> (HostFormat, (u32, u32)) {
-        (self.format, self.size)
     }
 
     /// Waits for the GPU's writes into the surface, a run's or a decode's,
@@ -518,91 +451,6 @@ fn export(
     Ok((descriptor, fds))
 }
 
-/// A surface of the driver's, its memory imported again as a surface of
-/// another format and width: the same bytes, which video processing reads
-/// as the other format's. A 4:2:2 output past what one host surface takes
-/// is read through one, YUY2 as BGRA of half its width, since radeonsi's
-/// video processing writes no YUY2 (`super::jpeg`). Destroyed before the
-/// surface it aliases; it holds the driver's memory too, so that destroying
-/// it frees nothing while the surface lives.
-pub(crate) struct Alias {
-    display: Display,
-    surface: ffi::VASurfaceID,
-}
-
-impl Alias {
-    /// `source`'s memory as a surface of `format`, `width` by `height`, in
-    /// one plane at the same offset and pitch: refused where `source`'s
-    /// export is not one linear dma-buf of one plane, where `format`'s rows
-    /// of `width` are wider than its pitch, or `height` of them run past the
-    /// dma-buf, or where the driver refuses the import.
-    pub(crate) fn new(
-        display: &Display,
-        source: ffi::VASurfaceID,
-        format: HostFormat,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, Error> {
-        let (descriptor, fds) = export(display, source)?;
-        let layer = descriptor.layers[0];
-        let object = descriptor.objects[0];
-        let (offset, pitch) = (to_usize(layer.offset[0]), to_usize(layer.pitch[0]));
-        let size = to_usize(object.size);
-        let wanted = format.planes(width, height).unwrap_or_default();
-        let fits = |&(row, rows): &(usize, usize)| {
-            row <= pitch
-                && (rows.checked_sub(1))
-                    .and_then(|last| {
-                        last.checked_mul(pitch)?
-                            .checked_add(offset)?
-                            .checked_add(row)
-                    })
-                    .is_some_and(|end| end <= size)
-        };
-        let [plane] = wanted[..] else {
-            return Err(Error::Unsupported(format!("an alias of {format:?}")));
-        };
-        let Some(fd) = fds.first().filter(|_| {
-            fds.len() == 1
-                && descriptor.num_layers == 1
-                && layer.num_planes == 1
-                && object.drm_format_modifier == ffi::DRM_FORMAT_MOD_LINEAR
-                && fits(&plane)
-        }) else {
-            return Err(Error::Unsupported(format!(
-                "{format:?} {width}x{height} over a surface of {} objects, {} layers of {} \
-                 planes, modifier {:#x}, offset {offset}, pitch {pitch}, {size} bytes",
-                fds.len(),
-                descriptor.num_layers,
-                layer.num_planes,
-                object.drm_format_modifier,
-            )));
-        };
-        let surface = import(
-            display,
-            format,
-            (width, height),
-            (fd.as_raw_fd(), size),
-            &[(offset, pitch)],
-        )?;
-        Ok(Self {
-            display: display.clone_ref(),
-            surface,
-        })
-    }
-
-    /// The surface.
-    pub(crate) fn surface(&self) -> ffi::VASurfaceID {
-        self.surface
-    }
-}
-
-impl Drop for Alias {
-    fn drop(&mut self) {
-        destroy_surface(&self.display, self.surface);
-    }
-}
-
 /// The staged way back: a [`HostSurface`] of the pool's format, and a
 /// video-processing context that copies a decode surface into it.
 pub(crate) struct Staging {
@@ -671,8 +519,8 @@ pub(crate) struct Band {
 /// band's rows into as many at the top of `target`, 1:1. The same colour
 /// standard, range and siting both sides, so that every sample is copied
 /// as it is, as every frame of the decoders' checks was through the staged
-/// copy back (docs/video/vaapi.md, "The copy back"), and as the JPEG
-/// engine's strips are (`super::jpeg`). The run is not waited for.
+/// copy back (docs/video/vaapi.md, "The copy back"). The run is not
+/// waited for.
 pub(crate) fn copy(
     display: &Display,
     context: &Context,

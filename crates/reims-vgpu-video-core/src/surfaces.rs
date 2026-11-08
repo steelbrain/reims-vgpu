@@ -1,37 +1,15 @@
-//! Guest surfaces as the host reaches them: by the mapping ID the guest's
-//! IOSurface mapper gave each one.
-//!
-//! The device that embeds this crate implements [`Surfaces`] over the GPU
-//! device's mapper. A hold is visible to the guest: unmapping a surface the
-//! host holds answers Busy, and the guest kext keeps its own mapping of the
-//! surface until the host's `rels` names it. So the host session holds each
-//! surface exactly as long as Apple's does: while a message that lent it is
-//! being handled, while a decoder session writes into it or waits to hand
-//! it back, and while an encoder session has a frame of it in flight.
-
-pub use crate::wire::surface_boxes::MappingId;
+//! Guest surfaces as a backend reaches them: [`GuestSurface`], one the host
+//! holds, and its layout.
 
 use crate::device_memory::DeviceMemory;
 use crate::fourcc::FourCc;
-
-/// Reaches the guest's surfaces by mapping ID.
-pub trait Surfaces: Send + Sync {
-    /// Takes a hold on the surface with `mapping_id`. The surface stays
-    /// held, and its memory valid, until the returned value is dropped.
-    ///
-    /// A failure is not reported to the guest by itself: the message that
-    /// named the surface is delivered with none of its surfaces, as
-    /// Apple's host does when it cannot map one.
-    fn retain(&self, mapping_id: MappingId) -> Result<Box<dyn GuestSurface>, SurfaceError>;
-}
 
 /// One held guest surface. Dropping it releases the hold.
 ///
 /// A lend, [`GuestSurface::write`] or [`GuestSurface::read`], must not
 /// lend another surface from inside it: a host may lend one surface at a
-/// time in the process, as reims-vgpu's mapper does, so a lend inside
-/// another waits on itself for ever. Copy one surface out first, as the
-/// scaler and the motion-estimation session do.
+/// time in the process, so a lend inside another waits on itself for ever.
+/// Copy one surface out first.
 pub trait GuestSurface: Send + Sync {
     /// The surface's pixel format, size and planes, as the guest created
     /// it.
@@ -42,9 +20,8 @@ pub trait GuestSurface: Send + Sync {
     fn write(&self, write: &mut dyn FnMut(&mut [u8])) -> Result<(), SurfaceError>;
 
     /// Lends the surface's memory for reading, as [`GuestSurface::write`]
-    /// lends it for writing: the encoder sessions read their source frames
-    /// through it. A surface that cannot be read says so, and the frame is
-    /// refused.
+    /// lends it for writing: an encoder reads its source frames through
+    /// it. A surface that cannot be read says so.
     fn read(&self, read: &mut dyn FnMut(&[u8])) -> Result<(), SurfaceError> {
         let _ = read;
         Err(SurfaceError::Unreachable(
@@ -126,9 +103,6 @@ pub struct PlaneSource<'a> {
 /// Why a surface could not be held or reached.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SurfaceError {
-    /// No surface has this mapping ID.
-    #[error("no surface with mapping ID {0:#x}")]
-    Unknown(u64),
     /// The surface exists but its memory cannot be reached.
     #[error("surface memory unreachable: {0}")]
     Unreachable(String),

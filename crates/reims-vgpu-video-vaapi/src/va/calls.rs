@@ -18,7 +18,7 @@
 //! | `vaSyncSurface2` and `vaSyncBuffer` with a timeout of 0 | return | return |
 //! | `vaPutImage`, `vaDeriveImage`, `vaMapBuffer` of an image `vaCreateImage` made, `vaExportSurfaceHandle`, creates and destroys | return | return |
 //!
-//! A run (staged, zero copy, the JPEG engine's) and an encode were held
+//! A run (staged, zero copy) and an encode were held
 //! back and waited for by their bounded questions; a decode was not: VCN
 //! runs beside both rings. Each call that waited held the display's lock
 //! while it did (Mesa's `drv->mutex`): another thread's `vaSyncSurface2`
@@ -67,8 +67,8 @@
 //! the gate as long as Mesa held its lock for it (`vlVaGetImage` and
 //! `vlVaMapBuffer2` map under `drv->mutex`, **read** in Mesa 26.2.4). So
 //! the backend makes none on radeonsi where it can help it: the decoders'
-//! frames and the JPEG engine's outputs are written into host memory of
-//! ours and read there (`super::readback`, `super::jpeg`). **Measured** on the
+//! frames are written into host memory of ours and read there
+//! (`super::readback`). **Measured** on the
 //! RX 7900 XTX and the Radeon 780M (2026-10-26), beside a thread decoding
 //! 4K JPEGs, a 4K H.264 decode on the same display waited for the gate
 //! 330 to 393 times a run of 720 `decode` calls, behind as many derived

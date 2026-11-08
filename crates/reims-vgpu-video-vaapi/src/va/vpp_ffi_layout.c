@@ -60,16 +60,7 @@ int main(void)
 
     C(VAProcPipelineParameterBufferType);
     C(VAProcColorStandardNone);
-    C(VAProcColorStandardBT601);
     C(VAProcColorStandardBT709);
-    C(VA_RT_FORMAT_YUV422);
-    C(VA_RT_FORMAT_RGB32);
-    C(VA_FOURCC_YUY2);
-    C(VA_FOURCC_BGRA);
-    C(VA_FILTER_SCALING_HQ);
     C(VA_ROTATION_NONE);
-    C(VA_SOURCE_RANGE_FULL);
-    C(VA_CHROMA_SITING_VERTICAL_CENTER);
-    C(VA_CHROMA_SITING_HORIZONTAL_CENTER);
     return 0;
 }

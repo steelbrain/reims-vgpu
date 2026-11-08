@@ -5,9 +5,6 @@
 //! compiler: each fuzzer is a plain `#[test]` over a seeded generator, in
 //! the debug test build, whose overflow checks are part of the point.
 //!
-//! Core's fuzz target (`tests/fuzz`) and the codec crate's unit tests
-//! include this file by path.
-//!
 //! A run is reproducible from its seed. Input `i` of a target is made
 //! from a seed of its own, a mix of the run's seed, the target's name and
 //! `i`, so `RVGV_FUZZ_SEED` and `RVGV_FUZZ_INDEX` replay one input, and a

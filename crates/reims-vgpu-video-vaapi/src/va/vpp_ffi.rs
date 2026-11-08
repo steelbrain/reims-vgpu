@@ -12,7 +12,7 @@
     reason = "libva's names, kept for grepping the headers"
 )]
 
-use core::ffi::{c_int, c_uint, c_void};
+use core::ffi::{c_int, c_void};
 
 use super::ffi::{VA_PADDING_LARGE, VABufferID, VABufferType, VASurfaceID};
 
@@ -24,25 +24,11 @@ pub(crate) type VAProcMode = c_int;
 pub(crate) const VAProcPipelineParameterBufferType: VABufferType = 41;
 
 pub(crate) const VAProcColorStandardNone: VAProcColorStandardType = 0;
-pub(crate) const VAProcColorStandardBT601: VAProcColorStandardType = 1;
 pub(crate) const VAProcColorStandardBT709: VAProcColorStandardType = 2;
-
-pub(crate) const VA_RT_FORMAT_YUV422: c_uint = 0x0000_0002;
-pub(crate) const VA_RT_FORMAT_RGB32: c_uint = 0x0002_0000;
-
-pub(crate) const VA_FOURCC_YUY2: u32 = 0x3259_5559;
-pub(crate) const VA_FOURCC_BGRA: u32 = 0x4152_4742;
-
-pub(crate) const VA_FILTER_SCALING_HQ: u32 = 0x0000_0200;
 
 pub(crate) const VA_ROTATION_NONE: u32 = 0;
 
 pub(crate) const VA_MIRROR_NONE: u32 = 0;
-
-pub(crate) const VA_SOURCE_RANGE_FULL: u8 = 2;
-
-pub(crate) const VA_CHROMA_SITING_VERTICAL_CENTER: u8 = 0x02;
-pub(crate) const VA_CHROMA_SITING_HORIZONTAL_CENTER: u8 = 0x08;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -179,29 +165,14 @@ mod tests {
             processing_mode => "processing_mode", output_hdr_metadata => "output_hdr_metadata",
             va_reserved => "va_reserved",
         });
-        let constants: [(&str, i64); 13] = [
+        let constants: [(&str, i64); 4] = [
             (
                 "VAProcPipelineParameterBufferType",
                 VAProcPipelineParameterBufferType.into(),
             ),
             ("VAProcColorStandardNone", VAProcColorStandardNone.into()),
-            ("VAProcColorStandardBT601", VAProcColorStandardBT601.into()),
             ("VAProcColorStandardBT709", VAProcColorStandardBT709.into()),
-            ("VA_RT_FORMAT_YUV422", VA_RT_FORMAT_YUV422.into()),
-            ("VA_RT_FORMAT_RGB32", VA_RT_FORMAT_RGB32.into()),
-            ("VA_FOURCC_YUY2", VA_FOURCC_YUY2.into()),
-            ("VA_FOURCC_BGRA", VA_FOURCC_BGRA.into()),
-            ("VA_FILTER_SCALING_HQ", VA_FILTER_SCALING_HQ.into()),
             ("VA_ROTATION_NONE", VA_ROTATION_NONE.into()),
-            ("VA_SOURCE_RANGE_FULL", VA_SOURCE_RANGE_FULL.into()),
-            (
-                "VA_CHROMA_SITING_VERTICAL_CENTER",
-                VA_CHROMA_SITING_VERTICAL_CENTER.into(),
-            ),
-            (
-                "VA_CHROMA_SITING_HORIZONTAL_CENTER",
-                VA_CHROMA_SITING_HORIZONTAL_CENTER.into(),
-            ),
         ];
         for (name, value) in constants {
             out.push(format!("{name} {value}"));

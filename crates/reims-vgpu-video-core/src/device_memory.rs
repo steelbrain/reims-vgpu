@@ -6,10 +6,8 @@
 //!   ([`crate::surfaces::GuestSurface::device_memory`]): its pages as a
 //!   dma-buf, for a GPU that imports one (VA-API), as one contiguous view
 //!   in the host's address space, for one that registers host memory
-//!   (NVIDIA's `cuMemHostRegister`), or on macOS as the host's IOSurface
-//!   over them, for VideoToolbox's pixel transfers. Each is the same pages
-//!   the surface's lends give, so what a device writes there is what the
-//!   guest reads.
+//!   (NVIDIA's `cuMemHostRegister`). Each is the same pages the surface's
+//!   lends give, so what a device writes there is what the guest reads.
 //! - [`MemoryIdentity`] names one mapping of one surface's pages: the same
 //!   for every hold on that mapping, and never the same for another mapping,
 //!   before or after, so an import kept by it can never be used for a
@@ -24,18 +22,12 @@
 //! - [`GuestTarget`] is a surface's layout checked against its memory, so
 //!   that a device told to write its planes writes nowhere else.
 //!
-//! What may be written, and when, is the CPU copy's: only while the session
+//! What may be written, and when, is the CPU copy's: only while the host
 //! holds the surface, in the window the copy wrote it in. A hold keeps the
-//! mapping and its pages as they are: the host's mapper answers an unmap of
-//! a held surface Busy, and a map of a mapping ID already mapped changes
-//! nothing (reims-vgpu's `iosurface/table.rs`, `unmap` and `map`).
+//! mapping and its pages as they are.
 
 use std::collections::{HashMap, HashSet};
-#[cfg(target_os = "macos")]
-use std::ffi::c_void;
 use std::fmt;
-#[cfg(target_os = "macos")]
-use std::marker::PhantomData;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
@@ -129,9 +121,8 @@ impl MemoryIdentity {
     }
 
     /// Runs `gone` once the mapping is gone, or at once if it is. It runs on
-    /// the thread that drops the mapping, which may hold the host's locks
-    /// (reims-vgpu's mapper unmaps under its own), so it must only pass the
-    /// word on, as a channel's send does: never call a driver, and never
+    /// the thread that drops the mapping, which may hold the host's locks,
+    /// so it must only pass the word on, as a channel's send does: never call a driver, and never
     /// wait.
     pub fn when_gone(&self, gone: impl FnOnce() + Send + 'static) {
         let gone: Gone = Box::new(gone);
@@ -193,95 +184,6 @@ pub trait DeviceMemory: Send + Sync {
         Err(SurfaceError::Unreachable(
             "this host lends no view of a surface's pages".to_owned(),
         ))
-    }
-
-    /// On macOS, the host's IOSurface over the surface's pages, for a
-    /// backend whose device writes IOSurfaces (VideoToolbox's pixel
-    /// transfer), lent for as long as this memory lives, which is the
-    /// hold's. `Err`, with why, where the host has none.
-    ///
-    /// A reference taken of the IOSurface is a hold the guest sees: the
-    /// host's mapper answers the guest's unmap of a surface Busy while
-    /// anything but the mapper retains its IOSurface (reims-vgpu's
-    /// `iosurface/table.rs`, `unmap`). So whatever a backend makes of it, a
-    /// pixel buffer over it among them, is released before its write
-    /// returns, and is never kept in a [`DeviceImports`], which would keep
-    /// it past the hold.
-    #[cfg(target_os = "macos")]
-    fn io_surface(&self) -> Result<LentIoSurface<'_>, SurfaceError> {
-        Err(SurfaceError::Unreachable(
-            "this host lends no IOSurface of a surface".to_owned(),
-        ))
-    }
-}
-
-/// A surface's IOSurface as the host lends it to a device on macOS
-/// ([`DeviceMemory::io_surface`]): the `IOSurfaceRef`, live for `'a`, and
-/// whether the host writes the surface itself.
-///
-/// A device must never write a surface the guest made read-only for its
-/// clients: Apple's scaler wrote into an IOSurface over pages read-only for
-/// it and panicked a Mac, twice. The host lends no such surface, and says
-/// besides, in [`LentIoSurface::writable`], whether it would lend the
-/// surface's bytes for writing, so that a backend checks again before every
-/// write.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-pub struct LentIoSurface<'a> {
-    surface: NonNull<c_void>,
-    writable: bool,
-    _lent: PhantomData<&'a ()>,
-}
-
-// SAFETY: an IOSurfaceRef is a thread-safe CoreFoundation object, which any
-// thread may use while it lives; this carries its address and a flag.
-#[cfg(target_os = "macos")]
-#[expect(unsafe_code, reason = "an IOSurfaceRef crosses threads")]
-unsafe impl Send for LentIoSurface<'_> {}
-// SAFETY: as above.
-#[cfg(target_os = "macos")]
-#[expect(unsafe_code, reason = "an IOSurfaceRef crosses threads")]
-unsafe impl Sync for LentIoSurface<'_> {}
-
-#[cfg(target_os = "macos")]
-impl LentIoSurface<'_> {
-    /// `surface`, lent for the borrow's life; `writable` as
-    /// [`LentIoSurface::writable`] says.
-    ///
-    /// # Safety
-    ///
-    /// `surface` is an `IOSurfaceRef` the caller keeps live for as long as
-    /// the result's lifetime.
-    #[expect(unsafe_code, reason = "the caller keeps the surface live")]
-    pub unsafe fn new(surface: NonNull<c_void>, writable: bool) -> Self {
-        Self {
-            surface,
-            writable,
-            _lent: PhantomData,
-        }
-    }
-
-    /// The `IOSurfaceRef`, live while this borrow is.
-    pub fn as_ptr(&self) -> NonNull<c_void> {
-        self.surface
-    }
-
-    /// Whether the host would lend the surface's bytes for writing, as it
-    /// recorded the surface made: never for one the guest made read-only
-    /// for its clients, or a protected one. A backend writes nothing into
-    /// a surface lent with this false.
-    pub fn writable(&self) -> bool {
-        self.writable
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl fmt::Debug for LentIoSurface<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LentIoSurface")
-            .field("surface", &self.surface)
-            .field("writable", &self.writable)
-            .finish()
     }
 }
 
@@ -504,16 +406,15 @@ impl<'a> GuestTarget<'a> {
         })
     }
 
-    /// The target with `hold`, the session's hold on the buffer, for
+    /// The target with `hold`, the host's hold on the buffer, for
     /// [`GuestTarget::hold`].
     pub fn with_hold(self, hold: GuestHold) -> Self {
         Self { hold, ..self }
     }
 
-    /// The session's hold on the buffer, to keep while the device may still
-    /// write it past its deadline ([`crate::device_wait`]): the guest gets
-    /// no `rels` for the buffer while it lives, so its pages are neither
-    /// reused nor unmapped. A target made without one holds nothing.
+    /// The host's hold on the buffer, to keep while the device may still
+    /// write it past its deadline ([`crate::device_wait`]): while it lives
+    /// the buffer's pages are neither reused nor unmapped. A target made without one holds nothing.
     pub fn hold(&self) -> GuestHold {
         self.hold.clone()
     }

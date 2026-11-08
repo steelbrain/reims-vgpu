@@ -1,23 +1,16 @@
 //! The NVIDIA backend: decode on NVDEC and encode on NVENC, over the CUDA
 //! driver API, with nothing above them.
 //!
-//! The driver's libraries (libcuda, libnvcuvid, libnvidia-encode), and
-//! libnvjpeg where there is one, are loaded at run time, so that a host
-//! with no NVIDIA driver runs without them: opening the backend there
-//! fails, and nothing else does. Their declarations are ours, checked
-//! against NVIDIA's headers on the test host (`layout`'s test), but for
-//! libnvjpeg's, written from `nvjpeg.h` (`jpeg::nvjpeg`).
+//! The driver's libraries (libcuda, libnvcuvid, libnvidia-encode) are
+//! loaded at run time, so that a host with no NVIDIA driver runs without
+//! them: opening a GPU there fails, and nothing else does. Their
+//! declarations are ours, checked against NVIDIA's headers on the test host
+//! (`layout`'s test).
 //!
 //! - [`Gpu`] is a GPU and its CUDA context; [`devices`] lists the host's.
 //! - [`decode_capabilities`] and [`encoder_report`] say what NVDEC and
 //!   NVENC answer.
-//! - [`NvencEncoder`] encodes raw frames to H.264 or HEVC, and
-//!   [`NvidiaEncoders`] is core's encoder backend of them.
-//! - [`NvidiaMotion`] is core's motion-estimation part, on NVENC's ME-only
-//!   mode.
-//! - [`NvidiaJpegDecoder`] is core's JPEG decoder, on nvJPEG's hardware
-//!   decoder, where libnvjpeg (a CUDA toolkit library, which the driver
-//!   does not install) is on the loader's path.
+//! - [`NvencEncoder`] encodes raw frames to H.264 or HEVC.
 //!
 //! Every `unsafe` block holds one operation and says why it is sound, and
 //! every `unsafe fn` its contract (the lints below).
@@ -27,31 +20,29 @@
     clippy::multiple_unsafe_ops_per_block,
     clippy::missing_safety_doc
 )]
+// NVDEC's decoder, its accelerators, CUDA's copies, the bounded waits and
+// zero copy are what the reims-graphics device's NVIDIA video decodes on;
+// nothing in the crate calls them yet.
+#![expect(
+    dead_code,
+    reason = "the NVDEC decoding the reims-graphics device's video builds on"
+)]
 
-mod backend;
 mod cuda;
 mod decode;
 mod dl;
-mod encode;
 mod error;
-mod jpeg;
 #[cfg(test)]
 mod layout;
-mod motion;
 mod nvdec;
 mod nvenc;
 mod probe;
 mod wait;
 mod zero_copy;
 
-pub use backend::{NAME, open_backend};
 pub use cuda::{DeviceInfo, Gpu, GpuSelector};
-pub use decode::NvidiaDecoders;
 pub use dl::LoadError;
-pub use encode::NvidiaEncoders;
 pub use error::Error;
-pub use jpeg::NvidiaJpegDecoder;
-pub use motion::NvidiaMotion;
 pub use nvdec::{ChromaFormat, DecodeCapabilities, NvdecCodec, SurfaceFormat, decode_capabilities};
 pub use nvenc::encoder::{
     Bitstream, EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl, NvencEncoder,

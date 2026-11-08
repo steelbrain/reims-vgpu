@@ -396,8 +396,7 @@ fn limit_rate(
 }
 
 /// The bits a stream held to a hard limit may put in any second: its
-/// buffer and a second at its peak, as the session makes them from the
-/// limit.
+/// buffer and a second at its peak.
 fn hard_limit(settings: &EncoderSettings, peak: u32) -> Result<u64, Unsupported> {
     u64::from(settings.buffer_bits(peak).0)
         .checked_add(u64::from(peak))
@@ -738,8 +737,8 @@ impl<A: Accelerator> Encoder<A> {
         settings.rate_control = rate_control;
         check_settings(&settings)?;
         if let (Some(rate), Some((average, peak))) = (&mut self.limit_rate, rates(rate_control)) {
-            // The limit follows the peak, as the session makes both from
-            // it, so that a new limit holds from here.
+            // The limit follows the peak, so that a new limit holds from
+            // here.
             rate.set_rates(average, hard_limit(&settings, peak)?);
         }
         self.settings = settings;
@@ -1146,7 +1145,7 @@ fn record_of(headers: &Headers, units: &[Vec<u8>]) -> Option<Vec<u8>> {
     }
 }
 
-/// The encoder's tests, and the fake accelerator the session's tests use too.
+/// The encoder's tests, and their fake accelerator.
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -1181,16 +1180,6 @@ pub mod tests {
         lsbs: Vec<u32>,
         /// Whether the stream was configured for QPs the encoder picks.
         picture_qp: bool,
-    }
-
-    impl Fake {
-        /// One whose encode call `call`, counted from 0, fails.
-        pub(crate) fn failing_at(call: usize) -> Self {
-            Self {
-                fail_call: Some(call),
-                ..Self::default()
-            }
-        }
     }
 
     impl Accelerator for Fake {
@@ -1698,8 +1687,8 @@ pub mod tests {
         (at_26 * ((26.0 - f64::from(qp)) / 6.0).exp2()) as usize
     }
 
-    /// Settings held to a limit of 450 kbit/s as the session makes them: a
-    /// peak of 300 kbit/s, and half a second's buffer at it.
+    /// Settings held to a limit of 450 kbit/s: a peak of 300 kbit/s, and
+    /// half a second's buffer at it.
     fn limited() -> EncoderSettings {
         let mut settings = EncoderSettings::new(Profile::H264Main, 640, 360);
         settings.rate_control = RateControl::VariableBitRate {

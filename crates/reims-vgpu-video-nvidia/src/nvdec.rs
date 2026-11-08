@@ -4,12 +4,10 @@
 //! and the DPB kept, by our own codec code; NVDEC gets each picture's
 //! parameters as `CUVIDPICPARAMS`, as VA-API gets its buffers.
 
-pub(crate) mod av1;
 pub(crate) mod decoder;
 pub(crate) mod ffi;
 pub(crate) mod h264;
 pub(crate) mod hevc;
-pub(crate) mod vp9;
 
 use std::sync::OnceLock;
 

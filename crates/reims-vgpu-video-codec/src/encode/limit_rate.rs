@@ -2,11 +2,10 @@
 //! whose own rate control does not keep the HRD buffer it is given. The
 //! encoder core codes each picture at a constant QP that this chooses:
 //! - no second of decode time holds more than the limit: the buffer and a
-//!   second at the peak, as the session makes them from `DataRateLimits`
-//!   (`encode/session.rs`). That is the limit as VideoToolbox's header
-//!   defines it, over "any contiguous segment of that duration (in decode
-//!   time)", held over the pictures themselves rather than through a
-//!   buffer;
+//!   second at the peak ([`super::EncoderSettings::buffer_bits`]). That is
+//!   the limit as VideoToolbox's header defines it, over "any contiguous
+//!   segment of that duration (in decode time)", held over the pictures
+//!   themselves rather than through a buffer;
 //! - the pictures until the next key frame share what the average allows,
 //!   less what the pictures so far took over it, each by its type's
 //!   complexity: the bits it took last at its QP, as if each 6 QP halved
@@ -23,7 +22,7 @@ use std::collections::VecDeque;
 use super::FrameType;
 
 /// What the I, P and B pictures' QPs are offset by from one base: I 2
-/// below, B 2 above, as the constant QP the session derives from `Quality`.
+/// below, B 2 above.
 const OFFSET: PerType<f64> = PerType {
     idr: -2.0,
     p: 0.0,
@@ -357,8 +356,8 @@ mod tests {
 
     #[test]
     fn no_second_takes_more_than_the_limit() {
-        // 720p under a limit of 775 kbit, which the session gives an
-        // average of two thirds of it, with key frames that cost 1.2 Mbit
+        // 720p under a limit of 775 kbit, with an average of two thirds of
+        // it, with key frames that cost 1.2 Mbit
         // at QP 26 and spikes as costly.
         let (average, limit) = (516_666, 775_000);
         let mut rate = LimitRate::new(1280 * 720, 30.0, 90_000, average, limit);

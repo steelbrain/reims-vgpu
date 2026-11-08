@@ -4,14 +4,12 @@
 //! [`accelerator::VaAccelerator`].
 
 mod accelerator;
-mod backend;
 mod caps;
 mod params;
 mod surfaces;
 
 use std::sync::Arc;
 
-pub use backend::VaapiEncoderBackend;
 pub use caps::{EncoderCapabilities, Feature, HevcBlockSizes, HevcFeatures};
 pub use surfaces::UploadMethod;
 

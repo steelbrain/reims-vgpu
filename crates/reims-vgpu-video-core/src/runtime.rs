@@ -2,15 +2,15 @@
 //!
 //! This crate is independent of reims-vgpu-core and of QEMU, so it does not link the library's
 //! platform: it is handed a runtime of three calls instead, a thread's start, the monotonic
-//! clock's time and one timed wait, which a host session ([`crate::host::HostSession`]) and each
-//! backend that starts a thread, waits or times a call keep from their making.
-//! - **The library's** is its platform's (reims-vgpu's `video/runtime.rs`): a session's thread
+//! clock's time and one timed wait, which each backend that starts a thread, waits or times a
+//! call keeps from its making.
+//! - **The library's** is its platform's (reims-vgpu's `video/runtime.rs`): a backend's thread
 //!   is the platform's, named, with the scheduling hints the platform gives a thread that is not
 //!   a FIFO thread, and marked as the library's, so that a panic on it ends the process at once
 //!   as on every thread of the library's (architecture 6.5); and every bound is kept, and every
 //!   time measured, on the platform's monotonic clock, which a test makes virtual.
-//! - **std's**, [`StdRuntime`], is the stand-in guest's (the conformance suite), the examples'
-//!   and the fuzzers': std's threads, and a clock read from std's `Instant`.
+//! - **std's**, [`StdRuntime`], is the examples' and the fuzzers': std's threads, and a clock
+//!   read from std's `Instant`.
 //!
 //! What the guest observes of a bound is its length on the monotonic clock, the same on either.
 //! The waits a bound ends are [`Bell::wait_until`]'s, and [`answer`]'s on it: a [`Bell`] is the
@@ -264,7 +264,7 @@ impl<T> fmt::Debug for Answer<T> {
 pub struct StdRuntime;
 
 impl StdRuntime {
-    /// The process's, as a runtime to hand a session or a backend.
+    /// The process's, as a runtime to hand a backend.
     pub fn shared() -> Arc<dyn Runtime> {
         static SHARED: OnceLock<Arc<StdRuntime>> = OnceLock::new();
         let shared: Arc<StdRuntime> = Arc::clone(SHARED.get_or_init(|| Arc::new(StdRuntime)));

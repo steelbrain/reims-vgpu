@@ -1,8 +1,7 @@
 //! Memory of the process's own that the GPU can write and the CPU reads
 //! cached: a memfd, made a dma-buf by udmabuf, and mapped. The staged copy
 //! back imports it as a VA surface and has the GPU copy each decoded frame
-//! into it; the JPEG engine has its decodes and conversions write their
-//! outputs into it (`super::readback::HostSurface`).
+//! into it (`super::readback::HostSurface`).
 //!
 //! A decode surface lives in video memory, which the CPU reads uncached
 //! over PCIe: `vaGetImage` of a decoded 4K frame on radeonsi ran at about

@@ -11,12 +11,11 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# The encoders' session half (`encode::session`) is core's BackendEncoder.
-reims-vgpu-video-core = { path = "../reims-vgpu-video-core" }
 # The Annex B start-code scan (`h264::nal`), a vectorized substring search.
 memchr.workspace = true
 
 [dev-dependencies]
-# Core's fuzzers' harness, which the tests include (`fuzz_support`), bounds each
-# input by its CPU time, which `clock_gettime` reads.
+# The fuzzers' harness (`fuzz_support`) runs each input on video-core's runtime and locks, and
+# bounds it by its CPU time, which `clock_gettime` reads.
+reims-vgpu-video-core = { path = "../reims-vgpu-video-core" }
 libc.workspace = true

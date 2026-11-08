@@ -808,44 +808,7 @@ fn all_checks() -> Checks {
     cuda_checks(&mut checks);
     nvdec_checks(&mut checks);
     nvenc_checks(&mut checks);
-    nvenc_motion_checks(&mut checks);
     checks
-}
-
-/// NVENC's ME-only mode (`crate::nvenc::motion_ffi`).
-fn nvenc_motion_checks(checks: &mut Checks) {
-    use crate::nvenc::motion_ffi as me;
-    layout!(checks, me::NV_ENC_MVECTOR, "NV_ENC_MVECTOR" { mvx, mvy });
-    layout!(checks, me::NV_ENC_H264_MV_DATA, "NV_ENC_H264_MV_DATA" {
-        mv, mbType, partitionType, reserved, mbCost,
-    });
-    layout!(checks, me::NV_ENC_CREATE_MV_BUFFER, "NV_ENC_CREATE_MV_BUFFER" {
-        version, reserved, mvBuffer, reserved1, reserved2,
-    });
-    layout!(checks, me::NV_ENC_MEONLY_PARAMS, "NV_ENC_MEONLY_PARAMS" {
-        version, inputWidth, inputHeight, reserved, inputBuffer, referenceFrame, mvBuffer,
-        reserved2, bufferFmt, completionEvent, viewID, meHintCountsPerBlock, meExternalHints,
-        reserved1, reserved3,
-    });
-    checks.bits(
-        "NV_ENC_INITIALIZE_PARAMS",
-        "enableMEOnlyMode",
-        offset_of!(enc::NV_ENC_INITIALIZE_PARAMS, flags),
-        size_of::<u32>(),
-        me::enableMEOnlyMode,
-    );
-    checks.constant(
-        "NV_ENC_CREATE_MV_BUFFER_VER",
-        i64::from(me::NV_ENC_CREATE_MV_BUFFER_VER),
-    );
-    checks.constant(
-        "NV_ENC_MEONLY_PARAMS_VER",
-        i64::from(me::NV_ENC_MEONLY_PARAMS_VER),
-    );
-    checks.constant(
-        "NV_ENC_CAPS_SUPPORT_MEONLY_MODE",
-        i64::from(me::NV_ENC_CAPS_SUPPORT_MEONLY_MODE),
-    );
 }
 
 /// The C program: the headers, a byte dumper for bit-fields, and every

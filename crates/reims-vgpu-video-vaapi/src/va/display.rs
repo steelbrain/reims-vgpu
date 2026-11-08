@@ -37,10 +37,6 @@ pub enum Error {
     Bitstream(crate::h264::Error),
     /// The HEVC stream is malformed, or uses what the decoder refuses.
     HevcBitstream(crate::hevc::Error),
-    /// The AV1 stream is malformed, or uses what the decoder refuses.
-    Av1Bitstream(crate::av1::Error),
-    /// The VP9 stream is malformed, or uses what the decoder refuses.
-    Vp9Bitstream(crate::vp9::Error),
     /// The driver cannot decode this stream: what is missing, in words.
     Unsupported(String),
     /// The caller holds every surface the decoder may make.
@@ -48,7 +44,7 @@ pub enum Error {
     /// A destination plane is too small for its stride and the frame.
     PlaneTooSmall(&'static str),
     /// The GPU did not finish work by its deadline, or an earlier frame's
-    /// of the same decoder, encoder or JPEG decoder (`super::wait`): which,
+    /// of the same decoder or encoder (`super::wait`): which,
     /// in words.
     Stalled(String),
 }
@@ -66,8 +62,6 @@ impl std::fmt::Display for Error {
             } => write!(f, "{call} failed: {message} ({status:#x})"),
             Self::Bitstream(e) => write!(f, "{e}"),
             Self::HevcBitstream(e) => write!(f, "{e}"),
-            Self::Av1Bitstream(e) => write!(f, "{e}"),
-            Self::Vp9Bitstream(e) => write!(f, "{e}"),
             Self::Unsupported(what) => write!(f, "the driver cannot: {what}"),
             Self::OutOfSurfaces => write!(f, "every decode surface is held"),
             Self::PlaneTooSmall(plane) => write!(f, "the {plane} plane is too small"),
@@ -87,18 +81,6 @@ impl From<crate::h264::Error> for Error {
 impl From<crate::hevc::Error> for Error {
     fn from(e: crate::hevc::Error) -> Self {
         Self::HevcBitstream(e)
-    }
-}
-
-impl From<crate::av1::Error> for Error {
-    fn from(e: crate::av1::Error) -> Self {
-        Self::Av1Bitstream(e)
-    }
-}
-
-impl From<crate::vp9::Error> for Error {
-    fn from(e: crate::vp9::Error) -> Self {
-        Self::Vp9Bitstream(e)
     }
 }
 

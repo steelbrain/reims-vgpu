@@ -9,8 +9,6 @@
 pub(crate) mod encoder;
 pub(crate) mod ffi;
 mod locks;
-pub(crate) mod motion;
-pub(crate) mod motion_ffi;
 
 use std::cell::{OnceCell, RefCell};
 use std::ffi::{CStr, c_int, c_void};
@@ -201,8 +199,6 @@ enum BufferKind {
     },
     /// A bitstream buffer (`nvEncCreateBitstreamBuffer`).
     Bitstream,
-    /// A motion vector buffer (`nvEncCreateMVBuffer`).
-    Vectors,
 }
 
 /// What [`Session::encode_picture`] submits.
@@ -387,22 +383,6 @@ impl Session {
         )
     }
 
-    /// Makes a motion vector buffer, for the session's input buffers' size.
-    pub(crate) fn create_vectors(&mut self) -> Result<Buffer, Error> {
-        let create = entry!(self.nvenc, nvEncCreateMVBuffer)?;
-        let mut vectors = motion_ffi::NV_ENC_CREATE_MV_BUFFER::zeroed();
-        vectors.version = motion_ffi::NV_ENC_CREATE_MV_BUFFER_VER;
-        {
-            let _current = self.gpu.push()?;
-            // SAFETY: a live session in ME-only mode, initialised; the
-            // parameters are live and versioned.
-            self.check("nvEncCreateMVBuffer", unsafe {
-                create(self.encoder, (&raw mut vectors).cast())
-            })?;
-        }
-        self.keep("nvEncCreateMVBuffer", vectors.mvBuffer, BufferKind::Vectors)
-    }
-
     /// Keeps `handle`, a buffer of `kind` that `call` just made, until the
     /// session is destroyed, and names it.
     fn keep(
@@ -510,8 +490,8 @@ impl Session {
         Ok(locked.pitch)
     }
 
-    /// Locks `output`, a bitstream or motion vector buffer of the session
-    /// that a submitted picture fills, once NVENC has filled it, and gives
+    /// Locks `output`, a bitstream buffer of the session that a submitted
+    /// picture fills, once NVENC has filled it, and gives
     /// what NVENC says of it to `read`; then unlocks it, on every path.
     /// `read`'s error comes first, then the unlock's. The lock waits on the
     /// session's lock thread, until the deadline, past which the session is
@@ -525,7 +505,7 @@ impl Session {
     ) -> Result<T, Error> {
         let call = entry!(self.nvenc, nvEncLockBitstream)?;
         let unlock = entry!(self.nvenc, nvEncUnlockBitstream)?;
-        let output = self.output(output, &[BufferKind::Bitstream, BufferKind::Vectors])?;
+        let output = self.output(output, &[BufferKind::Bitstream])?;
         self.check_not_stalled()?;
         self.submitted.borrow().check_pending(output)?;
         let Lock { status, locked } = self.wait_for_lock(call, output)?;
@@ -664,39 +644,6 @@ impl Session {
             self.submitted.borrow_mut().submit(picture.outputBitstream);
         }
         Ok(status)
-    }
-
-    /// Estimates the motion of `current` against `reference`, two input
-    /// buffers of one size and format, into `vectors`
-    /// (`nvEncRunMotionEstimationOnly`, on a session in ME-only mode).
-    pub(crate) fn estimate_motion(
-        &self,
-        current: Buffer,
-        reference: Buffer,
-        vectors: Buffer,
-    ) -> Result<(), Error> {
-        let run = entry!(self.nvenc, nvEncRunMotionEstimationOnly)?;
-        self.check_not_stalled()?;
-        let (current, width, height, format) = self.input(current)?;
-        let (reference, ..) = self.input(reference)?;
-        let vectors = self.output(vectors, &[BufferKind::Vectors])?;
-        self.submitted.borrow().check_free(vectors)?;
-        let mut params = motion_ffi::NV_ENC_MEONLY_PARAMS::zeroed();
-        params.version = motion_ffi::NV_ENC_MEONLY_PARAMS_VER;
-        params.inputWidth = width;
-        params.inputHeight = height;
-        params.inputBuffer = current;
-        params.referenceFrame = reference;
-        params.mvBuffer = vectors;
-        params.bufferFmt = format;
-        let _current = self.gpu.push()?;
-        // SAFETY: a live session; the parameters are live and versioned,
-        // and name three of this session's own buffers, none locked.
-        self.check("nvEncRunMotionEstimationOnly", unsafe {
-            run(self.encoder, (&raw mut params).cast())
-        })?;
-        self.submitted.borrow_mut().submit(vectors);
-        Ok(())
     }
 
     /// The parameter sets (`nvEncGetSequenceParams`), Annex B, at most
@@ -885,7 +832,6 @@ impl Drop for Session {
             let destroy = match kept.kind {
                 BufferKind::Input { .. } => api.nvEncDestroyInputBuffer,
                 BufferKind::Bitstream => api.nvEncDestroyBitstreamBuffer,
-                BufferKind::Vectors => api.nvEncDestroyMVBuffer,
             };
             let Some(destroy) = destroy else { continue };
             // SAFETY: a buffer of this live session, of the kind this entry

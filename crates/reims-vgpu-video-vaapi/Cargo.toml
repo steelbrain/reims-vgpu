@@ -11,12 +11,15 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-log = "0.4"
 reims-vgpu-video-codec = { path = "../reims-vgpu-video-codec" }
+
+# The runtime, locks and waits the libva binding runs on, and its log, which are Linux's alone.
+[target.'cfg(target_os = "linux")'.dependencies]
+log = "0.4"
 reims-vgpu-video-core = { path = "../reims-vgpu-video-core" }
 
 [dev-dependencies]
-# The suite every backend runs, and its stream readers.
+# The examples' stream readers and writers, and their frame hashes.
 reims-vgpu-video-conformance = { path = "../reims-vgpu-video-conformance" }
 
 # The tests of the bounded waits hold the GPU with a compute shader of their own, on Vulkan
@@ -24,8 +27,3 @@ reims-vgpu-video-conformance = { path = "../reims-vgpu-video-conformance" }
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 ash.workspace = true
 
-# The conformance suite on this backend, named for it: the three backends' examples share one
-# target directory, where examples of one name overwrite each other.
-[[example]]
-name = "vaapi-conformance"
-path = "examples/conformance.rs"

@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-video-core"
-description = "The two devices' behaviour, independent of host, driver and QEMU"
+description = "What the host video backends share: runtime, locks, guest surfaces and device waits"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,23 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-# The guest's property lists, binary plists from CoreMedia, read and written as
-# released, without the serde half. `wire/property_list.rs` walks a binary
-# plist as 1.10's reader reads it before decoding it, and builds each value
-# from the reader's events, the `stream` module the unstable feature makes
-# public, so that no value past its bounds is ever made. That feature's API
-# may change in a minor release, so the crate's docs ask for a tilde
-# requirement: a move to 1.11 re-reads its readers against the walk, and the
-# property-lists fuzzer runs on it.
-plist = { version = "~1.10.3", default-features = false, features = [
-    "enable_unstable_features_that_may_break_with_minor_version_bumps",
-] }
 thiserror = "2"
 log = "0.4"
 # The locks every video crate takes, reims-vgpu-core's (`sync`).
 parking_lot.workspace = true
-
-[dev-dependencies]
-# The fuzzers' harness (`tests/fuzz/support.rs`) bounds each input by its CPU
-# time, which `clock_gettime` reads.
-libc.workspace = true

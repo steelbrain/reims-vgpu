@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-video-conformance"
-description = "One conformance suite for every backend: a stand-in guest drives core's devices on it, and checks what comes back"
+description = "The test streams' readers and writers: MP4 in and out, and MD5 for frame hashes"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,3 @@ license.workspace = true
 
 [lints]
 workspace = true
-
-[dependencies]
-log = "0.4"
-reims-vgpu-video-codec = { path = "../reims-vgpu-video-codec" }
-reims-vgpu-video-core = { path = "../reims-vgpu-video-core" }

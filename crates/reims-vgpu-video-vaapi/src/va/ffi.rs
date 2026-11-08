@@ -17,7 +17,6 @@
 use core::ffi::{c_char, c_int, c_uint, c_void};
 
 pub(crate) mod encode;
-pub(crate) mod jpeg;
 
 pub(crate) type VADisplay = *mut c_void;
 pub(crate) type VAStatus = c_int;
@@ -112,13 +111,6 @@ pub(crate) const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// as VA's fourccs.
 pub(crate) const DRM_FORMAT_NV12: u32 = VA_FOURCC_NV12;
 pub(crate) const DRM_FORMAT_P010: u32 = VA_FOURCC_P010;
-/// `DRM_FORMAT_YUYV`, `DRM_FORMAT_YUV444`, `DRM_FORMAT_R8` and
-/// `DRM_FORMAT_ARGB8888` (drm_fourcc.h): the layouts of VA's `YUY2`,
-/// `444P`, `Y800` and `BGRA`.
-pub(crate) const DRM_FORMAT_YUYV: u32 = 0x5659_5559;
-pub(crate) const DRM_FORMAT_YUV444: u32 = 0x3432_5559;
-pub(crate) const DRM_FORMAT_R8: u32 = 0x2020_3852;
-pub(crate) const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 
 // VAGenericValueType.
 pub(crate) const VAGenericValueTypeInteger: VAGenericValueType = 1;
@@ -1034,10 +1026,6 @@ mod tests {
             DRM_FORMAT_MOD_LINEAR,
             DRM_FORMAT_NV12,
             DRM_FORMAT_P010,
-            DRM_FORMAT_YUYV,
-            DRM_FORMAT_YUV444,
-            DRM_FORMAT_R8,
-            DRM_FORMAT_ARGB8888,
             VAGenericValueTypeInteger,
             VAGenericValueTypePointer,
             VAPictureParameterBufferType,

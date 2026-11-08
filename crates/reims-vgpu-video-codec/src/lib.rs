@@ -2,28 +2,17 @@
 //! and the part of its decoding process a stateless accelerator is not
 //! given, in plain Rust with no FFI.
 //!
-//! - [`av1`] is AV1's: OBUs, `av1C`, sequence and frame headers with what
-//!   each frame inherits, tile groups and the reference slots, over an
-//!   `Accelerator` that decodes the tiles.
 //! - [`encode`] is the H.264 and HEVC encoders' portable half: their
-//!   settings, the host session's encoder over a backend's stream, the
-//!   GOP and decode times, the parameter sets, slice headers and
-//!   configuration records the VA-API backend packs, and the rate control
-//!   of a stream held to a hard limit, over an `Accelerator` that codes
-//!   the slice data.
+//!   settings, the GOP and decode times, the parameter sets, slice headers
+//!   and configuration records the VA-API backend packs, and the rate
+//!   control of a stream held to a hard limit, over an `Accelerator` that
+//!   codes the slice data.
 //! - [`h264`] is H.264's: NAL units, `avcC`, parameter sets, slice
 //!   headers, order counts and the DPB, over an `Accelerator` that decodes
 //!   the slice data.
 //! - [`hevc`] is HEVC's: NAL units, `hvcC`, parameter sets with their
 //!   reference picture sets, slice segment headers, order counts and the
 //!   DPB, over an `Accelerator` likewise. It shares H.264's bit reader.
-//! - [`jpeg`] is JPEG's: the markers and segments of one baseline or
-//!   extended sequential image, its tables, its frame and scan headers,
-//!   and where its entropy-coded data lies, with Annex K's tables for an
-//!   image that defines none.
-//! - [`vp9`] is VP9's: superframes, `vpcC`, the uncompressed header with
-//!   what each frame inherits, and the reference slots, over an
-//!   `Accelerator` that decodes the rest.
 
 // The crate's lint set, core's but its division lint: the decoding
 // processes divide by what the standards divide by. Tests are exempt as in
@@ -62,20 +51,16 @@
     )
 )]
 
-pub mod av1;
 mod bits;
 mod dpb;
 pub mod encode;
 pub mod h264;
 pub mod hevc;
-pub mod jpeg;
 mod num;
-pub mod vp9;
 
-/// The fuzzers' harness, core's: each codec's tests have a `fuzz` module
-/// of their own.
+/// The fuzzers' harness: each codec's tests have a `fuzz` module of their
+/// own.
 #[cfg(test)]
-#[path = "../../reims-vgpu-video-core/tests/fuzz/support.rs"]
 #[expect(
     unsafe_code,
     reason = "its counting allocator implements GlobalAlloc, and it reads the CPU time"

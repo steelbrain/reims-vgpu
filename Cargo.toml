@@ -12,7 +12,6 @@ members = [
     "crates/reims-vgpu-video-codec",
     "crates/reims-vgpu-video-vaapi",
     "crates/reims-vgpu-video-nvidia",
-    "crates/reims-vgpu-video-videotoolbox",
     "crates/reims-vgpu-video-vulkan",
     "crates/reims-vgpu-video-conformance",
     "crates/reims-graphics",
@@ -39,8 +38,6 @@ reims-graphics = { path = "crates/reims-graphics" }
 # The video crates' runtime and memory, which the reims-graphics device's video arms share
 # (`crate::video` of `reims-vgpu`).
 reims-vgpu-video-core = { path = "crates/reims-vgpu-video-core" }
-# Its decoders, encoders and scaler on VideoToolbox, on macOS.
-reims-vgpu-video-videotoolbox = { path = "crates/reims-vgpu-video-videotoolbox" }
 # The reims-graphics device's hardware video on the Vulkan platform: Vulkan Video on the runtime's
 # device.
 reims-vgpu-video-vulkan = { path = "crates/reims-vgpu-video-vulkan" }
