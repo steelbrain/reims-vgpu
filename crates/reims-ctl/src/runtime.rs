@@ -632,7 +632,16 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
             // QEMU wrote its pid file and exited, or never wrote it.
             std::thread::sleep(Duration::from_millis(200));
             if pid(vm).is_none() {
-                bail!("QEMU exited:\n{}", tail(&vm.qemu_log(), 15));
+                let note = vm
+                    .config
+                    .profile
+                    .memfd_ram(host)
+                    .then(|| mem_available_mib(Path::new("/proc/meminfo")))
+                    .flatten()
+                    .and_then(|a| memory_note(vm.name(), vm.config.memory_mib, a))
+                    .map(|n| format!("\n{n}"))
+                    .unwrap_or_default();
+                bail!("QEMU exited:\n{}{note}", tail(&vm.qemu_log(), 15));
             }
         }
         if Instant::now() > deadline {
@@ -748,6 +757,37 @@ fn wait_gone(p: i32, t: Duration) -> bool {
     !alive(p)
 }
 
+/// The host's available memory, `MemAvailable` in `file` (`/proc/meminfo`), in MiB; None where it
+/// isn't there.
+pub fn mem_available_mib(file: &Path) -> Option<u64> {
+    std::fs::read_to_string(file)
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .map(|kib| kib / 1024)
+}
+
+/// What a start that QEMU did not survive adds where the VM's RAM, which QEMU allocates whole as it
+/// starts on Linux (`qemu`'s module doc), is more than the host has available: the kernel ends a
+/// QEMU it cannot give that memory, which leaves no error of QEMU's own in its log. None where
+/// the RAM fits.
+pub fn memory_note(name: &str, memory_mib: u64, available_mib: u64) -> Option<String> {
+    let gib = |mib: u64| match mib % 1024 {
+        0 => format!("{} GiB", mib / 1024),
+        _ => format!("{:.1} GiB", mib as f64 / 1024.0),
+    };
+    (memory_mib > available_mib).then(|| {
+        format!(
+            "{name} needs {} of free memory to start: QEMU allocates all of its RAM as it starts, \
+             and this host has {} available. Free some, or give it less with reims-ctl set \
+             {name} --memory SIZE",
+            gib(memory_mib),
+            gib(available_mib)
+        )
+    })
+}
+
 /// The last `n` lines of a text file.
 pub fn tail(path: &Path, n: usize) -> String {
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -808,6 +848,29 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("vm.max_map_count=8388608"), "{note}");
+    }
+
+    /// A start QEMU did not survive names the memory a VM's RAM needs only where the host has
+    /// less available, read from `MemAvailable` as the kernel writes it.
+    #[test]
+    fn a_vm_whose_ram_is_more_than_the_host_has_is_told_what_it_needs() {
+        let env = crate::testenv::Env::new("meminfo");
+        let file = env.root.join("meminfo");
+        assert_eq!(mem_available_mib(&file), None);
+        std::fs::write(
+            &file,
+            "MemTotal:       32000000 kB\nMemFree:         1000000 kB\nMemAvailable:    3145728 kB\n",
+        )
+        .unwrap();
+        assert_eq!(mem_available_mib(&file), Some(3072));
+        assert_eq!(memory_note("mac", 3072, 3072), None);
+        let note = memory_note("mac", 8192, 3584).unwrap();
+        assert!(
+            note.starts_with("mac needs 8 GiB of free memory to start")
+                && note.contains("this host has 3.5 GiB available")
+                && note.contains("reims-ctl set mac --memory SIZE"),
+            "{note}"
+        );
     }
 
     /// The thrashing guard is told of above 0 only, read from its file as the kernel writes it,
