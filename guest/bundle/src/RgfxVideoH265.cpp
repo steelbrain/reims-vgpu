@@ -335,4 +335,197 @@ bool writePps(const Pps &p, std::vector<uint8_t> &out)
 	return true;
 }
 
+namespace {
+
+// Ceil(Log2(n)), the bits of a syntax element that indexes n things; 0 for n of 1 or less.
+uint32_t ceilLog2(uint32_t n)
+{
+	uint32_t bits = 0;
+	while (bits < 32 && ((uint64_t)1 << bits) < n)
+		bits++;
+	return bits;
+}
+
+// The pictures the current one uses of the short-term set a slice header codes itself,
+// st_ref_pic_set(num_short_term_ref_pic_sets) (7.3.7), read from `r`: a set of its own pictures,
+// or one predicted from the SPS's set RefRpsIdx (7-61, 7-62). False where it is out of range.
+bool ownShortTermUsed(BitReader &r, const Sps &sps, uint32_t *used)
+{
+	const uint32_t idx = sps.num_short_term_ref_pic_sets;
+	const bool predicted = idx != 0 && r.flag(); // inter_ref_pic_set_prediction_flag
+	*used = 0;
+	if (!predicted) {
+		const uint32_t negative = r.ue(), positive = r.ue();
+		if (r.failed() || negative > 16 || positive > 16 || negative + positive > 16)
+			return false;
+		for (uint32_t i = 0; i < negative + positive; i++) {
+			r.ue(); // delta_poc_s0_minus1, delta_poc_s1_minus1
+			*used += r.flag();
+		}
+		return !r.failed();
+	}
+	const uint32_t deltaIdx = r.ue() + 1; // delta_idx_minus1 + 1
+	if (r.failed() || deltaIdx > idx)
+		return false;
+	const ShortTermRps &ref = sps.st_ref_pic_set[idx - deltaIdx];
+	const uint32_t negative = ref.num_negative_pics, positive = ref.num_positive_pics;
+	if (negative > 16 || positive > 16 || negative + positive > 16)
+		return false;
+	const bool sign = r.flag();     // delta_rps_sign
+	const uint32_t abs = r.ue() + 1; // abs_delta_rps_minus1 + 1
+	if (r.failed() || abs > 0x8000)
+		return false;
+	const int32_t deltaRps = sign ? -(int32_t)abs : (int32_t)abs;
+	// used_by_curr_pic_flag[j] and use_delta_flag[j], j to NumDeltaPocs[RefRpsIdx]: the SPS
+	// set's S0 pictures, its S1 pictures, then its own picture.
+	bool usedBy[17], useDelta[17];
+	for (uint32_t j = 0; j <= negative + positive; j++) {
+		usedBy[j] = r.flag();
+		useDelta[j] = usedBy[j] || r.flag();
+	}
+	if (r.failed())
+		return false;
+	// 7-61 and 7-62: a picture of the set at dPoc from the current one is kept where its
+	// use_delta_flag is, in S0 where dPoc < 0 and S1 where dPoc > 0; the current picture uses it
+	// where its used_by_curr_pic_flag is.
+	const auto take = [&](int32_t dPoc, uint32_t j) {
+		if (dPoc != 0 && useDelta[j] && usedBy[j])
+			(*used)++;
+	};
+	for (uint32_t j = 0; j < negative; j++)
+		take(ref.delta_poc_s0[j] + deltaRps, j);
+	for (uint32_t j = 0; j < positive; j++)
+		take(ref.delta_poc_s1[j] + deltaRps, negative + j);
+	take(deltaRps, negative + positive);
+	return true;
+}
+
+// The pictures of the SPS's short-term set `rps` the current picture uses.
+uint32_t shortTermUsed(const ShortTermRps &rps)
+{
+	uint32_t used = 0;
+	for (uint32_t i = 0; i < rps.num_negative_pics && i < 16; i++)
+		used += rps.used_by_curr_pic_s0[i] != 0;
+	for (uint32_t i = 0; i < rps.num_positive_pics && i < 16; i++)
+		used += rps.used_by_curr_pic_s1[i] != 0;
+	return used;
+}
+
+} // namespace
+
+bool currentReferences(const Sps &sps, const Pps &pps, const uint8_t *au, size_t size,
+                       uint32_t *count)
+{
+	// The first VCL NAL unit: from after its start code to the next start code or the end.
+	const uint8_t *nal = nullptr;
+	size_t length = 0;
+	for (size_t i = 0; i + 3 <= size && !nal; i++) {
+		if (au[i] != 0 || au[i + 1] != 0 || au[i + 2] != 1)
+			continue;
+		const size_t start = i + 3;
+		size_t end = start;
+		while (end + 3 <= size && !(au[end] == 0 && au[end + 1] == 0 && au[end + 2] <= 1))
+			end++;
+		if (end + 3 > size)
+			end = size;
+		if (end - start > 2 && ((au[start] >> 1) & 0x3f) < 32) {
+			nal = au + start;
+			length = end - start;
+		}
+		i = end > i + 2 ? end - 1 : i + 2;
+	}
+	if (!nal)
+		return false;
+	const uint32_t type = (nal[0] >> 1) & 0x3f;
+	BitReader r(nal + 2, length - 2);
+	if (!r.flag()) // first_slice_segment_in_pic_flag
+		return false;
+	if (type >= 16 && type <= 23)
+		r.flag(); // no_output_of_prior_pics_flag
+	if (r.ue() != pps.pps_pic_parameter_set_id || r.failed()) // slice_pic_parameter_set_id
+		return false;
+	r.u(pps.num_extra_slice_header_bits);             // slice_reserved_flag[]
+	r.ue();                                           // slice_type
+	if (pps.output_flag_present_flag)
+		r.flag(); // pic_output_flag
+	if (sps.separate_colour_plane_flag)
+		r.u(2); // colour_plane_id
+	*count = 0;
+	if (type == 19 || type == 20) // IDR_W_RADL, IDR_N_LP
+		return !r.failed();
+	if (sps.log2_max_pic_order_cnt_lsb_minus4 > 12)
+		return false;
+	r.u(sps.log2_max_pic_order_cnt_lsb_minus4 + 4); // slice_pic_order_cnt_lsb
+	uint32_t used = 0;
+	if (!r.flag()) { // short_term_ref_pic_set_sps_flag
+		if (sps.num_short_term_ref_pic_sets > 64 || !ownShortTermUsed(r, sps, &used))
+			return false;
+	} else {
+		const uint32_t sets = sps.num_short_term_ref_pic_sets;
+		const uint32_t idx = r.u(ceilLog2(sets)); // short_term_ref_pic_set_idx
+		if (r.failed() || idx >= sets || sets > 64)
+			return false;
+		used = shortTermUsed(sps.st_ref_pic_set[idx]);
+	}
+	if (sps.long_term_ref_pics_present_flag) {
+		const uint32_t inSps = sps.num_long_term_ref_pics_sps;
+		if (inSps > 32)
+			return false;
+		const uint32_t fromSps = inSps > 0 ? r.ue() : 0; // num_long_term_sps
+		const uint32_t own = r.ue();                     // num_long_term_pics
+		if (r.failed() || fromSps > inSps || fromSps + own > 32)
+			return false;
+		for (uint32_t i = 0; i < fromSps + own; i++) {
+			if (i < fromSps) {
+				const uint32_t lt = r.u(ceilLog2(inSps)); // lt_idx_sps[i]
+				if (lt >= inSps)
+					return false;
+				used += sps.used_by_curr_pic_lt_sps_flag[lt] != 0;
+			} else {
+				r.u(sps.log2_max_pic_order_cnt_lsb_minus4 + 4); // poc_lsb_lt[i]
+				used += r.flag();                                // used_by_curr_pic_lt_flag[i]
+			}
+			if (r.flag()) // delta_poc_msb_present_flag[i]
+				r.ue(); // delta_poc_msb_cycle_lt[i]
+		}
+	}
+	if (r.failed())
+		return false;
+	*count = used;
+	return true;
+}
+
+bool narrowestTileColumn(const Sps &sps, const Pps &pps, uint32_t *narrowest)
+{
+	*narrowest = 0;
+	if (!pps.tiles_enabled_flag)
+		return true;
+	const uint32_t ctbLog2 = sps.log2_min_luma_coding_block_size_minus3 + 3 +
+	                         sps.log2_diff_max_min_luma_coding_block_size;
+	const uint32_t columns = pps.num_tile_columns_minus1 + 1;
+	if (ctbLog2 > 6 || columns > 20 || sps.pic_width_in_luma_samples == 0)
+		return false;
+	const uint32_t ctb = 1u << ctbLog2;
+	const uint32_t across = (sps.pic_width_in_luma_samples + ctb - 1) >> ctbLog2; // PicWidthInCtbsY
+	if (columns > across)
+		return false;
+	uint32_t least = UINT32_MAX, used = 0;
+	for (uint32_t i = 0; i < columns; i++) {
+		// 6-3, or the PPS's widths and the rest of the picture for the last column.
+		uint32_t width;
+		if (pps.uniform_spacing_flag)
+			width = (i + 1) * across / columns - i * across / columns;
+		else if (i + 1 < columns)
+			width = pps.column_width_minus1[i] + 1;
+		else
+			width = across > used ? across - used : 0;
+		if (width == 0 || width > across - used)
+			return false;
+		used += width;
+		least = width < least ? width : least;
+	}
+	*narrowest = least << ctbLog2;
+	return true;
+}
+
 } // namespace rgfx::video::h265

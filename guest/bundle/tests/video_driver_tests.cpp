@@ -24,6 +24,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "RgfxVideoBits.hpp"
 #include "RgfxVideoChannel.hpp"
 #include "RgfxVideoH264.hpp"
 #include "RgfxVideoH265.hpp"
@@ -212,6 +213,10 @@ int g_opensBeforeFailure = -1;
 // Whether the stand-in host has its decoders: false answers no codec's caps, as a process with no
 // device of ours, or a host with no hardware video, does.
 bool g_hostDecodes = true;
+// The stand-in host's HEVC decode's most current references, and its bounds beyond its caps: none,
+// but where a check sets them.
+uint32_t g_hevcMaxReferences = 0;
+RgfxVideoDecodeCaps g_decodeCaps = {};
 // Each decode the driver sends, as it sent it: its surface's id, its place and its crop, and the
 // parameter sets it sent (none where the session already had them).
 struct SentDecode {
@@ -245,9 +250,15 @@ const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction)
 	}
 	h264.formats = RGFX_VIDEO_FORMAT_NV12;
 	hevc.formats = RGFX_VIDEO_FORMAT_NV12 | RGFX_VIDEO_FORMAT_P010;
+	hevc.max_references = g_hevcMaxReferences;
 	if (direction != RGFX_VIDEO_DECODE || !g_hostDecodes)
 		return nullptr;
 	return codec == RGFX_VIDEO_CODEC_H264 ? &h264 : codec == RGFX_VIDEO_CODEC_HEVC ? &hevc : nullptr;
+}
+
+RgfxVideoDecodeCaps decodeCaps(uint32_t codec)
+{
+	return codec == RGFX_VIDEO_CODEC_HEVC && g_hostDecodes ? g_decodeCaps : RgfxVideoDecodeCaps{};
 }
 
 // A device whose linear textures of the planes' formats take 64 bytes.
@@ -726,6 +737,116 @@ void checkTileLanding()
 	CFRelease(odd);
 }
 
+// An HEVC picture the host's caps say it refuses is not sent, so its schedule fails: one of a
+// coded size outside the caps' least and largest; one whose PPS has a tile column narrower than
+// the caps' narrowest; and one whose slice header holds more current references than the caps'
+// most. A bound the caps leave 0 refuses nothing, and a picture at a bound is sent.
+void checkHostBounds()
+{
+	g_opened.clear();
+	std::vector<void *> contexts;
+	CHECK(makeContexts(1, contexts, kCodecHevc) == kOk, "a create of one HEVC decode");
+	const uint64_t bitstream = allocate(g_driver, 0, 0x10000);
+	CHECK(bitstream != 0, "the bitstream pool refused");
+	IOSurfaceRef surface = canvas(8320, 720);
+	// The picture's one slice segment in the pool, `slice` or bytes with no start code.
+	auto sends = [&](const rgfx::video::h265::Sps &sps, const rgfx::video::h265::Pps &pps,
+	                 const std::vector<uint8_t> &slice = {}) {
+		uint32_t bytes = 0x100;
+		std::memset((void *)bitstream, 0x5a, bytes);
+		if (!slice.empty()) {
+			std::memcpy((void *)bitstream, slice.data(), slice.size());
+			bytes = (uint32_t)slice.size();
+		}
+		g_sent.clear();
+		const uint64_t answer = scheduleHevc(contexts[0], HevcPicture(surface, sps, pps, 0, 0, bytes));
+		CHECK(answer == kOk || answer == kNotSent, "a schedule answered %llu", answer);
+		CHECK((answer == kOk) == (g_sent.size() == 1), "%zu decodes sent of a schedule of %llu",
+		      g_sent.size(), answer);
+		return answer == kOk;
+	};
+	static rgfx::video::h265::Sps sps;
+	static rgfx::video::h265::Pps pps;
+	sps = {};
+	pps = {};
+	sps.chroma_format_idc = 1;
+	sps.log2_diff_max_min_luma_coding_block_size = 3; // CTBs of 64
+	struct Size {
+		uint32_t width, height;
+		bool sent;
+	};
+	// The stand-in's caps: 144x144 to 8192x8192.
+	for (const Size &z : {Size{1280, 720, true}, Size{144, 144, true}, Size{8192, 720, true},
+	                      Size{128, 720, false}, Size{1280, 128, false}, Size{8320, 720, false}}) {
+		sps.pic_width_in_luma_samples = z.width;
+		sps.pic_height_in_luma_samples = z.height;
+		CHECK(sends(sps, pps) == z.sent, "a %ux%u picture %s", z.width, z.height,
+		      z.sent ? "not sent" : "sent");
+	}
+	sps.pic_width_in_luma_samples = 1280;
+	sps.pic_height_in_luma_samples = 720;
+
+	// Tile columns of 64, 64, 1088 and 64 samples; and of 128, 192, 640 and 320.
+	pps.tiles_enabled_flag = 1;
+	pps.num_tile_columns_minus1 = 3;
+	const uint32_t narrow[3] = {0, 0, 16}, wide[3] = {1, 2, 9};
+	auto columns = [&](const uint32_t (&minus1)[3]) {
+		std::memcpy(pps.column_width_minus1, minus1, sizeof minus1);
+	};
+	columns(narrow);
+	CHECK(sends(sps, pps), "columns of 64 not sent with no bound");
+	g_decodeCaps.min_tile_width = 128;
+	CHECK(!sends(sps, pps), "columns of 64 sent under a bound of 128");
+	columns(wide);
+	CHECK(sends(sps, pps), "columns of 128 and more not sent under a bound of 128");
+	pps.uniform_spacing_flag = 1;
+	pps.num_tile_columns_minus1 = 19;
+	CHECK(!sends(sps, pps), "20 uniform columns of 64 sent under a bound of 128");
+	pps.num_tile_columns_minus1 = 9;
+	CHECK(sends(sps, pps), "10 uniform columns of 128 not sent under a bound of 128");
+	g_decodeCaps = {};
+	pps = {};
+
+	// A P slice using the SPS's set 0, of 8 current references, or set 1, of 9.
+	sps.log2_max_pic_order_cnt_lsb_minus4 = 4;
+	sps.num_short_term_ref_pic_sets = 2;
+	for (uint32_t set = 0; set < 2; set++) {
+		rgfx::video::h265::ShortTermRps &r = sps.st_ref_pic_set[set];
+		r.num_negative_pics = r.num_delta_pocs = 8 + set;
+		for (uint32_t i = 0; i < r.num_negative_pics; i++) {
+			r.delta_poc_s0[i] = -(int32_t)(i + 1);
+			r.used_by_curr_pic_s0[i] = 1;
+		}
+	}
+	auto slice = [](uint32_t set) {
+		rgfx::video::BitWriter w;
+		w.flag(1);    // first_slice_segment_in_pic_flag
+		w.ue(0);      // slice_pic_parameter_set_id
+		w.ue(1);      // slice_type P
+		w.u(8, 9);    // slice_pic_order_cnt_lsb
+		w.flag(1);    // short_term_ref_pic_set_sps_flag
+		w.u(1, set);  // short_term_ref_pic_set_idx
+		for (int i = 0; i < 16; i++)
+			w.u(8, 0xa5);
+		std::vector<uint8_t> out;
+		w.appendNal({1 << 1, 1}, out); // TRAIL_R
+		return out;
+	};
+	CHECK(sends(sps, pps, slice(1)), "9 current references not sent with no bound");
+	g_hevcMaxReferences = 8;
+	CHECK(sends(sps, pps, slice(0)), "8 current references not sent under a bound of 8");
+	CHECK(!sends(sps, pps, slice(1)), "9 current references sent under a bound of 8");
+	// A slice the driver cannot read leaves it to the host.
+	CHECK(sends(sps, pps), "a slice of no start code not sent");
+	g_hevcMaxReferences = 0;
+
+	ContextDelete del = {1, 0, &contexts[0]};
+	CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+	CHECK(callOn(g_driver, kFreeBitstreamBufferPool, (const void *)0) == kOk,
+	      "FreeBitstreamBufferPool");
+	CFRelease(surface);
+}
+
 // An HEVC picture's frame describes its surface where its release lays the description out
 // (hevcOutputSurface): the driver searches the frame for the one layout, of fields of 4 or 8 bytes
 // from +0x60 to +0xa0, that names its surface, and its session keeps the layout its first picture
@@ -1190,6 +1311,7 @@ int main()
 	checkDelete();
 	checkUnsentDecode();
 	checkTileLanding();
+	checkHostBounds();
 	checkFrameDescriptions();
 	checkH264SpsLayouts();
 	checkNoZeroAnswers();

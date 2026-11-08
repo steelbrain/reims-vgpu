@@ -1,11 +1,13 @@
 /*
  * RgfxVideoBits: an RBSP written bit by bit and made a NAL unit, for the video driver's parameter
- * set writers (RgfxVideoH264.hpp, RgfxVideoH265.hpp).
+ * set writers (RgfxVideoH264.hpp, RgfxVideoH265.hpp), and a NAL unit's payload read bit by bit,
+ * for the slice header reader (RgfxVideoH265.hpp, currentReferences).
  */
 
 #ifndef RGFX_VIDEO_BITS_HPP_
 #define RGFX_VIDEO_BITS_HPP_
 
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <vector>
@@ -70,6 +72,67 @@ private:
 
 	std::vector<uint8_t> bytes_;
 	uint32_t filled_ = 0;
+};
+
+// A NAL unit's payload, read bit by bit with its emulation prevention bytes skipped. A read past
+// the end, or an Exp-Golomb code longer than 32 bits, reads 0 and marks the reader failed, which
+// every read after keeps.
+class BitReader {
+public:
+	BitReader(const uint8_t *bytes, size_t size) : bytes_(bytes), size_(size) {}
+
+	uint32_t u(uint32_t bits)
+	{
+		uint32_t v = 0;
+		for (uint32_t i = 0; i < bits; i++)
+			v = v << 1 | bit();
+		return failed_ ? 0 : v;
+	}
+
+	uint32_t ue()
+	{
+		uint32_t zeros = 0;
+		while (!failed_ && bit() == 0)
+			if (++zeros > 31)
+				failed_ = true;
+		if (failed_)
+			return 0;
+		const uint64_t v = ((uint64_t)1 << zeros) - 1 + u(zeros);
+		return failed_ || v > UINT32_MAX ? 0 : (uint32_t)v;
+	}
+
+	bool flag() { return bit() != 0; }
+
+	bool failed() const { return failed_; }
+
+private:
+	uint32_t bit()
+	{
+		if (left_ == 0) {
+			// 0x000003: the 3 is not the payload's.
+			if (at_ < size_ && zeros_ >= 2 && bytes_[at_] == 3) {
+				at_++;
+				zeros_ = 0;
+			}
+			if (at_ >= size_) {
+				failed_ = true;
+				return 0;
+			}
+			byte_ = bytes_[at_++];
+			zeros_ = byte_ == 0 ? zeros_ + 1 : 0;
+			left_ = 8;
+		}
+		left_--;
+		return (byte_ >> left_) & 1;
+	}
+
+	const uint8_t *bytes_;
+	size_t size_;
+	size_t at_ = 0;
+	uint32_t zeros_ = 0;
+	uint8_t byte_ = 0;
+	uint32_t left_ = 0;
+	bool failed_ = false;
 };
 
 } // namespace rgfx::video

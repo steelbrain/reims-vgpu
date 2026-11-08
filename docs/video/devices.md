@@ -62,6 +62,15 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   references with which every picture decodes ([vaapi.md](vaapi.md), "What it refuses";
   [nvidia.md](nvidia.md)).
 
+The guest's video driver checks an HEVC picture against these before it schedules it
+(`hevcTaken`, `guest/bundle/src/RgfxVideoDriver.cpp`): a picture whose coded size is outside its
+entry's, whose PPS has a tile column narrower than `decode`'s, or whose first slice segment's
+header names more current references than `max_references` fails its schedule, and VideoToolbox
+reports `kVTVideoDecoderMalfunctionErr` for it and every picture after it. Sent, the host would
+refuse it, and AppleGVA would take it and the next picture for decoded ([bugs.md](bugs.md),
+D25). AppleGVA's H.264 decoder delivers a picture whose schedule failed, so H.264 has no such
+check.
+
 ## Sessions
 
 `VIDEO_SESSION_CREATE` names a codec and a direction. The arm makes a session where it has an

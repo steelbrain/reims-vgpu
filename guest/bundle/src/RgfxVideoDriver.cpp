@@ -838,6 +838,48 @@ void *commitPicture(Context *context, std::vector<uint8_t> &sets, const uint8_t 
 	return work;
 }
 
+// Whether the host takes the HEVC picture whose slice segments are the `size` bytes at `au`, of
+// `sps` and `pps`, by what its caps say it decodes. It refuses, saying why once a reason: its
+// coded size outside the caps' least and largest; a tile column of the PPS narrower than the
+// caps' narrowest (RgfxVideoDecodeCaps); or, where its first slice segment's header gives
+// NumPicTotalCurr (h265::currentReferences), more current references than the caps'
+// max_references. A bound the caps leave 0 refuses nothing, and a header or PPS the driver cannot
+// read leaves the verdict to the host. AppleGVA's HEVC decoder hears of a refusal only as a failed
+// schedule (RgfxVideoStatus.hpp), so a picture the host would refuse fails its own: its frame and
+// every one after it carry kVTVideoDecoderMalfunctionErr, where a schedule that went ahead would
+// deliver it and the next one undecoded.
+bool hevcTaken(const rgfx::video::h265::Sps &sps, const rgfx::video::h265::Pps &pps,
+               const uint8_t *au, size_t size)
+{
+	const RgfxVideoCodecCaps *caps = rgfx::video::hostCodec(RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE);
+	if (!caps)
+		return true;
+	const uint32_t coded[2] = {sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples};
+	for (int i = 0; i < 2; i++)
+		if ((caps->min_size[i] && coded[i] < caps->min_size[i]) ||
+		    (caps->max_size[i] && coded[i] > caps->max_size[i])) {
+			static std::atomic<bool> said;
+			notSent(said, "its coded size is outside the sizes the host decodes");
+			return false;
+		}
+	const RgfxVideoDecodeCaps bounds = rgfx::video::decodeCaps(RGFX_VIDEO_CODEC_HEVC);
+	uint32_t narrowest;
+	if (bounds.min_tile_width && rgfx::video::h265::narrowestTileColumn(sps, pps, &narrowest) &&
+	    narrowest != 0 && narrowest < bounds.min_tile_width) {
+		static std::atomic<bool> said;
+		notSent(said, "a tile column of its PPS is narrower than the host decodes");
+		return false;
+	}
+	uint32_t current;
+	if (caps->max_references && rgfx::video::h265::currentReferences(sps, pps, au, size, &current) &&
+	    current > caps->max_references) {
+		static std::atomic<bool> said;
+		notSent(said, "its current reference sets hold more pictures than the host decodes");
+		return false;
+	}
+	return true;
+}
+
 // Commits the HEVC picture `c` decodes on its context's session: its work on the host, or null
 // where it could not be sent. Its slice segments lie one after another in one bitstream buffer,
 // each named by a record of the picture's.
@@ -886,6 +928,8 @@ void *decodeHevcPicture(const Command *c)
 		notSent(said, "its parameter sets are refused");
 		return nullptr;
 	}
+	if (!hevcTaken(*sps, *pps, bytes + first, end - first))
+		return nullptr;
 	NoOutput why;
 	IOSurfaceRef output = hevcOutputSurface(context, P, &why);
 	if (!output) {

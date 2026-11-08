@@ -95,6 +95,18 @@ const RgfxVideoCodecCaps *rgfx::video::hostCodec(uint32_t codec, uint32_t direct
 	return nullptr;
 }
 
+RgfxVideoDecodeCaps rgfx::video::decodeCaps(uint32_t codec)
+{
+	RgfxMetalDevice *device = processDevice();
+	if (device == nil)
+		return {};
+	const RgfxVideoCaps *caps = [device videoCaps];
+	for (uint32_t i = 0; i < caps->codec_count && i < RGFX_VIDEO_CAPS_CODECS; i++)
+		if (caps->codecs[i].codec == codec && caps->codecs[i].direction == RGFX_VIDEO_DECODE)
+			return caps->decode[i];
+	return {};
+}
+
 RgfxVideoOutputLayout rgfx::video::outputLayout(uint32_t codec)
 {
 	RgfxMetalDevice *device = processDevice();

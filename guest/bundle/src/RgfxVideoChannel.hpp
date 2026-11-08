@@ -31,6 +31,11 @@ namespace rgfx::video {
 /// or the host's hardware lacks the codec.
 const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction);
 
+/// What the host's decoder of `codec` refuses beyond its caps (RgfxVideoCaps::decode): the
+/// narrowest HEVC tile column it decodes. All zero where it names no bound, the process has no
+/// device of ours, or the host lacks the codec.
+RgfxVideoDecodeCaps decodeCaps(uint32_t codec);
+
 /// The least alignment, in bytes, of the first byte and the row pitch of each plane of an output
 /// surface of samples of `sampleBytes` bytes (1: NV12, 2: P010): the larger of the alignment the
 /// process's device takes for a linear texture of each plane's format, as the textures the decode

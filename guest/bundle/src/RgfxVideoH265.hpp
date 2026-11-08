@@ -214,6 +214,22 @@ static_assert(offsetof(Pps, slice_segment_header_extension_present_flag) == 0x19
 bool writeSps(const Sps &sps, std::vector<uint8_t> &out);
 bool writePps(const Pps &pps, std::vector<uint8_t> &out);
 
+// The pictures a picture's current reference sets hold together, NumPicTotalCurr (7-55): its
+// short-term pictures the current picture uses, before and after it, and its long-term ones it
+// uses, into `count`. Read from the slice segment header of the first VCL NAL unit of `au`, `size`
+// bytes of Annex-B NAL units (the picture's first slice segment), against `sps` and `pps`, the
+// parsed forms AppleGVA hands the driver with it: the header's own short-term set (predicted from
+// the SPS's or not), or the one of the SPS's it names, and its long-term pictures. 0 for an IDR
+// picture. False where no VCL unit holds a whole first slice segment header that parses against
+// the sets.
+bool currentReferences(const Sps &sps, const Pps &pps, const uint8_t *au, size_t size,
+                       uint32_t *count);
+
+// The narrowest of the PPS's tile columns over pictures of the SPS, in luma samples as HEVC's
+// ColumnWidthInLumaSamples counts them (6.5.1: a column's CTBs times their size), into
+// `narrowest`: 0 where the PPS has no tiles. False where its columns do not fit the picture.
+bool narrowestTileColumn(const Sps &sps, const Pps &pps, uint32_t *narrowest);
+
 } // namespace rgfx::video::h265
 
 #endif

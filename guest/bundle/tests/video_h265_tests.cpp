@@ -5,7 +5,8 @@
  * the encoder wrote: the SPS bit for bit up to its VUI flag, which ours clears, and the PPS byte
  * for byte. Where the encoder predicted a short-term set from another, which ours writes by its
  * pictures, the SPS's sets are read back instead and the bits after them compared. It also checks
- * the emulation prevention of a large field, and the refusals.
+ * the emulation prevention of a large field, the refusals, and the count of a picture's current
+ * references read from its first slice segment's header (currentReferences).
  *
  * Exits 0 and prints a one-line summary when every check passes; aborts on the first failure.
  */
@@ -17,6 +18,7 @@
 #include <initializer_list>
 #include <vector>
 
+#include "RgfxVideoBits.hpp"
 #include "RgfxVideoH265.hpp"
 #include "RgfxVideoStatus.hpp"
 
@@ -262,6 +264,268 @@ void checkRefusals()
 	CHECK(!writePps(p, out) && out.size() == 2, "16 default references taken");
 }
 
+// The first slice segments of pictures 0 (IDR_N_LP), 1, 8, 9 and 15 of kvazaar 2.3.2's `--gop 0
+// --ref 15` at 1280x720 (hevc-check.sh's kvz-720p-ref15), each its start code and first 24 bytes:
+// low-delay P pictures that code their own short-term set, picture n using the n before it, up to
+// 15. Its SPS: POC LSBs of 4 bits, no short-term set of its own, no long-term pictures; its PPS:
+// id 0, no extra header bits, no output flag.
+const std::vector<uint8_t> kRef15Pictures[] = {
+	{0x00, 0x00, 0x01, 0x26, 0x01, 0xaf, 0x8c, 0x1f, 0x0d, 0x21, 0xf2, 0x03, 0xf9, 0x07, 0xb0,
+	 0x0f, 0x37, 0xdf, 0x02, 0x38, 0xc4, 0xa4, 0x0f, 0x4c, 0xae, 0x73, 0x4b},
+	{0x00, 0x00, 0x01, 0x02, 0x01, 0xe2, 0x5f, 0xf7, 0x18, 0x3d, 0xc6, 0x5b, 0x48, 0x16, 0x61,
+	 0x0c, 0xaa, 0x59, 0x25, 0x32, 0xa9, 0x5f, 0x9d, 0x20, 0xf2, 0x50, 0x44},
+	{0x00, 0x00, 0x01, 0x02, 0x01, 0xf0, 0x13, 0xff, 0xff, 0xf1, 0x02, 0x1e, 0x30, 0x7a, 0xf8,
+	 0xa5, 0xd4, 0xeb, 0xb5, 0x57, 0x30, 0xae, 0x20, 0x5b, 0xda, 0xb7, 0xfe},
+	{0x00, 0x00, 0x01, 0x02, 0x01, 0xf2, 0x15, 0xff, 0xff, 0xfc, 0x48, 0x97, 0x8c, 0x1e, 0xbf,
+	 0x91, 0x79, 0xba, 0xee, 0xc5, 0xbf, 0xab, 0x93, 0x56, 0xf9, 0x2d, 0xc4},
+	{0x00, 0x00, 0x01, 0x02, 0x01, 0xfe, 0x08, 0x7f, 0xff, 0xff, 0xff, 0xf1, 0xe3, 0xde, 0x30,
+	 0x7a, 0xf3, 0x55, 0xad, 0x8b, 0x8c, 0x57, 0x4a, 0x2e, 0x22, 0x5b, 0xee},
+};
+
+// An access unit of one slice segment whose header BitWriter `w` wrote, of NAL unit type `type`:
+// zeros before it, its start code, its header, then 16 bytes of slice data.
+std::vector<uint8_t> sliceUnit(rgfx::video::BitWriter &w, uint32_t type)
+{
+	for (int i = 0; i < 16; i++)
+		w.u(8, 0xa5);
+	std::vector<uint8_t> out = {0, 0};
+	w.appendNal({(uint8_t)(type << 1), 1}, out);
+	return out;
+}
+
+// A PPS's narrowest tile column, as 6.5.1 lays the columns out over the SPS's CTBs.
+void checkNarrowestTileColumn()
+{
+	Sps sps = {};
+	Pps pps = {};
+	sps.pic_width_in_luma_samples = 1280;
+	sps.pic_height_in_luma_samples = 720;
+	sps.log2_diff_max_min_luma_coding_block_size = 3; // CTBs of 64: 20 across
+	uint32_t narrowest = 99;
+	CHECK(narrowestTileColumn(sps, pps, &narrowest) && narrowest == 0, "no tiles: %u", narrowest);
+	pps.tiles_enabled_flag = 1;
+	struct Columns {
+		uint8_t uniform;
+		std::vector<uint32_t> minus1; // the PPS's widths, the last column's left out
+		uint32_t want;                // 0: refused
+	};
+	for (const Columns &c : {
+	         // kvz-720p-tiles-narrow's: 256, 192, 512 and the 320 left.
+	         Columns{0, {3, 2, 7}, 192},
+	         // kvz-720p-tiles-col64's: 64, 64, 1088 and 64.
+	         Columns{0, {0, 0, 16}, 64},
+	         // The last column the rest: 1216 and 64.
+	         Columns{0, {18}, 64},
+	         // Uniform: 10 of 2 CTBs; 3 of 6, 7 and 7 (6-3); 20 of one.
+	         Columns{1, {0, 0, 0, 0, 0, 0, 0, 0, 0}, 128},
+	         Columns{1, {0, 0}, 384},
+	         Columns{1, std::vector<uint32_t>(19), 64},
+	         // Columns that leave the last none, or pass the picture; more columns than CTBs.
+	         Columns{0, {9, 9}, 0},
+	         Columns{0, {19}, 0},
+	         Columns{0, {20}, 0},
+	         Columns{1, std::vector<uint32_t>(20), 0},
+	     }) {
+		pps.uniform_spacing_flag = c.uniform;
+		pps.num_tile_columns_minus1 = (uint32_t)c.minus1.size();
+		for (size_t i = 0; i < c.minus1.size(); i++)
+			pps.column_width_minus1[i] = c.minus1[i];
+		const bool read = narrowestTileColumn(sps, pps, &narrowest);
+		CHECK(c.want ? read && narrowest == c.want : !read,
+		      "%u columns (uniform %u): %s, %u, not %u", pps.num_tile_columns_minus1 + 1, c.uniform,
+		      read ? "read" : "refused", narrowest, c.want);
+	}
+	// A picture of no whole number of CTBs: its last, part, column counts whole, as
+	// ColumnWidthInLumaSamples does. 1288 samples are 21 CTBs; 20 and 1.
+	sps.pic_width_in_luma_samples = 1288;
+	pps.uniform_spacing_flag = 0;
+	pps.num_tile_columns_minus1 = 1;
+	pps.column_width_minus1[0] = 19;
+	CHECK(narrowestTileColumn(sps, pps, &narrowest) && narrowest == 64, "a part CTB: %u", narrowest);
+	// CTBs of 16.
+	sps.pic_width_in_luma_samples = 1280;
+	sps.log2_diff_max_min_luma_coding_block_size = 1;
+	pps.column_width_minus1[0] = 3;
+	CHECK(narrowestTileColumn(sps, pps, &narrowest) && narrowest == 64, "CTBs of 16: %u", narrowest);
+}
+
+void checkCurrentReferences()
+{
+	using rgfx::video::BitWriter;
+	Sps sps = {};
+	Pps pps = {};
+	sps.pic_width_in_luma_samples = 1280;
+	sps.pic_height_in_luma_samples = 720;
+	sps.log2_diff_max_min_luma_coding_block_size = 3;
+	uint32_t count = 99;
+
+	// kvazaar's: picture n uses the n before it.
+	const uint32_t want[] = {0, 1, 8, 9, 15};
+	for (size_t i = 0; i < 5; i++) {
+		const std::vector<uint8_t> &au = kRef15Pictures[i];
+		CHECK(currentReferences(sps, pps, au.data(), au.size(), &count) && count == want[i],
+		      "ref15 picture %u: %u current references", want[i], count);
+	}
+	// Its header cut short of its set.
+	CHECK(!currentReferences(sps, pps, kRef15Pictures[4].data(), 9, &count), "a cut header read");
+	// Another PPS than its own.
+	pps.pps_pic_parameter_set_id = 1;
+	CHECK(!currentReferences(sps, pps, kRef15Pictures[3].data(), kRef15Pictures[3].size(), &count),
+	      "a header of another PPS read");
+	pps.pps_pic_parameter_set_id = 0;
+	// No VCL unit, or none that starts a picture.
+	const uint8_t sei[] = {0, 0, 1, 0x4e, 0x01, 0x05, 0x01, 0x00, 0x80};
+	CHECK(!currentReferences(sps, pps, sei, sizeof sei, &count), "an SEI read as a slice");
+	std::vector<uint8_t> second = kRef15Pictures[3];
+	second[5] &= 0x7f; // first_slice_segment_in_pic_flag 0
+	CHECK(!currentReferences(sps, pps, second.data(), second.size(), &count), "a later segment read");
+
+	// A CRA picture (its no_output_of_prior_pics_flag), with extra header bits and an output flag,
+	// using the SPS's second set by its index: its 3 used pictures of 4.
+	sps.log2_max_pic_order_cnt_lsb_minus4 = 4;
+	sps.num_short_term_ref_pic_sets = 3;
+	rps(sps.st_ref_pic_set[0], {-1}, {1}, {}, {});
+	rps(sps.st_ref_pic_set[1], {-1, -3}, {1, 0}, {2, 4}, {1, 1});
+	rps(sps.st_ref_pic_set[2], {-2}, {1}, {}, {});
+	pps.num_extra_slice_header_bits = 2;
+	pps.output_flag_present_flag = 1;
+	{
+		BitWriter w;
+		w.flag(1);   // first_slice_segment_in_pic_flag
+		w.flag(0);   // no_output_of_prior_pics_flag
+		w.ue(0);     // slice_pic_parameter_set_id
+		w.u(2, 3);   // slice_reserved_flag[2]
+		w.ue(1);     // slice_type P
+		w.flag(1);   // pic_output_flag
+		w.u(8, 200); // slice_pic_order_cnt_lsb
+		w.flag(1);   // short_term_ref_pic_set_sps_flag
+		w.u(2, 1);   // short_term_ref_pic_set_idx
+		const std::vector<uint8_t> au = sliceUnit(w, 21);
+		CHECK(currentReferences(sps, pps, au.data(), au.size(), &count) && count == 3,
+		      "the SPS's set: %u", count);
+	}
+	// A set of its own predicted from the SPS's last, {-2 used}, by -1: the set's picture at -3,
+	// unused, and the set's own at -1, used, so one.
+	{
+		BitWriter w;
+		w.flag(1);
+		w.ue(0);
+		w.u(2, 0);
+		w.ue(0);     // slice_type B
+		w.flag(1);
+		w.u(8, 7);
+		w.flag(0);   // short_term_ref_pic_set_sps_flag
+		w.flag(1);   // inter_ref_pic_set_prediction_flag
+		w.ue(0);     // delta_idx_minus1: set 2
+		w.flag(1);   // delta_rps_sign
+		w.ue(0);     // abs_delta_rps_minus1: deltaRps -1
+		w.flag(0);   // used_by_curr_pic_flag[0], -3
+		w.flag(1);   // use_delta_flag[0]
+		w.flag(1);   // used_by_curr_pic_flag[1], -1
+		const std::vector<uint8_t> au = sliceUnit(w, 1);
+		CHECK(currentReferences(sps, pps, au.data(), au.size(), &count) && count == 1,
+		      "a predicted set: %u", count);
+	}
+	// Predicted from the SPS's second, {-1, -3 | 2, 4}, by +1: pictures at 0 (none), -2, 3, 5 and
+	// the set's own at 1; all used but -2, so 3.
+	{
+		BitWriter w;
+		w.flag(1);
+		w.ue(0);
+		w.u(2, 0);
+		w.ue(0);
+		w.flag(1);
+		w.u(8, 7);
+		w.flag(0);
+		w.flag(1);
+		w.ue(1); // delta_idx_minus1: set 1
+		w.flag(0);
+		w.ue(0); // deltaRps +1
+		for (int used : {1, 0, 1, 1, 1}) {
+			w.flag(used);
+			if (!used)
+				w.flag(1);
+		}
+		const std::vector<uint8_t> au = sliceUnit(w, 1);
+		CHECK(currentReferences(sps, pps, au.data(), au.size(), &count) && count == 3,
+		      "a predicted set with a picture at 0: %u", count);
+	}
+	// A set of its own of 2 and 1 pictures, 2 used, and long-term pictures: two of the SPS's,
+	// the first used, and one of its own, used, with an MSB cycle; 4 in all.
+	sps.long_term_ref_pics_present_flag = 1;
+	sps.num_long_term_ref_pics_sps = 2;
+	sps.used_by_curr_pic_lt_sps_flag[0] = 1;
+	sps.used_by_curr_pic_lt_sps_flag[1] = 0;
+	{
+		BitWriter w;
+		w.flag(1);
+		w.ue(0);
+		w.u(2, 0);
+		w.ue(1);
+		w.flag(1);
+		w.u(8, 9);
+		w.flag(0); // short_term_ref_pic_set_sps_flag
+		w.flag(0); // inter_ref_pic_set_prediction_flag
+		w.ue(2);   // num_negative_pics
+		w.ue(1);   // num_positive_pics
+		w.ue(0), w.flag(1), w.ue(1), w.flag(0), w.ue(0), w.flag(1);
+		w.ue(2);    // num_long_term_sps
+		w.ue(1);    // num_long_term_pics
+		w.u(1, 0);  // lt_idx_sps[0]
+		w.flag(0);  // delta_poc_msb_present_flag[0]
+		w.u(1, 1);  // lt_idx_sps[1]
+		w.flag(0);
+		w.u(8, 50); // poc_lsb_lt[2]
+		w.flag(1);  // used_by_curr_pic_lt_flag[2]
+		w.flag(1);
+		w.ue(3);    // delta_poc_msb_cycle_lt[2]
+		const std::vector<uint8_t> au = sliceUnit(w, 1);
+		CHECK(currentReferences(sps, pps, au.data(), au.size(), &count) && count == 4,
+		      "long-term pictures: %u", count);
+	}
+	// An IDR picture's: none, before any set.
+	{
+		BitWriter w;
+		w.flag(1);
+		w.flag(0);
+		w.ue(0);
+		w.u(2, 0);
+		w.ue(2);
+		w.flag(1);
+		const std::vector<uint8_t> au = sliceUnit(w, 19);
+		CHECK(currentReferences(sps, pps, au.data(), au.size(), &count) && count == 0,
+		      "an IDR picture: %u", count);
+	}
+	// A set index past the SPS's sets, and a prediction from past them.
+	{
+		BitWriter w;
+		w.flag(1);
+		w.ue(0);
+		w.u(2, 0);
+		w.ue(1);
+		w.flag(1);
+		w.u(8, 9);
+		w.flag(1);
+		w.u(2, 3);
+		const std::vector<uint8_t> au = sliceUnit(w, 1);
+		CHECK(!currentReferences(sps, pps, au.data(), au.size(), &count), "set 3 of 3 read");
+	}
+	{
+		BitWriter w;
+		w.flag(1);
+		w.ue(0);
+		w.u(2, 0);
+		w.ue(1);
+		w.flag(1);
+		w.u(8, 9);
+		w.flag(0);
+		w.flag(1);
+		w.ue(3); // delta_idx_minus1: set -1
+		const std::vector<uint8_t> au = sliceUnit(w, 1);
+		CHECK(!currentReferences(sps, pps, au.data(), au.size(), &count), "a prediction from set -1 read");
+	}
+}
+
 // What the driver answers AppleGVA for a decode it could not complete (RgfxVideoStatus.hpp): the
 // schedule of a command it did not send fails, and so does an HEVC session's next schedule after
 // a failure on the host, the one answer AppleGVA's HEVC decoder reports; an H.264 session's fails
@@ -297,6 +561,8 @@ int main()
 		checkCase(make());
 	checkEscapes();
 	checkRefusals();
+	checkCurrentReferences();
+	checkNarrowestTileColumn();
 	checkStatus();
 	std::printf("video_h265_tests: %d checks passed over %zu streams\n", g_checks, kCases.size());
 	return 0;
