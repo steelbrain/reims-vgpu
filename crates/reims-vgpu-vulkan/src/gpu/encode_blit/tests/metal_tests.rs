@@ -188,7 +188,7 @@ fn pvrtc_copies_on<P: reims_vgpu_core::platform::Platform>(
 /// Metal's do on the M3 Max, at the suite's shape ([`pvrtc_copy_texture`]), of a
 /// shareable texture
 #[test]
-fn pvrtc_row_linear_copies_are_the_metal_platforms() {
+fn pvrtc_row_linear_copies_are_metals() {
     let d = dev();
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
     let vulkan = pvrtc_copies_on::<VulkanPlatform>(&d, &vulkan_desc);
@@ -330,7 +330,7 @@ fn two_plane_copies_on<P: reims_vgpu_core::platform::Platform>(
 /// platform's does on this host: `replaceRegion:` and the blits move each texel's colour word,
 /// 4 bytes, at the caller's rows, and leave the bytes between the rows as they were
 #[test]
-fn two_plane_xr10_copies_are_the_metal_platforms() {
+fn two_plane_xr10_copies_are_metals() {
     let d = dev();
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
     let (w, h) = TWO_PLANE_SIZE;
@@ -527,8 +527,8 @@ fn two_plane_copy_on<P: reims_vgpu_core::platform::Platform>(
 }
 
 /// The blits between two-plane XR10 textures
-/// [`two_plane_xr10_copies_of_any_region_are_the_metal_platforms`] compares with Metal, beyond
-/// [`two_plane_xr10_blits_are_the_metal_platforms`]'s: a copy of the whole of level 0 and
+/// [`two_plane_xr10_copies_of_any_region_are_metals`] compares with Metal, beyond
+/// [`two_plane_xr10_blits_are_metals`]'s: a copy of the whole of level 0 and
 /// slice 0 (`CopyTextureSlices`), and regions whose origins and widths are no multiple of 4,
 /// between textures of widths that are a multiple of 16, of 4 and of neither, of one width
 /// and of two, the destination's rows wider than the copy's and narrower; of the device's
@@ -588,7 +588,7 @@ const TWO_PLANE_COPIES: &[TwoPlaneShape] = {
     target_os = "macos",
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
-fn two_plane_xr10_copies_of_any_region_are_the_metal_platforms() {
+fn two_plane_xr10_copies_of_any_region_are_metals() {
     let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
         let d = dev();
         let vulkan_desc =
@@ -629,7 +629,7 @@ fn half_bits(value: f32) -> u16 {
     target_os = "macos",
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
-fn two_plane_xr10_blits_are_the_metal_platforms() {
+fn two_plane_xr10_blits_are_metals() {
     let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
         let d = dev();
         let vulkan_desc =
@@ -850,7 +850,7 @@ fn two_plane_copy_into_heap_on<P: reims_vgpu_core::platform::Platform>(
     target_os = "macos",
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
-fn two_plane_copies_into_a_heap_are_the_metal_platforms() {
+fn two_plane_copies_into_a_heap_are_metals() {
     let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
         let d = dev();
         let p = crate::platform::tests::platform();
@@ -1027,7 +1027,7 @@ fn multisampled_copies_on<P: reims_vgpu_core::platform::Platform>(
 /// shorter side) read the copied values too where no pass cleared them first: the runtime counts
 /// a blit that writes a whole level as writing the pattern Metal's new texture reads
 #[test]
-fn multisampled_depth_and_stencil_buffer_copies_are_the_metal_platforms() {
+fn multisampled_depth_and_stencil_buffer_copies_are_metals() {
     let vulkan = crate::platform::tests::platform();
     let depths = |n: u64| -> Vec<u8> {
         (0..n)
@@ -1365,7 +1365,7 @@ fn fills_on<P: reims_vgpu_core::platform::Platform>(
 /// at the level, ignored slices and depths, and fills that write nothing; depth textures;
 /// a fill larger than the staging buffer
 #[test]
-fn texture_fills_are_the_metal_platforms() {
+fn texture_fills_are_metals() {
     use reims_vgpu_core::platform::Platform as _;
     let rgba = [1.0, 0.5, 0.25, 1.0];
     let b = |level, slice, o, s, bytes: &[u8]| Fill::Bytes(level, slice, o, s, bytes.to_vec());
@@ -1748,7 +1748,7 @@ fn bfloat_values() -> Vec<f64> {
 /// another in one encoder each left its packed bytes, then `01` and zeroes, where the
 /// runtime repeats), and a bfloat or RGBX colour's are not compared
 #[test]
-fn colours_the_runtime_packs_are_the_metal_platforms() {
+fn colours_the_runtime_packs_are_metals() {
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
     let bfloats = rotations(&bfloat_values());
     // Metal's edges, by their bits: the colours the rest fills.
@@ -1868,7 +1868,7 @@ fn colours_the_runtime_packs_are_the_metal_platforms() {
 /// past 6, which take the face modulo 6, at a slice past a cube array's, which writes
 /// nothing, at a region of one block and of the whole level, and a colour
 #[test]
-fn compressed_cube_fills_are_the_metal_platforms() {
+fn compressed_cube_fills_are_metals() {
     let whole = ([0, 0, 0], [8, 8, 1]);
     let block = ([4, 4, 0], [4, 4, 1]);
     let fills = |slices: [u64; 4]| {
@@ -1935,7 +1935,7 @@ fn color_fill(
 /// which move the colour words; regions inside the level and past its edge, with bytes and
 /// with a colour packed in `RGBA8Unorm`
 #[test]
-fn two_plane_xr10_fills_off_a_surface_are_the_metal_platforms() {
+fn two_plane_xr10_fills_off_a_surface_are_metals() {
     let rgba = [1.0, 0.5, 0.25, 1.0];
     let two_plane = |format| (format, 4, [1, 1]);
     let (low, high) = ([0x21, 0x22, 0x23, 0x24], [0x31, 0x32, 0x33, 0x34]);
@@ -1969,7 +1969,7 @@ fn two_plane_xr10_fills_off_a_surface_are_the_metal_platforms() {
 /// `Depth32Float_Stencil8`'s depth, 4 bytes, read back as its depth; at a level past the first
 /// and a 2D array's slice, with bytes and with a colour packed in another format
 #[test]
-fn fills_the_runtime_writes_are_the_metal_platforms() {
+fn fills_the_runtime_writes_are_metals() {
     let rgba = [1.0, 0.5, 0.25, 1.0];
     let eight: Vec<u8> = (1..=8).collect();
     let sixteen: Vec<u8> = (0x41..=0x50).collect();
@@ -2070,7 +2070,7 @@ fn depth32_stencil8_fills_keep_the_stencil_as_metals() {
 /// the level, with bytes and with a colour packed in another format, at a level past the
 /// first and a 2D array's slice
 #[test]
-fn x32_stencil8_fills_are_the_metal_platforms() {
+fn x32_stencil8_fills_are_metals() {
     let stencil = |c: Case| Case {
         aspects: &[(2, 1)],
         ..c
@@ -2098,7 +2098,7 @@ fn x32_stencil8_fills_are_the_metal_platforms() {
 /// them or repeated to them, the region counting texels and cut at the level, with bytes and
 /// with a colour packed in another format
 #[test]
-fn bgrg422_fills_are_the_metal_platforms() {
+fn bgrg422_fills_are_metals() {
     fills_are_metals(&[read_case(
         (241, 4, [2, 1]),
         (2, [10, 3, 1], 1, 1),
@@ -2143,9 +2143,9 @@ fn pvrtc_fill_cases(
 /// to them, the region counting blocks (8 by 4 texels at 2 bits a texel, 4 by 4 at 4) and cut
 /// at the level's, with bytes and with a colour packed in another format. Its bytes are
 /// written and read back row by row (`MTLBlitOptionRowLinearPVRTC`), as
-/// `pvrtc_row_linear_copies_are_the_metal_platforms` measured those copies
+/// `pvrtc_row_linear_copies_are_metals` measured those copies
 #[test]
-fn pvrtc_fills_are_the_metal_platforms() {
+fn pvrtc_fills_are_metals() {
     fills_are_metals(&pvrtc_fill_cases(
         (Some(false), true),
         [
@@ -2190,15 +2190,15 @@ fn pvrtc_fill_textures_take_metals_size() {
 /// blocks and cut at the level's, at a level past the first, with bytes and with a colour
 /// packed in another format
 #[test]
-fn astc_hdr_fills_are_the_metal_platforms() {
+fn astc_hdr_fills_are_metals() {
     fills_are_metals(&astc_cases(&[(222, [4, 4]), (236, [12, 12])]));
 }
 
 /// A texture of the ASTC formats of blocks other than 4 by 4 (5 by 4 sRGB, 10 by 10 sRGB,
 /// 8 by 8 and 12 by 12) is filled as Metal fills it, as
-/// [`astc_hdr_fills_are_the_metal_platforms`] says
+/// [`astc_hdr_fills_are_metals`] says
 #[test]
-fn astc_fills_of_other_blocks_are_the_metal_platforms() {
+fn astc_fills_of_other_blocks_are_metals() {
     fills_are_metals(&astc_cases(&[
         (187, [5, 4]),
         (198, [10, 10]),
@@ -2317,7 +2317,7 @@ fn two_plane_heap_fill_on<P: reims_vgpu_core::platform::Platform>(
 /// overlap where the width is no multiple of 4, the alpha plane and the heap's other bytes
 /// kept; with bytes and with a colour packed in `RGBA8Unorm`, in one encoder
 #[test]
-fn two_plane_fills_in_a_heap_are_the_metal_platforms() {
+fn two_plane_fills_in_a_heap_are_metals() {
     let d = dev();
     let p = crate::platform::tests::platform();
     let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
@@ -2357,7 +2357,7 @@ fn two_plane_fills_in_a_heap_are_the_metal_platforms() {
 /// plane as Metal's does: a kernel writes its texels, a fill with bytes and one with a colour
 /// packed in `RGBA8Unorm` write their colour words, and a copy of the whole level into a
 /// heap's texture, which moves both planes as Metal's does
-/// ([`two_plane_copies_into_a_heap_are_the_metal_platforms`]), reads the heap's bytes, the
+/// ([`two_plane_copies_into_a_heap_are_metals`]), reads the heap's bytes, the
 /// alpha plane's among them ([`two_plane_copy_into_heap_on`])
 ///
 /// The runtime binds a two-plane XR10 texture to its kernels as `RGBA16Float`, a format that may
@@ -2385,7 +2385,7 @@ fn two_plane_fills_off_a_surface_keep_the_alpha_as_metals() {
 /// fillBuffer:range:pattern4: writes what Metal writes: the pattern from the range's start,
 /// cut at its end, nothing for an empty range, and across more than the staging buffer
 #[test]
-fn pattern_fills_are_the_metal_platforms() {
+fn pattern_fills_are_metals() {
     use reims_vgpu_core::platform::Platform;
     use reims_vgpu_core::platform::resource::Buffer as _;
     fn on<P: Platform>(d: &P::Device) -> Vec<u8> {
@@ -2625,7 +2625,7 @@ fn mipmaps_on<P: reims_vgpu_core::platform::Platform>(
 /// from 64 by 64 and 45 by 29 texels of random bytes, whose levels the runtime takes from the M3
 /// Max's passes
 #[test]
-fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
+fn two_bit_alpha_mipmaps_are_metals() {
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
     let designed = two_bit_chains()
         .into_iter()
@@ -2735,7 +2735,7 @@ fn m3_max_chains(formats: &[u64]) -> Vec<String> {
 /// `generateMipmapsForTexture:` of `BGRA8Unorm`, `RGBA8Unorm`, `RGB10A2Unorm` and `RG16Unorm`
 /// chains writes Metal's levels on this host, byte for byte ([`m3_max_chains`])
 #[test]
-fn m3_max_mipmap_passes_are_the_metal_platforms() {
+fn m3_max_mipmap_passes_are_metals() {
     let differ = m3_max_chains(&[80, 70, 90, 60]);
     assert!(differ.is_empty(), "{differ:#?}");
 }
@@ -2744,7 +2744,7 @@ fn m3_max_mipmap_passes_are_the_metal_platforms() {
 /// Metal's levels on this host, byte for byte ([`m3_max_chains`]): the runtime takes them from the M3 Max's passes, its tail reading an
 /// axis of one texel alone
 #[test]
-fn rg11b10_float_mipmaps_are_the_metal_platforms() {
+fn rg11b10_float_mipmaps_are_metals() {
     let differ = m3_max_chains(&[92]);
     assert!(differ.is_empty(), "{differ:#?}");
 }
@@ -2790,7 +2790,7 @@ fn canonical_extended_range(first: &mut [u8]) {
 /// ([`canonical_extended_range`]), so its first level is Metal's under either
 /// `extended_range_blits` form
 #[test]
-fn extended_range_mipmaps_are_the_metal_platforms() {
+fn extended_range_mipmaps_are_metals() {
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
     crate::answer::RELAYED.lock().clear();
     let mut differ = Vec::new();
@@ -3207,7 +3207,7 @@ fn texture_buffer_fills_of_width_are_metals(cases: &[TextureBufferCase], width: 
 /// Measured on the M3 Max (macOS 27.0.1): Metal writes the region's texels from its `x` at the
 /// texture's offset, one row, the pattern repeated from the region's first byte
 #[test]
-fn texture_buffer_fills_are_the_metal_platforms() {
+fn texture_buffer_fills_within_a_texel_are_metals() {
     let colour = [0.25, -0.5, 1.25, 0.75];
     let pattern =
         |n: usize| -> Vec<u8> { (0..n).map(|i| 0xa1 + u8::try_from(i).unwrap()).collect() };
@@ -3473,7 +3473,7 @@ fn multisample_fills_on<P: reims_vgpu_core::platform::Platform>(
 /// takes the pattern's bytes from `s` times the sample's, the pattern repeated, and past 16
 /// each sample takes the pattern cut at the sample's bytes
 #[test]
-fn multisample_fills_are_the_metal_platforms() {
+fn multisample_fills_are_metals() {
     let d = dev();
     let p = crate::platform::tests::platform();
     let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);

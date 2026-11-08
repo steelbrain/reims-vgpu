@@ -52,7 +52,7 @@ filter = '''
       | test(=gpu::encode_render::tests::metal_tests::resolves_into_other_formats_are_metals_or_die_named)
       | test(=gpu::encode_render::tests::metal_tests::indexed_strips_restart_at_the_set_index_as_metals_do)
       | test(=gpu::rgbx::nan_clears_are_metals)
-      | test(=gpu::fill::tests::metal_tests::colors_are_the_metal_platforms_here)))
+      | test(=gpu::fill::tests::metal_tests::colors_are_metals)))
 '''
 priority = 50
 

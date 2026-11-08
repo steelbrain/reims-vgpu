@@ -23,7 +23,7 @@ fn level(format: u64, width: u64, height: u64) -> TextureLevelQuery {
 /// among them) and plane arguments (the seventh), which the device answers by the runtime's
 /// rule where this module died before
 #[test]
-fn levels_are_the_metal_platforms_here() {
+fn levels_are_metals() {
     use reims_vgpu_core::platform::device::GpuDevice as _;
 
     use crate::gpu::device::tests::dev;
@@ -93,7 +93,7 @@ fn levels_are_the_metal_platforms_here() {
 /// them, which Metal would answer as BGRA8Unorm if it read the value's low 32 bits alone), as
 /// the device answers them; a format is named as the runtime names it
 #[test]
-fn descriptions_are_the_metal_platforms_here() {
+fn descriptions_are_metals() {
     use reims_vgpu_core::platform::device::GpuDevice as _;
 
     use crate::gpu::device::tests::dev;

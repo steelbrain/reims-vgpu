@@ -12,7 +12,7 @@
 //! whether the runtime makes textures of it: a descriptor takes one it lacks, and a texture of it
 //! dies where it is made ([`crate::gpu::desc::lacked`]) or is nil ([`crate::gpu::no_texture`]).
 //! The descriptions are Metal's on the M3 Max at every value
-//! (`descriptions_are_the_metal_platforms_here`).
+//! (`descriptions_are_metals`).
 //!
 //! **A texture level's layout** ([`level_layout`]), which core checks a texture on an IOSurface
 //! against (its rows' bytes, its rows, its bytes a pixel), is the runtime's
@@ -20,7 +20,7 @@
 //! with no miss, to 34,306 of Metal's answers on the M3 Max and 34,626 on the M4, over
 //! every described format at 20 sizes, levels (the sixth argument) from 0 to 2^32, depths, array
 //! lengths, plane arguments (the seventh), values no format is, and zero sizes, which Metal
-//! answers as sizes of 1. `levels_are_the_metal_platforms_here` compares it with the Metal
+//! answers as sizes of 1. `levels_are_metals` compares it with the Metal
 //! platform on this host, where it wraps at 2^64 as Metal does: it counts an extent's blocks as
 //! `(extent + block - 1) / block` with an add that wraps, so a width of `u64::MAX` has no blocks
 //! 4 wide (`wrapped_block_counts_are_metals`), and its products of blocks, bytes, depths and
@@ -246,7 +246,7 @@ mod tests {
     /// Metal's layouts where a level's block count wraps, as the M3 Max answered them: Metal counts an extent's blocks as `(extent + block - 1) / block` with an add that
     /// wraps at 2^64, so a width or height past 2^64 - block has no blocks (`u64::MAX` has none 4
     /// wide), and the extent they cover and the bytes of a row, an image and the level follow from
-    /// the count. The runtime answers each so (`levels_are_the_metal_platforms_here` compares every
+    /// the count. The runtime answers each so (`levels_are_metals` compares every
     /// format so on the device). Core never asks one: its extents are the guest's
     /// 32-bit width and height
     #[test]

@@ -139,7 +139,7 @@ fn colors_of(v: &[f64]) -> Vec<ClearColor> {
 /// A colour of each pixel format this platform packs, for many colours, is the bytes Metal
 /// writes here: an RGBA32Uint texel of each, its 16 bytes the colour's repeated
 #[test]
-fn colors_are_the_metal_platforms_here() {
+fn colors_are_metals() {
     assert_metals(&packed_formats(), &colors_of(&values()));
 }
 
@@ -161,7 +161,7 @@ fn beside(edge: f64) -> [f64; 6] {
 
 /// Values on and beside every sRGB and extended-range code's least value, and past each end
 #[test]
-fn srgb_and_extended_range_edges_are_the_metal_platforms_here() {
+fn srgb_and_extended_range_edges_are_metals() {
     let mut v = vec![-1e-30, 1e-30, 0.999_999_9, 1.000_000_1, 1.5, -0.8];
     for edge in srgb_edges() {
         v.extend(beside(edge));
@@ -176,7 +176,7 @@ fn srgb_and_extended_range_edges_are_the_metal_platforms_here() {
 /// Values on and beside the halfway points of RG11B10Float's and RGB9E5Float's mantissas, at
 /// every exponent and below the least normal, and past their largest values
 #[test]
-fn small_and_shared_exponent_float_edges_are_the_metal_platforms_here() {
+fn small_and_shared_exponent_float_edges_are_metals() {
     let mut v = vec![
         65024.0, 65279.0, 65280.0, 64512.0, 64767.0, 64768.0, 65408.0, 65472.0,
     ];
@@ -239,7 +239,7 @@ fn small_and_shared_exponent_float_edges_are_the_metal_platforms_here() {
 /// far from its edges (2^24 + 0.5, 3e9 + 0.5 and their kin, of either sign), in the integer
 /// formats
 #[test]
-fn nan_payloads_and_integer_edges_are_the_metal_platforms_here() {
+fn nan_payloads_and_integer_edges_are_metals() {
     let sign = 1u64 << 63;
     let nans = [
         0x7ff8_0000_0000_0000u64,

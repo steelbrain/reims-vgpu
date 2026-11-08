@@ -6,7 +6,7 @@
 //!   address mode and border colour, and through an argument buffer;
 //! - what kernels write, in each of their types, and read and write;
 //! - what `replaceRegion:`, blits and the private fills store, a colour fill in an RGBX format
-//!   by the runtime's packer (`encode_blit`'s `colours_the_runtime_packs_are_the_metal_platforms`);
+//!   by the runtime's packer (`encode_blit`'s `colours_the_runtime_packs_are_metals`);
 //! - `RGBX8Unorm_sRGB`'s storage reads and writes, and its RGBA twin's, at every code and around
 //!   every step of Metal's twelve-bit encode table, which the runtime converts through those
 //!   tables.
@@ -2334,7 +2334,7 @@ fn stores_into_rgbx_textures_are_metals() {
 /// of a texture buffer of the format (`Format`); a kernel's write into such a texture an
 /// argument buffer holds (`ArgumentBufferTextures`). A colour fill in the format, which the
 /// runtime's colour fill packs ([`crate::gpu::fill::OWN_FORMAT_PACKED`]), is compared with Metal's
-/// by `encode_blit`'s `colours_the_runtime_packs_are_the_metal_platforms`
+/// by `encode_blit`'s `colours_the_runtime_packs_are_metals`
 #[test]
 fn what_the_runtime_refuses_of_rgbx_textures_dies() {
     const PASS: &str = "renderCommandEncoderWithDescriptor:";

@@ -654,7 +654,7 @@ where
 /// a shareable texture; NonVolatile to every request for a smaller buffer or texture, a view
 /// and a texture over a buffer
 #[test]
-fn purgeable_states_are_the_metal_platforms() {
+fn purgeable_states_are_metals() {
     let ours =
         purgeable_answers_on::<VulkanPlatform>(&dev(), &|t| platform().texture_descriptor(t));
     let (kept, non_volatile) = ([2, 2, 3, 2, 4, 4], [2; 6]);
@@ -677,7 +677,7 @@ fn purgeable_states_are_the_metal_platforms() {
 /// texture's (550, 551), whose two planes Metal sizes: 2D of one and seven levels, at a
 /// display's size, and a 2D array
 #[test]
-fn heap_texture_sizes_are_the_metal_platforms() {
+fn heap_texture_sizes_are_metals() {
     for pixel_format in [550, 551] {
         for (texture_type, width, height, mipmap_level_count, array_length) in [
             (2, 64, 64, 1, 1),
@@ -735,7 +735,7 @@ fn heap_texture_sizes_are_the_metal_platforms() {
 /// `allowGPUOptimizedContents` off, which Metal keeps uncompressed. Each shape whose answer
 /// differs, or whose query dies, is named
 #[test]
-fn multisample_heap_texture_sizes_are_the_metal_platforms() {
+fn multisample_heap_texture_sizes_are_metals() {
     let (p, d) = (platform(), dev());
     let colour = [70, 80, 115];
     let depth = [252, 253, 260];
@@ -3219,7 +3219,7 @@ fn two_plane_samples_on<P: Platform>(
     target_os = "macos",
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
-fn two_plane_xr10_samples_are_the_metal_platforms() {
+fn two_plane_xr10_samples_are_metals() {
     let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
         let d = dev();
         let vulkan_desc = |t: &TextureDesc| platform().texture_descriptor(t);

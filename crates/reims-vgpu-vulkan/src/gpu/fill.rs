@@ -10,7 +10,7 @@
 //! - **The pattern** of `pattern4:` is its four bytes, low first, repeated from the range's start
 //!   up to the first offset that is a multiple of 16 (the head), and from that offset afresh to
 //!   the range's end: a fill of 7 bytes at 41 writes `01 02 03 04 01 02 03`, then `01 02 ..` from
-//!   48. An empty range writes nothing (`encode_blit`'s `pattern_fills_are_the_metal_platforms`).
+//!   48. An empty range writes nothing (`encode_blit`'s `pattern_fills_are_metals`).
 //! - **A texel** of either texture fill is its pattern (the bytes, or the colour's bytes) repeated
 //!   from its start and cut at the texture format's block bytes: bytes past a block go unread,
 //!   and a colour of fewer bytes repeats (an R8Unorm colour fills each byte of an RGBA32Uint
@@ -28,7 +28,7 @@
 //!   and those below them; and doubles on, beside and between the 8-, 16- and 32-bit integer
 //!   edges. A colour in a format of [`OWN_FORMAT_PACKED`] (the bfloat formats, the
 //!   extended-range `_sRGB` twins, the RGBX formats) is compared into a texture of its own format
-//!   (`encode_blit`'s `colours_the_runtime_packs_are_the_metal_platforms`); into a texture of
+//!   (`encode_blit`'s `colours_the_runtime_packs_are_metals`); into a texture of
 //!   another format nothing compared it ([`crate::gpu::encode_blit`]).
 //! - **A colour in a format Metal packs none in** (every format outside [`PACKED`] and
 //!   [`OWN_FORMAT_PACKED`]: Invalid, the depth and stencil formats and the two-plane XR10
@@ -63,7 +63,7 @@
 //!   from the texture's offset plus the region's `x` texels, one row whatever the level, slice,
 //!   row, height and depth, the pattern running across the region's bytes, not started again at
 //!   each texel, past the width too and cut at the buffer's end, as the runtime's fill writes it
-//!   (`texture_buffer_fills_are_the_metal_platforms`,
+//!   (`texture_buffer_fills_within_a_texel_are_metals`,
 //!   `texture_buffer_fills_metal_streams_are_metals`), of a pattern of up to 32752 bytes; a
 //!   longer one ends Metal's process in the call, whatever the region, and dies there, naming the
 //!   runtime's refusal of it ([`streamed_pattern`]). Where a 16-byte chunk of Metal's reads
@@ -72,7 +72,7 @@
 //! - **A multisample texture's** fill writes every sample of the region's texels and no other,
 //!   each sample its own bytes of the pattern where a texel's samples hold 16 bytes or fewer,
 //!   else every sample the pattern cut at the texel, as the runtime's fill writes them
-//!   (`encode_blit`'s `multisample_fills_are_the_metal_platforms`). The runtime refuses one only
+//!   (`encode_blit`'s `multisample_fills_are_metals`). The runtime refuses one only
 //!   where the device cannot run its sample copies, which dies naming the refusal.
 
 use metal2vulkan::metal::{PixelFormat, TextureType};

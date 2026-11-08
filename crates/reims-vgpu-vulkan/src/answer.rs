@@ -771,7 +771,7 @@ pub fn created_or_decided<T>(
 ///   load or a blit reads only its region; a copy of one aspect of a `Depth32Float_Stencil8`
 ///   texture writes that aspect alone. So a guest that copies a buffer into a new multisampled
 ///   `Depth32Float` target and reads it with no clearing pass between reads Metal's texels
-///   (`encode_blit`'s `multisampled_depth_and_stencil_buffer_copies_are_the_metal_platforms`). A
+///   (`encode_blit`'s `multisampled_depth_and_stencil_buffer_copies_are_metals`). A
 ///   pass's clear counts as a write, as the pass ends, only where it reaches the texture: an
 ///   attachment the pass renders itself, or one it renders through a stand-in or a separate
 ///   depth or stencil scratch that it stores. A new separate depth or stencil texture, or a

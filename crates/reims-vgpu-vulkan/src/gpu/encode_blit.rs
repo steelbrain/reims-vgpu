@@ -12,7 +12,7 @@
 //!   (MoltenVK 1.4.1 among them). Such a refusal is one, its line naming the copy's shape
 //!   (`buffer_copy_shape`).
 //! - **`fillBuffer:range:pattern4:`** is the runtime's `fill_buffer_pattern4`, which writes the
-//!   pattern as Metal does ([`crate::gpu::fill`]'s docs; `pattern_fills_are_the_metal_platforms`,
+//!   pattern as Metal does ([`crate::gpu::fill`]'s docs; `pattern_fills_are_metals`,
 //!   over more than the runtime stages at once).
 //! - **The private texture fills** (the two `fillTexture:...`) are the runtime's: a bytes fill
 //!   its `fill_texture` of the pattern, a colour fill its colour fill, which fills the texel it
@@ -20,42 +20,42 @@
 //!   buffer outside the Metal address space, at the level and slice and in the region
 //!   [`crate::gpu::fill::place`] gives (a texture buffer's as the call gives them, the bytes
 //!   of its buffer written from the region's `x` whatever the level, slice and row, the pattern
-//!   running across them past the width, `texture_buffer_fills_are_the_metal_platforms` and
+//!   running across them past the width, `texture_buffer_fills_within_a_texel_are_metals` and
 //!   `texture_buffer_fills_metal_streams_are_metals`); a fill that writes nothing encodes
 //!   nothing. They write
-//!   what Metal's fill writes on this host (`texture_fills_are_the_metal_platforms`, of colour
+//!   what Metal's fill writes on this host (`texture_fills_are_metals`, of colour
 //!   and depth formats, levels, slices, cube faces, 3D depths, cut regions and a fill larger than
 //!   the runtime stages at once) and:
 //!   - a compressed format's blocks, each the pattern cut at its bytes or repeated to them, the
 //!     region counting blocks, which the runtime cuts at the level's blocks (the cut `place`
 //!     makes, at the level's texels, is no tighter): BC, 4 by 4 ASTC, ETC2 and EAC
-//!     (`fills_the_runtime_writes_are_the_metal_platforms`), PVRTC at the suite's shape, of a
-//!     shareable texture (`pvrtc_fills_are_the_metal_platforms`), and ASTC of HDR blocks and
-//!     of other blocks (`astc_hdr_fills_are_the_metal_platforms`,
-//!     `astc_fills_of_other_blocks_are_the_metal_platforms`);
+//!     (`fills_the_runtime_writes_are_metals`), PVRTC at the suite's shape, of a
+//!     shareable texture (`pvrtc_fills_are_metals`), and ASTC of HDR blocks and
+//!     of other blocks (`astc_hdr_fills_are_metals`,
+//!     `astc_fills_of_other_blocks_are_metals`);
 //!   - a 4:2:2 format's texels, 2 bytes each (`GBGR422`,
-//!     `fills_the_runtime_writes_are_the_metal_platforms`, and `BGRG422`,
-//!     `bgrg422_fills_are_the_metal_platforms`);
+//!     `fills_the_runtime_writes_are_metals`, and `BGRG422`,
+//!     `bgrg422_fills_are_metals`);
 //!   - a stencil format's texels, 1 byte each (`Stencil8`,
-//!     `fills_the_runtime_writes_are_the_metal_platforms`, and `X32_Stencil8`'s stencil,
-//!     `x32_stencil8_fills_are_the_metal_platforms`); `Depth32Float_Stencil8`'s depth, its
+//!     `fills_the_runtime_writes_are_metals`, and `X32_Stencil8`'s stencil,
+//!     `x32_stencil8_fills_are_metals`); `Depth32Float_Stencil8`'s depth, its
 //!     stencil kept (`depth32_stencil8_fills_keep_the_stencil_as_metals`);
 //!   - a two-plane XR10 texture's (550, 551) colour words in plane 0, the alpha bytes kept: over
 //!     a surface's planes at Metal's blit rows
 //!     (`a_filled_two_plane_xr10_texture_over_a_surface_writes_as_metals`); in a placement heap's
 //!     bytes, of one level, at Metal's blit rows, which overlap where the width is no multiple of
-//!     4 (`two_plane_fills_in_a_heap_are_the_metal_platforms`); and of its own memory, of one
+//!     4 (`two_plane_fills_in_a_heap_are_metals`); and of its own memory, of one
 //!     level a multiple of 4 wide, at its rows
-//!     (`two_plane_xr10_fills_off_a_surface_are_the_metal_platforms`, the alpha kept
+//!     (`two_plane_xr10_fills_off_a_surface_are_metals`, the alpha kept
 //!     `two_plane_fills_off_a_surface_keep_the_alpha_as_metals`).
 //!
 //!   It fills every texture type [`crate::gpu::fill::place`] measured, a compressed cube and
-//!   cube array too (`compressed_cube_fills_are_the_metal_platforms`). The runtime fills the
+//!   cube array too (`compressed_cube_fills_are_metals`). The runtime fills the
 //!   rest of the formats Metal fills too: a two-plane XR10 texture of its own memory at any width
 //!   and level count, and a heap's of more than one level or slice, at level 0 of the slice's
 //!   words, rows `max(16, ⌊4 w / 16⌋ · 16)` bytes apart; the YCbCr and padded formats of a
 //!   texture over a surface or memory (`fills_of_ycbcr_and_padded_textures_are_metals`); and a
-//!   multisample texture's samples (`multisample_fills_are_the_metal_platforms`). It refuses a
+//!   multisample texture's samples (`multisample_fills_are_metals`). It refuses a
 //!   multisample texture's fill only where the device cannot run its sample copies (sample-rate
 //!   shading, an integer attachment at the sample count), which dies naming the refusal.
 //! - **A colour fill** is the runtime's colour fill, which packs the colour in the call's pixel
@@ -63,7 +63,7 @@
 //!   a pattern (above), at the level and slice and in the region `place` gives. A colour in a
 //!   format of [`crate::gpu::fill::OWN_FORMAT_PACKED`] (a bfloat format, an extended-range
 //!   `_sRGB` twin, an RGBX format) into a texture of another format is filled, relayed, and dies
-//!   in strict mode (`colours_the_runtime_packs_are_the_metal_platforms`): a twin's bytes there
+//!   in strict mode (`colours_the_runtime_packs_are_metals`): a twin's bytes there
 //!   follow no rule measured on Metal, and a bfloat or RGBX colour's were not compared, where the
 //!   runtime repeats the packed texel. A colour in a format Metal packs none in fills the bytes
 //!   of the command buffer's last packed texel, as Metal's do ([`crate::gpu::fill`]).
@@ -86,10 +86,10 @@
 //!   the whole level by a region and by `copyFromTexture:sourceSlice:sourceLevel:toTexture:...`,
 //!   and regions of any origin and width, between textures of one width and of two, whose widths
 //!   are a multiple of 16, of 4 or of neither, of the default storage, `Private`, and a placement
-//!   heap's (measured on the M3 Max: `two_plane_xr10_blits_are_the_metal_platforms`,
-//!   `two_plane_xr10_copies_of_any_region_are_the_metal_platforms`). Their copies to and from a
+//!   heap's (measured on the M3 Max: `two_plane_xr10_blits_are_metals`,
+//!   `two_plane_xr10_copies_of_any_region_are_metals`). Their copies to and from a
 //!   buffer move plane 0's colour words, as Metal's do on this host
-//!   (`two_plane_xr10_copies_are_the_metal_platforms`). Where the runtime's answer is not Metal's
+//!   (`two_plane_xr10_copies_are_metals`). Where the runtime's answer is not Metal's
 //!   measured one, it announces so, which is relayed, a death in strict mode (`TwoPlaneTextureCopy`
 //!   and `TwoPlaneBufferBlit`, [`crate::answer::DIES`]): a copy within one texture, of a texture of
 //!   more than one level or slice, of rows that overlap in the destination, of a texture narrower
@@ -102,7 +102,7 @@
 //!   (`two-plane-buffer-blit-order`, [`crate::answer`]). A copy into a
 //!   heap's texture writes the heap's bytes at Metal's blit rows, as Metal's blit does, the bytes
 //!   outside its texels and past its alpha plane over the heap's other resources included
-//!   (`two_plane_copies_into_a_heap_are_the_metal_platforms`).
+//!   (`two_plane_copies_into_a_heap_are_metals`).
 //! - **Bytes past a buffer's end** in a copy between it and a texture: the runtime reads a
 //!   no-copy buffer's to the end of its pages, as Metal reads them, and refuses another buffer's,
 //!   which dies, where Metal copies bytes no one wrote.

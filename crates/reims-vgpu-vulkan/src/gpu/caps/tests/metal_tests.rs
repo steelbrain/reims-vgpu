@@ -141,7 +141,7 @@ fn answers(caps: &DeviceCaps) -> Vec<(String, String)> {
 /// The registry ID, which names the device until the host restarts, is left out, and a GPU other
 /// than the one Metal's answers were recorded on answers otherwise, so there the test ends.
 #[test]
-fn every_cap_is_the_metal_platforms_here() {
+fn every_cap_is_metals() {
     let ours = answers(&dev().caps());
     if !reims_vgpu_core::metal_matches!("name", ours[0].1) {
         eprintln!(
