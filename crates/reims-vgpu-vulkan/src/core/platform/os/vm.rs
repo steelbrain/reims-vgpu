@@ -125,6 +125,15 @@ pub trait HostVm: Send + Sync {
     fn view_room(&self) -> Option<u64> {
         None
     }
+    /// No Mach counterpart: how many of the kernel mappings [`HostVm::view_room`] counts the view
+    /// of guest pages at `at`, `len` bytes, holds now, which its teardown gives back: a mapping a
+    /// run where its runs are mapped one by one, fewer where the platform mapped them another way
+    /// (Linux's dma-bufs, a mapping per 4 MiB). `None`, the default, where views take none that is
+    /// counted (Mach's).
+    fn view_mappings(&self, at: HostAddr, len: u64) -> Option<u64> {
+        let _ = (at, len);
+        None
+    }
 }
 
 #[cfg(test)]

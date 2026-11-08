@@ -1228,6 +1228,14 @@ impl HostVm for LinuxVm {
     fn view_room(&self) -> Option<u64> {
         Some(budget::room())
     }
+
+    /// The mappings the backing table's runs in the view take ([`files::mappings_between`]), as
+    /// the budget counts them: a mapping a run mapped from its file, one a dma-buf ("Views
+    /// through dma-bufs").
+    fn view_mappings(&self, at: HostAddr, len: u64) -> Option<u64> {
+        let first = at.addr().to_u64();
+        Some(files::mappings_between(first, first.saturating_add(len)))
+    }
 }
 
 #[cfg(test)]
@@ -1347,6 +1355,41 @@ pub(crate) mod tests {
         assert_eq!(both(), (4, 4), "its third page unmapped");
         assert!(v.deallocate(at, 8 * p).is_success());
         assert!(v.deallocate(src, 8 * p).is_success());
+    }
+
+    /// What `view_mappings` answers for a view is the kernel's count in its range, which its
+    /// teardown gives back: a mapping a page for pages remapped one at a time backwards, and,
+    /// for the same pages remapped at once, one where views are mapped through dma-bufs
+    #[test]
+    fn a_views_mappings_are_the_kernels_in_its_range() {
+        let v = vm();
+        let p = page();
+        let n = 16u64;
+        let src = allocate_aliasable(n * p).unwrap();
+        let one = v.allocate_anywhere(n * p).unwrap();
+        let at_once = v.allocate_anywhere(n * p).unwrap();
+        // Backwards, a page a run.
+        let runs: Vec<_> = (0..n)
+            .map(|i| (src.wrapping_add((n - 1 - i) * p), p))
+            .collect();
+        for (i, &(from, len)) in runs.iter().enumerate() {
+            v.remap_shared_overwrite(one.wrapping_add(i.to_u64() * p), from, len)
+                .unwrap();
+        }
+        v.remap_runs_shared_overwrite(at_once, &runs).unwrap();
+        let kernel = |at: HostAddr| {
+            let first = at.addr().to_u64();
+            kernel_mappings(first, first + n * p)
+        };
+        assert_eq!(v.view_mappings(one, n * p), Some(n));
+        assert_eq!(v.view_mappings(one, n * p), Some(kernel(one)));
+        let through = super::super::import::views_through_dma_bufs();
+        let want = if through { 1 } else { n };
+        assert_eq!(v.view_mappings(at_once, n * p), Some(want));
+        assert_eq!(v.view_mappings(at_once, n * p), Some(kernel(at_once)));
+        for at in [one, at_once, src] {
+            assert!(v.deallocate(at, n * p).is_success());
+        }
     }
 
     /// Whether this process opens `/dev/udmabuf`, which views through dma-bufs need.

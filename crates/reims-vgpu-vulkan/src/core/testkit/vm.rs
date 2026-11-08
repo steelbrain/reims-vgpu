@@ -145,6 +145,9 @@ struct VmState {
     idle_view_mappings: Option<u64>,
     /// What [`HostVm::view_room`] answers ([`FakeVm::set_view_room`]).
     view_room: Option<u64>,
+    /// What [`HostVm::view_mappings`] answers for the view at each first byte, in place of its
+    /// remaps ([`FakeVm::set_view_mappings`]).
+    view_mappings: std::collections::BTreeMap<u64, u64>,
 }
 
 impl VmState {
@@ -193,6 +196,18 @@ impl FakeVm {
     /// Has [`HostVm::view_room`] answer `mappings` from now on (`None` at first, as Mach's).
     pub fn set_view_room(&self, mappings: Option<u64>) {
         self.state.lock().view_room = mappings;
+    }
+
+    /// Has [`HostVm::view_mappings`] answer `mappings` for the view whose first byte is `at`, as
+    /// a view mapped another way than a mapping a run holds them, or count its remaps again with
+    /// `None`.
+    pub fn set_view_mappings(&self, at: HostPtr, mappings: Option<u64>) {
+        let key = at.addr().to_u64();
+        let mut g = self.state.lock();
+        match mappings {
+            Some(n) => g.view_mappings.insert(key, n),
+            None => g.view_mappings.remove(&key),
+        };
     }
 
     /// The same address space with its own, discarded log and an empty script: the host's (QEMU's)
@@ -471,6 +486,26 @@ impl HostVm for FakeVm {
     /// As set ([`FakeVm::set_view_room`]); unlogged, as no Mach call answers it.
     fn view_room(&self) -> Option<u64> {
         self.state.lock().view_room
+    }
+
+    /// Where a view room is set ([`FakeVm::set_view_room`]), as views' mappings are counted
+    /// there: what [`FakeVm::set_view_mappings`] set for a view at `at`, else the remaps whose
+    /// destination meets its `len` bytes, a mapping each; unlogged, as no Mach call answers it.
+    fn view_mappings(&self, at: HostAddr, len: u64) -> Option<u64> {
+        let g = self.state.lock();
+        g.view_room?;
+        if let Some(&n) = g.view_mappings.get(&at.addr().to_u64()) {
+            return Some(n);
+        }
+        let Some((i, off)) = g.find(at, len) else {
+            return Some(0);
+        };
+        let region = &g.areas.get(i)?.region;
+        let end = off.saturating_add(len);
+        let meets = |a: &&Alias| {
+            Arc::ptr_eq(&a.dst, region) && a.dst_off < end && off < a.dst_off.saturating_add(a.len())
+        };
+        Some(g.aliases.iter().filter(meets).count().to_u64())
     }
 }
 
