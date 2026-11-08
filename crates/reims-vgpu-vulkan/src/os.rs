@@ -151,8 +151,6 @@ impl Drop for PrivateMemory {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::core::platform::os::vm::HostVm as _;
-
     // The surface tests' helpers, which the crate's tests name here.
     pub(crate) use super::surface::tests::*;
     use super::*;
