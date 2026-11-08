@@ -63,6 +63,7 @@
 #include <vector>
 
 #include "RgfxCommitOrder.hpp"
+#include "RgfxCompletionThread.hpp"
 #include "RgfxEncoder.hpp"
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxObjectModel.hpp"
@@ -1281,6 +1282,21 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 } // namespace
 
+// The stages profilingResults times, in the order of its keys (MTLCommandBufferSPI, below).
+enum RgfxStage : unsigned {
+	kRgfxStageCreation,
+	kRgfxStageEnqueue,
+	kRgfxStageCommit,
+	kRgfxStageSubmitToKernel,
+	kRgfxStageKernelScheduled,
+	kRgfxStageSubmitToHW,
+	kRgfxStageCompletionInterrupt,
+	kRgfxStageKernelComplete,
+	kRgfxStageCompletionHandlerEnqueue,
+	kRgfxStageCompletionHandlerExecution,
+	kRgfxStageCount,
+};
+
 @implementation RgfxCmdBuffer {
 	RgfxCommandQueue *_queue; // kept alive, as Metal's command buffers keep their queue
 	RgfxEncoder *_encoder; // owned: built incrementally, posted on commit
@@ -1413,6 +1429,25 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	std::shared_ptr<RgfxUploadArena> _uploads;
 	bool _uploadsFailed;
 	uint64_t _traceId; // globalTraceObjectID
+	// What Metal's base command buffer keeps for its SPI (MTLCommandBufferSPI, below): the
+	// private data and its offset, a logging buffer it does not retain, the profiling and
+	// shared-indirection-table switches, and the logs it was given.
+	id _privateData;
+	NSUInteger _privateDataOffset;
+	__unsafe_unretained id _privateLoggingBuffer;
+	std::atomic<bool> _profilingEnabled;
+	BOOL _sharedIndirectionTable;
+	id _logs;
+	// The blocks __waitUntilScheduledAsync: and __waitUntilCompletedAsync: were given, run once
+	// the scheduled or the completed handlers have; each `*Done` says they have, so a block
+	// given later runs at once. Under `_handlersLock`.
+	NSMutableArray *_scheduledWaiters;
+	NSMutableArray *_completedWaiters;
+	bool _scheduledWaitersDone;
+	bool _completedWaitersDone;
+	// When it reached each stage, in mach_absolute_time's units, for profilingResults: its
+	// creation always, the rest where profiling is enabled then (rgfxNoteStage:).
+	std::atomic<uint64_t> _stageTimes[kRgfxStageCount];
 }
 
 + (instancetype)commandBufferForQueue:(RgfxCommandQueue *)queue
@@ -1432,6 +1467,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		cb->_status.store(MTLCommandBufferStatusNotEnqueued);
 		cb->_completedHandlers = [NSMutableArray array];
 		cb->_scheduledHandlers = [NSMutableArray array];
+		cb->_completedWaiters = [NSMutableArray array];
+		cb->_scheduledWaiters = [NSMutableArray array];
+		cb->_stageTimes[kRgfxStageCreation].store(mach_absolute_time());
 		const uint32_t reserve = queue.rgfxMessageReserve;
 		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId, reserve);
 		// Past its ring, the message is built in a block of the queue's pool, the size of the
@@ -1636,6 +1674,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	_enqueued = YES;
 	MTLCommandBufferStatus expected = MTLCommandBufferStatusNotEnqueued;
 	_status.compare_exchange_strong(expected, MTLCommandBufferStatusEnqueued);
+	[self rgfxNoteStage:kRgfxStageEnqueue];
 	return YES;
 }
 
@@ -1664,6 +1703,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// Not enqueued before, it is now, behind every buffer enqueued before it.
 	[_queue rgfxEnqueue:self];
 	_kernelStart.store(rgfxHostTime());
+	[self rgfxNoteStage:kRgfxStageCommit];
 	// The IOSurface copies the CPU changed since they last synced take the surfaces'
 	// pages before the GPU reads them; the copies this buffer writes go back at its
 	// completion.
@@ -1740,6 +1780,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 // commit that made it the oldest ready buffer of the queue (rgfxPostReady).
 - (void)rgfxPost
 {
+	[self rgfxNoteStage:kRgfxStageSubmitToKernel];
 	RgfxCommandQueue *queue = _queue;
 	// Where the process names its buffers' order, the buffers of other queues it runs after, as
 	// the surfaces' blocks name them now, as it goes on its ring: a Mac orders a buffer's
@@ -1998,6 +2039,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 
 - (void)rgfxHostDone:(const RgfxCbComplete *)msg
 {
+	[self rgfxNoteStage:kRgfxStageCompletionInterrupt];
+	[self rgfxNoteStage:kRgfxStageKernelComplete];
 	[self rgfxReachSubmitted];
 	// The slots of its surfaces that still name it are free: a buffer that named it would wait
 	// for nothing. Where its accesses are yet to be named, they are emptied once they are.
@@ -2144,13 +2187,17 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		_cbError = rgfxCommandBufferError(static_cast<NSInteger>(msg->error_code));
 		_status.store(MTLCommandBufferStatusError);
 	}
+	[self rgfxNoteStage:kRgfxStageCompletionHandlerEnqueue];
+	[self rgfxNoteStage:kRgfxStageCompletionHandlerExecution];
 	for (MTLCommandBufferHandler block in _completedHandlers) {
 		block(self);
 	}
 	[_completedHandlers removeAllObjects];
 	// What it kept goes after its handlers, which may still name it, and before its waiters
-	// wake, as Metal's buffer lets its retained references go.
+	// wake, as Metal's buffer lets its retained references go; the blocks
+	// __waitUntilCompletedAsync: was given run between the two, as Metal's do.
 	_kept.clear();
+	[self rgfxRunWaiters:_completedWaiters done:&_completedWaitersDone];
 	if (_done != nil && !_left.exchange(true))
 		dispatch_group_leave(_done);
 }
@@ -2174,10 +2221,12 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	[self rgfxScheduledNamesAccesses];
 	MTLCommandBufferStatus committed = MTLCommandBufferStatusCommitted;
 	_status.compare_exchange_strong(committed, MTLCommandBufferStatusScheduled);
+	[self rgfxNoteStage:kRgfxStageSubmitToHW];
 	for (MTLCommandBufferHandler block in _scheduledHandlers) {
 		block(self);
 	}
 	[_scheduledHandlers removeAllObjects];
+	[self rgfxRunWaiters:_scheduledWaiters done:&_scheduledWaitersDone];
 	_scheduledRan.store(true);
 	if (_scheduled != nil && !_scheduledLeft.exchange(true))
 		dispatch_group_leave(_scheduled);
@@ -2409,9 +2458,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 {
 	_errorOptions = options;
 }
+// What setLogs: gave, else an empty container.
 - (id<MTLLogContainer>)logs
 {
-	return [[RgfxLogContainer alloc] init];
+	return _logs != nil ? _logs : [[RgfxLogContainer alloc] init];
 }
 // The times (rgfxNoteGPUTimes:), 0 until the buffer has them.
 - (CFTimeInterval)kernelStartTime
@@ -2550,6 +2600,357 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 // Returns with nothing changed, before commit and after completion.
 - (void)validate
 {
+}
+
+// --- MTLCommandBufferSPI ---------------------------------------------------------------------
+// The members of Metal's command-buffer SPI that the AMD 5300M's and the Intel 630's buffers both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m),
+// answered as Metal's base command buffer answers them (read from code: _MTLCommandBuffer and
+// MTLIOAccelCommandBuffer, macOS 27.0.1); the getters of a fresh buffer answer what those two
+// GPUs' buffers answer (measured: oracle_spi_members answers).
+
+// When the buffer reached `stage`: profilingResults' times, kept while profiling is enabled.
+- (void)rgfxNoteStage:(RgfxStage)stage
+{
+	if (_profilingEnabled.load(std::memory_order_relaxed))
+		_stageTimes[stage].store(mach_absolute_time(), std::memory_order_relaxed);
+}
+
+// Runs the blocks `waiters` holds with the buffer, after its handlers of the stage, as Metal
+// runs its Swift waiters after its callbacks and before its waits return, and marks them run, so
+// a block given later runs at once (__waitUntilScheduledAsync:, __waitUntilCompletedAsync:). A record runs on the
+// completion thread only where it runs nothing of the app's (rgfxDeliver:here:), so there the
+// blocks go to the queue's completion queue instead.
+- (void)rgfxRunWaiters:(NSMutableArray *)waiters done:(bool *)done
+{
+	NSArray *blocks = nil;
+	{
+		std::lock_guard<std::mutex> hold(_handlersLock);
+		*done = true;
+		if (waiters.count == 0)
+			return;
+		blocks = [waiters copy];
+		[waiters removeAllObjects];
+	}
+	RgfxCmdBuffer *buffer = self;
+	dispatch_block_t run = ^{
+		for (void (^block)(id<MTLCommandBuffer>) in blocks)
+			block(buffer);
+	};
+	if (RgfxCompletionThread::onCurrentThread())
+		[_queue rgfxDeliver:run here:NO];
+	else
+		run();
+}
+
+// The wait Metal's Swift overlay awaits (scheduled()): `block` runs with the buffer once it is
+// scheduled and its scheduled handlers have run, at once where they have.
+- (void)__waitUntilScheduledAsync:(void (^)(id<MTLCommandBuffer>))block
+{
+	if (block == nil)
+		return;
+	{
+		std::lock_guard<std::mutex> hold(_handlersLock);
+		if (!_scheduledWaitersDone) {
+			[_scheduledWaiters addObject:[block copy]];
+			return;
+		}
+	}
+	block(self);
+}
+
+// The same, once it has completed and its completed handlers have run (completed()).
+- (void)__waitUntilCompletedAsync:(void (^)(id<MTLCommandBuffer>))block
+{
+	if (block == nil)
+		return;
+	{
+		std::lock_guard<std::mutex> hold(_handlersLock);
+		if (!_completedWaitersDone) {
+			[_completedWaiters addObject:[block copy]];
+			return;
+		}
+	}
+	block(self);
+}
+
+// Metal's IOAccel buffer hands the resources and heaps named here to its kernel to purge as the
+// buffer runs; the device has no such command.
+- (void)addPurgedResource:(id)resource
+{
+	(void)resource;
+	RGFX_UNSUPPORTED("purging a resource as a command buffer runs");
+}
+
+- (void)addPurgedHeap:(id)heap
+{
+	(void)heap;
+	RGFX_UNSUPPORTED("purging a heap as a command buffer runs");
+}
+
+// Metal's base buffer raises an unrecognized selector for a commit with a deadline (it sends
+// itself doesNotRecognizeSelector:), and so does its wait for the submission, which commits so.
+- (void)commitWithDeadline:(uint64_t)deadline
+{
+	(void)deadline;
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (BOOL)commitAndWaitUntilSubmittedWithDeadline:(uint64_t)deadline
+{
+	[self commitWithDeadline:deadline];
+	return NO;
+}
+
+// Metal takes only the descriptor's log state here, and a descriptor of the device's has none:
+// the device makes no log state (newLogStateWithDescriptor:error:).
+- (void)configWithCommandBufferDescriptor:(MTLCommandBufferDescriptor *)descriptor
+{
+	(void)descriptor;
+}
+
+- (id)deadlineProfile
+{
+	return nil;
+}
+
+// No debug buffer: Metal's base answers none, of length 0.
+- (void *)debugBufferContentsWithLength:(NSUInteger *)length
+{
+	if (length != nullptr)
+		*length = 0;
+	return nullptr;
+}
+
+// A tool's hook that corrupts the buffer's kernel commands on purpose.
+- (void)doCorruptCBSPI:(NSUInteger)how
+{
+	(void)how;
+	RGFX_UNSUPPORTED("corrupting a command buffer on purpose");
+}
+
+// Metal's IOAccel buffer encodes a kernel command that aborts it where the event is signalled.
+- (void)encodeConditionalAbortEvent:(id<MTLEvent>)event
+{
+	(void)event;
+	RGFX_UNSUPPORTED("aborting a command buffer on an event");
+}
+
+// Resource-group dashboards: Metal's base buffer fails each as unsupported on the device, with
+// its words.
+- (void)encodeDashboardTagForResourceGroup:(id)group
+{
+	(void)group;
+	RgfxMetalAssertionFailed("-[_MTLCommandBuffer encodeDashboardTagForResourceGroup:]",
+	                         @"-[_MTLCommandBuffer encodeDashboardTagForResourceGroup:] not "
+	                         @"supported on this device");
+}
+
+- (void)encodeDashboardFinalizeForResourceGroup:(id)group
+                                      dashboard:(NSUInteger)dashboard
+                                          value:(uint64_t)value
+                                       forIndex:(NSUInteger)index
+{
+	(void)group;
+	(void)dashboard;
+	(void)value;
+	(void)index;
+	RgfxMetalAssertionFailed(
+	    "-[_MTLCommandBuffer encodeDashboardFinalizeForResourceGroup:dashboard:value:forIndex:]",
+	    @"-[_MTLCommandBuffer encodeDashboardFinalizeForResourceGroup:dashboard:value:forIndex:] "
+	    @"not supported on this device");
+}
+
+- (void)encodeDashboardFinalizeForResourceGroup:(id)group
+                                      dashboard:(NSUInteger)dashboard
+                                         values:(const uint64_t *)values
+                                        indices:(const NSUInteger *)indices
+                                          count:(NSUInteger)count
+{
+	(void)group;
+	(void)dashboard;
+	(void)values;
+	(void)indices;
+	(void)count;
+	RgfxMetalAssertionFailed("-[_MTLCommandBuffer "
+	                         "encodeDashboardFinalizeForResourceGroup:dashboard:values:indices:count:]",
+	                         @"-[_MTLCommandBuffer "
+	                         @"encodeDashboardFinalizeForResourceGroup:dashboard:values:indices:count:] "
+	                         @"not supported on this device");
+}
+
+- (NSUInteger)getListIndex
+{
+	return 0;
+}
+
+- (BOOL)isProfilingEnabled
+{
+	return _profilingEnabled.load();
+}
+
+- (void)setProfilingEnabled:(BOOL)enabled
+{
+	_profilingEnabled.store(enabled);
+}
+
+// With profiling enabled, when the buffer reached each stage, in mach_absolute_time's units under
+// Metal's keys, 0 for one it has not reached; nil without. The device's stages: its creation,
+// enqueue and commit; its post to the device (submitted to the kernel, and done scheduling
+// there); its scheduling (submitted to the hardware); the completion's record taken off the ring
+// (the interrupt, and the kernel's completion); its delivery (its handlers' enqueue and run).
+- (NSDictionary *)profilingResults
+{
+	if (!_profilingEnabled.load())
+		return nil;
+	static NSString *const keys[kRgfxStageCount] = {
+	    @"MTLCommandBufferCreationTime",
+	    @"MTLCommandBufferEnqueueTime",
+	    @"MTLCommandBufferCommitTime",
+	    @"MTLCommandBufferSubmitToKernelTime",
+	    @"MTLCommandBufferKernelScheduledTime",
+	    @"MTLCommandBufferSubmitToHWTime",
+	    @"MTLCommandBufferCompletionInterruptTime",
+	    @"MTLCommandBufferKernelCompleteTime",
+	    @"MTLCommandBufferCompletionHandlerEnqueueTime",
+	    @"MTLCommandBufferCompletionHandlerExecutionTime",
+	};
+	NSMutableDictionary *results = [NSMutableDictionary dictionaryWithCapacity:kRgfxStageCount];
+	for (unsigned i = 0; i < kRgfxStageCount; i++) {
+		uint64_t at = _stageTimes[i].load(std::memory_order_relaxed);
+		if (i == kRgfxStageKernelScheduled)
+			at = _stageTimes[kRgfxStageSubmitToKernel].load(std::memory_order_relaxed);
+		results[keys[i]] = @(at);
+	}
+	return [results copy];
+}
+
+- (id)privateData
+{
+	return _privateData;
+}
+
+- (void)setPrivateData:(id)privateData
+{
+	_privateData = privateData;
+}
+
+- (NSUInteger)privateDataOffset
+{
+	return _privateDataOffset;
+}
+
+- (void)setPrivateDataOffset:(NSUInteger)offset
+{
+	_privateDataOffset = offset;
+}
+
+// Not retained, as Metal's base keeps it.
+- (id)privateLoggingBuffer
+{
+	return _privateLoggingBuffer;
+}
+
+- (void)setPrivateLoggingBuffer:(id)buffer
+{
+	_privateLoggingBuffer = buffer;
+}
+
+- (void)setLogs:(id)logs
+{
+	_logs = logs;
+}
+
+// Which tasks the buffer's work is for, which Metal's IOAccel buffer takes and does nothing with.
+- (void)setResponsibleTaskIDs:(const int *)taskIDs count:(NSUInteger)count
+{
+	(void)taskIDs;
+	(void)count;
+}
+
+- (BOOL)sharedIndirectionTable
+{
+	return _sharedIndirectionTable;
+}
+
+- (void)setSharedIndirectionTable:(BOOL)shared
+{
+	_sharedIndirectionTable = shared;
+}
+
+// Encoders that sample counters into a program-info buffer: Metal's base buffer answers nil for
+// each, and the device samples no counters.
+- (id)sampledBlitCommandEncoder:(uintptr_t)programInfoBuffer capacity:(NSUInteger)capacity
+{
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledBlitCommandEncoderWithDescriptor:(uintptr_t)descriptor
+                            programInfoBuffer:(uintptr_t)programInfoBuffer
+                                     capacity:(NSUInteger)capacity
+{
+	(void)descriptor;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledComputeCommandEncoderWithProgramInfoBuffer:(uintptr_t)programInfoBuffer
+                                               capacity:(NSUInteger)capacity
+{
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledComputeCommandEncoderWithDescriptor:(uintptr_t)descriptor
+                               programInfoBuffer:(uintptr_t)programInfoBuffer
+                                        capacity:(NSUInteger)capacity
+{
+	(void)descriptor;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledComputeCommandEncoderWithDispatchType:(NSUInteger)dispatchType
+                                 programInfoBuffer:(uintptr_t)programInfoBuffer
+                                          capacity:(NSUInteger)capacity
+{
+	(void)dispatchType;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledRenderCommandEncoderWithDescriptor:(uintptr_t)descriptor
+                              programInfoBuffer:(uintptr_t)programInfoBuffer
+                                       capacity:(NSUInteger)capacity
+{
+	(void)descriptor;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledAccelerationStructureCommandEncoder:(uintptr_t)programInfoBuffer
+                                        capacity:(NSUInteger)capacity
+{
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledAccelerationStructureCommandEncoderWithDescriptor:(uintptr_t)descriptor
+                                             programInfoBuffer:(uintptr_t)programInfoBuffer
+                                                      capacity:(NSUInteger)capacity
+{
+	(void)descriptor;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
 }
 
 @end

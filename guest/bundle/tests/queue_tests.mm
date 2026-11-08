@@ -60,6 +60,33 @@ int rgfxQueueTimings(int rounds);
 @implementation QueueTestHandle
 @end
 
+// The command-buffer SPI the guest's frameworks send (MTLCommandBufferSPI), as the AMD 5300M's and
+// the Intel 630's buffers answer it.
+@protocol QueueTestCommandBufferSPI
+- (void)__waitUntilScheduledAsync:(void (^)(id<MTLCommandBuffer>))block;
+- (void)__waitUntilCompletedAsync:(void (^)(id<MTLCommandBuffer>))block;
+- (id)privateData;
+- (void)setPrivateData:(id)privateData;
+- (NSUInteger)privateDataOffset;
+- (void)setPrivateDataOffset:(NSUInteger)offset;
+- (id)privateLoggingBuffer;
+- (void)setPrivateLoggingBuffer:(id)buffer;
+- (BOOL)sharedIndirectionTable;
+- (void)setSharedIndirectionTable:(BOOL)shared;
+- (BOOL)isProfilingEnabled;
+- (void)setProfilingEnabled:(BOOL)enabled;
+- (NSDictionary *)profilingResults;
+- (NSUInteger)getListIndex;
+- (id)deadlineProfile;
+- (void *)debugBufferContentsWithLength:(NSUInteger *)length;
+- (void)setLogs:(id)logs;
+- (id)sampledBlitCommandEncoder:(uintptr_t)programInfoBuffer capacity:(NSUInteger)capacity;
+- (id)sampledComputeCommandEncoderWithProgramInfoBuffer:(uintptr_t)programInfoBuffer
+                                               capacity:(NSUInteger)capacity;
+- (void)configWithCommandBufferDescriptor:(MTLCommandBufferDescriptor *)descriptor;
+- (void)setResponsibleTaskIDs:(const int *)taskIDs count:(NSUInteger)count;
+@end
+
 namespace {
 
 const char *g_self = nullptr;
@@ -1513,6 +1540,139 @@ int rgfxQueueTimings(int rounds)
 	return 0;
 }
 
+namespace {
+
+// The waits Metal's Swift overlay awaits (scheduled(), completed()): a block given before the
+// buffer gets there runs after its handlers of that stage, in the order given, on the queue's
+// completion queue; one given after runs at once, on the caller's thread.
+void test_async_waits_run_after_their_handlers()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		std::mutex lock;
+		std::mutex *logLock = &lock;
+		std::vector<std::string> log;
+		std::vector<std::string> *logp = &log;
+		auto note = [logLock, logp](const char *what) {
+			std::lock_guard<std::mutex> hold(*logLock);
+			logp->push_back(what);
+		};
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		id<QueueTestCommandBufferSPI> spi = (id<QueueTestCommandBufferSPI>)cb;
+		CHECK([cb respondsToSelector:@selector(__waitUntilScheduledAsync:)] &&
+		      [cb respondsToSelector:@selector(__waitUntilCompletedAsync:)]);
+		[spi __waitUntilCompletedAsync:^(id<MTLCommandBuffer> x) {
+			CHECK(x == cb && x.status == MTLCommandBufferStatusCompleted);
+			note("wc1");
+		}];
+		[spi __waitUntilScheduledAsync:^(id<MTLCommandBuffer> x) {
+			CHECK(x == cb);
+			note("ws1");
+		}];
+		[cb addScheduledHandler:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			note("s");
+		}];
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			note("c");
+		}];
+		[cb commit];
+		[spi __waitUntilCompletedAsync:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			note("wc2");
+		}];
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		hostComplete(q, *driven.kext, seqno, cb);
+		[cb waitUntilCompleted];
+		for (int i = 0; i < 5000; i++) {
+			{
+				std::lock_guard<std::mutex> hold(lock);
+				if (log.size() >= 5)
+					break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		{
+			std::lock_guard<std::mutex> hold(lock);
+			std::vector<std::string> want = {"s", "ws1", "c", "wc1", "wc2"};
+			CHECK(log == want);
+		}
+		bool ranHere = false;
+		bool *ranp = &ranHere;
+		[spi __waitUntilScheduledAsync:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			*ranp = true;
+		}];
+		CHECK(ranHere);
+		ranHere = false;
+		[spi __waitUntilCompletedAsync:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			*ranp = true;
+		}];
+		CHECK(ranHere);
+	}
+}
+
+// The SPI's state a buffer keeps, as Metal's base buffer keeps it, and the answers a fresh buffer
+// of the AMD 5300M's and the Intel 630's gives; profilingResults times each stage the buffer
+// reached while profiling was enabled, under Metal's keys.
+void test_command_buffer_spi_state()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		id<QueueTestCommandBufferSPI> spi = (id<QueueTestCommandBufferSPI>)cb;
+		CHECK(spi.privateData == nil && spi.privateDataOffset == 0 && spi.privateLoggingBuffer == nil);
+		CHECK(!spi.sharedIndirectionTable && !spi.isProfilingEnabled && spi.profilingResults == nil);
+		CHECK(spi.getListIndex == 0 && spi.deadlineProfile == nil);
+		NSUInteger length = 7;
+		CHECK([spi debugBufferContentsWithLength:&length] == nullptr && length == 0);
+		CHECK([spi sampledBlitCommandEncoder:0 capacity:16] == nil &&
+		      [spi sampledComputeCommandEncoderWithProgramInfoBuffer:0 capacity:16] == nil);
+		NSObject *data = [NSObject new];
+		spi.privateData = data;
+		spi.privateDataOffset = 48;
+		spi.privateLoggingBuffer = data;
+		spi.sharedIndirectionTable = YES;
+		CHECK(spi.privateData == data && spi.privateDataOffset == 48 &&
+		      spi.privateLoggingBuffer == data && spi.sharedIndirectionTable);
+		NSArray *logs = @[];
+		[spi setLogs:logs];
+		CHECK((id)cb.logs == logs);
+		[spi configWithCommandBufferDescriptor:[MTLCommandBufferDescriptor new]];
+		const int tasks[] = {1, 2};
+		[spi setResponsibleTaskIDs:tasks count:2];
+		[spi setProfilingEnabled:YES];
+		CHECK(spi.isProfilingEnabled);
+		[cb commit];
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		hostComplete(q, *driven.kext, seqno, cb);
+		[cb waitUntilCompleted];
+		NSDictionary *results = spi.profilingResults;
+		NSArray *keys = @[
+			@"MTLCommandBufferCreationTime", @"MTLCommandBufferEnqueueTime", @"MTLCommandBufferCommitTime",
+			@"MTLCommandBufferSubmitToKernelTime", @"MTLCommandBufferKernelScheduledTime",
+			@"MTLCommandBufferSubmitToHWTime", @"MTLCommandBufferCompletionInterruptTime",
+			@"MTLCommandBufferKernelCompleteTime", @"MTLCommandBufferCompletionHandlerEnqueueTime",
+			@"MTLCommandBufferCompletionHandlerExecutionTime"
+		];
+		CHECK(results.count == keys.count);
+		uint64_t last = 0;
+		for (NSString *key in keys) {
+			const uint64_t at = [results[key] unsignedLongLongValue];
+			CHECK(at != 0 && at >= last);
+			last = at;
+		}
+	}
+}
+
+} // namespace
+
 void rgfxQueueTests(const char *self)
 {
 	g_self = self;
@@ -1532,4 +1692,6 @@ void rgfxQueueTests(const char *self)
 	test_in_place_writes_retire_at_the_take();
 	test_no_copy_write_backs_land_at_the_take();
 	test_a_mid_buffer_signal_wakes_a_cpu_wait_before_the_buffer_ends();
+	test_async_waits_run_after_their_handlers();
+	test_command_buffer_spi_state();
 }

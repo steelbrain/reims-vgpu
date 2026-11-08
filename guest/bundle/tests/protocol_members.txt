@@ -34,6 +34,8 @@
 %spi-neither an SPI member neither the AMD 5300M's nor the Intel 630's objects of the kind answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
 %spi-differ an SPI member one of the AMD 5300M's and the Intel 630's objects of the kind answers and the other does not (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
 %spi-unmeasured an SPI member the oracle's objects were not asked (macOS 26.7.1's protocol has no such member); to be measured
+%cb-base Metal's base command buffer, _MTLCommandBuffer, and its IOAccel subclass, MTLIOAccelCommandBuffer (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, MTLCommandBufferSPI); that the AMD 5300M's and the Intel 630's buffers answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
+%cb-answers what a fresh buffer of the AMD 5300M's and of the Intel 630's answers (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
 %old-only a member only older guest releases' protocols carry (tests/protocol_members_releases.txt), with no public counterpart; no app pass on the releases that carry it showed a guest framework sending it to the bundle's objects (the bundle logs each selector it does not recognize, RGFX: unrecognized), so a call raises an unrecognized selector, as it did before
 %old-only-device a member only macOS 11's or 12's MTLDeviceSPI carries (tests/protocol_members_releases.txt): on those releases the device's IOGPU base answers it, the guest's own class (measured: macOS 11.7.11, the device answers it); on the Mac the base lacks it
 
@@ -1346,57 +1348,57 @@ setParentGPUSize: absent %spi-neither
 unfilteredResourceOptions implemented
 waitUntilComplete metal returns at once, as Metal's resources do (measured: M3 Max, macOS 27; RGFX_RESOURCE_SPI)
 [RgfxCmdBuffer]
-__waitUntilCompletedAsync: pending %spi-both
-__waitUntilScheduledAsync: pending %spi-both
-addPurgedHeap: pending %spi-both
-addPurgedResource: pending %spi-both
+__waitUntilCompletedAsync: implemented
+__waitUntilScheduledAsync: implemented
+addPurgedHeap: unsupported purging a heap as a command buffer runs: Metal's IOAccel buffer hands it to its kernel to purge (read from code, %cb-base)
+addPurgedResource: unsupported purging a resource as a command buffer runs: Metal's IOAccel buffer hands it to its kernel to purge (read from code, %cb-base)
 commitAndHold implemented
 commitAndWaitUntilSubmitted implemented
-commitAndWaitUntilSubmittedWithDeadline: pending %spi-both
-commitWithDeadline: pending %spi-both
+commitAndWaitUntilSubmittedWithDeadline: metal commits with commitWithDeadline:, which raises an unrecognized selector, as Metal's base buffer does (read from code, %cb-base; whether the AMD 5300M's and the Intel 630's own classes override it is to be measured with oracle_spi_members' answering class)
+commitWithDeadline: metal raises an unrecognized selector, as Metal's base buffer does: it sends itself doesNotRecognizeSelector: (read from code, %cb-base; whether the AMD 5300M's and the Intel 630's own classes override it is to be measured with oracle_spi_members' answering class)
 computeCommandEncoderWithDispatchType:substreamCount: absent %spi-neither
-configWithCommandBufferDescriptor: pending %spi-both
-deadlineProfile pending %spi-both
-debugBufferContentsWithLength: pending %spi-both
+configWithCommandBufferDescriptor: metal Metal's base buffer takes only the descriptor's log state (read from code, %cb-base), and a descriptor of the device's has none: the device makes no log state
+deadlineProfile metal nil, as the AMD 5300M's and the Intel 630's buffers answer (measured, %cb-answers); the device carries no deadline
+debugBufferContentsWithLength: metal no debug buffer, of length 0, as Metal's base buffer answers (read from code, %cb-base)
 debugCommandEncoder absent %spi-neither
-doCorruptCBSPI: pending %spi-both
+doCorruptCBSPI: unsupported corrupting a command buffer on purpose, a tool's hook into Metal's IOAccel buffer's kernel commands (read from code, %cb-base)
 dropResourceGroups:count: absent %spi-neither
 encodeCacheHintFinalize:resourceGroups:count: absent %spi-neither
 encodeCacheHintTag:resourceGroups:count: absent %spi-neither
-encodeConditionalAbortEvent: pending %spi-both
-encodeDashboardFinalizeForResourceGroup:dashboard:value:forIndex: pending %spi-both
-encodeDashboardFinalizeForResourceGroup:dashboard:values:indices:count: pending %spi-both
-encodeDashboardTagForResourceGroup: pending %spi-both
+encodeConditionalAbortEvent: unsupported aborting a command buffer on an event, a kernel command of Metal's IOAccel buffer (read from code, %cb-base)
+encodeDashboardFinalizeForResourceGroup:dashboard:value:forIndex: metal ends the process with Metal's words, as Metal's base buffer does: not supported on this device (read from code, %cb-base)
+encodeDashboardFinalizeForResourceGroup:dashboard:values:indices:count: metal ends the process with Metal's words, as Metal's base buffer does: not supported on this device (read from code, %cb-base)
+encodeDashboardTagForResourceGroup: metal ends the process with Metal's words, as Metal's base buffer does: not supported on this device (read from code, %cb-base)
 encodeSignalEvent:value:agentMask: implemented
 encodeSignalEventScheduled:value: absent %spi-neither
 encodeWaitForEvent:value:timeout: implemented
-getListIndex pending %spi-both
+getListIndex metal 0, as the AMD 5300M's and the Intel 630's buffers answer (measured, %cb-answers)
 globalTraceObjectID implemented
-isProfilingEnabled pending %spi-both
+isProfilingEnabled implemented
 presentDrawable:options: implemented
-privateData pending %spi-both
-privateDataOffset pending %spi-both
-privateLoggingBuffer pending %spi-both
-profilingResults pending %spi-both
+privateData implemented
+privateDataOffset implemented
+privateLoggingBuffer implemented
+profilingResults implemented
 protectionOptions implemented
-sampledAccelerationStructureCommandEncoder:capacity: pending %spi-both
-sampledAccelerationStructureCommandEncoderWithDescriptor:programInfoBuffer:capacity: pending %spi-both
-sampledBlitCommandEncoder:capacity: pending %spi-both
-sampledBlitCommandEncoderWithDescriptor:programInfoBuffer:capacity: pending %spi-both
-sampledComputeCommandEncoderWithDescriptor:programInfoBuffer:capacity: pending %spi-both
-sampledComputeCommandEncoderWithDispatchType:programInfoBuffer:capacity: pending %spi-both
-sampledComputeCommandEncoderWithProgramInfoBuffer:capacity: pending %spi-both
-sampledRenderCommandEncoderWithDescriptor:programInfoBuffer:capacity: pending %spi-both
-setLogs: pending %spi-both
-setPrivateData: pending %spi-both
-setPrivateDataOffset: pending %spi-both
-setPrivateLoggingBuffer: pending %spi-both
-setProfilingEnabled: pending %spi-both
+sampledAccelerationStructureCommandEncoder:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledAccelerationStructureCommandEncoderWithDescriptor:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledBlitCommandEncoder:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledBlitCommandEncoderWithDescriptor:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledComputeCommandEncoderWithDescriptor:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledComputeCommandEncoderWithDispatchType:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledComputeCommandEncoderWithProgramInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledRenderCommandEncoderWithDescriptor:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+setLogs: implemented
+setPrivateData: implemented
+setPrivateDataOffset: implemented
+setPrivateLoggingBuffer: implemented
+setProfilingEnabled: implemented
 setProtectionOptions: implemented
 setResourceGroups:count: absent %spi-neither
-setResponsibleTaskIDs:count: pending %spi-both
-setSharedIndirectionTable: pending %spi-both
-sharedIndirectionTable pending %spi-both
+setResponsibleTaskIDs:count: metal names the tasks the work is for, which Metal's IOAccel buffer takes and does nothing with (read from code, %cb-base); nothing the guest sees changes
+setSharedIndirectionTable: implemented
+sharedIndirectionTable implemented
 useInternalResidencySet: pending %spi-unmeasured
 useInternalResidencySets:count: pending %spi-unmeasured
 userDictionary implemented
