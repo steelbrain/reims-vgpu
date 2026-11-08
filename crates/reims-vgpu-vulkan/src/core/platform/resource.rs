@@ -72,6 +72,16 @@ pub trait Buffer<P: Platform>: GpuResource<P> {
         offset: u64,
         bytes_per_row: u64,
     ) -> RaiseResult<Option<P::Texture>>;
+    /// sel: newTiledTextureWithDescriptor:offset:bytesPerRow: SPI
+    /// As `newTextureWithDescriptor:offset:bytesPerRow:`, and also a 2D texture of more than one
+    /// level: its first level's texels the buffer's bytes from `offset`, rows `bytes_per_row`
+    /// apart, and its other levels the texture's own memory.
+    fn new_tiled_texture(
+        &self,
+        descriptor: &P::TextureDescriptor,
+        offset: u64,
+        bytes_per_row: u64,
+    ) -> RaiseResult<Option<P::Texture>>;
     /// sel: newTextureWithDescriptor:iosurface:plane: over the buffer — Metal's IOSurface
     /// creator, where the buffer stands for the surface: its first byte is the surface's base
     /// address, `plane` says where the asked plane lies in it, and the facts, where given, what

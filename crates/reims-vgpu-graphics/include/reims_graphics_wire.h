@@ -6571,7 +6571,9 @@ typedef struct {
 
 // `TEXTURE_FROM_BUFFER`: a texture of shape `desc` over the buffer
 // `buffer_obj_id` from `offset`, each row `bytes_per_row` apart, with the
-// guest-picked `resource_id`.
+// guest-picked `resource_id`. A `desc` of more than one level, a 2D texture
+// of Metal's `newTiledTextureWithDescriptor:offset:bytesPerRow:`, lays its
+// first level there and its other levels in the texture's own memory.
 typedef struct {
   // [`RGFX_CMD_TEXTURE_FROM_BUFFER`].
   RgfxMsgHeader header;

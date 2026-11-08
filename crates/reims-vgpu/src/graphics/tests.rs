@@ -5512,6 +5512,46 @@ fn a_linear_texture_is_made_by_the_platform_s_linear_form() {
     );
 }
 
+/// A `TEXTURE_FROM_BUFFER` of more than one level, WindowServer's 54 x 54 BGRA8 of 6 levels at
+/// 256 bytes a row, is made by the platform's tiled form with the offset and the bytes per row
+/// the guest asked, and one of one level by the public form
+#[test]
+fn a_texture_of_more_levels_over_a_buffer_is_made_by_the_platform_s_tiled_form() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1_0000;
+    guest.send(&device, block_grant(1, BLOCK, SIZE));
+    guest.send(&device, resource_id_chunk(1, 0));
+    guest.send(&device, buffer_over_host_memory(obj(1, 1), BLOCK, 0x8000));
+    let (mut tiled, _) =
+        RgfxTextureFromBuffer::read_from_prefix(&texture_from_buffer(obj(1, 2), 1, obj(1, 1)))
+            .unwrap();
+    tiled.offset = 0x4000;
+    tiled.desc = RgfxTextureDescriptor {
+        width: 54,
+        height: 54,
+        mipmap_level_count: 6,
+        usage: 1,
+        ..tiled.desc
+    };
+    guest.send(&device, tiled.as_bytes().to_vec());
+    guest.send(&device, texture_from_buffer(obj(1, 3), 2, obj(1, 1)));
+    // The block holds the buffer and both textures until they go.
+    let status = answered(&device, &mut guest, block_release(1, BLOCK, SIZE));
+    assert_eq!(status, RGFX_STATUS_REFUSED, "the buffer and its textures");
+    assert_eq!(device.decoder_object_count(), 3);
+    let log = platform.call_log();
+    let tiled = log.calls_to("newTiledTextureWithDescriptor:offset:bytesPerRow:");
+    assert_eq!(tiled.len(), 1);
+    assert_eq!(tiled[0].args[1..], [Arg::U64(0x4000), Arg::U64(256)]);
+    let public = log.calls_to("newTextureWithDescriptor:offset:bytesPerRow:");
+    assert_eq!(public.len(), 1, "the one of one level");
+    assert_eq!(public[0].args[1..], [Arg::U64(0), Arg::U64(256)]);
+}
+
 /// Whether ring 0's completion ring stays without a new event for about 100 ms.
 fn quiet(guest: &Guest) -> bool {
     std::thread::sleep(Duration::from_millis(100));

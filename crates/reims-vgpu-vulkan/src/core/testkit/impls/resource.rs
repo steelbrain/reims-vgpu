@@ -187,6 +187,26 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
         )
     }
 
+    fn new_tiled_texture(
+        &self,
+        descriptor: &<FakePlatform as Platform>::TextureDescriptor,
+        offset: u64,
+        bytes_per_row: u64,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Texture>> {
+        let desc = descriptor.desc();
+        let parent = self.erase();
+        self.make(
+            Policy::Caught,
+            "newTiledTextureWithDescriptor:offset:bytesPerRow:",
+            vec![
+                Arg::obj(descriptor),
+                Arg::U64(offset),
+                Arg::U64(bytes_per_row),
+            ],
+            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+        )
+    }
+
     /// Logged with the plane's index, offset and rows, whether the surface has planes, and its
     /// facts (`Arg::val` of the `Option`); a texture over the buffer, as `new_texture`'s.
     fn new_texture_over_surface_plane(

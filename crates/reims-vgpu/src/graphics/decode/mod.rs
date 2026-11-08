@@ -3011,12 +3011,19 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
-                    let made = buffer.new_texture(
-                        OnFault::Return,
-                        &descriptor,
-                        m.offset,
-                        m.bytes_per_row,
-                    )?;
+                    // A shape of more than one level is made by the platform's tiled form, the
+                    // one creator over a buffer that makes one (the guest sends it from
+                    // newTiledTextureWithDescriptor:offset:bytesPerRow: alone); one of one level
+                    // by the public form, which the tiled form makes alike.
+                    let made = match m.desc.mipmap_level_count > 1 {
+                        true => buffer.new_tiled_texture(&descriptor, m.offset, m.bytes_per_row)?,
+                        false => buffer.new_texture(
+                            OnFault::Return,
+                            &descriptor,
+                            m.offset,
+                            m.bytes_per_row,
+                        )?,
+                    };
                     if made.is_none() {
                         log_refused_texture(&TextureOverBuffer {
                             obj_id: m.obj_id,
@@ -9696,6 +9703,250 @@ lacks {part}"
         let answers = surface_textures_without_planes::<reims_vgpu_vulkan::VulkanPlatform>();
         for (&(format, ..), [from_buffer, from_surface]) in PIN_CASES.iter().zip(&answers) {
             assert_eq!(from_buffer, from_surface, "{format}");
+        }
+    }
+
+    /// WindowServer's mipmapped tiled texture under the x86 Macs' feature profile (macOS 26): 54
+    /// x 54 BGRA8Unorm of 6 levels, usage `ShaderRead`, over a 16384-byte Shared buffer at 256
+    /// bytes a row, whose 40 bytes past each row's texels are padding.
+    const TILED_SIZE: u64 = 54;
+    const TILED_LEVELS: u32 = 6;
+    const TILED_ROW: u64 = 256;
+    const TILED_PAD: u8 = 0xee;
+
+    /// What [`tiled_texture_levels`] read and the buffer held at each step.
+    struct TiledLevels {
+        /// The texture's level count.
+        levels: u64,
+        /// Level 0 read by a blit after the CPU wrote [`tiled_texel`]'s into the buffer's rows,
+        /// the texture made: packed rows.
+        first: Vec<u8>,
+        /// The buffer's bytes after a blit wrote one colour into the whole of level 0.
+        after_first_written: Vec<u8>,
+        /// Levels 1 to 5 read after `generateMipmapsForTexture:`, each packed rows.
+        generated: Vec<Vec<u8>>,
+        /// Level 3 read after a blit wrote [`tiled_texel`]'s of its size into it: packed rows.
+        third: Vec<u8>,
+        /// The buffer's bytes after that write.
+        after_third_written: Vec<u8>,
+    }
+
+    /// The BGRA8 texel at (`x`, `y`) of a pattern apart at every place, made opaque.
+    fn tiled_texel(x: u64, y: u64, seed: u8) -> [u8; 4] {
+        [
+            x as u8,
+            y as u8,
+            seed ^ (x as u8).wrapping_mul(7) ^ (y as u8),
+            0xff,
+        ]
+    }
+
+    /// The colour [`tiled_texture_levels`] writes into the whole of level 0.
+    const TILED_COLOUR: [u8; 4] = [0x10, 0x20, 0x30, 0x40];
+
+    /// Makes [`TILED_SIZE`]'s texture through the decoder on `P` (`TEXTURE_FROM_BUFFER` of
+    /// [`TILED_LEVELS`] levels, as the bundle sends it from
+    /// `newTiledTextureWithDescriptor:offset:bytesPerRow:`) over a buffer whose bytes past each
+    /// row's texels are [`TILED_PAD`], then, in order: the CPU writes a pattern into the rows and a
+    /// blit reads level 0; a blit writes [`TILED_COLOUR`] into level 0 and the buffer is read;
+    /// `generateMipmapsForTexture:` fills the other levels, which blits read; a blit writes a
+    /// pattern into level 3, which a blit reads back, and the buffer is read again.
+    fn tiled_texture_levels<P: crate::platform::ApiPlatform>() -> TiledLevels {
+        use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Texture as _};
+        use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
+        let (mut dec, device) = surface_decoder::<P>();
+        let length = 0x4000u64;
+        buffer_holding(&mut dec, &device, 10, &vec![TILED_PAD; length as usize]);
+        let m = RgfxTextureFromBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
+                size: size_of::<RgfxTextureFromBuffer>() as u32,
+                seqno: 0,
+            },
+            obj_id: context_obj(11),
+            resource_id: 11,
+            buffer_obj_id: context_obj(10),
+            offset: 0,
+            bytes_per_row: TILED_ROW,
+            desc: RgfxTextureDescriptor {
+                mipmap_level_count: TILED_LEVELS,
+                ..surface_desc(80, (TILED_SIZE, TILED_SIZE))
+            },
+        };
+        assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
+        let Some(ObjHandle::Buffer(buffer)) = dec.object(context_obj(10)) else {
+            panic!("no buffer");
+        };
+        let Some(ObjHandle::Texture(t)) = dec.object(context_obj(11)) else {
+            panic!("no texture");
+        };
+        let contents = buffer.contents().as_ptr::<u8>();
+        // SAFETY: the buffer's `length` bytes, which no command uses while they are read.
+        let buffer_bytes =
+            || unsafe { std::slice::from_raw_parts(contents, length as usize) }.to_vec();
+        let queue = device.new_command_queue().unwrap();
+        let run = |cmds: Vec<BlitCmd<'_, P>>| {
+            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            for cmd in cmds {
+                e.encode(OnFault::Return, cmd).unwrap();
+            }
+            e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+        };
+        let shared = |bytes: &[u8]| {
+            let b = device
+                .new_buffer_of_length(OnFault::Return, bytes.len() as u64, 0)
+                .unwrap()
+                .unwrap();
+            // SAFETY: a Shared buffer of `bytes.len()` bytes, which no command uses yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    b.contents().as_ptr::<u8>(),
+                    bytes.len(),
+                )
+            };
+            b
+        };
+        let side = |level: u64| (TILED_SIZE >> level).max(1);
+        let read_level = |level: u64| {
+            let s = side(level);
+            let out = shared(&vec![0; (s * s * 4) as usize]);
+            run(vec![BlitCmd::CopyTextureToBuffer {
+                source_texture: t,
+                source_slice: 0,
+                source_level: level,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(s, s, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: s * 4,
+                destination_bytes_per_image: s * s * 4,
+            }]);
+            // SAFETY: a Shared buffer's bytes, read after the blit completed.
+            unsafe {
+                std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (s * s * 4) as usize)
+            }
+            .to_vec()
+        };
+        let write_level = |level: u64, texels: &[u8]| {
+            let s = side(level);
+            let source = shared(texels);
+            run(vec![BlitCmd::CopyBufferToTexture {
+                source_buffer: &source,
+                source_offset: 0,
+                source_bytes_per_row: s * 4,
+                source_bytes_per_image: s * s * 4,
+                source_size: MtlSize::new(s, s, 1),
+                destination_texture: t,
+                destination_slice: 0,
+                destination_level: level,
+                destination_origin: MtlOrigin::new(0, 0, 0),
+            }]);
+        };
+        let pattern = |level: u64, seed: u8| {
+            let s = side(level);
+            (0..s * s)
+                .flat_map(|i| tiled_texel(i % s, i / s, seed))
+                .collect::<Vec<u8>>()
+        };
+        // The CPU's write of the rows, after the texture was made, as WindowServer draws a tile.
+        for y in 0..TILED_SIZE {
+            for x in 0..TILED_SIZE {
+                let texel = tiled_texel(x, y, 0x5a);
+                // SAFETY: inside the buffer's `length` bytes, which no command uses yet.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        texel.as_ptr(),
+                        contents.add((y * TILED_ROW + x * 4) as usize),
+                        4,
+                    )
+                };
+            }
+        }
+        let levels = t.mipmap_level_count();
+        let first = read_level(0);
+        let colour: Vec<u8> = (0..TILED_SIZE * TILED_SIZE)
+            .flat_map(|_| TILED_COLOUR)
+            .collect();
+        write_level(0, &colour);
+        let after_first_written = buffer_bytes();
+        run(vec![BlitCmd::GenerateMipmaps { texture: Some(t) }]);
+        let generated = (1..u64::from(TILED_LEVELS)).map(read_level).collect();
+        write_level(3, &pattern(3, 0xa5));
+        let third = read_level(3);
+        let after_third_written = buffer_bytes();
+        TiledLevels {
+            levels,
+            first,
+            after_first_written,
+            generated,
+            third,
+            after_third_written,
+        }
+    }
+
+    /// Whether `bytes`, the buffer's, hold `texel(x, y)` at each texel of level 0's rows and
+    /// [`TILED_PAD`] everywhere else; the first difference otherwise.
+    fn tiled_buffer_holds(bytes: &[u8], texel: impl Fn(u64, u64) -> [u8; 4]) -> Result<(), String> {
+        for (at, &byte) in bytes.iter().enumerate() {
+            let (y, x) = (at as u64 / TILED_ROW, at as u64 % TILED_ROW / 4);
+            let want = match y < TILED_SIZE && x < TILED_SIZE {
+                true => texel(x, y)[at % 4],
+                false => TILED_PAD,
+            };
+            if byte != want {
+                return Err(format!(
+                    "byte {at:#x} ({x}, {y}): {byte:#04x}, not {want:#04x}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// On the Vulkan platform, a tiled texture of 6 levels over a buffer has 6 levels, and its
+    /// first level reads the texels the CPU wrote into the buffer's rows after it was made
+    #[test]
+    fn on_vulkan_a_tiled_texture_s_first_level_reads_the_buffer_s_rows() {
+        let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        assert_eq!(r.levels, u64::from(TILED_LEVELS));
+        for (i, texel) in r.first.chunks(4).enumerate() {
+            let (x, y) = (i as u64 % TILED_SIZE, i as u64 / TILED_SIZE);
+            assert_eq!(texel, tiled_texel(x, y, 0x5a), "({x}, {y})");
+        }
+    }
+
+    /// On the Vulkan platform, a blit's write of a tiled texture's first level reaches the
+    /// buffer's rows, and the bytes between the rows stay as they were; a write of its level 3
+    /// reaches none of the buffer's bytes
+    #[test]
+    fn on_vulkan_a_tiled_texture_s_first_level_writes_the_buffer_s_rows_and_not_its_padding() {
+        let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        tiled_buffer_holds(&r.after_first_written, |_, _| TILED_COLOUR).unwrap();
+        tiled_buffer_holds(&r.after_third_written, |_, _| TILED_COLOUR).unwrap();
+    }
+
+    /// On the Vulkan platform, a tiled texture's levels 1 and up are its own: generating its
+    /// mipmaps fills each with its first level's colour, and a blit's write of level 3 reads back
+    #[test]
+    fn on_vulkan_a_tiled_texture_s_other_levels_hold_what_blits_write() {
+        let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        for (k, level) in r.generated.iter().enumerate() {
+            let side = (TILED_SIZE >> (k + 1)).max(1) as usize;
+            assert_eq!(level.len(), side * side * 4);
+            for (i, texel) in level.chunks(4).enumerate() {
+                assert_eq!(texel, TILED_COLOUR, "level {} texel {i}", k + 1);
+            }
+        }
+        let side = TILED_SIZE >> 3;
+        for (i, texel) in r.third.chunks(4).enumerate() {
+            let (x, y) = (i as u64 % side, i as u64 / side);
+            assert_eq!(texel, tiled_texel(x, y, 0xa5), "level 3 ({x}, {y})");
         }
     }
 

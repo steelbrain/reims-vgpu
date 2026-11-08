@@ -1183,6 +1183,40 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         Ok(Some(self.device.texture_in(raw, under, answered)))
     }
 
+    /// The runtime's tiled texture (`Buffer::new_tiled_texture`): one level is the texture
+    /// [`Buffer::new_texture`] makes; a 2D texture of more levels is one image of every level,
+    /// whose first level the runtime keeps in step with the buffer's bytes from `offset`, rows
+    /// `bytes_per_row` apart, and whose other levels are the image's own, as an x86 Mac's GPU
+    /// keeps them in its own memory (docs/graphics-kext/dgpu-oracle.md, Q11). Refused as
+    /// `new_texture`'s arguments are, and for more levels than the extent's full chain; nil for a
+    /// format Metal makes no texture of from a descriptor alone, as `new_texture`'s.
+    fn new_tiled_texture(
+        &self,
+        descriptor: &VulkanTextureDescriptor,
+        offset: u64,
+        bytes_per_row: u64,
+    ) -> RaiseResult<Option<VulkanTexture>> {
+        let sel = "newTiledTextureWithDescriptor:offset:bytesPerRow:";
+        let fields = descriptor.fields();
+        let mut desc = fields.descriptor(sel, Maker::Other);
+        // As the linear texture's.
+        let answered = match self.gpu_read_only() && fields.formatless().is_none() {
+            true => read_only_usage(&mut desc),
+            false => 0,
+        };
+        let format = fields.raw_pixel_format();
+        let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
+            (self.raw.new_tiled_texture(&desc, offset, bytes_per_row))
+                .map_err(|e| created_format_refused(sel, "a texture of", format, e))
+        })?
+        else {
+            return Ok(None);
+        };
+        let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
+        let under = Under::Buffer(self.clone_ref(), bytes);
+        Ok(Some(self.device.texture_in(raw, under, answered)))
+    }
+
     /// A texture of the buffer's bytes as Metal's IOSurface creator makes one over the plane of
     /// a surface the buffer stands for (`Buffer::new_texture_with_iosurface_plane`), at the
     /// plane's offset with rows its bytes per row apart: of the descriptor's options, a sampler
