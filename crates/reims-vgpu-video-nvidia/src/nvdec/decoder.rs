@@ -874,7 +874,7 @@ impl Picture {
                 let into = |plane: StagedPlane, bytes: &mut [u8]| {
                     let to = plane.host(bytes);
                     Destination {
-                        at: to.bytes.as_mut_ptr(),
+                        at: Memory::Host(to.bytes.as_mut_ptr()),
                         len: to.bytes.len(),
                         bytes_per_row: to.bytes_per_row,
                         rows: to.rows,
@@ -902,9 +902,11 @@ impl Picture {
     }
 
     /// Waits for the picture's decode, and copies `crop` of it straight
-    /// into `luma` and `chroma`, host memory the caller registered with
-    /// CUDA, as much as fits: the copy by DMA of the GPU alone, with no
-    /// staging and no copy by the CPU (`crate::zero_copy`). The outer
+    /// into `luma` and `chroma`, as much as fits: host memory the caller
+    /// registered with CUDA (`crate::zero_copy`), which the GPU writes by
+    /// DMA, or memory of the GPU's own, another API's imported on the
+    /// picture's GPU (`crate::external`), which a copy within the GPU
+    /// fills; with no staging and no copy by the CPU either way. The outer
     /// `Err` is the picture's, as [`Self::read_back`]'s: its map, a decode
     /// NVDEC reports as failed, or work not done by `deadline`, which is
     /// kept with `written` until the GPU is done. The inner is the copy's,
@@ -913,10 +915,11 @@ impl Picture {
     /// # Safety
     ///
     /// Each destination's `len` bytes from `at` are host memory the caller
-    /// keeps mapped and writable through the call, which nothing else
-    /// writes meanwhile, and which `written` keeps so for as long as it
-    /// lives: the copies may write it after the call, where they are not
-    /// done by its deadline.
+    /// registered with CUDA, or the picture's GPU's memory at an address of
+    /// its context, which the caller keeps mapped and writable through the
+    /// call, which nothing else writes meanwhile, and which `written` keeps
+    /// so for as long as it lives: the copies may write it after the call,
+    /// where they are not done by its deadline.
     pub(crate) unsafe fn write_into(
         &self,
         crop: Crop,
@@ -949,9 +952,9 @@ impl Picture {
     }
 
     /// Waits for the picture's decode, maps it, gives `plan` where `crop` of
-    /// it lies on the GPU, makes the copies `plan` gives into host memory
-    /// (the luma's, then the chroma's) and waits for them, and unmaps it, on
-    /// every path. The decoder's handle is held throughout, with the GPU's
+    /// it lies on the GPU, makes the copies `plan` gives (the luma's, then
+    /// the chroma's) and waits for them, and unmaps it, on every path. The
+    /// decoder's handle is held throughout, with the GPU's
     /// context pushed. Each wait asks after its work until `deadline`
     /// (module docs): copies into pageable memory are made on the
     /// call thread, and their answer waited for, the rest queued on the
@@ -961,11 +964,12 @@ impl Picture {
     ///
     /// # Safety
     ///
-    /// The destinations `plan` gives are host memory, writable until the
-    /// copies are done, which nothing else reaches meanwhile, and which the
-    /// caller keeps so with the work where it is not done by its deadline
-    /// ([`Missed::Stalled`]). Those it calls pageable are, and the others
-    /// are page-locked or registered with CUDA.
+    /// The destinations `plan` gives are writable until the copies are
+    /// done, which nothing else reaches meanwhile, and which the caller
+    /// keeps so with the work where it is not done by its deadline
+    /// ([`Missed::Stalled`]). Those it calls pageable are host memory, and
+    /// the others page-locked or registered with CUDA, or the GPU's own
+    /// memory at an address of its context.
     unsafe fn with_mapped<T>(
         &self,
         crop: Crop,
@@ -1360,7 +1364,7 @@ impl Mapped {
     }
 }
 
-/// The copy of a mapped picture's plane into host memory ([`copy_plane`]'s
+/// The copy of a mapped picture's plane into memory ([`copy_plane`]'s
 /// arguments): from the device plane (address, pitch, x in bytes, first
 /// row), `rows` rows of `row_bytes`, into `to`.
 #[derive(Clone, Copy, Debug)]
@@ -1371,7 +1375,7 @@ struct PlaneCopy {
     to: Destination,
 }
 
-/// A picture's copies into host memory ([`Picture::with_mapped`]): the
+/// A picture's copies out ([`Picture::with_mapped`]): the
 /// luma's, then the chroma's, and whether the memory is pageable, which a
 /// copy into returns only once done.
 struct Copies {
@@ -1384,9 +1388,9 @@ impl Copies {
     ///
     /// # Safety
     ///
-    /// As [`copy_plane`]'s, for each: the destinations are host memory,
-    /// writable until the stream has run the copies, which nothing else
-    /// reaches meanwhile; the sources lie in a frame mapped as long.
+    /// As [`copy_plane`]'s, for each: the destinations are writable until
+    /// the stream has run the copies, which nothing else reaches meanwhile;
+    /// the sources lie in a frame mapped as long.
     unsafe fn make(&self, cuda: &crate::cuda::Cuda, stream: CUstream) -> Result<(), Error> {
         for plane in &self.planes {
             // SAFETY: the function's contract.
@@ -1436,14 +1440,24 @@ impl PageableCopies {
     }
 }
 
-/// A plane of host memory to copy into: `len` bytes from `at`, its rows
+/// A plane of memory to copy into: `len` bytes from `at`, its rows
 /// `bytes_per_row` apart, `rows` of them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Destination {
-    pub(crate) at: *mut u8,
+    pub(crate) at: Memory,
     pub(crate) len: usize,
     pub(crate) bytes_per_row: usize,
     pub(crate) rows: u32,
+}
+
+/// Where a [`Destination`] lies.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Memory {
+    /// Host memory: page-locked, registered with CUDA, or pageable.
+    Host(*mut u8),
+    /// The GPU's own memory, at an address of the context's (another API's
+    /// memory, imported: `crate::external`).
+    Device(c_ulonglong),
 }
 
 /// `nals` as one Annex B stream, each after a three-byte start code, and
@@ -1476,14 +1490,15 @@ fn rows_that_fit(rows: u32, width: usize, len: usize, stride: usize) -> usize {
 /// device plane at `source` (address, pitch, x in bytes, first row) into
 /// `plane`, as much as fits: its rows, and its bytes, each row but the last
 /// needing its stride and the last its width. Into page-locked or
-/// registered memory the copy runs after the call returns; into pageable
-/// memory CUDA copies before it returns (the driver API's reference,
-/// "API synchronization behavior").
+/// registered memory, or the GPU's own, the copy runs after the call
+/// returns; into pageable memory CUDA copies before it returns (the driver
+/// API's reference, "API synchronization behavior").
 ///
 /// # Safety
 ///
-/// `plane`'s `len` bytes from `at` are host memory, writable until the
-/// stream has run the copy, which nothing else reaches meanwhile.
+/// `plane`'s `len` bytes from `at` are writable until the stream has run
+/// the copy, which nothing else reaches meanwhile: host memory, or the
+/// GPU's own at an address of the context current here.
 unsafe fn copy_plane(
     cuda: &crate::cuda::Cuda,
     stream: CUstream,
@@ -1510,9 +1525,18 @@ unsafe fn copy_plane(
         srcPitch: pitch,
         dstXInBytes: 0,
         dstY: 0,
-        dstMemoryType: CU_MEMORYTYPE_HOST,
-        dstHost: plane.at.cast::<c_void>(),
-        dstDevice: 0,
+        dstMemoryType: match plane.at {
+            Memory::Host(_) => CU_MEMORYTYPE_HOST,
+            Memory::Device(_) => CU_MEMORYTYPE_DEVICE,
+        },
+        dstHost: match plane.at {
+            Memory::Host(at) => at.cast::<c_void>(),
+            Memory::Device(_) => std::ptr::null_mut(),
+        },
+        dstDevice: match plane.at {
+            Memory::Host(_) => 0,
+            Memory::Device(at) => at,
+        },
         dstArray: std::ptr::null_mut(),
         dstPitch: plane.bytes_per_row,
         WidthInBytes: width,

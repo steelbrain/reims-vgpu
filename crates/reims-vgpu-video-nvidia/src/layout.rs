@@ -212,6 +212,50 @@ fn cuda_checks(checks: &mut Checks) {
     for signature in cu::CudaFunctions::SIGNATURES {
         checks.signature(&format!("t{}", signature.symbol), signature, false);
     }
+    // The handle's description: its `type` field is a Rust keyword, so checked by hand.
+    let handle = "CUDA_EXTERNAL_MEMORY_HANDLE_DESC";
+    checks.size(handle, size_of::<cu::CUDA_EXTERNAL_MEMORY_HANDLE_DESC>());
+    checks.offset(
+        handle,
+        "type",
+        offset_of!(cu::CUDA_EXTERNAL_MEMORY_HANDLE_DESC, r#type),
+    );
+    for (field, offset) in [
+        (
+            "handle",
+            offset_of!(cu::CUDA_EXTERNAL_MEMORY_HANDLE_DESC, handle),
+        ),
+        (
+            "size",
+            offset_of!(cu::CUDA_EXTERNAL_MEMORY_HANDLE_DESC, size),
+        ),
+        (
+            "flags",
+            offset_of!(cu::CUDA_EXTERNAL_MEMORY_HANDLE_DESC, flags),
+        ),
+        (
+            "reserved",
+            offset_of!(cu::CUDA_EXTERNAL_MEMORY_HANDLE_DESC, reserved),
+        ),
+    ] {
+        checks.offset(handle, field, offset);
+    }
+    checks.size(
+        "__typeof__(((CUDA_EXTERNAL_MEMORY_HANDLE_DESC *)0)->handle)",
+        size_of::<cu::CudaExternalMemoryHandle>(),
+    );
+    layout!(checks, cu::CUDA_EXTERNAL_MEMORY_BUFFER_DESC, "CUDA_EXTERNAL_MEMORY_BUFFER_DESC" {
+        offset, size, flags, reserved,
+    });
+    checks.constant(
+        "CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD",
+        cu::CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD.into(),
+    );
+    // `CUDA_EXTERNAL_MEMORY_DEDICATED` is CUDA's `cuda.h`'s, which ffnvcodec's headers do not
+    // carry: not checked here.
+    for signature in cu::CudaExternalMemory::SIGNATURES {
+        checks.signature(&format!("t{}", signature.symbol), signature, false);
+    }
 }
 
 fn nvdec_checks(checks: &mut Checks) {

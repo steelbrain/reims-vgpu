@@ -29,6 +29,7 @@ mod cuda;
 mod decode;
 mod dl;
 mod error;
+mod external;
 #[cfg(test)]
 mod layout;
 mod nvdec;
@@ -38,11 +39,13 @@ mod wait;
 mod zero_copy;
 
 pub use annex_b::{
-    AnnexBCodec, AnnexBDecoder, AnnexBPicture, Bitstreams, MemoryPlane, ReadBack, ReadPlane,
+    AnnexBCodec, AnnexBDecoder, AnnexBPicture, Bitstreams, DevicePlane, MemoryPlane, ReadBack,
+    ReadPlane,
 };
 pub use cuda::{DeviceInfo, Gpu, GpuSelector};
 pub use dl::LoadError;
 pub use error::Error;
+pub use external::ImportedBuffer;
 pub use nvdec::{ChromaFormat, DecodeCapabilities, NvdecCodec, SurfaceFormat, decode_capabilities};
 pub use nvenc::encoder::{
     Bitstream, EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl, NvencEncoder,

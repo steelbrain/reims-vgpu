@@ -18,7 +18,9 @@
 //!   the mapped picture into it ([`AnnexBPicture::write_into`]). Where the
 //!   memory is not to be had so, the picture is read back into the
 //!   decoder's staging memory for the CPU to copy
-//!   ([`AnnexBPicture::read_back`]).
+//!   ([`AnnexBPicture::read_back`]). Into the GPU's own memory, another
+//!   API's buffer imported on the picture's GPU (`crate::external`), the
+//!   copy is within the GPU ([`AnnexBPicture::write_into_device`]).
 //! - **A picture NVDEC fails** fails its write or read back, as bad data
 //!   ([`Error::DecodeFailed`]), and the decoder then fails each picture
 //!   after it until an I picture (H.264) or an IRAP picture (HEVC) decodes,
@@ -39,7 +41,10 @@ use reims_vgpu_video_core::runtime::Runtime;
 use crate::cuda::Gpu;
 use crate::decode::Failures;
 use crate::error::Error;
-use crate::nvdec::decoder::{Crop, Destination, InPlace, Picture, PictureReadBack, SPARE_SURFACES};
+use crate::external::ImportedBuffer;
+use crate::nvdec::decoder::{
+    Crop, Destination, InPlace, Memory, Picture, PictureReadBack, SPARE_SURFACES,
+};
 use crate::nvdec::h264::NvdecH264;
 use crate::nvdec::hevc::NvdecHevc;
 use crate::wait::Deadline;
@@ -241,6 +246,45 @@ pub struct MemoryPlane<'a> {
     pub rows: u32,
 }
 
+/// A plane of the GPU's own memory a picture is written into by a copy within the GPU
+/// ([`AnnexBPicture::write_into_device`]): `rows` rows of `row_bytes`, `bytes_per_row` apart,
+/// from `offset` into `buffer`.
+pub struct DevicePlane<'a> {
+    /// The buffer the plane lies in, imported on the picture's GPU.
+    pub buffer: &'a Arc<ImportedBuffer>,
+    /// The plane's first byte in the buffer.
+    pub offset: usize,
+    /// Bytes from one of its rows to the next.
+    pub bytes_per_row: usize,
+    /// The bytes of one of its rows that may be written.
+    pub row_bytes: usize,
+    /// Its rows.
+    pub rows: u32,
+}
+
+/// The end of a plane's rows, `(offset, bytes_per_row, row_bytes, rows)`, in memory of `length`
+/// bytes: its last row's last byte's next; `Err` says why there is none.
+fn plane_end(
+    (offset, bytes_per_row, row_bytes, rows): (usize, usize, usize, u32),
+    length: usize,
+) -> Result<usize, String> {
+    let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+    let end = match rows.checked_sub(1) {
+        None => offset,
+        Some(past) => past
+            .checked_mul(bytes_per_row)
+            .and_then(|bytes| bytes.checked_add(offset))
+            .and_then(|bytes| bytes.checked_add(row_bytes))
+            .ok_or_else(|| "a plane past the address space".to_owned())?,
+    };
+    if end > length {
+        return Err(format!(
+            "a plane at {offset} to {end} past its memory's {length} bytes"
+        ));
+    }
+    Ok(end)
+}
+
 /// A plane of a picture read back ([`ReadBack::planes`]): `rows` rows of
 /// `bytes_per_row` each, packed.
 pub struct ReadPlane<'a> {
@@ -337,29 +381,20 @@ impl AnnexBPicture {
                 Ok(registration) => registration,
                 Err(why) => return Ok(Err(why)),
             };
-            let length = plane.memory.length();
-            let rows = usize::try_from(plane.rows).unwrap_or(usize::MAX);
-            let end = match rows.checked_sub(1) {
-                None => plane.offset,
-                Some(past) => match past
-                    .checked_mul(plane.bytes_per_row)
-                    .and_then(|bytes| bytes.checked_add(plane.offset))
-                    .and_then(|bytes| bytes.checked_add(plane.row_bytes))
-                {
-                    Some(end) => end,
-                    None => return Ok(Err("a plane past the address space".to_owned())),
-                },
+            let place = (
+                plane.offset,
+                plane.bytes_per_row,
+                plane.row_bytes,
+                plane.rows,
+            );
+            let end = match plane_end(place, plane.memory.length()) {
+                Ok(end) => end,
+                Err(why) => return Ok(Err(why)),
             };
-            if end > length {
-                return Ok(Err(format!(
-                    "a plane at {} to {end} past its memory's {length} bytes",
-                    plane.offset
-                )));
-            }
             destinations.push(Destination {
                 // SAFETY: the offset is inside the memory (just checked),
                 // which lies inside the registered view from its first byte.
-                at: unsafe { registration.first().as_ptr().add(plane.offset) },
+                at: Memory::Host(unsafe { registration.first().as_ptr().add(plane.offset) }),
                 len: end - plane.offset,
                 bytes_per_row: plane.bytes_per_row,
                 rows: plane.rows,
@@ -374,6 +409,69 @@ impl AnnexBPicture {
         // registration keeps mapped and pinned, which the caller lets the
         // GPU write and nothing else, for as long as `written` (its hold and
         // the registrations) lives.
+        let copied = unsafe {
+            (self.picture).write_into(self.crop_at(size), luma, chroma, written, &deadline)
+        };
+        match copied {
+            Ok(Ok(())) => Ok(Ok(())),
+            Ok(Err(error)) => Ok(Err(format!("the GPU's copy failed: {error}"))),
+            Err(error) => Err(self.failures.noted(error)),
+        }
+    }
+
+    /// [`Self::write_into`] into the GPU's own memory: `size` of the crop into `luma` and
+    /// `chroma`, each plane's rows alone, as much as fits, by one `cuMemcpy2D` a plane within
+    /// the GPU, into buffers of another API's memory imported on the picture's GPU
+    /// ([`ImportedBuffer`]). The outer `Err` is as `write_into`'s, keeping `hold` and the imports
+    /// until the GPU is done; the inner says why the planes could not be written so: an import on
+    /// another GPU, a plane past its buffer, or a copy that failed, after which the planes may
+    /// hold part of the picture.
+    ///
+    /// # Safety
+    ///
+    /// Each plane's rows lie apart from the other's, and are the caller's for the GPU to write
+    /// from the call on, while `hold` lives: nothing else writes them meanwhile, and the memory
+    /// the buffers were imported from stays allocated.
+    pub unsafe fn write_into_device(
+        &self,
+        size: (u32, u32),
+        luma: DevicePlane<'_>,
+        chroma: DevicePlane<'_>,
+        hold: Box<dyn Any + Send>,
+    ) -> Result<Result<(), String>, Error> {
+        let gpu = self.picture.gpu();
+        let mut written: Vec<Box<dyn Any + Send>> = vec![hold];
+        let mut destinations = Vec::with_capacity(2);
+        for plane in [luma, chroma] {
+            // One GPU's imports share its primary context, which its decoders' copies run in.
+            if plane.buffer.gpu().info().pci_bus_id != gpu.info().pci_bus_id {
+                return Ok(Err("a buffer imported on another GPU".to_owned()));
+            }
+            let place = (
+                plane.offset,
+                plane.bytes_per_row,
+                plane.row_bytes,
+                plane.rows,
+            );
+            let end = match plane_end(place, plane.buffer.length()) {
+                Ok(end) => end,
+                Err(why) => return Ok(Err(why)),
+            };
+            destinations.push(Destination {
+                at: Memory::Device(plane.buffer.address_at(plane.offset)),
+                len: end - plane.offset,
+                bytes_per_row: plane.bytes_per_row,
+                rows: plane.rows,
+            });
+            written.push(Box::new(Arc::clone(plane.buffer)));
+        }
+        let [luma, chroma] = destinations[..] else {
+            return Ok(Err("not two planes".to_owned()));
+        };
+        let deadline = Deadline::default();
+        // SAFETY: each destination is a plane's rows alone, in a buffer imported on the
+        // picture's GPU and mapped in its context, which the caller lets the GPU write and
+        // nothing else, for as long as `written` (its hold and the imports) lives.
         let copied = unsafe {
             (self.picture).write_into(self.crop_at(size), luma, chroma, written, &deadline)
         };

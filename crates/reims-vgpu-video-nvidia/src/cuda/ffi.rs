@@ -92,7 +92,6 @@ functions! {
         cuDevicePrimaryCtxRelease: fn(CUdevice) -> CUresult = c"cuDevicePrimaryCtxRelease";
         cuCtxPushCurrent_v2: fn(CUcontext) -> CUresult = c"cuCtxPushCurrent_v2";
         cuCtxPopCurrent_v2: fn(*mut CUcontext) -> CUresult = c"cuCtxPopCurrent_v2";
-        #[expect(dead_code, reason = "the frees of device memory another API imports")]
         cuMemFree_v2: fn(CUdeviceptr) -> CUresult = c"cuMemFree_v2";
         cuMemHostAlloc: fn(*mut *mut c_void, usize, c_uint) -> CUresult = c"cuMemHostAlloc";
         cuMemFreeHost: fn(*mut c_void) -> CUresult = c"cuMemFreeHost";
@@ -121,6 +120,76 @@ functions! {
     }
 }
 
+functions! {
+    /// libcuda's import of another API's memory (a Vulkan device's, as an
+    /// opaque file descriptor), as ffnvcodec's header declares it. Loaded
+    /// apart from [`CudaFunctions`], so that a driver without it loses only
+    /// the landing in a device's memory (`crate::external`).
+    pub(crate) struct CudaExternalMemory {
+        cuImportExternalMemory:
+            fn(*mut CUexternalMemory, *const CUDA_EXTERNAL_MEMORY_HANDLE_DESC) -> CUresult
+            = c"cuImportExternalMemory";
+        cuExternalMemoryGetMappedBuffer: fn(
+            *mut CUdeviceptr,
+            CUexternalMemory,
+            *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC,
+        ) -> CUresult = c"cuExternalMemoryGetMappedBuffer";
+        cuDestroyExternalMemory: fn(CUexternalMemory) -> CUresult = c"cuDestroyExternalMemory";
+    }
+}
+
+/// `CUexternalMemory`.
+pub(crate) type CUexternalMemory = *mut c_void;
+/// `CUexternalMemoryHandleType`.
+pub(crate) type CUexternalMemoryHandleType = c_int;
+
+/// `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD`: a POSIX file descriptor of
+/// memory a Vulkan device exported (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`).
+pub(crate) const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: CUexternalMemoryHandleType = 1;
+/// `CUDA_EXTERNAL_MEMORY_DEDICATED`: the memory is a dedicated allocation. CUDA's `cuda.h`
+/// defines it; ffnvcodec's headers, which the layout test reads, do not.
+pub(crate) const CUDA_EXTERNAL_MEMORY_DEDICATED: c_uint = 0x1;
+
+/// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC`'s `win32` member of its `handle`
+/// union, which only sizes the union here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CudaExternalMemoryWin32 {
+    pub(crate) handle: *mut c_void,
+    pub(crate) name: *const c_void,
+}
+
+/// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC`'s `handle` union.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) union CudaExternalMemoryHandle {
+    pub(crate) fd: c_int,
+    pub(crate) win32: CudaExternalMemoryWin32,
+}
+
+/// `CUDA_EXTERNAL_MEMORY_HANDLE_DESC`: the memory `cuImportExternalMemory`
+/// imports.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
+    pub(crate) r#type: CUexternalMemoryHandleType,
+    pub(crate) handle: CudaExternalMemoryHandle,
+    pub(crate) size: c_ulonglong,
+    pub(crate) flags: c_uint,
+    pub(crate) reserved: [c_uint; 16],
+}
+
+/// `CUDA_EXTERNAL_MEMORY_BUFFER_DESC`: the range of imported memory
+/// `cuExternalMemoryGetMappedBuffer` maps.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
+    pub(crate) offset: c_ulonglong,
+    pub(crate) size: c_ulonglong,
+    pub(crate) flags: c_uint,
+    pub(crate) reserved: [c_uint; 16],
+}
+
 /// `CU_MEMHOSTREGISTER_PORTABLE`: the registered memory is pinned memory to
 /// every context, not just the one current at the call (the reference).
 pub(crate) const CU_MEMHOSTREGISTER_PORTABLE: c_uint = 0x01;
@@ -129,3 +198,9 @@ pub(crate) const CU_MEMHOSTREGISTER_PORTABLE: c_uint = 0x01;
 // (2026-10-24); `crate::layout`'s test checks every offset too.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<CUDA_MEMCPY2D>() == 128);
+// The C layout on x86-64 (the handle's 16-byte union at 8, the size at 24, the flags at 32, then
+// 16 reserved words), which `crate::layout`'s test checks against ffnvcodec's header.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<CUDA_EXTERNAL_MEMORY_HANDLE_DESC>() == 104);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<CUDA_EXTERNAL_MEMORY_BUFFER_DESC>() == 88);

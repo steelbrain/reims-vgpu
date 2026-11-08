@@ -22,13 +22,15 @@ use std::sync::{Arc, OnceLock};
 
 use crate::dl::Library;
 use crate::error::Error;
-use ffi::{CUcontext, CUdevice, CUresult, CudaFunctions, CudaRegistration};
+use ffi::{CUcontext, CUdevice, CUresult, CudaExternalMemory, CudaFunctions, CudaRegistration};
 
 /// libcuda, loaded and initialised once per process.
 pub(crate) struct Cuda {
     pub(crate) f: CudaFunctions,
     /// Its registration of host memory, where it has it.
     pub(crate) registration: Option<CudaRegistration>,
+    /// Its import of other APIs' memory, where it has it.
+    pub(crate) external: Option<CudaExternalMemory>,
     driver_version: i32,
     _library: Library,
 }
@@ -48,9 +50,13 @@ impl Cuda {
         let registration = CudaRegistration::load(&library)
             .inspect_err(|e| log::info!("{e}: zero copy into guest memory is off"))
             .ok();
+        let external = CudaExternalMemory::load(&library)
+            .inspect_err(|e| log::info!("{e}: no landing in a device's memory"))
+            .ok();
         let cuda = Self {
             f,
             registration,
+            external,
             driver_version: 0,
             _library: library,
         };
