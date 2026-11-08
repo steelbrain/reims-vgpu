@@ -25,9 +25,10 @@ mod va;
 
 #[cfg(target_os = "linux")]
 pub use va::{
-    Capabilities, ConfigCapabilities, Display, Entrypoint, Error, Fourcc, Frame, H264Decoder,
-    HevcDecoder, LoadError, Profile, ReadBack, ReadbackTimes, ReadbackWay, SurfaceCapabilities,
-    proc_filter_name, read_back_by, rt_format_names,
+    Capabilities, ConfigCapabilities, Display, Entrypoint, Error, Fourcc, Frame, GuestWrites,
+    H264Decoder, HevcDecoder, ImportWrite, ImportWrites, LoadError, PlaneRows, Profile, ReadBack,
+    ReadbackTimes, ReadbackWay, SurfaceCapabilities, proc_filter_name, read_back_by,
+    rt_format_names,
 };
 
 #[cfg(target_os = "linux")]

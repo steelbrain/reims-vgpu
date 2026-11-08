@@ -21,6 +21,7 @@ mod h264;
 mod hevc;
 mod host_memory;
 mod image;
+mod import_check;
 mod libva;
 mod readback;
 #[cfg(test)]
@@ -28,10 +29,6 @@ mod spin;
 mod surface;
 mod vpp_ffi;
 mod wait;
-#[expect(
-    dead_code,
-    reason = "the reims-graphics device's VA-API decoding writes guest buffers through it"
-)]
 mod zero_copy;
 
 pub use caps::{
@@ -43,8 +40,9 @@ pub use encoder::{
     EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, UploadMethod,
     VideoEncoder, encoder_support,
 };
-pub use frame::{Frame, ReadBack};
+pub use frame::{Frame, GuestWrites, PlaneRows, ReadBack};
 pub use h264::H264Decoder;
 pub use hevc::HevcDecoder;
+pub use import_check::{ImportWrite, ImportWrites};
 pub use libva::LoadError;
 pub use readback::{ReadbackTimes, ReadbackWay, read_back_by};

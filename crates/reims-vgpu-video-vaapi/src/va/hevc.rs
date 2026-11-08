@@ -44,6 +44,11 @@ pub struct HevcDecoder {
 }
 
 impl HevcDecoder {
+    /// The frames a caller may hold at once, beyond those the decoder holds
+    /// itself, before a decode finds no free surface (`Error::OutOfSurfaces`):
+    /// the pool's spare surfaces.
+    pub const SPARE_FRAMES: usize = SPARE_SURFACES;
+
     /// A decoder for samples described by an `hvcC` record (ISO/IEC
     /// 14496-15, 8.3.3.1), whose parameter sets it takes. The record's
     /// first SPS is checked against what the decoder and the driver take,

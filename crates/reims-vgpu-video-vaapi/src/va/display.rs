@@ -4,7 +4,7 @@ use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use reims_vgpu_video_core::runtime::{MonoTime, Runtime};
 use reims_vgpu_video_core::sync::Mutex;
@@ -12,6 +12,8 @@ use reims_vgpu_video_core::sync::Mutex;
 use super::calls::{Calls, Late};
 use super::caps::Answers;
 use super::ffi;
+use super::import_check::{ImportWrite, ImportWrites};
+use super::surface::SurfaceFormat;
 use super::wait;
 
 /// Why a VA-API operation failed.
@@ -107,31 +109,6 @@ pub(crate) fn check(call: &'static str, status: ffi::VAStatus) -> Result<(), Err
     })
 }
 
-/// The drivers whose video-processing writes into memory of ours, imported
-/// as a linear surface over a dma-buf, were measured right, by a word of
-/// their vendor string: Mesa's radeonsi, on an RX 7900 XTX and a Radeon
-/// 780M (Navi 31 and Phoenix, Mesa 26.2.4, 2026-10-24 and 2026-10-25).
-/// NVIDIA's VA-API driver (libva-nvidia-driver 0.0.18, an RTX 5080 Laptop
-/// GPU, 2026-10-25) took the import and the run and answered success, and
-/// no frame that came back so matched: a driver says nothing of what it
-/// gets wrong here, so another gets no such write until it is measured
-/// right, and its frames come back through `vaGetImage`.
-const DRIVERS_WRITING_IMPORTS: [&str; 1] = ["radeonsi"];
-
-/// [`Display::writes_imports`] for a driver of `vendor`.
-fn writes_imports(vendor: &str) -> Result<(), String> {
-    if DRIVERS_WRITING_IMPORTS
-        .iter()
-        .any(|word| vendor.contains(word))
-    {
-        return Ok(());
-    }
-    Err(format!(
-        "writes into imported memory are measured on {} alone, and this driver is \"{vendor}\"",
-        DRIVERS_WRITING_IMPORTS.join(", ")
-    ))
-}
-
 /// An initialised VA display on a render node. Another handle to the
 /// same display is taken with [`Display::clone_ref`]; the display is
 /// terminated when the last handle, and everything made on it, is gone.
@@ -159,6 +136,9 @@ struct DisplayInner {
     /// The host's threads and clock, which what is made on the display
     /// starts its threads on and times by.
     runtime: Arc<dyn Runtime>,
+    /// What the driver's video processing writes into imported memory, as
+    /// the check at the opening found it (`super::import_check`).
+    import_writes: OnceLock<ImportWrites>,
 }
 
 // SAFETY: "All VAAPI functions implemented in libva are thread-safe" and
@@ -187,9 +167,10 @@ impl Display {
     /// initialises VA-API on it, loading libva first where no display has
     /// yet: a host without it fails here, with [`Error::Load`]. Then asks
     /// the driver, on this thread, what a session will ask of it
-    /// ([`Display::prime`]). libva's informational messages are silenced;
-    /// its errors still go to stderr. What is made on it runs on
-    /// `runtime`.
+    /// ([`Display::prime`]), and checks what its video processing writes
+    /// into imported memory ([`Display::import_writes`]). libva's
+    /// informational messages are silenced; its errors still go to stderr.
+    /// What is made on it runs on `runtime`.
     pub fn open(path: impl AsRef<Path>, runtime: Arc<dyn Runtime>) -> Result<Self, Error> {
         let path = path.as_ref();
         super::libva::load().map_err(Error::Load)?;
@@ -235,9 +216,12 @@ impl Display {
                 answers: Mutex::new(Answers::default()),
                 node: Some(node),
                 runtime,
+                import_writes: OnceLock::new(),
             }),
         };
         display.prime();
+        let writes = super::import_check::learn(&display);
+        let _ = display.inner.import_writes.set(writes);
         Ok(display)
     }
 
@@ -263,13 +247,24 @@ impl Display {
         &self.inner.vendor
     }
 
-    /// `Err`, saying why, where the driver's video-processing writes into
-    /// memory of ours imported as a linear surface are not measured right:
-    /// the staged copy back's ([`super::readback`]) and zero copy's
-    /// ([`super::zero_copy`]). Measured right on [`DRIVERS_WRITING_IMPORTS`]
-    /// alone.
-    pub(crate) fn writes_imports(&self) -> Result<(), String> {
-        writes_imports(self.vendor())
+    /// What the driver's video processing writes into memory imported as a
+    /// linear surface, as the display's check at its opening found it
+    /// (`super::import_check`).
+    pub fn import_writes(&self) -> ImportWrites {
+        (self.inner.import_writes.get().cloned())
+            .unwrap_or_else(|| ImportWrites::none("the display's import check has not run"))
+    }
+
+    /// What of an import of `format` the driver's video processing writes
+    /// right, as the display's check found it: the staged copy back's
+    /// ([`super::readback`]), zero copy's ([`super::zero_copy`]) and the JPEG
+    /// engine's host surfaces' memory. `Err` says why the driver is lent no
+    /// such import.
+    pub(crate) fn writes_imports(&self, format: SurfaceFormat) -> Result<ImportWrite, String> {
+        match self.inner.import_writes.get() {
+            Some(writes) => writes.of(format),
+            None => Err("the display's import check has not run".to_owned()),
+        }
     }
 
     /// The VA-API version libva reports, major and minor.
@@ -353,30 +348,4 @@ impl Display {
 /// call that waits for the GPU.
 fn held() -> Error {
     Error::Stalled("a driver call ahead of this one on the display in time".into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::writes_imports;
-
-    #[test]
-    fn only_radeonsi_writes_into_imported_memory() {
-        // The vendor strings radeonsi and NVIDIA's driver answered
-        // (2026-10-25).
-        assert_eq!(
-            writes_imports(
-                "Mesa Gallium driver 26.2.4-arch3.1 for AMD Radeon RX 7900 XTX \
-                 (radeonsi, navi31, ACO, DRM 3.64, 7.2.9-1-cachyos)"
-            ),
-            Ok(())
-        );
-        let refused = writes_imports("VA-API NVDEC driver [direct backend]");
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|why| why.contains("VA-API NVDEC driver")),
-            "{refused:?}"
-        );
-        assert!(writes_imports("").is_err());
-    }
 }

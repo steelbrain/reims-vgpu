@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
-use super::display::Error;
+use reims_vgpu_video_core::backend::DeviceWrite;
+use reims_vgpu_video_core::device_memory::GuestTarget;
+
+use super::display::{Display, Error};
 use super::readback::ReadbackTimes;
 use super::surface::{Rect, Surface, SurfaceFormat, SurfaceReadBack};
 use super::wait::{self, Deadline};
@@ -186,25 +189,52 @@ impl ReadBack<'_> {
         (y, y_stride, y_rows): (&mut [u8], usize, usize),
         (uv, uv_stride, uv_rows): (&mut [u8], usize, usize),
     ) -> Result<(), Error> {
+        self.copy_into(
+            PlaneRows {
+                bytes: y,
+                bytes_per_row: y_stride,
+                rows: y_rows,
+                row_bytes: y_stride,
+            },
+            PlaneRows {
+                bytes: uv,
+                bytes_per_row: uv_stride,
+                rows: uv_rows,
+                row_bytes: uv_stride,
+            },
+        )
+    }
+
+    /// [`ReadBack::copy_fitting_to`] into planes whose rows hold `row_bytes` of the picture each,
+    /// which may be fewer than their `bytes_per_row`: what lies past them in a row (another
+    /// texture's bytes, inside a larger plane) is left as it was.
+    pub fn copy_into(&self, y: PlaneRows<'_>, uv: PlaneRows<'_>) -> Result<(), Error> {
         let frame = self.frame;
         let format = frame.surface.format();
         let sample = format.bytes_per_sample();
         let fit = |bytes: usize| u32::try_from(bytes / sample.max(1)).unwrap_or(u32::MAX);
         // A chroma row holds a pair for every two columns, the last one too
         // where the width is odd, so an even width fits where its bytes do.
-        let chroma_columns = fit(uv_stride) & !1;
+        let chroma_columns = fit(uv.row_bytes.min(uv.bytes_per_row)) & !1;
         let rect = Rect {
             width: frame
                 .rect
                 .width
-                .min(fit(y_stride))
+                .min(fit(y.row_bytes.min(y.bytes_per_row)))
                 .min(chroma_columns.max(1)),
             height: (frame.rect.height)
-                .min(u32::try_from(y_rows).unwrap_or(u32::MAX))
-                .min(u32::try_from(uv_rows).unwrap_or(u32::MAX).saturating_mul(2)),
+                .min(u32::try_from(y.rows).unwrap_or(u32::MAX))
+                .min(u32::try_from(uv.rows).unwrap_or(u32::MAX).saturating_mul(2)),
             ..frame.rect
         };
-        self.copy_rect(format, rect, y, y_stride, uv, uv_stride)
+        self.copy_rect(
+            format,
+            rect,
+            y.bytes,
+            y.bytes_per_row,
+            uv.bytes,
+            uv.bytes_per_row,
+        )
     }
 
     fn copy_rect(
@@ -225,5 +255,56 @@ impl ReadBack<'_> {
         }
         self.surface
             .copy_planes_to(rect, y, y_stride, uv, uv_stride)
+    }
+}
+
+/// One plane's rows, which [`ReadBack::copy_into`] copies a frame into.
+pub struct PlaneRows<'a> {
+    /// The plane, from its first row's first byte.
+    pub bytes: &'a mut [u8],
+    /// Bytes from one of its rows to the next.
+    pub bytes_per_row: usize,
+    /// Its rows.
+    pub rows: usize,
+    /// The bytes of one of its rows that hold the picture.
+    pub row_bytes: usize,
+}
+
+/// A display's imports of guest buffers, which its frames are written into by video-processing
+/// runs ([`Frame::write_to_guest`]): kept by each buffer's identity until its mapping goes.
+pub struct GuestWrites(Arc<super::zero_copy::GuestImports>);
+
+impl GuestWrites {
+    /// No imports yet, for frames of `display`.
+    pub fn new(display: &Display) -> Self {
+        Self(super::zero_copy::imports(display))
+    }
+}
+
+impl Frame {
+    /// Writes the frame into `target`, a buffer lent by its memory, by video-processing runs from
+    /// its surface, with nothing for the CPU to copy (`super::zero_copy`), once its decode is
+    /// done; [`DeviceWrite::Declined`] with why where the driver or the buffer's layout takes
+    /// none, and the frame is to be copied by the CPU instead. `writes` keeps the buffer's import
+    /// for the next frame written there.
+    ///
+    /// The run writes the buffer's whole width and height from the crop's first sample, as much
+    /// of it as the decoded (coded) picture holds: the rows and columns past an odd crop that a
+    /// buffer laid out to hold the coded picture's even rows and columns takes. Those of a frame
+    /// past what the buffer holds are not written.
+    pub fn write_to_guest(
+        &self,
+        target: &GuestTarget<'_>,
+        writes: &GuestWrites,
+    ) -> Result<DeviceWrite, Error> {
+        let rect = self.rect;
+        let (coded_width, coded_height) = self.surface.size();
+        let size = (
+            target.width().min(coded_width.saturating_sub(rect.x)),
+            target.height().min(coded_height.saturating_sub(rect.y)),
+        );
+        wait::by(&self.deadline, || {
+            super::zero_copy::write(self, target, &writes.0, size)
+        })
     }
 }

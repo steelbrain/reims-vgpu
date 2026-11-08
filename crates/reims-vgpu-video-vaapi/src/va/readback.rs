@@ -30,6 +30,7 @@ use super::host_memory::HostMemory;
 use super::surface::{Rect, SurfaceFormat};
 use super::vpp_ffi as vpp;
 use super::wait::{self, Work};
+use super::zero_copy::{PAGE, gcd};
 
 /// What a pool's frames came back through, and the time each part took,
 /// summed over the frames.
@@ -240,15 +241,21 @@ impl HostFormat {
 
     /// Where each plane of a [`HostSurface`] of `width` by `height` is, its
     /// offset and pitch, and the bytes of the whole: each plane's rows
-    /// 256-byte aligned, and each plane at a page. `None` past the address
-    /// space.
+    /// 256-byte aligned, and each plane at a page and a whole number of the
+    /// first plane's rows from its first byte, as iHD writes a chroma plane
+    /// whole rows after its luma plane (`super::import_check`). `None` past
+    /// the address space.
     fn layout(self, width: u32, height: u32) -> Option<(Vec<(usize, usize)>, usize)> {
         let shapes = self.planes(width, height)?;
         let mut planes = Vec::with_capacity(shapes.len());
         let mut size = 0usize;
+        let mut unit = PAGE;
         for (row, rows) in shapes {
-            let offset = size.checked_next_multiple_of(4096)?;
+            let offset = size.checked_next_multiple_of(unit)?;
             let pitch = row.checked_next_multiple_of(256)?;
+            if planes.is_empty() {
+                unit = (pitch / gcd(pitch, PAGE)).checked_mul(PAGE)?;
+            }
             size = pitch.checked_mul(rows)?.checked_add(offset)?;
             planes.push((offset, pitch));
         }
@@ -713,7 +720,7 @@ fn to_usize(value: u32) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, SurfaceFormat, copy_rect, copy_row};
+    use super::{HostFormat, Rect, SurfaceFormat, copy_rect, copy_row};
     use crate::va::display::Error;
 
     /// An NV12 frame of 4x4 in 8 bytes a row: luma 0 to 31, then chroma
@@ -772,5 +779,39 @@ mod tests {
         assert!(short(copy([(0, 8), (32, 8)], usize::MAX, rect(0, 0, 4, 2))));
         assert!(short(copy([(0, 8), (32, 8)], 4, rect(u32::MAX, 0, 4, 2))));
         assert!(short(copy([(0, 8), (32, 8)], 4, rect(0, 0, 4, 8))));
+    }
+
+    /// A staged surface's planes each start a page and lie whole rows of the first plane's pitch
+    /// from its first byte, at rows of 256 bytes: the sizes the decoders make, at 8 and 10 bits,
+    /// among them iHD's staged P010 1920x1080, whose chroma plane a page past the luma's rows
+    /// lay part of a row in.
+    #[test]
+    fn staged_planes_start_a_page_whole_rows_in() {
+        for format in [HostFormat::Nv12, HostFormat::P010] {
+            for (width, height) in [
+                (1920, 1080),
+                (1920, 1088),
+                (1280, 720),
+                (3840, 2160),
+                (640, 368),
+                (1366, 768),
+                (8192, 4352),
+                (16, 16),
+            ] {
+                let (planes, size) = format.layout(width, height).expect("a layout");
+                let [(luma, pitch), (chroma, chroma_pitch)] = planes[..] else {
+                    panic!("{width}x{height}: two planes");
+                };
+                let rows = height as usize;
+                assert_eq!(luma, 0);
+                assert_eq!(pitch, chroma_pitch);
+                assert_eq!(pitch % 256, 0, "{width}x{height}");
+                assert_eq!(chroma % 4096, 0, "{width}x{height}: a page");
+                assert_eq!(chroma % pitch, 0, "{width}x{height}: whole rows");
+                assert!(chroma >= pitch * rows, "{width}x{height}");
+                assert!(chroma - pitch * rows < pitch / super::gcd(pitch, 4096) * 4096);
+                assert_eq!(size, chroma + pitch * rows.div_ceil(2));
+            }
+        }
     }
 }

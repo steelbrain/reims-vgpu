@@ -1,37 +1,47 @@
 //! Zero copy on VA-API: a decoded frame written into the guest's buffer by
-//! video-processing runs, with nothing for the CPU to copy (core's
-//! `DecodedFrame::write_to_guest`).
+//! video-processing runs, with nothing for the CPU to copy
+//! (`Frame::write_to_guest`).
 //!
 //! The buffer is imported once per mapping and size of frame, in strips:
 //! each strip an even number of the frame's rows, a dma-buf the host makes
-//! of their luma rows' pages and one of their chroma rows' pages (core's
+//! of their luma rows' pages and their chroma rows' pages (core's
 //! `DeviceMemory::dma_buf_of`; reims-vgpu's `os/linux/device_lend.rs`, a
 //! udmabuf of the memfd behind the guest's RAM, the pages in the order the
-//! bytes lie in), and a linear VA surface over the two at the buffer's own
-//! pitches (`DRM_PRIME_2`, an object a plane). The strips are as few as
-//! udmabuf's limits allow: the whole buffer where each plane fits in one
-//! dma-buf, else as many as the host's count of the pages' runs calls for
-//! against its `list_limit` and `size_limit_mb`. A guest's buffer lies
-//! nearly one run a page, so at the stock limits (1,024 runs, 64 MiB) a
-//! 1080p P010 buffer takes one strip, a 4K NV12 one two and a 4K P010 one
-//! four. They share one video-processing context, and are kept by the
-//! mapping's identity in core's [`DeviceImports`] until the mapping goes.
+//! bytes lie in), and a linear VA surface over it at the buffer's own
+//! pitches (`DRM_PRIME_2`, one object of both planes: iHD takes no import
+//! of an object a plane, `super::import_check`). The strips are as few as
+//! udmabuf's limits allow: the whole buffer where it fits in one dma-buf,
+//! else as many as the host's count of the pages' runs calls for against
+//! its `list_limit` and `size_limit_mb`. A guest's buffer lies nearly one
+//! run a page, so at the stock limits (1,024 runs, 64 MiB) a 1080p NV12
+//! buffer takes one strip and a 4K one three. Where the driver writes rows
+//! of whole alignments alone, its luma plane at the dma-buf's first byte and
+//! its chroma plane whole rows after it ([`ImportWrite::whole_rows`]), each
+//! strip but the last is a multiple of the rows after which a luma row
+//! starts a page again, so that every strip's luma plane starts its dma-buf
+//! as the buffer's first does. They share one video-processing context, and
+//! are kept by the mapping's identity in core's [`DeviceImports`] until the
+//! mapping goes.
 //! Each frame is then one run a strip, from the decode surface's rows into
 //! it, and their syncs: the staged copy back's run, into the guest's pages
 //! instead of ours.
 //!
-//! What radeonsi takes, measured on the RX 7900 XTX and the Radeon 780M
-//! (Mesa 26.2.4, 2026-10-24), and so what is declined, each frame then
-//! copied by the CPU:
-//! - rows of a multiple of 256 bytes, and planes that start 256 bytes
-//!   apart from the dma-buf's first: rows of 1920 bytes, and a luma plane 64
-//!   bytes into a page, were refused (`VA_STATUS_ERROR_ALLOCATION_FAILED`);
-//!   a chroma plane 256 bytes past a page took;
-//! - an even size: at 641x361 every plane's samples past the first chroma
-//!   pair came out wrong, at 8 and 10 bits, though nothing was written past
-//!   the planes;
-//! - nothing else: in every case taken, every byte of the buffer that is not
-//!   one of the frame's samples, row padding included, stayed as it was.
+//! What the driver takes is learned as its display opens (`super::import_check`): the least
+//! alignment of rows and of planes from a dma-buf's first byte at which its imports of each
+//! format are taken and written right, and whether only in rows of whole alignments. Buffers
+//! whose rows or planes are not at it, or with such a driver whose rows of samples are not whole
+//! alignments or whose planes are not a page's start and whole rows after it, are declined, each
+//! frame then copied by the CPU, and so is every buffer of a format the driver writes no import
+//! of. Measured on radeonsi, on the RX 7900 XTX and the Radeon 780M (Mesa 26.2.4, 2026-10-24),
+//! with a probe of our own that checked each import byte for byte:
+//! - rows of a multiple of 256 bytes, and planes that start 256 bytes apart from the dma-buf's
+//!   first: rows of 1920 bytes, and a luma plane 64 bytes into a page, were refused
+//!   (`VA_STATUS_ERROR_ALLOCATION_FAILED`); a chroma plane 256 bytes past a page took;
+//! - an even size: at 641x361 every plane's samples past the first chroma pair came out wrong,
+//!   at 8 and 10 bits, though nothing was written past the planes. Frames of an odd width or
+//!   height are declined on every driver, as the strips here hold whole chroma rows;
+//! - nothing else: in every case taken, every byte of the buffer that is not one of the frame's
+//!   samples, row padding included, stayed as it was.
 //!
 //! Strips write what one run does, measured on the same GPUs (2026-10-25,
 //! udmabuf at its stock limits): through the stand-in guest every frame of
@@ -43,10 +53,9 @@
 //! a cost of its own, so the strips are as few as the limits allow
 //! (docs/video/vaapi.md, "What it saves").
 //!
-//! Only drivers measured right are lent guest buffers
-//! (`Display::writes_imports`): radeonsi alone. NVIDIA's VA-API driver took
-//! the import and the run and answered success, and wrote frames that did
-//! not match.
+//! A driver whose runs answer success and write nothing, as NVIDIA's VA-API
+//! driver's do (docs/video/bugs.md, U16), fails the display's check, and is
+//! lent no guest buffer.
 //!
 //! A frame's decode and its runs are waited for until one deadline
 //! (`super::wait`). Runs past it may still write the guest's pages: the
@@ -70,12 +79,10 @@ use super::caps::{Config, Context, Entrypoint, Profile};
 use super::display::{Display, Error, check};
 use super::ffi;
 use super::frame::Frame;
+use super::import_check::ImportWrite;
 use super::surface::SurfaceFormat;
 use super::vpp_ffi as vpp;
 use super::wait::{self, Work};
-
-/// What radeonsi's linear surfaces align their rows and planes to.
-const ALIGNMENT: usize = 256;
 
 /// The most imports a backend keeps at once: a guest's decoders use a few
 /// pools of 10 to 30 buffers each, and each import is a VA surface a strip
@@ -87,20 +94,15 @@ const MOST_IMPORTS: usize = 96;
 /// largest the decoders make, takes 17 or 18 at udmabuf's stock limits.
 const MOST_STRIPS: usize = 64;
 
-/// A backend's imports of guest buffers, shared by its sessions, and
-/// whether its driver is lent any.
+/// A backend's imports of guest buffers, shared by its sessions.
 pub(crate) struct GuestImports {
     imports: DeviceImports<GuestImport>,
-    /// Why the driver is lent no guest buffer; `None` where it is.
-    refused: Option<String>,
 }
 
 /// No imports yet, for a new backend on `display`.
 pub(crate) fn imports(display: &Display) -> Arc<GuestImports> {
-    let refused = display.writes_imports().err();
     Arc::new(GuestImports {
         imports: DeviceImports::new(display.runtime(), "vaapi", MOST_IMPORTS),
-        refused,
     })
 }
 
@@ -119,15 +121,14 @@ pub(crate) struct GuestImport {
 }
 
 /// Some of a buffer's rows, imported: a linear VA surface over a dma-buf of
-/// its luma rows and one of their chroma rows.
+/// its luma rows and their chroma rows.
 struct Strip {
     surface: ffi::VASurfaceID,
     /// Its first row, of the frame's, and its rows: both even.
     top: u32,
     rows: u32,
-    /// The dma-bufs of its luma and chroma rows, which the surface's buffer
-    /// objects hold too.
-    dma_bufs: [OwnedFd; 2],
+    /// The dma-buf of its rows, which the surface's buffer object holds too.
+    dma_buf: OwnedFd,
 }
 
 impl Drop for GuestImport {
@@ -145,23 +146,35 @@ fn declined(why: impl Into<String>) -> DeviceWrite {
     DeviceWrite::Declined(why.into())
 }
 
-/// Writes `frame`, cropped, into `target` by one video-processing run a
-/// strip (module docs): [`DeviceWrite::Declined`] where radeonsi takes no
-/// such buffer, or the host lends no dma-buf of it; an `Err` where the frame
-/// did not decode, or the GPU did not finish the frame by its deadline.
+/// Writes `frame` into `target` by one video-processing run a strip (module
+/// docs), the `size` of it from the frame's crop's first sample: the
+/// buffer's whole size within the frame's coded picture, as its buffers hold
+/// the coded rows and columns a decode writes in place
+/// (`Frame::write_to_guest`). [`DeviceWrite::Declined`] where the driver
+/// takes no such buffer, or the host lends no dma-buf of it; an `Err` where
+/// the frame did not decode, or the GPU did not finish the frame by its
+/// deadline.
 pub(crate) fn write(
     frame: &Frame,
     target: &GuestTarget<'_>,
     imports: &GuestImports,
+    (width, height): (u32, u32),
 ) -> Result<DeviceWrite, Error> {
-    if let Some(why) = &imports.refused {
-        return Ok(declined(why.clone()));
-    }
     let format = frame.surface.format();
-    let (width, height) = target.written_size(frame.width(), frame.height());
+    let display = frame.surface.display();
+    let write = match display.writes_imports(format) {
+        Ok(write) => write,
+        Err(why) => {
+            return Ok(declined(format!(
+                "the driver's video processing writes no {} import right: {why}",
+                format.name()
+            )));
+        }
+    };
     if width % 2 != 0 || height % 2 != 0 {
         return Ok(declined(format!(
-            "a frame of {width}x{height}: radeonsi's video processing writes an odd size wrongly"
+            "a frame of {width}x{height}: the strips hold whole chroma rows, and radeonsi's \
+             video processing wrote an odd size wrongly"
         )));
     }
     if width == 0 || height == 0 {
@@ -174,14 +187,22 @@ pub(crate) fn write(
             format.name()
         )));
     }
+    let alignment = write.alignment;
     let planes = target.planes();
     if let Some(plane) = planes
         .iter()
-        .find(|plane| plane.bytes_per_row % ALIGNMENT != 0)
+        .find(|plane| plane.bytes_per_row % alignment != 0)
     {
         return Ok(declined(format!(
-            "rows of {} bytes: radeonsi imports rows of a multiple of {ALIGNMENT} bytes alone",
+            "rows of {} bytes: the driver imports rows of a multiple of {alignment} bytes alone",
             plane.bytes_per_row
+        )));
+    }
+    let samples = usize::try_from(width).unwrap_or(usize::MAX) * format.bytes_per_sample();
+    if write.whole_rows && !samples.is_multiple_of(alignment) {
+        return Ok(declined(format!(
+            "rows of {samples} bytes of samples: the driver writes rows of whole {alignment} \
+             bytes alone"
         )));
     }
     let rect = frame.rect;
@@ -197,12 +218,11 @@ pub(crate) fn write(
     // given frames of another size gets another.
     let variant =
         u64::from(width) << 32 | u64::from(height) << 1 | u64::from(format == SurfaceFormat::P010);
-    let display = frame.surface.display();
     let memory = target.memory();
     let import = match imports.imports.get_or_make(
         &memory.identity(),
         variant,
-        || GuestImport::new(display, target, format, (width, height)),
+        || GuestImport::new(display, target, format, (width, height), write, None),
         || "the buffer's mapping went while it was held".to_owned(),
     ) {
         Ok(import) => import,
@@ -228,20 +248,26 @@ pub(crate) fn write(
 }
 
 impl GuestImport {
-    /// `target`'s buffer imported for `format` frames of `size`, in as few
-    /// strips as udmabuf's limits allow, with a context on them; `Err` says
-    /// why not, for the log.
+    /// `target`'s buffer imported for `format` frames of `size`, as `write`
+    /// says the driver takes it, in as few strips as udmabuf's limits allow
+    /// (or in `forced`, a test's), with a context on them; `Err` says why
+    /// not, for the log.
     fn new(
         display: &Display,
         target: &GuestTarget<'_>,
         format: SurfaceFormat,
         (width, height): (u32, u32),
+        write: ImportWrite,
+        forced: Option<usize>,
     ) -> Result<Self, String> {
-        let mut count = 1;
+        let mut count = forced.unwrap_or(1);
         let strips = loop {
-            match strips(display, target, format, (width, height), count) {
+            match strips(display, target, format, (width, height), count, write) {
                 Ok(strips) => break strips,
                 Err(Cut::Refused(why)) => return Err(why),
+                Err(Cut::TooLarge { why, .. }) if forced.is_some() => {
+                    return Err(format!("not in {count} strips: {why}"));
+                }
                 Err(Cut::TooLarge {
                     pieces,
                     bytes,
@@ -363,7 +389,7 @@ impl GuestImport {
         super::fence::wait_for_writes(
             &**self.display.runtime(),
             deadline,
-            (self.strips.iter()).flat_map(|strip| strip.dma_bufs.iter().map(AsFd::as_fd)),
+            (self.strips.iter()).map(|strip| strip.dma_buf.as_fd()),
         );
         for strip in &self.strips {
             wait::wait_for(
@@ -374,6 +400,34 @@ impl GuestImport {
             )?;
         }
         Ok(())
+    }
+}
+
+/// The display's import check's run (`super::import_check`): `source`, from its first sample,
+/// written into `target` as a frame of `source`'s format and `target`'s size is, imported as
+/// `write` says (in `strips` strips where given), and waited for. `Err` says why not. A run past
+/// its deadline keeps its import, and the pages under it, until the GPU is done with it.
+pub(crate) fn trial(
+    display: &Display,
+    source: &super::surface::Surface,
+    target: &GuestTarget<'_>,
+    write: ImportWrite,
+    strips: Option<usize>,
+) -> Result<(), String> {
+    let (width, height) = (target.width(), target.height());
+    let format = source.format();
+    let import = GuestImport::new(display, target, format, (width, height), write, strips)?;
+    let Ok(columns) = u16::try_from(width) else {
+        return Err("a trial too wide for a video-processing region".to_owned());
+    };
+    match import.run(source.id(), 0, 0, columns, wait::deadline(display)) {
+        Ok(()) => Ok(()),
+        Err(Error::Stalled(what)) => {
+            let works = import.works();
+            wait::keep(display, "the import check's run", works, import);
+            Err(format!("the run did not finish: {what}"))
+        }
+        Err(error) => Err(format!("the run failed: {error}")),
     }
 }
 
@@ -392,21 +446,29 @@ enum Cut {
 
 /// `target`'s rows imported in `count` strips for `format` frames of
 /// `size` (module docs): each an even number of the frame's rows, a dma-buf
-/// of their luma rows and one of their chroma rows, and a linear VA surface
-/// over them at the guest's own pitches.
+/// of their luma rows and their chroma rows, and a linear VA surface over it
+/// at the guest's own pitches, as `write` says the driver takes it.
 fn strips(
     display: &Display,
     target: &GuestTarget<'_>,
     format: SurfaceFormat,
     (width, height): (u32, u32),
     count: usize,
+    write: ImportWrite,
 ) -> Result<Vec<Strip>, Cut> {
     let refused = |why: &str| Cut::Refused(why.to_owned());
     let memory = target.memory();
     let [luma, chroma] = target.planes();
     let count = u32::try_from(count).map_err(|_| refused("too many strips"))?;
+    // With rows of whole alignments, each strip's luma plane at a page's start: its rows a
+    // multiple of those after which a luma row starts a page again.
+    let unit = if write.whole_rows {
+        u32::try_from(PAGE / gcd(luma.bytes_per_row, PAGE)).unwrap_or(u32::MAX)
+    } else {
+        1
+    };
     let mut made: Vec<Strip> = Vec::new();
-    for (top, rows) in strip_rows(height, count) {
+    for (top, rows) in strip_rows(height, count, unit) {
         let range = |plane: &TargetPlane, top: u32, rows: u32| {
             let at = (plane.bytes_per_row)
                 .checked_mul(usize::try_from(top).ok()?)?
@@ -423,21 +485,15 @@ fn strips(
             destroy(display, &made);
             return Err(refused("a buffer past the address space"));
         };
-        // A dma-buf a plane: a plane's rows must lie in one, and two let a
-        // strip's luma rows alone fill udmabuf's limits.
-        let dma_bufs = (memory.dma_buf_of(&[luma_rows])).and_then(|luma| {
-            memory
-                .dma_buf_of(&[chroma_rows])
-                .map(|chroma| [luma, chroma])
-        });
-        let strip = match dma_bufs {
-            Ok(dma_bufs) => Strip::new(
+        let strip = match memory.dma_buf_of(&[luma_rows, chroma_rows]) {
+            Ok(dma_buf) => Strip::new(
                 display,
                 format,
                 (width, rows),
                 top,
-                dma_bufs,
+                dma_buf,
                 [luma, chroma],
+                write,
             )
             .map_err(Cut::Refused),
             Err(DmaBufError::TooLarge {
@@ -470,13 +526,29 @@ fn strips(
 
 /// The `height` rows of an even frame in `count` strips at most, top to
 /// bottom, each its first row and its rows, both even, so that every strip
-/// starts on a chroma row; all but the last as tall.
-fn strip_rows(height: u32, count: u32) -> impl Iterator<Item = (u32, u32)> {
-    let each = height.div_ceil(count.max(1)).next_multiple_of(2).max(2);
+/// starts on a chroma row, and a multiple of `unit`; all but the last as
+/// tall.
+fn strip_rows(height: u32, count: u32, unit: u32) -> impl Iterator<Item = (u32, u32)> {
+    let unit = unit.max(1).next_multiple_of(2);
+    let each = height
+        .div_ceil(count.max(1))
+        .next_multiple_of(unit)
+        .max(unit);
     (0..height)
         .step_by(usize::try_from(each).unwrap_or(usize::MAX))
         .map(move |top| (top, each.min(height - top)))
 }
+
+/// The greatest common divisor of `a` and `b`.
+pub(super) fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
+/// The bytes of a page, which a dma-buf's first byte starts.
+pub(super) const PAGE: usize = 4096;
 
 /// Destroys the strips' surfaces, made on `display` and used by nothing.
 fn destroy(display: &Display, strips: &[Strip]) {
@@ -486,31 +558,56 @@ fn destroy(display: &Display, strips: &[Strip]) {
 }
 
 impl Strip {
-    /// A linear VA surface of `size` over `dma_bufs`, the strip's luma rows
-    /// and its chroma rows, at `planes`' pitches; `Err` says why not.
+    /// A linear VA surface of `size` over `dma_buf`, the strip's luma rows
+    /// and its chroma rows, at `planes`' pitches, as `write` says the driver
+    /// takes it: each plane at its alignment from the dma-buf's first byte,
+    /// and the luma plane at that byte where it says whole rows; `Err` says
+    /// why not.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         display: &Display,
         format: SurfaceFormat,
         (width, rows): (u32, u32),
         top: u32,
-        dma_bufs: [SurfaceDmaBuf; 2],
+        dma_buf: SurfaceDmaBuf,
         [luma, chroma]: [TargetPlane; 2],
+        write: ImportWrite,
     ) -> Result<Self, String> {
         let past = || "a buffer past 4 GiB".to_owned();
-        let (Some(&luma_at), Some(&chroma_at)) =
-            (dma_bufs[0].offsets.first(), dma_bufs[1].offsets.first())
+        let alignment = write.alignment;
+        let (Some(&luma_at), Some(&chroma_at)) = (dma_buf.offsets.first(), dma_buf.offsets.get(1))
         else {
-            return Err("the host's dma-bufs hold no planes".to_owned());
+            return Err("the host's dma-buf holds no planes".to_owned());
         };
         if [luma_at, chroma_at]
             .iter()
-            .any(|at| at % ALIGNMENT as u64 != 0)
+            .any(|at| at % alignment as u64 != 0)
         {
             return Err(format!(
-                "planes {} and {} bytes into their first page: radeonsi imports planes \
-                 {ALIGNMENT} bytes apart alone",
+                "planes {} and {} bytes into their first page: the driver imports planes \
+                 {alignment} bytes apart alone",
                 luma_at % 4096,
                 chroma_at % 4096
+            ));
+        }
+        if write.whole_rows && luma_at != 0 {
+            return Err(format!(
+                "a luma plane {} bytes into its first page: the driver writes a luma plane at a \
+                 page's start alone, its chroma plane whole rows after it",
+                luma_at % 4096
+            ));
+        }
+        let luma_pitch = luma.bytes_per_row as u64;
+        if write.whole_rows
+            && (luma_pitch == 0
+                || chroma.bytes_per_row != luma.bytes_per_row
+                || !chroma_at.is_multiple_of(luma_pitch))
+        {
+            return Err(format!(
+                "a chroma plane {chroma_at} bytes past the luma's first, at rows of {} bytes: the \
+                 driver writes a luma plane at a page's start alone, its chroma plane whole rows \
+                 after it",
+                chroma.bytes_per_row
             ));
         }
         let (Ok(luma_at), Ok(chroma_at)) = (u32::try_from(luma_at), u32::try_from(chroma_at))
@@ -522,24 +619,22 @@ impl Strip {
             fourcc: format.fourcc(),
             width,
             height: rows,
-            num_objects: 2,
+            num_objects: 1,
             num_layers: 1,
             ..Default::default()
         };
-        for (object, dma_buf) in descriptor.objects.iter_mut().zip(&dma_bufs) {
-            *object = ffi::VADRMPRIMESurfaceObject {
-                fd: dma_buf.fd.as_raw_fd(),
-                size: u32::try_from(dma_buf.size).map_err(|_| past())?,
-                drm_format_modifier: ffi::DRM_FORMAT_MOD_LINEAR,
-            };
-        }
+        descriptor.objects[0] = ffi::VADRMPRIMESurfaceObject {
+            fd: dma_buf.fd.as_raw_fd(),
+            size: u32::try_from(dma_buf.size).map_err(|_| past())?,
+            drm_format_modifier: ffi::DRM_FORMAT_MOD_LINEAR,
+        };
         descriptor.layers[0] = ffi::VADRMPRIMESurfaceLayer {
             drm_format: match format {
                 SurfaceFormat::Nv12 => ffi::DRM_FORMAT_NV12,
                 SurfaceFormat::P010 => ffi::DRM_FORMAT_P010,
             },
             num_planes: 2,
-            object_index: [0, 1, 0, 0],
+            object_index: [0, 0, 0, 0],
             offset: [luma_at, chroma_at, 0, 0],
             pitch: [pitch(luma.bytes_per_row), pitch(chroma.bytes_per_row), 0, 0],
         };
@@ -578,12 +673,12 @@ impl Strip {
             })
             .map_err(|error| format!("no import of the buffer: {error}"))?;
         check("vaCreateSurfaces (a guest buffer)", created)
-            .map_err(|error| format!("radeonsi refused the buffer: {error}"))?;
+            .map_err(|error| format!("the driver refused the buffer: {error}"))?;
         Ok(Self {
             surface,
             top,
             rows,
-            dma_bufs: dma_bufs.map(|dma_buf| dma_buf.fd),
+            dma_buf: dma_buf.fd,
         })
     }
 }
@@ -598,22 +693,25 @@ mod tests {
     fn strips_cover_the_rows_once_on_chroma_rows() {
         for height in [2, 16, 360, 720, 1080, 2160, 4352] {
             for count in 1..=40 {
-                let strips: Vec<_> = strip_rows(height, count).collect();
-                assert!(strips.len() <= count as usize, "{height} in {count}");
-                let mut next = 0;
-                for (top, rows) in strips {
-                    assert_eq!(top, next);
-                    assert!(
-                        top % 2 == 0 && rows % 2 == 0 && rows > 0,
-                        "{height} in {count}"
-                    );
-                    next = top + rows;
+                for unit in [1, 2, 16, 32, 64] {
+                    let strips: Vec<_> = strip_rows(height, count, unit).collect();
+                    assert!(strips.len() <= count as usize, "{height} in {count}");
+                    let mut next = 0;
+                    for (top, rows) in strips {
+                        assert_eq!(top, next);
+                        assert!(
+                            top % 2 == 0 && rows % 2 == 0 && rows > 0,
+                            "{height} in {count}"
+                        );
+                        assert_eq!(top % unit, 0, "{height} in {count} of {unit}");
+                        next = top + rows;
+                    }
+                    assert_eq!(next, height);
                 }
-                assert_eq!(next, height);
             }
         }
         assert_eq!(
-            strip_rows(2160, 7).collect::<Vec<_>>(),
+            strip_rows(2160, 7, 1).collect::<Vec<_>>(),
             [
                 (0, 310),
                 (310, 310),
@@ -624,5 +722,21 @@ mod tests {
                 (1860, 300)
             ]
         );
+    }
+
+    /// With rows of whole alignments, a strip's luma rows start a page wherever the buffer's
+    /// first does: its rows a multiple of those after which a row of `pitch` bytes starts one.
+    #[test]
+    fn strips_of_whole_rows_start_their_luma_rows_at_a_page() {
+        for pitch in [1920, 2048, 2176, 3840, 3904, 7680, 1344] {
+            let unit = u32::try_from(PAGE / gcd(pitch, PAGE)).unwrap();
+            for count in 1..=8 {
+                for (top, _) in strip_rows(2160, count, unit) {
+                    assert_eq!(top as usize * pitch % PAGE, 0, "rows of {pitch} in {count}");
+                }
+            }
+        }
+        assert_eq!(gcd(3840, PAGE), 256);
+        assert_eq!(gcd(1344, PAGE), 64);
     }
 }

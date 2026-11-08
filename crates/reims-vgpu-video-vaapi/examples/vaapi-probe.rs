@@ -25,7 +25,7 @@ mod linux {
     use reims_vgpu_video_core::runtime::StdRuntime;
     use std::process::ExitCode;
 
-    use reims_vgpu_video_vaapi::{Display, proc_filter_name, rt_format_names};
+    use reims_vgpu_video_vaapi::{Display, ImportWrite, proc_filter_name, rt_format_names};
 
     pub(crate) fn main() -> ExitCode {
         let mut nodes: Vec<String> = std::env::args().skip(1).collect();
@@ -66,7 +66,21 @@ mod linux {
     }
 
     fn probe(node: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let display = Display::open(node, StdRuntime::shared())?;
+        let runtime = StdRuntime::shared();
+        // Opened twice: the first open in the process, and one after it, each with the time
+        // its import check took.
+        let mut opens = Vec::new();
+        let mut display = None;
+        for _ in 0..2 {
+            let start = runtime.now();
+            let opened = Display::open(node, StdRuntime::shared())?;
+            let took = runtime.now().saturating_duration_since(start);
+            opens.push((took, opened.import_writes().took_each()));
+            display = Some(opened);
+        }
+        let Some(display) = display else {
+            return Ok(());
+        };
         let caps = display.capabilities()?;
         println!("== {node}");
         println!(
@@ -153,6 +167,34 @@ mod linux {
         }
         let images: Vec<String> = caps.image_formats.iter().map(ToString::to_string).collect();
         println!("images {}", images.join(","));
+        let writes = display.import_writes();
+        let said = |answer: Result<ImportWrite, String>| match answer {
+            Ok(ImportWrite {
+                alignment,
+                whole_rows: false,
+            }) => format!("at {alignment}-byte rows and planes"),
+            Ok(ImportWrite {
+                alignment,
+                whole_rows: true,
+            }) => format!("at {alignment}-byte rows and planes, rows of whole {alignment}s"),
+            Err(why) => format!("none ({why})"),
+        };
+        println!(
+            "import writes: NV12 {}; P010 {}",
+            said(writes.nv12()),
+            said(writes.p010())
+        );
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        for (n, (open, [nv12, p010])) in opens.iter().enumerate() {
+            println!(
+                "open {}: {:.2} ms, the import check {:.2} ms of it (NV12 {:.2}, P010 {:.2})",
+                n + 1,
+                ms(*open),
+                ms(*nv12 + *p010),
+                ms(*nv12),
+                ms(*p010)
+            );
+        }
         Ok(())
     }
 }

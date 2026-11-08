@@ -62,7 +62,7 @@ pub(crate) struct HostMemory {
     /// The dma-buf, which a VA import takes.
     dma_buf: OwnedFd,
     /// The memfd behind it, kept open as long as the mapping.
-    _memfd: File,
+    memfd: File,
     map: *mut u8,
     len: usize,
 }
@@ -100,25 +100,7 @@ impl HostMemory {
         if unsafe { fcntl(memfd.as_raw_fd(), F_ADD_SEALS, F_SEAL_SHRINK) } < 0 {
             return Err(io_error("sealing the memfd"));
         }
-        let device = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/udmabuf")
-            .map_err(|e| Error::Unsupported(format!("/dev/udmabuf: {e}")))?;
-        let create = UdmabufCreate {
-            memfd: u32::try_from(memfd.as_raw_fd()).unwrap_or(u32::MAX),
-            flags: UDMABUF_FLAGS_CLOEXEC,
-            offset: 0,
-            size: u64::try_from(len).unwrap_or(u64::MAX),
-        };
-        // SAFETY: the request's argument is a `struct udmabuf_create`,
-        // which lives for the call.
-        let dma_buf = unsafe { ioctl(device.as_raw_fd(), UDMABUF_CREATE, &raw const create) };
-        if dma_buf < 0 {
-            return Err(io_error("UDMABUF_CREATE"));
-        }
-        // SAFETY: a descriptor the ioctl just returned, owned from here.
-        let dma_buf = unsafe { OwnedFd::from_raw_fd(dma_buf) };
+        let dma_buf = udmabuf(&memfd, 0, len)?;
         // SAFETY: a shared mapping of the whole memfd, which is `len` bytes.
         let map = unsafe {
             mmap(
@@ -135,7 +117,7 @@ impl HostMemory {
         }
         Ok(Self {
             dma_buf,
-            _memfd: memfd,
+            memfd,
             map: map.cast(),
             len,
         })
@@ -163,6 +145,53 @@ impl HostMemory {
         // over, so nothing writes them while they are borrowed.
         unsafe { core::slice::from_raw_parts(self.map, self.len) }
     }
+
+    /// Its bytes, to write before the GPU does. The caller has no GPU work
+    /// on them in flight.
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `len` mapped bytes, alive until drop, borrowed mutably
+        // with the value, and no GPU work writes them meanwhile.
+        unsafe { core::slice::from_raw_parts_mut(self.map, self.len) }
+    }
+
+    /// Another dma-buf, of the `len` bytes from `offset`, whole pages of the
+    /// memfd: as the host's dma-buf of some of a guest buffer's pages is.
+    pub(crate) fn dma_buf_of_pages(&self, offset: usize, len: usize) -> Result<OwnedFd, Error> {
+        if !offset.is_multiple_of(PAGE)
+            || !len.is_multiple_of(PAGE)
+            || offset.saturating_add(len) > self.len
+        {
+            return Err(Error::Unsupported(format!(
+                "a dma-buf of {len} bytes at {offset} of {} bytes of host memory",
+                self.len
+            )));
+        }
+        udmabuf(&self.memfd, offset, len)
+    }
+}
+
+/// A dma-buf of the `len` bytes of `memfd` from `offset`, whole pages, made
+/// by udmabuf.
+fn udmabuf(memfd: &File, offset: usize, len: usize) -> Result<OwnedFd, Error> {
+    let device = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/udmabuf")
+        .map_err(|e| Error::Unsupported(format!("/dev/udmabuf: {e}")))?;
+    let create = UdmabufCreate {
+        memfd: u32::try_from(memfd.as_raw_fd()).unwrap_or(u32::MAX),
+        flags: UDMABUF_FLAGS_CLOEXEC,
+        offset: u64::try_from(offset).unwrap_or(u64::MAX),
+        size: u64::try_from(len).unwrap_or(u64::MAX),
+    };
+    // SAFETY: the request's argument is a `struct udmabuf_create`, which
+    // lives for the call.
+    let dma_buf = unsafe { ioctl(device.as_raw_fd(), UDMABUF_CREATE, &raw const create) };
+    if dma_buf < 0 {
+        return Err(io_error("UDMABUF_CREATE"));
+    }
+    // SAFETY: a descriptor the ioctl just returned, owned from here.
+    Ok(unsafe { OwnedFd::from_raw_fd(dma_buf) })
 }
 
 impl Drop for HostMemory {

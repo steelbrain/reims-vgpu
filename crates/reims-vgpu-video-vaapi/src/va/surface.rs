@@ -57,7 +57,7 @@ impl SurfaceFormat {
     }
 
     /// Bits a pixel takes, over both planes.
-    fn bits_per_pixel(self) -> u32 {
+    pub(crate) fn bits_per_pixel(self) -> u32 {
         match self {
             Self::Nv12 => 12,
             Self::P010 => 24,
@@ -411,6 +411,11 @@ impl Surface {
         self.pool.format
     }
 
+    /// Its width and height: its pool's, the decoded (coded) picture's.
+    pub(crate) fn size(&self) -> (u32, u32) {
+        (self.pool.width, self.pool.height)
+    }
+
     /// The display it is on.
     pub(crate) fn display(&self) -> &Display {
         &self.pool.display
@@ -644,7 +649,9 @@ impl PoolInner {
             Some(ReadbackWay::Mapped) => Readback::Mapped(Mappings::default()),
             Some(ReadbackWay::Derive) => Readback::Derive,
             Some(ReadbackWay::GetImage) => self.image_readback(),
-            None if let Err(why) = self.display.writes_imports() => {
+            // The staged surface's planes are whole rows from its first byte at rows of 256
+            // bytes, which a driver that writes rows of whole alignments alone takes too.
+            None if let Err(why) = self.display.writes_imports(self.format) => {
                 log::info!(
                     "no staged copy back for {} {}x{} frames, so they come back through \
                      vaGetImage: {why}",
