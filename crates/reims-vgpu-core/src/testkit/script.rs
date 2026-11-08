@@ -10,8 +10,8 @@
 //! - `Raise`: Metal raised an `NSException`, a raise at the selector (`Raise::foreign`), decided
 //!   by the send's [`Policy`], the label the metal crate's message layer gives the same send:
 //!   `Err(Raise)`, or a death at the send;
-//! - `Die`: Metal, IOGPU or the driver crashed, which ends the process whatever thread it is on
-//!   (an isolated task's too): a death marker;
+//! - `Die`: Metal, IOGPU or the driver crashed, which ends the process whatever thread it is on:
+//!   a death marker;
 //! - `Hold`: the call takes as long as the test makes it, on the thread that made it (a driver's
 //!   cold pipeline make inside a draw, say), and then the model answers ([`HeldCall`]).
 
@@ -414,9 +414,6 @@ impl Script {
 
     /// [`Script::next`] for a call of `sel` on an object (or class) of `class`.
     pub fn next_for(&self, obj: ObjId, class: &str, sel: &str) -> Step {
-        // As the metal crate's message layer: a thread of an isolated task that has ended stops
-        // at its next call (here, at the script's lookup, after a logged call is logged).
-        crate::tasks::isolation::life::stop_if_task_ended();
         let mut g = self.entries.lock();
         let pos = g.iter().position(|e| {
             e.obj.is_none_or(|o| o == obj)

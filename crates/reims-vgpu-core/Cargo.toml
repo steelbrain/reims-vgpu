@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-core"
-description = "All of the library's behaviour, generic over the platform; links no Apple framework"
+description = "What the platforms and the graphics device share, generic over the platform; links no Apple framework"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,9 +16,6 @@ testkit = []
 parking_lot.workspace = true
 zerocopy.workspace = true
 log.workspace = true
-
-[target.'cfg(loom)'.dependencies]
-loom.workspace = true
 
 [lints]
 workspace = true

@@ -137,12 +137,8 @@ pub fn default_driver_sizes() -> [Option<u64>; 4] {
 #[derive(Debug)]
 pub struct GuestMemoryLease;
 
-/// The lease of the guest's RAM a device holds: nothing on Mach ([`GuestMemoryLease`]). A
-/// device's dirty log is not used: the Mac's GPUs read the guest's RAM in place.
-pub fn lease_guest_memory(
-    _: impl IntoIterator<Item = super::GuestRamFile>,
-    _: Option<std::sync::Arc<reims_vgpu_core::memory::dirty::DirtyLog>>,
-) -> GuestMemoryLease {
+/// The lease of the guest's RAM a device holds: nothing on Mach ([`GuestMemoryLease`]).
+pub fn lease_guest_memory(_: impl IntoIterator<Item = super::GuestRamFile>) -> GuestMemoryLease {
     GuestMemoryLease
 }
 
@@ -237,7 +233,7 @@ pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64, _twin: bool) 
 /// # Safety
 ///
 /// `rt::HostMemory::new`'s contract, for the memory at `at`.
-pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>, _logged: bool) -> rt::HostMemory {
+pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>) -> rt::HostMemory {
     // SAFETY: the caller's.
     let memory = unsafe { rt::HostMemory::new(at) };
     #[cfg(test)]
@@ -278,11 +274,10 @@ pub(crate) fn refusing_imports<T>(call: impl FnOnce() -> T) -> T {
 /// [`host_memory`]'s.
 pub(crate) unsafe fn host_memory_vouched(
     at: std::ptr::NonNull<u8>,
-    logged: bool,
     _vouched: bool,
 ) -> rt::HostMemory {
     // SAFETY: the caller's.
-    unsafe { host_memory(at, logged) }
+    unsafe { host_memory(at) }
 }
 
 /// Why this thread's last dma-buf source made none: never, on macOS, where imports carry none.
@@ -519,7 +514,7 @@ pub(crate) fn recorded_mut<T>(
 
 /// The key of a surface's record, its `IOSurfaceID`: every object over the same IOSurface
 /// answers it, each a reference of its own. Measured on the M3 Max: a lookup in this process
-/// (`IOSurfaceLookupFromMachPort`, which an isolated task's surface is, and `IOSurfaceLookup`)
+/// (`IOSurfaceLookupFromMachPort` and `IOSurfaceLookup`)
 /// answers a new reference each time, of the same ID and base address.
 type SurfaceKey = u32;
 

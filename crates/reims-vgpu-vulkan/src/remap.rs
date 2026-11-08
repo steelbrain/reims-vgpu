@@ -8,13 +8,13 @@
 //! `rt::Device::host_range_remapped`, which [`crate::gpu::device::host_range_remapped`] calls on
 //! every device of the process.
 //!
-//! A host address takes new pages through one of two hands, and each reports what it changed,
+//! A host address takes new pages through core's Mach VM calls, and each reports what it changed,
 //! with the call's own arguments and answer passed through unchanged. A call that maps reports
 //! after it, and one that unmaps before it, at the unmap: a mapping that reports nothing (an
 //! IOSurface's, `malloc`'s) could take the freed address between the unmap and a later report,
 //! while a live buffer still lies in an import of the old pages there:
 //! - **Core's Mach VM calls** ([`VulkanVm`], the platform's `HostVm`): a memory map's mappings
-//!   (`remap_shared_overwrite`), a mapping task's unmaps (`allocate_fixed_overwrite`), every
+//!   (`remap_shared_overwrite`), fixed overwrites (`allocate_fixed_overwrite`), every
 //!   mapping's teardown, core's detach temporaries among them (`deallocate`, before the call:
 //!   one Mach refuses reports pages that did not change, which only has a later buffer over
 //!   them import them anew), and fresh ranges, which may lie where others were freed
@@ -22,15 +22,6 @@
 //!   ([`length_pages`], [`pages`]): a fixed overwrite's and a remap's length rounded up to whole
 //!   pages from the page of the address, a deallocate's every page its bytes touch; a call of no
 //!   bytes changes none. `protect_max` changes no pages.
-//! - **The host's task and memory blocks** in a device without a memory map ([`reporting`],
-//!   `Platform::host_blocks`), where the host does the mapping work: `createTask` reports its
-//!   task's whole range, as the host may hand back addresses it freed before; `mapMemory` the
-//!   ranges' summed length from the task's base plus the offset, as a map over mapped pages
-//!   replaces them; `unmapMemory` its range, before the host's block; `destroyTask` the task's
-//!   whole range, before the host's block, the task taken out of the wrapper's table first: once
-//!   the host freed it, a `createTask` on another thread may answer the same handle, whose entry is
-//!   the new task's. One wrapper covers the root, local and EFI tasks and every caller, a no-copy
-//!   buffer's deallocator among them.
 //!
 //! The platform's own Mach VM calls in [`crate::gpu::backing`] report nothing: an alias's
 //! mapping (`gather`), the block of zeros, and an alias's release; nor do those of Linux's
@@ -52,8 +43,8 @@
 //! a mapping of its own there, measured), at no offset into its allocation and with GPU writes that
 //! reach its memory (the others lie over an alias): one made after the host replaced the pages lies
 //! in a live one's import, over the old pages, and what Metal's texture on such a surface reads
-//! then is not measured. An isolated task's detached buffers and heaps lie in aliases of their own,
-//! fresh at each attach ([`crate::gpu::backing`]), never there.
+//! then is not measured. Detached buffers and heaps lie in aliases of their own, fresh at each
+//! attach ([`crate::gpu::backing`]), never there.
 //!
 //! **Unmaps an import waits for** ([`UnmapHold`]). The runtime runs a no-copy buffer's
 //! deallocator, given with a keep-alive, as the buffer is released, Metal's moment, and then
@@ -79,13 +70,12 @@
 //!   lock and returns. The hold's drop takes the same lock, takes the unmaps no hold meets any
 //!   more, lets the lock go, and unmaps them (`munmap` or `mach_vm_deallocate`), calling nothing
 //!   else. So neither side waits for another thread, and no thread can wait on a hold whose drop
-//!   needs it, or a thread it blocks: not core's FIFO threads, which release buffers and so may
-//!   run core's deallocators, nor a vCPU thread of QEMU's that holds its BQL inside a call of
-//!   the C API. The calls of `deallocate` are core's: a mapping's last release on the thread that
-//!   lets it go (a FIFO thread, an isolated task's thread, the host's thread inside a call, or the
-//!   runtime's thread that runs a buffer's deallocator, the releasing thread or one of its
-//!   handler threads as a command buffer completes), a detach temporary's, a failed map's, and
-//!   a mapping task's whole range at its release. The holds go on the runtime's thread that frees
+//!   needs it, or a thread it blocks: not the graphics device's threads, which release buffers and
+//!   so may run core's deallocators, nor a vCPU thread of QEMU's that holds its BQL inside a call
+//!   of the C API. The calls of `deallocate` are core's: a mapping's last release on the thread
+//!   that lets it go (a device thread, the host's thread inside a call, or the runtime's thread
+//!   that runs a buffer's deallocator, the releasing thread or one of its handler threads as a
+//!   command buffer completes), a detach temporary's and a failed map's. The holds go on the runtime's thread that frees
 //!   the import: the releasing thread, or a handler thread once the last command buffer that held
 //!   the import completed, or the creating thread where the runtime refused the call.
 //! - **What it keeps.** The pages stay mapped, at their address, until the hold goes: the kernel
@@ -94,13 +84,9 @@
 //!   pages out of it (`Holds::replaced`). A released hold's unmaps run from the decision to the
 //!   unmap in one order with the fixed overwrites ([`OVERWRITES`]), so an overwrite never lands
 //!   between them, to be unmapped with the pages that waited there.
-//! - **What is not ours to unmap**: memory a no-copy buffer lies in whose unmap is the host's or
-//!   the system's, which no hold defers: the host's own mapping in a device without a memory map
-//!   (`unmapMemory`, the blocks setup; QEMU passes a memory map, so a guest under QEMU never
-//!   reaches it, and only the suite's runner makes the blocks setup), and on macOS an IOSurface's
-//!   memory that a buffer over it at no offset imports as it is (core's buffer over a guest's
-//!   IOSurface, `MapperRef`, whichever guest maps one). There the deallocator (the host's unmap,
-//!   the surface's release) may unmap the pages before the free, in the same release, or, where
+//! - **What is not ours to unmap**: memory a no-copy buffer lies in whose unmap is the system's,
+//!   which no hold defers: on macOS an IOSurface's memory that a buffer over it at no offset
+//!   imports as it is. There the deallocator (the surface's release) may unmap the pages before the free, in the same release, or, where
 //!   a command buffer submitted before a texture over them was released still holds the import,
 //!   until it completes. Ground: MoltenVK's no-copy buffer keeps the pages it was made over,
 //!   which Metal wires as it makes the buffer (`tests/no_copy_remap.rs` measures a remap under
@@ -116,9 +102,7 @@
 //!   lists every import in every submission: once a file's pages are mapped under one, every
 //!   submission of the device fails, the runtime answering
 //!   `DeviceLost`, and other pages with no file behind them are what the GPU reads from then
-//!   (measured on both, Mesa 26.2.4). So on RADV a host of the blocks setup whose task memory
-//!   has no file behind it has the GPU read what it maps under a live buffer, and loses the
-//!   device where that is a file's pages. On Linux the surface stand-in's own memory and views
+//!   (measured on both, Mesa 26.2.4). On Linux the surface stand-in's own memory and views
 //!   (`os::linux::surface`) are held until the free, by the keep-alive of a buffer over a surface
 //!   at no offset (`surface_memory_hold`). A surface over a single range of the guest's pages
 //!   maps nothing: core makes one only over a page of the host's own RAM ("Not reported",
@@ -129,21 +113,15 @@
 //!   unmapped failed with `EFAULT`, which ANV answers as the device lost.
 //!
 //! What a report costs, measured on the M3 Max (release build, 100,000 calls, three runs): with
-//! no no-copy buffer live, about 11 ns per wrapped block call, the task lookup and the runtime's
-//! early return, and nothing a 270 ns `mach_vm_deallocate` shows above its noise; with 1,000
-//! live no-copy buffers the runtime imported, 40 to 62 ns per `deallocate` and 57 to 70 ns per
-//! wrapped `mapMemory` or `unmapMemory`, beside the host's own call.
+//! no no-copy buffer live, nothing a 270 ns `mach_vm_deallocate` shows above its noise; with
+//! 1,000 live no-copy buffers the runtime imported, 40 to 62 ns per `deallocate`.
 
 #[cfg(test)]
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::ops::Range;
 use std::ptr::NonNull;
-use std::sync::Arc;
 
-use reims_vgpu_core::host::{
-    CreateTask, DestroyTask, HostBlocks, HostPtr, HostTask, MapMemory, UnmapMemory,
-};
+use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
 use reims_vgpu_core::sync::Mutex;
@@ -153,9 +131,6 @@ use crate::os::OsVm;
 mod holds;
 
 use holds::Holds;
-
-/// What a report tells: the pages under the given host bytes were replaced.
-pub(crate) type Report = Arc<dyn Fn(HostPtr, u64) + Send + Sync>;
 
 /// The pages `len` bytes at `addr` touch, as Mach's `deallocate` takes them: from the page of
 /// `addr` to the page past its last byte; none for no bytes.
@@ -186,7 +161,7 @@ fn length_pages(addr: HostAddr, len: u64, page: u64) -> (HostPtr, u64) {
 
 /// Core's mappings of the guest's pages, for tests ([`guest_mappings_of`]): every remap through
 /// [`VulkanVm`] is one of core's memory map's guest pages, which it maps afresh for a no-copy
-/// buffer over a task's pages. Each run of a mapping's host bytes, keyed by its first byte, with
+/// buffer over them. Each run of a mapping's host bytes, keyed by its first byte, with
 /// its end and the first byte of the pages it shows, as the memory map names them, from the remap
 /// to the unmap. The runs share no byte. A leaf lock: nothing is called under it.
 #[cfg(test)]
@@ -477,97 +452,9 @@ impl HostVm for VulkanVm {
     }
 }
 
-/// The base and size of each task the host's `createTask` made, until its `destroyTask`. A leaf
-/// lock: nothing is called under it.
-#[derive(Default)]
-struct Tasks(Mutex<HashMap<HostTask, (HostPtr, u64)>>);
-
-impl Tasks {
-    /// The base of `task`, or `None` for a task `createTask` did not answer.
-    fn base(&self, task: HostTask) -> Option<HostPtr> {
-        self.0.lock().get(&task).map(|&(base, _)| base)
-    }
-}
-
-/// The host's task and memory blocks, each that changes pages then reporting to `report`
-/// (module docs). Each wrapper calls the host's block once per call, with the same arguments,
-/// answers its answer, and holds no other block, so the blocks release as the host's own do; a
-/// nil block stays nil, and the other blocks are the host's own.
-pub(crate) fn reporting(blocks: HostBlocks, report: Report) -> HostBlocks {
-    let tasks = Arc::new(Tasks::default());
-    let HostBlocks {
-        raise_interrupt,
-        create_task,
-        destroy_task,
-        map_memory,
-        unmap_memory,
-        read_memory,
-        add_trace_range,
-        remove_trace_range,
-    } = blocks;
-    let create_task = create_task.map(|host| -> CreateTask {
-        let (tasks, report) = (Arc::clone(&tasks), Arc::clone(&report));
-        Arc::new(move |size, base: &mut HostPtr| {
-            let task = host(size, base);
-            if !task.is_null() {
-                tasks.0.lock().insert(task, (*base, size));
-                report(*base, size);
-            }
-            task
-        })
-    });
-    let destroy_task = destroy_task.map(|host| -> DestroyTask {
-        let (tasks, report) = (Arc::clone(&tasks), Arc::clone(&report));
-        Arc::new(move |task| {
-            // Out of the table before the host frees the task, and reported at the unmap
-            // (module docs).
-            let gone = tasks.0.lock().remove(&task);
-            if let Some((base, size)) = gone {
-                report(base, size);
-            }
-            host(task);
-        })
-    });
-    let map_memory = map_memory.map(|host| -> MapMemory {
-        let (tasks, report) = (Arc::clone(&tasks), Arc::clone(&report));
-        Arc::new(move |task, count, offset, read_only, ranges| {
-            let mapped = host(task, count, offset, read_only, ranges);
-            if let Some(base) = tasks.base(task) {
-                let length = ranges
-                    .iter()
-                    .take(count.to_usize())
-                    .fold(0u64, |sum, r| sum.saturating_add(r.physical_length));
-                report(base.wrapping_add(offset), length);
-            }
-            mapped
-        })
-    });
-    let unmap_memory = unmap_memory.map(|host| -> UnmapMemory {
-        let (tasks, report) = (Arc::clone(&tasks), Arc::clone(&report));
-        Arc::new(move |task, offset, length| {
-            if let Some(base) = tasks.base(task) {
-                report(base.wrapping_add(offset), length);
-            }
-            host(task, offset, length)
-        })
-    });
-    HostBlocks {
-        raise_interrupt,
-        create_task,
-        destroy_task,
-        map_memory,
-        unmap_memory,
-        read_memory,
-        add_trace_range,
-        remove_trace_range,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-
-    use reims_vgpu_core::host::{HostTraceRange, PhysicalMemoryRange};
 
     use super::*;
 
@@ -667,163 +554,6 @@ mod tests {
         }
     }
 
-    /// What the host's fake blocks were called with, in order.
-    type Calls = Arc<Mutex<Vec<String>>>;
-
-    /// Fake host blocks: `createTask` answers task 7 at `0x1_0000_0000` for a size of 0x100000
-    /// and NULL otherwise, `mapMemory` true and `unmapMemory` false; each records its call.
-    fn host(calls: &Calls) -> HostBlocks {
-        let c = Arc::clone(calls);
-        let create: CreateTask = Arc::new(move |size, base| {
-            c.lock().push(format!("create {size:#x}"));
-            if size != 0x10_0000 {
-                return HostTask::NULL;
-            }
-            *base = HostPtr::from_addr(0x1_0000_0000);
-            HostTask::from_addr(7)
-        });
-        let c = Arc::clone(calls);
-        let destroy: DestroyTask = Arc::new(move |task| {
-            c.lock().push(format!("destroy {}", task.addr()));
-        });
-        let c = Arc::clone(calls);
-        let map: MapMemory = Arc::new(move |task, count, offset, read_only, ranges| {
-            c.lock().push(format!(
-                "map {} {count} {offset:#x} {read_only} {}",
-                task.addr(),
-                ranges.len()
-            ));
-            true
-        });
-        let c = Arc::clone(calls);
-        let unmap: UnmapMemory = Arc::new(move |task, offset, length| {
-            c.lock()
-                .push(format!("unmap {} {offset:#x} {length:#x}", task.addr()));
-            false
-        });
-        HostBlocks {
-            create_task: Some(create),
-            destroy_task: Some(destroy),
-            map_memory: Some(map),
-            unmap_memory: Some(unmap),
-            ..HostBlocks::default()
-        }
-    }
-
-    /// The wrapped blocks call the host's with the same arguments and answer its answers, and
-    /// report what each changed: a task's whole range after its creation and before its
-    /// destruction, a map's summed length and an unmap's range from the task's base plus the
-    /// offset, after them; nothing for a task the host did not make, or one destroyed
-    #[test]
-    fn the_blocks_report_what_the_host_changed() {
-        let calls = Calls::default();
-        let c = Arc::clone(&calls);
-        let b = reporting(
-            host(&calls),
-            Arc::new(move |at, length| {
-                c.lock()
-                    .push(format!("report {:#x} {length:#x}", at.addr()));
-            }),
-        );
-        let (create, destroy) = (b.create_task.unwrap(), b.destroy_task.unwrap());
-        let (map, unmap) = (b.map_memory.unwrap(), b.unmap_memory.unwrap());
-        let mut at = HostPtr::NULL;
-        assert!(create(0x2000, &mut at).is_null());
-        let task = create(0x10_0000, &mut at);
-        assert_eq!(
-            (task, at),
-            (HostTask::from_addr(7), HostPtr::from_addr(0x1_0000_0000))
-        );
-        let range = |length| PhysicalMemoryRange {
-            physical_address: 0x8000_0000,
-            physical_length: length,
-        };
-        let ranges = [range(0x4000), range(0x8000), range(0x10000)];
-        assert!(map(task, 2, 0x8000, true, &ranges));
-        assert!(!unmap(task, 0xc000, 0x4000));
-        let stranger = HostTask::from_addr(9);
-        assert!(map(stranger, 1, 0, false, &ranges));
-        assert!(!unmap(stranger, 0, 0x4000));
-        destroy(task);
-        assert!(!unmap(task, 0, 0x4000));
-        assert_eq!(
-            *calls.lock(),
-            [
-                "create 0x2000",
-                "create 0x100000",
-                "report 0x100000000 0x100000",
-                "map 7 2 0x8000 true 3",
-                "report 0x100008000 0xc000",
-                "report 0x10000c000 0x4000",
-                "unmap 7 0xc000 0x4000",
-                "map 9 1 0x0 false 3",
-                "unmap 9 0x0 0x4000",
-                "report 0x100000000 0x100000",
-                "destroy 7",
-                "unmap 7 0x0 0x4000",
-            ]
-        );
-    }
-
-    /// A handle the host answers again once it freed the task, to a `createTask` on another
-    /// thread while the destroy is still in the host's block, is the new task's: the destroy
-    /// reports the old task's range alone, and the new task's maps report from its own base
-    #[test]
-    fn a_handle_answered_again_during_its_destroy_is_the_new_tasks() {
-        let calls = Calls::default();
-        let wrapped: Arc<std::sync::OnceLock<CreateTask>> = Arc::default();
-        let bases = Arc::new(Mutex::new(vec![0x2_0000_0000_usize, 0x1_0000_0000]));
-        let c = Arc::clone(&calls);
-        let create: CreateTask = Arc::new(move |size, base| {
-            *base = HostPtr::from_addr(bases.lock().pop().unwrap());
-            c.lock().push(format!("create {size:#x}"));
-            HostTask::from_addr(7)
-        });
-        let (c, w) = (Arc::clone(&calls), Arc::clone(&wrapped));
-        let destroy: DestroyTask = Arc::new(move |task| {
-            c.lock().push(format!("destroy {}", task.addr()));
-            // Another thread's createTask, in the host's destroy once it freed the task.
-            let mut base = HostPtr::NULL;
-            assert_eq!(w.get().unwrap()(0x4000, &mut base), task);
-        });
-        let map: MapMemory = Arc::new(|_, _, _, _, _| true);
-        let c = Arc::clone(&calls);
-        let b = reporting(
-            HostBlocks {
-                create_task: Some(create),
-                destroy_task: Some(destroy),
-                map_memory: Some(map),
-                ..HostBlocks::default()
-            },
-            Arc::new(move |at, length| {
-                c.lock()
-                    .push(format!("report {:#x} {length:#x}", at.addr()));
-            }),
-        );
-        let (create, destroy) = (b.create_task.unwrap(), b.destroy_task.unwrap());
-        assert!(wrapped.set(Arc::clone(&create)).is_ok());
-        let mut base = HostPtr::NULL;
-        let task = create(0x8000, &mut base);
-        destroy(task);
-        let range = PhysicalMemoryRange {
-            physical_address: 0x8000_0000,
-            physical_length: 0x4000,
-        };
-        assert!(b.map_memory.unwrap()(task, 1, 0x100, false, &[range]));
-        assert_eq!(
-            *calls.lock(),
-            [
-                "create 0x8000",
-                "report 0x100000000 0x8000",
-                "report 0x100000000 0x8000",
-                "destroy 7",
-                "create 0x4000",
-                "report 0x200000000 0x4000",
-                "report 0x200000100 0x4000",
-            ]
-        );
-    }
-
     /// A `deallocate` of pages a hold meets reports them at the call and answers success,
     /// leaving them mapped until the hold goes, which unmaps them; one of pages no hold meets
     /// unmaps at once. Unmapped pages may be mapped again at once by another test's thread, so
@@ -868,38 +598,5 @@ mod tests {
             gone(at) && gone(at.wrapping_add(page)),
             "unmapped as the hold went"
         );
-    }
-
-    /// A nil block stays nil, the blocks that change no pages are the host's own, and each
-    /// wrapper holds its own block alone: the host's blocks' last references stay where they
-    /// were
-    #[test]
-    fn the_blocks_hold_only_their_own() {
-        let calls = Calls::default();
-        let mut given = host(&calls);
-        given.unmap_memory = None;
-        given.read_memory = Some(Arc::new(|_, _, _| true));
-        given.raise_interrupt = Some(Arc::new(|_| ()));
-        given.add_trace_range = Some(Arc::new(|_, _| HostTraceRange::NULL));
-        given.remove_trace_range = Some(Arc::new(|_| ()));
-        let b = reporting(given.clone(), Arc::new(|_, _| ()));
-        assert!(b.unmap_memory.is_none());
-        fn same<T: ?Sized>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
-            matches!((a, b), (Some(a), Some(b)) if Arc::ptr_eq(a, b))
-        }
-        assert!(same(&b.read_memory, &given.read_memory));
-        assert!(same(&b.raise_interrupt, &given.raise_interrupt));
-        assert!(same(&b.add_trace_range, &given.add_trace_range));
-        assert!(same(&b.remove_trace_range, &given.remove_trace_range));
-        let count = |given: &HostBlocks| {
-            [
-                given.create_task.as_ref().map(Arc::strong_count),
-                given.destroy_task.as_ref().map(Arc::strong_count),
-                given.map_memory.as_ref().map(Arc::strong_count),
-            ]
-        };
-        assert_eq!(count(&given), [Some(2); 3]);
-        drop(b);
-        assert_eq!(count(&given), [Some(1); 3]);
     }
 }

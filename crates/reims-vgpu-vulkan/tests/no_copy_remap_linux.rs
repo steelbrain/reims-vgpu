@@ -29,9 +29,8 @@
 //! so these measure the ground `crate::remap`'s docs give for pages the library does not unmap.
 //!
 //! A buffer made after such a remap, over exactly the bytes of a live one the GPU used, takes the
-//! new pages where the runtime was told of the remap: by the platform's VM
-//! (`VulkanPlatform::vm`), or by the host's blocks the platform wraps (`Platform::host_blocks`).
-//! Untold, it lies in the live one's import, over the old pages where that import keeps them.
+//! new pages where the runtime was told of the remap, by the platform's VM
+//! (`VulkanPlatform::vm`). Untold, it lies in the live one's import, over the old pages where that import keeps them.
 //!
 //! On Linux a view can be made only of pages with a file behind them (`os::linux::vm`), so every
 //! range remapped here comes from the platform's `allocate_aliasable`, and the remaps no one is
@@ -49,10 +48,10 @@
     unsafe_code
 )]
 
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
-use reims_vgpu_core::host::{HostBlocks, HostPtr, HostTask, PhysicalMemoryRange};
+use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
 use reims_vgpu_core::platform::device::{GpuDevice, NoCopyDeallocator};
@@ -61,8 +60,6 @@ use reims_vgpu_core::platform::resource::Buffer;
 use reims_vgpu_core::platform::types::NsRange;
 use reims_vgpu_core::platform::{HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::os::OsVm;
 use reims_vgpu_vulkan::remap::VulkanVm;
@@ -72,15 +69,6 @@ type Device = <P as Platform>::Device;
 type BufferOf = <P as Platform>::Buffer;
 
 const LEN: u64 = 0x8000;
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl TaskLauncher<P> for NoLauncher {
-    fn launch(&self, _: &Arc<P>, _: Arc<dyn HostSide<P>>) -> Arc<dyn ServiceLink<P>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// A fresh range of `LEN` bytes a view can be made of, every one `byte`.
 fn region(byte: u8) -> HostPtr {
@@ -317,95 +305,18 @@ fn made_after_a_remap(dev: &Device, vm: &dyn HostVm) -> ([[u8; 2]; 3], Path) {
     seen
 }
 
-/// Host blocks that do the mapping work as a host does, with the OS's VM of their own:
-/// `createTask` reserves the task's range, `mapMemory` remaps each range's pages, whose
-/// `physicalAddress` is here the host address of pages to share, from the task's base plus the
-/// offset on, `unmapMemory` puts fresh zero pages over its range, and `destroyTask` deallocates
-/// the task's range.
-fn host_blocks() -> HostBlocks {
-    let task: Arc<Mutex<(HostPtr, u64)>> = Arc::default();
-    let (t, vm) = (Arc::clone(&task), OsVm::new());
-    let create = move |size, base: &mut HostPtr| {
-        *base = vm.allocate_anywhere(size).unwrap();
-        *t.lock() = (*base, size);
-        HostTask::from_addr(1)
-    };
-    let (t, vm) = (Arc::clone(&task), OsVm::new());
-    let destroy = move |_| {
-        let (base, size) = *t.lock();
-        assert!(vm.deallocate(base, size).is_success());
-    };
-    let (t, vm) = (Arc::clone(&task), OsVm::new());
-    let map = move |_, count: u32, offset: u64, _, ranges: &[PhysicalMemoryRange]| {
-        let mut at = t.lock().0.wrapping_add(offset);
-        for r in &ranges[..usize::try_from(count).unwrap()] {
-            let src = HostPtr::from_addr(usize::try_from(r.physical_address).unwrap());
-            vm.remap_shared_overwrite(at, src, r.physical_length)
-                .unwrap();
-            at = at.wrapping_add(r.physical_length);
-        }
-        true
-    };
-    let (t, vm) = (Arc::clone(&task), OsVm::new());
-    let unmap = move |_, offset: u64, length| {
-        let at = t.lock().0.wrapping_add(offset);
-        vm.allocate_fixed_overwrite(at, length).is_ok()
-    };
-    HostBlocks {
-        create_task: Some(Arc::new(create)),
-        destroy_task: Some(Arc::new(destroy)),
-        map_memory: Some(Arc::new(map)),
-        unmap_memory: Some(Arc::new(unmap)),
-        ..HostBlocks::default()
-    }
-}
-
-/// [`made_after`] the host's blocks unmapped the task's first `LEN` bytes and mapped other pages
-/// there, through `blocks` (the host's, or what the platform answered for them).
-fn made_after_the_host_remaps(dev: &Device, blocks: &HostBlocks) -> ([[u8; 2]; 3], Path) {
-    let (create, destroy) = (blocks.create_task.as_ref(), blocks.destroy_task.as_ref());
-    let (map, unmap) = (blocks.map_memory.as_ref(), blocks.unmap_memory.as_ref());
-    let pages = |at: HostPtr| PhysicalMemoryRange {
-        physical_address: at.addr().try_into().unwrap(),
-        physical_length: LEN,
-    };
-    let mut base = HostPtr::NULL;
-    let task = create.unwrap()(4 * LEN, &mut base);
-    let old = region(0xa1);
-    assert!(map.unwrap()(task, 1, 0, false, &[pages(old)]));
-    let seen = made_after(dev, base, || {
-        assert!(unmap.unwrap()(task, 0, LEN));
-        let new = region(0xe5);
-        assert!(map.unwrap()(task, 1, 0, false, &[pages(new)]));
-        new
-    });
-    destroy.unwrap()(task);
-    assert!(OsVm::new().deallocate(old, LEN).is_success());
-    seen
-}
-
 /// A buffer made over the bytes of a live one after a remap there takes the new pages where the
-/// runtime was told of it, by the platform's VM or the host's blocks the platform wraps; untold,
+/// runtime was told of it, by the platform's VM; untold,
 /// it lies in the live one's import, and where that import keeps its pages ([`unmeasured`]) the
 /// GPU reads what that one wrote and fills the old pages
 #[test]
 fn a_buffer_made_after_a_remap_the_runtime_was_told_of_takes_the_new_pages() {
     let dev = VulkanPlatform::system_default_device().unwrap();
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     assert_eq!(made_after_a_remap(&dev, p.vm()).0, SEEN);
-    let blocks = p.host_blocks(host_blocks());
-    assert_eq!(made_after_the_host_remaps(&dev, &blocks).0, SEEN);
-    let untold = [
-        ("the OS's VM", made_after_a_remap(&dev, &OsVm::new())),
-        (
-            "the host's blocks",
-            made_after_the_host_remaps(&dev, &host_blocks()),
-        ),
-    ];
-    for (label, (seen, path)) in untold {
-        match unmeasured(&dev, path) {
-            None => assert_eq!(seen, not_seen(0xc3), "{label}"),
-            Some(why) => eprintln!("{label}: not measured ({path:?}): {why}"),
-        }
+    let (seen, path) = made_after_a_remap(&dev, &OsVm::new());
+    match unmeasured(&dev, path) {
+        None => assert_eq!(seen, not_seen(0xc3), "the OS's VM"),
+        Some(why) => eprintln!("the OS's VM: not measured ({path:?}): {why}"),
     }
 }

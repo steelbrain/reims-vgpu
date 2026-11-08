@@ -155,8 +155,7 @@ impl Execution {
     /// The check the runtime's host step runs on each command it records of this execution,
     /// where its commit reads nothing (the module docs); `None` where no death could ask of its
     /// commands, which leaves the runtime its other paths. It dies where [`Execution::check`]
-    /// would, at `commit`, on the scheduler's thread, a thread of no isolated task's: the death
-    /// ends the process there, as `fatal` does outside the tests' in-process capture, and unwinds
+    /// would, at `commit`, on the scheduler's thread: the death ends the process there, as `fatal` does outside the tests' in-process capture, and unwinds
     /// nothing into the runtime. A death test's child runs without that capture, as production.
     /// With it, what the check looks for: draws of points where a state sizes them. An execution
     /// of a range

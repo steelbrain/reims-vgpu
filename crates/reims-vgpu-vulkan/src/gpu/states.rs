@@ -1945,12 +1945,8 @@ mod tests {
     fn indirect_functions() -> (VulkanFunction, VulkanFunction) {
         use crate::gpu::serialized::tests::fixture_function;
         (
-            fixture_function(include_bytes!(
-                "../../../../tests/shaders/vert.metallib"
-            )),
-            fixture_function(include_bytes!(
-                "../../../../tests/shaders/frag.metallib"
-            )),
+            fixture_function(include_bytes!("../../../../tests/shaders/vert.metallib")),
+            fixture_function(include_bytes!("../../../../tests/shaders/frag.metallib")),
         )
     }
 

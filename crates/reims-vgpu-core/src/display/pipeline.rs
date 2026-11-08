@@ -1,13 +1,10 @@
 //! A display's render pipelines, by the target's pixel format and whether there is a gamma
-//! table, and the pipelines its window draws over a frame with, by the target's pixel format
-//! ([`DisplayPipelineCache::overlay_for`]). Each table is looked up and set under its mutex, never
-//! iterated.
+//! table. The table is looked up and set under its mutex, never iterated.
 
 use crate::collections::LookupMap;
 use crate::display::DeathKind;
 use crate::platform::device::GpuDevice;
 use crate::platform::resource::Library;
-use crate::platform::types::{MtlScissorRect, MtlViewport};
 use crate::platform::values::RenderPipelineDesc;
 use crate::platform::{Handle, Platform};
 use crate::raise::OnFault;
@@ -21,8 +18,6 @@ pub const FRAGMENT_FUNCTION_GAMMA_COLOR_MATRIX: &str =
     "displayPresentFragmentWithGammaTableAndColorMatrix";
 /// The pipeline label.
 pub const PIPELINE_LABEL: &str = "reims-vgpu.display-present";
-/// The overlay pipeline's label.
-pub const OVERLAY_LABEL: &str = "reims-vgpu.window-cursor";
 
 /// Which pipeline: the render target's pixel format, and whether it applies the gamma table and
 /// the colour matrix.
@@ -46,25 +41,6 @@ pub struct DisplayPipelineCache<P: Platform> {
     pub fragment_function_gamma_color_matrix: P::Function,
     /// The pipelines made so far.
     pub table: parking_lot::Mutex<LookupMap<PipelineKey, P::RenderPipeline>>,
-    /// The overlay pipelines made so far, by the target's `MTLPixelFormat`.
-    pub overlays: parking_lot::Mutex<LookupMap<u64, P::RenderPipeline>>,
-}
-
-/// A quad the display's own window draws over the frame, in the display's render pass after the
-/// frame's draw
-/// ([`DisplayCore::encode_current_frame_with`](super::DisplayCore::encode_current_frame_with)):
-/// the display's strip, a quad over the whole viewport, the texture's top row at its top, drawn
-/// with `pipeline` over `viewport`, clipped by `scissor`, sampling `texture`.
-pub struct OverlayDraw<'a, P: Platform> {
-    /// The display's overlay pipeline for the target's format
-    /// ([`DisplayPipelineCache::overlay_for`]).
-    pub pipeline: &'a P::RenderPipeline,
-    /// The texture the quad samples, fragment texture 0.
-    pub texture: &'a P::Texture,
-    /// Where the quad is drawn, in the target's pixels.
-    pub viewport: MtlViewport,
-    /// The pixels it may touch, inside the target.
-    pub scissor: MtlScissorRect,
 }
 
 impl<P: Platform> DisplayPipelineCache<P> {
@@ -101,7 +77,6 @@ impl<P: Platform> DisplayPipelineCache<P> {
             fragment_function,
             fragment_function_gamma_color_matrix,
             table: parking_lot::Mutex::new(LookupMap::new()),
-            overlays: parking_lot::Mutex::new(LookupMap::new()),
         };
         drop(library);
         Some(made)
@@ -138,48 +113,12 @@ impl<P: Platform> DisplayPipelineCache<P> {
         drop(table);
         pipeline
     }
-
-    /// The pipeline the display's window draws over a frame in a target of `format` with (a new
-    /// reference): the vertex function and the plain fragment function, with colour attachment 0
-    /// blending over what its pass loaded ([`RenderPipelineDesc::blend_over`]). Made on a miss with
-    /// no lock held, so that no present's [`DisplayPipelineCache::pipeline_for`] waits for its
-    /// making, and kept with the display's pipelines, which go before the functions they are
-    /// made of. A failed creation answers nil and keeps nothing; of two made for one format at
-    /// once, the first kept is answered and the other let go. A raise making it dies at its send.
-    pub fn overlay_for(&self, format: u64) -> Option<P::RenderPipeline> {
-        if let Some(pipeline) = self.overlays.lock().get(&format) {
-            return Some(pipeline.clone_ref());
-        }
-        let made = self
-            .mtl_device
-            .new_render_pipeline_state(&RenderPipelineDesc {
-                label: Some(OVERLAY_LABEL),
-                vertex: &self.vertex_function,
-                fragment: &self.fragment_function,
-                color0_pixel_format: format,
-                blend_over: true,
-                resource_index: None,
-            })
-            .ok()
-            .flatten()?;
-        let mut overlays = self.overlays.lock();
-        let kept = match overlays.get(&format) {
-            Some(kept) => kept.clone_ref(),
-            None => {
-                overlays.insert(format, made.clone_ref());
-                made
-            }
-        };
-        drop(overlays);
-        Some(kept)
-    }
 }
 
 impl<P: Platform> Drop for DisplayPipelineCache<P> {
     /// The pipelines first, then the fields in their order.
     fn drop(&mut self) {
         self.table.get_mut().clear();
-        self.overlays.get_mut().clear();
     }
 }
 
@@ -366,72 +305,6 @@ mod tests {
                 2
             );
         }
-    }
-
-    mod overlay_for_descriptor {
-        use super::*;
-
-        /// The descriptor of the overlay pipeline for `format`: its label, the vertex function,
-        /// the plain fragment function, the format, blending over, and no resource index.
-        fn desc(
-            c: &DisplayPipelineCache<FakePlatform>,
-            format: u64,
-        ) -> RenderPipelineDesc<'_, FakePlatform> {
-            RenderPipelineDesc {
-                label: Some("reims-vgpu.window-cursor"),
-                vertex: &c.vertex_function,
-                fragment: &c.fragment_function,
-                color0_pixel_format: format,
-                blend_over: true,
-                resource_index: None,
-            }
-        }
-
-        /// A miss makes the overlay pipeline from its descriptor, kept apart from the display's
-        /// own (whose table stays empty); a hit returns it without Metal
-        #[test]
-        fn miss_builds_then_hit_reuses() {
-            let p = FakePlatform::new();
-            let c = cache(&p);
-            let m = p.call_log().mark();
-            let a = c.overlay_for(80).unwrap();
-            let calls = p.call_log().since(m);
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].sel, "newRenderPipelineStateWithDescriptor:error:");
-            assert_eq!(calls[0].args, vec![Arg::val(&desc(&c, 80))]);
-            assert!(c.table.lock().is_empty());
-            let m = p.call_log().mark();
-            let b = c.overlay_for(80).unwrap();
-            assert!(p.call_log().since(m).is_empty());
-            assert_eq!(a.id(), b.id());
-            let other = c.overlay_for(81).unwrap();
-            assert_ne!(other.id(), a.id());
-        }
-
-        /// A failed creation returns nil, keeps nothing, and is tried again
-        #[test]
-        fn failure_is_not_kept() {
-            let p = FakePlatform::new();
-            let c = cache(&p);
-            p.script().push(
-                "newRenderPipelineStateWithDescriptor:error:",
-                Step::Error(Default::default()),
-            );
-            assert!(c.overlay_for(80).is_none());
-            assert!(c.overlays.lock().is_empty());
-            assert!(c.overlay_for(80).is_some());
-        }
-    }
-
-    /// The overlay pipelines are released with the display's
-    #[test]
-    fn drop_releases_overlay_pipelines() {
-        let p = FakePlatform::new();
-        let c = cache(&p);
-        let a = c.overlay_for(80).unwrap();
-        let held = a.retain_count();
-        drop(c);
-        assert_eq!(a.retain_count(), held - 1);
     }
 
     /// The table's pipelines are released

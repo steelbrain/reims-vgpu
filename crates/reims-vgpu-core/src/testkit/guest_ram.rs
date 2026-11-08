@@ -236,18 +236,6 @@ pub unsafe fn write_raw(dst: HostPtr, src: &[u8]) {
     unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_ptr::<u8>(), src.len()) };
 }
 
-/// Fills core's buffer at `dst` with `src`: the fake `readMemory` block's copy. The SDK's block
-/// type is a safe `Fn` over a raw address (`host::ReadMemory`), so its contract, not the type,
-/// promises that `dst..dst+src.len()` is writable memory the caller owns for the call; this
-/// crate-private helper carries that contract into the fake host.
-pub(crate) fn fill_host_buffer(dst: HostPtr, src: &[u8]) {
-    if dst.is_null() {
-        return;
-    }
-    // SAFETY: the `readMemory` contract above.
-    unsafe { write_raw(dst, src) };
-}
-
 /// One guest-physical range backed by a region.
 #[derive(Debug, Clone)]
 pub struct GuestRange {

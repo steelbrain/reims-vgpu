@@ -4,9 +4,8 @@
 //! The reims-graphics lane's host side runs each guest op inside a scope
 //! (docs/graphics-kext/design.md, "Guest input the host refuses"). There, a death that would end
 //! the process, a platform refusing a create or an encode among them, unwinds to the innermost
-//! scope instead, which answers [`Refusal`]. The lane then refuses the op to the guest. The
-//! paravirt device never opens a scope, so its deaths stay where its contract puts them: outside
-//! a scope [`trap`] returns at once, and the death writes its line and ends the process.
+//! scope instead, which answers [`Refusal`]. The lane then refuses the op to the guest. Outside a
+//! scope [`trap`] returns at once, and the death writes its line and ends the process.
 //!
 //! **Panics.** A panic is a bug (architecture 6.5), and one inside a scope is refused as a death
 //! there is: the library's panic hook writes its line and lets it unwind ([`refuses_panics`]),
@@ -29,8 +28,7 @@
 //! failure) takes the scope with it: [`carry`] at the registration notes whether the op runs in a
 //! scope, and [`Carried::run`] runs the work in one there too. So a death in the work, the
 //! platform's read of a failure no Metal answer matches among them, refuses that work and the
-//! process goes on. Work registered outside every scope, all of the paravirt device's, runs as it
-//! always did.
+//! process goes on. Work registered outside every scope runs as it always did.
 
 #![expect(
     clippy::disallowed_methods,
@@ -126,7 +124,7 @@ pub fn refusing<T>(f: impl FnOnce() -> T) -> Result<T, Refusal> {
 
 /// What a panic says: the message of `panic!` and of the panics of std (an index out of bounds,
 /// an overflow, an `unwrap`), whose payload is a string; `None` for any other payload, an unwind
-/// of the library's own (a test capture's death, an isolated task's stop) among them.
+/// of the library's own (a test capture's death) among them.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     match payload.downcast_ref::<&'static str>() {
         Some(message) => Some((*message).to_owned()),

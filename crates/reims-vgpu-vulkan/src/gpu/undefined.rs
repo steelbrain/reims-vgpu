@@ -62,10 +62,7 @@ pub(super) const STENCIL8: u64 = 253;
 
 /// Metal's platform and device, where the host has Metal.
 pub(super) fn metal() -> Option<(MetalPlatform, <MetalPlatform as Platform>::Device)> {
-    MetalPlatform::system_default_device().map(|d| {
-        let launcher = crate::gpu::device::tests::metal_tests::NoLauncher;
-        (MetalPlatform::new(Box::new(launcher)), d)
-    })
+    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(), d))
 }
 
 /// The bytes a texel of `format` takes.

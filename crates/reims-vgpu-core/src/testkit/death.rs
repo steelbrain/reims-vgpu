@@ -1109,18 +1109,14 @@ const DEATH_PREFIX: &str = "reims-vgpu: fatal: ";
 ///   `… panic. aborting.` (a panic that cannot unwind, a panic while panicking) and
 ///   `memory allocation of … failed` (the default allocation-error hook).
 ///
-/// `fatal`'s own line (`reims-vgpu: fatal: …`, [`parse_death_lines`]) is not one, nor is the
-/// line an isolated task's death writes (`reims-vgpu: isolated task died: …`: the task ends, the
-/// process goes on).
+/// `fatal`'s own line (`reims-vgpu: fatal: …`, [`parse_death_lines`]) is not one.
 pub fn parse_abort_lines(out: &str) -> Vec<String> {
     const HOOK: &str = "reims-vgpu: ";
-    const TASK_DIED: &str = "reims-vgpu: isolated task died: ";
     out.lines()
         .filter(|l| {
-            l.match_indices(HOOK).any(|(i, _)| {
-                l.get(i..)
-                    .is_some_and(|s| !s.starts_with(DEATH_PREFIX) && !s.starts_with(TASK_DIED))
-            }) || l.contains("fatal runtime error: ")
+            l.match_indices(HOOK)
+                .any(|(i, _)| l.get(i..).is_some_and(|s| !s.starts_with(DEATH_PREFIX)))
+                || l.contains("fatal runtime error: ")
                 || l.contains("panic. aborting.")
                 || (l.contains("memory allocation of ") && l.contains(" failed"))
         })
@@ -1778,7 +1774,6 @@ mod tests {
         let aborts = "test x ... reims-vgpu: fatal: site_a [site Abort site_a:1]\n\
             test y ... reims-vgpu: panicked at crates/x.rs:1:1:\n\
             fake: unscripted call\n\
-            reims-vgpu: isolated task died: gpu_task.x: the task only\n\
             fatal runtime error: stack overflow, aborting\n\
             thread caused non-unwinding panic. aborting.\n\
             memory allocation of 64 bytes failed\n";

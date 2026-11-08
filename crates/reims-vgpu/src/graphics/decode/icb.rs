@@ -9,7 +9,7 @@
 //!
 //! Each record is carried out in its own refusal scope: one that names an object the sender does
 //! not hold, of the wrong kind, a command past the buffer's size, or that the platform refuses
-//! (the Vulkan platform ends the paravirt process where its runtime refuses a setter) is skipped
+//! (the Vulkan platform dies where its runtime refuses a setter) is skipped
 //! alone, and the message names how many were in one warning. A record whose framing is broken
 //! ends the message there.
 //!

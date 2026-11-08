@@ -6145,7 +6145,7 @@ fn expect_reflection(guest: &mut Guest, obj_id: u64, status: u32) {
 }
 
 /// The platform ending the process at a pipeline's compile or at its function's specialisation
-/// (the Vulkan runtime refusing the compile, which ends the process on the paravirt device)
+/// (the Vulkan runtime refusing the compile, which ends the process outside a refusal scope)
 /// refuses the create in this lane: the reflection is refused, nothing is stored, and the device
 /// goes on, the next creates made
 #[test]
@@ -7317,7 +7317,7 @@ fn a_present_shows_the_latest_texture_over_its_surface() {
 }
 
 /// The platform dying at its read of a finished command buffer on its own thread (a failure it has
-/// no answer of Metal's for), which ends the process on the paravirt device, fails that command
+/// no answer of Metal's for), which ends the process outside a refusal scope, fails that command
 /// buffer alone, as a GPU error on Metal fails the buffer it struck: its completion is an internal
 /// error, and its context's later work is carried out as any context's, its command buffers,
 /// its creates (its sampler creates and its queue creates among them) and its destroys, as is

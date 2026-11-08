@@ -1280,7 +1280,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
                     // keep-alive is dropped, as nothing else frees or remaps it.
                     unsafe {
                         (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first, true),
+                            crate::os::host_memory(first),
                             None,
                             Some(keep),
                         )
@@ -1737,7 +1737,7 @@ pub(crate) fn guest_bytes<'a>(sel: &'static str, range: HostRange<'a>) -> rt::Ho
     }
     let first = range.ptr().addr();
     let start = NonNull::new(range.ptr().as_ptr::<u8>())
-        .filter(|_| first >= reims_vgpu_core::guest::ZERO_REGION_END)
+        .filter(|_| first >= reims_vgpu_core::host::ZERO_REGION_END)
         .filter(|_| first.checked_add(length).is_some());
     let Some(start) = start else {
         crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
@@ -1760,7 +1760,7 @@ fn first_bytes(sel: &'static str, range: HostRange<'_>, most: usize) -> Vec<u8> 
     }
     let start = range.ptr().as_ptr::<u8>();
     let first = range.ptr().addr();
-    if first < reims_vgpu_core::guest::ZERO_REGION_END || first.checked_add(length).is_none() {
+    if first < reims_vgpu_core::host::ZERO_REGION_END || first.checked_add(length).is_none() {
         crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
     }
     let read = length.min(most);
@@ -1800,7 +1800,7 @@ pub(crate) fn fill_bytes(
         return Vec::new();
     }
     let first = range.ptr().addr();
-    if range.is_empty() && first < reims_vgpu_core::guest::ZERO_REGION_END {
+    if range.is_empty() && first < reims_vgpu_core::host::ZERO_REGION_END {
         crate::answer::metal_reads_near_null(sel, &format!("0 bytes at {first:#x}"));
     }
     first_bytes(sel, range, most)
@@ -2043,7 +2043,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                     // which is the runtime's import unit on this host.
                     unsafe {
                         (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first, true),
+                            crate::os::host_memory(first),
                             None,
                             Some(keep),
                         )
@@ -2639,7 +2639,7 @@ pub(crate) mod tests {
         // SAFETY: an empty range is never read.
         let empty = unsafe { HostRange::new(HostPtr::NULL, 0) };
         assert!(host_bytes("s", empty).is_empty());
-        let last = u64::try_from(reims_vgpu_core::guest::ZERO_REGION_END - 1).unwrap();
+        let last = u64::try_from(reims_vgpu_core::host::ZERO_REGION_END - 1).unwrap();
         for at in [0, 0x10, 0x4000, last] {
             // SAFETY: a range of 4 bytes in the zero region, which the copy dies before reading.
             let near_null = unsafe { HostRange::new(HostPtr::NULL.wrapping_add(at), 4) };
@@ -2670,7 +2670,7 @@ pub(crate) mod tests {
         // SAFETY: an empty range is never read.
         let empty = unsafe { HostRange::new(HostPtr::NULL, 0) };
         assert!(guest_bytes("s", empty).is_empty());
-        let last = u64::try_from(reims_vgpu_core::guest::ZERO_REGION_END - 1).unwrap();
+        let last = u64::try_from(reims_vgpu_core::host::ZERO_REGION_END - 1).unwrap();
         for at in [0, 0x10, last] {
             // SAFETY: a range of 4 bytes in the zero region, which dies before any read.
             let near_null = unsafe { HostRange::new(HostPtr::NULL.wrapping_add(at), 4) };

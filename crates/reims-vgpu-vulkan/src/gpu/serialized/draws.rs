@@ -19,10 +19,8 @@ use reims_vgpu_core::platform::{Handle as _, Platform};
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::raise::death::DeathKind;
 use reims_vgpu_core::rt::Hold;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_core::testkit::capture::catch_death;
 use reims_vgpu_metal::MetalPlatform;
-use std::sync::Arc;
 
 use super::RENDER_SEL;
 use super::tests::rounded_render_of;
@@ -59,19 +57,6 @@ const EQUAL: u64 = 2;
 const ALWAYS: u64 = 7;
 const KEEP: u64 = 0;
 const REPLACE: u64 = 2;
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl TaskLauncher<MetalPlatform> for NoLauncher {
-    fn launch(
-        &self,
-        _platform: &Arc<MetalPlatform>,
-        _host: Arc<dyn HostSide<MetalPlatform>>,
-    ) -> Arc<dyn ServiceLink<MetalPlatform>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// The state of a render blob of the vertex function `vertex` (ref 1) and the fragment function
 /// `fragment` (ref 2) of `spi_keys.metal`, its 4-byte `entries` and colour attachment elements
@@ -346,7 +331,7 @@ fn spi_values_that_decode_draw_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let none: &[(u8, u32)] = &[];
     let mut decoded: Vec<Case<'_>> = vec![
@@ -625,7 +610,7 @@ fn spi_values_the_runtime_holds_draw_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let mut differ = Vec::new();
     // Adds to `differ` where `ours`, of the case `of`, is not `theirs`, or, where `unchanged`,
@@ -1101,7 +1086,7 @@ fn denormal_depths_store_and_compare_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let white = [255u8; 4].repeat(64);
     let mut cases = 0;
@@ -1139,7 +1124,7 @@ fn depth_stencil_write_disabled_draws_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let without = depth_drawn(&mp, &md, &[]);
     // The left half drew the second draw's green, the right half the third's white.

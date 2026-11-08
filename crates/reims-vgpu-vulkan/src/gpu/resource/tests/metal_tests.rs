@@ -1178,7 +1178,7 @@ fn lossless_mipmapped_heap_texture_sizes_are_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     for (name, t) in lossless_mipmapped_shapes() {
         let ours = d
             .heap_texture_size_and_align(&p.texture_descriptor(&t))
@@ -2046,7 +2046,7 @@ fn optimized_depth_textures_take_metals_modelled_size() {
             sized(4, 0x5, 261, 2, 1, 1),
         ),
     ];
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let md = MetalPlatform::system_default_device();
     let d = dev();
     for (name, t) in &shapes {
@@ -2102,7 +2102,7 @@ fn x32_stencil8_size_queries_are_metals() {
             shapes.push((format!("{storage} {name}"), t));
         }
     }
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let md = MetalPlatform::system_default_device();
     let theirs: Vec<_> = (shapes.iter())
         .map(|(_, t)| {
@@ -2891,7 +2891,7 @@ fn a_command_buffer_holds_a_surface_as_metals_does() {
         .chain([(Reach::View, [(2, 0), (2, 0), (1, 0), (1, 0)])])
         .collect();
     let theirs: Option<Vec<_>> = MetalPlatform::system_default_device().map(|md| {
-        let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+        let mp = MetalPlatform::new();
         (cases.iter())
             .map(|&(reach, _)| {
                 let (mut theirs, _) = surface_references::<MetalPlatform>(&mp, &md, reach, &|_| 0);
@@ -3242,7 +3242,7 @@ fn surface_holds<P: Platform<Surface = OsSurface>>(
 /// before this platform makes anything in the process.
 fn holds_as_metals(cases: &[(Beside, &[(i64, i32)])]) {
     let theirs: Option<Vec<_>> = MetalPlatform::system_default_device().map(|md| {
-        let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+        let mp = MetalPlatform::new();
         (cases.iter())
             .map(|&(beside, _)| surface_holds::<MetalPlatform>(&mp, &md, beside))
             .collect()
@@ -3277,7 +3277,7 @@ fn nothing_beside_a_command_buffer_holds_a_surface() {
     let none = [(1, 0); 3];
     let handled = [(2, 0), (2, 0), (1, 0), (1, 0), (1, 0)];
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+        let mp = MetalPlatform::new();
         let theirs = surface_holds::<MetalPlatform>(&mp, &md, Beside::PendingArgument);
         assert_eq!(theirs, none, "Metal's, through an argument buffer");
     }
@@ -3537,7 +3537,7 @@ fn views_metal_answers_nil_are_nil() {
         .unwrap()
         .unwrap();
     let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let theirs = md.as_ref().map(|md| {
         let d = mp.texture_descriptor(&TextureDesc {
             pixel_format: 80,
@@ -3822,7 +3822,7 @@ fn rotated_uses<P: Platform<Surface = OsSurface>>(
 #[test]
 fn rotated_textures_read_copy_and_store_as_metals() {
     let (p, d) = (platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let md = MetalPlatform::system_default_device();
     let passes = [CLEAR, LOAD].map(|l| [(l, Drawn::Corner), (l, Drawn::Nothing)]);
     for pass in passes.into_iter().flatten() {
@@ -4024,7 +4024,7 @@ fn rotated_resolve<P: Platform<Surface = OsSurface>>(
 #[test]
 fn views_of_rotated_textures_store_and_load_as_metals() {
     let (p, d) = (platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
@@ -4058,7 +4058,7 @@ fn views_of_rotated_textures_store_and_load_as_metals() {
 #[test]
 fn rotated_textures_and_their_views_resolve_as_metals() {
     let (p, d) = (platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
@@ -4081,7 +4081,7 @@ fn rotated_textures_and_their_views_resolve_as_metals() {
 fn views_of_rotated_textures_the_runtime_refuses_die() {
     use reims_vgpu_core::platform::resource::Texture as _;
     let (p, d) = (platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let md = MetalPlatform::system_default_device();
     let one = NsRange::new(0, 1);
     for rotation in 1..=4 {
@@ -4126,7 +4126,7 @@ fn rotated_loads_of_some_tiles_are_metals() {
     let (p, d) = (platform(), dev());
     let pass = (LOAD, Drawn::FirstTile);
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+        let mp = MetalPlatform::new();
         rotated_uses::<MetalPlatform>(&mp, &md, 4, pass);
     }
     let kind = rt::Degradation::RotatedLoadTiles;
@@ -4648,7 +4648,7 @@ fn heap_textures_over_guest_pages_metal_may_compress_are_made() {
     let relayed = crate::answer::RELAYED.lock().clone();
     let lossless = rt::Degradation::HeapTextureLosslessLayout;
     assert!(relayed.contains(&lossless), "{relayed:?}");
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     if let Some(md) = MetalPlatform::system_default_device() {
         assert!(placed(&mp, &md));
     }
@@ -4715,7 +4715,7 @@ fn placements_over_heap_depth_stencil_targets_are_made_as_metals() {
         assert!(after.is_some(), "{on}: a buffer once it is let go");
         drop((b, whole));
     }
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     if let Some(md) = MetalPlatform::system_default_device() {
         placements(&mp, &md, "Metal");
     }
@@ -4746,7 +4746,7 @@ fn depth_stencil_targets_beside_the_heaps_cover_are_made_as_metals() {
         assert!(t.is_some(), "{on}: the texture once the heap was resident");
         drop((t, cover));
     }
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     if let Some(md) = MetalPlatform::system_default_device() {
         beside_the_cover(&mp, &md, "Metal");
     }
@@ -4794,7 +4794,7 @@ fn a_view_keeps_its_released_textures_bytes() {
         let after = heap.new_buffer_of_length(0x100, options, 0x100).unwrap();
         [over.is_some(), after.is_some()]
     }
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     if let Some(md) = MetalPlatform::system_default_device() {
         assert_eq!(over_the_view(&mp, &md), [true; 2], "Metal");
     }
@@ -4879,7 +4879,7 @@ fn multisampled_textures_in_a_heap_over_guest_pages_die_where_metal_compresses_t
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
         assert!(matches!(made, Ok(true)), "{shape:?}: {line}");
     }
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     if let Some(md) = MetalPlatform::system_default_device() {
         for shape in std::iter::once(compressed).chain(uncompressed) {
             let (heap, multisample) = heap_and_texture(&mp, &md, shape);
@@ -4988,7 +4988,7 @@ fn placements_of_depth_textures_without_optimized_contents_take_metals_size() {
     let depth = |side, allow| depth_of(&platform(), side, allow);
     let suites = suites_of(&platform(), 0x120);
     let options = [OptionSet::StorageMode(2), OptionSet::HazardTrackingMode(0)];
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     if let Some(md) = MetalPlatform::system_default_device() {
         let h = heap_of::<MetalPlatform>(&md, 0x8000, &options)
             .heap
@@ -5090,7 +5090,7 @@ fn optimized_x32_stencil8_placements_are_made_as_metals() {
             ..TextureDesc::default()
         })
     }
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     if let Some(md) = MetalPlatform::system_default_device() {
         for pixel_format in [252, 261] {
             let (heap, ..) = heap_over_pages(&mp, &md);
@@ -5280,7 +5280,7 @@ fn usage_bits_metal_takes_are_answered_as_metals() {
 fn block_writes_only_sizes_are_metals_and_fit() {
     let (d, p) = (dev(), platform());
     let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let options = [OptionSet::StorageMode(2), OptionSet::HazardTrackingMode(0)];
     crate::answer::RELAYED.lock().clear();
     for (format, (width, height), levels, slices) in [
@@ -5344,7 +5344,7 @@ fn pvrtc_heap_sizes_are_metals() {
     );
     let (p, d) = (platform(), dev());
     let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let options = [OptionSet::StorageMode(2), OptionSet::HazardTrackingMode(0)];
     let suites = |pixel_format| TextureDesc {
         pixel_format,
@@ -5453,7 +5453,7 @@ fn pvrtc_sizes_against_the_runtimes() {
     let Some(metal) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let sel = "heapTextureSizeAndAlignWithDescriptor:";
     let (p, d) = (platform(), dev());
     let mut rows = Vec::new();

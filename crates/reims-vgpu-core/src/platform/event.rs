@@ -6,8 +6,7 @@ use crate::raise::RaiseResult;
 /// `id<MTLSharedEvent>`: the FIFO's event and the service's copy of it
 /// (`newSharedEventWithHandle:`).
 pub trait SharedEvent<P: Platform>: Handle {
-    /// sel: newSharedEventHandle — The handle crosses to an
-    /// isolated task's service (+1, released after the send). No path reaches it under a
+    /// sel: newSharedEventHandle (+1, released after the send). No path reaches it under a
     /// handler: a raise inside it dies at the send.
     fn new_shared_event_handle(&self) -> Option<P::SharedEventHandle>;
     /// sel: setSignaledValue:

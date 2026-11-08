@@ -26,7 +26,6 @@ use super::measure::{
 };
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::device::tests::dev;
-use crate::gpu::device::tests::metal_tests::NoLauncher;
 use crate::gpu::resource::{VulkanComputePipeline, VulkanTexture};
 use crate::os::{MATRIX_KEY, OsSurface};
 use crate::platform::VulkanPlatform;
@@ -572,7 +571,7 @@ fn samples_in_fragments_as_metals_do(format: u64, s: &OsSurface, size: (u64, u64
     let Some((md, mt)) = metals(format, s, size) else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let theirs = fragment_reads::<MetalPlatform>(&mp, &md, &mt, grid, &cases);
     for (((state, bytes), ours), theirs) in cases.iter().zip(&ours).zip(&theirs) {
         assert!(ours.0 == theirs.0, "{state:?} {}: {what}", bytes[28]);
@@ -2401,7 +2400,7 @@ fn cpu_writes_and_buffer_blits_of_family_textures_are_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let size = (32, 16);
     for format in [505, 543, 503] {
         for op in [Op::Replace, Op::ToBuffer, Op::FromBuffer] {
@@ -2423,7 +2422,7 @@ fn cpu_writes_and_buffer_blits_of_family_textures_are_metals() {
 #[test]
 fn copies_and_attachments_of_family_textures_die() {
     let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let size = (32, 16);
     for (format, op) in [
         (505, Op::Copy),
@@ -2491,7 +2490,7 @@ fn passes_into_code_formats_are_metals() {
 /// The comparison of [`passes_into_8_bit_formats_are_metals`], of `formats`.
 fn passes_are_metals(formats: &[u64]) {
     let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let size = (32, 16);
     for &format in formats {
         let (_, ostypes) = surfaces_of(format, true);
@@ -2538,7 +2537,7 @@ fn loaded_masked_and_blended_passes_are_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let size = (32, 16);
     let mut differ = Vec::new();
     for format in [500, 502, 503, 505, 506, 507, 540, 541, 542, 543, 544, 545] {
@@ -2626,7 +2625,7 @@ fn loaded_masked_and_blended_passes_are_metals() {
 #[test]
 fn packed_textures_copy_nothing_and_their_blits_die() {
     let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let size = (32, 16);
     let named = |line: Option<String>| line.unwrap_or_default();
     for format in [508, 509, 510, 528, 529, 530] {
@@ -2705,7 +2704,7 @@ fn kernel_writes_metal_drops_are_dropped_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let size = (32, 16);
     let dropped = family().into_iter().filter(|&f| {
         let pf = PixelFormat::try_from(u32::try_from(f).unwrap()).unwrap();
@@ -2728,7 +2727,7 @@ fn kernel_writes_metal_drops_are_dropped_as_metals() {
 #[test]
 fn fragment_writes_of_444_textures_are_metals() {
     let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let size = (32, 16);
     for format in [503, 507, 542, 545] {
         let (s, other) = noisy_pair(format, size, 11);
@@ -2755,7 +2754,7 @@ fn fragment_writes_of_444_textures_are_metals() {
 #[test]
 fn writes_of_444_textures_are_metals() {
     let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let size = (32, 16);
     let stored = family().into_iter().filter(|&f| {
         let pf = PixelFormat::try_from(u32::try_from(f).unwrap()).unwrap();
@@ -2782,7 +2781,7 @@ fn writes_of_444_textures_are_metals() {
 #[test]
 fn writes_the_runtime_refuses_die() {
     let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let size = (32, 16);
     let refused = family().into_iter().filter(|&f| {
         super::writes_refused(PixelFormat::try_from(u32::try_from(f).unwrap()).unwrap())

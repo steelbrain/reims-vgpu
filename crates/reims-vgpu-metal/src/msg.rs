@@ -35,12 +35,6 @@
 //! runtime's types (`crate::spi`, checked by `tests/spi_encodings.rs`), and the crate sends no
 //! selector the host's Metal does not implement: core raises the render records'
 //! unrecognized-selector fault itself, with no send.
-//!
-//! **A task that has ended sends nothing.** Before every send but a [`value`], a thread running
-//! the work of an isolated task that died or was invalidated stops (`stop_if_task_ended`): no
-//! commit, signal or copy of the task's reaches the GPU after its end, as none did once its
-//! process was gone. A value send has no effect anyone sees, so the thread stops at its next send
-//! instead.
 
 pub mod encode;
 
@@ -51,7 +45,6 @@ use objc2::rc::Retained;
 use objc2_foundation::{NSException, NSString};
 use reims_vgpu_core::raise::death::{DeathId, DeathKind};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
 
 /// What a raise inside Metal at a call does: the call's label, which decides it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,7 +152,6 @@ fn exception_detail(name: &str, reason: &str) -> Option<String> {
 /// Runs `call`, a send of `sel`, and hands an exception inside it back to the caller, who
 /// decides it (the deserialization sends, whose raise may be their resolver's own).
 pub fn catch<R>(sel: &'static str, call: impl FnOnce() -> R) -> Result<R, Caught> {
-    stop_if_task_ended();
     exception::catch(AssertUnwindSafe(call)).map_err(|exc| Caught::read(sel, exc.as_deref()))
 }
 
@@ -182,14 +174,12 @@ pub fn get<R>(sel: &'static str, call: impl FnOnce() -> R) -> R {
 /// `f` holds no value with a `Drop` (D34): a foreign unwind runs the landing pads of its frame,
 /// and a `Retained` dropped there would be a release the process never makes otherwise.
 pub(crate) fn fatal_send<R>(sel: &'static str, f: impl FnOnce() -> R) -> R {
-    stop_if_task_ended();
     value(sel, f)
 }
 
 /// A send that makes or reads a value and has no effect anyone sees (a string, a number, a
 /// collection, an error's text, an `+alloc`): a raise inside `f` dies at the send, named by
-/// `sel`, whatever handler is live, as at [`fatal_send`]. It is not a step of an isolated task's
-/// that stops once the task has ended (module doc).
+/// `sel`, whatever handler is live, as at [`fatal_send`].
 ///
 /// `f` holds no value with a `Drop` (D34), as for [`fatal_send`].
 pub(crate) fn value<R>(sel: &'static str, f: impl FnOnce() -> R) -> R {
@@ -352,12 +342,9 @@ mod tests {
         );
     }
 
-    /// A value send passes its value through, dies at the send, and is no stop for an ended
-    /// task's thread, which stops at its next `fatal_send`
+    /// A value send passes its value through and dies at the send
     #[test]
-    fn a_value_send_dies_at_the_send_and_is_no_stop() {
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
+    fn a_value_send_dies_at_the_send() {
         assert_eq!(value("count", || 3), 3);
         let a = array();
         let site = catch_death(|| {
@@ -368,15 +355,6 @@ mod tests {
             (site.kind, site.file, site.line),
             (DeathKind::UncaughtObjc, "objectAtIndex:", 0)
         );
-        let life = TaskLife::new();
-        let mut reached = Vec::new();
-        let r = life.run(|| {
-            life.exit();
-            reached.push(value("count", || 1));
-            reached.push(fatal_send("count", || 2));
-        });
-        assert_eq!(r, None);
-        assert_eq!(reached, vec![1]);
     }
 
     /// `new_string` and `string_text` carry text both ways

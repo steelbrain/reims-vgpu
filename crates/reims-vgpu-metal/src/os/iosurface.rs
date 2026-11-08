@@ -36,16 +36,7 @@ use crate::msg::{fatal_send, value};
 use crate::platform::MetalPlatform;
 
 /// One CF reference to an `IOSurfaceRef` (core's `Surface`: `retained()` is `CFRetain`, `Drop`
-/// is `CFRelease`, except while the thread unwinds or releases an isolated task that died
-/// ([`leaks_objects`](reims_vgpu_core::tasks::isolation::life::leaks_objects)): the reference is
-/// then leaked, as every platform handle of a dead task's is ([`crate::platform::Obj`]).
-///
-/// What a dead task holds is its own object over the surface, never the host's: a surface the
-/// host lends an isolated task reaches it through a port lookup, another object with a retain
-/// count of its own (`lookup_by_port`). So the leak changes no count the host reads. Measured on
-/// the M3 Max, macOS 27.0.1 (26A434), 5 rounds: the host's object counts 1 whether the lookup's
-/// references are released (2 rounds) or leaked (3), and in every round a new surface over the
-/// same pages is made and writes them, with the earlier rounds' leaked lookups alive.
+/// is `CFRelease`).
 #[derive(Debug)]
 pub struct MetalSurface {
     ptr: NonNull<IOSurfaceRef>,
@@ -161,12 +152,8 @@ impl MetalSurface {
 }
 
 impl Drop for MetalSurface {
-    /// The one `CFRelease` for the reference this value holds, or nothing while the thread unwinds
-    /// or releases an isolated task that died.
+    /// The one `CFRelease` for the reference this value holds.
     fn drop(&mut self) {
-        if reims_vgpu_core::tasks::isolation::life::leaks_objects() {
-            return;
-        }
         // SAFETY: this value owns one reference to a live IOSurfaceRef (`from_retained`).
         unsafe { CFRelease(self.ptr.as_ptr().cast_const().cast()) }
     }
@@ -932,32 +919,6 @@ mod tests {
             assert_eq!(t.alloc_size(), s.alloc_size());
             drop((t, held));
             assert_eq!(s.retain_count(), 1);
-        }
-
-        /// A reference an isolated task's death unwinds past, or that the release of a task that
-        /// died drops, is leaked, as every platform handle of the task's is; one the task's work
-        /// drops is released
-        #[test]
-        fn a_dead_tasks_unwind_leaks_its_surface_references() {
-            use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-            use reims_vgpu_core::tasks::isolation::TaskLife;
-
-            let s = MetalSurfaces::new().create(&host_only()).unwrap();
-            let life = TaskLife::new();
-            assert_eq!(life.run(|| drop(s.clone_ref())), Some(()));
-            assert_eq!(s.retain_count(), 1);
-            let r: Option<()> = life.run(|| {
-                let _held = s.clone_ref();
-                reims_vgpu_core::fatal!(DeathSite {
-                    kind: DeathKind::Abort,
-                    file: "iosurface.test",
-                    line: 0,
-                })
-            });
-            assert_eq!(r, None);
-            assert_eq!(s.retain_count(), 2);
-            assert_eq!(life.releasing(|| drop(s.clone_ref())), Some(()));
-            assert_eq!(s.retain_count(), 3);
         }
 
         /// IOSurfaceLock/Unlock and the test pattern writes through the base address

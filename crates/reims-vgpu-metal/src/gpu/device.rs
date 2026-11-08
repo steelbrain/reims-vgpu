@@ -300,10 +300,10 @@ unsafe fn made_or_error<T: Message>(
 /// would be to Apple's framework: the call answers what Metal made, and what the raise carries
 /// lands in `hold`'s holder, where a catch would land it.
 ///
-/// A death or a stop inside the resolver, in an isolated task's code, is a Rust unwind to the
-/// task's run, which never crosses Metal's frames: the context keeps it and raises through Metal
-/// in its place, and once Metal has returned the unwind goes on from here, so the task ends at
-/// the same op as it would with no Metal frame between.
+/// A death inside the resolver, in a refusal scope, is a Rust unwind to the scope, which never
+/// crosses Metal's frames: the context keeps it and raises through Metal in its place, and once
+/// Metal has returned the unwind goes on from here, so the scope refuses the same op as it would
+/// with no Metal frame between.
 ///
 /// Every caller is a pipeline creation, which runs only under a handler (its creator's own sends
 /// are `Caught`): either raise is `Err`, the caller's to catch.
@@ -2467,14 +2467,13 @@ vertex void vvoid(uint v [[vertex_id]]) {}
         assert!(released.load(Ordering::SeqCst));
     }
 
-    /// A death in an isolated task's resolver while Metal deserializes, and a stop there once the
-    /// task has ended, each end the task once Metal has returned: nothing after the
-    /// deserialization runs, the resolver is called once, and Metal deserializes again after
+    /// A death in the resolver inside a refusal scope while Metal deserializes ends the scope's work
+    /// once Metal has returned: nothing after the deserialization runs, the resolver is called
+    /// once, and Metal deserializes again after
     #[test]
-    fn a_death_or_stop_in_the_resolver_ends_the_task_after_metal() {
+    fn a_death_in_the_resolver_ends_the_scope_after_metal() {
         use reims_vgpu_core::raise::death::DeathSite;
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-        use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
+        use reims_vgpu_core::raise::refusals::refusing;
 
         let d = dev();
         let lib = library(&d);
@@ -2485,31 +2484,21 @@ vertex void vvoid(uint v [[vertex_id]]) {}
             objc2::sel!(serializeRenderPipelineDescriptor:),
             rd.get(),
         );
-        for stop in [false, true] {
-            let life = TaskLife::new();
-            let mut calls = 0u32;
-            let mut ended = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
-                calls += 1;
-                if stop {
-                    assert!(TaskLife::current().unwrap().exit());
-                    stop_if_task_ended();
-                } else {
-                    reims_vgpu_core::fatal!(DeathSite {
-                        kind: DeathKind::Abort,
-                        file: "resolver.test",
-                        line: 0,
-                    });
-                }
-                Ok(None)
-            };
-            let mut after = false;
-            let r = life.run(|| {
-                let _ = d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut ended);
-                after = true;
-            });
-            assert_eq!((r, after, calls), (None, false, 1), "stop: {stop}");
-            assert_eq!(life.death().is_some(), !stop);
-        }
+        let mut calls = 0u32;
+        let mut dies = |_: Hold<'_>, _r: u64| -> RaiseResult<Option<MetalFunction>> {
+            calls += 1;
+            reims_vgpu_core::fatal!(DeathSite {
+                kind: DeathKind::Abort,
+                file: "resolver.test",
+                line: 0,
+            })
+        };
+        let mut after = false;
+        let r = refusing(|| {
+            let _ = d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut dies);
+            after = true;
+        });
+        assert_eq!((r.is_err(), after, calls), (true, false, 1));
         let mut resolver = |_: Hold<'_>, _r: u64| Ok(Some(v.clone_ref()));
         assert!(
             d.deserialize_render_pipeline_descriptor(Hold::NONE, &bytes, &mut resolver)

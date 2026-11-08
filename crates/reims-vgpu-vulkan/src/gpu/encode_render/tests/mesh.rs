@@ -342,10 +342,8 @@ fn drawn<P: Platform>(p: &P, d: &P::Device, draw: Draw) -> ([u32; 8], [u32; 4]) 
 fn mesh_draws_draw_what_metal_draws() {
     let (p, d) = (platform(), dev());
     #[cfg(target_os = "macos")]
-    let metal = reims_vgpu_metal::MetalPlatform::system_default_device().map(|md| {
-        let launcher = crate::gpu::device::tests::metal_tests::NoLauncher;
-        (reims_vgpu_metal::MetalPlatform::new(Box::new(launcher)), md)
-    });
+    let metal = reims_vgpu_metal::MetalPlatform::system_default_device()
+        .map(|md| (reims_vgpu_metal::MetalPlatform::new(), md));
     let draws = [
         Draw::Threadgroups,
         Draw::Indirect,

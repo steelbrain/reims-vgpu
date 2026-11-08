@@ -17,9 +17,6 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-/// The dirty log's kept resolutions of an import's ranges, Linux's alone but measured anywhere.
-#[cfg(any(target_os = "linux", test))]
-pub(crate) mod resolutions;
 mod surface;
 mod wsi;
 
@@ -31,10 +28,6 @@ use macos as host_os;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
-/// The dirty source's side on Linux: the device's log, the harvester's interface, and the
-/// per-import answers the runtime asks (`os/linux/dirty.rs`).
-#[cfg(target_os = "linux")]
-pub use host_os::dirty;
 /// Learns whether a device imports views of guest pages mapped through dma-bufs, on Linux
 /// (`os/linux/import.rs`).
 #[cfg(target_os = "linux")]

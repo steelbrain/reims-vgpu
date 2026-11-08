@@ -18,7 +18,6 @@
 use std::sync::{Arc, Once, OnceLock};
 
 use reims_vgpu_core::rt::is_our_thread;
-use reims_vgpu_core::tasks::isolation::TaskThreads;
 #[cfg(target_os = "macos")]
 use reims_vgpu_metal::MetalPlatform;
 #[cfg(vulkan_platform)]
@@ -31,8 +30,7 @@ static VULKAN_PLATFORM: OnceLock<Arc<VulkanPlatform>> = OnceLock::new();
 static HOOK: Once = Once::new();
 
 /// The process's platform (D17) on macOS, made on first use: the panic hook first, the logger,
-/// then one `MetalPlatform` whose launcher runs each isolated task's service on threads of its own
-/// ([`TaskThreads`]).
+/// then one `MetalPlatform`.
 #[cfg(target_os = "macos")]
 pub fn platform() -> Arc<MetalPlatform> {
     platform_ref().clone()
@@ -44,20 +42,19 @@ pub fn platform_ref() -> &'static Arc<MetalPlatform> {
     PLATFORM.get_or_init(|| {
         install_panic_hook();
         reims_vgpu_core::logging::init();
-        Arc::new(MetalPlatform::new(Box::new(TaskThreads::new())))
+        Arc::new(MetalPlatform::new())
     })
 }
 
 /// The process's Vulkan platform, made on first use as [`platform`] makes the Metal one: the
-/// panic hook first, the logger, then one `VulkanPlatform` whose launcher runs each isolated
-/// task's service on threads of its own ([`TaskThreads`]).
+/// panic hook first, the logger, then one `VulkanPlatform`.
 #[cfg(vulkan_platform)]
 pub fn vulkan_platform() -> Arc<VulkanPlatform> {
     VULKAN_PLATFORM
         .get_or_init(|| {
             install_panic_hook();
             reims_vgpu_core::logging::init();
-            Arc::new(VulkanPlatform::new(Box::new(TaskThreads::new())))
+            Arc::new(VulkanPlatform::new())
         })
         .clone()
 }

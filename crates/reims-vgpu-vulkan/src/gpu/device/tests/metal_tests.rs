@@ -97,25 +97,6 @@ fn ycbcr8_420_on(
     d.new_texture_on_surface(&desc, Some(surface), plane)
 }
 
-/// A launcher no test launches through, for a Metal platform.
-pub(crate) struct NoLauncher;
-
-impl reims_vgpu_core::tasks::launcher::TaskLauncher<reims_vgpu_metal::MetalPlatform>
-    for NoLauncher
-{
-    fn launch(
-        &self,
-        _platform: &std::sync::Arc<reims_vgpu_metal::MetalPlatform>,
-        _host: std::sync::Arc<
-            dyn reims_vgpu_core::tasks::launcher::HostSide<reims_vgpu_metal::MetalPlatform>,
-        >,
-    ) -> std::sync::Arc<
-        dyn reims_vgpu_core::tasks::launcher::ServiceLink<reims_vgpu_metal::MetalPlatform>,
-    > {
-        panic!("no task is launched in these tests")
-    }
-}
-
 /// A probe of [`linear_samples`]: its grid, where it starts and its step, in texels.
 type Probe = ((u64, u64), (f32, f32), f32);
 
@@ -280,7 +261,7 @@ fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
     use reims_vgpu_metal::MetalPlatform;
     let d = dev();
     let p = crate::platform::tests::platform();
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     for (ostype, size) in [(b"420v", (33, 17)), (b"420f", (64, 32))] {
         let shape = Shape::of(ostype);
         let matrices = [
@@ -746,7 +727,7 @@ fn a_cleared_two_plane_xr10_texture_over_a_surface_writes_as_metals() {
         return;
     };
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let d = dev();
     let color = ClearColor {
         red: 0.25,
@@ -849,7 +830,7 @@ fn a_filled_two_plane_xr10_texture_over_a_surface_writes_as_metals() {
         return;
     };
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let d = dev();
     let color = ClearColor {
         red: 0.25,
@@ -1057,7 +1038,7 @@ fn fills_of_ycbcr_and_padded_textures_are_metals() {
         return;
     };
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let d = dev();
     let color = ClearColor {
         red: 0.25,
@@ -1228,7 +1209,7 @@ fn copies_between_two_plane_xr10_textures_over_surfaces_write_as_metals() {
         return;
     };
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let d = dev();
     for format in [550, 551] {
         for (size, rows, seed) in [((384, 256), (1536, 512), 11), ((33, 17), (192, 64), 13)] {
@@ -1267,7 +1248,7 @@ fn a_copy_within_a_two_plane_xr10_texture_over_a_surface_dies() {
         blit_one::<P>(&q, copy_region::<P>((&t, [0, 0]), (&t, [16, 8]), [8, 4]));
     }
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let md = reims_vgpu_metal::MetalPlatform::system_default_device();
     let d = dev();
     let sel = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:\
@@ -1301,7 +1282,7 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
     let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let (p, d) = (crate::platform::tests::platform(), dev());
     let (size, rows) = ((16, 8), (64, 16));
     for format in [550, 551] {
@@ -1374,7 +1355,7 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
     use reims_vgpu_core::platform::values::{HeapDesc, OptionSet, TextureDesc};
     let p = crate::platform::tests::platform();
     let md = reims_vgpu_metal::MetalPlatform::system_default_device();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let desc = |format, storage: u64| TextureDesc {
         texture_type: 2,
         pixel_format: format,
@@ -1898,7 +1879,7 @@ fn padded_samples_are_metals() {
     }
     let (p, d) = (crate::platform::tests::platform(), dev());
     let md = reims_vgpu_metal::MetalPlatform::system_default_device();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     for format in [576, 578] {
         let ours = samples(&p, &d, format);
         let Some(md) = &md else { continue };
@@ -2040,7 +2021,7 @@ fn write_swizzles_are_made_where_read_alone() {
     }
     let p = crate::platform::tests::platform();
     let md = reims_vgpu_metal::MetalPlatform::system_default_device();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let metals = |d: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(d);
     let read = desc(1, 2);
     let ours = made(&p, &dev(), &read);
@@ -2268,7 +2249,7 @@ fn texture_setters_act_where_metal_does() {
         out
     }
     let theirs = md.as_ref().map(|md| {
-        let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+        let mp = reims_vgpu_metal::MetalPlatform::new();
         let heap = md.new_heap(&HeapDesc {
             size: 1 << 20,
             heap_type: 1,
@@ -2476,7 +2457,7 @@ fn two_d_descriptors_keep_raw_formats_as_the_setter_does() {
     use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
     let p = crate::platform::tests::platform();
     let mp = reims_vgpu_metal::MetalPlatform::system_default_device()
-        .map(|_| reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher)));
+        .map(|_| reims_vgpu_metal::MetalPlatform::new());
     let raw = [505, 543].into_iter();
     for format in raw.chain(crate::gpu::no_texture::FORMATS) {
         let ours = p.texture_2d_descriptor(OnFault::Return, format, 16, 16, false);
@@ -3084,7 +3065,7 @@ fn an_unmeasured_rotated_blend_dies_at_the_draw() {
     let named = "(metal2vulkan-degrade-rotated-blend-rounding)";
     assert!(line.contains(named), "{line}");
     if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-        let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+        let mp = reims_vgpu_metal::MetalPlatform::new();
         assert_eq!(rotated_blend_draw(&mp, &md), (4, 0), "Metal");
     }
 }
@@ -3410,7 +3391,7 @@ fn a_texture_over_a_surface_reads_another_ones_writes_as_metals() {
     let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let p = crate::platform::tests::platform();
     let (size, texels) = surface_texels();
     for order in [Order::OneCommandBuffer, Order::EventAcrossQueues] {
@@ -3438,7 +3419,7 @@ fn a_texture_over_a_copied_surface_reads_another_ones_writes_as_metals() {
     let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+    let mp = reims_vgpu_metal::MetalPlatform::new();
     let p = crate::platform::tests::platform();
     let (size, texels) = surface_texels();
     let copies = || {

@@ -270,7 +270,6 @@ use reims_vgpu_core::platform::resource::RenderPipeline as _;
 use reims_vgpu_core::platform::types::{MtlScissorRect, MtlSize, MtlViewport, NsRange};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
-use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
 
 use crate::answer::{Policy, decide, get, metal_aborts, plain, plain_at, refused, unrepresentable};
 use crate::gpu::command::VulkanCommandBuffer;
@@ -1790,10 +1789,7 @@ fn make(
 
 /// The encoder of the runtime's `raw`, just made on `command_buffer` of the pass `d`, without its
 /// unused resolves ([`without_unused_resolves`]) and the colour resolves `dropped` lists
-/// ([`untouched_resolves`]). It is in its handle before anything can
-/// stop this thread: a thread of an isolated task that ended stops at the next send with the
-/// encoder open, as Metal's is left, where the runtime's encoder dropped as it unwinds would
-/// abandon the command buffer. What Metal aborts at in the pass dies then.
+/// ([`untouched_resolves`]). What Metal aborts at in the pass dies then.
 fn opened(
     command_buffer: &VulkanCommandBuffer,
     raw: rt::RenderCommandEncoder,
@@ -2071,9 +2067,8 @@ impl VulkanRenderEncoder {
         // nothing there leaves it as it is: `bind_one` would empty slots already empty, and
         // `used` keeps none of them. Most binds are such, of plain memory, a draw's among them,
         // and they take no lock. The check reaches the runtime only through `buffer_bind` and
-        // `texture_bind`'s own calls, as the bind does, after the task's end is checked where
-        // `plain` checked it; one whose objects decide something binds as before.
-        stop_if_task_ended();
+        // `texture_bind`'s own calls, as the bind does; one whose objects decide something binds
+        // as before.
         if self.quiet.load(Ordering::Acquire) && !quiet_bind_decides(&bind) {
             return;
         }
@@ -2125,11 +2120,9 @@ impl VulkanRenderEncoder {
     /// does ([`Reach::kept`], [`crate::gpu::writes::kept_write`]); a write through a buffer over
     /// read-only memory the runtime copies is sent, and dropped as on Metal.
     /// One that issues nothing, which Metal writes nothing of, is not asked. A pass that holds
-    /// nothing a draw asks of ([`Reach::quiet`]) finds nothing, so its draws only check the
-    /// task's end, where the lookup would have.
+    /// nothing a draw asks of ([`Reach::quiet`]) finds nothing.
     fn issues(&self, sel: &'static str, inherits: Option<Inherits>) {
         if self.quiet.load(Ordering::Acquire) {
-            stop_if_task_ended();
             return;
         }
         let (kept, written) = plain(|| {
@@ -2214,17 +2207,15 @@ impl VulkanRenderEncoder {
     /// drawing, which encodes nothing.
     ///
     /// What the draw asks of the encoder's state ([`Held`]) is read once, at its start: none of
-    /// its checks changes it. Each check that read it alone checks the task's end still, where it
-    /// did, so a thread of an isolated task that ended stops at the same places.
+    /// its checks changes it.
     fn draw<K: Copy>(
         &self,
         sel: &'static str,
         (drawn, empty): (Option<(Shape, K)>, bool),
         mut call: impl FnMut(&mut rt::RenderCommandEncoder, K) -> Result<(), rt::Error>,
     ) -> RaiseResult<()> {
-        // Reading the encoder's state reaches no runtime, so the task's end is checked where
-        // `plain` checked it, and nothing the runtime announces can fall inside it.
-        stop_if_task_ended();
+        // Reading the encoder's state reaches no runtime, so nothing the runtime announces can
+        // fall inside it.
         let held = self.held();
         nil_pipeline_drawn(sel, held.nil_pipeline);
         crate::gpu::timing::count_draw();
@@ -2232,7 +2223,6 @@ impl VulkanRenderEncoder {
             Some((shape, k)) => {
                 self.drawn(sel, shape, empty, &held);
                 if !empty {
-                    stop_if_task_ended();
                     marked_by(sel, held.marks);
                 }
                 self.binds(sel, &mut |e| call(e, k))
@@ -2282,11 +2272,9 @@ impl VulkanRenderEncoder {
         self.bfloat_drawn(sel);
         if !empty {
             self.layered(sel);
-            stop_if_task_ended();
             sized(sel, shape, held.marks);
             threads_held(sel, shape, held.marks);
             self.issues(sel, None);
-            stop_if_task_ended();
             if held.encodes {
                 self.icbs_written(sel);
             }
@@ -2893,13 +2881,11 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 // hang where nothing drew in it, as the Metal platform's draw keeps Metal's GPU
                 // from hanging (`rate_map::no_draw`). It is the pass's last command, so its
                 // pipeline is bound for nothing the guest encodes. Its pipeline is made here,
-                // once per device, after the stop a thread of a task that ended takes at the
-                // command; where the command buffer is gone, nothing encoded here runs, and the
-                // pass needs no draw.
+                // once per device; where the command buffer is gone, nothing encoded here runs,
+                // and the pass needs no draw.
                 if self.undrawn.load(Ordering::Acquire)
                     && let Some(cb) = self.encoder.command_buffer()
                 {
-                    stop_if_task_ended();
                     let no_draw = crate::gpu::rate_map::no_draw(sel, &cb.device);
                     self.run(sel, &mut |e| {
                         e.set_render_pipeline_state(&no_draw)?;
@@ -4030,8 +4016,7 @@ impl VulkanRenderEncoder {
     /// ([`nil_pipeline_drawn`]), none that encodes indirect commands ([`Self::icbs_written`]), a
     /// pass that loads no bfloat attachment ([`Self::bfloat_drawn`]) and has no rate map of no
     /// layers or of varying rates ([`Self::layered`]), a command buffer to bind for
-    /// ([`Self::bound`]), a thread that runs no isolated task's code, whose checks of the task's
-    /// end are then each nothing ([`stop_if_task_ended`]), and no timing lines
+    /// ([`Self::bound`]), and no timing lines
     /// ([`crate::gpu::timing::encoder_call`]). A command changes none of them but a pipeline
     /// state's set, a private setter or the encoder's end, none of which a run of draws holds;
     /// whether the pass holds anything a draw asks of ([`Reach::quiet`]) is read at each.
@@ -4043,7 +4028,6 @@ impl VulkanRenderEncoder {
             && !self.no_layers
             && !self.varying_rates
             && self.encoder.has_command_buffer()
-            && reims_vgpu_core::tasks::isolation::TaskLife::current().is_none()
             && !crate::gpu::timing::on();
         quietly.then_some(held)
     }
@@ -6873,10 +6857,8 @@ pub(crate) mod tests {
         };
         use reims_vgpu_core::platform::values::IcbDesc;
 
-        const VERT: &[u8] =
-            include_bytes!("../../../../tests/shaders/vert.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/shaders/frag.metallib");
+        const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
+        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -6984,10 +6966,8 @@ pub(crate) mod tests {
             TessellationDescriptor,
         };
 
-        const TESS: &[u8] =
-            include_bytes!("../../../../tests/shaders/render_tess.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/shaders/frag.metallib");
+        const TESS: &[u8] = include_bytes!("../../../../tests/shaders/render_tess.metallib");
+        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -7191,10 +7171,8 @@ pub(crate) mod tests {
         };
         use reims_vgpu_core::platform::values::IcbDesc;
 
-        const VERT: &[u8] =
-            include_bytes!("../../../../tests/shaders/vert.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/shaders/frag.metallib");
+        const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
+        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -7375,10 +7353,8 @@ pub(crate) mod tests {
         use reims_vgpu_core::platform::os::vm::HostVm as _;
         use reims_vgpu_core::platform::values::IcbDesc;
 
-        const VERT: &[u8] =
-            include_bytes!("../../../../tests/shaders/vert.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/shaders/frag.metallib");
+        const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
+        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -7520,10 +7496,8 @@ pub(crate) mod tests {
             DepthAttachmentSet, DepthStencilDesc, PassSet, RateMapDesc,
         };
 
-        const VERT: &[u8] =
-            include_bytes!("../../../../tests/shaders/vert.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/shaders/mutdec_fwrite.metallib");
+        const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
+        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/mutdec_fwrite.metallib");
         /// `MTLPixelFormatDepth32Float`, `MTLCompareFunctionAlways`.
         const DEPTH32F: u64 = 252;
         const ALWAYS: u64 = 7;
@@ -7970,127 +7944,6 @@ pub(crate) mod tests {
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert_eq!(cb.error(), None);
-    }
-
-    /// endEncoding in a thread of an isolated task that has ended stops before it touches the
-    /// encoder, which stays in its handle, its store action left `Unknown` unset, as Metal's is
-    /// left; outside a task the same pass ends, storing nothing for that attachment
-    #[test]
-    fn an_ended_tasks_end_encoding_leaves_the_encoder() {
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        /// `MTLStoreActionUnknown`.
-        const UNKNOWN: u64 = 4;
-        let p = platform();
-        let d = dev();
-        let (dst, pass) = pass_of(&p, &d, (4, 4));
-        pass.set_color_attachment(
-            OnFault::Die,
-            0,
-            &ColorAttachmentSet {
-                texture: Some(Some(&dst)),
-                store_action: Some(UNKNOWN),
-                ..ColorAttachmentSet::default()
-            },
-        )
-        .unwrap();
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            e.encode(OnFault::Return, RenderCmd::EndEncoding)
-        });
-        assert!(stopped.is_none());
-        assert!(
-            e.encoder.raw.lock().borrow().is_some(),
-            "the render encoder was taken"
-        );
-        assert_eq!(e.undecided.lock().len(), 1);
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-        assert!(e.encoder.raw.lock().borrow().is_none());
-        cb.commit(OnFault::Die).unwrap();
-        cb.wait_until_completed(OnFault::Die).unwrap();
-        assert_eq!(cb.error(), None);
-    }
-
-    /// An encoder made in a thread of an isolated task that ended, which stops at the encoder's
-    /// first command, leaves the runtime's encoder in its handle, open, as Metal's is left: the
-    /// command buffer then has an encoder open, not one abandoned
-    #[test]
-    fn an_ended_tasks_encoder_creation_leaves_the_encoder_open() {
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let p = platform();
-        let d = dev();
-        let (_dst, pass) = pass_of(&p, &d, (4, 4));
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let made = without_unused_resolves(pass.descriptor());
-        let raw = cb.raw.render_command_encoder(&made).unwrap();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            let e = opened(&cb, raw, (made, Vec::new()), Taken::UNMAPPED).unwrap();
-            let rect = MtlScissorRect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            };
-            e.encode(OnFault::Die, RenderCmd::SetScissorRect { rect })
-        });
-        assert!(stopped.is_none());
-        let refused = cb.raw.blit_command_encoder().unwrap_err();
-        assert!(
-            matches!(&refused, rt::Error::Invalid(i) if i.problem == rt::Problem::EncoderOpen),
-            "{refused:?}"
-        );
-    }
-
-    /// The encoder of a pass taken as one over a mutable rate map not yet reset is ([`Taken`]),
-    /// the device's first, made in a thread of an isolated task that ended, is to end with the
-    /// platform's draw and stops at the encoder's first command, the runtime's encoder in its
-    /// handle, open, as Metal's is left, not dropped with the command buffer abandoned. The
-    /// device's caps are read first, as core reads them as the device starts, before any task
-    #[test]
-    fn an_ended_tasks_first_encoder_over_a_mutable_map_is_left_open() {
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let p = platform();
-        let d = dev();
-        let (_dst, pass) = pass_of(&p, &d, (4, 4));
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let made = without_unused_resolves(pass.descriptor());
-        let raw = cb.raw.render_command_encoder(&made).unwrap();
-        let taken = Taken {
-            class: Some(Class::Unset),
-            mutable: true,
-        };
-        d.caps();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            let e = opened(&cb, raw, (made, Vec::new()), taken).unwrap();
-            assert!(e.undrawn.load(Ordering::Acquire));
-            let rect = MtlScissorRect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            };
-            e.encode(OnFault::Die, RenderCmd::SetScissorRect { rect })
-        });
-        assert!(stopped.is_none());
-        let refused = cb.raw.blit_command_encoder().unwrap_err();
-        assert!(
-            matches!(&refused, rt::Error::Invalid(i) if i.problem == rt::Problem::EncoderOpen),
-            "{refused:?}"
-        );
     }
 
     /// The platform's no-draw pipeline is made only for a pass over a mutable map that no draw of

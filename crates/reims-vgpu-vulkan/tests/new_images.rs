@@ -28,7 +28,6 @@
     unsafe_code
 )]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -42,7 +41,6 @@ use reims_vgpu_core::platform::resource::{Buffer, Library};
 use reims_vgpu_core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
 use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_metal::MetalPlatform;
 use reims_vgpu_vulkan::VulkanPlatform;
 
@@ -68,15 +66,6 @@ const PRIVATE: u64 = 0x20;
 const ROUNDS_WORD: usize = 0;
 const END_WORD: usize = 1;
 const ENDED: u32 = 0x600d;
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl<P: Platform> TaskLauncher<P> for NoLauncher {
-    fn launch(&self, _: &Arc<P>, _: Arc<dyn HostSide<P>>) -> Arc<dyn ServiceLink<P>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// What each creation saw as it returned: the kernel's end mark, its command buffer's status,
 /// and how long the creation took.
@@ -222,14 +211,14 @@ fn assert_made_while_running(seen: &Seen) {
 
 #[test]
 fn metal_makes_textures_while_the_gpu_runs() {
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     let seen = textures_while_a_kernel_runs(&p, &MetalPlatform::system_default_device().unwrap());
     assert_made_while_running(&seen);
 }
 
 #[test]
 fn this_platform_makes_textures_while_the_gpu_runs() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     let seen = textures_while_a_kernel_runs(&p, &VulkanPlatform::system_default_device().unwrap());
     assert_made_while_running(&seen);
 }

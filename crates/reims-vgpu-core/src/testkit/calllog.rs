@@ -109,7 +109,7 @@ pub struct Call {
     pub seq: u64,
     /// The receiver's identity (`ObjId(0)` for a service or free function).
     pub obj: ObjId,
-    /// The receiver's class (`MTLDevice`, `mach_vm`, `IOSurface`, `HostBlocks`, a seam name).
+    /// The receiver's class (`MTLDevice`, `mach_vm`, `IOSurface`).
     pub class: &'static str,
     /// The selector, C function or method name.
     pub sel: &'static str,
@@ -414,8 +414,7 @@ thread_local! {
 }
 
 /// Makes every log created from now on record events from the start (`true`), or not: for a
-/// process that runs one program at a time, whose fake processes (an isolated task's service's included)
-/// are made after it decides.
+/// process that runs one program at a time, whose fake processes are made after it decides.
 pub fn record_events_by_default(on: bool) {
     BY_DEFAULT.store(on, Ordering::SeqCst);
 }

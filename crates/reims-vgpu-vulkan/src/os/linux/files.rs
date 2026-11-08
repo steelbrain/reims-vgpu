@@ -41,7 +41,6 @@ use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
-use reims_vgpu_core::memory::dirty::DirtyLog;
 use reims_vgpu_core::num::ToU64 as _;
 use reims_vgpu_core::sync::Mutex;
 
@@ -589,21 +588,13 @@ pub struct GuestMemoryLease {
     /// first.
     _ram: Arc<super::host_ram::LeasedRam>,
     _registrations: Vec<Registration>,
-    /// The ranges registered for the device's dirty log (`super::dirty`).
-    _dirty: Option<super::dirty::Registered>,
 }
 
 /// Registers each range of the guest's RAM the host names a file behind: counted where the same
 /// range was registered already over the same descriptor (module docs). Warns where the views'
-/// budget of mappings is short of the guest's RAM (the `budget` module). With `dirty`, the
-/// device's dirty log, each range is registered for it too, at its guest physical address
-/// (`super::dirty`).
-pub fn lease_guest_memory(
-    ranges: impl IntoIterator<Item = GuestRamFile>,
-    dirty: Option<Arc<DirtyLog>>,
-) -> GuestMemoryLease {
+/// budget of mappings is short of the guest's RAM (the `budget` module).
+pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> GuestMemoryLease {
     let ranges: Vec<GuestRamFile> = ranges.into_iter().collect();
-    let dirty = dirty.map(|log| super::dirty::register(&ranges, &log));
     let ram: Vec<(u64, u64)> = ranges.iter().map(|r| (r.host, r.length)).collect();
     let registrations: Vec<Registration> = ranges
         .into_iter()
@@ -621,9 +612,8 @@ pub fn lease_guest_memory(
         .fold(0u64, u64::saturating_add);
     super::budget::warn_if_short(guest_ram);
     GuestMemoryLease {
-        _ram: super::host_ram::lease(&ram, dirty.is_some()),
+        _ram: super::host_ram::lease(&ram),
         _registrations: registrations,
-        _dirty: dirty,
     }
 }
 
@@ -760,10 +750,8 @@ mod tests {
             fd: Arc::clone(&f),
             offset,
         };
-        let lease = lease_guest_memory(
-            [ram(base, 0x4000, 0), ram(base + 0x10_000, 0x2000, 0x4000)],
-            None,
-        );
+        let lease =
+            lease_guest_memory([ram(base, 0x4000, 0), ram(base + 0x10_000, 0x2000, 0x4000)]);
         assert_eq!(
             shape(&pieces(base + 0x1000, 0x1000).unwrap()),
             [(0, 0x1000, 0x1000)]
@@ -792,10 +780,8 @@ mod tests {
             fd: Arc::clone(&f),
             offset,
         };
-        let lease = lease_guest_memory(
-            [ram(base, 0x4000, 0), ram(base + 0x10_000, 0x4000, 0x4000)],
-            None,
-        );
+        let lease =
+            lease_guest_memory([ram(base, 0x4000, 0), ram(base + 0x10_000, 0x4000, 0x4000)]);
         let backing = |offset| Backing {
             fd: Arc::clone(&f),
             offset,

@@ -327,7 +327,7 @@ fn filtered(min: u64, mag: u64, address: u64) -> SamplerDesc {
 fn cubic_samplers_sample_as_metals() {
     use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
@@ -398,7 +398,7 @@ fn cubic_samplers_sample_in_a_fragment_function_as_metals() {
             .collect()
     }
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
@@ -444,7 +444,7 @@ fn constexpr_bicubic_samplers_sample_as_metals() {
             .collect()
     }
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
@@ -475,7 +475,7 @@ fn constexpr_bicubic_samplers_sample_as_metals() {
 fn cubic_samplers_the_runtime_refuses_die_where_they_sample() {
     use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let md = MetalPlatform::system_default_device();
     let refused: [(&str, SamplerDesc, &str); 6] = [
         (
@@ -649,7 +649,7 @@ fn held_samples<P: reims_vgpu_core::platform::Platform>(
 fn a_cubic_sampler_in_an_argument_buffer_dies_where_its_failure_is_read() {
     use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let md = MetalPlatform::system_default_device();
     let linear = filtered(1, 1, 0);
     let ours = held_samples(&p, &d, &linear, Held::Both);
@@ -675,7 +675,7 @@ fn a_cubic_sampler_in_an_argument_buffer_dies_where_its_failure_is_read() {
 fn a_live_cubic_sampler_leaves_argument_buffer_samples_metals() {
     use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let md = MetalPlatform::system_default_device();
     let linear = filtered(1, 1, 0);
     let cubic = d.new_sampler_state(&filtered(2, 2, 0)).unwrap().unwrap();
@@ -814,7 +814,7 @@ fn a_cubic_state_made_before_a_fragment_stages_commit_is_relayed_unlisted() {
     let relayed = crate::answer::relaxed(|| held_draw(&p, &d, &linear, true));
     assert_eq!(relayed, (4, 0));
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+        let mp = MetalPlatform::new();
         for cubic in [false, true] {
             assert_eq!(
                 held_draw(&mp, &md, &linear, cubic),
@@ -834,7 +834,7 @@ fn a_cubic_state_made_before_a_fragment_stages_commit_is_relayed_unlisted() {
 fn a_texture_slot_sampled_through_an_argument_buffers_sampler_dies_where_it_is_made() {
     use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let md = MetalPlatform::system_default_device();
     for (case, desc) in [("linear", filtered(1, 1, 0)), ("cubic", filtered(2, 2, 0))] {
         let (sel, line) = death_line(|| held_samples(&p, &d, &desc, Held::Sampler));
@@ -1499,7 +1499,7 @@ fn a_function_linked_under_a_specialized_name_is_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (crate::platform::tests::platform(), dev());
     let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
     let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));

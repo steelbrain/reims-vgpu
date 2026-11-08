@@ -8,11 +8,7 @@
 //!   with remap aliasing and maximum protection, guest RAM, all over real memory;
 //! - [`clock::VirtualClock`]: virtual time for core's timed waits;
 //! - [`threads`]: a thread recorder;
-//! - [`logs`]: a capture of the `log` crate's lines;
-//! - [`host`]: the host's callbacks as the device reads them, over fake memory, and a display's
-//!   queue;
-//! - [`resource_host::FakeResourceHost`]: a scripted task, as resources see it;
-//! - [`launcher::ThreadLauncher`]: the isolated tasks' launcher, recording what it launched.
+//! - [`logs`]: a capture of the `log` crate's lines.
 
 // The testkit is outside core's production lint set.
 #![allow(clippy::integer_division_remainder_used, clippy::mod_module_files)]
@@ -23,13 +19,10 @@ pub mod clock;
 pub mod death;
 pub mod faults;
 pub mod guest_ram;
-pub mod host;
 pub mod impls;
-pub mod launcher;
 pub mod logs;
 pub mod objects;
 pub mod platform;
-pub mod resource_host;
 pub mod script;
 pub mod surfaces;
 pub mod threads;

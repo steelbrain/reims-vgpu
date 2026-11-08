@@ -3,8 +3,7 @@
 //!
 //! The accelerator kext wires an IOSurface's allocation while a process holds the surface's
 //! shared block, and lists its guest RAM runs in the block (`SURFACE_PAGES`). The host maps the
-//! runs as one view through the memory map ([`MemoryMap::new_range_mapping`], the same views the
-//! apple-gfx lane's memory maps make), and a `BUFFER_OVER_SURFACE_PAGES` buffer lies over the
+//! runs as one view through the memory map ([`MemoryMap::new_range_mapping`]), and a `BUFFER_OVER_SURFACE_PAGES` buffer lies over the
 //! view, so the GPU reads and writes the surface's own pages in place: no copy of them is made
 //! or synced. The view is the block's until its `BLOCK_RELEASE`; each buffer over it holds it
 //! until the platform frees the buffer.
@@ -94,8 +93,8 @@ use reims_graphics::wire::{
     RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxPageRun,
     RgfxSurfacePages,
 };
-use reims_vgpu_core::guest::records::APV_PAGE_SIZE;
 use reims_vgpu_core::host::{HostPtr, PhysRange};
+use reims_vgpu_core::memory::PAGE_SIZE as MAPPING_PAGE;
 use reims_vgpu_core::memory::map::MemoryMap;
 use reims_vgpu_core::memory::mapping::Mapping;
 use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
@@ -397,7 +396,7 @@ impl<P: Platform> SurfaceViews<P> {
     pub(crate) fn available(&self, platform: &P) -> bool {
         self.memory.is_some()
             && platform.vm().page_size() == GUEST_PAGE
-            && APV_PAGE_SIZE == GUEST_PAGE
+            && MAPPING_PAGE == GUEST_PAGE
     }
 
     /// What the views did so far.
@@ -627,7 +626,7 @@ impl<P: Platform> SurfaceViews<P> {
             return Err(PagesRefusal::NoMemoryMap);
         }
         // Whole pages of the host's, of the guest's and of the length core's mappings take.
-        let page = platform.vm().page_size().max(APV_PAGE_SIZE).max(GUEST_PAGE);
+        let page = platform.vm().page_size().max(MAPPING_PAGE).max(GUEST_PAGE);
         if !page.is_power_of_two() {
             return Err(PagesRefusal::PageSize);
         }

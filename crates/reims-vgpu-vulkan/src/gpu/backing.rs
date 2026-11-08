@@ -189,7 +189,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use metal2vulkan_runtime as rt;
@@ -201,7 +201,6 @@ use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use reims_vgpu_core::rt::BlockEnv;
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::tasks::isolation::TaskLife;
 
 use crate::answer::unrepresentable;
 use crate::os::OsVm;
@@ -795,29 +794,15 @@ struct Detached {
     released: BTreeMap<rt::ObjectId, u64>,
     /// The releases of `released`, in the order of their numbers, the oldest first.
     releases: VecDeque<(u64, rt::ObjectId)>,
-    /// The open command buffers, by number, until they close ([`Opened`]). One made by an isolated
-    /// task that ended and never committed holds nothing ([`Open::let_go`]): an ended task's
-    /// commits no more, but for a commit already past its check of the task's end, which puts it
-    /// back ([`Registry::commit`]), and one of a task that died is never released ([`TaskLife`]).
-    /// Such ones go as they reach the front, the oldest open, at a close, and all of them once the
-    /// open ones grew to twice `fewest`, at a close: in O(1) a close, over the closes.
+    /// The open command buffers, by number, until they close ([`Opened`]).
     open: BTreeMap<u64, Arc<Open>>,
-    /// The fewest open command buffers since those that hold nothing were last let go of.
-    fewest: usize,
 }
 
-/// An open command buffer ([`Opened`]): its number, the isolated task that made it, if one did,
-/// until it commits, and what the runtime submitted of it.
+/// An open command buffer ([`Opened`]): its number, and what the runtime submitted of it.
 #[derive(Debug)]
 struct Open {
     /// Its number in the sequence of [`Detached`].
     number: u64,
-    /// The isolated task that made it, if one did.
-    task: Option<Weak<TaskLife>>,
-    /// Whether it is open, not committed ([`OPEN`]), committed, open until it completed whatever
-    /// its task does ([`COMMITTED`]), or let go of as holding nothing ([`DROPPED`]): each change
-    /// is one exchange, so a commit and a close's letting go never both pass unseen.
-    state: AtomicU8,
     /// Its submissions the runtime submitted, until it closes: each decided and noted under this
     /// lock ([`Opened::submit`]), which a detach reads them under ([`in_flight`]), a note for
     /// each part of it the platform committed apart ([`Opened::next_part`]). A note holds its
@@ -825,26 +810,6 @@ struct Open {
     submitted: Mutex<Vec<Submitted>>,
     /// The places of its parts not yet closed ([`Opened`]): it closes with the last.
     parts: AtomicUsize,
-}
-
-/// [`Open::state`]: open, not committed.
-const OPEN: u8 = 0;
-/// [`Open::state`]: committed.
-const COMMITTED: u8 = 1;
-/// [`Open::state`]: let go of, not committed, as holding nothing ([`Open::let_go`]).
-const DROPPED: u8 = 2;
-
-impl Open {
-    /// Whether it holds nothing, and is let go of now: made by an isolated task that ended, and
-    /// not committed. A commit of its command buffer after this, which a task's end after the
-    /// commit's check of it lets through, finds it let go of and puts it back
-    /// ([`Registry::commit`]).
-    fn let_go(&self) -> bool {
-        (self.task.as_ref()).is_some_and(|task| task.upgrade().is_none_or(|task| task.has_ended()))
-            && (self.state)
-                .compare_exchange(OPEN, DROPPED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-    }
 }
 
 /// A command buffer whose submissions the runtime submitted, until it closes ([`Opened`]): it,
@@ -876,20 +841,6 @@ impl Detached {
             .map(|(&id, _)| id);
         self.detached.iter().copied().chain(released).collect()
     }
-
-    /// The open command buffers that hold nothing let go of ([`Detached::open`]).
-    fn prune(&mut self) {
-        while let Some(oldest) = self.open.first_entry()
-            && oldest.get().let_go()
-        {
-            oldest.remove();
-        }
-        self.fewest = self.fewest.min(self.open.len());
-        if self.open.len() >= 2 * self.fewest.max(16) {
-            self.open.retain(|_, open| !open.let_go());
-            self.fewest = self.open.len();
-        }
-    }
 }
 
 impl Registry {
@@ -905,40 +856,22 @@ impl Registry {
                 released: BTreeMap::new(),
                 releases: VecDeque::new(),
                 open: BTreeMap::new(),
-                fewest: 0,
             }),
             #[cfg(test)]
             between: None,
         }
     }
 
-    /// A command buffer made now by `task`, or by none: its place, open until it closes.
-    fn open(&self, task: Option<Weak<TaskLife>>) -> Arc<Open> {
+    /// A command buffer made now: its place, open until it closes.
+    fn open(&self) -> Arc<Open> {
         let mut state = self.state.lock();
         let open = Arc::new(Open {
             number: state.number(),
-            task,
-            state: AtomicU8::new(OPEN),
             submitted: Mutex::new(Vec::new()),
             parts: AtomicUsize::new(1),
         });
         state.open.insert(open.number, Arc::clone(&open));
         open
-    }
-
-    /// The command buffer of `open` commits now: open until it completed, whatever its task does.
-    /// One a close let go of as holding nothing, its task having ended after the commit's check
-    /// of the task's end, is open again, so a detach finds what it submits
-    /// ([`Registry::noted_since`]); a release made while it was let go of may have been forgotten
-    /// already.
-    fn commit(&self, open: &Arc<Open>) {
-        let committed =
-            (open.state).compare_exchange(OPEN, COMMITTED, Ordering::AcqRel, Ordering::Acquire);
-        if committed == Err(DROPPED) {
-            let mut state = self.state.lock();
-            open.state.store(COMMITTED, Ordering::Release);
-            state.open.insert(open.number, Arc::clone(open));
-        }
     }
 
     /// Object `id` detached.
@@ -1000,13 +933,12 @@ impl Registry {
         ids.iter().any(|id| failing.contains(id))
     }
 
-    /// Command buffer `number` closed, and those that hold nothing let go of: the releases no
-    /// open command buffer was made before are forgotten. Its place is answered, to be let go of
+    /// Command buffer `number` closed: the releases no open command buffer was made before are
+    /// forgotten. Its place is answered, to be let go of
     /// without the lock.
     fn closed(&self, number: u64) -> Option<Arc<Open>> {
         let mut state = self.state.lock();
         let open = state.open.remove(&number);
-        state.prune();
         let oldest = state.open.keys().next().copied().unwrap_or(u64::MAX);
         while let Some(&(at, id)) = state.releases.front()
             && at <= oldest
@@ -1053,11 +985,10 @@ pub(crate) struct Opened {
 }
 
 impl Opened {
-    /// The place of a command buffer made now, by the isolated task whose code runs, if one is.
+    /// The place of a command buffer made now.
     pub(crate) fn new() -> Opened {
-        let task = TaskLife::current().map(|task| Arc::downgrade(&task));
         Opened {
-            open: DETACHED.open(task),
+            open: DETACHED.open(),
             part: 0,
         }
     }
@@ -1071,13 +1002,6 @@ impl Opened {
             open: Arc::clone(&self.open),
             part: self.part + 1,
         }
-    }
-
-    /// The command buffer commits now: open until it completed, whatever its task does
-    /// ([`Registry::commit`]).
-    pub(crate) fn commit(self) -> Opened {
-        DETACHED.commit(&self.open);
-        self
     }
 
     /// The submission check of `submission` of the command buffer ([`submission_check`]): it
@@ -1335,8 +1259,7 @@ impl Drop for Alias {
 /// Where host memory was handed to the runtime, as the trace names it ([`ImportTrace`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ImportSite {
-    /// A no-copy buffer over host memory core gives (`newBufferWithBytesNoCopy`: task pages, the
-    /// EFI framebuffer).
+    /// A no-copy buffer over host memory core gives (`newBufferWithBytesNoCopy`: guest pages).
     NoCopyBytes,
     /// A no-copy buffer a descriptor names (a detached buffer).
     NoCopyDescriptor,
@@ -2114,17 +2037,10 @@ mod tests {
         Registry::new()
     }
 
-    /// A command buffer made now in `d` by `task`, or by none: its number. Its place stays in
-    /// `d` until it closes there.
-    fn made(d: &Registry, task: Option<&Arc<TaskLife>>) -> u64 {
-        d.open(task.map(Arc::downgrade)).number
-    }
-
-    /// Command buffer `made` committed now in `d`.
-    fn committed(d: &Registry, made: u64) -> u64 {
-        let open = Arc::clone(&d.state.lock().open[&made]);
-        d.commit(&open);
-        made
+    /// A command buffer made now in `d`: its number. Its place stays in `d` until it closes
+    /// there.
+    fn made(d: &Registry) -> u64 {
+        d.open().number
     }
 
     /// The numbers of the command buffers open in `d`.
@@ -2313,16 +2229,15 @@ mod tests {
     fn detached_objects_fail_their_command_buffers() {
         let d = registry();
         let [buffer, heap] = ids();
-        let first = made(&d, None);
+        let first = made(&d);
         assert!(!d.any(first));
         d.detached(buffer);
         assert!(d.any(first) && d.fails(&[buffer], first) && !d.fails(&[heap], first));
         d.attached(buffer);
         assert!(!d.any(first) && !d.fails(&[buffer], first), "replaced");
-        let first = committed(&d, first);
         d.detached(buffer);
         d.released(buffer);
-        let second = made(&d, None);
+        let second = made(&d);
         assert!(d.state.lock().detached.is_empty());
         assert!(d.fails(&[buffer], first), "made before the release");
         assert!(
@@ -2330,7 +2245,6 @@ mod tests {
             "made after it"
         );
         d.detached(heap);
-        let second = committed(&d, second);
         assert!(
             d.fails(&[heap], second) && d.fails(&[heap], first),
             "detached"
@@ -2362,9 +2276,8 @@ mod tests {
             ..Registry::new()
         };
         let [buffer] = ids();
-        let open = made(&d, None);
+        let open = made(&d);
         assert_eq!(open, 0);
-        let open = committed(&d, open);
         d.detached(buffer);
         assert!(d.any(open));
         d.released(buffer);
@@ -2380,18 +2293,18 @@ mod tests {
     fn releases_are_forgotten_in_order_as_the_oldest_command_buffers_close() {
         let d = registry();
         let objects: [rt::ObjectId; 6] = ids();
-        let old = made(&d, None);
+        let old = made(&d);
         let [first, second, third, rest @ ..] = objects;
         for id in [first, second] {
             d.detached(id);
             d.released(id);
         }
-        let middle = made(&d, None);
+        let middle = made(&d);
         for id in std::iter::once(third).chain(rest) {
             d.detached(id);
             d.released(id);
         }
-        let new = made(&d, None);
+        let new = made(&d);
         assert!(d.any(old) && d.any(middle) && !d.any(new));
         assert!(d.fails(&[first], old) && !d.fails(&[first], middle) && d.fails(&[third], middle));
         d.closed(old);
@@ -2574,86 +2487,6 @@ mod tests {
             (vec![(true, 1)], vec![(4, 0), (5, 0)]),
             "(not completed, command buffers taking it) waiting; (status, them) in the handlers"
         );
-    }
-
-    /// A command buffer of an isolated task that ended holds no release: one that died mid-encode
-    /// is never released, and never commits. One that committed holds it until it completed
-    #[test]
-    fn an_ended_tasks_command_buffer_holds_no_release() {
-        let d = registry();
-        let task = TaskLife::new();
-        let leaked = made(&d, Some(&task));
-        let sent = made(&d, Some(&task));
-        let sent = committed(&d, sent);
-        let host = made(&d, None);
-        let [buffer] = ids();
-        d.detached(buffer);
-        d.released(buffer);
-        assert!(d.fails(&[buffer], leaked) && d.fails(&[buffer], sent));
-        d.closed(host);
-        assert!(d.fails(&[buffer], leaked), "the task is running");
-        let other = made(&d, None);
-        assert!(task.exit());
-        d.closed(other);
-        assert_eq!(open(&d), [sent]);
-        assert!(d.fails(&[buffer], sent), "committed");
-        d.closed(sent);
-        assert!(open(&d).is_empty() && d.state.lock().released.is_empty());
-    }
-
-    /// A command buffer whose task ended after its commit's check of the task's end, so that a
-    /// close let go of its place as holding nothing before the commit, is open again from its
-    /// commit until it closes, so a detach finds what it submits ([`Registry::noted_since`]); a
-    /// later close keeps it
-    #[test]
-    fn a_commit_after_its_tasks_end_keeps_its_place() {
-        let d = registry();
-        let task = TaskLife::new();
-        let late = d.open(Some(Arc::downgrade(&task)));
-        let other = made(&d, None);
-        assert!(task.exit());
-        d.closed(other);
-        assert!(
-            open(&d).is_empty(),
-            "let go of: its task ended, uncommitted"
-        );
-        d.commit(&late);
-        assert_eq!(open(&d), [late.number], "open again");
-        let after = made(&d, None);
-        d.closed(after);
-        assert_eq!(open(&d), [late.number], "committed: kept");
-        d.closed(late.number);
-        assert!(open(&d).is_empty());
-    }
-
-    /// The command buffers of an ended task that lie behind an older open one go as the open ones
-    /// double since the last such sweep, at a close, and not one a close before: each close costs
-    /// O(1) over the closes, where a walk of every open one at each close cost O(open)
-    #[test]
-    fn an_ended_tasks_command_buffers_behind_an_open_one_go_as_the_open_ones_double() {
-        let d = registry();
-        let task = TaskLife::new();
-        let oldest = made(&d, None);
-        let leaked: Vec<u64> = (0..20).map(|_| made(&d, Some(&task))).collect();
-        assert!(task.exit());
-        let mut host: Vec<u64> = (0..11).map(|_| made(&d, None)).collect();
-        d.closed(host.remove(0));
-        assert_eq!(open(&d).len(), 31, "under twice 16 open after the close");
-        assert!(open(&d).contains(&leaked[0]));
-        host.extend([made(&d, None), made(&d, None)]);
-        d.closed(host.pop().unwrap());
-        assert_eq!(
-            open(&d).len(),
-            12,
-            "swept at twice 16: the oldest and eleven of the host's"
-        );
-        assert!(leaked.iter().all(|n| !open(&d).contains(n)));
-        assert_eq!(d.state.lock().fewest, 12);
-        d.closed(oldest);
-        for n in host {
-            d.closed(n);
-        }
-        assert!(open(&d).is_empty());
     }
 
     /// The length of a run of pages in [`Pages`]' tests.

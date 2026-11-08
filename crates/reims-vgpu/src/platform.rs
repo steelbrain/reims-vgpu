@@ -211,15 +211,14 @@ mod tests {
     }
 
     /// The Vulkan platform's devices: the default one, the same object again by the registry ID
-    /// the platform answers for it, and none for an ID no device has (the suite's `UINT64_MAX`)
+    /// the platform answers for it, and none for an ID no device has (`UINT64_MAX`)
     #[cfg(vulkan_platform)]
     #[test]
     fn vulkan_devices_by_registry_id() {
         use reims_vgpu_core::platform::Handle as _;
-        use reims_vgpu_core::tasks::isolation::TaskThreads;
         use reims_vgpu_vulkan::VulkanPlatform;
 
-        let p = VulkanPlatform::new(Box::new(TaskThreads::new()));
+        let p = VulkanPlatform::new();
         let d = p.metal_device(None).expect("a Vulkan device (MoltenVK)");
         let id = d.registry_id;
         assert_eq!(p.metal_device(Some(id)).map(|o| o.id()), Some(d.id()));
@@ -236,14 +235,13 @@ mod tests {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
         use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _};
-        use reims_vgpu_core::tasks::isolation::TaskThreads;
         use reims_vgpu_vulkan::VulkanPlatform;
         use reims_vgpu_vulkan::os::OsVm;
 
         use crate::memory::MemoryFile;
 
         const LEN: u64 = 0x4000;
-        let p = VulkanPlatform::new(Box::new(TaskThreads::new()));
+        let p = VulkanPlatform::new();
         let vm = OsVm::new();
         // The guest's RAM as QEMU maps it: a shared mapping of a memfd, from an offset into it.
         // SAFETY: a NUL-terminated name; the descriptor is owned from here on.

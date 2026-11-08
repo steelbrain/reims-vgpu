@@ -52,10 +52,6 @@
 //! through a slot that also reads the texture, or by a command that writes the planes through the
 //! texture and another way, which the runtime refuses alike.
 //!
-//! **A task that has ended sends nothing**, as on the Metal platform: before every call, a thread
-//! running the work of an isolated task that died or was invalidated stops
-//! (`stop_if_task_ended`).
-//!
 //! **A degradation of a kind [`DIES`] lists is relayed, and dies in strict mode** ([`notice`],
 //! the runtime's message sink), but those of [`DIES_BY_DEFAULT`], which die in either mode: the
 //! runtime announces each kind of degradation once per device, but these kinds at every
@@ -93,10 +89,8 @@
 //! says on stderr, once per process as it turns on, that the run is not faithful to Metal. On
 //! macOS the variable is ignored: every such degradation dies there.
 //!
-//! **Every death here ends the process**, one inside an isolated task's own call included: each
-//! is a platform death (`DeathId::Platform`), which core's isolation leaves to the process, as it
-//! leaves a crash inside Metal (`reims_vgpu_core::tasks::isolation::life`), and every task's work
-//! runs on the one runtime device and its scheduler thread. The runtime catches a panic in its
+//! **Every death here is a platform death** (`DeathId::Platform`): it ends the process, or, inside
+//! a refusal scope, refuses the op that met it. The runtime catches a panic in its
 //! sink, which only the test capture's death is: under the capture, a notice kept before it died
 //! dies again at the thread's next call here.
 //!
@@ -140,7 +134,6 @@ use metal2vulkan_runtime::Error;
 use reims_vgpu_core::platform::types::NsErrorText;
 use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
 
 pub mod census;
 pub mod native;
@@ -226,7 +219,6 @@ pub fn send<T>(
     policy: Policy,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<T> {
-    stop_if_task_ended();
     inside(Some(sel), call).or_else(|e| decide(sel, policy, e))
 }
 
@@ -238,7 +230,6 @@ pub fn send_describing<T>(
     describe: impl FnOnce() -> String,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<T> {
-    stop_if_task_ended();
     inside(Some(sel), call).or_else(|e| decide_describing(sel, policy, e, Some(&describe())))
 }
 
@@ -253,18 +244,10 @@ pub fn get_describing<T>(
     descriptor: Option<&str>,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> T {
-    stop_if_task_ended();
     got(sel, descriptor, call)
 }
 
-/// [`get`] without the check of the task's end before `call`: for a call no thread may stop
-/// before, as one made while the runtime's encoder just made is not in its handle yet
-/// (`crate::gpu::command`'s `CommandBufferObject::tiler_work`).
-pub fn unstopped_get<T>(sel: &'static str, call: impl FnOnce() -> Result<T, Error>) -> T {
-    got(sel, None, call)
-}
-
-/// [`get_describing`]'s call, after its check of the task's end.
+/// [`get_describing`]'s call.
 fn got<T>(
     sel: &'static str,
     descriptor: Option<&str>,
@@ -282,20 +265,12 @@ fn got<T>(
 /// [`DIES`] announced inside it dies at the kind's code. A call that stands for a selector is
 /// [`plain_at`]'s.
 pub fn plain<T>(call: impl FnOnce() -> T) -> T {
-    stop_if_task_ended();
     inside(None, call)
 }
 
 /// Runs `call`, the runtime's form of `sel`, whose result the caller decides: a degradation of
 /// [`DIES`] announced inside it dies at `sel`, as one inside [`send`]'s call does.
 pub fn plain_at<T>(sel: &'static str, call: impl FnOnce() -> T) -> T {
-    stop_if_task_ended();
-    inside(Some(sel), call)
-}
-
-/// [`plain_at`] without the check of the task's end before `call`: for a call no thread may stop
-/// before, as one holding an encoder it took ([`crate::gpu::encode_blit::EncoderObject::end`]).
-pub fn unstopped_at<T>(sel: &'static str, call: impl FnOnce() -> T) -> T {
     inside(Some(sel), call)
 }
 
@@ -308,7 +283,6 @@ pub fn create<T>(
     nil: Nil,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<Option<T>> {
-    stop_if_task_ended();
     match inside(Some(sel), call) {
         Ok(v) => Ok(Some(v)),
         Err(Error::Nil(_)) => Ok(None),

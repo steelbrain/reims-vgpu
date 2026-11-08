@@ -119,7 +119,6 @@ use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
     Policy, created_or_decided, get, hearing, plain, plain_at, refused, send, unrepresentable,
-    unstopped_at,
 };
 use crate::gpu::command::{Progress, VulkanCommandBuffer};
 use crate::gpu::device::VulkanDevice;
@@ -495,10 +494,7 @@ static NO_DRAW: Mutex<Vec<(u64, rt::RenderPipelineState)>> = Mutex::new(Vec::new
 /// Its vertex function returns nothing ([`NO_DRAW_LIBRARY`]), its rasterization is off, it names
 /// no attachment formats, and its largest vertex amplification count is the device's, which is
 /// 1 on a device without multiview. A refusal of the library, the function or the pipeline dies
-/// at `sel`, as the Metal platform's ends the process where Metal does not make one. Nothing here
-/// stops a thread of a task that ended: the pass's end, which asks for it, stopped one first
-/// (`crate::gpu::encode_render`). The device's caps it reads were read as core started the
-/// device, before any task ran.
+/// at `sel`, as the Metal platform's ends the process where Metal does not make one.
 pub(crate) fn no_draw(sel: &'static str, device: &VulkanDevice) -> rt::RenderPipelineState {
     use metal2vulkan::pipeline::{RenderPipelineDescriptor, StageSource};
     use reims_vgpu_core::platform::device::GpuDevice as _;
@@ -509,16 +505,16 @@ pub(crate) fn no_draw(sel: &'static str, device: &VulkanDevice) -> rt::RenderPip
     if let Some((_, pipeline)) = made.iter().find(|(r, _)| *r == id) {
         return pipeline.clone();
     }
-    let library = unstopped_at(sel, || device.raw.new_library_with_data(NO_DRAW_LIBRARY))
+    let library = plain_at(sel, || device.raw.new_library_with_data(NO_DRAW_LIBRARY))
         .unwrap_or_else(|e| refused(sel, &e));
-    let function = unstopped_at(sel, || library.new_function_with_name("reims_vgpu_no_draw"))
+    let function = plain_at(sel, || library.new_function_with_name("reims_vgpu_no_draw"))
         .unwrap_or_else(|e| refused(sel, &e));
     let mut desc =
         RenderPipelineDescriptor::new(StageSource::Function(function.function_descriptor()));
     desc.rasterization_enabled = false;
     desc.max_vertex_amplification_count =
         u32::try_from(device.caps().max_vertex_amplification_count).unwrap_or(u32::MAX);
-    let pipeline = unstopped_at(sel, || {
+    let pipeline = plain_at(sel, || {
         (device.raw).new_render_pipeline_state(&desc, &rt::PipelineOptions::default())
     })
     .unwrap_or_else(|e| refused(sel, &e));

@@ -4,8 +4,7 @@
 //! Every handle is an [`Obj<T>`]: one counted reference to a value of this crate, which holds the
 //! runtime's object (one reference of the runtime's own) and what core's trait asks of the object
 //! beside it. Not `Clone` (D6): `.clone_ref()` is the retain and `Drop` the release, so the
-//! runtime's object goes when core's last handle to it does (leaked instead while an isolated task
-//! that died lets go of it, as the Metal platform leaks its objects then). `id()` is the
+//! runtime's object goes when core's last handle to it does. `id()` is the
 //! reference's address: the same for every reference to one object, as a Metal object's pointer
 //! is.
 //!
@@ -17,16 +16,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::host::HostBlocks;
 use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::os::Threads;
 use reims_vgpu_core::platform::os::surface::IoSurfaces;
 use reims_vgpu_core::platform::os::vm::HostVm;
 use reims_vgpu_core::platform::types::{MtlSize, ResourceAddressRange};
 use reims_vgpu_core::platform::values::{RateMapDesc, TextureDesc};
-use reims_vgpu_core::platform::{Handle, ObjId, Platform, ProcessState};
+use reims_vgpu_core::platform::{Handle, ObjId, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::tasks::launcher::TaskLauncher;
 
 use crate::answer::{get, plain, plain_at, refused};
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
@@ -50,14 +47,11 @@ use crate::gpu::resource::{
     VulkanTexture,
 };
 use crate::os::{OsClock, OsSurface, OsSurfaces, OsThreads};
-use crate::remap::{self, VulkanVm};
+use crate::remap::VulkanVm;
 
 /// One counted reference to an object of this platform (architecture 4.1).
 ///
-/// Not `Clone` (D6): [`Handle::clone_ref`] is the only retain. `Drop` is the release, except
-/// while the thread unwinds or releases an isolated task that died
-/// ([`leaks_objects`](reims_vgpu_core::tasks::isolation::life::leaks_objects)): the reference
-/// is then leaked, as a crashed process never released it.
+/// Not `Clone` (D6): [`Handle::clone_ref`] is the only retain, and `Drop` the release.
 pub struct Obj<T: Send + Sync + 'static>(ManuallyDrop<Arc<T>>);
 
 impl<T: Send + Sync + 'static> Obj<T> {
@@ -78,11 +72,8 @@ impl<T: Send + Sync + 'static> Obj<T> {
 }
 
 impl<T: Send + Sync + 'static> Drop for Obj<T> {
-    /// The release, or nothing while the thread unwinds or releases an isolated task that died.
+    /// The release.
     fn drop(&mut self) {
-        if reims_vgpu_core::tasks::isolation::life::leaks_objects() {
-            return;
-        }
         // SAFETY: the reference is released once, here, and never touched after.
         unsafe { ManuallyDrop::drop(&mut self.0) }
     }
@@ -119,15 +110,18 @@ impl<T: Send + Sync + 'static> Handle for Obj<T> {
 static LISTENER: OnceLock<rt::SharedEventListener> = OnceLock::new();
 
 /// The process's platform: the runtime's GPU objects, and the OS's IOSurface, VM (reporting the
-/// pages it changes, [`crate::remap`]), clocks and threads ([`crate::os`]), with the task
-/// launcher.
+/// pages it changes, [`crate::remap`]), clocks and threads ([`crate::os`]).
 pub struct VulkanPlatform {
     surfaces: OsSurfaces,
     vm: VulkanVm,
     clock: OsClock,
     threads: OsThreads,
-    globals: ProcessState<VulkanPlatform>,
-    launcher: Box<dyn TaskLauncher<VulkanPlatform>>,
+}
+
+impl Default for VulkanPlatform {
+    fn default() -> VulkanPlatform {
+        VulkanPlatform::new()
+    }
 }
 
 impl fmt::Debug for VulkanPlatform {
@@ -137,21 +131,17 @@ impl fmt::Debug for VulkanPlatform {
 }
 
 impl VulkanPlatform {
-    /// The process's platform. `launcher` starts isolated GPU task services (each on threads of
-    /// its own in the product, `tasks::isolation::TaskThreads`). Make one per process:
-    /// `ProcessState` is the process-wide state (D17). It installs what the OS's services need
+    /// The process's platform. Make one per process (D17). It installs what the OS's services need
     /// first ([`crate::os::install_process_services`]): on macOS the Objective-C autorelease
     /// pool core's pools push, as `MetalPlatform::new` does, as IOSurface and Foundation still
     /// autorelease into it.
-    pub fn new(launcher: Box<dyn TaskLauncher<VulkanPlatform>>) -> VulkanPlatform {
+    pub fn new() -> VulkanPlatform {
         crate::os::install_process_services();
         VulkanPlatform {
             surfaces: OsSurfaces::new(),
             vm: VulkanVm::new(),
             clock: OsClock::new(),
             threads: OsThreads::new(),
-            globals: ProcessState::new(),
-            launcher,
         }
     }
 
@@ -671,20 +661,6 @@ impl Platform for VulkanPlatform {
     fn threads(&self) -> &dyn Threads {
         &self.threads
     }
-
-    fn globals(&self) -> &ProcessState<VulkanPlatform> {
-        &self.globals
-    }
-
-    fn launcher(&self) -> &dyn TaskLauncher<VulkanPlatform> {
-        &*self.launcher
-    }
-
-    /// The host's blocks, those that change pages reporting what they changed to every device
-    /// ([`remap::reporting`]).
-    fn host_blocks(&self, blocks: HostBlocks) -> HostBlocks {
-        remap::reporting(blocks, Arc::new(device::host_range_remapped))
-    }
 }
 
 /// The private `MTLResourceAddressRangeArray *`: the ranges, as the array copies them, which a
@@ -700,10 +676,6 @@ pub type VulkanAddressRangeArray = Obj<AddressRanges>;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::Arc;
-
-    use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink};
-
     use super::*;
     use crate::gpu::device::tests::dev;
 
@@ -727,21 +699,8 @@ pub(crate) mod tests {
         assert!(once.clone().all(|k| !by_default.contains(k)));
     }
 
-    /// A launcher no test launches through.
-    struct NoLauncher;
-
-    impl TaskLauncher<VulkanPlatform> for NoLauncher {
-        fn launch(
-            &self,
-            _platform: &Arc<VulkanPlatform>,
-            _host: Arc<dyn HostSide<VulkanPlatform>>,
-        ) -> Arc<dyn ServiceLink<VulkanPlatform>> {
-            panic!("no task is launched in these tests")
-        }
-    }
-
     pub(crate) fn platform() -> VulkanPlatform {
-        VulkanPlatform::new(Box::new(NoLauncher))
+        VulkanPlatform::new()
     }
 
     /// Each listener the platform makes is an object of its own, and every one runs what is posted
@@ -866,31 +825,6 @@ pub(crate) mod tests {
         assert!(format!("{:?}", Obj::new(3u8)).ends_with(" 3>"));
     }
 
-    /// Obj: a handle an isolated task's death unwinds past is leaked, not released
-    #[test]
-    fn a_dead_tasks_unwind_leaks_its_handles() {
-        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let o = Obj::new(1u8);
-        let weak = o.downgrade();
-        let life = TaskLife::new();
-        let r: Option<()> = life.run(|| {
-            let _held = o.clone_ref();
-            reims_vgpu_core::fatal!(DeathSite {
-                kind: DeathKind::Abort,
-                file: "platform.test",
-                line: 0,
-            })
-        });
-        assert_eq!(r, None);
-        drop(o);
-        assert!(
-            Obj::upgrade(&weak).is_some(),
-            "the task's reference was leaked"
-        );
-    }
-
     /// A device creator dies at its selector where the runtime refuses its devices otherwise than
     /// for having none, naming the refusal; with no device or no loader it makes none
     #[test]
@@ -978,7 +912,6 @@ pub(crate) mod tests {
     fn services() {
         let p = platform();
         let _ = (p.surfaces(), p.vm(), p.clock(), p.threads());
-        let _ = (p.globals(), p.launcher());
         assert!(format!("{p:?}").contains("VulkanPlatform"));
         let page = if cfg!(target_os = "macos") {
             16384

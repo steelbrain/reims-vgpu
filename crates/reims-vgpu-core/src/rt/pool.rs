@@ -64,7 +64,7 @@ impl Pool {
 }
 
 impl Drop for Pool {
-    /// Pops the pool. A death unwinding (a test's captured one, or an isolated task's) leaves it
+    /// Pops the pool. A death unwinding (a test's captured one) leaves it
     /// pushed, as a death that ends the process does.
     fn drop(&mut self) {
         if std::thread::panicking() {

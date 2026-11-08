@@ -1087,10 +1087,8 @@ fn multisampled_copies_on<P: reims_vgpu_core::platform::Platform>(
 #[test]
 fn multisampled_depth_and_stencil_buffer_copies_are_the_metal_platforms() {
     let vulkan = crate::platform::tests::platform();
-    let metal = reims_vgpu_metal::MetalPlatform::system_default_device().map(|d| {
-        let launcher = Box::new(crate::gpu::device::tests::metal_tests::NoLauncher);
-        (reims_vgpu_metal::MetalPlatform::new(launcher), d)
-    });
+    let metal = reims_vgpu_metal::MetalPlatform::system_default_device()
+        .map(|d| (reims_vgpu_metal::MetalPlatform::new(), d));
     let depths = |n: u64| -> Vec<u8> {
         (0..n)
             .flat_map(|i| ((i % 4096) as f32 / 4095.0).to_le_bytes())

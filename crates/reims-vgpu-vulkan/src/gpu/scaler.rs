@@ -280,7 +280,7 @@ impl ScalerGpu {
         keep: Box<dyn Send + 'static>,
     ) -> Result<GpuBuffer, String> {
         // SAFETY: the caller's: mapped, writable pages, kept mapped by `keep`.
-        let memory = unsafe { crate::os::host_memory(first, true) };
+        let memory = unsafe { crate::os::host_memory(first) };
         let contents = rt::BufferContents::NoCopy {
             memory,
             deallocator: None,

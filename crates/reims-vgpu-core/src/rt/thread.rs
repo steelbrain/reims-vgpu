@@ -1,7 +1,7 @@
-//! `spawn_named` (the FIFO's thread) and the "our thread" marker the panic hook reads.
+//! `spawn_named` (a named thread of core's) and the "our thread" marker the panic hook reads.
 //!
-//! Core asks the platform's `Threads` for the threads it runs on (D35): the FIFO thread here,
-//! and each serial queue's worker (`rt::queue`). This wrapper adds what the FIFO thread needs:
+//! Core asks the platform's `Threads` for the threads it runs on (D35): named threads here,
+//! and each serial queue's worker (`rt::queue`). This wrapper adds what such a thread needs:
 //! the "ours" mark the panic hook reads (6.5), the thread's own last-resort holder and pool, and,
 //! in tests, the creator's death slot. Its body starts with no handler, and holds under
 //! [`Hold::NONE`](crate::rt::Hold::NONE): a hold is not `Send`, so none reaches it.
@@ -11,11 +11,8 @@ use std::marker::PhantomData;
 
 use crate::platform::os::Threads;
 
-/// The FIFO thread's stack: 576 KiB. The FIFO thread runs an isolated task's exec job itself
-/// (`tasks::remote`), under its own frames (the loop's 512-byte barrier buffer, the command's
-/// dispatch and the two queue turns), so it has a queue worker's
-/// [`WORKER_STACK`](crate::rt::queue::WORKER_STACK), where such a job otherwise runs, and 64 KiB
-/// for those.
+/// A named thread's stack: 576 KiB, a queue worker's
+/// [`WORKER_STACK`](crate::rt::queue::WORKER_STACK) and 64 KiB more.
 pub const FIFO_THREAD_STACK: usize = crate::rt::queue::WORKER_STACK + 64 * 1024;
 
 thread_local! {
@@ -35,7 +32,7 @@ pub(crate) fn is_core_thread() -> bool {
     CORE.with(Cell::get)
 }
 
-/// Whether the current thread is ours (the FIFO thread, a queue's worker, or inside an `rvg_`
+/// Whether the current thread is ours (a named thread, a queue's worker, or inside an `rvg_`
 /// entry point). The panic hook aborts before unwinding on such a thread (6.5).
 pub fn is_our_thread() -> bool {
     OURS.with(Cell::get)
@@ -69,7 +66,7 @@ impl Drop for OursGuard {
 /// [`Threads::spawn`], whose body runs marked as ours, with the thread's
 /// last-resort holder and real pool. The thread ends in this order: `body` returns, the
 /// last-resort holder is released and the pool popped ([`crate::rt::pool::drain_thread_end`]),
-/// and then `target` (the FIFO) is dropped, on the thread.
+/// and then `target` is dropped, on the thread.
 pub fn spawn_named(
     threads: &dyn Threads,
     name: &'static str,
@@ -120,7 +117,7 @@ impl Drop for InSlot {
 }
 
 /// Marks the current thread, for its whole life, as one core made: ours (6.5) and core's (the
-/// testkit's `is_core_thread`). The FIFO thread, a queue's worker and a timer's thread.
+/// testkit's `is_core_thread`). A named thread, a queue's worker and a timer's thread.
 pub(crate) fn become_ours() {
     OURS.with(|o| o.set(true));
     #[cfg(any(test, feature = "testkit"))]
@@ -200,7 +197,7 @@ mod tests {
         }
     }
 
-    /// The thread's end: the body returns, and only then is the target (the FIFO) dropped, on
+    /// The thread's end: the body returns, and only then is the target dropped, on
     /// the thread
     #[test]
     fn the_thread_drops_its_target_after_its_body() {

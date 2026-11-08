@@ -398,7 +398,7 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // SAFETY: the view is mapped, read and write, and stays so until after the buffer, which
         // has no deallocator or keep-alive, is released: its import is freed in the release.
-        let memory = unsafe { host_memory_noting(at, false, Some(Arc::clone(&asked))) };
+        let memory = unsafe { host_memory_noting(at, Some(Arc::clone(&asked))) };
         let contents = rt::BufferContents::NoCopy {
             memory,
             deallocator: None,
@@ -533,18 +533,12 @@ impl ImportView {
 /// the runtime then refuses the import as it would have, or makes the texture as it does where
 /// it cannot alias the memory.
 ///
-/// Where `logged` and the import's first byte lies in the guest's RAM of a device with a dirty
-/// source, the memory also carries the answers of which of its pages changed
-/// (`super::dirty::ImportDirty`), a twin's those of the memory it twins. `logged` is false for
-/// bytes the log never watches (`HostRange::unlogged`): the runtime copies them whole and never
-/// asks for a harvest.
-///
 /// # Safety
 ///
 /// `rt::HostMemory::new`'s contract, for the memory at `at`.
-pub(crate) unsafe fn host_memory(at: NonNull<u8>, logged: bool) -> rt::HostMemory {
+pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
     // SAFETY: the caller's.
-    unsafe { host_memory_noting(at, logged, None) }
+    unsafe { host_memory_noting(at, None) }
 }
 
 /// [`host_memory`], its pages' write permission vouched for where `vouched`
@@ -561,13 +555,9 @@ pub(crate) unsafe fn host_memory(at: NonNull<u8>, logged: bool) -> rt::HostMemor
 /// imported, as `rt::HostMemory::assume_writable` asks: the library lowers no protection of a
 /// view or of the guest's RAM once made, and an unmap of its own waits for the import's free
 /// (`crate::remap`'s `UnmapHold`).
-pub(crate) unsafe fn host_memory_vouched(
-    at: NonNull<u8>,
-    logged: bool,
-    vouched: bool,
-) -> rt::HostMemory {
+pub(crate) unsafe fn host_memory_vouched(at: NonNull<u8>, vouched: bool) -> rt::HostMemory {
     // SAFETY: the caller's.
-    let memory = unsafe { host_memory_noting(at, logged, None) };
+    let memory = unsafe { host_memory_noting(at, None) };
     match vouched {
         // SAFETY: the caller's.
         true => unsafe { memory.assume_writable() },
@@ -582,7 +572,6 @@ pub(crate) unsafe fn host_memory_vouched(
 /// [`host_memory`]'s.
 unsafe fn host_memory_noting(
     at: NonNull<u8>,
-    logged: bool,
     asked: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> rt::HostMemory {
     // An earlier import's refusal is not this one's.
@@ -620,16 +609,9 @@ unsafe fn host_memory_noting(
         unsafe { rt::HostMemory::with_dma_buf(at, source) }.with_import_gate(Arc::clone(&GATE));
     // Where the devices take the guest's RAM whole (`super::host_ram`), the runs of it the pages
     // are, which the runtime asks of the import's window.
-    let memory = match imports_need_files() {
+    match imports_need_files() {
         true => memory.with_runs(Arc::clone(&RUNS)),
         false => memory,
-    };
-    let dirty = logged
-        .then(|| super::dirty::ImportDirty::new(shown_at(at).as_ptr().addr().to_u64()))
-        .flatten();
-    match dirty {
-        Some(dirty) => memory.with_dirty_pages(Arc::new(dirty)),
-        None => memory,
     }
 }
 

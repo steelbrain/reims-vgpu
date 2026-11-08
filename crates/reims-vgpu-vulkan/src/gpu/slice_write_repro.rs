@@ -4,8 +4,6 @@
 //! BlockWritesOnly (0x10005), at a level from its uniforms, and reads zeros where the write is
 //! dropped. The kernels are `slice_write_repro.metal`'s, hand-written.
 
-use std::sync::Arc;
-
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -15,7 +13,6 @@ use reims_vgpu_core::platform::resource::{Buffer as _, Library as _, Texture as 
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange};
 use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_metal::MetalPlatform;
 
 use crate::gpu::device::tests::dev;
@@ -34,22 +31,9 @@ const PRIVATE: u64 = 0x20;
 const SIDE: u64 = 64;
 const LEVELS: u64 = 3;
 
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl TaskLauncher<MetalPlatform> for NoLauncher {
-    fn launch(
-        &self,
-        _platform: &Arc<MetalPlatform>,
-        _host: Arc<dyn HostSide<MetalPlatform>>,
-    ) -> Arc<dyn ServiceLink<MetalPlatform>> {
-        panic!("no task is launched in these tests")
-    }
-}
-
 /// Metal's platform and device, when the host has Metal.
 fn metal() -> Option<(MetalPlatform, <MetalPlatform as Platform>::Device)> {
-    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(Box::new(NoLauncher)), d))
+    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(), d))
 }
 
 /// A Shared buffer of `length` bytes, `contents` at its start.

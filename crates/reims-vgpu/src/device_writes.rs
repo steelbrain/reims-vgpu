@@ -24,7 +24,10 @@ pub(crate) trait Watcher: Send + Sync {
     /// apart ([`sorted`]).
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "the graphics device's video arms write the guest's pages")
+        expect(
+            dead_code,
+            reason = "the graphics device's video arms write the guest's pages"
+        )
     )]
     fn wrote(&self, runs: &[Range<u64>]);
 }
@@ -42,7 +45,10 @@ pub(crate) fn watch(watcher: &Arc<dyn Watcher>) {
 /// A device of the host wrote `runs`, [`sorted`] (module docs): each live watcher is told.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the graphics device's video arms write the guest's pages")
+    expect(
+        dead_code,
+        reason = "the graphics device's video arms write the guest's pages"
+    )
 )]
 pub(crate) fn wrote(runs: &[Range<u64>]) {
     if runs.is_empty() {

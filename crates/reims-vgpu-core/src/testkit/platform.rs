@@ -1,9 +1,7 @@
 //! Fake: `FakePlatform`: every platform trait over the fake object models (architecture 13.2).
 //!
 //! One `FakePlatform` is one fake process: a fresh [`World`] (call log, script, virtual clock,
-//! address space, GPU VAs, resource indices), fresh `ProcessState`, and one default device
-//! that `open_device` finds. An isolated task `ThreadLauncher` launches runs over
-//! the same platform, as it runs in the same process.
+//! address space, GPU VAs, resource indices) and one default device that `open_device` finds.
 //!
 //! ```ignore
 //! let p = Arc::new(FakePlatform::new());
@@ -22,7 +20,6 @@ use super::clock::VirtualClock;
 use super::faults::Faults;
 use super::impls::descriptor::TextureDescriptorModel;
 use super::impls::device::DeviceModel;
-use super::launcher::ThreadLauncher;
 use super::objects::{Fk, Model, TexDesc, World, kind};
 use super::script::Script;
 use super::surfaces::FakeSurfaces;
@@ -33,9 +30,8 @@ use crate::platform::os::surface::IoSurfaces;
 use crate::platform::os::vm::HostVm;
 use crate::platform::types::{MtlSize, ResourceAddressRange};
 use crate::platform::values::{RateMapDesc, TextureDesc};
-use crate::platform::{Handle, ObjId, Platform, ProcessState};
+use crate::platform::{Handle, ObjId, Platform};
 use crate::raise::{OnFault, RaiseResult};
-use crate::tasks::launcher::TaskLauncher;
 
 /// The fake's device registry ID (`-[MTLDevice registryID]`).
 pub const FAKE_REGISTRY_ID: u64 = 0x1_0000_0f00;
@@ -67,8 +63,6 @@ pub struct FakePlatform {
     device: Fk<kind::Device>,
     surfaces: FakeSurfaces,
     threads: FakeThreads,
-    globals: ProcessState<FakePlatform>,
-    launcher: ThreadLauncher,
     registry_id: u64,
 }
 
@@ -94,8 +88,6 @@ impl FakePlatform {
         FakePlatform {
             surfaces: FakeSurfaces::new(world.clone()),
             threads: FakeThreads::for_world(world.clone()),
-            globals: ProcessState::new(),
-            launcher: ThreadLauncher::new(),
             registry_id: FAKE_REGISTRY_ID,
             device,
             world,
@@ -151,16 +143,6 @@ impl FakePlatform {
     /// The thread recorder.
     pub fn fake_threads(&self) -> &FakeThreads {
         &self.threads
-    }
-
-    /// The task launcher.
-    pub fn thread_launcher(&self) -> &ThreadLauncher {
-        &self.launcher
-    }
-
-    /// Replaces the task launcher (a test's service factory).
-    pub fn set_launcher(&mut self, l: ThreadLauncher) {
-        self.launcher = l;
     }
 
     /// A new reference to the fake's device (what a descriptor's `device` holds).
@@ -341,14 +323,6 @@ impl Platform for FakePlatform {
     fn threads(&self) -> &dyn Threads {
         &self.threads
     }
-
-    fn globals(&self) -> &ProcessState<Self> {
-        &self.globals
-    }
-
-    fn launcher(&self) -> &dyn TaskLauncher<Self> {
-        &self.launcher
-    }
 }
 
 #[cfg(test)]
@@ -466,7 +440,6 @@ mod tests {
         assert!(matches!(&r.state().model, Model::Ranges(v) if v.len() == 1));
         assert_eq!(p.vm().page_size(), crate::testkit::guest_ram::PAGE_SIZE);
         let _ = p.clock();
-        let _ = p.launcher();
         let _ = p.threads();
     }
 }

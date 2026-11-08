@@ -4,11 +4,10 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use crate::guest::records::APV_PAGE_SIZE;
 use crate::host::{HostPtr, PhysRange};
-use crate::memory::DeathKind;
 use crate::memory::descriptor::MemoryMapDescriptor;
 use crate::memory::mapping::{Mapping, Teardown};
+use crate::memory::{DeathKind, PAGE_SIZE};
 use crate::num::{ToU64, ToUsize};
 use crate::platform::Platform;
 use crate::platform::os::vm::{HostVm, VmProt};
@@ -315,7 +314,7 @@ impl<P: Platform> MemoryMap<P> {
         let vm = self.platform.vm();
         // A total length of 0 passes the assert.
         crate::fatal_unless!(
-            total_length % const { NonZeroU64::new(APV_PAGE_SIZE).unwrap() } == 0,
+            total_length % const { NonZeroU64::new(PAGE_SIZE).unwrap() } == 0,
             DeathKind::MappingLengthUnaligned
         );
         let Ok(address) = vm.allocate_anywhere(total_length) else {
@@ -410,16 +409,6 @@ impl<P: Platform> MemoryMap<P> {
         ))
     }
 
-    /// Copies `dst.len()` bytes from guest physical `physical`; false when no range holds them.
-    pub fn read(&self, physical: u64, dst: &mut [u8]) -> bool {
-        let source = self.virtual_address_for_physical(physical, dst.len().to_u64());
-        if !source.is_null() && !dst.is_empty() {
-            // A copy of 0 bytes touches nothing.
-            crate::guest::GuestPtr::new(source).copy_to(0, dst, DeathKind::MapReadFault);
-        }
-        !source.is_null()
-    }
-
     /// Where `length` bytes from guest physical `physical` are mapped here; NULL when no range
     /// holds them.
     pub fn virtual_address_for_physical(&self, physical: u64, length: u64) -> HostPtr {
@@ -446,18 +435,6 @@ impl<P: Platform> MemoryMap<P> {
             }
         }
         HostPtr::NULL
-    }
-
-    /// Copies `src` to guest physical `physical`. `src` is never NULL here, so this always
-    /// answers true.
-    pub fn write(&self, physical: u64, src: &[u8]) -> bool {
-        let destination = self.virtual_address_for_physical(physical, src.len().to_u64());
-        // `src` is tested, not `destination`: a NULL translation is copied to, which is the
-        // process's death when `src` is not empty.
-        if !src.is_empty() {
-            crate::guest::GuestPtr::new(destination).copy_from(0, src, DeathKind::MapWriteNull);
-        }
-        true
     }
 }
 
@@ -821,113 +798,6 @@ mod tests {
         }
     }
 
-    mod read {
-        use super::*;
-
-        #[test]
-        fn copies_guest_bytes() {
-            let p = plat();
-            let (ram, m) = ram_map(&p, &[(0x4000, 0x8000)]);
-            let mark = p.call_log().mark();
-            let bytes = pattern(0x40, 3);
-            assert!(ram.write(0x5000, &bytes));
-            let mut dst = vec![0u8; 0x40];
-            assert!(m.read(0x5000, &mut dst));
-            assert_eq!(dst, bytes);
-            assert!(p.call_log().since(mark).is_empty());
-        }
-
-        #[test]
-        fn refusal_leaves_dst_alone() {
-            let p = plat();
-            let (_ram, m) = ram_map(&p, &[(0x4000, 0x4000)]);
-            let mut dst = vec![0xaau8; 8];
-            let logs = crate::testkit::logs::capture();
-            assert!(!m.read(0x100_0000, &mut dst));
-            assert!(!m.read(0x7ffc, &mut dst));
-            assert_eq!(dst, vec![0xaa; 8]);
-            assert_eq!(
-                memory_lines(&logs),
-                vec![
-                    "0x8 bytes from guest address 0x7ffc run past the end of their memory map \
-                     range"
-                        .to_owned()
-                ]
-            );
-        }
-
-        #[test]
-        fn an_empty_read_inside_a_range_is_yes() {
-            let p = plat();
-            let (_ram, m) = ram_map(&p, &[(0x4000, 0x4000)]);
-            assert!(m.read(0x4000, &mut []));
-            assert!(!m.read(0x1_0000, &mut []));
-        }
-
-        #[test]
-        fn a_near_null_source_faults_at_the_memcpy() {
-            let p = plat();
-            let m = Map::new(p, &desc(&[gpr(0x4000, 0x4000, HostPtr::NULL)])).unwrap();
-            let e = catch_death(|| {
-                let mut dst = [0u8; 4];
-                m.read(0x4010, &mut dst)
-            });
-            assert_eq!(e.unwrap_err(), DeathKind::MapReadFault.site());
-        }
-    }
-
-    mod write {
-        use super::*;
-        use crate::raise::death::DeathSite;
-
-        const SITE: DeathSite = DeathKind::MapWriteNull.site();
-
-        #[test]
-        fn copies_into_guest_ram() {
-            let p = plat();
-            let (ram, m) = ram_map(&p, &[(0x4000, 0x8000)]);
-            let bytes = pattern(0x21, 9);
-            assert!(m.write(0x9ff0, &bytes));
-            assert_eq!(ram.read_vec(0x9ff0, 0x21).unwrap(), bytes);
-        }
-
-        /// Outside every range, the copy goes to NULL.
-        #[test]
-        fn outside_every_range_copies_to_null() {
-            let p = plat();
-            let (_ram, m) = ram_map(&p, &[(0x4000, 0x4000)]);
-            let e = catch_death(|| m.write(0x100_0000, &[1, 2, 3]));
-            assert_eq!(e.unwrap_err(), SITE);
-        }
-
-        /// A straddle logs, then copies to NULL.
-        #[test]
-        fn a_straddle_logs_then_copies_to_null() {
-            let p = plat();
-            let (_ram, m) = ram_map(&p, &[(0x4000, 0x4000), (0x8000, 0x4000)]);
-            let logs = crate::testkit::logs::capture();
-            let e = catch_death(|| m.write(0x7ffe, &[1, 2, 3, 4]));
-            assert_eq!(e.unwrap_err(), SITE);
-            assert_eq!(
-                memory_lines(&logs),
-                vec![
-                    "0x4 bytes from guest address 0x7ffe run past the end of their memory map \
-                     range"
-                        .to_owned()
-                ]
-            );
-        }
-
-        /// With nothing to copy, true even outside every range.
-        #[test]
-        fn an_empty_write_is_yes_anywhere() {
-            let p = plat();
-            let (_ram, m) = ram_map(&p, &[(0x4000, 0x4000)]);
-            assert!(m.write(0x100_0000, &[]));
-            assert!(m.write(0x4000, &[]));
-        }
-    }
-
     mod new_range_mapping {
         use super::*;
 
@@ -936,7 +806,7 @@ mod tests {
             let p = plat();
             let (_ram, m) = ram_map(&p, &[(0x4000, 0x8000)]);
             // Half a guest page.
-            let half = APV_PAGE_SIZE / 2;
+            let half = PAGE_SIZE / 2;
             let e = catch_death(|| m.new_range_mapping(&[pr(0x4000, half)], half, 0));
             assert_eq!(e.unwrap_err(), DeathKind::MappingLengthUnaligned.site());
             assert!(vm_calls(&p).is_empty());

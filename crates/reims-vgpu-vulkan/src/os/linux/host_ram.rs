@@ -87,15 +87,14 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     leases: Vec::new(),
 });
 
-/// A lease's RAM, `ranges` (each a host address and a length), with the answers of its dirty log
-/// where `logged` (the device's log over the RAM, `super::dirty`), handed to every device that
-/// takes it now, and to each one learned while the answer lives.
-pub(crate) fn lease(ranges: &[(u64, u64)], logged: bool) -> Arc<LeasedRam> {
+/// A lease's RAM, `ranges` (each a host address and a length), handed to every device that takes
+/// it now, and to each one learned while the answer lives.
+pub(crate) fn lease(ranges: &[(u64, u64)]) -> Arc<LeasedRam> {
     let ram = Arc::new(LeasedRam {
         uses: Mutex::new(Vec::new()),
         users: Mutex::new(Vec::new()),
         ranges: ranges.to_vec(),
-        ram: runtime_ram(ranges, logged).map(Arc::new),
+        ram: runtime_ram(ranges).map(Arc::new),
     });
     let devices = {
         let mut registry = REGISTRY.lock();
@@ -122,9 +121,8 @@ pub(crate) fn device_needs_ram(device: &rt::Device) {
     }
 }
 
-/// The runtime's RAM of `ranges`, with the dirty log's answers for all of it where `logged`;
-/// `None`, with a warning, where the runtime refuses them.
-fn runtime_ram(ranges: &[(u64, u64)], logged: bool) -> Option<rt::HostRam> {
+/// The runtime's RAM of `ranges`; `None`, with a warning, where the runtime refuses them.
+fn runtime_ram(ranges: &[(u64, u64)]) -> Option<rt::HostRam> {
     let pairs: Vec<(NonNull<u8>, u64)> = (ranges.iter())
         .filter_map(|&(at, length)| {
             Some((
@@ -149,17 +147,10 @@ fn runtime_ram(ranges: &[(u64, u64)], logged: bool) -> Option<rt::HostRam> {
             return None;
         }
     };
-    let ram = match dma_bufs() {
+    Some(match dma_bufs() {
         Some(source) => {
             (ram.with_dma_buf(source)).with_largest_dma_buf(super::dma_buf::limits().bytes)
         }
-        None => ram,
-    };
-    let dirty = logged
-        .then(|| super::dirty::ImportDirty::of_ram(ranges))
-        .flatten();
-    Some(match dirty {
-        Some(dirty) => ram.with_dirty_pages(Arc::new(dirty)),
         None => ram,
     })
 }
@@ -351,16 +342,13 @@ mod tests {
             )
         };
         let before = counts();
-        let lease = lease_guest_memory(
-            [GuestRamFile {
-                host: at,
-                guest: 0,
-                length,
-                fd,
-                offset: 0,
-            }],
-            None,
-        );
+        let lease = lease_guest_memory([GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            fd,
+            offset: 0,
+        }]);
         if imports_need_files() {
             // The RAM is one chunk (8 MiB): the runtime's thread is given 20 s to import it.
             let imported = (0..4000).any(|_| {
@@ -450,16 +438,13 @@ mod tests {
         };
         assert_ne!(start, libc::MAP_FAILED);
         let at = start.addr().to_u64();
-        let lease = lease_guest_memory(
-            [GuestRamFile {
-                host: at,
-                guest: 0,
-                length,
-                fd,
-                offset: 0,
-            }],
-            None,
-        );
+        let lease = lease_guest_memory([GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            fd,
+            offset: 0,
+        }]);
         // SAFETY: the RAM's first pages, mapped until the end, which no GPU work uses now.
         let ram =
             unsafe { std::slice::from_raw_parts_mut(start.cast::<u8>(), (8 * PAGE).to_usize()) };
@@ -571,16 +556,13 @@ mod tests {
         // SAFETY: the mapping above, `length` bytes.
         unsafe { std::ptr::write_bytes(start.cast::<u8>(), 0, length.to_usize()) };
         let at = start.addr().to_u64();
-        let lease = lease_guest_memory(
-            [GuestRamFile {
-                host: at,
-                guest: 0,
-                length,
-                fd: std::sync::Arc::clone(&fd),
-                offset: 0,
-            }],
-            None,
-        );
+        let lease = lease_guest_memory([GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            fd: std::sync::Arc::clone(&fd),
+            offset: 0,
+        }]);
         let counts = || {
             let c = device.raw.work_counts();
             (
@@ -829,16 +811,13 @@ mod tests {
         // SAFETY: the mapping above, `length` bytes.
         unsafe { std::ptr::write_bytes(start.cast::<u8>(), 0, length.to_usize()) };
         let at = start.addr().to_u64();
-        let lease = lease_guest_memory(
-            [GuestRamFile {
-                host: at,
-                guest: 0,
-                length,
-                fd: std::sync::Arc::clone(&fd),
-                offset: 0,
-            }],
-            None,
-        );
+        let lease = lease_guest_memory([GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            fd: std::sync::Arc::clone(&fd),
+            offset: 0,
+        }]);
         let counts = || {
             let c = device.raw.work_counts();
             (
@@ -1034,16 +1013,13 @@ mod tests {
         };
         assert_ne!(start, libc::MAP_FAILED);
         let at = start.addr().to_u64();
-        let lease = lease_guest_memory(
-            [GuestRamFile {
-                host: at,
-                guest: 0,
-                length,
-                fd,
-                offset: 0,
-            }],
-            None,
-        );
+        let lease = lease_guest_memory([GuestRamFile {
+            host: at,
+            guest: 0,
+            length,
+            fd,
+            offset: 0,
+        }]);
         let ram =
             |offset: u64| std::ptr::with_exposed_provenance_mut::<u8>((at + offset).to_usize());
         // SAFETY: bytes of the RAM, mapped readable and writable until the end of the test.

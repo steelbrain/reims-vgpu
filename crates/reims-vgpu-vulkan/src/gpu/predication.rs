@@ -2473,11 +2473,9 @@ mod tests {
     use crate::gpu::resource::tests::shared;
 
     /// `inc_k`: one thread adds 1 to `c[0]`, and marks `c[n]` with `n * 0x11` below 16.
-    const INC: &[u8] =
-        include_bytes!("../../../../tests/shaders/compute_inc.metallib");
+    const INC: &[u8] = include_bytes!("../../../../tests/shaders/compute_inc.metallib");
     /// `double_gid`: `out[gid] = gid * 2`, so one thread zeroes `out[0]`.
-    const DOUBLE: &[u8] =
-        include_bytes!("../../../../tests/shaders/kernel.metallib");
+    const DOUBLE: &[u8] = include_bytes!("../../../../tests/shaders/kernel.metallib");
 
     /// `MTLCommandBufferStatusCompleted`.
     const COMPLETED: u64 = 4;

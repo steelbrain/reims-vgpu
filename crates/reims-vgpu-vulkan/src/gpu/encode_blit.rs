@@ -122,7 +122,7 @@ use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
 
 use crate::answer::{
-    Policy, decide, metal_aborts, plain, send, send_describing, unrepresentable, unstopped_at,
+    Policy, decide, metal_aborts, plain, plain_at, send, send_describing, unrepresentable,
 };
 use crate::gpu::command::{CommandBufferObject, Failing, Progress, VulkanCommandBuffer};
 use crate::gpu::fill;
@@ -268,17 +268,14 @@ impl<E> EncoderObject<E> {
     }
 
     /// `endEncoding`, `end` the runtime's, whose refusal dies at `sel`, as Metal raises at none,
-    /// as does a degradation of [`crate::answer::DIES`] it announces. The task's end is checked
-    /// once, before the encoder is taken: a thread of an ended task stops with the encoder in
-    /// place, untouched, as Metal's is left (`stop_if_task_ended`), and none stops while it holds
-    /// the encoder taken, whose drop would abandon its command buffer.
+    /// as does a degradation of [`crate::answer::DIES`] it announces.
     pub fn end(
         &self,
         sel: &'static str,
         end: impl FnOnce(E) -> Result<(), rt::Error>,
     ) -> RaiseResult<()> {
         let e = plain(|| self.take(sel));
-        unstopped_at(sel, || end(e)).or_else(|err| decide(sel, Policy::Dies, err))
+        plain_at(sel, || end(e)).or_else(|err| decide(sel, Policy::Dies, err))
     }
 }
 
@@ -1179,40 +1176,6 @@ mod tests {
         let length = usize::try_from(b.length()).unwrap();
         // SAFETY: a Shared buffer's bytes, read after the GPU's writes completed.
         unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), length) }.to_vec()
-    }
-
-    /// endEncoding in a thread of an isolated task that has ended stops before it takes the
-    /// encoder, which stays in place, untouched, for the blit and the compute encoder alike, as
-    /// Metal's is left
-    #[test]
-    fn an_ended_tasks_end_encoding_leaves_the_encoder() {
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let cb = buffer();
-        let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            blit.encode(OnFault::Return, BlitCmd::EndEncoding)
-        });
-        assert!(stopped.is_none());
-        assert!(
-            blit.raw.lock().borrow().is_some(),
-            "the blit encoder was taken"
-        );
-        let cb = buffer();
-        let compute = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            compute.encode(OnFault::Return, ComputeCmd::EndEncoding)
-        });
-        assert!(stopped.is_none());
-        assert!(
-            compute.raw.lock().borrow().is_some(),
-            "the compute encoder was taken"
-        );
     }
 
     /// Fills and copies between buffers and a texture land on the GPU: a fill, an empty fill and

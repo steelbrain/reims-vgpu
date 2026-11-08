@@ -121,10 +121,8 @@ fn identifiers_after_are_metals(made: Made) {
         let after = make::<P>(d, &compute_desc(), 1);
         [first, before.unique_identifier(), after.unique_identifier()]
     }
-    let metal = MetalPlatform::system_default_device().map(|md| {
-        let launcher = Box::new(crate::gpu::device::tests::metal_tests::NoLauncher);
-        identifiers::<MetalPlatform>(&MetalPlatform::new(launcher), &md, made)
-    });
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| identifiers::<MetalPlatform>(&MetalPlatform::new(), &md, made));
     let p = crate::platform::tests::platform();
     let vulkan = identifiers::<VulkanPlatform>(&p, &dev(), made);
     assert_eq!(vulkan[..2], [0x10_0001_8000; 2], "{made:?}");

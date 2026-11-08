@@ -21,35 +21,12 @@ pub use on_fault::OnFault;
 
 use crate::rt::held::Deferred;
 
-/// A raise's identity: what raised and why. Areas add one variant each (a `RaiseKind` of their
-/// own, whose `Display` prints a dotted id such as `device.wait.circular`).
+/// A raise's identity: what raised and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RaiseId {
     /// An exception the platform raised at a send (a Metal or Foundation exception); the
     /// origin names the selector.
     Platform,
-    /// The tasks area's.
-    Tasks(crate::tasks::RaiseKind),
-    /// The deserializer's.
-    Deserializer(crate::deserializer::RaiseKind),
-    /// Memory's (`crate::memory::RaiseKind`).
-    Memory(crate::memory::RaiseKind),
-    /// The resources area's.
-    Resources(crate::resources::RaiseKind),
-    /// A display's.
-    Display(crate::display::RaiseKind),
-    /// A FIFO command's.
-    Fifo(crate::fifo::RaiseKind),
-    /// The GPU task service's.
-    GpuTask(crate::gpu_task::RaiseKind),
-    /// The device's (`crate::device::DeviceRaise`).
-    Device(crate::device::DeviceRaise),
-    /// The resource manager's.
-    Manager(crate::resources::manager::RaiseKind),
-    /// A guest display's.
-    GuestDisplay(crate::display::guest_display::RaiseKind),
-    /// The device's display ports'.
-    Displays(crate::device::displays::RaiseKind),
     /// A test's own raise, which dies uncaught at the site it names.
     #[cfg(any(test, feature = "testkit"))]
     Test {
@@ -58,52 +35,12 @@ pub enum RaiseId {
     },
 }
 
-impl RaiseId {
-    /// An area's raise by its dotted name, which an uncaught one's death names (at line 0).
-    /// `None` for a platform id, whose site is the selector's, for a resources raise, which dies
-    /// where it was raised, and for a test's.
-    pub fn name(&self) -> Option<&'static str> {
-        match self {
-            RaiseId::Platform | RaiseId::Resources(_) => None,
-            #[cfg(any(test, feature = "testkit"))]
-            RaiseId::Test { .. } => None,
-            RaiseId::Tasks(k) => Some(k.id()),
-            RaiseId::Deserializer(k) => Some(k.name()),
-            RaiseId::Memory(k) => Some(k.name()),
-            RaiseId::Display(k) => Some(k.id()),
-            RaiseId::Fifo(k) => Some(k.name()),
-            RaiseId::GpuTask(k) => Some(k.id()),
-            RaiseId::Device(k) => Some(k.name()),
-            RaiseId::Manager(k) => Some(k.name()),
-            RaiseId::GuestDisplay(k) => Some(k.id()),
-            RaiseId::Displays(k) => Some(k.id()),
-        }
-    }
-}
-
-impl From<crate::deserializer::RaiseKind> for RaiseId {
-    fn from(k: crate::deserializer::RaiseKind) -> RaiseId {
-        RaiseId::Deserializer(k)
-    }
-}
-
 impl fmt::Display for RaiseId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             #[cfg(any(test, feature = "testkit"))]
             RaiseId::Test { name } => write!(f, "test.{name}"),
             RaiseId::Platform => f.write_str("platform.raised"),
-            RaiseId::Tasks(k) => write!(f, "{k}"),
-            RaiseId::Deserializer(k) => f.write_str(k.name()),
-            RaiseId::Memory(k) => k.fmt(f),
-            RaiseId::Resources(k) => write!(f, "resources.{k}"),
-            RaiseId::Display(k) => write!(f, "{k}"),
-            RaiseId::Fifo(k) => write!(f, "{k}"),
-            RaiseId::GpuTask(k) => write!(f, "{k}"),
-            RaiseId::Device(k) => f.write_str(k.name()),
-            RaiseId::Manager(k) => f.write_str(k.name()),
-            RaiseId::GuestDisplay(k) => write!(f, "{k}"),
-            RaiseId::Displays(k) => write!(f, "{k}"),
         }
     }
 }
@@ -263,8 +200,8 @@ impl Raise {
 }
 
 /// The test capture's site of an uncaught raise of `id` from `origin`: the selector at line 0 for
-/// the platform's, an area's dotted name at line 0 for its own, and for a resources raise the
-/// Rust site it was raised at.
+/// the platform's, the Rust site for one core raised, the boundary's name for one met there, and a
+/// test's name for a test's.
 pub(crate) fn death_site(id: RaiseId, origin: Origin) -> DeathSite {
     match (id, origin) {
         (_, Origin::Platform(sel)) => DeathSite {
@@ -278,16 +215,6 @@ pub(crate) fn death_site(id: RaiseId, origin: Origin) -> DeathSite {
             file: name,
             line: 0,
         },
-        (RaiseId::Tasks(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.id(),
-            line: 0,
-        },
-        (RaiseId::GpuTask(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.id(),
-            line: 0,
-        },
         (RaiseId::Platform, Origin::Core(at)) => DeathSite {
             kind: DeathKind::UncaughtObjc,
             file: at.file(),
@@ -295,57 +222,6 @@ pub(crate) fn death_site(id: RaiseId, origin: Origin) -> DeathSite {
         },
         (RaiseId::Platform, Origin::Boundary(site)) => DeathSite {
             kind: DeathKind::UncaughtObjc,
-            file: site,
-            line: 0,
-        },
-        (RaiseId::Deserializer(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.name(),
-            line: 0,
-        },
-        (RaiseId::Memory(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.name(),
-            line: 0,
-        },
-        (RaiseId::Display(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.id(),
-            line: 0,
-        },
-        (RaiseId::Fifo(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.name(),
-            line: 0,
-        },
-        (RaiseId::Device(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.name(),
-            line: 0,
-        },
-        (RaiseId::Manager(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.name(),
-            line: 0,
-        },
-        (RaiseId::GuestDisplay(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.id(),
-            line: 0,
-        },
-        (RaiseId::Displays(k), _) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: k.id(),
-            line: 0,
-        },
-        // A resources raise dies where it was raised.
-        (_, Origin::Core(at)) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
-            file: at.file(),
-            line: at.line(),
-        },
-        (_, Origin::Boundary(site)) => DeathSite {
-            kind: DeathKind::UnhandledRaise,
             file: site,
             line: 0,
         },

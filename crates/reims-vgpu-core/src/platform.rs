@@ -1,5 +1,4 @@
-//! The platform traits (architecture 4): `Platform`, `Handle`, `ObjId`, `nil_send!`, and the
-//! `ProcessState` re-export.
+//! The platform traits (architecture 4): `Platform`, `Handle`, `ObjId` and `nil_send!`.
 //!
 //! Core is generic over one `P: Platform` (D3). Its associated types name every Metal object kind
 //! core touches, so a handle flows into another Metal call with its kind checked at compile time.
@@ -22,7 +21,6 @@ pub mod resource;
 pub mod types;
 pub mod values;
 
-pub use crate::process::ProcessState;
 use crate::raise::OnFault;
 pub use crate::raise::Raise;
 pub use crate::raise::RaiseResult;
@@ -30,7 +28,6 @@ pub use event::EventRef;
 pub use host_range::HostRange;
 pub use types::NilDefault;
 
-use crate::host::HostBlocks;
 use os::surface::{IoSurfaces, Surface};
 use os::vm::HostVm;
 use os::{Clock, Threads};
@@ -195,24 +192,6 @@ pub trait Platform: Sized + Send + Sync + 'static {
     fn clock(&self) -> &Self::Clock;
     /// Every OS thread core creates (D35).
     fn threads(&self) -> &dyn Threads;
-    /// The process-wide state (D17).
-    fn globals(&self) -> &ProcessState<Self>;
-    /// Starts isolated GPU task services: `tasks::isolation::TaskThreads`, each task's service on
-    /// threads of its own (the testkit's records what it launched).
-    fn launcher(&self) -> &dyn crate::tasks::launcher::TaskLauncher<Self>;
-
-    /// The task and memory blocks a device without a memory map keeps (`createTask`,
-    /// `destroyTask`, `mapMemory`, `unmapMemory` and `readMemory`; the others are `None`), asked
-    /// once, as the device copies the host's. By default the host's own, unchanged.
-    ///
-    /// A platform may answer blocks of its own around the host's, to learn of the host's mapping
-    /// work. Each calls the host's block once per call, with the same arguments, and answers its
-    /// answer; holds no other block, so the host sees the blocks' `destroy` callbacks in the order
-    /// it does (the `callbacks` module of [`crate::host`]); and a nil block stays nil. The answer's
-    /// other blocks are not read.
-    fn host_blocks(&self, blocks: HostBlocks) -> HostBlocks {
-        blocks
-    }
 }
 
 /// A send to nil does nothing and returns zero (Objective-C). Used exactly where core sends to a

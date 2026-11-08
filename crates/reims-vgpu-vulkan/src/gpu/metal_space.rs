@@ -20,10 +20,8 @@
 //! the runtime frees the buffer it is over too, and any other texture's while the platform's
 //! object lives ([`Hold`]).
 //!
-//! One model per process ([`process`]): Metal has one device per GPU, so an isolated task's
-//! objects take ranges after the device's and every other task's (`interplay_decodewalk_52`:
-//! task 2, which runs first, takes the start; task 1's buffers come after task 2's and after
-//! what Metal took for task 2's work).
+//! One model per process ([`process`]): Metal has one device per GPU, so every object of the
+//! process takes its range after those made before it, whoever made them.
 //!
 //! What the probes (`vaprobe`, plain Metal) and the recordings of the suite's isolate cases
 //! settle, on the M3 Max, macOS 26.7 (the table test plays every row):

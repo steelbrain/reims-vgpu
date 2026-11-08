@@ -5,14 +5,7 @@
 //!   release, and the retain count, which the guest sees, is the number of references to the
 //!   object. Its ID is the object's address, unique among live surfaces. A lookup
 //!   (`lookup_by_port`) is another object over the same memory, with a count of its own, as
-//!   IOSurface's lookup in the process that made the surface answers. While the thread unwinds
-//!   or releases an isolated task that died
-//!   ([`leaks_objects`](reims_vgpu_core::tasks::isolation::life::leaks_objects)), `Drop` leaks
-//!   the reference instead, as every platform handle of a dead task's is
-//!   ([`crate::platform::Obj`]): its object, and the memory the object holds, stay until the
-//!   process exits. What a dead task holds is its own object over a surface the host lent it,
-//!   never the host's: the surface reaches it through a lookup. So the leak changes no count the
-//!   host reads.
+//!   IOSurface's lookup in the process that made the surface answers.
 //! - **Memory.** A surface of its own memory is a file of its own, mapped and registered in the
 //!   backing table ([`super::vm::OwnMemory`]), so a view can be made of it (an alias of its
 //!   allocation, a buffer over it) and no `deallocate` frees it. One over the guest's pages
@@ -99,8 +92,7 @@ const PROTECTION_OPTIONS: u64 = 0xf;
 /// The bytes a row of a surface made from plane properties is rounded up to.
 const BACKING_ROW_ALIGNMENT: u64 = 128;
 
-/// One reference to an IOSurface stand-in (module docs): `Drop` is the release, or a leak while
-/// the thread unwinds or releases an isolated task that died.
+/// One reference to an IOSurface stand-in (module docs): `Drop` is the release.
 #[derive(Debug)]
 pub struct LinuxSurface(ManuallyDrop<Arc<Object>>);
 
@@ -259,11 +251,8 @@ impl LinuxSurface {
 }
 
 impl Drop for LinuxSurface {
-    /// The release, or nothing while the thread unwinds or releases an isolated task that died.
+    /// The release.
     fn drop(&mut self) {
-        if reims_vgpu_core::tasks::isolation::life::leaks_objects() {
-            return;
-        }
         // SAFETY: the reference is released once, here, and never touched after.
         unsafe { ManuallyDrop::drop(&mut self.0) }
     }
@@ -807,35 +796,6 @@ mod tests {
         assert!(mapped(base));
         drop(s);
         assert!(!mapped(base));
-    }
-
-    /// A reference an isolated task's death unwinds past, or that the release of a task that
-    /// died drops, is leaked, as every platform handle of the task's is, and the surface's
-    /// memory with it; one the task's work drops is released
-    #[test]
-    fn a_dead_tasks_unwind_leaks_its_surface_references() {
-        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let s = LinuxSurfaces::new().create(&host_only()).unwrap();
-        let life = TaskLife::new();
-        assert_eq!(life.run(|| drop(s.clone_ref())), Some(()));
-        assert_eq!(s.retain_count(), 1);
-        let r: Option<()> = life.run(|| {
-            let _held = s.clone_ref();
-            reims_vgpu_core::fatal!(DeathSite {
-                kind: DeathKind::Abort,
-                file: "surface.test",
-                line: 0,
-            })
-        });
-        assert_eq!(r, None);
-        assert_eq!(s.retain_count(), 2);
-        assert_eq!(life.releasing(|| drop(s.clone_ref())), Some(()));
-        assert_eq!(s.retain_count(), 3);
-        let base = s.base_address();
-        drop(s);
-        assert!(mapped(base), "the leaked references hold the memory");
     }
 
     /// A lookup is another object over the same memory, whose count is its own, and the

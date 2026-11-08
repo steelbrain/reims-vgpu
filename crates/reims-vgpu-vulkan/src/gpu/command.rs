@@ -3,9 +3,7 @@
 //!
 //! - **Handlers** run on the runtime's handler threads, in the queue's order. A completed
 //!   handler reads its buffer's `status` and `error` when it runs, as on the Metal platform, and
-//!   runs marked as ours, so a panic in it aborts. Its read of a failure that dies (below) is the
-//!   code of the isolated task that added it, if one did: once that task ended, nothing dies
-//!   there, as core's handlers of the task run none ([`completed_handler`]).
+//!   runs marked as ours, so a panic in it aborts ([`completed_handler`]).
 //! - **`encodeSignalEventScheduled:value:`** is the runtime's: the event's value is set as the
 //!   buffer is scheduled, before its status reads `Scheduled` and before `waitUntilScheduled`
 //!   returns, as Metal's; sent once the buffer is committed, it sets nothing, as Metal's, and once
@@ -42,9 +40,7 @@
 //!   buffer so, and it dies naming the runtime's refusal (`CommandBuffer::refusal`), never a
 //!   failure the guest could see. It dies as the command buffer completes, before any handler of
 //!   core's learns of it, at the selector of its first execution of an indirect command buffer
-//!   ([`Ending`]), and at `commit` where its status or error is read first ([`failure`]). An
-//!   isolated task's command buffer that completes after the task ended dies at neither, as
-//!   core's handlers of the task run none then.
+//!   ([`Ending`]), and at `commit` where its status or error is read first ([`failure`]).
 //! - **An execution's commands that decide a death** (a draw of points under a state whose points
 //!   Metal sizes none of; a command whose state can encode indirect commands in an encoder that
 //!   made resident for writing a buffer whose ID is not the runtime's) are read at the commit, as
@@ -168,8 +164,7 @@
 //!   ([`CommandBufferObject::faults_at_read_only_store`]); which encoders of such a command
 //!   buffer run, and whether its signals fire, are not measured for this fault. Metal then fails
 //!   every later command buffer of the process, with a code nothing recorded, so the commit of
-//!   one, of the same task (the host's process, or an isolated task's, as Metal's process is the
-//!   task's there), dies ([`READ_ONLY_FAULTED`]).
+//!   one dies ([`READ_ONLY_FAULTED`]).
 //! - **A submission that uses a detached buffer or heap** fails with
 //!   `MTLCommandBufferErrorOutOfMemory` (8), whose description is Metal's ("Insufficient
 //!   Memory"), as Metal fails it. Metal splits a command buffer into submissions, and decides
@@ -234,11 +229,9 @@ use reims_vgpu_core::raise::refusals::{self, Carried};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::rt::BlockEnv;
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::tasks::isolation::TaskLife;
 
 use crate::answer::{
-    Policy, hang, metal_aborts, plain, plain_at, refusal, refused, send, unrepresentable,
-    unstopped_get,
+    Policy, get, hang, metal_aborts, plain, plain_at, refusal, refused, send, unrepresentable,
 };
 use crate::gpu::backing::{self, Opened};
 use crate::gpu::desc::VulkanRenderPassDescriptor;
@@ -315,55 +308,16 @@ pub struct CommandBufferObject {
     /// which keeps it whole ([`CommandBufferObject::splits`]).
     signals_scheduled: AtomicBool,
     /// Whether a render pass in it stores an attachment into read-only memory the runtime copies,
-    /// which fails it ([`CommandBufferObject::faults_at_read_only_store`]): its commit marks its
-    /// task's later commits ([`READ_ONLY_FAULTED`]).
+    /// which fails it ([`CommandBufferObject::faults_at_read_only_store`]): its commit marks the
+    /// process's later commits ([`READ_ONLY_FAULTED`]).
     read_only_store: AtomicBool,
 }
 
-/// The tasks a command buffer of which a render pass's store into read-only memory failed
-/// ([`CommandBufferObject::faults_at_read_only_store`]), each by its life, `None` for code
-/// outside an isolated task (the host's process): Metal fails every later command buffer of the
-/// process with a code nothing recorded (the module docs), so the commit of a later one of the
-/// same task dies ([`read_only_faulted`]).
-static READ_ONLY_FAULTED: Mutex<Vec<Option<std::sync::Weak<TaskLife>>>> = Mutex::new(Vec::new());
-
-/// Whether [`READ_ONLY_FAULTED`] ever took a task: until it does, a commit takes no lock for it.
-static ANY_READ_ONLY_FAULTED: AtomicBool = AtomicBool::new(false);
-
-/// Whether a command buffer of the task this thread runs the code of failed at a render pass's
-/// store into read-only memory, committed before ([`READ_ONLY_FAULTED`]).
-fn read_only_faulted() -> bool {
-    if !ANY_READ_ONLY_FAULTED.load(Ordering::Acquire) {
-        return false;
-    }
-    let task = TaskLife::current();
-    READ_ONLY_FAULTED
-        .lock()
-        .iter()
-        .any(|kept| same_task(kept, task.as_ref()))
-}
-
-/// Whether `kept`, a task [`READ_ONLY_FAULTED`] holds, is `task`: both the host's process, or
-/// the same live isolated task.
-fn same_task(kept: &Option<std::sync::Weak<TaskLife>>, task: Option<&Arc<TaskLife>>) -> bool {
-    match (kept, task) {
-        (None, None) => true,
-        (Some(kept), Some(task)) => kept.upgrade().is_some_and(|kept| Arc::ptr_eq(&kept, task)),
-        _ => false,
-    }
-}
-
-/// Marks the task this thread runs the code of as one a command buffer of which a render pass's
-/// store into read-only memory failed ([`READ_ONLY_FAULTED`]).
-fn mark_read_only_faulted() {
-    let task = TaskLife::current();
-    let mut faulted = READ_ONLY_FAULTED.lock();
-    faulted.retain(|kept| kept.as_ref().is_none_or(|k| k.strong_count() > 0));
-    if !faulted.iter().any(|kept| same_task(kept, task.as_ref())) {
-        faulted.push(task.as_ref().map(Arc::downgrade));
-    }
-    ANY_READ_ONLY_FAULTED.store(true, Ordering::Release);
-}
+/// Whether a command buffer of the process failed at a render pass's store into read-only memory
+/// ([`CommandBufferObject::faults_at_read_only_store`]), committed before: Metal fails every later
+/// command buffer of the process with a code nothing recorded (the module docs), so the commit of
+/// a later one dies.
+static READ_ONLY_FAULTED: AtomicBool = AtomicBool::new(false);
 
 /// The submission handler of a command buffer that holds work for Metal's tiler
 /// ([`CommandBufferObject::tiler_work`]): Metal's allocation for that work. Metal takes its own
@@ -434,15 +388,13 @@ impl CommandBufferObject {
     /// Work for Metal's tiler encoded by `sel`, `first`: a render encoder made, or a blit's reset
     /// or copy of an indirect command buffer. Metal's own allocations for it the first time, and
     /// the command buffer's submission a first use too, which its submission handler takes, added
-    /// here while the process has not taken it ([`tiler_handler`]). Nothing here stops a thread
-    /// of a task that ended: a render encoder's runtime encoder is not in its handle yet
-    /// (`crate::gpu::encode_render`'s `make`), and dropped it would abandon the command buffer.
+    /// here while the process has not taken it ([`tiler_handler`]).
     pub(crate) fn tiler_work(&self, sel: &'static str, first: FirstUse) {
         metal_space::first_use(first);
         if !metal_space::taken(FirstUse::TilerSubmission)
             && !self.tiler.swap(true, Ordering::SeqCst)
         {
-            unstopped_get(sel, || self.raw.add_submission_handler(tiler_handler()));
+            get(sel, || self.raw.add_submission_handler(tiler_handler()));
         }
     }
 
@@ -463,9 +415,7 @@ impl CommandBufferObject {
     /// other than 0 fails the command buffer from it, with
     /// [`PROTECTION_VIOLATION`] below 0x10 and [`INVALID_INPUT`] from there up, its event
     /// signals firing none; under options that end the process at its first command (a blit
-    /// encoder's, [`aborts_encoders`]) it answers them, which that command dies at. Nothing here
-    /// stops a thread of a task that ended: the encoder is not in its handle yet, and dropped
-    /// it would abandon the command buffer.
+    /// encoder's, [`aborts_encoders`]) it answers them, which that command dies at.
     pub(crate) fn made_encoder(&self, whole: bool) -> (usize, Option<u64>) {
         let at = self.made.fetch_add(1, Ordering::SeqCst);
         if !whole {
@@ -524,7 +474,7 @@ impl CommandBufferObject {
 
     /// Records that the render pass at `from`, in the order the runtime ended its encoders, stores
     /// an attachment into read-only memory the runtime copies, which fails it with Metal's page
-    /// fault from that pass on, its event signals firing (the module docs), and marks its task's
+    /// fault from that pass on, its event signals firing (the module docs), and marks the process's
     /// later commits at its own ([`READ_ONLY_FAULTED`]).
     pub(crate) fn faults_at_read_only_store(&self, from: usize) {
         self.fail(Failing {
@@ -633,7 +583,6 @@ impl CommandBufferObject {
         let progress = Arc::new(Progress::default());
         let ending = Ending {
             progress: Some(Arc::clone(&progress)),
-            task: TaskLife::current(),
             carried: refusals::carry(),
             #[cfg(test)]
             slot: reims_vgpu_core::testkit::capture::current_slot(),
@@ -744,7 +693,7 @@ impl Progress {
 
     /// The command buffer ends at `stage`: its changes run if it completed, its failures' if it
     /// failed, what it held goes, then the stage is set. It runs on the runtime's thread, or
-    /// where the command buffer goes, and sends nothing, so it checks no task's end. Each change
+    /// where the command buffer goes, and sends nothing. Each change
     /// runs, and each object held is let go of, in the scope `carried` names, the one the
     /// command that made the progress carried (the graphics lane's): a death in one is refused
     /// there and logged, and the rest run and go, and the stage is set, all the same. Outside
@@ -804,9 +753,6 @@ impl Progress {
 struct Ending {
     /// The progress it ends, until it has.
     progress: Option<Arc<Progress>>,
-    /// The isolated task whose code made the progress, if one's did: the command buffer is the
-    /// task's, and its death in the handler is the task's code ([`as_task`]).
-    task: Option<Arc<TaskLife>>,
     /// The refusal scope of the op whose command made the progress (the graphics lane's), which
     /// the death in the handler refuses instead of ending the process; none outside every scope.
     /// The command buffer's own completed handlers then see its refused step as their failure.
@@ -835,18 +781,17 @@ impl Ending {
 
     /// Ends the progress at `stage`, after `refused`'s death at the selector of its first
     /// execution of an indirect command buffer where a host step refused the command buffer and
-    /// its commands execute one. The death is the task's code, so none comes once the task ended;
-    /// in the scope the progress carried, it is refused there, logged, and the progress ends.
+    /// its commands execute one. In the scope the progress carried, it is refused there, logged,
+    /// and the progress ends.
     fn end(&mut self, stage: Stage, refused: Option<impl Fn(&'static str)>) {
         let Some(progress) = self.progress.take() else {
             return;
         };
-        let task = self.task.take();
         let carried = self.carried;
         let end = || {
             if let Some(refused) = refused
                 && let Some(sel) = progress.first_execution()
-                && let Err(refusal) = carried.run(|| as_task(task.as_ref(), || refused(sel)))
+                && let Err(refusal) = carried.run(|| refused(sel))
             {
                 log::warn!(
                     target: "reims_vgpu::refused",
@@ -859,19 +804,6 @@ impl Ending {
         reims_vgpu_core::testkit::capture::with_slot(self.slot.take(), end);
         #[cfg(not(test))]
         end();
-    }
-}
-
-/// Runs `f` as the code of `task`, the isolated task a command buffer is of (none outside
-/// isolation), as core carries its completed handlers (`TaskLife::carry`): not at all once the
-/// task ended, so that a task's command buffer that ends after it kills nothing. A platform death
-/// in `f` still ends the process, as on the Metal platform a crash inside Metal does.
-fn as_task(task: Option<&Arc<TaskLife>>, f: impl FnOnce()) {
-    match task {
-        Some(life) => {
-            let _ = life.run(f);
-        }
-        None => f(),
     }
 }
 
@@ -1331,19 +1263,13 @@ fn failure_error(cb: &rt::CommandBuffer) -> Option<NsErrorText> {
     Some(command_buffer_error(e, cb.error_description()))
 }
 
-/// The runtime's handler of core's completed handler `block`, added by the code of `task`, the
-/// isolated task whose code runs, if one's does: it hands `block` the command buffer's `status`
-/// and `error` as they are then, after `read`, its read of the failure, which dies for a failure
-/// that is none of Metal's ([`failure`]). The read is the task's code ([`as_task`]), as the
-/// death in [`Ending`] is: once the task ended, core's handlers of it run none
-/// (`TaskLife::carry`), so none reads the failure, and nothing dies; `block` is called all the
-/// same, with the failure as its code says ([`command_buffer_error`]), and decides itself
-/// whether it runs. Added inside a refusal scope (the graphics lane's), the read and `block` run
+/// The runtime's handler of core's completed handler `block`: it hands `block` the command
+/// buffer's `status` and `error` as they are then, after `read`, its read of the failure, which
+/// dies for a failure that is none of Metal's ([`failure`]). Added inside a refusal scope (the graphics lane's), the read and `block` run
 /// in one on the runtime's thread too ([`run_completed`]): the read's death fails the command
 /// buffer to `block` ([`CompletedInfo::refused`]) and the process goes on.
 fn completed_handler(
     block: CompletedHandler,
-    task: Option<Arc<TaskLife>>,
     read: impl FnOnce(&rt::CommandBuffer) + Send + 'static,
 ) -> rt::Handler {
     #[cfg(test)]
@@ -1356,7 +1282,7 @@ fn completed_handler(
             run_completed(
                 carried,
                 || {
-                    as_task(task.as_ref(), || read(cb));
+                    read(cb);
                     let error = cb
                         .error()
                         .map(|e| command_buffer_error(e, cb.error_description()));
@@ -1407,10 +1333,9 @@ fn event<'a>(sel: &'static str, event: Option<EventRef<'a, VulkanPlatform>>) -> 
 
 impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// Refused once the buffer is committed, as Metal's validation refuses it. A failure that is
-    /// none of Metal's dies as the handler reads it, unless the isolated task whose code added
-    /// the handler ended ([`completed_handler`]).
+    /// none of Metal's dies as the handler reads it ([`completed_handler`]).
     fn add_completed_handler(&self, _on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
-        let handler = completed_handler(block, TaskLife::current(), |cb| {
+        let handler = completed_handler(block, |cb| {
             failure(cb);
         });
         send("addCompletedHandler:", Policy::Dies, || {
@@ -1446,7 +1371,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         _on: OnFault,
         block: CompletedHandler,
     ) -> RaiseResult<()> {
-        let handler = completed_handler(block, TaskLife::current(), |cb| {
+        let handler = completed_handler(block, |cb| {
             failure(cb);
         });
         send("addCompletionSeenHandler", Policy::Dies, || {
@@ -1466,9 +1391,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
 
     /// Refused while an encoder is open or after a commit, as Metal's validation refuses it.
     /// Every refusal dies naming the runtime's, and one of the records of an indirect command
-    /// buffer it executes says so ([`committing`]). Its progress is committed past the send's
-    /// check of the task's end, where a thread of an ended task stops with the command buffer
-    /// never committed. One that Metal's GPU fails for what its encoders did is committed failed
+    /// buffer it executes says so ([`committing`]). One that Metal's GPU fails for what its encoders did is committed failed
     /// ([`CommandBufferObject::failure`]); any other is committed with its submission check,
     /// which fails a submission that uses a detached buffer or heap (module docs). A slow commit
     /// and a late completion are debug lines ([`timing::commit`]). One that holds work for
@@ -1493,7 +1416,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         // The guest's GPU work, which keeps the GPU awake ([`crate::awake`]).
         self.device.awake.touch();
         let progress = self.progress.lock().clone();
-        if read_only_faulted() {
+        if READ_ONLY_FAULTED.load(Ordering::Acquire) {
             unrepresentable(
                 "commit",
                 "a command buffer committed after a render pass's store into read-only memory \
@@ -1502,7 +1425,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             );
         }
         if self.read_only_store.load(Ordering::SeqCst) {
-            mark_read_only_faulted();
+            READ_ONLY_FAULTED.store(true, Ordering::Release);
         }
         encoding("commit", Policy::Dies, || {
             predication::boundary(&self.predication, "commit");
@@ -1515,7 +1438,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             let failure = self.failure("commit", detached);
             self.check_executions(failure.as_ref().map(|f| &f.encoders), progress.as_deref());
             let check = match (&failure, opened) {
-                (None, Some(opened)) => Some(backing::submission_check(opened.commit())),
+                (None, Some(opened)) => Some(backing::submission_check(opened)),
                 _ => None,
             };
             if let Some(progress) = &progress {
@@ -2132,24 +2055,6 @@ mod tests {
         cb.wait_until_completed(OnFault::Return).unwrap();
     }
 
-    /// A command buffer's first work for the tiler, the process's first, adds its submission
-    /// handler without stopping a thread of an isolated task that ended: a render encoder's
-    /// runtime encoder is not in its handle yet as its work is taken (`encode_render`'s `make`)
-    #[test]
-    fn an_ended_tasks_work_for_the_tiler_stops_nothing() {
-        let q = dev().new_command_queue().unwrap();
-        let cb = buffer(&q);
-        assert!(!metal_space::taken(FirstUse::TilerSubmission));
-        let sel = "renderCommandEncoderWithDescriptor:";
-        let life = TaskLife::new();
-        let went_on = life.run(|| {
-            life.exit();
-            cb.tiler_work(sel, FirstUse::RenderEncoder);
-        });
-        assert!(went_on.is_some());
-        assert!(cb.tiler.load(Ordering::SeqCst));
-    }
-
     /// Once the process took Metal's allocation for its work for the tiler, a command buffer
     /// with such work carries no submission handler for it: the runtime runs its transition to
     /// scheduled on its scheduler thread as it submits it, with no handler thread woken for it,
@@ -2506,11 +2411,10 @@ mod tests {
     }
 
     /// A host step's refusal of a command buffer that executes an indirect command buffer dies
-    /// as the command buffer ends, at the execution's selector, outside isolation and while the
-    /// command buffer's task runs; once the task ended, as core's handlers of it run none, it
-    /// dies at nothing, and the command buffer's progress ends all the same
+    /// as the command buffer ends, at the execution's selector; in the refusal scope the command
+    /// carried it is refused, and the command buffer's progress ends all the same
     #[test]
-    fn a_refused_command_buffer_of_an_ended_task_dies_at_nothing() {
+    fn a_refused_command_buffer_dies_at_its_execution() {
         use reims_vgpu_core::platform::values::IcbDesc;
 
         let d = dev();
@@ -2521,12 +2425,11 @@ mod tests {
         };
         let icb = d.new_indirect_command_buffer(&desc, 1, 0).unwrap().unwrap();
         let sel = "executeCommandsInBuffer:withRange:";
-        let ending = |task| {
+        let ending = || {
             let progress = Arc::new(Progress::default());
             progress.executes(sel, icb.clone_ref());
             let ending = Ending {
                 progress: Some(Arc::clone(&progress)),
-                task,
                 carried: refusals::carry(),
                 slot: None,
             };
@@ -2535,19 +2438,12 @@ mod tests {
         let refused = |sel| {
             unrepresentable(sel, "a host step's refusal");
         };
-        let life = TaskLife::new();
-        for task in [None, Some(Arc::clone(&life))] {
-            let (_, mut e) = ending(task);
-            let site = catch_death(|| e.end(Stage::Failed, Some(refused))).unwrap_err();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-        }
-        let (progress, mut e) = ending(Some(Arc::clone(&life)));
-        assert!(life.exit());
-        e.end(Stage::Failed, Some(refused));
-        assert_eq!(progress.stage(), Stage::Failed);
+        let (_, mut e) = ending();
+        let site = catch_death(|| e.end(Stage::Failed, Some(refused))).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
         // Made by an op of the graphics lane's, in its refusal scope: the death is refused on the
         // handler's thread, and the progress ends all the same.
-        let (progress, mut e) = refusals::refusing(|| ending(None)).unwrap();
+        let (progress, mut e) = refusals::refusing(ending).unwrap();
         std::thread::Builder::new()
             .name("the runtime's progress".into())
             .spawn(move || e.end(Stage::Failed, Some(refused)))
@@ -2560,7 +2456,7 @@ mod tests {
     /// A command buffer's progress ends on the runtime's thread in the scope its command carried
     /// (the graphics lane's): a change that dies at the completion and an object whose release
     /// dies are refused there, the other changes run, the other objects go, and the stage is
-    /// set. Outside every scope (the paravirt device's), the same release dies, as before
+    /// set. Outside every scope the same release dies
     #[test]
     fn a_progress_ends_in_the_scope_its_command_carried() {
         /// An object whose release dies, as the platform's release of what a command used can.
@@ -2572,7 +2468,6 @@ mod tests {
         }
         let ending = |progress: &Arc<Progress>| Ending {
             progress: Some(Arc::clone(progress)),
-            task: None,
             carried: refusals::carry(),
             slot: None,
         };
@@ -2613,8 +2508,8 @@ mod tests {
 
     /// Core's completed handler added inside a refusal scope (the graphics lane's) reads a failure
     /// that dies in that scope on the runtime's thread: the handler is handed the command buffer
-    /// failed by the refusal, and the process goes on. Added outside every scope (the paravirt
-    /// device's), the same read dies, as before
+    /// failed by the refusal, and the process goes on. Added outside every scope, the same read
+    /// dies
     #[test]
     fn a_completed_handlers_read_in_a_scope_fails_its_command_buffer() {
         let q = dev().new_command_queue().unwrap();
@@ -2623,7 +2518,7 @@ mod tests {
         cb.wait_until_completed(OnFault::Return).unwrap();
         let handler = |seen: mpsc::Sender<CompletedInfo>| {
             let block: CompletedHandler = Box::new(move |info| seen.send(info).unwrap());
-            completed_handler(block, None, |_| {
+            completed_handler(block, |_| {
                 unrepresentable("commit", "a failure none of Metal's");
             })
         };
@@ -2647,108 +2542,6 @@ mod tests {
         let site = catch_death(|| h(&cb.raw)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
         assert!(rx.try_recv().is_err());
-    }
-
-    /// Core's completed handler reads a failure that dies as the code of the isolated task that
-    /// added it: outside isolation and while the task runs it dies, and once the task ended it
-    /// dies at nothing, the handler still handed the command buffer's status
-    #[test]
-    fn a_completed_handlers_read_of_an_ended_tasks_failure_dies_at_nothing() {
-        let q = dev().new_command_queue().unwrap();
-        let cb = buffer(&q);
-        cb.commit(OnFault::Return).unwrap();
-        cb.wait_until_completed(OnFault::Return).unwrap();
-        let handler = |task, seen: mpsc::Sender<CompletedInfo>| {
-            let block: CompletedHandler = Box::new(move |info| seen.send(info).unwrap());
-            completed_handler(block, task, |_| {
-                unrepresentable("commit", "a failure none of Metal's");
-            })
-        };
-        let life = TaskLife::new();
-        for task in [None, Some(Arc::clone(&life))] {
-            let (tx, rx) = mpsc::channel();
-            let h = handler(task, tx);
-            let site = catch_death(|| h(&cb.raw)).unwrap_err();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
-            assert!(rx.try_recv().is_err());
-        }
-        // Added by the task's code, as core adds it: the task is the handler's.
-        let (tx, rx) = mpsc::channel();
-        let h = life.run(|| handler(TaskLife::current(), tx)).unwrap();
-        assert!(life.exit());
-        h(&cb.raw);
-        assert_eq!(rx.recv().unwrap().status, CommandBufferStatus::COMPLETED);
-    }
-
-    /// A thread of an isolated task that ended stops at a command buffer's send before anything
-    /// of it dies or takes effect: an event send of a nil event, an encoder's creation, and a
-    /// commit whose unit of compute encoders holds an open block of command predication, each
-    /// of which dies while the task runs, stop, and the command buffer stays uncommitted
-    #[test]
-    fn an_ended_tasks_sends_stop_before_they_die() {
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        let q = dev().new_command_queue().unwrap();
-        let cb = buffer(&q);
-        let condition = crate::gpu::resource::tests::shared(16);
-        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-        let start = ComputeCmd::EncodeStartIf {
-            buffer: Some(&condition),
-            offset: 0,
-            comparison: 0,
-            reference_value: 0,
-        };
-        e.encode(OnFault::Return, start).unwrap();
-        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
-        let sends: [(&str, &dyn Fn()); 6] = [
-            ("encodeSignalEvent:value:", &|| {
-                let _ = cb.encode_signal(None, 1);
-            }),
-            ("encodeSignalEventScheduled:value:", &|| {
-                let _ = cb.encode_signal_when_scheduled(None, 1);
-            }),
-            ("encodeWaitForEvent:value:", &|| {
-                let _ = cb.encode_wait(None, 1);
-            }),
-            ("blitCommandEncoder", &|| {
-                let _ = cb.blit_encoder(OnFault::Return);
-            }),
-            ("renderCommandEncoderWithDescriptor:", &|| {
-                use reims_vgpu_core::platform::Platform as _;
-                let pass = crate::platform::tests::platform().render_pass_descriptor();
-                let _ = cb.render_encoder(OnFault::Return, &pass);
-            }),
-            ("commit", &|| {
-                let _ = cb.commit(OnFault::Return);
-            }),
-        ];
-        for (sel, send) in sends {
-            let site = catch_death(send).unwrap_err();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-            let life = TaskLife::new();
-            let stopped = life.run(|| {
-                life.exit();
-                send();
-            });
-            assert!(stopped.is_none(), "{sel}");
-        }
-        assert_eq!(cb.status(), CommandBufferStatus::NOT_ENQUEUED);
-    }
-
-    /// A thread of an isolated task that ended stops at commit before the runtime's commit, and
-    /// the command buffer's progress stays uncommitted: what it uses is not held as the GPU's
-    #[test]
-    fn an_ended_tasks_commit_leaves_its_command_buffer_uncommitted() {
-        let q = dev().new_command_queue().unwrap();
-        let cb = buffer(&q);
-        let progress = cb.progress("test");
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            cb.commit(OnFault::Return)
-        });
-        assert!(stopped.is_none());
-        assert_eq!(progress.stage(), Stage::Encoding);
-        assert_eq!(cb.status(), CommandBufferStatus::NOT_ENQUEUED);
     }
 
     /// A failure of the GPU's work the driver relayed reaches core with Metal's code where its

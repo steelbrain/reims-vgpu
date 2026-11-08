@@ -100,7 +100,7 @@ mod tests {
         );
     }
 
-    /// Two tokens are independent (one per ProcessState)
+    /// Two tokens are independent
     #[test]
     fn tokens_independent() {
         let (a, b) = (Once::default(), Once::new());

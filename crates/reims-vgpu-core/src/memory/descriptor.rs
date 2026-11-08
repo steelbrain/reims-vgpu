@@ -2,8 +2,7 @@
 
 use crate::host::HostPtr;
 
-/// One range of guest physical memory and where the host mapped it. The field names are
-/// QEMU's (`apple-gfx.h`).
+/// One range of guest physical memory and where the host mapped it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct GuestPhysicalRange {
     /// `physicalAddress`.

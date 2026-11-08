@@ -1,13 +1,10 @@
-//! The host's opaque values: addresses, tasks, trace ranges and physical ranges.
-//!
-//! Core never dereferences a host address itself: `crate::guest` turns one back into a pointer
-//! and owns every access.
+//! The host's values: addresses and physical ranges.
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// A host virtual address (`void *`): a task base, a no-copy buffer, `readMemory`'s
-/// destination. Carries no provenance of its own: `crate::guest` turns it back into a pointer
-/// (`with_exposed_provenance`). NULL is representable: the host passes it and core tests it.
+/// A host virtual address (`void *`): a range of the memory map, a no-copy buffer. Carries no
+/// provenance of its own: a user turns it back into a pointer (`with_exposed_provenance`). NULL
+/// is representable: the host passes it and core tests it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct HostPtr(usize);
@@ -27,7 +24,7 @@ impl HostPtr {
     }
 
     /// Back to a pointer with the exposed provenance. Creating it is safe; dereferencing it
-    /// is `crate::guest`'s job.
+    /// is its user's to make safe.
     pub fn as_ptr<T>(self) -> *mut T {
         std::ptr::with_exposed_provenance_mut(self.0)
     }
@@ -53,8 +50,7 @@ impl HostPtr {
     }
 }
 
-/// One range of guest physical memory, `{physicalAddress, physicalLength}`: the C API's
-/// `RvgPhysicalMemoryRange`, which has its layout.
+/// One range of guest physical memory, `{physicalAddress, physicalLength}`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, FromBytes, IntoBytes, Immutable, KnownLayout,
 )]
@@ -71,50 +67,10 @@ pub type PhysRange = PhysicalMemoryRange;
 
 const _: () = assert!(size_of::<PhysicalMemoryRange>() == 16);
 
-/// `PGTask_t *`: the host's opaque task. NULL is representable: `createTask` answers NULL on
-/// failure, and the device hands a NULL task to `destroyTask` after a failed root map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(transparent)]
-pub struct HostTask(usize);
-
-impl HostTask {
-    /// `NULL`.
-    pub const NULL: HostTask = HostTask(0);
-    /// From the host's pointer value.
-    pub const fn from_addr(addr: usize) -> HostTask {
-        HostTask(addr)
-    }
-    /// The host's pointer value.
-    pub const fn addr(self) -> usize {
-        self.0
-    }
-    /// Whether it is `NULL`.
-    pub const fn is_null(self) -> bool {
-        self.0 == 0
-    }
-}
-
-/// `PGTraceRange_t *`: the host's opaque trace range; NULL when the host installs none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-#[repr(transparent)]
-pub struct HostTraceRange(usize);
-
-impl HostTraceRange {
-    /// `NULL`.
-    pub const NULL: HostTraceRange = HostTraceRange(0);
-    /// From the host's pointer value.
-    pub const fn from_addr(addr: usize) -> HostTraceRange {
-        HostTraceRange(addr)
-    }
-    /// The host's pointer value.
-    pub const fn addr(self) -> usize {
-        self.0
-    }
-    /// Whether it is `NULL`.
-    pub const fn is_null(self) -> bool {
-        self.0 == 0
-    }
-}
+/// Where the zero region ends: every arm64 macOS executable, QEMU included, maps
+/// `__PAGEZERO` over `[0, 4 GiB)` (ld64's default `-pagezero_size`, `otool -l`), so an access below
+/// it faults. Name is ours: the "NULL or near-NULL" access.
+pub const ZERO_REGION_END: usize = 0x1_0000_0000;
 
 #[cfg(test)]
 mod tests {
@@ -133,7 +89,7 @@ mod tests {
         assert_eq!(HostPtr::default(), HostPtr::NULL);
     }
 
-    /// The SDK layout of PGPhysicalMemoryRange_t
+    /// Its layout: the address, then the length
     #[test]
     fn phys_range_layout() {
         let bytes = [1u8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0];
@@ -145,16 +101,5 @@ mod tests {
                 physical_length: 2
             })
         );
-    }
-
-    /// Opaque handles keep NULL
-    #[test]
-    fn opaque_handles() {
-        assert!(HostTask::NULL.is_null());
-        assert_eq!(HostTask::from_addr(8).addr(), 8);
-        assert!(!HostTask::from_addr(8).is_null());
-        assert!(HostTraceRange::NULL.is_null());
-        assert_eq!(HostTraceRange::from_addr(9).addr(), 9);
-        assert!(!HostTraceRange::from_addr(9).is_null());
     }
 }

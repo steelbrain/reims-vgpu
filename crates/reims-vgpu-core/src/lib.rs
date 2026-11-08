@@ -1,7 +1,10 @@
-//! All of the library's behaviour, generic over one `P: Platform` (D3). Links no Apple framework.
+//! What the library's platforms and the reims-graphics device share, generic over one
+//! `P: Platform` (D3): the platform traits, the runtime (threads, queues, holds), raises and
+//! deaths, the guest's RAM as the host maps it, and the testkit's fake platform. Links no Apple
+//! framework.
 
 // The crate root denies `unsafe_code` (D43): `forbid` cannot be lowered by the per-module
-// `#![allow(unsafe_code)]` that 17.3 grants `guest/ptr.rs` and `testkit/guest_ram.rs` (E0453).
+// `#![allow(unsafe_code)]` that 17.3 grants `testkit/guest_ram.rs` (E0453).
 #![deny(unsafe_code)]
 // The crate's lint set. Tests are exempt: clippy.toml lets them unwrap, index and panic,
 // and the conversion and division lints apply outside cfg(test) only, as clippy has no in-tests
@@ -28,30 +31,17 @@
         clippy::undocumented_unsafe_blocks
     )
 )]
-// Architecture 3 names `device/device.rs`, `fifo/fifo.rs`, `display/display.rs` and
-// `deserializer/deserializer.rs`.
-#![allow(clippy::module_inception)]
 
 pub mod collections;
-pub mod deserializer;
-pub mod device;
 pub mod display;
-pub mod fifo;
-pub mod gpu_task;
-pub mod guest;
 pub mod host;
-pub mod iosurface;
 pub mod logging;
 pub mod memory;
 pub mod num;
 pub mod platform;
-pub mod process;
 pub mod raise;
-pub mod resources;
 pub mod rt;
-pub mod seams;
 pub mod sync;
-pub mod tasks;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod trace;

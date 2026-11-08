@@ -2,12 +2,17 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_core::display::{POS_DATA, TEX_DATA};
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_metal::MetalPlatform;
 use reims_vgpu_metal::os::iosurface::MetalSurface;
 
 use super::*;
+
+/// The display's full-screen triangle strip's positions (float4 × 4).
+const POS_DATA: [f32; 16] = [
+    -1.0, -1.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0,
+];
+/// Its texture coordinates (float2 × 4).
+const TEX_DATA: [f32; 8] = [0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
 
 /// `MTLPixelFormatRGBA8Unorm`, `BGRA8Unorm`, `RGBA16Float` and `R32Float`.
 const RGBA8: u64 = 70;
@@ -16,19 +21,6 @@ const R32F: u64 = 55;
 
 /// `MTLResourceStorageModeManaged`: the property buffer's options.
 const MANAGED: u64 = 0x10;
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl TaskLauncher<MetalPlatform> for NoLauncher {
-    fn launch(
-        &self,
-        _platform: &Arc<MetalPlatform>,
-        _host: Arc<dyn HostSide<MetalPlatform>>,
-    ) -> Arc<dyn ServiceLink<MetalPlatform>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// The fragment properties as core writes them: the matrix's four columns of three (each
 /// padded to four), then the slopes at 0 and at 1.
@@ -367,7 +359,7 @@ fn on_both(check: impl Fn(&dyn Fn(Option<&Gamma>, Frame) -> Vec<[u8; 4]>)) {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     check(&|gamma, frame| {
         let f = frame.make(&mp, &md);
         present(&mp, &md, &f, gamma)
@@ -576,7 +568,7 @@ fn variant_on_both(variant: Variant, on_metal: bool) -> Vec<[u8; 4]> {
     let (p, d) = (platform(), dev());
     let vulkan = present_as(&p, &d, &frame.make(&p, &d), None, variant);
     if on_metal && let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         let metal = present_as(&mp, &md, &frame.make(&mp, &md), None, variant);
         assert_eq!(vulkan, metal, "{variant:?}");
     }
@@ -669,7 +661,7 @@ fn quads_give_metals_primitive_ids() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let clear = vec![[0, 0, 0, 0xff]; 256];
     for primitive_type in [7, 8] {
         for count in 4..=10 {
@@ -696,8 +688,7 @@ fn quads_give_metals_primitive_ids() {
 #[test]
 fn private_types_from_far_vertex_starts_draw_as_metals() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let wrapped = ("vertex_ids:wrapped_vertex", "vertex_ids:ids_fragment");
     let clear = vec![[0, 0, 0, 0xff]; 256];
     let mut differ = Vec::new();
@@ -759,8 +750,7 @@ const QUADS_RESTARTED_WIDE: &[u32] = &[0, 1, 2, 3, 4, 5, 0xffff_ffff, 6, 7, 8, 9
 #[test]
 fn private_types_draw_over_indices_and_arguments_as_metals() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let ids = ("vertex_ids:ids_vertex", "vertex_ids:ids_fragment");
     let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
         primitive_type,
@@ -1209,8 +1199,7 @@ const RESTARTED_AT_3: &[u32] = &[0, 1, 2, 3, 4, 3, 5, 6, 7, 8, 9];
 #[test]
 fn flat_inputs_take_metals_provoking_vertex_at_every_draw() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
         primitive_type,
         index_type,
@@ -1291,8 +1280,7 @@ fn colours_of(pixels: &[[u8; 4]]) -> std::collections::BTreeSet<[u8; 4]> {
 #[test]
 fn lines_take_metals_flat_inputs_at_the_last_vertex() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let kind = rt::Degradation::ProvokingVertexLines;
     for draw in [
         Provoked::Vertices(1, 0, 8, 1),
@@ -1337,8 +1325,7 @@ fn lines_take_metals_flat_inputs_at_the_last_vertex() {
 #[test]
 fn lines_draw_at_metals_widths() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let kind = rt::Degradation::DeviceWideLines;
     /// The flat state's draw of `primitive_type` over the first 8 flat vertices at `line_width`,
     /// the first white.
@@ -1410,8 +1397,7 @@ fn lines_draw_at_metals_widths() {
 #[test]
 fn barycentric_weights_take_metals_order_at_the_last_vertex() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let smooth = ("barycentric:smooth_vertex", "barycentric:smooth_weights");
     let flat = ("barycentric:flat_vertex", "barycentric:flat_weights");
     let draws = [
@@ -1523,7 +1509,7 @@ fn a_patchs_last_vertex_is_relayed_where_the_device_lacks_it() {
         assert_eq!(super::relayed_kind(kind), before, "{mode:#x}");
     }
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         let theirs = patch_pixels(&mp, &md, 0);
         assert!(first == theirs);
         assert!(patch_pixels(&mp, &md, 1) != theirs);
@@ -1561,8 +1547,7 @@ fn modes_past_1_draw_metals_third_way() {
         (FLAT, Provoked::Vertices(2, 3, 7, 1)),
         (SIZED, Provoked::Vertices(0, 0, 3, 1)),
     ];
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     for (at, (functions, draw)) in [list].into_iter().chain(others).enumerate() {
         let ours =
             |mode| crate::answer::relaxed(|| provoked(&p, &d, functions, (mode, None), draw));
@@ -1596,8 +1581,7 @@ fn modes_past_1_draw_metals_third_way() {
 fn re_indexed_draws_keep_metals_vertex_ids() {
     let (p, d) = (platform(), dev());
     let ids = ("vertex_ids:ids_vertex", "vertex_ids:ids_fragment");
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     for (mode, draw) in [
         (0, (5, 3, 5, 1)),
         (0, (6, 2, 6, 2)),
@@ -1639,8 +1623,7 @@ fn re_indexed_draws_keep_metals_draw_bases() {
     }
     let (p, d) = (platform(), dev());
     let bases = ("vertex_ids:bases_vertex", "vertex_ids:ids_fragment");
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     for (mode, draw) in [
         (0, (3, 2, 6, 2)),
         (0, (5, 3, 5, 1)),
@@ -1748,7 +1731,7 @@ fn points_die_where_metal_sizes_none() {
         ours
     );
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         let theirs = fixture_state::<MetalPlatform>(&md, SIZED.0, SIZED.1);
         assert_eq!(
             pass_pixels(&mp, &md, points::<MetalPlatform>(&theirs)),
@@ -2151,8 +2134,7 @@ fn provoked_runs<P: Platform>(
 #[test]
 fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let at = |start: usize, runs: &[u32]| -> Vec<u32> {
         let mut out = vec![0; RUNS];
         out[start..start + runs.len()].copy_from_slice(runs);
@@ -2204,8 +2186,7 @@ fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
 #[test]
 fn private_types_run_the_vertex_function_as_often_as_metals_at_every_draw() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
         primitive_type,
         index_type,
@@ -2432,7 +2413,7 @@ fn texture_writes_round_as_metals_at_the_modes_they_decode() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let half = [(25, 2), (65, 4), (115, 8)];
     let rest = [(70, 4), (12, 1), (20, 2), (90, 4), (92, 4)];
@@ -2581,7 +2562,7 @@ fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
         assert!(line.contains(named), "{line}");
     }
     if let Some(md) = &metal {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         for (fragment, blend) in dies.map(|(d, ..)| d) {
             let state = state::<MetalPlatform>(md, fragment, blend);
             let state = state.unwrap_or_else(|| panic!("{fragment:?}"));
@@ -2858,8 +2839,8 @@ fn second_source_blends_without_a_second_output_are_refused_as_metals() {
 /// each for a test ([`XrSide`]).
 fn xr_sides() -> XrSides {
     let ours = XrSide::new(platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| XrSide::new(MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal =
+        MetalPlatform::system_default_device().map(|md| XrSide::new(MetalPlatform::new(), md));
     (ours, metal)
 }
 
@@ -3793,7 +3774,7 @@ fn a_blend_onto_a_clear_between_codes_is_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let kind = rt::Degradation::ExtendedRangeBlendSource;
     for clear in [[0.0, 0.0, 0.0, 0.5], [0.0005, 0.0, 0.0, 0.5]] {
@@ -3916,7 +3897,7 @@ fn mode_2_render_states_are_decided_once_made() {
                 "{entries:?} {colours:?}"
             );
         }
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         for (kind, metals) in [(0, false), (1, true), (3, true)] {
             let ours = crate::answer::relaxed(|| {
                 swept(&p, &d, (false, NEAREST_EVEN), (115, 8), kind, covered)
@@ -3943,7 +3924,7 @@ fn mode_2_half_float_attachments_stored_as_written_round_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let replace: &[(u8, u32)] = &[(2, 1), (3, 1), (4, 0), (5, 0), (6, 1), (7, 0), (8, 0)];
     let drawn = [
@@ -4222,7 +4203,7 @@ fn half_outputs_store_within_the_bound_or_die_named() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let blends_relayed = || {
         (crate::answer::inexact_counts().into_iter())
@@ -4449,7 +4430,7 @@ fn bfloat_draws_store_metals_codes() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let half = Drawn {
         fragment: "sweep_half_fragment",
@@ -4521,7 +4502,7 @@ fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let coverage: &[&str] = &["05 04 01000000"];
     let covered = Drawn {
@@ -4699,7 +4680,7 @@ fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let draw = |format: (u64, u64), kind| {
         let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
@@ -4784,7 +4765,7 @@ fn mode_2_fragment_writes_through_handles_are_metals_or_die_at_the_draw() {
     let Some(md) = md else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     for format in [(70, 4), (125, 16)] {
         for kind in [0, 1, 3] {
             for mode in [0, NEAREST_EVEN] {
@@ -5171,7 +5152,7 @@ fn drawn_nan_and_infinite_samples_resolve_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let mut differ = Vec::new();
     for samples in [2, 4] {
@@ -5258,7 +5239,7 @@ fn drawn_extended_range_samples_resolve_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let tables = drawn_extended();
     let mut differ = Vec::new();
@@ -6097,8 +6078,7 @@ fn resolving_pass<P: Platform>(
 )]
 fn resolves_into_other_formats_are_metals_or_die_named() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let untouched = [(115, 8), (554, 4), (555, 4)];
     let written = [(90, 4), (94, 4), (552, 8), (553, 8)];
     let kept = |bytes: &[u8]| bytes.iter().all(|&b| b == 0xa5);
@@ -6386,7 +6366,7 @@ fn samples_resolved_into_the_twin_are_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (ours, theirs) = (
         States::<VulkanPlatform>::new(&d),
         States::<MetalPlatform>::new(&md),
@@ -7050,7 +7030,7 @@ fn resolves_as_metals(samples: u64) {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let modes = [0, NEAREST_EVEN];
     // Fully covered, a quarter pixel in, and a quarter pixel in resolved apart.
     let hows = [(0.0, false), (0.25, false), (0.25, true)];
@@ -7209,8 +7189,7 @@ fn routed_pass<P: Platform>(
 #[test]
 fn the_last_vertex_routes_layers_and_viewports_as_metals() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     /// The draw of `kind`: 0 a list of 6 vertices, 1 a strip of 6, 2 a list over [`LIST`]'s
     /// first 6 indices, 3 a strip over [`STRIP_OF_SIX`], 4 a strip of 6 from indirect
     /// arguments, 5 a line strip of 6, over `bytes`, the indices or arguments.
@@ -7299,8 +7278,7 @@ fn the_last_vertex_routes_layers_and_viewports_as_metals() {
 #[test]
 fn indexed_strips_restart_at_the_set_index_as_metals_do() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let odd = u16s(&[0, 1, 2, 3, 0xffff, 4, 5, 6, 7]);
     let even = u16s(&[0, 1, 2, 3, 0xffff, 4, 5, 6, 7, 8]);
     let wide = u32s(&[0, 1, 2, 3, 4, 5, 6, 7, 8]);
@@ -7349,7 +7327,7 @@ fn a_long_restarted_strip_draws_within_the_index_pool_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     for (index_type, indices) in long_restarted_strips() {
         let drawn = (STRIP, index_type, &indices[..]);
         let restart = Some((true, 3));
@@ -7365,8 +7343,7 @@ fn a_long_restarted_strip_draws_within_the_index_pool_as_metals() {
 #[test]
 fn private_types_draw_after_a_restart_set_as_metals_do() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     /// The pixels of ten vertices of `primitive_type`, after a setter of `k` where one is.
     fn drawn<P: Platform>(
         p: &P,
@@ -7524,8 +7501,7 @@ fn executed_strip(
 #[test]
 fn an_execution_draws_its_strips_after_a_restart_set_as_metals_does() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let k = 3;
     for (index_type, indices) in [
         (U16, u16s(&[0, 1, 2, 3, 0xffff, 4, 5, 6, 7])),
@@ -7588,8 +7564,7 @@ fn empty_executions_run_nothing_under_any_pipeline_state() {
         )
     }
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     for inherit in [true, false] {
         assert_eq!(
             pixels(&p, &d, inherit),
@@ -7663,7 +7638,7 @@ fn a_pass_past_its_attachments_slices_dies_where_metal_writes_past_the_texture()
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (descriptor, backing, _t) = pass(&mp, &md);
     let q = md.new_command_queue().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
@@ -7778,7 +7753,7 @@ fn unknown_stores_over_resolves_resolve_nothing() {
     let (p, d) = (platform(), dev());
     assert_eq!(unknown_stores_over_resolves(&p, &d), before);
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         assert_eq!(unknown_stores_over_resolves(&mp, &md), before);
     }
 }
@@ -7885,8 +7860,7 @@ const STENCIL8: u64 = 253;
 #[test]
 fn unused_depth_and_stencil_resolves_leave_their_textures() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     let depth: Vec<u8> = (0..256).flat_map(|_| 0.75f32.to_ne_bytes()).collect();
     let stencil = vec![0x5a; 256];
     for (format, kept) in [((DEPTH32F, 4), &depth), ((STENCIL8, 1), &stencil)] {
@@ -7919,7 +7893,7 @@ fn unused_depth_and_stencil_resolves_leave_their_textures() {
 fn render_pass_values_metal_refuses_die_at_the_encoder() {
     let p = platform();
     let d = dev();
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let md = MetalPlatform::system_default_device();
     // Each case's load action, store action and store action options.
     fn set_of<P: Platform>(
@@ -8042,7 +8016,6 @@ fn render_pass_values_metal_refuses_die_at_the_encoder() {
 /// The display's functions cannot write an integer target: no pipeline, as on Metal
 #[test]
 fn an_integer_target_has_no_display_pipeline() {
-    let p = platform();
     let d = dev();
     let cache = DisplayPipelineCache::<VulkanPlatform>::new(d.clone_ref()).unwrap();
     let key = PipelineKey {
@@ -8050,7 +8023,6 @@ fn an_integer_target_has_no_display_pipeline() {
         gamma: false,
     };
     assert!(cache.pipeline_for(key).is_none());
-    drop(p);
     if let Some(md) = MetalPlatform::system_default_device() {
         let cache = DisplayPipelineCache::<MetalPlatform>::new(md).unwrap();
         assert!(cache.pipeline_for(key).is_none());
@@ -8308,8 +8280,7 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
             assert!(line.contains(named), "{line}");
         }
     }
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let metal = MetalPlatform::system_default_device().map(|md| (MetalPlatform::new(), md));
     if let Some((mp, md)) = &metal {
         let theirs = shapes.map(|(reset, load)| stored(mp, md, reset, load));
         for ((shape, o), t) in shapes.iter().zip(&ours).zip(&theirs) {
@@ -8508,7 +8479,7 @@ fn drawless_passes_over_mutable_maps_store_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     for (&(case, multisample), answer) in runs.iter().zip(&ours) {
         let theirs = drawless(&mp, &md, case, multisample);
         assert!(
@@ -8689,7 +8660,7 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
         assert!(drawn(&p, &d, case) == Ok(shaded(case.1, side)), "{case:?}");
     }
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         for (case, side) in cases {
             assert!(
                 drawn(&mp, &md, case) == Ok(shaded(case.1, side)),
@@ -8785,7 +8756,7 @@ fn the_tile_size_is_metals() {
     let vulkan = tile(&platform(), &dev());
     assert_eq!(vulkan, (32, 32));
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         assert_eq!(tile(&mp, &md), vulkan);
     }
 }
@@ -8945,7 +8916,7 @@ fn tile_dispatch_cells_past_the_attachment_are_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let (w, h) = EDGE_EXTENT;
     let floats = |codes: [u8; 4]| codes.map(|c| (f32::from(c) / 255.0).to_bits());
@@ -9101,7 +9072,7 @@ fn simd_operations_in_a_vertex_function_draw_as_metals() {
             "{vertex}: {ours:?}"
         );
         if let Some(md) = &md {
-            let mp = MetalPlatform::new(Box::new(NoLauncher));
+            let mp = MetalPlatform::new();
             assert_eq!(ours, simd_vertex_pixels(&mp, md, vertex), "{vertex}");
         }
     }
@@ -9188,7 +9159,7 @@ fn simd_operations_in_kernels_and_fragments_run_as_metals() {
     let pixels = ["sum_fragment", "fill_fragment"].map(|f| simd_fragment_pixels(&p, &d, f));
     assert!(pixels[0].iter().all(|px| px[3] == 255), "{:?}", pixels[0]);
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         assert_eq!(words, simd_kernel_words::<MetalPlatform>(&md));
         for (fragment, ours) in ["sum_fragment", "fill_fragment"].into_iter().zip(&pixels) {
             assert_eq!(
@@ -9556,7 +9527,7 @@ fn later_command_buffers_of_a_hang_run_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     for _ in 0..3 {
         let theirs = untimed(after_a_failure(&mp, &md, Failure::Hang, Later::AtOnce));
@@ -9574,7 +9545,7 @@ fn metal_runs_after_a_type_9_hang_here() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let ms = std::time::Duration::from_millis;
     for later in [
         Later::AtOnce,
@@ -9795,7 +9766,7 @@ fn memoryless_slots_fail_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     for (fragment, metals) in METALS_MEMORYLESS_SLOT {
         assert_eq!(
@@ -9839,7 +9810,7 @@ fn type_9_draws_fail_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let mut steady = vec![0; METALS_TYPE_9.len()];
     for _ in 0..3 {
@@ -9952,7 +9923,7 @@ fn type_9_faults_revoke_queues_as_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     for (draws, metals) in REVOKING.into_iter().zip(METALS_REVOKING) {
         let theirs = after_type_9s(&mp, &md, draws);
@@ -10160,7 +10131,7 @@ fn visibility_results_are_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
     let (all, quad) = (VIS_SIDE * VIS_SIDE, VIS_SIDE * VIS_SIDE * 4);
     let one = |steps| VisPass {

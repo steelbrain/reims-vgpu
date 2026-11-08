@@ -295,7 +295,7 @@ static SURFACE_BUFFERS: Mutex<BTreeMap<u64, Vec<Weak<BufferObject>>>> = Mutex::n
 /// Held while a buffer over a surface is made (`newBufferWithIOSurface:`), from Metal's space's
 /// count of the buffers at the surface's address ([`metal_space::surface_buffer`]) to the made
 /// buffer's place among [`SURFACE_BUFFERS`]: so a second buffer over the surface, made at once
-/// on another thread (two isolated tasks' mappings of one surface prepared together), is made
+/// on another thread, is made
 /// after the first is kept, and shares its range, where it would otherwise find the address
 /// counted and no live buffer to share, and die.
 static SURFACE_BUFFER_MAKES: Mutex<()> = Mutex::new(());
@@ -365,8 +365,7 @@ pub fn kept(registry_id: u64) -> Option<VulkanDevice> {
 
 /// Tells every device made in the process that the pages under the `length` host bytes at
 /// `bytes` were replaced (`rt::Device::host_range_remapped`, [`crate::remap`]): a no-copy buffer
-/// made over any of them after this imports the pages there then. Not a Metal call, so it never
-/// stops an ended task's thread. Callable from any thread, a no-copy buffer's deallocator among
+/// made over any of them after this imports the pages there then. Callable from any thread, a no-copy buffer's deallocator among
 /// them: the runtime's lock under this one is a leaf. A null address or a length of 0 tells
 /// nothing.
 pub(crate) fn host_range_remapped(bytes: HostPtr, length: u64) {
@@ -831,7 +830,7 @@ impl VulkanDevice {
         // `HostMemory::new`'s keep-alive clause, a deviation whose ground is MoltenVK's no-copy
         // buffer keeping the pages Metal wired as it was made (`crate::remap`, "What is not ours
         // to unmap").
-        let memory = unsafe { crate::os::host_memory(base, true) };
+        let memory = unsafe { crate::os::host_memory(base) };
         let contents = rt::BufferContents::NoCopy {
             memory,
             deallocator: Some(run),
@@ -1052,8 +1051,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             // runs, or for the buffer's life with none, and an unmap of core's through the
             // platform's VM waits for the keep-alive; a twin of them stays until it goes; and a
             // vouch is the table's record of the pages as they are mapped now.
-            let memory =
-                unsafe { crate::os::host_memory_vouched(imported, bytes.logged(), vouched) };
+            let memory = unsafe { crate::os::host_memory_vouched(imported, vouched) };
             let contents = rt::BufferContents::NoCopy {
                 memory,
                 deallocator: run,
@@ -1818,9 +1816,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     // core's through the platform's VM waits for the keep-alive; a twin of them
                     // stays until it goes; and a vouch is the table's record of the pages as they
                     // are mapped now.
-                    memory: unsafe {
-                        crate::os::host_memory_vouched(imported, bytes.logged(), vouched)
-                    },
+                    memory: unsafe { crate::os::host_memory_vouched(imported, vouched) },
                     deallocator: run,
                     keep_alive: Some(keep),
                 }
@@ -1961,7 +1957,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                             match token {
                                 Some(token) => {
                                     self.raw.new_heap_with_bytes_no_copy_and_range_token(
-                                        crate::os::host_memory(first, true),
+                                        crate::os::host_memory(first),
                                         &descriptor,
                                         None,
                                         Some(keep),
@@ -1969,7 +1965,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                                     )
                                 }
                                 None => self.raw.new_heap_with_bytes_no_copy(
-                                    crate::os::host_memory(first, true),
+                                    crate::os::host_memory(first),
                                     &descriptor,
                                     None,
                                     Some(keep),
@@ -2055,7 +2051,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             // page, the runtime's import unit on this host; and a vouch is the table's record of
             // the pages as they are mapped now.
             let made = unsafe {
-                let memory = crate::os::host_memory_vouched(imported, bytes.logged(), vouched);
+                let memory = crate::os::host_memory_vouched(imported, vouched);
                 match token {
                     Some(token) => self.raw.new_heap_with_bytes_no_copy_and_range_token(
                         memory,
@@ -3114,8 +3110,7 @@ pub(crate) mod tests {
     }
 
     /// Every handle to one runtime device is one object
-    /// Buffers made over one surface on two threads at once, as two isolated tasks' mappings of
-    /// it are prepared, are both made, at the surface's address, whichever is made first: the
+    /// Buffers made over one surface on two threads at once are both made, at the surface's address, whichever is made first: the
     /// second shares the first's range once the first is made, and none sees the address held
     /// with no live buffer to share
     #[test]
@@ -3333,9 +3328,7 @@ pub(crate) mod tests {
         assert!(dev().new_library(CI_KERNEL).unwrap().unwrap().is_some());
         assert!(
             dev()
-                .new_library(include_bytes!(
-                    "../../../../tests/shaders/kernel.metallib"
-                ))
+                .new_library(include_bytes!("../../../../tests/shaders/kernel.metallib"))
                 .unwrap()
                 .unwrap()
                 .is_some()
@@ -3350,9 +3343,7 @@ pub(crate) mod tests {
         use reims_vgpu_core::platform::resource::Library as _;
         let d = dev();
         let library = d
-            .new_library(include_bytes!(
-                "../../../../tests/shaders/kernel.metallib"
-            ))
+            .new_library(include_bytes!("../../../../tests/shaders/kernel.metallib"))
             .unwrap()
             .unwrap()
             .unwrap();
@@ -3482,9 +3473,7 @@ pub(crate) mod tests {
             (placed.gpu_resource_id(), placed.raw.label()),
             (12, Some("ab"))
         );
-        let vert = fixture_function(include_bytes!(
-            "../../../../tests/shaders/vert.metallib"
-        ));
+        let vert = fixture_function(include_bytes!("../../../../tests/shaders/vert.metallib"));
         let refused = |blob| {
             d.new_compute_pipeline_state(Some(&descriptor(&vert, blob)), 0)
                 .unwrap()
@@ -3518,9 +3507,7 @@ pub(crate) mod tests {
     fn a_vertex_function_as_the_compute_function_is_an_error() {
         use crate::gpu::serialized::tests::{Resolve, fixture_function, hex};
         let d = dev();
-        let vert = fixture_function(include_bytes!(
-            "../../../../tests/shaders/vert.metallib"
-        ));
+        let vert = fixture_function(include_bytes!("../../../../tests/shaders/vert.metallib"));
         let mut resolve = Resolve::answering(Some(vert));
         let desc = d
             .deserialize_compute_pipeline_descriptor(

@@ -315,8 +315,8 @@ impl DeserializationContext {
     /// `NSException` to raise through Metal: `+exceptionWithName:reason:userInfo:` of a generic
     /// exception and the raise's detail.
     ///
-    /// A Rust unwind out of the resolver (a death or a stop in an isolated task's code, which
-    /// unwinds to the task's run, or a test's captured death) is caught here, before any of
+    /// A Rust unwind out of the resolver (a death in a refusal scope, which unwinds to the scope,
+    /// or a test's captured death) is caught here, before any of
     /// Metal's frames, and kept for [`Self::take_unwound`]. Metal gets a generic exception in its
     /// place, which unwinds Metal's frames as a raise's does, and the send goes on with the
     /// unwind once Metal has returned. While one is kept, a later call answers the same
@@ -432,17 +432,16 @@ mod tests {
         assert_eq!(t.detail(), Some("Invalid function reference"));
     }
 
-    /// A death in the resolver of an isolated task's code never unwinds through the send's frames:
-    /// the method raises through them as for a throw and keeps the unwind, a later send raises
-    /// the same without the resolver, and the task's death goes on once the sender takes the
+    /// A death in the resolver inside a refusal scope never unwinds through the send's frames: the
+    /// method raises through them as for a throw and keeps the unwind, a later send raises the
+    /// same without the resolver, and the death goes on to the scope once the sender takes the
     /// unwind back
     #[test]
     fn a_death_in_the_resolver_is_carried_across_the_send() {
         use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-        use reims_vgpu_core::tasks::isolation::TaskLife;
+        use reims_vgpu_core::raise::refusals::refusing;
 
         let ctx = DeserializationContext::new();
-        let life = TaskLife::new();
         let mut calls = 0u32;
         let mut resolver = |_: Hold<'_>, _: u64| -> RaiseResult<Option<MetalFunction>> {
             calls += 1;
@@ -453,7 +452,7 @@ mod tests {
             })
         };
         let mut steps = Vec::new();
-        let r: Option<()> = life.run(|| {
+        let r = refusing(|| {
             for _ in 0..2 {
                 let sent = ctx.with_resolver(Hold::NONE, &mut resolver, || {
                     objc2::exception::catch(std::panic::AssertUnwindSafe(|| send_ref(&ctx, 3)))
@@ -468,8 +467,7 @@ mod tests {
             }
             steps.push("never".to_owned());
         });
-        assert_eq!(r, None);
-        assert!(life.death().is_some());
+        assert!(r.is_err());
         assert_eq!(calls, 1);
         assert_eq!(steps, vec![UNWOUND, UNWOUND]);
     }

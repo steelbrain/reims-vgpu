@@ -33,8 +33,6 @@
     unsafe_code
 )]
 
-use std::sync::Arc;
-
 use reims_vgpu_core::host::{HostPtr, PhysicalMemoryRange};
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
 use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
@@ -51,7 +49,6 @@ use reims_vgpu_core::platform::types::{
 use reims_vgpu_core::platform::values::{ColorAttachmentSet, RenderPipelineDesc, TextureDesc};
 use reims_vgpu_core::platform::{HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_core::testkit::capture::catch_death;
 use reims_vgpu_metal::MetalPlatform;
 use reims_vgpu_metal::os::vm::MetalVm;
@@ -66,15 +63,6 @@ const READ_WRITE: u64 = 3;
 /// address it loads (`src/gpu/reach.metal`).
 const ROUNDING: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rounding.metallib"));
 const REACH: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/reach.metallib"));
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl<P: Platform> TaskLauncher<P> for NoLauncher {
-    fn launch(&self, _: &Arc<P>, _: Arc<dyn HostSide<P>>) -> Arc<dyn ServiceLink<P>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// What writes the surface, over the extent of its case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -829,12 +817,12 @@ fn sweep() {
     };
     let on = std::env::var("ON").unwrap_or_default();
     if on != "vulkan" {
-        let p = MetalPlatform::new(Box::new(NoLauncher));
+        let p = MetalPlatform::new();
         let d = MetalPlatform::system_default_device().unwrap();
         println!("metal {:?}", case::<MetalPlatform>(&p, &d, c));
     }
     if on != "metal" {
-        let p = VulkanPlatform::new(Box::new(NoLauncher));
+        let p = VulkanPlatform::new();
         let d = VulkanPlatform::system_default_device().unwrap();
         println!("vulkan {:?}", case::<VulkanPlatform>(&p, &d, c));
     }
@@ -916,13 +904,13 @@ fn dropped_everywhere<P: Platform>(p: &P, d: &P::Device) {
 
 #[test]
 fn metal_drops_a_buffers_writes_at_every_extent() {
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     dropped_everywhere(&p, &MetalPlatform::system_default_device().unwrap());
 }
 
 #[test]
 fn this_platform_drops_a_buffers_writes_at_every_extent() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     dropped_everywhere(&p, &VulkanPlatform::system_default_device().unwrap());
 }
 
@@ -948,13 +936,13 @@ fn evicted<P: Platform>(p: &P, d: &P::Device) {
 
 #[test]
 fn metal_reads_the_pages_once_other_gpu_work_evicts_a_dropped_write() {
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     evicted(&p, &MetalPlatform::system_default_device().unwrap());
 }
 
 #[test]
 fn this_platform_reads_the_pages_once_other_gpu_work_evicts_a_dropped_write() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     evicted(&p, &VulkanPlatform::system_default_device().unwrap());
 }
 
@@ -982,13 +970,13 @@ fn replaced_on_one_page<P: Platform>(p: &P, d: &P::Device) {
 
 #[test]
 fn metal_replaces_into_the_guests_page_of_a_surface_over_one() {
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     replaced_on_one_page(&p, &MetalPlatform::system_default_device().unwrap());
 }
 
 #[test]
 fn this_platform_replaces_into_the_guests_page_of_a_surface_over_one() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     replaced_on_one_page(&p, &VulkanPlatform::system_default_device().unwrap());
 }
 
@@ -1046,13 +1034,13 @@ fn replaced_at_an_offset<P: Platform>(p: &P, d: &P::Device) {
 
 #[test]
 fn metal_replaces_at_the_offset_into_the_guests_page() {
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     replaced_at_an_offset(&p, &MetalPlatform::system_default_device().unwrap());
 }
 
 #[test]
 fn this_platform_replaces_at_the_offset_into_the_guests_page() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     replaced_at_an_offset(&p, &VulkanPlatform::system_default_device().unwrap());
 }
 
@@ -1066,7 +1054,7 @@ fn this_platform_replaces_at_the_offset_into_the_guests_page() {
 /// `replaceRegion:` on a surface over several pages dies at the call.
 #[test]
 fn this_platform_dies_at_every_other_write() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     let d = VulkanPlatform::system_default_device().unwrap();
     let pass = "renderCommandEncoderWithDescriptor:";
     let dispatch = "dispatchThreads:threadsPerThreadgroup:";
@@ -1168,13 +1156,13 @@ fn small_blits_dropped<P: Platform>(p: &P, d: &P::Device, past_the_level: bool) 
 #[test]
 #[ignore = "opt-in: it faults the GPU on purpose, a GPU recovery that fails every process's in-flight work"]
 fn metal_drops_small_blits_into_the_texture() {
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     small_blits_dropped(&p, &MetalPlatform::system_default_device().unwrap(), true);
 }
 
 #[test]
 fn this_platform_drops_small_blits_into_the_texture() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     small_blits_dropped(&p, &VulkanPlatform::system_default_device().unwrap(), false);
 }
 
@@ -1330,7 +1318,7 @@ fn resolving<'a>(
 /// on.
 #[test]
 fn this_platform_dies_at_every_way_a_write_reaches_the_surface() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     let d = VulkanPlatform::system_default_device().unwrap();
     let q = d.new_command_queue().unwrap();
     let cb = || q.command_buffer(OnFault::Die).unwrap().unwrap();
@@ -1551,11 +1539,11 @@ fn read_only_textures_answer_metals_usage() {
         )
     }
     let metal = usages(
-        &MetalPlatform::new(Box::new(NoLauncher)),
+        &MetalPlatform::new(),
         &MetalPlatform::system_default_device().unwrap(),
     );
     let vulkan = usages(
-        &VulkanPlatform::new(Box::new(NoLauncher)),
+        &VulkanPlatform::new(),
         &VulkanPlatform::system_default_device().unwrap(),
     );
     assert_eq!(vulkan, metal);
@@ -1662,12 +1650,12 @@ fn unrasterized_write<P: Platform>(p: &P, d: &P::Device) -> u64 {
 /// fragment runs, so no write reaches the surface
 #[test]
 fn an_unrasterized_draw_writes_through_no_fragment_texture() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     let d = VulkanPlatform::system_default_device().unwrap();
     let ours = unrasterized_write(&p, &d);
     assert_eq!(ours, 4);
     if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let mp = MetalPlatform::new();
         assert_eq!(unrasterized_write(&mp, &md), ours, "Metal");
     }
 }
@@ -1678,7 +1666,7 @@ fn an_unrasterized_draw_writes_through_no_fragment_texture() {
 /// function stores through it.
 #[test]
 fn this_platform_draws_through_a_device_pointer_into_a_read_only_buffer() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     let d = VulkanPlatform::system_default_device().unwrap();
     let q = d.new_command_queue().unwrap();
     let (s, _t) = read_only_texture(&p, &d, &bgra(&p, (64, 16), 1, 1));
@@ -1795,14 +1783,14 @@ fn swizzled_texture_on_read_only_memory() {
         t.map_or("nil".into(), |t| format!("made usage {:#x}", t.usage()))
     }
     if std::env::var("ON").as_deref() == Ok("vulkan") {
-        let p = VulkanPlatform::new(Box::new(NoLauncher));
+        let p = VulkanPlatform::new();
         let d = VulkanPlatform::system_default_device().unwrap();
         match catch_death(|| made(&p, &d)) {
             Ok(seen) => println!("vulkan {seen}"),
             Err(site) => println!("vulkan died at {} ({:?})", site.file, site.kind),
         }
     } else {
-        let p = MetalPlatform::new(Box::new(NoLauncher));
+        let p = MetalPlatform::new();
         let d = MetalPlatform::system_default_device().unwrap();
         println!("metal {}", made(&p, &d));
     }

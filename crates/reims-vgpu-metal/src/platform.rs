@@ -1,8 +1,7 @@
-//! `MetalPlatform`: `impl Platform`, the process singleton, `ProcessState`.
+//! `MetalPlatform`: `impl Platform` and the process singleton.
 //!
 //! Every Metal handle is an [`Obj<T>`]: exactly one `Retained`, not `Clone` (D6), `.clone_ref()` is
-//! `-retain` and `Drop` is `-release` (leaked instead when an isolated task that died lets go of
-//! it). The associated types are aliases of `Obj` over objc2-metal's protocol objects and classes,
+//! `-retain` and `Drop` is `-release`. The associated types are aliases of `Obj` over objc2-metal's protocol objects and classes,
 //! or over the private classes in `spi::classes`. One `MetalPlatform` is one process's (D17);
 //! `reims-vgpu`'s singleton makes exactly one.
 
@@ -23,9 +22,8 @@ use reims_vgpu_core::platform::os::surface::IoSurfaces;
 use reims_vgpu_core::platform::os::vm::HostVm;
 use reims_vgpu_core::platform::types::{MtlSize, NsErrorText, ResourceAddressRange};
 use reims_vgpu_core::platform::values::{RateMapDesc, TextureDesc};
-use reims_vgpu_core::platform::{Handle, ObjId, Platform, ProcessState};
+use reims_vgpu_core::platform::{Handle, ObjId, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::tasks::launcher::TaskLauncher;
 
 use crate::gpu::command::{MetalCommandBuffer, MetalCommandQueue};
 use crate::gpu::desc::{
@@ -57,10 +55,7 @@ use crate::spi::methods::RateLayerDescriptorSpi;
 
 /// One reference to an Objective-C object: a Metal handle (architecture 4.1).
 ///
-/// Not `Clone` (D6): [`Handle::clone_ref`] is the only retain. `Drop` is the release, except
-/// while the thread unwinds or releases an isolated task that died
-/// ([`leaks_objects`](reims_vgpu_core::tasks::isolation::life::leaks_objects)): the reference
-/// is then leaked, as a crashed process never released it. objc2 answers every result as one
+/// Not `Clone` (D6): [`Handle::clone_ref`] is the only retain, and `Drop` the release. objc2 answers every result as one
 /// reference of the caller's, a `+1` result's (`new…`, `init…`, `copy…`) or a retain of a `+0`
 /// one, and [`Obj::from_retained`] takes it over. A `+0` result's own autorelease, where objc2
 /// does not elide it (a dev build), stays in the thread's pool until the pool pops.
@@ -122,11 +117,8 @@ impl<T: Message> Obj<T> {
 }
 
 impl<T: Message> Drop for Obj<T> {
-    /// The release, or nothing while the thread unwinds or releases an isolated task that died.
+    /// The release.
     fn drop(&mut self) {
-        if reims_vgpu_core::tasks::isolation::life::leaks_objects() {
-            return;
-        }
         // SAFETY: the reference is released once, here; `into_retained` never drops the handle.
         unsafe { ManuallyDrop::drop(&mut self.0) }
     }
@@ -187,14 +179,12 @@ pub(crate) unsafe fn ns_error_text(err: *mut NSError) -> Option<NsErrorText> {
     unsafe { err.as_ref() }.map(error_text)
 }
 
-/// The process's platform: Metal, IOSurface, Mach VM, threads and the task launcher.
+/// The process's platform: Metal, IOSurface, Mach VM and threads.
 pub struct MetalPlatform {
     surfaces: MetalSurfaces,
     vm: MetalVm,
     clock: MetalClock,
     threads: MetalThreads,
-    globals: ProcessState<MetalPlatform>,
-    launcher: Box<dyn TaskLauncher<MetalPlatform>>,
 }
 
 /// `[[MTLResourceAddressRangeArray alloc] initWithRanges:count:]` (`Platform`'s
@@ -216,6 +206,12 @@ pub(crate) fn address_range_array(
     Ok(array.map_or_else(|| msg::nil_result(sel), Obj::from_retained))
 }
 
+impl Default for MetalPlatform {
+    fn default() -> MetalPlatform {
+        MetalPlatform::new()
+    }
+}
+
 impl fmt::Debug for MetalPlatform {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MetalPlatform").finish_non_exhaustive()
@@ -223,10 +219,8 @@ impl fmt::Debug for MetalPlatform {
 }
 
 impl MetalPlatform {
-    /// The process's platform. `launcher` starts isolated GPU task services (each on threads of
-    /// its own in the product, `tasks::isolation::TaskThreads`). Make one per process:
-    /// `ProcessState` is the process-wide state (D17).
-    pub fn new(launcher: Box<dyn TaskLauncher<MetalPlatform>>) -> MetalPlatform {
+    /// The process's platform. Make one per process (D17).
+    pub fn new() -> MetalPlatform {
         crate::os::autorelease::install();
         if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
             reims_vgpu_core::trace::set_clock(crate::os::clock::trace_clock);
@@ -236,8 +230,6 @@ impl MetalPlatform {
             vm: MetalVm::new(),
             clock: MetalClock::new(),
             threads: MetalThreads::new(),
-            globals: ProcessState::new(),
-            launcher,
         }
     }
 
@@ -392,14 +384,6 @@ impl Platform for MetalPlatform {
     fn threads(&self) -> &dyn Threads {
         &self.threads
     }
-
-    fn globals(&self) -> &ProcessState<MetalPlatform> {
-        &self.globals
-    }
-
-    fn launcher(&self) -> &dyn TaskLauncher<MetalPlatform> {
-        &*self.launcher
-    }
 }
 
 /// The private `MTLResourceAddressRangeArray *`.
@@ -407,35 +391,18 @@ pub type MetalAddressRangeArray = Obj<MTLResourceAddressRangeArray>;
 
 #[cfg(test)]
 pub(crate) mod tests {
-
-    use std::sync::Arc;
-
     use objc2::runtime::AnyClass;
     use objc2::runtime::AnyObject;
     use objc2::{ClassType as _, msg_send};
     use objc2_foundation::NSString;
     use objc2_metal::MTLRasterizationRateLayerDescriptor as _Layer;
-    use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink};
 
     use super::*;
     use crate::gpu::device::tests::dev;
     use crate::spi::classes::MTLBufferDescriptor;
 
-    /// A launcher no test launches through.
-    struct NoLauncher;
-
-    impl TaskLauncher<MetalPlatform> for NoLauncher {
-        fn launch(
-            &self,
-            _platform: &Arc<MetalPlatform>,
-            _host: Arc<dyn HostSide<MetalPlatform>>,
-        ) -> Arc<dyn ServiceLink<MetalPlatform>> {
-            panic!("no task is launched in these tests")
-        }
-    }
-
     pub(crate) fn platform() -> MetalPlatform {
-        MetalPlatform::new(Box::new(NoLauncher))
+        MetalPlatform::new()
     }
 
     fn retain_count(o: &AnyObject) -> usize {
@@ -474,50 +441,6 @@ pub(crate) mod tests {
         // SAFETY: nil.
         assert!(unsafe { Obj::<NSString>::from_owned_ptr(std::ptr::null_mut()) }.is_none());
         assert_eq!(s.into_retained().to_string(), "x");
-    }
-
-    /// Obj: a handle an isolated task's death unwinds past is leaked, not released; one the
-    /// task's work drops is released
-    #[test]
-    fn a_dead_tasks_unwind_leaks_its_handles() {
-        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let o = Obj::from_retained(objc2::runtime::NSObject::new());
-        // SAFETY: an NSObject is an Objective-C object.
-        let a: &AnyObject = unsafe { &*Retained::as_ptr(o.as_retained()).cast::<AnyObject>() };
-        let before = retain_count(a);
-        let life = TaskLife::new();
-        let _ = life.run(|| drop(o.clone_ref()));
-        assert_eq!(retain_count(a), before);
-        let r: Option<()> = life.run(|| {
-            let _held = o.clone_ref();
-            reims_vgpu_core::fatal!(DeathSite {
-                kind: DeathKind::Abort,
-                file: "platform.test",
-                line: 0,
-            })
-        });
-        assert_eq!(r, None);
-        assert_eq!(retain_count(a), before + 1);
-    }
-
-    /// A thread of an isolated task that has ended sends nothing more: it stops at its next send
-    #[test]
-    fn an_ended_tasks_thread_stops_at_its_next_send() {
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let d = dev();
-        let life = TaskLife::new();
-        let mut reached = Vec::new();
-        let registry_id = || msg::get("registryID", || d.get().registryID());
-        let r = life.run(|| {
-            reached.push(registry_id() != 0);
-            life.exit();
-            reached.push(registry_id() != 0);
-        });
-        assert_eq!(r, None);
-        assert_eq!(reached, vec![true]);
     }
 
     /// The `+new` constructors each make an object of the class core asks for
@@ -631,7 +554,6 @@ pub(crate) mod tests {
     fn services() {
         let p = platform();
         let _ = (p.surfaces(), p.vm(), p.clock(), p.threads());
-        let _ = (p.globals(), p.launcher());
         assert!(format!("{p:?}").contains("MetalPlatform"));
         assert!(AnyClass::get(c"MTLTextureDescriptor").is_some());
     }

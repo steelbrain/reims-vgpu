@@ -1,7 +1,6 @@
 //! The tests of `caps` that compare with Metal on this host: macOS only.
 
 use reims_vgpu_core::platform::caps::LINEAR_ALIGNMENT_FORMAT;
-use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_metal::MetalPlatform;
 
 use super::*;
@@ -81,58 +80,6 @@ fn caps_are_the_runtimes_and_the_documented_facts() {
         LINEAR_ALIGNMENT_FORMAT,
         u64::from(PixelFormat::BGRA8Unorm.as_raw())
     );
-}
-
-/// Key 33 of the device info a guest that knows every key reads of `caps`, under `snapshot`.
-fn key_33(
-    caps: &DeviceCaps,
-    snapshot: &reims_vgpu_core::guest::abi::device_info::DeviceInfoSnapshot,
-) -> u32 {
-    use reims_vgpu_core::guest::abi::device_info::{
-        HOST_INFO_MAX_KEY, HOST_INFO_PAIRS, write_device_info,
-    };
-    let mut value = None;
-    write_device_info(
-        OnFault::Die,
-        caps,
-        snapshot,
-        HOST_INFO_MAX_KEY,
-        HOST_INFO_PAIRS,
-        |_, pair| {
-            if pair.key == 33 {
-                value = Some(pair.value);
-            }
-        },
-    )
-    .unwrap();
-    value.unwrap()
-}
-
-/// The device info's key 33 is Metal's on this host under every snapshot bit, its SIMD
-/// reduction and shuffle-and-fill bits (0x40 and 0x100) included, which answer the runtime's
-/// family rows ([`simd_rows_exact`]): 0x3c4 under no snapshot bit and 0xbff under all of them
-#[test]
-fn device_info_key_33_is_metals_but_the_simd_bits() {
-    use reims_vgpu_core::guest::abi::device_info::DeviceInfoSnapshot;
-    let Some(metal) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let every = DeviceInfoSnapshot {
-        supports_argument_buffers: true,
-        supports_shared_textures: true,
-        supports_large_user_tasks: true,
-        supports_large_kernel_tasks: true,
-        supports_range_buffer: true,
-        supports_shared_memory_heap: true,
-        ..DeviceInfoSnapshot::default()
-    };
-    let d = dev();
-    let ours = d.caps();
-    for (snapshot, want) in [(DeviceInfoSnapshot::default(), 0x3c4), (every, 0xbff)] {
-        let key = key_33(&ours, &snapshot);
-        let metals = key_33(&metal.caps(), &snapshot);
-        assert_eq!((key, metals), (want, want), "{key:#x} {metals:#x}");
-    }
 }
 
 /// Every stand-in is the Metal platform's answer on this host, and `supportsMemoryOrderAtomics`

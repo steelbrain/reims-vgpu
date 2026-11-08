@@ -578,8 +578,7 @@ fn frame_cost() {
     let raw_queue = d.raw.new_command_queue().unwrap();
     #[cfg(target_os = "macos")]
     let metal = reims_vgpu_metal::MetalPlatform::system_default_device().map(|md| {
-        use crate::gpu::device::tests::metal_tests::NoLauncher;
-        let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
+        let mp = reims_vgpu_metal::MetalPlatform::new();
         let objects = Objects::new(&mp, &md);
         (mp, md, objects)
     });

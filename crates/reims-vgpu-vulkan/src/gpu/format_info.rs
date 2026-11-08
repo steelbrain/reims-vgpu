@@ -2,9 +2,7 @@
 //! runtime's answers, at the one macOS release whose Metal every device answers as
 //! (`rt::MACOS_RELEASE`, 27.0.1).
 //!
-//! **A pixel format's description** ([`description`]), which core gives the guest (its flags, of
-//! which it reads the compressed, PVRTC and two-plane bits, and its four block words,
-//! `reims_vgpu_core::resources::texture::pixel_format`), is the runtime's
+//! **A pixel format's description** ([`description`]) is the runtime's
 //! (`Device::pixel_format_info`): Apple's private description, from the runtime's own
 //! measurements of plain Metal at every value from 0 to 2047 on an Apple M3 Max under macOS
 //! 27.0.1 (26A434), which describes 264 formats (an Apple M4 describes 630 to 645 too, which the

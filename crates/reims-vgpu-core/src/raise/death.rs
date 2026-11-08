@@ -3,8 +3,7 @@
 //! `reims-vgpu: fatal: <what died>`, then `abort()`. Nothing unwinds and no `Drop` runs, so the
 //! process ends at the guest op that caused it and nothing after it reaches the host or the
 //! guest. Where the process dies is the contract; the message and the signal are diagnostics.
-//! The two exceptions unwind instead: a death in an isolated task's own code ends the task
-//! (`tasks::isolation::life`), and one inside a refusal scope refuses the op it met
+//! The one exception unwinds instead: a death inside a refusal scope refuses the op it met
 //! ([`crate::raise::refusals`]), which only the graphics lane opens.
 //!
 //! [`DeathId`] names what died: an area's reason (its `Display` a dotted id), a raise nothing may
@@ -84,32 +83,10 @@ pub enum DeathId {
         /// The call: the block's SDK property name.
         call: &'static str,
     },
-    /// The guest ABI's codecs.
-    Guest(crate::guest::GuestDeath),
-    /// The tasks area's.
-    Tasks(crate::tasks::DeathKind),
-    /// The deserializer's.
-    Deserializer(crate::deserializer::DeathKind),
     /// Memory's (`crate::memory::DeathKind`).
     Memory(crate::memory::DeathKind),
-    /// The IOSurface host device's.
-    IoSurface(crate::iosurface::DeathKind),
-    /// The device's deaths.
-    Device(crate::device::DeviceDeath),
-    /// The resources area's.
-    Resources(crate::resources::DeathKind),
-    /// A display's.
+    /// A display's pipelines'.
     Display(crate::display::DeathKind),
-    /// A FIFO's.
-    Fifo(crate::fifo::DeathKind),
-    /// The GPU task service's.
-    GpuTask(crate::gpu_task::DeathKind),
-    /// The resource manager's.
-    Manager(crate::resources::manager::DeathKind),
-    /// A guest display's.
-    GuestDisplay(crate::display::guest_display::DeathKind),
-    /// The device's display ports'.
-    Displays(crate::device::displays::DeathKind),
     /// A panic in a refusal scope, which the scope refuses as a death there
     /// ([`crate::raise::refusals`], "Panics"): no death site raises it.
     Panic,
@@ -122,24 +99,6 @@ pub enum DeathId {
         /// The site's name.
         name: &'static str,
     },
-}
-
-impl From<crate::deserializer::DeathKind> for DeathId {
-    fn from(k: crate::deserializer::DeathKind) -> DeathId {
-        DeathId::Deserializer(k)
-    }
-}
-
-impl From<crate::iosurface::DeathKind> for DeathId {
-    fn from(k: crate::iosurface::DeathKind) -> DeathId {
-        DeathId::IoSurface(k)
-    }
-}
-
-impl From<crate::device::DeviceDeath> for DeathId {
-    fn from(d: crate::device::DeviceDeath) -> DeathId {
-        DeathId::Device(d)
-    }
 }
 
 /// A test's site as a death of its own: its kind, named by the site's name. A test's site is
@@ -176,31 +135,8 @@ impl DeathId {
                 file: call,
                 line: 0,
             },
-            DeathId::Guest(d) => d.site(),
-            DeathId::Tasks(k) => k.site(),
-            DeathId::Deserializer(k) => DeathSite {
-                kind: k.class(),
-                file: k.name(),
-                line: 0,
-            },
             DeathId::Memory(k) => k.site(),
-            DeathId::IoSurface(k) => k.site(),
-            DeathId::Device(d) => d.site(),
-            DeathId::Resources(k) => k.site(),
             DeathId::Display(k) => DeathSite {
-                kind: k.class(),
-                file: k.id(),
-                line: 0,
-            },
-            DeathId::Fifo(k) => k.site(),
-            DeathId::GpuTask(k) => k.site(),
-            DeathId::Manager(k) => k.site(),
-            DeathId::GuestDisplay(k) => DeathSite {
-                kind: k.class(),
-                file: k.id(),
-                line: 0,
-            },
-            DeathId::Displays(k) => DeathSite {
                 kind: k.class(),
                 file: k.id(),
                 line: 0,
@@ -230,19 +166,8 @@ impl fmt::Display for DeathId {
             #[cfg(any(test, feature = "testkit"))]
             DeathId::Test { kind, name } => write!(f, "test.{kind:?}.{name}"),
             DeathId::HostRaised { call } => write!(f, "the host raised out of {call}"),
-            DeathId::Guest(d) => write!(f, "{d}"),
-            DeathId::Tasks(k) => write!(f, "{k}"),
-            DeathId::Deserializer(k) => f.write_str(k.name()),
             DeathId::Memory(k) => k.fmt(f),
-            DeathId::IoSurface(k) => write!(f, "{k}"),
-            DeathId::Device(d) => d.fmt(f),
-            DeathId::Resources(k) => write!(f, "resources.{k}"),
             DeathId::Display(k) => write!(f, "{k}"),
-            DeathId::Fifo(k) => write!(f, "{k}"),
-            DeathId::GpuTask(k) => write!(f, "{k}"),
-            DeathId::Manager(k) => k.fmt(f),
-            DeathId::GuestDisplay(k) => write!(f, "{k}"),
-            DeathId::Displays(k) => write!(f, "{k}"),
             DeathId::Panic => f.write_str("a panic"),
         }
     }
@@ -260,8 +185,6 @@ pub fn fatal_with_detail(id: impl Into<DeathId>, detail: &str) -> ! {
 
 /// [`fatal`] with a detail after the id (a raise's).
 pub(crate) fn die(id: DeathId, detail: Option<&str>) -> ! {
-    // A death in an isolated task's own code ends that task, not the process.
-    crate::tasks::isolation::life::trap(id, detail);
     // A death inside a refusal scope (the graphics lane's ops) refuses the op instead.
     crate::raise::refusals::trap(id, detail);
     #[cfg(any(test, feature = "testkit"))]
@@ -379,10 +302,10 @@ mod tests {
             message(&raised, Some("the reason")),
             "reims-vgpu: fatal: uncaught raise platform.raised at setPurgeableState:: the reason"
         );
-        let area = DeathId::from(crate::gpu_task::DeathKind::NullTaskRoot);
+        let area = DeathId::from(crate::display::DeathKind::NoLibrary);
         assert_eq!(
             message(&area, None),
-            "reims-vgpu: fatal: gpu_task.root.null"
+            "reims-vgpu: fatal: display.pipeline.no_library"
         );
     }
 }

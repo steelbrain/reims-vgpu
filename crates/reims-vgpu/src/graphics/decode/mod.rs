@@ -342,8 +342,8 @@ impl Drop for Drain {
 /// from 1.
 ///
 /// No context is failed for a failure of its work: a command buffer whose completion the
-/// platform refused on its own thread ([`CompletedInfo::refused`]), where the paravirt device ends
-/// the process, fails alone, as a buffer Metal could not run does, and its process's later work
+/// platform refused on its own thread ([`CompletedInfo::refused`]), which outside a refusal scope
+/// ends the process, fails alone, as a buffer Metal could not run does, and its process's later work
 /// is carried out (docs/graphics-kext/design.md, "Guest input the host refuses").
 ///
 /// [`CompletedInfo::refused`]: reims_vgpu_core::platform::command::CompletedInfo::refused
@@ -4806,7 +4806,7 @@ pub(crate) fn no_raise() -> Box<dyn FnOnce(Raise) + Send> {
 
 /// `op`, one guest op of the lane's, inside the refusal scope ([`refusals::refusing`]): a death
 /// on this thread inside it, a platform refusing a create or an encode among them, which ends
-/// the process at its call on the paravirt device, refuses the op instead, as a raise the
+/// the process at its call outside a scope, refuses the op instead, as a raise the
 /// caller's handler takes. So the op is refused to the guest at its op (a refused reflection, a
 /// `COMPLETE` with its status, a failed command buffer) and the process goes on
 /// (docs/graphics-kext/design.md, "Guest input the host refuses").

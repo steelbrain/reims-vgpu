@@ -46,7 +46,6 @@ use reims_vgpu_core::testkit::capture::catch_death;
 use reims_vgpu_metal::MetalPlatform;
 
 use crate::gpu::device::tests::dev;
-use crate::gpu::device::tests::metal_tests::NoLauncher;
 use crate::gpu::encode_render::tests::metal_tests::memoryless_fetched;
 use crate::gpu::ycbcr::measure::sampler;
 use crate::platform::tests::platform;
@@ -1049,7 +1048,7 @@ impl<'a, P: Platform> Gpu<'a, P> {
 
 /// The Metal platform and its device, where the host has one.
 fn metal() -> Option<(MetalPlatform, <MetalPlatform as Platform>::Device)> {
-    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(Box::new(NoLauncher)), d))
+    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(), d))
 }
 
 /// What `f` answers, or where it died and the line its death named.

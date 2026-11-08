@@ -9,9 +9,8 @@
 //! validation, or the driver, ends the process at the op whose input breaks Metal's rules: a
 //! pipeline made from a nil or invalid function or with an unspecialized function constant, a
 //! malformed serialized descriptor, a texture descriptor Metal refuses, a second encoder over an
-//! open one, an encoder open at the commit, a nil indirect buffer. An isolated task's thread is no
-//! exception (`tasks::isolation::life`). A method whose input can do so says it on an `aborts:`
-//! line.
+//! open one, an encoder open at the commit, a nil indirect buffer. A method whose input can do so
+//! says it on an `aborts:` line.
 
 use std::sync::Arc;
 

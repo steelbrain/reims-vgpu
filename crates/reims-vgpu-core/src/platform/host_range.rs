@@ -4,8 +4,6 @@
 //! `new_buffer_over_host_memory`, `replace_region`, `set_contents` and `fill_texture` are safe
 //! methods that take a `HostRange<'_>`. Its only constructor is `unsafe`: the caller proves the
 //! range stays mapped for the call, or, handed to a no-copy creator, until its deallocator runs.
-//! The areas later move every mint into `guest/ptr.rs` and `memory/mapping.rs`, whose leases are
-//! that proof.
 
 use std::marker::PhantomData;
 
@@ -20,8 +18,6 @@ use crate::num::ToU64;
 pub struct HostRange<'a> {
     ptr: HostPtr,
     len: u64,
-    /// Whether a dirty log may watch the range's pages ([`HostRange::unlogged`]).
-    logged: bool,
     _mapped: PhantomData<&'a [u8]>,
 }
 
@@ -37,7 +33,6 @@ impl<'a> HostRange<'a> {
         HostRange {
             ptr,
             len,
-            logged: true,
             _mapped: PhantomData,
         }
     }
@@ -47,7 +42,6 @@ impl<'a> HostRange<'a> {
         HostRange {
             ptr: HostPtr::from_ptr(slice.as_ptr().cast_mut()),
             len: slice.len().to_u64(),
-            logged: true,
             _mapped: PhantomData,
         }
     }
@@ -65,25 +59,6 @@ impl<'a> HostRange<'a> {
     /// Whether the range is empty.
     pub const fn is_empty(&self) -> bool {
         self.len == 0
-    }
-
-    /// The range, never watched by the device's dirty log (`memory::dirty`): a platform that
-    /// gives the GPU runtime the log gives an import of it none, so the runtime copies all of it
-    /// at each use and never asks the host for a harvest over it. For memory whose copies are too
-    /// few to pay for the host's log: under KVM a logged slot is mapped 4 KiB at a time from the
-    /// first harvest on, so a harvest asked early costs the guest its huge pages for the run.
-    #[must_use]
-    pub const fn unlogged(self) -> HostRange<'a> {
-        HostRange {
-            logged: false,
-            ..self
-        }
-    }
-
-    /// Whether the device's dirty log may watch the range's pages: true unless
-    /// [`HostRange::unlogged`].
-    pub const fn logged(&self) -> bool {
-        self.logged
     }
 }
 

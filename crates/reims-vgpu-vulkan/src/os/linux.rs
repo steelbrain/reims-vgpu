@@ -8,7 +8,6 @@
 mod budget;
 mod clock;
 mod device_lend;
-pub mod dirty;
 mod dma_buf;
 mod files;
 mod hints;

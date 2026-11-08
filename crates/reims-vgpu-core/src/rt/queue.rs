@@ -173,10 +173,7 @@ impl std::fmt::Debug for SerialQueue {
 
 impl SerialQueue {
     /// A queue labelled `label`, with its worker started. The library's labels are
-    /// `reims-vgpu.<role>` ("reims-vgpu.fifo-control", "reims-vgpu.reporting",
-    /// "reims-vgpu.efi-present", "reims-vgpu.iosurface", "reims-vgpu.display",
-    /// "reims-vgpu.release", and an isolated task's "reims-vgpu.task-connection",
-    /// "reims-vgpu.task-service" and "reims-vgpu.task-link"), and the platform names the worker's
+    /// `reims-vgpu.<role>` ("reims-vgpu.display" among them), and the platform names the worker's
     /// thread after its queue. Labels are diagnostics.
     pub fn new(threads: &dyn Threads, label: &'static str) -> SerialQueue {
         let shared = Arc::new(Shared {

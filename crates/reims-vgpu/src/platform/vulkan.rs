@@ -67,7 +67,7 @@ impl ApiPlatform for VulkanPlatform {
                 offset: file.offset,
             })
         });
-        Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files, None))
+        Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
     }
 
     /// Vulkan Video on the device's video-decode queue (`graphics::vulkan::video`).

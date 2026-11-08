@@ -1,29 +1,13 @@
 //! The tests of `rate_map` that compare with Metal on this host: macOS only.
 
-use std::sync::Arc;
-
 use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_metal::MetalPlatform;
 
 use super::*;
 
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl TaskLauncher<MetalPlatform> for NoLauncher {
-    fn launch(
-        &self,
-        _platform: &Arc<MetalPlatform>,
-        _host: Arc<dyn HostSide<MetalPlatform>>,
-    ) -> Arc<dyn ServiceLink<MetalPlatform>> {
-        panic!("no task is launched in these tests")
-    }
-}
-
 /// Metal's platform and device, when the host has Metal.
 fn metal() -> Option<(MetalPlatform, <MetalPlatform as Platform>::Device)> {
-    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(Box::new(NoLauncher)), d))
+    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(), d))
 }
 
 /// A layer descriptor is nil for a count of 0 on either axis, else of zeroed samples and

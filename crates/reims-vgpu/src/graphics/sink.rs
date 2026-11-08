@@ -2006,10 +2006,7 @@ mod tests {
     #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_the_table_draws_what_the_pass_draws() {
-        use reims_vgpu_core::tasks::isolation::TaskThreads;
-        the_table_draws_what_the_pass_draws(Arc::new(reims_vgpu_vulkan::VulkanPlatform::new(
-            Box::new(TaskThreads::new()),
-        )));
+        the_table_draws_what_the_pass_draws(Arc::new(reims_vgpu_vulkan::VulkanPlatform::new()));
     }
 
     /// `on_metal_the_table_draws_what_the_pass_draws`, on `platform`.

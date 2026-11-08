@@ -1601,8 +1601,7 @@ pub(crate) mod tests {
             .unwrap()
     }
 
-    pub(crate) const KERNEL: &[u8] =
-        include_bytes!("../../../../tests/shaders/kernel.metallib");
+    pub(crate) const KERNEL: &[u8] = include_bytes!("../../../../tests/shaders/kernel.metallib");
     pub(crate) const STAGEIN: &[u8] =
         include_bytes!("../../../../tests/shaders/compute_stagein.metallib");
 

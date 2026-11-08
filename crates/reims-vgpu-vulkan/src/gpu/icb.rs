@@ -127,7 +127,7 @@ use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::answer::{
     Inexact, Policy, created_or_decided, decide, get, hang, inexact, metal_aborts, plain, plain_at,
-    refused, send, unrepresentable, unstopped_at,
+    refused, send, unrepresentable,
 };
 use crate::gpu::command::{Progress, Stage};
 use crate::gpu::device::VulkanDevice;
@@ -153,8 +153,7 @@ const LENGTHS_A_COMMAND: u64 = 38;
 
 /// The lock of Metal's pool of indirect command buffer IDs, of the process (one device's, as the
 /// host has one), which a reservation Metal spins at holds for good ([`reserve`]) and every
-/// creation takes ([`new_indirect_command_buffer`]). Isolated tasks share it, as every task's
-/// device is the one object of the process's device ([`crate::gpu::device::adopt`]).
+/// creation takes ([`new_indirect_command_buffer`]).
 ///
 /// Measured on this host: plain allocation hands out IDs from Metal's pool, which the runtime
 /// follows (the tests compare it with Metal: its first 32 IDs, the smallest free range first, a
@@ -188,7 +187,7 @@ const LENGTHS_A_COMMAND: u64 = 38;
 /// wait, and texture reservations go on. No buffer lives while it spins: one made first makes
 /// Metal ignore the reservation. At the runtime's refusal the thread parks for good holding this
 /// lock ([`answered`], [`crate::answer::hang`]), as a hang stays a hang, so every later creation
-/// and reservation of type 5, on any thread, an isolated task's among them, waits on it for good,
+/// and reservation of type 5, on any thread, waits on it for good,
 /// before any death of its own ([`new_indirect_command_buffer`]).
 ///
 /// A buffer released is not free while a command buffer that uses it may run (measured, a
@@ -203,16 +202,10 @@ static RESERVING: Mutex<()> = Mutex::new(());
 /// drops it as Metal does ([`RESERVING`]); the thread parks for good where Metal spins, which the
 /// runtime's refusal tells ([`answered`]). Another refusal of its would die at the selector.
 pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> RaiseResult<()> {
-    // The pool's lock stays held until the runtime answered, as a call Metal spins at holds it;
-    // no stop of an ended task comes between the two, so a call that took the lock reaches the
-    // runtime.
+    // The pool's lock stays held until the runtime answered, as a call Metal spins at holds it.
     let held = plain(|| RESERVING.lock());
-    #[cfg(test)]
-    if let Some(amid) = AMID_RESERVATION.take() {
-        amid();
-    }
     let ids: Vec<rt::ResourceId> = ids.iter().map(|&id| rt::ResourceId(id)).collect();
-    let answer = unstopped_at(sel, || {
+    let answer = plain_at(sel, || {
         device
             .raw
             .reserve_resource_ids(rt::ResourceIdKind::IndirectCommandBuffer, &ids)
@@ -249,13 +242,6 @@ fn spins(e: &rt::Error) -> bool {
             ..
         })
     )
-}
-
-#[cfg(test)]
-thread_local! {
-    /// What a test runs in [`reserve`] on this thread once it holds [`RESERVING`], before the
-    /// runtime takes the reservation.
-    static AMID_RESERVATION: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
 }
 
 // ---- The buffer.
@@ -1827,8 +1813,7 @@ mod tests {
     use crate::gpu::device::tests::dev;
     use crate::gpu::resource::{VulkanBuffer, VulkanComputePipeline};
 
-    const ADD: &[u8] =
-        include_bytes!("../../../../tests/shaders/compute_add.metallib");
+    const ADD: &[u8] = include_bytes!("../../../../tests/shaders/compute_add.metallib");
 
     /// `MTLCommandBufferStatusCompleted`.
     const COMPLETED: u64 = 4;
@@ -1898,27 +1883,6 @@ mod tests {
         let relayed = crate::answer::relaxed(|| after.unique_identifier());
         assert_eq!(relayed, plain(|| after.raw.unique_identifier()));
         assert_eq!(crate::answer::inexact_counts(), [(kind, 1)]);
-    }
-
-    /// An isolated task that ends while its reservation is under way, once it holds
-    /// [`RESERVING`], still gives it to the runtime, which then hands out Metal's IDs to the
-    /// process's later buffers: 1 then 3, 2 reserved
-    #[test]
-    fn a_task_that_ends_amid_its_reservation_leaves_the_runtimes_ids_metals() {
-        use reims_vgpu_core::tasks::isolation::life::TaskLife;
-
-        let d = dev();
-        let life = TaskLife::new();
-        AMID_RESERVATION.set(Some(|| {
-            assert!(TaskLife::current().unwrap().exit());
-        }));
-        let reserved = life.run(|| d.reserve_resource_indices(5, &[2]));
-        assert!(matches!(reserved, Some(Ok(()))), "{reserved:?}");
-        let made: Vec<VulkanIcb> = (0..2)
-            .map(|_| make::<VulkanPlatform>(&d, &compute_desc(), 1))
-            .collect();
-        let seen: Vec<u64> = made.iter().map(|b| b.gpu_resource_id()).collect();
-        assert_eq!(seen, [1, 3]);
     }
 
     /// A device the host releases and opens again is the one runtime device, whose IDs go on with

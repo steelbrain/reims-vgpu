@@ -94,14 +94,11 @@ serde_json = "1.0.151"
 # The library's allocator on the targets that ship (reims-vgpu-c's global allocator): jemalloc,
 # built from the crate's bundled source, with its symbols prefixed.
 tikv-jemallocator = "0.7.0"
-# dev and tooling
-loom = "0.7"
 
 # Architecture 17.4. reims-vgpu-core adds its stricter set in lib.rs.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 # The workspace's docs are its developers', built with its private items (`cargo doc
 # --document-private-items`), where a public item's links to the private items its docs name

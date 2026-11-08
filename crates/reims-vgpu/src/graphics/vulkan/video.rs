@@ -49,8 +49,7 @@
 //!     be distinct, and an output may be linear over imported host memory), but the decode
 //!     writes whole coded rows (1088 of a 1080-row frame), past the luma plane the guest's
 //!     driver asks AppleGVA for, which ends at the frame's last row; the Iris's output is its
-//!     DPB picture, tiled. The write is bracketed for the dirty log ([`host_write`]) while the
-//!     planes are held.
+//!     DPB picture, tiled.
 //! - **Order.** A decode starts as the host takes the command buffer that encodes it, after the
 //!   session's earlier decodes on the same queue. The session's event, which the command buffer
 //!   waits for, is then signalled by a submission of no work that waits for the decode and its
@@ -78,7 +77,6 @@ use reims_graphics::wire::{
     RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH, RGFX_VIDEO_H264_MAIN,
     RGFX_VIDEO_HEVC_MAIN, RGFX_VIDEO_HEVC_MAIN_10, RgfxVideoCodecCaps,
 };
-use reims_vgpu_core::memory::dirty::host_write;
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::event::EventRef;
@@ -934,8 +932,7 @@ fn output(video: &DeviceVideo, decode: &VideoDecode<'_, VulkanPlatform>) -> Rais
     if luma.cached || chroma.cached {
         return cache_output(video, luma, chroma);
     }
-    let (Some((import, luma_host)), Some((chroma_import, chroma_host))) =
-        (plane_import(luma), plane_import(chroma))
+    let (Some((import, _)), Some((chroma_import, _))) = (plane_import(luma), plane_import(chroma))
     else {
         return runtime_pages_output(video, luma, chroma);
     };
@@ -961,16 +958,8 @@ fn output(video: &DeviceVideo, decode: &VideoDecode<'_, VulkanPlatform>) -> Rais
     else {
         return Err(decode_fault("an output plane past 4 GiB"));
     };
-    // The planes' bytes, written while the output lives, for the dirty log (each in its buffer,
-    // so its end is too).
-    let end = |host: u64, p: &VideoPlane<'_, VulkanPlatform>| end_of(host, p).unwrap_or(host);
-    let first = luma_host.min(chroma_host);
-    let last = end(luma_host, luma).max(end(chroma_host, chroma));
-    let keep: Arc<dyn Send + Sync> = Arc::new((
-        luma.buffer.clone_ref(),
-        chroma.buffer.clone_ref(),
-        host_write(first, last - first),
-    ));
+    // The planes' buffers, held while the output lives.
+    let keep: Arc<dyn Send + Sync> = Arc::new((luma.buffer.clone_ref(), chroma.buffer.clone_ref()));
     let host = HostImport {
         memory: import.memory,
         offset: import.offset,
@@ -1013,8 +1002,7 @@ fn cache_output(
 /// The output of planes in their surface's pages, which the runtime imported in place other than
 /// by their pointer (as dma-bufs, or in its import of the guest's RAM), so that no buffer of the
 /// decoder's binds there: the runtime's buffer itself, which the decoders' copy out writes on a
-/// runtime queue ([`RuntimeQueue`]), the write bracketed for the dirty log as for
-/// [`ImportedPlanes`]. A copy out on the decode queue reaches no buffer of the runtime's; pages
+/// runtime queue ([`RuntimeQueue`]). A copy out on the decode queue reaches no buffer of the runtime's; pages
 /// imported by their pointer that answer no import are a read-only view, which drops the GPU's
 /// writes, and a copy of the pages is the runtime's to bring in step.
 fn runtime_pages_output(
@@ -1038,22 +1026,14 @@ fn runtime_pages_output(
         let first = at.checked_add(p.offset)?;
         Some((first, end_of(first, p)?))
     };
-    let (Some((luma_first, luma_end)), Some((chroma_first, chroma_end))) =
-        (host(luma), host(chroma))
-    else {
+    if host(luma).is_none() || host(chroma).is_none() {
         return Err(decode_fault(
             "an output surface whose planes are no host pages in place",
         ));
-    };
+    }
     let planes = runtime_planes(luma, chroma)?;
-    // The planes' bytes, written while the output lives, for the dirty log.
-    let first = luma_first.min(chroma_first);
-    let last = luma_end.max(chroma_end);
-    let keep: Arc<dyn Send + Sync> = Arc::new((
-        luma.buffer.clone_ref(),
-        chroma.buffer.clone_ref(),
-        host_write(first, last - first),
-    ));
+    // The planes' buffers, held while the output lives.
+    let keep: Arc<dyn Send + Sync> = Arc::new((luma.buffer.clone_ref(), chroma.buffer.clone_ref()));
     Ok(Output::Runtime {
         planes,
         _keep: keep,

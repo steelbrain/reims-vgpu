@@ -53,7 +53,6 @@
     unsafe_code
 )]
 
-use std::sync::Arc;
 use std::sync::mpsc;
 
 use reims_vgpu_core::host::HostPtr;
@@ -68,21 +67,11 @@ use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange, ResourceAddr
 use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_metal::MetalPlatform;
 use reims_vgpu_metal::os::vm::MetalVm;
 use reims_vgpu_vulkan::VulkanPlatform;
 
 const PAGE: u64 = 0x4000;
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl<P: Platform> TaskLauncher<P> for NoLauncher {
-    fn launch(&self, _: &Arc<P>, _: Arc<dyn HostSide<P>>) -> Arc<dyn ServiceLink<P>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// Fresh pages of the host, each byte `byte`.
 fn pages(count: u64, byte: u8) -> HostPtr {
@@ -1077,7 +1066,7 @@ fn detached_buffers_and_heaps_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     let seen = vec![buffer_life(&p, &dev), heap_life(&p, &dev), edges(&p, &dev)];
     assert_eq!(seen, expected());
     assert_eq!(detached_use(&p, &dev), expected_use());
@@ -1090,7 +1079,7 @@ fn detached_buffers_and_heaps_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
         return;
     };
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     let seen = vec![buffer_life(&p, &dev), heap_life(&p, &dev), edges(&p, &dev)];
     assert_eq!(seen, expected());
     assert_eq!(detached_use(&p, &dev), expected_use());
@@ -1190,7 +1179,7 @@ fn behind_a_wait_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     let seen = BEHIND_A_WAIT.map(|case| behind_a_wait(&p, &dev, case));
     assert_eq!(seen, expected_behind_a_wait());
 }
@@ -1210,7 +1199,7 @@ fn behind_a_wait_on_vulkan() {
     if let Ok(case) = std::env::var(CHILD_CASE) {
         reims_vgpu_core::testkit::capture::set_capture_enabled(false);
         let dev = VulkanPlatform::system_default_device().unwrap();
-        let p = VulkanPlatform::new(Box::new(NoLauncher));
+        let p = VulkanPlatform::new();
         println!("seen {:?}", behind_a_wait(&p, &dev, &case));
         std::process::exit(0);
     }
@@ -1317,7 +1306,7 @@ fn a_dispatch_behind_a_wait_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     for warm in [false, true] {
         assert_eq!(
             dispatch_behind_a_wait(&p, &dev, warm),
@@ -1338,7 +1327,7 @@ fn a_dispatch_behind_a_wait_on_vulkan() {
     if let Ok(warm) = std::env::var(CHILD) {
         reims_vgpu_core::testkit::capture::set_capture_enabled(false);
         let dev = VulkanPlatform::system_default_device().unwrap();
-        let p = VulkanPlatform::new(Box::new(NoLauncher));
+        let p = VulkanPlatform::new();
         println!("seen {:?}", dispatch_behind_a_wait(&p, &dev, warm == "1"));
         std::process::exit(0);
     }
@@ -1586,7 +1575,7 @@ fn pages_past_the_size_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     assert_eq!(past_the_size(&p, &dev), expected_past_the_size());
 }
 
@@ -1601,7 +1590,7 @@ fn pages_past_the_size_on_vulkan() {
     if std::env::var_os(CHILD).is_some() {
         reims_vgpu_core::testkit::capture::set_capture_enabled(false);
         let dev = VulkanPlatform::system_default_device().unwrap();
-        let p = VulkanPlatform::new(Box::new(NoLauncher));
+        let p = VulkanPlatform::new();
         println!("made {:?}", past_the_size(&p, &dev));
         std::process::exit(0);
     }
@@ -1632,7 +1621,7 @@ fn pages_without_access_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     assert_eq!(without_access(&p, &dev), expected_without_access());
 }
 
@@ -1647,7 +1636,7 @@ fn pages_without_access_on_vulkan() {
     if std::env::var_os(CHILD).is_some() {
         reims_vgpu_core::testkit::capture::set_capture_enabled(false);
         let dev = VulkanPlatform::system_default_device().unwrap();
-        let p = VulkanPlatform::new(Box::new(NoLauncher));
+        let p = VulkanPlatform::new();
         println!("made {:?}", without_access(&p, &dev));
         std::process::exit(0);
     }
@@ -1835,7 +1824,7 @@ fn unaligned_ranges_on_vulkan_are_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let mp = MetalPlatform::new();
     let cases: Vec<(usize, bool)> = (0..UNALIGNED)
         .flat_map(|index| [(index, true), (index, false)])
         .collect();
@@ -1844,7 +1833,7 @@ fn unaligned_ranges_on_vulkan_are_metals() {
         .map(|&(index, heap)| unaligned(&mp, &md, index, heap))
         .collect();
     let dev = VulkanPlatform::system_default_device().unwrap();
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     for (&(index, heap), theirs) in cases.iter().zip(&theirs) {
         let (case, sel) = match heap {
             true => (format!("heap {index}"), "newHeapWithDescriptor:"),
@@ -2090,7 +2079,7 @@ fn detached_in_flight_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     let [heap, buffer] = [true, false].map(|heap| in_flight(&p, &dev, heap));
     let [heap_expected, buffer_expected] = expected_in_flight();
     assert_eq!(heap, heap_expected, "heap");
@@ -2109,7 +2098,7 @@ fn detached_in_flight_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
         return;
     };
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     let seen = [true, false].map(|heap| in_flight(&p, &dev, heap));
     assert_eq!(seen, expected_in_flight());
 }
@@ -2364,7 +2353,7 @@ fn detached_in_a_completed_handler_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     for failing in COMPLETING {
         for heap in [true, false] {
             let seen = in_a_completed_handler(&p, &dev, heap, failing, false);
@@ -2394,7 +2383,7 @@ fn detached_in_a_completed_handler_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
         return;
     };
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     for failing in COMPLETING {
         for heap in [true, false] {
             for retired in [false, true] {
@@ -2416,7 +2405,7 @@ fn detached_in_a_failed_completed_handler_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     for failing in FAILING {
         for heap in [true, false] {
             let seen = in_a_completed_handler(&p, &dev, heap, failing, false);
@@ -2440,7 +2429,7 @@ fn detached_in_a_failed_completed_handler_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
         return;
     };
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     for failing in FAILING {
         for heap in [true, false] {
             let seen = in_a_completed_handler(&p, &dev, heap, failing, false);
@@ -2535,7 +2524,7 @@ fn detached_while_held_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     for (heap, open) in HELD {
         assert_eq!(
             held(&p, &dev, heap, open),
@@ -2553,7 +2542,7 @@ fn detached_while_held_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
         return;
     };
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     for (heap, open) in HELD {
         assert_eq!(
             held(&p, &dev, heap, open),
@@ -2671,7 +2660,7 @@ fn never_replaced_on_metal() {
     let Some(dev) = MetalPlatform::system_default_device() else {
         return;
     };
-    let p = MetalPlatform::new(Box::new(NoLauncher));
+    let p = MetalPlatform::new();
     for heap in [false, true] {
         assert_eq!(
             never_replaced(&p, &dev, heap),
@@ -2689,7 +2678,7 @@ fn never_replaced_on_vulkan() {
     let Some(dev) = VulkanPlatform::system_default_device() else {
         return;
     };
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     for heap in [false, true] {
         assert_eq!(
             never_replaced(&p, &dev, heap),

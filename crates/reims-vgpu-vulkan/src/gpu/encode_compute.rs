@@ -521,12 +521,9 @@ mod tests {
     /// `build.rs` compiled from `icb_encode.metal`.
     const ICB_ENCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icb_encode.metallib"));
 
-    const ADD: &[u8] =
-        include_bytes!("../../../../tests/shaders/compute_add.metallib");
-    const TGMEM: &[u8] =
-        include_bytes!("../../../../tests/shaders/compute_tgmem.metallib");
-    const SAMPLE: &[u8] =
-        include_bytes!("../../../../tests/shaders/compute_sample.metallib");
+    const ADD: &[u8] = include_bytes!("../../../../tests/shaders/compute_add.metallib");
+    const TGMEM: &[u8] = include_bytes!("../../../../tests/shaders/compute_tgmem.metallib");
+    const SAMPLE: &[u8] = include_bytes!("../../../../tests/shaders/compute_sample.metallib");
 
     /// `MTLCommandBufferStatusCompleted`.
     const COMPLETED: u64 = 4;
