@@ -418,14 +418,17 @@ FunctionInfo decodeH264()
 	return f;
 }
 
-// Makes the contexts of `n` decodes of `codec` (H.264's unless named): CreateContexts' answer,
-// the contexts in `contexts`.
-uint64_t makeContexts(uint32_t n, std::vector<void *> &contexts, uint64_t codec = kCodecH264)
+// Makes the contexts of `n` decodes of `codec` (H.264's unless named), of `width` x `height`
+// coded samples (1280x720 unless named): CreateContexts' answer, the contexts in `contexts`.
+uint64_t makeContexts(uint32_t n, std::vector<void *> &contexts, uint64_t codec = kCodecH264,
+                      uint32_t width = 1280, uint32_t height = 720)
 {
 	static std::vector<FunctionInfo> infos;
 	static std::vector<const FunctionInfo *> list;
 	FunctionInfo f = decodeH264();
 	f.sub_id = codec;
+	f.width = width;
+	f.height = height;
 	infos.assign(n, f);
 	list.clear();
 	for (const FunctionInfo &f : infos)
@@ -450,6 +453,54 @@ void checkFailedCreate()
 	CHECK(contexts[0] == nullptr && contexts[1] == nullptr, "a context handed back");
 	CHECK(call(kFreePixelBufferPool, nullptr) == kOk, "FreePixelBufferPool");
 	CHECK(g_opened[0]->forgotten == 0, "the closed session's outputs forgotten");
+}
+
+// An H.264 decode of a coded size outside the host's (144 to 8192 samples a side here) is refused
+// at its create, with no session opened, as are the contexts made before it in the same create;
+// one of the host's least and largest sizes is made. An HEVC decode of any size is made: its
+// pictures are held to the host's sizes as they are scheduled, which AppleGVA reports.
+void checkH264SizeAtCreate()
+{
+	const struct {
+		uint32_t width, height;
+		uint64_t want;
+	} cases[] = {
+	    {8193, 720, kUnsupported}, {1280, 8208, kUnsupported}, {128, 720, kUnsupported},
+	    {1280, 128, kUnsupported}, {144, 144, kOk},             {8192, 8192, kOk},
+	};
+	for (const auto &c : cases) {
+		g_opened.clear();
+		std::vector<void *> contexts;
+		CHECK(makeContexts(1, contexts, kCodecH264, c.width, c.height) == c.want,
+		      "an H.264 create of %ux%u", c.width, c.height);
+		CHECK(g_opened.size() == (c.want == kOk ? 1u : 0u), "%zu sessions opened for %ux%u",
+		      g_opened.size(), c.width, c.height);
+		CHECK((contexts[0] != nullptr) == (c.want == kOk), "the context of %ux%u", c.width, c.height);
+		if (contexts[0]) {
+			ContextDelete del = {1, 0, &contexts[0]};
+			CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+		}
+	}
+	// A create of two H.264 decodes whose second is of a size the host does not decode: the
+	// first's session goes with it.
+	{
+		static FunctionInfo infos[2];
+		infos[0] = infos[1] = decodeH264();
+		infos[1].width = 8193;
+		const FunctionInfo *list[2] = {&infos[0], &infos[1]};
+		void *contexts[2] = {};
+		ContextInfo info = {2, 0, list, contexts};
+		ContextInit init = {&info, nullptr};
+		g_opened.clear();
+		CHECK(call(kCreateContexts, &init) == kUnsupported, "a create whose second decode is too wide");
+		CHECK(g_opened.size() == 1 && g_opened[0]->closed, "the first decode's session left open");
+		CHECK(contexts[0] == nullptr && contexts[1] == nullptr, "a context handed back");
+	}
+	g_opened.clear();
+	std::vector<void *> contexts;
+	CHECK(makeContexts(1, contexts, kCodecHevc, 8193, 720) == kOk, "an HEVC create of 8193x720");
+	ContextDelete del = {1, 0, &contexts[0]};
+	CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
 }
 
 // DeleteContexts closes each context's session, which a later FreePixelBufferPool no longer
@@ -1370,6 +1421,7 @@ int main()
 	g_driver = createDriver();
 	checkPoolsPerDriver();
 	checkFailedCreate();
+	checkH264SizeAtCreate();
 	checkDelete();
 	checkUnsentDecode();
 	checkTileLanding();

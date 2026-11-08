@@ -1112,7 +1112,21 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			                       : fi->sub_id == kCodecHevc                       ? RGFX_VIDEO_CODEC_HEVC
 			                                                                        : 0;
 			if (codec != 0) {
-				context->session = rgfx::video::openSession(codec, RGFX_VIDEO_DECODE);
+				// An H.264 stream of a coded size the host does not decode is refused here, where
+				// VideoToolbox hears of it and turns to its software decoder: AppleGVA's H.264
+				// decoder hears of no failure later (RgfxVideoStatus.hpp).
+				if (codec == RGFX_VIDEO_CODEC_H264 &&
+				    !rgfx::video::sizeTaken(rgfx::video::hostCodec(codec, RGFX_VIDEO_DECODE),
+				                            fi->width, fi->height)) {
+					static std::atomic<bool> said;
+					if (!said.exchange(true))
+						os_log_error(OS_LOG_DEFAULT,
+						             "RGFX: video: an H.264 decode of %ux%u refused at its create: "
+						             "the host decodes no picture of its coded size",
+						             fi->width, fi->height);
+				} else {
+					context->session = rgfx::video::openSession(codec, RGFX_VIDEO_DECODE);
+				}
 				if (!context->session) {
 					// The contexts made before it go with their sessions, which leave the
 					// live ones.

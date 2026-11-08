@@ -23,13 +23,17 @@
  * host, 2026-11-07, every picture failed on the host). Its pipelines schedule their commands one
  * at a time and keep no decode's result (read from AppleGVA's code on macOS 26.7.1). So an H.264
  * schedule does not wait for the host, as waiting would only cost: its frames reach the guest as
- * decoded, as AppleGVA leaves no way to say otherwise.
+ * decoded, as AppleGVA leaves no way to say otherwise. What the driver can tell before the first
+ * picture, a coded size the host does not decode (sizeTaken), it refuses at the context's create,
+ * which fails the client's session create, so VideoToolbox decodes the stream in software.
  */
 
 #ifndef RGFX_VIDEO_STATUS_HPP_
 #define RGFX_VIDEO_STATUS_HPP_
 
 #include <cstdint>
+
+#include "reims_graphics_wire.h"
 
 namespace rgfx::video {
 
@@ -60,6 +64,20 @@ inline bool waitsForHost(bool hevc)
 inline bool scheduleFails(bool sent, bool hostFailed)
 {
 	return !sent || hostFailed;
+}
+
+// Whether the host decodes pictures of `width` x `height` coded samples, by its caps (`caps`, null
+// for none): within its least and largest coded size, where it names them.
+inline bool sizeTaken(const RgfxVideoCodecCaps *caps, uint32_t width, uint32_t height)
+{
+	if (!caps)
+		return false;
+	const uint32_t size[2] = {width, height};
+	for (int i = 0; i < 2; i++)
+		if ((caps->min_size[i] && size[i] < caps->min_size[i]) ||
+		    (caps->max_size[i] && size[i] > caps->max_size[i]))
+			return false;
+	return true;
 }
 
 } // namespace rgfx::video
