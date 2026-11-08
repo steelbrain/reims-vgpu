@@ -16,10 +16,12 @@
 //!   (`Device::private_properties`), read from what the runtime acts on: its argument tables'
 //!   entries, the texture sides and layers its descriptors take (Metal's, or the device's where
 //!   they are fewer), its viewports, its threadgroup memory table and alignment, its rate maps'
-//!   layers, the compile layer's threads per threadgroup, the linear and IOSurface alignment it
-//!   places textures at, and whether it takes a buffer's attribute stride per bind
-//!   (`supportsDynamicAttributeStride`: on every device, through the pipeline's static stride or
-//!   vertex pulling where the device lacks `VK_EXT_extended_dynamic_state`): [`computed`];
+//!   layers, the compile layer's threads per threadgroup, the linear alignment at which the
+//!   device's images hold a texture over a buffer in place (the largest of the formats'), the
+//!   IOSurface alignment it places textures at, and whether it takes a buffer's attribute stride
+//!   per bind (`supportsDynamicAttributeStride`: on every device, through the pipeline's static
+//!   stride or vertex pulling where the device lacks `VK_EXT_extended_dynamic_state`):
+//!   [`computed`];
 //! - **computed from documented facts** the runtime gives (its device's Vulkan description, the
 //!   compile layer's `MetalDeviceProperties`), for the other private properties: [`computed`];
 //! - **a stand-in** where no documented fact gives the answer, or where the runtime's answer is
@@ -36,6 +38,7 @@
 //! | `supportsFamily:` of Apple5 to Apple10, -1009 | yes, yes, yes, yes, yes, no, no | the runtime claims a family only where every row of Apple's table is exact, and claims none on MoltenVK. **Pending support** (below): what a family promises that the runtime refuses dies at its selector |
 //! | `supportsExtendedXR10Formats` | yes | **pending support** (below): the runtime makes textures of the XR10 formats (550 to 555), in heaps too, and of format 84 (plane 1's view format of the two-plane XR10 textures, 550 and 551), reads and writes them in kernels, samples them in 2D and gathers 552 to 555 as floats, unswizzled and under the four swizzles of the texture or a view the tests read through (`rgbx`'s `XR_SWIZZLES`, which move, repeat, drop and replace channels; no other swizzle is measured), as Metal does on the M3 (`rgbx`'s `extended_range_textures_read_as_metals`), reads 552 and 554 through an argument buffer as Metal does, and samples and gathers them so as Metal does through a sampler of one filter and no mip filter, samples other textures through one as Metal does while one lives that the command does not reach, and dies, naming the runtime's refusal, at a command that samples or gathers one it reaches (names or makes resident) through an argument buffer otherwise (a sampler of a mip filter among them), or reads an `_sRGB` twin or a swizzled one so (`rgbx`'s `extended_range_textures_an_argument_buffer_holds_read_as_metals`), copies 550's and 551's colour words to and from the CPU and buffers as Metal does, and renders to one where the fragment function writes all of its channels or none. It blends a `half4` output, and a `float4` one, into one in the shader, by its model of Metal's blend, and reads one it blends by framebuffer fetch. The model holds without fast math, each product rounded to `half` as Metal's compiler does there (`encode_render`'s `float4_extended_range_blends_are_metals_here` and `half4_extended_range_blends_are_metals_without_fast_math` compare `float4` and `half4` outputs with Metal across passes, into each linear form and each `_sRGB` twin), and under fast math for an output each of whose lanes is a load; where Metal may round the blend's source otherwise, under fast math an output the function computes, or a module that names no math mode, the render state announces the output's kind: for a `half4` one `extended-range-blend-source`, which the device relays for its reach ([`crate::answer`]): a computed `half4` misses Metal's by one code of a channel at 13 of the 66 blended configurations the tests draw, at 130 to 483 of 4096 texels each (`half4_extended_range_blends_announce_their_source`); for a `float4` one `extended-range-float-blend-source`, which the runtime announces at each draw that binds the state's variant, where the draw dies (the state is made), where a computed `float4` missed Metal's at 17 of the 66 (`float4_extended_range_blends_die_naming_their_source`). The tests draw the 22 blends of `XR_BLENDS` into each linear form and the 8 of `XR_SRGB_BLENDS` into each `_sRGB` twin; without fast math, where the runtime also draws a blend by the blend colour under a difference, and any blend into an `_sRGB` twin, they draw those of `XR_CONSTANT_DIFFERENCES` into each form and the rest of `XR_BLENDS` into each twin as Metal does (`extended_range_blends_drawn_without_fast_math_alone_are_metals`), and into each form and twin six blends under write masks of one colour channel and of two as Metal does, and a function's two outputs into colour 0, unblended, storing the first output's values as Metal does, the second nowhere, and without fast math under six blends of the second source as Metal does (`extended_range_masked_blends_and_two_output_states_are_metals`); the others are not measured. A draw that blends into or reads an attachment an earlier draw of its pass may have written, or that its `Clear` left between two codes, reads the `half` values the runtime holds through a pass of one sample and one layer without a rasterization-rate map, as Metal's tile memory does, announcing nothing, so its blends in one pass are Metal's (`encode_render`'s `float4_extended_range_blends_are_metals_here`, `a_blend_onto_a_clear_between_codes_is_metals`); otherwise (another such pass, after an execution of render commands or a tile dispatch, where an earlier render pass instance of the pass wrote the attachment, or a draw whose pipeline has no shadowed form) it sees the codes the runtime stored, where Metal holds the value through the pass, which the runtime announces and the device relays (`extended-range-blends-stored-codes`). A multisampled render target of one resolves by the runtime's own resolve of its codes after the pass: `BGR10_XR`'s and `BGRA10_XR`'s colour as Metal's, an alpha within a code and an `_sRGB` twin's colour within 7 (`encode_render`'s `drawn_extended_range_samples_resolve_as_metals`), which the runtime announces and the device relays (`extended-range-resolve`). The runtime refuses the rest, which dies at its selector; among it a render target of one unblended under a mask of some of its channels, blended under fast math under a mask of one colour channel, by a factor of the second source, by the blend colour under a difference, into an `_sRGB` form beyond the blends the runtime measured, or a `float4` output into one but by a blend whose colour lanes take one term alone, or from an output other than four `half` or `float` lanes; a state of a function that returns two outputs into colour 0 (a second, index 1, as a blend of the second source reads), blended by factors of the second source under fast math (`ExtendedRangeBlend(DualSource)`); a gather of 550 or 551, or as halves; and 550's and 551's views of another format, mipmaps, textures over a buffer and copies of a layout it has not measured; a copy between two textures of 550 or 551 dies at its selector too, whose alpha plane the runtime copies otherwise than Metal ([`crate::gpu::encode_blit`]) |
 //! | `supports_float16_bcubic_filtering` | yes | undocumented, unmeasured |
+//! | `minimumLinearTextureAlignmentForPixelFormat:` of `BGRA8Unorm`, and `minimumTextureBufferAlignmentForPixelFormat:` of each format a texture buffer takes ([`crate::gpu::identity`]) | 16 bytes, Metal's answer for every format a buffer backs (measured on the M3 Max and the M4), and the runtime's refusal of the others: a compressed, depth or stencil format, or one Metal describes none of ([`linear_alignment`]) | the runtime answers the alignment at which the device's images hold a texture over a buffer in place, at least Metal's (`Device::minimum_linear_texture_alignment_for_pixel_format`: 256 for most formats on RADV, 64 on lavapipe, 16 on MoltenVK), and the guest's frameworks lay out their linear textures and texture buffers by it: an answer stays as it was until the guests boot with the new one |
 //! | `is_rgb10a2_gamma_supported` (key 8) | yes | **pending support** (below): the runtime holds no texture of `RGB10A2Unorm_sRGB` (586), which Metal makes, so it answers no on every device (`Device::private_properties`), and a texture of it dies where it is made (measured on the M3 Max, of `ShaderRead` usage and of `ShaderRead` and `RenderTarget`) |
 //! | `is_large_mrt_supported`, `supports_conditional_load_store`, `supports_compute_compressed_texture_write` | yes, yes, no: Metal's answers, as the runtime records them (`PrivateAnswer::Metal`) | undocumented, unmeasured: the runtime has no answer of the device's for them |
 //! | `supports_texture_2d_multisample_array` | yes | undocumented |
@@ -404,6 +407,21 @@ fn gpu_core_count(name: &str, reported: Option<u32>, registry_id: u64) -> Option
     count
 }
 
+/// Metal's `minimumLinearTextureAlignmentForPixelFormat:` on an Apple GPU, the M3 Max's and the
+/// M4's, for every pixel format a buffer backs: a stand-in (the module's table).
+const METAL_LINEAR_ALIGNMENT: u64 = 16;
+
+/// `minimumLinearTextureAlignmentForPixelFormat:` of `pf` as this platform answers it, a stand-in
+/// (the module's table): [`METAL_LINEAR_ALIGNMENT`] for each format the runtime's query answers,
+/// and the runtime's refusal of the others (`Invalid`, `BufferTextureProblem::NotLinear`: a
+/// compressed, depth or stencil format, or one Metal describes none of, at which Metal's query
+/// asserts). The runtime's own answer, the device's, is not taken.
+pub(crate) fn linear_alignment(device: &rt::Device, pf: PixelFormat) -> Result<u64, rt::Error> {
+    device
+        .minimum_linear_texture_alignment_for_pixel_format(pf)
+        .map(|_| METAL_LINEAR_ALIGNMENT)
+}
+
 /// `heapBufferSizeAndAlignWithLength:options:` of (`length`, `options`).
 fn heap_buffer_size_and_align(
     device: &rt::Device,
@@ -464,7 +482,7 @@ pub fn read(device: &rt::Device, registry_id: u64, page_size: u64) -> Arc<Device
         min_linear_alignment_bgra8: send(
             "minimumLinearTextureAlignmentForPixelFormat:",
             Policy::Caught,
-            || props.minimum_linear_texture_alignment_for_pixel_format(PixelFormat::BGRA8Unorm),
+            || linear_alignment(device, PixelFormat::BGRA8Unorm),
         ),
     })
 }
@@ -515,10 +533,10 @@ mod tests {
     }
 
     /// Every count but four, and `supportsDynamicAttributeStride`, is the runtime's answer on
-    /// the device, read from what it acts on (`Device::private_properties`); the others are the
-    /// module's stand-ins, this platform's own (`gpuCoreCount`, predication, buffers and heaps
-    /// over address ranges and surfaces) or computed from the compile layer, each where its row
-    /// says
+    /// the device, read from what it acts on (`Device::private_properties`), no more than Metal's
+    /// but for an alignment, at least Metal's; the others are the module's stand-ins, this
+    /// platform's own (`gpuCoreCount`, predication, buffers and heaps over address ranges and
+    /// surfaces) or computed from the compile layer, each where its row says
     #[test]
     fn private_properties_are_the_runtimes_where_it_answers_them() {
         use rt::PrivateCount as C;
@@ -566,11 +584,23 @@ mod tests {
             };
             let answer = private.count(property);
             assert_eq!(Some(ours), answer.value(), "{}", property.selector());
-            assert!(
-                ours <= answer.metal(),
-                "{}: past Metal's",
-                property.selector()
-            );
+            // A linear alignment is the device's images' (256 on RADV), past Metal's 16.
+            if matches!(
+                property,
+                C::DeviceLinearTextureAlignmentBytes | C::LinearTextureAlignmentBytes
+            ) {
+                assert!(
+                    ours >= answer.metal(),
+                    "{}: below Metal's",
+                    property.selector()
+                );
+            } else {
+                assert!(
+                    ours <= answer.metal(),
+                    "{}: past Metal's",
+                    property.selector()
+                );
+            }
         }
         assert_eq!(
             Some(caps.flags.supports_dynamic_attribute_stride),

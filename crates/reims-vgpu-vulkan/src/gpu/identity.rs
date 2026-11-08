@@ -6,9 +6,11 @@
 //!   `maxBufferLength`, the argument-buffer and read-write texture tiers,
 //!   `supports32BitFloatFiltering`), `sparseTileSizeInBytes`, each format's sparse tiles,
 //!   `supportsFamily:`, `supportsVertexAmplificationCount:` and
-//!   `supportsRasterizationRateMapWithLayerCount:`, and, for
-//!   `minimumTextureBufferAlignmentForPixelFormat:`, its
-//!   `minimumLinearTextureAlignmentForPixelFormat:`, which Metal answers alike (measured);
+//!   `supportsRasterizationRateMapWithLayerCount:`;
+//! - **a stand-in**, [`crate::gpu::caps`]' (its table), for
+//!   `minimumTextureBufferAlignmentForPixelFormat:`: `minimumLinearTextureAlignmentForPixelFormat:`
+//!   as this platform answers it ([`crate::gpu::caps::linear_alignment`]), which Metal answers
+//!   alike (measured);
 //! - **the runtime's audit of a feature row** of Apple's tables, in the Apple9 column, which lists
 //!   every row read here, as [`crate::gpu::caps`]' SIMD flags are read ([`ROWS`]): a getter is yes
 //!   where the row its feature is is exact on the device;
@@ -165,10 +167,11 @@ fn sparse_page(page: i64) -> Option<rt::SparsePageSize> {
 }
 
 /// The answers of `format` [`FormatAnswers`] holds: the runtime's sparse tiles, and, of a format
-/// Metal answers it of ([`TEXTURE_BUFFER_FORMATS`]), the alignment of its texture buffers: the
-/// runtime's `minimumLinearTextureAlignmentForPixelFormat:`, which Metal answers alike for
-/// every format of the SDK (measured, an M3 Max under macOS 27.2). `None` for a format the
-/// runtime has no enumerator of.
+/// Metal answers it of ([`TEXTURE_BUFFER_FORMATS`]), the alignment of its texture buffers:
+/// `minimumLinearTextureAlignmentForPixelFormat:` as this platform answers it, a stand-in
+/// ([`crate::gpu::caps::linear_alignment`]), which Metal answers alike for every format of the
+/// SDK (measured, an M3 Max under macOS 27.2). `None` for a format the runtime has no enumerator
+/// of.
 fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
     let Some(pf) = runtime_pixel_format(format) else {
         return FormatAnswers {
@@ -178,12 +181,7 @@ fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
     };
     let texture_buffer_alignment = TEXTURE_BUFFER_FORMATS
         .contains(&format)
-        .then(|| {
-            device
-                .properties()
-                .minimum_linear_texture_alignment_for_pixel_format(pf)
-                .ok()
-        })
+        .then(|| crate::gpu::caps::linear_alignment(device, pf).ok())
         .flatten();
     let mut tiles = [[0; 3]; 9];
     let pairs = SPARSE_SAMPLE_COUNTS

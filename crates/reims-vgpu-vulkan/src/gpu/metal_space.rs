@@ -623,8 +623,10 @@ struct Pool {
     /// Whether a first use made it, which Metal keeps for good.
     kept: bool,
     /// The runtime's reservations of its range (`rt::Device::reserve_address_pool`), one on each
-    /// device a buffer lies in it on, which those buffers' holds keep ([`Placing::pool_slot`]).
-    reserved: Vec<Weak<rt::AddressPool>>,
+    /// device a buffer lies in it on, which those buffers' holds keep ([`Placing::pool_slot`]),
+    /// each beside the device it was made through, named by the address of its properties
+    /// ([`Pool::reservation`]).
+    reserved: Vec<(Weak<rt::AddressPool>, usize)>,
 }
 
 impl Pool {
@@ -648,19 +650,23 @@ impl Pool {
     /// A device is one runtime device, not one physical device: each has a space of its own,
     /// and refuses a slot of another's reservation (`ForeignObject`). Their buffers' holds keep
     /// them, so a device keeps its reservation while a buffer of it lies in the pool, and none
-    /// after; a live reservation keeps its device, so the address of the device's properties
-    /// names it alone.
+    /// after. A reservation is named by the address of the properties of the device it was made
+    /// through, the platform's handle, which every clone of that handle answers: a live
+    /// reservation holds a handle of its device's generation, which keeps that device and its
+    /// properties where they are, so the address names it alone. The reservation's own device
+    /// (`rt::AddressPool::device`) is that generation's handle, whose properties are a copy of
+    /// its own at another address.
     fn reservation(&mut self, device: &rt::Device) -> Result<Arc<rt::AddressPool>, rt::Error> {
-        self.reserved.retain(|reserved| reserved.strong_count() > 0);
-        let live = (self.reserved.iter()).filter_map(Weak::upgrade);
-        let mut of_device =
-            live.filter(|r| std::ptr::eq(r.device().properties(), device.properties()));
-        if let Some(reserved) = of_device.next() {
+        let named = std::ptr::from_ref(device.properties()).addr();
+        self.reserved
+            .retain(|(reserved, _)| reserved.strong_count() > 0);
+        let live = (self.reserved.iter()).filter(|&&(_, of)| of == named);
+        if let Some(reserved) = live.filter_map(|(reserved, _)| reserved.upgrade()).next() {
             return Ok(reserved);
         }
         let at = rt::AddressPlacement::At(rt::GpuAddress(self.held.address()));
         let reserved = Arc::new(device.reserve_address_pool(at, POOL_BYTES)?);
-        self.reserved.push(Arc::downgrade(&reserved));
+        self.reserved.push((Arc::downgrade(&reserved), named));
         Ok(reserved)
     }
 
