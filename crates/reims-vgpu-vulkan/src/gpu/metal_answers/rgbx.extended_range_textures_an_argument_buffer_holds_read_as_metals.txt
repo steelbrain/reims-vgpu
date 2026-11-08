@@ -1,0 +1,79 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+BGRA10_XR options 0x0: cases	7
+BGRA10_XR options 0x0 rgbx_read_held_float	xz 4096 0
+BGRA10_XR options 0x0 rgbx_read_held_half	bytes 2048 3fa9cca7ea6217c08f062751611629c1 072f41399239543082b9363c27afab3a85b88b3a6636223a9d34862d18385939
+BGRA10_XR options 0x0 rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+BGRA10_XR options 0x0 rgbx_sample_held filter 0 mip filter 0	xz 4096 4096
+BGRA10_XR options 0x0 rgbx_gather_held filter 0 mip filter 0	xz 4096 8192
+BGRA10_XR options 0x0 rgbx_sample_held filter 1 mip filter 0	xz 4096 12288
+BGRA10_XR options 0x0 rgbx_gather_held filter 1 mip filter 0	xz 4096 16384
+BGRA10_XR options 0x0: an RGBA8Unorm texture's samples beside it: cases	4
+BGRA10_XR options 0x0: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 0 mip filter 0	bytes 4096 d8ee99b78afef52f57aab6c280ff9d16 9998983eafaeae3ea3a2223fb1b0b03dd9d8d83d8584843ef8f7773fa8a7273f
+BGRA10_XR options 0x0: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 0 mip filter 0	bytes 4096 3c3e3d95540bf9393479105598dcc2ab d5d4543ff3f2f23e9190903e9998983ef5f4743ff5f4743fd9d8d83dd9d8d83d
+BGRA10_XR options 0x0: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 1 mip filter 0	bytes 4096 14eec3076a96be2a064e14b269c29617 9998983eafaeae3ea3a2223fb1b0b03d7171f13eb2b1013fcbca1a3f9f9e0e3f
+BGRA10_XR options 0x0: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 1 mip filter 0	bytes 4096 3c3e3d95540bf9393479105598dcc2ab d5d4543ff3f2f23e9190903e9998983ef5f4743ff5f4743fd9d8d83dd9d8d83d
+BGRA10_XR options 0x20: cases	7
+BGRA10_XR options 0x20 rgbx_read_held_float	xz 4096 20480
+BGRA10_XR options 0x20 rgbx_read_held_half	bytes 2048 3fa9cca7ea6217c08f062751611629c1 072f41399239543082b9363c27afab3a85b88b3a6636223a9d34862d18385939
+BGRA10_XR options 0x20 rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+BGRA10_XR options 0x20 rgbx_sample_held filter 0 mip filter 0	xz 4096 24576
+BGRA10_XR options 0x20 rgbx_gather_held filter 0 mip filter 0	xz 4096 28672
+BGRA10_XR options 0x20 rgbx_sample_held filter 1 mip filter 0	xz 4096 32768
+BGRA10_XR options 0x20 rgbx_gather_held filter 1 mip filter 0	xz 4096 36864
+BGRA10_XR options 0x20: an RGBA8Unorm texture's samples beside it: cases	4
+BGRA10_XR options 0x20: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 0 mip filter 0	bytes 4096 d8ee99b78afef52f57aab6c280ff9d16 9998983eafaeae3ea3a2223fb1b0b03dd9d8d83d8584843ef8f7773fa8a7273f
+BGRA10_XR options 0x20: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 0 mip filter 0	bytes 4096 3c3e3d95540bf9393479105598dcc2ab d5d4543ff3f2f23e9190903e9998983ef5f4743ff5f4743fd9d8d83dd9d8d83d
+BGRA10_XR options 0x20: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 1 mip filter 0	bytes 4096 14eec3076a96be2a064e14b269c29617 9998983eafaeae3ea3a2223fb1b0b03d7171f13eb2b1013fcbca1a3f9f9e0e3f
+BGRA10_XR options 0x20: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 1 mip filter 0	bytes 4096 3c3e3d95540bf9393479105598dcc2ab d5d4543ff3f2f23e9190903e9998983ef5f4743ff5f4743fd9d8d83dd9d8d83d
+BGR10_XR options 0x0: cases	7
+BGR10_XR options 0x0 rgbx_read_held_float	xz 4096 40960
+BGR10_XR options 0x0 rgbx_read_held_half	bytes 2048 c636a595d00a2c5a8b1d19b2bb4a3eb7 d9b85c34f631003c5e36e5b897b2003c3cb888b7cb3a003c2a3a15353038003c
+BGR10_XR options 0x0 rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+BGR10_XR options 0x0 rgbx_sample_held filter 0 mip filter 0	xz 4096 45056
+BGR10_XR options 0x0 rgbx_gather_held filter 0 mip filter 0	xz 4096 49152
+BGR10_XR options 0x0 rgbx_sample_held filter 1 mip filter 0	xz 4096 53248
+BGR10_XR options 0x0 rgbx_gather_held filter 1 mip filter 0	xz 4096 57344
+BGR10_XR options 0x0: an RGBA8Unorm texture's samples beside it: cases	4
+BGR10_XR options 0x0: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 0 mip filter 0	bytes 4096 4164ea398c7aff02b55ba6bcaeacb0c3 f1f0703f8180803eb5b4343e8180803c8f8e8e3ec1c0c03eedec6c3f8b8a8a3e
+BGR10_XR options 0x0: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 0 mip filter 0	bytes 4096 d8b27f1e9e974d340fd1e55e94b0ccbd 9998183f9190103ee7e6e63ef1f0703ff1f0703ef1f0703e8f8e8e3e8f8e8e3e
+BGR10_XR options 0x0: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 1 mip filter 0	bytes 4096 230dea74c47fd8bc05d8fbc71c09e837 f1f0703f8180803eb5b4343e8180803c0505853eefee6e3ec9c8183f0707a73e
+BGR10_XR options 0x0: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 1 mip filter 0	bytes 4096 d8b27f1e9e974d340fd1e55e94b0ccbd 9998183f9190103ee7e6e63ef1f0703ff1f0703ef1f0703e8f8e8e3e8f8e8e3e
+BGR10_XR options 0x20: cases	7
+BGR10_XR options 0x20 rgbx_read_held_float	xz 4096 61440
+BGR10_XR options 0x20 rgbx_read_held_half	bytes 2048 c636a595d00a2c5a8b1d19b2bb4a3eb7 d9b85c34f631003c5e36e5b897b2003c3cb888b7cb3a003c2a3a15353038003c
+BGR10_XR options 0x20 rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+BGR10_XR options 0x20 rgbx_sample_held filter 0 mip filter 0	xz 4096 65536
+BGR10_XR options 0x20 rgbx_gather_held filter 0 mip filter 0	xz 4096 69632
+BGR10_XR options 0x20 rgbx_sample_held filter 1 mip filter 0	xz 4096 73728
+BGR10_XR options 0x20 rgbx_gather_held filter 1 mip filter 0	xz 4096 77824
+BGR10_XR options 0x20: an RGBA8Unorm texture's samples beside it: cases	4
+BGR10_XR options 0x20: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 0 mip filter 0	bytes 4096 4164ea398c7aff02b55ba6bcaeacb0c3 f1f0703f8180803eb5b4343e8180803c8f8e8e3ec1c0c03eedec6c3f8b8a8a3e
+BGR10_XR options 0x20: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 0 mip filter 0	bytes 4096 d8b27f1e9e974d340fd1e55e94b0ccbd 9998183f9190103ee7e6e63ef1f0703ff1f0703ef1f0703e8f8e8e3e8f8e8e3e
+BGR10_XR options 0x20: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 1 mip filter 0	bytes 4096 230dea74c47fd8bc05d8fbc71c09e837 f1f0703f8180803eb5b4343e8180803c0505853eefee6e3ec9c8183f0707a73e
+BGR10_XR options 0x20: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 1 mip filter 0	bytes 4096 d8b27f1e9e974d340fd1e55e94b0ccbd 9998183f9190103ee7e6e63ef1f0703ff1f0703ef1f0703e8f8e8e3e8f8e8e3e
+R10Unorm_X6 options 0x0: cases	7
+R10Unorm_X6 options 0x0 rgbx_read_held_float	xz 4096 81920
+R10Unorm_X6 options 0x0 rgbx_read_held_half	bytes 2048 aeca81c698e9bae62ab72ceb9498d19b f12c00000000003cad3400000000003cc93400000000003cc22f00000000003c
+R10Unorm_X6 options 0x0 rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+R10Unorm_X6 options 0x0 rgbx_sample_held filter 0 mip filter 0	xz 4096 86016
+R10Unorm_X6 options 0x0 rgbx_gather_held filter 0 mip filter 0	xz 4096 90112
+R10Unorm_X6 options 0x0 rgbx_sample_held filter 1 mip filter 0	xz 4096 94208
+R10Unorm_X6 options 0x0 rgbx_gather_held filter 1 mip filter 0	xz 4096 98304
+R10Unorm_X6 options 0x0: an RGBA8Unorm texture's samples beside it: cases	4
+R10Unorm_X6 options 0x0: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 0 mip filter 0	bytes 4096 c3d4f7677801e350fec29428df850d20 dedd5d3fbab9393fa1a0a03c9f9e9e3e9d9c1c3f8180003cc1c0c03db5b4343e
+R10Unorm_X6 options 0x0: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 0 mip filter 0	bytes 4096 6b4b04f92d8e57d4d679c34351f647bd a5a4a43ecdcc4c3f9796963ededd5d3f8d8c0c3e8d8c0c3e9d9c1c3f9d9c1c3f
+R10Unorm_X6 options 0x0: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 1 mip filter 0	bytes 4096 6bb69ca478bf7e178b1367173cd82fb7 dedd5d3fbab9393fa1a0a03c9f9e9e3ed1d0d03ea4a3a33e2d2ded3edbdafa3e
+R10Unorm_X6 options 0x0: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 1 mip filter 0	bytes 4096 6b4b04f92d8e57d4d679c34351f647bd a5a4a43ecdcc4c3f9796963ededd5d3f8d8c0c3e8d8c0c3e9d9c1c3f9d9c1c3f
+RG10Unorm_X12 options 0x0: cases	7
+RG10Unorm_X12 options 0x0 rgbx_read_held_float	xz 4096 102400
+RG10Unorm_X12 options 0x0 rgbx_read_held_half	bytes 2048 4f12b841a07b11ce6f333975477b5fbc 0934083a0000003cae3a09350000003c1535fe370000003ca53911310000003c
+RG10Unorm_X12 options 0x0 rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+RG10Unorm_X12 options 0x0 rgbx_sample_held filter 0 mip filter 0	xz 4096 106496
+RG10Unorm_X12 options 0x0 rgbx_gather_held filter 0 mip filter 0	xz 4096 110592
+RG10Unorm_X12 options 0x0 rgbx_sample_held filter 1 mip filter 0	xz 4096 114688
+RG10Unorm_X12 options 0x0 rgbx_gather_held filter 1 mip filter 0	xz 4096 118784
+RG10Unorm_X12 options 0x0: an RGBA8Unorm texture's samples beside it: cases	4
+RG10Unorm_X12 options 0x0: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 0 mip filter 0	bytes 4096 3718e630407bd7704ed0c4f3300abcde e9e8e83e0000803f8180003f9998983ec5c4443ee4e3633fd1d0503ffdfc7c3f
+RG10Unorm_X12 options 0x0: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 0 mip filter 0	bytes 4096 bbfbdb8189e25391260cd1f4d0fb6d48 8180803d8382023fe4e3633fe9e8e83efffe7e3ffffe7e3fc5c4443ec5c4443e
+RG10Unorm_X12 options 0x0: an RGBA8Unorm texture's samples beside it rgbx_sample_held filter 1 mip filter 0	bytes 4096 4b223aedae2e5ab560da4615dbc8111e e9e8e83e0000803f8180003f9998983e9a99093fefee0e3f8382623f1717473f
+RG10Unorm_X12 options 0x0: an RGBA8Unorm texture's samples beside it rgbx_gather_held filter 1 mip filter 0	bytes 4096 bbfbdb8189e25391260cd1f4d0fb6d48 8180803d8382023fe4e3633fe9e8e83efffe7e3ffffe7e3fc5c4443ec5c4443e

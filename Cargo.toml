@@ -3,7 +3,6 @@
 resolver = "3"
 members = [
     "crates/reims-vgpu-core",
-    "crates/reims-vgpu-metal",
     "crates/reims-vgpu-window",
     "crates/reims-vgpu",
     "crates/reims-vgpu-c",
@@ -23,7 +22,6 @@ license = "GPL-2.0-or-later OR LGPL-3.0-or-later"
 
 [workspace.dependencies]
 reims-vgpu-core = { path = "crates/reims-vgpu-core" }
-reims-vgpu-metal = { path = "crates/reims-vgpu-metal" }
 # Without their default features: each member that wants SDL3's macOS window asks for it
 # (`macos-sdl`), so `reims-vgpu-c`'s default decides whether the library has it.
 reims-vgpu-window = { path = "crates/reims-vgpu-window", default-features = false }
@@ -35,7 +33,7 @@ reims-graphics = { path = "crates/reims-graphics" }
 # `reims-vgpu`), and, on Linux, VA-API through libva and NVDEC through CUDA, their libraries
 # loaded at run time (`graphics::vaapi` and `graphics::nvidia` of `reims-vgpu`).
 reims-vgpu-video = { path = "crates/reims-vgpu-video" }
-# The Vulkan platform's proof of concept (architecture D1): a Metal-shaped API on Vulkan, from
+# The Vulkan platform's runtime (architecture D1): a Metal-shaped API on Vulkan, from
 # metal2vulkan's public repository at the commit both name.
 metal2vulkan-runtime = { git = "https://github.com/steelbrain/metal2vulkan", rev = "eac9da30c7e6df2cddec724643546c1f2a401c87" }
 # Its translator, for the Metal enums and descriptor values the runtime's calls take.
@@ -54,12 +52,14 @@ sdl3-sys = { version = "=0.7.2", default-features = false, features = [
     "sdl-video",
     "use-ash-v0-38",
 ] }
+# Metal's recorded answers too long for text, in xz files (core::testkit::metal_answers).
+lzma-rs = "0.3.0"
 # core (architecture 2.2)
 parking_lot = "0.12.5"
 zerocopy = { version = "0.8.27", features = ["derive"] }
 # every crate's lines, and the default stderr logger (core::logging)
 log = "0.4.34"
-# metal and the public crate. objc2 `exception` is always on; `catch-all` is never enabled
+# The macOS sides of the crates. objc2 `exception` is always on; `catch-all` is never enabled
 # (architecture 2.3). objc2's checks (a message to nil, a missing method, the encodings) are
 # debug assertions: on in dev, off in `checked` (the objc2 profile override below).
 objc2 = { version = "0.6.4", features = ["exception"] }
@@ -67,7 +67,6 @@ objc2-foundation = "0.3.2"
 objc2-metal = "0.3.2"
 objc2-io-surface = "0.3.2"
 block2 = "0.6.2"
-dispatch2 = "0.3.1"
 # the window crate (AppKit, Core Animation, CoreGraphics). Default features off: their defaults
 # pull in every framework the crates cover (objc2-open-gl among them).
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std"] }

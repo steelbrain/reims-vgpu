@@ -118,18 +118,12 @@ fn numbered_ids<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> Vec<(&
 /// (made before the state or after it, past its library) and by every live library of the same
 /// bytes, and given back with its last holder, as Metal's are on this host. This platform's
 /// objects hold the runtime's libraries and functions exactly as long as the guest's handles
-/// to them live, which this checks. Metal's side runs first, before MoltenVK makes objects of
-/// its own on Metal's device
+/// to them live, which this checks
 #[test]
 fn sampler_ids_follow_pipeline_holders_as_metals() {
-    use reims_vgpu_metal::MetalPlatform;
-    reims_vgpu_metal::os::autorelease::install();
-    let theirs =
-        MetalPlatform::system_default_device().map(|md| numbered_ids::<MetalPlatform>(&md));
+    crate::os::install_process_services();
     let ours = numbered_ids::<VulkanPlatform>(&dev());
-    if let Some(theirs) = theirs {
-        assert_eq!(ours, theirs);
-    }
+    reims_vgpu_core::metal_check!("ids", ours);
 }
 
 /// `five_samplers.metal`'s kernel, compiled by build.rs.
@@ -175,23 +169,16 @@ fn five_samplers_move<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> 
 /// states, a kernel's five constexpr samplers bring the IDs to 256, which doubles the pool to
 /// 512 and grows the mempool's array to a page, a range of its own, so the next range moves
 /// on by 0x8000 ([`five_samplers_move`]), on Metal, where it runs, and here, where the
-/// runtime's pool holds 512 IDs. Metal's side runs first, before MoltenVK makes objects of its
-/// own on Metal's device
+/// runtime's pool holds 512 IDs
 #[test]
 fn pipeline_samplers_grow_metals_sampler_mempool() {
-    use reims_vgpu_metal::MetalPlatform;
-    reims_vgpu_metal::os::autorelease::install();
-    let theirs =
-        MetalPlatform::system_default_device().map(|md| five_samplers_move::<MetalPlatform>(&md));
+    crate::os::install_process_services();
     let d = dev();
     let ours = five_samplers_move::<VulkanPlatform>(&d);
     assert_eq!(
         (ours, plain(|| d.raw.sampler_id_pool_size())),
         (0x8000, 512)
     );
-    if let Some(theirs) = theirs {
-        assert_eq!(theirs, 0x8000, "Metal's");
-    }
 }
 
 /// A 16 by 8 `RGBA16Float` texture on `p`'s device `d`, its halves `seed`'s noise of every
@@ -280,16 +267,10 @@ fn filtered(min: u64, mag: u64, address: u64) -> SamplerDesc {
 ///
 /// Where the filter is cubic, this platform's sample dies at the dispatch naming
 /// `bicubic-filter-arithmetic` ([`crate::answer::DIES`]), which the runtime announces at every
-/// bicubic sample whose sums it has not pinned to Metal's rule for every format; Metal's side of
-/// each case runs
+/// bicubic sample whose sums it has not pinned to Metal's rule for every format
 #[test]
 fn cubic_samplers_sample_as_metals() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new();
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
     let kind = metal2vulkan_runtime::Degradation::BicubicFilterArithmetic;
     let pairs = [(2, 2), (2, 0), (2, 1), (0, 2), (1, 2), (0, 0), (1, 1)];
     let modes = [(0, 0), (2, 0), (3, 0), (4, 0), (5, 0), (5, 1), (5, 2)];
@@ -299,7 +280,6 @@ fn cubic_samplers_sample_as_metals() {
                 border_color: Some(border),
                 ..filtered(min, mag, address)
             };
-            let theirs = cubic_samples(&mp, &md, &desc, SAMPLE_ONLY);
             let case = format!("min {min} mag {mag} address {address} border {border}");
             if min == 2 || mag == 2 {
                 let site =
@@ -311,8 +291,7 @@ fn cubic_samplers_sample_as_metals() {
                 continue;
             }
             let ours = cubic_samples(&p, &d, &desc, SAMPLE_ONLY);
-            let differ = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-            assert_eq!(differ, 0, "{case}");
+            reims_vgpu_core::metal_check_raw!(case, ours);
         }
     }
     for compare in [1, 3, 7] {
@@ -320,7 +299,6 @@ fn cubic_samplers_sample_as_metals() {
             compare_function: Some(compare),
             ..filtered(2, 2, 0)
         };
-        cubic_samples(&mp, &md, &desc, SAMPLE_ONLY);
         let site = crate::answer::dies_of(kind, || cubic_samples(&p, &d, &desc, SAMPLE_ONLY));
         let case = format!("compare function {compare}");
         assert_eq!(
@@ -336,11 +314,10 @@ fn cubic_samplers_sample_as_metals() {
 ///
 /// This platform's draw dies naming `bicubic-filter-arithmetic` ([`crate::answer::DIES`]),
 /// which the runtime announces at every bicubic sample whose sums it has not pinned to Metal's
-/// rule for every format; Metal's side of each case runs
+/// rule for every format
 #[test]
 fn cubic_samplers_sample_in_a_fragment_function_as_metals() {
     use crate::gpu::ycbcr::measure::{drawn, float_texels, probe};
-    use reims_vgpu_metal::MetalPlatform;
     /// What `sample_fragment_float` reads of [`noise_texture`] through a sampler of `desc`.
     fn fragment_samples<P: reims_vgpu_core::platform::Platform>(
         p: &P,
@@ -357,16 +334,11 @@ fn cubic_samplers_sample_in_a_fragment_function_as_metals() {
             .collect()
     }
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new();
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
     for (address, border) in [(0, 0), (2, 0), (5, 2)] {
         let desc = SamplerDesc {
             border_color: Some(border),
             ..filtered(2, 2, address)
         };
-        fragment_samples(&mp, &md, &desc);
         let kind = metal2vulkan_runtime::Degradation::BicubicFilterArithmetic;
         let site = crate::answer::dies_of(kind, || fragment_samples(&p, &d, &desc));
         let case = format!("address {address} border {border}");
@@ -384,11 +356,10 @@ fn cubic_samplers_sample_in_a_fragment_function_as_metals() {
 ///
 /// This platform's dispatch dies naming `bicubic-filter-arithmetic` ([`crate::answer::DIES`]),
 /// which the runtime announces at every bicubic sample whose sums it has not pinned to Metal's
-/// rule for every format; Metal's side of each kernel runs
+/// rule for every format
 #[test]
 fn constexpr_bicubic_samplers_sample_as_metals() {
     use crate::gpu::ycbcr::measure::{float_texels, probe, probed_texels};
-    use reims_vgpu_metal::MetalPlatform;
     /// What `kernel` reads of [`noise_texture`] at the probe `at` over `grid`.
     fn constexpr_samples<P: reims_vgpu_core::platform::Platform>(
         p: &P,
@@ -403,17 +374,12 @@ fn constexpr_bicubic_samplers_sample_as_metals() {
             .collect()
     }
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new();
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
     let grid = ((16 + 8) * 3, (8 + 8) * 3);
     let at = probe((-4.0, -4.0), 1.0 / 3.0, grid, true, 0);
     for kernel in [
         "sample_constexpr_bicubic",
         "sample_constexpr_repeat_bicubic",
     ] {
-        constexpr_samples(&mp, &md, kernel, (grid, &at));
         let kind = metal2vulkan_runtime::Degradation::BicubicFilterArithmetic;
         let site = crate::answer::dies_of(kind, || constexpr_samples(&p, &d, kernel, (grid, &at)));
         assert_eq!(
@@ -432,10 +398,7 @@ fn constexpr_bicubic_samplers_sample_as_metals() {
 /// samples through alone ([`cubic_samplers_sample_as_metals`]). The sampler state is made
 #[test]
 fn cubic_samplers_the_runtime_refuses_die_where_they_sample() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new();
-    let md = MetalPlatform::system_default_device();
     let refused: [(&str, SamplerDesc, &str); 6] = [
         (
             "mip filter",
@@ -484,9 +447,6 @@ fn cubic_samplers_the_runtime_refuses_die_where_they_sample() {
             "{case}: {line}"
         );
         assert!(line.contains("SamplerBicubicFilter"), "{case}: {line}");
-        if let Some(md) = &md {
-            cubic_samples(&mp, md, &desc, kernel);
-        }
     }
 }
 
@@ -606,23 +566,15 @@ fn held_samples<P: reims_vgpu_core::platform::Platform>(
 /// filter's, not the argument buffer's
 #[test]
 fn a_cubic_sampler_in_an_argument_buffer_dies_where_its_failure_is_read() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new();
-    let md = MetalPlatform::system_default_device();
     let linear = filtered(1, 1, 0);
     let ours = held_samples(&p, &d, &linear, Held::Both);
-    if let Some(md) = &md {
-        assert_eq!(ours, held_samples(&mp, md, &linear, Held::Both), "linear");
-    }
+    reims_vgpu_core::metal_check_raw!("linear", ours);
     let cubic = filtered(2, 2, 0);
     let (sel, line) = death_line(|| held_samples(&p, &d, &cubic, Held::Both));
     assert_eq!(sel, "waitUntilCompleted", "{line}");
     let named = "a sample through a cubic sampler an argument buffer holds";
     assert!(line.contains(named), "{line}");
-    if let Some(md) = &md {
-        held_samples(&mp, md, &cubic, Held::Both);
-    }
 }
 
 /// While a cubic sampler state is alive on the device, one no argument buffer holds and no
@@ -632,19 +584,12 @@ fn a_cubic_sampler_in_an_argument_buffer_dies_where_its_failure_is_read() {
 /// is alive, the module's docs.)
 #[test]
 fn a_live_cubic_sampler_leaves_argument_buffer_samples_metals() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new();
-    let md = MetalPlatform::system_default_device();
     let linear = filtered(1, 1, 0);
     let cubic = d.new_sampler_state(&filtered(2, 2, 0)).unwrap().unwrap();
     let ours = held_samples(&p, &d, &linear, Held::Both);
     drop(cubic);
-    if let Some(md) = &md {
-        let cubic = md.new_sampler_state(&filtered(2, 2, 0)).unwrap().unwrap();
-        assert_eq!(ours, held_samples(&mp, md, &linear, Held::Both), "Metal");
-        drop(cubic);
-    }
+    reims_vgpu_core::metal_check_raw!("linear", ours);
 }
 
 /// What a draw over 16 by 8 `BGRA8Unorm` does on `p`'s device `d` whose fragment function
@@ -762,7 +707,6 @@ fn held_draw<P: reims_vgpu_core::platform::Platform>(
 /// state alone, completes as Metal's does
 #[test]
 fn a_cubic_state_made_before_a_fragment_stages_commit_is_relayed_unlisted() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
     let linear = filtered(1, 1, 0);
     assert_eq!(held_draw(&p, &d, &linear, false), (4, 0));
@@ -771,16 +715,6 @@ fn a_cubic_state_made_before_a_fragment_stages_commit_is_relayed_unlisted() {
     assert!(line.contains("unlisted-argument-sampler"), "{line}");
     let relayed = crate::answer::relaxed(|| held_draw(&p, &d, &linear, true));
     assert_eq!(relayed, (4, 0));
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new();
-        for cubic in [false, true] {
-            assert_eq!(
-                held_draw(&mp, &md, &linear, cubic),
-                (4, 0),
-                "Metal: {cubic}"
-            );
-        }
-    }
 }
 
 /// A pipeline state of a kernel that samples a texture slot's texture through a sampler an
@@ -790,10 +724,7 @@ fn a_cubic_state_made_before_a_fragment_stages_commit_is_relayed_unlisted() {
 /// of that shape reaches at its pipeline state
 #[test]
 fn a_texture_slot_sampled_through_an_argument_buffers_sampler_dies_where_it_is_made() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new();
-    let md = MetalPlatform::system_default_device();
     for (case, desc) in [("linear", filtered(1, 1, 0)), ("cubic", filtered(2, 2, 0))] {
         let (sel, line) = death_line(|| held_samples(&p, &d, &desc, Held::Sampler));
         assert_eq!(
@@ -801,9 +732,6 @@ fn a_texture_slot_sampled_through_an_argument_buffers_sampler_dies_where_it_is_m
             "{case}: {line}"
         );
         assert!(line.contains("ArgumentBufferTextures"), "{case}: {line}");
-        if let Some(md) = &md {
-            held_samples(&mp, md, &desc, Held::Sampler);
-        }
     }
 }
 
@@ -867,9 +795,7 @@ fn answers<P: reims_vgpu_core::platform::Platform>(
 /// Metal's answers are compared on the host
 #[test]
 fn refusals_metal_answers_are_its_nserror_codes() {
-    use reims_vgpu_metal::MetalPlatform;
     let d = dev();
-    let md = MetalPlatform::system_default_device();
     let refused: Pipelines<'_> = (
         &["k_cull", "k_depth_stencil", "k_draw"],
         &[
@@ -938,10 +864,6 @@ fn refusals_metal_answers_are_its_nserror_codes() {
         let ours = answers::<crate::platform::VulkanPlatform>(&d, library, pipelines);
         let codes: Vec<_> = ours.iter().map(|(_, a)| *a).collect();
         assert_eq!(codes, expected, "{ours:?}");
-        if let Some(md) = &md {
-            let metal = answers::<MetalPlatform>(md, library, pipelines);
-            assert_eq!(ours, metal);
-        }
     }
 }
 
@@ -1056,7 +978,6 @@ fn indirect_answers<P: reims_vgpu_core::platform::Platform>(
 /// compared on the host
 #[test]
 fn indirect_states_of_direct_arguments_are_metals_nserror() {
-    use reims_vgpu_metal::MetalPlatform;
     macro_rules! shader {
         ($name:literal) => {
             &include_bytes!(concat!(
@@ -1190,10 +1111,6 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     ];
     let answers: Vec<_> = ours.iter().map(|(_, a)| a.clone()).collect();
     assert_eq!(answers, expected, "{ours:?}");
-    let md = MetalPlatform::system_default_device();
-    if let Some(md) = &md {
-        assert_eq!(indirect_answers::<MetalPlatform>(md, &cases), ours);
-    }
     // Rasterization off, of a vertex function that returns a value: code 3, where Metal's
     // text names the fragment function's argument, the runtime's either refusal's.
     let unrasterized = IndirectValue {
@@ -1203,10 +1120,6 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     let case = ("fragment, rasterization off", unrasterized, fragment);
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), &[case]);
     assert!(matches!(ours[0].1, Err((3, _))), "{ours:?}");
-    if let Some(md) = &md {
-        let metal = indirect_answers::<MetalPlatform>(md, &[case]);
-        assert_eq!(metal[0].1, Err((3, vec![0])), "Metal");
-    }
     // Colour 0 `R8Unorm` under a mask of alpha alone, which holds none of its format's
     // channels: no colour is written, so the sample reaches none, and the state is made, as
     // Metal makes it.
@@ -1214,9 +1127,6 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     let case = ("fragment, R8Unorm of alpha", masked, fragment);
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), &[case]);
     assert_eq!(ours[0].1, Ok(()), "{ours:?}");
-    if let Some(md) = &md {
-        assert_eq!(indirect_answers::<MetalPlatform>(md, &[case]), ours);
-    }
     // The runtime's domain, as every pipeline `NSError` here carries.
     let d = dev();
     let library = d.new_library(sample_k).unwrap().unwrap().unwrap();
@@ -1244,7 +1154,6 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
 /// (`UnrasterizedVertexReturn`), with or without that support
 #[test]
 fn unrasterized_states_are_metals() {
-    use reims_vgpu_metal::MetalPlatform;
     macro_rules! shader {
         ($name:literal) => {
             &include_bytes!(concat!(
@@ -1297,9 +1206,6 @@ fn unrasterized_states_are_metals() {
     for ((name, _, _, expected), (_, answer)) in rows.iter().zip(&ours) {
         assert_eq!(answer, expected, "{name}");
     }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(indirect_answers::<MetalPlatform>(&md, &cases), ours);
-    }
 }
 
 /// A render state with rasterization on whose fragment function reads a `stage_in` input no
@@ -1308,7 +1214,6 @@ fn unrasterized_states_are_metals() {
 /// attachment, where the linking drops the read, the input reading zero
 #[test]
 fn an_input_no_vertex_output_writes_is_metals() {
-    use reims_vgpu_metal::MetalPlatform;
     macro_rules! shader {
         ($name:literal) => {
             &include_bytes!(concat!(
@@ -1342,9 +1247,6 @@ fn an_input_no_vertex_output_writes_is_metals() {
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), cases);
     let answers: Vec<_> = ours.iter().map(|(_, a)| a.clone()).collect();
     assert_eq!(answers, [Err((3, vec![])), Ok(())], "{ours:?}");
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(indirect_answers::<MetalPlatform>(&md, cases), ours);
-    }
 }
 
 /// A state that supports indirect command buffers whose function's reflection the compile layer
@@ -1401,33 +1303,20 @@ fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
 
 /// RenderBox's custom effect is Metal's: the fragment function that calls `custom_fn` links the
 /// function made under that specialized name and reads, at every pixel, the bits Metal's reads;
-/// with the function made under its own name or another, the pipeline is refused on both. (What
-/// each function answers as its name is Metal's too: the Metal platform's
-/// `a_specialized_name_resolves_a_kernel_s_call`.)
+/// with the function made under its own name or another, the pipeline is refused on both. What
+/// each function answers as its name is Metal's too (measured on the M3 Max, macOS 27.0.1)
 #[test]
 fn a_function_linked_under_a_specialized_name_is_metals() {
-    use reims_vgpu_metal::MetalPlatform;
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new();
     let (p, d) = (crate::platform::tests::platform(), dev());
     let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
     let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));
-    let metal_library = |bytes| md.new_library(bytes).unwrap().unwrap().unwrap();
-    let (metal_caller, metal_callee) = (metal_library(LINKED_CALLER), metal_library(LINKED_CALLEE));
     for specialized in [Some("custom_fn"), None, Some("other_fn")] {
+        let key = format!("{specialized:?}");
         let ours = gradient::<VulkanPlatform>(&callee, specialized).unwrap();
-        let metals = gradient::<MetalPlatform>(&metal_callee, specialized).unwrap();
         assert_eq!(ours.name(), specialized.unwrap_or("linked_gradient"));
-        let want = custom_effect(&mp, &md, &metal_caller, &metals);
-        assert_eq!(
-            want.is_some(),
-            specialized == Some("custom_fn"),
-            "{specialized:?}"
-        );
         let drawn = catch_death(|| custom_effect(&p, &d, &caller, &ours));
-        assert_eq!(drawn, Ok(want), "{specialized:?}");
+        let drawn = drawn.unwrap_or_else(|site| panic!("{specialized:?}: died at {site:?}"));
+        reims_vgpu_core::metal_check!(key, drawn);
     }
 }
 
@@ -1590,14 +1479,9 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
 /// was made compiled to a binary, and code 2 where it was not
 #[test]
 fn unresolved_visible_calls_are_metals() {
-    use reims_vgpu_metal::MetalPlatform;
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let metals = linked_answers::<MetalPlatform>(&md);
     let ours = linked_answers::<VulkanPlatform>(&dev());
-    assert_eq!(ours.len(), metals.len());
-    for ((case, ours), (_, metals)) in ours.into_iter().zip(metals) {
-        assert_eq!(ours, metals, "{case}");
+    assert_eq!(ours.len(), 13);
+    for (case, ours) in ours {
+        reims_vgpu_core::metal_check!(case, ours);
     }
 }

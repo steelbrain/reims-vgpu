@@ -128,17 +128,8 @@ fn measure<P: ApiPlatform>(name: &str) {
 }
 
 /// On the Vulkan platform: the runtime's completion thread, then its handler thread.
-#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU"]
 fn on_vulkan_handler_cost() {
     measure::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
-}
-
-/// On the Metal platform: Metal's handler thread, both handlers.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement, run by hand in a release build holding the GPU"]
-fn on_metal_handler_cost() {
-    measure::<reims_vgpu_metal::MetalPlatform>("metal");
 }

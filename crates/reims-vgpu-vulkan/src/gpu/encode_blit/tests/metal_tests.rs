@@ -185,7 +185,7 @@ fn pvrtc_copies_on<P: reims_vgpu_core::platform::Platform>(
 }
 
 /// A PVRTC texture's copies with MTLBlitOptionRowLinearPVRTC move its blocks row by row, as
-/// the Metal platform's do on this host, at the suite's shape ([`pvrtc_copy_texture`]), of a
+/// Metal's do on the M3 Max, at the suite's shape ([`pvrtc_copy_texture`]), of a
 /// shareable texture
 #[test]
 fn pvrtc_row_linear_copies_are_the_metal_platforms() {
@@ -193,13 +193,7 @@ fn pvrtc_row_linear_copies_are_the_metal_platforms() {
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
     let vulkan = pvrtc_copies_on::<VulkanPlatform>(&d, &vulkan_desc);
     assert_eq!(vulkan[0], (0..128).collect::<Vec<u8>>());
-    if let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
-        assert_eq!(
-            pvrtc_copies_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc),
-            vulkan
-        );
-    }
+    reims_vgpu_core::metal_check_raw!("copies", vulkan);
 }
 
 /// A texture of a PVRTC format is made by `newTextureWithDescriptor:`, as Metal makes one on
@@ -215,17 +209,7 @@ fn pvrtc_texture_takes_metals_size(t: &TextureDesc) {
         "{what}"
     );
     let ours = d.heap_texture_size_and_align(&desc).unwrap();
-    if let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-        let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(t);
-        let made = metal.new_texture(OnFault::Return, &desc).unwrap();
-        assert!(made.is_some(), "Metal's: {what}");
-        let theirs = metal.heap_texture_size_and_align(&desc).unwrap();
-        assert_eq!(
-            (ours.size, ours.align),
-            (theirs.size, theirs.align),
-            "{what}"
-        );
-    }
+    reims_vgpu_core::metal_check!(format!("{t:?}"), (ours.size, ours.align));
 }
 
 /// The PVRTC textures the row-linear copies are measured with ([`pvrtc_copy_texture`]), at the
@@ -349,19 +333,12 @@ fn two_plane_copies_on<P: reims_vgpu_core::platform::Platform>(
 fn two_plane_xr10_copies_are_the_metal_platforms() {
     let d = dev();
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal = reims_vgpu_metal::MetalPlatform::system_default_device();
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let (w, h) = TWO_PLANE_SIZE;
     for format in TWO_PLANE_XR10 {
         let vulkan = two_plane_copies_on::<VulkanPlatform>(&d, &vulkan_desc, format);
         assert_eq!(vulkan[0], noise(1, w * h * 4), "{format}");
-        if let Some(metal) = &metal {
-            assert_eq!(
-                two_plane_copies_on::<reims_vgpu_metal::MetalPlatform>(metal, &metal_desc, format),
-                vulkan,
-                "{format}"
-            );
-        }
+        let key = format!("{format}");
+        reims_vgpu_core::metal_check_raw!(key, vulkan);
     }
 }
 
@@ -616,20 +593,11 @@ fn two_plane_xr10_copies_of_any_region_are_the_metal_platforms() {
         let d = dev();
         let vulkan_desc =
             |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-        let metal = reims_vgpu_metal::MetalPlatform::system_default_device();
-        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
         for &shape in TWO_PLANE_COPIES {
             for formats in [(550, 550), (550, 551), (551, 550), (551, 551)] {
+                let key = format!("{shape:?} {formats:?}");
                 let ours = two_plane_copy_on::<VulkanPlatform>(&d, &vulkan_desc, formats, shape);
-                if let Some(metal) = &metal {
-                    let theirs = two_plane_copy_on::<reims_vgpu_metal::MetalPlatform>(
-                        metal,
-                        &metal_desc,
-                        formats,
-                        shape,
-                    );
-                    assert_eq!(ours, theirs, "{shape:?} {formats:?}");
-                }
+                reims_vgpu_core::metal_check_raw!(key, ours);
             }
         }
     });
@@ -666,8 +634,6 @@ fn two_plane_xr10_blits_are_the_metal_platforms() {
         let d = dev();
         let vulkan_desc =
             |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-        let metal = reims_vgpu_metal::MetalPlatform::system_default_device();
-        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
         for formats in [(550, 550), (550, 551), (551, 550), (551, 551)] {
             let whole = two_plane_blit_on::<VulkanPlatform>(&d, &vulkan_desc, formats, None);
             // Each texel's alpha half, from plane 1: the blit moved more than one value.
@@ -677,15 +643,8 @@ fn two_plane_xr10_blits_are_the_metal_platforms() {
             for region in [None, Some(((4, 2), (8, 4), (8, 3)))] {
                 let ours = two_plane_blit_on::<VulkanPlatform>(&d, &vulkan_desc, formats, region);
                 assert_eq!(region.is_none(), ours == whole, "{formats:?} {region:?}");
-                if let Some(metal) = &metal {
-                    let theirs = two_plane_blit_on::<reims_vgpu_metal::MetalPlatform>(
-                        metal,
-                        &metal_desc,
-                        formats,
-                        region,
-                    );
-                    assert_eq!(ours, theirs, "{formats:?} {region:?}");
-                }
+                let key = format!("{formats:?} {region:?}");
+                reims_vgpu_core::metal_check_raw!(key, ours);
             }
         }
     });
@@ -895,9 +854,7 @@ fn two_plane_copies_into_a_heap_are_the_metal_platforms() {
     let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
         let d = dev();
         let p = crate::platform::tests::platform();
-        let metal = reims_vgpu_metal::MetalPlatform::system_default_device();
         let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
-        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
         let shapes = [
             None,
             Some(((0, 0), (16, 2), (0, 6))),
@@ -912,16 +869,8 @@ fn two_plane_copies_into_a_heap_are_the_metal_platforms() {
                     region,
                     &[],
                 );
-                let Some(metal) = &metal else { continue };
-                let theirs = two_plane_copy_into_heap_on::<reims_vgpu_metal::MetalPlatform>(
-                    metal,
-                    &metal_desc,
-                    storage,
-                    region,
-                    &[],
-                );
-                let differ = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-                assert_eq!(differ, 0, "storage {storage} {region:?}");
+                let key = format!("storage {storage} {region:?}");
+                reims_vgpu_core::metal_check_raw!(key, ours);
             }
         }
     });
@@ -929,7 +878,7 @@ fn two_plane_copies_into_a_heap_are_the_metal_platforms() {
 }
 
 /// A copy into a texture of bytes past a no-copy buffer's length reads the caller's bytes
-/// there, the Metal platform's answer on this host; past another buffer's end it dies at its
+/// there, Metal's answer on the M3 Max; past another buffer's end it dies at its
 /// selector, where Metal copies bytes no one wrote
 #[test]
 fn copies_past_a_buffer() {
@@ -940,13 +889,6 @@ fn copies_past_a_buffer() {
         copied_past_a_no_copy_buffer_on::<VulkanPlatform>(&d, &vulkan_desc),
         page
     );
-    if let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-        let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
-        assert_eq!(
-            copied_past_a_no_copy_buffer_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc),
-            page
-        );
-    }
     let t = d
         .new_texture(OnFault::Return, &bgra(4, 4, 0))
         .unwrap()
@@ -1075,8 +1017,8 @@ fn multisampled_copies_on<P: reims_vgpu_core::platform::Platform>(
 }
 
 /// A copy from a buffer into a multisampled `Depth32Float` or `Stencil8` texture and back puts
-/// each unit in its own sample and returns the buffer bit for bit, as the Metal platform's does
-/// on this host, the texture cleared by a pass first or not, as a macOS 26 guest's screensaver
+/// each unit in its own sample and returns the buffer bit for bit, as Metal's does on the M3
+/// Max, the texture cleared by a pass first or not, as a macOS 26 guest's screensaver
 /// and HiDPI login window copy into a 4-sample `Depth32Float` texture of 54 by 54 and of 80
 /// by 80. The depths lie in `[0, 1]`, none with the sign bit set, where the runtime's sample-rate draw writes Metal's
 /// values; past them MoltenVK's draw changes them (`drawn-depth-copy`, relayed).
@@ -1087,8 +1029,6 @@ fn multisampled_copies_on<P: reims_vgpu_core::platform::Platform>(
 #[test]
 fn multisampled_depth_and_stencil_buffer_copies_are_the_metal_platforms() {
     let vulkan = crate::platform::tests::platform();
-    let metal = reims_vgpu_metal::MetalPlatform::system_default_device()
-        .map(|d| (reims_vgpu_metal::MetalPlatform::new(), d));
     let depths = |n: u64| -> Vec<u8> {
         (0..n)
             .flat_map(|i| ((i % 4096) as f32 / 4095.0).to_le_bytes())
@@ -1129,11 +1069,6 @@ fn multisampled_depth_and_stencil_buffer_copies_are_the_metal_platforms() {
                 true => format!("{name}, cleared first"),
                 false => format!("{name}, uncleared"),
             };
-            if let Some((mp, md)) = &metal
-                && multisampled_copies_on(mp, md, cleared, shape, &units) != units
-            {
-                differ.push(format!("{what}: Metal's copy did not return the buffer"));
-            }
             *crate::answer::LAST_LINE.lock() = None;
             let ours =
                 catch_death(|| multisampled_copies_on(&vulkan, &dev(), cleared, shape, &units));
@@ -1432,9 +1367,6 @@ fn fills_on<P: reims_vgpu_core::platform::Platform>(
 #[test]
 fn texture_fills_are_the_metal_platforms() {
     use reims_vgpu_core::platform::Platform as _;
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let rgba = [1.0, 0.5, 0.25, 1.0];
     let b = |level, slice, o, s, bytes: &[u8]| Fill::Bytes(level, slice, o, s, bytes.to_vec());
     let k = |level, slice, o, s, color, pf| Fill::Color(level, slice, o, s, color, pf);
@@ -1647,41 +1579,25 @@ fn texture_fills_are_the_metal_platforms() {
     plain_usage.usage = 1;
     cases.push(plain_usage);
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     for (i, c) in cases.iter().enumerate() {
         let ours = fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, c);
-        let theirs = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, c);
-        assert!(
-            ours == theirs,
-            "case {i}: ours {:02x?} Metal {:02x?}",
-            &ours[..ours.len().min(256)],
-            &theirs[..theirs.len().min(256)]
-        );
+        let key = format!("case {i}");
+        reims_vgpu_core::metal_check_bytes!(key, &ours);
     }
 }
 
-/// `cases` filled on this platform and on the Metal platform, read back: each case's bytes
-/// are Metal's. A case this platform dies at fails, naming the death's site and line.
+/// `cases` filled on this platform, read back: each case's bytes are Metal's, recorded on the M3
+/// Max. A case this platform dies at fails, naming the death's site and line.
 fn fills_are_metals(cases: &[Case]) {
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     for (i, c) in cases.iter().enumerate() {
         let what = format!("case {i}, format {}", c.format);
-        let theirs = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, c);
         let ours = catch_death(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, c))
             .unwrap_or_else(|site| {
                 let line = crate::answer::LAST_LINE.lock().clone();
                 panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
             });
-        assert!(
-            ours == theirs,
-            "{what}: ours {:02x?} Metal {:02x?}",
-            &ours[..ours.len().min(256)],
-            &theirs[..theirs.len().min(256)]
-        );
+        reims_vgpu_core::metal_check_bytes!(what, &ours);
     }
 }
 
@@ -1816,58 +1732,13 @@ fn bfloat_values() -> Vec<f64> {
     v
 }
 
-/// The least `f32` that a colour fill in `BGRA10_XR_sRGB` on `P` (Metal's) stores as each
-/// blue code from 1 to 1023, and the `f32` below each: bisected over the `f32`s from -2 to 2
-/// in their order, one fill of each code's middle `f32` a round, the code read from the
-/// texel's first 16-bit word's top 10 bits.
-fn xr_srgb_edges<P: reims_vgpu_core::platform::Platform>(
-    metal: &P::Device,
-    desc: &dyn Fn(&TextureDesc) -> P::TextureDescriptor,
-) -> Vec<f64> {
-    /// `v`'s place in the order of the `f32`s.
-    fn key(v: f32) -> u32 {
-        let b = v.to_bits();
-        if b >> 31 == 1 { !b } else { b | 0x8000_0000 }
-    }
-    /// The `f32` at place `k`.
-    fn value(k: u32) -> f32 {
-        f32::from_bits(if k & 0x8000_0000 == 0 {
-            !k
-        } else {
-            k & 0x7fff_ffff
-        })
-    }
-    let mut bounds = vec![(key(-2.0), key(2.0)); 1023];
-    while bounds.iter().any(|&(lo, hi)| hi - lo > 1) {
-        let mids: Vec<u32> = bounds.iter().map(|&(lo, hi)| lo + (hi - lo) / 2).collect();
-        let colours: Vec<[f64; 4]> = mids
-            .iter()
-            .map(|&m| [0.0, 0.0, f64::from(value(m)), 1.0])
-            .collect();
-        let bytes = packed_on::<P>(metal, desc, (553, 8), &colours);
-        for (code, ((lo, hi), (&mid, texel))) in
-            (1u16..).zip(bounds.iter_mut().zip(mids.iter().zip(bytes.chunks(8))))
-        {
-            if u16::from_le_bytes([texel[0], texel[1]]) >> 6 >= code {
-                *hi = mid;
-            } else {
-                *lo = mid;
-            }
-        }
-    }
-    bounds
-        .iter()
-        .flat_map(|&(lo, hi)| [f64::from(value(lo)), f64::from(value(hi))])
-        .collect()
-}
-
 /// A colour fill packed in a bfloat format (`R16Bfloat`, `RG16Bfloat`, `RGBA16Bfloat`), an
 /// extended-range `_sRGB` twin (`BGRA10_XR_sRGB`, `BGR10_XR_sRGB`) or an RGBX format (each of
 /// the 11), which the runtime's colour fill packs ([`fill::OWN_FORMAT_PACKED`]), writes Metal's
 /// bytes on this host, each colour into a texel of a texture of its format ([`packed_on`]),
 /// each value in each component ([`rotations`]): for bfloat, [`bfloat_values`]; for the
-/// twins, the least `f32` of each code and the one below it, as Metal stores them here
-/// ([`xr_srgb_edges`]), the `f64`s between the two ([`between`]), and NaNs, infinities,
+/// twins, the least `f32` of each code and the one below it, as Metal stores them here, the
+/// `f64`s between the two ([`between`]), and NaNs, infinities,
 /// signed zeroes and values past the ends; for `BGRA10_XR_sRGB`'s linear alpha, each value
 /// halfway between two of its codes, `(k + 0.5 - 384) / 510`, the `f32`s beside it and the
 /// `f64`s between them; for RGBX, [`rgbx_values`]. A colour of each bfloat format and twin
@@ -1878,13 +1749,14 @@ fn xr_srgb_edges<P: reims_vgpu_core::platform::Platform>(
 /// runtime repeats), and a bfloat or RGBX colour's are not compared
 #[test]
 fn colours_the_runtime_packs_are_the_metal_platforms() {
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let bfloats = rotations(&bfloat_values());
-    let mut edges = xr_srgb_edges::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc);
+    // Metal's edges, by their bits: the colours the rest fills.
+    let edge_key = "the XR sRGB edges' bits";
+    let edge_bits = reims_vgpu_core::metal_value!(edge_key);
+    let mut edges: Vec<f64> = (edge_bits.trim_matches(['[', ']']).split(", "))
+        .map(|b| f64::from_bits(b.parse().unwrap()))
+        .collect();
     let pairs: Vec<[f64; 2]> = edges.chunks(2).map(|p| [p[0], p[1]]).collect();
     edges.extend(
         pairs
@@ -1943,8 +1815,7 @@ fn colours_the_runtime_packs_are_the_metal_platforms() {
     let mut differ = Vec::new();
     for ((format, bpp), colours) in cases {
         let shape = (format, bpp);
-        let theirs =
-            packed_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, shape, colours);
+        let key = format!("{format}");
         let ours =
             catch_death(|| packed_on::<VulkanPlatform>(&dev(), &vulkan_desc, shape, colours))
                 .unwrap_or_else(|site| {
@@ -1954,15 +1825,11 @@ fn colours_the_runtime_packs_are_the_metal_platforms() {
                         site.file, site.kind
                     )
                 });
-        let texel = usize::try_from(bpp).unwrap();
-        let pairs = theirs.chunks(texel).zip(ours.chunks(texel));
-        for (colour, (m, o)) in colours.iter().zip(pairs) {
-            if m != o {
-                let bits = colour.map(f64::to_bits);
-                differ.push(format!(
-                    "{format} {bits:016x?}: ours {o:02x?} Metal {m:02x?}"
-                ));
-            }
+        // The colours' texels alone: past them lie texels no colour filled, whose bytes Metal's
+        // blit out of a texture it keeps compressed rewrites (553's), where the runtime keeps them.
+        let filled = colours.len() * usize::try_from(bpp).unwrap();
+        if !reims_vgpu_core::metal_matches_bytes!(key, &ours[..filled]) {
+            differ.push(format!("{format}: the bytes differ from Metal's"));
         }
     }
     let colour = [0.25, 0.5, 0.75, 1.0];
@@ -1975,11 +1842,6 @@ fn colours_the_runtime_packs_are_the_metal_platforms() {
     for (format, (target, bpp, name)) in crossed {
         let fill = Fill::Color(0, 0, [0, 0, 0], [1, 1, 1], colour, format);
         let case = read_case((target, bpp, [1, 1]), (2, [1, 1, 1], 1, 1), vec![fill]);
-        drop(fills_on::<reims_vgpu_metal::MetalPlatform>(
-            &metal,
-            &metal_desc,
-            &case,
-        ));
         *crate::answer::LAST_LINE.lock() = None;
         let into = format!("{format} into {name}");
         match catch_death(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, &case)) {
@@ -2458,11 +2320,7 @@ fn two_plane_heap_fill_on<P: reims_vgpu_core::platform::Platform>(
 fn two_plane_fills_in_a_heap_are_the_metal_platforms() {
     let d = dev();
     let p = crate::platform::tests::platform();
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let fills = [
         bytes_fill(0, 0, [0, 0, 0], [100, 100, 1], &[1, 2, 3]),
         bytes_fill(
@@ -2478,12 +2336,7 @@ fn two_plane_fills_in_a_heap_are_the_metal_platforms() {
         for format in [550, 551] {
             for size in [(16, 8), (6, 5)] {
                 let case = (storage, format, size);
-                let theirs = two_plane_heap_fill_on::<reims_vgpu_metal::MetalPlatform>(
-                    &metal,
-                    &metal_desc,
-                    case,
-                    &fills,
-                );
+                let key = format!("{case:?}");
                 let ours = catch_death(|| {
                     two_plane_heap_fill_on::<VulkanPlatform>(&d, &ours_desc, case, &fills)
                 })
@@ -2494,15 +2347,7 @@ fn two_plane_fills_in_a_heap_are_the_metal_platforms() {
                         site.file, site.kind
                     )
                 });
-                assert_eq!(ours.len(), theirs.len(), "{case:?}: the bytes read");
-                let differ: Vec<usize> =
-                    (0..ours.len()).filter(|&i| ours[i] != theirs[i]).collect();
-                assert!(
-                    differ.is_empty(),
-                    "{case:?}: {} bytes differ, from {:?}",
-                    differ.len(),
-                    differ.first()
-                );
+                reims_vgpu_core::metal_check_bytes!(key, &ours);
             }
         }
     }
@@ -2526,23 +2371,11 @@ fn two_plane_fills_in_a_heap_are_the_metal_platforms() {
 fn two_plane_fills_off_a_surface_keep_the_alpha_as_metals() {
     let d = dev();
     let p = crate::platform::tests::platform();
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let fills = [
         bytes_fill(0, 0, [1, 1, 0], [5, 3, 1], &(1..=8).collect::<Vec<u8>>()),
         color_fill((0, 0), ([8, 0, 0], [8, 8, 1]), [1.0, 0.5, 0.25, 1.0], 70),
     ];
-    let theirs = two_plane_copy_into_heap_on::<reims_vgpu_metal::MetalPlatform>(
-        &metal,
-        &metal_desc,
-        0,
-        None,
-        &fills,
-    );
-    assert!(!theirs.is_empty(), "the bytes Metal read");
     let site = crate::answer::dies_of(metal2vulkan_runtime::Degradation::DeviceNanEncoding, || {
         two_plane_copy_into_heap_on::<VulkanPlatform>(&d, &ours_desc, 0, None, &fills)
     });
@@ -2555,9 +2388,6 @@ fn two_plane_fills_off_a_surface_keep_the_alpha_as_metals() {
 fn pattern_fills_are_the_metal_platforms() {
     use reims_vgpu_core::platform::Platform;
     use reims_vgpu_core::platform::resource::Buffer as _;
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     fn on<P: Platform>(d: &P::Device) -> Vec<u8> {
         let length = 9 << 20;
         let b = d
@@ -2593,12 +2423,9 @@ fn pattern_fills_are_the_metal_platforms() {
         // SAFETY: the buffer's bytes, read after the GPU's writes completed.
         unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), length as usize) }.to_vec()
     }
-    let (ours, theirs) = (
-        on::<VulkanPlatform>(&dev()),
-        on::<reims_vgpu_metal::MetalPlatform>(&metal),
-    );
-    assert_eq!(&ours[..64], &theirs[..64]);
-    assert!(ours == theirs, "the long fill differs");
+    let ours = on::<VulkanPlatform>(&dev());
+    reims_vgpu_core::metal_check_bytes!("the first 64 bytes", &ours[..64]);
+    reims_vgpu_core::metal_check_bytes!("the fills", &ours);
 }
 
 /// The runtime's record of Metal's `generateMipmapsForTexture:` on an Apple M4:
@@ -2799,11 +2626,7 @@ fn mipmaps_on<P: reims_vgpu_core::platform::Platform>(
 /// Max's passes
 #[test]
 fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let designed = two_bit_chains()
         .into_iter()
         .map(|(format, extent, ties)| ((format, extent, 2), ties));
@@ -2821,28 +2644,19 @@ fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
             extent[0], extent[1]
         );
         let first = designed_first_level(extent, &ties, seed);
-        let theirs =
-            mipmaps_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, chain, 1, &first);
         let ours =
             catch_death(|| mipmaps_on::<VulkanPlatform>(&dev(), &vulkan_desc, chain, 1, &first))
                 .unwrap_or_else(|site| {
                     let line = crate::answer::LAST_LINE.lock().clone();
                     panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
                 });
-        for (level, (o, m)) in ours.iter().zip(&theirs).enumerate() {
-            let width = usize::try_from((extent[0] >> level).max(1)).unwrap();
-            let wrong = o
-                .chunks(4)
-                .zip(m.chunks(4))
-                .enumerate()
-                .filter(|(_, (a, b))| a != b);
-            let count = wrong.clone().count();
-            if let Some((i, (a, b))) = wrong.into_iter().next() {
+        for (level, o) in ours.iter().enumerate() {
+            if !reims_vgpu_core::metal_matches_bytes!(
+                format!("chain {seed}: {what} level {level}"),
+                o
+            ) {
                 differ.push(format!(
-                    "{what} level {level}: {count} texels differ, the first ({}, {}): ours \
-                     {a:02x?}, Metal {b:02x?}",
-                    i % width,
-                    i / width
+                    "{what} level {level}: the texels differ from Metal's"
                 ));
             }
         }
@@ -2851,20 +2665,18 @@ fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
         let alpha = |level: &[u8], [x, y]: [u64; 2]| {
             level[usize::try_from((y * width + x) * 4 + 3).unwrap()] >> 6
         };
-        for (platform, levels) in [("ours", &ours), ("Metal", &theirs)] {
-            let missed: Vec<_> = (ties.iter())
-                .filter(|&&(at, _, stored)| alpha(&levels[1], at) != stored)
-                .map(|&(at, codes, stored)| (at, codes, stored, alpha(&levels[1], at)))
-                .collect();
-            if !missed.is_empty() {
-                differ.push(format!(
-                    "{what}: {platform} stored another alpha than the M4 at {} of {} \
-                     designed texels, the first (position, taps, the M4's, stored): {:?}",
-                    missed.len(),
-                    ties.len(),
-                    missed[0]
-                ));
-            }
+        let missed: Vec<_> = (ties.iter())
+            .filter(|&&(at, _, stored)| alpha(&ours[1], at) != stored)
+            .map(|&(at, codes, stored)| (at, codes, stored, alpha(&ours[1], at)))
+            .collect();
+        if !missed.is_empty() {
+            differ.push(format!(
+                "{what}: ours stored another alpha than the M4 at {} of {} designed texels, the \
+                 first (position, taps, the M4's, stored): {:?}",
+                missed.len(),
+                ties.len(),
+                missed[0]
+            ));
         }
     }
     assert!(differ.is_empty(), "{differ:#?}");
@@ -2880,11 +2692,7 @@ fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
 /// usage too, 256 by 256, which Metal does not compress, whose passes the runtime knows for
 /// every format
 fn m3_max_chains(formats: &[u64]) -> Vec<String> {
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return Vec::new();
-    };
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let chains = [
         ([256, 256], 9),
         ([2048, 32], 12),
@@ -2907,13 +2715,6 @@ fn m3_max_chains(formats: &[u64]) -> Vec<String> {
                 extent[0], extent[1]
             );
             let first = noise(seed, extent[0] * extent[1] * 4);
-            let theirs = mipmaps_on::<reims_vgpu_metal::MetalPlatform>(
-                &metal,
-                &metal_desc,
-                chain,
-                usage,
-                &first,
-            );
             let ours = catch_death(|| {
                 mipmaps_on::<VulkanPlatform>(&dev(), &vulkan_desc, chain, usage, &first)
             })
@@ -2921,10 +2722,9 @@ fn m3_max_chains(formats: &[u64]) -> Vec<String> {
                 let line = crate::answer::LAST_LINE.lock().clone();
                 panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
             });
-            for (level, (o, m)) in ours.iter().zip(&theirs).enumerate() {
-                let wrong = o.chunks(4).zip(m.chunks(4)).filter(|(a, b)| a != b).count();
-                if wrong != 0 {
-                    differ.push(format!("{what} level {level}: {wrong} texels differ"));
+            for (level, o) in ours.iter().enumerate() {
+                if !reims_vgpu_core::metal_matches_bytes!(format!("{what} level {level}"), o) {
+                    differ.push(format!("{what} level {level}: the texels differ"));
                 }
             }
         }
@@ -2991,11 +2791,7 @@ fn canonical_extended_range(first: &mut [u8]) {
 /// `extended_range_blits` form
 #[test]
 fn extended_range_mipmaps_are_the_metal_platforms() {
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     crate::answer::RELAYED.lock().clear();
     let mut differ = Vec::new();
     let mut seed = 0x7872;
@@ -3011,13 +2807,8 @@ fn extended_range_mipmaps_are_the_metal_platforms() {
             if format == 552 {
                 canonical_extended_range(&mut first);
             }
-            let theirs = mipmaps_on::<reims_vgpu_metal::MetalPlatform>(
-                &metal,
-                &metal_desc,
-                chain,
-                1,
-                &first,
-            );
+            // Level 0 by its digest, compared exactly; the levels computed from it in full,
+            // compared within 2 codes.
             let ours = catch_death(|| {
                 mipmaps_on::<VulkanPlatform>(&dev(), &vulkan_desc, chain, 1, &first)
             })
@@ -3026,13 +2817,13 @@ fn extended_range_mipmaps_are_the_metal_platforms() {
                 panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
             });
             let step = usize::try_from(texel).unwrap();
-            if ours[0] != theirs[0] {
-                let n = (ours[0].chunks(step).zip(theirs[0].chunks(step)))
-                    .filter(|(a, b)| a != b)
-                    .count();
-                differ.push(format!("{what} level 0: {n} texels differ"));
+            if !reims_vgpu_core::metal_matches_bytes!(format!("{what} level 0"), &ours[0]) {
+                differ.push(format!("{what} level 0: the texels differ from Metal's"));
             }
-            for (level, (o, m)) in ours.iter().zip(&theirs).enumerate().skip(1) {
+            for (level, o) in ours.iter().enumerate().skip(1) {
+                let m = reims_vgpu_core::metal_full!(format!("{what} level {level}"));
+                let m = &m.unwrap_or_else(|| panic!("{what} level {level}: no bytes recorded"));
+                assert_eq!(o.len(), m.len(), "{what} level {level}");
                 let far = (o.chunks(step).zip(m.chunks(step)))
                     .map(|(a, b)| {
                         let (a, b) = (
@@ -3057,23 +2848,13 @@ fn extended_range_mipmaps_are_the_metal_platforms() {
 /// Each of `cases` read back as Metal's reads back ([`fills_on`]), Metal's bytes the same on a
 /// second run. Every case runs, and the ones that differ or die here are named together.
 fn each_fill_reads_back_as_metals(cases: &[Case]) {
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let mut differ = Vec::new();
     for (i, c) in cases.iter().enumerate() {
         let what = format!("case {i}, {} {:?}: {:?}", c.format, c.extent, c.fills);
-        let theirs = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, c);
-        let again = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, c);
-        assert_eq!(theirs, again, "{what}: Metal's bytes vary between runs");
         match catch_death(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, c)) {
-            Ok(ours) if ours == theirs => {}
-            Ok(ours) => {
-                let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-                differ.push(format!("{what}: {n} bytes differ"));
-            }
+            Ok(ours) if reims_vgpu_core::metal_matches_bytes!(what, &ours) => {}
+            Ok(_) => differ.push(format!("{what}: the bytes differ from Metal's")),
             Err(site) => {
                 let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
                 differ.push(format!("{what}: died at {}: {line}", site.file));
@@ -3135,11 +2916,7 @@ fn a_wide_two_plane_fill_relays_the_copy_into_its_rows() {
     const COPY_IN: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:\
                            sourceSize:toTexture:destinationSlice:destinationLevel:\
                            destinationOrigin:";
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let rgba = [1.0, 0.5, 0.25, 1.0];
     let case = |format, [w, h]: [u64; 2], fill| {
         read_case((format, 4, [1, 1]), (2, [w, h, 1], 1, 1), vec![fill])
@@ -3157,16 +2934,14 @@ fn a_wide_two_plane_fill_relays_the_copy_into_its_rows() {
         ),
     ] {
         let what = format!("{} {:?}: {:?}", c.format, c.extent, c.fills);
-        let theirs = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, &c);
-        let again = fills_on::<reims_vgpu_metal::MetalPlatform>(&metal, &metal_desc, &c);
-        assert_eq!(theirs, again, "{what}: Metal's bytes vary between runs");
         let site = catch_death(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, &c));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
         assert_eq!(site.map_err(|site| site.file), Err(COPY_IN), "{what}");
         let named = "(metal2vulkan-degrade-two-plane-buffer-blit)";
         assert!(line.contains(named), "{what}: {line}");
         let ours = crate::answer::relaxed(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, &c));
-        assert!(ours == theirs, "{what}: the bytes differ from Metal's");
+        let metals = reims_vgpu_core::metal_matches_bytes!(what, &ours);
+        assert!(metals, "{what}: the bytes differ from Metal's");
     }
     let relayed = crate::answer::relayed_counts();
     let kinds: Vec<_> = relayed.iter().map(|&(kind, _)| kind).collect();
@@ -3189,13 +2964,9 @@ fn a_wide_two_plane_fill_relays_the_copy_into_its_rows() {
 #[test]
 fn two_plane_heap_fills_of_more_levels_or_slices_are_metals() {
     const PLACED: &str = "newTextureWithDescriptor:offset:";
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let d = dev();
     let p = crate::platform::tests::platform();
     let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let eight: Vec<u8> = (1..=8).collect();
     let mut differ = Vec::new();
     for ((texture_type, levels, array), fill) in [
@@ -3225,20 +2996,6 @@ fn two_plane_heap_fills_of_more_levels_or_slices_are_metals() {
             "{texture_type} {levels} levels {array} slices: {:?}",
             fills[0]
         );
-        let on_metal = || {
-            two_plane_heap_texture_fill_on::<reims_vgpu_metal::MetalPlatform>(
-                &metal,
-                &metal_desc,
-                &shape,
-                &fills,
-            )
-        };
-        let theirs = on_metal();
-        assert_eq!(
-            theirs,
-            on_metal(),
-            "{what}: Metal's bytes vary between runs"
-        );
         let ours =
             || two_plane_heap_texture_fill_on::<VulkanPlatform>(&d, &ours_desc, &shape, &fills);
         *crate::answer::LAST_LINE.lock() = None;
@@ -3261,9 +3018,8 @@ fn two_plane_heap_fills_of_more_levels_or_slices_are_metals() {
                 continue;
             }
         };
-        if ours != theirs {
-            let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-            differ.push(format!("{what}: {n} bytes differ"));
+        if !reims_vgpu_core::metal_matches_bytes!(what, &ours) {
+            differ.push(format!("{what}: the bytes differ from Metal's"));
         }
     }
     assert!(
@@ -3413,43 +3169,19 @@ fn texture_buffer_fills_are_metals(cases: &[TextureBufferCase]) {
 /// ([`texture_buffer_fill_on`]); Metal's the same on a second run. Every case runs, and those
 /// that differ or die here are named together.
 fn texture_buffer_fills_of_width_are_metals(cases: &[TextureBufferCase], width: u64) {
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let d = dev();
     let p = crate::platform::tests::platform();
     let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let mut differ = Vec::new();
-    for ((format, bpp, offset), fills) in cases {
+    for (i, ((format, bpp, offset), fills)) in cases.iter().enumerate() {
         let what = format!("{format} at {offset}: {fills:?}");
         let what = what.get(..400).unwrap_or(&what);
+        let key = format!("width {width}, case {i}");
         let shape = (*format, *bpp, width, *offset);
-        let on_metal = || {
-            texture_buffer_fill_on::<reims_vgpu_metal::MetalPlatform>(
-                &metal,
-                &metal_desc,
-                shape,
-                fills,
-            )
-        };
-        let theirs = on_metal();
-        assert_eq!(
-            theirs,
-            on_metal(),
-            "{what}: Metal's bytes vary between runs"
-        );
         match catch_death(|| texture_buffer_fill_on::<VulkanPlatform>(&d, &ours_desc, shape, fills))
         {
-            Ok(ours) if ours == theirs => {}
-            Ok(ours) => {
-                let at: Vec<usize> = (0..ours.len()).filter(|&k| ours[k] != theirs[k]).collect();
-                differ.push(format!(
-                    "{what}: {} bytes differ, from {:#x}",
-                    at.len(),
-                    at[0]
-                ));
-            }
+            Ok(ours) if reims_vgpu_core::metal_matches_bytes!(key, &ours) => {}
+            Ok(_) => differ.push(format!("{what}: the bytes differ from Metal's")),
             Err(site) => {
                 let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
                 differ.push(format!("{what}: died at {}: {line}", site.file));
@@ -3742,13 +3474,9 @@ fn multisample_fills_on<P: reims_vgpu_core::platform::Platform>(
 /// each sample takes the pattern cut at the sample's bytes
 #[test]
 fn multisample_fills_are_the_metal_platforms() {
-    let Some(metal) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let d = dev();
     let p = crate::platform::tests::platform();
     let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
-    let metal_desc = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     let sixteen: Vec<u8> = (0xa1..=0xb0).collect();
     let three = [0xc1, 0xc2, 0xc3];
     let depths: Vec<u8> = [0.25f32, 0.5, 0.75, 1.0]
@@ -3810,33 +3538,12 @@ fn multisample_fills_are_the_metal_platforms() {
                 .collect(),
             _ => noise(0x6d5 + u32::try_from(i).unwrap(), n),
         };
-        let on_metal = || {
-            multisample_fills_on::<reims_vgpu_metal::MetalPlatform>(
-                &metal,
-                &metal_desc,
-                *shape,
-                &init,
-                fills,
-            )
-        };
-        let theirs = on_metal();
-        assert_eq!(
-            theirs,
-            on_metal(),
-            "{what}: Metal's bytes vary between runs"
-        );
+        let key = format!("case {i}");
         match catch_death(|| {
             multisample_fills_on::<VulkanPlatform>(&d, &ours_desc, *shape, &init, fills)
         }) {
-            Ok(ours) if ours == theirs => {}
-            Ok(ours) => {
-                let at: Vec<usize> = (0..ours.len()).filter(|&k| ours[k] != theirs[k]).collect();
-                differ.push(format!(
-                    "{what}: {} bytes differ, from {:#x}",
-                    at.len(),
-                    at[0]
-                ));
-            }
+            Ok(ours) if reims_vgpu_core::metal_matches_bytes!(key, &ours) => {}
+            Ok(_) => differ.push(format!("{what}: the bytes differ from Metal's")),
             Err(site) => {
                 let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
                 differ.push(format!("{what}: died at {}: {line}", site.file));

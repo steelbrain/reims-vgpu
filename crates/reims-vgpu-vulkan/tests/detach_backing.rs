@@ -1,9 +1,9 @@
 //! Detached buffers and heaps as core's isolated tasks make and use them
-//! (`resources/buffer/detach.rs`, `resources/heap/detach.rs`), on the Metal platform and on this
-//! crate's: a no-copy buffer over a temporary allocation and a heap over its address range,
-//! detached at once, then replaced by guest pages, scattered, read-only or not, detached and
-//! replaced again. Each platform's answers, the GPU address, the deallocator's runs, the bytes
-//! `contents` reads, and what the GPU reads and writes in the guest's pages, are the same: under a
+//! (`resources/buffer/detach.rs`, `resources/heap/detach.rs`), on this crate's platform: a
+//! no-copy buffer over a temporary allocation and a heap over its address range, detached at
+//! once, then replaced by guest pages, scattered, read-only or not, detached and replaced again.
+//! Its answers, the GPU address, the deallocator's runs, the bytes `contents` reads, and what the
+//! GPU reads and writes in the guest's pages, are Metal's: under a
 //! read-only replace the GPU's fill never reaches the pages, a copy later in its command buffer
 //! reads the fill, or the pages where the GPU's caches no longer hold it ([`cached_or_pages`]),
 //! and one in the next command buffer the pages. Measured on
@@ -38,7 +38,7 @@
 //! ([`never_replaced`]).
 
 #![cfg(target_os = "macos")]
-// Compares with Metal, which is macOS's.
+// Compares with Metal's answers, recorded on macOS.
 // Every platform object is `Send` and `Sync` (core's `Handle`, and `Obj`'s bound, which an
 // encoder's drop asks of `PredicatedEncoder`), and the proof walks the object's fields: an
 // encoder's command buffer, its predication, and the runtime objects that holds, 141 to 150
@@ -67,15 +67,14 @@ use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange, ResourceAddr
 use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
 use reims_vgpu_core::platform::{Handle, HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_metal::MetalPlatform;
-use reims_vgpu_metal::os::vm::MetalVm;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::os::OsVm;
 
 const PAGE: u64 = 0x4000;
 
 /// Fresh pages of the host, each byte `byte`.
 fn pages(count: u64, byte: u8) -> HostPtr {
-    let at = MetalVm::new().allocate_anywhere(count * PAGE).unwrap();
+    let at = OsVm::new().allocate_anywhere(count * PAGE).unwrap();
     // SAFETY: the pages were just allocated, readable and writable.
     unsafe {
         std::ptr::write_bytes(
@@ -205,7 +204,7 @@ fn buffer_life<P: Platform>(p: &P, dev: &P::Device) -> Steps {
             no_copy: true,
             deallocator: Some(Box::new(move |at, length| {
                 let _ = ran.send(at == dummy);
-                let _ = MetalVm::new().deallocate(at, length);
+                let _ = OsVm::new().deallocate(at, length);
             })),
         })
         .unwrap()
@@ -332,7 +331,7 @@ fn buffer_life<P: Platform>(p: &P, dev: &P::Device) -> Steps {
 fn heap_life<P: Platform>(p: &P, dev: &P::Device) -> Steps {
     let mut steps: Steps = Vec::new();
     let size = 2 * PAGE;
-    let vm = MetalVm::new();
+    let vm = OsVm::new();
     let dummy = pages(2, 0);
     let array = p.new_address_range_array(&[range(dummy, 0, size)]).unwrap();
     let made = dev
@@ -488,7 +487,7 @@ fn detached_buffer<P: Platform>(dev: &P::Device, count: u64) -> P::Buffer {
             contents: Some(contents),
             no_copy: true,
             deallocator: Some(Box::new(|at, length| {
-                let _ = MetalVm::new().deallocate(at, length);
+                let _ = OsVm::new().deallocate(at, length);
             })),
         })
         .unwrap()
@@ -1000,7 +999,7 @@ fn expected_placed() -> Steps {
 
 /// Frees `length` bytes of the test's pages at `at`.
 fn vm_free(at: HostPtr, length: u64) -> bool {
-    MetalVm::new().deallocate(at, length).is_success()
+    OsVm::new().deallocate(at, length).is_success()
 }
 
 /// What both platforms do in [`detached_use`].
@@ -1059,19 +1058,6 @@ fn expected() -> Vec<Steps> {
             ("a buffer of length 0, its deallocator's runs", vec![0, 0]),
         ],
     ]
-}
-
-#[test]
-fn detached_buffers_and_heaps_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    let seen = vec![buffer_life(&p, &dev), heap_life(&p, &dev), edges(&p, &dev)];
-    assert_eq!(seen, expected());
-    assert_eq!(detached_use(&p, &dev), expected_use());
-    assert_eq!(placed_detach(&p, &dev), expected_placed());
-    assert_eq!(detached_reach(&p, &dev), expected_reach());
 }
 
 #[test]
@@ -1172,16 +1158,6 @@ fn expected_behind_a_wait() -> [Vec<u64>; 5] {
         vec![5, 8, 0x01, 0x03],
         vec![5, 8, 0x01, 0x5c],
     ]
-}
-
-#[test]
-fn behind_a_wait_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    let seen = BEHIND_A_WAIT.map(|case| behind_a_wait(&p, &dev, case));
-    assert_eq!(seen, expected_behind_a_wait());
 }
 
 /// The case of [`BEHIND_A_WAIT`] a child copy of this test binary runs.
@@ -1301,21 +1277,6 @@ fn dispatch_behind_a_wait<P: Platform>(p: &P, dev: &P::Device, warm: bool) -> Ve
 /// 27.0.1): the dispatch runs over the new pages, the command buffer completing with no error.
 const DISPATCH_BEHIND_A_WAIT: [u64; 4] = [4, 0, 0, SPUN as u64];
 
-#[test]
-fn a_dispatch_behind_a_wait_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    for warm in [false, true] {
-        assert_eq!(
-            dispatch_behind_a_wait(&p, &dev, warm),
-            DISPATCH_BEHIND_A_WAIT,
-            "warm {warm}"
-        );
-    }
-}
-
 /// This crate in [`dispatch_behind_a_wait`], cold and warm, each in a child copy of this test
 /// binary under strict mode (`REIMS_VGPU_STRICT=1`), where a death ends the process as in
 /// production, on whatever thread it comes: each answers Metal's, and nothing dies. The rebind
@@ -1367,7 +1328,7 @@ fn a_dispatch_behind_a_wait_on_vulkan() {
 /// Two fresh pages of the host after `case`: 0 leaves them readable and writable, 1 takes all
 /// access from the second, 2 from both, 3 unmaps the second, 4 leaves both read-only.
 fn pages_after(case: u8) -> HostPtr {
-    let vm = MetalVm::new();
+    let vm = OsVm::new();
     let at = pages(2, 0x5a);
     let second = at.wrapping_add(PAGE);
     match case {
@@ -1394,7 +1355,7 @@ fn heap_options(read_only: bool) -> Vec<OptionSet> {
 /// heap's memory by them, read-only or not; 1 for each made, by case.
 fn without_access<P: Platform>(p: &P, dev: &P::Device) -> Steps {
     let cases = [0, 1, 2, 3, 4];
-    let vm = MetalVm::new();
+    let vm = OsVm::new();
     let mut steps: Steps = Vec::new();
     for read_only in [false, true] {
         let heaps = cases.map(|case| {
@@ -1485,7 +1446,7 @@ fn without_access<P: Platform>(p: &P, dev: &P::Device) -> Steps {
     steps
 }
 
-/// What the Metal platform makes over pages without access, measured on
+/// What Metal makes over pages without access, measured on
 /// `AppleM3Max-40c-25G229`: nothing over a page mapped without access or unmapped, as over
 /// read-only pages what it makes over readable and writable ones.
 fn expected_without_access() -> Steps {
@@ -1504,7 +1465,7 @@ fn expected_without_access() -> Steps {
 /// of a page each, with the second readable and writable, without access, and unmapped (its
 /// cases 0, 1 and 3), and a first range followed by a NULL one; 1 for each made.
 fn past_the_size<P: Platform>(p: &P, dev: &P::Device) -> Steps {
-    let vm = MetalVm::new();
+    let vm = OsVm::new();
     let mut steps: Steps = Vec::new();
     for read_only in [false, true] {
         let mut made = Vec::new();
@@ -1560,7 +1521,7 @@ fn heap_over<P: Platform>(
     u64::from(made.heap.is_some())
 }
 
-/// What the Metal platform makes past a heap's size, measured on `AppleM3Max-40c-25G229`: as
+/// What Metal makes past a heap's size, measured on `AppleM3Max-40c-25G229`: as
 /// within it, nothing where a page of the ranges past it is mapped without access or unmapped,
 /// in one range or a range of its own, and nothing after a NULL range.
 fn expected_past_the_size() -> Steps {
@@ -1568,15 +1529,6 @@ fn expected_past_the_size() -> Steps {
         ("heaps past the size", vec![1, 0, 0, 1, 0, 0, 0]),
         ("read-only heaps past the size", vec![1, 0, 0, 1, 0, 0, 0]),
     ]
-}
-
-#[test]
-fn pages_past_the_size_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    assert_eq!(past_the_size(&p, &dev), expected_past_the_size());
 }
 
 /// This crate in [`past_the_size`], in a child copy of this test binary under strict mode
@@ -1614,15 +1566,6 @@ fn pages_past_the_size_on_vulkan() {
     assert!(out.status.success() && death.is_none(), "{out:?}");
     let metal = expected_past_the_size();
     assert!(stdout.contains(&format!("made {metal:?}")), "{stdout}");
-}
-
-#[test]
-fn pages_without_access_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    assert_eq!(without_access(&p, &dev), expected_without_access());
 }
 
 /// This crate in [`without_access`], in a child copy of this test binary under strict mode
@@ -1821,20 +1764,12 @@ fn unaligned<P: Platform>(p: &P, dev: &P::Device, index: usize, heap: bool) -> S
 fn unaligned_ranges_on_vulkan_are_metals() {
     use reims_vgpu_core::raise::death::DeathKind;
     use reims_vgpu_core::testkit::capture::catch_death;
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new();
     let cases: Vec<(usize, bool)> = (0..UNALIGNED)
         .flat_map(|index| [(index, true), (index, false)])
         .collect();
-    let theirs: Vec<Steps> = cases
-        .iter()
-        .map(|&(index, heap)| unaligned(&mp, &md, index, heap))
-        .collect();
     let dev = VulkanPlatform::system_default_device().unwrap();
     let p = VulkanPlatform::new();
-    for (&(index, heap), theirs) in cases.iter().zip(&theirs) {
+    for &(index, heap) in &cases {
         let (case, sel) = match heap {
             true => (format!("heap {index}"), "newHeapWithDescriptor:"),
             false => (
@@ -1843,27 +1778,12 @@ fn unaligned_ranges_on_vulkan_are_metals() {
             ),
         };
         if index < 2 {
-            let first = |name: &str| {
-                theirs
-                    .iter()
-                    .find(|(step, _)| *step == name)
-                    .map(|(_, words)| words[0])
-            };
-            let start = 0x8000_0000 | [0x40, 0x1000][index];
-            assert_eq!(
-                (first("contents"), first("the GPU read")),
-                (Some(start), Some(0x8000_0000)),
-                "Metal {case}: {theirs:x?}"
-            );
             let site = catch_death(|| unaligned(&p, &dev, index, heap)).unwrap_err();
             assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{case}");
             continue;
         }
         let ours = unaligned(&p, &dev, index, heap);
-        assert!(
-            ours == *theirs,
-            "{case}:\nours  {ours:x?}\nMetal {theirs:x?}"
-        );
+        reims_vgpu_core::metal_check!(&case, ours);
     }
 }
 
@@ -2037,9 +1957,8 @@ fn in_flight<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> Steps {
 /// after the kernel in its command buffer (9 of 80), the command buffer held in flight past the
 /// detach by an event wait after the kernel (8 of 150, and 1 of 150 where the work behind the
 /// wait uses the buffer too), and a second queue's command buffer using the buffer (5 of 60)
-/// each left both answers. [`detached_in_flight_on_metal`] compares the rest of the buffer's
-/// steps and not that answer ([`answer_not_compared`]). This crate's NO, with the replace's NO
-/// after it, is one of Metal's two answers, and [`detached_in_flight_on_vulkan`] compares it.
+/// each left both answers. This crate's NO, with the replace's NO after it, is one of Metal's two
+/// answers, and [`detached_in_flight_on_vulkan`] compares it.
 fn expected_in_flight() -> [Steps; 2] {
     let completed = (
         "completed: status, error, the kernel's write",
@@ -2058,36 +1977,6 @@ fn expected_in_flight() -> [Steps; 2] {
             after,
         ],
     ]
-}
-
-/// `steps` of [`in_flight`] without the answer of the replace after the detach in flight, which
-/// Metal does not decide for a buffer ([`expected_in_flight`]): whether the kernel had ended as
-/// the detach returned stays.
-fn answer_not_compared(mut steps: Steps) -> Steps {
-    let (name, words) = &mut steps[0];
-    assert_eq!(*name, "detached in flight: ended, replaced");
-    *name = "detached in flight: ended";
-    words.truncate(1);
-    steps
-}
-
-/// [`in_flight`] on Metal, a heap and a buffer, the buffer's answer in flight not compared
-/// ([`answer_not_compared`]): run alone, as other GPU work (a fault's recovery) changes when
-/// Metal's command buffers complete
-#[test]
-fn detached_in_flight_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    let [heap, buffer] = [true, false].map(|heap| in_flight(&p, &dev, heap));
-    let [heap_expected, buffer_expected] = expected_in_flight();
-    assert_eq!(heap, heap_expected, "heap");
-    assert_eq!(
-        answer_not_compared(buffer),
-        answer_not_compared(buffer_expected),
-        "buffer"
-    );
 }
 
 /// [`in_flight`] on this crate, as on Metal ([`expected_in_flight`]): a detach answers NO while a
@@ -2274,8 +2163,6 @@ const COMPLETING: [Failing; 2] = [Failing::Not, Failing::NotSplit];
 /// to 40 in 40 per batch with the host's load, and 197 of 200 on macOS 26.7; made 20 µs or more
 /// into the handler, YES in all 684, 104 of them 20 ms in; every NO detached when made again,
 /// within 101 µs). Once the use retired, a detach detaches; the fill landed in the guest's pages.
-/// [`detached_in_a_completed_handler_on_metal`] compares the answer made once the use retired,
-/// and the rest, but not the answer made at once ([`handler_answer_not_compared`]).
 fn expected_in_a_completed_handler(replaced: u64) -> Steps {
     vec![
         (
@@ -2308,8 +2195,6 @@ const FAILING: [Failing; 5] = [
 /// one that completed answered NO in 248 of 800 the same day, [`expected_in_a_completed_handler`]);
 /// the handler sees status `Error` and the failure's code; once the use retired, a detach
 /// detaches; the fill landed in the guest's pages where its encoder ran.
-/// [`detached_in_a_failed_completed_handler_on_metal`] compares the rest, and not the answer in
-/// the handler ([`handler_answer_not_compared`]).
 fn expected_in_a_failed_completed_handler(failing: Failing) -> Steps {
     let (code, filled) = match failing {
         Failing::Fill(0x10) => (1, 0),
@@ -2327,49 +2212,6 @@ fn expected_in_a_failed_completed_handler(failing: Failing) -> Steps {
         ("detached once it completed: replaced", vec![1]),
         ("the fill in the guest's pages", vec![filled]),
     ]
-}
-
-/// `steps` of [`in_a_completed_handler`] without the answer of the replace after the detach in
-/// the handler, which Metal does not decide where it is made at once
-/// ([`expected_in_a_completed_handler`], [`expected_in_a_failed_completed_handler`]): the status
-/// and error the handler sees stay.
-fn handler_answer_not_compared(mut steps: Steps) -> Steps {
-    let (name, words) = &mut steps[0];
-    assert_eq!(
-        *name,
-        "detached in its completed handler: replaced, status, error"
-    );
-    *name = "detached in its completed handler: status, error";
-    words.remove(0);
-    steps
-}
-
-/// [`in_a_completed_handler`] on Metal where its command buffer completes, each way of
-/// [`COMPLETING`], a heap and a buffer: the detach in the handler made at once, its answer not
-/// compared ([`handler_answer_not_compared`]), and made once the use retired, which detaches
-/// ([`expected_in_a_completed_handler`])
-#[test]
-fn detached_in_a_completed_handler_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    for failing in COMPLETING {
-        for heap in [true, false] {
-            let seen = in_a_completed_handler(&p, &dev, heap, failing, false);
-            assert_eq!(
-                handler_answer_not_compared(seen),
-                handler_answer_not_compared(expected_in_a_completed_handler(1)),
-                "{failing:?}, heap {heap}"
-            );
-            let seen = in_a_completed_handler(&p, &dev, heap, failing, true);
-            assert_eq!(
-                seen,
-                expected_in_a_completed_handler(1),
-                "{failing:?}, heap {heap}, once the use retired"
-            );
-        }
-    }
 }
 
 /// [`in_a_completed_handler`] on this crate where its command buffer completes, each way of
@@ -2394,26 +2236,6 @@ fn detached_in_a_completed_handler_on_vulkan() {
                     "{failing:?}, heap {heap}, retired {retired}"
                 );
             }
-        }
-    }
-}
-
-/// [`in_a_completed_handler`] on Metal where its command buffer fails, each way of [`FAILING`],
-/// a heap and a buffer, the answer in the handler not compared ([`handler_answer_not_compared`])
-#[test]
-fn detached_in_a_failed_completed_handler_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    for failing in FAILING {
-        for heap in [true, false] {
-            let seen = in_a_completed_handler(&p, &dev, heap, failing, false);
-            assert_eq!(
-                handler_answer_not_compared(seen),
-                handler_answer_not_compared(expected_in_a_failed_completed_handler(failing)),
-                "{failing:?}, heap {heap}"
-            );
         }
     }
 }
@@ -2519,21 +2341,6 @@ fn expected_held() -> Steps {
 /// The cases of [`held`]: a heap or a buffer, the holder's encoder open or ended.
 const HELD: [(bool, bool); 4] = [(false, false), (false, true), (true, false), (true, true)];
 
-#[test]
-fn detached_while_held_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    for (heap, open) in HELD {
-        assert_eq!(
-            held(&p, &dev, heap, open),
-            expected_held(),
-            "heap {heap}, open {open}"
-        );
-    }
-}
-
 /// [`held`] on this crate, as on Metal ([`expected_held`]): the runtime's detach detaches the
 /// object while a command buffer not yet committed used it, which fails as it is submitted, and
 /// leaves it in no memory, which an unnamed reach reads as 0 (`src/gpu/backing.rs`'s docs)
@@ -2595,7 +2402,7 @@ fn never_replaced<P: Platform>(p: &P, dev: &P::Device, heap: bool) -> Steps {
                 no_copy: true,
                 deallocator: Some(Box::new(move |at, length| {
                     let _ = ran.send(at == dummy);
-                    let _ = MetalVm::new().deallocate(at, length);
+                    let _ = OsVm::new().deallocate(at, length);
                 })),
             })
             .unwrap()
@@ -2653,21 +2460,6 @@ fn expected_never_replaced(heap: bool) -> Steps {
         steps.push(("the deallocator ran once it went", vec![1]));
     }
     steps
-}
-
-#[test]
-fn never_replaced_on_metal() {
-    let Some(dev) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let p = MetalPlatform::new();
-    for heap in [false, true] {
-        assert_eq!(
-            never_replaced(&p, &dev, heap),
-            expected_never_replaced(heap),
-            "heap {heap}"
-        );
-    }
 }
 
 /// [`never_replaced`] on this crate, as on Metal: the runtime's detach leaves the object in no

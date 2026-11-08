@@ -15,7 +15,7 @@ fn level(format: u64, width: u64, height: u64) -> TextureLevelQuery {
     }
 }
 
-/// A level's layout is the Metal platform's on this host, word for word: for every value from
+/// A level's layout is Metal's on the M3 Max, word for word: for every value from
 /// 0 to 2047 and past 2^32, as core asks it, at every pair of [`EXTENTS`] (whose block counts
 /// and bytes wrap at 2^62 + 3 and `u64::MAX` as Metal's do); and for every format the runtime
 /// has, at queries core never makes, of other depths and array lengths (2^32 + 5, and
@@ -25,7 +25,6 @@ fn level(format: u64, width: u64, height: u64) -> TextureLevelQuery {
 #[test]
 fn levels_are_the_metal_platforms_here() {
     use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_metal::MetalPlatform;
 
     use crate::gpu::device::tests::dev;
 
@@ -40,31 +39,32 @@ fn levels_are_the_metal_platforms_here() {
         (zero.field_0, zero.aligned_height, zero.bytes_per_row),
         (1, 1, 4)
     );
-    let Some(metal) = MetalPlatform::system_default_device() else {
-        return;
-    };
     let values = (0..2048).chain([9999, u64::from(u32::MAX) + 70, (1 << 32) + 80]);
     let mut differ = Vec::new();
-    let mut compare = |q: TextureLevelQuery| {
-        let (ours, theirs) = (d.texture_level_info(&q), metal.texture_level_info(&q));
-        if ours != theirs {
-            differ.push(format!("{q:?}: ours {ours:?}, Metal's {theirs:?}"));
+    // A format's levels, ours checked against Metal's, recorded a format at a time.
+    let mut compare = |key: String, queries: Vec<TextureLevelQuery>| {
+        let ours: Vec<_> = queries.iter().map(|q| d.texture_level_info(q)).collect();
+        if !reims_vgpu_core::metal_matches_raw!(key, ours) {
+            differ.push(format!("{key}: ours differ from Metal's"));
         }
     };
     for format in values {
+        let mut queries = Vec::new();
         for width in EXTENTS {
             for height in EXTENTS {
-                compare(level(format, width, height));
+                queries.push(level(format, width, height));
             }
         }
+        compare(format!("format {format}"), queries);
     }
     for pf in PixelFormat::ALL {
+        let mut queries = Vec::new();
         for (width, height) in [(17, 9), (1000, 7)] {
             for depth in [1, 3, (1 << 32) + 5, (1 << 62) + 3] {
                 for array_length in [0, 1, 6, (1 << 32) + 5, (1 << 62) + 3] {
                     for options in [0, 1, 5, 63, 64, 1000, 1 << 32] {
                         for flags in [0, 1, 2, 3, 7, 1 << 31, u64::MAX] {
-                            compare(TextureLevelQuery {
+                            queries.push(TextureLevelQuery {
                                 pixel_format: u64::from(pf.as_raw()),
                                 width,
                                 height,
@@ -78,6 +78,7 @@ fn levels_are_the_metal_platforms_here() {
                 }
             }
         }
+        compare(format!("{pf:?} at other queries"), queries);
     }
     assert!(
         differ.is_empty(),
@@ -87,14 +88,13 @@ fn levels_are_the_metal_platforms_here() {
     );
 }
 
-/// Every format's description, and those of values no format is, are the Metal platform's on
-/// this host, field for field, at every value from 0 to 2047 and past 2^32 (2^32 + 80 among
+/// Every format's description, and those of values no format is, are Metal's on the M3 Max,
+/// field for field, at every value from 0 to 2047 and past 2^32 (2^32 + 80 among
 /// them, which Metal would answer as BGRA8Unorm if it read the value's low 32 bits alone), as
 /// the device answers them; a format is named as the runtime names it
 #[test]
 fn descriptions_are_the_metal_platforms_here() {
     use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_metal::MetalPlatform;
 
     use crate::gpu::device::tests::dev;
 
@@ -118,15 +118,9 @@ fn descriptions_are_the_metal_platforms_here() {
             assert_eq!(info.name.as_deref(), Some(pf.name()), "{pf:?}");
         }
     }
-    let Some(metal) = MetalPlatform::system_default_device() else {
-        return;
-    };
     let values = (0..2048).chain([9999, u64::from(u32::MAX) + 70, (1 << 32) + 80]);
     for format in values {
-        assert_eq!(
-            d.pixel_format_info(format),
-            metal.pixel_format_info(format),
-            "format {format}"
-        );
+        let key = format!("format {format}");
+        reims_vgpu_core::metal_check!(key, d.pixel_format_info(format));
     }
 }

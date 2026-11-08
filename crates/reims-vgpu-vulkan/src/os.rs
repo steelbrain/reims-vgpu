@@ -2,7 +2,8 @@
 //! facade (`OsClock`, `OsThreads`, `OsVm`, `OsSurface`, `OsSurfaces`), and what this platform
 //! reads of a surface beyond core's trait, written against it (`surface.rs`).
 //!
-//! - **macOS** (`os/macos.rs`): the metal crate's services, as they are, and IOSurface itself.
+//! - **macOS** (`os/macos.rs`): the system's threads, clocks, Mach VM, autorelease pool and
+//!   IOSurface, and the Objective-C message layer the window's AppKit side sends through (`msg`).
 //! - **Linux** (`os/linux.rs`): the clocks (`CLOCK_BOOTTIME`, `CLOCK_REALTIME`), threads, a host
 //!   VM over `mmap` that makes views of the guest's pages by mapping their files (the backing
 //!   table), and IOSurface's stand-in over that memory.
@@ -57,6 +58,10 @@ pub(crate) use host_os::{PAGE, mapped, writable};
 pub(crate) use host_os::{copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::MATRIX_KEY;
+/// The Objective-C message layer the window's AppKit side sends through, on macOS
+/// (`os/macos/msg.rs`).
+#[cfg(target_os = "macos")]
+pub use macos::msg;
 /// Runs a test's calls with their imports refused, so the runtime copies the pages, on macOS
 /// (`os/macos.rs`).
 #[cfg(all(test, target_os = "macos"))]

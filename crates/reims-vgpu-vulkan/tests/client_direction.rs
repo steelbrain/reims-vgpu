@@ -21,7 +21,7 @@
 //! dies at the call.
 
 #![cfg(target_os = "macos")]
-// Compares with Metal, which is macOS's.
+// Checks against Metal's answers, measured on macOS.
 // The proof that a command buffer's result is well-formed walks the runtime's types for `Send` and
 // `Sync`, deeper than rustc's default limit of 128, as in the library (`src/lib.rs`).
 #![recursion_limit = "256"]
@@ -50,10 +50,9 @@ use reims_vgpu_core::platform::values::{ColorAttachmentSet, RenderPipelineDesc, 
 use reims_vgpu_core::platform::{HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::testkit::capture::catch_death;
-use reims_vgpu_metal::MetalPlatform;
-use reims_vgpu_metal::os::vm::MetalVm;
 use reims_vgpu_vulkan::VulkanPlatform;
 use reims_vgpu_vulkan::gpu::resource::VulkanTexture;
+use reims_vgpu_vulkan::os::OsVm;
 
 /// `MTLPixelFormatBGRA8Unorm`; `MTLTextureUsageShaderRead | ShaderWrite`.
 const BGRA8: u64 = 80;
@@ -166,7 +165,7 @@ fn guest_byte(i: u64) -> u8 {
 
 /// The guest's pages, `length` bytes: byte `i` is [`guest_byte`].
 fn guest_pages(length: u64) -> HostPtr {
-    let at = MetalVm::new().allocate_anywhere(length).unwrap();
+    let at = OsVm::new().allocate_anywhere(length).unwrap();
     for i in 0..length {
         // SAFETY: the pages just allocated, readable and writable.
         unsafe { at.as_ptr::<u8>().add(i as usize).write(guest_byte(i)) };
@@ -295,7 +294,7 @@ fn shown(case: Case, bytes: &[u8]) -> Shown {
 fn case<P: Platform>(p: &P, d: &P::Device, c: Case) -> Seen {
     let (width, height) = c.size;
     let row = width * 4;
-    let page = MetalVm::new().page_size();
+    let page = OsVm::new().page_size();
     let alloc = (row * height).next_multiple_of(page);
     let pages = guest_pages(alloc);
     let spec = SurfaceSpec {
@@ -795,8 +794,7 @@ fn dims(name: &str) -> (u64, u64) {
 }
 
 /// One case, from the environment: `WRITER`, `SIZE`, `EXTENT` and `ORIGIN` (`n`x`m`, the origin
-/// 0x0 where unset), `USAGE`, and `ON` (`metal` or `vulkan`, both where unset). A measurement,
-/// run one case per process.
+/// 0x0 where unset) and `USAGE`. A measurement, run one case per process.
 #[test]
 #[ignore = "a measurement: one case per process, from the environment"]
 fn sweep() {
@@ -812,17 +810,9 @@ fn sweep() {
         extent: dims("EXTENT"),
         origin: std::env::var("ORIGIN").map_or((0, 0), |_| dims("ORIGIN")),
     };
-    let on = std::env::var("ON").unwrap_or_default();
-    if on != "vulkan" {
-        let p = MetalPlatform::new();
-        let d = MetalPlatform::system_default_device().unwrap();
-        println!("metal {:?}", case::<MetalPlatform>(&p, &d, c));
-    }
-    if on != "metal" {
-        let p = VulkanPlatform::new();
-        let d = VulkanPlatform::system_default_device().unwrap();
-        println!("vulkan {:?}", case::<VulkanPlatform>(&p, &d, c));
-    }
+    let p = VulkanPlatform::new();
+    let d = VulkanPlatform::system_default_device().unwrap();
+    println!("vulkan {:?}", case::<VulkanPlatform>(&p, &d, c));
 }
 
 /// What every case shows that writes nothing the guest sees: the command buffer completes, its
@@ -900,12 +890,6 @@ fn dropped_everywhere<P: Platform>(p: &P, d: &P::Device) {
 }
 
 #[test]
-fn metal_drops_a_buffers_writes_at_every_extent() {
-    let p = MetalPlatform::new();
-    dropped_everywhere(&p, &MetalPlatform::system_default_device().unwrap());
-}
-
-#[test]
 fn this_platform_drops_a_buffers_writes_at_every_extent() {
     let p = VulkanPlatform::new();
     dropped_everywhere(&p, &VulkanPlatform::system_default_device().unwrap());
@@ -929,12 +913,6 @@ fn evicted<P: Platform>(p: &P, d: &P::Device) {
         };
         assert_eq!(case(p, d, c), nothing, "{c:?}");
     }
-}
-
-#[test]
-fn metal_reads_the_pages_once_other_gpu_work_evicts_a_dropped_write() {
-    let p = MetalPlatform::new();
-    evicted(&p, &MetalPlatform::system_default_device().unwrap());
 }
 
 #[test]
@@ -966,12 +944,6 @@ fn replaced_on_one_page<P: Platform>(p: &P, d: &P::Device) {
 }
 
 #[test]
-fn metal_replaces_into_the_guests_page_of_a_surface_over_one() {
-    let p = MetalPlatform::new();
-    replaced_on_one_page(&p, &MetalPlatform::system_default_device().unwrap());
-}
-
-#[test]
 fn this_platform_replaces_into_the_guests_page_of_a_surface_over_one() {
     let p = VulkanPlatform::new();
     replaced_on_one_page(&p, &VulkanPlatform::system_default_device().unwrap());
@@ -981,7 +953,7 @@ fn this_platform_replaces_into_the_guests_page_of_a_surface_over_one() {
 /// write reaches the page at the offset, through the surface's base address, which lies there,
 /// and nothing else of the page changes.
 fn replaced_at_an_offset<P: Platform>(p: &P, d: &P::Device) {
-    let page = MetalVm::new().page_size();
+    let page = OsVm::new().page_size();
     let pages = guest_pages(page);
     let spec = SurfaceSpec {
         pixel_format: u32::from_be_bytes(*b"BGRA"),
@@ -1027,12 +999,6 @@ fn replaced_at_an_offset<P: Platform>(p: &P, d: &P::Device) {
         .collect();
     assert!(now == expected.as_slice());
     drop((t, s));
-}
-
-#[test]
-fn metal_replaces_at_the_offset_into_the_guests_page() {
-    let p = MetalPlatform::new();
-    replaced_at_an_offset(&p, &MetalPlatform::system_default_device().unwrap());
 }
 
 #[test]
@@ -1151,13 +1117,6 @@ fn small_blits_dropped<P: Platform>(p: &P, d: &P::Device, past_the_level: bool) 
 }
 
 #[test]
-#[ignore = "opt-in: it faults the GPU on purpose, a GPU recovery that fails every process's in-flight work"]
-fn metal_drops_small_blits_into_the_texture() {
-    let p = MetalPlatform::new();
-    small_blits_dropped(&p, &MetalPlatform::system_default_device().unwrap(), true);
-}
-
-#[test]
 fn this_platform_drops_small_blits_into_the_texture() {
     let p = VulkanPlatform::new();
     small_blits_dropped(&p, &VulkanPlatform::system_default_device().unwrap(), false);
@@ -1170,7 +1129,7 @@ fn read_only_texture<P: Platform>(
     d: &P::Device,
     desc: &P::TextureDescriptor,
 ) -> (P::Surface, P::Texture) {
-    let page = MetalVm::new().page_size();
+    let page = OsVm::new().page_size();
     let pages = guest_pages(page);
     let spec = SurfaceSpec {
         pixel_format: u32::from_be_bytes(*b"BGRA"),
@@ -1534,15 +1493,11 @@ fn read_only_textures_answer_metals_usage() {
             [0, 1, 0x10, 0x11].map(of_swizzled).to_vec(),
         )
     }
-    let metal = usages(
-        &MetalPlatform::new(),
-        &MetalPlatform::system_default_device().unwrap(),
-    );
     let vulkan = usages(
         &VulkanPlatform::new(),
         &VulkanPlatform::system_default_device().unwrap(),
     );
-    assert_eq!(vulkan, metal);
+    reims_vgpu_core::metal_check!("usages", vulkan);
 }
 
 /// The tests' vertex function that returns nothing (`src/gpu/unrasterized.metal`).
@@ -1635,10 +1590,6 @@ fn an_unrasterized_draw_writes_through_no_fragment_texture() {
     let d = VulkanPlatform::system_default_device().unwrap();
     let ours = unrasterized_write(&p, &d);
     assert_eq!(ours, 4);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new();
-        assert_eq!(unrasterized_write(&mp, &md), ours, "Metal");
-    }
 }
 
 /// A draw whose function only reads a buffer on a surface made read-only for the GPU, through a
@@ -1726,8 +1677,8 @@ fn this_platform_draws_through_a_device_pointer_into_a_read_only_buffer() {
 /// What a creator answers for a texture of a swizzle other than the default (B, G, R, A) and
 /// `USAGE` (`writeSwizzleEnabled` where `WSE` is 1), from the environment: `CREATOR` `surface`
 /// (on a surface made read-only for the GPU), `buffer` (over a buffer made on such a surface) or
-/// `device`, and `ON` (`metal` or `vulkan`). Prints the texture's usage, or nil; Metal's assertion
-/// ends the process, which the caller reads from its exit. A measurement, one case a process.
+/// `device`. Prints the texture's usage, or nil, or where this platform dies. A measurement, one
+/// case a process.
 #[test]
 #[ignore = "a measurement: one case per process, from the environment"]
 fn swizzled_texture_on_read_only_memory() {
@@ -1762,16 +1713,10 @@ fn swizzled_texture_on_read_only_memory() {
         };
         t.map_or("nil".into(), |t| format!("made usage {:#x}", t.usage()))
     }
-    if std::env::var("ON").as_deref() == Ok("vulkan") {
-        let p = VulkanPlatform::new();
-        let d = VulkanPlatform::system_default_device().unwrap();
-        match catch_death(|| made(&p, &d)) {
-            Ok(seen) => println!("vulkan {seen}"),
-            Err(site) => println!("vulkan died at {} ({:?})", site.file, site.kind),
-        }
-    } else {
-        let p = MetalPlatform::new();
-        let d = MetalPlatform::system_default_device().unwrap();
-        println!("metal {}", made(&p, &d));
+    let p = VulkanPlatform::new();
+    let d = VulkanPlatform::system_default_device().unwrap();
+    match catch_death(|| made(&p, &d)) {
+        Ok(seen) => println!("vulkan {seen}"),
+        Err(site) => println!("vulkan died at {} ({:?})", site.file, site.kind),
     }
 }

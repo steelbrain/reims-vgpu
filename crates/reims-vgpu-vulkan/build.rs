@@ -1,4 +1,4 @@
-//! Compiles the library's own shaders, the metal crate's `src/gpu/shaders.metal`, into
+//! Compiles the library's own shaders, `src/gpu/shaders.metal`, into
 //! `$OUT_DIR/shaders.metallib` with Apple's tools, which `src/gpu/shaders.rs` includes, and the
 //! command predication's step kernel, `src/gpu/predication.metal`, into
 //! `$OUT_DIR/predication.metallib`, which `src/gpu/predication.rs` includes, the vertex function
@@ -157,11 +157,7 @@ fn steps(manifest: &Path) -> Vec<Step> {
         sources: vec![source],
         portable: true,
     };
-    let mut steps = vec![one(
-        "shaders",
-        manifest.join("../reims-vgpu-metal/src/gpu/shaders.metal"),
-        &COMPILE,
-    )];
+    let mut steps = vec![one("shaders", gpu.join("shaders.metal"), &COMPILE)];
     for name in TEST_LIBRARIES {
         steps.push(one(name, gpu.join(format!("{name}.metal")), &COMPILE));
     }
@@ -259,7 +255,7 @@ fn main() -> Result<(), String> {
 
 /// Compiles every metallib into `out` with Apple's tools (module docs).
 fn compile(manifest: &Path, out: &Path) -> Result<(), String> {
-    let source = manifest.join("../reims-vgpu-metal/src/gpu/shaders.metal");
+    let source = manifest.join("src/gpu/shaders.metal");
     xcrun(&COMPILE, &source, &out.join("shaders.air"))?;
     xcrun(
         &["metallib"],

@@ -1,0 +1,6 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+an R32Uint render target	SizeAndAlign { size: 22528, align: 128 }
+r28's E26 and E26i	SizeAndAlign { size: 2594560, align: 128 }
+r28's E26 and E26i, bare	SizeAndAlign { size: 2594560, align: 128 }
+r28's E26w	SizeAndAlign { size: 2594560, align: 128 }
+r28's E26w, bare	SizeAndAlign { size: 2594560, align: 128 }

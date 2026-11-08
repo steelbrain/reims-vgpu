@@ -1,7 +1,6 @@
 //! What a draw costs the thread that decodes it, through the decoder as a queue's ring hands it a
 //! `COMMAND_BUFFER`, against the same commands sent through the platform's core traits and
-//! through what the platform drives alone: metal2vulkan's runtime on the Vulkan platform, Metal
-//! itself on the Metal one. A measurement, run by hand in a release build, holding the host's
+//! through what the platform drives alone, metal2vulkan's runtime. A measurement, run by hand in a release build, holding the host's
 //! GPU (`scripts/internal/gpu-locks.sh -- cargo nextest run -p reims-vgpu --release
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E 'test(draw_cost)'
 //! --no-capture`).
@@ -25,7 +24,7 @@
 //! draws of a compositor's stream; `mc`, 8 of WindowServer's Mission Control composites, each of
 //! 92 render passes of 3 draws; or `mc1`, the same ops in one pass a command buffer, whose gap to
 //! `mc` is what 91 more passes cost), `DRAW_COST_RUNS` the runs (9), `DRAW_COST_ONLY` one path, for
-//! a profile of it (`decoder`, `platform` or `runtime`, the runtime or Metal alone), and
+//! a profile of it (`decoder`, `platform` or `runtime`, the runtime alone), and
 //! `DRAW_COST_SECONDS` a time to keep running that path for, so a sampling profiler can attach.
 
 use std::sync::Arc;
@@ -899,7 +898,6 @@ fn target_pass<P: ApiPlatform>(bench: &Bench<P>, pass: usize) -> P::RenderPassDe
 
 /// The runtime alone, on the Vulkan platform's objects of `bench`: the calls the platform makes
 /// of it for each command.
-#[cfg(vulkan_platform)]
 fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     use metal2vulkan_runtime as rt;
     let (queue, _) = bench.queue_and_target();
@@ -953,79 +951,6 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     spent
 }
 
-/// Metal alone, on the Metal platform's objects of `bench`: the selectors the platform sends for
-/// each command. Its command buffers are waited for, not handled, after the count.
-#[cfg(target_os = "macos")]
-fn through_metal(bench: &Bench<reims_vgpu_metal::MetalPlatform>) -> Counts {
-    use objc2::runtime::ProtocolObject;
-    use objc2_foundation::NSRange;
-    use objc2_metal::{
-        MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _, MTLPrimitiveType,
-        MTLRenderCommandEncoder as _, MTLSamplerState,
-    };
-    let (queue, _) = bench.queue_and_target();
-    let bound = bench.bound();
-    let passes = [target_pass(bench, 0), target_pass(bench, 1)];
-    objc2::rc::autoreleasepool(|_| {
-        let mut committed = Vec::with_capacity(bound.len());
-        let start = counts();
-        for cb_bound in &bound {
-            let cb = queue.get().commandBuffer().unwrap();
-            for (p, pass_bound) in cb_bound.iter().enumerate() {
-                let e = cb
-                    .renderCommandEncoderWithDescriptor(passes[p.min(1)].get())
-                    .unwrap();
-                for &b in pass_bound {
-                    // SAFETY: the bench's objects, at indices and offsets inside what they hold and
-                    // what the pipelines' functions bind; the sampler list outlives its call.
-                    unsafe {
-                        match b {
-                            Bound::Pipeline(p) => e.setRenderPipelineState(p.get()),
-                            Bound::VertexBuffer(buffer, offset, index) => e
-                                .setVertexBuffer_offset_atIndex(
-                                    Some(buffer.get()),
-                                    offset as usize,
-                                    index as usize,
-                                ),
-                            Bound::FragmentBuffer(buffer, offset, index) => e
-                                .setFragmentBuffer_offset_atIndex(
-                                    Some(buffer.get()),
-                                    offset as usize,
-                                    index as usize,
-                                ),
-                            Bound::FragmentTexture(texture, index) => {
-                                e.setFragmentTexture_atIndex(Some(texture.get()), index as usize)
-                            }
-                            Bound::FragmentSampler(sampler) => {
-                                let list: [*const ProtocolObject<dyn MTLSamplerState>; 1] =
-                                    [sampler.get()];
-                                e.setFragmentSamplerStates_withRange(
-                                    std::ptr::NonNull::from(&list).cast(),
-                                    NSRange::new(0, 1),
-                                )
-                            }
-                            Bound::Draw(primitive_type, count) => e
-                                .drawPrimitives_vertexStart_vertexCount(
-                                    MTLPrimitiveType(primitive_type as usize),
-                                    0,
-                                    count as usize,
-                                ),
-                        }
-                    }
-                }
-                e.endEncoding();
-            }
-            cb.commit();
-            committed.push(cb);
-        }
-        let spent = counts() - start;
-        for cb in &committed {
-            cb.waitUntilCompleted();
-        }
-        spent
-    })
-}
-
 /// The median, lowest and highest of `values`.
 pub(super) fn spread(values: &mut [f64]) -> [f64; 3] {
     values.sort_by(f64::total_cmp);
@@ -1038,7 +963,7 @@ pub(super) fn spread(values: &mut [f64]) -> [f64; 3] {
     [median, values[0], values[n - 1]]
 }
 
-/// Runs the paths of `bench`, `alone` what the platform drives alone (the runtime, or Metal) and
+/// Runs the paths of `bench`, `alone` what the platform drives alone (the runtime) and
 /// its name, and prints each one's figures a draw.
 #[allow(clippy::disallowed_methods)] // a measurement: real time decides how long a profile runs
 fn measure<P: ApiPlatform>(
@@ -1180,19 +1105,9 @@ fn the_mc_shapes_cut_their_draws_into_passes() {
 }
 
 /// On the Vulkan platform: the decoder, the platform and the runtime alone.
-#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a draw's cost"]
 fn on_vulkan_draw_cost() {
     let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(Shape::chosen());
     measure("vulkan", bench, ("runtime", through_runtime));
-}
-
-/// On the Metal platform: the decoder, the platform and Metal alone.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a draw's cost"]
-fn on_metal_draw_cost() {
-    let bench = Bench::<reims_vgpu_metal::MetalPlatform>::new(Shape::chosen());
-    measure("metal", bench, ("metal", through_metal));
 }

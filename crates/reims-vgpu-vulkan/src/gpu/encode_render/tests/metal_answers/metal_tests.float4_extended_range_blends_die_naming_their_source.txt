@@ -1,0 +1,4 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+fast math xr_float_fragment format 550 blend None	xz 65536 0
+fast math xr_float_fragment format 552 blend None	xz 65536 65536
+fast math xr_float_fragment format 554 blend None	xz 65536 131072

@@ -8,7 +8,7 @@
 //! reference's address: the same for every reference to one object, as a Metal object's pointer
 //! is.
 //!
-//! One `VulkanPlatform` is one process's (D17), as `MetalPlatform` is.
+//! One `VulkanPlatform` is one process's (D17).
 
 use std::fmt;
 use std::mem::ManuallyDrop;
@@ -132,8 +132,7 @@ impl fmt::Debug for VulkanPlatform {
 impl VulkanPlatform {
     /// The process's platform. Make one per process (D17). It installs what the OS's services need
     /// first ([`crate::os::install_process_services`]): on macOS the Objective-C autorelease
-    /// pool core's pools push, as `MetalPlatform::new` does, as IOSurface and Foundation still
-    /// autorelease into it.
+    /// pool core's pools push, as IOSurface and Foundation still autorelease into it.
     pub fn new() -> VulkanPlatform {
         crate::os::install_process_services();
         VulkanPlatform {

@@ -1,56 +1,24 @@
 //! The process-wide platform and the panic-hook install.
 //!
 //! The process-wide state (the serial number set, the latest IOSurface host device) lives in one
-//! platform instance (D17), so every public constructor goes through the process's: on macOS
-//! [`platform`], one `MetalPlatform` per process, made on first use. Making it installs the
-//! aborting panic hook first (6.5), then the stderr logger if `REIMS_VGPU_LOG` asks for it
+//! platform instance (D17), so every public constructor goes through the process's: [`platform`],
+//! one `VulkanPlatform` per process, made on first use. Making it installs the aborting panic hook
+//! first (6.5), then the stderr logger if `REIMS_VGPU_LOG` asks for it
 //! (`reims_vgpu_core::logging::init`). Every function of the C API installs the hook too, before
 //! its body runs, since some make no platform.
-//!
-//! Where the library has the Vulkan platform (`cfg(vulkan_platform)`: on Linux, and on macOS with
-//! the `vulkan` feature), `vulkan_platform` is the process's `VulkanPlatform`, made the same way on
-//! its first use: the only platform on Linux.
-
-// The docs name macOS's platform, which other OSes have none of: their links resolve, and are
-// checked, on macOS.
-#![cfg_attr(not(target_os = "macos"), allow(rustdoc::broken_intra_doc_links))]
 
 use std::sync::{Arc, Once, OnceLock};
 
 use reims_vgpu_core::rt::is_our_thread;
-#[cfg(target_os = "macos")]
-use reims_vgpu_metal::MetalPlatform;
-#[cfg(vulkan_platform)]
 use reims_vgpu_vulkan::VulkanPlatform;
 
-#[cfg(target_os = "macos")]
-static PLATFORM: OnceLock<Arc<MetalPlatform>> = OnceLock::new();
-#[cfg(vulkan_platform)]
-static VULKAN_PLATFORM: OnceLock<Arc<VulkanPlatform>> = OnceLock::new();
+static PLATFORM: OnceLock<Arc<VulkanPlatform>> = OnceLock::new();
 static HOOK: Once = Once::new();
 
-/// The process's platform (D17) on macOS, made on first use: the panic hook first, the logger,
-/// then one `MetalPlatform`.
-#[cfg(target_os = "macos")]
-pub fn platform() -> Arc<MetalPlatform> {
-    platform_ref().clone()
-}
-
-/// [`platform`], borrowed for the life of the process.
-#[cfg(target_os = "macos")]
-pub fn platform_ref() -> &'static Arc<MetalPlatform> {
-    PLATFORM.get_or_init(|| {
-        install_panic_hook();
-        reims_vgpu_core::logging::init();
-        Arc::new(MetalPlatform::new())
-    })
-}
-
-/// The process's Vulkan platform, made on first use as [`platform`] makes the Metal one: the
-/// panic hook first, the logger, then one `VulkanPlatform`.
-#[cfg(vulkan_platform)]
-pub fn vulkan_platform() -> Arc<VulkanPlatform> {
-    VULKAN_PLATFORM
+/// The process's platform (D17), made on first use: the panic hook first, the logger, then one
+/// `VulkanPlatform`.
+pub fn platform() -> Arc<VulkanPlatform> {
+    PLATFORM
         .get_or_init(|| {
             install_panic_hook();
             reims_vgpu_core::logging::init();
@@ -143,7 +111,6 @@ mod tests {
 
     /// platform() is one per process (D17). In a child: making the platform installs the aborting
     /// hook, which must not meet the death-capture panics of this binary's fake-platform tests.
-    #[cfg(target_os = "macos")]
     #[test]
     fn one_platform_per_process() {
         if std::env::var_os("RVG_PLATFORM_CHILD").is_some() {
@@ -157,26 +124,6 @@ mod tests {
         let out = child(
             "singleton::tests::one_platform_per_process",
             "RVG_PLATFORM_CHILD",
-        );
-        assert_eq!(out.status.signal(), Some(6), "{out:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("reims-vgpu: "));
-    }
-
-    /// vulkan_platform() is one per process, and installs the aborting hook as platform() does;
-    /// in a child, for the reason above.
-    #[cfg(vulkan_platform)]
-    #[test]
-    fn one_vulkan_platform_per_process() {
-        if std::env::var_os("RVG_VULKAN_PLATFORM_CHILD").is_some() {
-            let a = vulkan_platform();
-            let b = vulkan_platform();
-            assert!(Arc::ptr_eq(&a, &b));
-            let _ours = reims_vgpu_core::rt::enter_ours();
-            panic!("after vulkan_platform()");
-        }
-        let out = child(
-            "singleton::tests::one_vulkan_platform_per_process",
-            "RVG_VULKAN_PLATFORM_CHILD",
         );
         assert_eq!(out.status.signal(), Some(6), "{out:?}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("reims-vgpu: "));

@@ -1,0 +1,31 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+80 16x16 1 1 0x10005	SizeAndAlign { size: 1152, align: 128 }
+80 16x16 1 1 0x10005 without the bit	SizeAndAlign { size: 1152, align: 128 }
+80 16x16 1 1 0x10001	SizeAndAlign { size: 1152, align: 128 }
+80 16x16 1 1 0x10001 without the bit	SizeAndAlign { size: 1152, align: 128 }
+80 16x16 1 1 0x10003	SizeAndAlign { size: 1024, align: 128 }
+80 16x16 1 1 0x10003 without the bit	SizeAndAlign { size: 1024, align: 128 }
+80 100x60 7 1 0x10005	SizeAndAlign { size: 44416, align: 128 }
+80 100x60 7 1 0x10005 without the bit	SizeAndAlign { size: 44416, align: 128 }
+80 100x60 7 1 0x10001	SizeAndAlign { size: 44416, align: 128 }
+80 100x60 7 1 0x10001 without the bit	SizeAndAlign { size: 44416, align: 128 }
+80 100x60 7 1 0x10003	SizeAndAlign { size: 43904, align: 128 }
+80 100x60 7 1 0x10003 without the bit	SizeAndAlign { size: 43904, align: 128 }
+115 256x256 9 1 0x10005	SizeAndAlign { size: 702208, align: 128 }
+115 256x256 9 1 0x10005 without the bit	SizeAndAlign { size: 702208, align: 128 }
+115 256x256 9 1 0x10001	SizeAndAlign { size: 702208, align: 128 }
+115 256x256 9 1 0x10001 without the bit	SizeAndAlign { size: 702208, align: 128 }
+115 256x256 9 1 0x10003	SizeAndAlign { size: 699264, align: 128 }
+115 256x256 9 1 0x10003 without the bit	SizeAndAlign { size: 699264, align: 128 }
+80 64x64 1 4 0x10005	SizeAndAlign { size: 66048, align: 16384 }
+80 64x64 1 4 0x10005 without the bit	SizeAndAlign { size: 66048, align: 16384 }
+80 64x64 1 4 0x10001	SizeAndAlign { size: 66048, align: 16384 }
+80 64x64 1 4 0x10001 without the bit	SizeAndAlign { size: 66048, align: 16384 }
+80 64x64 1 4 0x10003	SizeAndAlign { size: 65536, align: 16384 }
+80 64x64 1 4 0x10003 without the bit	SizeAndAlign { size: 65536, align: 16384 }
+70 33x17 6 3 0x10005	SizeAndAlign { size: 34176, align: 128 }
+70 33x17 6 3 0x10005 without the bit	SizeAndAlign { size: 34176, align: 128 }
+70 33x17 6 3 0x10001	SizeAndAlign { size: 34176, align: 128 }
+70 33x17 6 3 0x10001 without the bit	SizeAndAlign { size: 34176, align: 128 }
+70 33x17 6 3 0x10003	SizeAndAlign { size: 33408, align: 128 }
+70 33x17 6 3 0x10003 without the bit	SizeAndAlign { size: 33408, align: 128 }

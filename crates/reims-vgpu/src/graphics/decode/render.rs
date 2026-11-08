@@ -26,8 +26,7 @@
 
 use std::cell::Cell;
 
-// The render-op tags and body structs (`Rgfx*`): the whole render group, so a glob
-// (as the Metal platform's command impl globs `platform::render`).
+// The render-op tags and body structs (`Rgfx*`): the whole render group, so a glob.
 use reims_graphics::ops::render::*;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::platform::blit::ResourceRef;

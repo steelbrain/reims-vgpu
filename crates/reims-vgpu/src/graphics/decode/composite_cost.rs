@@ -483,19 +483,9 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
 }
 
 /// On the Vulkan platform.
-#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a frame's times"]
 fn on_vulkan_composite_cost() {
     let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(Shape::chosen());
     measure("vulkan", bench);
-}
-
-/// On the Metal platform.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a frame's times"]
-fn on_metal_composite_cost() {
-    let bench = Bench::<reims_vgpu_metal::MetalPlatform>::new(Shape::chosen());
-    measure("metal", bench);
 }

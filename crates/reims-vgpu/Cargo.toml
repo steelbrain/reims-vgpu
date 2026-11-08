@@ -15,14 +15,9 @@ default = ["macos-sdl"]
 macos-sdl = ["reims-vgpu-window/macos-sdl"]
 # Tests: the core objects behind the public handles (`core()`), and core's testkit.
 testkit = ["reims-vgpu-core/testkit"]
-# The Vulkan platform (architecture 2.2) on macOS: `VulkanPlatform` as an `ApiPlatform`, on
-# MoltenVK, which the C API's own `vulkan` feature makes its platform. Off by default, as the Metal
-# platform is the product there. On Linux the Vulkan platform is the library's only one, its
-# dependencies are not optional, and the feature changes nothing (`build.rs`).
-vulkan = [
-    "dep:reims-vgpu-vulkan",
-    "dep:metal2vulkan-runtime",
-]
+# Kept for the builds that name it (`--features vulkan`): the Vulkan platform is the library's only
+# one, everywhere, so the feature changes nothing.
+vulkan = []
 
 [dependencies]
 reims-vgpu-core.workspace = true
@@ -47,28 +42,22 @@ parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
 # (`graphics::sink`); on Linux, the guest's RAM as a host maps it in the tests (`platform::tests`).
 libc.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# The Vulkan platform, the library's only one on Linux: the dependencies of the `vulkan` feature,
-# which on macOS are optional (below).
+# The Vulkan platform (architecture 2.2), the library's only one: natively on Linux, and over
+# MoltenVK on macOS, a build for development and tests.
 reims-vgpu-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
 
-# The Metal platform, the product on macOS, and its window's drawable (`graphics::metal`,
-# `graphics::vulkan`'s macOS sink).
+# The window's drawable on macOS, a `CAMetalLayer`'s, which the Vulkan sink presents into
+# (`graphics::vulkan`'s macOS side); `entry`'s tests read retain counts with `objc2`.
 [target.'cfg(target_os = "macos")'.dependencies]
-reims-vgpu-metal.workspace = true
 objc2.workspace = true
 objc2-metal.workspace = true
 objc2-quartz-core = { workspace = true, features = ["CAMetalLayer", "objc2-metal"] }
-# The Vulkan platform on MoltenVK, with the `vulkan` feature: the dependencies Linux always has
-# (above).
-reims-vgpu-vulkan = { workspace = true, optional = true }
-metal2vulkan-runtime = { workspace = true, optional = true }
 
 [dev-dependencies]
 reims-vgpu-core = { workspace = true, features = ["testkit"] }
 
-# The decoder's tests of Metal's own stitched functions and arrays (`graphics::decode`).
+# The decoder's tests of Metal's own stitched functions (`graphics::decode`).
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-foundation.workspace = true
 

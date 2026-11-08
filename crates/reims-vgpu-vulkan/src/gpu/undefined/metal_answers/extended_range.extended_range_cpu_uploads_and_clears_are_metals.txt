@@ -1,0 +1,17 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+552 replaced	bytes 32768 8ab7a9f0b314c0833e93efdd05178d04 000a40a240b0806e8095c014805140db402c40e900084072c09e807f00834089
+552 ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 }	bytes 2048 90aa478df05c8b0c9f8ac067e13e358d c0bfc09fc07f80dfc0bfc09fc07f80dfc0bfc09fc07f80dfc0bfc09fc07f80df
+552 ClearColor { red: -0.75, green: 1.5, blue: 2.25, alpha: -1.0 }	bytes 2048 d42a9112850f11c2bc4aaf870a51ed8d c0ffc0ff80000060c0ffc0ff80000060c0ffc0ff80000060c0ffc0ff80000060
+552 ClearColor { red: 1000000.0, green: -1000000.0, blue: NaN, alpha: 3.0 }	bytes 2048 93995ccb7051d30d586491652ae26d8d 00000000c0ff80df00000000c0ff80df00000000c0ff80df00000000c0ff80df
+553 replaced	bytes 32768 8ab7a9f0b314c0833e93efdd05178d04 000a40a240b0806e8095c014805140db402c40e900084072c09e807f00834089
+553 ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 }	bytes 2048 569d7b5e06fff48ebef9e08d1448f58d 40d0c0bd80a480df40d0c0bd80a480df40d0c0bd80a480df40d0c0bd80a480df
+553 ClearColor { red: -0.75, green: 1.5, blue: 2.25, alpha: -1.0 }	bytes 2048 f0b7ff65a77b25e5143e6185b0eedd8d c0ff40f800000060c0ff40f800000060c0ff40f800000060c0ff40f800000060
+553 ClearColor { red: 1000000.0, green: -1000000.0, blue: NaN, alpha: 3.0 }	bytes 2048 19d337481ce28634bf59b18b3c3a6d8d 00600000c0ff80df00600000c0ff80df00600000c0ff80df00600000c0ff80df
+554 replaced	bytes 16384 5d7f47168e8c2c68fc537d9016a57cce 180a78a243b0a16ebc95e414aa5142db6f2c7ce91d085572c69ea37f03836589
+554 ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 }	bytes 1024 5b669286d5ebe96707471446b083df8d fffef91ffffef91ffffef91ffffef91ffffef91ffffef91ffffef91ffffef91f
+554 ClearColor { red: -0.75, green: 1.5, blue: 2.25, alpha: -1.0 }	bytes 1024 e544f580ba7067b34fae3bc0be441d8d ffff2f00ffff2f00ffff2f00ffff2f00ffff2f00ffff2f00ffff2f00ffff2f00
+554 ClearColor { red: 1000000.0, green: -1000000.0, blue: NaN, alpha: 3.0 }	bytes 1024 9ba09ce92e6a64626bb1dff6b2bfdd8d 0000f03f0000f03f0000f03f0000f03f0000f03f0000f03f0000f03f0000f03f
+555 replaced	bytes 16384 5d7f47168e8c2c68fc537d9016a57cce 180a78a243b0a16ebc95e414aa5142db6f2c7ce91d085572c69ea37f03836589
+555 ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 }	bytes 1024 223a4ec319326dbb4fd67166f2f4558d 41df2b2941df2b2941df2b2941df2b2941df2b2941df2b2941df2b2941df2b29
+555 ClearColor { red: -0.75, green: 1.5, blue: 2.25, alpha: -1.0 }	bytes 1024 d1c62ce3fb83e97883ad723653dd258d ff870f00ff870f00ff870f00ff870f00ff870f00ff870f00ff870f00ff870f00
+555 ClearColor { red: 1000000.0, green: -1000000.0, blue: NaN, alpha: 3.0 }	bytes 1024 f92c3617fe99da185ac1703c0d69358d 8001f03f8001f03f8001f03f8001f03f8001f03f8001f03f8001f03f8001f03f

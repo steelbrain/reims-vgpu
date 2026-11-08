@@ -1,0 +1,9 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+reset, load (false, false)	bytes 1033 cabcccd2d6e3f6c521355a2015196a78 010004000000000000bf8040ffbf8040ffbf8040ffbf8040ffbf8040ffbf8040
+reset, load (false, true)	bytes 1033 09adfa6bb8f5c0247608728eead0af80 01000400000000000000070e151c232a31383f464d545b626970777e858c939a
+reset, load (true, false)	bytes 1033 cabcccd2d6e3f6c521355a2015196a78 010004000000000000bf8040ffbf8040ffbf8040ffbf8040ffbf8040ffbf8040
+reset, load (true, true)	bytes 1033 09adfa6bb8f5c0247608728eead0af80 01000400000000000000070e151c232a31383f464d545b626970777e858c939a
+after a released map, reset, load (false, false)	bytes 1033 cabcccd2d6e3f6c521355a2015196a78 010004000000000000bf8040ffbf8040ffbf8040ffbf8040ffbf8040ffbf8040
+after a released map, reset, load (false, true)	bytes 1033 09adfa6bb8f5c0247608728eead0af80 01000400000000000000070e151c232a31383f464d545b626970777e858c939a
+after a released map, reset, load (true, false)	bytes 1033 cabcccd2d6e3f6c521355a2015196a78 010004000000000000bf8040ffbf8040ffbf8040ffbf8040ffbf8040ffbf8040
+after a released map, reset, load (true, true)	bytes 1033 09adfa6bb8f5c0247608728eead0af80 01000400000000000000070e151c232a31383f464d545b626970777e858c939a

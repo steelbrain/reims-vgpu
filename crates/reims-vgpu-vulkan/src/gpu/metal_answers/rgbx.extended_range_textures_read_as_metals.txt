@@ -1,0 +1,961 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+BGRA10_XR swizzle [2, 3, 4, 5]: cases	23
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_read_float at +[0, 0]	xz 4096 0
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_read_float at +[8, 8]	xz 4096 4096
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_read_half at +[0, 0]	bytes 2048 b59c618d9734ec1fcab2021e7f8b7aff 3db5b53ca2b90000cd387cb46139003c0cb45d351db5ce397e3a75310a3c2d35
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_read_half at +[8, 8]	bytes 2048 5fe6cd71e955fa4301dd87ba57054386 6b3b24b8063c00004e3c852caa390000a03714302c3800009db46e36603c0000
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 0 address 0 border 0	xz 4096 8192
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 6599ed04529a91889f96610c238ef2ab 4539683c6a3a00001038d6b1c837a83b423cc631e5b8003c3438ad3cc73c5838
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 0 border 0	xz 4096 12288
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 0 border 0	xz 2048 16384
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 2 border 0	xz 4096 18432
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 2 border 0	xz 2048 22528
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 4 border 0	xz 4096 24576
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 4 border 0	xz 2048 28672
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 0	xz 4096 30720
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 0	xz 2048 34816
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 1	xz 4096 36864
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 1	xz 2048 40960
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 2	xz 4096 43008
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 2	xz 2048 47104
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 0 address 5 border 2	xz 4096 49152
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 a6619459d988770307a7ddcd992e14f5 4539683c6a3a0000003c003c003c003c003c003c003c003c003c003c003c003c
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 0 border 0	xz 16384 53248
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 5 border 0	xz 16384 69632
+BGRA10_XR swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 5 border 2	xz 16384 86016
+BGRA10_XR swizzle [2, 3, 4, 5], a view's: cases	23
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_read_float at +[0, 0]	xz 4096 102400
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_read_float at +[8, 8]	xz 4096 106496
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_read_half at +[0, 0]	bytes 2048 b59c618d9734ec1fcab2021e7f8b7aff 3db5b53ca2b90000cd387cb46139003c0cb45d351db5ce397e3a75310a3c2d35
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_read_half at +[8, 8]	bytes 2048 5fe6cd71e955fa4301dd87ba57054386 6b3b24b8063c00004e3c852caa390000a03714302c3800009db46e36603c0000
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 110592
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 6599ed04529a91889f96610c238ef2ab 4539683c6a3a00001038d6b1c837a83b423cc631e5b8003c3438ad3cc73c5838
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 114688
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 118784
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 120832
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 124928
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 126976
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 131072
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 133120
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 137216
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 139264
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 143360
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 145408
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 149504
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 151552
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 a6619459d988770307a7ddcd992e14f5 4539683c6a3a0000003c003c003c003c003c003c003c003c003c003c003c003c
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 155648
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 172032
+BGRA10_XR swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 188416
+BGRA10_XR swizzle [5, 2, 1, 0]: cases	23
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_read_float at +[0, 0]	xz 4096 204800
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_read_float at +[8, 8]	xz 4096 208896
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_read_half at +[0, 0]	bytes 2048 c15be722e9b4531501e896e36b9b0ad8 00003db5003c0000003ccd38003c0000ce390cb4003c00002d357e3a003c0000
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_read_half at +[8, 8]	bytes 2048 53e25948fba2195a590ba97e09beb69d 00006b3b003c000000004e3c003c00000000a037003c000000009db4003c0000
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 0 address 0 border 0	xz 4096 212992
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 e5dedea36413efec45d7427ffb40028c 00004539003c0000a83b1038003c0000003c423c003c000058383438003c0000
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 0 border 0	xz 4096 217088
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 0 border 0	xz 2048 221184
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 2 border 0	xz 4096 223232
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 2 border 0	xz 2048 227328
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 4 border 0	xz 4096 229376
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 4 border 0	xz 2048 233472
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 0	xz 4096 235520
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 0	xz 2048 239616
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 1	xz 4096 241664
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 1	xz 2048 245760
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 2	xz 4096 247808
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 2	xz 2048 251904
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 0 address 5 border 2	xz 4096 253952
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 062e21b4d7fe8aec264d274cde36d993 00004539003c0000003c003c003c0000003c003c003c0000003c003c003c0000
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 0 border 0	xz 16384 258048
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 5 border 0	xz 16384 274432
+BGRA10_XR swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 5 border 2	xz 16384 290816
+BGRA10_XR swizzle [5, 2, 1, 0], a view's: cases	23
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_read_float at +[0, 0]	xz 4096 307200
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_read_float at +[8, 8]	xz 4096 311296
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_read_half at +[0, 0]	bytes 2048 c15be722e9b4531501e896e36b9b0ad8 00003db5003c0000003ccd38003c0000ce390cb4003c00002d357e3a003c0000
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_read_half at +[8, 8]	bytes 2048 53e25948fba2195a590ba97e09beb69d 00006b3b003c000000004e3c003c00000000a037003c000000009db4003c0000
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 315392
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 e5dedea36413efec45d7427ffb40028c 00004539003c0000a83b1038003c0000003c423c003c000058383438003c0000
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 319488
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 323584
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 325632
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 329728
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 331776
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 335872
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 337920
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 342016
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 344064
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 348160
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 350208
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 354304
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 356352
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 062e21b4d7fe8aec264d274cde36d993 00004539003c0000003c003c003c0000003c003c003c0000003c003c003c0000
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 360448
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 376832
+BGRA10_XR swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 393216
+BGRA10_XR swizzle [4, 3, 2, 5]: cases	23
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_read_float at +[0, 0]	xz 4096 409600
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_read_float at +[8, 8]	xz 4096 413696
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_read_half at +[0, 0]	bytes 2048 cfff7ab229f933433b0fa3d6e0b14437 a2b9b53c3db5000061397cb4cd38003c1db55d350cb4ce390a3c75317e3a2d35
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_read_half at +[8, 8]	bytes 2048 28165e6c57e0159d781d1b06e5057a36 063c24b86b3b0000aa39852c4e3c00002c381430a0370000603c6e369db40000
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 0 address 0 border 0	xz 4096 417792
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 599c26913ef00bed72de09da308acf47 6a3a683c45390000c837d6b11038a83be5b8c631423c003cc73cad3c34385838
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 0 border 0	xz 4096 421888
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 0 border 0	xz 2048 425984
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 2 border 0	xz 4096 428032
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 2 border 0	xz 2048 432128
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 4 border 0	xz 4096 434176
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 4 border 0	xz 2048 438272
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 0	xz 4096 440320
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 0	xz 2048 444416
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 1	xz 4096 446464
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 1	xz 2048 450560
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 2	xz 4096 452608
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 2	xz 2048 456704
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 0 address 5 border 2	xz 4096 458752
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 93156649c64858c95228be097a5fa549 6a3a683c45390000003c003c003c003c003c003c003c003c003c003c003c003c
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 0 border 0	xz 16384 462848
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 5 border 0	xz 16384 479232
+BGRA10_XR swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 5 border 2	xz 16384 495616
+BGRA10_XR swizzle [4, 3, 2, 5], a view's: cases	23
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_read_float at +[0, 0]	xz 4096 512000
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_read_float at +[8, 8]	xz 4096 516096
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_read_half at +[0, 0]	bytes 2048 cfff7ab229f933433b0fa3d6e0b14437 a2b9b53c3db5000061397cb4cd38003c1db55d350cb4ce390a3c75317e3a2d35
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_read_half at +[8, 8]	bytes 2048 28165e6c57e0159d781d1b06e5057a36 063c24b86b3b0000aa39852c4e3c00002c381430a0370000603c6e369db40000
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 520192
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 599c26913ef00bed72de09da308acf47 6a3a683c45390000c837d6b11038a83be5b8c631423c003cc73cad3c34385838
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 524288
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 528384
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 530432
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 534528
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 536576
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 540672
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 542720
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 546816
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 548864
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 552960
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 555008
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 559104
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 561152
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 93156649c64858c95228be097a5fa549 6a3a683c45390000003c003c003c003c003c003c003c003c003c003c003c003c
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 565248
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 581632
+BGRA10_XR swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 598016
+BGRA10_XR swizzle [3, 5, 4, 2]: cases	23
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_read_float at +[0, 0]	xz 4096 614400
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_read_float at +[8, 8]	xz 4096 618496
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_read_half at +[0, 0]	bytes 2048 54e6d5b2ed562ab9bb9a6e8a899eae5f b53c0000a2b93db57cb4003c6139cd385d35ce391db50cb475312d350a3c7e3a
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_read_half at +[8, 8]	bytes 2048 e20975be8be0191fc6c6f962a804b0d2 24b80000063c6b3b852c0000aa394e3c143000002c38a0376e360000603c9db4
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 0 address 0 border 0	xz 4096 622592
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 8a5774faa36b1e27e0dac18bcfbe364b 683c00006a3a4539d6b1a83bc8371038c631003ce5b8423cad3c5838c73c3438
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 0 border 0	xz 4096 626688
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 0 border 0	xz 2048 630784
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 2 border 0	xz 4096 632832
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 2 border 0	xz 2048 636928
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 4 border 0	xz 4096 638976
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 4 border 0	xz 2048 643072
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 0	xz 4096 645120
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 0	xz 2048 649216
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 1	xz 4096 651264
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 1	xz 2048 655360
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 2	xz 4096 657408
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 2	xz 2048 661504
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 0 address 5 border 2	xz 4096 663552
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 14b6dd38b76766d4779799c441fcb685 683c00006a3a4539003c003c003c003c003c003c003c003c003c003c003c003c
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 0 border 0	xz 16384 667648
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 5 border 0	xz 16384 684032
+BGRA10_XR swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 5 border 2	xz 16384 700416
+BGRA10_XR swizzle [3, 5, 4, 2], a view's: cases	23
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_read_float at +[0, 0]	xz 4096 716800
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_read_float at +[8, 8]	xz 4096 720896
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_read_half at +[0, 0]	bytes 2048 54e6d5b2ed562ab9bb9a6e8a899eae5f b53c0000a2b93db57cb4003c6139cd385d35ce391db50cb475312d350a3c7e3a
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_read_half at +[8, 8]	bytes 2048 e20975be8be0191fc6c6f962a804b0d2 24b80000063c6b3b852c0000aa394e3c143000002c38a0376e360000603c9db4
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 724992
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 8a5774faa36b1e27e0dac18bcfbe364b 683c00006a3a4539d6b1a83bc8371038c631003ce5b8423cad3c5838c73c3438
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 729088
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 733184
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 735232
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 739328
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 741376
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 745472
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 747520
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 751616
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 753664
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 757760
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 759808
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 763904
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 765952
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 14b6dd38b76766d4779799c441fcb685 683c00006a3a4539003c003c003c003c003c003c003c003c003c003c003c003c
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 770048
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 786432
+BGRA10_XR swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 802816
+BGRA10_XR swizzle [0, 1, 5, 3]: cases	23
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_read_float at +[0, 0]	xz 4096 819200
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_read_float at +[8, 8]	xz 4096 823296
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_read_half at +[0, 0]	bytes 2048 646583292652423cb0153b454672bd0b 0000003c0000b53c0000003c003c7cb40000003cce395d350000003c2d357531
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_read_half at +[8, 8]	bytes 2048 f7c57c98341074244e28377ce336ac82 0000003c000024b80000003c0000852c0000003c000014300000003c00006e36
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 0 address 0 border 0	xz 4096 827392
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 02924ed96b03c343a9809a2f821ba3b5 0000003c0000683c0000003ca83bd6b10000003c003cc6310000003c5838ad3c
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 0 border 0	xz 4096 831488
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 0 border 0	xz 2048 835584
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 2 border 0	xz 4096 837632
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 2 border 0	xz 2048 841728
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 4 border 0	xz 4096 843776
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 4 border 0	xz 2048 847872
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 0	xz 4096 849920
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 0	xz 2048 854016
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 1	xz 4096 856064
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 1	xz 2048 860160
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 2	xz 4096 862208
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 2	xz 2048 866304
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 0 address 5 border 2	xz 4096 868352
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 1fda1bab71cfc1827f363bbb0eb15eed 0000003c0000683c0000003c003c003c0000003c003c003c0000003c003c003c
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 0 border 0	xz 16384 872448
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 5 border 0	xz 16384 888832
+BGRA10_XR swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 5 border 2	xz 16384 905216
+BGRA10_XR swizzle [0, 1, 5, 3], a view's: cases	23
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_read_float at +[0, 0]	xz 4096 921600
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_read_float at +[8, 8]	xz 4096 925696
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_read_half at +[0, 0]	bytes 2048 646583292652423cb0153b454672bd0b 0000003c0000b53c0000003c003c7cb40000003cce395d350000003c2d357531
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_read_half at +[8, 8]	bytes 2048 f7c57c98341074244e28377ce336ac82 0000003c000024b80000003c0000852c0000003c000014300000003c00006e36
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 929792
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 02924ed96b03c343a9809a2f821ba3b5 0000003c0000683c0000003ca83bd6b10000003c003cc6310000003c5838ad3c
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 933888
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 937984
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 940032
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 944128
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 946176
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 950272
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 952320
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 956416
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 958464
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 962560
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 964608
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 968704
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 970752
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 1fda1bab71cfc1827f363bbb0eb15eed 0000003c0000683c0000003c003c003c0000003c003c003c0000003c003c003c
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 974848
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 991232
+BGRA10_XR swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 1007616
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5]: cases	23
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_read_float at +[0, 0]	xz 4096 1024000
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_read_float at +[8, 8]	xz 4096 1028096
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_read_half at +[0, 0]	xz 2048 1032192
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_read_half at +[8, 8]	xz 2048 1034240
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 0 address 0 border 0	xz 4096 1036288
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 0 address 0 border 0	xz 2048 1040384
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 0 border 0	xz 4096 1042432
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 0 border 0	xz 2048 1046528
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 2 border 0	xz 4096 1048576
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 2 border 0	xz 2048 1052672
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 4 border 0	xz 4096 1054720
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 4 border 0	xz 2048 1058816
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 0	xz 4096 1060864
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 0	xz 2048 1064960
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 1	xz 4096 1067008
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 1	xz 2048 1071104
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 2	xz 4096 1073152
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 2	xz 2048 1077248
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 0 address 5 border 2	xz 4096 1079296
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 0 address 5 border 2	xz 2048 1083392
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 0 border 0	xz 16384 1085440
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 5 border 0	xz 16384 1101824
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 5 border 2	xz 16384 1118208
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's: cases	23
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_read_float at +[0, 0]	xz 4096 1134592
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_read_float at +[8, 8]	xz 4096 1138688
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_read_half at +[0, 0]	xz 2048 1142784
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_read_half at +[8, 8]	xz 2048 1144832
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 1146880
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 1150976
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 1153024
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 1157120
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 1159168
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 1163264
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 1165312
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 1169408
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 1171456
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 1175552
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 1177600
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 1181696
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 1183744
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 1187840
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 1189888
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 1193984
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 1196032
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 1212416
+BGRA10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 1228800
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0]: cases	23
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_read_float at +[0, 0]	xz 4096 1245184
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_read_float at +[8, 8]	xz 4096 1249280
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_read_half at +[0, 0]	xz 2048 1253376
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_read_half at +[8, 8]	xz 2048 1255424
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 0 address 0 border 0	xz 4096 1257472
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 0 address 0 border 0	xz 2048 1261568
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 0 border 0	xz 4096 1263616
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 0 border 0	xz 2048 1267712
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 2 border 0	xz 4096 1269760
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 2 border 0	xz 2048 1273856
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 4 border 0	xz 4096 1275904
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 4 border 0	xz 2048 1280000
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 0	xz 4096 1282048
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 0	xz 2048 1286144
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 1	xz 4096 1288192
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 1	xz 2048 1292288
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 2	xz 4096 1294336
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 2	xz 2048 1298432
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 0 address 5 border 2	xz 4096 1300480
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 0 address 5 border 2	xz 2048 1304576
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 0 border 0	xz 16384 1306624
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 5 border 0	xz 16384 1323008
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 5 border 2	xz 16384 1339392
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's: cases	23
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_read_float at +[0, 0]	xz 4096 1355776
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_read_float at +[8, 8]	xz 4096 1359872
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_read_half at +[0, 0]	xz 2048 1363968
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_read_half at +[8, 8]	xz 2048 1366016
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 1368064
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 1372160
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 1374208
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 1378304
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 1380352
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 1384448
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 1386496
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 1390592
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 1392640
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 1396736
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 1398784
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 1402880
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 1404928
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 1409024
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 1411072
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 1415168
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 1417216
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 1433600
+BGRA10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 1449984
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5]: cases	23
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_read_float at +[0, 0]	xz 4096 1466368
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_read_float at +[8, 8]	xz 4096 1470464
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_read_half at +[0, 0]	xz 2048 1474560
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_read_half at +[8, 8]	xz 2048 1476608
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 0 address 0 border 0	xz 4096 1478656
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 0 address 0 border 0	xz 2048 1482752
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 0 border 0	xz 4096 1484800
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 0 border 0	xz 2048 1488896
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 2 border 0	xz 4096 1490944
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 2 border 0	xz 2048 1495040
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 4 border 0	xz 4096 1497088
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 4 border 0	xz 2048 1501184
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 0	xz 4096 1503232
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 0	xz 2048 1507328
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 1	xz 4096 1509376
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 1	xz 2048 1513472
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 2	xz 4096 1515520
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 2	xz 2048 1519616
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 0 address 5 border 2	xz 4096 1521664
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 0 address 5 border 2	xz 2048 1525760
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 0 border 0	xz 16384 1527808
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 5 border 0	xz 16384 1544192
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 5 border 2	xz 16384 1560576
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's: cases	23
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_read_float at +[0, 0]	xz 4096 1576960
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_read_float at +[8, 8]	xz 4096 1581056
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_read_half at +[0, 0]	xz 2048 1585152
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_read_half at +[8, 8]	xz 2048 1587200
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 1589248
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 1593344
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 1595392
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 1599488
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 1601536
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 1605632
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 1607680
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 1611776
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 1613824
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 1617920
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 1619968
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 1624064
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 1626112
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 1630208
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 1632256
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 1636352
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 1638400
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 1654784
+BGRA10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 1671168
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2]: cases	23
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_read_float at +[0, 0]	xz 4096 1687552
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_read_float at +[8, 8]	xz 4096 1691648
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_read_half at +[0, 0]	xz 2048 1695744
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_read_half at +[8, 8]	xz 2048 1697792
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 0 address 0 border 0	xz 4096 1699840
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 0 address 0 border 0	xz 2048 1703936
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 0 border 0	xz 4096 1705984
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 0 border 0	xz 2048 1710080
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 2 border 0	xz 4096 1712128
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 2 border 0	xz 2048 1716224
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 4 border 0	xz 4096 1718272
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 4 border 0	xz 2048 1722368
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 0	xz 4096 1724416
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 0	xz 2048 1728512
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 1	xz 4096 1730560
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 1	xz 2048 1734656
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 2	xz 4096 1736704
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 2	xz 2048 1740800
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 0 address 5 border 2	xz 4096 1742848
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 0 address 5 border 2	xz 2048 1746944
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 0 border 0	xz 16384 1748992
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 5 border 0	xz 16384 1765376
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 5 border 2	xz 16384 1781760
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's: cases	23
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_read_float at +[0, 0]	xz 4096 1798144
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_read_float at +[8, 8]	xz 4096 1802240
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_read_half at +[0, 0]	xz 2048 1806336
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_read_half at +[8, 8]	xz 2048 1808384
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 1810432
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 1814528
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 1816576
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 1820672
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 1822720
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 1826816
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 1828864
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 1832960
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 1835008
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 1839104
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 1841152
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 1845248
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 1847296
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 1851392
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 1853440
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 1857536
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 1859584
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 1875968
+BGRA10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 1892352
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3]: cases	23
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_read_float at +[0, 0]	xz 4096 1908736
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_read_float at +[8, 8]	xz 4096 1912832
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_read_half at +[0, 0]	xz 2048 1916928
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_read_half at +[8, 8]	xz 2048 1918976
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 0 address 0 border 0	xz 4096 1921024
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 0 address 0 border 0	xz 2048 1925120
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 0 border 0	xz 4096 1927168
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 0 border 0	xz 2048 1931264
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 2 border 0	xz 4096 1933312
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 2 border 0	xz 2048 1937408
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 4 border 0	xz 4096 1939456
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 4 border 0	xz 2048 1943552
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 0	xz 4096 1945600
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 0	xz 2048 1949696
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 1	xz 4096 1951744
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 1	xz 2048 1955840
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 2	xz 4096 1957888
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 2	xz 2048 1961984
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 0 address 5 border 2	xz 4096 1964032
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 0 address 5 border 2	xz 2048 1968128
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 0 border 0	xz 16384 1970176
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 5 border 0	xz 16384 1986560
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 5 border 2	xz 16384 2002944
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's: cases	23
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_read_float at +[0, 0]	xz 4096 2019328
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_read_float at +[8, 8]	xz 4096 2023424
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_read_half at +[0, 0]	xz 2048 2027520
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_read_half at +[8, 8]	xz 2048 2029568
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 2031616
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 2035712
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 2037760
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 2041856
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 2043904
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 2048000
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 2050048
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 2054144
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 2056192
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 2060288
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 2062336
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 2066432
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 2068480
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 2072576
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 2074624
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 2078720
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 2080768
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 2097152
+BGRA10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 2113536
+BGR10_XR swizzle [2, 3, 4, 5]: cases	23
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_read_float at +[0, 0]	xz 4096 2129920
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_read_float at +[8, 8]	xz 4096 2134016
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_read_half at +[0, 0]	bytes 2048 c03dca7ccd927174b54e111ce059c04e cf3a2cb4c5ac003c663a25b5f7b6003ca8b33d39d5b0003cfab906a246b2003c
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_read_half at +[8, 8]	bytes 2048 9c8eb716c377b93aa9fef05507d23e34 47b7423a44b4003c46aa3cb8de39003c2d39b9387d35003cc93cf03be93c003c
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 0 address 0 border 0	xz 4096 2138112
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 cc4225ada00f85f9ef70422e819568a0 e83b643454b8003c10b819b98239003c673b2e3691b8003ce7b6713939b9003c
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 0 border 0	xz 4096 2142208
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 0 border 0	xz 2048 2146304
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 2 border 0	xz 4096 2148352
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 2 border 0	xz 2048 2152448
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 4 border 0	xz 4096 2154496
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 4 border 0	xz 2048 2158592
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 0	xz 4096 2160640
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 0	xz 2048 2164736
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 1	xz 4096 2166784
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 1	xz 2048 2170880
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 2	xz 4096 2172928
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 2	xz 2048 2177024
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_float filter 0 address 5 border 2	xz 4096 2179072
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 b2381ddbc56ab7f51c46dcf1a838e8ae e83b643454b8003c003c003c003c003c003c003c003c003c003c003c003c003c
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 0 border 0	xz 16384 2183168
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 5 border 0	xz 16384 2199552
+BGR10_XR swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 5 border 2	xz 16384 2215936
+BGR10_XR swizzle [2, 3, 4, 5], a view's: cases	23
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_read_float at +[0, 0]	xz 4096 2232320
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_read_float at +[8, 8]	xz 4096 2236416
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_read_half at +[0, 0]	bytes 2048 c03dca7ccd927174b54e111ce059c04e cf3a2cb4c5ac003c663a25b5f7b6003ca8b33d39d5b0003cfab906a246b2003c
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_read_half at +[8, 8]	bytes 2048 9c8eb716c377b93aa9fef05507d23e34 47b7423a44b4003c46aa3cb8de39003c2d39b9387d35003cc93cf03be93c003c
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 2240512
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 cc4225ada00f85f9ef70422e819568a0 e83b643454b8003c10b819b98239003c673b2e3691b8003ce7b6713939b9003c
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 2244608
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 2248704
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 2250752
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 2254848
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 2256896
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 2260992
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 2263040
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 2267136
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 2269184
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 2273280
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 2275328
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 2279424
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 2281472
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 b2381ddbc56ab7f51c46dcf1a838e8ae e83b643454b8003c003c003c003c003c003c003c003c003c003c003c003c003c
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 2285568
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 2301952
+BGR10_XR swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 2318336
+BGR10_XR swizzle [5, 2, 1, 0]: cases	23
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_read_float at +[0, 0]	xz 4096 2334720
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_read_float at +[8, 8]	xz 4096 2338816
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_read_half at +[0, 0]	bytes 2048 5a1f54966331523f4c2166c8b63e9427 003ccf3a003c0000003c663a003c0000003ca8b3003c0000003cfab9003c0000
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_read_half at +[8, 8]	bytes 2048 0ce0a419143422baf67f266b5d12dde8 003c47b7003c0000003c46aa003c0000003c2d39003c0000003cc93c003c0000
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 0 address 0 border 0	xz 4096 2342912
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 305b1f200e4eed63a9961b670fc2ce55 003ce83b003c0000003c10b8003c0000003c673b003c0000003ce7b6003c0000
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 0 border 0	xz 4096 2347008
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 0 border 0	xz 2048 2351104
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 2 border 0	xz 4096 2353152
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 2 border 0	xz 2048 2357248
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 4 border 0	xz 4096 2359296
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 4 border 0	xz 2048 2363392
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 0	xz 4096 2365440
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 0	xz 2048 2369536
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 1	xz 4096 2371584
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 1	xz 2048 2375680
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 2	xz 4096 2377728
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 2	xz 2048 2381824
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_float filter 0 address 5 border 2	xz 4096 2383872
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 2416ae3244a1ab54ebd8ffd4a0386db0 003ce83b003c0000003c003c003c0000003c003c003c0000003c003c003c0000
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 0 border 0	xz 16384 2387968
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 5 border 0	xz 16384 2404352
+BGR10_XR swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 5 border 2	xz 16384 2420736
+BGR10_XR swizzle [5, 2, 1, 0], a view's: cases	23
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_read_float at +[0, 0]	xz 4096 2437120
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_read_float at +[8, 8]	xz 4096 2441216
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_read_half at +[0, 0]	bytes 2048 5a1f54966331523f4c2166c8b63e9427 003ccf3a003c0000003c663a003c0000003ca8b3003c0000003cfab9003c0000
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_read_half at +[8, 8]	bytes 2048 0ce0a419143422baf67f266b5d12dde8 003c47b7003c0000003c46aa003c0000003c2d39003c0000003cc93c003c0000
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 2445312
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 305b1f200e4eed63a9961b670fc2ce55 003ce83b003c0000003c10b8003c0000003c673b003c0000003ce7b6003c0000
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 2449408
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 2453504
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 2455552
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 2459648
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 2461696
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 2465792
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 2467840
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 2471936
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 2473984
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 2478080
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 2480128
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 2484224
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 2486272
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 2416ae3244a1ab54ebd8ffd4a0386db0 003ce83b003c0000003c003c003c0000003c003c003c0000003c003c003c0000
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 2490368
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 2506752
+BGR10_XR swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 2523136
+BGR10_XR swizzle [4, 3, 2, 5]: cases	23
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_read_float at +[0, 0]	xz 4096 2539520
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_read_float at +[8, 8]	xz 4096 2543616
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_read_half at +[0, 0]	bytes 2048 14227fd32eef7d83d786cedcba93e4e2 c5ac2cb4cf3a003cf7b625b5663a003cd5b03d39a8b3003c46b206a2fab9003c
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_read_half at +[8, 8]	bytes 2048 ddc1edd25a9a2a13572520e0bee4f0f8 44b4423a47b7003cde393cb846aa003c7d35b9382d39003ce93cf03bc93c003c
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 0 address 0 border 0	xz 4096 2547712
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 d4e1c1c3a40132f543e7e136b46a36b4 54b86434e83b003c823919b910b8003c91b82e36673b003c39b97139e7b6003c
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 0 border 0	xz 4096 2551808
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 0 border 0	xz 2048 2555904
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 2 border 0	xz 4096 2557952
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 2 border 0	xz 2048 2562048
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 4 border 0	xz 4096 2564096
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 4 border 0	xz 2048 2568192
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 0	xz 4096 2570240
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 0	xz 2048 2574336
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 1	xz 4096 2576384
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 1	xz 2048 2580480
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 2	xz 4096 2582528
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 2	xz 2048 2586624
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_float filter 0 address 5 border 2	xz 4096 2588672
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 5d4e8f2eb607c542751225dc55c8b1c2 54b86434e83b003c003c003c003c003c003c003c003c003c003c003c003c003c
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 0 border 0	xz 16384 2592768
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 5 border 0	xz 16384 2609152
+BGR10_XR swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 5 border 2	xz 16384 2625536
+BGR10_XR swizzle [4, 3, 2, 5], a view's: cases	23
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_read_float at +[0, 0]	xz 4096 2641920
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_read_float at +[8, 8]	xz 4096 2646016
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_read_half at +[0, 0]	bytes 2048 14227fd32eef7d83d786cedcba93e4e2 c5ac2cb4cf3a003cf7b625b5663a003cd5b03d39a8b3003c46b206a2fab9003c
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_read_half at +[8, 8]	bytes 2048 ddc1edd25a9a2a13572520e0bee4f0f8 44b4423a47b7003cde393cb846aa003c7d35b9382d39003ce93cf03bc93c003c
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 2650112
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 d4e1c1c3a40132f543e7e136b46a36b4 54b86434e83b003c823919b910b8003c91b82e36673b003c39b97139e7b6003c
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 2654208
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 2658304
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 2660352
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 2664448
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 2666496
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 2670592
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 2672640
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 2676736
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 2678784
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 2682880
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 2684928
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 2689024
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 2691072
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 5d4e8f2eb607c542751225dc55c8b1c2 54b86434e83b003c003c003c003c003c003c003c003c003c003c003c003c003c
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 2695168
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 2711552
+BGR10_XR swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 2727936
+BGR10_XR swizzle [3, 5, 4, 2]: cases	23
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_read_float at +[0, 0]	xz 4096 2744320
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_read_float at +[8, 8]	xz 4096 2748416
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_read_half at +[0, 0]	bytes 2048 b7b855eae542d1991858ffaec5552afa 2cb4003cc5accf3a25b5003cf7b6663a3d39003cd5b0a8b306a2003c46b2fab9
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_read_half at +[8, 8]	bytes 2048 38d7914732682f81044354aa3faa8f2c 423a003c44b447b73cb8003cde3946aab938003c7d352d39f03b003ce93cc93c
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 0 address 0 border 0	xz 4096 2752512
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 bcba3079c6e09a1da2faa5977934c100 6434003c54b8e83b19b9003c823910b82e36003c91b8673b7139003c39b9e7b6
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 0 border 0	xz 4096 2756608
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 0 border 0	xz 2048 2760704
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 2 border 0	xz 4096 2762752
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 2 border 0	xz 2048 2766848
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 4 border 0	xz 4096 2768896
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 4 border 0	xz 2048 2772992
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 0	xz 4096 2775040
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 0	xz 2048 2779136
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 1	xz 4096 2781184
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 1	xz 2048 2785280
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 2	xz 4096 2787328
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 2	xz 2048 2791424
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_float filter 0 address 5 border 2	xz 4096 2793472
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 55f9141a7eaac7c7e2e7f6c107c83fbe 6434003c54b8e83b003c003c003c003c003c003c003c003c003c003c003c003c
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 0 border 0	xz 16384 2797568
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 5 border 0	xz 16384 2813952
+BGR10_XR swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 5 border 2	xz 16384 2830336
+BGR10_XR swizzle [3, 5, 4, 2], a view's: cases	23
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_read_float at +[0, 0]	xz 4096 2846720
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_read_float at +[8, 8]	xz 4096 2850816
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_read_half at +[0, 0]	bytes 2048 b7b855eae542d1991858ffaec5552afa 2cb4003cc5accf3a25b5003cf7b6663a3d39003cd5b0a8b306a2003c46b2fab9
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_read_half at +[8, 8]	bytes 2048 38d7914732682f81044354aa3faa8f2c 423a003c44b447b73cb8003cde3946aab938003c7d352d39f03b003ce93cc93c
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 2854912
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 bcba3079c6e09a1da2faa5977934c100 6434003c54b8e83b19b9003c823910b82e36003c91b8673b7139003c39b9e7b6
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 2859008
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 2863104
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 2865152
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 2869248
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 2871296
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 2875392
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 2877440
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 2881536
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 2883584
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 2887680
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 2889728
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 2893824
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 2895872
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 55f9141a7eaac7c7e2e7f6c107c83fbe 6434003c54b8e83b003c003c003c003c003c003c003c003c003c003c003c003c
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 2899968
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 2916352
+BGR10_XR swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 2932736
+BGR10_XR swizzle [0, 1, 5, 3]: cases	23
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_read_float at +[0, 0]	xz 4096 2949120
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_read_float at +[8, 8]	xz 4096 2953216
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_read_half at +[0, 0]	bytes 2048 dfff72a0f3c538bb572590a722634e82 0000003c003c2cb40000003c003c25b50000003c003c3d390000003c003c06a2
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_read_half at +[8, 8]	bytes 2048 847802629ef597e0ed527a4cacbc57bf 0000003c003c423a0000003c003c3cb80000003c003cb9380000003c003cf03b
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 0 address 0 border 0	xz 4096 2957312
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 0 address 0 border 0	bytes 2048 f13a31c01a37913502197d22a98138b6 0000003c003c64340000003c003c19b90000003c003c2e360000003c003c7139
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 0 border 0	xz 4096 2961408
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 0 border 0	xz 2048 2965504
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 2 border 0	xz 4096 2967552
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 2 border 0	xz 2048 2971648
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 4 border 0	xz 4096 2973696
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 4 border 0	xz 2048 2977792
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 0	xz 4096 2979840
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 0	xz 2048 2983936
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 1	xz 4096 2985984
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 1	xz 2048 2990080
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 2	xz 4096 2992128
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 2	xz 2048 2996224
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_float filter 0 address 5 border 2	xz 4096 2998272
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_sample_half filter 0 address 5 border 2	bytes 2048 ea8df2c6cfa904730897b90a47fcfbb0 0000003c003c64340000003c003c003c0000003c003c003c0000003c003c003c
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 0 border 0	xz 16384 3002368
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 5 border 0	xz 16384 3018752
+BGR10_XR swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 5 border 2	xz 16384 3035136
+BGR10_XR swizzle [0, 1, 5, 3], a view's: cases	23
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_read_float at +[0, 0]	xz 4096 3051520
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_read_float at +[8, 8]	xz 4096 3055616
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_read_half at +[0, 0]	bytes 2048 dfff72a0f3c538bb572590a722634e82 0000003c003c2cb40000003c003c25b50000003c003c3d390000003c003c06a2
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_read_half at +[8, 8]	bytes 2048 847802629ef597e0ed527a4cacbc57bf 0000003c003c423a0000003c003c3cb80000003c003cb9380000003c003cf03b
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 3059712
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 0 address 0 border 0	bytes 2048 f13a31c01a37913502197d22a98138b6 0000003c003c64340000003c003c19b90000003c003c2e360000003c003c7139
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 3063808
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 3067904
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 3069952
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 3074048
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 3076096
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 3080192
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 3082240
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 3086336
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 3088384
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 3092480
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 3094528
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 3098624
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 3100672
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 0 address 5 border 2	bytes 2048 ea8df2c6cfa904730897b90a47fcfbb0 0000003c003c64340000003c003c003c0000003c003c003c0000003c003c003c
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 3104768
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 3121152
+BGR10_XR swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 3137536
+BGR10_XR_sRGB swizzle [2, 3, 4, 5]: cases	23
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_read_float at +[0, 0]	xz 4096 3153920
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_read_float at +[8, 8]	xz 4096 3158016
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_read_half at +[0, 0]	xz 2048 3162112
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_read_half at +[8, 8]	xz 2048 3164160
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 0 address 0 border 0	xz 4096 3166208
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 0 address 0 border 0	xz 2048 3170304
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 0 border 0	xz 4096 3172352
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 0 border 0	xz 2048 3176448
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 2 border 0	xz 4096 3178496
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 2 border 0	xz 2048 3182592
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 4 border 0	xz 4096 3184640
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 4 border 0	xz 2048 3188736
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 0	xz 4096 3190784
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 0	xz 2048 3194880
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 1	xz 4096 3196928
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 1	xz 2048 3201024
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 1 address 5 border 2	xz 4096 3203072
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 1 address 5 border 2	xz 2048 3207168
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_float filter 0 address 5 border 2	xz 4096 3209216
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_sample_half filter 0 address 5 border 2	xz 2048 3213312
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 0 border 0	xz 16384 3215360
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 5 border 0	xz 16384 3231744
+BGR10_XR_sRGB swizzle [2, 3, 4, 5] rgbx_gather filter 0 address 5 border 2	xz 16384 3248128
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's: cases	23
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_read_float at +[0, 0]	xz 4096 3264512
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_read_float at +[8, 8]	xz 4096 3268608
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_read_half at +[0, 0]	xz 2048 3272704
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_read_half at +[8, 8]	xz 2048 3274752
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 3276800
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 3280896
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 3282944
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 3287040
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 3289088
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 3293184
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 3295232
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 3299328
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 3301376
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 3305472
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 3307520
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 3311616
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 3313664
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 3317760
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 3319808
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 3323904
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 3325952
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 3342336
+BGR10_XR_sRGB swizzle [2, 3, 4, 5], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 3358720
+BGR10_XR_sRGB swizzle [5, 2, 1, 0]: cases	23
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_read_float at +[0, 0]	xz 4096 3375104
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_read_float at +[8, 8]	xz 4096 3379200
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_read_half at +[0, 0]	xz 2048 3383296
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_read_half at +[8, 8]	xz 2048 3385344
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 0 address 0 border 0	xz 4096 3387392
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 0 address 0 border 0	xz 2048 3391488
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 0 border 0	xz 4096 3393536
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 0 border 0	xz 2048 3397632
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 2 border 0	xz 4096 3399680
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 2 border 0	xz 2048 3403776
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 4 border 0	xz 4096 3405824
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 4 border 0	xz 2048 3409920
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 0	xz 4096 3411968
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 0	xz 2048 3416064
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 1	xz 4096 3418112
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 1	xz 2048 3422208
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 1 address 5 border 2	xz 4096 3424256
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 1 address 5 border 2	xz 2048 3428352
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_float filter 0 address 5 border 2	xz 4096 3430400
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_sample_half filter 0 address 5 border 2	xz 2048 3434496
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 0 border 0	xz 16384 3436544
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 5 border 0	xz 16384 3452928
+BGR10_XR_sRGB swizzle [5, 2, 1, 0] rgbx_gather filter 0 address 5 border 2	xz 16384 3469312
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's: cases	23
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_read_float at +[0, 0]	xz 4096 3485696
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_read_float at +[8, 8]	xz 4096 3489792
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_read_half at +[0, 0]	xz 2048 3493888
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_read_half at +[8, 8]	xz 2048 3495936
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 3497984
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 3502080
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 3504128
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 3508224
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 3510272
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 3514368
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 3516416
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 3520512
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 3522560
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 3526656
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 3528704
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 3532800
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 3534848
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 3538944
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 3540992
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 3545088
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 3547136
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 3563520
+BGR10_XR_sRGB swizzle [5, 2, 1, 0], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 3579904
+BGR10_XR_sRGB swizzle [4, 3, 2, 5]: cases	23
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_read_float at +[0, 0]	xz 4096 3596288
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_read_float at +[8, 8]	xz 4096 3600384
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_read_half at +[0, 0]	xz 2048 3604480
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_read_half at +[8, 8]	xz 2048 3606528
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 0 address 0 border 0	xz 4096 3608576
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 0 address 0 border 0	xz 2048 3612672
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 0 border 0	xz 4096 3614720
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 0 border 0	xz 2048 3618816
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 2 border 0	xz 4096 3620864
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 2 border 0	xz 2048 3624960
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 4 border 0	xz 4096 3627008
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 4 border 0	xz 2048 3631104
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 0	xz 4096 3633152
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 0	xz 2048 3637248
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 1	xz 4096 3639296
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 1	xz 2048 3643392
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 1 address 5 border 2	xz 4096 3645440
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 1 address 5 border 2	xz 2048 3649536
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_float filter 0 address 5 border 2	xz 4096 3651584
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_sample_half filter 0 address 5 border 2	xz 2048 3655680
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 0 border 0	xz 16384 3657728
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 5 border 0	xz 16384 3674112
+BGR10_XR_sRGB swizzle [4, 3, 2, 5] rgbx_gather filter 0 address 5 border 2	xz 16384 3690496
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's: cases	23
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_read_float at +[0, 0]	xz 4096 3706880
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_read_float at +[8, 8]	xz 4096 3710976
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_read_half at +[0, 0]	xz 2048 3715072
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_read_half at +[8, 8]	xz 2048 3717120
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 3719168
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 3723264
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 3725312
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 3729408
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 3731456
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 3735552
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 3737600
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 3741696
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 3743744
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 3747840
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 3749888
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 3753984
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 3756032
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 3760128
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 3762176
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 3766272
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 3768320
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 3784704
+BGR10_XR_sRGB swizzle [4, 3, 2, 5], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 3801088
+BGR10_XR_sRGB swizzle [3, 5, 4, 2]: cases	23
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_read_float at +[0, 0]	xz 4096 3817472
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_read_float at +[8, 8]	xz 4096 3821568
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_read_half at +[0, 0]	xz 2048 3825664
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_read_half at +[8, 8]	xz 2048 3827712
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 0 address 0 border 0	xz 4096 3829760
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 0 address 0 border 0	xz 2048 3833856
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 0 border 0	xz 4096 3835904
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 0 border 0	xz 2048 3840000
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 2 border 0	xz 4096 3842048
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 2 border 0	xz 2048 3846144
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 4 border 0	xz 4096 3848192
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 4 border 0	xz 2048 3852288
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 0	xz 4096 3854336
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 0	xz 2048 3858432
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 1	xz 4096 3860480
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 1	xz 2048 3864576
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 1 address 5 border 2	xz 4096 3866624
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 1 address 5 border 2	xz 2048 3870720
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_float filter 0 address 5 border 2	xz 4096 3872768
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_sample_half filter 0 address 5 border 2	xz 2048 3876864
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 0 border 0	xz 16384 3878912
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 5 border 0	xz 16384 3895296
+BGR10_XR_sRGB swizzle [3, 5, 4, 2] rgbx_gather filter 0 address 5 border 2	xz 16384 3911680
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's: cases	23
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_read_float at +[0, 0]	xz 4096 3928064
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_read_float at +[8, 8]	xz 4096 3932160
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_read_half at +[0, 0]	xz 2048 3936256
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_read_half at +[8, 8]	xz 2048 3938304
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 3940352
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 3944448
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 3946496
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 3950592
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 3952640
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 3956736
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 3958784
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 3962880
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 3964928
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 3969024
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 3971072
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 3975168
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 3977216
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 3981312
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 3983360
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 3987456
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 3989504
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 4005888
+BGR10_XR_sRGB swizzle [3, 5, 4, 2], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 4022272
+BGR10_XR_sRGB swizzle [0, 1, 5, 3]: cases	23
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_read_float at +[0, 0]	xz 4096 4038656
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_read_float at +[8, 8]	xz 4096 4042752
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_read_half at +[0, 0]	xz 2048 4046848
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_read_half at +[8, 8]	xz 2048 4048896
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 0 address 0 border 0	xz 4096 4050944
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 0 address 0 border 0	xz 2048 4055040
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 0 border 0	xz 4096 4057088
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 0 border 0	xz 2048 4061184
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 2 border 0	xz 4096 4063232
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 2 border 0	xz 2048 4067328
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 4 border 0	xz 4096 4069376
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 4 border 0	xz 2048 4073472
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 0	xz 4096 4075520
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 0	xz 2048 4079616
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 1	xz 4096 4081664
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 1	xz 2048 4085760
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 1 address 5 border 2	xz 4096 4087808
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 1 address 5 border 2	xz 2048 4091904
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_float filter 0 address 5 border 2	xz 4096 4093952
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_sample_half filter 0 address 5 border 2	xz 2048 4098048
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 0 border 0	xz 16384 4100096
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 5 border 0	xz 16384 4116480
+BGR10_XR_sRGB swizzle [0, 1, 5, 3] rgbx_gather filter 0 address 5 border 2	xz 16384 4132864
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's: cases	23
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_read_float at +[0, 0]	xz 4096 4149248
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_read_float at +[8, 8]	xz 4096 4153344
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_read_half at +[0, 0]	xz 2048 4157440
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_read_half at +[8, 8]	xz 2048 4159488
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 0 address 0 border 0	xz 4096 4161536
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 0 address 0 border 0	xz 2048 4165632
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 0 border 0	xz 4096 4167680
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 0 border 0	xz 2048 4171776
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 2 border 0	xz 4096 4173824
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 2 border 0	xz 2048 4177920
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 4 border 0	xz 4096 4179968
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 4 border 0	xz 2048 4184064
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 0	xz 4096 4186112
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 0	xz 2048 4190208
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 1	xz 4096 4192256
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 1	xz 2048 4196352
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 1 address 5 border 2	xz 4096 4198400
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 1 address 5 border 2	xz 2048 4202496
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_float filter 0 address 5 border 2	xz 4096 4204544
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_sample_half filter 0 address 5 border 2	xz 2048 4208640
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 0 border 0	xz 16384 4210688
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 5 border 0	xz 16384 4227072
+BGR10_XR_sRGB swizzle [0, 1, 5, 3], a view's rgbx_gather filter 0 address 5 border 2	xz 16384 4243456

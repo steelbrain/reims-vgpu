@@ -7,7 +7,6 @@ use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, Texture
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::raise::death::DeathKind;
 use reims_vgpu_core::testkit::capture::catch_death;
-use reims_vgpu_metal::MetalPlatform;
 
 use super::super::NO_VIEW;
 use super::*;
@@ -146,7 +145,6 @@ fn textures_of_formats_metal_makes_none_of_are_nil_as_metals_are() {
     ];
     let d = dev();
     let p = platform();
-    let md = MetalPlatform::system_default_device();
     let s = bgra_surface(16, 16);
     for format in FORMATS {
         let own: &[Case] = match format {
@@ -161,21 +159,14 @@ fn textures_of_formats_metal_makes_none_of_are_nil_as_metals_are() {
             assert_eq!(ours.0, format, "{format} {what}");
             assert_eq!(ours.1, [false; 6], "{format} {what}");
             assert_eq!(ours.2.size, 0, "{format} {what}");
-            if let Some(md) = &md {
-                let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-                assert_eq!(
-                    answers::<MetalPlatform>(md, &metal, &s),
-                    ours,
-                    "Metal: {format} {what}"
-                );
-            }
+            reims_vgpu_core::metal_check!(format!("{format} {what}"), ours);
         }
     }
 }
 
 /// Every creator of a texture of a format here but `newSharedTextureWithDescriptor:` dies
-/// where Metal's validation asserts (measured: the module's docs; Metal's side cannot run, as
-/// its assert ends the process), and that one answers nil, as Metal's does
+/// where Metal's validation asserts (measured: the module's docs), and that one answers nil, as
+/// Metal's does
 #[test]
 fn textures_of_formats_metal_makes_none_of_die_where_metal_asserts() {
     let every: [Case; 19] = [
@@ -226,7 +217,6 @@ fn textures_of_formats_metal_makes_none_of_die_where_metal_asserts() {
     ];
     let d = dev();
     let p = platform();
-    let md = MetalPlatform::system_default_device();
     let s = bgra_surface(16, 16);
     let buffer = d
         .new_buffer(BufferDesc {
@@ -295,11 +285,6 @@ fn textures_of_formats_metal_makes_none_of_die_where_metal_asserts() {
             }
             let shared = d.new_shared_texture(&ours).unwrap();
             assert!(shared.is_none(), "{format} {what}");
-            if let Some(md) = &md {
-                let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-                let shared = md.new_shared_texture(&metal).unwrap();
-                assert!(shared.is_none(), "Metal: {format} {what}");
-            }
         }
     }
 }
@@ -334,11 +319,6 @@ fn views_in_formats_metal_makes_no_view_in_are_nil() {
         .new_texture(OnFault::Return, &platform().texture_descriptor(&source))
         .unwrap()
         .unwrap();
-    let md = MetalPlatform::system_default_device();
-    let metal = md.as_ref().map(|md| {
-        let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&source);
-        md.new_texture(OnFault::Return, &desc).unwrap().unwrap()
-    });
     let formats = NO_VIEW.iter().flat_map(|&(first, last)| first..=last);
     for format in formats {
         assert_eq!(
@@ -346,13 +326,6 @@ fn views_in_formats_metal_makes_no_view_in_are_nil() {
             [false; 6],
             "{format}"
         );
-        if let Some(metal) = &metal {
-            assert_eq!(
-                views::<MetalPlatform>(metal, format),
-                [false; 6],
-                "Metal: {format}"
-            );
-        }
     }
     let site = catch_death(|| ours.new_texture_view(501)).unwrap_err();
     assert_eq!(

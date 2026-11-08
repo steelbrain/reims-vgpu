@@ -1,0 +1,3 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+the first 64 bytes	bytes 64 ba847bea29433127a9132d55c22e4716 ee010203040102eeee0102030401020301eeeeeeeeeeeeee0102030401020304
+the fills	bytes 9437184 d3fb6ec0ebca06bfc1cfc0e32638d0c9 ee010203040102eeee0102030401020301eeeeeeeeeeeeee0102030401020304

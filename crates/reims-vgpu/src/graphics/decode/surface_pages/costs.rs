@@ -744,7 +744,6 @@ fn measure_large_takes<P: ApiPlatform>(label: &str) {
 
 /// The range mappings alone, with no GPU device made: what a profiler of the views' own code
 /// runs, outside the GPU's locks (`RGK_BENCH_MAP_ONLY=1` with the Vulkan test).
-#[cfg(vulkan_platform)]
 fn map_only<P: ApiPlatform>(label: &str) {
     let platform = P::process();
     let page = platform.vm().page_size().max(GUEST_PAGE);
@@ -797,7 +796,6 @@ fn map_only<P: ApiPlatform>(label: &str) {
 }
 
 /// The Vulkan platform's costs (module docs).
-#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn surface_view_costs_vulkan() {
@@ -911,42 +909,16 @@ mod raw {
     }
 }
 
-/// The Metal platform's costs, for comparison (module docs).
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement: run it alone, under the GPU locks"]
-fn surface_view_costs_metal() {
-    measure::<reims_vgpu_metal::MetalPlatform>("metal");
-}
-
 /// The Vulkan platform's takes of pages slabs (module docs).
-#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn pages_take_costs_vulkan() {
     measure_takes::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
 }
 
-/// The Metal platform's takes of pages slabs, for comparison (module docs).
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement: run it alone, under the GPU locks"]
-fn pages_take_costs_metal() {
-    measure_takes::<reims_vgpu_metal::MetalPlatform>("metal");
-}
-
 /// The Vulkan platform's takes of large pages slabs (module docs).
-#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement: run it alone, under the GPU locks"]
 fn large_take_costs_vulkan() {
     measure_large_takes::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
-}
-
-/// The Metal platform's takes of large pages slabs, for comparison (module docs).
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement: run it alone, under the GPU locks"]
-fn large_take_costs_metal() {
-    measure_large_takes::<reims_vgpu_metal::MetalPlatform>("metal");
 }

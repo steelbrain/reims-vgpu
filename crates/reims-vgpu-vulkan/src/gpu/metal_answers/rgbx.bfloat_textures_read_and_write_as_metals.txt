@@ -1,0 +1,217 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+R16Bfloat options 0x0 reads: cases	30
+R16Bfloat options 0x0 reads rgbx_read_float at +[0, 0]	xz 4096 0
+R16Bfloat options 0x0 reads rgbx_read_float at +[8, 8]	xz 4096 4096
+R16Bfloat options 0x0 reads rgbx_read_half at +[0, 0]	bytes 2048 267d324ca6dc2ca98ab022f4e4e50cb1 007c00000000003c000000000000003c402a00000000003c00fc00000000003c
+R16Bfloat options 0x0 reads rgbx_read_half at +[8, 8]	bytes 2048 4fe4a61ababf38ecc72ed49f4bdecbe5 008000000000003c000000000000003c007c00000000003c00fc00000000003c
+R16Bfloat options 0x0 reads rgbx_sample_float filter 0 address 0 border 0	xz 4096 8192
+R16Bfloat options 0x0 reads rgbx_sample_half filter 0 address 0 border 0	xz 2048 12288
+R16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 0 border 0	xz 4096 14336
+R16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 0 border 0	xz 2048 18432
+R16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 2 border 0	xz 4096 20480
+R16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 2 border 0	xz 2048 24576
+R16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 4 border 0	xz 4096 26624
+R16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 4 border 0	xz 2048 30720
+R16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 5 border 0	xz 4096 32768
+R16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 5 border 0	xz 2048 36864
+R16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 5 border 1	xz 4096 38912
+R16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 5 border 1	xz 2048 43008
+R16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 5 border 2	xz 4096 45056
+R16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 5 border 2	xz 2048 49152
+R16Bfloat options 0x0 reads rgbx_sample_float filter 0 address 5 border 2	xz 4096 51200
+R16Bfloat options 0x0 reads rgbx_sample_half filter 0 address 5 border 2	xz 2048 55296
+R16Bfloat options 0x0 reads rgbx_gather filter 0 address 0 border 0	xz 16384 57344
+R16Bfloat options 0x0 reads rgbx_gather filter 0 address 5 border 0	xz 16384 73728
+R16Bfloat options 0x0 reads rgbx_gather filter 0 address 5 border 2	xz 16384 90112
+R16Bfloat options 0x0 reads rgbx_read_held_float	xz 4096 106496
+R16Bfloat options 0x0 reads rgbx_read_held_half	bytes 2048 267d324ca6dc2ca98ab022f4e4e50cb1 007c00000000003c000000000000003c402a00000000003c00fc00000000003c
+R16Bfloat options 0x0 reads rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+R16Bfloat options 0x0 reads rgbx_sample_held filter 0 mip filter 0	xz 4096 110592
+R16Bfloat options 0x0 reads rgbx_gather_held filter 0 mip filter 0	xz 4096 114688
+R16Bfloat options 0x0 reads rgbx_sample_held filter 1 mip filter 0	xz 4096 118784
+R16Bfloat options 0x0 reads rgbx_gather_held filter 1 mip filter 0	xz 4096 122880
+R16Bfloat options 0x0 writes: cases	4
+R16Bfloat options 0x0 writes rgbx_write_float	bytes 512 04d63184795faa2abb86245a2d9d3b11 124e003f80ffd1d9003b81bb56fe62bfd5011b860efbfa3f386182bfe80d6485
+R16Bfloat options 0x0 writes rgbx_write_half	bytes 512 a88a7d55a490a9f214f3d6bbf2b8b9e3 124ecc39d642d1d9e33d3f4756fe194456c51b8619c0cf443861febae73e6485
+R16Bfloat options 0x0 writes rgbx_read_write_float reads	xz 4096 126976
+R16Bfloat options 0x0 writes rgbx_read_write_float leaves	bytes 512 ffb113276834f2e382cc972c1e12f629 124e403f403fd1d9403f403f56fe403f403f1b86403f403f3861403f403f6485
+R16Bfloat options 0x20 reads: cases	30
+R16Bfloat options 0x20 reads rgbx_read_float at +[0, 0]	xz 4096 131072
+R16Bfloat options 0x20 reads rgbx_read_float at +[8, 8]	xz 4096 135168
+R16Bfloat options 0x20 reads rgbx_read_half at +[0, 0]	bytes 2048 267d324ca6dc2ca98ab022f4e4e50cb1 007c00000000003c000000000000003c402a00000000003c00fc00000000003c
+R16Bfloat options 0x20 reads rgbx_read_half at +[8, 8]	bytes 2048 4fe4a61ababf38ecc72ed49f4bdecbe5 008000000000003c000000000000003c007c00000000003c00fc00000000003c
+R16Bfloat options 0x20 reads rgbx_sample_float filter 0 address 0 border 0	xz 4096 139264
+R16Bfloat options 0x20 reads rgbx_sample_half filter 0 address 0 border 0	xz 2048 143360
+R16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 0 border 0	xz 4096 145408
+R16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 0 border 0	xz 2048 149504
+R16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 2 border 0	xz 4096 151552
+R16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 2 border 0	xz 2048 155648
+R16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 4 border 0	xz 4096 157696
+R16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 4 border 0	xz 2048 161792
+R16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 5 border 0	xz 4096 163840
+R16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 5 border 0	xz 2048 167936
+R16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 5 border 1	xz 4096 169984
+R16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 5 border 1	xz 2048 174080
+R16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 5 border 2	xz 4096 176128
+R16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 5 border 2	xz 2048 180224
+R16Bfloat options 0x20 reads rgbx_sample_float filter 0 address 5 border 2	xz 4096 182272
+R16Bfloat options 0x20 reads rgbx_sample_half filter 0 address 5 border 2	xz 2048 186368
+R16Bfloat options 0x20 reads rgbx_gather filter 0 address 0 border 0	xz 16384 188416
+R16Bfloat options 0x20 reads rgbx_gather filter 0 address 5 border 0	xz 16384 204800
+R16Bfloat options 0x20 reads rgbx_gather filter 0 address 5 border 2	xz 16384 221184
+R16Bfloat options 0x20 reads rgbx_read_held_float	xz 4096 237568
+R16Bfloat options 0x20 reads rgbx_read_held_half	bytes 2048 267d324ca6dc2ca98ab022f4e4e50cb1 007c00000000003c000000000000003c402a00000000003c00fc00000000003c
+R16Bfloat options 0x20 reads rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+R16Bfloat options 0x20 reads rgbx_sample_held filter 0 mip filter 0	xz 4096 241664
+R16Bfloat options 0x20 reads rgbx_gather_held filter 0 mip filter 0	xz 4096 245760
+R16Bfloat options 0x20 reads rgbx_sample_held filter 1 mip filter 0	xz 4096 249856
+R16Bfloat options 0x20 reads rgbx_gather_held filter 1 mip filter 0	xz 4096 253952
+R16Bfloat options 0x20 writes: cases	4
+R16Bfloat options 0x20 writes rgbx_write_float	bytes 512 04d63184795faa2abb86245a2d9d3b11 124e003f80ffd1d9003b81bb56fe62bfd5011b860efbfa3f386182bfe80d6485
+R16Bfloat options 0x20 writes rgbx_write_half	bytes 512 a88a7d55a490a9f214f3d6bbf2b8b9e3 124ecc39d642d1d9e33d3f4756fe194456c51b8619c0cf443861febae73e6485
+R16Bfloat options 0x20 writes rgbx_read_write_float reads	xz 4096 258048
+R16Bfloat options 0x20 writes rgbx_read_write_float leaves	bytes 512 ffb113276834f2e382cc972c1e12f629 124e403f403fd1d9403f403f56fe403f403f1b86403f403f3861403f403f6485
+RG16Bfloat options 0x0 reads: cases	30
+RG16Bfloat options 0x0 reads rgbx_read_float at +[0, 0]	xz 4096 262144
+RG16Bfloat options 0x0 reads rgbx_read_float at +[8, 8]	bytes 4096 bbfc5e70fb3971fee532175795c02587 00007a6800004be3000000000000803f0000700f0000052d000000000000803f
+RG16Bfloat options 0x0 reads rgbx_read_half at +[0, 0]	bytes 2048 061f6eef9fd0ecdffc07104cd66a38a1 a0b0007c0000003c008000fc0000003c00fc00000000003c0080007c0000003c
+RG16Bfloat options 0x0 reads rgbx_read_half at +[8, 8]	bytes 2048 0e786637e8f10092f1466b5e5e7cab61 007c00fc0000003c000000000000003c00fc00fc0000003c280900000000003c
+RG16Bfloat options 0x0 reads rgbx_sample_float filter 0 address 0 border 0	xz 4096 266240
+RG16Bfloat options 0x0 reads rgbx_sample_half filter 0 address 0 border 0	xz 2048 270336
+RG16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 0 border 0	xz 4096 272384
+RG16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 0 border 0	xz 2048 276480
+RG16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 2 border 0	xz 4096 278528
+RG16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 2 border 0	xz 2048 282624
+RG16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 4 border 0	xz 4096 284672
+RG16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 4 border 0	xz 2048 288768
+RG16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 5 border 0	xz 4096 290816
+RG16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 5 border 0	xz 2048 294912
+RG16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 5 border 1	xz 4096 296960
+RG16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 5 border 1	xz 2048 301056
+RG16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 5 border 2	xz 4096 303104
+RG16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 5 border 2	xz 2048 307200
+RG16Bfloat options 0x0 reads rgbx_sample_float filter 0 address 5 border 2	xz 4096 309248
+RG16Bfloat options 0x0 reads rgbx_sample_half filter 0 address 5 border 2	xz 2048 313344
+RG16Bfloat options 0x0 reads rgbx_gather filter 0 address 0 border 0	xz 16384 315392
+RG16Bfloat options 0x0 reads rgbx_gather filter 0 address 5 border 0	xz 16384 331776
+RG16Bfloat options 0x0 reads rgbx_gather filter 0 address 5 border 2	xz 16384 348160
+RG16Bfloat options 0x0 reads rgbx_read_held_float	xz 4096 364544
+RG16Bfloat options 0x0 reads rgbx_read_held_half	bytes 2048 061f6eef9fd0ecdffc07104cd66a38a1 a0b0007c0000003c008000fc0000003c00fc00000000003c0080007c0000003c
+RG16Bfloat options 0x0 reads rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+RG16Bfloat options 0x0 reads rgbx_sample_held filter 0 mip filter 0	xz 4096 368640
+RG16Bfloat options 0x0 reads rgbx_gather_held filter 0 mip filter 0	xz 4096 372736
+RG16Bfloat options 0x0 reads rgbx_sample_held filter 1 mip filter 0	xz 4096 376832
+RG16Bfloat options 0x0 reads rgbx_gather_held filter 1 mip filter 0	xz 4096 380928
+RG16Bfloat options 0x0 writes: cases	4
+RG16Bfloat options 0x0 writes rgbx_write_float	xz 1024 385024
+RG16Bfloat options 0x0 writes rgbx_write_half	bytes 1024 0512e23cb76ed0e5393591dad46a3382 14bedf48cb3950bc84bfa6b92389b54e873e30c3e6ba807f983edbe0be3b85b9
+RG16Bfloat options 0x0 writes rgbx_read_write_float reads	xz 4096 386048
+RG16Bfloat options 0x0 writes rgbx_read_write_float leaves	bytes 1024 57d3730b3bbe9387e21dc5076b30668e 14bedf48403f803e403f803e2389b54e403f803e403f803e983edbe0403f803e
+RG16Bfloat options 0x20 reads: cases	30
+RG16Bfloat options 0x20 reads rgbx_read_float at +[0, 0]	xz 4096 390144
+RG16Bfloat options 0x20 reads rgbx_read_float at +[8, 8]	bytes 4096 bbfc5e70fb3971fee532175795c02587 00007a6800004be3000000000000803f0000700f0000052d000000000000803f
+RG16Bfloat options 0x20 reads rgbx_read_half at +[0, 0]	bytes 2048 061f6eef9fd0ecdffc07104cd66a38a1 a0b0007c0000003c008000fc0000003c00fc00000000003c0080007c0000003c
+RG16Bfloat options 0x20 reads rgbx_read_half at +[8, 8]	bytes 2048 0e786637e8f10092f1466b5e5e7cab61 007c00fc0000003c000000000000003c00fc00fc0000003c280900000000003c
+RG16Bfloat options 0x20 reads rgbx_sample_float filter 0 address 0 border 0	xz 4096 394240
+RG16Bfloat options 0x20 reads rgbx_sample_half filter 0 address 0 border 0	xz 2048 398336
+RG16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 0 border 0	xz 4096 400384
+RG16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 0 border 0	xz 2048 404480
+RG16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 2 border 0	xz 4096 406528
+RG16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 2 border 0	xz 2048 410624
+RG16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 4 border 0	xz 4096 412672
+RG16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 4 border 0	xz 2048 416768
+RG16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 5 border 0	xz 4096 418816
+RG16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 5 border 0	xz 2048 422912
+RG16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 5 border 1	xz 4096 424960
+RG16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 5 border 1	xz 2048 429056
+RG16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 5 border 2	xz 4096 431104
+RG16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 5 border 2	xz 2048 435200
+RG16Bfloat options 0x20 reads rgbx_sample_float filter 0 address 5 border 2	xz 4096 437248
+RG16Bfloat options 0x20 reads rgbx_sample_half filter 0 address 5 border 2	xz 2048 441344
+RG16Bfloat options 0x20 reads rgbx_gather filter 0 address 0 border 0	xz 16384 443392
+RG16Bfloat options 0x20 reads rgbx_gather filter 0 address 5 border 0	xz 16384 459776
+RG16Bfloat options 0x20 reads rgbx_gather filter 0 address 5 border 2	xz 16384 476160
+RG16Bfloat options 0x20 reads rgbx_read_held_float	xz 4096 492544
+RG16Bfloat options 0x20 reads rgbx_read_held_half	bytes 2048 061f6eef9fd0ecdffc07104cd66a38a1 a0b0007c0000003c008000fc0000003c00fc00000000003c0080007c0000003c
+RG16Bfloat options 0x20 reads rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+RG16Bfloat options 0x20 reads rgbx_sample_held filter 0 mip filter 0	xz 4096 496640
+RG16Bfloat options 0x20 reads rgbx_gather_held filter 0 mip filter 0	xz 4096 500736
+RG16Bfloat options 0x20 reads rgbx_sample_held filter 1 mip filter 0	xz 4096 504832
+RG16Bfloat options 0x20 reads rgbx_gather_held filter 1 mip filter 0	xz 4096 508928
+RG16Bfloat options 0x20 writes: cases	4
+RG16Bfloat options 0x20 writes rgbx_write_float	xz 1024 513024
+RG16Bfloat options 0x20 writes rgbx_write_half	bytes 1024 0512e23cb76ed0e5393591dad46a3382 14bedf48cb3950bc84bfa6b92389b54e873e30c3e6ba807f983edbe0be3b85b9
+RG16Bfloat options 0x20 writes rgbx_read_write_float reads	xz 4096 514048
+RG16Bfloat options 0x20 writes rgbx_read_write_float leaves	bytes 1024 57d3730b3bbe9387e21dc5076b30668e 14bedf48403f803e403f803e2389b54e403f803e403f803e983edbe0403f803e
+RGBA16Bfloat options 0x0 reads: cases	30
+RGBA16Bfloat options 0x0 reads rgbx_read_float at +[0, 0]	xz 4096 518144
+RGBA16Bfloat options 0x0 reads rgbx_read_float at +[8, 8]	xz 4096 522240
+RGBA16Bfloat options 0x0 reads rgbx_read_half at +[0, 0]	bytes 2048 c9abe264e2323141ea73719b14040d61 00fc703206800000007c0080007c008000fc00fc00800080008000fc00fc007c
+RGBA16Bfloat options 0x0 reads rgbx_read_half at +[8, 8]	bytes 2048 8541a4e9e63c122107369fb817e5b8ee 007c007c00fcd001007c008000fc0080007e008000fc0280f28000fc007c0000
+RGBA16Bfloat options 0x0 reads rgbx_sample_float filter 0 address 0 border 0	xz 4096 526336
+RGBA16Bfloat options 0x0 reads rgbx_sample_half filter 0 address 0 border 0	xz 2048 530432
+RGBA16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 0 border 0	xz 4096 532480
+RGBA16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 0 border 0	xz 2048 536576
+RGBA16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 2 border 0	xz 4096 538624
+RGBA16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 2 border 0	xz 2048 542720
+RGBA16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 4 border 0	xz 4096 544768
+RGBA16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 4 border 0	xz 2048 548864
+RGBA16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 5 border 0	xz 4096 550912
+RGBA16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 5 border 0	xz 2048 555008
+RGBA16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 5 border 1	xz 4096 557056
+RGBA16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 5 border 1	xz 2048 561152
+RGBA16Bfloat options 0x0 reads rgbx_sample_float filter 1 address 5 border 2	xz 4096 563200
+RGBA16Bfloat options 0x0 reads rgbx_sample_half filter 1 address 5 border 2	xz 2048 567296
+RGBA16Bfloat options 0x0 reads rgbx_sample_float filter 0 address 5 border 2	xz 4096 569344
+RGBA16Bfloat options 0x0 reads rgbx_sample_half filter 0 address 5 border 2	xz 2048 573440
+RGBA16Bfloat options 0x0 reads rgbx_gather filter 0 address 0 border 0	xz 16384 575488
+RGBA16Bfloat options 0x0 reads rgbx_gather filter 0 address 5 border 0	xz 16384 591872
+RGBA16Bfloat options 0x0 reads rgbx_gather filter 0 address 5 border 2	xz 16384 608256
+RGBA16Bfloat options 0x0 reads rgbx_read_held_float	xz 4096 624640
+RGBA16Bfloat options 0x0 reads rgbx_read_held_half	bytes 2048 c9abe264e2323141ea73719b14040d61 00fc703206800000007c0080007c008000fc00fc00800080008000fc00fc007c
+RGBA16Bfloat options 0x0 reads rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+RGBA16Bfloat options 0x0 reads rgbx_sample_held filter 0 mip filter 0	xz 4096 628736
+RGBA16Bfloat options 0x0 reads rgbx_gather_held filter 0 mip filter 0	xz 4096 632832
+RGBA16Bfloat options 0x0 reads rgbx_sample_held filter 1 mip filter 0	xz 4096 636928
+RGBA16Bfloat options 0x0 reads rgbx_gather_held filter 1 mip filter 0	xz 4096 641024
+RGBA16Bfloat options 0x0 writes: cases	4
+RGBA16Bfloat options 0x0 writes rgbx_write_float	xz 2048 645120
+RGBA16Bfloat options 0x0 writes rgbx_write_half	bytes 2048 54a2d4a21e68b2dcabd7063e8a132b89 17ee4e3eb2b418156447a2c20b41963fabbf614344ba08c61eae02ff65cc5256
+RGBA16Bfloat options 0x0 writes rgbx_read_write_float reads	xz 4096 647168
+RGBA16Bfloat options 0x0 writes rgbx_read_write_float leaves	bytes 2048 203cf2c2506e29ddd5e8ea6ee8b19d38 17ee4e3eb2b41815803e5352803e0f7d803e803e7af505fe1eae02ff65cc5256
+RGBA16Bfloat options 0x20 reads: cases	30
+RGBA16Bfloat options 0x20 reads rgbx_read_float at +[0, 0]	xz 4096 651264
+RGBA16Bfloat options 0x20 reads rgbx_read_float at +[8, 8]	xz 4096 655360
+RGBA16Bfloat options 0x20 reads rgbx_read_half at +[0, 0]	bytes 2048 c9abe264e2323141ea73719b14040d61 00fc703206800000007c0080007c008000fc00fc00800080008000fc00fc007c
+RGBA16Bfloat options 0x20 reads rgbx_read_half at +[8, 8]	bytes 2048 8541a4e9e63c122107369fb817e5b8ee 007c007c00fcd001007c008000fc0080007e008000fc0280f28000fc007c0000
+RGBA16Bfloat options 0x20 reads rgbx_sample_float filter 0 address 0 border 0	xz 4096 659456
+RGBA16Bfloat options 0x20 reads rgbx_sample_half filter 0 address 0 border 0	xz 2048 663552
+RGBA16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 0 border 0	xz 4096 665600
+RGBA16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 0 border 0	xz 2048 669696
+RGBA16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 2 border 0	xz 4096 671744
+RGBA16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 2 border 0	xz 2048 675840
+RGBA16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 4 border 0	xz 4096 677888
+RGBA16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 4 border 0	xz 2048 681984
+RGBA16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 5 border 0	xz 4096 684032
+RGBA16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 5 border 0	xz 2048 688128
+RGBA16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 5 border 1	xz 4096 690176
+RGBA16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 5 border 1	xz 2048 694272
+RGBA16Bfloat options 0x20 reads rgbx_sample_float filter 1 address 5 border 2	xz 4096 696320
+RGBA16Bfloat options 0x20 reads rgbx_sample_half filter 1 address 5 border 2	xz 2048 700416
+RGBA16Bfloat options 0x20 reads rgbx_sample_float filter 0 address 5 border 2	xz 4096 702464
+RGBA16Bfloat options 0x20 reads rgbx_sample_half filter 0 address 5 border 2	xz 2048 706560
+RGBA16Bfloat options 0x20 reads rgbx_gather filter 0 address 0 border 0	xz 16384 708608
+RGBA16Bfloat options 0x20 reads rgbx_gather filter 0 address 5 border 0	xz 16384 724992
+RGBA16Bfloat options 0x20 reads rgbx_gather filter 0 address 5 border 2	xz 16384 741376
+RGBA16Bfloat options 0x20 reads rgbx_read_held_float	xz 4096 757760
+RGBA16Bfloat options 0x20 reads rgbx_read_held_half	bytes 2048 c9abe264e2323141ea73719b14040d61 00fc703206800000007c0080007c008000fc00fc00800080008000fc00fc007c
+RGBA16Bfloat options 0x20 reads rgbx_query_held	bytes 4096 c0394efa4912c47c6de0e96b1cb0b58d 1000000010000000010000000000000010000000100000000100000000000000
+RGBA16Bfloat options 0x20 reads rgbx_sample_held filter 0 mip filter 0	xz 4096 761856
+RGBA16Bfloat options 0x20 reads rgbx_gather_held filter 0 mip filter 0	xz 4096 765952
+RGBA16Bfloat options 0x20 reads rgbx_sample_held filter 1 mip filter 0	xz 4096 770048
+RGBA16Bfloat options 0x20 reads rgbx_gather_held filter 1 mip filter 0	xz 4096 774144
+RGBA16Bfloat options 0x20 writes: cases	4
+RGBA16Bfloat options 0x20 writes rgbx_write_float	xz 2048 778240
+RGBA16Bfloat options 0x20 writes rgbx_write_half	bytes 2048 54a2d4a21e68b2dcabd7063e8a132b89 17ee4e3eb2b418156447a2c20b41963fabbf614344ba08c61eae02ff65cc5256
+RGBA16Bfloat options 0x20 writes rgbx_read_write_float reads	xz 4096 780288
+RGBA16Bfloat options 0x20 writes rgbx_read_write_float leaves	bytes 2048 203cf2c2506e29ddd5e8ea6ee8b19d38 17ee4e3eb2b41815803e5352803e0f7d803e803e7af505fe1eae02ff65cc5256

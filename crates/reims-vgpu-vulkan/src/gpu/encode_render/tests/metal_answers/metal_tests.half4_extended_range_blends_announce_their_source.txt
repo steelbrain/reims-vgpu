@@ -1,0 +1,139 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+fast math xr_half_fragment format 550 blend None	bytes 65536 66c3837cb5c4458ee2766c872675dd86 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282bedddc5c3f
+fast math xr_half_fragment format 550 blend Some([1, 1, 0, 1, 1, 0])	bytes 65536 627affcff63cccf1c9351f8c2a62df3d 6060a03fc1c0c03ebfbe3ebf0000803fd6d5d5be4f4f4f3fc7c6463e0000803f
+fast math xr_half_fragment format 550 blend Some([0, 5, 0, 0, 5, 0])	bytes 65536 c4183744e4f660f7aadcf31b9f16d845 b0af2f3f959414bfebea6abec5c4443f9594943dcdccccbdf1f070bdc9c8483e
+fast math xr_half_fragment format 550 blend Some([1, 5, 0, 1, 5, 0])	bytes 65536 3d2d971edff9ceebcb5cc8e9ce44382e 6060a03f8d8c0c3f2d2d2dbf0000803fabaa2abf5353933fc8c7c73ef8f7773f
+fast math xr_half_fragment format 550 blend Some([4, 5, 0, 1, 5, 0])	bytes 65536 fcd86b7ff95439c1552e6b4110466dc7 e6e5653fa5a4a4beaaa9a9be0000803ffefdfdbe5d5d5d3f9493933ef8f7773f
+fast math xr_half_fragment format 550 blend Some([4, 5, 0, 4, 5, 0])	bytes 65536 ad333126dff12f7c31312a38881cbdd7 e6e5653fa5a4a4beaaa9a9bed3d2523ffefdfdbe5d5d5d3f9493933ecbca4a3f
+fast math xr_half_fragment format 550 blend Some([6, 0, 0, 6, 0, 0])	bytes 65536 b50bb0754d2fed8ab7e73b9c2805b5d8 5353533fc1c040bf8988083eedec6c3ef3f272be0d0d0dbfe9e8e8bdabaa2a3f
+fast math xr_half_fragment format 550 blend Some([6, 5, 0, 1, 5, 0])	bytes 65536 331fb7bade74d7a38a6606873e9c103d 6060a03fc1c040bfc5c4c4bd0000803fa9a828be272727bfb1b030bef8f7773f
+fast math xr_half_fragment format 550 blend Some([3, 8, 0, 1, 1, 0])	bytes 65536 1672dfb5d1de55bf49a03f6a7598defd f5f4743fc1c040bfc1c040bf0000803fc1c040bfb2b131bfe1e0e03c0000803f
+fast math xr_half_fragment format 550 blend Some([3, 6, 0, 1, 1, 0])	bytes 65536 c9217c1ffe605c635f2bd70ba2b0bc79 dcdb5b3fd8d7d73e8f8e0ebf0000803fc1c040bff5f4f4bda09f9f3e0000803f
+fast math xr_half_fragment format 550 blend Some([3, 5, 0, 1, 5, 0])	bytes 65536 6b15363c7ae5132685092a0b441b30cb c1c0403fbab939bfc1c040bf0000803fc1c040bfd5d4d4bec1c0403ef8f7773f
+fast math xr_half_fragment format 550 blend Some([6, 2, 0, 1, 1, 0])	bytes 65536 7545ffdbca5a3ad6ea17a69959f286fb 6060a03fc1c040bf8988883e0000803ff3f2f2bec1c040bfebea6abe0000803f
+fast math xr_half_fragment format 550 blend Some([1, 1, 1, 1, 1, 1])	bytes 65536 a311f6fbe4080186ee1c3b414b1b11af 9998183d6060a03f999818be00000000c1c040bf6060a03f3434343f00000000
+fast math xr_half_fragment format 550 blend Some([1, 1, 2, 1, 1, 2])	bytes 65536 c7bbe3a247bd382fa8cc0aadfc2cc7b0 999818bdc1c040bf9998183ec5c4443fc8c7873fc1c040bf343434bfb9b8b83d
+fast math xr_half_fragment format 550 blend Some([1, 1, 3, 1, 1, 3])	bytes 65536 ce072fa5ec37c996d31ab4071b25c23e e4e3633fc1c040bfe5e4e4beedec6c3e3d3d3dbfe2e1e1be838282bec6c5453f
+fast math xr_half_fragment format 550 blend Some([1, 1, 4, 1, 1, 4])	bytes 65536 f9f8c88f146c73386f2434a1ade08db6 6d6d6d3f9190903f999898be0000803fa5a4a43e2020a03fe6e5e53edddc5c3f
+fast math xr_half_fragment format 550 blend Some([7, 1, 0, 1, 1, 0])	bytes 65536 f629bfbc15621a4b5f64dd162e034b0b fefd7d3fdddc9c3fc1c040bf0000803fb9b838be6060a03f9f9e9e3e0000803f
+fast math xr_half_fragment format 550 blend Some([9, 1, 0, 9, 1, 0])	bytes 65536 558e48b872f7360dd7113c5e9bc45a0c e4e3633fc1c040bf999898be0000803fe1e0603e8a8989bec7c646bef8f7773f
+fast math xr_half_fragment format 550 blend Some([2, 0, 0, 2, 0, 0])	bytes 65536 b3b5e9e145c10e26d2b403b1b9489f52 5c5c5c3f6060a03fcdcc4c3ed1d0503d0c0c0c3f6060a03fcfce4e3e9998183f
+fast math xr_half_fragment format 550 blend Some([10, 1, 0, 1, 1, 0])	bytes 65536 69097ef2308d406e903c9639350bc021 e4e3633fc1c040bf999898be0000803fe1e0603e8a8989bec7c646be0000803f
+fast math xr_half_fragment format 550 blend Some([8, 9, 0, 8, 9, 0])	bytes 65536 b27e2104f800cef301becb53f5d9a0ab 6d6d6d3f9190903fe5e4e4beedec6c3e181818bf4242823fb5b4b43ec9c8483f
+fast math xr_half_fragment format 550 blend Some([11, 12, 0, 13, 14, 0])	bytes 65536 738adcd8acd3c68f7a502909f1cb0d86 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282bedddc5c3f
+fast math xr_half_fragment format 550 blend Some([5, 4, 0, 5, 4, 0])	bytes 65536 c493ebb1ea8f7b13299704a01a3c89e2 6b6b6b3f3232323fd3d2d2bed1d0d03ea1a0a03de1e060bdc1c0c0bdd8d7573f
+fast math xr_half_fragment format 552 blend None	bytes 65536 db3d31faeffcaefae7a174f6bdd21dbc e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be5d5d5d3f
+fast math xr_half_fragment format 552 blend Some([1, 1, 0, 1, 1, 0])	bytes 65536 a1ca334715b22d18611b775da72ff308 6060a03fc1c0c03ebfbe3ebf0000803fd6d5d5be4f4f4f3fc7c6463e0000803f
+fast math xr_half_fragment format 552 blend Some([0, 5, 0, 0, 5, 0])	bytes 65536 564f465fd3a95e9b71a9dfcb280f0dcf b0af2f3f959414bfebea6abe4545453f9594943dcdccccbdf1f070bdcbca4a3e
+fast math xr_half_fragment format 552 blend Some([1, 5, 0, 1, 5, 0])	bytes 65536 9a90c5175f90b49426c10229e396c949 6060a03f8d8c0c3f2d2d2dbf0000803fabaa2abf5353933fc8c7c73ef8f7773f
+fast math xr_half_fragment format 552 blend Some([4, 5, 0, 1, 5, 0])	bytes 65536 1fcd4beb138f821a6626d25c5ec1c03c e6e5653fa5a4a4beaaa9a9be0000803ffefdfdbe5d5d5d3f9493933ef8f7773f
+fast math xr_half_fragment format 552 blend Some([4, 5, 0, 4, 5, 0])	bytes 65536 4600f4aff31cde86b233c232002a3e72 e6e5653fa5a4a4beaaa9a9bed3d2523ffefdfdbe5d5d5d3f9493933ecbca4a3f
+fast math xr_half_fragment format 552 blend Some([6, 0, 0, 6, 0, 0])	bytes 65536 2a1ba20711fbdd4f7cbde9cef521267a 5353533fc1c040bf8988083eebea6a3ef3f272be0d0d0dbfe9e8e8bdabaa2a3f
+fast math xr_half_fragment format 552 blend Some([6, 5, 0, 1, 5, 0])	bytes 65536 076805a4e6b76a2f89160bcb726765c6 6060a03fc1c040bfc5c4c4bd0000803fa9a828be272727bfb1b030bef8f7773f
+fast math xr_half_fragment format 552 blend Some([3, 8, 0, 1, 1, 0])	bytes 65536 5ad0d4a82fabb9328d4075f890eca34b f5f4743fc1c040bfc1c040bf0000803fc1c040bf323232bfe1e0e03c0000803f
+fast math xr_half_fragment format 552 blend Some([3, 6, 0, 1, 1, 0])	bytes 65536 a8a5518beb11d282a7497cfff58176f4 dcdb5b3fd8d7d73e8f8e0ebf0000803fc1c040bff5f4f4bda09f9f3e0000803f
+fast math xr_half_fragment format 552 blend Some([3, 5, 0, 1, 5, 0])	bytes 65536 91195ce4611b42d0711470e970125cb4 c1c0403fbab939bfc1c040bf0000803fc1c040bfd5d4d4bec1c0403ef8f7773f
+fast math xr_half_fragment format 552 blend Some([6, 2, 0, 1, 1, 0])	bytes 65536 80022546eea03f6f7549910be74a7f92 6060a03fc1c040bf8988883e0000803ff3f2f2bec1c040bfebea6abe0000803f
+fast math xr_half_fragment format 552 blend Some([1, 1, 1, 1, 1, 1])	bytes 65536 c45e3f5fdd31578bd6c9cef578ec922c 9998183d6060a03f999818be00000000c1c040bf6060a03f3434343f00000000
+fast math xr_half_fragment format 552 blend Some([1, 1, 2, 1, 1, 2])	bytes 65536 c08cb367fca068d8c219e1f78a4efa62 999818bdc1c040bf9998183e4545453fc8c7873fc1c040bf343434bfc1c0c03d
+fast math xr_half_fragment format 552 blend Some([1, 1, 3, 1, 1, 3])	bytes 65536 c1bb0a69b00a68f7dc06029308ad572f e4e3633fc1c040bfe5e4e4beebea6a3e3d3d3dbfe2e1e1be838282be4545453f
+fast math xr_half_fragment format 552 blend Some([1, 1, 4, 1, 1, 4])	bytes 65536 537246c53b4aa7cf0084810af7615580 6d6d6d3f9190903f999898be0000803fa5a4a43e2020a03fe6e5e53e5d5d5d3f
+fast math xr_half_fragment format 552 blend Some([7, 1, 0, 1, 1, 0])	bytes 65536 22c2f44f600d259cad31ba0a1db3beb2 fefd7d3fdddc9c3fc1c040bf0000803fb9b838be6060a03f9f9e9e3e0000803f
+fast math xr_half_fragment format 552 blend Some([9, 1, 0, 9, 1, 0])	bytes 65536 7e525fd84531c697ce30f22c1e89547d e4e3633fc1c040bf999898be0000803fe3e2623e8c8b8bbec7c646bef8f7773f
+fast math xr_half_fragment format 552 blend Some([2, 0, 0, 2, 0, 0])	bytes 65536 129a40ee1f6dc218a3f82524f5d6ef83 5c5c5c3f6060a03fcdcc4c3ed9d8583d0c0c0c3f6060a03fcfce4e3e9998183f
+fast math xr_half_fragment format 552 blend Some([10, 1, 0, 1, 1, 0])	bytes 65536 cefc3907871ab7ab9a154b70e44efdb0 e4e3633fc1c040bf999898be0000803fe3e2623e8c8b8bbec7c646be0000803f
+fast math xr_half_fragment format 552 blend Some([8, 9, 0, 8, 9, 0])	bytes 65536 41a0139535247fecbb2626ef48cb6f51 6d6d6d3f9190903fe5e4e4beebea6a3e999818bfc3c2823fb6b5b53ec9c8483f
+fast math xr_half_fragment format 552 blend Some([11, 12, 0, 13, 14, 0])	bytes 65536 1b11fcff3248a99e84e31ebb4581f63c e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be5d5d5d3f
+fast math xr_half_fragment format 552 blend Some([5, 4, 0, 5, 4, 0])	bytes 65536 6a53a6ad52da2631b33c38f67120ade7 6b6b6b3f3232323fd3d2d2bed0cfcf3ea1a0a03de1e060bdc1c0c0bdd8d7573f
+fast math xr_half_fragment format 554 blend None	bytes 65536 251167742de895f7a4a97a7f44c14384 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 0, 1, 1, 0])	bytes 65536 0873ff79eef2bcfb097cf45b78223962 6060a03fc1c0c03ebfbe3ebf0000803fd6d5d5be4f4f4f3fc7c6463e0000803f
+fast math xr_half_fragment format 554 blend Some([0, 5, 0, 0, 5, 0])	bytes 65536 304e44b296a8a8a9b712184e193a08e7 b0af2f3f959414bfebea6abe0000803f9594943dcdccccbdf1f070bd0000803f
+fast math xr_half_fragment format 554 blend Some([1, 5, 0, 1, 5, 0])	bytes 65536 1e042673629ed4e2697b1fa92dcc8359 6060a03f8d8c0c3f2d2d2dbf0000803fabaa2abf5353933fc8c7c73e0000803f
+fast math xr_half_fragment format 554 blend Some([4, 5, 0, 1, 5, 0])	bytes 65536 0edc4ba271861532284cca78590cc640 e6e5653fa5a4a4beaaa9a9be0000803ffefdfdbe5d5d5d3f9493933e0000803f
+fast math xr_half_fragment format 554 blend Some([4, 5, 0, 4, 5, 0])	bytes 65536 0edc4ba271861532284cca78590cc640 e6e5653fa5a4a4beaaa9a9be0000803ffefdfdbe5d5d5d3f9493933e0000803f
+fast math xr_half_fragment format 554 blend Some([6, 0, 0, 6, 0, 0])	bytes 65536 32db70bf17ddce65193072061375600c 5353533fc1c040bf8988083e0000803ff3f272be0d0d0dbfe9e8e8bd0000803f
+fast math xr_half_fragment format 554 blend Some([6, 5, 0, 1, 5, 0])	bytes 65536 75712b658d9b178f83b3dff56e8452b6 6060a03fc1c040bfc5c4c4bd0000803fa9a828be272727bfb1b030be0000803f
+fast math xr_half_fragment format 554 blend Some([3, 8, 0, 1, 1, 0])	bytes 65536 3f4fab4d49cab4dfda0581a1eb1e5852 f5f4743fc1c040bfc1c040bf0000803fc1c040bfc1c040bf818000bc0000803f
+fast math xr_half_fragment format 554 blend Some([3, 6, 0, 1, 1, 0])	bytes 65536 a5d2493d4d8660cace56e6d6f07e543e dcdb5b3fd8d7d73e8f8e0ebf0000803fc1c040bff5f4f4bda09f9f3e0000803f
+fast math xr_half_fragment format 554 blend Some([3, 5, 0, 1, 5, 0])	bytes 65536 190392b99bc1bb21b336be668432b3a8 c1c0403fbab939bfc1c040bf0000803fc1c040bfd5d4d4bec1c0403e0000803f
+fast math xr_half_fragment format 554 blend Some([6, 2, 0, 1, 1, 0])	bytes 65536 e2c54bf7ea8c5965e92dd32119a6e41c 6060a03fc1c040bf8988883e0000803ff3f2f2bec1c040bfebea6abe0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 1, 1, 1, 1])	bytes 65536 e310e0c7852b76f55d51f5cb625351b1 9998183d6060a03f999818be0000803fc1c040bf6060a03f3434343f0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 2, 1, 1, 2])	bytes 65536 5f4596ac8c44231648dd8cf9a95d5995 999818bdc1c040bf9998183e0000803fc8c7873fc1c040bf343434bf0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 3, 1, 1, 3])	bytes 65536 199c7b71e0f3472b038f925aaccfb4a9 e4e3633fc1c040bfe5e4e4be0000803f3d3d3dbfe2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 4, 1, 1, 4])	bytes 65536 a40017a2681052192e61d5022b0eac88 6d6d6d3f9190903f999898be0000803fa5a4a43e2020a03fe6e5e53e0000803f
+fast math xr_half_fragment format 554 blend Some([7, 1, 0, 1, 1, 0])	bytes 65536 42d33e904a0074dfc976307e4e29536c fefd7d3fdddc9c3fc1c040bf0000803fb9b838be6060a03f9f9e9e3e0000803f
+fast math xr_half_fragment format 554 blend Some([9, 1, 0, 9, 1, 0])	bytes 65536 95f13dd758752cfab6eaa2926c11e004 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([2, 0, 0, 2, 0, 0])	bytes 65536 e3fa9bb52d9d1396aeae2ce5abbde57f 5c5c5c3f6060a03fcdcc4c3e0000803f0c0c0c3f6060a03fcfce4e3e0000803f
+fast math xr_half_fragment format 554 blend Some([10, 1, 0, 1, 1, 0])	bytes 65536 95f13dd758752cfab6eaa2926c11e004 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([8, 9, 0, 8, 9, 0])	bytes 65536 35f8f47652be86aa2b8bde9866ca6715 6d6d6d3f9190903fe5e4e4be0000803f3d3d3dbf2020a03fe6e5e53e0000803f
+fast math xr_half_fragment format 554 blend Some([11, 12, 0, 13, 14, 0])	bytes 65536 95f13dd758752cfab6eaa2926c11e004 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([5, 4, 0, 5, 4, 0])	bytes 65536 829a93830733edf67716a4bd4ad7410b 6b6b6b3f3232323fd3d2d2be0000803fa1a0a03de1e060bdc1c0c0bd0000803f
+fast math xr_half_fragment format 550 blend None in one pass	bytes 65536 66c3837cb5c4458ee2766c872675dd86 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282bedddc5c3f
+fast math xr_half_fragment format 550 blend Some([1, 1, 0, 1, 1, 0]) in one pass	bytes 65536 e9849b69a2ff529e4a114f0d3f58a9b6 6060a03fc1c0c03ebfbe3ebf0000803fd6d5d5be4f4f4f3fc7c6463e0000803f
+fast math xr_half_fragment format 550 blend Some([0, 5, 0, 0, 5, 0]) in one pass	bytes 65536 1a956135b88cc130c7c4d5941aa6f8a9 b0af2f3f959414bfebea6abec5c4443f9594943dcdccccbdf1f070bdc9c8483e
+fast math xr_half_fragment format 550 blend Some([1, 5, 0, 1, 5, 0]) in one pass	bytes 65536 7b33df3a9c4e455b0cafab0d39074638 6060a03f8d8c0c3f2d2d2dbf0000803fabaa2abf5353933fc8c7c73ef8f7773f
+fast math xr_half_fragment format 550 blend Some([4, 5, 0, 1, 5, 0]) in one pass	bytes 65536 2a3f9bec297c045b3d97571001474575 e6e5653fa5a4a4beabaaaabe0000803ffefdfdbe5d5d5d3f9493933ef8f7773f
+fast math xr_half_fragment format 550 blend Some([4, 5, 0, 4, 5, 0]) in one pass	bytes 65536 4687547955c981318c9e785e797eeb52 e6e5653fa5a4a4beabaaaabed3d2523ffefdfdbe5d5d5d3f9493933ecbca4a3f
+fast math xr_half_fragment format 550 blend Some([6, 0, 0, 6, 0, 0]) in one pass	bytes 65536 de53c0b37c229a18b18f07812a316cee 5353533fc1c040bf8988083eedec6c3ef3f272be8e8d0dbfedececbdabaa2a3f
+fast math xr_half_fragment format 550 blend Some([6, 5, 0, 1, 5, 0]) in one pass	bytes 65536 7666ba33f860a2cc24bc0eecfe9d24e4 6060a03fc1c040bfc5c4c4bd0000803fa9a828be272727bfb1b030bef8f7773f
+fast math xr_half_fragment format 550 blend Some([3, 8, 0, 1, 1, 0]) in one pass	bytes 65536 1cdc4b8ccdc67e82b7353acc8498c71d f5f4743fc1c040bfc1c040bf0000803fc1c040bf323232bfd1d0d03c0000803f
+fast math xr_half_fragment format 550 blend Some([3, 6, 0, 1, 1, 0]) in one pass	bytes 65536 76ca115957c993ed8951c98cefec6ffb 5c5c5c3fd8d7d73e8f8e0ebf0000803fc1c040bff5f4f4bda1a0a03e0000803f
+fast math xr_half_fragment format 550 blend Some([3, 5, 0, 1, 5, 0]) in one pass	bytes 65536 4a4faccee270634853279c7c24bc9293 c1c0403fbab939bfc1c040bf0000803fc1c040bfd5d4d4bec1c0403ef8f7773f
+fast math xr_half_fragment format 550 blend Some([6, 2, 0, 1, 1, 0]) in one pass	bytes 65536 42dd0f2351257ece333f494cf70dff5a 6060a03fc1c040bf8988883e0000803ff3f2f2bec1c040bfebea6abe0000803f
+fast math xr_half_fragment format 550 blend Some([1, 1, 1, 1, 1, 1]) in one pass	bytes 65536 720252eeb90baa98a3fb6a2b5534baab 9998183d6060a03f979616be00000000c1c040bf6060a03fb5b4343f00000000
+fast math xr_half_fragment format 550 blend Some([1, 1, 2, 1, 1, 2]) in one pass	bytes 65536 ce3eb8fe0a936aad1094f02c6d1a7460 999818bdc1c040bf9796163ec5c4443fc8c7873fc1c040bfb5b434bfc1c0c03d
+fast math xr_half_fragment format 550 blend Some([1, 1, 3, 1, 1, 3]) in one pass	bytes 65536 ce072fa5ec37c996d31ab4071b25c23e e4e3633fc1c040bfe5e4e4beedec6c3e3d3d3dbfe2e1e1be838282bec6c5453f
+fast math xr_half_fragment format 550 blend Some([1, 1, 4, 1, 1, 4]) in one pass	bytes 65536 f9f8c88f146c73386f2434a1ade08db6 6d6d6d3f9190903f999898be0000803fa5a4a43e2020a03fe6e5e53edddc5c3f
+fast math xr_half_fragment format 550 blend Some([7, 1, 0, 1, 1, 0]) in one pass	bytes 65536 708fec539078ca206a73e95384068019 fefd7d3fdddc9c3fc1c040bf0000803fb9b838be6060a03f9e9d9d3e0000803f
+fast math xr_half_fragment format 550 blend Some([9, 1, 0, 9, 1, 0]) in one pass	bytes 65536 5cd3113b21e163d11d5339e2698f3c0c e4e3633fc1c040bf999898be0000803fe3e2623e8b8a8abec7c646bef8f7773f
+fast math xr_half_fragment format 550 blend Some([2, 0, 0, 2, 0, 0]) in one pass	bytes 65536 b3b5e9e145c10e26d2b403b1b9489f52 5c5c5c3f6060a03fcdcc4c3ed1d0503d0c0c0c3f6060a03fcfce4e3e9998183f
+fast math xr_half_fragment format 550 blend Some([10, 1, 0, 1, 1, 0]) in one pass	bytes 65536 444daaf53a517fc1ed99c272c4672825 e4e3633fc1c040bf999898be0000803fe3e2623e8b8a8abec7c646be0000803f
+fast math xr_half_fragment format 550 blend Some([8, 9, 0, 8, 9, 0]) in one pass	bytes 65536 d8370568a007a0648e14b2ca71658f86 6d6d6d3f9190903fe5e4e4beedec6c3e999818bfc3c2823fb5b4b43ec9c8483f
+fast math xr_half_fragment format 550 blend Some([11, 12, 0, 13, 14, 0]) in one pass	bytes 65536 738adcd8acd3c68f7a502909f1cb0d86 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282bedddc5c3f
+fast math xr_half_fragment format 550 blend Some([5, 4, 0, 5, 4, 0]) in one pass	bytes 65536 4923a36b87e01b2aec709bfbcc3d4b82 6b6b6b3f3232323fd3d2d2bed1d0d03ea1a0a03de1e060bdc1c0c0bdd8d7573f
+fast math xr_half_fragment format 552 blend None in one pass	bytes 65536 db3d31faeffcaefae7a174f6bdd21dbc e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be5d5d5d3f
+fast math xr_half_fragment format 552 blend Some([1, 1, 0, 1, 1, 0]) in one pass	bytes 65536 62a9c2007080f20a3f59c62cdd11e2f2 6060a03fc1c0c03ebfbe3ebf0000803fd6d5d5be4f4f4f3fc7c6463e0000803f
+fast math xr_half_fragment format 552 blend Some([0, 5, 0, 0, 5, 0]) in one pass	bytes 65536 f15dc72d0fe5651404c5c4c29cfafb30 b0af2f3f959414bfebea6abe4545453f9594943dcdccccbdf1f070bdcbca4a3e
+fast math xr_half_fragment format 552 blend Some([1, 5, 0, 1, 5, 0]) in one pass	bytes 65536 e964e9c6ebefcf1ee56c5c1690a4f032 6060a03f8d8c0c3f2d2d2dbf0000803fabaa2abf5353933fc8c7c73ef8f7773f
+fast math xr_half_fragment format 552 blend Some([4, 5, 0, 1, 5, 0]) in one pass	bytes 65536 fe4fce68c8efbc28a6df3eb0bb107dc3 e6e5653fa5a4a4beabaaaabe0000803ffefdfdbe5d5d5d3f9493933ef8f7773f
+fast math xr_half_fragment format 552 blend Some([4, 5, 0, 4, 5, 0]) in one pass	bytes 65536 3ed17e8006e114905786cc03e7040e5d e6e5653fa5a4a4beabaaaabed3d2523ffefdfdbe5d5d5d3f9493933ecbca4a3f
+fast math xr_half_fragment format 552 blend Some([6, 0, 0, 6, 0, 0]) in one pass	bytes 65536 689747726d10c0a8dcefb0865c4a1059 5353533fc1c040bf8988083eebea6a3ef3f272be8e8d0dbfedececbdabaa2a3f
+fast math xr_half_fragment format 552 blend Some([6, 5, 0, 1, 5, 0]) in one pass	bytes 65536 45c5c06949beffbcf36b164fb0313b0e 6060a03fc1c040bfc5c4c4bd0000803fa9a828be272727bfb1b030bef8f7773f
+fast math xr_half_fragment format 552 blend Some([3, 8, 0, 1, 1, 0]) in one pass	bytes 65536 0e75c487bbab9939de5d26cececafe05 f5f4743fc1c040bfc1c040bf0000803fc1c040bf323232bfd1d0d03c0000803f
+fast math xr_half_fragment format 552 blend Some([3, 6, 0, 1, 1, 0]) in one pass	bytes 65536 b69e2ea00dd7221adaf3bf05e9332aaf 5c5c5c3fd8d7d73e8f8e0ebf0000803fc1c040bff5f4f4bda1a0a03e0000803f
+fast math xr_half_fragment format 552 blend Some([3, 5, 0, 1, 5, 0]) in one pass	bytes 65536 b7177eab9308400bcd308495d5a4fbf9 c1c0403fbab939bfc1c040bf0000803fc1c040bfd5d4d4bec1c0403ef8f7773f
+fast math xr_half_fragment format 552 blend Some([6, 2, 0, 1, 1, 0]) in one pass	bytes 65536 f476f74a36e2d8d9b704772399d67752 6060a03fc1c040bf8988883e0000803ff3f2f2bec1c040bfebea6abe0000803f
+fast math xr_half_fragment format 552 blend Some([1, 1, 1, 1, 1, 1]) in one pass	bytes 65536 16af4d41e6ea0942613acdf0642e2316 9998183d6060a03f979616be00000000c1c040bf6060a03fb5b4343f00000000
+fast math xr_half_fragment format 552 blend Some([1, 1, 2, 1, 1, 2]) in one pass	bytes 65536 c12f4aef3170d55b8031f1d90186ef45 999818bdc1c040bf9796163e4545453fc8c7873fc1c040bfb5b434bfbdbcbc3d
+fast math xr_half_fragment format 552 blend Some([1, 1, 3, 1, 1, 3]) in one pass	bytes 65536 c1bb0a69b00a68f7dc06029308ad572f e4e3633fc1c040bfe5e4e4beebea6a3e3d3d3dbfe2e1e1be838282be4545453f
+fast math xr_half_fragment format 552 blend Some([1, 1, 4, 1, 1, 4]) in one pass	bytes 65536 537246c53b4aa7cf0084810af7615580 6d6d6d3f9190903f999898be0000803fa5a4a43e2020a03fe6e5e53e5d5d5d3f
+fast math xr_half_fragment format 552 blend Some([7, 1, 0, 1, 1, 0]) in one pass	bytes 65536 58467c70e028ed0b7f95723da50fe011 fefd7d3fdddc9c3fc1c040bf0000803fb9b838be6060a03f9e9d9d3e0000803f
+fast math xr_half_fragment format 552 blend Some([9, 1, 0, 9, 1, 0]) in one pass	bytes 65536 a95e1f4edb46141e9850fc46d5ba9be2 e4e3633fc1c040bf999898be0000803fe3e2623e8b8a8abec7c646bef8f7773f
+fast math xr_half_fragment format 552 blend Some([2, 0, 0, 2, 0, 0]) in one pass	bytes 65536 129a40ee1f6dc218a3f82524f5d6ef83 5c5c5c3f6060a03fcdcc4c3ed9d8583d0c0c0c3f6060a03fcfce4e3e9998183f
+fast math xr_half_fragment format 552 blend Some([10, 1, 0, 1, 1, 0]) in one pass	bytes 65536 82ece1e95403b4ae1c89f01245dd4b91 e4e3633fc1c040bf999898be0000803fe3e2623e8b8a8abec7c646be0000803f
+fast math xr_half_fragment format 552 blend Some([8, 9, 0, 8, 9, 0]) in one pass	bytes 65536 1f6988c1f6c5757bf131c9facd52045e 6d6d6d3f9190903fe5e4e4beebea6a3e999818bfc3c2823fb5b4b43ec9c8483f
+fast math xr_half_fragment format 552 blend Some([11, 12, 0, 13, 14, 0]) in one pass	bytes 65536 1b11fcff3248a99e84e31ebb4581f63c e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be5d5d5d3f
+fast math xr_half_fragment format 552 blend Some([5, 4, 0, 5, 4, 0]) in one pass	bytes 65536 a16dcb54427985159a4ad72364e7a662 6b6b6b3f3232323fd3d2d2bed0cfcf3ea1a0a03de1e060bdc1c0c0bdd8d7573f
+fast math xr_half_fragment format 554 blend None in one pass	bytes 65536 251167742de895f7a4a97a7f44c14384 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 0, 1, 1, 0]) in one pass	bytes 65536 5c8015d636dbf5205c129aa0273317fc 6060a03fc1c0c03ebfbe3ebf0000803fd6d5d5be4f4f4f3fc7c6463e0000803f
+fast math xr_half_fragment format 554 blend Some([0, 5, 0, 0, 5, 0]) in one pass	bytes 65536 d7a4021e17c05dd1a279f0a101c17523 b0af2f3f959414bfebea6abe0000803f9594943dcdccccbdf1f070bd0000803f
+fast math xr_half_fragment format 554 blend Some([1, 5, 0, 1, 5, 0]) in one pass	bytes 65536 ff1b24b3e32e867c68b17a39684e0717 6060a03f8d8c0c3f2d2d2dbf0000803fabaa2abf5353933fc8c7c73e0000803f
+fast math xr_half_fragment format 554 blend Some([4, 5, 0, 1, 5, 0]) in one pass	bytes 65536 c2c392783a6761ed6f8d65394088b9aa e6e5653fa5a4a4beabaaaabe0000803ffefdfdbe5d5d5d3f9493933e0000803f
+fast math xr_half_fragment format 554 blend Some([4, 5, 0, 4, 5, 0]) in one pass	bytes 65536 c2c392783a6761ed6f8d65394088b9aa e6e5653fa5a4a4beabaaaabe0000803ffefdfdbe5d5d5d3f9493933e0000803f
+fast math xr_half_fragment format 554 blend Some([6, 0, 0, 6, 0, 0]) in one pass	bytes 65536 5b9edf7f0c76b524f26bd168c2cb6a0f 5353533fc1c040bf8988083e0000803ff3f272be8e8d0dbfedececbd0000803f
+fast math xr_half_fragment format 554 blend Some([6, 5, 0, 1, 5, 0]) in one pass	bytes 65536 ce8abc321e3dc15c06009cfd565caa7f 6060a03fc1c040bfc5c4c4bd0000803fa9a828be272727bfb1b030be0000803f
+fast math xr_half_fragment format 554 blend Some([3, 8, 0, 1, 1, 0]) in one pass	bytes 65536 c504f97c3b85e467e8d2324c2bea5a68 f5f4743fc1c040bfc1c040bf0000803fc1c040bfc1c040bf818000bc0000803f
+fast math xr_half_fragment format 554 blend Some([3, 6, 0, 1, 1, 0]) in one pass	bytes 65536 d22e2ba808d0d84568d77e65dce80d59 5c5c5c3fd8d7d73e8f8e0ebf0000803fc1c040bff5f4f4bda1a0a03e0000803f
+fast math xr_half_fragment format 554 blend Some([3, 5, 0, 1, 5, 0]) in one pass	bytes 65536 4411a022a725661737fc8843188061b8 c1c0403fbab939bfc1c040bf0000803fc1c040bfd5d4d4bec1c0403e0000803f
+fast math xr_half_fragment format 554 blend Some([6, 2, 0, 1, 1, 0]) in one pass	bytes 65536 328bc9289c9f534b81bd523c673e03cc 6060a03fc1c040bf8988883e0000803ff3f2f2bec1c040bfebea6abe0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 1, 1, 1, 1]) in one pass	bytes 65536 6624bf44ca3867c00eb8c5cab9d2182b 9998183d6060a03f979616be0000803fc1c040bf6060a03fb5b4343f0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 2, 1, 1, 2]) in one pass	bytes 65536 998344f0566117ff2b5da40662e4aab9 999818bdc1c040bf9796163e0000803fc8c7873fc1c040bfb5b434bf0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 3, 1, 1, 3]) in one pass	bytes 65536 199c7b71e0f3472b038f925aaccfb4a9 e4e3633fc1c040bfe5e4e4be0000803f3d3d3dbfe2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([1, 1, 4, 1, 1, 4]) in one pass	bytes 65536 a40017a2681052192e61d5022b0eac88 6d6d6d3f9190903f999898be0000803fa5a4a43e2020a03fe6e5e53e0000803f
+fast math xr_half_fragment format 554 blend Some([7, 1, 0, 1, 1, 0]) in one pass	bytes 65536 182aee07c45b076f0d6760259485d263 fefd7d3fdddc9c3fc1c040bf0000803fb9b838be6060a03f9e9d9d3e0000803f
+fast math xr_half_fragment format 554 blend Some([9, 1, 0, 9, 1, 0]) in one pass	bytes 65536 95f13dd758752cfab6eaa2926c11e004 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([2, 0, 0, 2, 0, 0]) in one pass	bytes 65536 e3fa9bb52d9d1396aeae2ce5abbde57f 5c5c5c3f6060a03fcdcc4c3e0000803f0c0c0c3f6060a03fcfce4e3e0000803f
+fast math xr_half_fragment format 554 blend Some([10, 1, 0, 1, 1, 0]) in one pass	bytes 65536 95f13dd758752cfab6eaa2926c11e004 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([8, 9, 0, 8, 9, 0]) in one pass	bytes 65536 35f8f47652be86aa2b8bde9866ca6715 6d6d6d3f9190903fe5e4e4be0000803f3d3d3dbf2020a03fe6e5e53e0000803f
+fast math xr_half_fragment format 554 blend Some([11, 12, 0, 13, 14, 0]) in one pass	bytes 65536 95f13dd758752cfab6eaa2926c11e004 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+fast math xr_half_fragment format 554 blend Some([5, 4, 0, 5, 4, 0]) in one pass	bytes 65536 f61bae83738fc97f906eb39e173c3629 6b6b6b3f3232323fd3d2d2be0000803fa1a0a03de1e060bdc1c0c0bd0000803f

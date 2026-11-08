@@ -1,0 +1,7 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+0x10005	([65541, 65541, 65541, 65541, 65541, 65541, 65541, 65541], 65537, SizeAndAlign { size: 1152, align: 128 })
+0x10015	([65557, 65557, 65557, 65557, 65557, 65557, 65557, 65557], 65553, SizeAndAlign { size: 1024, align: 128 })
+0x4005	([16389, 16389, 16389, 16389, 16389, 16389, 16389, 16389], 16385, SizeAndAlign { size: 1152, align: 128 })
+0x8005	([32773, 32773, 32773, 32773, 32773, 32773, 32773, 32773], 1, SizeAndAlign { size: 1152, align: 128 })
+0xd	([5, 5, 5, 5, 5, 5, 5, 5], 1, SizeAndAlign { size: 1152, align: 128 })
+0x1c01d	([114709, 114709, 114709, 114709, 114709, 114709, 114709, 114709], 81937, SizeAndAlign { size: 1024, align: 128 })

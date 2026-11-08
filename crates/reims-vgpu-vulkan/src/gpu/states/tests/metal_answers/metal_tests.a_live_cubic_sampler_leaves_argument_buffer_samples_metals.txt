@@ -1,0 +1,2 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+linear	bytes 34568 bc4c8bcd11a90a7bca89b86f585d8736 7008000000000000000000000020003a00a0ecbe00800538000000000020003a

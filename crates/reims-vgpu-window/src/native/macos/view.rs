@@ -78,7 +78,7 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize};
 use objc2_metal::MTLDevice;
 use objc2_quartz_core::CAMetalLayer;
 use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_metal::msg;
+use reims_vgpu_vulkan::os::msg;
 
 use super::cursor::CursorCache;
 use super::input::{InputState, Reaction, ViewContext};

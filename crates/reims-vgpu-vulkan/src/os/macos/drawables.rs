@@ -19,8 +19,8 @@
 //! **How.** The render thread fetches it as it takes the image, through `VK_EXT_metal_objects`'
 //! export of the image's Metal texture (`vkExportMetalObjectsEXT`), which MoltenVK answers with
 //! the drawable's texture, fetching the drawable (`MVKDevice::getMetalObjects`). A wait, where
-//! there is one, is then the render thread's, as `nextDrawable` is on the Metal platform's
-//! window, and the frame's encode finds the drawable fetched. MoltenVK lets go of an image's
+//! there is one, is then the render thread's, as `nextDrawable` is on a Metal window, and the
+//! frame's encode finds the drawable fetched. MoltenVK lets go of an image's
 //! drawable as the image is acquired again (`acquireAndSignalWhenAvailable`), so the fetch
 //! follows each acquire, never precedes it.
 //!

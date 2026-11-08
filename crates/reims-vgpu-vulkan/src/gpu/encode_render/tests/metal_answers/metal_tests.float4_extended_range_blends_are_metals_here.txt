@@ -1,0 +1,469 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+fast math xr_loaded_fragment format 550 blend None	xz 65536 0
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 65536
+fast math xr_loaded_fragment format 550 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 131072
+fast math xr_loaded_fragment format 550 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 196608
+fast math xr_loaded_fragment format 550 blend Some([4, 5, 0, 1, 5, 0])	xz 65536 262144
+fast math xr_loaded_fragment format 550 blend Some([4, 5, 0, 4, 5, 0])	xz 65536 327680
+fast math xr_loaded_fragment format 550 blend Some([6, 0, 0, 6, 0, 0])	xz 65536 393216
+fast math xr_loaded_fragment format 550 blend Some([6, 5, 0, 1, 5, 0])	xz 65536 458752
+fast math xr_loaded_fragment format 550 blend Some([3, 8, 0, 1, 1, 0])	xz 65536 524288
+fast math xr_loaded_fragment format 550 blend Some([3, 6, 0, 1, 1, 0])	xz 65536 589824
+fast math xr_loaded_fragment format 550 blend Some([3, 5, 0, 1, 5, 0])	xz 65536 655360
+fast math xr_loaded_fragment format 550 blend Some([6, 2, 0, 1, 1, 0])	xz 65536 720896
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 1, 1, 1, 1])	xz 65536 786432
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 2, 1, 1, 2])	xz 65536 851968
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 3, 1, 1, 3])	xz 65536 917504
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 4, 1, 1, 4])	xz 65536 983040
+fast math xr_loaded_fragment format 550 blend Some([7, 1, 0, 1, 1, 0])	xz 65536 1048576
+fast math xr_loaded_fragment format 550 blend Some([9, 1, 0, 9, 1, 0])	xz 65536 1114112
+fast math xr_loaded_fragment format 550 blend Some([2, 0, 0, 2, 0, 0])	xz 65536 1179648
+fast math xr_loaded_fragment format 550 blend Some([10, 1, 0, 1, 1, 0])	xz 65536 1245184
+fast math xr_loaded_fragment format 550 blend Some([8, 9, 0, 8, 9, 0])	xz 65536 1310720
+fast math xr_loaded_fragment format 550 blend Some([11, 12, 0, 13, 14, 0])	xz 65536 1376256
+fast math xr_loaded_fragment format 550 blend Some([5, 4, 0, 5, 4, 0])	xz 65536 1441792
+fast math xr_loaded_fragment format 552 blend None	xz 65536 1507328
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 1572864
+fast math xr_loaded_fragment format 552 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 1638400
+fast math xr_loaded_fragment format 552 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 1703936
+fast math xr_loaded_fragment format 552 blend Some([4, 5, 0, 1, 5, 0])	xz 65536 1769472
+fast math xr_loaded_fragment format 552 blend Some([4, 5, 0, 4, 5, 0])	xz 65536 1835008
+fast math xr_loaded_fragment format 552 blend Some([6, 0, 0, 6, 0, 0])	xz 65536 1900544
+fast math xr_loaded_fragment format 552 blend Some([6, 5, 0, 1, 5, 0])	xz 65536 1966080
+fast math xr_loaded_fragment format 552 blend Some([3, 8, 0, 1, 1, 0])	xz 65536 2031616
+fast math xr_loaded_fragment format 552 blend Some([3, 6, 0, 1, 1, 0])	xz 65536 2097152
+fast math xr_loaded_fragment format 552 blend Some([3, 5, 0, 1, 5, 0])	xz 65536 2162688
+fast math xr_loaded_fragment format 552 blend Some([6, 2, 0, 1, 1, 0])	xz 65536 2228224
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 1, 1, 1, 1])	xz 65536 2293760
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 2, 1, 1, 2])	xz 65536 2359296
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 3, 1, 1, 3])	xz 65536 2424832
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 4, 1, 1, 4])	xz 65536 2490368
+fast math xr_loaded_fragment format 552 blend Some([7, 1, 0, 1, 1, 0])	xz 65536 2555904
+fast math xr_loaded_fragment format 552 blend Some([9, 1, 0, 9, 1, 0])	xz 65536 2621440
+fast math xr_loaded_fragment format 552 blend Some([2, 0, 0, 2, 0, 0])	xz 65536 2686976
+fast math xr_loaded_fragment format 552 blend Some([10, 1, 0, 1, 1, 0])	xz 65536 2752512
+fast math xr_loaded_fragment format 552 blend Some([8, 9, 0, 8, 9, 0])	xz 65536 2818048
+fast math xr_loaded_fragment format 552 blend Some([11, 12, 0, 13, 14, 0])	xz 65536 2883584
+fast math xr_loaded_fragment format 552 blend Some([5, 4, 0, 5, 4, 0])	xz 65536 2949120
+fast math xr_loaded_fragment format 554 blend None	xz 65536 3014656
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 3080192
+fast math xr_loaded_fragment format 554 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 3145728
+fast math xr_loaded_fragment format 554 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 3211264
+fast math xr_loaded_fragment format 554 blend Some([4, 5, 0, 1, 5, 0])	xz 65536 3276800
+fast math xr_loaded_fragment format 554 blend Some([4, 5, 0, 4, 5, 0])	xz 65536 3342336
+fast math xr_loaded_fragment format 554 blend Some([6, 0, 0, 6, 0, 0])	xz 65536 3407872
+fast math xr_loaded_fragment format 554 blend Some([6, 5, 0, 1, 5, 0])	xz 65536 3473408
+fast math xr_loaded_fragment format 554 blend Some([3, 8, 0, 1, 1, 0])	xz 65536 3538944
+fast math xr_loaded_fragment format 554 blend Some([3, 6, 0, 1, 1, 0])	xz 65536 3604480
+fast math xr_loaded_fragment format 554 blend Some([3, 5, 0, 1, 5, 0])	xz 65536 3670016
+fast math xr_loaded_fragment format 554 blend Some([6, 2, 0, 1, 1, 0])	xz 65536 3735552
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 1, 1, 1, 1])	xz 65536 3801088
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 2, 1, 1, 2])	xz 65536 3866624
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 3, 1, 1, 3])	xz 65536 3932160
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 4, 1, 1, 4])	xz 65536 3997696
+fast math xr_loaded_fragment format 554 blend Some([7, 1, 0, 1, 1, 0])	xz 65536 4063232
+fast math xr_loaded_fragment format 554 blend Some([9, 1, 0, 9, 1, 0])	xz 65536 4128768
+fast math xr_loaded_fragment format 554 blend Some([2, 0, 0, 2, 0, 0])	xz 65536 4194304
+fast math xr_loaded_fragment format 554 blend Some([10, 1, 0, 1, 1, 0])	xz 65536 4259840
+fast math xr_loaded_fragment format 554 blend Some([8, 9, 0, 8, 9, 0])	xz 65536 4325376
+fast math xr_loaded_fragment format 554 blend Some([11, 12, 0, 13, 14, 0])	xz 65536 4390912
+fast math xr_loaded_fragment format 554 blend Some([5, 4, 0, 5, 4, 0])	xz 65536 4456448
+fast math off xr_float_fragment format 550 blend None	xz 65536 4521984
+fast math off xr_float_fragment format 550 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 4587520
+fast math off xr_float_fragment format 550 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 4653056
+fast math off xr_float_fragment format 550 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 4718592
+fast math off xr_float_fragment format 550 blend Some([4, 5, 0, 1, 5, 0])	xz 65536 4784128
+fast math off xr_float_fragment format 550 blend Some([4, 5, 0, 4, 5, 0])	xz 65536 4849664
+fast math off xr_float_fragment format 550 blend Some([6, 0, 0, 6, 0, 0])	xz 65536 4915200
+fast math off xr_float_fragment format 550 blend Some([6, 5, 0, 1, 5, 0])	xz 65536 4980736
+fast math off xr_float_fragment format 550 blend Some([3, 8, 0, 1, 1, 0])	xz 65536 5046272
+fast math off xr_float_fragment format 550 blend Some([3, 6, 0, 1, 1, 0])	xz 65536 5111808
+fast math off xr_float_fragment format 550 blend Some([3, 5, 0, 1, 5, 0])	xz 65536 5177344
+fast math off xr_float_fragment format 550 blend Some([6, 2, 0, 1, 1, 0])	xz 65536 5242880
+fast math off xr_float_fragment format 550 blend Some([1, 1, 1, 1, 1, 1])	xz 65536 5308416
+fast math off xr_float_fragment format 550 blend Some([1, 1, 2, 1, 1, 2])	xz 65536 5373952
+fast math off xr_float_fragment format 550 blend Some([1, 1, 3, 1, 1, 3])	xz 65536 5439488
+fast math off xr_float_fragment format 550 blend Some([1, 1, 4, 1, 1, 4])	xz 65536 5505024
+fast math off xr_float_fragment format 550 blend Some([7, 1, 0, 1, 1, 0])	xz 65536 5570560
+fast math off xr_float_fragment format 550 blend Some([9, 1, 0, 9, 1, 0])	xz 65536 5636096
+fast math off xr_float_fragment format 550 blend Some([2, 0, 0, 2, 0, 0])	xz 65536 5701632
+fast math off xr_float_fragment format 550 blend Some([10, 1, 0, 1, 1, 0])	xz 65536 5767168
+fast math off xr_float_fragment format 550 blend Some([8, 9, 0, 8, 9, 0])	xz 65536 5832704
+fast math off xr_float_fragment format 550 blend Some([11, 12, 0, 13, 14, 0])	xz 65536 5898240
+fast math off xr_float_fragment format 550 blend Some([5, 4, 0, 5, 4, 0])	xz 65536 5963776
+fast math off xr_float_fragment format 552 blend None	xz 65536 6029312
+fast math off xr_float_fragment format 552 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 6094848
+fast math off xr_float_fragment format 552 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 6160384
+fast math off xr_float_fragment format 552 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 6225920
+fast math off xr_float_fragment format 552 blend Some([4, 5, 0, 1, 5, 0])	xz 65536 6291456
+fast math off xr_float_fragment format 552 blend Some([4, 5, 0, 4, 5, 0])	xz 65536 6356992
+fast math off xr_float_fragment format 552 blend Some([6, 0, 0, 6, 0, 0])	xz 65536 6422528
+fast math off xr_float_fragment format 552 blend Some([6, 5, 0, 1, 5, 0])	xz 65536 6488064
+fast math off xr_float_fragment format 552 blend Some([3, 8, 0, 1, 1, 0])	xz 65536 6553600
+fast math off xr_float_fragment format 552 blend Some([3, 6, 0, 1, 1, 0])	xz 65536 6619136
+fast math off xr_float_fragment format 552 blend Some([3, 5, 0, 1, 5, 0])	xz 65536 6684672
+fast math off xr_float_fragment format 552 blend Some([6, 2, 0, 1, 1, 0])	xz 65536 6750208
+fast math off xr_float_fragment format 552 blend Some([1, 1, 1, 1, 1, 1])	xz 65536 6815744
+fast math off xr_float_fragment format 552 blend Some([1, 1, 2, 1, 1, 2])	xz 65536 6881280
+fast math off xr_float_fragment format 552 blend Some([1, 1, 3, 1, 1, 3])	xz 65536 6946816
+fast math off xr_float_fragment format 552 blend Some([1, 1, 4, 1, 1, 4])	xz 65536 7012352
+fast math off xr_float_fragment format 552 blend Some([7, 1, 0, 1, 1, 0])	xz 65536 7077888
+fast math off xr_float_fragment format 552 blend Some([9, 1, 0, 9, 1, 0])	xz 65536 7143424
+fast math off xr_float_fragment format 552 blend Some([2, 0, 0, 2, 0, 0])	xz 65536 7208960
+fast math off xr_float_fragment format 552 blend Some([10, 1, 0, 1, 1, 0])	xz 65536 7274496
+fast math off xr_float_fragment format 552 blend Some([8, 9, 0, 8, 9, 0])	xz 65536 7340032
+fast math off xr_float_fragment format 552 blend Some([11, 12, 0, 13, 14, 0])	xz 65536 7405568
+fast math off xr_float_fragment format 552 blend Some([5, 4, 0, 5, 4, 0])	xz 65536 7471104
+fast math off xr_float_fragment format 554 blend None	xz 65536 7536640
+fast math off xr_float_fragment format 554 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 7602176
+fast math off xr_float_fragment format 554 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 7667712
+fast math off xr_float_fragment format 554 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 7733248
+fast math off xr_float_fragment format 554 blend Some([4, 5, 0, 1, 5, 0])	xz 65536 7798784
+fast math off xr_float_fragment format 554 blend Some([4, 5, 0, 4, 5, 0])	xz 65536 7864320
+fast math off xr_float_fragment format 554 blend Some([6, 0, 0, 6, 0, 0])	xz 65536 7929856
+fast math off xr_float_fragment format 554 blend Some([6, 5, 0, 1, 5, 0])	xz 65536 7995392
+fast math off xr_float_fragment format 554 blend Some([3, 8, 0, 1, 1, 0])	xz 65536 8060928
+fast math off xr_float_fragment format 554 blend Some([3, 6, 0, 1, 1, 0])	xz 65536 8126464
+fast math off xr_float_fragment format 554 blend Some([3, 5, 0, 1, 5, 0])	xz 65536 8192000
+fast math off xr_float_fragment format 554 blend Some([6, 2, 0, 1, 1, 0])	xz 65536 8257536
+fast math off xr_float_fragment format 554 blend Some([1, 1, 1, 1, 1, 1])	xz 65536 8323072
+fast math off xr_float_fragment format 554 blend Some([1, 1, 2, 1, 1, 2])	xz 65536 8388608
+fast math off xr_float_fragment format 554 blend Some([1, 1, 3, 1, 1, 3])	xz 65536 8454144
+fast math off xr_float_fragment format 554 blend Some([1, 1, 4, 1, 1, 4])	xz 65536 8519680
+fast math off xr_float_fragment format 554 blend Some([7, 1, 0, 1, 1, 0])	xz 65536 8585216
+fast math off xr_float_fragment format 554 blend Some([9, 1, 0, 9, 1, 0])	xz 65536 8650752
+fast math off xr_float_fragment format 554 blend Some([2, 0, 0, 2, 0, 0])	xz 65536 8716288
+fast math off xr_float_fragment format 554 blend Some([10, 1, 0, 1, 1, 0])	xz 65536 8781824
+fast math off xr_float_fragment format 554 blend Some([8, 9, 0, 8, 9, 0])	xz 65536 8847360
+fast math off xr_float_fragment format 554 blend Some([11, 12, 0, 13, 14, 0])	xz 65536 8912896
+fast math off xr_float_fragment format 554 blend Some([5, 4, 0, 5, 4, 0])	xz 65536 8978432
+fast math off xr_loaded_fragment format 550 blend None	xz 65536 9043968
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 9109504
+fast math off xr_loaded_fragment format 550 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 9175040
+fast math off xr_loaded_fragment format 550 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 9240576
+fast math off xr_loaded_fragment format 550 blend Some([4, 5, 0, 1, 5, 0])	xz 65536 9306112
+fast math off xr_loaded_fragment format 550 blend Some([4, 5, 0, 4, 5, 0])	xz 65536 9371648
+fast math off xr_loaded_fragment format 550 blend Some([6, 0, 0, 6, 0, 0])	xz 65536 9437184
+fast math off xr_loaded_fragment format 550 blend Some([6, 5, 0, 1, 5, 0])	xz 65536 9502720
+fast math off xr_loaded_fragment format 550 blend Some([3, 8, 0, 1, 1, 0])	xz 65536 9568256
+fast math off xr_loaded_fragment format 550 blend Some([3, 6, 0, 1, 1, 0])	xz 65536 9633792
+fast math off xr_loaded_fragment format 550 blend Some([3, 5, 0, 1, 5, 0])	xz 65536 9699328
+fast math off xr_loaded_fragment format 550 blend Some([6, 2, 0, 1, 1, 0])	xz 65536 9764864
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 1, 1, 1, 1])	xz 65536 9830400
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 2, 1, 1, 2])	xz 65536 9895936
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 3, 1, 1, 3])	xz 65536 9961472
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 4, 1, 1, 4])	xz 65536 10027008
+fast math off xr_loaded_fragment format 550 blend Some([7, 1, 0, 1, 1, 0])	xz 65536 10092544
+fast math off xr_loaded_fragment format 550 blend Some([9, 1, 0, 9, 1, 0])	xz 65536 10158080
+fast math off xr_loaded_fragment format 550 blend Some([2, 0, 0, 2, 0, 0])	xz 65536 10223616
+fast math off xr_loaded_fragment format 550 blend Some([10, 1, 0, 1, 1, 0])	xz 65536 10289152
+fast math off xr_loaded_fragment format 550 blend Some([8, 9, 0, 8, 9, 0])	xz 65536 10354688
+fast math off xr_loaded_fragment format 550 blend Some([11, 12, 0, 13, 14, 0])	xz 65536 10420224
+fast math off xr_loaded_fragment format 550 blend Some([5, 4, 0, 5, 4, 0])	xz 65536 10485760
+fast math off xr_loaded_fragment format 552 blend None	xz 65536 10551296
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 10616832
+fast math off xr_loaded_fragment format 552 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 10682368
+fast math off xr_loaded_fragment format 552 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 10747904
+fast math off xr_loaded_fragment format 552 blend Some([4, 5, 0, 1, 5, 0])	xz 65536 10813440
+fast math off xr_loaded_fragment format 552 blend Some([4, 5, 0, 4, 5, 0])	xz 65536 10878976
+fast math off xr_loaded_fragment format 552 blend Some([6, 0, 0, 6, 0, 0])	xz 65536 10944512
+fast math off xr_loaded_fragment format 552 blend Some([6, 5, 0, 1, 5, 0])	xz 65536 11010048
+fast math off xr_loaded_fragment format 552 blend Some([3, 8, 0, 1, 1, 0])	xz 65536 11075584
+fast math off xr_loaded_fragment format 552 blend Some([3, 6, 0, 1, 1, 0])	xz 65536 11141120
+fast math off xr_loaded_fragment format 552 blend Some([3, 5, 0, 1, 5, 0])	xz 65536 11206656
+fast math off xr_loaded_fragment format 552 blend Some([6, 2, 0, 1, 1, 0])	xz 65536 11272192
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 1, 1, 1, 1])	xz 65536 11337728
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 2, 1, 1, 2])	xz 65536 11403264
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 3, 1, 1, 3])	xz 65536 11468800
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 4, 1, 1, 4])	xz 65536 11534336
+fast math off xr_loaded_fragment format 552 blend Some([7, 1, 0, 1, 1, 0])	xz 65536 11599872
+fast math off xr_loaded_fragment format 552 blend Some([9, 1, 0, 9, 1, 0])	xz 65536 11665408
+fast math off xr_loaded_fragment format 552 blend Some([2, 0, 0, 2, 0, 0])	xz 65536 11730944
+fast math off xr_loaded_fragment format 552 blend Some([10, 1, 0, 1, 1, 0])	xz 65536 11796480
+fast math off xr_loaded_fragment format 552 blend Some([8, 9, 0, 8, 9, 0])	xz 65536 11862016
+fast math off xr_loaded_fragment format 552 blend Some([11, 12, 0, 13, 14, 0])	xz 65536 11927552
+fast math off xr_loaded_fragment format 552 blend Some([5, 4, 0, 5, 4, 0])	xz 65536 11993088
+fast math off xr_loaded_fragment format 554 blend None	xz 65536 12058624
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 12124160
+fast math off xr_loaded_fragment format 554 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 12189696
+fast math off xr_loaded_fragment format 554 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 12255232
+fast math off xr_loaded_fragment format 554 blend Some([4, 5, 0, 1, 5, 0])	xz 65536 12320768
+fast math off xr_loaded_fragment format 554 blend Some([4, 5, 0, 4, 5, 0])	xz 65536 12386304
+fast math off xr_loaded_fragment format 554 blend Some([6, 0, 0, 6, 0, 0])	xz 65536 12451840
+fast math off xr_loaded_fragment format 554 blend Some([6, 5, 0, 1, 5, 0])	xz 65536 12517376
+fast math off xr_loaded_fragment format 554 blend Some([3, 8, 0, 1, 1, 0])	xz 65536 12582912
+fast math off xr_loaded_fragment format 554 blend Some([3, 6, 0, 1, 1, 0])	xz 65536 12648448
+fast math off xr_loaded_fragment format 554 blend Some([3, 5, 0, 1, 5, 0])	xz 65536 12713984
+fast math off xr_loaded_fragment format 554 blend Some([6, 2, 0, 1, 1, 0])	xz 65536 12779520
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 1, 1, 1, 1])	xz 65536 12845056
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 2, 1, 1, 2])	xz 65536 12910592
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 3, 1, 1, 3])	xz 65536 12976128
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 4, 1, 1, 4])	xz 65536 13041664
+fast math off xr_loaded_fragment format 554 blend Some([7, 1, 0, 1, 1, 0])	xz 65536 13107200
+fast math off xr_loaded_fragment format 554 blend Some([9, 1, 0, 9, 1, 0])	xz 65536 13172736
+fast math off xr_loaded_fragment format 554 blend Some([2, 0, 0, 2, 0, 0])	xz 65536 13238272
+fast math off xr_loaded_fragment format 554 blend Some([10, 1, 0, 1, 1, 0])	xz 65536 13303808
+fast math off xr_loaded_fragment format 554 blend Some([8, 9, 0, 8, 9, 0])	xz 65536 13369344
+fast math off xr_loaded_fragment format 554 blend Some([11, 12, 0, 13, 14, 0])	xz 65536 13434880
+fast math off xr_loaded_fragment format 554 blend Some([5, 4, 0, 5, 4, 0])	xz 65536 13500416
+fast math off xr_float_fragment format 551 blend None	xz 65536 13565952
+fast math off xr_float_fragment format 551 blend Some([0, 0, 0, 0, 0, 0])	bytes 65536 7d2cd49d043d0461b5ddb1ec35a1c58d 0000000000000000000000000000000000000000000000000000000000000000
+fast math off xr_float_fragment format 551 blend Some([0, 1, 0, 0, 1, 0])	xz 65536 13631488
+fast math off xr_float_fragment format 551 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 13697024
+fast math off xr_float_fragment format 551 blend Some([1, 0, 0, 1, 0, 0])	xz 65536 13762560
+fast math off xr_float_fragment format 551 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 13828096
+fast math off xr_float_fragment format 551 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 13893632
+fast math off xr_float_fragment format 551 blend Some([1, 5, 0, 1, 1, 0])	xz 65536 13959168
+fast math off xr_float_fragment format 551 blend Some([0, 5, 0, 1, 5, 0])	xz 65536 14024704
+fast math off xr_float_fragment format 553 blend None	xz 65536 14090240
+fast math off xr_float_fragment format 553 blend Some([0, 0, 0, 0, 0, 0])	bytes 65536 7d2cd49d043d0461b5ddb1ec35a1c58d 0000000000000000000000000000000000000000000000000000000000000000
+fast math off xr_float_fragment format 553 blend Some([0, 1, 0, 0, 1, 0])	xz 65536 14155776
+fast math off xr_float_fragment format 553 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 14221312
+fast math off xr_float_fragment format 553 blend Some([1, 0, 0, 1, 0, 0])	xz 65536 14286848
+fast math off xr_float_fragment format 553 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 14352384
+fast math off xr_float_fragment format 553 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 14417920
+fast math off xr_float_fragment format 553 blend Some([1, 5, 0, 1, 1, 0])	xz 65536 14483456
+fast math off xr_float_fragment format 553 blend Some([0, 5, 0, 1, 5, 0])	xz 65536 14548992
+fast math off xr_float_fragment format 555 blend None	xz 65536 14614528
+fast math off xr_float_fragment format 555 blend Some([0, 0, 0, 0, 0, 0])	bytes 65536 7dbde4267118f518f73b2b168b6bc58d 0000000000000000000000000000803f0000000000000000000000000000803f
+fast math off xr_float_fragment format 555 blend Some([0, 1, 0, 0, 1, 0])	xz 65536 14680064
+fast math off xr_float_fragment format 555 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 14745600
+fast math off xr_float_fragment format 555 blend Some([1, 0, 0, 1, 0, 0])	xz 65536 14811136
+fast math off xr_float_fragment format 555 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 14876672
+fast math off xr_float_fragment format 555 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 14942208
+fast math off xr_float_fragment format 555 blend Some([1, 5, 0, 1, 1, 0])	xz 65536 15007744
+fast math off xr_float_fragment format 555 blend Some([0, 5, 0, 1, 5, 0])	xz 65536 15073280
+fast math off xr_loaded_fragment format 551 blend None	xz 65536 15138816
+fast math off xr_loaded_fragment format 551 blend Some([0, 0, 0, 0, 0, 0])	bytes 65536 7d2cd49d043d0461b5ddb1ec35a1c58d 0000000000000000000000000000000000000000000000000000000000000000
+fast math off xr_loaded_fragment format 551 blend Some([0, 1, 0, 0, 1, 0])	xz 65536 15204352
+fast math off xr_loaded_fragment format 551 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 15269888
+fast math off xr_loaded_fragment format 551 blend Some([1, 0, 0, 1, 0, 0])	xz 65536 15335424
+fast math off xr_loaded_fragment format 551 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 15400960
+fast math off xr_loaded_fragment format 551 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 15466496
+fast math off xr_loaded_fragment format 551 blend Some([1, 5, 0, 1, 1, 0])	xz 65536 15532032
+fast math off xr_loaded_fragment format 551 blend Some([0, 5, 0, 1, 5, 0])	xz 65536 15597568
+fast math off xr_loaded_fragment format 553 blend None	xz 65536 15663104
+fast math off xr_loaded_fragment format 553 blend Some([0, 0, 0, 0, 0, 0])	bytes 65536 7d2cd49d043d0461b5ddb1ec35a1c58d 0000000000000000000000000000000000000000000000000000000000000000
+fast math off xr_loaded_fragment format 553 blend Some([0, 1, 0, 0, 1, 0])	xz 65536 15728640
+fast math off xr_loaded_fragment format 553 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 15794176
+fast math off xr_loaded_fragment format 553 blend Some([1, 0, 0, 1, 0, 0])	xz 65536 15859712
+fast math off xr_loaded_fragment format 553 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 15925248
+fast math off xr_loaded_fragment format 553 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 15990784
+fast math off xr_loaded_fragment format 553 blend Some([1, 5, 0, 1, 1, 0])	xz 65536 16056320
+fast math off xr_loaded_fragment format 553 blend Some([0, 5, 0, 1, 5, 0])	xz 65536 16121856
+fast math off xr_loaded_fragment format 555 blend None	xz 65536 16187392
+fast math off xr_loaded_fragment format 555 blend Some([0, 0, 0, 0, 0, 0])	bytes 65536 7dbde4267118f518f73b2b168b6bc58d 0000000000000000000000000000803f0000000000000000000000000000803f
+fast math off xr_loaded_fragment format 555 blend Some([0, 1, 0, 0, 1, 0])	xz 65536 16252928
+fast math off xr_loaded_fragment format 555 blend Some([0, 5, 0, 0, 5, 0])	xz 65536 16318464
+fast math off xr_loaded_fragment format 555 blend Some([1, 0, 0, 1, 0, 0])	xz 65536 16384000
+fast math off xr_loaded_fragment format 555 blend Some([1, 1, 0, 1, 1, 0])	xz 65536 16449536
+fast math off xr_loaded_fragment format 555 blend Some([1, 5, 0, 1, 5, 0])	xz 65536 16515072
+fast math off xr_loaded_fragment format 555 blend Some([1, 5, 0, 1, 1, 0])	xz 65536 16580608
+fast math off xr_loaded_fragment format 555 blend Some([0, 5, 0, 1, 5, 0])	xz 65536 16646144
+fast math xr_loaded_fragment format 550 blend None in one pass	xz 65536 16711680
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 0, 1, 1, 0]) in one pass	xz 65536 16777216
+fast math xr_loaded_fragment format 550 blend Some([0, 5, 0, 0, 5, 0]) in one pass	xz 65536 16842752
+fast math xr_loaded_fragment format 550 blend Some([1, 5, 0, 1, 5, 0]) in one pass	xz 65536 16908288
+fast math xr_loaded_fragment format 550 blend Some([4, 5, 0, 1, 5, 0]) in one pass	xz 65536 16973824
+fast math xr_loaded_fragment format 550 blend Some([4, 5, 0, 4, 5, 0]) in one pass	xz 65536 17039360
+fast math xr_loaded_fragment format 550 blend Some([6, 0, 0, 6, 0, 0]) in one pass	xz 65536 17104896
+fast math xr_loaded_fragment format 550 blend Some([6, 5, 0, 1, 5, 0]) in one pass	xz 65536 17170432
+fast math xr_loaded_fragment format 550 blend Some([3, 8, 0, 1, 1, 0]) in one pass	xz 65536 17235968
+fast math xr_loaded_fragment format 550 blend Some([3, 6, 0, 1, 1, 0]) in one pass	xz 65536 17301504
+fast math xr_loaded_fragment format 550 blend Some([3, 5, 0, 1, 5, 0]) in one pass	xz 65536 17367040
+fast math xr_loaded_fragment format 550 blend Some([6, 2, 0, 1, 1, 0]) in one pass	xz 65536 17432576
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 1, 1, 1, 1]) in one pass	xz 65536 17498112
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 2, 1, 1, 2]) in one pass	xz 65536 17563648
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 3, 1, 1, 3]) in one pass	xz 65536 17629184
+fast math xr_loaded_fragment format 550 blend Some([1, 1, 4, 1, 1, 4]) in one pass	xz 65536 17694720
+fast math xr_loaded_fragment format 550 blend Some([7, 1, 0, 1, 1, 0]) in one pass	xz 65536 17760256
+fast math xr_loaded_fragment format 550 blend Some([9, 1, 0, 9, 1, 0]) in one pass	xz 65536 17825792
+fast math xr_loaded_fragment format 550 blend Some([2, 0, 0, 2, 0, 0]) in one pass	xz 65536 17891328
+fast math xr_loaded_fragment format 550 blend Some([10, 1, 0, 1, 1, 0]) in one pass	xz 65536 17956864
+fast math xr_loaded_fragment format 550 blend Some([8, 9, 0, 8, 9, 0]) in one pass	xz 65536 18022400
+fast math xr_loaded_fragment format 550 blend Some([11, 12, 0, 13, 14, 0]) in one pass	xz 65536 18087936
+fast math xr_loaded_fragment format 550 blend Some([5, 4, 0, 5, 4, 0]) in one pass	xz 65536 18153472
+fast math xr_loaded_fragment format 552 blend None in one pass	xz 65536 18219008
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 0, 1, 1, 0]) in one pass	xz 65536 18284544
+fast math xr_loaded_fragment format 552 blend Some([0, 5, 0, 0, 5, 0]) in one pass	xz 65536 18350080
+fast math xr_loaded_fragment format 552 blend Some([1, 5, 0, 1, 5, 0]) in one pass	xz 65536 18415616
+fast math xr_loaded_fragment format 552 blend Some([4, 5, 0, 1, 5, 0]) in one pass	xz 65536 18481152
+fast math xr_loaded_fragment format 552 blend Some([4, 5, 0, 4, 5, 0]) in one pass	xz 65536 18546688
+fast math xr_loaded_fragment format 552 blend Some([6, 0, 0, 6, 0, 0]) in one pass	xz 65536 18612224
+fast math xr_loaded_fragment format 552 blend Some([6, 5, 0, 1, 5, 0]) in one pass	xz 65536 18677760
+fast math xr_loaded_fragment format 552 blend Some([3, 8, 0, 1, 1, 0]) in one pass	xz 65536 18743296
+fast math xr_loaded_fragment format 552 blend Some([3, 6, 0, 1, 1, 0]) in one pass	xz 65536 18808832
+fast math xr_loaded_fragment format 552 blend Some([3, 5, 0, 1, 5, 0]) in one pass	xz 65536 18874368
+fast math xr_loaded_fragment format 552 blend Some([6, 2, 0, 1, 1, 0]) in one pass	xz 65536 18939904
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 1, 1, 1, 1]) in one pass	xz 65536 19005440
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 2, 1, 1, 2]) in one pass	xz 65536 19070976
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 3, 1, 1, 3]) in one pass	xz 65536 19136512
+fast math xr_loaded_fragment format 552 blend Some([1, 1, 4, 1, 1, 4]) in one pass	xz 65536 19202048
+fast math xr_loaded_fragment format 552 blend Some([7, 1, 0, 1, 1, 0]) in one pass	xz 65536 19267584
+fast math xr_loaded_fragment format 552 blend Some([9, 1, 0, 9, 1, 0]) in one pass	xz 65536 19333120
+fast math xr_loaded_fragment format 552 blend Some([2, 0, 0, 2, 0, 0]) in one pass	xz 65536 19398656
+fast math xr_loaded_fragment format 552 blend Some([10, 1, 0, 1, 1, 0]) in one pass	xz 65536 19464192
+fast math xr_loaded_fragment format 552 blend Some([8, 9, 0, 8, 9, 0]) in one pass	xz 65536 19529728
+fast math xr_loaded_fragment format 552 blend Some([11, 12, 0, 13, 14, 0]) in one pass	xz 65536 19595264
+fast math xr_loaded_fragment format 552 blend Some([5, 4, 0, 5, 4, 0]) in one pass	xz 65536 19660800
+fast math xr_loaded_fragment format 554 blend None in one pass	xz 65536 19726336
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 0, 1, 1, 0]) in one pass	xz 65536 19791872
+fast math xr_loaded_fragment format 554 blend Some([0, 5, 0, 0, 5, 0]) in one pass	xz 65536 19857408
+fast math xr_loaded_fragment format 554 blend Some([1, 5, 0, 1, 5, 0]) in one pass	xz 65536 19922944
+fast math xr_loaded_fragment format 554 blend Some([4, 5, 0, 1, 5, 0]) in one pass	xz 65536 19988480
+fast math xr_loaded_fragment format 554 blend Some([4, 5, 0, 4, 5, 0]) in one pass	xz 65536 20054016
+fast math xr_loaded_fragment format 554 blend Some([6, 0, 0, 6, 0, 0]) in one pass	xz 65536 20119552
+fast math xr_loaded_fragment format 554 blend Some([6, 5, 0, 1, 5, 0]) in one pass	xz 65536 20185088
+fast math xr_loaded_fragment format 554 blend Some([3, 8, 0, 1, 1, 0]) in one pass	xz 65536 20250624
+fast math xr_loaded_fragment format 554 blend Some([3, 6, 0, 1, 1, 0]) in one pass	xz 65536 20316160
+fast math xr_loaded_fragment format 554 blend Some([3, 5, 0, 1, 5, 0]) in one pass	xz 65536 20381696
+fast math xr_loaded_fragment format 554 blend Some([6, 2, 0, 1, 1, 0]) in one pass	xz 65536 20447232
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 1, 1, 1, 1]) in one pass	xz 65536 20512768
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 2, 1, 1, 2]) in one pass	xz 65536 20578304
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 3, 1, 1, 3]) in one pass	xz 65536 20643840
+fast math xr_loaded_fragment format 554 blend Some([1, 1, 4, 1, 1, 4]) in one pass	xz 65536 20709376
+fast math xr_loaded_fragment format 554 blend Some([7, 1, 0, 1, 1, 0]) in one pass	xz 65536 20774912
+fast math xr_loaded_fragment format 554 blend Some([9, 1, 0, 9, 1, 0]) in one pass	xz 65536 20840448
+fast math xr_loaded_fragment format 554 blend Some([2, 0, 0, 2, 0, 0]) in one pass	xz 65536 20905984
+fast math xr_loaded_fragment format 554 blend Some([10, 1, 0, 1, 1, 0]) in one pass	xz 65536 20971520
+fast math xr_loaded_fragment format 554 blend Some([8, 9, 0, 8, 9, 0]) in one pass	xz 65536 21037056
+fast math xr_loaded_fragment format 554 blend Some([11, 12, 0, 13, 14, 0]) in one pass	xz 65536 21102592
+fast math xr_loaded_fragment format 554 blend Some([5, 4, 0, 5, 4, 0]) in one pass	xz 65536 21168128
+fast math off xr_float_fragment format 550 blend None in one pass	xz 65536 21233664
+fast math off xr_float_fragment format 550 blend Some([1, 1, 0, 1, 1, 0]) in one pass	xz 65536 21299200
+fast math off xr_float_fragment format 550 blend Some([0, 5, 0, 0, 5, 0]) in one pass	xz 65536 21364736
+fast math off xr_float_fragment format 550 blend Some([1, 5, 0, 1, 5, 0]) in one pass	xz 65536 21430272
+fast math off xr_float_fragment format 550 blend Some([4, 5, 0, 1, 5, 0]) in one pass	xz 65536 21495808
+fast math off xr_float_fragment format 550 blend Some([4, 5, 0, 4, 5, 0]) in one pass	xz 65536 21561344
+fast math off xr_float_fragment format 550 blend Some([6, 0, 0, 6, 0, 0]) in one pass	xz 65536 21626880
+fast math off xr_float_fragment format 550 blend Some([6, 5, 0, 1, 5, 0]) in one pass	xz 65536 21692416
+fast math off xr_float_fragment format 550 blend Some([3, 8, 0, 1, 1, 0]) in one pass	xz 65536 21757952
+fast math off xr_float_fragment format 550 blend Some([3, 6, 0, 1, 1, 0]) in one pass	xz 65536 21823488
+fast math off xr_float_fragment format 550 blend Some([3, 5, 0, 1, 5, 0]) in one pass	xz 65536 21889024
+fast math off xr_float_fragment format 550 blend Some([6, 2, 0, 1, 1, 0]) in one pass	xz 65536 21954560
+fast math off xr_float_fragment format 550 blend Some([1, 1, 1, 1, 1, 1]) in one pass	xz 65536 22020096
+fast math off xr_float_fragment format 550 blend Some([1, 1, 2, 1, 1, 2]) in one pass	xz 65536 22085632
+fast math off xr_float_fragment format 550 blend Some([1, 1, 3, 1, 1, 3]) in one pass	xz 65536 22151168
+fast math off xr_float_fragment format 550 blend Some([1, 1, 4, 1, 1, 4]) in one pass	xz 65536 22216704
+fast math off xr_float_fragment format 550 blend Some([7, 1, 0, 1, 1, 0]) in one pass	xz 65536 22282240
+fast math off xr_float_fragment format 550 blend Some([9, 1, 0, 9, 1, 0]) in one pass	xz 65536 22347776
+fast math off xr_float_fragment format 550 blend Some([2, 0, 0, 2, 0, 0]) in one pass	xz 65536 22413312
+fast math off xr_float_fragment format 550 blend Some([10, 1, 0, 1, 1, 0]) in one pass	xz 65536 22478848
+fast math off xr_float_fragment format 550 blend Some([8, 9, 0, 8, 9, 0]) in one pass	xz 65536 22544384
+fast math off xr_float_fragment format 550 blend Some([11, 12, 0, 13, 14, 0]) in one pass	xz 65536 22609920
+fast math off xr_float_fragment format 550 blend Some([5, 4, 0, 5, 4, 0]) in one pass	xz 65536 22675456
+fast math off xr_float_fragment format 552 blend None in one pass	xz 65536 22740992
+fast math off xr_float_fragment format 552 blend Some([1, 1, 0, 1, 1, 0]) in one pass	xz 65536 22806528
+fast math off xr_float_fragment format 552 blend Some([0, 5, 0, 0, 5, 0]) in one pass	xz 65536 22872064
+fast math off xr_float_fragment format 552 blend Some([1, 5, 0, 1, 5, 0]) in one pass	xz 65536 22937600
+fast math off xr_float_fragment format 552 blend Some([4, 5, 0, 1, 5, 0]) in one pass	xz 65536 23003136
+fast math off xr_float_fragment format 552 blend Some([4, 5, 0, 4, 5, 0]) in one pass	xz 65536 23068672
+fast math off xr_float_fragment format 552 blend Some([6, 0, 0, 6, 0, 0]) in one pass	xz 65536 23134208
+fast math off xr_float_fragment format 552 blend Some([6, 5, 0, 1, 5, 0]) in one pass	xz 65536 23199744
+fast math off xr_float_fragment format 552 blend Some([3, 8, 0, 1, 1, 0]) in one pass	xz 65536 23265280
+fast math off xr_float_fragment format 552 blend Some([3, 6, 0, 1, 1, 0]) in one pass	xz 65536 23330816
+fast math off xr_float_fragment format 552 blend Some([3, 5, 0, 1, 5, 0]) in one pass	xz 65536 23396352
+fast math off xr_float_fragment format 552 blend Some([6, 2, 0, 1, 1, 0]) in one pass	xz 65536 23461888
+fast math off xr_float_fragment format 552 blend Some([1, 1, 1, 1, 1, 1]) in one pass	xz 65536 23527424
+fast math off xr_float_fragment format 552 blend Some([1, 1, 2, 1, 1, 2]) in one pass	xz 65536 23592960
+fast math off xr_float_fragment format 552 blend Some([1, 1, 3, 1, 1, 3]) in one pass	xz 65536 23658496
+fast math off xr_float_fragment format 552 blend Some([1, 1, 4, 1, 1, 4]) in one pass	xz 65536 23724032
+fast math off xr_float_fragment format 552 blend Some([7, 1, 0, 1, 1, 0]) in one pass	xz 65536 23789568
+fast math off xr_float_fragment format 552 blend Some([9, 1, 0, 9, 1, 0]) in one pass	xz 65536 23855104
+fast math off xr_float_fragment format 552 blend Some([2, 0, 0, 2, 0, 0]) in one pass	xz 65536 23920640
+fast math off xr_float_fragment format 552 blend Some([10, 1, 0, 1, 1, 0]) in one pass	xz 65536 23986176
+fast math off xr_float_fragment format 552 blend Some([8, 9, 0, 8, 9, 0]) in one pass	xz 65536 24051712
+fast math off xr_float_fragment format 552 blend Some([11, 12, 0, 13, 14, 0]) in one pass	xz 65536 24117248
+fast math off xr_float_fragment format 552 blend Some([5, 4, 0, 5, 4, 0]) in one pass	xz 65536 24182784
+fast math off xr_float_fragment format 554 blend None in one pass	xz 65536 24248320
+fast math off xr_float_fragment format 554 blend Some([1, 1, 0, 1, 1, 0]) in one pass	xz 65536 24313856
+fast math off xr_float_fragment format 554 blend Some([0, 5, 0, 0, 5, 0]) in one pass	xz 65536 24379392
+fast math off xr_float_fragment format 554 blend Some([1, 5, 0, 1, 5, 0]) in one pass	xz 65536 24444928
+fast math off xr_float_fragment format 554 blend Some([4, 5, 0, 1, 5, 0]) in one pass	xz 65536 24510464
+fast math off xr_float_fragment format 554 blend Some([4, 5, 0, 4, 5, 0]) in one pass	xz 65536 24576000
+fast math off xr_float_fragment format 554 blend Some([6, 0, 0, 6, 0, 0]) in one pass	xz 65536 24641536
+fast math off xr_float_fragment format 554 blend Some([6, 5, 0, 1, 5, 0]) in one pass	xz 65536 24707072
+fast math off xr_float_fragment format 554 blend Some([3, 8, 0, 1, 1, 0]) in one pass	xz 65536 24772608
+fast math off xr_float_fragment format 554 blend Some([3, 6, 0, 1, 1, 0]) in one pass	xz 65536 24838144
+fast math off xr_float_fragment format 554 blend Some([3, 5, 0, 1, 5, 0]) in one pass	xz 65536 24903680
+fast math off xr_float_fragment format 554 blend Some([6, 2, 0, 1, 1, 0]) in one pass	xz 65536 24969216
+fast math off xr_float_fragment format 554 blend Some([1, 1, 1, 1, 1, 1]) in one pass	xz 65536 25034752
+fast math off xr_float_fragment format 554 blend Some([1, 1, 2, 1, 1, 2]) in one pass	xz 65536 25100288
+fast math off xr_float_fragment format 554 blend Some([1, 1, 3, 1, 1, 3]) in one pass	xz 65536 25165824
+fast math off xr_float_fragment format 554 blend Some([1, 1, 4, 1, 1, 4]) in one pass	xz 65536 25231360
+fast math off xr_float_fragment format 554 blend Some([7, 1, 0, 1, 1, 0]) in one pass	xz 65536 25296896
+fast math off xr_float_fragment format 554 blend Some([9, 1, 0, 9, 1, 0]) in one pass	xz 65536 25362432
+fast math off xr_float_fragment format 554 blend Some([2, 0, 0, 2, 0, 0]) in one pass	xz 65536 25427968
+fast math off xr_float_fragment format 554 blend Some([10, 1, 0, 1, 1, 0]) in one pass	xz 65536 25493504
+fast math off xr_float_fragment format 554 blend Some([8, 9, 0, 8, 9, 0]) in one pass	xz 65536 25559040
+fast math off xr_float_fragment format 554 blend Some([11, 12, 0, 13, 14, 0]) in one pass	xz 65536 25624576
+fast math off xr_float_fragment format 554 blend Some([5, 4, 0, 5, 4, 0]) in one pass	xz 65536 25690112
+fast math off xr_loaded_fragment format 550 blend None in one pass	xz 65536 25755648
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 0, 1, 1, 0]) in one pass	xz 65536 25821184
+fast math off xr_loaded_fragment format 550 blend Some([0, 5, 0, 0, 5, 0]) in one pass	xz 65536 25886720
+fast math off xr_loaded_fragment format 550 blend Some([1, 5, 0, 1, 5, 0]) in one pass	xz 65536 25952256
+fast math off xr_loaded_fragment format 550 blend Some([4, 5, 0, 1, 5, 0]) in one pass	xz 65536 26017792
+fast math off xr_loaded_fragment format 550 blend Some([4, 5, 0, 4, 5, 0]) in one pass	xz 65536 26083328
+fast math off xr_loaded_fragment format 550 blend Some([6, 0, 0, 6, 0, 0]) in one pass	xz 65536 26148864
+fast math off xr_loaded_fragment format 550 blend Some([6, 5, 0, 1, 5, 0]) in one pass	xz 65536 26214400
+fast math off xr_loaded_fragment format 550 blend Some([3, 8, 0, 1, 1, 0]) in one pass	xz 65536 26279936
+fast math off xr_loaded_fragment format 550 blend Some([3, 6, 0, 1, 1, 0]) in one pass	xz 65536 26345472
+fast math off xr_loaded_fragment format 550 blend Some([3, 5, 0, 1, 5, 0]) in one pass	xz 65536 26411008
+fast math off xr_loaded_fragment format 550 blend Some([6, 2, 0, 1, 1, 0]) in one pass	xz 65536 26476544
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 1, 1, 1, 1]) in one pass	xz 65536 26542080
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 2, 1, 1, 2]) in one pass	xz 65536 26607616
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 3, 1, 1, 3]) in one pass	xz 65536 26673152
+fast math off xr_loaded_fragment format 550 blend Some([1, 1, 4, 1, 1, 4]) in one pass	xz 65536 26738688
+fast math off xr_loaded_fragment format 550 blend Some([7, 1, 0, 1, 1, 0]) in one pass	xz 65536 26804224
+fast math off xr_loaded_fragment format 550 blend Some([9, 1, 0, 9, 1, 0]) in one pass	xz 65536 26869760
+fast math off xr_loaded_fragment format 550 blend Some([2, 0, 0, 2, 0, 0]) in one pass	xz 65536 26935296
+fast math off xr_loaded_fragment format 550 blend Some([10, 1, 0, 1, 1, 0]) in one pass	xz 65536 27000832
+fast math off xr_loaded_fragment format 550 blend Some([8, 9, 0, 8, 9, 0]) in one pass	xz 65536 27066368
+fast math off xr_loaded_fragment format 550 blend Some([11, 12, 0, 13, 14, 0]) in one pass	xz 65536 27131904
+fast math off xr_loaded_fragment format 550 blend Some([5, 4, 0, 5, 4, 0]) in one pass	xz 65536 27197440
+fast math off xr_loaded_fragment format 552 blend None in one pass	xz 65536 27262976
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 0, 1, 1, 0]) in one pass	xz 65536 27328512
+fast math off xr_loaded_fragment format 552 blend Some([0, 5, 0, 0, 5, 0]) in one pass	xz 65536 27394048
+fast math off xr_loaded_fragment format 552 blend Some([1, 5, 0, 1, 5, 0]) in one pass	xz 65536 27459584
+fast math off xr_loaded_fragment format 552 blend Some([4, 5, 0, 1, 5, 0]) in one pass	xz 65536 27525120
+fast math off xr_loaded_fragment format 552 blend Some([4, 5, 0, 4, 5, 0]) in one pass	xz 65536 27590656
+fast math off xr_loaded_fragment format 552 blend Some([6, 0, 0, 6, 0, 0]) in one pass	xz 65536 27656192
+fast math off xr_loaded_fragment format 552 blend Some([6, 5, 0, 1, 5, 0]) in one pass	xz 65536 27721728
+fast math off xr_loaded_fragment format 552 blend Some([3, 8, 0, 1, 1, 0]) in one pass	xz 65536 27787264
+fast math off xr_loaded_fragment format 552 blend Some([3, 6, 0, 1, 1, 0]) in one pass	xz 65536 27852800
+fast math off xr_loaded_fragment format 552 blend Some([3, 5, 0, 1, 5, 0]) in one pass	xz 65536 27918336
+fast math off xr_loaded_fragment format 552 blend Some([6, 2, 0, 1, 1, 0]) in one pass	xz 65536 27983872
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 1, 1, 1, 1]) in one pass	xz 65536 28049408
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 2, 1, 1, 2]) in one pass	xz 65536 28114944
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 3, 1, 1, 3]) in one pass	xz 65536 28180480
+fast math off xr_loaded_fragment format 552 blend Some([1, 1, 4, 1, 1, 4]) in one pass	xz 65536 28246016
+fast math off xr_loaded_fragment format 552 blend Some([7, 1, 0, 1, 1, 0]) in one pass	xz 65536 28311552
+fast math off xr_loaded_fragment format 552 blend Some([9, 1, 0, 9, 1, 0]) in one pass	xz 65536 28377088
+fast math off xr_loaded_fragment format 552 blend Some([2, 0, 0, 2, 0, 0]) in one pass	xz 65536 28442624
+fast math off xr_loaded_fragment format 552 blend Some([10, 1, 0, 1, 1, 0]) in one pass	xz 65536 28508160
+fast math off xr_loaded_fragment format 552 blend Some([8, 9, 0, 8, 9, 0]) in one pass	xz 65536 28573696
+fast math off xr_loaded_fragment format 552 blend Some([11, 12, 0, 13, 14, 0]) in one pass	xz 65536 28639232
+fast math off xr_loaded_fragment format 552 blend Some([5, 4, 0, 5, 4, 0]) in one pass	xz 65536 28704768
+fast math off xr_loaded_fragment format 554 blend None in one pass	xz 65536 28770304
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 0, 1, 1, 0]) in one pass	xz 65536 28835840
+fast math off xr_loaded_fragment format 554 blend Some([0, 5, 0, 0, 5, 0]) in one pass	xz 65536 28901376
+fast math off xr_loaded_fragment format 554 blend Some([1, 5, 0, 1, 5, 0]) in one pass	xz 65536 28966912
+fast math off xr_loaded_fragment format 554 blend Some([4, 5, 0, 1, 5, 0]) in one pass	xz 65536 29032448
+fast math off xr_loaded_fragment format 554 blend Some([4, 5, 0, 4, 5, 0]) in one pass	xz 65536 29097984
+fast math off xr_loaded_fragment format 554 blend Some([6, 0, 0, 6, 0, 0]) in one pass	xz 65536 29163520
+fast math off xr_loaded_fragment format 554 blend Some([6, 5, 0, 1, 5, 0]) in one pass	xz 65536 29229056
+fast math off xr_loaded_fragment format 554 blend Some([3, 8, 0, 1, 1, 0]) in one pass	xz 65536 29294592
+fast math off xr_loaded_fragment format 554 blend Some([3, 6, 0, 1, 1, 0]) in one pass	xz 65536 29360128
+fast math off xr_loaded_fragment format 554 blend Some([3, 5, 0, 1, 5, 0]) in one pass	xz 65536 29425664
+fast math off xr_loaded_fragment format 554 blend Some([6, 2, 0, 1, 1, 0]) in one pass	xz 65536 29491200
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 1, 1, 1, 1]) in one pass	xz 65536 29556736
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 2, 1, 1, 2]) in one pass	xz 65536 29622272
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 3, 1, 1, 3]) in one pass	xz 65536 29687808
+fast math off xr_loaded_fragment format 554 blend Some([1, 1, 4, 1, 1, 4]) in one pass	xz 65536 29753344
+fast math off xr_loaded_fragment format 554 blend Some([7, 1, 0, 1, 1, 0]) in one pass	xz 65536 29818880
+fast math off xr_loaded_fragment format 554 blend Some([9, 1, 0, 9, 1, 0]) in one pass	xz 65536 29884416
+fast math off xr_loaded_fragment format 554 blend Some([2, 0, 0, 2, 0, 0]) in one pass	xz 65536 29949952
+fast math off xr_loaded_fragment format 554 blend Some([10, 1, 0, 1, 1, 0]) in one pass	xz 65536 30015488
+fast math off xr_loaded_fragment format 554 blend Some([8, 9, 0, 8, 9, 0]) in one pass	xz 65536 30081024
+fast math off xr_loaded_fragment format 554 blend Some([11, 12, 0, 13, 14, 0]) in one pass	xz 65536 30146560
+fast math off xr_loaded_fragment format 554 blend Some([5, 4, 0, 5, 4, 0]) in one pass	xz 65536 30212096

@@ -1,0 +1,15 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+Private 2D, one level	SizeAndAlign { size: 128, align: 128 }
+Private 2D, two levels	SizeAndAlign { size: 384, align: 128 }
+Private a 2D array	SizeAndAlign { size: 256, align: 128 }
+Private a cube	SizeAndAlign { size: 768, align: 128 }
+Private 2D, one level, 8x8	SizeAndAlign { size: 128, align: 128 }
+Private 2D, two levels, 64x64	SizeAndAlign { size: 5888, align: 128 }
+Private 2D, one level, read and render	SizeAndAlign { size: 128, align: 128 }
+Shared 2D, one level	SizeAndAlign { size: 128, align: 128 }
+Shared 2D, two levels	SizeAndAlign { size: 384, align: 128 }
+Shared a 2D array	SizeAndAlign { size: 256, align: 128 }
+Shared a cube	SizeAndAlign { size: 768, align: 128 }
+Shared 2D, one level, 8x8	SizeAndAlign { size: 128, align: 128 }
+Shared 2D, two levels, 64x64	SizeAndAlign { size: 5888, align: 128 }
+Shared 2D, one level, read and render	SizeAndAlign { size: 128, align: 128 }

@@ -238,7 +238,7 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
         )
     }
 
-    /// A new library each call, holding the world's function names; the metal crate's compiles
+    /// A new library each call, holding the world's function names; the Vulkan platform's loads
     /// once per device, which no core behaviour depends on.
     fn new_shader_library(
         &self,

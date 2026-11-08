@@ -1,8 +1,8 @@
 # The metallibs beside this file and the sha256 of the commands and sources each was
 # built from (cargo xtask metallibs; reims-vgpu-vulkan/build.rs).
-"shaders.metallib" = "fde4244c2f4356f1c4d045f0c2865df8ce51fd611833d6f8f2895a419f7629a5"
+"shaders.metallib" = "b93f90469854c30f86264d0c72309f45286bf42fd1d2de3c7a9e4e2f50f9894d"
 "predication.metallib" = "3d408cde1f3dafa068fc0fed8ed31e782bb61674ea77da6ce2a656e35c9a1d15"
-"no_draw.metallib" = "4a29b5560f98b442be51aa5f743ca552131a39bc8e53efddb011932b5aa85650"
+"no_draw.metallib" = "4aa72002de04f787ddfa645fe398fa5620126f6a7655e91474a0703ff7df2635"
 "icb_encode.metallib" = "354ca4fee482115b1cb9bbd867b10bb36c37828e7ef8ff404ebfcf9c78bf6e9d"
 "barycentric.metallib" = "7decabb9010e04bfa6edf67aa618ee8603f9df4c6aa9299f84ba70585e3077f9"
 "vertex_ids.metallib" = "d4c2056c7c97ada7fa1bc8cc53bc4c42998ec4e868e51539e633c0fc2f7b89f5"
@@ -19,7 +19,7 @@
 "five_samplers.metallib" = "642332057a42cc63c609ffc8df4b513f94a72a799d76755156c3aa962dacb807"
 "spin.metallib" = "46cffaa10c2398657558682d61e832ca5e759dde699234dee6b583498349b065"
 "rgbx.metallib" = "43e0882f74d507bf4bdf72f054f58e60dae9e4b82e621e5aad73f45614e54cb4"
-"argument_probe.metallib" = "bf1dd4e4b4e7a77348e94786148c7ccc6b6c4eb28bf35164a57288d754021db1"
+"argument_probe.metallib" = "aff2ccbc2ca293ca13d8afcf19e286a89bde7570d2a7475e97dd9043eff6aeb2"
 "linked_caller.metallib" = "5a9f899c17f97bd6f2f043ae011f76ebe44a98f6aa2eacdf059543a629b0b1ac"
 "linked_callee.metallib" = "12e554dcb8248e43489597dd8e013b07dcfc61719c2ff567c44088676df109a3"
 "mesh.metallib" = "a4f408406cf4201e2eb244bb0d2e90ce6bf543a454866ec31aee2ad888e059d6"

@@ -2,7 +2,7 @@
 //! over the runtime's.
 //!
 //! - **Handlers** run on the runtime's handler threads, in the queue's order. A completed
-//!   handler reads its buffer's `status` and `error` when it runs, as on the Metal platform, and
+//!   handler reads its buffer's `status` and `error` when it runs, as on Metal, and
 //!   runs marked as ours, so a panic in it aborts ([`completed_handler`]).
 //! - **`encodeSignalEventScheduled:value:`** is the runtime's: the event's value is set as the
 //!   buffer is scheduled, before its status reads `Scheduled` and before `waitUntilScheduled`
@@ -1850,7 +1850,6 @@ mod tests {
     #[test]
     fn a_scheduled_signal_sent_after_the_commit_sets_nothing_as_metals() {
         use reims_vgpu_core::platform::Platform;
-        use reims_vgpu_metal::MetalPlatform;
 
         /// Whether the value reached the scheduled signal's 1 and the late one's 7, once the
         /// command buffer completed.
@@ -1886,9 +1885,6 @@ mod tests {
             (site.kind, site.file),
             (DeathKind::OutOfBounds, "encodeSignalEventScheduled:value:")
         );
-        if let Some(md) = MetalPlatform::system_default_device() {
-            assert_eq!(reached::<MetalPlatform>(&md).0, vulkan);
-        }
     }
 
     /// A command buffer whose first command waits for an unsignalled shared event is not
@@ -1964,10 +1960,6 @@ mod tests {
                 0x5a
             )
         );
-        #[cfg(target_os = "macos")]
-        if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-            assert_eq!(held::<reims_vgpu_metal::MetalPlatform>(&md), vulkan);
-        }
     }
 
     /// A completed handler learns its buffer's GPU times, in nanoseconds of the host's clock: a
@@ -2014,11 +2006,6 @@ mod tests {
         };
         let vulkan = learned::<VulkanPlatform>(&dev());
         assert!(plausible(vulkan), "{vulkan:?}");
-        #[cfg(target_os = "macos")]
-        if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-            let metal = learned::<reims_vgpu_metal::MetalPlatform>(&md);
-            assert!(plausible(metal), "{metal:?}");
-        }
     }
 
     /// Metal takes its own allocation for a command buffer's first work for its tiler as it

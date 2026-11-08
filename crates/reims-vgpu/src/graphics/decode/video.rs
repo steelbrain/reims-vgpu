@@ -39,7 +39,7 @@ use reims_vgpu_core::platform::resource::Buffer as _;
 use reims_vgpu_core::platform::types::PixelFormatInfo;
 use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
-#[cfg(all(vulkan_platform, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use reims_vgpu_video::core::surfaces::SurfaceError;
 use zerocopy::FromBytes;
@@ -370,7 +370,7 @@ impl DeviceMemory for RegionMemory {
     /// A dma-buf of the block's pages behind `ranges`, where the Vulkan platform's backing table
     /// knows the files behind the region's mapping (`platform/vulkan/lent_memory.rs`); refused
     /// where it does not. The region stays mapped while it lives.
-    #[cfg(all(vulkan_platform, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn dma_buf_of(&self, ranges: &[(usize, usize)]) -> Result<SurfaceDmaBuf, DmaBufError> {
         let first = usize::try_from(self.first)
             .ok()

@@ -11,8 +11,7 @@
 //! The lock is `parking_lot::RwLock`: a first read is its `read()`, which waits while a writer
 //! has set the writer bit, and a nested read its `read_recursive()`, which does not. The thread's
 //! reads are counted per lock in a thread-local table; the guards are not `Send`, so a read
-//! always ends on the thread that took it. `tests/golden_shared_mutex.rs` of the metal crate
-//! runs the schedules without nested reads on libc++'s `std::shared_mutex` and on this lock.
+//! always ends on the thread that took it.
 
 use std::cell::RefCell;
 use std::fmt;

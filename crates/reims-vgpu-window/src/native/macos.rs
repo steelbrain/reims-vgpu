@@ -44,7 +44,7 @@ use objc2_app_kit::{NSEvent, NSEventMask};
 use objc2_metal::MTLDevice;
 use objc2_quartz_core::CAMetalDrawable;
 use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
-use reims_vgpu_metal::os::clock::MetalClock;
+use reims_vgpu_vulkan::os::OsClock;
 
 pub(crate) use self::iso::is_iso_keyboard;
 pub(crate) use self::screens::host_screens;
@@ -60,7 +60,7 @@ use main_thread::post_main;
 /// frame in flight, as any frame does.
 ///
 /// A sink draws in one of two ways, which [`FrameSink::presents`] tells: into each drawable the
-/// render thread takes of the layer ([`FrameSink::draw`], the Metal platform's), or through a
+/// render thread takes of the layer ([`FrameSink::draw`]), or through a
 /// presenter of its own over a Vulkan surface of the layer ([`FrameSink::presenter`], the Vulkan
 /// platform's, whose swapchain takes the layer's drawables and sets the layer up for them).
 pub trait FrameSink: Send + Sync {
@@ -176,9 +176,9 @@ pub(crate) fn close(id: u64) {
     });
 }
 
-/// Now, on the monotonic clock the library's platform reads (`MetalClock`).
+/// Now, on the monotonic clock the library's platform reads (`OsClock`).
 pub(crate) fn now() -> MonoTime {
-    MetalClock::new().now_mono()
+    OsClock::new().now_mono()
 }
 
 /// The application has launched, before the windows posted so far open: SDL's video starts,

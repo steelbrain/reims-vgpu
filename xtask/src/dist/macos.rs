@@ -1,7 +1,7 @@
-//! `cargo xtask dist` on macOS: the library for arm64 macOS [`DEPLOYMENT_TARGET`], on Metal by
-//! default. The dylib's install name is `@rpath/libreims_vgpu.dylib`, and it is signed ad hoc
-//! again after the name changes. `Libs.private` names every library the dylib links
-//! (`otool -L`).
+//! `cargo xtask dist` on macOS: the library for arm64 macOS [`DEPLOYMENT_TARGET`], on the Vulkan
+//! platform over MoltenVK, a build for development and tests. The dylib's install name is
+//! `@rpath/libreims_vgpu.dylib`, and it is signed ad hoc again after the name changes.
+//! `Libs.private` names every library the dylib links (`otool -L`).
 //!
 //! **The archive's symbols and classes.** The archive bundles what the library links statically:
 //! Rust's standard library and SDL3, which draws a display's window. A host that links the
@@ -37,12 +37,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{LIB, Options, Platform, c_api_args, install, layout, pc_file, strs, strs_with, write};
+use super::{LIB, Options, c_api_args, install, layout, pc_file, strs, strs_with, write};
 use crate::tools::Tools;
 use crate::util::Res;
 
-/// The platform `dist` builds when `--platform` names none: Metal, the product.
-pub const DEFAULT_PLATFORM: Platform = Platform::Metal;
 /// The shared library's extension: `lib/libreims_vgpu.dylib`.
 pub const SHARED_LIBRARY_EXTENSION: &str = "dylib";
 /// The macOS the library is built for (`MACOSX_DEPLOYMENT_TARGET`): rustc's own default for
@@ -356,8 +354,7 @@ mod tests {
     fn parse_args_defaults() {
         let o = parse_args(&[], Path::new("/t")).unwrap();
         assert_eq!(o.profile, Profile("release".into()));
-        assert_eq!(o.platform, Platform::Metal);
-        assert_eq!(o.out, PathBuf::from("/t/dist"));
+        assert_eq!(o.out, PathBuf::from("/t/dist-vulkan"));
     }
 
     /// The `--config` entry that renames SDL's Objective-C names.
@@ -377,20 +374,6 @@ mod tests {
             cargo_args(&o).join(" "),
             format!(
                 "build --profile release -p reims-vgpu-c --lib \
-                 --config env.MACOSX_DEPLOYMENT_TARGET=\"11.0\" {}",
-                renames()
-            )
-        );
-    }
-
-    /// The Vulkan tree is the C API's crate with its vulkan feature
-    #[test]
-    fn cargo_args_on_vulkan_select_the_feature() {
-        let o = parse_args(&strs(&["--platform", "vulkan"]), Path::new("/t")).unwrap();
-        assert_eq!(
-            cargo_args(&o).join(" "),
-            format!(
-                "build --profile release -p reims-vgpu-c --lib --features reims-vgpu-c/vulkan \
                  --config env.MACOSX_DEPLOYMENT_TARGET=\"11.0\" {}",
                 renames()
             )

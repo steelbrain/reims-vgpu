@@ -1,0 +1,4 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+case 0, format 550	bytes 192 9c28738b505ba948481761bd5224420e 0102030401020304010203040102030401020304010203040102030401020304
+case 1, format 551	bytes 64 4c2943fa1bc9e2d1ecd7b6e9e6045fcd eeeeeeeeeeeeeeee21222324212223242122232421222324eeeeeeeeeeeeeeee
+case 2, format 550	bytes 128 f7cf7daddd7d65b2b096820814634ecd eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee

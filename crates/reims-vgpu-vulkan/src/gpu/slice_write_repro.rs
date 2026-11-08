@@ -13,7 +13,6 @@ use reims_vgpu_core::platform::resource::{Buffer as _, Library as _, Texture as 
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange};
 use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_metal::MetalPlatform;
 
 use crate::gpu::device::tests::dev;
 use crate::platform::tests::platform;
@@ -30,11 +29,6 @@ const PRIVATE: u64 = 0x20;
 /// The written texture's side at level 0, and its levels.
 const SIDE: u64 = 64;
 const LEVELS: u64 = 3;
-
-/// Metal's platform and device, when the host has Metal.
-fn metal() -> Option<(MetalPlatform, <MetalPlatform as Platform>::Device)> {
-    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(), d))
-}
 
 /// A Shared buffer of `length` bytes, `contents` at its start.
 fn buffer<P: Platform>(d: &P::Device, length: u64, contents: &[u8]) -> P::Buffer {
@@ -202,23 +196,12 @@ fn slice_write_levels<P: Platform>(
     ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn imageblock_slice_writes_at_every_usage_are_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
     for usage in [0x10005, 0x10001, 0x10007, 0x7] {
         for lod in [Some(0), Some(1), None] {
-            let theirs = slice_write_levels(&mp, &md, usage, lod);
             let ours = slice_write_levels(&vp, &vd, usage, lod);
-            let written = &theirs[usize::try_from(lod.unwrap_or(0)).unwrap()];
             let case = format!("usage {usage:#x} lod {lod:?} (None: a constant 0)");
-            assert!(
-                written.iter().any(|b| *b != 0),
-                "Metal writes nothing: {case}"
-            );
-            for (level, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
-                assert_eq!(ours, theirs, "{case}: level {level}");
-            }
+            reims_vgpu_core::metal_check_raw!(&case, ours);
         }
     }
 }

@@ -8,7 +8,7 @@
 //! - `Nil` / `Error`: Metal returned nil or an `NSError` (the expected channel);
 //! - `Value`: a scripted return value (`false`, a count, a struct) in place of the model's;
 //! - `Raise`: Metal raised an `NSException`, a raise at the selector (`Raise::foreign`), decided
-//!   by the send's [`Policy`], the label the metal crate's message layer gives the same send:
+//!   by the send's [`Policy`], the label the platform's answer layer gives the same send:
 //!   `Err(Raise)`, or a death at the send;
 //! - `Die`: Metal, IOGPU or the driver crashed, which ends the process whatever thread it is on:
 //!   a death marker;
@@ -26,8 +26,9 @@ use crate::platform::types::NsErrorText;
 use crate::raise::death::{DeathId, DeathKind, DeathSite, fatal};
 use crate::raise::{OnFault, Raise, RaiseResult};
 
-/// What a scripted raise at a send does: the label the metal crate's message layer gives the same
-/// send (its `msg::Policy`), so that the fake decides each raise as the real platform does.
+/// What a scripted raise at a send does: the label the platform's answer layer gives the same send
+/// (the Vulkan crate's `answer::Policy`), so that the fake decides each raise as the real platform
+/// does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Policy {
     /// A send no path reaches without a handler: the raise is `Err`, the caller's to catch.

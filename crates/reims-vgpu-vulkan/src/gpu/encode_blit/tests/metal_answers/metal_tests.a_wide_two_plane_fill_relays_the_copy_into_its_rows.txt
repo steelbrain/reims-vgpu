@@ -1,0 +1,3 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+551 [33, 5, 1]: [Color(0, 0, [3, 1, 0], [20, 3, 1], [1.0, 0.5, 0.25, 1.0], 70)]	bytes 660 36169414e4b18182391dbd4211d28d85 eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+550 [37, 3, 1]: [Bytes(0, 0, [2, 1, 0], [9, 5, 1], [9, 10, 11])]	bytes 444 5901c0e1f712a73f8bdf57d847280b29 eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee

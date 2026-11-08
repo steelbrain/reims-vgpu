@@ -7,7 +7,7 @@
 //! follow the runtime's encodings (D41), as `method_getTypeEncoding` reads them on the AGX
 //! classes (macOS 26.7), where a declaration in the headers differs. Methods with arguments,
 //! creators and actions return `RaiseResult<T>`; zero-argument property getters and descriptor
-//! property setters do not (the metal crate wraps them in `send_get`). A handle argument core can
+//! property setters do not (a platform dies at their send on a raise). A handle argument core can
 //! pass as nil is `Option<&P::X>`; one it never passes as nil is `&P::X`.
 
 use super::types::{MtlRegion, MtlSize};

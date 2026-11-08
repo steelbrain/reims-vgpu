@@ -1,7 +1,7 @@
 //! The comparisons of the runtime's textures of Apple's eleven RGBX formats with Metal's on this
 //! host. The runtime holds each in its RGBA twin (reads take alpha 1, GPU writes
 //! store the green field's bits in the fourth field, Metal's X), as it measured on an Apple M4
-//! under macOS 27.0.1; these tests hold its answers to the Metal platform's here, byte for byte:
+//! under macOS 27.0.1; these tests hold its answers to Metal's on the M3 Max, byte for byte:
 //! - what kernels read, sample and gather of random bytes, in bounds and out, through each
 //!   address mode and border colour, and through an argument buffer;
 //! - what kernels write, in each of their types, and read and write;
@@ -19,7 +19,7 @@
 //!
 //! What the runtime refuses dies here, named: a pass into such a texture, with `RenderTarget`
 //! usage or without; the mipmaps of one of two levels; a texture buffer a kernel reads; and a
-//! write through an argument buffer. Metal's side of each runs first.
+//! write through an argument buffer.
 //! The kernels are `rgbx.metal`'s, each at its thread's texel of a 16 by 16 texture.
 //!
 //! The same readers and writers hold the runtime's textures of the three bfloat formats to
@@ -43,7 +43,6 @@ use reims_vgpu_core::platform::{HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
 use reims_vgpu_core::testkit::capture::catch_death;
-use reims_vgpu_metal::MetalPlatform;
 
 use crate::gpu::device::tests::dev;
 use crate::gpu::encode_render::tests::metal_tests::memoryless_fetched;
@@ -118,10 +117,6 @@ fn stored_usages(format: u64) -> &'static [u64] {
         &[READ_WRITE]
     }
 }
-
-/// The formats Metal renders into: passes into the others' textures run no
-/// pipeline on Metal here.
-const RENDERED: [u64; 3] = [300, 315, 325];
 
 /// The samplers the sampling kernels read through: the filter (0 nearest, 1 linear), the
 /// address mode on both axes (0 clamp to edge, 2 repeat, 4 clamp to zero, 5 clamp to the border
@@ -1046,11 +1041,6 @@ impl<'a, P: Platform> Gpu<'a, P> {
     }
 }
 
-/// The Metal platform and its device, where the host has one.
-fn metal() -> Option<(MetalPlatform, <MetalPlatform as Platform>::Device)> {
-    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(), d))
-}
-
 /// What `f` answers, or where it died and the line its death named.
 fn survived<R>(f: impl FnOnce() -> R) -> Result<R, (DeathSite, String)> {
     *crate::answer::LAST_LINE.lock() = None;
@@ -1077,19 +1067,21 @@ fn half_nans_only(metal: &[u8], ours: &[u8]) -> bool {
         .all(|(m, o)| m == o || (half_nan(m) && half_nan(o)))
 }
 
-/// Adds to `differ` each of `ours`' cases whose bytes are not `theirs`', named after `of`: how
+/// Metal's answer under `key` for a test to compare `mine` with ([`reims_vgpu_core::metal_answer`]).
+fn metals_of(key: &str, mine: &Result<Vec<u8>, (DeathSite, String)>) -> Vec<u8> {
+    reims_vgpu_core::metal_answer!(key, mine.as_ref().ok().map(Vec::as_slice))
+}
+
+/// Adds to `differ` each of `ours`' cases whose bytes are not Metal's, named after `of`: how
 /// many of its 256 threads' (or texels') bytes differ, and the first such, both sides'. A half
 /// read's or sample's thread whose halves differ only in NaNs' bits ([`half_nans_only`]) is
-/// counted in `nans` instead, for the test to check the note was relayed.
-fn compare(
-    differ: &mut Vec<String>,
-    nans: &mut usize,
-    of: &str,
-    theirs: &[(String, Vec<u8>)],
-    ours: &[(String, Vec<u8>)],
-) {
-    assert_eq!(theirs.len(), ours.len(), "{of}");
-    for ((case, metal), (_, mine)) in theirs.iter().zip(ours) {
+/// counted in `nans` instead, for the test to check the note was relayed. Metal's cases are the
+/// ones recorded.
+fn compare(differ: &mut Vec<String>, nans: &mut usize, of: &str, ours: &[(String, Vec<u8>)]) {
+    let cases = format!("{of}: cases");
+    reims_vgpu_core::metal_check!(&cases, ours.len());
+    for (case, mine) in ours {
+        let metal = &reims_vgpu_core::metal_near!(format!("{of} {case}"), mine);
         assert_eq!(metal.len(), mine.len(), "{of} {case}");
         let element = (metal.len() / TEXELS).max(1);
         let halves = ["rgbx_read_half", "rgbx_sample_half", "rgbx_read_held_half"]
@@ -1123,22 +1115,18 @@ fn compare(
 /// That dispatch dies, naming the kind ([`crate::answer::DIES`]), for the float formats alone
 #[test]
 fn reads_of_rgbx_textures_are_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let (mut differ, mut nans, mut died) = (Vec::new(), 0, Vec::new());
     let sel = "dispatchThreads:threadsPerThreadgroup:";
     let named = "(metal2vulkan-degrade-device-nan-encoding)";
     for (seed, (format, name, texel, class, _)) in (1u64..).zip(FORMATS) {
         for options in [SHARED, PRIVATE] {
             let bytes = Rng(0x9e37_79b9_7f4a_7c15 ^ seed).bytes(TEXELS * texel);
-            let metals = theirs.reads(class, &theirs.texture(format, READ, options, &bytes));
             let of = format!("{name} options {options:#x}");
             let mine = survived(|| ours.reads(class, &ours.texture(format, READ, options, &bytes)));
             match mine {
-                Ok(mine) => compare(&mut differ, &mut nans, &of, &metals, &mine),
+                Ok(mine) => compare(&mut differ, &mut nans, &of, &mine),
                 Err((site, line))
                     if (site.kind, site.file) == (DeathKind::Abort, sel)
                         && line.contains(named)
@@ -1174,20 +1162,16 @@ fn reads_of_rgbx_textures_are_metals() {
     ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn kernel_writes_of_rgbx_textures_are_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let (mut differ, mut nans) = (Vec::new(), 0);
     for (seed, (format, name, texel, class, _)) in (1u64..).zip(FORMATS) {
         for options in [SHARED, PRIVATE] {
             let bytes = Rng(0xbb67_ae85_84ca_a73b ^ seed).bytes(TEXELS * texel);
             let shape = (format, texel, class);
-            let metals = theirs.writes(shape, options, &bytes, seed);
             let of = format!("{name} options {options:#x}");
             match survived(|| ours.writes(shape, options, &bytes, seed)) {
-                Ok(mine) => compare(&mut differ, &mut nans, &of, &metals, &mine),
+                Ok(mine) => compare(&mut differ, &mut nans, &of, &mine),
                 Err((site, line)) => differ.push(format!("{of}: died at {site:?}: {line}")),
             }
         }
@@ -1206,11 +1190,8 @@ fn kernel_writes_of_rgbx_textures_are_metals() {
 /// through the argument buffer: each is Metal's, bit for bit
 #[test]
 fn mistyped_reads_are_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let reader = |class| match class {
         Class::Float => "rgbx_read_float",
         Class::Uint => "rgbx_read_uint",
@@ -1226,29 +1207,20 @@ fn mistyped_reads_are_metals() {
     for (seed, (format, name, texel, class)) in (1u64..).zip(formats) {
         for options in [SHARED, PRIVATE] {
             let bytes = Rng(0x2545_f491_4f6c_dd1d ^ seed).bytes(TEXELS * texel);
-            let metals = theirs.texture(format, READ, options, &bytes);
             let mine = ours.texture(format, READ, options, &bytes);
-            let at = (theirs.buffer(&le([0, 0])), ours.buffer(&le([0, 0])));
-            let lanes = theirs.output(reader(class), &metals, 16, &[&at.0], None);
+            let at = ours.buffer(&le([0, 0]));
             let others = [Class::Float, Class::Uint, Class::Int].into_iter();
             for read in others.filter(|&read| read != class) {
                 for held in [false, true] {
                     let of = format!("{name} options {options:#x} read as {read:?} held {held}");
-                    let metal = if held {
-                        theirs.held_read(read, &metals).1
-                    } else {
-                        theirs.output(reader(read), &metals, 16, &[&at.0], None)
-                    };
-                    if metal != lanes {
-                        differ.push(format!("{of}: Metal's are not the texels' own lanes"));
-                    }
                     let read = survived(|| {
                         if held {
                             ours.held_read(read, &mine).1
                         } else {
-                            ours.output(reader(read), &mine, 16, &[&at.1], None)
+                            ours.output(reader(read), &mine, 16, &[&at], None)
                         }
                     });
+                    let metal = metals_of(&of, &read);
                     match read {
                         Ok(read) => {
                             let pairs = read.chunks(16).zip(metal.chunks(16));
@@ -1276,11 +1248,8 @@ fn mistyped_reads_are_metals() {
 /// announcing nothing: each sample is Metal's, bit for bit
 #[test]
 fn cross_class_samples_are_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     // The kernels that sample each format in the other classes, with their bytes a thread.
     let r32 = [
         ("rgbx_sample_float", 16),
@@ -1288,31 +1257,19 @@ fn cross_class_samples_are_metals() {
         ("rgbx_sample_int", 16),
     ];
     let rgba8 = [("rgbx_sample_uint", 16), ("rgbx_sample_int", 16)];
-    // Each format: its raw value, its name, the kernel that samples it in its own class, whether
-    // that class is an integer one, and the kernels of the other classes.
-    let formats = [
-        (53, "R32Uint", "rgbx_sample_uint", true, &r32[..]),
-        (70, "RGBA8Unorm", "rgbx_sample_float", false, &rgba8[..]),
-    ];
+    // Each format: its raw value, its name and the kernels of the other classes.
+    let formats = [(53, "R32Uint", &r32[..]), (70, "RGBA8Unorm", &rgba8[..])];
     let mut differ = Vec::new();
-    for (seed, (format, name, own, integer, others)) in (1u64..).zip(formats) {
+    for (seed, (format, name, others)) in (1u64..).zip(formats) {
         let bytes = Rng(0x3c6e_f372_fe94_f82b ^ seed).bytes(TEXELS * 4);
-        let metals = theirs.texture(format, READ, SHARED, &bytes);
         let mine = ours.texture(format, READ, SHARED, &bytes);
         for filter in [0, 1] {
             // Metal samples an integer format through a linear filter as through a nearest one.
-            let words = theirs.sampled(own, &metals, 16, if integer { 0 } else { filter });
             for &(kernel, bytes) in others {
                 let of = format!("{name} by {kernel} filter {filter}");
-                let handed: Vec<u8> = if bytes == 16 {
-                    words.clone()
-                } else {
-                    words.chunks(4).flat_map(|w| [w[0], w[1]]).collect()
-                };
-                if theirs.sampled(kernel, &metals, bytes, filter) != handed {
-                    differ.push(format!("{of}: Metal's are not the own class's words"));
-                }
-                match survived(|| ours.sampled(kernel, &mine, bytes, filter)) {
+                let read = survived(|| ours.sampled(kernel, &mine, bytes, filter));
+                let handed = metals_of(&of, &read);
+                match read {
                     Ok(read) => {
                         let pairs = read.chunks(bytes).zip(handed.chunks(bytes));
                         let off = pairs.filter(|(o, m)| o != m).count();
@@ -1348,11 +1305,8 @@ fn cross_class_samples_are_metals() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn bfloat_textures_read_and_write_as_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let (mut differ, mut nans, mut died) = (Vec::new(), 0, Vec::new());
     let sel = "dispatchThreads:threadsPerThreadgroup:";
     let named = "(metal2vulkan-degrade-half-texel-conversion)";
@@ -1365,11 +1319,6 @@ fn bfloat_textures_read_and_write_as_metals() {
         for options in [SHARED, PRIVATE] {
             let of = format!("{name} options {options:#x}");
             let bytes = Rng(0x3c6e_f372_fe94_f82b ^ seed).bytes(TEXELS * texel);
-            let t = theirs.texture(format, READ, options, &bytes);
-            let mut metals = theirs.direct_reads(Class::Float, &t);
-            metals.extend(theirs.held_float_reads(&t));
-            metals.extend(theirs.held_samples(&t, false));
-            theirs.held_samples(&t, true);
             let t = ours.texture(format, READ, options, &bytes);
             let read = || {
                 let mut mine = ours.direct_reads(Class::Float, &t);
@@ -1378,7 +1327,10 @@ fn bfloat_textures_read_and_write_as_metals() {
                 mine
             };
             match survived(read) {
-                Ok(mine) => compare(&mut differ, &mut nans, &of, &metals, &mine),
+                Ok(mine) => {
+                    let reads = format!("{of} reads");
+                    compare(&mut differ, &mut nans, &reads, &mine);
+                }
                 Err((site, line))
                     if (site.kind, site.file) == (DeathKind::Abort, sel)
                         && line.contains(named) =>
@@ -1394,9 +1346,11 @@ fn bfloat_textures_read_and_write_as_metals() {
                 survived(|| ours.held_samples(&t, true)),
             );
             let shape = (format, texel, Class::Float);
-            let metals = theirs.writes(shape, options, &bytes, seed);
             match survived(|| ours.writes(shape, options, &bytes, seed)) {
-                Ok(mine) => compare(&mut differ, &mut nans, &of, &metals, &mine),
+                Ok(mine) => {
+                    let writes = format!("{of} writes");
+                    compare(&mut differ, &mut nans, &writes, &mine);
+                }
                 Err((site, line)) => differ.push(format!("{of} writes: died at {site:?}: {line}")),
             }
         }
@@ -1571,11 +1525,8 @@ fn new_textures_read_as_metals() {
         let t = made(g, desc);
         g.read(&t, texel)
     }
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let shape = |format, usage, options| TextureDesc {
         pixel_format: format,
         width: SIDE,
@@ -1601,8 +1552,8 @@ fn new_textures_read_as_metals() {
     let zero = |b: &[u8]| b.iter().all(|&x| x == 0);
     for (seed, (name, desc, texel)) in (1u64..).zip(blitted) {
         let bytes = Rng(0x510e_527f_ade6_82d1 ^ seed).bytes(TEXELS * texel);
-        let metals = fresh(&theirs, &desc, texel, &bytes);
         let mine = survived(|| fresh(&ours, &desc, texel, &bytes));
+        let metals = metals_of(name, &mine);
         match mine {
             Ok(mine) if mine == metals && zero(&mine) => {}
             Ok(mine) => differ.push(format!(
@@ -1620,7 +1571,7 @@ fn new_textures_read_as_metals() {
         ..shape(70, RENDER, PRIVATE)
     };
     let two_plane = shape(550, READ, PRIVATE);
-    let at = (theirs.buffer(&le([0, 0])), ours.buffer(&le([0, 0])));
+    let at = ours.buffer(&le([0, 0]));
     let kernels = [
         (
             "RGBA8Unorm 4 samples",
@@ -1631,8 +1582,8 @@ fn new_textures_read_as_metals() {
         ("RGB10A8_2P_XR10 Private", &two_plane, "rgbx_read_float", 16),
     ];
     for (name, desc, kernel, bytes) in kernels {
-        let metals = theirs.output(kernel, &made(&theirs, desc), bytes, &[&at.0], None);
-        let mine = survived(|| ours.output(kernel, &made(&ours, desc), bytes, &[&at.1], None));
+        let mine = survived(|| ours.output(kernel, &made(&ours, desc), bytes, &[&at], None));
+        let metals = metals_of(name, &mine);
         match mine {
             Ok(mine) if mine == metals => {}
             Ok(mine) => differ.push(format!(
@@ -1645,25 +1596,21 @@ fn new_textures_read_as_metals() {
     }
     let compressed = shape(70, READ, PRIVATE);
     let bytes = Rng(0x510e_527f_ade6_82d1).bytes(TEXELS * 4);
-    let metals = fresh(&theirs, &compressed, 4, &bytes);
-    let pattern = [0xff, 0x00, 0xff, 0xff];
-    if metals != pattern.repeat(TEXELS) {
-        let off = metals.chunks(4).filter(|t| *t != pattern).count();
-        let first = &metals[..16];
-        differ.push(format!(
-            "compressed: Metal's {off} of {TEXELS} texels are not {pattern:02x?}: {first:02x?}"
-        ));
-    }
-    match survived(|| fresh(&ours, &compressed, 4, &bytes)) {
+    let mine = survived(|| fresh(&ours, &compressed, 4, &bytes));
+    let metals = metals_of("compressed", &mine);
+    match mine {
         Ok(mine) if mine == metals => {}
         Ok(mine) => differ.push(format!("compressed: ours {:02x?}", &mine[..16])),
         Err((site, line)) => differ.push(format!("compressed: died at {site:?}: {line}")),
     }
     for (name, desc, texel, slices) in compressed_shapes() {
-        let metals = fresh_levels(&theirs, &desc, texel, slices);
+        let levels = format!("{name}: levels");
         match survived(|| fresh_levels(&ours, &desc, texel, slices)) {
             Ok(mine) => {
-                for ((level, m), (_, o)) in metals.iter().zip(&mine) {
+                reims_vgpu_core::metal_check!(&levels, mine.len());
+                for (level, o) in &mine {
+                    let key = format!("{name} {level}");
+                    let m = &reims_vgpu_core::metal_answer!(&key, Some(&o[..]));
                     if m != o {
                         differ.push(format!(
                             "{name} {level}: Metal {:02x?}, ours {:02x?}",
@@ -1681,11 +1628,12 @@ fn new_textures_read_as_metals() {
         sample_count: 4,
         ..shape(format, RENDER, PRIVATE)
     };
-    let at = (theirs.buffer(&le([0, 0])), ours.buffer(&le([0, 0])));
+    let at = ours.buffer(&le([0, 0]));
     let read = "rgbx_read_samples";
     let name = "RGBA8Unorm 4 samples, compressed";
-    let metals = theirs.output(read, &made(&theirs, &samples(70)), 64, &[&at.0], None);
-    match survived(|| ours.output(read, &made(&ours, &samples(70)), 64, &[&at.1], None)) {
+    let mine = survived(|| ours.output(read, &made(&ours, &samples(70)), 64, &[&at], None));
+    let metals = metals_of(name, &mine);
+    match mine {
         Ok(mine) if mine == metals => {}
         Ok(mine) => differ.push(format!(
             "{name}: Metal {:02x?}, ours {:02x?}",
@@ -1702,8 +1650,9 @@ fn new_textures_read_as_metals() {
         (92, "RG11B10Float"),
     ] {
         let name = format!("{name} 4 samples, compressed");
-        let metals = theirs.output(read, &made(&theirs, &samples(format)), 64, &[&at.0], None);
-        match survived(|| ours.output(read, &made(&ours, &samples(format)), 64, &[&at.1], None)) {
+        let mine = survived(|| ours.output(read, &made(&ours, &samples(format)), 64, &[&at], None));
+        let metals = metals_of(&name, &mine);
+        match mine {
             Ok(mine) if mine == metals => {}
             Ok(mine) => differ.push(format!(
                 "{name}: Metal {:02x?}, ours {:02x?}",
@@ -1715,8 +1664,9 @@ fn new_textures_read_as_metals() {
     }
     for tiles_written in [false, true] {
         let name = format!("memoryless DontCare fetched, tiles written first {tiles_written}");
-        let metals = memoryless_fetched(&mp, &md, tiles_written);
-        match survived(|| memoryless_fetched(&vp, &vd, tiles_written)) {
+        let mine = survived(|| memoryless_fetched(&vp, &vd, tiles_written));
+        let metals = metals_of(&name, &mine);
+        match mine {
             Ok(mine) if mine == metals && zero(&mine) => {}
             Ok(mine) => differ.push(format!(
                 "{name}: Metal {:02x?}, ours {:02x?}",
@@ -1801,19 +1751,17 @@ fn clears_and_bfloat_fills_are_metals() {
         });
         g.read(&t, texel)
     }
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let formats = [
         (26, "R16Bfloat", 2),
         (66, "RG16Bfloat", 4),
         (116, "RGBA16Bfloat", 8),
     ];
     let mut differ = Vec::new();
-    let mut compare =
-        |of: String, metals: Vec<u8>, mine: Result<Vec<u8>, (DeathSite, String)>| match mine {
+    let mut compare = |of: String, mine: Result<Vec<u8>, (DeathSite, String)>| {
+        let metals = metals_of(&of, &mine);
+        match mine {
             Ok(mine) if mine == metals => {}
             Ok(mine) => {
                 let off = (metals.iter().zip(&mine)).position(|(m, o)| m != o);
@@ -1826,33 +1774,38 @@ fn clears_and_bfloat_fills_are_metals() {
                 ));
             }
             Err((site, line)) => differ.push(format!("{of}: died at {site:?}: {line}")),
-        };
+        }
+    };
     for (seed, (format, name, texel)) in (1u64..).zip(formats) {
         for colour in BFLOAT_CLEARS {
             for (usage, route) in [(RENDER, "straight"), (RENDER | READ_WRITE, "through half")] {
-                let of = format!("{name} clear to {colour:?} ({route})");
-                let metals = theirs.read(&theirs.cleared(format, usage, colour), texel);
+                let of = format!("{name} clear to {:x?} ({route})", colour.map(f64::to_bits));
                 let mine = survived(|| ours.read(&ours.cleared(format, usage, colour), texel));
-                compare(of, metals, mine);
+                compare(of, mine);
             }
         }
         for colour in BFLOAT_COLOURS {
-            let metals = theirs.read(&theirs.filled(format, colour), texel);
             let mine = survived(|| ours.read(&ours.filled(format, colour), texel));
-            compare(format!("{name} fill of {colour:?}"), metals, mine);
+            compare(
+                format!("{name} fill of {:x?}", colour.map(f64::to_bits)),
+                mine,
+            );
         }
         let bytes = Rng(0x1f83_d9ab_fb41_bd6b ^ seed).bytes(TEXELS * texel);
-        let metals = loaded(&theirs, format, texel, &bytes);
         let mine = survived(|| loaded(&ours, format, texel, &bytes));
-        compare(format!("{name} loaded, nothing drawn"), metals, mine);
+        compare(format!("{name} loaded, nothing drawn"), mine);
     }
     for colour in FLOAT_CLEARS {
-        let of = format!("RGBA16Float 4 samples clear to {colour:?}");
-        let (stored, held) = theirs.multisample_cleared(115, 8, colour);
+        let of = format!(
+            "RGBA16Float 4 samples clear to {:x?}",
+            colour.map(f64::to_bits)
+        );
         match survived(|| ours.multisample_cleared(115, 8, colour)) {
-            Ok((mine, _)) if mine != stored => compare(of, stored, Ok(mine)),
-            Ok((_, mine)) => compare(format!("{of}, samples"), held, Ok(mine)),
-            Err(death) => compare(of, stored, Err(death)),
+            Ok((mine, samples)) => {
+                compare(of.clone(), Ok(mine));
+                compare(format!("{of}, samples"), Ok(samples));
+            }
+            Err(death) => compare(of, Err(death)),
         }
     }
     assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
@@ -2002,11 +1955,8 @@ const CLEAR_NANS: [u64; 5] = [
     ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn nan_clears_are_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let nans: Vec<[f64; 4]> = CLEAR_NANS
         .iter()
         .map(|&bits| f64::from_bits(bits))
@@ -2048,11 +1998,23 @@ fn nan_clears_are_metals() {
                              {drawn:?}, clear to {:#x?}",
                             colour.map(f64::to_bits)
                         );
-                        let metals = nan_cleared(&theirs, (format, texel), shape, colour, drawn)
-                            .unwrap_or_else(|| panic!("{of}: Metal makes no such texture"));
                         let mine =
                             survived(|| nan_cleared(&ours, (format, texel), shape, colour, drawn));
                         cases += 1;
+                        let made = match &mine {
+                            Ok(Some(mine)) => Some(mine),
+                            _ => None,
+                        };
+                        let metals = (
+                            reims_vgpu_core::metal_answer!(
+                                format!("{of}: stored"),
+                                made.map(|m| &m.0[..])
+                            ),
+                            reims_vgpu_core::metal_answer!(
+                                format!("{of}: samples"),
+                                made.map(|m| &m.1[..])
+                            ),
+                        );
                         match mine {
                             Ok(Some(mine)) if mine == metals => {}
                             Ok(None) => differ.push(format!("{of}: no texture made")),
@@ -2152,11 +2114,8 @@ fn extended_range_textures_an_argument_buffer_holds_read_as_metals() {
             false => g.texture(format, READ, options, bytes),
         }
     }
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     // Each format, its name and texel's bytes, whether a buffer holds it, and its `_sRGB` twin.
     let formats = [
         (552, "BGRA10_XR", 8, false, 553),
@@ -2174,10 +2133,6 @@ fn extended_range_textures_an_argument_buffer_holds_read_as_metals() {
             let shape = (over, options);
             let bytes = Rng(0x6a09_e667_f3bc_c908 ^ seed).bytes(TEXELS * texel);
             let of = format!("{name} options {options:#x}");
-            let t = made(&theirs, format, shape, &bytes);
-            let mut metals = theirs.held_float_reads(&t);
-            metals.extend(theirs.held_samples(&t, false));
-            theirs.held_samples(&t, true);
             let t = made(&ours, format, shape, &bytes);
             let read = || {
                 let mut mine = ours.held_float_reads(&t);
@@ -2185,7 +2140,7 @@ fn extended_range_textures_an_argument_buffer_holds_read_as_metals() {
                 mine
             };
             match survived(read) {
-                Ok(mine) => compare(&mut differ, &mut nans, &of, &metals, &mine),
+                Ok(mine) => compare(&mut differ, &mut nans, &of, &mine),
                 Err((site, line))
                     if (site.kind, site.file) == (DeathKind::Abort, sel)
                         && line.contains(named) =>
@@ -2202,15 +2157,13 @@ fn extended_range_textures_an_argument_buffer_holds_read_as_metals() {
                 survived(|| ours.held_samples(&t, true)),
             );
             let other = Rng(0xbb67_ae85_84ca_a73b ^ seed).bytes(TEXELS * 4);
-            let metals = theirs.held_samples(&theirs.texture(70, READ, SHARED, &other), false);
             let plain = ours.texture(70, READ, SHARED, &other);
             let beside = format!("{of}: an RGBA8Unorm texture's samples beside it");
             match survived(|| ours.held_samples(&plain, false)) {
-                Ok(mine) => compare(&mut differ, &mut nans, &beside, &metals, &mine),
+                Ok(mine) => compare(&mut differ, &mut nans, &beside, &mine),
                 Err((site, line)) => differ.push(format!("{beside}: died at {site:?}: {line}")),
             }
             let of = format!("{name}_sRGB options {options:#x}");
-            theirs.held_float_reads(&made(&theirs, twin, shape, &bytes));
             let t = made(&ours, twin, shape, &bytes);
             held_reads_die(
                 &mut differ,
@@ -2228,7 +2181,6 @@ fn extended_range_textures_an_argument_buffer_holds_read_as_metals() {
         blue,
         alpha,
     };
-    theirs.held_float_reads(&theirs.swizzled(552, swizzle, &bytes));
     let t = ours.swizzled(552, swizzle, &bytes);
     let of = "BGRA10_XR under a swizzle";
     held_reads_die(
@@ -2275,11 +2227,8 @@ const XR_SWIZZLES: [[u8; 4]; 5] = [
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn extended_range_textures_read_as_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let (mut differ, mut nans) = (Vec::new(), 0);
     let formats = [
         (552, "BGRA10_XR", 8),
@@ -2297,19 +2246,16 @@ fn extended_range_textures_read_as_metals() {
                 alpha,
             };
             let of = format!("{name} swizzle {:?}", [red, green, blue, alpha]);
-            let metals =
-                theirs.direct_reads(Class::Float, &theirs.swizzled(format, swizzle, &bytes));
             match survived(|| {
                 ours.direct_reads(Class::Float, &ours.swizzled(format, swizzle, &bytes))
             }) {
-                Ok(mine) => compare(&mut differ, &mut nans, &of, &metals, &mine),
+                Ok(mine) => compare(&mut differ, &mut nans, &of, &mine),
                 Err((site, line)) => differ.push(format!("{of}: died at {site:?}: {line}")),
             }
             let of = format!("{of}, a view's");
-            let metals = theirs.direct_reads(Class::Float, &theirs.view(format, swizzle, &bytes));
             match survived(|| ours.direct_reads(Class::Float, &ours.view(format, swizzle, &bytes)))
             {
-                Ok(mine) => compare(&mut differ, &mut nans, &of, &metals, &mine),
+                Ok(mine) => compare(&mut differ, &mut nans, &of, &mine),
                 Err((site, line)) => differ.push(format!("{of}: died at {site:?}: {line}")),
             }
         }
@@ -2332,19 +2278,15 @@ fn extended_range_textures_read_as_metals() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn srgb_storage_reads_and_writes_are_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     crate::answer::RELAYED.lock().clear();
     let (mut differ, mut nans) = (Vec::new(), 0);
     for (format, name) in [(SRGB_X, "RGBX8Unorm_sRGB"), (SRGB_RGBA, "RGBA8Unorm_sRGB")] {
         for options in [SHARED, PRIVATE] {
-            let metals = theirs.srgb_storage(format, options);
             let of = format!("{name} options {options:#x}");
             match survived(|| ours.srgb_storage(format, options)) {
-                Ok(mine) => compare(&mut differ, &mut nans, &of, &metals, &mine),
+                Ok(mine) => compare(&mut differ, &mut nans, &of, &mine),
                 Err((site, line)) => differ.push(format!("{of}: died at {site:?}: {line}")),
             }
         }
@@ -2362,11 +2304,8 @@ fn srgb_storage_reads_and_writes_are_metals() {
 /// a blit of the region into a buffer: the bytes stored are Metal's
 #[test]
 fn stores_into_rgbx_textures_are_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let (mut differ, mut nans) = (Vec::new(), 0);
     for (seed, (format, name, texel, _, twin)) in (1u64..).zip(FORMATS) {
         for (&usage, options) in stored_usages(format)
@@ -2376,11 +2315,10 @@ fn stores_into_rgbx_textures_are_metals() {
             let bytes = Rng(0x3c6e_f372_fe94_f82b ^ seed).bytes(TEXELS * texel);
             let other = Rng(0xa54f_f53a_5f1d_36f1 ^ seed).bytes(TEXELS * texel);
             let shape = (format, texel, twin);
-            let metals = theirs.stores(shape, (usage, options), &bytes, &other);
             let of = format!("{name} usage {usage:#x} options {options:#x}");
             let mine = survived(|| ours.stores(shape, (usage, options), &bytes, &other));
             match mine {
-                Ok(mine) => compare(&mut differ, &mut nans, &of, &metals, &mine),
+                Ok(mine) => compare(&mut differ, &mut nans, &of, &mine),
                 Err((site, line)) => differ.push(format!("{of}: died at {site:?}: {line}")),
             }
         }
@@ -2390,8 +2328,8 @@ fn stores_into_rgbx_textures_are_metals() {
 }
 
 /// What the runtime refuses of a texture of each RGBX format dies here where it is encoded,
-/// naming the refusal, where Metal runs it (Metal's side first; a pass and mipmaps only of the
-/// formats Metal renders into): a pass that clears it and stores it, with `RenderTarget` usage
+/// naming the refusal, where Metal runs it (a pass and mipmaps only of the formats Metal renders
+/// into): a pass that clears it and stores it, with `RenderTarget` usage
 /// or without (`Format`); the mipmaps of one of two levels (`MipmapGeneration`); a kernel's read
 /// of a texture buffer of the format (`Format`); a kernel's write into such a texture an
 /// argument buffer holds (`ArgumentBufferTextures`). A colour fill in the format, which the
@@ -2402,20 +2340,10 @@ fn what_the_runtime_refuses_of_rgbx_textures_dies() {
     const PASS: &str = "renderCommandEncoderWithDescriptor:";
     const MIPMAPS: &str = "generateMipmapsForTexture:";
     const DISPATCH: &str = "dispatchThreads:threadsPerThreadgroup:";
-    let theirs = metal();
-    let theirs = theirs.as_ref().map(|(mp, md)| Gpu::new(mp, md));
     let (vp, vd) = (platform(), dev());
     let ours = Gpu::new(&vp, &vd);
     let mut differ = Vec::new();
     for (format, name, texel, class, _) in FORMATS {
-        if let Some(g) = &theirs {
-            if RENDERED.contains(&format) {
-                g.pass(format, RENDER);
-                g.mipmaps(format);
-            }
-            g.texture_buffer(format, texel, class);
-            g.held_write(format, texel, class);
-        }
         let cases: [(&str, &str, &str, &dyn Fn()); 5] = [
             ("a pass", PASS, "Format", &|| ours.pass(format, RENDER)),
             ("a pass without RenderTarget usage", PASS, "Format", &|| {
@@ -2464,11 +2392,8 @@ fn what_the_runtime_refuses_of_rgbx_textures_dies() {
     ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn half_nan_writes_are_metals() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     // Each format, its texel's bytes, and the seed of the writes test's values.
     let cases = [(315, 8, 8), (325, 16, 11), (115, 8, 8), (125, 16, 11)];
     let mut differ = Vec::new();
@@ -2476,8 +2401,9 @@ fn half_nan_writes_are_metals() {
         for options in [SHARED, PRIVATE] {
             let of = format!("{format} options {options:#x}");
             let bytes = Rng(0xbb67_ae85_84ca_a73b ^ seed).bytes(TEXELS * texel);
-            let metals = theirs.half_writes((format, texel), options, &bytes, seed);
-            match survived(|| ours.half_writes((format, texel), options, &bytes, seed)) {
+            let mine = survived(|| ours.half_writes((format, texel), options, &bytes, seed));
+            let metals = metals_of(&of, &mine);
+            match mine {
                 Ok(mine) if mine == metals => {}
                 Ok(_) => differ.push(format!("{of}: the texels differ")),
                 Err((site, line)) => differ.push(format!("{of}: died at {site:?}: {line}")),
@@ -2500,15 +2426,11 @@ fn a_texture_of_usage_0x8_alone_is_metals() {
     const DROPPED: u64 = 0x8;
     /// `MTLPixelFormatBGRA8Unorm`, and its sRGB twin.
     const BGRA: (u64, u64) = (80, 81);
-    let Some((mp, md)) = metal() else {
-        return;
-    };
     let (vp, vd) = (platform(), dev());
-    let (theirs, ours) = (Gpu::new(&mp, &md), Gpu::new(&vp, &vd));
+    let ours = Gpu::new(&vp, &vd);
     let (mut differ, mut nans) = (Vec::new(), 0);
     for options in [SHARED, PRIVATE] {
         let bytes = Rng(0x0008_d409 ^ options).bytes(TEXELS * 4);
-        let metals = theirs.texture(BGRA.0, DROPPED, options, &bytes);
         let mine = ours.texture(BGRA.0, DROPPED, options, &bytes);
         let of = format!("options {options:#x}");
         let view = |t: &dyn Fn() -> u64| t();
@@ -2520,28 +2442,14 @@ fn a_texture_of_usage_0x8_alone_is_metals() {
             (0, 0),
             "{of}"
         );
-        assert_eq!(
-            (
-                metals.usage(),
-                view(&|| metals.new_texture_view(BGRA.1).unwrap().unwrap().usage())
-            ),
-            (0, 0),
-            "{of}: Metal's"
-        );
-        let (m, o) = (
-            theirs.direct_reads(Class::Float, &metals),
-            ours.direct_reads(Class::Float, &mine),
-        );
-        compare(&mut differ, &mut nans, &of, &m, &o);
+        let o = ours.direct_reads(Class::Float, &mine);
+        compare(&mut differ, &mut nans, &of, &o);
     }
     assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
     assert_eq!(nans, 0);
     let colour = [0.25, 0.5, 0.75, 1.0];
-    assert_eq!(
-        ours.read(&ours.cleared(BGRA.0, DROPPED, colour), 4),
-        theirs.read(&theirs.cleared(BGRA.0, DROPPED, colour), 4),
-        "a pass's clear"
-    );
+    let cleared = ours.read(&ours.cleared(BGRA.0, DROPPED, colour), 4);
+    reims_vgpu_core::metal_check_bytes!("a pass's clear", &cleared);
     let sized = TextureDesc {
         pixel_format: BGRA.0,
         width: 64,
@@ -2553,10 +2461,8 @@ fn a_texture_of_usage_0x8_alone_is_metals() {
     let size = vd
         .heap_texture_size_and_align(&vp.texture_descriptor(&sized))
         .unwrap();
-    let metals = md
-        .heap_texture_size_and_align(&mp.texture_descriptor(&sized))
-        .unwrap();
-    assert_eq!((size, size.size), (metals, 16512));
+    reims_vgpu_core::metal_check!("the heap's size query", size);
+    assert_eq!(size.size, 16512);
     let t = ours.texture_of(BGRA.0, DROPPED, PRIVATE, 1);
     let one = NsRange::new(0, 1);
     let swapped = Swizzle {

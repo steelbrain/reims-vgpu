@@ -1,5 +1,5 @@
-//! Measured: a no-copy buffer keeps the pages its range held when it was made, on Metal
-//! (`MetalPlatform`) and on this crate's runtime alike, which imports them then, as Metal wires
+//! Measured: a no-copy buffer keeps the pages its range held when it was made, on Metal and on
+//! this crate's runtime alike, which imports them then, as Metal wires
 //! them. A `mach_vm_remap` of other pages over the range (`HostVm::remap_shared_overwrite`) after
 //! that is not seen by the GPU, whether the range was ever touched, and whether or not the GPU
 //! used the buffer before the remap: a GPU read answers the old pages' bytes, and a GPU fill
@@ -14,7 +14,7 @@
 //! whichever thread releases the buffer.
 
 #![cfg(target_os = "macos")]
-// Compares with Metal, which is macOS's.
+// Compares with Metal's answers, recorded on macOS.
 // The proof that a command buffer's result is well-formed walks the runtime's types for `Send` and
 // `Sync`, deeper than rustc's default limit of 128, as in the library (`src/lib.rs`).
 #![recursion_limit = "256"]
@@ -39,9 +39,8 @@ use reims_vgpu_core::platform::resource::Buffer;
 use reims_vgpu_core::platform::types::NsRange;
 use reims_vgpu_core::platform::{HostRange, Platform};
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_metal::MetalPlatform;
-use reims_vgpu_metal::os::vm::MetalVm;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::os::OsVm;
 
 const LEN: u64 = 0x8000;
 
@@ -106,7 +105,7 @@ fn remapped<P: Platform>(
     va: HostPtr,
     before: impl Fn(&P::Buffer),
 ) -> [[u8; 2]; 3] {
-    let vm = MetalVm::new();
+    let vm = OsVm::new();
     let (released, gone) = mpsc::channel();
     let deallocator: NoCopyDeallocator = Box::new(move || {
         let _ = released.send(());
@@ -148,7 +147,7 @@ fn remapped<P: Platform>(
 /// over touched pages (`0xa1`), both after the buffer was made and before its first GPU use,
 /// and one after that use (`0xc3`).
 fn every_order<P: Platform>(dev: &P::Device) -> [[[u8; 2]; 3]; 3] {
-    let vm = MetalVm::new();
+    let vm = OsVm::new();
     [
         remapped::<P>(dev, vm.allocate_anywhere(LEN).unwrap(), |_| ()),
         remapped::<P>(dev, region(&vm, 0xa1), |_| ()),
@@ -175,12 +174,6 @@ fn kept() -> [[[u8; 2]; 3]; 3] {
 fn the_vulkan_runtime_keeps_a_no_copy_buffers_pages_from_its_creation() {
     let dev = VulkanPlatform::system_default_device().unwrap();
     assert_eq!(every_order::<VulkanPlatform>(&dev), kept());
-}
-
-#[test]
-fn metal_keeps_a_no_copy_buffers_pages_from_its_creation() {
-    let dev = MetalPlatform::system_default_device().unwrap();
-    assert_eq!(every_order::<MetalPlatform>(&dev), kept());
 }
 
 /// A no-copy buffer over `va..va + LEN` whose deallocator says so on the answer's receiver.
@@ -230,7 +223,7 @@ fn made_after<P: Platform>(
     let seen = [gpu_read_then_fill::<P>(dev, &b, 0x7c), ends(va), ends(new)];
     drop((b, a));
     released(&[b_gone, a_gone]);
-    assert!(MetalVm::new().deallocate(new, LEN).is_success());
+    assert!(OsVm::new().deallocate(new, LEN).is_success());
     seen
 }
 
@@ -247,13 +240,6 @@ fn made_after_a_remap<P: Platform>(dev: &P::Device, vm: &dyn HostVm) -> [[u8; 2]
 }
 
 #[test]
-fn metal_takes_the_pages_there_at_each_buffer_it_makes() {
-    let dev = MetalPlatform::system_default_device().unwrap();
-    let p = MetalPlatform::new();
-    assert_eq!(made_after_a_remap::<MetalPlatform>(&dev, p.vm()), SEEN);
-}
-
-#[test]
 fn a_buffer_made_after_a_remap_the_runtime_was_told_of_takes_the_new_pages() {
     let dev = VulkanPlatform::system_default_device().unwrap();
     let p = VulkanPlatform::new();
@@ -261,7 +247,7 @@ fn a_buffer_made_after_a_remap_the_runtime_was_told_of_takes_the_new_pages() {
     // Untold, as through Mach VM of the test's own, the buffer lies in the live one's import: the
     // GPU reads what A wrote, and fills the old pages.
     assert_eq!(
-        made_after_a_remap::<VulkanPlatform>(&dev, &MetalVm::new()),
+        made_after_a_remap::<VulkanPlatform>(&dev, &OsVm::new()),
         not_seen(0xc3)
     );
 }

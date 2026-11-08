@@ -1,0 +1,99 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+RGBA8Unorm Shared	bytes 1024 36f36fed69410b09f3e352e89461f58d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm Private ShaderWrite	bytes 1024 36f36fed69410b09f3e352e89461f58d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA16Float Private ShaderWrite	bytes 2048 945b773b8519a40797dff259b32e258d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm 4 samples	bytes 16384 ff656b0d5074e46e72fe50af9758c58d 0000000000000000000000000000000000000000000000000000000000000000
+RGB10A8_2P_XR10 Private	xz 4096 0
+compressed	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+R8Unorm: levels	1
+R8Unorm slice 0 level 0 (16 by 16)	bytes 256 cb5ff6188082ed55a44774cf19b64e8d ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+RG8Unorm: levels	1
+RG8Unorm slice 0 level 0 (16 by 16)	bytes 512 5bca35579e835fb797e6f9cbf998f98d ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00
+R16Float: levels	1
+R16Float slice 0 level 0 (16 by 16)	bytes 512 d1ce1dd010429cc72779f545c6f2d78d ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+R32Float: levels	1
+R32Float slice 0 level 0 (16 by 16)	bytes 1024 315aca26bf5b5e49b60c9ea443bfe98d ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+RG16Float: levels	1
+RG16Float slice 0 level 0 (16 by 16)	bytes 1024 c1008893be5fb674ba0e6b8ea231378d ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000ffff0000
+RGBA8Unorm: levels	1
+RGBA8Unorm slice 0 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm_sRGB: levels	1
+RGBA8Unorm_sRGB slice 0 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Snorm: levels	1
+RGBA8Snorm slice 0 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Uint: levels	1
+RGBA8Uint slice 0 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+BGRA8Unorm: levels	1
+BGRA8Unorm slice 0 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+BGRA8Unorm_sRGB: levels	1
+BGRA8Unorm_sRGB slice 0 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGB10A2Unorm: levels	1
+RGB10A2Unorm slice 0 level 0 (16 by 16)	bytes 1024 6c0d5c284c840550036aa416245d598d ff03f0ffff03f0ffff03f0ffff03f0ffff03f0ffff03f0ffff03f0ffff03f0ff
+BGR10A2Unorm: levels	1
+BGR10A2Unorm slice 0 level 0 (16 by 16)	bytes 1024 6c0d5c284c840550036aa416245d598d ff03f0ffff03f0ffff03f0ffff03f0ffff03f0ffff03f0ffff03f0ffff03f0ff
+RG11B10Float: levels	1
+RG11B10Float slice 0 level 0 (16 by 16)	bytes 1024 51fe7e51dd577abebe2457e81e6be58d e00700fce00700fce00700fce00700fce00700fce00700fce00700fce00700fc
+RGB9E5Float: levels	1
+RGB9E5Float slice 0 level 0 (16 by 16)	bytes 1024 25190b0d7f3bf86c4a784bbf8af35f8d ff01fcffff01fcffff01fcffff01fcffff01fcffff01fcffff01fcffff01fcff
+RGBA16Unorm: levels	1
+RGBA16Unorm slice 0 level 0 (16 by 16)	bytes 2048 b41abe3ac0115316dfbb0565acc66b8d ffff0000ffffffffffff0000ffffffffffff0000ffffffffffff0000ffffffff
+RGBA16Float: levels	1
+RGBA16Float slice 0 level 0 (16 by 16)	bytes 2048 b41abe3ac0115316dfbb0565acc66b8d ffff0000ffffffffffff0000ffffffffffff0000ffffffffffff0000ffffffff
+RGBA32Float: levels	1
+RGBA32Float slice 0 level 0 (16 by 16)	bytes 4096 50004ab335f74bfc219d72c4ccb9418d ffffffff00000000ffffffffffffffffffffffff00000000ffffffffffffffff
+BGRA10_XR: levels	1
+BGRA10_XR slice 0 level 0 (16 by 16)	bytes 2048 7ae80fd509b04d10a14211681122758d c0ff0000c0ff80dfc0ff0000c0ff80dfc0ff0000c0ff80dfc0ff0000c0ff80df
+BGR10_XR: levels	1
+BGR10_XR slice 0 level 0 (16 by 16)	bytes 1024 6c0d5c284c840550036aa416245d598d ff03f0ffff03f0ffff03f0ffff03f0ffff03f0ffff03f0ffff03f0ffff03f0ff
+RGBA8Unorm RenderTarget: levels	1
+RGBA8Unorm RenderTarget slice 0 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 64 by 64 chain: levels	7
+RGBA8Unorm 64 by 64 chain slice 0 level 0 (64 by 64)	bytes 16384 d7e0b3d1c3f5ef3c564a9e91624d458d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 64 by 64 chain slice 0 level 1 (32 by 32)	bytes 4096 2c5d5547ec57e430990fd51c5683a58d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 64 by 64 chain slice 0 level 2 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 64 by 64 chain slice 0 level 3 (8 by 8)	bytes 256 94e32b1846373b4275b3d97900d0d18d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm 64 by 64 chain slice 0 level 4 (4 by 4)	bytes 64 006a3449d7e31b9ad8a10cfa7dc1088d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm 64 by 64 chain slice 0 level 5 (2 by 2)	bytes 16 f1f90b7bf705b5ef1517163834145e4d 00000000000000000000000000000000
+RGBA8Unorm 64 by 64 chain slice 0 level 6 (1 by 1)	bytes 4 66ad387c16757277b806e89d2e80f03d 00000000
+RGBA8Unorm 100 by 40 chain: levels	7
+RGBA8Unorm 100 by 40 chain slice 0 level 0 (100 by 40)	bytes 16000 c0e13d170b178ec507718d1122d7f88d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 100 by 40 chain slice 0 level 1 (50 by 20)	bytes 4000 341908ca663e148a32afa7992aa7b14d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 100 by 40 chain slice 0 level 2 (25 by 10)	bytes 1000 b4e1dd95d1a1a945fd5893fbc46a166d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm 100 by 40 chain slice 0 level 3 (12 by 5)	bytes 240 ed2759d87594490002eef46d886408cd 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm 100 by 40 chain slice 0 level 4 (6 by 2)	bytes 48 6fdd964bc6f0c7cdce1ebf786e1dffcd 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm 100 by 40 chain slice 0 level 5 (3 by 1)	bytes 12 15915375576d2f389a938dc3a9940c9d 000000000000000000000000
+RGBA8Unorm 100 by 40 chain slice 0 level 6 (1 by 1)	bytes 4 66ad387c16757277b806e89d2e80f03d 00000000
+RGBA8Unorm 17 by 17 chain: levels	5
+RGBA8Unorm 17 by 17 chain slice 0 level 0 (17 by 17)	bytes 1156 1e60d9e03edf2e1f7c99e6226f4c7eb0 ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 17 by 17 chain slice 0 level 1 (8 by 8)	bytes 256 94e32b1846373b4275b3d97900d0d18d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm 17 by 17 chain slice 0 level 2 (4 by 4)	bytes 64 006a3449d7e31b9ad8a10cfa7dc1088d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm 17 by 17 chain slice 0 level 3 (2 by 2)	bytes 16 f1f90b7bf705b5ef1517163834145e4d 00000000000000000000000000000000
+RGBA8Unorm 17 by 17 chain slice 0 level 4 (1 by 1)	bytes 4 66ad387c16757277b806e89d2e80f03d 00000000
+RGBA16Float 64 by 64 chain: levels	7
+RGBA16Float 64 by 64 chain slice 0 level 0 (64 by 64)	bytes 32768 e17b86c72bf038783b82d14eeba0258d ffff0000ffffffffffff0000ffffffffffff0000ffffffffffff0000ffffffff
+RGBA16Float 64 by 64 chain slice 0 level 1 (32 by 32)	bytes 8192 65d0b3a52876bf816f528d6796d85d8d ffff0000ffffffffffff0000ffffffffffff0000ffffffffffff0000ffffffff
+RGBA16Float 64 by 64 chain slice 0 level 2 (16 by 16)	bytes 2048 b41abe3ac0115316dfbb0565acc66b8d ffff0000ffffffffffff0000ffffffffffff0000ffffffffffff0000ffffffff
+RGBA16Float 64 by 64 chain slice 0 level 3 (8 by 8)	bytes 512 62dcdb5e626c217db294c4d23ddbdd8d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA16Float 64 by 64 chain slice 0 level 4 (4 by 4)	bytes 128 fdde1cef0fd7612ea2e63f4c09d94b8d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA16Float 64 by 64 chain slice 0 level 5 (2 by 2)	bytes 32 28ee198ca550ba36979ea053be3dc70d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA16Float 64 by 64 chain slice 0 level 6 (1 by 1)	bytes 8 9d30c1f78465995be47dda5e4e4e77ed 0000000000000000
+RGBA8Unorm cube: levels	6
+RGBA8Unorm cube slice 0 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm cube slice 1 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm cube slice 2 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm cube slice 3 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm cube slice 4 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm cube slice 5 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 2D array: levels	2
+RGBA8Unorm 2D array slice 0 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 2D array slice 1 level 0 (16 by 16)	bytes 1024 f174d68bc6cc0a9d873d95291ed13d8d ff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffffff00ffff
+RGBA8Unorm 1D: levels	1
+RGBA8Unorm 1D slice 0 level 0 (64 by 1)	bytes 256 94e32b1846373b4275b3d97900d0d18d 0000000000000000000000000000000000000000000000000000000000000000
+RGBA8Unorm 4 samples, compressed	bytes 16384 b1d202515032f08cfc07a2451c6b458d 0000803f000000000000803f0000803f0000803f000000000000803f0000803f
+R16Float 4 samples, compressed	bytes 16384 1f21e561fb33306b1160ae8cde0e858d 0000c07f00000000000000000000803f0000c07f00000000000000000000803f
+RG16Float 4 samples, compressed	bytes 16384 1f21e561fb33306b1160ae8cde0e858d 0000c07f00000000000000000000803f0000c07f00000000000000000000803f
+RGBA16Float 4 samples, compressed	bytes 16384 cd3ba018dca725fb9bdf06748f2b458d 0000c07f000000000000c07f0000c07f0000c07f000000000000c07f0000c07f
+R32Float 4 samples, compressed	bytes 16384 cb2e4372308e09bbbb0d00c40f06458d ffffffff00000000000000000000803fffffffff00000000000000000000803f
+RG11B10Float 4 samples, compressed	bytes 16384 d52695058cce57253c4741bb13eb458d 0000c07f000000000000c07f0000803f0000c07f000000000000c07f0000803f
+memoryless DontCare fetched, tiles written first false	bytes 16384 ff656b0d5074e46e72fe50af9758c58d 0000000000000000000000000000000000000000000000000000000000000000
+memoryless DontCare fetched, tiles written first true	bytes 16384 ff656b0d5074e46e72fe50af9758c58d 0000000000000000000000000000000000000000000000000000000000000000

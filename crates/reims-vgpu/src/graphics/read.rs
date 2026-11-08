@@ -92,7 +92,7 @@ impl<P: ApiPlatform> DisplayRead<P> {
 
     /// Reads of the display `self` reads, at `screen`'s mode: the Vulkan platform's tests' read at
     /// the size of a window, which a device without one does not have.
-    #[cfg(all(test, vulkan_platform))]
+    #[cfg(test)]
     pub(crate) fn at_screen(&self, screen: Arc<dyn Screen>) -> DisplayRead<P> {
         DisplayRead::new(
             &self.platform,

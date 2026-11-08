@@ -145,16 +145,15 @@ fn the_device_reserves_the_guest_s_texture_ids_first() {
     assert_eq!(checks, RESERVATION_CHECKS);
 }
 
-/// On Metal, a texture the guest places at one of its ids and the plain textures the host makes
-/// never share an id, and one placed at the guest's last id, past the table a fresh device has,
-/// is made and lives (Metal's heap is not corrupted). Each test runs in a process of its own, so
-/// the device's ids start fresh
-#[cfg(target_os = "macos")]
+/// On the Vulkan platform, a texture the guest places at one of its ids and the plain textures the
+/// host makes never share an id, and one placed at the guest's last id, past the table a fresh
+/// device has, is made and lives. Each test runs in a process of its own, so the device's ids
+/// start fresh
 #[test]
-fn on_metal_guest_texture_ids_are_kept_from_the_host_s() {
+fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
     use reims_vgpu_core::platform::resource::Texture as _;
     use reims_vgpu_core::platform::values::TextureDesc;
-    let platform = reims_vgpu_metal::MetalPlatform::process();
+    let platform = crate::singleton::platform();
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
@@ -9346,14 +9345,13 @@ fn color_matrix(rows: [[f32; 4]; 3]) -> Vec<u8> {
     bytes
 }
 
-/// On Metal, a display colour of the identity matrix reads as no colour: the scanout's bytes as
-/// the guest wrote them, its alpha included (a colour pass would make it opaque), with each of
-/// blue, green and red taking all 256 values; a matrix off the identity still draws through the
-/// colour, which swaps red and blue here and makes every pixel opaque
-#[cfg(target_os = "macos")]
+/// On the Vulkan platform, a display colour of the identity matrix reads as no colour: the
+/// scanout's bytes as the guest wrote them, its alpha included (a colour pass would make it
+/// opaque), with each of blue, green and red taking all 256 values; a matrix off the identity
+/// still draws through the colour, which swaps red and blue here and makes every pixel opaque
 #[test]
-fn on_metal_an_identity_colour_matrix_reads_as_no_colour() {
-    let platform = reims_vgpu_metal::MetalPlatform::process();
+fn on_vulkan_an_identity_colour_matrix_reads_as_no_colour() {
+    let platform = crate::singleton::platform();
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
@@ -9543,12 +9541,11 @@ fn a_read_of_the_display_draws_what_it_shows() {
     assert!(quiet(&guest), "a read told the guest something");
 }
 
-/// On Metal, the read gives the guest's pixels: a scanout smaller than the mode shows at its top
-/// left, B, G, R and A as the guest wrote them, and the rest of the mode is black
-#[cfg(target_os = "macos")]
+/// On the Vulkan platform, the read gives the guest's pixels: a scanout smaller than the mode
+/// shows at its top left, B, G, R and A as the guest wrote them, and the rest of the mode is black
 #[test]
-fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
-    let platform = reims_vgpu_metal::MetalPlatform::process();
+fn on_vulkan_a_read_of_the_display_gives_the_scanout_s_pixels() {
+    let platform = crate::singleton::platform();
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
@@ -9590,7 +9587,6 @@ fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
 }
 
 /// The pixel the odd-width reads put at `(x, y)`, B, G, R and A: no two alike within 7 rows
-#[cfg(vulkan_platform)]
 fn odd_width_pixel(x: usize, y: usize) -> [u8; 4] {
     let v = x * 7 + y * 131;
     [v as u8, (v >> 8) as u8, (x ^ y) as u8, 0xff]
@@ -9598,7 +9594,6 @@ fn odd_width_pixel(x: usize, y: usize) -> [u8; 4] {
 
 /// How a read of `width` × `height` pixels, rows of `width * 4` bytes, differs from `want`: the
 /// count and the first, or `None` where every pixel is `want`'s
-#[cfg(vulkan_platform)]
 fn read_differs(
     dst: &[u8],
     (width, height): (usize, usize),
@@ -9623,10 +9618,9 @@ fn read_differs(
 /// width's bytes or padded to 64 or 256 bytes: through no colour (the blit), a matrix that swaps
 /// red and blue (the colour's fragment), and a post-gamma ramp that inverts every channel (the
 /// table's fragment)
-#[cfg(vulkan_platform)]
 #[test]
 fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
-    let platform = crate::singleton::vulkan_platform();
+    let platform = crate::singleton::platform();
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks::default(),
         window: None,
@@ -9725,11 +9719,10 @@ fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
 /// padded to 64 bytes as a guest's IOSurface rows are, reads row for row at a mode of its size,
 /// rendered to (shadowed) and read only (in place): copied as the guest wrote it with no colour,
 /// and drawn through a matrix that swaps red and blue
-#[cfg(vulkan_platform)]
 #[test]
 fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
     const RING_DATA: u32 = 0x1_0000;
-    let platform = crate::singleton::vulkan_platform();
+    let platform = crate::singleton::platform();
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks::default(),
         window: None,

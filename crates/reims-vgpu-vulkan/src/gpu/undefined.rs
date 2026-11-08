@@ -3,7 +3,7 @@
 //! not reach ([`dont_care_load`], [`unreached_tiles`]), the bits an extended-range format's codes
 //! leave unused ([`extended_range`]), and the bytes of a texture placed in a heap
 //! ([`heap_layout`]). Each module's docs state Metal's rule over every shape it probes, whether
-//! Metal's answer is one value (each probe runs [`RUNS`] times, each run on resources of its
+//! Metal's answer is one value (each probe ran 5 times on Metal, each run on resources of its
 //! own), what this platform answers today, and what it would take to answer as Metal.
 //!
 //! **Measured on one GPU.** Every answer here is an Apple M3 Max's (40-core GPU) under macOS 26.7
@@ -23,13 +23,8 @@ use reims_vgpu_core::platform::values::{
     StencilAttachmentSet, StencilDesc, TextureDesc,
 };
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_metal::MetalPlatform;
 
 use crate::gpu::device::tests::colours_of;
-
-/// How many times each probe runs on Metal, each run on resources of its own: every answer
-/// recorded here was the same in each.
-pub(super) const RUNS: usize = 5;
 
 /// `rounding.metal`'s library: `reach_vertex` places buffer 0's float4s, one a vertex, and
 /// `xr_constant_fragment` writes (0.5, 0.25, 0.75, 1) as a `half4` to colour 0.
@@ -58,11 +53,6 @@ pub(super) const RGBA16F: u64 = 115;
 pub(super) const RGBA32F: u64 = 125;
 pub(super) const DEPTH32F: u64 = 252;
 pub(super) const STENCIL8: u64 = 253;
-
-/// Metal's platform and device, where the host has Metal.
-pub(super) fn metal() -> Option<(MetalPlatform, <MetalPlatform as Platform>::Device)> {
-    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(), d))
-}
 
 /// The bytes a texel of `format` takes.
 pub(super) fn texel_bytes(format: u64) -> usize {
@@ -501,100 +491,6 @@ pub(super) fn positions(pixels: &[(f32, f32)], (w, h): (u64, u64)) -> Vec<u8> {
 /// The triangle whose pixels lie inside tile (1, 1) of a 32 by 32 grid: corners (36, 36),
 /// (56, 36) and (36, 56), 190 pixel centres.
 pub(super) const IN_TILE_1_1: [(f32, f32); 3] = [(36.0, 36.0), (56.0, 36.0), (36.0, 56.0)];
-
-/// Triangles, each its three corners in pixels.
-pub(super) type Triangles<'a> = &'a [&'a [(f32, f32)]];
-
-/// Whether the pixel at `(x, y)` lies within 1.5 pixels of the triangle `t` (pixel corners):
-/// a pixel a draw of it may have written.
-pub(super) fn near(t: &[(f32, f32)], (x, y): (usize, usize)) -> bool {
-    #[expect(
-        clippy::as_conversions,
-        reason = "a pixel's coordinates, at most 16384, as f32"
-    )]
-    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-    let area = (t[1].0 - t[0].0) * (t[2].1 - t[0].1) - (t[1].1 - t[0].1) * (t[2].0 - t[0].0);
-    (0..3).all(|i| {
-        let (a, b) = (t[i], t[(i + 1) % 3]);
-        let (ex, ey) = (b.0 - a.0, b.1 - a.1);
-        let cross = ex * (py - a.1) - ey * (px - a.0);
-        cross * area.signum() / ex.hypot(ey) >= -1.5
-    })
-}
-
-/// Each tile of a `tile`-sized grid over a texture of `size` and `texel` bytes, as a letter, rows
-/// separated by `/`: `K` where every texel of `after` is `before`'s, `F` where none is but those
-/// `fill` also is (each other texel `fill` or what a draw wrote), and `?` elsewhere. A texel near
-/// one of the `drawn` triangles ([`near`]) whose draw may have written `before`'s value again
-/// counts as written.
-pub(super) fn tiles(
-    (before, after): (&[u8], &[u8]),
-    (fill, drawn): (&[u8], Triangles<'_>),
-    (size, tile): ((u64, u64), (u64, u64)),
-) -> String {
-    let texel = fill.len();
-    let (w, h) = (
-        usize::try_from(size.0).unwrap(),
-        usize::try_from(size.1).unwrap(),
-    );
-    let (tw, th) = (
-        usize::try_from(tile.0).unwrap(),
-        usize::try_from(tile.1).unwrap(),
-    );
-    let mut grid = Vec::new();
-    for ty in 0..h.div_ceil(th) {
-        let mut row = String::new();
-        for tx in 0..w.div_ceil(tw) {
-            let (mut kept, mut kept_alone, mut total) = (0, 0, 0);
-            for y in ty * th..((ty + 1) * th).min(h) {
-                for x in tx * tw..((tx + 1) * tw).min(w) {
-                    let at = (y * w + x) * texel;
-                    let (b, a) = (&before[at..at + texel], &after[at..at + texel]);
-                    total += 1;
-                    if a == b {
-                        kept += 1;
-                        if a != fill && !drawn.iter().any(|t| near(t, (x, y))) {
-                            kept_alone += 1;
-                        }
-                    }
-                }
-            }
-            row.push(match () {
-                () if kept == total => 'K',
-                () if kept_alone == 0 => 'F',
-                () => '?',
-            });
-        }
-        grid.push(row);
-    }
-    grid.join("/")
-}
-
-/// A grid of `size` in `tile`s, `F` at `filled`, `K` elsewhere, as [`tiles`] writes one.
-pub(super) fn grid(size: (u64, u64), tile: (u64, u64), filled: &[(u64, u64)]) -> String {
-    (0..size.1.div_ceil(tile.1))
-        .map(|y| {
-            (0..size.0.div_ceil(tile.0))
-                .map(|x| if filled.contains(&(x, y)) { 'F' } else { 'K' })
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Answers `probe` on Metal [`RUNS`] times and requires every run's answer to be the first's,
-/// which it returns: Metal's answer is one value.
-pub(super) fn once<T: PartialEq + std::fmt::Debug>(what: &str, mut probe: impl FnMut() -> T) -> T {
-    let first = probe();
-    for run in 1..RUNS {
-        let again = probe();
-        assert!(
-            again == first,
-            "{what}: Metal's run {run} differs from its first"
-        );
-    }
-    first
-}
 
 /// Whether the runtime announced `kind` in this process. It announces a relayed kind once per
 /// device (`crate::platform::device_options`), so a test checks what the process heard.

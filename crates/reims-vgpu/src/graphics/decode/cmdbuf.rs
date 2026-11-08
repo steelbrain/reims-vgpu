@@ -5041,24 +5041,12 @@ mod tests {
         (early, bytes.to_vec())
     }
 
-    /// On Metal, a command buffer behind one of its queue that waits for an event is not
-    /// answered as submitted until that one is scheduled, as Metal's
-    /// `commitAndWaitUntilSubmitted` returns only then (the M3, the 5300M and the 630,
-    /// docs/graphics-kext/dgpu-oracle.md, Q7): Metal orders a tracked resource across queues
-    /// behind work it has submitted, not behind work a queue holds. A buffer committed on another
-    /// queue once the answer comes, which reads a tracked buffer the first one writes, sees its
-    /// writes (Q6).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes() {
-        let (early, bytes) = a_later_commit_on_another_queue::<reims_vgpu_metal::MetalPlatform>();
-        assert!(!early, "answered as submitted while its queue was held");
-        assert!(bytes.iter().all(|&b| b == 0x5a));
-    }
-
-    /// The same on the Vulkan platform
-    /// (`on_metal_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes`).
-    #[cfg(vulkan_platform)]
+    /// A command buffer behind one of its queue that waits for an event is not answered as
+    /// submitted until that one is scheduled, as Metal's `commitAndWaitUntilSubmitted` returns
+    /// only then (the M3, the 5300M and the 630, docs/graphics-kext/dgpu-oracle.md, Q7): Metal
+    /// orders a tracked resource across queues behind work it has submitted, not behind work a
+    /// queue holds. A buffer committed on another queue once the answer comes, which reads a
+    /// tracked buffer the first one writes, sees its writes (Q6).
     #[test]
     fn on_vulkan_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes() {
         let (early, bytes) = a_later_commit_on_another_queue::<reims_vgpu_vulkan::VulkanPlatform>();
@@ -5174,23 +5162,11 @@ mod tests {
         (early, finished, posted == [signalled, completed])
     }
 
-    /// On Metal, a guest thread that waits on the CPU for a signal from the middle of a command
-    /// buffer, before it sets the value the buffer waits for next, gets the signal while the
-    /// buffer runs, as Metal's CPU does (docs/graphics-kext/dgpu-oracle.md, Q18), and the buffer
-    /// then completes: the value goes as the host's event reaches it, once, ahead of the buffer's
+    /// A guest thread that waits on the CPU for a signal from the middle of a command buffer,
+    /// before it sets the value the buffer waits for next, gets the signal while the buffer runs,
+    /// as Metal's CPU does (docs/graphics-kext/dgpu-oracle.md, Q18), and the buffer then
+    /// completes: the value goes as the host's event reaches it, once, ahead of the buffer's
     /// completion.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends() {
-        let (early, finished, once) =
-            a_cpu_wait_for_a_mid_buffer_signal::<reims_vgpu_metal::MetalPlatform>();
-        assert!(early, "the signal came only at the buffer's end, or never");
-        assert!(finished && once);
-    }
-
-    /// The same on the Vulkan platform
-    /// (`on_metal_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends`).
-    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends() {
         let (early, finished, once) =
@@ -5330,29 +5306,11 @@ mod tests {
         bytes.to_vec()
     }
 
-    /// On Metal, a plain commit on another queue that the guest made after a buffer's, and that
-    /// names it in its `COMMIT_ORDER`, reads the tracked buffer it writes, though the host took
-    /// it first: the host commits it only once the buffer it names is committed, here once Metal
-    /// has scheduled that one, and Metal orders a tracked resource across queues behind work it
-    /// has submitted (docs/graphics-kext/dgpu-oracle.md, Q6 and Q7). Committed as soon as the
-    /// named buffer's `commit` returned, it missed that buffer's writes in 1 of 40 runs of
-    /// `graphics::decode`'s tests in one process (measured on the M3 Max; Q6's 0 of 5 ran on an
-    /// idle GPU).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names() {
-        let bytes = a_plain_commit_after_a_named_buffer_of_another_queue::<
-            reims_vgpu_metal::MetalPlatform,
-        >();
-        assert!(
-            bytes.iter().all(|&b| b == 0x5a),
-            "committed before the buffer it names"
-        );
-    }
-
-    /// The same on the Vulkan platform
-    /// (`on_metal_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names`).
-    #[cfg(vulkan_platform)]
+    /// A plain commit on another queue that the guest made after a buffer's, and that names it in
+    /// its `COMMIT_ORDER`, reads the tracked buffer it writes, though the host took it first: the
+    /// host commits it only once the buffer it names is committed, here once the platform has
+    /// scheduled that one, as Metal orders a tracked resource across queues behind work it has
+    /// submitted (docs/graphics-kext/dgpu-oracle.md, Q6 and Q7).
     #[test]
     fn on_vulkan_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names() {
         let bytes = a_plain_commit_after_a_named_buffer_of_another_queue::<
@@ -5506,28 +5464,14 @@ mod tests {
         (posted, waited, completed, bytes.to_vec())
     }
 
-    /// On Metal, a command buffer that waits on the GPU for a buffer of another queue the
-    /// platform holds is answered as submitted and scheduled as its commit returns, as a Mac
-    /// answers a buffer it orders after another queue's access to an IOSurface
-    /// (docs/graphics-kext/dgpu-oracle.md, Q16), and still runs after that buffer: it completes
-    /// after it and copies what it wrote.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_an_order_behind_a_held_buffer_holds_back_no_record() {
-        let (posted, waited, completed, bytes) =
-            an_order_behind_a_held_buffer::<reims_vgpu_metal::MetalPlatform>();
-        assert_eq!(posted, [RGFX_EVT_CB_SUBMITTED, RGFX_EVT_CB_SCHEDULED]);
-        assert!(waited, "B ran before the buffer it names");
-        assert_eq!(completed, [20, 21]);
-        assert!(bytes.iter().all(|&b| b == 0x5a));
-    }
-
-    /// The same on the Vulkan platform, which holds a wait for a shared event's value on the host
-    /// until it is reached (`on_metal_an_order_behind_a_held_buffer_holds_back_no_record`). B
-    /// still runs after A, copying what A wrote; the order in which the runtime reports the two
-    /// queues' completions is its own: on MoltenVK on the M3 Max it reported B's before A's in 20
-    /// runs of 20, with B's records held back to its scheduling as with them posted at its commit.
-    #[cfg(vulkan_platform)]
+    /// A command buffer that waits on the GPU for a buffer of another queue the platform holds is
+    /// answered as submitted and scheduled as its commit returns, as a Mac answers a buffer it
+    /// orders after another queue's access to an IOSurface (docs/graphics-kext/dgpu-oracle.md,
+    /// Q16), though the Vulkan platform holds a wait for a shared event's value on the host until
+    /// it is reached. B still runs after A, copying what A wrote; the order in which the runtime
+    /// reports the two queues' completions is its own: on MoltenVK on the M3 Max it reported B's
+    /// before A's in 20 runs of 20, with B's records held back to its scheduling as with them
+    /// posted at its commit.
     #[test]
     fn on_vulkan_an_order_behind_a_held_buffer_holds_back_no_record() {
         let (posted, waited, mut completed, bytes) =
@@ -5699,23 +5643,10 @@ mod tests {
         [words[0], words[1], words[2], words[3]]
     }
 
-    /// On Metal, the sub-encoders' draws under `Disabled` write nothing, as every Mac's do: the
-    /// count at 16 is the square's 4096 samples, and the words at 0 and 24 keep their bytes. Sent
-    /// at those offsets, `Disabled` makes the M3 Max write 0 at 24 (measured), which
-    /// [`render::visibility_offset`] keeps it from.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_sub_encoders_after_a_count_write_nothing_under_disabled() {
-        let fill = u64::from_ne_bytes([0xee; 8]);
-        assert_eq!(
-            sub_encoders_after_a_count::<reims_vgpu_metal::MetalPlatform>(),
-            [fill, fill, 4096, fill]
-        );
-    }
-
-    /// The same on the Vulkan platform, whose runtime writes nothing under `Disabled` at any
-    /// offset.
-    #[cfg(vulkan_platform)]
+    /// The sub-encoders' draws under `Disabled` write nothing, as every Mac's do: the count at 16
+    /// is the square's 4096 samples, and the words at 0 and 24 keep their bytes. The runtime
+    /// writes nothing under `Disabled` at any offset; the M3 Max writes 0 at 24 for `Disabled` sent
+    /// at those offsets (measured), which [`render::visibility_offset`] keeps it from.
     #[test]
     fn on_vulkan_sub_encoders_after_a_count_write_nothing_under_disabled() {
         let fill = u64::from_ne_bytes([0xee; 8]);
@@ -5727,7 +5658,6 @@ mod tests {
 
     /// A `BUFFER_CREATE` of `length` bytes, id `obj_id`, at `gpu_address` (0: where the host
     /// places it).
-    #[cfg(vulkan_platform)]
     fn buffer_at(obj_id: u64, gpu_address: u64, length: u64) -> RgfxBufferCreate {
         RgfxBufferCreate {
             header: RgfxMsgHeader {
@@ -5748,14 +5678,12 @@ mod tests {
     /// refused in 4 of 20 one-process runs of `graphics::decode` (measured on the M3 Max), where
     /// `on_vulkan_the_host_s_own_ranges_lie_below_every_unit`'s pin at the range's base, 96 KiB,
     /// covers its address.
-    #[cfg(vulkan_platform)]
     static CONTEXT_RANGE_PINS: Mutex<()> = Mutex::new(());
 
     /// A decoder on the Vulkan platform with a queue (1), and, as a process in slot 0 picks
     /// (`RgfxIdSpace`, next fit from the slot's base, a pick of Metal's span of a pin), a
     /// device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes no
     /// pin of: the runtime makes its bytes at an address it picks itself.
-    #[cfg(vulkan_platform)]
     fn decoder_with_a_texture_buffer() -> (
         GraphicsDecoder<reims_vgpu_vulkan::VulkanPlatform>,
         <reims_vgpu_vulkan::VulkanPlatform as Platform>::Device,
@@ -5810,7 +5738,6 @@ mod tests {
     /// A guest's pin meets no range the Vulkan platform's runtime placed for itself: a buffer
     /// pinned at the pick after a texture buffer's is made, though the runtime made the texture
     /// buffer's bytes where it picks.
-    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
         use reims_graphics::wire::RGFX_CONTEXT_VA_BASE;
@@ -5825,7 +5752,6 @@ mod tests {
     /// itself lies below them, and, with it, a queue's and a texture buffer's ranges made, the
     /// first pick of every unit the kext hands the contexts out in and the last unit's last pick
     /// are made.
-    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_the_host_s_own_ranges_lie_below_every_unit() {
         use reims_graphics::wire::{

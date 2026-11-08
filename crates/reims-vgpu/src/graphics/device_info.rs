@@ -2,8 +2,7 @@
 //! platform's [`DeviceCaps`] and [`IdentityCaps`], so the guest bundle's `MTLDevice`
 //! answers `supportsFamily:` of every family, `supportsFeatureSet:` of every
 //! feature set, its identity (the host GPU's real name among it), the limits and
-//! the feature queries as the host device does (Metal on macOS, the Vulkan
-//! platform on Linux). A query the platform cannot answer (a runtime gap, an `Err`
+//! the feature queries as the host device does on the Vulkan platform. A query the platform cannot answer (a runtime gap, an `Err`
 //! or `None` in the caps) is reported as unsupported here, never guessed yes.
 //! Where the lane's own device can do less than the host GPU, its answer is the
 //! lane's ([`lane`]'s table).

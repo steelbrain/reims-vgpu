@@ -23,10 +23,9 @@
 //! - **computed from documented facts** the runtime gives (its device's Vulkan description, the
 //!   compile layer's `MetalDeviceProperties`), for the other private properties: [`computed`];
 //! - **a stand-in** where no documented fact gives the answer, or where the runtime's answer is
-//!   not Metal's and the guest or the host sees it: the Metal platform's answer on the host the
-//!   stand-ins were read on, an Apple M3 Max (`stand_ins_are_the_metal_platforms_here` checks them
-//!   against the Metal platform on the host it runs on), but for the registry ID, which Metal
-//!   answers at run time on the host the library runs on.
+//!   not Metal's and the guest or the host sees it: Metal's answer on the host the stand-ins were
+//!   read on, an Apple M3 Max, but for the registry ID, which Metal answers at run time on the
+//!   host the library runs on.
 //!
 //! **This table lists every stand-in of the crate**, the `DeviceCaps` answers read here and the
 //! answers other modules give from Metal on the M3 Max, each beside the code that answers it:
@@ -179,7 +178,7 @@ use crate::gpu::resource_options;
 /// runtime draws.
 const PUBLIC_PRIMITIVE_TYPES: u64 = 5;
 
-/// The stand-ins: the Metal platform's answers on an Apple M3 Max, where no documented fact
+/// The stand-ins: Metal's answers on an Apple M3 Max, where no documented fact
 /// gives one (the module's table). The registry ID, which Metal answers at run time, is the
 /// OS's ([`crate::os::default_registry_id`]).
 pub mod stand_in {

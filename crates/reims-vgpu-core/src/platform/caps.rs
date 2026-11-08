@@ -280,8 +280,7 @@ caps_struct! {
 /// capability getters. Only the graphics lane asks it ([`GpuDevice::identity_caps`]), once per
 /// device; core's guest ABI never reads it.
 ///
-/// Each answer is the platform's own: Metal's getter on the Metal platform, the runtime's answer
-/// on the Vulkan platform. `None` is a query the platform has no answer of, which the asker must
+/// Each answer is the platform's own: the runtime's answer on the Vulkan platform. `None` is a query the platform has no answer of, which the asker must
 /// not read as support.
 ///
 /// [`GpuDevice::identity_caps`]: super::device::GpuDevice::identity_caps

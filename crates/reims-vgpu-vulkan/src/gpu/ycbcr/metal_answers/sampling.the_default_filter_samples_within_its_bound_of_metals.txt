@@ -1,0 +1,5 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+500: halves	bytes 78624 33d16934d37d9f01ecebc67835052de7 0000b02cf02d003c0000b02cf02d003c0000b02cf02d003c0000b02cf02d003c
+500: floats	bytes 157248 81d5e30818bb8368d6790838bf2b6f6f 000000000000963d0000be3d0000803f000000000000963d0000be3d0000803f
+520: halves	xz 78624 0
+520: floats	xz 157248 78624

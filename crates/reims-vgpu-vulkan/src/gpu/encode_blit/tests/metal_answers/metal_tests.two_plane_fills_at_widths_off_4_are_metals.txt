@@ -1,0 +1,5 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+case 0, 550 [7, 3, 1]: [Bytes(0, 0, [0, 0, 0], [7, 3, 1], [1, 2, 3, 4, 5, 6, 7, 8])]	bytes 84 9a5fd478f41769cdeff447799241dd85 0102030401020304010203040102030401020304010203040102030401020304
+case 1, 550 [7, 3, 1]: [Bytes(0, 0, [2, 1, 0], [9, 5, 1], [9, 10, 11])]	bytes 84 a2bb11b095a756ede0dfef7ddaa59806 eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee090a0b09eeeeeeee
+case 2, 551 [7, 3, 1]: [Color(0, 0, [3, 1, 0], [20, 3, 1], [1.0, 0.5, 0.25, 1.0], 70)]	bytes 84 6d3892e15d1543af3cfb1c35874c596f eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+case 3, 550 [6, 2, 1]: [Bytes(0, 0, [0, 0, 0], [6, 2, 1], [1, 2, 3, 4, 5, 6, 7, 8])]	bytes 48 80b7071ba4356a6b2f193021bcc727ad 0102030401020304010203040102030401020304010203040102030401020304

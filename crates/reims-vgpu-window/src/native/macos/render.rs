@@ -53,8 +53,8 @@ use objc2_metal::{MTLDevice, MTLPixelFormat};
 use objc2_quartz_core::{CAMetalLayer, CATransaction};
 use reims_vgpu_core::rt::spawn_named;
 use reims_vgpu_core::sync::{Condvar, Mutex};
-use reims_vgpu_metal::msg;
-use reims_vgpu_metal::os::threads::MetalThreads;
+use reims_vgpu_vulkan::os::OsThreads;
+use reims_vgpu_vulkan::os::msg;
 
 use super::main_thread::post_main;
 use super::metal_surface::LayerTarget;
@@ -283,7 +283,7 @@ impl Surface {
 /// Starts `window`'s render thread.
 pub(crate) fn start(window: Arc<Window>) {
     spawn_named(
-        &MetalThreads::new(),
+        &OsThreads::new(),
         "reims-vgpu.window",
         STACK,
         Box::new(()),

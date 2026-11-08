@@ -47,7 +47,7 @@ use objc2_foundation::{
     NSProcessInfo, NSString, ns_string,
 };
 use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_metal::msg;
+use reims_vgpu_vulkan::os::msg;
 
 use super::main_thread::{self, MainOnly, ns_text, responds, shared_app};
 use super::view;

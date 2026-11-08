@@ -110,7 +110,7 @@ mod tests {
             );
             return;
         }
-        reims_vgpu_metal::os::autorelease::install();
+        reims_vgpu_vulkan::os::install_process_services();
         let object = NSObject::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let alone = retain_count(&object);

@@ -1,0 +1,198 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+compute_add.metallib add_one	Some((1024, 32, 0, false))
+compute_inc.metallib inc_k	Some((1024, 32, 0, false))
+compute_sample.metallib sample_k	Some((1024, 32, 0, false))
+compute_stagein.metallib stage_in_k	None
+compute_texwrite.metallib tex_write	Some((1024, 32, 0, false))
+compute_tgmem.metallib tg_reverse	Some((1024, 32, 0, false))
+compute_tgstatic.metallib tg_static	Some((1024, 32, 256, false))
+frag.metallib tri_frag	None
+fresh_res_spin.metallib fresh_res_spin	Some((1024, 32, 0, false))
+kernel.metallib double_gid	Some((1024, 32, 0, false))
+kernel_trunc.metallib the library	None
+mutdec_fwrite.metallib mutdec_fwrite	None
+mutdec_imageblock.metallib mutdec_imageblock	Some((1024, 32, 0, false))
+mutdec_tgread.metallib mutdec_tgread	None
+mutdec_tgwrite_blue.metallib mutdec_tgwrite_blue	Some((1024, 32, 0, false))
+mutdec_tgwrite_green.metallib mutdec_tgwrite_green	Some((1024, 32, 0, false))
+mutdec_tilesample.metallib mutdec_tilesample	None
+mutdec_tiletg.metallib mutdec_tiletg	None
+mutdec_vread.metallib mutdec_vread	None
+mutres2_sample_l1.metallib sample_l1	Some((1024, 32, 0, false))
+mutres4_sample_grad.metallib sample_grad	Some((1024, 32, 0, false))
+rdec_flat_f.metallib rdec_flat_f	None
+rdec_flat_v.metallib rdec_flat_v	None
+rdec_vtex1.metallib rdec_vtex1	None
+rel.metallib rel	Some((1024, 32, 0, false))
+render_color.metallib render_color	None
+render_depth.metallib render_depth	None
+render_fbuf.metallib render_fbuf	None
+render_ftex.metallib render_ftex	None
+render_tess.metallib render_tess	None
+render_tilebuf.metallib render_tilebuf	None
+render_vbuf.metallib render_vbuf	None
+render_vdesc.metallib render_vdesc	None
+render_vtex.metallib render_vtex	None
+tile.metallib tile_k	None
+two.metallib a	Some((1024, 32, 0, false))
+two.metallib b	Some((1024, 32, 0, false))
+vert.metallib tri_vert	None
+shaders displayPipeColorFragment	None
+shaders displayPipeColorScanoutFragment	None
+shaders displayPipeLutFragment	None
+shaders displayPipeLutScanoutFragment	None
+shaders displayPresentFragment	None
+shaders displayPresentFragmentWithGammaTableAndColorMatrix	None
+shaders displayPresentVertex	None
+predication predication_step	Some((1024, 32, 0, false))
+rgbx rgbx_gather	Some((1024, 32, 0, false))
+rgbx rgbx_gather_held	Some((1024, 32, 0, false))
+rgbx rgbx_query_held	Some((1024, 32, 0, false))
+rgbx rgbx_read_buffer_float	Some((1024, 32, 0, false))
+rgbx rgbx_read_buffer_int	Some((1024, 32, 0, false))
+rgbx rgbx_read_buffer_uint	Some((1024, 32, 0, false))
+rgbx rgbx_read_float	Some((1024, 32, 0, false))
+rgbx rgbx_read_half	Some((1024, 32, 0, false))
+rgbx rgbx_read_held_float	Some((1024, 32, 0, false))
+rgbx rgbx_read_held_half	Some((1024, 32, 0, false))
+rgbx rgbx_read_held_int	Some((1024, 32, 0, false))
+rgbx rgbx_read_held_uint	Some((1024, 32, 0, false))
+rgbx rgbx_read_int	Some((1024, 32, 0, false))
+rgbx rgbx_read_samples	Some((1024, 32, 0, false))
+rgbx rgbx_read_uint	Some((1024, 32, 0, false))
+rgbx rgbx_read_write_float	Some((1024, 32, 0, false))
+rgbx rgbx_read_write_half	Some((1024, 32, 0, false))
+rgbx rgbx_read_write_int	Some((1024, 32, 0, false))
+rgbx rgbx_read_write_uint	Some((1024, 32, 0, false))
+rgbx rgbx_sample_float	Some((1024, 32, 0, false))
+rgbx rgbx_sample_half	Some((1024, 32, 0, false))
+rgbx rgbx_sample_held	Some((1024, 32, 0, false))
+rgbx rgbx_sample_int	Some((1024, 32, 0, false))
+rgbx rgbx_sample_uint	Some((1024, 32, 0, false))
+rgbx rgbx_store_float	Some((1024, 32, 0, false))
+rgbx rgbx_store_half	Some((1024, 32, 0, false))
+rgbx rgbx_write_float	Some((1024, 32, 0, false))
+rgbx rgbx_write_half	Some((1024, 32, 0, false))
+rgbx rgbx_write_held_float	Some((1024, 32, 0, false))
+rgbx rgbx_write_held_int	Some((1024, 32, 0, false))
+rgbx rgbx_write_held_uint	Some((1024, 32, 0, false))
+rgbx rgbx_write_int	Some((1024, 32, 0, false))
+rgbx rgbx_write_uint	Some((1024, 32, 0, false))
+spin spin	Some((1024, 32, 0, false))
+icb_encode a_colour	None
+icb_encode a_vertex	None
+icb_encode mark	Some((1024, 32, 0, false))
+icb_encode nothing	Some((1024, 32, 0, false))
+icb_encode reset_commands	Some((1024, 32, 0, false))
+icb_encode set_compute_state	Some((1024, 32, 0, false))
+icb_encode set_render_state	Some((1024, 32, 0, false))
+reach reach	Some((1024, 32, 0, false))
+rounding exchange_words	Some((1024, 32, 0, false))
+rounding fetch_float_fragment	None
+rounding fetch_half_fragment	None
+rounding fetch_seen_fragment	None
+rounding reach_vertex	None
+rounding read_fragment	None
+rounding read_vertex	None
+rounding store_fragment	None
+rounding store_vertex	None
+rounding store_words	Some((1024, 32, 0, false))
+rounding sweep_four_fragment	None
+rounding sweep_fragment	None
+rounding sweep_half_fragment	None
+rounding sweep_kernel	Some((1024, 32, 0, false))
+rounding sweep_vertex	None
+rounding write_args_fragment	None
+rounding write_fragment	None
+rounding xr_constant_fragment	None
+rounding xr_dual_float_fragment	None
+rounding xr_dual_half_fragment	None
+rounding xr_float_fragment	None
+rounding xr_half_fragment	None
+rounding xr_loaded_fragment	None
+rounding xr_read	Some((1024, 32, 0, false))
+rounding_safe exchange_words	Some((1024, 32, 0, false))
+rounding_safe fetch_float_fragment	None
+rounding_safe fetch_half_fragment	None
+rounding_safe fetch_seen_fragment	None
+rounding_safe reach_vertex	None
+rounding_safe read_fragment	None
+rounding_safe read_vertex	None
+rounding_safe store_fragment	None
+rounding_safe store_vertex	None
+rounding_safe store_words	Some((1024, 32, 0, false))
+rounding_safe sweep_four_fragment	None
+rounding_safe sweep_fragment	None
+rounding_safe sweep_half_fragment	None
+rounding_safe sweep_kernel	Some((1024, 32, 0, false))
+rounding_safe sweep_vertex	None
+rounding_safe write_args_fragment	None
+rounding_safe write_fragment	None
+rounding_safe xr_constant_fragment	None
+rounding_safe xr_dual_float_fragment	None
+rounding_safe xr_dual_half_fragment	None
+rounding_safe xr_float_fragment	None
+rounding_safe xr_half_fragment	None
+rounding_safe xr_loaded_fragment	None
+rounding_safe xr_read	Some((1024, 32, 0, false))
+simd_stages fill_fragment	None
+simd_stages fill_vertex	None
+simd_stages plain_vertex	None
+simd_stages simd_kernel	Some((1024, 32, 0, false))
+simd_stages sum_fragment	None
+simd_stages sum_vertex	None
+simd_stages value_fragment	None
+ycbcr_probe copy_texels	Some((1024, 32, 0, false))
+ycbcr_probe copy_words	Some((1024, 32, 0, false))
+ycbcr_probe corner_vertex	None
+ycbcr_probe cover_vertex	None
+ycbcr_probe gradient_fragment	None
+ycbcr_probe nested_arguments_kernel	Some((1024, 32, 0, false))
+ycbcr_probe nested_arguments_vertex	None
+ycbcr_probe probe_fragment	None
+ycbcr_probe probe_fragment_float	None
+ycbcr_probe read_held	Some((1024, 32, 0, false))
+ycbcr_probe read_only_beside_nested_fragment	None
+ycbcr_probe read_only_beside_nested_vertex	None
+ycbcr_probe read_slice_texels_float	Some((1024, 32, 0, false))
+ycbcr_probe read_texels	Some((1024, 32, 0, false))
+ycbcr_probe read_texels_float	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_bicubic	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_border_black_linear	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_border_clear_linear	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_border_clear_linear_fragment	None
+ycbcr_probe sample_constexpr_border_white	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_clamped	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_linear	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_linear_float	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_mirrored_repeat	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_mirrored_repeat_fragment	None
+ycbcr_probe sample_constexpr_mirrored_repeat_linear	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_repeat	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_repeat_bicubic	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_repeat_linear	Some((1024, 32, 0, false))
+ycbcr_probe sample_constexpr_repeat_linear_fragment	None
+ycbcr_probe sample_constexpr_zero	Some((1024, 32, 0, false))
+ycbcr_probe sample_fragment	None
+ycbcr_probe sample_fragment_float	None
+ycbcr_probe sample_held_float	Some((1024, 32, 0, false))
+ycbcr_probe sample_held_fragment	None
+ycbcr_probe sample_held_sampler_float	Some((1024, 32, 0, false))
+ycbcr_probe sample_only_texels	Some((1024, 32, 0, false))
+ycbcr_probe sample_only_texels_float	Some((1024, 32, 0, false))
+ycbcr_probe sample_slice_texels_float	Some((1024, 32, 0, false))
+ycbcr_probe sample_texels	Some((1024, 32, 0, false))
+ycbcr_probe sample_texels_float	Some((1024, 32, 0, false))
+ycbcr_probe sample_two	Some((1024, 32, 0, false))
+ycbcr_probe write_texels	Some((1024, 32, 0, false))
+ycbcr_probe write_texels_fragment	None
+ycbcr_probe zero_words	Some((1024, 32, 0, false))
+slice_write_repro slice_write	Some((1024, 32, 0, false))
+slice_write_repro slice_write_l0	Some((1024, 32, 0, false))
+numbered_samplers numbered_fragment_read	None
+numbered_samplers numbered_read	Some((1024, 32, 0, false))
+numbered_samplers numbered_sample	Some((1024, 32, 0, false))
+numbered_samplers numbered_vertex	None
+numbered_samplers numbered_write	Some((1024, 32, 0, false))
+five_samplers five_samplers	Some((1024, 32, 0, false))

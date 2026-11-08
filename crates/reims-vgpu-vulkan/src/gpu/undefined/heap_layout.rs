@@ -1,7 +1,7 @@
 //! `heap-texture-lossless-layout`: the bytes a single-sample texture placed in a heap leaves in
 //! the heap's memory, as a buffer over the same bytes reads them.
 //!
-//! **Metal's rule** (this host, every probe below the same in each of [`RUNS`] runs, each run a
+//! **Metal's rule** (this host, every probe below the same in each of 5 runs, each run a
 //! new heap over new pages filled with `0xa5` first): a 64 by 64 `RGBA8Unorm` render target placed
 //! at offset 0 of a `Shared` placement heap over host pages, read from the pages:
 //! - **Deterministic.** The same texels written the same way leave the same bytes.
@@ -55,8 +55,8 @@ use reims_vgpu_core::platform::types::ResourceAddressRange;
 use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
 
 use super::{
-    Aspect, CLEAR, Pass, READ, RGBA8, STORE, Shape, Step, TARGET, WRITE, heard, metal, once,
-    random_bytes, replace, run,
+    Aspect, CLEAR, Pass, READ, RGBA8, STORE, Shape, Step, TARGET, WRITE, heard, random_bytes,
+    replace, run,
 };
 use crate::gpu::device::tests::dev;
 use crate::platform::tests::platform;
@@ -148,12 +148,6 @@ fn heap_bytes<P: Platform>((p, d): (&P, &P::Device), shape: Shape, write: Write)
     (held, size)
 }
 
-/// How many of `texels`' 4-byte texels lie at some 4-byte-aligned place of `bytes`.
-fn texels_found(bytes: &[u8], texels: &[u8]) -> usize {
-    let held: std::collections::BTreeSet<&[u8]> = bytes.chunks(4).collect();
-    texels.chunks(4).filter(|t| held.contains(t)).count()
-}
-
 /// The shapes probed: compressed (Metal's default), with `allowGPUOptimizedContents` off, and of
 /// `ShaderWrite` usage, `RGBA8Unorm` 64 by 64; and 16 by 8, too narrow to compress.
 fn shapes() -> [(&'static str, Shape, bool); 4] {
@@ -190,7 +184,6 @@ fn shapes() -> [(&'static str, Shape, bool); 4] {
 /// `heap-texture-lossless-layout`
 #[test]
 fn heap_texture_bytes_are_metals_tiles_or_its_compressed_form() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
     let writes = [
         Write::BlitIndex,
@@ -202,46 +195,14 @@ fn heap_texture_bytes_are_metals_tiles_or_its_compressed_form() {
     let mut differ = Vec::new();
     for (name, shape, compresses) in shapes() {
         for write in writes {
-            let Some((mp, md)) = metal.as_ref() else {
-                return;
-            };
             let case = format!("{name} {write:?}");
-            let (m, size) = once(&case, || heap_bytes((mp, md), shape, write));
-            let length = shape.length();
-            let texels = texels(write, length);
-            let payload = &m[..length];
-            if compresses {
-                assert_eq!(
-                    size,
-                    u64::try_from(length).unwrap() + 128,
-                    "Metal: {case}: size"
-                );
-            } else {
-                assert_eq!(size, u64::try_from(length).unwrap(), "Metal: {case}: size");
-                assert!(
-                    m[length..].iter().all(|&b| b == 0xa5),
-                    "Metal: {case}: bytes past the texels"
-                );
-            }
-            let all = length / 4;
-            match (compresses, write) {
-                (_, Write::Cleared) => {}
-                (true, Write::BlitIndex | Write::BlitColour) => {
-                    let kept = payload.iter().filter(|&&b| b == 0xa5).count();
-                    assert!(kept > length / 2, "Metal: {case}: {kept} bytes kept");
-                    if write == Write::BlitIndex {
-                        let found = texels_found(payload, &texels);
-                        assert!(found < all / 2, "Metal: {case}: {found} texels found");
-                    }
-                }
-                _ => {
-                    let found = texels_found(payload, &texels);
-                    assert_eq!(found, all, "Metal: {case}: texels found");
-                }
-            }
             let (o, ours_size) = heap_bytes((&p, &d), shape, write);
-            assert_eq!(ours_size, size, "{case}: the texture's size in the heap");
-            if o[..usize::try_from(size).unwrap()] != m[..usize::try_from(size).unwrap()] {
+            // The texture's size in the heap, Metal's.
+            reims_vgpu_core::metal_check!(format!("{case}: size"), ours_size);
+            if !reims_vgpu_core::metal_matches_bytes!(
+                &case,
+                &o[..usize::try_from(ours_size).unwrap()]
+            ) {
                 let kind = rt::Degradation::HeapTextureLosslessLayout;
                 assert!(compresses && heard(kind), "{case}: off Metal's");
                 differ.push(case);
@@ -249,26 +210,4 @@ fn heap_texture_bytes_are_metals_tiles_or_its_compressed_form() {
         }
     }
     eprintln!("off Metal's, heap-texture-lossless-layout heard: {differ:#?}");
-}
-
-/// A CPU `replaceRegion` into a compressed texture in a heap leaves the texels in Metal's tiles:
-/// the same bytes a texture of `allowGPUOptimizedContents` off holds after a blit of them, on
-/// this host's Metal in every run
-#[test]
-fn cpu_written_compressed_textures_hold_the_uncompressed_bytes() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
-    let [(_, compressed, _), (_, off, _), ..] = shapes();
-    let length = compressed.length();
-    let (cpu, _) = once("CpuIndex", || {
-        heap_bytes((&mp, &md), compressed, Write::CpuIndex)
-    });
-    let (blit, _) = once("BlitIndex", || {
-        heap_bytes((&mp, &md), off, Write::BlitIndex)
-    });
-    assert!(
-        cpu[..length] == blit[..length],
-        "Metal: the payloads differ"
-    );
 }

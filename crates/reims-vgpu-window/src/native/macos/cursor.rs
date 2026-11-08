@@ -13,7 +13,7 @@ use objc2::rc::Retained;
 use objc2::{AllocAnyThread, MainThreadMarker};
 use objc2_app_kit::{NSBitmapFormat, NSBitmapImageRep, NSCursor, NSDeviceRGBColorSpace, NSImage};
 use objc2_foundation::{NSPoint, NSSize};
-use reims_vgpu_metal::msg;
+use reims_vgpu_vulkan::os::msg;
 
 use crate::geometry;
 use crate::handle::Glyph;

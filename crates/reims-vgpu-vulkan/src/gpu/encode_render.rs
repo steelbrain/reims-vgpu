@@ -239,10 +239,9 @@
 //!   fixed-point ones: a draw and an execution of indirect commands that is not empty relay it
 //!   there, and so does a tile dispatch, each dying in strict mode. A pass over a map made of a
 //!   `Mutable` descriptor, reset or not, that no draw of the guest's took the place of ends with
-//!   a draw of no vertices the guest did not encode, as the Metal platform's does, without which
-//!   the runtime fails the command buffer of one that nothing drew in as a GPU hang, as Metal's
-//!   GPU does ([`crate::gpu::rate_map::no_draw`]). A draw takes its place where the Metal
-//!   platform's does: one of at least one whole triangle of a triangle list or strip (3 vertices
+//!   a draw of no vertices the guest did not encode, without which the runtime fails the command
+//!   buffer of one that nothing drew in as a GPU hang, as Metal's GPU does
+//!   ([`crate::gpu::rate_map::no_draw`]). A draw takes its place: one of at least one whole triangle of a triangle list or strip (3 vertices
 //!   or more), once or more, that the runtime took, which it counts as the pass's draw call
 //!   ([`VulkanRenderEncoder::drew`]).
 //! - **What the runtime has no form for dies**: an index or a count past `u32`, a raw value no
@@ -2877,8 +2876,8 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
                 // A pass over a mutable map that no draw of the guest's took the place of ends
                 // with a draw of no vertices, which keeps the runtime from failing it as a GPU
-                // hang where nothing drew in it, as the Metal platform's draw keeps Metal's GPU
-                // from hanging (`rate_map::no_draw`). It is the pass's last command, so its
+                // hang where nothing drew in it, as Metal's GPU hangs at such a pass
+                // (`rate_map::no_draw`). It is the pass's last command, so its
                 // pipeline is bound for nothing the guest encodes. Its pipeline is made here,
                 // once per device; where the command buffer is gone, nothing encoded here runs,
                 // and the pass needs no draw.
@@ -3989,11 +3988,10 @@ impl VulkanRenderEncoder {
     /// After a guest's draw of `count` vertices of `t`, `instances` times, answered `drawn`: one
     /// of at least one whole triangle of a triangle list or strip (3 vertices or more), once or
     /// more, that the runtime took, takes the place of the platform's draw of no vertices at the
-    /// pass's end ([`crate::gpu::rate_map::no_draw`]), as the Metal platform's does (its
-    /// `gpu::rate_map::drew`). The runtime counts every draw it takes as the pass's draw call
-    /// (`rate_mapped_pass.rs`), so it no longer fails the pass as a GPU hang. Other draws leave
-    /// the platform's in place, as the Metal platform's do: what Metal's GPU takes as the pass's
-    /// draw was measured for this shape alone.
+    /// pass's end ([`crate::gpu::rate_map::no_draw`]). The runtime counts every draw it takes as
+    /// the pass's draw call (`rate_mapped_pass.rs`), so it no longer fails the pass as a GPU hang.
+    /// Other draws leave the platform's in place: what Metal's GPU takes as the pass's draw was
+    /// measured for this shape alone.
     fn drew(
         &self,
         t: rt::DrawPrimitiveType,

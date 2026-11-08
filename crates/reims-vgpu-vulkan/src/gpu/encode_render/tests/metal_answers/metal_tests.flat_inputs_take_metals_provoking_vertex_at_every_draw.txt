@@ -1,0 +1,45 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+Vertices(3, 0, 6, 1) at mode 0	bytes 1032 8235c772220040687ae982e715364aa2 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(3, 0, 6, 1) at mode 1	bytes 1032 5dc27b69c12a1fcbab2e72338e8b3ec2 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(3, 1, 9, 2) at mode 0	bytes 1032 1851e56e5a4c2076d55eb4820f5c7cc8 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(3, 1, 9, 2) at mode 1	bytes 1032 5233b525f29802ce7ed3801ece167785 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(4, 0, 5, 1) at mode 0	bytes 1032 89d374e5a442e71788577cb21179d6da 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(4, 0, 5, 1) at mode 1	bytes 1032 85cfb7daf6b20948ce78cddebbe2ddea 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(4, 3, 8, 2) at mode 0	bytes 1032 d0165a7f0ec7e8e6a9709200a17b37a1 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(4, 3, 8, 2) at mode 1	bytes 1032 bb221c22e7ff62bc5e13a128c2acfe54 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(6, 2, 6, 2) at mode 0	bytes 1032 5f4ed3689353a73a0260c4d099b7d4ca 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(6, 2, 6, 2) at mode 1	bytes 1032 5462caaac88e7d921abf56112a0e134c 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(7, 1, 8, 1) at mode 0	bytes 1032 22f7b33a70f61e0ca3267cffc04bc82c 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(7, 1, 8, 1) at mode 1	bytes 1032 0d31d869491b8e0d6b4d05143b5ae2d1 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(8, 0, 8, 1) at mode 0	bytes 1032 c3a4ea4a5e52b2f4a4e1a7a70c28c24e 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Vertices(8, 0, 8, 1) at mode 1	bytes 1032 a3c1ac6a95122dac39842413520dc107 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 3, index_type: 0, indices: [5, 0, 9, 1, 7, 3, 2, 8, 4], base_vertex: 2, instances: 1 } at mode 0	bytes 1032 334a5a10658d55a94cbcc011c0fa9b44 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 3, index_type: 0, indices: [5, 0, 9, 1, 7, 3, 2, 8, 4], base_vertex: 2, instances: 1 } at mode 1	bytes 1032 4f0ab6127c94510131d6a5f1105277b3 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 3, index_type: 1, indices: [5, 0, 9, 1, 7, 3, 2, 8, 4], base_vertex: 0, instances: 2 } at mode 0	bytes 1032 976dc0be03702ce9b0e40b59577be79e 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 3, index_type: 1, indices: [5, 0, 9, 1, 7, 3, 2, 8, 4], base_vertex: 0, instances: 2 } at mode 1	bytes 1032 ae5dadbf044306c4537c017c48e2011e 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 0, indices: [0, 3, 1, 4, 2, 5, 7, 6], base_vertex: 0, instances: 1 } at mode 0	bytes 1032 f020ec62cbe55390fc60fe947f75cf7a 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 0, indices: [0, 3, 1, 4, 2, 5, 7, 6], base_vertex: 0, instances: 1 } at mode 1	bytes 1032 f36a0ba59a2042b336e7dcc444ada825 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 1, indices: [0, 3, 1, 4, 2, 5, 7, 6], base_vertex: 1, instances: 1 } at mode 0	bytes 1032 af11f08af2c84400e6573feb712ec933 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 1, indices: [0, 3, 1, 4, 2, 5, 7, 6], base_vertex: 1, instances: 1 } at mode 1	bytes 1032 25d6ced53e7ad2af3d99e411778ef22f 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 0, indices: [0, 1, 2, 3, 65535, 4, 5, 6, 7, 8], base_vertex: 0, instances: 1 } at mode 0	bytes 1032 09ccfbeae801fbf4d056fa51dfdb0d10 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 0, indices: [0, 1, 2, 3, 65535, 4, 5, 6, 7, 8], base_vertex: 0, instances: 1 } at mode 1	bytes 1032 db8dcf2691ad34a709e9d9191878be6c 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 1, indices: [0, 1, 2, 3, 4294967295, 4, 5, 6, 7, 8], base_vertex: 0, instances: 2 } at mode 0	bytes 1032 09ccfbeae801fbf4d056fa51dfdb0d10 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 1, indices: [0, 1, 2, 3, 4294967295, 4, 5, 6, 7, 8], base_vertex: 0, instances: 2 } at mode 1	bytes 1032 db8dcf2691ad34a709e9d9191878be6c 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 0, indices: [0, 1, 2, 3, 4, 3, 5, 6, 7, 8, 9], base_vertex: 0, instances: 1 } at mode 0	bytes 1032 0e3bac39c219d1eacec11141cdea6c11 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 0, indices: [0, 1, 2, 3, 4, 3, 5, 6, 7, 8, 9], base_vertex: 0, instances: 1 } at mode 1	bytes 1032 a4d2e491d5bedc1d0539122f345887c9 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 1, indices: [0, 1, 2, 3, 4, 3, 5, 6, 7, 8, 9], base_vertex: 0, instances: 1 } at mode 0	bytes 1032 0e3bac39c219d1eacec11141cdea6c11 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indices { primitive_type: 4, index_type: 1, indices: [0, 1, 2, 3, 4, 3, 5, 6, 7, 8, 9], base_vertex: 0, instances: 1 } at mode 1	bytes 1032 a4d2e491d5bedc1d0539122f345887c9 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indirect(3, [9, 2, 1, 0]) at mode 0	bytes 1032 1851e56e5a4c2076d55eb4820f5c7cc8 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indirect(3, [9, 2, 1, 0]) at mode 1	bytes 1032 5233b525f29802ce7ed3801ece167785 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indirect(4, [8, 1, 3, 0]) at mode 0	bytes 1032 d0165a7f0ec7e8e6a9709200a17b37a1 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Indirect(4, [8, 1, 3, 0]) at mode 1	bytes 1032 bb221c22e7ff62bc5e13a128c2acfe54 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+IndexedIndirect { primitive_type: 4, index_type: 0, indices: [0, 1, 2, 3, 65535, 4, 5, 6, 7, 8], arguments: [10, 1, 0, 0, 0] } at mode 0	bytes 1032 09ccfbeae801fbf4d056fa51dfdb0d10 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+IndexedIndirect { primitive_type: 4, index_type: 0, indices: [0, 1, 2, 3, 65535, 4, 5, 6, 7, 8], arguments: [10, 1, 0, 0, 0] } at mode 1	bytes 1032 db8dcf2691ad34a709e9d9191878be6c 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+IndexedIndirect { primitive_type: 3, index_type: 1, indices: [5, 0, 9, 1, 7, 3, 2, 8, 4], arguments: [9, 1, 0, 2, 0] } at mode 0	bytes 1032 334a5a10658d55a94cbcc011c0fa9b44 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+IndexedIndirect { primitive_type: 3, index_type: 1, indices: [5, 0, 9, 1, 7, 3, 2, 8, 4], arguments: [9, 1, 0, 2, 0] } at mode 1	bytes 1032 4f0ab6127c94510131d6a5f1105277b3 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Executed { inherits: true, primitive_type: 4, count: 7, indices: None } at mode 0	bytes 1032 b513b234c1be5330f480786e78d848d2 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Executed { inherits: true, primitive_type: 4, count: 7, indices: None } at mode 1	bytes 1032 b513b234c1be5330f480786e78d848d2 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Executed { inherits: false, primitive_type: 4, count: 7, indices: None } at mode 0	bytes 1032 b513b234c1be5330f480786e78d848d2 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Executed { inherits: false, primitive_type: 4, count: 7, indices: None } at mode 1	bytes 1032 b513b234c1be5330f480786e78d848d2 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Executed { inherits: false, primitive_type: 3, count: 9, indices: None } at mode 0	bytes 1032 a93a28311ae2bb87f6a5839faca09e96 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff
+Executed { inherits: false, primitive_type: 3, count: 9, indices: None } at mode 1	bytes 1032 a93a28311ae2bb87f6a5839faca09e96 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff

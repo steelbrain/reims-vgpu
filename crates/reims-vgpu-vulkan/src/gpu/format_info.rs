@@ -11,7 +11,7 @@
 //! nor `X24_Stencil8` (262), as no Apple GPU has them. A format's description does not hang on
 //! whether the runtime makes textures of it: a descriptor takes one it lacks, and a texture of it
 //! dies where it is made ([`crate::gpu::desc::lacked`]) or is nil ([`crate::gpu::no_texture`]).
-//! The descriptions are the Metal platform's on this host at every value
+//! The descriptions are Metal's on the M3 Max at every value
 //! (`descriptions_are_the_metal_platforms_here`).
 //!
 //! **A texture level's layout** ([`level_layout`]), which core checks a texture on an IOSurface
@@ -49,7 +49,7 @@ fn info(sel: &'static str, raw: u64) -> rt::PixelFormatInfo {
 
 /// Whether Metal describes `raw` as a format: a format the runtime has that Metal's description
 /// names, which `Depth24Unorm_Stencil8` (255) and `X24_Stencil8` (262) are not, as no Apple GPU
-/// has them. These are the 264 formats the Metal platform describes on this host
+/// has them. These are the 264 formats Metal describes on the M3 Max
 /// (`the_runtime_has_every_format_metal_describes`).
 pub(crate) fn described(sel: &'static str, raw: u64) -> bool {
     crate::gpu::runtime_pixel_format(raw).is_some() && info(sel, raw).describes_a_format()

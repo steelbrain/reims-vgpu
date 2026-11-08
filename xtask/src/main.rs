@@ -36,7 +36,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "dist",
-        about: "the library as a plain library in target/dist: libreims_vgpu.a and .dylib, reims_vgpu.h and reims-vgpu.pc; --profile <p>, --out DIR, --platform vulkan (the proof of concept, in target/dist-vulkan)",
+        about: "the library as a plain library in target/dist-vulkan: libreims_vgpu.a and the shared library, reims_vgpu.h and reims-vgpu.pc; --profile <p>, --out DIR, --platform vulkan (the only platform, kept for the builds that name it)",
         run: dist::cmd_dist,
     },
     Command {
@@ -145,20 +145,16 @@ fn make(args: &[&str]) -> Res<bool> {
     Ok(status.success())
 }
 
-/// The features `check` tests with: every feature of the workspace's crates but the C API's
-/// `vulkan`, which makes every handle of the C API the Vulkan platform's, so that the pins and
-/// the C harness, which drive the product's C API, would run on that platform instead
-/// (architecture 13.1). Clippy lints with every feature as well, the C API's on Vulkan among them.
-const TESTED_FEATURES: &str = "reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan";
-
-/// The features on Linux, where the Vulkan platform is the only one, the C API's included.
-const LINUX_FEATURES: &str =
+/// The features `check` tests with: the testkits, and the `vulkan` features, which change
+/// nothing now that the Vulkan platform is the library's only one, and which the builds that name
+/// them keep. Clippy lints with every feature as well.
+const TESTED_FEATURES: &str =
     "reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan";
 
 /// The Linux the library ships for, which a Mac type-checks.
 const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 
-/// The features a Mac type-checks Linux with: [`LINUX_FEATURES`], and SDL's sources left
+/// The features a Mac type-checks Linux with: [`TESTED_FEATURES`], and SDL's sources left
 /// unbuilt, as a Mac has no Linux C toolchain for them and nothing links.
 const LINUX_CHECK_FEATURES: &str = "reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,\
     reims-vgpu-c/vulkan,reims-vgpu-window/sdl-no-link";
@@ -204,11 +200,7 @@ fn cmd_check(args: &[String]) -> Res<bool> {
     ok &= make(&["-C", "firmware", "prebuilt-check"])?;
     ok &= make(&["-C", "guest", "prebuilt-check"])?;
     if !flag(args, "--no-cargo") {
-        let features = if cfg!(target_os = "linux") {
-            LINUX_FEATURES
-        } else {
-            TESTED_FEATURES
-        };
+        let features = TESTED_FEATURES;
         ok &= cargo(&["fmt", "--all", "--check"])?;
         let clippy = |more: &[&str], env: &[(&str, &std::path::Path)]| {
             let mut args = vec!["clippy", "--workspace", "--all-targets"];

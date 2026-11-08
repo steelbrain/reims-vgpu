@@ -17,12 +17,17 @@ log.workspace = true
 # (`os/wsi.rs`), through ash, on either OS.
 ash.workspace = true
 
-# On macOS the OS services are the metal crate's (threads, clock, Mach VM, the autorelease pool and
-# IOSurface, `os/macos.rs`), with Metal's system default device, whose registryID the runtime's
-# default device answers (os/macos.rs's default_registry_id). The tests that compare answers with
-# the Metal platform's use it too.
+# On macOS the OS services are this crate's own (`os/macos.rs`): threads, clocks, Mach VM, the
+# autorelease pool, IOSurface through Foundation, and the message layer of those sends; with
+# Metal's system default device, whose registryID the runtime's default device answers
+# (os/macos.rs's default_registry_id). objc2's `exception` is on (the workspace's).
 [target.'cfg(target_os = "macos")'.dependencies]
-reims-vgpu-metal.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-io-surface.workspace = true
+objc2-metal.workspace = true
+mach2.workspace = true
+libc.workspace = true
 
 # On Linux the OS services are this crate's own (`os/linux.rs`): threads, clocks, the views of
 # guest pages over the memory map's files, and IOSurface's stand-in.

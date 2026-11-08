@@ -25,7 +25,7 @@ use std::sync::Arc;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSEvent, NSEventType, NSWindow};
-use reims_vgpu_metal::msg;
+use reims_vgpu_vulkan::os::msg;
 
 use crate::geometry::Rect;
 use crate::handle::Window;

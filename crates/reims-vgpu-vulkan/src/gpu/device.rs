@@ -385,7 +385,7 @@ fn runtime_deallocator<D: Send + 'static>(
 }
 
 /// Core's deallocator of a buffer the runtime did not make: never run, and its captures kept for
-/// good, as the Metal platform keeps them (what they hold stays mapped).
+/// good (what they hold stays mapped).
 fn keep_unrun<D, T>(made: &RaiseResult<Option<T>>, slot: Option<Slot<D>>) {
     if !matches!(made, Ok(Some(_)))
         && let Some(d) = slot.and_then(|slot| slot.lock().take())
@@ -934,7 +934,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// runtime's model of Metal's answer ([`VulkanDevice::metal_answer_at`]), the size
     /// `newTextureWithDescriptor:` gives such a texture's range of Metal's space, which answers
     /// `Depth16Unorm`, `Depth32Float`, `Stencil8` and `Depth32Float_Stencil8` textures, and an
-    /// `X32_Stencil8` one as a `Stencil8` one of its shape: the Metal platform's answer at each
+    /// `X32_Stencil8` one as a `Stencil8` one of its shape: Metal's answer at each
     /// shape measured (`resource`'s
     /// `heap_depth_stencil_shapes_with_optimized_contents_off_are_metals` and
     /// `x32_stencil8_size_queries_are_metals`). It dies at the selector where the model has
@@ -1591,7 +1591,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     }
 
     /// Read on the first call for this device object, then shared: the heap-buffer query's length
-    /// is the host's page size, as on the Metal platform.
+    /// is the host's page size, as on Metal.
     fn caps(&self) -> Arc<DeviceCaps> {
         Arc::clone(
             self.caps
@@ -2269,10 +2269,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Descriptors and a function's argument buffer are laid out as the Metal platform's own
-    /// encoder lays them out (`reims-vgpu-metal`'s `gpu::argument` tests, measured on the M3 Max,
-    /// with the same descriptors and the same probe kernel): the runtime's layout, Metal's
-    /// rules, reaches the guest unchanged
+    /// Descriptors and a function's argument buffer are laid out as Metal's own encoder lays them
+    /// out (measured on the M3 Max with the same descriptors and the same probe kernel): the
+    /// runtime's layout, Metal's rules, reaches the guest unchanged
     #[test]
     fn argument_layouts_are_metals() {
         use reims_vgpu_core::platform::resource::Library as _;

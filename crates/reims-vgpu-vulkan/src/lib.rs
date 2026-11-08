@@ -11,8 +11,8 @@
 //!   the selector where the runtime refuses what Metal does.
 //! - **A method not built yet** dies at its selector ([`answer::unbuilt`]), so a run's death line
 //!   names the first selector the platform lacks; none answers a made-up value.
-//! - **The OS services** ([`os`]): on macOS the metal crate's (threads, clocks, Mach VM, the
-//!   autorelease pool and IOSurface), over MoltenVK; on Linux this crate's own, over the host's
+//! - **The OS services** ([`os`]): on macOS this crate's over the system's (threads, clocks, Mach
+//!   VM, the autorelease pool, IOSurface and the Objective-C message layer), beside MoltenVK; on Linux this crate's own, over the host's
 //!   Vulkan driver.
 //! - **A display window's swapchain** (`swapchain`), on the runtime's own device: the window's
 //!   render thread presents the display's frames through it, with no copy, on either OS.

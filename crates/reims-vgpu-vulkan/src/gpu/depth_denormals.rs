@@ -13,7 +13,6 @@ use reims_vgpu_core::platform::values::{
     ColorAttachmentSet, DepthAttachmentSet, DepthStencilDesc, FullRenderPipelineDesc, TextureDesc,
 };
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_metal::MetalPlatform;
 
 use crate::gpu::device::tests::dev;
 use crate::platform::tests::platform;
@@ -33,9 +32,6 @@ const USAGE: u64 = 5;
 const PRIVATE: u64 = 0x20;
 const CLEAR: u64 = 2;
 const STORE: u64 = 1;
-
-/// `MTLCompareFunctionLess`.
-const LESS: u64 = 1;
 
 /// The state of the vertex function `vertex` and the fragment function `fragment` of
 /// `depth_denormals.metal`, into `colours` ([`colours_of`]) over a `Depth32Float` depth
@@ -280,12 +276,7 @@ fn denormal_depth_drawn<P: Platform>(
 /// measured on an Apple M4 alone; this is the measurement on this host's GPU
 #[test]
 fn denormal_depths_store_and_compare_as_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new();
     let (p, d) = (platform(), dev());
-    let white = [255u8; 4].repeat(64);
     let mut cases = 0;
     for bits in DENORMALS {
         let stored = f32::from_bits(bits);
@@ -297,15 +288,9 @@ fn denormal_depths_store_and_compare_as_metals() {
         };
         for &cleared in ways {
             for compare in 1..=6 {
-                let theirs = denormal_depth_drawn(&mp, &md, stored, cleared, compare);
                 let ours = denormal_depth_drawn(&p, &d, stored, cleared, compare);
                 let case = format!("{bits:#010x}, cleared {cleared}, compare {compare}");
-                assert_eq!(ours, theirs, "{case}");
-                if bits & 0x8000_0000 == 0 && compare == LESS {
-                    assert_eq!(theirs.0, white, "{case}: Metal compares it above zero");
-                    let kept: Vec<u8> = (0..64).flat_map(|_| bits.to_ne_bytes()).collect();
-                    assert_eq!(theirs.1, kept, "{case}: Metal keeps its bytes");
-                }
+                reims_vgpu_core::metal_check_raw!(&case, ours);
                 cases += 1;
             }
         }

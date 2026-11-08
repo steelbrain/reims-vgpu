@@ -1,5 +1,5 @@
-// The tests' kernel whose argument buffer every platform lays out alike (the Metal platform's
-// `gpu::argument` tests and the Vulkan platform's `argument_layouts_are_metals`): a texture, a
+// The tests' kernel whose argument buffer the runtime lays out as Metal does
+// (`argument_layouts_are_metals`): a texture, a
 // pointer to an argument buffer of a texture and a sampler, a sampler, a float4 and a pointer to
 // plain floats, which nests no layout.
 #include <metal_stdlib>

@@ -1,0 +1,4 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+made	bytes 2160 8a36edcf74971119fab0c09ba8c5a37d 809fbeddfc1b3a597897b6d5f4133251708faecdec0b2a496887a6c5e4032241
+rewritten	bytes 2160 601d8971099d47be56589afb38c719ad dac5e487a641600322cdec8fae49680b2ad5f497b651701332ddfc9fbe59781b
+after	bytes 65536 4d694580de43654c933d9d4def63025d 5a45640726c1e083a24d6c0f2ec9e88baa55741736d1f093b25d7c1f3ed9f89b

@@ -17,9 +17,8 @@ use reims_vgpu_core::platform::{Handle as _, Platform};
 use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_core::raise::death::DeathKind;
 use reims_vgpu_core::testkit::capture::catch_death;
-use reims_vgpu_metal::MetalPlatform;
 
-use super::measure::metal::set_value;
+use super::measure::host::set_value;
 use super::measure::{
     self, PROBE, Shape, desc_505, fill_noise, float_bits, probe, probed, probed_texels, sampled,
     sampled_floats, surface_420, surface_420_over,
@@ -34,19 +33,6 @@ use crate::platform::tests::platform;
 /// `MTLPixelFormatRGB8_420_2P`, the runtime's own over a surface, compared here with the
 /// family's members.
 const RGB8_420_2P: u64 = 540;
-
-/// Metal's system default device and a texture of `format` of `size` over `surface` made by
-/// it.
-fn metals(
-    format: u64,
-    surface: &OsSurface,
-    size: (u64, u64),
-) -> Option<(
-    <MetalPlatform as Platform>::Device,
-    <MetalPlatform as Platform>::Texture,
-)> {
-    measure::metal::metals(format, surface, 0, size)
-}
 
 /// This platform's texture of `format` of `size` over `surface`.
 fn ours(format: u64, surface: &OsSurface, size: (u64, u64)) -> VulkanTexture {
@@ -287,10 +273,6 @@ fn reads_as_metals_do(
     *crate::answer::LAST_LINE.lock() = None;
     let made = catch_death(|| d.new_texture_on_surface(&desc, Some(s), plane));
     let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-    let metal = measure::metal::metals(format, s, plane, size);
-    if let Some((_, mt)) = &metal {
-        assert_eq!(mt.pixel_format(), format, "Metal: {what}");
-    }
     if rows_overlap(format, shape, plane, size) {
         let site = made.map(drop).unwrap_err();
         let sel = "newTextureWithDescriptor:iosurface:plane:";
@@ -316,15 +298,17 @@ fn reads_as_metals_do(
     }
     let ours = crate::answer::relaxed(read);
     let ours_floats = measure::read_floats::<V>(&d, &t, size);
-    let Some((md, mt)) = metal else {
-        return;
-    };
-    let theirs = probed::<MetalPlatform>(&md, "read_texels", &mt, size, None, None);
-    assert!(ours == theirs, "read: {what}");
-    let theirs = measure::read_floats::<MetalPlatform>(&md, &mt, size);
+    let keys = [format!("read: {what}"), format!("read into floats: {what}")];
     assert!(
-        float_bits(&ours_floats) == float_bits(&theirs),
-        "read into floats: {what}"
+        reims_vgpu_core::metal_matches_bytes!(keys[0], &ours),
+        "{}",
+        keys[0]
+    );
+    let floats = float_bits(&ours_floats);
+    assert!(
+        reims_vgpu_core::metal_matches_raw!(keys[1], floats),
+        "{}",
+        keys[1]
     );
 }
 
@@ -371,9 +355,6 @@ fn textures_over_other_ostypes_read_as_metals() {
             let site = made.map(drop).unwrap_err();
             let sel = "newTextureWithDescriptor:iosurface:plane:";
             assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{what}");
-            if let Some((_, mt)) = measure::metal::metals(format, &s, 0, size) {
-                assert_eq!(mt.pixel_format(), format, "Metal: {what}");
-            }
         }
     }
 }
@@ -474,34 +455,37 @@ fn sample_as_metals_do(format: u64, s: &OsSurface, size: (u64, u64), what: &str)
             )
         })
         .collect();
-    let Some((md, mt)) = metals(format, s, size) else {
-        return;
+    let keys = [format!("read: {what}"), format!("read into floats: {what}")];
+    let probe_keys = |(state, bytes): &Probe| {
+        let probe = format!("{state:?} {}", bytes[28]);
+        [
+            format!("{probe}: {what}"),
+            format!("{probe} into floats: {what}"),
+        ]
     };
-    assert_eq!(
-        (
-            mt.pixel_format(),
-            mt.usage(),
-            mt.storage_mode(),
-            mt.texture_type()
-        ),
-        (format, 1, 0, 2),
-        "Metal: {what}"
-    );
-    let metal_read = probed::<MetalPlatform>(&md, "read_texels", &mt, size, None, None);
-    assert!(ours_read == metal_read, "read: {what}");
-    let metal_floats = measure::read_floats::<MetalPlatform>(&md, &mt, size);
     assert!(
-        float_bits(&ours_floats) == float_bits(&metal_floats),
-        "read into floats: {what}"
+        reims_vgpu_core::metal_matches_bytes!(keys[0], &ours_read),
+        "{}",
+        keys[0]
     );
-    for ((state, bytes), (ours, ours_floats)) in cases.iter().zip(&ours_sampled) {
-        let metal = sampled::<MetalPlatform>(&md, &mt, *state, grid, bytes);
-        assert!(*ours == metal, "{state:?} {}: {what}", bytes[28]);
-        let metal = sampled_floats::<MetalPlatform>(&md, &mt, *state, grid, bytes);
+    let floats = float_bits(&ours_floats);
+    assert!(
+        reims_vgpu_core::metal_matches_raw!(keys[1], floats),
+        "{}",
+        keys[1]
+    );
+    for (case, (ours, ours_floats)) in cases.iter().zip(&ours_sampled) {
+        let keys = probe_keys(case);
         assert!(
-            float_bits(ours_floats) == float_bits(&metal),
-            "{state:?} {} into floats: {what}",
-            bytes[28]
+            reims_vgpu_core::metal_matches_bytes!(keys[0], ours),
+            "{}",
+            keys[0]
+        );
+        let floats = float_bits(ours_floats);
+        assert!(
+            reims_vgpu_core::metal_matches_raw!(keys[1], floats),
+            "{}",
+            keys[1]
         );
     }
 }
@@ -568,17 +552,24 @@ fn samples_in_fragments_as_metals_do(format: u64, s: &OsSurface, size: (u64, u64
     let t = ours_on(&d, format, s, size);
     let (grid, cases) = cases(size);
     let ours = fragment_reads::<VulkanPlatform>(&p, &d, &t, grid, &cases);
-    let Some((md, mt)) = metals(format, s, size) else {
-        return;
+    let keys = |(state, bytes): &Probe| {
+        let probe = format!("{state:?} {}", bytes[28]);
+        [
+            format!("{probe}: {what}"),
+            format!("{probe} into floats: {what}"),
+        ]
     };
-    let mp = MetalPlatform::new();
-    let theirs = fragment_reads::<MetalPlatform>(&mp, &md, &mt, grid, &cases);
-    for (((state, bytes), ours), theirs) in cases.iter().zip(&ours).zip(&theirs) {
-        assert!(ours.0 == theirs.0, "{state:?} {}: {what}", bytes[28]);
+    for (case, ours) in cases.iter().zip(&ours) {
+        let keys = keys(case);
         assert!(
-            ours.1 == theirs.1,
-            "{state:?} {} into floats: {what}",
-            bytes[28]
+            reims_vgpu_core::metal_matches_bytes!(keys[0], &ours.0),
+            "{}",
+            keys[0]
+        );
+        assert!(
+            reims_vgpu_core::metal_matches_bytes!(keys[1], &ours.1),
+            "{}",
+            keys[1]
         );
     }
 }
@@ -696,20 +687,10 @@ fn views_in_srgb_twins_read_as_metals() {
                 let site = catch_death(|| twin.new_texture_view(base).map(drop)).unwrap_err();
                 let sel = "newTextureViewWithPixelFormat:";
                 assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{what}");
-                let Some((md, mt)) = metals(base, &s, size) else {
-                    continue;
-                };
-                let theirs = mt.new_texture_view(format).unwrap().unwrap();
-                assert_eq!(
-                    (view.usage(), theirs.usage()),
-                    (1, 1),
-                    "the view's usage, ours and Metal's: {what}"
-                );
-                let metal = measure::read_floats::<MetalPlatform>(&md, &theirs, size);
-                assert!(
-                    float_bits(&viewed) == float_bits(&metal),
-                    "the view: {what}"
-                );
+                assert_eq!(view.usage(), 1, "the view's usage: {what}");
+                let key = format!("the view: {what}");
+                let floats = float_bits(&viewed);
+                assert!(reims_vgpu_core::metal_matches_raw!(key, floats), "{key}");
             }
         }
     }
@@ -730,7 +711,6 @@ fn views_in_srgb_twins_read_as_metals() {
 /// chroma
 #[test]
 fn own_format_views_are_metals() {
-    use metal2vulkan::metal::format::{YCbCrReads, ycbcr_format};
     use reims_vgpu_core::platform::types::Swizzle;
     const BGRA: Swizzle = Swizzle {
         red: 4,
@@ -784,25 +764,6 @@ fn own_format_views_are_metals() {
         };
         float_bits(&measure::float_texels(&bytes))
     }
-    /// The bits, chroma, packing and reads of `format`, raw.
-    fn of(format: u64) -> metal2vulkan::metal::format::YCbCrFormat {
-        let pf = PixelFormat::try_from(u32::try_from(format).unwrap()).unwrap();
-        ycbcr_format(pf).unwrap()
-    }
-    /// The format whose 2D array view Metal reads as the runtime reads `format`'s: an `_sRGB`
-    /// twin's converted format, or `format`.
-    fn read_as(format: u64) -> u64 {
-        let f = of(format);
-        if f.reads != YCbCrReads::Srgb {
-            return format;
-        }
-        let converted = |c: &u64| {
-            let c = of(*c);
-            (c.bits, c.subsampling, c.packed) == (f.bits, f.subsampling, f.packed)
-                && c.reads == YCbCrReads::Converted
-        };
-        family().into_iter().find(converted).unwrap()
-    }
     let size = (33, 17);
     let (d, e) = (dev(), exact());
     let mut differ = Vec::new();
@@ -812,48 +773,32 @@ fn own_format_views_are_metals() {
         let s = shape.surface(size);
         shape.fill_noise(&s, size, 12);
         let t = ours(format, &s, size);
-        let Some((md, mt)) = metals(format, &s, size) else {
-            return;
-        };
         for swizzle in [None, Some(BGRA)] {
             let ours = viewed::<VulkanPlatform>(
                 &d,
                 &view::<VulkanPlatform>(&t, format, (2, swizzle)).unwrap(),
                 size,
             );
-            let metal = view::<MetalPlatform>(&mt, format, (2, swizzle)).unwrap();
-            let theirs = viewed::<MetalPlatform>(&md, &metal, size);
+            let key = format!("{format} {swizzle:?}");
+            let array_key = format!("the 2D array view's type and usage: {format} {swizzle:?}");
             assert!(
-                ours == theirs,
-                "{format} {swizzle:?}: {:?} {:?}",
-                (ours.0, ours.1),
-                (theirs.0, theirs.1)
+                reims_vgpu_core::metal_matches_raw!(key, ours),
+                "{key}: {:?}",
+                (ours.0, ours.1)
             );
             let array = view::<VulkanPlatform>(&t, format, (3, swizzle)).unwrap();
-            let metal = view::<MetalPlatform>(&mt, format, (3, swizzle)).unwrap();
-            assert_eq!(
-                (array.texture_type(), array.usage()),
-                (metal.texture_type(), metal.usage()),
-                "the 2D array view's type and usage: {format} {swizzle:?}"
-            );
+            reims_vgpu_core::metal_check!(array_key, (array.texture_type(), array.usage()));
             let filtered = ours_on(&e, format, &s, size);
             let filtered = view::<VulkanPlatform>(&filtered, format, (3, swizzle)).unwrap();
-            let base = read_as(format);
-            let (rd, read) = metals(base, &s, size).unwrap();
-            let read = view::<MetalPlatform>(&read, base, (3, swizzle)).unwrap();
             for sample in [None, Some((0, 0)), Some((1, 0)), Some((0, 1)), Some((0, 2))] {
                 let (on, subject) = match sample {
                     None => (&d, &array),
                     Some(_) => (&e, &filtered),
                 };
                 let ours = arrayed::<VulkanPlatform>(on, subject, size, sample);
-                let theirs = arrayed::<MetalPlatform>(&rd, &read, size, sample);
                 let what = format!("{format} {swizzle:?} {sample:?}");
-                if ours != theirs {
-                    let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-                    let at = ours.iter().zip(&theirs).position(|(a, b)| a != b);
-                    let first = at.map(|i| (ours[i], theirs[i]));
-                    differ.push(format!("{what}: {n} differ, first at {at:?}: {first:?}"));
+                if !reims_vgpu_core::metal_matches_raw!(what, ours) {
+                    differ.push(format!("{what}: the texels differ from Metal's"));
                 }
             }
         }
@@ -900,9 +845,6 @@ fn samples_under_every_mode_as_metals(format: u64, ostypes: [&[u8; 4]; 2]) {
         shape.fill_noise(&s, size, 7);
         let d = exact();
         let t = ours_on(&d, format, &s, size);
-        let Some((md, mt)) = metals(format, &s, size) else {
-            return;
-        };
         let grid = ((size.0 + 2) * 3, (size.1 + 2) * 3);
         type V = crate::platform::VulkanPlatform;
         for (read, filter) in [(0, 0), (0, 1), (1, 0), (2, 0)] {
@@ -930,24 +872,12 @@ fn samples_under_every_mode_as_metals(format: u64, ostypes: [&[u8; 4]; 2]) {
                     measure::float_texels(&read)
                 };
                 let ours = sample(&t, &d);
-                let s = measure::sampler::<MetalPlatform>(&md, (filter, address, true), border);
-                let metal = measure::float_texels(&probed_texels::<MetalPlatform>(
-                    &md,
-                    ("sample_texels_float", 16),
-                    &mt,
-                    grid,
-                    Some(&s),
-                    Some(&bytes),
-                ));
-                let (ours, metal) = (float_bits(&ours), float_bits(&metal));
-                let differ = ours.iter().zip(&metal).filter(|(a, b)| a != b).count();
-                assert_eq!(
-                    differ,
-                    0,
+                let key = format!(
                     "{format} over {}: read {read} filter {filter} address {address} \
                      border {border}",
                     String::from_utf8_lossy(ostype)
                 );
+                reims_vgpu_core::metal_check_raw!(key, float_bits(&ours));
             }
         }
     }
@@ -1036,12 +966,19 @@ fn the_default_filter_samples_within_its_bound_of_metals() {
             .filter(|&(k, n)| !before.contains(&(k, n)))
             .map(|(k, _)| k)
             .collect();
-        let Some((md, mt)) = metals(format, &s, size) else {
-            return;
+        let float_bytes = |f: &[[f32; 4]]| -> Vec<u8> {
+            (f.as_flattened().iter())
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
         };
-        let metal_halves = sampled::<MetalPlatform>(&md, &mt, linear, grid, &bytes);
-        let metal_floats = sampled_floats::<MetalPlatform>(&md, &mt, linear, grid, &bytes);
-        let (ours, metal) = (floats.as_flattened(), metal_floats.as_flattened());
+        let keys = [format!("{format}: halves"), format!("{format}: floats")];
+        let ours_bytes = [halves.clone(), float_bytes(&floats)];
+        let [metal_halves, metal_floats] =
+            [0, 1].map(|i| reims_vgpu_core::metal_near!(&keys[i], &ours_bytes[i]));
+        let metal_floats: Vec<f32> = (metal_floats.chunks(4))
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let (ours, metal) = (floats.as_flattened(), &metal_floats[..]);
         assert_eq!(ours.len(), metal.len(), "{format}");
         let worst = (ours.iter().zip(metal)).fold(0.0_f32, |w, (o, m)| w.max((o - m).abs()));
         let differ = (ours.iter().zip(metal))
@@ -1158,10 +1095,6 @@ fn the_guests_id_is_metals() {
     fill_noise(&s, size, 8);
     // Metal's first, before this platform's runtime makes any Metal texture of its own in
     // the process, which would take IDs of Metal's pool.
-    let metal = MetalPlatform::system_default_device().map(|md| {
-        let descriptor = reims_vgpu_metal::gpu::desc::texture_descriptor;
-        ids::<MetalPlatform>(&md, descriptor, &s, size, true)
-    });
     let p = platform();
     let (ours, _) = ids::<crate::platform::VulkanPlatform>(
         &dev(),
@@ -1176,9 +1109,7 @@ fn the_guests_id_is_metals() {
         (ours[0] + 1, ours[1], ours[1]),
         "{ours:?}"
     );
-    if let Some((metal, _)) = metal {
-        assert_eq!(ours, metal);
-    }
+    reims_vgpu_core::metal_check!("ids", ours);
     let d = dev();
     let t = self::ours(505, &s, size);
     let kind = metal2vulkan_runtime::Degradation::HalfTexelConversion;
@@ -1194,7 +1125,6 @@ fn the_guests_id_is_metals() {
 fn usage_bits_metal_takes_are_answered_as_metals() {
     let size = (16, 8);
     let s = surface_420(b"x420", size);
-    let md = MetalPlatform::system_default_device();
     for (usage, answered) in [(0x1_0005, 0x1_0005), (0x1_c00d, 0x1_c005)] {
         let desc = TextureDesc {
             usage,
@@ -1205,14 +1135,6 @@ fn usage_bits_metal_takes_are_answered_as_metals() {
             .unwrap()
             .unwrap();
         assert_eq!(t.usage(), answered, "{usage:#x}");
-        if let Some(md) = &md {
-            let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-            let mt = md
-                .new_texture_on_surface(&metal, Some(&s), 0)
-                .unwrap()
-                .unwrap();
-            assert_eq!(mt.usage(), answered, "Metal: {usage:#x}");
-        }
     }
 }
 
@@ -1415,17 +1337,7 @@ fn sampling_a_mapped_texture_where_the_runtime_cannot_map_it_dies() {
         None,
         Some(&bytes),
     );
-    if let Some((md, mt)) = metals(543, &s, size) {
-        let theirs = probed::<MetalPlatform>(
-            &md,
-            "sample_constexpr_clamped",
-            &mt,
-            grid,
-            None,
-            Some(&bytes),
-        );
-        assert!(clamped == theirs);
-    }
+    reims_vgpu_core::metal_check_bytes!("clamped", &clamped);
 }
 
 /// A texture of the family samples through a constexpr sampler as Metal's does, bit for bit,
@@ -1473,9 +1385,6 @@ fn constexpr_samplers_sample_as_metals() {
         let s = shape.surface(size);
         shape.fill_noise(&s, size, 11);
         let t = ours_on(&d, format, &s, size);
-        let Some((md, mt)) = metals(format, &s, size) else {
-            return;
-        };
         for kernel in kernels {
             let read = |bytes_read: Vec<u8>| -> Vec<[u32; 4]> {
                 (measure::float_texels(&bytes_read).into_iter())
@@ -1492,21 +1401,13 @@ fn constexpr_samplers_sample_as_metals() {
                     Some(&bytes),
                 ))
             };
-            let theirs = read(probed_texels::<MetalPlatform>(
-                &md,
-                (kernel, 16),
-                &mt,
-                grid,
-                None,
-                Some(&bytes),
-            ));
             let what = format!(
                 "{format} over {}: {kernel}",
                 String::from_utf8_lossy(ostype)
             );
             if in_place || !kernel.ends_with("_linear") {
                 let ours = read_ours();
-                if ours != theirs {
+                if !reims_vgpu_core::metal_matches_raw!(&what, ours) {
                     differ.push(format!("{what}: not Metal's bits"));
                 }
                 continue;
@@ -1521,7 +1422,16 @@ fn constexpr_samplers_sample_as_metals() {
                 differ.push(format!("{what}: did not die naming {named}: {line}"));
             }
             let ours = crate::answer::relaxed(read_ours);
-            let (ours, theirs) = (ours.as_flattened(), theirs.as_flattened());
+            let le = |v: &[[u32; 4]]| -> Vec<u8> {
+                (v.as_flattened().iter())
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect()
+            };
+            let ours_bytes = le(&ours);
+            let theirs: Vec<u32> = (reims_vgpu_core::metal_near!(&what, &ours_bytes).chunks(4))
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            let (ours, theirs) = (ours.as_flattened(), &theirs[..]);
             // How far apart two values are: a NaN against a number is infinitely far.
             let apart = |(&o, &m): (&u32, &u32)| {
                 let (o, m) = (f32::from_bits(o), f32::from_bits(m));
@@ -1754,10 +1664,6 @@ fn samples_see_the_writes_before_them() {
                 s
             };
             // Metal's first, before this platform's runtime makes any texture of its own.
-            let metal = MetalPlatform::system_default_device().map(|md| {
-                let descriptor = reims_vgpu_metal::gpu::desc::texture_descriptor;
-                after::<MetalPlatform>(&md, (format, descriptor), &surface(), size, write)
-            });
             let p = platform();
             let unwritten = surface();
             let before = {
@@ -1777,9 +1683,7 @@ fn samples_see_the_writes_before_them() {
                 write,
             );
             assert!(ours != before, "{format} {write:?}: the write shows");
-            if let Some(metal) = metal {
-                assert!(ours == metal, "{format} {write:?}");
-            }
+            reims_vgpu_core::metal_check_bytes!(format!("{format} {write:?}"), &ours);
         }
     }
 }
@@ -1899,10 +1803,6 @@ fn a_write_through_a_buffer_on_the_surface_shows_in_the_same_command_buffer() {
     };
     let all = [Before::Dispatch, Before::Encoder, Before::CommandBuffer];
     // Metal's first, before this platform's runtime makes any texture of its own.
-    let metal = MetalPlatform::system_default_device().map(|md| {
-        let descriptor = reims_vgpu_metal::gpu::desc::texture_descriptor;
-        all.map(|before| read(&|s| through::<MetalPlatform>(&md, descriptor, s, size, before)))
-    });
     let p = platform();
     let descriptor = |d: &TextureDesc| p.texture_descriptor(d);
     let ours =
@@ -1917,9 +1817,7 @@ fn a_write_through_a_buffer_on_the_surface_shows_in_the_same_command_buffer() {
     });
     assert!(ours.iter().all(|o| *o != unwritten), "the write shows");
     assert!(ours.iter().all(|o| *o == ours[2]));
-    if let Some(metal) = metal {
-        assert!(metal == ours, "Metal's reads show the write: measure again");
-    }
+    reims_vgpu_core::metal_check_raw!("reads", ours);
 }
 
 /// A texture of 505 made while a compute encoder is open is read by the encoder's next
@@ -1985,19 +1883,13 @@ fn a_texture_made_in_an_encoder_reads_as_metals() {
     let s = surface_420(b"x420", size);
     fill_noise(&s, size, 12);
     // Metal's first, before this platform's runtime makes any texture of its own.
-    let metal = MetalPlatform::system_default_device().map(|md| {
-        let descriptor = reims_vgpu_metal::gpu::desc::texture_descriptor;
-        read::<MetalPlatform>(&md, descriptor, &s, size)
-    });
     let p = platform();
     let ours = read::<VulkanPlatform>(&dev(), |d| p.texture_descriptor(d), &s, size);
     assert!(
         ours.iter().any(|&b| b != 0),
         "the texture reads its surface"
     );
-    if let Some(metal) = metal {
-        assert!(ours == metal);
-    }
+    reims_vgpu_core::metal_check_bytes!("read", &ours);
 }
 
 /// What a test does with a texture of the family ([`written`]).
@@ -2382,18 +2274,13 @@ fn noisy_pair_of(ostype: &[u8; 4], size: (u64, u64), seed: u64) -> (OsSurface, O
 /// buffer, write the surface's bytes and the buffer's as Metal's do, byte for byte
 #[test]
 fn cpu_writes_and_buffer_blits_of_family_textures_are_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new();
     let size = (32, 16);
     for format in [505, 543, 503] {
         for op in [Op::Replace, Op::ToBuffer, Op::FromBuffer] {
             let ours = noisy_pair(format, size, 3);
             let ours = written(&platform(), &dev(), op, format, (&ours.0, &ours.1), size);
-            let theirs = noisy_pair(format, size, 3);
-            let theirs = written(&mp, &md, op, format, (&theirs.0, &theirs.1), size);
-            assert!(ours == theirs, "{format} {op:?}");
+            let case = format!("{format} {op:?}");
+            reims_vgpu_core::metal_check_raw!(&case, ours);
         }
     }
 }
@@ -2406,8 +2293,6 @@ fn cpu_writes_and_buffer_blits_of_family_textures_are_metals() {
 /// [`passes_into_10_bit_formats_are_metals`]' and [`passes_into_code_formats_are_metals`]'
 #[test]
 fn copies_and_attachments_of_family_textures_die() {
-    let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new();
     let size = (32, 16);
     for (format, op) in [
         (505, Op::Copy),
@@ -2437,10 +2322,6 @@ fn copies_and_attachments_of_family_textures_die() {
                 line.contains("by a rule the runtime does not hold"),
                 "{case}"
             );
-        }
-        if let Some(md) = &md {
-            let (s, other) = noisy_pair(format, size, 5);
-            written(&mp, md, op, format, (&s, &other), size);
         }
     }
 }
@@ -2474,8 +2355,6 @@ fn passes_into_code_formats_are_metals() {
 
 /// The comparison of [`passes_into_8_bit_formats_are_metals`], of `formats`.
 fn passes_are_metals(formats: &[u64]) {
-    let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new();
     let size = (32, 16);
     for &format in formats {
         let (_, ostypes) = surfaces_of(format, true);
@@ -2487,17 +2366,12 @@ fn passes_are_metals(formats: &[u64]) {
                 let before = bytes_of(&s);
                 let ours = written(&platform(), &dev(), op, format, (&s, &other), size);
                 assert!(ours[0] != before, "{case}: the pass stored nothing");
-                let Some(md) = &md else { continue };
-                let (s, other) = noisy_pair_of(ostype, size, 7);
-                let theirs = written(&mp, md, op, format, (&s, &other), size);
-                let differ = (ours[0].iter().zip(&theirs[0]))
-                    .filter(|(a, b)| a != b)
-                    .count();
-                assert_eq!(differ, 0, "{case}: bytes of the surface");
-                assert!(
-                    ours[1..] == theirs[1..],
-                    "{case}: the other surface and the buffer"
-                );
+                let keys = [
+                    format!("{case}: bytes of the surface"),
+                    format!("{case}: the other surface and the buffer"),
+                ];
+                reims_vgpu_core::metal_check_bytes!(&keys[0], &ours[0]);
+                reims_vgpu_core::metal_check_raw!(&keys[1], &ours[1..]);
             }
         }
     }
@@ -2519,10 +2393,6 @@ fn passes_are_metals(formats: &[u64]) {
 #[test]
 fn loaded_masked_and_blended_passes_are_metals() {
     const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new();
     let size = (32, 16);
     let mut differ = Vec::new();
     for format in [500, 502, 503, 505, 506, 507, 540, 541, 542, 543, 544, 545] {
@@ -2550,8 +2420,6 @@ fn loaded_masked_and_blended_passes_are_metals() {
                 Op::Blended,
             ] {
                 let case = format!("{format} over {} {op:?}", String::from_utf8_lossy(ostype));
-                let (s, other) = noisy_pair_of(ostype, size, 7);
-                let theirs = written(&mp, &md, op, format, (&s, &other), size);
                 let ours = |relaxed: bool| {
                     let (s, other) = noisy_pair_of(ostype, size, 7);
                     let run = || written(&platform(), &dev(), op, format, (&s, &other), size);
@@ -2582,11 +2450,16 @@ fn loaded_masked_and_blended_passes_are_metals() {
                         continue;
                     }
                 };
-                if ours[1..] != theirs[1..] {
+                let keys = [
+                    format!("{case}: the surface"),
+                    format!("{case}: the other surface or the buffer"),
+                ];
+                if !reims_vgpu_core::metal_matches_raw!(&keys[1], &ours[1..]) {
                     differ.push(format!("{case}: the other surface or the buffer"));
                 }
+                let theirs = reims_vgpu_core::metal_near!(&keys[0], &ours[0]);
                 let within = u32::from(op == Op::Blended);
-                let pairs = codes(&ours[0]).into_iter().zip(codes(&theirs[0]));
+                let pairs = codes(&ours[0]).into_iter().zip(codes(&theirs));
                 let off = pairs
                     .filter(|((o, o_low), (m, m_low))| o.abs_diff(*m) > within || o_low != m_low)
                     .count();
@@ -2609,8 +2482,6 @@ fn loaded_masked_and_blended_passes_are_metals() {
 /// Metal ignore the queue's later command buffers
 #[test]
 fn packed_textures_copy_nothing_and_their_blits_die() {
-    let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new();
     let size = (32, 16);
     let named = |line: Option<String>| line.unwrap_or_default();
     for format in [508, 509, 510, 528, 529, 530] {
@@ -2618,11 +2489,7 @@ fn packed_textures_copy_nothing_and_their_blits_die() {
         let before = bytes_of(&s);
         let ours = written(&platform(), &dev(), Op::Replace, format, (&s, &other), size);
         assert!(ours[0] == before, "{format}");
-        if let Some(md) = &md {
-            let (s, other) = noisy_pair(format, size, 11);
-            let theirs = written(&mp, md, Op::Replace, format, (&s, &other), size);
-            assert!(ours == theirs, "Metal: {format}");
-        }
+        reims_vgpu_core::metal_check_raw!(format!("{format}"), ours);
         for op in [Op::ToBuffer, Op::FromBuffer] {
             *crate::answer::LAST_LINE.lock() = None;
             let site = catch_death(|| written(&platform(), &dev(), op, format, (&s, &other), size))
@@ -2659,7 +2526,6 @@ fn packed_textures_copy_nothing_and_their_blits_die() {
 /// height is nil, as Metal's is, and one of a 4:4:4 format is made, as Metal's is
 #[test]
 fn odd_render_targets_of_subsampled_formats_are_nil_as_metals() {
-    let md = MetalPlatform::system_default_device();
     for format in family() {
         let (pf, ostypes) = surfaces_of(format, true);
         let f = metal2vulkan::metal::format::ycbcr_format(pf).unwrap();
@@ -2672,11 +2538,6 @@ fn odd_render_targets_of_subsampled_formats_are_nil_as_metals() {
                 dev().new_texture_on_surface(&platform().texture_descriptor(&desc), Some(&s), 0);
             let what = format!("{format} of {size:?}");
             assert_eq!(ours.unwrap().is_some(), !subsampled, "{what}");
-            if let Some(md) = &md {
-                let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-                let theirs = md.new_texture_on_surface(&desc, Some(&s), 0).unwrap();
-                assert_eq!(theirs.is_some(), !subsampled, "Metal: {what}");
-            }
         }
     }
 }
@@ -2686,10 +2547,6 @@ fn odd_render_targets_of_subsampled_formats_are_nil_as_metals() {
 /// as Metal's does on this host
 #[test]
 fn kernel_writes_metal_drops_are_dropped_as_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new();
     let size = (32, 16);
     let dropped = family().into_iter().filter(|&f| {
         let pf = PixelFormat::try_from(u32::try_from(f).unwrap()).unwrap();
@@ -2700,9 +2557,7 @@ fn kernel_writes_metal_drops_are_dropped_as_metals() {
         let before = bytes_of(&s);
         let ours = written(&platform(), &dev(), Op::Kernel, format, (&s, &other), size);
         assert!(ours[0] == before, "{format}");
-        let (s, other) = noisy_pair(format, size, 7);
-        let theirs = written(&mp, &md, Op::Kernel, format, (&s, &other), size);
-        assert!(ours == theirs, "Metal: {format}");
+        reims_vgpu_core::metal_check_raw!(format!("{format}"), ours);
     }
 }
 
@@ -2711,8 +2566,6 @@ fn kernel_writes_metal_drops_are_dropped_as_metals() {
 /// byte for byte, as a kernel's does (`writes_of_444_textures_are_metals`)
 #[test]
 fn fragment_writes_of_444_textures_are_metals() {
-    let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new();
     let size = (32, 16);
     for format in [503, 507, 542, 545] {
         let (s, other) = noisy_pair(format, size, 11);
@@ -2726,11 +2579,7 @@ fn fragment_writes_of_444_textures_are_metals() {
             size,
         );
         assert!(ours[0] != before, "{format}'s planes");
-        if let Some(md) = &md {
-            let (s, other) = noisy_pair(format, size, 11);
-            let theirs = written(&mp, md, Op::Fragment, format, (&s, &other), size);
-            assert!(ours == theirs, "Metal: {format}");
-        }
+        reims_vgpu_core::metal_check_raw!(format!("{format}"), ours);
     }
 }
 
@@ -2738,8 +2587,6 @@ fn fragment_writes_of_444_textures_are_metals() {
 /// into the surface's planes as Metal's does, byte for byte
 #[test]
 fn writes_of_444_textures_are_metals() {
-    let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new();
     let size = (32, 16);
     let stored = family().into_iter().filter(|&f| {
         let pf = PixelFormat::try_from(u32::try_from(f).unwrap()).unwrap();
@@ -2752,11 +2599,7 @@ fn writes_of_444_textures_are_metals() {
         let before = bytes_of(&s);
         let ours = written(&platform(), &dev(), Op::Kernel, format, (&s, &other), size);
         assert!(ours[0] != before, "{format}'s planes");
-        if let Some(md) = &md {
-            let (s, other) = noisy_pair(format, size, 9);
-            let theirs = written(&mp, md, Op::Kernel, format, (&s, &other), size);
-            assert!(ours == theirs, "Metal: {format}");
-        }
+        reims_vgpu_core::metal_check_raw!(format!("{format}"), ours);
     }
 }
 
@@ -2765,8 +2608,6 @@ fn writes_of_444_textures_are_metals() {
 /// twins 523 and 527, whose planes Metal's changes
 #[test]
 fn writes_the_runtime_refuses_die() {
-    let md = MetalPlatform::system_default_device();
-    let mp = MetalPlatform::new();
     let size = (32, 16);
     let refused = family().into_iter().filter(|&f| {
         super::writes_refused(PixelFormat::try_from(u32::try_from(f).unwrap()).unwrap())
@@ -2788,12 +2629,6 @@ fn writes_the_runtime_refuses_die() {
         );
         assert!(line.contains(&format!("a texture of {pf:?}")), "{line}");
         assert!(line.contains("the runtime refuses"), "{line}");
-        if let Some(md) = &md {
-            let (s, other) = noisy_pair(format, size, 9);
-            let before = bytes_of(&s);
-            let theirs = written(&mp, md, Op::Kernel, format, (&s, &other), size);
-            assert!(theirs[0] != before, "Metal: {format}");
-        }
     }
 }
 
@@ -2849,11 +2684,7 @@ fn every_luma_code_of_505_reads_as_metals() {
         );
         let t = ours(505, &s, size);
         let ours = float_bits(&measure::read_floats::<VulkanPlatform>(&d, &t, size));
-        let Some((md, mt)) = metals(505, &s, size) else {
-            return;
-        };
-        let theirs = float_bits(&measure::read_floats::<MetalPlatform>(&md, &mt, size));
-        let differ = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-        assert_eq!(differ, 0, "{}", String::from_utf8_lossy(ostype));
+        let key = String::from_utf8_lossy(ostype).into_owned();
+        reims_vgpu_core::metal_check_raw!(&key, ours);
     }
 }

@@ -32,7 +32,7 @@
 //!
 //! **Pacing, on the render thread.** Each draw takes the next image with a fence, and waits for the
 //! fence, up to [`WAIT_NS`]: that is the render thread's wait for the compositor, as `nextDrawable`
-//! is on the Metal platform's window. Where the presentation engine has no image to give (every one
+//! is on a Metal window. Where the presentation engine has no image to give (every one
 //! queued or shown, as a FIFO-only surface's are when frames come faster than the screen shows
 //! them), the take waits for one in the window system, in calls of [`TAKE_NS`] each, for up to
 //! [`WAIT_NS`] in all, read on the monotonic clock ([`take_image`]): the draw goes on as the engine

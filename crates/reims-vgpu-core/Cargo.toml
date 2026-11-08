@@ -9,13 +9,18 @@ license.workspace = true
 
 [features]
 # core::testkit and testkit::capture outside this crate's own unit tests (architecture 13.2).
-testkit = []
+testkit = ["dep:lzma-rs"]
 
 # Architecture 2.2: no objc2, block2, dispatch2, mach2 or libc here.
 [dependencies]
 parking_lot.workspace = true
 zerocopy.workspace = true
 log.workspace = true
+# testkit::metal_answers: the recorded answers too long for text, in xz files.
+lzma-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+lzma-rs.workspace = true
 
 [lints]
 workspace = true

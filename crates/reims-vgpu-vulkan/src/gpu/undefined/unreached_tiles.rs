@@ -1,7 +1,7 @@
 //! The bytes a render pass leaves in the tiles its draws never rasterise into, by load action,
 //! and what its store makes of the tiles they do reach.
 //!
-//! **Metal's rule** (this host, every probe below the same in each of [`RUNS`] runs; random
+//! **Metal's rule** (this host, every probe below the same in each of 5 runs; random
 //! bytes uploaded by a blit, so NaN payloads, denormals, out-of-range and non-canonical codes
 //! among them, Private 64 by 64 and 100 by 70 textures):
 //! - A tile no draw's primitive reaches keeps every byte under `Load` and `DontCare`, for every
@@ -39,8 +39,7 @@ use reims_vgpu_core::platform::Platform;
 
 use super::{
     Aspect, CLEAR, DEPTH32F, DONT_CARE, Draw, IN_TILE_1_1, LOAD, Pass, STENCIL8, STORE, Shape,
-    Step, buffer, grid, heard, metal, once, positions, random_bytes, run, state, texel_bytes,
-    tiles, writing,
+    Step, buffer, heard, positions, random_bytes, run, state, writing,
 };
 use crate::gpu::device::tests::dev;
 use crate::platform::tests::platform;
@@ -51,26 +50,6 @@ use crate::platform::tests::platform;
 const FORMATS: [u64; 14] = [
     70, 71, 72, 12, 90, 92, 93, 22, 112, 115, 125, 250, DEPTH32F, STENCIL8,
 ];
-
-/// What a reached tile's store makes of a loaded texel of `format`, Metal's rule (module docs).
-fn stored(format: u64, texel: &[u8]) -> Vec<u8> {
-    let mut t = texel.to_vec();
-    match format {
-        // 8-bit signed normalized channels: 0x80 comes back 0x81.
-        12 | 72 => t.iter_mut().filter(|b| **b == 0x80).for_each(|b| *b = 0x81),
-        // 16-bit ones: 0x8000 comes back 0x8001.
-        22 | 112 => {
-            for c in t.chunks_mut(2) {
-                if c == [0x00, 0x80] {
-                    c[0] = 0x01;
-                }
-            }
-        }
-        DEPTH32F => t[3] &= 0x7f,
-        _ => {}
-    }
-    t
-}
 
 /// The bytes of a single-sample `format` texture of `size`, uploaded with random bytes, before
 /// and after a pass that loads it by `load`, stores it, and draws `drawn` (a draw writing its
@@ -117,52 +96,6 @@ fn probe<P: Platform>(
     (r.next().unwrap(), r.next().unwrap())
 }
 
-/// Metal's rule over one probe's bytes (module docs): every tile no draw reaches keeps its bytes
-/// under `Load` and `DontCare`; `Clear` writes every tile; under `Load` a reached tile's undrawn
-/// texels are [`stored`]'s.
-fn holds_metals_rule(
-    (format, size): (u64, (u64, u64)),
-    (load, drawn): (u64, bool),
-    (before, after): (&[u8], &[u8]),
-) {
-    let case = format!("{format} {size:?} load {load} drawn {drawn}");
-    let texel = texel_bytes(format);
-    let tile = (32, 32);
-    let reached: &[(u64, u64)] = if drawn { &[(1, 1)] } else { &[] };
-    match load {
-        CLEAR => {
-            // Every tile holds the clear value (texel (0, 0)'s) but what the draw wrote.
-            let fill = &after[..texel];
-            let all: Vec<(u64, u64)> = (0..size.1.div_ceil(32))
-                .flat_map(|y| (0..size.0.div_ceil(32)).map(move |x| (x, y)))
-                .collect();
-            let got = tiles((before, after), (fill, &[&IN_TILE_1_1]), (size, tile));
-            assert_eq!(got, grid(size, tile, &all), "Metal: {case}");
-        }
-        DONT_CARE => {
-            let fill = if Aspect::of(format) == Aspect::Colour {
-                vec![0; texel]
-            } else {
-                after[(33 * usize::try_from(size.0).unwrap() + 33) * texel..][..texel].to_vec()
-            };
-            let got = tiles((before, after), (&fill, &[&IN_TILE_1_1]), (size, tile));
-            assert_eq!(got, grid(size, tile, reached), "Metal: {case}");
-        }
-        _ => {
-            let w = usize::try_from(size.0).unwrap();
-            for (i, (b, a)) in before.chunks(texel).zip(after.chunks(texel)).enumerate() {
-                let (x, y) = (i % w, i / w);
-                let in_reached = drawn && (32..64).contains(&x) && (32..64).contains(&y);
-                if !in_reached {
-                    assert_eq!(a, b, "Metal: {case}: texel ({x}, {y}) of an unreached tile");
-                } else if !super::near(&IN_TILE_1_1, (x, y)) {
-                    assert_eq!(a, stored(format, b), "Metal: {case}: texel ({x}, {y})");
-                }
-            }
-        }
-    }
-}
-
 /// Every tile no draw reaches keeps its bytes under `Load` and `DontCare`, `Clear` writes every
 /// tile, and a reached tile's `Load` round trip moves a signed normalized format's most negative
 /// code and a written depth's sign as Metal's tile memory does, for each of [`FORMATS`] of random
@@ -175,21 +108,15 @@ fn holds_metals_rule(
     ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn unreached_tiles_keep_their_bytes_under_load_and_dont_care() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
     let mut differ = Vec::new();
     for format in FORMATS {
         for size in [(64, 64), (100, 70)] {
             for load in [DONT_CARE, LOAD, CLEAR] {
                 for drawn in [false, true] {
-                    let Some((mp, md)) = metal.as_ref() else {
-                        return;
-                    };
                     let case = format!("{format} {size:?} load {load} drawn {drawn}");
-                    let m = once(&case, || probe((mp, md), (format, size), (load, drawn)));
-                    holds_metals_rule((format, size), (load, drawn), (&m.0, &m.1));
                     let o = probe((&p, &d), (format, size), (load, drawn));
-                    if o != m {
+                    if !reims_vgpu_core::metal_matches_raw!(&case, o) {
                         let kind = metal2vulkan_runtime::Degradation::DontCareLoadTiles;
                         assert!(load == DONT_CARE && heard(kind), "{case}: off Metal's");
                         differ.push(case);

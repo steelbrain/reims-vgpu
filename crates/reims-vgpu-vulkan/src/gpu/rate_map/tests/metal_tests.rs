@@ -1,14 +1,8 @@
 //! The tests of `rate_map` that compare with Metal on this host: macOS only.
 
 use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_metal::MetalPlatform;
 
 use super::*;
-
-/// Metal's platform and device, when the host has Metal.
-fn metal() -> Option<(MetalPlatform, <MetalPlatform as Platform>::Device)> {
-    MetalPlatform::system_default_device().map(|d| (MetalPlatform::new(), d))
-}
 
 /// A layer descriptor is nil for a count of 0 on either axis, else of zeroed samples and
 /// that count, depth 0; a map descriptor counts its layers from 0 to the first index with
@@ -51,9 +45,7 @@ fn layers_and_descriptors_answer_as_on_metal() {
     }
     let vulkan = answers(&platform());
     assert_eq!(vulkan[..3], [u64::MAX; 3]);
-    if let Some((mp, _)) = metal() {
-        assert_eq!(answers(&mp), vulkan);
-    }
+    reims_vgpu_core::metal_check!("answers", vulkan);
 }
 
 /// A map's answers: an immutable one's compiled at creation, a mutable one's of no
@@ -113,16 +105,13 @@ fn maps_answer_as_on_metal() {
             1.0, 1.0, 0.0, 0.0, 1.0, 32.0, 32.0, 1.0, 24624.0, 4.0, 0.0, 0.0
         ]
     );
-    if let Some((mp, md)) = metal() {
-        let metal = answers(&mp, &md);
-        let bits = |answers: &[Vec<f64>]| -> Vec<Vec<u64>> {
-            answers
-                .iter()
-                .map(|a| a.iter().map(|x| x.to_bits()).collect())
-                .collect()
-        };
-        assert_eq!(bits(&metal), bits(&vulkan), "{metal:?} {vulkan:?}");
-    }
+    let bits = |answers: &[Vec<f64>]| -> Vec<Vec<u64>> {
+        answers
+            .iter()
+            .map(|a| a.iter().map(|x| x.to_bits()).collect())
+            .collect()
+    };
+    reims_vgpu_core::metal_check!("bits", bits(&vulkan));
 }
 
 /// The parameter copy writes Metal's 24,624 bytes at its offset, byte for byte as Metal's:
@@ -161,13 +150,9 @@ fn the_parameter_copy_is_metals() {
     for bytes in &compiled {
         assert!(around(bytes));
     }
-    if let Some((mp, md)) = metal() {
-        assert!(copied(&mp, &md, 0.1, true) == unset, "a map not yet reset");
-        for (quality, ours) in [1.0, 0.1].into_iter().zip(&compiled) {
-            let theirs = copied(&mp, &md, quality, false);
-            let differ = theirs.iter().zip(ours).filter(|(a, b)| a != b).count();
-            assert_eq!(differ, 0, "quality {quality}");
-        }
+    reims_vgpu_core::metal_check_bytes!("unset", &unset);
+    for (quality, ours) in [1.0, 0.1].into_iter().zip(&compiled) {
+        reims_vgpu_core::metal_check_bytes!(format!("quality {quality}"), ours);
     }
 }
 
@@ -175,7 +160,7 @@ fn the_parameter_copy_is_metals() {
 /// compiled map's reset, which compiles over the tables the map held, as Metal makes it: its
 /// layer count is 0, its parameter data Metal's byte for byte, and its physical sizes at
 /// layers 0 and 1 Metal's; its coordinate maps die at their selectors, where Metal ends the
-/// process, which Metal's side does not run
+/// process
 #[test]
 fn maps_of_no_layers_are_made_as_metals() {
     /// What `P` answers of a map of no layers made from an immutable descriptor, of a mutable
@@ -231,12 +216,9 @@ fn maps_of_no_layers_are_made_as_metals() {
             .unwrap_err();
         assert_eq!(site.file, "mapPhysicalToScreenCoordinates:forLayer:");
     }
-    if let Some((mp, md)) = metal() {
-        let (theirs, _maps) = made(&mp, &md);
-        let which = ["immutable", "reset", "compiled and reset"];
-        for (which, (o, t)) in which.iter().zip(ours.iter().zip(&theirs)) {
-            assert_eq!(o[..7], t[..7], "{which}: layer count and physical sizes");
-            assert!(o[7..] == t[7..], "{which}: the parameter copy");
-        }
+    let which = ["immutable", "reset", "compiled and reset"];
+    for (which, o) in which.iter().zip(&ours) {
+        reims_vgpu_core::metal_check!(format!("{which}: sizes"), &o[..7]);
+        reims_vgpu_core::metal_check_raw!(format!("{which}: copy"), o[7..]);
     }
 }

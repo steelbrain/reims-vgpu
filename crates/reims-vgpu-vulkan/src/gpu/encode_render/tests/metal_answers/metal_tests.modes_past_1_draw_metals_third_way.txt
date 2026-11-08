@@ -1,0 +1,2 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+Vertices(3, 1, 9, 1): the third way	bytes 1032 5233b525f29802ce7ed3801ece167785 0001000000000000000000ff000000ff000000ff000000ff000000ff000000ff

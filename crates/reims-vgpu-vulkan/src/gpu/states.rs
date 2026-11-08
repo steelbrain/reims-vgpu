@@ -675,17 +675,16 @@ pub(crate) fn new_mesh_render_pipeline_state_full(
     )
 }
 
-/// The refusal of a mesh render pipeline whose stage function is of another stage's type, as the
-/// Metal platform refuses it before Metal sees the descriptor (`reims-vgpu-metal`'s
-/// `wrong_mesh_stage`): Metal on the M3 Max (macOS 27.0.1) ends the process with SIGSEGV at a
-/// vertex function as the mesh function, a mesh function as the fragment function and a fragment
-/// function as the object function, and refuses an object function as the mesh function and a
-/// mesh function as the object function (measured by the graphics lane's `oracle_mesh`). A
-/// guest's input never ends the host, so each is refused in the compiler's domain: code 2 for a
-/// vertex function as the mesh function, code 1 for the rest, the mesh function's type asked
-/// first, then the object function's, then the fragment function's, so both platforms answer
-/// one descriptor alike. A function whose type the runtime does not answer
-/// ([`rt::Function::function_type`]'s refusal) is left to the runtime's creation.
+/// The refusal of a mesh render pipeline whose stage function is of another stage's type, before
+/// the runtime sees the descriptor: Metal on the M3 Max (macOS 27.0.1) ends the process with
+/// SIGSEGV at a vertex function as the mesh function, a mesh function as the fragment function
+/// and a fragment function as the object function, and refuses an object function as the mesh
+/// function and a mesh function as the object function (measured by the graphics lane's
+/// `oracle_mesh`). A guest's input never ends the host, so each is refused in the compiler's
+/// domain: code 2 for a vertex function as the mesh function, code 1 for the rest, the mesh
+/// function's type asked first, then the object function's, then the fragment function's. A
+/// function whose type the runtime does not answer ([`rt::Function::function_type`]'s refusal)
+/// is left to the runtime's creation.
 fn wrong_mesh_stage(
     sel: &'static str,
     desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
@@ -1985,8 +1984,7 @@ mod tests {
     }
 
     /// Any depth-stencil value is a state; below Apple10 its resource ID is plain Metal's, 0, and
-    /// its resource index raises, as Metal's do on the M3 Max (the Metal platform's
-    /// `depth_stencil_state_getters_raise`)
+    /// its resource index raises, as Metal's do on the M3 Max
     #[test]
     fn depth_stencil_states_are_made_and_their_ids_raise() {
         let d = dev();
@@ -2248,8 +2246,7 @@ mod tests {
     }
 
     /// A rasterizing render state whose vertex function returns nothing is Metal's
-    /// (metal2vulkan's measurement on the M3 Max, macOS 27.0.1, and the Metal platform's
-    /// `opengl_mode_makes_a_rasterizing_void_vertex_state`): the `NSError` of code 3
+    /// (metal2vulkan's measurement on the M3 Max, macOS 27.0.1): the `NSError` of code 3
     /// (`RasterizedVoidVertex`) outside OpenGL mode, with or without a fragment function, and
     /// made in it
     #[test]

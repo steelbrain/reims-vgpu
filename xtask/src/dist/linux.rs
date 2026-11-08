@@ -1,4 +1,4 @@
-//! `cargo xtask dist` on Linux: the library on the Vulkan platform, the only one Linux builds.
+//! `cargo xtask dist` on Linux: the library on the Vulkan platform, its only one.
 //! The shared library is `lib/libreims_vgpu.so`, whose soname is its own name; nothing is signed
 //! and nothing has an install name. `Libs.private` is what rustc prints for linking the archive
 //! (`--print native-static-libs`).
@@ -19,12 +19,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{LIB, Options, Platform, c_api_args, install, layout, pc_file, strs, strs_with, write};
+use super::{LIB, Options, c_api_args, install, layout, pc_file, strs, strs_with, write};
 use crate::tools::Tools;
 use crate::util::Res;
 
-/// The platform `dist` builds when `--platform` names none: Vulkan, the only one on Linux.
-pub const DEFAULT_PLATFORM: Platform = Platform::Vulkan;
 /// The shared library's extension: `lib/libreims_vgpu.so`.
 pub const SHARED_LIBRARY_EXTENSION: &str = "so";
 
@@ -84,13 +82,6 @@ pub fn native_static_libs(cargo: &str) -> Res<Vec<String>> {
 /// Builds and writes the tree with `tools`; `header` is the committed header. Returns the output
 /// directory.
 pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path) -> Res<PathBuf> {
-    if o.platform == Platform::Metal {
-        return Err(
-            "--platform metal: the Metal platform is macOS only; on Linux the library is built \
-             on Vulkan, the default"
-                .to_owned(),
-        );
-    }
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     tools.run(&cargo, &cargo_args(o))?;
     let built = target_dir.join(o.profile.dir());
@@ -222,10 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_args_defaults_to_vulkan() {
+    fn parse_args_defaults() {
         let o = parse_args(&[], Path::new("/t")).unwrap();
         assert_eq!(o.profile, Profile("release".into()));
-        assert_eq!(o.platform, Platform::Vulkan);
         assert_eq!(o.out, PathBuf::from("/t/dist-vulkan"));
     }
 
@@ -233,7 +223,7 @@ mod tests {
     fn cargo_args_build_the_c_api_crate_with_its_soname() {
         assert_eq!(
             cargo_args(&options(&[], Path::new("/t"))).join(" "),
-            "rustc --profile release -p reims-vgpu-c --lib --features reims-vgpu-c/vulkan \
+            "rustc --profile release -p reims-vgpu-c --lib \
              -- -C link-arg=-Wl,-soname,libreims_vgpu.so"
         );
     }
@@ -242,7 +232,7 @@ mod tests {
     fn static_libs_args_build_the_archive_alone_and_print_its_libraries() {
         assert_eq!(
             static_libs_args(&options(&["--profile", "dev"], Path::new("/t"))).join(" "),
-            "rustc --profile dev -p reims-vgpu-c --lib --features reims-vgpu-c/vulkan \
+            "rustc --profile dev -p reims-vgpu-c --lib \
              --crate-type staticlib --message-format json -- --print native-static-libs"
         );
     }
@@ -437,17 +427,5 @@ mod tests {
             strs(&["rvg_graphics_device_create", "rvg_status_message"])
         );
         assert_eq!(defined_globals(""), Vec::<String>::new());
-    }
-
-    #[test]
-    fn dist_refuses_metal_before_building() {
-        let (root, target, header) = built("refusals");
-        let mut log = Log::default();
-        let metal = options(&["--platform", "metal"], &target);
-        let e = dist(&mut log, &metal, &target, &header).unwrap_err();
-        assert!(e.contains("--platform metal"), "{e}");
-        assert!(log.calls.is_empty(), "{:?}", log.calls);
-        assert!(!metal.out.exists());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

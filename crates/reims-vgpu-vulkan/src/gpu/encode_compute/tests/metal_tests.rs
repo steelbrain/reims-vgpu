@@ -1,7 +1,6 @@
 //! The tests of `encode_compute` that compare with Metal on this host: macOS only.
 
 use reims_vgpu_core::platform::resource::ComputePipeline;
-use reims_vgpu_metal::MetalPlatform;
 
 use super::*;
 
@@ -47,15 +46,6 @@ fn libraries_and_functions() {
         assert_eq!((e.domain.as_str(), e.code), ("MTLLibraryErrorDomain", 1));
         assert!(e.description.contains("\"Invalid library file\""), "{e:?}");
     }
-    // Metal's text may say more ("Invalid library file (unexpected end of file)").
-    let Some(metal) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    for bytes in refused {
-        let e = metal.new_library(bytes).unwrap().unwrap_err();
-        assert_eq!((e.domain.as_str(), e.code), ("MTLLibraryErrorDomain", 1));
-        assert!(e.description.contains("\"Invalid library file"), "{e:?}");
-    }
 }
 
 /// A pipeline of a function answers its getters as Metal's does on this host; a nil function
@@ -74,16 +64,8 @@ fn pipelines_of_functions() {
         .map(|&(bytes, name)| answers(&pipeline(bytes, name)))
         .collect();
     assert_eq!(ours[2].4, 256, "tg_static's 64 words");
-    if let Some(metal) = MetalPlatform::system_default_device() {
-        for (&(bytes, name), ours) in kernels.iter().zip(&ours) {
-            let lib = metal.new_library(bytes).unwrap().unwrap().unwrap();
-            let f = lib.new_function(OnFault::Return, name).unwrap().unwrap();
-            let p = metal
-                .new_compute_pipeline_state_for_function(Some(&f))
-                .unwrap()
-                .unwrap();
-            assert_eq!(*ours, answers(&p), "{name}");
-        }
+    for (&(_, name), ours) in kernels.iter().zip(&ours) {
+        reims_vgpu_core::metal_check!(name, ours);
     }
     let sel = "newComputePipelineStateWithFunction:error:";
     let site = catch_death(|| dev().new_compute_pipeline_state_for_function(None)).unwrap_err();
@@ -189,18 +171,11 @@ fn encoders_of_pass_descriptors() {
         // SAFETY: the Shared buffer's 4 words, read after the GPU's writes completed.
         unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u32>(), 4) }.to_vec()
     }
-    let metal = MetalPlatform::system_default_device();
     for dispatch_type in [2, 3, 7, 0x8000_0000, 0xffff_ffff] {
         assert_eq!(
             unknown_type::<VulkanPlatform>(&dev(), dispatch_type),
             [2, 3, 4, 5]
         );
-        if let Some(md) = &metal {
-            assert_eq!(
-                unknown_type::<MetalPlatform>(md, dispatch_type),
-                [2, 3, 4, 5]
-            );
-        }
     }
     let site = catch_death(|| {
         command_buffer().compute_encoder_for_pass(&ComputePassDesc {
@@ -411,15 +386,11 @@ fn a_units_first_indirect_dispatch_of_another_type_dies() {
             Encoder(CONCURRENT, Groups),
         ],
     ];
-    let metal = MetalPlatform::system_default_device();
     for parts in goes_on {
         assert_eq!(
             unit::<VulkanPlatform>(&dev(), parts),
             [2, 3, 4, 5],
             "{parts:?}"
         );
-        if let Some(md) = &metal {
-            assert_eq!(unit::<MetalPlatform>(md, parts), [2, 3, 4, 5], "{parts:?}");
-        }
     }
 }

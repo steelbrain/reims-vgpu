@@ -8494,27 +8494,18 @@ lacks {part}"
         );
     }
 
-    /// On Metal, from the wire: a kernel that calls `linked_add_one`, which its library only
-    /// declares, is made with the callee library's `linked_add_two` linked as a private function
-    /// made with the specialized name `linked_add_one`, and with `linked_add_one` itself; it is
-    /// refused with `linked_add_two` linked under its own name, and with `linked_add_one` made
-    /// under another
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_linked_function_s_specialized_name_resolves_its_call() {
-        a_linked_function_s_specialized_name_resolves_its_call::<reims_vgpu_metal::MetalPlatform>();
-    }
-
-    /// [`on_metal_a_linked_function_s_specialized_name_resolves_its_call`] on the Vulkan
-    /// platform, whose answers are Metal's
-    #[cfg(vulkan_platform)]
+    /// From the wire: a kernel that calls `linked_add_one`, which its library only declares, is
+    /// made with the callee library's `linked_add_two` linked as a private function made with the
+    /// specialized name `linked_add_one`, and with `linked_add_one` itself; it is refused with
+    /// `linked_add_two` linked under its own name, and with `linked_add_one` made under another,
+    /// as Metal answers
     #[test]
     fn on_vulkan_a_linked_function_s_specialized_name_resolves_its_call() {
         a_linked_function_s_specialized_name_resolves_its_call::<reims_vgpu_vulkan::VulkanPlatform>(
         );
     }
 
-    /// The cases of [`on_metal_a_linked_function_s_specialized_name_resolves_its_call`] on `P`.
+    /// The cases of [`on_vulkan_a_linked_function_s_specialized_name_resolves_its_call`] on `P`.
     fn a_linked_function_s_specialized_name_resolves_its_call<P: crate::platform::ApiPlatform>() {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
@@ -8923,33 +8914,27 @@ lacks {part}"
     }
 
     /// The Vulkan crate's metallibs of the shell tests' stitchable functions and of the library
-    /// Metal's stitcher makes of them (its build.rs, `stitched`), which a host without Metal takes.
+    /// Metal's stitcher makes of them (that crate's build.rs, `stitched`), which a host without
+    /// Metal takes.
     const COMMITTED_STITCHED: [&[u8]; 2] = [
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/stitchable.metallib"),
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/stitched.metallib"),
     ];
 
-    /// On Metal, a guest's stitched library is a library like any other: the library Metal's
-    /// stitcher made in the guest, sent as its bytes, gives a function `stitch_caller`'s pipeline
-    /// links from either list, as Metal's own does, and the pipeline writes what Metal's writes;
-    /// with nothing linked, it is refused, as Metal refuses it. The Vulkan crate's committed
-    /// stitched metallibs get the same answers
+    /// On a Mac, a guest's stitched library is a library like any other: the library Metal's
+    /// stitcher makes here, as in the guest, sent as its bytes, gives a function
+    /// `stitch_caller`'s pipeline links from either list, as Metal's own does, and the pipeline
+    /// writes what Metal's writes; with nothing linked, it is refused, as Metal refuses it
     #[cfg(target_os = "macos")]
     #[test]
-    fn on_metal_a_stitched_function_links_and_computes_as_metal_s() {
-        use reims_vgpu_metal::MetalPlatform;
+    fn made_here_a_stitched_function_links_and_computes_as_metal_s() {
         let s = stitched_on_metal();
         let metal = metal_s_own_stitched_links(&s, "stitch_caller", "fused");
         assert_eq!(metal, [Some(20.0), Some(20.0), None]);
         let made = (s.caller_bytes.as_slice(), s.stitched_bytes.as_slice());
         assert_eq!(
-            stitched_links_through_the_decoder::<MetalPlatform>(made, "stitch_caller", "fused"),
-            metal
-        );
-        let [caller, stitched] = COMMITTED_STITCHED;
-        assert_eq!(
-            stitched_links_through_the_decoder::<MetalPlatform>(
-                (caller, stitched),
+            stitched_links_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(
+                made,
                 "stitch_caller",
                 "fused"
             ),
@@ -8957,32 +8942,22 @@ lacks {part}"
         );
     }
 
-    /// On Metal, a stitched function of fewer parameters than its call passes arguments links
+    /// On a Mac, a stitched function of fewer parameters than its call passes arguments links
     /// and computes: `stitch_caller_extra` calls `pair` with three arguments, Metal's stitcher
     /// makes it of the two its graph takes, and Metal's own pipeline drops the third and writes
     /// 2 + 3 from either list, as MPS's reduce_stitched calls the write_fn it stitches of two
-    /// inputs with three. A guest's stitched library, sent as its bytes, gets the same answers
-    /// through the decoder, and so do the Vulkan crate's committed stitched metallibs
+    /// inputs with three. The library stitched here, sent as its bytes, gets the same answers
+    /// through the decoder
     #[cfg(target_os = "macos")]
     #[test]
-    fn on_metal_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes() {
-        use reims_vgpu_metal::MetalPlatform;
+    fn made_here_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes() {
         let s = stitched_on_metal();
         let metal = metal_s_own_stitched_links(&s, "stitch_caller_extra", "pair");
         assert_eq!(metal, [Some(5.0), Some(5.0), None]);
         let made = (s.caller_bytes.as_slice(), s.stitched_bytes.as_slice());
         assert_eq!(
-            stitched_links_through_the_decoder::<MetalPlatform>(
+            stitched_links_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(
                 made,
-                "stitch_caller_extra",
-                "pair"
-            ),
-            metal
-        );
-        let [caller, stitched] = COMMITTED_STITCHED;
-        assert_eq!(
-            stitched_links_through_the_decoder::<MetalPlatform>(
-                (caller, stitched),
                 "stitch_caller_extra",
                 "pair"
             ),
@@ -8991,12 +8966,11 @@ lacks {part}"
     }
 
     /// On the Vulkan platform, a guest's stitched library gets Metal's answers
-    /// (`on_metal_a_stitched_function_links_and_computes_as_metal_s`): the runtime links the
+    /// (`made_here_a_stitched_function_links_and_computes_as_metal_s`): the runtime links the
     /// function Metal's stitcher made like any other, from either list, and the pipeline writes
     /// 20; with nothing linked, it is refused. The one linked signature the runtime still refuses
     /// (Unsupported, Feature::Linking), a linked-constants signature on a module that still
     /// declares function constants, is not this library's: it declares none
-    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_stitched_function_links_and_computes_as_metal_s() {
         let [caller, stitched] = COMMITTED_STITCHED;
@@ -9011,11 +8985,10 @@ lacks {part}"
     }
 
     /// On the Vulkan platform, a stitched function of fewer parameters than its call gets Metal's
-    /// answers (`on_metal_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes`):
+    /// answers (`made_here_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes`):
     /// the runtime links `pair`, made of the two parameters its graph takes, to
     /// `stitch_caller_extra`'s call of three by position, drops the third, and the pipeline writes
     /// 2 + 3 from either list; with nothing linked, it is refused
-    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes() {
         let [caller, stitched] = COMMITTED_STITCHED;
@@ -9161,24 +9134,10 @@ lacks {part}"
         ]
     }
 
-    /// On Metal, from the wire: a kernel that declares a function constant, sent with none, as
-    /// the guest sends a function made with constant values that set none of its constants, is
-    /// made, and reads it as undefined (7), as Metal makes one of such values; sent with it, it
-    /// reads its value (5)
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_stage_function_sent_with_no_constants_is_made_with_them_undefined() {
-        let cases = optional_constant_cases();
-        let cases: Vec<&[RgfxFunctionConstant]> = cases.iter().map(Vec::as_slice).collect();
-        assert_eq!(
-            optional_constant_through_the_decoder::<reims_vgpu_metal::MetalPlatform>(&cases),
-            [Some(7), Some(5)]
-        );
-    }
-
-    /// [`on_metal_a_stage_function_sent_with_no_constants_is_made_with_them_undefined`] on the
-    /// Vulkan platform, whose answers are Metal's
-    #[cfg(vulkan_platform)]
+    /// From the wire: a kernel that declares a function constant, sent with none, as the guest
+    /// sends a function made with constant values that set none of its constants, is made, and
+    /// reads it as undefined (7), as Metal makes one of such values; sent with it, it reads its
+    /// value (5)
     #[test]
     fn on_vulkan_a_stage_function_sent_with_no_constants_is_made_with_them_undefined() {
         let cases = optional_constant_cases();
@@ -9580,9 +9539,8 @@ lacks {part}"
     }
 
     /// Metal's answer to [`ycbcr_through_the_decoder`]'s probe of the same bytes over a real
-    /// 'x420' surface of BT.2020 (`on_metal_a_505_texture_over_an_x420_surface_samples_as_recorded`,
-    /// an Apple M3 Max under macOS 27.0.1): each sample's red, green and blue, as their bits,
-    /// in the grid's rows; every alpha is 1.
+    /// 'x420' surface of BT.2020, recorded on an Apple M3 Max under macOS 27.0.1: each sample's
+    /// red, green and blue, as their bits, in the grid's rows; every alpha is 1.
     const METAL_505: [[u32; 3]; 40] = [
         [0x3f800000, 0x3f16c000, 0x00000000],
         [0x3e1b8000, 0x3f0d0000, 0x3e398000],
@@ -9626,66 +9584,9 @@ lacks {part}"
         [0x3e728000, 0x3f800000, 0x3f194000],
     ];
 
-    /// On Metal, a texture over a surface's plane of BGRA8 or RGBA16F answers alike by the
-    /// buffer's creator over the guest's copy of a surface without planes, and by Metal's own
-    /// IOSurface creator over a real surface of the same bytes and rows, as the Metal platform's
-    /// IOSurface route over the copy (the buffer's creator) does: so its answers stay the
-    /// buffer's on the Vulkan platform too (`on_vulkan_surface_textures_without_planes_are_the_buffer_s`).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_surface_textures_without_planes_are_the_buffer_s() {
-        use reims_vgpu_core::platform::os::surface::{Surface as _, SurfaceSpec};
-        use reims_vgpu_metal::MetalPlatform;
-
-        use crate::platform::ApiPlatform as _;
-        let answers = surface_textures_without_planes::<MetalPlatform>();
-        let platform = MetalPlatform::process();
-        let device = platform.metal_device(None).unwrap();
-        for (&(format, ostype, texel), [from_buffer, from_surface]) in
-            PIN_CASES.iter().zip(&answers)
-        {
-            assert_eq!(from_buffer, from_surface, "{format}");
-            let spec = SurfaceSpec {
-                pixel_format: u32::from_be_bytes(*ostype),
-                alloc_size: 0x4000,
-                width: PIN_SIZE.0,
-                height: PIN_SIZE.1,
-                bytes_per_element: texel,
-                bytes_per_row: PIN_ROW,
-                element_width: 1,
-                element_height: 1,
-                ..SurfaceSpec::default()
-            };
-            let surface = platform.surfaces().create(&spec).unwrap();
-            assert_eq!(surface.bytes_per_row(), PIN_ROW);
-            let bytes = pin_bytes();
-            // SAFETY: the surface's allocation holds its rows, which no command uses yet.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    surface.base_address().as_ptr::<u8>(),
-                    bytes.len(),
-                )
-            };
-            let desc = surface_desc(format, PIN_SIZE);
-            let descriptor = platform.texture_descriptor(&TextureDesc {
-                resource_index: None,
-                ..texture_desc(&desc, 0)
-            });
-            let own = device
-                .new_texture_on_surface(&descriptor, Some(&surface), 0)
-                .unwrap()
-                .unwrap();
-            let metal = texture_answer::<MetalPlatform>(&device, &own, PIN_SIZE);
-            assert_eq!(&metal, from_buffer, "{format}");
-        }
-    }
-
     /// On the Vulkan platform, a texture of BGRA8 or RGBA16F over the guest's copy of a surface
     /// without planes answers by the runtime's IOSurface creator what it answers by the buffer's
     /// creator, as Metal's own two creators answer alike
-    /// (`on_metal_surface_textures_without_planes_are_the_buffer_s`)
-    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_surface_textures_without_planes_are_the_buffer_s() {
         let answers = surface_textures_without_planes::<reims_vgpu_vulkan::VulkanPlatform>();
@@ -9778,137 +9679,10 @@ lacks {part}"
     }
 
     /// [`sampler_create_cost`] on the Vulkan platform.
-    #[cfg(vulkan_platform)]
     #[test]
     #[ignore = "a measurement, run by hand"]
     fn on_vulkan_sampler_create_cost_by_live_samplers() {
         sampler_create_cost::<reims_vgpu_vulkan::VulkanPlatform>();
-    }
-
-    /// [`sampler_create_cost`] on Metal.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "a measurement, run by hand"]
-    fn on_metal_sampler_create_cost_by_live_samplers() {
-        sampler_create_cost::<reims_vgpu_metal::MetalPlatform>();
-    }
-
-    /// On Metal, a texture of 505 over plane 0 of a real 'x420' surface of BT.2020 holding the
-    /// bundle's copy's bytes, at its planes' offsets and rows, samples through a linear sampler
-    /// as recorded ([`METAL_505`]), every alpha 1. Through the decoder the Metal platform refuses
-    /// the create: Metal makes no texture over a surface's plane from a buffer's bytes, and the
-    /// host holds no surface, only the guest's copy of it.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_505_texture_over_an_x420_surface_samples_as_recorded() {
-        use std::ffi::c_void;
-
-        use reims_vgpu_core::platform::os::surface::{Surface as _, SurfacePlaneSpec, SurfaceSpec};
-        use reims_vgpu_metal::MetalPlatform;
-
-        use crate::platform::ApiPlatform as _;
-        // The guest's route first, which keeps the guest's texture ids on the device before any
-        // texture is made on it.
-        assert_eq!(ycbcr_through_the_decoder::<MetalPlatform>(), None);
-        #[link(name = "IOSurface", kind = "framework")]
-        unsafe extern "C" {
-            fn IOSurfaceSetValue(buffer: *const c_void, key: *const c_void, value: *const c_void);
-        }
-        #[link(name = "CoreFoundation", kind = "framework")]
-        unsafe extern "C" {
-            fn CFStringCreateWithBytes(
-                alloc: *const c_void,
-                bytes: *const u8,
-                num_bytes: isize,
-                encoding: u32,
-                is_external_representation: u8,
-            ) -> *const c_void;
-            fn CFRelease(cf: *const c_void);
-        }
-        // A UTF-8 CFString of `s`, +1.
-        let cf_string = |s: &str| {
-            // SAFETY: `s`'s bytes, live for the call, which copies them.
-            unsafe {
-                CFStringCreateWithBytes(
-                    std::ptr::null(),
-                    s.as_ptr(),
-                    s.len() as isize,
-                    0x0800_0100,
-                    0,
-                )
-            }
-        };
-        let platform = MetalPlatform::process();
-        let device = platform.metal_device(None).unwrap();
-        let (width, height) = YCBCR_SIZE;
-        let plane = |offset, (width, height): (u64, u64), element| SurfacePlaneSpec {
-            base: offset,
-            offset,
-            width,
-            height,
-            size: YCBCR_ROW * height,
-            bytes_per_row: YCBCR_ROW,
-            bytes_per_element: element,
-            element_width: 1,
-            element_height: 1,
-            ..SurfacePlaneSpec::default()
-        };
-        let spec = SurfaceSpec {
-            planes: Some(vec![
-                plane(0, YCBCR_SIZE, 2),
-                plane(YCBCR_CHROMA_AT, (width / 2, height / 2), 4),
-            ]),
-            pixel_format: u32::from_be_bytes(*b"x420"),
-            alloc_size: 0x4000,
-            width,
-            height,
-            bytes_per_element: 2,
-            bytes_per_row: YCBCR_ROW,
-            element_width: 1,
-            element_height: 1,
-            ..SurfaceSpec::default()
-        };
-        let surface = platform.surfaces().create(&spec).unwrap();
-        assert_eq!(surface.plane_count(), 2);
-        let ptr = std::ptr::with_exposed_provenance::<c_void>(surface.id().0 as usize);
-        let (key, value) = (cf_string("IOSurfaceYCbCrMatrix"), cf_string("ITU_R_2020"));
-        // SAFETY: the surface's IOSurfaceRef (its handle's id), live while `surface` is, and two
-        // CFStrings, released after the call, which retains what it keeps.
-        unsafe {
-            IOSurfaceSetValue(ptr, key, value);
-            CFRelease(key);
-            CFRelease(value);
-        }
-        let bytes = ycbcr_bytes();
-        // SAFETY: the surface's allocation holds both planes, which no command uses yet.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                surface.base_address().as_ptr::<u8>(),
-                bytes.len(),
-            )
-        };
-        let desc = surface_desc(505, YCBCR_SIZE);
-        let descriptor = platform.texture_descriptor(&TextureDesc {
-            resource_index: None,
-            ..texture_desc(&desc, 0)
-        });
-        let own = device
-            .new_texture_on_surface(&descriptor, Some(&surface), 0)
-            .unwrap()
-            .unwrap();
-        let sampler = linear_sampler::<MetalPlatform>(&device);
-        let probe = ycbcr_probe();
-        let read = (Some(&sampler), Some(&probe[..]));
-        let metal =
-            kernel_reads::<MetalPlatform>(&device, "sample_texels_float", &own, YCBCR_GRID, read);
-        let bits: Vec<[u32; 3]> = metal
-            .iter()
-            .map(|t| [t[0], t[1], t[2]].map(f32::to_bits))
-            .collect();
-        eprintln!("METAL_505 = {bits:#010x?}");
-        assert!(metal.iter().all(|t| t[3] == 1.0), "{metal:?}");
-        assert_eq!(bits, METAL_505);
     }
 
     /// On the Vulkan platform, the 505 texture WindowServer composites the wallpaper's video
@@ -9918,7 +9692,6 @@ lacks {part}"
     /// of the sampling is printed: on a native device nothing of [`reims_vgpu_vulkan::answer::DIES`]
     /// is relayed but what a native device relays (`DeviceSampling` among them); on MoltenVK,
     /// Metal's own sampler's filter of the converted texels is `YCbCrFilterNotExact`'s, relayed.
-    #[cfg(vulkan_platform)]
     #[test]
     fn on_vulkan_a_505_texture_over_the_bundle_s_copy_samples_as_metal_s() {
         use reims_vgpu_vulkan::answer::{self, native};

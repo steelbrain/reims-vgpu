@@ -7,7 +7,6 @@ use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _, Texture as _};
 use reims_vgpu_core::platform::types::{SizeAndAlign, Swizzle};
 use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_metal::MetalPlatform;
 
 use super::*;
 use crate::os::tests::bgra_surface;
@@ -192,7 +191,6 @@ fn textures_but_over_a_surface_are_nil_as_metals_are() {
     ];
     let d = dev();
     let platform = platform();
-    let md = MetalPlatform::system_default_device();
     for format in two_plane_formats() {
         for (what, change) in nil {
             let desc = ycbcr(format, change);
@@ -207,21 +205,13 @@ fn textures_but_over_a_surface_are_nil_as_metals_are() {
             let align = if desc.texture_type == 3 { 128 } else { 16 };
             let expected = (format, [false; 13], SizeAndAlign { size: 0, align });
             assert_eq!(answered, expected, "{format} {what}");
-            if let Some(md) = &md {
-                let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-                assert_eq!(
-                    answers::<MetalPlatform>(md, &metal, storage),
-                    answered,
-                    "Metal: {format} {what}"
-                );
-            }
         }
     }
 }
 
 /// Every creator but the IOSurface one and `newSharedTextureWithDescriptor:` dies where
-/// Metal's validation asserts (measured with 505 and 543: the module's docs; Metal's side
-/// cannot run, as its assert ends the process), and that one answers nil, as Metal's does:
+/// Metal's validation asserts (measured with 505 and 543: the module's docs), and that one
+/// answers nil, as Metal's does:
 /// of each two-plane format, where the runtime answers no texture first for one it has
 #[test]
 fn textures_but_over_a_surface_die_where_metal_asserts() {
@@ -266,7 +256,6 @@ fn textures_but_over_a_surface_die_where_metal_asserts() {
     type V = crate::platform::VulkanPlatform;
     let d = dev();
     let platform = platform();
-    let md = MetalPlatform::system_default_device();
     let b = buffer::<V>(&d);
     let h = heap::<V>(&d, 2);
     for format in two_plane_formats() {
@@ -304,11 +293,6 @@ fn textures_but_over_a_surface_die_where_metal_asserts() {
                 );
             }
             assert!(d.new_shared_texture(&ours).unwrap().is_none(), "{what}");
-            if let Some(md) = &md {
-                let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-                let shared = md.new_shared_texture(&metal).unwrap();
-                assert!(shared.is_none(), "Metal: {format} {what}");
-            }
         }
     }
 }
@@ -329,11 +313,6 @@ fn die_where_made(format: u64) {
     let d = dev();
     let s = bgra_surface(16, 16);
     let desc = ycbcr(format, |_| {});
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-        let made = md.new_texture_on_surface(&metal, Some(&s), 0).unwrap();
-        assert_eq!(made.map(|t| t.pixel_format()), Some(format), "Metal");
-    }
     let ours = platform().texture_descriptor(&desc);
     let site = catch_death(|| d.new_texture_on_surface(&ours, Some(&s), 0)).unwrap_err();
     assert_eq!(
@@ -510,10 +489,8 @@ fn one_plane_textures_are_made_and_copied_as_metals() {
     use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
     use reims_vgpu_core::platform::values::ColorAttachmentSet;
-    let md = MetalPlatform::system_default_device();
     let d = dev();
     let p = platform();
-    let metal = |t: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(t);
     for (format, bytes) in one_plane_copies_only() {
         let private = ycbcr(format, |_| {});
         let shared = ycbcr(format, |d| d.resource_options = Some(0));
@@ -565,20 +542,6 @@ fn one_plane_textures_are_made_and_copied_as_metals() {
             (DeathKind::Abort, "renderCommandEncoderWithDescriptor:"),
             "{format}"
         );
-        let Some(md) = &md else { continue };
-        let (private, shared) = (metal(&private), metal(&shared));
-        let theirs = one_plane_creators::<MetalPlatform>(md, &private, &shared);
-        assert_eq!(theirs, made, "Metal: {format}");
-        let t = md.new_texture(OnFault::Return, &private).unwrap().unwrap();
-        let view = t.new_texture_view(format).unwrap();
-        assert_eq!(
-            view.map(|v| v.pixel_format()),
-            Some(format),
-            "Metal: {format}: a view"
-        );
-        let theirs = [&shared, &private]
-            .map(|desc| one_plane_copies::<MetalPlatform>(md, desc, bytes, &pattern));
-        assert!(theirs == copied, "{format}: copies");
     }
 }
 
@@ -641,9 +604,6 @@ fn one_plane_reads_die_at_the_dispatch() {
         // SAFETY: the buffer's bytes, read after its command buffer completed.
         unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), 16 * 16 * 16) }.to_vec()
     }
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
     let d = dev();
     let p = platform();
     for (format, bytes) in one_plane_copies_only() {
@@ -660,12 +620,6 @@ fn one_plane_reads_die_at_the_dispatch() {
         assert!(
             line.contains("the bind state was refused") && line.contains("feature: Format"),
             "{format}: {line}"
-        );
-        let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-        assert_eq!(
-            read::<MetalPlatform>(&md, &metal, bytes).len(),
-            16 * 16 * 16,
-            "{format}"
         );
     }
 }

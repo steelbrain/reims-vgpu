@@ -1,0 +1,3 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+OneCommandBuffer	bytes 16384 0471743bce33f33322181df7bae6abde 01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3da
+EventAcrossQueues	bytes 16384 0471743bce33f33322181df7bae6abde 01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3da

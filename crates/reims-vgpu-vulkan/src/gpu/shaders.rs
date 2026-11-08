@@ -1,12 +1,11 @@
-//! The library's own shaders on this platform: the metal crate's `shaders.metal` (the display's
-//! present functions and the XR10 paging kernels), compiled by Apple's tools when this crate is
-//! built (`build.rs`) into [`METALLIB`], which [`library`] loads with the runtime's
-//! `new_library_with_data`. Core asks for it as `newLibraryWithSource:options:error:`.
+//! The library's own shaders on this platform: `shaders.metal` (the display's present
+//! functions), compiled by Apple's tools when this crate is built (`build.rs`) into
+//! [`METALLIB`], which [`library`] loads with the runtime's `new_library_with_data`. Core asks
+//! for it as `newLibraryWithSource:options:error:`.
 //!
-//! As on the Metal platform, a library belongs to the device that made it, so the metallib is
-//! loaded once per device, the first time core asks for it (a device's blit pipelines, a
-//! display's pipeline cache, a service task's blit pipelines), and every later ask answers the
-//! same library. Devices are told apart by the registry ID the platform answers for them
+//! As in Metal, a library belongs to the device that made it, so the metallib is loaded once per
+//! device, the first time it is asked for (a display's pipelines), and every later ask answers
+//! the same library. Devices are told apart by the registry ID the platform answers for them
 //! (`device::registry_id`). A loaded library stays for the life of the process; one that fails to
 //! load is not kept, and the next ask loads again.
 
@@ -80,10 +79,8 @@ mod tests {
     use super::*;
     use crate::gpu::device::tests::dev;
 
-    /// The display's and the blits' nine entry points.
-    const FUNCTIONS: [&str; 9] = [
-        "BlitInRGB_2P_XR10_A8",
-        "BlitOutRGB_2P_XR10_A8",
+    /// The display's seven entry points.
+    const FUNCTIONS: [&str; 7] = [
         "displayPresentVertex",
         "displayPresentFragment",
         "displayPresentFragmentWithGammaTableAndColorMatrix",
@@ -99,17 +96,17 @@ mod tests {
             .unwrap_or_else(|e| panic!("no function {name}: {e}"))
     }
 
-    /// The metallib loads as a library of the device holding the nine functions
+    /// The metallib loads as a library of the device holding the seven functions
     #[test]
-    fn the_metallib_loads_with_the_nine_functions() {
+    fn the_metallib_loads_with_the_seven_functions() {
         let d = dev();
         let lib = library(&d).unwrap().unwrap();
         assert_eq!(lib.device.id(), d.id());
         let mut names = lib.raw.function_names();
         names.sort();
-        let mut nine = FUNCTIONS.map(str::to_owned);
-        nine.sort();
-        assert_eq!(names, nine);
+        let mut seven = FUNCTIONS.map(str::to_owned);
+        seven.sort();
+        assert_eq!(names, seven);
     }
 
     /// The metallibs the repository holds for a build without Apple's tools (`metallibs/`,

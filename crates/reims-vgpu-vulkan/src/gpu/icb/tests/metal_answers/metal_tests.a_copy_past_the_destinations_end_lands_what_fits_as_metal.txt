@@ -1,0 +1,8 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+render false 2,1,2	[(64, 10)]
+render false 4,3,2	[(64, 10)]
+render false 4,1,4	[(64, 10), (64, 11), (64, 12)]
+render false 8,5,8	[(64, 10), (64, 11), (64, 12)]
+render false 64,63,64	[(64, 10)]
+render true 2,1,2	[(1, 10)]
+render true 4,3,2	[(1, 10)]

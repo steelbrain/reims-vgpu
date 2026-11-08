@@ -1,7 +1,7 @@
 //! `dont-care-load-tiles`: what a render pass that loads an attachment by `DontCare` leaves in
 //! it, and what a `DontCare` or `MultisampleResolve` store leaves.
 //!
-//! **Metal's rule** (this host, every probe below the same in each of [`RUNS`] runs):
+//! **Metal's rule** (this host, every probe below the same in each of 5 runs):
 //! - A pass's attachments are stored a tile at a time: 32 by 32 pixels at 1 sample, 32 by 16 at
 //!   4. A tile is *reached* where a draw's primitive covers a pixel or sample centre of it (a
 //!   draw of two vertices of a triangle list, and a triangle too small to hold a centre, reach
@@ -52,10 +52,9 @@ use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Platform;
 
 use super::{
-    Aspect, CLEAR, CLEAR_DEPTH, CLEAR_STENCIL, Colour, DEPTH32F, DONT_CARE, Draw, IN_TILE_1_1,
-    LOAD, MULTISAMPLE_RESOLVE, PRIVATE, Pass, RGBA8, RGBA16F, RGBA32F, SHARED, STENCIL8, STORE,
-    STORE_AND_RESOLVE, Shape, Step, buffer, grid, heard, masked_state, metal, once, positions,
-    random_bytes, run, state, texel_bytes, tiles, writing,
+    Aspect, CLEAR, Colour, DEPTH32F, DONT_CARE, Draw, IN_TILE_1_1, LOAD, MULTISAMPLE_RESOLVE,
+    PRIVATE, Pass, RGBA8, RGBA16F, RGBA32F, SHARED, STENCIL8, STORE, STORE_AND_RESOLVE, Shape,
+    Step, buffer, heard, masked_state, positions, random_bytes, run, state, writing,
 };
 use crate::gpu::device::tests::dev;
 use crate::platform::tests::platform;
@@ -174,32 +173,18 @@ fn single<P: Platform>(
     (reads.next().unwrap(), reads.next().unwrap())
 }
 
-/// What a reached tile's undrawn texels hold after a `DontCare` load of `format`: zero, or the
-/// clear value.
-fn fill(format: u64) -> Vec<u8> {
-    match Aspect::of(format) {
-        Aspect::Colour => vec![0; texel_bytes(format)],
-        #[expect(
-            clippy::as_conversions,
-            reason = "the clear depth, 0.25, as Depth32Float"
-        )]
-        Aspect::Depth => (CLEAR_DEPTH as f32).to_le_bytes().to_vec(),
-        Aspect::Stencil => vec![u8::try_from(CLEAR_STENCIL).unwrap()],
-    }
-}
-
 /// Compares this platform's answer to Metal's for each case `probe` names: equal, or with
-/// `dont-care-load-tiles` announced. Answers the cases that differ.
+/// `dont-care-load-tiles` announced. Answers the cases that differ. Metal's answers are the ones
+/// recorded.
 fn against_metal<C: std::fmt::Debug + Copy>(
     cases: &[C],
-    mut theirs: impl FnMut(C) -> Option<(Vec<u8>, Vec<u8>)>,
     mut ours: impl FnMut(C) -> (Vec<u8>, Vec<u8>),
 ) -> Vec<String> {
     let mut differ = Vec::new();
     for &c in cases {
-        let Some(m) = theirs(c) else { continue };
+        let key = format!("{c:?}");
         let o = ours(c);
-        if o != m {
+        if !reims_vgpu_core::metal_matches_raw!(&key, o) {
             assert!(
                 heard(KIND),
                 "{c:?}: off Metal's, with no {} heard",
@@ -223,7 +208,6 @@ fn against_metal<C: std::fmt::Debug + Copy>(
     ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn colour_dont_care_loads_zero_the_reached_tiles_alone() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
     let mut cases = Vec::new();
     for format in [RGBA8, RGBA16F, RGBA32F] {
@@ -247,30 +231,9 @@ fn colour_dont_care_loads_zero_the_reached_tiles_alone() {
         }
     }
     let actions = (DONT_CARE, STORE);
-    let differ = against_metal(
-        &cases,
-        |(shape, earlier, drawn)| {
-            let (mp, md) = metal.as_ref()?;
-            let m = once(&format!("{shape:?} {earlier:?} {drawn:?}"), || {
-                single((mp, md), (shape, earlier), actions, (drawn, false))
-            });
-            let reached: &[(u64, u64)] = if drawn == Drawn::InTile {
-                &[(1, 1)]
-            } else {
-                &[]
-            };
-            let expected = grid(shape.size, (32, 32), reached);
-            let fill = fill(shape.format);
-            let got = tiles(
-                (&m.0, &m.1),
-                (&fill, &[&IN_TILE_1_1]),
-                (shape.size, (32, 32)),
-            );
-            assert_eq!(got, expected, "Metal: {shape:?} {earlier:?} {drawn:?}");
-            Some(m)
-        },
-        |(shape, earlier, drawn)| single((&p, &d), (shape, earlier), actions, (drawn, false)),
-    );
+    let differ = against_metal(&cases, |(shape, earlier, drawn)| {
+        single((&p, &d), (shape, earlier), actions, (drawn, false))
+    });
     eprintln!("off Metal's, dont-care-load-tiles heard: {differ:#?}");
 }
 
@@ -282,7 +245,6 @@ fn colour_dont_care_loads_zero_the_reached_tiles_alone() {
 /// `dont-care-load-tiles`
 #[test]
 fn depth_and_stencil_dont_care_loads_take_the_clear_value_where_the_pass_writes() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
     let mut cases = Vec::new();
     for format in [DEPTH32F, STENCIL8] {
@@ -297,35 +259,11 @@ fn depth_and_stencil_dont_care_loads_take_the_clear_value_where_the_pass_writes(
         }
     }
     let actions = (DONT_CARE, STORE);
-    let differ = against_metal(
-        &cases,
-        |(shape, earlier, drawn)| {
-            let (mp, md) = metal.as_ref()?;
-            let m = once(&format!("{shape:?} {earlier:?} {drawn:?}"), || {
-                single((mp, md), (shape, earlier), actions, drawn)
-            });
-            let reached: &[(u64, u64)] = if drawn == (Drawn::InTile, true) {
-                &[(1, 1)]
-            } else {
-                &[]
-            };
-            let expected = grid(shape.size, (32, 32), reached);
-            let fill = fill(shape.format);
-            let got = tiles(
-                (&m.0, &m.1),
-                (&fill, &[&IN_TILE_1_1]),
-                (shape.size, (32, 32)),
-            );
-            assert_eq!(got, expected, "Metal: {shape:?} {earlier:?} {drawn:?}");
-            Some(m)
-        },
-        |(shape, earlier, drawn)| single((&p, &d), (shape, earlier), actions, drawn),
-    );
+    let differ = against_metal(&cases, |(shape, earlier, drawn)| {
+        single((&p, &d), (shape, earlier), actions, drawn)
+    });
     eprintln!("off Metal's, dont-care-load-tiles heard: {differ:#?}");
 }
-
-/// Tiles of a grid, each `(x, y)`.
-type Tiles = &'static [(u64, u64)];
 
 /// A triangle inside tile (0, 0).
 const TILE_0_0: [(f32, f32); 3] = [(4.0, 4.0), (24.0, 4.0), (4.0, 24.0)];
@@ -391,29 +329,11 @@ fn colour_and_depth<P: Platform>(
 /// This platform's answer is Metal's, or the runtime announced `dont-care-load-tiles`
 #[test]
 fn a_depth_dont_care_load_clears_the_reached_tiles_once_the_pass_writes_depth() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
-    let size = (64, 64);
-    let zero = fill(RGBA8);
-    let clear = fill(DEPTH32F);
-    // The colour's reached tiles and the depth's, of each shape.
-    let shapes: [((bool, bool), Tiles, Tiles); 3] = [
-        ((false, false), &[(1, 1)], &[]),
-        ((true, false), &[(1, 1)], &[(1, 1)]),
-        ((true, true), &[(0, 0), (1, 1)], &[(0, 0), (1, 1)]),
-    ];
     let mut differ = Vec::new();
-    for (draws, colour_tiles, depth_tiles) in shapes {
-        let Some((mp, md)) = metal.as_ref() else {
-            break;
-        };
-        let m = once(&format!("{draws:?}"), || colour_and_depth((mp, md), draws));
-        let drawn: &[&[(f32, f32)]] = &[&IN_TILE_1_1, &TILE_0_0];
-        let colour = tiles((&m[0], &m[2]), (&zero, drawn), (size, (32, 32)));
-        let depth = tiles((&m[1], &m[3]), (&clear, drawn), (size, (32, 32)));
-        assert_eq!(colour, grid(size, (32, 32), colour_tiles), "{draws:?}");
-        assert_eq!(depth, grid(size, (32, 32), depth_tiles), "{draws:?}");
-        if colour_and_depth((&p, &d), draws) != m {
+    for draws in [(false, false), (true, false), (true, true)] {
+        let key = format!("{draws:?}");
+        if !reims_vgpu_core::metal_matches_raw!(&key, colour_and_depth((&p, &d), draws)) {
             assert!(
                 heard(KIND),
                 "{draws:?}: off Metal's, with no {} heard",
@@ -471,26 +391,11 @@ fn two_colours<P: Platform>((p, d): (&P, &P::Device), mask: Option<u32>) -> [Vec
 /// announced `dont-care-load-tiles`
 #[test]
 fn every_colour_attachment_of_a_reached_tile_is_zeroed() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
-    let size = (64, 64);
-    let zero = fill(RGBA8);
-    let reached = grid(size, (32, 32), &[(1, 1)]);
     let mut differ = Vec::new();
     for mask in [None, Some(0)] {
-        let Some((mp, md)) = metal.as_ref() else {
-            break;
-        };
-        let m = once(&format!("{mask:?}"), || two_colours((mp, md), mask));
-        for (before, after) in [(0, 2), (1, 3)] {
-            let got = tiles(
-                (&m[before], &m[after]),
-                (&zero, &[&IN_TILE_1_1]),
-                (size, (32, 32)),
-            );
-            assert_eq!(got, reached, "{mask:?}, attachment {before}");
-        }
-        if two_colours((&p, &d), mask) != m {
+        let key = format!("{mask:?}");
+        if !reims_vgpu_core::metal_matches_raw!(&key, two_colours((&p, &d), mask)) {
             assert!(
                 heard(KIND),
                 "{mask:?}: off Metal's, with no {} heard",
@@ -513,7 +418,6 @@ fn every_colour_attachment_of_a_reached_tile_is_zeroed() {
     ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn dont_care_stores_keep_every_texel() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
     let mut cases = Vec::new();
     for (format, options) in [
@@ -536,18 +440,6 @@ fn dont_care_stores_keep_every_texel() {
         }
     }
     for (shape, load, drawn) in cases {
-        let probe = |pd| {
-            single(
-                pd,
-                (shape, Earlier::Uploaded),
-                (load, DONT_CARE),
-                (drawn, true),
-            )
-        };
-        if let Some((mp, md)) = metal.as_ref() {
-            let m = once(&format!("{shape:?} {load} {drawn:?}"), || probe((mp, md)));
-            assert_eq!(m.0, m.1, "Metal: {shape:?} {load} {drawn:?}");
-        }
         let (before, after) = single(
             (&p, &d),
             (shape, Earlier::Uploaded),
@@ -646,7 +538,6 @@ fn multisampled<P: Platform>(
 /// runtime announced `dont-care-load-tiles`
 #[test]
 fn multisample_dont_care_loads_zero_reached_tiles_where_the_samples_are_stored() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
     let mut cases = Vec::new();
     for size in [(64, 64), (100, 70)] {
@@ -656,32 +547,8 @@ fn multisample_dont_care_loads_zero_reached_tiles_where_the_samples_are_stored()
             }
         }
     }
-    let differ = against_metal(
-        &cases,
-        |(size, store, drawn)| {
-            let (mp, md) = metal.as_ref()?;
-            let m = once(&format!("{size:?} {store} {drawn:?}"), || {
-                multisampled((mp, md), size, (store, drawn))
-            });
-            let stored = store == STORE || store == STORE_AND_RESOLVE;
-            let reached: &[(u64, u64)] = if stored && drawn == Drawn::InTile {
-                &[(1, 2), (1, 3)]
-            } else {
-                &[]
-            };
-            let got = tiles(
-                (&m.0, &m.1),
-                (&fill(RGBA8), &[&IN_TILE_1_1]),
-                (size, (32, 16)),
-            );
-            assert_eq!(
-                got,
-                grid(size, (32, 16), reached),
-                "Metal: {size:?} {store} {drawn:?}"
-            );
-            Some(m)
-        },
-        |(size, store, drawn)| multisampled((&p, &d), size, (store, drawn)),
-    );
+    let differ = against_metal(&cases, |(size, store, drawn)| {
+        multisampled((&p, &d), size, (store, drawn))
+    });
     eprintln!("off Metal's, dont-care-load-tiles heard: {differ:#?}");
 }

@@ -1,7 +1,6 @@
 //! What one frame's work costs on the encoding thread, call by call, through this platform as
-//! core drives it, against the runtime alone on the same device and objects, and (on macOS)
-//! against the Metal platform through the same core traits: a measurement, run by hand in a
-//! release build (`cargo nextest run -p reims-vgpu-vulkan --release --run-ignored only -E
+//! core drives it, against the runtime alone on the same device and objects: a measurement, run
+//! by hand in a release build (`cargo nextest run -p reims-vgpu-vulkan --release --run-ignored only -E
 //! 'test(frame_cost)' --no-capture`).
 //!
 //! A frame is command buffers, each of a render pass of draws, two compute encoders of
@@ -21,8 +20,8 @@
 //! runs. A frame's work is waited for inside it, so the process's CPU is that frame's.
 //!
 //! The environment picks what runs: `FRAME_COST_RUNS` the runs (5), `FRAME_COST_SHAPE` one shape
-//! (`wide` or `many`), `FRAME_COST_ONLY` one path, for a profile of it (`platform`, `runtime` or
-//! `metal`), `FRAME_COST_OPTIONS` other device options ([`product_device`]), and
+//! (`wide` or `many`), `FRAME_COST_ONLY` one path, for a profile of it (`platform` or `runtime`),
+//! `FRAME_COST_OPTIONS` other device options ([`product_device`]), and
 //! `FRAME_COST_RUNTIME_CHECK=1` a submission check on each of the runtime's command buffers
 //! ([`runtime_checks`]).
 
@@ -559,8 +558,8 @@ fn product_device() -> VulkanDevice {
 }
 
 /// Prints, in nanoseconds a call, each step's best mean over runs of [`FRAMES`] frames: through
-/// this platform as core drives it, through the runtime alone on the same objects, and through
-/// the Metal platform on macOS, frames of the three alternating.
+/// this platform as core drives it and through the runtime alone on the same objects, frames of the
+/// two alternating.
 #[test]
 #[ignore = "a measurement, run by hand in a release build: prints each step's cost"]
 fn frame_cost() {
@@ -568,19 +567,13 @@ fn frame_cost() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
-    // One path alone, for a profile of it: `platform`, `runtime` or `metal`.
+    // One path alone, for a profile of it: `platform` or `runtime`.
     let only = std::env::var("FRAME_COST_ONLY").ok();
     let only = only.as_deref();
     let p = crate::platform::tests::platform();
     let d = product_device();
     let ours = crate::answer::relaxed(|| Objects::new(&p, &d));
     let raw_queue = d.raw.new_command_queue().unwrap();
-    #[cfg(target_os = "macos")]
-    let metal = reims_vgpu_metal::MetalPlatform::system_default_device().map(|md| {
-        let mp = reims_vgpu_metal::MetalPlatform::new();
-        let objects = Objects::new(&mp, &md);
-        (mp, md, objects)
-    });
     // One shape alone: `wide` or `many`.
     let shape = std::env::var("FRAME_COST_SHAPE").ok();
     let shapes = [("wide", WIDE), ("many", MANY)];
@@ -588,16 +581,16 @@ fn frame_cost() {
         .into_iter()
         .filter(|(name, _)| shape.as_deref().is_none_or(|s| s == *name))
     {
-        let mut seen: [Vec<[f64; STEPS.len()]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut seen: [Vec<[f64; STEPS.len()]>; 2] = [Vec::new(), Vec::new()];
         // Each run's CPU a frame, by path: the encoding thread's, the process's, and wall time.
-        let mut cpu_runs: [Vec<[f64; 3]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut cpu_runs: [Vec<[f64; 3]>; 2] = [Vec::new(), Vec::new()];
         let mut counts = Tally::default();
         for _ in 0..runs {
-            let mut tallies = [Tally::default(); 3];
-            let mut cpu = [[0u64; 3]; 3];
+            let mut tallies = [Tally::default(); 2];
+            let mut cpu = [[0u64; 3]; 2];
             for frame in 0..WARM + FRAMES {
-                let mut t = [Tally::default(); 3];
-                let mut c = [[0u64; 3]; 3];
+                let mut t = [Tally::default(); 2];
+                let mut c = [[0u64; 3]; 2];
                 if only.is_none_or(|o| o == "platform") {
                     cpu_of(&mut c[0], || {
                         crate::answer::relaxed(|| ours.frame(shape, &mut t[0]));
@@ -607,12 +600,6 @@ fn frame_cost() {
                     cpu_of(&mut c[1], || {
                         runtime_frame(&ours, &raw_queue, shape, &mut t[1]);
                     });
-                }
-                #[cfg(target_os = "macos")]
-                if let Some((_, _, objects)) = &metal
-                    && only.is_none_or(|o| o == "metal")
-                {
-                    cpu_of(&mut c[2], || objects.frame(shape, &mut t[2]));
                 }
                 if frame >= WARM {
                     for (cpu, c) in cpu.iter_mut().zip(c) {
@@ -641,18 +628,17 @@ fn frame_cost() {
                 runs.push(cpu.map(us_a_frame));
             }
         }
-        let [platform, runtime, metal_platform] = seen.map(|runs| best(&runs));
+        let [platform, runtime] = seen.map(|runs| best(&runs));
         println!(
             "{name} frames of {shape:?}, ns a call, best of {runs} runs of {FRAMES} frames: \
-             platform, runtime alone, ours above it, Metal platform"
+             platform, runtime alone, ours above it"
         );
         for (i, step) in STEPS.iter().enumerate() {
             println!(
-                "  {step:>28}: {:>9.0} {:>9.0} {:>9.0} {:>9.0}",
+                "  {step:>28}: {:>9.0} {:>9.0} {:>9.0}",
                 platform[i],
                 runtime[i],
-                platform[i] - runtime[i],
-                metal_platform[i]
+                platform[i] - runtime[i]
             );
         }
         #[expect(clippy::as_conversions, reason = "a sum, printed")]
@@ -660,12 +646,11 @@ fn frame_cost() {
             m.iter().zip(counts.0).map(|(v, (_, n))| v * n as f64).sum()
         };
         println!(
-            "  a frame's calls: platform {:.0} us, runtime alone {:.0} us, Metal platform {:.0} us",
+            "  a frame's calls: platform {:.0} us, runtime alone {:.0} us",
             frame(&platform) / 1000.0,
-            frame(&runtime) / 1000.0,
-            frame(&metal_platform) / 1000.0
+            frame(&runtime) / 1000.0
         );
-        let paths = ["platform", "runtime alone", "Metal platform"];
+        let paths = ["platform", "runtime alone"];
         for (path, runs) in paths.iter().zip(&cpu_runs) {
             if runs.is_empty() || runs.iter().all(|r| r[2] == 0.0) {
                 continue;

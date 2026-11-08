@@ -1,7 +1,7 @@
 //! `extended-range-bits-kept`: what becomes of the bits an extended-range format's codes leave
 //! unused, and of codes past its range, through blits, CPU uploads, loads, clears and draws.
 //!
-//! **Metal's rule** (this host, every probe below the same in each of [`RUNS`] runs; random bytes,
+//! **Metal's rule** (this host, every probe below the same in each of 5 runs; random bytes,
 //! 64 by 64, Private and Shared, with and without `allowGPUOptimizedContents`, and of
 //! `ShaderWrite` usage):
 //! - *Canonical* codes: `BGRA10_XR` (and `_sRGB`) with the low six bits of each 16-bit field zero
@@ -43,7 +43,7 @@ use reims_vgpu_core::platform::types::ClearColor;
 
 use super::{
     Aspect, CLEAR, Colour, Draw, IN_TILE_1_1, LOAD, Pass, READ, SHARED, STORE, Shape, Step, TARGET,
-    WRITE, buffer, heard, metal, near, once, positions, random_bytes, replace, run, state,
+    WRITE, buffer, heard, positions, random_bytes, replace, run, state,
 };
 
 use crate::gpu::device::tests::dev;
@@ -73,31 +73,6 @@ fn shapes(format: u64) -> [Shape; 4] {
     ]
 }
 
-/// Whether Metal keeps a texture of `shape` losslessly compressed (module docs).
-fn compressed(shape: Shape) -> bool {
-    shape.optimized != Some(false)
-        && shape.usage & WRITE == 0
-        && shape.size.0.min(shape.size.1) >= 16
-}
-
-/// The canonical code of a texel of `format` (module docs).
-fn canonical(format: u64, texel: &[u8]) -> Vec<u8> {
-    if matches!(format, 552 | 553) {
-        let mut out = Vec::new();
-        for (field, c) in texel.chunks(2).enumerate() {
-            let mut code = u16::from_le_bytes([c[0], c[1]]) >> 6;
-            if field == 3 {
-                code = code.clamp(384, 894);
-            }
-            out.extend((code << 6).to_le_bytes());
-        }
-        out
-    } else {
-        let word = u32::from_le_bytes(texel.try_into().unwrap()) | 0xc000_0000;
-        word.to_le_bytes().to_vec()
-    }
-}
-
 /// The bytes of a `shape` texture after: a blit of `raw` into it; a blit of it into another of
 /// its shape; a pass that loads and stores it with no draw; one that draws [`IN_TILE_1_1`].
 fn paths<P: Platform>((p, d): (&P, &P::Device), shape: Shape, raw: &[u8]) -> [Vec<u8>; 4] {
@@ -124,44 +99,10 @@ fn paths<P: Platform>((p, d): (&P, &P::Device), shape: Shape, raw: &[u8]) -> [Ve
     [r[0].clone(), r[1].clone(), r[2].clone(), r[3].clone()]
 }
 
-/// Metal's rule over [`paths`]' bytes (module docs).
-fn holds_metals_rule(shape: Shape, raw: &[u8], [up, copied, loaded, drawn]: &[Vec<u8>; 4]) {
-    let texel = super::texel_bytes(shape.format);
-    let rewrites = matches!(shape.format, 552 | 553) && compressed(shape);
-    let expected_up: Vec<u8> = raw
-        .chunks(texel)
-        .flat_map(|t| {
-            if rewrites {
-                canonical(shape.format, t)
-            } else {
-                t.to_vec()
-            }
-        })
-        .collect();
-    assert!(*up == expected_up, "Metal: {shape:?}: the blit's bytes");
-    assert!(copied == up, "Metal: {shape:?}: the copy's bytes");
-    assert!(loaded == up, "Metal: {shape:?}: a pass that draws nothing");
-    for (i, (b, a)) in up.chunks(texel).zip(drawn.chunks(texel)).enumerate() {
-        let (x, y) = (i % 64, i / 64);
-        if x < 32 || y < 32 {
-            assert_eq!(
-                a, b,
-                "Metal: {shape:?}: texel ({x}, {y}) of an unreached tile"
-            );
-        } else if !near(&IN_TILE_1_1, (x, y)) {
-            assert_eq!(
-                a,
-                canonical(shape.format, b),
-                "Metal: {shape:?}: texel ({x}, {y})"
-            );
-        }
-    }
-}
-
-/// Requires `ours` to be `theirs`, or the runtime to have announced `extended-range-bits-kept`;
-/// answers whether they differ.
-fn against(case: &str, ours: &[Vec<u8>], theirs: &[Vec<u8>]) -> bool {
-    let differ = ours != theirs;
+/// Requires `ours` to be Metal's bytes, recorded, or the runtime to have announced
+/// `extended-range-bits-kept`; answers whether they differ.
+fn against(case: &str, ours: &[u8]) -> bool {
+    let differ = !reims_vgpu_core::metal_matches_bytes!(case, ours);
     if differ {
         assert!(
             heard(rt::Degradation::ExtendedRangeBitsKept),
@@ -181,7 +122,6 @@ fn against(case: &str, ours: &[Vec<u8>], theirs: &[Vec<u8>]) -> bool {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn extended_range_codes_through_blits_and_loads_are_metals() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
     let mut differ = Vec::new();
     for format in FORMATS {
@@ -189,22 +129,10 @@ fn extended_range_codes_through_blits_and_loads_are_metals() {
             .into_iter()
             .zip(shapes(format))
         {
-            let Some((mp, md)) = metal.as_ref() else {
-                return;
-            };
             let raw = random_bytes(shape.length(), 41);
-            let m = once(&format!("{shape:?}"), || paths((mp, md), shape, &raw));
-            holds_metals_rule(shape, &raw, &m);
             let o = paths((&p, &d), shape, &raw);
-            for (path, (o, m)) in ["blit", "copy", "no draw", "drawn"]
-                .iter()
-                .zip(o.iter().zip(&m))
-            {
-                if against(
-                    &format!("{shape:?} {path}"),
-                    std::slice::from_ref(o),
-                    std::slice::from_ref(m),
-                ) {
+            for (i, path) in ["blit", "copy", "no draw", "drawn"].iter().enumerate() {
+                if against(&format!("{shape:?} {path}"), &o[i]) {
                     differ.push(format!("{format} {name} {path}"));
                 }
             }
@@ -245,7 +173,6 @@ fn cleared<P: Platform>((p, d): (&P, &P::Device), format: u64, colour: ClearColo
 /// (0, or 384 in an `_sRGB` twin), as the runtime does
 #[test]
 fn extended_range_cpu_uploads_and_clears_are_metals() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
     let colours = [
         ClearColor {
@@ -269,42 +196,20 @@ fn extended_range_cpu_uploads_and_clears_are_metals() {
     ];
     let mut differ = Vec::new();
     for format in FORMATS {
-        let Some((mp, md)) = metal.as_ref() else {
-            return;
-        };
         {
             let shape = Shape {
                 options: SHARED,
                 ..Shape::of(format, (64, 64))
             };
             let raw = random_bytes(shape.length(), 43);
-            let m = once(&format!("{format} replaced"), || {
-                replaced_then_read((mp, md), shape, &raw)
-            });
-            let canon: Vec<u8> = raw
-                .chunks(super::texel_bytes(format))
-                .flat_map(|t| canonical(format, t))
-                .collect();
-            let expected = if matches!(format, 552 | 553) {
-                &canon
-            } else {
-                &raw
-            };
-            assert!(
-                m == *expected,
-                "Metal: {format}: replaced, then read by a blit"
-            );
             let o = replaced_then_read((&p, &d), shape, &raw);
-            if against(&format!("{format} replaced"), &[o], &[m]) {
+            if against(&format!("{format} replaced"), &o) {
                 differ.push(format!("{format} replaced"));
             }
         }
         for colour in colours {
-            let m = once(&format!("{format} {colour:?}"), || {
-                cleared((mp, md), format, colour)
-            });
             let o = cleared((&p, &d), format, colour);
-            if against(&format!("{format} {colour:?}"), &[o], &[m]) {
+            if against(&format!("{format} {colour:?}"), &o) {
                 differ.push(format!("{format} {colour:?}"));
             }
         }

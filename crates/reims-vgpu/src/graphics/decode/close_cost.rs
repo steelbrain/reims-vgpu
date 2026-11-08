@@ -3,7 +3,7 @@
 //! `CLOSE_COST_COUNT` objects of one kind (1000 by default) and puts them in a context's table, as
 //! their creates do, then closes the context, timing the thread's CPU time and the wall time
 //! between. On the fake platform, whose objects cost next to nothing to let go of, the figures are
-//! the decoder's own an object; on the Vulkan and Metal platforms they add the platform's release
+//! the decoder's own an object; on the Vulkan platform they add the platform's release
 //! and its driver's. Each kind runs once to warm up, then [`REPS`] times, and the median of each
 //! figure is printed. A measurement, run by hand in a release build holding the host's GPU
 //! (`scripts/internal/gpu-locks.sh -- cargo nextest run -p reims-vgpu --release
@@ -268,17 +268,8 @@ fn on_fake_close_cost() {
 }
 
 /// On the Vulkan platform: the decoder's, the platform's and the runtime's.
-#[cfg(vulkan_platform)]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a close's cost an object"]
 fn on_vulkan_close_cost() {
     measure::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
-}
-
-/// On the Metal platform: the decoder's, the platform's and Metal's.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a close's cost an object"]
-fn on_metal_close_cost() {
-    measure::<reims_vgpu_metal::MetalPlatform>("metal");
 }

@@ -1,0 +1,9 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+315 options 0x0	xz 2048 0
+315 options 0x20	xz 2048 2048
+325 options 0x0	bytes 4096 29ff974131841a24ba5f1bf305c9fdee 2b2e71cd88903fd3bc7dfac7ede59b15004087be0080263d00a06dc20080263d
+325 options 0x20	bytes 4096 29ff974131841a24ba5f1bf305c9fdee 2b2e71cd88903fd3bc7dfac7ede59b15004087be0080263d00a06dc20080263d
+115 options 0x0	xz 2048 4096
+115 options 0x20	xz 2048 6144
+125 options 0x0	bytes 4096 2b1e28f3fcf9f22c129b4efd0f0068bb 2b2e71cd88903fd3bc7dfac7ede59b15004087be0080263d00a06dc2002063be
+125 options 0x20	bytes 4096 2b1e28f3fcf9f22c129b4efd0f0068bb 2b2e71cd88903fd3bc7dfac7ede59b15004087be0080263d00a06dc2002063be

@@ -1,0 +1,5 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+add_one	(0, 0, 1024, 0, 0, false, 32)
+tg_reverse	(0, 0, 1024, 0, 0, false, 32)
+tg_static	(0, 0, 1024, 0, 256, false, 32)
+sample_k	(0, 0, 1024, 0, 0, false, 32)

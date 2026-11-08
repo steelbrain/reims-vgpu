@@ -36,7 +36,7 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSWindow, NSWindowOcclusionState, NSWindowStyleMask};
 use objc2_foundation::NSRect;
 use objc2_quartz_core::CAMetalLayer;
-use reims_vgpu_metal::msg;
+use reims_vgpu_vulkan::os::msg;
 use sdl3_sys::everything::*;
 
 pub(crate) use self::input::{Input, key_input_captured, quit_requested, release_key_input, takes};

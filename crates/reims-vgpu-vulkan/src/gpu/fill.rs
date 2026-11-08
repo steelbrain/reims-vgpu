@@ -35,14 +35,13 @@
 //!   formats, 550 and 551, [`LEFTOVER_FORMATS`]; the compressed, 4:2:2, YCbCr and padded ones)
 //!   writes no byte of the colour, but the 16 bytes of the calling thread's stack where Metal's
 //!   packing writes a colour in a format it packs, which hold what the last call to use them
-//!   left (measured on the M3 Max, macOS 27.0.1,
-//!   `metal_fills_a_colour_it_packs_none_in_with_its_stacks_bytes`): a fill sent right after an
+//!   left (measured on the M3 Max, macOS 27.0.1, 2026-11-07): a fill sent right after an
 //!   RGBA32Uint fill of (7, 9, 3, 1) into another texture, with no call between the two, writes
 //!   `07 00 00 00 09 00 00 00 03 00 00 00 01 00 00 00` into an RGBA32Uint texel, cut at a
 //!   narrower one, and one sent right after a call that set the stack below to one byte writes
 //!   that byte. A call between them leaves its own bytes: an encoder's end and the next
 //!   encoder's start leave other bytes, and objc2's check of the method before each send in a
-//!   dev build, which the Metal platform's sends make, leaves the encoder's class and the
+//!   dev build, which this library's sends to Metal made, leaves the encoder's class and the
 //!   selector, as pointers (measured: `80 ef 0b 82 02 00 00 00 42 a2 3d fe 01 00 00 00`),
 //!   whatever came before. On the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 (macOS
 //!   26.7.1) every colour fill raises `NSInvalidArgumentException`: Metal's colour fill sends

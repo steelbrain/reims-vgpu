@@ -4,7 +4,7 @@
 //! An [`InputState`] belongs to one window and lives on the main thread. The view calls it for
 //! each event it receives, and the application calls [`InputState::app_send_event`] for the key
 //! window's events before AppKit dispatches them. It reads each event's values (every send
-//! through the message layer, `reims_vgpu_metal::msg`), decides with the crate's pure logic
+//! through the message layer, `reims_vgpu_vulkan::os::msg`), decides with the crate's pure logic
 //! ([`crate::keys`], [`crate::capture`], [`crate::scroll`], [`crate::geometry`],
 //! [`crate::keymap`]) in an [`InputLogic`] that takes plain values, and calls the host's
 //! callbacks, taken from the [`Window`] at each event: after the window's end there are none,
@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use objc2_app_kit::{NSEvent, NSEventPhase, NSEventType};
 use objc2_core_graphics::{CGEvent, CGEventField};
-use reims_vgpu_metal::msg;
+use reims_vgpu_vulkan::os::msg;
 
 use super::hotkeys;
 use crate::capture::{Capture, Route};

@@ -1,0 +1,7 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+(115, 8) None sweep 0: a float4 output	bytes 524288 c8746fba45f538cda3625d457703527d 00b400b400b400b4ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3
+(115, 8) None sweep 4: a float4 output	bytes 524288 07a9e62ed1c7a0d54129fa7146c4460d 00c000c000c000c0ffbfffbfffbfffbfffbfffbfffbfffbfffbfffbfffbfffbf
+(115, 8) None sweep 0: a half4 output	bytes 524288 54ce4785335228e9d405bd673beb4925 00b400b400b400b400b400b400b400b400b400b400b400b4ffb3ffb3ffb3ffb3
+(115, 8) None sweep 4: a half4 output	bytes 524288 c741141b5ff461934f2371ee4215720d 00c000c000c000c000c000c000c000c000c000c000c000c000c000c000c000c0
+(115, 8) Some((1, 0, 0)) sweep 0: a float4 output	bytes 524288 c8746fba45f538cda3625d457703527d 00b400b400b400b4ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3ffb3
+(115, 8) Some((1, 0, 0)) sweep 4: a float4 output	bytes 524288 07a9e62ed1c7a0d54129fa7146c4460d 00c000c000c000c0ffbfffbfffbfffbfffbfffbfffbfffbfffbfffbfffbfffbf

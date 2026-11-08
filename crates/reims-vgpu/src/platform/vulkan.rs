@@ -1,5 +1,5 @@
-//! `VulkanPlatform` as an `ApiPlatform` (`cfg(vulkan_platform)`): the runtime's devices, on macOS
-//! over MoltenVK, with the `vulkan` feature, and on Linux natively, always.
+//! `VulkanPlatform` as an `ApiPlatform`: the runtime's devices, on macOS over MoltenVK, and on
+//! Linux natively.
 
 use reims_vgpu_core::num::ToU64 as _;
 use reims_vgpu_core::platform::Platform;
@@ -16,7 +16,7 @@ pub(crate) use dma_buf::host_dma_buf;
 /// The platform over metal2vulkan's runtime (architecture 2.2): the runtime's devices.
 impl ApiPlatform for VulkanPlatform {
     fn process() -> Arc<VulkanPlatform> {
-        crate::singleton::vulkan_platform()
+        crate::singleton::platform()
     }
 
     /// The runtime's system default device (`MTLCreateSystemDefaultDevice()`), or the device

@@ -17,10 +17,8 @@ default = ["macos-sdl"]
 # SDL3's window on macOS (`reims-vgpu`'s `macos-sdl`), on by default: `--no-default-features`
 # builds the macOS library without SDL, its windows AppKit's alone.
 macos-sdl = ["reims-vgpu/macos-sdl"]
-# The Vulkan platform on macOS (architecture 11.1): every handle is made on `VulkanPlatform` in
-# place of `MetalPlatform`. Off by default: the Metal platform is the product there, and
-# `cargo xtask dist --platform vulkan` builds the dist tree with it. On Linux every handle is
-# made on `VulkanPlatform` with or without it (`Plat`, `lib.rs`).
+# Kept for the builds that name it (`--features vulkan`): every handle is made on `VulkanPlatform`
+# with or without it (`Plat`, `lib.rs`).
 vulkan = ["reims-vgpu/vulkan"]
 
 [dependencies]
@@ -28,7 +26,7 @@ reims-vgpu.workspace = true
 # The graphics device's wire constants, which the C API's PCI constants are checked against.
 reims-graphics.workspace = true
 # The death of a NULL handle, and the mark of the library's threads (the unit tests' testkit
-# platform stands where MetalPlatform stands in the product).
+# platform stands where VulkanPlatform stands in the product).
 reims-vgpu-core.workspace = true
 # A refusal of a memory map's files.
 log.workspace = true

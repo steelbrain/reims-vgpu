@@ -2,9 +2,9 @@
 # repository root.
 #
 #   make        the library as a plain library (cargo xtask dist) in its dist
-#               tree: on a Mac, on Metal, target/dist (libreims_vgpu.a and
-#               .dylib); on Linux, on Vulkan, target/dist-vulkan
-#               (libreims_vgpu.a and .so); with reims_vgpu.h and reims-vgpu.pc
+#               tree, target/dist-vulkan: libreims_vgpu.a and the shared
+#               library (.so on Linux, .dylib on a Mac, over MoltenVK), with
+#               reims_vgpu.h and reims-vgpu.pc
 #   make qemu   the library as a plain library (cargo xtask dist), then
 #               vendor/qemu's qemu-system-x86_64 with reims-graphics-pci on
 #               its C API, linked statically through pkg-config, in
@@ -25,9 +25,8 @@ QEMU_SRC := $(CURDIR)/vendor/qemu
 # relative one against the directory it runs in.
 RUST_TARGET_REL := $(or $(CARGO_TARGET_DIR),target)
 RUST_TARGET := $(if $(filter /%,$(RUST_TARGET_REL)),$(RUST_TARGET_REL),$(CURDIR)/$(RUST_TARGET_REL))
-# The dist tree cargo xtask dist writes on the host's platform: Metal's on a
-# Mac, Vulkan's on Linux, the only one Linux builds (xtask/src/dist.rs).
-RUST_DIST := $(RUST_TARGET)/$(if $(filter Linux,$(shell uname -s)),dist-vulkan,dist)
+# The dist tree cargo xtask dist writes (xtask/src/dist.rs).
+RUST_DIST := $(RUST_TARGET)/dist-vulkan
 
 .PHONY: all qemu clean
 

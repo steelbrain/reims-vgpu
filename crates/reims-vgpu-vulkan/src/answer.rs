@@ -1,5 +1,5 @@
-//! The answer layer: where the runtime's typed errors become core's outcomes, as the metal
-//! crate's message layer (`reims_vgpu_metal::msg`) decides a raise inside Metal.
+//! The answer layer: where the runtime's typed errors become core's outcomes, as Metal decides a
+//! raise inside its own calls.
 //!
 //! Every runtime call core asks for runs here, named by the Metal selector it stands for, which a
 //! raise and a death name:
@@ -174,7 +174,7 @@ pub enum Nil {
     /// None: every refusal is decided as [`send`] decides it.
     Never,
     /// A buffer's length or memory: a length of 0 or past the device's largest buffer, no memory
-    /// for it, or a pinned address the space cannot honour (measured on the Metal platform:
+    /// for it, or a pinned address the space cannot honour (measured on Metal on the M3 Max:
     /// `newBufferWithLength:options:` of `u64::MAX`, and a no-copy buffer of length 0 or 2^46,
     /// answer nil).
     BufferLength,
@@ -185,10 +185,10 @@ pub enum Nil {
     /// No memory for a shared texture: one of storage other than `Private` is an [`Error::Nil`].
     StorageMode,
     /// A heap's size or memory: a size of 0, no memory for it, or a pinned address the space
-    /// cannot honour (measured on the Metal platform: a heap of size 0 is nil).
+    /// cannot honour (measured on Metal on the M3 Max: a heap of size 0 is nil).
     Heap,
     /// Where a resource is placed in a heap: an offset off the resource's alignment, bytes past
-    /// the heap's end, or no memory for it (measured on the Metal platform: a buffer at an offset
+    /// the heap's end, or no memory for it (measured on Metal on the M3 Max: a buffer at an offset
     /// off 256 bytes, and a buffer or texture past the heap's end, are nil).
     Placed,
 }
@@ -2122,7 +2122,7 @@ pub fn decide_describing<T>(
 }
 
 /// The domain of every `NSError` this platform answers but a mesh render pipeline's of a stage
-/// function of another stage's type, which is the compiler's, as on the Metal platform
+/// function of another stage's type, which is the compiler's
 /// (`crate::gpu::states::wrong_mesh_stage`): Metal's is its driver's name, which differs between
 /// GPU families, and only core's log line reads it ([`crate::gpu::states`]' module docs).
 pub const RUNTIME_DOMAIN: &str = "metal2vulkan-runtime";

@@ -1,7 +1,5 @@
 //! The tests of `icb` that compare with Metal on this host: macOS only.
 
-use reims_vgpu_metal::MetalPlatform;
-
 use super::*;
 
 /// `a` as an offset from `base`; 0 and Metal's nil address as themselves.
@@ -57,9 +55,7 @@ fn unique_identifiers_follow_metals_sizes() {
         live.iter().map(|b| b.unique_identifier() - first).collect()
     }
     let vulkan = offsets::<VulkanPlatform>(&dev());
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(offsets::<MetalPlatform>(&md), vulkan);
-    }
+    reims_vgpu_core::metal_check!("offsets", vulkan);
 }
 
 /// An encoder [`identifiers_after_are_metals`] makes, of a command buffer never committed, on
@@ -121,20 +117,12 @@ fn identifiers_after_are_metals(made: Made) {
         let after = make::<P>(d, &compute_desc(), 1);
         [first, before.unique_identifier(), after.unique_identifier()]
     }
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| identifiers::<MetalPlatform>(&MetalPlatform::new(), &md, made));
     let p = crate::platform::tests::platform();
     let vulkan = identifiers::<VulkanPlatform>(&p, &dev(), made);
     assert_eq!(vulkan[..2], [0x10_0001_8000; 2], "{made:?}");
     assert_eq!(crate::answer::inexact_counts(), [], "{made:?}");
-    if let Some(metal) = metal {
-        let from_first = |n: [u64; 3]| n.map(|x| x - n[0]);
-        assert_eq!(
-            from_first(metal),
-            from_first(vulkan),
-            "{made:?}: Metal's {metal:x?}, ours {vulkan:x?}"
-        );
-    }
+    let from_first = |n: [u64; 3]| n.map(|x| x - n[0]);
+    reims_vgpu_core::metal_check!("from the first", from_first(vulkan));
 }
 
 /// [`identifiers_after_are_metals`] an empty blit encoder
@@ -207,12 +195,7 @@ fn icbs_take_metals_numbers() {
     let vulkan = numbers::<VulkanPlatform>(&dev());
     assert_eq!(vulkan[0], (1, 1, 0x10_0001_8000, 1));
     assert_eq!(vulkan[2].0, 5);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(
-            from_first(numbers::<MetalPlatform>(&md)),
-            from_first(vulkan)
-        );
-    }
+    reims_vgpu_core::metal_check!("numbers", from_first(vulkan));
 }
 
 /// An execution of a command a kernel encoded with a state the program released since, whose
@@ -221,11 +204,8 @@ fn icbs_take_metals_numbers() {
 /// `mark` writes 1
 #[test]
 fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it_as_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
     let ours = released_state_marks::<VulkanPlatform>(&dev());
-    assert_eq!((released_state_marks::<MetalPlatform>(&md), ours), (1, 1));
+    assert_eq!(ours, 1);
 }
 
 /// A reservation holding an ID of 2^23 or more is the runtime's too, whose IDs stay Metal's: 2
@@ -235,13 +215,6 @@ fn a_reservation_past_2_23_is_metals() {
     fn ids<P: Platform>(d: &P::Device) -> Vec<P::Icb> {
         d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
         (0..2).map(|_| make::<P>(d, &compute_desc(), 1)).collect()
-    }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let metal: Vec<u64> = ids::<MetalPlatform>(&md)
-            .iter()
-            .map(|b| b.gpu_resource_id())
-            .collect();
-        assert_eq!(metal, [1, 3]);
     }
     let live = ids::<VulkanPlatform>(&dev());
     let seen: Vec<u64> = live.iter().map(|b| b.gpu_resource_id()).collect();
@@ -255,9 +228,6 @@ fn a_buffer_numbered_past_2_23_is_metals() {
     fn id<P: Platform>(d: &P::Device) -> u64 {
         d.reserve_resource_indices(5, &[16_000_000]).unwrap();
         make::<P>(d, &compute_desc(), 1).gpu_resource_id()
-    }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(id::<MetalPlatform>(&md), 16_000_001);
     }
     assert_eq!(id::<VulkanPlatform>(&dev()), 16_000_001);
 }
@@ -276,9 +246,6 @@ fn ids_given_back_come_back_from_the_smallest_free_range() {
         let again: Vec<P::Icb> = (0..4).map(|_| make::<P>(d, &compute_desc(), 1)).collect();
         again.iter().map(|b| b.gpu_resource_id()).collect()
     }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), [5, 2, 3, 9]);
-    }
     assert_eq!(ids::<VulkanPlatform>(&dev()), [5, 2, 3, 9]);
 }
 
@@ -296,9 +263,6 @@ fn the_first_pool_holds_32_ids() {
         }
         make::<P>(d, &compute_desc(), 1).gpu_resource_id()
     }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(next::<MetalPlatform>(&md), 26);
-    }
     assert_eq!(next::<VulkanPlatform>(&dev()), 26);
 }
 
@@ -310,9 +274,6 @@ fn a_reservation_of_100_starts_plain_ids_past_it() {
         d.reserve_resource_indices(5, &[100]).unwrap();
         let live: Vec<P::Icb> = (0..3).map(|_| make::<P>(d, &compute_desc(), 1)).collect();
         live.iter().map(|b| b.gpu_resource_id()).collect()
-    }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), [101, 102, 103]);
     }
     assert_eq!(ids::<VulkanPlatform>(&dev()), [101, 102, 103]);
 }
@@ -326,9 +287,6 @@ fn a_reservation_of_10_leaves_plain_ids_from_1() {
         let live: Vec<P::Icb> = (0..3).map(|_| make::<P>(d, &compute_desc(), 1)).collect();
         live.iter().map(|b| b.gpu_resource_id()).collect()
     }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), [1, 2, 3]);
-    }
     assert_eq!(ids::<VulkanPlatform>(&dev()), [1, 2, 3]);
 }
 
@@ -340,9 +298,6 @@ fn a_reservation_of_2_and_16382_hands_out_1_then_16383() {
         d.reserve_resource_indices(5, &[2, 16382]).unwrap();
         let live: Vec<P::Icb> = (0..3).map(|_| make::<P>(d, &compute_desc(), 1)).collect();
         live.iter().map(|b| b.gpu_resource_id()).collect()
-    }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), [1, 16383, 3]);
     }
     assert_eq!(ids::<VulkanPlatform>(&dev()), [1, 16383, 3]);
 }
@@ -356,9 +311,6 @@ fn a_reservation_past_32_bits_leaves_it_to_the_next_call() {
         d.reserve_resource_indices(5, &[2]).unwrap();
         let live: Vec<P::Icb> = (0..3).map(|_| make::<P>(d, &compute_desc(), 1)).collect();
         live.iter().map(|b| b.gpu_resource_id()).collect()
-    }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), [1, 3, 4]);
     }
     assert_eq!(ids::<VulkanPlatform>(&dev()), [1, 3, 4]);
 }
@@ -380,9 +332,6 @@ fn a_reservation_after_a_placement_is_ignored() {
             .map(|b| b.gpu_resource_id())
             .collect()
     }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), [9, 1, 2]);
-    }
     assert_eq!(ids::<VulkanPlatform>(&dev()), [9, 1, 2]);
 }
 
@@ -396,9 +345,6 @@ fn a_reservation_holding_0_beside_other_ids_is_theirs() {
         live.iter().map(|b| b.gpu_resource_id()).collect()
     }
     let want: Vec<u64> = (21..=31).chain(1..=19).chain(32..=34).collect();
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), want);
-    }
     assert_eq!(ids::<VulkanPlatform>(&dev()), want);
 }
 
@@ -411,9 +357,6 @@ fn a_reservation_of_0_alone_reserves_nothing() {
         live.iter().map(|b| b.gpu_resource_id()).collect()
     }
     let want: Vec<u64> = (1..=40).collect();
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), want);
-    }
     assert_eq!(ids::<VulkanPlatform>(&dev()), want);
 }
 
@@ -428,9 +371,6 @@ fn a_reservation_after_one_of_0_alone_hands_out_ids_twice_as_metals() {
         live.iter().map(|b| b.gpu_resource_id()).collect()
     }
     let twice: Vec<u64> = (21..=31).chain(1..=19).chain(1..=10).collect();
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), twice);
-    }
     assert_eq!(ids::<VulkanPlatform>(&dev()), twice);
 }
 
@@ -443,9 +383,6 @@ fn a_reservation_of_2_31_minus_1_is_metals() {
         d.reserve_resource_indices(5, &[(1 << 31) - 1]).unwrap();
         let live: Vec<P::Icb> = (0..3).map(|_| make::<P>(d, &compute_desc(), 1)).collect();
         live.iter().map(|b| b.gpu_resource_id()).collect()
-    }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), [1, 2, 3]);
     }
     assert_eq!(ids::<VulkanPlatform>(&dev()), [1, 2, 3]);
 }
@@ -465,9 +402,6 @@ fn reservations_after_an_allocation_are_ignored_whatever_they_hold() {
             .chain(&live)
             .map(|b| b.gpu_resource_id())
             .collect()
-    }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(ids::<MetalPlatform>(&md), [1, 2, 3]);
     }
     assert_eq!(ids::<VulkanPlatform>(&dev()), [1, 2, 3]);
 }
@@ -489,9 +423,6 @@ fn creations_metal_does_not_make_as_asked_die() {
         ..compute_desc()
     };
     assert_eq!(make::<VulkanPlatform>(&d, &none, 1).size(), 1);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(make::<MetalPlatform>(&md, &none, 1).size(), 1);
-    }
     let near = IcbDesc {
         resource_index: Some(16383),
         ..compute_desc()
@@ -595,9 +526,7 @@ fn compute_commands_read_back_as_on_metal() {
         out
     }
     let vulkan = reads::<VulkanPlatform>(&dev());
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(reads::<MetalPlatform>(&md), vulkan);
-    }
+    reims_vgpu_core::metal_check!("reads", vulkan);
 }
 
 /// What a render command's getters answer core, fresh, after each draw kind with its
@@ -803,9 +732,7 @@ fn render_commands_read_back_as_on_metal() {
         out
     }
     let vulkan = reads::<VulkanPlatform>(&dev());
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(reads::<MetalPlatform>(&md), vulkan);
-    }
+    reims_vgpu_core::metal_check!("reads", vulkan);
 }
 
 /// What the buffer getters answer of a slot through plain sets and stride forms of a buffer
@@ -903,12 +830,7 @@ fn buffer_slots_read_back_as_on_metal() {
         out
     }
     let vulkan = [true, false].map(|dynamic| reads::<VulkanPlatform>(&dev(), dynamic));
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(
-            [true, false].map(|dynamic| reads::<MetalPlatform>(&md, dynamic)),
-            vulkan
-        );
-    }
+    reims_vgpu_core::metal_check!("reads", vulkan);
 }
 
 /// What the buffer getters answer of slots past the 32 a record holds, of a descriptor of 64
@@ -982,12 +904,7 @@ fn slots_past_the_record_read_back_as_on_metal() {
             .collect()
     }
     let vulkan = [true, false].map(|dynamic| reads::<VulkanPlatform>(&dev(), dynamic));
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(
-            [true, false].map(|dynamic| reads::<MetalPlatform>(&md, dynamic)),
-            vulkan
-        );
-    }
+    reims_vgpu_core::metal_check!("reads", vulkan);
 }
 
 /// What the threadgroup memory length getter answers past the 31 lengths a record holds, of
@@ -1009,9 +926,6 @@ fn lengths_past_the_record_read_back_as_on_metal() {
     }
     let vulkan = reads::<VulkanPlatform>(&dev());
     assert_eq!(vulkan, [0, 16, 32, 48, 0, 64]);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(reads::<MetalPlatform>(&md), vulkan);
-    }
 }
 
 /// A blit's copy and reset of commands move and clear the threadgroup memory lengths past the
@@ -1082,12 +996,6 @@ fn blits_move_lengths_past_the_record_as_metals() {
     let kind = crate::answer::Inexact::IcbCopiedLength;
     assert!(line.contains(kind.code()), "{line}");
     assert_eq!(crate::answer::relaxed(|| length(&b)), 0);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let (metal, b) = reads::<MetalPlatform>(&md);
-        assert_eq!(metal, vulkan);
-        let command = b.compute_command(1).unwrap().unwrap();
-        assert_eq!(command.threadgroup_memory_length(37).unwrap(), 24);
-    }
 }
 
 /// A threadgroup memory length at an index of 38 or more is a later command's, 38 a command
@@ -1129,9 +1037,6 @@ fn lengths_cross_into_later_commands_as_on_metal() {
     }
     let vulkan = reads::<VulkanPlatform>(&dev());
     assert_eq!(vulkan, [16, 16, 32, 48, 48, 64, 64, 64, 80, 80, 0]);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(reads::<MetalPlatform>(&md), vulkan);
-    }
 }
 
 /// A blit's copy carries the threadgroup memory lengths a command holds, the record's and the 7
@@ -1230,30 +1135,6 @@ fn blits_carry_the_lengths_a_command_holds_as_on_metal() {
     ];
     assert_eq!(again, [7, 5]);
     assert_eq!(unfollowed(&b, 1, 40), 80);
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let (metal, [a, b]) = reads::<MetalPlatform>(&md);
-    assert_eq!(metal, vulkan);
-    let tail_on_metal = [
-        length::<MetalPlatform>(&b, 1, 40),
-        length::<MetalPlatform>(&b, 1, 41),
-    ];
-    assert_eq!(tail_on_metal, tail);
-    a.compute_command(1)
-        .unwrap()
-        .unwrap()
-        .encode(IcbComputeCmd::Reset)
-        .unwrap();
-    assert_eq!(length::<MetalPlatform>(&a, 1, 40), reset);
-    set::<MetalPlatform>(&b, 1, 7, 41);
-    set::<MetalPlatform>(&a, 1, 5, 40);
-    let again_on_metal = [
-        length::<MetalPlatform>(&b, 1, 41),
-        length::<MetalPlatform>(&a, 1, 40),
-    ];
-    assert_eq!(again_on_metal, again);
-    assert_eq!(length::<MetalPlatform>(&b, 1, 40), 80);
 }
 
 /// A buffer set at an offset past 32 bits answers the buffer's address plus the offset's low
@@ -1318,9 +1199,6 @@ fn offsets_keep_their_low_32_bits_as_on_metal() {
     }
     let vulkan = reads::<VulkanPlatform>(&dev());
     assert_eq!(vulkan, [16, 32, 16, 16, 32]);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(reads::<MetalPlatform>(&md), vulkan);
-    }
 }
 
 /// For a compute and then a render buffer, whose command 0 a kernel encoded with the second
@@ -1383,9 +1261,6 @@ fn encoded_by_a_kernel<P: Platform>(d: &P::Device) -> [(bool, bool, u64); 2] {
 fn a_command_a_kernel_encoded_answers_its_states_identifier() {
     let vulkan = encoded_by_a_kernel::<VulkanPlatform>(&dev());
     assert_eq!(vulkan, [(true, false, 0); 2]);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(encoded_by_a_kernel::<MetalPlatform>(&md), vulkan);
-    }
 }
 
 /// A compute buffer of 2 commands whose command 0 a kernel encoded with a state that, with
@@ -1426,10 +1301,6 @@ fn a_command_whose_state_was_released_answers_as_metals() {
     }
     let (before, released, none, fresh) = answers::<VulkanPlatform>(&dev());
     assert_eq!((released, none, fresh), (before, 0, 0));
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let (before, released, none, fresh) = answers::<MetalPlatform>(&md);
-        assert_eq!((released, none, fresh), (before, 0, 0));
-    }
 }
 
 /// Core's map of identifiers to the guest's references, as core builds it: each state's
@@ -1480,11 +1351,6 @@ fn a_command_naming_a_released_state_reaches_a_later_one_as_metals() {
     }
     let (reached_here, released, reused) = reaches::<VulkanPlatform>(&dev());
     assert!(reused && reached_here.flatten().unwrap() > released);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let (reached_there, released, _) = reaches::<MetalPlatform>(&md);
-        let reached_there = reached_there.flatten().unwrap();
-        assert!(reached_there > released);
-    }
 }
 
 /// The first word of a buffer of zeros an execution of a command writes on `d` that the CPU
@@ -1527,9 +1393,6 @@ fn released_state_runs<P: Platform>(d: &P::Device) -> u32 {
 fn a_released_state_the_cpu_set_runs_as_metals() {
     let ours = released_state_runs::<VulkanPlatform>(&dev());
     assert_eq!(ours, 1);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(released_state_runs::<MetalPlatform>(&md), ours);
-    }
 }
 
 /// A command core set a state on, which the guest then released before states were made:
@@ -1581,10 +1444,6 @@ fn a_command_core_set_reaches_a_later_state_holding_its_identifier_as_metals() {
         states[0].unique_identifier()
     );
     drop(renders);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let (_, reached_there, taken) = set_then_released::<MetalPlatform>(&md);
-        assert!(taken && reached_there.flatten().unwrap() > 1);
-    }
 }
 
 /// An ICB-capable state of `name` in `library`, made from a whole value, as `twin_states`' are
@@ -1696,17 +1555,13 @@ fn a_command_an_executed_kernel_wrote_answers_the_state_holding_its_id_then() {
     }
     let (taker, reached_here) = written_by_an_execution::<VulkanPlatform>(&dev());
     assert_eq!(reached_here, Some(taker));
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let (taker, reached_there) = written_by_an_execution::<MetalPlatform>(&md);
-        assert_eq!(reached_there, Some(taker));
-    }
 }
 
 /// The guest's read of a state's identifier (info command 460) answers the runtime's for every
 /// state, made with indirect command buffer support or not. Metal's identifier of a state made
 /// with it is an address of its own allocation of them, `0x1000000000` and up, the same in
-/// every process that makes the same states in the same order in one environment (here two
-/// child processes, each making [`twin_states`]); the runtime's is in that range, at offsets
+/// every process that makes the same states in the same order in one environment (measured on
+/// the M3 Max, macOS 27.0.1, in two child processes, each making [`twin_states`]); the runtime's is in that range, at offsets
 /// that are not Metal's, so the read is relayed (`inexact-unique-identifier`), dying in strict
 /// mode, and a render state made after one was released takes the released one's, the last
 /// released first, as Metal's does
@@ -1715,18 +1570,6 @@ fn an_icb_capable_states_identifier_is_the_runtimes() {
     use reims_vgpu_core::platform::resource::{
         ComputePipeline as _, Library as _, RenderPipeline as _,
     };
-    const TEST: &str =
-        "gpu::icb::tests::metal_tests::an_icb_capable_states_identifier_is_the_runtimes";
-    if std::env::var("RVG_CHILD").as_deref() == Ok(TEST) {
-        let md = MetalPlatform::system_default_device().unwrap();
-        let library = md.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
-        let (computes, renders) = twin_states::<MetalPlatform>(&md, &library);
-        let computes = computes.iter().map(|c| c.unique_identifier());
-        for identifier in computes.chain(renders.iter().map(|r| r.unique_identifier())) {
-            println!("identifier {identifier}");
-        }
-        return;
-    }
     let d = dev();
     let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
     let (computes, mut renders) = twin_states::<VulkanPlatform>(&d, &library);
@@ -1768,28 +1611,6 @@ fn an_icb_capable_states_identifier_is_the_runtimes() {
         .unwrap()
         .unwrap();
     assert_eq!(plain.guest_unique_identifier(), plain.unique_identifier());
-    if MetalPlatform::system_default_device().is_none() {
-        return;
-    }
-    let in_a_child = || {
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-            .env("RVG_CHILD", TEST)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{out:?}");
-        let stdout = String::from_utf8(out.stdout).unwrap();
-        // The harness's line of the test's name runs on into the first.
-        let identifiers = stdout.lines().filter_map(|l| l.split_once("identifier "));
-        identifiers
-            .map(|(_, i)| i.parse().unwrap())
-            .collect::<Vec<u64>>()
-    };
-    let (first, second) = (in_a_child(), in_a_child());
-    assert_eq!(first.len(), 4, "{first:x?}");
-    assert_eq!(first, second, "{first:x?}, {second:x?}");
-    let allocated = |&i: &u64| i >= 0x10_0000_0000 && i % 0x40 == 0;
-    assert!(first.iter().all(allocated), "{first:x?}");
 }
 
 /// A copy past the destination's end, in the shapes measured (`n,to,k`: a destination of
@@ -1799,7 +1620,6 @@ fn an_icb_capable_states_identifier_is_the_runtimes() {
 /// at others), dies at its getter
 #[test]
 fn a_copy_past_the_destinations_end_lands_what_fits_as_metal() {
-    let md = MetalPlatform::system_default_device();
     let shapes = [
         (false, (2, 1, 2)),
         (false, (4, 3, 2)),
@@ -1827,18 +1647,7 @@ fn a_copy_past_the_destinations_end_lands_what_fits_as_metal() {
             let neighbour = kind_and_width::<VulkanPlatform>(&c, render, i);
             assert_eq!(neighbour, (kind, 30 + i), "{shape}");
         }
-        let Some(md) = &md else { continue };
-        let [a, b, c] = three_buffers::<MetalPlatform>(md, render, n);
-        let cb = blits::<MetalPlatform>(md, vec![copy_to(&a, k, &b, to)]);
-        assert_eq!(cb.status().0, COMPLETED, "Metal: {shape}");
-        let metals: Vec<_> = (to..n)
-            .map(|i| kind_and_width::<MetalPlatform>(&b, render, i))
-            .collect();
-        assert_eq!(landed, metals, "{shape}");
-        for i in 0..n {
-            let neighbour = kind_and_width::<MetalPlatform>(&c, render, i);
-            assert_eq!(neighbour, (kind, 30 + i), "Metal: {shape}");
-        }
+        reims_vgpu_core::metal_check!(shape, landed);
     }
 }
 
@@ -1871,15 +1680,6 @@ fn a_copy_past_the_end_of_an_unmeasured_descriptor_dies() {
         }
         buffers
     }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let [a, b, c] = threadgroup_buffers::<MetalPlatform>(&md);
-        let cb = blits::<MetalPlatform>(&md, vec![copy_to(&a, 2, &b, 1)]);
-        assert_eq!(cb.status().0, COMPLETED, "Metal");
-        let landed = kind_and_width::<MetalPlatform>(&b, false, 1);
-        let neighbours = [0, 1].map(|i| kind_and_width::<MetalPlatform>(&c, false, i));
-        assert_eq!(landed, (0x20, 10), "Metal");
-        assert_eq!(neighbours, [(0x20, 30), (0x20, 31)], "Metal");
-    }
     let d = dev();
     let [a, b, _] = threadgroup_buffers::<VulkanPlatform>(&d);
     *crate::answer::LAST_LINE.lock() = None;
@@ -1889,261 +1689,6 @@ fn a_copy_past_the_end_of_an_unmeasured_descriptor_dies() {
     let copy = "copyIndirectCommandBuffer:sourceRange:destination:destinationIndex:";
     assert_eq!((site.kind, site.file), (DeathKind::Abort, copy), "{line}");
     assert!(line.contains("in a shape nothing measured"), "{line}");
-}
-
-/// What Metal answers and runs of a command its copy past the end wrote over, once the program
-/// encodes it again with every setter (its pipeline state, both kernel buffers, both
-/// threadgroup memory lengths, then a threads dispatch): from a copy of 2 commands to index 3
-/// of a buffer of 4, command 1 encoded again and executed alone, writing the first word of a
-/// buffer of zeros. A measurement: the command buffer's status, the word, and the command's
-/// type and threads across.
-#[test]
-#[ignore = "a measurement, on Metal"]
-fn metal_reencodes_an_overwritten_command_here() {
-    let d = MetalPlatform::system_default_device().unwrap();
-    let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
-    let state = marking_state::<MetalPlatform>(&d, &library);
-    let [a, b, _] = three_buffers::<MetalPlatform>(&d, false, 4);
-    blits::<MetalPlatform>(&d, vec![copy_to(&a, 2, &b, 3)]);
-    let before = kind_and_width::<MetalPlatform>(&b, false, 1);
-    let out = d
-        .new_buffer_of_length(OnFault::Return, 16, 0)
-        .unwrap()
-        .unwrap();
-    let spare = buffer::<MetalPlatform>(&d);
-    let command = b.compute_command(1).unwrap().unwrap();
-    for cmd in [
-        IcbComputeCmd::SetComputePipelineState {
-            pipeline_state: Some(&state),
-        },
-        IcbComputeCmd::SetKernelBuffer {
-            buffer: Some(&out),
-            offset: 0,
-            index: 0,
-        },
-        IcbComputeCmd::SetKernelBuffer {
-            buffer: Some(&spare),
-            offset: 0,
-            index: 1,
-        },
-        IcbComputeCmd::SetThreadgroupMemoryLength {
-            length: 0,
-            index: 0,
-        },
-        IcbComputeCmd::SetThreadgroupMemoryLength {
-            length: 0,
-            index: 1,
-        },
-        IcbComputeCmd::ConcurrentDispatchThreads {
-            threads_per_grid: MtlSize::new(1, 1, 1),
-            threads_per_threadgroup: MtlSize::new(1, 1, 1),
-        },
-    ] {
-        command.encode(cmd).unwrap();
-    }
-    let after = kind_and_width::<MetalPlatform>(&b, false, 1);
-    let q = d.new_command_queue().unwrap();
-    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-    let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-    for cmd in [
-        ComputeCmd::UseResources {
-            resources: &[Some(ResourceRef::Icb(&b))],
-            usage: 1,
-        },
-        ComputeCmd::UseResources {
-            resources: &[
-                Some(ResourceRef::Buffer(&out)),
-                Some(ResourceRef::Buffer(&spare)),
-            ],
-            usage: 3,
-        },
-        ComputeCmd::ExecuteCommandsInBuffer {
-            indirect_command_buffer: &b,
-            execution_range: NsRange::new(1, 1),
-        },
-        ComputeCmd::EndEncoding,
-    ] {
-        e.encode(OnFault::Return, cmd).unwrap();
-    }
-    cb.commit(OnFault::Return).unwrap();
-    cb.wait_until_completed(OnFault::Return).unwrap();
-    // SAFETY: a Shared buffer of 16 bytes, read after the GPU ran.
-    let word = unsafe { out.contents().as_ptr::<u32>().read() };
-    println!(
-        "metal: before {before:x?} after {after:x?} status {} error {:?} word {word}",
-        cb.status().0,
-        cb.error().map(|e| e.code)
-    );
-}
-
-/// What Metal's copy of `k` commands into index `to` of a buffer of `n` (`render`: of draws,
-/// else of threads dispatches) writes past the destination's end: each command of the
-/// destination and of a neighbour made after it, as `type:width` (a dispatch's threads or
-/// threadgroups across, a draw's vertex count), after the copy completed. The source's
-/// commands are of width 10 and up, the destination's 20 and up, the neighbour's 30 and up.
-fn past_end_on<P: Platform>(d: &P::Device, render: bool, (n, to, k): (u64, u64, u64)) -> String {
-    let desc = if render {
-        render_desc()
-    } else {
-        compute_desc()
-    };
-    let (source, destination, neighbour) = (
-        make::<P>(d, &desc, n),
-        make::<P>(d, &desc, n),
-        make::<P>(d, &desc, n),
-    );
-    for (icb, base) in [(&source, 10), (&destination, 20), (&neighbour, 30)] {
-        for i in 0..n {
-            if render {
-                icb.render_command(i)
-                    .unwrap()
-                    .unwrap()
-                    .encode(IcbRenderCmd::DrawPrimitives {
-                        primitive_type: 3,
-                        vertex_start: 0,
-                        vertex_count: base + i,
-                        instance_count: 1,
-                        base_instance: 0,
-                    })
-                    .unwrap();
-            } else {
-                icb.compute_command(i)
-                    .unwrap()
-                    .unwrap()
-                    .encode(IcbComputeCmd::ConcurrentDispatchThreads {
-                        threads_per_grid: MtlSize::new(base + i, 1, 1),
-                        threads_per_threadgroup: MtlSize::new(1, 1, 1),
-                    })
-                    .unwrap();
-            }
-        }
-    }
-    let q = d.new_command_queue().unwrap();
-    let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-    let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-    blit.encode(
-        OnFault::Return,
-        BlitCmd::CopyIndirectCommandBuffer {
-            source: &source,
-            source_range: NsRange::new(0, k),
-            destination: &destination,
-            destination_index: to,
-        },
-    )
-    .unwrap();
-    blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
-    cb.commit(OnFault::Return).unwrap();
-    cb.wait_until_completed(OnFault::Return).unwrap();
-    let read = |icb: &P::Icb| {
-        (0..n)
-            .map(|i| {
-                if render {
-                    let c = icb.render_command(i).unwrap().unwrap();
-                    let count = c.draw_args().map_or(u64::MAX, |a| a.vertex_count);
-                    format!("{:#x}:{count}", c.command_type())
-                } else {
-                    let c = icb.compute_command(i).unwrap().unwrap();
-                    let width = match c.command_type() {
-                        0x40 => c.dispatch_threads_args().map(|a| a.threads_per_grid.width),
-                        _ => c
-                            .dispatch_threadgroups_args()
-                            .map(|a| a.threadgroups_per_grid.width),
-                    };
-                    format!("{:#x}:{}", c.command_type(), width.unwrap_or(u64::MAX))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    format!(
-        "status {} destination [{}] neighbour [{}]",
-        cb.status().0,
-        read(&destination),
-        read(&neighbour)
-    )
-}
-
-/// Metal's copy past a destination's end, one shape a process from `RVG_SHAPE`
-/// (`compute` or `render`, then `n,to,k`). A measurement.
-#[test]
-#[ignore = "a measurement: one shape a process, from the environment"]
-fn metal_copies_past_the_destinations_end_here() {
-    let shape = std::env::var("RVG_SHAPE").unwrap();
-    let (kind, numbers) = shape.split_once(' ').unwrap();
-    let n: Vec<u64> = numbers.split(',').map(|v| v.parse().unwrap()).collect();
-    let md = MetalPlatform::system_default_device().unwrap();
-    let seen = past_end_on::<MetalPlatform>(&md, kind == "render", (n[0], n[1], n[2]));
-    println!("metal {shape}: {seen}");
-}
-
-/// Whether Metal gives a state of indirect command buffer support, made after the program
-/// released one, the released one's identifier, in the way `RVG_REUSE` names: `plain` (the
-/// first only made), `icb` (set on a command first), `executed` (and that command executed,
-/// its command buffer completed), `icb_gone` (executed, then the buffer released before the
-/// state), `other` (the second of another kernel). A measurement, one way a process.
-#[test]
-#[ignore = "a measurement: one way a process, from the environment"]
-fn metal_reuses_a_released_states_identifier_here() {
-    use reims_vgpu_core::platform::resource::{ComputePipeline as _, Library as _};
-    let how = std::env::var("RVG_REUSE").unwrap();
-    let d = MetalPlatform::system_default_device().unwrap();
-    let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
-    let first = marking_state::<MetalPlatform>(&d, &library);
-    let id1 = first.unique_identifier();
-    let out = d
-        .new_buffer_of_length(OnFault::Return, 16, 0)
-        .unwrap()
-        .unwrap();
-    let mut icb = None;
-    if how != "plain" && how != "other" {
-        let buffer = make::<MetalPlatform>(&d, &compute_desc(), 1);
-        let command = buffer.compute_command(0).unwrap().unwrap();
-        for cmd in [
-            IcbComputeCmd::SetComputePipelineState {
-                pipeline_state: Some(&first),
-            },
-            IcbComputeCmd::SetKernelBuffer {
-                buffer: Some(&out),
-                offset: 0,
-                index: 0,
-            },
-            IcbComputeCmd::ConcurrentDispatchThreads {
-                threads_per_grid: MtlSize::new(1, 1, 1),
-                threads_per_threadgroup: MtlSize::new(1, 1, 1),
-            },
-        ] {
-            command.encode(cmd).unwrap();
-        }
-        if how != "icb" {
-            execute_writing::<MetalPlatform>(&d, &buffer, &out);
-        }
-        icb = Some(buffer);
-    }
-    if how == "icb_gone" {
-        icb = None;
-    }
-    drop(first);
-    let second = if how == "other" {
-        use reims_vgpu_core::platform::values::FullComputePipelineDesc;
-        let nothing = library
-            .new_function(OnFault::Return, "nothing")
-            .unwrap()
-            .unwrap();
-        d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
-            support_indirect_command_buffers: true,
-            ..FullComputePipelineDesc::new(&nothing)
-        })
-        .unwrap()
-        .unwrap()
-    } else {
-        marking_state::<MetalPlatform>(&d, &library)
-    };
-    let id2 = second.unique_identifier();
-    let held = icb.is_some();
-    println!(
-        "metal {how}: first {id1:#x} second {id2:#x} reused {} (buffer held {held})",
-        id1 == id2
-    );
 }
 
 /// A Shared buffer of 256 bytes.
@@ -2329,7 +1874,6 @@ fn lengths_past_the_last_command_follow_metals_words() {
         ],
     ];
     let d = dev();
-    let md = MetalPlatform::system_default_device();
     for (inherit, relayed) in [false, true].into_iter().zip(relayed) {
         for (scenario, relayed) in (0..).zip(relayed) {
             let what = format!("inherit {inherit}, scenario {scenario}");
@@ -2339,13 +1883,7 @@ fn lengths_past_the_last_command_follow_metals_words() {
                 .map(|(place, _)| place - 76)
                 .collect();
             assert_eq!(none, relayed, "{what}");
-            let Some(md) = &md else { continue };
-            let metal = read::<MetalPlatform>(md, inherit, scenario);
-            for ((place, o), m) in PLACES.zip(ours).zip(metal) {
-                if o.is_some() {
-                    assert_eq!(o, m, "{what}, place {}", place - 76);
-                }
-            }
+            reims_vgpu_core::metal_check!(what, ours);
         }
     }
 }

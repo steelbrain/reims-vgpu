@@ -9,9 +9,8 @@
 //!
 //! Creation takes no slot on the target: the first handler call is queued at the merge, behind
 //! the blocks queued before it, and a cancel before any merge queues its callout at the cancel,
-//! as libdispatch does on a queue not suspended at the source's creation (measured:
-//! `reims-vgpu-metal/tests/golden_coalescing.rs`, `first_fire_order_on_a_busy_target`,
-//! `cancel_on_a_busy_target`). Core's queues are never suspended, and a display's newFrame source
+//! as libdispatch does on a queue not suspended at the source's creation (measured on
+//! libdispatch: a source's first fire and its cancel on a busy target). Core's queues are never suspended, and a display's newFrame source
 //! is this model on every queue the library gives a display.
 //!
 //! Cancelling, explicitly (`dispatch_source_cancel`) or by releasing the last reference to a source

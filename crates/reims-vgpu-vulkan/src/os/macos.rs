@@ -1,14 +1,21 @@
-//! The OS services on macOS: the metal crate's, as they are. Core's threads, clocks, Mach VM and
-//! autorelease pool are `MetalPlatform`'s own (`VulkanPlatform` holds them; its Mach VM then
-//! reports the pages it changes to the runtime, [`crate::remap::VulkanVm`]), and an IOSurface is
-//! the metal crate's `MetalSurface`, one CF reference whose retain count the guest sees.
+//! The OS services on macOS: core's threads ([`threads`]), clocks ([`clock`]), Mach VM ([`vm`]),
+//! the Objective-C autorelease pool ([`autorelease`]) and IOSurface ([`iosurface`]), whose
+//! surface is one CF reference whose retain count the guest sees; and the message layer the
+//! Objective-C sends go through ([`msg`]), which the window's AppKit side uses too.
+//! `VulkanPlatform` holds them; its Mach VM reports the pages it changes to the runtime
+//! ([`crate::remap::VulkanVm`]).
 //!
-//! Only IOSurface creation names the platform in its trait (`IoSurfaces<P>` answers
-//! `P::Surface`), and both platforms' surface is `MetalSurface`: [`VulkanSurfaces`] answers each
-//! call with the metal crate's `MetalSurfaces`, unchanged, and records what each surface it made
-//! over the guest's pages, or at an offset into its allocation, was made over ([`ClientPages`]).
+//! [`VulkanSurfaces`] answers each IOSurface creation with [`iosurface`]'s, and records what each
+//! surface it made over the guest's pages, or at an offset into its allocation, was made over
+//! ([`ClientPages`]).
 
+mod autorelease;
+mod clock;
 mod drawables;
+mod iosurface;
+pub mod msg;
+mod threads;
+mod vm;
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, c_void};
@@ -16,40 +23,42 @@ use std::path::PathBuf;
 use std::sync::Weak;
 
 use metal2vulkan_runtime as rt;
+use objc2::rc::Retained;
+use objc2::runtime::{NSObjectProtocol as _, ProtocolObject, Sel};
+use objc2::{msg_send, sel};
+use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
 
 use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::os::surface::{
     BackingSurfaceSpec, IoSurfaces, Surface, SurfaceSpec,
 };
 use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _, KernReturn};
-use reims_vgpu_metal::MetalPlatform;
-use reims_vgpu_metal::os::clock::MetalClock;
-use reims_vgpu_metal::os::iosurface::{MetalSurface, MetalSurfaces};
-use reims_vgpu_metal::os::threads::MetalThreads;
-use reims_vgpu_metal::os::vm::MetalVm;
+
+use self::clock::MacClock;
+use self::iosurface::{MacSurface, MacSurfaces};
+use self::threads::MacThreads;
+use self::vm::MacVm;
 
 use super::{MadeOver, READ_ONLY_DIRECTION, page_runs};
 use crate::platform::VulkanPlatform;
 
 pub(crate) use drawables::Drawables;
 
-/// The clocks: the metal crate's.
-pub type OsClock = MetalClock;
-/// The threads: the metal crate's.
-pub type OsThreads = MetalThreads;
-/// Mach VM: the metal crate's.
-pub type OsVm = MetalVm;
-/// An IOSurface: the metal crate's, one CF reference.
-pub type OsSurface = MetalSurface;
+/// The clocks: [`clock`]'s.
+pub type OsClock = MacClock;
+/// The threads: [`threads`]'.
+pub type OsThreads = MacThreads;
+/// Mach VM: [`vm`]'s.
+pub type OsVm = MacVm;
+/// An IOSurface: [`iosurface`]'s, one CF reference.
+pub type OsSurface = MacSurface;
 /// IOSurface creation: [`VulkanSurfaces`].
 pub type OsSurfaces = VulkanSurfaces;
 
 /// Installs what the process's platform needs before it runs: the Objective-C autorelease pool
-/// core's pools push, as `MetalPlatform::new` does. IOSurface and Foundation still autorelease
-/// into it.
+/// core's pools push, which MoltenVK, IOSurface and Foundation autorelease into.
 pub fn install_process_services() {
-    reims_vgpu_metal::os::autorelease::install();
+    autorelease::install();
 }
 
 /// The instance's surface extension a display's window presents over, besides `VK_KHR_surface`,
@@ -96,20 +105,44 @@ pub fn default_registry_id() -> Option<u64> {
     if let Some(id) = ID.get() {
         return Some(*id);
     }
-    let id = MetalPlatform::system_default_device().map(|d| d.caps().registry_id)?;
+    let id = default_device().map(|d| msg::get("registryID", || d.registryID()))?;
     Some(*ID.get_or_init(|| id))
+}
+
+/// `MTLCreateSystemDefaultDevice()`: Metal's system default device, `None` where Metal has none.
+fn default_device() -> Option<Retained<ProtocolObject<dyn MTLDevice>>> {
+    msg::get(
+        "MTLCreateSystemDefaultDevice()",
+        MTLCreateSystemDefaultDevice,
+    )
+}
+
+/// The value of `getter`, an `MTLDeviceSPI` getter of `d`, sent only where `d` responds to it,
+/// else `None`.
+fn device_spi<R>(
+    d: &ProtocolObject<dyn MTLDevice>,
+    getter: Sel,
+    name: &'static str,
+    get: impl FnOnce() -> R,
+) -> Option<R> {
+    msg::get("respondsToSelector:", || d.respondsToSelector(getter)).then(|| msg::get(name, get))
 }
 
 /// `gpuCoreCount` of the system default `MTLDevice`, asked of Metal once, on the first call that
 /// finds a device: the cores of the GPU [`default_registry_id`] names, which MoltenVK reports to
 /// no Vulkan query. `None` where Metal has no device, or its device does not respond to
-/// `gpuCoreCount` (the metal crate's caps).
+/// `gpuCoreCount`.
 pub fn default_gpu_core_count() -> Option<u64> {
     static COUNT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     if let Some(count) = COUNT.get() {
         return *count;
     }
-    let count = MetalPlatform::system_default_device().map(|d| d.caps().gpu_core_count)?;
+    let d = default_device()?;
+    // SAFETY: the runtime answers `gpuCoreCount` as `unsigned int` (`I@:`).
+    let count = device_spi(&d, sel!(gpuCoreCount), "gpuCoreCount", || unsafe {
+        let n: u32 = msg_send![&*d, gpuCoreCount];
+        u64::from(n)
+    });
     *COUNT.get_or_init(|| count)
 }
 
@@ -120,13 +153,21 @@ pub fn default_gpu_core_count() -> Option<u64> {
 pub fn default_driver_sizes() -> [Option<u64>; 4] {
     static SIZES: std::sync::OnceLock<[Option<u64>; 4]> = std::sync::OnceLock::new();
     *SIZES.get_or_init(|| {
-        MetalPlatform::system_default_device().map_or([None; 4], |d| {
-            let z = d.identity_caps().sizes;
+        default_device().map_or([None; 4], |d| {
+            // SAFETY: each is a `Q@:` getter of `MTLDeviceSPI`, sent only where `d` responds.
             [
-                z.feature_profile,
-                z.half_fp_config,
-                z.single_fp_config,
-                z.double_fp_config,
+                device_spi(&d, sel!(featureProfile), "featureProfile", || unsafe {
+                    msg_send![&*d, featureProfile]
+                }),
+                device_spi(&d, sel!(halfFPConfig), "halfFPConfig", || unsafe {
+                    msg_send![&*d, halfFPConfig]
+                }),
+                device_spi(&d, sel!(singleFPConfig), "singleFPConfig", || unsafe {
+                    msg_send![&*d, singleFPConfig]
+                }),
+                device_spi(&d, sel!(doubleFPConfig), "doubleFPConfig", || unsafe {
+                    msg_send![&*d, doubleFPConfig]
+                }),
             ]
         })
     })
@@ -287,7 +328,7 @@ pub(crate) fn shown_at(at: std::ptr::NonNull<u8>) -> std::ptr::NonNull<u8> {
 
 /// A fresh range of `len` bytes that a view can be made of: on Mach, any allocation.
 pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
-    MetalVm::new().allocate_anywhere(len)
+    MacVm::new().allocate_anywhere(len)
 }
 
 /// The host's page, which the tests lay their pages out by: Mach's 16 KiB on arm64, 4 KiB on
@@ -304,7 +345,7 @@ pub(crate) const PAGE: u64 = if cfg!(target_arch = "aarch64") {
 #[cfg(test)]
 pub(crate) fn writable(at: HostAddr, len: u64) -> bool {
     use reims_vgpu_core::platform::os::vm::VmProt;
-    let vm = MetalVm::new();
+    let vm = MacVm::new();
     vm.protect_max(at, len, VmProt::READ | VmProt::WRITE)
         .is_ok()
 }
@@ -314,7 +355,7 @@ pub(crate) fn writable(at: HostAddr, len: u64) -> bool {
 /// whose maximum is all three already or which refuses the raise.
 #[cfg(test)]
 pub(crate) fn mapped(at: HostAddr) -> bool {
-    let vm = MetalVm::new();
+    let vm = MacVm::new();
     vm.protect_max(
         at,
         vm.page_size(),
@@ -322,7 +363,7 @@ pub(crate) fn mapped(at: HostAddr) -> bool {
     ) != Err(KernReturn(1))
 }
 
-// IOSurface's plane and value queries, which the metal crate's surface does not answer.
+// IOSurface's plane and value queries, which [`iosurface`]'s surface does not answer.
 #[link(name = "IOSurface", kind = "framework")]
 unsafe extern "C" {
     fn IOSurfaceGetBaseAddressOfPlane(buffer: *const c_void, plane_index: usize) -> *mut c_void;
@@ -361,16 +402,16 @@ unsafe extern "C" {
 /// `kCFStringEncodingUTF8`.
 const UTF8: u32 = 0x0800_0100;
 
-/// The `IOSurfaceRef` of `surface`: its identity is the reference's address (`MetalSurface`'s
+/// The `IOSurfaceRef` of `surface`: its identity is the reference's address (`MacSurface`'s
 /// `Handle::id`), live while `surface` holds its reference.
-fn surface_ref(surface: &MetalSurface) -> Option<*const c_void> {
+fn surface_ref(surface: &MacSurface) -> Option<*const c_void> {
     let address = usize::try_from(surface.id().0).ok()?;
     Some(std::ptr::with_exposed_provenance::<c_void>(address))
 }
 
 /// Plane `plane` of `surface`: its bytes' offset from the surface's base address
 /// (`IOSurfaceGetBaseAddressOfPlane`) and its bytes per row; `None` for a plane the surface lacks.
-pub(crate) fn plane_at(surface: &MetalSurface, plane: u64) -> Option<(u64, u64)> {
+pub(crate) fn plane_at(surface: &MacSurface, plane: u64) -> Option<(u64, u64)> {
     if plane >= surface.plane_count() {
         return None;
     }
@@ -392,7 +433,7 @@ pub(crate) fn plane_at(surface: &MetalSurface, plane: u64) -> Option<(u64, u64)>
 
 /// The width, height and bytes per element of plane `plane` of `surface`, which has planes;
 /// `None` for a plane it lacks.
-pub(crate) fn plane_shape(surface: &MetalSurface, plane: u64) -> Option<(u64, u64, u64)> {
+pub(crate) fn plane_shape(surface: &MacSurface, plane: u64) -> Option<(u64, u64, u64)> {
     if plane >= surface.plane_count() {
         return None;
     }
@@ -416,12 +457,12 @@ pub(crate) fn plane_shape(surface: &MetalSurface, plane: u64) -> Option<(u64, u6
 /// What keeps `surface`'s memory mapped while a device imports it at its base address, the
 /// surface gone or not: nothing here. IOSurface's memory is the surface's own, and nothing but a
 /// reference of the surface, which the guest counts, keeps it.
-pub(crate) fn surface_memory_hold(_surface: &MetalSurface) -> impl Send + 'static {}
+pub(crate) fn surface_memory_hold(_surface: &MacSurface) -> impl Send + 'static {}
 
 /// The alias of `surface`'s allocation its buffers lie over where it is the surface's own
 /// mapping (`crate::os::surface_alias`): none on macOS, where IOSurface's mapping goes with the
 /// surface's last release, which a buffer's alias may outlive.
-pub(crate) fn own_alias(_surface: &MetalSurface) -> Option<crate::gpu::backing::Alias> {
+pub(crate) fn own_alias(_surface: &MacSurface) -> Option<crate::gpu::backing::Alias> {
     None
 }
 
@@ -430,7 +471,7 @@ pub(crate) const MATRIX_KEY: &str = "IOSurfaceYCbCrMatrix";
 
 /// The YCbCr matrix `surface` names now (`kIOSurfaceYCbCrMatrix`, [`MATRIX_KEY`]): `None` for no
 /// value there, a value that is no string the runtime's `Other`.
-pub(crate) fn ycbcr_matrix(surface: &MetalSurface) -> Option<rt::SurfaceYCbCrMatrix> {
+pub(crate) fn ycbcr_matrix(surface: &MacSurface) -> Option<rt::SurfaceYCbCrMatrix> {
     match surface_value(surface, MATRIX_KEY) {
         SurfaceValue::Absent => None,
         SurfaceValue::Text(t) => Some(rt::SurfaceYCbCrMatrix::from_attachment(&t)),
@@ -450,7 +491,7 @@ enum SurfaceValue {
 }
 
 /// The value of `surface` at `key` (`IOSurfaceCopyValue`).
-fn surface_value(surface: &MetalSurface, key: &str) -> SurfaceValue {
+fn surface_value(surface: &MacSurface, key: &str) -> SurfaceValue {
     let Some(surface_ref) = surface_ref(surface) else {
         return SurfaceValue::Other;
     };
@@ -491,7 +532,7 @@ fn surface_value(surface: &MetalSurface, key: &str) -> SurfaceValue {
 /// What [`ClientPages`] recorded of `surface`, `change` given the record to change; `None` for a
 /// surface it did not record.
 pub(crate) fn recorded_mut<T>(
-    surface: &MetalSurface,
+    surface: &MacSurface,
     change: impl FnOnce(&mut MadeOver) -> T,
 ) -> Option<T> {
     let key = key(surface)?;
@@ -505,7 +546,7 @@ pub(crate) fn recorded_mut<T>(
 type SurfaceKey = u32;
 
 /// `surface`'s [`SurfaceKey`].
-fn key(surface: &MetalSurface) -> Option<SurfaceKey> {
+fn key(surface: &MacSurface) -> Option<SurfaceKey> {
     let at = surface_ref(surface)?;
     // SAFETY: a live surface.
     Some(unsafe { IOSurfaceGetID(at) })
@@ -530,7 +571,7 @@ static CLIENT_PAGES: reims_vgpu_core::sync::Mutex<ClientPages> =
 
 impl ClientPages {
     /// Drops the entry of `surface`'s ID, one of a surface gone where `surface` was just made.
-    fn forget(&mut self, surface: &MetalSurface) {
+    fn forget(&mut self, surface: &MacSurface) {
         if let Some(key) = key(surface) {
             self.entries.remove(&key);
         }
@@ -541,7 +582,7 @@ impl ClientPages {
     /// `gpu_read_only`.
     fn record(
         &mut self,
-        surface: &MetalSurface,
+        surface: &MacSurface,
         pages: &[(u64, u64)],
         offset: u64,
         gpu_read_only: bool,
@@ -580,24 +621,24 @@ fn alive(id: u32) -> bool {
     true
 }
 
-/// `IOSurfaceCreate` and `[[IOSurface alloc] initWithProperties:]`: the metal crate's. A surface
+/// `IOSurfaceCreate` and `[[IOSurface alloc] initWithProperties:]`: [`iosurface`]'s. A surface
 /// made over the guest's pages, or at an offset into its allocation, is recorded with them
 /// ([`crate::os::surface_memory`], [`crate::os::surface_offset`]), and with whether the GPU's
 /// writes through it reach them ([`crate::os::gpu_read_only`]); every lookup of it answers the
 /// record too. Each surface made here drops the record of a surface gone that had its ID.
 #[derive(Debug, Default)]
-pub struct VulkanSurfaces(MetalSurfaces);
+pub struct VulkanSurfaces(MacSurfaces);
 
 impl VulkanSurfaces {
     /// The process's IoSurfaces.
     pub fn new() -> VulkanSurfaces {
-        VulkanSurfaces(MetalSurfaces::new())
+        VulkanSurfaces(MacSurfaces::new())
     }
 }
 
 impl IoSurfaces<VulkanPlatform> for VulkanSurfaces {
-    fn create(&self, spec: &SurfaceSpec) -> Option<MetalSurface> {
-        let made = IoSurfaces::<MetalPlatform>::create(&self.0, spec)?;
+    fn create(&self, spec: &SurfaceSpec) -> Option<MacSurface> {
+        let made = self.0.create(spec)?;
         let mut recorded = CLIENT_PAGES.lock();
         recorded.forget(&made);
         if spec.client_address_ranges.is_some() || spec.offset != 0 {
@@ -612,14 +653,14 @@ impl IoSurfaces<VulkanPlatform> for VulkanSurfaces {
         Some(made)
     }
 
-    fn create_backing(&self, spec: &BackingSurfaceSpec) -> Option<MetalSurface> {
-        let made = IoSurfaces::<MetalPlatform>::create_backing(&self.0, spec)?;
+    fn create_backing(&self, spec: &BackingSurfaceSpec) -> Option<MacSurface> {
+        let made = self.0.create_backing(spec)?;
         CLIENT_PAGES.lock().forget(&made);
         Some(made)
     }
 
     fn describe(&self, spec: &SurfaceSpec) -> String {
-        IoSurfaces::<MetalPlatform>::describe(&self.0, spec)
+        self.0.describe(spec)
     }
 }
 
@@ -676,7 +717,7 @@ mod tests {
                 "{offset:#x}"
             );
             drop(s);
-            reims_vgpu_metal::os::vm::MetalVm::new().deallocate(pages, length);
+            MacVm::new().deallocate(pages, length);
         }
     }
 
@@ -713,7 +754,7 @@ mod tests {
             width: 16,
             height: 16,
         };
-        let makers: [&dyn Fn() -> MetalSurface; 2] = [&|| bgra_surface(16, 16), &|| {
+        let makers: [&dyn Fn() -> MacSurface; 2] = [&|| bgra_surface(16, 16), &|| {
             VulkanSurfaces::new().create_backing(&backing).unwrap()
         }];
         for make in makers {
@@ -732,9 +773,9 @@ mod tests {
         }
     }
 
-    /// A host-only surface is the metal crate's: one CF reference, the spec's size
+    /// A host-only surface is one CF reference, of the spec's size
     #[test]
-    fn surfaces_are_the_metal_crates() {
+    fn host_only_surfaces_are_one_reference() {
         let spec = SurfaceSpec {
             pixel_format: u32::from_be_bytes(*b"BGRA"),
             alloc_size: 16 * 64,

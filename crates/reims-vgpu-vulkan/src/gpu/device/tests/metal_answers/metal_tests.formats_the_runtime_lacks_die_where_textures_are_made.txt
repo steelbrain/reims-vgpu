@@ -1,0 +1,13 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+576's size	SizeAndAlign { size: 640, align: 128 }
+576: a texture buffer's size	SizeAndAlign { size: 32, align: 16 }
+577's size	SizeAndAlign { size: 640, align: 128 }
+577: a texture buffer's size	SizeAndAlign { size: 32, align: 16 }
+578's size	SizeAndAlign { size: 1152, align: 128 }
+578: a texture buffer's size	SizeAndAlign { size: 64, align: 16 }
+579's size	SizeAndAlign { size: 1152, align: 128 }
+579: a texture buffer's size	SizeAndAlign { size: 64, align: 16 }
+624's size	SizeAndAlign { size: 16640, align: 16 }
+625's size	SizeAndAlign { size: 16640, align: 16 }
+626's size	SizeAndAlign { size: 16640, align: 16 }
+627's size	SizeAndAlign { size: 16640, align: 16 }

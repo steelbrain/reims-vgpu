@@ -38,8 +38,8 @@
 //! remap, a range a view can be made of or a stand-in's memory that would pass it is refused
 //! before anything is mapped, so the rest of the process keeps its mappings: a remap or a range
 //! answers `KERN_NO_SPACE` and a stand-in no memory, as Mach's and IOSurface's calls answer when
-//! memory runs out, which core answers as it does on the Metal platform then
-//! (`crate::answer::out_of_host_memory`, counted; in strict mode a death).
+//! memory runs out, which core answers as Metal does then (`crate::answer::out_of_host_memory`,
+//! counted; in strict mode a death).
 //!
 //! **Views through dma-bufs.** An x86-64 macOS guest hands out its pages in 4 KiB pieces, each
 //! 16 KiB clump of them backwards (its free queue refills each CPU's list last in, first out), and

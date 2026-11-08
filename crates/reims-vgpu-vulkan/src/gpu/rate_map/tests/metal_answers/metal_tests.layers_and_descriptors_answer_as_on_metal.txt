@@ -1,0 +1,2 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+answers	[18446744073709551615, 18446744073709551615, 18446744073709551615, 1, 1, 0, 0, 0, 3, 2, 0, 0, 0, 0, 0, 1, 2, 1, 1, 0]

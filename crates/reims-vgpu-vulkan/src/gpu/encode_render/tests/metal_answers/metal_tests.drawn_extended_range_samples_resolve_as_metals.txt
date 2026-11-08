@@ -1,0 +1,7 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+554 2x store 2	bytes 16384 e4bf15bc2ca372b35dcd7aea811c8b0d d4d124c07fce76ce4ba308d8feff39db022c8de2e7f8ffe78009b0f4b39de3ff
+554 2x store 3	bytes 16384 e4bf15bc2ca372b35dcd7aea811c8b0d d4d124c07fce76ce4ba308d8feff39db022c8de2e7f8ffe78009b0f4b39de3ff
+554 2x store 1	bytes 16384 e4bf15bc2ca372b35dcd7aea811c8b0d d4d124c07fce76ce4ba308d8feff39db022c8de2e7f8ffe78009b0f4b39de3ff
+554 4x store 2	bytes 16384 3150ea53342bdc42975003e419afb476 d4d124c07fce76ce4ba308d8feff39db022c8de2e7f8ffe78009b0f4b39de3ff
+554 4x store 3	bytes 16384 3150ea53342bdc42975003e419afb476 d4d124c07fce76ce4ba308d8feff39db022c8de2e7f8ffe78009b0f4b39de3ff
+554 4x store 1	bytes 16384 3150ea53342bdc42975003e419afb476 d4d124c07fce76ce4ba308d8feff39db022c8de2e7f8ffe78009b0f4b39de3ff

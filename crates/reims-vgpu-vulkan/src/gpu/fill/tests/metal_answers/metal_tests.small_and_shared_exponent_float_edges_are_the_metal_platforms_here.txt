@@ -1,0 +1,3 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+call 0: format 92	bytes 131072 482eb8f6c14a34e996addc601dcf6e35 bffffdf7bffffdf7bffffdf7bffffdf7bffffdf7bffffdf7bffffdf7bffffdf7
+call 0: format 93	bytes 131072 7eb6e919252ef64e90b273f5a4fcac6d fcfdfbfffcfdfbfffcfdfbfffcfdfbfffefde3fffefde3fffefde3fffefde3ff

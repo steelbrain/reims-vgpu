@@ -2,7 +2,7 @@
 //!
 //! Core is generic over one `P: Platform` (D3). Its associated types name every Metal object kind
 //! core touches, so a handle flows into another Metal call with its kind checked at compile time.
-//! Two implementations: `reims_vgpu_metal::MetalPlatform` and
+//! Two implementations: `reims_vgpu_vulkan::VulkanPlatform` and
 //! `core::testkit::platform::FakePlatform`.
 
 pub mod blit;
@@ -160,7 +160,7 @@ pub trait Platform: Sized + Send + Sync + 'static {
     /// sel: initWithRanges:count: SPI
     /// (`[[MTLResourceAddressRangeArray alloc] initWithRanges:count:]`). The runtime encodes the
     /// ranges as `^{MTLAddressRange=QQ}`; the array copies them, so `ranges` may live on the stack
-    /// (D41; the metal crate's test `new_address_range_array`).
+    /// (D41).
     fn new_address_range_array(
         &self,
         ranges: &[ResourceAddressRange],

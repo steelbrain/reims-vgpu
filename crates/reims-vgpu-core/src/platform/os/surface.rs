@@ -48,7 +48,7 @@ pub trait Surface: Handle {
 
 /// Creates IOSurfaces. The private keys a spec can carry (client address ranges, direction,
 /// address format, protection options, plane compression and extended pixels) are constants
-/// IOSurface exports but no SDK header declares (the metal crate's `os::iosurface`).
+/// IOSurface exports but no SDK header declares (the Vulkan crate's `os/macos/iosurface.rs`).
 pub trait IoSurfaces<P: Platform>: Send + Sync {
     /// `IOSurfaceCreate(dict)` with the dictionary `spec` describes, private keys included. `None`
     /// (NULL) is the caller's `kIOReturnBadArgument`.

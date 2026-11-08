@@ -9,8 +9,8 @@
 //! it (`Platform::texture_descriptor`, `new_render_pass_descriptor`), and later sets are typed
 //! methods, each sending its setters in the order core sets them.
 //!
-//! Conventions (architecture 4.2): a setter or getter that cannot raise returns its value (the
-//! metal crate dies at the send on a raise); one that can raise returns `RaiseResult<T>`.
+//! Conventions (architecture 4.2): a setter or getter that cannot raise returns its value (a
+//! platform dies at the send on a raise); one that can raise returns `RaiseResult<T>`.
 
 use super::types::MtlSamplePosition;
 use super::values::{

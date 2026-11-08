@@ -12,11 +12,12 @@ reims-vgpu-core.workspace = true
 log.workspace = true
 # ash's Vulkan types for a window's surface (`present`): SDL's on Linux, the layer's on macOS.
 ash.workspace = true
-
-# The window on Linux (`sdl`): SDL3 for the window, its input and its Vulkan surface, and the
-# Vulkan crate's threads.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The Vulkan crate's OS layer: its threads, and on macOS its clock and the message layer the
+# AppKit side sends through (`reims_vgpu_vulkan::os`).
 reims-vgpu-vulkan.workspace = true
+
+# The window on Linux (`sdl`): SDL3 for the window, its input and its Vulkan surface.
+[target.'cfg(target_os = "linux")'.dependencies]
 sdl3-sys.workspace = true
 
 [features]
@@ -32,10 +33,8 @@ sdl-no-link = ["sdl3-sys?/no-link"]
 # `cargo build -p reims-vgpu-c --no-default-features` builds the library without SDL.
 macos-sdl = ["dep:sdl3-sys"]
 
-# The window's AppKit side (`native/macos.rs`): AppKit, Core Animation, CoreGraphics and Carbon,
-# and the metal crate's message layer and threads.
+# The window's AppKit side (`native/macos.rs`): AppKit, Core Animation, CoreGraphics and Carbon.
 [target.'cfg(target_os = "macos")'.dependencies]
-reims-vgpu-metal.workspace = true
 sdl3-sys = { workspace = true, optional = true }
 libc.workspace = true
 objc2.workspace = true

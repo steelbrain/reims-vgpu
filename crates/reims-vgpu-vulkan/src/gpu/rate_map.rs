@@ -62,11 +62,10 @@
 //!   does. A tile dispatch in it, which only draws were measured against, dies.
 //! - **A pass over a mutable map**, reset or not, that no draw of the guest's took the place of
 //!   ends with a draw of no vertices the guest did not encode ([`no_draw`],
-//!   [`crate::gpu::encode_render`]), as the Metal platform's does. Without a draw call Metal's
+//!   [`crate::gpu::encode_render`]). Without a draw call Metal's
 //!   GPU hangs at it (measured on the M3 Max, macOS 27.0.1: its command buffer fails with code 2
 //!   and stores nothing), and the runtime fails it so too; with the draw, both run it and store
-//!   what it loaded or cleared. A guest's draw takes its place where it takes the Metal
-//!   platform's: at least one whole triangle of a triangle list or strip, once or more, which the
+//!   what it loaded or cleared. A guest's draw takes its place: at least one whole triangle of a triangle list or strip, once or more, which the
 //!   runtime took and counts as the pass's draw call. The draw's pipeline is made only for a pass
 //!   that needs it, at the pass's end, as making it moves identifiers the guest reads: the
 //!   runtime gives a pipeline state made without `supportIndirectCommandBuffers`, as this one
@@ -494,7 +493,7 @@ static NO_DRAW: Mutex<Vec<(u64, rt::RenderPipelineState)>> = Mutex::new(Vec::new
 /// Its vertex function returns nothing ([`NO_DRAW_LIBRARY`]), its rasterization is off, it names
 /// no attachment formats, and its largest vertex amplification count is the device's, which is
 /// 1 on a device without multiview. A refusal of the library, the function or the pipeline dies
-/// at `sel`, as the Metal platform's ends the process where Metal does not make one.
+/// at `sel`.
 pub(crate) fn no_draw(sel: &'static str, device: &VulkanDevice) -> rt::RenderPipelineState {
     use metal2vulkan::pipeline::{RenderPipelineDescriptor, StageSource};
     use reims_vgpu_core::platform::device::GpuDevice as _;

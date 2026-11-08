@@ -1,7 +1,6 @@
 //! The tests of `caps` that compare with Metal on this host: macOS only.
 
 use reims_vgpu_core::platform::caps::LINEAR_ALIGNMENT_FORMAT;
-use reims_vgpu_metal::MetalPlatform;
 
 use super::*;
 
@@ -48,14 +47,6 @@ fn caps_are_the_runtimes_and_the_documented_facts() {
         !caps.flags.is_depth24_stencil8_pixel_format_supported,
         "an Apple GPU's no, on every device (the runtime's D663)"
     );
-    if let Some(metal) = MetalPlatform::system_default_device() {
-        assert!(
-            !metal
-                .caps()
-                .flags
-                .is_depth24_stencil8_pixel_format_supported
-        );
-    }
     assert!(
         caps.flags.supports_command_buffer_jump,
         "the adapter's predication"
@@ -79,122 +70,6 @@ fn caps_are_the_runtimes_and_the_documented_facts() {
     assert_eq!(
         LINEAR_ALIGNMENT_FORMAT,
         u64::from(PixelFormat::BGRA8Unorm.as_raw())
-    );
-}
-
-/// Every stand-in is the Metal platform's answer on this host, and `supportsMemoryOrderAtomics`
-/// is Metal's, true, where the runtime takes the atomics on this device
-/// ([`memory_order_atomics`])
-#[test]
-fn stand_ins_are_the_metal_platforms_here() {
-    let Some(metal) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let m = metal.caps();
-    let ours = dev().caps();
-    let f = &m.flags;
-    assert_eq!(f.is_large_mrt_supported, ours.flags.is_large_mrt_supported);
-    assert_eq!(f.is_rgb10a2_gamma_supported, stand_in::RGB10A2_GAMMA);
-    assert_eq!(
-        (
-            f.supports_command_buffer_jump,
-            m.limits.max_predicated_nesting_depth
-        ),
-        (
-            ours.flags.supports_command_buffer_jump,
-            ours.limits.max_predicated_nesting_depth
-        ),
-        "the adapter's predication answers Metal's"
-    );
-    assert_eq!(
-        f.supports_compute_compressed_texture_write,
-        ours.flags.supports_compute_compressed_texture_write
-    );
-    assert_eq!(
-        f.supports_conditional_load_store,
-        ours.flags.supports_conditional_load_store
-    );
-    assert_eq!(
-        f.supports_float16_bcubic_filtering,
-        stand_in::FLOAT16_BCUBIC_FILTERING
-    );
-    let metals = true;
-    assert_eq!(
-        (
-            f.supports_memory_order_atomics,
-            ours.flags.supports_memory_order_atomics
-        ),
-        (metals, metals)
-    );
-    assert_eq!(
-        f.supports_texture_2d_multisample_array,
-        stand_in::TEXTURE_2D_MULTISAMPLE_ARRAY
-    );
-    assert_eq!(
-        m.primitive_types[5..],
-        stand_in::PRIVATE_PRIMITIVE_TYPES.map(Ok)
-    );
-    assert_eq!(
-        m.limits.max_compute_threadgroup_memory,
-        ours.limits.max_compute_threadgroup_memory
-    );
-    assert_eq!(
-        m.max_vertex_amplification_count,
-        ours.max_vertex_amplification_count
-    );
-    assert_eq!(
-        (f.supports_tile_shaders, f.supports_non_square_tile_shaders),
-        (stand_in::TILE_SHADERS, stand_in::TILE_SHADERS)
-    );
-    assert_eq!(f.supports_image_blocks, stand_in::IMAGE_BLOCKS);
-    assert_eq!(
-        ours.registry_id, m.registry_id,
-        "the default device's, Metal's"
-    );
-    assert_eq!(m.families, stand_in::FAMILIES.map(Ok));
-    assert_eq!(
-        f.supports_extended_xr10_formats,
-        stand_in::EXTENDED_XR10_FORMATS
-    );
-    assert_eq!(
-        ours.write_rounding_modes, m.write_rounding_modes,
-        "the runtime's answer"
-    );
-    // The answers both platforms take from the device agree where the runtime reproduces
-    // Metal's, and `gpuCoreCount` is Metal's own for this GPU.
-    assert_eq!(ours.gpu_core_count, m.gpu_core_count);
-    assert_eq!(
-        ours.max_threads_per_threadgroup,
-        m.max_threads_per_threadgroup
-    );
-    assert_eq!(
-        ours.min_linear_alignment_bgra8,
-        m.min_linear_alignment_bgra8
-    );
-    assert_eq!(ours.heap_buffer_page_private, m.heap_buffer_page_private);
-    assert_eq!(
-        ours.limits.max_compute_buffers,
-        m.limits.max_compute_buffers
-    );
-    assert_eq!(ours.limits.max_texture_layers, m.limits.max_texture_layers);
-    assert_eq!(
-        (
-            ours.limits.device_linear_texture_alignment_bytes,
-            ours.limits.linear_texture_alignment_bytes,
-            ours.limits.iosurface_texture_alignment_bytes,
-            ours.limits.iosurface_read_only_texture_alignment_bytes,
-        ),
-        (
-            m.limits.device_linear_texture_alignment_bytes,
-            m.limits.linear_texture_alignment_bytes,
-            m.limits.iosurface_texture_alignment_bytes,
-            m.limits.iosurface_read_only_texture_alignment_bytes,
-        ),
-        "the runtime's alignments"
-    );
-    assert_eq!(
-        ours.limits.max_threadgroup_memory_length,
-        m.limits.max_threadgroup_memory_length
     );
 }
 
@@ -259,21 +134,26 @@ fn answers(caps: &DeviceCaps) -> Vec<(String, String)> {
     out
 }
 
-/// Every answer of the device's caps is the Metal platform's on this host, field for field:
+/// Every answer of the device's caps is Metal's on the M3 Max, field for field:
 /// every limit, flag, sample count, primitive type, family and rounding mode core asks, and the
 /// heap-buffer and linear-alignment queries
+///
+/// The registry ID, which names the device until the host restarts, is left out, and a GPU other
+/// than the one Metal's answers were recorded on answers otherwise, so there the test ends.
 #[test]
 fn every_cap_is_the_metal_platforms_here() {
-    let Some(metal) = MetalPlatform::system_default_device() else {
+    let ours = answers(&dev().caps());
+    if !reims_vgpu_core::metal_matches!("name", ours[0].1) {
+        eprintln!(
+            "{}: not the GPU Metal's answers were recorded on",
+            ours[0].1
+        );
         return;
-    };
-    let (ours, theirs) = (answers(&dev().caps()), answers(&metal.caps()));
-    assert_eq!(ours.len(), theirs.len());
+    }
     let differ: Vec<String> = ours
         .iter()
-        .zip(&theirs)
-        .filter(|(o, t)| o != t)
-        .map(|((name, o), (_, t))| format!("{name}: ours {o}, Metal's {t}"))
+        .filter(|(name, o)| name != "registryID" && !reims_vgpu_core::metal_matches!(name, o))
+        .map(|(name, o)| format!("{name}: ours {o}, not Metal's"))
         .collect();
     assert!(
         differ.is_empty(),

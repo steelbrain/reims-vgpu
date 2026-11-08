@@ -109,9 +109,8 @@ const STORE_ACTION_STORE: u64 = 1;
 pub(crate) struct ScanoutDraw<P: Platform> {
     /// The platform, whose render pass descriptors clear the drawable.
     platform: Arc<P>,
-    /// The device the queue and the buffer are on: the platform's default. The Metal sink, on
-    /// macOS, and the host's reads of the display (`read`), which make their texture on it, read
-    /// it.
+    /// The device the queue and the buffer are on: the platform's default. The host's reads of
+    /// the display (`read`), which make their texture on it, read it.
     pub(crate) device: P::Device,
     /// The sink's command queue, unshared ([`new_command_queue_unshared`]): it puts the guest's
     /// scanout and presented surfaces into the window, each draw on a present's path. The host's
@@ -1990,25 +1989,16 @@ mod tests {
         }
     }
 
-    /// On Metal, the colour's table draws the drawable's bytes the colour's pass draws: the
-    /// scanout, and a surface of each format a table carries, holding every value in each
-    /// channel across a width off a power of two (3840), through colours of one stage and of
-    /// three, of 1 to 1024 entries, none the identity
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_the_table_draws_what_the_pass_draws() {
-        the_table_draws_what_the_pass_draws(reims_vgpu_metal::MetalPlatform::process());
-    }
-
-    /// On the Vulkan platform (MoltenVK's on a Mac), the colour's table draws the bytes the
-    /// colour's pass draws, as on Metal (`on_metal_the_table_draws_what_the_pass_draws`)
-    #[cfg(vulkan_platform)]
+    /// The colour's table draws the drawable's bytes the colour's pass draws: the scanout, and a
+    /// surface of each format a table carries, holding every value in each channel across a width
+    /// off a power of two (3840), through colours of one stage and of three, of 1 to 1024 entries,
+    /// none the identity
     #[test]
     fn on_vulkan_the_table_draws_what_the_pass_draws() {
         the_table_draws_what_the_pass_draws(Arc::new(reims_vgpu_vulkan::VulkanPlatform::new()));
     }
 
-    /// `on_metal_the_table_draws_what_the_pass_draws`, on `platform`.
+    /// `on_vulkan_the_table_draws_what_the_pass_draws`, on `platform`.
     fn the_table_draws_what_the_pass_draws<P: ApiPlatform>(platform: Arc<P>) {
         crate::entry::run(|_| table_draws_what_the_pass_draws(&platform));
     }

@@ -1,0 +1,7 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+immutable: sizes	[0, 0, 16, 1, 0, 16, 1]
+immutable: copy	bytes 240008 cdd2a7ffa42a49962db9cf72fcc2696e 3075000000000000ee00000000000000ee00000000000000ee00000000000000
+reset: sizes	[0, 0, 16, 1, 0, 16, 1]
+reset: copy	bytes 240008 cdd2a7ffa42a49962db9cf72fcc2696e 3075000000000000ee00000000000000ee00000000000000ee00000000000000
+compiled and reset: sizes	[0, 168, 16, 1, 0, 16, 1]
+compiled and reset: copy	bytes 240008 1067f5c1bb89601e65431284e5cf8055 3075000000000000ee00000000000000ee00000000000000ee00000000000000

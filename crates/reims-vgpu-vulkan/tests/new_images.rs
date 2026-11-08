@@ -13,7 +13,7 @@
 //! at its cap).
 
 #![cfg(target_os = "macos")]
-// Compares with Metal, which is macOS's.
+// Compares with Metal's answers, recorded on macOS.
 // Every platform object is `Send` and `Sync` (core's `Handle`, and `Obj`'s bound, which an
 // encoder's drop asks of `PredicatedEncoder`), and the proof walks the object's fields: an
 // encoder's command buffer, its predication, and the runtime objects that holds, 141 to 150
@@ -41,7 +41,6 @@ use reims_vgpu_core::platform::resource::{Buffer, Library};
 use reims_vgpu_core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
 use reims_vgpu_core::platform::values::TextureDesc;
 use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_metal::MetalPlatform;
 use reims_vgpu_vulkan::VulkanPlatform;
 
 /// The kernel that keeps the GPU busy (`src/gpu/spin.metal`).
@@ -207,13 +206,6 @@ fn assert_made_while_running(seen: &Seen) {
             made.took, made.status
         );
     }
-}
-
-#[test]
-fn metal_makes_textures_while_the_gpu_runs() {
-    let p = MetalPlatform::new();
-    let seen = textures_while_a_kernel_runs(&p, &MetalPlatform::system_default_device().unwrap());
-    assert_made_while_running(&seen);
 }
 
 #[test]

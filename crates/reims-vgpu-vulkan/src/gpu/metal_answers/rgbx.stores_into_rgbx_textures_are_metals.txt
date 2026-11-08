@@ -1,0 +1,205 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+RGBX8Unorm usage 0x3 options 0x0: cases	8
+RGBX8Unorm usage 0x3 options 0x0 replaceRegion	bytes 1024 3bc5ea912cd3e3ceb918120759fbbeb1 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x0 a blit from a buffer	bytes 1024 3bc5ea912cd3e3ceb918120759fbbeb1 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x0 a blit from a texture	bytes 1024 22a981febbae25b9463f6bbc6bf8ffb9 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x0 a byte fill	bytes 1024 c0bc65d13bc7fe17ec03c70f040c7844 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 70	bytes 1024 94464afb1c255fecc6d794ed32df3076 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 70	bytes 1024 b2d6b241fdd0bf78b9f978b75e2bd3d4 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 70	bytes 1024 21dcecf3f24cc290e74f2f8bf9dc5154 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x0 a blit to a buffer	bytes 364 8e783eebbf27911a647362c37d6c7571 2e4b23a77c23be6014a47ec87f266a0986084be61ec2f60fe48fb85005378ce9
+RGBX8Unorm usage 0x3 options 0x20: cases	7
+RGBX8Unorm usage 0x3 options 0x20 a blit from a buffer	bytes 1024 3bc5ea912cd3e3ceb918120759fbbeb1 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x20 a blit from a texture	bytes 1024 22a981febbae25b9463f6bbc6bf8ffb9 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x20 a byte fill	bytes 1024 c0bc65d13bc7fe17ec03c70f040c7844 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 70	bytes 1024 94464afb1c255fecc6d794ed32df3076 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 70	bytes 1024 b2d6b241fdd0bf78b9f978b75e2bd3d4 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 70	bytes 1024 21dcecf3f24cc290e74f2f8bf9dc5154 124ed815483dd1d921eadc9156fee946ebb91b863eeb6c6b3861405875eb6485
+RGBX8Unorm usage 0x3 options 0x20 a blit to a buffer	bytes 364 8e783eebbf27911a647362c37d6c7571 2e4b23a77c23be6014a47ec87f266a0986084be61ec2f60fe48fb85005378ce9
+RGBX8Unorm_sRGB usage 0x3 options 0x0: cases	8
+RGBX8Unorm_sRGB usage 0x3 options 0x0 replaceRegion	bytes 1024 69fb23e700ff805ce1c8d7b96e165810 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x0 a blit from a buffer	bytes 1024 69fb23e700ff805ce1c8d7b96e165810 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x0 a blit from a texture	bytes 1024 36f1d954fe3b86358f82407e281b086c 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x0 a byte fill	bytes 1024 2df43b57db70a109c78f8c404fc7d24d 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 71	bytes 1024 8ae9e40aefd8d6db8ce78ee4414ef8c0 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 71	bytes 1024 8cb25398794161795a81a2ae85327554 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 71	bytes 1024 bfcba2596fb5e44efca3db89c4bd895d 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x0 a blit to a buffer	bytes 364 29a7e4d42df0932c27be006c93758c6d 5ca66cca67a92124fcbab4c09a5f5b4a566cf5f3e77aff6fe8da714cc69a9450
+RGBX8Unorm_sRGB usage 0x3 options 0x20: cases	7
+RGBX8Unorm_sRGB usage 0x3 options 0x20 a blit from a buffer	bytes 1024 69fb23e700ff805ce1c8d7b96e165810 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x20 a blit from a texture	bytes 1024 36f1d954fe3b86358f82407e281b086c 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x20 a byte fill	bytes 1024 2df43b57db70a109c78f8c404fc7d24d 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 71	bytes 1024 8ae9e40aefd8d6db8ce78ee4414ef8c0 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 71	bytes 1024 8cb25398794161795a81a2ae85327554 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 71	bytes 1024 bfcba2596fb5e44efca3db89c4bd895d 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x3 options 0x20 a blit to a buffer	bytes 364 29a7e4d42df0932c27be006c93758c6d 5ca66cca67a92124fcbab4c09a5f5b4a566cf5f3e77aff6fe8da714cc69a9450
+RGBX8Unorm_sRGB usage 0x1 options 0x0: cases	8
+RGBX8Unorm_sRGB usage 0x1 options 0x0 replaceRegion	bytes 1024 69fb23e700ff805ce1c8d7b96e165810 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x0 a blit from a buffer	bytes 1024 69fb23e700ff805ce1c8d7b96e165810 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x0 a blit from a texture	bytes 1024 36f1d954fe3b86358f82407e281b086c 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x0 a byte fill	bytes 1024 2df43b57db70a109c78f8c404fc7d24d 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 71	bytes 1024 8ae9e40aefd8d6db8ce78ee4414ef8c0 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 71	bytes 1024 8cb25398794161795a81a2ae85327554 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 71	bytes 1024 bfcba2596fb5e44efca3db89c4bd895d 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x0 a blit to a buffer	bytes 364 29a7e4d42df0932c27be006c93758c6d 5ca66cca67a92124fcbab4c09a5f5b4a566cf5f3e77aff6fe8da714cc69a9450
+RGBX8Unorm_sRGB usage 0x1 options 0x20: cases	7
+RGBX8Unorm_sRGB usage 0x1 options 0x20 a blit from a buffer	bytes 1024 69fb23e700ff805ce1c8d7b96e165810 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x20 a blit from a texture	bytes 1024 36f1d954fe3b86358f82407e281b086c 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x20 a byte fill	bytes 1024 2df43b57db70a109c78f8c404fc7d24d 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 71	bytes 1024 8ae9e40aefd8d6db8ce78ee4414ef8c0 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 71	bytes 1024 8cb25398794161795a81a2ae85327554 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 71	bytes 1024 bfcba2596fb5e44efca3db89c4bd895d 14bedf48e28597e34de2fa1b2389b54e1aa0b9370a71bb0e983edbe09a14aef2
+RGBX8Unorm_sRGB usage 0x1 options 0x20 a blit to a buffer	bytes 364 29a7e4d42df0932c27be006c93758c6d 5ca66cca67a92124fcbab4c09a5f5b4a566cf5f3e77aff6fe8da714cc69a9450
+RGBX8Snorm usage 0x3 options 0x0: cases	8
+RGBX8Snorm usage 0x3 options 0x0 replaceRegion	bytes 1024 785f43986774549885525008e84c4519 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x0 a blit from a buffer	bytes 1024 785f43986774549885525008e84c4519 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x0 a blit from a texture	bytes 1024 afcd249a5c2958498ba4c7be1428338f 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x0 a byte fill	bytes 1024 e9d98635c4c3c5d05de99b209c0b1560 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 72	bytes 1024 7e5ea7c5fb2267c0fedbf41e68eb4daa 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 72	bytes 1024 29dfe7449743e69e43eafc9973e6c4b9 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 72	bytes 1024 e9b1f6a75114a8a93b0560a9cdb1a638 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x0 a blit to a buffer	bytes 364 73b057145b56706fbfb83133fda2b9be 3baa8b342ce4cbd4788725a8f1d96b71f12822f4922d2f338a281c3fac163473
+RGBX8Snorm usage 0x3 options 0x20: cases	7
+RGBX8Snorm usage 0x3 options 0x20 a blit from a buffer	bytes 1024 785f43986774549885525008e84c4519 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x20 a blit from a texture	bytes 1024 afcd249a5c2958498ba4c7be1428338f 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x20 a byte fill	bytes 1024 e9d98635c4c3c5d05de99b209c0b1560 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 72	bytes 1024 7e5ea7c5fb2267c0fedbf41e68eb4daa 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 72	bytes 1024 29dfe7449743e69e43eafc9973e6c4b9 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 72	bytes 1024 e9b1f6a75114a8a93b0560a9cdb1a638 17ee4e3eb2b418158f7deaa1d352589a85fefaf5758f1daf1eae02ff65cc5256
+RGBX8Snorm usage 0x3 options 0x20 a blit to a buffer	bytes 364 73b057145b56706fbfb83133fda2b9be 3baa8b342ce4cbd4788725a8f1d96b71f12822f4922d2f338a281c3fac163473
+RGBX8Uint usage 0x3 options 0x0: cases	8
+RGBX8Uint usage 0x3 options 0x0 replaceRegion	bytes 1024 fc3452f96c13a38050bd9da13c56788c 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x0 a blit from a buffer	bytes 1024 fc3452f96c13a38050bd9da13c56788c 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x0 a blit from a texture	bytes 1024 65fe6b6b45e8570a32bc33ee9d190b52 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x0 a byte fill	bytes 1024 7cb7df856a2bd163de9ea28c19a65cfd 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 73	bytes 1024 592c612c5a8a14d2e1ca362126dd8562 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 73	bytes 1024 733e7eccb9b5a5f8ceee9fa7058b3399 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 73	bytes 1024 d8b62bdf41fac490e6dd3b57fd1bffc3 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x0 a blit to a buffer	bytes 364 95e2e6fe3550ad1a208883e970380f13 ebcd79a14542a642026063b72d928984a1232c004c7c3525e74494a06e5de0b7
+RGBX8Uint usage 0x3 options 0x20: cases	7
+RGBX8Uint usage 0x3 options 0x20 a blit from a buffer	bytes 1024 fc3452f96c13a38050bd9da13c56788c 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x20 a blit from a texture	bytes 1024 65fe6b6b45e8570a32bc33ee9d190b52 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x20 a byte fill	bytes 1024 7cb7df856a2bd163de9ea28c19a65cfd 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 73	bytes 1024 592c612c5a8a14d2e1ca362126dd8562 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 73	bytes 1024 733e7eccb9b5a5f8ceee9fa7058b3399 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 73	bytes 1024 d8b62bdf41fac490e6dd3b57fd1bffc3 15ac335e2a7a91be9a22950252492bf28d90deba3a8629c099c2976f64e69388
+RGBX8Uint usage 0x3 options 0x20 a blit to a buffer	bytes 364 95e2e6fe3550ad1a208883e970380f13 ebcd79a14542a642026063b72d928984a1232c004c7c3525e74494a06e5de0b7
+RGBX8Sint usage 0x3 options 0x0: cases	8
+RGBX8Sint usage 0x3 options 0x0 replaceRegion	bytes 1024 f528e81761fe9cdfc36cf40f5a382ad6 cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x0 a blit from a buffer	bytes 1024 f528e81761fe9cdfc36cf40f5a382ad6 cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x0 a blit from a texture	bytes 1024 170e694db04aa7ca9b1b001d82d5f63e cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x0 a byte fill	bytes 1024 8355f7db5dc45d46bd343f0e801ff137 cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 74	bytes 1024 73c85d91c8cb35f0d51dc4c168881694 cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 74	bytes 1024 2b0beff1f917c034885722dcc33c79df cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 74	bytes 1024 05415178b5b1af0523a3a093dad8365d cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x0 a blit to a buffer	bytes 364 0a97ea86d4aceaca0398c4f53f601dce 8175d90ec96c9b301ee51e72489c74bb46514a4a8f99fa9cdabac4dbe67a1bc5
+RGBX8Sint usage 0x3 options 0x20: cases	7
+RGBX8Sint usage 0x3 options 0x20 a blit from a buffer	bytes 1024 f528e81761fe9cdfc36cf40f5a382ad6 cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x20 a blit from a texture	bytes 1024 170e694db04aa7ca9b1b001d82d5f63e cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x20 a byte fill	bytes 1024 8355f7db5dc45d46bd343f0e801ff137 cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 74	bytes 1024 73c85d91c8cb35f0d51dc4c168881694 cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 74	bytes 1024 2b0beff1f917c034885722dcc33c79df cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 74	bytes 1024 05415178b5b1af0523a3a093dad8365d cd0ec4a00d84d67a837009d4d5019b72f5d1a6c059c3e1700ba4fc8cacdaa87e
+RGBX8Sint usage 0x3 options 0x20 a blit to a buffer	bytes 364 0a97ea86d4aceaca0398c4f53f601dce 8175d90ec96c9b301ee51e72489c74bb46514a4a8f99fa9cdabac4dbe67a1bc5
+RGBX16Uint usage 0x3 options 0x0: cases	8
+RGBX16Uint usage 0x3 options 0x0 replaceRegion	bytes 2048 524c95b2d06165ea3060e73188b35b0c 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x0 a blit from a buffer	bytes 2048 524c95b2d06165ea3060e73188b35b0c 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x0 a blit from a texture	bytes 2048 c0b5010de583700fb38935124aa2c25e 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x0 a byte fill	bytes 2048 a917746cc1b7e5d97ccd5f87e284a553 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 113	bytes 2048 a3924f78ae2c033905484b87be5678de 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 113	bytes 2048 92a69676719ef820034d79666c0fddeb 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 113	bytes 2048 00df1422bb17276bfb016675abe2d725 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x0 a blit to a buffer	bytes 616 1ccb7372c9c4063dad402d554af75db9 2276d1ae232e0f0963f4c3be37f607e8caf7c7ad192c61a60792fe7f05c3442e
+RGBX16Uint usage 0x3 options 0x20: cases	7
+RGBX16Uint usage 0x3 options 0x20 a blit from a buffer	bytes 2048 524c95b2d06165ea3060e73188b35b0c 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x20 a blit from a texture	bytes 2048 c0b5010de583700fb38935124aa2c25e 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x20 a byte fill	bytes 2048 a917746cc1b7e5d97ccd5f87e284a553 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 113	bytes 2048 a3924f78ae2c033905484b87be5678de 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 113	bytes 2048 92a69676719ef820034d79666c0fddeb 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 113	bytes 2048 00df1422bb17276bfb016675abe2d725 1a4b5498935e01fd2d641484b31fc3bc5fc947e507ee7427e7f8fe7141e332ec
+RGBX16Uint usage 0x3 options 0x20 a blit to a buffer	bytes 616 1ccb7372c9c4063dad402d554af75db9 2276d1ae232e0f0963f4c3be37f607e8caf7c7ad192c61a60792fe7f05c3442e
+RGBX16Sint usage 0x3 options 0x0: cases	8
+RGBX16Sint usage 0x3 options 0x0 replaceRegion	bytes 2048 b06f6f69cf31287f80813803ae68428b d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x0 a blit from a buffer	bytes 2048 b06f6f69cf31287f80813803ae68428b d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x0 a blit from a texture	bytes 2048 3891b8a2e1abfbfaabb77464a941d882 d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x0 a byte fill	bytes 2048 a8c24630dbb3e19f2613bf97c63b736c d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 114	bytes 2048 4643fe5e32183ad5d4512da1164a6339 d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 114	bytes 2048 a5433337ab7ddc0bcd19e18cdb4061e4 d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 114	bytes 2048 1512f31c4f769e1494990259cf5d941e d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x0 a blit to a buffer	bytes 616 2d3ac38677f72aa785614d919802600d 5b1a33d666d6e629b65659116e5d4872e94f7c6e7b3cbc73a0073647063cc444
+RGBX16Sint usage 0x3 options 0x20: cases	7
+RGBX16Sint usage 0x3 options 0x20 a blit from a buffer	bytes 2048 b06f6f69cf31287f80813803ae68428b d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x20 a blit from a texture	bytes 2048 3891b8a2e1abfbfaabb77464a941d882 d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x20 a byte fill	bytes 2048 a8c24630dbb3e19f2613bf97c63b736c d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 114	bytes 2048 4643fe5e32183ad5d4512da1164a6339 d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 114	bytes 2048 a5433337ab7ddc0bcd19e18cdb4061e4 d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 114	bytes 2048 1512f31c4f769e1494990259cf5d941e d2aed7c966a8ec30d3874d52ff707d76b69d11153e32a49995fdc635e332df4a
+RGBX16Sint usage 0x3 options 0x20 a blit to a buffer	bytes 616 2d3ac38677f72aa785614d919802600d 5b1a33d666d6e629b65659116e5d4872e94f7c6e7b3cbc73a0073647063cc444
+RGBX16Float usage 0x3 options 0x0: cases	8
+RGBX16Float usage 0x3 options 0x0 replaceRegion	bytes 2048 b151de12b488bb4f4e9ecb3df5db1a7d 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x0 a blit from a buffer	bytes 2048 b151de12b488bb4f4e9ecb3df5db1a7d 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x0 a blit from a texture	bytes 2048 86256768fc6ec5de75480bc1b07ccf89 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x0 a byte fill	bytes 2048 470657f12019da80f81a15da03b9cab6 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 115	bytes 2048 71403f47381c50835364a8d2857f9bc0 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 115	bytes 2048 64fc3811052a61aafae23f8d1a59d9d9 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 115	bytes 2048 ea447ac086ab6bf0a5ba845887d73219 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x0 a blit to a buffer	bytes 616 b6d69da20ef640b8ee9e63a172e61e82 6c9b3271481994f5c96d4e8eef8e7df12b3bce135000e019d70d45d4de54c854
+RGBX16Float usage 0x3 options 0x20: cases	7
+RGBX16Float usage 0x3 options 0x20 a blit from a buffer	bytes 2048 b151de12b488bb4f4e9ecb3df5db1a7d 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x20 a blit from a texture	bytes 2048 86256768fc6ec5de75480bc1b07ccf89 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x20 a byte fill	bytes 2048 470657f12019da80f81a15da03b9cab6 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 115	bytes 2048 71403f47381c50835364a8d2857f9bc0 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 115	bytes 2048 64fc3811052a61aafae23f8d1a59d9d9 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 115	bytes 2048 ea447ac086ab6bf0a5ba845887d73219 6fa6d978cfb746bead51bc2658b927fdccbc4b4919821b3b6da0c73bcd330220
+RGBX16Float usage 0x3 options 0x20 a blit to a buffer	bytes 616 b6d69da20ef640b8ee9e63a172e61e82 6c9b3271481994f5c96d4e8eef8e7df12b3bce135000e019d70d45d4de54c854
+RGBX32Uint usage 0x3 options 0x0: cases	8
+RGBX32Uint usage 0x3 options 0x0 replaceRegion	bytes 4096 ddcc5182243c64bd11f0c3e15f011e36 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x0 a blit from a buffer	bytes 4096 ddcc5182243c64bd11f0c3e15f011e36 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x0 a blit from a texture	bytes 4096 3ba370d5b0f63c99be746ecce319037a 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x0 a byte fill	bytes 4096 2f5eb34c69e77e0245874f31573508ab 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 123	bytes 4096 bfd58f913faf140f3248cc223c639892 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 123	bytes 4096 97e8f3d29772ce61d8267e1b0a523e5b 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 123	bytes 4096 4f6350da6c590dc61329896713d30385 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x0 a blit to a buffer	bytes 1120 d4fd83d744279915850f9c7260083f4e ee0aee82009ee35427772f2d09d03bcf6c32f93a6ef70dbed7409fd9b11fcccd
+RGBX32Uint usage 0x3 options 0x20: cases	7
+RGBX32Uint usage 0x3 options 0x20 a blit from a buffer	bytes 4096 ddcc5182243c64bd11f0c3e15f011e36 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x20 a blit from a texture	bytes 4096 3ba370d5b0f63c99be746ecce319037a 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x20 a byte fill	bytes 4096 2f5eb34c69e77e0245874f31573508ab 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 123	bytes 4096 bfd58f913faf140f3248cc223c639892 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 123	bytes 4096 97e8f3d29772ce61d8267e1b0a523e5b 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 123	bytes 4096 4f6350da6c590dc61329896713d30385 71d6e11de64f5dc89df5c94615b9aeba7b4de16acecb97d7b73bceea87b3e3d0
+RGBX32Uint usage 0x3 options 0x20 a blit to a buffer	bytes 1120 d4fd83d744279915850f9c7260083f4e ee0aee82009ee35427772f2d09d03bcf6c32f93a6ef70dbed7409fd9b11fcccd
+RGBX32Sint usage 0x3 options 0x0: cases	8
+RGBX32Sint usage 0x3 options 0x0 replaceRegion	bytes 4096 455aad05064b3ba18e9b53d3e12f2e01 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x0 a blit from a buffer	bytes 4096 455aad05064b3ba18e9b53d3e12f2e01 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x0 a blit from a texture	bytes 4096 213fcbaa5e119d690ec4ee0500214a9e dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x0 a byte fill	bytes 4096 c8b958a767ab421ade2749a328fd31f4 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 124	bytes 4096 0debaae2e396fff6795b9b31c1eac3b1 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 124	bytes 4096 3396bce196d270c7520d5664e25eb0c4 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 124	bytes 4096 86d3f9eb381f42b521bff8f48b1b1546 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x0 a blit to a buffer	bytes 1120 21dd9b6b3df0deaa3bf1909359dff8ec a24f611fddb8d0ec46f972d77de6432202f98950019b4bbf4badb2b92209f74f
+RGBX32Sint usage 0x3 options 0x20: cases	7
+RGBX32Sint usage 0x3 options 0x20 a blit from a buffer	bytes 4096 455aad05064b3ba18e9b53d3e12f2e01 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x20 a blit from a texture	bytes 4096 213fcbaa5e119d690ec4ee0500214a9e dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x20 a byte fill	bytes 4096 c8b958a767ab421ade2749a328fd31f4 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 124	bytes 4096 0debaae2e396fff6795b9b31c1eac3b1 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 124	bytes 4096 3396bce196d270c7520d5664e25eb0c4 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 124	bytes 4096 86d3f9eb381f42b521bff8f48b1b1546 dfe16ce22e000a88e00fce8046eb1fba84819900192da826aaad90a0444be413
+RGBX32Sint usage 0x3 options 0x20 a blit to a buffer	bytes 1120 21dd9b6b3df0deaa3bf1909359dff8ec a24f611fddb8d0ec46f972d77de6432202f98950019b4bbf4badb2b92209f74f
+RGBX32Float usage 0x3 options 0x0: cases	8
+RGBX32Float usage 0x3 options 0x0 replaceRegion	bytes 4096 9b7a8dcdafc2daa42b7d9e510a9e7d09 e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x0 a blit from a buffer	bytes 4096 9b7a8dcdafc2daa42b7d9e510a9e7d09 e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x0 a blit from a texture	bytes 4096 7a9957545634c79f6473f7c9d6ddeeab e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x0 a byte fill	bytes 4096 c06524af6c505f05904bd89ea04583f8 e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x0 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 125	bytes 4096 5aa1c64486066884676e8cf223e4112b e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x0 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 125	bytes 4096 bfdb9455b302c1db0e54014f0fba2ab6 e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x0 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 125	bytes 4096 b7dd9968b9e43ab246d386eaaa6d6d08 e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x0 a blit to a buffer	bytes 1120 210ae6ba705ea68c5abbdf6f2c762411 6256db95a59edaf5b9dcfff45210a9782f7c09175c74832b9b4c330b182e1492
+RGBX32Float usage 0x3 options 0x20: cases	7
+RGBX32Float usage 0x3 options 0x20 a blit from a buffer	bytes 4096 9b7a8dcdafc2daa42b7d9e510a9e7d09 e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x20 a blit from a texture	bytes 4096 7a9957545634c79f6473f7c9d6ddeeab e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x20 a byte fill	bytes 4096 c06524af6c505f05904bd89ea04583f8 e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x20 a fill of ClearColor { red: 0.25, green: 0.5, blue: 0.75, alpha: 1.0 } in 125	bytes 4096 5aa1c64486066884676e8cf223e4112b e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x20 a fill of ClearColor { red: 0.1, green: 0.9, blue: 0.3, alpha: 0.5 } in 125	bytes 4096 bfdb9455b302c1db0e54014f0fba2ab6 e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x20 a fill of ClearColor { red: 1.5, green: -0.5, blue: 7.0, alpha: 0.0 } in 125	bytes 4096 b7dd9968b9e43ab246d386eaaa6d6d08 e2112616a863079440279210d259a7a5708b73bf7b9b844a2a86a77e4f1ead5f
+RGBX32Float usage 0x3 options 0x20 a blit to a buffer	bytes 1120 210ae6ba705ea68c5abbdf6f2c762411 6256db95a59edaf5b9dcfff45210a9782f7c09175c74832b9b4c330b182e1492

@@ -1,0 +1,3 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+None	bytes 65568 6d01c726f899210c92b781711eebce12 00400000000000008a375040a17b2079bedc80847c82a90652565f4337f47782
+Some(0)	bytes 65568 2f807e790b74bd453ccff63f65c8973e 00400000000000008a375040a17b2079bedc80847c82a90652565f4337f47782

@@ -21,6 +21,7 @@ pub mod faults;
 pub mod guest_ram;
 pub mod impls;
 pub mod logs;
+pub mod metal_answers;
 pub mod objects;
 pub mod platform;
 pub mod script;

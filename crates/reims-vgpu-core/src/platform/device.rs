@@ -1,8 +1,8 @@
 //! Platform trait: `GpuDevice`: MTLDevice selectors, SPI included, and the two Metal C SPI
 //! functions that take a device.
 //!
-//! Conventions (architecture 4.2): zero-argument getters return `T` (the metal crate's `send_get`
-//! dies on a raise); every method with arguments and every creator returns `RaiseResult<T>`;
+//! Conventions (architecture 4.2): zero-argument getters return `T` (a platform dies at the
+//! send on a raise); every method with arguments and every creator returns `RaiseResult<T>`;
 //! creators return `Option` because Metal can return nil whether or not core checks.
 //!
 //! Creators and encoders hand Metal much of what the guest sends as it is, so Metal's own
@@ -227,9 +227,8 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// call; only the graphics lane asks it, once per device.
     fn identity_caps(&self) -> IdentityCaps;
     /// Whether the device makes render pipelines with the private state Apple's OpenGL renderer
-    /// sets ([`FullRenderPipelineDesc::private_state`]): on the Metal platform, where Metal's
-    /// render pipeline descriptors answer each of its setters (SPI); on the Vulkan platform,
-    /// always. The graphics lane offers `PRIVATE_RENDER_STATE` where it does.
+    /// sets ([`FullRenderPipelineDesc::private_state`]): on the Vulkan platform, always. The
+    /// graphics lane offers `PRIVATE_RENDER_STATE` where it does.
     fn takes_private_render_state(&self) -> bool;
     /// The bytes of the GPU's own memory the process may hold, as the platform answers at the
     /// call: Metal's `recommendedMaxWorkingSetSize`; on the Vulkan platform the budget of the
@@ -238,9 +237,7 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// start.
     fn own_memory_budget(&self) -> u64;
     /// Whether the device makes compute pipelines of OpenCL mode
-    /// ([`FullComputePipelineDesc::open_cl_mode`]): on the Metal platform, where Metal's compute
-    /// pipeline descriptors take `setOpenCLModeEnabled:` (SPI) and its functions
-    /// `newFunctionWithPluginData:bitcodeType:` (SPI); on the Vulkan platform, whose runtime links
+    /// ([`FullComputePipelineDesc::open_cl_mode`]): on the Vulkan platform, whose runtime links
     /// such a kernel as Metal does. The graphics lane offers `OPENCL_MODE` where it does.
     fn makes_opencl_mode_pipelines(&self) -> bool;
     /// sel: newBufferWithDescriptor: SPI — from a private `MTLBufferDescriptor` made from

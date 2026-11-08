@@ -2096,8 +2096,7 @@ impl SamplerState for VulkanSamplerState {
     }
 }
 
-/// The getters below Apple10 are the host's stubs' (the Metal platform's
-/// `depth_stencil_state_getters_raise`, measured on the M3 Max): `gpuResourceID` is the runtime's,
+/// The getters below Apple10 are the host's stubs' (measured on the M3 Max): `gpuResourceID` is the runtime's,
 /// what plain Metal answers, 0; `resourceIndex` raises, and the runtime has no index of its own.
 /// So the guest's info request, which reads both, raises, as on Metal.
 impl DepthStencilState for VulkanDepthStencilState {

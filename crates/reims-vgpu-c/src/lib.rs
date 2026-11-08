@@ -13,10 +13,9 @@
 //! - every struct the host writes starts with `struct_size` ([`sized`]);
 //! - every callback table has one `ctx` and one `destroy` ([`table`]).
 //!
-//! The exports are made over [`Plat`]: on macOS the product's `MetalPlatform`, or with the
-//! `vulkan` feature `VulkanPlatform`; on Linux `VulkanPlatform`, with or without the feature,
-//! since Metal is macOS's; and core's testkit platform in this crate's unit tests, which then run
-//! the product's code.
+//! The exports are made over [`Plat`]: `VulkanPlatform`, natively on Linux and over MoltenVK on
+//! macOS (a build for development and tests); and core's testkit platform in this crate's unit
+//! tests, which then run the product's code.
 
 // On the Vulkan platform, a debug build's proof that the runtime's types are `Send` and `Sync`
 // nests deeper than rustc's default limit of 128 (E0275).
@@ -44,8 +43,7 @@ pub use status::RvgStatus;
 /// arena for each such block on the allocating thread (measured on ms01's Iris Xe with jemalloc
 /// preloaded into all of QEMU: a drag at 36 frames/s under glibc, 42 under jemalloc). Its
 /// symbols are prefixed (`_rjem_`), so the host's C code and the drivers keep the system's
-/// `malloc`, and no block crosses between the two: the host is handed no block, and the bytes
-/// the library gives Metal to free are `malloc`'s own.
+/// `malloc`, and no block crosses between the two: the host is handed no block.
 #[cfg(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(target_os = "macos", target_arch = "aarch64")
@@ -53,12 +51,9 @@ pub use status::RvgStatus;
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// The platform every handle is made on: the product's, on macOS.
-#[cfg(not(any(test, feature = "vulkan", target_os = "linux")))]
-pub(crate) type Plat = reims_vgpu::MetalPlatform;
-/// The platform every handle is made on, on Linux and with the `vulkan` feature: the Vulkan
-/// platform, over metal2vulkan's runtime (architecture 2.2).
-#[cfg(all(not(test), any(feature = "vulkan", target_os = "linux")))]
+/// The platform every handle is made on: the Vulkan platform, over metal2vulkan's runtime
+/// (architecture 2.2).
+#[cfg(not(test))]
 pub(crate) type Plat = reims_vgpu::VulkanPlatform;
 /// The platform every handle is made on: core's testkit platform in this crate's unit tests.
 #[cfg(test)]

@@ -8,8 +8,7 @@
 //! was queued. The queue's worker exits after [`reims_vgpu_core::rt::queue::IDLE_EXIT`] idle and
 //! the next job starts another. The library never waits for it, and a queue's drop joins nothing.
 //!
-//! **By platform.** Each platform's `ApiPlatform` is a file of its own: `platform/metal.rs`
-//! (macOS) and `platform/vulkan.rs` (Linux, and macOS with the `vulkan` feature).
+//! **By platform.** The Vulkan platform's `ApiPlatform` is `platform/vulkan.rs`.
 
 use std::any::Any;
 use std::sync::{Arc, OnceLock, Weak};
@@ -134,13 +133,10 @@ impl HostQueue for DisplayThread {
     }
 }
 
-#[cfg(target_os = "macos")]
-mod metal;
-#[cfg(vulkan_platform)]
 mod vulkan;
 /// A dma-buf of host memory the Vulkan platform mapped from files, for a device to import
 /// (`platform/vulkan/lent_memory.rs`).
-#[cfg(all(vulkan_platform, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(crate) use vulkan::host_dma_buf;
 
 #[cfg(any(test, feature = "testkit"))]
@@ -221,7 +217,6 @@ mod tests {
 
     /// The Vulkan platform's devices: the default one, the same object again by the registry ID
     /// the platform answers for it, and none for an ID no device has (`UINT64_MAX`)
-    #[cfg(vulkan_platform)]
     #[test]
     fn vulkan_devices_by_registry_id() {
         use reims_vgpu_core::platform::Handle as _;

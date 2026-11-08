@@ -1,0 +1,2 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+numbers	[(1, 1, 0, 1), (2, 2, 32768, 100), (5, 5, 163840, 3), (1, 1, 196608, 2000), (3, 3, 0, 1), (4, 4, 1736704, 0), (1, 1, 0, 1)]

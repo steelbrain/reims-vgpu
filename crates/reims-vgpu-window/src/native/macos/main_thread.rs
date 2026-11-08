@@ -35,7 +35,7 @@ use objc2_core_foundation::{CFRunLoop, kCFRunLoopCommonModes};
 use objc2_foundation::NSString;
 use reims_vgpu_core::rt::BlockEnv;
 use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_metal::msg;
+use reims_vgpu_vulkan::os::msg;
 
 /// Work for the main thread.
 type Job = Box<dyn FnOnce(MainThreadMarker) + Send>;

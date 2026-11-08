@@ -4,7 +4,7 @@
 //!
 //! Widths follow the Objective-C runtime's encodings (D41): `NSUInteger` is `u64`, `float` is
 //! `f32`, `double` is `f64`, `MTLTextureSwizzle` is `u8`. Every struct is `#[repr(C)]` with its
-//! C size asserted, so the metal crate can pass it by value with a matching `Encode`.
+//! C size asserted, so it crosses to Metal's C layout unchanged.
 
 /// `MTLSize` (`{?=QQQ}`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -245,9 +245,8 @@ pub struct VertexAmplificationViewMapping {
 
 /// `MTLResourceAddressRange`: one range of an `MTLResourceAddressRangeArray`. The type keeps the
 /// SPI's name, but the runtime tags the struct
-/// `MTLAddressRange` (`^{MTLAddressRange=QQ}` in `-initWithRanges:count:`), so the metal crate
-/// encodes it as `Struct("MTLAddressRange", [u64, u64])` (D41). The array copies its ranges, so a
-/// slice on the stack may be passed (the metal crate's test `new_address_range_array`).
+/// `MTLAddressRange` (`^{MTLAddressRange=QQ}` in `-initWithRanges:count:`) (D41). The array
+/// copies its ranges, so a slice on the stack may be passed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(C)]
 pub struct ResourceAddressRange {

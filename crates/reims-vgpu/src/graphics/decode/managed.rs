@@ -2128,115 +2128,12 @@ mod tests {
         }
     }
 
-    /// On Metal a one-level `Managed` 2D array on unified memory lies over its CPU copy where the
-    /// layout puts its slices: the GPU reads and writes the copy's bytes.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_managed_2d_array_lies_over_its_cpu_copy() {
-        check_managed_array_in_place(
-            managed_array_in_place_on::<reims_vgpu_metal::MetalPlatform>(),
-        );
-    }
-
-    /// As on Metal ([`on_metal_a_managed_2d_array_lies_over_its_cpu_copy`]), on the Vulkan
-    /// platform.
-    #[cfg(vulkan_platform)]
+    /// A one-level `Managed` 2D array on unified memory lies over its CPU copy where the layout
+    /// puts its slices: the GPU reads and writes the copy's bytes.
     #[test]
     fn on_vulkan_a_managed_2d_array_lies_over_its_cpu_copy() {
         check_managed_array_in_place(
             managed_array_in_place_on::<reims_vgpu_vulkan::VulkanPlatform>(),
-        );
-    }
-
-    /// What one-level `Managed` 2D arrays cost the host on Metal on unified memory: a
-    /// measurement, run by hand holding the GPU (`cargo nextest run -p reims-vgpu --run-ignored
-    /// only -E 'test(managed_array_cost_on_metal)' --no-capture`). Makes `ARRAYS` arrays of
-    /// `SLICES` slices of `SIDE` x `SIDE` RGBA8 texels over their CPU copies in region blocks, then
-    /// carries out a `TEXTURE_REPLACE_REGION` of each whole slice, and prints the median create and
-    /// replace times and the bytes of the platform textures made beside the CPU copies.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "a measurement, run by hand"]
-    #[allow(clippy::disallowed_methods)] // a measurement: the wall times are figures it prints
-    fn managed_array_cost_on_metal() {
-        use std::time::{Duration, Instant};
-
-        use crate::platform::ApiPlatform as _;
-        type P = reims_vgpu_metal::MetalPlatform;
-        const ARRAYS: u64 = 16;
-        const SLICES: u64 = 4;
-        const SIDE: u64 = 512;
-        const SLICE: u64 = SIDE * 4 * SIDE;
-        let platform = P::process();
-        let device = platform.metal_device(None).unwrap();
-        crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
-        let size = BLOCKS + ARRAYS * SLICES * SLICE + RGFX_CURSOR_SPAN;
-        let region = Arc::new(Region::new(size as usize).unwrap());
-        let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::clone(&region));
-        dec.set_unified_memory(true);
-        dec.hold_resource_ids(0, 0);
-        let median = |mut times: Vec<Duration>| {
-            times.sort();
-            times[times.len() / 2].as_secs_f64() * 1e6
-        };
-        let (mut creates, mut replaces, mut copies) = (Vec::new(), Vec::new(), 0);
-        for n in 0..ARRAYS {
-            let (buffer, texture) = (100 + 2 * n, 101 + 2 * n);
-            let at = BLOCKS + n * SLICES * SLICE;
-            let m = RgfxBufferOverHostMemory {
-                header: header(RGFX_CMD_BUFFER_OVER_HOST_MEMORY),
-                obj_id: buffer,
-                gpu_address: 0,
-                region_offset: at,
-                length: SLICES * SLICE,
-                options: 0,
-                ..RgfxBufferOverHostMemory::default()
-            };
-            assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
-            let m = RgfxManagedTextureCreate {
-                header: header(RGFX_CMD_MANAGED_TEXTURE_CREATE),
-                obj_id: texture,
-                gpu_address: 0,
-                // Of the 64 ids of chunk 0, which the context holds.
-                resource_id: 1 + n,
-                cpu_buffer_obj_id: buffer,
-                bytes_per_block: 4,
-                block_width: 1,
-                block_height: 1,
-                flags: RGFX_MANAGED_TEXTURE_LINEAR,
-                desc: RgfxTextureDescriptor {
-                    texture_type: 3,
-                    array_length: SLICES as u32,
-                    ..rgba(SIDE as u32, SIDE as u32, 1)
-                },
-            };
-            let start = Instant::now();
-            assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
-            creates.push(start.elapsed());
-            if dec.managed_copy(texture).unwrap().cpu.is_some() {
-                copies += 1;
-            }
-            for slice in 0..SLICES as u32 {
-                let m = RgfxTextureReplaceRegion {
-                    header: header(RGFX_CMD_TEXTURE_REPLACE_REGION),
-                    obj_id: texture,
-                    level: 0,
-                    slice,
-                    origin: [0, 0, 0],
-                    size: [SIDE as u32, SIDE as u32, 1],
-                };
-                let start = Instant::now();
-                assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
-                replaces.push(start.elapsed());
-            }
-        }
-        println!(
-            "managed_array_cost: {ARRAYS} arrays of {SLICES} x {SIDE}x{SIDE} RGBA8: create {:.1} us, \
-             replace of a slice {:.1} us (medians); {copies} GPU copies beside the CPU copies, \
-             {} MiB",
-            median(creates),
-            median(replaces),
-            (copies * SLICES * SLICE) >> 20
         );
     }
 }

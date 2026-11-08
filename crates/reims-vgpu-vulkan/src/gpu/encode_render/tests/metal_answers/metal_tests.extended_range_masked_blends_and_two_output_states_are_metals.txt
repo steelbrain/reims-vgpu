@@ -1,0 +1,637 @@
+# Metal's answers, recorded from the Metal platform on an M3 Max, macOS 27.0.1, 2026-11-07. Never rewrite them from this library's own output.
+xr_half_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 4854ade505a4dabbd658821400005de4 6060a03fc1c040bf999898be0000803fd6d5d5bee2e1e1be838282bedddc5c3f
+xr_half_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 c5f8da0351fc1eb8c30dc73c63deebe5 b0af2f3fc1c040bf999898be0000803f9594943de2e1e1be838282bedddc5c3f
+xr_half_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 155dff90df1de68a046bbcf89fc9da61 e6e5653fc1c040bf999898be0000803ffefdfdbee2e1e1be838282bedddc5c3f
+xr_half_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 5df2ab48dd39bc4f70707d3aacfcf499 f5f4743fc1c040bf999898be0000803fc1c040bfe2e1e1be838282bedddc5c3f
+xr_half_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 1d9bb025545eeadb183f11303c8aea66 6b6b6b3fc1c040bf999898be0000803fa1a0a03de2e1e1be838282bedddc5c3f
+xr_half_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 be9943fefe79cdca8086cc0946044148 6d6d6d3fc1c040bf999898be0000803f181818bfe2e1e1be838282bedddc5c3f
+xr_half_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 a9cc4abcc811692b9f1383feeba13b7e e4e3633fc1c0c03e999898be0000803fa5a4a43e4f4f4f3f838282be0000803f
+xr_half_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 56ec6ef6d44804221ec20a3c96a454a7 e4e3633f959414bf999898bec5c4443fa5a4a43ecdccccbd838282bec9c8483e
+xr_half_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 2c43d0723427ced113deaab286fa87b9 e4e3633fa5a4a4be999898be0000803fa5a4a43e5d5d5d3f838282bef8f7773f
+xr_half_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 a7940fad80b59bb684fb1307b9aef4be e4e3633fc1c040bf999898be0000803fa5a4a43eb2b131bf838282be0000803f
+xr_half_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 d6a35cee0cbb779a93966cc757624b19 e4e3633f3232323f999898bed1d0d03ea5a4a43ee1e060bd838282bed8d7573f
+xr_half_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 43b02bfdba63659b235d5a6f79644b03 e4e3633f9190903f999898beedec6c3ea5a4a43e4242823f838282bec9c8483f
+xr_half_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 876093b3774da2aaf51a7ba88c5321fb e4e3633fc1c040bfbfbe3ebf0000803fa5a4a43ee2e1e1bec7c6463edddc5c3f
+xr_half_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 66d577845706d71342e3e7fb45e6995b e4e3633fc1c040bfebea6abe0000803fa5a4a43ee2e1e1bef1f070bddddc5c3f
+xr_half_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 6a7dc030bbfad5d2d7089d80c6280897 e4e3633fc1c040bfaaa9a9be0000803fa5a4a43ee2e1e1be9493933edddc5c3f
+xr_half_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 e30977c999d9007fd63389ec65536ea4 e4e3633fc1c040bfc1c040bf0000803fa5a4a43ee2e1e1bee1e0e03cdddc5c3f
+xr_half_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 601ece670d783b7c2befeb6facc371a1 e4e3633fc1c040bfd3d2d2be0000803fa5a4a43ee2e1e1bec1c0c0bddddc5c3f
+xr_half_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 886859b036a5088bee82967143c141c8 e4e3633fc1c040bfe5e4e4be0000803fa5a4a43ee2e1e1beb5b4b43edddc5c3f
+xr_half_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 303c14f1a6a0ec24a8e425105cc16f25 6060a03fc1c0c03e999898be0000803fd6d5d5be4f4f4f3f838282bedddc5c3f
+xr_half_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 33a45431b7cabaae5981298f24244ba4 b0af2f3f959414bf999898be0000803f9594943dcdccccbd838282bedddc5c3f
+xr_half_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 9ff37bb84f3f5b4d1ff239171638b335 e6e5653fa5a4a4be999898be0000803ffefdfdbe5d5d5d3f838282bedddc5c3f
+xr_half_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 3c52c943038f3359cb89903f46d32798 f5f4743fc1c040bf999898be0000803fc1c040bfb2b131bf838282bedddc5c3f
+xr_half_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 ce3bd120d0ff8f77d07cf6b85f88a158 6b6b6b3f3232323f999898be0000803fa1a0a03de1e060bd838282bedddc5c3f
+xr_half_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 2374d1ca6b84d9d80972642b27743f93 6d6d6d3f9190903f999898be0000803f181818bf4242823f838282bedddc5c3f
+xr_half_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 e05cfb7f31afd6b64a3757f9a5260d17 e4e3633fc1c0c03ebfbe3ebf0000803fa5a4a43e4f4f4f3fc7c6463e0000803f
+xr_half_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 99eca8ed03a441bfcd1eb499193e5522 e4e3633f959414bfebea6abec5c4443fa5a4a43ecdccccbdf1f070bdc9c8483e
+xr_half_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 555244897d6aa51e65e7d31521086fd0 e4e3633fa5a4a4beaaa9a9be0000803fa5a4a43e5d5d5d3f9493933ef8f7773f
+xr_half_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 e2147705cf2e71eb3cbc1f1817e13fa8 e4e3633fc1c040bfc1c040bf0000803fa5a4a43eb2b131bfe1e0e03c0000803f
+xr_half_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 d409d2de7d75ccc00eb9d2c5c73da206 e4e3633f3232323fd3d2d2bed1d0d03ea5a4a43ee1e060bdc1c0c0bdd8d7573f
+xr_half_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 4f1696620b61032130ee142ab2f06235 e4e3633f9190903fe5e4e4beedec6c3ea5a4a43e4242823fb5b4b43ec9c8483f
+xr_float_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 6e203d8d6e0326825d6e47bc5736c4af 6060a03fc0bfbf3e9a99193fe3e2e23e6060a03f8887073f999818bfbdbcbc3e
+xr_float_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 28a50c16fcbe2feabdef42ed98de4299 1111913fc0bfbf3e9a99193fe3e2e23e9e9d1d3f8887073f999818bfbdbcbc3e
+xr_float_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 bd623f1288fbfb6894416f1bef1f33f0 5959993fc0bfbf3e9a99193fe3e2e23e3d3d3d3f8887073f999818bfbdbcbc3e
+xr_float_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 184e20a6f797559f363818b779051cd6 8b8a8a3ec0bfbf3e9a99193fe3e2e23e1212123f8887073f999818bfbdbcbc3e
+xr_float_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 a22f0c224ed3d17d42aa69ec9902d266 5b5b9b3fc0bfbf3e9a99193fe3e2e23e0d0d0d3f8887073f999818bfbdbcbc3e
+xr_float_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 829132222eb6934fd337175a5f1d48be 1a1a9a3fc0bfbf3e9a99193fe3e2e23eb7b6363f8887073f999818bfbdbcbc3e
+xr_float_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 cebb129f8e9f2bf011daae8ec1f03e6b 1919993ff1f0f03e9a99193ffdfcfc3ee9e8683f3333333f999818bfb1b0303f
+xr_float_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 96d6909d050889c59b047b3b56380bff 1919993fb6b5b53e9a99193fd7d6d63ee9e8683fb8b7b73e999818bf8180803e
+xr_float_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 d1e70e6578ccd396dda6df973b1e110d 1919993fb9b8b83e9a99193ff1f0f03ee9e8683fd4d3d33e999818bf9392123f
+xr_float_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 9c3673befb10525a36722a9b72921643 1919993f8281813e9a99193ffdfcfc3ee9e8683fadacac3e999818bfb1b0303f
+xr_float_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 de001f2751e1bade7b8ccd1d4f654124 1919993fe1e0e03d9a99193f9998983de9e8683f9392923e999818bfadacac3e
+xr_float_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 a8e632089fdaeefcdbb4bab373d20530 1919993f8180803e9a99193f8b8a8a3ee9e8683fcccbcb3e999818bfb5b4b43e
+xr_float_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 44c28a7fc24e21964b643add6d441f10 1919993fc0bfbf3e5050903fe3e2e23ee9e8683f8887073fc2c1c13ebdbcbc3e
+xr_float_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 f35054bad61a4a1bf3ad7645d2ea1f95 1919993fc0bfbf3e9291113fe3e2e23ee9e8683f8887073fcfcecebebdbcbc3e
+xr_float_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 05fa2ee363f54ecabb684569d500729b 1919993fc0bfbf3e9998183fe3e2e23ee9e8683f8887073fb5b4b4bdbdbcbc3e
+xr_float_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 7db1a91cab0b87f73d9f3f57dc9ec8f1 1919993fc0bfbf3e0404043fe3e2e23ee9e8683f8887073fc7c646bebdbcbc3e
+xr_float_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 7b53dbe5b969b4234a8557554ccb25ab 1919993fc0bfbf3e0808083fe3e2e23ee9e8683f8887073fefeeee3ebdbcbc3e
+xr_float_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 23c1e9f604a60d83342941d2eb54338e 1919993fc0bfbf3e1111113fe3e2e23ee9e8683f8887073f919090bcbdbcbc3e
+xr_float_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 1063cfca6e6e327412b1f9964469e9bb 6060a03ff1f0f03e9a99193fe3e2e23e6060a03f3333333f999818bfbdbcbc3e
+xr_float_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 419245ce8fdd7296457918151e7b837f 1111913fb6b5b53e9a99193fe3e2e23e9e9d1d3fb8b7b73e999818bfbdbcbc3e
+xr_float_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 6b3033b14c3f4bbe0a53cd29f1e14356 5959993fb9b8b83e9a99193fe3e2e23e3d3d3d3fd4d3d33e999818bfbdbcbc3e
+xr_float_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 4ac78b17c3b3ebf1a6162a1d9aded702 8b8a8a3e8281813e9a99193fe3e2e23e1212123fadacac3e999818bfbdbcbc3e
+xr_float_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 53f7e394aaba3dd02856731f4d817a05 5b5b9b3fe1e0e03d9a99193fe3e2e23e0d0d0d3f9392923e999818bfbdbcbc3e
+xr_float_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 a7fce114f56150590582763e547c55a6 1a1a9a3f8180803e9a99193fe3e2e23eb7b6363fcccbcb3e999818bfbdbcbc3e
+xr_float_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 168a880a1b8a27c3e77d4b90682e2bb2 1919993ff1f0f03e5050903ffdfcfc3ee9e8683f3333333fc2c1c13eb1b0303f
+xr_float_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 5c577fe7dbb362e68b011b0e2e2bf2f3 1919993fb6b5b53e9291113fd7d6d63ee9e8683fb8b7b73ecfcecebe8180803e
+xr_float_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 26c7fc68d808c31cb2f38c980a2b4ddb 1919993fb9b8b83e9998183ff1f0f03ee9e8683fd4d3d33eb5b4b4bd9392123f
+xr_float_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 ce91f1c2dfdd1ea834bf59422b576aa7 1919993f8281813e0404043ffdfcfc3ee9e8683fadacac3ec7c646beb1b0303f
+xr_float_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 4a2a7ba543f484f38e23c131521d0346 1919993fe1e0e03d0808083f9998983de9e8683f9392923eefeeee3eadacac3e
+xr_float_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 06b1e170e3e0395d0eae3ab77ef9a163 1919993f8180803e1111113f8b8a8a3ee9e8683fcccbcb3e919090bcb5b4b43e
+xr_loaded_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 61991e29f55d84037ac4d7df26f06c00 6060a03fdfde5e3fb3b2b2bedddcdc3eb7b6b63e8887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 8d103ed21c65238459b5596309a69455 00000000dfde5e3fb3b2b2bedddcdc3e000000008887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 2459c38d0ecd2b805edaf14fbfa7b966 a6a5a53edfde5e3fb3b2b2bedddcdc3e898808be8887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 35cc30ae0404a01b7ccc6879a1f80e33 a2a1213fdfde5e3fb3b2b2bedddcdc3ed9d8583e8887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 14f81df495c0605855bbf0c9b4321901 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 762b0387a7fc617542688c2ee6b5df47 2f2f2f3fdfde5e3fb3b2b2bedddcdc3ee1e0e03c8887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 c010d63ccc0e478bc5924c9b287cecde 7575753f6060a03fb3b2b2be0000803ffbfafa3e9392923f999818be0000803f
+xr_loaded_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 1606e06adde63f19912452ffba31b2d6 7575753f00000000b3b2b2be00000000fbfafa3e00000000999818be00000000
+xr_loaded_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 33674c800991876e62a7b0b854022069 7575753f2020a03fb3b2b2be0000803ffbfafa3eb1b0b03d999818be0000803f
+xr_loaded_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 d4c4687666a87aa33b5303ae36ea6374 7575753ff9f8783db3b2b2be0000803ffbfafa3e5d5d5d3f999818be0000803f
+xr_loaded_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 a685002e427b0bb7dcc231e78f0fbdc3 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 2aeebbb7d7669c9f8f8519bf80f058f8 7575753f4444843fb3b2b2beaead2d3ffbfafa3eaeadad3e999818beefee6e3f
+xr_loaded_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 206f0e7de22e614904fe512b3f53bd7a 7575753fdfde5e3fe5e464bedddcdc3efbfafa3e8887873fe0dfdfbebebd3d3f
+xr_loaded_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 de0db45cec682ff4168a18c358834c90 7575753fdfde5e3f00000000dddcdc3efbfafa3e8887873f00000000bebd3d3f
+xr_loaded_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 6cfdbe14ba3c616ab2ad96872a5a5f5d 7575753fdfde5e3f8180003edddcdc3efbfafa3e8887873f949393bebebd3d3f
+xr_loaded_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 2b6f3525e6466b7f9061ed7fd2067268 7575753fdfde5e3fa1a020bddddcdc3efbfafa3e8887873ff6f5f5bebebd3d3f
+xr_loaded_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 bbec70966b47a8b3d05d4a4a18065a3e 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 2b95b97ef3510d3edc3200a28d92a63b 7575753fdfde5e3f939212bedddcdc3efbfafa3e8887873f818080bebebd3d3f
+xr_loaded_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 42a3abb641e41c74e7bd6a1d0a8ff19d 6060a03f6060a03fb3b2b2bedddcdc3eb7b6b63e9392923f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 78dcdbbe83b086017a2b84129fbe099c 0000000000000000b3b2b2bedddcdc3e0000000000000000999818bebebd3d3f
+xr_loaded_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 609f6a2d2f15fc1d4c603fa1d8de0f04 a6a5a53e2020a03fb3b2b2bedddcdc3e898808beb1b0b03d999818bebebd3d3f
+xr_loaded_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 c979d86851537066c8e1d9ee55bb08f8 a2a1213ff9f8783db3b2b2bedddcdc3ed9d8583e5d5d5d3f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 9b1a7acd7f80d69bf399dcf3e2b94db7 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 8baa04e5566d1a7d8354eac8f94b4b5b 2f2f2f3f4444843fb3b2b2bedddcdc3ee1e0e03caeadad3e999818bebebd3d3f
+xr_loaded_fragment format 550 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 ff50e488368effa85753a11f625113b7 7575753f6060a03fe5e464be0000803ffbfafa3e9392923fe0dfdfbe0000803f
+xr_loaded_fragment format 550 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 c9c1a7c1dd3b765067e802afc86df7a9 7575753f000000000000000000000000fbfafa3e000000000000000000000000
+xr_loaded_fragment format 550 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 9d7656d9fbb8d6ee581355fe2615d777 7575753f2020a03f8180003e0000803ffbfafa3eb1b0b03d949393be0000803f
+xr_loaded_fragment format 550 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 ab6157ad1e1f273a6ee77680102baebb 7575753ff9f8783da1a020bd0000803ffbfafa3e5d5d5d3ff6f5f5be0000803f
+xr_loaded_fragment format 550 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 8a0c3cc12bab09afc102d8e03641c716 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818bebebd3d3f
+xr_loaded_fragment format 550 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 50146d331fdf768fecbd937f03e1a59c 7575753f4444843f939212beaead2d3ffbfafa3eaeadad3e818080beefee6e3f
+xr_half_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 ce8944c0793f7847a853ed5b2608ce32 6060a03fc1c040bf999898be0000803fd6d5d5bee2e1e1be838282be5d5d5d3f
+xr_half_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 b73179ce933ea35fc2f0e1c5a025ab13 b0af2f3fc1c040bf999898be0000803f9594943de2e1e1be838282be5d5d5d3f
+xr_half_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 d5dfb2f898c1514825b5c5714b42d3cf e6e5653fc1c040bf999898be0000803ffefdfdbee2e1e1be838282be5d5d5d3f
+xr_half_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 652916e78259e9d98eeec58dabe77d7c f5f4743fc1c040bf999898be0000803fc1c040bfe2e1e1be838282be5d5d5d3f
+xr_half_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 98b43d9aa8e3fdae4213750ba7349ff4 6b6b6b3fc1c040bf999898be0000803fa1a0a03de2e1e1be838282be5d5d5d3f
+xr_half_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 67c91da87a8292c30a50be768574f535 6d6d6d3fc1c040bf999898be0000803f999818bfe2e1e1be838282be5d5d5d3f
+xr_half_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 73c6c96e185f6b3eba8ebf02fddf74e7 e4e3633fc1c0c03e999898be0000803fa5a4a43e4f4f4f3f838282be0000803f
+xr_half_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 e1c98efa9c8386e9617bd218723ca349 e4e3633f959414bf999898be4545453fa5a4a43ecdccccbd838282becbca4a3e
+xr_half_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 ca4569256e79cad93d46b2ab07af5c75 e4e3633fa5a4a4be999898be0000803fa5a4a43e5d5d5d3f838282bef8f7773f
+xr_half_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 2acd4a0d73be27c5a23baa817e527898 e4e3633fc1c040bf999898be0000803fa5a4a43e323232bf838282be0000803f
+xr_half_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 ac5914485066c4f31300001355a2895f e4e3633f3232323f999898bed0cfcf3ea5a4a43ee1e060bd838282bed8d7573f
+xr_half_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 db2a93246c9bbc278e6580797ce0e15e e4e3633f9190903f999898beebea6a3ea5a4a43ec3c2823f838282bec9c8483f
+xr_half_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 c92124ec5082058fbd4f5bc17c3c1521 e4e3633fc1c040bfbfbe3ebf0000803fa5a4a43ee2e1e1bec7c6463e5d5d5d3f
+xr_half_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 9140c381e4388d45cf7ecf050b83d751 e4e3633fc1c040bfebea6abe0000803fa5a4a43ee2e1e1bef1f070bd5d5d5d3f
+xr_half_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 189f035302c65096e9d1415475f6a201 e4e3633fc1c040bfaaa9a9be0000803fa5a4a43ee2e1e1be9493933e5d5d5d3f
+xr_half_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 9128d13dc81d8e3c4243d7660cc92c8e e4e3633fc1c040bfc1c040bf0000803fa5a4a43ee2e1e1bee1e0e03c5d5d5d3f
+xr_half_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 a3693eb22b20bd0090fa5b44e234aa37 e4e3633fc1c040bfd3d2d2be0000803fa5a4a43ee2e1e1bec1c0c0bd5d5d5d3f
+xr_half_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 e344691369240743a3e9cd9cf8a64d2f e4e3633fc1c040bfe5e4e4be0000803fa5a4a43ee2e1e1beb6b5b53e5d5d5d3f
+xr_half_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 a5b0c61095112287b6301b8a7d080ebb 6060a03fc1c0c03e999898be0000803fd6d5d5be4f4f4f3f838282be5d5d5d3f
+xr_half_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 2bcd7d998d098b96f9237487b547a9ae b0af2f3f959414bf999898be0000803f9594943dcdccccbd838282be5d5d5d3f
+xr_half_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 0364608e0e8165b132cca26fc4691c7f e6e5653fa5a4a4be999898be0000803ffefdfdbe5d5d5d3f838282be5d5d5d3f
+xr_half_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 037d66162abac00ef46a539897fe5292 f5f4743fc1c040bf999898be0000803fc1c040bf323232bf838282be5d5d5d3f
+xr_half_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 d8da9623f421f16c14ff0f9c6fc6a5ce 6b6b6b3f3232323f999898be0000803fa1a0a03de1e060bd838282be5d5d5d3f
+xr_half_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 4a5f3e4506c539abfd28b199585dca34 6d6d6d3f9190903f999898be0000803f999818bfc3c2823f838282be5d5d5d3f
+xr_half_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 f2d794816de31d870878c69dc148aa92 e4e3633fc1c0c03ebfbe3ebf0000803fa5a4a43e4f4f4f3fc7c6463e0000803f
+xr_half_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 8a2ad7f6bda37445b1eceb237fd749e0 e4e3633f959414bfebea6abe4545453fa5a4a43ecdccccbdf1f070bdcbca4a3e
+xr_half_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 28c4125350ad9e1838d2e47c5bb0dd34 e4e3633fa5a4a4beaaa9a9be0000803fa5a4a43e5d5d5d3f9493933ef8f7773f
+xr_half_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 c26baf33c8fb197bb061473e2dc0715a e4e3633fc1c040bfc1c040bf0000803fa5a4a43e323232bfe1e0e03c0000803f
+xr_half_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 277479aa37fcffdda8c4cd06c7731ea4 e4e3633f3232323fd3d2d2bed0cfcf3ea5a4a43ee1e060bdc1c0c0bdd8d7573f
+xr_half_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 a6160cedea344fba35a8e0ce6d43f215 e4e3633f9190903fe5e4e4beebea6a3ea5a4a43ec3c2823fb6b5b53ec9c8483f
+xr_float_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 64163d641013b920cf90ae7f74f60725 6060a03fc0bfbf3e9a99193fe3e2e23e6060a03f8887073f999818bfbebdbd3e
+xr_float_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 cd4ba7e4f774bbe1dc0cd2008567e8af 1111913fc0bfbf3e9a99193fe3e2e23e9e9d1d3f8887073f999818bfbebdbd3e
+xr_float_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 ee1689200e6397f27401c4f27dae5a56 5959993fc0bfbf3e9a99193fe3e2e23e3d3d3d3f8887073f999818bfbebdbd3e
+xr_float_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 b85f2fb65647a3802288181f4f77a17e 8b8a8a3ec0bfbf3e9a99193fe3e2e23e9392123f8887073f999818bfbebdbd3e
+xr_float_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 1b6ac75cc40fb68707a9b03afe671e4c 5b5b9b3fc0bfbf3e9a99193fe3e2e23e0d0d0d3f8887073f999818bfbebdbd3e
+xr_float_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 cb788a1797364ce5039327e3dc7aa493 1a1a9a3fc0bfbf3e9a99193fe3e2e23eb7b6363f8887073f999818bfbebdbd3e
+xr_float_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 61d1a09380f404a1b383822a1fd3f2b3 1919993ff1f0f03e9a99193ffefdfd3ee9e8683f3333333f999818bfb2b1313f
+xr_float_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 56c46cac4a6a2979fb24e1831be61b2e 1919993fb6b5b53e9a99193fd7d6d63ee9e8683fb8b7b73e999818bf8180803e
+xr_float_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 d89a955185ed1976d66ecc3c8c9f166c 1919993fb9b8b83e9a99193ff2f1f13ee9e8683fd4d3d33e999818bf1313133f
+xr_float_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 c9ae42588cfa10dcd649678dc84dd165 1919993f8281813e9a99193ffefdfd3ee9e8683fadacac3e999818bfb2b1313f
+xr_float_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 79727347b46810d293b2cbe77c5e18b4 1919993fe1e0e03d9a99193f9594943de9e8683f9392923e999818bfaeadad3e
+xr_float_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 f3962bff0e6718bc386b60bd86965510 1919993f8180803e9a99193f8b8a8a3ee9e8683fcbcaca3e999818bfb5b4b43e
+xr_float_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 afc6188f8c7f6f8efbe03da25d943ada 1919993fc0bfbf3e5050903fe3e2e23ee9e8683f8887073fc2c1c13ebebdbd3e
+xr_float_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 a4862f157106b48d7e9adeafc3fd63e3 1919993fc0bfbf3e9291113fe3e2e23ee9e8683f8887073fcfcecebebebdbd3e
+xr_float_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 bafbef8fa104c9da7f300c71455c3a49 1919993fc0bfbf3e9998183fe3e2e23ee9e8683f8887073fb5b4b4bdbebdbd3e
+xr_float_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 263205afe8188ac2ec31d4e925c2250f 1919993fc0bfbf3e0404043fe3e2e23ee9e8683f8887073fc9c848bebebdbd3e
+xr_float_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 daca5f74a3aaab55323e216d91a9fe69 1919993fc0bfbf3e0808083fe3e2e23ee9e8683f8887073fefeeee3ebebdbd3e
+xr_float_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 4c8b8add5154d8903f3842ac063d43da 1919993fc0bfbf3e1111113fe3e2e23ee9e8683f8887073fe1e060bcbebdbd3e
+xr_float_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 4b9359b4095a741ca6f99c137a7ddbb1 6060a03ff1f0f03e9a99193fe3e2e23e6060a03f3333333f999818bfbebdbd3e
+xr_float_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 246fb61a5ab2729bbc36143de2297315 1111913fb6b5b53e9a99193fe3e2e23e9e9d1d3fb8b7b73e999818bfbebdbd3e
+xr_float_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 df6969f057593a8b3fcb337543d36544 5959993fb9b8b83e9a99193fe3e2e23e3d3d3d3fd4d3d33e999818bfbebdbd3e
+xr_float_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 74633c17e3474a66ce991aae33f9703c 8b8a8a3e8281813e9a99193fe3e2e23e9392123fadacac3e999818bfbebdbd3e
+xr_float_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 880b72bff7e529b53e7b6d0593f0ec0f 5b5b9b3fe1e0e03d9a99193fe3e2e23e0d0d0d3f9392923e999818bfbebdbd3e
+xr_float_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 ed1105860c6e865b6e2678a98b5c5a70 1a1a9a3f8180803e9a99193fe3e2e23eb7b6363fcbcaca3e999818bfbebdbd3e
+xr_float_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 5c9a5f1a4f8feeb9848213f437562d7e 1919993ff1f0f03e5050903ffefdfd3ee9e8683f3333333fc2c1c13eb2b1313f
+xr_float_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 3fa4fab49926428c2ed50b6e8fab0c96 1919993fb6b5b53e9291113fd7d6d63ee9e8683fb8b7b73ecfcecebe8180803e
+xr_float_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 174d21ac1cfc933a9390be0a3780e706 1919993fb9b8b83e9998183ff2f1f13ee9e8683fd4d3d33eb5b4b4bd1313133f
+xr_float_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 c8fa6327f080318e07b6bbd98bc17ea1 1919993f8281813e0404043ffefdfd3ee9e8683fadacac3ec9c848beb2b1313f
+xr_float_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 914b61915a244d0b6f76a829854a497a 1919993fe1e0e03d0808083f9594943de9e8683f9392923eefeeee3eaeadad3e
+xr_float_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 642477b834c16a24fec1979bcb4e8239 1919993f8180803e1111113f8b8a8a3ee9e8683fcbcaca3ee1e060bcb5b4b43e
+xr_loaded_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 dc7eca485e4071aff42870fd0d8a8796 6060a03fdfde5e3fb3b2b2bedddcdc3eb7b6b63e8887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 642aeb0cb504249ef98be7dbf6d8f447 00000000dfde5e3fb3b2b2bedddcdc3e000000008887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 2346b88228afff3130423978a4feb4c4 a6a5a53edfde5e3fb3b2b2bedddcdc3e898808be8887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 da3c6ebd1fca55b5ccea1c0f3e0d17af a2a1213fdfde5e3fb3b2b2bedddcdc3ed7d6563e8887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 f42451e3a3ed52392e7219a08688a3ff 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 408e33620e4aff4fd9da44b32bae225c 2f2f2f3fdfde5e3fb3b2b2bedddcdc3ef1f0f03c8887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 84507592ad338a49e0d066af3354ed07 7575753f6060a03fb3b2b2be0000803ffbfafa3e9392923f999818be0000803f
+xr_loaded_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 866a4bdd2e68184c6c2cff3cc3367251 7575753f00000000b3b2b2be00000000fbfafa3e00000000999818be00000000
+xr_loaded_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 cb2e0a58fe725b483fe083540cdda77e 7575753f2020a03fb3b2b2be0000803ffbfafa3eb1b0b03d999818be0000803f
+xr_loaded_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 cbe9152dfd401795fe9a4128502da1eb 7575753ff9f8783db3b2b2be0000803ffbfafa3edddc5c3f999818be0000803f
+xr_loaded_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 f51d6827c56b71e45f3225ffb5cec8ae 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 28c9e8313f3ab85ac833459a708d5151 7575753f4444843fb3b2b2be2d2d2d3ffbfafa3eafaeae3e999818be6e6e6e3f
+xr_loaded_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 4db1cf5e064f48eb60581ca955c3d3f8 7575753fdfde5e3fe5e464bedddcdc3efbfafa3e8887873fe0dfdfbe3d3d3d3f
+xr_loaded_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 c240931aaa33912fd5f5b3c842ea711e 7575753fdfde5e3f00000000dddcdc3efbfafa3e8887873f000000003d3d3d3f
+xr_loaded_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 6de51b9e8e0d8cc3529ba54fd7a8ff1f 7575753fdfde5e3f8180003edddcdc3efbfafa3e8887873f949393be3d3d3d3f
+xr_loaded_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 4a321df8547209acf5774c2d297e7ed6 7575753fdfde5e3fa1a020bddddcdc3efbfafa3e8887873ff6f5f5be3d3d3d3f
+xr_loaded_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 cce0834d62326f67670ffe5ad8c99bb0 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 788fdb4b750ddeb724b8921388953c5e 7575753fdfde5e3f939212bedddcdc3efbfafa3e8887873f818080be3d3d3d3f
+xr_loaded_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 d5dd2ff67207fd522b6c1f4f06b59e2b 6060a03f6060a03fb3b2b2bedddcdc3eb7b6b63e9392923f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 fe2cd9ea4c7a0381790f2ae8400ada3e 0000000000000000b3b2b2bedddcdc3e0000000000000000999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 a43ba464d3af17445b1439c1dddd7422 a6a5a53e2020a03fb3b2b2bedddcdc3e898808beb1b0b03d999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 1b10f56edd8cfb11b7c969d2ac722be6 a2a1213ff9f8783db3b2b2bedddcdc3ed7d6563edddc5c3f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 62a9a79a23eac689ebac5e1825381501 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 339ffb5f26f4b67b3863d7f5d24ffff4 2f2f2f3f4444843fb3b2b2bedddcdc3ef1f0f03cafaeae3e999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 f62f0ef403007b48d4512b29f1d2fb62 7575753f6060a03fe5e464be0000803ffbfafa3e9392923fe0dfdfbe0000803f
+xr_loaded_fragment format 552 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 9e10d5769fd481df6466e6b34355f172 7575753f000000000000000000000000fbfafa3e000000000000000000000000
+xr_loaded_fragment format 552 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 e7839ab4d9441f18eae2953d267bdedc 7575753f2020a03f8180003e0000803ffbfafa3eb1b0b03d949393be0000803f
+xr_loaded_fragment format 552 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 ec3914c802e5e830cedd8cbd35803424 7575753ff9f8783da1a020bd0000803ffbfafa3edddc5c3ff6f5f5be0000803f
+xr_loaded_fragment format 552 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 8a6dafc86ca357beb7a6955936fbc67f 7575753fdfde5e3fb3b2b2bedddcdc3efbfafa3e8887873f999818be3d3d3d3f
+xr_loaded_fragment format 552 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 b95989eb348f3040eb310e197adac5d6 7575753f4444843f939212be2d2d2d3ffbfafa3eafaeae3e818080be6e6e6e3f
+xr_half_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 d5cf14d15fb91e08ac5635d2578e55ce 6060a03fc1c040bf999898be0000803fd6d5d5bee2e1e1be838282be0000803f
+xr_half_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 3373e1e2c4affc5264caa49aa34f4c17 b0af2f3fc1c040bf999898be0000803f9594943de2e1e1be838282be0000803f
+xr_half_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 e507fc8291f1468c02dd2d9a97a0c69b e6e5653fc1c040bf999898be0000803ffefdfdbee2e1e1be838282be0000803f
+xr_half_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 8a0c3d341ba3d6f7e3a15bc27014faf9 f5f4743fc1c040bf999898be0000803fc1c040bfe2e1e1be838282be0000803f
+xr_half_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 e1e4f0d9c09ad5f2733c8e11c26fc4e8 6b6b6b3fc1c040bf999898be0000803fa1a0a03de2e1e1be838282be0000803f
+xr_half_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 482d3de801779987a2d48beeee907de1 6d6d6d3fc1c040bf999898be0000803f3d3d3dbfe2e1e1be838282be0000803f
+xr_half_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 2ff1ab075288b66cb44a53e9dbed5be1 e4e3633fc1c0c03e999898be0000803fa5a4a43e4f4f4f3f838282be0000803f
+xr_half_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 51f40c9c17b3b972961d851a1d5b7545 e4e3633f959414bf999898be0000803fa5a4a43ecdccccbd838282be0000803f
+xr_half_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 93fa860b1591ac7bf4de4a280dfa2c94 e4e3633fa5a4a4be999898be0000803fa5a4a43e5d5d5d3f838282be0000803f
+xr_half_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 9749ac930aae337ba2e484940c854bc9 e4e3633fc1c040bf999898be0000803fa5a4a43ec1c040bf838282be0000803f
+xr_half_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 b0f3b26cd9209fc4bc74a6709e24a772 e4e3633f3232323f999898be0000803fa5a4a43ee1e060bd838282be0000803f
+xr_half_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 38e0c76cf4f5bd347fbc52c3771cb948 e4e3633f9190903f999898be0000803fa5a4a43e2020a03f838282be0000803f
+xr_half_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 e91ce2ed1c1f08d4c7b7ef7b353ffc31 e4e3633fc1c040bfbfbe3ebf0000803fa5a4a43ee2e1e1bec7c6463e0000803f
+xr_half_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 a92f26326b6e6fd5450ae3000dca23ad e4e3633fc1c040bfebea6abe0000803fa5a4a43ee2e1e1bef1f070bd0000803f
+xr_half_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 b57b32a59bd9c3e356279bdcbd584f19 e4e3633fc1c040bfaaa9a9be0000803fa5a4a43ee2e1e1be9493933e0000803f
+xr_half_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 af76d1e2fbb8daf297cf0c982ecc6130 e4e3633fc1c040bfc1c040bf0000803fa5a4a43ee2e1e1be818000bc0000803f
+xr_half_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 86e8726a0390d31cd3c8fc4a3e45b687 e4e3633fc1c040bfd3d2d2be0000803fa5a4a43ee2e1e1bec1c0c0bd0000803f
+xr_half_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 75935da665c7cbebc4f31c7cdbe52048 e4e3633fc1c040bfe5e4e4be0000803fa5a4a43ee2e1e1bee6e5e53e0000803f
+xr_half_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 00f437dacfea033f320210c4b7a4e0af 6060a03fc1c0c03e999898be0000803fd6d5d5be4f4f4f3f838282be0000803f
+xr_half_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 ca3ab06ddb70ea8179378e628866622a b0af2f3f959414bf999898be0000803f9594943dcdccccbd838282be0000803f
+xr_half_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 bd0a25bfbd35f5d11556de3a1035729b e6e5653fa5a4a4be999898be0000803ffefdfdbe5d5d5d3f838282be0000803f
+xr_half_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 7a4a4bb9a140cf59915f7d50d9d41090 f5f4743fc1c040bf999898be0000803fc1c040bfc1c040bf838282be0000803f
+xr_half_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 9641bbcb21ce4cbacaf5c4ba5bdf8272 6b6b6b3f3232323f999898be0000803fa1a0a03de1e060bd838282be0000803f
+xr_half_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 668345643e58873b338b5e2b662c3c7d 6d6d6d3f9190903f999898be0000803f3d3d3dbf2020a03f838282be0000803f
+xr_half_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 19ff58ef082512394f21d03ec02ba420 e4e3633fc1c0c03ebfbe3ebf0000803fa5a4a43e4f4f4f3fc7c6463e0000803f
+xr_half_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 00b14f5259405dadffd129586642efd0 e4e3633f959414bfebea6abe0000803fa5a4a43ecdccccbdf1f070bd0000803f
+xr_half_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 f9c8d658383cdbe650991a8cc4e54569 e4e3633fa5a4a4beaaa9a9be0000803fa5a4a43e5d5d5d3f9493933e0000803f
+xr_half_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 d91dfa032f5aa029a4f35d42f8b72e25 e4e3633fc1c040bfc1c040bf0000803fa5a4a43ec1c040bf818000bc0000803f
+xr_half_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 1464e62044feb2137b3a496bb21ab37d e4e3633f3232323fd3d2d2be0000803fa5a4a43ee1e060bdc1c0c0bd0000803f
+xr_half_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 5b2a66da16a2807b46980393b3d1d4ec e4e3633f9190903fe5e4e4be0000803fa5a4a43e2020a03fe6e5e53e0000803f
+xr_float_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 583b51144302ae1ba1b693a3acf79b84 6060a03fc0bfbf3e9a99193f0000803f6060a03f8887073f999818bf0000803f
+xr_float_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 1461baba9dcdd3282ea3e3a76a9d18f6 1111913fc0bfbf3e9a99193f0000803f9e9d1d3f8887073f999818bf0000803f
+xr_float_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 ac5d86abd0d7fe44415d56019c02302b 5959993fc0bfbf3e9a99193f0000803f3d3d3d3f8887073f999818bf0000803f
+xr_float_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 83dfcc7b721003c93c19f97a5edcbfa5 f0ef6f3fc0bfbf3e9a99193f0000803f9392923f8887073f999818bf0000803f
+xr_float_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 57cd6814db142505f49c012cbd152201 5b5b9b3fc0bfbf3e9a99193f0000803f0d0d0d3f8887073f999818bf0000803f
+xr_float_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 9c61f0ab02f5d5b56219bf951aac3155 5b5b9b3fc0bfbf3e9a99193f0000803fc3c2c23e8887073f999818bf0000803f
+xr_float_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 ca0486043712fae6ea5e381e144fb92e 1919993ff1f0f03e9a99193f0000803fe9e8683f3333333f999818bf0000803f
+xr_float_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 32c5fca0f97fd0a91e4e5969c06dba78 1919993fb6b5b53e9a99193f0000803fe9e8683fb8b7b73e999818bf0000803f
+xr_float_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 119c9a16e464555549774dda277eabc0 1919993fb9b8b83e9a99193f0000803fe9e8683fd4d3d33e999818bf0000803f
+xr_float_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 10c3754506c859093e25f4228e3cc104 1919993fecebeb3e9a99193f0000803fe9e8683facab2b3f999818bf0000803f
+xr_float_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 cc004ec31cd43774ffbfaeeb02ad69a1 1919993fe1e0e03d9a99193f0000803fe9e8683f9392923e999818bf0000803f
+xr_float_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 200ecf225fb39e49b830937aa2c6acbe 1919993fc5c4c43d9a99193f0000803fe9e8683fafae2e3e999818bf0000803f
+xr_float_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 a28c342ffc1ec01b9cd1c3e0bfff2e0f 1919993fc0bfbf3e5050903f0000803fe9e8683f8887073fc2c1c13e0000803f
+xr_float_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 591ca1bda6feb61f9830cb59a41f48ce 1919993fc0bfbf3e9291113f0000803fe9e8683f8887073fcfcecebe0000803f
+xr_float_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 95e8d27d0dc62c68a5a4854e7a4cdad4 1919993fc0bfbf3e9998183f0000803fe9e8683f8887073fb5b4b4bd0000803f
+xr_float_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 0cffbacc601c2481651993e4d97f8ed7 1919993fc0bfbf3e5959593f0000803fe9e8683f8887073f121212bf0000803f
+xr_float_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 3958c4b33993c703ef5b586cc8052960 1919993fc0bfbf3e0808083f0000803fe9e8683f8887073fefeeee3e0000803f
+xr_float_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 1b5bc46256a7bc41497029bb0a68a56f 1919993fc0bfbf3e0707073f0000803fe9e8683f8887073f7979793f0000803f
+xr_float_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 e420a1f2d0d5363746aef799ffd383c4 6060a03ff1f0f03e9a99193f0000803f6060a03f3333333f999818bf0000803f
+xr_float_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 76b7b1c29b721996408b9432d83c8a0c 1111913fb6b5b53e9a99193f0000803f9e9d1d3fb8b7b73e999818bf0000803f
+xr_float_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 e4c43e7096c85f1235e122ff4f521761 5959993fb9b8b83e9a99193f0000803f3d3d3d3fd4d3d33e999818bf0000803f
+xr_float_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 debf0f4772311b6c98d54298c397049f f0ef6f3fecebeb3e9a99193f0000803f9392923facab2b3f999818bf0000803f
+xr_float_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 4b41d78a19a90e80437390d6fb7119ce 5b5b9b3fe1e0e03d9a99193f0000803f0d0d0d3f9392923e999818bf0000803f
+xr_float_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 10e4ea494dff92bf15348796efe6c111 5b5b9b3fc5c4c43d9a99193f0000803fc3c2c23eafae2e3e999818bf0000803f
+xr_float_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 c5189594ea22fbad32c657330ab726d3 1919993ff1f0f03e5050903f0000803fe9e8683f3333333fc2c1c13e0000803f
+xr_float_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 9d2b5a760c8e5e39ce8480216b6d6d2c 1919993fb6b5b53e9291113f0000803fe9e8683fb8b7b73ecfcecebe0000803f
+xr_float_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 271f371d7e91b9012181c22669f4578e 1919993fb9b8b83e9998183f0000803fe9e8683fd4d3d33eb5b4b4bd0000803f
+xr_float_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 887dfc7fbb41bbcac76758532df6587d 1919993fecebeb3e5959593f0000803fe9e8683facab2b3f121212bf0000803f
+xr_float_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 c16049e20839eb0eab9f9e648e993337 1919993fe1e0e03d0808083f0000803fe9e8683f9392923eefeeee3e0000803f
+xr_float_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 3fb7ee735784aca36fd71ccf2bf52d1f 1919993fc5c4c43d0707073f0000803fe9e8683fafae2e3e7979793f0000803f
+xr_loaded_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 44a7382cafdd860a8479537662b57b44 6060a03fdfde5e3fb3b2b2be0000803fb7b6b63e8887873f999818be0000803f
+xr_loaded_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 5a601fed83d95873694b27ee94a0127d 00000000dfde5e3fb3b2b2be0000803f000000008887873f999818be0000803f
+xr_loaded_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 c5b37046cbc3477d5216e0e8916500ba a6a5a53edfde5e3fb3b2b2be0000803f898808be8887873f999818be0000803f
+xr_loaded_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 04970247e9e4a54519ae25c5294a46c5 d7d6963fdfde5e3fb3b2b2be0000803faeadad3e8887873f999818be0000803f
+xr_loaded_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 3b9f28b810cf02ccba13d922bc306075 7575753fdfde5e3fb3b2b2be0000803ffbfafa3e8887873f999818be0000803f
+xr_loaded_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 b36bdac9435a2e71d26ff387fd6464f2 a6a5a53edfde5e3fb3b2b2be0000803f898808be8887873f999818be0000803f
+xr_loaded_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 87a80084b06611642e1494bcda332fca 7575753f6060a03fb3b2b2be0000803ffbfafa3e9392923f999818be0000803f
+xr_loaded_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 8a7c98ae00b1db18f4ef369ffbf50ca6 7575753f00000000b3b2b2be0000803ffbfafa3e00000000999818be0000803f
+xr_loaded_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 b5a3266a0ef5ae3d39b10c71c36ceae5 7575753f2020a03fb3b2b2be0000803ffbfafa3eb1b0b03d999818be0000803f
+xr_loaded_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 6c6dbb847784db4c85e1a4e28ef3a213 7575753f8f8e0e3fb3b2b2be0000803ffbfafa3e9291913f999818be0000803f
+xr_loaded_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 da481f88f66700ca0605236d0c99676d 7575753fdfde5e3fb3b2b2be0000803ffbfafa3e8887873f999818be0000803f
+xr_loaded_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 d8eeacc2f05a18248f15e60cd16f72c9 7575753f2020a03fb3b2b2be0000803ffbfafa3eb1b0b03d999818be0000803f
+xr_loaded_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 827d60c44b1aaf3e865f9e3fad0a48a2 7575753fdfde5e3fe5e464be0000803ffbfafa3e8887873fe0dfdfbe0000803f
+xr_loaded_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 c6280f54dadb4c7d221757777cc61e70 7575753fdfde5e3f000000000000803ffbfafa3e8887873f000000000000803f
+xr_loaded_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 671d679c09537d8dd3f6ecdab55a60e9 7575753fdfde5e3f8180003e0000803ffbfafa3e8887873f949393be0000803f
+xr_loaded_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 c8941c3dc8df5a9a9bac3d306174c78a 7575753fdfde5e3ff5f474be0000803ffbfafa3e8887873f050505bf0000803f
+xr_loaded_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 9bed993233cc2d4509aedf741ea86282 7575753fdfde5e3fb3b2b2be0000803ffbfafa3e8887873f999818be0000803f
+xr_loaded_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 703658d34f6fbfcd49e3ae9c498da48b 7575753fdfde5e3f8180003e0000803ffbfafa3e8887873f949393be0000803f
+xr_loaded_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 bd1804bc3606face851bff74dbe0cee5 6060a03f6060a03fb3b2b2be0000803fb7b6b63e9392923f999818be0000803f
+xr_loaded_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 948201125faf5e4bcfa3b72e3331edb8 0000000000000000b3b2b2be0000803f0000000000000000999818be0000803f
+xr_loaded_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 fad17372cbd45c41904e04510b56f2e0 a6a5a53e2020a03fb3b2b2be0000803f898808beb1b0b03d999818be0000803f
+xr_loaded_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 ace1d411698cd71df232ef9d8d110065 d7d6963f8f8e0e3fb3b2b2be0000803faeadad3e9291913f999818be0000803f
+xr_loaded_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 49b2ea9c77b616ad081d4b7828873bf3 7575753fdfde5e3fb3b2b2be0000803ffbfafa3e8887873f999818be0000803f
+xr_loaded_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 8ce6c6cc511f3d9c0aa088b426230f14 a6a5a53e2020a03fb3b2b2be0000803f898808beb1b0b03d999818be0000803f
+xr_loaded_fragment format 554 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 54c479ba5025751718d9f4dc2de21e8b 7575753f6060a03fe5e464be0000803ffbfafa3e9392923fe0dfdfbe0000803f
+xr_loaded_fragment format 554 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 502b452ff3cc488ed86912be40699531 7575753f00000000000000000000803ffbfafa3e00000000000000000000803f
+xr_loaded_fragment format 554 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 6c12125b37d66aefcb688642220034d3 7575753f2020a03f8180003e0000803ffbfafa3eb1b0b03d949393be0000803f
+xr_loaded_fragment format 554 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 c4a16e77cc451503aa5e831eb1c9682e 7575753f8f8e0e3ff5f474be0000803ffbfafa3e9291913f050505bf0000803f
+xr_loaded_fragment format 554 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 a82ec6ad54bf3347f3e0077ec3ab8d78 7575753fdfde5e3fb3b2b2be0000803ffbfafa3e8887873f999818be0000803f
+xr_loaded_fragment format 554 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 8d176dac255e938a8dc9bf48624bf891 7575753f2020a03f8180003e0000803ffbfafa3eb1b0b03d949393be0000803f
+xr_half_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 4c85b42222a8aa4783b0dab90c31cc83 0064d63f00f006bf00c098be0000803f00f0d5be0080e2be002083bedddc5c3f
+xr_half_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 a215649cbdb70f4195fac87f76791a33 00c82f3f00f006bf00c098be0000803f0000963d0080e2be002083bedddc5c3f
+xr_half_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 077a2bce4cbce693b0e7405bc67505b9 0088663f00f006bf00c098be0000803f0070febe0080e2be002083bedddc5c3f
+xr_half_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 a167c629b05560111f55694870f47221 00d8753f00f006bf00c098be0000803f00f006bf0080e2be002083bedddc5c3f
+xr_half_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 be5379aa67c6c499c1545ed54e06ba7c 00d86a3f00f006bf00c098be0000803f0040a03d0080e2be002083bedddc5c3f
+xr_half_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 b7dc4deb69fc2656178457faecdcf3ca 00006d3f00f006bf00c098be0000803f00f006bf0080e2be002083bedddc5c3f
+xr_half_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 ab8d1589be56cb18145df713557ff91f 0060643f00b8193f00c098be0000803f0040a43e00984e3f002083be0000803f
+xr_half_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 79fff4cdce36650e5adcf9d8a1f48897 0060643f0080d0be00c098bec5c4443f0040a43e0000cfbd002083bec9c8483e
+xr_half_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 c38ecbfadb83b388f420fd2f1a088471 0060643f008016be00c098be0000803f0040a43e00f85c3f002083bef8f7773f
+xr_half_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 bf02d6742ddbb7731a0e98246ec51e07 0060643f00f006bf00c098be0000803f0040a43e00f006bf002083be0000803f
+xr_half_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 5d818d638fb27a69e701f320f300c091 0060643f00c83f3f00c098bed1d0d03e0040a43e008062bd002083bed8d7573f
+xr_half_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 29b734595701595b499042309ac7683a 0060643f0094903f00c098beedec6c3e0040a43e004c823f002083bec9c8483f
+xr_half_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 c08fd5c1eaf25b11b2a15689befd92c3 0060643f00f006bf00f006bf0000803f0040a43e0080e2be0080453edddc5c3f
+xr_half_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 b1322bda956d1918e30872a89fa65f15 0060643f00f006bf00406cbe0000803f0040a43e0080e2be000070bddddc5c3f
+xr_half_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 e75e5b9cb173fb06e5baf0bba3f1d431 0060643f00f006bf0030aabe0000803f0040a43e0080e2be0030933edddc5c3f
+xr_half_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 59616c6c77f58ea36ccda194cf22c6e4 0060643f00f006bf00f006bf0000803f0040a43e0080e2be0000d73cdddc5c3f
+xr_half_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 dc5a143854d23cec92dc102bb8106901 0060643f00f006bf0040d3be0000803f0040a43e0080e2be0040c3bddddc5c3f
+xr_half_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 0a348416518678346817a35d5aac6dcd 0060643f00f006bf00f0e3be0000803f0040a43e0080e2be0000b43edddc5c3f
+xr_half_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 03078655683d5d63785e6aa86fe35e69 0064d63f00b8193f00c098be0000803f00f0d5be00984e3f002083bedddc5c3f
+xr_half_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 e7b982ba0e2534b941b137d6604df5b8 00c82f3f0080d0be00c098be0000803f0000963d0000cfbd002083bedddc5c3f
+xr_half_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 c0c239993fd2c646e6686df87abdeeaf 0088663f008016be00c098be0000803f0070febe00f85c3f002083bedddc5c3f
+xr_half_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 2e3411f728b39b8838d1585a39c2048b 00d8753f00f006bf00c098be0000803f00f006bf00f006bf002083bedddc5c3f
+xr_half_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 3d5453c7cc505285f0c7d4286d6fed38 00d86a3f00c83f3f00c098be0000803f0040a03d008062bd002083bedddc5c3f
+xr_half_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 5fb1437b745808cc96039660e0f4f236 00006d3f0094903f00c098be0000803f00f006bf004c823f002083bedddc5c3f
+xr_half_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 d853935ac13af6e54cb735c0d549a9ac 0060643f00b8193f00f006bf0000803f0040a43e00984e3f0080453e0000803f
+xr_half_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 029540c065b408e74e17a1cb68a0fb12 0060643f0080d0be00406cbec5c4443f0040a43e0000cfbd000070bdc9c8483e
+xr_half_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 0b7f08fef83a742e68561a6ea1459ea8 0060643f008016be0030aabe0000803f0040a43e00f85c3f0030933ef8f7773f
+xr_half_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 ac9537442df28e0dd7254ece908223d7 0060643f00f006bf00f006bf0000803f0040a43e00f006bf0000d73c0000803f
+xr_half_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 896f2f380ef21a47b0db5e2f36e50bb8 0060643f00c83f3f0040d3bed1d0d03e0040a43e008062bd0040c3bdd8d7573f
+xr_half_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 4450d33ed8a425aadd27e8580d0202e3 0060643f0094903f00f0e3beedec6c3e0040a43e004c823f0000b43ec9c8483f
+xr_float_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 89b8fa78ec5da066b7c37f064982972d 0064d63f0060bf3e00b8193fe3e2e23e00f8a43f00b8073f00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 81a9ba5c04e9054c1fd50049074ea2a4 0030913f0060bf3e00b8193fe3e2e23e00281d3f00b8073f00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 a572b46e003ddc1573f0a88b442949fd 004c993f0060bf3e00b8193fe3e2e23e00e83c3f00b8073f00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 2b23730acd8461aabd3f24055662875c 00808a3e0060bf3e00b8193fe3e2e23e0038123f00b8073f00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 44b724491eca82ad286cd9a1bd0f7340 00389b3f0060bf3e00b8193fe3e2e23e00500d3f00b8073f00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 089d9e84121e77ef44d0bd10a3f4b6fb 00f0993f0060bf3e00b8193fe3e2e23e0038373f00b8073f00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 f0f64f524da5c3c88f05b3024909de73 004c993f0000f13e00b8193ffdfcfc3e00a8683f0078333f00f006bfb1b0303f
+xr_float_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 02713ced9c07782238d7930d993b7ed1 004c993f0040b53e00b8193fd7d6d63e00a8683f00c0b73e00f006bf8180803e
+xr_float_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 cd7b918718c6fd6941e98915af84adda 004c993f00c0b73e00b8193ff1f0f03e00a8683f0090d43e00f006bf9392123f
+xr_float_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 c1e93e4c520170e780ced64f7b61ef87 004c993f0020813e00b8193ffdfcfc3e00a8683f00a0ac3e00f006bfb1b0303f
+xr_float_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 fca2a445188e3bf98e8579091d7f995f 004c993f00c0e23d00b8193f9998983d00a8683f0030933e00f006bfadacac3e
+xr_float_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 1bbdc7bd2e083a04efd31fc451f4a8ac 004c993f0010803e00b8193f8b8a8a3e00a8683f0020cb3e00f006bfb5b4b43e
+xr_float_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 4d9561556ca03feb787a6ea5c7e5a996 004c993f0060bf3e00f48f3fe3e2e23e00a8683f00b8073f0060e53ebdbcbc3e
+xr_float_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 08497072f70532635b5627aff62b0f09 004c993f0060bf3e0060113fe3e2e23e00a8683f00b8073f0080b6bebdbcbc3e
+xr_float_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 264ea2704b60c186d1816425eaa0d1bb 004c993f0060bf3e00e0183fe3e2e23e00a8683f00b8073f00802dbdbdbcbc3e
+xr_float_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 d873c338ebb06110d1fd01e9b2539ba2 004c993f0060bf3e00d0033fe3e2e23e00a8683f00b8073f00e02dbebdbcbc3e
+xr_float_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 6d1c66c4e414676b01cc3a08dfa2cb22 004c993f0060bf3e00b8073fe3e2e23e00a8683f00b8073f00e0f93ebdbcbc3e
+xr_float_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 aacfbaec94ae45e8146697a29486eb32 004c993f0060bf3e0060113fe3e2e23e00a8683f00b8073f0000d73cbdbcbc3e
+xr_float_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 43088cc6797d0c33812161019cdf3cb1 0064d63f0000f13e00b8193fe3e2e23e00f8a43f0078333f00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 b83ee0fe276e8ebc3a1587fd46af4d90 0030913f0040b53e00b8193fe3e2e23e00281d3f00c0b73e00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 3ba2e0b9b1bcdc81e9efd5a534138044 004c993f00c0b73e00b8193fe3e2e23e00e83c3f0090d43e00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 60851d51c66ef999de10644747a48110 00808a3e0020813e00b8193fe3e2e23e0038123f00a0ac3e00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 058ecf9316760657ec483df694f90394 00389b3f00c0e23d00b8193fe3e2e23e00500d3f0030933e00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 304759dec7521350fe2798c29ce121cf 00f0993f0010803e00b8193fe3e2e23e0038373f0020cb3e00f006bfbdbcbc3e
+xr_float_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 cfa100d88541ea9276b6fd6cea2f5828 004c993f0000f13e00f48f3ffdfcfc3e00a8683f0078333f0060e53eb1b0303f
+xr_float_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 ab4b0fe9175edead2eae5fe0784c4b79 004c993f0040b53e0060113fd7d6d63e00a8683f00c0b73e0080b6be8180803e
+xr_float_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 6405049ec4212ccb457682158a0cd0d0 004c993f00c0b73e00e0183ff1f0f03e00a8683f0090d43e00802dbd9392123f
+xr_float_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 110527d1469e2a5675186c977e79a1d8 004c993f0020813e00d0033ffdfcfc3e00a8683f00a0ac3e00e02dbeb1b0303f
+xr_float_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 586dbcc32f7c6ab44c9cb68c48dd1194 004c993f00c0e23d00b8073f9998983d00a8683f0030933e00e0f93eadacac3e
+xr_float_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 8ad1abeb5e191141ab40b539341d4563 004c993f0010803e0060113f8b8a8a3e00a8683f0020cb3e0000d73cb5b4b43e
+xr_loaded_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 747a882129ff27c2d580726580de92a0 0050a43f00105f3f00c0b2bedddcdc3e0080b63e008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 5c9eeb3fcfec67fbb054770d16ab2407 0000000000105f3f00c0b2bedddcdc3e00000000008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 47d64a8be6e70ab01ab0ffff61c45a4b 0070a53e00105f3f00c0b2bedddcdc3e008009be008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 38848c00e051281722224f78bfc5a952 0058223f00105f3f00c0b2bedddcdc3e0060593e008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 d52c8e2dbe45f5287eb7834dbeb37ae3 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 1527f8cc5c6bd9dcab8b325ad7fc75ee 00c82f3f00105f3f00c0b2bedddcdc3e0000e43c008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 f6ba75e9d33b8b0d2bc2111f32330b60 00d8753f0064d63f00c0b2be0000803f0060fb3e006c923f000018be0000803f
+xr_loaded_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 f10cadf43348903f7860e1eab5edad09 00d8753f0000000000c0b2be000000000060fb3e00000000000018be00000000
+xr_loaded_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 50e5b634dfc5bdba47016027290ce127 00d8753f0060a03f00c0b2be0000803f0060fb3e0040b13d000018be0000803f
+xr_loaded_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 4991b6ee0f6edc08e271dfadfcba6c95 00d8753f00807e3d00c0b2be0000803f0060fb3e00f85c3f000018be0000803f
+xr_loaded_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 38787950a1b87e120121fc07df015adc 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 3ce80d9ae120eb26e51c4347d9c53026 00d8753f009c843f00c0b2beaead2d3f0060fb3e00d0ad3e000018beefee6e3f
+xr_loaded_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 7c883a8f4c789c0dda893a8b7549b67e 00d8753f00105f3f00a064bedddcdc3e0060fb3e008c873f00b0dfbebebd3d3f
+xr_loaded_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 ae0e28accfa32f86f9c62c0c57b7c61e 00d8753f00105f3f00000000dddcdc3e0060fb3e008c873f00000000bebd3d3f
+xr_loaded_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 409856f04a8fc693f2ae0875dff893bd 00d8753f00105f3f0020013edddcdc3e0060fb3e008c873f003093bebebd3d3f
+xr_loaded_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 f021e0db1f965927233e4e07061b29d9 00d8753f00105f3f000025bddddcdc3e0060fb3e008c873f0070f5bebebd3d3f
+xr_loaded_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 6569f670e090e23440c81967581d9756 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 c32c0ddc107a2785b922586d92d3aa69 00d8753f00105f3f00a013bedddcdc3e0060fb3e008c873f002081bebebd3d3f
+xr_loaded_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 471fb99921fd7cd0dfdb834ce59bc8b8 0050a43f0064d63f00c0b2bedddcdc3e0080b63e006c923f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 a36fa0acdb0ab7810298686a415878a2 000000000000000000c0b2bedddcdc3e0000000000000000000018bebebd3d3f
+xr_loaded_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 95bf6552fafe095b191a90175b2c68a0 0070a53e0060a03f00c0b2bedddcdc3e008009be0040b13d000018bebebd3d3f
+xr_loaded_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 e5d7c9018c934624598c614dee273843 0058223f00807e3d00c0b2bedddcdc3e0060593e00f85c3f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 5fd600d8f8a64db4ac19f0559e5d42cd 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 ec02cc9cd0edf43a986be99c4ec75553 00c82f3f009c843f00c0b2bedddcdc3e0000e43c00d0ad3e000018bebebd3d3f
+xr_loaded_fragment format 551 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 1aecda05076785a29548ae85659768d2 00d8753f0064d63f00a064be0000803f0060fb3e006c923f00b0dfbe0000803f
+xr_loaded_fragment format 551 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 a00161c85b2e2020d417b50694b93b1f 00d8753f0000000000000000000000000060fb3e000000000000000000000000
+xr_loaded_fragment format 551 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 1b4abb0e85b8c3c44d8e10128325cfaa 00d8753f0060a03f0020013e0000803f0060fb3e0040b13d003093be0000803f
+xr_loaded_fragment format 551 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 8faade83df1e007050495be97210dd50 00d8753f00807e3d000025bd0000803f0060fb3e00f85c3f0070f5be0000803f
+xr_loaded_fragment format 551 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 f9357f6a078218c36ba458800495a666 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018bebebd3d3f
+xr_loaded_fragment format 551 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 6d63a6568c809043564489458cb03987 00d8753f009c843f00a013beaead2d3f0060fb3e00d0ad3e002081beefee6e3f
+xr_half_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 d42439b83663e01112111d38e8a075bb 0064d63f00f006bf00c098be0000803f00e053be0080e2be002083be5d5d5d3f
+xr_half_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 df7da65b8d634c1af05a3c76a79cb9ee 00c82f3f00f006bf00c098be0000803f0000963d0080e2be002083be5d5d5d3f
+xr_half_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 45de3c7700980a7c62bf5b39270e590a 0088663f00f006bf00c098be0000803f0030aabe0080e2be002083be5d5d5d3f
+xr_half_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 eb849cefef3f605d705a185cd501baa8 00d8753f00f006bf00c098be0000803f00f006bf0080e2be002083be5d5d5d3f
+xr_half_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 4d6d78aaf44be7d7ce759f9f8958c879 00d86a3f00f006bf00c098be0000803f0080023e0080e2be002083be5d5d5d3f
+xr_half_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 0a540c312436219a58591d1e3544b81a 00006d3f00f006bf00c098be0000803f0040d3be0080e2be002083be5d5d5d3f
+xr_half_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 394da6a8271b155c601b969bb9d92ea7 0060643f00b8193f00c098be0000803f0040a43e00b8563f002083be0000803f
+xr_half_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 7e4e49e3ea9208a3ff11a3e527852546 0060643f0080d0be00c098be4545453f0040a43e0000cfbd002083becbca4a3e
+xr_half_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 e94857279da11d66c78dce874e90aaa7 0060643f008016be00c098be0000803f0040a43e0050633f002083bef8f7773f
+xr_half_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 2f1edb74814af49adca9e6f81f86e35a 0060643f00f006bf00c098be0000803f0040a43e00f006bf002083be0000803f
+xr_half_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 904dd3a03454355e4b1c82ee417b565e 0060643f00c83f3f00c098bed0cfcf3e0040a43e008048bd002083bed8d7573f
+xr_half_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 41410424863cd9e55179260d1f6bed82 0060643f0094903f00c098beebea6a3e0040a43e0060863f002083bec9c8483f
+xr_half_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 9030f8091fad3a8ccf8913b19acbb761 0060643f00f006bf00f006bf0000803f0040a43e0080e2be0080453e5d5d5d3f
+xr_half_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 84e673982b2b0abece7fab31c070e4f9 0060643f00f006bf00406cbe0000803f0040a43e0080e2be000070bd5d5d5d3f
+xr_half_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 7fdce6abb8c3fb0c2bef5c063f415e74 0060643f00f006bf0030aabe0000803f0040a43e0080e2be0030933e5d5d5d3f
+xr_half_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 7b5631f62177e93d5bd62268976ecbe4 0060643f00f006bf00f006bf0000803f0040a43e0080e2be0000d73c5d5d5d3f
+xr_half_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 a28f8e9861ab181d12824c724565bbcc 0060643f00f006bf0040d3be0000803f0040a43e0080e2be0040c3bd5d5d5d3f
+xr_half_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 ef44b0a3f0e42c90d52f8078a52357ca 0060643f00f006bf00f0e3be0000803f0040a43e0080e2be0040b53e5d5d5d3f
+xr_half_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 8b615748843c0b02fbde5dd689ce1328 0064d63f00b8193f00c098be0000803f00e053be00b8563f002083be5d5d5d3f
+xr_half_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 4ae09c06a1966fb89842df7ed9b198be 00c82f3f0080d0be00c098be0000803f0000963d0000cfbd002083be5d5d5d3f
+xr_half_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 51465137bb1fc776f5ebc231f30bac36 0088663f008016be00c098be0000803f0030aabe0050633f002083be5d5d5d3f
+xr_half_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 bbea4fd7a4ec9c3eb4a61c246eff222a 00d8753f00f006bf00c098be0000803f00f006bf00f006bf002083be5d5d5d3f
+xr_half_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 d6a54c125cae8066978b536c6fa52d30 00d86a3f00c83f3f00c098be0000803f0080023e008048bd002083be5d5d5d3f
+xr_half_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 081898961f1b92f86ee9a7a553c546ad 00006d3f0094903f00c098be0000803f0040d3be0060863f002083be5d5d5d3f
+xr_half_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 ba5fe7fc1bc246140c33d29a3bfa79f4 0060643f00b8193f00f006bf0000803f0040a43e00b8563f0080453e0000803f
+xr_half_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 86d9e074147ee193ad028832605dfd75 0060643f0080d0be00406cbe4545453f0040a43e0000cfbd000070bdcbca4a3e
+xr_half_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 28e760f568dd1ff6f69ce83ab3653745 0060643f008016be0030aabe0000803f0040a43e0050633f0030933ef8f7773f
+xr_half_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 d5385c27c97909ee4a63e307d263eff8 0060643f00f006bf00f006bf0000803f0040a43e00f006bf0000d73c0000803f
+xr_half_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 988f0fd51f6dfd7f5c8321851ae2d618 0060643f00c83f3f0040d3bed0cfcf3e0040a43e008048bd0040c3bdd8d7573f
+xr_half_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 8ae76a7e68bf15f901c21c0d6a94352e 0060643f0094903f00f0e3beebea6a3e0040a43e0060863f0040b53ec9c8483f
+xr_float_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 2d5dfc169b39df697beabd2a29ec6a18 0064d63f0060bf3e00b8193fe3e2e23e00f8a43f00b8073f00f006bfbebdbd3e
+xr_float_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 da2f800d158b12757d5525a924b987b1 0030913f0060bf3e00b8193fe3e2e23e00281d3f00b8073f00f006bfbebdbd3e
+xr_float_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 c584022d8fc04ef4ad2eb040b80f8c2a 004c993f0060bf3e00b8193fe3e2e23e00e83c3f00b8073f00f006bfbebdbd3e
+xr_float_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 dba6317227a85210e989cabf6da16314 00808a3e0060bf3e00b8193fe3e2e23e0038123f00b8073f00f006bfbebdbd3e
+xr_float_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 6cc2f91e6c76b769b623d9b53fee3c73 00389b3f0060bf3e00b8193fe3e2e23e00500d3f00b8073f00f006bfbebdbd3e
+xr_float_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 fac8973ee3ce21f97d70b7a2786a21af 00f0993f0060bf3e00b8193fe3e2e23e0048363f00b8073f00f006bfbebdbd3e
+xr_float_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 29886c9c4e2c0834616cf0f377ea81d2 004c993f0000f13e00b8193ffefdfd3e00a8683f0078333f00f006bfb2b1313f
+xr_float_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 41246f6e4381dad91fac8bec45b5be4a 004c993f0040b53e00b8193fd7d6d63e00a8683f00c0b73e00f006bf8180803e
+xr_float_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 8999dd9f5b64725249c67f2c5574be71 004c993f00c0b73e00b8193ff2f1f13e00a8683f0090d43e00f006bf1313133f
+xr_float_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 f140ee3884a4df9dbab0ef375218ad13 004c993f0020813e00b8193ffefdfd3e00a8683f00d0ad3e00f006bfb2b1313f
+xr_float_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 d6da79bc5629fc98be94e8f7a91210cf 004c993f00c0e23d00b8193f9594943d00a8683f0030933e00f006bfaeadad3e
+xr_float_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 b053016f77dad55f36d7219a44946463 004c993f0010803e00b8193f8b8a8a3e00a8683f0020cb3e00f006bfb5b4b43e
+xr_float_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 7d2cdf0370eb503230691773b2d94845 004c993f0060bf3e00f48f3fe3e2e23e00a8683f00b8073f0060e53ebebdbd3e
+xr_float_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 88be348a1c7f246c246e82c645c2d180 004c993f0060bf3e0060113fe3e2e23e00a8683f00b8073f0080b6bebebdbd3e
+xr_float_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 14ffbfa63c85e8451ae1f6bb0b45c3bd 004c993f0060bf3e00e0183fe3e2e23e00a8683f00b8073f00802dbdbebdbd3e
+xr_float_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 770a51e6810439d6a4c4714c5bee85c2 004c993f0060bf3e00d0033fe3e2e23e00a8683f00b8073f00802fbebebdbd3e
+xr_float_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 c66b0516d23891399c628b8ad0f21667 004c993f0060bf3e00b8073fe3e2e23e00a8683f00b8073f00e0f93ebebdbd3e
+xr_float_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 7e569b766bcff3fdd38816b5a0f71344 004c993f0060bf3e0060113fe3e2e23e00a8683f00b8073f0000f23cbebdbd3e
+xr_float_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 abd8f7f4cb8bf202c7b8165a1614b99d 0064d63f0000f13e00b8193fe3e2e23e00f8a43f0078333f00f006bfbebdbd3e
+xr_float_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 db6d448cf863ac9e99725aa4656e9ac3 0030913f0040b53e00b8193fe3e2e23e00281d3f00c0b73e00f006bfbebdbd3e
+xr_float_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 f5a0104ae1f27890e184d281f32da369 004c993f00c0b73e00b8193fe3e2e23e00e83c3f0090d43e00f006bfbebdbd3e
+xr_float_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 82e876da1fc411d20d18ac4eacc5ab10 00808a3e0020813e00b8193fe3e2e23e0038123f00d0ad3e00f006bfbebdbd3e
+xr_float_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 53ad80138427364ad4fa5fc214b143d7 00389b3f00c0e23d00b8193fe3e2e23e00500d3f0030933e00f006bfbebdbd3e
+xr_float_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 b39f3ccabda4efcc7ea189391d39f4d3 00f0993f0010803e00b8193fe3e2e23e0048363f0020cb3e00f006bfbebdbd3e
+xr_float_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 d5107aa40213a23f7f5171f9021dc2a4 004c993f0000f13e00f48f3ffefdfd3e00a8683f0078333f0060e53eb2b1313f
+xr_float_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 cadf893d13bfb980ad7737e796747f45 004c993f0040b53e0060113fd7d6d63e00a8683f00c0b73e0080b6be8180803e
+xr_float_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 6b71679182af98ef4f3a9878e0d32bb3 004c993f00c0b73e00e0183ff2f1f13e00a8683f0090d43e00802dbd1313133f
+xr_float_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 abb505ec1546681fb3324dae447eabce 004c993f0020813e00d0033ffefdfd3e00a8683f00d0ad3e00802fbeb2b1313f
+xr_float_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 a3bedb4bd787b06d1ad7aeaa8599c9af 004c993f00c0e23d00b8073f9594943d00a8683f0030933e00e0f93eaeadad3e
+xr_float_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 6381f3419ba0630a32a1b86e90ac4514 004c993f0010803e0060113f8b8a8a3e00a8683f0020cb3e0000f23cb5b4b43e
+xr_loaded_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 ade60ab2b59fe1ec2f33e936aef00bec 0050a43f00105f3f00c0b2bedddcdc3e0080b63e008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 250a5ab29b023c0a8b44195143127309 0000000000105f3f00c0b2bedddcdc3e00000000008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 f4e3570cf851f9223b1a8d2267778506 0070a53e00105f3f00c0b2bedddcdc3e008009be008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 2996a8e1754832ab9fcf19ab77f91c08 0058223f00105f3f00c0b2bedddcdc3e0080573e008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 fc1a8c31ca43006312c6f76d83126ce7 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 afa0cdbb30b2726dff15803ffceb8ad2 00c82f3f00105f3f00c0b2bedddcdc3e0000ed3c008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 ff98c9fbd942106b2027bb48564811c3 00d8753f0064d63f00c0b2be0000803f0060fb3e006c923f000018be0000803f
+xr_loaded_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 221520a6a0ccafa9b8583bdd7a0b890f 00d8753f0000000000c0b2be000000000060fb3e00000000000018be00000000
+xr_loaded_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 7b78be4d3d5183e9ab5807be17f0ecee 00d8753f004ca83f00c0b2be0000803f0060fb3e0040b13d000018be0000803f
+xr_loaded_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 77398cbbdd00400ad463e9711ccfb24a 00d8753f000025bd00c0b2be0000803f0060fb3e00f85c3f000018be0000803f
+xr_loaded_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 d16d40cf1d0b35cdc76bb62bd8e24fcf 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 41a9a9e652a3513f53126692e6109dc7 00d8753f0024883f00c0b2be2d2d2d3f0060fb3e00d0ad3e000018be6e6e6e3f
+xr_loaded_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 3f3f64f4d21863788f457feb5cd8ea81 00d8753f00105f3f00a064bedddcdc3e0060fb3e008c873f00b0dfbe3d3d3d3f
+xr_loaded_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 11e7458fe821c53d440e461c1d828971 00d8753f00105f3f00000000dddcdc3e0060fb3e008c873f000000003d3d3d3f
+xr_loaded_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 64490de20eb93396ec96c024b9a86bab 00d8753f00105f3f0020013edddcdc3e0060fb3e008c873f003093be3d3d3d3f
+xr_loaded_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 a44b93c6a63f64b18de3289f1de795a4 00d8753f00105f3f000025bddddcdc3e0060fb3e008c873f0070f5be3d3d3d3f
+xr_loaded_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 be96cd4f37f938b47041d330a88e34e5 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 57ad5029d0cce2fcebe632ca60a4638b 00d8753f00105f3f00a013bedddcdc3e0060fb3e008c873f002081be3d3d3d3f
+xr_loaded_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 65b7009b5fe31eda245d79049ed9d2a6 0050a43f0064d63f00c0b2bedddcdc3e0080b63e006c923f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 4e382d49737439826a785d5c219807ed 000000000000000000c0b2bedddcdc3e0000000000000000000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 125b423552b46823ac3f029e1a37e01b 0070a53e004ca83f00c0b2bedddcdc3e008009be0040b13d000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 cba5e52e8616ee5e1e6e47c32e7b00d7 0058223f000025bd00c0b2bedddcdc3e0080573e00f85c3f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 7f814a37603df324c68f86c2efc50bcf 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 1d171613daa48d0380996d11cabe8957 00c82f3f0024883f00c0b2bedddcdc3e0000ed3c00d0ad3e000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 ded7e3734b6e7141fac85b4ff7d5a108 00d8753f0064d63f00a064be0000803f0060fb3e006c923f00b0dfbe0000803f
+xr_loaded_fragment format 553 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 6af2e92067bd0e104e814e2e722e8da4 00d8753f0000000000000000000000000060fb3e000000000000000000000000
+xr_loaded_fragment format 553 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 c23ec4b251fb781d21cb5cfe6b851d87 00d8753f004ca83f0020013e0000803f0060fb3e0040b13d003093be0000803f
+xr_loaded_fragment format 553 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 66e532ea5a30ce67558420bd879a89dc 00d8753f000025bd000025bd0000803f0060fb3e00f85c3f0070f5be0000803f
+xr_loaded_fragment format 553 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 ae4c74ecfbf7bb2dc1e7239b6c68f96c 00d8753f00105f3f00c0b2bedddcdc3e0060fb3e008c873f000018be3d3d3d3f
+xr_loaded_fragment format 553 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 3cf310c5f905040d0703f33829d21b9e 00d8753f0024883f00a013be2d2d2d3f0060fb3e00d0ad3e002081be6e6e6e3f
+xr_half_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 6cf278d55d4524fd95816dc8c9d174cd 0064d63f00f006bf00c098be0000803f00f0d5be0080e2be002083be0000803f
+xr_half_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 efad959c6c85e23863cd2a3eb134f6c1 00c82f3f00f006bf00c098be0000803f0000963d0080e2be002083be0000803f
+xr_half_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 82a43ecc5ecb1ba74109f1ec2c673f3b 0088663f00f006bf00c098be0000803f0070febe0080e2be002083be0000803f
+xr_half_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 d74b8561d7382356c538779490376258 00d8753f00f006bf00c098be0000803f00f006bf0080e2be002083be0000803f
+xr_half_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 1a410aa9835a7066f5e04279d5107afe 00d86a3f00f006bf00c098be0000803f0040a03d0080e2be002083be0000803f
+xr_half_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 b760dd236d539c83497dc1809d147367 00006d3f00f006bf00c098be0000803f00f006bf0080e2be002083be0000803f
+xr_half_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 42957be1ab08b8deff88d0b3b1de5548 0060643f00b8193f00c098be0000803f0040a43e00984e3f002083be0000803f
+xr_half_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 5b85e23b28575b28885c93eb531a6de9 0060643f0080d0be00c098be0000803f0040a43e0000cfbd002083be0000803f
+xr_half_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 d94ca2a826350d8eb25b01f927298360 0060643f008016be00c098be0000803f0040a43e00f85c3f002083be0000803f
+xr_half_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 fd0d9836a7ae2f4b7c6c08d39f7a1c73 0060643f00f006bf00c098be0000803f0040a43e00f006bf002083be0000803f
+xr_half_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 942da439ba06bbaeaa2c9c7827643cfa 0060643f00c83f3f00c098be0000803f0040a43e008062bd002083be0000803f
+xr_half_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 de0642efcc2011b3bab266041a1d595f 0060643f0094903f00c098be0000803f0040a43e0060a03f002083be0000803f
+xr_half_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 17799f6c42a28dbade094be06595e751 0060643f00f006bf00f006bf0000803f0040a43e0080e2be0080453e0000803f
+xr_half_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 cba1f29ee21d44ec4111bf52738264f7 0060643f00f006bf00406cbe0000803f0040a43e0080e2be000070bd0000803f
+xr_half_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 33ce2e1f730f457ff8f7e1687cc31cc7 0060643f00f006bf0030aabe0000803f0040a43e0080e2be0030933e0000803f
+xr_half_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 ec7d55120f9badf1e455fc70e30141a3 0060643f00f006bf00f006bf0000803f0040a43e0080e2be00000cbc0000803f
+xr_half_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 09d2628249e4bbaf385ac24238d297df 0060643f00f006bf0040d3be0000803f0040a43e0080e2be0040c3bd0000803f
+xr_half_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 e2430cef7c13e59b0e3b3f71cbdf2c71 0060643f00f006bf00f0e3be0000803f0040a43e0080e2be0060e53e0000803f
+xr_half_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 1ef5fae1eee6c98fd7e62d5ea058fcfb 0064d63f00b8193f00c098be0000803f00f0d5be00984e3f002083be0000803f
+xr_half_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 e893b7aa2e913a594f587e1cbdb5aae2 00c82f3f0080d0be00c098be0000803f0000963d0000cfbd002083be0000803f
+xr_half_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 f8a2d2fbba5e9e481cfd7f23a7ac8275 0088663f008016be00c098be0000803f0070febe00f85c3f002083be0000803f
+xr_half_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 2b86f37273cb72ee3b68664243e9f861 00d8753f00f006bf00c098be0000803f00f006bf00f006bf002083be0000803f
+xr_half_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 86b33e11192456517433051f4aae2772 00d86a3f00c83f3f00c098be0000803f0040a03d008062bd002083be0000803f
+xr_half_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 1c5c6143e9f5abeada67c0806b665fea 00006d3f0094903f00c098be0000803f00f006bf0060a03f002083be0000803f
+xr_half_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 0db924eb35a138f284606f00cda67d2f 0060643f00b8193f00f006bf0000803f0040a43e00984e3f0080453e0000803f
+xr_half_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 7ca63e875412446a927b78a8186af620 0060643f0080d0be00406cbe0000803f0040a43e0000cfbd000070bd0000803f
+xr_half_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 3d0d6578c5e4e98f31bbce4c83de2d49 0060643f008016be0030aabe0000803f0040a43e00f85c3f0030933e0000803f
+xr_half_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 b82a85609a3c8e5b90ad533c2ac51c76 0060643f00f006bf00f006bf0000803f0040a43e00f006bf00000cbc0000803f
+xr_half_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 db8e08703dd7c3021f1ed4c397c3ac97 0060643f00c83f3f0040d3be0000803f0040a43e008062bd0040c3bd0000803f
+xr_half_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 98876b4fd518defe7d7ee6ba2b81c394 0060643f0094903f00f0e3be0000803f0040a43e0060a03f0060e53e0000803f
+xr_float_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 e28e05b3cfc380bee38bee56c62a1e62 0064d63f0060bf3e00b8193f0000803f00f8a43f00b8073f00f006bf0000803f
+xr_float_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 fdabf08a7d9f16d23d391767c5fccd4b 0030913f0060bf3e00b8193f0000803f00281d3f00b8073f00f006bf0000803f
+xr_float_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 3c64f142690942ca022aa88b2544748e 004c993f0060bf3e00b8193f0000803f00e83c3f00b8073f00f006bf0000803f
+xr_float_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 252034b3c671c1dc4783a745d1086810 0050703f0060bf3e00b8193f0000803f006c923f00b8073f00f006bf0000803f
+xr_float_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 2d901ab33d75b0f0d740f926896a2367 00389b3f0060bf3e00b8193f0000803f00500d3f00b8073f00f006bf0000803f
+xr_float_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 d9a1bdd7f669643e7f952e303a4c7198 00389b3f0060bf3e00b8193f0000803f0040c33e00b8073f00f006bf0000803f
+xr_float_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 c63d19f52610c02b342f70f4f57e51be 004c993f0000f13e00b8193f0000803f00a8683f0078333f00f006bf0000803f
+xr_float_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 9084727e8c8087f4aafa2d77ff93f5e2 004c993f0040b53e00b8193f0000803f00a8683f00c0b73e00f006bf0000803f
+xr_float_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 95f358662d15ba36bdc193fd014af3bb 004c993f00c0b73e00b8193f0000803f00a8683f0090d43e00f006bf0000803f
+xr_float_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 7084be4e5eee40a99f7254a284d19234 004c993f0020eb3e00b8193f0000803f00a8683f00282c3f00f006bf0000803f
+xr_float_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 ca07b7222961c4f80c8994c2b386eb26 004c993f00c0e23d00b8193f0000803f00a8683f0030933e00f006bf0000803f
+xr_float_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 077ca1e8bfb0bf1bb6d43e00712807db 004c993f0040c33d00b8193f0000803f00a8683f00802f3e00f006bf0000803f
+xr_float_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 56ca472342af404f59fcea219ed0a155 004c993f0060bf3e00f48f3f0000803f00a8683f00b8073f0060e53e0000803f
+xr_float_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 861d5d8c35563455ebb0c835188eab36 004c993f0060bf3e0060113f0000803f00a8683f00b8073f0080b6be0000803f
+xr_float_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 2c0db0a7184a82706d5a9739ce13af58 004c993f0060bf3e00e0183f0000803f00a8683f00b8073f00802dbd0000803f
+xr_float_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 ce114e40d7dbb5937b1ce10b08012d4b 004c993f0060bf3e00d8593f0000803f00a8683f00b8073f00c000bf0000803f
+xr_float_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 4e11c8145cffdbd86a3dfadf076851ad 004c993f0060bf3e00b8073f0000803f00a8683f00b8073f00e0f93e0000803f
+xr_float_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 4e885f7995be0e18abe7419a255d9a91 004c993f0060bf3e00f0063f0000803f00a8683f00b8073f0030793f0000803f
+xr_float_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 2be01a7dafb96d76d233a3b552eb6c6e 0064d63f0000f13e00b8193f0000803f00f8a43f0078333f00f006bf0000803f
+xr_float_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 3322799bcf86915c9fd1d02157dc5023 0030913f0040b53e00b8193f0000803f00281d3f00c0b73e00f006bf0000803f
+xr_float_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 0bb090e4a642db00b54d593f57718e1b 004c993f00c0b73e00b8193f0000803f00e83c3f0090d43e00f006bf0000803f
+xr_float_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 3736aa245c37da2f521219d31df5bfba 0050703f0020eb3e00b8193f0000803f006c923f00282c3f00f006bf0000803f
+xr_float_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 a10ef93cdedeb7594caa2db164dd69cb 00389b3f00c0e23d00b8193f0000803f00500d3f0030933e00f006bf0000803f
+xr_float_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 53fa5b069cbafb30cac0e035ee62fd59 00389b3f0040c33d00b8193f0000803f0040c33e00802f3e00f006bf0000803f
+xr_float_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 389e19362e5d5daab76bd310dcf08de9 004c993f0000f13e00f48f3f0000803f00a8683f0078333f0060e53e0000803f
+xr_float_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 90019805596cb3166de53aec203974d2 004c993f0040b53e0060113f0000803f00a8683f00c0b73e0080b6be0000803f
+xr_float_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 7883aa6678add9cb48775c02f5cb7a39 004c993f00c0b73e00e0183f0000803f00a8683f0090d43e00802dbd0000803f
+xr_float_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 1688ff0df46df1119b417c68efcc998d 004c993f0020eb3e00d8593f0000803f00a8683f00282c3f00c000bf0000803f
+xr_float_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 6e24ce25d95b5f4ce6f50a45f186f64d 004c993f00c0e23d00b8073f0000803f00a8683f0030933e00e0f93e0000803f
+xr_float_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 63ca8c9034fb427f4577892b8db4f5d0 004c993f0040c33d00f0063f0000803f00a8683f00802f3e0030793f0000803f
+xr_loaded_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x8	bytes 65536 84a314c4768fb3cdce45c876db1aa4f8 0050a43f00105f3f00c0b2be0000803f0080b63e008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x8	bytes 65536 db1550945632f75079c882b2363cc24b 0000000000105f3f00c0b2be0000803f00000000008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x8	bytes 65536 ca42aad716e01490a1c3ac6f4836eadb 0070a53e00105f3f00c0b2be0000803f008009be008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x8	bytes 65536 bc05f9d3852bb0a40a2ab52f84f71c55 00c8963f00105f3f00c0b2be0000803f00d0ad3e008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x8	bytes 65536 09b7723845f1b415732cb627ff8144df 00d8753f00105f3f00c0b2be0000803f0060fb3e008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x8	bytes 65536 9f2c7ca700b3a7543efb7ad09c49423f 0070a53e00105f3f00c0b2be0000803f008009be008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x5	bytes 65536 05a81cea777293b289b68fb0b536abd4 00d8753f0064d63f00c0b2be0000803f0060fb3e006c923f000018be0000803f
+xr_loaded_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x5	bytes 65536 03964f22f967767bb42ec0469fce791d 00d8753f0000000000c0b2be0000803f0060fb3e00000000000018be0000803f
+xr_loaded_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x5	bytes 65536 d62c2f516c10e391b58c85181b821883 00d8753f0060a03f00c0b2be0000803f0060fb3e0040b13d000018be0000803f
+xr_loaded_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x5	bytes 65536 3c47af21208f5c99236ba24da53032d9 00d8753f00f00e3f00c0b2be0000803f0060fb3e00cc913f000018be0000803f
+xr_loaded_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x5	bytes 65536 d8cbd4c92d3b71c86e55e5823738cfea 00d8753f00105f3f00c0b2be0000803f0060fb3e008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x5	bytes 65536 9a8c55e730e44d826cbb2485c7da72f7 00d8753f0060a03f00c0b2be0000803f0060fb3e0040b13d000018be0000803f
+xr_loaded_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x2	bytes 65536 c98e5ee5636122866ac5c733b2bb2ca6 00d8753f00105f3f00a064be0000803f0060fb3e008c873f00b0dfbe0000803f
+xr_loaded_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x2	bytes 65536 c3840597fc4bf42cee39ae0445e66dda 00d8753f00105f3f000000000000803f0060fb3e008c873f000000000000803f
+xr_loaded_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x2	bytes 65536 5e5228d641ce48fc15f786b18a2c7dad 00d8753f00105f3f0020013e0000803f0060fb3e008c873f003093be0000803f
+xr_loaded_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x2	bytes 65536 ddce2d3d8094890fbed9c738e022e004 00d8753f00105f3f002074be0000803f0060fb3e008c873f009804bf0000803f
+xr_loaded_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x2	bytes 65536 df26aa8ef0edeb11025f528fc8a0d1da 00d8753f00105f3f00c0b2be0000803f0060fb3e008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x2	bytes 65536 db16e46edecc6d41b8f19ca5eded91df 00d8753f00105f3f0020013e0000803f0060fb3e008c873f003093be0000803f
+xr_loaded_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0xc	bytes 65536 60ec116973c601d3878364df0d3e51b0 0050a43f0064d63f00c0b2be0000803f0080b63e006c923f000018be0000803f
+xr_loaded_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0xc	bytes 65536 d12220362935f6a7c094c44898b4ed16 000000000000000000c0b2be0000803f0000000000000000000018be0000803f
+xr_loaded_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0xc	bytes 65536 1602e9dbc018388a2716e9d9318ef114 0070a53e0060a03f00c0b2be0000803f008009be0040b13d000018be0000803f
+xr_loaded_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0xc	bytes 65536 a7405fc279fd921a3ae9842db6e9f4dc 00c8963f00f00e3f00c0b2be0000803f00d0ad3e00cc913f000018be0000803f
+xr_loaded_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0xc	bytes 65536 78f0b3b99e9dc8ca3bf75d4fbb32c0c9 00d8753f00105f3f00c0b2be0000803f0060fb3e008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0xc	bytes 65536 c354601a8225ee4707dd7d376bfb7844 0070a53e0060a03f00c0b2be0000803f008009be0040b13d000018be0000803f
+xr_loaded_fragment format 555 blend [1, 1, 0, 1, 1, 0] mask 0x7	bytes 65536 da9865bbc2f87813f81f8b7565678e9e 00d8753f0064d63f00a064be0000803f0060fb3e006c923f00b0dfbe0000803f
+xr_loaded_fragment format 555 blend [0, 5, 0, 0, 5, 0] mask 0x7	bytes 65536 e06410c59124cb2ab9bba082d3bf4b63 00d8753f00000000000000000000803f0060fb3e00000000000000000000803f
+xr_loaded_fragment format 555 blend [4, 5, 0, 1, 5, 0] mask 0x7	bytes 65536 dd846e7f16bc2d04d32edd3a559bfdc6 00d8753f0060a03f0020013e0000803f0060fb3e0040b13d003093be0000803f
+xr_loaded_fragment format 555 blend [3, 8, 0, 1, 1, 0] mask 0x7	bytes 65536 fb91ec8427a1a2bf69363fd0b4d2e399 00d8753f00f00e3f002074be0000803f0060fb3e00cc913f009804bf0000803f
+xr_loaded_fragment format 555 blend [5, 4, 0, 5, 4, 0] mask 0x7	bytes 65536 4d97a42dd635cc4cec9cfff8809e4e7c 00d8753f00105f3f00c0b2be0000803f0060fb3e008c873f000018be0000803f
+xr_loaded_fragment format 555 blend [8, 9, 0, 8, 9, 0] mask 0x7	bytes 65536 e23628f80f703062d40f2c198473fb08 00d8753f0060a03f0020013e0000803f0060fb3e0040b13d003093be0000803f
+xr_dual_half_fragment fast math format 550 blend None	bytes 65536 66c3837cb5c4458ee2766c872675dd86 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282bedddc5c3f
+xr_dual_half_fragment fast math off format 550 blend None	bytes 65536 66c3837cb5c4458ee2766c872675dd86 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282bedddc5c3f
+xr_dual_half_fragment fast math off format 550 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 cfe5c9981271228d569cee24d9ad719d 5e5e5e3f6060a03ffbfa7abeb4b3333fbbba3a3e6060a03fcac9c93ecfce4e3f
+xr_dual_half_fragment fast math off format 550 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 dae2eff521dcddeebb215c527f7dd3fd 6060a03f6060a03fc1c040bfd8d7573fecebebbe6060a03fdcdbdb3e0000803f
+xr_dual_half_fragment fast math off format 550 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 f533fd1027fc5f4e22be8e805b834d20 6767673ff1f0f0bcb6b5b5beb4b3333fabaaaabe9b9a1a3fb9b8383ecfce4e3f
+xr_dual_half_fragment fast math off format 550 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 8c880e7a2a276388c9b3364c1c365c76 bcbbbb3ea9a8283f8d8c0cbe0000803fe5e4643ed0cf8f3fa3a2223e0000803f
+xr_dual_half_fragment fast math off format 550 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 fe1b27092a4295ae503eaf571b526110 6060a03fe5e4e43e020202bfdcdb5b3f969595becac9893fa8a7a73eadac2c3f
+xr_dual_half_fragment fast math off format 550 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 0e86a66b815e372f8150d3916019bc08 c1c040bfa9a828bfb7b6363f000000002f2f2f3ff3f272be8b8a8abe00000000
+xr_dual_float_fragment fast math format 550 blend None	bytes 65536 89f20ddf152bd0077b461259548cbffd 1919993fc0bfbf3e9a99193fe3e2e23ee9e8683f8887073f999818bfbdbcbc3e
+xr_dual_float_fragment fast math off format 550 blend None	bytes 65536 89f20ddf152bd0077b461259548cbffd 1919993fc0bfbf3e9a99193fe3e2e23ee9e8683f8887073f999818bfbdbcbc3e
+xr_dual_float_fragment fast math off format 550 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 9e6035051ee26261a30273b65421136b 9897973fa8a7a73ea6a5253fc9c8c83e908f8f3fa9a8a83d9c9b1bbfb7b6b63e
+xr_dual_float_fragment fast math off format 550 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 8df61b5833d69132feb9287e556af322 6060a03fd1d0d03e6060a03fe1e0e03e6060a03fa1a0203dc0bfbf3e9a99193f
+xr_dual_float_fragment fast math off format 550 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 c50c515737f87a7fffcc6f32604bd54b 9a99993faeadad3e1717173fc9c8c83ec8c7473fe2e1e13ed7d656beb7b6b63e
+xr_dual_float_fragment fast math off format 550 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 061a8f5857c460246e8dda3577c04bbe 9291913ec8c7c73e8584843efdfcfc3ec2c1413f3e3e3e3f9b9a1abfb1b0303f
+xr_dual_float_fragment fast math off format 550 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 3328b5cab141509f1f81c8d04c8b6195 6060a03fa3a2a23e0202823fdbdada3e6060a03f9d9c9cbd939292bea9a8a83e
+xr_dual_float_fragment fast math off format 550 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 5b03a7ab211771bd3f282ca89369e626 c1c040bf919090bcc1c040bf00000000c1c040bfb5b4343fc1c040bf9d9c1c3e
+xr_dual_half_fragment fast math format 552 blend None	bytes 65536 db3d31faeffcaefae7a174f6bdd21dbc e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be5d5d5d3f
+xr_dual_half_fragment fast math off format 552 blend None	bytes 65536 db3d31faeffcaefae7a174f6bdd21dbc e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be5d5d5d3f
+xr_dual_half_fragment fast math off format 552 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 dfcc9067670eb243b294db42a30f3392 5e5e5e3f6060a03ffbfa7abe3434343fbbba3a3e6060a03fcac9c93ecfce4e3f
+xr_dual_half_fragment fast math off format 552 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 7348e1f583339d9801ab6ed0e8a5ebf3 6060a03f6060a03fc1c040bf5858583fecebebbe6060a03fdcdbdb3e0000803f
+xr_dual_half_fragment fast math off format 552 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 97a7b7dd0697e25d04beaa13c06c5bcb 6767673ff1f0f0bcb6b5b5be3434343fabaaaabe9b9a1a3fb9b8383ecfce4e3f
+xr_dual_half_fragment fast math off format 552 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 9dc4294de965f6c12c5246c44032e2a7 bcbbbb3ea9a8283f8d8c0cbe0000803fe5e4643ed0cf8f3fa3a2223e0000803f
+xr_dual_half_fragment fast math off format 552 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 83721b26cabe55b333eeaa804f9ec640 6060a03fe5e4e43e020202bfdcdb5b3f969595becac9893fa8a7a73eadac2c3f
+xr_dual_half_fragment fast math off format 552 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 d3c616b0c6976c7fbe283f9e1873f81b c1c040bfa9a828bfb7b6363f000000002f2f2f3ff3f272be8b8a8abe00000000
+xr_dual_float_fragment fast math format 552 blend None	bytes 65536 e63bafc68c8047d1a1a85eda8a35207f 1919993fc0bfbf3e9a99193fe3e2e23ee9e8683f8887073f999818bfbebdbd3e
+xr_dual_float_fragment fast math off format 552 blend None	bytes 65536 e63bafc68c8047d1a1a85eda8a35207f 1919993fc0bfbf3e9a99193fe3e2e23ee9e8683f8887073f999818bfbebdbd3e
+xr_dual_float_fragment fast math off format 552 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 6bd7c47cd824701733d49ca50b6ed627 9897973fa8a7a73ea6a5253fc9c8c83e908f8f3fa9a8a83d9c9b1bbfb8b7b73e
+xr_dual_float_fragment fast math off format 552 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 a304a45d09a7d33c2226d597e7011caf 6060a03fd1d0d03e6060a03fe0dfdf3e6060a03fa1a0203dc0bfbf3e1a1a1a3f
+xr_dual_float_fragment fast math off format 552 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 d0c35b97cb6af3000b456282ec67f1db 9a99993faeadad3e1717173fc9c8c83ec8c7473fe2e1e13ed7d656beb8b7b73e
+xr_dual_float_fragment fast math off format 552 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 ac17c1c5f9d76e341802a57a20776f16 9291913ec8c7c73e8584843efefdfd3ec2c1413f3e3e3e3f9b9a1abfb2b1313f
+xr_dual_float_fragment fast math off format 552 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 849ac53e7230ca0c142ac3dc9b1abfab 6060a03fa3a2a23e0202823fdbdada3e6060a03f9d9c9cbd939292bea9a8a83e
+xr_dual_float_fragment fast math off format 552 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 fa284e36ec46280bdace6dfff016a478 c1c040bf919090bcc1c040bf00000000c1c040bfb5b4343fc1c040bf9d9c1c3e
+xr_dual_half_fragment fast math format 554 blend None	bytes 65536 251167742de895f7a4a97a7f44c14384 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+xr_dual_half_fragment fast math off format 554 blend None	bytes 65536 251167742de895f7a4a97a7f44c14384 e4e3633fc1c040bf999898be0000803fa5a4a43ee2e1e1be838282be0000803f
+xr_dual_half_fragment fast math off format 554 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 432fff529d06dc55c1027e2b95abd2ba 5e5e5e3f6060a03ffbfa7abe0000803fbbba3a3e6060a03fcac9c93e0000803f
+xr_dual_half_fragment fast math off format 554 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 77f8be63faba5a7e7d4e9bac8323d88e 6060a03f6060a03fc1c040bf0000803fecebebbe6060a03fdcdbdb3e0000803f
+xr_dual_half_fragment fast math off format 554 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 67b2282a10b9e252d36a7a7b2ff47cb7 6767673ff1f0f0bcb6b5b5be0000803fabaaaabe9b9a1a3fb9b8383e0000803f
+xr_dual_half_fragment fast math off format 554 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 264da15a537be6cb94df5e31a8a70bb5 bcbbbb3ea9a8283f8d8c0cbe0000803fe5e4643ed0cf8f3fa3a2223e0000803f
+xr_dual_half_fragment fast math off format 554 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 4cea0f11487c57c13f46dc54d0cfefe6 6060a03fe5e4e43e020202bf0000803f969595becac9893fa8a7a73e0000803f
+xr_dual_half_fragment fast math off format 554 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 679d878ea1fdc15205e103d10cfe868c c1c040bfa9a828bfb7b6363f0000803f2f2f2f3ff3f272be8b8a8abe0000803f
+xr_dual_float_fragment fast math format 554 blend None	bytes 65536 3b101f23e4a3d8f83532c6936ab0509e 1919993fc0bfbf3e9a99193f0000803fe9e8683f8887073f999818bf0000803f
+xr_dual_float_fragment fast math off format 554 blend None	bytes 65536 3b101f23e4a3d8f83532c6936ab0509e 1919993fc0bfbf3e9a99193f0000803fe9e8683f8887073f999818bf0000803f
+xr_dual_float_fragment fast math off format 554 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 39aa13e6049842808c7a0b82b36c0eab 9897973fa8a7a73ea6a5253f0000803f908f8f3fa9a8a83d9c9b1bbf0000803f
+xr_dual_float_fragment fast math off format 554 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 70d94a695645bdc40bd0c667ad52383e 6060a03fd1d0d03e6060a03f0000803f6060a03fa1a0203dc0bfbf3e0000803f
+xr_dual_float_fragment fast math off format 554 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 2efb63cd426541bd40abb37e435b6543 9a99993faeadad3e1717173f0000803fc8c7473fe2e1e13ed7d656be0000803f
+xr_dual_float_fragment fast math off format 554 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 ec1205fce1df2065b335def4c910eb1b 9291913ec8c7c73e8584843e0000803fc2c1413f3e3e3e3f9b9a1abf0000803f
+xr_dual_float_fragment fast math off format 554 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 17575bf4372d5d42addc7ddab0796aae 6060a03fa3a2a23e0202823f0000803f6060a03f9d9c9cbd939292be0000803f
+xr_dual_float_fragment fast math off format 554 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 54f5710d53a655e988b0ec61479c7859 c1c040bf919090bcc1c040bf0000803fc1c040bfb5b4343fc1c040bf0000803f
+xr_dual_half_fragment fast math format 551 blend None	bytes 65536 deacc34c4e7592e58b56ea79bd181220 0060643f00f006bf00c098be0000803f0040a43e0080e2be002083bedddc5c3f
+xr_dual_half_fragment fast math off format 551 blend None	bytes 65536 deacc34c4e7592e58b56ea79bd181220 0060643f00f006bf00c098be0000803f0040a43e0080e2be002083bedddc5c3f
+xr_dual_half_fragment fast math off format 551 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 6a6a9ff92808693f6c97ea1bf6b8970c 00105f3f00d0c53f00207cbeb4b3333f0080393e0064d63f00d0c93ecfce4e3f
+xr_dual_half_fragment fast math off format 551 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 9f9db829f0ad52ef5370da9c0fcab9c1 0064d63f00aca13f00f006bfd8d7573f0090ecbe0064ae3f0080db3e0000803f
+xr_dual_half_fragment fast math off format 551 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 19ef8ac029ef318d5f0b84e7fd705147 0098673f0040e03d0080b6beb4b3333f0030aabe00981a3f00e0373ecfce4e3f
+xr_dual_half_fragment fast math off format 551 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 d0d571d8f7273571b32420a66fff6def 00d0bc3e0040623f00c00dbe0000803f00a0643e00f48f3f00c0223e0000803f
+xr_dual_half_fragment fast math off format 551 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 efb110f32f4dcb2489f258bf36ed5b45 0004ce3f0080c83e004802bfdcdb5b3f006095be00ec893f00d0a73eadac2c3f
+xr_dual_half_fragment fast math off format 551 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 3bf85d53a01235aa4c0a780a5bd317b1 00f006bf00a0c0be0048363f0000000000e02e3f002074be00808abe00000000
+xr_dual_float_fragment fast math format 551 blend None	bytes 65536 2689a05142cd71a2a22c3c9b44cce615 004c993f0060bf3e00b8193fe3e2e23e00a8683f00b8073f00f006bfbdbcbc3e
+xr_dual_float_fragment fast math off format 551 blend None	bytes 65536 2689a05142cd71a2a22c3c9b44cce615 004c993f0060bf3e00b8193fe3e2e23e00a8683f00b8073f00f006bfbdbcbc3e
+xr_dual_float_fragment fast math off format 551 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 5c25e3cd11f600534b5ac684c5bf0d31 0008983f00d0a73e00e0253fc9c8c83e00588f3f0080a63d00f006bfb7b6b63e
+xr_dual_float_fragment fast math off format 551 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 db1419caefabcaa9de6a05a9e709ee61 0064d63f0080d03e0028c23fe1e0e03e0018d43f00801c3d0080e23e9a99193f
+xr_dual_float_fragment fast math off format 551 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 c1e70d42e8ef77e5ee0e0191342f70d3 004c993f00a0ac3e0030173fc9c8c83e0098473f0080e23e004021beb7b6b63e
+xr_dual_float_fragment fast math off format 551 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 95d81e2ef3bc0e30afadc6a2d37bed09 0010923e0030c73e0040853efdfcfc3e00b8413f00d03e3f00f006bfb1b0303f
+xr_dual_float_fragment fast math off format 551 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 d3d289ba2c6891354e2b3ddb736be225 0064d63f00f0a13e004c823fdbdada3e0038b33f00009ebd00005dbea9a8a83e
+xr_dual_float_fragment fast math off format 551 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 76f0e8387047fd6188f73435d642fb82 00f006bf00008dbc00f006bf0000000000f006bf0068343f00f006bf9d9c1c3e
+xr_dual_half_fragment fast math format 553 blend None	bytes 65536 777c1dbde6e84b770f43f015e4cfa04a 0060643f00f006bf00c098be0000803f0040a43e0080e2be002083be5d5d5d3f
+xr_dual_half_fragment fast math off format 553 blend None	bytes 65536 777c1dbde6e84b770f43f015e4cfa04a 0060643f00f006bf00c098be0000803f0040a43e0080e2be002083be5d5d5d3f
+xr_dual_half_fragment fast math off format 553 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 2741969a31a19d75026cebc800e96152 00105f3f0044ca3f00207cbe3434343f00a0553e0064d63f00d0c93ecfce4e3f
+xr_dual_half_fragment fast math off format 553 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 8eaa8974ffb54610bca822c41d94f812 0064d63f00fca23f00f006bf5858583f00207ebe0050b53f0080db3e0000803f
+xr_dual_half_fragment fast math off format 553 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 f8cf691d9fb52bb827fb1e390df1c719 0098673f0040e03d0080b6be3434343f004050be00e01e3f00e0373ecfce4e3f
+xr_dual_half_fragment fast math off format 553 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 6da5a94e58b44ed08f7cf9f09fbe7f5f 00d0cd3e00a8683f00c00dbe0000803f0020813e00c89d3f00c0223e0000803f
+xr_dual_half_fragment fast math off format 553 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 31a54a0828ea5107d820c13177b4e23a 0084c93f00d0cd3e004802bfdcdb5b3f00e003be00f48f3f00d0a73eadac2c3f
+xr_dual_half_fragment fast math off format 553 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 6a542b3c1df248ac82960fc338258d70 00f006bf0040babe0048363f0000000000f0ff3e00e03cbe00808abe00000000
+xr_dual_float_fragment fast math format 553 blend None	bytes 65536 ca2b3c5e0116ebbf8f60852d8e76af3f 004c993f0060bf3e00b8193fe3e2e23e00a8683f00b8073f00f006bfbebdbd3e
+xr_dual_float_fragment fast math off format 553 blend None	bytes 65536 ca2b3c5e0116ebbf8f60852d8e76af3f 004c993f0060bf3e00b8193fe3e2e23e00a8683f00b8073f00f006bfbebdbd3e
+xr_dual_float_fragment fast math off format 553 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 fc1ed7535546b4158c944835336171b6 0008983f00d0a73e0018243fc9c8c83e00588f3f0000d73c00f006bfb8b7b73e
+xr_dual_float_fragment fast math off format 553 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 b57926fd6be48d99c77aa900a6cb58c2 0064d63f0080d03e00d4b83fe0dfdf3e0018d43f000030bd0080e23e1a1a1a3f
+xr_dual_float_fragment fast math off format 553 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 fc4fc29a816c277c68b616ce062b660a 004c993f00a0ac3e0030173fc9c8c83e0098473f0080e23e004021beb8b7b73e
+xr_dual_float_fragment fast math off format 553 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 9302d7d77bc7113ef7f851345c597b2c 00f00e3f0030c73e0070a53efefdfd3e00b8413f00a0453f00f006bfb2b1313f
+xr_dual_float_fragment fast math off format 553 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 1c50bfae248f81de9835f2b9ebd1fa5f 0064d63f00f0a13e0068713fdbdada3e0038b33f00c022be00005dbea9a8a83e
+xr_dual_float_fragment fast math off format 553 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 8d21413072b9088939342072441264ae 00f006bf00008dbc00f006bf0000000000f006bf0098503f00f006bf9d9c1c3e
+xr_dual_half_fragment fast math format 555 blend None	bytes 65536 2ef2065c142466b429fc2905c907bc02 0060643f00f006bf00c098be0000803f0040a43e0080e2be002083be0000803f
+xr_dual_half_fragment fast math off format 555 blend None	bytes 65536 2ef2065c142466b429fc2905c907bc02 0060643f00f006bf00c098be0000803f0040a43e0080e2be002083be0000803f
+xr_dual_half_fragment fast math off format 555 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 ceb3e85c254a5219406e0efe056c6c3f 00105f3f00d0c53f00207cbe0000803f0080393e0064d63f00d0c93e0000803f
+xr_dual_half_fragment fast math off format 555 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 bf57988917c9fddc8759e8eacc1af40a 0064d63f00aca13f00f006bf0000803f0090ecbe0064ae3f0080db3e0000803f
+xr_dual_half_fragment fast math off format 555 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 0f08ea4675db679e9a3a9d3f409b2604 0098673f0040e03d0080b6be0000803f0030aabe00981a3f00e0373e0000803f
+xr_dual_half_fragment fast math off format 555 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 3042696a908d3f943921cb822f84e0fc 00d0bc3e0040623f00c00dbe0000803f00a0643e00f48f3f00c0223e0000803f
+xr_dual_half_fragment fast math off format 555 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 8b519b648b0290080c4d6189fd856517 0004ce3f0080c83e004802bf0000803f006095be00ec893f00d0a73e0000803f
+xr_dual_half_fragment fast math off format 555 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 cb6c0882e42e14d067cefbfd0da700a1 00f006bf00a0c0be0048363f0000803f00e02e3f002074be00808abe0000803f
+xr_dual_float_fragment fast math format 555 blend None	bytes 65536 6969e485680ed5c4e9de409c24213d0e 004c993f0060bf3e00b8193f0000803f00a8683f00b8073f00f006bf0000803f
+xr_dual_float_fragment fast math off format 555 blend None	bytes 65536 6969e485680ed5c4e9de409c24213d0e 004c993f0060bf3e00b8193f0000803f00a8683f00b8073f00f006bf0000803f
+xr_dual_float_fragment fast math off format 555 blend Some([15, 16, 0, 17, 18, 0])	bytes 65536 254707bfa56bd41533c39f83cb27d4e5 0008983f00d0a73e00e0253f0000803f00588f3f0080a63d00f006bf0000803f
+xr_dual_float_fragment fast math off format 555 blend Some([1, 16, 0, 1, 18, 0])	bytes 65536 04e18fe0bf1ff89614f81e8bf9582fe1 0064d63f0080d03e0028c23f0000803f0018d43f00801c3d0080e23e0000803f
+xr_dual_float_fragment fast math off format 555 blend Some([17, 18, 0, 17, 18, 0])	bytes 65536 b01227282801ff03cecba9da24d74a0f 004c993f00a0ac3e0030173f0000803f0098473f0080e23e004021be0000803f
+xr_dual_float_fragment fast math off format 555 blend Some([15, 1, 0, 1, 1, 0])	bytes 65536 fba6d3b2ea43e3cde0c8e35f5ccfaff4 0010923e0030c73e0040853e0000803f00b8413f00d03e3f00f006bf0000803f
+xr_dual_float_fragment fast math off format 555 blend Some([4, 16, 0, 17, 5, 0])	bytes 65536 e4b1a2a5863817a5ab458508a1ff6b8e 0064d63f00f0a13e004c823f0000803f0038b33f00009ebd00005dbe0000803f
+xr_dual_float_fragment fast math off format 555 blend Some([16, 15, 2, 18, 17, 1])	bytes 65536 a42d79f9d997403243a2ac0e261b45f5 00f006bf00008dbc00f006bf0000803f00f006bf0068343f00f006bf0000803f

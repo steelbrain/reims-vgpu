@@ -1,6 +1,6 @@
 //! `cargo xtask dist`: the library as a plain library, which a host links the way it links its
 //! other dependencies, through pkg-config (docs/architecture.md 11.3). It writes
-//! `<target>/dist/`:
+//! `<target>/dist-vulkan/` ([`DEFAULT_OUT`]) unless `--out` names another directory:
 //!
 //! - `lib/libreims_vgpu.a`, and the shared library beside it, built from `reims-vgpu-c`, the
 //!   crate of the C API: `lib/libreims_vgpu.dylib` on macOS, `lib/libreims_vgpu.so` on Linux.
@@ -13,10 +13,9 @@
 //!
 //! QEMU (`make qemu`) links the archive; the C API's tests link the shared library.
 //!
-//! `--platform vulkan` builds the library on the Vulkan platform instead (`reims-vgpu-c`'s
-//! `vulkan` feature, architecture 2.2), into `<target>/dist-vulkan` unless `--out` says
-//! otherwise, so the two trees sit side by side. The tree is laid out the same. On macOS the
-//! default is Metal; on Linux, where only the Vulkan platform builds, it is Vulkan.
+//! The library is built on the Vulkan platform (architecture 2.2), its only one: natively on
+//! Linux, and over MoltenVK on macOS, a build for development and tests. `--platform vulkan`
+//! names it, for the builds that pass it; any other platform is refused.
 
 use std::path::{Path, PathBuf};
 
@@ -44,61 +43,25 @@ pub const LICENSE: &str = "LICENSE";
 /// the tree's [`doc_dir`].
 pub const LICENSES: &str = "LICENSES";
 
-/// The platform the tree's library is built on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Platform {
-    /// Metal: the product.
-    Metal,
-    /// The Vulkan platform, over metal2vulkan's runtime: `reims-vgpu-c`'s `vulkan` feature.
-    Vulkan,
-}
-
-impl Platform {
-    /// The platform `--platform` names.
-    pub fn parse(name: &str) -> Res<Platform> {
-        match name {
-            "metal" => Ok(Platform::Metal),
-            "vulkan" => Ok(Platform::Vulkan),
-            other => Err(format!("--platform {other}: not metal or vulkan\n{USAGE}")),
-        }
-    }
-
-    /// The tree's directory under the target dir when `--out` names none.
-    pub fn default_out(self) -> &'static str {
-        match self {
-            Platform::Metal => "dist",
-            Platform::Vulkan => "dist-vulkan",
-        }
-    }
-
-    /// The `cargo build` features that select the platform: none for Metal, the default.
-    pub fn features(self) -> &'static [&'static str] {
-        match self {
-            Platform::Metal => &[],
-            Platform::Vulkan => &["--features", "reims-vgpu-c/vulkan"],
-        }
-    }
-}
+/// The tree's directory under the target dir when `--out` names none.
+pub const DEFAULT_OUT: &str = "dist-vulkan";
 
 /// `cargo xtask dist`'s arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub profile: Profile,
-    pub platform: Platform,
     /// The directory the tree is written into.
     pub out: PathBuf,
 }
 
 /// The usage line.
-pub const USAGE: &str = "usage: cargo xtask dist [--platform metal|vulkan] \
+pub const USAGE: &str = "usage: cargo xtask dist [--platform vulkan] \
 [--profile dev|release|checked] [--release] [--out DIR]";
 
-/// Parses the arguments. The default is a release build on the OS's default platform
-/// (`native::DEFAULT_PLATFORM`), into `<target>/dist` on Metal and `<target>/dist-vulkan` on
-/// Vulkan; `--out` wins over either.
+/// Parses the arguments. The default is a release build into `<target>/dist-vulkan`
+/// ([`DEFAULT_OUT`]); `--out` wins over it.
 pub fn parse_args(args: &[String], target_dir: &Path) -> Res<Options> {
     let mut profile = Profile("release".to_owned());
-    let mut platform = native::DEFAULT_PLATFORM;
     let mut out = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -108,7 +71,14 @@ pub fn parse_args(args: &[String], target_dir: &Path) -> Res<Options> {
                 .ok_or_else(|| format!("{name} needs a value\n{USAGE}"))
         };
         match a.as_str() {
-            "--platform" => platform = Platform::parse(&value("--platform")?)?,
+            "--platform" => match value("--platform")?.as_str() {
+                "vulkan" => {}
+                other => {
+                    return Err(format!(
+                        "--platform {other}: the library builds on vulkan alone\n{USAGE}"
+                    ));
+                }
+            },
             "--profile" => profile = Profile(value("--profile")?),
             "--release" => profile = Profile("release".to_owned()),
             "--out" => out = Some(PathBuf::from(value("--out")?)),
@@ -117,23 +87,20 @@ pub fn parse_args(args: &[String], target_dir: &Path) -> Res<Options> {
     }
     Ok(Options {
         profile,
-        platform,
-        out: out.unwrap_or_else(|| target_dir.join(platform.default_out())),
+        out: out.unwrap_or_else(|| target_dir.join(DEFAULT_OUT)),
     })
 }
 
 /// The Cargo arguments every OS's build of the library starts its own with, after the
-/// subcommand: `reims-vgpu-c`'s libraries in the profile, on the platform.
+/// subcommand: `reims-vgpu-c`'s libraries in the profile.
 pub fn c_api_args(o: &Options) -> Vec<String> {
-    let mut args = strs(&[
+    strs(&[
         "--profile",
         o.profile.0.as_str(),
         "-p",
         "reims-vgpu-c",
         "--lib",
-    ]);
-    args.extend(strs(o.platform.features()));
-    args
+    ])
 }
 
 /// `reims-vgpu.pc`. Its prefix is the file's grandparent directory (`${pcfiledir}`), so the tree
@@ -326,26 +293,24 @@ mod tests {
         assert_eq!(o.out, PathBuf::from("/o"));
         let o = parse_args(&strs(&["--profile", "dev", "--release"]), Path::new("/t")).unwrap();
         assert_eq!(o.profile, Profile("release".into()));
-        let o = parse_args(&strs(&["--platform", "metal"]), Path::new("/t")).unwrap();
-        assert_eq!(
-            (o.platform, o.out),
-            (Platform::Metal, PathBuf::from("/t/dist"))
-        );
     }
 
-    /// Vulkan's tree goes beside Metal's unless --out names one, whichever comes first
+    /// `--platform vulkan` changes nothing: the tree goes into dist-vulkan unless --out names
+    /// one, whichever comes first
     #[test]
-    fn parse_args_vulkan_goes_beside_metal() {
+    fn parse_args_takes_vulkan_alone() {
         let o = parse_args(&strs(&["--platform", "vulkan"]), Path::new("/t")).unwrap();
-        assert_eq!(o.platform, Platform::Vulkan);
+        assert_eq!(o, parse_args(&[], Path::new("/t")).unwrap());
         assert_eq!(o.out, PathBuf::from("/t/dist-vulkan"));
         for args in [
             ["--platform", "vulkan", "--out", "/o"],
             ["--out", "/o", "--platform", "vulkan"],
         ] {
             let o = parse_args(&strs(&args), Path::new("/t")).unwrap();
-            assert_eq!((o.platform, o.out), (Platform::Vulkan, PathBuf::from("/o")));
+            assert_eq!(o.out, PathBuf::from("/o"));
         }
+        let metal = parse_args(&strs(&["--platform", "metal"]), Path::new("/t")).unwrap_err();
+        assert!(metal.contains("--platform metal"), "{metal}");
     }
 
     #[test]
