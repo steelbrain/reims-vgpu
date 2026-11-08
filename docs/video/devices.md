@@ -55,6 +55,12 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   controls (a bit each of CQP, CBR and VBR, as the arm's API lists them for the codec's
   profiles) and the most consecutive B pictures, 0 on both arms, whose encoders keep frames in
   display order.
+- **What a decode entry bounds**: an `RgfxVideoDecodeCaps` per entry (`decode`): the narrowest
+  HEVC tile column the arm decodes, in luma samples, 128 on both arms
+  (`reims_vgpu_video::codec::hevc::MIN_TILE_COLUMN_WIDTH`); zero, no bound, in every other
+  entry. An HEVC decode entry's `max_references` is 8 on both arms: the most current
+  references with which every picture decodes ([vaapi.md](vaapi.md), "What it refuses";
+  [nvidia.md](nvidia.md)).
 
 ## Sessions
 

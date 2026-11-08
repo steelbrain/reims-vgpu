@@ -2708,12 +2708,14 @@ fn video_caps<P: Platform>(features: u64, video: &dyn GraphicsVideo<P>) -> RgfxV
         .codecs
         .iter_mut()
         .zip(&mut caps.layouts)
-        .zip(&mut caps.encode);
-    for (((slot, layout), encode), codec) in slots.zip(video.caps()) {
+        .zip(&mut caps.encode)
+        .zip(&mut caps.decode);
+    for ((((slot, layout), encode), decode), codec) in slots.zip(video.caps()) {
         if !cached {
             *layout = video.layout(&codec);
         }
         *encode = video.encode_caps(&codec);
+        *decode = video.decode_caps(&codec);
         *slot = codec;
         caps.codec_count += 1;
     }

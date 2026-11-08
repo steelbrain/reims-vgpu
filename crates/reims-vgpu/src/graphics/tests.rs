@@ -10344,7 +10344,8 @@ impl GraphicsVideo<FakePlatform> for CapsVideo {
 /// layout in place, on a device whose kext makes caches of every surface it asks one for
 /// (`SURFACE_CACHE`) and on one whose GPU shares the CPU's memory and keeps caches of the surfaces
 /// whose textures would not lie in place (`SURFACE_CACHE_REFUSED`); a device that makes no cache,
-/// or a video that lands none, answers the layout its pictures land in place at
+/// or a video that lands none, answers the layout its pictures land in place at. Either way the
+/// decode entry carries the codec crate's bounds beyond it, HEVC's narrowest tile column.
 #[test]
 fn outputs_are_cached_where_the_kext_makes_caches_and_the_video_lands_in_them() {
     let refused = u64::from(RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE_REFUSED);
@@ -10362,6 +10363,11 @@ fn outputs_are_cached_where_the_kext_makes_caches_and_the_video_lands_in_them() 
         let what = format!("features {features:#x}, landing in caches: {lands}");
         assert_eq!(caps.codec_count, 1, "{what}");
         assert_eq!(caps.codecs[0].codec, RGFX_VIDEO_CODEC_HEVC, "{what}");
+        assert_eq!(
+            caps.decode[0].min_tile_width,
+            reims_vgpu_video::codec::hevc::MIN_TILE_COLUMN_WIDTH,
+            "{what}"
+        );
         if cached {
             assert_eq!(caps.flags, RGFX_VIDEO_CAPS_OUTPUT_CACHED, "{what}");
             assert_eq!(caps.layouts[0], RgfxVideoOutputLayout::default(), "{what}");

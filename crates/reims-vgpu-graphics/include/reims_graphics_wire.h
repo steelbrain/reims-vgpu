@@ -6787,6 +6787,22 @@ typedef struct {
   uint32_t reserved_0c;
 } RgfxVideoEncodeCaps;
 
+// What the host's hardware takes of one decode codec beside its [`RgfxVideoCodecCaps`], by the
+// same index ([`RgfxVideoCaps::decode`]): the bounds of a picture the host refuses, which the
+// guest's video driver checks before it schedules the picture. All zero for an encode entry,
+// and from a host older than these: no bound beyond the entry's.
+typedef struct {
+  // The narrowest tile column a decode takes, in luma samples: HEVC's
+  // `ColumnWidthInLumaSamples`, a column's CTBs times their size; 0 where any is.
+  uint32_t min_tile_width;
+  // Zero.
+  uint32_t reserved_04;
+  // Zero.
+  uint32_t reserved_08;
+  // Zero.
+  uint32_t reserved_0c;
+} RgfxVideoDecodeCaps;
+
 // The video caps the host writes at the device's init, at [`RGFX_VIDEO_CAPS_OFFSET`]: one
 // [`RgfxVideoCodecCaps`] for each codec and direction its hardware takes, which the guest's
 // video driver lists, and none for the rest, which the guest's software codecs serve.
@@ -6809,6 +6825,8 @@ typedef struct {
   RgfxVideoOutputLayout layouts[RGFX_VIDEO_CAPS_CODECS];
   // What each encode entry of `codecs` takes beyond them, by its index there.
   RgfxVideoEncodeCaps encode[RGFX_VIDEO_CAPS_CODECS];
+  // What each decode entry of `codecs` takes beyond them, by its index there.
+  RgfxVideoDecodeCaps decode[RGFX_VIDEO_CAPS_CODECS];
 } RgfxVideoCaps;
 
 // What became of one encode, which the host writes at the op's `result_offset` before its

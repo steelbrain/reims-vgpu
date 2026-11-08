@@ -29,8 +29,8 @@ use reims_vgpu_graphics::ops::video::{
     RgfxVideoEncodeSettings, RgfxVideoOpDecodeH264, RgfxVideoOpDecodeH265, RgfxVideoOpEncode,
 };
 use reims_vgpu_graphics::wire::{
-    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RgfxSurfaceFacts, RgfxVideoCodecCaps,
-    RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
+    RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxSurfaceFacts,
+    RgfxVideoCodecCaps, RgfxVideoDecodeCaps, RgfxVideoEncodeCaps, RgfxVideoOutputLayout,
 };
 use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdentity};
 #[cfg(target_os = "linux")]
@@ -67,6 +67,14 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     fn encode_caps(&self, _codec: &RgfxVideoCodecCaps) -> RgfxVideoEncodeCaps {
         RgfxVideoEncodeCaps::default()
     }
+    /// What a decode of `codec`, one of [`Self::caps`] in the decode direction, refuses beyond
+    /// it, for the guest's video driver to refuse first: the bounds of the video crate's codec
+    /// decoders, which both arms decode through, HEVC's narrowest tile column
+    /// ([`MIN_TILE_COLUMN_WIDTH`](reims_vgpu_video::codec::hevc::MIN_TILE_COLUMN_WIDTH)); all
+    /// zero for an encode entry.
+    fn decode_caps(&self, codec: &RgfxVideoCodecCaps) -> RgfxVideoDecodeCaps {
+        codec_decode_caps(codec)
+    }
     /// A session of `codec` (`RGFX_VIDEO_CODEC_*`) in `direction` (`RGFX_VIDEO_DECODE` or
     /// `RGFX_VIDEO_ENCODE`); `None` where the hardware has no such codec.
     fn session(&self, codec: u32, direction: u32) -> Option<Arc<dyn GraphicsVideoSession<P>>>;
@@ -81,6 +89,22 @@ pub trait GraphicsVideo<P: Platform>: Send + Sync {
     /// so ([`VideoPlane::cache`]).
     fn imports_device_caches(&self) -> bool {
         false
+    }
+}
+
+/// What the video crate's codec decoders refuse of `codec` beyond its entry
+/// ([`GraphicsVideo::decode_caps`]): HEVC's tile columns under
+/// [`MIN_TILE_COLUMN_WIDTH`](reims_vgpu_video::codec::hevc::MIN_TILE_COLUMN_WIDTH); nothing for
+/// H.264 or an encode.
+pub(crate) fn codec_decode_caps(codec: &RgfxVideoCodecCaps) -> RgfxVideoDecodeCaps {
+    let hevc = codec.codec == RGFX_VIDEO_CODEC_HEVC && codec.direction == RGFX_VIDEO_DECODE;
+    RgfxVideoDecodeCaps {
+        min_tile_width: if hevc {
+            reims_vgpu_video::codec::hevc::MIN_TILE_COLUMN_WIDTH
+        } else {
+            0
+        },
+        ..RgfxVideoDecodeCaps::default()
     }
 }
 
@@ -848,6 +872,35 @@ mod tests {
         assert_eq!(row(R16, 3840, 8192), 7680);
         assert_eq!(row(RG16, 1920, 8192), 7680);
         assert_eq!(row(R8, 3840, 2048), 2048);
+    }
+
+    /// The decode caps of HEVC decode name the codec crate's narrowest tile column, and those of
+    /// H.264 decode and of an encode of either nothing.
+    #[test]
+    fn only_hevc_decode_bounds_its_tile_columns() {
+        let entry = |codec, direction| RgfxVideoCodecCaps {
+            codec,
+            direction,
+            ..RgfxVideoCodecCaps::default()
+        };
+        use reims_vgpu_graphics::wire::RGFX_VIDEO_ENCODE;
+        assert_eq!(
+            codec_decode_caps(&entry(RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE)),
+            RgfxVideoDecodeCaps {
+                min_tile_width: 128,
+                ..RgfxVideoDecodeCaps::default()
+            }
+        );
+        for (codec, direction) in [
+            (RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_DECODE),
+            (RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_ENCODE),
+            (RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_ENCODE),
+        ] {
+            assert_eq!(
+                codec_decode_caps(&entry(codec, direction)),
+                RgfxVideoDecodeCaps::default()
+            );
+        }
     }
 
     /// A format of blocks has its whole blocks across, at most its pitch, and its pitch where its

@@ -3334,6 +3334,26 @@ pub struct RgfxVideoEncodeCaps {
     pub reserved_0c: u32,
 }
 
+/// What the host's hardware takes of one decode codec beside its [`RgfxVideoCodecCaps`], by the
+/// same index ([`RgfxVideoCaps::decode`]): the bounds of a picture the host refuses, which the
+/// guest's video driver checks before it schedules the picture. All zero for an encode entry,
+/// and from a host older than these: no bound beyond the entry's.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxVideoDecodeCaps {
+    /// The narrowest tile column a decode takes, in luma samples: HEVC's
+    /// `ColumnWidthInLumaSamples`, a column's CTBs times their size; 0 where any is.
+    pub min_tile_width: u32,
+    /// Zero.
+    pub reserved_04: u32,
+    /// Zero.
+    pub reserved_08: u32,
+    /// Zero.
+    pub reserved_0c: u32,
+}
+
 /// The video caps the host writes at the device's init, at [`RGFX_VIDEO_CAPS_OFFSET`]: one
 /// [`RgfxVideoCodecCaps`] for each codec and direction its hardware takes, which the guest's
 /// video driver lists, and none for the rest, which the guest's software codecs serve.
@@ -3360,6 +3380,8 @@ pub struct RgfxVideoCaps {
     pub layouts: [RgfxVideoOutputLayout; RGFX_VIDEO_CAPS_CODECS],
     /// What each encode entry of `codecs` takes beyond them, by its index there.
     pub encode: [RgfxVideoEncodeCaps; RGFX_VIDEO_CAPS_CODECS],
+    /// What each decode entry of `codecs` takes beyond them, by its index there.
+    pub decode: [RgfxVideoDecodeCaps; RGFX_VIDEO_CAPS_CODECS],
 }
 
 /// `VIDEO_SESSION_CREATE`: a video session.
@@ -4000,11 +4022,14 @@ const _: () = {
                 + 8
                 + 16 * RGFX_VIDEO_CAPS_CODECS
                 + 16 * RGFX_VIDEO_CAPS_CODECS
+                + 16 * RGFX_VIDEO_CAPS_CODECS
     );
     assert!(core::mem::offset_of!(RgfxVideoCaps, reserved_30c) == 0x30c);
     assert!(core::mem::offset_of!(RgfxVideoCaps, layouts) == 0x310);
     assert!(size_of::<RgfxVideoEncodeCaps>() == 16);
     assert!(core::mem::offset_of!(RgfxVideoCaps, encode) == 0x410);
+    assert!(size_of::<RgfxVideoDecodeCaps>() == 16);
+    assert!(core::mem::offset_of!(RgfxVideoCaps, decode) == 0x510);
     assert!(RGFX_VIDEO_CAPS_OFFSET == RGFX_DEVICE_INFO_OFFSET + size_of::<RgfxDeviceInfo>() as u64);
     assert!(RGFX_VIDEO_CAPS_OFFSET.is_multiple_of(8));
     assert!(
