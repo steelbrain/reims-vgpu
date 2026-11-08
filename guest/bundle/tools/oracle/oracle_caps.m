@@ -98,7 +98,7 @@ static void device_answers(id<MTLDevice> d)
 	    "maxThreadgroupMemoryLength", "maxArgumentBufferSamplerCount", "argumentBuffersSupport",
 	    "readWriteTextureSupport", "sparseTileSizeInBytes", "maxVertexAmplificationCount",
 	    "maximumConcurrentCompilationTaskCount", "gpuCoreCount",
-	    // MTLDeviceSPI, as core reads them (crates/reims-vgpu-metal/src/gpu/device.rs).
+	    // MTLDeviceSPI.
 	    "featureProfile", "halfFPConfig", "singleFPConfig", "doubleFPConfig",
 	    "deviceLinearTextureAlignmentBytes", "iosurfaceReadOnlyTextureAlignmentBytes",
 	    "iosurfaceTextureAlignmentBytes", "linearTextureAlignmentBytes", "maxComputeBuffers",

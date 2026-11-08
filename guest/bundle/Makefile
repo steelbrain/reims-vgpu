@@ -370,10 +370,10 @@ test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_REFLECTED) $
 # command buffer's commit) against the host's library through its C API, with a stand-in for the
 # kext (tests/peer_tests.mm), recording the wire's traffic against tests/peer_wire2.trace. Never in
 # `make test`: it runs on the GPU, so build it first (`make peer-test-build`), then run
-# `make peer-test` holding the Mac's GPU lock. DIST is the tree `cargo xtask dist` wrote (Metal,
-# release): its archive is linked as QEMU links it, with its pkg-config file's private libraries.
+# `make peer-test` holding the Mac's GPU lock. DIST is the tree `cargo xtask dist` wrote (release):
+# its archive is linked as QEMU links it, with its pkg-config file's private libraries.
 # RGFX_PEER_RECORD=1 records the trace again.
-DIST          ?= ../../target/dist
+DIST          ?= ../../target/dist-vulkan
 PEER_TESTBIN   = $(BUILD)/peer_tests
 PEER_TRACE     = tests/peer_wire2.trace
 PEER_LIBS      = $(shell sed -n 's/^Libs.private: //p' $(DIST)/lib/pkgconfig/reims-vgpu.pc)

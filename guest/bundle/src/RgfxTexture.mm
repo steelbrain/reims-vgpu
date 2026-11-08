@@ -2138,8 +2138,7 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // no program relies on (argument buffers name a texture by its gpuResourceID); the host places
 // none of the texture's memory there, so a shader that reaches the range through a pointer meets
 // no resource: on the Vulkan platform it reads zeros and its writes are dropped (metal2vulkan's
-// residency.rs, read), and on the Metal platform it touches GPU addresses nothing maps (not
-// measured).
+// residency.rs, read).
 - (uint64_t)gpuAddress
 {
 	if (_parent != nil) {
