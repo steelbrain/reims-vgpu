@@ -448,7 +448,6 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "parking_lot",
- "reims-vgpu-core",
  "reims-vgpu-graphics",
  "reims-vgpu-video",
  "reims-vgpu-vulkan",
@@ -467,19 +466,9 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "reims-vgpu",
- "reims-vgpu-core",
  "reims-vgpu-graphics",
+ "reims-vgpu-vulkan",
  "tikv-jemallocator",
-]
-
-[[package]]
-name = "reims-vgpu-core"
-version = "0.1.0"
-dependencies = [
- "log",
- "lzma-rs",
- "parking_lot",
- "zerocopy",
 ]
 
 [[package]]
@@ -516,6 +505,7 @@ dependencies = [
  "ash",
  "libc",
  "log",
+ "lzma-rs",
  "mach2",
  "metal2vulkan",
  "metal2vulkan-runtime",
@@ -523,8 +513,10 @@ dependencies = [
  "objc2-foundation",
  "objc2-io-surface",
  "objc2-metal",
- "reims-vgpu-core",
+ "parking_lot",
+ "reims-vgpu-vulkan",
  "sha2 0.10.9",
+ "zerocopy",
 ]
 
 [[package]]
@@ -542,7 +534,6 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "objc2-quartz-core",
- "reims-vgpu-core",
  "reims-vgpu-vulkan",
  "sdl3-sys",
 ]

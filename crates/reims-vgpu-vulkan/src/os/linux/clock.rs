@@ -9,8 +9,8 @@
 
 use std::time::Duration;
 
-use reims_vgpu_core::platform::os::{Clock, Deadline, MonoTime, TimedOut, WallTime};
-use reims_vgpu_core::sync::{Condvar, MutexGuard};
+use crate::core::platform::os::{Clock, Deadline, MonoTime, TimedOut, WallTime};
+use crate::core::sync::{Condvar, MutexGuard};
 
 /// `clock_gettime(clock)` in nanoseconds.
 fn nanos(clock: libc::clockid_t) -> u64 {
@@ -93,7 +93,7 @@ impl Clock for LinuxClock {
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::sync::Mutex;
+    use crate::core::sync::Mutex;
 
     use super::*;
 

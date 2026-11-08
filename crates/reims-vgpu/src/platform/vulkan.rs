@@ -1,9 +1,9 @@
 //! `VulkanPlatform` as an `ApiPlatform`: the runtime's devices, on macOS over MoltenVK, and on
 //! Linux natively.
 
-use reims_vgpu_core::num::ToU64 as _;
-use reims_vgpu_core::platform::Platform;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::num::ToU64 as _;
+use reims_vgpu_vulkan::core::platform::Platform;
 use reims_vgpu_vulkan::os::GuestRamFile;
 
 use super::*;

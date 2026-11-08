@@ -31,16 +31,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::sync::{Condvar, Mutex};
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_EVT_COMPLETE,
     RGFX_LIBRARY_BYTES_OFFSET, RGFX_LIBRARY_FLAG_KEYED, RGFX_STATUS_INVALID_ARGUMENT,
     RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxComplete, RgfxLibraryCreate,
     RgfxLibraryFromRegion, RgfxLibraryLookup, RgfxMsgHeader,
 };
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::raise::RaiseResult;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 
 use reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
@@ -833,7 +833,7 @@ pub(crate) mod tests {
     /// leaves the list, and named entries are never dropped
     #[test]
     fn the_released_list_keeps_to_its_budget() {
-        use reims_vgpu_core::testkit::FakePlatform;
+        use reims_vgpu_vulkan::core::testkit::FakePlatform;
         let platform = FakePlatform::new();
         let device = platform.device();
         let library = || device.new_library(&[1]).unwrap().unwrap().unwrap();

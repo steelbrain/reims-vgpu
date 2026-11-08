@@ -358,7 +358,7 @@ do_cargo() {
     expr="$expr | package($p)"
   done
   echo "packages: ${pkgs[*]}; filter: $expr"
-  local feats=reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan
+  local feats=reims-vgpu-vulkan/testkit,reims-vgpu/testkit,reims-vgpu/vulkan
   printf '[profile.default.junit]\npath = "junit.xml"\n' > "$GH/nextest-tool.toml"
   cargo nextest run --no-run "${pkgs[@]}" --features "$feats"
   # nextest keeps its store under the workspace's target/, whatever CARGO_TARGET_DIR says.

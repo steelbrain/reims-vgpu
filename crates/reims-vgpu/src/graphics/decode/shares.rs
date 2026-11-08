@@ -39,15 +39,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::event::SharedEvent as _;
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::wire::{
     RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_EVT_EVENT_SIGNALLED, RGFX_EVT_SHARED_EVENT_VALUE,
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RgfxEventSignalled,
     RgfxMsgHeader, RgfxSharedEventImport, RgfxSharedEventName, RgfxSharedEventUnname,
     RgfxSharedEventValue,
 };
+use reims_vgpu_vulkan::core::platform::event::SharedEvent as _;
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::{Entry, GraphicsDecoder, ObjHandle, read};
 
@@ -564,8 +564,8 @@ impl Posts {
 mod tests {
     use std::sync::atomic::AtomicBool;
 
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
     use zerocopy::IntoBytes;
 
     use super::*;

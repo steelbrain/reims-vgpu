@@ -47,12 +47,12 @@
 //! every format and sample count, by every path that writes (blits, a pass's store, a clear),
 //! with the block's unused bytes kept. No public specification of the encoding is known.
 
+use crate::core::platform::Platform;
+use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::resource::Heap as _;
+use crate::core::platform::types::ResourceAddressRange;
+use crate::core::platform::values::{HeapDesc, OptionSet};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::resource::Heap as _;
-use reims_vgpu_core::platform::types::ResourceAddressRange;
-use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
 
 use super::{
     Aspect, CLEAR, Pass, READ, RGBA8, STORE, Shape, Step, TARGET, WRITE, heard, random_bytes,
@@ -198,11 +198,8 @@ fn heap_texture_bytes_are_metals_tiles_or_its_compressed_form() {
             let case = format!("{name} {write:?}");
             let (o, ours_size) = heap_bytes((&p, &d), shape, write);
             // The texture's size in the heap, Metal's.
-            reims_vgpu_core::metal_check!(format!("{case}: size"), ours_size);
-            if !reims_vgpu_core::metal_matches_bytes!(
-                &case,
-                &o[..usize::try_from(ours_size).unwrap()]
-            ) {
+            crate::metal_check!(format!("{case}: size"), ours_size);
+            if !crate::metal_matches_bytes!(&case, &o[..usize::try_from(ours_size).unwrap()]) {
                 let kind = rt::Degradation::HeapTextureLosslessLayout;
                 assert!(compresses && heard(kind), "{case}: off Metal's");
                 differ.push(case);

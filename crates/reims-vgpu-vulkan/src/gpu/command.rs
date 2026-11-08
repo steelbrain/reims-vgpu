@@ -214,21 +214,21 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use metal2vulkan::metal::DispatchType;
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::command::committing as committing_here;
-use reims_vgpu_core::platform::command::{
+use crate::core::platform::Handle;
+use crate::core::platform::command::committing as committing_here;
+use crate::core::platform::command::{
     CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler, run_completed,
 };
-use reims_vgpu_core::platform::event::EventRef;
-use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
-use reims_vgpu_core::platform::values::ComputePassDesc;
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
-use reims_vgpu_core::raise::refusals::{self, Carried};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_core::sync::Mutex;
+use crate::core::platform::event::EventRef;
+use crate::core::platform::types::{CommandBufferStatus, NsErrorText};
+use crate::core::platform::values::ComputePassDesc;
+use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+use crate::core::raise::refusals::{self, Carried};
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::rt::BlockEnv;
+use crate::core::sync::Mutex;
+use metal2vulkan::metal::DispatchType;
+use metal2vulkan_runtime as rt;
 
 use crate::answer::{
     Policy, get, hang, metal_aborts, plain, plain_at, refusal, refused, send, unrepresentable,
@@ -585,7 +585,7 @@ impl CommandBufferObject {
             progress: Some(Arc::clone(&progress)),
             carried: refusals::carry(),
             #[cfg(test)]
-            slot: reims_vgpu_core::testkit::capture::current_slot(),
+            slot: crate::core::testkit::capture::current_slot(),
         };
         let handler: rt::Handler = Box::new(move |cb: &rt::CommandBuffer| ending.run(cb));
         plain(|| self.raw.add_completed_handler(handler)).unwrap_or_else(|e| refused(sel, &e));
@@ -759,7 +759,7 @@ struct Ending {
     carried: Carried,
     /// The test's death slot, which a death in the handler lands in.
     #[cfg(test)]
-    slot: Option<Arc<reims_vgpu_core::testkit::capture::DeathSlot>>,
+    slot: Option<Arc<crate::core::testkit::capture::DeathSlot>>,
 }
 
 impl Ending {
@@ -801,7 +801,7 @@ impl Ending {
             progress.end(stage, carried);
         };
         #[cfg(test)]
-        reims_vgpu_core::testkit::capture::with_slot(self.slot.take(), end);
+        crate::core::testkit::capture::with_slot(self.slot.take(), end);
         #[cfg(not(test))]
         end();
     }
@@ -1273,7 +1273,7 @@ fn completed_handler(
     read: impl FnOnce(&rt::CommandBuffer) + Send + 'static,
 ) -> rt::Handler {
     #[cfg(test)]
-    let slot = reims_vgpu_core::testkit::capture::current_slot();
+    let slot = crate::core::testkit::capture::current_slot();
     let carried = refusals::carry();
     Box::new(move |cb: &rt::CommandBuffer| {
         // A callout on the runtime's thread: marked ours, so a panic here aborts.
@@ -1300,7 +1300,7 @@ fn completed_handler(
             );
         };
         #[cfg(test)]
-        reims_vgpu_core::testkit::capture::with_slot(slot, run);
+        crate::core::testkit::capture::with_slot(slot, run);
         #[cfg(not(test))]
         run();
     })
@@ -1311,12 +1311,12 @@ fn completed_handler(
 /// took its last batch.
 fn scheduled_handler(block: ScheduledHandler) -> rt::Handler {
     #[cfg(test)]
-    let slot = reims_vgpu_core::testkit::capture::current_slot();
+    let slot = crate::core::testkit::capture::current_slot();
     Box::new(move |_cb: &rt::CommandBuffer| {
         // A callout on the runtime's thread: marked ours, so a panic here aborts.
         let _env = BlockEnv::foreign();
         #[cfg(test)]
-        reims_vgpu_core::testkit::capture::with_slot(slot, block);
+        crate::core::testkit::capture::with_slot(slot, block);
         #[cfg(not(test))]
         block();
     })
@@ -1409,7 +1409,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// ([`backing::submission_check`]), the tiler's handler the process's space
     /// ([`tiler_handler`]), and the decoder's handlers their records' locks and the completion
     /// ring's. The call is marked as one that runs submission handlers inside it
-    /// (`reims_vgpu_core::platform::command::committing`), so a handler of a buffer whose records
+    /// (`crate::core::platform::command::committing`), so a handler of a buffer whose records
     /// go to a guest knows it runs on the committing thread, which may be one that must not post
     /// them.
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
@@ -1695,7 +1695,7 @@ fn trace_event(
     event: Option<&EventRef<'_, VulkanPlatform>>,
     value: u64,
 ) {
-    if !reims_vgpu_core::trace::on() {
+    if !crate::core::trace::on() {
         return;
     }
     let id = match event {
@@ -1707,17 +1707,17 @@ fn trace_event(
 }
 
 fn trace_event_id(kind: &str, cb: &rt::CommandBuffer, event: u64, value: u64) {
-    reims_vgpu_core::trace::event(kind, &[crate::gpu::timing::id(cb), event, value]);
+    crate::core::trace::event(kind, &[crate::gpu::timing::id(cb), event, value]);
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
 
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -1789,12 +1789,12 @@ mod tests {
     /// detach registry's lock ([`backing::submission_check`]), the decoder's handlers their
     /// records' locks and the completion ring's, and the tiler's handler the process's space
     /// ([`tiler_handler`]), none of which a commit's caller holds. The commit is marked on its
-    /// thread (`reims_vgpu_core::platform::command::committing`), so a decoder's handler run there
+    /// thread (`crate::core::platform::command::committing`), so a decoder's handler run there
     /// on a thread the host's raise is not named for hands its records over to post.
     #[test]
     fn a_commit_checks_and_submits_inside_the_call_under_the_caller_s_locks() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
 
         let d = dev();
         let q = d.new_command_queue().unwrap();
@@ -1815,7 +1815,7 @@ mod tests {
             OnFault::Return,
             Box::new(move || {
                 let held = lock.try_lock().is_none();
-                let inside = reims_vgpu_core::platform::command::inside_commit();
+                let inside = crate::core::platform::command::inside_commit();
                 *at.lock() = Some((std::thread::current().id(), held, inside));
             }),
         )
@@ -1849,7 +1849,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_scheduled_signal_sent_after_the_commit_sets_nothing_as_metals() {
-        use reims_vgpu_core::platform::Platform;
+        use crate::core::platform::Platform;
 
         /// Whether the value reached the scheduled signal's 1 and the late one's 7, once the
         /// command buffer completed.
@@ -1897,10 +1897,10 @@ mod tests {
     /// handler, so the guest's buffer reads scheduled no earlier
     #[test]
     fn a_command_buffer_waiting_for_an_event_is_scheduled_at_its_signal() {
-        use reims_vgpu_core::platform::Platform;
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::Platform;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::NsRange;
 
         /// On `d`: the buffer's status 100 ms after its commit, then the order its scheduled
         /// and completed handlers ran in around the CPU's signal, and the first byte its blit
@@ -1967,9 +1967,9 @@ mod tests {
     /// Metal's on this host
     #[test]
     fn a_completed_handler_learns_the_gpu_times() {
-        use reims_vgpu_core::platform::Platform;
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::Platform;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
 
         /// On `d`: the GPU times a blit fill's completed handler learned.
         fn learned<P: Platform>(d: &P::Device) -> Option<(u64, u64)> {
@@ -2075,10 +2075,10 @@ mod tests {
     /// is taken as the runtime submits its command buffer, before it reads scheduled
     #[test]
     fn a_render_encoders_tiler_work_is_taken_as_it_is_submitted() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-        use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::descriptor::RenderPassDescriptor as _;
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::values::{ColorAttachmentSet, TextureDesc};
         let d = dev();
         let q = d.new_command_queue().unwrap();
         let p = crate::platform::tests::platform();
@@ -2287,8 +2287,8 @@ mod tests {
     /// runtime refuses: the wait dies at its selector, as Metal's answer there is not measured
     #[test]
     fn a_cycle_of_handlers_waits_dies() {
-        use reims_vgpu_core::raise::death::DeathSite;
-        use reims_vgpu_core::testkit::capture::expect_death;
+        use crate::core::raise::death::DeathSite;
+        use crate::core::testkit::capture::expect_death;
 
         let site = DeathSite {
             kind: DeathKind::Abort,
@@ -2337,7 +2337,7 @@ mod tests {
     /// can show.
     fn in_child(test: &str, body: impl FnOnce()) -> std::process::ExitStatus {
         if std::env::var("RVG_CHILD").as_deref() == Ok(test) {
-            reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+            crate::core::testkit::capture::set_capture_enabled(false);
             body();
             std::process::exit(0);
         }
@@ -2402,7 +2402,7 @@ mod tests {
     /// carried it is refused, and the command buffer's progress ends all the same
     #[test]
     fn a_refused_command_buffer_dies_at_its_execution() {
-        use reims_vgpu_core::platform::values::IcbDesc;
+        use crate::core::platform::values::IcbDesc;
 
         let d = dev();
         let desc = IcbDesc {
@@ -2683,8 +2683,8 @@ mod tests {
     /// A Shared buffer of 16 zero bytes, and a blit encoder of `cb` that fills it with `value`
     /// and ends.
     fn filled(cb: &VulkanCommandBuffer, value: u8) -> crate::gpu::resource::VulkanBuffer {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
         let b = crate::gpu::resource::tests::shared(16);
         let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
         let range = NsRange::new(0, 16);
@@ -2700,7 +2700,7 @@ mod tests {
 
     /// The 16 bytes of a Shared buffer.
     fn sixteen(b: &crate::gpu::resource::VulkanBuffer) -> Vec<u8> {
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use crate::core::platform::resource::Buffer as _;
         // SAFETY: a Shared buffer of 16 bytes, read after its command buffer completed.
         unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), 16) }.to_vec()
     }
@@ -2804,8 +2804,8 @@ mod tests {
     /// options from 0x10 up, die
     #[test]
     fn protection_options_that_end_the_process_die() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
         let q = dev().new_command_queue().unwrap();
         for options in [1, 3, 7] {
             let cb = buffer(&q);
@@ -2915,7 +2915,7 @@ mod tests {
     /// plain Metal asserts as the encoder goes (the runtime's statement)
     #[test]
     fn an_open_encoder_kills_what_metal_asserts_at() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
         let d = dev();
         let q = d.new_command_queue().unwrap();
         let cb = buffer(&q);

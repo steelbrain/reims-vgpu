@@ -128,11 +128,11 @@
 use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 
+use crate::core::platform::types::NsErrorText;
+use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+use crate::core::raise::{OnFault, Raise, RaiseResult};
 use metal2vulkan_runtime as rt;
 use metal2vulkan_runtime::Error;
-use reims_vgpu_core::platform::types::NsErrorText;
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 
 pub mod census;
 pub mod native;
@@ -1921,8 +1921,8 @@ pub fn trace_degradations() -> bool {
 }
 
 /// The kinds the trace saw, which the runtime announces once without it.
-static TRACED_KINDS: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
-    reims_vgpu_core::sync::Mutex::new(Vec::new());
+static TRACED_KINDS: crate::core::sync::Mutex<Vec<rt::Degradation>> =
+    crate::core::sync::Mutex::new(Vec::new());
 
 /// The runtime's message sink (`DeviceOptions::messages`, [`crate::platform`]): a degradation
 /// of [`DIES`] is relayed and counted, or in strict mode kept for the call here it was announced
@@ -1940,10 +1940,10 @@ pub fn notice(message: &rt::DebugMessage) {
     if UNHEARD.with(Cell::get) {
         return;
     }
-    if trace_degradations() && reims_vgpu_core::trace::on() {
+    if trace_degradations() && crate::core::trace::on() {
         let kind = notice.degradation;
         // deg: an occurrence of a degradation, its code
-        reims_vgpu_core::trace::event_text("deg", &[], kind.code());
+        crate::core::trace::event_text("deg", &[], kind.code());
         // A kind announced once without the trace goes on only at its first occurrence.
         if !DIES.contains(&kind) && !HEARD.contains(&kind) {
             let mut seen = TRACED_KINDS.lock();
@@ -2014,8 +2014,8 @@ fn hear(kind: rt::Degradation) {
 /// The degradations not of [`DIES`] the runtime announced in this process, in order, which
 /// [`notice`] relays and a test reads.
 #[cfg(test)]
-pub(crate) static RELAYED: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
-    reims_vgpu_core::sync::Mutex::new(Vec::new());
+pub(crate) static RELAYED: crate::core::sync::Mutex<Vec<rt::Degradation>> =
+    crate::core::sync::Mutex::new(Vec::new());
 
 /// The least severity the sink hears of the messages that are no degradation
 /// (`MessageSink::with_least_severity`): `Verbose` where the log takes this module's debug lines,
@@ -2147,8 +2147,8 @@ pub fn refused(sel: &'static str, e: &Error) -> ! {
 /// The line of the last death [`dies`] made in this process, which a test reads: the test
 /// capture takes a death before its line is written.
 #[cfg(test)]
-pub(crate) static LAST_LINE: reims_vgpu_core::sync::Mutex<Option<String>> =
-    reims_vgpu_core::sync::Mutex::new(None);
+pub(crate) static LAST_LINE: crate::core::sync::Mutex<Option<String>> =
+    crate::core::sync::Mutex::new(None);
 
 /// The death at `sel` of [`refused`], [`metal_aborts`] and [`unrepresentable`], its line
 /// `line`.
@@ -2494,7 +2494,7 @@ pub fn relays_gap(e: &Error) -> bool {
 /// writing a line on stderr naming the refusal and `descriptor` ([`refusal_describing`]). The
 /// creator then answers nil, a pipeline or library creator with [`error_text`] as its
 /// `NSError`, and the relay is noted for core on the creator's thread
-/// ([`reims_vgpu_core::platform::device::note_relayed_gap`]), which faults the work that names a
+/// ([`crate::core::platform::device::note_relayed_gap`]), which faults the work that names a
 /// function so refused where Metal would end the process at the nil one create later. `false` in
 /// strict mode and for every other refusal, which the creator decides as before: a death at
 /// `sel`.
@@ -2502,7 +2502,7 @@ pub fn relay_gap(sel: &'static str, e: &Error, descriptor: Option<&str>) -> bool
     if !relays_gap(e) {
         return false;
     }
-    reims_vgpu_core::platform::device::note_relayed_gap();
+    crate::core::platform::device::note_relayed_gap();
     if counted_first(Inexact::RefusedCreate) {
         let line = format!(
             "reims-vgpu: {sel}: {}; answered nil, relayed ({}), the first of its kind: \
@@ -2576,9 +2576,9 @@ pub fn hang() -> ! {
 pub(crate) fn dies_of<T>(
     kind: rt::Degradation,
     call: impl FnOnce() -> T,
-) -> reims_vgpu_core::raise::death::DeathSite {
+) -> crate::core::raise::death::DeathSite {
     *LAST_LINE.lock() = None;
-    let Err(site) = reims_vgpu_core::testkit::capture::catch_death(call) else {
+    let Err(site) = crate::core::testkit::capture::catch_death(call) else {
         panic!("it did not die, where {} dies", kind.code());
     };
     let line = LAST_LINE.lock().take().unwrap_or_default();
@@ -2593,10 +2593,10 @@ pub(crate) fn dies_of<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::platform::device::relaying_gaps;
+    use crate::core::raise::{Origin, RaiseId};
+    use crate::core::testkit::capture::catch_death;
     use metal2vulkan_runtime::{Invalid, Problem, RuntimeGap};
-    use reims_vgpu_core::platform::device::relaying_gaps;
-    use reims_vgpu_core::raise::{Origin, RaiseId};
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     fn invalid() -> Error {
         Error::Invalid(Invalid::new("fill_buffer", Problem::StorageMode))
@@ -3175,7 +3175,7 @@ mod tests {
         relaxed(|| inexact("sel:", Inexact::HeapLayout, || "a value".into()));
         assert_eq!(counted(), before + 2);
         *LAST_LINE.lock() = None;
-        let site = reims_vgpu_core::testkit::capture::catch_death(|| {
+        let site = crate::core::testkit::capture::catch_death(|| {
             inexact("sel:", Inexact::HeapLayout, || "a value".into());
         })
         .unwrap_err();
@@ -3236,10 +3236,10 @@ mod tests {
     /// `two_plane_xr10_blits_metal_was_not_measured_at_die`)
     #[test]
     fn a_call_that_unwinds_lets_its_notice_go() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::values::TextureDesc;
-        use reims_vgpu_core::raise::OnFault;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::values::TextureDesc;
+        use crate::core::raise::OnFault;
         let d = crate::gpu::device::tests::dev();
         let desc = crate::platform::tests::platform().texture_descriptor(&TextureDesc {
             pixel_format: 550,
@@ -3287,10 +3287,10 @@ mod tests {
     /// The copy of `a_call_that_unwinds_lets_its_notice_go` announces `TwoPlaneTextureCopy`
     #[test]
     fn a_kind_of_dies_is_relayed_and_counted_by_default() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::values::TextureDesc;
-        use reims_vgpu_core::raise::OnFault;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::values::TextureDesc;
+        use crate::core::raise::OnFault;
         let kind = rt::Degradation::TwoPlaneTextureCopy;
         let counted = || {
             (relayed_counts().into_iter())

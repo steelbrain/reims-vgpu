@@ -90,25 +90,6 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
-use reims_vgpu_core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler,
-};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-use reims_vgpu_core::platform::os::clock::{Clock as _, MonoTime};
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder, VertexDraw};
-use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
-use reims_vgpu_core::platform::values::{
-    ColorAttachmentSet, ComputePassDesc, DepthAttachmentSet, PassSet, StencilAttachmentSet,
-};
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::ops::render::{
     RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_VERTEX_BUFFER, RgfxOpDrawPrimitives,
     RgfxOpSetVertexBuffer,
@@ -131,6 +112,25 @@ use reims_vgpu_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
     RgfxCbSubmitted, RgfxEventSignalled, RgfxMsgHeader,
 };
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
+use reims_vgpu_vulkan::core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
+use reims_vgpu_vulkan::core::platform::command::{
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler,
+};
+use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, MonoTime};
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder, VertexDraw};
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::platform::types::{ClearColor, MtlSamplePosition};
+use reims_vgpu_vulkan::core::platform::values::{
+    ColorAttachmentSet, ComputePassDesc, DepthAttachmentSet, PassSet, StencilAttachmentSet,
+};
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::super::completion::{cb_complete, cb_failed, cb_unlanded};
@@ -206,7 +206,7 @@ impl Drop for Finisher {
 /// ([`RgfxEventSignalled`]). A signal the buffer runs more work after (an encoder, or a wait for
 /// an event: [`work_after`]) is posted by the platform's notification as the host's event reaches
 /// its value
-/// ([`notify_listener`](reims_vgpu_core::platform::event::SharedEvent::notify_listener)): where
+/// ([`notify_listener`](reims_vgpu_vulkan::core::platform::event::SharedEvent::notify_listener)): where
 /// the GPU gets to it in the buffer, as Metal's value and listeners move there (measured:
 /// docs/graphics-kext/dgpu-oracle.md, Q18). So a guest thread that waits on the CPU for it before
 /// it sets a value the buffer waits for later is released, where a post at the buffer's end would
@@ -2655,14 +2655,6 @@ fn clear_color(bits: [u64; 4]) -> ClearColor {
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::platform::Handle;
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
-    use reims_vgpu_core::platform::values::AttachmentState;
-    use reims_vgpu_core::sync::Mutex;
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_core::testkit::Step;
-    use reims_vgpu_core::testkit::calllog::Arg;
-    use reims_vgpu_core::testkit::objects::CompleteOn;
     use reims_vgpu_graphics::ops::render::{
         RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES, RGFX_OP_RENDER_DRAW_PRIMITIVES,
         RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
@@ -2687,6 +2679,14 @@ mod tests {
         RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
     };
     use reims_vgpu_video::core::device_memory::MemoryIdentity;
+    use reims_vgpu_vulkan::core::platform::Handle;
+    use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor;
+    use reims_vgpu_vulkan::core::platform::values::AttachmentState;
+    use reims_vgpu_vulkan::core::sync::Mutex;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::Step;
+    use reims_vgpu_vulkan::core::testkit::calllog::Arg;
+    use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
     use super::super::split::SPLIT_AFTER;
@@ -3173,8 +3173,8 @@ mod tests {
     }
 
     impl GraphicsVideoSession<FakePlatform> for FakeSession {
-        fn event(&self) -> reims_vgpu_core::platform::event::EventRef<'_, FakePlatform> {
-            reims_vgpu_core::platform::event::EventRef::Shared(&self.event)
+        fn event(&self) -> reims_vgpu_vulkan::core::platform::event::EventRef<'_, FakePlatform> {
+            reims_vgpu_vulkan::core::platform::event::EventRef::Shared(&self.event)
         }
 
         fn codec(&self) -> u32 {
@@ -4010,7 +4010,7 @@ mod tests {
     /// as `GPUStartTime` and `GPUEndTime`; a failed buffer the platform gives none of carries 0.
     #[test]
     fn a_completion_record_carries_the_platforms_gpu_times() {
-        use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
+        use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
         let (p, mut dec) = setup();
         let device = p.device();
         let captured = Arc::new(Mutex::new(Vec::<RgfxCbComplete>::new()));
@@ -4116,7 +4116,7 @@ mod tests {
     /// One whose submission handler ran has them posted there, once.
     #[test]
     fn a_buffer_never_submitted_is_scheduled_ahead_of_its_completion() {
-        use reims_vgpu_core::platform::types::CommandBufferStatus;
+        use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
         let (_p, dec, posted) = posting(true);
         for ran in [false, true] {
             posted.lock().clear();
@@ -4849,7 +4849,7 @@ mod tests {
     /// queue, and its failure comes after that buffer's completion.
     #[test]
     fn a_refused_make_after_an_answer_fails_in_turn() {
-        use reims_vgpu_core::testkit::script::Step;
+        use reims_vgpu_vulkan::core::testkit::script::Step;
 
         let (p, mut dec, posted) = posting(false);
         let device = p.device();
@@ -4922,14 +4922,14 @@ mod tests {
     fn a_later_commit_on_another_queue<P: crate::platform::ApiPlatform>() -> (bool, Vec<u8>) {
         use std::time::{Duration, Instant};
 
-        use reims_vgpu_core::platform::resource::Buffer as _;
         use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
             RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
         };
         use reims_vgpu_graphics::wire::RgfxSharedEventSetValue;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         const LEN: u64 = 1 << 20;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
@@ -5067,7 +5067,7 @@ mod tests {
 
         use reims_vgpu_graphics::ops::blit::{RGFX_OP_BLIT_FILL_BUFFER, RgfxBlitOpFillBuffer};
         const LEN: u64 = 1 << 20;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
@@ -5188,13 +5188,13 @@ mod tests {
     -> Vec<u8> {
         use std::time::{Duration, Instant};
 
-        use reims_vgpu_core::platform::resource::Buffer as _;
         use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
             RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
         };
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         const LEN: u64 = 1 << 20;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
@@ -5266,7 +5266,7 @@ mod tests {
         std::thread::scope(|scope| {
             let device = &device;
             let taken_first = scope.spawn(|| {
-                let _pool = reims_vgpu_core::rt::Pool::here();
+                let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
                 let begun = second.begin_taken(device, &b, Some(2)).unwrap().unwrap();
                 let done = second.finish_command_buffer(device, &b, begun).unwrap();
                 second.end_message();
@@ -5334,14 +5334,14 @@ mod tests {
     -> (Vec<u32>, bool, Vec<u64>, Vec<u8>) {
         use std::time::{Duration, Instant};
 
-        use reims_vgpu_core::platform::resource::Buffer as _;
         use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
             RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
         };
         use reims_vgpu_graphics::wire::RgfxSharedEventSetValue;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         const LEN: u64 = 1 << 20;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
@@ -5495,13 +5495,13 @@ mod tests {
     fn sub_encoders_after_a_count<P: crate::platform::ApiPlatform>() -> [u64; 4] {
         use std::time::{Duration, Instant};
 
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::values::{RenderPipelineDesc, TextureDesc};
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::values::{RenderPipelineDesc, TextureDesc};
 
         use super::super::draw_cost::fixture;
         const SIDE: u64 = 64;
         const BGRA8: u64 = 80;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
@@ -5744,7 +5744,7 @@ mod tests {
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
         use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
         let _pins = CONTEXT_RANGE_PINS.lock();
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let (mut dec, device) = decoder_with_a_texture_buffer();
         let buffer = buffer_at(11, RGFX_CONTEXT_VA_BASE + 0x8000, 0x1_0000);
         assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
@@ -5756,12 +5756,12 @@ mod tests {
     /// are made.
     #[test]
     fn on_vulkan_the_host_s_own_ranges_lie_below_every_unit() {
-        use reims_vgpu_core::platform::resource::Buffer as _;
         use reims_vgpu_graphics::wire::{
             RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END, RGFX_CONTEXT_VA_UNIT, RGFX_CONTEXT_VA_UNITS,
         };
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         let _pins = CONTEXT_RANGE_PINS.lock();
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let (mut dec, device) = decoder_with_a_texture_buffer();
         let placed = buffer_at(11, 0, 64 << 20);
         assert_eq!(dec.decode(&device, placed.as_bytes()).unwrap(), Ok(()));
@@ -5808,7 +5808,7 @@ mod tests {
     /// the flag sets none.
     #[test]
     fn a_render_pass_takes_its_sample_positions() {
-        use reims_vgpu_core::testkit::impls::descriptor::PassModel;
+        use reims_vgpu_vulkan::core::testkit::impls::descriptor::PassModel;
         let (p, dec) = setup();
         let mut caps = (*p.device().caps()).clone();
         caps.sample_counts = [Ok(true), Ok(true), Ok(true), Ok(false)];
@@ -5910,7 +5910,7 @@ mod tests {
     /// neither.
     #[test]
     fn a_render_pass_takes_its_visibility_result_buffer() {
-        use reims_vgpu_core::testkit::impls::descriptor::PassModel;
+        use reims_vgpu_vulkan::core::testkit::impls::descriptor::PassModel;
         let (_p, dec) = setup();
         let Some(ObjHandle::Buffer(buffer)) = dec.object(2) else {
             panic!("no buffer 2");
@@ -6260,11 +6260,11 @@ mod tests {
     /// stands in for the GPU reaching the signal. So does a stand-in's signal before its wait.
     #[test]
     fn a_signal_before_more_of_its_buffer_goes_as_the_event_reaches_it() {
-        use reims_vgpu_core::platform::event::SharedEvent as _;
         use reims_vgpu_graphics::ops::compute::{
             RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
         };
         use reims_vgpu_graphics::wire::RGFX_CB_INTERNAL;
+        use reims_vgpu_vulkan::core::platform::event::SharedEvent as _;
         let (p, mut dec) = setup();
         let device = p.device();
         create_events(&p, &mut dec, 0);
@@ -6689,7 +6689,10 @@ mod tests {
 
     /// A gate the first walk to reach it stops at, after its op `at`, until the test opens it.
     /// Whether a walk took the gate, stopped at it, and whether it is open; and their moves.
-    type GateState = Arc<(Mutex<(bool, bool, bool)>, reims_vgpu_core::sync::Condvar)>;
+    type GateState = Arc<(
+        Mutex<(bool, bool, bool)>,
+        reims_vgpu_vulkan::core::sync::Condvar,
+    )>;
 
     struct Gate(GateState);
 
@@ -6698,7 +6701,7 @@ mod tests {
         fn on(dec: &GraphicsDecoder<FakePlatform>, at: usize) -> Gate {
             let state = Arc::new((
                 Mutex::new((false, false, false)),
-                reims_vgpu_core::sync::Condvar::new(),
+                reims_vgpu_vulkan::core::sync::Condvar::new(),
             ));
             let hook = Arc::clone(&state);
             dec.set_walk_hook(Some(Arc::new(move |index: usize| {
@@ -7108,7 +7111,7 @@ mod tests {
     /// that failed.
     #[test]
     fn a_buffer_walked_long_is_committed_in_parts_with_one_outcome() {
-        use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
+        use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
         let Split {
             p,
             mut dec,
@@ -7366,7 +7369,7 @@ mod tests {
     /// completion, after its last part, never at a part's.
     #[test]
     fn a_split_after_a_mid_buffer_signal_keeps_the_signal_before_the_cut() {
-        use reims_vgpu_core::platform::types::CommandBufferStatus;
+        use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
         let Split {
             p, mut dec, posted, ..
         } = splitting();

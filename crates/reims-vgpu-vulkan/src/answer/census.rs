@@ -35,9 +35,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Once, OnceLock};
 use std::time::Duration;
 
+use crate::core::platform::os::{Clock as _, Deadline};
+use crate::core::sync::{Condvar, Mutex};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::os::{Clock as _, Deadline};
-use reims_vgpu_core::sync::{Condvar, Mutex};
 
 use super::native::{self, Placement};
 

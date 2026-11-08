@@ -48,18 +48,18 @@
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::platform::types::CommandBufferStatus;
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_video::core::device_memory::MemoryIdentity;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::platform::Handle as _;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::decode::{
     Decoded, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoPlane, op_fault,

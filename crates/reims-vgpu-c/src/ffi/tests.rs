@@ -3,8 +3,8 @@
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::Command;
 
-use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-use reims_vgpu_core::rt::is_our_thread;
+use reims_vgpu_vulkan::core::raise::death::{DeathKind, DeathSite};
+use reims_vgpu_vulkan::core::rt::is_our_thread;
 
 use super::*;
 

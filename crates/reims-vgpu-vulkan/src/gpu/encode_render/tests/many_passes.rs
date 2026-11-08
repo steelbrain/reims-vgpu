@@ -19,11 +19,11 @@
 //! runtime's device memory grows by no attachment's bytes a pass, and the target holds what the
 //! draws left.
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::os::vm::HostVm as _;
-use reims_vgpu_core::platform::resource::Library as _;
-use reims_vgpu_core::platform::values::{
+use crate::core::host::HostPtr;
+use crate::core::num::{ToU64, ToUsize};
+use crate::core::platform::os::vm::HostVm as _;
+use crate::core::platform::resource::Library as _;
+use crate::core::platform::values::{
     ColorAttachmentDesc, DepthAttachmentSet, DepthStencilDesc, FullRenderPipelineDesc,
     LinkedFunctionsDesc, PassSet, StencilAttachmentSet, StencilDesc, SurfaceFacts, SurfacePlane,
 };

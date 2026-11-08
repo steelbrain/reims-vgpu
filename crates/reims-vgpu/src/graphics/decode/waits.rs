@@ -17,9 +17,9 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::os::clock::{Clock, Deadline, MonoTime};
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock, Deadline, MonoTime};
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 /// How long a waiting command buffer goes unfinished before the log names it.
 pub(crate) const WAIT_LOGGED_AFTER: Duration = Duration::from_secs(5);
@@ -233,7 +233,7 @@ fn run<P: Platform>(shared: &Shared<P>) {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
 
     use super::*;
 

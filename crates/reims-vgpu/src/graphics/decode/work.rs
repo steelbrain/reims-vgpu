@@ -9,7 +9,7 @@
 //! - **Counted**: a command buffer made for a context's `COMMAND_BUFFER` message (its queue gave
 //!   one, whatever its walk then does), and a render encoder opened for its `ENCODER_BEGIN_RENDER`.
 //! - **Asked for by name**: [`start`] turns counting on only where `REIMS_VGPU_LOG` names the
-//!   target itself at debug as the first decoder is made (`reims_vgpu_core::logging::names`),
+//!   target itself at debug as the first decoder is made (`reims_vgpu_vulkan::core::logging::names`),
 //!   and makes the thread then: a lone level, such as a bug report's `debug`, or a pair of a
 //!   target above it (`reims_vgpu=debug`) does not, as for the runtime's counts on the same
 //!   target, whose reading costs the draws they count.
@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::os::clock::{Clock as _, Deadline};
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, Deadline};
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 /// The log target of the lines, at debug, which the filter names to start them ([`start`]).
 pub(crate) const TARGET: &str = "reims_vgpu::work";
@@ -90,7 +90,7 @@ fn counts() -> &'static Counts {
 pub(crate) fn start<P: Platform>(platform: &Arc<P>) {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
-        if !(reims_vgpu_core::logging::names(TARGET, log::Level::Debug)
+        if !(reims_vgpu_vulkan::core::logging::names(TARGET, log::Level::Debug)
             && log::log_enabled!(target: TARGET, log::Level::Debug))
         {
             return;

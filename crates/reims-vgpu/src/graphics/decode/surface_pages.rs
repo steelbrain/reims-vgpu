@@ -25,7 +25,7 @@
 //! kept every one, ended sessions' among them, so the process's mappings only grew, from 3,220 at
 //! the desktop to 43,949, past the headroom.
 //!
-//! [`HostVm::idle_view_mappings`]: reims_vgpu_core::platform::os::vm::HostVm::idle_view_mappings
+//! [`HostVm::idle_view_mappings`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::idle_view_mappings
 //!
 //! The runs are the guest's: each must be whole pages of the guest's (4 KiB) and of the host's
 //! from a page, lie in guest RAM, and the runs must sum to the surface's length; else the block
@@ -64,7 +64,7 @@
 //! where the platform refuses a copy, or where it makes no cache, and the block then lies over
 //! the view as any other. A block whose runs leave the RAM's mapping takes its view as before.
 //!
-//! [`GpuDevice::copies_guest_ram`]: reims_vgpu_core::platform::device::GpuDevice::copies_guest_ram
+//! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
 //!
 //! **Device caches where the pages cannot serve** (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`). On a
 //! device whose GPU shares the CPU's memory a surface's textures lie in its pages, but not every
@@ -82,7 +82,7 @@
 //! left in the cache of views, and the kext posts it again marked cached, which takes that view
 //! and a device cache ([`super::surface_cache`]). The counts keep how each ask was answered.
 //!
-//! [`GpuDevice::surface_pages_in_place`]: reims_vgpu_core::platform::device::GpuDevice::surface_pages_in_place
+//! [`GpuDevice::surface_pages_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_in_place
 //!
 //! **Off ring 0's threads.** A view costs a kernel mapping per run, and the runtime's import of
 //! them: real surfaces' runs are single 4 KiB pages, most laid right below the run before (measured
@@ -118,17 +118,6 @@ use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use reims_vgpu_core::host::{HostPtr, PhysRange};
-use reims_vgpu_core::memory::PAGE_SIZE as MAPPING_PAGE;
-use reims_vgpu_core::memory::map::MemoryMap;
-use reims_vgpu_core::memory::mapping::Mapping;
-use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::os::clock::Clock as _;
-use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, PagesPlane};
-use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-use reims_vgpu_core::raise::{RaiseResult, refusals};
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::wire::{
     RGFX_SURFACE_PAGES_PLANES, RgfxBufferOverPages, RgfxBufferOverSurfacePages, RgfxHeapOverPages,
     RgfxPageRun, RgfxSurfacePages, RgfxSurfacePagesLayout,
@@ -137,6 +126,17 @@ use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdenti
 #[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use reims_vgpu_video::core::surfaces::SurfaceError;
+use reims_vgpu_vulkan::core::host::{HostPtr, PhysRange};
+use reims_vgpu_vulkan::core::memory::PAGE_SIZE as MAPPING_PAGE;
+use reims_vgpu_vulkan::core::memory::map::MemoryMap;
+use reims_vgpu_vulkan::core::memory::mapping::Mapping;
+use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
+use reims_vgpu_vulkan::core::platform::values::{BufferDesc, HeapDesc, OptionSet, PagesPlane};
+use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::{RaiseResult, refusals};
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::worker::{Settle, Worker};
 
@@ -1462,10 +1462,6 @@ mod costs;
 
 #[cfg(test)]
 pub(super) mod tests {
-    use reims_vgpu_core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::platform::values::PagesInPlace;
-    use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam};
     use reims_vgpu_graphics::region::Region;
     use reims_vgpu_graphics::wire::{
         RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_PAGES,
@@ -1478,6 +1474,10 @@ pub(super) mod tests {
         RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout, RgfxTextureDescriptor,
         RgfxTextureFromBuffer,
     };
+    use reims_vgpu_vulkan::core::memory::descriptor::{GuestPhysicalRange, MemoryMapDescriptor};
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
+    use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, GuestRam};
     use zerocopy::IntoBytes;
 
     use super::super::{DecodeError, GraphicsDecoder, no_raise};

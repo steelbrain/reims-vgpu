@@ -41,14 +41,14 @@
 //! `supports32BitMSAA` and `supportsPullModelInterpolation` are the runtime's answers; a gap in the
 //! latter is `None`.
 
-use ash::vk;
-use metal2vulkan::metal::TextureType;
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::caps::{
+use crate::core::platform::caps::{
     DeviceCaps, FEATURE_SETS, FormatAnswers, IdentityCaps, IdentityFlags, IdentitySizes,
     LARGEST_COUNT_ASKED, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
     TEXTURE_BUFFER_FORMATS, feature_set_family,
 };
+use ash::vk;
+use metal2vulkan::metal::TextureType;
+use metal2vulkan_runtime as rt;
 
 use crate::gpu::runtime_pixel_format;
 
@@ -221,7 +221,7 @@ fn device_local_bytes(device: &rt::Device) -> u64 {
 /// physical device lists the extension, which a physical-device query may chain without the device
 /// enabling it, else the heaps' sizes ([`device_local_bytes`]).
 ///
-/// [`GpuDevice::own_memory_budget`]: reims_vgpu_core::platform::device::GpuDevice::own_memory_budget
+/// [`GpuDevice::own_memory_budget`]: crate::core::platform::device::GpuDevice::own_memory_budget
 pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
     // SAFETY: the instance and physical device are the runtime's, read only, while `device`
     // lives.
@@ -384,7 +384,7 @@ pub fn read(device: &rt::Device, caps: &DeviceCaps) -> IdentityCaps {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::device::GpuDevice;
+    use crate::core::platform::device::GpuDevice;
 
     use super::*;
     use crate::gpu::device::tests::dev;

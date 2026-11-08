@@ -15,8 +15,8 @@
 //! Linux. The host's function-pointer types stay `extern "C-unwind"`, since both are sound only
 //! around an ABI that unwinds.
 
-use reims_vgpu_core::raise::death::{DeathId, fatal};
-use reims_vgpu_core::rt::enter_ours;
+use reims_vgpu_vulkan::core::raise::death::{DeathId, fatal};
+use reims_vgpu_vulkan::core::rt::enter_ours;
 
 mod catch;
 

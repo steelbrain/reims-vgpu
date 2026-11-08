@@ -49,10 +49,10 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::core::platform::icb::IndirectCommandBuffer as _;
 use metal2vulkan::metal::PrimitiveType;
 use metal2vulkan::pipeline::CommandWrites;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
 
 use crate::answer::{get, plain, unrepresentable};
 use crate::gpu::command::Progress;
@@ -325,19 +325,19 @@ impl Drop for Read {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::platform::Handle as _;
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::icb::{IcbRenderCmd, IndirectRenderCommand as _};
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::types::NsRange;
+    use crate::core::platform::values::IcbDesc;
+    use crate::core::raise::OnFault;
+    use crate::core::testkit::capture::catch_death;
     use metal2vulkan::metal::PixelFormat;
     use metal2vulkan::pipeline::{
         ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
     };
-    use reims_vgpu_core::platform::Handle as _;
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::icb::{IcbRenderCmd, IndirectRenderCommand as _};
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::types::NsRange;
-    use reims_vgpu_core::platform::values::IcbDesc;
-    use reims_vgpu_core::raise::OnFault;
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::VulkanDevice;

@@ -37,8 +37,8 @@ use objc2::rc::Retained;
 use objc2_core_graphics::{CGColor, CGColorSpace, kCGColorBlack, kCGColorSpaceSRGB};
 use objc2_metal::MTLPixelFormat;
 use objc2_quartz_core::CAMetalLayer;
-use reims_vgpu_core::rt::spawn_named;
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::rt::spawn_named;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 use reims_vgpu_vulkan::os::OsThreads;
 use reims_vgpu_vulkan::os::msg;
 

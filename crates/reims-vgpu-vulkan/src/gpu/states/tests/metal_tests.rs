@@ -8,7 +8,7 @@ const NUMBERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbered_sampl
 /// `f`'s value, made inside an autorelease pool of its own, as core runs each unit of work:
 /// what Metal autoreleases inside it goes at its end.
 fn pooled<T>(f: impl FnOnce() -> T) -> T {
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = crate::core::rt::Pool::here();
     f()
 }
 
@@ -17,8 +17,8 @@ fn pooled<T>(f: impl FnOnce() -> T) -> T {
 /// device's own sampler ID for good: at each step a sampler state of a descriptor no other
 /// equals is made and kept to the end, so it takes the lowest ID no holder holds, and its
 /// `gpuResourceID` is read. Each creation and release runs in a pool of its own.
-fn numbered_ids<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> Vec<(&'static str, u64)> {
-    use reims_vgpu_core::platform::values::RenderPipelineDesc;
+fn numbered_ids<P: crate::core::platform::Platform>(d: &P::Device) -> Vec<(&'static str, u64)> {
+    use crate::core::platform::values::RenderPipelineDesc;
     let _queue = pooled(|| d.new_command_queue().unwrap());
     let mut kept: Vec<P::SamplerState> = Vec::new();
     let mut ids = Vec::new();
@@ -123,7 +123,7 @@ fn numbered_ids<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> Vec<(&
 fn sampler_ids_follow_pipeline_holders_as_metals() {
     crate::os::install_process_services();
     let ours = numbered_ids::<VulkanPlatform>(&dev());
-    reims_vgpu_core::metal_check!("ids", ours);
+    crate::metal_check!("ids", ours);
 }
 
 /// `five_samplers.metal`'s kernel, compiled by build.rs.
@@ -133,7 +133,7 @@ const FIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/five_samplers.meta
 /// kernel's function and its state are made, after a command queue, which takes the device's
 /// own sampler ID, and 250 sampler states of argument buffer support, each of its own LOD
 /// clamp, kept to the end. Each creation and release runs in a pool of its own.
-fn five_samplers_move<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> u64 {
+fn five_samplers_move<P: crate::core::platform::Platform>(d: &P::Device) -> u64 {
     use crate::gpu::resource::tests::metal_tests::next_range;
     let _queue = pooled(|| d.new_command_queue().unwrap());
     let states: Vec<P::SamplerState> = (0..250u16)
@@ -183,25 +183,25 @@ fn pipeline_samplers_grow_metals_sampler_mempool() {
 
 /// A 16 by 8 `RGBA16Float` texture on `p`'s device `d`, its halves `seed`'s noise of every
 /// sign below 2 in magnitude, written by the CPU.
-fn noise_texture<P: reims_vgpu_core::platform::Platform>(
+fn noise_texture<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     seed: u64,
 ) -> P::Texture {
-    use reims_vgpu_core::platform::HostRange;
-    use reims_vgpu_core::platform::resource::Texture as _;
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+    use crate::core::platform::HostRange;
+    use crate::core::platform::resource::Texture as _;
+    use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
     let (w, h) = (16, 8);
     let t = d
         .new_texture(
             OnFault::Die,
-            &p.texture_descriptor(&reims_vgpu_core::platform::values::TextureDesc {
+            &p.texture_descriptor(&crate::core::platform::values::TextureDesc {
                 pixel_format: 115,
                 width: w,
                 height: h,
                 usage: 1,
                 resource_options: Some(0),
-                ..reims_vgpu_core::platform::values::TextureDesc::default()
+                ..crate::core::platform::values::TextureDesc::default()
             }),
         )
         .unwrap()
@@ -221,7 +221,7 @@ fn noise_texture<P: reims_vgpu_core::platform::Platform>(
 /// `d`, into floats, as their bits, by `kernel` (`sample_only_texels_float`, or
 /// `sample_texels_float`, which holds a gather too): at positions a third of a texel apart
 /// from two texels before the texture to two past it, normalized.
-fn cubic_samples<P: reims_vgpu_core::platform::Platform>(
+fn cubic_samples<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     desc: &SamplerDesc,
@@ -291,7 +291,7 @@ fn cubic_samplers_sample_as_metals() {
                 continue;
             }
             let ours = cubic_samples(&p, &d, &desc, SAMPLE_ONLY);
-            reims_vgpu_core::metal_check_raw!(case, ours);
+            crate::metal_check_raw!(case, ours);
         }
     }
     for compare in [1, 3, 7] {
@@ -319,7 +319,7 @@ fn cubic_samplers_sample_as_metals() {
 fn cubic_samplers_sample_in_a_fragment_function_as_metals() {
     use crate::gpu::ycbcr::measure::{drawn, float_texels, probe};
     /// What `sample_fragment_float` reads of [`noise_texture`] through a sampler of `desc`.
-    fn fragment_samples<P: reims_vgpu_core::platform::Platform>(
+    fn fragment_samples<P: crate::core::platform::Platform>(
         p: &P,
         d: &P::Device,
         desc: &SamplerDesc,
@@ -361,7 +361,7 @@ fn cubic_samplers_sample_in_a_fragment_function_as_metals() {
 fn constexpr_bicubic_samplers_sample_as_metals() {
     use crate::gpu::ycbcr::measure::{float_texels, probe, probed_texels};
     /// What `kernel` reads of [`noise_texture`] at the probe `at` over `grid`.
-    fn constexpr_samples<P: reims_vgpu_core::platform::Platform>(
+    fn constexpr_samples<P: crate::core::platform::Platform>(
         p: &P,
         d: &P::Device,
         kernel: &str,
@@ -465,17 +465,17 @@ enum Held {
 /// What `sample()` through a sampler of `desc`, made for argument buffers and held by its
 /// resource ID in an argument buffer as `held` says, reads of [`noise_texture`] on `p`'s
 /// device `d`, into floats, as their bits, at [`cubic_samples`]'s positions.
-fn held_samples<P: reims_vgpu_core::platform::Platform>(
+fn held_samples<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     desc: &SamplerDesc,
     held: Held,
 ) -> Vec<[u32; 4]> {
-    use reims_vgpu_core::platform::blit::ResourceRef;
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::resource::{Buffer as _, Texture as _};
-    use reims_vgpu_core::platform::types::{MtlSize, NsRange};
+    use crate::core::platform::blit::ResourceRef;
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::resource::{Buffer as _, Texture as _};
+    use crate::core::platform::types::{MtlSize, NsRange};
 
     use crate::gpu::ycbcr::measure::{PROBE, float_texels, probe};
     let t = noise_texture(p, d, 5);
@@ -569,7 +569,7 @@ fn a_cubic_sampler_in_an_argument_buffer_dies_where_its_failure_is_read() {
     let (p, d) = (crate::platform::tests::platform(), dev());
     let linear = filtered(1, 1, 0);
     let ours = held_samples(&p, &d, &linear, Held::Both);
-    reims_vgpu_core::metal_check_raw!("linear", ours);
+    crate::metal_check_raw!("linear", ours);
     let cubic = filtered(2, 2, 0);
     let (sel, line) = death_line(|| held_samples(&p, &d, &cubic, Held::Both));
     assert_eq!(sel, "waitUntilCompleted", "{line}");
@@ -589,7 +589,7 @@ fn a_live_cubic_sampler_leaves_argument_buffer_samples_metals() {
     let cubic = d.new_sampler_state(&filtered(2, 2, 0)).unwrap().unwrap();
     let ours = held_samples(&p, &d, &linear, Held::Both);
     drop(cubic);
-    reims_vgpu_core::metal_check_raw!("linear", ours);
+    crate::metal_check_raw!("linear", ours);
 }
 
 /// What a draw over 16 by 8 `BGRA8Unorm` does on `p`'s device `d` whose fragment function
@@ -597,19 +597,19 @@ fn a_live_cubic_sampler_leaves_argument_buffer_samples_metals() {
 /// argument buffer at fragment buffer 0 holds beside it (`sample_held_fragment`), a cubic
 /// sampler state made after the draw was encoded and before the commit where `cubic` says:
 /// the command buffer's status and error code once it completed.
-fn held_draw<P: reims_vgpu_core::platform::Platform>(
+fn held_draw<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     desc: &SamplerDesc,
     cubic: bool,
 ) -> (u64, u64) {
-    use reims_vgpu_core::platform::blit::ResourceRef;
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::{Buffer as _, Texture as _};
-    use reims_vgpu_core::platform::types::NsRange;
-    use reims_vgpu_core::platform::values::{ColorAttachmentSet, RenderPipelineDesc, TextureDesc};
+    use crate::core::platform::blit::ResourceRef;
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::descriptor::RenderPassDescriptor as _;
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::{Buffer as _, Texture as _};
+    use crate::core::platform::types::NsRange;
+    use crate::core::platform::values::{ColorAttachmentSet, RenderPipelineDesc, TextureDesc};
 
     use crate::gpu::ycbcr::measure::PROBE;
     let t = noise_texture(p, d, 5);
@@ -742,12 +742,12 @@ type Pipelines<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
 
 /// What each creator answers on `d` for the functions `pipelines` names of the metallib
 /// `library`, by name: `Ok` for a state, `Err` of the `NSError`'s code.
-fn answers<P: reims_vgpu_core::platform::Platform>(
+fn answers<P: crate::core::platform::Platform>(
     d: &P::Device,
     library: &[u8],
     (kernels, renders): Pipelines<'_>,
 ) -> Vec<(String, Result<(), i64>)> {
-    use reims_vgpu_core::platform::values::FullComputePipelineDesc;
+    use crate::core::platform::values::FullComputePipelineDesc;
 
     use crate::gpu::device::tests::render_value;
     let library = d.new_library(library).unwrap().unwrap().unwrap();
@@ -909,11 +909,11 @@ type IndirectAnswer = Result<(), (i64, Vec<usize>)>;
 /// What the compute and render creators answer on `d` for each of `cases`, a whole value
 /// (compute where its name says so) of the fixture functions its refs 5 (a kernel), 0x21 (a
 /// vertex function) and 0x22 (a fragment function, where it has one) are, by name.
-fn indirect_answers<P: reims_vgpu_core::platform::Platform>(
+fn indirect_answers<P: crate::core::platform::Platform>(
     d: &P::Device,
     cases: &[IndirectCase<'_>],
 ) -> Vec<(String, IndirectAnswer)> {
-    use reims_vgpu_core::platform::values::{FullComputePipelineDesc, FullRenderPipelineDesc};
+    use crate::core::platform::values::{FullComputePipelineDesc, FullRenderPipelineDesc};
 
     use crate::gpu::device::tests::colours_of;
     let function = |bytes: &[u8]| {
@@ -1135,12 +1135,10 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
         .unwrap()
         .unwrap();
     let error = d
-        .new_compute_pipeline_state_full(
-            &reims_vgpu_core::platform::values::FullComputePipelineDesc {
-                support_indirect_command_buffers: true,
-                ..reims_vgpu_core::platform::values::FullComputePipelineDesc::new(&f)
-            },
-        )
+        .new_compute_pipeline_state_full(&crate::core::platform::values::FullComputePipelineDesc {
+            support_indirect_command_buffers: true,
+            ..crate::core::platform::values::FullComputePipelineDesc::new(&f)
+        })
         .unwrap_err();
     assert_eq!(error.domain, crate::answer::RUNTIME_DOMAIN);
 }
@@ -1258,10 +1256,10 @@ fn an_input_no_vertex_output_writes_is_metals() {
 /// state of the vertex function alike
 #[test]
 fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::values::{FullComputePipelineDesc, FullRenderPipelineDesc};
     use metal2vulkan::error::{Error as Compile, Feature};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::values::{FullComputePipelineDesc, FullRenderPipelineDesc};
 
     let d = dev();
     let library = d
@@ -1316,13 +1314,13 @@ fn a_function_linked_under_a_specialized_name_is_metals() {
         assert_eq!(ours.name(), specialized.unwrap_or("linked_gradient"));
         let drawn = catch_death(|| custom_effect(&p, &d, &caller, &ours));
         let drawn = drawn.unwrap_or_else(|site| panic!("{specialized:?}: died at {site:?}"));
-        reims_vgpu_core::metal_check!(key, drawn);
+        crate::metal_check!(key, drawn);
     }
 }
 
 /// A pipeline creator's answer in [`linked_answers`]: made, or the `NSError`'s code, or where the
 /// creator dies.
-type LinkedAnswer = Result<Result<(), i64>, reims_vgpu_core::raise::death::DeathSite>;
+type LinkedAnswer = Result<Result<(), i64>, crate::core::raise::death::DeathSite>;
 
 /// What the compute and render creators answer for `linked_caller.metal`'s functions with
 /// `linked_callee.metal`'s `linked_add_one`, which they call, linked by each list a value
@@ -1334,7 +1332,7 @@ type LinkedAnswer = Result<Result<(), i64>, reims_vgpu_core::raise::death::Death
 /// library made of the same bytes, and the copy turns the function made before it into that
 /// object (measured on the M3 Max, macOS 27.0.1). A case after the copy would link the binary
 /// where it names the function made by name.
-fn linked_answers<P: reims_vgpu_core::platform::Platform>(
+fn linked_answers<P: crate::core::platform::Platform>(
     d: &P::Device,
 ) -> Vec<(&'static str, LinkedAnswer)> {
     let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
@@ -1348,18 +1346,16 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
     let add_one = named(&callee, "linked_add_one");
     let one = |f: &P::Function| vec![f.clone_ref()];
     let group = || vec![("g".to_owned(), one(&add_one))];
-    let answer = |made: Result<
-        Result<Option<()>, NsErrorText>,
-        reims_vgpu_core::raise::death::DeathSite,
-    >| {
-        made.map(|made| match made {
-            Ok(state) => {
-                assert!(state.is_some());
-                Ok(())
-            }
-            Err(e) => Err(e.code),
-        })
-    };
+    let answer =
+        |made: Result<Result<Option<()>, NsErrorText>, crate::core::raise::death::DeathSite>| {
+            made.map(|made| match made {
+                Ok(state) => {
+                    assert!(state.is_some());
+                    Ok(())
+                }
+                Err(e) => Err(e.code),
+            })
+        };
     let compute = |functions, binary_functions, groups, private_functions| {
         answer(catch_death(|| {
             d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
@@ -1482,6 +1478,6 @@ fn unresolved_visible_calls_are_metals() {
     let ours = linked_answers::<VulkanPlatform>(&dev());
     assert_eq!(ours.len(), 13);
     for (case, ours) in ours {
-        reims_vgpu_core::metal_check!(case, ours);
+        crate::metal_check!(case, ours);
     }
 }

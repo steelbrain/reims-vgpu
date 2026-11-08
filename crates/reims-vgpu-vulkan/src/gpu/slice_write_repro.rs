@@ -4,15 +4,15 @@
 //! BlockWritesOnly (0x10005), at a level from its uniforms, and reads zeros where the write is
 //! dropped. The kernels are `slice_write_repro.metal`'s, hand-written.
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::resource::{Buffer as _, Library as _, Texture as _};
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange};
-use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::raise::OnFault;
+use crate::core::platform::Platform;
+use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::resource::{Buffer as _, Library as _, Texture as _};
+use crate::core::platform::types::{MtlOrigin, MtlSize, NsRange};
+use crate::core::platform::values::TextureDesc;
+use crate::core::raise::OnFault;
 
 use crate::gpu::device::tests::dev;
 use crate::platform::tests::platform;
@@ -201,7 +201,7 @@ fn imageblock_slice_writes_at_every_usage_are_metals() {
         for lod in [Some(0), Some(1), None] {
             let ours = slice_write_levels(&vp, &vd, usage, lod);
             let case = format!("usage {usage:#x} lod {lod:?} (None: a constant 0)");
-            reims_vgpu_core::metal_check_raw!(&case, ours);
+            crate::metal_check_raw!(&case, ours);
         }
     }
 }

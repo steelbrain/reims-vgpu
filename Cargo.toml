@@ -2,7 +2,6 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/reims-vgpu-core",
     "crates/reims-vgpu-window",
     "crates/reims-vgpu",
     "crates/reims-vgpu-c",
@@ -21,7 +20,6 @@ publish = false
 license = "GPL-2.0-or-later OR LGPL-3.0-or-later"
 
 [workspace.dependencies]
-reims-vgpu-core = { path = "crates/reims-vgpu-core" }
 # Without their default features: each member that wants SDL3's macOS window asks for it
 # (`macos-sdl`), so `reims-vgpu-c`'s default decides whether the library has it.
 reims-vgpu-window = { path = "crates/reims-vgpu-window", default-features = false }

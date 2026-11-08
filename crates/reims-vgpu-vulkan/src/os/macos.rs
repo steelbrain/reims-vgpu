@@ -28,11 +28,9 @@ use objc2::runtime::{NSObjectProtocol as _, ProtocolObject, Sel};
 use objc2::{msg_send, sel};
 use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
 
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::os::surface::{
-    BackingSurfaceSpec, IoSurfaces, Surface, SurfaceSpec,
-};
-use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _, KernReturn};
+use crate::core::platform::Handle;
+use crate::core::platform::os::surface::{BackingSurfaceSpec, IoSurfaces, Surface, SurfaceSpec};
+use crate::core::platform::os::vm::{HostAddr, HostVm as _, KernReturn};
 
 use self::clock::MacClock;
 use self::iosurface::{MacSurface, MacSurfaces};
@@ -344,7 +342,7 @@ pub(crate) const PAGE: u64 = if cfg!(target_arch = "aarch64") {
 /// maximum protection lowered to read.
 #[cfg(test)]
 pub(crate) fn writable(at: HostAddr, len: u64) -> bool {
-    use reims_vgpu_core::platform::os::vm::VmProt;
+    use crate::core::platform::os::vm::VmProt;
     let vm = MacVm::new();
     vm.protect_max(at, len, VmProt::READ | VmProt::WRITE)
         .is_ok()
@@ -356,11 +354,8 @@ pub(crate) fn writable(at: HostAddr, len: u64) -> bool {
 #[cfg(test)]
 pub(crate) fn mapped(at: HostAddr) -> bool {
     let vm = MacVm::new();
-    vm.protect_max(
-        at,
-        vm.page_size(),
-        reims_vgpu_core::platform::os::vm::VmProt(7),
-    ) != Err(KernReturn(1))
+    vm.protect_max(at, vm.page_size(), crate::core::platform::os::vm::VmProt(7))
+        != Err(KernReturn(1))
 }
 
 // IOSurface's plane and value queries, which [`iosurface`]'s surface does not answer.
@@ -563,8 +558,8 @@ struct ClientPages {
     prune_at: usize,
 }
 
-static CLIENT_PAGES: reims_vgpu_core::sync::Mutex<ClientPages> =
-    reims_vgpu_core::sync::Mutex::new(ClientPages {
+static CLIENT_PAGES: crate::core::sync::Mutex<ClientPages> =
+    crate::core::sync::Mutex::new(ClientPages {
         entries: BTreeMap::new(),
         prune_at: 64,
     });
@@ -666,7 +661,7 @@ impl IoSurfaces<VulkanPlatform> for VulkanSurfaces {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::num::ToU64;
+    use crate::core::num::ToU64;
 
     use super::*;
     use crate::os::tests::{bgra_surface, bgra_surface_over_at, free};
@@ -678,7 +673,7 @@ mod tests {
     /// memory and its bytes' are found there
     #[test]
     fn an_offset_surface_is_at_its_offset_into_its_pages() {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use crate::core::platform::os::vm::HostVm as _;
         for offset in [0x40, 0x1000, 0x4000] {
             let (s, pages, length) =
                 crate::gpu::ycbcr::measure::surface_420_over_at(b"x420", (32, 16), offset);
@@ -740,7 +735,7 @@ mod tests {
     /// ID handed out again on the M3 Max (macOS 27.0.1), and 0 of 40 with 64
     #[test]
     fn a_surface_taking_the_id_of_one_gone_takes_none_of_its_record() {
-        use reims_vgpu_core::platform::os::surface::{BackingPlaneSpec, BackingSurfaceSpec};
+        use crate::core::platform::os::surface::{BackingPlaneSpec, BackingSurfaceSpec};
         let backing = BackingSurfaceSpec {
             pixel_format: u32::from_be_bytes(*b"BGRA"),
             planes: vec![BackingPlaneSpec {

@@ -256,19 +256,19 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::core::platform::Handle as _;
+use crate::core::platform::blit::ResourceRef;
+use crate::core::platform::render::{RenderCmd, RenderEncoder, VertexDraw, encode_each};
+use crate::core::platform::resource::RenderPipeline as _;
+use crate::core::platform::types::{MtlScissorRect, MtlSize, MtlViewport, NsRange};
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::{Mutex, ReentrantMutex};
 use metal2vulkan::metal::{
     BarrierScope, CullMode, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
     PrimitiveType, RenderStages, ResourceUsage, TextureType, TriangleFillMode, Winding,
 };
 use metal2vulkan::pipeline::ColorAttachmentDescriptor;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder, VertexDraw, encode_each};
-use reims_vgpu_core::platform::resource::RenderPipeline as _;
-use reims_vgpu_core::platform::types::{MtlScissorRect, MtlSize, MtlViewport, NsRange};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
 
 use crate::answer::{Policy, decide, get, metal_aborts, plain, plain_at, refused, unrepresentable};
 use crate::gpu::command::VulkanCommandBuffer;
@@ -4401,19 +4401,19 @@ pub(crate) mod tests {
         }
     }
 
-    use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};
-    use reims_vgpu_core::platform::blit::ResourceRef;
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::{Buffer, Texture};
-    use reims_vgpu_core::platform::types::{
+    use crate::core::display::pipeline::{DisplayPipelineCache, PipelineKey};
+    use crate::core::platform::blit::ResourceRef;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder};
+    use crate::core::platform::command::{CommandBuffer, CommandQueue};
+    use crate::core::platform::descriptor::RenderPassDescriptor as _;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::resource::{Buffer, Texture};
+    use crate::core::platform::types::{
         ClearColor, MtlOrigin, MtlRegion, MtlScissorRect, MtlSize, NsRange,
     };
-    use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
-    use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::values::{ColorAttachmentSet, TextureDesc};
+    use crate::core::platform::{Handle, HostRange, Platform};
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -4632,7 +4632,7 @@ pub(crate) mod tests {
     /// `vertex_ids` and `simd_stages`, the crate's own [`BARYCENTRIC`], [`VERTEX_IDS`] and
     /// [`SIMD_STAGES`].
     fn fixture<P: Platform>(d: &P::Device, function: &str) -> P::Function {
-        use reims_vgpu_core::platform::resource::Library as _;
+        use crate::core::platform::resource::Library as _;
         let (file, name) = function.split_once(':').unwrap_or((function, function));
         let bytes = if file == "barycentric" {
             BARYCENTRIC.to_vec()
@@ -4655,7 +4655,7 @@ pub(crate) mod tests {
         vertex: &str,
         fragment: &str,
     ) -> P::RenderPipeline {
-        use reims_vgpu_core::platform::values::RenderPipelineDesc;
+        use crate::core::platform::values::RenderPipelineDesc;
         let (v, f) = (fixture::<P>(d, vertex), fixture::<P>(d, fragment));
         d.new_render_pipeline_state(&RenderPipelineDesc {
             label: None,
@@ -4856,8 +4856,8 @@ pub(crate) mod tests {
     /// commands after the draw in its encoder are taken
     #[test]
     fn a_type_9_draw_fails_its_command_buffer_as_metals_gpu_does() {
-        use reims_vgpu_core::platform::event::EventRef;
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::event::EventRef;
+        use crate::core::platform::types::NsRange;
 
         let (p, d) = (platform(), dev());
         let (dst, pass) = pass_of(&p, &d, (4, 4));
@@ -4923,8 +4923,8 @@ pub(crate) mod tests {
         d: &P::Device,
         fragment: &str,
     ) -> String {
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-        use reims_vgpu_core::platform::render::RenderEncoder as _;
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::render::RenderEncoder as _;
 
         /// `MTLResourceStorageModeMemoryless`, and `MTLTextureUsageShaderWrite`.
         const MEMORYLESS: u64 = 0x30;
@@ -4943,7 +4943,7 @@ pub(crate) mod tests {
         });
         let memoryless = d.new_texture(OnFault::Die, &desc).unwrap().unwrap();
         let sampler = d
-            .new_sampler_state(&reims_vgpu_core::platform::values::SamplerDesc::default())
+            .new_sampler_state(&crate::core::platform::values::SamplerDesc::default())
             .unwrap()
             .unwrap();
         let state = fixture_state::<P>(d, "vert:tri_vert", fragment);
@@ -5089,9 +5089,9 @@ pub(crate) mod tests {
     /// however long the other queue's takes to run under load
     #[test]
     fn a_type_9_hang_is_in_flight_as_long_as_metals() {
-        use reims_vgpu_core::platform::event::EventRef;
-        use reims_vgpu_core::platform::os::Clock as _;
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::event::EventRef;
+        use crate::core::platform::os::Clock as _;
+        use crate::core::platform::types::NsRange;
 
         let (p, d) = (platform(), dev());
         let (_dst, pass) = pass_of(&p, &d, (4, 4));
@@ -5186,9 +5186,9 @@ pub(crate) mod tests {
     /// queue runs meanwhile, as Metal's (the runtime's measurement, `command_buffer/hang.rs`)
     #[test]
     fn a_type_9_fault_is_in_flight_as_long_as_metals() {
-        use reims_vgpu_core::platform::event::EventRef;
-        use reims_vgpu_core::platform::os::Clock as _;
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::event::EventRef;
+        use crate::core::platform::os::Clock as _;
+        use crate::core::platform::types::NsRange;
 
         let (p, d) = (platform(), dev());
         let (_dst, pass) = pass_of(&p, &d, (4, 4));
@@ -5488,9 +5488,9 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_draw_through_a_read_only_surface_at_slots_it_cannot_write_draws_on_linux() {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::platform::values::RenderPipelineDesc;
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::values::RenderPipelineDesc;
 
         use crate::gpu::resource::VulkanRenderPipeline;
         use crate::gpu::resource::tests::on_read_only_surface;
@@ -5603,7 +5603,7 @@ pub(crate) mod tests {
     /// the pages stayed zeros.
     #[cfg(target_os = "linux")]
     fn read_only_pass(load: u64, store: u64, late: Option<u64>) -> (u64, Option<i64>, bool) {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
         use crate::os::{OsVm, PAGE};
@@ -5713,7 +5713,7 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_resolve_into_read_only_memory_dies() {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::{bgra_over, read_only_buffer};
         use crate::os::{OsVm, PAGE};
@@ -6066,7 +6066,7 @@ pub(crate) mod tests {
     /// `metal_tests::lines_take_metals_flat_inputs_at_the_last_vertex`)
     #[test]
     fn empty_draws_go_on_after_the_private_setters() {
-        use reims_vgpu_core::platform::values::IcbDesc;
+        use crate::core::platform::values::IcbDesc;
 
         let (e, indices) = drawing_encoder(FLAT.0, FLAT.1);
         let icb = dev()
@@ -6165,8 +6165,8 @@ pub(crate) mod tests {
     /// `render_state_misc` sends them
     #[test]
     fn an_amplification_mode_kills_draws_only_where_it_changes_the_count() {
-        use reims_vgpu_core::platform::types::VertexAmplificationViewMapping;
-        use reims_vgpu_core::platform::values::IcbDesc;
+        use crate::core::platform::types::VertexAmplificationViewMapping;
+        use crate::core::platform::values::IcbDesc;
 
         let (e, _indices) = drawing_encoder("vert:tri_vert", "frag:tri_frag");
         let icb = dev()
@@ -6236,7 +6236,7 @@ pub(crate) mod tests {
         let (e, dst) = open_encoder();
         let d = dev();
         let sampler = d
-            .new_sampler_state(&reims_vgpu_core::platform::values::SamplerDesc::default())
+            .new_sampler_state(&crate::core::platform::values::SamplerDesc::default())
             .unwrap()
             .unwrap();
         let buf = d
@@ -6367,14 +6367,14 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        pass.set_depth_attachment(&reims_vgpu_core::platform::values::DepthAttachmentSet {
+        pass.set_depth_attachment(&crate::core::platform::values::DepthAttachmentSet {
             texture: Some(Some(&depth)),
             resolve_texture: Some(Some(&depth_resolve)),
             load_action: Some(CLEAR),
             store_action: Some(STORE),
             ..Default::default()
         });
-        pass.set_stencil_attachment(&reims_vgpu_core::platform::values::StencilAttachmentSet {
+        pass.set_stencil_attachment(&crate::core::platform::values::StencilAttachmentSet {
             texture: Some(Some(&depth)),
             resolve_texture: Some(Some(&depth_resolve)),
             load_action: Some(CLEAR),
@@ -6461,7 +6461,7 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        pass.set_pass(&reims_vgpu_core::platform::values::PassSet {
+        pass.set_pass(&crate::core::platform::values::PassSet {
             render_target_width: Some(16),
             render_target_height: Some(8),
             default_raster_sample_count: Some(1),
@@ -6506,7 +6506,7 @@ pub(crate) mod tests {
         let r = pass.set_color_attachment(OnFault::Return, 8, &ColorAttachmentSet::default());
         assert!(r.is_err());
         assert!(pass.color_attachment_state(8).is_err());
-        pass.set_pass(&reims_vgpu_core::platform::values::PassSet {
+        pass.set_pass(&crate::core::platform::values::PassSet {
             default_color_sample_count: Some(4),
             ..Default::default()
         });
@@ -6516,7 +6516,7 @@ pub(crate) mod tests {
     /// request the runtime answers its cached state for; every reference answers its handle's
     #[test]
     fn every_render_pipeline_creation_takes_a_new_identifier() {
-        use reims_vgpu_core::platform::resource::RenderPipeline as _;
+        use crate::core::platform::resource::RenderPipeline as _;
         let d = dev();
         let key = PipelineKey {
             format: BGRA8,
@@ -6537,7 +6537,7 @@ pub(crate) mod tests {
     /// past it
     #[test]
     fn binds_at_the_last_slot_die_at_their_selector() {
-        use reims_vgpu_core::raise::death::DeathKind;
+        use crate::core::raise::death::DeathKind;
 
         let (p, d) = (platform(), dev());
         let b = crate::gpu::resource::tests::shared(64);
@@ -6589,9 +6589,9 @@ pub(crate) mod tests {
     /// (code 1); 1, 4 and 7 complete it
     #[test]
     fn a_pass_without_attachments_answers_metals_default_sample_counts() {
-        use reims_vgpu_core::platform::types::CommandBufferStatus;
-        use reims_vgpu_core::platform::values::PassSet;
-        use reims_vgpu_core::raise::death::DeathKind;
+        use crate::core::platform::types::CommandBufferStatus;
+        use crate::core::platform::values::PassSet;
+        use crate::core::raise::death::DeathKind;
 
         let p = platform();
         let q = dev().new_command_queue().unwrap();
@@ -6651,7 +6651,7 @@ pub(crate) mod tests {
     /// pipeline state. The execution of one whose commands set their own is taken
     #[test]
     fn what_runs_the_pipeline_after_a_nil_one_dies() {
-        use reims_vgpu_core::platform::values::IcbDesc;
+        use crate::core::platform::values::IcbDesc;
 
         let p = platform();
         let d = dev();
@@ -6723,14 +6723,14 @@ pub(crate) mod tests {
     /// pipeline state draws to RGBA16Float in a pass of a BGRA8 target, which the runtime refuses,
     /// the buffer made resident with `usage`.
     fn execute_a_mismatched_draw(usage: u64) {
+        use crate::core::platform::icb::{
+            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+        };
+        use crate::core::platform::values::IcbDesc;
         use metal2vulkan::metal::PixelFormat;
         use metal2vulkan::pipeline::{
             ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
         };
-        use reims_vgpu_core::platform::icb::{
-            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-        };
-        use reims_vgpu_core::platform::values::IcbDesc;
 
         const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
         const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
@@ -6814,8 +6814,8 @@ pub(crate) mod tests {
     /// still refused, which dies at the execution's selector, as no handler of core's learns of it
     #[test]
     fn refused_icb_records_die_naming_the_execution() {
-        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-        use reims_vgpu_core::testkit::capture::expect_death;
+        use crate::core::raise::death::{DeathKind, DeathSite};
+        use crate::core::testkit::capture::expect_death;
 
         let site = catch_death(|| execute_a_mismatched_draw(1)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
@@ -7037,14 +7037,14 @@ pub(crate) mod tests {
     /// `device-color-conversion` (`PrecisionNote::DeviceColorConversion`)
     #[test]
     fn a_pass_executes_an_icbs_draws() {
+        use crate::core::platform::icb::{
+            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+        };
+        use crate::core::platform::values::IcbDesc;
         use metal2vulkan::metal::PixelFormat;
         use metal2vulkan::pipeline::{
             ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
         };
-        use reims_vgpu_core::platform::icb::{
-            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-        };
-        use reims_vgpu_core::platform::values::IcbDesc;
 
         const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
         const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
@@ -7216,17 +7216,17 @@ pub(crate) mod tests {
     /// made resident for writing, it dies at the execution
     #[test]
     fn an_execution_of_states_of_its_own_writes_no_bound_texture() {
+        use crate::core::host::PhysicalMemoryRange;
+        use crate::core::platform::icb::{
+            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+        };
+        use crate::core::platform::os::surface::SurfaceSpec;
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::values::IcbDesc;
         use metal2vulkan::metal::PixelFormat;
         use metal2vulkan::pipeline::{
             ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
         };
-        use reims_vgpu_core::host::PhysicalMemoryRange;
-        use reims_vgpu_core::platform::icb::{
-            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-        };
-        use reims_vgpu_core::platform::os::surface::SurfaceSpec;
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
-        use reims_vgpu_core::platform::values::IcbDesc;
 
         const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
         const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
@@ -7292,7 +7292,7 @@ pub(crate) mod tests {
             element_height: 1,
             client_direction: Some(2),
             client_address_ranges: Some(vec![PhysicalMemoryRange {
-                physical_address: reims_vgpu_core::num::ToU64::to_u64(guest.addr()),
+                physical_address: crate::core::num::ToU64::to_u64(guest.addr()),
                 physical_length: page,
             }]),
             ..SurfaceSpec::default()
@@ -7360,15 +7360,15 @@ pub(crate) mod tests {
     /// there
     #[test]
     fn a_pass_of_a_mutable_rate_map_not_yet_reset_rasterizes_nothing() {
+        use crate::core::platform::rate_map::{
+            RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+        };
+        use crate::core::platform::values::{
+            DepthAttachmentSet, DepthStencilDesc, PassSet, RateMapDesc,
+        };
         use metal2vulkan::metal::PixelFormat;
         use metal2vulkan::pipeline::{
             ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
-        };
-        use reims_vgpu_core::platform::rate_map::{
-            RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
-        };
-        use reims_vgpu_core::platform::values::{
-            DepthAttachmentSet, DepthStencilDesc, PassSet, RateMapDesc,
         };
 
         const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
@@ -7561,10 +7561,10 @@ pub(crate) mod tests {
         side: u64,
         mutability: u64,
     ) -> crate::gpu::rate_map::VulkanRateMapDescriptor {
-        use reims_vgpu_core::platform::rate_map::{
+        use crate::core::platform::rate_map::{
             RateMapDescriptor as _, RateMapLayerDescriptor as _,
         };
-        use reims_vgpu_core::platform::values::RateMapDesc;
+        use crate::core::platform::values::RateMapDesc;
 
         let m = p.rate_map_descriptor(&RateMapDesc {
             screen_size: MtlSize::new(side, side, 1),
@@ -7595,11 +7595,11 @@ pub(crate) mod tests {
     fn a_reset_waits_for_a_committed_pass_core_let_go_of() {
         use std::sync::mpsc;
 
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-        use reims_vgpu_core::platform::rate_map::RateMap as _;
-        use reims_vgpu_core::platform::values::PassSet;
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::rate_map::RateMap as _;
+        use crate::core::platform::values::PassSet;
 
-        use reims_vgpu_core::platform::values::RateMapDesc;
+        use crate::core::platform::values::RateMapDesc;
 
         let p = platform();
         let d = dev();
@@ -7651,11 +7651,11 @@ pub(crate) mod tests {
     /// creation or a reset, and a draw in a pass over it is taken
     #[test]
     fn draws_over_a_map_of_varying_rates_die() {
-        use reims_vgpu_core::platform::rate_map::{
+        use crate::core::platform::rate_map::{
             RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
         };
-        use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
-        use reims_vgpu_core::raise::death::DeathKind;
+        use crate::core::platform::values::{PassSet, RateMapDesc};
+        use crate::core::raise::death::DeathKind;
 
         use crate::gpu::rate_map::{VulkanRateMap, VulkanRateMapDescriptor};
 
@@ -7829,8 +7829,8 @@ pub(crate) mod tests {
     /// reuses it. Every pass completes with no error, none failed as a GPU hang
     #[test]
     fn no_draw_moves_later_plain_identifiers_only_for_a_pass_that_drew_nothing() {
-        use reims_vgpu_core::platform::rate_map::RateMap as _;
-        use reims_vgpu_core::platform::values::PassSet;
+        use crate::core::platform::rate_map::RateMap as _;
+        use crate::core::platform::values::PassSet;
 
         /// `MTLPrimitiveTypeTriangle` and `TriangleStrip`.
         const TRIANGLE: u64 = 3;

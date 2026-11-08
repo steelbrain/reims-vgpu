@@ -334,8 +334,8 @@ fn short(what: &str, kept: u64, level: log::Level) {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::num::ToU64 as _;
-    use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _, VmProt};
+    use crate::core::num::ToU64 as _;
+    use crate::core::platform::os::vm::{HostAddr, HostVm as _, VmProt};
 
     use super::super::{LinuxVm, import, vm};
     use super::*;
@@ -361,8 +361,8 @@ mod tests {
 
     /// Whether `f` ends the process at the budget's death (`mmap`).
     fn dies_at_the_budget<R>(f: impl FnOnce() -> R) -> bool {
-        use reims_vgpu_core::raise::death::DeathKind;
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::raise::death::DeathKind;
+        use crate::core::testkit::capture::catch_death;
         catch_death(f).is_err_and(|site| (site.kind, site.file) == (DeathKind::Abort, "mmap"))
     }
 
@@ -421,7 +421,7 @@ mod tests {
     /// answer when memory runs out
     #[test]
     fn past_the_budget_answers_as_memory_runs_out_by_default() {
-        use reims_vgpu_core::platform::os::vm::KernReturn;
+        use crate::core::platform::os::vm::KernReturn;
         let v = LinuxVm::new();
         let src = vm::allocate_aliasable(64 * PAGE).unwrap();
         let at = v.allocate_anywhere(64 * PAGE).unwrap();

@@ -6,9 +6,9 @@
 //! `mesh.metal` holds. MoltenVK has no `VK_EXT_mesh_shader`, so on a Mac the runtime draws them
 //! emulated (the module docs).
 
-use reims_vgpu_core::platform::resource::Library as _;
-use reims_vgpu_core::platform::types::NsErrorText;
-use reims_vgpu_core::platform::values::{
+use crate::core::platform::resource::Library as _;
+use crate::core::platform::types::NsErrorText;
+use crate::core::platform::values::{
     ColorAttachmentDesc, FullMeshRenderPipelineDesc, LinkedFunctionsDesc, SamplerDesc,
 };
 

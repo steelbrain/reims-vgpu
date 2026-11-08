@@ -116,7 +116,7 @@
 //!   mapping of the pages, so the two never share a command buffer: each copy has a transfer
 //!   command buffer of its own, and a refused copy by runs encodes nothing in it.
 //!
-//! [`GpuDevice::copies_guest_ram`]: reims_vgpu_core::platform::device::GpuDevice::copies_guest_ram
+//! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
 //!
 //! What the guest observes is IOSurface's contract under its locks: a lock after a GPU write sees
 //! it, and a GPU use after a read-write lock sees the CPU's writes. A CPU write made without a
@@ -147,24 +147,24 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::platform::values::PagesPlane;
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
-use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
 use reims_vgpu_graphics::ops::{RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_BLOCK_RELEASE_NO_CLIENT, RGFX_BLOCK_RELEASE_UNHELD, RgfxBufferOverSurfacePages,
 };
 use reims_vgpu_video::core::device_memory::{MemoryIdentity, MemoryLife};
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::platform::types::NsRange;
+use reims_vgpu_vulkan::core::platform::values::PagesPlane;
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult, refusals};
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 
 use super::refusing;
 use super::surface_pages::{SurfaceView, Unmade, buffer_over};
@@ -461,7 +461,7 @@ struct Transfer<P: Platform> {
     /// Unshared ([`new_command_queue_unshared`]): a present of a surface waits for its fill, and
     /// a frame drawn from a cache for the fill before it ([`FillWait`]).
     ///
-    /// [`new_command_queue_unshared`]: reims_vgpu_core::platform::device::GpuDevice::new_command_queue_unshared
+    /// [`new_command_queue_unshared`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_command_queue_unshared
     queue: P::CommandQueue,
     /// The early copies behind writers that hold no video encoder
     /// ([`SurfaceCaches::early_copies`]), apart from the fills, so neither waits behind the
@@ -3549,9 +3549,6 @@ fn copy<P: Platform>(
 mod tests {
     use std::sync::atomic::AtomicBool;
 
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_core::testkit::calllog::{Arg, Call};
-    use reims_vgpu_core::testkit::objects::CompleteOn;
     use reims_vgpu_graphics::ops::{
         RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_USE, RgfxCommandBuffer,
         RgfxOpHeader,
@@ -3562,6 +3559,9 @@ mod tests {
         RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
         RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun, RgfxQueueCreate, RgfxSurfacePages,
     };
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::calllog::{Arg, Call};
+    use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
     use super::super::surface_pages::tests::{BLOCK, RAM, Rig, rig};
@@ -4517,7 +4517,7 @@ mod tests {
     /// queue
     #[test]
     fn the_transfer_queue_is_made_unshared_with_the_first_queue() {
-        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+        use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
         let mut r = cached();
         let (unshared, plain) = (
             r.p.call_log().count(UNSHARED_QUEUE),
@@ -5502,7 +5502,9 @@ mod tests {
     /// what the view then holds, as the guest's pages lie scattered and out of order
     #[test]
     fn a_cached_block_by_runs_copies_the_bytes_its_view_holds() {
-        use reims_vgpu_core::testkit::impls::blit::{BUFFER_TO_GUEST_RAM, GUEST_RAM_TO_BUFFER};
+        use reims_vgpu_vulkan::core::testkit::impls::blit::{
+            BUFFER_TO_GUEST_RAM, GUEST_RAM_TO_BUFFER,
+        };
         let mut r = cached_by_runs();
         let page = r.page;
         assert_eq!(
@@ -5581,8 +5583,10 @@ mod tests {
     /// both ways: what a command buffer wrote of the cache still reaches the pages
     #[test]
     fn a_refused_fill_by_runs_fills_through_a_view_from_then_on() {
-        use reims_vgpu_core::testkit::Step;
-        use reims_vgpu_core::testkit::impls::blit::{BUFFER_TO_GUEST_RAM, GUEST_RAM_TO_BUFFER};
+        use reims_vgpu_vulkan::core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::impls::blit::{
+            BUFFER_TO_GUEST_RAM, GUEST_RAM_TO_BUFFER,
+        };
         let mut r = cached_by_runs();
         let cache = cache_id(&r);
         r.p.script().push(GUEST_RAM_TO_BUFFER, Step::value(false));
@@ -5649,8 +5653,8 @@ mod tests {
     #[test]
     fn a_download_of_a_laid_out_cache_leaves_the_bytes_between_rows() {
         use super::super::surface_pages::tests::one_plane;
-        use reims_vgpu_core::platform::values::PagesInPlace;
         use reims_vgpu_graphics::wire::RGFX_STATUS_CACHE;
+        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
         let mut r = rig(16);
         let page = r.page;
         r.dec.set_unified_memory(true);
@@ -5756,8 +5760,8 @@ mod tests {
     /// buffer's write is not lost, and the release that follows has nothing more to copy
     #[test]
     fn a_refused_download_by_runs_copies_through_a_view() {
-        use reims_vgpu_core::testkit::Step;
-        use reims_vgpu_core::testkit::impls::blit::BUFFER_TO_GUEST_RAM;
+        use reims_vgpu_vulkan::core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::impls::blit::BUFFER_TO_GUEST_RAM;
         let mut r = cached_by_runs();
         let cache = cache_id(&r);
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
@@ -5806,7 +5810,7 @@ mod tests {
     /// its buffers lie over the view
     #[test]
     fn a_block_by_runs_with_no_cache_takes_its_view() {
-        use reims_vgpu_core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::Step;
         let mut r = rig(8);
         let page = r.page;
         r.p.world().copy_guest_ram(true);
@@ -5823,7 +5827,9 @@ mod tests {
     /// Each transfer command buffer's copies of the block's cache, as (copies by runs asked,
     /// copies through a view), from `commandBuffer` to its `commit`.
     fn copies_per_command_buffer(calls: &[Call]) -> Vec<(usize, usize)> {
-        use reims_vgpu_core::testkit::impls::blit::{BUFFER_TO_GUEST_RAM, GUEST_RAM_TO_BUFFER};
+        use reims_vgpu_vulkan::core::testkit::impls::blit::{
+            BUFFER_TO_GUEST_RAM, GUEST_RAM_TO_BUFFER,
+        };
         let mut out = Vec::new();
         let mut open: Option<(usize, usize)> = None;
         for c in calls {
@@ -5852,8 +5858,8 @@ mod tests {
     /// copy having encoded nothing, and every copy after it goes through the view, each in its own
     #[test]
     fn a_copy_by_runs_and_one_through_the_view_never_share_a_command_buffer() {
-        use reims_vgpu_core::testkit::Step;
-        use reims_vgpu_core::testkit::impls::blit::BUFFER_TO_GUEST_RAM;
+        use reims_vgpu_vulkan::core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::impls::blit::BUFFER_TO_GUEST_RAM;
         let mut r = cached_by_runs();
         let mark = r.p.call_log().mark();
         use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 1, true)]);
@@ -5881,7 +5887,7 @@ mod tests {
     /// follows copies the GPU's write out of it by them
     #[test]
     fn a_deferred_blocks_pages_are_taken_by_their_runs() {
-        use reims_vgpu_core::testkit::impls::blit::BUFFER_TO_GUEST_RAM;
+        use reims_vgpu_vulkan::core::testkit::impls::blit::BUFFER_TO_GUEST_RAM;
         let mut r = deferring(8);
         let page = r.page;
         r.p.world().copy_guest_ram(true);
@@ -6139,7 +6145,7 @@ mod tests {
     /// its room back
     #[test]
     fn a_deferred_block_not_made_is_refused_with_nothing_left() {
-        use reims_vgpu_core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::Step;
         let mut r = deferring(3);
         let page = r.page;
         let refused = RGFX_STATUS_REFUSED;
@@ -6173,8 +6179,8 @@ mod tests {
 
     /// The live Shared buffer `id`'s bytes, each set to `with` first where given.
     fn buffer_bytes(r: &Rig, id: u64, with: Option<u8>) -> Vec<u8> {
-        use reims_vgpu_core::platform::ObjId;
-        use reims_vgpu_core::testkit::objects::kind;
+        use reims_vgpu_vulkan::core::platform::ObjId;
+        use reims_vgpu_vulkan::core::testkit::objects::kind;
         let buffer = (r.p.world().find(ObjId(id)))
             .and_then(|o| o.cast::<kind::Buffer>())
             .expect("a live buffer");
@@ -6214,7 +6220,7 @@ mod tests {
     /// surface's bytes are refused still
     #[test]
     fn a_deferred_blocks_pages_with_no_view_are_copied() {
-        use reims_vgpu_core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::Step;
         let mut r = deferring(8);
         let page = r.page;
         let length = 2 * page;
@@ -6408,7 +6414,7 @@ mod tests {
     /// writer copies the cache into the runs, and the download that follows copies nothing more
     #[test]
     fn a_surface_read_back_by_runs_is_copied_out_by_them_behind_its_next_writer() {
-        use reims_vgpu_core::testkit::impls::blit::BUFFER_TO_GUEST_RAM;
+        use reims_vgpu_vulkan::core::testkit::impls::blit::BUFFER_TO_GUEST_RAM;
         let r = cached_by_runs();
         let cache = cache_id(&r);
         let queue = r.device.new_command_queue().unwrap();

@@ -14,22 +14,22 @@ use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 
+use crate::core::host::HostPtr;
+use crate::core::num::ToUsize;
+use crate::core::platform::resource::{
+    Buffer, ComputePipeline, DepthStencilState, ExportedMemory, GpuResource, Heap, Library,
+    RenderPipeline, SamplerState, Texture,
+};
+use crate::core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
+use crate::core::platform::values::{SurfaceMatrix, SurfacePlane};
+use crate::core::platform::{Handle, HostRange};
+use crate::core::raise::{OnFault, Raise, RaiseResult};
+use crate::core::sync::Mutex;
 use metal2vulkan::metal::{PixelFormat, PrimitiveTopologyClass, TextureType, TextureUsage};
 use metal2vulkan::pipeline::{
     ComputePipelineDescriptor, MeshPipelineDescriptor, RenderPipelineDescriptor,
 };
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::num::ToUsize;
-use reims_vgpu_core::platform::resource::{
-    Buffer, ComputePipeline, DepthStencilState, ExportedMemory, GpuResource, Heap, Library,
-    RenderPipeline, SamplerState, Texture,
-};
-use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
-use reims_vgpu_core::platform::values::{SurfaceMatrix, SurfacePlane};
-use reims_vgpu_core::platform::{Handle, HostRange};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
     Nil, Policy, create, get, hearing, metal_aborts, plain, plain_at, refused, relay_gap, send,
@@ -1747,7 +1747,7 @@ pub(crate) fn guest_bytes<'a>(sel: &'static str, range: HostRange<'a>) -> rt::Ho
     }
     let first = range.ptr().addr();
     let start = NonNull::new(range.ptr().as_ptr::<u8>())
-        .filter(|_| first >= reims_vgpu_core::host::ZERO_REGION_END)
+        .filter(|_| first >= crate::core::host::ZERO_REGION_END)
         .filter(|_| first.checked_add(length).is_some());
     let Some(start) = start else {
         crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
@@ -1770,7 +1770,7 @@ fn first_bytes(sel: &'static str, range: HostRange<'_>, most: usize) -> Vec<u8> 
     }
     let start = range.ptr().as_ptr::<u8>();
     let first = range.ptr().addr();
-    if first < reims_vgpu_core::host::ZERO_REGION_END || first.checked_add(length).is_none() {
+    if first < crate::core::host::ZERO_REGION_END || first.checked_add(length).is_none() {
         crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
     }
     let read = length.min(most);
@@ -1810,7 +1810,7 @@ pub(crate) fn fill_bytes(
         return Vec::new();
     }
     let first = range.ptr().addr();
-    if range.is_empty() && first < reims_vgpu_core::host::ZERO_REGION_END {
+    if range.is_empty() && first < crate::core::host::ZERO_REGION_END {
         crate::answer::metal_reads_near_null(sel, &format!("0 bytes at {first:#x}"));
     }
     first_bytes(sel, range, most)
@@ -2283,7 +2283,7 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         &self,
         _on: OnFault,
         function_name: &str,
-        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+        constants: &[crate::core::platform::resource::FunctionConstant],
     ) -> RaiseResult<Option<VulkanFunction>> {
         let sel = "newFunctionWithName:constantValues:error:";
         let Some(values) = constant_values(function_name, constants) else {
@@ -2318,7 +2318,7 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         &self,
         _on: OnFault,
         function_name: &str,
-        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+        constants: &[crate::core::platform::resource::FunctionConstant],
         options: u64,
         specialized_name: Option<&str>,
     ) -> RaiseResult<Option<VulkanFunction>> {
@@ -2363,7 +2363,7 @@ impl Library<VulkanPlatform> for VulkanLibrary {
 /// of a type the runtime does not know or no function constant takes.
 fn constant_values(
     function_name: &str,
-    constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+    constants: &[crate::core::platform::resource::FunctionConstant],
 ) -> Option<metal2vulkan::library::FunctionConstantValues> {
     let mut values = metal2vulkan::library::FunctionConstantValues::defaults();
     for c in constants {
@@ -2391,17 +2391,15 @@ pub(crate) mod tests {
     use std::alloc::{Layout, alloc_zeroed, dealloc};
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-    use reims_vgpu_core::platform::device::{GpuDevice, NoCopyDeallocator};
-    use reims_vgpu_core::platform::os::surface::{Surface, SurfacePlaneSpec, SurfaceSpec};
-    use reims_vgpu_core::platform::types::MtlOrigin;
-    use reims_vgpu_core::platform::values::{
-        BufferDesc, HeapDesc, HeapMade, OptionSet, TextureDesc,
-    };
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::sync::Mutex;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::Platform;
+    use crate::core::platform::descriptor::TextureDescriptor as _;
+    use crate::core::platform::device::{GpuDevice, NoCopyDeallocator};
+    use crate::core::platform::os::surface::{Surface, SurfacePlaneSpec, SurfaceSpec};
+    use crate::core::platform::types::MtlOrigin;
+    use crate::core::platform::values::{BufferDesc, HeapDesc, HeapMade, OptionSet, TextureDesc};
+    use crate::core::raise::death::DeathKind;
+    use crate::core::sync::Mutex;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -2415,7 +2413,7 @@ pub(crate) mod tests {
     /// gone.
     #[cfg(target_os = "linux")]
     fn over_read_only_pages(pages: u64) -> (VulkanBuffer, HostPtr) {
-        use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
+        use crate::core::platform::os::vm::{HostVm as _, VmProt};
 
         use crate::os::{OsVm, PAGE};
 
@@ -2442,9 +2440,9 @@ pub(crate) mod tests {
     /// frees once the buffer is gone.
     #[cfg(target_os = "linux")]
     pub(crate) fn on_read_only_surface() -> (VulkanBuffer, HostPtr) {
-        use reims_vgpu_core::host::PhysicalMemoryRange;
-        use reims_vgpu_core::num::ToU64 as _;
-        use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
+        use crate::core::host::PhysicalMemoryRange;
+        use crate::core::num::ToU64 as _;
+        use crate::core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
 
         use crate::os::{OsSurfaces, PAGE, READ_ONLY_DIRECTION};
 
@@ -2537,11 +2535,11 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_fill_into_read_only_pages_is_dropped_on_linux() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::NsRange;
 
         use crate::os::{OsVm, PAGE};
 
@@ -2578,11 +2576,11 @@ pub(crate) mod tests {
     /// there is unmeasured. Its contents answer the pages' address on both
     #[test]
     fn a_blit_into_a_read_only_buffer_is_dropped() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::{MtlSize, NsRange};
 
         use crate::os::{OsVm, PAGE};
 
@@ -2649,9 +2647,9 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_cpu_write_of_a_texture_over_a_read_only_buffer_dies_on_linux() {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
-        use reims_vgpu_core::platform::resource::Texture as _;
-        use reims_vgpu_core::platform::types::{MtlRegion, MtlSize};
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::Texture as _;
+        use crate::core::platform::types::{MtlRegion, MtlSize};
 
         use crate::os::{OsVm, PAGE};
 
@@ -2686,7 +2684,7 @@ pub(crate) mod tests {
         // SAFETY: an empty range is never read.
         let empty = unsafe { HostRange::new(HostPtr::NULL, 0) };
         assert!(host_bytes("s", empty).is_empty());
-        let last = u64::try_from(reims_vgpu_core::host::ZERO_REGION_END - 1).unwrap();
+        let last = u64::try_from(crate::core::host::ZERO_REGION_END - 1).unwrap();
         for at in [0, 0x10, 0x4000, last] {
             // SAFETY: a range of 4 bytes in the zero region, which the copy dies before reading.
             let near_null = unsafe { HostRange::new(HostPtr::NULL.wrapping_add(at), 4) };
@@ -2717,7 +2715,7 @@ pub(crate) mod tests {
         // SAFETY: an empty range is never read.
         let empty = unsafe { HostRange::new(HostPtr::NULL, 0) };
         assert!(guest_bytes("s", empty).is_empty());
-        let last = u64::try_from(reims_vgpu_core::host::ZERO_REGION_END - 1).unwrap();
+        let last = u64::try_from(crate::core::host::ZERO_REGION_END - 1).unwrap();
         for at in [0, 0x10, last] {
             // SAFETY: a range of 4 bytes in the zero region, which dies before any read.
             let near_null = unsafe { HostRange::new(HostPtr::NULL.wrapping_add(at), 4) };
@@ -2941,9 +2939,9 @@ pub(crate) mod tests {
     /// Metal), as the runtime frees the range then ([`crate::gpu::metal_space::Hold`])
     #[test]
     fn a_released_buffers_range_comes_back_once_its_command_buffer_completes() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
         let d = dev();
         let q = d.new_command_queue().unwrap();
         let gate = d.new_shared_event().unwrap();
@@ -2996,9 +2994,9 @@ pub(crate) mod tests {
     /// width and no height, whose bytes Metal never reads, fills nothing and goes on
     #[test]
     fn a_fill_with_a_surface_buffers_bytes_dies() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
         let d = dev();
         let s = bgra_surface(64, 32);
         let b = d.new_buffer_on_surface(Some(&s)).unwrap().unwrap();
@@ -3105,11 +3103,11 @@ pub(crate) mod tests {
     where
         P::Device: GpuDevice<P>,
     {
-        use reims_vgpu_core::host::HostPtr;
-        use reims_vgpu_core::platform::HostRange;
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use crate::core::host::HostPtr;
+        use crate::core::platform::HostRange;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::resource::Buffer as _;
 
         const LENGTH: usize = 0x10000;
         const SLICE: u64 = 60 * 3 * 4;
@@ -3806,7 +3804,7 @@ pub(crate) mod tests {
     /// sends them
     #[test]
     fn bc_textures_over_a_surface_s_rows_are_made() {
-        use reims_vgpu_core::platform::values::SurfaceFacts;
+        use crate::core::platform::values::SurfaceFacts;
         let p = platform();
         let (rows, pitch) = (64u64, 256u64);
         let b = shared(2 * rows * pitch);
@@ -3901,12 +3899,12 @@ pub(crate) mod tests {
     /// meanwhile lies elsewhere, and one made after the completion at the range
     #[test]
     fn a_surface_texture_keeps_its_range_until_its_command_buffer_completed() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::MtlSize;
-        use reims_vgpu_core::rt::Pool;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::MtlSize;
+        use crate::core::rt::Pool;
         let (p, d) = (platform(), dev());
         // 64 by 64, 4 bytes a texel: a page, whose range is the space's 0x8000.
         let side = 64;
@@ -3977,12 +3975,12 @@ pub(crate) mod tests {
     /// and one made after the completion at the range
     #[test]
     fn a_texture_keeps_its_range_until_its_command_buffer_completed() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::MtlSize;
-        use reims_vgpu_core::rt::Pool;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::MtlSize;
+        use crate::core::rt::Pool;
         let (p, d) = (platform(), dev());
         // BGRA8 at Private storage: 64 by 64 of its own memory, a heap size of a page, and a
         // shareable 8 by 8 of a page with its extra bytes; each a range of the space's 0x8000.
@@ -4096,7 +4094,7 @@ pub(crate) mod tests {
     /// goes with it
     #[test]
     fn every_texture_takes_a_descriptor_while_it_lives() {
-        use reims_vgpu_core::platform::resource::{Heap as _, Texture as _};
+        use crate::core::platform::resource::{Heap as _, Texture as _};
         let (p, d) = (platform(), dev());
         let live = || crate::gpu::metal_space::process().textures_live();
         let of = |format, options| {
@@ -4215,7 +4213,7 @@ pub(crate) mod tests {
     /// `metal_space::Hold`)
     #[test]
     fn an_opened_shared_texture_keeps_its_source_range() {
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use crate::core::platform::resource::Buffer as _;
         let d = dev();
         let page = || {
             d.new_buffer_of_length(OnFault::Die, 0x4000, 0)
@@ -4521,7 +4519,7 @@ pub(crate) mod tests {
     /// `ShaderRead` usage, whose blocks lie in Metal's tiles at every level
     #[test]
     fn heap_textures_over_guest_pages_in_metals_block_layout_are_made() {
-        use reims_vgpu_core::platform::types::ResourceAddressRange;
+        use crate::core::platform::types::ResourceAddressRange;
 
         const SIZE: u64 = 0x10000;
         let (p, d) = (platform(), dev());
@@ -4567,7 +4565,7 @@ pub(crate) mod tests {
     /// neither as host memory nor as a dma-buf
     #[test]
     fn a_heap_over_less_than_its_granule_is_made() {
-        use reims_vgpu_core::platform::types::ResourceAddressRange;
+        use crate::core::platform::types::ResourceAddressRange;
 
         const SIZE: u64 = 0x1000;
         let (p, d) = (platform(), dev());
@@ -4620,7 +4618,7 @@ pub(crate) mod tests {
 
     /// The address range array of the [`over_pages`] bytes at `address`.
     fn ranges_at<P: Platform>(p: &P, address: u64) -> P::AddressRangeArray {
-        use reims_vgpu_core::platform::types::ResourceAddressRange;
+        use crate::core::platform::types::ResourceAddressRange;
         p.new_address_range_array(&[ResourceAddressRange {
             address,
             length: over_pages(),

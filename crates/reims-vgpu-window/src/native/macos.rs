@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSEvent, NSEventMask};
-use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
+use reims_vgpu_vulkan::core::platform::os::{Clock as _, MonoTime};
 use reims_vgpu_vulkan::os::OsClock;
 
 pub(crate) use self::iso::is_iso_keyboard;

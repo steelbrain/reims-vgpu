@@ -7,8 +7,16 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# core::testkit and testkit::capture outside this crate's own unit tests (architecture 13.2).
+testkit = ["dep:lzma-rs"]
+
 [dependencies]
-reims-vgpu-core.workspace = true
+# core (`core`): its locks (`core::sync`), and the guest's physical ranges as bytes (`core::host`).
+parking_lot.workspace = true
+zerocopy.workspace = true
+# core's testkit::metal_answers: the recorded answers too long for text, in xz files.
+lzma-rs = { workspace = true, optional = true }
 metal2vulkan-runtime.workspace = true
 metal2vulkan.workspace = true
 # The debug lines that time the runtime's compiles (gpu/timing.rs), through core's logger.
@@ -39,7 +47,11 @@ libc.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-reims-vgpu-core = { workspace = true, features = ["testkit"] }
+# core's testkit for the integration tests (`tests/`), which link the library as other
+# crates do.
+reims-vgpu-vulkan = { path = ".", features = ["testkit"] }
+# core's testkit in the unit tests, compiled under cfg(test).
+lzma-rs.workspace = true
 
 [lints]
 workspace = true

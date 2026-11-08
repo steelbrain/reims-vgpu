@@ -79,12 +79,12 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::os::clock::MonoTime;
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_STATUS_OK, RgfxSurfaceWriter};
 use reims_vgpu_graphics::{CompletionPoster, PresentAnswer};
+use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::color::ColorChange;
 use super::compile::Now;
@@ -336,7 +336,9 @@ impl<P: Platform> PresentQueue<P> {
             state.queues.clear();
             std::mem::take(&mut state.waiting)
         };
-        if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(waiting)) {
+        if let Err(refusal) =
+            reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(waiting))
+        {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "the presents waiting were dropped at the device's reset, and a texture's release \
@@ -649,8 +651,8 @@ mod tests {
 
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use reims_vgpu_core::platform::os::clock::MonoTime;
-    use reims_vgpu_core::sync::Mutex;
+    use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
+    use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::{Answer, Drawing, PresentAnswers, TIMING};
 
@@ -841,7 +843,7 @@ mod tests {
     /// its draw's end, and the refresh that answered it, counted from its take
     #[test]
     fn each_answer_logs_its_timing_at_debug() {
-        let logs = reims_vgpu_core::testkit::logs::capture();
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
         // A clock 100 us on at each read.
         let clock = AtomicU64::new(0);
         let answers = PresentAnswers::<Recorded>::new(Box::new(move || {

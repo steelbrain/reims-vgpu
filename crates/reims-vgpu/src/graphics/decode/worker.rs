@@ -61,9 +61,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use reims_vgpu_core::platform::os::MonoTime;
-use reims_vgpu_core::sync::{Condvar, Mutex};
 use reims_vgpu_graphics::keep::{KEEP, Keep};
+use reims_vgpu_vulkan::core::platform::os::MonoTime;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 /// The most threads a [`Worker`] runs.
 pub(crate) const POOL_THREADS: usize = 4;

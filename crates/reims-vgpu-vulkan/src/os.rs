@@ -99,7 +99,7 @@ pub struct GuestRamFile {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use reims_vgpu_core::platform::os::vm::HostVm as _;
+    use crate::core::platform::os::vm::HostVm as _;
 
     // The surface tests' helpers, which the crate's tests name here.
     pub(crate) use super::surface::tests::*;
@@ -119,8 +119,8 @@ pub(crate) mod tests {
     /// start changes nothing, a remap's refused as an invalid argument
     #[test]
     fn the_vm_spans_its_calls_as_mach_does() {
-        use reims_vgpu_core::num::ToUsize as _;
-        use reims_vgpu_core::platform::os::vm::{HostAddr, KernReturn, VmProt};
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::os::vm::{HostAddr, KernReturn, VmProt};
 
         let vm = OsVm::new();
         let page = vm.page_size();

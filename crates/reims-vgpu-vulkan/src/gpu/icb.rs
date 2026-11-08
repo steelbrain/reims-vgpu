@@ -110,20 +110,20 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use metal2vulkan::metal::{IndexType, IndirectCommandType};
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::Truncate;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::icb::{
+use crate::core::num::Truncate;
+use crate::core::platform::Handle;
+use crate::core::platform::blit::ResourceRef;
+use crate::core::platform::icb::{
     DispatchThreadgroupsArgs, DispatchThreadsArgs, DrawArgs, DrawIndexedArgs,
     DrawIndexedPatchesArgs, DrawPatchesArgs, IcbComputeCmd, IcbRenderCmd, ImageBlockArgs,
     IndirectCommandBuffer, IndirectComputeCommand, IndirectRenderCommand, TessellationFactorArgs,
 };
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
-use reims_vgpu_core::platform::values::IcbDesc;
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::sync::{Mutex, MutexGuard};
+use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+use crate::core::platform::values::IcbDesc;
+use crate::core::raise::RaiseResult;
+use crate::core::sync::{Mutex, MutexGuard};
+use metal2vulkan::metal::{IndexType, IndirectCommandType};
+use metal2vulkan_runtime as rt;
 
 use crate::answer::{
     Inexact, Policy, created_or_decided, decide, get, hang, inexact, metal_aborts, plain, plain_at,
@@ -1796,17 +1796,17 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
 /// the process, so under `cargo test`'s threads one test's states and releases reach another's.
 #[cfg(test)]
 mod tests {
+    use crate::core::platform::Platform;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::resource::{Buffer as _, ComputePipeline as _};
+    use crate::core::platform::types::NsRange;
+    use crate::core::raise::OnFault;
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
     use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::{Buffer as _, ComputePipeline as _};
-    use reims_vgpu_core::platform::types::NsRange;
-    use reims_vgpu_core::raise::OnFault;
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::command::VulkanCommandBuffer;
@@ -1856,7 +1856,7 @@ mod tests {
     /// (`metal_tests::identifiers_after_are_metals`)
     #[test]
     fn identifiers_after_a_scheduled_render_encoder_are_relayed() {
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
         let d = dev();
         let before = make::<VulkanPlatform>(&d, &compute_desc(), 1);
         assert_eq!(before.unique_identifier(), 0x10_0001_8000);
@@ -2265,8 +2265,8 @@ mod tests {
         d: &P::Device,
         library: &P::Library,
     ) -> (Vec<P::ComputePipeline>, Vec<P::RenderPipeline>) {
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::platform::values::{
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::values::{
             ColorAttachmentDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
         };
         let function = |name: &str| {
@@ -2319,7 +2319,7 @@ mod tests {
         icb: &P::Icb,
         state: u64,
     ) {
-        use reims_vgpu_core::platform::resource::Library as _;
+        use crate::core::platform::resource::Library as _;
         let f = library
             .new_function(OnFault::Return, name)
             .unwrap()
@@ -2375,7 +2375,7 @@ mod tests {
     /// answer one identifier
     #[test]
     fn a_command_written_while_two_states_held_its_id_answers_their_identifier() {
-        use reims_vgpu_core::platform::resource::{ComputePipeline as _, Library as _};
+        use crate::core::platform::resource::{ComputePipeline as _, Library as _};
         let d = dev();
         let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
         let (mut computes, renders) = twin_states::<VulkanPlatform>(&d, &library);
@@ -2441,8 +2441,8 @@ mod tests {
 
     /// A state of `mark` of `library`, made from a value that supports indirect command buffers.
     fn marking_state<P: Platform>(d: &P::Device, library: &P::Library) -> P::ComputePipeline {
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::platform::values::FullComputePipelineDesc;
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::values::FullComputePipelineDesc;
         let mark = library
             .new_function(OnFault::Return, "mark")
             .unwrap()
@@ -2526,7 +2526,7 @@ mod tests {
     /// reaches the later state, as Metal's does
     #[test]
     fn a_state_a_command_names_goes_at_the_guests_release() {
-        use reims_vgpu_core::platform::resource::ComputePipeline as _;
+        use crate::core::platform::resource::ComputePipeline as _;
         let d = dev();
         let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
         let (mut computes, renders) = twin_states::<VulkanPlatform>(&d, &library);
@@ -2860,7 +2860,7 @@ mod tests {
     /// intact is made resident
     #[test]
     fn a_buffer_a_copy_past_its_end_overwrote_dies_where_made_resident() {
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
         const USE: &str = "useResources:count:usage:";
         let d = dev();
         let p = crate::platform::tests::platform();
@@ -3086,8 +3086,8 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-        use reims_vgpu_core::platform::os::Clock as _;
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::os::Clock as _;
 
         let d = dev();
         let pipeline = icb_pipeline(&d);
@@ -3177,7 +3177,7 @@ mod tests {
     fn blits_move_lengths_past_the_record_as_they_run() {
         use std::sync::mpsc;
 
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
 
         let d = dev();
         let (a, b) = (

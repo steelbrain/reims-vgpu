@@ -27,7 +27,7 @@ reims-vgpu.workspace = true
 reims-vgpu-graphics.workspace = true
 # The death of a NULL handle, and the mark of the library's threads (the unit tests' testkit
 # platform stands where VulkanPlatform stands in the product).
-reims-vgpu-core.workspace = true
+reims-vgpu-vulkan.workspace = true
 # A refusal of a memory map's files.
 log.workspace = true
 # `fstat` and the host's page size, for the files behind a memory map's ranges.
@@ -43,7 +43,7 @@ objc2.workspace = true
 
 [dev-dependencies]
 reims-vgpu = { workspace = true, features = ["testkit"] }
-reims-vgpu-core = { workspace = true, features = ["testkit"] }
+reims-vgpu-vulkan = { workspace = true, features = ["testkit"] }
 # The window tests' recorder.
 parking_lot.workspace = true
 

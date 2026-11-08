@@ -1,12 +1,12 @@
 //! The tests of `no_texture` that compare with Metal on this host: macOS only.
 
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _, Texture as _};
-use reims_vgpu_core::platform::types::{NsRange, SizeAndAlign, Swizzle};
-use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::raise::death::DeathKind;
-use reims_vgpu_core::testkit::capture::catch_death;
+use crate::core::platform::device::GpuDevice;
+use crate::core::platform::resource::{Buffer as _, Heap as _, Texture as _};
+use crate::core::platform::types::{NsRange, SizeAndAlign, Swizzle};
+use crate::core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
+use crate::core::raise::OnFault;
+use crate::core::raise::death::DeathKind;
+use crate::core::testkit::capture::catch_death;
 
 use super::super::NO_VIEW;
 use super::*;
@@ -159,7 +159,7 @@ fn textures_of_formats_metal_makes_none_of_are_nil_as_metals_are() {
             assert_eq!(ours.0, format, "{format} {what}");
             assert_eq!(ours.1, [false; 6], "{format} {what}");
             assert_eq!(ours.2.size, 0, "{format} {what}");
-            reims_vgpu_core::metal_check!(format!("{format} {what}"), ours);
+            crate::metal_check!(format!("{format} {what}"), ours);
         }
     }
 }

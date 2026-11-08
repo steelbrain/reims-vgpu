@@ -37,8 +37,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::os::clock::MonoTime;
-use reims_vgpu_core::sync::{Condvar, Mutex};
 use reims_vgpu_graphics::icb::{
     RGFX_ICB_OP_COMPUTE_PIPELINE, RGFX_ICB_OP_RENDER_PIPELINE, RGFX_ICB_SLOT_PIPELINE,
     RgfxIcbObject, RgfxIcbRecord, slot_bytes,
@@ -56,6 +54,8 @@ use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbWrite,
 };
+use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 use zerocopy::FromBytes;
 
 /// The most compile threads a device runs.

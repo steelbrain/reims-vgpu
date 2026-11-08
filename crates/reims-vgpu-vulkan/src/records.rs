@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use crate::core::sync::Mutex;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::sync::Mutex;
 
 /// The records file under `HOME`, beside the shader cache's directory.
 pub(crate) const RECORDS: &str = ".cache/reims-vgpu-vulkan-pipelines";

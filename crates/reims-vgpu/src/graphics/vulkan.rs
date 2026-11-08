@@ -4,10 +4,10 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::command::CommandBuffer as _;
-use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
+use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::swapchain::{Acquired, Swapchain};
 use reims_vgpu_window::{Drawn, DrawnCursor, FrameSink, PixelRect, Presenter, VulkanTarget};
 

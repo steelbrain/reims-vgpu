@@ -34,9 +34,6 @@
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Weak};
 
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_ENCODE,
     RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
@@ -52,6 +49,9 @@ use reims_vgpu_video::vaapi::{
     Capabilities, ConfigCapabilities, Display, EncoderSupport, Entrypoint, Frame, GuestWrites,
     H264Decoder, HevcDecoder, ImportWrites, PlaneRows, Profile, encoder_support,
 };
+use reims_vgpu_vulkan::core::platform::Handle as _;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::decode::{GraphicsVideo, GraphicsVideoSession, PlanePages};
 use reims_vgpu_vulkan::VulkanPlatform;

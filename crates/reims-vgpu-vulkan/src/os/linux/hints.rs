@@ -137,7 +137,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use reims_vgpu_core::platform::os::Threads;
+    use crate::core::platform::os::Threads;
 
     use super::super::LinuxThreads;
     use super::*;

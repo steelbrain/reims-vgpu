@@ -12,8 +12,8 @@
 //!   buffer) goes at the pool's pop, so no uncommitted buffer outlives the call and holds one of
 //!   its queue's 64 slots.
 
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::rt::{Held, Hold, Pool, enter_ours};
+use reims_vgpu_vulkan::core::raise::RaiseResult;
+use reims_vgpu_vulkan::core::rt::{Held, Hold, Pool, enter_ours};
 
 /// A raise that reaches an entry point: nothing catches it there, so it ends the process.
 pub(crate) fn no_catch<T>(r: RaiseResult<T>) -> T {
@@ -38,8 +38,8 @@ pub(crate) fn run<T>(body: impl for<'u> FnOnce(Hold<'u>) -> T) -> T {
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::rt::is_our_thread;
-    use reims_vgpu_core::sync::Mutex;
+    use reims_vgpu_vulkan::core::rt::is_our_thread;
+    use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::*;
 

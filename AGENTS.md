@@ -145,7 +145,7 @@ The video crates' checks:
   ```sh
   ulimit -c 0
   scripts/internal/gpu-locks.sh --all -- cargo nextest run --workspace --no-fail-fast \
-    --features reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan
+    --features reims-vgpu-vulkan/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan
   scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^vaapi::/)'   # the VA-API host
   scripts/internal/gpu-locks.sh --all -- cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^nvidia::/)'  # the NVIDIA host
   ```

@@ -35,7 +35,7 @@
 //! ([`super::extended_range`]), would take the signed normalized formats (the most negative code
 //! one up) and `Depth32Float` (the sign bit cleared, where a draw of the pass writes depth).
 
-use reims_vgpu_core::platform::Platform;
+use crate::core::platform::Platform;
 
 use super::{
     Aspect, CLEAR, DEPTH32F, DONT_CARE, Draw, IN_TILE_1_1, LOAD, Pass, STENCIL8, STORE, Shape,
@@ -116,7 +116,7 @@ fn unreached_tiles_keep_their_bytes_under_load_and_dont_care() {
                 for drawn in [false, true] {
                     let case = format!("{format} {size:?} load {load} drawn {drawn}");
                     let o = probe((&p, &d), (format, size), (load, drawn));
-                    if !reims_vgpu_core::metal_matches_raw!(&case, o) {
+                    if !crate::metal_matches_raw!(&case, o) {
                         let kind = metal2vulkan_runtime::Degradation::DontCareLoadTiles;
                         assert!(load == DONT_CARE && heard(kind), "{case}: off Metal's");
                         differ.push(case);

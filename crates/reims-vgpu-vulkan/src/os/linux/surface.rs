@@ -62,14 +62,14 @@ use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use reims_vgpu_core::host::{HostPtr, PhysicalMemoryRange};
-use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::os::surface::{
+use crate::core::host::{HostPtr, PhysicalMemoryRange};
+use crate::core::num::{ToU64, ToUsize};
+use crate::core::platform::os::surface::{
     BackingSurfaceSpec, IoSurfaces, Surface, SurfacePlaneSpec, SurfaceSpec,
 };
-use reims_vgpu_core::platform::os::vm::{HostVm as _, KernReturn, VmProt};
-use reims_vgpu_core::platform::{Handle, ObjId};
-use reims_vgpu_core::sync::Mutex;
+use crate::core::platform::os::vm::{HostVm as _, KernReturn, VmProt};
+use crate::core::platform::{Handle, ObjId};
+use crate::core::sync::Mutex;
 
 use super::vm::{LinuxVm, OwnMemory, allocate_aliasable};
 use crate::gpu::backing::Alias;
@@ -661,7 +661,7 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::os::surface::BackingPlaneSpec;
+    use crate::core::platform::os::surface::BackingPlaneSpec;
 
     use super::super::vm::tests::mapped;
     use super::*;
@@ -1041,7 +1041,7 @@ mod tests {
     /// the range is made at once
     #[test]
     fn a_single_range_surfaces_hold_is_its_range() {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use crate::core::platform::os::vm::HostVm as _;
 
         let page = page_size();
         let (at, ranges) = guest_pages(4);
@@ -1084,7 +1084,7 @@ mod tests {
     #[test]
     fn a_surface_lends_its_view_as_its_buffers_alias() {
         use super::super::vm::tests::writable;
-        use reims_vgpu_core::platform::os::vm::HostAddr;
+        use crate::core::platform::os::vm::HostAddr;
 
         let page = page_size();
         let (at, ranges) = guest_pages(3);

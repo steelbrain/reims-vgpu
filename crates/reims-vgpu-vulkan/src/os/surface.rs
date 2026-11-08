@@ -5,9 +5,9 @@
 
 use std::sync::{Arc, Weak};
 
+use crate::core::num::{ToU64, ToUsize};
+use crate::core::platform::os::surface::Surface;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::os::surface::Surface;
 
 use super::{OsSurface, host_os};
 use crate::gpu::backing::Alias;
@@ -324,10 +324,10 @@ pub(crate) fn page_runs(pages: impl IntoIterator<Item = (u64, u64)>) -> Vec<std:
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use reims_vgpu_core::host::{HostPtr, PhysicalMemoryRange};
-    use reims_vgpu_core::platform::Handle as _;
-    use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
-    use reims_vgpu_core::platform::os::vm::HostVm as _;
+    use crate::core::host::{HostPtr, PhysicalMemoryRange};
+    use crate::core::platform::Handle as _;
+    use crate::core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
+    use crate::core::platform::os::vm::HostVm as _;
 
     use super::*;
     use crate::os::{OsSurfaces, OsVm, allocate_aliasable};

@@ -4,7 +4,7 @@
 //! halves and into floats. The same probes run for every member: a surface's shape is its
 //! OSType's ([`Shape`]), and the texture's format is a parameter of each probe ([`probes`]).
 //! Floats show a texel's value at full precision; a kernel that reads into halves rounds it.
-use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfacePlaneSpec, SurfaceSpec};
+use crate::core::platform::os::surface::{IoSurfaces as _, SurfacePlaneSpec, SurfaceSpec};
 
 use crate::os::{OsSurface, OsSurfaces};
 

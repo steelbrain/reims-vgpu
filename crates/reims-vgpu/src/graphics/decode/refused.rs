@@ -39,7 +39,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use reims_vgpu_core::raise::{Origin, Raise, RaiseResult};
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
     RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_BUFFER_OVER_PAGES,
@@ -52,6 +51,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
     RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE, RgfxObjectCreate,
 };
+use reims_vgpu_vulkan::core::raise::{Origin, Raise, RaiseResult};
 
 use super::read;
 

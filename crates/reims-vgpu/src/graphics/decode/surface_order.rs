@@ -55,13 +55,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
 use reims_vgpu_graphics::ops::RgfxSurfaceOrderWait;
 use reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult, refusals};
 
 use super::commit_order;
 
@@ -716,10 +716,6 @@ mod tests {
 
     use std::sync::atomic::Ordering;
 
-    use reims_vgpu_core::sync::Mutex;
-    use reims_vgpu_core::testkit::calllog::{Arg, Call};
-    use reims_vgpu_core::testkit::objects::CompleteOn;
-    use reims_vgpu_core::testkit::{FakePlatform, Step};
     use reims_vgpu_graphics::ops::{
         RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
         RgfxCommandBuffer, RgfxOpHeader,
@@ -729,6 +725,10 @@ mod tests {
         RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_EVT_CB_SUBMITTED, RgfxMsgHeader, RgfxObjectDestroy,
         RgfxQueueCreate,
     };
+    use reims_vgpu_vulkan::core::sync::Mutex;
+    use reims_vgpu_vulkan::core::testkit::calllog::{Arg, Call};
+    use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
+    use reims_vgpu_vulkan::core::testkit::{FakePlatform, Step};
     use zerocopy::IntoBytes;
 
     use super::super::{DecodeError, GraphicsDecoder, refusing};

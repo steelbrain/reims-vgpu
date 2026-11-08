@@ -21,20 +21,6 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::icb::{
-    IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-};
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::platform::values::{
-    ColorAttachmentDesc, ColorAttachmentSet, FullRenderPipelineDesc, LinkedFunctionsDesc,
-    TextureDesc,
-};
-use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_graphics::icb::{
     RGFX_ICB_OP_DRAW, RGFX_ICB_SLOT_ACTION, RGFX_ICB_SLOT_BUFFER_0, RGFX_ICB_SLOT_PIPELINE,
     RgfxIcbDraw, RgfxIcbRenderSlot, RgfxIcbSlotBuffer,
@@ -44,6 +30,20 @@ use reims_vgpu_graphics::wire::{
     RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN,
     RGFX_ICB_SLOTS_RENDER, RgfxIcbCreate, RgfxIcbSlotRun, RgfxIcbSlots, RgfxMsgHeader,
 };
+use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::icb::{
+    IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+};
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _};
+use reims_vgpu_vulkan::core::platform::types::NsRange;
+use reims_vgpu_vulkan::core::platform::values::{
+    ColorAttachmentDesc, ColorAttachmentSet, FullRenderPipelineDesc, LinkedFunctionsDesc,
+    TextureDesc,
+};
+use reims_vgpu_vulkan::core::raise::OnFault;
 use zerocopy::IntoBytes;
 
 use super::draw_cost::{Counts, FIGURES, counts, fixture, spread};
@@ -389,7 +389,7 @@ fn measure<P: ApiPlatform>(
     let only = only.as_deref();
     let message = message();
     let executed = std::env::var("ICB_SLOTS_COST_EXECUTED").is_ok_and(|v| v == "1");
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
     #[cfg(target_os = "macos")]
     // SAFETY: sets this thread's own class, which takes no pointer.
     unsafe {

@@ -41,8 +41,8 @@ use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
-use reims_vgpu_core::num::ToU64 as _;
-use reims_vgpu_core::sync::Mutex;
+use crate::core::num::ToU64 as _;
+use crate::core::sync::Mutex;
 
 use crate::os::GuestRamFile;
 

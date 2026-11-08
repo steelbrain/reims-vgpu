@@ -5,7 +5,7 @@
 //! **The display thread.** A graphics device queues its host's cursor callbacks onto one core
 //! [`SerialQueue`], made at the process's first device whose host takes them (`graphics`'
 //! `HostCursor`), so every display callback of the process runs one at a time in the order it
-//! was queued. The queue's worker exits after [`reims_vgpu_core::rt::queue::IDLE_EXIT`] idle and
+//! was queued. The queue's worker exits after [`reims_vgpu_vulkan::core::rt::queue::IDLE_EXIT`] idle and
 //! the next job starts another. The library never waits for it, and a queue's drop joins nothing.
 //!
 //! **By platform.** The Vulkan platform's `ApiPlatform` is `platform/vulkan.rs`.
@@ -13,10 +13,10 @@
 use std::any::Any;
 use std::sync::{Arc, OnceLock, Weak};
 
-use reims_vgpu_core::host::HostQueue;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::rt::{Executor, Job, SerialQueue};
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::host::HostQueue;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::rt::{Executor, Job, SerialQueue};
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use crate::memory::MemoryMap;
 
@@ -141,8 +141,8 @@ pub(crate) use vulkan::host_dma_buf;
 
 #[cfg(any(test, feature = "testkit"))]
 mod fake {
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_core::testkit::platform::FAKE_REGISTRY_ID;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::platform::FAKE_REGISTRY_ID;
 
     use super::*;
 
@@ -180,7 +180,7 @@ mod fake {
 mod tests {
     use std::sync::mpsc;
 
-    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
 
     use super::*;
 
@@ -219,8 +219,8 @@ mod tests {
     /// the platform answers for it, and none for an ID no device has (`UINT64_MAX`)
     #[test]
     fn vulkan_devices_by_registry_id() {
-        use reims_vgpu_core::platform::Handle as _;
         use reims_vgpu_vulkan::VulkanPlatform;
+        use reims_vgpu_vulkan::core::platform::Handle as _;
 
         let p = VulkanPlatform::new();
         let d = p.metal_device(None).expect("a Vulkan device (MoltenVK)");
@@ -238,8 +238,8 @@ mod tests {
     fn the_vulkan_lease_lets_views_be_made_of_the_guests_ram() {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
-        use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _};
         use reims_vgpu_vulkan::VulkanPlatform;
+        use reims_vgpu_vulkan::core::platform::os::vm::{HostAddr, HostVm as _};
         use reims_vgpu_vulkan::os::OsVm;
 
         use crate::memory::MemoryFile;

@@ -33,24 +33,26 @@
     unsafe_code
 )]
 
-use reims_vgpu_core::host::{HostPtr, PhysicalMemoryRange};
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::os::surface::SurfaceSpec;
-use reims_vgpu_core::platform::os::vm::HostVm;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
-use reims_vgpu_core::platform::resource::{Buffer, Library, Texture};
-use reims_vgpu_core::platform::types::{
+use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::host::{HostPtr, PhysicalMemoryRange};
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::os::surface::SurfaceSpec;
+use reims_vgpu_vulkan::core::platform::os::vm::HostVm;
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder};
+use reims_vgpu_vulkan::core::platform::resource::{Buffer, Library, Texture};
+use reims_vgpu_vulkan::core::platform::types::{
     ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange, Swizzle,
 };
-use reims_vgpu_core::platform::values::{ColorAttachmentSet, RenderPipelineDesc, TextureDesc};
-use reims_vgpu_core::platform::{HostRange, Platform};
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::testkit::capture::catch_death;
-use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::platform::values::{
+    ColorAttachmentSet, RenderPipelineDesc, TextureDesc,
+};
+use reims_vgpu_vulkan::core::platform::{HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::OnFault;
+use reims_vgpu_vulkan::core::testkit::capture::catch_death;
 use reims_vgpu_vulkan::gpu::resource::VulkanTexture;
 use reims_vgpu_vulkan::os::OsVm;
 
@@ -1182,7 +1184,7 @@ fn pass<P: Platform>(
     attachment: &ColorAttachmentSet<'_, P>,
     visibility: Option<&P::Buffer>,
 ) -> P::RenderPassDescriptor {
-    use reims_vgpu_core::platform::values::PassSet;
+    use reims_vgpu_vulkan::core::platform::values::PassSet;
     let pass = p.render_pass_descriptor();
     pass.set_color_attachment(OnFault::Die, 0, attachment)
         .unwrap();
@@ -1497,7 +1499,7 @@ fn read_only_textures_answer_metals_usage() {
         &VulkanPlatform::new(),
         &VulkanPlatform::system_default_device().unwrap(),
     );
-    reims_vgpu_core::metal_check!("usages", vulkan);
+    reims_vgpu_vulkan::metal_check!("usages", vulkan);
 }
 
 /// The tests' vertex function that returns nothing (`src/gpu/unrasterized.metal`).
@@ -1508,7 +1510,7 @@ const UNRASTERIZED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unrasteriz
 /// command buffer's status. Its vertex function returns nothing (`void_vertex`), and colour 0 is
 /// `BGRA8Unorm`.
 fn unrasterized_write<P: Platform>(p: &P, d: &P::Device) -> u64 {
-    use reims_vgpu_core::platform::values::{ColorAttachmentDesc, FullRenderPipelineDesc};
+    use reims_vgpu_vulkan::core::platform::values::{ColorAttachmentDesc, FullRenderPipelineDesc};
     let q = d.new_command_queue().unwrap();
     let (_s, t) = read_only_texture(p, d, &bgra(p, (64, 16), 3, 1));
     let own = d

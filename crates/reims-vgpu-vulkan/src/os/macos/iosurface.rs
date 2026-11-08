@@ -11,6 +11,13 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
+use crate::core::host::{HostPtr, PhysicalMemoryRange};
+use crate::core::num::ToU64;
+use crate::core::platform::os::surface::{
+    BackingPlaneSpec, BackingSurfaceSpec, SurfacePlaneSpec, SurfaceSpec,
+};
+use crate::core::platform::os::vm::KernReturn;
+use crate::core::platform::{Handle, ObjId};
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -24,13 +31,6 @@ use objc2_io_surface::{
     IOSurfacePropertyKeyPlaneInfo, IOSurfacePropertyKeyPlaneOffset, IOSurfacePropertyKeyPlaneWidth,
     IOSurfacePropertyKeyWidth, IOSurfaceRef,
 };
-use reims_vgpu_core::host::{HostPtr, PhysicalMemoryRange};
-use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::os::surface::{
-    BackingPlaneSpec, BackingSurfaceSpec, SurfacePlaneSpec, SurfaceSpec,
-};
-use reims_vgpu_core::platform::os::vm::KernReturn;
-use reims_vgpu_core::platform::{Handle, ObjId};
 
 use super::msg::{fatal_send, value};
 
@@ -170,7 +170,7 @@ impl Handle for MacSurface {
     }
 }
 
-impl reims_vgpu_core::platform::os::surface::Surface for MacSurface {
+impl crate::core::platform::os::surface::Surface for MacSurface {
     fn retain_count(&self) -> i64 {
         // SAFETY: a live CF object this value holds a reference to.
         let n = unsafe { CFGetRetainCount(self.ptr.as_ptr().cast_const().cast()) };
@@ -572,9 +572,9 @@ impl MacSurfaces {
 mod tests {
 
     use super::*;
+    use crate::core::platform::os::surface::{Surface, SurfaceComponentSpec};
+    use crate::core::platform::os::vm::HostVm;
     use objc2::runtime::AnyObject;
-    use reims_vgpu_core::platform::os::surface::{Surface, SurfaceComponentSpec};
-    use reims_vgpu_core::platform::os::vm::HostVm;
 
     const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 

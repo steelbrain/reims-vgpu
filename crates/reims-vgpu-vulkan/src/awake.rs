@@ -72,10 +72,10 @@ use std::sync::{Arc, OnceLock};
 use std::thread::Thread;
 use std::time::Duration;
 
+use crate::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
+use crate::core::sync::{Mutex, MutexGuard};
 use ash::vk;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::os::clock::{Clock as _, Deadline, MonoTime};
-use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 /// How long after the guest's last GPU work the GPU is kept awake.
 pub(crate) const AWAKE_FOR: Duration = Duration::from_secs(5 * 60);

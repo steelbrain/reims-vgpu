@@ -33,8 +33,8 @@ use objc2::{MainThreadMarker, Message};
 use objc2_app_kit::{NSApp, NSApplication};
 use objc2_core_foundation::{CFRunLoop, kCFRunLoopCommonModes};
 use objc2_foundation::NSString;
-use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::rt::BlockEnv;
+use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_vulkan::os::msg;
 
 /// Work for the main thread.

@@ -6,7 +6,7 @@
 //!
 //! - **Asked for by name.** [`start`] makes the thread only where `REIMS_VGPU_LOG` names the
 //!   target itself at debug as the device is adopted (`info,reims_vgpu::work=debug`, the lane
-//!   benches' filter: `reims_vgpu_core::logging::names`). A lone level, such as the `debug` a
+//!   benches' filter: `crate::core::logging::names`). A lone level, such as the `debug` a
 //!   bug report's log asks for, and a pair of a target above it (`reims_vgpu=debug`) start none,
 //!   though they write the target's lines: reading the counts costs the draws it counts (below).
 //! - **Off, it costs nothing.** No thread is made, and the thread reads no count while the
@@ -28,8 +28,8 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use crate::core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 
 /// The log target of the lines, at debug, which the filter names to start them ([`start`]).
 pub(crate) const TARGET: &str = "reims_vgpu::work";
@@ -43,7 +43,7 @@ type Flat = Vec<(String, u64)>;
 /// Starts the thread that logs `device`'s counts (the module docs), where the filter names the
 /// target at debug and its lines are written.
 pub(crate) fn start(device: &rt::Device) {
-    if !(reims_vgpu_core::logging::names(TARGET, log::Level::Debug)
+    if !(crate::core::logging::names(TARGET, log::Level::Debug)
         && log::log_enabled!(target: TARGET, log::Level::Debug))
     {
         return;

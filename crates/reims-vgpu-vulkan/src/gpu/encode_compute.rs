@@ -47,13 +47,13 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 
+use crate::core::platform::Handle as _;
+use crate::core::platform::blit::ResourceRef;
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use crate::core::platform::types::NsRange;
+use crate::core::raise::{OnFault, RaiseResult};
 use metal2vulkan::metal::{BarrierScope, DispatchType, ResourceUsage};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
 use crate::answer::{Policy, plain, send, unrepresentable};
 use crate::gpu::command::executions::{self, Execution, Points};
@@ -498,17 +498,17 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::command::{CommandBuffer, CommandQueue};
+    use crate::core::platform::descriptor::TextureDescriptor as _;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::resource::{Buffer as _, Library as _};
+    use crate::core::platform::types::MtlSize;
+    use crate::core::platform::values::{ComputePassDesc, TextureDesc};
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
     use metal2vulkan::bind::SamplerDescriptor;
     use metal2vulkan::metal::SamplerAddressMode;
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-    use reims_vgpu_core::platform::types::MtlSize;
-    use reims_vgpu_core::platform::values::{ComputePassDesc, TextureDesc};
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::command::VulkanCommandBuffer;
@@ -597,7 +597,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_dispatch_through_a_read_only_surface_dies_on_linux() {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::on_read_only_surface;
         use crate::os::{OsVm, PAGE};
@@ -667,7 +667,7 @@ mod tests {
     /// the pages on Linux, and Metal's read-only view on macOS. The kernel reads it as the pages
     #[test]
     fn a_kernel_store_into_a_read_only_buffer_is_dropped() {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::{host_bytes_at, read_only_buffer};
         use crate::os::{OsVm, PAGE};
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement, run by hand: prints the times"]
     fn dispatches_after_a_large_residency() {
-        use reims_vgpu_core::platform::os::Clock as _;
+        use crate::core::platform::os::Clock as _;
         let now = || crate::os::OsClock::new().now_mono();
         let add = pipeline(ADD, "add_one");
         let (input, out) = (shared(1024), shared(1024));
@@ -1060,8 +1060,8 @@ mod tests {
     /// of the buffer, whose command dispatches nothing
     #[test]
     fn a_dispatch_after_an_icb_made_writable_runs() {
-        use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
-        use reims_vgpu_core::platform::values::IcbDesc;
+        use crate::core::platform::icb::IndirectCommandBuffer as _;
+        use crate::core::platform::values::IcbDesc;
 
         let d = dev();
         d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();

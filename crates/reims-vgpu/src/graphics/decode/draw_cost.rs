@@ -31,17 +31,6 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _, VertexDraw};
-use reims_vgpu_core::platform::resource::Library as _;
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::platform::values::{
-    ColorAttachmentDesc, ColorAttachmentSet, FullRenderPipelineDesc, SamplerDesc, TextureDesc,
-};
-use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_graphics::ops::render::{
     RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_FRAGMENT_BUFFER,
     RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
@@ -60,6 +49,17 @@ use reims_vgpu_graphics::wire::{
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxBufferOverHostMemory, RgfxMsgHeader,
     RgfxQueueCreate,
 };
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _, VertexDraw};
+use reims_vgpu_vulkan::core::platform::resource::Library as _;
+use reims_vgpu_vulkan::core::platform::types::NsRange;
+use reims_vgpu_vulkan::core::platform::values::{
+    ColorAttachmentDesc, ColorAttachmentSet, FullRenderPipelineDesc, SamplerDesc, TextureDesc,
+};
+use reims_vgpu_vulkan::core::raise::OnFault;
 use zerocopy::IntoBytes;
 
 use super::{GraphicsDecoder, ObjHandle};
@@ -562,7 +562,7 @@ impl<P: ApiPlatform> Bench<P> {
         let region = reims_vgpu_graphics::region::Region::new(region_size as usize).unwrap();
         let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::new(region));
         let (tx, completed) = mpsc::channel();
-        let tx = reims_vgpu_core::sync::Mutex::new(tx);
+        let tx = reims_vgpu_vulkan::core::sync::Mutex::new(tx);
         decoder.set_completion_sink(Arc::new(move |m| {
             let _ = tx.lock().send(m.cb_obj_id);
         }));
@@ -990,7 +990,7 @@ fn measure<P: ApiPlatform>(
             })
             .collect::<Vec<_>>()
     };
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
     // On a Mac, the thread asks for the performance cores, which an efficiency core's slower
     // draws would otherwise mix into the figures.
     #[cfg(target_os = "macos")]

@@ -24,7 +24,7 @@ fn level(format: u64, width: u64, height: u64) -> TextureLevelQuery {
 /// rule where this module died before
 #[test]
 fn levels_are_metals() {
-    use reims_vgpu_core::platform::device::GpuDevice as _;
+    use crate::core::platform::device::GpuDevice as _;
 
     use crate::gpu::device::tests::dev;
 
@@ -44,7 +44,7 @@ fn levels_are_metals() {
     // A format's levels, ours checked against Metal's, recorded a format at a time.
     let mut compare = |key: String, queries: Vec<TextureLevelQuery>| {
         let ours: Vec<_> = queries.iter().map(|q| d.texture_level_info(q)).collect();
-        if !reims_vgpu_core::metal_matches_raw!(key, ours) {
+        if !crate::metal_matches_raw!(key, ours) {
             differ.push(format!("{key}: ours differ from Metal's"));
         }
     };
@@ -94,7 +94,7 @@ fn levels_are_metals() {
 /// the device answers them; a format is named as the runtime names it
 #[test]
 fn descriptions_are_metals() {
-    use reims_vgpu_core::platform::device::GpuDevice as _;
+    use crate::core::platform::device::GpuDevice as _;
 
     use crate::gpu::device::tests::dev;
 
@@ -121,6 +121,6 @@ fn descriptions_are_metals() {
     let values = (0..2048).chain([9999, u64::from(u32::MAX) + 70, (1 << 32) + 80]);
     for format in values {
         let key = format!("format {format}");
-        reims_vgpu_core::metal_check!(key, d.pixel_format_info(format));
+        crate::metal_check!(key, d.pixel_format_info(format));
     }
 }

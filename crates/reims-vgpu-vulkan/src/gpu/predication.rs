@@ -120,17 +120,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, Range};
 use std::sync::{Arc, Weak};
 
+use crate::core::num::Truncate;
+use crate::core::platform::Handle;
+use crate::core::platform::blit::ResourceRef;
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+use crate::core::platform::types::{MtlRegion, MtlSize, NsRange};
+use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::rt::BlockEnv;
+use crate::core::sync::Mutex;
 use metal2vulkan::metal::{BarrierScope, DispatchType, ResourceUsage};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::Truncate;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange};
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{Policy, metal_aborts, plain, refused, send};
 use crate::gpu::command::{CommandBufferObject, VulkanCommandBuffer};
@@ -2454,17 +2454,17 @@ pub fn end_do_while(
 
 #[cfg(test)]
 mod tests {
-    use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::event::EventRef;
-    use reims_vgpu_core::platform::icb::{
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::event::EventRef;
+    use crate::core::platform::icb::{
         IcbComputeCmd, IndirectCommandBuffer as _, IndirectComputeCommand as _,
     };
-    use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-    use reims_vgpu_core::platform::values::{ComputePassDesc, IcbDesc};
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::resource::{Buffer as _, Library as _};
+    use crate::core::platform::values::{ComputePassDesc, IcbDesc};
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
+    use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
 
     use super::*;
     use crate::gpu::command::{QueueObject, VulkanCommandBuffer};
@@ -3305,7 +3305,7 @@ mod tests {
         });
     }
 
-    reims_vgpu_core::death_test!(
+    crate::death_test!(
         /// A loop still running after its iterations laid down ends the process at the command
         /// buffer's completion, at its End's selector: Metal would run it on
         a_loop_past_its_copies_dies_at_completion,

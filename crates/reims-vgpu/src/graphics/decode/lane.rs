@@ -52,8 +52,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::os::Threads;
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::platform::os::Threads;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 /// The most threads a lane runs its jobs on at once: its own and the budget's.
 pub(crate) const LANE_THREADS: usize = 4;
@@ -643,7 +643,9 @@ mod tests {
             Arc::new(HintLog(Arc::clone(&self.0)))
         }
 
-        fn timer_clock(&self) -> Option<Arc<dyn reims_vgpu_core::platform::os::TimerClock>> {
+        fn timer_clock(
+            &self,
+        ) -> Option<Arc<dyn reims_vgpu_vulkan::core::platform::os::TimerClock>> {
             None
         }
     }

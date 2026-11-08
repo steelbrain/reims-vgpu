@@ -34,9 +34,6 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::values::{FullRenderPipelineDesc, SamplerDesc, TextureDesc};
-use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_graphics::ops::render::{
     RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_MEMORY_BARRIER_WITH_SCOPE,
     RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
@@ -55,6 +52,9 @@ use reims_vgpu_graphics::wire::{
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxBufferOverHostMemory, RgfxCbComplete,
     RgfxMsgHeader, RgfxQueueCreate,
 };
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::values::{FullRenderPipelineDesc, SamplerDesc, TextureDesc};
+use reims_vgpu_vulkan::core::raise::OnFault;
 use zerocopy::IntoBytes;
 
 use super::draw_cost::{counts, fixture, over, spread};
@@ -313,7 +313,7 @@ impl<P: ApiPlatform> Bench<P> {
         }
         let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::new(region));
         let (tx, completed) = mpsc::channel();
-        let tx = reims_vgpu_core::sync::Mutex::new(tx);
+        let tx = reims_vgpu_vulkan::core::sync::Mutex::new(tx);
         decoder.set_completion_sink(Arc::new(move |m| {
             let _ = tx.lock().send((m, Instant::now()));
         }));
@@ -406,7 +406,7 @@ impl<P: ApiPlatform> Bench<P> {
 #[allow(clippy::disallowed_methods)] // a measurement: real time is what it measures
 fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
     let shape = bench.shape;
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
     // On a Mac, the thread asks for the performance cores, as a lane's thread is mostly on one.
     #[cfg(target_os = "macos")]
     // SAFETY: sets this thread's own class, which takes no pointer.

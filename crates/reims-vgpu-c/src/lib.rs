@@ -57,11 +57,11 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub(crate) type Plat = reims_vgpu::VulkanPlatform;
 /// The platform every handle is made on: core's testkit platform in this crate's unit tests.
 #[cfg(test)]
-pub(crate) type Plat = reims_vgpu_core::testkit::FakePlatform;
+pub(crate) type Plat = reims_vgpu_vulkan::core::testkit::FakePlatform;
 
 /// Ends the process: `call` was given a NULL handle it cannot answer without one.
 pub(crate) fn null_handle(call: &'static str) -> ! {
-    use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal};
+    use reims_vgpu_vulkan::core::raise::death::{DeathId, DeathKind, fatal};
     fatal(DeathId::Platform {
         kind: DeathKind::NullDeref,
         call,

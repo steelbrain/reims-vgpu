@@ -26,25 +26,25 @@ use std::fmt;
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock, Weak};
 
-use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::caps::{DeviceCaps, IdentityCaps};
-use reims_vgpu_core::platform::device::{GpuDevice, NoCopyDeallocator};
-use reims_vgpu_core::platform::os::vm::HostVm;
-use reims_vgpu_core::platform::types::{
+use crate::core::host::HostPtr;
+use crate::core::platform::caps::{DeviceCaps, IdentityCaps};
+use crate::core::platform::device::{GpuDevice, NoCopyDeallocator};
+use crate::core::platform::os::vm::HostVm;
+use crate::core::platform::types::{
     ArgumentKind, ArgumentLayout, ArgumentMember, NsErrorText, PixelFormatInfo,
     ResourceAddressRange, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
-use reims_vgpu_core::platform::values::{
+use crate::core::platform::values::{
     ArgumentDesc, BufferDeallocator, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
     FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
     PagesInPlace, PagesPlane, RenderPipelineDesc, SamplerDesc,
 };
-use reims_vgpu_core::platform::{Handle, HostRange};
-use reims_vgpu_core::raise::{Kept, OnFault, RaiseResult, keep_forever};
-use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_core::sync::Mutex;
+use crate::core::platform::{Handle, HostRange};
+use crate::core::raise::{Kept, OnFault, RaiseResult, keep_forever};
+use crate::core::rt::BlockEnv;
+use crate::core::sync::Mutex;
+use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
+use metal2vulkan_runtime as rt;
 
 use crate::answer::{
     Nil, Policy, create, created_or_decided, decide, error_text, get, get_describing, hearing,
@@ -129,7 +129,7 @@ pub struct OnSurface<'a> {
 
 impl fmt::Display for OnSurface<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use reims_vgpu_core::platform::os::surface::Surface as _;
+        use crate::core::platform::os::surface::Surface as _;
         let OnSurface {
             fields,
             surface,
@@ -739,7 +739,7 @@ impl VulkanDevice {
         shares: Option<&rt::Buffer>,
         nil: Nil,
     ) -> RaiseResult<Option<rt::Buffer>> {
-        use reims_vgpu_core::platform::os::surface::Surface as _;
+        use crate::core::platform::os::surface::Surface as _;
         let held = Arc::clone(surface);
         let run: rt::Deallocator = Box::new(move |_, _| {
             let _env = BlockEnv::foreign();
@@ -1073,7 +1073,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         &self,
         iosurface: Option<&OsSurface>,
     ) -> RaiseResult<Option<VulkanBuffer>> {
-        use reims_vgpu_core::platform::os::surface::Surface as _;
+        use crate::core::platform::os::surface::Surface as _;
         let sel = "newBufferWithIOSurface:";
         let surface = iosurface.unwrap_or_else(|| unrepresentable(sel, "a nil IOSurface"));
         let _making = SURFACE_BUFFER_MAKES.lock();
@@ -1516,8 +1516,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         // Metal asserts at a plane past 0 of a surface without planes, whatever the format
         // ("IOSurface is non-planar, but plane 1 specified"), and answers nil at a plane past a
         // planar surface's last (measured: `textures_over_planes_a_surface_lacks_are_metals`).
-        if plane != 0 && reims_vgpu_core::platform::os::surface::Surface::plane_count(surface) == 0
-        {
+        if plane != 0 && crate::core::platform::os::surface::Surface::plane_count(surface) == 0 {
             metal_aborts(sel, &format!("plane {plane} of a surface without planes"));
         }
         let Some(mut at) = crate::os::plane(surface, plane) else {
@@ -1538,7 +1537,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         // command buffer that used the texture completed, as Metal frees it ([`metal_space::Hold`]).
         let space = Arc::new(metal_space::surface(
             surface.id().0,
-            reims_vgpu_core::platform::os::surface::Surface::alloc_size(&*surface),
+            crate::core::platform::os::surface::Surface::alloc_size(&*surface),
         ));
         let token: rt::RangeToken = Box::new(Arc::clone(&space));
         let Some(buffer) = self.buffer_over_surface(sel, &surface, token)? else {
@@ -2125,10 +2124,10 @@ pub(crate) fn two_plane_xr10(pf: metal2vulkan::metal::PixelFormat) -> bool {
 pub(crate) mod tests {
     use std::sync::LazyLock;
 
-    use reims_vgpu_core::platform::Handle;
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::Handle;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
 
@@ -2158,7 +2157,7 @@ pub(crate) mod tests {
 
     /// The one function of a fixture metallib.
     pub(crate) fn fixture_function(bytes: &[u8]) -> VulkanFunction {
-        use reims_vgpu_core::platform::resource::Library as _;
+        use crate::core::platform::resource::Library as _;
         let library = dev().new_library(bytes).unwrap().unwrap().unwrap();
         let name = library.function_names().remove(0);
         library
@@ -2176,8 +2175,8 @@ pub(crate) mod tests {
     /// its write mask; Metal's defaults for those unnamed.
     pub(crate) fn colours_of(
         colours: &[&[(u8, u32)]],
-    ) -> Vec<(u64, reims_vgpu_core::platform::values::ColorAttachmentDesc)> {
-        use reims_vgpu_core::platform::values::ColorAttachmentDesc;
+    ) -> Vec<(u64, crate::core::platform::values::ColorAttachmentDesc)> {
+        use crate::core::platform::values::ColorAttachmentDesc;
         colours
             .iter()
             .map(|properties| {
@@ -2206,12 +2205,12 @@ pub(crate) mod tests {
     /// The whole render value of `vertex` and `fragment` into `colours` ([`colours_of`]) at
     /// `samples` samples, Metal's defaults elsewhere.
     #[cfg(target_os = "macos")]
-    pub(crate) fn render_value<'a, P: reims_vgpu_core::platform::Platform>(
+    pub(crate) fn render_value<'a, P: crate::core::platform::Platform>(
         (vertex, fragment): (&'a P::Function, &'a P::Function),
         samples: u64,
         colours: &[&[(u8, u32)]],
-    ) -> reims_vgpu_core::platform::values::FullRenderPipelineDesc<'a, P> {
-        use reims_vgpu_core::platform::values::FullRenderPipelineDesc;
+    ) -> crate::core::platform::values::FullRenderPipelineDesc<'a, P> {
+        use crate::core::platform::values::FullRenderPipelineDesc;
         FullRenderPipelineDesc {
             colors: colours_of(colours),
             raster_sample_count: samples,
@@ -2259,7 +2258,7 @@ pub(crate) mod tests {
             kept(registry_id(&raw)).is_none(),
             "the test's process adopted a device before"
         );
-        use reims_vgpu_core::platform::os::Clock as _;
+        use crate::core::platform::os::Clock as _;
         let device = adopt(raw);
         let clock = crate::os::OsClock::new();
         let began = clock.now_mono();
@@ -2279,8 +2278,8 @@ pub(crate) mod tests {
     /// runtime's layout, Metal's rules, reaches the guest unchanged
     #[test]
     fn argument_layouts_are_metals() {
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::platform::types::ArgumentKind as K;
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::types::ArgumentKind as K;
         let d = dev();
         let arg = |data_type: u64, index: u64, array_length: u64| ArgumentDesc {
             data_type,
@@ -2384,9 +2383,9 @@ pub(crate) mod tests {
     /// refusal: the held range the pin met.
     #[test]
     fn a_pinned_buffer_the_runtime_refuses_logs_why() {
-        use reims_vgpu_core::platform::resource::Buffer;
-        use reims_vgpu_core::platform::values::OptionSet;
-        use reims_vgpu_core::testkit::logs;
+        use crate::core::platform::resource::Buffer;
+        use crate::core::platform::values::OptionSet;
+        use crate::core::testkit::logs;
         let d = dev();
         let pin = metal_space::END / 4 + 0x100_0000;
         let pinned = || BufferDesc {
@@ -2424,11 +2423,11 @@ pub(crate) mod tests {
     /// the runtime's granule make none.
     #[test]
     fn a_heap_over_host_memory_lies_in_its_bytes() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-        use reims_vgpu_core::platform::resource::{Buffer, Heap};
-        use reims_vgpu_core::platform::types::NsRange;
-        use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder};
+        use crate::core::platform::command::{CommandBuffer, CommandQueue};
+        use crate::core::platform::resource::{Buffer, Heap};
+        use crate::core::platform::types::NsRange;
+        use crate::core::platform::values::{HeapDesc, OptionSet};
         let d = dev();
         // Private anonymous memory, as the graphics device's region is, kept for the process.
         let layout = std::alloc::Layout::from_size_align(0x2_0000, 0x4000).unwrap();
@@ -2505,7 +2504,7 @@ pub(crate) mod tests {
     /// the pin, as the runtime would make it and Metal's answer there is not measured
     #[test]
     fn sparse_heaps_die_at_pins_the_space_refuses() {
-        use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+        use crate::core::platform::values::{HeapDesc, OptionSet};
         let d = dev();
         let sparse = |pin: Option<u64>| HeapDesc {
             size: 0x40000,
@@ -2544,8 +2543,8 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_buffer_is_vouched_for_while_its_pages_are_writable() {
-        use reims_vgpu_core::num::ToUsize as _;
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::os::vm::HostVm as _;
 
         const PAGE: u64 = 0x1000;
         let d = dev();
@@ -2607,10 +2606,10 @@ pub(crate) mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-        use reims_vgpu_core::platform::resource::Buffer;
-        use reims_vgpu_core::platform::types::CommandBufferStatus;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder};
+        use crate::core::platform::command::{CommandBuffer, CommandQueue};
+        use crate::core::platform::resource::Buffer;
+        use crate::core::platform::types::CommandBufferStatus;
 
         use crate::gpu::spin;
 
@@ -2766,15 +2765,15 @@ pub(crate) mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::time::Duration;
 
-        use reims_vgpu_core::host::PhysicalMemoryRange;
-        use reims_vgpu_core::num::ToU64 as _;
-        use reims_vgpu_core::platform::blit::ResourceRef;
-        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-        use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, Surface as _, SurfaceSpec};
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
-        use reims_vgpu_core::platform::resource::{Buffer, Library, Texture as _};
-        use reims_vgpu_core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
+        use crate::core::host::PhysicalMemoryRange;
+        use crate::core::num::ToU64 as _;
+        use crate::core::platform::blit::ResourceRef;
+        use crate::core::platform::command::{CommandBuffer, CommandQueue};
+        use crate::core::platform::compute::{ComputeCmd, ComputeEncoder};
+        use crate::core::platform::os::surface::{IoSurfaces as _, Surface as _, SurfaceSpec};
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::{Buffer, Library, Texture as _};
+        use crate::core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
 
         use crate::gpu::resource::tests::bgra;
 
@@ -3001,10 +3000,10 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn textures_over_a_surface_map_its_pages_once_more_at_most() {
-        use reims_vgpu_core::host::PhysicalMemoryRange;
-        use reims_vgpu_core::num::ToU64 as _;
-        use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
+        use crate::core::host::PhysicalMemoryRange;
+        use crate::core::num::ToU64 as _;
+        use crate::core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
+        use crate::core::platform::os::vm::HostVm as _;
 
         use crate::gpu::resource::tests::bgra;
 
@@ -3108,7 +3107,7 @@ pub(crate) mod tests {
                 (made(), other.join().unwrap())
             });
             let (one, two) = (one.unwrap(), two.unwrap());
-            use reims_vgpu_core::platform::resource::Buffer as _;
+            use crate::core::platform::resource::Buffer as _;
             assert_eq!(one.gpu_address(), two.gpu_address(), "round {round}");
         }
     }
@@ -3126,7 +3125,7 @@ pub(crate) mod tests {
     /// device made answers none
     #[test]
     fn a_made_device_is_kept_by_its_registry_id() {
-        use reims_vgpu_core::platform::Platform as _;
+        use crate::core::platform::Platform as _;
         let d = dev();
         assert_eq!(kept(d.registry_id).map(|k| k.id()), Some(d.id()));
         assert!(kept(d.registry_id ^ 0xdead_beef).is_none());
@@ -3140,7 +3139,7 @@ pub(crate) mod tests {
     /// and rows, or the surface's own for a surface of no planes
     #[test]
     fn a_texture_over_a_surface_has_a_debug_line_of_its_shape() {
-        use reims_vgpu_core::platform::values::TextureDesc;
+        use crate::core::platform::values::TextureDesc;
         let fields = |pixel_format, (width, height), usage, resource_options| {
             TextureFields::of(&TextureDesc {
                 texture_type: 2,
@@ -3236,8 +3235,8 @@ pub(crate) mod tests {
     /// aborts ([`a_stopped_multisample_padded_texture_dies_at_its_creator`])
     #[test]
     fn multisample_padded_textures_die_where_metal_aborts() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::values::TextureDesc;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::values::TextureDesc;
         let p = crate::platform::tests::platform();
         let sel = "newTextureWithDescriptor:";
         for raw in 576..=579 {
@@ -3269,9 +3268,9 @@ pub(crate) mod tests {
     /// without it, where a guest texture held in its place moves them
     #[test]
     fn an_own_texture_takes_no_resource_id_or_metal_space() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::resource::{Buffer as _, Texture as _};
-        use reims_vgpu_core::platform::values::TextureDesc;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::resource::{Buffer as _, Texture as _};
+        use crate::core::platform::values::TextureDesc;
         let p = crate::platform::tests::platform();
         let d = dev();
         let desc = p.texture_descriptor(&TextureDesc {
@@ -3318,8 +3317,8 @@ pub(crate) mod tests {
     /// and every reference to a state answers its own
     #[test]
     fn each_compute_pipeline_creation_takes_a_new_identifier() {
-        use reims_vgpu_core::platform::resource::ComputePipeline as _;
-        use reims_vgpu_core::platform::resource::Library as _;
+        use crate::core::platform::resource::ComputePipeline as _;
+        use crate::core::platform::resource::Library as _;
         let d = dev();
         let library = d
             .new_library(include_bytes!("../../../../tests/shaders/kernel.metallib"))
@@ -3365,7 +3364,7 @@ pub(crate) mod tests {
     /// (`MaxCommandBufferCount`), where the platform asks for Metal's 64.
     #[test]
     fn an_unshared_queue_runs_and_its_refusals_are_the_runtimes() {
-        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        use crate::core::platform::command::{CommandBuffer, CommandQueue};
         let d = dev();
         match unshared_queue(&d.raw, 0) {
             Err(rt::Error::Invalid(i)) => assert_eq!(i.problem, rt::Problem::MaxCommandBufferCount),

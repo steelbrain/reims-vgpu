@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::os::{Threads, TimerClock};
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal};
+use crate::core::platform::os::{Threads, TimerClock};
+use crate::core::raise::death::{DeathId, DeathKind, fatal};
 
 use super::clock::LinuxClock;
 
@@ -74,7 +74,7 @@ impl Threads for LinuxThreads {
     fn spawn_worker(&self, label: &'static str, body: Box<dyn FnOnce() + Send>) {
         spawn_thread(
             label,
-            reims_vgpu_core::rt::queue::WORKER_STACK,
+            crate::core::rt::queue::WORKER_STACK,
             Box::new(move || {
                 super::hints::drop_inherited_hints();
                 body();

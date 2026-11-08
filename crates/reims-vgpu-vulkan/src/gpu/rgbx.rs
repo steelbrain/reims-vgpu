@@ -27,22 +27,20 @@
 //! single-plane extended-range formats, swizzled and not
 //! ([`extended_range_textures_read_as_metals`]).
 
+use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
+use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+use crate::core::platform::descriptor::RenderPassDescriptor as _;
+use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+use crate::core::platform::resource::{Buffer as _, Library as _, Texture as _};
+use crate::core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange, Swizzle};
+use crate::core::platform::values::{ColorAttachmentSet, SamplerDesc, TextureDesc};
+use crate::core::platform::{HostRange, Platform};
+use crate::core::raise::OnFault;
+use crate::core::raise::death::{DeathKind, DeathSite};
+use crate::core::testkit::capture::catch_death;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::resource::{Buffer as _, Library as _, Texture as _};
-use reims_vgpu_core::platform::types::{
-    ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange, Swizzle,
-};
-use reims_vgpu_core::platform::values::{ColorAttachmentSet, SamplerDesc, TextureDesc};
-use reims_vgpu_core::platform::{HostRange, Platform};
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-use reims_vgpu_core::testkit::capture::catch_death;
 
 use crate::gpu::device::tests::dev;
 use crate::gpu::encode_render::tests::metal_tests::memoryless_fetched;
@@ -1067,9 +1065,9 @@ fn half_nans_only(metal: &[u8], ours: &[u8]) -> bool {
         .all(|(m, o)| m == o || (half_nan(m) && half_nan(o)))
 }
 
-/// Metal's answer under `key` for a test to compare `mine` with ([`reims_vgpu_core::metal_answer`]).
+/// Metal's answer under `key` for a test to compare `mine` with ([`crate::metal_answer`]).
 fn metals_of(key: &str, mine: &Result<Vec<u8>, (DeathSite, String)>) -> Vec<u8> {
-    reims_vgpu_core::metal_answer!(key, mine.as_ref().ok().map(Vec::as_slice))
+    crate::metal_answer!(key, mine.as_ref().ok().map(Vec::as_slice))
 }
 
 /// Adds to `differ` each of `ours`' cases whose bytes are not Metal's, named after `of`: how
@@ -1079,9 +1077,9 @@ fn metals_of(key: &str, mine: &Result<Vec<u8>, (DeathSite, String)>) -> Vec<u8> 
 /// ones recorded.
 fn compare(differ: &mut Vec<String>, nans: &mut usize, of: &str, ours: &[(String, Vec<u8>)]) {
     let cases = format!("{of}: cases");
-    reims_vgpu_core::metal_check!(&cases, ours.len());
+    crate::metal_check!(&cases, ours.len());
     for (case, mine) in ours {
-        let metal = &reims_vgpu_core::metal_near!(format!("{of} {case}"), mine);
+        let metal = &crate::metal_near!(format!("{of} {case}"), mine);
         assert_eq!(metal.len(), mine.len(), "{of} {case}");
         let element = (metal.len() / TEXELS).max(1);
         let halves = ["rgbx_read_half", "rgbx_sample_half", "rgbx_read_held_half"]
@@ -1607,10 +1605,10 @@ fn new_textures_read_as_metals() {
         let levels = format!("{name}: levels");
         match survived(|| fresh_levels(&ours, &desc, texel, slices)) {
             Ok(mine) => {
-                reims_vgpu_core::metal_check!(&levels, mine.len());
+                crate::metal_check!(&levels, mine.len());
                 for (level, o) in &mine {
                     let key = format!("{name} {level}");
-                    let m = &reims_vgpu_core::metal_answer!(&key, Some(&o[..]));
+                    let m = &crate::metal_answer!(&key, Some(&o[..]));
                     if m != o {
                         differ.push(format!(
                             "{name} {level}: Metal {:02x?}, ours {:02x?}",
@@ -2006,14 +2004,8 @@ fn nan_clears_are_metals() {
                             _ => None,
                         };
                         let metals = (
-                            reims_vgpu_core::metal_answer!(
-                                format!("{of}: stored"),
-                                made.map(|m| &m.0[..])
-                            ),
-                            reims_vgpu_core::metal_answer!(
-                                format!("{of}: samples"),
-                                made.map(|m| &m.1[..])
-                            ),
+                            crate::metal_answer!(format!("{of}: stored"), made.map(|m| &m.0[..])),
+                            crate::metal_answer!(format!("{of}: samples"), made.map(|m| &m.1[..])),
                         );
                         match mine {
                             Ok(Some(mine)) if mine == metals => {}
@@ -2449,7 +2441,7 @@ fn a_texture_of_usage_0x8_alone_is_metals() {
     assert_eq!(nans, 0);
     let colour = [0.25, 0.5, 0.75, 1.0];
     let cleared = ours.read(&ours.cleared(BGRA.0, DROPPED, colour), 4);
-    reims_vgpu_core::metal_check_bytes!("a pass's clear", &cleared);
+    crate::metal_check_bytes!("a pass's clear", &cleared);
     let sized = TextureDesc {
         pixel_format: BGRA.0,
         width: 64,
@@ -2461,7 +2453,7 @@ fn a_texture_of_usage_0x8_alone_is_metals() {
     let size = vd
         .heap_texture_size_and_align(&vp.texture_descriptor(&sized))
         .unwrap();
-    reims_vgpu_core::metal_check!("the heap's size query", size);
+    crate::metal_check!("the heap's size query", size);
     assert_eq!(size.size, 16512);
     let t = ours.texture_of(BGRA.0, DROPPED, PRIVATE, 1);
     let one = NsRange::new(0, 1);

@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 use super::surface_order::Marks;
 
@@ -214,8 +214,6 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use reims_vgpu_core::sync::Mutex;
-    use reims_vgpu_core::testkit::FakePlatform;
     use reims_vgpu_graphics::ops::{
         RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_COMMIT_ORDER, RGFX_OP_SUBMITTED, RgfxCommandBuffer,
         RgfxOpHeader, RgfxSurfaceOrderWait,
@@ -224,6 +222,8 @@ mod tests {
         RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
         RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxMsgHeader, RgfxObjectDestroy, RgfxQueueCreate,
     };
+    use reims_vgpu_vulkan::core::sync::Mutex;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
     use zerocopy::IntoBytes;
 
     use super::super::{DecodeError, GraphicsDecoder};
@@ -541,7 +541,7 @@ mod tests {
     /// failure is posted.
     #[test]
     fn a_buffer_named_whose_begin_fails_lets_the_buffer_that_names_it_go_on() {
-        use reims_vgpu_core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::Step;
         use zerocopy::FromBytes;
 
         for how in ["op_bytes", "short", "refused"] {

@@ -298,7 +298,7 @@ Set in `Cargo.toml` (architecture 2.3):
   SDL3's window on macOS, which `REIMS_VGPU_WINDOW_IMPL=sdl` opens in place of AppKit's. Without it
   the macOS library has no SDL.
 - `reims-vgpu-window/sdl-no-link`: SDL left unbuilt, for the Linux target's clippy on a Mac.
-- `reims-vgpu-core/testkit`: `core::testkit` for other crates' tests.
+- `reims-vgpu-vulkan/testkit`: `core::testkit` for other crates' tests.
 - `reims-vgpu/testkit`: the same, through the public crate, and each handle's core object.
 
 [api.md](api.md) section 2 lists the device's settings and the environment variables the library

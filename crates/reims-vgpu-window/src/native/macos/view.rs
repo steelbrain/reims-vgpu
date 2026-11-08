@@ -74,7 +74,7 @@ use objc2_app_kit::{
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize};
 use objc2_quartz_core::CAMetalLayer;
-use reims_vgpu_core::rt::BlockEnv;
+use reims_vgpu_vulkan::core::rt::BlockEnv;
 use reims_vgpu_vulkan::os::msg;
 
 use super::cursor::CursorCache;

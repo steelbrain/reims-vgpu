@@ -25,22 +25,22 @@
 //! `FRAME_COST_RUNTIME_CHECK=1` a submission check on each of the runtime's command buffers
 //! ([`runtime_checks`]).
 
-use metal2vulkan::metal::{PrimitiveType, ResourceUsage};
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::os::Clock as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-use reims_vgpu_core::platform::types::{MtlSize, NsRange};
-use reims_vgpu_core::platform::values::{
+use crate::core::platform::Platform;
+use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
+use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+use crate::core::platform::descriptor::RenderPassDescriptor as _;
+use crate::core::platform::device::GpuDevice;
+use crate::core::platform::os::Clock as _;
+use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+use crate::core::platform::resource::{Buffer as _, Library as _};
+use crate::core::platform::types::{MtlSize, NsRange};
+use crate::core::platform::values::{
     ColorAttachmentSet, RenderPipelineDesc, SamplerDesc, TextureDesc,
 };
-use reims_vgpu_core::raise::OnFault;
+use crate::core::raise::OnFault;
+use metal2vulkan::metal::{PrimitiveType, ResourceUsage};
+use metal2vulkan_runtime as rt;
 
 use crate::gpu::device::VulkanDevice;
 use crate::platform::VulkanPlatform;

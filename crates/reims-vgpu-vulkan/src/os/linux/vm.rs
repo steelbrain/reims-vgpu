@@ -108,9 +108,9 @@
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::Arc;
 
-use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
-use reims_vgpu_core::sync::{ReadGuard, WriterPrefRwLock};
+use crate::core::num::{ToU64, ToUsize};
+use crate::core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
+use crate::core::sync::{ReadGuard, WriterPrefRwLock};
 
 use super::budget;
 use super::files::{self, Backing, Through};
@@ -910,7 +910,7 @@ pub(crate) fn unfold(first: u64, end: u64) -> Result<(), u64> {
 
 /// [`unfold`], once: what a refused map leaves through dma-bufs a second try maps.
 fn unfold_once(first: u64, end: u64) -> Result<(), u64> {
-    static UNFOLDING: reims_vgpu_core::sync::Mutex<()> = reims_vgpu_core::sync::Mutex::new(());
+    static UNFOLDING: crate::core::sync::Mutex<()> = crate::core::sync::Mutex::new(());
     let _one = UNFOLDING.lock();
     let mut held = views();
     let mut pieces = files::through_pieces(first, end);
@@ -1226,7 +1226,7 @@ impl HostVm for LinuxVm {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
     use super::*;
 
@@ -1465,11 +1465,11 @@ pub(crate) mod tests {
     /// a call that can try again, it ends the process in strict mode
     #[test]
     fn a_map_refused_at_the_limit_folds_the_views_and_tries_again() {
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::testkit::capture::catch_death;
         if !udmabuf_opens() {
             return;
         }
-        let dies = |site: Result<KernReturn, reims_vgpu_core::raise::death::DeathSite>| {
+        let dies = |site: Result<KernReturn, crate::core::raise::death::DeathSite>| {
             site.is_err_and(|site| (site.kind, site.file) == (DeathKind::Abort, "mmap"))
         };
         let at_limit = |on: bool| TEST_AT_LIMIT.with(|t| t.set(on));
@@ -1526,7 +1526,7 @@ pub(crate) mod tests {
     /// counted; in strict mode the process ends at the call that made no file
     #[test]
     fn no_file_answers_as_memory_runs_out() {
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::testkit::capture::catch_death;
         let p = page();
         TEST_NO_FILE.with(|t| t.set(true));
         let site = catch_death(|| allocate_aliasable(p));
@@ -1895,8 +1895,8 @@ pub(crate) mod tests {
     /// (`crate::gpu::backing::gather`, `super::dma_buf`)
     #[test]
     fn an_alias_with_zeros_past_its_pages_has_a_file_behind_every_byte() {
+        use crate::core::platform::types::ResourceAddressRange;
         use crate::gpu::backing::{REPLACE, gather};
-        use reims_vgpu_core::platform::types::ResourceAddressRange;
         let p = page();
         for read_only in [false, true] {
             let guest = allocate_aliasable(p).unwrap();

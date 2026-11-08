@@ -1,6 +1,6 @@
 //! The tests of `encode_compute` that compare with Metal on this host: macOS only.
 
-use reims_vgpu_core::platform::resource::ComputePipeline;
+use crate::core::platform::resource::ComputePipeline;
 
 use super::*;
 
@@ -65,7 +65,7 @@ fn pipelines_of_functions() {
         .collect();
     assert_eq!(ours[2].4, 256, "tg_static's 64 words");
     for (&(_, name), ours) in kernels.iter().zip(&ours) {
-        reims_vgpu_core::metal_check!(name, ours);
+        crate::metal_check!(name, ours);
     }
     let sel = "newComputePipelineStateWithFunction:error:";
     let site = catch_death(|| dev().new_compute_pipeline_state_for_function(None)).unwrap_err();
@@ -111,7 +111,7 @@ fn encoders_of_pass_descriptors() {
     assert_eq!(words(&out), [2, 3, 4, 5]);
     /// An encoder of `dispatch_type` of a pass descriptor on `d` that names a nil resource
     /// in its residency and adds one to 4 words: its output, once it completed.
-    fn unknown_type<P: reims_vgpu_core::platform::Platform>(
+    fn unknown_type<P: crate::core::platform::Platform>(
         d: &P::Device,
         dispatch_type: u64,
     ) -> Vec<u32> {
@@ -209,9 +209,9 @@ enum Dispatch {
 }
 
 /// `parts` in one command buffer on `d`, committed: the 4 words `add_one` wrote.
-fn unit<P: reims_vgpu_core::platform::Platform>(d: &P::Device, parts: &[Part]) -> Vec<u32> {
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+fn unit<P: crate::core::platform::Platform>(d: &P::Device, parts: &[Part]) -> Vec<u32> {
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
 
     let lib = d.new_library(ADD).unwrap().unwrap().unwrap();
     let f = lib

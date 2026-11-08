@@ -1,18 +1,18 @@
 //! A `Depth32Float` texture's denormal depths, stored and compared as Metal does: what the
 //! runtime announces as `depth-denormals` on this host's MoltenVK is measured against Metal here.
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlSize};
-use reims_vgpu_core::platform::values::{
+use crate::core::platform::Platform;
+use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use crate::core::platform::descriptor::RenderPassDescriptor as _;
+use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+use crate::core::platform::resource::{Buffer as _, Library as _};
+use crate::core::platform::types::{ClearColor, MtlOrigin, MtlSize};
+use crate::core::platform::values::{
     ColorAttachmentSet, DepthAttachmentSet, DepthStencilDesc, FullRenderPipelineDesc, TextureDesc,
 };
-use reims_vgpu_core::raise::OnFault;
+use crate::core::raise::OnFault;
 
 use crate::gpu::device::tests::dev;
 use crate::platform::tests::platform;
@@ -290,7 +290,7 @@ fn denormal_depths_store_and_compare_as_metals() {
             for compare in 1..=6 {
                 let ours = denormal_depth_drawn(&p, &d, stored, cleared, compare);
                 let case = format!("{bits:#010x}, cleared {cleared}, compare {compare}");
-                reims_vgpu_core::metal_check_raw!(&case, ours);
+                crate::metal_check_raw!(&case, ours);
                 cases += 1;
             }
         }

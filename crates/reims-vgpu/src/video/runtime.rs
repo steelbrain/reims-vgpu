@@ -17,13 +17,13 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::os::{Clock as _, Deadline, MonoTime as CoreTime};
-#[cfg(doc)]
-use reims_vgpu_core::platform::os::{Clock, Threads};
-use reims_vgpu_core::rt::enter_ours;
 use reims_vgpu_video::core::runtime::{MonoTime, Rings, Runtime, TimedOut};
 use reims_vgpu_video::core::sync::{Condvar, MutexGuard};
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::os::{Clock as _, Deadline, MonoTime as CoreTime};
+#[cfg(doc)]
+use reims_vgpu_vulkan::core::platform::os::{Clock, Threads};
+use reims_vgpu_vulkan::core::rt::enter_ours;
 
 /// `P` as a video crate's runtime (module doc).
 pub(crate) struct PlatformRuntime<P: Platform>(Arc<P>);
@@ -66,9 +66,9 @@ impl<P: Platform> Runtime for PlatformRuntime<P> {
 mod tests {
     use std::time::Duration;
 
-    use reims_vgpu_core::rt::is_our_thread;
-    use reims_vgpu_core::testkit::FakePlatform;
     use reims_vgpu_video::core::runtime::{Bell, StdRuntime, Unanswered, answer};
+    use reims_vgpu_vulkan::core::rt::is_our_thread;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
 
     use super::*;
 

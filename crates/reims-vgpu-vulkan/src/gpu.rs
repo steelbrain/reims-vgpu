@@ -59,11 +59,11 @@ pub mod ycbcr;
 
 use std::ops::Range;
 
+use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange, Swizzle};
 use metal2vulkan::metal::{
     PixelFormat, TextureSwizzle, TextureSwizzleChannels, TextureType, TextureUsage,
 };
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange, Swizzle};
 
 use crate::answer::unrepresentable;
 
@@ -226,16 +226,16 @@ pub(crate) fn resource_options(sel: &'static str, raw: u64) -> rt::ResourceOptio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
 
     /// The platform's own buffers lie outside the Metal address space, `[2^47, 2^48)`, where no
     /// guest buffer lies
     #[test]
     fn own_buffers_take_no_metal_address() {
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::raise::OnFault;
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::raise::OnFault;
 
         let d = crate::gpu::device::tests::dev();
         let shared = rt::ResourceOptions::shared();

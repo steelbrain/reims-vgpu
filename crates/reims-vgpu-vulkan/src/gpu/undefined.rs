@@ -9,20 +9,20 @@
 //! **Measured on one GPU.** Every answer here is an Apple M3 Max's (40-core GPU) under macOS 26.7
 //! (25G229). Other Apple GPU generations were not measured: an answer here may not hold on them.
 
-use reims_vgpu_core::platform::HostRange;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::resource::{Buffer as _, Library as _, Texture as _};
-use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize};
-use reims_vgpu_core::platform::values::{
+use crate::core::platform::HostRange;
+use crate::core::platform::Platform;
+use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use crate::core::platform::descriptor::RenderPassDescriptor as _;
+use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+use crate::core::platform::resource::{Buffer as _, Library as _, Texture as _};
+use crate::core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize};
+use crate::core::platform::values::{
     ColorAttachmentSet, DepthAttachmentSet, DepthStencilDesc, FullRenderPipelineDesc,
     StencilAttachmentSet, StencilDesc, TextureDesc,
 };
-use reims_vgpu_core::raise::OnFault;
+use crate::core::raise::OnFault;
 
 use crate::gpu::device::tests::colours_of;
 

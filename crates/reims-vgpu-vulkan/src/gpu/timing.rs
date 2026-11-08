@@ -43,15 +43,15 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::core::platform::os::{Clock as _, MonoTime};
 use metal2vulkan::pipeline::{MeshPipelineDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
 
+use crate::core::platform::types::NsErrorText;
+use crate::core::raise::RaiseResult;
+use crate::core::sync::Mutex;
+use crate::core::trace;
 use crate::os::OsClock;
-use reims_vgpu_core::platform::types::NsErrorText;
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::trace;
 
 /// An encoder command or a commit that takes this long or longer is written.
 pub const SLOW_CALL: Duration = Duration::from_millis(5);
@@ -522,12 +522,12 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
+    use crate::core::raise::OnFault;
+    use crate::core::sync::Mutex;
     use log::LevelFilter;
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-    use reims_vgpu_core::raise::OnFault;
-    use reims_vgpu_core::sync::Mutex;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -542,7 +542,7 @@ mod tests {
     fn hook() -> Seen {
         let seen = Seen::default();
         let lines = Arc::clone(&seen);
-        let installed = reims_vgpu_core::logging::set_hook(
+        let installed = crate::core::logging::set_hook(
             LevelFilter::Debug,
             Box::new(move |_, target, message| {
                 if target == module_path!().trim_end_matches("::tests") {
@@ -568,7 +568,7 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env(CHILD, "1")
-                .env_remove(reims_vgpu_core::logging::ENV_VAR)
+                .env_remove(crate::core::logging::ENV_VAR)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "{out:?}");
@@ -698,8 +698,8 @@ mod tests {
     #[test]
     #[ignore = "a measurement, run by hand: prints the latencies"]
     fn commit_to_handler_latency() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
 
         let d = dev();
         let q = d.new_command_queue().unwrap();

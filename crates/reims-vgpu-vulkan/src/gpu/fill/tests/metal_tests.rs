@@ -1,13 +1,13 @@
 //! The tests of `fill` that compare with Metal on this host: macOS only.
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::resource::Buffer;
-use reims_vgpu_core::platform::types::ClearColor;
-use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::raise::OnFault;
+use crate::core::platform::Platform;
+use crate::core::platform::blit::{BlitCmd, BlitEncoder};
+use crate::core::platform::command::{CommandBuffer, CommandQueue};
+use crate::core::platform::device::GpuDevice;
+use crate::core::platform::resource::Buffer;
+use crate::core::platform::types::ClearColor;
+use crate::core::platform::values::TextureDesc;
+use crate::core::raise::OnFault;
 
 use crate::platform::VulkanPlatform;
 
@@ -393,7 +393,7 @@ fn assert_metals(formats: &[u64], colors: &[ClearColor]) {
     for &format in formats {
         let key = format!("call {call}: format {format}");
         let ours = fills_of::<VulkanPlatform>(&d, &vulkan_desc, format, colors);
-        if !reims_vgpu_core::metal_matches_bytes!(key, &ours) {
+        if !crate::metal_matches_bytes!(key, &ours) {
             wrong.push(key);
         }
     }
@@ -534,7 +534,7 @@ fn leftover_colours_fill_an_earlier_colours_bytes_as_metals() {
                     )
                 });
                 match ours {
-                    Ok(ours) if reims_vgpu_core::metal_matches!(key, ours) => {}
+                    Ok(ours) if crate::metal_matches!(key, ours) => {}
                     Ok(ours) => differ.push(format!("{what}: ours {ours:02x?}, not Metal's")),
                     Err(site) => {
                         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();

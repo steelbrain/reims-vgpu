@@ -115,12 +115,12 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::core::platform::Handle as _;
+use crate::core::platform::os::Clock as _;
+use crate::core::sync::{Mutex, MutexGuard};
 use ash::{khr, vk};
 use metal2vulkan::metal::{PixelFormat, TextureUsage};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::os::Clock as _;
-use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
 use crate::gpu::device::VulkanDevice;
@@ -1399,11 +1399,11 @@ mod tests {
     /// lives takes the ID it takes without it
     #[test]
     fn a_swapchain_images_texture_takes_no_resource_id() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::resource::Texture as _;
-        use reims_vgpu_core::platform::values::TextureDesc;
-        use reims_vgpu_core::raise::OnFault;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::Texture as _;
+        use crate::core::platform::values::TextureDesc;
+        use crate::core::raise::OnFault;
 
         let p = crate::platform::tests::platform();
         let d = crate::gpu::device::tests::dev();

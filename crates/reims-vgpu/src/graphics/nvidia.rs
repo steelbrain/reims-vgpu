@@ -42,11 +42,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RGFX_VIDEO_ENCODE,
     RGFX_VIDEO_FORMAT_NV12, RGFX_VIDEO_FORMAT_P010, RGFX_VIDEO_H264_BASELINE, RGFX_VIDEO_H264_HIGH,
@@ -61,6 +56,11 @@ use reims_vgpu_video::nvidia::{
     decode_capabilities, encode_profiles,
 };
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::platform::Handle as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::raise::OnFault;
+use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_vulkan::gpu::device::VulkanDevice;
 use reims_vgpu_vulkan::gpu::resource::VulkanBuffer;
 

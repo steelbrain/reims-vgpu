@@ -8,7 +8,6 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-reims-vgpu-core.workspace = true
 log.workspace = true
 # ash's Vulkan types for a window's surface (`present`): SDL's on Linux, the layer's on macOS.
 ash.workspace = true
@@ -99,7 +98,7 @@ objc2-app-kit = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-reims-vgpu-core = { workspace = true, features = ["testkit"] }
+reims-vgpu-vulkan = { workspace = true, features = ["testkit"] }
 
 [lints]
 workspace = true

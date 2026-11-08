@@ -52,20 +52,20 @@
 use std::ptr;
 use std::sync::Arc;
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::resource::{Buffer, Heap, Texture};
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
-use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
-use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_graphics::managed::LinearLayout;
 use reims_vgpu_graphics::wire::{
     RGFX_MANAGED_TEXTURE_LINEAR, RgfxBufferDidModifyRange, RgfxBufferManagedAtOffset,
     RgfxBufferOverHostMemory, RgfxManagedBufferCreate, RgfxManagedTextureCreate,
     RgfxTextureReplaceRegion,
 };
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::resource::{Buffer, Heap, Texture};
+use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
+use reims_vgpu_vulkan::core::platform::values::{BufferDesc, OptionSet};
+use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult};
 
 use super::tables::{Entry, GuestBytes};
 use super::{DecodeError, Drain, GraphicsDecoder, ObjHandle, op_fault, read, texture_desc};
@@ -812,8 +812,6 @@ impl<P: Platform> GraphicsDecoder<P> {
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::testkit::{Arg, FakePlatform, GuestRam, Step};
     use reims_vgpu_graphics::ops::blit::{
         RGFX_BLIT_RESOURCE_BUFFER, RGFX_BLIT_RESOURCE_TEXTURE, RGFX_OP_BLIT_SYNCHRONIZE_RESOURCE,
         RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE, RgfxBlitOpSynchronizeResource,
@@ -829,6 +827,8 @@ mod tests {
         RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset, RgfxBufferOverPages,
         RgfxHeapOverHostMemory, RgfxMsgHeader, RgfxObjectDestroy, RgfxTextureDescriptor,
     };
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+    use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, GuestRam, Step};
     use zerocopy::IntoBytes;
 
     use super::super::blit::decode_op;
@@ -1968,10 +1968,10 @@ mod tests {
     /// the copy after a blit wrote 0x5a into slice 1 and synchronized it, as a guest does (the GPU
     /// writes it there, slices 0 and 2 kept).
     fn managed_array_in_place_on<P: crate::platform::ApiPlatform>() -> (Vec<u8>, Vec<u8>) {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 
         const W: u64 = 48;
         const H: u64 = 16;

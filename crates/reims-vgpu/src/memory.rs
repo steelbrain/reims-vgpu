@@ -6,8 +6,8 @@ use std::any::Any;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::memory::descriptor::{
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::memory::descriptor::{
     GuestPhysicalRange, MemoryMapDescriptor as CoreMemoryMap,
 };
 

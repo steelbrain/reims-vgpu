@@ -18,13 +18,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::values::{RenderPipelineDesc, SamplerDesc, TextureDesc};
-use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_QUEUE_CREATE, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
     RGFX_CURSOR_SPAN, RgfxBufferOverHostMemory, RgfxMsgHeader, RgfxQueueCreate,
 };
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::values::{RenderPipelineDesc, SamplerDesc, TextureDesc};
+use reims_vgpu_vulkan::core::raise::OnFault;
 use zerocopy::IntoBytes;
 
 use super::draw_cost::{counts, fixture, spread, test_shaders};
@@ -127,7 +127,7 @@ fn made<P: ApiPlatform>(kind: Kind, n: u64) -> (GraphicsDecoder<P>, P::Device) {
             .unwrap()
             .unwrap()
             .unwrap();
-        reims_vgpu_core::platform::resource::Library::new_function(&library, o, "add_one")
+        reims_vgpu_vulkan::core::platform::resource::Library::new_function(&library, o, "add_one")
             .unwrap()
             .unwrap()
     });
@@ -264,7 +264,7 @@ fn measure<P: ApiPlatform>(platform: &str) {
 #[test]
 #[ignore = "a measurement, run by hand in a release build: prints a close's cost an object"]
 fn on_fake_close_cost() {
-    measure::<reims_vgpu_core::testkit::FakePlatform>("the fake platform");
+    measure::<reims_vgpu_vulkan::core::testkit::FakePlatform>("the fake platform");
 }
 
 /// On the Vulkan platform: the decoder's, the platform's and the runtime's.

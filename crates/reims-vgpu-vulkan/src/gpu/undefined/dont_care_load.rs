@@ -48,8 +48,8 @@
 //! the draws' primitives reach (the runtime's tile-reach rule and capture replay, which its load
 //! pass of extended-range attachments uses), then load every attachment by `Load`.
 
+use crate::core::platform::Platform;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Platform;
 
 use super::{
     Aspect, CLEAR, Colour, DEPTH32F, DONT_CARE, Draw, IN_TILE_1_1, LOAD, MULTISAMPLE_RESOLVE,
@@ -184,7 +184,7 @@ fn against_metal<C: std::fmt::Debug + Copy>(
     for &c in cases {
         let key = format!("{c:?}");
         let o = ours(c);
-        if !reims_vgpu_core::metal_matches_raw!(&key, o) {
+        if !crate::metal_matches_raw!(&key, o) {
             assert!(
                 heard(KIND),
                 "{c:?}: off Metal's, with no {} heard",
@@ -333,7 +333,7 @@ fn a_depth_dont_care_load_clears_the_reached_tiles_once_the_pass_writes_depth() 
     let mut differ = Vec::new();
     for draws in [(false, false), (true, false), (true, true)] {
         let key = format!("{draws:?}");
-        if !reims_vgpu_core::metal_matches_raw!(&key, colour_and_depth((&p, &d), draws)) {
+        if !crate::metal_matches_raw!(&key, colour_and_depth((&p, &d), draws)) {
             assert!(
                 heard(KIND),
                 "{draws:?}: off Metal's, with no {} heard",
@@ -395,7 +395,7 @@ fn every_colour_attachment_of_a_reached_tile_is_zeroed() {
     let mut differ = Vec::new();
     for mask in [None, Some(0)] {
         let key = format!("{mask:?}");
-        if !reims_vgpu_core::metal_matches_raw!(&key, two_colours((&p, &d), mask)) {
+        if !crate::metal_matches_raw!(&key, two_colours((&p, &d), mask)) {
             assert!(
                 heard(KIND),
                 "{mask:?}: off Metal's, with no {} heard",

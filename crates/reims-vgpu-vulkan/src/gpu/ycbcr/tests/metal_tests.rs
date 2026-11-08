@@ -1,12 +1,12 @@
 //! The tests of `ycbcr` that compare with Metal on this host: macOS only.
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _, Texture as _};
-use reims_vgpu_core::platform::types::{SizeAndAlign, Swizzle};
-use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
-use reims_vgpu_core::raise::OnFault;
+use crate::core::platform::Platform;
+use crate::core::platform::descriptor::TextureDescriptor as _;
+use crate::core::platform::device::GpuDevice;
+use crate::core::platform::resource::{Buffer as _, Heap as _, Texture as _};
+use crate::core::platform::types::{SizeAndAlign, Swizzle};
+use crate::core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
+use crate::core::raise::OnFault;
 
 use super::*;
 use crate::os::tests::bgra_surface;
@@ -397,10 +397,10 @@ fn one_plane_copies<P: Platform>(
     bytes: u64,
     pattern: &[u8],
 ) -> [Vec<u8>; 2] {
-    use reims_vgpu_core::platform::HostRange;
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+    use crate::core::platform::HostRange;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
 
     let (row, image) = (16 * bytes, 16 * 16 * bytes);
     let size = MtlSize::new(16, 16, 1);
@@ -486,9 +486,9 @@ fn one_plane_copies<P: Platform>(
 /// ([`one_plane_reads_die_at_the_dispatch`])
 #[test]
 fn one_plane_textures_are_made_and_copied_as_metals() {
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-    use reims_vgpu_core::platform::values::ColorAttachmentSet;
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::descriptor::RenderPassDescriptor as _;
+    use crate::core::platform::values::ColorAttachmentSet;
     let d = dev();
     let p = platform();
     for (format, bytes) in one_plane_copies_only() {
@@ -553,11 +553,11 @@ fn one_plane_textures_are_made_and_copied_as_metals() {
 #[test]
 fn one_plane_reads_die_at_the_dispatch() {
     fn read<P: Platform>(d: &P::Device, desc: &P::TextureDescriptor, bytes: u64) -> Vec<u8> {
-        use reims_vgpu_core::platform::HostRange;
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
+        use crate::core::platform::HostRange;
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
         let t = d.new_texture(OnFault::Return, desc).unwrap().unwrap();
         let n = usize::try_from(16 * 16 * bytes).unwrap();
         let pattern: Vec<u8> = (0..n)

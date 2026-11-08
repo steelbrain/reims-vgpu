@@ -5,7 +5,7 @@
 
 use std::ffi::c_void;
 
-use reims_vgpu_core::platform::os::autorelease::{NativePool, install_native};
+use crate::core::platform::os::autorelease::{NativePool, install_native};
 
 /// `objc_autoreleasePoolPush()`.
 fn push() -> *mut c_void {

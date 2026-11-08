@@ -22,7 +22,7 @@
 use std::ffi::{CStr, c_int, c_void};
 use std::sync::OnceLock;
 
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 /// `CGSMainConnectionID()`: the process's connection to WindowServer.
 type MainConnectionId = unsafe extern "C" fn() -> c_int;

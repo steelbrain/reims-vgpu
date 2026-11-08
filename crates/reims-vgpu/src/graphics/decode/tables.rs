@@ -38,10 +38,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use parking_lot::RwLock;
-use reims_vgpu_core::collections::hasher::KeyBuild;
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::collections::hasher::KeyBuild;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::lane::Lane;
 use super::managed::ManagedCopy;
@@ -601,12 +601,12 @@ impl<P: Platform> Drop for View<P> {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
 
     use super::*;
 
     fn fence(p: &FakePlatform) -> ObjHandle<FakePlatform> {
-        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
         let device = p.device();
         ObjHandle::Fence(device.new_fence().unwrap().unwrap())
     }

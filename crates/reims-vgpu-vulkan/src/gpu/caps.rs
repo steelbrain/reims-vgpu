@@ -162,17 +162,17 @@
 
 use std::sync::Arc;
 
+use crate::core::num::ToU64;
+use crate::core::platform::caps::{
+    DeviceCaps, FAMILIES, Flags, HEAP_QUERY_OPTIONS, Limits, PRIMITIVE_TYPE_COUNT, SAMPLE_COUNTS,
+    WRITE_ROUNDING_MODES,
+};
+use crate::core::platform::types::{MtlSize, SizeAndAlign};
+use crate::core::raise::RaiseResult;
 use metal2vulkan::device::{VkExtension, VkFeature};
 use metal2vulkan::error::Feature;
 use metal2vulkan::metal::PixelFormat;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::caps::{
-    DeviceCaps, FAMILIES, Flags, HEAP_QUERY_OPTIONS, Limits, PRIMITIVE_TYPE_COUNT, SAMPLE_COUNTS,
-    WRITE_ROUNDING_MODES,
-};
-use reims_vgpu_core::platform::types::{MtlSize, SizeAndAlign};
-use reims_vgpu_core::raise::RaiseResult;
 
 use crate::answer::{Policy, refused, send};
 use crate::gpu::resource_options;
@@ -495,7 +495,7 @@ const _: () = assert!(PRIMITIVE_TYPE_COUNT == PUBLIC_PRIMITIVE_TYPES + 5);
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::device::GpuDevice;
+    use crate::core::platform::device::GpuDevice;
 
     use super::*;
     use crate::gpu::device::tests::dev;

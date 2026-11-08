@@ -37,9 +37,9 @@
 //! sparse texture's image); a NaN clear's codes (0, or 384 in an `_sRGB` twin) taken into the
 //! runtime's clear.
 
+use crate::core::platform::Platform;
+use crate::core::platform::types::ClearColor;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::types::ClearColor;
 
 use super::{
     Aspect, CLEAR, Colour, Draw, IN_TILE_1_1, LOAD, Pass, READ, SHARED, STORE, Shape, Step, TARGET,
@@ -102,7 +102,7 @@ fn paths<P: Platform>((p, d): (&P, &P::Device), shape: Shape, raw: &[u8]) -> [Ve
 /// Requires `ours` to be Metal's bytes, recorded, or the runtime to have announced
 /// `extended-range-bits-kept`; answers whether they differ.
 fn against(case: &str, ours: &[u8]) -> bool {
-    let differ = !reims_vgpu_core::metal_matches_bytes!(case, ours);
+    let differ = !crate::metal_matches_bytes!(case, ours);
     if differ {
         assert!(
             heard(rt::Degradation::ExtendedRangeBitsKept),

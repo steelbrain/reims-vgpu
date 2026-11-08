@@ -22,9 +22,9 @@
 //! The verdicts are read from the runtime's report (`rt::Device::in_place_check_report`), in one
 //! place ([`verdict`]), until the runtime answers a texture's placement itself.
 
+use crate::core::num::ToU64 as _;
+use crate::core::platform::values::{PagesInPlace, PagesPlane};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::ToU64 as _;
-use reims_vgpu_core::platform::values::{PagesInPlace, PagesPlane};
 
 use crate::answer::plain;
 

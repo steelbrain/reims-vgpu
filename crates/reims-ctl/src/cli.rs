@@ -355,7 +355,7 @@ pub struct SetArgs {
     pub gpu: Option<String>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub logs: Option<bool>,
-    /// REIMS_VGPU_LOG's filter, such as info or warn,reims_vgpu_core=debug
+    /// REIMS_VGPU_LOG's filter, such as info or warn,reims_vgpu_vulkan::core=debug
     #[arg(long)]
     pub log_level: Option<String>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]

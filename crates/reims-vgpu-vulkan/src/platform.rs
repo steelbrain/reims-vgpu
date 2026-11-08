@@ -15,15 +15,15 @@ use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
+use crate::core::num::ToU64;
+use crate::core::platform::os::Threads;
+use crate::core::platform::os::surface::IoSurfaces;
+use crate::core::platform::os::vm::HostVm;
+use crate::core::platform::types::{MtlSize, ResourceAddressRange};
+use crate::core::platform::values::{RateMapDesc, TextureDesc};
+use crate::core::platform::{Handle, ObjId, Platform};
+use crate::core::raise::{OnFault, RaiseResult};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::os::Threads;
-use reims_vgpu_core::platform::os::surface::IoSurfaces;
-use reims_vgpu_core::platform::os::vm::HostVm;
-use reims_vgpu_core::platform::types::{MtlSize, ResourceAddressRange};
-use reims_vgpu_core::platform::values::{RateMapDesc, TextureDesc};
-use reims_vgpu_core::platform::{Handle, ObjId, Platform};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
 use crate::answer::{get, plain, plain_at, refused};
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
@@ -294,9 +294,9 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         options.messages = Some(sink.with_least_severity(crate::answer::least_severity()));
         options.announce_each =
             announced_each(crate::answer::strict_process() || crate::answer::census::on());
-        if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
-            reims_vgpu_core::trace::set_clock(crate::gpu::timing::trace_clock);
-            if crate::answer::trace_degradations() && reims_vgpu_core::trace::on() {
+        if std::env::var_os(crate::core::trace::ENV_VAR).is_some() {
+            crate::core::trace::set_clock(crate::gpu::timing::trace_clock);
+            if crate::answer::trace_degradations() && crate::core::trace::on() {
                 // Every occurrence reaches the sink, which writes each to the trace and relays
                 // a kind the runtime announces once only the first time: only where the trace's
                 // file opened, the sink's own condition, so a refused file changes nothing.
@@ -770,8 +770,8 @@ pub(crate) mod tests {
     /// for having none, naming the refusal; with no device or no loader it makes none
     #[test]
     fn a_refused_device_dies_at_the_creator() {
-        use reims_vgpu_core::raise::death::DeathKind;
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::raise::death::DeathKind;
+        use crate::core::testkit::capture::catch_death;
         for sel in ["MTLCreateSystemDefaultDevice()", "MTLCopyAllDevices()"] {
             let refusal = rt::Error::NotImplemented(rt::RuntimeGap::Textures);
             *crate::answer::LAST_LINE.lock() = None;

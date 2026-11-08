@@ -102,7 +102,7 @@ fn show(name: &str, rep: &lint::Report) -> bool {
 
 fn cmd_testkit(_args: &[String]) -> Res<bool> {
     let root = repo_root();
-    let lib = read(&root.join("crates/reims-vgpu-core/src/lib.rs"))?;
+    let lib = read(&root.join("crates/reims-vgpu-vulkan/src/core.rs"))?;
     let mut manifests = Vec::new();
     for p in util::walk(&root.join("crates"), &["Cargo.toml"]) {
         manifests.push((util::rel(&p, &root), read(&p)?));
@@ -149,15 +149,15 @@ fn make(args: &[&str]) -> Res<bool> {
 /// nothing now that the Vulkan platform is the library's only one, and which the builds that name
 /// them keep. Clippy lints with every feature as well.
 const TESTED_FEATURES: &str =
-    "reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan";
+    "reims-vgpu-vulkan/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan";
 
 /// The Linux the library ships for, which a Mac type-checks.
 const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 /// The features a Mac type-checks Linux with: [`TESTED_FEATURES`], and SDL's sources left
 /// unbuilt, as a Mac has no Linux C toolchain for them and nothing links.
-const LINUX_CHECK_FEATURES: &str = "reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,\
-    reims-vgpu-c/vulkan,reims-vgpu-window/sdl-no-link";
+const LINUX_CHECK_FEATURES: &str = "reims-vgpu-vulkan/testkit,reims-vgpu/testkit,\
+    reims-vgpu/vulkan,reims-vgpu-c/vulkan,reims-vgpu-window/sdl-no-link";
 
 /// The variable jemalloc's build script (`tikv-jemalloc-sys`, the C API's allocator on
 /// [`LINUX_TARGET`]) reads for that target as a library to link in place of the one it builds. A
@@ -177,6 +177,10 @@ fn empty_archive() -> Res<std::path::PathBuf> {
 
 /// The macOS core's tests run as under Rosetta, with the x86-64 guest's pages.
 const X86_64_MACOS_TARGET: &str = "x86_64-apple-darwin";
+
+/// core's tests, which run as [`X86_64_MACOS_TARGET`] too: the Vulkan crate's unit tests in its
+/// `core` module, a nextest filter over the crate's library (`-p reims-vgpu-vulkan --lib`).
+const CORE_TESTS: &str = "test(/^core::/)";
 
 /// Whether this Mac runs x86-64 code: an x86-64 `true` run under `arch -x86_64` exits 0, which
 /// it does where Rosetta is installed (and on an Intel Mac); without Rosetta the launch fails.
@@ -236,10 +240,13 @@ fn cmd_check(args: &[String]) -> Res<bool> {
                     "nextest",
                     "run",
                     "-p",
-                    "reims-vgpu-core",
+                    "reims-vgpu-vulkan",
+                    "--lib",
                     "--target",
                     X86_64_MACOS_TARGET,
                     "--no-fail-fast",
+                    "-E",
+                    CORE_TESTS,
                 ])?;
             } else {
                 println!(

@@ -1,15 +1,15 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::ObjId;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::types::CommandBufferStatus;
-use reims_vgpu_core::testkit::faults::Fault;
-use reims_vgpu_core::testkit::impls::device::FAKE_LINEAR_ROW_ALIGNMENT;
-use reims_vgpu_core::testkit::objects::CompleteOn;
-use reims_vgpu_core::testkit::{Arg, FakePlatform, HeldCall};
 use reims_vgpu_graphics::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
 use reims_vgpu_graphics::wire::*;
+use reims_vgpu_vulkan::core::platform::ObjId;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+use reims_vgpu_vulkan::core::testkit::faults::Fault;
+use reims_vgpu_vulkan::core::testkit::impls::device::FAKE_LINEAR_ROW_ALIGNMENT;
+use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
+use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, HeldCall};
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
@@ -152,8 +152,8 @@ fn the_device_reserves_the_guest_s_texture_ids_first() {
 /// start fresh
 #[test]
 fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
-    use reims_vgpu_core::platform::resource::Texture as _;
-    use reims_vgpu_core::platform::values::TextureDesc;
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
     let platform = crate::singleton::platform();
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
@@ -2058,7 +2058,7 @@ fn the_guest_s_cursor_reaches_the_host() {
 /// scanout moves or changes size, and kept to the region
 #[test]
 fn the_sink_imports_only_the_scanout_s_pages() {
-    use reims_vgpu_core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 
     const IMPORT: &str = "newBufferWithBytesNoCopy:length:options:deallocator:";
     let platform = Arc::new(FakePlatform::new());
@@ -2069,7 +2069,7 @@ fn the_sink_imports_only_the_scanout_s_pages() {
     assert_eq!(platform.call_log().count(IMPORT), 0);
     // Its queue is unshared: each draw is on a present's path.
     {
-        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+        use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
         assert_eq!(platform.call_log().count(UNSHARED_QUEUE), 1);
         assert_eq!(platform.call_log().count("newCommandQueue"), 0);
     }
@@ -2177,7 +2177,7 @@ fn draws_the_scanout(
     drawable: &<FakePlatform as Platform>::Texture,
     stride: u64,
 ) -> bool {
-    use reims_vgpu_core::platform::resource::Texture as _;
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
     let blits = platform.call_log().count(SCANOUT_BLIT);
     let rect = reims_vgpu_window::PixelRect {
         x: 0,
@@ -2608,8 +2608,8 @@ fn display_color_entries(stage: u32, entries: &[[f32; 3]]) -> Vec<u8> {
 /// the black a fade ends on
 #[test]
 fn a_kept_present_s_table_reaches_the_next_drawn_frame() {
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::testkit::objects::kind;
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::testkit::objects::kind;
     const FRAGMENT_BUFFER: &str = "setFragmentBuffer:offset:atIndex:";
     /// `displayPipeColorScanoutFragment`'s buffer of the post-gamma table.
     const POST_TABLE: u64 = 3;
@@ -3226,8 +3226,8 @@ fn sampler_command_buffer(queue_obj_id: u64, cb_obj_id: u64, sampler: u64) -> Ve
 /// a walk in flight, which holds nothing device-wide.
 /// Whether a walk took the gate, stopped at it, and whether it is open; and their moves.
 type GateState = Arc<(
-    reims_vgpu_core::sync::Mutex<(bool, bool, bool)>,
-    reims_vgpu_core::sync::Condvar,
+    reims_vgpu_vulkan::core::sync::Mutex<(bool, bool, bool)>,
+    reims_vgpu_vulkan::core::sync::Condvar,
 )>;
 
 struct WalkGate {
@@ -3251,8 +3251,8 @@ impl WalkGate {
     /// short buffer whose commit would wait for nothing stops there on its queue's service thread.
     fn in_place(device: &GraphicsDevice<FakePlatform>) -> WalkGate {
         let state = Arc::new((
-            reims_vgpu_core::sync::Mutex::new((false, false, false)),
-            reims_vgpu_core::sync::Condvar::new(),
+            reims_vgpu_vulkan::core::sync::Mutex::new((false, false, false)),
+            reims_vgpu_vulkan::core::sync::Condvar::new(),
         ));
         let passed = Arc::new(AtomicU32::new(0));
         let taken_on = Arc::new(super::Mutex::new(None));
@@ -3353,7 +3353,7 @@ fn create_queue_flagged(
 /// The platform's queue creators' calls, newest last, once `count` of them were made (about 2 s):
 /// each queue's handle is made on its service thread, after its create is answered.
 fn queue_calls(platform: &FakePlatform, count: usize) -> Vec<&'static str> {
-    use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+    use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
     let made = || -> Vec<&'static str> {
         let calls = platform.call_log().calls();
         let creators = calls.iter().map(|c| c.sel);
@@ -3375,7 +3375,7 @@ fn queue_calls(platform: &FakePlatform, count: usize) -> Vec<&'static str> {
 /// did not take the feature, a flagged create is refused and the platform makes no queue for it.
 #[test]
 fn a_queue_the_kext_asks_unshared_is_the_platforms_unshared_queue() {
-    use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+    use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
     const RING_DATA: u32 = 0x1_0000;
     let rings = |n: u64| {
         let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * 0x4_0000;
@@ -4049,7 +4049,7 @@ fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
         message[8..16].copy_from_slice(&seqno.to_le_bytes());
         message
     };
-    let events = |calls: &[reims_vgpu_core::testkit::calllog::Call], sel: &str| {
+    let events = |calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call], sel: &str| {
         (calls.iter())
             .filter(|c| c.sel == sel)
             .map(|c| (c.args[0].as_obj(), c.args[1].as_u64()))
@@ -4140,7 +4140,7 @@ fn a_queue_s_buffers_are_waited_for_before_its_handle_is_made() {
         message[8..16].copy_from_slice(&seqno.to_le_bytes());
         message
     };
-    let events = |calls: &[reims_vgpu_core::testkit::calllog::Call], sel: &str| {
+    let events = |calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call], sel: &str| {
         (calls.iter())
             .filter(|c| c.sel == sel)
             .map(|c| (c.args[0].as_obj(), c.args[1].as_u64()))
@@ -4594,7 +4594,7 @@ fn a_lone_video_buffer_is_walked_on_its_queue_s_service_thread() {
 
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, _guest, mut ring) = one_queue(&raised);
-    let threads = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+    let threads = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
     let seen = Arc::clone(&threads);
     device
         .control
@@ -4640,8 +4640,8 @@ fn a_lone_video_buffer_is_walked_on_its_queue_s_service_thread() {
 /// their walks began.
 fn walk_threads(
     device: &GraphicsDevice<FakePlatform>,
-) -> Arc<reims_vgpu_core::sync::Mutex<Vec<String>>> {
-    let threads = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+) -> Arc<reims_vgpu_vulkan::core::sync::Mutex<Vec<String>>> {
+    let threads = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
     let seen = Arc::clone(&threads);
     device
         .control
@@ -5641,9 +5641,9 @@ fn a_managed_range_is_carried_out_before_a_later_command_buffer() {
     };
     let modified = at(
         "didModifyRange:",
-        Some(Arg::val(&reims_vgpu_core::platform::types::NsRange::new(
-            0x40, 0x10,
-        ))),
+        Some(Arg::val(
+            &reims_vgpu_vulkan::core::platform::types::NsRange::new(0x40, 0x10),
+        )),
     );
     assert!(modified < at("commit", None));
 }
@@ -5696,8 +5696,10 @@ fn a_managed_range_behind_an_answered_walk_holds_up_nothing_on_ring_0() {
         RGFX_STATUS_OK,
         "ring 0 waited for the walk"
     );
-    let modified = |calls: &[reims_vgpu_core::testkit::calllog::Call]| {
-        let range = Arg::val(&reims_vgpu_core::platform::types::NsRange::new(0x40, 0x10));
+    let modified = |calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call]| {
+        let range = Arg::val(&reims_vgpu_vulkan::core::platform::types::NsRange::new(
+            0x40, 0x10,
+        ));
         (calls.iter()).position(|c| c.sel == "didModifyRange:" && c.args.first() == Some(&range))
     };
     assert_eq!(
@@ -6973,7 +6975,7 @@ fn presents_waiting(device: &GraphicsDevice<FakePlatform>, n: usize) {
 
 /// The width of the texture the display shows; `None` for the scanout.
 fn shown_width(device: &GraphicsDevice<FakePlatform>) -> Option<u64> {
-    use reims_vgpu_core::platform::resource::Texture as _;
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
     device
         .control
         .presented
@@ -7168,7 +7170,7 @@ fn a_later_buffer_failed_at_once_shows_no_present_of_an_earlier_writer() {
 /// new layout, the cursor) is on the GPU; once the release is answered, no draw reads the block
 #[test]
 fn a_presented_surface_s_block_waits_for_the_display() {
-    use reims_vgpu_core::platform::command::CommandBuffer as _;
+    use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
     let (mut guest, _ring) = surface_and_queue(&device);
@@ -7546,7 +7548,7 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// device of no surface pages leaves as they were
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
-    use reims_vgpu_core::testkit::GuestRam;
+    use reims_vgpu_vulkan::core::testkit::GuestRam;
 
     let platform = Arc::new(FakePlatform::new());
     let ram = GuestRam::with_range(0x10_0000, 0x10_0000).unwrap();
@@ -8632,12 +8634,13 @@ fn surface_device(
 ) -> (
     GraphicsDevice<FakePlatform>,
     Arc<FakePlatform>,
-    reims_vgpu_core::testkit::GuestRam,
+    reims_vgpu_vulkan::core::testkit::GuestRam,
     u64,
 ) {
     let platform = Arc::new(FakePlatform::new());
     let page = platform.vm().page_size();
-    let ram = reims_vgpu_core::testkit::GuestRam::with_range(SURFACE_RAM, pages * page).unwrap();
+    let ram =
+        reims_vgpu_vulkan::core::testkit::GuestRam::with_range(SURFACE_RAM, pages * page).unwrap();
     platform.fake_vm().adopt(&ram);
     let mut map = crate::MemoryMap::new();
     for r in ram.ranges() {
@@ -9967,7 +9970,7 @@ fn submitted_then_scheduled(ring: &mut QueueRing, cb_obj_id: u64) {
 /// across its commit: the raise never comes on the committing thread
 #[test]
 fn a_foreign_commit_hands_a_decoder_buffer_s_records_to_its_queue_s_thread() {
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 
     let caller = Arc::new(parking_lot::Mutex::new(()));
     let raises = Raises::default();
@@ -10177,7 +10180,7 @@ fn a_commit_on_the_device_s_thread_posts_a_decoder_buffer_s_records_there() {
 #[ignore = "a measurement, run by hand"]
 #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
 fn a_handed_over_record_s_cost() {
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use std::time::Instant;
 
     const ROUNDS: usize = 1000;

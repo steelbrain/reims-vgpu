@@ -12,7 +12,7 @@
 use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
 
-use reims_vgpu_core::num::ToU64 as _;
+use crate::core::num::ToU64 as _;
 
 use super::dma_buf::{self, Refusal, Zeros};
 use super::vm;
@@ -140,10 +140,10 @@ fn pages_of(
 mod tests {
     use std::os::fd::AsRawFd as _;
 
-    use reims_vgpu_core::host::PhysicalMemoryRange;
-    use reims_vgpu_core::num::ToUsize as _;
-    use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, Surface as _, SurfaceSpec};
-    use reims_vgpu_core::platform::os::vm::HostVm as _;
+    use crate::core::host::PhysicalMemoryRange;
+    use crate::core::num::ToUsize as _;
+    use crate::core::platform::os::surface::{IoSurfaces as _, Surface as _, SurfaceSpec};
+    use crate::core::platform::os::vm::HostVm as _;
 
     use super::super::surface::LinuxSurfaces;
     use super::super::vm::{LinuxVm, allocate_aliasable};
@@ -200,7 +200,7 @@ mod tests {
 
     fn free(at: u64, length: u64) {
         let vm = LinuxVm::new();
-        let at = reims_vgpu_core::host::HostPtr::from_addr(at.to_usize());
+        let at = crate::core::host::HostPtr::from_addr(at.to_usize());
         assert!(vm.deallocate(at, length).is_success());
     }
 

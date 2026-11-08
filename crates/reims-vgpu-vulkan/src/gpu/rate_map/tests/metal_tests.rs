@@ -1,6 +1,6 @@
 //! The tests of `rate_map` that compare with Metal on this host: macOS only.
 
-use reims_vgpu_core::platform::resource::Buffer as _;
+use crate::core::platform::resource::Buffer as _;
 
 use super::*;
 
@@ -45,7 +45,7 @@ fn layers_and_descriptors_answer_as_on_metal() {
     }
     let vulkan = answers(&platform());
     assert_eq!(vulkan[..3], [u64::MAX; 3]);
-    reims_vgpu_core::metal_check!("answers", vulkan);
+    crate::metal_check!("answers", vulkan);
 }
 
 /// A map's answers: an immutable one's compiled at creation, a mutable one's of no
@@ -111,7 +111,7 @@ fn maps_answer_as_on_metal() {
             .map(|a| a.iter().map(|x| x.to_bits()).collect())
             .collect()
     };
-    reims_vgpu_core::metal_check!("bits", bits(&vulkan));
+    crate::metal_check!("bits", bits(&vulkan));
 }
 
 /// The parameter copy writes Metal's 24,624 bytes at its offset, byte for byte as Metal's:
@@ -150,9 +150,9 @@ fn the_parameter_copy_is_metals() {
     for bytes in &compiled {
         assert!(around(bytes));
     }
-    reims_vgpu_core::metal_check_bytes!("unset", &unset);
+    crate::metal_check_bytes!("unset", &unset);
     for (quality, ours) in [1.0, 0.1].into_iter().zip(&compiled) {
-        reims_vgpu_core::metal_check_bytes!(format!("quality {quality}"), ours);
+        crate::metal_check_bytes!(format!("quality {quality}"), ours);
     }
 }
 
@@ -218,7 +218,7 @@ fn maps_of_no_layers_are_made_as_metals() {
     }
     let which = ["immutable", "reset", "compiled and reset"];
     for (which, o) in which.iter().zip(&ours) {
-        reims_vgpu_core::metal_check!(format!("{which}: sizes"), &o[..7]);
-        reims_vgpu_core::metal_check_raw!(format!("{which}: copy"), o[7..]);
+        crate::metal_check!(format!("{which}: sizes"), &o[..7]);
+        crate::metal_check_raw!(format!("{which}: copy"), o[7..]);
     }
 }

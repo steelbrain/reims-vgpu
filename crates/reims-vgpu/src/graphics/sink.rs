@@ -69,37 +69,37 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::resource::Texture as _;
-use reims_vgpu_core::platform::types::{
-    ClearColor, CommandBufferStatus, MtlOrigin, MtlRegion, MtlSize,
-};
-use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
-use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::Scanout;
 use reims_vgpu_graphics::region::Region;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _};
+use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+use reims_vgpu_vulkan::core::platform::types::{
+    ClearColor, CommandBufferStatus, MtlOrigin, MtlRegion, MtlSize,
+};
+use reims_vgpu_vulkan::core::platform::values::{ColorAttachmentSet, TextureDesc};
+use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult, refusals};
+use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_window::PixelRect;
 
-use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};
-use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::platform::types::MtlViewport;
+use reims_vgpu_vulkan::core::display::pipeline::{DisplayPipelineCache, PipelineKey};
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::platform::types::MtlViewport;
 
 use super::color::DisplayColor;
 use super::{DisplayHold, DrawnPresents, Presented, Shown};
 use crate::entry::no_catch;
 use crate::platform::ApiPlatform;
-use reims_vgpu_core::platform::resource::Library as _;
-use reims_vgpu_core::platform::values::RenderPipelineDesc;
 use reims_vgpu_graphics::wire::{
     RGFX_COLOR_MATRIX, RGFX_COLOR_PLANE_GAMMA, RGFX_COLOR_POST_GAMMA, RGFX_COLOR_PRE_GAMMA,
 };
+use reims_vgpu_vulkan::core::platform::resource::Library as _;
+use reims_vgpu_vulkan::core::platform::values::RenderPipelineDesc;
 
 /// `MTLLoadActionClear`.
 const LOAD_ACTION_CLEAR: u64 = 2;
@@ -118,7 +118,7 @@ pub(crate) struct ScanoutDraw<P: Platform> {
     /// reads of the display, which no present waits on, draw on a queue the platform may share
     /// ([`ScanoutDraw::for_reads`]).
     ///
-    /// [`new_command_queue_unshared`]: reims_vgpu_core::platform::device::GpuDevice::new_command_queue_unshared
+    /// [`new_command_queue_unshared`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_command_queue_unshared
     pub(crate) queue: P::CommandQueue,
     /// The device's region.
     region: Arc<Region>,
@@ -1337,9 +1337,9 @@ impl<P: ApiPlatform> ScanoutDraw<P> {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::ObjId;
-    use reims_vgpu_core::testkit::objects::{CompleteOn, kind};
-    use reims_vgpu_core::testkit::{Arg, FakePlatform};
+    use reims_vgpu_vulkan::core::platform::ObjId;
+    use reims_vgpu_vulkan::core::testkit::objects::{CompleteOn, kind};
+    use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform};
 
     use super::super::color::Table;
     use super::super::{DisplayHold, ShownTexture};
@@ -1466,7 +1466,7 @@ mod tests {
     /// `a_death_in_a_table_s_draw_refuses_that_draw_alone`)
     #[test]
     fn a_death_in_a_draw_refuses_that_draw_alone() {
-        use reims_vgpu_core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::Step;
         let (platform, draw, presented, drawable) = rig();
         draw.without_tables();
         let log = platform.call_log();
@@ -1509,7 +1509,7 @@ mod tests {
     /// and commits
     #[test]
     fn a_death_in_a_table_s_draw_refuses_that_draw_alone() {
-        use reims_vgpu_core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::Step;
         const BEGIN: &str = "renderCommandEncoderWithDescriptor:";
         let (platform, draw, presented, drawable) = rig();
         let log = platform.call_log();

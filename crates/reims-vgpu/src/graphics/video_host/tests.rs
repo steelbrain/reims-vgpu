@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use reims_vgpu_core::testkit::FakePlatform;
-use reims_vgpu_core::testkit::calllog::Arg;
-use reims_vgpu_core::testkit::objects::CompleteOn;
 use reims_vgpu_graphics::wire::RGFX_VIDEO_CODEC_H264;
+use reims_vgpu_vulkan::core::testkit::FakePlatform;
+use reims_vgpu_vulkan::core::testkit::calllog::Arg;
+use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
 
 use super::*;
 

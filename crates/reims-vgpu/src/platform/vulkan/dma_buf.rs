@@ -5,8 +5,8 @@
 
 use std::ptr::NonNull;
 
-use reims_vgpu_core::num::ToU64 as _;
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
+use reims_vgpu_vulkan::core::num::ToU64 as _;
 use reims_vgpu_vulkan::os::{LendRefusal, dma_buf_of_host};
 
 /// A dma-buf of `ranges` of the `length` bytes from `first`, memory the library mapped from files

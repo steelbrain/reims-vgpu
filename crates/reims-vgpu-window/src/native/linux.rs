@@ -15,7 +15,7 @@ mod ui;
 
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
+use reims_vgpu_vulkan::core::platform::os::{Clock as _, MonoTime};
 use reims_vgpu_vulkan::os::OsClock;
 
 pub(crate) use render::Surface;

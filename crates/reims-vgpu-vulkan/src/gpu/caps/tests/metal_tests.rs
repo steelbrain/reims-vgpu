@@ -1,6 +1,6 @@
 //! The tests of `caps` that compare with Metal on this host: macOS only.
 
-use reims_vgpu_core::platform::caps::LINEAR_ALIGNMENT_FORMAT;
+use crate::core::platform::caps::LINEAR_ALIGNMENT_FORMAT;
 
 use super::*;
 
@@ -143,7 +143,7 @@ fn answers(caps: &DeviceCaps) -> Vec<(String, String)> {
 #[test]
 fn every_cap_is_metals() {
     let ours = answers(&dev().caps());
-    if !reims_vgpu_core::metal_matches!("name", ours[0].1) {
+    if !crate::metal_matches!("name", ours[0].1) {
         eprintln!(
             "{}: not the GPU Metal's answers were recorded on",
             ours[0].1
@@ -152,7 +152,7 @@ fn every_cap_is_metals() {
     }
     let differ: Vec<String> = ours
         .iter()
-        .filter(|(name, o)| name != "registryID" && !reims_vgpu_core::metal_matches!(name, o))
+        .filter(|(name, o)| name != "registryID" && !crate::metal_matches!(name, o))
         .map(|(name, o)| format!("{name}: ours {o}, not Metal's"))
         .collect();
     assert!(

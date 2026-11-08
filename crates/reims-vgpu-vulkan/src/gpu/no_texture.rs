@@ -172,9 +172,9 @@ fn runtime_passes(fields: &TextureFields) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-    use reims_vgpu_core::platform::values::TextureDesc;
+    use crate::core::platform::Platform;
+    use crate::core::platform::descriptor::TextureDescriptor as _;
+    use crate::core::platform::values::TextureDesc;
 
     use crate::platform::tests::platform;
 

@@ -27,15 +27,15 @@
 use std::cell::Cell;
 
 // The render-op tags and body structs (`Rgfx*`): the whole render group, so a glob.
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder};
-use reims_vgpu_core::platform::types::{
+use reims_vgpu_graphics::ops::render::*;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder};
+use reims_vgpu_vulkan::core::platform::types::{
     MtlOrigin, MtlRegion, MtlScissorRect, MtlSize, MtlViewport, NsRange,
     VertexAmplificationViewMapping,
 };
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_graphics::ops::render::*;
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
 
 use super::refused::{self, Bound, Marks, Slot, Stage};
@@ -1843,17 +1843,17 @@ pub(crate) fn decode_op<P: Platform>(
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::values::IcbDesc;
-    use reims_vgpu_core::platform::{Handle, Platform};
-    use reims_vgpu_core::testkit::{Arg, FakePlatform};
     use reims_vgpu_graphics::wire::{
         RGFX_CMD_BUFFER_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_FENCE_CREATE,
         RGFX_CMD_HEAP_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate,
         RgfxDepthStencilCreate, RgfxHeapCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxSamplerCreate,
         RgfxTextureCreate, RgfxTextureDescriptor,
     };
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+    use reims_vgpu_vulkan::core::platform::values::IcbDesc;
+    use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+    use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform};
     use zerocopy::IntoBytes;
 
     use super::super::ObjHandle;

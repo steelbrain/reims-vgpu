@@ -19,15 +19,15 @@
 
 use std::sync::{Arc, OnceLock};
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::CommandBuffer as _;
-use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::types::CommandBufferStatus;
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::Screen;
 use reims_vgpu_graphics::region::Region;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
+use reims_vgpu_vulkan::core::platform::descriptor::TextureDescriptor as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+use reims_vgpu_vulkan::core::raise::OnFault;
+use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_window::PixelRect;
 
 use super::sink::ScanoutDraw;

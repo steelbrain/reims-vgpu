@@ -55,7 +55,7 @@ fn unique_identifiers_follow_metals_sizes() {
         live.iter().map(|b| b.unique_identifier() - first).collect()
     }
     let vulkan = offsets::<VulkanPlatform>(&dev());
-    reims_vgpu_core::metal_check!("offsets", vulkan);
+    crate::metal_check!("offsets", vulkan);
 }
 
 /// An encoder [`identifiers_after_are_metals`] makes, of a command buffer never committed, on
@@ -77,7 +77,7 @@ enum Made {
 
 impl Encoder for Made {
     fn encode<P: Platform>(&self, p: &P, d: &P::Device, cb: &P::CommandBuffer) {
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
         match self {
             Made::Blit => {
                 let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
@@ -88,7 +88,7 @@ impl Encoder for Made {
                 e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
             }
             Made::ComputePass => {
-                let desc = reims_vgpu_core::platform::values::ComputePassDesc::default();
+                let desc = crate::core::platform::values::ComputePassDesc::default();
                 let e = cb.compute_encoder_for_pass(&desc).unwrap().unwrap();
                 e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
             }
@@ -122,7 +122,7 @@ fn identifiers_after_are_metals(made: Made) {
     assert_eq!(vulkan[..2], [0x10_0001_8000; 2], "{made:?}");
     assert_eq!(crate::answer::inexact_counts(), [], "{made:?}");
     let from_first = |n: [u64; 3]| n.map(|x| x - n[0]);
-    reims_vgpu_core::metal_check!("from the first", from_first(vulkan));
+    crate::metal_check!("from the first", from_first(vulkan));
 }
 
 /// [`identifiers_after_are_metals`] an empty blit encoder
@@ -195,7 +195,7 @@ fn icbs_take_metals_numbers() {
     let vulkan = numbers::<VulkanPlatform>(&dev());
     assert_eq!(vulkan[0], (1, 1, 0x10_0001_8000, 1));
     assert_eq!(vulkan[2].0, 5);
-    reims_vgpu_core::metal_check!("numbers", from_first(vulkan));
+    crate::metal_check!("numbers", from_first(vulkan));
 }
 
 /// An execution of a command a kernel encoded with a state the program released since, whose
@@ -526,7 +526,7 @@ fn compute_commands_read_back_as_on_metal() {
         out
     }
     let vulkan = reads::<VulkanPlatform>(&dev());
-    reims_vgpu_core::metal_check!("reads", vulkan);
+    crate::metal_check!("reads", vulkan);
 }
 
 /// What a render command's getters answer core, fresh, after each draw kind with its
@@ -732,7 +732,7 @@ fn render_commands_read_back_as_on_metal() {
         out
     }
     let vulkan = reads::<VulkanPlatform>(&dev());
-    reims_vgpu_core::metal_check!("reads", vulkan);
+    crate::metal_check!("reads", vulkan);
 }
 
 /// What the buffer getters answer of a slot through plain sets and stride forms of a buffer
@@ -830,7 +830,7 @@ fn buffer_slots_read_back_as_on_metal() {
         out
     }
     let vulkan = [true, false].map(|dynamic| reads::<VulkanPlatform>(&dev(), dynamic));
-    reims_vgpu_core::metal_check!("reads", vulkan);
+    crate::metal_check!("reads", vulkan);
 }
 
 /// What the buffer getters answer of slots past the 32 a record holds, of a descriptor of 64
@@ -904,7 +904,7 @@ fn slots_past_the_record_read_back_as_on_metal() {
             .collect()
     }
     let vulkan = [true, false].map(|dynamic| reads::<VulkanPlatform>(&dev(), dynamic));
-    reims_vgpu_core::metal_check!("reads", vulkan);
+    crate::metal_check!("reads", vulkan);
 }
 
 /// What the threadgroup memory length getter answers past the 31 lengths a record holds, of
@@ -1205,7 +1205,7 @@ fn offsets_keep_their_low_32_bits_as_on_metal() {
 /// of two states made from one descriptor: whether command 0 answers that state's identifier,
 /// whether it answers the first's, and what command 1, which nothing encoded, answers.
 fn encoded_by_a_kernel<P: Platform>(d: &P::Device) -> [(bool, bool, u64); 2] {
-    use reims_vgpu_core::platform::resource::{ComputePipeline as _, RenderPipeline as _};
+    use crate::core::platform::resource::{ComputePipeline as _, RenderPipeline as _};
     let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
     let (computes, renders) = twin_states::<P>(d, &library);
     let compute = make::<P>(d, &compute_desc(), 2);
@@ -1266,7 +1266,7 @@ fn a_command_a_kernel_encoded_answers_its_states_identifier() {
 /// A compute buffer of 2 commands whose command 0 a kernel encoded with a state that, with
 /// every handle to it, was released since, and the identifier command 0 answered before.
 fn released_after_encoding<P: Platform>(d: &P::Device) -> (P::Icb, u64) {
-    use reims_vgpu_core::platform::resource::ComputePipeline as _;
+    use crate::core::platform::resource::ComputePipeline as _;
     let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
     let (computes, renders) = twin_states::<P>(d, &library);
     drop(renders);
@@ -1314,7 +1314,7 @@ fn reached(made: &[u64], answer: u64) -> Option<usize> {
 fn made_by<P: Platform>(
     (computes, renders): &(Vec<P::ComputePipeline>, Vec<P::RenderPipeline>),
 ) -> Vec<u64> {
-    use reims_vgpu_core::platform::resource::{ComputePipeline as _, RenderPipeline as _};
+    use crate::core::platform::resource::{ComputePipeline as _, RenderPipeline as _};
     let computes = computes.iter().map(|state| state.unique_identifier());
     computes
         .chain(renders.iter().map(|state| state.unique_identifier()))
@@ -1330,7 +1330,7 @@ fn a_command_naming_a_released_state_reaches_a_later_one_as_metals() {
     /// What the guest reaches by the command's answer, in making order, the index of the
     /// released state and whether a later state took its ID; `None` where the getter died
     fn reaches<P: Platform>(d: &P::Device) -> (Option<Option<usize>>, usize, bool) {
-        use reims_vgpu_core::platform::resource::ComputePipeline as _;
+        use crate::core::platform::resource::ComputePipeline as _;
         let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
         let mut first = twin_states::<P>(d, &library);
         let mut made = made_by::<P>(&first);
@@ -1403,7 +1403,7 @@ fn a_released_state_the_cpu_set_runs_as_metals() {
 /// state a kernel encodes on the command after is answered
 #[test]
 fn a_command_core_set_reaches_a_later_state_holding_its_identifier_as_metals() {
-    use reims_vgpu_core::platform::resource::ComputePipeline as _;
+    use crate::core::platform::resource::ComputePipeline as _;
     /// The command, what the guest reaches by its answer once the first was released and
     /// states were made after it (in making order; `None` where the getter died), and
     /// whether one of those took its ID
@@ -1448,8 +1448,8 @@ fn a_command_core_set_reaches_a_later_state_holding_its_identifier_as_metals() {
 
 /// An ICB-capable state of `name` in `library`, made from a whole value, as `twin_states`' are
 fn icb_kernel<P: Platform>(d: &P::Device, library: &P::Library, name: &str) -> P::ComputePipeline {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::values::FullComputePipelineDesc;
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::values::FullComputePipelineDesc;
     let kernel = library
         .new_function(OnFault::Return, name)
         .unwrap()
@@ -1468,7 +1468,7 @@ fn icb_kernel<P: Platform>(d: &P::Device, library: &P::Library, name: &str) -> P
 /// execution opens a span on the buffer, which tells the two states of the ID apart
 #[test]
 fn a_command_an_executed_kernel_wrote_answers_the_state_holding_its_id_then() {
-    use reims_vgpu_core::platform::resource::ComputePipeline as _;
+    use crate::core::platform::resource::ComputePipeline as _;
     /// The index, in making order, of the state that took a released one's ID and that the
     /// kernel wrote, and of the state core's map reaches by the command's answer
     fn written_by_an_execution<P: Platform>(d: &P::Device) -> (usize, Option<usize>) {
@@ -1567,7 +1567,7 @@ fn a_command_an_executed_kernel_wrote_answers_the_state_holding_its_id_then() {
 /// released first, as Metal's does
 #[test]
 fn an_icb_capable_states_identifier_is_the_runtimes() {
-    use reims_vgpu_core::platform::resource::{
+    use crate::core::platform::resource::{
         ComputePipeline as _, Library as _, RenderPipeline as _,
     };
     let d = dev();
@@ -1647,7 +1647,7 @@ fn a_copy_past_the_destinations_end_lands_what_fits_as_metal() {
             let neighbour = kind_and_width::<VulkanPlatform>(&c, render, i);
             assert_eq!(neighbour, (kind, 30 + i), "{shape}");
         }
-        reims_vgpu_core::metal_check!(shape, landed);
+        crate::metal_check!(shape, landed);
     }
 }
 
@@ -1715,7 +1715,7 @@ fn at(a: u64, base: u64) -> [u64; 2] {
 /// imageblock words, 20 a copy's, and the rest up to 24 none of them
 #[test]
 fn lengths_past_the_last_command_follow_metals_words() {
-    use reims_vgpu_core::platform::types::MtlSize;
+    use crate::core::platform::types::MtlSize;
     /// The places read, past the last command's lengths at 76.
     const PLACES: std::ops::Range<u64> = 76..101;
     /// What each place reads after `scenario` over buffers that inherit their pipeline state or
@@ -1883,7 +1883,7 @@ fn lengths_past_the_last_command_follow_metals_words() {
                 .map(|(place, _)| place - 76)
                 .collect();
             assert_eq!(none, relayed, "{what}");
-            reims_vgpu_core::metal_check!(what, ours);
+            crate::metal_check!(what, ours);
         }
     }
 }

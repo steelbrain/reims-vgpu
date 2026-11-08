@@ -1,6 +1,6 @@
-//! The testkit manifest check (D50): the testkit stays out of the product. Core declares its
-//! `testkit` module under `#[cfg(any(test, feature = "testkit"))]`, and only dev-dependencies
-//! turn the feature on, so a product build cannot name it.
+//! The testkit manifest check (D50): the testkit stays out of the product. The Vulkan crate's
+//! `core` module declares its `testkit` module under `#[cfg(any(test, feature = "testkit"))]`, and
+//! only dev-dependencies turn the crate's feature on, so a product build cannot name it.
 
 /// A check's result: errors fail the command.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -8,10 +8,10 @@ pub struct Report {
     pub errors: Vec<String>,
 }
 
-/// The gate core's `lib.rs` puts on its testkit module.
+/// The gate core's `core.rs` puts on its testkit module.
 const GATE: &str = "#[cfg(any(test, feature = \"testkit\"))]";
 
-/// Checks core's `lib.rs` (`lib`, its text) and the crates' manifests (path, text).
+/// Checks core's `core.rs` (`lib`, its text) and the crates' manifests (path, text).
 pub fn testkit_manifests(lib: &str, manifests: &[(String, String)]) -> Report {
     let mut rep = Report::default();
     let mut prev = "";
@@ -19,7 +19,7 @@ pub fn testkit_manifests(lib: &str, manifests: &[(String, String)]) -> Report {
         let t = line.trim();
         if (t.starts_with("pub mod testkit") || t.starts_with("mod testkit")) && prev != GATE {
             rep.errors.push(format!(
-                "crates/reims-vgpu-core/src/lib.rs:{}: `mod testkit` must be under {GATE} (D50)",
+                "crates/reims-vgpu-vulkan/src/core.rs:{}: `mod testkit` must be under {GATE} (D50)",
                 i + 1
             ));
         }
@@ -37,7 +37,7 @@ pub fn testkit_manifests(lib: &str, manifests: &[(String, String)]) -> Report {
             }
             let dev = section.contains("dev-dependencies");
             let deps = section.contains("dependencies");
-            if deps && !dev && t.starts_with("reims-vgpu-core") && t.contains("\"testkit\"") {
+            if deps && !dev && t.starts_with("reims-vgpu-vulkan") && t.contains("\"testkit\"") {
                 rep.errors.push(format!(
                     "{path}:{}: the `testkit` feature outside [dev-dependencies] (D50)",
                     i + 1
@@ -63,7 +63,7 @@ mod tests {
         let lib = "#[cfg(any(test, feature = \"testkit\"))]\npub mod testkit;\npub mod real;\n";
         let manifests = vec![(
             "crates/a/Cargo.toml".to_owned(),
-            "[dependencies]\nreims-vgpu-core = { path = \"x\", features = [\"testkit\"] }\n[dev-dependencies]\nreims-vgpu-core = { path = \"x\", features = [\"testkit\"] }\n[features]\ndefault = [\"testkit\"]\n".to_owned(),
+            "[dependencies]\nreims-vgpu-vulkan = { path = \"x\", features = [\"testkit\"] }\n[dev-dependencies]\nreims-vgpu-vulkan = { path = \"x\", features = [\"testkit\"] }\n[features]\ndefault = [\"testkit\"]\n".to_owned(),
         )];
         let r = testkit_manifests(lib, &manifests);
         assert_eq!(r.errors.len(), 2, "{:#?}", r.errors);
@@ -72,6 +72,6 @@ mod tests {
         assert!(testkit_manifests(lib, &[]).errors.is_empty());
         let ungated = testkit_manifests("pub mod testkit;\n", &[]);
         assert_eq!(ungated.errors.len(), 1);
-        assert!(ungated.errors[0].contains("lib.rs:1"));
+        assert!(ungated.errors[0].contains("core.rs:1"));
     }
 }

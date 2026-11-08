@@ -26,7 +26,6 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::ops::video::{
     RGFX_VIDEO_ENTROPY_CABAC, RGFX_VIDEO_ENTROPY_CAVLC, RGFX_VIDEO_PICTURE_B, RGFX_VIDEO_PICTURE_I,
     RGFX_VIDEO_PICTURE_P, RGFX_VIDEO_RATE_CBR, RGFX_VIDEO_RATE_CQP, RGFX_VIDEO_RATE_VBR,
@@ -41,6 +40,7 @@ use reims_vgpu_video::nvidia::{
     EncodeParams, EncodeProfile, EncodeProfileSupport, EncodeRateControl, Gpu, NvencEncoder,
     PictureType, RawFrame, Tuning,
 };
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::super::video_host::{
     BackendError, EncodeFrame, EncodeSource, Encoded, HostEncodedFrame, HostEncoder, SourcePlane,

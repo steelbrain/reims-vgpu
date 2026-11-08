@@ -1,8 +1,8 @@
 //! What the Rust API (`reims-vgpu`) asks of this platform beyond core's `Platform`: a frame
 //! target's pixels ([`read_pixels`]).
 
+use crate::core::num::ToU64;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::ToU64;
 
 use crate::answer::{get, plain};
 use crate::gpu::resource::VulkanTexture;
@@ -23,8 +23,8 @@ pub fn read_pixels(texture: &VulkanTexture, dst: &mut [u8], bytes_per_row: usize
 
 #[cfg(test)]
 mod tests {
+    use crate::core::platform::Handle as _;
     use metal2vulkan::metal::PixelFormat;
-    use reims_vgpu_core::platform::Handle as _;
 
     use super::*;
     use crate::gpu::device::tests::dev;

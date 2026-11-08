@@ -43,17 +43,6 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::lock_api::ArcRwLockReadGuard;
 use parking_lot::{RawRwLock, RwLock};
-use reims_vgpu_core::host::HostQueue;
-use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
-use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::command::CommandBuffer as _;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::os::clock::Clock as _;
-use reims_vgpu_core::platform::resource::Texture;
-use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::ops::RgfxCommandBuffer;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
@@ -84,6 +73,17 @@ use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
     Screen,
 };
+use reims_vgpu_vulkan::core::host::HostQueue;
+use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
+use reims_vgpu_vulkan::core::num::ToU64;
+use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
+use reims_vgpu_vulkan::core::platform::resource::Texture;
+use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_window::{FrameSink, Window, WindowConfig, geometry};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -726,7 +726,7 @@ pub(crate) struct Presented<P: Platform> {
 impl<P: Platform> Default for Presented<P> {
     fn default() -> Self {
         Presented::new(Box::new(
-            reims_vgpu_core::platform::os::clock::MonoTime::default,
+            reims_vgpu_vulkan::core::platform::os::clock::MonoTime::default,
         ))
     }
 }
@@ -854,7 +854,9 @@ impl<P: Platform> Presented<P> {
         // goes on.
         let shown = std::mem::replace(&mut *self.texture.lock(), texture);
         let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
-        if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(shown)) {
+        if let Err(refusal) =
+            reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(shown))
+        {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "the texture of IOSurface {previous} was let go of, and its release was refused: \
@@ -885,7 +887,9 @@ impl<P: Platform> Presented<P> {
         let previous = self.surface_id.swap(0, Ordering::AcqRel);
         let shown = self.texture.lock().take();
         let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
-        if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(shown)) {
+        if let Err(refusal) =
+            reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(shown))
+        {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "the texture of IOSurface {previous} was let go of at the device's reset, and its \
@@ -2238,7 +2242,7 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 /// run a buffer's handlers); handed to the queue's service thread, which posts it and raises
 /// there, where a submission handler runs inside a commit on any other thread
 /// ([`foreign_committer`]). The platform's runtime may run every ready buffer's submission
-/// handlers inside one commit (`reims_vgpu_core::platform::command::committing`): the window's
+/// handlers inside one commit (`reims_vgpu_vulkan::core::platform::command::committing`): the window's
 /// render thread, the host's thread inside `rvg_graphics_device_read_display`, or another
 /// device's, which neither post nor raise for this one, so none of them waits for room on a full
 /// ring either.
@@ -2251,11 +2255,11 @@ fn post_from_handler(poster: &CompletionPoster, record: &[u8]) {
 }
 
 /// Whether this thread runs a submission handler inside a platform commit
-/// (`reims_vgpu_core::platform::command::inside_commit`) and is none of the threads the
+/// (`reims_vgpu_vulkan::core::platform::command::inside_commit`) and is none of the threads the
 /// header names for the device's raise ([`RAISE_THREADS`]). A handler run outside a commit runs
 /// on the platform's own thread.
 fn foreign_committer() -> bool {
-    reims_vgpu_core::platform::command::inside_commit()
+    reims_vgpu_vulkan::core::platform::command::inside_commit()
         && !std::thread::current()
             .name()
             .is_some_and(|name| RAISE_THREADS.iter().any(|named| name.starts_with(named)))

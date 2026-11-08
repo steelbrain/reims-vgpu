@@ -76,9 +76,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock, Weak};
 
+use crate::core::platform::types::SizeAndAlign;
+use crate::core::sync::{Mutex, MutexGuard};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::types::SizeAndAlign;
-use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 /// Metal's page on this host: a range holds whole pages.
 pub const PAGE: u64 = 0x4000;

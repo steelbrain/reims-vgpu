@@ -105,16 +105,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::core::host::HostPtr;
+use crate::core::platform::Handle;
+use crate::core::platform::rate_map::{RateMap, RateMapDescriptor, RateMapLayerDescriptor};
+use crate::core::platform::types::{MtlCoordinate2D, MtlSize, SizeAndAlign};
+use crate::core::platform::values::RateMapDesc;
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::Mutex;
 use metal2vulkan::bind;
 use metal2vulkan::metal::Mutability;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::rate_map::{RateMap, RateMapDescriptor, RateMapLayerDescriptor};
-use reims_vgpu_core::platform::types::{MtlCoordinate2D, MtlSize, SizeAndAlign};
-use reims_vgpu_core::platform::values::RateMapDesc;
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
     Policy, created_or_decided, get, hearing, plain, plain_at, refused, send, unrepresentable,
@@ -495,8 +495,8 @@ static NO_DRAW: Mutex<Vec<(u64, rt::RenderPipelineState)>> = Mutex::new(Vec::new
 /// 1 on a device without multiview. A refusal of the library, the function or the pipeline dies
 /// at `sel`.
 pub(crate) fn no_draw(sel: &'static str, device: &VulkanDevice) -> rt::RenderPipelineState {
+    use crate::core::platform::device::GpuDevice as _;
     use metal2vulkan::pipeline::{RenderPipelineDescriptor, StageSource};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
 
     let id = device.registry_id;
     // Held through the make, so two first asks make one.
@@ -688,10 +688,10 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::Platform;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::tests::dev;

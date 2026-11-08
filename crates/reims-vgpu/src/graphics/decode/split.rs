@@ -75,9 +75,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reims_vgpu_core::platform::command::{CompletedHandler, CompletedInfo};
-use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::platform::command::{CompletedHandler, CompletedInfo};
+use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 use super::sequencer::RangeOp;
 

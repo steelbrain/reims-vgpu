@@ -102,10 +102,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::core::num::{ToU64, ToUsize};
+use crate::core::platform::os::vm::{HostAddr, KernReturn};
+use crate::core::sync::Mutex;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::os::vm::{HostAddr, KernReturn};
-use reims_vgpu_core::sync::Mutex;
 
 use super::budget;
 use super::files;
@@ -268,7 +268,7 @@ impl Refused {
     /// Counts the refusal of `first..end`, which would have taken `adding` mappings: the count
     /// and the bytes so far, where the count is one to log.
     fn count(&self, first: u64, end: u64, adding: u64) -> Option<(u64, u64)> {
-        reims_vgpu_core::trace::event(self.record, &[first, end - first, adding]);
+        crate::core::trace::event(self.record, &[first, end - first, adding]);
         let bytes = self.bytes.fetch_add(end - first, Ordering::Relaxed) + (end - first);
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         count.is_power_of_two().then_some((count, bytes))
@@ -351,7 +351,7 @@ fn addr_of(at: NonNull<u8>) -> u64 {
 /// 2026-10-27, `super::vm`'s module docs, "Imports of views"). Nothing is learned where the view is
 /// not mapped through dma-bufs (udmabuf not the process's): no import then needs it.
 pub(crate) fn learn_view_imports(device: &rt::Device) {
-    use reims_vgpu_core::platform::os::vm::HostVm as _;
+    use crate::core::platform::os::vm::HostVm as _;
     if IMPORTS_NEED_FILES.load(Ordering::Relaxed) {
         return;
     }
@@ -791,7 +791,7 @@ fn address(at: u64) -> Option<NonNull<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
+    use crate::core::platform::os::vm::{HostVm as _, VmProt};
 
     use super::super::LinuxVm;
     use super::*;
@@ -903,7 +903,7 @@ mod tests {
         assert!(view.vouched(), "every page writable");
         drop(view);
         let second = address(first + PAGE).unwrap();
-        let second = reims_vgpu_core::host::HostPtr::from_ptr(second.as_ptr());
+        let second = crate::core::host::HostPtr::from_ptr(second.as_ptr());
         assert!(vm.protect_max(second, PAGE, VmProt::READ).is_ok());
         let view = import_view(p, 2 * PAGE, true);
         assert!(view.twinned(), "a twin of the read-only page");
@@ -1005,7 +1005,7 @@ mod tests {
     /// them, as its zeros map the block of zeros
     #[test]
     fn a_read_only_alias_with_zeros_past_its_pages_is_twinned() {
-        use reims_vgpu_core::platform::types::ResourceAddressRange;
+        use crate::core::platform::types::ResourceAddressRange;
 
         let vm = LinuxVm::new();
         let guest = vm::allocate_aliasable(PAGE).unwrap();
@@ -1038,9 +1038,9 @@ mod tests {
     /// answers nil there by default, counted, as when memory runs out, and dies in strict mode
     #[test]
     fn a_gather_of_pages_without_a_file_is_the_hosts_refusal() {
-        use reims_vgpu_core::platform::types::ResourceAddressRange;
-        use reims_vgpu_core::raise::death::DeathKind;
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::platform::types::ResourceAddressRange;
+        use crate::core::raise::death::DeathKind;
+        use crate::core::testkit::capture::catch_death;
 
         let vm = LinuxVm::new();
         let at = vm.allocate_anywhere(PAGE).unwrap();
@@ -1081,8 +1081,8 @@ mod tests {
     /// which nextest runs this test alone in.
     #[test]
     fn past_the_headroom_imports_are_refused_at_the_gate() {
-        use reims_vgpu_core::raise::death::DeathKind;
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::raise::death::DeathKind;
+        use crate::core::testkit::capture::catch_death;
         fn dies<R>(f: impl FnOnce() -> R) -> bool {
             catch_death(f).is_err_and(|site| (site.kind, site.file) == (DeathKind::Abort, "mmap"))
         }

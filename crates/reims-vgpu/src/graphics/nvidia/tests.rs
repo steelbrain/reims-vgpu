@@ -3,14 +3,14 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::types::CommandBufferStatus;
 use reims_vgpu_video::core::device_memory::MemoryLife;
 use reims_vgpu_video::nvidia::{
     EncodeParams, EncodeProfile, EncodeRateControl, NvencEncoder, RawFrame, Tuning,
 };
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
 
 use super::*;
 

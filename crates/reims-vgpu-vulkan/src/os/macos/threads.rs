@@ -14,8 +14,8 @@ use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::os::{Threads, TimerClock};
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal};
+use crate::core::platform::os::{Threads, TimerClock};
+use crate::core::raise::death::{DeathId, DeathKind, fatal};
 
 use super::clock::MacClock;
 
@@ -100,7 +100,7 @@ impl Threads for MacThreads {
 
     /// A worker named after its queue, with a GCD worker's 512 KiB of stack.
     fn spawn_worker(&self, label: &'static str, body: Box<dyn FnOnce() + Send>) {
-        spawn_pthread(label, reims_vgpu_core::rt::queue::WORKER_STACK, body)
+        spawn_pthread(label, crate::core::rt::queue::WORKER_STACK, body)
     }
 
     fn handle(&self) -> Arc<dyn Threads> {
@@ -185,7 +185,7 @@ mod tests {
     /// thread, a queue's worker and a timer's handler.
     mod a_raising_block_dies_uncaught {
         use super::*;
-        use reims_vgpu_core::rt::{SerialQueue, Timer};
+        use crate::core::rt::{SerialQueue, Timer};
 
         /// Prints `DROPPED` when dropped: a block's capture.
         struct Tracer;
@@ -201,14 +201,13 @@ mod tests {
                 handler: Option<unsafe extern "C" fn(*mut objc2::runtime::AnyObject)>,
             );
             #[link_name = "_exit"]
-            fn libc_exit(status: std::ffi::c_int) -> !;
+            safe fn libc_exit(status: std::ffi::c_int) -> !;
         }
 
         /// The host's uncaught-exception handler: reports and ends the process with status 42.
         unsafe extern "C" fn uncaught(_exception: *mut objc2::runtime::AnyObject) {
             eprintln!("UNCAUGHT");
-            // SAFETY: ends the process at once.
-            unsafe { libc_exit(42) }
+            libc_exit(42)
         }
 
         /// The host's code: raises an NSException.
@@ -288,7 +287,7 @@ mod tests {
             unsafe { NSSetUncaughtExceptionHandler(Some(uncaught)) };
             let q = SerialQueue::new(&MacThreads::new(), "dev.reims.vgpu.t.raise");
             let tracer = Tracer;
-            use reims_vgpu_core::platform::os::{Clock as _, Deadline};
+            use crate::core::platform::os::{Clock as _, Deadline};
             let _t = Timer::start(
                 &q,
                 Deadline::Wall(MacClock::new().now_wall()),

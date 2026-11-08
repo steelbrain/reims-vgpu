@@ -68,8 +68,8 @@ use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, OnceLock};
 
+use crate::core::sync::Mutex;
 use metal2vulkan_runtime::DmaBufChunk;
-use reims_vgpu_core::sync::Mutex;
 
 use super::files::{self, Backing};
 use super::vm;
@@ -556,8 +556,8 @@ fn create(device: &OwnedFd, runs: &[Run<Arc<OwnedFd>>]) -> Result<OwnedFd, Refus
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
-    use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _};
+    use crate::core::num::{ToU64 as _, ToUsize as _};
+    use crate::core::platform::os::vm::{HostAddr, HostVm as _};
 
     use super::*;
 

@@ -17,11 +17,13 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _, CompletedInfo};
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+use reims_vgpu_vulkan::core::platform::command::{
+    CommandBuffer as _, CommandQueue as _, CompletedInfo,
+};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::types::NsRange;
+use reims_vgpu_vulkan::core::raise::OnFault;
 
 use crate::platform::ApiPlatform;
 

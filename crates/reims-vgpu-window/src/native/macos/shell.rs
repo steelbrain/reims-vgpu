@@ -59,7 +59,7 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSNotification, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, ns_string,
 };
-use reims_vgpu_core::rt::BlockEnv;
+use reims_vgpu_vulkan::core::rt::BlockEnv;
 use reims_vgpu_vulkan::os::msg;
 
 use super::main_thread::{MainOnly, responds, shared_app};

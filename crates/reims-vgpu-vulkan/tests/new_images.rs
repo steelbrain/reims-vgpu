@@ -31,17 +31,17 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::os::clock::{Clock, MonoTime};
-use reims_vgpu_core::platform::os::surface::SurfaceSpec;
-use reims_vgpu_core::platform::resource::{Buffer, Library};
-use reims_vgpu_core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
-use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock, MonoTime};
+use reims_vgpu_vulkan::core::platform::os::surface::SurfaceSpec;
+use reims_vgpu_vulkan::core::platform::resource::{Buffer, Library};
+use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
+use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+use reims_vgpu_vulkan::core::raise::OnFault;
 
 /// The kernel that keeps the GPU busy (`src/gpu/spin.metal`).
 const SPIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spin.metallib"));

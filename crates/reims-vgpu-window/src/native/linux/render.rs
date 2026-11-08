@@ -24,8 +24,8 @@
 use std::sync::Arc;
 
 use ash::vk;
-use reims_vgpu_core::rt::spawn_named;
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::rt::spawn_named;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 use reims_vgpu_vulkan::os::OsThreads;
 use sdl3_sys::everything::{SDL_Vulkan_CreateSurface, SDL_Window};
 

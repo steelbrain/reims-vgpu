@@ -275,8 +275,8 @@ pub fn two_plane(pf: PixelFormat) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
 
     use crate::gpu::device::tests::dev;
 

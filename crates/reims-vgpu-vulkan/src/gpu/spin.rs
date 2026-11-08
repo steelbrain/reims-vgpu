@@ -19,14 +19,14 @@
 
 use std::time::Duration;
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::os::Clock as _;
-use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-use reims_vgpu_core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
-use reims_vgpu_core::raise::OnFault;
+use crate::core::platform::Platform;
+use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::os::Clock as _;
+use crate::core::platform::resource::{Buffer as _, Library as _};
+use crate::core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
+use crate::core::raise::OnFault;
 
 use crate::VulkanPlatform;
 use crate::gpu::device::VulkanDevice;

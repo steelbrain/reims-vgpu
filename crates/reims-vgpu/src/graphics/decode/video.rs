@@ -23,12 +23,6 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::CommandBuffer as _;
-use reims_vgpu_core::platform::event::EventRef;
-use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::platform::types::PixelFormatInfo;
-use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_graphics::ops::video::{
     RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RGFX_OP_VIDEO_ENCODE_H264,
     RGFX_OP_VIDEO_ENCODE_H265, RGFX_VIDEO_ENCODE_FORCE_KEYFRAME, RgfxVideoEncodeResult,
@@ -42,6 +36,12 @@ use reims_vgpu_video::core::device_memory::{DeviceMemory, HostView, MemoryIdenti
 #[cfg(target_os = "linux")]
 use reims_vgpu_video::core::device_memory::{DmaBufError, SurfaceDmaBuf};
 use reims_vgpu_video::core::surfaces::SurfaceError;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
+use reims_vgpu_vulkan::core::platform::event::EventRef;
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
+use reims_vgpu_vulkan::core::raise::RaiseResult;
 use zerocopy::FromBytes;
 
 use super::worker::Worker;

@@ -16,12 +16,14 @@
 //!
 //! [`RGFX_OP_GROUP_BLIT`]: reims_vgpu_graphics::ops::RGFX_OP_GROUP_BLIT
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
-use reims_vgpu_core::platform::host_range::HostRange;
-use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_graphics::ops::blit::*;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
+use reims_vgpu_vulkan::core::platform::host_range::HostRange;
+use reims_vgpu_vulkan::core::platform::types::{
+    ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange,
+};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
 
 use super::{GraphicsDecoder, op_fault};
@@ -530,17 +532,17 @@ fn clear_color(bits: [u64; 4]) -> ClearColor {
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::platform::Handle;
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::values::IcbDesc;
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_core::testkit::calllog::Arg;
     use reims_vgpu_graphics::ops::{RGFX_OP_BODY_OFFSET, RgfxOpHeader};
     use reims_vgpu_graphics::wire::{
         RGFX_CMD_BUFFER_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate,
         RgfxMsgHeader, RgfxObjectCreate, RgfxTextureCreate, RgfxTextureDescriptor,
     };
+    use reims_vgpu_vulkan::core::platform::Handle;
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+    use reims_vgpu_vulkan::core::platform::values::IcbDesc;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::calllog::Arg;
     use zerocopy::IntoBytes;
 
     use super::super::ObjHandle;

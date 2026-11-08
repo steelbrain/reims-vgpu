@@ -121,10 +121,10 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::ptr::NonNull;
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
-use reims_vgpu_core::sync::Mutex;
+use crate::core::host::HostPtr;
+use crate::core::num::{ToU64, ToUsize};
+use crate::core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
+use crate::core::sync::Mutex;
 
 use crate::os::OsVm;
 

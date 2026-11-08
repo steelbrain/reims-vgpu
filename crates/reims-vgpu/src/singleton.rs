@@ -4,13 +4,13 @@
 //! platform instance (D17), so every public constructor goes through the process's: [`platform`],
 //! one `VulkanPlatform` per process, made on first use. Making it installs the aborting panic hook
 //! first (6.5), then the stderr logger if `REIMS_VGPU_LOG` asks for it
-//! (`reims_vgpu_core::logging::init`). Every function of the C API installs the hook too, before
+//! (`reims_vgpu_vulkan::core::logging::init`). Every function of the C API installs the hook too, before
 //! its body runs, since some make no platform.
 
 use std::sync::{Arc, Once, OnceLock};
 
-use reims_vgpu_core::rt::is_our_thread;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::rt::is_our_thread;
 
 static PLATFORM: OnceLock<Arc<VulkanPlatform>> = OnceLock::new();
 static HOOK: Once = Once::new();
@@ -21,7 +21,7 @@ pub fn platform() -> Arc<VulkanPlatform> {
     PLATFORM
         .get_or_init(|| {
             install_panic_hook();
-            reims_vgpu_core::logging::init();
+            reims_vgpu_vulkan::core::logging::init();
             Arc::new(VulkanPlatform::new())
         })
         .clone()
@@ -38,7 +38,7 @@ pub(crate) fn hook_message(info: &dyn std::fmt::Display) -> String {
 /// process as a death does: one line on stderr, then `abort()`, before anything unwinds, so no
 /// panic crosses into the host's frames and no drop runs first. Inside a refusal scope (the
 /// graphics lane's ops) it is refused as a death there is: the line is written, and the panic
-/// unwinds to the scope, which refuses the op (`reims_vgpu_core::raise::refusals`, "Panics"). A
+/// unwinds to the scope, which refuses the op (`reims_vgpu_vulkan::core::raise::refusals`, "Panics"). A
 /// panic anywhere else is the host's own, and goes to the previous hook.
 pub fn install_panic_hook() {
     HOOK.call_once(|| {
@@ -47,7 +47,7 @@ pub fn install_panic_hook() {
             if is_our_thread() {
                 use std::io::Write as _;
                 let _ = std::io::stderr().write_all(hook_message(info).as_bytes());
-                if reims_vgpu_core::raise::refusals::refuses_panics() {
+                if reims_vgpu_vulkan::core::raise::refusals::refuses_panics() {
                     return;
                 }
                 #[allow(clippy::disallowed_methods)] // a panic's abort (6.5)
@@ -80,12 +80,12 @@ mod tests {
     /// capture off, as the product runs.
     #[test]
     fn a_panic_in_a_refusal_scope_is_refused_and_the_process_goes_on() {
-        use reims_vgpu_core::raise::death::DeathId;
-        use reims_vgpu_core::raise::refusals::refusing;
+        use reims_vgpu_vulkan::core::raise::death::DeathId;
+        use reims_vgpu_vulkan::core::raise::refusals::refusing;
         if std::env::var_os("RVG_SCOPED_PANIC_CHILD").is_some() {
-            reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+            reims_vgpu_vulkan::core::testkit::capture::set_capture_enabled(false);
             install_panic_hook();
-            let _ours = reims_vgpu_core::rt::enter_ours();
+            let _ours = reims_vgpu_vulkan::core::rt::enter_ours();
             let r: Result<(), _> = refusing(|| panic!("in a guest op"));
             assert_eq!(r.unwrap_err().id, DeathId::Panic);
             let _ = std::io::Write::write_all(&mut std::io::stderr(), b"the process goes on\n");
@@ -118,7 +118,7 @@ mod tests {
             let b = platform();
             assert!(Arc::ptr_eq(&a, &b));
             // The hook is in: a panic on our thread now aborts.
-            let _ours = reims_vgpu_core::rt::enter_ours();
+            let _ours = reims_vgpu_vulkan::core::rt::enter_ours();
             panic!("after platform()");
         }
         let out = child(
@@ -147,7 +147,7 @@ mod tests {
                 }
             }
             install_panic_hook();
-            let _ours = reims_vgpu_core::rt::enter_ours();
+            let _ours = reims_vgpu_vulkan::core::rt::enter_ours();
             let _l = Loud;
             panic!("ours panic");
         }

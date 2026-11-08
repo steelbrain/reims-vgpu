@@ -3,6 +3,8 @@
 //! Every call is on `mach_task_self()`; the `kern_return_t` goes back raw. Only `== KERN_SUCCESS`
 //! is ever tested.
 
+use crate::core::num::{ToU64, ToUsize};
+use crate::core::platform::os::vm::{HostAddr, KernReturn, VmProt};
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::traps::mach_task_self;
 use mach2::vm::{mach_vm_allocate, mach_vm_deallocate, mach_vm_protect, mach_vm_remap};
@@ -10,8 +12,6 @@ use mach2::vm_inherit::VM_INHERIT_COPY;
 use mach2::vm_prot::vm_prot_t;
 use mach2::vm_statistics::{VM_FLAGS_ANYWHERE, VM_FLAGS_FIXED, VM_FLAGS_OVERWRITE};
 use mach2::vm_types::mach_vm_address_t;
-use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::os::vm::{HostAddr, KernReturn, VmProt};
 
 /// Mach VM (`mach_vm_*`, `vm_page_size`).
 #[derive(Debug, Default)]
@@ -81,7 +81,7 @@ fn check(kr: kern_return_t) -> Result<(), KernReturn> {
     }
 }
 
-impl reims_vgpu_core::platform::os::vm::HostVm for MacVm {
+impl crate::core::platform::os::vm::HostVm for MacVm {
     /// `vm_page_size`: 19 uses.
     fn page_size(&self) -> u64 {
         // SAFETY: `vm_page_size` is a libsystem_kernel global, set before `main` and never
@@ -174,7 +174,7 @@ impl reims_vgpu_core::platform::os::vm::HostVm for MacVm {
 mod tests {
 
     use super::*;
-    use reims_vgpu_core::platform::os::vm::HostVm;
+    use crate::core::platform::os::vm::HostVm;
 
     /// `KERN_INVALID_ADDRESS`.
     const KERN_INVALID_ADDRESS: i32 = 1;

@@ -19,10 +19,10 @@
 
 use std::panic::AssertUnwindSafe;
 
+use crate::core::raise::Raise;
+use crate::core::raise::death::{DeathId, DeathKind};
 use objc2::exception::{self, Exception};
 use objc2_foundation::{NSException, NSString};
-use reims_vgpu_core::raise::Raise;
-use reims_vgpu_core::raise::death::{DeathId, DeathKind};
 
 /// An Objective-C exception raised inside a call, caught at the call before any Rust frame
 /// unwound. Its name and reason are diagnostics: they reach logs, never a decision.
@@ -132,8 +132,8 @@ pub fn value<R>(sel: &'static str, f: impl FnOnce() -> R) -> R {
                 call: sel,
             };
             match exception_detail(&name, &reason) {
-                Some(detail) => reims_vgpu_core::raise::death::fatal_with_detail(id, &detail),
-                None => reims_vgpu_core::raise::fatal(id),
+                Some(detail) => crate::core::raise::death::fatal_with_detail(id, &detail),
+                None => crate::core::raise::fatal(id),
             }
         }
     }
@@ -147,10 +147,10 @@ pub fn string_text(s: &NSString) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::testkit::capture::catch_death;
     use objc2::rc::Retained;
     use objc2::runtime::NSObject;
     use objc2_foundation::{NSArray, NSString};
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     fn array() -> Retained<NSArray<NSObject>> {
         NSArray::new()

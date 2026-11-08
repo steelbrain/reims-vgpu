@@ -38,8 +38,8 @@
 //! The answers need a device, any of the process's, as every device answers alike
 //! ([`crate::platform::answering_device`]).
 
+use crate::core::platform::types::{PixelFormatInfo, TextureLevelInfo, TextureLevelQuery};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::types::{PixelFormatInfo, TextureLevelInfo, TextureLevelQuery};
 
 /// Metal's description of `raw`, asked by `sel` of the process's device
 /// ([`crate::platform::answering_device`]).

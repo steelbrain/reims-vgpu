@@ -150,6 +150,15 @@
 use std::collections::BTreeMap;
 use std::sync::Weak;
 
+use crate::core::platform::resource::RenderPipeline as _;
+use crate::core::platform::types::{MtlSize, NsErrorText};
+use crate::core::platform::values::{
+    ColorAttachmentDesc, DepthStencilDesc, FullComputePipelineDesc, FullMeshRenderPipelineDesc,
+    FullRenderPipelineDesc, LinkedFunctionsDesc, PrivateRenderDesc, RenderPipelineDesc,
+    SamplerDesc, StageInputDesc, StencilDesc, VertexDesc,
+};
+use crate::core::raise::RaiseResult;
+use crate::core::sync::Mutex;
 use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::metal::PrimitiveTopologyClass;
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
@@ -160,15 +169,6 @@ use metal2vulkan::pipeline::{
     VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::resource::RenderPipeline as _;
-use reims_vgpu_core::platform::types::{MtlSize, NsErrorText};
-use reims_vgpu_core::platform::values::{
-    ColorAttachmentDesc, DepthStencilDesc, FullComputePipelineDesc, FullMeshRenderPipelineDesc,
-    FullRenderPipelineDesc, LinkedFunctionsDesc, PrivateRenderDesc, RenderPipelineDesc,
-    SamplerDesc, StageInputDesc, StencilDesc, VertexDesc,
-};
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
     Nil, Policy, create, decide_describing, error_text, get_describing, plain, plain_at, relay_gap,
@@ -1202,13 +1202,13 @@ pub(crate) fn compute_formats(d: &ComputePipelineDescriptor) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::platform::Handle;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::resource::{DepthStencilState, SamplerState};
+    use crate::core::platform::resource::{Library, RenderPipeline};
+    use crate::core::raise::OnFault;
+    use crate::core::testkit::capture::catch_death;
     use metal2vulkan::metal::PixelFormat;
-    use reims_vgpu_core::platform::Handle;
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::{DepthStencilState, SamplerState};
-    use reims_vgpu_core::platform::resource::{Library, RenderPipeline};
-    use reims_vgpu_core::raise::OnFault;
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -1308,7 +1308,7 @@ mod tests {
     /// attribute it lacks
     #[test]
     fn a_whole_render_value_carries_its_vertex_descriptor() {
-        use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
+        use crate::core::platform::values::{AttributeDesc, BufferLayoutDesc};
         let (v, f) = vertex_descriptor_functions();
         let d = dev();
         let mut desc = full_render(&v, Some(&f));
@@ -1430,9 +1430,9 @@ mod tests {
     /// value's other fields are the runtime descriptor's own
     #[test]
     fn a_whole_compute_value_carries_its_stage_input() {
+        use crate::core::platform::resource::ComputePipeline as _;
+        use crate::core::platform::values::{AttributeDesc, BufferLayoutDesc};
         use crate::gpu::device::tests::{STAGEIN, fixture_function};
-        use reims_vgpu_core::platform::resource::ComputePipeline as _;
-        use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
         let f = fixture_function(STAGEIN);
         let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
         let mut desc = FullComputePipelineDesc {
@@ -1614,10 +1614,10 @@ mod tests {
         include_bytes!(concat!(env!("OUT_DIR"), "/linked_callee.metallib"));
 
     /// The float constant of `index` whose value is `v`.
-    fn float_constant(index: u32, v: f32) -> reims_vgpu_core::platform::resource::FunctionConstant {
-        let mut value = [0; reims_vgpu_core::platform::resource::FunctionConstant::MAX_BYTES];
+    fn float_constant(index: u32, v: f32) -> crate::core::platform::resource::FunctionConstant {
+        let mut value = [0; crate::core::platform::resource::FunctionConstant::MAX_BYTES];
         value[..4].copy_from_slice(&v.to_le_bytes());
-        reims_vgpu_core::platform::resource::FunctionConstant {
+        crate::core::platform::resource::FunctionConstant {
             index,
             data_type: 3,
             value,
@@ -1627,7 +1627,7 @@ mod tests {
     /// `linked_callee.metal`'s `linked_gradient` of `callee` with `linked_gradient_scale` 0.5,
     /// made by descriptor under `specialized` where given: the function RenderBox links under
     /// `custom_fn`. `None` where the library makes none.
-    pub(super) fn gradient<P: reims_vgpu_core::platform::Platform>(
+    pub(super) fn gradient<P: crate::core::platform::Platform>(
         callee: &P::Library,
         specialized: Option<&str>,
     ) -> Option<P::Function> {
@@ -1646,19 +1646,19 @@ mod tests {
     /// `linked_effect_alpha` 0.75 and `linked` linked to its stage (RenderBox's custom effect),
     /// writes for each pixel of a 4x4 target on `p`'s device `d`, by its bits: `None` where the
     /// pipeline is refused.
-    pub(super) fn custom_effect<P: reims_vgpu_core::platform::Platform>(
+    pub(super) fn custom_effect<P: crate::core::platform::Platform>(
         p: &P,
         d: &P::Device,
         caller: &P::Library,
         linked: &P::Function,
     ) -> Option<Vec<[u32; 4]>> {
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::NsRange;
-        use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use crate::core::platform::descriptor::RenderPassDescriptor as _;
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::NsRange;
+        use crate::core::platform::values::{ColorAttachmentSet, TextureDesc};
+        let _pool = crate::core::rt::Pool::here();
         let vertex = caller
             .new_function(OnFault::Die, "linked_effect_vertex")
             .unwrap()
@@ -1978,7 +1978,7 @@ mod tests {
     fn death_line<T>(f: impl FnOnce() -> T) -> (&'static str, String) {
         *crate::answer::LAST_LINE.lock() = None;
         let site = catch_death(f).err().expect("it dies");
-        assert_eq!(site.kind, reims_vgpu_core::raise::death::DeathKind::Abort);
+        assert_eq!(site.kind, crate::core::raise::death::DeathKind::Abort);
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
         (site.file, line)
     }
@@ -2106,9 +2106,9 @@ mod tests {
     /// A stage of the platform's own vertex function, from its metallib on the CPU: the lines of
     /// a descriptor's formats read no stage.
     fn cpu_stage() -> StageSource {
+        use crate::core::display::pipeline::VERTEX_FUNCTION;
         use metal2vulkan::library::Library;
         use metal2vulkan::pipeline::FunctionDescriptor;
-        use reims_vgpu_core::display::pipeline::VERTEX_FUNCTION;
         let library = Library::from_metallib(crate::gpu::shaders::METALLIB).unwrap();
         StageSource::Function(FunctionDescriptor::new(
             library.function(VERTEX_FUNCTION).unwrap(),

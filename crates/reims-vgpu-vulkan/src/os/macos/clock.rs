@@ -13,8 +13,8 @@
 
 use std::time::Duration;
 
-use reims_vgpu_core::platform::os::{Clock, Deadline, MonoTime, TimedOut, WallTime};
-use reims_vgpu_core::sync::{Condvar, MutexGuard};
+use crate::core::platform::os::{Clock, Deadline, MonoTime, TimedOut, WallTime};
+use crate::core::sync::{Condvar, MutexGuard};
 
 /// `clockid_t` of `CLOCK_MONOTONIC_RAW` (`<time.h>`): libc++'s `steady_clock` on Apple.
 const CLOCK_MONOTONIC_RAW: libc::clockid_t = 4;
@@ -99,7 +99,7 @@ impl Clock for MacClock {
 mod tests {
 
     use super::*;
-    use reims_vgpu_core::sync::Mutex;
+    use crate::core::sync::Mutex;
     use std::sync::Arc;
 
     const MS: Duration = Duration::from_millis(1);

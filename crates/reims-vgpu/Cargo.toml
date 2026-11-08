@@ -14,13 +14,12 @@ default = ["macos-sdl"]
 # Linux's window is SDL3's whatever this says.
 macos-sdl = ["reims-vgpu-window/macos-sdl"]
 # Tests: the core objects behind the public handles (`core()`), and core's testkit.
-testkit = ["reims-vgpu-core/testkit"]
+testkit = ["reims-vgpu-vulkan/testkit"]
 # Kept for the builds that name it (`--features vulkan`): the Vulkan platform is the library's only
 # one, everywhere, so the feature changes nothing.
 vulkan = []
 
 [dependencies]
-reims-vgpu-core.workspace = true
 reims-vgpu-window.workspace = true
 # The reims-graphics device's host video: its runtime, which the video arms run on (`video`), and
 # on Linux the arms' VA-API and NVDEC (`graphics::vaapi`, `graphics::nvidia`).
@@ -48,7 +47,7 @@ reims-vgpu-vulkan.workspace = true
 metal2vulkan-runtime.workspace = true
 
 [dev-dependencies]
-reims-vgpu-core = { workspace = true, features = ["testkit"] }
+reims-vgpu-vulkan = { workspace = true, features = ["testkit"] }
 
 # The decoder's tests of Metal's own stitched functions (`graphics::decode`); `entry`'s tests read
 # retain counts with `objc2`.

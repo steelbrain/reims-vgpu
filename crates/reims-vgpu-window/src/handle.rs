@@ -47,8 +47,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::os::MonoTime;
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::platform::os::MonoTime;
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 pub use crate::present::FrameSink;
 

@@ -113,13 +113,13 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
+use crate::core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
+use crate::core::platform::icb::IndirectCommandBuffer as _;
+use crate::core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize};
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::{Mutex, ReentrantMutex};
 use metal2vulkan::metal::PixelFormat;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
-use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
-use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
 
 use crate::answer::{
     Policy, decide, metal_aborts, plain, plain_at, send, send_describing, unrepresentable,
@@ -325,10 +325,7 @@ fn some<'a, T>(sel: &'static str, object: Option<&'a T>, what: &str) -> &'a T {
 }
 
 /// The indices `r` names, for `sel`; a range whose end passes `u64::MAX` dies.
-fn indices(
-    sel: &'static str,
-    r: reims_vgpu_core::platform::types::NsRange,
-) -> std::ops::Range<u64> {
+fn indices(sel: &'static str, r: crate::core::platform::types::NsRange) -> std::ops::Range<u64> {
     range(r).unwrap_or_else(|| unrepresentable(sel, &format!("the range {r:?}")))
 }
 
@@ -345,7 +342,7 @@ impl VulkanBlitEncoder {
         sel: &'static str,
         texture: &VulkanTexture,
         (level, slice, region): (u64, u64, MtlRegion),
-        bytes: reims_vgpu_core::platform::HostRange<'_>,
+        bytes: crate::core::platform::HostRange<'_>,
     ) -> RaiseResult<()> {
         let raw = texture.copied(sel);
         let shape = plain(|| fill::Shape {
@@ -1152,13 +1149,13 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange};
-    use reims_vgpu_core::platform::values::TextureDesc;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::command::{CommandBuffer, CommandQueue};
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::resource::Buffer as _;
+    use crate::core::platform::types::{MtlOrigin, MtlSize, NsRange};
+    use crate::core::platform::values::TextureDesc;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::command::VulkanCommandBuffer;
@@ -1304,7 +1301,7 @@ mod tests {
             || (d.raw.properties().driver_facts)
                 .contains(&rt::DriverFact::DepthImageKeepsValuesOutsideUnitRange);
         let desc = crate::platform::tests::platform().texture_descriptor(
-            &reims_vgpu_core::platform::values::TextureDesc {
+            &crate::core::platform::values::TextureDesc {
                 pixel_format: 260,
                 width: 4,
                 height: 4,
@@ -1409,8 +1406,8 @@ mod tests {
     /// them in an order that varies from run to run. Each case's last blit is the one that dies
     #[test]
     fn two_plane_xr10_blits_metal_was_not_measured_at_die() {
-        use reims_vgpu_core::platform::resource::Heap as _;
-        use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+        use crate::core::platform::resource::Heap as _;
+        use crate::core::platform::values::{HeapDesc, OptionSet};
         let d = dev();
         let p = crate::platform::tests::platform();
         let made = |desc: TextureDesc| {
@@ -1564,7 +1561,7 @@ mod tests {
                 cb.wait_until_completed(OnFault::Return).unwrap();
             })
             .unwrap_err();
-            let abort = reims_vgpu_core::raise::death::DeathKind::Abort;
+            let abort = crate::core::raise::death::DeathKind::Abort;
             assert_eq!((site.kind, site.file), (abort, sel), "{case}");
         }
     }

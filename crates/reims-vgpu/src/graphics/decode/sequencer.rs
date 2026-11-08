@@ -44,7 +44,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use reims_vgpu_core::sync::{Condvar, Mutex, MutexGuard};
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 
 /// A range message's work, carried out once its context's tickets before it are given back.
 pub(crate) type RangeOp = Box<dyn FnOnce() + Send>;

@@ -3,15 +3,15 @@
 
 use std::ffi::c_void;
 
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-use reims_vgpu_core::platform::types::{MtlSize, NsRange};
-use reims_vgpu_core::platform::values::{SamplerDesc, TextureDesc};
-use reims_vgpu_core::raise::OnFault;
+use crate::core::platform::Handle as _;
+use crate::core::platform::Platform;
+use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::resource::{Buffer as _, Library as _};
+use crate::core::platform::types::{MtlSize, NsRange};
+use crate::core::platform::values::{SamplerDesc, TextureDesc};
+use crate::core::raise::OnFault;
 
 use super::*;
 use crate::os::OsSurface;
@@ -89,7 +89,7 @@ pub(crate) fn surface_420(ostype: &[u8; 4], size: (u64, u64)) -> OsSurface {
 pub(crate) fn surface_420_over(
     ostype: &[u8; 4],
     size: (u64, u64),
-) -> (OsSurface, reims_vgpu_core::host::HostPtr, u64) {
+) -> (OsSurface, crate::core::host::HostPtr, u64) {
     surface_420_over_at(ostype, size, 0)
 }
 
@@ -99,10 +99,10 @@ pub(crate) fn surface_420_over_at(
     ostype: &[u8; 4],
     size: (u64, u64),
     offset: u64,
-) -> (OsSurface, reims_vgpu_core::host::HostPtr, u64) {
-    use reims_vgpu_core::host::PhysicalMemoryRange;
-    use reims_vgpu_core::num::ToU64;
-    use reims_vgpu_core::platform::os::vm::HostVm as _;
+) -> (OsSurface, crate::core::host::HostPtr, u64) {
+    use crate::core::host::PhysicalMemoryRange;
+    use crate::core::num::ToU64;
+    use crate::core::platform::os::vm::HostVm as _;
     let mut spec = spec_420(ostype, size);
     let vm = crate::os::OsVm::new();
     let page = vm.page_size();
@@ -173,7 +173,7 @@ pub(crate) fn probed_texels<P: Platform>(
 ) -> Vec<u8> {
     // What Metal autoreleases for the probe (its command buffer and encoder, which a dev build
     // cannot elide) goes at its end.
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = crate::core::rt::Pool::here();
     let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
     let f = library.new_function(OnFault::Die, kernel).unwrap().unwrap();
     let state = d
@@ -401,16 +401,16 @@ pub(crate) fn drawn<P: Platform>(
     sampler: &P::SamplerState,
     bytes: &[u8],
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-    use reims_vgpu_core::platform::types::NsRange;
-    use reims_vgpu_core::platform::values::{ColorAttachmentSet, RenderPipelineDesc};
-    use reims_vgpu_core::raise::OnFault;
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::descriptor::RenderPassDescriptor as _;
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::{Buffer as _, Library as _};
+    use crate::core::platform::types::NsRange;
+    use crate::core::platform::values::{ColorAttachmentSet, RenderPipelineDesc};
+    use crate::core::raise::OnFault;
     // What Metal autoreleases for the draw goes at its end, and its queue is the tests' one
     // (`test_queue`): a draw of its own queue each would pass the process's limit of queues.
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = crate::core::rt::Pool::here();
     let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
     let (vertex, fragment) = (function("cover_vertex"), function(fragment));
@@ -535,7 +535,7 @@ impl Shape {
         luma: impl Fn(u64, u64) -> u16,
         chroma: impl Fn(u64, u64) -> (u16, u16),
     ) {
-        use reims_vgpu_core::platform::os::surface::Surface as _;
+        use crate::core::platform::os::surface::Surface as _;
         let (y_plane, c_plane) = (
             crate::os::plane(surface, 0).unwrap(),
             crate::os::plane(surface, 1).unwrap(),
@@ -586,7 +586,7 @@ impl Shape {
         luma: impl Fn(u64, u64) -> u16,
         chroma: impl Fn(u64, u64) -> (u16, u16),
     ) {
-        use reims_vgpu_core::platform::os::surface::Surface as _;
+        use crate::core::platform::os::surface::Surface as _;
         let base = surface.base_address().as_ptr::<u8>();
         let write = |plane: &metal2vulkan_runtime::IoSurfacePlane, y: u64, i: u64, code: u16| {
             let at = plane.offset + y * plane.bytes_per_row + i / 3 * 4;

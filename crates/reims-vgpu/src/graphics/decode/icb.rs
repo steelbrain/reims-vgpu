@@ -19,14 +19,6 @@
 //! and dispatches are dropped until the guest resets it ([`Dropped`]). Nothing else of the
 //! buffer changes, and the command buffers that execute it go on.
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::icb::{
-    IcbComputeCmd, IcbRenderCmd, IndirectCommandBuffer, IndirectComputeCommand,
-    IndirectRenderCommand,
-};
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
-use reims_vgpu_core::platform::values::IcbDesc;
 use reims_vgpu_graphics::icb::*;
 use reims_vgpu_graphics::wire::{
     RGFX_EVT_ICB_STATE, RGFX_ICB_INHERIT_BLEND_COLOR, RGFX_ICB_INHERIT_BUFFERS,
@@ -39,11 +31,19 @@ use reims_vgpu_graphics::wire::{
     RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxIcbCreate,
     RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbState, RgfxIcbWrite, RgfxMsgHeader,
 };
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::icb::{
+    IcbComputeCmd, IcbRenderCmd, IndirectCommandBuffer, IndirectComputeCommand,
+    IndirectRenderCommand,
+};
+use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+use reims_vgpu_vulkan::core::platform::values::IcbDesc;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::raise::RaiseResult;
+use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::{DecodeError, Entry, GraphicsDecoder, ObjHandle, op_fault, read, refused, refusing};
@@ -1061,11 +1061,11 @@ fn slot_fields(
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::platform::Handle;
-    use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
     use reims_vgpu_graphics::wire::{
         RGFX_CMD_BUFFER_CREATE, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_WRITE, RgfxBufferCreate,
     };
+    use reims_vgpu_vulkan::core::platform::Handle;
+    use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, Step};
     use zerocopy::{Immutable, IntoBytes};
 
     use reims_vgpu_graphics::region::Region;

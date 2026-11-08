@@ -1,9 +1,3 @@
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::testkit::FakePlatform;
 use reims_vgpu_graphics::ops::video::{
     RGFX_VIDEO_ENCODE_OK, RGFX_VIDEO_ENCODE_OVERFLOW, RGFX_VIDEO_ENCODED_KEYFRAME,
     RGFX_VIDEO_ENCODED_PARAMETER_SETS, RgfxVideoEncodeResult,
@@ -11,6 +5,12 @@ use reims_vgpu_graphics::ops::video::{
 use reims_vgpu_graphics::wire::RGFX_VIDEO_DECODE;
 use reims_vgpu_video::core::runtime::{Runtime, StdRuntime};
 use reims_vgpu_video::nvidia::{AnnexBCodec, AnnexBDecoder, GpuSelector, encode_profiles};
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::raise::OnFault;
+use reims_vgpu_vulkan::core::testkit::FakePlatform;
 use zerocopy::FromBytes;
 
 use super::super::super::decode::{GraphicsVideoSession, VideoEncode, VideoPlane};

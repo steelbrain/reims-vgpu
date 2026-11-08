@@ -48,9 +48,9 @@ use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 
+use crate::core::num::ToU64 as _;
+use crate::core::sync::Mutex;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::ToU64 as _;
-use reims_vgpu_core::sync::Mutex;
 
 use super::files;
 
@@ -285,15 +285,15 @@ pub(crate) fn runs(start: u64, length: u64) -> Option<Vec<Range<u64>>> {
 mod tests {
     use std::os::fd::AsRawFd as _;
 
-    use reims_vgpu_core::host::HostPtr;
-    use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
-    use reims_vgpu_core::platform::HostRange;
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::platform::types::NsRange;
-    use reims_vgpu_core::raise::OnFault;
+    use crate::core::host::HostPtr;
+    use crate::core::num::{ToU64 as _, ToUsize as _};
+    use crate::core::platform::HostRange;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::resource::Buffer as _;
+    use crate::core::platform::types::NsRange;
+    use crate::core::raise::OnFault;
 
     use super::super::import::imports_need_files;
     use super::super::vm::memfd;
@@ -545,9 +545,9 @@ mod tests {
     #[test]
     #[ignore = "a measurement: run alone, holding the GPU"]
     fn slab_heap_costs() {
-        use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
-        use reims_vgpu_core::platform::resource::Heap as _;
-        use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+        use crate::core::platform::os::{Clock as _, MonoTime};
+        use crate::core::platform::resource::Heap as _;
+        use crate::core::platform::values::{HeapDesc, OptionSet};
         let clock = crate::os::OsClock::new();
         let now = || clock.now_mono();
         let since = |t: MonoTime| clock.now_mono().saturating_duration_since(t);
@@ -802,9 +802,9 @@ mod tests {
     #[test]
     #[ignore = "a measurement: run alone, holding the GPU"]
     fn slab_nocopy_costs() {
-        use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
+        use crate::core::platform::os::{Clock as _, MonoTime};
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::values::{BufferDesc, OptionSet};
         let clock = crate::os::OsClock::new();
         let now = || clock.now_mono();
         let since = |t: MonoTime| clock.now_mono().saturating_duration_since(t);

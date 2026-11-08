@@ -56,19 +56,19 @@
 
 use std::sync::mpsc;
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
-use reims_vgpu_core::platform::os::vm::{HostVm, VmProt};
-use reims_vgpu_core::platform::resource::{Buffer, Heap, Library, Texture};
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange, ResourceAddressRange};
-use reims_vgpu_core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
-use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_vulkan::core::platform::os::vm::{HostVm, VmProt};
+use reims_vgpu_vulkan::core::platform::resource::{Buffer, Heap, Library, Texture};
+use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize, NsRange, ResourceAddressRange};
+use reims_vgpu_vulkan::core::platform::values::{BufferDesc, HeapDesc, OptionSet, TextureDesc};
+use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::os::OsVm;
 
 const PAGE: u64 = 0x4000;
@@ -1174,7 +1174,7 @@ const CHILD_CASE: &str = "RVG_BEHIND_A_WAIT";
 #[test]
 fn behind_a_wait_on_vulkan() {
     if let Ok(case) = std::env::var(CHILD_CASE) {
-        reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+        reims_vgpu_vulkan::core::testkit::capture::set_capture_enabled(false);
         let dev = VulkanPlatform::system_default_device().unwrap();
         let p = VulkanPlatform::new();
         println!("seen {:?}", behind_a_wait(&p, &dev, &case));
@@ -1287,7 +1287,7 @@ const DISPATCH_BEHIND_A_WAIT: [u64; 4] = [4, 0, 0, SPUN as u64];
 fn a_dispatch_behind_a_wait_on_vulkan() {
     const CHILD: &str = "RVG_DISPATCH_BEHIND_A_WAIT";
     if let Ok(warm) = std::env::var(CHILD) {
-        reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+        reims_vgpu_vulkan::core::testkit::capture::set_capture_enabled(false);
         let dev = VulkanPlatform::system_default_device().unwrap();
         let p = VulkanPlatform::new();
         println!("seen {:?}", dispatch_behind_a_wait(&p, &dev, warm == "1"));
@@ -1541,7 +1541,7 @@ fn expected_past_the_size() -> Steps {
 fn pages_past_the_size_on_vulkan() {
     const CHILD: &str = "RVG_PAGES_PAST_THE_SIZE";
     if std::env::var_os(CHILD).is_some() {
-        reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+        reims_vgpu_vulkan::core::testkit::capture::set_capture_enabled(false);
         let dev = VulkanPlatform::system_default_device().unwrap();
         let p = VulkanPlatform::new();
         println!("made {:?}", past_the_size(&p, &dev));
@@ -1578,7 +1578,7 @@ fn pages_past_the_size_on_vulkan() {
 fn pages_without_access_on_vulkan() {
     const CHILD: &str = "RVG_PAGES_WITHOUT_ACCESS";
     if std::env::var_os(CHILD).is_some() {
-        reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+        reims_vgpu_vulkan::core::testkit::capture::set_capture_enabled(false);
         let dev = VulkanPlatform::system_default_device().unwrap();
         let p = VulkanPlatform::new();
         println!("made {:?}", without_access(&p, &dev));
@@ -1763,8 +1763,8 @@ fn unaligned<P: Platform>(p: &P, dev: &P::Device, index: usize, heap: bool) -> S
 /// (`src/gpu/backing.rs`'s `off_the_page`), which Metal's first words show
 #[test]
 fn unaligned_ranges_on_vulkan_are_metals() {
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use reims_vgpu_vulkan::core::raise::death::DeathKind;
+    use reims_vgpu_vulkan::core::testkit::capture::catch_death;
     let cases: Vec<(usize, bool)> = (0..UNALIGNED)
         .flat_map(|index| [(index, true), (index, false)])
         .collect();
@@ -1784,7 +1784,7 @@ fn unaligned_ranges_on_vulkan_are_metals() {
             continue;
         }
         let ours = unaligned(&p, &dev, index, heap);
-        reims_vgpu_core::metal_check!(&case, ours);
+        reims_vgpu_vulkan::metal_check!(&case, ours);
     }
 }
 

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::values::FullRenderPipelineDesc;
+use crate::core::platform::values::FullRenderPipelineDesc;
 
 use super::*;
 
@@ -559,7 +559,7 @@ fn variant_on_both(variant: Variant, on_metal: bool) -> Vec<[u8; 4]> {
     let (p, d) = (platform(), dev());
     let vulkan = present_as(&p, &d, &frame.make(&p, &d), None, variant);
     if on_metal {
-        reims_vgpu_core::metal_check!(format!("{variant:?}"), vulkan);
+        crate::metal_check!(format!("{variant:?}"), vulkan);
     }
     vulkan
 }
@@ -656,7 +656,7 @@ fn quads_give_metals_primitive_ids() {
                     let key = format!("{draw:?} at mode {mode}");
                     let ours = flat_pass(&p, &d, PRIMITIVES, mode, draw);
                     assert!(ours != clear, "{key}");
-                    assert!(reims_vgpu_core::metal_matches_raw!(key, ours), "{key}");
+                    assert!(crate::metal_matches_raw!(key, ours), "{key}");
                 }
             }
         }
@@ -701,7 +701,7 @@ fn private_types_from_far_vertex_starts_draw_as_metals() {
                         differ.push(format!("{draw:?} at mode {mode}: drew nothing"));
                     }
                     let key = format!("{draw:?} at mode {mode}");
-                    if !reims_vgpu_core::metal_matches_raw!(key, ours) {
+                    if !crate::metal_matches_raw!(key, ours) {
                         differ.push(format!("{key}: pixels differ"));
                     }
                 }
@@ -772,7 +772,7 @@ fn private_types_draw_over_indices_and_arguments_as_metals() {
                     let ours = provoked(&p, &d, functions, (mode, restart), draw);
                     blank += usize::from(ours == clear);
                     let key = format!("{draw:?} of {functions:?} at mode {mode}");
-                    assert!(reims_vgpu_core::metal_matches_raw!(key, ours), "{key}");
+                    assert!(crate::metal_matches_raw!(key, ours), "{key}");
                 }
             }
         }
@@ -915,10 +915,10 @@ fn provoked<P: Platform>(
     (mode, restart): (u64, Option<(bool, u64)>),
     draw: Provoked<'_>,
 ) -> Vec<[u8; 4]> {
-    use reims_vgpu_core::platform::icb::{
+    use crate::core::platform::icb::{
         IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
     };
-    use reims_vgpu_core::platform::values::IcbDesc;
+    use crate::core::platform::values::IcbDesc;
 
     let executed = matches!(draw, Provoked::Executed { .. });
     let state = value_state::<P>(d, functions, |v| {
@@ -1200,7 +1200,7 @@ fn flat_inputs_take_metals_provoking_vertex_at_every_draw() {
         assert_eq!(first == last, execution, "{draw:?}");
         for (mode, ours) in [(0, &first), (1, &last)] {
             let key = format!("{draw:?} at mode {mode}");
-            assert!(reims_vgpu_core::metal_matches_raw!(key, ours), "{key}");
+            assert!(crate::metal_matches_raw!(key, ours), "{key}");
         }
     }
     for draw in [
@@ -1256,17 +1256,11 @@ fn lines_take_metals_flat_inputs_at_the_last_vertex() {
         assert!(first != last, "{draw:?}");
         let keys = [0, 1].map(|mode| format!("{draw:?} at mode {mode}"));
         let colours = format!("{draw:?} at mode 1: the colours");
-        assert!(
-            reims_vgpu_core::metal_matches_raw!(keys[0], first),
-            "{draw:?}"
-        );
+        assert!(crate::metal_matches_raw!(keys[0], first), "{draw:?}");
         if native {
-            assert!(
-                reims_vgpu_core::metal_matches_raw!(keys[1], last),
-                "{draw:?}"
-            );
+            assert!(crate::metal_matches_raw!(keys[1], last), "{draw:?}");
         } else {
-            reims_vgpu_core::metal_check!(colours, colours_of(&last));
+            crate::metal_check!(colours, colours_of(&last));
         }
     }
 }
@@ -1334,7 +1328,7 @@ fn lines_draw_at_metals_widths() {
             lit_at.push(lit(&ours));
             let key = format!("{primitive_type} at {w}");
             if exact {
-                assert!(reims_vgpu_core::metal_matches_raw!(key, ours), "{key}");
+                assert!(crate::metal_matches_raw!(key, ours), "{key}");
             }
         }
         assert!(lit_at[1] > lit_at[0], "{primitive_type}: {lit_at:?}");
@@ -1366,7 +1360,7 @@ fn barycentric_weights_take_metals_order_at_the_last_vertex() {
             let ours = provoked(&p, &d, smooth, (mode, None), draw);
             assert_ne!(ours, vec![[0, 0, 0, 0xff]; 256], "{draw:?}");
             let key = format!("smooth: {draw:?} at mode {mode}");
-            assert!(reims_vgpu_core::metal_matches_raw!(key, ours), "{key}");
+            assert!(crate::metal_matches_raw!(key, ours), "{key}");
         }
     }
     for draw in [
@@ -1383,15 +1377,9 @@ fn barycentric_weights_take_metals_order_at_the_last_vertex() {
             None
         };
         let keys = [0, 1].map(|mode| format!("flat: {draw:?} at mode {mode}"));
-        assert!(
-            reims_vgpu_core::metal_matches_raw!(keys[0], first),
-            "{draw:?}"
-        );
+        assert!(crate::metal_matches_raw!(keys[0], first), "{draw:?}");
         if let Some(last) = last {
-            assert!(
-                reims_vgpu_core::metal_matches_raw!(keys[1], last),
-                "{draw:?}"
-            );
+            assert!(crate::metal_matches_raw!(keys[1], last), "{draw:?}");
         }
     }
 }
@@ -1437,7 +1425,7 @@ fn modes_past_1_draw_metals_third_way() {
         // Metal's third way, which a list's triangles draw as at mode 1.
         let key = format!("{draw:?}: the third way");
         if at == 0 {
-            assert!(reims_vgpu_core::metal_matches_raw!(key, last), "{draw:?}");
+            assert!(crate::metal_matches_raw!(key, last), "{draw:?}");
         }
     }
 }
@@ -1466,7 +1454,7 @@ fn re_indexed_draws_keep_metals_vertex_ids() {
             "{draw:?}"
         );
         let key = format!("{mode} {draw:?}");
-        reims_vgpu_core::metal_check_raw!(key, ours);
+        crate::metal_check_raw!(key, ours);
     }
 }
 
@@ -1506,7 +1494,7 @@ fn re_indexed_draws_keep_metals_draw_bases() {
             "{mode} {draw:?}"
         );
         let key = format!("{mode} {draw:?}");
-        reims_vgpu_core::metal_check_raw!(key, ours);
+        crate::metal_check_raw!(key, ours);
     }
 }
 
@@ -1517,7 +1505,7 @@ fn classed_state(
     (vertex, indirect): (&str, bool),
     class: PrimitiveTopologyClass,
 ) -> crate::gpu::resource::VulkanRenderPipeline {
-    use reims_vgpu_core::platform::resource::Library as _;
+    use crate::core::platform::resource::Library as _;
 
     let library = d.new_library(VERTEX_IDS).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
@@ -1581,7 +1569,7 @@ fn points_die_where_metal_sizes_none() {
         pass_pixels(&p, &d, points::<VulkanPlatform>(&classed)),
         ours
     );
-    reims_vgpu_core::metal_check_raw!("the sized points", ours);
+    crate::metal_check_raw!("the sized points", ours);
 }
 
 /// An indirect command buffer of two commands whose first draws `count` points from vertex 1
@@ -1591,10 +1579,10 @@ fn points_icb(
     state: Option<&crate::gpu::resource::VulkanRenderPipeline>,
     count: u64,
 ) -> crate::gpu::icb::VulkanIcb {
-    use reims_vgpu_core::platform::icb::{
+    use crate::core::platform::icb::{
         IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
     };
-    use reims_vgpu_core::platform::values::IcbDesc;
+    use crate::core::platform::values::IcbDesc;
 
     let icb = d
         .new_indirect_command_buffer(
@@ -1671,7 +1659,7 @@ fn commit_dies(cmds: Vec<RenderCmd<'_, VulkanPlatform>>) -> String {
 /// the buffer's commands
 #[test]
 fn executed_points_die_where_metal_sizes_none() {
-    use reims_vgpu_core::platform::event::EventRef;
+    use crate::core::platform::event::EventRef;
 
     let (p, d) = (platform(), dev());
     let unsizing = classed_state(
@@ -1760,7 +1748,7 @@ fn executed_points_die_where_metal_sizes_none() {
     blit.encode(OnFault::Die, reset).unwrap();
 }
 
-reims_vgpu_core::death_test!(
+crate::death_test!(
     /// An execution of a buffer whose records the GPU may have written (a blit's reset of another
     /// of its commands) is asked at the runtime's host step, once the work before it completed:
     /// its draw of points under a state of its own that writes no `[[point_size]]` outside the
@@ -1792,7 +1780,7 @@ reims_vgpu_core::death_test!(
         pass_pixels(&p, &d, execute_first(&written, None));
     },
     |report| {
-        use reims_vgpu_core::raise::death::{DeathId, DeathKind};
+        use crate::core::raise::death::{DeathId, DeathKind};
         report.assert_died(
             DeathId::Platform {
                 kind: DeathKind::Abort,
@@ -1812,10 +1800,10 @@ reims_vgpu_core::death_test!(
 /// cannot, and one where the buffer made resident for writing is numbered 1
 #[test]
 fn work_that_can_encode_after_an_icb_made_writable_runs() {
-    use reims_vgpu_core::platform::icb::{
+    use crate::core::platform::icb::{
         IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
     };
-    use reims_vgpu_core::platform::values::IcbDesc;
+    use crate::core::platform::values::IcbDesc;
 
     let (p, d) = (platform(), dev());
     d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
@@ -2007,7 +1995,7 @@ fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
         let ours = vertex_runs(&p, &d, mode, draw);
         assert!(ours.iter().any(|&n| n > 1), "{mode} {draw:?}");
         let key = format!("{mode} {draw:?}");
-        reims_vgpu_core::metal_check_raw!(key, ours);
+        crate::metal_check_raw!(key, ours);
     }
 }
 
@@ -2046,7 +2034,7 @@ fn private_types_run_the_vertex_function_as_often_as_metals_at_every_draw() {
                 let ours = crate::answer::relaxed(|| provoked_runs(&p, &d, (mode, restart), draw));
                 assert!(ours.iter().any(|&n| n > 1), "{draw:?} at mode {mode}");
                 let key = format!("{draw:?} at mode {mode}");
-                reims_vgpu_core::metal_check_raw!(key, ours);
+                crate::metal_check_raw!(key, ours);
             }
         }
     }
@@ -2089,11 +2077,11 @@ fn swept<P: Platform>(
     kind: u32,
     drawn: Drawn<'_>,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::types::NsRange;
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::types::NsRange;
 
-    use reims_vgpu_core::platform::values::FullComputePipelineDesc;
+    use crate::core::platform::values::FullComputePipelineDesc;
 
     use crate::gpu::device::tests::render_value;
 
@@ -2226,12 +2214,12 @@ fn texture_writes_round_as_metals() {
         for format in half.into_iter().chain(rest) {
             let key = format!("kernel {format:?} sweep {kind}");
             let ours = swept(&p, &d, true, format, kind, PLAIN);
-            assert!(reims_vgpu_core::metal_matches_bytes!(key, &ours), "{key}");
+            assert!(crate::metal_matches_bytes!(key, &ours), "{key}");
         }
         for format in half.into_iter().chain(rest).chain([srgb]) {
             let key = format!("render {format:?} sweep {kind}");
             let ours = swept(&p, &d, false, format, kind, PLAIN);
-            assert!(reims_vgpu_core::metal_matches_bytes!(key, &ours), "{key}");
+            assert!(crate::metal_matches_bytes!(key, &ours), "{key}");
         }
     }
 }
@@ -2257,8 +2245,8 @@ fn texture_writes_round_as_metals() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::platform::resource::Library as _;
+    use crate::core::raise::death::DeathKind;
 
     use crate::gpu::device::tests::render_value;
 
@@ -2491,7 +2479,7 @@ fn blended_state<P: Platform>(
     format: u32,
     blend: Option<[u32; 6]>,
 ) -> Result<(), i64> {
-    use reims_vgpu_core::platform::resource::Library as _;
+    use crate::core::platform::resource::Library as _;
 
     use crate::gpu::device::tests::render_value;
 
@@ -2553,7 +2541,7 @@ fn second_source_blends_without_a_second_output_are_refused_as_metals() {
             catch_death(|| blended_state::<VulkanPlatform>(&d, (library, fragment), format, blend));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
         match ours {
-            Ok(ours) if reims_vgpu_core::metal_matches!(what, ours) => {}
+            Ok(ours) if crate::metal_matches!(what, ours) => {}
             Ok(ours) => differ.push(format!("{what}: ours {ours:?}, not Metal's")),
             Err(site) => differ.push(format!("{what}: died at {}: {line}", site.file)),
         }
@@ -2585,9 +2573,9 @@ fn xr_blended_masked<P: Platform>(
     (blend, mask): (Option<[u32; 6]>, Option<u32>),
     across: bool,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::Pool;
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::Library as _;
+    use crate::core::rt::Pool;
 
     use crate::gpu::device::tests::render_value;
 
@@ -2685,8 +2673,8 @@ fn xr_read_back<P: Platform>(
     library: &P::Library,
     t: &P::Texture,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::resource::Library as _;
 
     let read = library
         .new_function(OnFault::Die, "xr_read")
@@ -2800,9 +2788,9 @@ fn xr_compared(
                     continue;
                 }
             };
-            let (count, wrong) = if reims_vgpu_core::metal_matches_bytes!(what, &ours) {
+            let (count, wrong) = if crate::metal_matches_bytes!(what, &ours) {
                 (0, None)
-            } else if let Some(theirs) = reims_vgpu_core::metal_full!(what) {
+            } else if let Some(theirs) = crate::metal_full!(what) {
                 let count = (ours.chunks(16).zip(theirs.chunks(16)))
                     .filter(|(o, t)| o != t)
                     .count();
@@ -2933,7 +2921,7 @@ fn float4_extended_range_blends_are_metals_here() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn float4_extended_range_blends_die_naming_their_source() {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
     const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
     let drawn = ("fast math", ROUNDING, "xr_float_fragment");
@@ -2991,7 +2979,7 @@ const XR_CONSTANT_DIFFERENCES: [[u32; 6]; 2] = [[11, 12, 1, 1, 1, 0], [12, 11, 2
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn extended_range_blends_drawn_without_fast_math_alone_are_metals() {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
     const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
     let fragments = [
@@ -3108,7 +3096,7 @@ const XR_DUAL_BLENDS: [[u32; 6]; 6] = [
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn extended_range_masked_blends_and_two_output_states_are_metals() {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
     const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
     let ours = xr_sides();
@@ -3129,7 +3117,7 @@ fn extended_range_masked_blends_and_two_output_states_are_metals() {
                 *crate::answer::LAST_LINE.lock() = None;
                 let ours = catch_death(|| ours.masked(library, format, shape, true));
                 match ours {
-                    Ok(ours) if reims_vgpu_core::metal_matches_bytes!(what, &ours) => {}
+                    Ok(ours) if crate::metal_matches_bytes!(what, &ours) => {}
                     Ok(_) => differ.push(format!("{what}: the texels differ from Metal's")),
                     Err(site) => {
                         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
@@ -3161,7 +3149,7 @@ fn extended_range_masked_blends_and_two_output_states_are_metals() {
                 *crate::answer::LAST_LINE.lock() = None;
                 let ours = catch_death(|| ours.masked(library, format, shape, true));
                 match ours {
-                    Ok(ours) if reims_vgpu_core::metal_matches_bytes!(what, &ours) => {}
+                    Ok(ours) if crate::metal_matches_bytes!(what, &ours) => {}
                     Ok(_) => differ.push(format!("{what}: the texels differ from Metal's")),
                     Err(site) => {
                         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
@@ -3318,10 +3306,10 @@ fn half4_extended_range_blends_are_metals_without_fast_math() {
 /// platform `P` that clears it to `clear` and draws `xr_half_fragment` of seed 1 into it under
 /// source and destination factor one, added, colour and alpha.
 fn xr_blended_onto_clear<P: Platform>(p: &P, d: &P::Device, clear: [f64; 4]) -> Vec<u8> {
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::types::ClearColor;
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::types::ClearColor;
 
     use crate::gpu::device::tests::render_value;
 
@@ -3575,7 +3563,7 @@ impl Channels {
     ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn half_outputs_store_within_the_bound_or_die_named() {
-    use reims_vgpu_core::platform::resource::Library as _;
+    use crate::core::platform::resource::Library as _;
 
     use crate::gpu::device::tests::render_value;
 
@@ -3821,7 +3809,7 @@ fn half_outputs_store_within_the_bound_or_die_named() {
                 let float4 = (ROUNDING, "sweep_fragment", kind);
                 let key = format!("{format:?} {blend:?} sweep {kind}: a float4 output");
                 let ours = drawn((&p, &d), *format, float4, blend, under);
-                if !reims_vgpu_core::metal_matches_bytes!(key, &ours) {
+                if !crate::metal_matches_bytes!(key, &ours) {
                     wrong.push(format!(
                         "{format:?} {blend:?} sweep {kind}: a float4 output"
                     ));
@@ -3850,9 +3838,9 @@ fn half_outputs_store_within_the_bound_or_die_named() {
                 let key = format!("{format:?} {blend:?} sweep {kind}: a half4 output");
                 let ours = drawn((&p, &d), *format, half4, blend, under);
                 // Metal's bytes in full where ours differ from them, else by their digest.
-                let (far, count) = if reims_vgpu_core::metal_matches_bytes!(key, &ours) {
+                let (far, count) = if crate::metal_matches_bytes!(key, &ours) {
                     (0.0, 0)
-                } else if let Some(theirs) = reims_vgpu_core::metal_full!(key) {
+                } else if let Some(theirs) = crate::metal_full!(key) {
                     channels.apart(&ours, &theirs)
                 } else {
                     (f64::INFINITY, ours.len())
@@ -3900,7 +3888,7 @@ fn half_outputs_store_within_the_bound_or_die_named() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn bfloat_draws_store_metals_codes() {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
     const STATE: &str = "newRenderPipelineStateWithDescriptor:error:";
     const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
@@ -3917,7 +3905,7 @@ fn bfloat_draws_store_metals_codes() {
                 let case = format!("{format:?} {output} sweep {kind}");
                 *crate::answer::LAST_LINE.lock() = None;
                 match catch_death(|| swept(&p, &d, false, format, kind, how)) {
-                    Ok(ours) if reims_vgpu_core::metal_matches_bytes!(case, &ours) => {}
+                    Ok(ours) if crate::metal_matches_bytes!(case, &ours) => {}
                     Ok(_) => differ.push(format!("{case}: the bytes differ from Metal's")),
                     Err(site) => {
                         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
@@ -3969,8 +3957,8 @@ fn resolved<P: Platform>(
     kind: u32,
     (offset, apart): (f64, bool),
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::types::ClearColor;
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::types::ClearColor;
 
     use crate::gpu::device::tests::render_value;
 
@@ -4108,7 +4096,7 @@ fn drawn_resolved<P: Platform>(
     store: u64,
     tables: &[Vec<[f32; 4]>; 2],
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::resource::Library as _;
+    use crate::core::platform::resource::Library as _;
 
     use crate::gpu::device::tests::render_value;
 
@@ -4306,7 +4294,7 @@ fn drawn_nan_and_infinite_samples_resolve_as_metals() {
                 }
                 let key = format!("{format} {samples}x store {store}");
                 let ours = drawn_resolved(&p, &d, case, store, &drawn_specials());
-                if !reims_vgpu_core::metal_matches_bytes!(key, &ours) {
+                if !crate::metal_matches_bytes!(key, &ours) {
                     differ.push(format!("{key}: the texels differ from Metal's"));
                 }
             }
@@ -4403,10 +4391,10 @@ fn drawn_extended_range_samples_resolve_as_metals() {
                     }
                 };
                 // Metal's texels in full where ours differ from them, else by their digest.
-                if reims_vgpu_core::metal_matches_bytes!(what, &ours) {
+                if crate::metal_matches_bytes!(what, &ours) {
                     continue;
                 }
-                let Some(theirs) = reims_vgpu_core::metal_full!(what) else {
+                let Some(theirs) = crate::metal_full!(what) else {
                     differ.push(format!(
                         "{what}: differs from Metal's, recorded by its digest"
                     ));
@@ -4675,7 +4663,7 @@ fn sweep_state<P: Platform>(
     colours: &[(u32, u64)],
     depth: Option<u64>,
 ) -> P::RenderPipeline {
-    use reims_vgpu_core::platform::resource::Library as _;
+    use crate::core::platform::resource::Library as _;
 
     use crate::gpu::device::tests::render_value;
 
@@ -4729,10 +4717,8 @@ fn copy_out<'a, P: Platform>(
 
 /// A rate map of a `width` by `height` screen, with one layer of one sample of 1 on each axis.
 fn even_rate_map<P: Platform>(p: &P, d: &P::Device, (width, height): (u64, u64)) -> P::RateMap {
-    use reims_vgpu_core::platform::rate_map::{
-        RateMapDescriptor as _, RateMapLayerDescriptor as _,
-    };
-    use reims_vgpu_core::platform::values::RateMapDesc;
+    use crate::core::platform::rate_map::{RateMapDescriptor as _, RateMapLayerDescriptor as _};
+    use crate::core::platform::values::RateMapDesc;
 
     let m = p.rate_map_descriptor(&RateMapDesc {
         screen_size: MtlSize::new(width, height, 1),
@@ -4771,12 +4757,12 @@ fn resolved_into<P: Platform<Surface = crate::os::OsSurface>>(
     states: &States<'_, P>,
     c: Resolve,
 ) -> Resolved {
-    use reims_vgpu_core::platform::os::surface::{Surface as _, SurfaceSpec};
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, PassSet, StencilAttachmentSet};
+    use crate::core::platform::os::surface::{Surface as _, SurfaceSpec};
+    use crate::core::platform::values::{DepthAttachmentSet, PassSet, StencilAttachmentSet};
 
     /// `kIOSurfaceLockReadOnly`.
     const READ_ONLY: u32 = 1;
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = crate::core::rt::Pool::here();
     let (into, bytes) = c.into;
     let (width, height) = c.size;
     let length = width * height * bytes;
@@ -5085,7 +5071,7 @@ fn resolved_into<P: Platform<Surface = crate::os::OsSurface>>(
 
 /// The death of `f`, which must abort at `sel`, and its line.
 fn died_at<T>(sel: &str, f: impl FnOnce() -> T) -> String {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
     *crate::answer::LAST_LINE.lock() = None;
     let Err(site) = catch_death(f) else {
         panic!("no death at {sel}");
@@ -5226,7 +5212,7 @@ fn resolves_into_other_formats_are_metals_or_die_named() {
     let mut both = |c: Resolve, keeps: bool| {
         let resolved = resolved_into(&p, &d, &ours, c);
         let key = format!("{c:?}");
-        if !reims_vgpu_core::metal_matches_raw!(key, raw(&resolved)) {
+        if !crate::metal_matches_raw!(key, raw(&resolved)) {
             differ.push(format!("{c:?}: ours {}, not Metal's", shown(&resolved)));
         }
         if kept(&resolved.resolved) != keeps {
@@ -5480,7 +5466,7 @@ fn samples_resolved_into_the_twin_are_metals() {
                 let c = Resolve::of(from, (twin, 4), made, (load, RESOLVE));
                 let key = format!("{c:?}");
                 let o = resolved_into(&p, &d, &ours, c);
-                if !reims_vgpu_core::metal_matches_bytes!(key, &o.samples) {
+                if !crate::metal_matches_bytes!(key, &o.samples) {
                     let head = |b: &[u8]| b.iter().take(8).copied().collect::<Vec<u8>>();
                     let o = head(&o.samples);
                     differ.push(format!("{c:?}: ours {o:02x?}, not Metal's"));
@@ -5507,12 +5493,10 @@ fn samples_resolved_into_the_twin_are_metals() {
 /// by a store action left `Unknown`, which the runtime refuses as the pass is made
 #[test]
 fn untouched_resolves_in_shapes_not_measured_die_named() {
-    use reims_vgpu_core::platform::os::surface::{SurfacePlaneSpec, SurfaceSpec};
-    use reims_vgpu_core::platform::rate_map::{
-        RateMapDescriptor as _, RateMapLayerDescriptor as _,
-    };
-    use reims_vgpu_core::platform::resource::Heap as _;
-    use reims_vgpu_core::platform::values::{
+    use crate::core::platform::os::surface::{SurfacePlaneSpec, SurfaceSpec};
+    use crate::core::platform::rate_map::{RateMapDescriptor as _, RateMapLayerDescriptor as _};
+    use crate::core::platform::resource::Heap as _;
+    use crate::core::platform::values::{
         DepthAttachmentSet, HeapDesc, OptionSet, PassSet, RateMapDesc,
     };
 
@@ -5813,7 +5797,7 @@ fn untouched_resolves_in_shapes_not_measured_die_named() {
 /// refuses.)
 #[test]
 fn late_setters_of_a_dropped_resolve_are_the_descriptors() {
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    use crate::core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
 
     /// `MTLPixelFormatBGRA8Unorm_sRGB`; `MTLStoreActionUnknown`.
     const BGRA8_SRGB: u64 = 81;
@@ -5942,7 +5926,7 @@ fn late_setters_of_a_dropped_resolve_are_the_descriptors() {
 /// late `Store`
 #[test]
 fn late_resolves_beside_a_dropped_one_follow_late_store_actions() {
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    use crate::core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
 
     /// `MTLPixelFormatBGRA8Unorm_sRGB`; `MTLStoreActionUnknown`.
     const BGRA8_SRGB: u64 = 81;
@@ -6118,7 +6102,7 @@ fn resolves_as_metals(samples: u64) {
         for how in hows {
             let ours = resolved(&p, &d, samples, format, kind, how);
             let key = key(format, kind, how);
-            assert!(reims_vgpu_core::metal_matches_bytes!(key, &ours), "{key}");
+            assert!(crate::metal_matches_bytes!(key, &ours), "{key}");
         }
     }
 }
@@ -6144,8 +6128,8 @@ fn routed_pass<P: Platform>(
     (indices, mode): (&[u32], u64),
     draw: RenderCmd<'_, P>,
 ) -> Vec<[u8; 4]> {
-    use reims_vgpu_core::platform::types::MtlViewport;
-    use reims_vgpu_core::platform::values::PassSet;
+    use crate::core::platform::types::MtlViewport;
+    use crate::core::platform::values::PassSet;
 
     let state = routed_state::<P>(d, vertex, class);
     let (pos, _) = flat_vertices::<P>(d, 16);
@@ -6315,7 +6299,7 @@ fn the_last_vertex_routes_layers_and_viewports_as_metals() {
                     let key = format!("{vertex} {indices:?} at mode {mode}, draw {kind}");
                     let compared = kind < 5 || mode == 0 || native;
                     if compared {
-                        assert!(reims_vgpu_core::metal_matches_raw!(key, ours), "{key}");
+                        assert!(crate::metal_matches_raw!(key, ours), "{key}");
                     }
                 }
             }
@@ -6361,7 +6345,7 @@ fn indexed_strips_restart_at_the_set_index_as_metals_do() {
                 }
                 for indirectly in [false, true] {
                     let key = format!("{case}, Metal's indirect {indirectly}");
-                    reims_vgpu_core::metal_check_raw!(key, ours);
+                    crate::metal_check_raw!(key, ours);
                 }
             }
         }
@@ -6379,7 +6363,7 @@ fn a_long_restarted_strip_draws_within_the_index_pool_as_metals() {
         let restart = Some((true, 3));
         let ours = restart_draw(&p, &d, drawn, restart, (true, 0));
         let key = format!("{index_type}");
-        reims_vgpu_core::metal_check_raw!(key, ours);
+        crate::metal_check_raw!(key, ours);
     }
 }
 
@@ -6420,7 +6404,7 @@ fn private_types_draw_after_a_restart_set_as_metals_do() {
                 assert_eq!(ours, unset, "type {primitive_type} at {k}");
             }
             let key = format!("type {primitive_type} at {k}");
-            reims_vgpu_core::metal_check_raw!(key, ours);
+            crate::metal_check_raw!(key, ours);
         }
     }
 }
@@ -6444,14 +6428,14 @@ fn executed_strip(
     (index_type, indices): (u64, &[u8]),
     (enabled, index): (bool, u64),
 ) -> Vec<[u8; 4]> {
+    use crate::core::platform::icb::{
+        IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+    };
+    use crate::core::platform::values::IcbDesc;
     use metal2vulkan::metal::PixelFormat;
     use metal2vulkan::pipeline::{
         ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
     };
-    use reims_vgpu_core::platform::icb::{
-        IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-    };
-    use reims_vgpu_core::platform::values::IcbDesc;
 
     let function = |name: &str| {
         let path = crate::gpu::device::tests::fixture_shaders().join(format!("{name}.metallib"));
@@ -6562,8 +6546,8 @@ fn an_execution_draws_its_strips_after_a_restart_set_as_metals_does() {
             format!("{index_type} direct"),
             format!("{index_type} restarted"),
         ];
-        reims_vgpu_core::metal_check_raw!(keys[0], direct);
-        reims_vgpu_core::metal_check_raw!(keys[1], restarted);
+        crate::metal_check_raw!(keys[0], direct);
+        crate::metal_check_raw!(keys[1], restarted);
     }
 }
 
@@ -6573,7 +6557,7 @@ fn an_execution_draws_its_strips_after_a_restart_set_as_metals_does() {
 /// (`render_draw_icb`)
 #[test]
 fn empty_executions_run_nothing_under_any_pipeline_state() {
-    use reims_vgpu_core::platform::values::IcbDesc;
+    use crate::core::platform::values::IcbDesc;
 
     fn pixels<P: Platform>(p: &P, d: &P::Device, inherit: bool) -> Vec<[u8; 4]> {
         let state = fixture_state::<P>(d, FLAT.0, FLAT.1);
@@ -6622,8 +6606,8 @@ fn empty_executions_run_nothing_under_any_pipeline_state() {
 /// core makes one, the buffer's bytes at `0x100`, slice 1's being at `0x80`
 #[test]
 fn a_pass_past_its_attachments_slices_dies_where_metal_writes_past_the_texture() {
-    use reims_vgpu_core::platform::values::PassSet;
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::platform::values::PassSet;
+    use crate::core::raise::death::DeathKind;
 
     /// The pass on `d`, and the ranges of the 16 KiB buffer under the texture that its
     /// commit changed from `0x55`.
@@ -6725,7 +6709,7 @@ fn unknown_stores_over_resolves<P: Platform>(p: &P, d: &P::Device) -> Vec<u8> {
         },
     )
     .unwrap();
-    pass.set_depth_attachment(&reims_vgpu_core::platform::values::DepthAttachmentSet {
+    pass.set_depth_attachment(&crate::core::platform::values::DepthAttachmentSet {
         texture: Some(Some(&depth)),
         resolve_texture: Some(Some(&depth_resolve)),
         load_action: Some(CLEAR),
@@ -6782,7 +6766,7 @@ fn unused_resolve<P: Platform>(
     store: u64,
     memoryless: bool,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    use crate::core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
     let resolve = d
         .new_texture(
             OnFault::Die,
@@ -6932,7 +6916,7 @@ fn render_pass_values_metal_refuses_die_at_the_encoder() {
         assert_eq!(
             (site.kind, site.file),
             (
-                reims_vgpu_core::raise::death::DeathKind::Abort,
+                crate::core::raise::death::DeathKind::Abort,
                 "renderCommandEncoderWithDescriptor:"
             ),
             "{line}"
@@ -6956,7 +6940,7 @@ fn render_pass_values_metal_refuses_die_at_the_encoder() {
     // action of 9, a depth resolve filter of 9 and a stencil resolve filter of 2 or 9
     // ("resolveFilter is not a valid MTLMultisampleDepthResolveFilter.", and
     // "MTLMultisampleStencilResolveFilter."). A depth resolve filter of 2 makes the encoder.
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    use crate::core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
     let q = d.new_command_queue().unwrap();
     let encoder = |pass: &VulkanRenderPassDescriptor| {
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
@@ -6994,7 +6978,7 @@ fn render_pass_values_metal_refuses_die_at_the_encoder() {
         assert_eq!(
             (site.kind, site.file),
             (
-                reims_vgpu_core::raise::death::DeathKind::Abort,
+                crate::core::raise::death::DeathKind::Abort,
                 "renderCommandEncoderWithDescriptor:"
             ),
             "{line}"
@@ -7023,7 +7007,7 @@ fn an_integer_target_has_no_display_pipeline() {
 #[test]
 fn a_display_pipeline_answers_metals_values() {
     fn values<P: Platform>(d: &P::Device) -> (bool, u64, u64, bool, u64) {
-        use reims_vgpu_core::platform::resource::RenderPipeline as _;
+        use crate::core::platform::resource::RenderPipeline as _;
         let cache = DisplayPipelineCache::<P>::new(d.clone_ref()).unwrap();
         let state = cache
             .pipeline_for(PipelineKey {
@@ -7040,7 +7024,7 @@ fn a_display_pipeline_answers_metals_values() {
         )
     }
     let vulkan = values::<VulkanPlatform>(&dev());
-    reims_vgpu_core::metal_check!("values", vulkan);
+    crate::metal_check!("values", vulkan);
 }
 
 /// A pass over a rasterization rate map of no layers made from an immutable descriptor that
@@ -7053,11 +7037,11 @@ fn a_display_pipeline_answers_metals_values() {
 /// dies at its selector, naming the map, and a tile dispatch there dies by its own line
 #[test]
 fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
-    use reims_vgpu_core::platform::rate_map::{
+    use crate::core::platform::rate_map::{
         RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
     };
-    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::platform::values::{PassSet, RateMapDesc};
+    use crate::core::raise::death::DeathKind;
 
     /// `MTLLoadActionLoad`.
     const LOAD: u64 = 1;
@@ -7107,7 +7091,7 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     /// it once its command buffer completed: on Metal, a map of no layers made after it draws,
     /// which a pass that only loads or clears and stores must not change.
     fn draw_and_release<P: Platform>(p: &P, d: &P::Device) {
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = crate::core::rt::Pool::here();
         let map = d.new_rate_map(&one_layer(p, None)).unwrap().unwrap();
         let (_dst, pass) = pass(p, d, &map, false);
         let state = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
@@ -7270,14 +7254,14 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     }
     for (shape, o) in shapes.iter().zip(&ours) {
         let key = format!("reset, load {shape:?}");
-        assert!(reims_vgpu_core::metal_matches_raw!(key, o), "{key}");
+        assert!(crate::metal_matches_raw!(key, o), "{key}");
     }
     // After a map of one layer was drawn with and released, each platform's own.
     draw_and_release(&p, &d);
     let ours = shapes.map(|(reset, load)| stored(&p, &d, reset, load));
     for (shape, o) in shapes.iter().zip(&ours) {
         let key = format!("after a released map, reset, load {shape:?}");
-        assert!(reims_vgpu_core::metal_matches_raw!(key, o), "{key}");
+        assert!(crate::metal_matches_raw!(key, o), "{key}");
     }
 }
 
@@ -7291,10 +7275,10 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
 /// command buffer of its own queue, before any command buffer drew over a mutable map
 #[test]
 fn drawless_passes_over_mutable_maps_store_as_metals() {
-    use reims_vgpu_core::platform::rate_map::{
+    use crate::core::platform::rate_map::{
         RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
     };
-    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+    use crate::core::platform::values::{PassSet, RateMapDesc};
 
     const SIDE: u64 = 64;
     /// `MTLMutabilityMutable`.
@@ -7472,12 +7456,12 @@ fn drawless_passes_over_mutable_maps_store_as_metals() {
 /// reset to 48
 #[test]
 fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-    use reims_vgpu_core::platform::rate_map::{
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
+    use crate::core::platform::rate_map::{
         RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
     };
-    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
-    use reims_vgpu_core::raise::death::DeathSite;
+    use crate::core::platform::values::{PassSet, RateMapDesc};
+    use crate::core::raise::death::DeathSite;
 
     const SIDE: u64 = 16;
     const HALF: u64 = SIDE / 2;
@@ -7636,10 +7620,10 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
 /// Metal's GPU draws then ([`crate::gpu::rate_map`])
 #[test]
 fn a_reset_of_a_varying_map_to_another_screen_dies_while_its_pass_may_run() {
-    use reims_vgpu_core::platform::rate_map::{
+    use crate::core::platform::rate_map::{
         RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
     };
-    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+    use crate::core::platform::values::{PassSet, RateMapDesc};
 
     /// An immutable descriptor of a `side` by `side` screen of one layer of one sample of 0.5
     /// on each axis.
@@ -7723,7 +7707,7 @@ fn the_tile_size_is_metals() {
 fn simd_state<P: Platform>(
     d: &P::Device,
     vertex: &str,
-) -> Result<Option<P::RenderPipeline>, reims_vgpu_core::platform::types::NsErrorText> {
+) -> Result<Option<P::RenderPipeline>, crate::core::platform::types::NsErrorText> {
     let v = fixture::<P>(d, &format!("simd_stages:{vertex}"));
     let f = fixture::<P>(d, "simd_stages:value_fragment");
     d.new_render_pipeline_state_full(&crate::gpu::device::tests::render_value::<P>(
@@ -7784,7 +7768,7 @@ fn simd_operations_in_a_vertex_function_draw_as_metals() {
 /// The words `simd_kernel` of `simd_stages.metal` writes on `d`, two a thread, over 64 threads
 /// in one threadgroup: each thread's `simd_sum` and explicit-width fill.
 fn simd_kernel_words<P: Platform>(d: &P::Device) -> Vec<[u32; 2]> {
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
     let f = fixture::<P>(d, "simd_stages:simd_kernel");
     let state = d
         .new_compute_pipeline_state_for_function(Some(&f))
@@ -7862,9 +7846,9 @@ fn simd_operations_in_kernels_and_fragments_run_as_metals() {
     let pixels = ["sum_fragment", "fill_fragment"].map(|f| simd_fragment_pixels(&p, &d, f));
     assert!(pixels[0].iter().all(|px| px[3] == 255), "{:?}", pixels[0]);
     let fragments = ["sum_fragment", "fill_fragment"];
-    reims_vgpu_core::metal_check_raw!("the kernel's words", words);
+    crate::metal_check_raw!("the kernel's words", words);
     for (fragment, ours) in fragments.into_iter().zip(&pixels) {
-        reims_vgpu_core::metal_check_raw!(fragment, ours);
+        crate::metal_check_raw!(fragment, ours);
     }
 }
 
@@ -7901,8 +7885,8 @@ pub(crate) fn memoryless_fetched<P: Platform>(
     d: &P::Device,
     tiles_written: bool,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::Library as _;
 
     use crate::gpu::device::tests::render_value;
 
@@ -8007,7 +7991,7 @@ pub(crate) fn memoryless_fetched<P: Platform>(
 }
 
 /// What [`filling`]'s completed handlers saw: each one's fill value, status and error code.
-type Seen = Arc<reims_vgpu_core::sync::Mutex<Vec<(u8, u64, Option<i64>)>>>;
+type Seen = Arc<crate::core::sync::Mutex<Vec<(u8, u64, Option<i64>)>>>;
 
 /// A command buffer of `q` that waits for `wait` where given, fills a new 16-byte buffer of `d`'s
 /// with `value` in a blit, then signals a new event of its own to 1, with a completed handler that
@@ -8018,7 +8002,7 @@ fn filling<P: Platform>(
     (value, wait): (u8, Option<&P::SharedEvent>),
     seen: &Seen,
 ) -> (P::CommandBuffer, P::Buffer, P::SharedEvent) {
-    use reims_vgpu_core::platform::event::EventRef;
+    use crate::core::platform::event::EventRef;
     let b = buffer::<P>(d, 16, 0, &[0; 16]);
     let event = d.new_shared_event().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
@@ -8072,7 +8056,7 @@ fn type_9_pass<P: Platform>(p: &P, d: &P::Device, draw: Nine) -> String {
 /// first byte of each buffer, whether the signal fired, and the target's first texel, black
 /// where the pass's clear ran, read through a new queue.
 fn type_9_pass_on<P: Platform>(p: &P, d: &P::Device, q: &P::CommandQueue, draw: Nine) -> String {
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
     let (dst, pass) = pass_of(p, d, (4, 4));
     let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
     dst.replace_region(region, 0, 0, HostRange::of_slice(&[0x11; 64]), 16, 0)
@@ -8270,7 +8254,7 @@ fn type_9_draws_fail_their_command_buffers_as_metals() {
 /// some runs (the runtime's measurement, `command_buffer/revocation.rs`), where
 /// [`type_9_draws_fail_as_metals`] compares it on a GPU that ran just before.
 fn after_type_9s<P: Platform>(p: &P, d: &P::Device, draws: &[Nine]) -> Vec<String> {
-    use reims_vgpu_core::platform::event::SharedEvent as _;
+    use crate::core::platform::event::SharedEvent as _;
     let q = d.new_command_queue().unwrap();
     let mut lines: Vec<String> = (draws.iter())
         .map(|&draw| {
@@ -8378,7 +8362,7 @@ fn visibility_results<P: Platform>(
     init: &[u64],
     passes: &[VisPass<'_>],
 ) -> Vec<u64> {
-    use reims_vgpu_core::platform::values::{DepthStencilDesc, PassSet};
+    use crate::core::platform::values::{DepthStencilDesc, PassSet};
 
     let words: Vec<u8> = init.iter().flat_map(|w| w.to_ne_bytes()).collect();
     let length = u64::try_from(words.len()).unwrap();
@@ -8430,7 +8414,7 @@ fn visibility_results<P: Platform>(
         .unwrap();
         let depth = pass.depth.then(|| attachment(252));
         if let Some(depth) = &depth {
-            rp.set_depth_attachment(&reims_vgpu_core::platform::values::DepthAttachmentSet {
+            rp.set_depth_attachment(&crate::core::platform::values::DepthAttachmentSet {
                 texture: Some(Some(depth)),
                 load_action: Some(CLEAR),
                 store_action: Some(0),

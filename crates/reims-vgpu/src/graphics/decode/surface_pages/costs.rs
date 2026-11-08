@@ -48,9 +48,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reims_vgpu_core::host::PhysRange;
-use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
-use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
@@ -60,6 +57,9 @@ use reims_vgpu_graphics::wire::{
     RgfxBufferOverSurfacePages, RgfxHeapOverPages, RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun,
     RgfxSurfacePages,
 };
+use reims_vgpu_vulkan::core::host::PhysRange;
+use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
+use reims_vgpu_vulkan::core::num::{ToU64 as _, ToUsize as _};
 use zerocopy::IntoBytes;
 
 use super::super::{GraphicsDecoder, no_raise};

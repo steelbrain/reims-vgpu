@@ -26,9 +26,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::testkit::FakePlatform;
-use reims_vgpu_core::testkit::objects::CompleteOn;
 use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
     RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_OP_SUBMITTED, RGFX_PASS_FLAG_RT_SIZE,
@@ -42,6 +39,9 @@ use reims_vgpu_graphics::wire::{
     RgfxCbScheduled, RgfxMsgHeader, RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate,
     RgfxTextureCreate, RgfxTextureDescriptor,
 };
+use reims_vgpu_vulkan::core::sync::Mutex;
+use reims_vgpu_vulkan::core::testkit::FakePlatform;
+use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::{DecodeError, GraphicsDecoder, ObjHandle, refusing};
@@ -543,7 +543,7 @@ impl Outcomes {
     fn add<E>(
         &mut self,
         r#type: u32,
-        outcome: &reims_vgpu_core::raise::RaiseResult<Result<(), E>>,
+        outcome: &reims_vgpu_vulkan::core::raise::RaiseResult<Result<(), E>>,
     ) {
         let r#type = if (0x200..0x400).contains(&r#type) {
             r#type

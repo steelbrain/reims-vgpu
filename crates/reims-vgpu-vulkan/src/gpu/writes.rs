@@ -61,10 +61,10 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::core::num::ToU64;
 use metal2vulkan::metal::{BindingType, PixelFormat};
 use metal2vulkan::pipeline::ComputePipelineDescriptor;
 use metal2vulkan::reflection::{SlotWritability, SlotWrite, SlotWriteGap};
-use reims_vgpu_core::num::ToU64;
 
 use crate::answer::plain;
 use crate::gpu::backing::Pages;
@@ -813,11 +813,11 @@ impl Whether {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _};
-    use reims_vgpu_core::platform::values::TextureDesc;
-    use reims_vgpu_core::raise::OnFault;
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::resource::{Buffer as _, Heap as _};
+    use crate::core::platform::values::TextureDesc;
+    use crate::core::raise::OnFault;
 
     use super::*;
     use crate::gpu::resource::tests::{guest_pages, heap_at, over_pages};

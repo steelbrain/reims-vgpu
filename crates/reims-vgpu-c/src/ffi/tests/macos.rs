@@ -5,7 +5,7 @@ use objc2::exception::{self, Exception};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2_foundation::{NSException, NSString};
-use reims_vgpu_core::testkit::capture::catch_death;
+use reims_vgpu_vulkan::core::testkit::capture::catch_death;
 
 use super::*;
 

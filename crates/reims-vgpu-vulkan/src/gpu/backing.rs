@@ -188,15 +188,15 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
+use crate::core::host::HostPtr;
+use crate::core::num::ToU64;
+use crate::core::platform::os::vm::{HostVm, KernReturn, VmProt};
+use crate::core::platform::types::ResourceAddressRange;
+use crate::core::raise::RaiseResult;
+use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+use crate::core::rt::BlockEnv;
+use crate::core::sync::Mutex;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::os::vm::{HostVm, KernReturn, VmProt};
-use reims_vgpu_core::platform::types::ResourceAddressRange;
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
-use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::unrepresentable;
 use crate::os::OsVm;
@@ -1269,7 +1269,7 @@ impl ImportSite {
 }
 
 /// The trace of the host memory this platform hands the runtime for one no-copy buffer, heap or
-/// rebind, with `REIMS_VGPU_TRACE` set ([`reims_vgpu_core::trace`]): `imp` as its keep-alive is
+/// rebind, with `REIMS_VGPU_TRACE` set ([`crate::core::trace`]): `imp` as its keep-alive is
 /// made (the site, the first byte given, its length, the first byte handed over), and `impfree`
 /// as the keep-alive goes ([`keep_alive`]). It marks each buffer, not each import: a buffer
 /// made over exactly the bytes a live no-copy buffer was made over lies in that one's import
@@ -1287,14 +1287,14 @@ impl ImportTrace {
     ) -> Self {
         let at = imported.as_ptr().addr().to_u64();
         let given = given.as_ptr().addr().to_u64();
-        reims_vgpu_core::trace::event("imp", &[site.code(), given, length, at]);
+        crate::core::trace::event("imp", &[site.code(), given, length, at]);
         Self(at)
     }
 }
 
 impl Drop for ImportTrace {
     fn drop(&mut self) {
-        reims_vgpu_core::trace::event("impfree", &[self.0]);
+        crate::core::trace::event("impfree", &[self.0]);
     }
 }
 
@@ -1861,8 +1861,8 @@ mod tests {
     /// first, as Metal makes nothing of them
     #[test]
     fn a_first_range_off_its_page_dies() {
-        use reims_vgpu_core::raise::death::DeathKind;
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::raise::death::DeathKind;
+        use crate::core::testkit::capture::catch_death;
         let guest = pages(3, 0);
         for (into, sel) in [(0x40, REPLACE), (PAGE / 4, "newHeapWithDescriptor:")] {
             let ranges = [range(address(guest) + into, 2 * PAGE)];
@@ -1925,7 +1925,7 @@ mod tests {
     /// it, or none, gathers nothing; read-only pages gather
     #[test]
     fn refused_ranges_gather_nothing() {
-        use reims_vgpu_core::platform::os::vm::VmProt;
+        use crate::core::platform::os::vm::VmProt;
         let vm = OsVm::new();
         // A hole of one page between two mapped ones, where no alias of two pages fits.
         let around = pages(3, 0);
@@ -2015,7 +2015,7 @@ mod tests {
     /// caller's
     #[test]
     fn replace_answers_as_metal() {
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::testkit::capture::catch_death;
         let guest = pages(2, 0xa1);
         let ranges = [range(address(guest), 2 * PAGE)];
         let [id, other] = ids();
@@ -2285,20 +2285,20 @@ mod tests {
     /// writes
     #[test]
     fn a_commit_while_detached_fails_on_every_host() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-        use reims_vgpu_core::platform::device::GpuDevice;
-        use reims_vgpu_core::platform::resource::Buffer;
-        use reims_vgpu_core::platform::types::NsRange;
-        use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
-        use reims_vgpu_core::raise::OnFault;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder};
+        use crate::core::platform::command::{CommandBuffer, CommandQueue};
+        use crate::core::platform::device::GpuDevice;
+        use crate::core::platform::resource::Buffer;
+        use crate::core::platform::types::NsRange;
+        use crate::core::platform::values::{BufferDesc, OptionSet};
+        use crate::core::raise::OnFault;
         const TEST: &str = "gpu::backing::tests::a_commit_while_detached_fails_on_every_host";
         if std::env::var("RVG_CHILD").as_deref() == Ok(TEST) {
-            reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+            crate::core::testkit::capture::set_capture_enabled(false);
             let d = crate::gpu::device::tests::dev();
             let memory = pages(1, 0xd0);
             // SAFETY: the pages stay mapped for the process, which exits below.
-            let contents = unsafe { reims_vgpu_core::platform::HostRange::new(memory, PAGE) };
+            let contents = unsafe { crate::core::platform::HostRange::new(memory, PAGE) };
             let buffer = d
                 .new_buffer(BufferDesc {
                     length: PAGE,
@@ -2355,16 +2355,16 @@ mod tests {
     /// code 8 by a detached use
     #[test]
     fn a_command_buffer_took_the_object_until_it_completed() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder};
+        use crate::core::platform::command::{CommandBuffer, CommandQueue};
+        use crate::core::platform::device::GpuDevice;
+        use crate::core::platform::event::{EventRef, SharedEvent};
+        use crate::core::platform::resource::Buffer;
+        use crate::core::platform::types::NsRange;
+        use crate::core::platform::values::{BufferDesc, OptionSet};
+        use crate::core::raise::OnFault;
         use crate::gpu::command::VulkanCommandBuffer;
         use crate::gpu::resource::VulkanBuffer;
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-        use reims_vgpu_core::platform::device::GpuDevice;
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
-        use reims_vgpu_core::platform::resource::Buffer;
-        use reims_vgpu_core::platform::types::NsRange;
-        use reims_vgpu_core::platform::values::{BufferDesc, OptionSet};
-        use reims_vgpu_core::raise::OnFault;
         fn fill(cb: &VulkanCommandBuffer, buffer: &VulkanBuffer) {
             let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
             for command in [
@@ -2382,7 +2382,7 @@ mod tests {
         // A no-copy buffer over a page of the test's, which stays mapped for the process.
         let no_copy = || {
             // SAFETY: the page stays mapped for the process.
-            let contents = unsafe { reims_vgpu_core::platform::HostRange::new(pages(1, 0), PAGE) };
+            let contents = unsafe { crate::core::platform::HostRange::new(pages(1, 0), PAGE) };
             d.new_buffer(BufferDesc {
                 length: PAGE,
                 options: vec![OptionSet::StorageMode(0)],

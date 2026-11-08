@@ -692,7 +692,7 @@ impl Drop for InputState {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::sync::Mutex;
+    use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::*;
     use crate::config::{BUTTON_LEFT, BUTTON_RIGHT};

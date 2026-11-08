@@ -111,17 +111,17 @@
 //! the pass by the map as the GPU runs it, and decides what it decides by the map's class at the
 //! encoder's creation ([`crate::gpu::rate_map`]).
 
-use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::descriptor::{RenderPassDescriptor, TextureDescriptor};
-use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
-use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::platform::values::{
+use crate::core::platform::Handle;
+use crate::core::platform::descriptor::{RenderPassDescriptor, TextureDescriptor};
+use crate::core::platform::types::{ClearColor, MtlSamplePosition};
+use crate::core::platform::values::TextureDesc;
+use crate::core::platform::values::{
     AttachmentState, ColorAttachmentSet, DepthAttachmentSet, PassSet, StencilAttachmentSet,
 };
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::Mutex;
+use metal2vulkan::metal::PixelFormat;
+use metal2vulkan_runtime as rt;
 
 use crate::answer::{Policy, metal_aborts, plain, send, unrepresentable};
 use crate::gpu::rate_map::VulkanRateMap;

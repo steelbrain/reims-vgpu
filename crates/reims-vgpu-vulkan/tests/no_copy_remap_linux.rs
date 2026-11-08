@@ -51,16 +51,16 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-use reims_vgpu_core::platform::device::{GpuDevice, NoCopyDeallocator};
-use reims_vgpu_core::platform::os::vm::HostVm;
-use reims_vgpu_core::platform::resource::Buffer;
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::platform::{HostRange, Platform};
-use reims_vgpu_core::raise::OnFault;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+use reims_vgpu_vulkan::core::platform::device::{GpuDevice, NoCopyDeallocator};
+use reims_vgpu_vulkan::core::platform::os::vm::HostVm;
+use reims_vgpu_vulkan::core::platform::resource::Buffer;
+use reims_vgpu_vulkan::core::platform::types::NsRange;
+use reims_vgpu_vulkan::core::platform::{HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::os::OsVm;
 use reims_vgpu_vulkan::remap::VulkanVm;
 

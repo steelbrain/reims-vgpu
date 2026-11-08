@@ -82,26 +82,6 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::memory::map::MemoryMap;
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
-use reims_vgpu_core::platform::os::clock::{Clock as _, MonoTime};
-use reims_vgpu_core::platform::resource::{
-    Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
-};
-use reims_vgpu_core::platform::types::{MtlSize, Swizzle};
-use reims_vgpu_core::platform::values::{
-    AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
-    FullComputePipelineDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc,
-    LinkedFunctionsDesc, OptionSet, PagesInPlace, PagesPlane, PrivateRenderDesc, SamplerDesc,
-    StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix, SurfacePlane, TextureDesc,
-    VertexDesc,
-};
-use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
-use reims_vgpu_core::sync::Mutex;
 use reims_vgpu_graphics::region::Region;
 use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
@@ -153,6 +133,26 @@ use reims_vgpu_graphics::wire::{
     RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
 use reims_vgpu_video::core::device_memory::MemoryLife;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::memory::map::MemoryMap;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, MonoTime};
+use reims_vgpu_vulkan::core::platform::resource::{
+    Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
+};
+use reims_vgpu_vulkan::core::platform::types::{MtlSize, Swizzle};
+use reims_vgpu_vulkan::core::platform::values::{
+    AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
+    FullComputePipelineDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc,
+    LinkedFunctionsDesc, OptionSet, PagesInPlace, PagesPlane, PrivateRenderDesc, SamplerDesc,
+    StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix, SurfacePlane, TextureDesc,
+    VertexDesc,
+};
+use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult, refusals};
+use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Metal's page on Apple silicon, to which a Shared heap's memory is rounded up: the guest's
@@ -352,7 +352,7 @@ impl Drop for Drain {
 /// ends the process, fails alone, as a buffer Metal could not run does, and its process's later work
 /// is carried out (docs/graphics-kext/design.md, "Guest input the host refuses").
 ///
-/// [`CompletedInfo::refused`]: reims_vgpu_core::platform::command::CompletedInfo::refused
+/// [`CompletedInfo::refused`]: reims_vgpu_vulkan::core::platform::command::CompletedInfo::refused
 #[derive(Default)]
 pub(crate) struct ClosedContexts {
     /// The contexts closed since the device's reset.
@@ -872,7 +872,7 @@ impl<P: Platform> Recent<P> {
 
 /// What the tests call after each op of a command buffer's walk, with its index, but for the
 /// render ops, which run inside their encoder's runs
-/// ([`reims_vgpu_core::platform::render::RenderEncoder::encoding`]) and are not counted.
+/// ([`reims_vgpu_vulkan::core::platform::render::RenderEncoder::encoding`]) and are not counted.
 #[cfg(test)]
 pub(crate) type WalkHook = Arc<dyn Fn(usize) + Send + Sync>;
 
@@ -1545,7 +1545,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// for the answer [`RGFX_STATUS_CACHE`]; the device's verdict not known yet keeps it in place,
     /// counted apart.
     ///
-    /// [`GpuDevice::surface_pages_in_place`]: reims_vgpu_core::platform::device::GpuDevice::surface_pages_in_place
+    /// [`GpuDevice::surface_pages_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_in_place
     fn asks_cache(&self, device: &P::Device, block: u64, planes: &[PagesPlane]) -> bool {
         let views = &self.shared.surface_views;
         let Some(import) = views.lock().import_of(block) else {
@@ -2037,7 +2037,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn caches(
         &self,
-    ) -> reims_vgpu_core::sync::MutexGuard<'_, surface_cache::SurfaceCaches<P>> {
+    ) -> reims_vgpu_vulkan::core::sync::MutexGuard<'_, surface_cache::SurfaceCaches<P>> {
         self.surface_caches.lock()
     }
 
@@ -2112,7 +2112,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn views_of_surfaces(
         &self,
-    ) -> reims_vgpu_core::sync::MutexGuard<'_, surface_pages::SurfaceViews<P>> {
+    ) -> reims_vgpu_vulkan::core::sync::MutexGuard<'_, surface_pages::SurfaceViews<P>> {
         self.shared.surface_views.lock()
     }
 
@@ -5263,11 +5263,11 @@ fn stencil(s: &RgfxStencilDescriptor) -> StencilDesc {
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
     use reims_vgpu_graphics::wire::{
         RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_LIBRARY_BYTES_OFFSET, RGFX_RESOURCE_ID_CHUNKS,
         RgfxLibraryCreate, RgfxLibraryFromRegion, RgfxTextureView,
     };
+    use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, Step};
     use zerocopy::IntoBytes;
 
     use super::*;
@@ -5279,7 +5279,7 @@ mod tests {
     /// none (0) is no attachment
     #[test]
     fn a_pixel_format_the_device_describes_none_for_is_refused_before_the_platform() {
-        use reims_vgpu_core::platform::types::PixelFormatInfo;
+        use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
         const INFO: &str = "MTLPixelFormatGetInfoForDevice()";
         const MAKES: [&str; 3] = [
             "newTextureWithDescriptor:",
@@ -5816,10 +5816,10 @@ mod tests {
     /// way, is refused, and stores and makes nothing more.
     #[test]
     fn an_unshared_queue_create_makes_the_platforms_unshared_queue() {
-        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
         use reims_vgpu_graphics::wire::{
             RGFX_QUEUE_QUIET_SCHEDULED, RGFX_QUEUE_UNSHARED, RgfxQueueCreateFlags,
         };
+        use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
 
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
@@ -6066,7 +6066,7 @@ mod tests {
     /// message sees the destroy.
     #[test]
     fn a_message_names_what_its_own_destroys_and_makes_left() {
-        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap());
@@ -6122,8 +6122,8 @@ mod tests {
     /// a reset sets those of the contexts it drops.
     #[test]
     fn a_gone_context_s_events_are_set_past_every_value() {
-        use reims_vgpu_core::testkit::Call;
-        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+        use reims_vgpu_vulkan::core::testkit::Call;
+        use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
 
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
@@ -6667,7 +6667,7 @@ mod tests {
         );
         assert_eq!(format!("{:?}", dec.surface_texture(0x77).unwrap()), first);
         assert_eq!(
-            reims_vgpu_core::platform::resource::Texture::width(&shown),
+            reims_vgpu_vulkan::core::platform::resource::Texture::width(&shown),
             64
         );
         drop(shown);
@@ -7127,7 +7127,7 @@ mod tests {
             desc,
             writers_offset: RGFX_SURFACE_NO_WRITERS,
         };
-        let logs = reims_vgpu_core::testkit::logs::capture();
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
         let script = p.script();
         script.push("newTextureWithDescriptor:offset:bytesPerRow:", Step::Nil);
         script.push(
@@ -7308,7 +7308,7 @@ mod tests {
         assert_eq!(made(), 2, "no platform call for a malformed message");
 
         // A refused texture's warning names the facts.
-        let logs = reims_vgpu_core::testkit::logs::capture();
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
         p.script()
             .push("newTextureWithDescriptor:iosurface:plane:", Step::Nil);
         assert_eq!(
@@ -7527,7 +7527,7 @@ mod tests {
     pub(super) fn pipeline_decoder() -> (
         Arc<FakePlatform>,
         GraphicsDecoder<FakePlatform>,
-        Arc<reims_vgpu_core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
+        Arc<reims_vgpu_vulkan::core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
     ) {
         pipeline_decoder_over(Arc::new(
             reims_vgpu_graphics::region::Region::new(0x10000).unwrap(),
@@ -7540,12 +7540,12 @@ mod tests {
     ) -> (
         Arc<FakePlatform>,
         GraphicsDecoder<FakePlatform>,
-        Arc<reims_vgpu_core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
+        Arc<reims_vgpu_vulkan::core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
     ) {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), region);
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies.lock().push(r.reflection);
@@ -7947,10 +7947,10 @@ mod tests {
     /// kind, with no limits after it
     #[test]
     fn a_mesh_render_create_is_answered_with_its_mesh_limits() {
-        use reims_vgpu_core::testkit::faults::Fault;
+        use reims_vgpu_vulkan::core::testkit::faults::Fault;
         let (p, mut dec, _) = pipeline_decoder();
         let device = p.device();
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies.lock().push(r.bytes());
@@ -8066,7 +8066,7 @@ lacks {part}"
         const MAKE: &str = "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:";
         let (p, mut dec, _) = pipeline_decoder();
         let device = p.device();
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies.lock().push(r.bytes());
@@ -8101,7 +8101,7 @@ lacks {part}"
     /// [`DecodeError::Refused`] with a refused reply, nothing is stored, and the next is made
     #[test]
     fn a_compile_the_platform_refuses_in_the_decoder_is_a_refused_reply() {
-        use reims_vgpu_core::testkit::faults::Fault;
+        use reims_vgpu_vulkan::core::testkit::faults::Fault;
         let (p, mut dec, replies) = pipeline_decoder();
         let device = p.device();
         let faults = p.faults();
@@ -8500,7 +8500,7 @@ lacks {part}"
     /// at refuses the create
     #[test]
     fn a_create_s_bad_linked_function_makes_nothing() {
-        use reims_vgpu_core::testkit::faults::Fault;
+        use reims_vgpu_vulkan::core::testkit::faults::Fault;
         let (p, mut dec, replies) = pipeline_decoder();
         let device = p.device();
         let with = |obj_id, library, list| {
@@ -8617,7 +8617,7 @@ lacks {part}"
             Arc::clone(&platform),
             Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies
@@ -8897,20 +8897,20 @@ lacks {part}"
         kernel: &str,
         linked: &str,
     ) -> Vec<Option<f32>> {
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
-        use reims_vgpu_core::platform::values::ComputePassDesc;
-        use reims_vgpu_core::raise::OnFault;
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::types::{MtlSize, NsRange};
+        use reims_vgpu_vulkan::core::platform::values::ComputePassDesc;
+        use reims_vgpu_vulkan::core::raise::OnFault;
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
             Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies
@@ -9116,20 +9116,20 @@ lacks {part}"
     fn optional_constant_through_the_decoder<P: crate::platform::ApiPlatform>(
         cases: &[&[RgfxFunctionConstant]],
     ) -> Vec<Option<i32>> {
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
-        use reims_vgpu_core::platform::values::ComputePassDesc;
-        use reims_vgpu_core::raise::OnFault;
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::types::{MtlSize, NsRange};
+        use reims_vgpu_vulkan::core::platform::values::ComputePassDesc;
+        use reims_vgpu_vulkan::core::raise::OnFault;
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
             Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies
@@ -9267,10 +9267,10 @@ lacks {part}"
         grid: (u64, u64),
         (sampler, probe): (Option<&P::SamplerState>, Option<&[u8]>),
     ) -> Vec<[f32; 4]> {
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_vulkan::core::platform::types::{MtlSize, NsRange};
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let library = device.new_library(PROBE_LIBRARY).unwrap().unwrap().unwrap();
         let f = library.new_function(OnFault::Die, kernel).unwrap().unwrap();
         let state = device
@@ -9460,7 +9460,7 @@ lacks {part}"
         texture: &P::Texture,
         size: (u64, u64),
     ) -> TextureAnswer {
-        use reims_vgpu_core::platform::resource::{GpuResource as _, Texture as _};
+        use reims_vgpu_vulkan::core::platform::resource::{GpuResource as _, Texture as _};
         let t = texture;
         let getters = [
             t.pixel_format(),
@@ -9707,7 +9707,7 @@ lacks {part}"
     /// mean, median and 99th percentile of each. `RVG_SAMPLER_BENCH_LIVE` (comma-separated) sets
     /// other live counts.
     fn sampler_create_cost<P: crate::platform::ApiPlatform>() {
-        use reims_vgpu_core::platform::os::Clock as _;
+        use reims_vgpu_vulkan::core::platform::os::Clock as _;
         let (mut dec, device) = surface_decoder::<P>();
         let platform = P::process();
         let now = || platform.clock().now_mono();
@@ -9840,7 +9840,7 @@ lacks {part}"
     /// non-library is a bad reference and makes nothing.
     #[test]
     fn render_and_compute_pipeline_creates() {
-        use reims_vgpu_core::sync::Mutex;
+        use reims_vgpu_vulkan::core::sync::Mutex;
 
         let p = Arc::new(FakePlatform::new());
         let device = p.device();

@@ -16,7 +16,7 @@
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 /// What watches the host's devices' writes.
 pub(crate) trait Watcher: Send + Sync {

@@ -9,10 +9,10 @@
 //! (`device::registry_id`). A loaded library stays for the life of the process; one that fails to
 //! load is not kept, and the next ask loads again.
 
+use crate::core::platform::Handle;
+use crate::core::platform::types::NsErrorText;
+use crate::core::sync::Mutex;
 use metal2vulkan_runtime::Error;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::types::NsErrorText;
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{error_text, plain, refused};
 use crate::gpu::device::VulkanDevice;

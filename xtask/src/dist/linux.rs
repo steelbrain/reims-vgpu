@@ -203,7 +203,7 @@ mod tests {
 
     /// What `cargo rustc --message-format json -- --print native-static-libs` prints: the note,
     /// once as its message and once rendered, among the other messages.
-    const CARGO: &str = r#"{"reason":"compiler-artifact","package_id":"path+file:///r/crates/reims-vgpu-core#0.1.0","filenames":["/t/release/deps/libreims_vgpu_core.rlib"],"fresh":true}
+    const CARGO: &str = r#"{"reason":"compiler-artifact","package_id":"path+file:///r/crates/reims-vgpu-vulkan#0.1.0","filenames":["/t/release/deps/libreims_vgpu_vulkan.rlib"],"fresh":true}
 {"reason":"compiler-message","package_id":"path+file:///r/crates/reims-vgpu-c#0.1.0","message":{"rendered":"note: Link against the following native artifacts when linking against this static library. The order and any duplication can be significant on some platforms.\n\n","children":[],"level":"note","message":"Link against the following native artifacts when linking against this static library. The order and any duplication can be significant on some platforms.","spans":[]}}
 {"reason":"compiler-message","package_id":"path+file:///r/crates/reims-vgpu-c#0.1.0","message":{"rendered":"note: native-static-libs: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc\n\n","children":[],"level":"note","message":"native-static-libs: -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc","spans":[]}}
 {"reason":"build-finished","success":true}"#;

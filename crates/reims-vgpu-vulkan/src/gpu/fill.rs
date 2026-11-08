@@ -75,9 +75,9 @@
 //!   (`encode_blit`'s `multisample_fills_are_metals`). The runtime refuses one only
 //!   where the device cannot run its sample copies, which dies naming the refusal.
 
+use crate::core::platform::types::MtlRegion;
 use metal2vulkan::metal::{PixelFormat, TextureType};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::types::MtlRegion;
 
 use crate::answer::unrepresentable;
 
@@ -266,7 +266,7 @@ pub fn texture_buffer_writes(sel: &'static str, region: MtlRegion) -> bool {
 /// (`LongTextureBufferFillPattern`), before the region is read: the runtime refuses it only for a
 /// region it is given, and this platform gives none of no texels across.
 pub fn streamed_pattern(sel: &'static str, length: u64) {
-    use reims_vgpu_core::num::ToU64 as _;
+    use crate::core::num::ToU64 as _;
     if length > MOST_STREAMED_PATTERN_BYTES.to_u64() {
         let problem = rt::Problem::LongTextureBufferFillPattern { length };
         let e = rt::Error::Invalid(rt::Invalid::new("fill_texture", problem));
@@ -344,9 +344,9 @@ pub fn place(
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize};
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::types::{MtlOrigin, MtlSize};
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
 

@@ -16,11 +16,6 @@
 //!
 //! [`RGFX_OP_GROUP_COMPUTE`]: reims_vgpu_graphics::ops::RGFX_OP_GROUP_COMPUTE
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_COMPRESSED_TEXTURE_REINTERPRETATION_FLUSH,
     RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS_INDIRECT,
@@ -54,6 +49,11 @@ use reims_vgpu_graphics::ops::compute::{
     RgfxComputeOpUseResources, RgfxComputeOpWaitForFence, RgfxComputeResourceRef,
     RgfxComputeSamplerBinding, RgfxComputeSamplerLodBinding, RgfxComputeTextureBinding,
 };
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
+use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::{FromBytes, Immutable};
 
 use super::refused::{self, Bound, Marks, Slot, Stage};
@@ -612,18 +612,18 @@ pub(crate) fn decode_op<P: Platform>(
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::platform::Handle;
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::values::ComputePassDesc;
-    use reims_vgpu_core::raise::OnFault;
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_core::testkit::calllog::Arg;
     use reims_vgpu_graphics::wire::{
         RGFX_CMD_BUFFER_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_QUEUE_CREATE,
         RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate, RgfxMsgHeader, RgfxObjectCreate,
         RgfxQueueCreate, RgfxTextureCreate, RgfxTextureDescriptor,
     };
+    use reims_vgpu_vulkan::core::platform::Handle;
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+    use reims_vgpu_vulkan::core::platform::values::ComputePassDesc;
+    use reims_vgpu_vulkan::core::raise::OnFault;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::calllog::Arg;
     use zerocopy::IntoBytes;
 
     use super::*;
