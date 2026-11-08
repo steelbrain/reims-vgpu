@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use crate::core::runtime::{Runtime, StdRuntime};
 
-use super::gpu::{Run, SIZE, begin, decoded, display, encoder, h264, input, noise, stalled};
+use super::gpu::{
+    Run, SIZE, begin, decoded, display, encoder, flat, h264, h264_of, input, noise, stalled,
+};
 use super::kept;
 use super::tests::{NO_SYNC_SURFACE2, WAIT, within_5_s};
 use super::{Deadline, by};
@@ -356,12 +358,17 @@ fn an_encode_on_a_held_gpu_fails_by_its_deadline() {
 /// by theirs while the call is in the driver; and the new decoder's pool
 /// and context are kept until the GPU is let go and the call returns,
 /// after which a decoder decodes again.
+///
+/// The picture is flat, its IDR a few kilobytes: the timed decode reads its
+/// access unit before it first waits, and the CPU work of a noise IDR's 6.2
+/// MB took 127 ms in a debug build (7 ms in a release one) and grew with
+/// the host's load past the call's [`SLACK`].
 #[test]
 #[ignore = "needs an AMD GPU: run on the VA-API host"]
 fn a_new_decoders_first_picture_after_a_free_on_a_held_gpu_fails_by_its_deadline() {
     on_a_held_gpu("a new decoder's first picture after a free", || {
         let display = display();
-        let (avcc, samples) = h264(&display, 1);
+        let (avcc, samples) = h264_of(&display, 1, flat);
         let mut before = H264Decoder::new(&display, &avcc).expect("a decoder");
         let frames = decoded(&mut before, &samples);
         frames

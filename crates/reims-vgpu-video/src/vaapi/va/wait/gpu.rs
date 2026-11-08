@@ -52,6 +52,14 @@ pub(super) fn noise(n: u64) -> Vec<u8> {
         .collect()
 }
 
+/// Frame `n` of mid grey at [`SIZE`], NV12, the same for every `n`: its IDR picture codes to a
+/// few kilobytes, where noise's codes to megabytes.
+pub(super) fn flat(_n: u64) -> Vec<u8> {
+    let (width, height) = SIZE;
+    let len = usize::try_from(u64::from(width) * u64::from(height) * 3 / 2).unwrap_or(0);
+    vec![128; len]
+}
+
 /// `bytes`, frame `n`, as the encoder takes it.
 pub(super) fn input(bytes: &[u8], n: u64) -> InputFrame<'_> {
     let row = SIZE.0 as usize;
@@ -84,10 +92,20 @@ pub(super) fn encoder(display: &Display) -> VideoEncoder {
 /// `count` frames of noise, H.264 by the driver's encoder: its avcC, and
 /// its samples.
 pub(super) fn h264(display: &Display, count: u64) -> (Vec<u8>, Vec<Vec<u8>>) {
+    h264_of(display, count, noise)
+}
+
+/// `count` frames of `picture` (frame `n` its `picture(n)`), H.264 by the
+/// driver's encoder: its avcC, and its samples.
+pub(super) fn h264_of(
+    display: &Display,
+    count: u64,
+    picture: fn(u64) -> Vec<u8>,
+) -> (Vec<u8>, Vec<Vec<u8>>) {
     let mut encoder = encoder(display);
     let mut samples = Vec::new();
     for n in 0..count {
-        let bytes = noise(n);
+        let bytes = picture(n);
         let coded = encoder.encode(&input(&bytes, n)).expect("a frame taken");
         samples.extend(coded.into_iter().map(|c| c.expect("a sample").data));
     }
