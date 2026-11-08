@@ -80,6 +80,35 @@ fn c_harness_passes() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("harness: ok"));
 }
 
+/// On macOS the dylib's install name is `@rpath/libreims_vgpu_c.dylib`, and the harness links it
+/// by that name, so the harness finds the library through its rpath, not through the path of the
+/// build that first linked it (`build.rs`)
+#[cfg(target_os = "macos")]
+#[test]
+fn the_dylib_is_found_by_rpath() {
+    let otool = |flag: &str, file: &Path| {
+        let out = Command::new("otool").arg(flag).arg(file).output().unwrap();
+        assert!(out.status.success(), "otool {flag}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let install_name = format!("@rpath/{}", cdylib::file_name());
+    let dylib = cdylib::dir().join(cdylib::file_name());
+    let id = otool("-D", &dylib);
+    assert_eq!(
+        id.lines().nth(1).map(str::trim),
+        Some(install_name.as_str()),
+        "{id}"
+    );
+    let h = harness("rpath");
+    let linked = otool("-L", &h.bin);
+    assert!(
+        linked
+            .lines()
+            .any(|l| l.trim().starts_with(&format!("{install_name} ("))),
+        "{linked}"
+    );
+}
+
 /// A NULL handle given to a function without a status ends the process (SIGABRT)
 #[test]
 fn c_harness_null_handle_aborts() {

@@ -9,7 +9,8 @@ license.workspace = true
 
 [lib]
 # cdylib: the dist tree's lib/libreims_vgpu.dylib (@rpath/libreims_vgpu.dylib), which the C
-# harness links; staticlib: lib/libreims_vgpu.a, which QEMU links; rlib so Rust tests link it.
+# harness links (built as @rpath/libreims_vgpu_c.dylib on macOS, build.rs); staticlib:
+# lib/libreims_vgpu.a, which QEMU links; rlib so Rust tests link it.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
