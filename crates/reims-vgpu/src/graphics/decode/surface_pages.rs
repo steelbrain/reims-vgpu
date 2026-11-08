@@ -131,6 +131,20 @@
 //! namings went from 223 ms to 58 ms, and the page's `requestAnimationFrame` callbacks over the 5 s
 //! of the scroll down from 80 to 199.
 //!
+//! A block that asks is answered `RGFX_STATUS_CACHE` with no view made where the platform has no
+//! room for its view's mappings ([`HostVm::view_room`]) once the cached views no block holds went
+//! where they cover it ([`PagesRefusal::NoRoom`]): past that room a view is mapped another way,
+//! and on a device that imports a view's pages only mapped from their files (Intel's ANV), every
+//! buffer over such a view is copied rather than imported, which costs each command buffer a
+//! compare of its bytes. **Measured** 2026-11-08 on homelab-ms01-1 (Iris Xe, ANV), an 8 GiB
+//! x86-64 macOS 26.7.2 guest at 3648 x 2038 with Safari playing two 4K HEVC clips at once, then
+//! three: every view's pages were imported, so the views held all they mapped, about 66,000
+//! mappings by the desktop and 273,000 to 282,000 with the clips, at the host's
+//! `vm.max_map_count` of 1,048,576, and the clips presented 52 to 56 frames a second. With the
+//! library's limit set to a stock host's 65,530 (a diagnostic build), the views stayed within the
+//! 40,954 short of the headroom, 116 buffers of 1.7 GiB were copied, and the clips presented 29
+//! to 31 frames a second two at once, and 7 to 30 three at once.
+//!
 //! [`GpuDevice::surface_pages_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_in_place
 //! [`GpuDevice::surface_pages_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_never_in_place
 //!
@@ -364,6 +378,13 @@ pub(crate) enum PagesRefusal {
     NotMapped,
     /// The platform made no buffer over the view.
     NoBuffer,
+    /// Not a refusal: the block asked whether it needs a device cache, and the platform has no
+    /// room for its view's mappings ([`HostVm::view_room`]), the cached views no block holds let
+    /// go of first where they cover it, so it takes a device cache instead (the module doc,
+    /// "Device caches where the pages cannot serve").
+    ///
+    /// [`HostVm::view_room`]: reims_vgpu_vulkan::core::platform::os::vm::HostVm::view_room
+    NoRoom,
 }
 
 /// What the views did, for the log ([`SurfaceViews::counts`]).
@@ -394,6 +415,9 @@ pub(crate) struct ViewCounts {
     pub(crate) asked_pending: u64,
     /// Such blocks answered `RGFX_STATUS_CACHE`.
     pub(crate) asked_cache: u64,
+    /// Of `asked_cache`, those answered so with no view made, the platform having no room for
+    /// its mappings ([`PagesRefusal::NoRoom`]).
+    pub(crate) asked_room: u64,
 }
 
 /// How a block that asked whether it needs a device cache was answered, for the counts
@@ -406,6 +430,9 @@ pub(crate) enum Asked {
     Pending,
     /// A device cache.
     Cache,
+    /// A device cache, with no view made, the platform having no room for its mappings
+    /// ([`PagesRefusal::NoRoom`]).
+    Room,
 }
 
 /// The planes of the surface `layout` gives ([`RgfxSurfacePagesLayout`]), where it has 1 to
@@ -670,10 +697,12 @@ impl<P: Platform> SurfaceViews<P> {
     /// by one `SURFACE_PAGES` of a block at a time (the surface [`Worker`]), and at a release,
     /// which names another block, and a reset, which waits for it. Two blocks' at once change
     /// only their own entries, and two views made at once over the same runs are both cached.
-    /// What leaves the views goes once the lock is let go, on this thread. `None` where the
-    /// device was reset since `settle` began it.
+    /// What leaves the views goes once the lock is let go, on this thread. A block that `ask`s
+    /// whether it needs a device cache, whose view the platform has no room for, gets none
+    /// ([`PagesRefusal::NoRoom`]). `None` where the device was reset since `settle` began it.
     ///
     /// [`Worker`]: super::worker::Worker
+    #[allow(clippy::too_many_arguments)] // the block, its runs, and how its message asks
     pub(crate) fn surface_pages(
         views: &Mutex<SurfaceViews<P>>,
         platform: &P,
@@ -682,6 +711,7 @@ impl<P: Platform> SurfaceViews<P> {
         runs: &[RgfxPageRun],
         settle: &Settle,
         by_runs: bool,
+        ask: bool,
     ) -> RaiseResult<Option<Result<(), PagesRefusal>>> {
         let (old, found) = {
             let mut v = views.lock();
@@ -710,6 +740,9 @@ impl<P: Platform> SurfaceViews<P> {
                 key,
             } => {
                 Self::make_room_for(views, platform, key.len());
+                if ask && !Self::room_for(platform, key.len()) {
+                    return Ok(Some(Err(PagesRefusal::NoRoom)));
+                }
                 match make_view(
                     platform, device, pages, runs, &memory, lease, teardown, &key,
                 )? {
@@ -1047,6 +1080,13 @@ impl<P: Platform> SurfaceViews<P> {
         }
     }
 
+    /// Whether `platform` has room for the mappings of a view of `runs` runs, a mapping a run and
+    /// one at each end, as [`Self::make_room_for`] weighs them; always where it counts none.
+    fn room_for(platform: &P, runs: usize) -> bool {
+        let needed = runs.to_u64().saturating_add(2);
+        platform.vm().view_room().is_none_or(|room| room >= needed)
+    }
+
     /// Views no block holds, out of the cache, until the mappings each holds (`held`) add up to
     /// `short`: first those whose mapping nothing but the view holds, which goes at once, then
     /// those a host's video device holds too ([`SurfaceView::memory`]), which goes once the device
@@ -1101,6 +1141,10 @@ impl<P: Platform> SurfaceViews<P> {
             Asked::InPlace => self.counts.asked_in_place += 1,
             Asked::Pending => self.counts.asked_pending += 1,
             Asked::Cache => self.counts.asked_cache += 1,
+            Asked::Room => {
+                self.counts.asked_cache += 1;
+                self.counts.asked_room += 1;
+            }
         }
     }
 
@@ -2052,6 +2096,57 @@ pub(super) mod tests {
         let views = r.dec.views_of_surfaces();
         assert_eq!(views.counts().idle_returned, 1);
         assert_eq!(views.len(), (2, 4));
+    }
+
+    /// A block asking whether it needs a device cache whose view the platform has no room for,
+    /// with no unheld cached view to let go of, is answered `RGFX_STATUS_CACHE` with no view
+    /// mapped and the device not asked, counted apart, and its cached `SURFACE_PAGES` then gets
+    /// a device cache; with room, a block asking takes the device's answer as before
+    #[test]
+    fn a_block_asking_with_no_room_for_its_view_is_answered_a_cache() {
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.set_unified_memory(true);
+        let world = Arc::clone(r.p.world());
+        let layout = one_plane(page, page - 16, 2);
+        let runs: [&[(u64, u64)]; 2] = [&[(1, 1), (3, 1)], &[(5, 1), (7, 1)]];
+
+        // Room for the four mappings a view of two runs adds: in place.
+        r.p.fake_vm().set_view_room(Some(4));
+        assert_eq!(
+            r.pages_asking(BLOCK, runs[0], 2 * page, Some(layout)),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.views_of_surfaces().view(BLOCK).is_some());
+        assert_eq!(world.surface_pages_asked().len(), 1);
+
+        // Room for three, and the one view its block holds: a cache, nothing mapped or asked.
+        r.p.fake_vm().set_view_room(Some(3));
+        let second = BLOCK + 0x8000;
+        let made = r.dec.views_of_surfaces().counts().made;
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.pages_asking(second, runs[1], 2 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        let sels = r.p.call_log().sels_since(mark);
+        assert!(
+            !sels.contains(&"mach_vm_allocate"),
+            "no view mapped: {sels:?}"
+        );
+        assert!(r.dec.views_of_surfaces().view(second).is_none());
+        assert!(r.dec.views_of_surfaces().view(BLOCK).is_some());
+        assert_eq!(r.dec.views_of_surfaces().counts().made, made);
+        assert_eq!(world.surface_pages_asked().len(), 1, "the device not asked");
+        let c = r.dec.views_of_surfaces().counts();
+        assert_eq!((c.asked_in_place, c.asked_cache, c.asked_room), (1, 1, 1));
+
+        // Its cached SURFACE_PAGES gets a device cache.
+        assert_eq!(
+            r.pages_cached(second, runs[1], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.caches().has(second));
     }
 
     /// Where the platform has too little room for a new view's mappings, cached views no block

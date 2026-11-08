@@ -1193,9 +1193,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                  from it unheld for their mappings; {} pages blocks' views made; {} named by \
                  their runs; refused: {} for bad runs, {} not mapped; asked whether they need a \
                  device cache: {} in place, {} in place while the device's verdict was pending, \
-                 {} answered a cache",
+                 {} answered a cache, {} of them for want of room for their views",
                 c.made, c.reused, c.idle_returned, c.private, c.by_runs, c.bad_runs, c.not_mapped,
-                c.asked_in_place, c.asked_pending, c.asked_cache
+                c.asked_in_place, c.asked_pending, c.asked_cache, c.asked_room
             );
             if d.made != 0 {
                 log::info!(
@@ -1351,6 +1351,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 runs,
                 settle,
                 by_runs,
+                planes.is_some(),
             )
         };
         let status = match made {
@@ -1358,6 +1359,23 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(Some(Ok(()))) if private => {
                 self.uncache_surface(device, pages.block_offset);
                 RGFX_STATUS_OK
+            }
+            Ok(Some(Err(surface_pages::PagesRefusal::NoRoom))) => {
+                let mut v = views.lock();
+                v.asked(surface_pages::Asked::Room);
+                // The cache the block's cached `SURFACE_PAGES` makes copies out the texels alone.
+                if let Some(planes) = planes {
+                    v.laid_out(pages.block_offset, planes);
+                }
+                drop(v);
+                log::debug!(
+                    target: "reims_vgpu::graphics::surface_pages",
+                    "the IOSurface block at {:#x} needs a device cache: no room for its view's \
+                     {} runs",
+                    pages.block_offset,
+                    runs.len()
+                );
+                RGFX_STATUS_CACHE
             }
             Ok(Some(Ok(()))) => match planes {
                 Some(planes) if !self.asks_cache(device, pages.block_offset, &planes) => {
@@ -1470,6 +1488,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             runs,
             settle,
             self.copies_by_runs(device),
+            false,
         );
         // Runs that are not whole guest pages summing to the surface, or with no guest RAM to map,
         // are refused; pages the host made no view of, or no buffer over, are copied instead.

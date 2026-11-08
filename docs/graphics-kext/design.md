@@ -569,7 +569,13 @@ Stages:
       place. Where they do not, it answers `RGFX_STATUS_CACHE`, its view of
       the pages left in its cache of views, and the kext makes the surface's
       device cache and posts the block again cached, which takes that view
-      and the host's cache, kept from then on as above. Such a cache's copies
+      and the host's cache, kept from then on as above. It answers
+      `RGFX_STATUS_CACHE` too, with no view made, where the platform has no
+      room for the view's kernel mappings (`HostVm::view_room`; on Linux the
+      views' budget short of its headroom, which Intel's ANV, importing a
+      view's pages only mapped from their files, reaches at a stock
+      `vm.max_map_count`): past that room the view's buffers would be copied
+      rather than imported. Such a cache's copies
       into the pages copy the surface's texels alone, each plane's rows from
       the layout the ask gave, so the bytes between rows stay as the guest's
       CPU wrote them, whatever a render over the cache leaves in its own
