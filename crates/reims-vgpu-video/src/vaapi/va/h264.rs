@@ -179,7 +179,9 @@ fn profile_candidates(sps: &Sps) -> &'static [Profile] {
             Profile::H264_MAIN,
             Profile::H264_HIGH,
         ],
-        77 => &[Profile::H264_MAIN, Profile::H264_HIGH],
+        // Extended's pictures that reach a driver are Main's: its own tools
+        // are refused at their slices (h264::check_supported).
+        77 | 88 => &[Profile::H264_MAIN, Profile::H264_HIGH],
         _ => &[Profile::H264_HIGH],
     }
 }

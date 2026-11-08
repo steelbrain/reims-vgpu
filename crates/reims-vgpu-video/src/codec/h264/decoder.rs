@@ -129,10 +129,11 @@ pub trait Accelerator {
 
 /// An H.264 decoder over an [`Accelerator`], one access unit per sample.
 ///
-/// Progressive Baseline (without FMO, ASO or redundant pictures), Main and
-/// High at 8 bits and 4:2:0 are decoded. An SPS that allows fields is
-/// refused with [`Error::Interlaced`]; other chroma formats and bit
-/// depths, data partitioning and SP/SI slices with [`Error::Unsupported`].
+/// Progressive Baseline (without FMO, ASO or redundant pictures), Main,
+/// Extended (without its data partitioning and SP and SI slices) and High
+/// at 8 bits and 4:2:0 are decoded. An SPS that allows fields is refused
+/// with [`Error::Interlaced`]; other chroma formats and bit depths, data
+/// partitioning and SP/SI slices with [`Error::Unsupported`].
 ///
 /// Errors follow Apple's AVC decoder: after a sample that does not decode,
 /// each picture is refused with [`Error::Unrecovered`] until an I picture
@@ -733,7 +734,15 @@ fn same_but_vui(a: &Sps, b: &Sps) -> bool {
 
 /// Whether [`Decoder`] takes `sps`'s stream: progressive
 /// (`frame_mbs_only_flag` 1, else [`Error::Interlaced`]), 4:2:0 at 8 bits,
-/// without lossless macroblocks or the Extended profile.
+/// without lossless macroblocks.
+///
+/// The Extended profile is taken: its pictures are Main's where their
+/// slices use none of its own tools, as Apple's AVC decoder on an x86-64
+/// Mac decodes them in hardware (measured on an AMD Radeon Pro 5300M's
+/// AppleGVA flow and an Intel UHD 630's, macOS 26.7.1, 2026-11-08: JM 19's
+/// Extended stream of B slices decoded as JM's reconstruction). Its own
+/// tools, data partitioning and SP and SI slices, are refused at the slices
+/// that use them.
 pub fn check_supported(sps: &Sps) -> Result<(), Error> {
     if !sps.frame_mbs_only_flag {
         return Err(Error::Interlaced);
@@ -746,9 +755,6 @@ pub fn check_supported(sps: &Sps) -> Result<(), Error> {
     }
     if sps.qpprime_y_zero_transform_bypass_flag {
         return Err(Error::Unsupported("lossless macroblocks"));
-    }
-    if sps.profile_idc == 88 {
-        return Err(Error::Unsupported("the Extended profile"));
     }
     Ok(())
 }

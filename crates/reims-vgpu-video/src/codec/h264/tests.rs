@@ -1056,6 +1056,28 @@ fn an_sps_that_allows_fields_is_refused_before_any_slice_reaches_the_accelerator
 }
 
 #[test]
+fn an_extended_stream_decodes_and_its_data_partitions_are_refused() {
+    // Apple's AVC decoder on an x86-64 Mac decodes the Extended profile's
+    // pictures in hardware; data partitioning is not decoded there.
+    let spec = SpsSpec {
+        profile_idc: 88,
+        ..SpsSpec::default()
+    };
+    let parsed = sps::Sps::parse(&sps(&spec)).map(|s| check_supported(&s));
+    assert_eq!(parsed, Ok(Ok(())));
+    let units = [sps(&spec), pps(false), slice(&idr(), &spec)];
+    assert_eq!(refused(&units), (None, 1));
+    // Partition A of a slice (nal_unit_type 2), its header as a slice's.
+    let mut partition = slice(&idr(), &spec);
+    partition[0] = 0x62;
+    let units = [sps(&spec), pps(false), partition];
+    assert_eq!(
+        refused(&units),
+        (Some(Error::Unsupported("data partitioning")), 0)
+    );
+}
+
+#[test]
 fn an_interlaced_sps_in_band_is_refused_until_a_progressive_idr_picture() -> Result<(), Error> {
     let progressive = SpsSpec::default();
     let interlaced = SpsSpec {

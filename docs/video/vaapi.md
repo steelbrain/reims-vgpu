@@ -747,9 +747,12 @@ Before anything reaches the GPU:
   whether its pictures are fields, MBAFF frames or frames alone, x264's
   `--fake-interlaced` streams among them;
 - with `Error::Bitstream(h264::Error::Unsupported(..))`, chroma other than
-  4:2:0, bit depths other than 8, lossless macroblocks, and the Extended
-  profile;
+  4:2:0, bit depths other than 8, and lossless macroblocks;
 - the same, for FMO, data partitioning, and SP and SI slices.
+
+The Extended profile's pictures that use none of its own tools decode as
+Main's (VA's Main profile, else High), as Apple's AVC decoder on an x86-64
+Mac decodes them in hardware (`h264::check_supported`).
 
 Redundant pictures are dropped.
 
