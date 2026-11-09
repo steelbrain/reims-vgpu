@@ -43,16 +43,19 @@
 //!
 //! A view of many runs is resolved in one pass of the backing table and recorded over its fresh
 //! reservation with no run to cut (`files::view_pieces`, `files::record_pieces`), so the kernel's
-//! maps are most of what it costs. **Measured** 2026-11-08 on homelab-um870-1 (Ryzen 7 8745H,
-//! Linux 7.3.1, release build): a view of 7,261 one-page runs of a registered memfd, three in
-//! four the page below the one before (an IOSurface's, as an x86-64 macOS guest hands its pages
-//! out), took 1.86 µs a run beside 66,000 one-page views, and 2.06 µs beside 200,000, against
-//! 2.06 and 2.29 µs with each run resolved and recorded on its own. A C loop of the same maps
-//! took 2.0 to 2.2 µs a run on homelab-um790-xtx-1 (Ryzen 7 7840HS, Linux 7.3.1) beside 66,000
-//! one-page mappings of the file, each `MAP_FIXED` cutting the reservation it lands in
-//! (`vms_gather_munmap_vmas` and `__split_vma` in its profile); `MAP_FIXED_NOREPLACE` into a hole
-//! took 1.6 to 1.7 µs, but a hole is no reservation: another thread's `mmap` may land in it while
-//! the runs go in.
+//! maps are most of what it costs. **Measured** 2026-11-08 on homelab-um870-1 (Ryzen 7 8745H, Linux
+//! 7.3.1, release build): a view of 7,261 one-page runs of a registered memfd, three in four the
+//! page below the one before (an IOSurface's, as an x86-64 macOS guest hands its pages out), took
+//! 1.86 µs a run beside 66,000 one-page views, and 2.06 µs beside 200,000, against 2.06 and 2.29 µs
+//! with each run resolved and recorded on its own. On homelab-ms01-1 (Core i9-13900H, Linux 7.3.1),
+//! beside 66,000, it took 1.21 µs a run on a performance core and 2.11 µs on an efficiency core,
+//! against 1.50 and 2.58 µs a run at a time: that processor gives the kernel no capacity to place a
+//! thread by (`hints`), so a view is mapped on either. A C loop of the same maps took 2.0 to 2.2 µs
+//! a run on homelab-um790-xtx-1 (Ryzen 7 7840HS, Linux 7.3.1) beside 66,000 one-page mappings of
+//! the file, and 1.09 to 1.26 µs on homelab-ms01-1, each `MAP_FIXED` cutting the reservation it
+//! lands in (`vms_gather_munmap_vmas` and `__split_vma` in its profile); `MAP_FIXED_NOREPLACE` into
+//! a hole took 1.6 to 1.7 µs and 0.90 to 1.01 µs, but a hole is no reservation: another thread's
+//! `mmap` may land in it while the runs go in.
 //!
 //! **Views through dma-bufs.** An x86-64 macOS guest hands out its pages in 4 KiB pieces, each
 //! 16 KiB clump of them backwards (its free queue refills each CPU's list last in, first out), and
