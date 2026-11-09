@@ -5,9 +5,16 @@
     stage-config.py --identifiers
 
 OUT is written afresh: CONFIG, the config.plist that names the module, with a Kernel > Add entry
-for each kext as OUT/config.plist; MODULE as OUT/Drivers/ReimsGraphics.elf; and each kext as
-OUT/Kexts/<its name>.kext. The entries list the kexts in KEXTS' order, Graft before the two kexts
-that run on it.
+for each kext and the display's node (Graphics > DisplayNode) as OUT/config.plist; MODULE as
+OUT/Drivers/ReimsGraphics.elf; and each kext as OUT/Kexts/<its name>.kext. The entries list the
+kexts in KEXTS' order, Graft before the two kexts that run on it.
+
+Graphics > DisplayNode has Ambrosia add /arm-io/<DISPLAY_NODE> to the device tree, a display-subsystem
+node, where the module drives a display: IOMobileFramebuffer.framework counts such nodes once in a
+process, WindowServer before the kexts load, and waits for as many framebuffer services as it
+counted. The node is given only with the kexts, which publish display 0's service and use the node
+as it stands; a bundle of the module alone gives none, so no process waits for a service that never
+comes.
 
 Each kext must be a bundle whose Contents/Info.plist names the identifier KEXTS gives its role,
 and whose executable has an arm64e slice, the architecture of an arm64 guest's kernel. Every kext
@@ -28,6 +35,10 @@ KEXTS = [
     ("REIMS_GRAPHICS", "ReimsGraphics.kext", "com.steelbrain.ReimsGraphics"),
     ("RGFXGATE", "RgfxGate.kext", "com.steelbrain.RgfxGate"),
 ]
+
+# The name of display 0's node under /arm-io, the one ReimsGraphics looks for
+# (ReimsGraphicsMobile.cpp, attachMobileNode).
+DISPLAY_NODE = "reims-display0"
 
 CPU_TYPE_X86_64 = 0x01000007
 CPU_TYPE_ARM64 = 0x0100000C
@@ -116,6 +127,7 @@ def main(argv):
     with open(config, "rb") as f:
         plist = plistlib.load(f)
     plist.setdefault("Kernel", {})["Add"] = [{"BundlePath": f"Kexts/{name}"} for _, name, _ in KEXTS]
+    plist.setdefault("Graphics", {})["DisplayNode"] = DISPLAY_NODE
     if os.path.isdir(out):
         shutil.rmtree(out)
     os.makedirs(os.path.join(out, "Drivers"))

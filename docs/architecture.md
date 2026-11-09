@@ -735,7 +735,8 @@ config.plist             the bundle's configuration: the module, and the vtables
                          hands over, for Graft to sign the arm64e display's vtable with
                          (Kernel > ExportVtableDiscriminators)
 tools/stage-config.py    our configuration: config.plist with a Kernel > Add entry for Graft and each
-                         of our two kexts, after checking each is an arm64e kext with its identifier
+                         of our two kexts, after checking each is an arm64e kext with its identifier,
+                         and display 0's node in the device tree (Graphics > DisplayNode)
 check-boot.sh            boots an arm64 guest with a bundle and checks the boot (docs/qemu.md,
                          "arm64 guests: the boot check of our configuration")
 ```
@@ -750,6 +751,18 @@ takes the preferred mode of the first connected display, or 1920 × 1080, with r
 returns. It turns on neither bus mastering nor MSI-X, and leaves the scanout set, for the kernel.
 It returns 1 where bus 0 has no device, and 2, saying why in Ambrosia's log, where the device can't
 be driven; Ambrosia then boots with no console but the UART.
+
+**The display's node.** IOMobileFramebuffer.framework finds an arm64 guest's displays by counting
+the children of `IODeviceTree:/arm-io` whose `device_type` is `display-subsystem`, once in a process,
+and waits up to 30 seconds for as many IOMobileFramebuffer services as it counted; a count of 0
+leaves the process with no display. Our kexts load from the auxiliary kernel collection, after
+WindowServer has counted, so the node must be in the device tree before the kernel starts. Our
+configuration's `Graphics` > `DisplayNode`, `reims-display0`, has Ambrosia add
+`/arm-io/reims-display0` with only a `name` and that `device_type` where the module drives a
+display, and ReimsGraphics uses that node as display 0's, attaching one of its own only where
+none was placed. No personality matches the node: ReimsGraphics matches the PCI device, as
+Graft's activation gate requires. The module's bundle alone (`make bundle`) gives no node, since
+nothing would publish the service a process waits for.
 
 **The build.** The module is an ELF64 aarch64 static PIE, the format Ambrosia loads: clang compiles
 the C freestanding for `aarch64-unknown-none-elf`, position-independent and with strict alignment,
