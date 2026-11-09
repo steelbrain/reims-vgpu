@@ -6,9 +6,10 @@
  * Each override logs its calls (the first ones and then one in kLogEvery). The class queues the
  * swaps a process submits, and swap_begin_gated takes them off its queue as Apple's paravirtual
  * display does: the device presents a swap's layer-0 surface, and the swap completes once the host
- * answers the present. The device's refreshes reach the class as its vblank note. The class's own
- * pure methods answer what a display with no frame info, no factory configuration and no CRC
- * answers.
+ * answers the present. The device's refreshes reach the class as its vblank note. Each completed
+ * swap's times reach WindowServer as the paravirtual display sends them: a swap-info record to each
+ * notify request (RgfxLegacySwapInfo.hpp). The class's other pure methods answer what a display
+ * with no frame info, no factory configuration and no CRC answers.
  *
  * None of the class's methods a subclass overrides is forwarded to the class: what the class
  * implements there is for no display at all, on every arm64 release from 13 to 27.0.1 (read from
@@ -41,6 +42,7 @@
 
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOUserClient.h>
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 
@@ -82,6 +84,13 @@ extern "C" void rgfxLegacyDropAbortedSwaps(IOMobileFramebufferLegacy *self, bool
     __asm__("__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEb");
 extern "C" void rgfxLegacyDropDummySwaps(IOMobileFramebufferLegacy *self)
     __asm__("__ZN25IOMobileFramebufferLegacy20dropDummySwaps_gatedEv");
+// The class's own dispatch of a swap-info record to each notify request it holds, through the
+// display's do_swap_info_notify_gated (RgfxLegacySwapInfo.hpp), which the paravirtual display's
+// notify_swap_done_gated calls: called directly, under the name every release from 14 to 27.0.1
+// exports, in the class's gate.
+extern "C" void rgfxLegacySwapInfoNotifyDispatch(IOMobileFramebufferLegacy *self,
+                                                 RgfxSwapInfoRecord *record)
+    __asm__("__ZN25IOMobileFramebufferLegacy31swap_info_notify_dispatch_gatedEPNS_12SwapInfoBlobE");
 
 // IOAVFamily's constructors of a timing element and of a colour element, and a timing's colour
 // elements, which the paravirtual display calls to make the elements it publishes
@@ -154,6 +163,8 @@ bool ReimsGraphics::startMobile()
 	mobileSwapShowing = nullptr;
 	mobileSwapRate.clear();
 	mobileSecond = 0;
+	mobileSwapInfoKept.head = 0;
+	mobileSwapInfoKept.tail = 0;
 	// The release, by the size of the class this one derives from as the kernel has it.
 	const uint32_t legacySize = IOMobileFramebufferLegacy::gMetaClass.getClassSize();
 	mobileSwapLayout = rgfxLegacySwapLayoutOf(legacySize);
@@ -617,13 +628,22 @@ void ReimsGraphics::mobileSwapAnswered(OSObject *owner, IOInterruptEventSource *
 
 // MARK: - The class's own pure methods
 
+// A notify request's tag mask, for the swap-info notification alone, as the paravirtual display
+// sets it; any other type is answered kIOReturnBadArgument, as the paravirtual display answers it
+// (RgfxLegacySwapInfo.hpp).
 RgfxIOMFBWord ReimsGraphics::set_notify_tag_mask_gated(IOMFB_NotificationType type,
                                                        IOMFBNotifyRequest *request, uint32_t mask)
 {
+	IOReturn r = kIOReturnBadArgument;
+	if (static_cast<uint32_t>(type) == kRgfxSwapInfoNotification && request) {
+		*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(request) +
+		                              kRgfxNotifyRequestMask) = mask;
+		r = kIOReturnSuccess;
+	}
 	if (logged(kSetNotifyTagMask))
-		IOLog("ReimsGraphics: set_notify_tag_mask_gated(%u, %p, 0x%x)\n",
-		      static_cast<uint32_t>(type), request, mask);
-	return word(kIOReturnSuccess);
+		IOLog("ReimsGraphics: set_notify_tag_mask_gated(%u, %p, 0x%x) = 0x%x\n",
+		      static_cast<uint32_t>(type), request, mask, r);
+	return word(r);
 }
 
 RgfxIOMFBWord ReimsGraphics::supported_frame_info(uint32_t index, uint32_t *count, char (*names)[64],
@@ -657,21 +677,61 @@ RgfxIOMFBWord ReimsGraphics::set_frame_info_notification_state_gated(IOMFBNotify
 	return word(kIOReturnSuccess);
 }
 
+// A swap-info record sent to one notify request's client, as the paravirtual display sends it: an
+// async result of the values the request's tag mask asks for (rgfxSwapInfoArgs), which the
+// client may drop, answering the send's result. WindowServer learns its swaps' times from them.
 RgfxIOMFBWord ReimsGraphics::do_swap_info_notify_gated(IOMFBNotifyRequest *request,
                                                        const IOMobileFramebufferLegacy::SwapInfoBlob *blob)
 {
+	IOReturn r = kIOReturnBadArgument;
+	if (request && blob) {
+		uint8_t *bytes = reinterpret_cast<uint8_t *>(request);
+		const uint32_t mask = *reinterpret_cast<const uint32_t *>(bytes + kRgfxNotifyRequestMask);
+		uint64_t *last = reinterpret_cast<uint64_t *>(bytes + kRgfxNotifyRequestLast);
+		uint64_t args[kRgfxSwapInfoMaxArgs + 1];
+		const uint32_t n =
+		    rgfxSwapInfoArgs(mask, last, *reinterpret_cast<const RgfxSwapInfoRecord *>(blob), args);
+		r = IOUserClient::sendAsyncResult64WithOptions(
+		    reinterpret_cast<io_user_reference_t *>(bytes + kRgfxNotifyRequestReference),
+		    kIOReturnSuccess, args, n, kIOUserNotifyOptionCanDrop);
+	}
 	if (logged(kDoSwapInfoNotify))
-		IOLog("ReimsGraphics: do_swap_info_notify_gated(%p, %p)\n", request, blob);
-	return word(kIOReturnSuccess);
+		IOLog("ReimsGraphics: do_swap_info_notify_gated(%p, %p) = 0x%x\n", request, blob, r);
+	return word(r);
 }
 
+// The class's swap_complete_gated calls this with the completed swap's ID. As the paravirtual
+// display does, the swap's record (rgfxSwapInfoRecord) is made from the class's last vblank time and
+// the swap's own fields, at the release's offsets (RgfxLegacySwapLayout.hpp), and dispatched to each
+// notify request (swap_info_notify_dispatch_gated), after the records kept while the class held
+// them. A swap whose state word is not 0 gets none, answered kIOReturnUnsupported.
 RgfxIOMFBWord ReimsGraphics::notify_swap_done_gated(uint32_t field_0, ::SwapInfoBlob *blob,
                                                     uint32_t *field_2, uint32_t field_3)
 {
+	IOReturn r = kIOReturnUnsupported;
+	const RgfxLegacySwapLayout *l = mobileSwapLayout;
+	const uint8_t *swap =
+	    l ? static_cast<const uint8_t *>(RgfxLegacySwapQueue(this, *l).current()) : nullptr;
+	if (swap && *reinterpret_cast<const uint32_t *>(swap + l->state) == 0) {
+		const uint8_t *self = reinterpret_cast<const uint8_t *>(this);
+		RgfxSwapInfoRecord record = rgfxSwapInfoRecord(
+		    field_0, *reinterpret_cast<const uint64_t *>(self + l->vblankTime),
+		    *reinterpret_cast<const uint64_t *>(swap + l->swapRecordField00),
+		    *reinterpret_cast<const uint32_t *>(swap + l->swapFlags));
+		if (*reinterpret_cast<const uint16_t *>(self + l->notifyHeld) != 0) {
+			mobileSwapInfoKept.keep(record);
+		} else {
+			mobileSwapInfoKept.flush([this](RgfxSwapInfoRecord &kept) {
+				rgfxLegacySwapInfoNotifyDispatch(this, &kept);
+			});
+			rgfxLegacySwapInfoNotifyDispatch(this, &record);
+		}
+		r = kIOReturnSuccess;
+	}
 	if (logged(kNotifySwapDone))
-		IOLog("ReimsGraphics: notify_swap_done_gated(%u, %p, %p, %u)\n", field_0, blob, field_2,
-		      field_3);
-	return word(kIOReturnSuccess);
+		IOLog("ReimsGraphics: notify_swap_done_gated(%u, %p, %p, %u) = 0x%x\n", field_0, blob,
+		      field_2, field_3, r);
+	return word(r);
 }
 
 RgfxIOMFBWord ReimsGraphics::notify_crc_ready_gated(uint32_t field_0)

@@ -36,6 +36,7 @@
 // The Graft SDK stand-in's methods answer graft_iomfb_word, a uint64_t; the arm64e front end
 // (ReimsGraphicsMobile.cpp) names it RgfxIOMFBWord.
 typedef graft_iomfb_word RgfxIOMFBWord;
+#include "RgfxLegacySwapInfo.hpp"
 #include "RgfxLegacySwapLayout.hpp"
 #include "RgfxSwapRate.hpp"
 #endif
@@ -583,6 +584,9 @@ private:
 	RgfxSwapRate mobileSwapRate;
 	UInt64 mobileSecond;
 	void noteMobileSwapRate(UInt64 now);
+	// The swap-info records notify_swap_done_gated keeps while the class holds them
+	// (RgfxLegacySwapInfo.hpp), in the class's gate.
+	RgfxSwapInfoKept mobileSwapInfoKept;
 #endif
 
 	bool ready;

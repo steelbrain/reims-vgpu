@@ -1,5 +1,6 @@
 // RgfxLegacySwapLayout: where IOMobileGraphicsFamily's IOMobileFramebufferLegacy keeps its swap
-// queue and its display's size on each arm64 release the arm64e kext runs on, the queue as a
+// queue, its display's size and what a swap's swap-info record is made of (RgfxLegacySwapInfo.hpp)
+// on each arm64 release the arm64e kext runs on, the queue as a
 // display subclass's swap_begin_gated takes its swaps from it, and the size as its
 // set_digital_out_mode sets it (ReimsGraphicsMobile.cpp). The class declares no accessor for them.
 // Apple's paravirtual display, the class's subclass in a VM (AppleParavirtDisplay), reads and
@@ -41,15 +42,28 @@ struct RgfxLegacySwapLayout {
 	// default framebuffer surface read them; the class never writes them, and the paravirtual
 	// display's set_digital_out_mode writes both, in its gate.
 	uint32_t displaySize;
+	// What the paravirtual display's notify_swap_done_gated reads to make a swap's swap-info
+	// record (RgfxLegacySwapInfo.hpp), with the class's own uses of each:
+	// - in the class, the time of the last vblank, a doubleword the class's note_vbl_ISR writes;
+	// - in a swap, the doubleword the class's swap_submit copies from offset 0 of the swap's
+	//   IOMFBSwapRec, whose meaning nothing states (field_00), adding the time where the record
+	//   asks;
+	// - in a swap, a word whose bit 0 the class's abort_swap_gated and dropSwap_gated set;
+	// - in the class, a halfword: where it is not 0, the paravirtual display keeps the record
+	//   instead of dispatching it.
+	uint32_t vblankTime;
+	uint32_t swapRecordField00;
+	uint32_t swapFlags;
+	uint32_t notifyHeld;
 };
 
 // macOS 14.6 (Darwin 23.6), 15.6 (24.6), 26.6 (25.6), and 27.0 and 27.0.1 (27.0): the arm64
 // releases Ambrosia boots from 14 on, where the arm64e kext loads (its MinKernel is 23).
 constexpr RgfxLegacySwapLayout kRgfxLegacySwapLayouts[] = {
-    {"14", 0x18a0, 0x1560, 0xb90, 0x32c, 0x318, 0xa40, 0x16b0},
-    {"15", 0x19c0, 0x1668, 0xc00, 0x32c, 0x318, 0xa48, 0x17c8},
-    {"26", 0x1af8, 0x1790, 0xc78, 0x34c, 0x338, 0xac0, 0x1900},
-    {"27", 0x1dd8, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80, 0x1bf0},
+    {"14", 0x18a0, 0x1560, 0xb90, 0x32c, 0x318, 0xa40, 0x16b0, 0x108, 0x2d0, 0x310, 0x189e},
+    {"15", 0x19c0, 0x1668, 0xc00, 0x32c, 0x318, 0xa48, 0x17c8, 0x108, 0x2d0, 0x310, 0x19be},
+    {"26", 0x1af8, 0x1790, 0xc78, 0x34c, 0x338, 0xac0, 0x1900, 0x108, 0x2f0, 0x330, 0x1af6},
+    {"27", 0x1dd8, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80, 0x1bf0, 0x108, 0x390, 0x3d0, 0x1dd2},
 };
 
 // The layout of the release whose IOMobileFramebufferLegacy is `classSize` bytes, or null for a
