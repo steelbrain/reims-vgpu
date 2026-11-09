@@ -186,6 +186,9 @@ public:
 	// And what the class reads of its provider as an AppleARMIODevice, which a PCI device is not
 	// (ReimsGraphicsMobile.cpp): the dot pitch.
 	RgfxIOMFBWord get_dot_pitch(uint32_t *pitch) override;
+	// And the mode WindowServer sets of those the display publishes, by its colour and timing IDs
+	// (ReimsGraphicsMobile.cpp), which the class answers kIOReturnUnsupported.
+	RgfxIOMFBWord set_digital_out_mode(uint32_t colorId, uint32_t timingId) override;
 #endif
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
@@ -545,6 +548,7 @@ private:
 	void attachMobileNode();
 	void detachMobileNode();
 	void publishMobileDisplay();
+	void publishMobileModes();
 	static void mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	static void mobilePresented(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
 	// The swaps (ReimsGraphicsMobile.cpp, swap_begin_gated): the next one begun, and the swap

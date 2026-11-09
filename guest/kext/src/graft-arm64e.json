@@ -5,6 +5,10 @@
     },
     {
       "id": "com.apple.iokit.IOMobileGraphicsFamily"
+    },
+    {
+      "id": "com.apple.iokit.IOAVFamily",
+      "anchor": "IOAVVideoTimingElement"
     }
   ],
   "classes": [
@@ -76,11 +80,21 @@
         "swap_layer_map": {},
         "surface_layer_map": {},
         "surface_layer_unmap": {},
-        "get_dot_pitch": { "required": true }
+        "get_dot_pitch": { "required": true },
+        "set_digital_out_mode": { "required": true }
       }
     }
   ],
   "imports": {
+    "__ZN22IOAVVideoTimingElement8withDataEPK19IOAVVideoTimingData16IOAVStandardType23IOAVVideoTimingStandard": {
+      "library": 2
+    },
+    "__ZN21IOAVVideoColorElement16withCapabilitiesE16IOAVStandardTypej22IOAVVideoPixelEncoding26IOAVVideoColorDynamicRange18IOAVVideoColorEOTF20IOAVVideoColorimetrybPK12OSDictionaryS7_S7_PK5OSSet": {
+      "library": 2
+    },
+    "__ZN22IOAVVideoTimingElement16setColorElementsEP7OSArray": {
+      "library": 2
+    },
     "__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEb": {
       "library": 1,
       "candidates": [

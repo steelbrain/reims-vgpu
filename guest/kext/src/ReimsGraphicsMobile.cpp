@@ -26,7 +26,9 @@
  * complete one.
  *
  * Of what the class implements for every subclass, ReimsGraphics overrides what reads the
- * class's provider as an AppleARMIODevice unchecked where a process reaches it: get_dot_pitch.
+ * class's provider as an AppleARMIODevice unchecked where a process reaches it: get_dot_pitch. And
+ * as the paravirtual display does, it overrides set_digital_out_mode, which the class answers
+ * kIOReturnUnsupported, to set the mode WindowServer picks of those it publishes.
  *
  * A process finds the display as IOMobileFramebuffer.framework counts displays: by a node of the
  * device tree (attachMobileNode), then the framebuffer's service and the properties it publishes
@@ -40,6 +42,7 @@
 #include <libkern/libkern.h>
 
 #include "RgfxDisplayIdentity.hpp"
+#include "RgfxMobileModes.hpp"
 
 #if defined(__arm64e__)
 
@@ -77,6 +80,24 @@ extern "C" void rgfxLegacyDropAbortedSwaps(IOMobileFramebufferLegacy *self, bool
 extern "C" void rgfxLegacyDropDummySwaps(IOMobileFramebufferLegacy *self)
     __asm__("__ZN25IOMobileFramebufferLegacy20dropDummySwaps_gatedEv");
 
+// IOAVFamily's constructors of a timing element and of a colour element, and a timing's colour
+// elements, which the paravirtual display calls to make the elements it publishes
+// (RgfxMobileModes.hpp): called directly, under the names every release from 14 to 27.0.1 exports.
+// IOAVFamily is a library of IOMobileGraphicsFamily's on each of them, so it is loaded before the
+// kext, and Graft binds each (graft-arm64e.json). Each constructor answers a retained element, or
+// null. setColorElements retains the array it is given.
+extern "C" OSObject *rgfxIOAVTimingWithData(const RgfxIOAVTimingData *data, uint32_t standardType,
+                                            uint32_t timingStandard)
+    __asm__("__ZN22IOAVVideoTimingElement8withDataEPK19IOAVVideoTimingData16IOAVStandardType23IOAVVideoTimingStandard");
+extern "C" OSObject *rgfxIOAVColorWithCapabilities(
+    uint32_t standardType, uint32_t depth, uint32_t pixelEncoding, uint32_t dynamicRange,
+    uint32_t eotf, uint32_t colorimetry, bool supportsDsc, const OSDictionary *chromaticity,
+    const OSDictionary *whitePoint, const OSDictionary *displayLuminance,
+    const OSSet *hdrStaticMetadataTypes)
+    __asm__("__ZN21IOAVVideoColorElement16withCapabilitiesE16IOAVStandardTypej22IOAVVideoPixelEncoding26IOAVVideoColorDynamicRange18IOAVVideoColorEOTF20IOAVVideoColorimetrybPK12OSDictionaryS7_S7_PK5OSSet");
+extern "C" void rgfxIOAVTimingSetColorElements(OSObject *timing, OSArray *colors)
+    __asm__("__ZN22IOAVVideoTimingElement16setColorElementsEP7OSArray");
+
 // The IOMFBSwapCompletionState the paravirtual display gives a swap as it begins it.
 constexpr uint32_t kSwapStateAtBegin = 2;
 
@@ -101,6 +122,7 @@ enum MobileCall : unsigned {
 	kSurfaceLayerMap,
 	kSurfaceLayerUnmap,
 	kGetDotPitch,
+	kSetDigitalOutMode,
 	kVblank,
 	kPresented,
 	kSwapShown,
@@ -298,9 +320,14 @@ void ReimsGraphics::detachMobileNode()
 // - Transport: "Other" upstream and downstream, as no link carries the pixels;
 // - IOMFBMaxSrcPixels: the largest source buffer and source rectangle a layer takes, the largest
 //   mode's size; and its MaxSrcRectTotal and IOMFBMaxCompressedSizeInBytes 0, as the paravirtual
-//   display gives them.
-// The paravirtual display's TimingElements and ColorElements, IOAVFamily's objects, are not
-// published.
+//   display gives them;
+// - IOMFBScalingLimits: no layer scaled, up (RGBLayer_MaxScale 1) or down
+//   (RGBLayer_MinScaleFraction 1), where the paravirtual display gives 4 each way: the device shows
+//   layer 0's whole surface, whatever rectangles the swap gives it;
+// - TimingElements and ColorElements: the device's modes (publishMobileModes).
+// Of the rest the paravirtual display publishes, CursorPlane is not, since no swap's cursor layer
+// is shown; nor are its own ParavirtDisplayPrefs and ParavirtBrightnessCaps, nor the
+// DisplayContainerID its host may give it.
 void ReimsGraphics::publishMobileDisplay()
 {
 	IOLockLock(stateLock);
@@ -367,8 +394,92 @@ void ReimsGraphics::publishMobileDisplay()
 		setProperty("IOMFBMaxSrcPixels", source);
 		source->release();
 	}
+
+	if (OSDictionary *scaling = OSDictionary::withCapacity(2)) {
+		putNumber(scaling, "RGBLayer_MinScaleFraction", 1);
+		putNumber(scaling, "RGBLayer_MaxScale", 1);
+		setProperty("IOMFBScalingLimits", scaling);
+		scaling->release();
+	}
+	publishMobileModes();
 	IOLog("ReimsGraphics: display %u is %s, %ux%u native, UUID %s\n", id,
 	      id != 0 ? "external" : "primary", native.width, native.height, uuid);
+}
+
+namespace {
+
+// Writes an IOAVFamily element's ID and Score (RgfxMobileModes.hpp).
+void setElementId(OSObject *element, uint32_t id, uint32_t score)
+{
+	uint8_t *bytes = reinterpret_cast<uint8_t *>(element);
+	*reinterpret_cast<uint64_t *>(bytes + kRgfxIOAVElementId) = id;
+	*reinterpret_cast<uint32_t *>(bytes + kRgfxIOAVElementScore) = score;
+}
+
+} // namespace
+
+// The display's modes as IOMobileFramebuffer.framework reads them, as the paravirtual display
+// publishes its own (RgfxMobileModes.hpp): ColorElements, the one colour mode, and TimingElements,
+// a timing for each mode the device lists, with the reduced blanking the x86-64 framebuffer's
+// detailed timing gives it (timingFor) at the device's rate, and the colour mode as its ColorModes.
+// WindowServer sets one of them with set_digital_out_mode.
+void ReimsGraphics::publishMobileModes()
+{
+	Mode modes[kMaxModes];
+	IOLockLock(stateLock);
+	const UInt32 n = modeSet.modeCount;
+	for (UInt32 i = 0; i < n; i++)
+		modes[i] = modeSet.modes[i];
+	const int32_t preferred = modeSet.preferredId;
+	const UInt32 id = displayId;
+	IOLockUnlock(stateLock);
+	RgfxMobileTiming timings[kMaxModes];
+	const uint32_t count = rgfxMobileTimings(modes, n, preferred, timings);
+
+	OSObject *color =
+	    rgfxIOAVColorWithCapabilities(kRgfxIOAVStandardType, kRgfxColorDepth, 0, 0, 0,
+	                                  kRgfxIOAVColorimetry, false, nullptr, nullptr, nullptr, nullptr);
+	OSArray *colors = color ? OSArray::withCapacity(1) : nullptr;
+	OSArray *timingElements = colors ? OSArray::withCapacity(count) : nullptr;
+	if (!timingElements) {
+		IOLog("ReimsGraphics: display %u: no colour element, so no mode is published\n", id);
+		OSSafeReleaseNULL(colors);
+		OSSafeReleaseNULL(color);
+		return;
+	}
+	setElementId(color, kRgfxColorElementId, kRgfxColorElementId);
+	colors->setObject(color);
+	uint32_t published = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const RgfxMobileTiming &t = timings[i];
+		Timing timing;
+		timingFor(t.mode, &timing);
+		const RgfxIOAVTimingData data = rgfxIOAVTimingData(timing, t.mode.refreshMhz);
+		OSObject *element = rgfxIOAVTimingWithData(&data, kRgfxIOAVStandardType,
+		                                           kRgfxIOAVTimingStandard);
+		// A timing's own array, as the paravirtual display gives each of its timings.
+		OSArray *modeColors = element ? OSArray::withCapacity(1) : nullptr;
+		if (!modeColors) {
+			IOLog("ReimsGraphics: display %u: mode %ux%u has no timing element\n", id, t.mode.width,
+			      t.mode.height);
+			OSSafeReleaseNULL(element);
+			continue;
+		}
+		setElementId(element, t.id, t.score);
+		modeColors->setObject(color);
+		rgfxIOAVTimingSetColorElements(element, modeColors);
+		timingElements->setObject(element);
+		published++;
+		modeColors->release();
+		element->release();
+	}
+	setProperty("ColorElements", colors);
+	setProperty("TimingElements", timingElements);
+	IOLog("ReimsGraphics: display %u publishes %u timings (preferred %u) and colour mode %u\n", id,
+	      published, count ? timings[0].id : 0, kRgfxColorElementId);
+	timingElements->release();
+	colors->release();
+	color->release();
 }
 
 void ReimsGraphics::mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next)
@@ -665,6 +776,37 @@ RgfxIOMFBWord ReimsGraphics::get_dot_pitch(uint32_t *pitch)
 	if (logged(kGetDotPitch))
 		IOLog("ReimsGraphics: get_dot_pitch() = %u\n", *pitch);
 	return word(kIOReturnSuccess);
+}
+
+// The mode WindowServer picks of the timings and colour modes the display publishes
+// (publishMobileModes), by their IDs: the colour mode's, then the timing's, as
+// IOMobileFramebufferUserClient passes them from IOMobileFramebufferSetDigitalOutMode (read from
+// macOS 14.6.1's QuartzCore and IOMobileFramebuffer.framework, and 27.0.1's AppleParavirtGPU, whose
+// set_digital_out_mode looks the second up among its timings and the first among that timing's
+// colour modes). The device shows the mode, as the x86-64 framebuffer's setDisplayMode has it
+// shown, and the framebuffer then publishes its size and timing ID as the paravirtual display does:
+// DisplayWidth, DisplayHeight and DPTimingModeId. A pair the display does not publish is answered
+// kIOReturnUnsupported, as the paravirtual display leaves it to the class, which answers that.
+RgfxIOMFBWord ReimsGraphics::set_digital_out_mode(uint32_t colorId, uint32_t timingId)
+{
+	IOLockLock(stateLock);
+	Mode mode{};
+	const bool published =
+	    rgfxMobileModeFor(colorId, timingId, modeSet.modes, modeSet.modeCount, &mode);
+	IOLockUnlock(stateLock);
+	IOReturn r = kIOReturnUnsupported;
+	if (published) {
+		r = setScanout(mode);
+		if (r == kIOReturnSuccess) {
+			setProperty("DisplayWidth", mode.width, 32);
+			setProperty("DisplayHeight", mode.height, 32);
+			setProperty("DPTimingModeId", timingId, 64);
+		}
+	}
+	if (logged(kSetDigitalOutMode))
+		IOLog("ReimsGraphics: set_digital_out_mode(%u, %u) = 0x%x: %ux%u at %u.%03u Hz\n", colorId,
+		      timingId, r, mode.width, mode.height, mode.refreshMhz / 1000, mode.refreshMhz % 1000);
+	return word(r);
 }
 
 #endif // __arm64e__

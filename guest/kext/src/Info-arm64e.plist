@@ -85,6 +85,8 @@
 	<string>13.0</string>
 	<key>OSBundleLibraries</key>
 	<dict>
+		<key>com.apple.iokit.IOAVFamily</key>
+		<string>1.0.0</string>
 		<key>com.apple.iokit.IOGraphicsFamily</key>
 		<string>1.0.0b1</string>
 		<key>com.apple.iokit.IOMobileGraphicsFamily</key>

@@ -1,7 +1,9 @@
 // The native test of what ReimsGraphics overrides of IOMobileFramebufferLegacy's own methods
-// because the class's start leaves their state unset for a PCI device (ReimsGraphicsMobile.cpp,
-// get_dot_pitch). start keeps its provider as an AppleARMIODevice in one field, NULL where the
-// provider is not one, and the class's get_dot_pitch calls through that field unchecked.
+// (ReimsGraphicsMobile.cpp): get_dot_pitch, because the class's start leaves its state unset for a
+// PCI device, and set_digital_out_mode, which the class answers kIOReturnUnsupported and the
+// paravirtual display overrides to set its modes. start keeps its provider as an AppleARMIODevice in
+// one field, NULL where the provider is not one, and the class's get_dot_pitch calls through that
+// field unchecked.
 //
 // For each release the arm64e kexts run on, kReleases records that field and the vtable slot of
 // each method ReimsGraphics overrides for it, read from the release's IOMobileGraphicsFamily. Graft
@@ -43,6 +45,10 @@ constexpr Method kMethods[] = {
 	{"get_dot_pitch", "virtual graft_iomfb_word get_dot_pitch(uint32_t *pitch);",
 	 "RgfxIOMFBWord get_dot_pitch(uint32_t *pitch) override;",
 	 "__ZN25IOMobileFramebufferLegacy13get_dot_pitchEPj"},
+	{"set_digital_out_mode",
+	 "virtual graft_iomfb_word set_digital_out_mode(uint32_t field_0, uint32_t field_1);",
+	 "RgfxIOMFBWord set_digital_out_mode(uint32_t colorId, uint32_t timingId) override;",
+	 "__ZN25IOMobileFramebufferLegacy20set_digital_out_modeEjj"},
 };
 constexpr size_t kMethodCount = sizeof(kMethods) / sizeof(kMethods[0]);
 
@@ -56,10 +62,10 @@ struct Release {
 };
 
 constexpr Release kReleases[] = {
-	{"14.6.1", 0x18a0, 0x1640, {292}},
-	{"15.6.1", 0x19c0, 0x1758, {292}},
-	{"26.6.2", 0x1af8, 0x1890, {293}},
-	{"27.0.1", 0x1dd8, 0x1b80, {294}},
+	{"14.6.1", 0x18a0, 0x1640, {292, 289}},
+	{"15.6.1", 0x19c0, 0x1758, {292, 289}},
+	{"26.6.2", 0x1af8, 0x1890, {293, 290}},
+	{"27.0.1", 0x1dd8, 0x1b80, {294, 291}},
 };
 
 // The SDK stand-in's virtual slots past its own: GRAFT_IOMFB_VTABLE_RESERVE.

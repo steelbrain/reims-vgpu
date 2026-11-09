@@ -313,8 +313,13 @@ Stages:
       release from 13 to 27. Its vtable grows release by release (Legacy's
       has 445 slots on 13.6 and 484 on 27.0.1), so Graft builds the
       subclass's vtable from the live parent at bind time and places its
-      overrides by method. Until that front end lands, the arm64e
-      ReimsGraphics is the IOFramebuffer front end x86-64 uses.
+      overrides by method. The front end (ReimsGraphicsMobile.cpp)
+      publishes the display as the paravirtual display does: its
+      attributes, and its modes as IOAVFamily's timing and colour elements,
+      a timing for each mode the device lists and one 8-bit colour mode.
+      WindowServer sets one of them by its colour and timing IDs
+      (set_digital_out_mode), which the device then shows by `SET_SCANOUT`,
+      as x86-64's setDisplayMode does.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync
