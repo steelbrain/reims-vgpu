@@ -98,6 +98,7 @@ public:
 		uint64_t regionOffset = 0;
 		bool zeroed = false;
 		uint64_t blockSize = 0; // a pages block's size, for a source of the process's own pages
+		bool superpages = false; // a source of the process's own pages: superpages, not plain
 	};
 
 	/// The host's object over a slab of a class whose buffers are placed in it (heaped): its
@@ -226,6 +227,17 @@ struct RgfxPagesMemory {
 	int (*pages)(void *context, uint64_t size, uint8_t **bytes) = nullptr;
 	/// Gives back what superpages or pages made.
 	void (*unmap)(void *context, uint8_t *bytes, uint64_t size) = nullptr;
+	/// What `record` is told, or asked.
+	enum Note {
+		kAsk,       // only asks
+		kRefused,   // the kernel refused a superpage: no contiguous 2 MiB (KERN_NO_SPACE)
+		kGivenBack, // a slab of superpages went back to the kernel
+	};
+	/// The guest's superpage record, which every process shares (the kext's,
+	/// RgfxSuperpageRecord.hpp): takes `note` and answers whether to ask the kernel for
+	/// superpages, false once it refused one until a slab of them goes back. Null for none, and
+	/// every take asks.
+	bool (*record)(void *context, Note note) = nullptr;
 };
 
 /// Slabs of the process's own pages: 2 MiB superpages, or plain pages where the kernel has no
@@ -246,6 +258,13 @@ struct RgfxPagesMemory {
 /// process's stores there, against 56 to 123 GB/s in a superpage; RgfxRegion.hpp). A slab goes
 /// with its heap's destroy, then its block's release (the kext's Free, which waits for the
 /// device's answer), then its pages.
+///
+/// Why the superpage record (RgfxPagesMemory::record): once they ran out, each ask the kernel
+/// refused cost the asking thread its search for a contiguous 2 MiB, 140 to 190 ms on that guest
+/// on the Radeon 780M host, in the first slab of every process (RgfxSuperpageRecord.hpp). So a
+/// take asks the kernel only while the record says it may have one: a refused superpage
+/// (KERN_NO_SPACE) closes it for every process, a slab of superpages given back opens it, and a
+/// take it closes takes plain pages at once, as a refused one does.
 class RgfxPagesSlabSource : public RgfxRegionSlabSource {
 public:
 	RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
@@ -266,6 +285,10 @@ public:
 	static constexpr uint64_t kUnit = 2ull << 20;
 
 private:
+	/// Gives the `size` bytes at `bytes` back to the kernel, and where they were `superpages`
+	/// tells the record a slab of them went back.
+	void giveBack(uint8_t *bytes, uint64_t size, bool superpages);
+
 	RgfxPagesMemory m_memory;
 	uint64_t m_capacity;
 };

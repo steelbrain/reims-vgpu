@@ -86,13 +86,29 @@ enum {
 	// The client's queue scalarInput[0] has its buffers up to the seqno scalarInput[1] complete,
 	// their copies written back: their writes retire.
 	kRgfxAccelMethodSurfaceRetire = 9,
-	// 10 and 11 are a shared event's port's own (below). A new selector takes the next number
-	// design.md's registry gives out.
+	// 10 and 11 are a shared event's port's own (below).
+	// The guest's record of whether its kernel has a 2 MiB superpage left, one for every process
+	// (kRgfxKextFeatureSuperpages; RgfxSuperpageRecord.hpp): in one of the notes below, out 1
+	// where a process may ask the kernel for superpages, 0 where the kernel refused the last ask
+	// since a slab of them went back. kIOReturnBadArgument for any other note. A new selector
+	// takes the next number design.md's registry gives out.
+	kRgfxAccelMethodSuperpages = 12,
+};
+
+// kRgfxAccelMethodSuperpages's notes, its scalar in.
+enum {
+	// Only asks.
+	kRgfxSuperpagesAsk = 0,
+	// The kernel refused a superpage: it found no contiguous 2 MiB (KERN_NO_SPACE).
+	kRgfxSuperpagesRefused = 1,
+	// A slab of superpages went back to the kernel: a contiguous 2 MiB is free again.
+	kRgfxSuperpagesGivenBack = 2,
 };
 
 // The process's device context (RgfxAcceleratorContexts.cpp), on our own user client only: the
-// selectors below, and the features call, pages blocks, answers, releases and retires above,
-// which the kext routes to its context methods (rgfxAccelContextSelector).
+// selectors below, and the features call, pages blocks, answers, releases, retires and the
+// superpage record above, which the kext routes to its context methods
+// (rgfxAccelContextSelector).
 enum {
 	// Opens the client's context and its window. No input; out: the context number c, the
 	// object-id base (c << RGFX_CONTEXT_OBJ_ID_SHIFT), the GPU-address base of the context's
@@ -216,6 +232,7 @@ static inline int rgfxAccelContextSelector(unsigned selector)
 	case kRgfxAccelMethodSurfaceBlock:
 	case kRgfxAccelMethodDeviceInfo:
 	case kRgfxAccelMethodSurfaceWrites:
+	case kRgfxAccelMethodSuperpages:
 		return 1;
 	default:
 		return 0;
@@ -270,6 +287,8 @@ enum {
 	kRgfxKextFeatureSharedEvents = 1 << 6,
 	// Alloc's (0x101) third input, the part of the block mapped write-combined.
 	kRgfxKextFeatureWriteCombined = 1 << 7,
+	// The superpage record, 12.
+	kRgfxKextFeatureSuperpages = 1 << 8,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

@@ -26,6 +26,7 @@
 #include "RgfxSlabs.hpp"
 #include "RgfxSuperpages.hpp"
 #include "reims_graphics_wire.h"
+#include "../../kext/src/RgfxSuperpageRecord.hpp"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
 
 void rgfxSlabTests();
@@ -816,12 +817,14 @@ struct PagesKext {
 
 // The kernel's memory for the pages source: `superpagesLeft` superpages of contiguous room, then
 // KERN_NO_SPACE; past the wire budget (`budgetSpent`), KERN_RESOURCE_SHORTAGE. Plain pages
-// (`pages`) where `refusePlain` is false, else KERN_NO_SPACE.
+// (`pages`) where `refusePlain` is false, else KERN_NO_SPACE. And the guest's superpage record
+// (`record`), the kext's own (RgfxSuperpageRecord.hpp) over `none`, which every process shares.
 struct PagesVm {
 	std::map<uint8_t *, std::vector<uint8_t>> held;
 	uint64_t superpagesLeft = 0;
 	bool budgetSpent = false;
 	bool refusePlain = false;
+	bool none = false;
 	std::vector<std::string> *log;
 
 	explicit PagesVm(std::vector<std::string> *events) : log(events) {}
@@ -862,6 +865,14 @@ struct PagesVm {
 		if (vm->plain.erase(bytes) == 0)
 			vm->superpagesLeft += size / (2 * kMiB);
 		vm->log->push_back("unmap " + std::to_string(size));
+	}
+	static bool record(void *context, RgfxPagesMemory::Note note)
+	{
+		PagesVm *vm = static_cast<PagesVm *>(context);
+		const int answer = rgfxSuperpagesNote(&vm->none, note);
+		static const char *const kNotes[] = {"ask", "refused", "given back"};
+		vm->log->push_back(std::string("record ") + kNotes[note] + " " + std::to_string(answer));
+		return answer != 0;
 	}
 	std::set<uint8_t *> plain; // what pages made
 };
@@ -1310,6 +1321,113 @@ void test_pages_source_short_of_superpages()
 	}
 }
 
+// The guest's superpage record, which every process shares (the kext's, RgfxSuperpageRecord.hpp):
+// a take asks the kernel for superpages only while it is open. A superpage the kernel refuses
+// (KERN_NO_SPACE, its search of the whole RAM, 140 to 190 ms on an 8 GiB guest once none are
+// left) closes it, and from then on every process's take, of one superpage or several, takes
+// plain pages without asking the kernel. A slab of superpages given back to the kernel opens it,
+// and the next take asks again. A refused slab of several superpages leaves it open (the kernel
+// had fewer than it asked for, and those it made went back), as does a refusal past the wire
+// budget, and plain pages given back tell it nothing.
+void test_pages_source_superpage_record()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	std::vector<std::string> log;
+	PagesKext kext(16 * kMiB, &log);
+	region.setBlockSource(&PagesKext::alloc, &PagesKext::release, &kext);
+	region.setPagesBlockSource(&PagesKext::pagesBlock, &kext);
+	PagesVm vm(&log);
+	vm.superpagesLeft = 1;
+	RgfxPagesMemory calls;
+	calls.context = &vm;
+	calls.superpages = &PagesVm::superpages;
+	calls.pages = &PagesVm::pages;
+	calls.unmap = &PagesVm::unmap;
+	calls.record = &PagesVm::record;
+	// Two processes of the guest: each its own slabs over its own pages source, one kernel and
+	// one record between them.
+	RgfxRegionSlabSource regionSource(region, ser);
+	RgfxPagesSlabSource pagesA(region, ser, calls, 16ull << 30);
+	RgfxPagesSlabSource pagesB(region, ser, calls, 16ull << 30);
+	RgfxSlabs a(regionSource), b(regionSource);
+	a.setFirst(&pagesA);
+	b.setFirst(&pagesB);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	auto drain = [&] {
+		while (ring.next(&h, &bytes)) {
+		}
+	};
+
+	// The last superpage, to process A.
+	RgfxSlabs::Range a1, b1, a2, b2, b3, b4;
+	CHECK(a.take(0x1000, kShared, 0, &a1));
+	CHECK(log == std::vector<std::string>({"record ask 1", "superpages 2097152"}));
+	// None left: process B's ask is refused, which closes the record; its slab is plain pages.
+	log.clear();
+	CHECK(b.take(0x1000, kShared, 0, &b1));
+	CHECK(log == std::vector<std::string>({"record ask 1", "superpages 2097152 refused",
+	                                       "record refused 0", "pages 2097152"}));
+	CHECK(vm.none && kext.pages.size() == 2);
+	// Closed: process A's next slab, and B's large one, are plain pages, the kernel never asked.
+	log.clear();
+	CHECK(a.take(0x1000, kSharedUntracked, 0, &a2));
+	CHECK(b.take(3 * kMiB, kShared, 0, &b2) && b2.size == 3 * kMiB);
+	CHECK(log == std::vector<std::string>(
+	                 {"record ask 0", "pages 2097152", "record ask 0", "pages 4194304"}));
+	CHECK(kext.pages.size() == 4 && a.stats().firstSlabs == 2 && b.stats().firstSlabs == 2);
+	drain();
+	// Process A's superpage slab let go: back to the kernel, which opens the record.
+	a.give(a1);
+	log.clear();
+	CHECK(a.reclaim());
+	CHECK(log == std::vector<std::string>(
+	                 {"release pages", "unmap 2097152", "record given back 1"}));
+	CHECK(!vm.none && vm.superpagesLeft == 1);
+	// Open again: process B's next slab asks, and gets the superpage A gave back.
+	log.clear();
+	CHECK(b.take(0x1000, kShared | 0x1, 0, &b3));
+	CHECK(log == std::vector<std::string>({"record ask 1", "superpages 2097152"}));
+	CHECK(vm.superpagesLeft == 0 && kext.pages.size() == 4);
+	// A slab of several the kernel has too few for: refused, plain pages, the record left open.
+	vm.superpagesLeft = 1;
+	log.clear();
+	CHECK(b.take(3 * kMiB, kSharedUntracked, 0, &b4));
+	CHECK(log == std::vector<std::string>(
+	                 {"record ask 1", "superpages 4194304 refused", "pages 4194304"}));
+	CHECK(!vm.none);
+	// Past the wire budget: refused, not for want of contiguous RAM, the record left open.
+	vm.budgetSpent = true;
+	RgfxSlabs::Range a3;
+	log.clear();
+	CHECK(a.take(0x1000, kShared | 0x2, 0, &a3));
+	CHECK(log == std::vector<std::string>(
+	                 {"record ask 1", "superpages 2097152 refused", "pages 2097152"}));
+	CHECK(!vm.none);
+	vm.budgetSpent = false;
+	drain();
+	// Plain pages given back tell the record nothing; B's superpage given back opens it again.
+	vm.none = true;
+	for (RgfxSlabs::Range *r : {&a2, &a3})
+		a.give(*r);
+	log.clear();
+	CHECK(a.reclaim() && vm.none);
+	CHECK(std::count(log.begin(), log.end(), "record given back 1") == 0);
+	for (RgfxSlabs::Range *r : {&b1, &b2, &b3, &b4})
+		b.give(*r);
+	log.clear();
+	CHECK(b.reclaim() && !vm.none);
+	CHECK(std::count(log.begin(), log.end(), "record given back 1") == 1);
+	CHECK(kext.pages.empty() && vm.held.empty());
+	drain();
+}
+
 // Where the device took MANAGED_BUFFER_SLABS, a Managed buffer lies in its Shared class: a range
 // of the Shared buffers' slabs, the process's own superpages first, at any size, its CPU copy a
 // Shared buffer there (BUFFER_AT_OFFSET in a superpage's heap, BUFFER_OVER_PAGES over a larger
@@ -1429,5 +1547,6 @@ void rgfxSlabTests()
 	test_pages_slab_source_plain_pages();
 	test_superpages_one_call_each();
 	test_pages_source_short_of_superpages();
+	test_pages_source_superpage_record();
 	test_managed_buffers_over_shared_copies();
 }

@@ -389,6 +389,24 @@ void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
 	rgfxGiveSuperpages(rgfxKernelSuperpageVm(), bytes, size);
 }
 
+// The pages source's superpage record (RgfxPagesMemory::record): the kext's, which every process
+// of the guest shares (kRgfxAccelMethodSuperpages, RgfxSuperpageRecord.hpp). Where the call
+// fails, the take asks the kernel, as with no record.
+bool rgfxKextSuperpages(void *context, RgfxPagesMemory::Note note)
+{
+	static_assert(RgfxPagesMemory::kAsk == kRgfxSuperpagesAsk &&
+	                  RgfxPagesMemory::kRefused == kRgfxSuperpagesRefused &&
+	                  RgfxPagesMemory::kGivenBack == kRgfxSuperpagesGivenBack,
+	              "the record's notes are the kext's");
+	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	uint64_t in = note;
+	uint64_t out = 1;
+	uint32_t outCount = 1;
+	kern_return_t kr =
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodSuperpages, &in, 1, &out, &outCount);
+	return kr != KERN_SUCCESS || outCount != 1 || out != 0;
+}
+
 void rgfxKextSurfaceRelease(void *context, uint64_t offset)
 {
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
@@ -803,6 +821,11 @@ RGFX_LOG_UNRECOGNIZED
 		memory.superpages = &rgfxSuperpages;
 		memory.pages = &rgfxPlainPages;
 		memory.unmap = &rgfxUnmapPages;
+		// The guest's superpage record, where the kext keeps one: else every take asks the kernel.
+		if ((_caps.kextFeatures() & kRgfxKextFeatureSuperpages) != 0) {
+			memory.context = connContext;
+			memory.record = &rgfxKextSuperpages;
+		}
 		_pagesSource = std::make_unique<RgfxPagesSlabSource>(
 		    *_region, *_serializer, memory, [NSProcessInfo processInfo].physicalMemory,
 		    managedAtOffset, managedOverCopy);

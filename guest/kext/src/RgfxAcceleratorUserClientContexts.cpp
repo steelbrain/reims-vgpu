@@ -307,6 +307,15 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		out[1] = size;
 		return kIOReturnSuccess;
 	}
+	case kRgfxAccelMethodSuperpages: {
+		if (a->scalarInputCount != 1 || a->scalarOutputCount != 1)
+			return kIOReturnBadArgument;
+		const int answer = owner->superpagesNote(in[0]);
+		if (answer < 0)
+			return kIOReturnBadArgument;
+		out[0] = static_cast<UInt64>(answer);
+		return kIOReturnSuccess;
+	}
 	case kRgfxAccelMethodSurfaceWrites:
 		return surfaceWritesMethod(a);
 	case kRgfxAccelMethodSurfaceRetire:

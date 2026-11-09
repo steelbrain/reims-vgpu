@@ -2090,7 +2090,29 @@ the host's import, and the kext's block table holds one entry per slab:
   Apple's platform binaries and the hardened browser processes, WebKit's GPU
   process among them (`src/RgfxSuperpages.hpp`). A slab let go
   destroys its heap, releases its pages block (the kext answers once the host
-  let go of it, and unwires the pages), then deallocates its pages. On the
+  let go of it, and unwires the pages), then deallocates its pages.
+- A take asks the kernel for superpages only while the guest's superpage
+  record says it may have one: the kext keeps it for every process (selector
+  12, `Superpages`, kext feature 1 << 8; `kext/src/RgfxSuperpageRecord.hpp`),
+  open at the kext's start. A superpage the kernel refuses for want of
+  contiguous RAM (`KERN_NO_SPACE`, a take of one superpage) closes it, and a
+  slab of superpages given back to the kernel opens it; while it is closed
+  every process's take, of one superpage or several, takes plain pages without
+  asking. A refused slab of several superpages leaves it as it was (the kernel
+  had fewer than it asked for, and those it made went back), as does a refusal
+  past the wire budget (`KERN_RESOURCE_SHORTAGE`). Why: once superpages ran
+  out, each refused ask cost its thread the kernel's search for a contiguous
+  2 MiB (`vm_map_enter`'s superpage path, in `cpm_allocate`, which sleeps as
+  it goes and moves pages to make a run): 140 to 190 ms on the 8 GiB 26.7.2
+  guest above, sampled with spindump, in the first slabs of every process (a
+  video decoder session's first access unit, Safari's GPU process's layer
+  drawing), which then took plain pages anyway. A
+  process's own memory of a refusal would spare only its later slabs. A
+  16 GiB 26.6.1 guest on the RTX 5080 host gave every superpage asked for at
+  once, and its record stays open. Where the kext lacks the bit, or the call
+  fails, the bundle asks the kernel at every take, as with no record; the host
+  sees the same pages blocks either way, a superpage's one run or plain pages'
+  many. On the
   RTX 5080 a heap over a run of guest RAM took 13.4 us and a 4 KiB buffer
   placed in it 1.93 us, where a no-copy buffer over a block's view took
   65-75 us, an import of its own (`slab_heap_costs`, `slab_nocopy_costs`).
@@ -3329,6 +3351,7 @@ Map 1:
 | 9 | `SurfaceRetire` | | a queue's writes up to a seqno retire |
 | 10 | `Export`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | names the caller's shared event for other processes ("Shared events across processes") |
 | 11 | `Import`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | makes the caller's new shared event of the one the port names |
+| 12 | `Superpages` | 1 << 8 `Superpages` | the guest's superpage record: whether a process may ask its kernel for superpages ("Shared and Managed buffers lie in slabs") |
 | 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output) | the context and its window; five outputs, or six with its GPU addresses' span |
 | 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
 | 0x102 | `Free` | | frees a block |
@@ -3347,7 +3370,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents` and 1 << 7 `WriteCombined`; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined` and 1 << 8 `Superpages`; no other bit yet.
 
 **A GL window: the drawable (type 7) and the window surface (type 0x20).**
 These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its

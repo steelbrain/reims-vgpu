@@ -59,6 +59,7 @@
 #include "RgfxPagesBlock.hpp"
 #include "RgfxIdChunks.hpp"
 #include "RgfxReleaseTable.hpp"
+#include "RgfxSuperpageRecord.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -170,6 +171,9 @@ bool &hooked = state.hooked;
 // Whether the device uses surfaces' own pages in place (RGFX_FEATURE_SURFACE_PAGES), read from
 // FEATURES_LO at the first context's open.
 bool surfacePages = false;
+// The guest's superpage record (RgfxSuperpageRecord.hpp): true where the kernel refused the last
+// superpage a process asked for since a slab of them went back. Read and written atomically.
+bool noSuperpages = false;
 // Whether the device keeps cached surfaces' GPU copies in its own memory
 // (RGFX_FEATURE_SURFACE_CACHE), or keeps them only of the surfaces it answers need one
 // (RGFX_FEATURE_SURFACE_CACHE_REFUSED, taken), read with it.
@@ -2396,6 +2400,11 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	*offset = at;
 	*size = bytes;
 	return kIOReturnSuccess;
+}
+
+int RgfxAccelerator::superpagesNote(UInt64 note)
+{
+	return rgfxSuperpagesNote(&noSuperpages, note);
 }
 
 IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client, UInt64 offset)

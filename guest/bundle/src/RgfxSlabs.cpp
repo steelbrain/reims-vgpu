@@ -195,19 +195,28 @@ bool RgfxPagesSlabSource::heapedSlab(const Memory &memory, uint32_t options) con
 
 bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 {
-	// Superpages, each one run of guest RAM; where the kernel has none to give (no contiguous
-	// 2 MiB free, or the wire budget spent), plain pages, which the kext wires as it makes the
-	// block; and where neither, the region's slab.
+	// Superpages, each one run of guest RAM, where the superpage record says the kernel may have
+	// some; where it has none to give (no contiguous 2 MiB free, or the wire budget spent), plain
+	// pages, which the kext wires as it makes the block; and where neither, the region's slab. A
+	// refused superpage, for want of contiguous RAM, closes the record for every process; not a
+	// refused slab of several, whose refusal shows only that the kernel had fewer than it asked
+	// for, and whose superpages made before it went back.
 	uint8_t *bytes = nullptr;
 	if (size == 0 || size % kUnit != 0)
 		return false;
-	if (m_memory.superpages(m_memory.context, size, &bytes) != KERN_SUCCESS &&
-	    (m_memory.pages == nullptr ||
-	     m_memory.pages(m_memory.context, size, &bytes) != KERN_SUCCESS))
+	bool superpages = false;
+	if (m_memory.record == nullptr || m_memory.record(m_memory.context, RgfxPagesMemory::kAsk)) {
+		const int kr = m_memory.superpages(m_memory.context, size, &bytes);
+		superpages = kr == KERN_SUCCESS;
+		if (kr == KERN_NO_SPACE && size == kUnit && m_memory.record != nullptr)
+			m_memory.record(m_memory.context, RgfxPagesMemory::kRefused);
+	}
+	if (!superpages && (m_memory.pages == nullptr ||
+	                    m_memory.pages(m_memory.context, size, &bytes) != KERN_SUCCESS))
 		return false;
 	RgfxRegion::Block block = m_region.acquirePages(bytes, size, true);
 	if (!block.ok) {
-		m_memory.unmap(m_memory.context, bytes, size);
+		giveBack(bytes, size, superpages);
 		return false;
 	}
 	out->bytes = bytes;
@@ -215,6 +224,7 @@ bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 	out->regionOffset = block.offset;
 	out->blockSize = block.size;
 	out->zeroed = true; // fresh pages of the kernel's, superpages zeroed and plain ones zero-filled
+	out->superpages = superpages;
 	return true;
 }
 
@@ -223,7 +233,14 @@ void RgfxPagesSlabSource::give(const Memory &memory)
 	// The block's release first: the kext answers once the device has let go of it, and unwires
 	// the pages.
 	m_region.release(memory.regionOffset);
-	m_memory.unmap(m_memory.context, memory.bytes, memory.size);
+	giveBack(memory.bytes, memory.size, memory.superpages);
+}
+
+void RgfxPagesSlabSource::giveBack(uint8_t *bytes, uint64_t size, bool superpages)
+{
+	m_memory.unmap(m_memory.context, bytes, size);
+	if (superpages && m_memory.record != nullptr)
+		m_memory.record(m_memory.context, RgfxPagesMemory::kGivenBack);
 }
 
 bool RgfxPagesSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap *out)

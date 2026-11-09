@@ -85,13 +85,14 @@ enum {
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
 // second word kRgfxAccelMethodFeatures answers: PagesBlock, Submit's deferred flag and
-// TakeAnswers, OpenContext's span, shared events' ports, and Alloc's write-combined part. Each
-// bit is set by the change that lands its call.
+// TakeAnswers, OpenContext's span, shared events' ports, Alloc's write-combined part and the
+// superpage record. Each bit is set by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureDeferredAnswers |
                                           kRgfxKextFeatureContextSpan |
                                           kRgfxKextFeatureSharedEvents |
-                                          kRgfxKextFeatureWriteCombined;
+                                          kRgfxKextFeatureWriteCombined |
+                                          kRgfxKextFeatureSuperpages;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;
@@ -389,6 +390,10 @@ public:
 	IOReturn pagesBlock(RgfxAcceleratorUserClient *owner, UInt32 context, task_t task,
 	                    UInt64 address, UInt64 length, bool writable, UInt64 *offset,
 	                    UInt64 *size);
+	// The guest's superpage record (kRgfxAccelMethodSuperpages, RgfxSuperpageRecord.hpp): takes
+	// `note` and answers 1 where a process may ask the kernel for superpages, 0 where not, -1 for
+	// a note that is none of the record's.
+	int superpagesNote(UInt64 note);
 	void freeBlocks(const void *owner);
 	// Before the owner's close is posted: none of its blocks is released from here on, a freed
 	// or a refused one included, so no release of its comes behind the close, which the device
