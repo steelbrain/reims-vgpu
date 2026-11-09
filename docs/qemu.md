@@ -1043,16 +1043,18 @@ released image (`ea2987b`) and APFS clones of the 26.6.2 (25G83) guest
   refused ("Permission denied") after about 20 had succeeded; the guest's
   commands now share the first login's connection and retry a failed login.
 
-The arm64e builds of `ReimsGraphics.kext` and `RgfxGate.kext`, with the Metal
-bundle inside RgfxGate for arm64e and arm64, are `guest/prebuilt-arm64e`
-(`make -C guest prebuilt-arm64e`): `REIMS_GRAPHICS=guest/prebuilt-arm64e/ReimsGraphics.kext`
-and `RGFXGATE=guest/prebuilt-arm64e/RgfxGate.kext`.
+Graft's arm64e build and the arm64e builds of `ReimsGraphics.kext` and
+`RgfxGate.kext`, with the Metal bundle inside RgfxGate for arm64e and arm64,
+are `guest/prebuilt-arm64e` (`make -C guest prebuilt-arm64e`):
+`GRAFT=guest/prebuilt-arm64e/Graft-arm64e.kext`,
+`REIMS_GRAPHICS=guest/prebuilt-arm64e/ReimsGraphics.kext` and
+`RGFXGATE=guest/prebuilt-arm64e/RgfxGate.kext`.
 
-**What a pass still needs** (2026-11-08): Graft built for arm64e in
-`guest/graft` (its vendored build is x86-64); RgfxGate's install on arm64,
-whose build still calls `VNOP_*` functions an arm64 kernel collection does not
-export; and the arm64e display on IOMobileFramebuffer
-([graphics-kext/design.md](graphics-kext/design.md), "Decided", item 13).
+**What a pass still needs** (2026-11-08): Graft's bind of the arm64e
+ReimsGraphics, its display and accelerator together; the display is an
+IOMobileFramebuffer ([graphics-kext/design.md](graphics-kext/design.md),
+"Decided", item 13), whose bind waits for Graft 1.3.0's bind-time
+IOMobileFramebuffer vtable synthesis (Graft's `notes/arm64-display.md`).
 
 **A TCG run** (`-t`) runs on a Linux member. What it needs:
 - **A node** with the arm64 guests: `homelab-um870-1` holds reflink copies of

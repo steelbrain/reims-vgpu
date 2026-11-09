@@ -356,16 +356,17 @@ Three tiers:
     with its record, `guest/graft/source.toml`, which the same check
     verifies. A new Graft replaces the directory and its record together.
   - **The guest's arm64e kext set for that device**, in
-    `guest/prebuilt-arm64e`: `set.toml`, `sources.toml`, and for each of
-    `ReimsGraphics` and `RgfxGate`, `<name>.kext/Contents/Info.plist` and
-    `<name>.kext/Contents/MacOS/<name>`, built for arm64e from the same
+    `guest/prebuilt-arm64e`: `set.toml`, `sources.toml`,
+    `Graft-arm64e.kext/Contents/Info.plist` and
+    `Graft-arm64e.kext/Contents/MacOS/Graft`, Graft's arm64e build, and for
+    each of `ReimsGraphics` and `RgfxGate`, `<name>.kext/Contents/Info.plist`
+    and `<name>.kext/Contents/MacOS/<name>`, built for arm64e from the same
     sources, with the Metal bundle inside RgfxGate for arm64e and arm64.
     Ambrosia's config bundle (`make -C firmware/ambrosia config-bundle`,
     [docs/qemu.md](docs/qemu.md), "arm64 guests") adds them to an arm64 VM's
     kernel collection. `make -C guest prebuilt-arm64e` rewrites them on a Mac
     with Xcode alone, with their record, `sources.toml`, and a stale set
-    fails `make -C guest prebuilt-check`, which `cargo xtask check` runs. The
-    set lists no Graft until `guest/graft` carries Graft's arm64e build.
+    fails `make -C guest prebuilt-check`, which `cargo xtask check` runs.
 - **Never commit Apple binaries.** The build needs none: the option ROM is
   built from `firmware/`, and the kexts from `guest/`. The committed
   metallibs hold only our shaders and constant samplers, with no Apple code

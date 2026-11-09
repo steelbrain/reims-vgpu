@@ -302,7 +302,7 @@ Stages:
       arm64e kext has a Graft declaration and an Info.plist of its own
       (src/graft-arm64e.json, src/Info-arm64e.plist): IOFramebuffer and
       IOAccelerator from IOGraphicsFamily, and no device control. The set
-      lists no Graft until guest/graft carries Graft's arm64e build.
+      starts with Graft's arm64e build, Graft-arm64e.kext from guest/graft.
     - The arm64 display (owner, 2026-11-08): an arm64 WindowServer drives no
       IOFramebuffer (measured on 27.0.1 with SIP on: a bound IOFramebuffer
       consumer got no user client, and the system had no

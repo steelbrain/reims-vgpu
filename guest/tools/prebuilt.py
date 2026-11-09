@@ -8,8 +8,8 @@
 
 The x86-64 set (stage, guest/prebuilt) includes the vendored Graft build, dormant
 ReimsGraphics and RgfxGate. The arm64e set (stage-arm64e, guest/prebuilt-arm64e) is
-dormant ReimsGraphics and RgfxGate for the arm64 guests Ambrosia boots; it takes Graft
-once guest/graft carries an arm64e Graft build.
+the vendored arm64e Graft build, dormant ReimsGraphics and RgfxGate for the arm64
+guests Ambrosia boots.
 No kernel-range gate, KDK, loader, shim or downloaded build input is used.
 check also verifies guest/graft against the record Graft's tools/vendor.py
 wrote beside it.
@@ -46,6 +46,7 @@ SET = (
 # release of Ambrosia's arm64 configuration. Ambrosia's config bundle places these kexts.
 MIN_KERNEL_ARM64E = "22.0.0"
 SET_ARM64E = (
+    ("Graft-arm64e.kext", "Binds and routes the owned guest kexts"),
     ("kext/ReimsGraphics.kext", "The reims-graphics display and accelerator"),
     ("rgfxgate/RgfxGate.kext", "Installs the reims-graphics Metal bundle and admits it"),
 )
@@ -144,8 +145,9 @@ def stage(out, work, arch="x86_64"):
     dependencies = infos["ReimsGraphics.kext"].get("OSBundleLibraries", {})
     if {"com.apple.iokit.IOGraphicsFamily", "com.apple.AppleGraphicsDeviceControl"} & set(dependencies):
         raise SystemExit("prebuilt: dormant ReimsGraphics still names System-KC dependencies")
-    if not arm64e and sha256(work / "Graft.kext/Contents/MacOS/Graft") != sha256(ROOT / "guest/graft/built/Graft.kext/Contents/MacOS/Graft"):
-        raise SystemExit("prebuilt: Graft differs from the vendored build")
+    graft = "Graft-arm64e.kext" if arm64e else "Graft.kext"
+    if sha256(work / graft / "Contents/MacOS/Graft") != sha256(GRAFT / "built" / graft / "Contents/MacOS/Graft"):
+        raise SystemExit(f"prebuilt: {graft} differs from the vendored build")
     for kext, _ in kexts:
         exe = kext / "Contents/MacOS" / infos[kext.name]["CFBundleExecutable"]
         if arch not in tool("lipo", "-archs", str(exe)).split():

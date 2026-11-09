@@ -17,8 +17,8 @@
 #       record of the sources it was built from; commit prebuilt/ with the
 #       change to those sources
 #   make set-arm64e [OUT64=build/set-arm64e]
-#       the arm64e set: ReimsGraphics and RgfxGate for arm64e, with the Metal
-#       bundle for arm64e and arm64 inside RgfxGate
+#       the arm64e set: Graft's arm64e build, and ReimsGraphics and RgfxGate
+#       for arm64e, with the Metal bundle for arm64e and arm64 inside RgfxGate
 #   make prebuilt-arm64e
 #       that set built afresh into prebuilt-arm64e/ with its own sources.toml
 #   make prebuilt-check
@@ -70,6 +70,7 @@ set-arm64e:
 	$(MAKE) -C kext ARCH_NAME=arm64e BUILD=$(WORK64)/kext
 	$(MAKE) -C bundle ARCH=arm64e PACKAGE_ARCHS="arm64e arm64" BUILD=$(WORK64)/bundle package
 	$(MAKE) -C rgfxgate ARCH_NAME=arm64e BUILD=$(WORK64)/rgfxgate BUNDLE_DIR=$(BUNDLE64)
+	ditto graft/built/Graft-arm64e.kext $(WORK64)/Graft-arm64e.kext
 	python3 -I -B tools/prebuilt.py stage-arm64e $(OUT64) $(WORK64)
 
 prebuilt-arm64e:
