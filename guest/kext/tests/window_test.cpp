@@ -37,6 +37,19 @@ int main()
 	check(!rgfxWindowSpan(window, window, 0x1000), "nor one after it");
 	check(!rgfxWindowSpan(window, 0xfffffffffffff000ull, 0x2000), "nor one that wraps");
 	check(!rgfxWindowSpan(0, head, 0x1000), "a closed window maps nothing");
+	// On x86-64 a window page is a guest page, 4 KiB: the span of whole guest pages is those
+	// pages, and a part of one maps the page it is in.
+	check(rgfxWindowSpanLength(0x1000) == 0x1000 && rgfxWindowSpanLength(0xfd2000) == 0xfd2000,
+	      "whole 4 KiB pages are their own span");
+	check(rgfxWindowSpanLength(0x1800) == 0x2000 && rgfxWindowSpanLength(1) == 0x1000,
+	      "a part of a page maps the page");
+	// The write-combined split of a block: from its byte where that lies in the asked bytes, a
+	// page's offset; none, the whole block write-back, where it lies in the block's rounding or
+	// past it.
+	check(rgfxWindowWriteBackPart(0x3000, 0x3000, 0x1000) == 0x1000, "write-back to the split");
+	check(rgfxWindowWriteBackPart(0x1800, 0x2000, 0x1900) == 0x2000,
+	      "a split in the rounding leaves the block write-back, a span");
+	check(rgfxWindowWriteBackPart(0x2000, 0x2000, UINT64_MAX) == 0x2000, "no split, no part");
 	// xnu charges a mapping of pageable memory that is not purgeable at its whole size, the
 	// region's, to the process's footprint as the context opens.
 	check((kRgfxWindowMemoryOptions & kRgfxWindowPageable) != 0, "the window's memory is pageable");

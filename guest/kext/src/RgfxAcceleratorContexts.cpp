@@ -1069,6 +1069,9 @@ void RgfxAccelerator::keepIdChunks(const void *owner)
 
 // MARK: - Blocks
 
+// A block is whole window pages, so the whole of it is a span a window maps.
+static_assert(kRgfxBlockPage == kRgfxWindowPage, "a block is whole window pages");
+
 IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 context,
                                     UInt64 size, UInt64 align, UInt64 writeCombinedFrom,
                                     UInt64 *offset)
@@ -1097,7 +1100,7 @@ IOReturn RgfxAccelerator::allocBlock(RgfxAcceleratorUserClient *owner, UInt32 co
 		// which are no RAM of the guest's, are mapped uncached for any other ask (xnu's pmap
 		// sets PCD on every page it does not manage). The process fences its stores before it
 		// publishes them.
-		const UInt64 combined = writeCombinedFrom < bytes ? writeCombinedFrom : bytes;
+		const UInt64 combined = rgfxWindowWriteBackPart(size, bytes, writeCombinedFrom);
 		IOReturn posted = combined ? owner->mapSpan(pin.offset, combined) : kIOReturnSuccess;
 		if (posted == kIOReturnSuccess && combined < bytes)
 			posted = owner->mapSpan(pin.offset + combined, bytes - combined, true);
@@ -1143,7 +1146,7 @@ IOReturn RgfxAccelerator::freeBlock(RgfxAcceleratorUserClient *owner, UInt64 off
 		// the window.
 		const int64_t at = rgfxBlockIndex(blockTable, offset);
 		if (at < 0 || !blockTable.blocks[at].wired)
-			owner->unmapSpan(offset, size);
+			owner->unmapSpan(offset, rgfxWindowSpanLength(size));
 		r = rgfxBlockFree(blockTable, owner, offset, mach_absolute_time());
 	}
 	IOLockUnlock(contextLock);
@@ -1817,12 +1820,13 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 				writeBackLate = true;
 				releaseStats.writeBackLate++;
 			}
-			// A new block in place holds the runs past the part the processes map, whole pages
-			// of them; a deferred one room for one run a page of the plane.
+			// A new block in place holds the runs past the span the processes map
+			// (rgfxSurfaceRunsFrom), whole pages of them; a deferred one room for one run a
+			// page of the plane.
 			const UInt64 runBytes = sizeof(RgfxPageRun) * static_cast<UInt64>(count);
 			total = !inPlace ? size
-			        : count  ? size + alignUp(runBytes, kPage)
-			                 : size + rgfxSurfaceRunRoom(length);
+			        : count  ? rgfxSurfaceRunsFrom(size) + alignUp(runBytes, kPage)
+			                 : rgfxSurfaceRunsFrom(size) + rgfxSurfaceRunRoom(length);
 			// A new block: a dormant one gives its entry where the table is full, and the
 			// region's room where it has none, its release waited for a while, once.
 			slot = rgfxSurfaceFreeEntry(table);
@@ -1885,14 +1889,14 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		IOReturn mapped = kIOReturnSuccess;
 		bool keptWire = false;
 		if (held == kRgfxSurfaceHoldNew) {
-			mapped = client->mapSpan(e.offset, e.size);
+			mapped = client->mapSpan(e.offset, rgfxWindowSpanLength(e.size));
 			if (mapped != kIOReturnSuccess) {
 				// No hold the device was not told of, nor one not in the window; a block held
 				// again goes, holding none.
 				void *mine = nullptr;
 				UInt32 c = 0;
 				rgfxSurfaceLetGo(e, client, true, &mine, &c);
-				client->unmapSpan(e.offset, e.size);
+				client->unmapSpan(e.offset, rgfxWindowSpanLength(e.size));
 				held = kRgfxSurfaceHoldFull;
 				if (!e.holdCount && letGoBlock(e, context, false, mine, &keptWire))
 					thread_call_enter(releaseCall);
@@ -1931,7 +1935,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			                                                      true, &mine, &c)
 			                                   : kRgfxSurfaceLetGoNotHeld;
 			if (gone != kRgfxSurfaceLetGoNotHeld)
-				client->unmapSpan(block->offset, block->size);
+				client->unmapSpan(block->offset, rgfxWindowSpanLength(block->size));
 			if (gone == kRgfxSurfaceLetGoLast)
 				release = letGoBlock(table.entries[again], c, false, mine, &shareKeptWire);
 		}
@@ -1979,10 +1983,10 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	// In the client's window, under the lock, so no let-go of the hold comes between: the part
 	// the processes map, never the runs. A block that is not goes back as if never made: the
 	// device was not told of it.
-	IOReturn mapped = client->mapSpan(offset, size);
+	IOReturn mapped = client->mapSpan(offset, rgfxWindowSpanLength(size));
 	if (mapped != kIOReturnSuccess) {
 		OSObject *deferredSurface = deferring ? static_cast<OSObject *>(e.surface) : nullptr;
-		client->unmapSpan(offset, size);
+		client->unmapSpan(offset, rgfxWindowSpanLength(size));
 		rgfxBlockDrop(blockTable, pin);
 		rgfxSurfaceClear(table, e);
 		if (inPlace)
@@ -2025,8 +2029,9 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		                                 cached, ask ? layout : nullptr, &status)) {
 			if (ask && status == RGFX_STATUS_CACHE) {
 				cached = cacheSurface(e, task, surfaceId, offset);
-				if (postPages(context, offset, total, offset + size, length, count,
-				              cached ? RGFX_SURFACE_PAGES_CACHED : 0) != kIOReturnSuccess)
+				if (postPages(context, offset, total, offset + rgfxSurfaceRunsFrom(size),
+				              length, count, cached ? RGFX_SURFACE_PAGES_CACHED : 0) !=
+				    kIOReturnSuccess)
 					posted = kIOReturnUnsupported;
 			} else {
 				posted = kIOReturnUnsupported;
@@ -2051,7 +2056,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		UInt32 c = 0;
 		RgfxSurfaceLetGo gone = rgfxSurfaceLetGo(e, client, true, &mine, &c);
 		if (gone != kRgfxSurfaceLetGoNotHeld)
-			client->unmapSpan(offset, size);
+			client->unmapSpan(offset, rgfxWindowSpanLength(size));
 		if (gone == kRgfxSurfaceLetGoLast)
 			release = letGoBlock(e, c, false, mine, &keptWire);
 	}
@@ -2214,16 +2219,17 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 	// A deferral that carries pages names them in its runs, past the part the processes map, in
 	// the room the block keeps for one run a page: one whose runs could not be written names its
 	// pages now, as a refused one does, nothing read of the carried pages.
-	const bool runsWritten =
-	    !carriedCount || writeRuns(region, offset + size, carried, carriedCount);
+	const bool runsWritten = !carriedCount ||
+	                         writeRuns(region, offset + rgfxSurfaceRunsFrom(size), carried,
+	                                   carriedCount);
 	if (answer == kRgfxDeferFresh && !runsWritten)
 		rgfxSurfaceLocksRefusedCarry(cache);
 	if (answer == kRgfxDeferFresh && runsWritten) {
 		UInt32 status = RGFX_STATUS_OK;
 		const UInt32 flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED |
 		                     (asking ? RGFX_SURFACE_PAGES_ASK_CACHE : 0);
-		const IOReturn r = postPages(context, offset, total, offset + size, length, carriedCount,
-		                             flags, &status, asking);
+		const IOReturn r = postPages(context, offset, total, offset + rgfxSurfaceRunsFrom(size),
+		                             length, carriedCount, flags, &status, asking);
 		if (r == kIOReturnSuccess || r != kIOReturnUnsupported || status != RGFX_STATUS_REFUSED) {
 			// Deferred, or not answered: a block whose answer did not come goes through its
 			// release, its region bytes given out again only at an OK answer. No guest page was
@@ -2319,27 +2325,29 @@ RgfxPagesNaming RgfxAccelerator::attachSurfacePages(UInt32 context, UInt64 offse
 		return kRgfxPagesNotNamed;
 	UInt32 count = 0;
 	RgfxPageRun *runs = walkRuns(memory, 0, length, &count);
+	// Its runs past the span its holders map (rgfxSurfaceRunsFrom).
+	const UInt64 runsAt = offset + rgfxSurfaceRunsFrom(size);
 	RgfxPagesNaming naming = kRgfxPagesNotNamed;
 	const char *why = nullptr;
 	if (!runs) {
 		why = "its runs do not fit";
-	} else if (!writeRuns(region, offset + size, runs, count)) {
+	} else if (!writeRuns(region, runsAt, runs, count)) {
 		why = "its runs could not be written";
 	} else {
-		const UInt64 total = size + rgfxSurfaceRunRoom(length);
+		const UInt64 total = rgfxSurfaceRunsFrom(size) + rgfxSurfaceRunRoom(length);
 		IOReturn r = kIOReturnSuccess;
 		UInt32 status = RGFX_STATUS_OK;
 		if (layout) {
 			// The ask: in place where answered OK; named again with `flags` where the host
 			// answered that the surface needs a device cache, the runs written already.
-			r = postPages(context, offset, total, offset + size, length, count,
+			r = postPages(context, offset, total, runsAt, length, count,
 			              RGFX_SURFACE_PAGES_ASK_CACHE, &status, layout);
 			if (r == kIOReturnSuccess && inPlace)
 				*inPlace = true;
 			else if (r == kIOReturnUnsupported && status == RGFX_STATUS_CACHE)
-				r = postPages(context, offset, total, offset + size, length, count, flags);
+				r = postPages(context, offset, total, runsAt, length, count, flags);
 		} else {
-			r = postPages(context, offset, total, offset + size, length, count, flags);
+			r = postPages(context, offset, total, runsAt, length, count, flags);
 		}
 		naming = rgfxPagesNaming(r == kIOReturnSuccess || r == kIOReturnUnsupported,
 		                         r == kIOReturnSuccess);
@@ -2386,7 +2394,7 @@ bool RgfxAccelerator::postSurfacePages(UInt32 context, UInt64 offset, UInt64 tot
                                        bool cached, const RgfxSurfacePagesLayout *layout,
                                        UInt32 *status)
 {
-	if (!writeRuns(region, offset + size, runs, count)) {
+	if (!writeRuns(region, offset + rgfxSurfaceRunsFrom(size), runs, count)) {
 		IOLog("RgfxAccelerator: the block 0x%llx's runs could not be written: its surface is "
 		      "copied\n",
 		      offset);
@@ -2395,8 +2403,8 @@ bool RgfxAccelerator::postSurfacePages(UInt32 context, UInt64 offset, UInt64 tot
 	const UInt32 flags = cached ? RGFX_SURFACE_PAGES_CACHED
 	                     : layout ? RGFX_SURFACE_PAGES_ASK_CACHE
 	                              : 0;
-	IOReturn r = postPages(context, offset, total, offset + size, length, count, flags, status,
-	                       layout);
+	IOReturn r = postPages(context, offset, total, offset + rgfxSurfaceRunsFrom(size), length,
+	                       count, flags, status, layout);
 	if (r != kIOReturnSuccess && r != kIOReturnUnsupported)
 		IOLog("RgfxAccelerator: the block 0x%llx's pages were not answered (0x%x): its surface "
 		      "is copied\n",
@@ -2576,7 +2584,7 @@ IOReturn RgfxAccelerator::releaseSurfaceBlock(RgfxAcceleratorUserClient *client,
 	UInt64 serial = at < 0 ? 0 : table.entries[at].serial;
 	// Out of the client's window once its hold ends, before the block can be anyone else's.
 	if (gone == kRgfxSurfaceLetGoHold || gone == kRgfxSurfaceLetGoLast)
-		client->unmapSpan(offset, size);
+		client->unmapSpan(offset, rgfxWindowSpanLength(size));
 	bool release = false, slept = false, keptWire = false;
 	OSObject *sleeper = nullptr;
 	if (gone == kRgfxSurfaceLetGoLast) {

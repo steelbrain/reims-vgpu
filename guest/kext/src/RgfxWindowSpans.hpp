@@ -42,4 +42,23 @@ inline bool rgfxWindowSpan(uint64_t windowSize, uint64_t offset, uint64_t length
 	       length <= windowSize - offset;
 }
 
+// The span a window maps for the `length` bytes a process uses from the start of a block or the
+// scanout: whole window pages, 16 KiB on arm64, where the bytes the process uses are whole guest
+// pages of 4 KiB (a 1920x1080 RGBA16Float plane's 0xfd2000). Every block is whole window pages
+// at a page's offset (RgfxBlockTable.hpp), so the span's pages past `length` are the block's
+// own; a block whose part only the kext and the device read (a surface block's runs) places it
+// past the span.
+inline uint64_t rgfxWindowSpanLength(uint64_t length)
+{
+	return (length + kRgfxWindowPage - 1) & ~(kRgfxWindowPage - 1);
+}
+
+// The part of a block of `bytes`, asked as `size` bytes, a window maps write-back, the rest
+// write-combined: up to `writeCombinedFrom` where that lies in the asked bytes, a page's offset,
+// and the whole block where it does not, the bytes past `size` being the block's rounding.
+inline uint64_t rgfxWindowWriteBackPart(uint64_t size, uint64_t bytes, uint64_t writeCombinedFrom)
+{
+	return writeCombinedFrom < size ? writeCombinedFrom : bytes;
+}
+
 #endif // RGFX_WINDOW_SPANS_HPP_

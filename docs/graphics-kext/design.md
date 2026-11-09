@@ -1987,6 +1987,10 @@ before a block's free marks it freed, and when a hold ends, a scanout grant
 goes or a mode change moves the scanout. At the close the whole window goes,
 every span in it, before the context's blocks are freed. Each span is whole
 pages past the region's head, so no mapped page holds a byte of anything else.
+A page here is the process's: 4 KiB on x86-64 and 16 KiB on arm64, where the
+kext maps the whole 16 KiB pages of a block's part a process uses (a plane's
+bytes, whole 4 KiB guest pages) and of the scanout's rows. Every block is whole
+such pages, and a surface block's runs start past the mapped pages.
 The device info shares its page with the control completion ring's tail, so
 the kext reads it for the process (selector 0x10b), and the region's own map
 (`kRgfxAccelMemoryRegion`) is refused. One difference from Apple's: a process

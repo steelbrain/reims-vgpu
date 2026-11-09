@@ -30,6 +30,7 @@
 #include "RgfxSurfaceUserClient.hpp"
 #include "ReimsGraphics.hpp"
 #include "RgfxScanoutOwner.hpp"
+#include "RgfxWindowSpans.hpp"
 #include "RgfxTrace.hpp"
 
 #include <IOKit/IOLib.h>
@@ -168,7 +169,9 @@ bool RgfxAccelerator::currentScanout(Scanout *scanout)
 	fb->release();
 	if (!ok)
 		return false;
-	scanout->length = round_page_64(static_cast<UInt64>(scanout->rowBytes) * scanout->height);
+	// The span a window maps of it, whole window pages: 16 KiB on arm64 (RgfxWindowSpans.hpp).
+	scanout->length =
+	    rgfxWindowSpanLength(static_cast<UInt64>(scanout->rowBytes) * scanout->height);
 	return true;
 }
 

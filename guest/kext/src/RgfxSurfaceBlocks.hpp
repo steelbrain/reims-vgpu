@@ -50,6 +50,8 @@
 // RgfxPageRun, a run of physically contiguous bytes of a plane's pages, is the wire's: an
 // in-place block hands its runs to the device as they are.
 #include "reims_graphics_wire.h"
+// The span a holder's window maps of a block (rgfxWindowSpanLength).
+#include "RgfxWindowSpans.hpp"
 
 // The most clients that hold one plane's block.
 constexpr uint32_t kRgfxSurfaceHolders = 16;
@@ -481,6 +483,13 @@ inline bool rgfxPagesNamingWired(RgfxPagesNaming n)
 inline bool rgfxSurfaceDeferFits(const RgfxSurfaceTable &t, uint64_t length, uint64_t budget)
 {
 	return budget != 0 && length <= budget && t.deferredBytes <= budget - length;
+}
+
+// Where a block's runs lie from its start, past the `size` bytes its holders use: past the span
+// their windows map of those (rgfxWindowSpanLength), so no page a holder maps holds a run.
+inline uint64_t rgfxSurfaceRunsFrom(uint64_t size)
+{
+	return rgfxWindowSpanLength(size);
 }
 
 // The bytes an in-place block of a plane of `length` bytes keeps for its runs past the part its
