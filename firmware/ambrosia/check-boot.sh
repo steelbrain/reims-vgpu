@@ -163,9 +163,13 @@ PY
 
 # The guest's commands share one SSH connection, the first login's (ControlMaster), so the
 # password is given once; the socket's name is a hash of the port, short enough for a socket.
-SOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password
-  -o PubkeyAuthentication=no -o ConnectTimeout=5 -o LogLevel=ERROR
-  -o ControlMaster=auto -o "ControlPath=/tmp/check-boot-%C" -o ControlPersist=yes)
+# The boot's login probe opens none (PROBE_SOPTS): a probe its timeout cuts off, as one can be
+# while a slow boot (-v) brings sshd up, could leave a master behind that later probes would wait
+# on. The first command after the login (G) opens the shared one.
+BASE_SOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password
+  -o PubkeyAuthentication=no -o ConnectTimeout=5 -o LogLevel=ERROR)
+SOPTS=("${BASE_SOPTS[@]}" -o ControlMaster=auto -o "ControlPath=/tmp/check-boot-%C" -o ControlPersist=yes)
+PROBE_SOPTS=("${BASE_SOPTS[@]}" -o ControlMaster=no -o ControlPath=none)
 # A command in the guest, under a limit of SECONDS: prints its output, also kept in guest.log, and
 # returns its status. A login that fails (sshpass's 5, a refused password; ssh's 255) is tried
 # twice more, 5 s apart, as the lane gate retries its copies.
@@ -260,15 +264,33 @@ verdict() { printf -v "st_${1//-/_}" '%s' "$2"; printf -v "dt_${1//-/_}" '%s' "$
 state() { local v="st_${1//-/_}"; echo "${!v:-}"; }
 detail() { local v="dt_${1//-/_}"; echo "${!v:-}"; }
 serial() { [[ -f $out/serial.log ]] && tr -d '\r' < "$out/serial.log"; }
+# What the serial log gained since the last call, in slog_new: the line the last call ended part
+# way through, if it did, and the bytes written since. The boot's wait reads the log this way,
+# each byte about once, as a -v boot's log runs to hundreds of KB.
+slog_off=0 slog_last= slog_new=
+serial_read() {
+  local size chunk
+  slog_new=$slog_last
+  [[ -f $out/serial.log ]] || return 0
+  size=$(wc -c < "$out/serial.log" | tr -d ' ')
+  ((size > slog_off)) || return 0
+  # The x keeps a final newline, which command substitution would drop.
+  chunk=$(tail -c +"$((slog_off + 1))" "$out/serial.log" | head -c "$((size - slog_off))" | tr -d '\r'; printf x)
+  slog_new+=${chunk%x}
+  slog_off=$size
+  slog_last=${slog_new##*$'\n'}
+}
 
 # The boot, up to the SSH limit: Ambrosia's stop line, QEMU's exit, or the guest's login.
-stop= ssh_s=
+stop= ssh_s= in_kernel=
 while :; do
-  stop=$(serial | grep -a -m1 -E "^ambrosia: (bad configuration|bad graphics driver|can't read the boot objects|boot failed|exception [0-9]|panic:)")
+  serial_read
+  stop=$(grep -a -m1 -E "^ambrosia: (bad configuration|bad graphics driver|can't read the boot objects|boot failed|exception [0-9]|panic:)" <<< "$slog_new")
   [[ -n $stop ]] && break
+  [[ -n $in_kernel ]] || ! grep -a -q '^ambrosia: entering the kernel' <<< "$slog_new" || in_kernel=1
   kill -0 "$qpid" 2> /dev/null || break
-  if serial | grep -a -q '^ambrosia: entering the kernel' &&
-    timeout 10 sshpass -p "$GUEST_PASS" ssh -n -p "$port" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" true 2> /dev/null; then
+  if [[ -n $in_kernel ]] &&
+    timeout 10 sshpass -p "$GUEST_PASS" ssh -n -p "$port" "${PROBE_SOPTS[@]}" "$GUEST_USER@127.0.0.1" true 2> /dev/null; then
     ssh_s=$(since "$t0")
     break
   fi
