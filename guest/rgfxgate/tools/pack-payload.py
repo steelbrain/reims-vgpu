@@ -2,11 +2,13 @@
 """Pack a signed reims-graphics.bundle directory into a C header RgfxGate embeds.
 
 Emits the bundle's files as byte arrays, the directory list (parents first), and
-the executable's 20-byte code-directory hash (cdhash) that the kext gates
-library-validation and file-map-executable on. Run on a Mac (uses codesign to
-read the cdhash). Output is build output, never committed.
+the code-directory hashes (cdhashes) the kext gates library validation,
+file-map-executable and the signature check on: kExecCDHash, the guest's slice
+of the executable, and kExecCDHashes, every slice's, the guest's first. Run on
+a Mac (uses lipo and codesign to read them). Output is build output, never
+committed.
 
-    pack-payload.py BUNDLE_DIR OUT_HEADER
+    pack-payload.py BUNDLE_DIR OUT_HEADER [ARCH]
 """
 import os, sys, subprocess
 
@@ -47,6 +49,28 @@ cdbytes = bytes.fromhex(cdhash)[:20]
 if len(cdbytes) != 20:
     die("cdhash is not 20 bytes: " + cdhash)
 
+# Every slice of the executable, each with a cdhash of its own: a process maps the slice of its
+# own architecture, so on an arm64 guest the platform processes (arm64e, WindowServer among them)
+# map the arm64e slice and third-party ones (arm64) the arm64 slice. The kext admits each slice's
+# hash (kExecCDHashes), the guest's slice first; the x86-64 bundle has one.
+exec_path = os.path.join(bundle, exec_rel)
+lipo = subprocess.run(["lipo", "-archs", exec_path], capture_output=True, text=True)
+if lipo.returncode != 0:
+    die("could not read the slices of " + exec_path + ": " + lipo.stderr.strip())
+slices = lipo.stdout.split()
+if arch not in slices:
+    die("the executable has no %s slice (it has %s)" % (arch, " ".join(slices)))
+slice_hashes = []
+for a in [arch] + sorted(s for s in slices if s != arch):
+    sd = subprocess.run(["codesign", "--arch", a, "-dvvv", bundle], capture_output=True, text=True)
+    h = next((l.split("=", 1)[1].strip() for l in (sd.stdout + sd.stderr).splitlines()
+              if l.startswith("CDHash=")), None)
+    if not h or len(bytes.fromhex(h)[:20]) != 20:
+        die("could not read the %s slice's CDHash from codesign of %s" % (a, bundle))
+    slice_hashes.append(bytes.fromhex(h)[:20])
+if slice_hashes[0] != cdbytes:
+    die("the %s slice's cdhash differs between two reads" % arch)
+
 files, dirs, marker_rel = [], set(), None
 for root, _, fnames in os.walk(bundle):
     for fn in fnames:
@@ -82,6 +106,11 @@ with open(out, "w") as o:
     w('static const char kExecRel[] = "%s";\n' % exec_rel)
     w('static const char kMarkerRel[] = "%s";\n\n' % marker_rel)
     w("static const uint8_t kExecCDHash[20] = {%s};\n\n" % carr(cdbytes))
+    w("static const uint8_t kExecCDHashes[%d][20] = {\n" % len(slice_hashes))
+    for h in slice_hashes:
+        w("    {%s},\n" % carr(h))
+    w("};\n")
+    w("static const uint32_t kExecCDHashCount = %d;\n\n" % len(slice_hashes))
     w("static const char *const kDirs[] = {\n")
     for d in dir_list:
         w('    "%s",\n' % d)
@@ -100,4 +129,5 @@ with open(out, "w") as o:
     w("static const uint32_t kFileCount = %d;\n\n" % len(files))
     w("} // namespace rgfx_payload\n")
 
-print("pack-payload: %s -> %s (%d files, cdhash %s)" % (bundle, out, len(files), cdhash))
+print("pack-payload: %s -> %s (%d files, cdhash %s, %d slices)" % (bundle, out, len(files), cdhash,
+                                                                 len(slice_hashes)))

@@ -26,9 +26,18 @@ thread_t gInstallThread = nullptr;
 using t_csblob_get_cdhash = const uint8_t *(*)(void *cs_blob);
 static t_csblob_get_cdhash gCsblobGetCdhash = nullptr;
 
+#if defined(__arm64e__)
+// The allowed cdhashes: every slice of the embedded bundle executable's. A process maps the
+// slice of its own architecture, so platform processes (arm64e, WindowServer among them) map the
+// arm64e slice and third-party ones (arm64) the arm64 slice, each with its own cdhash
+// (tools/pack-payload.py).
+static const uint8_t (*const kAllowed)[kRgfxCDHashLen] = rgfx_payload::kExecCDHashes;
+static constexpr size_t kAllowedCount = rgfx_payload::kExecCDHashCount;
+#else
 // The one allowed cdhash: the embedded bundle executable's.
 static const uint8_t (*const kAllowed)[kRgfxCDHashLen] = &rgfx_payload::kExecCDHash;
 static constexpr size_t kAllowedCount = 1;
+#endif
 
 // The directory every install write stays under (the SIP-restricted path).
 static const char kGpuBundlesDir[] = "/Library/GPUBundles";
