@@ -41,7 +41,6 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "RgfxSlabs.hpp"
-#include "RgfxSuperpages.hpp"
 
 // The accelerator's user-client protocol, the kext's own header: its type, its selectors and
 // the kext's own feature bits.
@@ -433,16 +432,8 @@ bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, boo
 	return true;
 }
 
-// The pages source's memory (RgfxPagesMemory): one 2 MiB superpage, zeroed and wired, one run of
-// RAM, asked on the slabs' thread alone (RgfxPagesSlabSource::prepare), one kernel call, so a
-// refusal is safe in a process whose VM guard is on (RgfxSuperpages.hpp).
-int rgfxSuperpages(void *, uint64_t size, uint8_t **bytes)
-{
-	return size == kRgfxSuperpage ? rgfxTakeSuperpage(bytes) : KERN_INVALID_ARGUMENT;
-}
-
-// The pages source's memory where the kernel has no superpage left (RgfxPagesMemory::pages):
-// plain pages, zero-filled, tagged as the superpages are, which the kext's pages block wires.
+// The pages source's memory (RgfxPagesMemory::pages): plain pages, zero-filled, tagged
+// VM_MEMORY_IOACCELERATOR, which the kext's pages block wires.
 int rgfxPlainPages(void *, uint64_t size, uint8_t **bytes)
 {
 	mach_vm_address_t at = 0;
@@ -457,24 +448,6 @@ int rgfxPlainPages(void *, uint64_t size, uint8_t **bytes)
 void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
 {
 	mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(bytes), size);
-}
-
-// The pages source's superpage record (RgfxPagesMemory::record): the kext's, which every process
-// of the guest shares (kRgfxAccelMethodSuperpages, RgfxSuperpageRecord.hpp). Where the call
-// fails, the take asks the kernel, as with no record.
-bool rgfxKextSuperpages(void *context, RgfxPagesMemory::Note note)
-{
-	static_assert(RgfxPagesMemory::kAsk == kRgfxSuperpagesAsk &&
-	                  RgfxPagesMemory::kRefused == kRgfxSuperpagesRefused &&
-	                  RgfxPagesMemory::kGivenBack == kRgfxSuperpagesGivenBack,
-	              "the record's notes are the kext's");
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
-	uint64_t in = note;
-	uint64_t out = 1;
-	uint32_t outCount = 1;
-	kern_return_t kr =
-	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodSuperpages, &in, 1, &out, &outCount);
-	return kr != KERN_SUCCESS || outCount != 1 || out != 0;
 }
 
 void rgfxKextSurfaceRelease(void *context, uint64_t offset)
@@ -885,21 +858,13 @@ RGFX_LOG_UNRECOGNIZED
 	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer, managedAtOffset,
 	                                                     managedOverCopy);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
-	// The slabs whose buffers lie in heaps, and large Shared buffers, are the process's own pages:
-	// the superpage the slabs' thread took ahead, for a 2 MiB slab, else plain pages, wired into
-	// pages blocks the host makes heaps or buffers over, where the region has a pages block source
-	// (above) and the device took HEAP_OVER_PAGES; else the region's.
+	// The slabs whose buffers lie in heaps, and large Shared buffers, are the process's own plain
+	// pages, wired into pages blocks the host makes heaps or buffers over, where the region has a
+	// pages block source (above) and the device took HEAP_OVER_PAGES; else the region's.
 	if (_region->hasPagesBlocks() && (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
 		RgfxPagesMemory memory;
-		memory.superpages = &rgfxSuperpages;
 		memory.pages = &rgfxPlainPages;
 		memory.unmap = &rgfxUnmapPages;
-		// The guest's superpage record, where the kext keeps one: else the slabs' thread asks the
-		// kernel at each prepare.
-		if ((_caps.kextFeatures() & kRgfxKextFeatureSuperpages) != 0) {
-			memory.context = connContext;
-			memory.record = &rgfxKextSuperpages;
-		}
 		_pagesSource = std::make_unique<RgfxPagesSlabSource>(
 		    *_region, *_serializer, memory, [NSProcessInfo processInfo].physicalMemory,
 		    managedAtOffset, managedOverCopy);

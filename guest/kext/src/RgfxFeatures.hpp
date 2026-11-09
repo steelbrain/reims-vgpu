@@ -24,8 +24,8 @@
 //  - MANAGED_AT_OFFSET (bit 14): the bundle places its Managed buffers' CPU copies in heaps over
 //    its blocks (BUFFER_MANAGED_AT_OFFSET, which Submit posts as it posts BUFFER_AT_OFFSET), which
 //    needs nothing more of the kext;
-//  - HEAP_OVER_PAGES (bit 15): the bundle makes its slabs' heaps over pages blocks of one run, its
-//    superpages (HEAP_OVER_PAGES, which Submit checks names a block of the process's, as it does
+//  - HEAP_OVER_PAGES (bit 15): the bundle makes its slabs' heaps over pages blocks of its own pages
+//    (HEAP_OVER_PAGES, which Submit checks names a block of the process's, as it does
 //    BUFFER_OVER_PAGES);
 //  - SUBMIT_ROOM (bit 16): a post that finds a submission ring full sets the ring's
 //    producer_waiting and waits for the host's SUBMIT_ROOM record: the framebuffer's on ring 0,

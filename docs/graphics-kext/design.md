@@ -1076,7 +1076,7 @@ only where no negotiation can carry it.
   Managed buffer whose CPU copy is the first bytes of any Shared buffer over
   the sender's memory, read and written where that buffer's contents lie, so
   the bundle takes a Managed buffer's CPU copy from its Shared slabs, its own
-  superpages among them, on every host ("Managed storage", below). Every host
+  pages among them, on every host ("Managed storage", below). Every host
   offers it, and the kext takes it.
 - Bit 23 is `SMALL_ID_CHUNKS`: ring 0 carries `RESOURCE_ID_SMALL_CHUNK`, a grant
   of 16 texture resource ids, so the kext hands each process its ids 16 at a
@@ -2152,7 +2152,7 @@ the host's import, and the kext's block table holds one entry per slab:
   `MANAGED_BUFFER_SLABS`, a Managed buffer lies in the Shared class of its
   cache and hazard tracking modes: its CPU copy is a Shared buffer of that
   class, made as any (a `BUFFER_AT_OFFSET`, or the `BUFFER_OVER_PAGES` of a
-  larger slab of superpages, below), and the buffer a `MANAGED_BUFFER_CREATE`
+  larger slab of the process's own pages, below), and the buffer a `MANAGED_BUFFER_CREATE`
   over it at an address of its own, so a Managed buffer of any size lies where
   a Shared one of its size does, on every host; its range goes back once the
   copy's destroy follows the buffer's. Without that feature, where the device
@@ -2176,63 +2176,41 @@ the host's import, and the kext's block table holds one entry per slab:
   for a `BLOCK_RELEASE`.
 - Where the host maps a process's own pages (`PAGES_BUFFERS`, and the kext's
   `PagesBlock`) and makes heaps over them (`HEAP_OVER_PAGES`), a heaped slab
-  of 2 MiB is the process's own memory instead: a 2 MiB superpage
-  (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, tagged `VM_MEMORY_IOACCELERATOR`), one run
-  of guest RAM, which the slabs' thread took ahead (below), or where it holds
-  none 2 MiB of plain pages, tagged the same, many runs. Either is wired into
-  a pages block and made one `HEAP_OVER_PAGES`, its buffers placed in it as in
-  a region slab's heap: the host makes the heap over the run where the guest's
-  RAM is mapped, and over plain pages' runs over the block's view, which it
-  makes off ring 0 as a `BUFFER_OVER_PAGES`'s. A larger dedicated Shared slab
-  is plain pages, with no heap: its one buffer is a `BUFFER_OVER_PAGES` over
-  the block's view, or a Managed buffer's CPU copy. A larger Managed slab of a
-  class of its own (no `MANAGED_BUFFER_SLABS`) is the region's, as is a slab
-  where the kernel gives no pages at all or the kext gives no pages block.
-  Plain pages because superpages run out: measured on an x86-64 macOS 26.7.2
-  guest of 8 GiB on the Radeon 780M host, a process got 19 at boot with
-  2.5 GiB free, then `KERN_NO_SPACE`, and none three minutes later; every
-  Shared buffer then lay in the region, where the guest's stores ran at
-  13 MB/s (Decided 5, "The guest maps host memory only"). A queue's upload
-  chunks, the bytes `set*Bytes:` hands in, are Shared buffers of the slabs
-  too. A superpage is asked one at a time: a call for several superpages that
-  runs out partway takes down past what it made on macOS 26.4 and later (xnu's
-  `vm_map_enter` deletes up to the request's end after shrinking its size), a
-  deallocation gap whose `EXC_GUARD` (`DEALLOC_GAP`) is fatal in every process
-  whose VM guard is on: Apple's platform binaries and the hardened browser
-  processes, WebKit's GPU process among them (`src/RgfxSuperpages.hpp`). A
-  slab let go destroys its heap, releases its pages block (the kext answers
-  once the host let go of it, and unwires the pages), then deallocates its
-  pages.
-- Only the slabs' background thread asks the kernel for a superpage, one ahead
-  of the take that uses it: at its start, and after each slab of the process's
-  own pages, where it holds none. A take of a 2 MiB slab uses the one held,
-  and takes plain pages at once where none is; no thread that takes a slab
-  asks the kernel. So a process holds at most one superpage it does not use.
-  Why: the kernel's search for a contiguous 2 MiB (`vm_map_enter`'s superpage
-  path, in `cpm_allocate`, which sleeps as it goes and moves pages to make a
-  run) runs on the thread that asks, given or refused. Sampled with tailspin
-  on the 8 GiB 26.7.2 guest above, when a take asked: WindowServer's main
+  of 2 MiB is the process's own memory instead: 2 MiB of plain pages
+  (`mach_vm_allocate`, tagged `VM_MEMORY_IOACCELERATOR`), which the take asks
+  for, wired into a pages block and made one `HEAP_OVER_PAGES`, its buffers
+  placed in it as in a region slab's heap. The host makes the heap over the
+  block's view, which it makes off ring 0 as a `BUFFER_OVER_PAGES`'s, or over
+  the run where the guest's RAM is mapped where the block is one run. A larger
+  dedicated Shared slab is plain pages too, with no heap: its one buffer is a
+  `BUFFER_OVER_PAGES` over the block's view, or a Managed buffer's CPU copy. A
+  larger Managed slab of a class of its own (no `MANAGED_BUFFER_SLABS`) is the
+  region's, as is a slab where the kernel gives no pages or the kext gives no
+  pages block. Why the process's own pages: in the region the guest's stores
+  ran at 13 MB/s (Decided 5, "The guest maps host memory only"). A queue's
+  upload chunks, the bytes `set*Bytes:` hands in, are Shared buffers of the
+  slabs too. A slab let go destroys its heap, releases its pages block (the
+  kext answers once the host let go of it, and unwires the pages), then
+  deallocates its pages.
+- Plain pages, never superpages (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, 2 MiB of RAM in
+  one run): superpages run out, and asking for one stalls the process, on
+  whatever thread asks. Measured on an x86-64 macOS 26.7.2 guest of 8 GiB on
+  the Radeon 780M host, a process got 19 at boot with 2.5 GiB free, then
+  `KERN_NO_SPACE`, and none three minutes later; each refused ask spent 140 to
+  190 ms in the kernel's search for a contiguous 2 MiB (`vm_map_enter`'s
+  superpage path, in `cpm_allocate`, which sleeps as it goes and moves pages to
+  make a run), sampled with spindump. The search runs with the process's map
+  held: in the public xnu-12377.101.15 source, `vm_map_enter` holds the map's
+  interlock and the new entry locked exclusive across it, and a walk of the
+  map past that entry (`vm_map_region`) waits for it. Sampled with tailspin on
+  that guest: asked on the thread that takes the slab, WindowServer's main
   thread, making a texture over a layer's image as a window moved, was in
   `cpm_allocate` in two samples 100 ms apart, and Safari's page drew no frame
-  for 151 ms.
-- The thread asks the kernel only while the guest's superpage record says it
-  may have one: the kext keeps it for every process (selector 12,
-  `Superpages`, kext feature 1 << 8; `kext/src/RgfxSuperpageRecord.hpp`), open
-  at the kext's start. A superpage the kernel refuses for want of contiguous
-  RAM (`KERN_NO_SPACE`) closes it, and a slab of superpages given back to the
-  kernel opens it; while it is closed every process's thread asks the record
-  alone. A refusal past the wire budget (`KERN_RESOURCE_SHORTAGE`) leaves it
-  as it was. Why: once superpages ran out, each refused ask spent 140 to
-  190 ms in the kernel's search on the 8 GiB 26.7.2 guest above, sampled with
-  spindump, moving the guest's pages for nothing. A process's own memory of a
-  refusal would spare only its later asks. A 16 GiB 26.6.1 guest on the
-  RTX 5080 host gave every superpage asked for at once, and its record stays
-  open. Where the kext lacks the bit, or the call fails, the thread asks the
-  kernel each time, as with no record; the host sees the same pages blocks
-  either way, a superpage's one run or plain pages' many. On the RTX 5080 a
-  heap over a run of guest RAM took 13.4 us and a 4 KiB buffer placed in it
-  1.93 us, where a no-copy buffer over a block's view took 65-75 us, an import
-  of its own (`slab_heap_costs`, `slab_nocopy_costs`).
+  for 151 ms; asked ahead on the slabs' background thread instead, the main
+  thread, making such a texture as a window was resized, waited in
+  `mach_vm_region` behind it, and the page drew no frame for 179 ms. Plain
+  pages are what every slab took once superpages ran out, minutes after a
+  boot.
 - Where no source has memory for a new slab, the process's own empty and
   cached slabs go first, then smaller region slabs are tried down to the
   buffer's size; nil only past that. Any other block of the process's the
@@ -2258,7 +2236,7 @@ host's buffer over the pages is a Shared one, and its `didModifyRange:` and a
 blit's synchronize of it, or of a texture over it, send nothing. Over any other
 memory (read-only, or memory the kext or host makes no pages block of) the buffer lies
 over a range of a slab of its own options, as a device buffer of them does
-("Shared and Managed buffers lie in slabs"): the process's own superpages where
+("Shared and Managed buffers lie in slabs"): the process's own pages where
 the device takes them, so no app-sized copy lies in the region. `contents`
 stays the app's pointer. The range syncs with the memory as the IOSurface copies do
 (Decided 14): from the memory before the commit of each command buffer that uses
@@ -2281,7 +2259,7 @@ the slabs where the device takes `RGFX_FEATURE_MANAGED_BUFFER_SLABS`, else a
 range of a slab ("Shared and Managed buffers lie in slabs") or a region block;
 a texture's a Shared buffer of the slabs where the device takes
 `RGFX_FEATURE_MANAGED_TEXTURE_SLABS`, else a region block. The slabs are the
-process's own superpages where the device takes them, so no app-sized copy
+process's own pages where the device takes them, so no app-sized copy
 lies in the region. The host decides the form from the platform's answer of whether the GPU
 shares the CPU's memory:
 - **Shared memory:** one copy. The buffer is a no-copy buffer over its block,
@@ -3468,7 +3446,6 @@ Map 1:
 | 9 | `SurfaceRetire` | | a queue's writes up to a seqno retire |
 | 10 | `Export`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | names the caller's shared event for other processes ("Shared events across processes") |
 | 11 | `Import`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | makes the caller's new shared event of the one the port names |
-| 12 | `Superpages` | 1 << 8 `Superpages` | the guest's superpage record: whether a process may ask its kernel for superpages ("Shared and Managed buffers lie in slabs") |
 | 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output) | the context and its window; five outputs, or six with its GPU addresses' span |
 | 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
 | 0x102 | `Free` | | frees a block |
@@ -3487,7 +3464,7 @@ the accelerator, which the bundle opens for each event it hands out: 10 and 11
 are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined` and 1 << 8 `Superpages`; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents` and 1 << 7 `WriteCombined`; no other bit yet.
 
 **A GL window: the drawable (type 7) and the window surface (type 0x20).**
 These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its

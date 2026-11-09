@@ -10251,7 +10251,7 @@ void test_no_copy_buffers_in_place()
 
 
 // A no-copy buffer's GPU copy (its shadow) is a range of a slab of its options, as a device
-// buffer's is (RgfxBuffer.h): with the process's superpages as the slabs' first source, the
+// buffer's is (RgfxBuffer.h): with the process's own pages as the slabs' first source, the
 // copies of read-only memory, Shared and Managed, lie in them, seeded from the memory, eight 4 KiB
 // copies a page apart in one heap over one pages block, and the region gives none of them a block
 // of its own (each took one before: the region held every app-sized copy).
@@ -10264,13 +10264,13 @@ void test_no_copy_shadows_lie_in_slabs()
 	RgfxRegion region(mem.data(), mem.size());
 	BlockLog blocks;
 	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
-	// The kernel's superpages, zeroed, and the kext's pages blocks of them, each a block of the
-	// region's a page long.
+	// The kernel's plain pages, zero-filled, and the kext's pages blocks of them, each a block of
+	// the region's a page long.
 	struct Vm {
 		std::map<uint8_t *, std::unique_ptr<uint8_t[]>> held;
 		std::vector<const void *> wired;
 		BlockLog *blocks = nullptr;
-		static int superpages(void *c, uint64_t size, uint8_t **bytes)
+		static int pages(void *c, uint64_t size, uint8_t **bytes)
 		{
 			std::unique_ptr<uint8_t[]> memory(new uint8_t[size]());
 			*bytes = memory.get();
@@ -10291,7 +10291,7 @@ void test_no_copy_shadows_lie_in_slabs()
 	region.setPagesBlockSource(&Vm::block, &vm);
 	RgfxPagesMemory calls;
 	calls.context = &vm;
-	calls.superpages = &Vm::superpages;
+	calls.pages = &Vm::pages;
 	calls.unmap = &Vm::unmap;
 	// As a device that took MANAGED_AT_OFFSET and HEAP_OVER_PAGES makes them.
 	RgfxRegionSlabSource regionSource(region, f.ser, true);
@@ -10316,7 +10316,6 @@ void test_no_copy_shadows_lie_in_slabs()
 	};
 	@autoreleasepool {
 		NSMutableArray<RgfxBuffer *> *held = [NSMutableArray array];
-		CHECK(slabs.step()); // the superpage the slabs' thread takes ahead
 		for (int i = 0; i < 8; i++) {
 			RgfxBuffer *b = noCopy(p + i * 0x1000, 0x1000, MTLResourceStorageModeShared);
 			CHECK(b != nil && [b contents] == p + i * 0x1000 && [b rgfxShadow] != nullptr &&
@@ -10324,18 +10323,16 @@ void test_no_copy_shadows_lie_in_slabs()
 			[held addObject:b];
 		}
 		CHECK(vm.held.size() == 1 && vm.wired.size() == 1 && blocks.allocated.size() == 1);
-		uint8_t *superpage = vm.held.begin()->first;
+		uint8_t *slab = vm.held.begin()->first;
 		auto heap = expectMessage<RgfxHeapOverPages>(f.control, RGFX_CMD_HEAP_OVER_PAGES);
 		CHECK(heap.block_offset == blocks.allocated[0] && heap.size_bytes == 2ull << 20);
 		for (int i = 0; i < 8; i++) {
 			auto at = expectMessage<RgfxBufferAtOffset>(f.control, RGFX_CMD_BUFFER_AT_OFFSET);
 			CHECK(at.obj_id == held[i].rgfxObjId && at.heap_obj_id == heap.obj_id &&
 			      at.offset == static_cast<uint64_t>(i) * 0x1000 && at.length == 0x1000);
-			CHECK(std::memcmp(superpage + at.offset, p + i * 0x1000, 0x1000) == 0);
+			CHECK(std::memcmp(slab + at.offset, p + i * 0x1000, 0x1000) == 0);
 		}
-		// A Managed one's CPU copy lies in a superpage of its own class, placed in its heap: the
-		// next the thread took, after the first slab.
-		CHECK(slabs.step());
+		// A Managed one's CPU copy lies in a slab of its own class, placed in its heap.
 		RgfxBuffer *managed = noCopy(p + 0x8000, 0x2000, MTLResourceStorageModeManaged);
 		CHECK(managed != nil && [managed rgfxShadow] != nullptr &&
 		      ![managed rgfxShadow]->writable());
@@ -10347,7 +10344,7 @@ void test_no_copy_shadows_lie_in_slabs()
 		      mat.offset == 0 && mat.length == 0x2000);
 		uint8_t *copy = nullptr;
 		for (auto &h : vm.held)
-			if (h.first != superpage)
+			if (h.first != slab)
 				copy = h.first;
 		CHECK(copy != nullptr && std::memcmp(copy, p + 0x8000, 0x2000) == 0);
 		// The region's only blocks are the two pages blocks.

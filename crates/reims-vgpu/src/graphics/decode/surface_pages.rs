@@ -78,17 +78,15 @@
 //! The view goes at the block's `BLOCK_RELEASE` or its context's close, once the buffers over it
 //! have let it go.
 //!
-//! **Heaps over pages** (`RGFX_FEATURE_HEAP_OVER_PAGES`). A pages block, a slab of the guest's,
-//! can hold a `HEAP_OVER_PAGES`, the buffers placed in it costing what a heap over host memory's
-//! do. A block of one run, a 2 MiB superpage, holds it over that run where the guest's RAM is
-//! mapped for the host (the memory map's), not over the view, so the platform imports it as it
-//! does guest RAM; the RAM stays mapped as long as the device. A block of more than one run, a
-//! slab of plain pages the guest took where its kernel had no superpage left (most of a guest's
-//! uptime: they run out minutes after its boot), holds it over the block's view, made as a
-//! `BUFFER_OVER_PAGES`'s is, on the surface worker where it is not made yet. Either way the heap
-//! lies over the block, so the block is not released while it lives (its `BLOCK_RELEASE` is
-//! refused), and a context's close lets go of its objects before its pages blocks' views: the view
-//! outlives the heap with no hold of its own.
+//! **Heaps over pages** (`RGFX_FEATURE_HEAP_OVER_PAGES`). A pages block, a slab of the guest's, can
+//! hold a `HEAP_OVER_PAGES`, the buffers placed in it costing what a heap over host memory's do. A
+//! block of one run holds it over that run where the guest's RAM is mapped for the host (the memory
+//! map's), not over the view, so the platform imports it as it does guest RAM; the RAM stays mapped
+//! as long as the device. A block of more than one run, as a guest's slab of plain pages mostly is,
+//! holds it over the block's view, made as a `BUFFER_OVER_PAGES`'s is, on the surface worker where
+//! it is not made yet. Either way the heap lies over the block, so the block is not released while
+//! it lives (its `BLOCK_RELEASE` is refused), and a context's close lets go of its objects before
+//! its pages blocks' views: the view outlives the heap with no hold of its own.
 //!
 //! **By runs.** A cached block (`RGFX_SURFACE_PAGES_CACHED`) on a device that copies the guest's
 //! RAM by its runs ([`GpuDevice::copies_guest_ram`]) takes no view: its `SURFACE_PAGES` checks
@@ -3142,13 +3140,12 @@ pub(super) mod tests {
         assert!(!r.dec.span_in_use(BLOCK, 0x2000));
     }
 
-    /// A pages block of several runs, a slab of plain pages the guest took where its kernel had no
-    /// superpage left, holds a heap over its view, made by the heap where no buffer made it
-    /// before: the heap's bytes are the view's, whose pages are the guest's runs in their order, a
-    /// buffer placed in it lies at the heap's address plus its offset, and the heap records the
-    /// view's bytes for a CPU copy placed in it. The block is in use while the heap lives, so its
-    /// release, which lets go of the view, is refused until the heap's destroy; a heap past the
-    /// view is refused
+    /// A pages block of several runs, a guest's slab of plain pages, holds a heap over its view,
+    /// made by the heap where no buffer made it before: the heap's bytes are the view's, whose
+    /// pages are the guest's runs in their order, a buffer placed in it lies at the heap's address
+    /// plus its offset, and the heap records the view's bytes for a CPU copy placed in it. The
+    /// block is in use while the heap lives, so its release, which lets go of the view, is refused
+    /// until the heap's destroy; a heap past the view is refused
     #[test]
     fn a_pages_block_of_several_runs_holds_a_heap_over_its_view() {
         let mut r = rig(16);

@@ -58,8 +58,6 @@
 #                   the wire round trip of the bundle's ring code against the host's library
 #                   (tests/peer_tests.mm; native arch, this Mac's GPU, never in `make test`):
 #                   build, then run holding the GPU lock. DIST names `cargo xtask dist`'s tree.
-#   make spguard    what the kernel's VM guard makes of one call for several superpages
-#                   (tools/spguard), build/spguard-x86_64, run in a guest.
 #   make clean      remove build/
 #
 # Everything lands in build/, never committed.
@@ -127,7 +125,7 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxRegion.cpp src/RgfxReplyReader.cpp src/RgfxLibraryKey.cpp \
 	src/RgfxCompletionThread.cpp src/RgfxFunctionConstants.cpp \
 	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp src/RgfxKnownPipelines.cpp \
-	src/RgfxSlabs.cpp src/RgfxSuperpages.cpp src/RgfxIcbSlotTable.cpp \
+	src/RgfxSlabs.cpp src/RgfxIcbSlotTable.cpp \
 	src/RgfxLibraryStream.cpp src/RgfxMetallibWriter.cpp src/RgfxGLLowering.cpp \
 	src/RgfxClMode.cpp
 
@@ -574,16 +572,6 @@ $(PIPELINES_LIBDIR)/stamp: tools/pipelines/pipelines.metal Makefile
 	rm -f $(@D)/*.air
 	echo $(PIPELINES_SEED) > $@
 
-# --- the VM guard and several superpages in a call (tools/spguard; spguard.cpp says each case) ---
-# One x86-64 binary, run in a guest, never in `make test`: no Metal.
-SPGUARDBIN = $(BUILD)/spguard-x86_64
-
-spguard: $(SPGUARDBIN)
-
-$(SPGUARDBIN): tools/spguard/spguard.cpp Makefile
-	@mkdir -p $(@D)
-	$(CXX) -arch x86_64 $(CXXFLAGS) -mmacosx-version-min=13.0 tools/spguard/spguard.cpp -o $@
-
 # --- the stitchable reflection's check against Metal's own (tools/reflection_check.mm) ---------
 # One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
 # run on a real device, never in `make test`: it compares with Metal's own compiler's answers.
@@ -616,6 +604,5 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe reflection-check \
-	pipeline-reflection-check peer-test peer-test-build \
-	spguard clean
+	pipeline-reflection-check peer-test peer-test-build clean
 

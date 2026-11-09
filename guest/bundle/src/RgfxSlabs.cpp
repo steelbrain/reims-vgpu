@@ -182,8 +182,8 @@ RgfxPagesSlabSource::RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &ser
 
 bool RgfxPagesSlabSource::serves(uint32_t options, uint64_t size) const
 {
-	// A 2 MiB slab for any heaped class; a larger one, plain pages, only for a Shared buffer of its
-	// own, which BUFFER_OVER_PAGES makes over the view.
+	// A 2 MiB slab for any heaped class; a larger one only for a Shared buffer of its own, which
+	// BUFFER_OVER_PAGES makes over the view.
 	const bool shared = ((options & kStorageMask) >> kStorageShift) == kStorageShared;
 	return heaped(options) && (size == kUnit || shared);
 }
@@ -193,68 +193,24 @@ bool RgfxPagesSlabSource::heapedSlab(const Memory &memory, uint32_t options) con
 	return memory.size == kUnit && heaped(options);
 }
 
-RgfxPagesSlabSource::~RgfxPagesSlabSource()
-{
-	if (m_held != nullptr)
-		giveBack(m_held, kUnit, true);
-}
-
-bool RgfxPagesSlabSource::holdsSuperpage()
-{
-	std::lock_guard<std::mutex> hold(m_heldLock);
-	return m_held != nullptr;
-}
-
-bool RgfxPagesSlabSource::prepare()
-{
-	// One superpage ahead, on the slabs' thread alone, while the record is open: the kernel's
-	// search for a contiguous 2 MiB runs here, never on a thread that takes a slab. A refusal, for
-	// want of contiguous RAM, closes the record for every process.
-	if (holdsSuperpage() || m_memory.superpages == nullptr)
-		return false;
-	if (m_memory.record != nullptr && !m_memory.record(m_memory.context, RgfxPagesMemory::kAsk))
-		return false;
-	uint8_t *bytes = nullptr;
-	const int kr = m_memory.superpages(m_memory.context, kUnit, &bytes);
-	if (kr != KERN_SUCCESS) {
-		if (kr == KERN_NO_SPACE && m_memory.record != nullptr)
-			m_memory.record(m_memory.context, RgfxPagesMemory::kRefused);
-		return false;
-	}
-	std::lock_guard<std::mutex> hold(m_heldLock);
-	m_held = bytes;
-	return true;
-}
-
 bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 {
-	// The superpage prepare took ahead, one run of guest RAM, for a slab of one; else plain pages
-	// at once, which the kext wires as it makes the block (a take never asks the kernel for a
-	// superpage: prepare); and where neither, the region's slab.
+	// Plain pages, which the kext wires as it makes the block; where the kernel has none to give
+	// or the kext no pages block, the region's slab.
 	uint8_t *bytes = nullptr;
-	if (size == 0 || size % kUnit != 0)
-		return false;
-	bool superpages = false;
-	if (size == kUnit) {
-		std::lock_guard<std::mutex> hold(m_heldLock);
-		bytes = m_held;
-		m_held = nullptr;
-		superpages = bytes != nullptr;
-	}
-	if (!superpages && (m_memory.pages == nullptr ||
-	                    m_memory.pages(m_memory.context, size, &bytes) != KERN_SUCCESS))
+	if (size == 0 || size % kUnit != 0 || m_memory.pages == nullptr ||
+	    m_memory.pages(m_memory.context, size, &bytes) != KERN_SUCCESS)
 		return false;
 	RgfxRegion::Block block = m_region.acquirePages(bytes, size, true);
 	if (!block.ok) {
-		giveBack(bytes, size, superpages);
+		m_memory.unmap(m_memory.context, bytes, size);
 		return false;
 	}
 	out->bytes = bytes;
 	out->size = size;
 	out->regionOffset = block.offset;
 	out->blockSize = block.size;
-	out->zeroed = true; // fresh pages of the kernel's, superpages zeroed and plain ones zero-filled
-	out->superpages = superpages;
+	out->zeroed = true; // fresh pages of the kernel's, zero-filled
 	return true;
 }
 
@@ -263,14 +219,7 @@ void RgfxPagesSlabSource::give(const Memory &memory)
 	// The block's release first: the kext answers once the device has let go of it, and unwires
 	// the pages.
 	m_region.release(memory.regionOffset);
-	giveBack(memory.bytes, memory.size, memory.superpages);
-}
-
-void RgfxPagesSlabSource::giveBack(uint8_t *bytes, uint64_t size, bool superpages)
-{
-	m_memory.unmap(m_memory.context, bytes, size);
-	if (superpages && m_memory.record != nullptr)
-		m_memory.record(m_memory.context, RgfxPagesMemory::kGivenBack);
+	m_memory.unmap(m_memory.context, memory.bytes, memory.size);
 }
 
 bool RgfxPagesSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap *out)
@@ -291,8 +240,8 @@ bool RgfxPagesSlabSource::makeBuffer(const Memory &memory, const Heap &heap, uin
 {
 	if (heap.objId != 0)
 		return RgfxRegionSlabSource::makeBuffer(memory, heap, offset, length, options, out);
-	// A dedicated slab larger than 2 MiB, plain pages (offset 0): a Shared buffer over the block's
-	// view, at an address picked for it.
+	// A dedicated slab larger than 2 MiB (offset 0): a Shared buffer over the block's view, at an
+	// address picked for it.
 	RgfxCreated created = m_serializer.createBufferOverPages(length, options, memory.regionOffset,
 	                                                         memory.blockSize, offset);
 	if (created.obj_id == 0 || m_serializer.refused(created))
@@ -582,10 +531,6 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		std::lock_guard<std::mutex> hold(m_lock);
 		made->serial = m_nextSerial++;
 		m_all.insert(made);
-		if (made->source == m_first) {
-			m_prepare = true; // the first source's next superpage, asked on the thread
-			wake = true;
-		}
 		takeIn(made, size, keep, &zero, &at); // a new slab holds it from its first byte
 		if (made->dirty.bytes != 0) {
 			m_dirtySlabs.insert(made);
@@ -824,17 +769,8 @@ bool RgfxSlabs::step()
 		drop(drops);
 		return true;
 	}
-	if (zeroIn == nullptr) {
-		RgfxSlabSource *first = nullptr;
-		{
-			std::lock_guard<std::mutex> hold(m_lock);
-			if (m_prepare && m_first != nullptr) {
-				first = m_first;
-				m_prepare = false;
-			}
-		}
-		return first != nullptr && first->prepare();
-	}
+	if (zeroIn == nullptr)
+		return false;
 	std::memset(zeroIn->memory.bytes + at, 0, length);
 	std::lock_guard<std::mutex> hold(m_lock);
 	zeroIn->free.add(at, length);
@@ -860,8 +796,7 @@ void RgfxSlabs::run()
 		std::unique_lock<std::mutex> hold(m_lock);
 		if (m_stop)
 			return;
-		const bool work =
-		    !m_doomed.empty() || !m_dirtySlabs.empty() || (m_prepare && m_first != nullptr);
+		const bool work = !m_doomed.empty() || !m_dirtySlabs.empty();
 		if (work)
 			continue;
 		const int64_t left = idleWait(nowMs());

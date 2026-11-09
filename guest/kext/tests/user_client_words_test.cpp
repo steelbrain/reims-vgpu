@@ -3,8 +3,7 @@
 // calls and which calls it answers (RgfxIOGPUReplies.hpp), and the user-client protocol the
 // bundle shares (RgfxUserClientABI.hpp): its type, its selectors, each a number every WebKit
 // web-content sandbox allows, the bundle's calls of them, and the features call with the kext's
-// own feature bits; and the superpage record the kext keeps for every process
-// (RgfxSuperpageRecord.hpp).
+// own feature bits.
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -15,7 +14,6 @@
 
 #include "RgfxIOGPUReplies.hpp"
 #include "RgfxPipeNotifications.hpp"
-#include "RgfxSuperpageRecord.hpp"
 #include "RgfxUserClientABI.hpp"
 
 static int g_checks = 0, g_failed = 0;
@@ -136,7 +134,6 @@ static const Selector kSelectors[] = {
 	{"kRgfxAccelMethodTakeAnswers", kRgfxAccelMethodTakeAnswers, false},
 	{"kRgfxAccelMethodSurfaceBlockRelease", kRgfxAccelMethodSurfaceBlockRelease, false},
 	{"kRgfxAccelMethodSurfaceRetire", kRgfxAccelMethodSurfaceRetire, false},
-	{"kRgfxAccelMethodSuperpages", kRgfxAccelMethodSuperpages, false},
 	{"kRgfxAccelMethodOpenContext", kRgfxAccelMethodOpenContext, false},
 	{"kRgfxAccelMethodAlloc", kRgfxAccelMethodAlloc, false},
 	{"kRgfxAccelMethodFree", kRgfxAccelMethodFree, false},
@@ -305,7 +302,6 @@ static void features()
 		kRgfxKextFeatureContextSpan,
 		kRgfxKextFeatureSharedEvents,
 		kRgfxKextFeatureWriteCombined,
-		kRgfxKextFeatureSuperpages,
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
@@ -319,26 +315,6 @@ static void features()
 	CHECK(kRgfxSharedEventUserClientType == 0x52475345);
 	CHECK(kRgfxSharedEventMethodExport == 10);
 	CHECK(kRgfxSharedEventMethodImport == 11);
-	// The superpage record past the port's numbers, and its notes.
-	CHECK(kRgfxAccelMethodSuperpages == 12);
-	CHECK(kRgfxSuperpagesAsk == 0 && kRgfxSuperpagesRefused == 1 && kRgfxSuperpagesGivenBack == 2);
-}
-
-// The guest's superpage record (RgfxSuperpageRecord.hpp): open at the kext's start; a refusal
-// closes it for every asker, an ask leaves it as it is, and a slab of superpages given back opens
-// it again; a note that is none of its own is refused, the record unchanged.
-static void superpageRecord()
-{
-	bool none = false;
-	CHECK(rgfxSuperpagesNote(&none, kRgfxSuperpagesAsk) == 1);
-	CHECK(rgfxSuperpagesNote(&none, kRgfxSuperpagesRefused) == 0 && none);
-	CHECK(rgfxSuperpagesNote(&none, kRgfxSuperpagesAsk) == 0);
-	CHECK(rgfxSuperpagesNote(&none, kRgfxSuperpagesAsk) == 0);
-	CHECK(rgfxSuperpagesNote(&none, 3) == -1 && none);
-	CHECK(rgfxSuperpagesNote(&none, kRgfxSuperpagesGivenBack) == 1 && !none);
-	CHECK(rgfxSuperpagesNote(&none, kRgfxSuperpagesAsk) == 1);
-	CHECK(rgfxSuperpagesNote(&none, ~0ull) == -1 && !none);
-	CHECK(rgfxSuperpagesNote(&none, kRgfxSuperpagesGivenBack) == 1 && !none);
 }
 
 int main()
@@ -350,7 +326,6 @@ int main()
 	protocol();
 	bundleCalls();
 	features();
-	superpageRecord();
 	if (g_failed) {
 		std::fprintf(stderr, "user_client_words_test: %d of %d checks failed\n", g_failed,
 		             g_checks);
