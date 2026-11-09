@@ -37,6 +37,7 @@
 // (ReimsGraphicsMobile.cpp) names it RgfxIOMFBWord.
 typedef graft_iomfb_word RgfxIOMFBWord;
 #include "RgfxLegacySwapLayout.hpp"
+#include "RgfxSwapRate.hpp"
 #endif
 
 #include "RgfxBootConsole.hpp"
@@ -577,6 +578,11 @@ private:
 	void *mobileSwapShowing;
 	IOInterruptEventSource *mobileSwapAnswer;
 	IOWorkLoop *mobileSwapLoop;
+	// What the swaps did over the second now running, logged once it is over (RgfxSwapRate.hpp),
+	// and a second in mach_absolute_time's ticks.
+	RgfxSwapRate mobileSwapRate;
+	UInt64 mobileSecond;
+	void noteMobileSwapRate(UInt64 now);
 #endif
 
 	bool ready;

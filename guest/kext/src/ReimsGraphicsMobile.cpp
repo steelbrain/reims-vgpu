@@ -41,6 +41,7 @@
 
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
+#include <kern/clock.h>
 #include <libkern/libkern.h>
 
 #include "RgfxDisplayIdentity.hpp"
@@ -151,6 +152,8 @@ bool ReimsGraphics::startMobile()
 	mobilePresentSeqno = 0;
 	mobileTransaction = 0;
 	mobileSwapShowing = nullptr;
+	mobileSwapRate.clear();
+	mobileSecond = 0;
 	// The release, by the size of the class this one derives from as the kernel has it.
 	const uint32_t legacySize = IOMobileFramebufferLegacy::gMetaClass.getClassSize();
 	mobileSwapLayout = rgfxLegacySwapLayoutOf(legacySize);
@@ -534,6 +537,9 @@ void ReimsGraphics::beginMobileSwaps()
 			// The class's dropSwap_gated takes the swap off the queue and completes it.
 			if (logged(kSwapDropped))
 				IOLog("ReimsGraphics: swap %p dropped at its state\n", swap);
+			const UInt64 now = mach_absolute_time();
+			noteMobileSwapRate(now);
+			mobileSwapRate.drop(now);
 			rgfxLegacyDropSwap(this, swap, false);
 			continue;
 		}
@@ -558,10 +564,33 @@ void ReimsGraphics::beginMobileSwaps()
 		if (logged(kSwapShown))
 			IOLog("ReimsGraphics: swap %p begun: surface %u, present 0x%x seqno %llu\n", swap, id,
 			      presented, __atomic_load_n(&mobilePresentSeqno, __ATOMIC_RELAXED));
+		const UInt64 now = mach_absolute_time();
+		noteMobileSwapRate(now);
+		mobileSwapRate.begin(now, id, queue.surface(swap, 1) != nullptr,
+		                     presented == kIOReturnSuccess);
 		if (mobileSwapShowing)
 			return;
 		rgfxLegacySwapComplete(this);
+		mobileSwapRate.complete(now);
 	}
+}
+
+// The line of the second of swaps just over, once a swap comes after it: none while the display
+// is idle.
+void ReimsGraphics::noteMobileSwapRate(UInt64 now)
+{
+	if (!mobileSecond)
+		nanoseconds_to_absolutetime(1000000000ull, &mobileSecond);
+	const RgfxSwapRate &r = mobileSwapRate;
+	if (!r.due(now, mobileSecond))
+		return;
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(now - r.start, &ns);
+	IOLog("ReimsGraphics: swaps over %llu ms: %u begun, %u completed, %u dropped, %u not shown, "
+	      "%u with layer 1; layer 0: %u x%u, %u x%u, %u x%u, %u x%u, others x%u\n",
+	      ns / 1000000, r.begun, r.completed, r.dropped, r.unshown, r.layer1, r.ids[0], r.counts[0],
+	      r.ids[1], r.counts[1], r.ids[2], r.counts[2], r.ids[3], r.counts[3], r.others);
+	mobileSwapRate.clear();
 }
 
 void ReimsGraphics::completeMobileSwap()
@@ -575,6 +604,9 @@ void ReimsGraphics::completeMobileSwap()
 	if (queue.current() != swap)
 		return;
 	rgfxLegacySwapComplete(this);
+	const UInt64 now = mach_absolute_time();
+	noteMobileSwapRate(now);
+	mobileSwapRate.complete(now);
 	beginMobileSwaps();
 }
 
