@@ -1877,6 +1877,19 @@ pub(super) mod tests {
                     length: n * self.page,
                 })
                 .collect();
+            self.pages_of_runs(block, context, &runs, length, flags, layout)
+        }
+
+        /// [`Self::pages_laid_out`] of `runs` as the message carries them.
+        pub(crate) fn pages_of_runs(
+            &mut self,
+            block: u64,
+            context: u32,
+            runs: &[RgfxPageRun],
+            length: u64,
+            flags: u32,
+            layout: Option<RgfxSurfacePagesLayout>,
+        ) -> u32 {
             let m = RgfxSurfacePages {
                 header: header(RGFX_CMD_SURFACE_PAGES),
                 context,
@@ -1886,7 +1899,7 @@ pub(super) mod tests {
                 runs_offset: block + 0x1000,
                 length,
             };
-            (self.dec).surface_pages_laid_out(&self.device, &m, &runs, flags, layout)
+            (self.dec).surface_pages_laid_out(&self.device, &m, runs, flags, layout)
         }
 
         /// A `BUFFER_OVER_SURFACE_PAGES` of `length` bytes over the block at `block`.

@@ -252,6 +252,10 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// The other end of each copy: the surface's own pages; `None` for a deferred block whose
     /// pages the kext has not named yet.
     pages: Option<CachePages<P>>,
+    /// A deferred block's carried pages, while its pages are not named
+    /// ([`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`](reims_vgpu_graphics::wire::RGFX_FEATURE_SURFACE_DEFERRED_CARRY)):
+    /// what its first fill copies in, over its make's zeros.
+    carried: Option<Arc<CarriedPages>>,
     /// The surface's bytes.
     length: u64,
     /// The bytes of the surface's texels, where the kext's ask laid the surface out (its
@@ -271,7 +275,7 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// The CPU's generation of the surface the cache's first fill is of, owed from the cache's
     /// make, which made it zeros, until the first fill of the cache or a decode that takes it as
     /// met (the module doc, "Fill"); `None` then, and for a deferred block's cache, which owes
-    /// none.
+    /// none but where it carries pages (generation 0, of them alone).
     first_fill: Option<u64>,
     /// The context of the first buffer over the block while its first fill is owed (`Some(None)`
     /// for one of no context): a command buffer of its with work that may reach the cache with no
@@ -506,6 +510,36 @@ impl CopiedPages {
     }
 }
 
+/// A deferred block's carried pages ([`SurfaceCache::carried`]): each run of its surface's
+/// resident pages as the surface's byte it starts at, its host address in the guest's RAM, which
+/// the kext holds wired until the block's pages are named or its release is answered, and its
+/// bytes, in the surface's order.
+pub(crate) struct CarriedPages {
+    runs: Vec<(u64, HostPtr, u64)>,
+}
+
+impl CarriedPages {
+    /// The carried pages of a surface of `length` bytes, from `runs` (the surface's byte, host
+    /// address, bytes), where each lies in the surface after the one before it and they hold
+    /// some bytes; `None` otherwise.
+    pub(crate) fn new(runs: Vec<(u64, HostPtr, u64)>, length: u64) -> Option<Self> {
+        let mut end = 0u64;
+        for &(at, _, bytes) in &runs {
+            let run_end = at.checked_add(bytes)?;
+            if at < end || bytes == 0 || run_end > length {
+                return None;
+            }
+            end = run_end;
+        }
+        (!runs.is_empty()).then_some(CarriedPages { runs })
+    }
+
+    /// Their bytes.
+    fn bytes(&self) -> u64 {
+        self.runs.iter().map(|&(_, _, bytes)| bytes).sum()
+    }
+}
+
 /// The host's transfer queue, on which every copy runs, and the event its fills signal.
 struct Transfer<P: Platform> {
     /// Unshared ([`new_command_queue_unshared`]): a present of a surface waits for its fill, and
@@ -690,6 +724,8 @@ pub(crate) struct CacheCounts {
     pub(crate) attached: u64,
     /// Of them, pages the host made no view of, or no buffer over, copied instead.
     pub(crate) attached_copied: u64,
+    /// Deferred blocks' caches made carrying pages ([`SurfaceCache::carried`]).
+    pub(crate) carried: u64,
     pub(crate) unattached: u64,
     /// Early copies of caches into their pages, behind a writer of a surface that reads back
     /// ([`SurfaceCaches::early_copies`]), and their bytes.
@@ -814,6 +850,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The device offers `SURFACE_DEFERRED_ASK`: a deferred block asks with its surface's layout
     /// ([`Self::set_deferred_asks`]).
     deferred_asks: bool,
+    /// Whether a deferral may carry its surface's resident pages, as the device offers
+    /// `SURFACE_DEFERRED_CARRY` ([`Self::set_deferred_carries`]).
+    deferred_carries: bool,
     /// The copies of caches into pages asked and not yet landed ([`Self::copies_into`]), those
     /// landed let go of as each is added.
     into_pages: Vec<IntoPages>,
@@ -976,6 +1015,7 @@ impl<P: Platform> SurfaceCaches<P> {
             deferred_budget: 0,
             deferred_bytes: 0,
             deferred_asks: false,
+            deferred_carries: false,
             into_pages: Vec::new(),
             exportable: false,
             owed: HashSet::new(),
@@ -1088,6 +1128,7 @@ impl<P: Platform> SurfaceCaches<P> {
             SurfaceCache {
                 device: cache,
                 pages: Some(pages),
+                carried: None,
                 length,
                 texels: layout.as_deref().map(texel_spans),
                 generation: None,
@@ -1260,10 +1301,14 @@ impl<P: Platform> SurfaceCaches<P> {
     /// A cache of zeros for the deferred block at `block` (the module doc), of `length` bytes,
     /// at the CPU's generation 0, its block `block_size` bytes, its surface laid out as `layout`
     /// where its ask gave it (a device that shares the CPU's memory: [`Self::make`]'s caches of a
-    /// layout): zeroed on the transfer queue, whose fill every use of it waits for. `Ok(false)`,
-    /// with no cache, where the deferred caches' budget has no room for it, or the platform made
-    /// no buffer or no transfer queue for it. A cache the block had goes first, as at a release
-    /// ([`SurfaceCaches::released`]).
+    /// layout): zeroed on the transfer queue, whose fill every use of it waits for. Where it
+    /// `carried` pages (their host addresses in the guest's RAM `host_pages`), it owes a first
+    /// fill of them at generation 0, as a new cache owes one of its pages ([`Self::make`]),
+    /// which the zeroing comes before on the same queue, and their pages are watched until the
+    /// block's are named. `Ok(false)`, with no cache, where the deferred caches' budget has no
+    /// room for it, or the platform made no buffer or no transfer queue for it. A cache the
+    /// block had goes first, as at a release ([`SurfaceCaches::released`]).
+    #[allow(clippy::too_many_arguments)] // the deferral's, and its carried pages
     pub(crate) fn make_deferred(
         &mut self,
         device: &P::Device,
@@ -1271,6 +1316,8 @@ impl<P: Platform> SurfaceCaches<P> {
         length: u64,
         block_size: u64,
         layout: Option<Vec<PagesPlane>>,
+        carried: Option<CarriedPages>,
+        host_pages: Vec<Range<u64>>,
     ) -> RaiseResult<bool> {
         if self.by_block.contains_key(&block) {
             self.released(device, block, 0, None, None, Box::new(|| {}))?;
@@ -1290,18 +1337,21 @@ impl<P: Platform> SurfaceCaches<P> {
             self.counts.deferred_refused += 1;
             return Ok(false);
         };
+        let carries = carried.is_some();
         self.by_block.insert(
             block,
             SurfaceCache {
                 device: cache,
                 pages: None,
+                carried: carried.map(Arc::new),
                 length,
                 texels: layout.as_deref().map(texel_spans),
-                generation: Some(0),
+                // A carrying block holds no generation until its first fill, as a new cache.
+                generation: (!carries).then_some(0),
                 host_read: 0,
                 written: false,
                 filled_at,
-                first_fill: None,
+                first_fill: carries.then_some(0),
                 owner: None,
                 zeros: false,
                 users: HashMap::new(),
@@ -1314,6 +1364,15 @@ impl<P: Platform> SurfaceCaches<P> {
                 life,
             },
         );
+        if carries {
+            let pages = Pages {
+                runs: host_pages,
+                writes: 0,
+            };
+            self.watched.0.lock().insert(block, pages);
+            self.owed.insert(block);
+            self.counts.carried += 1;
+        }
         self.deferred_bytes += length;
         self.counts.made += 1;
         self.counts.deferred += 1;
@@ -1394,6 +1453,7 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.pages = Some(ends);
+            cache.carried = None;
         }
         let pages = Pages {
             runs: host_pages,
@@ -1421,6 +1481,7 @@ impl<P: Platform> SurfaceCaches<P> {
         };
         if let Some(cache) = self.by_block.get_mut(&block) {
             cache.pages = Some(CachePages::Copied(Arc::new(copied)));
+            cache.carried = None;
         }
         let pages = Pages {
             runs: host_pages,
@@ -1463,6 +1524,17 @@ impl<P: Platform> SurfaceCaches<P> {
     /// `SURFACE_DEFERRED_ASK` (a device whose GPU shares the CPU's memory).
     pub(crate) fn set_deferred_asks(&mut self) {
         self.deferred_asks = true;
+    }
+
+    /// Has a deferral carry its surface's resident pages where it has some from now on, as the
+    /// device offers `SURFACE_DEFERRED_CARRY`.
+    pub(crate) fn set_deferred_carries(&mut self) {
+        self.deferred_carries = true;
+    }
+
+    /// Whether a deferral may carry pages ([`Self::set_deferred_carries`]).
+    pub(crate) fn deferred_carries(&self) -> bool {
+        self.deferred_carries
     }
 
     /// Whether a deferred block asks with its surface's layout ([`Self::set_deferred_asks`]).
@@ -2335,9 +2407,9 @@ impl<P: Platform> SurfaceCaches<P> {
         else {
             return Ok(None);
         };
-        // A deferred block's pages, not named yet, hold nothing the cache does not: the CPU has
-        // not locked the surface for writing.
-        if cache.pages.is_none() {
+        // A deferred block's pages, not named yet, hold nothing the cache does not but those it
+        // carried: the CPU has not locked the surface for writing.
+        if cache.pages.is_none() && cache.carried.is_none() {
             return Ok(None);
         }
         let Some(cb) = transfer.queue.command_buffer(ON)? else {
@@ -3114,6 +3186,12 @@ impl<P: Platform> Caches<P> {
         self.state.lock().set_deferred_asks();
     }
 
+    /// Has a deferral carry its surface's resident pages from now on
+    /// ([`SurfaceCaches::set_deferred_carries`]): set once, at the device's make.
+    pub(crate) fn set_deferred_carries(&self) {
+        self.state.lock().set_deferred_carries();
+    }
+
     /// Waits, letting the lock go meanwhile, while a command buffer begun and not finished that
     /// may write the block at `block`'s cache is, or a copy of it asked waits for command buffers
     /// ([`SurfaceCaches::deferred`]): for the block's pages named again, whose buffers made on
@@ -3603,8 +3681,9 @@ impl<P: Platform> Caches<P> {
     }
 
     /// A cache of zeros for the deferred block at `block` ([`SurfaceCaches::make_deferred`]),
-    /// after every command buffer begun and not finished that may write the cache it had, and the
-    /// copies of it asked.
+    /// carrying `carried` where given, after every command buffer begun and not finished that may
+    /// write the cache it had, and the copies of it asked.
+    #[allow(clippy::too_many_arguments)] // the deferral's, and its carried pages
     pub(crate) fn make_deferred(
         &self,
         device: &P::Device,
@@ -3612,10 +3691,14 @@ impl<P: Platform> Caches<P> {
         length: u64,
         block_size: u64,
         layout: Option<Vec<PagesPlane>>,
+        carried: Option<CarriedPages>,
+        host_pages: Vec<Range<u64>>,
     ) -> RaiseResult<bool> {
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
-        state.make_deferred(device, block, length, block_size, layout)
+        state.make_deferred(
+            device, block, length, block_size, layout, carried, host_pages,
+        )
     }
 
     /// The deferred block at `block`'s pages taken for its cache ([`SurfaceCaches::attach`]),
@@ -3919,7 +4002,9 @@ impl<P: Platform> Staging<P> {
 /// through the view, which a refused copy by runs makes now (the module doc; counted in
 /// `counts`); or, for copied pages, through a Shared buffer of the copy's own, which the host's
 /// CPU fills from the pages now for a copy in, and which the caller keeps until the command
-/// buffer completes, then empties into the pages for a copy out ([`Staging::done`]). Where no
+/// buffer completes, then empties into the pages for a copy out ([`Staging::done`]). A deferred
+/// block's carried pages, its pages not named, are copied in the same way, each run to its own
+/// bytes of the cache, the rest left as it is; nothing is copied out of such a cache. Where no
 /// view or buffer can be made, nothing is copied, as where no encoder is.
 fn copy<P: Platform>(
     device: &P::Device,
@@ -4003,6 +4088,38 @@ fn copy<P: Platform>(
             let into = (way == Way::Out).then(|| Arc::clone(copied));
             staged = Some(Staging { buffer, into });
         }
+        if cache.pages.is_none()
+            && way == Way::In
+            && let Some(carried) = &cache.carried
+            && let Some(buffer) =
+                device.new_buffer_of_length(ON, carried.bytes(), STORAGE_SHARED)?
+        {
+            let mut from = 0u64;
+            for &(at, host, bytes) in &carried.runs {
+                // SAFETY: `bytes` of the new buffer's Shared bytes from `from`, which no GPU work
+                // uses yet; the carried pages are the kext's, wired until their block's pages are
+                // named, which drops them from the cache first.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        host.as_ptr::<u8>(),
+                        buffer.contents().as_ptr::<u8>().add(from.to_usize()),
+                        bytes.to_usize(),
+                    );
+                }
+                blit.encode(
+                    ON,
+                    BlitCmd::CopyBufferToBuffer {
+                        source_buffer: Some(&buffer),
+                        source_offset: from,
+                        destination_buffer: Some(&cache.device),
+                        destination_offset: at,
+                        size: bytes,
+                    },
+                )?;
+                from += bytes;
+            }
+            staged = Some(Staging { buffer, into: None });
+        }
     }
     blit.encode(ON, BlitCmd::EndEncoding)?;
     Ok(staged)
@@ -4017,11 +4134,11 @@ mod tests {
         RgfxOpHeader,
     };
     use reims_vgpu_graphics::wire::{
-        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE, RGFX_STATUS_CACHE,
-        RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-        RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED,
-        RGFX_SURFACE_PAGES_DEFERRED, RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun,
-        RgfxQueueCreate, RgfxSurfacePages, RgfxSurfacePagesLayout,
+        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+        RGFX_PAGE_RUN_ZEROS, RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+        RGFX_STATUS_REFUSED, RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_ATTACH,
+        RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED, RgfxMsgHeader, RgfxObjectDestroy,
+        RgfxPageRun, RgfxQueueCreate, RgfxSurfacePages, RgfxSurfacePagesLayout,
     };
     use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
@@ -7389,6 +7506,239 @@ mod tests {
             invalid
         );
         assert!(!r.dec.caches().has(third));
+    }
+
+    /// A rig of [`deferring`]'s whose device lets a deferral carry its surface's resident pages,
+    /// as `SURFACE_DEFERRED_CARRY` has it.
+    fn deferring_carrying(budget: u64) -> Rig {
+        let r = deferring(budget);
+        r.dec.set_deferred_carries();
+        r
+    }
+
+    /// The runs of a carrying deferral of a surface of `pages` pages: each surface page of
+    /// `carried` (the surface's page, a guest RAM page) that page of guest RAM, every other a
+    /// run of zeros.
+    fn carrying_runs(r: &Rig, pages: u64, carried: &[(u64, u64)]) -> Vec<RgfxPageRun> {
+        (0..pages)
+            .map(|at| RgfxPageRun {
+                address: (carried.iter())
+                    .find(|&&(page, _)| page == at)
+                    .map_or(RGFX_PAGE_RUN_ZEROS, |&(_, ram)| RAM + ram * r.page),
+                length: r.page,
+            })
+            .collect()
+    }
+
+    /// A `SURFACE_PAGES` of the deferred block at `block`, of `pages` pages, carrying `carried`
+    /// ([`carrying_runs`]), asking with `layout` where given; its answer.
+    fn defer_carrying(
+        r: &mut Rig,
+        block: u64,
+        pages: u64,
+        carried: &[(u64, u64)],
+        layout: Option<RgfxSurfacePagesLayout>,
+    ) -> u32 {
+        let runs = carrying_runs(r, pages, carried);
+        let ask = if layout.is_some() {
+            RGFX_SURFACE_PAGES_ASK_CACHE
+        } else {
+            0
+        };
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED | ask;
+        r.pages_of_runs(block, 0, &runs, pages * r.page, flags, layout)
+    }
+
+    /// Each copy in `calls`: its source, source offset, destination, destination offset and size.
+    fn copies_at(calls: &[Call]) -> Vec<(u64, u64, u64, u64, u64)> {
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        let at = |a: &Arg| a.as_u64().unwrap_or(u64::MAX);
+        (calls.iter())
+            .filter(|c| c.sel == COPY)
+            .map(|c| {
+                let a = &c.args;
+                (id(&a[0]), at(&a[1]), id(&a[2]), at(&a[3]), at(&a[4]))
+            })
+            .collect()
+    }
+
+    /// A deferral that carries its surface's resident pages is a cache of zeros, with no view,
+    /// that owes a first fill of those pages alone: nothing is copied at the deferral, and the
+    /// first use that reads the cache, at the CPU's generation 0, copies each carried page in at
+    /// its own bytes of the cache, through a Shared buffer the host's CPU filled from the page as
+    /// the fill was made, the rest of the cache left as its zeroing left it. The cache then holds
+    /// generation 0, so a use after it fills nothing
+    #[test]
+    fn a_carrying_deferral_fills_its_pages_in_before_a_read() {
+        let mut r = deferring_carrying(8);
+        let page = r.page;
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            defer_carrying(&mut r, BLOCK, 3, &[(1, 4)], None),
+            RGFX_STATUS_OK
+        );
+        let calls = r.p.call_log().since(mark);
+        let cache = cache_id(&r);
+        assert_eq!(calls.iter().filter(|c| c.sel == FILL).count(), 1, "zeroed");
+        assert!(copies(&calls).is_empty(), "nothing copied at the deferral");
+        assert_eq!(r.dec.views_of_surfaces().len(), (0, 0), "no view");
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.deferred, counts.carried), (1, 1));
+        assert_eq!(r.dec.caches().unattached(BLOCK), Some(3 * page));
+
+        // The page as the fill finds it, written after the deferral.
+        let ram = ram_bytes(&r, 4, page, Some(0x3c));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        let filled = copies_at(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1, "the carried page alone: {filled:?}");
+        let (staging, from, into, at, size) = filled[0];
+        assert_ne!(staging, cache);
+        assert_eq!(
+            (from, into, at, size),
+            (0, cache, page, page),
+            "at its own bytes"
+        );
+        assert_eq!(buffer_bytes(&r, staging, None), ram, "the page's bytes");
+        r.p.world().complete_all(CompleteOn::Caller);
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.fills, counts.made_fills), (1, 1));
+
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 2, 0x101, &[(BLOCK, 0, true)]);
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "generation 0 held"
+        );
+    }
+
+    /// A carrying deferral that asks with its surface's layout fills its carried page in whole,
+    /// as every fill copies every byte in, those beside the rows' texels among them. Its pages,
+    /// named at a CPU lock, are taken for the cache, and the download that follows copies each
+    /// row's texels alone, as an asked cache's downloads do
+    #[test]
+    fn a_carrying_deferral_that_asks_fills_its_pages_in_whole() {
+        let mut r = deferring_carrying(8);
+        r.dec.set_unified_memory(true);
+        r.dec.set_deferred_asks();
+        let page = r.page;
+        let (layout, _) = short_rows(page);
+        r.p.world()
+            .answer_fresh_surfaces(Some("the rows end inside a line".into()));
+        assert_eq!(
+            defer_carrying(&mut r, BLOCK, 2, &[(0, 1)], Some(layout)),
+            RGFX_STATUS_OK
+        );
+        let cache = cache_id(&r);
+        let ram = ram_bytes(&r, 1, page, Some(0x3c));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        let filled = copies_at(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1, "{filled:?}");
+        let (staging, from, into, at, size) = filled[0];
+        assert_eq!(
+            (from, into, at, size),
+            (0, cache, 0, page),
+            "the whole page, the bytes beside its row's texels too"
+        );
+        assert_eq!(buffer_bytes(&r, staging, None), ram);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        assert_eq!(
+            attach(&mut r, BLOCK, 7, &[(1, 2)], 2 * page),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(r.dec.caches().unattached(BLOCK), None);
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let out = copies(&r.p.call_log().since(mark));
+        let pages = out[0].1;
+        assert_ne!(pages, cache);
+        assert_eq!(out, vec![(cache, pages); 2], "each row's texels alone");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// A carrying deferral whose pages are named before anything read its cache still owes its
+    /// first fill, now of all its pages: the carried ones go with the naming, and the first use
+    /// fills the cache from the pages' view, whole
+    #[test]
+    fn a_carrying_deferrals_naming_owes_its_first_fill_of_all_its_pages() {
+        let mut r = deferring_carrying(8);
+        let page = r.page;
+        assert_eq!(
+            defer_carrying(&mut r, BLOCK, 2, &[(0, 1)], None),
+            RGFX_STATUS_OK
+        );
+        let cache = cache_id(&r);
+        assert_eq!(
+            attach(&mut r, BLOCK, 0, &[(1, 2)], 2 * page),
+            RGFX_STATUS_OK
+        );
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        let filled = copies_at(&r.p.call_log().since(mark));
+        assert_eq!(filled.len(), 1, "{filled:?}");
+        let (pages, from, into, at, size) = filled[0];
+        assert_ne!(pages, cache);
+        assert_eq!(
+            (from, into, at, size),
+            (0, cache, 0, 2 * page),
+            "the whole surface, from its pages"
+        );
+    }
+
+    /// A carrying deferral whose runs are not whole guest pages summing to its surface's bytes,
+    /// lie outside the guest's RAM the host maps, or carry no page, is an invalid argument and
+    /// makes nothing; so is a deferral with runs where the device lets none carry. One past the
+    /// budget is refused with nothing made, as any deferral is, so the kext names its pages
+    /// instead
+    #[test]
+    fn a_carrying_deferral_carries_whole_pages_of_its_surface_or_is_refused() {
+        let mut r = deferring_carrying(8);
+        let page = r.page;
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+        let run = |address, length| RgfxPageRun { address, length };
+        let zeros = RGFX_PAGE_RUN_ZEROS;
+        let bad = [
+            vec![run(RAM + page, page)],
+            vec![run(RAM + page, page), run(zeros, page), run(zeros, page)],
+            vec![run(zeros, page), run(zeros, page)],
+            vec![
+                run(RAM + page, page),
+                run(zeros, page - 0x800),
+                run(zeros, 0x800),
+            ],
+            vec![run(RAM + page + 0x800, page), run(zeros, page)],
+            vec![run(RAM + 64 * page, page), run(zeros, page)],
+            vec![run(RAM + page, page), run(zeros, 0), run(zeros, page)],
+        ];
+        for runs in bad {
+            assert_eq!(
+                r.pages_of_runs(BLOCK, 0, &runs, 2 * page, flags, None),
+                RGFX_STATUS_INVALID_ARGUMENT,
+                "{runs:?}"
+            );
+        }
+        assert!(!r.dec.caches().has(BLOCK));
+        assert_eq!(r.dec.caches().counts().deferred, 0);
+
+        let mut plain = deferring(8);
+        assert_eq!(
+            defer_carrying(&mut plain, BLOCK, 2, &[(0, 1)], None),
+            RGFX_STATUS_INVALID_ARGUMENT,
+            "a device that lets no deferral carry"
+        );
+        assert!(!plain.dec.caches().has(BLOCK));
+
+        let mut full = deferring_carrying(1);
+        assert_eq!(
+            defer_carrying(&mut full, BLOCK, 2, &[(0, 1)], None),
+            RGFX_STATUS_REFUSED,
+            "past the budget"
+        );
+        assert!(!full.dec.caches().has(BLOCK));
+        assert_eq!(full.dec.caches().counts().deferred_refused, 1);
     }
 
     /// A deferred block the budget has no room for, or whose cache the platform does not make, is

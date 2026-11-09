@@ -7585,8 +7585,10 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// the CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a device cache
 /// (`SURFACE_CACHE_REFUSED`), keeps none of the rest, defers a fresh one of those that would need
 /// one whatever its pages (`SURFACE_DEFERRED_ASK`), within a quarter of its GPU's own memory's
-/// budget, and has the guest align the surfaces' rows as its GPU's images take them in place (the
-/// device info's `linear_row_alignment`), which a device of no surface pages leaves as they were
+/// budget, the few pages a process wrote of it without a lock carried in
+/// (`SURFACE_DEFERRED_CARRY`, `FEATURES_HI` bit 0), and has the guest align the surfaces' rows as
+/// its GPU's images take them in place (the device info's `linear_row_alignment`), which a device
+/// of no surface pages leaves as they were
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_vulkan::core::testkit::GuestRam;
@@ -7637,7 +7639,15 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_MESH_PIPELINES
             | RGFX_FEATURE_SHARED_EVENT_NAMES
     );
-    assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
+    let carries = want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0;
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
+        if carries {
+            RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+        } else {
+            0
+        }
+    );
     // The fake's GPU shares the CPU's memory: deferred blocks only where they ask.
     let budget = if want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0 {
         FAKE_OWN_MEMORY / 4

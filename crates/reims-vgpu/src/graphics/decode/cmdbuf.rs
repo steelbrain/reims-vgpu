@@ -3795,15 +3795,45 @@ mod tests {
     /// bitstream buffer 2, the H.264 session 40 of a fake host's video, buffer 6 over the block
     /// and textures 7 and 8 over its planes; and what the video is handed.
     fn cached_video() -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
-        use super::super::surface_pages::tests::{BLOCK, rig};
-        use reims_vgpu_graphics::wire::RGFX_STATUS_OK;
+        video_rig(false)
+    }
+
+    /// [`cached_video`]'s rig, its block, where `carrying`, deferred carrying its first page, a
+    /// page of guest RAM, the other a run of zeros, as a decoder's new output with a page its
+    /// process wrote without a lock is (`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`).
+    fn video_rig(carrying: bool) -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
+        use super::super::surface_pages::tests::{BLOCK, RAM, rig};
+        use reims_vgpu_graphics::wire::{
+            RGFX_PAGE_RUN_ZEROS, RGFX_STATUS_OK, RGFX_SURFACE_PAGES_CACHED,
+            RGFX_SURFACE_PAGES_DEFERRED, RgfxPageRun,
+        };
 
         let mut r = rig(8);
         let page = r.page;
-        assert_eq!(
-            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
-            RGFX_STATUS_OK
-        );
+        if carrying {
+            r.dec.set_deferred_budget(8 * page);
+            r.dec.set_deferred_carries();
+            let runs = [
+                RgfxPageRun {
+                    address: RAM + page,
+                    length: page,
+                },
+                RgfxPageRun {
+                    address: RGFX_PAGE_RUN_ZEROS,
+                    length: page,
+                },
+            ];
+            let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+            assert_eq!(
+                r.pages_of_runs(BLOCK, 0, &runs, 2 * page, flags, None),
+                RGFX_STATUS_OK
+            );
+        } else {
+            assert_eq!(
+                r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+                RGFX_STATUS_OK
+            );
+        }
         let queue = RgfxQueueCreate {
             header: RgfxMsgHeader {
                 r#type: RGFX_CMD_QUEUE_CREATE,
@@ -3888,11 +3918,17 @@ mod tests {
     /// output, whose planes' rows are the surface's bytes 32 to 1568. The block's cache owes its
     /// first fill, its zeros done.
     fn cached_video_whole() -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
+        video_whole(false)
+    }
+
+    /// [`cached_video_whole`] of [`video_rig`]'s rig, its block deferred carrying a page where
+    /// `carrying`.
+    fn video_whole(carrying: bool) -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
         use reims_vgpu_graphics::wire::{
             RGFX_SURFACE_FACTS_OFFSET, RGFX_YCBCR_MATRIX_ITU_R_709_2, RgfxSurfaceFacts,
         };
 
-        let (mut r, seen) = cached_video();
+        let (mut r, seen) = video_rig(carrying);
         let facts = RgfxSurfaceFacts {
             surface_pixel_format: u32::from_be_bytes(*b"420v"),
             plane_count: 2,
@@ -3994,6 +4030,47 @@ mod tests {
         assert_eq!((into, out), (0, vec![(32, 1536)]), "the planes' rows alone");
         r.p.world().complete_all(CompleteOn::Caller);
         assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// A decoder's new output deferred carrying a page its process wrote without a lock, a
+    /// command buffer of a decode alone whose textures are the whole of the surface's two planes,
+    /// takes no fill of its cache either: the carried page's first fill is taken as met, as a new
+    /// cache's is, nothing copied in, and the cache holds the use's generation, so a later use of
+    /// it fills nothing
+    #[test]
+    fn a_decode_takes_a_carried_fill_as_met() {
+        let (mut r, seen) = video_whole(true);
+        let cache = video_cache(&r);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(*seen.cached.lock(), [[true, true]], "into the cache");
+        let (into, _) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 0, "no fill");
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (
+                counts.carried,
+                counts.fills,
+                counts.made_fills,
+                counts.decode_firsts
+            ),
+            (1, 0, 0, 1)
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(101, 2, false))
+                .unwrap(),
+            Ok(())
+        );
+        let (into, _) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 0, "generation 0 held");
     }
 
     /// A decoder's new output whose picture fails to land holds the cache's zeros where the

@@ -103,34 +103,34 @@ use reims_vgpu_graphics::wire::{
     RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN, RGFX_LINKED_BINARY_FUNCTIONS,
     RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP, RGFX_LINKED_PRIVATE_FUNCTIONS,
     RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH,
-    RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_PIPELINE_KIND_COMPUTE,
-    RGFX_PIPELINE_KIND_MESH, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
-    RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
-    RGFX_PIPELINE_REFUSED, RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED,
-    RGFX_PRIVATE_RENDER_LOGIC_OPERATION, RGFX_PRIVATE_RENDER_OPENGL_MODE,
-    RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT, RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE,
-    RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_PRIVATE_STATE,
-    RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED, RGFX_RENDER_PIPELINE_SUPPORT_ICB,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT, RGFX_RESOURCE_ID_SMALL_CHUNK,
-    RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS,
-    RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED,
-    RGFX_SURFACE_PAGES_DEFERRED, RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3,
-    RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
-    RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
-    RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
-    RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
-    RgfxCbSubmitted, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
-    RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
-    RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer,
-    RgfxLinkedFunction, RgfxMeshPipelineReflection, RgfxMeshRenderPipelineCreate, RgfxMsgHeader,
-    RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
-    RgfxRenderPipelineCreate, RgfxRenderPipelinePrivateState, RgfxResourceIdChunk,
-    RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue,
-    RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfacePages,
-    RgfxSurfacePagesLayout, RgfxSurfaceWriter, RgfxSurfaceWriters, RgfxTextureCreate,
-    RgfxTextureDescriptor, RgfxTextureFromBuffer, RgfxTextureFromIOSurface, RgfxVertexAttribute,
-    RgfxVertexBufferLayout, RgfxVideoSessionCreate,
+    RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_PAGE_RUN_ZEROS,
+    RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_MESH, RGFX_PIPELINE_KIND_RENDER,
+    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED,
+    RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED, RGFX_PRIVATE_RENDER_LOGIC_OPERATION,
+    RGFX_PRIVATE_RENDER_OPENGL_MODE, RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT,
+    RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE, RGFX_RENDER_PIPELINE_ALPHA_TO_ONE,
+    RGFX_RENDER_PIPELINE_PRIVATE_STATE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
+    RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT,
+    RGFX_RESOURCE_ID_SMALL_CHUNK, RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_STATUS_CACHE,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET,
+    RGFX_SURFACE_NO_WRITERS, RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_ATTACH,
+    RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED, RGFX_SURFACE_PAGES_PRIVATE,
+    RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2,
+    RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER,
+    RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset,
+    RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxCbComplete,
+    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc, RgfxComputePipelineCreate,
+    RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate,
+    RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign,
+    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMeshPipelineReflection,
+    RgfxMeshRenderPipelineCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
+    RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate,
+    RgfxRenderPipelinePrivateState, RgfxResourceIdChunk, RgfxSamplerCreate, RgfxSamplerState,
+    RgfxSharedEventCreate, RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor,
+    RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxSurfaceWriter,
+    RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
 use reims_vgpu_video::core::device_memory::MemoryLife;
 use reims_vgpu_vulkan::core::host::HostPtr;
@@ -1021,6 +1021,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.surface_caches.set_deferred_asks();
     }
 
+    /// Has a deferral carry its surface's resident pages where it has some from now on, as the
+    /// device offers `SURFACE_DEFERRED_CARRY` ([`Self::deferred_surface_pages`]): set once, at
+    /// the device's make.
+    pub(crate) fn set_deferred_carries(&self) {
+        self.surface_caches.set_deferred_carries();
+    }
+
     /// Whether a cached block on `device` is named by its runs, with no view: the device copies
     /// the guest's RAM by them (`surface_pages`, "By runs").
     fn copies_by_runs(&self, device: &P::Device) -> bool {
@@ -1212,8 +1219,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      kext counts them: {} of them written since their last copy, dropped \
                      uncopied ({} MiB), {} copied as taken again; {} copies out not made, the CPU's \
                      generation past the cache's; {} \
-                     deferred, {} refused, {} refused as they might lie in place, {} named \
-                     their pages ({} copied), {} released unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
+                     deferred ({} carrying pages), {} refused, {} refused as they might lie in \
+                     place, {} named their pages ({} copied), {} released unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
                      downloads they answered, {} unread; {} copy by runs, {} copies by runs \
                      refused; {} downloads or releases answered {} ms or more after they were \
                      asked; {} fills made behind the command buffers they followed, {} waits on \
@@ -1226,7 +1233,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
                     d.unheld_released, d.unheld, d.unheld_bytes >> 20, d.retaken, d.behind,
-                    d.deferred, d.deferred_refused, d.deferred_in_place, d.attached,
+                    d.deferred, d.carried, d.deferred_refused, d.deferred_in_place, d.attached,
                     d.attached_copied, d.unattached,
                     d.early, d.early_bytes >> 20, d.early_aside, d.early_read, d.early_unread,
                     d.by_runs, d.runs_refused,
@@ -1411,7 +1418,14 @@ impl<P: Platform> GraphicsDecoder<P> {
     ///   [`RGFX_STATUS_INVALID_ARGUMENT`] for a block with no deferred cache whose pages are not
     ///   named, with no view made.
     ///
-    /// A message with both flags, or without `CACHED`, or a deferred block's with runs, is
+    /// A deferral may carry its surface's resident pages, where the device offers
+    /// `SURFACE_DEFERRED_CARRY`: its runs are the surface's bytes in order, those of pages that
+    /// are not resident [`RGFX_PAGE_RUN_ZEROS`], and its cache owes a first fill of the others
+    /// ([`surface_cache::CarriedPages`]).
+    ///
+    /// A message with both flags, or without `CACHED`, or a deferred block's with runs where the
+    /// device offers no `SURFACE_DEFERRED_CARRY`, or with runs that are not whole guest pages
+    /// summing to the surface, in the guest's RAM the host maps, or that carry none, is
     /// [`RGFX_STATUS_INVALID_ARGUMENT`], and changes nothing; so is a deferred block's that asks
     /// where the device offers no `SURFACE_DEFERRED_ASK`, or with a layout that does not lie in
     /// its bytes, or that does not ask where the device offers it, and pages that ask. `None`,
@@ -1433,11 +1447,14 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
         let ask = flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0;
-        let asks = self.surface_caches.lock().deferred_asks();
+        let (asks, carries) = {
+            let caches = self.surface_caches.lock();
+            (caches.deferred_asks(), caches.deferred_carries())
+        };
         if !cached
             || private
             || (deferred && attach)
-            || (deferred && !runs.is_empty())
+            || (deferred && !runs.is_empty() && !carries)
             || (attach && ask)
             || (deferred && ask != asks)
         {
@@ -1484,6 +1501,23 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Some(planes)
                 }
             };
+            // The pages it carries, where it carries some.
+            let (carried, host_pages) = if runs.is_empty() {
+                (None, Vec::new())
+            } else {
+                let Some((carried, host_pages)) = self.carried_pages(runs, pages.length) else {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "the IOSurface block at {block:#x}: deferred carrying {} runs that are \
+                         not whole guest pages summing to its {:#x} bytes in the guest's RAM, or \
+                         carry none: refused",
+                        runs.len(),
+                        pages.length
+                    );
+                    return Some(RGFX_STATUS_INVALID_ARGUMENT);
+                };
+                (Some(carried), host_pages)
+            };
             if !surface_pages::SurfaceViews::deferred(views, block, settle) {
                 return None;
             }
@@ -1493,6 +1527,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 pages.length,
                 pages.block_size,
                 planes,
+                carried,
+                host_pages,
             );
             return Some(match made {
                 Ok(true) => RGFX_STATUS_OK,
@@ -1593,6 +1629,51 @@ impl<P: Platform> GraphicsDecoder<P> {
             runs.len()
         );
         Some(RGFX_STATUS_REFUSED)
+    }
+
+    /// The pages a carrying deferral's `runs` carry, of a surface of `length` bytes
+    /// ([`Self::deferred_surface_pages`]): each guest page of a run that is not
+    /// [`RGFX_PAGE_RUN_ZEROS`], as the surface's byte it holds, its host address in the guest's
+    /// RAM and its bytes; and their host addresses as runs, which the cache watches. `None` where
+    /// a run is not whole guest pages, they do not sum to the surface's bytes in whole pages, a
+    /// page lies outside the guest's RAM the host maps, or none is carried.
+    fn carried_pages(
+        &self,
+        runs: &[RgfxPageRun],
+        length: u64,
+    ) -> Option<(surface_cache::CarriedPages, Vec<std::ops::Range<u64>>)> {
+        let page = surface_pages::GUEST_PAGE;
+        let whole = length.checked_next_multiple_of(page)?;
+        let mut at = 0u64;
+        let mut carried = Vec::new();
+        let mut named = Vec::new();
+        let views = self.shared.surface_views.lock();
+        for run in runs {
+            if run.length == 0 || !run.length.is_multiple_of(page) {
+                return None;
+            }
+            if run.address != RGFX_PAGE_RUN_ZEROS {
+                if !run.address.is_multiple_of(page) {
+                    return None;
+                }
+                let mut from = at;
+                for (host, bytes) in views.host_pages_in_order(std::slice::from_ref(run))? {
+                    carried.push((from, host, bytes));
+                    from += bytes;
+                }
+                named.push(*run);
+            }
+            at = at.checked_add(run.length)?;
+        }
+        if at != whole {
+            return None;
+        }
+        let host_pages = views.host_runs(&named);
+        drop(views);
+        Some((
+            surface_cache::CarriedPages::new(carried, whole)?,
+            host_pages,
+        ))
     }
 
     /// Gives the block at `block`, whose view of `runs` was just made, or which is named by its

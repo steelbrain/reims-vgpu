@@ -61,14 +61,15 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SHARED_EVENT_NAMES,
     RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
     RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
-    RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
-    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
-    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
-    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
-    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
-    RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState,
-    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxSharedEventName,
-    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
+    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES,
+    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
+    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
+    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
+    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
+    RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup,
+    RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxSharedEventName, RgfxSurfacePages,
+    RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -351,24 +352,29 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     // A host whose GPU shares the CPU's memory keeps a device cache only of the
                     // surfaces whose pages its textures cannot use in place, where the kext asks,
                     // and keeps a fresh one of those in its cache alone where the kext defers it,
-                    // asking.
+                    // asking, the few pages a process wrote of it without a lock carried in.
                     (true, true) => {
                         in_place
                             | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED)
                             | u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK)
+                            | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
                     }
                     // A host that keeps caches keeps fresh surfaces in them alone where the kext
-                    // defers their pages.
+                    // defers their pages, the few a process wrote without a lock carried in.
                     (true, false) => {
                         in_place
                             | u64::from(RGFX_FEATURE_SURFACE_CACHE)
                             | u64::from(RGFX_FEATURE_SURFACE_DEFERRED)
+                            | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
                     }
                 };
             let deferred_budget = deferred_budget(features, gpu_device.own_memory_budget());
             decoder.set_deferred_budget(deferred_budget);
             if features & u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK) != 0 {
                 decoder.set_deferred_asks();
+            }
+            if features & RGFX_FEATURE_SURFACE_DEFERRED_CARRY != 0 {
+                decoder.set_deferred_carries();
             }
             // The processes read the features from the device info, as no register is theirs.
             info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
