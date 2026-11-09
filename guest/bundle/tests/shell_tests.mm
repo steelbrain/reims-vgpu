@@ -2709,7 +2709,8 @@ void test_texture_descriptor_validation_as_the_x86_macs()
 // On a device that answers as an Apple GPU, every texture creator ends the process at Metal's
 // descriptor validation as the M3 Max under macOS 27.0.1 ends it, and goes on at what it makes or
 // answers nil for (kAppleDescriptorCases over kDescriptorCases); the device's and a heap's
-// creators answer nil for a two-plane format and Unspecialized, and a heap's makes a Memoryless
+// creators answer nil for a two-plane format but the XR10 ones (550, 551), which they make, and
+// for Unspecialized, and a heap's makes a Memoryless
 // texture in a Private heap, as the M3's do. Where the device answers no Apple family, the rules
 // stay the x86 Macs'.
 void test_texture_descriptor_validation_as_an_apple_gpu()
@@ -2718,17 +2719,26 @@ void test_texture_descriptor_validation_as_an_apple_gpu()
 	CHECK(rgfxAppleGPU(apple) && !rgfxAppleGPU(nil) &&
 	      !rgfxAppleGPU((id<MTLDevice>)[NSObject new]));
 	// An arm64 guest's device takes an Apple GPU's rules though it answers no Apple family, so
-	// its creators answer nil for a two-plane format (550, which 14.6.1's WindowServer makes)
-	// where the x86 Macs' rules end the process; an x86-64 build keeps the x86 Macs' rules.
+	// its creators answer nil for a two-plane Y'CbCr format (500) where the x86 Macs' rules end the
+	// process, and make one of a two-plane XR10 format (550, which 14.6.1's WindowServer makes);
+	// an x86-64 build keeps the x86 Macs' rules.
 	id<MTLDevice> guest = (id<MTLDevice>)[RgfxGuestRulesDevice new];
 	MTLTextureDescriptor *twoPlane = [MTLTextureDescriptor new];
-	twoPlane.pixelFormat = (MTLPixelFormat)550;
+	twoPlane.pixelFormat = (MTLPixelFormat)500;
 	twoPlane.width = 64;
 	twoPlane.height = 64;
+	MTLTextureDescriptor *xr10 = [MTLTextureDescriptor new];
+	xr10.pixelFormat = (MTLPixelFormat)550;
+	xr10.width = 64;
+	xr10.height = 64;
+	xr10.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	xr10.storageMode = MTLStorageModePrivate;
 #if defined(__arm64__)
-	CHECK(rgfxAppleGPU(guest) && rgfxDeviceMakesNoTextureOf(twoPlane, guest));
+	CHECK(rgfxAppleGPU(guest) && rgfxDeviceMakesNoTextureOf(twoPlane, guest) &&
+	      !rgfxDeviceMakesNoTextureOf(xr10, guest));
 #else
-	CHECK(!rgfxAppleGPU(guest) && !rgfxDeviceMakesNoTextureOf(twoPlane, guest));
+	CHECK(!rgfxAppleGPU(guest) && !rgfxDeviceMakesNoTextureOf(twoPlane, guest) &&
+	      !rgfxDeviceMakesNoTextureOf(xr10, guest));
 #endif
 	for (const DescriptorCase &c : kDescriptorCases) {
 		if (const char *words = appleWords(c)) {
@@ -2748,7 +2758,7 @@ void test_texture_descriptor_validation_as_an_apple_gpu()
 		return d;
 	};
 	for (uint64_t f : kTwoPlaneFormats)
-		CHECK(rgfxDeviceMakesNoTextureOf(ofFormat(f), apple) &&
+		CHECK(rgfxDeviceMakesNoTextureOf(ofFormat(f), apple) == (f != 550 && f != 551) &&
 		      !rgfxDeviceMakesNoTextureOf(ofFormat(f), nil));
 	CHECK(rgfxDeviceMakesNoTextureOf(ofFormat(263), apple));
 	CHECK(!rgfxDeviceMakesNoTextureOf(ofFormat(MTLPixelFormatBGRA8Unorm), apple) &&

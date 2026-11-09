@@ -175,11 +175,19 @@ bool rgfxAppleGPU(id<MTLDevice> _Nullable device);
 bool rgfxBlockCompressedFormat(uint64_t format, id<MTLDevice> _Nullable device);
 
 /// Whether the device's and a heap's texture creators answer nil for `descriptor`, past Metal's
-/// validation, sending nothing: on an Apple GPU, a two-plane format or Unspecialized (263), as the
-/// M3 Max under macOS 27.0.1 answers at both (oracle_texdesc device and heap, fmt.ycbcr500 and
-/// fmt.unspecialized). The x86 Macs end the process at both in the validation.
+/// validation, sending nothing: on an Apple GPU, a two-plane Y'CbCr or RGB format or Unspecialized
+/// (263), as the M3 Max under macOS 27.0.1 answers at both (oracle_texdesc device and heap,
+/// fmt.ycbcr500 and fmt.unspecialized). The two-plane XR10 formats, RGB10A8_2P_XR10 (550) and its
+/// sRGB twin (551), are made: Metal on the M3 Max makes a texture of either of its own memory, as
+/// the Vulkan platform's tests that compare theirs with Metal's make them
+/// (two_plane_xr10_fills_off_a_surface_are_metals, heap_texture_sizes_are_metals), and 14.6.1's
+/// WindowServer, on a display that answers extended range, flattens a window's layers into a
+/// Private one of usage ShaderRead and RenderTarget and ends the process at a nil (read from
+/// SkyLight's determine_required_pixel_format and MetalBacking::PrepareForUse). A buffer's
+/// creator (`overBuffer`) answers nil for them too, as the Vulkan platform makes no texture of
+/// one over a buffer. The x86 Macs end the process at each of them in the validation.
 bool rgfxDeviceMakesNoTextureOf(MTLTextureDescriptor *_Nullable descriptor,
-                                id<MTLDevice> _Nullable device);
+                                id<MTLDevice> _Nullable device, bool overBuffer = false);
 
 /// Ends the process, with Metal's words, where a heap's texture creator ends it after the
 /// descriptor's validation, as the AMD 5300M and the Intel 630 under macOS 26.7.1 end it at a

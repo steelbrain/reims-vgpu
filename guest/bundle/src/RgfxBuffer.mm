@@ -770,7 +770,7 @@ RGFX_RESOURCE_SPI
 	if (descriptor != nil) {
 		const uint64_t f = descriptor.pixelFormat;
 		if (rgfxBlockCompressedFormat(f, self.device) ||
-		    rgfxDeviceMakesNoTextureOf(descriptor, self.device)) {
+		    rgfxDeviceMakesNoTextureOf(descriptor, self.device, /*overBuffer=*/true)) {
 			static std::atomic<bool> logged{false};
 			if (!logged.exchange(true)) {
 				NSLog(@"RGFX: a texture over buffer 0x%llx of format %llu, which "

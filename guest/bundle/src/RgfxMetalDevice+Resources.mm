@@ -82,7 +82,8 @@
 	rgfxEndAtInvalidTextureDescriptor(descriptor, self);
 	if (descriptor != nil && RgfxMakesNoResourceOf(descriptor.resourceOptions))
 		return nil;
-	// None of a two-plane format or Unspecialized on an Apple GPU (rgfxDeviceMakesNoTextureOf).
+	// None of a two-plane format but the XR10 ones, or Unspecialized, on an Apple GPU
+	// (rgfxDeviceMakesNoTextureOf).
 	if (rgfxDeviceMakesNoTextureOf(descriptor, self))
 		return nil;
 	// None of more bytes than maxBufferLength, as the Intel 630 makes none

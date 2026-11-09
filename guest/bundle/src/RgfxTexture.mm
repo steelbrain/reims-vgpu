@@ -717,12 +717,14 @@ bool rgfxBlockCompressedFormat(uint64_t format, id<MTLDevice> device)
 	       (rgfxAppleGPU(device) && rgfxAppleCompressedFormat(format));
 }
 
-bool rgfxDeviceMakesNoTextureOf(MTLTextureDescriptor *descriptor, id<MTLDevice> device)
+bool rgfxDeviceMakesNoTextureOf(MTLTextureDescriptor *descriptor, id<MTLDevice> device,
+                                bool overBuffer)
 {
 	if (descriptor == nil || !rgfxAppleGPU(device))
 		return false;
 	const uint64_t format = descriptor.pixelFormat;
-	return rgfxTwoPlaneFormat(format) || format == 263;
+	const bool xr10 = format == 550 || format == 551; // made but over a buffer (RgfxTexture.h)
+	return (rgfxTwoPlaneFormat(format) && (overBuffer || !xr10)) || format == 263;
 }
 
 // Metal's descriptor validation, `-[MTLTextureDescriptorInternal validateWithDevice:]`, which
@@ -732,13 +734,14 @@ bool rgfxDeviceMakesNoTextureOf(MTLTextureDescriptor *descriptor, id<MTLDevice> 
 // their words and order (oracle_texdesc, 11-09, every case but the 2 GiB and larger ones at the
 // device's, a Private heap's and a Shared buffer's creators): it has every format the x86 Macs
 // lack but Invalid, Depth24Unorm_Stencil8 and X24_Stencil8 (two-plane formats and Unspecialized
-// pass, and the creators answer nil for them, rgfxDeviceMakesNoTextureOf); it makes multisample
-// BGR5A1Unorm and RGB9E5Float textures, depth, stencil and multisample textures in Shared and
-// Managed storage, and Memoryless ones; and its compressed formats, which the type and
-// multisample rules take as the BC ones, include PVRTC, EAC, ETC2 and ASTC. Measured on the AMD 5300M and the Intel 630 under
-// macOS 26.7.1, alike at the device's, a Private heap's and a Shared buffer's creators
-// (oracle_texdesc), over an IOSurface (oracle_surftex, Q20) and in Q12's cases; the two differ
-// only in Depth24Unorm_Stencil8 and X24_Stencil8, which the Intel GPU lacks, as the lane does.
+// pass, and the creators answer nil for them but the XR10 ones, rgfxDeviceMakesNoTextureOf); it
+// makes multisample BGR5A1Unorm and RGB9E5Float textures, depth, stencil and multisample textures
+// in Shared and Managed storage, and Memoryless ones; and its compressed formats, which the type
+// and multisample rules take as the BC ones, include PVRTC, EAC, ETC2 and ASTC. Measured on the AMD
+// 5300M and the Intel 630 under macOS 26.7.1, alike at the device's, a Private heap's and a Shared
+// buffer's creators (oracle_texdesc), over an IOSurface (oracle_surftex, Q20) and in Q12's cases;
+// the two differ only in Depth24Unorm_Stencil8 and X24_Stencil8, which the Intel GPU lacks, as the
+// lane does.
 // Where the x86 Macs and the M3 Max differ (a format the x86 Macs lack, which they name by number
 // and the M3 by name), these are the x86 Macs' words. A sample count of a multisample texture is
 // checked against `device` where it answers supportsTextureSampleCount:, else against the counts
