@@ -25,8 +25,9 @@ fetches nothing.
 ## Making a release
 
 1. Set `VERSION` in the `Makefile` and add the release to `CHANGELOG.md`.
-2. Run `make built`. It builds from a snapshot of the checkout's sources and
-   rewrites this directory. It refuses a version that already has a tag.
+2. Run `make built` from a clean checkout. It builds from a snapshot of the
+   source files on disk, committed or not, and rewrites this directory. It
+   refuses a version that already has a tag.
 3. Commit the version, the changelog and this directory together, and tag
    that commit `v` plus the version.
 4. Run `make check-built` to confirm the tag rebuilds what you committed.

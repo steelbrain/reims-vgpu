@@ -45,7 +45,7 @@ from typing import NamedTuple
 
 # Python's -I leaves the script's own directory off the import path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from consumer import BRANCH_OPCODES, HEADER_SIZE, MAGIC, POINTER, SITE, VERSION, Header
+from consumer import BRANCH_OPCODES, HEADER_SIZE, MAGIC, POINTER, SITE, VERSION_X86_64, Header
 from graft_macho import (
     CPU_TYPE_X86_64,
     LC_SEGMENT_64,
@@ -393,7 +393,7 @@ def read_manifest(raw: bytes) -> tuple[bytes, list[SiteRecord]]:
     header = Header.unpack_from(raw)
     if (header.magic, header.version, header.header_size) != (
         MAGIC,
-        VERSION,
+        VERSION_X86_64,
         HEADER_SIZE,
     ) or not HEADER_SIZE <= header.size <= len(raw):
         raise Error("section holds no staged manifest")

@@ -3,44 +3,53 @@
   "bundle": {
     "Contents/Info.plist": {
       "mode": 420,
-      "sha256": "aa9221c62185214ffcc06ed53e074f4418009cb170dc02c7596cf3effb150cd9",
+      "sha256": "c86955b413fe70e6852aac9cb5698ab8c676e65b9d214be491a65541ed79c4bd",
       "size": 1433
     },
     "Contents/MacOS/Graft": {
       "mode": 493,
-      "sha256": "0a29c2d26219d87941104bd4aef3de836fedcc6824d831bb5de8f8993b16898e",
-      "size": 69552
+      "sha256": "8b15b89f1f361b1c9c6a94bb6a51c3deba19bbe47575e69035d61dfaec65d42f",
+      "size": 69632
     }
   },
   "format": 2,
   "sources": {
-    "Makefile": "95c061bf5b68d2f5c366d26e87961d15a2c1af5c6ccfe1b3defbb8866dedb32f",
-    "sdk/include/graft/Graft.h": "7ce3819e34aab2c8772ced30df2d5f79af495637905d0095cc722a9ec7802602",
-    "src/Binding.h": "5514f3a322bf0188dc618b49ff406fc97d0fa40c2af96460aca5ec30615b6291",
-    "src/Consumer.cpp": "f7aee801981483f608234667f6ca7286d75b7fa56aee965a2b211989865be526",
-    "src/Consumer.h": "67a82d7c7625203914b75486db2269b1c266126a6d82a127989abf1b6e5165a6",
+    "Makefile": "e2b12fe7a7d22651c01aac3bfbce1f49c06f1822bfee7adcca656fb64a98711c",
+    "sdk/include/graft/Graft.h": "a248d23e0b169fb602d5a1ceb9b66cc3f586feb65cb7d053364e8a4c43370072",
+    "src/Binding.h": "f9981e88b752e7245f48804b64cb8791629e5dc55b9dd6e018218fc9c513189a",
+    "src/BindingPlacement.h": "3c3fb121ef04789db69c9fdede8316da3805240d6b78426f158e4d4690ae4a76",
+    "src/Consumer.h": "79961d6a9087d7b976420501b4cbf2ce2de03c480059078820dcc81015e82efb",
+    "src/Fixup.h": "5e5c7c321524006c4c337ce4729b0ebf47d367fb1a07cc20ae7819d383710e44",
+    "src/FixupShared.h": "ae5bc04eb7ea09bc56f7261260e0f563a73503f5c9a53698020cc7fd179003f2",
     "src/Info.plist": "b3d1d3ef234971253994dda75cc1169b8801bddb578baa114e3ca9a570041241",
-    "src/KernelBinding.cpp": "56abc90bbc04aa07e82cdee8f24fffe719cdeea63fe4204bd0b6e9e777dd17b2",
+    "src/KernelBinding.cpp": "b977c3aa1193688512f6a45fe0c210b22d55ea44a82b76cbe5d26a32379f1976",
     "src/KernelBinding.h": "4aa63823caf3189b5e67207576e8621055b94587dd36e7e43e0f8b3135207f9e",
     "src/KernelWrite.h": "5780ad6f502f13bf7295a733404928833e4992b1c201906cea41e36ad2aa686c",
     "src/Layout.h": "e7becb433ef559ec74a354adf85ecefd4ef3d971359e9b2f2bb68f7ec5306dec",
     "src/Log.cpp": "45673799f541afb6f717a1f9da0389f26185da329e4cced4198b91cedaa53840",
     "src/Log.h": "62c109e696442c5bd8866e58bdf0091052d227098690adeeaab9372584c5a207",
     "src/MachO.h": "4c72d4ca2152234a0f1539c757e9c6d8b435626a3956a9a4bf493ef22ccce81c",
-    "src/Manifest.h": "20f0f9e08b01f5165c0abc751d80c07d6baf3f21e089cc7ed8bf5824aa28a606",
+    "src/Manifest.h": "b603b332725305f8a81a36e94d51d3e62be0af1a9fda962b73df9f7144351c91",
     "src/Memory.h": "4496e5e88d870e7d0b30339a291ca3be46eb6ecd0f218792ecadda002c6aa595",
-    "src/Policy.h": "d2e42a2f94db85e31d20517fdf8f139ab1de42a8c0f471282504466f19c0e40d",
-    "src/README.md": "35e6415aa04c2c9564d0a3e73bddabaf75300a8e2adecf804a5f3fec02f9dbdf",
-    "src/Resolve.h": "b827cbdcbd197c4f36e5420649d25688bb79534fc22c5c83dac57672e3f53d75",
-    "src/Route.cpp": "980c264154a5a6f6a218266f2fca81c8b8ddbb80f29d3d7cf58a4acaadda0dfb",
-    "src/Route.h": "224e1e5a914927a46e2905b0f1329459e978d5a3f9137128f062f7466d06ec9b",
-    "src/RuntimeImage.cpp": "39adcc764a89126e1578c9ed7d02a1c0fd4dcc7cded5669db67040f4c3d68d68",
-    "src/RuntimeImage.h": "f8a89fc4ace2a5425b03fa9834cd5489aab0a73652ae1011ceba6dc7da8d1002",
-    "src/Start.cpp": "8628466fa29e78c30815e080f6cef01f1314a6a65b71f991e74fc4e23f8dfcd0",
-    "src/Vtable.h": "2151d10c385161425a63a4501ed823e1f08550e075d1a973700b0e9f075e44f4",
+    "src/Policy.h": "4f00b1ebffaa29b1fca904690e784d8dafd7b640235d4ec231233857db790f17",
+    "src/README.md": "339ddab0e9e6f1fe56f3805738d8d5587c783b85dd160de0e13fc2314909ec1f",
+    "src/Resolve.h": "96dfd37a07af4cfbd43fafb4d20eb93277394b2669faad2573148ddad2e5b896",
+    "src/Route.h": "fb20d6f9ea12b8aa3d82dc1479a5ba17fe99eabc471f9512f6a9493a4a068a3f",
+    "src/RuntimeImage.cpp": "39218263be0c9465e927baa8dac66c596609ddedcdb31d62d3131e2dd03ebbf4",
+    "src/RuntimeImage.h": "013a869e06a2f9072935c02d2d0d0a862a4df25fc1ce298ee7d2cd51fc9b8c7c",
+    "src/Start.cpp": "bb46c31b4e8d2a277bc3df0a8039830c0b7daab9f13ac14bcb22c5c3a914139e",
+    "src/Vtable.h": "34bc8879ad14cad73eab64d70963bc80c57ef04b7ee6de97daa9cd4e3986f2d0",
     "src/WritePlan.h": "e2f16d134b0c0aeea350cafb5bc61a61905a55eb137578183f7a4c4625758a91",
-    "src/x86_64/Fixup.h": "7eac1b2a84f7079d8572a61029e428f09b5d3081c4fab0141aae3a6b80a02a5e",
+    "src/arm64e/BindingPlacement.cpp": "377428ce371a0d07bd7d7155ff95f221e8d40910bd789365cf2b478b94e2e4e6",
+    "src/arm64e/Fixup.h": "56fd74cfe8ae6657dcbeccb0f17450910c9e7a89eaff4959027e30dcaa421454",
+    "src/arm64e/Kernel.cpp": "2bfcec554175f2c84b8efe0b85e85a4e11265723f54e089b5356221d3cd7d10f",
+    "src/arm64e/KernelWrite.cpp": "230340e674653cedad464482dd375fa722cecc2e889f90475b5459ab56ec3283",
+    "src/arm64e/Route.cpp": "5c579911efe7afd419e05208cf51eaf50ed02ee6565c82d8e57262b070867362",
+    "src/x86_64/BindingPlacement.cpp": "2f338b40483121fdb3837ec11797c7e2981b38c7db5631b69c3bfc2ef4c73602",
+    "src/x86_64/Fixup.h": "37642dbdafef828042d8991e14703b5817fa0663c417f77b6eeba403a12fe189",
+    "src/x86_64/Kernel.cpp": "0b8149d4f4c92585f7c360f1a1dabd22fae262ac82685a577e49da334f541ac6",
     "src/x86_64/KernelWrite.cpp": "1ce9c61a625f981a00afff361fe1a82f8395c459e36e4479bd129455d3bbac48",
+    "src/x86_64/Route.cpp": "2f8a04c54153d48ef8394a62226e9fadbe3f8233c104450c44f92761d5d9e713",
     "src/x86_64/X86Route.h": "b883bfe4193b91f69f929c5759523be80e0a2f3e865c3437b8a9fd61d291fe25"
   },
   "toolchain": {
@@ -50,5 +59,5 @@
     "sdk_version": "27.2",
     "xcode": "Xcode 27.2\nBuild version 27B52"
   },
-  "version": "1.0.0"
+  "version": "1.1.0"
 }

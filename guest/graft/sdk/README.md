@@ -81,7 +81,7 @@ Its `src/Info.plist` is an ordinary kext's, with `CFBundleExecutable`
 `OurAccelerator`, `CFBundleVersion` `@VERSION@`, its `IOKitPersonalities`,
 and `com.apple.iokit.IOGraphicsFamily` among its `OSBundleLibraries`. `make`
 writes `build/OurAccelerator.kext`, whose Info.plist keeps the other
-libraries but has no personalities and no IOGraphicsFamily.
+libraries and its personalities, now gated, but no IOGraphicsFamily.
 `measure/binding-probe/` has the same shape, and imports through both a
 pointer and a direct call.
 
@@ -223,9 +223,10 @@ Staging checks its inputs before it creates the output bundle.
   relocations kept, so that the boot linker does not patch its vtable
   against a parent it cannot see. The manifest records each vtable and its
   overridden slots; the inherited slots are not sites.
-- **The Info.plist goes dormant.** Its personalities move into the
-  manifest, each naming the consumer's bundle identifier, and the declared
-  libraries leave `OSBundleLibraries`. Its other dependencies stay.
+- **The Info.plist goes dormant.** Its personalities stay but gain an
+  `IOPropertyMatch` gate on the device nub that Graft opens when it binds, each
+  naming the consumer's bundle identifier, and the declared libraries leave
+  `OSBundleLibraries`. Its other dependencies stay.
 
 ## Commands
 

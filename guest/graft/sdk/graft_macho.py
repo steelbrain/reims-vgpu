@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
-"""Read and edit the thin x86-64 Mach-O files of a consumer's build.
+"""Read and edit the thin x86-64 and arm64e Mach-O files of a consumer's build.
 
 consumer.py reads compiler objects and linked kexts through Image, and stages a kext by
 editing its symbol table in place (Image.localize, Image.rename_symbols). prelink.py reads
 staged kexts. Every offset is checked against the file before it is read or written.
 The module handles what Xcode's clang and ld emit for our kexts, not arbitrary
 architectures or linkers, and raises Error for anything else rather than guessing.
+
+An x86-64 kext records its cross-image references as classic relocations (Image.relocations);
+an arm64e kext records them as a chain of fixups (LC_DYLD_CHAINED_FIXUPS, Image.fixups) whose
+authenticated sites carry their own signing context. Image.arch says which.
 """
 
 from __future__ import annotations
@@ -15,15 +19,19 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import NamedTuple
 
-# <mach-o/loader.h>
+# <mach-o/loader.h> and <mach/machine.h>
 MH_MAGIC_64 = 0xFEEDFACF
 CPU_TYPE_X86_64 = 0x01000007
+CPU_TYPE_ARM64 = 0x0100000C
+CPU_SUBTYPE_MASK = 0xFF000000  # the capability bits above the subtype
+CPU_SUBTYPE_ARM64E = 0x2
 MH_OBJECT = 0x1
 MH_KEXT_BUNDLE = 0xB
 MACH_HEADER_SIZE = 32
 LC_SYMTAB = 0x2
 LC_DYSYMTAB = 0xB
 LC_SEGMENT_64 = 0x19
+LC_DYLD_CHAINED_FIXUPS = 0x80000034  # 0x34 | LC_REQ_DYLD
 SEGMENT_COMMAND_SIZE = 72
 SECTION_HEADER_SIZE = 80
 # A section's type is its flags' low byte. These types have no bytes in the file.
@@ -50,6 +58,16 @@ X86_64_RELOC_BRANCH = 2
 # Indirect-symbol entries that name no symbol.
 INDIRECT_SYMBOL_LOCAL = 0x80000000
 INDIRECT_SYMBOL_ABS = 0x40000000
+
+# <mach-o/fixup-chains.h>. Graft handles only the one shape our arm64e kext link
+# emits (notes/arm64-boot.md): imports as DYLD_CHAINED_IMPORT and sites in the
+# DYLD_CHAINED_PTR_ARM64E_KERNEL pointer format. Both are refused otherwise.
+DYLD_CHAINED_IMPORT = 1
+DYLD_CHAINED_PTR_ARM64E_KERNEL = 7  # stride 4; an unauthenticated target is a vm offset
+DYLD_CHAINED_PTR_START_NONE = 0xFFFF
+CHAINED_STRIDE = 4
+# The arm64e pointer-authentication keys, indexed by a site's two-bit key field.
+ARM64E_KEYS = ("IA", "IB", "DA", "DB")
 
 # LC_DYSYMTAB's symbol groups, in the order the symbol table must hold them.
 LOCAL, EXTERNAL, UNDEFINED = 0, 1, 2
@@ -135,6 +153,38 @@ class Relocation:
     entry_offset: int
 
 
+@dataclass
+class AuthContext:
+    """An arm64e site's pointer-authentication context: the inputs that signed it.
+
+    key indexes ARM64E_KEYS. diversity is the 16-bit discriminator; when addr_div is set the
+    slot's own address is blended into it. Graft re-signs its replacement pointer with these.
+    """
+
+    key: int
+    diversity: int
+    addr_div: bool
+
+
+@dataclass
+class ChainedFixup:
+    """One arm64e chained-fixup site: an 8-byte slot the loader resolves.
+
+    A bind references an imported symbol by name (symbol), with an addend; a rebase targets an
+    address inside the image (target). auth carries the signing context when the slot is
+    authenticated, else None. address is the slot's image address, entry_offset its file offset.
+    """
+
+    address: int
+    entry_offset: int
+    bind: bool
+    symbol: str | None
+    weak: bool
+    addend: int
+    target: int | None
+    auth: AuthContext | None
+
+
 class SymbolTable(NamedTuple):
     """LC_SYMTAB's fields after cmd and cmdsize."""
 
@@ -168,26 +218,32 @@ class DynamicSymbolTable(NamedTuple):
 
 
 class Image:
-    """A thin x86-64 MH_OBJECT or MH_KEXT_BUNDLE, parsed from a copy of its bytes.
+    """A thin x86-64 or arm64e MH_OBJECT or MH_KEXT_BUNDLE, parsed from a copy of its bytes.
 
-    base is the first segment's address, from which the manifest's image offsets count.
+    arch is "x86_64" or "arm64e". base is the first segment's address, from which the
+    manifest's image offsets count.
     """
 
     def __init__(self, data: bytes | bytearray) -> None:
         self.data = bytearray(data)
         self.bounds(0, MACH_HEADER_SIZE)
-        magic, cpu, _, self.filetype, ncmds, sizeofcmds, _, _ = self.unpack("<8I", 0)
-        if (
-            magic != MH_MAGIC_64
-            or cpu != CPU_TYPE_X86_64
-            or self.filetype not in (MH_OBJECT, MH_KEXT_BUNDLE)
-        ):
-            raise Error("expected thin x86-64 object or kext")
+        magic, cpu, subtype, self.filetype, ncmds, sizeofcmds, _, _ = self.unpack("<8I", 0)
+        if cpu == CPU_TYPE_X86_64:
+            self.arch = "x86_64"
+        elif cpu == CPU_TYPE_ARM64 and subtype & ~CPU_SUBTYPE_MASK == CPU_SUBTYPE_ARM64E:
+            self.arch = "arm64e"
+        else:
+            self.arch = ""
+        bundle = self.filetype in (MH_OBJECT, MH_KEXT_BUNDLE)
+        if magic != MH_MAGIC_64 or not self.arch or not bundle:
+            raise Error("expected thin x86-64 or arm64e object or kext")
         self.segments: list[Segment] = []
         self.sections: list[Section] = []
         self.symtab: SymbolTable | None = None
         self.dysymtab: DynamicSymbolTable | None = None
         self.dysymtab_offset = 0
+        self.chained_fixups: tuple[int, int] | None = None
+        self._fixups: list[ChainedFixup] | None = None
         self._read_load_commands(ncmds, sizeofcmds)
         self.symbols = self._read_symbols()
         self.base = self.segments[0].address if self.segments else 0
@@ -212,6 +268,12 @@ class Image:
                     raise Error("invalid dynamic symbol-table command")
                 self.dysymtab = DynamicSymbolTable(*self.unpack("<18I", at + 8))
                 self.dysymtab_offset = at
+            elif command == LC_DYLD_CHAINED_FIXUPS:
+                if length != 16 or self.chained_fixups is not None:
+                    raise Error("invalid chained-fixups command")
+                dataoff, datasize = self.unpack("<2I", at + 8)
+                self.bounds(dataoff, datasize)
+                self.chained_fixups = (dataoff, datasize)
             at += length
         if at != end or self.symtab is None:
             raise Error("incomplete load commands or symbol table")
@@ -381,6 +443,108 @@ class Image:
             *self._read_relocations(table.extreloff, table.nextrel, self.base),
             *self._read_relocations(table.locreloff, table.nlocrel, self.base),
         ]
+
+    def fixups(self) -> list[ChainedFixup]:
+        """Every arm64e chained fixup: an import bind or a local rebase, in image order.
+
+        Reads LC_DYLD_CHAINED_FIXUPS in the one shape our arm64e kext link emits
+        (DYLD_CHAINED_IMPORT imports, DYLD_CHAINED_PTR_ARM64E_KERNEL pointers); any other is
+        refused. An x86-64 image, which has none, raises.
+        """
+        if self.arch != "arm64e":
+            raise Error("chained fixups are read only from an arm64e image")
+        if self.chained_fixups is None:
+            raise Error("arm64e kext has no chained fixups")
+        # The census walks the chain several times; the data is fixed for an
+        # image (an edit builds a new Image), so parse it once and reuse.
+        if self._fixups is not None:
+            return self._fixups
+        base, size = self.chained_fixups
+        version, starts_off, imports_off, symbols_off, count, iformat, sformat = self.unpack(
+            "<7I", base
+        )
+        if version != 0 or iformat != DYLD_CHAINED_IMPORT or sformat != 0:
+            raise Error("unsupported chained-fixups header")
+        imports = self._read_chained_imports(
+            base + imports_off, count, base + symbols_off, base + size
+        )
+        fixups: list[ChainedFixup] = []
+        self.bounds(base + starts_off, 4)
+        seg_count = self.unpack("<I", base + starts_off)[0]
+        self.bounds(base + starts_off + 4, seg_count * 4)
+        for i in range(seg_count):
+            offset = self.unpack("<I", base + starts_off + 4 + i * 4)[0]
+            if offset:
+                self._walk_segment(base + starts_off + offset, imports, fixups)
+        self._fixups = fixups
+        return fixups
+
+    def _read_chained_imports(
+        self, offset: int, count: int, symbols: int, end: int
+    ) -> list[tuple[str, bool]]:
+        """The (name, weak) of each import, by ordinal. A bind's ordinal indexes this."""
+        self.bounds(offset, count * 4)
+        imports = []
+        for i in range(count):
+            entry = self.unpack("<I", offset + i * 4)[0]
+            weak = bool(entry >> 8 & 1)
+            name_offset = entry >> 9  # lib_ordinal:8, weak_import:1, name_offset:23
+            if symbols + name_offset > end:
+                raise Error("chained import name outside the fixups data")
+            imports.append((self.string(symbols + name_offset, end - symbols - name_offset), weak))
+        return imports
+
+    def _walk_segment(
+        self, offset: int, imports: list[tuple[str, bool]], fixups: list[ChainedFixup]
+    ) -> None:
+        """Walk one segment's page chains, appending each decoded fixup."""
+        size, page_size, pointer_format = self.unpack("<IHH", offset)
+        segment_offset = self.unpack("<Q", offset + 8)[0]
+        page_count = self.unpack("<H", offset + 20)[0]
+        if pointer_format != DYLD_CHAINED_PTR_ARM64E_KERNEL:
+            raise Error("unsupported chained pointer format")
+        self.bounds(offset, size)
+        self.bounds(offset + 22, page_count * 2)
+        for page in range(page_count):
+            start = self.unpack("<H", offset + 22 + page * 2)[0]
+            if start != DYLD_CHAINED_PTR_START_NONE:
+                self._walk_chain(segment_offset + page * page_size + start, imports, fixups)
+
+    def _walk_chain(
+        self, address: int, imports: list[tuple[str, bool]], fixups: list[ChainedFixup]
+    ) -> None:
+        """Walk one chain from address, decoding each ARM64E_KERNEL site, until next is 0."""
+        while True:
+            file_offset = self.file_offset(address, 8)
+            raw = struct.unpack_from("<Q", self.data, file_offset)[0]
+            auth = bool(raw >> 63 & 1)
+            context = None
+            if auth:
+                context = AuthContext(
+                    key=raw >> 49 & 3, diversity=raw >> 32 & 0xFFFF, addr_div=bool(raw >> 48 & 1)
+                )
+            if raw >> 62 & 1:  # bind
+                ordinal = raw & 0xFFFF
+                if ordinal >= len(imports):
+                    raise Error("chained bind ordinal outside the import table")
+                name, weak = imports[ordinal]
+                addend = 0 if auth else self._sign_extend(raw >> 32 & 0x7FFFF, 19)
+                fixups.append(
+                    ChainedFixup(address, file_offset, True, name, weak, addend, None, context)
+                )
+            else:  # rebase: an unauthenticated target is a vm offset from the image base
+                target = self.base + (raw & 0xFFFFFFFF if auth else raw & 0x7FFFFFFFFFF)
+                fixups.append(
+                    ChainedFixup(address, file_offset, False, None, False, 0, target, context)
+                )
+            nxt = raw >> 51 & 0x7FF
+            if not nxt:
+                return
+            address += nxt * CHAINED_STRIDE
+
+    @staticmethod
+    def _sign_extend(value: int, bits: int) -> int:
+        return value - (1 << bits) if value & (1 << (bits - 1)) else value
 
     def localize(self, definitions: dict[str, tuple[int, int]]) -> Image:
         """Turn undefined symbols into private local definitions, editing the bytes in place.

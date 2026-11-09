@@ -256,14 +256,19 @@ Stages:
     (`guest/graft/sdk/consumer.mk`): its System-collection imports point at
     placeholders inside the kext, and it carries a manifest
     (`__DATA,__graft`) of every imported site and of the library classes it
-    derives from, with no personalities and no System-collection
-    `OSBundleLibraries`. OpenCore links that dormant kext in the Boot
-    collection. Graft (`guest/graft`, a copy of Graft's committed build)
-    starts from its own kext start. At a catalogue send after the
+    derives from, with no System-collection `OSBundleLibraries`. Its
+    personalities stay, each gated by an `IOPropertyMatch` requiring
+    `com.steelbrain.ReimsGraphics.graft-bound` on the device nub, and the
+    manifest names the device (its `IOPCIPrimaryMatch`). OpenCore links that
+    dormant kext in the Boot collection. Graft (`guest/graft`, a copy of
+    Graft's release build) starts from its own kext start. Once the
     libraries are registered, it checks each parent class's size and vtable
     against the running library, resolves each site by name, writes the
-    sites and vtables, and publishes ReimsGraphics' personalities, so
-    IOKit's matching starts it. On a missing symbol or a layout that
+    sites and vtables, then sets the gate property on the 1234:5247 nub and
+    registers the nub again. Until then the passive property match fails,
+    so IOKit does not even construct ReimsGraphics' classes, whose parent
+    constructors run through the sites (an `IOResourceMatch` would hold
+    back only `start()`). On a missing symbol or a layout that
     differs, Graft declines ReimsGraphics by name in its log and in the
     registry root's `GraftClient.com.steelbrain.ReimsGraphics`, and the
     guest boots on. The image carries the set `make -C guest set` builds,
