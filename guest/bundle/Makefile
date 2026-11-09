@@ -402,9 +402,18 @@ peer-test: $(PEER_TESTBIN)
 
 bundle: $(BUNDLEBIN)
 
+# arm64e: the linker's message-send stubs (__objc_stubs) in their small form, which branch to
+# objc_msgSend's own stub. In their default form each loads objc_msgSend from a slot of the
+# authenticated GOT of its own, and ld (ld-27106.1) then makes two slots for objc_msgSend, one
+# for those stubs and one for its call stub, and gives each its slot in either order from one
+# link to the next: the bundle's bytes, and so RgfxGate's, alternated between two builds of one
+# tree (measured on the M3 Max, 2026-11-08; docs/lessons.md). One slot, one build.
+BUNDLE_LDFLAGS = $(if $(filter arm64e,$(ARCH)),-Wl$(comma)-objc_stubs_small)
+comma := ,
+
 $(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) $(VIDEO_OBJ_ARCH) Makefile
 	@mkdir -p $(@D)
-	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) \
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) $(BUNDLE_LDFLAGS) \
 		-bundle -undefined dynamic_lookup $(FRAMEWORKS) $(PRIVFW) \
 		$(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) $(VIDEO_OBJ_ARCH) -o $@
 	@echo "$(notdir $@): $$(cat src/*.mm | grep -o 'RGFX_UNSUPPORTED[A-Z_]*(' | wc -l | tr -d ' ')" \
