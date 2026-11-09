@@ -64,7 +64,7 @@ VERSION_X86_64 = 2
 VERSION_ARM64E = 3
 NO_FALLBACK = (1 << 64) - 1
 IMPORT_WEAK = 1
-HEADER = struct.Struct("<28I")
+HEADER = struct.Struct("<34I")
 HEADER_SIZE = HEADER.size
 LIBRARY = struct.Struct("<2I")  # identifier, anchor
 IMPORT = struct.Struct("<4IQ")  # library, first candidate, candidate count, flags, fallback
@@ -83,6 +83,16 @@ OVERRIDE = struct.Struct("<I")  # parent slot index
 # (src/Manifest.h, Segment and Fill). A version-2 manifest carries neither.
 SEGMENT = struct.Struct("<QQII")  # origin, size, name, reserved
 FILL = struct.Struct("<IHBB")  # slot, diversity, opcode, reserved
+# The arm64e synthesis tables (src/Manifest.h, SynthClass and SynthOverride): a
+# consumer subclass of a header-less, per-release-variable parent whose vtable Graft
+# builds by method identity at bind. A version-2 manifest carries none.
+SELECTOR = struct.Struct("<I")  # a selector string offset
+# impl, first selector, selector count, diversity, opcode, flags, reserved
+SYNTH_OVERRIDE = struct.Struct("<QIIHBBI")
+SYNTH_REQUIRED = 1
+# vtable offset, name, parent, sibling, library, vtable slot cap, parent region,
+# first override, override count
+SYNTH_CLASS = struct.Struct("<Q8I")
 
 # A site's opcode: 0 for an eight-byte pointer, or the opcode before a branch's rel32.
 POINTER = 0
@@ -138,18 +148,21 @@ class Header(NamedTuple):
     overrides: Table
     segments: Table
     fills: Table
+    selectors: Table
+    synth_overrides: Table
+    synth_classes: Table
     gate: int
     device: int
 
     @classmethod
     def unpack_from(cls, data: bytes | bytearray, offset: int = 0) -> Header:
         words = HEADER.unpack_from(data, offset)
-        tables = [Table(*words[i : i + 2]) for i in range(4, 26, 2)]
-        return cls(*words[:4], *tables, *words[26:])
+        tables = [Table(*words[i : i + 2]) for i in range(4, 32, 2)]
+        return cls(*words[:4], *tables, *words[32:])
 
     def pack(self) -> bytes:
-        tables = [word for table in self[4:15] for word in table]
-        return HEADER.pack(*self[:4], *tables, *self[15:])
+        tables = [word for table in self[4:18] for word in table]
+        return HEADER.pack(*self[:4], *tables, *self[18:])
 
 
 @dataclass
@@ -200,6 +213,39 @@ class Vtable:
     fills: list[tuple[int, int, int]] = field(default_factory=list)
 
 
+@dataclass
+class SynthOverrideRecord:
+    """One override of a synthesized class (arm64e).
+
+    selectors are its mangled forms, composed + resolved against the parent (then the
+    sibling) at bind; the first is the consumer's own override symbol, any others declared
+    alternatives for per-release parameter drift. impl is the override function's image
+    offset. diversity and opcode are the signing context the consumer's own build gave the
+    slot. required marks an override the synthesis must place or refuse the bind: a pure
+    parent slot, or one of the consumer's own methods its declaration does not name.
+    """
+
+    selectors: list[str]
+    impl: int
+    diversity: int
+    opcode: int
+    required: bool
+
+
+@dataclass
+class SynthClassRecord:
+    """A synthesized consumer class: its own vtable and refuse bounds, and its overrides."""
+
+    name: str
+    parent_class: str
+    sibling_class: str
+    library: int
+    vtable_offset: int
+    vtable_slot_cap: int
+    parent_region: int
+    overrides: list[SynthOverrideRecord]
+
+
 class Census(NamedTuple):
     """What the manifest records about a linked consumer."""
 
@@ -207,6 +253,7 @@ class Census(NamedTuple):
     sites: list[Site]
     vtables: list[Vtable]
     segments: list[tuple[str, int, int]]
+    synth: list[SynthClassRecord]
 
 
 def identifier(name: str) -> str:
@@ -225,6 +272,26 @@ def owner_class(name: str) -> str | None:
     """The top-level class whose member, vtable or typeinfo the Mach-O symbol name is."""
     match = re.match(r"__(?:ZNK?|ZT[VIS])(\d+)(.*)", name)
     return match[2][: int(match[1])] if match else None
+
+
+def member_name(symbol: str) -> str | None:
+    """The first member-name component of a nested-name mangled symbol, or None.
+
+    For `__ZN <cv> <ref> <len><class> <len><method> ...` it returns <method>: the component
+    that identifies which method a vtable slot holds, so a synthesized consumer's override
+    slot matches the method name its declaration names. Only plain length-prefixed components
+    are read; a non-member or substitution/operator form returns None.
+    """
+    match = re.match(r"__ZN[KVr]*[RO]?(\d+)", symbol)
+    if not match:
+        return None
+    after_class = match.end() + int(match.group(1))
+    method = re.match(r"(\d+)", symbol[after_class:])
+    if not method:
+        return None
+    start, length = after_class + method.end(), int(method.group(1))
+    name = symbol[start : start + length]
+    return name if len(name) == length else None
 
 
 def read_declaration(path: Path) -> Declaration:
@@ -254,6 +321,24 @@ def read_declaration(path: Path) -> Declaration:
         identifier(consumer["name"])
         if not consumer.get("header") or not 0 <= consumer["parent"] < len(classes):
             raise Error("consumer class has no header or parent")
+    # A synthesized consumer subclasses a header-less, per-release-variable parent through
+    # the SDK stand-in; its vtable is built at bind by method identity, so it declares its
+    # overrides by method name (with a required flag and per-release selector alternatives)
+    # rather than by slot. parent indexes the declared classes (the stand-in); sibling is a
+    # class name Graft composes a pure slot's symbol under.
+    for synth in config.get("synthesized", []):
+        identifier(synth["name"])
+        if not synth.get("header") or not 0 <= synth["parent"] < len(classes):
+            raise Error("synthesized class has no header or parent")
+        if "sibling" in synth:
+            identifier(synth["sibling"])
+        overrides = synth.get("overrides")
+        if not isinstance(overrides, dict) or not overrides:
+            raise Error("synthesized class must declare its overrides")
+        for spec in overrides.values():
+            for selector in spec.get("selectors", []):
+                if not isinstance(selector, str) or not selector or "\0" in selector:
+                    raise Error("synthesized override selector must be a symbol name")
     return config
 
 
@@ -266,9 +351,11 @@ def probe_layouts(config: Declaration, flags: list[str]) -> Layouts:
     except for the destructors, which name the subclass and map back to the parent.
     """
     parents = config.get("classes", [])
-    rows = parents + config.get("consumers", [])
+    consumers = config.get("consumers", [])
+    synthesized = config.get("synthesized", [])
+    rows = parents + consumers + synthesized
     if not rows:
-        return {"classes": [], "consumers": []}
+        return {"classes": [], "consumers": [], "synthesized": []}
     image, dump = compile_probe(probe_source(rows), flags)
     entries = {
         int(i): int(count)
@@ -285,7 +372,12 @@ def probe_layouts(config: Declaration, flags: list[str]) -> Layouts:
         }
         for i, row in enumerate(rows)
     ]
-    return {"classes": layouts[: len(parents)], "consumers": layouts[len(parents) :]}
+    nparents, nconsumers = len(parents), len(consumers)
+    return {
+        "classes": layouts[:nparents],
+        "consumers": layouts[nparents : nparents + nconsumers],
+        "synthesized": layouts[nparents + nconsumers :],
+    }
 
 
 def probe_source(rows: list[dict[str, Any]]) -> str:
@@ -415,8 +507,9 @@ def census(image: Image, config: Declaration, layouts: Layouts) -> Census:
     """
     if image.filetype != MH_KEXT_BUNDLE:
         raise Error("consumer must be linked as a kext")
-    declared = [[row["name"] for row in config.get(key, [])] for key in ("classes", "consumers")]
-    measured = [[row["name"] for row in layouts[key]] for key in ("classes", "consumers")]
+    keys = ("classes", "consumers", "synthesized")
+    declared = [[row["name"] for row in config.get(key, [])] for key in keys]
+    measured = [[row["name"] for row in layouts.get(key, [])] for key in keys]
     if declared != measured:
         raise Error("layouts describe another declaration")
     imports = select_imports(config, image)
@@ -424,14 +517,18 @@ def census(image: Image, config: Declaration, layouts: Layouts) -> Census:
         fixups = image.fixups()
         sited = {f.address: f for f in fixups}
         vtables, parent_slots = consumer_vtables_arm64e(image, config, layouts, sited)
+        synth, synth_slots = consumer_synthesized_arm64e(image, config, layouts, sited)
+        parent_slots |= synth_slots
         sites = import_sites_arm64e(image, imports, fixups, parent_slots)
         segments = consumer_segments(image)
     else:
+        if config.get("synthesized"):
+            raise Error("synthesis is supported only for arm64e")
         relocations = image.relocations()
         vtables, parent_slots = consumer_vtables(image, config, layouts, relocations)
         sites = import_sites(image, imports, relocations, parent_slots)
-        segments = []
-    return Census(imports, sites, vtables, segments)
+        segments, synth = [], []
+    return Census(imports, sites, vtables, segments, synth)
 
 
 def consumer_segments(image: Image) -> list[tuple[str, int, int]]:
@@ -653,6 +750,100 @@ def consumer_vtables_arm64e(
     return sorted(vtables, key=lambda vtable: vtable.offset), parent_slots
 
 
+def consumer_synthesized_arm64e(
+    image: Image, config: Declaration, layouts: Layouts, sited: dict[int, Any]
+) -> tuple[list[SynthClassRecord], set[int]]:
+    """Each synthesized class's manifest record, and the addresses of its inherited slots.
+
+    A synthesized consumer subclasses a header-less, per-release-variable parent through the
+    SDK stand-in; Graft builds its vtable at bind by method identity, not by declared slot.
+    Each override's primary selector is its own slot's method symbol, and its impl and
+    signing context come from that slot's local-rebase fixup. Every parent slot holding one
+    of the consumer class's own methods is an override: the declared ones take their
+    declaration's required flag and selector alternatives, and the rest -- the destructors
+    and getMetaClass that OSDefineMetaClassAndStructors defines, which a declaration cannot
+    key by method name -- are required, so a bind refuses rather than leave the parent's
+    method in their place. A local rebase to code the stand-in defines (its reserved pad
+    stubs) is not an override. The inherited slots are binds to provider-owned parent
+    methods; their addresses are returned so census excludes them from the import sites
+    (Graft fills them by synthesis, not import-binding), exactly as the regular consumer
+    vtable flow does. The record's vtable offset is the image offset of the consumer's
+    __ZTV word 0, which Graft fills from (src/Manifest.h, SynthClass).
+    """
+    records, parent_slots = [], set()
+    classes = config.get("classes", [])
+    for synth, layout in zip(
+        config.get("synthesized", []), layouts.get("synthesized", []), strict=True
+    ):
+        symbol = image.symbol(vtable_name(synth["name"]))
+        parent_layout = layouts["classes"][synth["parent"]]
+        inherited = len(parent_layout["slots"])
+        count = len(layout["slots"])
+        if count < inherited or image.symbol_extent(symbol) < (count + 2) * POINTER_SIZE:
+            raise Error("synthesized consumer vtable is shorter than its compiler layout")
+        declared = synth["overrides"]
+        found: dict[str, tuple[str, Any]] = {}
+        undeclared: list[tuple[str, Any]] = []
+        for slot in range(count):
+            address = symbol.value + VTABLE_ADDRESS_POINT + slot * POINTER_SIZE
+            fixup = sited.get(address)
+            if fixup is None or fixup.bind:
+                if slot < inherited:
+                    parent_slots.add(address)  # an inherited parent-method bind
+                continue
+            if not executable(image, fixup.target):
+                raise Error("synthesized override does not point to its executable code")
+            method = layout["slots"][slot]
+            if slot >= inherited or owner_class(method) != synth["name"]:
+                continue
+            name = member_name(method)
+            if name in declared:
+                if name in found:
+                    raise Error("synthesized override method is ambiguous")
+                found[name] = (method, fixup)
+            else:
+                undeclared.append((method, fixup))
+        overrides = []
+        for method, spec in declared.items():
+            if method not in found:
+                raise Error(f"synthesized override {method} is not the consumer's own method")
+            selector, fixup = found[method]
+            opcode, diversity = auth_trailer(fixup.auth)
+            overrides.append(
+                SynthOverrideRecord(
+                    selectors=[selector, *spec.get("selectors", [])],
+                    impl=fixup.target - image.base,
+                    diversity=diversity,
+                    opcode=opcode,
+                    required=bool(spec.get("required", False)),
+                )
+            )
+        for selector, fixup in undeclared:
+            opcode, diversity = auth_trailer(fixup.auth)
+            overrides.append(
+                SynthOverrideRecord(
+                    selectors=[selector],
+                    impl=fixup.target - image.base,
+                    diversity=diversity,
+                    opcode=opcode,
+                    required=True,
+                )
+            )
+        records.append(
+            SynthClassRecord(
+                name=synth["name"],
+                parent_class=classes[synth["parent"]]["name"],
+                sibling_class=synth.get("sibling", ""),
+                library=classes[synth["parent"]]["library"],
+                vtable_offset=symbol.value - image.base,
+                vtable_slot_cap=count + VTABLE_ADDRESS_POINT // POINTER_SIZE,
+                parent_region=parent_layout["size"],
+                overrides=overrides,
+            )
+        )
+    return records, parent_slots
+
+
 def import_sites_arm64e(
     image: Image, imports: dict[str, Import], fixups: list[Any], parent_slots: set[int]
 ) -> list[Site]:
@@ -759,11 +950,18 @@ def pack_manifest(
         )
         for site in found.sites
     ]
+    # A synthesized class's parent is measured, not checked slot by slot (src/Vtable.h): its
+    # probed slots are the stand-in's, so it records none.
+    synth_parents = {synth["parent"] for synth in config.get("synthesized", [])}
     classes, slots = [], []
     for i, (declaration, layout) in enumerate(
         zip(config.get("classes", []), layouts["classes"], strict=True)
     ):
-        required = required_slots(declaration, layout, [v for v in found.vtables if v.parent == i])
+        required = (
+            []
+            if i in synth_parents
+            else required_slots(declaration, layout, [v for v in found.vtables if v.parent == i])
+        )
         first = len(slots)
         slots += [(slot, strings.add(layout["slots"][slot])) for slot in required]
         classes.append(
@@ -793,6 +991,36 @@ def pack_manifest(
         overrides += [(slot,) for slot in vtable.overrides]
         fills += [(slot, diversity, opcode, 0) for slot, opcode, diversity in vtable.fills]
     segments = [(origin, size, strings.add(name), 0) for name, origin, size in found.segments]
+    selectors, synth_overrides, synth_classes = [], [], []
+    for record in found.synth:
+        first_override = len(synth_overrides)
+        for override in record.overrides:
+            first_selector = len(selectors)
+            selectors += [(strings.add(selector),) for selector in override.selectors]
+            synth_overrides.append(
+                (
+                    override.impl,
+                    first_selector,
+                    len(override.selectors),
+                    override.diversity,
+                    override.opcode,
+                    SYNTH_REQUIRED if override.required else 0,
+                    0,
+                )
+            )
+        synth_classes.append(
+            (
+                record.vtable_offset,
+                strings.add(record.name),
+                strings.add(record.parent_class),
+                strings.add(record.sibling_class) if record.sibling_class else 0,
+                record.library,
+                record.vtable_slot_cap,
+                record.parent_region,
+                first_override,
+                len(record.overrides),
+            )
+        )
     rows = [
         (LIBRARY, libraries),
         (IMPORT, imports),
@@ -804,6 +1032,9 @@ def pack_manifest(
         (OVERRIDE, overrides),
         (SEGMENT, segments),
         (FILL, fills),
+        (SELECTOR, selectors),
+        (SYNTH_OVERRIDE, synth_overrides),
+        (SYNTH_CLASS, synth_classes),
     ]
     return assemble(strings.data, rows, gate_offset, device_offset, version)
 
@@ -814,11 +1045,20 @@ def required_slots(
     """The parent slots whose methods Graft must find unchanged, in order.
 
     These are the inherited methods the declaration's required list names, or every parent
-    slot when it has none, and every slot a consumer class overrides.
+    slot but the reserved ones when it has none, and every slot a consumer class overrides.
+    A reserved slot (the kernel's _RESERVED<class><n> placeholders) is never verified by
+    default: the header keeps the placeholder name where the running kernel may have put a
+    method in that slot (arm64 kernels hold OSMetaClassBase::Dispatch where the header has
+    _RESERVEDOSMetaClassBase3), and no consumer calls one. Graft still fills it from the
+    live parent.
     """
     required = declaration.get("required")
     if required is None:
-        slots = set(range(len(layout["slots"])))
+        slots = {
+            slot
+            for slot, method in enumerate(layout["slots"])
+            if not (member_name(method) or "").startswith("_RESERVED")
+        }
     else:
         slots = set()
         for name in required:

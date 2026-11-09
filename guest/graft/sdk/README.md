@@ -13,6 +13,7 @@ part of a release, with `tools/vendor.py` ([tools/](../tools/README.md)).
 | file | what it is |
 |---|---|
 | `include/graft/Graft.h` | the calls an owned client makes: `graft_client_ready`, `graft_kernel_symbol`, `graft_route_kernel`, `graft_client_log` and `graft_client_state` |
+| `include/graft/IOMobileFramebufferLegacy.h` | the stand-in parent an arm64e synthesized class derives from ([Synthesized classes](#synthesized-classes)) |
 | `Start.cpp` | an owned client's start glue: declares its kmod from `GRAFT_CLIENT_ID` and `GRAFT_CLIENT_VERSION`, calls `graft_client_initialize()` at start, and refuses to stop |
 | `consumer.mk` | the make rules that link and stage a bound consumer |
 | `consumer.py` | the three steps `consumer.mk` runs: `probe`, `reserve` and `stage` |
@@ -54,7 +55,8 @@ OBJECTS  = $(BUILD)/obj/OurAccelerator.o
 HEADERS  = src/OurAccelerator.hpp
 CXXFLAGS = $(ARCH) -isysroot $(SDK) -mmacosx-version-min=11.0 -mkernel -nostdinc \
     -isystem $(SDK)/System/Library/Frameworks/Kernel.framework/Headers -DKERNEL \
-    -std=c++17 -fapple-kext -fno-rtti -fno-exceptions -Os -Wall -Werror
+    -std=c++17 -fapple-kext -fno-rtti -fno-exceptions -Os -Wall -Werror \
+    -Igraft/sdk/include
 
 all: $(BINARY)
 
@@ -62,6 +64,11 @@ $(BUILD)/obj/%.o: src/%.cpp $(HEADERS) Makefile ; mkdir -p $(@D) && xcrun clang+
 
 include graft/sdk/consumer.mk
 ```
+
+`CXXFLAGS` adds the SDK's `include/` (`-Igraft/sdk/include` above, for the
+path the consumer vendored Graft at), so a source or header can
+`#include <graft/Graft.h>` and the stand-in parents under `graft/`; the
+probe compiles with `CXXFLAGS` too, so it resolves the same headers.
 
 The compile rule uses make's one-line form, `target: prerequisites ; recipe`,
 which means the same as a recipe on its own tab-indented line. The
@@ -101,11 +108,18 @@ rule would otherwise become the default. It reads these variables:
 | `OBJECTS` | the kext's objects, which the Makefile's own rules compile |
 | `HEADERS` | the consumer's headers; a change to one probes again |
 | `CXXFLAGS` | the flags `OBJECTS` are compiled with; the probe compiles with them too |
+| `GRAFT_DECL` | optional: the declaration, `src/graft.json` unless set before the include |
+| `GRAFT_INFO_PLIST` | optional: the Info.plist, `src/Info.plist` unless set before the include |
 
-The consumer supplies `src/graft.json` and `src/Info.plist`. `consumer.mk`
+The consumer supplies the declaration and the Info.plist. A Makefile that
+builds more than one variant from one source, or a per-architecture
+Info.plist, sets `GRAFT_DECL` or `GRAFT_INFO_PLIST` before including
+`consumer.mk`. `consumer.mk`
 reads no `SDK` variable: the probe asks `xcrun` for the macOS SDK. Both
 links run `xcrun clang++` with `$(ARCH) -nostdlib -Xlinker -kext`, the
-objects and `-lcc_kext`; the second adds `-sectcreate __DATA __graft`.
+objects and `-lcc_kext`; the second adds `-sectcreate __DATA __graft`. An
+arm64e consumer also links with `-Xlinker -no_data_const`, which keeps its
+import GOT and vtables in writable `__DATA`, where Graft writes them.
 
 Under `$(BUILD)/graft` the rules leave `layouts.json` (the probe's output),
 `census` (the first link), `manifest-reserve.bin` (the reservation) and
@@ -118,8 +132,9 @@ first. The layouts are probed again when `src/graft.json`, a header in
 
 The declaration names the libraries the consumer imports from, the
 System-collection classes it derives from, and its own classes derived from
-them. Indices count from 0. In this example, the second library and the
-import illustrate the fields:
+them. An arm64e consumer can also declare `synthesized` classes, described in
+[Synthesized classes](#synthesized-classes). Indices count from 0. In this
+example, the second library and the import illustrate the fields:
 
 ```json
 {
@@ -204,6 +219,106 @@ the manifest. Where nothing defines it and it has no fallback, Graft binds
 it to the pointer the kernel's `gOSKextUnresolved` holds, so the consumer
 can ask `OSKextSymbolIsResolved()` whether it is there. List its library as
 for any import.
+
+## Synthesized classes
+
+An arm64e consumer can derive from a parent that no Apple SDK header declares
+and whose vtable changes between releases. It compiles against a stand-in
+declaration of the parent, and Graft lays out the class's vtable when it
+binds, placing each override on the live slot that holds the same method
+([docs/manifest.md](../docs/manifest.md#synthesized-classes)). The SDK has one
+stand-in, `include/graft/IOMobileFramebufferLegacy.h`, for
+IOMobileGraphicsFamily's `IOMobileFramebufferLegacy`. On x86-64 the build
+refuses a synthesized class.
+
+The stand-in goes in `classes` like any parent, and the consumer's class in
+`synthesized`:
+
+```json
+{
+  "libraries": [{"id": "com.apple.iokit.IOMobileGraphicsFamily"}],
+  "classes": [
+    {"name": "IOMobileFramebufferLegacy", "header": "graft/IOMobileFramebufferLegacy.h",
+     "library": 0}
+  ],
+  "synthesized": [
+    {"name": "OurDisplay", "header": "OurDisplay.hpp", "parent": 0,
+     "sibling": "AppleParavirtDisplay",
+     "overrides": {
+       "are_timings_enabled": {"required": true},
+       "supported_frame_info": {"required": true,
+                                "selectors": ["__ZN10OurDisplay20supported_frame_infoEjPjPA64_c"]},
+       "start_hardware": {}
+     }}
+  ]
+}
+```
+
+| key | meaning |
+|---|---|
+| `name` | a top-level C++ class name |
+| `header` | the header that declares it |
+| `parent` | the index in `classes` of the stand-in it derives from |
+| `sibling` | optional: a concrete subclass of the parent, which implements the parent's pure methods, through which Graft finds a pure method's slot. Graft reads it from whichever kext of the boot collection defines it, loaded or not |
+| `overrides` | required and not empty: the methods the class overrides, keyed by method name, such as `start_hardware` |
+
+Each name in `overrides` must be one method the class itself defines in one
+of the stand-in's slots. Its value takes two optional keys:
+
+| key | meaning |
+|---|---|
+| `required` | `true`: Graft refuses the bind when it finds no live slot for the method. Otherwise Graft leaves the override out when it finds no slot for it |
+| `selectors` | other mangled symbols for the method, tried after the class's own, for a method whose parameters differ between releases |
+
+Mark the parent's pure methods `required`. Graft reads only the method from a
+selector, not its class, so a selector can be written under the consumer's
+own class, as above.
+
+From the declaration and the linked consumer, `consumer.py` records for each
+class its overrides, its compiled vtable's length and the stand-in's size:
+
+- Each declared override takes the class's own method symbol as its first
+  selector, followed by its `selectors`, and its implementation and signing
+  context from the class's vtable.
+- Every other method the class defines in a stand-in slot is an override
+  too, and a required one, with its own symbol as its only selector. These
+  include the destructors and `getMetaClass` that
+  `OSDefineMetaClassAndStructors` defines. So the bind refuses rather than
+  leave the parent's method in their place.
+- The stand-in's reserved slots are not overrides. They only lengthen the
+  vtable, and nothing calls them.
+- The inherited slots are not import sites.
+
+Graft measures the stand-in's live class but does not hold it to the probed
+size and slots. It refuses the bind when the live class is larger than the
+stand-in, or when its vtable is longer than the class's compiled vtable.
+
+### IOMobileFramebufferLegacy.h
+
+The stand-in declares the class's pure methods, which a consumer implements;
+the concrete methods a consumer overrides; `start`, `stop` and `free`; and
+`note_vbl_ISR`, a non-virtual method a consumer calls, which Graft binds like
+any import. Methods with no known return type return `graft_iomfb_word`, a
+64-bit word. `GRAFT_IOMFB_VTABLE_RESERVE` reserved virtual slots make the
+compiled vtable at least as long as the live class's, and a
+`GRAFT_IOMFB_LEGACY_RESERVE`-byte field holds the live class's fields, so the
+consumer's own fields follow them.
+
+The class's own implementations of its concrete methods do no display work,
+since its hardware subclasses override them: `start_hardware` and
+`verify_swap` return 0. A display overrides each and does not call the
+class's. It calls none of the virtual methods the stand-in declares except
+`start`, `stop` and `free`: not virtually, since Graft fills its vtable in the
+live order, and not as a qualified call such as
+`IOMobileFramebufferLegacy::start_hardware()`, which under `-fapple-kext`
+loads the method from the class's vtable at the stand-in's compiled slot, a
+slot the live class gives to another method. `start`, `stop` and `free` lie in
+IOService's part of the vtable, which keeps the SDK's order, so a qualified
+call to them is right:
+
+```cpp
+bool OurDisplay::start(IOService *provider) { return IOMobileFramebufferLegacy::start(provider); }
+```
 
 ## What staging does
 
@@ -292,6 +407,17 @@ collection.
   weak imports, anchors, required methods, placeholders, the renumbered
   symbol table, the renamed markers, a short reservation, truncated Mach-O
   files and the dormant bundle.
+- `tests/chained_fixups_test.py` links the fixture for arm64e and checks
+  that `graft_macho.py` decodes its chained fixups: each import bind by name,
+  the weak ones flagged, and every rebase inside the image.
+- `tests/arm64e_tooling_test.py` stages the fixture built for arm64e and
+  checks its version-3 manifest: signed sites carry their signing context,
+  and each provider import becomes a rebase at its placeholder.
+- `tests/sdk_standin_test.py` compiles a subclass of the
+  `IOMobileFramebufferLegacy` stand-in, and checks its reserved slots and the
+  symbols its overrides produce.
+- `tests/synth_emit_test.py` builds an arm64e synthesized consumer, and checks
+  the synthesized-class and override records `consumer.py` writes for it.
 - `tests/prelink_test.py` links the staged fixture into synthetic
   collections the way OpenCore does, then corrupts them, and checks that
   `prelink.py` accepts the faithful one and refuses each defect.
