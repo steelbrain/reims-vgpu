@@ -58,9 +58,13 @@ GRAFT_SDK ?= ../graft/sdk
 ifeq ($(ARCH_NAME),arm64e)
 GRAFT_DECL = src/graft-arm64e.json
 GRAFT_INFO_PLIST = src/Info-arm64e.plist
+# The arm64e display subclasses the Graft SDK's IOMobileFramebufferLegacy stand-in
+# (<graft/IOMobileFramebufferLegacy.h>); the SDK's include directory holds it. x86-64 takes no
+# Graft stand-in, so this is empty there and its flags are unchanged.
+GRAFT_INC = -I$(GRAFT_SDK)/include
 endif
 
-FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-vgpu-graphics/include \
+FLAGS = $(ARCH) $(GRAFT_INC) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-vgpu-graphics/include \
 	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' -DRGFX_FB_TRACE=$(TRACE) \
 	-Os -Wall -Wextra -Wshadow-all -Werror -Wno-unused-parameter \
 	-Wno-deprecated-declarations

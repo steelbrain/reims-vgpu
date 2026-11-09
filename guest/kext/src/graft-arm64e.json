@@ -10,7 +10,7 @@
   "classes": [
     {
       "name": "IOMobileFramebufferLegacy",
-      "header": "IOMobileFramebufferLegacy.hpp",
+      "header": "graft/IOMobileFramebufferLegacy.h",
       "library": 1
     },
     {
@@ -21,14 +21,41 @@
   ],
   "consumers": [
     {
-      "name": "ReimsGraphics",
-      "header": "ReimsGraphics.hpp",
-      "parent": 0
-    },
-    {
       "name": "RgfxAccelerator",
       "header": "RgfxAccelerator.hpp",
       "parent": 1
+    }
+  ],
+  "synthesized": [
+    {
+      "name": "ReimsGraphics",
+      "header": "ReimsGraphics.hpp",
+      "parent": 0,
+      "sibling": "AppleParavirtDisplay",
+      "overrides": {
+        "set_notify_tag_mask_gated": { "required": true },
+        "supported_frame_info": {
+          "required": true,
+          "selectors": ["__ZN13ReimsGraphics20supported_frame_infoEjPjPA64_c"]
+        },
+        "factory_portal": { "required": true },
+        "executeFactoryConfigurations_gated": { "required": true },
+        "set_frame_info_notification_state_gated": { "required": true },
+        "do_swap_info_notify_gated": { "required": true },
+        "notify_swap_done_gated": { "required": true },
+        "notify_crc_ready_gated": { "required": true },
+        "are_timings_enabled": { "required": true },
+        "start": {},
+        "stop": {},
+        "free": {},
+        "start_hardware": {},
+        "stop_hardware_gated": {},
+        "swap_begin_gated": {},
+        "verify_swap": {},
+        "swap_layer_map": {},
+        "surface_layer_map": {},
+        "surface_layer_unmap": {}
+      }
     }
   ],
   "imports": {}

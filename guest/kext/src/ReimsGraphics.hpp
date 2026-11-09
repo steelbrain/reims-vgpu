@@ -32,7 +32,10 @@
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #if defined(__arm64e__)
-#include "IOMobileFramebufferLegacy.hpp"
+#include <graft/IOMobileFramebufferLegacy.h>
+// The Graft SDK stand-in's methods answer graft_iomfb_word, a uint64_t; the arm64e front end
+// (ReimsGraphicsMobile.cpp) names it RgfxIOMFBWord.
+typedef graft_iomfb_word RgfxIOMFBWord;
 #endif
 
 #include "RgfxBootConsole.hpp"
