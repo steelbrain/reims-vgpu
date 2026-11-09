@@ -268,6 +268,85 @@ impl Table {
         }
     }
 
+    /// Appends to `into` the pieces of `length` bytes from `first` ([`pieces`]), the first `at`
+    /// bytes into the range `into` gathers, joined to the last piece there where it follows on in
+    /// its file with its protection; false where a byte has no file behind it, the pieces of the
+    /// bytes before it appended.
+    fn pieces_into(&self, first: u64, length: u64, at: u64, into: &mut Vec<Piece>) -> bool {
+        let Some(end) = first.checked_add(length) else {
+            return false;
+        };
+        let mut from = first;
+        while from < end {
+            let Some((fd, offset, prot, to)) = self.file_at(from, end) else {
+                return false;
+            };
+            match into.last_mut() {
+                Some(last)
+                    if Arc::ptr_eq(&last.backing.fd, fd)
+                        && last.backing.offset + last.length == offset
+                        && last.prot == prot =>
+                {
+                    last.length += to - from;
+                }
+                _ => into.push(Piece {
+                    at: at + (from - first),
+                    length: to - from,
+                    backing: Backing {
+                        fd: Arc::clone(fd),
+                        offset,
+                    },
+                    prot,
+                }),
+            }
+            from = to;
+        }
+        true
+    }
+
+    /// Whether no run holds a byte of `first..end`.
+    fn holds_none(&self, first: u64, end: u64) -> bool {
+        self.run_at(first).is_none() && self.next_run(first, end).is_none()
+    }
+
+    /// [`Self::record`] of each of `pieces` from `target`, `piece.at` bytes in, over bytes no run
+    /// holds ([`Self::holds_none`]), in order: nothing of another run to cut or drop, and each
+    /// piece joins only the one before it, the first the run before the range and the last the
+    /// run after it, as [`Self::insert`] counts them.
+    fn record_fresh(&mut self, target: u64, pieces: Vec<Piece>) {
+        let mut before: Option<u64> = (self.runs.range(..target).next_back()).map(|(&at, _)| at);
+        let mut last: Option<u64> = None;
+        for piece in pieces {
+            let first = target.saturating_add(piece.at);
+            let end = first.saturating_add(piece.length);
+            if first >= end {
+                continue;
+            }
+            let run = Run {
+                end,
+                backing: piece.backing,
+                prot: piece.prot,
+                through: None,
+            };
+            if let Some(at) = before.take()
+                && let Some(prior) = self.runs.get(&at)
+                && joined(at, prior, first, &run)
+            {
+                self.joins += 1;
+            }
+            self.runs.insert(first, run);
+            before = Some(first);
+            last = Some(first);
+        }
+        if let Some(at) = last
+            && let Some(run) = self.runs.get(&at)
+            && let Some((&next, after)) = self.runs.range(run.end..).next()
+            && joined(at, run, next, after)
+        {
+            self.joins += 1;
+        }
+    }
+
     /// Sets the protection of what of the runs lies in `first..end` (`protect`), cutting a run it
     /// changes where the range ends inside it. A run that has the protection already stays as it
     /// is, as the kernel leaves a mapping that a protect does not change.
@@ -376,39 +455,60 @@ pub(crate) fn forget(first: u64, length: u64) {
 /// a view of following pages left follow on, as the kernel maps them as one); `None` where a byte
 /// has no file behind it.
 pub(crate) fn pieces(first: u64, length: u64) -> Option<Vec<Piece>> {
-    let end = first.checked_add(length)?;
-    let table = TABLE.lock();
     let mut pieces: Vec<Piece> = Vec::new();
-    let mut at = first;
-    while at < end {
-        let (fd, offset, prot, to) = table.file_at(at, end)?;
-        match pieces.last_mut() {
-            Some(last)
-                if Arc::ptr_eq(&last.backing.fd, fd)
-                    && last.backing.offset + last.length == offset
-                    && last.prot == prot =>
-            {
-                last.length += to - at;
+    TABLE
+        .lock()
+        .pieces_into(first, length, 0, &mut pieces)
+        .then_some(pieces)
+}
+
+/// How many sources [`view_pieces`] resolves under one hold of the table's lock: a view of a
+/// surface's scattered pages has thousands, each one or two lookups, and the lock is taken by
+/// every import's resolve of its pages too.
+const SOURCES_HELD: usize = 256;
+
+/// The pieces of a view of `sources`, each (address, length), in order: [`pieces`] of each, `at`
+/// its bytes into the view, the pieces of one source and of its neighbours that follow on in one
+/// file with one protection joined, as the kernel maps them as one. `Err` with the index of the
+/// first source a byte of which has no file behind it, and the pieces of the sources before it.
+pub(crate) fn view_pieces(sources: &[(u64, u64)]) -> Result<Vec<Piece>, (usize, Vec<Piece>)> {
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut at = 0u64;
+    for (chunk, held) in sources.chunks(SOURCES_HELD).enumerate() {
+        let table = TABLE.lock();
+        for (i, &(first, length)) in held.iter().enumerate() {
+            if !table.pieces_into(first, length, at, &mut pieces) {
+                // What the source added before the byte with no file goes: its own pieces, and
+                // what it joined to the last piece of the sources before it.
+                pieces.truncate(pieces.partition_point(|p| p.at < at));
+                if let Some(last) = pieces.last_mut() {
+                    last.length = last.length.min(at - last.at);
+                }
+                return Err((chunk * SOURCES_HELD + i, pieces));
             }
-            _ => pieces.push(Piece {
-                at: at - first,
-                length: to - at,
-                backing: Backing {
-                    fd: Arc::clone(fd),
-                    offset,
-                },
-                prot,
-            }),
+            at += length;
         }
-        at = to;
     }
-    Some(pieces)
+    Ok(pieces)
 }
 
 /// `pieces` of a range, as [`pieces`] gave them, show from `target` on from now on, each
 /// `piece.at` bytes in: what of other runs they cover goes (a remap's record, under one lock).
+/// Over bytes no run holds, as a view's over core's fresh reservation, the pieces in order are
+/// added as they are, with no run to cut ([`Table::record_fresh`]).
 pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
     let mut table = TABLE.lock();
+    let end = (pieces.iter())
+        .map(|p| target.saturating_add(p.at).saturating_add(p.length))
+        .max();
+    let in_order = (pieces.windows(2)).all(|w| w[0].at.saturating_add(w[0].length) <= w[1].at);
+    if let Some(end) = end
+        && in_order
+        && table.holds_none(target, end)
+    {
+        table.record_fresh(target, pieces);
+        return;
+    }
     for piece in pieces {
         let first = target.saturating_add(piece.at);
         let end = first.saturating_add(piece.length);
@@ -1038,5 +1138,161 @@ mod tests {
         assert!(pieces(base, 0x1000).is_some());
         drop(second);
         assert!(pieces(base, 0x1000).is_none());
+    }
+
+    /// A view's pieces recorded over bytes no run holds leave the table as recording them one at
+    /// a time does: the same runs, and the same mappings counted, the neighbours before and after
+    /// the range joining its first and last pieces in some rounds, and pieces that follow on in a
+    /// file, a file apart or a protection apart in between
+    #[test]
+    fn a_fresh_views_record_is_the_one_at_a_time_record() {
+        let (f, g) = (file(), file());
+        let page = 0x1000;
+        let at = |i: u64| 0x5000_0000 + i * page;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let b = |fd: &Arc<OwnedFd>, offset| Backing {
+            fd: Arc::clone(fd),
+            offset,
+        };
+        let shape = |t: &Table| {
+            let runs: Vec<(u64, u64, bool, u64, i32)> = (t.runs.iter())
+                .map(|(&first, r)| {
+                    (
+                        first,
+                        r.end,
+                        Arc::ptr_eq(&r.backing.fd, &f),
+                        r.backing.offset,
+                        r.prot,
+                    )
+                })
+                .collect();
+            (runs, t.joins, t.mappings())
+        };
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for _ in 0..200 {
+            // The pieces of pages 2 to 30, one to three pages each.
+            let mut pieces = Vec::new();
+            let mut page_at = 2;
+            let mut offset = 0x40 * page;
+            while page_at < 30 {
+                let pages = (1 + next(3)).min(30 - page_at);
+                let fd = if next(5) == 0 { &g } else { &f };
+                offset = match next(3) {
+                    0 => offset,
+                    _ => next(0x40) * page,
+                };
+                let prot = if next(6) == 0 { libc::PROT_READ } else { rw };
+                pieces.push(Piece {
+                    at: (page_at - 2) * page,
+                    length: pages * page,
+                    backing: b(fd, offset),
+                    prot,
+                });
+                offset += pages * page;
+                page_at += pages;
+            }
+            // Neighbours: page 1 before the range and page 30 after it, each joining the piece
+            // beside it in some rounds; page 0 apart.
+            let first = &pieces[0];
+            let last = &pieces[pieces.len() - 1];
+            let before = match next(2) {
+                0 => first.backing.offset.saturating_sub(page),
+                _ => 0x80 * page,
+            };
+            let after = match next(2) {
+                0 => last.backing.offset + last.length,
+                _ => 0x90 * page,
+            };
+            let mut one = Table::default();
+            let mut fresh = Table::default();
+            for t in [&mut one, &mut fresh] {
+                t.record(at(0), at(1), b(&g, 0xa0 * page), rw, None);
+                t.record(at(1), at(2), b(&first.backing.fd, before), first.prot, None);
+                t.record(at(30), at(31), b(&last.backing.fd, after), last.prot, None);
+            }
+            assert!(fresh.holds_none(at(2), at(30)));
+            for piece in pieces.clone() {
+                let start = at(2) + piece.at;
+                one.record(start, start + piece.length, piece.backing, piece.prot, None);
+            }
+            fresh.record_fresh(at(2), pieces);
+            assert_eq!(shape(&fresh), shape(&one));
+        }
+    }
+
+    /// A view's sources resolve as each would alone, laid out one after another in the view and
+    /// joined where they follow on in a file across sources; a source with a byte of no file
+    /// answers its index and the pieces of the sources before it, a piece that ran into it cut
+    /// back
+    #[test]
+    fn a_views_sources_resolve_in_one_pass() {
+        let f = file();
+        let base = 0x7980_0000_0000;
+        let page = 0x1000;
+        let backing = |offset| Backing {
+            fd: Arc::clone(&f),
+            offset,
+        };
+        let held = Registration::new(base, 0x10 * page, backing(0x100 * page));
+        let src = |i: u64| base + i * page;
+        // Pages 3, 4 (following on), 2 (backwards), 9 and 10 as one source.
+        let sources = [
+            (src(3), page),
+            (src(4), page),
+            (src(2), page),
+            (src(9), 2 * page),
+        ];
+        let all = view_pieces(&sources).unwrap();
+        assert_eq!(
+            shape(&all),
+            [
+                (0, 2 * page, 0x103 * page),
+                (2 * page, page, 0x102 * page),
+                (3 * page, 2 * page, 0x109 * page)
+            ]
+        );
+        // Many sources, past one hold of the lock: as each alone.
+        let many: Vec<(u64, u64)> = (0..(3 * SOURCES_HELD as u64))
+            .map(|i| (src(i % 0x10), page))
+            .collect();
+        let mut alone = Vec::new();
+        for (i, &(first, length)) in many.iter().enumerate() {
+            for p in pieces(first, length).unwrap() {
+                alone.push((i as u64 * page + p.at, p.length, p.backing.offset));
+            }
+        }
+        let joined: Vec<(u64, u64, u64)> = shape(&view_pieces(&many).unwrap());
+        let total: u64 = joined.iter().map(|&(_, length, _)| length).sum();
+        assert_eq!(total, many.len() as u64 * page);
+        for &(at, length, offset) in &alone {
+            assert!(
+                joined.iter().any(|&(j, jl, jo)| j <= at
+                    && at + length <= j + jl
+                    && jo + (at - j) == offset),
+                "the page {at:#x} of the view shows the file at {offset:#x}"
+            );
+        }
+        // Page 0x10 has no file: the index of the source that runs into it, and the pieces
+        // before it, the second source's piece, which the third's first page joined, cut back to
+        // its own page.
+        let refused = [
+            (src(5), page),
+            (src(0xe), page),
+            (src(0xf), 2 * page),
+            (src(1), page),
+        ];
+        let (i, before) = view_pieces(&refused).unwrap_err();
+        assert_eq!(i, 2);
+        assert_eq!(
+            shape(&before),
+            [(0, page, 0x105 * page), (page, page, 0x10e * page)]
+        );
+        drop(held);
     }
 }

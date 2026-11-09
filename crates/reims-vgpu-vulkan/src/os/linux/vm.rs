@@ -41,6 +41,19 @@
 //! memory runs out, which core answers as Metal does then (`crate::answer::out_of_host_memory`,
 //! counted; in strict mode a death).
 //!
+//! A view of many runs is resolved in one pass of the backing table and recorded over its fresh
+//! reservation with no run to cut (`files::view_pieces`, `files::record_pieces`), so the kernel's
+//! maps are most of what it costs. **Measured** 2026-11-08 on homelab-um870-1 (Ryzen 7 8745H,
+//! Linux 7.3.1, release build): a view of 7,261 one-page runs of a registered memfd, three in
+//! four the page below the one before (an IOSurface's, as an x86-64 macOS guest hands its pages
+//! out), took 1.86 µs a run beside 66,000 one-page views, and 2.06 µs beside 200,000, against
+//! 2.06 and 2.29 µs with each run resolved and recorded on its own. A C loop of the same maps
+//! took 2.0 to 2.2 µs a run on homelab-um790-xtx-1 (Ryzen 7 7840HS, Linux 7.3.1) beside 66,000
+//! one-page mappings of the file, each `MAP_FIXED` cutting the reservation it lands in
+//! (`vms_gather_munmap_vmas` and `__split_vma` in its profile); `MAP_FIXED_NOREPLACE` into a hole
+//! took 1.6 to 1.7 µs, but a hole is no reservation: another thread's `mmap` may land in it while
+//! the runs go in.
+//!
 //! **Views through dma-bufs.** An x86-64 macOS guest hands out its pages in 4 KiB pieces, each
 //! 16 KiB clump of them backwards (its free queue refills each CPU's list last in, first out), and
 //! a mapping of a file can only run forwards through it, so a view of a guest's buffer mapped from
@@ -1129,38 +1142,23 @@ impl HostVm for LinuxVm {
         }
         reclaiming(|| {
             let target = dst.addr().to_u64();
-            let mut all: Vec<files::Piece> = Vec::new();
-            let mut offset = 0u64;
-            for (i, &(src, len)) in runs.iter().enumerate() {
-                let source = src.addr().to_u64();
-                let Some(pieces) = files::pieces(source, len) else {
+            let sources: Vec<(u64, u64)> = (runs.iter())
+                .map(|&(src, len)| (src.addr().to_u64(), len))
+                .collect();
+            match files::view_pieces(&sources) {
+                Ok(all) => map_view(target, all).map_err(|kr| (0, kr)),
+                Err((i, before)) => {
+                    let (source, len) = sources[i];
                     log::debug!(
                         target: "reims_vgpu_vulkan::os",
                         "remap of {len:#x} bytes at {source:#x}: no file behind them"
                     );
-                    if !all.is_empty() {
-                        map_view(target, all).map_err(|kr| (0, kr))?;
+                    if !before.is_empty() {
+                        map_view(target, before).map_err(|kr| (0, kr))?;
                     }
-                    return Err((i, INVALID_ADDRESS));
-                };
-                for piece in pieces {
-                    match all.last_mut() {
-                        Some(last)
-                            if Arc::ptr_eq(&last.backing.fd, &piece.backing.fd)
-                                && last.backing.offset + last.length == piece.backing.offset
-                                && last.prot == piece.prot =>
-                        {
-                            last.length += piece.length;
-                        }
-                        _ => all.push(files::Piece {
-                            at: offset + piece.at,
-                            ..piece
-                        }),
-                    }
+                    Err((i, INVALID_ADDRESS))
                 }
-                offset += len;
             }
-            map_view(target, all).map_err(|kr| (0, kr))
         })
     }
 
