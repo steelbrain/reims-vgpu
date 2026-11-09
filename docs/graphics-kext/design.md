@@ -582,7 +582,9 @@ Stages:
         the kernel allocated (`IOBufferMemoryDescriptor`, anonymous memory,
         never a client's own, which may be a file's). It counts them on every
         kernel the same way: it maps the memory read-only into the kernel's
-        own map for the count, and `mach_vm_region`'s
+        map for the count (IOKit puts a pageable buffer's kernel mapping
+        inside one of its pageable maps, a submap of the kernel's, which the
+        kext finds through `IOIteratePageableMaps`), and `mach_vm_region`'s
         `VM_REGION_EXTENDED_INFO` walks the mapping's regions, which count
         each page resident or compressed or paged out (`pages_swapped_out`;
         **measured** on 11.7.11 against each page's disposition, with the

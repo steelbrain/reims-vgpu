@@ -582,8 +582,12 @@ bool rgfxSurfaceLocksStartsAt(OSObject *surface, const RgfxPageRun *runs, UInt32
 	return rgfxSurfaceRunsSame(walk);
 }
 
-// The kernel's map, exported in com.apple.kpi.unsupported, which no SDK header declares.
+// The kernel's map, exported in com.apple.kpi.unsupported, and IOKit's walk of its pageable maps,
+// exported in com.apple.kpi.iokit, which no SDK header declares.
 extern "C" vm_map_t kernel_map;
+using RgfxPageableMapsCallback = kern_return_t (*)(vm_map_t map, void *ref);
+extern "C" kern_return_t IOIteratePageableMaps(vm_size_t size, RgfxPageableMapsCallback callback,
+                                               void *ref);
 
 namespace {
 // The most regions of a surface's mapping a count walks: more, and it is not counted.
@@ -592,6 +596,61 @@ constexpr uint32_t kMaxCountRegions = 8;
 constexpr uint64_t kCountLoggedBytes = 16ull << 20;
 constexpr uint32_t kCountsLogged = 16;
 } // namespace
+
+// The regions of `map` from `start` on, as many as `room`, up to `start + length`: how many it
+// found. A failed call ends the walk short of the end, which rgfxRegionPageCounts refuses.
+static uint32_t walkRegions(vm_map_t map, uint64_t start, uint64_t length, RgfxPageRegion *regions,
+                            uint32_t room)
+{
+	uint32_t found = 0;
+	mach_vm_address_t at = start;
+	while (found < room && at < start + length) {
+		mach_vm_address_t address = at;
+		mach_vm_size_t size = 0;
+		vm_region_extended_info_data_t info = {};
+		mach_msg_type_number_t infoCount = VM_REGION_EXTENDED_INFO_COUNT;
+		mach_port_t object = MACH_PORT_NULL;
+		if (mach_vm_region(map, &address, &size, VM_REGION_EXTENDED_INFO,
+		                   reinterpret_cast<vm_region_info_t>(&info), &infoCount,
+		                   &object) != KERN_SUCCESS)
+			break;
+		regions[found++] = {address, size, info.pages_resident, info.pages_swapped_out,
+		                    info.external_pager != 0, info.share_mode == SM_EMPTY};
+		if (address + size <= address)
+			break;
+		at = address + size;
+	}
+	return found;
+}
+
+namespace {
+// The pageable map that holds an address, as IOIteratePageableMaps' callback finds it.
+struct PageableMapFind {
+	uint64_t address;
+	vm_map_t map;
+};
+} // namespace
+
+// IOIteratePageableMaps' callback: success, which ends the walk, for the map with a region that
+// holds the address; failure otherwise, which neither ends the walk nor, at its end, has IOKit
+// make a map (it makes one only where the last answer is KERN_NO_SPACE).
+static kern_return_t pageableMapHolds(vm_map_t map, void *ref)
+{
+	PageableMapFind *find = static_cast<PageableMapFind *>(ref);
+	mach_vm_address_t address = find->address;
+	mach_vm_size_t size = 0;
+	vm_region_basic_info_data_64_t info = {};
+	mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
+	mach_port_t object = MACH_PORT_NULL;
+	if (map && mach_vm_region(map, &address, &size, VM_REGION_BASIC_INFO_64,
+	                          reinterpret_cast<vm_region_info_t>(&info), &infoCount,
+	                          &object) == KERN_SUCCESS &&
+	    address <= find->address && find->address - address < size) {
+		find->map = map;
+		return KERN_SUCCESS;
+	}
+	return KERN_FAILURE;
+}
 
 // What a count of a surface's pages took, logged where it is the longest yet by a quarter or
 // more, or where the surface is large, for the first kCountsLogged of those.
@@ -620,9 +679,11 @@ static void noteCountTime(uint64_t bytes, uint64_t ns, const RgfxSurfacePageCoun
 // or compressed or paged out (pages_swapped_out), measured on 11.7.11 (20G1443) for an IOSurface
 // whose pages a child's allocations pushed into the compressor and on to swap: its counts equal
 // each page's disposition, resident, compressed or mixed. mach_vm_region and kernel_map are in
-// com.apple.kpi.unsupported, and kernel_task in com.apple.kpi.mach, in the symbol sets of every
-// release kernel checked (x86_64 11.7.10 to 26.7.2, arm64 13 to 26; each kernel's
-// __LINKINFO,__symbolsets): a strong import, bound by every linker, OpenCore's included. The
+// com.apple.kpi.unsupported, kernel_task in com.apple.kpi.mach and IOIteratePageableMaps in
+// com.apple.kpi.iokit, in the symbol sets of every release kernel checked (x86_64 11.7.10 to
+// 26.7.2, arm64 13 to 26; each kernel's __LINKINFO,__symbolsets): strong imports, bound by every
+// linker, OpenCore's included. A pageable buffer's mapping lies inside one of IOKit's pageable
+// maps, where the walk finds its regions (walkRegions, pageableMapHolds). The
 // walk costs about a microsecond per 1-16 pages (measured from user space on 11.7.11: 0.13 ms
 // for 16384 resident pages, 1.3 ms for the same compressed), plus the mapping's making and
 // removal.
@@ -657,26 +718,19 @@ RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
 	}
 	const uint64_t start = map->getAddress(), length = map->getLength();
 	RgfxPageRegion regions[kMaxCountRegions] = {};
-	uint32_t found = 0;
-	mach_vm_address_t at = start;
-	while (found < kMaxCountRegions && at < start + length) {
-		mach_vm_address_t address = at;
-		mach_vm_size_t size = 0;
-		vm_region_extended_info_data_t info = {};
-		mach_msg_type_number_t infoCount = VM_REGION_EXTENDED_INFO_COUNT;
-		mach_port_t object = MACH_PORT_NULL;
-		if (mach_vm_region(kernel_map, &address, &size, VM_REGION_EXTENDED_INFO,
-		                   reinterpret_cast<vm_region_info_t>(&info), &infoCount,
-		                   &object) != KERN_SUCCESS)
-			break;
-		regions[found++] = {address, size, info.pages_resident, info.pages_swapped_out,
-		                    info.external_pager != 0, info.share_mode == SM_EMPTY};
-		if (address + size <= address)
-			break;
-		at = address + size;
+	uint32_t found = walkRegions(kernel_map, start, length, regions, kMaxCountRegions);
+	// IOKit maps a pageable buffer into the kernel inside one of its pageable maps, a submap of
+	// the kernel's, whose one region in the kernel's map has nothing to count (SM_EMPTY) and
+	// reaches past the mapping: measured on 11.7.11 (20G1443), a 512 MiB region in the kernel's
+	// map, and in the pageable map one region that is the mapping exactly. The walk then goes on
+	// in that pageable map, found by IOKit's own walk of them.
+	if (found == 1 && regions[0].empty && regions[0].start <= start &&
+	    start + length - regions[0].start <= regions[0].size) {
+		PageableMapFind find = {start, nullptr};
+		if (IOIteratePageableMaps(PAGE_SIZE, &pageableMapHolds, &find) == KERN_SUCCESS &&
+		    find.map)
+			found = walkRegions(find.map, start, length, regions, kMaxCountRegions);
 	}
-	// A walk that ended short (a failed call, or more regions than kMaxCountRegions) leaves the
-	// regions short of the mapping's end, which rgfxRegionPageCounts refuses.
 	counts = rgfxRegionPageCounts(regions, found, start, length);
 	map->release();
 	uint64_t ns = 0;
