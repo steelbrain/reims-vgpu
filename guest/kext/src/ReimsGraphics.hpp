@@ -195,6 +195,11 @@ public:
 	// RgfxMobileColor.hpp), which the class answers kIOReturnUnsupported.
 	RgfxIOMFBWord swap_set_color_matrix(IOMFBColorFixedMatrix *matrix,
 	                                    IOMFBColorMatrixFunction function, uint32_t field_2) override;
+	// And the colour filter scale WindowServer sets after that matrix (ReimsGraphicsMobile.cpp,
+	// RgfxMobileColor.hpp), which the class answers kIOReturnUnsupported: its other parameters
+	// go to the class.
+	RgfxIOMFBWord set_parameter(IOMFBParameterName name, const uint64_t *values,
+	                            uint32_t count) override;
 #endif
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the

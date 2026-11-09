@@ -1,8 +1,9 @@
 // The native test of what ReimsGraphics overrides of IOMobileFramebufferLegacy's own methods
 // (ReimsGraphicsMobile.cpp): get_dot_pitch, because the class's start leaves its state unset for a
 // PCI device; set_digital_out_mode, which the class answers kIOReturnUnsupported and the
-// paravirtual display overrides to set its modes; and swap_set_color_matrix, which the class
-// answers kIOReturnUnsupported and the display answers 0 to show the matrix
+// paravirtual display overrides to set its modes; swap_set_color_matrix, which the class answers
+// kIOReturnUnsupported and the display answers 0 to show the matrix; and set_parameter, whose
+// colour filter scale of 1.0 the display answers 0 and hands the rest to the class
 // (RgfxMobileColor.hpp, tests/mobile_color_test.cpp). start keeps its provider as an
 // AppleARMIODevice in one field, NULL where the provider is not one, and the class's get_dot_pitch
 // calls through that field unchecked.
@@ -60,6 +61,12 @@ constexpr Method kMethods[] = {
 	 "override;",
 	 "__ZN25IOMobileFramebufferLegacy21swap_set_color_matrixEP21IOMFBColorFixedMatrix"
 	 "24IOMFBColorMatrixFunctionj"},
+	{"set_parameter",
+	 "virtual graft_iomfb_word set_parameter(IOMFBParameterName name, const uint64_t *values,\n"
+	 "                                           uint32_t count);",
+	 "RgfxIOMFBWord set_parameter(IOMFBParameterName name, const uint64_t *values,\n"
+	 "\t                            uint32_t count) override;",
+	 "__ZN25IOMobileFramebufferLegacy13set_parameterE18IOMFBParameterNamePKyj"},
 };
 constexpr size_t kMethodCount = sizeof(kMethods) / sizeof(kMethods[0]);
 
@@ -73,10 +80,10 @@ struct Release {
 };
 
 constexpr Release kReleases[] = {
-	{"14.6.1", 0x18a0, 0x1640, {292, 289, 331}},
-	{"15.6.1", 0x19c0, 0x1758, {292, 289, 334}},
-	{"26.6.2", 0x1af8, 0x1890, {293, 290, 335}},
-	{"27.0.1", 0x1dd8, 0x1b80, {294, 291, 343}},
+	{"14.6.1", 0x18a0, 0x1640, {292, 289, 331, 332}},
+	{"15.6.1", 0x19c0, 0x1758, {292, 289, 334, 335}},
+	{"26.6.2", 0x1af8, 0x1890, {293, 290, 335, 336}},
+	{"27.0.1", 0x1dd8, 0x1b80, {294, 291, 343, 344}},
 };
 
 // The SDK stand-in's virtual slots past its own: GRAFT_IOMFB_VTABLE_RESERVE.

@@ -43,6 +43,26 @@ constexpr uint32_t kRgfxMobileMatrixWords = 15;
 // The function QuartzCore sets its accessibility matrix with (read).
 constexpr uint32_t kRgfxMobileAccessibilityMatrix = 2;
 
+// The colour filter scale. WindowServer follows its accessibility matrix with
+// IOMobileFramebufferSetParameter(fb, 3, &scale, 1): parameter 3 with one value, the matrix's
+// scale in 16.16 fixed point, and logs "IOMFB was not able to set accessibility matrix." where
+// that call answers other than 0, the matrix kept as set (27.0.1). The user client calls the
+// display's set_parameter with them, outside the display's gate; IOMobileFramebufferLegacy's runs
+// parameter 3 with one value as its set_color_filter_scale_gated, which answers
+// kIOReturnUnsupported on each of 14.6.1, 15.6.1, 26.6.2 and 27.0.1 where its subclass does not
+// take it. The display takes a scale of 1.0 alone: with the matrix shown, it shows what a scale of
+// 1.0 shows. What another scale does is not stated, so the display leaves it to the class.
+constexpr uint32_t kRgfxColorFilterScaleParameter = 3;
+constexpr uint64_t kRgfxColorFilterScaleOne = 0x10000;
+
+// Whether set_parameter's `name`, `values` and `count` are the colour filter scale of 1.0, which
+// the display answers 0 to, changing nothing.
+inline bool rgfxColorFilterScaleIsOne(uint32_t name, const uint64_t *values, uint32_t count)
+{
+	return name == kRgfxColorFilterScaleParameter && count == 1 && values != nullptr &&
+	       values[0] == kRgfxColorFilterScaleOne;
+}
+
 // The bits of `v` rounded to nearest, ties to even, at `drop` low bits (drop < 64): the kept bits.
 inline uint64_t rgfxRoundNearestEven(uint64_t v, uint32_t drop)
 {

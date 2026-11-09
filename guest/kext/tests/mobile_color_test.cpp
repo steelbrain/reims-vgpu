@@ -2,7 +2,8 @@
 // the colour matrix WindowServer sets with a swap (ReimsGraphicsMobile.cpp's
 // swap_set_color_matrix), against the same conversion done in floating point here: each word
 // converted to a double, times 2^-32, rounded to a float. Also the override's source: it converts
-// the matrix, posts it as the matrix stage, and answers 0.
+// the matrix, posts it as the matrix stage, and answers 0. And the colour filter scale the display
+// takes (set_parameter): 1.0 alone, answered 0, the rest the class's.
 #include "RgfxMobileColor.hpp"
 
 #include <cstdio>
@@ -170,6 +171,45 @@ void source()
 	      "the post's result is not the answer", "source");
 }
 
+// The colour filter scale: parameter 3 with the one value 1.0 in 16.16 is the display's, anything
+// else is not.
+void filterScale()
+{
+	const uint64_t one = 0x10000, two[2] = {0x10000, 0x10000};
+	check(rgfxColorFilterScaleIsOne(3, &one, 1), "a scale of 1.0 is the display's", "scale");
+	for (uint64_t v : {uint64_t(0), uint64_t(0x8000), uint64_t(0xffff), uint64_t(0x10001),
+	                   uint64_t(0x20000), ~uint64_t(0)})
+		check(!rgfxColorFilterScaleIsOne(3, &v, 1), "another scale goes to the class", "scale");
+	check(!rgfxColorFilterScaleIsOne(3, two, 2), "two values go to the class", "scale");
+	check(!rgfxColorFilterScaleIsOne(3, &one, 0), "no value goes to the class", "scale");
+	check(!rgfxColorFilterScaleIsOne(3, nullptr, 1), "no values go to the class", "scale");
+	for (uint32_t name : {0u, 1u, 2u, 4u, 0x11u, 0xffffffffu})
+		check(!rgfxColorFilterScaleIsOne(name, &one, 1), "another parameter goes to the class",
+		      "scale");
+}
+
+// The override answers 0 for the scale of 1.0 and the class's answer for the rest, posting
+// nothing.
+void filterScaleSource()
+{
+	const std::string src = readFile("src/ReimsGraphicsMobile.cpp");
+	const size_t at = src.find("RgfxIOMFBWord ReimsGraphics::set_parameter(");
+	check(at != std::string::npos, "the override is defined", "scale source");
+	const size_t end = src.find("\n}\n", at);
+	check(end != std::string::npos, "the override ends", "scale source");
+	const std::string body = src.substr(at, end - at);
+	check(body.find("rgfxColorFilterScaleIsOne(parameter, values, count)") != std::string::npos,
+	      "it decides by the scale", "scale source");
+	check(body.find("one ? word(kIOReturnSuccess)") != std::string::npos, "1.0 is answered 0",
+	      "scale source");
+	check(body.find(": rgfxLegacySetParameter(this, name, values, count)") != std::string::npos,
+	      "the rest is the class's", "scale source");
+	check(body.find("postDisplayColor") == std::string::npos, "it posts nothing", "scale source");
+	check(src.find("__asm__(\"__ZN25IOMobileFramebufferLegacy13set_parameterE18IOMFBParameterName"
+	               "PKyj\")") != std::string::npos,
+	      "the class's is its own set_parameter", "scale source");
+}
+
 } // namespace
 
 int main()
@@ -181,6 +221,8 @@ int main()
 	conversion();
 	rows();
 	source();
+	filterScale();
+	filterScaleSource();
 	std::printf("mobile_color_test: %d checks passed\n", checks);
 	return 0;
 }

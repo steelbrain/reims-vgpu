@@ -95,6 +95,13 @@ extern "C" void rgfxLegacyDropDummySwaps(IOMobileFramebufferLegacy *self)
 extern "C" void rgfxLegacySwapInfoNotifyDispatch(IOMobileFramebufferLegacy *self,
                                                  RgfxSwapInfoRecord *record)
     __asm__("__ZN25IOMobileFramebufferLegacy31swap_info_notify_dispatch_gatedEPNS_12SwapInfoBlobE");
+// The class's own set_parameter, which the display's override hands each parameter it does not
+// take (set_parameter): called directly, under the name every release from 14 to 27.0.1 exports,
+// as the paravirtual display's override hands the class those it does not take.
+extern "C" RgfxIOMFBWord rgfxLegacySetParameter(IOMobileFramebufferLegacy *self,
+                                                IOMFBParameterName name, const uint64_t *values,
+                                                uint32_t count)
+    __asm__("__ZN25IOMobileFramebufferLegacy13set_parameterE18IOMFBParameterNamePKyj");
 
 // IOMobileFramebufferUserClient's enqueue of `bytes` bytes at `words` in its shared data queue,
 // which IOMobileFramebuffer.framework reads a frame info record from (RgfxLegacySwapInfo.hpp):
@@ -147,6 +154,7 @@ enum MobileCall : unsigned {
 	kGetDotPitch,
 	kSetDigitalOutMode,
 	kSwapSetColorMatrix,
+	kSetParameter,
 	kVblank,
 	kPresented,
 	kSwapShown,
@@ -985,6 +993,25 @@ RgfxIOMFBWord ReimsGraphics::swap_set_color_matrix(IOMFBColorFixedMatrix *matrix
 		      rows[0].y, rows[0].z, rows[1].x, rows[1].y, rows[1].z, rows[2].x, rows[2].y, rows[2].z,
 		      posted);
 	return word(kIOReturnSuccess);
+}
+
+// The colour filter scale WindowServer sets after its accessibility matrix, by
+// IOMobileFramebufferSetParameter (RgfxMobileColor.hpp): a scale of 1.0 is answered 0, the matrix
+// shown as swap_set_color_matrix shows it. Every other parameter, and another scale, goes to the
+// class, which answers as it does for the paravirtual display. The user client calls it ungated,
+// in WindowServer's thread, as it calls swap_set_color_matrix.
+RgfxIOMFBWord ReimsGraphics::set_parameter(IOMFBParameterName name, const uint64_t *values,
+                                           uint32_t count)
+{
+	const uint32_t parameter = static_cast<uint32_t>(name);
+	const bool one = rgfxColorFilterScaleIsOne(parameter, values, count);
+	const RgfxIOMFBWord answer = one ? word(kIOReturnSuccess)
+	                                 : rgfxLegacySetParameter(this, name, values, count);
+	if (parameter == kRgfxColorFilterScaleParameter && logged(kSetParameter))
+		IOLog("ReimsGraphics: set_parameter(%u, %u values, first 0x%llx) = 0x%x%s\n", parameter,
+		      count, (values && count) ? static_cast<unsigned long long>(values[0]) : 0ull,
+		      static_cast<uint32_t>(answer), one ? "" : ", the class's answer");
+	return answer;
 }
 
 IOReturn ReimsGraphics::setMobileMode(uint32_t colorId, uint32_t timingId, Mode *shown)
