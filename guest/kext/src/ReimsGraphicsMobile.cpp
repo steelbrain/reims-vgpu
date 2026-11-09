@@ -7,9 +7,11 @@
  * swaps a process submits, and swap_begin_gated takes them off its queue as Apple's paravirtual
  * display does: the device presents a swap's layer-0 surface, and the swap completes once the host
  * answers the present. The device's refreshes reach the class as its vblank note. Each completed
- * swap's times reach WindowServer as the paravirtual display sends them: a swap-info record to each
- * notify request (RgfxLegacySwapInfo.hpp). The class's other pure methods answer what a display
- * with no frame info, no factory configuration and no CRC answers.
+ * swap's presentation time reaches WindowServer as frame info, which the paravirtual display has
+ * none of: supported_frame_info answers the tags the device fills, and a record of the swap goes to
+ * each notify request as the paravirtual display sends its swap-info records
+ * (RgfxLegacySwapInfo.hpp). The class's other pure methods answer what a display with no factory
+ * configuration and no CRC answers.
  *
  * None of the class's methods a subclass overrides is forwarded to the class: what the class
  * implements there is for no display at all, on every arm64 release from 13 to 27.0.1 (read from
@@ -173,6 +175,8 @@ bool ReimsGraphics::startMobile()
 	mobileSwapShowing = nullptr;
 	mobileSwapRate.clear();
 	mobileSecond = 0;
+	mobileShownAt = 0;
+	mobilePresentedAt = 0;
 	mobileSwapInfoKept.head = 0;
 	mobileSwapInfoKept.tail = 0;
 	// The release, by the size of the class this one derives from as the kernel has it.
@@ -523,6 +527,8 @@ void ReimsGraphics::mobilePresented(OSObject *client, UInt64 seqno, UInt32 statu
 		return;
 	if (logged(kPresented))
 		IOLog("ReimsGraphics: present %llu shown, status %u at %llu\n", seqno, status, time);
+	// The refresh it showed in, for the swap's frame info (completeMobileSwap).
+	__atomic_store_n(&self->mobileShownAt, time, __ATOMIC_RELEASE);
 	// The swap it shows completes in the class's gate (completeMobileSwap).
 	if (IOInterruptEventSource *answer = __atomic_load_n(&self->mobileSwapAnswer, __ATOMIC_ACQUIRE))
 		answer->interruptOccurred(nullptr, nullptr, 0);
@@ -591,6 +597,8 @@ void ReimsGraphics::beginMobileSwaps()
 		                     presented == kIOReturnSuccess);
 		if (mobileSwapShowing)
 			return;
+		// Nothing was shown: its frame info says so (notify_swap_done_gated).
+		mobilePresentedAt = 0;
 		rgfxLegacySwapComplete(this);
 		mobileSwapRate.complete(now);
 	}
@@ -624,6 +632,12 @@ void ReimsGraphics::completeMobileSwap()
 	RgfxLegacySwapQueue queue(this, *mobileSwapLayout);
 	if (queue.current() != swap)
 		return;
+	// The swap's presentation time, the refresh the host answered in, in mach_continuous_time's
+	// clock, which its frame info carries (notify_swap_done_gated, which the class's
+	// swap_complete_gated calls).
+	const UInt64 shown = __atomic_exchange_n(&mobileShownAt, 0, __ATOMIC_ACQ_REL);
+	const UInt64 absolute = mach_absolute_time();
+	mobilePresentedAt = rgfxFrameInfoTime(shown, absolute, mach_continuous_time());
 	rgfxLegacySwapComplete(this);
 	const UInt64 now = mach_absolute_time();
 	noteMobileSwapRate(now);
@@ -656,13 +670,26 @@ RgfxIOMFBWord ReimsGraphics::set_notify_tag_mask_gated(IOMFB_NotificationType ty
 	return word(r);
 }
 
+// The frame info tags the device fills (RgfxLegacySwapInfo.hpp), one a call: the count, and tag
+// `index`'s name in `names[0]`, which IOMobileFramebuffer.framework asks for each index below the
+// count it is given at index 0. The records go as async results (`dataQueue` 0; the library reads
+// 1 as a shared data queue's, which no display here has).
 RgfxIOMFBWord ReimsGraphics::supported_frame_info(uint32_t index, uint32_t *count, char (*names)[64],
-                                                  uint32_t *field_3)
+                                                  uint32_t *dataQueue)
 {
+	IOReturn r = kIOReturnBadArgument;
+	const char *tag = rgfxFrameInfoTag(index);
+	if (count)
+		*count = kRgfxFrameInfoTagCount;
+	if (dataQueue)
+		*dataQueue = 0;
+	if (tag && names) {
+		strlcpy(names[0], tag, sizeof(names[0]));
+		r = kIOReturnSuccess;
+	}
 	if (logged(kSupportedFrameInfo))
-		IOLog("ReimsGraphics: supported_frame_info(%u, %p, %p, %p)\n", index, count, names,
-		      field_3);
-	return word(kIOReturnUnsupported);
+		IOLog("ReimsGraphics: supported_frame_info(%u) = 0x%x: %s\n", index, r, tag ? tag : "none");
+	return word(r);
 }
 
 RgfxIOMFBWord ReimsGraphics::factory_portal(void *field_0, task *owner)
@@ -711,10 +738,11 @@ RgfxIOMFBWord ReimsGraphics::do_swap_info_notify_gated(IOMFBNotifyRequest *reque
 }
 
 // The class's swap_complete_gated calls this with the completed swap's ID. As the paravirtual
-// display does, the swap's record (rgfxSwapInfoRecord) is made from the class's last vblank time and
-// the swap's own fields, at the release's offsets (RgfxLegacySwapLayout.hpp), and dispatched to each
-// notify request (swap_info_notify_dispatch_gated), after the records kept while the class held
-// them. A swap whose state word is not 0 gets none, answered kIOReturnUnsupported.
+// display does, the swap's record (rgfxSwapInfoRecord) is made, here from its presentation time
+// (completeMobileSwap) and the swap's own fields, at the release's offsets
+// (RgfxLegacySwapLayout.hpp), and dispatched to each notify request
+// (swap_info_notify_dispatch_gated), after the records kept while the class held them. A swap
+// whose state word is not 0 gets none, answered kIOReturnUnsupported.
 RgfxIOMFBWord ReimsGraphics::notify_swap_done_gated(uint32_t field_0, ::SwapInfoBlob *blob,
                                                     uint32_t *field_2, uint32_t field_3)
 {
@@ -725,7 +753,7 @@ RgfxIOMFBWord ReimsGraphics::notify_swap_done_gated(uint32_t field_0, ::SwapInfo
 	if (swap && *reinterpret_cast<const uint32_t *>(swap + l->state) == 0) {
 		const uint8_t *self = reinterpret_cast<const uint8_t *>(this);
 		RgfxSwapInfoRecord record = rgfxSwapInfoRecord(
-		    field_0, *reinterpret_cast<const uint64_t *>(self + l->vblankTime),
+		    field_0, mobilePresentedAt,
 		    *reinterpret_cast<const uint64_t *>(swap + l->swapRecordField00),
 		    *reinterpret_cast<const uint32_t *>(swap + l->swapFlags));
 		if (*reinterpret_cast<const uint16_t *>(self + l->notifyHeld) != 0) {

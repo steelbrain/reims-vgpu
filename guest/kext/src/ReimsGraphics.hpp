@@ -163,7 +163,7 @@ public:
 	RgfxIOMFBWord set_notify_tag_mask_gated(IOMFB_NotificationType type, IOMFBNotifyRequest *request,
 	                                        uint32_t mask) override;
 	RgfxIOMFBWord supported_frame_info(uint32_t index, uint32_t *count, char (*names)[64],
-	                                   uint32_t *field_3) override;
+	                                   uint32_t *dataQueue) override;
 	RgfxIOMFBWord factory_portal(void *field_0, task *owner) override;
 	RgfxIOMFBWord executeFactoryConfigurations_gated() override;
 	RgfxIOMFBWord set_frame_info_notification_state_gated(IOMFBNotifyRequest *request,
@@ -569,8 +569,13 @@ private:
 	bool mobileNodeAttached;
 	// Whether start_hardware joined power management, which stop_hardware_gated leaves.
 	bool mobilePowerJoined;
-	// The latest present's seqno, written before the host can answer it.
+	// The latest present's seqno, written before the host can answer it; the refresh its answer
+	// came in (mach_absolute_time's, 0 until it comes), which the swap's completion takes; and that
+	// swap's presentation time as its frame info carries it (mach_continuous_time's, 0 where it
+	// showed nothing), in the class's gate.
 	UInt64 mobilePresentSeqno;
+	UInt64 mobileShownAt;
+	UInt64 mobilePresentedAt;
 	UInt32 mobileTransaction;
 	// The release's swap queue (RgfxLegacySwapLayout.hpp), null where the class's size is no
 	// release's; the swap whose present waits for its answer, null where none does; and the event

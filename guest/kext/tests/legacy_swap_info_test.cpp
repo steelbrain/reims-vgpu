@@ -2,7 +2,8 @@
 // each release's offsets as its AppleParavirtGPU's notify_swap_done_gated, do_swap_info_notify_gated
 // and set_notify_tag_mask_gated and its IOMobileGraphicsFamily's note_vbl_ISR, swap_submit,
 // abort_swap_gated and dropSwap_gated use them; the record the paravirtual display makes; the
-// async result's values; and the records kept while the class holds them.
+// async result's values as IOMobileFramebuffer.framework reads them; the frame info tags the device
+// answers and its presentation time; and the records kept while the class holds them.
 #include "RgfxLegacySwapInfo.hpp"
 #include "RgfxLegacySwapLayout.hpp"
 
@@ -79,7 +80,8 @@ void record()
 {
 	const RgfxSwapInfoRecord r = rgfxSwapInfoRecord(77, 0x1122334455667788ull, 0xabcdef, 0x80000001u);
 	check(r.field_00 == 77 && r.field_04 == 0, "the swap's ID first", "record");
-	check(r.field_08 == 0x1122334455667788ull && r.field_10 == 0, "the vblank time, then 0", "record");
+	check(r.field_08 == 0x1122334455667788ull && r.field_10 == 0, "the presentation time, then 0",
+	      "record");
 	check(r.field_18 == 0xabcdef && r.field_20 == 0x80000001u && r.field_28 == 0,
 	      "the swap's field_00 copy, its flags zero-extended, then 0", "record");
 	uint8_t bytes[sizeof r];
@@ -94,30 +96,67 @@ void args()
 	const RgfxSwapInfoRecord r = rgfxSwapInfoRecord(9, 0x0000000500000010ull, 0x0000000700000020ull, 3);
 	uint64_t a[kRgfxSwapInfoMaxArgs + 1];
 
+	// As FrameInfoNotifyFunc reads them: with the mask's bit 31 clear, one argument a value.
 	uint64_t last = 0x0000000500000000ull;
 	uint32_t n = rgfxSwapInfoArgs(0x1f, &last, r, a);
-	check(n == 12, "five values in two words each, after the mask and the ID", "args");
+	check(n == 7, "five values in one argument each, after the mask and the ID", "args");
 	check(a[0] == 0x1f && a[1] == 9, "the mask, then the swap's ID", "args");
-	check(a[2] == 0x10 && a[3] == 5, "field_08, low word first", "args");
-	check(a[4] == 0x10 && a[5] == 0, "the second value is field_08 less the last", "args");
-	check(a[6] == 0x20 && a[7] == 7, "field_18", "args");
-	check(a[8] == 3 && a[9] == 0 && a[10] == 0 && a[11] == 0, "field_20, then field_28", "args");
+	check(a[2] == r.field_08, "field_08 whole", "args");
+	check(a[3] == 0x10, "the second value is field_08 less the last", "args");
+	check(a[4] == r.field_18 && a[5] == 3 && a[6] == 0, "field_18, field_20, then field_28", "args");
 	check(last == r.field_08, "the request's last becomes field_08", "args");
 
+	// With bit 31, two arguments a value, its low and then its high word.
+	last = 0x0000000500000000ull;
 	n = rgfxSwapInfoArgs(0x80000000u | 0x1f, &last, r, a);
-	check(n == 7, "with bit 31, one argument a value", "args");
-	check(a[0] == (0x80000000u | 0x1f) && a[2] == r.field_08 && a[3] == 0 &&
-	          a[4] == r.field_18 && a[5] == 3 && a[6] == 0,
-	      "the values whole, the second 0 against itself", "args");
+	check(n == 12, "with bit 31, two arguments a value, the fifth left out", "args");
+	check(a[0] == (0x80000000u | 0x1f) && a[1] == 9, "the mask as asked, then the ID", "args");
+	check(a[2] == 0x10 && a[3] == 5, "field_08, low word first", "args");
+	check(a[4] == 0x10 && a[5] == 0, "the difference, low word first", "args");
+	check(a[6] == 0x20 && a[7] == 7, "field_18", "args");
+	check(a[8] == 3 && a[9] == 0 && a[10] == 0 && a[11] == 0, "field_20, then field_28", "args");
 
 	last = 0x10;
 	n = rgfxSwapInfoArgs(0x2, &last, r, a);
-	check(n == 4 && a[2] == static_cast<uint32_t>(r.field_08 - 0x10) && a[3] == (r.field_08 - 0x10) >> 32,
-	      "a mask's bits pick the values", "args");
+	check(n == 3 && a[2] == r.field_08 - 0x10, "a mask's bits pick the values", "args");
 	n = rgfxSwapInfoArgs(0, &last, r, a);
 	check(n == 2 && a[0] == 0 && a[1] == 9, "no bit, the mask and the ID alone", "args");
 	n = rgfxSwapInfoArgs(0x60, &last, r, a);
 	check(n == 2, "bits past 4 pick nothing", "args");
+}
+
+// The frame info the device answers: two tags, by index, whose bits pick the record's
+// presentation time and its difference from the one sent before, one argument each, as
+// IOMobileFramebuffer.framework builds the client's dictionary from them.
+void frameInfo()
+{
+	check(kRgfxFrameInfoTagCount == 2, "two tags", "frameInfo");
+	check(std::strcmp(rgfxFrameInfoTag(0), "Presentation_time") == 0,
+	      "tag 0, QuartzCore's presentation time", "frameInfo");
+	check(std::strcmp(rgfxFrameInfoTag(1), "Presentation_delta") == 0, "tag 1, its difference",
+	      "frameInfo");
+	check(rgfxFrameInfoTag(2) == nullptr && rgfxFrameInfoTag(31) == nullptr, "none past them",
+	      "frameInfo");
+	for (uint32_t i = 0; i < kRgfxFrameInfoTagCount; i++)
+		check(std::strlen(rgfxFrameInfoTag(i)) < 64, "a name fits the 64 bytes asked", "frameInfo");
+
+	// A swap shown at 1000 absolute, the continuous clock 40 ahead: 1040; a swap that showed
+	// nothing, 0.
+	check(rgfxFrameInfoTime(1000, 5000, 5040) == 1040, "the shown time in the continuous clock",
+	      "frameInfo");
+	check(rgfxFrameInfoTime(1000, 5000, 5000) == 1000, "the clocks equal, the time as it is",
+	      "frameInfo");
+	check(rgfxFrameInfoTime(0, 5000, 5040) == 0, "nothing shown, 0", "frameInfo");
+
+	// QuartzCore's mask for both tags: bits 0 and 1, the presentation time, then its difference.
+	const uint64_t first = rgfxFrameInfoTime(1000, 5000, 5040);
+	const uint64_t second = rgfxFrameInfoTime(1400, 5400, 5440);
+	uint64_t a[kRgfxSwapInfoMaxArgs + 1];
+	uint64_t last = 0;
+	rgfxSwapInfoArgs(0x3, &last, rgfxSwapInfoRecord(11, first, 0, 0), a);
+	const uint32_t n = rgfxSwapInfoArgs(0x3, &last, rgfxSwapInfoRecord(12, second, 0, 0), a);
+	check(n == 4 && a[0] == 0x3 && a[1] == 12, "the mask and the swap's ID", "frameInfo");
+	check(a[2] == 1440 && a[3] == 400, "Presentation_time, then Presentation_delta", "frameInfo");
 }
 
 void kept()
@@ -161,6 +200,11 @@ void imports()
 	check(source.find("sendAsyncResult64WithOptions") != std::string::npos &&
 	          source.find("kIOUserNotifyOptionCanDrop") != std::string::npos,
 	      "the result is sent as one the client may drop", "imports");
+	check(source.find("rgfxFrameInfoTag(index)") != std::string::npos,
+	      "supported_frame_info answers the tags", "imports");
+	check(source.find("rgfxFrameInfoTime(shown, absolute, mach_continuous_time())") !=
+	          std::string::npos,
+	      "the presentation time goes in mach_continuous_time's clock", "imports");
 }
 
 } // namespace
@@ -170,6 +214,7 @@ int main()
 	layouts();
 	record();
 	args();
+	frameInfo();
 	kept();
 	imports();
 	std::printf("legacy_swap_info_test: %d checks passed (%zu releases)\n", checks,
