@@ -20,6 +20,9 @@
  * its three maps map nothing. ReimsGraphics does the same: the device reads a surface by its
  * IOSurface ID, so no layer's surface is mapped.
  *
+ * Of what the class implements for every subclass, ReimsGraphics overrides what reads the
+ * class's provider as an AppleARMIODevice unchecked where a process reaches it: get_dot_pitch.
+ *
  * A process finds the display as IOMobileFramebuffer.framework counts displays: by a node of the
  * device tree (attachMobileNode), then the framebuffer's service and the properties it publishes
  * (publishMobileDisplay).
@@ -68,6 +71,7 @@ enum MobileCall : unsigned {
 	kSwapLayerMap,
 	kSurfaceLayerMap,
 	kSurfaceLayerUnmap,
+	kGetDotPitch,
 	kVblank,
 	kPresented,
 	kMobileCalls,
@@ -499,6 +503,29 @@ RgfxIOMFBWord ReimsGraphics::surface_layer_unmap(IOMFB::AP::DisplayedData *data,
 	if (logged(kSurfaceLayerUnmap))
 		IOLog("ReimsGraphics: surface_layer_unmap(%p, %u)\n", data, layer);
 	return 0;
+}
+
+// IOMobileFramebufferLegacy's start keeps its provider as an AppleARMIODevice, NULL where the
+// provider is not one, as a PCI device is not, and leaves nothing else unset. Of the class's
+// functions that read it, get_dot_pitch alone calls through it unchecked: it reads the provider's
+// "dot-pitch" property, and IOMobileFramebufferUserClient's s_get_dot_pitch reaches it from any
+// process, so the class's own faulted (macOS 26.6.2 and 27.0.1, from photolibraryd). The others
+// do not fault: the thread find_swap_function_gated starts hands the provider to
+// AppleARMFunction::withProvider, which answers none for a NULL provider, and allocate_carveout
+// reads it only under a flag the family never sets (read from the IOMobileGraphicsFamily of
+// macOS 14.6.1, 15.6.1, 26.6.2 and 27.0.1; tests/legacy_overrides_test.cpp). The display's dot
+// pitch is its pixels per inch, as the paravirtual display answers from its own size.
+RgfxIOMFBWord ReimsGraphics::get_dot_pitch(uint32_t *pitch)
+{
+	if (!pitch)
+		return word(kIOReturnBadArgument);
+	IOLockLock(stateLock);
+	const Mode native = nativeMode(Mode{});
+	IOLockUnlock(stateLock);
+	*pitch = rgfxDisplayPixelsPerInch(native.width);
+	if (logged(kGetDotPitch))
+		IOLog("ReimsGraphics: get_dot_pitch() = %u\n", *pitch);
+	return word(kIOReturnSuccess);
 }
 
 #endif // __arm64e__

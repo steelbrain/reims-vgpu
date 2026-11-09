@@ -182,6 +182,9 @@ public:
 	RgfxIOMFBWord surface_layer_map(IOMFB::AP::DisplayedData *data, uint32_t layer,
 	                                IOSurface *surface) override;
 	RgfxIOMFBWord surface_layer_unmap(IOMFB::AP::DisplayedData *data, uint32_t layer) override;
+	// And what the class reads of its provider as an AppleARMIODevice, which a PCI device is not
+	// (ReimsGraphicsMobile.cpp): the dot pitch.
+	RgfxIOMFBWord get_dot_pitch(uint32_t *pitch) override;
 #endif
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the

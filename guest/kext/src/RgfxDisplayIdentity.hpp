@@ -30,12 +30,19 @@ constexpr uint32_t rgfxDisplaySerial(uint32_t displayId)
 	return (static_cast<uint32_t>(kRgfxDisplayProduct) << 16) | ((displayId + 1) & 0xffff);
 }
 
-// The size, in millimetres, of `pixels` of a display whose native mode is `width` pixels wide: at
-// 220 pixels per inch for a native mode at least 2880 pixels wide, as a high-density panel, and
-// 110 otherwise.
+// The pixels per inch of a display whose native mode is `width` pixels wide: 220 for a native mode
+// at least 2880 pixels wide, as a high-density panel, and 110 otherwise.
+constexpr uint32_t rgfxDisplayPixelsPerInch(uint32_t width)
+{
+	return width >= 2880 ? 220 : 110;
+}
+
+// The size, in millimetres, of `pixels` of a display whose native mode is `width` pixels wide, at
+// its pixels per inch.
 constexpr uint32_t rgfxDisplayMillimetres(uint32_t pixels, uint32_t width)
 {
-	return (pixels * 254 + (width >= 2880 ? 220 : 110) * 5) / ((width >= 2880 ? 220 : 110) * 10);
+	return (pixels * 254 + rgfxDisplayPixelsPerInch(width) * 5) /
+	       (rgfxDisplayPixelsPerInch(width) * 10);
 }
 
 // sRGB's primaries and D65 white, the display's colours, in thousandths of CIE 1931 x and y.

@@ -138,7 +138,8 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/gamma_capability_test \
 	$(BUILD)/tests/shared_event_ports_test $(BUILD)/tests/gl_surfaces_test \
 	$(BUILD)/tests/surface_rows_test $(BUILD)/tests/accel_types_test $(BUILD)/tests/pci_class_test \
-	$(BUILD)/tests/defer_carry_test $(BUILD)/tests/arm64_region_test
+	$(BUILD)/tests/defer_carry_test $(BUILD)/tests/arm64_region_test \
+	$(BUILD)/tests/legacy_overrides_test
 
 $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)

@@ -75,7 +75,8 @@
         "verify_swap": {},
         "swap_layer_map": {},
         "surface_layer_map": {},
-        "surface_layer_unmap": {}
+        "surface_layer_unmap": {},
+        "get_dot_pitch": { "required": true }
       }
     }
   ],
