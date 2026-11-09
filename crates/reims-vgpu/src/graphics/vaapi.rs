@@ -92,6 +92,13 @@ const MIN_SIZE: u32 = 16;
 
 /// H.264's top level, 6.2 (`level_idc` 62), and HEVC's, 6.2 (`general_level_idc` 186).
 const H264_TOP_LEVEL: u32 = 62;
+
+/// The widest H.264 picture answered where the driver's largest size holds more than
+/// `H264_MAX_MACROBLOCKS`: the widest either driver decodes. radeonsi answers 4096; iHD answers
+/// 8192 in `VAConfigAttribMaxPictureWidth`, but its surfaces' bound is 4096x4096 and it refuses
+/// every wider picture, from 4112x2160 to 8192x1024 (measured, Iris Xe of an i9-13900H, iHD
+/// 26.3.5, 2026-11-08).
+const H264_WIDEST: u32 = 4096;
 const HEVC_TOP_LEVEL: u32 = 186;
 
 /// The VA-API video of the runtime device `device`: on the render node of its GPU
@@ -304,9 +311,10 @@ fn decode_caps(codec: u32, configs: &[&ConfigCapabilities]) -> Option<RgfxVideoC
 
 /// H.264 decode: Baseline where a config of ConstrainedBaseline, Main or High decodes 4:2:0, as
 /// the decoder runs a Baseline stream on the first of those the driver has; Main on Main or High;
-/// High on High. NV12 out. The largest size is the driver's, its height lowered where its width
-/// would make a picture of more than `H264_MAX_MACROBLOCKS`, which the decoder refuses: 4096x4096
-/// is answered as 4096x4080, keeping 4096-wide pictures.
+/// High on High. NV12 out. The largest size is the driver's, but where it holds a picture of more
+/// than `H264_MAX_MACROBLOCKS`, which the decoder refuses, it is at most `H264_WIDEST` wide and as
+/// tall as the bound leaves at that width: radeonsi's 4096x4096 and iHD's 8192x8192 are answered
+/// as 4096x4080, which holds 3840x2160 and 4096x2160.
 fn h264_caps(caps: &Capabilities) -> Option<RgfxVideoCodecCaps> {
     let of = |profile| vld(caps, profile, RT_YUV420);
     let (baseline, main, high) = (
@@ -316,8 +324,13 @@ fn h264_caps(caps: &Capabilities) -> Option<RgfxVideoCodecCaps> {
     );
     let configs: Vec<&ConfigCapabilities> = [baseline, main, high].into_iter().flatten().collect();
     let mut entry = decode_caps(RGFX_VIDEO_CODEC_H264, &configs)?;
-    let columns = entry.max_size[0].div_ceil(16).max(1);
-    entry.max_size[1] = entry.max_size[1].min(H264_MAX_MACROBLOCKS / columns * 16);
+    let [width, height] = entry.max_size;
+    let macroblocks = u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16));
+    if macroblocks > u64::from(H264_MAX_MACROBLOCKS) {
+        let width = width.min(H264_WIDEST);
+        let height = height.min(H264_MAX_MACROBLOCKS / width.div_ceil(16) * 16);
+        entry.max_size = [width, height];
+    }
     for (bit, on) in [
         (RGFX_VIDEO_H264_BASELINE, !configs.is_empty()),
         (RGFX_VIDEO_H264_MAIN, main.is_some() || high.is_some()),

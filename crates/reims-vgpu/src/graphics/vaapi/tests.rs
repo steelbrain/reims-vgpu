@@ -94,9 +94,10 @@ fn the_caps_are_the_driver_s_answers() {
     );
 }
 
-/// H.264's largest size keeps its pictures to `H264_MAX_MACROBLOCKS`, the height lowered: a driver
-/// answering 4096x4096, which decodes nothing at that size (bugs.md, U28), is answered 4096x4080;
-/// sizes within the bound are the driver's
+/// H.264's largest size keeps its pictures to `H264_MAX_MACROBLOCKS`: radeonsi's 4096x4096, which
+/// it decodes nothing at (bugs.md, U28), and iHD's 8192x8192, whose pictures past 4096 wide it
+/// refuses, are both answered 4096x4080, which holds 3840x2160 and 4096x2160; sizes within the
+/// bound are the driver's
 #[test]
 fn h264_s_largest_size_stays_under_the_macroblocks_the_drivers_decode() {
     let largest = |max| {
@@ -109,10 +110,16 @@ fn h264_s_largest_size_stays_under_the_macroblocks_the_drivers_decode() {
             .max_size
     };
     assert_eq!(largest((4096, 4096)), [4096, 4080]);
+    assert_eq!(largest((8192, 8192)), [4096, 4080]);
     assert_eq!(largest((4096, 2304)), [4096, 2304]);
     assert_eq!(largest((4080, 4096)), [4080, 4096]);
-    let [width, height] = largest((4096, 4096));
-    assert!((width / 16) * (height / 16) <= H264_MAX_MACROBLOCKS);
+    for max in [(4096, 4096), (8192, 8192)] {
+        let [width, height] = largest(max);
+        assert!((width / 16) * (height / 16) <= H264_MAX_MACROBLOCKS);
+        for (w, h) in [(3840, 2160), (4096, 2160)] {
+            assert!(w <= width && h <= height, "{w}x{h} within {width}x{height}");
+        }
+    }
 }
 
 /// A profile whose config decodes no format of its own is left out, and a codec of none goes

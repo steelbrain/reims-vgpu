@@ -31,8 +31,8 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
   profiles, its highest level, its smallest and largest coded pictures, its DPB and reference
   bounds, its output formats, and the alignment at which it reads an access unit in place.
   Each answer is the arm's video API's own (the arms' docs), but for VA-API's largest H.264
-  size, kept under the 65,535 macroblocks its drivers decode: 4096x4096 is answered as 4096x4080
-  ([bugs.md](bugs.md), U28).
+  size, kept under the 65,535 macroblocks its drivers decode: radeonsi's 4096x4096 and iHD's
+  8192x8192 are answered as 4096x4080 ([bugs.md](bugs.md), U28).
 - **The flags**: `RGFX_VIDEO_CAPS_OUTPUT_CACHED` where the kext makes device caches, of every
   surface it asks one for (`RGFX_FEATURE_SURFACE_CACHE`, a GPU of its own memory) or of those
   whose textures would not lie in place in their pages (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`, a

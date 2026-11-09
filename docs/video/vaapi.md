@@ -753,7 +753,10 @@ Before anything reaches the GPU:
   (`H264_MAX_MACROBLOCKS`), past which iHD and radeonsi decode nothing of
   it while answering success ([bugs.md](bugs.md), U28), and a size past
   the driver's largest. The graphics device answers H.264's largest size
-  under the same bound, the driver's 4096x4096 as 4096x4080.
+  under the same bound, at most 4096 wide: radeonsi's 4096x4096 and
+  iHD's 8192x8192 as 4096x4080. iHD's `VAConfigAttribMaxPictureWidth` is
+  8192, but its surfaces' bound is 4096x4096, and it refuses every wider
+  picture, from 4112x2160 to 8192x1024.
 
 The Extended profile's pictures that use none of its own tools decode as
 Main's (VA's Main profile, else High), as Apple's AVC decoder on an x86-64
