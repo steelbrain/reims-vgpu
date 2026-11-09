@@ -7,6 +7,16 @@ MinKernel = "22.0.0"
 MaxKernel = ""
 
 [[kext]]
+BundlePath = "Graft-arm64e.kext"
+ExecutablePath = "Contents/MacOS/Graft"
+PlistPath = "Contents/Info.plist"
+Arch = "arm64e"
+MinKernel = "22.0.0"
+MaxKernel = ""
+Comment = "Binds and routes the owned guest kexts"
+sha256 = "6f4265dac0f9da7b789a94c2931511d7fc65de5acbb22d0b4991b77d56b217a7"
+
+[[kext]]
 BundlePath = "ReimsGraphics.kext"
 ExecutablePath = "Contents/MacOS/ReimsGraphics"
 PlistPath = "Contents/Info.plist"
