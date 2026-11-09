@@ -3,10 +3,11 @@
 // and set_notify_tag_mask_gated and its IOMobileGraphicsFamily's note_vbl_ISR, swap_submit,
 // abort_swap_gated and dropSwap_gated use them; the record the paravirtual display makes; its
 // words as IOMobileFramebuffer.framework reads them from the client's shared data queue; the frame
-// info tags the device answers and its presentation time; and the records kept while the class
-// holds them.
+// info tags the device answers and its presentation times, over a long run of refreshes as the
+// display's clocks give them; and the records kept while the class holds them.
 #include "RgfxLegacySwapInfo.hpp"
 #include "RgfxLegacySwapLayout.hpp"
+#include "RgfxVblankClock.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -144,16 +145,14 @@ void frameInfo()
 
 	// A swap shown at 1000 absolute, the continuous clock 40 ahead: 1040; a swap that showed
 	// nothing, 0.
-	check(rgfxFrameInfoTime(1000, 5000, 5040) == 1040, "the shown time in the continuous clock",
+	check(rgfxFrameInfoTime(1000, 40) == 1040, "the shown time in the continuous clock",
 	      "frameInfo");
-	check(rgfxFrameInfoTime(1000, 5000, 5000) == 1000, "the clocks equal, the time as it is",
-	      "frameInfo");
-	check(rgfxFrameInfoTime(0, 5000, 5040) == 0, "nothing shown, 0", "frameInfo");
+	check(rgfxFrameInfoTime(1000, 0) == 1000, "no lead, the time as it is", "frameInfo");
+	check(rgfxFrameInfoTime(0, 40) == 0, "nothing shown, 0", "frameInfo");
 
-	// The clocks read together: the continuous one 40 ahead of the absolute one, which ticks
-	// at the reads of it `ticks` says (from 1). Reads that agree give the lead exactly, the reads
-	// before them taken again where a tick fell between; where none agree, the last try's later
-	// read.
+	// The clocks read: the continuous one 40 ahead of the absolute one, which ticks at the reads
+	// of it `ticks` says (from 1). Reads that agree give the lead exactly; where none agree, the
+	// lead is at least the last continuous read less the later absolute read.
 	struct Clocks {
 		std::vector<uint64_t> ticks;
 		uint64_t now = 5000, reads = 0, continuousReads = 0;
@@ -173,30 +172,126 @@ void frameInfo()
 	const std::vector<std::vector<uint64_t>> agreeing = {{}, {3}, {2}, {2, 4}, {1, 2, 4, 6}};
 	for (const std::vector<uint64_t> &ticks : agreeing) {
 		Clocks k{ticks};
-		uint64_t a = 0, c = 0;
-		rgfxClocksTogether([&] { return k.absolute(); }, [&] { return k.continuous(); }, &a, &c);
-		check(c - a == 40 && rgfxFrameInfoTime(1000, a, c) == 1040,
+		RgfxFrameInfoClock clock;
+		rgfxReadClocks([&] { return k.absolute(); }, [&] { return k.continuous(); }, clock);
+		check(clock.lead() == 40 && clock.time(1000) == 1040,
 		      "reads that agree give the lead exactly", "frameInfo");
 	}
 	{
 		Clocks k{};
 		for (uint64_t r = 2; r <= 2 * kRgfxClockReads; r += 2)
-			k.ticks.push_back(r); // a tick between the two reads of every try
-		uint64_t a = 0, c = 0;
-		rgfxClocksTogether([&] { return k.absolute(); }, [&] { return k.continuous(); }, &a, &c);
-		check(k.continuousReads == kRgfxClockReads && c - a == 39,
-		      "none agree: every try made, the last one's later read", "frameInfo");
+			k.ticks.push_back(r); // a tick between the continuous read and the later absolute one
+		RgfxFrameInfoClock clock;
+		rgfxReadClocks([&] { return k.absolute(); }, [&] { return k.continuous(); }, clock);
+		check(k.continuousReads == kRgfxClockReads && clock.lead() == 39,
+		      "none agree: every try made, the lead at least the continuous less the later read",
+		      "frameInfo");
+		check(clock.time(1000) == 1039, "a time short by the tick", "frameInfo");
+		// A later reading that agrees: the lead exact, the time with it.
+		Clocks again{};
+		again.now = 9000;
+		rgfxReadClocks([&] { return again.absolute(); }, [&] { return again.continuous(); },
+		               clock);
+		check(clock.lead() == 40 && clock.time(1000) == 1040, "the lead exact once read so",
+		      "frameInfo");
+		// A reading short again leaves the lead: it never shrinks.
+		clock.read(20000, 20039, 20001);
+		check(clock.lead() == 40, "a lower bound under the lead leaves it", "frameInfo");
+		// The system slept 500 ticks: the lead grows with the next reading.
+		clock.read(30000, 30540, 30000);
+		check(clock.lead() == 540 && clock.time(2000) == 2540, "a longer lead after a sleep",
+		      "frameInfo");
+	}
+	{
+		// Times never go back: one shown before the last given is given as that one, and a swap
+		// that showed nothing reads 0 and changes nothing.
+		RgfxFrameInfoClock clock;
+		clock.read(5000, 5040, 5000);
+		check(clock.time(1001) == 1041, "the first time", "frameInfo");
+		check(clock.time(1000) == 1041, "a time before it given as it", "frameInfo");
+		check(clock.time(0) == 0, "nothing shown, 0", "frameInfo");
+		check(clock.time(1002) == 1042, "a later one as it is", "frameInfo");
 	}
 
 	// QuartzCore's mask for both tags: bits 0 and 1, the presentation time, then its difference.
-	const uint64_t first = rgfxFrameInfoTime(1000, 5000, 5040);
-	const uint64_t second = rgfxFrameInfoTime(1400, 5400, 5440);
+	const uint64_t first = rgfxFrameInfoTime(1000, 40);
+	const uint64_t second = rgfxFrameInfoTime(1400, 40);
 	uint64_t a[kRgfxSwapInfoMaxArgs + 1];
 	uint64_t last = 0;
 	rgfxSwapInfoArgs(0x3, &last, rgfxSwapInfoRecord(11, first, 0, 0), a);
 	const uint32_t n = rgfxSwapInfoArgs(0x3, &last, rgfxSwapInfoRecord(12, second, 0, 0), a);
 	check(n == 4 && a[0] == 0x3 && a[1] == 12, "the mask and the swap's ID", "frameInfo");
 	check(a[2] == 1440 && a[3] == 400, "Presentation_time, then Presentation_delta", "frameInfo");
+}
+
+// A long run of refreshes as the display gives its swaps' times: a 60 Hz display whose VBLANKs
+// reach the guest 0.1 to 3.1 ms late, a host that answers each present at once (no window), one to
+// three swaps a refresh, the guest's clock at 24 MHz with nanoseconds_to_absolutetime's conversion
+// (3/125 of a nanosecond, rounded down), and the clocks
+// read with 0 to 2 ticks of mach time passing at each read, so many readings agree in none of
+// their tries; midway the system sleeps for a second, which grows the continuous clock's lead.
+// QuartzCore takes each time back by the exact lead (mach_get_times): what it traces never goes
+// back, is never after the shown refresh nor more than 2 ticks before it, and is the shown refresh
+// exactly once a reading gave the lead exactly.
+void longRun()
+{
+	uint64_t x = 0x2545f4914f6cdd1dull;
+	auto next = [&x](uint64_t n) {
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		return x % n;
+	};
+	auto toTicks = [](uint64_t ns) { return ns * 3 / 125; };
+	const uint64_t periodNs = 16666667;
+	RgfxVblankClock vblank;
+	RgfxFrameInfoClock clock;
+	uint64_t lead = 0, traced = 0, lastShown = 0, swaps = 0, shared = 0, short_ = 0;
+	uint64_t mach = 0; // the absolute clock's ticks, as the reads advance it
+	for (uint64_t n = 1; n <= 100000; n++) {
+		if (n == 50000)
+			lead += 24000000; // a second asleep: the absolute clock stops, the continuous one not
+		const uint64_t hostNs = 5000000000ull + n * periodNs;
+		const uint64_t receiptNs = hostNs + 100000 + next(3000000);
+		vblank.vblank(n, hostNs, receiptNs);
+		uint64_t nowNs = receiptNs;
+		const uint64_t answers = 1 + next(3);
+		for (uint64_t k = 0; k < answers; k++) {
+			nowNs += 1000 + next(periodNs / 4);
+			const uint64_t shown = toTicks(vblank.shownAt(nowNs));
+			// The swap completes, and the clocks are read, a little after the answer.
+			mach = toTicks(nowNs) + 10 + next(100);
+			auto absolute = [&] {
+				const uint64_t t = mach;
+				mach += next(3);
+				return t;
+			};
+			auto continuous = [&] {
+				const uint64_t t = mach + lead;
+				mach += next(3);
+				return t;
+			};
+			rgfxReadClocks(absolute, continuous, clock);
+			const uint64_t time = clock.time(shown);
+			const uint64_t seen = time - lead;
+			check(clock.lead() <= static_cast<int64_t>(lead), "the lead never read past itself",
+			      "longRun");
+			check(swaps == 0 || seen >= traced, "a traced time never goes back", "longRun");
+			check(seen <= shown && seen + 2 >= shown,
+			      "a traced time is its refresh's, or at most 2 ticks before", "longRun");
+			if (clock.lead() == static_cast<int64_t>(lead))
+				check(seen == shown, "the refresh's exactly once the lead was read exactly",
+				      "longRun");
+			else
+				short_++;
+			shared += swaps && shown == lastShown ? 1 : 0;
+			traced = seen;
+			lastShown = shown;
+			swaps++;
+		}
+	}
+	check(shared > 1000 && short_ > 0, "the run has swaps sharing a refresh and short leads",
+	      "longRun");
 }
 
 // What IOMobileFramebuffer.framework makes of an entry of the client's shared data queue
@@ -244,8 +339,8 @@ void queueRecord()
 		const uint32_t mask = 0x3;
 		std::memcpy(request + r.requestMask, &mask, sizeof(mask));
 		uint64_t words[kRgfxSwapInfoMaxArgs + 1];
-		const uint64_t first = rgfxFrameInfoTime(1000, 5000, 5040);
-		const uint64_t second = rgfxFrameInfoTime(1400, 5400, 5440);
+		const uint64_t first = rgfxFrameInfoTime(1000, 40);
+		const uint64_t second = rgfxFrameInfoTime(1400, 40);
 		const uint32_t n1 = rgfxFrameInfoRecord(request, rgfxSwapInfoRecord(11, first, 7, 1), words);
 		Parsed p = readEntry(words, n1 * 8, r.name);
 		check(n1 == 4 && p.swapId == 11, "the first swap's record", r.name);
@@ -320,10 +415,10 @@ void imports()
 	      "Graft binds the enqueue from IOMobileGraphicsFamily", "imports");
 	check(source.find("rgfxFrameInfoTag(index)") != std::string::npos,
 	      "supported_frame_info answers the tags", "imports");
-	check(source.find("rgfxClocksTogether([] { return mach_absolute_time(); }, [] { return "
+	check(source.find("rgfxReadClocks([] { return mach_absolute_time(); }, [] { return "
 	                  "mach_continuous_time(); },") != std::string::npos &&
-	          source.find("rgfxFrameInfoTime(shown, absolute, continuous)") != std::string::npos,
-	      "the presentation time goes in mach_continuous_time's clock, the clocks read together",
+	          source.find("mobilePresentedAt = mobileFrameClock.time(shown);") != std::string::npos,
+	      "the presentation time goes in mach_continuous_time's clock by the display's frame clock",
 	      "imports");
 }
 
@@ -335,6 +430,7 @@ int main()
 	record();
 	args();
 	frameInfo();
+	longRun();
 	queueRecord();
 	kept();
 	imports();

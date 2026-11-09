@@ -178,6 +178,7 @@ bool ReimsGraphics::startMobile()
 	mobileSecond = 0;
 	mobileShownAt = 0;
 	mobilePresentedAt = 0;
+	mobileFrameClock = RgfxFrameInfoClock();
 	mobileSwapInfoKept.head = 0;
 	mobileSwapInfoKept.tail = 0;
 	// The release, by the size of the class this one derives from as the kernel has it.
@@ -637,10 +638,9 @@ void ReimsGraphics::completeMobileSwap()
 	// clock, which its frame info carries (notify_swap_done_gated, which the class's
 	// swap_complete_gated calls).
 	const UInt64 shown = __atomic_exchange_n(&mobileShownAt, 0, __ATOMIC_ACQ_REL);
-	uint64_t absolute = 0, continuous = 0;
-	rgfxClocksTogether([] { return mach_absolute_time(); }, [] { return mach_continuous_time(); },
-	                   &absolute, &continuous);
-	mobilePresentedAt = rgfxFrameInfoTime(shown, absolute, continuous);
+	rgfxReadClocks([] { return mach_absolute_time(); }, [] { return mach_continuous_time(); },
+	               mobileFrameClock);
+	mobilePresentedAt = mobileFrameClock.time(shown);
 	rgfxLegacySwapComplete(this);
 	const UInt64 now = mach_absolute_time();
 	noteMobileSwapRate(now);

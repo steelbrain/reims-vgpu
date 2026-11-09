@@ -159,32 +159,82 @@ inline const char *rgfxFrameInfoTag(uint32_t index)
 }
 
 // A swap's presentation time as the frame info carries it: `shown`, a time of mach_absolute_time's,
-// as mach_continuous_time's, from the two clocks read together (`absolute`, `continuous`,
-// rgfxClocksTogether); 0 stays 0, a swap that showed nothing.
-inline uint64_t rgfxFrameInfoTime(uint64_t shown, uint64_t absolute, uint64_t continuous)
+// as mach_continuous_time's, `lead` ticks ahead of it (RgfxFrameInfoClock); 0 stays 0, a swap that
+// showed nothing.
+inline uint64_t rgfxFrameInfoTime(uint64_t shown, int64_t lead)
 {
-	return shown ? shown + (continuous - absolute) : 0;
+	return shown ? shown + static_cast<uint64_t>(lead) : 0;
 }
 
-// How many times rgfxClocksTogether reads the clocks at most.
+// The presentation times a display's frame info carries, in mach_continuous_time's clock, as a
+// Mac's are: never before the one given before. QuartzCore takes each back into
+// mach_absolute_time's by the continuous clock's lead, which it reads with mach_get_times (its
+// frame_info_callback, read from 27.0.1's), so a time given here reaches its kdebug trace
+// (0x31ca002c) and its presentation timing as the shown refresh plus the error of the lead used
+// here.
+//
+// The lead, the time the system has spent asleep, is read from the clocks: the continuous one
+// read between two reads of the absolute one (rgfxReadClocks). A reading bounds it: it is at least
+// the continuous read less the later absolute read, and exactly that where the two absolute reads
+// agree. Taken from each swap's own reading, the lead came short by the ticks between the reads
+// (24 MHz, 41.7 ns each) where none of the swap's tries agreed, as happens in an arm64 VM: a swap
+// shown in the same refresh as the one before it got a time 1 or 2 ticks before that one's
+// (Ambrosia's g147 boots of 14.6.1, 15.6.1 and 26.6.2: 2 to 5 of 180 swaps in 3 s). The lead never
+// shrinks, as the system never gives back time it slept, so the clock keeps the largest lower bound
+// it has read: exact from the first reading whose continuous read came in the later absolute
+// read's tick, and never past the lead. And a time before the one given before is given as that
+// one, so two swaps shown in one refresh get one time.
+class RgfxFrameInfoClock
+{
+public:
+	// A reading of the clocks: the absolute one, then the continuous one, then the absolute one
+	// again.
+	void read(uint64_t before, uint64_t continuous, uint64_t after)
+	{
+		(void)before;
+		const int64_t atLeast = static_cast<int64_t>(continuous - after);
+		if (!have_ || atLeast > lead_)
+			lead_ = atLeast;
+		have_ = true;
+	}
+
+	// The time of a swap shown at `shown`, mach_absolute_time's, in the continuous clock, never
+	// before the time given before; 0 for a swap that showed nothing, which changes nothing.
+	uint64_t time(uint64_t shown)
+	{
+		if (!shown)
+			return 0;
+		uint64_t t = rgfxFrameInfoTime(shown, lead_);
+		if (t < given_)
+			t = given_;
+		given_ = t;
+		return t;
+	}
+
+	// The lead as read so far.
+	int64_t lead() const { return lead_; }
+
+private:
+	int64_t lead_ = 0;
+	bool have_ = false;
+	uint64_t given_ = 0;
+};
+
+// How many times rgfxReadClocks reads the clocks at most.
 constexpr int kRgfxClockReads = 8;
 
-// The absolute and the continuous clock read together, by `absolute` and `continuous`, into `*a`
-// and `*c`: the continuous clock read between two reads of the absolute one that agree, so its
-// lead over the absolute one, the time the system spent asleep, is exact, and two swaps shown in
-// one refresh get one presentation time. Read once each, the lead took the tick of mach time
-// between the reads where one fell there, and a swap's time came a tick before the one shown
-// before it in the same refresh (measured on a macOS 14.6.1 arm64 guest). Where none of
-// kRgfxClockReads tries agree, the last try's later absolute read: a lead short by the ticks
-// between its reads.
+// The absolute and the continuous clock read by `absolute` and `continuous` into `clock`: up to
+// kRgfxClockReads readings, the continuous clock between two reads of the absolute one, until the
+// two absolute reads agree.
 template <typename Absolute, typename Continuous>
-inline void rgfxClocksTogether(Absolute absolute, Continuous continuous, uint64_t *a, uint64_t *c)
+inline void rgfxReadClocks(Absolute absolute, Continuous continuous, RgfxFrameInfoClock &clock)
 {
 	for (int i = 0; i < kRgfxClockReads; i++) {
 		const uint64_t before = absolute();
-		*c = continuous();
-		*a = absolute();
-		if (*a == before)
+		const uint64_t c = continuous();
+		const uint64_t after = absolute();
+		clock.read(before, c, after);
+		if (after == before)
 			return;
 	}
 }
