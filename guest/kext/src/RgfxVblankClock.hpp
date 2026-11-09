@@ -3,7 +3,8 @@
 // kext does.
 //
 // The host stamps each VBLANK with the time of its refresh on its own monotonic clock, in
-// nanoseconds; the guest's mach_absolute_time counts nanoseconds too (x86-64). The two clocks
+// nanoseconds; the guest's clock is taken in nanoseconds too (an x86-64 guest's mach_absolute_time
+// counts them; the kext converts an arm64 guest's ticks to and from them). The two clocks
 // differ by an offset, and each refresh maps to its host time + that offset: a refresh's time is
 // when it happened, not when its interrupt was taken.
 //

@@ -160,6 +160,30 @@ inline void traceAttribute(const char *, IOIndex, IOSelect, uintptr_t, IOReturn)
 #endif
 #endif
 
+// The guest's clock in nanoseconds, which RgfxVblankClock maps the host's stamps in, and back: an
+// x86-64 guest's mach_absolute_time counts nanoseconds, and an arm64 guest's its timebase's ticks.
+inline UInt64 clockNs(UInt64 absolute)
+{
+#if defined(__arm64__)
+	UInt64 ns = 0;
+	absolutetime_to_nanoseconds(absolute, &ns);
+	return ns;
+#else
+	return absolute;
+#endif
+}
+
+inline UInt64 clockAbsolute(UInt64 ns)
+{
+#if defined(__arm64__)
+	UInt64 absolute = 0;
+	nanoseconds_to_absolutetime(ns, &absolute);
+	return absolute;
+#else
+	return ns;
+#endif
+}
+
 } // namespace
 
 // MARK: - Registers and the control rings
@@ -639,7 +663,7 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		answer(seqno, status);
 		// Every pipe client: the one whose transaction this answers takes it, at the time of
 		// the refresh the host answered in.
-		UInt64 shown = vblankClock.shownAt(mach_absolute_time());
+		UInt64 shown = clockAbsolute(vblankClock.shownAt(clockNs(mach_absolute_time())));
 		OSObject *clients[kMaxPipeClients];
 		IOSimpleLockLock(interruptLock);
 		UInt32 n = pipes.all(clients);
@@ -701,22 +725,24 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// The event's count and the host's stamp are 8 and 16 bytes into its payload
 		// (RgfxVblank); the refresh's time is the stamp in the guest's clock.
 		UInt64 count = size >= 16 ? *reinterpret_cast<const volatile UInt64 *>(payload + 8) : 0;
-		UInt64 now = mach_absolute_time();
+		UInt64 now = clockNs(mach_absolute_time());
 		if (hostTime) {
 			// The host's clock, read between two of ours (RgfxVblankClock::reading): only LO's
 			// read is timed.
 			UInt32 hi = readRegister(RGFX_REG_HOST_TIME_HI);
-			UInt64 before = mach_absolute_time();
+			UInt64 before = clockNs(mach_absolute_time());
 			UInt32 lo = readRegister(RGFX_REG_HOST_TIME_LO);
-			UInt64 after = mach_absolute_time();
+			UInt64 after = clockNs(mach_absolute_time());
 			UInt32 hiAgain = readRegister(RGFX_REG_HOST_TIME_HI);
 			vblankClock.reading(before, RgfxVblankClock::hostTime(hi, lo, hiAgain), after);
 		}
-		UInt64 time = size >= 24 ? vblankClock.vblank(count,
-		                                              *reinterpret_cast<const volatile UInt64 *>(payload + 16),
-		                                              now)
-		                         : now;
-		UInt64 next = size >= 24 ? vblankClock.next() : now + RgfxVblankClock::kDefaultPeriodNs;
+		UInt64 time = clockAbsolute(
+		    size >= 24 ? vblankClock.vblank(count,
+		                                    *reinterpret_cast<const volatile UInt64 *>(payload + 16),
+		                                    now)
+		               : now);
+		UInt64 next =
+		    clockAbsolute(size >= 24 ? vblankClock.next() : now + RgfxVblankClock::kDefaultPeriodNs);
 		for (UInt32 i = 0; i < n; i++) {
 			if (hook)
 				hook(clients[i], count, time, next);
