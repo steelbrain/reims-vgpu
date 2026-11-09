@@ -1,4 +1,4 @@
-//! A probe, for tests: whether the driver decodes into render targets imported over memory of
+//! A probe, run by hand: whether the driver decodes into render targets imported over memory of
 //! ours, laid out as a device cache's planes are, as a decode straight into a cache would; and
 //! whether a picture's later references read their targets, which a decode into a guest's output
 //! cannot have, since the output holds the picture alone (the wire's `DECODE_H264`).
@@ -6,6 +6,11 @@
 //! Each conformance stream is decoded three ways: into the driver's own surfaces, read back as the
 //! reference; into imported targets, the picture read from our memory itself; and into imported
 //! targets each overwritten once its picture is read, while the decoder may still reference it.
+//!
+//! It measures, and checks nothing but that it decoded something: the target check's tests
+//! (`super::target_check`) are the check. Its entry is an ignored test outside the `vaapi::` set
+//! the VA-API host's check runs (`crate::probes`), since it needs the conformance scripts'
+//! streams, which a checkout has only once the scripts have written them.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -280,18 +285,14 @@ fn run(display: &Display, stream: &std::path::Path, laid: Option<Laid>, scribble
     out
 }
 
-/// The probe over the conformance streams in `RVG_VA_STREAMS` (`:`-separated directories), on the
-/// display of `RVG_VAAPI_NODE`: for each way, how many of the reference's pictures came out the
+/// The probe over the conformance streams in `dirs` (`:`-separated directories), on the display
+/// of the render node `node`: for each way, how many of the reference's pictures came out the
 /// same, and the first stream each way refused or came out other at. Prints its answers; asserts
 /// only that it decoded something.
-#[test]
-#[ignore = "needs a VA-API GPU and the conformance suite's streams: run on the VA-API host"]
-fn imported_targets_and_their_references() {
+pub(crate) fn probe(node: &str, dirs: &str) {
     use crate::core::runtime::StdRuntime;
 
-    let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-    let display = Display::open(&node, std::sync::Arc::new(StdRuntime)).expect("a display");
-    let dirs = std::env::var("RVG_VA_STREAMS").expect("RVG_VA_STREAMS: the streams' directories");
+    let display = Display::open(node, std::sync::Arc::new(StdRuntime)).expect("a display");
     let mut streams: Vec<std::path::PathBuf> = (dirs.split(':'))
         .flat_map(|dir| std::fs::read_dir(dir).expect("a streams directory"))
         .map(|entry| entry.expect("a directory entry").path())

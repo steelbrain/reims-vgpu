@@ -1303,6 +1303,15 @@ and the bounded waits ("Waiting for the GPU", "Its tests"):
 cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^vaapi::/)'
 ```
 
+The probe of decodes into targets over memory of ours
+(`src/vaapi/va/target_probe.rs`) is outside that set, and runs by hand once
+the conformance scripts below have written their streams
+(`probes::va_imported_targets_and_their_references`, `src/probes.rs`): it
+decodes each stream into the driver's own surfaces and into targets over
+its memory, and prints how many pictures of each way came out as the
+driver's. It checks nothing but that it decoded something; the target
+check's ignored tests are the check.
+
 The hardware checks, from the checkout's root on a Linux host with libva
 and the oracles below:
 

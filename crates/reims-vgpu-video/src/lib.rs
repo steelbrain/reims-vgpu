@@ -12,5 +12,7 @@ pub mod codec;
 pub mod core;
 #[cfg(target_os = "linux")]
 pub mod nvidia;
+#[cfg(all(test, target_os = "linux"))]
+mod probes;
 #[cfg(target_os = "linux")]
 pub mod vaapi;

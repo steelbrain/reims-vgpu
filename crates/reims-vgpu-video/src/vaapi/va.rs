@@ -31,7 +31,7 @@ mod surface;
 mod target;
 mod target_check;
 #[cfg(test)]
-mod target_probe;
+pub(crate) mod target_probe;
 mod vpp_ffi;
 mod wait;
 mod zero_copy;

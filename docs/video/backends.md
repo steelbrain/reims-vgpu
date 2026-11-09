@@ -60,7 +60,9 @@ asking: a GPU that is not NVIDIA's loads no CUDA. Both are built on Linux alone.
   `cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^vaapi::/)'` (a VA-API
   host) and `cargo nextest run -p reims-vgpu-video --run-ignored only -E 'test(/^nvidia::/)'`
   (an NVIDIA host) run them: the bindings' layouts against the installed headers, and the
-  hardware's own answers.
+  hardware's own answers. The probes, which print what they measure over inputs a checkout
+  does not hold and check nothing else, are ignored tests outside both sets (`src/probes.rs`),
+  run by hand.
 - **The arms' tests** are reims-vgpu's `graphics::` tests, on any host: the host sessions' on
   the fake platform (`video_host`'s tests), and the VA-API arm's on driver answers the tests
   make up (`graphics/vaapi/tests.rs`).

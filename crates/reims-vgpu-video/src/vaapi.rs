@@ -20,6 +20,10 @@ pub use va::{
     TargetShape,
 };
 
+/// The probe of decodes into targets over memory of ours, which `crate::probes` runs by hand.
+#[cfg(test)]
+pub(crate) use va::target_probe;
+
 pub use va::{
     EncoderCapabilities, EncoderSupport, Feature, HevcBlockSizes, HevcFeatures, UploadMethod,
     VideoEncoder, encoder_support,
