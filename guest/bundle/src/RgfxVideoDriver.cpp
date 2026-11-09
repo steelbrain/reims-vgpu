@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
@@ -483,6 +484,9 @@ struct Context {
 	// The layout its H.264 pictures' parsed SPS comes in (rgfx::video::h264::SpsLayout), once a
 	// picture's has shown it, and 0 until then.
 	std::atomic<uint8_t> h264_sps_layout{0};
+	// Held across a schedule of its pictures (ScheduleCommands): one list of the context's at a
+	// time, so they reach its session in AppleGVA's order, while other contexts' lists go on.
+	std::mutex schedule{};
 };
 
 // The live sessions, whose output textures go when AppleGVA frees its frames' pool.
@@ -573,7 +577,6 @@ struct Token {
 };
 constexpr size_t kTokens = 1024;
 std::mutex g_tokenLock;
-std::mutex g_scheduleLock;
 Token g_tokens[kTokens];
 uint64_t g_seqno;
 
@@ -1288,8 +1291,23 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		std::vector<void *> verdicts;
 		bool sent = true;
 		{
-			// One list at a time, so pictures reach their sessions in AppleGVA's order.
-			std::lock_guard<std::mutex> hold(g_scheduleLock);
+			// One list of a context's at a time, so its pictures reach its session in AppleGVA's
+			// order: the schedule locks of the contexts the list names, taken in their order in
+			// memory. Another context's list goes on meanwhile, as a picture's work here can take
+			// milliseconds (the first textures over a new output surface wait for the host).
+			std::vector<Context *> contexts;
+			for (uint32_t i = 0; i < cl->count; i++) {
+				const Command *decode = decodeCommand(cl->commands[i]);
+				Context *context = decode ? (Context *)decode->context : nullptr;
+				if (context &&
+				    std::find(contexts.begin(), contexts.end(), context) == contexts.end())
+					contexts.push_back(context);
+			}
+			std::sort(contexts.begin(), contexts.end(), std::less<Context *>());
+			std::vector<std::unique_lock<std::mutex>> holds;
+			holds.reserve(contexts.size());
+			for (Context *context : contexts)
+				holds.emplace_back(context->schedule);
 			for (uint32_t i = 0; i < cl->count && sent; i++) {
 				const Command *decode = decodeCommand(cl->commands[i]);
 				const Context *context = decode ? (const Context *)decode->context : nullptr;

@@ -7,8 +7,9 @@
  * driver cannot send fails its schedule, that an HEIF grid's HEVC tile lands at its place in its
  * canvas, cropped to the canvas, that no answer of the driver AppleGVA may divide by is 0 (an
  * alignment, a plane's size or pitch, a budget, a limit, a decoder's tile parameter), that a tile
- * parameter it cannot write whole is refused rather than answered unwritten, and that each driver
- * AppleGVA makes keeps bitstream pools of its own.
+ * parameter it cannot write whole is refused rather than answered unwritten, that each driver
+ * AppleGVA makes keeps bitstream pools of its own, and that a context's schedule waits only for
+ * its own context's, not for another's held in its work.
  *
  * Exits 0 and prints a one-line summary when every check passes; aborts on the first failure.
  */
@@ -18,6 +19,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -229,6 +235,14 @@ int g_work;
 // for since a check cleared the count.
 int g_verdict = 1;
 int g_waits;
+// The stand-in's decodes run on the schedules' threads, so what they record is under g_sentLock;
+// a decode on the session g_holdOn waits there until g_holdOn is cleared, as the driver's work for
+// a picture waits for the host (its output's first textures), g_held saying it is waiting.
+std::mutex g_sentLock;
+std::condition_variable g_sentChanged;
+FakeSession *g_holdOn = nullptr;
+bool g_held = false;
+std::vector<FakeSession *> g_sentOn;
 
 } // namespace
 
@@ -301,12 +315,21 @@ void forgetOutputs(Session *session)
 	session->forgotten++;
 }
 
-// Each decode is sent, as work that is done at once.
-void *decode(Session *, const Decode &d)
+// Each decode is sent, as work that is done at once; one on g_holdOn's session waits first.
+void *decode(Session *session, const Decode &d)
 {
+	std::unique_lock<std::mutex> hold(g_sentLock);
+	if (session == g_holdOn) {
+		g_held = true;
+		g_sentChanged.notify_all();
+		g_sentChanged.wait(hold, [&] { return g_holdOn != session; });
+		g_held = false;
+	}
 	const uint8_t *sets = d.parameterSets;
 	g_sent.push_back({d.output ? IOSurfaceGetID(d.output) : 0, d.x, d.y, d.width, d.height,
 	                  std::vector<uint8_t>(sets, sets + d.parameterSetsSize)});
+	g_sentOn.push_back(session);
+	g_sentChanged.notify_all();
 	return &g_work;
 }
 int tokenStatus(void *) { return 1; }
@@ -950,6 +973,64 @@ void checkHostVerdict()
 	CFRelease(surface);
 }
 
+// Contexts schedule apart: while the work of one context's picture waits in the driver (as the
+// first textures over a new output surface wait for the host), another context's schedule goes on
+// and its picture reaches its session; the same context's next schedule waits for the first, so
+// the context's pictures reach its session in AppleGVA's order.
+void checkContextsScheduleApart()
+{
+	using namespace std::chrono_literals;
+	g_opened.clear();
+	g_sentOn.clear();
+	std::vector<void *> contexts;
+	CHECK(makeContexts(2, contexts, kCodecHevc) == kOk, "a create of two HEVC decodes");
+	const uint64_t bitstream = allocate(g_driver, 0, 0x10000);
+	CHECK(bitstream != 0, "the bitstream pool refused");
+	std::memset((void *)bitstream, 0x5a, 0x100);
+	IOSurfaceRef surface = canvas(1280, 720);
+	static rgfx::video::h265::Sps sps;
+	static rgfx::video::h265::Pps pps;
+	sps = {};
+	pps = {};
+	sps.chroma_format_idc = 1;
+	sps.log2_diff_max_min_luma_coding_block_size = 3; // CTBs of 64
+	sps.pic_width_in_luma_samples = 1280;
+	sps.pic_height_in_luma_samples = 720;
+	const HevcPicture picture(surface, sps, pps, 0, 0, 0x100);
+	FakeSession *held = g_opened[0], *other = g_opened[1];
+	std::atomic<uint64_t> heldAnswer{~0ull}, otherAnswer{~0ull}, againAnswer{~0ull};
+	std::unique_lock<std::mutex> lock(g_sentLock);
+	g_holdOn = held;
+	std::thread first([&] { heldAnswer = scheduleHevc(contexts[0], picture); });
+	CHECK(g_sentChanged.wait_for(lock, 5s, [] { return g_held; }), "the held decode never began");
+	lock.unlock();
+	std::thread second([&] { otherAnswer = scheduleHevc(contexts[1], picture); });
+	std::thread again([&] { againAnswer = scheduleHevc(contexts[0], picture); });
+	lock.lock();
+	CHECK(g_sentChanged.wait_for(lock, 5s, [&] { return g_sentOn.size() == 1; }),
+	      "another context's schedule waited for a context's held decode");
+	CHECK(g_sentOn[0] == other, "a decode of the held context's sent while it was held");
+	// The held context's next schedule stays behind its first.
+	CHECK(!g_sentChanged.wait_for(lock, 200ms, [&] { return g_sentOn.size() > 1; }),
+	      "a context's second schedule went ahead of its first");
+	g_holdOn = nullptr;
+	g_sentChanged.notify_all();
+	lock.unlock();
+	first.join();
+	second.join();
+	again.join();
+	CHECK(heldAnswer == kOk && otherAnswer == kOk && againAnswer == kOk,
+	      "schedules answered %llu, %llu and %llu", (unsigned long long)heldAnswer.load(),
+	      (unsigned long long)otherAnswer.load(), (unsigned long long)againAnswer.load());
+	CHECK(g_sentOn.size() == 3 && g_sentOn[1] == held && g_sentOn[2] == held,
+	      "%zu decodes sent, the held context's not after the other's", g_sentOn.size());
+	ContextDelete del = {2, 0, contexts.data()};
+	CHECK(call(kDeleteContexts, &del) == kOk, "DeleteContexts");
+	CHECK(callOn(g_driver, kFreeBitstreamBufferPool, (const void *)0) == kOk,
+	      "FreeBitstreamBufferPool");
+	CFRelease(surface);
+}
+
 // An HEVC picture's frame describes its surface where its release lays the description out
 // (hevcOutputSurface): the driver searches the frame for the one layout, of fields of 4 or 8 bytes
 // from +0x60 to +0xa0, that names its surface, and its session keeps the layout its first picture
@@ -1427,6 +1508,7 @@ int main()
 	checkTileLanding();
 	checkHostBounds();
 	checkHostVerdict();
+	checkContextsScheduleApart();
 	checkFrameDescriptions();
 	checkH264SpsLayouts();
 	checkNoZeroAnswers();
