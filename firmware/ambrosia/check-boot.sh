@@ -248,7 +248,7 @@ REIMS_VGPU_WINDOW=0 REIMS_VGPU_LOG=info "$qemu" "${accel[@]}" \
   -device vmapple-virtio-blk-pci,variant=aux,drive=aux \
   -device vmapple-virtio-blk-pci,variant=root,drive=root \
   -netdev "user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:$port-:22" \
-  -device virtio-net-pci,netdev=net0 \
+  -device virtio-net-pci,netdev=net0,romfile= \
   -device reims-graphics-pci \
   -device "loader,file=$bundle,addr=0x120000000,force-raw=on" \
   -display none -serial "file:$out/serial.log" \
