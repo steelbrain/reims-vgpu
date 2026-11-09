@@ -423,8 +423,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crate::core::runtime::StdRuntime;
     use super::super::gated::GatedRuntime;
+    use crate::core::runtime::StdRuntime;
 
     use super::*;
 

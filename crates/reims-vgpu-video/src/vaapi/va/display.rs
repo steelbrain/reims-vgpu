@@ -375,8 +375,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crate::core::runtime::StdRuntime;
     use super::super::gated::{GatedRuntime, close_the_gate};
+    use crate::core::runtime::StdRuntime;
 
     use super::*;
 
@@ -465,7 +465,13 @@ mod tests {
                     a_display_let_go_once_its_drivers_exit_time_destructors_ran_calls_nothing";
         for _ in 0..5 {
             let child = std::process::Command::new(std::env::current_exe().expect("the test"))
-                .args(["--exact", name, "--nocapture", "--test-threads=1", "--ignored"])
+                .args([
+                    "--exact",
+                    name,
+                    "--nocapture",
+                    "--test-threads=1",
+                    "--ignored",
+                ])
                 .env(LATE_CHILD, "1")
                 .output()
                 .expect("a child");
