@@ -1,9 +1,11 @@
 // The native test of what ReimsGraphics overrides of IOMobileFramebufferLegacy's own methods
 // (ReimsGraphicsMobile.cpp): get_dot_pitch, because the class's start leaves its state unset for a
-// PCI device, and set_digital_out_mode, which the class answers kIOReturnUnsupported and the
-// paravirtual display overrides to set its modes. start keeps its provider as an AppleARMIODevice in
-// one field, NULL where the provider is not one, and the class's get_dot_pitch calls through that
-// field unchecked.
+// PCI device; set_digital_out_mode, which the class answers kIOReturnUnsupported and the
+// paravirtual display overrides to set its modes; and swap_set_color_matrix, which the class
+// answers kIOReturnUnsupported and the paravirtual display overrides to keep the matrix
+// (RgfxMobileColor.hpp, tests/mobile_color_test.cpp). start keeps its provider as an
+// AppleARMIODevice in one field, NULL where the provider is not one, and the class's get_dot_pitch
+// calls through that field unchecked.
 //
 // For each release the arm64e kexts run on, kReleases records that field and the vtable slot of
 // each method ReimsGraphics overrides for it, read from the release's IOMobileGraphicsFamily. Graft
@@ -49,6 +51,15 @@ constexpr Method kMethods[] = {
 	 "virtual graft_iomfb_word set_digital_out_mode(uint32_t field_0, uint32_t field_1);",
 	 "RgfxIOMFBWord set_digital_out_mode(uint32_t colorId, uint32_t timingId) override;",
 	 "__ZN25IOMobileFramebufferLegacy20set_digital_out_modeEjj"},
+	{"swap_set_color_matrix",
+	 "virtual graft_iomfb_word swap_set_color_matrix(IOMFBColorFixedMatrix *matrix,\n"
+	 "                                                   IOMFBColorMatrixFunction function,\n"
+	 "                                                   uint32_t field_2);",
+	 "RgfxIOMFBWord swap_set_color_matrix(IOMFBColorFixedMatrix *matrix,\n"
+	 "\t                                    IOMFBColorMatrixFunction function, uint32_t field_2) "
+	 "override;",
+	 "__ZN25IOMobileFramebufferLegacy21swap_set_color_matrixEP21IOMFBColorFixedMatrix"
+	 "24IOMFBColorMatrixFunctionj"},
 };
 constexpr size_t kMethodCount = sizeof(kMethods) / sizeof(kMethods[0]);
 
@@ -62,10 +73,10 @@ struct Release {
 };
 
 constexpr Release kReleases[] = {
-	{"14.6.1", 0x18a0, 0x1640, {292, 289}},
-	{"15.6.1", 0x19c0, 0x1758, {292, 289}},
-	{"26.6.2", 0x1af8, 0x1890, {293, 290}},
-	{"27.0.1", 0x1dd8, 0x1b80, {294, 291}},
+	{"14.6.1", 0x18a0, 0x1640, {292, 289, 331}},
+	{"15.6.1", 0x19c0, 0x1758, {292, 289, 334}},
+	{"26.6.2", 0x1af8, 0x1890, {293, 290, 335}},
+	{"27.0.1", 0x1dd8, 0x1b80, {294, 291, 343}},
 };
 
 // The SDK stand-in's virtual slots past its own: GRAFT_IOMFB_VTABLE_RESERVE.

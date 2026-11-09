@@ -81,7 +81,8 @@
         "surface_layer_map": {},
         "surface_layer_unmap": {},
         "get_dot_pitch": { "required": true },
-        "set_digital_out_mode": { "required": true }
+        "set_digital_out_mode": { "required": true },
+        "swap_set_color_matrix": { "required": true }
       }
     }
   ],

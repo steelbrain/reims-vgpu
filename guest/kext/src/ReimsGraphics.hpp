@@ -191,6 +191,10 @@ public:
 	// And the mode WindowServer sets of those the display publishes, by its colour and timing IDs
 	// (ReimsGraphicsMobile.cpp), which the class answers kIOReturnUnsupported.
 	RgfxIOMFBWord set_digital_out_mode(uint32_t colorId, uint32_t timingId) override;
+	// And the colour matrix WindowServer sets with a swap (ReimsGraphicsMobile.cpp,
+	// RgfxMobileColor.hpp), which the class answers kIOReturnUnsupported.
+	RgfxIOMFBWord swap_set_color_matrix(IOMFBColorFixedMatrix *matrix,
+	                                    IOMFBColorMatrixFunction function, uint32_t field_2) override;
 #endif
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the

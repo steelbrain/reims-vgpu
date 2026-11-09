@@ -33,6 +33,10 @@
  * kIOReturnUnsupported, to set the mode WindowServer picks of those it publishes. Unlike the
  * paravirtual display, which publishes three colour modes, it publishes one, and the device lists
  * one mode, so WindowServer picks none: the display starts in its preferred mode (start_hardware).
+ * And it overrides swap_set_color_matrix, which the class answers kIOReturnUnsupported, so
+ * WindowServer, which sets its accessibility matrix at each swap until the call succeeds, sets it
+ * once: as the paravirtual display does, it answers 0 and the display shows the matrix
+ * (RgfxMobileColor.hpp).
  *
  * A process finds the display as IOMobileFramebuffer.framework counts displays: by a node of the
  * device tree (attachMobileNode), then the framebuffer's service and the properties it publishes
@@ -47,6 +51,7 @@
 #include <libkern/libkern.h>
 
 #include "RgfxDisplayIdentity.hpp"
+#include "RgfxMobileColor.hpp"
 #include "RgfxMobileModes.hpp"
 
 #if defined(__arm64e__)
@@ -142,6 +147,7 @@ enum MobileCall : unsigned {
 	kSurfaceLayerUnmap,
 	kGetDotPitch,
 	kSetDigitalOutMode,
+	kSwapSetColorMatrix,
 	kVblank,
 	kPresented,
 	kSwapShown,
@@ -945,6 +951,36 @@ RgfxIOMFBWord ReimsGraphics::set_digital_out_mode(uint32_t colorId, uint32_t tim
 		IOLog("ReimsGraphics: set_digital_out_mode(%u, %u) = 0x%x: %ux%u at %u.%03u Hz\n", colorId,
 		      timingId, r, mode.width, mode.height, mode.refreshMhz / 1000, mode.refreshMhz % 1000);
 	return word(r);
+}
+
+// The colour matrix WindowServer sets with a swap, by IOMobileFramebufferSwapSetColorMatrix:
+// QuartzCore sets its accessibility matrix so (function 2) at each swap until the call succeeds
+// (RgfxMobileColor.hpp). As the paravirtual display does, any function and field are answered 0,
+// NULL sets the identity, and the display shows the matrix from the next present: the device's
+// DISPLAY_COLOR matrix stage, which the host stages for the next PRESENT_SURFACE it takes and
+// keeps until it is set again, as the x86-64 display pipe sets it (RgfxPipeColor.hpp); an
+// identity turns the stage off. The user client calls it ungated, in WindowServer's thread, so
+// the post may wait for the ring's room. A host without RGFX_FEATURE_DISPLAY_COLOR shows no
+// matrix, and the call is still answered 0, as the paravirtual display answers whatever its host
+// does with it.
+RgfxIOMFBWord ReimsGraphics::swap_set_color_matrix(IOMFBColorFixedMatrix *matrix,
+                                                   IOMFBColorMatrixFunction function,
+                                                   uint32_t field_2)
+{
+	RgfxColorEntry rows[kRgfxMobileMatrixRows];
+	rgfxMobileColorMatrix(reinterpret_cast<const int64_t *>(matrix), rows);
+	// A swap's colour has no pipe transaction: its parts carry 0, which the host only logs.
+	const IOReturn posted =
+	    displayColor() ? postDisplayColor(0, RGFX_COLOR_MATRIX, kRgfxMobileMatrixRows,
+	                                      reinterpret_cast<const UInt8 *>(rows))
+	                   : kIOReturnUnsupported;
+	if (logged(kSwapSetColorMatrix))
+		IOLog("ReimsGraphics: swap_set_color_matrix(%s, %u, %u): rows %08x %08x %08x / %08x %08x "
+		      "%08x / %08x %08x %08x, posted 0x%x\n",
+		      matrix ? "matrix" : "NULL", static_cast<uint32_t>(function), field_2, rows[0].x,
+		      rows[0].y, rows[0].z, rows[1].x, rows[1].y, rows[1].z, rows[2].x, rows[2].y, rows[2].z,
+		      posted);
+	return word(kIOReturnSuccess);
 }
 
 IOReturn ReimsGraphics::setMobileMode(uint32_t colorId, uint32_t timingId, Mode *shown)
