@@ -402,6 +402,10 @@ pub fn created_or_decided<T>(
 ///   clips, which stores a depth the bias takes past `[0, 1]` unclamped, where Metal stores 0
 ///   or 1. Announced at the draw, inside its call, which dies at its selector. MoltenVK does not
 ///   enable the extension, so no draw here reaches it;
+/// - `RestrictedDepthUpload` and the note `RestrictedDepthRange`: a `Depth32Float` value outside
+///   `[0, 1]` on a device without `VK_EXT_depth_range_unrestricted`, MoltenVK included, which
+///   stores it clamped where Metal keeps it. Announced inside the call that meets it (an upload;
+///   for the note, a draw binding a pipeline that compares depth), which dies at its selector;
 /// - the kinds whose answer this host's driver gives as Metal's, which another device's may not,
 ///   so that no device here announces them, each dying where a device announces it, inside the
 ///   guest's call that met it (a draw, a pass, an upload, a resource's or the device's creation;
@@ -411,9 +415,6 @@ pub fn created_or_decided<T>(
 ///     deviations `MetalDepth16BiasedStores` and `MetalDepth16Stores`), where another device
 ///     biases, converts and rounds the depth by its own rules. Each is announced at the draw or
 ///     the pass;
-///   - `RestrictedDepthUpload` and the note `RestrictedDepthRange`, a `Depth32Float` value outside
-///     `[0, 1]` that a device stores clamped, which MoltenVK keeps
-///     (`DepthImageKeepsValuesOutsideUnitRange`);
 ///   - `UnmeasuredResolve`, a resolve past 4 samples, of a texture neither this device nor Metal's
 ///     here makes;
 ///   - `MoltenVkArgumentBuffersUnread` and the note
@@ -2838,11 +2839,12 @@ mod tests {
         //   otherwise than Metal's, which keeps it and compares a positive one above zero and a
         //   negative one not below zero. Announced once per device, where
         //   the denormal may be stored, not where a depth test or a read meets one. Grounds:
-        //   - this host's answer, measured equal to Metal's: MoltenVK keeps a denormal in a depth
-        //     image on the M3 Max (the runtime's `DepthImageKeepsDenormals`),
-        //     and its depth test compares one as Metal's does there, positive and negative,
-        //     written by a blit or a pass's clear, under every compare function but `Never` and
-        //     `Always` (`gpu::depth_denormals`'
+        //   - this host's answer, measured equal to Metal's: MoltenVK keeps a positive denormal
+        //     in a depth image on the M3 Max (the runtime's `DepthImageKeepsDenormals`),
+        //     and its depth test compares one as Metal's does there, written by a blit or a pass's
+        //     clear, under every compare function but `Never` and `Always`; a negative one a blit
+        //     writes is stored as 0, the upload's clamp into `[0, 1]` (`RestrictedDepthUpload`)
+        //     (`gpu::depth_denormals`'
         //     `denormal_depths_store_and_compare_as_metals`, which announces the kind); the
         //     runtime measured that depth test on an Apple M4 alone (`DepthTestKeepsDenormals`),
         //     so it announces the kind on this host too;

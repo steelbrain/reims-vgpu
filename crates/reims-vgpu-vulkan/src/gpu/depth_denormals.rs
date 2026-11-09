@@ -267,15 +267,31 @@ fn denormal_depth_drawn<P: Platform>(
     )
 }
 
+/// `MTLCompareFunctionEqual`, `LessEqual` and `GreaterEqual`: the compare functions under which a
+/// fragment at depth 0 passes against a stored 0.
+const PASS_AT_ZERO: [u64; 3] = [2, 3, 6];
+
 /// A `Depth32Float` texture keeps a denormal depth that a blit from a buffer writes, positive or
 /// negative, or that a pass clears it to, and a draw at depth 0 compares against it, under every
 /// compare function but `Never` and `Always`, as Metal on this host does (an Apple M3 Max): the
 /// drawn colour and the depth's bytes are Metal's. Metal compares a positive denormal above
 /// zero, so a draw at 0 under `Less` covers the target, and keeps its bytes. The runtime
 /// announces `depth-denormals` at each such blit and clear on this host's MoltenVK, which it has
-/// measured on an Apple M4 alone; this is the measurement on this host's GPU
+/// measured on an Apple M4 alone; this is the measurement on this host's GPU.
+///
+/// A device without `VK_EXT_depth_range_unrestricted` (MoltenVK) clamps a blit's depths into
+/// `[0, 1]`: each blit dies of `restricted-depth-upload` in strict mode. By default the blit
+/// keeps a positive denormal, and the answer is Metal's; it stores a negative one as 0, its
+/// clamp, against which the draw at depth 0 passes under `Equal`, `LessEqual` and
+/// `GreaterEqual` alone: the colour white under those, the black clear under the others, and
+/// every depth byte 0. A pass's clear, to a positive denormal alone, is no upload, and its
+/// answer is Metal's there too
 #[test]
 fn denormal_depths_store_and_compare_as_metals() {
+    use crate::gpu::device::tests::{clamped_depth, clamps_depth, uploading_depth};
+    const UPLOAD: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:\
+                          sourceSize:toTexture:destinationSlice:destinationLevel:\
+                          destinationOrigin:";
     let (p, d) = (platform(), dev());
     let mut cases = 0;
     for bits in DENORMALS {
@@ -288,9 +304,25 @@ fn denormal_depths_store_and_compare_as_metals() {
         };
         for &cleared in ways {
             for compare in 1..=6 {
-                let ours = denormal_depth_drawn(&p, &d, stored, cleared, compare);
+                let drawn = || denormal_depth_drawn(&p, &d, stored, cleared, compare);
+                let ours = if cleared {
+                    drawn()
+                } else {
+                    uploading_depth(&d, UPLOAD, drawn)
+                };
                 let case = format!("{bits:#010x}, cleared {cleared}, compare {compare}");
-                crate::metal_check_raw!(&case, ours);
+                if clamped_depth(bits) == bits || !clamps_depth(&d) {
+                    crate::metal_check_raw!(&case, ours);
+                } else {
+                    assert_eq!(clamped_depth(bits), 0, "{case}");
+                    let texel: [u8; 4] = match PASS_AT_ZERO.contains(&compare) {
+                        true => [0xff; 4],
+                        false => [0, 0, 0, 0xff],
+                    };
+                    let texels = usize::try_from(SIDE * SIDE).unwrap();
+                    let colour: Vec<u8> = texel.repeat(texels);
+                    assert_eq!(ours, (colour, vec![0; 4 * texels]), "{case}");
+                }
                 cases += 1;
             }
         }

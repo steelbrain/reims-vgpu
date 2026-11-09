@@ -1284,11 +1284,10 @@ mod tests {
     /// its depth, 4 bytes a texel, both ways, as Metal's does on this host (the same bytes, with
     /// the stencil left as it was). The stencil is written first, by a stencil-only upload: a new
     /// texture's never-written stencil reads what its memory held before, which on an RX 550
-    /// (RADV) was an earlier process's bytes. A device that may clamp a depth outside `[0, 1]`
-    /// (neither `VK_EXT_depth_range_unrestricted` nor the runtime's
-    /// `DepthImageKeepsValuesOutsideUnitRange`: ANV) dies at the upload in strict mode, naming
-    /// `restricted-depth-upload`, and copies depths in `[0, 1]` both ways, by default, where any
-    /// other device copies any bytes
+    /// (RADV) was an earlier process's bytes. A device without `VK_EXT_depth_range_unrestricted`,
+    /// which clamps a depth outside `[0, 1]` (ANV, and MoltenVK), dies at the upload in strict
+    /// mode, naming `restricted-depth-upload`, and copies depths in `[0, 1]` both ways, by
+    /// default, where any other device copies any bytes
     #[test]
     fn no_option_copies_a_combined_textures_depth() {
         use metal2vulkan::device::VkExtension;
@@ -1296,9 +1295,7 @@ mod tests {
                               sourceSize:toTexture:destinationSlice:destinationLevel:\
                               destinationOrigin:";
         let d = dev();
-        let keeps = (d.raw.enabled().extensions).contains(&VkExtension::ExtDepthRangeUnrestricted)
-            || (d.raw.properties().driver_facts)
-                .contains(&rt::DriverFact::DepthImageKeepsValuesOutsideUnitRange);
+        let keeps = (d.raw.enabled().extensions).contains(&VkExtension::ExtDepthRangeUnrestricted);
         let desc = crate::platform::tests::platform().texture_descriptor(
             &crate::core::platform::values::TextureDesc {
                 pixel_format: 260,

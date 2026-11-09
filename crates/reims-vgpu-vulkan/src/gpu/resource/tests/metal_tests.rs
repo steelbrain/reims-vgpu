@@ -6,7 +6,15 @@ use crate::core::platform::values::{
 };
 
 use super::*;
+use crate::gpu::device::tests::uploading_depth;
 use crate::os::OsSurface;
+
+/// A heap's texture's making, where a device that clamps a 32-bit float depth into `[0, 1]`
+/// (`gpu::device`'s `clamps_depth`: MoltenVK) dies of `restricted-depth-upload` in strict mode
+/// for a texture whose image holds a 32-bit float depth (`Depth32Float`, `Depth32Float_Stencil8`,
+/// an optimized `X32_Stencil8`) in a heap over the guest's pages, or in core's legacy heap: the
+/// runtime copies the heap's bytes into its depth image clamped.
+const PLACED: &str = "newTextureWithDescriptor:offset:";
 
 /// Of the suite's kernel function, made on `d`, a state without indirect command buffer
 /// support and one with it (`supportIndirectCommandBuffers` set): whether
@@ -3504,7 +3512,9 @@ fn a_buffer_over_a_one_level_two_plane_heap_texture_sees_its_texels_as_metals() 
 /// (`heap-texture-lossless-layout`, its bytes there Metal's uncompressed tiles) is relayed, not a
 /// death: a two-aspect `Depth32Float_Stencil8` render target, as the suite's depth and stencil
 /// cases place it (core's detach heap, `Shared` over the pages, and the texture of the heap's
-/// options, as core sets them whatever the guest's descriptor names)
+/// options, as core sets them whatever the guest's descriptor names). On a device that clamps a
+/// depth outside `[0, 1]` (MoltenVK), its making dies of `restricted-depth-upload` in strict
+/// mode, and by default it is made, the layout's announcement relayed
 #[test]
 fn heap_textures_over_guest_pages_metal_may_compress_are_made() {
     use crate::core::platform::os::vm::HostVm as _;
@@ -3548,7 +3558,7 @@ fn heap_textures_over_guest_pages_metal_may_compress_are_made() {
 
     let (p, d) = (platform(), dev());
     crate::answer::RELAYED.lock().clear();
-    assert!(placed(&p, &d));
+    assert!(uploading_depth(&d, PLACED, || placed(&p, &d)));
     let relayed = crate::answer::RELAYED.lock().clone();
     let lossless = rt::Degradation::HeapTextureLosslessLayout;
     assert!(relayed.contains(&lossless), "{relayed:?}");
@@ -3593,7 +3603,9 @@ fn use_heap<P: Platform>(d: &P::Device, heap: &P::Heap) {
 /// runtime lays the texture out there as Metal's tiles, uncompressed where Metal may keep it
 /// compressed (`heap-texture-lossless-layout`, relayed), so nothing keeps it apart. A buffer
 /// beside it is made, and one over its bytes once it is let go. Each is made as Metal makes it in
-/// the same heap, beside a buffer over all of the heap, as core makes with each heap
+/// the same heap, beside a buffer over all of the heap, as core makes with each heap. On a device
+/// that clamps a depth outside `[0, 1]` (MoltenVK), the first texture's making dies of
+/// `restricted-depth-upload` in strict mode, and by default each is made
 #[test]
 fn placements_over_heap_depth_stencil_targets_are_made_as_metals() {
     /// Each placement on `on`'s side, which `d` makes.
@@ -3615,7 +3627,8 @@ fn placements_over_heap_depth_stencil_targets_are_made_as_metals() {
         assert!(after.is_some(), "{on}: a buffer once it is let go");
         drop((b, whole));
     }
-    placements(&platform(), &dev(), "Vulkan");
+    let (p, d) = (platform(), dev());
+    uploading_depth(&d, PLACED, || placements(&p, &d, "Vulkan"));
 }
 
 /// A `Depth32Float_Stencil8` render target placed in a heap over the guest's pages beside its
@@ -3624,7 +3637,9 @@ fn placements_over_heap_depth_stencil_targets_are_made_as_metals() {
 /// (`heap-texture-lossless-layout`, relayed), so the cover sees its bytes as Metal's
 /// ([`Placements`]). So is one placed after the heap was made resident. Each is made as Metal
 /// makes it, and a fill of the cover over the texture and the pass that makes the heap resident
-/// run on both
+/// run on both. On a device that clamps a depth outside `[0, 1]` (MoltenVK), the first texture's
+/// making dies of `restricted-depth-upload` in strict mode, and by default each is made, and the
+/// fill and the pass run
 #[test]
 fn depth_stencil_targets_beside_the_heaps_cover_are_made_as_metals() {
     /// Each placement, fill and pass on `on`'s side, which `d` makes.
@@ -3642,7 +3657,8 @@ fn depth_stencil_targets_beside_the_heaps_cover_are_made_as_metals() {
         assert!(t.is_some(), "{on}: the texture once the heap was resident");
         drop((t, cover));
     }
-    beside_the_cover(&platform(), &dev(), "Vulkan");
+    let (p, d) = (platform(), dev());
+    uploading_depth(&d, PLACED, || beside_the_cover(&p, &d, "Vulkan"));
 }
 
 /// A view of a texture of a heap over the guest's pages, a 4-sample `Depth16Unorm` render target
@@ -3783,7 +3799,9 @@ fn multisampled_textures_in_a_heap_over_guest_pages_die_where_metal_compresses_t
 /// all of the heap, as core makes with each heap, is made first. In a `Shared` heap over the
 /// guest's pages, as core's detach heap is, with no such buffer, a `Depth32Float` one is made,
 /// and so are a buffer and a texture over a byte of it while it lives, and such a texture over a
-/// byte of a buffer that lives. Metal makes each made here or dying here
+/// byte of a buffer that lives. Metal makes each made here or dying here. On a device that clamps
+/// a depth outside `[0, 1]` (MoltenVK), the first texture's making dies of
+/// `restricted-depth-upload` in strict mode, and by default each placement is answered so
 #[test]
 fn placements_of_depth_textures_without_optimized_contents_take_metals_size() {
     let texture_sel = "newTextureWithDescriptor:offset:";
@@ -3864,58 +3882,66 @@ fn placements_of_depth_textures_without_optimized_contents_take_metals_size() {
         drop(b);
     }
     let depth = |side, allow| depth_of(&platform(), side, allow);
-    let suites = suites_of(&platform(), 0x120);
     let d = dev();
-    let raw = suites.fields().descriptor(texture_sel, Maker::SizeQuery);
-    let answer = plain(|| d.raw.heap_texture_size_and_align(&raw)).unwrap();
-    let (beside, _) = beside_and_over(answer.size, answer.align);
-    let h = private_heap();
-    let whole = h.new_buffer_of_length(0x8000, 0x120, 0).unwrap().unwrap();
-    for (case, desc, at) in [
-        ("a Depth32Float one", depth(16, Some(false)), 0),
-        ("the suite's", suites, 0),
-        ("with the property on", depth(16, Some(true)), beside),
-        ("a 64x64 one at 0x4000", depth(64, Some(false)), 0x4000),
-    ] {
-        assert!(h.new_texture(&desc, at).unwrap().is_some(), "{case}");
-    }
-    let suites = suites_of(&platform(), 0x120);
-    assert!(
-        (h.new_texture(&suites, beside).unwrap()).is_none(),
-        "nil where Metal's size runs past the heap's end"
-    );
-    assert!(
-        (h.new_texture(&depth(128, Some(false)), 0).unwrap()).is_none(),
-        "nil inside the heap where Metal's size does not fit either"
-    );
-    assert!(
-        (h.new_texture(&depth(16, Some(false)), 0x40).unwrap()).is_none(),
-        "nil off Metal's alignment"
-    );
-    assert!(
-        h.new_texture(&depth(16, Some(false)), 0x8000)
-            .unwrap()
-            .is_none()
-    );
-    drop(whole);
-    let p = platform();
-    let (shared, ..) = heap_over_pages(&p, &d);
-    let desc = depth_in(&p, 16, Some(false), shared.resource_options());
-    let raw = desc.fields().descriptor(texture_sel, Maker::SizeQuery);
-    let size = plain(|| d.raw.heap_texture_size_and_align(&raw)).unwrap();
-    let size = SizeAndAlign {
-        size: size.size,
-        align: size.align,
+    let placements = || {
+        let suites = suites_of(&platform(), 0x120);
+        let raw = suites.fields().descriptor(texture_sel, Maker::SizeQuery);
+        let answer = plain(|| d.raw.heap_texture_size_and_align(&raw)).unwrap();
+        let (beside, _) = beside_and_over(answer.size, answer.align);
+        let h = private_heap();
+        let whole = h.new_buffer_of_length(0x8000, 0x120, 0).unwrap().unwrap();
+        for (case, desc, at) in [
+            ("a Depth32Float one", depth(16, Some(false)), 0),
+            ("the suite's", suites, 0),
+            ("with the property on", depth(16, Some(true)), beside),
+            ("a 64x64 one at 0x4000", depth(64, Some(false)), 0x4000),
+        ] {
+            assert!(h.new_texture(&desc, at).unwrap().is_some(), "{case}");
+        }
+        let suites = suites_of(&platform(), 0x120);
+        assert!(
+            (h.new_texture(&suites, beside).unwrap()).is_none(),
+            "nil where Metal's size runs past the heap's end"
+        );
+        assert!(
+            (h.new_texture(&depth(128, Some(false)), 0).unwrap()).is_none(),
+            "nil inside the heap where Metal's size does not fit either"
+        );
+        assert!(
+            (h.new_texture(&depth(16, Some(false)), 0x40).unwrap()).is_none(),
+            "nil off Metal's alignment"
+        );
+        assert!(
+            h.new_texture(&depth(16, Some(false)), 0x8000)
+                .unwrap()
+                .is_none()
+        );
+        drop(whole);
+        let p = platform();
+        let (shared, ..) = heap_over_pages(&p, &d);
+        let desc = depth_in(&p, 16, Some(false), shared.resource_options());
+        let raw = desc.fields().descriptor(texture_sel, Maker::SizeQuery);
+        let size = plain(|| d.raw.heap_texture_size_and_align(&raw)).unwrap();
+        let size = SizeAndAlign {
+            size: size.size,
+            align: size.align,
+        };
+        over_pages(&p, &shared, size, &|case, _, made| {
+            assert!(made(), "{case}");
+        });
     };
-    over_pages(&p, &shared, size, &|case, _, made| {
-        assert!(made(), "{case}");
-    });
+    uploading_depth(&d, texture_sel, placements);
 }
 
 /// An optimized `X32_Stencil8` render target (`optimized-depth-stencil-texture`) placed in a
 /// heap over the guest's pages is made, as a `Depth32Float` one is: its size and alignment are
 /// the runtime's model of Metal's, a `Stencil8` one's of its shape, which the runtime's own
-/// answer covers. Metal makes each
+/// answer covers. Metal makes each. On a device that clamps a depth outside `[0, 1]`
+/// (MoltenVK), the making of each dies of `restricted-depth-upload` in strict mode, the
+/// `X32_Stencil8` one's too, whose image holds a 32-bit float depth beside its stencil, and by
+/// default each is made. The `X32_Stencil8` one's death is the runtime's bug at pin 27 (its copy
+/// in clamps the padding); pin 28 copies its stencil alone, unannounced, and this expectation
+/// flips there
 #[test]
 fn optimized_x32_stencil8_placements_are_made_as_metals() {
     let sel = "newTextureWithDescriptor:offset:";
@@ -3934,13 +3960,16 @@ fn optimized_x32_stencil8_placements_are_made_as_metals() {
     }
     let (p, d) = (platform(), dev());
     for pixel_format in [252, 261] {
-        let (heap, ..) = heap_over_pages(&p, &d);
-        let desc = target(&p, &heap, pixel_format);
+        let place = || {
+            let (heap, ..) = heap_over_pages(&p, &d);
+            let desc = target(&p, &heap, pixel_format);
+            heap.new_texture(&desc, 0).unwrap().is_some()
+        };
         *crate::answer::LAST_LINE.lock() = None;
-        let made = catch_death(|| heap.new_texture(&desc, 0));
+        let made = catch_death(|| uploading_depth(&d, sel, place));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
         let made = made.unwrap_or_else(|site| panic!("{pixel_format}: died at {site:?}: {line}"));
-        assert!(made.unwrap().is_some(), "{pixel_format} ({sel})");
+        assert!(made, "{pixel_format} ({sel})");
     }
 }
 
@@ -4947,6 +4976,8 @@ type LegacyBytes = Option<(u64, Vec<u8>, Vec<u8>)>;
 /// What [`legacy_heap_bytes_on`] shows of `shape` at 0x10000 on the Vulkan platform's `d`, and
 /// the degradations the runtime announced as it ran that are not of [`crate::answer::DIES`]; the
 /// death's site and line where it dies (of the format, which the runtime lacks, among others).
+/// On a device that clamps a depth outside `[0, 1]` (MoltenVK), a `Depth32Float` texture's making
+/// dies of `restricted-depth-upload` in strict mode, and it shows what it shows by default.
 fn legacy_heap_on_vulkan(
     d: &VulkanDevice,
     shape: LegacyShape,
@@ -4954,7 +4985,11 @@ fn legacy_heap_on_vulkan(
     let desc = |t: &TextureDesc| platform().texture_descriptor(t);
     *crate::answer::LAST_LINE.lock() = None;
     let before = crate::answer::RELAYED.lock().len();
-    match catch_death(|| legacy_heap_bytes_on::<VulkanPlatform>(d, &desc, shape, 0x10000)) {
+    let shown = || legacy_heap_bytes_on::<VulkanPlatform>(d, &desc, shape, 0x10000);
+    match catch_death(|| match shape.format {
+        252 => uploading_depth(d, PLACED, shown),
+        _ => shown(),
+    }) {
         Ok(bytes) => Ok((bytes, crate::answer::RELAYED.lock()[before..].to_vec())),
         Err(site) => {
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
@@ -5137,7 +5172,10 @@ fn legacy_heap_depth_textures_are_metals_where_metal_keeps_them_plain() {
 /// Metal keeps uncompressed, is laid out in Metal's tiles on MoltenVK, announcing nothing, and in
 /// the driver's layout on any other driver (`heap-texture-untiled-layout`); so is an 8x8 4-sample
 /// `RGBA8Unorm` render target without the property, whose image MoltenVK lays out as Metal's
-/// heap texture (the runtime's measured fact, `MultisampleColorImagesLieAsMetalHeapTextures`)
+/// heap texture (the runtime's measured fact, `MultisampleColorImagesLieAsMetalHeapTextures`).
+/// On a device that clamps a depth outside `[0, 1]` (MoltenVK), the `Depth32Float` one's making
+/// dies of `restricted-depth-upload` in strict mode, and by default it is made and announces its
+/// layout as above ([`legacy_heap_on_vulkan`])
 #[test]
 fn legacy_heap_textures_announce_the_runtimes_layouts() {
     let d = dev();

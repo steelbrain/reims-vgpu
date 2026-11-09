@@ -7,6 +7,15 @@ use super::*;
 /// The two-plane XR10 formats: `MTLPixelFormatRGB10A8_2P_XR10` and its sRGB twin.
 const TWO_PLANE_XR10: [u64; 2] = [550, 551];
 
+/// A blit from a buffer into a texture, without and with blit options: where a device that clamps
+/// a `Depth32Float` depth into `[0, 1]` dies of `restricted-depth-upload` in strict mode
+/// (`gpu::device`'s `uploading_depth`).
+const UPLOAD: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:\
+                      toTexture:destinationSlice:destinationLevel:destinationOrigin:";
+const UPLOAD_OPTIONS: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:\
+                              sourceBytesPerImage:sourceSize:toTexture:destinationSlice:\
+                              destinationLevel:destinationOrigin:options:";
+
 /// The 4 by 4 BGRA8Unorm texture a copy of 64 bytes from a no-copy buffer of 63 over a page
 /// of `0..=255` fills on platform `P`, read back.
 fn copied_past_a_no_copy_buffer_on<P: crate::core::platform::Platform>(
@@ -1025,9 +1034,14 @@ fn multisampled_copies_on<P: crate::core::platform::Platform>(
 ///
 /// The two `Depth32Float` shapes Metal keeps losslessly compressed (16 texels or more on the
 /// shorter side) read the copied values too where no pass cleared them first: the runtime counts
-/// a blit that writes a whole level as writing the pattern Metal's new texture reads
+/// a blit that writes a whole level as writing the pattern Metal's new texture reads.
+///
+/// On a device without `VK_EXT_depth_range_unrestricted` (MoltenVK), which clamps a depth outside
+/// `[0, 1]`, each copy into a `Depth32Float` texture dies of `restricted-depth-upload` in strict
+/// mode, and by default returns the buffer bit for bit, its depths inside `[0, 1]` as they are
 #[test]
 fn multisampled_depth_and_stencil_buffer_copies_are_metals() {
+    use crate::gpu::device::tests::uploading_depth;
     let vulkan = crate::platform::tests::platform();
     let depths = |n: u64| -> Vec<u8> {
         (0..n)
@@ -1070,8 +1084,12 @@ fn multisampled_depth_and_stencil_buffer_copies_are_metals() {
                 false => format!("{name}, uncleared"),
             };
             *crate::answer::LAST_LINE.lock() = None;
-            let ours =
-                catch_death(|| multisampled_copies_on(&vulkan, &dev(), cleared, shape, &units));
+            let d = dev();
+            let copies = || multisampled_copies_on(&vulkan, &d, cleared, shape, &units);
+            let ours = catch_death(|| match shape.0 {
+                252 => uploading_depth(&d, UPLOAD, copies),
+                _ => copies(),
+            });
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
             match ours {
                 Ok(ours) if ours == units => {}
@@ -1171,6 +1189,61 @@ fn texture_of(c: &Case) -> TextureDesc {
     }
 }
 
+/// Each slice's levels of `c`'s texture, each level's aspects, in order: its slice, level,
+/// extent, blit option and bytes a block.
+fn images_of(c: &Case) -> Vec<(u64, u64, [u64; 3], u64, u64)> {
+    let slices = match c.texture_type {
+        1 | 3 => c.array,
+        5 => 6,
+        6 => 6 * c.array,
+        _ => 1,
+    };
+    let whole = [(0, c.bpp)];
+    let aspects: &[(u64, u64)] = if c.aspects.is_empty() {
+        &whole
+    } else {
+        c.aspects
+    };
+    (0..slices)
+        .flat_map(|slice| {
+            (0..c.levels).flat_map(move |level| {
+                let e = c.extent.map(|e| (e >> level).max(1));
+                aspects
+                    .iter()
+                    .map(move |&(option, bpp)| (slice, level, e, option, bpp))
+            })
+        })
+        .collect()
+}
+
+/// The bytes of a level of `c`'s texture of `extent`, at `bpp` bytes a block.
+fn level_bytes(c: &Case, extent: [u64; 3], bpp: u64) -> u64 {
+    extent[0].div_ceil(c.block[0]) * bpp * extent[1].div_ceil(c.block[1]) * extent[2]
+}
+
+/// Whether `c`'s texture holds a 32-bit float depth: `Depth32Float` (252) or
+/// `Depth32Float_Stencil8` (260).
+fn holds_float_depth(c: &Case) -> bool {
+    matches!(c.format, 252 | 260)
+}
+
+/// The ranges of `c`'s bytes read back ([`fills_on`]) that hold its texture's 32-bit float
+/// depths, 4 bytes a texel: every image's but a stencil copy's (option 2). A copy of no option of
+/// `Depth32Float_Stencil8` moves its depth alone, as a depth copy (option 1) does.
+fn depth_ranges(c: &Case) -> Vec<std::ops::Range<usize>> {
+    if !holds_float_depth(c) {
+        return Vec::new();
+    }
+    let mut at = 0;
+    (images_of(c).into_iter())
+        .filter_map(|(_, _, e, option, bpp)| {
+            let range = at..at + usize::try_from(level_bytes(c, e, bpp)).unwrap();
+            at = range.end;
+            (option != 2).then_some(range)
+        })
+        .collect()
+}
+
 /// Each (slice, level) of `c`'s texture after its fills on platform `P`, read back, in order,
 /// each aspect's bytes in turn.
 fn fills_on<P: crate::core::platform::Platform>(
@@ -1185,30 +1258,7 @@ fn fills_on<P: crate::core::platform::Platform>(
         false => d.new_texture(OnFault::Return, &desc),
     };
     let t = t.unwrap().unwrap();
-    let slices = match c.texture_type {
-        1 | 3 => c.array,
-        5 => 6,
-        6 => 6 * c.array,
-        _ => 1,
-    };
-    let whole = [(0, c.bpp)];
-    let aspects: &[(u64, u64)] = if c.aspects.is_empty() {
-        &whole
-    } else {
-        c.aspects
-    };
-    // Each slice's levels, each level's aspects: its slice, level, extent, blit option and
-    // bytes a block.
-    let images: Vec<(u64, u64, [u64; 3], u64, u64)> = (0..slices)
-        .flat_map(|slice| {
-            (0..c.levels).flat_map(move |level| {
-                let e = c.extent.map(|e| (e >> level).max(1));
-                aspects
-                    .iter()
-                    .map(move |&(option, bpp)| (slice, level, e, option, bpp))
-            })
-        })
-        .collect();
+    let images = images_of(c);
     let buffer_of = |bytes: &[u8]| {
         let b = d
             .new_buffer_of_length(OnFault::Return, bytes.len() as u64, 0)
@@ -1360,10 +1410,12 @@ fn fills_on<P: crate::core::platform::Platform>(
 /// The texture fills write what Metal writes, where it writes it: bytes past a block go
 /// unread and a shorter colour repeats; levels, slices, cube faces and 3D depths; regions cut
 /// at the level, ignored slices and depths, and fills that write nothing; depth textures;
-/// a fill larger than the staging buffer
+/// a fill larger than the staging buffer. On a device that clamps a depth outside `[0, 1]`
+/// (MoltenVK), the `Depth32Float` texture's first upload dies of `restricted-depth-upload` in
+/// strict mode, and its bytes by default are Metal's with each depth clamped
+/// ([`fills_are_metals_under`])
 #[test]
 fn texture_fills_are_metals() {
-    use crate::core::platform::Platform as _;
     let rgba = [1.0, 0.5, 0.25, 1.0];
     let b = |level, slice, o, s, bytes: &[u8]| Fill::Bytes(level, slice, o, s, bytes.to_vec());
     let k = |level, slice, o, s, color, pf| Fill::Color(level, slice, o, s, color, pf);
@@ -1575,27 +1627,74 @@ fn texture_fills_are_metals() {
     );
     plain_usage.usage = 1;
     cases.push(plain_usage);
-    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
     for (i, c) in cases.iter().enumerate() {
-        let ours = fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, c);
-        let key = format!("case {i}");
-        crate::metal_check_bytes!(key, &ours);
+        fills_are_metals_under(&format!("case {i}"), c);
     }
 }
 
 /// `cases` filled on this platform, read back: each case's bytes are Metal's, recorded on the M3
-/// Max. A case this platform dies at fails, naming the death's site and line.
+/// Max ([`fills_are_metals_under`]). A case this platform dies at fails, naming the death's site
+/// and line.
 fn fills_are_metals(cases: &[Case]) {
-    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
     for (i, c) in cases.iter().enumerate() {
-        let what = format!("case {i}, format {}", c.format);
-        let ours = catch_death(|| fills_on::<VulkanPlatform>(&dev(), &vulkan_desc, c))
-            .unwrap_or_else(|site| {
-                let line = crate::answer::LAST_LINE.lock().clone();
-                panic!("{what}: died at {} ({:?}): {line:?}", site.file, site.kind)
-            });
-        crate::metal_check_bytes!(what, &ours);
+        fills_are_metals_under(&format!("case {i}, format {}", c.format), c);
     }
+}
+
+/// Case `c` filled on this platform, read back: its bytes are Metal's, recorded on the M3 Max
+/// under `key`. On a device that clamps a 32-bit float depth into `[0, 1]`
+/// (`gpu::device`'s `clamps_depth`: MoltenVK), a texture that holds one dies of
+/// `restricted-depth-upload` at its first upload in strict mode, and its bytes by default are
+/// Metal's with each depth clamped ([`clamped_fills_are_metals`]). A case this platform dies at
+/// fails, naming the death's site and line.
+fn fills_are_metals_under(key: &str, c: &Case) {
+    use crate::gpu::device::tests::{clamps_depth, uploading_depth};
+    let d = dev();
+    let vulkan_desc = |t: &TextureDesc| crate::platform::tests::platform().texture_descriptor(t);
+    let fills = || fills_on::<VulkanPlatform>(&d, &vulkan_desc, c);
+    let upload = match c.aspects.first() {
+        Some(&(option, _)) if option != 0 => UPLOAD_OPTIONS,
+        _ => UPLOAD,
+    };
+    let ours = catch_death(|| match holds_float_depth(c) {
+        true => uploading_depth(&d, upload, fills),
+        false => fills(),
+    })
+    .unwrap_or_else(|site| {
+        let line = crate::answer::LAST_LINE.lock().clone();
+        panic!("{key}: died at {} ({:?}): {line:?}", site.file, site.kind)
+    });
+    if holds_float_depth(c) && clamps_depth(&d) {
+        clamped_fills_are_metals(key, c, &ours);
+    } else {
+        crate::metal_check_bytes!(key, &ours);
+    }
+}
+
+/// Checks `ours`, case `c`'s bytes read back on a device that clamps a 32-bit float depth into
+/// `[0, 1]`, against Metal's under `key`: they are Metal's with each depth clamped
+/// (`gpu::device`'s `clamped_depth`). Every byte [`fills_on`] writes first is 0xee, whose depth
+/// is negative, which the device stores as 0 where Metal keeps it, and no fill of these cases
+/// writes a depth of 0: so with 0xeeeeeeee in place of each depth of 0 in `ours` they are
+/// Metal's bytes, recorded, and each such depth clamped answers `ours`.
+fn clamped_fills_are_metals(key: &str, c: &Case, ours: &[u8]) {
+    use crate::gpu::device::tests::clamped_depth;
+    let first = [0xee; 4];
+    assert_eq!(clamped_depth(u32::from_le_bytes(first)), 0);
+    let mut metals = ours.to_vec();
+    let mut clamped = ours.to_vec();
+    for range in depth_ranges(c) {
+        let (words, _) = metals[range.clone()].as_chunks_mut::<4>();
+        let (kept, _) = clamped[range].as_chunks_mut::<4>();
+        for (metal, kept) in words.iter_mut().zip(kept) {
+            if *metal == [0; 4] {
+                *metal = first;
+            }
+            *kept = clamped_depth(u32::from_le_bytes(*metal)).to_le_bytes();
+        }
+    }
+    assert_eq!(clamped, ours, "{key}: each depth clamped into [0, 1]");
+    crate::metal_check_bytes!(key, &metals);
 }
 
 /// The bytes of a Private 2D texture of `format`, of `bpp` bytes a texel, 64 texels wide, on
@@ -1964,7 +2063,10 @@ fn two_plane_xr10_fills_off_a_surface_are_metals() {
 /// the pattern cut at the block's bytes or repeated to them, the region counting blocks and
 /// cut at the level's; a 4:2:2 format's texels, 2 bytes each; a stencil format's, 1 byte;
 /// `Depth32Float_Stencil8`'s depth, 4 bytes, read back as its depth; at a level past the first
-/// and a 2D array's slice, with bytes and with a colour packed in another format
+/// and a 2D array's slice, with bytes and with a colour packed in another format. On a device
+/// that clamps a depth outside `[0, 1]` (MoltenVK), the `Depth32Float_Stencil8` texture's first
+/// upload dies of `restricted-depth-upload` in strict mode, and its bytes by default are Metal's
+/// with each depth clamped ([`fills_are_metals_under`])
 #[test]
 fn fills_the_runtime_writes_are_metals() {
     let rgba = [1.0, 0.5, 0.25, 1.0];
@@ -2037,7 +2139,10 @@ const DEPTH_AND_STENCIL: &[(u64, u64)] = &[(1, 4), (2, 1)];
 /// A `Depth32Float_Stencil8` texture is filled as Metal fills it, its depth and its stencil
 /// read back apart: each texel's depth the pattern cut at 4 bytes, its stencil kept, at a
 /// level past the first and a 2D array's slice, with bytes and with a colour packed in
-/// another format
+/// another format. On a device that clamps a depth outside `[0, 1]` (MoltenVK), each texture's
+/// first depth upload dies of `restricted-depth-upload` in strict mode, and its bytes by default
+/// are Metal's with each depth clamped, the stencil's as they are
+/// ([`fills_are_metals_under`])
 #[test]
 fn depth32_stencil8_fills_keep_the_stencil_as_metals() {
     let both = |c: Case| Case {
@@ -3465,9 +3570,13 @@ fn multisample_fills_on<P: crate::core::platform::Platform>(
 /// Max (macOS 27.0.1), as the runtime's probe of Metal found: a fill writes every sample of the
 /// region's texels and no other byte; where a texel's samples hold 16 bytes or fewer, sample `s`
 /// takes the pattern's bytes from `s` times the sample's, the pattern repeated, and past 16
-/// each sample takes the pattern cut at the sample's bytes
+/// each sample takes the pattern cut at the sample's bytes. On a device that clamps a depth
+/// outside `[0, 1]` (MoltenVK), each `Depth32Float` texture's upload dies of
+/// `restricted-depth-upload` in strict mode, and by default its depths, inside `[0, 1]`, are
+/// written as they are, its bytes Metal's
 #[test]
 fn multisample_fills_are_metals() {
+    use crate::gpu::device::tests::uploading_depth;
     let d = dev();
     let p = crate::platform::tests::platform();
     let ours_desc = |t: &TextureDesc| p.texture_descriptor(t);
@@ -3533,8 +3642,11 @@ fn multisample_fills_are_metals() {
             _ => noise(0x6d5 + u32::try_from(i).unwrap(), n),
         };
         let key = format!("case {i}");
-        match catch_death(|| {
-            multisample_fills_on::<VulkanPlatform>(&d, &ours_desc, *shape, &init, fills)
+        let filled =
+            || multisample_fills_on::<VulkanPlatform>(&d, &ours_desc, *shape, &init, fills);
+        match catch_death(|| match format {
+            252 => uploading_depth(&d, UPLOAD, filled),
+            _ => filled(),
         }) {
             Ok(ours) if crate::metal_matches_bytes!(key, &ours) => {}
             Ok(_) => differ.push(format!("{what}: the bytes differ from Metal's")),

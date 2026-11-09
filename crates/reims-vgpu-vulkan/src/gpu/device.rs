@@ -2244,6 +2244,56 @@ pub(crate) mod tests {
         DEVICE.clone_ref()
     }
 
+    /// Whether `d` stores a `Depth32Float` depth outside `[0, 1]` clamped into `[0, 1]`
+    /// ([`clamped_depth`]), where Metal keeps it: a device without
+    /// `VK_EXT_depth_range_unrestricted` (MoltenVK, ANV). The runtime announces
+    /// `restricted-depth-upload` at every upload into such a depth there, whatever values it
+    /// writes: a blit from a buffer, and a heap texture's copy in of the heap's bytes as it is
+    /// made over the guest's pages or in core's legacy heap.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clamps_depth(d: &VulkanDevice) -> bool {
+        use metal2vulkan::device::VkExtension;
+        !(d.raw.enabled().extensions).contains(&VkExtension::ExtDepthRangeUnrestricted)
+    }
+
+    /// The `Depth32Float` depth `bits` as a device that clamps ([`clamps_depth`]) stores it: a
+    /// NaN of either sign as 1.0, -0.0 as it is, any other negative value (a negative denormal
+    /// included) as 0, one above 1.0 as 1.0, and any other as it is, a positive denormal included.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn clamped_depth(bits: u32) -> u32 {
+        let depth = f32::from_bits(bits);
+        if depth.is_nan() || depth > 1.0 {
+            1.0f32.to_bits()
+        } else if depth.is_sign_negative() && bits != (-0.0f32).to_bits() {
+            0
+        } else {
+            bits
+        }
+    }
+
+    /// Runs `call`, which uploads into a `Depth32Float` depth, on `d`: as it is where `d` keeps a
+    /// depth outside `[0, 1]`. On a device that clamps ([`clamps_depth`]), `call` dies of
+    /// `restricted-depth-upload` at `site` in strict mode, and runs again under the default
+    /// ([`crate::answer::relaxed`]), which answers here: it relays that kind of
+    /// [`crate::answer::DIES`] and no other.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn uploading_depth<T>(d: &VulkanDevice, site: &str, call: impl Fn() -> T) -> T {
+        if !clamps_depth(d) {
+            return call();
+        }
+        let restricted = rt::Degradation::RestrictedDepthUpload;
+        let died = crate::answer::dies_of(restricted, &call);
+        assert_eq!(died.file, site, "where it dies of {}", restricted.code());
+        let before = crate::answer::relayed_counts();
+        let answer = crate::answer::relaxed(&call);
+        let relayed: Vec<rt::Degradation> = (crate::answer::relayed_counts().into_iter())
+            .filter(|count| !before.contains(count))
+            .map(|(kind, _)| kind)
+            .collect();
+        assert_eq!(relayed, [restricted], "the kinds of DIES relayed");
+        answer
+    }
+
     /// Waits, up to a minute each, for the checks the device starts on threads of its own as it
     /// is adopted: its in-place, queue-switch and submission checks. They make, import and submit
     /// through the program's paths, the runtime counts their imports with the program's, and the

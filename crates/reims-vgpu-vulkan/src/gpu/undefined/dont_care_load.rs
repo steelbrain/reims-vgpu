@@ -56,10 +56,16 @@ use super::{
     PRIVATE, Pass, RGBA8, RGBA16F, RGBA32F, SHARED, STENCIL8, STORE, STORE_AND_RESOLVE, Shape,
     Step, buffer, heard, masked_state, positions, random_bytes, run, state, writing,
 };
-use crate::gpu::device::tests::dev;
+use crate::gpu::device::tests::{dev, uploading_depth};
 use crate::platform::tests::platform;
 
 const KIND: rt::Degradation = rt::Degradation::DontCareLoadTiles;
+
+/// A blit from a buffer into a texture ([`Step::Upload`]), where a device that clamps a
+/// `Depth32Float` depth into `[0, 1]` (`gpu::device`'s `clamps_depth`: MoltenVK) dies of
+/// `restricted-depth-upload` in strict mode, whatever depths it writes.
+const UPLOAD: &str = "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:\
+                      toTexture:destinationSlice:destinationLevel:destinationOrigin:";
 
 /// What a probed texture held before its pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,7 +248,9 @@ fn colour_dont_care_loads_zero_the_reached_tiles_alone() {
 /// keeps every tile, the reached ones too, where it writes nothing (a nil state): as Metal does
 /// on this host in every run, `Depth32Float` and `Stencil8`, 64 by 64 and 100 by 70, uploaded or
 /// cleared before the pass. This platform's answer is Metal's, or the runtime announced
-/// `dont-care-load-tiles`
+/// `dont-care-load-tiles`. The uploaded depths lie in `[0, 1)`: on a device that clamps a depth
+/// outside `[0, 1]` (MoltenVK), each `Depth32Float` upload dies of `restricted-depth-upload` in
+/// strict mode, and by default writes them as they are
 #[test]
 fn depth_and_stencil_dont_care_loads_take_the_clear_value_where_the_pass_writes() {
     let (p, d) = (platform(), dev());
@@ -260,7 +268,11 @@ fn depth_and_stencil_dont_care_loads_take_the_clear_value_where_the_pass_writes(
     }
     let actions = (DONT_CARE, STORE);
     let differ = against_metal(&cases, |(shape, earlier, drawn)| {
-        single((&p, &d), (shape, earlier), actions, drawn)
+        let ours = || single((&p, &d), (shape, earlier), actions, drawn);
+        match (shape.format, earlier) {
+            (DEPTH32F, Earlier::Uploaded) => uploading_depth(&d, UPLOAD, ours),
+            _ => ours(),
+        }
     });
     eprintln!("off Metal's, dont-care-load-tiles heard: {differ:#?}");
 }
@@ -326,14 +338,18 @@ fn colour_and_depth<P: Platform>(
 /// tiles hold zero whatever the depth-stencil state, and the depth's hold the clear value only
 /// where a draw of the pass writes depth, the tile of a later draw under a nil state too: a draw
 /// under a nil state alone leaves the depth as it was, as Metal does on this host in every run.
-/// This platform's answer is Metal's, or the runtime announced `dont-care-load-tiles`
+/// This platform's answer is Metal's, or the runtime announced `dont-care-load-tiles`. The
+/// uploaded depths lie in `[0, 1)`: on a device that clamps a depth outside `[0, 1]` (MoltenVK),
+/// the depth's upload dies of `restricted-depth-upload` in strict mode, and by default writes
+/// them as they are
 #[test]
 fn a_depth_dont_care_load_clears_the_reached_tiles_once_the_pass_writes_depth() {
     let (p, d) = (platform(), dev());
     let mut differ = Vec::new();
     for draws in [(false, false), (true, false), (true, true)] {
         let key = format!("{draws:?}");
-        if !crate::metal_matches_raw!(&key, colour_and_depth((&p, &d), draws)) {
+        let ours = uploading_depth(&d, UPLOAD, || colour_and_depth((&p, &d), draws));
+        if !crate::metal_matches_raw!(&key, ours) {
             assert!(
                 heard(KIND),
                 "{draws:?}: off Metal's, with no {} heard",
