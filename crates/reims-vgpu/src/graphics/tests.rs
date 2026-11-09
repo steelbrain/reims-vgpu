@@ -7,7 +7,7 @@ use reims_vgpu_vulkan::core::platform::ObjId;
 use reims_vgpu_vulkan::core::platform::device::GpuDevice;
 use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
 use reims_vgpu_vulkan::core::testkit::faults::Fault;
-use reims_vgpu_vulkan::core::testkit::impls::device::FAKE_LINEAR_ROW_ALIGNMENT;
+use reims_vgpu_vulkan::core::testkit::impls::device::{FAKE_LINEAR_ROW_ALIGNMENT, FAKE_OWN_MEMORY};
 use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
 use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, HeldCall};
 use zerocopy::{FromBytes, IntoBytes};
@@ -7583,9 +7583,10 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// slots in the region (`ICB_SLOTS`), lets the guest read the clock its VBLANKs are stamped on
 /// (`HOST_TIME`), and shows the display pipe's colour (`DISPLAY_COLOR`). The fake's GPU shares
 /// the CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a device cache
-/// (`SURFACE_CACHE_REFUSED`), keeps none of the rest, and has the guest align the surfaces' rows
-/// as its GPU's images take them in place (the device info's `linear_row_alignment`), which a
-/// device of no surface pages leaves as they were
+/// (`SURFACE_CACHE_REFUSED`), keeps none of the rest, defers a fresh one of those that would need
+/// one whatever its pages (`SURFACE_DEFERRED_ASK`), within a quarter of its GPU's own memory's
+/// budget, and has the guest align the surfaces' rows as its GPU's images take them in place (the
+/// device info's `linear_row_alignment`), which a device of no surface pages leaves as they were
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     use reims_vgpu_vulkan::core::testkit::GuestRam;
@@ -7615,6 +7616,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_PAGES_BUFFERS
             | RGFX_FEATURE_HEAP_OVER_PAGES
             | RGFX_FEATURE_SURFACE_CACHE_REFUSED
+            | RGFX_FEATURE_SURFACE_DEFERRED_ASK
     } else {
         0
     };
@@ -7636,9 +7638,20 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_SHARED_EVENT_NAMES
     );
     assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
-    // The fake's GPU shares the CPU's memory: no deferred blocks, so no budget.
-    assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
-    assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
+    // The fake's GPU shares the CPU's memory: deferred blocks only where they ask.
+    let budget = if want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0 {
+        FAKE_OWN_MEMORY / 4
+    } else {
+        0
+    };
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into())),
+        budget & 0xffff_ffff
+    );
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into())),
+        budget >> 32
+    );
     let aligned = want & RGFX_FEATURE_SURFACE_PAGES != 0;
     assert_eq!(
         u64::from(device_info_of(&device).linear_row_alignment),
@@ -7674,7 +7687,8 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
 }
 
 /// The deferred blocks' budget is a quarter of the GPU's own memory's where the device offers
-/// `SURFACE_DEFERRED`, and 0 where it does not
+/// `SURFACE_DEFERRED`, or `SURFACE_DEFERRED_ASK` on a GPU that shares the CPU's memory, and 0
+/// where it offers neither
 #[test]
 fn the_deferred_budget_is_a_quarter_of_the_gpus_own_memory() {
     let deferred = u64::from(RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_SURFACE_DEFERRED);
@@ -7683,8 +7697,12 @@ fn the_deferred_budget_is_a_quarter_of_the_gpus_own_memory() {
         super::deferred_budget(deferred, 0xcf5c_2c000),
         0xcf5c_2c000 / 4
     );
+    let asking = u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED | RGFX_FEATURE_SURFACE_DEFERRED_ASK);
+    assert_eq!(super::deferred_budget(asking, 16 << 30), 4 << 30);
     let cached = u64::from(RGFX_FEATURE_SURFACE_CACHE);
     assert_eq!(super::deferred_budget(cached, 16 << 30), 0);
+    let refused = u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED);
+    assert_eq!(super::deferred_budget(refused, 16 << 30), 0);
 }
 
 /// What the poison-fill tests write over the guest's memory before the host answers into it: a

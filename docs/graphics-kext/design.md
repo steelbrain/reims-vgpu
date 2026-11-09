@@ -869,7 +869,7 @@ sit in BAR0 from 0x800.
 | 0x024 | `DRIVER_FEATURES_LO` | RW | feature bits 0-31 the guest's driver takes; reads back the ones the host took ("Negotiated features", below) |
 | 0x028 | `DRIVER_FEATURES_HI` | RW | feature bits 32-63, likewise |
 | 0x02c | `CONSUMED` | WO | writing a completion ring's offset wakes its producer waiting for room, under `CONSUMED_DOORBELL`; no host handles it yet, so it reads 0 and a write is ignored |
-| 0x030 | `DEFERRED_BUDGET_LO` | RO | under `SURFACE_DEFERRED`, the bytes of the host GPU's memory deferred blocks' device caches may hold, low 32 bits: a quarter of the device-local heap's budget, the same for the device's life; 0 without the feature |
+| 0x030 | `DEFERRED_BUDGET_LO` | RO | under `SURFACE_DEFERRED` or `SURFACE_DEFERRED_ASK`, the bytes of the host GPU's memory deferred blocks' device caches may hold, low 32 bits: a quarter of the device-local heap's budget, the same for the device's life; 0 without either feature |
 | 0x034 | `DEFERRED_BUDGET_HI` | RO | its high 32 bits |
 | 0x038 | `HOST_TIME_LO` | RO | under `HOST_TIME`, the host's monotonic clock at the read in ns, low 32 bits: the clock `VBLANK`s are stamped on; nothing is latched, so the guest reads `HI`, `LO`, `HI` and takes the second `HI` where `LO` is below 2^31, else the first; 0 where the guest did not take the feature |
 | 0x03c | `HOST_TIME_HI` | RO | its high 32 bits |
@@ -1059,6 +1059,15 @@ only where no negotiation can carry it.
   block again cached where the host answers `RGFX_STATUS_CACHE`. A host
   offers it where it offers `SURFACE_PAGES` and its GPU shares the CPU's
   memory, where it offers neither `SURFACE_CACHE` nor `SURFACE_DEFERRED`.
+- Bit 30 is `SURFACE_DEFERRED_ASK`, which means nothing without
+  `SURFACE_CACHE_REFUSED`: a fresh surface that would need a device cache
+  whatever its pages gets none until a CPU lock needs them, as under
+  `SURFACE_DEFERRED`. The kext's deferral carries `ASK_CACHE` and the
+  surface's layout; the host defers only such a surface and refuses the
+  rest, whose pages the kext then names asking (Decided 14, "Device caches
+  on a GPU that shares the CPU's memory"). A host offers it where it offers
+  `SURFACE_CACHE_REFUSED`, with its budget in `DEFERRED_BUDGET_LO` and
+  `_HI`.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

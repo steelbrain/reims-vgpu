@@ -60,14 +60,15 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
     RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SHARED_EVENT_NAMES,
     RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER,
-    RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-    RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
-    RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
-    RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
-    RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun,
-    RgfxSamplerState, RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
+    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
+    RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState,
+    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxSharedEventName,
+    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -193,9 +194,12 @@ pub struct GraphicsConfig {
 /// The bytes of the host GPU's memory deferred blocks' device caches may hold, which
 /// `DEFERRED_BUDGET_LO` and `_HI` read, of a device offering `features` on a GPU whose own memory's
 /// budget is `own_memory` ([`GpuDevice::own_memory_budget`]): a quarter of it, as the wire gives
-/// it (`RGFX_REG_DEFERRED_BUDGET_LO`); 0 without `SURFACE_DEFERRED`.
+/// it (`RGFX_REG_DEFERRED_BUDGET_LO`), whether the GPU shares the CPU's memory or not; 0 without
+/// `SURFACE_DEFERRED` or `SURFACE_DEFERRED_ASK`.
 fn deferred_budget(features: u64, own_memory: u64) -> u64 {
-    if features & u64::from(RGFX_FEATURE_SURFACE_DEFERRED) == 0 {
+    let deferring =
+        u64::from(RGFX_FEATURE_SURFACE_DEFERRED) | u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK);
+    if features & deferring == 0 {
         return 0;
     }
     own_memory / 4
@@ -345,8 +349,14 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | match (decoder.surface_pages_available(), unified_memory) {
                     (false, _) => 0,
                     // A host whose GPU shares the CPU's memory keeps a device cache only of the
-                    // surfaces whose pages its textures cannot use in place, where the kext asks.
-                    (true, true) => in_place | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED),
+                    // surfaces whose pages its textures cannot use in place, where the kext asks,
+                    // and keeps a fresh one of those in its cache alone where the kext defers it,
+                    // asking.
+                    (true, true) => {
+                        in_place
+                            | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED)
+                            | u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK)
+                    }
                     // A host that keeps caches keeps fresh surfaces in them alone where the kext
                     // defers their pages.
                     (true, false) => {
@@ -357,6 +367,9 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 };
             let deferred_budget = deferred_budget(features, gpu_device.own_memory_budget());
             decoder.set_deferred_budget(deferred_budget);
+            if features & u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK) != 0 {
+                decoder.set_deferred_asks();
+            }
             // The processes read the features from the device info, as no register is theirs.
             info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
             // A host whose surfaces lie in place in their pages has the guest align their rows as

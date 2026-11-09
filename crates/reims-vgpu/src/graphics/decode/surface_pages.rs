@@ -1861,7 +1861,7 @@ pub(super) mod tests {
         }
 
         /// [`Self::pages_flagged`], the message carrying `layout`.
-        fn pages_laid_out(
+        pub(crate) fn pages_laid_out(
             &mut self,
             block: u64,
             context: u32,

@@ -64,8 +64,9 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// [`RGFX_FEATURE_MANAGED_TEXTURE_SLABS`], [`RGFX_FEATURE_MANAGED_BUFFER_SLABS`],
 /// [`RGFX_FEATURE_SMALL_ID_CHUNKS`], [`RGFX_FEATURE_DISPLAY_COLOR`],
 /// [`RGFX_FEATURE_MESH_PIPELINES`], [`RGFX_FEATURE_SHARED_EVENT_NAMES`],
-/// [`RGFX_FEATURE_OPENCL_MODE`], [`RGFX_FEATURE_PRIVATE_RENDER_STATE`] and
-/// [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`]). Bits 9 and 10 are reserved.
+/// [`RGFX_FEATURE_OPENCL_MODE`], [`RGFX_FEATURE_PRIVATE_RENDER_STATE`],
+/// [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`] and [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`]). Bits 9 and
+/// 10 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
@@ -253,8 +254,22 @@ pub const RGFX_FEATURE_PRIVATE_RENDER_STATE: u32 = 1 << 28;
 /// the kext then names the block cached ([`RGFX_SURFACE_PAGES_CACHED`]), the host keeping its
 /// device cache as [`RGFX_FEATURE_SURFACE_CACHE`] says. Every other block stays in place as on a
 /// host without it. A host offers it where it offers `SURFACE_PAGES` and its GPU shares the CPU's
-/// memory, and offers neither `SURFACE_CACHE` nor [`RGFX_FEATURE_SURFACE_DEFERRED`] there.
+/// memory, and offers neither `SURFACE_CACHE` nor [`RGFX_FEATURE_SURFACE_DEFERRED`] there, but
+/// [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`].
 pub const RGFX_FEATURE_SURFACE_CACHE_REFUSED: u32 = 1 << 29;
+/// `FEATURES_LO` bit 30, `SURFACE_DEFERRED_ASK`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_LO`], beside [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`]: a kext that took
+/// both may defer a new block in place of a fresh surface ([`RGFX_SURFACE_PAGES_DEFERRED`]), as
+/// [`RGFX_FEATURE_SURFACE_DEFERRED`] lets it on a host that keeps caches, asking with the
+/// surface's layout ([`RGFX_SURFACE_PAGES_ASK_CACHE`]). The host defers it, a device cache with no
+/// pages, only where the block would take a device cache whatever pages the surface comes to
+/// have: textures over them would lie in place over no import of them the host makes. It refuses
+/// every other, whose pages the kext then names asking, as without the feature. Such a surface's
+/// pages are wired, and copied into its cache, only once a CPU lock needs them, as on a GPU of its
+/// own memory, not at its first texture. The host says in [`RGFX_REG_DEFERRED_BUDGET_LO`] how many
+/// bytes of its GPU's memory such caches may hold. A host offers it where it offers
+/// `SURFACE_CACHE_REFUSED`.
+pub const RGFX_FEATURE_SURFACE_DEFERRED_ASK: u32 = 1 << 30;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -277,12 +292,13 @@ pub const RGFX_REG_DRIVER_FEATURES_HI: u32 = 0x028;
 /// ignores a write, as at any offset it does not know.
 pub const RGFX_REG_CONSUMED: u32 = 0x02c;
 /// `DEFERRED_BUDGET_LO`, RO: the bytes of the host GPU's memory the device caches of deferred
-/// blocks ([`RGFX_FEATURE_SURFACE_DEFERRED`]) may hold at once, held and dormant, its low 32 bits:
+/// blocks ([`RGFX_FEATURE_SURFACE_DEFERRED`], [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`]) may hold at
+/// once, held and dormant, its low 32 bits:
 /// a quarter of the budget of the GPU's device-local memory (`VK_EXT_memory_budget`'s heap budget
 /// where the device has it, else a quarter of the heap's size), read once at the device's start
 /// and the same for its life, so the kext's one read at its start holds. The kext defers no block
-/// past it, and lets dormant deferred blocks go past half of it. It reads 0 where the host does
-/// not offer the feature, as at any offset a host does not know.
+/// past it, and lets dormant deferred blocks go past half of it. It reads 0 where the host offers
+/// neither feature, as at any offset a host does not know.
 pub const RGFX_REG_DEFERRED_BUDGET_LO: u32 = 0x030;
 /// `DEFERRED_BUDGET_HI`, RO: [`RGFX_REG_DEFERRED_BUDGET_LO`]'s high 32 bits.
 pub const RGFX_REG_DEFERRED_BUDGET_HI: u32 = 0x034;
@@ -781,7 +797,11 @@ pub const RGFX_CMD_BLOCK_UNSHARE: u32 = 0x2f5;
 /// made no cache, and the kext then names the block's pages as above. The kext keeps the surface's
 /// pages unwired meanwhile. Its first CPU lock that needs the pages posts a second `SURFACE_PAGES`
 /// of the block, [`RGFX_SURFACE_PAGES_ATTACH`], with the runs, and the host takes them for the
-/// cache, which keeps its bytes and the CPU's generation it holds.
+/// cache, which keeps its bytes and the CPU's generation it holds. Where the guest took
+/// [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`] instead, the deferred block asks too
+/// ([`RGFX_SURFACE_PAGES_ASK_CACHE`], with the layout), and the host answers [`RGFX_STATUS_OK`]
+/// only where the block would take a device cache whatever its pages, else
+/// [`RGFX_STATUS_REFUSED`], with nothing made; the kext then names its pages asking, as below.
 ///
 /// Where the guest took [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`], a block not cached may ask
 /// whether it needs a device cache ([`RGFX_SURFACE_PAGES_ASK_CACHE`]), with the surface's layout
@@ -1631,13 +1651,17 @@ pub const RGFX_SURFACE_PAGES_CACHED: u32 = 1 << 0;
 /// the kext wired for the block's context, and the host takes no device cache for it.
 pub const RGFX_SURFACE_PAGES_PRIVATE: u32 = 1 << 1;
 /// [`RgfxSurfacePagesCache::flags`], with [`RGFX_SURFACE_PAGES_CACHED`], where the guest took
-/// [`RGFX_FEATURE_SURFACE_DEFERRED`]: the block's surface has no pages yet (a fresh surface no CPU
+/// [`RGFX_FEATURE_SURFACE_DEFERRED`], or [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`] and then with
+/// [`RGFX_SURFACE_PAGES_ASK_CACHE`]: the block's surface has no pages yet (a fresh surface no CPU
 /// lock and no other device has touched), and its contents live in the device cache alone, as a
 /// GPU of its own memory keeps a surface only the GPU uses. The message has `run_count` 0; the
 /// host makes the cache, fills it with zeros before any use, holds the CPU's generation 0, and
 /// makes no view and watches no pages. Its `BLOCK_RELEASE` copies nothing, there being no pages
 /// (the kext names them first where the surface still lives). Answered [`RGFX_STATUS_REFUSED`]
-/// where the host made no cache (its GPU's memory, or its budget, is spent).
+/// where the host made no cache (its GPU's memory, or its budget, is spent), and, asking, where
+/// the surface's textures might lie in place over its pages. One with `ASK_CACHE` where the host
+/// does not offer `SURFACE_DEFERRED_ASK`, or without it where it does, is
+/// [`RGFX_STATUS_INVALID_ARGUMENT`].
 pub const RGFX_SURFACE_PAGES_DEFERRED: u32 = 1 << 2;
 /// [`RgfxSurfacePagesCache::flags`], with [`RGFX_SURFACE_PAGES_CACHED`]: the pages of a deferred
 /// block ([`RGFX_SURFACE_PAGES_DEFERRED`]), which the kext wired at the surface's first CPU lock
@@ -1651,7 +1675,9 @@ pub const RGFX_SURFACE_PAGES_ATTACH: u32 = 1 << 3;
 /// device cache. The message carries the surface's layout ([`RgfxSurfacePagesLayout`] at
 /// [`RGFX_SURFACE_PAGES_LAYOUT_OFFSET`]); a message too short for it is
 /// [`RGFX_STATUS_INVALID_ARGUMENT`]. Answered [`RGFX_STATUS_OK`], the block in place, or
-/// [`RGFX_STATUS_CACHE`] (the command's doc).
+/// [`RGFX_STATUS_CACHE`] (the command's doc). With [`RGFX_SURFACE_PAGES_CACHED`] and
+/// [`RGFX_SURFACE_PAGES_DEFERRED`], where the guest took [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`], a
+/// fresh surface's block asks to be deferred, carrying the layout the same way.
 pub const RGFX_SURFACE_PAGES_ASK_CACHE: u32 = 1 << 4;
 
 /// Where a `SURFACE_PAGES` message's [`RgfxSurfacePagesLayout`] starts: right after its

@@ -129,6 +129,16 @@
 //!   one whose cache the platform does not make, is refused with no cache, and the kext names its
 //!   pages instead.
 //!
+//!   On a GPU that shares the CPU's memory, where the guest took
+//!   `RGFX_FEATURE_SURFACE_DEFERRED_ASK`, a deferral asks with the surface's layout
+//!   ([`RGFX_SURFACE_PAGES_ASK_CACHE`](reims_vgpu_graphics::wire::RGFX_SURFACE_PAGES_ASK_CACHE)), and
+//!   the block is deferred only where the surface would need a device cache whatever pages it
+//!   comes to have ([`GpuDevice::fresh_surface_never_in_place`]); its cache is then laid out as an
+//!   asked one's ([`super::surface_pages`], "Device caches where the pages cannot serve"). Every
+//!   other is refused with nothing made, counted, and the kext names its pages asking, as it does
+//!   for a block refused past the budget: the pages then decide, as on a device that defers
+//!   nothing.
+//!
 //! - **By runs or by a view.** A cache's copies go between it and the pages' runs in the guest's
 //!   RAM where the platform copies by them ([`GpuDevice::copies_guest_ram`]; the block takes no
 //!   view, [`super::surface_pages`]), else through a buffer over the surface's view. A copy by
@@ -139,6 +149,7 @@
 //!   command buffer of its own, and a refused copy by runs encodes nothing in it.
 //!
 //! [`GpuDevice::copies_guest_ram`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::copies_guest_ram
+//! [`GpuDevice::fresh_surface_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::fresh_surface_never_in_place
 //! [`GpuDevice::new_buffer_of_length_padding_unobserved`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::new_buffer_of_length_padding_unobserved
 //!
 //! What the guest observes is IOSurface's contract under its locks: a lock after a GPU write sees
@@ -669,10 +680,13 @@ pub(crate) struct CacheCounts {
     pub(crate) by_runs: u64,
     /// Copies by runs the platform refused, each of which made its cache's view.
     pub(crate) runs_refused: u64,
-    /// Deferred blocks' caches made, and refused (past the budget, or not made); deferred blocks
-    /// whose pages were named; and those released with their pages never named.
+    /// Deferred blocks' caches made, and refused (past the budget, or not made); of those asked
+    /// with their surface's layout, those refused as their textures might lie in place over the
+    /// pages they come to have; deferred blocks whose pages were named; and those released with
+    /// their pages never named.
     pub(crate) deferred: u64,
     pub(crate) deferred_refused: u64,
+    pub(crate) deferred_in_place: u64,
     pub(crate) attached: u64,
     /// Of them, pages the host made no view of, or no buffer over, copied instead.
     pub(crate) attached_copied: u64,
@@ -797,6 +811,9 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// bytes they hold.
     deferred_budget: u64,
     deferred_bytes: u64,
+    /// The device offers `SURFACE_DEFERRED_ASK`: a deferred block asks with its surface's layout
+    /// ([`Self::set_deferred_asks`]).
+    deferred_asks: bool,
     /// The copies of caches into pages asked and not yet landed ([`Self::copies_into`]), those
     /// landed let go of as each is added.
     into_pages: Vec<IntoPages>,
@@ -958,6 +975,7 @@ impl<P: Platform> SurfaceCaches<P> {
             on_fill_done,
             deferred_budget: 0,
             deferred_bytes: 0,
+            deferred_asks: false,
             into_pages: Vec::new(),
             exportable: false,
             owed: HashSet::new(),
@@ -1240,10 +1258,11 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// A cache of zeros for the deferred block at `block` (the module doc), of `length` bytes,
-    /// at the CPU's generation 0, its block `block_size` bytes: zeroed on the transfer queue,
-    /// whose fill every use of it waits for. `Ok(false)`, with no cache, where the deferred
-    /// caches' budget has no room for it, or the platform made no buffer or no transfer queue for
-    /// it. A cache the block had goes first, as at a release
+    /// at the CPU's generation 0, its block `block_size` bytes, its surface laid out as `layout`
+    /// where its ask gave it (a device that shares the CPU's memory: [`Self::make`]'s caches of a
+    /// layout): zeroed on the transfer queue, whose fill every use of it waits for. `Ok(false)`,
+    /// with no cache, where the deferred caches' budget has no room for it, or the platform made
+    /// no buffer or no transfer queue for it. A cache the block had goes first, as at a release
     /// ([`SurfaceCaches::released`]).
     pub(crate) fn make_deferred(
         &mut self,
@@ -1251,13 +1270,15 @@ impl<P: Platform> SurfaceCaches<P> {
         block: u64,
         length: u64,
         block_size: u64,
+        layout: Option<Vec<PagesPlane>>,
     ) -> RaiseResult<bool> {
         if self.by_block.contains_key(&block) {
             self.released(device, block, 0, None, None, Box::new(|| {}))?;
         }
         let room = self.deferred_budget.saturating_sub(self.deferred_bytes);
+        let aligned = layout.as_deref().and_then(aligned_byte);
         let made = if length <= room {
-            self.new_cache(device, length, false, None)?
+            self.new_cache(device, length, layout.is_some(), aligned)?
         } else {
             None
         };
@@ -1275,8 +1296,7 @@ impl<P: Platform> SurfaceCaches<P> {
                 device: cache,
                 pages: None,
                 length,
-                // A deferred block's ask carries no layout (no host offers both).
-                texels: None,
+                texels: layout.as_deref().map(texel_spans),
                 generation: Some(0),
                 host_read: 0,
                 written: false,
@@ -1437,6 +1457,23 @@ impl<P: Platform> SurfaceCaches<P> {
     /// Sets the bytes deferred blocks' caches may hold at once.
     pub(crate) fn set_deferred_budget(&mut self, budget: u64) {
         self.deferred_budget = budget;
+    }
+
+    /// Has a deferred block ask with its surface's layout from now on, as the device offers
+    /// `SURFACE_DEFERRED_ASK` (a device whose GPU shares the CPU's memory).
+    pub(crate) fn set_deferred_asks(&mut self) {
+        self.deferred_asks = true;
+    }
+
+    /// Whether a deferred block asks with its surface's layout ([`Self::set_deferred_asks`]).
+    pub(crate) fn deferred_asks(&self) -> bool {
+        self.deferred_asks
+    }
+
+    /// A deferred block's ask refused, its surface's textures possibly lying in place over the
+    /// pages it comes to have.
+    pub(crate) fn deferred_in_place(&mut self) {
+        self.counts.deferred_in_place += 1;
     }
 
     /// The cache of the block at `block`, which its buffers are.
@@ -3071,6 +3108,12 @@ impl<P: Platform> Caches<P> {
         self.state.lock().set_deferred_budget(budget);
     }
 
+    /// Has a deferred block ask with its surface's layout from now on
+    /// ([`SurfaceCaches::set_deferred_asks`]): set once, at the device's make.
+    pub(crate) fn set_deferred_asks(&self) {
+        self.state.lock().set_deferred_asks();
+    }
+
     /// Waits, letting the lock go meanwhile, while a command buffer begun and not finished that
     /// may write the block at `block`'s cache is, or a copy of it asked waits for command buffers
     /// ([`SurfaceCaches::deferred`]): for the block's pages named again, whose buffers made on
@@ -3568,10 +3611,11 @@ impl<P: Platform> Caches<P> {
         block: u64,
         length: u64,
         block_size: u64,
+        layout: Option<Vec<PagesPlane>>,
     ) -> RaiseResult<bool> {
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
-        state.make_deferred(device, block, length, block_size)
+        state.make_deferred(device, block, length, block_size, layout)
     }
 
     /// The deferred block at `block`'s pages taken for its cache ([`SurfaceCaches::attach`]),
@@ -3973,11 +4017,13 @@ mod tests {
         RgfxOpHeader,
     };
     use reims_vgpu_graphics::wire::{
-        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
+        RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE, RGFX_STATUS_CACHE,
         RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
-        RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
-        RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun, RgfxQueueCreate, RgfxSurfacePages,
+        RGFX_SURFACE_PAGES_ASK_CACHE, RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED,
+        RGFX_SURFACE_PAGES_DEFERRED, RgfxMsgHeader, RgfxObjectDestroy, RgfxPageRun,
+        RgfxQueueCreate, RgfxSurfacePages, RgfxSurfacePagesLayout,
     };
+    use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
     use reims_vgpu_vulkan::core::testkit::calllog::{Arg, Call};
     use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
@@ -7077,6 +7123,226 @@ mod tests {
         use_surfaces(&mut r, 1, 0x102, &[(BLOCK, 1, false)]);
         let filled = copies(&r.p.call_log().since(mark));
         assert_eq!(filled, vec![(out[0].1, cache)], "from the pages");
+    }
+
+    /// A `SURFACE_PAGES` of the deferred block at `block`, of `length` bytes and no runs, that
+    /// asks with its surface's layout `layout`, as a kext does where the device answers which
+    /// surfaces need a device cache; its answer.
+    fn defer_asking(
+        r: &mut Rig,
+        block: u64,
+        length: u64,
+        layout: Option<RgfxSurfacePagesLayout>,
+    ) -> u32 {
+        let flags =
+            RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED | RGFX_SURFACE_PAGES_ASK_CACHE;
+        r.pages_laid_out(block, 0, &[], length, flags, layout)
+    }
+
+    /// A rig of [`deferring`]'s whose GPU shares the CPU's memory, its device answering which
+    /// surfaces need a device cache and deferring the fresh ones that would whatever their pages,
+    /// as `SURFACE_DEFERRED_ASK` has it.
+    fn deferring_asking(budget: u64) -> Rig {
+        let mut r = deferring(budget);
+        r.dec.set_unified_memory(true);
+        r.dec.set_deferred_asks();
+        r
+    }
+
+    /// One plane of two rows of a page apart whose texels end 16 bytes short of the next row.
+    fn short_rows(page: u64) -> (RgfxSurfacePagesLayout, Vec<PagesPlane>) {
+        use super::super::surface_pages::tests::one_plane;
+        let plane = PagesPlane {
+            offset: 0,
+            bytes_per_row: page,
+            row_bytes: page - 16,
+            rows: 2,
+        };
+        (one_plane(page, page - 16, 2), vec![plane])
+    }
+
+    /// On a GPU that shares the CPU's memory, a fresh block that asks to be deferred is asked of
+    /// the device with its planes alone, no page named: where textures over them would lie in
+    /// place over no import of any pages, it is a cache of zeros with no view, as a deferred
+    /// block of a GPU of its own memory is. Where they may lie in place, it is refused with
+    /// nothing made, counted, and its pages then ask whether it needs a cache as any block's do
+    #[test]
+    fn a_fresh_block_asking_is_deferred_only_where_it_would_need_a_cache() {
+        let mut r = deferring_asking(8);
+        let page = r.page;
+        let world = Arc::clone(r.p.world());
+        let (layout, planes) = short_rows(page);
+        world.answer_fresh_surfaces(Some("the rows end inside a line".into()));
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            defer_asking(&mut r, BLOCK, 2 * page, Some(layout)),
+            RGFX_STATUS_OK
+        );
+        assert_eq!(world.fresh_surfaces_asked(), [planes]);
+        let calls = r.p.call_log().since(mark);
+        let cache = cache_id(&r);
+        let zeroed: Vec<&Call> = calls.iter().filter(|c| c.sel == FILL).collect();
+        assert_eq!(zeroed.len(), 1, "zeroed");
+        assert_eq!(zeroed[0].args[0].as_obj().map(|o| o.0), Some(cache));
+        assert_eq!(r.dec.views_of_surfaces().len(), (0, 0), "no view");
+        assert!(world.surface_pages_asked().is_empty(), "no page asked of");
+        assert_eq!(r.dec.caches().unattached(BLOCK), Some(2 * page));
+        assert_eq!(r.dec.caches().counts().deferred, 1);
+
+        world.answer_fresh_surfaces(None);
+        let second = BLOCK + 0x8000;
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            defer_asking(&mut r, second, 2 * page, Some(layout)),
+            RGFX_STATUS_REFUSED
+        );
+        assert!(r.p.call_log().sels_since(mark).is_empty(), "nothing made");
+        assert!(!r.dec.caches().has(second));
+        let counts = r.dec.caches().counts();
+        assert_eq!((counts.deferred, counts.deferred_in_place), (1, 1));
+        world.answer_surface_pages(PagesInPlace::Yes);
+        assert_eq!(
+            r.pages_asking(second, &[(5, 2)], 2 * page, Some(layout)),
+            RGFX_STATUS_OK,
+            "in place"
+        );
+        assert!(r.dec.views_of_surfaces().view(second).is_some());
+        assert!(!r.dec.caches().has(second));
+    }
+
+    /// A deferral that asks fails safe at a full deferred budget: it is refused with nothing
+    /// made, as a deferral of a GPU of its own memory is, and the block's pages then ask whether
+    /// it needs a device cache as they do on a device that defers nothing: answered a cache, its
+    /// cached `SURFACE_PAGES` makes one over them. The room a deferred block gave back takes the
+    /// next
+    #[test]
+    fn a_full_deferred_budget_has_the_pages_ask_as_without_deferral() {
+        let mut r = deferring_asking(2);
+        let page = r.page;
+        let world = Arc::clone(r.p.world());
+        let (layout, _) = short_rows(page);
+        world.answer_fresh_surfaces(Some("the rows end inside a line".into()));
+        assert_eq!(
+            defer_asking(&mut r, BLOCK, 2 * page, Some(layout)),
+            RGFX_STATUS_OK
+        );
+        let second = BLOCK + 0x8000;
+        assert_eq!(
+            defer_asking(&mut r, second, 2 * page, Some(layout)),
+            RGFX_STATUS_REFUSED,
+            "past the budget"
+        );
+        assert!(!r.dec.caches().has(second));
+        assert_eq!(r.dec.caches().counts().deferred_refused, 1);
+        assert_eq!(r.dec.views_of_surfaces().len(), (0, 0), "no view");
+
+        world.answer_surface_pages(PagesInPlace::No("the rows end inside a line".into()));
+        assert_eq!(
+            r.pages_asking(second, &[(5, 2)], 2 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        assert_eq!(
+            r.pages_cached(second, &[(5, 2)], 2 * page, true),
+            RGFX_STATUS_OK
+        );
+        assert!(r.dec.caches().has(second));
+        assert_eq!(r.dec.caches().unattached(second), None, "over its pages");
+
+        let released = release(&r, BLOCK);
+        assert!(released.load(Ordering::SeqCst));
+        let third = BLOCK + 0x10000;
+        assert_eq!(
+            defer_asking(&mut r, third, 2 * page, Some(layout)),
+            RGFX_STATUS_OK,
+            "the room is back"
+        );
+    }
+
+    /// Where the device answers which surfaces need a device cache, a deferral that does not
+    /// ask, or asks with no layout or one that does not lie in the surface's bytes, is an
+    /// invalid argument, and asks the device nothing; where it does not answer them, one that
+    /// asks is. Neither makes a cache
+    #[test]
+    fn a_deferral_asks_exactly_where_the_device_answers_asks() {
+        use super::super::surface_pages::tests::one_plane;
+        let mut r = deferring_asking(8);
+        let page = r.page;
+        let world = Arc::clone(r.p.world());
+        let (layout, _) = short_rows(page);
+        world.answer_fresh_surfaces(Some("the rows end inside a line".into()));
+        let invalid = RGFX_STATUS_INVALID_ARGUMENT;
+        assert_eq!(defer(&mut r, BLOCK, 2 * page), invalid, "no ask");
+        let past = one_plane(page, page, 3);
+        let empty = one_plane(page, 0, 2);
+        for bad in [Some(past), Some(empty), None] {
+            assert_eq!(defer_asking(&mut r, BLOCK, 2 * page, bad), invalid);
+        }
+        assert!(world.fresh_surfaces_asked().is_empty());
+        assert!(!r.dec.caches().has(BLOCK));
+
+        let mut r = deferring(8);
+        assert_eq!(
+            defer_asking(&mut r, BLOCK, 2 * page, Some(layout)),
+            invalid,
+            "asked of a device that answers no asks"
+        );
+        assert!(!r.dec.caches().has(BLOCK));
+    }
+
+    /// A deferred block that asked keeps the cache it was given through the CPU's first lock:
+    /// the lock's pages are taken for the cache, which keeps its bytes and its generation, and
+    /// the download that follows copies the GPU's write from the cache into the pages, the
+    /// texels of each row alone, as an asked cache's downloads do; a use after a CPU write's lock
+    /// fills the cache from them, as any cache's
+    #[test]
+    fn a_deferred_block_that_asked_is_read_and_written_through_its_pages() {
+        let mut r = deferring_asking(8);
+        let page = r.page;
+        let (layout, _) = short_rows(page);
+        r.p.world()
+            .answer_fresh_surfaces(Some("the rows end inside a line".into()));
+        assert_eq!(
+            defer_asking(&mut r, BLOCK, 2 * page, Some(layout)),
+            RGFX_STATUS_OK
+        );
+        let cache = cache_id(&r);
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        r.p.world().complete_all(CompleteOn::Caller);
+
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            attach(&mut r, BLOCK, 7, &[(1, 2)], 2 * page),
+            RGFX_STATUS_OK
+        );
+        assert!(
+            copies(&r.p.call_log().since(mark)).is_empty(),
+            "nothing copied"
+        );
+        assert_eq!(cache_id(&r), cache, "the same cache");
+        assert_eq!(r.dec.caches().unattached(BLOCK), None);
+        assert_eq!(r.dec.caches().counts().attached, 1);
+
+        let mark = r.p.call_log().mark();
+        let done = download(&r, BLOCK);
+        let out = copies(&r.p.call_log().since(mark));
+        let pages = out[0].1;
+        assert_ne!(pages, cache);
+        assert_eq!(
+            out,
+            vec![(cache, pages); 2],
+            "the GPU's write, out of the cache, each row's texels as the layout has them"
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 1, false)]);
+        let filled = copies(&r.p.call_log().since(mark));
+        assert!(!filled.is_empty(), "filled");
+        assert!(
+            filled.iter().all(|&c| c == (pages, cache)),
+            "from the pages: {filled:?}"
+        );
     }
 
     /// Pages named for a block with no deferred cache whose pages are not named (none, one

@@ -1015,6 +1015,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.surface_caches.set_deferred_budget(budget);
     }
 
+    /// Has a deferred block ask with its surface's layout from now on, as the device offers
+    /// `SURFACE_DEFERRED_ASK` ([`Self::deferred_surface_pages`]): set once, at the device's make.
+    pub(crate) fn set_deferred_asks(&self) {
+        self.surface_caches.set_deferred_asks();
+    }
+
     /// Whether a cached block on `device` is named by its runs, with no view: the device copies
     /// the guest's RAM by them (`surface_pages`, "By runs").
     fn copies_by_runs(&self, device: &P::Device) -> bool {
@@ -1143,7 +1149,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
         let views = &self.shared.surface_views;
         let status = if flags & (RGFX_SURFACE_PAGES_DEFERRED | RGFX_SURFACE_PAGES_ATTACH) != 0 {
-            self.deferred_surface_pages(device, pages, runs, flags, settle)?
+            self.deferred_surface_pages(device, pages, runs, flags, layout.as_ref(), settle)?
         } else {
             self.view_surface_pages(device, pages, runs, flags, layout.as_ref(), settle)?
         };
@@ -1175,7 +1181,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         // A deferred block, and a block named by its runs, make no view, so they are counted
         // here too.
         let counted = (c.made + c.reused + c.bad_runs + c.not_mapped + c.private + c.by_runs)
-            .saturating_add(d.deferred + d.deferred_refused);
+            .saturating_add(d.deferred + d.deferred_refused + d.deferred_in_place);
         let now = clock.now_mono();
         let logged_at = &self.shared.views_logged_at;
         let last = logged_at.load(Ordering::Relaxed);
@@ -1206,8 +1212,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                      kext counts them: {} of them written since their last copy, dropped \
                      uncopied ({} MiB), {} copied as taken again; {} copies out not made, the CPU's \
                      generation past the cache's; {} \
-                     deferred, {} refused, {} named their pages ({} copied), {} released \
-                     unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
+                     deferred, {} refused, {} refused as they might lie in place, {} named \
+                     their pages ({} copied), {} released unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
                      downloads they answered, {} unread; {} copy by runs, {} copies by runs \
                      refused; {} downloads or releases answered {} ms or more after they were \
                      asked; {} fills made behind the command buffers they followed, {} waits on \
@@ -1220,7 +1226,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
                     d.unheld_released, d.unheld, d.unheld_bytes >> 20, d.retaken, d.behind,
-                    d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
+                    d.deferred, d.deferred_refused, d.deferred_in_place, d.attached,
+                    d.attached_copied, d.unattached,
                     d.early, d.early_bytes >> 20, d.early_aside, d.early_read, d.early_unread,
                     d.by_runs, d.runs_refused,
                     self.shared.slow_answers.load(Ordering::Relaxed), SLOW_ANSWER.as_millis(),
@@ -1388,7 +1395,13 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// - a deferred block, with no runs, gets a device cache of zeros and no view, any view it had
     ///   going: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with no cache and no view, where
     ///   the deferred caches' budget has no room or the platform made none, and the kext then
-    ///   names the block's pages as any block's;
+    ///   names the block's pages as any block's. On a device that offers `SURFACE_DEFERRED_ASK`
+    ///   (its GPU shares the CPU's memory) the block asks ([`RGFX_SURFACE_PAGES_ASK_CACHE`]) with
+    ///   its surface's `layout`, and is deferred only where textures over the pages it comes to
+    ///   have would lie in place over none the device makes
+    ///   ([`GpuDevice::fresh_surface_never_in_place`]), so its pages, once named, would take a
+    ///   device cache all the same; any other is [`RGFX_STATUS_REFUSED`], counted, with nothing
+    ///   made, and the kext then names its pages asking, as any block's;
     /// - its pages, found by the block whatever context sends them (the maker's may have closed),
     ///   get a view, which the cache takes, keeping its bytes: [`RGFX_STATUS_OK`]. Where the host
     ///   makes no view of them, or no buffer over it, the cache takes them copied, through the
@@ -1399,14 +1412,19 @@ impl<P: Platform> GraphicsDecoder<P> {
     ///   named, with no view made.
     ///
     /// A message with both flags, or without `CACHED`, or a deferred block's with runs, is
-    /// [`RGFX_STATUS_INVALID_ARGUMENT`], and changes nothing. `None`, with nothing made, where the
-    /// device was reset since `settle` began it.
+    /// [`RGFX_STATUS_INVALID_ARGUMENT`], and changes nothing; so is a deferred block's that asks
+    /// where the device offers no `SURFACE_DEFERRED_ASK`, or with a layout that does not lie in
+    /// its bytes, or that does not ask where the device offers it, and pages that ask. `None`,
+    /// with nothing made, where the device was reset since `settle` began it.
+    ///
+    /// [`GpuDevice::fresh_surface_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::fresh_surface_never_in_place
     fn deferred_surface_pages(
         &self,
         device: &P::Device,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
         flags: u32,
+        layout: Option<&RgfxSurfacePagesLayout>,
         settle: &worker::Settle,
     ) -> Option<u32> {
         let block = pages.block_offset;
@@ -1414,7 +1432,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         let attach = flags & RGFX_SURFACE_PAGES_ATTACH != 0;
         let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
-        if !cached || private || (deferred && attach) || (deferred && !runs.is_empty()) {
+        let ask = flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0;
+        let asks = self.surface_caches.lock().deferred_asks();
+        if !cached
+            || private
+            || (deferred && attach)
+            || (deferred && !runs.is_empty())
+            || (attach && ask)
+            || (deferred && ask != asks)
+        {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "the IOSurface block at {block:#x}: a SURFACE_PAGES of {} runs with flags \
@@ -1425,12 +1451,49 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let views = &self.shared.surface_views;
         if deferred {
+            // An ask's layout, which must lie in the surface's bytes; the block is deferred only
+            // where its textures would lie in place over none of the pages it may come to have.
+            let planes = match (ask, layout) {
+                (false, _) => None,
+                (true, layout) => {
+                    let Some(planes) =
+                        layout.and_then(|l| surface_pages::layout_planes(l, pages.length))
+                    else {
+                        log::warn!(
+                            target: "reims_vgpu::graphics",
+                            "the IOSurface block at {block:#x}: asked to be deferred with no \
+                             layout, or one that does not lie in its {:#x} bytes: refused",
+                            pages.length
+                        );
+                        return Some(RGFX_STATUS_INVALID_ARGUMENT);
+                    };
+                    let Some(why) = device.fresh_surface_never_in_place(&planes) else {
+                        self.surface_caches.lock().deferred_in_place();
+                        log::debug!(
+                            target: "reims_vgpu::graphics::surface_pages",
+                            "the IOSurface block at {block:#x}: not deferred, as its textures \
+                             may lie in place over the pages it comes to have"
+                        );
+                        return Some(RGFX_STATUS_REFUSED);
+                    };
+                    log::debug!(
+                        target: "reims_vgpu::graphics::surface_pages",
+                        "the IOSurface block at {block:#x} is deferred, as it would need a \
+                         device cache: {why}"
+                    );
+                    Some(planes)
+                }
+            };
             if !surface_pages::SurfaceViews::deferred(views, block, settle) {
                 return None;
             }
-            let made =
-                self.surface_caches
-                    .make_deferred(device, block, pages.length, pages.block_size);
+            let made = self.surface_caches.make_deferred(
+                device,
+                block,
+                pages.length,
+                pages.block_size,
+                planes,
+            );
             return Some(match made {
                 Ok(true) => RGFX_STATUS_OK,
                 Ok(false) => RGFX_STATUS_REFUSED,
