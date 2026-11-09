@@ -1018,8 +1018,13 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
   Metal device that is not Apple's paravirtual one, WindowServer's pid kept,
   and the host's log showing an IOSurface the guest presented.
   `metal-app`: `present_probe` full-screen in the user's session, under
-  `report.py`'s bar. `no-fatal`: no `reims-vgpu: fatal` line in QEMU's log
-  or the serial log.
+  `report.py`'s bar. `bundle-install`: RgfxGate's Graft client state reads
+  installed, tagged or present, and `/Library/GPUBundles/reims-graphics.bundle`
+  carries the restricted flag and the `KernelExtensionManagement` rootless
+  class. `amfi-map`: WindowServer maps the bundle's executable (`sudo lsof`
+  on its pid) and the boot's log has no AMFI or library-validation denial
+  naming it. `no-fatal`: no `reims-vgpu: fatal` line in QEMU's log or the
+  serial log.
 
 **Measured** on the M3 Max under HVF on 2026-11-08, with our QEMU at
 `bc378624` built as above on the library of `61b1aac9e`, Ambrosia 0.1.0's

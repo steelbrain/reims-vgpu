@@ -50,6 +50,15 @@
 #   metal-app  present_probe, an on-screen Metal app, ran full-screen for 10 s in the user's
 #              session, as the lane gate's present phase: OK, frames presented, and at most a
 #              tenth dropped or unanswered (report.py's bar for the correctness boot).
+#   bundle-install
+#              RgfxGate installed the Metal bundle, as it records it and as the disk shows it:
+#              its Graft client state (GraftClient.com.steelbrain.RgfxGate) reads installed,
+#              tagged or present; /Library/GPUBundles/reims-graphics.bundle is there with the
+#              restricted flag; and its com.apple.rootless class is KernelExtensionManagement.
+#   amfi-map   AMFI admitted the bundle where it counts: WindowServer has the bundle's
+#              executable mapped (`sudo lsof` on its pid, which reads the mappings without
+#              task_for_pid, so SIP allows it), and this boot's log has no AMFI or
+#              library-validation denial naming reims-graphics.
 #   no-fatal   no `reims-vgpu: fatal` line in QEMU's log or the serial log.
 #
 # OUT keeps serial.log, qemu.log, screen.png (QMP's screendump of the display at the end, before
@@ -232,7 +241,7 @@ qpid=$!
 
 # --- the checks ---------------------------------------------------------------------------------
 
-names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app no-fatal)
+names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map no-fatal)
 # A check's verdict, PASS or FAIL, and what it found; in plain variables, for macOS's bash 3.2.
 verdict() { printf -v "st_${1//-/_}" '%s' "$2"; printf -v "dt_${1//-/_}" '%s' "$3"; }
 state() { local v="st_${1//-/_}"; echo "${!v:-}"; }
@@ -360,12 +369,46 @@ if [[ -n $ssh_s ]]; then
   else
     verdict metal-app FAIL "not run: $desk_say"
   fi
+  # RgfxGate's install: the state it records, then the bundle's flags and SIP class on disk.
+  bpath=/Library/GPUBundles/reims-graphics.bundle
+  gstate=$(G 30 "ioreg -l -w0 | grep -m1 -o '\"GraftClient.com.steelbrain.RgfxGate\" = \"[^\"]*\"'")
+  gstate=${gstate#*= }
+  bflags=$(G 20 "ls -ldO $bpath 2>&1 | head -1")
+  bclass=$(G 20 "xattr -p com.apple.rootless $bpath 2>&1 | head -1")
+  inst=() iok=1
+  case $gstate in
+  \"installed:* | \"tagged:* | \"present:*) inst+=("RgfxGate's state $gstate") ;;
+  '') inst+=("no GraftClient.com.steelbrain.RgfxGate state") iok=0 ;;
+  *) inst+=("RgfxGate's state $gstate") iok=0 ;;
+  esac
+  if [[ $bflags == *restricted* ]]; then inst+=("bundle restricted")
+  else inst+=("bundle not restricted: ${bflags:-no answer}") iok=0; fi
+  if [[ $bclass == KernelExtensionManagement ]]; then inst+=("rootless class $bclass")
+  else inst+=("rootless class: ${bclass:-none}") iok=0; fi
+  verdict bundle-install "$( ((iok)) && echo PASS || echo FAIL)" "$(IFS=';'; echo "${inst[*]}" | sed 's/;/; /g')"
+
+  # AMFI's admission: the bundle mapped in WindowServer, and no denial naming it in this boot's log.
+  if [[ -n $ws_pid ]]; then
+    mapped=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' lsof -p $ws_pid 2>/dev/null | grep -c 'GPUBundles/reims-graphics.bundle'")
+    mapped=${mapped//[^0-9]/}
+  else
+    mapped=
+  fi
+  denied=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"reims-graphics\"' 2>/dev/null | grep -c -i -E 'amfi|library validation|not valid|code signature'")
+  denied=${denied//[^0-9]/}
+  if [[ -z $ws_pid ]]; then
+    verdict amfi-map FAIL "not run: no WindowServer"
+  elif [[ ${mapped:-0} -gt 0 && ${denied:-0} -eq 0 ]]; then
+    verdict amfi-map PASS "WindowServer (pid $ws_pid) maps the bundle ($mapped mappings); no AMFI denial naming it"
+  else
+    verdict amfi-map FAIL "WindowServer (pid $ws_pid) maps the bundle ${mapped:-0} times; ${denied:-unread} AMFI or library-validation lines name reims-graphics"
+  fi
   ws_end=$(G 20 'pgrep -x WindowServer | head -1') || ws_end="unread: $(echo "$ws_end" | tail -1)"
 elif [[ $(state firmware) == FAIL ]]; then
-  for n in ssh sip boot-args kexts windowserver-metal metal-app; do verdict "$n" FAIL "not run: the firmware check failed"; done
+  for n in ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map; do verdict "$n" FAIL "not run: the firmware check failed"; done
 else
   verdict ssh FAIL "no SSH login in $limit s"
-  for n in sip boot-args kexts windowserver-metal metal-app; do verdict "$n" FAIL "not run: no SSH login"; done
+  for n in sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map; do verdict "$n" FAIL "not run: no SSH login"; done
 fi
 # What the display shows at the end: the desktop, or the console's log and the kernel's progress.
 qmp "{\"execute\": \"screendump\", \"arguments\": {\"filename\": \"$out/screen.png\", \"format\": \"png\"}}" > /dev/null 2>&1 ||
