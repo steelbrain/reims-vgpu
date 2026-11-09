@@ -50,6 +50,21 @@
  * it and its surface lives on (rgfxSurfaceCacheReleaseAttach), on the naming worker, never the
  * release thread, which goes on with the other releases meanwhile (RgfxReleaseTable.hpp).
  *
+ * A count of a surface's pages maps its memory into the kernel, walks the mapping's regions and
+ * removes the mapping (rgfxSurfaceLocksPageCounts). Each ask that may defer a block counts
+ * (rgfxSurfaceLocksFresh), and so does the deferral's read under the surface's lock. Measured
+ * with every count's time logged (a scratch build of this code, the log after the timed span),
+ * on a Radeon 780M Linux host, over a cold boot, Safari's scroll and Mission Control:
+ *  - 26.7.2 (25G332): 3695 counts, median 9.8 us, 99th percentile 68 us, 70.7 ms in all;
+ *  - 11.7.11 (20G1443): 1516 counts, median 13.3 us, 99th percentile 65 us, 29.3 ms in all.
+ * In medians, the mapping's making takes 4-8 us and its removal about 1 us, whatever the size;
+ * the walk grows with it: about 1 us at 64 KiB or less, 6-8 us for Safari's 7296 KiB tiles (the
+ * whole count 14-18 us), 21-27 us at 16-32 MiB, 46-53 us at 53-63 MiB. A walk over resident
+ * pages is slower: 46 us for a 7296 KiB tile holding some. Every mapping lay in one of IOKit's
+ * pageable maps, in one region, and every count counted; no page was compressed or paged out in
+ * these runs. The longest counts, 1-9 ms, 0.2% of them, waited mostly in the mapping's making:
+ * on 26.7.2 the longest, 9.1 ms, was for a 4 KiB surface.
+ *
  * Our own code; it names SDK-public IOKit calls and IOSurface's interface (RgfxIOSurfaceKPI.hpp).
  */
 
@@ -686,7 +701,7 @@ static void noteCountTime(uint64_t bytes, uint64_t ns, const RgfxSurfacePageCoun
 // maps, where the walk finds its regions (walkRegions, pageableMapHolds). The
 // walk costs about a microsecond per 1-16 pages (measured from user space on 11.7.11: 0.13 ms
 // for 16384 resident pages, 1.3 ms for the same compressed), plus the mapping's making and
-// removal.
+// removal; what whole counts take in the kernel is at the top of this file.
 RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
 {
 	RgfxSurfacePageCounts counts = {false, ~0ull, ~0ull};
