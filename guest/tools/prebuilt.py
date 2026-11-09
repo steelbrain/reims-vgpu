@@ -113,8 +113,12 @@ def stage(out, work):
         if not exe.is_file():
             raise SystemExit(f"prebuilt: {kext} has no executable {exe.name}")
         infos[kext.name] = info
-    if infos["ReimsGraphics.kext"].get("IOKitPersonalities"):
-        raise SystemExit("prebuilt: dormant ReimsGraphics carries personalities")
+    # Graft's staging keeps the personalities, each gated on the device nub by the property
+    # Graft sets once it has bound the kext, so none is even constructed before that.
+    personalities = infos["ReimsGraphics.kext"].get("IOKitPersonalities", {})
+    gate = {"com.steelbrain.ReimsGraphics.graft-bound": True}
+    if not personalities or any(p.get("IOPropertyMatch") != gate for p in personalities.values()):
+        raise SystemExit("prebuilt: dormant ReimsGraphics has a personality without Graft's gate")
     dependencies = infos["ReimsGraphics.kext"].get("OSBundleLibraries", {})
     if {"com.apple.iokit.IOGraphicsFamily", "com.apple.AppleGraphicsDeviceControl"} & set(dependencies):
         raise SystemExit("prebuilt: dormant ReimsGraphics still names System-KC dependencies")
