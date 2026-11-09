@@ -56,9 +56,7 @@ ARCH = -arch $(ARCH_NAME) -isysroot $(SDK) -mmacosx-version-min=$(MIN_OS)
 GRAFT_SDK ?= ../graft/sdk
 ifeq ($(ARCH_NAME),arm64e)
 GRAFT_DECL = src/graft-arm64e.json
-INFO_PLIST = src/Info-arm64e.plist
-else
-INFO_PLIST = src/Info.plist
+GRAFT_INFO_PLIST = src/Info-arm64e.plist
 endif
 
 FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-vgpu-graphics/include \
@@ -110,16 +108,6 @@ $(BUILD)/obj/layout.o: src/ReimsGraphics.cpp src/ReimsGraphics.hpp ../../crates/
 
 # Graft owns the two-pass link and dormant staging of this consumer.
 include $(GRAFT_SDK)/consumer.mk
-
-# Graft's rules read src/Info.plist; the arm64e kext's Info.plist is its own. Until Graft's
-# consumer.mk takes the Info.plist's path, this recipe replaces Graft's for arm64e, and make
-# says it overrides it.
-ifneq ($(INFO_PLIST),src/Info.plist)
-$(GRAFT_INFO): $(INFO_PLIST)
-	@mkdir -p $(@D)
-	sed 's/@VERSION@/$(VERSION)/g' $(INFO_PLIST) > $@
-	plutil -lint $@ > /dev/null
-endif
 
 check: $(BINARY) $(BUILD)/obj/layout.o
 	bash tools/check-imports.sh "$(KDK)" $(KEXT)
