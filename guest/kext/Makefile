@@ -62,9 +62,11 @@ GRAFT_INFO_PLIST = src/Info-arm64e.plist
 # (<graft/IOMobileFramebufferLegacy.h>); the SDK's include directory holds it. x86-64 takes no
 # Graft stand-in, so this is empty there and its flags are unchanged.
 GRAFT_INC = -I$(GRAFT_SDK)/include
+# How an arm64 process maps the region: no write-combining (src/RgfxRegionMapping.hpp).
+GUEST_FLAGS = -DRGFX_GUEST_ARM64=1
 endif
 
-FLAGS = $(ARCH) $(GRAFT_INC) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-vgpu-graphics/include \
+FLAGS = $(ARCH) $(GRAFT_INC) $(GUEST_FLAGS) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-vgpu-graphics/include \
 	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' -DRGFX_FB_TRACE=$(TRACE) \
 	-Os -Wall -Wextra -Wshadow-all -Werror -Wno-unused-parameter \
 	-Wno-deprecated-declarations

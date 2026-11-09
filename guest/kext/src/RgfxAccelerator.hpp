@@ -55,6 +55,7 @@
 #include "RgfxDeferCarry.hpp"
 #include "RgfxDeviceName.hpp"
 #include "RgfxMemorySize.hpp"
+#include "RgfxRegionMapping.hpp"
 #include "RgfxUserClientABI.hpp"
 #include "reims_graphics_wire.h"
 
@@ -86,13 +87,14 @@ enum {
 
 // The kext's own features (kRgfxKextFeature*, RgfxUserClientABI.hpp) this kext carries out, the
 // second word kRgfxAccelMethodFeatures answers: PagesBlock, Submit's deferred flag and
-// TakeAnswers, OpenContext's span, shared events' ports and Alloc's write-combined part. Each bit
-// is set by the change that lands its call.
+// TakeAnswers, OpenContext's span, shared events' ports and Alloc's write-combined part, where the
+// region's write-combined mappings are ordinary memory (RgfxRegionMapping.hpp). Each bit is set
+// by the change that lands its call.
 constexpr uint64_t kRgfxKextFeatureWord = kRgfxKextFeaturePagesBlock |
                                           kRgfxKextFeatureDeferredAnswers |
                                           kRgfxKextFeatureContextSpan |
                                           kRgfxKextFeatureSharedEvents |
-                                          kRgfxKextFeatureWriteCombined;
+                                          kRgfxKextFeatureRegionWriteCombined;
 
 class RgfxAccelerator;
 class RgfxAcceleratorUserClient;

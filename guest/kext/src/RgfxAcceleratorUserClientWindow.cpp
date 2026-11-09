@@ -111,7 +111,7 @@ IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length, bool w
 		return kIOReturnNotReady;
 	// A write-combined span from the region's descriptor of its own, and every other span from
 	// the region's (RgfxAccelerator::copyWriteCombinedRegion says why); where the first is
-	// missing, the span is mapped write-back.
+	// missing, as on arm64 (RgfxRegionMapping.hpp), the span is mapped write-back.
 	IODeviceMemory *region =
 	    owner && writeCombined ? owner->copyWriteCombinedRegion() : nullptr;
 	const bool combined = region != nullptr;
@@ -127,9 +127,9 @@ IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length, bool w
 		r = kIOReturnBadArgument;
 	} else {
 		const UInt64 start = mach_absolute_time();
-		// The region's bytes over the window's: write-back as asked, which xnu's pmap maps
-		// uncached for a page it does not manage (PCD, the guest PAT's UC-), or write-combined
-		// (PCD and PAT, the guest PAT's WC).
+		// The region's bytes over the window's: write-back as asked, which xnu's x86-64 pmap
+		// maps uncached for a page it does not manage (PCD, the guest PAT's UC-) and its arm64
+		// pmap maps Normal write-back, or write-combined (PCD and PAT, the guest PAT's WC).
 		const IOOptionBits cache = combined ? kIOMapWriteCombineCache : kIOMapCopybackCache;
 		IOMemoryMap *map = region->createMappingInTask(task, windowBase + offset,
 		                                               kIOMapOverwrite | cache, offset, length);

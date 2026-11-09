@@ -698,11 +698,14 @@ bool RgfxAccelerator::startContexts()
 	    static_cast<RgfxReleaseEntry *>(IOMalloc(sizeof(RgfxReleaseEntry) * kMaxReleases));
 	thread_call_t timer = thread_call_allocate(releaseTimerFired, nullptr);
 	// The region's bytes again for the write-combined spans (copyWriteCombinedRegion), with no
-	// effect on the region's own descriptor; a context goes on without it.
+	// effect on the region's own descriptor; a context goes on without it. None where the region's
+	// write-combined mappings are not ordinary memory (RgfxRegionMapping.hpp): every span is then
+	// mapped write-back.
 	IODeviceMemory *combined =
-	    region ? IODeviceMemory::withRange(region->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone),
-	                                       region->getLength())
-	           : nullptr;
+	    kRgfxRegionWriteCombines && region
+	        ? IODeviceMemory::withRange(region->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone),
+	                                    region->getLength())
+	        : nullptr;
 	RgfxBlock *expected = nullptr;
 	if (lock && wlock && table && rings && call && naming && rlock && releases && timer &&
 	    __atomic_compare_exchange_n(&blocks, &expected, table, false, __ATOMIC_ACQ_REL,
