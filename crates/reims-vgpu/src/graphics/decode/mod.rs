@@ -9937,6 +9937,825 @@ lacks {part}"
         }
     }
 
+    /// The shared surface's size, its copy's rows, and the composite's target, whose size
+    /// `render_ftex` takes (8 x 8): a copy of the bundle's lays a surface without planes in one
+    /// block of the region, its rows 256 bytes apart, which every process holding the surface lies
+    /// over (docs/graphics-kext/design.md, Decided 14, "The copy").
+    const SHARED_SIZE: (u64, u64) = (32, 16);
+    const SHARED_ROW: u64 = 256;
+    const SHARED_BLOCK: u64 = 0x4000;
+    const COMPOSITE_SIZE: u64 = 8;
+
+    /// Where the shared surface's bytes lie ([`shared_surface_composites`]): in a block of the
+    /// region both contexts hold, the bundle's copy of the surface; or in guest RAM, the surface's
+    /// own pages, which a block both hold names (`SURFACE_PAGES`) and each lies over
+    /// (`BUFFER_OVER_SURFACE_PAGES`).
+    #[derive(Clone, Copy, Debug)]
+    enum SharedPath {
+        Copy,
+        InPlace,
+    }
+
+    /// Context `context`'s object `n`.
+    const fn object_of(context: u64, n: u64) -> u64 {
+        (context << RGFX_CONTEXT_OBJ_ID_SHIFT) | n
+    }
+
+    /// A rectangle of texels, [x0, x1) x [y0, y1), and its premultiplied colour. Every component
+    /// is 0, 1/8, 1/4, 3/4 or 1: a half holds each exactly, and each is an 8-bit code with no tie
+    /// between two (0, 32, 64, 191, 255).
+    type SharedRect = ([u64; 4], [f32; 4]);
+
+    /// What the surface holds at each step: a colour over the whole of it, then rectangles over
+    /// that, among them some on each edge row and column and in each corner, where a clamped read
+    /// lands. Steps 0 and 3 are the guest's CPU's writes into the copy; 1 and 2 are drawn in the
+    /// first context.
+    fn shared_step(step: usize) -> ([f32; 4], Vec<SharedRect>) {
+        let (w, h) = SHARED_SIZE;
+        match step {
+            0 => (
+                [0.0, 0.0, 0.125, 1.0],
+                vec![([8, 24, 4, 12], [0.125, 0.25, 0.0, 0.25])],
+            ),
+            1 => (
+                [0.25, 0.125, 0.75, 1.0],
+                vec![
+                    ([5, 19, 3, 11], [0.75, 0.25, 0.125, 0.75]),
+                    ([0, 4, 0, 2], [1.0, 0.0, 0.0, 1.0]),
+                    ([w - 3, w, 0, 3], [0.0, 1.0, 0.0, 1.0]),
+                    ([0, 3, h - 3, h], [0.0, 0.0, 1.0, 1.0]),
+                    ([w - 4, w, h - 2, h], [1.0, 1.0, 1.0, 1.0]),
+                    ([0, w, 7, 8], [0.125, 0.125, 0.125, 0.25]),
+                    ([16, 17, 0, h], [0.0, 0.25, 0.25, 0.25]),
+                ],
+            ),
+            2 => (
+                [0.75, 0.75, 0.25, 0.75],
+                vec![
+                    ([0, w, 0, 1], [0.0, 0.125, 1.0, 1.0]),
+                    ([0, 1, 0, h], [1.0, 0.75, 0.0, 1.0]),
+                    ([0, w, h - 1, h], [0.25, 0.0, 0.25, 0.25]),
+                    ([w - 1, w, 0, h], [0.125, 0.0, 0.0, 0.125]),
+                    ([10, 30, 6, 13], [0.0, 0.0, 0.0, 0.0]),
+                ],
+            ),
+            _ => (
+                [1.0, 1.0, 1.0, 1.0],
+                vec![
+                    ([0, 2, 0, 2], [0.0, 0.0, 0.0, 1.0]),
+                    ([w - 2, w, h - 2, h], [0.25, 0.25, 0.25, 0.25]),
+                    ([12, 20, 0, h], [0.75, 0.0, 0.75, 0.75]),
+                ],
+            ),
+        }
+    }
+
+    /// The colour of texel (`x`, `y`) at `step`: the last rectangle over it, else the step's
+    /// colour.
+    fn shared_texel(step: usize, x: u64, y: u64) -> [f32; 4] {
+        let (clear, rects) = shared_step(step);
+        rects
+            .iter()
+            .rev()
+            .find(|([x0, x1, y0, y1], _)| (*x0..*x1).contains(&x) && (*y0..*y1).contains(&y))
+            .map_or(clear, |&(_, colour)| colour)
+    }
+
+    /// The bits of the half `v` is, for a `v` a half holds exactly.
+    fn exact_half(v: f32) -> u16 {
+        if v == 0.0 {
+            return 0;
+        }
+        let bits = v.to_bits();
+        let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        assert!(
+            bits & 0x1fff == 0 && (1..31).contains(&exponent),
+            "{v} is no half"
+        );
+        ((bits >> 16) & 0x8000) as u16 | ((exponent as u16) << 10) | ((bits >> 13) & 0x3ff) as u16
+    }
+
+    /// The copy's bytes at `step`, of BGRA8 (80) or RGBA16F (115): every texel in its row, the
+    /// bytes past each row's texels 0.
+    fn shared_bytes(format: u32, step: usize) -> Vec<u8> {
+        let (w, h) = SHARED_SIZE;
+        let mut bytes = vec![0u8; (SHARED_ROW * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let [r, g, b, a] = shared_texel(step, x, y);
+                let texel: Vec<u8> = match format {
+                    80 => [b, g, r, a].map(|v| (v * 255.0).round() as u8).to_vec(),
+                    _ => [r, g, b, a].map(exact_half).as_bytes().to_vec(),
+                };
+                let at = (y * SHARED_ROW) as usize + x as usize * texel.len();
+                bytes[at..at + texel.len()].copy_from_slice(&texel);
+            }
+        }
+        bytes
+    }
+
+    /// One op of a command buffer: its header, then its body.
+    fn shared_op(tag: u16, body: &[u8]) -> Vec<u8> {
+        use reims_vgpu_graphics::ops::RgfxOpHeader;
+        let mut v = RgfxOpHeader {
+            tag,
+            flags: 0,
+            len: u32::try_from(8 + body.len()).unwrap(),
+        }
+        .as_bytes()
+        .to_vec();
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// The `COMMAND_BUFFER` of `ops` on context `context`'s queue (its object 1), command buffer
+    /// `cb` of it, the queue's `seqno`th.
+    fn shared_command_buffer(context: u64, cb: u64, seqno: u64, ops: &[u8]) -> Vec<u8> {
+        use reims_vgpu_graphics::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
+        let m = RgfxCommandBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_COMMAND_BUFFER,
+                size: u32::try_from(RGFX_COMMAND_BUFFER_OPS_OFFSET as usize + ops.len()).unwrap(),
+                seqno,
+            },
+            queue_obj_id: object_of(context, 1),
+            cb_obj_id: object_of(context, cb),
+            op_bytes: ops.len() as u64,
+        };
+        let mut message = m.as_bytes().to_vec();
+        message.extend_from_slice(ops);
+        message
+    }
+
+    /// A render pass's ops over `target` of `size`, cleared to `clear`, with the pipeline
+    /// `pipeline`, each draw a strip of 4 vertices at a 64-byte slot of buffer `positions`
+    /// (`render_vbuf`'s buffer 0), its colour a 16-byte slot of buffer `colours` (its buffer 1),
+    /// and, where given, fragment texture 0 and sampler 0.
+    fn shared_pass(
+        target: u64,
+        size: (u64, u64),
+        clear: [f32; 4],
+        pipeline: u64,
+        (positions, colours): (u64, u64),
+        draws: &[(u64, u64)],
+        sampled: Option<(u64, u64)>,
+    ) -> Vec<u8> {
+        use reims_vgpu_graphics::ops::render::{
+            RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES,
+            RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            RGFX_OP_RENDER_SET_VERTEX_BUFFER, RgfxOpDrawPrimitives, RgfxOpSetFragmentSamplerStates,
+            RgfxOpSetFragmentTexture, RgfxOpSetRenderPipelineState, RgfxOpSetVertexBuffer,
+            RgfxSamplerBinding,
+        };
+        use reims_vgpu_graphics::ops::{
+            RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_PASS_FLAG_RT_SIZE,
+            RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
+        };
+        let desc = RgfxRenderPassDesc {
+            color_count: 1,
+            flags: RGFX_PASS_FLAG_RT_SIZE,
+            render_target_width: size.0 as u32,
+            render_target_height: size.1 as u32,
+            ..RgfxRenderPassDesc::default()
+        };
+        let color = RgfxRenderPassColorAttachment {
+            texture_obj_id: target,
+            // Clear, then Store.
+            load_action: 2,
+            store_action: 1,
+            clear_color_bits: clear.map(|v| f64::from(v).to_bits()),
+            ..RgfxRenderPassColorAttachment::default()
+        };
+        let mut begin = desc.as_bytes().to_vec();
+        begin.extend_from_slice(color.as_bytes());
+        let mut ops = shared_op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin);
+        let state = RgfxOpSetRenderPipelineState {
+            pipeline_obj_id: pipeline,
+        };
+        ops.extend(shared_op(
+            RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            state.as_bytes(),
+        ));
+        if let Some((texture, sampler)) = sampled {
+            let texture = RgfxOpSetFragmentTexture {
+                texture_obj_id: texture,
+                index: 0,
+            };
+            ops.extend(shared_op(
+                RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
+                texture.as_bytes(),
+            ));
+            let mut samplers = RgfxOpSetFragmentSamplerStates {
+                range_location: 0,
+                range_length: 1,
+            }
+            .as_bytes()
+            .to_vec();
+            samplers.extend_from_slice(
+                RgfxSamplerBinding {
+                    sampler_obj_id: sampler,
+                }
+                .as_bytes(),
+            );
+            ops.extend(shared_op(
+                RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES,
+                &samplers,
+            ));
+        }
+        for &(quad, colour) in draws {
+            for (buffer, offset, index) in [(positions, quad * 64, 0), (colours, colour * 16, 1)] {
+                let set = RgfxOpSetVertexBuffer {
+                    buffer_obj_id: buffer,
+                    offset,
+                    index,
+                };
+                ops.extend(shared_op(RGFX_OP_RENDER_SET_VERTEX_BUFFER, set.as_bytes()));
+            }
+            // A triangle strip.
+            let draw = RgfxOpDrawPrimitives {
+                primitive_type: 4,
+                vertex_start: 0,
+                vertex_count: 4,
+            };
+            ops.extend(shared_op(RGFX_OP_RENDER_DRAW_PRIMITIVES, draw.as_bytes()));
+        }
+        ops.extend(shared_op(RGFX_OP_ENCODER_END, &[]));
+        ops
+    }
+
+    /// The 4 positions of a strip over texels [x0, x1) x [y0, y1) of a target of `size`, in
+    /// normalized device coordinates (y up, row 0 at the top), each edge on a texel's.
+    fn shared_quad([x0, x1, y0, y1]: [u64; 4], (w, h): (u64, u64)) -> [f32; 16] {
+        let x = |v: u64| -1.0 + 2.0 * v as f32 / w as f32;
+        let y = |v: u64| 1.0 - 2.0 * v as f32 / h as f32;
+        [
+            x(x0),
+            y(y0),
+            0.0,
+            1.0,
+            x(x1),
+            y(y0),
+            0.0,
+            1.0,
+            x(x0),
+            y(y1),
+            0.0,
+            1.0,
+            x(x1),
+            y(y1),
+            0.0,
+            1.0,
+        ]
+    }
+
+    /// A Shared buffer of `device` holding `bytes`.
+    fn shared_buffer<P: Platform>(device: &P::Device, bytes: &[u8]) -> P::Buffer {
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        let length = (bytes.len() as u64).next_multiple_of(0x4000);
+        let buffer = device
+            .new_buffer_of_length(OnFault::Die, length, 0)
+            .unwrap()
+            .unwrap();
+        // SAFETY: a Shared buffer of at least `bytes.len()` bytes, which no command uses yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                buffer.contents().as_ptr::<u8>(),
+                bytes.len(),
+            )
+        };
+        buffer
+    }
+
+    /// The probe's minified linear read of the surface: 8 x 6 positions from texel (0, 0), the
+    /// last at (32, 15), each about 4.6 texels from the next across and 3 down, so the first and
+    /// last of each row and column lie on the surface's edges and each corner is read.
+    fn shared_probe() -> (u64, u64, Vec<u8>) {
+        let (columns, rows) = (8u32, 6u32);
+        let floats = [0.0f32, 0.0, 32.0 / 7.0, 3.0].map(f32::to_le_bytes);
+        let words = [columns, rows, 1, 0].map(u32::to_le_bytes);
+        (
+            u64::from(columns),
+            u64::from(rows),
+            [floats.concat(), words.concat()].concat(),
+        )
+    }
+
+    /// What `texture` of the decoder answers at a step: every texel `read()` reads, the probe's
+    /// samples through `sampler` ([`shared_probe`]), as their bits.
+    fn shared_reads<P: Platform>(
+        device: &P::Device,
+        texture: &P::Texture,
+        sampler: &P::SamplerState,
+    ) -> [Vec<[u32; 4]>; 2] {
+        let (columns, rows, probe) = shared_probe();
+        let read = kernel_reads::<P>(
+            device,
+            "read_texels_float",
+            texture,
+            SHARED_SIZE,
+            (None, None),
+        );
+        let sampled = kernel_reads::<P>(
+            device,
+            "sample_texels_float",
+            texture,
+            (columns, rows),
+            (Some(sampler), Some(&probe[..])),
+        );
+        [read, sampled].map(|v| v.iter().map(|t| t.map(f32::to_bits)).collect())
+    }
+
+    /// A surface drawn on one context's queue and composited on another's, as an app's layer or
+    /// WindowServer's own capture is drawn and then read as a backdrop, through the decoder on
+    /// `P`, of `format` over a surface of `ostype`, its bytes where `path` lays them: each context
+    /// has its own buffer over them (`BUFFER_OVER_HOST_MEMORY` over the copy's block, or
+    /// `BUFFER_OVER_SURFACE_PAGES` over the block that names its pages) and its own texture over
+    /// the buffer (`TEXTURE_FROM_IOSURFACE`), the first's a render target. At each step the
+    /// surface takes new contents (the guest's CPU writes its bytes, or the first context draws
+    /// it and its command buffer completes), and then the second context's command buffer
+    /// composites it: a linear, minified read of the whole surface, clamped at its edges, over a
+    /// target cleared to another colour, the target's border left uncovered. The same composite
+    /// of a texture over a block the CPU wrote with what the surface should hold, made fresh for
+    /// the step, is the reference. In place, the surface's pages are whole host pages, and the
+    /// bytes past its own must stay as they were. `Err` says the first difference.
+    fn shared_surface_composites<P: crate::platform::ApiPlatform>(
+        format: u32,
+        ostype: &[u8; 4],
+        path: SharedPath,
+    ) -> Result<(), String> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_SURFACE_PAGES,
+            RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_STATUS_OK,
+            RgfxBufferOverSurfacePages, RgfxPageRun, RgfxSurfaceFacts, RgfxSurfacePages,
+        };
+        use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+
+        use super::surface_pages::Lease;
+        use super::surface_pages::costs::{RAM, guest_ram};
+
+        const STEPS: usize = 4;
+        let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+        assert!(blocks.is_multiple_of(SHARED_BLOCK));
+        // The shared block, then one reference block a step.
+        let block_at = |k: u64| blocks + k * SHARED_BLOCK;
+        let size = block_at(1 + STEPS as u64) + RGFX_CURSOR_SPAN;
+        let region = Arc::new(Region::new(size as usize).unwrap());
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
+        // The guest's RAM, where the surface lies in place, outlives the decoder and its views.
+        let mut ram = None;
+        let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::clone(&region));
+        let (tx, completed) = mpsc::channel();
+        let tx = reims_vgpu_vulkan::core::sync::Mutex::new(tx);
+        dec.set_completion_sink(Arc::new(move |m| {
+            let _ = tx.lock().send(m);
+        }));
+        // The first context draws, the second composites; each holds its resource ids.
+        let (drawer, compositor) = (1u64, 2u64);
+        dec.hold_resource_ids(drawer as u32, 0);
+        dec.hold_resource_ids(compositor as u32, 1);
+        let id_base = |context: u64| (context - 1) * RGFX_RESOURCE_ID_CHUNK;
+        for context in [drawer, compositor] {
+            region.share(context as u32, block_at(0), SHARED_BLOCK);
+        }
+        for k in 0..STEPS as u64 {
+            region.grant(compositor as u32, block_at(1 + k), SHARED_BLOCK);
+        }
+        // Where the surface's bytes lie: in the shared block, a copy; or in guest RAM, which the
+        // shared block names, in place: three host pages into the RAM, the surface's whole pages,
+        // the bytes past its own a sentinel no step may change.
+        let page = platform.vm().page_size().max(4096);
+        let own = SHARED_ROW * SHARED_SIZE.1;
+        let length = own.next_multiple_of(page);
+        // Every byte of the RAM is this until written.
+        const SENTINEL: u8 = 0x5a;
+        let surface: *mut u8 = match path {
+            // SAFETY: the shared block's bytes, in the region, which outlives every use here.
+            SharedPath::Copy => unsafe { region.base().add(block_at(0) as usize) },
+            SharedPath::InPlace => {
+                let r = ram.insert(guest_ram(16 * page, true));
+                let lease: Lease = Arc::from(platform.guest_memory(&r.map));
+                let core = CoreMemoryMap::new(Arc::clone(&platform), &r.map.to_core())
+                    .expect("a memory map");
+                dec.set_guest_memory(core, lease);
+                if !dec.surface_pages_available() {
+                    return Err(format!("no views of guest RAM on a host page of {page:#x}"));
+                }
+                // SAFETY: three pages into the RAM's `16 * page` bytes, which `ram` keeps mapped.
+                unsafe { r.at.add((3 * page) as usize) }
+            }
+        };
+        // SAFETY: `length` bytes at `surface`, which no command uses yet.
+        let write_surface = |bytes: &[u8]| unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), surface, bytes.len())
+        };
+        // SAFETY: as above; read once the commands that wrote them completed.
+        let read_surface =
+            |n: u64| unsafe { std::slice::from_raw_parts(surface, n as usize).to_vec() };
+        write_surface(&shared_bytes(format, 0));
+        if let SharedPath::InPlace = path {
+            let blocks = RgfxSurfacePages {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_SURFACE_PAGES,
+                    size: 0,
+                    seqno: 0,
+                },
+                context: compositor as u32,
+                run_count: 1,
+                block_offset: block_at(0),
+                block_size: SHARED_BLOCK,
+                runs_offset: block_at(0) + SHARED_BLOCK / 2,
+                length,
+            };
+            let runs = [RgfxPageRun {
+                address: RAM + 3 * page,
+                length,
+            }];
+            dec.set_context(None);
+            let answer = dec.surface_pages(&device, &blocks, &runs, 0);
+            if answer != RGFX_STATUS_OK {
+                return Err(format!(
+                    "the surface's pages in place were answered {answer}"
+                ));
+            }
+        }
+
+        let decode = |dec: &mut GraphicsDecoder<P>, context: u64, message: &[u8]| {
+            dec.set_context(Some(context as u32));
+            let done = dec.decode(&device, message).unwrap();
+            assert_eq!(
+                done,
+                Ok(()),
+                "context {context}'s message {:?}",
+                &message[..8]
+            );
+        };
+        let insert = |dec: &mut GraphicsDecoder<P>, obj_id: u64, handle: ObjHandle<P>| {
+            dec.set_context(Some((obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32));
+            assert_eq!(dec.insert(obj_id, handle).unwrap(), Ok(()));
+        };
+        let over_block = |obj_id: u64, region_offset: u64| RgfxBufferOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+                size: size_of::<RgfxBufferOverHostMemory>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            region_offset,
+            length: SHARED_BLOCK,
+            ..RgfxBufferOverHostMemory::default()
+        };
+        let facts = RgfxSurfaceFacts {
+            surface_pixel_format: u32::from_be_bytes(*ostype),
+            plane_count: 0,
+            width: SHARED_SIZE.0 as u32,
+            height: SHARED_SIZE.1 as u32,
+            ..RgfxSurfaceFacts::default()
+        };
+        // Texture `n` of `context` over its buffer `buffer`, of surface `surface`, with `usage`.
+        let over_surface = |context: u64, n: u64, buffer: u64, surface: u32, usage: u32| {
+            use reims_vgpu_graphics::wire::RGFX_SURFACE_FACTS_OFFSET;
+            let m = RgfxTextureFromIOSurface {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                    size: (RGFX_SURFACE_FACTS_OFFSET as usize + size_of::<RgfxSurfaceFacts>())
+                        as u32,
+                    seqno: 0,
+                },
+                obj_id: object_of(context, n),
+                resource_id: id_base(context) + n,
+                buffer_obj_id: object_of(context, buffer),
+                offset: 0,
+                bytes_per_row: SHARED_ROW,
+                iosurface_id: surface,
+                plane: 0,
+                desc: RgfxTextureDescriptor {
+                    usage,
+                    ..surface_desc(format, SHARED_SIZE)
+                },
+                writers_offset: RGFX_SURFACE_NO_WRITERS,
+            };
+            let mut bytes = m.as_bytes().to_vec();
+            bytes.extend_from_slice(facts.as_bytes());
+            bytes
+        };
+        // `MTLTextureUsageShaderRead`, and `| RenderTarget`.
+        let (sampled, target) = (1u32, 1u32 | 4);
+        const SURFACE: u32 = 0x51;
+
+        // Each context's queue, its buffer over the shared block and its texture over that, the
+        // compositor's first, as WindowServer's backdrop texture outlives the frames drawn into
+        // its surface.
+        for context in [compositor, drawer] {
+            let queue = RgfxQueueCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_QUEUE_CREATE,
+                    size: size_of::<RgfxQueueCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id: object_of(context, 1),
+                ..RgfxQueueCreate::default()
+            };
+            decode(&mut dec, context, queue.as_bytes());
+            match path {
+                SharedPath::Copy => {
+                    let buffer = over_block(object_of(context, 10), block_at(0));
+                    decode(&mut dec, context, buffer.as_bytes());
+                }
+                SharedPath::InPlace => {
+                    let buffer = RgfxBufferOverSurfacePages {
+                        header: RgfxMsgHeader {
+                            r#type: RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
+                            size: size_of::<RgfxBufferOverSurfacePages>() as u32,
+                            seqno: 0,
+                        },
+                        obj_id: object_of(context, 10),
+                        block_offset: block_at(0),
+                        block_size: SHARED_BLOCK,
+                        length,
+                        ..RgfxBufferOverSurfacePages::default()
+                    };
+                    decode(&mut dec, context, buffer.as_bytes());
+                }
+            }
+            let usage = if context == drawer { target } else { sampled };
+            decode(
+                &mut dec,
+                context,
+                &over_surface(context, 11, 10, SURFACE, usage),
+            );
+        }
+
+        // The drawer's pipeline (flat colours, no blending) and its quads: one strip a rectangle
+        // of each drawn step, and the colours of each.
+        let pipeline = |fragment: &str, color: ColorAttachmentDesc| {
+            let vertex = super::draw_cost::fixture::<P>(&device, "render_vbuf");
+            let fragment = super::draw_cost::fixture::<P>(&device, fragment);
+            device
+                .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                    colors: vec![(0, color)],
+                    ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+                })
+                .unwrap()
+                .unwrap()
+        };
+        let flat = ColorAttachmentDesc {
+            pixel_format: u64::from(format),
+            ..ColorAttachmentDesc::default()
+        };
+        let mut quads = Vec::new();
+        let mut colours = Vec::new();
+        let mut draws = vec![Vec::new(); STEPS];
+        for (step, step_draws) in draws
+            .iter_mut()
+            .enumerate()
+            .filter(|(s, _)| *s == 1 || *s == 2)
+        {
+            for (rect, colour) in shared_step(step).1 {
+                step_draws.push((quads.len() as u64, colours.len() as u64));
+                quads.push(shared_quad(rect, SHARED_SIZE));
+                colours.push(colour);
+            }
+        }
+        let positions = shared_buffer::<P>(&device, quads.as_bytes());
+        let colours = shared_buffer::<P>(&device, colours.as_bytes());
+        insert(
+            &mut dec,
+            object_of(drawer, 20),
+            ObjHandle::RenderPipeline(pipeline("render_color", flat)),
+        );
+        insert(
+            &mut dec,
+            object_of(drawer, 21),
+            ObjHandle::Buffer(positions),
+        );
+        insert(&mut dec, object_of(drawer, 22), ObjHandle::Buffer(colours));
+
+        // The compositor's pipeline (the source over the target), its quad (the target less a
+        // border of one texel), its sampler, and its two targets: one the surface is composited
+        // into, one the reference is.
+        let composite = (COMPOSITE_SIZE, COMPOSITE_SIZE);
+        let inset = shared_quad([1, COMPOSITE_SIZE - 1, 1, COMPOSITE_SIZE - 1], composite);
+        let backdrop = [0.0f32, 0.125, 0.25, 1.0];
+        let over = super::draw_cost::over(u64::from(format));
+        insert(
+            &mut dec,
+            object_of(compositor, 20),
+            ObjHandle::RenderPipeline(pipeline("render_ftex", over)),
+        );
+        insert(
+            &mut dec,
+            object_of(compositor, 21),
+            ObjHandle::Buffer(shared_buffer::<P>(&device, inset.as_bytes())),
+        );
+        insert(
+            &mut dec,
+            object_of(compositor, 22),
+            ObjHandle::Buffer(shared_buffer::<P>(&device, &[0; 16])),
+        );
+        insert(
+            &mut dec,
+            object_of(compositor, 23),
+            ObjHandle::Sampler(linear_sampler::<P>(&device)),
+        );
+        for n in [30, 31] {
+            let desc = platform.texture_descriptor(&TextureDesc {
+                pixel_format: u64::from(format),
+                width: COMPOSITE_SIZE,
+                height: COMPOSITE_SIZE,
+                usage: u64::from(target),
+                ..TextureDesc::default()
+            });
+            let texture = device.new_texture(OnFault::Die, &desc).unwrap().unwrap();
+            insert(
+                &mut dec,
+                object_of(compositor, n),
+                ObjHandle::Texture(texture),
+            );
+        }
+        let sampler = linear_sampler::<P>(&device);
+
+        let mut seqnos = [0u64; 3];
+        let mut run = |dec: &mut GraphicsDecoder<P>, context: u64, ops: &[u8]| {
+            let seqno = &mut seqnos[context as usize];
+            *seqno += 1;
+            let cb = 0x100 + *seqno;
+            decode(
+                dec,
+                context,
+                &shared_command_buffer(context, cb, *seqno, ops),
+            );
+            let record = completed
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| {
+                    panic!("context {context}'s command buffer {cb:#x} never completed")
+                });
+            assert_eq!(record.cb_obj_id, object_of(context, cb));
+            assert_eq!(
+                record.status, 0,
+                "context {context}'s command buffer failed: {record:?}"
+            );
+        };
+        let texture_of = |dec: &GraphicsDecoder<P>, n: u64| -> P::Texture {
+            let Some(ObjHandle::Texture(t)) = dec.object(object_of(compositor, n)) else {
+                panic!("no texture {n} of the compositor's");
+            };
+            t.clone_ref()
+        };
+
+        for (step, step_draws) in draws.iter().enumerate() {
+            let expected = shared_bytes(format, step);
+            if step_draws.is_empty() {
+                // The guest's CPU writes the surface: its pages in place, or the copy, as the
+                // bundle syncs it from the pages before a commit.
+                write_surface(&expected);
+            } else {
+                let ops = shared_pass(
+                    object_of(drawer, 11),
+                    SHARED_SIZE,
+                    shared_step(step).0,
+                    object_of(drawer, 20),
+                    (object_of(drawer, 21), object_of(drawer, 22)),
+                    step_draws,
+                    None,
+                );
+                run(&mut dec, drawer, &ops);
+                // The draw is in the block when its command buffer is reported complete, where
+                // the bundle writes the copy back to the surface's pages.
+                let held = read_surface(expected.len() as u64);
+                let texel = if format == 80 { 4 } else { 8 };
+                for y in 0..SHARED_SIZE.1 {
+                    let row = (y * SHARED_ROW) as usize
+                        ..(y * SHARED_ROW + SHARED_SIZE.0 * texel) as usize;
+                    if held[row.clone()] != expected[row.clone()] {
+                        return Err(format!(
+                            "step {step}: row {y} of the copy after the draw's completion is \
+                             {:02x?}, not {:02x?}",
+                            &held[row.clone()],
+                            &expected[row]
+                        ));
+                    }
+                }
+            }
+            // The reference: a block the CPU wrote, under a texture made after the write.
+            let reference = block_at(1 + step as u64);
+            assert!(region.write(reference, &expected));
+            let (buffer, texture) = (40 + 2 * step as u64, 41 + 2 * step as u64);
+            decode(
+                &mut dec,
+                compositor,
+                over_block(object_of(compositor, buffer), reference).as_bytes(),
+            );
+            decode(
+                &mut dec,
+                compositor,
+                &over_surface(compositor, texture, buffer, 0x60 + step as u32, sampled),
+            );
+            let mut ops = Vec::new();
+            for (target, source) in [(30, 11), (31, texture)] {
+                ops.extend(shared_pass(
+                    object_of(compositor, target),
+                    composite,
+                    backdrop,
+                    object_of(compositor, 20),
+                    (object_of(compositor, 21), object_of(compositor, 22)),
+                    &[(0, 0)],
+                    Some((object_of(compositor, source), object_of(compositor, 23))),
+                ));
+            }
+            run(&mut dec, compositor, &ops);
+            dec.set_context(Some(compositor as u32));
+            let read = |n: u64| {
+                let t = texture_of(&dec, n);
+                kernel_reads::<P>(&device, "read_texels_float", &t, composite, (None, None))
+                    .iter()
+                    .map(|t| t.map(f32::to_bits))
+                    .collect::<Vec<_>>()
+            };
+            let (surface, wanted) = (read(30), read(31));
+            if surface != wanted {
+                return Err(format!(
+                    "step {step}: the composite of the shared surface is {surface:08x?}, not the \
+                     reference's {wanted:08x?}"
+                ));
+            }
+            // The reference's composite reads the surface: its inside is not the backdrop.
+            let backdrop_bits = backdrop.map(f32::to_bits);
+            assert!(
+                wanted.iter().any(|t| *t != backdrop_bits),
+                "step {step}: an empty reference"
+            );
+            // The second context's texture itself, read texel by texel and sampled minified.
+            let surface = texture_of(&dec, 11);
+            let reference = texture_of(&dec, texture);
+            let [read_s, sampled_s] = shared_reads::<P>(&device, &surface, &sampler);
+            let [read_r, sampled_r] = shared_reads::<P>(&device, &reference, &sampler);
+            if read_s != read_r {
+                return Err(format!(
+                    "step {step}: the second context's texture reads {read_s:08x?}, not the \
+                     reference's {read_r:08x?}"
+                ));
+            }
+            if sampled_s != sampled_r {
+                return Err(format!(
+                    "step {step}: the second context's texture samples {sampled_s:08x?}, not the \
+                     reference's {sampled_r:08x?}"
+                ));
+            }
+        }
+        // In place, nothing wrote past the surface's own bytes in its last page.
+        if ram.is_some() {
+            let tail = read_surface(length);
+            if let Some(at) = tail[own as usize..].iter().position(|&b| b != SENTINEL) {
+                return Err(format!(
+                    "the byte {:#x} past the surface's own {own:#x} in its page is {:#04x}",
+                    own as usize + at,
+                    tail[own as usize + at]
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`shared_surface_composites`] on the Vulkan platform by `path`, of BGRA8 and of RGBA16F:
+    /// every difference.
+    fn shared_cases(path: SharedPath) {
+        let mut failed = Vec::new();
+        for &(format, ostype, _) in &PIN_CASES {
+            let done = shared_surface_composites::<reims_vgpu_vulkan::VulkanPlatform>(
+                format, ostype, path,
+            );
+            if let Err(e) = done {
+                failed.push(format!("{path:?} {format}: {e}"));
+            }
+        }
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// On the Vulkan platform, a surface's copy that one context draws and another composites
+    /// reads in the second as the first drew it, and as the guest's CPU wrote it, of BGRA8 and of
+    /// RGBA16F: texel by texel, sampled minified through a linear sampler, and composited over
+    /// another colour with its edge rows and columns clamped into the corners
+    #[test]
+    fn on_vulkan_another_context_composites_a_surface_copy_as_it_was_drawn() {
+        shared_cases(SharedPath::Copy);
+    }
+
+    /// On the Vulkan platform, a surface in place, its own pages of guest RAM, that one context
+    /// draws and another composites reads in the second as the first drew it, and as the guest's
+    /// CPU wrote its pages, as the copy does; and nothing lands past the surface's own bytes in its
+    /// last page
+    #[test]
+    fn on_vulkan_another_context_composites_a_surface_in_place_as_it_was_drawn() {
+        shared_cases(SharedPath::InPlace);
+    }
+
     /// WindowServer's mipmapped tiled texture under the x86 Macs' feature profile (macOS 26): 54
     /// x 54 BGRA8Unorm of 6 levels, usage `ShaderRead`, over a 16384-byte Shared buffer at 256
     /// bytes a row, whose 40 bytes past each row's texels are padding.

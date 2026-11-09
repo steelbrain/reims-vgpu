@@ -1755,7 +1755,7 @@ impl<P: Platform> super::GraphicsDecoder<P> {
 }
 
 #[cfg(test)]
-mod costs;
+pub(super) mod costs;
 
 #[cfg(test)]
 pub(super) mod tests {

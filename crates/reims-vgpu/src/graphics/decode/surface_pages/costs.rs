@@ -75,7 +75,7 @@ use crate::platform::ApiPlatform;
 const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4000;
 
 /// The guest physical address of the RAM's first byte.
-const RAM: u64 = 0x1_0000_0000;
+pub(in crate::graphics::decode) const RAM: u64 = 0x1_0000_0000;
 
 const MIB: u64 = 1 << 20;
 
@@ -208,9 +208,9 @@ impl Step {
 }
 
 /// The guest's RAM as the host maps it, and what keeps it.
-struct Ram {
-    map: MemoryMap,
-    at: *mut u8,
+pub(in crate::graphics::decode) struct Ram {
+    pub(in crate::graphics::decode) map: MemoryMap,
+    pub(in crate::graphics::decode) at: *mut u8,
     length: u64,
     /// The memfd behind it, on Linux.
     #[cfg(target_os = "linux")]
@@ -228,7 +228,7 @@ impl Drop for Ram {
 /// memfd's shared mapping on Linux (with huge pages asked for where `RGK_BENCH_THP=1`), sealed as
 /// QEMU's `memory-backend-memfd` seals it (`F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`), since
 /// udmabuf refuses a memfd not sealed against shrinking; anonymous memory on macOS.
-fn guest_ram(length: u64, touched: bool) -> Ram {
+pub(in crate::graphics::decode) fn guest_ram(length: u64, touched: bool) -> Ram {
     #[cfg(target_os = "linux")]
     let (at, file) = {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
