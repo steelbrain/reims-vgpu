@@ -4,10 +4,21 @@
  * ReimsGraphics.cpp's, as on x86-64; this file is what the class asks of a subclass.
  *
  * This first cut learns the class's calls: each override logs its calls (the first ones and then
- * one in kLogEvery) and forwards to the class where it implements the method. A layer's surface
- * map presents the layer-0 surface on the device, and the device's refreshes reach the class as
- * its vblank note. The class's own pure methods answer what a display with no frame info, no
- * factory configuration and no CRC answers.
+ * one in kLogEvery). A layer's surface map presents the layer-0 surface on the device, and the
+ * device's refreshes reach the class as its vblank note. The class's own pure methods answer what
+ * a display with no frame info, no factory configuration and no CRC answers.
+ *
+ * None of the class's methods a subclass overrides is forwarded to the class: what the class
+ * implements there is for no display at all, on every arm64 release from 13 to 27.0.1 (read from
+ * each release's IOMobileGraphicsFamily). Its start_hardware answers false, which fails its start
+ * ("start_hardware failed"); its stop_hardware_gated and swap_begin_gated do nothing; its
+ * verify_swap answers false, which fails every swap ("verify_swap failed for swap id"); and its
+ * swap_layer_map, surface_layer_map and surface_layer_unmap map a layer's surface for the display
+ * hardware's DMA, through the mapper an AppleARMIODevice provider names. Apple's paravirtual
+ * display, the class's subclass in a VM (AppleParavirtDisplay), overrides each of the seven: its
+ * start_hardware starts its display and joins power management, its verify_swap answers true, and
+ * its three maps map nothing. ReimsGraphics does the same: the device reads a surface by its
+ * IOSurface ID, so no layer's surface is mapped.
  */
 
 #include "ReimsGraphics.hpp"
@@ -76,7 +87,7 @@ bool ReimsGraphics::startMobile()
 		IOLog("ReimsGraphics: no pipe for the mobile framebuffer\n");
 		return false;
 	}
-	setPipeVblankEnabled(this, true);
+	mobilePowerJoined = false;
 	IOLog("ReimsGraphics: mobile framebuffer, display %u\n", displayId);
 	return true;
 }
@@ -178,52 +189,75 @@ bool ReimsGraphics::are_timings_enabled() const
 	return true;
 }
 
-// MARK: - What the class implements, logged and forwarded
+// MARK: - What a subclass implements for its display
+
+namespace {
+
+// The power states the display registers, as Apple's paravirtual display registers its own: off,
+// and on and usable.
+IOPMPowerState mobilePowerStates[] = {
+	{kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+	{kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0},
+};
+
+} // namespace
 
 RgfxIOMFBWord ReimsGraphics::start_hardware()
 {
-	const RgfxIOMFBWord r = super::start_hardware();
+	// The class's start calls this last, and fails unless it answers true. The device runs
+	// already (start). Power management's state reaches the class through its setPowerState,
+	// which records it: the class drops every swap submitted while the display is off. The
+	// vblanks start here, once the class has its work loop and swap queue.
+	PMinit();
+	if (IOService *provider = getProvider())
+		provider->joinPMtree(this);
+	const IOReturn power = registerPowerDriver(this, mobilePowerStates,
+	                                           sizeof(mobilePowerStates) / sizeof(mobilePowerStates[0]));
+	mobilePowerJoined = true;
+	if (mobilePipe)
+		setPipeVblankEnabled(this, true);
 	if (logged(kStartHardware))
-		IOLog("ReimsGraphics: start_hardware() = 0x%llx\n", r);
-	return r;
+		IOLog("ReimsGraphics: start_hardware(): power driver 0x%x, vblanks on\n", power);
+	return 1;
 }
 
 RgfxIOMFBWord ReimsGraphics::stop_hardware_gated()
 {
-	const RgfxIOMFBWord r = super::stop_hardware_gated();
+	if (mobilePipe)
+		setPipeVblankEnabled(this, false);
+	if (mobilePowerJoined)
+		PMstop();
+	mobilePowerJoined = false;
 	if (logged(kStopHardware))
-		IOLog("ReimsGraphics: stop_hardware_gated() = 0x%llx\n", r);
-	return r;
+		IOLog("ReimsGraphics: stop_hardware_gated()\n");
+	return 0;
 }
 
 RgfxIOMFBWord ReimsGraphics::swap_begin_gated()
 {
-	const RgfxIOMFBWord r = super::swap_begin_gated();
 	if (logged(kSwapBegin))
-		IOLog("ReimsGraphics: swap_begin_gated() = 0x%llx\n", r);
-	return r;
+		IOLog("ReimsGraphics: swap_begin_gated()\n");
+	return 0;
 }
 
 RgfxIOMFBWord ReimsGraphics::verify_swap(IOMFBSwapIORequest *request)
 {
-	const RgfxIOMFBWord r = super::verify_swap(request);
 	if (logged(kVerifySwap))
-		IOLog("ReimsGraphics: verify_swap(%p) = 0x%llx\n", request, r);
-	return r;
+		IOLog("ReimsGraphics: verify_swap(%p) = 1\n", request);
+	return 1;
 }
 
 RgfxIOMFBWord ReimsGraphics::swap_layer_map(IOMFBSwapIORequest *request, uint32_t layer)
 {
-	const RgfxIOMFBWord r = super::swap_layer_map(request, layer);
 	if (logged(kSwapLayerMap))
-		IOLog("ReimsGraphics: swap_layer_map(%p, %u) = 0x%llx\n", request, layer, r);
-	return r;
+		IOLog("ReimsGraphics: swap_layer_map(%p, %u)\n", request, layer);
+	return word(kIOReturnSuccess);
 }
 
 RgfxIOMFBWord ReimsGraphics::surface_layer_map(IOMFB::AP::DisplayedData *data, uint32_t layer,
                                                IOSurface *surface)
 {
-	const RgfxIOMFBWord r = super::surface_layer_map(data, layer, surface);
+	const RgfxIOMFBWord r = word(kIOReturnSuccess);
 	const uint32_t id =
 	    surface ? rgfxIOSurfaceSurfaceID(reinterpret_cast<const OSObject *>(surface)) : 0;
 	IOReturn presented = kIOReturnNotReady;
@@ -243,10 +277,9 @@ RgfxIOMFBWord ReimsGraphics::surface_layer_map(IOMFB::AP::DisplayedData *data, u
 
 RgfxIOMFBWord ReimsGraphics::surface_layer_unmap(IOMFB::AP::DisplayedData *data, uint32_t layer)
 {
-	const RgfxIOMFBWord r = super::surface_layer_unmap(data, layer);
 	if (logged(kSurfaceLayerUnmap))
-		IOLog("ReimsGraphics: surface_layer_unmap(%p, %u) = 0x%llx\n", data, layer, r);
-	return r;
+		IOLog("ReimsGraphics: surface_layer_unmap(%p, %u)\n", data, layer);
+	return 0;
 }
 
 #endif // __arm64e__

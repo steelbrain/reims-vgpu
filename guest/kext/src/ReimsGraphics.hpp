@@ -168,8 +168,9 @@ public:
 	                                     uint32_t field_3) override;
 	RgfxIOMFBWord notify_crc_ready_gated(uint32_t field_0) override;
 	bool are_timings_enabled() const override;
-	// And what the class implements, which each of these logs and forwards to it: the hardware's
-	// start and stop, and a swap's steps; a layer's surface map also presents it.
+	// And what a subclass implements for its display, none of it forwarded to the class, whose own
+	// is for no display (ReimsGraphicsMobile.cpp): the hardware's start and stop, and a swap's
+	// steps; a layer's surface map also presents it.
 	RgfxIOMFBWord start_hardware() override;
 	RgfxIOMFBWord stop_hardware_gated() override;
 	RgfxIOMFBWord swap_begin_gated() override;
@@ -534,6 +535,8 @@ private:
 	static void mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	static void mobilePresented(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
 	bool mobilePipe;
+	// Whether start_hardware joined power management, which stop_hardware_gated leaves.
+	bool mobilePowerJoined;
 	UInt64 mobilePresentSeqno;
 	UInt32 mobileTransaction;
 #endif
