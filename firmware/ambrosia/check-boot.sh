@@ -59,6 +59,14 @@
 #              executable mapped (`sudo lsof` on its pid, which reads the mappings without
 #              task_for_pid, so SIP allows it), and this boot's log has no AMFI or
 #              library-validation denial naming reims-graphics.
+#   page-count the kext's count of a surface's pages (mach_vm_region over kernel_map, and
+#              inside IOKit's pageable maps by IOIteratePageableMaps) did not take the guest
+#              down: read after the Metal work, its kern.boottime is the one it had at the
+#              login, and no panic report was written in this run. Its detail is the host's last
+#              count of IOSurface device caches (made, deferred, carrying pages, refused) and the
+#              kext's own count lines this boot (counted, not counted). Zero deferred while
+#              caches were made, no count line, or no count that counted is printed as a finding
+#              under the verdict, not a failure.
 #   no-fatal   no `reims-vgpu: fatal` line in QEMU's log or the serial log.
 #
 # OUT keeps serial.log, qemu.log, screen.png (QMP's screendump of the display at the end, before
@@ -241,7 +249,12 @@ qpid=$!
 
 # --- the checks ---------------------------------------------------------------------------------
 
-names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map no-fatal)
+names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count no-fatal)
+# What a check reports beside its verdict, printed under it: neither a pass nor a failure.
+findings=()
+# The guest's kern.boottime at the login and after the Metal work, the panic reports written in
+# this run, and the kext's count lines this boot (page-count).
+boot0= boot1= panics= kc=
 # A check's verdict, PASS or FAIL, and what it found; in plain variables, for macOS's bash 3.2.
 verdict() { printf -v "st_${1//-/_}" '%s' "$2"; printf -v "dt_${1//-/_}" '%s' "$3"; }
 state() { local v="st_${1//-/_}"; echo "${!v:-}"; }
@@ -288,6 +301,7 @@ fi
 if [[ -n $ssh_s ]]; then
   verdict ssh PASS "a login $ssh_s s after QEMU started (limit $limit s)"
   G 20 'sw_vers -productVersion; sw_vers -buildVersion' > /dev/null
+  boot0=$(G 20 'sysctl -n kern.boottime') || boot0=
 
   csr=$(G 30 csrutil status)
   case $csr in
@@ -403,12 +417,20 @@ if [[ -n $ssh_s ]]; then
   else
     verdict amfi-map FAIL "WindowServer (pid $ws_pid) maps the bundle ${mapped:-0} times; ${denied:-unread} AMFI or library-validation lines name reims-graphics"
   fi
+
+  # The page count's path, after the Metal work: the guest's boot unchanged, the panic reports
+  # written in this run (each marked where it names our kexts or the count's calls), and the
+  # kext's count lines this boot. The host's counts are read from its log once QEMU has ended.
+  boot1=$(G 20 'sysctl -n kern.boottime') || boot1=
+  run_min=$(perl -e 'printf "%d\n", $ARGV[0] / 60 + 2' "$(since "$t0")")
+  panics=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' sh -c 'find /Library/Logs/DiagnosticReports -maxdepth 2 -type f \\( -name \"*.panic\" -o -name \"panic-*\" \\) -mmin -$run_min | while read -r f; do if grep -q -E \"com\\.steelbrain|mach_vm_region|IOIteratePageableMaps\" \"\$f\"; then echo \"\$f (names our kexts)\"; else echo \"\$f\"; fi; done'")
+  kc=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"RgfxAccelerator: \"' 2>/dev/null | grep -E 'counting an IOSurface|not a buffer the kernel allocated|could not be mapped to count'")
   ws_end=$(G 20 'pgrep -x WindowServer | head -1') || ws_end="unread: $(echo "$ws_end" | tail -1)"
 elif [[ $(state firmware) == FAIL ]]; then
-  for n in ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map; do verdict "$n" FAIL "not run: the firmware check failed"; done
+  for n in ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count; do verdict "$n" FAIL "not run: the firmware check failed"; done
 else
   verdict ssh FAIL "no SSH login in $limit s"
-  for n in sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map; do verdict "$n" FAIL "not run: no SSH login"; done
+  for n in sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count; do verdict "$n" FAIL "not run: no SSH login"; done
 fi
 # What the display shows at the end: the desktop, or the console's log and the kernel's progress.
 qmp "{\"execute\": \"screendump\", \"arguments\": {\"filename\": \"$out/screen.png\", \"format\": \"png\"}}" > /dev/null 2>&1 ||
@@ -429,6 +451,33 @@ if [[ -n $ssh_s ]]; then
   if ((presents > 0)); then ws+=("the host's display switched to an IOSurface the guest presented $presents times")
   else ws+=("the host's log shows no IOSurface the guest presented") ok=0; fi
   verdict windowserver-metal "$( ((ok)) && echo PASS || echo FAIL)" "$(IFS=';'; echo "${ws[*]}" | sed 's/;/; /g')"
+
+  # The page count: the host's last count of its IOSurface device caches (logged only once one
+  # is made), and the kext's count lines, read in the guest after its Metal work.
+  caches=$(grep -o 'IOSurface device caches: .*' "$out/qemu.log" | tail -1)
+  cc=($(echo "$caches" | perl -ne 'my ($m) = /device caches: (\d+) made;/;
+    print "$m $1 $2 $3 $4\n" if defined $m && /; (\d+) deferred \((\d+) carrying pages\), (\d+) refused, (\d+) refused as they might lie in place/'))
+  made=${cc[0]:-0} deferred=${cc[1]:-0}
+  n_counted=$(echo "$kc" | grep -c ': counted,')
+  n_not=$(echo "$kc" | grep -c ': not counted,')
+  notes=$(echo "$kc" | grep -o -E 'an IOSurface.s memory (is a [A-Za-z0-9_]+, not a buffer the kernel allocated|could not be mapped to count its pages)' | sort -u | tr '\n' ';' | sed 's/;$//; s/;/; /g')
+  pc=() pok=1
+  if [[ -z $boot1 ]]; then pc+=("the guest did not answer after its Metal work") pok=0
+  elif [[ -z $boot0 ]]; then pc+=("kern.boottime unread at the login, so a boot again is not told")
+  elif [[ $boot1 != "$boot0" ]]; then pc+=("the guest booted again during the run: kern.boottime was $boot0, then $boot1") pok=0
+  else pc+=("kern.boottime kept"); fi
+  if [[ -n $panics ]]; then pc+=("panic reports written in this run: $(echo "$panics" | tr '\n' ';' | sed 's/;$//; s/;/, /g')") pok=0
+  else pc+=("no panic report in this run"); fi
+  if [[ -n $caches && -n ${cc[0]:-} ]]; then
+    pc+=("host: ${cc[0]} device caches made, ${cc[1]} deferred (${cc[2]} carrying pages), ${cc[3]} refused (${cc[4]} as they might lie in place)")
+  elif [[ -n $caches ]]; then pc+=("host: a device caches line in an unknown form: ${caches:0:160}")
+  else pc+=("host: no device cache made"); fi
+  pc+=("kext: $n_counted counts counted, $n_not not counted${notes:+; $notes}")
+  verdict page-count "$( ((pok)) && echo PASS || echo FAIL)" "$(IFS='|'; echo "${pc[*]}" | sed 's/|/; /g')"
+  ((made > 0 && deferred == 0)) && findings+=("page-count: zero deferred while the host made $made device caches")
+  ((n_counted + n_not == 0)) && findings+=("page-count: the kext logged no count of an IOSurface's pages this boot: the count's path did not run")
+  ((n_counted == 0 && n_not > 0)) && findings+=("page-count: every count the kext logged was refused ($n_not not counted)")
+  [[ -n $notes ]] && findings+=("page-count: the kext refused counts: $notes")
 fi
 if ((fatal_q + fatal_s == 0)); then
   verdict no-fatal PASS "no 'reims-vgpu: fatal' line in QEMU's log or the serial log"
@@ -446,6 +495,7 @@ fi
     printf 'check-boot: %-18s %s  %s\n' "$n" "$(state "$n")" "$(detail "$n")"
     [[ $(state "$n") == PASS ]] || failed+=("$n")
   done
+  for ((i = 0; i < ${#findings[@]}; i++)); do echo "check-boot: finding: ${findings[i]}"; done
   if ((${#failed[@]} == 0)); then
     echo "check-boot: PASS, ${#names[@]} of ${#names[@]} checks"
   else
