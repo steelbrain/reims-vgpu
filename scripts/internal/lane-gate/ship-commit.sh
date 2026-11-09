@@ -15,7 +15,11 @@ S=$(cd "$1" && pwd) parent=$2 branch=$3 wt=$4 msg=$5
 gd=$(git rev-parse --path-format=absolute --git-common-dir)
 [[ -z $(cd "$S" && find . -type l -print -quit) ]] || { echo "ship-commit: symbolic links in $S" >&2; exit 1; }
 tmp=$(mktemp -d /tmp/lg-ship.XXXXXX)
-trap 'rm -rf "$tmp"' EXIT
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; rm -rf "$tmp"; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 (cd "$S" && find . -type f | sed 's#^\./##' | LC_ALL=C sort) > "$tmp/files"
 sed "s#^#$S/#" "$tmp/files" | git --git-dir="$gd" hash-object -w --stdin-paths > "$tmp/blobs"
 while IFS= read -r f; do if [[ -x $S/$f ]]; then echo 100755; else echo 100644; fi; done < "$tmp/files" > "$tmp/modes"
@@ -27,4 +31,5 @@ commit=$(git --git-dir="$gd" commit-tree "$tree" -p "$parent" -m "$msg")
 git branch -f -q "$branch" "$commit"
 mkdir -p "$(dirname "$wt")"
 git worktree add -q "$wt" "$branch"
+ended=1
 echo "$commit"

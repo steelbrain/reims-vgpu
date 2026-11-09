@@ -187,7 +187,11 @@ cleanup() {
   rm -f "$clone/disk.img" "$clone/aux.img.trimmed" "$qmp_sock"
   rmdir "$clone" 2> /dev/null
 }
-trap cleanup EXIT
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; cleanup; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 trap 'exit 2' INT TERM
 
 # --- the clones ---------------------------------------------------------------------------------
@@ -405,4 +409,5 @@ fi
     echo "check-boot: FAIL, ${#failed[@]} of ${#names[@]} checks failed: ${failed[*]}"
   fi
 } | tee "$out/verdict.txt"
+ended=1
 grep -q '^check-boot: PASS' "$out/verdict.txt"

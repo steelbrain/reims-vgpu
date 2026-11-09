@@ -10,14 +10,17 @@
 #    admission decision (rgfx_cdhash_allowed over kExecCDHashes, the arm64 hooks' allowed set)
 #    takes the arm64 slice's hash, which third-party processes present, and the arm64e slice's,
 #    which is kExecCDHash and comes first.
-# SCRATCH is removed first and at the end of a run that finishes; one that aborts leaves it for
-# the next to remove. No EXIT trap removes it: bash 3.2, macOS's, exits 0 from a set -u error
-# where one is set, which would make an aborted run read as a pass. Nothing is fetched.
+# SCRATCH is removed first and at the end. Nothing is fetched.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 S=$1
 rm -rf "$S"
 mkdir -p "$S"
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; rm -rf "$S"; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 fails=0
 
 # bundle DIR CODE [ARCH...]: a signed reims-graphics.bundle in DIR whose executable returns
@@ -122,6 +125,6 @@ GE=$(python3 -I -c 'import sys; print(",".join(str(b) for b in bytes.fromhex(sys
 expect "an arm64 guest's kExecCDHash is the arm64e slice's" \
 	"$(sed -n 's/^static const uint8_t kExecCDHash\[20\] = {\(.*\)};$/\1/p' "$S/build64/gen/RgfxGatePayload.h")" "$GE"
 
-rm -rf "$S"
+ended=1
 [ $fails = 0 ] || exit 1
 echo "payload_test: all checks passed"

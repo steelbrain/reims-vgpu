@@ -36,7 +36,11 @@ for k in "$@"; do
 done
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/opencore-add-kexts.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; rm -rf "$tmp"; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 qemu-img convert -O raw "$src" "$tmp/disk.raw"
 
 # The ESP: the GPT's first partition, in 512-byte sectors as reims-util
@@ -143,4 +147,5 @@ case $out in
 esac
 qemu-img convert -O "$format" "$tmp/disk.raw" "$tmp/out"
 mv "$tmp/out" "$out"
+ended=1
 echo "opencore-add-kexts: wrote $out ($format)"

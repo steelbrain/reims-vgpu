@@ -52,7 +52,11 @@ cleanup() {
   [[ -n "$CLONE" ]] && rm -rf "$CLONE"
   [[ "${KEEP:-0}" == 1 ]] || rm -rf "$OUT"
 }
-trap cleanup EXIT
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; cleanup; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 
 # Results: one line per step.
 record() { printf '%-6s %-5s %s\n' "$1" "$2" "${3:-}" >>"$RESULTS"; }
@@ -255,6 +259,7 @@ step M5 "Modes the host sets with QEMU's display-modes replace the offered ones:
 wait_for "Close the window"
 ended chosen
 
+ended=1
 echo
 echo "=== results ($RESULTS) ==="
 cat "$RESULTS"

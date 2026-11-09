@@ -235,7 +235,11 @@ finish() {
   kv hold_s "$(( $(date +%s) - T0 ))"
   log "BOOT_DONE"
 }
-trap finish EXIT
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; finish; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 
 # A probe boot (PROBES) runs msi-probes.sh in place of guest-run.sh, with no corpus.
 needs=("$PAYLOAD/guest-run.sh" "$CORPUS/MANIFEST")
@@ -717,6 +721,7 @@ if [[ -n ${PROBES:-} ]]; then
   kv load_end "$(cut -d' ' -f1 /proc/loadavg)"
   log "probes done"
   [[ ${CAPTURE:-0} == 1 ]] && stalls
+  ended=1
   exit 0
 fi
 log "guest run: ${PHASES:-all phases}, $(left) s left"
@@ -811,4 +816,5 @@ if [[ -n ${POST_PROBES:-} && -d ${POST_PROBES:-} ]]; then
   kv post_probes_rc "${PIPESTATUS[0]}"
   log "post probes done"
 fi
+ended=1
 exit 0

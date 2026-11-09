@@ -19,7 +19,11 @@ bash "$OCADD" "$BASE" "$OUT" "$KEXTS/Graft.kext" "$KEXTS/ReimsGraphics.kext" "$G
 
 # What the image carries, read back from its ESP (the GPT's first partition).
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; rm -rf "$tmp"; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 qemu-img convert -O raw "$OUT" "$tmp/disk.raw"
 off=$(python3 -I - "$tmp/disk.raw" << 'EOF'
 import struct, sys
@@ -51,4 +55,5 @@ for k in "$KEXTS"/*.kext "$GATEKEXT"; do
   [[ $want == "$got" ]] || { echo "msi-image: $OUT carries another $n ($got, not $want)" >&2; exit 1; }
   echo "IMAGE $n ${want:0:16}"
 done
+ended=1
 echo MSI_IMAGE_OK
