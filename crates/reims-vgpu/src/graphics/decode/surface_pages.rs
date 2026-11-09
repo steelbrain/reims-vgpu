@@ -68,6 +68,16 @@
 //! `RGFX_FEATURE_PAGES_16K` lays out: the device offers the in-place features to no other guest
 //! there (`reims_vgpu_graphics::device`).
 //!
+//! On a Mac each run of a view takes a kernel map entry of its own, at most one a 16 KiB page of
+//! the surface (2,025 for a 3840 x 2160 surface of 4 bytes a pixel), and Mach counts them against
+//! no budget the platform answers ([`HostVm::view_room`] is `None`). **Measured** 2026-11-09 on
+//! the M3 Max host, macOS 27.0.1: one process made 1,500,000 views of one 16 KiB page each, every
+//! one its own map entry (`mach_vm_region_recurse` walked one an entry), and none was refused, so
+//! no limit was reached. That is 740 views of such a surface at once, where the cache keeps
+//! [`CACHED_VIEWS`] that no block holds. `vmmap`'s summary merges a view's entries into one
+//! region: the arm64 guests' boots in job m3-max-12451 (14.6.1 to 27.0.1, 26.6.2 making 403
+//! views) showed 4,500 to 15,000 untagged regions in QEMU.
+//!
 //! **Pages blocks** (`RGFX_FEATURE_PAGES_BUFFERS`). A `SURFACE_PAGES` marked
 //! `RGFX_SURFACE_PAGES_PRIVATE` names a block of one process's own, which holds nothing but the
 //! runs of pages of that process's the kext wired for it (its `PagesBlock` call): an app's memory
