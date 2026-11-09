@@ -232,7 +232,9 @@ void frameInfo()
 // their tries; midway the system sleeps for a second, which grows the continuous clock's lead.
 // QuartzCore takes each time back by the exact lead (mach_get_times): what it traces never goes
 // back, is never after the shown refresh nor more than 2 ticks before it, and is the shown refresh
-// exactly once a reading gave the lead exactly.
+// exactly once a reading gave the lead exactly. The run also gives each swap the time its own
+// last try's reading gave, as the display did before the clock kept its lead: that time goes back
+// in the run, as it did on Ambrosia's boots.
 void longRun()
 {
 	uint64_t x = 0x2545f4914f6cdd1dull;
@@ -246,8 +248,10 @@ void longRun()
 	const uint64_t periodNs = 16666667;
 	RgfxVblankClock vblank;
 	RgfxFrameInfoClock clock;
-	uint64_t lead = 0, traced = 0, lastShown = 0, swaps = 0, shared = 0, short_ = 0;
-	uint64_t mach = 0; // the absolute clock's ticks, as the reads advance it
+	uint64_t lead = 0, traced = 0, lastShown = 0, swaps = 0, shared = 0;
+	uint64_t mach = 0;                    // the absolute clock's ticks, as the reads advance it
+	uint64_t lastAfter = 0, lastC = 0;    // the last try's later absolute read and continuous read
+	uint64_t oldTraced = 0, oldBack = 0;  // the time from each swap's own last try
 	for (uint64_t n = 1; n <= 100000; n++) {
 		if (n == 50000)
 			lead += 24000000; // a second asleep: the absolute clock stops, the continuous one not
@@ -264,11 +268,13 @@ void longRun()
 			auto absolute = [&] {
 				const uint64_t t = mach;
 				mach += next(3);
+				lastAfter = t;
 				return t;
 			};
 			auto continuous = [&] {
 				const uint64_t t = mach + lead;
 				mach += next(3);
+				lastC = t;
 				return t;
 			};
 			rgfxReadClocks(absolute, continuous, clock);
@@ -282,16 +288,17 @@ void longRun()
 			if (clock.lead() == static_cast<int64_t>(lead))
 				check(seen == shown, "the refresh's exactly once the lead was read exactly",
 				      "longRun");
-			else
-				short_++;
+			const uint64_t oldSeen = shown + (lastC - lastAfter) - lead;
+			oldBack += swaps && oldSeen < oldTraced ? 1 : 0;
+			oldTraced = oldSeen;
 			shared += swaps && shown == lastShown ? 1 : 0;
 			traced = seen;
 			lastShown = shown;
 			swaps++;
 		}
 	}
-	check(shared > 1000 && short_ > 0, "the run has swaps sharing a refresh and short leads",
-	      "longRun");
+	check(shared > 1000, "the run has swaps sharing a refresh", "longRun");
+	check(oldBack > 0, "each swap's own last reading gives times that go back", "longRun");
 }
 
 // What IOMobileFramebuffer.framework makes of an entry of the client's shared data queue
