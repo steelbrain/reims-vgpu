@@ -7,33 +7,33 @@
     "arm64e": {
       "Contents/Info.plist": {
         "mode": 420,
-        "sha256": "088262fda3ab68f794dd3008a8786cb6747a589470081aff50a4b8f3c6883e80",
+        "sha256": "365510a070f7f7852609911b3b88b3afe6d2152ede9d64d2a2d90e2a0ac5b7cf",
         "size": 1513
       },
       "Contents/MacOS/Graft": {
         "mode": 493,
-        "sha256": "39cb4e01d83c5e1c70cce65d546d66a6b5c0dca19a9f3c016834538c5a6393ec",
+        "sha256": "5090616fbade1601166b04ad24e719d5fa4379ae773ea5c35f2bbdf4f88794eb",
         "size": 140464
       }
     },
     "x86_64": {
       "Contents/Info.plist": {
         "mode": 420,
-        "sha256": "119ce6745a8c8f7fc320e8edeec3616596cf847e8775e3081254670abe7e4568",
+        "sha256": "83d27e13f34fff38696c8bee5d8bb7f5746a074abd26f045805e64a00ef28c72",
         "size": 1433
       },
       "Contents/MacOS/Graft": {
         "mode": 493,
-        "sha256": "427a30e4286b43d47f3582dc7297d685325a1e4ffe560c3c293af2eca1265032",
+        "sha256": "0a964de98b78e98b2f9add4b8424ba5914f286a0518d6a1dd418bcd731a49eb6",
         "size": 83456
       }
     }
   },
   "format": 3,
   "sources": {
-    "Makefile": "bb483c45351426d62bacb23c0e1ef9551a9164e4dbd3def770ebf27194d984ff",
+    "Makefile": "41ee289e5e3a3933c8233987f032d66bc42e8d35d132ced56f70ce02dfa3054b",
     "sdk/include/graft/Graft.h": "84de20363d72e6c6df29eade02c8f89eedf28620755ea659e74c87c9458f3d50",
-    "sdk/include/graft/IOMobileFramebufferLegacy.h": "5708ac979483672dcf2486a4f971fd5ec74c5268628d60128936fe96b7ae340f",
+    "sdk/include/graft/IOMobileFramebufferLegacy.h": "96d726c51ef932b0503115241d35752b87862ec5bd64ab293bdcbf5a83cefb7a",
     "src/Binding.h": "f9981e88b752e7245f48804b64cb8791629e5dc55b9dd6e018218fc9c513189a",
     "src/BindingPlacement.h": "3c3fb121ef04789db69c9fdede8316da3805240d6b78426f158e4d4690ae4a76",
     "src/Consumer.h": "79961d6a9087d7b976420501b4cbf2ce2de03c480059078820dcc81015e82efb",
@@ -81,5 +81,5 @@
     "sdk_version": "27.2",
     "xcode": "Xcode 27.2\nBuild version 27B52"
   },
-  "version": "1.3.2"
+  "version": "1.3.3"
 }

@@ -45,12 +45,17 @@ struct task;
 struct IOMFBNotifyRequest;
 struct IOMFBSwapIORequest;
 struct SwapInfoBlob;
+struct IOMFBGammaTable;
+struct IOMFBColorFixedMatrix;
 namespace IOMFB {
 namespace AP {
 struct DisplayedData;
 }
 } // namespace IOMFB
 enum IOMFB_NotificationType : uint32_t;
+enum DisplayColorRemapMode : uint32_t;
+enum IOMFBColorMatrixFunction : uint32_t;
+enum IOMFBParameterName : uint32_t;
 
 // A 64-bit method word: see the file comment.
 typedef uint64_t graft_iomfb_word;
@@ -123,9 +128,10 @@ public:
     virtual graft_iomfb_word notify_crc_ready_gated(uint32_t field_0) = 0;
     virtual bool are_timings_enabled() const = 0;
 
-    // What the class implements. Its own implementations do no display work, as
-    // its hardware subclasses override them (start_hardware and verify_swap
-    // return 0), so a display overrides each and never calls the class's.
+    // What the class implements. Its own implementations serve its hardware
+    // subclasses, so a display overrides those its callers reach and never calls
+    // the class's. These do no display work (start_hardware and verify_swap
+    // return 0):
     virtual graft_iomfb_word start_hardware();
     virtual graft_iomfb_word stop_hardware_gated();
     virtual graft_iomfb_word swap_begin_gated();
@@ -134,6 +140,25 @@ public:
     virtual graft_iomfb_word surface_layer_map(IOMFB::AP::DisplayedData *data, uint32_t layer,
                                                IOSurface *surface);
     virtual graft_iomfb_word surface_layer_unmap(IOMFB::AP::DisplayedData *data, uint32_t layer);
+    // And these serve the display's settings. get_dot_pitch reads state the
+    // class's start sets up only for its hardware subclasses' provider, so it
+    // faults on a paravirtual one. AppleParavirtDisplay, the class's paravirtual
+    // subclass, overrides most of them.
+    virtual graft_iomfb_word get_dot_pitch(uint32_t *pitch);
+    virtual graft_iomfb_word set_display_device(uint32_t device);
+    virtual graft_iomfb_word set_digital_out_mode(uint32_t field_0, uint32_t field_1);
+    virtual graft_iomfb_word get_digital_out_state(uint32_t *state);
+    virtual graft_iomfb_word get_protection_options(uint64_t *options);
+    virtual graft_iomfb_word get_gamma_table(IOMFBGammaTable *table);
+    virtual graft_iomfb_word set_gamma_table(IOMFBGammaTable *table);
+    virtual graft_iomfb_word set_color_remap_mode(DisplayColorRemapMode mode);
+    virtual graft_iomfb_word get_color_remap_mode(DisplayColorRemapMode *mode) const;
+    virtual graft_iomfb_word swap_set_color_matrix(IOMFBColorFixedMatrix *matrix,
+                                                   IOMFBColorMatrixFunction function,
+                                                   uint32_t field_2);
+    virtual graft_iomfb_word set_parameter(IOMFBParameterName name, const uint64_t *values,
+                                           uint32_t count);
+    virtual graft_iomfb_word do_power_state_change_gated();
 
     // What a consumer calls: a refresh of the display. Graft resolves its symbol
     // in the live collection, as it resolves the consumer's other kernel imports.

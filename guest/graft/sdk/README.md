@@ -319,10 +319,11 @@ compiled vtable at least as long as the live class's, and a
 `GRAFT_IOMFB_LEGACY_RESERVE`-byte field holds the live class's fields, so the
 consumer's own fields follow them.
 
-The class's own implementations of its concrete methods do no display work,
-since its hardware subclasses override them: `start_hardware` and
-`verify_swap` return 0. A display overrides each and does not call the
-class's. It calls none of the virtual methods the stand-in declares except
+The class's own implementations of its concrete methods serve its hardware
+subclasses. Some do no display work (`start_hardware` and `verify_swap`
+return 0), and `get_dot_pitch` reads state the class's start sets up only for
+those subclasses' provider, so it faults on a paravirtual one. A display
+overrides those its callers reach and does not call the class's. It calls none of the virtual methods the stand-in declares except
 `start`, `stop` and `free`: not virtually, since Graft fills its vtable in the
 live order, and not as a qualified call such as
 `IOMobileFramebufferLegacy::start_hardware()`, which under `-fapple-kext`
