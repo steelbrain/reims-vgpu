@@ -31,6 +31,9 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#if defined(__arm64e__)
+#include "IOMobileFramebufferLegacy.hpp"
+#endif
 
 #include "RgfxBootConsole.hpp"
 #include "RgfxDeferredAnswers.hpp"
@@ -43,7 +46,15 @@
 
 class RgfxAccelerator;
 
+// The display front end each architecture's WindowServer drives: an IOFramebuffer on x86-64, and
+// on arm64, where WindowServer opens no IOFramebuffer, an IOMobileFramebuffer, the subclass of
+// IOMobileFramebufferLegacy that Apple's own paravirtual display is (docs/graphics-kext/design.md,
+// Decided 13). The device, its rings and its pipe clients are one for both.
+#if defined(__x86_64__)
 class ReimsGraphics : public IOFramebuffer {
+#else
+class ReimsGraphics : public IOMobileFramebufferLegacy {
+#endif
 	OSDeclareDefaultStructors(ReimsGraphics);
 
 public:
@@ -52,6 +63,7 @@ public:
 	void stop(IOService *provider) override;
 	void free() override;
 
+#if defined(__x86_64__)
 	// IOFramebuffer: the device and its modes
 	IOReturn enableController() override;
 	IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;
@@ -139,6 +151,33 @@ public:
 	OSObject *copyProperty(const OSSymbol *aKey) const override;
 	OSObject *copyProperty(const OSString *aKey) const override;
 	OSObject *copyProperty(const char *aKey) const override;
+#endif
+#else
+	// IOMobileFramebufferLegacy (ReimsGraphicsMobile.cpp): the class's own pure methods.
+	RgfxIOMFBWord set_notify_tag_mask_gated(IOMFB_NotificationType type, IOMFBNotifyRequest *request,
+	                                        uint32_t mask) override;
+	RgfxIOMFBWord supported_frame_info(uint32_t index, uint32_t *count, char (*names)[64],
+	                                   uint32_t *field_3) override;
+	RgfxIOMFBWord factory_portal(void *field_0, task *owner) override;
+	RgfxIOMFBWord executeFactoryConfigurations_gated() override;
+	RgfxIOMFBWord set_frame_info_notification_state_gated(IOMFBNotifyRequest *request,
+	                                                      bool on) override;
+	RgfxIOMFBWord do_swap_info_notify_gated(IOMFBNotifyRequest *request,
+	                                        const IOMobileFramebufferLegacy::SwapInfoBlob *blob) override;
+	RgfxIOMFBWord notify_swap_done_gated(uint32_t field_0, ::SwapInfoBlob *blob, uint32_t *field_2,
+	                                     uint32_t field_3) override;
+	RgfxIOMFBWord notify_crc_ready_gated(uint32_t field_0) override;
+	bool are_timings_enabled() const override;
+	// And what the class implements, which each of these logs and forwards to it: the hardware's
+	// start and stop, and a swap's steps; a layer's surface map also presents it.
+	RgfxIOMFBWord start_hardware() override;
+	RgfxIOMFBWord stop_hardware_gated() override;
+	RgfxIOMFBWord swap_begin_gated() override;
+	RgfxIOMFBWord verify_swap(IOMFBSwapIORequest *request) override;
+	RgfxIOMFBWord swap_layer_map(IOMFBSwapIORequest *request, uint32_t layer) override;
+	RgfxIOMFBWord surface_layer_map(IOMFB::AP::DisplayedData *data, uint32_t layer,
+	                                IOSurface *surface) override;
+	RgfxIOMFBWord surface_layer_unmap(IOMFB::AP::DisplayedData *data, uint32_t layer) override;
 #endif
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
@@ -485,6 +524,19 @@ private:
 	UInt64 largestScanout;
 	UInt64 bootScreenSeqno;
 	bool bootScreenCleared;
+
+#if defined(__arm64e__)
+	// The arm64e front end's (ReimsGraphicsMobile.cpp): set up in start before the class's own
+	// start, which it is the pipe client of, and let go in stop. The present of the latest swap's
+	// surface waits for its answer; the transactions it posts are numbered from 1.
+	bool startMobile();
+	void stopMobile();
+	static void mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
+	static void mobilePresented(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
+	bool mobilePipe;
+	UInt64 mobilePresentSeqno;
+	UInt32 mobileTransaction;
+#endif
 
 	bool ready;
 	// start's and stop's alone: whether start reset the device to take it. Only a device taken is

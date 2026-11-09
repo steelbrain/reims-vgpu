@@ -21,8 +21,13 @@
 
 #include "RgfxTrace.hpp"
 
+#if defined(__x86_64__)
 #define super IOFramebuffer
 OSDefineMetaClassAndStructors(ReimsGraphics, IOFramebuffer);
+#else
+#define super IOMobileFramebufferLegacy
+OSDefineMetaClassAndStructors(ReimsGraphics, IOMobileFramebufferLegacy);
+#endif
 
 namespace {
 
@@ -39,10 +44,12 @@ constexpr UInt32 kMsgAlign = 8;
 static_assert(kRgfxIOReturnError == static_cast<uint32_t>(kIOReturnError) &&
                   kRgfxIOReturnUnsupportedMode == static_cast<uint32_t>(kIOReturnUnsupportedMode),
               "RgfxDisplayModes.hpp's statuses are IOReturn's");
+#if defined(__x86_64__)
 IOReturn noSuchMode(RgfxModeCall call)
 {
 	return static_cast<IOReturn>(rgfxNoSuchModeStatus(call));
 }
+#endif
 
 // The ring header's fields, by their offset in it (each in a 64-byte line).
 constexpr UInt32 kRingProducer = __builtin_offsetof(RgfxRingHeader, producer);
@@ -146,7 +153,9 @@ void traceAttribute(const char *kind, IOIndex connect, IOSelect attribute, uintp
 }
 #else
 #define FBTRACE(...) do {} while (0)
+#if defined(__x86_64__)
 inline void traceAttribute(const char *, IOIndex, IOSelect, uintptr_t, IOReturn) {}
+#endif
 #endif
 
 } // namespace
@@ -1023,6 +1032,7 @@ RgfxAccelerator *ReimsGraphics::copyAccelerator()
 	return accelerator;
 }
 
+#if defined(__x86_64__)
 IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt32 type,
                                       IOUserClient **clientH)
 {
@@ -1079,6 +1089,7 @@ IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt3
 		      caller.name, caller.pid, r);
 	return r;
 }
+#endif
 
 // IOAcceleratorFamily2's IOAccelMemoryMap::getAssignedGPUVirtualAddressLength() const,
 // referenced weakly and never called (assignedLengthExported). A binder that cannot resolve it
@@ -1266,6 +1277,7 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 	setProperty("IOAccelIndex", 0ull, 32);
 
+#if defined(__x86_64__)
 	// The framebuffer is its own controller's one dependent (index 0), named by its own registry
 	// ID. IOFramebuffer finishes a framebuffer's open (postOpen, in IOGraphics' open source) only
 	// for one with a dependent ID: there it publishes kIOFBNeedsRefreshKey, initialises the
@@ -1334,6 +1346,10 @@ bool ReimsGraphics::start(IOService *provider)
 	// accelerated, transactional display model (kIOWindowServerActiveAttribute) off for a name in
 	// which it finds none, as it does for "ReimsGraphics".
 	setProperty("IOClassNameOverride", "ReimsGraphicsAMD");
+#else
+	if (!startMobile())
+		goto fail;
+#endif
 
 	if (super::start(provider))
 		return true;
@@ -1345,6 +1361,9 @@ fail:
 
 void ReimsGraphics::stop(IOService *provider)
 {
+#if defined(__arm64e__)
+	stopMobile();
+#endif
 	quiesce();
 	super::stop(provider);
 	teardown();
@@ -1455,6 +1474,7 @@ void ReimsGraphics::free()
 	super::free();
 }
 
+#if defined(__x86_64__)
 // MARK: - IOFramebuffer: the device and its modes
 
 IOReturn ReimsGraphics::enableController()
@@ -2239,6 +2259,7 @@ IOReturn ReimsGraphics::setInterruptState(void *interruptRef, UInt32 state)
 	kickWorkLoop();
 	return kIOReturnSuccess;
 }
+#endif
 
 // MARK: - The display pipe
 
@@ -2424,7 +2445,7 @@ void ReimsGraphics::setPipeVblankEnabled(OSObject *client, bool enabled)
 	kickWorkLoop();
 }
 
-#if RGFX_FB_TRACE
+#if RGFX_FB_TRACE && defined(__x86_64__)
 // MARK: - The trace build's forwarding overrides
 
 IOReturn ReimsGraphics::open()

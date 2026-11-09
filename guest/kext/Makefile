@@ -50,8 +50,9 @@ endif
 ARCH = -arch $(ARCH_NAME) -isysroot $(SDK) -mmacosx-version-min=$(MIN_OS)
 # Graft's consumer rules, and the declaration and Info.plist they stage this kext from: one of
 # each per architecture. An arm64 kernel collection has neither AppleGraphicsDeviceControl nor
-# IOAcceleratorFamily2, so the arm64e kext (src/graft-arm64e.json, src/Info-arm64e.plist) takes
-# both of its parents from IOGraphicsFamily and has no device control.
+# IOAcceleratorFamily2, and its WindowServer drives an IOMobileFramebuffer, so the arm64e kext
+# (src/graft-arm64e.json, src/Info-arm64e.plist) takes its display's parent from
+# IOMobileGraphicsFamily, its accelerator's from IOGraphicsFamily, and has no device control.
 GRAFT_SDK ?= ../graft/sdk
 ifeq ($(ARCH_NAME),arm64e)
 GRAFT_DECL = src/graft-arm64e.json
@@ -75,7 +76,7 @@ HEADERS = $(wildcard src/*.hpp)
 # control (RgfxDeviceControl), all one kext: the objects both architectures build, with
 # each architecture's own (OBJECTS_x86_64, OBJECTS_arm64e) third in the link.
 OBJECTS_x86_64 = $(BUILD)/obj/RgfxDeviceControl.o
-OBJECTS_arm64e =
+OBJECTS_arm64e = $(BUILD)/obj/ReimsGraphicsMobile.o
 OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAccelerator.o \
 	$(OBJECTS_$(ARCH_NAME)) \
