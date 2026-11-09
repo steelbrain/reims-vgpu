@@ -2,8 +2,9 @@
 
 This directory holds Graft's latest release, built and ready to install:
 
-- `Graft.kext`: the kext bundle, x86-64, for macOS 11 and later.
-- `build.json`: what went into it. That covers the version, the SHA-256 of
+- `Graft.kext`: the x86-64 kext, for macOS 11 and later.
+- `Graft-arm64e.kext`: the arm64e kext.
+- `build.json`: what went into them. That covers the version, the SHA-256 of
   every source file the build reads (`Makefile`, `src/`, `sdk/include/`), the
   Xcode toolchain, and each bundle file's SHA-256, size and mode.
 
@@ -17,8 +18,8 @@ make check-built
 ```
 
 The check takes the sources at the release's tag (`v` and the version, such as
-`v1.0.0`) into a scratch directory, builds them with Xcode, and requires the
-result to match `Graft.kext` byte for byte. It needs the toolchain
+`v1.0.0`) into a scratch directory, builds them with Xcode, and requires each
+bundle it builds to match the one here byte for byte. It needs the toolchain
 `build.json` names, because another Xcode produces different bytes. It
 fetches nothing.
 

@@ -293,6 +293,21 @@ Graft measures the stand-in's live class but does not hold it to the probed
 size and slots. It refuses the bind when the live class is larger than the
 stand-in, or when its vtable is longer than the class's compiled vtable.
 
+Graft signs each slot with the discriminator the running system's callers
+use, which the boot firmware reads from the boot collection and hands over
+per vtable. It needs the parent's vtable and that of each of the parent's
+ancestors its library defines, and refuses the bind when one is missing.
+For `IOMobileFramebufferLegacy`, Ambrosia's configuration lists these under
+`Kernel > ExportVtableDiscriminators`:
+
+```xml
+<array>
+  <string>__ZTV25IOMobileFramebufferLegacy</string>
+  <string>__ZTV26IOMobileFramebufferService</string>
+  <string>__ZTV19IOMobileFramebuffer</string>
+</array>
+```
+
 ### IOMobileFramebufferLegacy.h
 
 The stand-in declares the class's pure methods, which a consumer implements;
