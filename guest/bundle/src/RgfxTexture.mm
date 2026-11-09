@@ -925,8 +925,11 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 		[rules appendString:@"MTLTextureUsage has unknown bits 0x80.\n"];
 	if (rules.length > 0) {
 		// The descriptor, in the unified log, for the process's death the guest's log keeps.
+		// compressionType reached MTLTextureDescriptor in macOS 12.5. Asked by selector, as
+		// RgfxTexture's initializer asks: @available would link compiler-rt's version check,
+		// which opens a file (bundle_files_check.sh).
 		long long compression = -1;
-		if (@available(macOS 12.5, *))
+		if ([descriptor respondsToSelector:@selector(compressionType)])
 			compression = static_cast<long long>(descriptor.compressionType);
 		NSLog(@"RGFX: texture descriptor of format %llu, type %llu, %llux%llux%llu, %llu slices, "
 		      @"%llu levels, %llu samples, usage 0x%llx, storage %llu, CPU cache %llu, hazard "
