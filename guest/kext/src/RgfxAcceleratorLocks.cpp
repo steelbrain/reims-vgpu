@@ -40,8 +40,9 @@
  * control function until then.
  *
  * A deferred block's surface (RgfxSurfaceBlocks.hpp) has its cache made at its ask, before the
- * block is posted, and the ask reads the surface's seed and its resident pages only once the
- * control function is set, under a read-only lockSurface, which waits out any lock calling the
+ * block is posted, and the ask reads the surface's seed and its pages' counts (resident, and
+ * compressed or paged out: rgfxSurfaceLocksPageCounts) only once the control function is set,
+ * under a read-only lockSurface, which waits out any lock calling the
  * control functions (RgfxIOSurfaceKPI.hpp): a read-write lock begun before it has moved the seed,
  * and one after it calls the control function, which waits for the host's answer to the
  * deferral, then names the block's pages before it goes on (SURFACE_PAGES with ATTACH), one lock
@@ -58,10 +59,13 @@
 #include "RgfxSurfaceCaches.hpp"
 #include "RgfxSurfaceLocks.hpp"
 
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
 #include <libkern/OSAtomic.h>
+#include <libkern/OSKextLib.h>
 #include <libkern/libkern.h>
+#include <ptrauth.h>
 #include <sys/proc.h>
 
 namespace {
@@ -568,14 +572,70 @@ bool rgfxSurfaceLocksStartsAt(OSObject *surface, const RgfxPageRun *runs, UInt32
 	return rgfxSurfaceRunsSame(walk);
 }
 
+// IOMemoryDescriptor::getPageCounts(resident, dirty, swapped), which counts the pages compressed
+// or paged out too (`swapped`), referenced weakly: of the release kernels checked, the symbol
+// sets of 26.6.1 (25G76) and 26.7.2 (25G332) export it in com.apple.kpi.iokit, and those of
+// 11.7.10, 11.7.11, 12.7.4, 12.7.6, 13.7.8, 14.8.9, 15.7.9 and 15.8.2 do not, nor any routine of
+// any KPI set that counts or queries a page's being compressed or paged out (each kernel's
+// __LINKINFO,__symbolsets, read 2026-11-08). The two-count form counts the resident pages alone,
+// so a page a writer that takes no lock dirtied, then compressed or paged out, would read as
+// fresh, and the host's zeros would take its place. A binder that cannot resolve the symbol
+// binds it to gOSKextUnresolved, as the kernel's linker does, or to 0: either reads as absent,
+// and then no surface is counted, so none is deferred, and every block's pages are named at its
+// ask. A non-virtual member: `memory` is its `this`.
+extern "C" IOReturn rgfxMemoryPageCounts(IOMemoryDescriptor *memory, IOByteCount *resident,
+                                         IOByteCount *dirty, IOByteCount *swapped)
+    __asm("__ZN18IOMemoryDescriptor13getPageCountsEPyS0_S0_") __attribute__((weak_import));
+
+// Whether the weak function at `symbol` was bound to a definition. A pointer to it is signed
+// where calls are authenticated (arm64e), so it is stripped before it is compared with the
+// pointer gOSKextUnresolved holds.
+static bool weakFunctionResolved(const void *symbol)
+{
+#if __has_feature(ptrauth_calls)
+	symbol = ptrauth_strip(symbol, ptrauth_key_function_pointer);
+#endif
+	return symbol != nullptr && symbol != gOSKextUnresolved;
+}
+
+RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
+{
+	RgfxSurfacePageCounts counts = {false, ~0ull, ~0ull};
+	static bool countsNoted = false, memoryNoted = false;
+	if (!weakFunctionResolved(reinterpret_cast<const void *>(&rgfxMemoryPageCounts))) {
+		if (!__atomic_exchange_n(&countsNoted, true, __ATOMIC_RELAXED))
+			IOLog("RgfxAccelerator: this kernel counts no compressed or paged-out pages of a "
+			      "memory descriptor: no IOSurface's block is deferred\n");
+		return counts;
+	}
+	// An IOBufferMemoryDescriptor allocates its memory itself, pageable or wired, from the
+	// kernel's anonymous allocators, never over a file (xnu's IOBufferMemoryDescriptor.cpp; not
+	// re-read for this change): a page of it neither resident nor compressed nor paged out was
+	// never written. A descriptor over other memory, a client's own, may be a file's, whose
+	// pages not resident hold the file's bytes, which no count shows: it is not counted.
+	IOMemoryDescriptor *memory = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
+	if (!memory)
+		return counts;
+	if (!OSDynamicCast(IOBufferMemoryDescriptor, memory)) {
+		if (!__atomic_exchange_n(&memoryNoted, true, __ATOMIC_RELAXED))
+			IOLog("RgfxAccelerator: an IOSurface's memory is a %s, not a buffer the kernel "
+			      "allocated: its block, and any such, is not deferred\n",
+			      memory->getMetaClass()->getClassName());
+		return counts;
+	}
+	IOByteCount resident = 0, dirty = 0, swapped = 0;
+	if (rgfxMemoryPageCounts(memory, &resident, &dirty, &swapped) != kIOReturnSuccess)
+		return counts;
+	counts = {true, resident, swapped};
+	return counts;
+}
+
 bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length)
 {
-	if (rgfxIOSurfaceLockSeed(surface) != 0)
-		return false;
 	IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
-	IOByteCount resident = 0, dirty = 0;
 	return md && length <= md->getLength() &&
-	       md->getPageCounts(&resident, &dirty) == kIOReturnSuccess && resident == 0;
+	       rgfxSurfaceHoldsOnlyResident(true, rgfxIOSurfaceLockSeed(surface),
+	                                    rgfxSurfaceLocksPageCounts(surface), 0);
 }
 
 RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
@@ -640,14 +700,13 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 	// the read-only lock below returned, or calls the control function.
 	rgfxDeviceCacheSetControl(cache, accel, &surfaceControl);
 	uint32_t seed = ~0u;
-	IOByteCount resident = ~0ull, dirty = 0;
+	RgfxSurfacePageCounts counts = {false, ~0ull, ~0ull};
 	const IOReturn locked = rgfxIOSurfaceLock(surface, kRgfxIOSurfaceLockReadOnly, &seed);
 	if (locked == kIOReturnSuccess) {
-		if (memory->getPageCounts(&resident, &dirty) != kIOReturnSuccess)
-			resident = ~0ull;
+		counts = rgfxSurfaceLocksPageCounts(surface);
 		rgfxIOSurfaceUnlock(surface, kRgfxIOSurfaceLockReadOnly, nullptr);
 	}
-	const bool fresh = locked == kIOReturnSuccess && seed == 0 && resident == 0;
+	const bool fresh = rgfxSurfaceHoldsOnlyResident(locked == kIOReturnSuccess, seed, counts, 0);
 	if (fresh) {
 		IOLockLock(state.lock);
 		rgfxCacheGated(state.caches, key);

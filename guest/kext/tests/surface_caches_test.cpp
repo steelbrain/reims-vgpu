@@ -290,6 +290,32 @@ void deferral()
 	check(r->deferral == kRgfxCacheNotDeferred, "an answer after it changes nothing");
 }
 
+// A surface is fresh only where its bytes can be in no page: its read under the read-only
+// lock, its seed 0, its pages counted, and none resident, compressed or paged out. A page a
+// writer that takes no lock dirtied, then compressed or paged out, is not resident but holds
+// its bytes: the surface is not fresh, so its block is never deferred over zeros.
+void heldBytes()
+{
+	const RgfxSurfacePageCounts untouched = {true, 0, 0};
+	check(rgfxSurfaceHoldsOnlyResident(true, 0, untouched, 0),
+	      "no page resident, compressed or paged out, seed 0, under the lock: fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {true, 0, 1}, 0),
+	      "a page compressed or paged out holds bytes: not fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {true, 1, 0}, 0),
+	      "a page resident: not fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {false, 0, 0}, 0),
+	      "pages the kernel could not count so (an older kernel, or memory not the kernel's "
+	      "buffer): not fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 1, untouched, 0),
+	      "a lock for writing taken (seed 1): not fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(false, 0, untouched, 0), "read without the lock: no");
+	check(rgfxSurfaceHoldsOnlyResident(true, 0, {true, 3, 0}, 3),
+	      "three pages expected resident, three resident, none elsewhere: only those");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {true, 3, 1}, 3),
+	      "and one compressed besides: not only those");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {true, 2, 0}, 3), "two of three: no");
+}
+
 // On a host that answers which surfaces need a cache, a deferral refused, or a surface read not
 // fresh, has the block ask with its pages; answered in place, its entry goes.
 void ungated()
@@ -989,6 +1015,7 @@ int main()
 	clients();
 	room();
 	deferral();
+	heldBytes();
 	ungated();
 	deferredRelease();
 	forgottenAttach();

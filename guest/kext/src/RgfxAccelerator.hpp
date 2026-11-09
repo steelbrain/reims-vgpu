@@ -207,8 +207,15 @@ bool rgfxSurfaceLocksMapsAt(OSObject *surface, task_t task, UInt64 address, UInt
 // `length` bytes.
 bool rgfxSurfaceLocksStartsAt(OSObject *surface, const RgfxPageRun *runs, UInt32 count,
                               UInt64 length);
-// Whether `surface` reads fresh, to look at: its seed 0, none of its pages resident and its
-// memory holding `length` bytes. Racy: the deferral's own read is rgfxSurfaceLocksDefer's.
+struct RgfxSurfacePageCounts;
+// What the kernel counts of `surface`'s pages, resident and compressed or paged out
+// (RgfxSurfaceCaches.hpp): counted only where its memory is a buffer the kernel allocated and
+// the kernel counts the pages compressed or paged out. Takes no lock, so a caller may hold the
+// surface's read-only lock across it.
+RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface);
+// Whether `surface` reads fresh, to look at: its seed 0, its pages counted, none of them
+// resident, compressed or paged out (rgfxSurfaceHoldsOnlyResident), and its memory holding
+// `length` bytes. Racy: the deferral's own read is rgfxSurfaceLocksDefer's.
 bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length);
 // What rgfxSurfaceLocksDefer found.
 enum RgfxDeferAnswer {

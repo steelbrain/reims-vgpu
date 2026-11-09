@@ -570,12 +570,23 @@ Stages:
         use). Where the kext took `RGFX_FEATURE_SURFACE_DEFERRED`, and no
         IOSurface mapper device (`IOSurfaceParavirtMapperService`) is matched,
         a cacheable ask in place of a surface that reads fresh (its seed 0,
-        none of its pages resident) defers its block: the kext makes the
-        device cache and sets its control function first, then reads the seed
-        and the resident pages under a read-only `lockSurface`, which waits
-        out any lock calling the control functions, so a read-write lock
-        either moved the seed before the read or calls the control function
-        after it (`RgfxIOSurfaceKPI.hpp`). Found fresh, its `SURFACE_PAGES`
+        none of its pages resident, compressed or paged out) defers its
+        block: the kext makes the device cache and sets its control function
+        first, then reads the seed and the pages' counts under a read-only
+        `lockSurface`, which waits out any lock calling the control
+        functions, so a read-write lock either moved the seed before the read
+        or calls the control function after it (`RgfxIOSurfaceKPI.hpp`). A
+        page a writer that takes no lock dirtied is resident, or, compressed
+        or paged out since, counted so, and holds bytes the cache's zeros
+        would lose. The kext counts only a surface whose memory is a buffer
+        the kernel allocated (`IOBufferMemoryDescriptor`, anonymous memory,
+        never a client's own, which may be a file's), and only on a kernel
+        whose `IOMemoryDescriptor::getPageCounts` counts the pages compressed
+        or paged out, referenced weakly: of the release kernels checked, those
+        of 26.6.1 and 26.7.2 export it, those of 11.7.10 to 15.8.2 do not, nor
+        any routine that tells a page compressed or paged out. A surface not
+        counted is never fresh, so there every block's pages are named at its
+        ask (`guest/kext/src/RgfxAcceleratorLocks.cpp`). Found fresh, its `SURFACE_PAGES`
         carries `DEFERRED` and no runs, the block keeping room for one run a
         page of the whole allocation, every plane's; the host makes the cache
         as zeros. Not fresh, or refused, the kext names the pages at once, as

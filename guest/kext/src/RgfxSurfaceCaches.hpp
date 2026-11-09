@@ -41,9 +41,11 @@
 //     discarded; made nonvolatile again (op 6, or op 7), it is neither.
 //   - A deferred block (RgfxSurfaceBlocks.hpp) has no pages until a lock needs them: the kext
 //     holds its surface's memory retained, not wired. Its ask reads the surface's seed and its
-//     resident pages once its device cache and control function are made (kRgfxCacheGating),
-//     and a lock goes on then as for any block: its seed moves, and the ask names the pages.
-//     Found fresh, a lock waits for the host's answer to the deferral (kRgfxCacheDeferring).
+//     pages' counts, resident and compressed or paged out, once its device cache and control
+//     function are made (kRgfxCacheGating), and a lock goes on then as for any block: its seed
+//     moves, and the ask names the pages. Found fresh (rgfxSurfaceHoldsOnlyResident, with no
+//     resident page), a lock waits for the host's answer to the deferral (kRgfxCacheDeferring).
+//     A surface whose pages the kernel cannot count so is never fresh.
 //     Deferred, a read-write lock, or a read-only one of a surface the GPU wrote, attaches the
 //     pages first (RGFX_SURFACE_PAGES_ATTACH), one lock at a time, the others waiting; then it
 //     goes on as for any block, a download among it. A naming not answered OK is made again,
@@ -513,6 +515,30 @@ inline uint64_t rgfxCacheAttached(RgfxCacheTable &t, uint64_t key, RgfxPagesNami
 	*surface = c->surface;
 	rgfxCacheRemove(t, c, map, wire);
 	return key;
+}
+
+// What the kernel counted of a surface's pages (rgfxSurfaceLocksPageCounts). `counted` only
+// where the counts cover every place its bytes can be: memory the kernel allocated anonymous,
+// so a page neither resident nor compressed nor paged out holds nothing, and a kernel that
+// counts the compressed and paged-out pages (`swapped`), not only the resident ones.
+struct RgfxSurfacePageCounts {
+	bool counted;
+	uint64_t resident;
+	uint64_t swapped;
+};
+
+// Whether a surface's bytes can only be in its `resident` resident pages, as the read that
+// found `seed` and `counts` saw it: under its read-only lock (`locked`), its seed 0 (no lock for
+// writing yet), its pages counted, none compressed or paged out, and `resident` of them in
+// memory. With `resident` 0 the surface is fresh, every page of it zeros: a page a writer that
+// takes no lock dirtied reads as one resident, or, once compressed or paged out, as one swapped,
+// either way not fresh. The read itself takes no lock, so a caller holding the surface's
+// read-only lock may read again.
+inline bool rgfxSurfaceHoldsOnlyResident(bool locked, uint32_t seed,
+                                         const RgfxSurfacePageCounts &counts, uint64_t resident)
+{
+	return locked && seed == 0 && counts.counted && counts.swapped == 0 &&
+	       counts.resident == resident;
 }
 
 // The ask of surface `key`'s deferred block read the surface fresh: it asks the host to defer
