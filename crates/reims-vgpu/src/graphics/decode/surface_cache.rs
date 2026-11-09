@@ -2875,7 +2875,9 @@ pub(crate) struct Caches<P: Platform> {
 /// used with it let go of, as a new block of the device's memory may take tens of milliseconds
 /// (**measured** 2026-11-09, a macOS 26.7.2 guest's Safari scroll on a Radeon 780M: each 64 MiB
 /// block of 7.125 MiB dma-buf caches, every 8th cache, took 8 to 28 ms), and every queue's begin
-/// takes that lock ([`Caches::before_answering`]).
+/// takes that lock ([`Caches::before_answering`]). Made under the lock, those makes held 11 of
+/// the scroll's begins for 14 to 25 ms each; made outside it, none of the same scroll's begins
+/// took 2 ms or more for its caches (**measured** 2026-11-09, the same guest and host).
 #[derive(Clone, Copy, Debug)]
 struct CacheMaker {
     /// Caches are made exportable, for the host's video to import ([`Caches::set_exportable`]).
