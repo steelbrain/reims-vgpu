@@ -138,7 +138,7 @@ TESTS = $(BUILD)/tests/spans_test $(BUILD)/tests/blocks_test $(BUILD)/tests/surf
 	$(BUILD)/tests/gamma_capability_test \
 	$(BUILD)/tests/shared_event_ports_test $(BUILD)/tests/gl_surfaces_test \
 	$(BUILD)/tests/surface_rows_test $(BUILD)/tests/accel_types_test $(BUILD)/tests/pci_class_test \
-	$(BUILD)/tests/defer_carry_test $(BUILD)/tests/arm64_region_test \
+	$(BUILD)/tests/defer_carry_test $(BUILD)/tests/arm64_region_test $(BUILD)/tests/features_arm64_test \
 	$(BUILD)/tests/legacy_overrides_test $(BUILD)/tests/legacy_swap_queue_test \
 	$(BUILD)/tests/mobile_modes_test $(BUILD)/tests/swap_rate_test \
 	$(BUILD)/tests/legacy_swap_info_test $(BUILD)/tests/mobile_color_test
@@ -149,6 +149,11 @@ $(BUILD)/tests/%: tests/%.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/includ
 
 # The region's rules as the arm64e kext builds them (RgfxRegionMapping.hpp).
 $(BUILD)/tests/arm64_region_test: tests/arm64_region_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
+	@mkdir -p $(@D)
+	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
+
+# The features as the arm64e kext takes them (RgfxFeatures.hpp's PAGES_16K).
+$(BUILD)/tests/features_arm64_test: tests/features_test.cpp $(HEADERS) ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ -std=c++17 -Wall -Wextra -Werror -DRGFX_GUEST_ARM64=1 -Isrc -I../../crates/reims-vgpu-graphics/include $< -o $@
 

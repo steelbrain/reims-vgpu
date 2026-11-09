@@ -1167,6 +1167,30 @@ only where no negotiation can carry it.
   ("Scheduled", below). The bundle posts it from `waitUntilScheduled` on the
   rings it writes itself, so the kext takes the bit with nothing of its own
   to do. Every host offers it.
+- Bit 34, `FEATURES_HI`'s bit 2, is `PAGES_16K`: every run of guest RAM the
+  guest names, and a `SURFACE_PAGES`' length, is whole 16 KiB pages from a
+  16 KiB page's first byte, as an arm64 guest's pages are. A host whose page
+  is 16 KiB (a Mac) can map guest RAM for its GPU only in whole pages of its
+  own, so it offers its features over guest RAM (`SURFACE_PAGES`,
+  `PAGES_BUFFERS`, `HEAP_OVER_PAGES`, and with them `SURFACE_CACHE_REFUSED`,
+  `SURFACE_DEFERRED_ASK` and `SURFACE_DEFERRED_CARRY`) only to a guest that
+  took `PAGES_16K`, where it maps the guest's RAM at all:
+  - until the driver takes it, `FEATURES_LO` and `_HI` read the host's
+    other bits and `PAGES_16K`, and `DEFERRED_BUDGET_LO` and `_HI` read 0,
+    exactly as from a host that maps no guest RAM, and a write cannot take
+    the features over guest RAM;
+  - the `DRIVER_FEATURES_HI` write that takes it shows them in `FEATURES_LO`
+    and `_HI` (and the budget), and that write and later ones may take them;
+    a write that lets `PAGES_16K` go lets them go, and a reset hides them;
+  - the arm64 kext writes `DRIVER_FEATURES_HI` with `PAGES_16K` first, reads
+    the offer again, and then writes both halves as before. An x86-64 kext
+    never takes it, so an x86-64 guest on a Mac reads the features it read
+    before the bit: the guest RAM features stay hidden, and its surfaces are
+    copied into the region.
+  The device info's `features_lo` and `linear_row_alignment` stay as a host
+  that maps no guest RAM writes them, as the info is written before any
+  guest takes the bit. A host whose page is 4 KiB never offers `PAGES_16K`:
+  every guest's runs are whole pages of its own there.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed

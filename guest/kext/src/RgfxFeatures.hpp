@@ -82,7 +82,14 @@
 //    runs once its read of the surface proves them (RgfxDeferCarry.hpp);
 //  - SCHEDULED_ASK (bit 33): a thread of the bundle's that waits for a command buffer to be
 //    scheduled (waitUntilScheduled) posts RGFX_CMD_SCHEDULED_ASK on the buffer's queue's ring,
-//    which the bundle writes itself, so it needs nothing of the kext.
+//    which the bundle writes itself, so it needs nothing of the kext;
+//  - PAGES_16K (bit 34), the arm64e kext alone (RGFX_GUEST_ARM64): its runs of guest RAM are whole
+//    16 KiB pages, as its kernel's pages are. A host whose page is 16 KiB shows its features over
+//    guest RAM (SURFACE_PAGES, PAGES_BUFFERS, HEAP_OVER_PAGES and those that go with them) only
+//    once the guest took it (design.md, "Negotiated features"), so the framebuffer first writes
+//    DRIVER_FEATURES_HI with it where offered (rgfxDriverFeaturesFirst), reads the offer again,
+//    and then writes both halves from that offer. The x86-64 kext never takes it, and reads the
+//    offer once, as before the bit.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -97,6 +104,10 @@
 #define RGFX_FEATURES_HPP_
 
 #include "reims_graphics_wire.h"
+
+#ifndef RGFX_GUEST_ARM64
+#define RGFX_GUEST_ARM64 0
+#endif
 
 // The bits the host acts on as it offers them, with no write: bits 0 to 2.
 constexpr uint64_t kRgfxOfferedFeatures =
@@ -114,12 +125,20 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES | RGFX_FEATURE_OPENCL_MODE |
     RGFX_FEATURE_PRIVATE_RENDER_STATE | RGFX_FEATURE_SURFACE_CACHE_REFUSED |
     RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
-    RGFX_FEATURE_SCHEDULED_ASK;
+    RGFX_FEATURE_SCHEDULED_ASK | (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : 0);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
 {
 	return offered & kRgfxCarriedFeatures;
+}
+
+// What the framebuffer writes to DRIVER_FEATURES_HI before it reads the offer again, given the
+// host's first offer: PAGES_16K where the kext carries it (the arm64e kext) and the host offers
+// it, else nothing, and the offer is read once.
+inline uint64_t rgfxDriverFeaturesFirst(uint64_t offered)
+{
+	return offered & kRgfxCarriedFeatures & RGFX_FEATURE_PAGES_16K;
 }
 
 // The feature word the bundle works by: bits 0 to 2 as offered, and from bit 3 the ones the host

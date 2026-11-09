@@ -21,6 +21,7 @@ static_assert(RGFX_FEATURE_SURFACE_DEFERRED_ASK == (1u << 30), "SURFACE_DEFERRED
 static_assert(RGFX_FEATURE_SURFACE_DEFERRED_CARRY == (1ull << 32),
               "SURFACE_DEFERRED_CARRY is bit 32");
 static_assert(RGFX_FEATURE_SCHEDULED_ASK == (1ull << 33), "SCHEDULED_ASK is bit 33");
+static_assert(RGFX_FEATURE_PAGES_16K == (1ull << 34), "PAGES_16K is bit 34");
 static_assert(RGFX_STATUS_CACHE == 7, "STATUS_CACHE");
 static_assert(RGFX_SURFACE_PAGES_LAYOUT_OFFSET ==
                   RGFX_SURFACE_PAGES_CACHE_OFFSET + sizeof(RgfxSurfacePagesCache),
@@ -49,10 +50,14 @@ void check(bool ok, const char *what)
 	}
 }
 
+// PAGES_16K, which the arm64e kext carries (this test built with RGFX_GUEST_ARM64 set, as
+// features_arm64_test) and the x86-64 kext does not.
+constexpr uint64_t k16K = RGFX_FEATURE_PAGES_16K;
+constexpr uint64_t k16KCarried = RGFX_GUEST_ARM64 ? k16K : 0;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
 constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
                                  RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
-                                 RGFX_FEATURE_QUEUE_VECTORS;
+                                 RGFX_FEATURE_QUEUE_VECTORS | (k16K & ~k16KCarried);
 // The ones it does: the bundle lays no-copy buffers over pages blocks the kext makes, orders its
 // command buffers over IOSurfaces and places its Managed buffers' CPU copies in its heaps, neither
 // of which needs anything of the kext, makes indirect command buffers, whose creates and writes,
@@ -95,7 +100,7 @@ constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kH
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
                               kBufferSlabs | kSmallIds | kColor | kMesh | kShares | kOpenCL |
                               kPrivate | kCacheRefused | kDeferredAsk | kDeferredCarry |
-                              kScheduledAsk;
+                              kScheduledAsk | k16KCarried;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -218,6 +223,15 @@ int main()
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kScheduledAsk, kScheduledAsk) ==
 	          (kRgfxOfferedFeatures | kScheduledAsk),
 	      "SCHEDULED_ASK taken is in the word");
+	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
+	// x86-64 kext never writes it, and writes nothing first.
+	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");
+	check(rgfxDriverFeaturesFirst(~0ull & ~k16K) == 0, "nothing first where PAGES_16K is not offered");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kScheduledAsk | k16K) ==
+	          (kScheduledAsk | k16KCarried),
+	      "PAGES_16K offered, written where carried");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | k16K, k16K) == (kRgfxOfferedFeatures | k16KCarried),
+	      "PAGES_16K taken is in the word where carried");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
 	      "every other bit offered, none written");

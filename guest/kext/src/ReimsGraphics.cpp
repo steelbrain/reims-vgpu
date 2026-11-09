@@ -1252,8 +1252,15 @@ bool ReimsGraphics::start(IOService *provider)
 	taken = true;
 	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_RESET);
 	{
-		const uint64_t offered = (static_cast<uint64_t>(readRegister(RGFX_REG_FEATURES_HI)) << 32) |
-		                         readRegister(RGFX_REG_FEATURES_LO);
+		uint64_t offered = (static_cast<uint64_t>(readRegister(RGFX_REG_FEATURES_HI)) << 32) |
+		                   readRegister(RGFX_REG_FEATURES_LO);
+		// PAGES_16K first, where the kext takes it: a host whose page is 16 KiB shows the
+		// features over guest RAM only from that take on (RgfxFeatures.hpp).
+		if (const uint64_t first = rgfxDriverFeaturesFirst(offered)) {
+			writeRegister(RGFX_REG_DRIVER_FEATURES_HI, static_cast<UInt32>(first >> 32));
+			offered = (static_cast<uint64_t>(readRegister(RGFX_REG_FEATURES_HI)) << 32) |
+			          readRegister(RGFX_REG_FEATURES_LO);
+		}
 		const uint64_t wanted = rgfxDriverFeatures(offered);
 		writeRegister(RGFX_REG_DRIVER_FEATURES_LO, static_cast<UInt32>(wanted));
 		writeRegister(RGFX_REG_DRIVER_FEATURES_HI, static_cast<UInt32>(wanted >> 32));

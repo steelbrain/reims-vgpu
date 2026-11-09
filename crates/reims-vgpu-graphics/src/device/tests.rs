@@ -2571,6 +2571,72 @@ fn the_deferred_budget_reads_as_the_host_gives_it() {
     assert_eq!(budget(), (0x2345_6000, 1));
 }
 
+/// A host that offers `PAGES_16K` offers its features over the guest's RAM only to a driver that
+/// took it. A driver that never takes it, as an x86-64 guest's kext, reads every feature register
+/// and the deferred budget as from the host without them, `PAGES_16K` alone added, and cannot
+/// take them. A write of `DRIVER_FEATURES_HI` that takes it shows them in `FEATURES_LO` and `_HI`;
+/// a write of `_LO` then takes them, as does one write of the two halves' bits once `_HI` took
+/// it; a write that lets `PAGES_16K` go lets them go; and a reset hides them again.
+#[test]
+fn the_pages_16k_features_are_offered_only_once_taken() {
+    const PLAIN: u64 = RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_PAGES_16K;
+    const OVER_RAM: u64 = (RGFX_FEATURE_SURFACE_PAGES
+        | RGFX_FEATURE_PAGES_BUFFERS
+        | RGFX_FEATURE_HEAP_OVER_PAGES
+        | RGFX_FEATURE_SURFACE_CACHE_REFUSED
+        | RGFX_FEATURE_SURFACE_DEFERRED_ASK) as u64
+        | RGFX_FEATURE_SURFACE_DEFERRED_CARRY;
+    struct Mac;
+    impl Host for Mac {
+        fn raise_interrupt(&self, _vector: u32) {}
+        fn features(&self) -> u64 {
+            PLAIN
+        }
+        fn features_with_16k_pages(&self) -> u64 {
+            OVER_RAM
+        }
+        fn deferred_budget(&self) -> u64 {
+            0x4000_0000
+        }
+    }
+    let rig = Rig::with_host(Box::new(Mac));
+    let read = |offset: u32| rig.device.mmio_read(offset.into());
+    let write = |offset: u32, value: u32| rig.device.mmio_write(offset.into(), value);
+    let word = |lo: u32, hi: u32| (u64::from(read(hi)) << 32) | u64::from(read(lo));
+    let offered = || word(RGFX_REG_FEATURES_LO, RGFX_REG_FEATURES_HI);
+    let taken = || word(RGFX_REG_DRIVER_FEATURES_LO, RGFX_REG_DRIVER_FEATURES_HI);
+    let budget = || word(RGFX_REG_DEFERRED_BUDGET_LO, RGFX_REG_DEFERRED_BUDGET_HI);
+    let take = |bits: u64| {
+        write(RGFX_REG_DRIVER_FEATURES_LO, bits as u32);
+        write(RGFX_REG_DRIVER_FEATURES_HI, (bits >> 32) as u32);
+    };
+    // Untaken: the plain offer, no budget, and a driver that asks for everything gets the plain
+    // bits it asked for alone.
+    assert_eq!((offered(), budget()), (PLAIN, 0));
+    write(RGFX_REG_STATUS, RGFX_STATUS_RESET);
+    take(OVER_RAM | RGFX_FEATURE_SCHEDULED_ASK);
+    assert_eq!(taken(), RGFX_FEATURE_SCHEDULED_ASK);
+    assert_eq!((offered(), budget()), (PLAIN, 0));
+    // `_HI` takes `PAGES_16K` first (the low half's bits written before it were not offered);
+    // the offer and the budget follow, and `_LO`'s next write takes the low half's.
+    take(OVER_RAM | PLAIN);
+    assert_eq!(taken(), PLAIN | (OVER_RAM & !0xffff_ffff));
+    assert_eq!((offered(), budget()), (PLAIN | OVER_RAM, 0x4000_0000));
+    take(OVER_RAM | PLAIN);
+    assert_eq!(taken(), PLAIN | OVER_RAM);
+    // Letting `PAGES_16K` go lets the rest go with it.
+    write(RGFX_REG_DRIVER_FEATURES_HI, (RGFX_FEATURE_SCHEDULED_ASK >> 32) as u32);
+    assert_eq!(taken(), RGFX_FEATURE_SCHEDULED_ASK);
+    assert_eq!((offered(), budget()), (PLAIN, 0));
+    // Taken again and started, then reset: the reset hides them.
+    take(OVER_RAM | PLAIN);
+    take(OVER_RAM | PLAIN);
+    rig.start();
+    assert_eq!((taken(), offered()), (PLAIN | OVER_RAM, PLAIN | OVER_RAM));
+    write(RGFX_REG_STATUS, RGFX_STATUS_RESET);
+    assert_eq!((taken(), offered(), budget()), (0, PLAIN, 0));
+}
+
 /// A host that offers `PRIVATE_RENDER_STATE` lets the driver take it: the driver's write reads
 /// back
 #[test]

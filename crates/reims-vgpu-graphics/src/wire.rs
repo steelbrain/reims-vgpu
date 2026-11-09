@@ -69,8 +69,9 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// 10 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
-/// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`] and
-/// [`RGFX_FEATURE_SCHEDULED_ASK`].
+/// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`],
+/// [`RGFX_FEATURE_SCHEDULED_ASK`] and [`RGFX_FEATURE_PAGES_16K`]. On a host that offers
+/// `PAGES_16K`, `FEATURES_LO` and `_HI` read the guest RAM features only once the guest took it.
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
 /// `FEATURES_LO` bit 0, `SURFACE_PAGES`: the host maps an IOSurface's own guest pages for its GPU
 /// to use in place (`SURFACE_PAGES`, `BUFFER_OVER_SURFACE_PAGES`); without it a surface's GPU
@@ -292,6 +293,19 @@ pub const RGFX_FEATURE_SURFACE_DEFERRED_CARRY: u64 = 0x1_0000_0000;
 /// then, as it posts that of a buffer that asks for its `CB_SUBMITTED` at its take. Every host
 /// offers it.
 pub const RGFX_FEATURE_SCHEDULED_ASK: u64 = 0x2_0000_0000;
+/// `FEATURES_HI` bit 2, feature bit 34, `PAGES_16K`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: every run of guest RAM the guest names (a `SURFACE_PAGES`'
+/// runs, a pages block's) is whole 16 KiB pages from a 16 KiB page's first byte, and the length
+/// of a `SURFACE_PAGES` is whole such pages too, as an arm64 guest's pages are. A host whose page
+/// is 16 KiB offers it where it maps the guest's RAM, and offers the features over guest RAM there
+/// ([`RGFX_FEATURE_SURFACE_PAGES`], [`RGFX_FEATURE_PAGES_BUFFERS`],
+/// [`RGFX_FEATURE_HEAP_OVER_PAGES`] and those that go with them) only to a guest that took it:
+/// `FEATURES_LO` and `_HI` read them from the write that takes `PAGES_16K` on, that write and the
+/// ones after it may take them, and a reset, which clears the take, hides them again. A guest that
+/// never takes it, as an x86-64 guest's kext, reads every other bit and register as from a host
+/// that maps no guest RAM. A host whose page is 4 KiB never offers it: any guest's runs are whole
+/// pages of its own there.
+pub const RGFX_FEATURE_PAGES_16K: u64 = 0x4_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;

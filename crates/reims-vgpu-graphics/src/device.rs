@@ -246,7 +246,7 @@ impl Room {
 const MIN_QUEUE_RING_DATA: u64 = 4096;
 
 /// The feature bits whose meaning the host knows, which a `DRIVER_FEATURES` write may take:
-/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 32.
+/// `RGFX_FEATURE_*`, bits 0 to 8 and 11 to 34.
 const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE
     | RGFX_FEATURE_CB_SUBMITTED
@@ -277,7 +277,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_SURFACE_CACHE_REFUSED
     | RGFX_FEATURE_SURFACE_DEFERRED_ASK) as u64
     | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
-    | RGFX_FEATURE_SCHEDULED_ASK;
+    | RGFX_FEATURE_SCHEDULED_ASK
+    | RGFX_FEATURE_PAGES_16K;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -382,6 +383,16 @@ pub trait Host: Send + Sync + 'static {
     /// `RGFX_FEATURE_*` the host carries out. The default is none, for a host with no stage-3
     /// decoder.
     fn features(&self) -> u64 {
+        0
+    }
+
+    /// The feature bits the host offers only to a guest whose driver took
+    /// [`RGFX_FEATURE_PAGES_16K`], which [`Host::features`] then offers: from the
+    /// `DRIVER_FEATURES` write that takes it to the next reset, `FEATURES_LO` and `_HI` read them
+    /// beside [`Host::features`], and a write may take them. A host whose page is 16 KiB offers
+    /// its features over the guest's RAM so, as the guest's runs are whole pages of its own only
+    /// where they are whole 16 KiB pages. The default is none.
+    fn features_with_16k_pages(&self) -> u64 {
         0
     }
 
@@ -1007,8 +1018,8 @@ impl Device {
         match u32::try_from(offset).unwrap_or(u32::MAX) {
             RGFX_REG_MAGIC => RGFX_MAGIC,
             RGFX_REG_VERSION => RGFX_VERSION,
-            RGFX_REG_FEATURES_LO => (self.shared.host.features() & 0xffff_ffff) as u32,
-            RGFX_REG_FEATURES_HI => (self.shared.host.features() >> 32) as u32,
+            RGFX_REG_FEATURES_LO => (self.shared.offered() & 0xffff_ffff) as u32,
+            RGFX_REG_FEATURES_HI => (self.shared.offered() >> 32) as u32,
             RGFX_REG_STATUS => self.shared.status.load(Ordering::Acquire),
             RGFX_REG_DRIVER_FEATURES_LO => {
                 (self.shared.driver_features.load(Ordering::Acquire) & 0xffff_ffff) as u32
@@ -1018,10 +1029,8 @@ impl Device {
             }
             RGFX_REG_REGION_SIZE_LO => (size & 0xffff_ffff) as u32,
             RGFX_REG_REGION_SIZE_HI => (size >> 32) as u32,
-            RGFX_REG_DEFERRED_BUDGET_LO => {
-                (self.shared.host.deferred_budget() & 0xffff_ffff) as u32
-            }
-            RGFX_REG_DEFERRED_BUDGET_HI => (self.shared.host.deferred_budget() >> 32) as u32,
+            RGFX_REG_DEFERRED_BUDGET_LO => (self.shared.deferred_budget() & 0xffff_ffff) as u32,
+            RGFX_REG_DEFERRED_BUDGET_HI => (self.shared.deferred_budget() >> 32) as u32,
             // The clock the refresh thread's grid stamps each VBLANK on.
             RGFX_REG_HOST_TIME_LO if host_time() => (now_ns() & 0xffff_ffff) as u32,
             RGFX_REG_HOST_TIME_HI if host_time() => (now_ns() >> 32) as u32,
@@ -1373,20 +1382,54 @@ impl Shared {
         self.screen.cursor_moved(0, 0, true);
     }
 
+    /// The feature bits the device offers a guest whose driver took `taken`: the host's
+    /// ([`Host::features`]), and where `taken` holds [`RGFX_FEATURE_PAGES_16K`] and the host
+    /// offers it, those it offers only then ([`Host::features_with_16k_pages`]).
+    fn offered_to(&self, taken: u64) -> u64 {
+        let features = self.host.features();
+        if taken & features & RGFX_FEATURE_PAGES_16K != 0 {
+            features | self.host.features_with_16k_pages()
+        } else {
+            features
+        }
+    }
+
+    /// The feature bits `FEATURES_LO` and `_HI` read: those offered to the guest's driver as it
+    /// took them so far ([`Self::offered_to`]).
+    fn offered(&self) -> u64 {
+        self.offered_to(self.driver_features.load(Ordering::Acquire))
+    }
+
+    /// What `DEFERRED_BUDGET_LO` and `_HI` read: the host's budget where the device offers a
+    /// deferral ([`RGFX_FEATURE_SURFACE_DEFERRED`] or [`RGFX_FEATURE_SURFACE_DEFERRED_ASK`]),
+    /// else 0, as the host answers where it offers neither.
+    fn deferred_budget(&self) -> u64 {
+        let deferrals =
+            u64::from(RGFX_FEATURE_SURFACE_DEFERRED | RGFX_FEATURE_SURFACE_DEFERRED_ASK);
+        if self.offered() & deferrals != 0 {
+            self.host.deferred_budget()
+        } else {
+            0
+        }
+    }
+
     /// A write of `DRIVER_FEATURES`' half at bit `shift` (0 for `_LO`, 32 for `_HI`): that half
-    /// becomes the bits of `value` the host offers ([`Host::features`]) and knows
-    /// ([`KNOWN_FEATURES`]), the other half kept. Ignored once the driver is ready: the features
-    /// are fixed from `STATUS` 1 to the next reset.
+    /// becomes the bits of `value` the device offers and the host knows ([`KNOWN_FEATURES`]), the
+    /// other half kept, where the offer is the one to the bits taken after the write
+    /// ([`Self::offered_to`]): a write that takes [`RGFX_FEATURE_PAGES_16K`] may take what it
+    /// offers in the same write, and one that lets it go lets those go too. Ignored once the
+    /// driver is ready: the features are fixed from `STATUS` 1 to the next reset.
     fn take_driver_features(&self, shift: u32, value: u32) {
         if self.status.load(Ordering::Acquire) == RGFX_STATUS_DRIVER_READY {
             return;
         }
         let half = 0xffff_ffff_u64 << shift;
-        let taken = (u64::from(value) << shift) & self.host.features() & KNOWN_FEATURES;
+        let written = u64::from(value) << shift;
         let _ = self
             .driver_features
             .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                Some((old & !half) | taken)
+                let asked = ((old & !half) | written) & KNOWN_FEATURES;
+                Some(asked & self.offered_to(asked))
             });
     }
 
