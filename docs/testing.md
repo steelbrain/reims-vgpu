@@ -25,7 +25,7 @@ How the code is tested, and how a claim about Metal or the hardware says where i
 - **The host video backends** have hardware tests and conformance runs of their own
   ([video/](video/)).
 - **The guest's kexts and Metal bundle** have their tests (`make -C guest test`, on a Mac).
-  `cargo xtask check` also runs the records of the prebuilt kext set (`make -C guest
+  `cargo xtask check` also runs the records of the prebuilt kext sets, x86-64 and arm64e (`make -C guest
   prebuilt-check`) and of the option ROM (`make -C firmware prebuilt-check`), which fail when the
   committed binaries are stale.
 - **VM boots** are the only check of what a guest's frameworks choose from the device's answers,

@@ -6,8 +6,11 @@ drivers drive in x86-64 macOS guests:
 - the library and its C API, `reims_vgpu.h`, which `cargo xtask dist`
   writes into its dist tree with a pkg-config package;
 - the guest's side (`guest/`): our kexts, their loader and the Metal bundle,
-  which reims-ctl adds to an x86-64 VM's OpenCore image as a prebuilt set.
-  They are to work on every x86-64 macOS release from 11.0 to 26's last;
+  which reims-ctl adds to an x86-64 VM's OpenCore image as a prebuilt set,
+  and their arm64e builds, a second prebuilt set that Ambrosia's config
+  bundle adds to an arm64 VM's kernel collection. They are to work on every
+  x86-64 macOS release from 11.0 to 26's last, and on the arm64 releases
+  Ambrosia boots, from macOS 13;
 - the option ROM (`firmware/`), the device's UEFI driver in C, which an
   x86-64 guest's firmware runs, and its driver module for Ambrosia
   (`firmware/ambrosia`), which gives an arm64 guest's firmware an early
@@ -62,7 +65,7 @@ The Makefile's header lists every target. README.md lists the requirements.
 | a display's own window, and the register of what it does | `crates/reims-vgpu-window`, its `features.md` and its manual walk on macOS, `scripts/internal/walk_window_macos.sh`; the wiring is `crates/reims-vgpu/src/window.rs` |
 | the reims-graphics device's video on the host, on NVDEC or VA-API | `crates/reims-vgpu-video`, in modules: `core` (what the arms share: their runtime, locks, a guest surface's memory and bounded waits), `codec` (the codecs above the hardware), and on Linux `vaapi` and `nvidia` (the hardware's); its subcrate `conformance` is the test streams' readers and writers; the arms are reims-vgpu's `crates/reims-vgpu/src/graphics/{nvidia,vaapi,video_choice,video_host}.rs`, on the runtime in `crates/reims-vgpu/src/video/runtime.rs` |
 | the video docs | [docs/video](docs/video): `devices.md` is what the device answers and what a decode does, `backends.md` the arms, the crate and the conformance suite (`crates/reims-vgpu-video/tools/h264-check.sh` and `hevc-check.sh`), `core.md`, `vaapi.md` and `nvidia.md` its modules, `bugs.md` what is wrong or put off |
-| the guest's kexts, loader and Metal bundle | `guest/`, and the prebuilt set reims-ctl carries, `guest/prebuilt` |
+| the guest's kexts, loader and Metal bundle | `guest/`, the prebuilt set reims-ctl carries, `guest/prebuilt`, and the arm64e set Ambrosia's config bundle takes, `guest/prebuilt-arm64e` |
 | the dist tree QEMU links | `xtask/src/dist.rs` (`cargo xtask dist`) |
 | the option ROM reims-ctl gives the device | `firmware/`, and the prebuilt ROM, `firmware/prebuilt/ReimsGraphics.rom`, described in [docs/architecture.md](docs/architecture.md) section 11.4 |
 | the device's driver module for Ambrosia, the arm64 guests' firmware | `firmware/ambrosia`, described in [docs/architecture.md](docs/architecture.md) section 11.5; how a guest boots with it is [docs/qemu.md](docs/qemu.md), "arm64 guests" |
@@ -128,7 +131,7 @@ passes run again alone.
 | the video crate (`crates/reims-vgpu-video`), or its arms in `reims-vgpu` | `cargo xtask check` on a Mac; the Linux tests on a VA-API host and on an NVIDIA host; and, where the `vaapi` module's decoders change, the conformance suite on a VA-API host ("The video crates' checks", below) |
 | `xtask/` | `cargo test -p xtask`, rustfmt and clippy on it |
 | `crates/reims-ctl` | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it (`cargo xtask check` does not reach it); a change to the QEMU command it builds, or to `scripts/install-ctl.sh`, also needs an install and a VM boot on each host it touches |
-| `guest/` (kext, bundle, rgfxgate, loader) | `make -C guest test` on a Mac; a change to a source the set is built from also needs `make -C guest prebuilt KDK=<KDK Extensions dir>`, committing `guest/prebuilt` with it (`make -C guest prebuilt-check` fails otherwise) |
+| `guest/` (kext, bundle, rgfxgate, loader) | `make -C guest test` on a Mac; a change to a source the sets are built from also needs `make -C guest prebuilt KDK=<KDK Extensions dir>` and `make -C guest prebuilt-arm64e`, committing `guest/prebuilt` and `guest/prebuilt-arm64e` with it (`make -C guest prebuilt-check`, which checks both, fails otherwise) |
 | `firmware/`, the option ROM | build it (`make -C firmware`); a change not meant to alter what the guest's firmware sees keeps the ROM's bytes; a change to what `ReimsGraphics.rom` is built from (its sources, the Makefile, `crates/reims-vgpu-graphics/include/reims_graphics_wire.h`) also runs `make -C firmware prebuilt` on a Mac, committing the ROM and record it writes |
 | `firmware/ambrosia` | build it (`make -C firmware/ambrosia bundle`); a change to what it does with the device also needs an arm64 guest's boot on Ambrosia with the device and the module ([docs/qemu.md](docs/qemu.md), "arm64 guests") |
 | `vendor/qemu` | build it (`make qemu`) and realize the device paused (`-S`); a change to `hw/display/reims-graphics-pci.c`, or to what QEMU calls, also needs a VM boot ([docs/lessons.md](docs/lessons.md), [docs/qemu.md](docs/qemu.md)) |
@@ -352,6 +355,17 @@ Three tiers:
     committed build and consumer tooling, made by Graft's `tools/vendor.py`
     with its record, `guest/graft/source.toml`, which the same check
     verifies. A new Graft replaces the directory and its record together.
+  - **The guest's arm64e kext set for that device**, in
+    `guest/prebuilt-arm64e`: `set.toml`, `sources.toml`, and for each of
+    `ReimsGraphics` and `RgfxGate`, `<name>.kext/Contents/Info.plist` and
+    `<name>.kext/Contents/MacOS/<name>`, built for arm64e from the same
+    sources, with the Metal bundle inside RgfxGate for arm64e and arm64.
+    Ambrosia's config bundle (`make -C firmware/ambrosia config-bundle`,
+    [docs/qemu.md](docs/qemu.md), "arm64 guests") adds them to an arm64 VM's
+    kernel collection. `make -C guest prebuilt-arm64e` rewrites them on a Mac
+    with Xcode alone, with their record, `sources.toml`, and a stale set
+    fails `make -C guest prebuilt-check`, which `cargo xtask check` runs. The
+    set lists no Graft until `guest/graft` carries Graft's arm64e build.
 - **Never commit Apple binaries.** The build needs none: the option ROM is
   built from `firmware/`, and the kexts from `guest/`. The committed
   metallibs hold only our shaders and constant samplers, with no Apple code

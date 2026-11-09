@@ -293,6 +293,27 @@ Stages:
       sources in `sources.toml` (`make -C guest prebuilt`;
       `make -C guest prebuilt-check` fails when they differ from the tree).
       reims-ctl adds the set to an image, since a Linux host cannot build it.
+    - Arm64 guests: the same sources build for arm64e (`ARCH_NAME=arm64e`)
+      into a second set, guest/prebuilt-arm64e (`make -C guest
+      prebuilt-arm64e`), for the arm64 guests from macOS 13 that Ambrosia
+      boots; Ambrosia's config bundle adds it to the guest's kernel
+      collection (docs/qemu.md, "arm64 guests"). An arm64 kernel collection
+      has no AppleGraphicsDeviceControl and no IOAcceleratorFamily2, so the
+      arm64e kext has a Graft declaration and an Info.plist of its own
+      (src/graft-arm64e.json, src/Info-arm64e.plist): IOFramebuffer and
+      IOAccelerator from IOGraphicsFamily, and no device control. The set
+      lists no Graft until guest/graft carries Graft's arm64e build.
+    - The arm64 display (owner, 2026-11-08): an arm64 WindowServer drives no
+      IOFramebuffer (measured on 27.0.1 with SIP on: a bound IOFramebuffer
+      consumer got no user client, and the system had no
+      IOFramebufferUserClient with WindowServer up), so the arm64e display
+      is an IOMobileFramebuffer: a subclass of IOMobileFramebufferLegacy,
+      as Apple's own paravirtual display, AppleParavirtDisplay, is on every
+      release from 13 to 27. Its vtable grows release by release (Legacy's
+      has 445 slots on 13.6 and 484 on 27.0.1), so Graft builds the
+      subclass's vtable from the live parent at bind time and places its
+      overrides by method. Until that front end lands, the arm64e
+      ReimsGraphics is the IOFramebuffer front end x86-64 uses.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync

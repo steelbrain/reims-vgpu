@@ -1043,11 +1043,16 @@ released image (`ea2987b`) and APFS clones of the 26.6.2 (25G83) guest
   refused ("Permission denied") after about 20 had succeeded; the guest's
   commands now share the first login's connection and retry a failed login.
 
-**What a pass still needs** (2026-11-08): arm64e builds of `ReimsGraphics.kext`
-and `RgfxGate.kext` (both x86-64 only) and of the Metal bundle `RgfxGate`
-installs; Graft built for arm64e (its only build is x86-64); and Ambrosia's
-kext placement: Ambrosia 0.1.0 reads every enabled `Kernel` > `Add` entry
-and then stops the boot with `boot failed: KextsNotPlaced`.
+The arm64e builds of `ReimsGraphics.kext` and `RgfxGate.kext`, with the Metal
+bundle inside RgfxGate for arm64e and arm64, are `guest/prebuilt-arm64e`
+(`make -C guest prebuilt-arm64e`): `REIMS_GRAPHICS=guest/prebuilt-arm64e/ReimsGraphics.kext`
+and `RGFXGATE=guest/prebuilt-arm64e/RgfxGate.kext`.
+
+**What a pass still needs** (2026-11-08): Graft built for arm64e in
+`guest/graft` (its vendored build is x86-64); RgfxGate's install on arm64,
+whose build still calls `VNOP_*` functions an arm64 kernel collection does not
+export; and the arm64e display on IOMobileFramebuffer
+([graphics-kext/design.md](graphics-kext/design.md), "Decided", item 13).
 
 **A TCG run** (`-t`) runs on a Linux member. What it needs:
 - **A node** with the arm64 guests: `homelab-um870-1` holds reflink copies of
