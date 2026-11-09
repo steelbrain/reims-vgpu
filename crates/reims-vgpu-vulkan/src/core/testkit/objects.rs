@@ -949,6 +949,11 @@ pub struct World {
     ///
     /// [`GpuDevice::surface_pages_never_in_place`]: crate::core::platform::device::GpuDevice::surface_pages_never_in_place
     never_in_place: Mutex<(Option<String>, Vec<PagesRuns>)>,
+    /// What the devices' [`GpuDevice::fresh_surface_never_in_place`] answers
+    /// ([`World::answer_fresh_surfaces`]), and the planes each call was asked of, in order.
+    ///
+    /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
+    fresh_never_in_place: Mutex<(Option<String>, Vec<Vec<PagesPlane>>)>,
 }
 
 /// A surface's pages as host addresses, as runs, in its order.
@@ -992,6 +997,7 @@ impl World {
             guest_ram_copies: AtomicBool::new(false),
             surface_pages: Mutex::new((PagesInPlace::Yes, Vec::new())),
             never_in_place: Mutex::new((None, Vec::new())),
+            fresh_never_in_place: Mutex::new((None, Vec::new())),
         })
     }
 
@@ -1035,6 +1041,33 @@ impl World {
         let mut state = self.never_in_place.lock();
         state.1.push(pages.to_vec());
         state.0.clone()
+    }
+
+    /// Has the devices answer `why` to [`GpuDevice::fresh_surface_never_in_place`] from now on:
+    /// textures over a fresh surface's pages, whatever they come to be, lie in place over none,
+    /// for that reason; `None` at first, the surface's pages deciding once it has them.
+    ///
+    /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
+    pub fn answer_fresh_surfaces(&self, why: Option<String>) {
+        self.fresh_never_in_place.lock().0 = why;
+    }
+
+    /// What the devices answer to [`GpuDevice::fresh_surface_never_in_place`] asked of `planes`
+    /// ([`World::answer_fresh_surfaces`]), the planes asked of kept.
+    ///
+    /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
+    pub fn fresh_surface_never_in_place(&self, planes: &[PagesPlane]) -> Option<String> {
+        let mut state = self.fresh_never_in_place.lock();
+        state.1.push(planes.to_vec());
+        state.0.clone()
+    }
+
+    /// The planes each call of [`GpuDevice::fresh_surface_never_in_place`] was asked of, in
+    /// order.
+    ///
+    /// [`GpuDevice::fresh_surface_never_in_place`]: crate::core::platform::device::GpuDevice::fresh_surface_never_in_place
+    pub fn fresh_surfaces_asked(&self) -> Vec<Vec<PagesPlane>> {
+        self.fresh_never_in_place.lock().1.clone()
     }
 
     /// The pages, host addresses as runs, each call of [`GpuDevice::surface_pages_never_in_place`]

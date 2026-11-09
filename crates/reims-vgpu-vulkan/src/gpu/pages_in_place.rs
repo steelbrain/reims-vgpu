@@ -274,6 +274,55 @@ fn dma_bufs_never_in_place(
     verdicts(report, line, 0, Class::DmaBuf, planes).err()
 }
 
+/// Why textures over a fresh IOSurface's pages, laid out as `planes` from a page's first byte,
+/// would lie in place over no import of them `raw` makes, whatever pages the surface comes to
+/// have, asked before it has any: as [`surface_pages_never_in_place`] answers, each page counted a
+/// piece of its own on a device whose views are dma-bufs ([`fresh_dma_bufs_never_in_place`]).
+/// `None` where some class's verdicts all passed or are pending, or the device's lines do not
+/// divide a page: textures over some such pages may lie in place.
+pub(crate) fn fresh_surface_never_in_place(
+    raw: &rt::Device,
+    planes: &[PagesPlane],
+) -> Option<String> {
+    let report = plain(|| raw.in_place_check_report());
+    let line = plain(|| raw.in_place_check_line());
+    if plain(|| raw.imports_shared_host_pointers()).is_ok_and(|takes| !takes) {
+        return fresh_dma_bufs_never_in_place(&report, line, planes);
+    }
+    never_in_place(&report, line, planes)
+}
+
+/// [`fresh_surface_never_in_place`] on a device whose views are dma-bufs, from its `report` and
+/// `line`: a plane of more pages than one dma-buf takes pieces, each page a piece of its own, as
+/// a fresh surface's pages come; else the dma-bufs' verdicts as [`dma_bufs_never_in_place`] reads
+/// them. The guest gives a fresh surface's pages as its allocator finds them, a run apiece or near
+/// it (**measured** 2026-11-08 on homelab-um870-1, the 780M, an 8 GiB x86-64 macOS 26.7.2 guest
+/// scrolling Safari, job m3-max-10438: the 379 WebKit tiles of 1,824 pages each came in 1,379 to
+/// 1,824 runs, 1,821 the median, each more than udmabuf's default `list_limit` of 1,024).
+fn fresh_dma_bufs_never_in_place(
+    report: &[String],
+    line: u64,
+    planes: &[PagesPlane],
+) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    for (i, plane) in planes.iter().enumerate() {
+        let Some(end) = plane.end() else { continue };
+        let from = plane.offset - plane.offset % GUEST_PAGE;
+        let bytes = end.next_multiple_of(GUEST_PAGE) - from;
+        if let Err(refusal) = crate::os::one_dma_buf_of_pieces_fits(bytes / GUEST_PAGE, bytes) {
+            return Some(format!(
+                "plane {i}'s pages, each a piece of its own as a fresh surface's come, are no \
+                 one dma-buf, which a texture over {} binds: {refusal}",
+                Class::DmaBuf.words()
+            ));
+        }
+    }
+    if line == 0 || !GUEST_PAGE.is_multiple_of(line) {
+        return None;
+    }
+    verdicts(report, line, 0, Class::DmaBuf, planes).err()
+}
+
 /// The runs of `pages`, host addresses of a surface's bytes in its order, that its bytes `span`
 /// lie in, cut to them, in order.
 #[cfg(target_os = "linux")]
@@ -482,5 +531,44 @@ mod tests {
             dma_bufs_never_in_place(&passed, 0, &planes, &mapped).is_none(),
             "no lines, pages that fit"
         );
+    }
+
+    /// A fresh surface on a device whose views are dma-bufs needs a device cache whatever its
+    /// pages where a plane has more pages than one dma-buf takes pieces, each page counted a piece
+    /// of its own, or where the dma-bufs' verdicts refuse its rows; a plane within the pieces whose
+    /// verdicts pass, or a device with no lines, may lie in place
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fresh_surface_needs_a_cache_where_its_pages_fit_no_dma_buf_or_its_rows_fail() {
+        let line = 64;
+        let page = GUEST_PAGE;
+        let report = |dma_buf: &str| -> Vec<String> {
+            ["", " renders", " writes"]
+                .iter()
+                .map(|access| format!("DmaBuf{access}, rows on lines: {dma_buf}"))
+                .collect()
+        };
+        let passed = report("Passed");
+        let fits = [plane(0, page, page, 4)];
+        assert_eq!(fresh_dma_bufs_never_in_place(&passed, line, &fits), None);
+        assert_eq!(
+            fresh_dma_bufs_never_in_place(&passed, 0, &fits),
+            None,
+            "no lines"
+        );
+        // The fewest pages, doubling from udmabuf's default list_limit, that one dma-buf of a
+        // piece apiece does not take on this host.
+        let pages = std::iter::successors(Some(1024u64), |n| n.checked_mul(2))
+            .find(|&n| crate::os::one_dma_buf_of_pieces_fits(n, n * page).is_err())
+            .unwrap();
+        let over = [plane(0, page, page, pages)];
+        let why = fresh_dma_bufs_never_in_place(&passed, line, &over).unwrap();
+        assert!(
+            why.contains("plane 0's pages, each a piece of its own"),
+            "{why}"
+        );
+        let failed = report("Failed");
+        let why = fresh_dma_bufs_never_in_place(&failed, line, &fits).unwrap();
+        assert!(why.contains("imported as dma-bufs"), "{why}");
     }
 }

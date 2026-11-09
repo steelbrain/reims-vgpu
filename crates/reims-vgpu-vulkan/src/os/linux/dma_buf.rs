@@ -413,6 +413,13 @@ pub(crate) fn fits_one_of(ranges: &[std::ops::Range<u64>]) -> Result<(), Refusal
         }
         bytes = bytes.saturating_add(length);
     }
+    fits_pieces(pieces, bytes)
+}
+
+/// Whether one dma-buf takes `pieces` pieces of `bytes` bytes in all, within udmabuf's limits as
+/// the host has them now, asked of pages that do not exist yet: refused as [`fits_one_of`] refuses
+/// pages past the limits.
+pub(crate) fn fits_pieces(pieces: u64, bytes: u64) -> Result<(), Refusal> {
     let limits = limits();
     if pieces > limits.pieces || bytes > limits.bytes {
         return Err(Refusal::Limit {

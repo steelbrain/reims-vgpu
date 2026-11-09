@@ -1288,6 +1288,12 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         crate::gpu::pages_in_place::surface_pages_never_in_place(&self.raw, planes, pages)
     }
 
+    /// The runtime's verdicts for textures over a fresh surface's pages, each a piece of its own
+    /// (`crate::gpu::pages_in_place::fresh_surface_never_in_place`).
+    fn fresh_surface_never_in_place(&self, planes: &[PagesPlane]) -> Option<String> {
+        crate::gpu::pages_in_place::fresh_surface_never_in_place(&self.raw, planes)
+    }
+
     /// The runtime's alignment of a BGRA8 texture's offset and rows in a buffer at which the
     /// device's images hold it in place (`rt::Device::minimum_linear_texture_alignment_for_pixel_format`,
     /// the device's own answer, which the guest's `minimumLinearTextureAlignmentForPixelFormat:`

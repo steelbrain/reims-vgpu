@@ -32,7 +32,10 @@ pub use surface::{LinuxSurface, LinuxSurfaces};
 pub use threads::LinuxThreads;
 pub use vm::{LinuxVm, RegionMemory};
 
-pub(crate) use dma_buf::{fits_one as one_dma_buf_fits, fits_one_of as one_dma_buf_of_fits};
+pub(crate) use dma_buf::{
+    fits_one as one_dma_buf_fits, fits_one_of as one_dma_buf_of_fits,
+    fits_pieces as one_dma_buf_of_pieces_fits,
+};
 pub(crate) use host_ram::{
     copies as copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over,
 };

@@ -62,10 +62,11 @@ pub(crate) use host_os::{PAGE, mapped, writable};
 /// The guest's RAM a device copies by runs of it, on Linux (`os/linux/host_ram.rs`).
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::{copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over};
-/// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, or of
-/// a list of ranges, before a view of them is made, on Linux (`os/linux/dma_buf.rs`).
+/// Whether one dma-buf takes the pages of a range, as the runtime asks for a texture's own, of a
+/// list of ranges, before a view of them is made, or of pieces of pages not made yet, on Linux
+/// (`os/linux/dma_buf.rs`).
 #[cfg(target_os = "linux")]
-pub(crate) use host_os::{one_dma_buf_fits, one_dma_buf_of_fits};
+pub(crate) use host_os::{one_dma_buf_fits, one_dma_buf_of_fits, one_dma_buf_of_pieces_fits};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::MATRIX_KEY;
 /// The Objective-C message layer the window's AppKit side sends through, on macOS
