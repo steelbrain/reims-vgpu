@@ -1342,6 +1342,16 @@ fn pages_after(case: u8) -> HostPtr {
     at
 }
 
+/// Lets go of what [`pages_after`] left mapped of its two pages at `at` for `case`: both
+/// pages, but only the first after case 3, whose second page it already unmapped. Unmapping
+/// that second page again would unmap whatever the process has mapped there since, as a new
+/// thread's malloc cache or the GPU driver's shared memory, and the process's next touch of it
+/// faults.
+fn let_go_pages_after(case: u8, at: HostPtr) {
+    let length = if case == 3 { PAGE } else { 2 * PAGE };
+    let _ = VulkanVm::new().deallocate(at, length);
+}
+
 /// The heaps cases' options: Shared, and read-only (resource option bit 24) or not.
 fn heap_options(read_only: bool) -> Vec<OptionSet> {
     let mut options = vec![OptionSet::StorageMode(0)];
@@ -1374,7 +1384,7 @@ fn without_access<P: Platform>(p: &P, dev: &P::Device) -> Steps {
                 })
                 .unwrap();
             let made = u64::from(made.heap.is_some());
-            let _ = vm.deallocate(at, 2 * PAGE);
+            let_go_pages_after(case, at);
             made
         });
         steps.push((
@@ -1395,7 +1405,7 @@ fn without_access<P: Platform>(p: &P, dev: &P::Device) -> Steps {
                 .unwrap();
             let replaced = u64::from(buffer.replace_backing(&array, read_only).unwrap());
             drop(buffer);
-            let _ = vm.deallocate(at, 2 * PAGE);
+            let_go_pages_after(case, at);
             replaced
         });
         steps.push((
@@ -1431,7 +1441,7 @@ fn without_access<P: Platform>(p: &P, dev: &P::Device) -> Steps {
                 .unwrap();
             let replaced = u64::from(heap.replace_backing(&array, read_only).unwrap());
             drop(heap);
-            let _ = vm.deallocate(at, 2 * PAGE);
+            let_go_pages_after(case, at);
             let _ = vm.deallocate(dummy, 2 * PAGE);
             replaced
         });
@@ -1478,7 +1488,7 @@ fn past_the_size<P: Platform>(p: &P, dev: &P::Device) -> Steps {
                     true => vec![range(at, 0, PAGE), range(at, PAGE, PAGE)],
                 };
                 made.push(heap_over::<P>(p, dev, &ranges, read_only));
-                let _ = vm.deallocate(at, 2 * PAGE);
+                let_go_pages_after(case, at);
             }
         }
         let at = pages(1, 0x5a);
