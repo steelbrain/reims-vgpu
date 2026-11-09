@@ -19,11 +19,19 @@
  * start_hardware starts its display and joins power management, its verify_swap answers true, and
  * its three maps map nothing. ReimsGraphics does the same: the device reads a surface by its
  * IOSurface ID, so no layer's surface is mapped.
+ *
+ * A process finds the display as IOMobileFramebuffer.framework counts displays: by a node of the
+ * device tree (attachMobileNode), then the framebuffer's service and the properties it publishes
+ * (publishMobileDisplay).
  */
 
 #include "ReimsGraphics.hpp"
 
+#include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
+#include <libkern/libkern.h>
+
+#include "RgfxDisplayIdentity.hpp"
 
 #if defined(__arm64e__)
 
@@ -89,14 +97,207 @@ bool ReimsGraphics::startMobile()
 	}
 	mobilePowerJoined = false;
 	IOLog("ReimsGraphics: mobile framebuffer, display %u\n", displayId);
+	publishMobileDisplay();
+	attachMobileNode();
 	return true;
 }
 
 void ReimsGraphics::stopMobile()
 {
+	detachMobileNode();
 	if (mobilePipe)
 		removePipe(this);
 	mobilePipe = false;
+}
+
+// MARK: - The display as a process finds it
+
+namespace {
+
+// A dictionary's entries, each left out where it cannot be made.
+void putNumber(OSDictionary *dict, const char *key, uint32_t value)
+{
+	if (OSNumber *n = OSNumber::withNumber(value, 32)) {
+		dict->setObject(key, n);
+		n->release();
+	}
+}
+
+void putString(OSDictionary *dict, const char *key, const char *value)
+{
+	if (OSString *s = OSString::withCString(value)) {
+		dict->setObject(key, s);
+		s->release();
+	}
+}
+
+// Puts `value` (which may be null) and lets it go.
+void putDictionary(OSDictionary *dict, const char *key, OSDictionary *value)
+{
+	if (value) {
+		dict->setObject(key, value);
+		value->release();
+	}
+}
+
+// A colour's point as DisplayAttributes gives it: X and Y in 16.16 fixed point, and a Gamma of 1.0
+// in 16.16, as Apple's paravirtual display gives its own (read from macOS 27.0.1's
+// AppleParavirtGPU, createColorPointDict).
+OSDictionary *colorPoint(RgfxDisplayChromaticity c)
+{
+	OSDictionary *dict = OSDictionary::withCapacity(3);
+	if (!dict)
+		return nullptr;
+	putNumber(dict, "X", (c.x * 65536 + 500) / 1000);
+	putNumber(dict, "Y", (c.y * 65536 + 500) / 1000);
+	putNumber(dict, "Gamma", 0x10000);
+	return dict;
+}
+
+// What the device tree node's device_type holds: IOMobileFramebuffer.framework counts a child of
+// /arm-io whose device_type begins with these 17 bytes as one display.
+constexpr char kDisplayNodeType[] = "display-subsystem";
+
+} // namespace
+
+// The display's node in the device tree. A process waits for as many IOMobileFramebuffer services
+// as IOMobileFramebuffer.framework counts displays (iomfb_populate_all_display_infos), and it
+// counts the children of IODeviceTree:/arm-io whose device_type is "display-subsystem" or
+// "ext-display-subsystem", and the DisplayPortCount of an AppleParavirtGPU where a child's
+// compatible names Apple's paravirtual GPU (read from macOS 27.0.1's framework). A VM's device
+// tree has no such child for this device: the framework counted no display, and WindowServer ran
+// headless ("FB Count = 0"). The node is attached at start, before WindowServer's first count, and
+// is ours alone: nothing in the kernel reads it.
+void ReimsGraphics::attachMobileNode()
+{
+	mobileNode = nullptr;
+	IORegistryEntry *armIO = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
+	if (!armIO) {
+		IOLog("ReimsGraphics: no /arm-io in the device tree, so no process counts display %u\n",
+		      displayId);
+		return;
+	}
+	char name[32];
+	snprintf(name, sizeof(name), "reims-display%u", displayId);
+	OSDictionary *props = OSDictionary::withCapacity(2);
+	OSData *nameData = OSData::withBytes(name, static_cast<unsigned>(strlen(name) + 1));
+	OSData *typeData = OSData::withBytes(kDisplayNodeType, sizeof(kDisplayNodeType));
+	IORegistryEntry *node = OSTypeAlloc(IORegistryEntry);
+	bool attached = false;
+	if (props && nameData && typeData && node) {
+		props->setObject("name", nameData);
+		props->setObject("device_type", typeData);
+		if (node->init(props)) {
+			node->setName(name);
+			attached = node->attachToParent(armIO, gIODTPlane);
+		}
+	}
+	if (attached) {
+		mobileNode = node;
+		node = nullptr;
+	}
+	OSSafeReleaseNULL(node);
+	OSSafeReleaseNULL(typeData);
+	OSSafeReleaseNULL(nameData);
+	OSSafeReleaseNULL(props);
+	armIO->release();
+	IOLog("ReimsGraphics: display %u %s IODeviceTree:/arm-io/%s, a %s\n", displayId,
+	      attached ? "attached" : "could not attach", name, kDisplayNodeType);
+}
+
+void ReimsGraphics::detachMobileNode()
+{
+	if (!mobileNode)
+		return;
+	mobileNode->detachAbove(gIODTPlane);
+	OSSafeReleaseNULL(mobileNode);
+}
+
+// The framebuffer's properties a process reads of the display, as Apple's paravirtual display
+// publishes its own (read from macOS 27.0.1's AppleParavirtGPU, AppleParavirtDisplay's
+// createDisplayAttributes), with the values the x86-64 framebuffer's EDID gives
+// (RgfxDisplayIdentity.hpp):
+// - external: false for the device's first display, which IOMobileFramebuffer.framework then
+//   names primary-0, and true for the others, which it names external-N;
+// - IOMFBUUID: the display's UUID, a fixed one of ours: "RVG" in ASCII, the product code, the
+//   version and variant bits of RFC 9562's custom UUIDs (8), and the serial;
+// - DisplayAttributes: the product (manufacturer, product code, serial, name, year), sRGB's
+//   primaries and D65 white, sRGB the default colour space, no PQ transfer function, and the
+//   native mode's size in pixels, in whole centimetres and as an aspect ratio in 16.16;
+// - Transport: "Other" upstream and downstream, as no link carries the pixels;
+// - IOMFBMaxSrcPixels: the largest source buffer and source rectangle a layer takes, the largest
+//   mode's size; and its MaxSrcRectTotal and IOMFBMaxCompressedSizeInBytes 0, as the paravirtual
+//   display gives them.
+// The paravirtual display's TimingElements and ColorElements, IOAVFamily's objects, are not
+// published.
+void ReimsGraphics::publishMobileDisplay()
+{
+	IOLockLock(stateLock);
+	const Mode native = nativeMode(Mode{});
+	const UInt32 id = displayId;
+	IOLockUnlock(stateLock);
+	const uint32_t serial = rgfxDisplaySerial(id);
+
+	setProperty("external", id != 0);
+	char uuid[40];
+	snprintf(uuid, sizeof(uuid), "52564700-%04X-8000-8000-%012X", kRgfxDisplayProduct, serial);
+	setProperty("IOMFBUUID", uuid);
+
+	OSDictionary *attributes = OSDictionary::withCapacity(12);
+	if (attributes) {
+		OSDictionary *product = OSDictionary::withCapacity(6);
+		if (product) {
+			putString(product, "ManufacturerID", kRgfxDisplayManufacturer);
+			putNumber(product, "ProductID", kRgfxDisplayProduct);
+			putNumber(product, "SerialNumber", serial);
+			putString(product, "ProductName", kRgfxDisplayName);
+			putNumber(product, "WeekOfManufacture", 0);
+			putNumber(product, "YearOfManufacture", kRgfxDisplayYear);
+		}
+		putDictionary(attributes, "ProductAttributes", product);
+		OSDictionary *chromaticity = OSDictionary::withCapacity(3);
+		if (chromaticity) {
+			putDictionary(chromaticity, "Red", colorPoint(kRgfxDisplayRed));
+			putDictionary(chromaticity, "Green", colorPoint(kRgfxDisplayGreen));
+			putDictionary(chromaticity, "Blue", colorPoint(kRgfxDisplayBlue));
+		}
+		putDictionary(attributes, "Chromaticity", chromaticity);
+		putDictionary(attributes, "DefaultWhitePoint", colorPoint(kRgfxDisplayWhite));
+		attributes->setObject("DefaultColorSpaceIsSRGB", kOSBooleanTrue);
+		attributes->setObject("SupportsPQEOTF", kOSBooleanFalse);
+		if (native.width && native.height) {
+			putNumber(attributes, "MaxHorizontalImageSize",
+			          (rgfxDisplayMillimetres(native.width, native.width) + 9) / 10);
+			putNumber(attributes, "MaxVerticalImageSize",
+			          (rgfxDisplayMillimetres(native.height, native.width) + 9) / 10);
+			putNumber(attributes, "NativeFormatHorizontalPixels", native.width);
+			putNumber(attributes, "NativeFormatVerticalPixels", native.height);
+			putNumber(attributes, "PreciseAspectRatio",
+			          static_cast<uint32_t>((static_cast<uint64_t>(native.width) << 16) /
+			                                native.height));
+		}
+		setProperty("DisplayAttributes", attributes);
+		attributes->release();
+	}
+
+	if (OSDictionary *transport = OSDictionary::withCapacity(2)) {
+		putString(transport, "Upstream", "Other");
+		putString(transport, "Downstream", "Other");
+		setProperty("Transport", transport);
+		transport->release();
+	}
+
+	if (OSDictionary *source = OSDictionary::withCapacity(5)) {
+		putNumber(source, "MaxSrcBufferWidth", kRgfxDisplayMaxDimension);
+		putNumber(source, "MaxSrcBufferHeight", kRgfxDisplayMaxDimension);
+		putNumber(source, "MaxSrcRectWidth", kRgfxDisplayMaxDimension);
+		putNumber(source, "MaxSrcRectTotal", 0);
+		putNumber(source, "IOMFBMaxCompressedSizeInBytes", 0);
+		setProperty("IOMFBMaxSrcPixels", source);
+		source->release();
+	}
+	IOLog("ReimsGraphics: display %u is %s, %ux%u native, UUID %s\n", id,
+	      id != 0 ? "external" : "primary", native.width, native.height, uuid);
 }
 
 void ReimsGraphics::mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next)

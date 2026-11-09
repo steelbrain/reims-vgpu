@@ -20,6 +20,7 @@
 #include <libkern/libkern.h>
 #include <libkern/OSKextLib.h>
 
+#include "RgfxDisplayIdentity.hpp"
 #include "RgfxTrace.hpp"
 
 #if defined(__x86_64__)
@@ -67,7 +68,7 @@ constexpr UInt64 kCursorSlot = kCursorMax * kCursorMax * 4;
 // Scanout rows start on 256-byte boundaries, as the option ROM's do, so the
 // boot frame keeps its layout when the driver takes the display over.
 constexpr UInt32 kStrideAlign = 256;
-constexpr UInt32 kMaxDimension = 16384;
+constexpr UInt32 kMaxDimension = kRgfxDisplayMaxDimension;
 
 // How long a command waits for ring space, and then for its answer.
 constexpr UInt32 kPostTimeoutMs = 5000;
@@ -881,9 +882,8 @@ void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) cons
 {
 	// The EDID's size, from the preferred mode.
 	Mode native = nativeMode(m);
-	UInt32 ppi = native.width >= 2880 ? 220 : 110;
-	*width = static_cast<UInt16>((native.width * 254 + ppi * 5) / (ppi * 10));
-	*height = static_cast<UInt16>((native.height * 254 + ppi * 5) / (ppi * 10));
+	*width = static_cast<UInt16>(rgfxDisplayMillimetres(native.width, native.width));
+	*height = static_cast<UInt16>(rgfxDisplayMillimetres(native.height, native.width));
 }
 
 // A mode's information flags: valid and safe; the preferred mode is the default and the
@@ -1356,6 +1356,9 @@ bool ReimsGraphics::start(IOService *provider)
 	if (super::start(provider))
 		return true;
 fail:
+#if defined(__arm64e__)
+	stopMobile();
+#endif
 	quiesce();
 	teardown();
 	return false;
@@ -2022,20 +2025,6 @@ void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
 
 namespace {
 
-// The EDID's identity: our own three-letter PNP manufacturer ID "RVG", packed as five
-// bits a letter ('A' is 1), and our product code.
-constexpr UInt16 kEdidManufacturer = ((('R' - '@') << 10) | (('V' - '@') << 5) | ('G' - '@'));
-constexpr UInt16 kEdidProduct = 0x5247;
-constexpr char kEdidName[] = "Reims Display";
-
-// The size, in millimetres, the EDID gives a mode's display: at 220 pixels per inch for a
-// mode at least 2880 pixels wide, as a high-density panel, and 110 otherwise.
-UInt32 edidMillimetres(UInt32 pixels, UInt32 width)
-{
-	UInt32 ppi = width >= 2880 ? 220 : 110;
-	return (pixels * 254 + ppi * 5) / (ppi * 10);
-}
-
 void edidChecksum(UInt8 *block)
 {
 	UInt8 sum = 0;
@@ -2066,29 +2055,31 @@ bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 
 	static const UInt8 header[8] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
 	memcpy(b, header, sizeof(header));
-	b[8] = static_cast<UInt8>(kEdidManufacturer >> 8);
-	b[9] = static_cast<UInt8>(kEdidManufacturer);
-	b[10] = static_cast<UInt8>(kEdidProduct);
-	b[11] = static_cast<UInt8>(kEdidProduct >> 8);
-	// The serial: the product code over the device's display id, so each display keeps its own.
-	UInt32 serial = (static_cast<UInt32>(kEdidProduct) << 16) | ((displayId + 1) & 0xffff);
+	// The identity (RgfxDisplayIdentity.hpp).
+	b[8] = static_cast<UInt8>(kRgfxDisplayManufacturerPacked >> 8);
+	b[9] = static_cast<UInt8>(kRgfxDisplayManufacturerPacked);
+	b[10] = static_cast<UInt8>(kRgfxDisplayProduct);
+	b[11] = static_cast<UInt8>(kRgfxDisplayProduct >> 8);
+	UInt32 serial = rgfxDisplaySerial(displayId);
 	b[12] = static_cast<UInt8>(serial);
 	b[13] = static_cast<UInt8>(serial >> 8);
 	b[14] = static_cast<UInt8>(serial >> 16);
 	b[15] = static_cast<UInt8>(serial >> 24);
 	b[16] = 0;    // week unspecified
-	b[17] = 36;   // 2026
+	b[17] = static_cast<UInt8>(kRgfxDisplayYear - 1990); // the year, counted from 1990
 	b[18] = 1;    // EDID 1.4
 	b[19] = 4;
 	b[20] = 0xa5; // digital, 8 bits a component, DisplayPort
-	b[21] = static_cast<UInt8>((edidMillimetres(native.width, native.width) + 5) / 10);
-	b[22] = static_cast<UInt8>((edidMillimetres(native.height, native.width) + 5) / 10);
+	b[21] = static_cast<UInt8>((rgfxDisplayMillimetres(native.width, native.width) + 5) / 10);
+	b[22] = static_cast<UInt8>((rgfxDisplayMillimetres(native.height, native.width) + 5) / 10);
 	b[23] = 120;  // gamma 2.2
 	b[24] = 0x04; // RGB 4:4:4, sRGB the default colour space
 
 	// sRGB's primaries and D65 white, 10 bits each.
-	const UInt32 rx = chroma(640), ry = chroma(330), gx = chroma(300), gy = chroma(600);
-	const UInt32 bx = chroma(150), by = chroma(60), wx = chroma(313), wy = chroma(329);
+	const UInt32 rx = chroma(kRgfxDisplayRed.x), ry = chroma(kRgfxDisplayRed.y);
+	const UInt32 gx = chroma(kRgfxDisplayGreen.x), gy = chroma(kRgfxDisplayGreen.y);
+	const UInt32 bx = chroma(kRgfxDisplayBlue.x), by = chroma(kRgfxDisplayBlue.y);
+	const UInt32 wx = chroma(kRgfxDisplayWhite.x), wy = chroma(kRgfxDisplayWhite.y);
 	b[25] = static_cast<UInt8>(((rx & 3) << 6) | ((ry & 3) << 4) | ((gx & 3) << 2) | (gy & 3));
 	b[26] = static_cast<UInt8>(((bx & 3) << 6) | ((by & 3) << 4) | ((wx & 3) << 2) | (wy & 3));
 	b[27] = static_cast<UInt8>(rx >> 2);
@@ -2109,9 +2100,9 @@ bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 	d[3] = 0x10;
 	d += 18;
 	d[3] = 0xfc;
-	UInt32 len = sizeof(kEdidName) - 1;
+	UInt32 len = sizeof(kRgfxDisplayName) - 1;
 	for (UInt32 i = 0; i < 13; i++)
-		d[5 + i] = i < len ? static_cast<UInt8>(kEdidName[i]) : (i == len ? 0x0a : 0x20);
+		d[5 + i] = i < len ? static_cast<UInt8>(kRgfxDisplayName[i]) : (i == len ? 0x0a : 0x20);
 	d += 18;
 	d[3] = 0x10;
 	d += 18;

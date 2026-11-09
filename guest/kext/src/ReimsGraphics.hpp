@@ -535,9 +535,17 @@ private:
 	// surface waits for its answer; the transactions it posts are numbered from 1.
 	bool startMobile();
 	void stopMobile();
+	// The display as IOMobileFramebuffer.framework finds it: its node in the device tree
+	// (attachMobileNode, detachMobileNode) and the properties it reads of the framebuffer
+	// (publishMobileDisplay).
+	void attachMobileNode();
+	void detachMobileNode();
+	void publishMobileDisplay();
 	static void mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	static void mobilePresented(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
 	bool mobilePipe;
+	// The display's node under /arm-io in the device tree (retained), where attached.
+	IORegistryEntry *mobileNode;
 	// Whether start_hardware joined power management, which stop_hardware_gated leaves.
 	bool mobilePowerJoined;
 	UInt64 mobilePresentSeqno;
