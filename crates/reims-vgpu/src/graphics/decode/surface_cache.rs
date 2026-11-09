@@ -308,7 +308,7 @@ pub(crate) struct SurfaceCache<P: Platform> {
     /// early copy, and so does a use that writes the cache, on the GPU.
     out: Option<OutCopy>,
     /// The cache's life, where its memory was made for the host's video (exportable, or a
-    /// dma-buf: [`SurfaceCaches::new_cache`]), as the host's video keeps what it makes of the
+    /// dma-buf: [`CacheMaker::make`]), as the host's video keeps what it makes of the
     /// cache's memory (an import of it, [`SurfaceCaches::identity`]): it ends as the cache goes.
     /// `None` for any other cache, whose memory no device of the host's video reaches.
     life: Option<MemoryLife>,
@@ -751,16 +751,16 @@ pub(crate) struct CacheCounts {
     /// one, left to their queue's thread.
     pub(crate) doorbell_free: u64,
     pub(crate) doorbell_waits: u64,
-    /// Caches made exportable for the host's video ([`SurfaceCaches::new_cache`]), and those the
+    /// Caches made exportable for the host's video ([`CacheMaker::make`]), and those the
     /// platform made none for, made as any other buffer.
     pub(crate) exportable: u64,
     pub(crate) unexportable: u64,
     /// Caches made with their memory exported as a dma-buf, for the host's video to decode into
-    /// ([`SurfaceCaches::new_cache`]), and those the platform made none for, made as before.
+    /// ([`CacheMaker::make`]), and those the platform made none for, made as before.
     pub(crate) dma_buf: u64,
     pub(crate) no_dma_buf: u64,
     /// Caches made with their surface's first plane on a multiple of 256 bytes of their memory
-    /// ([`SurfaceCaches::new_cache`]).
+    /// ([`CacheMaker::make`]).
     pub(crate) aligned: u64,
 }
 
@@ -1029,65 +1029,39 @@ impl<P: Platform> SurfaceCaches<P> {
         self.counts
     }
 
-    /// A cache for the block at `block`, whose surface's pages `view` maps: `Ok(false)` where
-    /// the platform made no buffer for it, and the block keeps its view. `host_pages` are the
-    /// pages' host addresses in the guest's RAM, [`device_writes::sorted`], which the host's
-    /// devices' writes are watched over. A new cache is made as zeros on the transfer queue, and
-    /// owes its first fill from the pages as of `generation`, the CPU's generation of the surface
-    /// in the block's header (the module doc, "Fill"); `Ok(false)` too where the platform made no
-    /// command buffer for the zeros, as for no buffer: no cache holds what the GPU's memory held
-    /// before.
-    ///
-    /// A block that has a cache keeps it where its pages are the same, filled again from them as
-    /// of `generation` ([`Self::fill_named_again`]), as the kext's generations of the surface may
-    /// count anew; any other goes as at a release ([`SurfaceCaches::released`]). Either way what a buffer wrote of the cache is
-    /// copied into the pages first. (The kext names a block's pages once, before any process
-    /// holds it, and a block's offset is given out again only once its release is answered.)
-    pub(crate) fn make(
+    /// Whether the block at `block` keeps the cache it has as its pages are named again: one of
+    /// `length` bytes over the same pages, `host_pages` ([`Caches::make`]).
+    fn keeps(&self, block: u64, length: u64, host_pages: &[Range<u64>]) -> bool {
+        (self.by_block.get(&block)).is_some_and(|cache| {
+            cache.length == length
+                && (self.watched.0.lock().get(&block)).is_some_and(|p| p.runs == host_pages)
+        })
+    }
+
+    /// The cache the block at `block` keeps ([`Self::keeps`]), what a buffer wrote of it copied
+    /// into its pages first, filled again from them as of `generation`
+    /// ([`Self::fill_named_again`]), as the kext's generations of the surface may count anew.
+    fn named_again(
         &mut self,
         device: &P::Device,
         block: u64,
-        view: &Arc<SurfaceView<P>>,
-        host_pages: Vec<Range<u64>>,
         generation: u64,
-        layout: Option<Vec<PagesPlane>>,
     ) -> RaiseResult<bool> {
-        let pages = || {
-            buffer_over(device, view, 0, view.length(), 0, None).map(|b| b.map(CachePages::View))
-        };
-        let length = view.length();
-        self.make_with(device, block, length, host_pages, generation, layout, pages)
+        if self.written_since_host(block) {
+            self.write_back(device, block, Box::new(|| {}))?;
+        }
+        self.fill_named_again(device, block, generation)?;
+        Ok(true)
     }
 
-    /// A cache for the block at `block`, named by its pages' runs with no view
-    /// ([`super::surface_pages`]): `runs` in the surface's order, and `unmade`, which makes the
-    /// view where the platform refuses a copy by them; else as [`Self::make`].
-    #[allow(clippy::too_many_arguments)] // make's, and the runs
-    pub(crate) fn make_by_runs(
-        &mut self,
-        device: &P::Device,
-        block: u64,
-        runs: Vec<Range<u64>>,
-        unmade: Arc<Unmade<P>>,
-        host_pages: Vec<Range<u64>>,
-        generation: u64,
-        layout: Option<Vec<PagesPlane>>,
-    ) -> RaiseResult<bool> {
-        let length = unmade.length();
-        self.make_with(
-            device,
-            block,
-            length,
-            host_pages,
-            generation,
-            layout,
-            || Ok(Some(CachePages::Runs { runs, unmade })),
-        )
-    }
-
-    /// [`Self::make`] of a cache of `length` bytes whose copies' other end `pages` makes, its
-    /// surface laid out as `layout` where the kext's ask gave it.
-    #[allow(clippy::too_many_arguments)] // make's, and what makes the pages
+    /// [`Caches::make`] under the caches' lock, of a cache of `length` bytes, its surface laid
+    /// out as `layout` where the kext's ask gave it: a block that keeps its cache
+    /// ([`Self::keeps`]) has it filled again ([`Self::named_again`]) and takes nothing of `made`;
+    /// any other cache it had goes as at a release ([`SurfaceCaches::released`]), and the cache
+    /// `made` with the lock let go of ([`CacheMaker::make`]) is taken, its first fill owed as of
+    /// `generation`. What is not taken stays in `made`, for the caller to let go of with the lock
+    /// let go of.
+    #[allow(clippy::too_many_arguments)] // make's, and what was made
     fn make_with(
         &mut self,
         device: &P::Device,
@@ -1096,25 +1070,22 @@ impl<P: Platform> SurfaceCaches<P> {
         host_pages: Vec<Range<u64>>,
         generation: u64,
         layout: Option<Vec<PagesPlane>>,
-        pages: impl FnOnce() -> RaiseResult<Option<CachePages<P>>>,
+        made: &mut Option<RaiseResult<Made<P>>>,
     ) -> RaiseResult<bool> {
-        if let Some(cache) = self.by_block.get(&block) {
-            let same = cache.length == length
-                && (self.watched.0.lock().get(&block)).is_some_and(|p| p.runs == host_pages);
-            if same {
-                if self.written_since_host(block) {
-                    self.write_back(device, block, Box::new(|| {}))?;
-                }
-                self.fill_named_again(device, block, generation)?;
-                return Ok(true);
-            }
+        if self.keeps(block, length, &host_pages) {
+            return self.named_again(device, block, generation);
+        }
+        if self.by_block.contains_key(&block) {
             self.released(device, block, 0, None, None, Box::new(|| {}))?;
         }
-        let aligned = layout.as_deref().and_then(aligned_byte);
-        let Some((cache, life)) = self.new_cache(device, length, layout.is_some(), aligned)? else {
+        let Some(made) = made.take() else {
             return Ok(false);
         };
-        let Some(pages) = pages()? else {
+        let Made { cache, pages } = made?;
+        let Some((cache, life)) = cache.take(&mut self.counts) else {
+            return Ok(false);
+        };
+        let Some(pages) = pages else {
             return Ok(false);
         };
         let Some(filled_at) = self.zero(device, &cache, length)? else {
@@ -1300,16 +1271,18 @@ impl<P: Platform> SurfaceCaches<P> {
 
     /// A cache of zeros for the deferred block at `block` (the module doc), of `length` bytes,
     /// at the CPU's generation 0, its block `block_size` bytes, its surface laid out as `layout`
-    /// where its ask gave it (a device that shares the CPU's memory: [`Self::make`]'s caches of a
-    /// layout): zeroed on the transfer queue, whose fill every use of it waits for. Where it
-    /// `carried` pages (their host addresses in the guest's RAM `host_pages`), it owes a first
-    /// fill of them at generation 0, as a new cache owes one of its pages ([`Self::make`]),
-    /// which the zeroing comes before on the same queue, and their pages are watched until the
-    /// block's are named. `Ok(false)`, with no cache, where the deferred caches' budget has no
-    /// room for it, or the platform made no buffer or no transfer queue for it. A cache the
-    /// block had goes first, as at a release ([`SurfaceCaches::released`]).
-    #[allow(clippy::too_many_arguments)] // the deferral's, and its carried pages
-    pub(crate) fn make_deferred(
+    /// where its ask gave it (a device that shares the CPU's memory: [`Caches::make`]'s caches
+    /// of a layout): the cache `made` with the caches' lock let go of ([`Caches::make_deferred`]),
+    /// zeroed on the transfer queue, whose fill every use of it waits for. Where it `carried`
+    /// pages (their host addresses in the guest's RAM `host_pages`), it owes a first fill of them
+    /// at generation 0, as a new cache owes one of its pages ([`Caches::make`]), which the
+    /// zeroing comes before on the same queue, and their pages are watched until the block's are
+    /// named. `Ok(false)`, with no cache, where the deferred caches' budget has no room for it
+    /// now (what was made then stays in `made`, for the caller to let go of with the lock let go
+    /// of), or the platform made no buffer or no transfer queue for it. A cache the block had
+    /// goes first, as at a release ([`SurfaceCaches::released`]).
+    #[allow(clippy::too_many_arguments)] // the deferral's, its carried pages, and what was made
+    fn make_deferred(
         &mut self,
         device: &P::Device,
         block: u64,
@@ -1318,16 +1291,15 @@ impl<P: Platform> SurfaceCaches<P> {
         layout: Option<Vec<PagesPlane>>,
         carried: Option<CarriedPages>,
         host_pages: Vec<Range<u64>>,
+        made: &mut Option<RaiseResult<NewCache<P>>>,
     ) -> RaiseResult<bool> {
         if self.by_block.contains_key(&block) {
             self.released(device, block, 0, None, None, Box::new(|| {}))?;
         }
         let room = self.deferred_budget.saturating_sub(self.deferred_bytes);
-        let aligned = layout.as_deref().and_then(aligned_byte);
-        let made = if length <= room {
-            self.new_cache(device, length, layout.is_some(), aligned)?
-        } else {
-            None
+        let made = match made.take_if(|_| length <= room) {
+            Some(new) => new?.take(&mut self.counts),
+            None => None,
         };
         let zeroed = match &made {
             Some((cache, _)) => self.zero(device, cache, length)?,
@@ -1424,7 +1396,7 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The pages of the deferred block at `block`, `named` by a view or by their runs, whose host
-    /// addresses in the guest's RAM are `host_pages` ([`Self::make`]), taken for its cache, which
+    /// addresses in the guest's RAM are `host_pages` ([`Caches::make`]), taken for its cache, which
     /// keeps its bytes, its generation and whether a buffer wrote it: `Some(true)`; `Some(false)`
     /// where they are fewer than the cache's bytes or the platform made no buffer over the view,
     /// the block keeping none; `None` where the block has no deferred cache whose pages are not
@@ -1465,7 +1437,7 @@ impl<P: Platform> SurfaceCaches<P> {
     }
 
     /// The pages of the deferred block at `block`, `copied` from the guest's RAM, whose host
-    /// addresses are `host_pages` ([`Self::make`]), taken for its cache where the host made no
+    /// addresses are `host_pages` ([`Caches::make`]), taken for its cache where the host made no
     /// view of them or no buffer over it (`CachePages::Copied`), as [`Self::attach`] takes them:
     /// `Some(true)`; `Some(false)` where they hold fewer bytes than the cache; `None` where the
     /// block has no deferred cache whose pages are not named.
@@ -1562,69 +1534,23 @@ impl<P: Platform> SurfaceCaches<P> {
         Some(life.identity())
     }
 
-    /// A new cache's buffer of `length` bytes, Private: exportable where the host's video
-    /// imports caches ([`Caches::set_exportable`]) and the platform makes one; else, where
-    /// `laid_out` and the host's video decodes into caches ([`Caches::set_dma_buf`]), one whose
-    /// memory is also a dma-buf, laid as the next is, where the platform makes one; else, where
-    /// `laid_out` (the kext's ask gave the surface's layout, so the cache's copies into the pages
-    /// take its texels alone: [`SurfaceCache::texels`]), one that declares the bytes between a
-    /// texture's rows unobserved, which a texture over the cache whose rows lie with bytes
-    /// between them may hold and change in place, with its byte `aligned` on a multiple of 256
-    /// bytes of its memory where given ([`aligned_byte`]), so that textures over its surface's
-    /// planes lie in it rather than in copies of their own
-    /// ([`GpuDevice::new_buffer_of_length_padding_unobserved`]); else as any other buffer. An
-    /// exportable cache is made as the platform makes one, its first byte where the platform puts
-    /// it. With the buffer, the cache's life where its memory was made for the host's video,
-    /// exportable or a dma-buf ([`SurfaceCache::life`]).
-    fn new_cache(
-        &mut self,
-        device: &P::Device,
-        length: u64,
-        laid_out: bool,
-        aligned: Option<u64>,
-    ) -> RaiseResult<Option<(P::Buffer, Option<MemoryLife>)>> {
-        #[cfg(unix)]
-        if self.exportable {
-            let made = device.new_exportable_buffer_of_length(ON, length, STORAGE_PRIVATE)?;
-            if let Some(cache) = made {
-                self.counts.exportable += 1;
-                return Ok(Some((cache, Some(MemoryLife::new()))));
-            }
-            self.counts.unexportable += 1;
+    /// How a new cache's buffer is made as the caches are set now ([`CacheMaker::make`]), with
+    /// their lock let go of.
+    fn maker(&self) -> CacheMaker {
+        CacheMaker {
+            exportable: self.exportable,
+            dma_buf: self.dma_buf,
         }
-        #[cfg(unix)]
-        if self.dma_buf && laid_out {
-            let made = device.new_dma_buf_buffer_of_length_padding_unobserved(
-                ON,
-                length,
-                STORAGE_PRIVATE,
-                aligned,
-            )?;
-            if let Some(cache) = made {
-                self.counts.dma_buf += 1;
-                if aligned.is_some() {
-                    self.counts.aligned += 1;
-                }
-                return Ok(Some((cache, Some(MemoryLife::new()))));
-            }
-            self.counts.no_dma_buf += 1;
-        }
-        let made = match laid_out {
-            true => {
-                let made = device.new_buffer_of_length_padding_unobserved(
-                    ON,
-                    length,
-                    STORAGE_PRIVATE,
-                    aligned,
-                )?;
-                if aligned.is_some() && made.is_some() {
-                    self.counts.aligned += 1;
-                }
-                made
-            }
-            false => device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)?,
-        };
-        Ok(made.map(|cache| (cache, None)))
+    }
+
+    /// The room the deferred caches' budget has for the deferred block at `block`'s cache, the
+    /// cache the block has going first ([`Self::make_deferred`]).
+    fn deferred_room(&self, block: u64) -> u64 {
+        let going = (self.by_block.get(&block))
+            .filter(|cache| cache.deferred.is_some())
+            .map_or(0, |cache| cache.length);
+        let held = self.deferred_bytes.saturating_sub(going);
+        self.deferred_budget.saturating_sub(held)
     }
 
     /// Whether the block at `block` has a cache.
@@ -2935,12 +2861,136 @@ impl<P: Platform> SurfaceCaches<P> {
 /// message waits on the CPU for another buffer's walk, but where the platform makes no event
 /// (then the begin waits there for the copy before counting its uses, as it did for the
 /// buffers), a decode of the host's for its output's fill ([`Self::wait_filled`]), and the
-/// block's pages named again.
+/// block's pages named again. Nor does one wait for a cache's make: a new cache's buffer, and the
+/// buffer over its pages, are made with the lock let go of ([`CacheMaker`]), and only taken under
+/// it.
 pub(crate) struct Caches<P: Platform> {
     state: Mutex<SurfaceCaches<P>>,
     moved: Condvar,
     /// What each fill tells as it finishes ([`Self::on_fill_done`]).
     on_fill_done: Arc<OnceLock<FillHook>>,
+}
+
+/// How a new cache's buffer is made ([`SurfaceCaches::maker`]): read under the caches' lock and
+/// used with it let go of, as a new block of the device's memory may take tens of milliseconds
+/// (**measured** 2026-11-09, a macOS 26.7.2 guest's Safari scroll on a Radeon 780M: each 64 MiB
+/// block of 7.125 MiB dma-buf caches, every 8th cache, took 8 to 28 ms), and every queue's begin
+/// takes that lock ([`Caches::before_answering`]).
+#[derive(Clone, Copy, Debug)]
+struct CacheMaker {
+    /// Caches are made exportable, for the host's video to import ([`Caches::set_exportable`]).
+    exportable: bool,
+    /// Laid-out caches are made with their memory a dma-buf ([`Caches::set_dma_buf`]).
+    dma_buf: bool,
+}
+
+impl CacheMaker {
+    /// A new cache's buffer of `length` bytes, Private: exportable where the host's video
+    /// imports caches ([`Caches::set_exportable`]) and the platform makes one; else, where
+    /// `laid_out` and the host's video decodes into caches ([`Caches::set_dma_buf`]), one whose
+    /// memory is also a dma-buf, laid as the next is, where the platform makes one; else, where
+    /// `laid_out` (the kext's ask gave the surface's layout, so the cache's copies into the pages
+    /// take its texels alone: [`SurfaceCache::texels`]), one that declares the bytes between a
+    /// texture's rows unobserved, which a texture over the cache whose rows lie with bytes
+    /// between them may hold and change in place, with its byte `aligned` on a multiple of 256
+    /// bytes of its memory where given ([`aligned_byte`]), so that textures over its surface's
+    /// planes lie in it rather than in copies of their own
+    /// ([`GpuDevice::new_buffer_of_length_padding_unobserved`]); else as any other buffer. An
+    /// exportable cache is made as the platform makes one, its first byte where the platform puts
+    /// it. With the buffer, the cache's life where its memory was made for the host's video,
+    /// exportable or a dma-buf ([`SurfaceCache::life`]).
+    fn make<P: Platform>(
+        self,
+        device: &P::Device,
+        length: u64,
+        laid_out: bool,
+        aligned: Option<u64>,
+    ) -> RaiseResult<NewCache<P>> {
+        let mut counts = MakerCounts::default();
+        let life = || Some(MemoryLife::new());
+        #[cfg(unix)]
+        if self.exportable {
+            let made = device.new_exportable_buffer_of_length(ON, length, STORAGE_PRIVATE)?;
+            if let Some(cache) = made {
+                counts.exportable = true;
+                return Ok(NewCache::new(Some((cache, life())), counts));
+            }
+            counts.unexportable = true;
+        }
+        #[cfg(unix)]
+        if self.dma_buf && laid_out {
+            let made = device.new_dma_buf_buffer_of_length_padding_unobserved(
+                ON,
+                length,
+                STORAGE_PRIVATE,
+                aligned,
+            )?;
+            if let Some(cache) = made {
+                counts.dma_buf = true;
+                counts.aligned = aligned.is_some();
+                return Ok(NewCache::new(Some((cache, life())), counts));
+            }
+            counts.no_dma_buf = true;
+        }
+        let made = match laid_out {
+            true => {
+                let made = device.new_buffer_of_length_padding_unobserved(
+                    ON,
+                    length,
+                    STORAGE_PRIVATE,
+                    aligned,
+                )?;
+                counts.aligned = aligned.is_some() && made.is_some();
+                made
+            }
+            false => device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)?,
+        };
+        Ok(NewCache::new(made.map(|cache| (cache, None)), counts))
+    }
+}
+
+/// What a cache's make counts ([`CacheCounts`]'s `exportable`, `unexportable`, `dma_buf`,
+/// `no_dma_buf` and `aligned`), added as the cache is taken ([`NewCache::take`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct MakerCounts {
+    exportable: bool,
+    unexportable: bool,
+    dma_buf: bool,
+    no_dma_buf: bool,
+    aligned: bool,
+}
+
+/// A new cache's buffer made with the caches' lock let go of ([`CacheMaker::make`]), with its
+/// life where its memory was made for the host's video, and what its make counts. One the caches
+/// do not take is let go of by the caller once it has let go of their lock.
+pub(crate) struct NewCache<P: Platform> {
+    made: Option<(P::Buffer, Option<MemoryLife>)>,
+    counts: MakerCounts,
+}
+
+impl<P: Platform> NewCache<P> {
+    fn new(made: Option<(P::Buffer, Option<MemoryLife>)>, counts: MakerCounts) -> Self {
+        NewCache { made, counts }
+    }
+
+    /// The buffer and its life, `None` where the platform made none; its make counted into
+    /// `counts`.
+    fn take(self, counts: &mut CacheCounts) -> Option<(P::Buffer, Option<MemoryLife>)> {
+        let made = self.counts;
+        counts.exportable += u64::from(made.exportable);
+        counts.unexportable += u64::from(made.unexportable);
+        counts.dma_buf += u64::from(made.dma_buf);
+        counts.no_dma_buf += u64::from(made.no_dma_buf);
+        counts.aligned += u64::from(made.aligned);
+        self.made
+    }
+}
+
+/// A new cache made with the caches' lock let go of ([`Caches::make`]): its buffer, and the other
+/// end of its copies, made where the buffer was.
+pub(crate) struct Made<P: Platform> {
+    cache: NewCache<P>,
+    pages: Option<CachePages<P>>,
 }
 
 /// The blocks a begin answered before its fills holds ([`Caches::before_answering`]), let go of as
@@ -3664,8 +3714,25 @@ impl<P: Platform> Caches<P> {
         state.released(device, block, 0, None, None, done)
     }
 
-    /// A cache for the block at `block` ([`SurfaceCaches::make`]), after every command buffer
-    /// begun and not finished that may write the cache it had, and the copies of it asked.
+    /// A cache for the block at `block`, whose surface's pages `view` maps: `Ok(false)` where
+    /// the platform made no buffer for it, and the block keeps its view. `host_pages` are the
+    /// pages' host addresses in the guest's RAM, [`device_writes::sorted`], which the host's
+    /// devices' writes are watched over. A new cache is made as zeros on the transfer queue, and
+    /// owes its first fill from the pages as of `generation`, the CPU's generation of the surface
+    /// in the block's header (the module doc, "Fill"); `Ok(false)` too where the platform made no
+    /// command buffer for the zeros, as for no buffer: no cache holds what the GPU's memory held
+    /// before.
+    ///
+    /// A block that has a cache keeps it where its pages are the same, filled again from them as
+    /// of `generation` ([`Self::fill_named_again`]), as the kext's generations of the surface may
+    /// count anew; any other goes as at a release ([`SurfaceCaches::released`]). Either way what a buffer wrote of the cache is
+    /// copied into the pages first. (The kext names a block's pages once, before any process
+    /// holds it, and a block's offset is given out again only once its release is answered.)
+    ///
+    /// It follows every command buffer begun and not finished that may write the cache the block
+    /// had, and the copies of it asked. The cache's buffer, and the buffer over `view` its copies
+    /// take, are made with the caches' lock let go of ([`CacheMaker`]), and taken under it
+    /// ([`SurfaceCaches::make_with`]).
     pub(crate) fn make(
         &self,
         device: &P::Device,
@@ -3675,14 +3742,61 @@ impl<P: Platform> Caches<P> {
         generation: u64,
         layout: Option<Vec<PagesPlane>>,
     ) -> RaiseResult<bool> {
+        let length = view.length();
+        let pages =
+            || buffer_over(device, view, 0, length, 0, None).map(|b| b.map(CachePages::View));
+        self.make_with(device, block, length, host_pages, generation, layout, pages)
+    }
+
+    /// [`Self::make`] of a cache of `length` bytes whose copies' other end `pages` makes, its
+    /// surface laid out as `layout` where the kext's ask gave it: a block that keeps its cache
+    /// has it filled again under the lock ([`SurfaceCaches::keeps`]); for any other the cache's
+    /// buffer, and then `pages`, are made with the lock let go of and taken under it, and what was
+    /// not taken is let go of once the lock is let go of again.
+    #[allow(clippy::too_many_arguments)] // make's, and what makes the pages
+    fn make_with(
+        &self,
+        device: &P::Device,
+        block: u64,
+        length: u64,
+        host_pages: Vec<Range<u64>>,
+        generation: u64,
+        layout: Option<Vec<PagesPlane>>,
+        pages: impl FnOnce() -> RaiseResult<Option<CachePages<P>>>,
+    ) -> RaiseResult<bool> {
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
-        state.make(device, block, view, host_pages, generation, layout)
+        if state.keeps(block, length, &host_pages) {
+            return state.named_again(device, block, generation);
+        }
+        let maker = state.maker();
+        drop(state);
+        let aligned = layout.as_deref().and_then(aligned_byte);
+        let made = (maker.make::<P>(device, length, layout.is_some(), aligned)).and_then(|cache| {
+            let pages = match cache.made.is_some() {
+                true => pages()?,
+                false => None,
+            };
+            Ok(Made { cache, pages })
+        });
+        let mut made = Some(made);
+        let mut state = self.state.lock();
+        self.wait_copies(&mut state, block);
+        let taken = state.make_with(
+            device, block, length, host_pages, generation, layout, &mut made,
+        );
+        drop(state);
+        drop(made);
+        taken
     }
 
     /// A cache of zeros for the deferred block at `block` ([`SurfaceCaches::make_deferred`]),
     /// carrying `carried` where given, after every command buffer begun and not finished that may
-    /// write the cache it had, and the copies of it asked.
+    /// write the cache it had, and the copies of it asked. Its buffer is made with the caches'
+    /// lock let go of ([`CacheMaker`]), where the deferred caches' budget has room for it then
+    /// ([`SurfaceCaches::deferred_room`]), and taken under the lock where the budget still has
+    /// room for it: one made while other deferrals took that room is refused as a deferral
+    /// without room is, and its buffer let go of once the lock is let go of.
     #[allow(clippy::too_many_arguments)] // the deferral's, and its carried pages
     pub(crate) fn make_deferred(
         &self,
@@ -3694,11 +3808,21 @@ impl<P: Platform> Caches<P> {
         carried: Option<CarriedPages>,
         host_pages: Vec<Range<u64>>,
     ) -> RaiseResult<bool> {
+        let (room, maker) = {
+            let state = self.state.lock();
+            (state.deferred_room(block), state.maker())
+        };
+        let aligned = layout.as_deref().and_then(aligned_byte);
+        let mut made =
+            (length <= room).then(|| maker.make::<P>(device, length, layout.is_some(), aligned));
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
-        state.make_deferred(
-            device, block, length, block_size, layout, carried, host_pages,
-        )
+        let taken = state.make_deferred(
+            device, block, length, block_size, layout, carried, host_pages, &mut made,
+        );
+        drop(state);
+        drop(made);
+        taken
     }
 
     /// The deferred block at `block`'s pages taken for its cache ([`SurfaceCaches::attach`]),
@@ -3713,9 +3837,9 @@ impl<P: Platform> Caches<P> {
         self.state.lock().attach(device, block, named, host_pages)
     }
 
-    /// A cache for the block at `block` named by its runs ([`SurfaceCaches::make_by_runs`]),
-    /// after every command buffer begun and not finished that may write the cache it had, and the
-    /// copies of it asked.
+    /// A cache for the block at `block`, named by its pages' runs with no view
+    /// ([`super::surface_pages`]): `runs` in the surface's order, and `unmade`, which makes the
+    /// view where the platform refuses a copy by them; else as [`Self::make`].
     #[allow(clippy::too_many_arguments)] // make's, and the runs
     pub(crate) fn make_by_runs(
         &self,
@@ -3727,9 +3851,9 @@ impl<P: Platform> Caches<P> {
         generation: u64,
         layout: Option<Vec<PagesPlane>>,
     ) -> RaiseResult<bool> {
-        let mut state = self.state.lock();
-        self.wait_copies(&mut state, block);
-        state.make_by_runs(device, block, runs, unmade, host_pages, generation, layout)
+        let length = unmade.length();
+        let pages = || Ok(Some(CachePages::Runs { runs, unmade }));
+        self.make_with(device, block, length, host_pages, generation, layout, pages)
     }
 
     /// A buffer over the block at `block` made in `context`, its cache the buffer
@@ -4143,7 +4267,9 @@ mod tests {
     use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
     use reims_vgpu_vulkan::core::testkit::calllog::{Arg, Call};
+    use reims_vgpu_vulkan::core::testkit::faults::Fault;
     use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
+    use reims_vgpu_vulkan::core::testkit::script::HeldCall;
     use zerocopy::IntoBytes;
 
     use super::super::surface_pages::tests::{BLOCK, RAM, Rig, rig};
@@ -7099,6 +7225,125 @@ mod tests {
         r.dec.set_deferred_budget(budget * r.page);
         queues(&mut r);
         r
+    }
+
+    /// The `SURFACE_PAGES` of the deferred block at `block`, of `length` bytes and no runs, as
+    /// [`defer`] sends it.
+    fn deferral(block: u64, length: u64) -> RgfxSurfacePages {
+        RgfxSurfacePages {
+            header: RgfxMsgHeader {
+                r#type: reims_vgpu_graphics::wire::RGFX_CMD_SURFACE_PAGES,
+                size: size_of::<RgfxSurfacePages>() as u32,
+                seqno: 0,
+            },
+            context: 0,
+            run_count: 0,
+            block_offset: block,
+            block_size: 0x2000,
+            runs_offset: block + 0x1000,
+            length,
+        }
+    }
+
+    /// Holds the next cache's buffer the platform is asked to make (one of no layout, made as
+    /// any buffer), as the driver holds a make that takes a new block of the device's memory:
+    /// the hold.
+    fn hold_next_cache_make(r: &Rig) -> HeldCall {
+        let made = HeldCall::new();
+        r.p.faults().at(
+            "MTLDevice",
+            "newBufferWithLength:options:",
+            0,
+            Fault::Hold(made.clone()),
+        );
+        made
+    }
+
+    /// A cache's buffer is made with the caches' lock let go of: while the platform holds a
+    /// deferred block's make, as a driver holds one that takes a new block of the device's
+    /// memory (8 to 28 ms on a Radeon 780M), a command buffer that names another block's cache is
+    /// decoded, rather than waiting for the make to end; the deferral then gets its cache
+    #[test]
+    fn a_begin_waits_for_no_cache_s_make() {
+        let r = cached();
+        let page = r.page;
+        r.dec.set_deferred_budget(8 * page);
+        let made = hold_next_cache_make(&r);
+        let deferred = BLOCK + 0x8000;
+        let m = deferral(deferred, 2 * page);
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+        let message = surfaces_message(1, 0x100, &[(BLOCK, 0, false)], true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let answer = std::thread::scope(|scope| {
+            let deferring = r.dec.sender(None, super::super::Sinks::default());
+            let device = r.device.clone_ref();
+            let deferral = scope
+                .spawn(move || deferring.surface_pages_laid_out(&device, &m, &[], flags, None));
+            assert!(
+                made.reached(std::time::Duration::from_secs(5)),
+                "the deferral's cache is being made"
+            );
+            let mut begin = r.dec.sender(None, super::super::Sinks::default());
+            let device = r.device.clone_ref();
+            scope.spawn(move || tx.send(begin.decode(&device, &message).unwrap()).unwrap());
+            let decoded = rx.recv_timeout(std::time::Duration::from_secs(2));
+            made.open();
+            assert_eq!(decoded, Ok(Ok(())), "decoded while the make was held");
+            deferral.join().unwrap()
+        });
+        assert_eq!(answer, RGFX_STATUS_OK, "the deferral's answer");
+        let caches = r.dec.caches();
+        assert!(caches.has(deferred), "its cache, taken once made");
+        assert_eq!(caches.counts().deferred, 1);
+    }
+
+    /// A deferred block's cache is made where the deferred caches' budget has room for it, with
+    /// the caches' lock let go of, and taken under it where the budget still has room: one whose
+    /// room another deferral took while it was made is refused, as a deferral without room is,
+    /// counted, and its buffer let go of; the other keeps its cache
+    #[test]
+    fn a_deferral_whose_room_went_while_its_cache_was_made_is_refused() {
+        let r = deferring(2);
+        let page = r.page;
+        let buffers = r.p.world().live("MTLBuffer").len();
+        let made = hold_next_cache_make(&r);
+        let (first, second) = (BLOCK, BLOCK + 0x8000);
+        let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let answers = std::thread::scope(|scope| {
+            let deferring = r.dec.sender(None, super::super::Sinks::default());
+            let device = r.device.clone_ref();
+            let m = deferral(first, 2 * page);
+            let held = scope
+                .spawn(move || deferring.surface_pages_laid_out(&device, &m, &[], flags, None));
+            assert!(
+                made.reached(std::time::Duration::from_secs(5)),
+                "the first deferral's cache is being made"
+            );
+            // The second takes the budget's room meanwhile, its own make not held.
+            let deferring = r.dec.sender(None, super::super::Sinks::default());
+            let device = r.device.clone_ref();
+            let m = deferral(second, 2 * page);
+            scope.spawn(move || {
+                let answer = deferring.surface_pages_laid_out(&device, &m, &[], flags, None);
+                tx.send(answer).unwrap();
+            });
+            let second_answer = rx.recv_timeout(std::time::Duration::from_secs(2));
+            made.open();
+            (held.join().unwrap(), second_answer)
+        });
+        assert_eq!(answers, (RGFX_STATUS_REFUSED, Ok(RGFX_STATUS_OK)));
+        let caches = r.dec.caches();
+        assert!(!caches.has(first), "no cache for the refused deferral");
+        assert!(caches.has(second));
+        let counts = caches.counts();
+        assert_eq!((counts.deferred, counts.deferred_refused), (1, 1));
+        drop(caches);
+        assert_eq!(
+            r.p.world().live("MTLBuffer").len(),
+            buffers + 1,
+            "the second's cache alone: the refused one's buffer let go of"
+        );
     }
 
     /// Command queues 1 and 2.
