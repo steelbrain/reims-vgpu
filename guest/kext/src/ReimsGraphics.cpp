@@ -8,6 +8,7 @@
 #include "RgfxBootConsole.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxPipeColor.hpp"
+#include "RgfxRegionMapping.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -169,6 +170,7 @@ UInt32 ReimsGraphics::readRegister(UInt32 offset) const
 
 void ReimsGraphics::writeRegister(UInt32 offset, UInt32 value)
 {
+	rgfxRegisterWriteBarrier();
 	*reinterpret_cast<volatile UInt32 *>(registers + offset) = value;
 }
 

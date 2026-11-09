@@ -22,6 +22,7 @@
 #include "RgfxFeatures.hpp"
 #include "RgfxIOSurfaceKPI.hpp"
 #include "RgfxPciClass.hpp"
+#include "RgfxRegionMapping.hpp"
 #include "RgfxSurfaceRows.hpp"
 #include "RgfxTrace.hpp"
 #include "RgfxVideoCodecs.hpp"
@@ -295,6 +296,7 @@ UInt32 RgfxAccelerator::readRegister(UInt32 offset) const
 
 void RgfxAccelerator::writeRegister(UInt32 offset, UInt32 value)
 {
+	rgfxRegisterWriteBarrier();
 	*reinterpret_cast<volatile UInt32 *>(registers + offset) = value;
 }
 

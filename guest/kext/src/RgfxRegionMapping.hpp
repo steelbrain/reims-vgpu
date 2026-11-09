@@ -38,4 +38,16 @@ constexpr bool kRgfxRegionWriteCombines = true;
 constexpr uint64_t kRgfxKextFeatureRegionWriteCombined =
     kRgfxRegionWriteCombines ? kRgfxKextFeatureWriteCombined : 0;
 
+// Before a store to the device's registers (a doorbell, a status): orders every store before it,
+// the region's among them, before the register's store for the device. On arm64 the region's
+// release stores and fences order them for the guest's CPUs alone (inner shareable), and the
+// device is no CPU of the guest's, so the register's store takes a DMB OSHST first, as Linux's
+// writel does. x86-64 keeps every store in order, and takes nothing.
+inline void rgfxRegisterWriteBarrier()
+{
+#if RGFX_GUEST_ARM64
+	__builtin_arm_dmb(2); // DMB OSHST
+#endif
+}
+
 #endif // RGFX_REGION_MAPPING_HPP_
