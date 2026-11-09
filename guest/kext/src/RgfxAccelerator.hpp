@@ -480,16 +480,19 @@ public:
 	// deferred block's attach, or the pages of a block its ask meant to defer. With `layout`, a
 	// device that answers which surfaces need a cache is asked first
 	// (RGFX_SURFACE_PAGES_ASK_CACHE): answered OK, the pages are named in place, `*inPlace` set;
-	// answered RGFX_STATUS_CACHE, they are posted again with `flags`. Named, the device answered
-	// OK, `memory` wired, and the runs in `*runs` (IOMalloc'd, `*count` of them, the caller's)
-	// where asked for; not named, `memory` as it was; unanswered, `memory` left wired once more,
-	// which the caller keeps until the block's release is answered OK, the host free to take the
-	// pages yet (rgfxPagesNaming). Under no lock of the kext's.
+	// answered RGFX_STATUS_CACHE, they are posted again with `flags`. Posted with `flags` alone,
+	// the message carries `carriedLayout` where given, the surface's layout for a cached block on a
+	// device that asks nothing (rgfxPagesCarryLayout). Named, the device answered OK, `memory`
+	// wired, and the runs in `*runs` (IOMalloc'd, `*count` of them, the caller's) where asked for;
+	// not named, `memory` as it was; unanswered, `memory` left wired once more, which the caller
+	// keeps until the block's release is answered OK, the host free to take the pages yet
+	// (rgfxPagesNaming). Under no lock of the kext's.
 	RgfxPagesNaming attachSurfacePages(UInt32 context, UInt64 offset, UInt64 size, UInt64 length,
 	                                   IOMemoryDescriptor *memory, UInt32 flags,
 	                                   RgfxPageRun **runs, UInt32 *count,
 	                                   const RgfxSurfacePagesLayout *layout = nullptr,
-	                                   bool *inPlace = nullptr);
+	                                   bool *inPlace = nullptr,
+	                                   const RgfxSurfacePagesLayout *carriedLayout = nullptr);
 	IOReturn releaseSurfaceBlock(RgfxAcceleratorUserClient *client, UInt64 offset);
 	void dropSurfaceBlocks(const void *client, bool closed);
 	// The processes' object lifecycle, on the framebuffer's control ring
@@ -619,8 +622,9 @@ private:
 	// A fresh block in place's SURFACE_PAGES (RgfxAcceleratorContexts.cpp): its `count` runs of
 	// the surface's `length` bytes written at `size` bytes into the block of `total` bytes at
 	// `offset`, and posted for context `context`, its block cached where `cached`, else asking
-	// whether it needs a device cache with `layout` where given; true where the device answered
-	// OK, its status in `*status` where it answered and that is asked for.
+	// whether it needs a device cache with `layout` where given, which a cached block's carries
+	// too where given (rgfxPagesCarryLayout); true where the device answered OK, its status in
+	// `*status` where it answered and that is asked for.
 	bool postSurfacePages(UInt32 context, UInt64 offset, UInt64 total, UInt64 size,
 	                      UInt64 length, const RgfxPageRun *runs, UInt32 count, bool cached,
 	                      const RgfxSurfacePagesLayout *layout = nullptr,
@@ -628,7 +632,7 @@ private:
 	// SURFACE_PAGES of the block of `total` bytes at `offset` made for context `context`: its
 	// `count` runs of `length` bytes at region offset `runsOffset`, already written, with
 	// `flags` (RGFX_SURFACE_PAGES_*, none sent where 0) and `layout` after them where given
-	// (RGFX_SURFACE_PAGES_ASK_CACHE). kIOReturnSuccess where the device answered OK,
+	// (rgfxPagesCarryLayout). kIOReturnSuccess where the device answered OK,
 	// kIOReturnUnsupported where it answered otherwise, its status in `*status` where asked for,
 	// else why it did not answer.
 	IOReturn postPages(UInt32 context, UInt64 offset, UInt64 total, UInt64 runsOffset,
@@ -637,12 +641,13 @@ private:
 	// The new deferred block of entry `e`, pending, held by its asker of context `context` alone,
 	// `total` bytes with its runs' room, its surface laid out as `layout`: makes its surface's
 	// device cache and reads the surface (rgfxSurfaceLocksDefer); fresh, asks the host to defer
-	// it, with the layout where the device answers which surfaces need a cache (askCache); not
-	// fresh, refused or with no cache, names its pages now, asking with the layout there, the
-	// entry keyed by them from then on. A surface fresh but for the resident pages its asker in
-	// `task` at `address` listed (`resident`, RgfxDeferCarry.hpp) is deferred carrying them, where
-	// its read proves them. Whether the device took the block, and `*cached` where it is cached.
-	// Not under the contexts' lock.
+	// it, with the layout where the device answers which surfaces need a cache (askCache), and
+	// carrying it where the device asks nothing, its block cached (rgfxPagesCarryLayout); not
+	// fresh, refused or with no cache, names its pages now, asking with the layout there, or
+	// carrying it, the entry keyed by them from then on. A surface fresh but for the resident
+	// pages its asker in `task` at `address` listed (`resident`, RgfxDeferCarry.hpp) is deferred
+	// carrying them, where its read proves them. Whether the device took the block, and `*cached`
+	// where it is cached. Not under the contexts' lock.
 	bool deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uint32_t surfaceId, UInt64 total,
 	                       const RgfxSurfacePagesLayout *layout, task_t task, UInt64 address,
 	                       const RgfxSurfaceResident *resident, bool *cached);

@@ -827,7 +827,8 @@ pub const RGFX_CMD_BLOCK_UNSHARE: u32 = 0x2f5;
 /// gives a surface whose pages were refused a block that holds a copy of them instead. Where the
 /// device has [`RGFX_FEATURE_SURFACE_CACHE`], an [`RgfxSurfacePagesCache`] may follow the message
 /// at [`RGFX_SURFACE_PAGES_CACHE_OFFSET`], whose [`RGFX_SURFACE_PAGES_CACHED`] gives the block a
-/// device cache.
+/// device cache, and the surface's layout may follow that, which places the cache
+/// ([`RGFX_SURFACE_PAGES_CACHED`]'s doc).
 ///
 /// Where the guest took [`RGFX_FEATURE_SURFACE_DEFERRED`], a cached block may be deferred
 /// ([`RGFX_SURFACE_PAGES_DEFERRED`]): its message has `run_count` 0, and the host makes its device
@@ -1714,7 +1715,15 @@ pub const RGFX_SURFACE_PAGES_CACHE_OFFSET: u32 = 56;
 /// [`RGFX_FEATURE_SURFACE_CACHE`]: its `BUFFER_OVER_SURFACE_PAGES` buffers lie over the cache, every
 /// command buffer that uses the surface names it in an `RGFX_OP_SURFACE_USE` with the CPU's
 /// generation of the surface, and the kext asks a [`RGFX_CMD_SURFACE_DOWNLOAD`] before a CPU lock
-/// that follows a GPU write. Without the feature the host gives the block none.
+/// that follows a GPU write. Without the feature the host gives the block none. Where the guest
+/// took no [`RGFX_FEATURE_SURFACE_CACHE_REFUSED`], the message may carry the surface's layout, as
+/// an ask does ([`RgfxSurfacePagesLayout`] at [`RGFX_SURFACE_PAGES_LAYOUT_OFFSET`]), a deferred
+/// block's ([`RGFX_SURFACE_PAGES_DEFERRED`]) among them: the host places the cache by it alone, its
+/// surface's first plane's first byte where the host's GPU's textures over the cache may start in
+/// place (as CoreVideo lays a frame's planes 32 bytes into their surface), and answers the
+/// message as one with no layout; a message too short for it carries none, and a layout whose
+/// planes do not lie in the surface's bytes places nothing. Its copies between the cache and the
+/// pages move the surface's bytes as without it.
 pub const RGFX_SURFACE_PAGES_CACHED: u32 = 1 << 0;
 /// [`RgfxSurfacePagesCache::flags`], where the guest took [`RGFX_FEATURE_PAGES_BUFFERS`]: the
 /// block is a process's pages block, for its `BUFFER_OVER_PAGES` buffers, not an IOSurface's, and

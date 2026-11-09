@@ -449,7 +449,17 @@ Stages:
       kext marks cached (`RGFX_SURFACE_PAGES_CACHED`) gets a device cache on
       the host: a Private buffer of the surface's bytes in the pages' layout,
       which every buffer over the block is, so every texture over the
-      surface, of any shape, plane or format, lies over the same bytes. Each
+      surface, of any shape, plane or format, lies over the same bytes. The
+      block's `SURFACE_PAGES` carries the surface's `RgfxSurfacePagesLayout`
+      where the bundle gave it, a deferred block's too, and the host places
+      the cache by it alone: its first plane's first byte where the host's
+      GPU's textures over the cache may start in place, as CoreVideo lays a
+      frame's planes 32 bytes into their surface, past every linear image's
+      alignment measured (128 bytes on an RTX 5080 Laptop GPU, 256 on RADV),
+      so the textures over a decoder's planes are images of the cache's own
+      memory, not the runtime's shadows, which copy them in before each
+      command buffer's use. The answer and the copies are those of a message
+      with no layout. Each
       command buffer names the cached surfaces it uses
       (`RGFX_OP_SURFACE_USE`) with the kext's count of the surface's
       read-write locks when it was committed; the host fills the cache from

@@ -25,7 +25,8 @@
 // only where nothing but the kext holds the surface, and a lock or a new block of it met before
 // the answer marks the header's clients for the host. The wire of the pages a deferral carried is
 // held while the host may read them, is the caller's once the block's pages are named or the
-// deferral refused, and goes with the entry wherever it goes.
+// deferral refused, and goes with the entry wherever it goes. A block's SURFACE_PAGES carries its
+// surface's layout where it asks, and where it is cached on a device that asks nothing.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -932,6 +933,23 @@ void writeBack()
 
 // A block whose ask names its pages after all (deferSurfaceBlock): each wiring taken is let go
 // once, by its cache or by the asker's hold, cached or not, whatever the naming's outcome.
+// A SURFACE_PAGES carries the layout the bundle gave where it asks whether the block needs a
+// device cache, and where it names a cached block on a device that asks nothing; a cached block
+// on a device that answers asks, an uncached block on one that asks nothing, and any block with
+// no layout given carry none.
+void layoutCarried()
+{
+	check(rgfxPagesCarryLayout(true, true, false, true), "an ask carries the layout");
+	check(rgfxPagesCarryLayout(true, false, true, false),
+	      "a cached block on a device that asks nothing carries it");
+	check(!rgfxPagesCarryLayout(true, false, true, true),
+	      "a cached block on a device that answers asks carries none");
+	check(!rgfxPagesCarryLayout(true, false, false, false), "an uncached block carries none");
+	check(!rgfxPagesCarryLayout(false, true, false, true) &&
+	          !rgfxPagesCarryLayout(false, false, true, false),
+	      "no layout given: none carried");
+}
+
 void askNaming()
 {
 	const RgfxPagesNaming namings[] = {kRgfxPagesNamed, kRgfxPagesNotNamed,
@@ -1050,6 +1068,7 @@ void unheldReleases()
 
 int main()
 {
+	layoutCarried();
 	askNaming();
 	unheldReleases();
 	RgfxCachedSurface entries[2] = {};

@@ -867,4 +867,17 @@ inline bool rgfxCacheBlockLetGo(RgfxCacheTable &t, uint64_t key, uint64_t offset
 	return rgfxCacheLetGo(t, key, releasing, surface, map, wire, blockWired, carried);
 }
 
+// Whether a block's SURFACE_PAGES carries its surface's layout (RgfxSurfacePagesLayout, at
+// RGFX_SURFACE_PAGES_LAYOUT_OFFSET), the one the bundle gave with its ask (`laidOut`): an ask
+// whether the block needs a device cache (`ask`, on a device that answers it, `askCache`:
+// SURFACE_CACHE_REFUSED) carries it, and so does a cached block's (`cached`, a deferred one's
+// among them) on a device that asks nothing (SURFACE_CACHE alone), by which the host places the
+// cache's first plane where its GPU's textures over the cache may start in place, answering it as
+// with none. A cached block's on a device that answers asks carries none: its cache takes the
+// layout its ask gave. Any other carries none.
+inline bool rgfxPagesCarryLayout(bool laidOut, bool ask, bool cached, bool askCache)
+{
+	return laidOut && (ask || (cached && !askCache));
+}
+
 #endif // RGFX_SURFACE_CACHES_HPP_
