@@ -2,7 +2,7 @@
 // (ReimsGraphicsMobile.cpp): get_dot_pitch, because the class's start leaves its state unset for a
 // PCI device; set_digital_out_mode, which the class answers kIOReturnUnsupported and the
 // paravirtual display overrides to set its modes; and swap_set_color_matrix, which the class
-// answers kIOReturnUnsupported and the paravirtual display overrides to keep the matrix
+// answers kIOReturnUnsupported and the display answers 0 to show the matrix
 // (RgfxMobileColor.hpp, tests/mobile_color_test.cpp). start keeps its provider as an
 // AppleARMIODevice in one field, NULL where the provider is not one, and the class's get_dot_pitch
 // calls through that field unchecked.

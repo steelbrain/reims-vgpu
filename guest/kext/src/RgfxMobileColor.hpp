@@ -3,31 +3,29 @@
 // applies (reims_graphics_wire.h, RGFX_COLOR_MATRIX). Header-only and free of the kernel's headers,
 // so its native test (tests/mobile_color_test.cpp) builds it as the kext does.
 //
-// IOMobileFramebufferSwapSetColorMatrix(fb, matrix, function, field) sends IOMobileFramebuffer's
-// user client selector 69 a structure of 0x88 bytes: a byte at 0x00, set for no matrix; fifteen
-// signed 64-bit words from 0x08, each a float of the caller's times 2^32 rounded toward zero; the
-// function at 0x80 and the field at 0x84. The user client's s_swap_set_color_matrix passes the
-// display's swap_set_color_matrix the words (NULL where the byte is set), the function and the
-// field, ungated. The words, as the display reads them:
+// What the guest sends: IOMobileFramebufferSwapSetColorMatrix(fb, matrix, function, field) sends
+// IOMobileFramebuffer's user client selector 69 a structure of 0x88 bytes: a byte at 0x00, set for
+// no matrix; fifteen signed 64-bit words from 0x08, each a float of the caller's times 2^32
+// rounded toward zero; the function at 0x80 and the field at 0x84. The user client calls the
+// display's swap_set_color_matrix with the words (NULL where the byte is set), the function and
+// the field, outside the display's gate. The words, as the display gets them:
 //   0x00  field_00: three words
 //   0x18  the matrix's nine words, row by row: row i is output channel i's red, green and blue
 //   0x60  field_60: three words
-// (read from IOMobileFramebuffer.framework's kern_SwapSetColorMatrix and IOMobileGraphicsFamily's
-// s_swap_set_color_matrix on macOS 14.6.1, 15.6.1, 26.6.2 and 27.0.1, which lay it out alike).
-// QuartzCore's IOMFBDisplay::set_framebuffer_ax_matrix sets WindowServer's accessibility matrix so,
-// at each swap until the call succeeds, with function 2, field 0, its matrix's three rows at 0x18
-// and zeros in field_00 and field_60; it logs "IOMFB was not able to set accessibility matrix." at
-// each failure (27.0.1). IOMobileFramebufferLegacy's own swap_set_color_matrix answers
-// kIOReturnUnsupported (0xe00002c7) on each of those releases.
+// (read on macOS 14.6.1, 15.6.1, 26.6.2 and 27.0.1, which lay it out alike). WindowServer sets its
+// accessibility matrix so at each swap until the call succeeds, with function 2, field 0, its
+// matrix's three rows at 0x18 and zeros in field_00 and field_60, and logs "IOMFB was not able to
+// set accessibility matrix." at each refusal (27.0.1). IOMobileFramebufferLegacy refuses the call
+// (kIOReturnUnsupported, 0xe00002c7) on each of those releases where its subclass does not take
+// it.
 //
-// Apple's paravirtual display (27.0.1's AppleParavirtGPU, AppleParavirtDisplay) answers 0 for any
-// function and field. It keeps the nine words, or the identity for NULL, reading neither field_00
-// nor field_60, and its swap gives its host the matrix as three rows of four floats, row i's
-// first three each word converted to a double, times 2^-32, rounded to a float, and its fourth 0
-// (in its first colour remap mode). rgfxMobileColorMatrix gives the same rows, in the wire's
-// entries: out_i = row_i[0] * r + row_i[1] * g + row_i[2] * b + row_i[3]. Its conversion is integer
-// arithmetic with the same two roundings (to nearest, ties to even: a 64-bit integer to a double,
-// then a double to a float), so the kext needs no floating point.
+// What the display does with it: swap_set_color_matrix answers 0 for any function and field, and
+// shows the nine words, or the identity for NULL, reading neither field_00 nor field_60.
+// rgfxMobileColorMatrix makes them the wire's three rows of four floats, out_i = row_i[0] * r +
+// row_i[1] * g + row_i[2] * b + row_i[3]: row i's first three entries each word converted to a
+// double, times 2^-32, rounded to a float, and its fourth 0. The conversion is integer arithmetic
+// with the same two roundings (to nearest, ties to even: a 64-bit integer to a double, then a
+// double to a float), so the kext needs no floating point.
 //
 // Our own code; it depends only on the committed wire header.
 #ifndef RGFX_MOBILE_COLOR_HPP_

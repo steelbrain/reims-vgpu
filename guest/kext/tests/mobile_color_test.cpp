@@ -1,8 +1,8 @@
 // The native test of RgfxMobileColor.hpp: the DISPLAY_COLOR matrix rows the arm64 display posts for
 // the colour matrix WindowServer sets with a swap (ReimsGraphicsMobile.cpp's
-// swap_set_color_matrix), against the paravirtual display's conversion done in floating point
-// here: each word converted to a double, times 2^-32, rounded to a float. Also the override's
-// source: it converts the matrix, posts it as the matrix stage, and answers 0.
+// swap_set_color_matrix), against the same conversion done in floating point here: each word
+// converted to a double, times 2^-32, rounded to a float. Also the override's source: it converts
+// the matrix, posts it as the matrix stage, and answers 0.
 #include "RgfxMobileColor.hpp"
 
 #include <cstdio>
@@ -25,8 +25,8 @@ void check(bool ok, const char *what, const char *about)
 	}
 }
 
-// The paravirtual display's conversion, in floating point.
-uint32_t paravirtBits(int64_t word)
+// The conversion in floating point: to a double, times 2^-32, to a float.
+uint32_t floatBits(int64_t word)
 {
 	const float f = static_cast<float>(static_cast<double>(word) * 0x1p-32);
 	uint32_t bits = 0;
@@ -47,7 +47,7 @@ uint32_t bitsOf(float f)
 	return bits;
 }
 
-// Each word converts as the paravirtual display converts it: edges, the boundaries where a double
+// Each word converts as floating point converts it: edges, the boundaries where a double
 // and then a float round (ties among them), and a pseudo-random spread over every magnitude.
 void conversion()
 {
@@ -56,7 +56,7 @@ void conversion()
 	    INT64_MAX, INT64_MIN, INT64_MIN + 1, INT64_MAX - 1, int64_t(1) << 62, -(int64_t(1) << 62),
 	};
 	for (int64_t w : edges)
-		check(rgfxFixed32ToFloatBits(w) == paravirtBits(w),
+		check(rgfxFixed32ToFloatBits(w) == floatBits(w),
 		      "an edge word converts as two roundings do", "edge");
 	// Around each power of two, for the first rounding (past 53 bits) and the second (past 24):
 	// halfway points and one either side, which a single rounding gets otherwise than two.
@@ -70,7 +70,7 @@ void conversion()
 				const int64_t mid = base + (k << drop) + half;
 				for (int64_t d = -2; d <= 2; d++) {
 					for (int64_t w : {mid + d, -(mid + d)})
-						check(rgfxFixed32ToFloatBits(w) == paravirtBits(w),
+						check(rgfxFixed32ToFloatBits(w) == floatBits(w),
 						      "a word near a boundary converts as two roundings do", "tie");
 				}
 			}
@@ -82,7 +82,7 @@ void conversion()
 		x ^= x >> 7;
 		x ^= x << 17;
 		const int64_t w = static_cast<int64_t>(x) >> (x % 63);
-		check(rgfxFixed32ToFloatBits(w) == paravirtBits(w), "a word converts as two roundings do",
+		check(rgfxFixed32ToFloatBits(w) == floatBits(w), "a word converts as two roundings do",
 		      "spread");
 	}
 }
@@ -112,7 +112,7 @@ void rows()
 	for (uint32_t i = 0; i < kRgfxMobileMatrixRows; i++) {
 		const uint32_t row[4] = {r[i].x, r[i].y, r[i].z, r[i].w};
 		for (uint32_t j = 0; j < 3; j++)
-			check(row[j] == paravirtBits(wordOf(grey[j])), "row i is the matrix's row i", "grey");
+			check(row[j] == floatBits(wordOf(grey[j])), "row i is the matrix's row i", "grey");
 		check(row[3] == 0, "the fourth entry is 0", "grey");
 	}
 
@@ -148,7 +148,7 @@ std::string readFile(const char *path)
 }
 
 // The override converts the matrix, posts it as the matrix stage where the host took the colour,
-// and answers 0 whatever the post did, as the paravirtual display answers.
+// and answers 0 whatever the post did.
 void source()
 {
 	const std::string src = readFile("src/ReimsGraphicsMobile.cpp");

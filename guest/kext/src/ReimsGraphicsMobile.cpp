@@ -35,8 +35,7 @@
  * one mode, so WindowServer picks none: the display starts in its preferred mode (start_hardware).
  * And it overrides swap_set_color_matrix, which the class answers kIOReturnUnsupported, so
  * WindowServer, which sets its accessibility matrix at each swap until the call succeeds, sets it
- * once: as the paravirtual display does, it answers 0 and the display shows the matrix
- * (RgfxMobileColor.hpp).
+ * once: it answers 0 and the display shows the matrix (RgfxMobileColor.hpp).
  *
  * A process finds the display as IOMobileFramebuffer.framework counts displays: by a node of the
  * device tree (attachMobileNode), then the framebuffer's service and the properties it publishes
@@ -955,14 +954,13 @@ RgfxIOMFBWord ReimsGraphics::set_digital_out_mode(uint32_t colorId, uint32_t tim
 
 // The colour matrix WindowServer sets with a swap, by IOMobileFramebufferSwapSetColorMatrix:
 // QuartzCore sets its accessibility matrix so (function 2) at each swap until the call succeeds
-// (RgfxMobileColor.hpp). As the paravirtual display does, any function and field are answered 0,
-// NULL sets the identity, and the display shows the matrix from the next present: the device's
-// DISPLAY_COLOR matrix stage, which the host stages for the next PRESENT_SURFACE it takes and
-// keeps until it is set again, as the x86-64 display pipe sets it (RgfxPipeColor.hpp); an
-// identity turns the stage off. The user client calls it ungated, in WindowServer's thread, so
-// the post may wait for the ring's room. A host without RGFX_FEATURE_DISPLAY_COLOR shows no
-// matrix, and the call is still answered 0, as the paravirtual display answers whatever its host
-// does with it.
+// (RgfxMobileColor.hpp). Any function and field are answered 0, NULL sets the identity, and the
+// display shows the matrix from the next present: the device's DISPLAY_COLOR matrix stage, which
+// the host stages for the next PRESENT_SURFACE it takes and keeps until it is set again, as the
+// x86-64 display pipe sets it (RgfxPipeColor.hpp); an identity turns the stage off. The user
+// client calls it ungated, in WindowServer's thread, so the post may wait for the ring's room. A
+// host without RGFX_FEATURE_DISPLAY_COLOR shows no matrix, and the call is still answered 0:
+// WindowServer's matrix is set, whatever the host shows of it.
 RgfxIOMFBWord ReimsGraphics::swap_set_color_matrix(IOMFBColorFixedMatrix *matrix,
                                                    IOMFBColorMatrixFunction function,
                                                    uint32_t field_2)
