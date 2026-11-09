@@ -671,4 +671,50 @@ inline bool rgfxSurfaceRunsSame(const RgfxRunsWalk &w)
 	return w.same && w.run + 1 == w.count && w.at == w.runs[w.run].length;
 }
 
+// Why the kext gives a process no shared copy block of a plane (an ask not in place): the
+// process then copies the surface in a block of its own, which no other holder shares, so
+// another process's GPU writes reach it only through the surface's pages.
+enum RgfxCopyRefusal : uint32_t {
+	kRgfxCopyRefusedShape = 0, // a plane length or block size the kext does not take
+	kRgfxCopyRefusedPages,     // the plane's range is not mapped in the task, or not wired
+	kRgfxCopyRefusedDiffers,   // the plane's block is of another size, or one in place
+	kRgfxCopyRefusedHolders,   // the plane's block has no room for another holder
+	kRgfxCopyRefusedTable,     // the table has no free entry
+	kRgfxCopyRefusedRoom,      // the region has no room
+	kRgfxCopyRefusedMap,       // the block does not map into the process's window
+	kRgfxCopyRefusedShare,     // the device was not told of the hold
+	kRgfxCopyRefusals,
+};
+
+inline const char *rgfxCopyRefusalName(uint32_t why)
+{
+	switch (why) {
+	case kRgfxCopyRefusedShape:
+		return "a plane length or block size the kext does not take";
+	case kRgfxCopyRefusedPages:
+		return "the plane's range is not mapped in the process, or not wired";
+	case kRgfxCopyRefusedDiffers:
+		return "the plane's block is of another size, or one in place";
+	case kRgfxCopyRefusedHolders:
+		return "the plane's block has no room for another holder";
+	case kRgfxCopyRefusedTable:
+		return "the surface table has no free entry";
+	case kRgfxCopyRefusedRoom:
+		return "the region has no room";
+	case kRgfxCopyRefusedMap:
+		return "the block does not map into the process's window";
+	case kRgfxCopyRefusedShare:
+		return "the device was not told of the hold";
+	default:
+		return "unknown";
+	}
+}
+
+// Whether `why` is the first refusal of its kind in `*logged`, one bit a reason, marking it.
+inline bool rgfxCopyRefusalFirst(uint32_t *logged, uint32_t why)
+{
+	const uint32_t bit = 1u << why;
+	return (__atomic_fetch_or(logged, bit, __ATOMIC_RELAXED) & bit) == 0;
+}
+
 #endif // RGFX_SURFACE_BLOCKS_HPP_

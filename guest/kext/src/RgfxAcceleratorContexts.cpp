@@ -65,6 +65,7 @@
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 
 namespace {
@@ -1301,6 +1302,24 @@ void freeRuns(RgfxPageRun *runs, UInt32 count)
 		IOFree(runs, sizeof(RgfxPageRun) * count);
 }
 
+// The reasons a copy block was refused for so far, a bit each (rgfxCopyRefusalFirst).
+uint32_t copyRefusalsLogged;
+
+// The asking process gets no shared copy block of a plane of `length` bytes, block `size`, for
+// `why`: logged the first time a reason refuses one, out of the contexts' lock. Answers `r`.
+IOReturn refuseCopy(RgfxCopyRefusal why, UInt64 length, UInt64 size, IOReturn r)
+{
+	if (rgfxCopyRefusalFirst(&copyRefusalsLogged, why)) {
+		char name[32] = {};
+		proc_name(proc_selfpid(), name, sizeof(name));
+		IOLog("RgfxAccelerator: %s[%d] gets no shared copy block of a plane of %llu bytes (block "
+		      "%llu bytes, 0x%x): %s; it copies the surface in a block of its own, which no "
+		      "other holder shares (the first refusal of this kind)\n",
+		      name, proc_selfpid(), length, size, r, rgfxCopyRefusalName(why));
+	}
+	return r;
+}
+
 void unwire(void *pages)
 {
 	if (IOMemoryDescriptor *md = static_cast<IOMemoryDescriptor *>(pages)) {
@@ -1628,12 +1647,17 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		return kIOReturnNotReady;
 	if (inPlace && (!surfacePages || !region))
 		return kIOReturnUnsupported;
+	// A refused copy block says why, once a reason (refuseCopy); the bundle counts the refusals
+	// of blocks in place.
+	auto refused = [&](RgfxCopyRefusal why, IOReturn r) {
+		return inPlace ? r : refuseCopy(why, length, size, r);
+	};
 	if (!length || length > kMaxPlaneBytes || !size || size % kPage || size > 2 * kMaxPlaneBytes)
-		return kIOReturnBadArgument;
+		return refused(kRgfxCopyRefusedShape, kIOReturnBadArgument);
 	// A copy block holds the plane's bytes; a block in place holds none of the surface's whole
 	// pages, which the device maps as they are.
 	if (inPlace ? address % kPage || length % kPage : size < length)
-		return kIOReturnBadArgument;
+		return refused(kRgfxCopyRefusedShape, kIOReturnBadArgument);
 	RgfxSurfaceTable &table = surfaceTable;
 	// The asker's IOSurface, where the device caches surfaces: a new block of it waits for its
 	// pages' write-back (rgfxSurfaceCacheWritingBack), and a cached block in place of it, held or
@@ -1714,7 +1738,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		if (wire) {
 			pages = wirePlane(task, address, length, &runs, &count);
 			if (!pages)
-				return kIOReturnBadArgument;
+				return refused(kRgfxCopyRefusedPages, kIOReturnBadArgument);
 		}
 		IOLockLock(contextLock);
 		// The ask finds no deferred block and has no pages: it wires them, and looks again.
@@ -1909,8 +1933,10 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			if (!keptWire)
 				unwire(pages);
 			if (mapped != kIOReturnSuccess)
-				return mapped;
-			return held == kRgfxSurfaceHoldAgain ? kIOReturnSuccess : kIOReturnNoResources;
+				return refused(kRgfxCopyRefusedMap, mapped);
+			if (held != kRgfxSurfaceHoldAgain)
+				return refused(kRgfxCopyRefusedHolders, kIOReturnNoResources);
+			return kIOReturnSuccess;
 		}
 		RgfxBlockGrant share = {};
 		share.context = context;
@@ -1950,15 +1976,16 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		// The asker holds the surface: the processes see its clients counted anew.
 		if (posted == kIOReturnSuccess && block->cached)
 			rgfxSurfaceCacheNoteClients(block->offset);
-		return posted;
+		return posted == kIOReturnSuccess ? posted : refused(kRgfxCopyRefusedShare, posted);
 	}
 	if (made != kRgfxBlockOk) {
 		IOLockUnlock(contextLock);
 		freeRuns(runs, count);
 		unwire(pages);
 		if (differs)
-			return kIOReturnBadArgument;
-		return made == kRgfxBlockNoSpace ? kIOReturnNoSpace : kIOReturnNoResources;
+			return refused(kRgfxCopyRefusedDiffers, kIOReturnBadArgument);
+		return made == kRgfxBlockNoSpace ? refused(kRgfxCopyRefusedRoom, kIOReturnNoSpace)
+		                                 : refused(kRgfxCopyRefusedTable, kIOReturnNoResources);
 	}
 	RgfxSurfaceEntry &e = table.entries[slot];
 	e.used = true;
@@ -1995,7 +2022,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		freeRuns(runs, count);
 		unwire(pages);
 		OSSafeReleaseNULL(deferredSurface);
-		return mapped;
+		return refused(kRgfxCopyRefusedMap, mapped);
 	}
 	IOLockUnlock(contextLock);
 	if (writeBackLate)
@@ -2075,7 +2102,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		thread_call_enter(releaseCall);
 	if (client->isWindowServer())
 		noteReserve();
-	return posted;
+	return posted == kIOReturnSuccess ? posted : refused(kRgfxCopyRefusedShare, posted);
 }
 
 void RgfxAccelerator::wakeReleases()

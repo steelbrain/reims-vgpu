@@ -8,11 +8,12 @@
 // surface too, laid out as the ask, by an ask that maps the surface where it asks, and by no
 // other; a surface's memory is its block's runs only page for page. Pages a SURFACE_PAGES named
 // and the host never answered for stay wired. A client's new hold makes its other asks wait until
-// its share is posted.
+// its share is posted. Each reason a copy block is refused has its own name, logged once.
 #include "RgfxSurfaceBlocks.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 
 namespace {
@@ -557,6 +558,21 @@ int main()
 	      "it waits on once none is dormant: their releases are in flight");
 	check(rgfxSurfaceRoomStep(150, 3, 150) == kRgfxSurfaceRoomGiveUp,
 	      "at the deadline it gives up");
+
+	// A refused copy block: each reason has its own name, and is logged the first time alone.
+	{
+		uint32_t logged = 0;
+		for (uint32_t why = 0; why < kRgfxCopyRefusals; why++) {
+			check(std::strcmp(rgfxCopyRefusalName(why), "unknown") != 0, "each reason is named");
+			for (uint32_t other = 0; other < why; other++)
+				check(std::strcmp(rgfxCopyRefusalName(why), rgfxCopyRefusalName(other)) != 0,
+				      "no two reasons share a name");
+		}
+		check(kRgfxCopyRefusals <= 32, "a bit a reason");
+		check(rgfxCopyRefusalFirst(&logged, kRgfxCopyRefusedRoom), "a reason's first refusal");
+		check(!rgfxCopyRefusalFirst(&logged, kRgfxCopyRefusedRoom), "its second is not logged");
+		check(rgfxCopyRefusalFirst(&logged, kRgfxCopyRefusedMap), "another reason's first is");
+	}
 
 	std::printf("surface_blocks_test: OK (%d checks)\n", checks);
 	return 0;

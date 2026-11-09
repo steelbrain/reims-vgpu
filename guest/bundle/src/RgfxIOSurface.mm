@@ -410,6 +410,10 @@ private:
 std::atomic<uint64_t> gCopiedAlignment{0};   // a plane where no host texture lies over it
 std::atomic<uint64_t> gCopiedUnsupported{0}; // no view in place on the device, or of its pages
 std::atomic<uint64_t> gCopiedRefused{0};     // the kext gave no block in place
+// The copies made: in the surface's shared block, or, where the kext gave none, in a block of
+// the process's own, which no other holder shares (its GPU sees theirs only through the pages).
+std::atomic<uint64_t> gCopyShared{0};
+std::atomic<uint64_t> gCopyOwn{0};
 
 const uint64_t kCopyReportNs = 10ull * 1000 * 1000 * 1000;
 
@@ -425,7 +429,7 @@ void reportCopies(uint64_t now)
 	static std::mutex lock;
 	static uint64_t last = 0, upCount = 0, upBytes = 0, upNs = 0, wbCount = 0, wbBytes = 0,
 	                wbNs = 0, inPlace = 0, cached = 0, forAlignment = 0, unsupported = 0,
-	                refused = 0;
+	                refused = 0, shared = 0, own = 0;
 	std::unique_lock<std::mutex> g(lock, std::try_to_lock);
 	if (!g.owns_lock()) {
 		return;
@@ -440,18 +444,21 @@ void reportCopies(uint64_t now)
 	uint64_t uc = gUploads.count, ub = gUploads.bytes, un = gUploads.ns;
 	uint64_t wc = gWriteBacks.count, wb = gWriteBacks.bytes, wn = gWriteBacks.ns;
 	uint64_t ip = gInPlace, cc = gCached, ca = gCopiedAlignment, cu = gCopiedUnsupported,
-	         cr = gCopiedRefused;
+	         cr = gCopiedRefused, cs = gCopyShared, co = gCopyOwn;
 	// The process's id and name are the log's own.
 	os_log_info(OS_LOG_DEFAULT,
 	            "RGFX: surface copies, %.1f s: %llu uploads %.1f MiB %.2f ms, %llu write-backs "
 	            "%.1f MiB %.2f ms; views made: %llu in place (%llu cached), copies %llu for "
-	            "alignment, %llu unsupported, %llu refused by the kext",
+	            "alignment, %llu unsupported, %llu refused by the kext; copy blocks: %llu shared, "
+	            "%llu own",
 	            (now - last) / 1e9, uc - upCount, (ub - upBytes) / 1048576.0, (un - upNs) / 1e6,
 	            wc - wbCount, (wb - wbBytes) / 1048576.0, (wn - wbNs) / 1e6, ip - inPlace,
-	            cc - cached, ca - forAlignment, cu - unsupported, cr - refused);
+	            cc - cached, ca - forAlignment, cu - unsupported, cr - refused, cs - shared,
+	            co - own);
 	last = now;
 	upCount = uc, upBytes = ub, upNs = un, wbCount = wc, wbBytes = wb, wbNs = wn;
 	inPlace = ip, cached = cc, forAlignment = ca, unsupported = cu, refused = cr;
+	shared = cs, own = co;
 }
 
 /// Counts a copy of `bytes` that started at `start`.
@@ -1009,6 +1016,10 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 			if (!sharedBlock.block.ok) {
 				shadow->block = region->allocate(size);
 			}
+			if (sharedBlock.block.ok)
+				gCopyShared.fetch_add(1, std::memory_order_relaxed);
+			else if (shadow->block.ok)
+				gCopyOwn.fetch_add(1, std::memory_order_relaxed);
 			if (!shadow->block.ok && !sharedBlock.block.ok) {
 				uint64_t free = 0;
 				std::string room = region->freeBytes(&free)
