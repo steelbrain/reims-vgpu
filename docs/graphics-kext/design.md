@@ -590,7 +590,35 @@ Stages:
         carries `DEFERRED` and no runs, the block keeping room for one run a
         page of the whole allocation, every plane's; the host makes the cache
         as zeros. Not fresh, or refused, the kext names the pages at once, as
-        for any block. A deferred block is found by its surface, never by
+        for any block. A surface no CPU lock touched may still have a few
+        pages resident, written by a process that takes no lock:
+        **measured** on the 780M, VTDecoderXPCService writes page 0 of each
+        new decoder output before the first decode (all 208 of a 4K HEVC
+        session's in Safari, macOS 26, the other pages never resident), so a
+        test of no page resident named each one's 12 MiB at once, wired and
+        filled with zeros (5 to 7 ms of the guest's each). Where the kext
+        took `RGFX_FEATURE_SURFACE_DEFERRED_CARRY`, the bundle's cacheable
+        ask lists after the layout the surface's resident pages it finds in
+        its mapping (`mach_vm_page_range_query`), 16 at most, and the kext
+        defers a surface fresh but for them: under the same read, the fresh
+        test's own verdict on its counts with as many pages resident as listed
+        and none compressed or paged out (so where nothing is counted nothing
+        is carried), the listed runs wired with `kIODirectionPrepareNoFault`,
+        and the counts read again after the wire the same, so a listed page
+        not resident either fails the wire or, faulted in, raises the count,
+        and a page written or compressed meanwhile shows too (**measured** on
+        a macOS 26.7.2 guest: such a wire fails, `kIOReturnNoResources`,
+        faulting nothing in; `guest/kext/src/RgfxDeferCarry.hpp`). Its
+        `SURFACE_PAGES` then carries `DEFERRED` with runs: the surface's bytes
+        in order, each carried page at its guest address, every other run
+        `RGFX_PAGE_RUN_ZEROS`. The host makes the cache of zeros and copies
+        the carried pages into it as a new cache's first fill, after the
+        zeros: before what reads the cache next, or never where a decode
+        writes the planes whole first. The kext keeps the carried pages wired
+        until the block's pages are named or its release is answered, and
+        lets them go at a refusal; any other read, a wire refused or a page
+        faulted in names the pages at once, as before. A deferred block is
+        found by its surface, never by
         pages, and its holders wire none. Its first read-write lock, or a
         read-only one after a GPU write, wires the pages and names them
         (`ATTACH`) before it goes on, one lock at a time, under no lock of the
@@ -1108,6 +1136,14 @@ only where no negotiation can carry it.
   on a GPU that shares the CPU's memory"). A host offers it where it offers
   `SURFACE_CACHE_REFUSED`, with its budget in `DEFERRED_BUDGET_LO` and
   `_HI`.
+- Bit 32, `FEATURES_HI`'s bit 0, is `SURFACE_DEFERRED_CARRY`, which means
+  nothing without `SURFACE_DEFERRED` or `SURFACE_DEFERRED_ASK`: a deferral
+  may carry the few resident pages of a surface no CPU lock touched, its
+  runs the surface's bytes in order, each run of pages not resident
+  `RGFX_PAGE_RUN_ZEROS` (Decided 14, *Deferred pages*). The bundle lists
+  them after the layout of its 0x109 call, the kext proves them under its
+  read of the surface, and the host fills the cache from them as a new
+  cache's first fill. A host offers it where it offers either deferral.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -1890,7 +1926,9 @@ answers whether the block is, whichever ask made it. Where the device has
 `RGFX_FEATURE_SURFACE_CACHE_REFUSED` instead, a struct input with the six
 (`RgfxSurfacePagesLayout`) is the surface's layout, with which the kext asks
 the device whether the block needs a cache, and marks it cached only where
-the device answers so. The kext then writes the
+the device answers so; the surface's resident pages may follow the layout
+(`RgfxSurfaceResident`), where the kext took `RGFX_FEATURE_SURFACE_DEFERRED_CARRY`,
+for a deferral that carries them. The kext then writes the
 surface's CPU generation at offset 16 of the block, and asks `SURFACE_DOWNLOAD`
 (block offset) at a CPU lock that follows a GPU write, answered once the
 surface's pages hold the host's device cache (Decided 14, "The device cache").
