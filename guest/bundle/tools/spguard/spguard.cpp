@@ -1,30 +1,22 @@
-// spguard: what the kernel's VM guard makes of the device's superpages (src/RgfxSuperpages.hpp), in
-// a scratch process with its VM guard on, as Apple's platform binaries and WebKit's GPU process
-// have it. The process turns its own guard on (task_set_exc_guard_behavior; a process may only add
-// bits) and takes its EXC_GUARD exceptions on a port of its own, recording each one's codes and
-// answering it handled, so a guard exception shows and the process lives on. To run in an x86-64
-// guest; no Metal, no GPU.
+// spguard: what the kernel's VM guard makes of one call for several superpages, the call the
+// device's superpages never make (src/RgfxSuperpages.hpp, ONE SUPERPAGE A CALL), in a scratch
+// process with its VM guard on, as Apple's platform binaries and WebKit's GPU process have it. The
+// process turns its own guard on (task_set_exc_guard_behavior; a process may only add bits) and
+// takes its EXC_GUARD exceptions on a port of its own, recording each one's codes and answering it
+// handled, so a guard exception shows and the process lives on. To run in an x86-64 guest; no
+// Metal, no GPU.
 //   spguard CASE...
 // The cases:
-//   behavior      the process's EXC_GUARD behaviour as it started, then with the VM guard on.
-//   old.anywhere  car 8's call: one mach_vm_allocate of more superpages than the kernel has free
-//                 RAM for (the free pages' bytes and 512 MiB, at most the RAM): its answer, and
-//                 the guard exceptions it raised (code, subcode).
-//   old.fixed     the same one call, at a fixed address of a free range of its own: the
-//                 exception's subcode less the address, in superpages (the kernel's cleanup takes
-//                 down past the end of the last superpage entry it made).
-//   new.short     rgfxTakeSuperpages over as many bytes: what the kernel was asked (the
-//                 reservation, how many superpages it made in it before the first refusal and that
-//                 refusal, the deallocations after it and their bytes), the guard exceptions, and
-//                 the process's IOAccelerator-tagged bytes before and after it (equal: nothing left
-//                 mapped).
-//   new.room.MIB  rgfxTakeSuperpages of MIB MiB with room for them: its answer and time, the
-//                 entries the range holds (one a superpage, each 2 MiB and tagged), the guard
-//                 exceptions; then the same bytes in car 8's one call: its answer, time and guard
-//                 exceptions.
-//   fatal.old     a child with the VM guard fatal (VM_DELIVER | VM_FATAL, WebKit's GPU process's)
-//                 and no port of its own makes the old.anywhere call: how it ended.
-//   fatal.new     the same child making the new.short call: how it ended.
+//   behavior          the process's EXC_GUARD behaviour as it started, then with the VM guard on.
+//   several.anywhere  one mach_vm_allocate of more superpages than the kernel has free RAM for
+//                     (the free pages' bytes and 512 MiB, at most the RAM): its answer, and the
+//                     guard exceptions it raised (code, subcode).
+//   several.fixed     the same one call, at a fixed address of a free range of its own: the
+//                     exception's subcode less the address, in superpages (the kernel's cleanup
+//                     takes down past the end of the last superpage entry it made).
+//   several.fatal     a child with the VM guard fatal (VM_DELIVER | VM_FATAL, WebKit's GPU
+//                     process's) and no port of its own makes the several.anywhere call: how it
+//                     ended.
 // One line a case: "spg: NAME key=value ...". Build (on a Mac): `make -C guest/bundle spguard`,
 // build/spguard-x86_64.
 //
@@ -44,13 +36,11 @@
 
 #include <atomic>
 #include <string>
-#include <vector>
-
-#include "RgfxSuperpages.hpp"
 
 namespace {
 
 constexpr uint64_t kMiB = 1ull << 20;
+constexpr uint64_t kSuperpage = 2ull << 20;
 
 double nowUs()
 {
@@ -169,147 +159,53 @@ uint64_t pastFree(uint64_t *freeBytes)
 	host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&s), &n);
 	*freeBytes = (static_cast<uint64_t>(s.free_count) + s.speculative_count) * vm_page_size;
 	uint64_t want = *freeBytes + 512 * kMiB;
-	const uint64_t ram = memsize() & ~(kRgfxSuperpage - 1);
+	const uint64_t ram = memsize() & ~(kSuperpage - 1);
 	if (want > ram)
 		want = ram;
-	return want & ~(kRgfxSuperpage - 1);
+	return want & ~(kSuperpage - 1);
 }
-
-// The process's bytes in entries tagged VM_MEMORY_IOACCELERATOR, and their count.
-uint64_t taggedBytes(uint64_t *entries)
-{
-	uint64_t bytes = 0;
-	*entries = 0;
-	mach_vm_address_t at = 0;
-	for (;;) {
-		mach_vm_size_t size = 0;
-		natural_t depth = 0;
-		vm_region_submap_info_data_64_t info = {};
-		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-		if (mach_vm_region_recurse(mach_task_self(), &at, &size, &depth,
-		                           reinterpret_cast<vm_region_recurse_info_t>(&info),
-		                           &count) != KERN_SUCCESS)
-			break;
-		if (info.user_tag == VM_MEMORY_IOACCELERATOR) {
-			bytes += size;
-			(*entries)++;
-		}
-		at += size;
-	}
-	return bytes;
-}
-
-// The entries over [at, at + size): how many, and whether each is 2 MiB, tagged and resident.
-void describeRange(uint64_t at, uint64_t size, uint64_t *entries, bool *twoMiBTagged,
-                   bool *resident)
-{
-	*entries = 0;
-	*twoMiBTagged = true;
-	*resident = true;
-	mach_vm_address_t a = at;
-	while (a < at + size) {
-		mach_vm_size_t s = 0;
-		natural_t depth = 0;
-		vm_region_submap_info_data_64_t info = {};
-		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-		if (mach_vm_region_recurse(mach_task_self(), &a, &s, &depth,
-		                           reinterpret_cast<vm_region_recurse_info_t>(&info),
-		                           &count) != KERN_SUCCESS ||
-		    a >= at + size)
-			break;
-		(*entries)++;
-		*twoMiBTagged = *twoMiBTagged && s == kRgfxSuperpage &&
-		                info.user_tag == VM_MEMORY_IOACCELERATOR;
-		*resident = *resident && info.pages_resident * vm_page_size == s;
-		a += s;
-	}
-}
-
-// The kernel's own calls, each one counted, for new.short's account of what was asked.
-struct Counting {
-	RgfxSuperpageVm kernel = rgfxKernelSuperpageVm();
-	uint64_t reserved = 0, made = 0, cleanups = 0, cleanupBytes = 0;
-	int refusal = 0;
-
-	static int superpages(void *c, uint64_t *at, uint64_t size, bool fixed)
-	{
-		Counting *k = static_cast<Counting *>(c);
-		const int kr = k->kernel.superpages(k->kernel.context, at, size, fixed);
-		if (kr == KERN_SUCCESS)
-			k->made++;
-		else if (k->refusal == 0)
-			k->refusal = kr;
-		return kr;
-	}
-	static int reserve(void *c, uint64_t *at, uint64_t size)
-	{
-		Counting *k = static_cast<Counting *>(c);
-		const int kr = k->kernel.reserve(k->kernel.context, at, size);
-		if (kr == KERN_SUCCESS)
-			k->reserved = size;
-		return kr;
-	}
-	static void deallocate(void *c, uint64_t at, uint64_t size)
-	{
-		Counting *k = static_cast<Counting *>(c);
-		if (k->refusal != 0) {
-			k->cleanups++;
-			k->cleanupBytes += size;
-		}
-		k->kernel.deallocate(k->kernel.context, at, size);
-	}
-	RgfxSuperpageVm calls()
-	{
-		RgfxSuperpageVm vm;
-		vm.context = this;
-		vm.superpages = &superpages;
-		vm.reserve = &reserve;
-		vm.deallocate = &deallocate;
-		return vm;
-	}
-};
 
 // --- the cases ---------------------------------------------------------------------------------
 
-int oldCall(uint64_t size, mach_vm_address_t *at, bool fixed)
+int severalCall(uint64_t size, mach_vm_address_t *at, bool fixed)
 {
 	return mach_vm_allocate(mach_task_self(), at, size,
 	                        (fixed ? VM_FLAGS_FIXED : VM_FLAGS_ANYWHERE) |
 	                            VM_FLAGS_SUPERPAGE_SIZE_2MB | VM_MAKE_TAG(VM_MEMORY_IOACCELERATOR));
 }
 
-void oldAnywhere()
+void severalAnywhere()
 {
 	uint64_t freeBytes = 0;
 	const uint64_t size = pastFree(&freeBytes);
 	const int from = g_seenCount.load();
 	mach_vm_address_t at = 0;
 	const double t = nowUs();
-	const int kr = oldCall(size, &at, false);
+	const int kr = severalCall(size, &at, false);
 	const double us = nowUs() - t;
 	if (kr == KERN_SUCCESS)
 		mach_vm_deallocate(mach_task_self(), at, size);
-	printf("spg: old.anywhere free_mib=%llu asked_mib=%llu kr=%d us=%.0f%s\n",
+	printf("spg: several.anywhere free_mib=%llu asked_mib=%llu kr=%d us=%.0f%s\n",
 	       (unsigned long long)(freeBytes / kMiB), (unsigned long long)(size / kMiB), kr, us,
 	       seenSince(from).c_str());
 }
 
-void oldFixed()
+void severalFixed()
 {
 	uint64_t freeBytes = 0;
 	const uint64_t size = pastFree(&freeBytes);
 	// A free range of its own: a reservation's, given back just before.
 	mach_vm_address_t at = 0;
-	if (mach_vm_map(mach_task_self(), &at, size, kRgfxSuperpage - 1, VM_FLAGS_ANYWHERE,
+	if (mach_vm_map(mach_task_self(), &at, size, kSuperpage - 1, VM_FLAGS_ANYWHERE,
 	                MEMORY_OBJECT_NULL, 0, FALSE, VM_PROT_NONE, VM_PROT_DEFAULT,
 	                VM_INHERIT_NONE) != KERN_SUCCESS) {
-		printf("spg: old.fixed no range of %llu MiB\n", (unsigned long long)(size / kMiB));
+		printf("spg: several.fixed no range of %llu MiB\n", (unsigned long long)(size / kMiB));
 		return;
 	}
 	mach_vm_deallocate(mach_task_self(), at, size);
 	const int from = g_seenCount.load();
 	mach_vm_address_t a = at;
-	const int kr = oldCall(size, &a, true);
+	const int kr = severalCall(size, &a, true);
 	if (kr == KERN_SUCCESS)
 		mach_vm_deallocate(mach_task_self(), at, size);
 	std::string where;
@@ -318,67 +214,14 @@ void oldFixed()
 		const uint64_t sub = g_seen[from].subcode;
 		char b[96];
 		snprintf(b, sizeof(b), " at=0x%llx gap_at_superpage=%lld", (unsigned long long)at,
-		         (long long)((int64_t)(sub - at) / (int64_t)kRgfxSuperpage));
+		         (long long)((int64_t)(sub - at) / (int64_t)kSuperpage));
 		where = b;
 	}
-	printf("spg: old.fixed asked_mib=%llu kr=%d%s%s\n", (unsigned long long)(size / kMiB), kr,
+	printf("spg: several.fixed asked_mib=%llu kr=%d%s%s\n", (unsigned long long)(size / kMiB), kr,
 	       where.c_str(), seenSince(from).c_str());
 }
 
-void newShort()
-{
-	uint64_t freeBytes = 0;
-	const uint64_t size = pastFree(&freeBytes);
-	uint64_t entriesBefore = 0, entriesAfter = 0;
-	const uint64_t before = taggedBytes(&entriesBefore);
-	const int from = g_seenCount.load();
-	Counting k;
-	uint8_t *bytes = nullptr;
-	const double t = nowUs();
-	const int kr = rgfxTakeSuperpages(k.calls(), size, &bytes);
-	const double us = nowUs() - t;
-	if (kr == KERN_SUCCESS)
-		rgfxGiveSuperpages(k.calls(), bytes, size);
-	const uint64_t after = taggedBytes(&entriesAfter);
-	printf("spg: new.short free_mib=%llu asked_mib=%llu kr=%d us=%.0f reserved_mib=%llu made=%llu "
-	       "refusal=%d cleanups=%llu cleanup_mib=%llu tagged_mib_before=%llu "
-	       "tagged_mib_after=%llu%s\n",
-	       (unsigned long long)(freeBytes / kMiB), (unsigned long long)(size / kMiB), kr, us,
-	       (unsigned long long)(k.reserved / kMiB), (unsigned long long)k.made, k.refusal,
-	       (unsigned long long)k.cleanups, (unsigned long long)(k.cleanupBytes / kMiB),
-	       (unsigned long long)(before / kMiB), (unsigned long long)(after / kMiB),
-	       seenSince(from).c_str());
-}
-
-void newRoom(uint64_t mib)
-{
-	const uint64_t size = (mib * kMiB + kRgfxSuperpage - 1) & ~(kRgfxSuperpage - 1);
-	const int from = g_seenCount.load();
-	uint8_t *bytes = nullptr;
-	double t = nowUs();
-	const int kr = rgfxTakeSuperpages(rgfxKernelSuperpageVm(), size, &bytes);
-	const double us = nowUs() - t;
-	uint64_t entries = 0;
-	bool twoMiB = false, resident = false;
-	if (kr == KERN_SUCCESS) {
-		describeRange(reinterpret_cast<uintptr_t>(bytes), size, &entries, &twoMiB, &resident);
-		rgfxGiveSuperpages(rgfxKernelSuperpageVm(), bytes, size);
-	}
-	const std::string newSeen = seenSince(from);
-	const int oldFrom = g_seenCount.load();
-	mach_vm_address_t at = 0;
-	t = nowUs();
-	const int oldKr = oldCall(size, &at, false);
-	const double oldUs = nowUs() - t;
-	if (oldKr == KERN_SUCCESS)
-		mach_vm_deallocate(mach_task_self(), at, size);
-	printf("spg: new.room.%llu kr=%d us=%.0f entries=%llu each_2mib_tagged=%d resident=%d%s | "
-	       "old_kr=%d old_us=%.0f old%s\n",
-	       (unsigned long long)mib, kr, us, (unsigned long long)entries, twoMiB ? 1 : 0,
-	       resident ? 1 : 0, newSeen.c_str(), oldKr, oldUs, seenSince(oldFrom).c_str());
-}
-
-void fatalChild(bool useNew)
+void severalFatal()
 {
 	fflush(stdout);
 	const pid_t pid = fork();
@@ -391,31 +234,20 @@ void fatalChild(bool useNew)
 			_exit(3);
 		uint64_t freeBytes = 0;
 		const uint64_t size = pastFree(&freeBytes);
-		int kr;
-		if (useNew) {
-			uint8_t *bytes = nullptr;
-			kr = rgfxTakeSuperpages(rgfxKernelSuperpageVm(), size, &bytes);
-			if (kr == KERN_SUCCESS)
-				rgfxGiveSuperpages(rgfxKernelSuperpageVm(), bytes, size);
-		} else {
-			mach_vm_address_t at = 0;
-			kr = oldCall(size, &at, false);
-			if (kr == KERN_SUCCESS)
-				mach_vm_deallocate(mach_task_self(), at, size);
-		}
-		printf("spg: %s child kr=%d (alive after the call)\n", useNew ? "fatal.new" : "fatal.old",
-		       kr);
+		mach_vm_address_t at = 0;
+		const int kr = severalCall(size, &at, false);
+		if (kr == KERN_SUCCESS)
+			mach_vm_deallocate(mach_task_self(), at, size);
+		printf("spg: several.fatal child kr=%d (alive after the call)\n", kr);
 		fflush(stdout);
 		_exit(kr == KERN_SUCCESS ? 2 : 0);
 	}
 	int status = 0;
 	waitpid(pid, &status, 0);
 	if (WIFSIGNALED(status))
-		printf("spg: %s ended=signal sig=%d\n", useNew ? "fatal.new" : "fatal.old",
-		       WTERMSIG(status));
+		printf("spg: several.fatal ended=signal sig=%d\n", WTERMSIG(status));
 	else
-		printf("spg: %s ended=exit code=%d\n", useNew ? "fatal.new" : "fatal.old",
-		       WEXITSTATUS(status));
+		printf("spg: several.fatal ended=exit code=%d\n", WEXITSTATUS(status));
 }
 
 } // namespace
@@ -435,18 +267,12 @@ int main(int argc, char **argv)
 		if (c == "behavior")
 			printf("spg: behavior initial=0x%x set_kr=%d now=0x%x ram_mib=%llu\n", initial, set,
 			       guardBehavior(), (unsigned long long)(memsize() / kMiB));
-		else if (c == "old.anywhere")
-			oldAnywhere();
-		else if (c == "old.fixed")
-			oldFixed();
-		else if (c == "new.short")
-			newShort();
-		else if (c.rfind("new.room.", 0) == 0)
-			newRoom(strtoull(c.c_str() + 9, nullptr, 10));
-		else if (c == "fatal.old")
-			fatalChild(false);
-		else if (c == "fatal.new")
-			fatalChild(true);
+		else if (c == "several.anywhere")
+			severalAnywhere();
+		else if (c == "several.fixed")
+			severalFixed();
+		else if (c == "several.fatal")
+			severalFatal();
 		else
 			printf("spg: %s unknown\n", c.c_str());
 		fflush(stdout);

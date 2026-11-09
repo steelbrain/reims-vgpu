@@ -438,7 +438,7 @@ bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, boo
 // refusal is safe in a process whose VM guard is on (RgfxSuperpages.hpp).
 int rgfxSuperpages(void *, uint64_t size, uint8_t **bytes)
 {
-	return rgfxTakeSuperpages(rgfxKernelSuperpageVm(), size, bytes);
+	return size == kRgfxSuperpage ? rgfxTakeSuperpage(bytes) : KERN_INVALID_ARGUMENT;
 }
 
 // The pages source's memory where the kernel has no superpage left (RgfxPagesMemory::pages):
@@ -456,7 +456,7 @@ int rgfxPlainPages(void *, uint64_t size, uint8_t **bytes)
 
 void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
 {
-	rgfxGiveSuperpages(rgfxKernelSuperpageVm(), bytes, size);
+	mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(bytes), size);
 }
 
 // The pages source's superpage record (RgfxPagesMemory::record): the kext's, which every process
