@@ -235,6 +235,11 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 // The host answered the ask of the block of device cache `cache`: deferred where `deferred`,
 // else its pages are named, its surface's memory wired. Locks waiting for the answer go on.
 void rgfxSurfaceCacheSettle(void *cache, bool deferred);
+// The block of device cache `cache`, made for its deferral (rgfxSurfaceLocksDefer), had its pages
+// named asking, and the host answered that they lie in place: the surface is not cached, so the
+// cache's entry goes (rgfxCacheUngated), with its mapping, its reference of the surface's memory
+// and the cache's reference, and locks waiting for the answer go on. Under no lock of the kext's.
+void rgfxSurfaceLocksUngate(void *cache);
 // What rgfxSurfaceCacheReleaseAttach did.
 enum RgfxReleaseAttach {
 	// Nothing: not a deferred block, or one whose pages were named before.
@@ -443,14 +448,19 @@ public:
 	// Names the pages of the in-place block at `offset` made by context `context`: wires the
 	// first `length` bytes of the surface's memory `memory`, writes their runs past the `size`
 	// bytes its holders map, and posts its SURFACE_PAGES with `flags` (RGFX_SURFACE_PAGES_*): a
-	// deferred block's attach, or the pages of a block its ask meant to defer. Named, the device
-	// answered OK, `memory` wired, and the runs in `*runs` (IOMalloc'd, `*count` of them, the
-	// caller's) where asked for; not named, `memory` as it was; unanswered, `memory` left wired
-	// once more, which the caller keeps until the block's release is answered OK, the host free to
-	// take the pages yet (rgfxPagesNaming). Under no lock of the kext's.
+	// deferred block's attach, or the pages of a block its ask meant to defer. With `layout`, a
+	// device that answers which surfaces need a cache is asked first
+	// (RGFX_SURFACE_PAGES_ASK_CACHE): answered OK, the pages are named in place, `*inPlace` set;
+	// answered RGFX_STATUS_CACHE, they are posted again with `flags`. Named, the device answered
+	// OK, `memory` wired, and the runs in `*runs` (IOMalloc'd, `*count` of them, the caller's)
+	// where asked for; not named, `memory` as it was; unanswered, `memory` left wired once more,
+	// which the caller keeps until the block's release is answered OK, the host free to take the
+	// pages yet (rgfxPagesNaming). Under no lock of the kext's.
 	RgfxPagesNaming attachSurfacePages(UInt32 context, UInt64 offset, UInt64 size, UInt64 length,
 	                                   IOMemoryDescriptor *memory, UInt32 flags,
-	                                   RgfxPageRun **runs, UInt32 *count);
+	                                   RgfxPageRun **runs, UInt32 *count,
+	                                   const RgfxSurfacePagesLayout *layout = nullptr,
+	                                   bool *inPlace = nullptr);
 	IOReturn releaseSurfaceBlock(RgfxAcceleratorUserClient *client, UInt64 offset);
 	void dropSurfaceBlocks(const void *client, bool closed);
 	// The processes' object lifecycle, on the framebuffer's control ring
@@ -596,12 +606,14 @@ private:
 	                   UInt64 length, UInt32 count, UInt32 flags, UInt32 *status = nullptr,
 	                   const RgfxSurfacePagesLayout *layout = nullptr);
 	// The new deferred block of entry `e`, pending, held by its asker of context `context` alone,
-	// `total` bytes with its runs' room: makes its surface's device cache and reads the surface
-	// (rgfxSurfaceLocksDefer); fresh, asks the host to defer it; not fresh, refused or with no
-	// cache, names its pages now, the entry keyed by them from then on. Whether the device took
-	// the block, and `*cached` where it is cached. Not under the contexts' lock.
+	// `total` bytes with its runs' room, its surface laid out as `layout`: makes its surface's
+	// device cache and reads the surface (rgfxSurfaceLocksDefer); fresh, asks the host to defer
+	// it, with the layout where the device answers which surfaces need a cache (askCache); not
+	// fresh, refused or with no cache, names its pages now, asking with the layout there, the
+	// entry keyed by them from then on. Whether the device took the block, and `*cached` where it
+	// is cached. Not under the contexts' lock.
 	bool deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uint32_t surfaceId, UInt64 total,
-	                       bool *cached);
+	                       const RgfxSurfacePagesLayout *layout, bool *cached);
 	// Holds the dormant block of entry `e`, deferred or cached in place, again for the ask of
 	// IOSurfaceID `surfaceId`, its own surface, which found it: false, nothing changed, where its
 	// cache asked it to go. Under the contexts' lock.

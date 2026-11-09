@@ -667,6 +667,27 @@ void rgfxSurfaceCacheSettle(void *cache, bool deferred)
 	IOLockUnlock(state.lock);
 }
 
+void rgfxSurfaceLocksUngate(void *cache)
+{
+	if (!cache || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	void *map = nullptr, *wire = nullptr;
+	IOLockLock(state.lock);
+	const bool gone =
+	    rgfxCacheUngated(state.caches, reinterpret_cast<uintptr_t>(cache), &map, &wire);
+	wakeLocked();
+	IOLockUnlock(state.lock);
+	if (!gone)
+		return;
+	// The entry's references, as rgfxSurfaceLocksDefer took them: its header's mapping, the
+	// surface's memory retained and never prepared for it, and the cache.
+	if (map)
+		static_cast<IOMemoryMap *>(map)->release();
+	if (wire)
+		static_cast<IOMemoryDescriptor *>(wire)->release();
+	reinterpret_cast<OSObject *>(cache)->release();
+}
+
 RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset,
                                                 OSObject *surface, bool name)
 {

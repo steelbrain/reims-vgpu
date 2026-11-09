@@ -290,6 +290,43 @@ void deferral()
 	check(r->deferral == kRgfxCacheNotDeferred, "an answer after it changes nothing");
 }
 
+// On a host that answers which surfaces need a cache, a deferral refused, or a surface read not
+// fresh, has the block ask with its pages; answered in place, its entry goes.
+void ungated()
+{
+	RgfxCachedSurface entries[3] = {};
+	RgfxCacheTable t = {entries, 0, 3};
+	void *map = nullptr, *wire = nullptr;
+	int mapping = 0, memory = 0;
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->map = &mapping;
+	c->wire = &memory;
+	c->deferral = kRgfxCacheGating;
+	check(rgfxCacheUngated(t, kSurface, &map, &wire) && map == &mapping && wire == &memory,
+	      "a gating entry goes, its mapping and memory the caller's to let go");
+	check(rgfxCacheFind(t, kSurface) == nullptr && t.count == 0, "nothing is left of it");
+
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheGating;
+	check(rgfxCacheGated(t, kSurface), "fresh, it asks to be deferred");
+	check(rgfxCacheUngated(t, kSurface, &map, &wire) && t.count == 0,
+	      "a deferring one goes too, its deferral refused and its pages in place");
+
+	// One the host deferred, or one named cached, stays.
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheGating;
+	rgfxCacheSettled(t, kSurface, true);
+	check(!rgfxCacheUngated(t, kSurface, &map, &wire) && map == nullptr && wire == nullptr &&
+	          rgfxCacheFind(t, kSurface) == c,
+	      "a deferred entry stays");
+	RgfxCachedSurface *d = rgfxCacheAdd(t, kOther, kOtherBlock, kOtherId);
+	d->deferral = kRgfxCacheGating;
+	rgfxCacheSettled(t, kOther, false);
+	check(!rgfxCacheUngated(t, kOther, &map, &wire) && rgfxCacheFind(t, kOther) == d,
+	      "so does one whose pages were named cached");
+	check(!rgfxCacheUngated(t, kNotCached, &map, &wire), "and a surface not cached has none");
+}
+
 // Op 5 keeps a dormant deferred block while clients are left, and its release names its pages
 // only where the GPU wrote it and the surface lives on.
 void deferredRelease()
@@ -952,6 +989,7 @@ int main()
 	clients();
 	room();
 	deferral();
+	ungated();
 	deferredRelease();
 	forgottenAttach();
 	keptAttachWire();

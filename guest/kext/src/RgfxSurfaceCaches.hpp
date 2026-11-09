@@ -535,6 +535,22 @@ inline void rgfxCacheSettled(RgfxCacheTable &t, uint64_t key, bool deferred)
 		c->deferral = deferred ? kRgfxCacheDeferred : kRgfxCacheNotDeferred;
 }
 
+// The ask of surface `key`'s block, made for its deferral, names its pages instead, and the host
+// answered that they lie in place (a host that answers which surfaces need a cache, where the
+// deferral was refused or the surface read not fresh): the surface is not cached, so its entry
+// goes, its mapping and its memory, retained and never prepared for the entry, in `*map` and
+// `*wire` for the caller to let go. False, nothing changed, where the surface is not gating or
+// deferring: an entry the host deferred, or named cached, stays.
+inline bool rgfxCacheUngated(RgfxCacheTable &t, uint64_t key, void **map, void **wire)
+{
+	*map = *wire = nullptr;
+	RgfxCachedSurface *c = rgfxCacheFind(t, key);
+	if (c == nullptr || (c->deferral != kRgfxCacheGating && c->deferral != kRgfxCacheDeferring))
+		return false;
+	rgfxCacheRemove(t, c, map, wire);
+	return true;
+}
+
 // Whether the asker's hold of a block whose ask named its pages after all (its surface not fresh,
 // the deferral refused, or no device cache: deferSurfaceBlock), `naming` the outcome, wires
 // them again for itself, the block cached where `cached`. The naming's own wiring

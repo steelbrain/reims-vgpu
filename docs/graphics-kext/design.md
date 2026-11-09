@@ -635,6 +635,35 @@ Stages:
       layout (an older bundle's) stays in place, as every block of such a
       host did before (`reims-vgpu`'s `graphics/decode/surface_pages.rs`,
       "Device caches where the pages cannot serve").
+      Such a surface's pages are the CPU's copy alone, so where it is fresh
+      they wait for a CPU lock that needs them, as *Deferred pages* above
+      has them on a GPU of its own memory. The host offers
+      `RGFX_FEATURE_SURFACE_DEFERRED_ASK` beside `SURFACE_CACHE_REFUSED`,
+      with a budget as `SURFACE_DEFERRED`'s, and the kext's deferral then
+      asks with the surface's layout (`DEFERRED` with `ASK_CACHE` and no
+      runs). The host defers the block only where textures over the layout
+      would lie in place over no import of any pages the surface may come
+      to have (`GpuDevice::fresh_surface_never_in_place`): rows that end
+      inside the GPU's lines, which no pages change, or, on RADV, a plane of
+      more pages than one dma-buf takes pieces, each counted a piece of its
+      own, as a fresh surface's come (**measured** on the 780M: Safari's
+      WebKit tiles of 1,824 pages came in 1,379 to 1,824 runs). It refuses
+      every other with nothing made, as it refuses one past its budget, and
+      the kext then names the block's pages asking as above: answered a
+      cache, it posts them again cached; answered OK, the surface is not
+      cached, and the device cache's entry the deferral made goes. So no
+      surface whose pages could serve in place takes a cache for being
+      deferred, and a full budget leaves a surface as it was without the
+      feature. A deferred block is the deferred block above from then on:
+      its pages wired, named (`ATTACH`) and copied into the cache only at a
+      CPU lock that needs them. Before it, Safari's WebKit tiles, which the
+      GPU alone draws, wired each its 7 MiB of the guest's memory at its
+      first use, with the host copying the zeros into the cache, and the
+      wired pages counted in the owner's footprint though WebKit marked the
+      tiles volatile: about 400 of them took a WebContent past its 2 GB
+      footprint limit (**measured** on the 780M and the Iris, an 8 GiB
+      macOS 26.7.2 guest scrolling a long page), whose corpse and memory
+      pressure stalled it for 100 to 800 ms.
       The guest lays its surfaces' rows out as the GPU's images take them
       in place: where the host's GPU aligns a linear image's rows to more
       than IOSurface's 64 bytes (256 on RADV), the host says so in the
