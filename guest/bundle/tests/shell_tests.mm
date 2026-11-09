@@ -167,6 +167,24 @@ bool ringEmpty(TestRing &ring);
 void drainRing(TestRing &ring);
 void syncAsCommitted(std::initializer_list<id> textures);
 
+// A device that answers as the M3 Max does where the texture rules ask: an Apple GPU (every Apple
+// family) that makes 1, 2 and 4 samples a texel (oracle_texdesc device ms.s8: "sampleCount (8) is
+// not supported by device").
+@interface RgfxAppleFamilyDevice : NSObject
+- (BOOL)supportsFamily:(MTLGPUFamily)family;
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count;
+@end
+@implementation RgfxAppleFamilyDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	return family >= MTLGPUFamilyApple1 && family <= MTLGPUFamilyApple9;
+}
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count
+{
+	return count == 1 || count == 2 || count == 4;
+}
+@end
+
 namespace {
 
 // A ring + id space + serialiser over a plain-buffer region, the fixture every
@@ -1743,24 +1761,6 @@ static const DescriptorCase kDescriptorCases[] = {
                    "device.\nMTLTextureDescriptor: Multisample textures cannot be allocated with "
                    "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
 };
-
-// A device that answers as the M3 Max does where the texture rules ask: an Apple GPU (every Apple
-// family) that makes 1, 2 and 4 samples a texel (oracle_texdesc device ms.s8: "sampleCount (8) is
-// not supported by device").
-@interface RgfxAppleFamilyDevice : NSObject
-- (BOOL)supportsFamily:(MTLGPUFamily)family;
-- (BOOL)supportsTextureSampleCount:(NSUInteger)count;
-@end
-@implementation RgfxAppleFamilyDevice
-- (BOOL)supportsFamily:(MTLGPUFamily)family
-{
-	return family >= MTLGPUFamilyApple1 && family <= MTLGPUFamilyApple9;
-}
-- (BOOL)supportsTextureSampleCount:(NSUInteger)count
-{
-	return count == 1 || count == 2 || count == 4;
-}
-@end
 
 // The kDescriptorCases the M3 Max under macOS 27.0.1 answers otherwise than the x86 Macs, at the
 // device's newTextureWithDescriptor: (oracle_texdesc Apple device, 11-09): its words where it ends
