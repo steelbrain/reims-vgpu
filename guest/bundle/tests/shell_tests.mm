@@ -185,6 +185,24 @@ void syncAsCommitted(std::initializer_list<id> textures);
 }
 @end
 
+// A device as an arm64 guest's answers: no Apple family, as the host lets it answer none, and an
+// Apple GPU's texture rules (RgfxAppleRulesDevice, on arm64 builds).
+@interface RgfxGuestRulesDevice : NSObject
+- (BOOL)supportsFamily:(MTLGPUFamily)family;
+- (BOOL)rgfxAppleRules;
+@end
+@implementation RgfxGuestRulesDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	(void)family;
+	return NO;
+}
+- (BOOL)rgfxAppleRules
+{
+	return YES;
+}
+@end
+
 namespace {
 
 // A ring + id space + serialiser over a plain-buffer region, the fixture every
@@ -2699,6 +2717,19 @@ void test_texture_descriptor_validation_as_an_apple_gpu()
 	id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
 	CHECK(rgfxAppleGPU(apple) && !rgfxAppleGPU(nil) &&
 	      !rgfxAppleGPU((id<MTLDevice>)[NSObject new]));
+	// An arm64 guest's device takes an Apple GPU's rules though it answers no Apple family, so
+	// its creators answer nil for a two-plane format (550, which 14.6.1's WindowServer makes)
+	// where the x86 Macs' rules end the process; an x86-64 build keeps the x86 Macs' rules.
+	id<MTLDevice> guest = (id<MTLDevice>)[RgfxGuestRulesDevice new];
+	MTLTextureDescriptor *twoPlane = [MTLTextureDescriptor new];
+	twoPlane.pixelFormat = (MTLPixelFormat)550;
+	twoPlane.width = 64;
+	twoPlane.height = 64;
+#if defined(__arm64__)
+	CHECK(rgfxAppleGPU(guest) && rgfxDeviceMakesNoTextureOf(twoPlane, guest));
+#else
+	CHECK(!rgfxAppleGPU(guest) && !rgfxDeviceMakesNoTextureOf(twoPlane, guest));
+#endif
 	for (const DescriptorCase &c : kDescriptorCases) {
 		if (const char *words = appleWords(c)) {
 			checkDies(("apple-texdesc-" + std::string(c.name)).c_str(), words);

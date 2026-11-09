@@ -164,8 +164,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// multisample formats and the storage it takes, and its compressed formats (RgfxTexture.mm).
 void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLDevice> device = nil);
 
-/// Whether `device` answers as an Apple GPU, an Apple family (Apple7, every Apple-silicon Mac's),
-/// as the device answers in an arm64 guest, where Metal's rules are an Apple GPU's: false for nil.
+/// Whether Metal's rules for `device` are an Apple GPU's: where `device` answers an Apple family
+/// (Apple7, every Apple-silicon Mac's), and in an arm64 guest where it is the guest's device
+/// (RgfxAppleRulesDevice), whatever families it answers, as every GPU an arm64 Mac has is Apple's.
+/// False for nil.
 bool rgfxAppleGPU(id<MTLDevice> _Nullable device);
 
 /// Whether `format` is a block-compressed format the device has: BC1 to BC7, and on an Apple GPU
@@ -231,6 +233,17 @@ void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64
 @protocol RgfxLinearAlignmentSource <NSObject>
 - (NSUInteger)rgfxLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format;
 @end
+
+#if defined(__arm64__)
+/// The device of an arm64 guest (RgfxMetalDevice), whose texture rules are an Apple GPU's
+/// (rgfxAppleGPU) though it answers no Apple family while the host lets it answer none
+/// (device_info.rs, cap_apple_families): an arm64 Mac's GPU is always Apple's, and the guest's
+/// frameworks make what an Apple GPU takes, such as a texture of a two-plane format, which the
+/// x86 Macs' rules end the process at.
+@protocol RgfxAppleRulesDevice <NSObject>
+- (BOOL)rgfxAppleRules;
+@end
+#endif
 
 NS_ASSUME_NONNULL_END
 

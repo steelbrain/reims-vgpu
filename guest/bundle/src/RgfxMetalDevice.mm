@@ -520,6 +520,11 @@ bool rgfxKextQueueOpener(void *context, const RgfxQueueCreate &q)
 - (uint64_t)rgfxListenQueue;
 @end
 
+#if defined(__arm64__)
+@interface RgfxMetalDevice () <RgfxAppleRulesDevice>
+@end
+#endif
+
 namespace {
 void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 {
@@ -1398,6 +1403,14 @@ RGFX_LOG_UNRECOGNIZED
 	// bit the host reports among them; any other value names no family, and is no.
 	return _caps.supportsFamily(static_cast<int64_t>(gpuFamily));
 }
+
+#if defined(__arm64__)
+// In an arm64 guest, Metal's texture rules are an Apple GPU's (RgfxAppleRulesDevice).
+- (BOOL)rgfxAppleRules
+{
+	return YES;
+}
+#endif
 
 - (BOOL)supportsFeatureSet:(MTLFeatureSet)featureSet
 {

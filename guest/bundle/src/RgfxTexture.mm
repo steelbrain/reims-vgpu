@@ -701,6 +701,11 @@ bool rgfxAppleCompressedFormat(uint64_t f)
 
 bool rgfxAppleGPU(id<MTLDevice> device)
 {
+#if defined(__arm64__)
+	if ([device respondsToSelector:@selector(rgfxAppleRules)] &&
+	    [(id<RgfxAppleRulesDevice>)device rgfxAppleRules])
+		return true;
+#endif
 	return device != nil && [device respondsToSelector:@selector(supportsFamily:)] &&
 	       [device supportsFamily:MTLGPUFamilyApple7];
 }
