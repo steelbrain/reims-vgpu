@@ -515,8 +515,10 @@ pub(crate) struct Askable {
 enum Asking {
     /// Begun and not yet committed, its record unposted.
     Begun(Arc<Scheduled>),
-    /// Asked before its commit: its record posted, its ticket out until its commit.
-    Asked(Option<Ticket>),
+    /// Asked before its commit: its record posted, its ticket out until its commit. Nothing reads
+    /// the ticket: it is held for its drop, which gives it back to the commit order where
+    /// [`Askable::end`] leaves this state, at the buffer's commit or as it ends uncommitted.
+    Asked { _ticket: Option<Ticket> },
     /// Committed before an ask: an ask posts its record at once, with no ticket, as its commit
     /// already has its place.
     Committed(Arc<Scheduled>),
@@ -529,7 +531,7 @@ impl Askable {
     /// Whether an ask may still post its record, or it holds its ticket.
     fn open(&self) -> bool {
         match &*self.state.lock() {
-            Asking::Begun(_) | Asking::Asked(_) => true,
+            Asking::Begun(_) | Asking::Asked { .. } => true,
             Asking::Committed(scheduled) => !scheduled.is_posted(),
             Asking::Ended => false,
         }
@@ -543,7 +545,9 @@ impl Askable {
             let mut state = self.state.lock();
             match std::mem::replace(&mut *state, Asking::Ended) {
                 Asking::Begun(scheduled) => {
-                    *state = Asking::Asked(sequencer.issue(self.context, false));
+                    *state = Asking::Asked {
+                        _ticket: sequencer.issue(self.context, false),
+                    };
                     scheduled
                 }
                 Asking::Committed(scheduled) => scheduled,
