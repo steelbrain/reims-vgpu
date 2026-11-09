@@ -225,20 +225,32 @@ impl Drop for Ram {
 }
 
 /// `length` bytes of guest RAM at [`RAM`], every page touched where `touched`, else none: a
-/// memfd's shared mapping on Linux (with huge pages asked for where `RGK_BENCH_THP=1`), anonymous
-/// memory on macOS.
+/// memfd's shared mapping on Linux (with huge pages asked for where `RGK_BENCH_THP=1`), sealed as
+/// QEMU's `memory-backend-memfd` seals it (`F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`), since
+/// udmabuf refuses a memfd not sealed against shrinking; anonymous memory on macOS.
 fn guest_ram(length: u64, touched: bool) -> Ram {
     #[cfg(target_os = "linux")]
     let (at, file) = {
         use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
         // SAFETY: a NUL-terminated name; the descriptor is owned from here on.
-        let fd = unsafe { libc::memfd_create(c"rvg-bench-ram".as_ptr(), libc::MFD_CLOEXEC) };
+        let fd = unsafe {
+            libc::memfd_create(
+                c"rvg-bench-ram".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
         assert!(fd >= 0);
         // SAFETY: a descriptor just made, owned once.
         let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
         // SAFETY: sizing the file the test owns.
         assert_eq!(
             unsafe { libc::ftruncate(fd.as_raw_fd(), length as libc::off_t) },
+            0
+        );
+        let seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        // SAFETY: sealing the file the test owns, sized just above.
+        assert_eq!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) },
             0
         );
         // SAFETY: a new shared mapping of the whole file, unmapped at the drop.
