@@ -784,7 +784,9 @@ RgfxIOMFBWord ReimsGraphics::get_dot_pitch(uint32_t *pitch)
 // macOS 14.6.1's QuartzCore and IOMobileFramebuffer.framework, and 27.0.1's AppleParavirtGPU, whose
 // set_digital_out_mode looks the second up among its timings and the first among that timing's
 // colour modes). The device shows the mode, as the x86-64 framebuffer's setDisplayMode has it
-// shown, and the framebuffer then publishes its size and timing ID as the paravirtual display does:
+// shown; then, as the paravirtual display does, the class's own fields get the mode's size, in the
+// class's gate (RgfxLegacySwapLayout.hpp), which its get_display_size answers and its swap_submit
+// and default framebuffer surface read, and the framebuffer publishes the size and the timing ID:
 // DisplayWidth, DisplayHeight and DPTimingModeId. A pair the display does not publish is answered
 // kIOReturnUnsupported, as the paravirtual display leaves it to the class, which answers that.
 RgfxIOMFBWord ReimsGraphics::set_digital_out_mode(uint32_t colorId, uint32_t timingId)
@@ -797,6 +799,22 @@ RgfxIOMFBWord ReimsGraphics::set_digital_out_mode(uint32_t colorId, uint32_t tim
 	IOReturn r = kIOReturnUnsupported;
 	if (published) {
 		r = setScanout(mode);
+		if (r == kIOReturnSuccess && mobileSwapLayout) {
+			IOWorkLoop::Action write = [](OSObject *owner, void *layout, void *width, void *height,
+			                              void *) -> IOReturn {
+				rgfxLegacySetDisplaySize(owner, *static_cast<const RgfxLegacySwapLayout *>(layout),
+				                         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(width)),
+				                         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(height)));
+				return kIOReturnSuccess;
+			};
+			void *layout = const_cast<RgfxLegacySwapLayout *>(mobileSwapLayout);
+			void *width = reinterpret_cast<void *>(static_cast<uintptr_t>(mode.width));
+			void *height = reinterpret_cast<void *>(static_cast<uintptr_t>(mode.height));
+			if (IOWorkLoop *loop = getWorkLoop())
+				loop->runAction(write, this, layout, width, height);
+			else
+				write(this, layout, width, height, nullptr);
+		}
 		if (r == kIOReturnSuccess) {
 			setProperty("DisplayWidth", mode.width, 32);
 			setProperty("DisplayHeight", mode.height, 32);

@@ -1,11 +1,12 @@
 // RgfxLegacySwapLayout: where IOMobileGraphicsFamily's IOMobileFramebufferLegacy keeps its swap
-// queue on each arm64 release the arm64e kext runs on, and the queue as a display subclass's
-// swap_begin_gated takes its swaps from it (ReimsGraphicsMobile.cpp). The class declares no
-// accessor for them. Apple's paravirtual display, the class's subclass in a VM
-// (AppleParavirtDisplay), reads and writes them at these offsets in its swap_begin_gated,
-// clean_queue_gated and program_hardware_gated, and the class's own swap_complete_gated and
-// dropSwap_gated do the same (read from each release's AppleParavirtGPU and
-// IOMobileGraphicsFamily). Each release's class is told by its size, the size its metaclass gives
+// queue and its display's size on each arm64 release the arm64e kext runs on, the queue as a
+// display subclass's swap_begin_gated takes its swaps from it, and the size as its
+// set_digital_out_mode sets it (ReimsGraphicsMobile.cpp). The class declares no accessor for them.
+// Apple's paravirtual display, the class's subclass in a VM (AppleParavirtDisplay), reads and
+// writes the queue at these offsets in its swap_begin_gated, clean_queue_gated and
+// program_hardware_gated, and the size in its set_digital_out_mode, and the class's own
+// swap_complete_gated and dropSwap_gated do the same with the queue, and its get_display_size with
+// the size (read from each release's AppleParavirtGPU and IOMobileGraphicsFamily). Each release's class is told by its size, the size its metaclass gives
 // it. Header-only and free of the kernel's headers, for the native tests.
 //
 // Our own code.
@@ -35,15 +36,20 @@ struct RgfxLegacySwapLayout {
 	uint32_t layers;
 	// In a swap: each layer's IOSurface, layer 0's first.
 	uint32_t surfaces;
+	// In the class: the display's width, then its height, in pixels, two words. The class's
+	// get_display_size, display_width and display_height answer them, and its swap_submit and
+	// default framebuffer surface read them; the class never writes them, and the paravirtual
+	// display's set_digital_out_mode writes both, in its gate.
+	uint32_t displaySize;
 };
 
 // macOS 14.6 (Darwin 23.6), 15.6 (24.6), 26.6 (25.6), and 27.0 and 27.0.1 (27.0): the arm64
 // releases Ambrosia boots from 14 on, where the arm64e kext loads (its MinKernel is 23).
 constexpr RgfxLegacySwapLayout kRgfxLegacySwapLayouts[] = {
-    {"14", 0x18a0, 0x1560, 0xb90, 0x32c, 0x318, 0xa40},
-    {"15", 0x19c0, 0x1668, 0xc00, 0x32c, 0x318, 0xa48},
-    {"26", 0x1af8, 0x1790, 0xc78, 0x34c, 0x338, 0xac0},
-    {"27", 0x1dd8, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80},
+    {"14", 0x18a0, 0x1560, 0xb90, 0x32c, 0x318, 0xa40, 0x16b0},
+    {"15", 0x19c0, 0x1668, 0xc00, 0x32c, 0x318, 0xa48, 0x17c8},
+    {"26", 0x1af8, 0x1790, 0xc78, 0x34c, 0x338, 0xac0, 0x1900},
+    {"27", 0x1dd8, 0x1a40, 0xd38, 0x3ec, 0x3d8, 0xb80, 0x1bf0},
 };
 
 // The layout of the release whose IOMobileFramebufferLegacy is `classSize` bytes, or null for a
@@ -54,6 +60,17 @@ inline const RgfxLegacySwapLayout *rgfxLegacySwapLayoutOf(uint32_t classSize)
 		if (l.classSize == classSize)
 			return &l;
 	return nullptr;
+}
+
+// Sets the display's size in the class's own fields at a release's offsets: `framebuffer` is the
+// IOMobileFramebufferLegacy. Call in the class's gate, as the paravirtual display writes them.
+inline void rgfxLegacySetDisplaySize(void *framebuffer, const RgfxLegacySwapLayout &layout,
+                                     uint32_t width, uint32_t height)
+{
+	uint32_t *size = reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(framebuffer) +
+	                                              layout.displaySize);
+	size[0] = width;
+	size[1] = height;
 }
 
 // One framebuffer's swap queue at a release's offsets: `framebuffer` is the

@@ -65,6 +65,24 @@ void testLayout(const RgfxLegacySwapLayout &layout)
 	check(layout.link % 8 == 0 && layout.surfaces % 8 == 0 && layout.current % 8 == 0,
 	      "pointers are aligned", r);
 	check(layout.state % 4 == 0 && layout.layers % 4 == 0, "words are aligned", r);
+	check(layout.displaySize % 8 == 0 && layout.displaySize + 8 <= layout.classSize,
+	      "the display's size is two aligned words in the class", r);
+	check((layout.displaySize >= layout.current + 24 || layout.displaySize + 8 <= layout.current),
+	      "the display's size is not the queue's", r);
+
+	{
+		Fake sized(layout);
+		std::memset(sized.fb.data(), 0xa5, sized.fb.size());
+		rgfxLegacySetDisplaySize(sized.fb.data(), layout, 2560, 1440);
+		uint32_t w, h;
+		std::memcpy(&w, sized.fb.data() + layout.displaySize, 4);
+		std::memcpy(&h, sized.fb.data() + layout.displaySize + 4, 4);
+		check(w == 2560 && h == 1440, "the size is the width, then the height", r);
+		size_t changed = 0;
+		for (uint8_t byte : sized.fb)
+			changed += byte != 0xa5;
+		check(changed <= 8, "the size writes its two words alone", r);
+	}
 
 	Fake f(layout);
 	RgfxLegacySwapQueue q(f.fb.data(), layout);
@@ -135,6 +153,12 @@ int main()
 		testLayout(layout);
 	check(rgfxLegacySwapLayoutOf(0x1dd0) == nullptr && rgfxLegacySwapLayoutOf(0) == nullptr,
 	      "a size no release has tells none", "-");
+	// Where each release's get_display_size reads the width and the height, as its paravirtual
+	// display's set_digital_out_mode writes them (read from 14.6.1, 15.6.1, 26.6.2 and 27.0.1).
+	const uint32_t sizes[] = {0x16b0, 0x17c8, 0x1900, 0x1bf0};
+	for (size_t i = 0; i < 4; i++)
+		check(kRgfxLegacySwapLayouts[i].displaySize == sizes[i],
+		      "the display's size is where the release keeps it", kRgfxLegacySwapLayouts[i].release);
 	std::printf("legacy_swap_queue_test: %d checks passed over %zu releases\n", checks,
 	            sizeof(kRgfxLegacySwapLayouts) / sizeof(kRgfxLegacySwapLayouts[0]));
 	return 0;
