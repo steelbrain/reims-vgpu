@@ -129,13 +129,19 @@ is its transport:
   allocations from there. It has no dirty log: the library's window draws
   the guest's scanout again at each of the display's refreshes while it
   shows no presented surface.
-- **The guest's RAM**: the device gives the library the map of the RAM ranges
-  that are a shared file in pages of the host's size (the memfd of
+- **The guest's RAM**: on Linux the device gives the library the map of the
+  RAM ranges that are a shared file in pages of the host's size (the memfd of
   `reims-ctl`'s VMs), with the files behind them, and the GPU uses an
   IOSurface's own pages in place. A range with no such file (anonymous or huge
   pages) is left out of the map, and a surface whose pages fall there is copied
   as every surface is without a map; since IOSurfaces live only in the main
-  RAM, which the memfd backs, every surface maps in place. QEMU gives the
+  RAM, which the memfd backs, every surface maps in place. On macOS the device
+  gives every RAM range in pages of the host's size, with no file (an fd of
+  -1): the library views the process's own mapping of it (`mach_vm_remap`),
+  which shares the pages HVF maps into the guest. There the library uses a
+  surface in place only for a guest that lays its pages out in whole 16 KiB
+  pages (`RGFX_FEATURE_PAGES_16K`, which the arm64e kext takes); an x86-64
+  guest's surfaces are copied. QEMU gives the
   library no dirty log of the guest's RAM: with one (`2243023e`, which
   `926401c4` reverts), resolving the pages behind each IOSurface's import cost
   its thread about 5 ms a command buffer on a discrete GPU, more than the whole
@@ -1023,18 +1029,20 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
   the guest's RAM is a shared memfd, as `reims-ctl` gives its VMs on Linux:
   `-machine vmapple,...,memory-backend=ram,dump-guest-core=off` and
   `-object memory-backend-memfd,id=ram,size=8G,share=on`. Under HVF the RAM
-  stays QEMU's own.
+  stays QEMU's own, which the device maps with no file on macOS ("The
+  reims-graphics device", above).
 - **The guest's RAM on `vmapple` is not all memfd.** Besides the guest's main
   RAM, `vmapple` has two small RAM regions with no file behind them:
   `firmware` (1 MiB at 0x100000, where Ambrosia runs) and `VMApple Config`
   (64 KiB at 0x400000), each made by `memory_region_init_ram`, and no
-  command-line option gives them one. The device maps the file-backed ranges
-  and leaves these two out ("The reims-graphics device", above), so with the
-  memfd it maps the main RAM in place and prints no copy warning; an IOSurface
-  never lies in those two regions, so every surface still maps in place. (With
-  the main RAM not a memfd either, no range is file-backed, and the device
-  warns `no guest RAM is a shared memfd in pages of the host's size:
-  IOSurfaces are copied for the GPU` and copies every surface.)
+  command-line option gives them one. On Linux the device maps the
+  file-backed ranges and leaves these two out ("The reims-graphics device",
+  above), so with the memfd it maps the main RAM in place and prints no copy
+  warning; an IOSurface never lies in those two regions, so every surface
+  still maps in place. (With the main RAM not a memfd either, no range is
+  file-backed, and the device warns `no guest RAM is a shared memfd in pages
+  of the host's size: IOSurfaces are copied for the GPU` and copies every
+  surface.) On macOS it maps all three, with no file.
 - **The checks**, each a line with PASS or FAIL and what it found, then the
   verdict; the script's header says what each one reads. `firmware`:
   Ambrosia entered the kernel; where it stops the boot, its line, and QEMU
