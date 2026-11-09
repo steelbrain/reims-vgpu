@@ -159,11 +159,34 @@ inline const char *rgfxFrameInfoTag(uint32_t index)
 }
 
 // A swap's presentation time as the frame info carries it: `shown`, a time of mach_absolute_time's,
-// as mach_continuous_time's, from the two clocks read together (`absolute`, `continuous`); 0
-// stays 0, a swap that showed nothing.
+// as mach_continuous_time's, from the two clocks read together (`absolute`, `continuous`,
+// rgfxClocksTogether); 0 stays 0, a swap that showed nothing.
 inline uint64_t rgfxFrameInfoTime(uint64_t shown, uint64_t absolute, uint64_t continuous)
 {
 	return shown ? shown + (continuous - absolute) : 0;
+}
+
+// How many times rgfxClocksTogether reads the clocks at most.
+constexpr int kRgfxClockReads = 8;
+
+// The absolute and the continuous clock read together, by `absolute` and `continuous`, into `*a`
+// and `*c`: the continuous clock read between two reads of the absolute one that agree, so its
+// lead over the absolute one, the time the system spent asleep, is exact, and two swaps shown in
+// one refresh get one presentation time. Read once each, the lead took the tick of mach time
+// between the reads where one fell there, and a swap's time came a tick before the one shown
+// before it in the same refresh (measured on a macOS 14.6.1 arm64 guest). Where none of
+// kRgfxClockReads tries agree, the last try's later absolute read: a lead short by the ticks
+// between its reads.
+template <typename Absolute, typename Continuous>
+inline void rgfxClocksTogether(Absolute absolute, Continuous continuous, uint64_t *a, uint64_t *c)
+{
+	for (int i = 0; i < kRgfxClockReads; i++) {
+		const uint64_t before = absolute();
+		*c = continuous();
+		*a = absolute();
+		if (*a == before)
+			return;
+	}
 }
 
 // The records a display keeps while the class holds them, and dispatches in order before the next

@@ -150,6 +150,44 @@ void frameInfo()
 	      "frameInfo");
 	check(rgfxFrameInfoTime(0, 5000, 5040) == 0, "nothing shown, 0", "frameInfo");
 
+	// The clocks read together: the continuous one 40 ahead of the absolute one, which ticks
+	// at the reads of it `ticks` says (from 1). Reads that agree give the lead exactly, the reads
+	// before them taken again where a tick fell between; where none agree, the last try's later
+	// read.
+	struct Clocks {
+		std::vector<uint64_t> ticks;
+		uint64_t now = 5000, reads = 0, continuousReads = 0;
+		uint64_t absolute()
+		{
+			reads++;
+			for (uint64_t t : ticks)
+				now += t == reads ? 1 : 0;
+			return now;
+		}
+		uint64_t continuous()
+		{
+			continuousReads++;
+			return now + 40;
+		}
+	};
+	const std::vector<std::vector<uint64_t>> agreeing = {{}, {3}, {2}, {2, 4}, {1, 2, 4, 6}};
+	for (const std::vector<uint64_t> &ticks : agreeing) {
+		Clocks k{ticks};
+		uint64_t a = 0, c = 0;
+		rgfxClocksTogether([&] { return k.absolute(); }, [&] { return k.continuous(); }, &a, &c);
+		check(c - a == 40 && rgfxFrameInfoTime(1000, a, c) == 1040,
+		      "reads that agree give the lead exactly", "frameInfo");
+	}
+	{
+		Clocks k{};
+		for (uint64_t r = 2; r <= 2 * kRgfxClockReads; r += 2)
+			k.ticks.push_back(r); // a tick between the two reads of every try
+		uint64_t a = 0, c = 0;
+		rgfxClocksTogether([&] { return k.absolute(); }, [&] { return k.continuous(); }, &a, &c);
+		check(k.continuousReads == kRgfxClockReads && c - a == 39,
+		      "none agree: every try made, the last one's later read", "frameInfo");
+	}
+
 	// QuartzCore's mask for both tags: bits 0 and 1, the presentation time, then its difference.
 	const uint64_t first = rgfxFrameInfoTime(1000, 5000, 5040);
 	const uint64_t second = rgfxFrameInfoTime(1400, 5400, 5440);
@@ -282,9 +320,11 @@ void imports()
 	      "Graft binds the enqueue from IOMobileGraphicsFamily", "imports");
 	check(source.find("rgfxFrameInfoTag(index)") != std::string::npos,
 	      "supported_frame_info answers the tags", "imports");
-	check(source.find("rgfxFrameInfoTime(shown, absolute, mach_continuous_time())") !=
-	          std::string::npos,
-	      "the presentation time goes in mach_continuous_time's clock", "imports");
+	check(source.find("rgfxClocksTogether([] { return mach_absolute_time(); }, [] { return "
+	                  "mach_continuous_time(); },") != std::string::npos &&
+	          source.find("rgfxFrameInfoTime(shown, absolute, continuous)") != std::string::npos,
+	      "the presentation time goes in mach_continuous_time's clock, the clocks read together",
+	      "imports");
 }
 
 } // namespace

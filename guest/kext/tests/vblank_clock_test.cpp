@@ -2,7 +2,8 @@
 // time is its host stamp plus the clocks' offset, the held reading of the host's clock's where
 // one came (HOST_TIME), else the one with the shortest delivery, never after its receipt and never
 // going back; either offset follows a drift; the period comes from the stamps; and an answer taken
-// within a period after a VBLANK is that refresh's.
+// within a period after a VBLANK is that refresh's, one taken whole periods after it the refresh
+// that many periods on, up to kOffPeriods, and the answers' times never go back.
 #include <cstdio>
 
 #include "RgfxVblankClock.hpp"
@@ -79,19 +80,66 @@ static void neverBack()
 	CHECK(b > a);
 }
 
-static void shown()
+// A clock with two VBLANKs at 120 Hz, the second's time in `*t` and its receipt in `*receipt`.
+static RgfxVblankClock twoVblanks(uint64_t *t, uint64_t *receipt)
 {
 	RgfxVblankClock c;
 	uint64_t host = 1000000;
 	c.vblank(1, host, host + kOffset + 20000);
-	uint64_t t = c.vblank(2, host + kPeriod, host + kPeriod + kOffset + 20000);
-	uint64_t receipt = host + kPeriod + kOffset + 20000;
+	*t = c.vblank(2, host + kPeriod, host + kPeriod + kOffset + 20000);
+	*receipt = host + kPeriod + kOffset + 20000;
+	return c;
+}
+
+static void shown()
+{
+	uint64_t t = 0, receipt = 0;
 	// Taken with the VBLANK, or later within its period: that refresh's time.
+	RgfxVblankClock c = twoVblanks(&t, &receipt);
 	CHECK(c.shownAt(receipt) == t);
 	CHECK(c.shownAt(receipt + kPeriod - 1) == t);
-	// A period or more after it, or before it: the answer's own time.
-	CHECK(c.shownAt(receipt + kPeriod) == receipt + kPeriod);
+	// Whole periods after it, up to kOffPeriods: the refresh that many periods on, never after
+	// the answer's receipt.
+	c = twoVblanks(&t, &receipt);
+	CHECK(c.shownAt(receipt + kPeriod) == t + kPeriod);
+	c = twoVblanks(&t, &receipt);
+	CHECK(c.shownAt(receipt + 2 * kPeriod + 5) == t + 2 * kPeriod);
+	c = twoVblanks(&t, &receipt);
+	const uint64_t lastOn = receipt + RgfxVblankClock::kOffPeriods * kPeriod - 1;
+	CHECK(c.shownAt(lastOn) == t + (RgfxVblankClock::kOffPeriods - 1) * kPeriod);
+	CHECK(t + (RgfxVblankClock::kOffPeriods - 1) * kPeriod <= lastOn);
+	// kOffPeriods or more after it (the VBLANKs are off), or before it: the answer's own time.
+	c = twoVblanks(&t, &receipt);
+	const uint64_t off = receipt + RgfxVblankClock::kOffPeriods * kPeriod;
+	CHECK(c.shownAt(off) == off);
+	c = twoVblanks(&t, &receipt);
 	CHECK(c.shownAt(receipt - 1) == receipt - 1);
+}
+
+static void shownNeverBack()
+{
+	// An answer taken a period and 3 ms after the last VBLANK's receipt, before the next VBLANK
+	// came, is the next refresh's: the answer after that VBLANK, that refresh's too, does not
+	// go back (mapped to its receipt, the first came 3 ms after the second).
+	uint64_t t = 0, receipt = 0;
+	RgfxVblankClock c = twoVblanks(&t, &receipt);
+	const uint64_t first = c.shownAt(receipt + kPeriod + 3000000);
+	CHECK(first == t + kPeriod);
+	const uint64_t host = 1000000 + 2 * kPeriod;
+	const uint64_t next = c.vblank(3, host, host + kOffset + 3500000);
+	CHECK(next == t + kPeriod + RgfxVblankClock::kDriftNs); // its offset crept up a step
+	CHECK(c.shownAt(host + kOffset + 3600000) == next && next >= first);
+	// Each answer after one mapped by its own time, past the VBLANKs: the next refresh's time
+	// would go back, so the last answer's is taken.
+	c = twoVblanks(&t, &receipt);
+	const uint64_t own = receipt + RgfxVblankClock::kOffPeriods * kPeriod + 1000;
+	CHECK(c.shownAt(own) == own);
+	const uint64_t late = c.vblank(3, 1000000 + 2 * kPeriod, own + 2000);
+	CHECK(late < own);
+	CHECK(c.shownAt(own + 3000) == own);
+	// Two answers in one refresh: one time.
+	c = twoVblanks(&t, &receipt);
+	CHECK(c.shownAt(receipt + 100) == t && c.shownAt(receipt + 200) == t);
 }
 
 static void hostTimeWords()
@@ -181,6 +229,7 @@ int main()
 	drift();
 	neverBack();
 	shown();
+	shownNeverBack();
 	hostTimeWords();
 	readingsMapPastDelivery();
 	shortestRoundTripHolds();
