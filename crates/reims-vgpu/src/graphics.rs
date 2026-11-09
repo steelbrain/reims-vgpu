@@ -58,18 +58,18 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
-    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SCHEDULED_ASK,
-    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
-    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
-    RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
-    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES,
-    RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
-    RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET,
-    RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
-    RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
-    RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup,
-    RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName,
-    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE,
+    RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS,
+    RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED,
+    RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_DEFERRED_ASK,
+    RGFX_FEATURE_SURFACE_DEFERRED_CARRY, RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_VIDEO_CAPS_CODECS,
+    RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant,
+    RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted,
+    RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState,
+    RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxScheduledAsk,
+    RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -350,36 +350,37 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     u64::from(RGFX_FEATURE_MANAGED_AT_OFFSET)
                 };
             let pages_features = match (decoder.surface_pages_available(), unified_memory) {
-                    (false, _) => 0,
-                    // A host whose GPU shares the CPU's memory keeps a device cache only of the
-                    // surfaces whose pages its textures cannot use in place, where the kext asks,
-                    // and keeps a fresh one of those in its cache alone where the kext defers it,
-                    // asking, the few pages a process wrote of it without a lock carried in.
-                    (true, true) => {
-                        in_place
-                            | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED)
-                            | u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK)
-                            | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
-                    }
-                    // A host that keeps caches keeps fresh surfaces in them alone where the kext
-                    // defers their pages, the few a process wrote without a lock carried in.
-                    (true, false) => {
-                        in_place
-                            | u64::from(RGFX_FEATURE_SURFACE_CACHE)
-                            | u64::from(RGFX_FEATURE_SURFACE_DEFERRED)
-                            | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
-                    }
-                };
+                (false, _) => 0,
+                // A host whose GPU shares the CPU's memory keeps a device cache only of the
+                // surfaces whose pages its textures cannot use in place, where the kext asks,
+                // and keeps a fresh one of those in its cache alone where the kext defers it,
+                // asking, the few pages a process wrote of it without a lock carried in.
+                (true, true) => {
+                    in_place
+                        | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED)
+                        | u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK)
+                        | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+                }
+                // A host that keeps caches keeps fresh surfaces in them alone where the kext
+                // defers their pages, the few a process wrote without a lock carried in.
+                (true, false) => {
+                    in_place
+                        | u64::from(RGFX_FEATURE_SURFACE_CACHE)
+                        | u64::from(RGFX_FEATURE_SURFACE_DEFERRED)
+                        | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+                }
+            };
             // A host of 16 KiB pages offers the guest RAM's features only to a guest that takes
             // `PAGES_16K`, whose runs are whole 16 KiB pages: the device reads them in
             // `FEATURES_LO` and `_HI` once it is taken, and every other guest reads the features
-            // without them, as from a host with no guest RAM (`device::Host::features_with_16k_pages`).
-            let (features, features_16k) = if pages_features != 0 && decoder.surface_pages_need_16k()
-            {
-                (features | RGFX_FEATURE_PAGES_16K, pages_features)
-            } else {
-                (features | pages_features, 0)
-            };
+            // without them, as from a host with no guest RAM
+            // (`device::Host::features_with_16k_pages`).
+            let (features, features_16k) =
+                if pages_features != 0 && decoder.surface_pages_need_16k() {
+                    (features | RGFX_FEATURE_PAGES_16K, pages_features)
+                } else {
+                    (features | pages_features, 0)
+                };
             // The decoder carries out each feature the device may offer; the device's registers
             // read the budget only where it offers the deferred blocks.
             let offerable = features | features_16k;

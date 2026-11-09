@@ -7865,7 +7865,10 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         | RGFX_FEATURE_SURFACE_CACHE_REFUSED
         | RGFX_FEATURE_SURFACE_DEFERRED_ASK;
     let page = platform.vm().page_size();
-    assert!(page == 4096 || page == 16384, "the hosts the library builds for");
+    assert!(
+        page == 4096 || page == 16384,
+        "the hosts the library builds for"
+    );
     let sixteen = page == 16384;
     let want = if sixteen { 0 } else { in_place };
     let base = RGFX_FEATURE_CB_SUBMITTED
@@ -7949,7 +7952,9 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         );
         assert_eq!(
             u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
-            RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+            RGFX_FEATURE_SCHEDULED_ASK
+                | RGFX_FEATURE_PAGES_16K
+                | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
         );
         assert_eq!(
             u64::from(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()))

@@ -1052,7 +1052,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// ([`surface_pages::SurfaceViews::needs_16k_pages`]): the in-place features go only to a
     /// guest that takes `PAGES_16K`.
     pub(crate) fn surface_pages_need_16k(&self) -> bool {
-        self.shared.surface_views.lock().needs_16k_pages(&self.platform)
+        self.shared
+            .surface_views
+            .lock()
+            .needs_16k_pages(&self.platform)
     }
 
     /// `SURFACE_PAGES` carried out here, at once ([`Self::begin_surface_pages`],

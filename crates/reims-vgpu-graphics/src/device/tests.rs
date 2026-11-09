@@ -2625,7 +2625,10 @@ fn the_pages_16k_features_are_offered_only_once_taken() {
     take(OVER_RAM | PLAIN);
     assert_eq!(taken(), PLAIN | OVER_RAM);
     // Letting `PAGES_16K` go lets the rest go with it.
-    write(RGFX_REG_DRIVER_FEATURES_HI, (RGFX_FEATURE_SCHEDULED_ASK >> 32) as u32);
+    write(
+        RGFX_REG_DRIVER_FEATURES_HI,
+        (RGFX_FEATURE_SCHEDULED_ASK >> 32) as u32,
+    );
     assert_eq!(taken(), RGFX_FEATURE_SCHEDULED_ASK);
     assert_eq!((offered(), budget()), (PLAIN, 0));
     // Taken again and started, then reset: the reset hides them.
