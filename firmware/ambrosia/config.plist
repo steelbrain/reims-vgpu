@@ -12,6 +12,8 @@
 		<key>ExportVtableDiscriminators</key>
 		<array>
 			<string>__ZTV25IOMobileFramebufferLegacy</string>
+			<string>__ZTV26IOMobileFramebufferService</string>
+			<string>__ZTV19IOMobileFramebuffer</string>
 		</array>
 	</dict>
 </dict>

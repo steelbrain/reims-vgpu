@@ -6,10 +6,11 @@
 #
 #   make         build/ReimsGraphics.elf, the module
 #   make bundle  build/ReimsGraphics.cpio, a configuration bundle: config.plist,
-#                which names the module and the vtable whose discriminators Ambrosia
-#                hands to Graft (Kernel > ExportVtableDiscriminators), and the module as
-#                Drivers/ReimsGraphics.elf, in the cpio "newc" format with config.plist
-#                first, as Ambrosia reads it
+#                which names the module and the vtables whose discriminators Ambrosia
+#                hands to Graft (Kernel > ExportVtableDiscriminators: IOMobileFramebufferLegacy's
+#                and its superclasses', IOMobileFramebufferService's and IOMobileFramebuffer's),
+#                and the module as Drivers/ReimsGraphics.elf, in the cpio "newc" format with
+#                config.plist first, as Ambrosia reads it
 #   make config-bundle GRAFT=<Graft.kext> REIMS_GRAPHICS=<ReimsGraphics.kext>
 #                      RGFXGATE=<RgfxGate.kext>
 #                build/Config.cpio, our configuration: the bundle's config.plist with a

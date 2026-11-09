@@ -729,9 +729,10 @@ Makefile                 clang and lld: the module, build/ReimsGraphics.elf, and
                          build/Config.cpio (make config-bundle); the guest probes (make guest-tools)
 ReimsGraphicsModule.c    the entry point: the device's BARs, its control ring and its mode
 AmbrosiaGraphics.h       Ambrosia's graphics driver interface, revision 1
-config.plist             the bundle's configuration: the module, and IOMobileFramebufferLegacy's vtable,
-                         whose slots' pointer-authentication discriminators Ambrosia reads from the Boot
-                         KC and hands over, for Graft to sign the arm64e display's vtable with
+config.plist             the bundle's configuration: the module, and the vtables of IOMobileFramebufferLegacy
+                         and its superclasses, IOMobileFramebufferService and IOMobileFramebuffer, whose
+                         slots' pointer-authentication discriminators Ambrosia reads from the Boot KC and
+                         hands over, for Graft to sign the arm64e display's vtable with
                          (Kernel > ExportVtableDiscriminators)
 tools/stage-config.py    our configuration: config.plist with a Kernel > Add entry for Graft and each
                          of our two kexts, after checking each is an arm64e kext with its identifier
