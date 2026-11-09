@@ -786,6 +786,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The command buffer's ticket in the commit order, where it was answered at its take; given
     /// back with the handle, after its commit or its stand-in's.
     ticket: RefCell<Option<Ticket>>,
+    /// The command buffer, where a thread that waits for it to be scheduled may ask for its
+    /// `CB_SCHEDULED` ([`cmdbuf::Askable`]), from its begin to its commit, or the handle's end.
+    asked: RefCell<Option<Arc<cmdbuf::Askable>>>,
     /// The command buffer's turn in its queue's lane ([`lane`]), from its begin; it passes with
     /// the handle, once the buffer's commit, stand-in or failure is done.
     turn: RefCell<Option<Turn>>,
@@ -812,10 +815,12 @@ pub struct GraphicsDecoder<P: Platform> {
 }
 
 impl<P: Platform> Drop for GraphicsDecoder<P> {
-    /// As [`GraphicsDecoder::end_message`] does: its command buffer's queue's commit mark rises
+    /// As [`GraphicsDecoder::end_message`] does: a ticket an ask of its command buffer's
+    /// `CB_SCHEDULED` took is given back ([`cmdbuf::Askable`]), and its queue's commit mark rises
     /// before its turn passes, which a lane's job takes out of the handle first and lets go of
     /// after ([`commit_order`]).
     fn drop(&mut self) {
+        self.end_ask(false);
         self.note_committed();
     }
 }
@@ -936,6 +941,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             mark: Cell::new(None),
             ranges: Cell::new(None),
             ticket: RefCell::new(None),
+            asked: RefCell::new(None),
             turn: RefCell::new(None),
             posted_at_doorbell: Cell::new(false),
             scheduled_at_doorbell: Cell::new(false),
@@ -967,6 +973,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.mark.set(None);
         self.ranges.set(None);
         self.ticket.get_mut().take();
+        self.end_ask(false);
         // Its queue's commit mark rises before its turn passes, so a queue's buffers raise it in
         // its ring's order ([`commit_order`]).
         self.note_committed();

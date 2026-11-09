@@ -70,7 +70,11 @@
 //! handler unless it holds something. A buffer that does not ask keeps its `CB_SCHEDULED` to its
 //! scheduling: posted at its take, it would need its ticket in the commit order there, as a
 //! `CB_SUBMITTED` there does, and a walk held on one of a process's queues would then hold up the
-//! process's other queues' commits ([`Begun::scheduled_at_take`]). Metal makes such a buffer `Scheduled` within a fraction of a millisecond of its
+//! process's other queues' commits ([`Begun::scheduled_at_take`]). A thread that waits for it to
+//! be scheduled asks for it (`SCHEDULED_ASK`), and where it would have got the record at its take
+//! had it asked for its `CB_SUBMITTED`, the ask posts it, its ticket issued first ([`Askable`]):
+//! then a held walk holds up the process's other queues' later commits, as after a `CB_SUBMITTED`,
+//! only once a thread waits for it. Metal makes such a buffer `Scheduled` within a fraction of a millisecond of its
 //! commit, whatever its queue runs on the GPU before it: on the M3 Max (macOS 27) the scheduled
 //! handler of a buffer on an idle queue runs about 10 us after `commitAndWaitUntilSubmitted`
 //! returns, and behind a 120 ms buffer `waitUntilScheduled` returns in 0.1 ms; commit to the
@@ -399,6 +403,9 @@ type Records = (Option<Arc<Submitted>>, Arc<Scheduled>);
 pub(crate) struct Line {
     /// The committed buffers' records not seen posted, oldest first.
     line: Mutex<VecDeque<Records>>,
+    /// The begun buffers whose `CB_SCHEDULED` a waiting thread's ask may post ([`Askable`]),
+    /// oldest first, each until its record is posted, or it ends uncommitted.
+    asks: Mutex<VecDeque<Arc<Askable>>>,
     /// How many committed buffers of the queue that wait on the GPU for a buffer of another queue
     /// the platform has not yet taken.
     ordered: Arc<AtomicUsize>,
@@ -453,6 +460,22 @@ impl Line {
         line.push_back((submitted, scheduled));
     }
 
+    /// Notes `askable`, a buffer just begun whose `CB_SCHEDULED` an ask may post, last in the
+    /// queue's order; those whose records went, or that ended uncommitted, leave.
+    fn askable(&self, askable: Arc<Askable>) {
+        let mut asks = self.asks.lock();
+        asks.retain(|a| a.open());
+        asks.push_back(askable);
+    }
+
+    /// The buffer at `seqno`, `cb_obj_id`, where an ask may still post its `CB_SCHEDULED`.
+    fn asked(&self, seqno: u64, cb_obj_id: u64) -> Option<Arc<Askable>> {
+        let asks = self.asks.lock();
+        (asks.iter())
+            .find(|a| a.seqno == seqno && a.cb_obj_id == cb_obj_id)
+            .cloned()
+    }
+
     /// Posts, in commit order, the records of every buffer up to and including `last` (one
     /// [`Self::committed`] noted), each `CB_SUBMITTED` ahead of its `CB_SCHEDULED`, and lets them
     /// leave. Posted at most once each, whoever posts them.
@@ -467,6 +490,81 @@ impl Line {
                 break;
             }
         }
+    }
+}
+
+/// A begun command buffer whose `CB_SCHEDULED` a thread of its process that waits for it to be
+/// scheduled may ask for (`SCHEDULED_ASK`, [`GraphicsDecoder::ask_scheduled`]): one that would get
+/// it at its take had it asked for its `CB_SUBMITTED` ([`Begun::askable`]). The ask posts it at
+/// once, its ticket in the commit order issued first and given back at its commit, as an answer at
+/// its take does: a buffer its process sends once the record is posted is committed after it.
+/// So a walk held on one of a process's queues holds up the process's other queues' commits only
+/// once a thread has asked to wait for it; until then the buffer keeps its record to its
+/// scheduling, holding none of them up.
+pub(crate) struct Askable {
+    /// Its message's seqno, and the guest's id of the buffer.
+    seqno: u64,
+    cb_obj_id: u64,
+    /// Its context, its ticket's.
+    context: Option<u32>,
+    /// Where it is.
+    state: Mutex<Asking>,
+}
+
+/// Where an [`Askable`] buffer is.
+enum Asking {
+    /// Begun and not yet committed, its record unposted.
+    Begun(Arc<Scheduled>),
+    /// Asked before its commit: its record posted, its ticket out until its commit.
+    Asked(Option<Ticket>),
+    /// Committed before an ask: an ask posts its record at once, with no ticket, as its commit
+    /// already has its place.
+    Committed(Arc<Scheduled>),
+    /// Ended: asked and committed, or never committed (its stand-in's completion stands for its
+    /// record).
+    Ended,
+}
+
+impl Askable {
+    /// Whether an ask may still post its record, or it holds its ticket.
+    fn open(&self) -> bool {
+        match &*self.state.lock() {
+            Asking::Begun(_) | Asking::Asked(_) => true,
+            Asking::Committed(scheduled) => !scheduled.is_posted(),
+            Asking::Ended => false,
+        }
+    }
+
+    /// A thread waits for it to be scheduled: before its commit, its ticket in the commit order
+    /// is issued, then its `CB_SCHEDULED` posted; after it, its record is posted. Once asked, or
+    /// once it ended, an ask does nothing.
+    fn ask(&self, sequencer: &Arc<super::sequencer::Sequencer>) {
+        let scheduled = {
+            let mut state = self.state.lock();
+            match std::mem::replace(&mut *state, Asking::Ended) {
+                Asking::Begun(scheduled) => {
+                    *state = Asking::Asked(sequencer.issue(self.context, false));
+                    scheduled
+                }
+                Asking::Committed(scheduled) => scheduled,
+                other => {
+                    *state = other;
+                    return;
+                }
+            }
+        };
+        scheduled.post();
+    }
+
+    /// Its commit is done (`committed`), or it ends uncommitted: a ticket an ask issued is given
+    /// back, and an ask from now on posts its record only where it was committed.
+    fn end(&self, committed: bool) {
+        let mut state = self.state.lock();
+        let ended = match std::mem::replace(&mut *state, Asking::Ended) {
+            Asking::Begun(scheduled) if committed => Asking::Committed(scheduled),
+            _ => Asking::Ended,
+        };
+        *state = ended;
     }
 }
 
@@ -600,6 +698,16 @@ impl<P: Platform> Begun<P> {
     /// its process's other queues (`a_walk_held_in_a_draw_holds_up_no_other_queue`).
     fn scheduled_at_take(&self) -> Option<&Arc<Scheduled>> {
         (self.scheduled.as_ref()).filter(|_| self.first && self.submitted_at_take().is_some())
+    }
+
+    /// Its `CB_SCHEDULED`, where a thread that waits for it to be scheduled may ask for it there
+    /// and then (`SCHEDULED_ASK`, [`Askable`]): it would get it at its take had it asked for its
+    /// `CB_SUBMITTED` ([`Self::scheduled_at_take`]), and did not ask (one that did got it there,
+    /// or has a buffer before it on its queue that owes its own).
+    fn askable(&self) -> Option<&Arc<Scheduled>> {
+        (self.scheduled.as_ref())
+            .filter(|_| self.first && self.submitted.is_none())
+            .filter(|_| self.held.is_none() && !self.behind)
     }
 
     /// Whether it gets a record at its take ([`Self::post_at_take`]), so its ticket in the commit
@@ -1233,6 +1341,29 @@ impl<P: Platform> GraphicsDecoder<P> {
         *self.ticket.borrow_mut() = self.shared.sequencer.issue(self.context, false);
     }
 
+    /// The command buffer is committed (`committed`), or its message ends with it uncommitted: an
+    /// ask of its `CB_SCHEDULED` gives its ticket back, and posts the record from now on only
+    /// where it was committed ([`Askable`]).
+    pub(super) fn end_ask(&self, committed: bool) {
+        if let Some(asked) = self.asked.borrow_mut().take() {
+            asked.end(committed);
+        }
+    }
+
+    /// A `SCHEDULED_ASK` on the ring of queue `queue_obj_id`, taken by its service thread: a
+    /// thread of the queue's process waits for the queue's command buffer `cb_obj_id`, at
+    /// `cb_seqno`, to be scheduled. Where an ask may post its `CB_SCHEDULED` ([`Askable`]), it
+    /// does, once its ticket in the commit order is issued where it is not yet committed; any
+    /// other buffer is scheduled as it would have been.
+    pub(crate) fn ask_scheduled(&self, queue_obj_id: u64, cb_seqno: u64, cb_obj_id: u64) {
+        let Some(counts) = self.queue_counts(queue_obj_id) else {
+            return;
+        };
+        if let Some(askable) = counts.line.asked(cb_seqno, cb_obj_id) {
+            askable.ask(&self.shared.sequencer);
+        }
+    }
+
     /// The command buffer's turn in the lane of the queue whose counts are `counts`
     /// ([`super::lane`]), where the queue has one.
     fn turn_on(counts: &QueueCounts) -> Option<Turn> {
@@ -1475,7 +1606,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         // Those GPU waits hold back none of its records, nor its queue ([`Line`]), and nor do the
         // fills of caches made at its begin: only an event's wait, or a deferred copy's, does.
         let (behind, held) = hold(counts, follows || take.waits);
-        Ok(Ok(Begun {
+        let begun = Begun {
             queue_obj_id: m.queue_obj_id,
             queue: (take.video && uses.is_some()).then(|| queue.clone_ref()),
             cb_obj_id: m.cb_obj_id,
@@ -1494,7 +1625,20 @@ impl<P: Platform> GraphicsDecoder<P> {
             behind,
             drain,
             ordered: take.video,
-        }))
+        };
+        // A thread of its process that waits for it to be scheduled may ask for its record from
+        // now, where it would have got it here had it asked for its `CB_SUBMITTED`.
+        if let Some(scheduled) = begun.askable() {
+            let askable = Arc::new(Askable {
+                seqno: m.header.seqno,
+                cb_obj_id: m.cb_obj_id,
+                context: self.context,
+                state: Mutex::new(Asking::Begun(Arc::clone(scheduled))),
+            });
+            counts.line.askable(Arc::clone(&askable));
+            *self.asked.borrow_mut() = Some(askable);
+        }
+        Ok(Ok(begun))
     }
 
     /// Finishes the `COMMAND_BUFFER` `message` that `begun` began: walks its op stream into its
@@ -1632,8 +1776,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             None => commit()?,
         }
         // Committed: a buffer behind it in the commit order goes on, and so does its context's
-        // next commit and its range messages held while its parts were out.
+        // next commit and its range messages held while its parts were out; so does one sent
+        // after an ask's record ([`Askable`]).
         self.ticket.borrow_mut().take();
+        self.end_ask(true);
         drop((under_way, split_hold));
         // Last in its queue's order: its records, and those before it, go now where they go at
         // its commit.

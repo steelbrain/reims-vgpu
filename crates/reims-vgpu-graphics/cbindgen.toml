@@ -285,6 +285,7 @@ include = [
     "RgfxSamplerCreateExt",
     "RgfxSamplerLodBinding",
     "RgfxSamplerState",
+    "RgfxScheduledAsk",
     "RgfxScissorRectElem",
     "RgfxSetCursor",
     "RgfxSetScanout",

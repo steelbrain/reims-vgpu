@@ -276,7 +276,8 @@ const KNOWN_FEATURES: u64 = (RGFX_FEATURE_SURFACE_PAGES
     | RGFX_FEATURE_PRIVATE_RENDER_STATE
     | RGFX_FEATURE_SURFACE_CACHE_REFUSED
     | RGFX_FEATURE_SURFACE_DEFERRED_ASK) as u64
-    | RGFX_FEATURE_SURFACE_DEFERRED_CARRY;
+    | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+    | RGFX_FEATURE_SCHEDULED_ASK;
 
 /// The `RGFX_QUEUE_*` flags the host carries out, each with the feature the guest's driver must
 /// take for a `QUEUE_CREATE` to ask for it: [`RGFX_QUEUE_UNSHARED`] alone, so a create that asks
@@ -515,6 +516,18 @@ pub trait Host: Send + Sync + 'static {
     ) {
         let _ = claim;
         self.stage3_message(completion, &message);
+    }
+
+    /// Hands a `SCHEDULED_ASK` from a command queue's own submission ring to the host, on the
+    /// queue's service thread, where the guest took `SCHEDULED_ASK`: a thread of the queue's
+    /// process waits for the queue's command buffer the ask names, which the service thread
+    /// handed over before it ([`Host::command_buffer`]), to be scheduled. The host posts the
+    /// buffer's `CB_SCHEDULED` through `completion` where the buffer may be scheduled now, and
+    /// otherwise changes nothing; the device posts nothing for the ask. It waits for nothing of
+    /// ring 0's: the buffer it names was begun after what it waited for. The default does
+    /// nothing.
+    fn scheduled_ask(&self, completion: &CompletionPoster, message: &[u8]) {
+        let _ = (completion, message);
     }
 
     /// Offers the host the `COMMAND_BUFFER` `message` at the head of a command queue's
@@ -2315,10 +2328,23 @@ impl Shared {
                 {
                     message
                 }
+                // A thread waits for a buffer of the queue handed over before it to be
+                // scheduled: handed to the host at once, with the queue's claim held, as the
+                // buffer it names is begun.
+                Ok(Some(message))
+                    if message.header.r#type == RGFX_CMD_SCHEDULED_ASK
+                        && self.driver_features.load(Ordering::Acquire)
+                            & RGFX_FEATURE_SCHEDULED_ASK
+                            != 0 =>
+                {
+                    self.host.scheduled_ask(poster, &message.bytes);
+                    continue;
+                }
                 Ok(Some(message)) => {
-                    // A queue's ring carries only its process's command buffers; every other
-                    // message rides ring 0, through the kext, which checks that its sender owns
-                    // the object it names. Refused here, and the ring goes on.
+                    // A queue's ring carries only its process's command buffers, and the asks
+                    // of its threads that wait for them; every other message rides ring 0,
+                    // through the kext, which checks that its sender owns the object it names.
+                    // Refused here, and the ring goes on.
                     log::warn!(
                         target: "reims_vgpu_graphics",
                         "queue {:#x}'s submission ring carried a message of type {:#x} \

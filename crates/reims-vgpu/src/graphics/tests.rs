@@ -3715,12 +3715,28 @@ fn two_processes(
     Guest,
     [QueueRing; 3],
 ) {
+    two_processes_taking(raised, 0)
+}
+
+/// [`two_processes`], the guest's driver having taken the feature bits `taken` of those the
+/// device offers.
+fn two_processes_taking(
+    raised: &Arc<AtomicU32>,
+    taken: u64,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    Guest,
+    [QueueRing; 3],
+) {
     const RING_DATA: u32 = 0x1_0000;
     let rings = |n: u64| {
         let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * 0x4_0000;
         (at, at + 0x2_0000)
     };
     let (device, platform) = headless_on(raised);
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), taken as u32);
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_HI.into(), (taken >> 32) as u32);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
     for (at, (context, n)) in [(1, 1), (1, 2), (2, 1)].into_iter().enumerate() {
@@ -3952,6 +3968,232 @@ fn a_walk_held_in_a_draw_holds_up_no_other_queue() {
             (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
         ]
     );
+}
+
+/// A `SCHEDULED_ASK` of command buffer `cb_obj_id`, posted on its queue's ring at `cb_seqno`, the
+/// ask's own seqno `seqno`: a thread waits for the buffer to be scheduled.
+fn scheduled_ask(cb_obj_id: u64, cb_seqno: u64, seqno: u64) -> Vec<u8> {
+    RgfxScheduledAsk {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SCHEDULED_ASK,
+            size: size_of::<RgfxScheduledAsk>() as u32,
+            seqno,
+        },
+        cb_obj_id,
+        cb_seqno,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// `message`, a command buffer, at `seqno` on its ring.
+fn at_seqno(mut message: Vec<u8>, seqno: u64) -> Vec<u8> {
+    message[8..16].copy_from_slice(&seqno.to_le_bytes());
+    message
+}
+
+/// Whether `ring` takes the `CB_SCHEDULED` `(seqno, cb_obj_id)` within about 3 s, completing
+/// nothing on the platform meanwhile.
+fn scheduled_comes(ring: &mut QueueRing, record: (u64, u64)) -> bool {
+    for _ in 0..3000 {
+        ring.has_event();
+        if ring.scheduled.contains(&record) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
+}
+
+/// A command buffer that waits for nothing and does not ask for its `CB_SUBMITTED` gets its
+/// `CB_SCHEDULED` as its queue's service thread takes a waiting thread's `SCHEDULED_ASK` of it,
+/// before the platform has its work: with its walk held inside the platform's draw, the record
+/// comes, the buffer not yet committed. It completes once its draw returns, its record posted
+/// once; a later ask of it posts nothing more
+#[test]
+fn a_waited_buffer_is_scheduled_before_its_submission() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut held, _, _]) =
+        two_processes_taking(&raised, RGFX_FEATURE_SCHEDULED_ASK);
+    // Walked on its queue's lane, as a long buffer is (`GraphicsControl::carry_out`).
+    device.control.inline_walk_max.store(0, Ordering::Relaxed);
+    let draw = hold_next_draw(&platform);
+    let commits = platform.call_log().count("commit");
+    held.send(
+        &device,
+        at_seqno(
+            render_command_buffer(obj(1, 1), 100, obj(1, 11), obj(1, 20)),
+            1,
+        ),
+    );
+    assert!(
+        draw.reached(Duration::from_secs(3)),
+        "the walk did not reach its draw"
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        !held.has_event() && held.scheduled.is_empty(),
+        "scheduled before the ask"
+    );
+    held.send(&device, scheduled_ask(100, 1, 2));
+    assert!(
+        scheduled_comes(&mut held, (1, 100)),
+        "no CB_SCHEDULED at the ask"
+    );
+    assert_eq!(
+        platform.call_log().count("commit"),
+        commits,
+        "the buffer was committed before its record came"
+    );
+
+    draw.open();
+    assert_eq!(
+        ring_events(&platform, &mut held, 3),
+        [
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 5),
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    held.send(&device, scheduled_ask(100, 1, 3));
+    held.send(&device, at_seqno(asking(obj(1, 1), 101), 4));
+    assert_eq!(
+        ring_events(&platform, &mut held, 2),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 101, 0),
+            (RGFX_EVT_CB_COMPLETE, 101, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    assert_eq!(
+        held.scheduled,
+        [(1, 100), (4, 101)],
+        "a record posted twice, or out of the queue's order"
+    );
+}
+
+/// A command buffer whose walk is held inside the platform's draw holds up its process's other
+/// queues only while a thread waits for it to be scheduled: before the ask, a buffer of the
+/// process's other queue is committed and completed with the draw held, as no thread waits for
+/// the held one; once a thread's `SCHEDULED_ASK` has its `CB_SCHEDULED` posted, a buffer of that
+/// queue begun after the record is answered its `CB_SUBMITTED` but committed only after the held
+/// one ([`decode::sequencer`]), as a `CB_SUBMITTED` at the held one's take would have it. Another
+/// process's buffer is committed and completed throughout
+#[test]
+fn a_held_walk_holds_up_its_process_s_other_queues_only_once_waited_for() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut held, mut beside, mut other]) =
+        two_processes_taking(&raised, RGFX_FEATURE_SCHEDULED_ASK);
+    device.control.inline_walk_max.store(0, Ordering::Relaxed);
+    let draw = hold_next_draw(&platform);
+    held.send(
+        &device,
+        at_seqno(
+            render_command_buffer(obj(1, 1), 100, obj(1, 11), obj(1, 20)),
+            1,
+        ),
+    );
+    assert!(
+        draw.reached(Duration::from_secs(3)),
+        "the walk did not reach its draw"
+    );
+
+    // No thread waits for it: the process's other queue goes on.
+    beside.send(&device, at_seqno(asking(obj(1, 2), 300), 1));
+    assert_eq!(
+        ring_events(&platform, &mut beside, 2),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 300, 0),
+            (RGFX_EVT_CB_COMPLETE, 300, u64::from(RGFX_CB_OK)),
+        ],
+        "a buffer of the held process's other queue waited for the held walk before any ask"
+    );
+
+    // A thread waits for it: its record comes with the draw still held.
+    held.send(&device, scheduled_ask(100, 1, 2));
+    assert!(
+        scheduled_comes(&mut held, (1, 100)),
+        "no CB_SCHEDULED at the ask"
+    );
+    // Another process's buffer goes on.
+    other.send(&device, at_seqno(asking(obj(2, 1), 200), 1));
+    assert_eq!(
+        ring_events(&platform, &mut other, 2),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 200, 0),
+            (RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK)),
+        ],
+        "another process's buffer waited for the held walk"
+    );
+    // The held process's other queue's buffer, begun after the record: answered, and committed
+    // only after the held buffer.
+    let commits = platform.call_log().count("commit");
+    beside.send(&device, at_seqno(asking(obj(1, 2), 301), 2));
+    assert_eq!(
+        ring_events(&platform, &mut beside, 1),
+        [(RGFX_EVT_CB_SUBMITTED, 301, 0)],
+        "the held process's other queue's buffer was not begun beside the held walk"
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        platform.call_log().count("commit"),
+        commits,
+        "a buffer of the held process begun after the record was committed before the held one"
+    );
+
+    draw.open();
+    assert_eq!(
+        ring_events(&platform, &mut held, 3),
+        [
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 5),
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    assert_eq!(
+        ring_events(&platform, &mut beside, 1),
+        [(RGFX_EVT_CB_COMPLETE, 301, u64::from(RGFX_CB_OK))]
+    );
+}
+
+/// A `SCHEDULED_ASK` of a command buffer that waits for an event changes nothing: its walk held at
+/// the gate, the ask posts no `CB_SCHEDULED`, and the record comes at the buffer's scheduling, once
+/// it is committed (the fake platform schedules each buffer at its commit), as without the ask.
+/// Nor does an ask of a buffer behind it on its queue, which it holds
+#[test]
+fn an_ask_of_a_buffer_that_waits_for_an_event_changes_nothing() {
+    use reims_vgpu_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut held, _, _]) =
+        two_processes_taking(&raised, RGFX_FEATURE_SCHEDULED_ASK);
+    let wait = RgfxOpEvent {
+        event_obj_id: obj(1, 20),
+        value: 1,
+    };
+    let gate = WalkGate::on(&device);
+    let waits = command_buffer_of(obj(1, 1), 100, &[(RGFX_OP_WAIT_EVENT, wait.as_bytes())]);
+    held.send(&device, at_seqno(waits, 1));
+    assert!(gate.reached(), "the walk did not start");
+    held.send(
+        &device,
+        at_seqno(sampler_command_buffer(obj(1, 1), 101, obj(1, 4)), 2),
+    );
+    held.send(&device, scheduled_ask(100, 1, 3));
+    held.send(&device, scheduled_ask(101, 2, 4));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !held.has_event() && held.scheduled.is_empty(),
+        "an ask posted the record of a buffer that waits, or of one behind it"
+    );
+    gate.open();
+    assert_eq!(
+        ring_events(&platform, &mut held, 2),
+        [
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+            (RGFX_EVT_CB_COMPLETE, 101, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    assert_eq!(held.scheduled, [(1, 100), (2, 101)]);
 }
 
 /// A command buffer answered its `CB_SUBMITTED` whose walk is held inside the platform's draw
@@ -7581,8 +7823,10 @@ fn a_release_the_platform_dies_at_is_refused() {
 /// unshared queue (`UNSHARED_QUEUES`), tells a producer waiting for room on a full submission
 /// ring of the device's takes (`SUBMIT_ROOM`), reads indirect command buffers' CPU encodes from
 /// slots in the region (`ICB_SLOTS`), lets the guest read the clock its VBLANKs are stamped on
-/// (`HOST_TIME`), and shows the display pipe's colour (`DISPLAY_COLOR`). The fake's GPU shares
-/// the CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a device cache
+/// (`HOST_TIME`), shows the display pipe's colour (`DISPLAY_COLOR`), and posts a waited-for
+/// buffer's `CB_SCHEDULED` at a thread's ask (`SCHEDULED_ASK`, `FEATURES_HI` bit 1). The fake's
+/// GPU shares the CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a
+/// device cache
 /// (`SURFACE_CACHE_REFUSED`), keeps none of the rest, defers a fresh one of those that would need
 /// one whatever its pages (`SURFACE_DEFERRED_ASK`), within a quarter of its GPU's own memory's
 /// budget, the few pages a process wrote of it without a lock carried in
@@ -7642,11 +7886,12 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     let carries = want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0;
     assert_eq!(
         u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
-        if carries {
-            RGFX_FEATURE_SURFACE_DEFERRED_CARRY
-        } else {
-            0
-        }
+        RGFX_FEATURE_SCHEDULED_ASK
+            | if carries {
+                RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+            } else {
+                0
+            }
     );
     // The fake's GPU shares the CPU's memory: deferred blocks only where they ask.
     let budget = if want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0 {
@@ -7691,6 +7936,10 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_DISPLAY_COLOR
             | RGFX_FEATURE_MESH_PIPELINES
             | RGFX_FEATURE_SHARED_EVENT_NAMES
+    );
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
+        RGFX_FEATURE_SCHEDULED_ASK
     );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);

@@ -69,7 +69,8 @@ pub const RGFX_REG_VERSION: u32 = 0x004;
 /// 10 are reserved.
 pub const RGFX_REG_FEATURES_LO: u32 = 0x008;
 /// `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
-/// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`].
+/// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`] and
+/// [`RGFX_FEATURE_SCHEDULED_ASK`].
 pub const RGFX_REG_FEATURES_HI: u32 = 0x00c;
 /// `FEATURES_LO` bit 0, `SURFACE_PAGES`: the host maps an IOSurface's own guest pages for its GPU
 /// to use in place (`SURFACE_PAGES`, `BUFFER_OVER_SURFACE_PAGES`); without it a surface's GPU
@@ -284,6 +285,13 @@ pub const RGFX_FEATURE_SURFACE_DEFERRED_ASK: u32 = 1 << 30;
 /// ([`RGFX_SURFACE_PAGES_ATTACH`]) or its release is answered. A host offers it where it offers
 /// either deferral; one that does not never gets a deferral with runs.
 pub const RGFX_FEATURE_SURFACE_DEFERRED_CARRY: u64 = 0x1_0000_0000;
+/// `FEATURES_HI` bit 1, feature bit 33, `SCHEDULED_ASK`, which the guest takes through
+/// [`RGFX_REG_DRIVER_FEATURES_HI`]: a queue's ring carries [`RGFX_CMD_SCHEDULED_ASK`], a thread
+/// of the process waiting for a command buffer of the queue to be scheduled, and the host posts
+/// the buffer's [`RGFX_EVT_CB_SCHEDULED`] as it takes the ask where the buffer may be scheduled
+/// then, as it posts that of a buffer that asks for its `CB_SUBMITTED` at its take. Every host
+/// offers it.
+pub const RGFX_FEATURE_SCHEDULED_ASK: u64 = 0x2_0000_0000;
 /// `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 /// [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
 pub const RGFX_REG_STATUS: u32 = 0x010;
@@ -859,6 +867,18 @@ pub const RGFX_CB_PART_ABORT: u32 = 1 << 1;
 /// How many buffers a queue holds sent in part but not yet committed, under
 /// [`RGFX_FEATURE_CB_PARTS`]: a part past it fails its buffer at its last part.
 pub const RGFX_CB_PARTS_MAX_PARTIAL: u32 = 64;
+/// Command `SCHEDULED_ASK` ([`RgfxScheduledAsk`], a per-queue submission ring), where the guest
+/// took [`RGFX_FEATURE_SCHEDULED_ASK`]: a thread of the queue's process waits for the queue's
+/// command buffer `cb_obj_id`, posted on the ring before the ask at `cb_seqno`, to be scheduled
+/// (`waitUntilScheduled`). Where the buffer waits for no event, follows no deferred copy of a
+/// device cache, is behind no buffer of its queue that waits for one, and found no buffer before
+/// it on its queue owing its `CB_SCHEDULED` as it was taken, the host posts the buffer's
+/// [`RGFX_EVT_CB_SCHEDULED`] as it takes the ask, whether or not the buffer's work has reached
+/// its platform, and commits every command buffer the process sends after the record after that
+/// buffer, as after a [`RGFX_EVT_CB_SUBMITTED`]. An ask of any other buffer, of one already
+/// scheduled, or of one the host does not hold changes nothing: the buffer is scheduled as
+/// without it. The host answers nothing for the ask itself.
+pub const RGFX_CMD_SCHEDULED_ASK: u32 = 0x303;
 
 /// Event `CB_COMPLETE` ([`RgfxCbComplete`], a per-queue completion ring): a
 /// command buffer finished, with its status and GPU times.
@@ -1558,6 +1578,21 @@ pub struct RgfxCommandBufferPart {
     pub region_offset: u64,
     /// The part's length: a multiple of 8.
     pub byte_length: u64,
+}
+
+/// `SCHEDULED_ASK`: a thread waits for the queue's command buffer `cb_obj_id`, posted on the ring
+/// at `cb_seqno`, to be scheduled. Its header's `seqno` is the ring's.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct RgfxScheduledAsk {
+    /// [`RGFX_CMD_SCHEDULED_ASK`].
+    pub header: RgfxMsgHeader,
+    /// The command buffer's guest-picked id.
+    pub cb_obj_id: u64,
+    /// The seqno of the buffer's `COMMAND_BUFFER` or `COMMAND_BUFFER_IN_REGION` on the ring.
+    pub cb_seqno: u64,
 }
 
 /// `RESOURCE_ID_CHUNK`: context `context` holds chunk `chunk` of the texture resource ids.
@@ -4001,6 +4036,7 @@ const _: () = {
     assert!(RGFX_QUEUE_CREATE_FLAGS_OFFSET as usize == size_of::<RgfxQueueCreate>());
     assert!(size_of::<RgfxQueueCreateFlags>() == 8);
     assert!(size_of::<RgfxCommandBufferPart>() == 56);
+    assert!(size_of::<RgfxScheduledAsk>() == 32);
     assert!(core::mem::offset_of!(RgfxCommandBufferPart, region_offset) == 40);
     assert!(size_of::<RgfxHeapCreate>() == 48);
     assert!(size_of::<RgfxHeapOverHostMemory>() == 56);
@@ -4109,7 +4145,8 @@ const _: () = {
     assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER_IN_REGION);
     assert!(RGFX_CMD_COMMAND_BUFFER_IN_REGION > RGFX_CMD_COMMAND_BUFFER);
     assert!(RGFX_CMD_COMMAND_BUFFER_PART > RGFX_CMD_COMMAND_BUFFER_IN_REGION);
-    assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_COMMAND_BUFFER_PART);
+    assert!(RGFX_CMD_SCHEDULED_ASK > RGFX_CMD_COMMAND_BUFFER_PART);
+    assert!(RGFX_EVT_CB_COMPLETE > RGFX_CMD_SCHEDULED_ASK);
     assert!(RGFX_CMD_BUFFER_OVER_PAGES > RGFX_CMD_VIDEO_SESSION_CREATE);
     assert!(RGFX_CMD_BUFFER_OVER_PAGES < RGFX_CMD_CONTEXT_CLOSE);
 };

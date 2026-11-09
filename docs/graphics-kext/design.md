@@ -1154,6 +1154,11 @@ only where no negotiation can carry it.
   them after the layout of its 0x109 call, the kext proves them under its
   read of the surface, and the host fills the cache from them as a new
   cache's first fill. A host offers it where it offers either deferral.
+- Bit 33, `FEATURES_HI`'s bit 1, is `SCHEDULED_ASK`: a queue's ring carries
+  `SCHEDULED_ASK` (0x303), a thread's ask of a command buffer's scheduling
+  ("Scheduled", below). The bundle posts it from `waitUntilScheduled` on the
+  rings it writes itself, so the kext takes the bit with nothing of its own
+  to do. Every host offers it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -2401,7 +2406,7 @@ goes on the queue's completion ring once, ahead of its `CB_COMPLETE`. A buffer t
 right after its `CB_SUBMITTED`, where no buffer begun before it on its queue owes its own, so a
 queue's records keep their order; one answered on its doorbell's thread gets it there, with its
 `CB_SUBMITTED`, where the same holds there. A buffer that does not ask keeps it to its
-scheduling: posted at its take, it would need the buffer's ticket in its process's commit order
+scheduling, or to a waiting thread's ask ("Scheduled at an ask", below): posted at its take, it would need the buffer's ticket in its process's commit order
 there, as the `CB_SUBMITTED` does, and a walk held on one of the process's queues would then hold
 up the commits of its others (`a_walk_held_in_a_draw_holds_up_no_other_queue`). Metal makes such
 a buffer `Scheduled` within a
@@ -2436,6 +2441,27 @@ neither submitted nor scheduled until the event is signalled, or Metal's timeout
 buffer the host could not
 carry out has no `CB_SCHEDULED`, and its `CB_COMPLETE` stands for both; so does every
 `CB_COMPLETE` from a host that posts none.
+
+**Scheduled at an ask.** A thread that waits for a buffer that does not ask for its
+`CB_SUBMITTED` to be scheduled (`waitUntilScheduled`) asks for it, where the device's word holds
+`SCHEDULED_ASK`: the bundle posts `SCHEDULED_ASK` (`RgfxScheduledAsk`, the buffer's `ObjId` and
+the seqno of its message; 32 bytes) on the buffer's queue's ring, after the buffer's message,
+once, unless the buffer is held as far as the process knows or is scheduled already. The queue's
+service thread takes the ask after its begin of the buffer. Where the buffer would have got its
+`CB_SCHEDULED` at its take had it asked for its `CB_SUBMITTED` (it waits for no event, follows
+no deferred copy of a device cache, is behind no buffer of its queue that waits for one, and
+found no buffer before it on its queue owing its `CB_SCHEDULED`), the host issues the buffer's
+ticket in the commit order, given back at its commit, and posts the record then, whether or not
+the walk is done; for a buffer already committed, the record goes at once with no ticket. Any
+other ask changes nothing. So a walk held on one of a process's queues holds up the commits of
+its other queues only for buffers sent once a thread has asked to wait for it, as after a
+`CB_SUBMITTED` at its take
+(`a_held_walk_holds_up_its_process_s_other_queues_only_once_waited_for`). Without the ask,
+during a window's live resize on a 780M host (macOS 26.7.2, 11-09), the guest's GPU process
+waited in `waitUntilScheduled` 349 times for 291.5 ms over 50 s, 288 ms of it before the host
+posted the buffer's record at the platform's submission, 1.3 to 1.5 ms after the buffer's begin
+on average; 192 of the waits, 205 ms, came in the busiest second. The ask is posted for blocking
+waits alone: a scheduled handler, which no thread waits on, runs at the buffer's scheduling.
 
 **Submitted** (per-queue completion ring), where the device has `CB_SUBMITTED` (`FEATURES_LO`
 bit 2; every host sets it). A command buffer committed by `commitAndWaitUntilSubmitted` carries a

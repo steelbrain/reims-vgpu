@@ -8358,6 +8358,83 @@ void test_submitted_before_scheduled()
 	}
 }
 
+// A queue whose device answers RGFX_CMD_SCHEDULED_ASK: a thread's waitUntilScheduled of a
+// committed buffer posts one ask on the queue's ring after the buffer's message, naming its id and
+// seqno, and returns at the CB_SCHEDULED the host posts for it, the buffer Scheduled. A second wait,
+// and a wait of a buffer already scheduled, ask nothing more; nor does a wait of a buffer
+// committed by commitAndWaitUntilSubmitted, whose records the host posts at its take where it
+// may. A queue whose device does not answer the ask asks nothing.
+void test_waiting_asks_for_its_scheduling()
+{
+	for (bool answers : {true, false}) {
+		@autoreleasepool {
+		QueueFixture f;
+		f.queue.asksScheduled = answers;
+		f.queue.asksSubmitted = YES;
+		FakeKext *kext = new FakeKext();
+		RgfxCompletionThread thread(&FakeKext::wait, kext);
+		CHECK(thread.start());
+		thread.add([f.queue sharedReplyReader]);
+
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		const uint64_t cbObjId = ((RgfxResource *)cb).rgfxObjId;
+		[cb commit];
+		const uint64_t seqno = f.nextSeqno();
+		// The host's side: the ask, then the record; or, with no ask, the record after 30 ms.
+		std::atomic<int> asks{0};
+		std::thread host([&] {
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			for (int i = 0; i < (answers ? 5000 : 30) && !f.submit.next(&h, &bytes); i++)
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			if (h.type == RGFX_CMD_SCHEDULED_ASK) {
+				asks.fetch_add(1);
+				RgfxScheduledAsk ask = {};
+				CHECK(bytes.size() == sizeof(ask));
+				memcpy(&ask, bytes.data(), sizeof(ask));
+				CHECK(ask.cb_obj_id == cbObjId && ask.cb_seqno == seqno);
+				CHECK(h.seqno > seqno);
+			}
+			RgfxCbScheduled scheduled = cbScheduled(seqno, cbObjId);
+			hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+		});
+		[cb waitUntilScheduled];
+		host.join();
+		CHECK(cb.status == MTLCommandBufferStatusScheduled);
+		CHECK(asks.load() == (answers ? 1 : 0));
+		[cb waitUntilScheduled];
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(!f.submit.next(&h, &bytes));
+		RgfxCbComplete done = cbComplete(seqno, cbObjId);
+		hostPost(f.completion, *kext, &done, sizeof(done));
+		[cb waitUntilCompleted];
+		[cb waitUntilScheduled];
+		CHECK(!f.submit.next(&h, &bytes));
+
+		// One committed by commitAndWaitUntilSubmitted asks for its submission alone.
+		id<MTLCommandBuffer> asking = [f.queue commandBuffer];
+		const uint64_t askingId = ((RgfxResource *)asking).rgfxObjId;
+		std::atomic<uint64_t> taken{0};
+		std::atomic<int> asked{-1};
+		std::thread answer = hostAnswers(&f.submit, &f.completion, kext, askingId,
+		                                 RGFX_EVT_CB_SUBMITTED, &taken, &asked);
+		CHECK([(id<MTLCommandBufferSPI>)asking commitAndWaitUntilSubmitted]);
+		answer.join();
+		CHECK(asked.load() == 1);
+		RgfxCbScheduled scheduled = cbScheduled(taken.load(), askingId);
+		hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+		[asking waitUntilScheduled];
+		CHECK(!f.submit.next(&h, &bytes));
+		RgfxCbComplete askingDone = cbComplete(taken.load(), askingId);
+		hostPost(f.completion, *kext, &askingDone, sizeof(askingDone));
+		[asking waitUntilCompleted];
+		kext->close();
+		CHECK(eventually([&] { return !thread.running(); }));
+		}
+	}
+}
+
 // A host that answers on the doorbell's thread: the doorbell write takes the buffer off the
 // submission ring and posts its CB_SUBMITTED before it returns, as the host's post does (the
 // record published, `armed` read and cleared), but the vector's wake of the completion thread
@@ -15594,6 +15671,7 @@ int main(int argc, char **argv)
 		test_scheduled_before_completion();
 		test_present_drawable();
 		test_submitted_before_scheduled();
+		test_waiting_asks_for_its_scheduling();
 		test_submitted_at_the_doorbell_wakes_no_thread();
 		test_wait_until_scheduled_pumps();
 		test_completion_thread_stops();

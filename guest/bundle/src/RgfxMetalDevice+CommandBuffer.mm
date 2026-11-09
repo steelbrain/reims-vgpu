@@ -112,6 +112,9 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	// where the host answers it.
 	const RgfxCaps *caps = [self caps];
 	queue.asksSubmitted = caps != nullptr && (caps->features() & RGFX_FEATURE_CB_SUBMITTED) != 0;
+	// A thread that waits for one of them to be scheduled asks for its record where the host
+	// answers that.
+	queue.asksScheduled = caps != nullptr && (caps->features() & RGFX_FEATURE_SCHEDULED_ASK) != 0;
 	// A commit that finds the queue's ring full waits for the host's room record on the queue's
 	// completion ring, which the reader hands to the ring's writer, where the device's word holds
 	// SUBMIT_ROOM; else it sleeps between looks (RgfxRingWriter::post).

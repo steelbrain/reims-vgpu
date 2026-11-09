@@ -127,6 +127,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// returns at the host's RGFX_EVT_CB_SUBMITTED, else at the buffer's CB_SCHEDULED. NO by default.
 @property(nonatomic) BOOL asksSubmitted;
 
+/// Whether a thread that waits for a command buffer of it to be scheduled (waitUntilScheduled) asks
+/// the host for the buffer's CB_SCHEDULED (RGFX_CMD_SCHEDULED_ASK on the queue's ring), where the
+/// device's word holds RGFX_FEATURE_SCHEDULED_ASK: the host then posts it at once where the
+/// buffer waits for nothing, not at its platform's submission. NO by default.
+@property(nonatomic) BOOL asksScheduled;
+
 /// The bytes the queue guesses a new command buffer's message takes (RgfxEncoder): the
 /// largest of the queue's recent messages, as its command buffers committed them. Each smaller
 /// one takes an eighth off, so one large buffer does not hold it. A message has room for it

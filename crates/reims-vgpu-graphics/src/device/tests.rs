@@ -1187,8 +1187,16 @@ impl QueueTestSeen {
 }
 
 impl Host for QueueTestHost {
+    fn features(&self) -> u64 {
+        RGFX_FEATURE_SCHEDULED_ASK
+    }
     fn raise_interrupt(&self, vector: u32) {
         self.vectors.lock().push(vector);
+    }
+    fn scheduled_ask(&self, _completion: &crate::device::CompletionPoster, message: &[u8]) {
+        let (ask, _) = RgfxScheduledAsk::read_from_prefix(message).unwrap();
+        self.handed.lock().push(ask.header.r#type);
+        self.buffers.lock().push(message.to_vec());
     }
     fn context_closed(&self, context: u32, answer: crate::device::CompleteAnswer) {
         self.closed.lock().push(context);
@@ -1444,6 +1452,65 @@ fn a_command_buffer_published_before_its_queue_create_completes() {
         *seen.handed.lock(),
         vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_COMMAND_BUFFER]
     );
+}
+
+/// A `SCHEDULED_ASK` on a queue's ring is handed to the host, after the command buffer it names,
+/// only where the guest took `SCHEDULED_ASK`; where it did not, the ring may not carry it, and
+/// it is refused, the ring going on to the next buffer
+#[test]
+fn a_scheduled_ask_reaches_the_host_only_where_the_guest_took_it() {
+    const QUEUE: u64 = (5 << RGFX_CONTEXT_OBJ_ID_SHIFT) | 1;
+    let ask = |cb_obj_id: u64, cb_seqno: u64| {
+        RgfxScheduledAsk {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SCHEDULED_ASK,
+                size: size_of::<RgfxScheduledAsk>() as u32,
+                seqno: 0,
+            },
+            cb_obj_id,
+            cb_seqno,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    for took in [false, true] {
+        let seen = QueueTestSeen::new();
+        let mut rig = Rig::with_host(seen.host());
+        if took {
+            rig.device.mmio_write(
+                RGFX_REG_DRIVER_FEATURES_HI.into(),
+                (RGFX_FEATURE_SCHEDULED_ASK >> 32) as u32,
+            );
+        }
+        rig.start();
+        let seqno = send_queue_create(&mut rig, QUEUE);
+        assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
+        wait_queue_idle(&rig);
+        let mut at = publish_queue_message(&rig, 0, 1, command_buffer(QUEUE, 100, 1));
+        at = publish_queue_message(&rig, at, 2, ask(100, 1));
+        publish_queue_message(&rig, at, 3, command_buffer(QUEUE, 101, 3));
+        let events = queue_events(&rig, 2);
+        assert_eq!(
+            events.iter().map(|e| (e.1, e.2)).collect::<Vec<_>>(),
+            [(1, 100), (3, 101)],
+            "took {took}"
+        );
+        wait_queue_idle(&rig);
+        let mut handed = vec![RGFX_CMD_QUEUE_CREATE, RGFX_CMD_COMMAND_BUFFER];
+        if took {
+            handed.push(RGFX_CMD_SCHEDULED_ASK);
+        }
+        handed.push(RGFX_CMD_COMMAND_BUFFER);
+        assert_eq!(*seen.handed.lock(), handed, "took {took}");
+        if took {
+            let asked = seen.buffers.lock()[1].clone();
+            let (asked, _) = RgfxScheduledAsk::read_from_prefix(&asked).unwrap();
+            assert_eq!(
+                (asked.header.seqno, asked.cb_obj_id, asked.cb_seqno),
+                (2, 100, 1)
+            );
+        }
+    }
 }
 
 /// The host is told of a queue the device makes before its create is answered, so a buffer of

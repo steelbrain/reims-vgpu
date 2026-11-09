@@ -1042,7 +1042,8 @@
 #define RGFX_REG_FEATURES_LO 8
 
 // `FEATURES_HI`, RO: feature bits 32 to 63, the ones the host offers, which the guest takes
-// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`].
+// through [`RGFX_REG_DRIVER_FEATURES_HI`]: [`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`] and
+// [`RGFX_FEATURE_SCHEDULED_ASK`].
 #define RGFX_REG_FEATURES_HI 12
 
 // `FEATURES_LO` bit 0, `SURFACE_PAGES`: the host maps an IOSurface's own guest pages for its GPU
@@ -1287,6 +1288,14 @@
 // ([`RGFX_SURFACE_PAGES_ATTACH`]) or its release is answered. A host offers it where it offers
 // either deferral; one that does not never gets a deferral with runs.
 #define RGFX_FEATURE_SURFACE_DEFERRED_CARRY 4294967296
+
+// `FEATURES_HI` bit 1, feature bit 33, `SCHEDULED_ASK`, which the guest takes through
+// [`RGFX_REG_DRIVER_FEATURES_HI`]: a queue's ring carries [`RGFX_CMD_SCHEDULED_ASK`], a thread
+// of the process waiting for a command buffer of the queue to be scheduled, and the host posts
+// the buffer's [`RGFX_EVT_CB_SCHEDULED`] as it takes the ask where the buffer may be scheduled
+// then, as it posts that of a buffer that asks for its `CB_SUBMITTED` at its take. Every host
+// offers it.
+#define RGFX_FEATURE_SCHEDULED_ASK 8589934592
 
 // `STATUS`, RW: writing [`RGFX_STATUS_RESET`] resets the device; the guest writes
 // [`RGFX_STATUS_DRIVER_READY`] once it has read the rings' headers.
@@ -1913,6 +1922,19 @@
 // How many buffers a queue holds sent in part but not yet committed, under
 // [`RGFX_FEATURE_CB_PARTS`]: a part past it fails its buffer at its last part.
 #define RGFX_CB_PARTS_MAX_PARTIAL 64
+
+// Command `SCHEDULED_ASK` ([`RgfxScheduledAsk`], a per-queue submission ring), where the guest
+// took [`RGFX_FEATURE_SCHEDULED_ASK`]: a thread of the queue's process waits for the queue's
+// command buffer `cb_obj_id`, posted on the ring before the ask at `cb_seqno`, to be scheduled
+// (`waitUntilScheduled`). Where the buffer waits for no event, follows no deferred copy of a
+// device cache, is behind no buffer of its queue that waits for one, and found no buffer before
+// it on its queue owing its `CB_SCHEDULED` as it was taken, the host posts the buffer's
+// [`RGFX_EVT_CB_SCHEDULED`] as it takes the ask, whether or not the buffer's work has reached
+// its platform, and commits every command buffer the process sends after the record after that
+// buffer, as after a [`RGFX_EVT_CB_SUBMITTED`]. An ask of any other buffer, of one already
+// scheduled, or of one the host does not hold changes nothing: the buffer is scheduled as
+// without it. The host answers nothing for the ask itself.
+#define RGFX_CMD_SCHEDULED_ASK 771
 
 // Event `CB_COMPLETE` ([`RgfxCbComplete`], a per-queue completion ring): a
 // command buffer finished, with its status and GPU times.
@@ -6303,6 +6325,17 @@ typedef struct {
   // `MTLSamplerState.gpuResourceID`: what an argument buffer holds of the sampler.
   uint64_t gpu_resource_id;
 } RgfxSamplerState;
+
+// `SCHEDULED_ASK`: a thread waits for the queue's command buffer `cb_obj_id`, posted on the ring
+// at `cb_seqno`, to be scheduled. Its header's `seqno` is the ring's.
+typedef struct {
+  // [`RGFX_CMD_SCHEDULED_ASK`].
+  RgfxMsgHeader header;
+  // The command buffer's guest-picked id.
+  uint64_t cb_obj_id;
+  // The seqno of the buffer's `COMMAND_BUFFER` or `COMMAND_BUFFER_IN_REGION` on the ring.
+  uint64_t cb_seqno;
+} RgfxScheduledAsk;
 
 // One element of a scissor-rect array ([`RgfxOpSetScissorRects`]): an
 // `MTLScissorRect`.

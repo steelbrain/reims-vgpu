@@ -58,9 +58,9 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
-    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SHARED_EVENT_NAMES,
-    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
-    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SCHEDULED_ASK,
+    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
+    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
     RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES,
     RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK,
@@ -68,8 +68,8 @@ use reims_vgpu_graphics::wire::{
     RGFX_VIDEO_CAPS_OUTPUT_CACHED, RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease,
     RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry,
     RgfxDisplayColor, RgfxEventSignalled, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup,
-    RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxSharedEventName, RgfxSurfacePages,
-    RgfxSurfacePagesLayout, RgfxVideoCaps,
+    RgfxMsgHeader, RgfxPageRun, RgfxSamplerState, RgfxScheduledAsk, RgfxSharedEventName,
+    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
 use reims_vgpu_graphics::{
     CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
@@ -291,7 +291,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // CPU's memory keeps them only for the surfaces whose pages its textures cannot use
             // in place, which it answers the kext surface by surface (`SURFACE_CACHE_REFUSED`,
             // `decode::surface_pages`). Every host answers a
-            // command buffer's ask for its submission, orders command buffers of different queues
+            // command buffer's ask for its submission, and a waiting thread's for its scheduling
+            // (`SCHEDULED_ASK`), orders command buffers of different queues
             // over the IOSurfaces they share where the guest names the order, commits a process's
             // command buffers across its queues in the order it names, makes a queue the
             // kext asks unshared (WindowServer's) on the platform's unshared queue, and tells a
@@ -327,6 +328,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_SMALL_ID_CHUNKS)
                 | u64::from(RGFX_FEATURE_DISPLAY_COLOR)
                 | u64::from(RGFX_FEATURE_SHARED_EVENT_NAMES)
+                | RGFX_FEATURE_SCHEDULED_ASK
                 | if gpu_device.makes_opencl_mode_pipelines() {
                     u64::from(RGFX_FEATURE_OPENCL_MODE)
                 } else {
@@ -1611,6 +1613,29 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         (self.decoders).answer_at_doorbell(context, message, |record| poster.try_post(record))
     }
 
+    /// [`Host::scheduled_ask`]: a thread of the process of the queue `poster` posts onto waits for
+    /// the queue's command buffer the `SCHEDULED_ASK` `message` names to be scheduled, on the
+    /// queue's service thread, which began that buffer before it: its `CB_SCHEDULED` is posted
+    /// through `poster` where it may be now ([`GraphicsDecoder::ask_scheduled`]). Nothing is
+    /// posted for the ask itself, nor where a reset ended the queue.
+    fn scheduled_ask(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (Ok((ask, _)), Some(queue)) = (
+            RgfxScheduledAsk::read_from_prefix(message),
+            poster.queue_obj_id(),
+        ) else {
+            return;
+        };
+        entry::run(|_| {
+            let _carried = self.reset_gate.read();
+            if poster.stale() {
+                return;
+            }
+            let decoder =
+                (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+            decoder.ask_scheduled(queue, ask.cb_seqno, ask.cb_obj_id);
+        });
+    }
+
     /// A pipeline create from ring 0: prepared here, on its context's lane, with the decoder's
     /// table (a malformed create or one naming no library is refused here, unanswered, as the
     /// decoder refuses it), marked pending, and compiled on the compile pool, so ring 0 goes on
@@ -2236,6 +2261,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn answer_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> bool {
         stepped(|| self.control.answer_command_buffer(completion, message))
+    }
+
+    fn scheduled_ask(&self, completion: &CompletionPoster, message: &[u8]) {
+        stepped(|| self.control.scheduled_ask(completion, message));
     }
 }
 

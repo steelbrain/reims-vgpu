@@ -1473,6 +1473,8 @@ struct RgfxBarrierSlot {
 - (void)rgfxWriteBackCopies;
 - (void)rgfxReachScheduled;
 - (void)rgfxReachSubmitted;
+- (void)rgfxAskScheduled;
+- (void)rgfxPostScheduledAsk;
 - (void)rgfxWaitFor:(dispatch_group_t)group reached:(const std::atomic<bool> *)reached;
 @end
 
@@ -1532,6 +1534,10 @@ constexpr uint64_t kRgfxBarrierRenderStages = MTLRenderStageVertex | MTLRenderSt
 constexpr uint32_t kRgfxSlotsNamed = 1, kRgfxSlotsFinished = 2, kRgfxSlotsHeld = 4,
                    kRgfxSlotsScheduled = 8;
 
+// A waiting thread's ask of a command buffer's scheduling (RgfxCmdBuffer's _scheduledAsk): a
+// thread waits for it to be scheduled; its message is on its ring, held by nothing.
+constexpr uint32_t kRgfxAskWanted = 1, kRgfxAskPosted = 2;
+
 // The fences a barrier in the encoder of `b` waits for: every one but its own that an earlier
 // encoder took, calling `wait` with each.
 template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &b, Wait wait)
@@ -1569,6 +1575,11 @@ enum RgfxStage : unsigned {
 	BOOL _waitsSubmitted;
 	// It asks the host for its submission (RGFX_OP_SUBMITTED), so its post expects CB_SUBMITTED.
 	BOOL _asksSubmitted;
+	// Its queue's submission ring, which its message and a waiting thread's ask of its scheduling
+	// go on; and where that ask is (kRgfxAsk*: a thread waits, the message is on the ring), so the
+	// one of the two that comes second posts it, once (rgfxAskScheduled).
+	RgfxRingWriter *_ring;
+	std::atomic<uint32_t> _scheduledAsk;
 	// In its queue's enqueue order (under the queue's order lock), and committed and ready to
 	// post once every buffer before it is.
 	BOOL _enqueued;
@@ -1728,6 +1739,7 @@ enum RgfxStage : unsigned {
 		cb->_traceId = RgfxNextTraceObjectId();
 		cb->_queue = queue;
 		cb->_retained = retained;
+		cb->_ring = ring;
 		cb->_status.store(MTLCommandBufferStatusNotEnqueued);
 		cb->_completedHandlers = [NSMutableArray array];
 		cb->_scheduledHandlers = [NSMutableArray array];
@@ -2179,6 +2191,12 @@ enum RgfxStage : unsigned {
 	// the record then finds the buffer submitted already.
 	if (posted && _asksSubmitted && _reader != nullptr && _reader->holdsSubmitted(_seqno))
 		[self rgfxReachSubmitted];
+	// On its ring, and held by nothing as far as this process knows: a thread that waits for it
+	// to be scheduled may ask for its record now, and one that already waits is asked for here
+	// (rgfxAskScheduled). A held buffer is scheduled past its waits, so no ask is posted for it.
+	if (posted && !held && _reader != nullptr &&
+	    (_scheduledAsk.fetch_or(kRgfxAskPosted, std::memory_order_acq_rel) & kRgfxAskWanted) != 0)
+		[self rgfxPostScheduledAsk];
 	if (!posted) {
 		// No block for it: the buffer fails as Metal's does when memory runs out, and its
 		// handlers run off the committing thread.
@@ -2584,8 +2602,42 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 - (void)waitUntilScheduled
 {
 	// Blocks until the buffer is scheduled and its scheduled handlers have run
-	// (rgfxReachScheduled), as Metal's does.
+	// (rgfxReachScheduled), as Metal's does, asking the host for its scheduling first.
+	[self rgfxAskScheduled];
 	[self rgfxWaitFor:_scheduled reached:&_scheduledRan];
+}
+
+// A thread waits for the committed buffer to be scheduled: where its queue's device answers
+// RGFX_CMD_SCHEDULED_ASK (asksScheduled), and the buffer did not ask for its submission, whose
+// records the host posts at its take where it may, and is not yet scheduled, the host is asked
+// for its CB_SCHEDULED, once, after its message: here where the message is on its ring, else by
+// its post (rgfxPost), whichever comes second. Metal makes a buffer that waits for nothing
+// Scheduled within a fraction of a millisecond of its commit (measured on the M3 Max, an AMD
+// 5300M and Apple's paravirtualized device: 0.05 to 0.2 ms, behind a 120 ms buffer too); the host
+// posts the record at the ask where the buffer waits for nothing, not once its platform has
+// submitted the buffer's work, which took 1.3 to 1.5 ms of each of the GPU process's waits during
+// a window's resize on a 780M host (11-09).
+- (void)rgfxAskScheduled
+{
+	if (_reader == nullptr || _asksSubmitted || !_queue.asksScheduled || _scheduledReached.load())
+		return;
+	const uint32_t prior = _scheduledAsk.fetch_or(kRgfxAskWanted, std::memory_order_acq_rel);
+	if ((prior & (kRgfxAskWanted | kRgfxAskPosted)) == kRgfxAskPosted)
+		[self rgfxPostScheduledAsk];
+}
+
+// Posts the buffer's RGFX_CMD_SCHEDULED_ASK on its queue's ring, after its message, waiting for
+// room as a commit does.
+- (void)rgfxPostScheduledAsk
+{
+	RgfxScheduledAsk ask = {};
+	ask.cb_obj_id = [self rgfxObjId];
+	ask.cb_seqno = _seqno;
+	RgfxReplyReader *reader = _reader;
+	std::function<void()> whileWaiting;
+	if (!reader->driven())
+		whileWaiting = [reader] { reader->pump(); };
+	_ring->post(RGFX_CMD_SCHEDULED_ASK, &ask, sizeof(ask), nullptr, whileWaiting);
 }
 
 - (void)waitUntilCompleted
