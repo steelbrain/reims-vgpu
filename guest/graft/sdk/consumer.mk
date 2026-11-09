@@ -13,14 +13,17 @@
 #   OBJECTS   the kext's objects, which the consumer's own rules compile
 #   HEADERS   the consumer's headers, on which the layout probe depends
 #   CXXFLAGS  the flags OBJECTS are compiled with, which the layout probe uses too
-# and provides src/Info.plist and the declaration. The declaration path defaults
-# to src/graft.json; a Makefile that builds more than one variant from one source
-# (a test probe, say) sets GRAFT_DECL to another path before including this file.
+# and provides the Info.plist and the declaration. The declaration path defaults
+# to src/graft.json and the Info.plist to src/Info.plist; a Makefile that builds
+# more than one variant from one source (a test probe, say), or a per-architecture
+# Info.plist, sets GRAFT_DECL or GRAFT_INFO_PLIST to another path before including
+# this file.
 
 GRAFT_TOOLS := $(dir $(lastword $(MAKEFILE_LIST)))
 GRAFT_PYTHON = python3 -I -B $(GRAFT_TOOLS)consumer.py
 GRAFT_SOURCES = $(GRAFT_TOOLS)consumer.py $(GRAFT_TOOLS)graft_macho.py
 GRAFT_DECL ?= src/graft.json
+GRAFT_INFO_PLIST ?= src/Info.plist
 GRAFT_WORK = $(BUILD)/graft
 # An arm64e consumer keeps its import GOT and vtable in writable __DATA, which
 # Graft writes after lockdown (notes/arm64-boot.md); -no_data_const folds
@@ -44,7 +47,7 @@ $(GRAFT_CENSUS): $(OBJECTS) Makefile
 	@mkdir -p $(@D)
 	xcrun clang++ $(ARCH) -nostdlib -Xlinker -kext $(GRAFT_LDEXTRA) $(OBJECTS) -lcc_kext -o $@
 
-$(GRAFT_INFO): src/Info.plist Makefile
+$(GRAFT_INFO): $(GRAFT_INFO_PLIST) Makefile
 	@mkdir -p $(@D)
 	sed 's/@VERSION@/$(VERSION)/g' $< > $@
 	plutil -lint $@ > /dev/null

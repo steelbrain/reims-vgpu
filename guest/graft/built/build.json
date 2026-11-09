@@ -1,21 +1,38 @@
 {
-  "architecture": "x86_64",
+  "architecture": [
+    "x86_64",
+    "arm64e"
+  ],
   "bundle": {
-    "Contents/Info.plist": {
-      "mode": 420,
-      "sha256": "43f099b48e587bbfc307f3cb28db9cfe187f7b09859fdc108e5683d81212fdf0",
-      "size": 1433
+    "arm64e": {
+      "Contents/Info.plist": {
+        "mode": 420,
+        "sha256": "2f77836588ac3ac9df68dacf943905393a9e529ca195acb1fa73206512f3f5cf",
+        "size": 1433
+      },
+      "Contents/MacOS/Graft": {
+        "mode": 493,
+        "sha256": "6f4265dac0f9da7b789a94c2931511d7fc65de5acbb22d0b4991b77d56b217a7",
+        "size": 122728
+      }
     },
-    "Contents/MacOS/Graft": {
-      "mode": 493,
-      "sha256": "e2c03b036a8e93322932b7df5ff7fb5fbaa508ca222dcba3fc7e9d874f4107fa",
-      "size": 69632
+    "x86_64": {
+      "Contents/Info.plist": {
+        "mode": 420,
+        "sha256": "2f77836588ac3ac9df68dacf943905393a9e529ca195acb1fa73206512f3f5cf",
+        "size": 1433
+      },
+      "Contents/MacOS/Graft": {
+        "mode": 493,
+        "sha256": "fea86b8c978462eb92690a9d77704a3bc7185abd3b29c2f6fe452dfd2c4e8fce",
+        "size": 69632
+      }
     }
   },
-  "format": 2,
+  "format": 3,
   "sources": {
-    "Makefile": "ccb9c86d96a6b721c78baed91fb3aaff2bbb65ccee9684ca7c300124212a87eb",
-    "sdk/include/graft/Graft.h": "a248d23e0b169fb602d5a1ceb9b66cc3f586feb65cb7d053364e8a4c43370072",
+    "Makefile": "a1e55b92a47b91a51d94dec6a11e4092413db88be939b63b413f9b74d089b7d9",
+    "sdk/include/graft/Graft.h": "84de20363d72e6c6df29eade02c8f89eedf28620755ea659e74c87c9458f3d50",
     "src/Binding.h": "f9981e88b752e7245f48804b64cb8791629e5dc55b9dd6e018218fc9c513189a",
     "src/BindingPlacement.h": "3c3fb121ef04789db69c9fdede8316da3805240d6b78426f158e4d4690ae4a76",
     "src/Consumer.h": "79961d6a9087d7b976420501b4cbf2ce2de03c480059078820dcc81015e82efb",
@@ -31,7 +48,7 @@
     "src/MachO.h": "4c72d4ca2152234a0f1539c757e9c6d8b435626a3956a9a4bf493ef22ccce81c",
     "src/Manifest.h": "b603b332725305f8a81a36e94d51d3e62be0af1a9fda962b73df9f7144351c91",
     "src/Memory.h": "4496e5e88d870e7d0b30339a291ca3be46eb6ecd0f218792ecadda002c6aa595",
-    "src/Policy.h": "4f00b1ebffaa29b1fca904690e784d8dafd7b640235d4ec231233857db790f17",
+    "src/Policy.h": "d33f277aa94f1d703024478f90d2d12cbd9f2f4f47022ac1292eecc8686b4305",
     "src/README.md": "339ddab0e9e6f1fe56f3805738d8d5587c783b85dd160de0e13fc2314909ec1f",
     "src/Resolve.h": "96dfd37a07af4cfbd43fafb4d20eb93277394b2669faad2573148ddad2e5b896",
     "src/Route.h": "fb20d6f9ea12b8aa3d82dc1479a5ba17fe99eabc471f9512f6a9493a4a068a3f",
@@ -40,11 +57,13 @@
     "src/Start.cpp": "bb46c31b4e8d2a277bc3df0a8039830c0b7daab9f13ac14bcb22c5c3a914139e",
     "src/Vtable.h": "34bc8879ad14cad73eab64d70963bc80c57ef04b7ee6de97daa9cd4e3986f2d0",
     "src/WritePlan.h": "e2f16d134b0c0aeea350cafb5bc61a61905a55eb137578183f7a4c4625758a91",
+    "src/arm64e/Arm64Route.h": "2c62b02bbd2aea24b739765624e9ae835f1606f532e5fa7726ec5091610ed014",
     "src/arm64e/BindingPlacement.cpp": "377428ce371a0d07bd7d7155ff95f221e8d40910bd789365cf2b478b94e2e4e6",
     "src/arm64e/Fixup.h": "56fd74cfe8ae6657dcbeccb0f17450910c9e7a89eaff4959027e30dcaa421454",
     "src/arm64e/Kernel.cpp": "2bfcec554175f2c84b8efe0b85e85a4e11265723f54e089b5356221d3cd7d10f",
     "src/arm64e/KernelWrite.cpp": "230340e674653cedad464482dd375fa722cecc2e889f90475b5459ab56ec3283",
-    "src/arm64e/Route.cpp": "5c579911efe7afd419e05208cf51eaf50ed02ee6565c82d8e57262b070867362",
+    "src/arm64e/Route.cpp": "803193701700718c229978997378960c57853c3b5ba7a7003c904cbffabd57a0",
+    "src/arm64e/Synthesize.h": "1e6029213920f2b579139e9d753fe3fb3a3ee09306990f1dfc8e1e6858ee980a",
     "src/x86_64/BindingPlacement.cpp": "2f338b40483121fdb3837ec11797c7e2981b38c7db5631b69c3bfc2ef4c73602",
     "src/x86_64/Fixup.h": "37642dbdafef828042d8991e14703b5817fa0663c417f77b6eeba403a12fe189",
     "src/x86_64/Kernel.cpp": "0b8149d4f4c92585f7c360f1a1dabd22fae262ac82685a577e49da334f541ac6",
@@ -59,5 +78,5 @@
     "sdk_version": "27.2",
     "xcode": "Xcode 27.2\nBuild version 27B52"
   },
-  "version": "1.1.1"
+  "version": "1.2.0"
 }

@@ -31,10 +31,13 @@ bool graft_client_ready(const char *identifier);
 // state becomes "refused", naming the symbol.
 bool graft_kernel_symbol(const char *identifier, const char *symbol, uint64_t *address);
 
-// Installs count routes, at most six, all together or none, before BSD
-// starts. Graft publishes the outcome as the client's state: "routed", or
-// "refused" naming the route and the reason. It returns false and records
-// nothing when Graft is not active, or count is 0 or more than six.
+// Installs count routes, at most six, all together or none. On x86-64 the
+// routes are kernel-text trampolines and must be in place before BSD starts;
+// on arm64 the route is one atomic swap of a policy table, safe at any time, so
+// a client that matches as an IOKit driver installs after BSD. Graft publishes
+// the outcome as the client's state: "routed", or "refused" naming the route
+// and the reason. It returns false and records nothing when Graft is not
+// active, or count is 0 or more than six.
 // Routes live for the boot. Keep replacement code, wrapper state and original
 // storage resident even on failure: an unverified rollback can retain a route.
 bool graft_route_kernel(const char *identifier, const graft_route_request *requests, size_t count);
