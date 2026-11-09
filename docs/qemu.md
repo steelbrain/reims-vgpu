@@ -901,6 +901,18 @@ that what it shows is the change's:
   and a lone GPU hang the driver reports (an NVIDIA Xid) that the same boot
   run again does not show. A crash while the guest runs is in scope.
 
+**The x86-64 guests** for a check's boots are on `homelab-um870-1` (Radeon
+780M), one of each release, in `~/.cache/rvg-vms`: `macos-11.7.11`
+(20G1443), `macos-12.7.6` (21H1320), `macos-13.7.8` (22H730),
+`macos-14.8.9` (23J631), `macos-15.8.2` (24H232) and `macos-26.7.2-shared`
+(25G332), each a `disk.qcow2` with its `opencore.qcow2` and `OVMF_VARS.fd`.
+`macos-14.8.9` and `macos-15.8.2` are copies of the guests of the same names
+in `~/.cache/rvg-vms` on `msi-laptop`, equal by SHA-256 on both hosts and
+clean by `qemu-img check` (2026-11-09). Each is an 8 GiB guest; one job
+booting `macos-14.8.9` and `macos-15.8.2` in turn, with the device, held
+`--ram 18`, and their QEMUs peaked at 11.8 and 16.7 GiB of anonymous and
+shared memory.
+
 ## arm64 guests
 
 arm64 macOS guests ran on QEMU's `vmapple` machine on an Apple silicon Mac,
