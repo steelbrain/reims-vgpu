@@ -745,6 +745,11 @@ RGFX_LOG_UNRECOGNIZED
 		_videoCaps = blob.video;
 		if (_videoCaps.codec_count > RGFX_VIDEO_CAPS_CODECS)
 			_videoCaps.codec_count = RGFX_VIDEO_CAPS_CODECS;
+	} else if (blob.video.version == 0) {
+		// A host with no hardware video writes no caps: a macOS host, whose library has no
+		// video arm, or a Linux host where neither NVDEC nor VA-API opens on the GPU.
+		os_log(OS_LOG_DEFAULT,
+		       "RGFX: the host has no hardware video; this process's device has no video codec");
 	} else {
 		os_log_error(OS_LOG_DEFAULT,
 		             "RGFX: the host's video caps are of version %u, where this bundle reads %u; "
