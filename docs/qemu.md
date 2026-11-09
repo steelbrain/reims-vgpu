@@ -1060,7 +1060,10 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
   (counted, not counted). Zero deferred while caches were made, no count
   line, or no count that counted is printed under the verdict as a
   `check-boot: finding:` line, not a failure. `no-fatal`: no `reims-vgpu:
-  fatal` line in QEMU's log or the serial log.
+  fatal` line in QEMU's log or the serial log. A reading in the guest that
+  printed nothing fails its check as unread (a desktop poll that never
+  answered is no desktop), and under TCG each command in the guest has 5
+  times its HVF limit.
 
 **Measured** on the M3 Max under HVF on 2026-11-08, with our QEMU at
 `bc378624` built as above on the library of `61b1aac9e`, Ambrosia 0.1.0's

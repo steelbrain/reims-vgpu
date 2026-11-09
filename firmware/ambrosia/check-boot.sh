@@ -37,6 +37,9 @@
 #              QEMU is stopped, and the guest's checks fail as not run.
 #   console    Ambrosia logged the module's early console.
 #   ssh        the guest took an SSH login within 90 s of QEMU's start under HVF, 300 s under TCG.
+#              Under TCG every command the checks run in the guest has 5 times its HVF limit.
+#              A check whose reading in the guest printed nothing (its command failed or ran
+#              out of time) fails as unread: no reading passes as an empty one.
 #   sip        `csrutil status` says enabled (the lane gate's sip).
 #   boot-args  `sysctl kern.bootargs` is empty.
 #   kexts      `kmutil showloaded` lists Graft and our two kexts (stage-config.py's identifiers),
@@ -44,9 +47,10 @@
 #   windowserver-metal
 #              WindowServer composites with Metal on our device, as the lane gate's guest checks
 #              and boot read it: the desktop came up (WindowServer, Dock and Finder) within 60 s
-#              of SSH under HVF, 180 s under TCG; `bench -l` lists a Metal device, not Apple's
-#              paravirtual one; WindowServer kept its pid to the end; and the host's log says the
-#              display shows an IOSurface the guest presented.
+#              of SSH under HVF, 180 s under TCG, each of the three read as a pid; `bench -l`
+#              lists a Metal device, not Apple's paravirtual one; WindowServer kept its pid to
+#              the end; and the host's log says the display shows an IOSurface the guest
+#              presented.
 #   metal-app  present_probe, an on-screen Metal app, ran full-screen for 10 s in the user's
 #              session, as the lane gate's present phase: OK, frames presented, and at most a
 #              tenth dropped or unanswered (report.py's bar for the correctness boot).
@@ -101,11 +105,11 @@ GUEST_USER=${GUEST_USER:-aneesiqbal} GUEST_PASS=${GUEST_PASS:-aneesiqbal}
 
 ram=8G
 if ((tcg)); then
-  accel=(-accel tcg,thread=multi) limit=300 desktop_wait=180
+  accel=(-accel tcg,thread=multi) limit=300 desktop_wait=180 slow=5
   machine=",memory-backend=ram,dump-guest-core=off"
   mem=(-m "$ram" -object "memory-backend-memfd,id=ram,size=$ram,share=on")
 else
-  accel=(-accel hvf,kernel-irqchip=on) limit=90 desktop_wait=60
+  accel=(-accel hvf,kernel-irqchip=on) limit=90 desktop_wait=60 slow=1
   machine= mem=(-m "$ram")
 fi
 
@@ -175,11 +179,11 @@ PROBE_SOPTS=("${BASE_SOPTS[@]}" -o ControlMaster=no -o ControlPath=none)
 # its ssh_config.d), and a locale the guest lacks (C.UTF-8 on macOS 14) has its perl print five
 # warning lines before a command's own output.
 GUEST_ENV=(env LANG=C LC_ALL=C)
-# A command in the guest, under a limit of SECONDS: prints its output, also kept in guest.log, and
-# returns its status. A login that fails (sshpass's 5, a refused password; ssh's 255) is tried
-# twice more, 5 s apart, as the lane gate retries its copies.
+# A command in the guest, under a limit of SECONDS (times `slow`, 5 under TCG): prints its output,
+# also kept in guest.log, and returns its status. A login that fails (sshpass's 5, a refused
+# password; ssh's 255) is tried twice more, 5 s apart, as the lane gate retries its copies.
 G() {
-  local s=$1 try rc
+  local s=$(($1 * slow)) try rc
   shift
   for try in 1 2 3; do
     echo "\$ $*" >> "$out/guest.log"
@@ -362,30 +366,36 @@ if [[ -n $ssh_s ]]; then
   fi
 
   # The desktop, as the lane gate waits for it.
-  desk= t_desk=$(now)
+  # It is up once all three read as pids; a poll that failed or printed nothing is no reading.
+  desk= t_desk=$(now) up='^[0-9]+ [0-9]+ [0-9]+$'
   while :; do
     d=$(G 20 'for p in WindowServer Dock Finder; do n=$(pgrep -x $p | head -1); echo ${n:-none}; done') &&
       desk=$(echo $d)
-    set -- $desk
-    [[ $# -eq 3 && " $desk" != *" none "* ]] && break
+    [[ $desk =~ $up ]] && break
     perl -e "exit !($(since "$t_desk") > $desktop_wait)" && break
     sleep 5
   done
-  set -- $desk none none none
   [[ $gver =~ ^[0-9]+\.[0-9] ]] || { gver=$(G 20 'sw_vers -productVersion; sw_vers -buildVersion') || gver=; }
-  desk_say="WindowServer $1, Dock $2, Finder $3" ws_pid=${1#none}
-  if [[ " $desk" != *" none "* ]]; then desk_ok=1
-  else desk_ok=0 desk_say="no desktop in $desktop_wait s: $desk_say"; fi
+  if [[ $desk =~ $up ]]; then
+    set -- $desk
+    desk_ok=1 desk_say="WindowServer $1, Dock $2, Finder $3" ws_pid=$1
+  elif [[ -z $desk ]]; then
+    desk_ok=0 desk_say="no desktop in $desktop_wait s: unread, no poll answered" ws_pid=
+  else
+    set -- $desk none none none
+    desk_ok=0 desk_say="no desktop in $desktop_wait s: WindowServer $1, Dock $2, Finder $3"
+    ws_pid=${1//[^0-9]/}
+  fi
 
   # The probes, copied over the shared connection.
   G 30 'mkdir -p ~/ambrosia-check' > /dev/null
   for t in bench present_probe; do
-    timeout 60 "${GUEST_ENV[@]}" sshpass -p "$GUEST_PASS" ssh -p "$port" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
+    timeout $((60 * slow)) "${GUEST_ENV[@]}" sshpass -p "$GUEST_PASS" ssh -p "$port" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
       "cat > ~/ambrosia-check/$t && chmod +x ~/ambrosia-check/$t" < "$tools/$t" >> "$out/guest.log" 2>&1
   done
   # bench -l's device lines; anything else it prints (the bundle's log lines, a warning) is
   # quoted only where it lists no device.
-  if bl=$(G 40 "perl -e 'alarm 30; exec @ARGV' ~/ambrosia-check/bench -l"); then
+  if bl=$(G 40 "perl -e 'alarm $((30 * slow)); exec @ARGV' ~/ambrosia-check/bench -l"); then
     dev=$(echo "$bl" | grep '^bench: device' | head -5 | tr '\n' ' ' | sed 's/ *$//')
     case $dev in
     *Apple\ Paravirtual*) dev_ok=0 dev_say="Apple's paravirtual device: $dev" ;;
@@ -400,7 +410,7 @@ if [[ -n $ssh_s ]]; then
   fi
 
   if ((dev_ok && desk_ok)); then
-    probe=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' launchctl asuser \$(id -u) sudo -u \$(id -un) perl -e 'alarm shift @ARGV; exec @ARGV' 40 \$HOME/ambrosia-check/present_probe -t 10" |
+    probe=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' launchctl asuser \$(id -u) sudo -u \$(id -un) perl -e 'alarm shift @ARGV; exec @ARGV' $((40 * slow)) \$HOME/ambrosia-check/present_probe -t 10" |
       grep '^present_probe:' | head -1)
     # report.py's bar for the correctness boot: frames presented, and at most a tenth lost, a
     # loss being a drop or an answer still missing beyond the last 3.
@@ -448,10 +458,13 @@ if [[ -n $ssh_s ]]; then
   ws_was=
   [[ -n $ws_pid && -n $ws_now && $ws_now != "$ws_pid" ]] && ws_was=", the desktop's was $ws_pid"
   denied=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"reims-graphics\"' 2>/dev/null | grep -c -i -E 'amfi|library validation|not valid|code signature'")
-  denied=${denied//[^0-9]/}
+  denied=$(echo "$denied" | tail -1)
+  [[ $denied =~ ^[0-9]+$ ]] || denied=
   if [[ -z $ws_now ]]; then
     verdict amfi-map FAIL "not run: no WindowServer"
-  elif [[ ${mapped:-0} -gt 0 && ${denied:-0} -eq 0 ]]; then
+  elif [[ -z $denied ]]; then
+    verdict amfi-map FAIL "WindowServer (pid $ws_now$ws_was) maps the bundle ${mapped:-0} times; this boot's log unread, so AMFI's denials are not known"
+  elif [[ ${mapped:-0} -gt 0 && $denied -eq 0 ]]; then
     verdict amfi-map PASS "WindowServer (pid $ws_now$ws_was) maps the bundle ($mapped mappings); no AMFI denial naming it"
   else
     verdict amfi-map FAIL "WindowServer (pid $ws_now$ws_was) maps the bundle ${mapped:-0} times; ${denied:-unread} AMFI or library-validation lines name reims-graphics"
@@ -462,8 +475,13 @@ if [[ -n $ssh_s ]]; then
   # kext's count lines this boot. The host's counts are read from its log once QEMU has ended.
   boot1=$(G 20 'sysctl -n kern.boottime') || boot1=
   run_min=$(perl -e 'printf "%d\n", $ARGV[0] / 60 + 2' "$(since "$t0")")
-  panics=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' sh -c 'find /Library/Logs/DiagnosticReports -maxdepth 2 -type f \\( -name \"*.panic\" -o -name \"panic-*\" \\) -mmin -$run_min | while read -r f; do if grep -q -E \"com\\.steelbrain|mach_vm_region|IOIteratePageableMaps\" \"\$f\"; then echo \"\$f (names our kexts)\"; else echo \"\$f\"; fi; done'")
-  kc=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"RgfxAccelerator: \"' 2>/dev/null | grep -E 'counting an IOSurface|not a buffer the kernel allocated|could not be mapped to count'")
+  panics_read=1
+  panics=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' sh -c 'find /Library/Logs/DiagnosticReports -maxdepth 2 -type f \\( -name \"*.panic\" -o -name \"panic-*\" \\) -mmin -$run_min | while read -r f; do if grep -q -E \"com\\.steelbrain|mach_vm_region|IOIteratePageableMaps\" \"\$f\"; then echo \"\$f (names our kexts)\"; else echo \"\$f\"; fi; done'") || panics_read=0
+  # The count lines, then a line that says the log was read: grep's status is 1 for no lines.
+  kc=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"RgfxAccelerator: \"' 2>/dev/null | grep -E 'counting an IOSurface|not a buffer the kernel allocated|could not be mapped to count'; echo check-boot-read")
+  kc_read=0
+  [[ $kc == *check-boot-read ]] && kc_read=1
+  kc=$(echo "$kc" | grep -v '^check-boot-read$')
   ws_end=$(G 20 'pgrep -x WindowServer | head -1') || ws_end="unread: $(echo "$ws_end" | tail -1)"
 elif [[ $(state firmware) == FAIL ]]; then
   for n in ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count; do verdict "$n" FAIL "not run: the firmware check failed"; done
@@ -502,19 +520,21 @@ if [[ -n $ssh_s ]]; then
   notes=$(echo "$kc" | grep -o -E 'an IOSurface.s memory (is a [A-Za-z0-9_]+, not a buffer the kernel allocated|could not be mapped to count its pages)' | sort -u | tr '\n' ';' | sed 's/;$//; s/;/; /g')
   pc=() pok=1
   if [[ -z $boot1 ]]; then pc+=("the guest did not answer after its Metal work") pok=0
-  elif [[ -z $boot0 ]]; then pc+=("kern.boottime unread at the login, so a boot again is not told")
+  elif [[ -z $boot0 ]]; then pc+=("kern.boottime unread at the login, so a boot again is not told") pok=0
   elif [[ $boot1 != "$boot0" ]]; then pc+=("the guest booted again during the run: kern.boottime was $boot0, then $boot1") pok=0
   else pc+=("kern.boottime kept"); fi
-  if [[ -n $panics ]]; then pc+=("panic reports written in this run: $(echo "$panics" | tr '\n' ';' | sed 's/;$//; s/;/, /g')") pok=0
+  if ((!panics_read)); then pc+=("the panic reports unread: ${panics:-no answer}") pok=0
+  elif [[ -n $panics ]]; then pc+=("panic reports written in this run: $(echo "$panics" | tr '\n' ';' | sed 's/;$//; s/;/, /g')") pok=0
   else pc+=("no panic report in this run"); fi
   if [[ -n $caches && -n ${cc[0]:-} ]]; then
     pc+=("host: ${cc[0]} device caches made, ${cc[1]} deferred (${cc[2]} carrying pages), ${cc[3]} refused (${cc[4]} as they might lie in place)")
   elif [[ -n $caches ]]; then pc+=("host: a device caches line in an unknown form: ${caches:0:160}")
   else pc+=("host: no device cache made"); fi
-  pc+=("kext: $n_counted counts counted, $n_not not counted${notes:+; $notes}")
+  if ((kc_read)); then pc+=("kext: $n_counted counts counted, $n_not not counted${notes:+; $notes}")
+  else pc+=("kext: its count lines unread, the log not read in time"); fi
   verdict page-count "$( ((pok)) && echo PASS || echo FAIL)" "$(IFS='|'; echo "${pc[*]}" | sed 's/|/; /g')"
   ((made > 0 && deferred == 0)) && findings+=("page-count: zero deferred while the host made $made device caches")
-  ((n_counted + n_not == 0)) && findings+=("page-count: the kext logged no count of an IOSurface's pages this boot: the count's path did not run")
+  ((kc_read && n_counted + n_not == 0)) && findings+=("page-count: the kext logged no count of an IOSurface's pages this boot: the count's path did not run")
   ((n_counted == 0 && n_not > 0)) && findings+=("page-count: every count the kext logged was refused ($n_not not counted)")
   [[ -n $notes ]] && findings+=("page-count: the kext refused counts: $notes")
 fi
