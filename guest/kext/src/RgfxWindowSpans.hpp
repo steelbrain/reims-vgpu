@@ -10,11 +10,12 @@
 
 #include <stdint.h>
 
+#include "RgfxRegionMapping.hpp"
 #include "reims_graphics_wire.h"
 
-// The window's page: a span starts and ends on one, so no page mapped in holds a byte of
-// anything else's.
-constexpr uint64_t kRgfxWindowPage = 0x1000;
+// The window's page, a process's page (RgfxRegionMapping.hpp): a span starts and ends on one, so
+// no page mapped in, or taken back, holds a byte of anything else's.
+constexpr uint64_t kRgfxWindowPage = kRgfxProcessPage;
 
 // The window's own memory, in IOBufferMemoryDescriptor's option bits (IOKit's
 // IOMemoryDescriptor.h and IOBufferMemoryDescriptor.h; RgfxAcceleratorUserClientWindow.cpp

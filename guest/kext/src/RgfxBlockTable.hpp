@@ -15,6 +15,8 @@
 
 #include <stdint.h>
 
+#include "RgfxRegionMapping.hpp"
+
 // The most blocks the kext's table hands out at once.
 constexpr uint32_t kRgfxMaxBlocks = 16384;
 // WindowServer's reserve (RgfxBlockTable's): the last bytes of the region and the last entries of
@@ -110,8 +112,10 @@ enum RgfxBlockResult {
 	kRgfxBlockBusy,
 };
 
-// Every block is page-aligned and a whole number of pages, so a block can back a mapping.
-constexpr uint64_t kRgfxBlockPage = 0x1000;
+// Every block is page-aligned and a whole number of pages, a process's page
+// (RgfxRegionMapping.hpp), so a block can back a mapping, and no page a process maps holds a byte
+// of another block.
+constexpr uint64_t kRgfxBlockPage = kRgfxProcessPage;
 
 // The owner of the blocks of a client whose close the device did not answer: no client, so they
 // are never named or given out again.
