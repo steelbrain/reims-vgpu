@@ -539,15 +539,34 @@ static bool installBundle(vfs_context_t ctx) {
 	return ok;
 }
 
+// Records the install's outcome as RgfxGate's Graft client state
+// (GraftClient.com.steelbrain.RgfxGate, "<state>: <reason>"), so a refusal is
+// visible there and never hidden behind the install-done flag, which only says
+// the pass ended. Published on arm64, whose boots read it back; a no-op on
+// x86-64, which keeps that build byte-identical.
+#if defined(__arm64e__)
+static inline void recordInstallState(const char *state, const char *reason) {
+	graft_client_state(kClientID, state, reason);
+}
+#else
+// A macro, not an empty inline: it drops its arguments at the preprocessor, so
+// the states and reasons compile to nothing at all and the x86-64 build is
+// byte-identical to one without this recording.
+#define recordInstallState(state, reason) ((void)0)
+#endif
+
 static void doInstall() {
 	vfs_context_t ctx = vfs_context_create(nullptr);
-	if (ctx == nullptr)
+	if (ctx == nullptr) {
+		recordInstallState("refused", "no VFS context for the install");
 		return;
+	}
 
 	// Installer/Recovery: do nothing.
 	vnode_t inst = nullptr;
 	if (vnode_lookup("/System/Installation", 0, &inst, ctx) == 0) {
 		vnode_put(inst);
+		recordInstallState("skipped", "installer or Recovery environment");
 		vfs_context_rele(ctx);
 		return;
 	}
@@ -568,6 +587,7 @@ static void doInstall() {
 			vnode_put(root);
 		if (!ready) {
 			graft_client_log(kClientID, "vnode op vector unverified (%s); no install", why);
+			recordInstallState("refused", why);
 			vfs_context_rele(ctx);
 			return;
 		}
@@ -578,6 +598,7 @@ static void doInstall() {
 	bool tagged = bundleTagged(ctx);
 	if (!needWrite && tagged) {
 		graft_client_log(kClientID, "bundle current and tagged; no install");
+		recordInstallState("present", "bundle already installed and tagged");
 		vfs_context_rele(ctx);
 		return;
 	}
@@ -605,6 +626,12 @@ static void doInstall() {
 	vfs_context_rele(ctx);
 	graft_client_log(kClientID, "bundle %s %s", needWrite ? "install" : "tag",
 	       ok ? "complete" : "FAILED");
+	if (ok)
+		recordInstallState(needWrite ? "installed" : "tagged",
+		                   needWrite ? "wrote the bundle to /Library/GPUBundles and tagged it"
+		                             : "tagged the current bundle in place");
+	else
+		recordInstallState("failed", "the bundle write did not complete");
 }
 
 // Publishes the install pass on IOResources (RgfxGate.hpp): `done` false while
@@ -648,8 +675,10 @@ static void installEntry(void *, wait_result_t) {
 		vfs_context_rele(ctx);
 	if (ready)
 		doInstall();
-	else
+	else {
 		graft_client_log(kClientID, "Data volume never appeared; no install");
+		recordInstallState("refused", "Data volume never mounted");
+	}
 	publishPass(true);
 	if (ready)
 		keepVideoPreference();
@@ -658,11 +687,13 @@ static void installEntry(void *, wait_result_t) {
 
 void startInstaller() {
 	publishPass(false);
+	recordInstallState("pending", "install thread starting");
 	thread_t t = nullptr;
 	if (kernel_thread_start(installEntry, nullptr, &t) == KERN_SUCCESS)
 		thread_deallocate(t);
 	else {
 		graft_client_log(kClientID, "could not start install thread");
+		recordInstallState("refused", "could not start the install thread");
 		publishPass(true);
 	}
 }
