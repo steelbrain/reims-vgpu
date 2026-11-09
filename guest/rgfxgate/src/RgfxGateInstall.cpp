@@ -36,23 +36,9 @@
 #include "RgfxGate.hpp"
 #include "RgfxGatePayload.h"
 #include "RgfxGatePrefs.hpp"
+#include "RgfxGateVnop.hpp"
 #include "rgfx_match.h"
 #include "rgfx_tree.h"
-
-// These kernel-global vnode operations are not declared as callable KPIs.
-extern "C" int VNOP_MKDIR(vnode_t, vnode_t *, struct componentname *,
-                          struct vnode_attr *, vfs_context_t);
-extern "C" int VNOP_REMOVE(vnode_t, vnode_t, struct componentname *, int,
-                           vfs_context_t);
-extern "C" int VNOP_RMDIR(vnode_t, vnode_t, struct componentname *,
-                          vfs_context_t);
-extern "C" int VNOP_RENAME(vnode_t, vnode_t, struct componentname *, vnode_t,
-                           vnode_t, struct componentname *, vfs_context_t);
-extern "C" int VNOP_RENAMEX(vnode_t, vnode_t, struct componentname *, vnode_t,
-                            vnode_t, struct componentname *, vfs_rename_flags_t,
-                            vfs_context_t);
-extern "C" int VNOP_REMOVEXATTR(vnode_t, const char *, int, vfs_context_t);
-extern "C" int VNOP_READDIR(vnode_t, struct uio *, int, int *, int *, vfs_context_t);
 
 namespace rgfxgate {
 
@@ -146,7 +132,7 @@ static bool ensureDir(const char *path, vfs_context_t ctx) {
 	VATTR_SET(&va, va_gid, 0);
 
 	vnode_t nvp = nullptr;
-	int err = VNOP_MKDIR(dvp, &nvp, &cn, &va, ctx);
+	int err = rgfxVnopMkdir(dvp, &nvp, &cn, &va, ctx);
 	if (nvp)
 		vnode_put(nvp);
 	vnode_put(dvp);
@@ -295,7 +281,7 @@ static void clearRootless(const char *path, vfs_context_t ctx) {
 	vnode_t vp = nullptr;
 	if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
 		return;
-	VNOP_REMOVEXATTR(vp, kRootlessXattr, 0, ctx);
+	rgfxVnopRemovexattr(vp, kRootlessXattr, 0, ctx);
 	struct vnode_attr va;
 	VATTR_INIT(&va);
 	VATTR_SET(&va, va_flags, 0);
@@ -333,7 +319,7 @@ static void removeFile(const char *path, vfs_context_t ctx) {
 		cn.cn_pnlen = (int)strlen(leaf);
 		cn.cn_nameptr = (char *)leaf;
 		cn.cn_namelen = (int)strlen(leaf);
-		VNOP_REMOVE(dvp, vp, &cn, 0, ctx);
+		rgfxVnopRemove(dvp, vp, &cn, 0, ctx);
 		vnode_put(dvp);
 	}
 	vnode_put(vp);
@@ -349,7 +335,7 @@ static void removeDir(const char *path, vfs_context_t ctx) {
 	struct componentname cn;
 	vnode_t dvp = parentAndLeaf(path, DELETE, &cn, leaf, sizeof(leaf), ctx);
 	if (dvp != nullptr) {
-		VNOP_RMDIR(dvp, vp, &cn, ctx);
+		rgfxVnopRmdir(dvp, vp, &cn, ctx);
 		vnode_put(dvp);
 	}
 	vnode_put(vp);
@@ -376,9 +362,8 @@ bool rgfxRenameNode(const char *from, const char *to, bool swap,
 		vnode_t fdvp = parentAndLeaf(from, RENAME, &fcn, fleaf, sizeof(fleaf), ctx);
 		vnode_t tdvp = parentAndLeaf(to, RENAME, &tcn, tleaf, sizeof(tleaf), ctx);
 		if (fdvp != nullptr && tdvp != nullptr) {
-			int err = swap ? VNOP_RENAMEX(fdvp, fvp, &fcn, tdvp, tvp, &tcn,
-			                              VFS_RENAME_SWAP, ctx)
-			               : VNOP_RENAME(fdvp, fvp, &fcn, tdvp, tvp, &tcn, ctx);
+			int err = swap ? rgfxVnopRenamex(fdvp, fvp, &fcn, tdvp, tvp, &tcn, VFS_RENAME_SWAP, ctx)
+			               : rgfxVnopRename(fdvp, fvp, &fcn, tdvp, tvp, &tcn, ctx);
 			ok = err == 0;
 			if (!ok)
 				graft_client_log(kClientID, "rename %s -> %s failed (%d)", from, to, err);
@@ -426,7 +411,7 @@ struct KernelTree {
 			uio_reset(uio, offset, UIO_SYSSPACE, UIO_READ);
 			uio_addiov(uio, (user_addr_t)(uintptr_t)buf, cap);
 			int eof = 0, count = 0;
-			if (VNOP_READDIR(vp, uio, VNODE_READDIR_EXTENDED, &eof, &count, ctx) != 0)
+			if (rgfxVnopReaddir(vp, uio, VNODE_READDIR_EXTENDED, &eof, &count, ctx) != 0)
 				break;
 			const size_t got = cap - (size_t)uio_resid(uio);
 			size_t pos = 0;
@@ -566,6 +551,29 @@ static void doInstall() {
 		vfs_context_rele(ctx);
 		return;
 	}
+
+#if defined(__arm64e__)
+	// The arm64 install writes through the vnode op vector, whose offset in
+	// struct vnode is a measured per-release fact. Confirm it against a live
+	// vnode before any op-vector call: the root always exists and carries no
+	// probe xattr, so the cross-check against the exported VNOP_GETXATTR is
+	// clean. A release outside the measured five, or a failed cross-check,
+	// refuses the install rather than dereferencing an unverified layout.
+	{
+		vnode_t root = nullptr;
+		const char *why = "no root vnode";
+		bool ready = vnode_lookup("/", 0, &root, ctx) == 0 &&
+		             rgfxVnopInstallReady(root, ctx, &why);
+		if (root != nullptr)
+			vnode_put(root);
+		if (!ready) {
+			graft_client_log(kClientID, "vnode op vector unverified (%s); no install", why);
+			vfs_context_rele(ctx);
+			return;
+		}
+	}
+#endif
+
 	bool needWrite = installNeeded(ctx);
 	bool tagged = bundleTagged(ctx);
 	if (!needWrite && tagged) {

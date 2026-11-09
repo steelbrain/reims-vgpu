@@ -109,6 +109,8 @@ test:
 	@mkdir -p $(BUILD)/obj
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/match_test.cpp -o $(BUILD)/obj/match_test
 	$(BUILD)/obj/match_test
+	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/amfi_test.cpp -o $(BUILD)/obj/amfi_test
+	$(BUILD)/obj/amfi_test
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/gva_pref_test.cpp -framework CoreFoundation -o $(BUILD)/obj/gva_pref_test
 	$(BUILD)/obj/gva_pref_test
 	xcrun --sdk macosx clang++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/tree_test.cpp -o $(BUILD)/obj/tree_test

@@ -10,6 +10,11 @@
 #include "rgfx_match.h"
 #include "RgfxGatePayload.h"
 
+#if defined(__arm64e__)
+#include <ptrauth.h>
+#include "rgfx_amfi.h"
+#endif
+
 namespace rgfxgate {
 
 t_csfg_get_cdhash gCsfgGetCdhash = nullptr;
@@ -51,6 +56,90 @@ static bool vnodeUnderBundles(vnode_t vp) {
 		return false;
 	return rgfx_path_under(path, kGpuBundlesDir);
 }
+
+#if defined(__arm64e__)
+
+// --- arm64: the three AMFI admission ops, called as raw mpo_* --------------
+// Graft shadows AMFI's mac_policy_ops table and places each replacement
+// directly in the operation's slot, so these wrappers are called as the raw
+// policy ops (mpo_*), not the x86 dispatchers below. Only the three admission
+// ops are routed: the install writes go below the MAC layer on arm64
+// (RgfxGateVnop.hpp), so there is no create/open/truncate route. The mpo
+// signatures insert a `struct label *` (file_check_mmap arg3,
+// vnode_check_signature arg2, library_validation none; Ambrosia's disasm of the
+// five config-2 KCs, 2026-11-08), forwarded unchanged. Each saved original is
+// AMFI's own mpo pointer, signed key IA under the operation's constant
+// discriminator with no address diversity (rgfx_amfi.h), so it is declared as a
+// matching __ptrauth function pointer and called through directly.
+
+// library validation (wall B): no label, the dispatcher's shape.
+static int (*__ptrauth(ptrauth_key_asia, 0, kRgfxAmfiDiscLibraryValidation) orgLibVal)(
+    void *proc, void *fg, off_t slice_offset, uint64_t error_message, size_t error_message_size);
+static int wrapLibVal(void *proc, void *fg, off_t slice_offset, uint64_t error_message,
+                      size_t error_message_size) {
+	if (cdhashIsOurs(fg, (uint64_t)slice_offset))
+		return 0; // our bundle is valid to load into a library-validated process
+	return orgLibVal(proc, fg, slice_offset, error_message, error_message_size);
+}
+
+// file-map-executable (wall C): label at arg3 (NULL from the dispatcher; never
+// dereferenced). The *maxprot clamp is the x86 wrapper's, for the same reason.
+static int (*__ptrauth(ptrauth_key_asia, 0, kRgfxAmfiDiscFileCheckMmap) orgMmap)(
+    void *cred, void *fg, void *label, int prot, int flags, uint64_t file_pos, int *maxprot);
+static int wrapMmap(void *cred, void *fg, void *label, int prot, int flags, uint64_t file_pos,
+                    int *maxprot) {
+	if ((prot & kVmProtExecute) && cdhashIsOurs(fg, file_pos)) {
+		if (maxprot != nullptr)
+			*maxprot &= prot;
+		return 0; // the GPU process may map our driver executable
+	}
+	return orgMmap(cred, fg, label, prot, flags, file_pos, maxprot);
+}
+
+// code-signature trust (wall B, before library validation): label at arg2
+// (real, from the vnode). The x86 wrapVSig's comment holds for this one: the
+// real policies run first, and only our bundle's own executable under
+// /Library/GPUBundles is trusted when they reject it.
+static int (*__ptrauth(ptrauth_key_asia, 0, kRgfxAmfiDiscVnodeCheckSignature) orgVSig)(
+    vnode_t vp, void *label, void *cs_blob, void *imgp, unsigned int *cs_flags,
+    unsigned int *signer_type, int flags, unsigned int platform);
+static int wrapVSig(vnode_t vp, void *label, void *cs_blob, void *imgp, unsigned int *cs_flags,
+                    unsigned int *signer_type, int flags, unsigned int platform) {
+	int r = orgVSig(vp, label, cs_blob, imgp, cs_flags, signer_type, flags, platform);
+	if (r == 0)
+		return 0; // already trusted; leave everything to the real policies
+	const uint8_t *cd = (gCsblobGetCdhash && cs_blob) ? gCsblobGetCdhash(cs_blob) : nullptr;
+	if (cd && rgfx_cdhash_allowed(cd, kRgfxCDHashLen, kAllowed, kAllowedCount) &&
+	    vnodeUnderBundles(vp))
+		return 0; // trust our bundle's own ad-hoc signature, nothing more
+	return r;
+}
+
+bool installHooks() {
+	uint64_t csfg = 0, csblob = 0;
+	if (!graft_kernel_symbol(kClientID, "_csfg_get_cdhash", &csfg) ||
+	    !graft_kernel_symbol(kClientID, "_csblob_get_cdhash", &csblob))
+		return false;
+	gCsfgGetCdhash = reinterpret_cast<t_csfg_get_cdhash>(csfg);
+	gCsblobGetCdhash = reinterpret_cast<t_csblob_get_cdhash>(csblob);
+	// The replacements go as plain function pointers: Graft strips and re-signs
+	// each for its slot. Each original's storage is the __ptrauth variable, so
+	// AMFI's signed slot value, stored there raw, is called through as is.
+	const graft_route_request requests[] = {
+	    {RGFX_OP_LIBRARY_VALIDATION, reinterpret_cast<void *>(wrapLibVal),
+	     reinterpret_cast<void **>(&orgLibVal)},
+	    {RGFX_OP_FILE_CHECK_MMAP, reinterpret_cast<void *>(wrapMmap),
+	     reinterpret_cast<void **>(&orgMmap)},
+	    {RGFX_OP_VNODE_CHECK_SIGNATURE, reinterpret_cast<void *>(wrapVSig),
+	     reinterpret_cast<void **>(&orgVSig)},
+	};
+	if (!graft_route_kernel(kClientID, requests, sizeof(requests) / sizeof(requests[0])))
+		return false;
+	graft_client_log(kClientID, "hooks installed (3 AMFI ops; writes below MAC)");
+	return true;
+}
+
+#else // x86-64: Graft inline-hooks the six MAC dispatchers.
 
 // True on exactly our install thread while an install is in flight, for a
 // vnode (a directory being created in, or a file being written) under
@@ -174,5 +263,8 @@ bool installHooks() {
     graft_client_log(kClientID, "hooks installed");
     return true;
 }
+
+
+#endif // __arm64e__
 
 } // namespace rgfxgate
