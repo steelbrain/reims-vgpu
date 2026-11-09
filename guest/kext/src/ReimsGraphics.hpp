@@ -331,7 +331,7 @@ private:
 	// A mode's timing: the active size with reduced blanking (VESA CVT's second reduced
 	// blanking: a fixed 80-pixel horizontal blank and at least 460 us of vertical blank),
 	// its pixel clock in 10 kHz steps, as an EDID carries it. getTimingInfoForDisplayMode
-	// gives it.
+	// gives it, and so do the arm64e front end's timing elements (publishMobileModes).
 	struct Timing {
 		UInt64 pixelClock;
 		UInt32 hActive, hBlank, hFront, hSync;

@@ -1995,8 +1995,8 @@ IOReturn ReimsGraphics::setConnectionAttribute(IOIndex connectIndex, IOSelect at
 	}
 }
 
-// MARK: - The display's timings and EDID
-
+// MARK: - The display's timings (both front ends: arm64e's modes too) and EDID
+#endif // defined(__x86_64__)
 void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
 {
 	// Reduced blanking: 80 pixels of horizontal blank (8 front porch, 32 sync), and enough
@@ -2026,7 +2026,7 @@ void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
 	// half hertz that would change WebKit's whole number.
 	t->pixelClock = (clock + 5000) / 10000 * 10000;
 }
-
+#if defined(__x86_64__)
 namespace {
 
 void edidChecksum(UInt8 *block)
