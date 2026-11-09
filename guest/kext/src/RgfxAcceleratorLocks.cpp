@@ -109,11 +109,15 @@ constexpr UInt32 kNoRoomLogged = 4;
 // One initialised object (it lands in __DATA,__data, as the contexts' state does), made at the
 // first write named and kept for the kernel's life.
 struct LockState {
-	// Under `lock`: the pending writes. The waiting locks sleep on `table`.
+	// Under `lock`: the pending writes. The waiting locks sleep on `table`. The control function
+	// takes `lock` holding IOSurface's own locks, and a thread holding the contexts' lock may take
+	// it: so nothing calls into IOSurface under it but IOSurface's getters, which take no lock,
+	// and nothing takes the contexts' lock under it (the lock order, ContextState in
+	// RgfxAcceleratorContexts.cpp).
 	IOLock *lock;
 	RgfxLockTable table;
-	// Under the contexts' lock (RgfxAccelerator::surfaceDeviceCache): IOSurfaceRoot, retained,
-	// and the accelerator ID it gave this accelerator.
+	// Set once (startRoot), under no lock: IOSurfaceRoot, retained, and the accelerator ID it
+	// gave this accelerator. Atomic: the device caches made, the first kCachesLogged logged.
 	OSObject *root;
 	uint32_t acceleratorId;
 	uint32_t cachesMade;
@@ -218,21 +222,35 @@ bool isSurface(const OSObject *surface)
 	return meta && strcmp(meta->getClassName(), "IOSurface") == 0;
 }
 
-// IOSurfaceRoot, retained, and the accelerator ID it gives `accel`, found at the first call.
-// Under the contexts' lock.
+// Whether a caller of startRoot is finding IOSurfaceRoot, or found it.
+bool rootStarting = false;
+
+// IOSurfaceRoot, retained, and the accelerator ID it gives `accel`, found at the first call and
+// kept. Under no lock of the kext's, as the ID is IOSurface's to give (the lock order,
+// ContextState in RgfxAcceleratorContexts.cpp): one caller finds them, and the others wait for
+// it to publish them, or to find no root, which the next call looks for again.
 bool startRoot(RgfxAccelerator *accel)
 {
-	if (state.root)
+	if (__atomic_load_n(&state.root, __ATOMIC_ACQUIRE))
 		return true;
+	bool expected = false;
+	if (!__atomic_compare_exchange_n(&rootStarting, &expected, true, false, __ATOMIC_ACQ_REL,
+	                                 __ATOMIC_ACQUIRE)) {
+		while (!__atomic_load_n(&state.root, __ATOMIC_ACQUIRE) &&
+		       __atomic_load_n(&rootStarting, __ATOMIC_ACQUIRE))
+			IOSleep(1);
+		return __atomic_load_n(&state.root, __ATOMIC_ACQUIRE) != nullptr;
+	}
 	OSDictionary *matching = IOService::serviceMatching("IOSurfaceRoot");
 	IOService *root = matching ? IOService::copyMatchingService(matching) : nullptr;
 	OSSafeReleaseNULL(matching);
 	if (!root) {
 		IOLog("RgfxAccelerator: no IOSurfaceRoot: CPU locks of surfaces wait for no GPU write\n");
+		__atomic_store_n(&rootStarting, false, __ATOMIC_RELEASE);
 		return false;
 	}
-	state.root = root;
 	state.acceleratorId = rgfxIOSurfaceRootAcceleratorID(root, accel);
+	__atomic_store_n(&state.root, root, __ATOMIC_RELEASE);
 	IOLog("RgfxAccelerator: IOSurface accelerator ID %u\n", state.acceleratorId);
 	return true;
 }
@@ -363,6 +381,11 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 			const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
 			if (c != nullptr && c->object != nullptr) {
 				const auto *surface = static_cast<const OSObject *>(c->object);
+				// IOSurface's getter under state.lock, kept there on purpose: it loads a field and
+				// takes no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and op 5
+				// calls it holding IOSurface's own lock at each client's release, which a getter
+				// taking that lock could not do (the lock order, ContextState in
+				// RgfxAcceleratorContexts.cpp).
 				clients = rgfxIOSurfaceClientCount(surface);
 				rgfxCacheNoteClients(state.caches, key, clients);
 			}
@@ -532,7 +555,7 @@ bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfac
 		return false;
 	}
 	rgfxDeviceCacheSetControl(cache, accel, &surfaceControl);
-	if (state.cachesMade++ < kCachesLogged)
+	if (__atomic_fetch_add(&state.cachesMade, 1, __ATOMIC_RELAXED) < kCachesLogged)
 		IOLog("RgfxAccelerator: IOSurface %u's device cache %p, retain count %d\n", surfaceId,
 		      cache, reinterpret_cast<OSObject *>(cache)->getRetainCount());
 	*surfaceOut = surface;
@@ -756,6 +779,11 @@ RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
 
 bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length, uint64_t listed)
 {
+	// Called under the contexts' lock, kept there on purpose: IOSurface's getters here load a
+	// field and take no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK; op 5 calls
+	// getClientRetainCount holding IOSurface's own lock at each client's release), and the count
+	// maps and walks the surface's memory through IOKit and the VM, never IOSurface (the lock
+	// order, ContextState in RgfxAcceleratorContexts.cpp).
 	const uint32_t seed = rgfxIOSurfaceLockSeed(surface);
 	IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
 	return md && length <= md->getLength() &&
@@ -842,6 +870,10 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 		c->context = context;
 		c->size = size;
 		c->length = length;
+		// IOSurface's getter, as in op 5, under state.lock, kept there on purpose: it loads a field
+		// and takes no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and op 5 calls
+		// it holding IOSurface's own lock at each client's release, which a getter taking that lock
+		// could not do (the lock order, ContextState in RgfxAcceleratorContexts.cpp).
 		rgfxCacheNoteClients(state.caches, key, rgfxIOSurfaceClientCount(surface));
 	} else if (!previous) {
 		state.noRoom++;
@@ -1045,7 +1077,7 @@ void unwireSurface(void *wire)
 }
 } // namespace
 
-void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool releasing,
+bool rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool releasing,
                             bool blockWired, void **wireOut)
 {
 	if (wireOut)
@@ -1076,20 +1108,18 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool rele
 		static_cast<IOMemoryMap *>(map)->release();
 	letGoMemory(carried, true);
 	if (kept)
-		return;
-	// The references rgfxSurfaceLocksAttach took, out of every lock, the cache's first: IOSurface
-	// frees a cache released to none (RgfxIOSurfaceKPI.hpp), while its surface lives. Then the
-	// surface's memory is unwired, or its wiring handed to the caller, who keeps it while the
-	// device may map the memory: the wiring holds the memory, whatever becomes of the surface. A
-	// deferred block's memory never wired, whose pages the device never had, is only released.
-	if (cache)
-		reinterpret_cast<OSObject *>(cache)->release();
-	if (surface)
-		static_cast<OSObject *>(surface)->release();
+		return false;
+	// The references rgfxSurfaceLocksAttach took are the caller's to release, out of every lock,
+	// the cache's first: IOSurface frees a cache released to none (RgfxIOSurfaceKPI.hpp), while
+	// its surface lives. The surface's memory is unwired, or its wiring handed to the caller, who
+	// keeps it while the device may map the memory: the wiring holds the memory, whatever becomes
+	// of the surface. A deferred block's memory never wired, whose pages the device never had, is
+	// only released.
 	if (wireOut && wired)
 		*wireOut = wire;
 	else
 		letGoMemory(wire, wired);
+	return true;
 }
 
 bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t surfaceId,
@@ -1138,6 +1168,10 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 		c->clientsAt = reinterpret_cast<volatile uint32_t *>(header->getVirtualAddress() +
 		                                                     kRgfxSurfaceClientsOffset);
 		c->object = surface;
+		// IOSurface's getter, as in op 5, under state.lock, kept there on purpose: it loads a field
+		// and takes no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and op 5 calls
+		// it holding IOSurface's own lock at each client's release, which a getter taking that lock
+		// could not do (the lock order, ContextState in RgfxAcceleratorContexts.cpp).
 		rgfxCacheNoteClients(state.caches, key,
 		                     rgfxIOSurfaceClientCount(static_cast<const OSObject *>(surface)));
 	}
@@ -1178,6 +1212,10 @@ void rgfxSurfaceCacheNoteClients(UInt64 offset)
 		return;
 	IOLockLock(state.lock);
 	RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset);
+	// IOSurface's getter, as in op 5, under state.lock, kept there on purpose: it loads a field and
+	// takes no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and op 5 calls it
+	// holding IOSurface's own lock at each client's release, which a getter taking that lock could
+	// not do (the lock order, ContextState in RgfxAcceleratorContexts.cpp).
 	if (c != nullptr && c->object != nullptr)
 		rgfxCacheNoteClients(state.caches, c->key,
 		                     rgfxIOSurfaceClientCount(static_cast<const OSObject *>(c->object)));

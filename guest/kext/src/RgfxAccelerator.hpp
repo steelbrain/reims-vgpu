@@ -105,21 +105,23 @@ class RgfxSurfaceUserClient;
 class ReimsGraphics;
 
 // A surface's shared block goes (RgfxAcceleratorContexts.cpp): its device cache's pending writes
-// go, waking the locks waiting on them, and its device cache and IOSurface are released
-// (RgfxAcceleratorLocks.cpp), the cache's first. Either may be null. A cached block's surface
-// stays cached until its BLOCK_RELEASE is answered where `releasing` (rgfxSurfaceCacheReleased),
-// its locks waiting for the answer and its cache, its surface and its memory's wiring held until
-// then; else it goes, or, where a lock is naming a deferred block's pages, goes once that attach
-// is answered, which lets it go: the call waits for no host. A surface that goes takes the wiring
-// of its memory with it, unless `wire` is given: that wiring is then the caller's (`*wire`, null
-// where the surface was not cached, or its memory was never wired), to hand to a block the device
-// may still map in place, or to unwire. The block is the one at `offset`: the surface's cached
-// state is its cached block's alone, which another block of the surface leaves as it is
-// (rgfxCacheBlockLetGo). `blockWired`: the block keeps a wire of the surface's pages of its own
-// while it is in the table; decided in the same hold of the locks' state as the attach in flight,
-// a block kept for good without one has that attach keep its pages' wiring for good
-// (rgfxCacheLetGo).
-void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool releasing,
+// go, waking the locks waiting on them. Either of the cache and the IOSurface may be null. A
+// cached block's surface stays cached until its BLOCK_RELEASE is answered where `releasing`
+// (rgfxSurfaceCacheReleased), its locks waiting for the answer and its cache, its surface and its
+// memory's wiring held until then; else it goes, or, where a lock is naming a deferred block's
+// pages, goes once that attach is answered, which lets it go: the call waits for no host. True
+// where the block's references of its device cache and IOSurface are the caller's to release,
+// out of every lock of the kext's, the cache's first (the contexts' lock order,
+// RgfxAcceleratorContexts.cpp); false where the cached state keeps them. A surface that goes
+// takes the wiring of its memory with it, unless `wire` is given: that wiring is then the
+// caller's (`*wire`, null where the surface was not cached, or its memory was never wired), to
+// hand to a block the device may still map in place, or to unwire. The block is the one at
+// `offset`: the surface's cached state is its cached block's alone, which another block of the
+// surface leaves as it is (rgfxCacheBlockLetGo). `blockWired`: the block keeps a wire of the
+// surface's pages of its own while it is in the table; decided in the same hold of the locks'
+// state as the attach in flight, a block kept for good without one has that attach keep its
+// pages' wiring for good (rgfxCacheLetGo).
+bool rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool releasing,
                             bool blockWired, void **wire = nullptr);
 // The surface `surface` of device cache `cache` (rgfxSurfaceLocksAttach), IOSurfaceID
 // `surfaceId`, has its block at `offset` cached (RgfxSurfaceCaches.hpp), the block's first page
@@ -198,14 +200,15 @@ void rgfxSurfaceCacheLetGo(const RgfxReleasedSurface &gone);
 bool rgfxSurfaceCacheGeneration(uint32_t surfaceId, uint64_t *gen);
 // Makes the device cache of the surface of ID `surfaceId` that `task` may see, whose memory holds
 // the physical byte `phys` (a shared block's first), with the kext's control function: its
-// IOSurface and its cache, each retained, or false. Under the contexts' lock.
+// IOSurface and its cache, each retained, or false. Under no lock of the kext's: it calls into
+// IOSurface (the contexts' lock order, RgfxAcceleratorContexts.cpp).
 bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfaceId, UInt64 phys,
                             void **surface, void **cache);
 // The device raised its vector: the locks waiting for a surface look at the queues' completions
 // again.
 void rgfxSurfaceLocksWake();
-// The IOSurface of ID `surfaceId` that `task` may see, retained, or null. Under the contexts'
-// lock.
+// The IOSurface of ID `surfaceId` that `task` may see, retained, or null. Under no lock of the
+// kext's: it calls into IOSurface (the contexts' lock order, RgfxAcceleratorContexts.cpp).
 OSObject *rgfxSurfaceLocksLookup(RgfxAccelerator *accel, task_t task, uint32_t surfaceId);
 // Whether `task` maps `surface`'s memory from its first byte at `address`, `length` bytes of it
 // or more: IOSurface's own mapping of it for the task's client, found, never made, and not wired.
@@ -457,7 +460,9 @@ public:
 	                             const RgfxSurfacePagesLayout *layout,
 	                             const RgfxSurfaceResident *resident, SurfaceBlock *block);
 	// A dormant block's surface asked it to go (RgfxAcceleratorLocks.cpp): the release thread
-	// lets it go (RgfxAcceleratorContexts.cpp). From any thread, under no lock of the kext's.
+	// lets it go (RgfxAcceleratorContexts.cpp). From any thread holding no lock of the kext's, the
+	// device caches' control function among them, under IOSurface's lock: it takes no lock (the
+	// contexts' lock order, RgfxAcceleratorContexts.cpp).
 	void wakeReleases();
 	// Posts again the release of every block the device refused (an object of some context lay in
 	// it): a context close may have dropped that object. Called after a context closes, from the
@@ -649,10 +654,11 @@ private:
 	// block in place of entry `e` at `offset`, still pending, and records the block cached
 	// (rgfxSurfaceCacheAdd): false, nothing made, where it cannot be.
 	bool cacheSurface(RgfxSurfaceEntry &e, task_t task, uint32_t surfaceId, UInt64 offset);
-	// Holds the dormant block of entry `e` again for the ask of the surface of IOSurfaceID
-	// `surfaceId` in `task`, where it is that block's surface (RgfxSurfaceBlocks.hpp): false,
-	// nothing changed, where it is not. Under the contexts' lock.
-	bool reviveSurfaceBlock(RgfxSurfaceEntry &e, task_t task, uint32_t surfaceId);
+	// Holds the dormant block of entry `e`, found by the asker's pages, again for the ask of
+	// `surface`, of IOSurfaceID `surfaceId`, the asker's lookup of it (null where none), where it
+	// is that block's surface (RgfxSurfaceBlocks.hpp): false, nothing changed, where it is not.
+	// Under the contexts' lock, calling nothing of IOSurface's.
+	bool reviveSurfaceBlock(RgfxSurfaceEntry &e, OSObject *surface, uint32_t surfaceId);
 
 	IOPCIDevice *pci;
 	IOMemoryMap *registerMap;

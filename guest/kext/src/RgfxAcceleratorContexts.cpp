@@ -121,6 +121,21 @@ struct ContextState {
 	// Under contextLock: the units of GPU addresses held, the units a context holds (set at the
 	// state's start, from the device's maxBufferLength), the next context number, and the
 	// blocks handed out, sorted by offset.
+	//
+	// The lock order: IOSurface's own locks come before every lock of the kext's. IOSurface calls
+	// the device caches' control function (RgfxAcceleratorLocks.cpp) holding locks of its own:
+	// op 5 from a client's release (IOSurfaceRootUserClient::release_surface), under the lock
+	// IOSurfaceRoot's lookupSurface takes; ops 6 and 7 from a purgeable change; ops 0 to 3 from a
+	// CPU lock. The control function takes the locks' state.lock, which is taken after
+	// contextLock where both are held, and never contextLock. So no thread holding contextLock or
+	// state.lock calls into IOSurface: no lookup, no device cache made or its control function
+	// set, no setCurrent, no CPU lock, and no release of a surface or a device cache, which may
+	// free it inside IOSurface (letGo hands those to the release worker). The getters read under
+	// them, IOSurface's getClientRetainCount, getLockSeed and getMemoryDescriptor, each load a
+	// field and take no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK). Seen on a
+	// 12.7.6 boot, in a spindump: an ask holding contextLock in a lookup, and a client's release
+	// holding the lock it waited for, its op 5 waiting for contextLock in wakeReleases, held
+	// WindowServer for good.
 	IOLock *contextLock;
 	RgfxContextSlots slots;
 	UInt32 contextUnits;
@@ -258,11 +273,66 @@ struct ReleaseStats {
 	// on with it still pending.
 	UInt64 writeBackWaits;
 	UInt64 writeBackLate;
+	// Atomic, under no lock: when the first dormant block asked to go since the worker's last
+	// run, set from the control function (wakeReleases), which takes no contextLock.
 	UInt64 reapAskedAt;
 	UInt64 loggedCount;
 	UInt64 loggedAt;
 };
 ReleaseStats releaseStats = {};
+
+// Under contextLock: the references of device caches and surfaces let go of under it (letGo),
+// which the release worker releases out of every lock of the kext's (releaseLetGo), in the order
+// let go. The list holds them as they were given, retaining none; null and empty while none waits.
+struct LetGoList {
+	OSObject **refs;
+	UInt32 count;
+	UInt32 capacity;
+};
+LetGoList letGoList = {nullptr, 0, 0};
+constexpr UInt32 kLetGoFirst = 16;
+
+// Hands the caller's reference of `object`, a device cache or a surface, to the release worker,
+// which releases it out of every lock of the kext's: a release here may free it inside IOSurface,
+// which may wait for IOSurface's lock (ContextState's lock order). Under contextLock. One the list
+// has no room for is kept for good, logged.
+void letGo(OSObject *object)
+{
+	if (!object)
+		return;
+	if (letGoList.count == letGoList.capacity) {
+		const UInt32 grown = letGoList.capacity ? 2 * letGoList.capacity : kLetGoFirst;
+		auto *refs = static_cast<OSObject **>(IOMalloc(sizeof(OSObject *) * grown));
+		if (!refs) {
+			IOLog("RgfxAccelerator: no memory to let go of a %s out of the contexts' lock: it is "
+			      "kept for good\n",
+			      object->getMetaClass()->getClassName());
+			return;
+		}
+		if (letGoList.count)
+			bcopy(letGoList.refs, refs, sizeof(OSObject *) * letGoList.count);
+		if (letGoList.refs)
+			IOFree(letGoList.refs, sizeof(OSObject *) * letGoList.capacity);
+		letGoList.refs = refs;
+		letGoList.capacity = grown;
+	}
+	letGoList.refs[letGoList.count++] = object;
+	thread_call_enter(releaseCall);
+}
+
+// Releases the references letGo was given, in its order, out of every lock of the kext's. On the
+// release worker.
+void releaseLetGo()
+{
+	IOLockLock(contextLock);
+	const LetGoList list = letGoList;
+	letGoList = {nullptr, 0, 0};
+	IOLockUnlock(contextLock);
+	for (UInt32 i = 0; i < list.count; i++)
+		list.refs[i]->release();
+	if (list.refs)
+		IOFree(list.refs, sizeof(OSObject *) * list.capacity);
+}
 
 UInt64 nanosSince(UInt64 then, UInt64 now)
 {
@@ -499,13 +569,11 @@ void releaseFreedBlocks(thread_call_param_t accelerator, thread_call_param_t)
 {
 	RgfxAccelerator *accel = static_cast<RgfxAccelerator *>(accelerator);
 	IOLockLock(contextLock);
-	if (releaseStats.reapAskedAt) {
-		rgfxLatencyAdd(releaseStats.reapWait,
-		               nanosSince(releaseStats.reapAskedAt, mach_absolute_time()));
-		releaseStats.reapAskedAt = 0;
-	}
+	if (const UInt64 asked = __atomic_exchange_n(&releaseStats.reapAskedAt, 0, __ATOMIC_RELAXED))
+		rgfxLatencyAdd(releaseStats.reapWait, nanosSince(asked, mach_absolute_time()));
 	reapDormant();
 	IOLockUnlock(contextLock);
+	releaseLetGo();
 	noteDormant();
 	// The answers come through the framebuffer's work loop: name this worker's hook there
 	// before the first release is posted.
@@ -1299,8 +1367,13 @@ bool letGoBlock(RgfxSurfaceEntry &e, UInt32 context, bool keep, void *wired = nu
 	// flight names it), the cache's, so they never go back to macOS while it is in the table.
 	void *cacheWire = nullptr;
 	const bool blockWired = ownedWire || hostPages != nullptr;
-	rgfxSurfaceLocksForget(e.cache, e.surface, e.offset, e.cached && release, blockWired,
-	                       &cacheWire);
+	// The entry's references of the device cache and the surface go out of this lock, the
+	// cache's first, where the locks' state no longer holds them.
+	if (rgfxSurfaceLocksForget(e.cache, e.surface, e.offset, e.cached && release, blockWired,
+	                           &cacheWire)) {
+		letGo(static_cast<OSObject *>(e.cache));
+		letGo(static_cast<OSObject *>(e.surface));
+	}
 	if (cacheWire && !rgfxBlockHoldWire(blockTable, e.offset, cacheWire))
 		unwire(cacheWire);
 	rgfxSurfaceClear(surfaceTable, e);
@@ -1559,6 +1632,22 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	if (inPlace ? address % kPage || length % kPage : size < length)
 		return kIOReturnBadArgument;
 	RgfxSurfaceTable &table = surfaceTable;
+	// The asker's IOSurface, where the device caches surfaces: a new block of it waits for its
+	// pages' write-back (rgfxSurfaceCacheWritingBack), and a cached block in place of it, held or
+	// dormant, is the ask's, found by it (rgfxSurfaceFindCached), and so is a dormant block found
+	// by the asker's pages that is its block (reviveSurfaceBlock). Where a block of it may be
+	// deferred (RgfxSurfaceBlocks.hpp), a deferred block of it is the ask's, found by it whatever
+	// the asker's pages, and a fresh one may be deferred, where cacheable and within the device's
+	// budget. None wires the asker's pages: the kext wires them only where none holds.
+	// Looked up before the contexts' lock, under which nothing calls into IOSurface
+	// (ContextState), and released once the ask is done, out of it, but a new deferred entry's,
+	// which keeps it.
+	struct SurfaceRef {
+		OSObject *object = nullptr;
+		~SurfaceRef() { OSSafeReleaseNULL(object); }
+	} asker;
+	if (inPlace && surfaceId && (surfaceCache || deferredBudget))
+		asker.object = rgfxSurfaceLocksLookup(this, task, surfaceId);
 	IOLockLock(contextLock);
 	if (!table.entries) {
 		auto *made = static_cast<RgfxSurfaceEntry *>(
@@ -1568,17 +1657,6 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			table = {made, kMaxSurfaceBlocks};
 		}
 	}
-	// The asker's IOSurface, where the device caches surfaces: a new block of it waits for its
-	// pages' write-back (rgfxSurfaceCacheWritingBack), and a cached block in place of it, held or
-	// dormant, is the ask's, found by it (rgfxSurfaceFindCached). Where a block of it may be
-	// deferred (RgfxSurfaceBlocks.hpp), a deferred block of it is the ask's, found by it whatever
-	// the asker's pages, and a fresh one may be deferred, where cacheable and within the device's
-	// budget. None wires the asker's pages: the kext wires them only where none holds.
-	// Released once the ask is done, but a new deferred entry's, which keeps it.
-	struct SurfaceRef {
-		OSObject *object = nullptr;
-		~SurfaceRef() { OSSafeReleaseNULL(object); }
-	} asker;
 	bool defer = false, deferredFound = false, cachedFound = false;
 	// The surface's resident pages the ask listed, where the host lets a deferral carry them
 	// (RgfxDeferCarry.hpp): a surface fresh but for those may be deferred too.
@@ -1586,11 +1664,9 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	    resident && deferCarries ? rgfxResidentPages(*resident, length, PAGE_SIZE) : 0;
 	if (!listed)
 		resident = nullptr;
-	if (inPlace && surfaceId && (surfaceCache || deferredBudget) && table.entries)
-		asker.object = rgfxSurfaceLocksLookup(this, task, surfaceId);
-	if (asker.object && surfaceCache)
+	if (asker.object && table.entries && surfaceCache)
 		cachedFound = rgfxSurfaceFindCached(table, asker.object, length, size, true) >= 0;
-	if (asker.object && deferredBudget && !cachedFound) {
+	if (asker.object && table.entries && deferredBudget && !cachedFound) {
 		int32_t d = -1;
 		while (asker.object && (d = rgfxSurfaceFindDeferred(table, asker.object)) >= 0 &&
 		       table.entries[d].pending)
@@ -1696,7 +1772,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			         ? rgfxSurfaceFind(table, runs, count, length, size, inPlace, &differs)
 			         : -1;
 			if (at >= 0 && table.entries[at].dormant) {
-				revived = reviveSurfaceBlock(table.entries[at], task, surfaceId);
+				revived = reviveSurfaceBlock(table.entries[at], asker.object, surfaceId);
 				if (revived)
 					break;
 				release |= letGoDormant(static_cast<UInt32>(at), kRgfxDormantStale);
@@ -2001,11 +2077,11 @@ void RgfxAccelerator::wakeReleases()
 {
 	if (!__atomic_load_n(&contextLock, __ATOMIC_ACQUIRE))
 		return;
-	// When the first dormant block asked to go, for the worker's reap of it (ReleaseStats).
-	IOLockLock(contextLock);
-	if (!releaseStats.reapAskedAt)
-		releaseStats.reapAskedAt = mach_absolute_time();
-	IOLockUnlock(contextLock);
+	// When the first dormant block asked to go, for the worker's reap of it (ReleaseStats), set
+	// with no lock: the control function calls this holding IOSurface's lock (ContextState).
+	UInt64 none = 0;
+	__atomic_compare_exchange_n(&releaseStats.reapAskedAt, &none, mach_absolute_time(), false,
+	                            __ATOMIC_RELAXED, __ATOMIC_RELAXED);
 	thread_call_enter(releaseCall);
 }
 
@@ -2024,21 +2100,15 @@ void RgfxAccelerator::retryRefusedBlocks()
 	}
 }
 
-bool RgfxAccelerator::reviveSurfaceBlock(RgfxSurfaceEntry &e, task_t task, uint32_t surfaceId)
+bool RgfxAccelerator::reviveSurfaceBlock(RgfxSurfaceEntry &e, OSObject *surface,
+                                         uint32_t surfaceId)
 {
-	void *surface = nullptr, *cache = nullptr;
-	if (!surfaceCache || !surfaceId || !e.runCount ||
-	    !rgfxSurfaceLocksAttach(this, task, surfaceId, e.runs[0].address, &surface, &cache))
-		return false;
-	// The asker's surface is the dormant block's only where IOSurface gives it the same device
-	// cache, which the block holds: no other surface has it, and no new cache takes its address
-	// while it is held.
-	const bool same = cache == e.cache && surface == e.surface &&
-	                  rgfxSurfaceRevives(e, cache, rgfxSurfaceCacheWake(cache));
-	// The attach's references go: the entry holds its own of both.
-	static_cast<OSObject *>(cache)->release();
-	static_cast<OSObject *>(surface)->release();
-	if (!same)
+	// The asker's surface is the dormant block's only where it is the surface the block holds,
+	// with the block's device cache, the one IOSurface gives that surface for this accelerator:
+	// the block's pages, which the ask found it by, are that surface's (rgfxSurfaceLocksAttach
+	// checked them at the block's caching), and no other surface has the cache.
+	if (!surfaceCache || !surfaceId || !e.runCount || !surface || surface != e.surface ||
+	    !e.cache || !rgfxSurfaceRevives(e, e.cache, rgfxSurfaceCacheWake(e.cache)))
 		return false;
 	rgfxSurfaceWake(surfaceTable, e);
 	e.surfaceId = surfaceId;
@@ -2545,32 +2615,66 @@ RgfxAccelerator::surfaceDeviceCache(RgfxAcceleratorUserClient *client, task_t ta
 	if (!contextLock)
 		return kSurfaceCacheNotHeld;
 	RgfxSurfaceTable &table = surfaceTable;
-	IOLockLock(contextLock);
-	int32_t at = table.entries ? rgfxSurfaceAt(table, offset) : -1;
-	RgfxSurfaceEntry *e = at >= 0 ? &table.entries[at] : nullptr;
+	// A held block with no device cache yet has its surface's made out of the contexts' lock
+	// (ContextState's lock order), for the block of that serial and first page, and the entry is
+	// read again under the lock: the block that takes the attach is the one it was made for, and
+	// an attach no block takes is released out of the lock, the cache's first.
+	void *madeCache = nullptr, *madeSurface = nullptr;
+	bool attached = false, tried = false;
+	UInt64 madeSerial = 0, madeAt = 0;
 	SurfaceCacheAnswer answer = kSurfaceCacheMade;
-	if (!e || (!e->runCount && !e->deferred) || !rgfxSurfaceHeldBy(table, client, offset, 1))
-		answer = kSurfaceCacheNotHeld;
-	else if (e->pending)
-		answer = kSurfaceCachePending;
-	if (answer == kSurfaceCacheMade && !e->cache && !e->noCache) {
-		e->noCache = !rgfxSurfaceLocksAttach(this, task, surfaceId, e->runs[0].address,
-		                                     &e->surface, &e->cache);
-		if (!e->noCache)
-			e->surfaceId = surfaceId;
-	}
-	if (answer == kSurfaceCacheMade && !e->cache)
-		answer = kSurfaceCacheNone;
-	else if (answer == kSurfaceCacheMade && e->surfaceId != surfaceId)
-		answer = kSurfaceCacheOtherSurface;
-	if (answer == kSurfaceCacheMade) {
-		*cache = e->cache;
-		static_cast<OSObject *>(e->cache)->retain();
-		*surface = static_cast<OSObject *>(e->surface);
-		(*surface)->retain();
-		*inPlace = e->inPlace;
+	IOLockLock(contextLock);
+	for (;;) {
+		const int32_t at = table.entries ? rgfxSurfaceAt(table, offset) : -1;
+		RgfxSurfaceEntry *e = at >= 0 ? &table.entries[at] : nullptr;
+		answer = kSurfaceCacheMade;
+		if (!e || (!e->runCount && !e->deferred) || !rgfxSurfaceHeldBy(table, client, offset, 1))
+			answer = kSurfaceCacheNotHeld;
+		else if (e->pending)
+			answer = kSurfaceCachePending;
+		const bool needed = answer == kSurfaceCacheMade && !e->cache && !e->noCache;
+		if (needed && (!tried || e->serial != madeSerial || e->runs[0].address != madeAt)) {
+			madeSerial = e->serial;
+			madeAt = e->runs[0].address;
+			IOLockUnlock(contextLock);
+			if (madeCache)
+				static_cast<OSObject *>(madeCache)->release();
+			if (madeSurface)
+				static_cast<OSObject *>(madeSurface)->release();
+			madeCache = madeSurface = nullptr;
+			attached = rgfxSurfaceLocksAttach(this, task, surfaceId, madeAt, &madeSurface,
+			                                  &madeCache);
+			tried = true;
+			IOLockLock(contextLock);
+			continue;
+		}
+		if (needed) {
+			e->noCache = !attached;
+			if (attached) {
+				e->surface = madeSurface;
+				e->cache = madeCache;
+				e->surfaceId = surfaceId;
+				madeCache = madeSurface = nullptr;
+			}
+		}
+		if (answer == kSurfaceCacheMade && !e->cache)
+			answer = kSurfaceCacheNone;
+		else if (answer == kSurfaceCacheMade && e->surfaceId != surfaceId)
+			answer = kSurfaceCacheOtherSurface;
+		if (answer == kSurfaceCacheMade) {
+			*cache = e->cache;
+			static_cast<OSObject *>(e->cache)->retain();
+			*surface = static_cast<OSObject *>(e->surface);
+			(*surface)->retain();
+			*inPlace = e->inPlace;
+		}
+		break;
 	}
 	IOLockUnlock(contextLock);
+	if (madeCache)
+		static_cast<OSObject *>(madeCache)->release();
+	if (madeSurface)
+		static_cast<OSObject *>(madeSurface)->release();
 	return answer;
 }
 
