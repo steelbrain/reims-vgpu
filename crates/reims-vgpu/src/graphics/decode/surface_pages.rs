@@ -2069,6 +2069,36 @@ pub(super) mod tests {
         assert!(!r.dec.span_in_use(BLOCK, 0x1000));
     }
 
+    /// Two live blocks whose runs share a page of guest RAM, as two surfaces' would where each is
+    /// named to the end of its last page and the two met in one, each get a view and a buffer of
+    /// their own, and the shared page is one memory under both: a write through either view is in
+    /// the RAM and read through the other, and neither's write takes the other's away
+    #[test]
+    fn blocks_whose_runs_share_a_page_both_lie_over_it() {
+        let mut r = rig(8);
+        let page = r.page;
+        assert_eq!(r.pages(BLOCK, &[(1, 2)], 2 * page), RGFX_STATUS_OK);
+        assert_eq!(r.pages(BLOCK + 0x8000, &[(2, 2)], 2 * page), RGFX_STATUS_OK);
+        let (first, second) = (r.view(BLOCK), r.view(BLOCK + 0x8000));
+        assert!(!Arc::ptr_eq(&first, &second), "a view each");
+        assert_eq!(r.buffer(10, BLOCK, 2 * page), Ok(()));
+        assert_eq!(r.buffer(11, BLOCK + 0x8000, 2 * page), Ok(()));
+        // The first view's second page is the second's first: the RAM's page 2.
+        let fake = r.p.fake_vm();
+        assert!(fake.write(first.base().wrapping_add(page), b"first"));
+        assert!(fake.write(second.base().wrapping_add(8), b"second"));
+        fake.sync();
+        assert_eq!(fake.read(second.base(), 5).unwrap(), b"first");
+        assert_eq!(
+            fake.read(first.base().wrapping_add(page + 8), 6).unwrap(),
+            b"second"
+        );
+        let mut got = [0u8; 14];
+        assert!(r.ram.read(RAM + 2 * page, &mut got));
+        assert_eq!(&got[..5], b"first");
+        assert_eq!(&got[8..], b"second");
+    }
+
     /// A block made again over the same runs takes the cached view, with no mapping made; the
     /// cache keeps [`CACHED_VIEWS`] views, the last taken
     #[test]

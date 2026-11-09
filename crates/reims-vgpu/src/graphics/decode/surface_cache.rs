@@ -6963,6 +6963,67 @@ mod tests {
         );
     }
 
+    /// A laid-out cache of a surface whose block names its pages to the end of the last one, as
+    /// an arm64 guest's kext names them under `PAGES_16K` (a 1920 x 1080 surface of 8 bytes a
+    /// texel, 0xfd2000 bytes, in 16 KiB pages to 0xfd4000), lands no byte past the surface's own
+    /// in the pages: its fill reads the whole block's bytes, and neither a download after a GPU
+    /// write nor the block's release after another copies past the last row's texels
+    #[test]
+    fn a_laid_out_cache_writes_nothing_past_its_surface_in_its_last_page() {
+        use super::super::surface_pages::tests::one_plane;
+        use reims_vgpu_graphics::wire::RGFX_STATUS_CACHE;
+        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
+        let mut r = rig(16);
+        let page = r.page;
+        r.dec.set_unified_memory(true);
+        let world = Arc::clone(r.p.world());
+        world.answer_surface_pages(PagesInPlace::No("the rows end inside a line".into()));
+        // Five rows of half a page, no bytes between them: the surface's own bytes end half way
+        // through the third page, and the block names all three.
+        let (pitch, rows) = (page / 2, 5);
+        let own = pitch * rows;
+        let layout = one_plane(pitch, pitch, rows);
+        assert_eq!(
+            r.pages_asking(BLOCK, &[(1, 3)], 3 * page, Some(layout)),
+            RGFX_STATUS_CACHE
+        );
+        assert_eq!(
+            r.pages_cached(BLOCK, &[(1, 3)], 3 * page, true),
+            RGFX_STATUS_OK
+        );
+        queues(&mut r);
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, true)]);
+        assert_eq!(
+            offsets(&r.p.call_log().since(mark)),
+            [(0, 0, 3 * page)],
+            "the fill reads every byte the block names"
+        );
+        // Every copy into the pages lands inside the surface's own bytes.
+        let inside = |calls: &[Call], what: &str| {
+            let out = offsets(calls);
+            assert!(!out.is_empty(), "{what}: copies");
+            for (from, to, size) in out {
+                assert_eq!(from, to, "{what}: each byte into its own place");
+                assert!(
+                    to + size <= own,
+                    "{what}: {size:#x} bytes at {to:#x} pass {own:#x}"
+                );
+            }
+        };
+        let mark = r.p.call_log().mark();
+        r.dec
+            .surface_download(&r.device, BLOCK, Box::new(|| {}), no_raise());
+        r.p.world().complete_all(CompleteOn::Caller);
+        inside(&r.p.call_log().since(mark), "the download");
+        use_surfaces(&mut r, 1, 0x101, &[(BLOCK, 0, true)]);
+        let mark = r.p.call_log().mark();
+        r.dec
+            .block_released(&r.device, BLOCK, 0, Box::new(|| {}), no_raise());
+        r.p.world().complete_all(CompleteOn::Caller);
+        inside(&r.p.call_log().since(mark), "the release");
+    }
+
     /// A laid-out cache on a device that copies the guest's RAM by its runs copies its rows'
     /// texels out in one copy: each row cut to the runs its bytes lie in, a run two rows lie in
     /// cut for each, every one from its own byte of the cache
