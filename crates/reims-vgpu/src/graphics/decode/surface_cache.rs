@@ -7612,6 +7612,43 @@ mod tests {
         );
     }
 
+    /// A carrying deferral's pages that follow one another both in the surface and in guest RAM
+    /// fill in with one copy, the host's guest pages of each run merged, and a page apart from the
+    /// one before it in either with its own: surface pages 0 and 1 at RAM pages 2 and 3 are one
+    /// copy, page 2 at RAM page 5 (apart in RAM) another, and page 4 at RAM page 6 (apart in the
+    /// surface) a third, each at its own bytes of the cache and through its own bytes of the
+    /// Shared buffer
+    #[test]
+    fn a_carrying_deferral_copies_each_run_of_its_pages_once() {
+        let mut r = deferring_carrying(8);
+        let page = r.page;
+        assert_eq!(
+            defer_carrying(&mut r, BLOCK, 5, &[(0, 2), (1, 3), (2, 5), (4, 6)], None),
+            RGFX_STATUS_OK
+        );
+        let cache = cache_id(&r);
+        let mut ram = ram_bytes(&r, 2, 2 * page, Some(0x5a));
+        ram.extend(ram_bytes(&r, 5, 2 * page, Some(0xa5)));
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK, 0, false)]);
+        let filled = copies_at(&r.p.call_log().since(mark));
+        let staging = filled.first().map_or(0, |c| c.0);
+        assert_eq!(
+            filled,
+            [
+                (staging, 0, cache, 0, 2 * page),
+                (staging, 2 * page, cache, 2 * page, page),
+                (staging, 3 * page, cache, 4 * page, page)
+            ],
+            "one copy a run"
+        );
+        assert_eq!(
+            buffer_bytes(&r, staging, None),
+            ram,
+            "the pages' bytes, in order"
+        );
+    }
+
     /// A carrying deferral that asks with its surface's layout fills its carried page in whole,
     /// as every fill copies every byte in, those beside the rows' texels among them. Its pages,
     /// named at a CPU lock, are taken for the cache, and the download that follows copies each

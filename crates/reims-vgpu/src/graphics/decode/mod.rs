@@ -1632,11 +1632,12 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// The pages a carrying deferral's `runs` carry, of a surface of `length` bytes
-    /// ([`Self::deferred_surface_pages`]): each guest page of a run that is not
-    /// [`RGFX_PAGE_RUN_ZEROS`], as the surface's byte it holds, its host address in the guest's
-    /// RAM and its bytes; and their host addresses as runs, which the cache watches. `None` where
-    /// a run is not whole guest pages, they do not sum to the surface's bytes in whole pages, a
-    /// page lies outside the guest's RAM the host maps, or none is carried.
+    /// ([`Self::deferred_surface_pages`]): the guest pages of the runs that are not
+    /// [`RGFX_PAGE_RUN_ZEROS`], in runs of pages that follow one another both in the surface and
+    /// in the host's mapping of the guest's RAM, each as the surface's byte it starts at, its host
+    /// address in the guest's RAM and its bytes; and their host addresses as runs, which the cache
+    /// watches. `None` where a run is not whole guest pages, they do not sum to the surface's bytes
+    /// in whole pages, a page lies outside the guest's RAM the host maps, or none is carried.
     fn carried_pages(
         &self,
         runs: &[RgfxPageRun],
@@ -1645,7 +1646,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let page = surface_pages::GUEST_PAGE;
         let whole = length.checked_next_multiple_of(page)?;
         let mut at = 0u64;
-        let mut carried = Vec::new();
+        let mut carried: Vec<(u64, HostPtr, u64)> = Vec::new();
         let mut named = Vec::new();
         let views = self.shared.surface_views.lock();
         for run in runs {
@@ -1658,7 +1659,16 @@ impl<P: Platform> GraphicsDecoder<P> {
                 }
                 let mut from = at;
                 for (host, bytes) in views.host_pages_in_order(std::slice::from_ref(run))? {
-                    carried.push((from, host, bytes));
+                    // A page that follows the one before it both in the surface and in the
+                    // host's mapping of the guest's RAM extends its run: one copy fills it.
+                    match carried.last_mut() {
+                        Some((start, first, so_far))
+                            if *start + *so_far == from && first.wrapping_add(*so_far) == host =>
+                        {
+                            *so_far += bytes;
+                        }
+                        _ => carried.push((from, host, bytes)),
+                    }
                     from += bytes;
                 }
                 named.push(*run);
