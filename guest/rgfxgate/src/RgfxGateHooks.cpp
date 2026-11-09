@@ -129,8 +129,15 @@ bool installHooks() {
 	if (!graft_kernel_symbol(kClientID, "_csfg_get_cdhash", &csfg) ||
 	    !graft_kernel_symbol(kClientID, "_csblob_get_cdhash", &csblob))
 		return false;
-	gCsfgGetCdhash = reinterpret_cast<t_csfg_get_cdhash>(csfg);
-	gCsblobGetCdhash = reinterpret_cast<t_csblob_get_cdhash>(csblob);
+	// Graft returns each symbol's raw address (Graft.h). On arm64e a C function
+	// pointer is signed (IA key, zero discriminator for these plain fn-ptr
+	// types), so sign the raw address for that schema here; the call sites
+	// authenticate it. Casting the integer straight to the pointer type would
+	// make the compiler authenticate a raw value and trap under FEAT_FPAC.
+	gCsfgGetCdhash = reinterpret_cast<t_csfg_get_cdhash>(ptrauth_sign_unauthenticated(
+	    reinterpret_cast<void *>(csfg), ptrauth_key_function_pointer, 0));
+	gCsblobGetCdhash = reinterpret_cast<t_csblob_get_cdhash>(ptrauth_sign_unauthenticated(
+	    reinterpret_cast<void *>(csblob), ptrauth_key_function_pointer, 0));
 	// The replacements go as plain function pointers: Graft strips and re-signs
 	// each for its slot. Each original's storage is the __ptrauth variable, so
 	// AMFI's signed slot value, stored there raw, is called through as is.
