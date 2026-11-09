@@ -192,6 +192,9 @@ inline uint64_t rgfxFrameInfoTime(uint64_t shown, int64_t lead)
 // swap whose refresh is not after the last one given is given the refresh after that one, a
 // period on, where that lies at most kAheadPeriods past its own; past that (swaps coming faster
 // than the refreshes), the time given before, so their times do not run ahead of the refreshes.
+// The refreshes given are kept in mach_absolute_time's clock, the one QuartzCore takes the times
+// back into: a sleep between two swaps grows the lead the second is given with, and leaves them a
+// period apart there all the same.
 class RgfxFrameInfoClock
 {
 public:
@@ -210,21 +213,22 @@ public:
 	}
 
 	// The time of a swap shown at `shown`, mach_absolute_time's, in the continuous clock, on a
-	// display whose refreshes are `period` ticks apart: a period after the time given before at
-	// least, where that lies at most kAheadPeriods past `shown`'s, else the time given before; 0
-	// for a swap that showed nothing, which changes nothing.
+	// display whose refreshes are `period` ticks apart: its refresh, or a period after the refresh
+	// given before where its own is not, if that lies at most kAheadPeriods past its own, else the
+	// refresh given before; then the lead added. 0 for a swap that showed nothing, which changes
+	// nothing.
 	uint64_t time(uint64_t shown, uint64_t period)
 	{
 		if (!shown)
 			return 0;
-		uint64_t t = rgfxFrameInfoTime(shown, lead_);
-		if (haveGiven_ && t < given_ + period) {
+		uint64_t refresh = shown;
+		if (haveGiven_ && refresh < given_ + period) {
 			const uint64_t next = given_ + period;
-			t = next - t <= kAheadPeriods * period ? next : given_;
+			refresh = next - refresh <= kAheadPeriods * period ? next : given_;
 		}
 		haveGiven_ = true;
-		given_ = t;
-		return t;
+		given_ = refresh;
+		return rgfxFrameInfoTime(refresh, lead_);
 	}
 
 	// The lead as read so far.
@@ -234,7 +238,7 @@ private:
 	int64_t lead_ = 0;
 	bool have_ = false;
 	bool haveGiven_ = false;
-	uint64_t given_ = 0;
+	uint64_t given_ = 0; // the refresh given last, mach_absolute_time's
 };
 
 // How many times rgfxReadClocks reads the clocks at most.

@@ -218,6 +218,11 @@ void frameInfo()
 		      "frameInfo");
 		check(clock.time(3001, 400) == 3041, "a later refresh as it is", "frameInfo");
 		check(clock.time(3441, 400) == 3481, "a period on, as it is", "frameInfo");
+		// A sleep of 500 ticks between two swaps: the second is a period after the first in the
+		// absolute clock, its time with the longer lead.
+		clock.read(6000, 6540, 6000);
+		check(clock.time(3442, 400) == 3841 + 540, "a period on after a sleep, with its lead",
+		      "frameInfo");
 		// No period (no refresh seen): never before the last one.
 		RgfxFrameInfoClock still;
 		still.read(5000, 5040, 5000);
@@ -262,7 +267,8 @@ void longRun()
 	const uint64_t periodNs = 16666667;
 	RgfxVblankClock vblank;
 	RgfxFrameInfoClock clock;
-	uint64_t lead = 0, traced = 0, lastShown = 0, swaps = 0, shared = 0;
+	uint64_t lead = 0, traced = 0, lastShown = 0, lastGiven = 0, swaps = 0, shared = 0;
+	bool lastExact = false;
 	uint64_t mach = 0;                    // the absolute clock's ticks, as the reads advance it
 	uint64_t lastAfter = 0, lastC = 0;    // the last try's later absolute read and continuous read
 	uint64_t oldTraced = 0, oldBack = 0;  // the time from each swap's own last try
@@ -294,29 +300,40 @@ void longRun()
 			};
 			rgfxReadClocks(absolute, continuous, clock);
 			const uint64_t periodTicks = toTicks(vblank.period());
+			const uint64_t ahead = RgfxFrameInfoClock::kAheadPeriods * periodTicks;
 			const uint64_t time = clock.time(shown, periodTicks);
+			// What QuartzCore traces, by the lead itself, and the refresh the clock gave, by the
+			// lead it read: the two agree where it read the lead exactly.
 			const uint64_t seen = time - lead;
+			const uint64_t given = time - static_cast<uint64_t>(clock.lead());
+			const bool exact = clock.lead() == static_cast<int64_t>(lead);
 			check(clock.lead() <= static_cast<int64_t>(lead), "the lead never read past itself",
 			      "longRun");
-			check(swaps == 0 || seen >= traced, "a traced time never goes back", "longRun");
-			check(seen + 2 >= shown &&
-			          seen <= shown + RgfxFrameInfoClock::kAheadPeriods * periodTicks,
+			check(given >= shown && given <= shown + ahead,
+			      "a given refresh is its own or at most two periods after", "longRun");
+			check(swaps == 0 || given - lastGiven >= periodTicks ||
+			          (given == lastGiven && lastGiven + periodTicks > shown + ahead),
+			      "a period after the one before, or its refresh where that is two periods ahead",
+			      "longRun");
+			check(seen + 2 >= shown && seen <= shown + ahead,
 			      "a traced time is at most 2 ticks before its refresh, two periods after",
 			      "longRun");
-			check(swaps == 0 || seen - traced >= periodTicks ||
-			          (seen == traced && traced + periodTicks + 2 >
-			                                 shown + RgfxFrameInfoClock::kAheadPeriods * periodTicks),
-			      "a period after the one before, or its time where that is two periods ahead",
-			      "longRun");
-			if (clock.lead() == static_cast<int64_t>(lead))
+			if (swaps && exact && lastExact)
+				check(seen == traced || seen - traced >= periodTicks,
+				      "with the lead read exactly, a traced time is a period after the one before "
+				      "or that one",
+				      "longRun");
+			if (exact)
 				check(seen >= shown, "never before its refresh once the lead was read exactly",
 				      "longRun");
-			again += swaps && seen == traced ? 1 : 0;
+			again += swaps && given == lastGiven ? 1 : 0;
 			const uint64_t oldSeen = shown + (lastC - lastAfter) - lead;
 			oldBack += swaps && oldSeen < oldTraced ? 1 : 0;
 			oldTraced = oldSeen;
 			shared += swaps && shown == lastShown ? 1 : 0;
 			traced = seen;
+			lastGiven = given;
+			lastExact = exact;
 			lastShown = shown;
 			swaps++;
 		}
