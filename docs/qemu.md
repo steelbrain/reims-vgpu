@@ -999,10 +999,23 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
 
 - **The bundle.** `config-bundle` writes `build/Config.cpio`: the module's
   `config.plist` with a `Kernel` > `Add` entry for each kext, Graft first,
-  and the kexts under `Kexts/`. It checks each kext's `CFBundleIdentifier`
+  `Graphics` > `DisplayNode` set to `reims-display0`, and the kexts under
+  `Kexts/`. It checks each kext's `CFBundleIdentifier`
   (`com.steelbrain.Graft`, `com.steelbrain.ReimsGraphics`,
   `com.steelbrain.RgfxGate`) and that its executable has an arm64e slice,
   and names every kext that is not given or fails, writing no bundle.
+- **The Ambrosia it needs.** `Graphics` > `DisplayNode` needs Ambrosia
+  `8f2655b` or later (Ambrosia's `docs/configuration.md`, "Graphics >
+  DisplayNode"). Where the module drives a display, Ambrosia adds
+  `/arm-io/reims-display0`, a `display-subsystem` node, to the device tree
+  before the kernel starts, and logs `ambrosia: display node
+  /arm-io/reims-display0, a display-subsystem`; ReimsGraphics uses that node
+  as display 0's ([architecture.md](architecture.md) 11.5). An older
+  Ambrosia ignores the key, as it ignores every key it does not know, and
+  boots with no node: ReimsGraphics then attaches its own node when it
+  starts, after WindowServer has counted the displays, so WindowServer
+  counts none and stays headless, while the processes that start later find
+  the display.
 - **The boot.** The script boots APFS clones of the guest's disks (`cp -c`;
   `cp --reflink=always` on Linux) in its log directory and removes them at
   the end, with 8 GiB, 4 CPUs, the device, `REIMS_VGPU_WINDOW=0` and
