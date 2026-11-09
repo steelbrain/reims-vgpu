@@ -924,8 +924,17 @@ pub fn created_or_decided<T>(
 ///   returned ran nothing, the command buffer running on, where Metal's draw renders, and Metal
 ///   fails the state's creation instead. Announced where the draw is recorded: in the commit, or
 ///   the command buffer's host step;
-/// - six kinds no device on Metal announces, each dying where a device announces it, at its
+/// - seven kinds no device on Metal announces, each dying where a device announces it, at its
 ///   selector, as no fact of the hardware forces it:
+///   - `VisibilityPastEarlyMask`: a draw under a visibility result (`Counting` or `Boolean`)
+///     whose fragment function declares `[[early_fragment_tests]]` and writes its sample mask,
+///     on a device that does not state `earlyFragmentMultisampleCoverageAfterSampleCounting`
+///     (the runtime's measurement: ANV on the Iris Xe), where Vulkan lets the mask come before
+///     sample counting: the result may leave out the samples the mask drops, which Metal counts
+///     under early tests, a `Counting` one counting fewer and a `Boolean` one reading 0 where
+///     Metal's passed. A second draw of each counted draw without the mask and its writes would
+///     count as Metal does, which the runtime has not built. Announced at the draw, inside its
+///     call;
 ///   - `VisibilityCountPerColor`: a draw counted by a `Counting` visibility result whose
 ///     fragment variant writes more than one colour attachment, on a device whose driver counts
 ///     each sample once per colour output (the runtime's `OcclusionCountPerColorOutput`: ANV),
@@ -1246,6 +1255,13 @@ pub fn created_or_decided<T>(
 ///   of at least sixteenths and clamps to the device's range, where Metal's grid and range are not
 ///   measured. Such reads died before the runtime lowered Metal's `interpolant` inputs, so placing
 ///   it here ends no run that went on. Announced at each draw that binds such a pipeline;
+/// - the note `ExtrapolatedInterpolation`: a fragment function's perspective interpolant read at
+///   a sample or an offset on a device whose driver extrapolates it from the pixel centre along
+///   the quad's coarse derivatives (the runtime's `PerspectiveReadsExtrapolated`: RADV, measured
+///   on the Radeon 780M within 0.005 of that form), where Metal's read is not extrapolated.
+///   Vulkan states no precision for interpolation. Before the runtime named it, such reads went
+///   on unannounced, so by default it ends no run that went on. Announced at each draw that binds
+///   such a pipeline;
 /// - `PredicationWordPastBuffer`: a command predication record of the runtime's whose condition
 ///   word lies past its buffer's end, past the 256 bytes Metal rounds a lone buffer up to, or past
 ///   the end of the heap the buffer lies in, which reads zero where Metal reads what its own
@@ -1297,7 +1313,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 143] = [
+pub const DIES: [rt::Degradation; 145] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1323,6 +1339,7 @@ pub const DIES: [rt::Degradation; 143] = [
     rt::Degradation::ViewBaseTexelOffset,
     rt::Degradation::DeviceInterpolation,
     rt::Degradation::DeviceInterpolationOffset,
+    rt::Degradation::ExtrapolatedInterpolation,
     rt::Degradation::QuadsSplitByClipping,
     rt::Degradation::VertexSimdgroupGrouping,
     rt::Degradation::FragmentSimdgroupGrouping,
@@ -1387,6 +1404,7 @@ pub const DIES: [rt::Degradation; 143] = [
     rt::Degradation::DrawDroppedStillMaking,
     rt::Degradation::DispatchDroppedStillMaking,
     rt::Degradation::DrawDroppedUnmade,
+    rt::Degradation::VisibilityPastEarlyMask,
     rt::Degradation::VisibilityCountPerColor,
     rt::Degradation::ColorAttachmentGroups,
     rt::Degradation::DevicePointSize,

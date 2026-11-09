@@ -3937,11 +3937,11 @@ fn placements_of_depth_textures_without_optimized_contents_take_metals_size() {
 /// heap over the guest's pages is made, as a `Depth32Float` one is: its size and alignment are
 /// the runtime's model of Metal's, a `Stencil8` one's of its shape, which the runtime's own
 /// answer covers. Metal makes each. On a device that clamps a depth outside `[0, 1]`
-/// (MoltenVK), the making of each dies of `restricted-depth-upload` in strict mode, the
-/// `X32_Stencil8` one's too, whose image holds a 32-bit float depth beside its stencil, and by
-/// default each is made. The `X32_Stencil8` one's death is the runtime's bug at pin 27 (its copy
-/// in clamps the padding); pin 28 copies its stencil alone, unannounced, and this expectation
-/// flips there
+/// (MoltenVK), the `Depth32Float` one's making dies of `restricted-depth-upload` in strict mode
+/// and is made by default. The `X32_Stencil8` one, whose image holds a 32-bit float depth beside
+/// its stencil, is made in either mode and announces nothing: the runtime copies its stencil in
+/// alone, as a heap texture of a format without depth (it clamped the padding up to pin 27, which
+/// died here in strict mode)
 #[test]
 fn optimized_x32_stencil8_placements_are_made_as_metals() {
     let sel = "newTextureWithDescriptor:offset:";
@@ -3966,10 +3966,19 @@ fn optimized_x32_stencil8_placements_are_made_as_metals() {
             heap.new_texture(&desc, 0).unwrap().is_some()
         };
         *crate::answer::LAST_LINE.lock() = None;
-        let made = catch_death(|| uploading_depth(&d, sel, place));
+        let made = match pixel_format {
+            252 => catch_death(|| uploading_depth(&d, sel, place)),
+            _ => catch_death(place),
+        };
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
         let made = made.unwrap_or_else(|site| panic!("{pixel_format}: died at {site:?}: {line}"));
         assert!(made, "{pixel_format} ({sel})");
+        if pixel_format == 261 {
+            let before = crate::answer::relayed_counts();
+            assert!(crate::answer::relaxed(place), "{pixel_format} by default");
+            let after = crate::answer::relayed_counts();
+            assert_eq!(after, before, "{pixel_format} relays no kind of DIES");
+        }
     }
 }
 
