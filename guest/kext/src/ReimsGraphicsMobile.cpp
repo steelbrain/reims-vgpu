@@ -164,21 +164,36 @@ constexpr char kDisplayNodeType[] = "display-subsystem";
 // as IOMobileFramebuffer.framework counts displays (iomfb_populate_all_display_infos), and it
 // counts the children of IODeviceTree:/arm-io whose device_type is "display-subsystem" or
 // "ext-display-subsystem", and the DisplayPortCount of an AppleParavirtGPU where a child's
-// compatible names Apple's paravirtual GPU (read from macOS 27.0.1's framework). A VM's device
-// tree has no such child for this device: the framework counted no display, and WindowServer ran
-// headless ("FB Count = 0"). The node is attached at start, before WindowServer's first count, and
-// is ours alone: nothing in the kernel reads it.
+// compatible names Apple's paravirtual GPU (read from macOS 14.6.1's and 27.0.1's framework). A
+// VM's device tree has no such child for this device: the framework counted no display, and
+// WindowServer ran headless ("FB Count = 0").
+//
+// The framework counts once in a process (dispatch_once), and only a count above 0 starts its wait,
+// up to 30 seconds, for the IOMobileFramebuffer services. The kexts load from the auxiliary kernel
+// collection, after userspace starts: WindowServer counts before start runs, so a node attached
+// here is counted only by the processes that start after it. A node the firmware placed at the same
+// path, before the kernel started, is counted by every process: start uses it as it stands, and
+// attaches a node of its own only where the firmware placed none. Nothing in the kernel reads the
+// node: no driver matches its name or its device_type.
 void ReimsGraphics::attachMobileNode()
 {
 	mobileNode = nullptr;
+	mobileNodeAttached = false;
+	char name[32];
+	snprintf(name, sizeof(name), "reims-display%u", displayId);
+	char path[48];
+	snprintf(path, sizeof(path), "/arm-io/%s", name);
+	if (IORegistryEntry *placed = IORegistryEntry::fromPath(path, gIODTPlane)) {
+		mobileNode = placed;
+		IOLog("ReimsGraphics: display %u has the firmware's IODeviceTree:%s\n", displayId, path);
+		return;
+	}
 	IORegistryEntry *armIO = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
 	if (!armIO) {
 		IOLog("ReimsGraphics: no /arm-io in the device tree, so no process counts display %u\n",
 		      displayId);
 		return;
 	}
-	char name[32];
-	snprintf(name, sizeof(name), "reims-display%u", displayId);
 	OSDictionary *props = OSDictionary::withCapacity(2);
 	OSData *nameData = OSData::withBytes(name, static_cast<unsigned>(strlen(name) + 1));
 	OSData *typeData = OSData::withBytes(kDisplayNodeType, sizeof(kDisplayNodeType));
@@ -194,6 +209,7 @@ void ReimsGraphics::attachMobileNode()
 	}
 	if (attached) {
 		mobileNode = node;
+		mobileNodeAttached = true;
 		node = nullptr;
 	}
 	OSSafeReleaseNULL(node);
@@ -209,7 +225,9 @@ void ReimsGraphics::detachMobileNode()
 {
 	if (!mobileNode)
 		return;
-	mobileNode->detachAbove(gIODTPlane);
+	if (mobileNodeAttached)
+		mobileNode->detachAbove(gIODTPlane);
+	mobileNodeAttached = false;
 	OSSafeReleaseNULL(mobileNode);
 }
 

@@ -544,8 +544,10 @@ private:
 	static void mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	static void mobilePresented(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
 	bool mobilePipe;
-	// The display's node under /arm-io in the device tree (retained), where attached.
+	// The display's node under /arm-io in the device tree (retained): the firmware's, or one start
+	// attached (mobileNodeAttached), which stop detaches.
 	IORegistryEntry *mobileNode;
+	bool mobileNodeAttached;
 	// Whether start_hardware joined power management, which stop_hardware_gated leaves.
 	bool mobilePowerJoined;
 	UInt64 mobilePresentSeqno;
