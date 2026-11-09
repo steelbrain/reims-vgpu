@@ -7815,8 +7815,10 @@ fn a_release_the_platform_dies_at_is_refused() {
 }
 
 /// With a memory map the device carries out `SURFACE_PAGES`, and `PAGES_BUFFERS` and
-/// `HEAP_OVER_PAGES` over it, where
-/// the host's page is the guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does.
+/// `HEAP_OVER_PAGES` over it, and says so in `FEATURES_LO`: to every guest where the host's page is
+/// the guest's 4 KiB, and on a host of 16 KiB pages only to a guest that takes `PAGES_16K`
+/// (`FEATURES_HI` bit 2), every other reading the features and the device info of a device with
+/// no map; without one it never does.
 /// Every device answers a command buffer's ask for its submission (`CB_SUBMITTED`), orders command
 /// buffers over the IOSurfaces they share (`SURFACE_ORDER`), makes indirect command buffers
 /// (`INDIRECT_COMMAND_BUFFERS`), makes the queues the kext asks unshared on the platform's
@@ -7857,15 +7859,30 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         memory_map: Some(map),
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
-    let want = if platform.vm().page_size() == 4096 {
-        RGFX_FEATURE_SURFACE_PAGES
-            | RGFX_FEATURE_PAGES_BUFFERS
-            | RGFX_FEATURE_HEAP_OVER_PAGES
-            | RGFX_FEATURE_SURFACE_CACHE_REFUSED
-            | RGFX_FEATURE_SURFACE_DEFERRED_ASK
-    } else {
-        0
-    };
+    let in_place = RGFX_FEATURE_SURFACE_PAGES
+        | RGFX_FEATURE_PAGES_BUFFERS
+        | RGFX_FEATURE_HEAP_OVER_PAGES
+        | RGFX_FEATURE_SURFACE_CACHE_REFUSED
+        | RGFX_FEATURE_SURFACE_DEFERRED_ASK;
+    let page = platform.vm().page_size();
+    assert!(page == 4096 || page == 16384, "the hosts the library builds for");
+    let sixteen = page == 16384;
+    let want = if sixteen { 0 } else { in_place };
+    let base = RGFX_FEATURE_CB_SUBMITTED
+        | RGFX_FEATURE_SURFACE_ORDER
+        | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
+        | RGFX_FEATURE_UNSHARED_QUEUES
+        | RGFX_FEATURE_SUBMIT_ROOM
+        | RGFX_FEATURE_ICB_SLOTS
+        | RGFX_FEATURE_COMMIT_ORDER
+        | RGFX_FEATURE_HOST_TIME
+        | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
+        | RGFX_FEATURE_MANAGED_BUFFER_SLABS
+        | RGFX_FEATURE_SMALL_ID_CHUNKS
+        | RGFX_FEATURE_DISPLAY_COLOR
+        | RGFX_FEATURE_MESH_PIPELINES
+        | RGFX_FEATURE_SHARED_EVENT_NAMES;
+    let sixteen_bit = if sixteen { RGFX_FEATURE_PAGES_16K } else { 0 };
     assert_eq!(
         device.mmio_read(RGFX_REG_FEATURES_LO.into()),
         want | RGFX_FEATURE_CB_SUBMITTED
@@ -7887,6 +7904,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
     assert_eq!(
         u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
         RGFX_FEATURE_SCHEDULED_ASK
+            | sixteen_bit
             | if carries {
                 RGFX_FEATURE_SURFACE_DEFERRED_CARRY
             } else {
@@ -7917,6 +7935,29 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         },
         "the rows of the surfaces that lie in place in their pages"
     );
+
+    // A guest that takes `PAGES_16K` on a host of 16 KiB pages reads the guest RAM's features,
+    // and the deferred blocks' budget with them; the device info, written before, stays.
+    if sixteen {
+        device.mmio_write(
+            RGFX_REG_DRIVER_FEATURES_HI.into(),
+            u32::try_from(RGFX_FEATURE_PAGES_16K >> 32).unwrap(),
+        );
+        assert_eq!(
+            device.mmio_read(RGFX_REG_FEATURES_LO.into()),
+            in_place | base
+        );
+        assert_eq!(
+            u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
+            RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_PAGES_16K | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+        );
+        assert_eq!(
+            u64::from(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()))
+                | u64::from(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into())) << 32,
+            FAKE_OWN_MEMORY / 4
+        );
+        assert_eq!(device_info_of(&device).linear_row_alignment, 0);
+    }
 
     let (device, _) = headless_on(&Arc::new(AtomicU32::new(0)));
     assert_eq!(device_info_of(&device).linear_row_alignment, 0);

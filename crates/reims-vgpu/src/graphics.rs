@@ -58,7 +58,7 @@ use reims_vgpu_graphics::wire::{
     RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
     RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
-    RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SCHEDULED_ASK,
+    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_SCHEDULED_ASK,
     RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
     RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
     RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
@@ -185,10 +185,10 @@ pub struct GraphicsConfig {
     /// window. The window keeps its size whatever this says (the module doc).
     pub window: Option<WindowConfig>,
     /// The guest's RAM, with the files behind it, through which the GPU uses an IOSurface's own
-    /// pages in place (`RGFX_FEATURE_SURFACE_PAGES`, where the host's page is the guest's 4 KiB);
-    /// `None` keeps each surface's GPU view a copy of its pages in the region. The pages stay the
-    /// guest's RAM while the device lives: a host that discards guest RAM (a balloon, hot-unplug)
-    /// gives none.
+    /// pages in place (`RGFX_FEATURE_SURFACE_PAGES`, where the host's page is the guest's 4 KiB, or
+    /// 16 KiB for a guest that takes `RGFX_FEATURE_PAGES_16K`); `None` keeps each surface's GPU
+    /// view a copy of its pages in the region. The pages stay the guest's RAM while the device
+    /// lives: a host that discards guest RAM (a balloon, hot-unplug) gives none.
     pub memory_map: Option<MemoryMap>,
 }
 
@@ -348,8 +348,8 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     0
                 } else {
                     u64::from(RGFX_FEATURE_MANAGED_AT_OFFSET)
-                }
-                | match (decoder.surface_pages_available(), unified_memory) {
+                };
+            let pages_features = match (decoder.surface_pages_available(), unified_memory) {
                     (false, _) => 0,
                     // A host whose GPU shares the CPU's memory keeps a device cache only of the
                     // surfaces whose pages its textures cannot use in place, where the kext asks,
@@ -370,20 +370,35 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                             | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
                     }
                 };
-            let deferred_budget = deferred_budget(features, gpu_device.own_memory_budget());
+            // A host of 16 KiB pages offers the guest RAM's features only to a guest that takes
+            // `PAGES_16K`, whose runs are whole 16 KiB pages: the device reads them in
+            // `FEATURES_LO` and `_HI` once it is taken, and every other guest reads the features
+            // without them, as from a host with no guest RAM (`device::Host::features_with_16k_pages`).
+            let (features, features_16k) = if pages_features != 0 && decoder.surface_pages_need_16k()
+            {
+                (features | RGFX_FEATURE_PAGES_16K, pages_features)
+            } else {
+                (features | pages_features, 0)
+            };
+            // The decoder carries out each feature the device may offer; the device's registers
+            // read the budget only where it offers the deferred blocks.
+            let offerable = features | features_16k;
+            let deferred_budget = deferred_budget(offerable, gpu_device.own_memory_budget());
             decoder.set_deferred_budget(deferred_budget);
-            if features & u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK) != 0 {
+            if offerable & u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK) != 0 {
                 decoder.set_deferred_asks();
             }
-            if features & RGFX_FEATURE_SURFACE_DEFERRED_CARRY != 0 {
+            if offerable & RGFX_FEATURE_SURFACE_DEFERRED_CARRY != 0 {
                 decoder.set_deferred_carries();
             }
-            // The processes read the features from the device info, as no register is theirs.
+            // The processes read the features from the device info, as no register is theirs:
+            // those every guest reads, written before any takes `PAGES_16K`.
             info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
             // A host whose surfaces lie in place in their pages has the guest align their rows as
             // its GPU's images take them in place; one that keeps them in device caches leaves the
-            // guest's rows as they were.
-            if decoder.surface_pages_available() && unified_memory {
+            // guest's rows as they were, as does one that offers its pages only once a guest takes
+            // `PAGES_16K`, as the device info is written before it does.
+            if decoder.surface_pages_available() && unified_memory && features_16k == 0 {
                 info.linear_row_alignment =
                     u32::try_from(gpu_device.linear_row_alignment()).unwrap_or_default();
             }
@@ -432,6 +447,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
                 features,
+                features_16k,
                 deferred_budget,
                 control: Arc::clone(&control),
             });
@@ -2148,6 +2164,9 @@ struct CallbackHost<P: ApiPlatform> {
     /// The `RGFX_FEATURE_*` the decoder carries out, fixed at the device's make: the guest reads
     /// them on a vCPU, which takes no lock of the decoder's.
     features: u64,
+    /// Those it carries out only for a guest that takes `RGFX_FEATURE_PAGES_16K`, also fixed at
+    /// the make: the guest RAM's on a host of 16 KiB pages, else none.
+    features_16k: u64,
     /// The deferred blocks' budget ([`deferred_budget`]), read once at the device's make, so the
     /// kext's one read holds.
     deferred_budget: u64,
@@ -2203,6 +2222,10 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
 
     fn features(&self) -> u64 {
         self.features
+    }
+
+    fn features_with_16k_pages(&self) -> u64 {
+        self.features_16k
     }
 
     fn deferred_budget(&self) -> u64 {

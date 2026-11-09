@@ -1048,6 +1048,13 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.surface_views.lock().available(&self.platform)
     }
 
+    /// Whether the guest's runs must be whole 16 KiB pages for `SURFACE_PAGES`
+    /// ([`surface_pages::SurfaceViews::needs_16k_pages`]): the in-place features go only to a
+    /// guest that takes `PAGES_16K`.
+    pub(crate) fn surface_pages_need_16k(&self) -> bool {
+        self.shared.surface_views.lock().needs_16k_pages(&self.platform)
+    }
+
     /// `SURFACE_PAGES` carried out here, at once ([`Self::begin_surface_pages`],
     /// [`Self::carry_out_surface_pages`]): its answer (for the tests).
     #[cfg(test)]

@@ -64,6 +64,9 @@
 //! The runs are the guest's: each must be whole pages of the guest's (4 KiB) and of the host's
 //! from a page, lie in guest RAM, and the runs must sum to the surface's length; else the block
 //! gets no view, `SURFACE_PAGES` is refused, and the kext gives the surface a copy block instead.
+//! On a host of 16 KiB pages (a Mac) the runs are whole 16 KiB pages, which only a guest that takes
+//! `RGFX_FEATURE_PAGES_16K` lays out: the device offers the in-place features to no other guest
+//! there (`reims_vgpu_graphics::device`).
 //!
 //! **Pages blocks** (`RGFX_FEATURE_PAGES_BUFFERS`). A `SURFACE_PAGES` marked
 //! `RGFX_SURFACE_PAGES_PRIVATE` names a block of one process's own, which holds nothing but the
@@ -207,8 +210,13 @@ use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::worker::{Settle, Worker};
 
-/// The guest's page: every run is whole pages of it.
+/// The guest's least page: every run is whole pages of it, and of the host's ([`SurfaceViews`]'
+/// checks).
 pub(crate) const GUEST_PAGE: u64 = 4096;
+
+/// The page of a guest that takes `RGFX_FEATURE_PAGES_16K`: its runs are whole pages of it, as a
+/// host of 16 KiB pages needs them.
+pub(crate) const GUEST_PAGE_16K: u64 = 16384;
 
 /// How many views the cache keeps, the last made or taken.
 pub(crate) const CACHED_VIEWS: usize = 32;
@@ -674,14 +682,26 @@ impl<P: Platform> SurfaceViews<P> {
         }
     }
 
-    /// Whether views can be made: a memory map, and a host page the guest's runs are whole
-    /// pages of ([`GUEST_PAGE`]); the device's [`RGFX_FEATURE_SURFACE_PAGES`] says so.
+    /// Whether views can be made: a memory map, and a host page core's mappings take that a
+    /// guest's runs can be whole pages of: the guest's 4 KiB ([`GUEST_PAGE`]), or 16 KiB
+    /// ([`GUEST_PAGE_16K`]), which only a guest that takes `PAGES_16K` lays its runs out in
+    /// ([`Self::needs_16k_pages`]); the device's [`RGFX_FEATURE_SURFACE_PAGES`] says so.
     ///
     /// [`RGFX_FEATURE_SURFACE_PAGES`]: reims_vgpu_graphics::wire::RGFX_FEATURE_SURFACE_PAGES
     pub(crate) fn available(&self, platform: &P) -> bool {
+        let page = platform.vm().page_size();
         self.memory.is_some()
-            && platform.vm().page_size() == GUEST_PAGE
-            && MAPPING_PAGE == GUEST_PAGE
+            && page == MAPPING_PAGE
+            && (page == GUEST_PAGE || page == GUEST_PAGE_16K)
+    }
+
+    /// Whether the guest's runs must be whole 16 KiB pages for a view: a host of 16 KiB pages,
+    /// whose device offers the in-place features only to a guest that takes
+    /// [`RGFX_FEATURE_PAGES_16K`].
+    ///
+    /// [`RGFX_FEATURE_PAGES_16K`]: reims_vgpu_graphics::wire::RGFX_FEATURE_PAGES_16K
+    pub(crate) fn needs_16k_pages(&self, platform: &P) -> bool {
+        platform.vm().page_size() == GUEST_PAGE_16K
     }
 
     /// What the views did so far.
