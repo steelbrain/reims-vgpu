@@ -428,13 +428,32 @@ WIRE_VERSION = $(shell sed -n 's/^\#define RGFX_VERSION \([0-9][0-9]*\)$$/\1/p' 
 
 package: $(PACKAGETGZ)
 
-$(PACKAGETGZ): $(BUNDLEBIN) Info.plist $(WIRE_H) Makefile
+# PACKAGE_ARCHS: the architectures the installable bundle's executable carries; one is ARCH's
+# build itself, more are each built with ARCH set to it and joined with lipo. An arm64 guest
+# runs arm64e system processes (WindowServer) and arm64 apps, and Metal loads the bundle into
+# both, so its package is PACKAGE_ARCHS="arm64e arm64".
+PACKAGE_ARCHS ?= $(ARCH)
+ifeq ($(words $(PACKAGE_ARCHS)),1)
+PACKAGEBIN = $(BUNDLEBIN)
+else
+PACKAGEBIN = $(BUILD)/reims-graphics.universal
+PACKAGESLICES = $(foreach a,$(PACKAGE_ARCHS),$(BUILD)/reims-graphics-$(a).bundle)
+.PHONY: package-slices
+package-slices:
+	@for a in $(PACKAGE_ARCHS); do \
+		$(MAKE) ARCH=$$a PACKAGE_ARCHS=$$a BUILD=$(BUILD) BUNDLEBIN=$(BUILD)/reims-graphics-$$a.bundle bundle || exit 1; \
+	done
+$(PACKAGEBIN): package-slices
+	lipo -create $(PACKAGESLICES) -output $@
+endif
+
+$(PACKAGETGZ): $(PACKAGEBIN) Info.plist $(WIRE_H) Makefile
 	@test -n "$(WIRE_VERSION)" || { echo "no RGFX_VERSION in $(WIRE_H)"; exit 1; }
 	rm -rf $(PACKAGE)
 	@mkdir -p $(PACKAGE)/Contents/MacOS $(PACKAGE)/Contents/Resources
 	plutil -lint Info.plist > /dev/null
 	cp Info.plist $(PACKAGE)/Contents/Info.plist
-	cp $(BUNDLEBIN) $(PACKAGE)/Contents/MacOS/reims-graphics
+	cp $(PACKAGEBIN) $(PACKAGE)/Contents/MacOS/reims-graphics
 	: > $(PACKAGE)/Contents/Resources/wire-version-$(WIRE_VERSION)
 	codesign --force --sign - $(PACKAGE)
 	codesign -v --strict $(PACKAGE)

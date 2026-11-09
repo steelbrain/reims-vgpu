@@ -1,0 +1,27 @@
+# The kexts an arm64 macOS guest's Ambrosia config places for the reims-graphics
+# device: one [[kext]] per Kernel > Add entry, in order, each the bundle
+# beside this file named by BundlePath. Written by `make -C guest prebuilt-arm64e`; do not edit.
+# The keys are OpenCore's, but sha256, the SHA-256 of the entry's executable.
+format = 1
+MinKernel = "22.0.0"
+MaxKernel = ""
+
+[[kext]]
+BundlePath = "ReimsGraphics.kext"
+ExecutablePath = "Contents/MacOS/ReimsGraphics"
+PlistPath = "Contents/Info.plist"
+Arch = "arm64e"
+MinKernel = "22.0.0"
+MaxKernel = ""
+Comment = "The reims-graphics display and accelerator"
+sha256 = "5d2420dea52a69b54323bde47f015934b5243c03f53576ae6056918009c40077"
+
+[[kext]]
+BundlePath = "RgfxGate.kext"
+ExecutablePath = "Contents/MacOS/RgfxGate"
+PlistPath = "Contents/Info.plist"
+Arch = "arm64e"
+MinKernel = "22.0.0"
+MaxKernel = ""
+Comment = "Installs the reims-graphics Metal bundle and admits it"
+sha256 = "0952924130440d1fecc310b07442c0002f2b986c951606107239e7433969248c"

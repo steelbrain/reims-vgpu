@@ -2,10 +2,14 @@
 """Stage/check the SDK-only Graft set and its source/output hashes.
 
     python3 -I -B guest/tools/prebuilt.py stage OUT WORK
+    python3 -I -B guest/tools/prebuilt.py stage-arm64e OUT WORK
     python3 -I -B guest/tools/prebuilt.py record OUT
     python3 -I -B guest/tools/prebuilt.py check [DIR]
 
-The set includes the vendored Graft build, dormant ReimsGraphics and RgfxGate.
+The x86-64 set (stage, guest/prebuilt) includes the vendored Graft build, dormant
+ReimsGraphics and RgfxGate. The arm64e set (stage-arm64e, guest/prebuilt-arm64e) is
+dormant ReimsGraphics and RgfxGate for the arm64 guests Ambrosia boots; it takes Graft
+once guest/graft carries an arm64e Graft build.
 No kernel-range gate, KDK, loader, shim or downloaded build input is used.
 check also verifies guest/graft against the record Graft's tools/vendor.py
 wrote beside it.
@@ -37,6 +41,21 @@ SET = (
     ("Graft.kext", "Binds and routes the owned guest kexts"),
     ("kext/ReimsGraphics.kext", "The reims-graphics display, accelerator and device control"),
     ("rgfxgate/RgfxGate.kext", "Installs the reims-graphics Metal bundle and admits it"),
+)
+# The arm64e set, for the arm64 guests Ambrosia boots: from macOS 13 (Darwin 22), the oldest
+# release of Ambrosia's arm64 configuration. Ambrosia's config bundle places these kexts.
+MIN_KERNEL_ARM64E = "22.0.0"
+SET_ARM64E = (
+    ("kext/ReimsGraphics.kext", "The reims-graphics display and accelerator"),
+    ("rgfxgate/RgfxGate.kext", "Installs the reims-graphics Metal bundle and admits it"),
+)
+HEADER = (
+    "# The kexts an x86-64 macOS guest's OpenCore image injects for the reims-graphics",
+    "# device: one [[kext]] per Kernel > Add entry, in order, each the bundle",
+)
+HEADER_ARM64E = (
+    "# The kexts an arm64 macOS guest's Ambrosia config places for the reims-graphics",
+    "# device: one [[kext]] per Kernel > Add entry, in order, each the bundle",
 )
 # What the set is built from, below the repository's root: what each part's
 # build reads (guest/kext, guest/bundle, guest/rgfxgate, guest/graft and the
@@ -101,11 +120,14 @@ def quote(text):
     return json.dumps(text)
 
 
-def stage(out, work):
+def stage(out, work, arch="x86_64"):
+    arm64e = arch == "arm64e"
+    members, header = (SET_ARM64E, HEADER_ARM64E) if arm64e else (SET, HEADER)
+    min_kernel = MIN_KERNEL_ARM64E if arm64e else MIN_KERNEL
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    kexts = [(work / src, comment) for src, comment in SET]
+    kexts = [(work / src, comment) for src, comment in members]
     infos = {}
     for kext, _ in kexts:
         info = plist(kext)
@@ -122,21 +144,25 @@ def stage(out, work):
     dependencies = infos["ReimsGraphics.kext"].get("OSBundleLibraries", {})
     if {"com.apple.iokit.IOGraphicsFamily", "com.apple.AppleGraphicsDeviceControl"} & set(dependencies):
         raise SystemExit("prebuilt: dormant ReimsGraphics still names System-KC dependencies")
-    if sha256(work / "Graft.kext/Contents/MacOS/Graft") != sha256(ROOT / "guest/graft/built/Graft.kext/Contents/MacOS/Graft"):
+    if not arm64e and sha256(work / "Graft.kext/Contents/MacOS/Graft") != sha256(ROOT / "guest/graft/built/Graft.kext/Contents/MacOS/Graft"):
         raise SystemExit("prebuilt: Graft differs from the vendored build")
+    for kext, _ in kexts:
+        exe = kext / "Contents/MacOS" / infos[kext.name]["CFBundleExecutable"]
+        if arch not in tool("lipo", "-archs", str(exe)).split():
+            raise SystemExit(f"prebuilt: {kext.name} has no {arch} slice")
     # Each kext after those of the set it names.
     ids = [infos[k.name]["CFBundleIdentifier"] for k, _ in kexts]
     for i, (kext, _) in enumerate(kexts):
         later = set(infos[kext.name].get("OSBundleLibraries", {})) & set(ids[i:])
         if later:
             raise SystemExit(f"prebuilt: {kext.name} names {sorted(later)}, which come at or after it")
+    target = "prebuilt-arm64e" if arm64e else "prebuilt"
     lines = [
-        f"# The kexts an x86-64 macOS guest's OpenCore image injects for the reims-graphics",
-        f"# device: one [[kext]] per Kernel > Add entry, in order, each the bundle",
-        f"# beside this file named by BundlePath. Written by `make -C guest prebuilt`; do not edit.",
+        *header,
+        f"# beside this file named by BundlePath. Written by `make -C guest {target}`; do not edit.",
         f"# The keys are OpenCore's, but sha256, the SHA-256 of the entry's executable.",
         f"format = {FORMAT}",
-        f"MinKernel = {quote(MIN_KERNEL)}",
+        f"MinKernel = {quote(min_kernel)}",
         f"MaxKernel = {quote(MAX_KERNEL)}",
     ]
     for kext, comment in kexts:
@@ -148,8 +174,8 @@ def stage(out, work):
             f"BundlePath = {quote(kext.name)}",
             f"ExecutablePath = {quote('Contents/MacOS/' + exe)}",
             f"PlistPath = {quote('Contents/Info.plist')}",
-            f"Arch = {quote('x86_64')}",
-            f"MinKernel = {quote(MIN_KERNEL)}",
+            f"Arch = {quote(arch)}",
+            f"MinKernel = {quote(min_kernel)}",
             f"MaxKernel = {quote(MAX_KERNEL)}",
             f"Comment = {quote(comment)}",
             f"sha256 = {quote(sha256(kext / 'Contents/MacOS' / exe))}",
@@ -261,6 +287,8 @@ def main(argv):
     args = argv[1:]
     if len(args) == 3 and args[0] == "stage":
         stage(Path(args[1]), Path(args[2]))
+    elif len(args) == 3 and args[0] == "stage-arm64e":
+        stage(Path(args[1]), Path(args[2]), "arm64e")
     elif len(args) == 2 and args[0] == "record":
         record(Path(args[1]))
     elif args == ["check"]:

@@ -1083,8 +1083,12 @@ IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt3
 // IOAcceleratorFamily2's IOAccelMemoryMap::getAssignedGPUVirtualAddressLength() const,
 // referenced weakly and never called (assignedLengthExported). A binder that cannot resolve it
 // binds it to gOSKextUnresolved, as the kernel's linker does, or to 0: either reads as absent.
+// An arm64 kernel collection has no IOAcceleratorFamily2, so the arm64e kext references nothing
+// of it and reads the function as absent.
+#if defined(__x86_64__)
 extern "C" void rgfxAssignedGPUVirtualAddressLength()
     __asm("__ZNK16IOAccelMemoryMap34getAssignedGPUVirtualAddressLengthEv") __attribute__((weak_import));
+#endif
 
 bool ReimsGraphics::start(IOService *provider)
 {
@@ -1110,8 +1114,12 @@ bool ReimsGraphics::start(IOService *provider)
 	hostTime = false;
 	roomStats = {};
 	roomRecords = 0;
+#if defined(__x86_64__)
 	assignedLength = &rgfxAssignedGPUVirtualAddressLength != nullptr &&
 	                 OSKextSymbolIsResolved(rgfxAssignedGPUVirtualAddressLength);
+#else
+	assignedLength = false;
+#endif
 
 	pci->setMemoryEnable(true);
 	// setBusMasterEnable, which the SDK deprecates in favour of setBusLeadEnable: it is virtual, so

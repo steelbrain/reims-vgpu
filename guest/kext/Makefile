@@ -1,4 +1,5 @@
-# The reims-graphics display kext for x86-64 macOS 11 to 26 guests:
+# The reims-graphics display kext for x86-64 macOS 11 to 26 guests, and, with
+# ARCH_NAME=arm64e, for the arm64 macOS 13 and later guests Ambrosia boots:
 # ReimsGraphics, an IOFramebuffer on the device's PCI function
 # (src/ReimsGraphics.hpp; the protocol is docs/graphics-kext/design.md).
 # Builds on a Mac with Xcode's clang and ld, against the macOS SDK's
@@ -7,6 +8,8 @@
 # Graft to bind against the System kernel collection's libraries.
 #
 #   make        build/ReimsGraphics.kext
+#   make ARCH_NAME=arm64e BUILD=build/arm64e
+#               the arm64e kext, in a build directory of its own
 #   make check  check its imports and IOFramebuffer's layout against a
 #               guest's KDK (tools/check-imports.sh, tools/check-layout.py):
 #                 KDK=<the guest release's KDK's Extensions directory>
@@ -36,7 +39,26 @@ KDK        ?=
 TRACE   ?= 0
 DTRACE  ?= 0
 
-ARCH = -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=11.0
+# The guest's architecture: x86_64 (macOS 11 and later) or arm64e (the arm64 guests Ambrosia
+# boots, macOS 13 and later). Each builds in a BUILD of its own.
+ARCH_NAME ?= x86_64
+ifeq ($(ARCH_NAME),arm64e)
+MIN_OS = 13.0
+else
+MIN_OS = 11.0
+endif
+ARCH = -arch $(ARCH_NAME) -isysroot $(SDK) -mmacosx-version-min=$(MIN_OS)
+# Graft's consumer rules, and the declaration and Info.plist they stage this kext from: one of
+# each per architecture. An arm64 kernel collection has neither AppleGraphicsDeviceControl nor
+# IOAcceleratorFamily2, so the arm64e kext (src/graft-arm64e.json, src/Info-arm64e.plist) takes
+# both of its parents from IOGraphicsFamily and has no device control.
+GRAFT_SDK ?= ../graft/sdk
+ifeq ($(ARCH_NAME),arm64e)
+GRAFT_DECL = src/graft-arm64e.json
+INFO_PLIST = src/Info-arm64e.plist
+else
+INFO_PLIST = src/Info.plist
+endif
 
 FLAGS = $(ARCH) -mkernel -nostdinc -isystem $(KERNEL) -I../../crates/reims-vgpu-graphics/include \
 	-DKERNEL -DBUNDLE_VERSION='"$(VERSION)"' -DRGFX_FB_TRACE=$(TRACE) \
@@ -49,11 +71,14 @@ CFLAGS   = $(FLAGS) -std=c11
 HEADERS = $(wildcard src/*.hpp)
 
 # The Stage-2 framebuffer (ReimsGraphics), the Stage-3 Metal accelerator
-# (RgfxAccelerator) and its region-map + doorbell user client, and the device
-# control (RgfxDeviceControl), all one kext.
+# (RgfxAccelerator) and its region-map + doorbell user client, and on x86-64 the device
+# control (RgfxDeviceControl), all one kext: the objects both architectures build, with
+# each architecture's own (OBJECTS_x86_64, OBJECTS_arm64e) third in the link.
+OBJECTS_x86_64 = $(BUILD)/obj/RgfxDeviceControl.o
+OBJECTS_arm64e =
 OBJECTS = $(BUILD)/obj/ReimsGraphics.o \
 	$(BUILD)/obj/RgfxAccelerator.o \
-	$(BUILD)/obj/RgfxDeviceControl.o \
+	$(OBJECTS_$(ARCH_NAME)) \
 	$(BUILD)/obj/RgfxAcceleratorUserClient.o \
 	$(BUILD)/obj/RgfxDisplayPipeUserClient.o \
 	$(BUILD)/obj/kmod_info.o \
@@ -83,7 +108,17 @@ $(BUILD)/obj/layout.o: src/ReimsGraphics.cpp src/ReimsGraphics.hpp ../../crates/
 	xcrun clang++ $(CXXFLAGS) -g -fstandalone-debug -c $< -o $@
 
 # Graft owns the two-pass link and dormant staging of this consumer.
-include ../graft/sdk/consumer.mk
+include $(GRAFT_SDK)/consumer.mk
+
+# Graft's rules read src/Info.plist; the arm64e kext's Info.plist is its own. Until Graft's
+# consumer.mk takes the Info.plist's path, this recipe replaces Graft's for arm64e, and make
+# says it overrides it.
+ifneq ($(INFO_PLIST),src/Info.plist)
+$(GRAFT_INFO): $(INFO_PLIST)
+	@mkdir -p $(@D)
+	sed 's/@VERSION@/$(VERSION)/g' $(INFO_PLIST) > $@
+	plutil -lint $@ > /dev/null
+endif
 
 check: $(BINARY) $(BUILD)/obj/layout.o
 	bash tools/check-imports.sh "$(KDK)" $(KEXT)

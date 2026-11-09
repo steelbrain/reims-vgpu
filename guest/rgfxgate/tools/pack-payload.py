@@ -13,9 +13,11 @@ import os, sys, subprocess
 def die(m):
     sys.stderr.write("pack-payload: " + m + "\n"); sys.exit(2)
 
-if len(sys.argv) != 3:
-    die("usage: pack-payload.py BUNDLE_DIR OUT_HEADER")
+if len(sys.argv) not in (3, 4):
+    die("usage: pack-payload.py BUNDLE_DIR OUT_HEADER [ARCH]")
 bundle, out = sys.argv[1], sys.argv[2]
+# The slice the guest's kernel gates on: x86_64 for an x86-64 guest, arm64e for an arm64 one.
+arch = sys.argv[3] if len(sys.argv) == 4 else "x86_64"
 if not os.path.isdir(bundle):
     die("no bundle dir " + bundle)
 name = os.path.basename(bundle.rstrip("/"))
@@ -28,12 +30,11 @@ stem = name[:-len(".bundle")]
 exec_rel = "Contents/MacOS/" + stem
 
 # cdhash of the executable, from codesign (truncated to CS_CDHASH_LEN = 20 bytes).
-# Pin the x86_64 slice: the guest runs x86_64, and the kernel's csfg_get_cdhash
-# gates on that slice's cdhash. A fat bundle packed on an arm64 Mac would
-# otherwise embed the arm64 slice's hash, and the gate would reject the guest's
-# x86_64 slice -- a silent "bundle won't load". codesign's default --arch is the
-# host's; --arch x86_64 reads the slice the guest actually loads.
-cd = subprocess.run(["codesign", "--arch", "x86_64", "-dvvv", bundle],
+# Pin the guest's slice (arch: x86_64 for an x86-64 guest, arm64e for an arm64 one): the
+# kernel's csfg_get_cdhash gates on that slice's cdhash. A fat bundle read without --arch
+# would embed the host's slice's hash, and the gate would reject the guest's slice -- a
+# silent "bundle won't load". codesign's default --arch is the host's.
+cd = subprocess.run(["codesign", "--arch", arch, "-dvvv", bundle],
                     capture_output=True, text=True)
 cdhash = None
 for line in (cd.stdout + cd.stderr).splitlines():

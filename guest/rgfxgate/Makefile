@@ -30,8 +30,18 @@ PAYLOAD = $(GEN)/RgfxGatePayload.h
 BUNDLE_DIR ?=
 BUNDLE_STAMP = $(GEN)/bundle-dir
 
-FLAGS = -arch x86_64 -mmacosx-version-min=11.0 -isysroot $(SDK) -mkernel -nostdlib -fno-builtin -fno-stack-protector \
-	-mno-red-zone -Os -Wall -Wextra -Werror -Wno-unused-parameter
+# The guest's architecture: x86_64 (macOS 11 and later) or arm64e (macOS 13 and later). The red
+# zone is x86's alone.
+ARCH_NAME ?= x86_64
+ifeq ($(ARCH_NAME),arm64e)
+MIN_OS = 13.0
+REDZONE =
+else
+MIN_OS = 11.0
+REDZONE = -mno-red-zone
+endif
+FLAGS = -arch $(ARCH_NAME) -mmacosx-version-min=$(MIN_OS) -isysroot $(SDK) -mkernel -nostdlib -fno-builtin -fno-stack-protector \
+	$(REDZONE) -Os -Wall -Wextra -Werror -Wno-unused-parameter
 CXXFLAGS = $(FLAGS) -MMD -MP -std=c++17 -fapple-kext -fno-rtti -fno-exceptions \
 	-DKERNEL -DKERNEL_PRIVATE -nostdinc -isystem $(KHEADERS) \
 	-DGRAFT_CLIENT_ID=com.steelbrain.RgfxGate -DGRAFT_CLIENT_VERSION=\"$(VERSION)\" \
@@ -61,7 +71,7 @@ endif
 $(PAYLOAD):
 	@test -n "$(BUNDLE_DIR)" || { echo "set BUNDLE_DIR=<signed reims-graphics.bundle dir>" >&2; exit 2; }
 	@mkdir -p $(GEN)
-	python3 -I tools/pack-payload.py "$(BUNDLE_DIR)" $(PAYLOAD)
+	python3 -I tools/pack-payload.py "$(BUNDLE_DIR)" $(PAYLOAD) $(ARCH_NAME)
 	@echo '$(BUNDLE_KEY)' > $(BUNDLE_STAMP)
 
 $(BUILD)/obj/RgfxGate.o: src/RgfxGate.cpp src/RgfxGate.hpp $(PAYLOAD)
@@ -86,7 +96,7 @@ $(BUILD)/obj/GraftStart.o: $(GRAFT)/sdk/Start.cpp
 
 $(BIN): $(OBJS)
 	@mkdir -p $(KEXT)/Contents/MacOS
-	xcrun --sdk macosx ld -arch x86_64 -kext -undefined dynamic_lookup $(OBJS) -o $(BIN)
+	xcrun --sdk macosx ld -arch $(ARCH_NAME) -kext -undefined dynamic_lookup $(OBJS) -o $(BIN)
 
 $(KEXT): $(PLIST)
 

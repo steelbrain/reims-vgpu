@@ -1,0 +1,32 @@
+{
+  "libraries": [
+    {
+      "id": "com.apple.iokit.IOGraphicsFamily"
+    }
+  ],
+  "classes": [
+    {
+      "name": "IOFramebuffer",
+      "header": "IOKit/graphics/IOFramebuffer.h",
+      "library": 0
+    },
+    {
+      "name": "IOAccelerator",
+      "header": "IOKit/graphics/IOAccelerator.h",
+      "library": 0
+    }
+  ],
+  "consumers": [
+    {
+      "name": "ReimsGraphics",
+      "header": "ReimsGraphics.hpp",
+      "parent": 0
+    },
+    {
+      "name": "RgfxAccelerator",
+      "header": "RgfxAccelerator.hpp",
+      "parent": 1
+    }
+  ],
+  "imports": {}
+}
