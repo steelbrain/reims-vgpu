@@ -3,10 +3,12 @@
  * drives (ReimsGraphics.hpp). The device, its rings, its display and its pipe clients are
  * ReimsGraphics.cpp's, as on x86-64; this file is what the class asks of a subclass.
  *
- * This first cut learns the class's calls: each override logs its calls (the first ones and then
- * one in kLogEvery). A layer's surface map presents the layer-0 surface on the device, and the
- * device's refreshes reach the class as its vblank note. The class's own pure methods answer what
- * a display with no frame info, no factory configuration and no CRC answers.
+ * Each override logs its calls (the first ones and then one in kLogEvery). The class queues the
+ * swaps a process submits, and swap_begin_gated takes them off its queue as Apple's paravirtual
+ * display does: the device presents a swap's layer-0 surface, and the swap completes once the host
+ * answers the present. The device's refreshes reach the class as its vblank note. The class's own
+ * pure methods answer what a display with no frame info, no factory configuration and no CRC
+ * answers.
  *
  * None of the class's methods a subclass overrides is forwarded to the class: what the class
  * implements there is for no display at all, on every arm64 release from 13 to 27.0.1 (read from
@@ -18,7 +20,10 @@
  * display, the class's subclass in a VM (AppleParavirtDisplay), overrides each of the seven: its
  * start_hardware starts its display and joins power management, its verify_swap answers true, and
  * its three maps map nothing. ReimsGraphics does the same: the device reads a surface by its
- * IOSurface ID, so no layer's surface is mapped.
+ * IOSurface ID, so no layer's surface is mapped. Its swap_begin_gated begins each swap the class
+ * queued, in the class's own fields at each release's offsets (RgfxLegacySwapLayout.hpp), and
+ * the class's own methods, which the paravirtual display calls, clean the queue, drop a swap and
+ * complete one.
  *
  * Of what the class implements for every subclass, ReimsGraphics overrides what reads the
  * class's provider as an AppleARMIODevice unchecked where a process reaches it: get_dot_pitch.
@@ -51,6 +56,30 @@ static constexpr RgfxIOMFBWord word(IOReturn r)
 extern "C" uint32_t rgfxIOSurfaceSurfaceID(const OSObject *surface)
     __asm__("__ZNK9IOSurface12getSurfaceIDEv");
 
+// IOMobileFramebufferLegacy's own methods for its swap queue, which the paravirtual display's
+// swap_begin_gated and clean_queue_gated call and ReimsGraphics overrides none of: called directly,
+// as the SDK stand-in's note_vbl_ISR is, under the names every release from 14 to 27.0.1 exports.
+// Each runs in the class's gate. dropAbortedSwaps_gated takes a bool from macOS 15 on and none
+// on 14; Graft binds this import to either (graft-arm64e.json), and 14's ignores the bool.
+extern "C" void rgfxLegacySwapComplete(IOMobileFramebufferLegacy *self)
+    __asm__("__ZN25IOMobileFramebufferLegacy19swap_complete_gatedEv");
+extern "C" void rgfxLegacyDropSwap(IOMobileFramebufferLegacy *self, void *swap, bool field_1)
+    __asm__("__ZN25IOMobileFramebufferLegacy14dropSwap_gatedEP18IOMFBSwapIORequestb");
+extern "C" void rgfxLegacyUpdateSwapInfoState(IOMobileFramebufferLegacy *self, void *swap,
+                                              uint32_t state)
+    __asm__("__ZN25IOMobileFramebufferLegacy28update_swap_info_state_gatedEP18IOMFBSwapIORequest24IOMFBSwapCompletionState");
+extern "C" uint32_t rgfxLegacyDropObsoleteSwaps(IOMobileFramebufferLegacy *self)
+    __asm__("__ZN25IOMobileFramebufferLegacy23dropObsoleteSwaps_gatedEv");
+extern "C" void rgfxLegacyDropNoOpSwaps(IOMobileFramebufferLegacy *self)
+    __asm__("__ZN25IOMobileFramebufferLegacy19dropNoOpSwaps_gatedEv");
+extern "C" void rgfxLegacyDropAbortedSwaps(IOMobileFramebufferLegacy *self, bool field_1)
+    __asm__("__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEb");
+extern "C" void rgfxLegacyDropDummySwaps(IOMobileFramebufferLegacy *self)
+    __asm__("__ZN25IOMobileFramebufferLegacy20dropDummySwaps_gatedEv");
+
+// The IOMFBSwapCompletionState the paravirtual display gives a swap as it begins it.
+constexpr uint32_t kSwapStateAtBegin = 2;
+
 namespace {
 
 // The methods whose calls are logged, each counted apart.
@@ -74,6 +103,9 @@ enum MobileCall : unsigned {
 	kGetDotPitch,
 	kVblank,
 	kPresented,
+	kSwapShown,
+	kSwapDropped,
+	kSwapCursor,
 	kMobileCalls,
 };
 
@@ -94,6 +126,16 @@ bool ReimsGraphics::startMobile()
 {
 	mobilePresentSeqno = 0;
 	mobileTransaction = 0;
+	mobileSwapShowing = nullptr;
+	// The release, by the size of the class this one derives from as the kernel has it.
+	const uint32_t legacySize = IOMobileFramebufferLegacy::gMetaClass.getClassSize();
+	mobileSwapLayout = rgfxLegacySwapLayoutOf(legacySize);
+	if (mobileSwapLayout)
+		IOLog("ReimsGraphics: the swap queue as macOS %s lays it out\n", mobileSwapLayout->release);
+	else
+		IOLog("ReimsGraphics: IOMobileFramebufferLegacy is 0x%x bytes, no release's size, so no "
+		      "swap is begun\n",
+		      legacySize);
 	mobilePipe = addPipe(this, mobileVblank, mobilePresented);
 	if (!mobilePipe) {
 		IOLog("ReimsGraphics: no pipe for the mobile framebuffer\n");
@@ -112,6 +154,13 @@ void ReimsGraphics::stopMobile()
 	if (mobilePipe)
 		removePipe(this);
 	mobilePipe = false;
+	// The answer's event source leaves the class's work loop; free lets it go, once no pipe hook
+	// can still signal it.
+	if (IOInterruptEventSource *answer = mobileSwapAnswer) {
+		answer->disable();
+		if (mobileSwapLoop)
+			mobileSwapLoop->removeEventSource(answer);
+	}
 }
 
 // MARK: - The display as a process finds it
@@ -337,6 +386,88 @@ void ReimsGraphics::mobilePresented(OSObject *client, UInt64 seqno, UInt32 statu
 		return;
 	if (logged(kPresented))
 		IOLog("ReimsGraphics: present %llu shown, status %u at %llu\n", seqno, status, time);
+	// The swap it shows completes in the class's gate (completeMobileSwap).
+	if (IOInterruptEventSource *answer = __atomic_load_n(&self->mobileSwapAnswer, __ATOMIC_ACQUIRE))
+		answer->interruptOccurred(nullptr, nullptr, 0);
+}
+
+// MARK: - The swaps
+
+void ReimsGraphics::beginMobileSwaps()
+{
+	if (!mobileSwapLayout)
+		return;
+	RgfxLegacySwapQueue queue(this, *mobileSwapLayout);
+	for (;;) {
+		// The queue cleaned as the paravirtual display's clean_queue_gated cleans it, once no swap
+		// is shown and one waits: none begins where the class keeps an obsolete swap's turn.
+		if (queue.current() || !queue.first())
+			return;
+		if (rgfxLegacyDropObsoleteSwaps(this) != 0)
+			return;
+		rgfxLegacyDropNoOpSwaps(this);
+		rgfxLegacyDropAbortedSwaps(this, false);
+		rgfxLegacyDropDummySwaps(this);
+		void *swap = queue.first();
+		if (!swap)
+			return;
+		if (!queue.firstLinked()) {
+			// Where the paravirtual display stops the kernel: the queue is left as it is.
+			IOLog("ReimsGraphics: swap %p is not linked as the queue's first; no swap is begun\n",
+			      swap);
+			return;
+		}
+		if (!queue.begins(swap)) {
+			// The class's dropSwap_gated takes the swap off the queue and completes it.
+			if (logged(kSwapDropped))
+				IOLog("ReimsGraphics: swap %p dropped at its state\n", swap);
+			rgfxLegacyDropSwap(this, swap, false);
+			continue;
+		}
+		queue.setCurrent(swap);
+		rgfxLegacyUpdateSwapInfoState(this, swap, kSwapStateAtBegin);
+		queue.removeFirst();
+		if (queue.surface(swap, 1) && logged(kSwapCursor))
+			IOLog("ReimsGraphics: swap %p has a layer-1 surface, which is not shown\n", swap);
+		// Layer 0's surface, by its IOSurface ID. The swap completes when the host answers its
+		// present (mobilePresented), or here where nothing is presented or no answer can reach
+		// the gate. The present's seqno is written before the host can answer it.
+		OSObject *surface = static_cast<OSObject *>(queue.surface(swap, 0));
+		const uint32_t id = surface ? rgfxIOSurfaceSurfaceID(surface) : 0;
+		IOReturn presented = kIOReturnNotReady;
+		if (id) {
+			const UInt32 transaction = ++mobileTransaction;
+			mobileSwapShowing = mobileSwapAnswer ? swap : nullptr;
+			presented = postPresent(id, transaction, 0, &mobilePresentSeqno);
+			if (presented != kIOReturnSuccess)
+				mobileSwapShowing = nullptr;
+		}
+		if (logged(kSwapShown))
+			IOLog("ReimsGraphics: swap %p begun: surface %u, present 0x%x seqno %llu\n", swap, id,
+			      presented, __atomic_load_n(&mobilePresentSeqno, __ATOMIC_RELAXED));
+		if (mobileSwapShowing)
+			return;
+		rgfxLegacySwapComplete(this);
+	}
+}
+
+void ReimsGraphics::completeMobileSwap()
+{
+	void *swap = mobileSwapShowing;
+	if (!swap || !mobileSwapLayout)
+		return;
+	mobileSwapShowing = nullptr;
+	// The class may have finished the swap itself meanwhile (an abort or a stop).
+	RgfxLegacySwapQueue queue(this, *mobileSwapLayout);
+	if (queue.current() != swap)
+		return;
+	rgfxLegacySwapComplete(this);
+	beginMobileSwaps();
+}
+
+void ReimsGraphics::mobileSwapAnswered(OSObject *owner, IOInterruptEventSource *, int)
+{
+	static_cast<ReimsGraphics *>(owner)->completeMobileSwap();
 }
 
 // MARK: - The class's own pure methods
@@ -437,6 +568,22 @@ RgfxIOMFBWord ReimsGraphics::start_hardware()
 	const IOReturn power = registerPowerDriver(this, mobilePowerStates,
 	                                           sizeof(mobilePowerStates) / sizeof(mobilePowerStates[0]));
 	mobilePowerJoined = true;
+	// The present's answer reaches the class's gate through an event source on its work loop.
+	if (!mobileSwapAnswer && mobileSwapLayout) {
+		IOWorkLoop *loop = getWorkLoop();
+		IOInterruptEventSource *answer =
+		    loop ? IOInterruptEventSource::interruptEventSource(this, mobileSwapAnswered) : nullptr;
+		if (answer && loop->addEventSource(answer) == kIOReturnSuccess) {
+			loop->retain();
+			mobileSwapLoop = loop;
+			answer->enable();
+			__atomic_store_n(&mobileSwapAnswer, answer, __ATOMIC_RELEASE);
+		} else {
+			IOLog("ReimsGraphics: no event source on the framebuffer's work loop; no swap is "
+			      "begun\n");
+			OSSafeReleaseNULL(answer);
+		}
+	}
 	if (mobilePipe)
 		setPipeVblankEnabled(this, true);
 	if (logged(kStartHardware))
@@ -460,6 +607,7 @@ RgfxIOMFBWord ReimsGraphics::swap_begin_gated()
 {
 	if (logged(kSwapBegin))
 		IOLog("ReimsGraphics: swap_begin_gated()\n");
+	beginMobileSwaps();
 	return 0;
 }
 
@@ -480,21 +628,12 @@ RgfxIOMFBWord ReimsGraphics::swap_layer_map(IOMFBSwapIORequest *request, uint32_
 RgfxIOMFBWord ReimsGraphics::surface_layer_map(IOMFB::AP::DisplayedData *data, uint32_t layer,
                                                IOSurface *surface)
 {
+	// Nothing to map: the swap's begin presents its surface by ID.
 	const RgfxIOMFBWord r = word(kIOReturnSuccess);
-	const uint32_t id =
-	    surface ? rgfxIOSurfaceSurfaceID(reinterpret_cast<const OSObject *>(surface)) : 0;
-	IOReturn presented = kIOReturnNotReady;
-	UInt64 seqno = 0;
-	if (layer == 0 && id) {
-		const UInt32 transaction = ++mobileTransaction;
-		presented = postPresent(id, transaction, 0, &seqno);
-		if (presented == kIOReturnSuccess)
-			__atomic_store_n(&mobilePresentSeqno, seqno, __ATOMIC_RELEASE);
-	}
 	if (logged(kSurfaceLayerMap))
-		IOLog("ReimsGraphics: surface_layer_map(%p, %u, %p: surface %u) = 0x%llx, present 0x%x "
-		      "seqno %llu\n",
-		      data, layer, surface, id, r, presented, seqno);
+		IOLog("ReimsGraphics: surface_layer_map(%p, %u, %p: surface %u) = 0x%llx\n", data, layer,
+		      surface, surface ? rgfxIOSurfaceSurfaceID(reinterpret_cast<const OSObject *>(surface)) : 0,
+		      r);
 	return r;
 }
 

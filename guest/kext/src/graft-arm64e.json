@@ -80,5 +80,13 @@
       }
     }
   ],
-  "imports": {}
+  "imports": {
+    "__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEb": {
+      "library": 1,
+      "candidates": [
+        "__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEb",
+        "__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEv"
+      ]
+    }
+  }
 }

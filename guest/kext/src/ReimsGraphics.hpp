@@ -36,6 +36,7 @@
 // The Graft SDK stand-in's methods answer graft_iomfb_word, a uint64_t; the arm64e front end
 // (ReimsGraphicsMobile.cpp) names it RgfxIOMFBWord.
 typedef graft_iomfb_word RgfxIOMFBWord;
+#include "RgfxLegacySwapLayout.hpp"
 #endif
 
 #include "RgfxBootConsole.hpp"
@@ -546,6 +547,12 @@ private:
 	void publishMobileDisplay();
 	static void mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	static void mobilePresented(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
+	// The swaps (ReimsGraphicsMobile.cpp, swap_begin_gated): the next one begun, and the swap
+	// whose surface the display is to show completed once the host answers its present, both in
+	// the class's gate.
+	void beginMobileSwaps();
+	void completeMobileSwap();
+	static void mobileSwapAnswered(OSObject *owner, IOInterruptEventSource *sender, int count);
 	bool mobilePipe;
 	// The display's node under /arm-io in the device tree (retained): the firmware's, or one start
 	// attached (mobileNodeAttached), which stop detaches.
@@ -553,8 +560,16 @@ private:
 	bool mobileNodeAttached;
 	// Whether start_hardware joined power management, which stop_hardware_gated leaves.
 	bool mobilePowerJoined;
+	// The latest present's seqno, written before the host can answer it.
 	UInt64 mobilePresentSeqno;
 	UInt32 mobileTransaction;
+	// The release's swap queue (RgfxLegacySwapLayout.hpp), null where the class's size is no
+	// release's; the swap whose present waits for its answer, null where none does; and the event
+	// source on the class's work loop (retained, with the work loop) that the answer signals.
+	const RgfxLegacySwapLayout *mobileSwapLayout;
+	void *mobileSwapShowing;
+	IOInterruptEventSource *mobileSwapAnswer;
+	IOWorkLoop *mobileSwapLoop;
 #endif
 
 	bool ready;

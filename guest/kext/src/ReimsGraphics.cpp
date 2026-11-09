@@ -1476,6 +1476,10 @@ void ReimsGraphics::free()
 	}
 	OSSafeReleaseNULL(queueTarget);
 	OSSafeReleaseNULL(releaseTarget);
+#if defined(__arm64e__)
+	OSSafeReleaseNULL(mobileSwapAnswer);
+	OSSafeReleaseNULL(mobileSwapLoop);
+#endif
 	super::free();
 }
 
