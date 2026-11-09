@@ -72,12 +72,25 @@ for i in "${!binaries[@]}"; do
 done
 grep -q -F '[OK] Prelink inject complete success' "$log" ||
 	{ echo "oc-link-set: the injection did not complete; see $log" >&2; status=1; }
-# Every imported name must resolve to a nonzero address.
-for id in "${ids[@]}"; do
-	if grep -E "was resolved for kext $id to 0\$|was unresolved for kext $id\$" "$log" >&2; then
+# Every imported name must resolve to a nonzero address, but a weak import, which the
+# linker binds to 0 where the kernel lacks it: the kext reads it only through a word of data,
+# and a reference to it from the code would have failed its injection above ("RIP-relative
+# overflow").
+for i in "${!binaries[@]}"; do
+	b=${binaries[$i]} id=${ids[$i]}
+	weak=$(nm -arch x86_64 -m "$b" | sed -n 's/^ *(undefined) weak external \([^ ]*\).*/\1/p')
+	unresolved=$(grep -E "was resolved for kext $id to 0\$|was unresolved for kext $id\$" "$log" |
+		sed -n 's/^OCAK: Symbol \([^ ]*\) was .*/\1/p' | grep -vxF -f <(printf '%s\n' $weak) || true)
+	if [ -n "$unresolved" ]; then
+		echo "$unresolved" >&2
 		echo "oc-link-set: the names above did not resolve for $id; see $log" >&2
 		status=1
 	fi
+	for w in $weak; do
+		if grep -q -E "Symbol $w was resolved for kext $id to 0\$" "$log"; then
+			echo "oc-link-set: $(basename "$b")'s weak import $w is absent from this kernel"
+		fi
+	done
 done
 
 if [ "${#consumers[@]}" = 0 ]; then

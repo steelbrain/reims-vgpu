@@ -587,6 +587,16 @@ extern "C" IOReturn rgfxMemoryPageCounts(IOMemoryDescriptor *memory, IOByteCount
                                          IOByteCount *dirty, IOByteCount *swapped)
     __asm("__ZN18IOMemoryDescriptor13getPageCountsEPyS0_S0_") __attribute__((weak_import));
 
+// The function is reached only through this word of data, its address bound there whole, never
+// from the code: an address relative to an instruction cannot reach 0, and OpenCore's linker
+// refuses the whole kext where it binds such a reference to 0 ("RIP-relative overflow ...
+// target=0x0", then the kext not injected, measured with its TestKextInject on the Boot KCs of
+// 11.7.11, 13.7.8 and 15.8.2). Volatile, so the compiler reads the word rather than call the
+// function directly.
+using RgfxMemoryPageCountsFn = IOReturn (*)(IOMemoryDescriptor *, IOByteCount *, IOByteCount *,
+                                            IOByteCount *);
+static RgfxMemoryPageCountsFn volatile memoryPageCounts = &rgfxMemoryPageCounts;
+
 // Whether the weak function at `symbol` was bound to a definition. A pointer to it is signed
 // where calls are authenticated (arm64e), so it is stripped before it is compared with the
 // pointer gOSKextUnresolved holds.
@@ -602,7 +612,8 @@ RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
 {
 	RgfxSurfacePageCounts counts = {false, ~0ull, ~0ull};
 	static bool countsNoted = false, memoryNoted = false;
-	if (!weakFunctionResolved(reinterpret_cast<const void *>(&rgfxMemoryPageCounts))) {
+	const RgfxMemoryPageCountsFn pageCounts = memoryPageCounts;
+	if (!weakFunctionResolved(reinterpret_cast<const void *>(pageCounts))) {
 		if (!__atomic_exchange_n(&countsNoted, true, __ATOMIC_RELAXED))
 			IOLog("RgfxAccelerator: this kernel counts no compressed or paged-out pages of a "
 			      "memory descriptor: no IOSurface's block is deferred\n");
@@ -624,7 +635,7 @@ RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
 		return counts;
 	}
 	IOByteCount resident = 0, dirty = 0, swapped = 0;
-	if (rgfxMemoryPageCounts(memory, &resident, &dirty, &swapped) != kIOReturnSuccess)
+	if (pageCounts(memory, &resident, &dirty, &swapped) != kIOReturnSuccess)
 		return counts;
 	counts = {true, resident, swapped};
 	return counts;
