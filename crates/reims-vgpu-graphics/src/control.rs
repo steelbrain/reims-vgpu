@@ -124,14 +124,17 @@ fn lifecycle(shared: &Shared, message: &Message, epoch: u64) -> Option<Vec<u8>> 
         RGFX_CMD_SURFACE_PAGES => {
             let flags = read_at::<RgfxSurfacePagesCache>(message, RGFX_SURFACE_PAGES_CACHE_OFFSET)
                 .map_or(0, |c| c.flags);
-            // A block that asks whether it needs a device cache carries its surface's layout.
-            let layout = (flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0).then(|| {
-                read_at::<RgfxSurfacePagesLayout>(message, RGFX_SURFACE_PAGES_LAYOUT_OFFSET)
-            });
-            let status = match (read::<RgfxSurfacePages>(message), layout) {
-                (None, _) | (_, Some(None)) => Some(RGFX_STATUS_INVALID_ARGUMENT),
-                (Some(pages), layout) => {
-                    shared.surface_pages(&pages, flags, layout.flatten(), seqno, epoch)
+            // A block that asks whether it needs a device cache carries its surface's layout; a
+            // cached one may, a message long enough for it.
+            let layout =
+                read_at::<RgfxSurfacePagesLayout>(message, RGFX_SURFACE_PAGES_LAYOUT_OFFSET);
+            let ask = flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0;
+            let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
+            let status = match (read::<RgfxSurfacePages>(message), ask, layout) {
+                (None, _, _) | (_, true, None) => Some(RGFX_STATUS_INVALID_ARGUMENT),
+                (Some(pages), ask, layout) => {
+                    let layout = layout.filter(|_| ask || cached);
+                    shared.surface_pages(&pages, flags, layout, seqno, epoch)
                 }
             };
             status.map(|status| complete(seqno, status))

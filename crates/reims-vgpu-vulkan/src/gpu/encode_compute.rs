@@ -1056,7 +1056,7 @@ mod tests {
         /// `MTLResourceStorageModePrivate`.
         const PRIVATE: u64 = 2 << 4;
         let d = dev();
-        let made = d.new_exportable_buffer_of_length(OnFault::Return, LENGTH, PRIVATE);
+        let made = d.new_exportable_buffer_of_length(OnFault::Return, LENGTH, PRIVATE, None);
         let cache = made.expect("no raise").expect("an exportable buffer");
         let exported = cache.export_memory().expect("its memory");
         // The export's memory type, which the import names: the runtime's own answer.

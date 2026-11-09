@@ -113,17 +113,42 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// ([`Buffer::export_memory`](super::resource::Buffer::export_memory)): the host's video
     /// writes its pictures into the IOSurface device caches so, on its own GPU work. `Ok(None)`
     /// where the platform makes none (the default, and a device that exports no buffer's memory),
-    /// and the caller makes the buffer as any other. Reached both under a handler and with none:
-    /// `on` says which this call is.
+    /// and the caller makes the buffer as any other. Where `aligned_byte` is given, that byte of
+    /// the buffer lies on a multiple of 256 bytes of its memory, as
+    /// [`new_buffer_of_length_aligned`](GpuDevice::new_buffer_of_length_aligned)'s does, its
+    /// export's offset ([`ExportedMemory::offset`](super::resource::ExportedMemory::offset)) the
+    /// buffer's first byte as for any. Reached both under a handler and with none: `on` says
+    /// which this call is.
     #[cfg(unix)]
     fn new_exportable_buffer_of_length(
         &self,
         on: OnFault,
         length: u64,
         options: u64,
+        aligned_byte: Option<u64>,
     ) -> RaiseResult<Option<P::Buffer>> {
-        let _ = (on, length, options);
+        let _ = (on, length, options, aligned_byte);
         Ok(None)
+    }
+    /// No Metal counterpart: a buffer as [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s,
+    /// whose byte `aligned_byte` lies on a multiple of 256 bytes of its memory, so that a texture
+    /// whose texels start there, or a multiple of 256 bytes past it, lies in its memory as one
+    /// over its first byte does: for a device cache whose surface's first plane starts off such a
+    /// multiple, as CoreVideo's start 32 bytes into their surface (`decode::surface_cache`). It
+    /// declares nothing else, so a texture whose rows lie with bytes between them is the
+    /// platform's as over any buffer. Its length and the answers of its own are
+    /// `new_buffer_of_length`'s. The default, for a platform that places no byte so, makes the
+    /// buffer as `new_buffer_of_length` does. Reached both under a handler and with none: `on`
+    /// says which this call is.
+    fn new_buffer_of_length_aligned(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: u64,
+    ) -> RaiseResult<Option<P::Buffer>> {
+        let _ = aligned_byte;
+        self.new_buffer_of_length(on, length, options)
     }
     /// No Metal counterpart: a buffer as [`new_buffer_of_length`](GpuDevice::new_buffer_of_length)'s,
     /// that declares the bytes between the rows (and slices) of a texture over it unobserved: a

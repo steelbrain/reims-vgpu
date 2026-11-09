@@ -291,7 +291,7 @@ fn imports_caches(
     };
     let start = runtime.now();
     let made =
-        device.new_exportable_buffer_of_length(OnFault::Return, PROBE_BYTES, STORAGE_PRIVATE);
+        device.new_exportable_buffer_of_length(OnFault::Return, PROBE_BYTES, STORAGE_PRIVATE, None);
     let make = runtime.elapsed_since(start);
     let buffer = match made {
         Ok(Some(buffer)) => buffer,

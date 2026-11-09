@@ -45,6 +45,10 @@ pub const PADDING_UNOBSERVED_BUFFER: &str = "newBufferWithLength:options: (paddi
 /// under: no selector of Metal's names it.
 pub const DMA_BUF_BUFFER: &str = "newBufferWithLength:options: (dma-buf, padding unobserved)";
 
+/// The name the fake logs and scripts [`GpuDevice::new_buffer_of_length_aligned`] under: no
+/// selector of Metal's names it.
+pub const ALIGNED_BUFFER: &str = "newBufferWithLength:options: (aligned byte)";
+
 /// A device's model: its capabilities.
 #[derive(Debug)]
 pub struct DeviceModel {
@@ -221,6 +225,24 @@ impl GpuDevice<FakePlatform> for Fk<kind::Device> {
                 Arg::U64(options),
                 Arg::U64(aligned_byte.unwrap_or(0)),
             ],
+            |w| new_buffer(w, length, options, Backing::Fresh, None),
+        )
+    }
+
+    /// Logged and scripted under [`ALIGNED_BUFFER`], as no selector of Metal's names it, with the
+    /// aligned byte after the length and options; its buffer is `newBufferWithLength:options:`'s,
+    /// its memory starting where the fake's starts.
+    fn new_buffer_of_length_aligned(
+        &self,
+        on: OnFault,
+        length: u64,
+        options: u64,
+        aligned_byte: u64,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Buffer>> {
+        self.make(
+            Policy::On(on),
+            ALIGNED_BUFFER,
+            vec![Arg::U64(length), Arg::U64(options), Arg::U64(aligned_byte)],
             |w| new_buffer(w, length, options, Backing::Fresh, None),
         )
     }

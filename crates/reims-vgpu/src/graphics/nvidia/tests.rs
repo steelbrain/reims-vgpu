@@ -59,9 +59,11 @@ fn copy(
 
 /// Each picture of NVENC's H.264 and HEVC at 1080p lands in an exportable buffer of the runtime
 /// device's, imported once, by NVDEC's copy within the GPU, its rows alone at a pitch of their
-/// own, and said written by another API (`Buffer::external_write_done`), as a landing says it: a
-/// copy of the buffer on the runtime's queue reads NVDEC's read back of the picture in each row,
-/// and the bytes past each row as the runtime's fill left them.
+/// own, its planes 32 bytes in as CoreVideo lays them, the byte the buffer places for textures
+/// in place (`aligned_byte`), and said written by another API (`Buffer::external_write_done`), as
+/// a landing says it: a copy of the buffer on the runtime's queue reads NVDEC's read back of the
+/// picture in each row, and the bytes before the planes and past each row as the runtime's fill
+/// left them.
 #[test]
 #[ignore = "needs an NVIDIA GPU: run on the NVIDIA host"]
 fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
@@ -73,11 +75,13 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
         let imports = (video.imports.as_ref()).expect("CUDA's imports of exportable buffers");
         let (width, height, pitch) = (1920u32, 1080u32, 2048usize);
         let rows = usize::try_from(height).expect("rows");
-        let chroma_at = pitch * rows;
+        let luma_at = 0x20;
+        let chroma_at = luma_at + pitch * rows;
         let len = u64::try_from(chroma_at + pitch * rows / 2).expect("a length");
-        let cache = (device.new_exportable_buffer_of_length(OnFault::Return, len, STORAGE_PRIVATE))
-            .expect("no raise")
-            .expect("an exportable buffer");
+        let aligned = Some(u64::try_from(luma_at).expect("a byte"));
+        let made =
+            device.new_exportable_buffer_of_length(OnFault::Return, len, STORAGE_PRIVATE, aligned);
+        let cache = made.expect("no raise").expect("an exportable buffer");
         let life = MemoryLife::new();
         let imported = (imports.get_or_make(
             &life.identity(),
@@ -155,7 +159,7 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
                     let written = unsafe {
                         picture.write_into_device(
                             (width, height),
-                            plane(0, height),
+                            plane(luma_at, height),
                             plane(chroma_at, height / 2),
                             Box::new(()),
                         )
@@ -169,7 +173,11 @@ fn a_picture_lands_in_an_imported_device_cache_as_it_reads_back() {
                     let bytes = unsafe {
                         std::slice::from_raw_parts(read_back.contents().as_ptr::<u8>(), length)
                     };
-                    for (read, at) in read.planes().iter().zip([0, chroma_at]) {
+                    assert!(
+                        bytes[..luma_at].iter().all(|&b| b == UNTOUCHED),
+                        "{codec:?} picture {n}: the bytes before the planes"
+                    );
+                    for (read, at) in read.planes().iter().zip([luma_at, chroma_at]) {
                         assert_eq!(read.bytes_per_row, 1920);
                         for row in 0..usize::try_from(read.rows).expect("rows") {
                             let landed = &bytes[at + row * pitch..][..pitch];

@@ -411,7 +411,8 @@ pub trait Host: Send + Sync + 'static {
     /// [`RGFX_STATUS_REFUSED`], with no view. `flags` are the message's `RGFX_SURFACE_PAGES_*`
     /// ([`RgfxSurfacePagesCache::flags`], 0 for a message without them):
     /// [`RGFX_SURFACE_PAGES_CACHED`], where a host that carries out
-    /// [`RGFX_FEATURE_SURFACE_CACHE`] gives the block a device cache, which its buffers are, and
+    /// [`RGFX_FEATURE_SURFACE_CACHE`] gives the block a device cache, which its buffers are,
+    /// placed by the surface's `layout` where the message carries one, and
     /// with it [`RGFX_SURFACE_PAGES_DEFERRED`], no runs and a cache of zeros alone, or
     /// [`RGFX_SURFACE_PAGES_ATTACH`], the runs of such a block's pages
     /// ([`RGFX_FEATURE_SURFACE_DEFERRED`]); [`RGFX_SURFACE_PAGES_PRIVATE`], where the block is a process's pages block, whose view a

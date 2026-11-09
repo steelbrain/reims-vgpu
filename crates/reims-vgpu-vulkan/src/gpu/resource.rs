@@ -2770,6 +2770,73 @@ pub(crate) mod tests {
         assert_eq!((site.kind, site.file), (DeathKind::NullDeref, "s"));
     }
 
+    /// A device cache made as the host's video makes those it lands its pictures in (an
+    /// exportable `Private` buffer, NVDEC's) of a 4K NV12 frame as CoreVideo lays it, its luma
+    /// plane 32 bytes in and its chroma plane after its rows, with that first plane's byte placed
+    /// for textures in place (`aligned_byte`), takes the textures over both planes in its memory:
+    /// once the device's checks of its exported memory are known, the runtime's answer for each
+    /// (`Buffer::texture_placement_with_iosurface_plane`, the making's own decision) is a linear
+    /// image of the cache's memory, not a shadow, which copies the plane in before each command
+    /// buffer's use of it. Made without the byte, as every exportable cache was, the planes lie 32
+    /// bytes past the runtime's boundary, off every linear image's alignment measured (128 on an
+    /// RTX 5080 Laptop GPU, 256 on RADV, 64 on lavapipe), and their textures were shadows: that
+    /// answer is printed, not checked. Linux's: MoltenVK exports no buffer's memory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_device_cache_lays_its_planes_in_its_memory_from_its_first_planes_byte() {
+        const WIDTH: u64 = 3840;
+        const HEIGHT: u64 = 2160;
+        const LUMA_AT: u64 = 0x20;
+        const CHROMA_AT: u64 = LUMA_AT + WIDTH * HEIGHT;
+        const LENGTH: u64 = CHROMA_AT + WIDTH * HEIGHT / 2;
+        /// `MTLResourceStorageModePrivate`.
+        const PRIVATE: u64 = 2 << 4;
+        let d = dev();
+        let sel = "newTextureWithDescriptor:iosurface:plane:";
+        // R8Unorm over plane 0 and RG8Unorm over plane 1, sampled, as a frame's decode names them.
+        let planes = [
+            (10, WIDTH, HEIGHT, LUMA_AT),
+            (30, WIDTH / 2, HEIGHT / 2, CHROMA_AT),
+        ];
+        let placements = |aligned: Option<u64>| {
+            let made = d.new_exportable_buffer_of_length(OnFault::Return, LENGTH, PRIVATE, aligned);
+            let cache = made.expect("no raise").expect("an exportable buffer");
+            let placement = |&(pixel_format, width, height, at): &(u64, u64, u64, u64)| {
+                let desc = platform().texture_descriptor(&TextureDesc {
+                    pixel_format,
+                    width,
+                    height,
+                    usage: 1,
+                    resource_options: Some(PRIVATE),
+                    ..TextureDesc::default()
+                });
+                let made =
+                    crate::gpu::device::surface_plane_descriptor(&d.raw, sel, &desc.fields());
+                let desc = made.expect("no raise").expect("a plane's descriptor");
+                let plane = rt::IoSurfacePlane::new(at, WIDTH, true);
+                let answer = cache
+                    .raw
+                    .texture_placement_with_iosurface_plane(&desc, plane);
+                answer.expect("an answer")
+            };
+            // The first answers start the device's checks of its exported memory.
+            let _ = planes.map(|p| placement(&p));
+            let checks = std::time::Duration::from_secs(60);
+            assert!(
+                d.raw.settle_in_place_checks(checks),
+                "the device's checks answered"
+            );
+            planes.map(|p| placement(&p))
+        };
+        let unplaced = placements(None);
+        eprintln!("the planes' textures over a cache made with no aligned byte: {unplaced:?}");
+        assert_eq!(
+            placements(Some(LUMA_AT)),
+            [rt::TexturePlacement::NotHostPages; 2],
+            "both planes' textures in the cache's memory"
+        );
+    }
+
     /// The bytes a runtime call reads in place are the range itself, at its pointer and of its
     /// length; an empty range is no bytes, even at NULL; a non-empty range in the zero region, or
     /// wrapping past the top of the address space, dies at the selector as a NULL access, as a

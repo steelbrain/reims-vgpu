@@ -75,6 +75,13 @@
 //!   with bytes between them may hold and change them, and lies over the cache's memory where
 //!   the platform would otherwise make it a copy of its own (on the Vulkan platform, metal2vulkan's
 //!   shadow, which each command buffer copies in before its use and back after its write).
+//!   Where the kext gives the surface's layout (its ask, or on a GPU of its own memory the cached
+//!   or deferred block's own `SURFACE_PAGES`), the platform places the surface's first plane's
+//!   first byte on a multiple of 256 bytes of the cache's memory ([`aligned_byte`],
+//!   [`CacheLayout`]), whichever way the cache is made, its exportable one among them: CoreVideo
+//!   lays a frame's planes 32 bytes into their surface, off every linear image's alignment
+//!   measured, and the textures over a decoder's planes are then images of the cache's memory,
+//!   not the runtime's shadows. Only the ask's layout makes the copies take texels alone.
 //!   A download or a release copies nothing where, as its copy is made (at once, or in the
 //!   finish of a buffer begun before it), the CPU's generation in the block's header
 //!   ([`CPU_GEN_OFFSET`]) has moved past the cache's: the lock that asked gave up waiting for the
@@ -2899,10 +2906,12 @@ impl CacheMaker {
     /// between them may hold and change in place, with its byte `aligned` on a multiple of 256
     /// bytes of its memory where given ([`aligned_byte`]), so that textures over its surface's
     /// planes lie in it rather than in copies of their own
-    /// ([`GpuDevice::new_buffer_of_length_padding_unobserved`]); else as any other buffer. An
-    /// exportable cache is made as the platform makes one, its first byte where the platform puts
-    /// it. With the buffer, the cache's life where its memory was made for the host's video,
-    /// exportable or a dma-buf ([`SurfaceCache::life`]).
+    /// ([`GpuDevice::new_buffer_of_length_padding_unobserved`]); else as any other buffer, its
+    /// byte `aligned` placed alike where given and nothing else declared
+    /// ([`GpuDevice::new_buffer_of_length_aligned`]). An exportable cache places its byte
+    /// `aligned` alike where given ([`GpuDevice::new_exportable_buffer_of_length`]). With the
+    /// buffer, the cache's life where its memory was made for the host's video, exportable or a
+    /// dma-buf ([`SurfaceCache::life`]).
     fn make<P: Platform>(
         self,
         device: &P::Device,
@@ -2915,9 +2924,11 @@ impl CacheMaker {
         let life = || Some(MemoryLife::new());
         #[cfg(unix)]
         if self.exportable {
-            let made = device.new_exportable_buffer_of_length(ON, length, STORAGE_PRIVATE)?;
+            let made =
+                device.new_exportable_buffer_of_length(ON, length, STORAGE_PRIVATE, aligned)?;
             if let Some(cache) = made {
                 counts.exportable = true;
+                counts.aligned = aligned.is_some();
                 return Ok(NewCache::new(Some((cache, life())), counts));
             }
             counts.unexportable = true;
@@ -2948,7 +2959,15 @@ impl CacheMaker {
                 counts.aligned = aligned.is_some() && made.is_some();
                 made
             }
-            false => device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)?,
+            false => match aligned {
+                Some(byte) => {
+                    let made =
+                        device.new_buffer_of_length_aligned(ON, length, STORAGE_PRIVATE, byte)?;
+                    counts.aligned = made.is_some();
+                    made
+                }
+                None => device.new_buffer_of_length(ON, length, STORAGE_PRIVATE)?,
+            },
         };
         Ok(NewCache::new(made.map(|cache| (cache, None)), counts))
     }
@@ -3754,7 +3773,7 @@ impl<P: Platform> Caches<P> {
         view: &Arc<SurfaceView<P>>,
         host_pages: Vec<Range<u64>>,
         generation: u64,
-        layout: Option<Vec<PagesPlane>>,
+        layout: CacheLayout,
     ) -> RaiseResult<bool> {
         let length = view.length();
         let pages =
@@ -3762,8 +3781,8 @@ impl<P: Platform> Caches<P> {
         self.make_with(device, block, length, host_pages, generation, layout, pages)
     }
 
-    /// [`Self::make`] of a cache of `length` bytes whose copies' other end `pages` makes, its
-    /// surface laid out as `layout` where the kext's ask gave it: a block that keeps its cache
+    /// [`Self::make`] of a cache of `length` bytes whose copies' other end `pages` makes, placed
+    /// and laid out as `layout` says ([`CacheLayout`]): a block that keeps its cache
     /// has it filled again under the lock ([`SurfaceCaches::keeps`]); for any other the cache's
     /// buffer, and then `pages`, are made with the lock let go of and taken under it, and what was
     /// not taken is let go of once the lock is let go of again.
@@ -3775,7 +3794,7 @@ impl<P: Platform> Caches<P> {
         length: u64,
         host_pages: Vec<Range<u64>>,
         generation: u64,
-        layout: Option<Vec<PagesPlane>>,
+        layout: CacheLayout,
         pages: impl FnOnce() -> RaiseResult<Option<CachePages<P>>>,
     ) -> RaiseResult<bool> {
         let mut state = self.state.lock();
@@ -3785,7 +3804,8 @@ impl<P: Platform> Caches<P> {
         }
         let maker = state.maker();
         drop(state);
-        let aligned = layout.as_deref().and_then(aligned_byte);
+        let aligned = layout.aligned_byte();
+        let layout = layout.into_planes();
         let made =
             (maker.make::<P>(device, length, layout.as_deref(), aligned)).and_then(|cache| {
                 let pages = match cache.made.is_some() {
@@ -3819,7 +3839,7 @@ impl<P: Platform> Caches<P> {
         block: u64,
         length: u64,
         block_size: u64,
-        layout: Option<Vec<PagesPlane>>,
+        layout: CacheLayout,
         carried: Option<CarriedPages>,
         host_pages: Vec<Range<u64>>,
     ) -> RaiseResult<bool> {
@@ -3827,7 +3847,8 @@ impl<P: Platform> Caches<P> {
             let state = self.state.lock();
             (state.deferred_room(block), state.maker())
         };
-        let aligned = layout.as_deref().and_then(aligned_byte);
+        let aligned = layout.aligned_byte();
+        let layout = layout.into_planes();
         let mut made =
             (length <= room).then(|| maker.make::<P>(device, length, layout.as_deref(), aligned));
         let mut state = self.state.lock();
@@ -3864,7 +3885,7 @@ impl<P: Platform> Caches<P> {
         unmade: Arc<Unmade<P>>,
         host_pages: Vec<Range<u64>>,
         generation: u64,
-        layout: Option<Vec<PagesPlane>>,
+        layout: CacheLayout,
     ) -> RaiseResult<bool> {
         let length = unmade.length();
         let pages = || Ok(Some(CachePages::Runs { runs, unmade }));
@@ -4020,6 +4041,43 @@ fn signal_after<P: Platform>(
 enum Way {
     In,
     Out,
+}
+
+/// What a new cache knows of its surface's layout ([`Caches::make`], [`Caches::make_deferred`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CacheLayout {
+    /// Nothing: the cache's first byte where the platform puts it, and its copies into the pages
+    /// the surface's bytes whole, as of a block named cached with no layout.
+    #[default]
+    Unknown,
+    /// The surface's first plane's first byte ([`aligned_byte`]), from the layout a cached or
+    /// deferred block's own `SURFACE_PAGES` carries on a device that asks nothing (its GPU keeps
+    /// its own memory): the cache places that byte on a multiple of 256 bytes of its memory, and
+    /// its copies into the pages still move the surface's bytes whole.
+    FirstPlaneAt(u64),
+    /// The planes the kext's ask gave (on a GPU that shares the CPU's memory): the cache places
+    /// its first plane's byte as [`Self::FirstPlaneAt`] does, and its copies into the pages take
+    /// the surface's texels alone ([`SurfaceCache::texels`]).
+    Asked(Vec<PagesPlane>),
+}
+
+impl CacheLayout {
+    /// The byte the cache places on a multiple of 256 bytes of its memory, where it places one.
+    fn aligned_byte(&self) -> Option<u64> {
+        match self {
+            CacheLayout::Unknown => None,
+            CacheLayout::FirstPlaneAt(byte) => Some(*byte),
+            CacheLayout::Asked(planes) => aligned_byte(planes),
+        }
+    }
+
+    /// The planes the kext's ask gave, where it asked.
+    fn into_planes(self) -> Option<Vec<PagesPlane>> {
+        match self {
+            CacheLayout::Asked(planes) => Some(planes),
+            CacheLayout::Unknown | CacheLayout::FirstPlaneAt(_) => None,
+        }
+    }
 }
 
 /// The bytes of a surface laid out as `planes` that its texels are: each plane's rows'
@@ -6734,6 +6792,122 @@ mod tests {
             "no layout: as any other buffer"
         );
         assert_eq!(r.dec.caches().counts().aligned, 1);
+    }
+
+    /// A cached block's own `SURFACE_PAGES` that carries its surface's layout, on a device that
+    /// asks nothing (its GPU keeps its own memory), places the block's cache by it alone: the
+    /// cache's buffer has its first plane's byte placed on a multiple of 256 bytes of its memory
+    /// where the plane starts off one (CoreVideo's 32 bytes in), with nothing else declared, and
+    /// its copies still move the surface's bytes whole, a fill and a download copying every byte;
+    /// a deferred block's message places its cache alike. A first plane at the surface's first
+    /// byte, a layout that does not lie in the surface's bytes, and a message with none place
+    /// nothing, and every one is answered as with none
+    #[test]
+    fn a_cached_blocks_layout_places_its_cache_alone() {
+        use reims_vgpu_graphics::wire::{RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout};
+        use reims_vgpu_vulkan::core::testkit::impls::device::{
+            ALIGNED_BUFFER, PADDING_UNOBSERVED_BUFFER,
+        };
+        const NEW_BUFFER: &str = "newBufferWithLength:options:";
+        let mut r = rig(24);
+        r.dec.set_deferred_budget(16 * r.page);
+        queues(&mut r);
+        let page = r.page;
+        // NV12 as CoreVideo lays it in four pages, its luma plane `first` bytes in.
+        let planes = |first: u64, rows: u64| {
+            let mut layout = RgfxSurfacePagesLayout {
+                plane_count: 2,
+                ..Default::default()
+            };
+            layout.planes[0] = RgfxSurfacePlaneLayout {
+                offset: first,
+                bytes_per_row: 512,
+                row_bytes: 480,
+                rows,
+            };
+            layout.planes[1] = RgfxSurfacePlaneLayout {
+                offset: first + rows * 512,
+                bytes_per_row: 512,
+                row_bytes: 480,
+                rows: rows / 2,
+            };
+            layout
+        };
+        let cached = RGFX_SURFACE_PAGES_CACHED;
+        let deferred = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+        // The cache each message makes: its maker and arguments.
+        let made = |r: &mut Rig, block: u64, at: u64, flags: u32, layout| {
+            let mark = r.p.call_log().mark();
+            let runs: &[(u64, u64)] = if flags == deferred { &[] } else { &[(at, 4)] };
+            assert_eq!(
+                r.pages_laid_out(block, 0, runs, 4 * page, flags, layout),
+                RGFX_STATUS_OK,
+                "answered as with no layout"
+            );
+            let calls = r.p.call_log().since(mark);
+            let made: Vec<(&str, Vec<Arg>)> = (calls.iter())
+                .filter(|c| {
+                    [NEW_BUFFER, PADDING_UNOBSERVED_BUFFER, ALIGNED_BUFFER].contains(&c.sel)
+                })
+                .map(|c| (c.sel, c.args.clone()))
+                .collect();
+            assert_eq!(made.len(), 1, "one cache");
+            made.into_iter().next().unwrap()
+        };
+        let (sel, args) = made(&mut r, BLOCK + 0x10000, 1, cached, Some(planes(0x20, 16)));
+        assert_eq!(
+            (sel, args.get(2)),
+            (ALIGNED_BUFFER, Some(&Arg::U64(0x20))),
+            "the first plane's byte placed, nothing declared"
+        );
+        assert_eq!(args[0], Arg::U64(4 * page));
+        let (sel, args) = made(&mut r, BLOCK + 0x20000, 0, deferred, Some(planes(0x20, 16)));
+        assert_eq!(
+            (sel, args.get(2)),
+            (ALIGNED_BUFFER, Some(&Arg::U64(0x20))),
+            "a deferred block's cache placed alike"
+        );
+        assert_eq!(r.dec.caches().counts().aligned, 2);
+        for (block, at, layout, why) in [
+            (
+                BLOCK + 0x30000,
+                5,
+                Some(planes(0, 16)),
+                "a first plane at the first byte",
+            ),
+            (
+                BLOCK + 0x40000,
+                9,
+                Some(planes(0x20, 4096)),
+                "a layout past the surface's bytes",
+            ),
+            (BLOCK + 0x50000, 13, None, "no layout"),
+        ] {
+            let (sel, args) = made(&mut r, block, at, cached, layout);
+            assert_eq!(
+                (sel, args.len()),
+                (NEW_BUFFER, 2),
+                "{why}: placed as any other"
+            );
+        }
+        assert_eq!(r.dec.caches().counts().aligned, 2);
+
+        // The placed cache's copies move the surface's bytes whole: its first fill copies every
+        // byte in, and a download every byte out, as of a cache with no layout.
+        let mark = r.p.call_log().mark();
+        use_surfaces(&mut r, 1, 0x100, &[(BLOCK + 0x10000, 0, true)]);
+        assert_eq!(
+            offsets(&r.p.call_log().since(mark)),
+            [(0, 0, 4 * page)],
+            "the first fill copies every byte in"
+        );
+        let mark = r.p.call_log().mark();
+        (r.dec).surface_download(&r.device, BLOCK + 0x10000, Box::new(|| {}), no_raise());
+        assert_eq!(
+            offsets(&r.p.call_log().since(mark)),
+            [(0, 0, 4 * page)],
+            "the download copies every byte out"
+        );
     }
 
     /// Only a cache whose memory was made for the host's video gives the video its identity

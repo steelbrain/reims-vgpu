@@ -2761,7 +2761,8 @@ fn surface_pages_hand_the_host_their_runs() {
             layout: Option<RgfxSurfacePagesLayout>,
             answer: CompleteAnswer,
         ) {
-            let cache = layout.is_some_and(|l| l.planes[0].bytes_per_row == 0x1100);
+            let cache = flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0
+                && layout.is_some_and(|l| l.planes[0].bytes_per_row == 0x1100);
             self.0.lock().push((*pages, runs, flags, layout));
             answer.answer(if cache {
                 RGFX_STATUS_CACHE
@@ -2823,7 +2824,7 @@ fn surface_pages_hand_the_host_their_runs() {
         }
         .as_bytes(),
     );
-    let seqno = rig.send(cached);
+    let seqno = rig.send(cached.clone());
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     // A process's pages block: its flags as they are.
     let mut private = pages(BLOCK, BLOCK + 0x1000, 2).as_bytes().to_vec();
@@ -2870,6 +2871,11 @@ fn surface_pages_hand_the_host_their_runs() {
     // Asked with no layout: refused, nothing handed.
     let seqno = rig.send(ask(None));
     assert_eq!(rig.complete(), (seqno, RGFX_STATUS_INVALID_ARGUMENT));
+    // A cached block's message that carries its surface's layout: the layout handed with it.
+    let mut laid_out = cached.clone();
+    laid_out.extend_from_slice(layout.as_bytes());
+    let seqno = rig.send(laid_out);
+    assert_eq!(rig.complete(), (seqno, RGFX_STATUS_OK));
     let seqno = rig.send(
         RgfxSurfaceDownload {
             header: RgfxMsgHeader {
@@ -2898,7 +2904,7 @@ fn surface_pages_hand_the_host_their_runs() {
     let seen = seen.lock();
     assert_eq!(
         seen.len(),
-        5,
+        6,
         "only the SURFACE_PAGES whose runs lie in its block and asks with a layout, and the \
          download"
     );
@@ -2922,7 +2928,12 @@ fn surface_pages_hand_the_host_their_runs() {
         (seen[3].1.as_slice(), seen[3].2, seen[3].3),
         (&runs[..], RGFX_SURFACE_PAGES_ASK_CACHE, Some(layout))
     );
-    assert_eq!((seen[4].0.block_offset, seen[4].1.len()), (BLOCK, 0));
+    assert_eq!(
+        (seen[4].1.as_slice(), seen[4].2, seen[4].3),
+        (&runs[..], RGFX_SURFACE_PAGES_CACHED, Some(layout)),
+        "a cached block's layout"
+    );
+    assert_eq!((seen[5].0.block_offset, seen[5].1.len()), (BLOCK, 0));
 }
 
 /// What a [`TakingHost`] records, and what it is set to do.
