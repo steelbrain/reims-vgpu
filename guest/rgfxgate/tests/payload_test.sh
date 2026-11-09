@@ -10,25 +10,26 @@
 #    admission decision (rgfx_cdhash_allowed over kExecCDHashes, the arm64 hooks' allowed set)
 #    takes the arm64 slice's hash, which third-party processes present, and the arm64e slice's,
 #    which is kExecCDHash and comes first.
-# SCRATCH is removed first and at the end. Nothing is fetched.
+# SCRATCH is removed first and at the end of a run that finishes; one that aborts leaves it for
+# the next to remove. No EXIT trap removes it: bash 3.2, macOS's, exits 0 from a set -u error
+# where one is set, which would make an aborted run read as a pass. Nothing is fetched.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 S=$1
 rm -rf "$S"
 mkdir -p "$S"
-trap 'rm -rf "$S"' EXIT
 fails=0
 
 # bundle DIR CODE [ARCH...]: a signed reims-graphics.bundle in DIR whose executable returns
 # CODE, with a slice for each ARCH (x86_64 alone where none is given).
 bundle() {
-	local b=$1/reims-graphics.bundle code=$2
+	local dir=$1 b=$1/reims-graphics.bundle code=$2
 	shift 2
 	local archs=()
 	for a in "${@:-x86_64}"; do archs+=(-arch "$a"); done
 	mkdir -p "$b/Contents/MacOS" "$b/Contents/Resources"
-	printf 'int main(void) { return %d; }\n' "$code" > "$1/main.c"
-	xcrun --sdk macosx clang "${archs[@]}" "$1/main.c" -o "$b/Contents/MacOS/reims-graphics"
+	printf 'int main(void) { return %d; }\n' "$code" > "$dir/main.c"
+	xcrun --sdk macosx clang "${archs[@]}" "$dir/main.c" -o "$b/Contents/MacOS/reims-graphics"
 	touch "$b/Contents/Resources/wire-version-2"
 	cat > "$b/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -121,5 +122,6 @@ GE=$(python3 -I -c 'import sys; print(",".join(str(b) for b in bytes.fromhex(sys
 expect "an arm64 guest's kExecCDHash is the arm64e slice's" \
 	"$(sed -n 's/^static const uint8_t kExecCDHash\[20\] = {\(.*\)};$/\1/p' "$S/build64/gen/RgfxGatePayload.h")" "$GE"
 
+rm -rf "$S"
 [ $fails = 0 ] || exit 1
 echo "payload_test: all checks passed"
