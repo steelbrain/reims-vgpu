@@ -159,13 +159,32 @@ NS_ASSUME_NONNULL_BEGIN
 /// Managed storage, Memoryless storage and a storage mode Metal has no name for, and usage bit
 /// 0x80. A type past MTLTextureTypeTextureBuffer ends it with no words, as there. The device's, the heaps' and a buffer's texture creators, by the public form and the
 /// linear and tiled SPI, and the creator over an IOSurface, call it before they send the host
-/// anything; it returns for any other descriptor.
+/// anything; it returns for any other descriptor. Where `device` is an Apple GPU
+/// (rgfxAppleGPU), the rules are the M3 Max's, which differ in the formats it lacks, the
+/// multisample formats and the storage it takes, and its compressed formats (RgfxTexture.mm).
 void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLDevice> device = nil);
+
+/// Whether `device` answers as an Apple GPU, an Apple family (Apple7, every Apple-silicon Mac's),
+/// as the device answers in an arm64 guest, where Metal's rules are an Apple GPU's: false for nil.
+bool rgfxAppleGPU(id<MTLDevice> _Nullable device);
+
+/// Whether `format` is a block-compressed format the device has: BC1 to BC7, and on an Apple GPU
+/// (rgfxAppleGPU) PVRTC, EAC, ETC2 and ASTC too.
+bool rgfxBlockCompressedFormat(uint64_t format, id<MTLDevice> _Nullable device);
+
+/// Whether the device's and a heap's texture creators answer nil for `descriptor`, past Metal's
+/// validation, sending nothing: on an Apple GPU, a two-plane format or Unspecialized (263), as the
+/// M3 Max under macOS 27.0.1 answers at both (oracle_texdesc device and heap, fmt.ycbcr500 and
+/// fmt.unspecialized). The x86 Macs end the process at both in the validation.
+bool rgfxDeviceMakesNoTextureOf(MTLTextureDescriptor *_Nullable descriptor,
+                                id<MTLDevice> _Nullable device);
 
 /// Ends the process, with Metal's words, where a heap's texture creator ends it after the
 /// descriptor's validation, as the AMD 5300M and the Intel 630 under macOS 26.7.1 end it at a
-/// Private heap (oracle_texdesc heap): a descriptor of another storage mode than the heap's.
-void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode);
+/// Private heap (oracle_texdesc heap): a descriptor of another storage mode than the heap's, but,
+/// on an Apple GPU, a Memoryless one, which the M3 Max makes there.
+void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode,
+                                  id<MTLDevice> device = nil);
 
 /// Ends the process, with Metal's words, where `minimumLinearTextureAlignmentForPixelFormat:` ends
 /// it on the x86-64 Macs, and returns for the 64 raw formats both answer (256), alike on the AMD

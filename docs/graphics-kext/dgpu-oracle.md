@@ -1274,6 +1274,19 @@ both x86 Macs *(class 3)*:
 7. Storage: a depth, stencil or multisample texture in Shared or Managed storage; Memoryless
    storage; and a mode Metal has no name for (5), whose line comes twice. Then usage bit 0x80.
 
+The M3 Max under macOS 27.0.1 (11-09, every case but the 2 GiB and larger ones and the
+16384 x 16384 one, at all three creators) lists the rules it shares with the x86 Macs in their
+words and order, and differs in these: it has every format the x86 Macs lack but Invalid,
+Depth24Unorm_Stencil8 (255) and X24_Stencil8 (262), making B5G6R5, A1BGR5, ABGR4, sRGB R8 and RG8,
+BGRA10_XR, BGR10_XR, ASTC, ETC2, EAC and PVRTC, and answering nil at the device's and the heap's
+creators for the two-plane format 500 and Unspecialized; it makes multisample BGR5A1Unorm and
+RGB9E5Float textures, depth, stencil and multisample textures in Shared and Managed storage, and
+Memoryless ones, a Private heap's among them; and it makes 2 and 4 samples but not 8 ("sampleCount
+(8) is not supported by device"). Its heap names its class `IOGPUMetalHeap` in the storage
+assertion. Over a buffer it answers nil for every compressed format, BC1 included. The bundle
+takes the M3's rules where the device answers an Apple family, as it does in an arm64 guest
+(`rgfxAppleGPU`, RgfxTexture.h).
+
 A texture type past TextureBuffer (10) ends the process at every creator with no words. A pixel
 format value no format has (9999) ends it at the descriptor's setter, which is Metal's own in a
 guest too. After the validation, a heap's creator ends the process at a descriptor of another

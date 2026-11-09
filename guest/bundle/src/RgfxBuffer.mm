@@ -764,13 +764,16 @@ RGFX_RESOURCE_SPI
 	// it over a Shared buffer, 64 x 64 and 62 x 64, where the Intel 630 makes it (oracle_texdesc
 	// buffer bc1.*): the host's platform makes no texture of one over a buffer's bytes, and one it
 	// refused would drop every draw that named it. Both make one of a single block, 2 x 2, which
-	// the bundle answers nil for too.
+	// the bundle answers nil for too. On an Apple GPU so does every compressed format it has (PVRTC,
+	// EAC, ETC2 and ASTC too), a two-plane format and Unspecialized, as the M3 Max under macOS
+	// 27.0.1 answers each (oracle_texdesc Apple buffer, 11-09).
 	if (descriptor != nil) {
 		const uint64_t f = descriptor.pixelFormat;
-		if ((f >= 130 && f <= 135) || (f >= 140 && f <= 143) || (f >= 150 && f <= 153)) {
+		if (rgfxBlockCompressedFormat(f, self.device) ||
+		    rgfxDeviceMakesNoTextureOf(descriptor, self.device)) {
 			static std::atomic<bool> logged{false};
 			if (!logged.exchange(true)) {
-				NSLog(@"RGFX: a texture over buffer 0x%llx of block-compressed format %llu, which "
+				NSLog(@"RGFX: a texture over buffer 0x%llx of format %llu, which "
 				      @"the host does not carry: answered nil",
 				      (unsigned long long)[self rgfxObjId], (unsigned long long)f);
 			}

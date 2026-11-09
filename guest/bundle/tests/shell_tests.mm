@@ -1743,6 +1743,78 @@ static const DescriptorCase kDescriptorCases[] = {
                    "device.\nMTLTextureDescriptor: Multisample textures cannot be allocated with "
                    "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
 };
+
+// A device that answers as the M3 Max does where the texture rules ask: an Apple GPU (every Apple
+// family) that makes 1, 2 and 4 samples a texel (oracle_texdesc device ms.s8: "sampleCount (8) is
+// not supported by device").
+@interface RgfxAppleFamilyDevice : NSObject
+- (BOOL)supportsFamily:(MTLGPUFamily)family;
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count;
+@end
+@implementation RgfxAppleFamilyDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	return family >= MTLGPUFamilyApple1 && family <= MTLGPUFamilyApple9;
+}
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count
+{
+	return count == 1 || count == 2 || count == 4;
+}
+@end
+
+// The kDescriptorCases the M3 Max under macOS 27.0.1 answers otherwise than the x86 Macs, at the
+// device's newTextureWithDescriptor: (oracle_texdesc Apple device, 11-09): its words where it ends
+// the process, null where it makes the texture or answers nil. It answers every other case as the
+// x86 Macs, in the same words.
+struct AppleDescriptorCase {
+	const char *name;
+	const char *words;
+};
+static const AppleDescriptorCase kAppleDescriptorCases[] = {
+    {"ms.s8", RGFX_VALIDATE "MTLTextureDescriptor sampleCount (8) is not supported by device.\n'"},
+    {"ms.shared", nullptr},
+    {"ms.managed", nullptr},
+    {"ms.bgr5a1", nullptr},
+    {"ms.rgb9e5", nullptr},
+    {"memoryless", nullptr},
+    {"depth32f.shared", nullptr},
+    {"depth32f.shared.ms", nullptr},
+    {"fmt.b5g6r5", nullptr},
+    {"fmt.a1bgr5", nullptr},
+    {"fmt.abgr4", nullptr},
+    {"fmt.r8srgb", nullptr},
+    {"fmt.rg8srgb", nullptr},
+    {"fmt.bgra10xr", nullptr},
+    {"fmt.bgr10xr", nullptr},
+    {"fmt.astc4x4", nullptr},
+    {"fmt.etc2", nullptr},
+    {"fmt.eac", nullptr},
+    {"fmt.pvrtc", nullptr},
+    {"fmt.ycbcr500", nullptr},
+    {"fmt.unspecialized", nullptr},
+    {"w0.ms.shared.s1",
+     RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\nMTLTextureDescriptor sampleCount "
+                   "must be > 1 for multisample textures.\n'"},
+    {"bc1.ms.shared",
+     RGFX_VALIDATE "MTLTextureDescriptor pixelFormat (MTLPixelFormatBC1_RGBA) does not support "
+                   "multisample textures.\nMTLTextureDescriptor has a compressed pixel format set "
+                   "with a sample count greater than one.\nMTLTextureDescriptor: compressed pixel "
+                   "formats require texture type of MTLTextureType2D[Array], MTLTextureType3D or "
+                   "MTLTextureTypeCube[Array].\n'"},
+    {"b5g6r5.w0.d2",
+     RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\nMTLTextureDescriptor has depth (2) "
+                   "greater than the maximum allowed size of 1.\nMTLTextureDescriptor requests a "
+                   "depth of 2 but the texture type MTLTextureType2D requires that depth is 1\n'"},
+};
+
+// The words the M3 Max ends the process with at `c`, null where it goes on.
+static const char *appleWords(const DescriptorCase &c)
+{
+	for (const AppleDescriptorCase &a : kAppleDescriptorCases)
+		if (std::strcmp(a.name, c.name) == 0)
+			return a.words;
+	return c.words;
+}
 #define RGFX_HEAP_MISMATCH(MODE)                                                                   \
 	"-[MTLIOAccelHeap newSubResourceWithLength:alignment:options:offset:]: failed assertion `The " \
 	"requested storage mode (" MODE ") is not compatible with the heap's mode "                    \
@@ -1932,6 +2004,12 @@ static int dies_case(const char *name)
 		for (const DescriptorCase &c : kDescriptorCases)
 			if (std::strcmp(name + 8, c.name) == 0)
 				rgfxEndAtInvalidTextureDescriptor(descriptorOf(c));
+	}
+	if (std::strncmp(name, "apple-texdesc-", 14) == 0) {
+		id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+		for (const DescriptorCase &c : kDescriptorCases)
+			if (std::strcmp(name + 14, c.name) == 0)
+				rgfxEndAtInvalidTextureDescriptor(descriptorOf(c), apple);
 	}
 	// kCreatorCases: a 64 x 64 BGRA8Unorm texture (of 4 samples where the case says), by the
 	// creator the case names.
@@ -2608,6 +2686,48 @@ void test_texture_descriptor_validation_as_the_x86_macs()
 	}
 	for (const auto &c : kCreatorCases)
 		checkDies(c.name, c.words);
+}
+
+// On a device that answers as an Apple GPU, every texture creator ends the process at Metal's
+// descriptor validation as the M3 Max under macOS 27.0.1 ends it, and goes on at what it makes or
+// answers nil for (kAppleDescriptorCases over kDescriptorCases); the device's and a heap's
+// creators answer nil for a two-plane format and Unspecialized, and a heap's makes a Memoryless
+// texture in a Private heap, as the M3's do. Where the device answers no Apple family, the rules
+// stay the x86 Macs'.
+void test_texture_descriptor_validation_as_an_apple_gpu()
+{
+	id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+	CHECK(rgfxAppleGPU(apple) && !rgfxAppleGPU(nil) &&
+	      !rgfxAppleGPU((id<MTLDevice>)[NSObject new]));
+	for (const DescriptorCase &c : kDescriptorCases) {
+		if (const char *words = appleWords(c)) {
+			checkDies(("apple-texdesc-" + std::string(c.name)).c_str(), words);
+		} else {
+			rgfxEndAtInvalidTextureDescriptor(descriptorOf(c), apple);
+			g_checks++;
+		}
+	}
+	auto ofFormat = [](uint64_t format) {
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		d.pixelFormat = static_cast<MTLPixelFormat>(format);
+		return d;
+	};
+	for (uint64_t f : kTwoPlaneFormats)
+		CHECK(rgfxDeviceMakesNoTextureOf(ofFormat(f), apple) &&
+		      !rgfxDeviceMakesNoTextureOf(ofFormat(f), nil));
+	CHECK(rgfxDeviceMakesNoTextureOf(ofFormat(263), apple));
+	CHECK(!rgfxDeviceMakesNoTextureOf(ofFormat(MTLPixelFormatBGRA8Unorm), apple) &&
+	      !rgfxDeviceMakesNoTextureOf(ofFormat(MTLPixelFormatBGRA10_XR), apple) &&
+	      !rgfxDeviceMakesNoTextureOf(nil, apple));
+	MTLTextureDescriptor *memoryless = ofFormat(MTLPixelFormatBGRA8Unorm);
+	memoryless.storageMode = MTLStorageModeMemoryless;
+	memoryless.usage = MTLTextureUsageRenderTarget;
+	rgfxEndAtHeapStorageMismatch(memoryless, MTLStorageModePrivate, apple);
+	g_checks++;
 }
 
 // A texture over an IOSurface ends the process with Metal's words, before the host is sent
@@ -15602,6 +15722,7 @@ int main(int argc, char **argv)
 		test_buffer_texture_buffers();
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_descriptor_validation_as_the_x86_macs();
+		test_texture_descriptor_validation_as_an_apple_gpu();
 		test_invalid_surface_textures_end_the_process();
 		test_unalignable_linear_formats_end_the_process();
 		test_memoryless_icb_ends_the_process();

@@ -684,9 +684,53 @@ uint64_t rgfxMaxLevels(uint64_t width, uint64_t height, uint64_t depth)
 
 } // namespace
 
+namespace {
+
+// The compressed formats an Apple GPU has beyond BC: PVRTC, EAC and ETC2, and ASTC (sRGB, LDR and
+// HDR), each of which the M3 Max makes (oracle_texdesc device, fmt.pvrtc, fmt.eac, fmt.etc2 and
+// fmt.astc4x4).
+bool rgfxAppleCompressedFormat(uint64_t f)
+{
+	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
+	return in(160, 167) || f == 170 || f == 172 || f == 174 || f == 176 || in(178, 183) ||
+	       in(186, 190) || in(192, 200) || in(204, 208) || in(210, 218) || in(222, 226) ||
+	       in(228, 236);
+}
+
+} // namespace
+
+bool rgfxAppleGPU(id<MTLDevice> device)
+{
+	return device != nil && [device respondsToSelector:@selector(supportsFamily:)] &&
+	       [device supportsFamily:MTLGPUFamilyApple7];
+}
+
+bool rgfxBlockCompressedFormat(uint64_t format, id<MTLDevice> device)
+{
+	return (format >= 130 && format <= 135) || (format >= 140 && format <= 143) ||
+	       (format >= 150 && format <= 153) ||
+	       (rgfxAppleGPU(device) && rgfxAppleCompressedFormat(format));
+}
+
+bool rgfxDeviceMakesNoTextureOf(MTLTextureDescriptor *descriptor, id<MTLDevice> device)
+{
+	if (descriptor == nil || !rgfxAppleGPU(device))
+		return false;
+	const uint64_t format = descriptor.pixelFormat;
+	return rgfxTwoPlaneFormat(format) || format == 263;
+}
+
 // Metal's descriptor validation, `-[MTLTextureDescriptorInternal validateWithDevice:]`, which
 // every texture creator runs first: one assertion listing every rule the descriptor breaks, a line
-// each, in the order the x86 Macs list them. Measured on the AMD 5300M and the Intel 630 under
+// each, in the order the x86 Macs list them. Where `device` is an Apple GPU (rgfxAppleGPU), the
+// rules are the M3 Max's under macOS 27.0.1, which lists the rules it shares with the x86 Macs in
+// their words and order (oracle_texdesc, 11-09, every case but the 2 GiB and larger ones at the
+// device's, a Private heap's and a Shared buffer's creators): it has every format the x86 Macs
+// lack but Invalid, Depth24Unorm_Stencil8 and X24_Stencil8 (two-plane formats and Unspecialized
+// pass, and the creators answer nil for them, rgfxDeviceMakesNoTextureOf); it makes multisample
+// BGR5A1Unorm and RGB9E5Float textures, depth, stencil and multisample textures in Shared and
+// Managed storage, and Memoryless ones; and its compressed formats, which the type and
+// multisample rules take as the BC ones, include PVRTC, EAC, ETC2 and ASTC. Measured on the AMD 5300M and the Intel 630 under
 // macOS 26.7.1, alike at the device's, a Private heap's and a Shared buffer's creators
 // (oracle_texdesc), over an IOSurface (oracle_surftex, Q20) and in Q12's cases; the two differ
 // only in Depth24Unorm_Stencil8 and X24_Stencil8, which the Intel GPU lacks, as the lane does.
@@ -713,6 +757,7 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 		abort();
 	}
 	NSString *typeName = rgfxTextureTypeName(type);
+	const bool apple = rgfxAppleGPU(device);
 	const bool oneD = type == MTLTextureType1D || type == MTLTextureType1DArray;
 	const bool threeD = type == MTLTextureType3D;
 	const bool cube = type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray;
@@ -722,17 +767,23 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	                     type == MTLTextureTypeCubeArray ||
 	                     type == MTLTextureType2DMultisampleArray;
 	// A format the device lacks, which the x86 Macs name MTLPixelFormatInvalid: Invalid itself,
-	// the three-channel formats (Q12), and every two-plane format (Q13).
+	// the three-channel formats (Q12), and every two-plane format (Q13). An Apple GPU lacks
+	// Invalid, Depth24Unorm_Stencil8 and X24_Stencil8 alone of those the x86 Macs lack (the
+	// three-channel formats, which the M3 was not asked, are kept).
 	const bool threeChannel = (format >= 45 && format <= 48) ||
 	                          (format >= 95 && format <= 100) || (format >= 120 && format <= 122);
-	const bool lacked = format == MTLPixelFormatInvalid || rgfxDeviceLacks(format) ||
-	                    rgfxTwoPlaneFormat(format) || threeChannel;
+	const bool lacked =
+	    apple ? format == MTLPixelFormatInvalid || format == MTLPixelFormatDepth24Unorm_Stencil8 ||
+	                format == MTLPixelFormatX24_Stencil8 || threeChannel
+	          : format == MTLPixelFormatInvalid || rgfxDeviceLacks(format) ||
+	                rgfxTwoPlaneFormat(format) || threeChannel;
 	const bool subsampled = format == MTLPixelFormatGBGR422 || format == MTLPixelFormatBGRG422;
-	// The compressed formats the device has (BC1 to BC7), and the 4:2:2 ones, which Metal counts
-	// among them.
-	const bool compressed = !lacked && ((format >= 130 && format <= 135) ||
-	                                    (format >= 140 && format <= 143) ||
-	                                    (format >= 150 && format <= 153) || subsampled);
+	// The compressed formats the device has (BC1 to BC7, and on an Apple GPU PVRTC, EAC, ETC2 and
+	// ASTC), and the 4:2:2 ones, which Metal counts among them.
+	const bool compressed =
+	    !lacked && ((format >= 130 && format <= 135) || (format >= 140 && format <= 143) ||
+	                (format >= 150 && format <= 153) || subsampled ||
+	                (apple && rgfxAppleCompressedFormat(format)));
 	const bool depthOrStencil = !lacked && rgfxDepthStencilBytes(format) != 0;
 	// The largest side each type takes (measured: 16384 wide, 2048 for a 3D texture's sides; one
 	// row for the 1D types and a texture buffer, one slice for every type but 3D, one element for
@@ -799,9 +850,9 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	const char *noMultisample = nullptr;
 	if (lacked)
 		noMultisample = "MTLPixelFormatInvalid";
-	else if (format == MTLPixelFormatBGR5A1Unorm)
+	else if (format == MTLPixelFormatBGR5A1Unorm && !apple)
 		noMultisample = "MTLPixelFormatBGR5A1Unorm";
-	else if (format == MTLPixelFormatRGB9E5Float)
+	else if (format == MTLPixelFormatRGB9E5Float && !apple)
 		noMultisample = "MTLPixelFormatRGB9E5Float";
 	else if (compressed)
 		for (const RgfxNamedFormat &f : kNoMultisample)
@@ -848,8 +899,9 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	if (subsampled && width % 2 != 0)
 		[rules appendString:@"MTLTextureDescriptor: MTLPixelFormat422 requires even width.\n"];
 	// The x86 Macs keep depth, stencil and multisample textures Private (oracle_bundle
-	// buftex.depth and devtex.*), and have no memoryless storage (Q5).
-	const bool cpuStorage = storage == MTLStorageModeShared || storage == MTLStorageModeManaged;
+	// buftex.depth and devtex.*), and have no memoryless storage (Q5); an Apple GPU makes each.
+	const bool cpuStorage =
+	    !apple && (storage == MTLStorageModeShared || storage == MTLStorageModeManaged);
 	if (depthOrStencil && cpuStorage)
 		[rules appendString:@"MTLTextureDescriptor: Depth, Stencil, DepthStencil textures cannot be "
 		                    @"allocated with MTLStorageModeShared or MTLStorageModeManaged on this "
@@ -857,7 +909,7 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	if (multisample && cpuStorage)
 		[rules appendString:@"MTLTextureDescriptor: Multisample textures cannot be allocated with "
 		                    @"MTLStorageModeShared or MTLStorageModeManaged on this device.\n"];
-	if (storage == MTLStorageModeMemoryless)
+	if (storage == MTLStorageModeMemoryless && !apple)
 		[rules appendString:@"MTLTextureDescriptor: MTLResourceStorageModeMemoryless is not a "
 		                    @"supported storage mode on this device.\n"];
 	// A storage mode Metal has no name for, a line the x86 Macs give twice.
@@ -871,14 +923,32 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	// the system's own, so they pass).
 	if ((usage & 0x80) != 0)
 		[rules appendString:@"MTLTextureUsage has unknown bits 0x80.\n"];
-	if (rules.length > 0)
+	if (rules.length > 0) {
+		// The descriptor, in the unified log, for the process's death the guest's log keeps.
+		long long compression = -1;
+		if (@available(macOS 12.5, *))
+			compression = static_cast<long long>(descriptor.compressionType);
+		NSLog(@"RGFX: texture descriptor of format %llu, type %llu, %llux%llux%llu, %llu slices, "
+		      @"%llu levels, %llu samples, usage 0x%llx, storage %llu, CPU cache %llu, hazard "
+		      @"tracking %llu, options 0x%llx, GPU-optimized %d, compression %lld, on %s rules",
+		      ull(format), ull(type), ull(width), ull(height), ull(depth), ull(arrayLength),
+		      ull(levels), ull(samples), ull(usage), ull(storage), ull(descriptor.cpuCacheMode),
+		      ull(descriptor.hazardTrackingMode), ull(descriptor.resourceOptions),
+		      descriptor.allowGPUOptimizedContents ? 1 : 0, compression,
+		      apple ? "an Apple GPU's" : "the x86 Macs'");
 		RgfxMetalAssertionFailed("-[MTLTextureDescriptorInternal validateWithDevice:]",
 		                         [@"Texture Descriptor Validation\n" stringByAppendingString:rules]);
+	}
 }
 
-void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode)
+void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode,
+                                  id<MTLDevice> device)
 {
 	if (descriptor == nil || descriptor.storageMode == heapMode)
+		return;
+	// An Apple GPU makes a Memoryless texture in a Private heap (the M3 Max under macOS 27.0.1,
+	// oracle_texdesc heap memoryless).
+	if (descriptor.storageMode == MTLStorageModeMemoryless && rgfxAppleGPU(device))
 		return;
 	RgfxMetalAssertionFailed(
 	    "-[MTLIOAccelHeap newSubResourceWithLength:alignment:options:offset:]",
