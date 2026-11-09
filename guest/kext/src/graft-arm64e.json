@@ -16,7 +16,28 @@
     {
       "name": "IOAccelerator",
       "header": "IOKit/graphics/IOAccelerator.h",
-      "library": 0
+      "library": 0,
+      "required": [
+        "__ZNK8OSObject14getRetainCountEv",
+        "__ZNK8OSObject6retainEv",
+        "__ZNK8OSObject7releaseEv",
+        "__ZNK8OSObject9serializeEP11OSSerialize",
+        "__ZN9IOService4freeEv",
+        "__ZN15IORegistryEntry11setPropertyEPKcP8OSObject",
+        "__ZN15IORegistryEntry11setPropertyEPKcS1_",
+        "__ZN15IORegistryEntry11setPropertyEPKcyj",
+        "__ZNK15IORegistryEntry11getPropertyEPKc",
+        "__ZNK15IORegistryEntry12copyPropertyEPKc",
+        "__ZNK15IORegistryEntry7getNameEPK15IORegistryPlane",
+        "__ZN15IORegistryEntry7setNameEPKcPK15IORegistryPlane",
+        "__ZNK15IORegistryEntry7getPathEPcPiPK15IORegistryPlane",
+        "__ZN9IOService15registerServiceEj",
+        "__ZN9IOService9terminateEj",
+        "__ZN9IOService6attachEPS_",
+        "__ZN9IOService6detachEPS_",
+        "__ZNK9IOService17getClientIteratorEv",
+        "__ZN9IOService16getInterruptTypeEiPi"
+      ]
     }
   ],
   "consumers": [
