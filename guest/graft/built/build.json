@@ -3,18 +3,18 @@
   "bundle": {
     "Contents/Info.plist": {
       "mode": 420,
-      "sha256": "c86955b413fe70e6852aac9cb5698ab8c676e65b9d214be491a65541ed79c4bd",
+      "sha256": "43f099b48e587bbfc307f3cb28db9cfe187f7b09859fdc108e5683d81212fdf0",
       "size": 1433
     },
     "Contents/MacOS/Graft": {
       "mode": 493,
-      "sha256": "8b15b89f1f361b1c9c6a94bb6a51c3deba19bbe47575e69035d61dfaec65d42f",
+      "sha256": "e2c03b036a8e93322932b7df5ff7fb5fbaa508ca222dcba3fc7e9d874f4107fa",
       "size": 69632
     }
   },
   "format": 2,
   "sources": {
-    "Makefile": "e2b12fe7a7d22651c01aac3bfbce1f49c06f1822bfee7adcca656fb64a98711c",
+    "Makefile": "ccb9c86d96a6b721c78baed91fb3aaff2bbb65ccee9684ca7c300124212a87eb",
     "sdk/include/graft/Graft.h": "a248d23e0b169fb602d5a1ceb9b66cc3f586feb65cb7d053364e8a4c43370072",
     "src/Binding.h": "f9981e88b752e7245f48804b64cb8791629e5dc55b9dd6e018218fc9c513189a",
     "src/BindingPlacement.h": "3c3fb121ef04789db69c9fdede8316da3805240d6b78426f158e4d4690ae4a76",
@@ -59,5 +59,5 @@
     "sdk_version": "27.2",
     "xcode": "Xcode 27.2\nBuild version 27B52"
   },
-  "version": "1.1.0"
+  "version": "1.1.1"
 }

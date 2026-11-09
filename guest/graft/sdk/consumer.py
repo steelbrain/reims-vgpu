@@ -41,6 +41,7 @@ from typing import Any, NamedTuple
 # Python's -I leaves the script's own directory off the import path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from graft_macho import (
+    ARM64_RELOC_AUTHENTICATED_POINTER,
     MH_KEXT_BUNDLE,
     N_WEAK_REF,
     X86_64_RELOC_BRANCH,
@@ -302,11 +303,26 @@ def probe_source(rows: list[dict[str, Any]]) -> str:
     return "\n".join(source) + "\n"
 
 
-def without_arch(flags: list[str]) -> list[str]:
-    """The consumer's flags with any -arch pair dropped, so the layout probe stays x86-64.
+def target_arch(flags: list[str]) -> str:
+    """The architecture the consumer builds for, from its flags' -arch pair (x86-64 default).
 
-    A class's vtable layout is the same on every architecture (the Itanium C++ ABI), so the
-    probe is always x86-64 and reads x86-64 relocations, even for an arm64e consumer.
+    The layout probe compiles for this architecture, because a class's inherited vtable is
+    NOT the same on every one: the Kernel headers give OSMetaClassBase four more slots on
+    arm64 (the arm64-only _RESERVEDOSMetaClassBase* under APPLE_KEXT_VTABLE_PADDING) and turn
+    each OSMetaClassDeclareReservedUsedX86 slot into a reserved one, so an arm64e consumer's
+    parent slots differ from x86-64's in both count and order (IOAccelerator 272 vs 266).
+    """
+    for i, flag in enumerate(flags):
+        if flag == "-arch" and i + 1 < len(flags):
+            return flags[i + 1]
+    return "x86_64"
+
+
+def without_arch(flags: list[str]) -> list[str]:
+    """The consumer's flags with any -arch pair dropped.
+
+    compile_probe sets the probe's -arch from target_arch(flags) and then appends these, so
+    the consumer's own -arch is dropped here to avoid a second, conflicting one.
     """
     kept, skip = [], False
     for flag in flags:
@@ -320,7 +336,7 @@ def without_arch(flags: list[str]) -> list[str]:
 
 
 def compile_probe(source: str, flags: list[str]) -> tuple[Image, str]:
-    """Compile source with x86-64 kext flags for macOS 11, followed by the consumer's flags.
+    """Compile source with kext flags for macOS 11 on the consumer's arch, then its flags.
 
     Returns the object and the compiler's vtable-layout dump. The source and object live in
     a temporary directory outside the consumer's tree.
@@ -332,7 +348,7 @@ def compile_probe(source: str, flags: list[str]) -> tuple[Image, str]:
         source_path, object_path = Path(temp) / "probe.cpp", Path(temp) / "probe.o"
         source_path.write_text(source)
         command = [
-            *("xcrun", "clang++", "-arch", "x86_64", "-isysroot", sdk),
+            *("xcrun", "clang++", "-arch", target_arch(flags), "-isysroot", sdk),
             *("-mmacosx-version-min=11.0", "-mkernel", "-nostdinc"),
             *("-isystem", f"{sdk}/System/Library/Frameworks/Kernel.framework/Headers"),
             *("-DKERNEL", "-std=c++17", "-fapple-kext", "-fno-rtti", "-fno-exceptions"),
@@ -365,6 +381,9 @@ def probe_slots(
     end = vtable.value + (entries - 1) * POINTER_SIZE
     if end in relocations or image.read(end, POINTER_SIZE) != bytes(POINTER_SIZE):
         raise Error("compiler vtable lacks its final zero sentinel")
+    # An arm64e object relocates each vtable slot as an authenticated pointer; x86-64 as a
+    # plain one. Either way the slot names its method through the relocation's symbol.
+    pointer = ARM64_RELOC_AUTHENTICATED_POINTER if image.arch == "arm64e" else X86_64_RELOC_UNSIGNED
     slots = []
     for slot in range(entries - 3):
         relocation = relocations.get(vtable.value + VTABLE_ADDRESS_POINT + slot * POINTER_SIZE)
@@ -373,7 +392,7 @@ def probe_slots(
             or not relocation.external
             or relocation.width != POINTER_SIZE
             or relocation.pcrel
-            or relocation.kind != X86_64_RELOC_UNSIGNED
+            or relocation.kind != pointer
         ):
             raise Error("compiler vtable slot has no supported symbolic relocation")
         method = image.symbols[relocation.symbol_index].name

@@ -55,6 +55,9 @@ RELOCATION_SIZE = 8
 X86_64_RELOC_UNSIGNED = 0
 X86_64_RELOC_SIGNED = 1
 X86_64_RELOC_BRANCH = 2
+# <mach-o/arm64/reloc.h>: an arm64e object relocates each vtable slot as an authenticated
+# (signed) pointer, where an x86-64 object uses X86_64_RELOC_UNSIGNED.
+ARM64_RELOC_AUTHENTICATED_POINTER = 11
 # Indirect-symbol entries that name no symbol.
 INDIRECT_SYMBOL_LOCAL = 0x80000000
 INDIRECT_SYMBOL_ABS = 0x40000000

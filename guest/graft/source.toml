@@ -1,21 +1,21 @@
-# Graft 1.1.0, copied from its release tag v1.1.0 by Graft's tools/vendor.py.
+# Graft 1.1.1, copied from its release tag v1.1.1 by Graft's tools/vendor.py.
 # Replace the directory and this record together; do not edit either.
-version = "1.1.0"
-commit = "1b17bb7c5ec3de15a28866643bdcaf512b465a68"
+version = "1.1.1"
+commit = "63a620087da0251422e82230ecb414bb31f94178"
 
 [files]
 "LICENSE" = "aa03754de05115e6218873f65ec1a6a4c95c550742dafca7ce8d4c4b627e50e3"
 "LICENSES/GPL-2.0-or-later.txt" = "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
 "LICENSES/GPL-3.0-or-later.txt" = "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
 "LICENSES/LGPL-3.0-or-later.txt" = "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118"
-"built/Graft.kext/Contents/Info.plist" = "c86955b413fe70e6852aac9cb5698ab8c676e65b9d214be491a65541ed79c4bd"
-"built/Graft.kext/Contents/MacOS/Graft" = "8b15b89f1f361b1c9c6a94bb6a51c3deba19bbe47575e69035d61dfaec65d42f"
+"built/Graft.kext/Contents/Info.plist" = "43f099b48e587bbfc307f3cb28db9cfe187f7b09859fdc108e5683d81212fdf0"
+"built/Graft.kext/Contents/MacOS/Graft" = "e2c03b036a8e93322932b7df5ff7fb5fbaa508ca222dcba3fc7e9d874f4107fa"
 "built/README.md" = "df87082e9f43bfef7dff9dad135a15791d3653503a87f08ac079017722f893d2"
-"built/build.json" = "e812db8a555a3d02ae93226b6aac297f906ce61f494f69c020485a742e96791b"
+"built/build.json" = "a3351b630af5928f14c071f278d8f435f9ec45838593754b093e64dbbfb0ed20"
 "sdk/README.md" = "064905dd071c6839d9181bd4e29edbfe2590f032a99f0e709cc847fcdfade9b9"
 "sdk/Start.cpp" = "d442ab1f6403ec72b952f595463e7fc479362414c39dad5effec71332ccb9055"
 "sdk/consumer.mk" = "2064cb7659544f97bad1cbfc5cd19885a805c97d7c67df7d4ff8037fd6c3945a"
-"sdk/consumer.py" = "d167726888be74831e92dcb58ccddebd34ab5dd81f6e480214507e90390b412b"
-"sdk/graft_macho.py" = "4687e821349388e2b779d6a07f09704750f8148f92b0a23db11107cdd16943b4"
+"sdk/consumer.py" = "b5944afabb6df2b01496209577846222b2da2bfebcced487f3a4407d69249e0f"
+"sdk/graft_macho.py" = "4bdb9e47fb07a572a9046df2ed2f653492b7fa15804aa884826859ebe62f6516"
 "sdk/include/graft/Graft.h" = "a248d23e0b169fb602d5a1ceb9b66cc3f586feb65cb7d053364e8a4c43370072"
 "sdk/prelink.py" = "ee7970ffdee693dddfa565188cbed157f5095a5225461e98d6a722409b0e4ec8"
