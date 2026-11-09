@@ -162,6 +162,16 @@ void timings()
 	      "with no preferred mode listed, the device's order", "order");
 	check(rgfxMobileTimings(modes, 0, 7, out) == 0, "no modes, no timings", "order");
 
+	// The display starts in the timing listed first.
+	check(rgfxMobileStartTimingId(modes, 3, 7) == 1007, "the preferred mode's timing", "start");
+	check(rgfxMobileTimings(modes, 3, 42, out) == 3 &&
+	          rgfxMobileStartTimingId(modes, 3, 42) == out[0].id,
+	      "with none preferred, the first timing listed", "start");
+	const RgfxMode unnumbered[] = {{0, 640, 480, 60000}, {5, 800, 600, 60000}};
+	check(rgfxMobileStartTimingId(unnumbered, 2, 0) == 1005, "never mode 0, which has no timing",
+	      "start");
+	check(rgfxMobileStartTimingId(modes, 0, 7) == 0, "no modes, no timing", "start");
+
 	RgfxMode m{};
 	check(rgfxMobileModeFor(100, 1007, modes, 3, &m) && m.width == 1920 && m.height == 1080,
 	      "the colour and timing IDs set a mode", "set");

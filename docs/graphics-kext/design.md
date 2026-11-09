@@ -319,7 +319,10 @@ Stages:
       a timing for each mode the device lists and one 8-bit colour mode.
       WindowServer sets one of them by its colour and timing IDs
       (set_digital_out_mode), which the device then shows by `SET_SCANOUT`,
-      as x86-64's setDisplayMode does.
+      as x86-64's setDisplayMode does. With one colour mode and one timing,
+      WindowServer sets none and reads the display's size from the class
+      (QuartzCore's IOMFBDisplay), so the display starts in its preferred
+      mode (start_hardware).
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync

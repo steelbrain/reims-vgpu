@@ -107,6 +107,23 @@ inline uint32_t rgfxMobileTimings(const RgfxMode *modes, uint32_t n, int32_t pre
 	return count;
 }
 
+// The timing a display starts in, before WindowServer sets one: the first rgfxMobileTimings lists,
+// the preferred mode's, or the first mode's where none is preferred. 0 for a display with no mode.
+inline uint32_t rgfxMobileStartTimingId(const RgfxMode *modes, uint32_t n, int32_t preferredId)
+{
+	uint32_t first = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (modes[i].id <= 0)
+			continue;
+		const uint32_t id = kRgfxTimingIdBase + static_cast<uint32_t>(modes[i].id);
+		if (modes[i].id == preferredId)
+			return id;
+		if (!first)
+			first = id;
+	}
+	return first;
+}
+
 // The mode of the colour and timing IDs set_digital_out_mode takes, in that order: the mode in
 // `modes[0..n)` whose timing has `timingId`, with the display's one colour mode. False for any other
 // pair, which the paravirtual display leaves to its parent class to answer.

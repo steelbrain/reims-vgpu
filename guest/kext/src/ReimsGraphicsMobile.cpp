@@ -28,7 +28,9 @@
  * Of what the class implements for every subclass, ReimsGraphics overrides what reads the
  * class's provider as an AppleARMIODevice unchecked where a process reaches it: get_dot_pitch. And
  * as the paravirtual display does, it overrides set_digital_out_mode, which the class answers
- * kIOReturnUnsupported, to set the mode WindowServer picks of those it publishes.
+ * kIOReturnUnsupported, to set the mode WindowServer picks of those it publishes. Unlike the
+ * paravirtual display, which publishes three colour modes, it publishes one, and the device lists
+ * one mode, so WindowServer picks none: the display starts in its preferred mode (start_hardware).
  *
  * A process finds the display as IOMobileFramebuffer.framework counts displays: by a node of the
  * device tree (attachMobileNode), then the framebuffer's service and the properties it publishes
@@ -422,7 +424,7 @@ void setElementId(OSObject *element, uint32_t id, uint32_t score)
 // publishes its own (RgfxMobileModes.hpp): ColorElements, the one colour mode, and TimingElements,
 // a timing for each mode the device lists, with the reduced blanking the x86-64 framebuffer's
 // detailed timing gives it (timingFor) at the device's rate, and the colour mode as its ColorModes.
-// WindowServer sets one of them with set_digital_out_mode.
+// WindowServer sets one of them with set_digital_out_mode where it has two to pick from.
 void ReimsGraphics::publishMobileModes()
 {
 	Mode modes[kMaxModes];
@@ -695,6 +697,22 @@ RgfxIOMFBWord ReimsGraphics::start_hardware()
 			OSSafeReleaseNULL(answer);
 		}
 	}
+	// The display starts in its preferred mode, as a panel does. WindowServer reads an internal
+	// display's timings only where it publishes two colour modes or two timings: with one of each
+	// it sets no mode and takes the display's size from get_display_size, which answers the
+	// class's fields (read from 14.6.1's and 27.0.1's QuartzCore, IOMFBDisplay's
+	// update_framebuffer_locked and set_physical_and_canvas_sizes). The device lists one mode,
+	// so the size must be there before WindowServer opens the framebuffer.
+	IOLockLock(stateLock);
+	const uint32_t startTiming =
+	    rgfxMobileStartTimingId(modeSet.modes, modeSet.modeCount, modeSet.preferredId);
+	IOLockUnlock(stateLock);
+	Mode start{};
+	const IOReturn shown = startTiming ? setMobileMode(kRgfxColorElementId, startTiming, &start)
+	                                   : kIOReturnNotReady;
+	IOLog("ReimsGraphics: display %u starts in timing %u: 0x%x, %ux%u at %u.%03u Hz\n", displayId,
+	      startTiming, shown, start.width, start.height, start.refreshMhz / 1000,
+	      start.refreshMhz % 1000);
 	if (mobilePipe)
 		setPipeVblankEnabled(this, true);
 	if (logged(kStartHardware))
@@ -789,13 +807,25 @@ RgfxIOMFBWord ReimsGraphics::get_dot_pitch(uint32_t *pitch)
 // and default framebuffer surface read, and the framebuffer publishes the size and the timing ID:
 // DisplayWidth, DisplayHeight and DPTimingModeId. A pair the display does not publish is answered
 // kIOReturnUnsupported, as the paravirtual display leaves it to the class, which answers that.
+// start_hardware sets the display's first mode the same way (setMobileMode).
 RgfxIOMFBWord ReimsGraphics::set_digital_out_mode(uint32_t colorId, uint32_t timingId)
+{
+	Mode mode{};
+	const IOReturn r = setMobileMode(colorId, timingId, &mode);
+	if (logged(kSetDigitalOutMode))
+		IOLog("ReimsGraphics: set_digital_out_mode(%u, %u) = 0x%x: %ux%u at %u.%03u Hz\n", colorId,
+		      timingId, r, mode.width, mode.height, mode.refreshMhz / 1000, mode.refreshMhz % 1000);
+	return word(r);
+}
+
+IOReturn ReimsGraphics::setMobileMode(uint32_t colorId, uint32_t timingId, Mode *shown)
 {
 	IOLockLock(stateLock);
 	Mode mode{};
 	const bool published =
 	    rgfxMobileModeFor(colorId, timingId, modeSet.modes, modeSet.modeCount, &mode);
 	IOLockUnlock(stateLock);
+	*shown = mode;
 	IOReturn r = kIOReturnUnsupported;
 	if (published) {
 		r = setScanout(mode);
@@ -821,10 +851,7 @@ RgfxIOMFBWord ReimsGraphics::set_digital_out_mode(uint32_t colorId, uint32_t tim
 			setProperty("DPTimingModeId", timingId, 64);
 		}
 	}
-	if (logged(kSetDigitalOutMode))
-		IOLog("ReimsGraphics: set_digital_out_mode(%u, %u) = 0x%x: %ux%u at %u.%03u Hz\n", colorId,
-		      timingId, r, mode.width, mode.height, mode.refreshMhz / 1000, mode.refreshMhz % 1000);
-	return word(r);
+	return r;
 }
 
 #endif // __arm64e__

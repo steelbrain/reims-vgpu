@@ -549,6 +549,9 @@ private:
 	void detachMobileNode();
 	void publishMobileDisplay();
 	void publishMobileModes();
+	// Shows the mode of a published colour and timing ID (set_digital_out_mode), and writes its
+	// size where the class reads it; kIOReturnUnsupported for a pair it does not publish.
+	IOReturn setMobileMode(uint32_t colorId, uint32_t timingId, Mode *mode);
 	static void mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	static void mobilePresented(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
 	// The swaps (ReimsGraphicsMobile.cpp, swap_begin_gated): the next one begun, and the swap
