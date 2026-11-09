@@ -7,5 +7,12 @@
 		<key>Driver</key>
 		<string>Drivers/ReimsGraphics.elf</string>
 	</dict>
+	<key>Kernel</key>
+	<dict>
+		<key>ExportVtableDiscriminators</key>
+		<array>
+			<string>__ZTV25IOMobileFramebufferLegacy</string>
+		</array>
+	</dict>
 </dict>
 </plist>
