@@ -42,9 +42,10 @@ SET = (
     ("kext/ReimsGraphics.kext", "The reims-graphics display, accelerator and device control"),
     ("rgfxgate/RgfxGate.kext", "Installs the reims-graphics Metal bundle and admits it"),
 )
-# The arm64e set, for the arm64 guests Ambrosia boots: from macOS 13 (Darwin 22), the oldest
-# release of Ambrosia's arm64 configuration. Ambrosia's config bundle places these kexts.
-MIN_KERNEL_ARM64E = "22.0.0"
+# The arm64e set, for the arm64 guests Ambrosia boots: from macOS 14 (Darwin 23). arm64 macOS 11
+# to 13 are not supported for now: 13.6 offers the device no MSI, and the kexts have no INTx
+# path. Ambrosia's config bundle places these kexts.
+MIN_KERNEL_ARM64E = "23.0.0"
 SET_ARM64E = (
     ("Graft-arm64e.kext", "Binds and routes the owned guest kexts"),
     ("kext/ReimsGraphics.kext", "The reims-graphics display and accelerator"),

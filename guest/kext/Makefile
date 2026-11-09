@@ -1,5 +1,5 @@
 # The reims-graphics display kext for x86-64 macOS 11 to 26 guests, and, with
-# ARCH_NAME=arm64e, for the arm64 macOS 13 and later guests Ambrosia boots:
+# ARCH_NAME=arm64e, for the arm64 macOS 14 and later guests Ambrosia boots:
 # ReimsGraphics, an IOFramebuffer on the device's PCI function
 # (src/ReimsGraphics.hpp; the protocol is docs/graphics-kext/design.md).
 # Builds on a Mac with Xcode's clang and ld, against the macOS SDK's
@@ -40,7 +40,8 @@ TRACE   ?= 0
 DTRACE  ?= 0
 
 # The guest's architecture: x86_64 (macOS 11 and later) or arm64e (the arm64 guests Ambrosia
-# boots, macOS 13 and later). Each builds in a BUILD of its own.
+# boots, macOS 14 and later, built for a deployment target of 13.0). Each builds in a BUILD of
+# its own.
 ARCH_NAME ?= x86_64
 ifeq ($(ARCH_NAME),arm64e)
 MIN_OS = 13.0

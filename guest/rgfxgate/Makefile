@@ -30,8 +30,8 @@ PAYLOAD = $(GEN)/RgfxGatePayload.h
 BUNDLE_DIR ?=
 BUNDLE_STAMP = $(GEN)/bundle-dir
 
-# The guest's architecture: x86_64 (macOS 11 and later) or arm64e (macOS 13 and later). The red
-# zone is x86's alone.
+# The guest's architecture: x86_64 (macOS 11 and later) or arm64e (macOS 14 and later, built for
+# a deployment target of 13.0). The red zone is x86's alone.
 ARCH_NAME ?= x86_64
 ifeq ($(ARCH_NAME),arm64e)
 MIN_OS = 13.0

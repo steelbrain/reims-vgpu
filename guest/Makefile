@@ -1,6 +1,6 @@
 # The guest side of the reims-graphics device (QEMU's reims-graphics-pci) for
 # x86-64 macOS 11 to 26 guests, and the kext set their OpenCore image injects
-# for it, and the arm64e set for the arm64 macOS 13 and later guests Ambrosia
+# for it, and the arm64e set for the arm64 macOS 14 and later guests Ambrosia
 # boots (prebuilt-arm64e/, which Ambrosia's config bundle places):
 # Graft (graft/, vendored from Graft's repository with its record),
 # ReimsGraphics (kext/), injected dormant for Graft to bind against the
