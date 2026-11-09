@@ -92,6 +92,16 @@ extern "C" void rgfxLegacySwapInfoNotifyDispatch(IOMobileFramebufferLegacy *self
                                                  RgfxSwapInfoRecord *record)
     __asm__("__ZN25IOMobileFramebufferLegacy31swap_info_notify_dispatch_gatedEPNS_12SwapInfoBlobE");
 
+// IOUserClient's async result, which it keeps for its subclasses: sent through a subclass of its
+// own, as the paravirtual display sends it through its user client class's. Never made.
+struct RgfxAsyncResult : IOUserClient {
+	static IOReturn send(io_user_reference_t *reference, IOReturn result, io_user_reference_t *args,
+	                     UInt32 count, IOOptionBits options)
+	{
+		return sendAsyncResult64WithOptions(reference, result, args, count, options);
+	}
+};
+
 // IOAVFamily's constructors of a timing element and of a colour element, and a timing's colour
 // elements, which the paravirtual display calls to make the elements it publishes
 // (RgfxMobileModes.hpp): called directly, under the names every release from 14 to 27.0.1 exports.
@@ -691,7 +701,7 @@ RgfxIOMFBWord ReimsGraphics::do_swap_info_notify_gated(IOMFBNotifyRequest *reque
 		uint64_t args[kRgfxSwapInfoMaxArgs + 1];
 		const uint32_t n =
 		    rgfxSwapInfoArgs(mask, last, *reinterpret_cast<const RgfxSwapInfoRecord *>(blob), args);
-		r = IOUserClient::sendAsyncResult64WithOptions(
+		r = RgfxAsyncResult::send(
 		    reinterpret_cast<io_user_reference_t *>(bytes + kRgfxNotifyRequestReference),
 		    kIOReturnSuccess, args, n, kIOUserNotifyOptionCanDrop);
 	}
