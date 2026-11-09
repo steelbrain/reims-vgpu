@@ -191,6 +191,10 @@ bool askCache = false;
 // block asks with its surface's layout, and is deferred only where the device answers that the
 // block would need a cache whatever its pages (deferSurfaceBlock).
 UInt64 deferredBudget = 0;
+// Whether a deferral may carry the resident pages of its surface its asker lists
+// (RGFX_FEATURE_SURFACE_DEFERRED_CARRY, taken, RgfxDeferCarry.hpp): a surface fresh but for them
+// is deferred too. Read with deferredBudget, and false where it is 0.
+bool deferCarries = false;
 // The service of that mapper device, the paravirtualized GPU's.
 const char *const kSurfaceMapperService = "IOSurfaceParavirtMapperService";
 // Under contextLock: the shared blocks of surface planes, made at the first ask.
@@ -733,11 +737,13 @@ bool RgfxAccelerator::startContexts()
 			OSDictionary *matching = IOService::serviceMatching(kSurfaceMapperService);
 			IOService *mapper = matching ? IOService::copyMatchingService(matching) : nullptr;
 			OSSafeReleaseNULL(matching);
-			if (!mapper)
+			if (!mapper) {
 				deferredBudget =
 				    (static_cast<UInt64>(readRegister(RGFX_REG_DEFERRED_BUDGET_HI)) << 32) |
 				    readRegister(RGFX_REG_DEFERRED_BUDGET_LO);
-			else
+				deferCarries = deferredBudget != 0 &&
+				               (featureWord() & RGFX_FEATURE_SURFACE_DEFERRED_CARRY) != 0;
+			} else
 				IOLog("RgfxAccelerator: the guest's IOSurfaces have a mapper device (%s): no "
 				      "block is deferred\n",
 				      kSurfaceMapperService);
@@ -1444,6 +1450,9 @@ void noteDormant()
 	// Read first, holding no other lock.
 	const UInt64 noRoom = rgfxSurfaceCacheNoRoom();
 	const UInt64 retaken = rgfxSurfaceCacheRetaken();
+	UInt64 carries[kRgfxCarryOutcomes] = {};
+	if (deferCarries)
+		rgfxSurfaceCacheCarries(carries);
 	IOLockLock(contextLock);
 	const bool log = (dormantStats.changes != dormantStats.loggedChanges ||
 	                  noRoom != dormantStats.loggedNoRoom) &&
@@ -1476,6 +1485,15 @@ void noteDormant()
 		      d.letGo[kRgfxDormantStale], d.letGo[kRgfxDormantDeferredBytes], d.unread,
 		      d.unreadWritten, d.unheld, d.unheldWritten, retaken, noRoom, d.deferred,
 		      d.deferredRefused, d.deferredUnattached, d.foundBySurface);
+	// How the deferrals of surfaces whose asks listed resident pages ended (RgfxDeferCarry.hpp).
+	if (log && deferCarries)
+		IOLog("RgfxAccelerator: deferrals of listed pages: %llu carried them, %llu found none "
+		      "resident; not deferred: %llu touched, %llu not counted, %llu with other pages "
+		      "resident, compressed or paged out, %llu not wired with no fault, %llu counted "
+		      "otherwise after the wire, %llu with no runs\n",
+		      carries[kRgfxCarryTaken], carries[kRgfxCarryNone], carries[kRgfxCarryTouched],
+		      carries[kRgfxCarryUncounted], carries[kRgfxCarryCounted], carries[kRgfxCarryUnwired],
+		      carries[kRgfxCarryFaulted], carries[kRgfxCarryNoRuns]);
 }
 
 // The last holder, of context `context`, of the cached entry `e` let it go: the block sleeps
@@ -1528,6 +1546,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
                                              task_t task, UInt64 address, UInt64 length,
                                              UInt64 size, bool inPlace, uint32_t surfaceId,
                                              bool cacheable, const RgfxSurfacePagesLayout *layout,
+                                             const RgfxSurfaceResident *resident,
                                              SurfaceBlock *block)
 {
 	if (!contextLock)
@@ -1562,6 +1581,12 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		~SurfaceRef() { OSSafeReleaseNULL(object); }
 	} asker;
 	bool defer = false, deferredFound = false, cachedFound = false;
+	// The surface's resident pages the ask listed, where the host lets a deferral carry them
+	// (RgfxDeferCarry.hpp): a surface fresh but for those may be deferred too.
+	const uint64_t listed =
+	    resident && deferCarries ? rgfxResidentPages(*resident, length, PAGE_SIZE) : 0;
+	if (!listed)
+		resident = nullptr;
 	if (inPlace && surfaceId && (surfaceCache || deferredBudget) && table.entries)
 		asker.object = rgfxSurfaceLocksLookup(this, task, surfaceId);
 	if (asker.object && surfaceCache)
@@ -1576,7 +1601,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 		// surface's layout: an ask with none (an older bundle's) stays in place, as it did.
 		defer = asker.object && !deferredFound && cacheable && (!askCache || layout) &&
 		        rgfxSurfaceDeferFits(table, length, deferredBudget) &&
-		        rgfxSurfaceLocksFresh(asker.object, length);
+		        rgfxSurfaceLocksFresh(asker.object, length, listed);
 	}
 	IOLockUnlock(contextLock);
 	// A cached block of the surface is the ask's, found by the surface, only where the asker
@@ -1664,7 +1689,7 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 			// No pages, no deferred block: a new one is deferred where its surface is fresh
 			// still, and fits the budget.
 			if (!count && (!defer || !rgfxSurfaceDeferFits(table, length, deferredBudget) ||
-			               !rgfxSurfaceLocksFresh(asker.object, length))) {
+			               !rgfxSurfaceLocksFresh(asker.object, length, listed))) {
 				needPages = true;
 				break;
 			}
@@ -1913,7 +1938,8 @@ IOReturn RgfxAccelerator::acquireSurfaceBlock(RgfxAcceleratorUserClient *client,
 	bool cached = false;
 	IOReturn posted = kIOReturnSuccess;
 	if (deferring) {
-		if (!deferSurfaceBlock(e, context, surfaceId, total, layout, &cached))
+		if (!deferSurfaceBlock(e, context, surfaceId, total, layout, task, address, resident,
+		                       &cached))
 			posted = kIOReturnUnsupported;
 	} else {
 		const bool ask = inPlace && askCache && cacheable && surfaceId && layout;
@@ -2072,7 +2098,8 @@ bool RgfxAccelerator::reviveBlockOfSurface(RgfxSurfaceEntry &e, uint32_t surface
 
 bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uint32_t surfaceId,
                                         UInt64 total, const RgfxSurfacePagesLayout *layout,
-                                        bool *cached)
+                                        task_t task, UInt64 address,
+                                        const RgfxSurfaceResident *resident, bool *cached)
 {
 	// The entry is pending until the device answers its pages, so no other asker reads it. Nor
 	// does anything let it go meanwhile, so `e` is this block's still under the contexts' lock
@@ -2087,9 +2114,15 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 	IOMemoryMap *header = region->createMappingInTask(
 	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, offset, kPage);
 	void *cache = nullptr;
+	// The deferral's runs where it carries resident pages of the surface (RgfxDeferCarry.hpp):
+	// a run a page at most, and one of zeros before each and at the end.
+	RgfxPageRun carried[2 * kRgfxCarryPagesMost + 1] = {};
+	UInt32 carriedCount = 0;
 	const RgfxDeferAnswer answer =
 	    header ? rgfxSurfaceLocksDefer(this, surface, surfaceId, offset, size, length, context,
-	                                   header, &cache)
+	                                   header, task, address, resident, carried,
+	                                   sizeof(carried) / sizeof(carried[0]), &carriedCount,
+	                                   &cache)
 	           : kRgfxDeferNoCache;
 	// Not cached: its surface is looked up anew at its first write named, as any block's, and the
 	// entry's reference goes once its pages are named.
@@ -2109,12 +2142,19 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 	// layout, at its deferral and at its naming: the host defers only a block that would need a
 	// cache whatever its pages, and a block whose pages it then takes in place is not cached.
 	const RgfxSurfacePagesLayout *asking = askCache ? layout : nullptr;
-	if (answer == kRgfxDeferFresh) {
+	// A deferral that carries pages names them in its runs, past the part the processes map, in
+	// the room the block keeps for one run a page: one whose runs could not be written names its
+	// pages now, as a refused one does, nothing read of the carried pages.
+	const bool runsWritten =
+	    !carriedCount || writeRuns(region, offset + size, carried, carriedCount);
+	if (answer == kRgfxDeferFresh && !runsWritten)
+		rgfxSurfaceLocksRefusedCarry(cache);
+	if (answer == kRgfxDeferFresh && runsWritten) {
 		UInt32 status = RGFX_STATUS_OK;
 		const UInt32 flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED |
 		                     (asking ? RGFX_SURFACE_PAGES_ASK_CACHE : 0);
-		const IOReturn r =
-		    postPages(context, offset, total, offset + size, length, 0, flags, &status, asking);
+		const IOReturn r = postPages(context, offset, total, offset + size, length, carriedCount,
+		                             flags, &status, asking);
 		if (r == kIOReturnSuccess || r != kIOReturnUnsupported || status != RGFX_STATUS_REFUSED) {
 			// Deferred, or not answered: a block whose answer did not come goes through its
 			// release, its region bytes given out again only at an OK answer. No guest page was
@@ -2134,6 +2174,8 @@ bool RgfxAccelerator::deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uin
 		dormantStats.deferredRefused++;
 		dormantStats.changes++;
 		IOLockUnlock(contextLock);
+		// The host made nothing, so it reads none of the pages the deferral carried.
+		rgfxSurfaceLocksRefusedCarry(cache);
 	}
 	// Not fresh, refused, or with no cache: the block's pages are named now, as any block's in
 	// place, and its asker's hold wires them as any holder's. Where the device answers which

@@ -193,7 +193,11 @@ enum {
 	// 0. With six inputs, a struct input of exactly sizeof(RgfxSurfacePagesLayout) is the
 	// surface's planes as its memory holds them: where the device answers which surfaces need a
 	// device cache (RGFX_FEATURE_SURFACE_CACHE_REFUSED), a new cacheable block asks it with them,
-	// and is cached only where it answers so; with none, it stays in place.
+	// and is cached only where it answers so; with none, it stays in place. A struct input of
+	// the layout followed by an RgfxSurfaceResident (RgfxDeferCarry.hpp) lists the surface's
+	// resident pages the process found in its mapping, where the kext took
+	// RGFX_FEATURE_SURFACE_DEFERRED_CARRY: a new block of a surface fresh but for those is
+	// deferred carrying them, where the kext's read proves them; elsewhere the list is ignored.
 	kRgfxAccelMethodSurfaceBlock = 0x109,
 	// The device info the host wrote at RGFX_DEVICE_INFO_OFFSET (RgfxDeviceInfo): no input;
 	// struct out, exactly sizeof(RgfxDeviceInfo) bytes, or those and the video caps after them

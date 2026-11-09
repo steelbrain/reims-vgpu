@@ -23,7 +23,9 @@
 // in place of a surface whose pages are still to take a released block's write-back waits for it
 // until the release is late, and so does a CPU lock of the surface. A release is flagged unheld
 // only where nothing but the kext holds the surface, and a lock or a new block of it met before
-// the answer marks the header's clients for the host.
+// the answer marks the header's clients for the host. The wire of the pages a deferral carried is
+// held while the host may read them, is the caller's once the block's pages are named or the
+// deferral refused, and goes with the entry wherever it goes.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -351,6 +353,90 @@ void ungated()
 	check(!rgfxCacheUngated(t, kOther, &map, &wire) && rgfxCacheFind(t, kOther) == d,
 	      "so does one whose pages were named cached");
 	check(!rgfxCacheUngated(t, kNotCached, &map, &wire), "and a surface not cached has none");
+}
+
+// The wire of the pages a deferral carried (RgfxDeferCarry.hpp): held while the host may read
+// them, the caller's once the block's pages are named or the host refused the deferral, and
+// handed out with the entry wherever it goes.
+void carriedWires()
+{
+	RgfxCachedSurface entries[2] = {};
+	RgfxCacheTable t = {entries, 0, 2};
+	int carriedWire = 0, surfaceObject = 0;
+	void *map = nullptr, *wire = nullptr, *held = nullptr, *carried = nullptr;
+	uint64_t offset = 0, mark = 0;
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	check(c->carried == nullptr, "a new entry carries nothing");
+	c->deferral = kRgfxCacheGating;
+	c->carried = &carriedWire;
+	check(rgfxCacheGated(t, kSurface), "fresh but for the carried pages, it asks to be deferred");
+	check(rgfxCacheTakeCarried(t, kSurface) == nullptr && c->carried == &carriedWire,
+	      "its pages not named, the carried wire stays");
+	check(rgfxCacheRefusedCarried(t, kSurface) == &carriedWire && c->carried == nullptr,
+	      "the host refused the deferral, making nothing: the carried wire is the caller's");
+	check(rgfxCacheRefusedCarried(t, kSurface) == nullptr, "and only once");
+
+	// Deferred, the host may read the carried pages until the block's pages are named.
+	c->carried = &carriedWire;
+	rgfxCacheSettled(t, kSurface, true);
+	check(c->deferral == kRgfxCacheDeferred && rgfxCacheRefusedCarried(t, kSurface) == nullptr &&
+	          c->carried == &carriedWire,
+	      "a deferral answered keeps the carried wire");
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheAttach &&
+	          rgfxCacheTakeCarried(t, kSurface) == nullptr,
+	      "a lock names the block's pages: while it is in flight, the carried wire stays");
+	check(rgfxCacheAttached(t, kSurface, kRgfxPagesNotNamed, &map, &wire, &held) == 0 &&
+	          rgfxCacheTakeCarried(t, kSurface) == nullptr && c->carried == &carriedWire,
+	      "a naming not taken leaves it");
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheAttach &&
+	          rgfxCacheAttached(t, kSurface, kRgfxPagesNamed, &map, &wire, &held) == 0,
+	      "the next lock names them");
+	check(rgfxCacheTakeCarried(t, kSurface) == &carriedWire && c->carried == nullptr,
+	      "named, the host reads the pages themselves: the carried wire is the caller's");
+	check(rgfxCacheTakeCarried(t, kSurface) == nullptr, "and only once");
+
+	// Wherever the entry goes, its carried wire goes with it.
+	c->deferral = kRgfxCacheDeferred;
+	c->carried = &carriedWire;
+	check(rgfxCacheLetGo(t, kSurface, false, &surfaceObject, &map, &wire, true, &carried) &&
+	          carried == &carriedWire && t.count == 0,
+	      "a deferred block let go hands it out");
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheDeferring;
+	c->carried = &carriedWire;
+	check(rgfxCacheUngated(t, kSurface, &map, &wire, &carried) && carried == &carriedWire,
+	      "so does a deferral ungated");
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheDeferred;
+	c->carried = &carriedWire;
+	check(!rgfxCacheLetGo(t, kSurface, true, &surfaceObject, &map, &wire, true, &carried) &&
+	          carried == nullptr,
+	      "a block released keeps it until its release is answered");
+	check(rgfxCacheReleased(t, kBlock, &map, &wire, &held, &carried) == kSurface &&
+	          carried == &carriedWire,
+	      "then hands it out");
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheDeferred;
+	c->carried = &carriedWire;
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheAttach &&
+	          !rgfxCacheLetGo(t, kSurface, false, &surfaceObject, &map, &wire, true, &carried) &&
+	          carried == nullptr,
+	      "a block let go while its pages are named keeps it for the naming");
+	check(rgfxCacheAttached(t, kSurface, kRgfxPagesNotNamed, &map, &wire, &held, nullptr,
+	                        &carried) == kSurface &&
+	          carried == &carriedWire,
+	      "whose answer hands it out");
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheDeferred;
+	c->carried = &carriedWire;
+	check(rgfxCacheBlockLetGo(t, kSurface, kOtherBlock, false, &surfaceObject, &map, &wire, true,
+	                          &carried) &&
+	          carried == nullptr && t.count == 1,
+	      "another block of the surface going leaves it");
+	check(rgfxCacheBlockLetGo(t, kSurface, kBlock, false, &surfaceObject, &map, &wire, true,
+	                          &carried) &&
+	          carried == &carriedWire && t.count == 0,
+	      "its own block going hands it out");
 }
 
 // Op 5 keeps a dormant deferred block while clients are left, and its release names its pages
@@ -1016,6 +1102,7 @@ int main()
 	room();
 	deferral();
 	heldBytes();
+	carriedWires();
 	ungated();
 	deferredRelease();
 	forgottenAttach();

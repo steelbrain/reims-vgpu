@@ -248,18 +248,26 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 	case kRgfxAccelMethodSurfaceBlock: {
 		// Three inputs ask for a copy block; a fourth of 1, for one in place; a fifth and a
 		// sixth name the surface and whether it may be cached, and a struct input with them is
-		// the surface's layout. A fifth output says whether it is.
+		// the surface's layout, followed by the surface's resident pages the asker found in
+		// its mapping where it lists them (RgfxDeferCarry.hpp). A fifth output says whether
+		// it is.
 		const UInt32 inputs = a->scalarInputCount;
 		if ((inputs < 3 || inputs > 6 || inputs == 5) ||
 		    (a->scalarOutputCount != 4 && a->scalarOutputCount != 5))
 			return kIOReturnBadArgument;
 		RgfxSurfacePagesLayout given = {};
+		RgfxSurfaceResident resident = {};
 		const bool laidOut = a->structureInputSize != 0 || a->structureInputDescriptor;
+		const bool listed = a->structureInputSize == sizeof(given) + sizeof(resident);
 		if (laidOut && (inputs != 6 || a->structureInputDescriptor || !a->structureInput ||
-		                a->structureInputSize != sizeof(given)))
+		                (a->structureInputSize != sizeof(given) && !listed)))
 			return kIOReturnBadArgument;
 		if (laidOut)
 			memcpy(&given, a->structureInput, sizeof(given));
+		if (listed)
+			memcpy(&resident,
+			       static_cast<const uint8_t *>(a->structureInput) + sizeof(given),
+			       sizeof(resident));
 		bool inPlace = inputs >= 4 && in[3] != 0;
 		if (inputs >= 4 && in[3] > 1)
 			return kIOReturnBadArgument;
@@ -274,7 +282,8 @@ IOReturn RgfxAcceleratorUserClient::contextMethod(uint32_t selector,
 		RgfxAccelerator::SurfaceBlock block = {};
 		IOReturn r = ask.begun ? owner->acquireSurfaceBlock(this, ctx, task, in[0], in[1], in[2],
 		                                                    inPlace, surfaceId, cacheable,
-		                                                    laidOut ? &given : nullptr, &block)
+		                                                    laidOut ? &given : nullptr,
+		                                                    listed ? &resident : nullptr, &block)
 		                       : kIOReturnBadArgument;
 		if (r != kIOReturnSuccess)
 			return r;

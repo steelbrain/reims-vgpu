@@ -118,9 +118,11 @@ struct LockState {
 	uint64_t retaken;
 	// Under `lock`: the waiting locks' wakes so far (wakeLocked).
 	uint64_t wakes;
+	// Under `lock`: how the deferrals whose asks listed resident pages ended (RgfxCarryOutcome).
+	uint64_t carries[kRgfxCarryOutcomes];
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0};
+                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0, {}};
 
 bool startLocks()
 {
@@ -253,11 +255,19 @@ bool attachLocked(RgfxAccelerator *accel, uint64_t key, bool logged)
 	           : kRgfxPagesNotNamed;
 	const bool ok = naming == kRgfxPagesNamed;
 	IOLockLock(state.lock);
-	void *map = nullptr, *wire = nullptr, *surface = nullptr;
+	void *map = nullptr, *wire = nullptr, *surface = nullptr, *carried = nullptr;
 	bool keepWired = false;
-	OSObject *cache = reinterpret_cast<OSObject *>(static_cast<uintptr_t>(
-	    rgfxCacheAttached(state.caches, key, naming, &map, &wire, &surface, &keepWired)));
+	OSObject *cache = reinterpret_cast<OSObject *>(static_cast<uintptr_t>(rgfxCacheAttached(
+	    state.caches, key, naming, &map, &wire, &surface, &keepWired, &carried)));
+	// Its pages named, the host reads them from now on, not those its deferral carried.
+	if (!cache && ok)
+		carried = rgfxCacheTakeCarried(state.caches, key);
 	wakeLocked();
+	if (carried) {
+		IOLockUnlock(state.lock);
+		letGoMemory(carried, true);
+		IOLockLock(state.lock);
+	}
 	if (cache) {
 		// Its block went meanwhile (rgfxCacheLetGo): the let-go is this attach's, out of the
 		// lock. IOSurface holds the cache for the lock calling this, and the lock's process the
@@ -641,20 +651,56 @@ RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
 	return counts;
 }
 
-bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length)
+bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length, uint64_t listed)
 {
+	const uint32_t seed = rgfxIOSurfaceLockSeed(surface);
 	IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
 	return md && length <= md->getLength() &&
-	       rgfxSurfaceHoldsOnlyResident(true, rgfxIOSurfaceLockSeed(surface),
-	                                    rgfxSurfaceLocksPageCounts(surface), 0);
+	       rgfxDeferRead(true, seed, rgfxSurfaceLocksPageCounts(surface), listed) !=
+	           kRgfxDeferReadStale;
 }
+
+namespace {
+// The device's page, of which SURFACE_PAGES' runs are whole ones: a kernel page is whole ones too.
+constexpr UInt64 kPage = 0x1000;
+// A kernel's page, 4 KiB on x86-64 and 16 KiB on arm64 (PAGE_SIZE, which an arm64 kext reads at
+// run time), is whole device pages, PAGE_MAX_SIZE at most.
+static_assert(PAGE_MIN_SIZE % kPage == 0, "a kernel page is whole device pages");
+
+// A wire of the `resident` pages the ask listed of the surface `task` maps at `address`, made
+// but not prepared: one descriptor over their runs, in the surface's order. Null where it is not
+// made.
+IOMemoryDescriptor *carryWire(task_t task, UInt64 address, const RgfxSurfaceResident &resident)
+{
+	IOAddressRange ranges[kRgfxCarryPagesMost] = {};
+	for (uint32_t i = 0; i < resident.count; i++)
+		ranges[i] = {address + resident.runs[i].offset, resident.runs[i].length};
+	return IOMemoryDescriptor::withAddressRanges(ranges, resident.count, kIODirectionOutIn, task);
+}
+
+// The guest physical address of each page of `wire`, prepared, in its order, `pages` of them:
+// false where one is not a page's.
+bool carryAddresses(IOMemoryDescriptor *wire, uint64_t pages, uint64_t *addresses)
+{
+	for (uint64_t p = 0; p < pages; p++) {
+		IOByteCount segment = 0;
+		addresses[p] = wire->getPhysicalSegment(p * kPage, &segment, kIOMemoryMapperNone);
+		if (!addresses[p] || addresses[p] % kPage || segment < kPage)
+			return false;
+	}
+	return true;
+}
+} // namespace
 
 RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
                                       uint32_t surfaceId, UInt64 offset, UInt64 size,
                                       UInt64 length, UInt32 context, IOMemoryMap *header,
-                                      void **cacheOut)
+                                      task_t task, UInt64 address,
+                                      const RgfxSurfaceResident *resident, RgfxPageRun *runs,
+                                      UInt32 room, UInt32 *runCount, void **cacheOut)
 {
 	*cacheOut = nullptr;
+	*runCount = 0;
 	IOMemoryDescriptor *memory =
 	    OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
 	if (!memory || !startLocks())
@@ -707,24 +753,69 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 		reinterpret_cast<OSObject *>(cache)->release();
 		return kRgfxDeferNoCache;
 	}
+	// The pages the ask listed resident, the kernel's, as rgfxSurfaceLocksPageCounts counts them,
+	// where it listed any of the surface the asker maps where it asks: their wire, made now, is
+	// prepared only under the read.
+	const uint64_t listed = resident ? rgfxResidentPages(*resident, length, PAGE_SIZE) : 0;
+	IOMemoryDescriptor *carry = listed && rgfxSurfaceLocksMapsAt(surface, task, address, length)
+	                                ? carryWire(task, address, *resident)
+	                                : nullptr;
 	// The control function first, then the read: a read-write lock either moved the seed before
-	// the read-only lock below returned, or calls the control function.
+	// the read-only lock below returned, or calls the control function. A surface fresh but for
+	// the listed pages carries them where their wire, with no fault, proves them its resident
+	// pages (RgfxDeferCarry.hpp).
 	rgfxDeviceCacheSetControl(cache, accel, &surfaceControl);
 	uint32_t seed = ~0u;
-	RgfxSurfacePageCounts counts = {false, ~0ull, ~0ull};
+	RgfxSurfacePageCounts counts = {false, ~0ull, ~0ull}, after = counts;
+	bool wired = false;
 	const IOReturn locked = rgfxIOSurfaceLock(surface, kRgfxIOSurfaceLockReadOnly, &seed);
 	if (locked == kIOReturnSuccess) {
 		counts = rgfxSurfaceLocksPageCounts(surface);
+		if (rgfxDeferRead(true, seed, counts, carry ? listed : 0) == kRgfxDeferReadCarry) {
+			wired = carry->prepare(kIODirectionOutIn | kIODirectionPrepareNoFault) ==
+			        kIOReturnSuccess;
+			if (wired)
+				after = rgfxSurfaceLocksPageCounts(surface);
+		}
 		rgfxIOSurfaceUnlock(surface, kRgfxIOSurfaceLockReadOnly, nullptr);
 	}
-	const bool fresh = rgfxSurfaceHoldsOnlyResident(locked == kIOReturnSuccess, seed, counts, 0);
+	// The deferral's runs: each device page of the listed pages at its guest address, the rest
+	// zeros.
+	if (rgfxDeferCarried(wired, seed, after, listed)) {
+		uint64_t addresses[kRgfxCarryPagesMost * (PAGE_MAX_SIZE / kPage)] = {};
+		if (carryAddresses(carry, listed * (PAGE_SIZE / kPage), addresses))
+			*runCount = rgfxCarryRuns(*resident, addresses, length, kPage, runs, room);
+	}
+	const bool isLocked = locked == kIOReturnSuccess;
+	const RgfxCarryOutcome outcome =
+	    rgfxCarryOutcome(isLocked, seed, counts, carry ? listed : 0, wired, after, *runCount);
+	const bool fresh = outcome == kRgfxCarryTaken || outcome == kRgfxCarryNone;
+	IOLockLock(state.lock);
+	if (carry)
+		state.carries[outcome]++;
 	if (fresh) {
-		IOLockLock(state.lock);
 		rgfxCacheGated(state.caches, key);
-		IOLockUnlock(state.lock);
+		RgfxCachedSurface *gated = rgfxCacheFind(state.caches, key);
+		if (gated != nullptr && outcome == kRgfxCarryTaken)
+			gated->carried = carry;
+	}
+	IOLockUnlock(state.lock);
+	if (outcome != kRgfxCarryTaken) {
+		letGoMemory(carry, wired);
+		*runCount = 0;
 	}
 	*cacheOut = cache;
 	return fresh ? kRgfxDeferFresh : kRgfxDeferStale;
+}
+
+void rgfxSurfaceLocksRefusedCarry(void *cache)
+{
+	if (!cache || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	IOLockLock(state.lock);
+	void *carried = rgfxCacheRefusedCarried(state.caches, reinterpret_cast<uintptr_t>(cache));
+	IOLockUnlock(state.lock);
+	letGoMemory(carried, true);
 }
 
 void rgfxSurfaceCacheSettle(void *cache, bool deferred)
@@ -741,14 +832,15 @@ void rgfxSurfaceLocksUngate(void *cache)
 {
 	if (!cache || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
 		return;
-	void *map = nullptr, *wire = nullptr;
+	void *map = nullptr, *wire = nullptr, *carried = nullptr;
 	IOLockLock(state.lock);
-	const bool gone =
-	    rgfxCacheUngated(state.caches, reinterpret_cast<uintptr_t>(cache), &map, &wire);
+	const bool gone = rgfxCacheUngated(state.caches, reinterpret_cast<uintptr_t>(cache), &map,
+	                                   &wire, &carried);
 	wakeLocked();
 	IOLockUnlock(state.lock);
 	if (!gone)
 		return;
+	letGoMemory(carried, true);
 	// The entry's references, as rgfxSurfaceLocksDefer took them: its header's mapping, the
 	// surface's memory retained and never prepared for it, and the cache.
 	if (map)
@@ -855,7 +947,7 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool rele
 {
 	if (wireOut)
 		*wireOut = nullptr;
-	void *map = nullptr, *wire = nullptr;
+	void *map = nullptr, *wire = nullptr, *carried = nullptr;
 	bool kept = false, wired = true;
 	if (cache && __atomic_load_n(&state.lock, __ATOMIC_ACQUIRE)) {
 		IOLockLock(state.lock);
@@ -872,13 +964,14 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool rele
 		wired = c == nullptr || rgfxCacheWired(*c);
 		// The cached entry is the cached block's alone: another block of the surface leaves it.
 		kept = !rgfxCacheBlockLetGo(state.caches, key, offset, releasing, surface, &map, &wire,
-		                            blockWired);
+		                            blockWired, &carried);
 		if (wake)
 			wakeLocked();
 		IOLockUnlock(state.lock);
 	}
 	if (map)
 		static_cast<IOMemoryMap *>(map)->release();
+	letGoMemory(carried, true);
 	if (kept)
 		return;
 	// The references rgfxSurfaceLocksAttach took, out of every lock, the cache's first: IOSurface
@@ -998,6 +1091,18 @@ UInt64 rgfxSurfaceCacheNoRoom()
 	return n;
 }
 
+void rgfxSurfaceCacheCarries(UInt64 counts[kRgfxCarryOutcomes])
+{
+	for (uint32_t i = 0; i < kRgfxCarryOutcomes; i++)
+		counts[i] = 0;
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	IOLockLock(state.lock);
+	for (uint32_t i = 0; i < kRgfxCarryOutcomes; i++)
+		counts[i] = state.carries[i];
+	IOLockUnlock(state.lock);
+}
+
 UInt64 rgfxSurfaceCacheRetaken()
 {
 	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
@@ -1037,8 +1142,8 @@ void rgfxSurfaceCacheReleased(UInt64 offset, RgfxReleasedSurface *gone)
 	if (c != nullptr && c->releasing && c->unheld && c->retaken)
 		state.retaken++;
 	// One cached surface at most has the block: its offset is reused only past this release.
-	gone->cache = reinterpret_cast<void *>(static_cast<uintptr_t>(
-	    rgfxCacheReleased(state.caches, offset, &gone->map, &gone->wire, &gone->surface)));
+	gone->cache = reinterpret_cast<void *>(static_cast<uintptr_t>(rgfxCacheReleased(
+	    state.caches, offset, &gone->map, &gone->wire, &gone->surface, &gone->carried)));
 	if (gone->cache)
 		wakeLocked();
 	IOLockUnlock(state.lock);
@@ -1055,6 +1160,7 @@ void rgfxSurfaceCacheLetGo(const RgfxReleasedSurface &gone)
 	if (gone.surface)
 		static_cast<OSObject *>(gone.surface)->release();
 	letGoMemory(gone.wire, gone.wired);
+	letGoMemory(gone.carried, true);
 }
 
 OSObject *rgfxSurfaceCacheReleasingSurface(UInt64 offset, bool *written)

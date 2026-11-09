@@ -52,6 +52,7 @@
 #include <IOKit/pci/IOPCIDevice.h>
 
 #include "RgfxBlockTable.hpp"
+#include "RgfxDeferCarry.hpp"
 #include "RgfxDeviceName.hpp"
 #include "RgfxMemorySize.hpp"
 #include "RgfxUserClientABI.hpp"
@@ -159,6 +160,9 @@ UInt64 rgfxSurfaceCacheNoRoom();
 // How many releases posted unheld (RGFX_BLOCK_RELEASE_UNHELD) and answered OK had their surface
 // taken again by a process before the answer (rgfxCacheRetaken). Takes the locks' lock alone.
 UInt64 rgfxSurfaceCacheRetaken();
+// How the deferrals whose asks listed resident pages ended so far, each RgfxCarryOutcome's count
+// in `counts`.
+void rgfxSurfaceCacheCarries(UInt64 counts[kRgfxCarryOutcomes]);
 // The flags of the BLOCK_RELEASE of the cached block at `offset`, its surface `surface`
 // (rgfxSurfaceCacheReleasingSurface's), whose counts are read out of every lock and decided on
 // under the locks' lock (rgfxCacheReleaseFlags). Takes the locks' lock alone.
@@ -176,6 +180,8 @@ struct RgfxReleasedSurface {
 	void *surface;
 	void *wire;
 	bool wired;
+	// The wire of the pages the block's deferral carried, where it still held it.
+	void *carried;
 };
 // The BLOCK_RELEASE of the block at `offset` was answered: a cached surface releasing it is
 // cached no more and its locks go on, what it held in `*gone`, for the caller to let go with
@@ -214,9 +220,10 @@ struct RgfxSurfacePageCounts;
 // surface's read-only lock across it.
 RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface);
 // Whether `surface` reads fresh, to look at: its seed 0, its pages counted, none of them
-// resident, compressed or paged out (rgfxSurfaceHoldsOnlyResident), and its memory holding
-// `length` bytes. Racy: the deferral's own read is rgfxSurfaceLocksDefer's.
-bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length);
+// compressed or paged out, none resident or as many as `listed`, the pages the ask lists of them
+// (rgfxDeferRead, RgfxDeferCarry.hpp; 0 for none), and its memory holding `length` bytes. Racy:
+// the deferral's own read is rgfxSurfaceLocksDefer's.
+bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length, uint64_t listed);
 // What rgfxSurfaceLocksDefer found.
 enum RgfxDeferAnswer {
 	// No device cache, or no state for it: the block is neither deferred nor cached.
@@ -224,8 +231,9 @@ enum RgfxDeferAnswer {
 	// The cache made, the surface not fresh: the block's pages are named now, as any cached
 	// block's, and rgfxSurfaceCacheSettle says so.
 	kRgfxDeferStale,
-	// The cache made, the surface fresh: the host is asked to defer the block, and
-	// rgfxSurfaceCacheSettle gives its answer, locks waiting for it meanwhile.
+	// The cache made, the surface fresh, or fresh but for the resident pages it carries: the host
+	// is asked to defer the block, and rgfxSurfaceCacheSettle gives its answer, locks waiting for
+	// it meanwhile.
 	kRgfxDeferFresh,
 };
 // For the new deferred block at `offset` of surface `surface` (retained by its entry), IOSurfaceID
@@ -233,12 +241,22 @@ enum RgfxDeferAnswer {
 // makes the surface's device cache with the kext's control function, and records the block
 // cached and gating (RgfxSurfaceCaches.hpp), the block's first page mapped at `header`, which the
 // table keeps, its memory retained but not wired; then reads whether the surface is fresh, under
-// a read-only lock of it. `*cache` is the cache, retained, for the entry, where it answers other
-// than kRgfxDeferNoCache, which leaves `header` the caller's. Under no lock of the kext's.
+// a read-only lock of it. Where the ask listed the surface's `resident` pages (null for none) and
+// `task` maps the surface at `address`, a surface fresh but for those, proven
+// (RgfxDeferCarry.hpp), is fresh too: their wire, prepared with no fault under the read, is kept
+// by the entry, and the deferral's runs (rgfxCarryRuns) are in `runs`, `room` at most, their count
+// in `*runCount` (0 for a surface that carries none). `*cache` is the cache, retained, for the
+// entry, where it answers other than kRgfxDeferNoCache, which leaves `header` the caller's. Under
+// no lock of the kext's.
 RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
                                       uint32_t surfaceId, UInt64 offset, UInt64 size,
                                       UInt64 length, UInt32 context, IOMemoryMap *header,
-                                      void **cache);
+                                      task_t task, UInt64 address,
+                                      const RgfxSurfaceResident *resident, RgfxPageRun *runs,
+                                      UInt32 room, UInt32 *runCount, void **cache);
+// The host refused the deferral of the block of device cache `cache`: the wire of the pages it
+// carried goes, as nothing reads them (rgfxCacheRefusedCarried). Under no lock of the kext's.
+void rgfxSurfaceLocksRefusedCarry(void *cache);
 // The host answered the ask of the block of device cache `cache`: deferred where `deferred`,
 // else its pages are named, its surface's memory wired. Locks waiting for the answer go on.
 void rgfxSurfaceCacheSettle(void *cache, bool deferred);
@@ -438,7 +456,8 @@ public:
 	IOReturn acquireSurfaceBlock(RgfxAcceleratorUserClient *client, UInt32 context, task_t task,
 	                             UInt64 address, UInt64 length, UInt64 size, bool inPlace,
 	                             uint32_t surfaceId, bool cacheable,
-	                             const RgfxSurfacePagesLayout *layout, SurfaceBlock *block);
+	                             const RgfxSurfacePagesLayout *layout,
+	                             const RgfxSurfaceResident *resident, SurfaceBlock *block);
 	// A dormant block's surface asked it to go (RgfxAcceleratorLocks.cpp): the release thread
 	// lets it go (RgfxAcceleratorContexts.cpp). From any thread, under no lock of the kext's.
 	void wakeReleases();
@@ -617,10 +636,13 @@ private:
 	// device cache and reads the surface (rgfxSurfaceLocksDefer); fresh, asks the host to defer
 	// it, with the layout where the device answers which surfaces need a cache (askCache); not
 	// fresh, refused or with no cache, names its pages now, asking with the layout there, the
-	// entry keyed by them from then on. Whether the device took the block, and `*cached` where it
-	// is cached. Not under the contexts' lock.
+	// entry keyed by them from then on. A surface fresh but for the resident pages its asker in
+	// `task` at `address` listed (`resident`, RgfxDeferCarry.hpp) is deferred carrying them, where
+	// its read proves them. Whether the device took the block, and `*cached` where it is cached.
+	// Not under the contexts' lock.
 	bool deferSurfaceBlock(RgfxSurfaceEntry &e, UInt32 context, uint32_t surfaceId, UInt64 total,
-	                       const RgfxSurfacePagesLayout *layout, bool *cached);
+	                       const RgfxSurfacePagesLayout *layout, task_t task, UInt64 address,
+	                       const RgfxSurfaceResident *resident, bool *cached);
 	// Holds the dormant block of entry `e`, deferred or cached in place, again for the ask of
 	// IOSurfaceID `surfaceId`, its own surface, which found it: false, nothing changed, where its
 	// cache asked it to go. Under the contexts' lock.

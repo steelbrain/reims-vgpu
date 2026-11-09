@@ -45,6 +45,7 @@
 
 // The accelerator's user-client protocol, the kext's own header: its type, its selectors and
 // the kext's own feature bits.
+#include "../../kext/src/RgfxDeferCarry.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp"
 
 namespace {
@@ -304,28 +305,67 @@ bool rgfxKextSurfaceBlock(void *context, const void *plane, uint64_t length, uin
 	return true;
 }
 
+// The resident pages of the surface the process maps at `base`, `length` bytes, in the task's
+// pages, which are the kernel's: true where 1 to kRgfxCarryPagesMost are, listed in `resident`
+// (RgfxDeferCarry.hpp); false where none or more are, or the query fails. It stops at the first
+// page past those.
+bool rgfxResidentPagesAt(const void *base, uint64_t length, RgfxSurfaceResident *resident)
+{
+	const uint64_t page = vm_page_size;
+	const uint64_t pages = (length + page - 1) / page;
+	constexpr uint64_t kBatch = 1024;
+	int dispositions[kBatch];
+	*resident = {};
+	for (uint64_t at = 0; at < pages; at += kBatch) {
+		mach_vm_size_t count = std::min(kBatch, pages - at);
+		if (mach_vm_page_range_query(mach_task_self(),
+		                             reinterpret_cast<uintptr_t>(base) + at * page, count * page,
+		                             reinterpret_cast<mach_vm_address_t>(dispositions),
+		                             &count) != KERN_SUCCESS)
+			return false;
+		for (uint64_t i = 0; i < count; i++)
+			if ((dispositions[i] & VM_PAGE_QUERY_PAGE_PRESENT) != 0 &&
+			    !rgfxResidentAdd(*resident, (at + i) * page, page))
+				return false;
+	}
+	return resident->count != 0;
+}
+
 // The kext's shared blocks of surfaces in place, as RgfxRegion's surface pages source: the
 // block every process that holds the surface gets, found by the whole allocation it maps at
 // `base`, the device's GPU using those pages, and cached where the kext made it so (six inputs,
 // the surface's IOSurfaceID and whether it may be cached; a fifth output), the surface's layout
-// its struct input where given. Unsupported where the device lacks the feature or refused the
-// pages; no room where the kext had none, in the region (kIOReturnNoSpace) or its tables
-// (kIOReturnNoResources); refused for any other answer, among them a kext that takes fewer
-// inputs.
-RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, uint64_t length,
-                                             uint64_t size, uint32_t surfaceId, bool cacheable,
-                                             const RgfxSurfacePagesLayout *layout,
-                                             uint64_t *offset, uint64_t *serial, bool *fresh,
-                                             bool *cached)
+// its struct input where given, followed by the surface's resident pages where `resident` lists
+// them. Unsupported where the device lacks the feature or refused the pages; no room where the
+// kext had none, in the region (kIOReturnNoSpace) or its tables (kIOReturnNoResources); refused
+// for any other answer, among them a kext that takes fewer inputs.
+RgfxRegion::PagesAnswer rgfxKextSurfacePagesListing(void *context, const void *base,
+                                                    uint64_t length, uint64_t size,
+                                                    uint32_t surfaceId, bool cacheable,
+                                                    const RgfxSurfacePagesLayout *layout,
+                                                    const RgfxSurfaceResident *resident,
+                                                    uint64_t *offset, uint64_t *serial,
+                                                    bool *fresh, bool *cached)
 {
 	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
 	uint64_t in[6] = {reinterpret_cast<uintptr_t>(base), length, size, 1, surfaceId,
 	                  cacheable ? 1u : 0u};
 	uint64_t out[5] = {};
 	uint32_t outCount = 5;
-	kern_return_t kr = IOConnectCallMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 6, layout,
-	                                       layout != nullptr ? sizeof(*layout) : 0, out,
-	                                       &outCount, nullptr, nullptr);
+	uint8_t given[sizeof(RgfxSurfacePagesLayout) + sizeof(RgfxSurfaceResident)] = {};
+	size_t givenSize = 0;
+	if (layout != nullptr) {
+		memcpy(given, layout, sizeof(*layout));
+		givenSize = sizeof(*layout);
+		if (resident != nullptr) {
+			memcpy(given + sizeof(*layout), resident, sizeof(*resident));
+			givenSize += sizeof(*resident);
+		}
+	}
+	kern_return_t kr =
+	    IOConnectCallMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 6,
+	                        givenSize != 0 ? given : nullptr, givenSize, out, &outCount,
+	                        nullptr, nullptr);
 	if (kr == kIOReturnUnsupported)
 		return RgfxRegion::kPagesUnsupported;
 	if (kr == kIOReturnNoSpace || kr == kIOReturnNoResources)
@@ -342,6 +382,36 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, ui
 	*fresh = out[3] != 0;
 	*cached = out[4] != 0;
 	return RgfxRegion::kPagesGiven;
+}
+
+RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, uint64_t length,
+                                             uint64_t size, uint32_t surfaceId, bool cacheable,
+                                             const RgfxSurfacePagesLayout *layout,
+                                             uint64_t *offset, uint64_t *serial, bool *fresh,
+                                             bool *cached)
+{
+	return rgfxKextSurfacePagesListing(context, base, length, size, surfaceId, cacheable, layout,
+	                                   nullptr, offset, serial, fresh, cached);
+}
+
+// As rgfxKextSurfacePages, where a deferral may carry its surface's resident pages
+// (RGFX_FEATURE_SURFACE_DEFERRED_CARRY): a cacheable ask with its layout lists them, where 1 to
+// kRgfxCarryPagesMost are, and the kext defers the surface fresh but for them where it proves
+// them (RgfxDeferCarry.hpp). Measured, VTDecoderXPCService writes page 0 of each new decoder
+// output before its first decode, the rest not resident.
+RgfxRegion::PagesAnswer rgfxKextSurfacePagesCarrying(void *context, const void *base,
+                                                     uint64_t length, uint64_t size,
+                                                     uint32_t surfaceId, bool cacheable,
+                                                     const RgfxSurfacePagesLayout *layout,
+                                                     uint64_t *offset, uint64_t *serial,
+                                                     bool *fresh, bool *cached)
+{
+	RgfxSurfaceResident resident = {};
+	const bool listed =
+	    cacheable && layout != nullptr && rgfxResidentPagesAt(base, length, &resident);
+	return rgfxKextSurfacePagesListing(context, base, length, size, surfaceId, cacheable, layout,
+	                                   listed ? &resident : nullptr, offset, serial, fresh,
+	                                   cached);
 }
 
 // The region's pages block source (RgfxRegion::setPagesBlockSource): the kext's pages block of
@@ -765,8 +835,11 @@ RGFX_LOG_UNRECOGNIZED
 	if ((_caps.kextFeatures() & kRgfxKextFeatureWriteCombined) != 0)
 		_region->setWriteCombinedSource(&rgfxKextAllocWriteCombined);
 	_region->setSurfaceSource(&rgfxKextSurfaceBlock, &rgfxKextSurfaceRelease, connContext);
-	_region->setSurfacePagesSource(&rgfxKextSurfacePages, _caps.linearTextureAlignment(),
-	                               connContext);
+	// Its asks list their surfaces' few resident pages where a deferral may carry them.
+	_region->setSurfacePagesSource((_caps.features() & RGFX_FEATURE_SURFACE_DEFERRED_CARRY) != 0
+	                                   ? &rgfxKextSurfacePagesCarrying
+	                                   : &rgfxKextSurfacePages,
+	                               _caps.linearTextureAlignment(), connContext);
 	_region->setSurfaceWriteSource(&rgfxKextSurfaceWrites, &rgfxKextSurfaceRetire, connContext);
 	// No-copy buffers over the process's own pages, where the kext makes pages blocks and the
 	// host took the feature that maps them.

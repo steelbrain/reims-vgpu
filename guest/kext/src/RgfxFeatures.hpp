@@ -75,7 +75,11 @@
 //    kext asks the host, at a new cacheable block in place, whether its surface needs a device
 //    cache (RGFX_SURFACE_PAGES_ASK_CACHE, with the layout the bundle gives with its ask), and
 //    makes the block cached where the host answers RGFX_STATUS_CACHE, its cached blocks then kept
-//    as SURFACE_CACHE's are (RgfxSurfaceCaches.hpp).
+//    as SURFACE_CACHE's are (RgfxSurfaceCaches.hpp);
+//  - SURFACE_DEFERRED_CARRY (bit 32), meaningful only with SURFACE_DEFERRED: the bundle lists, at
+//    its ask of a cacheable block in place, the few resident pages of its surface it finds in its
+//    mapping, and the kext defers a surface fresh but for those, carrying them in the deferral's
+//    runs once its read of the surface proves them (RgfxDeferCarry.hpp).
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -106,7 +110,7 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_MANAGED_BUFFER_SLABS | RGFX_FEATURE_SMALL_ID_CHUNKS | RGFX_FEATURE_DISPLAY_COLOR |
     RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES | RGFX_FEATURE_OPENCL_MODE |
     RGFX_FEATURE_PRIVATE_RENDER_STATE | RGFX_FEATURE_SURFACE_CACHE_REFUSED |
-    RGFX_FEATURE_SURFACE_DEFERRED_ASK;
+    RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY;
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
