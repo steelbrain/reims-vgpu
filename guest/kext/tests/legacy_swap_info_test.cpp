@@ -174,7 +174,7 @@ void frameInfo()
 		Clocks k{ticks};
 		RgfxFrameInfoClock clock;
 		rgfxReadClocks([&] { return k.absolute(); }, [&] { return k.continuous(); }, clock);
-		check(clock.lead() == 40 && clock.time(1000) == 1040,
+		check(clock.lead() == 40 && clock.time(1000, 0) == 1040,
 		      "reads that agree give the lead exactly", "frameInfo");
 	}
 	{
@@ -186,31 +186,43 @@ void frameInfo()
 		check(k.continuousReads == kRgfxClockReads && clock.lead() == 39,
 		      "none agree: every try made, the lead at least the continuous less the later read",
 		      "frameInfo");
-		check(clock.time(1000) == 1039, "a time short by the tick", "frameInfo");
+		check(clock.time(1000, 0) == 1039, "a time short by the tick", "frameInfo");
 		// A later reading that agrees: the lead exact, the time with it.
 		Clocks again{};
 		again.now = 9000;
 		rgfxReadClocks([&] { return again.absolute(); }, [&] { return again.continuous(); },
 		               clock);
-		check(clock.lead() == 40 && clock.time(1000) == 1040, "the lead exact once read so",
+		check(clock.lead() == 40 && clock.time(1000, 0) == 1040, "the lead exact once read so",
 		      "frameInfo");
 		// A reading short again leaves the lead: it never shrinks.
 		clock.read(20000, 20039, 20001);
 		check(clock.lead() == 40, "a lower bound under the lead leaves it", "frameInfo");
 		// The system slept 500 ticks: the lead grows with the next reading.
 		clock.read(30000, 30540, 30000);
-		check(clock.lead() == 540 && clock.time(2000) == 2540, "a longer lead after a sleep",
+		check(clock.lead() == 540 && clock.time(2000, 0) == 2540, "a longer lead after a sleep",
 		      "frameInfo");
 	}
 	{
-		// Times never go back: one shown before the last given is given as that one, and a swap
-		// that showed nothing reads 0 and changes nothing.
+		// Each time is a refresh, 400 ticks, after the one given before: a swap whose refresh is
+		// not after the last one's is given the refresh after that, up to two periods past its
+		// own, then the last one's; a swap that showed nothing reads 0 and changes nothing.
 		RgfxFrameInfoClock clock;
 		clock.read(5000, 5040, 5000);
-		check(clock.time(1001) == 1041, "the first time", "frameInfo");
-		check(clock.time(1000) == 1041, "a time before it given as it", "frameInfo");
-		check(clock.time(0) == 0, "nothing shown, 0", "frameInfo");
-		check(clock.time(1002) == 1042, "a later one as it is", "frameInfo");
+		check(clock.time(1001, 400) == 1041, "the first time", "frameInfo");
+		check(clock.time(1000, 400) == 1441, "one before it: the next refresh", "frameInfo");
+		check(clock.time(0, 400) == 0, "nothing shown, 0", "frameInfo");
+		check(clock.time(1401, 400) == 1841, "the last one's refresh: the next", "frameInfo");
+		check(clock.time(1402, 400) == 2241, "two periods past its own at most", "frameInfo");
+		check(clock.time(1403, 400) == 2241, "past that, the last time", "frameInfo");
+		check(clock.time(2201, 400) == 2641, "its own refresh, the last one's: the next",
+		      "frameInfo");
+		check(clock.time(3001, 400) == 3041, "a later refresh as it is", "frameInfo");
+		check(clock.time(3441, 400) == 3481, "a period on, as it is", "frameInfo");
+		// No period (no refresh seen): never before the last one.
+		RgfxFrameInfoClock still;
+		still.read(5000, 5040, 5000);
+		check(still.time(1001, 0) == 1041 && still.time(1000, 0) == 1041,
+		      "no period: a time before the last given as it", "frameInfo");
 	}
 
 	// QuartzCore's mask for both tags: bits 0 and 1, the presentation time, then its difference.
@@ -231,10 +243,12 @@ void frameInfo()
 // read with 0 to 2 ticks of mach time passing at each read, so many readings agree in none of
 // their tries; midway the system sleeps for a second, which grows the continuous clock's lead.
 // QuartzCore takes each time back by the exact lead (mach_get_times): what it traces never goes
-// back, is never after the shown refresh nor more than 2 ticks before it, and is the shown refresh
-// exactly once a reading gave the lead exactly. The run also gives each swap the time its own
-// last try's reading gave, as the display did before the clock kept its lead: that time goes back
-// in the run, as it did on Ambrosia's boots.
+// back, is never more than 2 ticks before the shown refresh nor more than two periods after it,
+// and is never before it once a reading gave the lead exactly; each is a period after the one
+// before, but where swaps come faster than the refreshes and the one before is two periods ahead
+// already, which gives its time again. The run also gives each swap the time its own last try's
+// reading gave, as the display did before the clock kept its lead: that time goes back in the
+// run, as it did on Ambrosia's boots.
 void longRun()
 {
 	uint64_t x = 0x2545f4914f6cdd1dull;
@@ -252,6 +266,7 @@ void longRun()
 	uint64_t mach = 0;                    // the absolute clock's ticks, as the reads advance it
 	uint64_t lastAfter = 0, lastC = 0;    // the last try's later absolute read and continuous read
 	uint64_t oldTraced = 0, oldBack = 0;  // the time from each swap's own last try
+	uint64_t again = 0;                   // swaps given the time before theirs
 	for (uint64_t n = 1; n <= 100000; n++) {
 		if (n == 50000)
 			lead += 24000000; // a second asleep: the absolute clock stops, the continuous one not
@@ -278,16 +293,25 @@ void longRun()
 				return t;
 			};
 			rgfxReadClocks(absolute, continuous, clock);
-			const uint64_t time = clock.time(shown);
+			const uint64_t periodTicks = toTicks(vblank.period());
+			const uint64_t time = clock.time(shown, periodTicks);
 			const uint64_t seen = time - lead;
 			check(clock.lead() <= static_cast<int64_t>(lead), "the lead never read past itself",
 			      "longRun");
 			check(swaps == 0 || seen >= traced, "a traced time never goes back", "longRun");
-			check(seen <= shown && seen + 2 >= shown,
-			      "a traced time is its refresh's, or at most 2 ticks before", "longRun");
+			check(seen + 2 >= shown &&
+			          seen <= shown + RgfxFrameInfoClock::kAheadPeriods * periodTicks,
+			      "a traced time is at most 2 ticks before its refresh, two periods after",
+			      "longRun");
+			check(swaps == 0 || seen - traced >= periodTicks ||
+			          (seen == traced && traced + periodTicks + 2 >
+			                                 shown + RgfxFrameInfoClock::kAheadPeriods * periodTicks),
+			      "a period after the one before, or its time where that is two periods ahead",
+			      "longRun");
 			if (clock.lead() == static_cast<int64_t>(lead))
-				check(seen == shown, "the refresh's exactly once the lead was read exactly",
+				check(seen >= shown, "never before its refresh once the lead was read exactly",
 				      "longRun");
+			again += swaps && seen == traced ? 1 : 0;
 			const uint64_t oldSeen = shown + (lastC - lastAfter) - lead;
 			oldBack += swaps && oldSeen < oldTraced ? 1 : 0;
 			oldTraced = oldSeen;
@@ -298,7 +322,74 @@ void longRun()
 		}
 	}
 	check(shared > 1000, "the run has swaps sharing a refresh", "longRun");
+	check(again > 0, "the run has swaps faster than the refreshes", "longRun");
 	check(oldBack > 0, "each swap's own last reading gives times that go back", "longRun");
+}
+
+// A swap a refresh, each answered at, or just before or after, its refresh's VBLANK is taken (a
+// host with no window answers as it shows the surface; the VBLANK reaches the guest 0.1 to 3.1 ms
+// after its refresh, the answer between the refresh and a millisecond past the VBLANK's receipt).
+// An answer taken before its refresh's VBLANK maps to the refresh before (RgfxVblankClock::shownAt).
+// Each swap's time is a period after the one before, and its own refresh's: no earlier than the
+// refresh, no later than the latest the VBLANKs' delivery maps it to. The rule before,
+// each time never before the one given before (a period of 0), gives two swaps a refresh apart
+// one time.
+void refreshEdges()
+{
+	uint64_t x = 0x9e3779b97f4a7c15ull;
+	auto next = [&x](uint64_t n) {
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		return x % n;
+	};
+	auto toTicks = [](uint64_t ns) { return ns * 3 / 125; };
+	const uint64_t periodNs = 16666667, lead = 1000;
+	RgfxVblankClock vblank;
+	RgfxFrameInfoClock clock, before;
+	clock.read(0, lead, 0);
+	before.read(0, lead, 0);
+	uint64_t last = 0, lastBefore = 0, early = 0, onTime = 0, pushed = 0, shared = 0;
+	for (uint64_t n = 1; n <= 20000; n++) {
+		const uint64_t hostNs = 5000000000ull + n * periodNs;
+		const int64_t delay = 100000 + static_cast<int64_t>(next(3000000));
+		const uint64_t receiptNs = hostNs + static_cast<uint64_t>(delay);
+		// Where the answer comes, from the VBLANK's receipt: at it, a nanosecond or a microsecond
+		// to either side, half a millisecond or a millisecond after, or a microsecond after the
+		// refresh itself, or midway between the refresh and the receipt.
+		const int64_t edges[] = {0, -1, 1, -1000, 1000, 500000, 1000000, 1000 - delay, -delay / 2};
+		const int64_t at = edges[next(sizeof(edges) / sizeof(edges[0]))];
+		const uint64_t answerNs = receiptNs + static_cast<uint64_t>(at);
+		uint64_t shownNs = 0;
+		if (at < 0) {
+			shownNs = vblank.shownAt(answerNs);
+			vblank.vblank(n, hostNs, receiptNs);
+			early++;
+		} else {
+			vblank.vblank(n, hostNs, receiptNs);
+			shownNs = vblank.shownAt(answerNs);
+			onTime++;
+		}
+		const uint64_t periodTicks = toTicks(vblank.period());
+		const uint64_t shown = toTicks(shownNs);
+		const uint64_t time = clock.time(shown, periodTicks) - lead;
+		const uint64_t old = before.time(shown, 0) - lead;
+		if (n > 1) {
+			check(time - last >= periodTicks, "a period after the one before", "refreshEdges");
+			shared += old == lastBefore ? 1 : 0;
+		}
+		// The guest's clock is the host's here: a refresh maps to its time plus the least delivery
+		// the VBLANKs showed, 0.1 to 3.1 ms on, a period before the next.
+		check(time >= toTicks(hostNs) && time <= toTicks(hostNs + 3100000) + 2,
+		      "on its own refresh", "refreshEdges");
+		pushed += time != shown ? 1 : 0;
+		last = time;
+		lastBefore = old;
+	}
+	check(early > 1000 && onTime > 1000, "answers on both sides of the VBLANKs", "refreshEdges");
+	check(pushed > 1000, "answers before their VBLANK given the refresh after the last",
+	      "refreshEdges");
+	check(shared > 0, "the rule before gives two swaps a refresh apart one time", "refreshEdges");
 }
 
 // What IOMobileFramebuffer.framework makes of an entry of the client's shared data queue
@@ -424,7 +515,10 @@ void imports()
 	      "supported_frame_info answers the tags", "imports");
 	check(source.find("rgfxReadClocks([] { return mach_absolute_time(); }, [] { return "
 	                  "mach_continuous_time(); },") != std::string::npos &&
-	          source.find("mobilePresentedAt = mobileFrameClock.time(shown);") != std::string::npos,
+	          source.find("mobilePresentedAt = mobileFrameClock.time(shown, period);") !=
+	              std::string::npos &&
+	          source.find("nanoseconds_to_absolutetime(self->vblankClock.period(), &period);") !=
+	              std::string::npos,
 	      "the presentation time goes in mach_continuous_time's clock by the display's frame clock",
 	      "imports");
 }
@@ -438,6 +532,7 @@ int main()
 	args();
 	frameInfo();
 	longRun();
+	refreshEdges();
 	queueRecord();
 	kept();
 	imports();

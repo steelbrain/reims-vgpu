@@ -167,7 +167,7 @@ inline uint64_t rgfxFrameInfoTime(uint64_t shown, int64_t lead)
 }
 
 // The presentation times a display's frame info carries, in mach_continuous_time's clock, as a
-// Mac's are: never before the one given before. QuartzCore takes each back into
+// Mac's are: each a refresh after the one given before. QuartzCore takes each back into
 // mach_absolute_time's by the continuous clock's lead, which it reads with mach_get_times (its
 // frame_info_callback, read from 27.0.1's), so a time given here reaches its kdebug trace
 // (0x31ca002c) and its presentation timing as the shown refresh plus the error of the lead used
@@ -182,11 +182,22 @@ inline uint64_t rgfxFrameInfoTime(uint64_t shown, int64_t lead)
 // (Ambrosia's g147 boots of 14.6.1, 15.6.1 and 26.6.2: 2 to 5 of 180 swaps in 3 s). The lead never
 // shrinks, as the system never gives back time it slept, so the clock keeps the largest lower bound
 // it has read: exact from the first reading whose continuous read came in the later absolute
-// read's tick, and never past the lead. And a time before the one given before is given as that
-// one, so two swaps shown in one refresh get one time.
+// read's tick, and never past the lead.
+//
+// A display shows one frame a refresh, so each swap's time is a refresh after the one given
+// before. The refresh an answer maps to (RgfxVblankClock::shownAt) is the last VBLANK's taken, so
+// an answer taken before its own refresh's VBLANK maps to the refresh before it, which the swap
+// before may have been given; given that refresh's time, two swaps a refresh apart got one time
+// (Ambrosia's g147 and g148 boots: 6 to 18 of 180 swaps in 3 s, one frame apart in wall time). A
+// swap whose refresh is not after the last one given is given the refresh after that one, a
+// period on, where that lies at most kAheadPeriods past its own; past that (swaps coming faster
+// than the refreshes), the time given before, so their times do not run ahead of the refreshes.
 class RgfxFrameInfoClock
 {
 public:
+	// How many periods past its own refresh a swap's time may lie.
+	static constexpr uint64_t kAheadPeriods = 2;
+
 	// A reading of the clocks: the absolute one, then the continuous one, then the absolute one
 	// again.
 	void read(uint64_t before, uint64_t continuous, uint64_t after)
@@ -198,15 +209,20 @@ public:
 		have_ = true;
 	}
 
-	// The time of a swap shown at `shown`, mach_absolute_time's, in the continuous clock, never
-	// before the time given before; 0 for a swap that showed nothing, which changes nothing.
-	uint64_t time(uint64_t shown)
+	// The time of a swap shown at `shown`, mach_absolute_time's, in the continuous clock, on a
+	// display whose refreshes are `period` ticks apart: a period after the time given before at
+	// least, where that lies at most kAheadPeriods past `shown`'s, else the time given before; 0
+	// for a swap that showed nothing, which changes nothing.
+	uint64_t time(uint64_t shown, uint64_t period)
 	{
 		if (!shown)
 			return 0;
 		uint64_t t = rgfxFrameInfoTime(shown, lead_);
-		if (t < given_)
-			t = given_;
+		if (haveGiven_ && t < given_ + period) {
+			const uint64_t next = given_ + period;
+			t = next - t <= kAheadPeriods * period ? next : given_;
+		}
+		haveGiven_ = true;
 		given_ = t;
 		return t;
 	}
@@ -217,6 +233,7 @@ public:
 private:
 	int64_t lead_ = 0;
 	bool have_ = false;
+	bool haveGiven_ = false;
 	uint64_t given_ = 0;
 };
 

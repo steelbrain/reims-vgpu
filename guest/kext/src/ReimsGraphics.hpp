@@ -574,11 +574,13 @@ private:
 	// Whether start_hardware joined power management, which stop_hardware_gated leaves.
 	bool mobilePowerJoined;
 	// The latest present's seqno, written before the host can answer it; the refresh its answer
-	// came in (mach_absolute_time's, 0 until it comes), which the swap's completion takes; and that
-	// swap's presentation time as its frame info carries it (mach_continuous_time's, 0 where it
-	// showed nothing), which mobileFrameClock gives (RgfxLegacySwapInfo.hpp), in the class's gate.
+	// came in (mach_absolute_time's, 0 until it comes) and the display's period then (its ticks),
+	// which the swap's completion takes; and that swap's presentation time as its frame info
+	// carries it (mach_continuous_time's, 0 where it showed nothing), which mobileFrameClock gives
+	// (RgfxLegacySwapInfo.hpp), in the class's gate.
 	UInt64 mobilePresentSeqno;
 	UInt64 mobileShownAt;
+	UInt64 mobileShownPeriod;
 	UInt64 mobilePresentedAt;
 	RgfxFrameInfoClock mobileFrameClock;
 	UInt32 mobileTransaction;

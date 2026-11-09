@@ -176,6 +176,7 @@ bool ReimsGraphics::startMobile()
 	mobileSwapRate.clear();
 	mobileSecond = 0;
 	mobileShownAt = 0;
+	mobileShownPeriod = 0;
 	mobilePresentedAt = 0;
 	mobileFrameClock = RgfxFrameInfoClock();
 	mobileSwapInfoKept.head = 0;
@@ -528,7 +529,11 @@ void ReimsGraphics::mobilePresented(OSObject *client, UInt64 seqno, UInt32 statu
 		return;
 	if (logged(kPresented))
 		IOLog("ReimsGraphics: present %llu shown, status %u at %llu\n", seqno, status, time);
-	// The refresh it showed in, for the swap's frame info (completeMobileSwap).
+	// The refresh it showed in, and the display's period, for the swap's frame info
+	// (completeMobileSwap), read where the VBLANKs set it.
+	UInt64 period = 0;
+	nanoseconds_to_absolutetime(self->vblankClock.period(), &period);
+	__atomic_store_n(&self->mobileShownPeriod, period, __ATOMIC_RELAXED);
 	__atomic_store_n(&self->mobileShownAt, time, __ATOMIC_RELEASE);
 	// The swap it shows completes in the class's gate (completeMobileSwap).
 	if (IOInterruptEventSource *answer = __atomic_load_n(&self->mobileSwapAnswer, __ATOMIC_ACQUIRE))
@@ -633,13 +638,14 @@ void ReimsGraphics::completeMobileSwap()
 	RgfxLegacySwapQueue queue(this, *mobileSwapLayout);
 	if (queue.current() != swap)
 		return;
-	// The swap's presentation time, the refresh the host answered in, in mach_continuous_time's
-	// clock, which its frame info carries (notify_swap_done_gated, which the class's
-	// swap_complete_gated calls).
+	// The swap's presentation time, the refresh the host answered in, a refresh after the swap's
+	// before, in mach_continuous_time's clock, which its frame info carries
+	// (notify_swap_done_gated, which the class's swap_complete_gated calls).
 	const UInt64 shown = __atomic_exchange_n(&mobileShownAt, 0, __ATOMIC_ACQ_REL);
+	const UInt64 period = __atomic_load_n(&mobileShownPeriod, __ATOMIC_RELAXED);
 	rgfxReadClocks([] { return mach_absolute_time(); }, [] { return mach_continuous_time(); },
 	               mobileFrameClock);
-	mobilePresentedAt = mobileFrameClock.time(shown);
+	mobilePresentedAt = mobileFrameClock.time(shown, period);
 	rgfxLegacySwapComplete(this);
 	const UInt64 now = mach_absolute_time();
 	noteMobileSwapRate(now);
