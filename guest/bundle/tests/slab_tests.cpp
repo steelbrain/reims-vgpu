@@ -882,14 +882,16 @@ bool endsWith(const std::vector<std::string> &log, const std::vector<std::string
 	return log.size() >= want.size() && std::equal(want.begin(), want.end(), log.end() - want.size());
 }
 
-// The process's own pages as the first source: a heaped class's slab is one 2 MiB superpage
-// wired into a pages block of the kext's, made one HEAP_OVER_PAGES its buffers are placed in
-// (BUFFER_AT_OFFSET, and BUFFER_MANAGED_AT_OFFSET where the device took MANAGED_AT_OFFSET). A
-// dedicated Shared slab larger than a superpage is superpages with no heap, its buffer a
-// BUFFER_OVER_PAGES over the block's view; a larger Managed one, a kernel with no superpage to
-// give (no contiguous 2 MiB, or the wire budget spent), and a kext that gives no block (the
-// superpages given back) are the region's slabs, as are Managed buffers without
-// MANAGED_AT_OFFSET. A slab's heap is destroyed, then its block released, then its pages go.
+// The process's own pages as the first source: a heaped class's slab is the 2 MiB superpage the
+// slabs' thread took ahead (prepare, a piece of its step), wired into a pages block of the kext's,
+// made one HEAP_OVER_PAGES its buffers are placed in (BUFFER_AT_OFFSET, and
+// BUFFER_MANAGED_AT_OFFSET where the device took MANAGED_AT_OFFSET); the thread takes the next
+// after each slab of the source, and a take asks the kernel for none. A dedicated Shared slab
+// larger than a superpage is plain pages with no heap, its buffer a BUFFER_OVER_PAGES over the
+// block's view. A larger Managed one, a take with no superpage held and no plain pages to be had,
+// and a kext that gives no block (the superpage given back) are the region's slabs, as are
+// Managed buffers without MANAGED_AT_OFFSET. A slab's heap is destroyed, then its block released,
+// then its pages go.
 void test_pages_slab_source()
 {
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
@@ -904,10 +906,11 @@ void test_pages_slab_source()
 	region.setBlockSource(&PagesKext::alloc, &PagesKext::release, &kext);
 	region.setPagesBlockSource(&PagesKext::pagesBlock, &kext);
 	PagesVm vm(&log);
-	vm.superpagesLeft = 5;
+	vm.superpagesLeft = 3;
 	RgfxPagesMemory calls;
 	calls.context = &vm;
 	calls.superpages = &PagesVm::superpages;
+	calls.pages = &PagesVm::pages;
 	calls.unmap = &PagesVm::unmap;
 	RgfxRegionSlabSource regionSource(region, ser);
 	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30);
@@ -919,9 +922,12 @@ void test_pages_slab_source()
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 
+	// The thread's first piece of work: a superpage ahead, which the first take uses.
+	CHECK(slabs.step() && pages.holdsSuperpage());
+	CHECK(log == std::vector<std::string>({"superpages 2097152"}) && kext.pages.empty());
 	RgfxSlabs::Range a, b;
 	CHECK(slabs.take(256, kShared, 0, &a) && a.offset == 0 && a.size == 0x1000);
-	CHECK(log == std::vector<std::string>({"superpages 2097152"}) && kext.pages.size() == 1);
+	CHECK(log.size() == 1 && kext.pages.size() == 1 && !pages.holdsSuperpage());
 	CHECK(kext.lastAddress == a.contents && kext.lastLength == 2 * kMiB && kext.lastWritable);
 	const uint64_t block = *kext.pages.begin();
 	auto heap = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
@@ -936,14 +942,18 @@ void test_pages_slab_source()
 	CHECK(at.heap_obj_id == heap.obj_id && at.offset == 0x1000 && at.length == 0x2800);
 	CHECK(made.objId == at.obj_id && made.gpuAddress == heap.gpu_address + 0x1000);
 	CHECK(!made.ownsAddress);
-	// A dedicated buffer of up to a superpage takes one of its own, with its heap; a larger one
-	// superpages with no heap, which are more than one run, its buffer over the block's view.
+	// The next superpage, taken ahead after that slab; one held, nothing more to do.
+	CHECK(slabs.step() && log == std::vector<std::string>({"superpages 2097152",
+	                                                       "superpages 2097152"}));
+	CHECK(!slabs.step() && log.size() == 2 && pages.holdsSuperpage());
+	// A dedicated buffer of up to a superpage takes the one held, with its heap; a larger one
+	// plain pages with no heap, the kernel asked for no superpage, its buffer over the block's view.
 	RgfxSlabs::Range one, big;
 	CHECK(slabs.take(3 * kMiB / 2, kShared, 0, &one) && one.size == 3 * kMiB / 2);
-	CHECK(endsWith(log, {"superpages 2097152"}) && kext.pages.size() == 2);
+	CHECK(log.size() == 2 && kext.pages.size() == 2 && !pages.holdsSuperpage());
 	CHECK(expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES).size_bytes == 2 * kMiB);
 	CHECK(slabs.take(3 * kMiB, kShared, 0, &big) && big.size == 3 * kMiB && big.offset == 0);
-	CHECK(endsWith(log, {"superpages 4194304"}) && kext.pages.size() == 3);
+	CHECK(log.size() == 3 && endsWith(log, {"pages 4194304"}) && kext.pages.size() == 3);
 	CHECK(kext.lastAddress == big.contents && kext.lastLength == 4 * kMiB);
 	CHECK(!ring.next(&h, &bytes));
 	CHECK(slabs.makeBuffer(big, 3 * kMiB, kShared, &made));
@@ -959,44 +969,57 @@ void test_pages_slab_source()
 	CHECK(log.size() == asked);
 	CHECK(expectMessage<RgfxBufferOverHostMemory>(ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY).length ==
 	      0x1000);
-	// The last superpage, then none: the region's heaped slab.
-	RgfxSlabs::Range c, d;
-	CHECK(slabs.take(0x1000, kSharedUntracked, 0, &c) && endsWith(log, {"superpages 2097152"}));
-	CHECK(slabs.take(0x1000, kShared | 0x1, 0, &d));
-	CHECK(endsWith(log, {"superpages 2097152 refused"}));
+	// The last superpage, taken ahead, then none: the thread's ask refused, and the next take
+	// plain pages at once; with no plain pages either, the region's heaped slab. (The thread's
+	// work runs until it has none: the region's slab's bytes are zeroed first.)
+	RgfxSlabs::Range c, d, d2;
+	while (slabs.step()) {
+	}
+	CHECK(endsWith(log, {"superpages 2097152"}) && pages.holdsSuperpage());
+	CHECK(slabs.take(0x1000, kSharedUntracked, 0, &c) && log.size() == asked + 1);
+	CHECK(!slabs.step() && endsWith(log, {"superpages 2097152 refused"}));
+	CHECK(slabs.take(0x1000, kShared | 0x1, 0, &d) && endsWith(log, {"pages 2097152"}));
+	vm.refusePlain = true;
+	CHECK(slabs.take(0x1000, kShared | 0x2, 0, &d2) && endsWith(log, {"pages 2097152 refused"}));
+	vm.refusePlain = false;
 	while (ring.next(&h, &bytes)) {
 	}
 	CHECK(h.type == RGFX_CMD_HEAP_OVER_HOST_MEMORY);
-	CHECK(slabs.stats().slabs == 6 && slabs.stats().firstSlabs == 4);
-	// Past the wire budget: the region's slab.
+	CHECK(slabs.stats().slabs == 7 && slabs.stats().firstSlabs == 5);
+	// Past the wire budget: the thread's ask refused, and the take plain pages.
+	vm.superpagesLeft = 1;
 	vm.budgetSpent = true;
 	RgfxSlabs::Range e;
-	CHECK(slabs.take(0x1000, kSharedUntracked | 0x1, 0, &e));
-	CHECK(endsWith(log, {"superpages 2097152 refused"}) && slabs.stats().firstSlabs == 4);
+	while (slabs.step()) {
+	}
+	CHECK(endsWith(log, {"superpages 2097152 refused"}) && !pages.holdsSuperpage());
+	CHECK(slabs.take(0x1000, kSharedUntracked | 0x1, 0, &e) && endsWith(log, {"pages 2097152"}));
 	vm.budgetSpent = false;
-	// No block from the kext: the superpage goes back, and the region's slab.
-	slabs.give(c);
-	CHECK(slabs.reclaim());
+	// No block from the kext: the superpage held goes back, and the region's slab.
+	while (slabs.step()) {
+	}
+	CHECK(endsWith(log, {"superpages 2097152"}) && pages.holdsSuperpage());
 	kext.refusePages = true;
 	log.clear();
 	RgfxSlabs::Range f;
 	CHECK(slabs.take(0x1000, kSharedUntracked | 0x2, 0, &f));
-	CHECK(log == std::vector<std::string>({"superpages 2097152", "unmap 2097152"}));
+	CHECK(log == std::vector<std::string>({"unmap 2097152"}) && !pages.holdsSuperpage());
+	CHECK(vm.held.size() == 6 && slabs.stats().firstSlabs == 6);
 	kext.refusePages = false;
 	while (ring.next(&h, &bytes)) {
 	}
 	// Every slab let go: each heap destroyed, its pages block released, then its pages.
-	for (RgfxSlabs::Range *r : {&a, &b, &one, &big, &m, &d, &e, &f})
+	for (RgfxSlabs::Range *r : {&a, &b, &one, &big, &m, &c, &d, &d2, &e, &f})
 		slabs.give(*r);
 	log.clear();
 	CHECK(slabs.reclaim() && slabs.stats().slabs == 0 && kext.pages.empty() && vm.held.empty());
-	CHECK(log.size() == 6 && std::count(log.begin(), log.end(), "unmap 4194304") == 1);
+	CHECK(log.size() == 12 && std::count(log.begin(), log.end(), "unmap 4194304") == 1);
 	for (size_t i = 0; i < log.size(); i += 2)
 		CHECK(log[i] == "release pages" && log[i + 1].rfind("unmap ", 0) == 0);
 	int destroys = 0;
 	while (ring.next(&h, &bytes))
 		destroys += h.type == RGFX_CMD_OBJECT_DESTROY;
-	CHECK(destroys == 5); // every slab's heap: none for the Managed plain block or the large one
+	CHECK(destroys == 7); // every slab's heap: none for the Managed plain block or the large one
 
 	// With MANAGED_AT_OFFSET, a Managed slab is a superpage too, its buffers' CPU copies placed
 	// in its heap.
@@ -1007,14 +1030,15 @@ void test_pages_slab_source()
 	RgfxSlabs both(managedRegion);
 	both.setFirst(&managed);
 	RgfxSlabs::Range g;
-	CHECK(both.take(0x1000, kManaged, 0, &g) && endsWith(log, {"superpages 2097152"}));
+	CHECK(both.step() && endsWith(log, {"superpages 2097152"}));
+	CHECK(both.take(0x1000, kManaged, 0, &g) && !managed.holdsSuperpage());
 	auto mheap = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
 	CHECK(mheap.options == kShared && mheap.size_bytes == 2 * kMiB);
 	CHECK(both.makeBuffer(g, 0x800, kManaged, &made));
 	auto mat = expectMessage<RgfxBufferManagedAtOffset>(ring, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET);
 	CHECK(mat.heap_obj_id == mheap.obj_id && mat.offset == 0 && mat.length == 0x800);
 	CHECK(made.ownsAddress && made.gpuAddress == mat.gpu_address);
-	// A Managed buffer past a superpage: the region's heaped slab, its superpages never asked.
+	// A Managed buffer past a superpage: the region's heaped slab, the kernel never asked.
 	const size_t before = log.size();
 	RgfxSlabs::Range bigManaged;
 	CHECK(both.take(3 * kMiB, kManaged, 0, &bigManaged) && log.size() == before);
@@ -1025,12 +1049,13 @@ void test_pages_slab_source()
 	CHECK(both.reclaim() && kext.pages.empty() && vm.held.empty());
 }
 
-// Where the kernel has no superpage left (it runs out minutes after a boot), the pages source
-// takes plain pages: a heaped class's 2 MiB slab is a pages block of them, one HEAP_OVER_PAGES its
-// buffers are placed in, as over a superpage (the host makes the heap over the block's view); a
-// dedicated Shared slab larger than 2 MiB is plain pages too, its buffer a BUFFER_OVER_PAGES over
-// the view. Only where the kernel gives neither is the slab the region's. Plain pages go back as
-// superpages do, after the block's release.
+// Where the kernel has no superpage left (it runs out minutes after a boot), the slabs' thread's
+// ask is refused, and the pages source takes plain pages: a heaped class's 2 MiB slab is a pages
+// block of them, one HEAP_OVER_PAGES its buffers are placed in, as over a superpage (the host
+// makes the heap over the block's view); a dedicated Shared slab larger than 2 MiB is plain pages,
+// as at any time, its buffer a BUFFER_OVER_PAGES over the view. Only where the kernel gives
+// neither is the slab the region's. Plain pages go back as superpages do, after the block's
+// release.
 void test_pages_slab_source_plain_pages()
 {
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
@@ -1059,8 +1084,10 @@ void test_pages_slab_source_plain_pages()
 	std::vector<uint8_t> bytes;
 
 	RgfxSlabs::Range a, b;
+	CHECK(!slabs.step() && log == std::vector<std::string>({"superpages 2097152 refused"}));
+	log.clear();
 	CHECK(slabs.take(256, kShared, 0, &a) && a.offset == 0 && a.size == 0x1000);
-	CHECK(log == std::vector<std::string>({"superpages 2097152 refused", "pages 2097152"}));
+	CHECK(log == std::vector<std::string>({"pages 2097152"}));
 	CHECK(kext.pages.size() == 1 && kext.lastAddress == a.contents);
 	CHECK(kext.lastLength == 2 * kMiB && kext.lastWritable);
 	auto heap = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
@@ -1073,7 +1100,7 @@ void test_pages_slab_source_plain_pages()
 	// A dedicated Shared buffer past 2 MiB: plain pages with no heap, its buffer over the view.
 	RgfxSlabs::Range big;
 	CHECK(slabs.take(3 * kMiB, kShared, 0, &big) && big.size == 3 * kMiB);
-	CHECK(endsWith(log, {"superpages 4194304 refused", "pages 4194304"}));
+	CHECK(log == std::vector<std::string>({"pages 2097152", "pages 4194304"}));
 	CHECK(kext.pages.size() == 2 && kext.lastAddress == big.contents);
 	CHECK(!ring.next(&h, &bytes));
 	CHECK(slabs.makeBuffer(big, 3 * kMiB, kShared, &made));
@@ -1084,7 +1111,7 @@ void test_pages_slab_source_plain_pages()
 	vm.refusePlain = true;
 	RgfxSlabs::Range c;
 	CHECK(slabs.take(0x1000, kSharedUntracked, 0, &c));
-	CHECK(endsWith(log, {"superpages 2097152 refused", "pages 2097152 refused"}));
+	CHECK(endsWith(log, {"pages 4194304", "pages 2097152 refused"}));
 	CHECK(expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY).size_bytes >=
 	      0x1000);
 	vm.refusePlain = false;
@@ -1268,67 +1295,13 @@ void test_superpages_one_call_each()
 	CHECK(vm.log.empty() && vm.gaps == 0);
 }
 
-int guardedSuperpages(void *context, uint64_t size, uint8_t **bytes)
-{
-	return rgfxTakeSuperpages(static_cast<GuardedVm *>(context)->calls(), size, bytes);
-}
-
-void guardedUnmap(void *context, uint8_t *bytes, uint64_t size)
-{
-	rgfxGiveSuperpages(static_cast<GuardedVm *>(context)->calls(), bytes, size);
-}
-
-// A large Shared buffer where the kernel has fewer superpages than it needs: the region's slab, as
-// for any refusal, and no gap on the way; with room, its superpages, one run each.
-void test_pages_source_short_of_superpages()
-{
-	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
-	TestRing ring(0x10000);
-	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
-	                      nullptr);
-	RgfxIdSpace ids;
-	RgfxSerializer ser(writer, ids);
-	RgfxRegion region(mem.data(), mem.size());
-	std::vector<std::string> log;
-	PagesKext kext(16 * kMiB, &log);
-	region.setBlockSource(&PagesKext::alloc, &PagesKext::release, &kext);
-	region.setPagesBlockSource(&PagesKext::pagesBlock, &kext);
-	GuardedVm vm;
-	vm.free = 2;
-	RgfxPagesMemory calls;
-	calls.context = &vm;
-	calls.superpages = &guardedSuperpages;
-	calls.unmap = &guardedUnmap;
-	RgfxRegionSlabSource regionSource(region, ser);
-	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30);
-	RgfxSlabs slabs(regionSource);
-	slabs.setFirst(&pages);
-	RgfxSlabs::Range big;
-	CHECK(slabs.take(5 * kMiB, kShared, 0, &big) && big.size == 5 * kMiB);
-	CHECK(kext.pages.empty() && vm.pieces.empty() && vm.free == 2 && vm.gaps == 0);
-	CHECK(slabs.stats().firstSlabs == 0 && slabs.stats().slabs == 1);
-	vm.free = 3;
-	RgfxSlabs::Range own;
-	CHECK(slabs.take(5 * kMiB, kSharedUntracked, 0, &own) && own.size == 5 * kMiB);
-	CHECK(kext.pages.size() == 1 && slabs.stats().firstSlabs == 1);
-	CHECK(vm.runOfSuperpages(reinterpret_cast<uintptr_t>(own.contents), 6 * kMiB));
-	slabs.give(big);
-	slabs.give(own);
-	CHECK(slabs.reclaim() && kext.pages.empty() && vm.pieces.empty() && vm.gaps == 0);
-	RgfxMsgHeader h = {};
-	std::vector<uint8_t> bytes;
-	while (ring.next(&h, &bytes)) {
-	}
-}
-
 // The guest's superpage record, which every process shares (the kext's, RgfxSuperpageRecord.hpp):
-// a take asks the kernel for superpages only while it is open. A superpage the kernel refuses
-// (KERN_NO_SPACE, its search of the whole RAM, 140 to 190 ms on an 8 GiB guest once none are
-// left) closes it, and from then on every process's take, of one superpage or several, takes
-// plain pages without asking the kernel. A slab of superpages given back to the kernel opens it,
-// and the next take asks again. A refused slab of several superpages leaves it open (the kernel
-// had fewer than it asked for, and those it made went back), as does a refusal past the wire
-// budget, and plain pages given back tell it nothing.
+// a process's slabs' thread asks the kernel for its superpage ahead only while it is open. A
+// superpage the kernel refuses (KERN_NO_SPACE, its search of the whole RAM, 140 to 190 ms on an
+// 8 GiB guest once none are left) closes it, and from then on every process's thread asks the
+// record alone, and its takes take plain pages. A slab of superpages given back to the kernel opens
+// it, and the next ask goes to the kernel again. A refusal past the wire budget leaves it open, and
+// plain pages given back tell it nothing.
 void test_pages_source_superpage_record()
 {
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
@@ -1365,22 +1338,26 @@ void test_pages_source_superpage_record()
 		}
 	};
 
-	// The last superpage, to process A.
-	RgfxSlabs::Range a1, b1, a2, b2, b3, b4;
-	CHECK(a.take(0x1000, kShared, 0, &a1));
-	CHECK(log == std::vector<std::string>({"record ask 1", "superpages 2097152"}));
-	// None left: process B's ask is refused, which closes the record; its slab is plain pages.
+	// The last superpage, to process A's thread, which A's first slab uses.
+	RgfxSlabs::Range a1, b1, a2, b2, b3;
+	CHECK(a.step() && log == std::vector<std::string>({"record ask 1", "superpages 2097152"}));
+	CHECK(a.take(0x1000, kShared, 0, &a1) && log.size() == 2);
+	// None left: process B's thread's ask is refused, which closes the record; B's slab is plain
+	// pages.
 	log.clear();
+	CHECK(!b.step());
+	CHECK(log == std::vector<std::string>(
+	                 {"record ask 1", "superpages 2097152 refused", "record refused 0"}));
 	CHECK(b.take(0x1000, kShared, 0, &b1));
-	CHECK(log == std::vector<std::string>({"record ask 1", "superpages 2097152 refused",
-	                                       "record refused 0", "pages 2097152"}));
-	CHECK(vm.none && kext.pages.size() == 2);
-	// Closed: process A's next slab, and B's large one, are plain pages, the kernel never asked.
+	CHECK(endsWith(log, {"pages 2097152"}) && vm.none && kext.pages.size() == 2);
+	// Closed: each thread asks the record and not the kernel, and A's next slab, and B's large
+	// one, are plain pages.
 	log.clear();
+	CHECK(!a.step() && !b.step());
 	CHECK(a.take(0x1000, kSharedUntracked, 0, &a2));
 	CHECK(b.take(3 * kMiB, kShared, 0, &b2) && b2.size == 3 * kMiB);
 	CHECK(log == std::vector<std::string>(
-	                 {"record ask 0", "pages 2097152", "record ask 0", "pages 4194304"}));
+	                 {"record ask 0", "record ask 0", "pages 2097152", "pages 4194304"}));
 	CHECK(kext.pages.size() == 4 && a.stats().firstSlabs == 2 && b.stats().firstSlabs == 2);
 	drain();
 	// Process A's superpage slab let go: back to the kernel, which opens the record.
@@ -1390,26 +1367,21 @@ void test_pages_source_superpage_record()
 	CHECK(log == std::vector<std::string>(
 	                 {"release pages", "unmap 2097152", "record given back 1"}));
 	CHECK(!vm.none && vm.superpagesLeft == 1);
-	// Open again: process B's next slab asks, and gets the superpage A gave back.
+	// Open again: B's thread asks, and takes the superpage A gave back, which B's next slab uses.
 	log.clear();
-	CHECK(b.take(0x1000, kShared | 0x1, 0, &b3));
-	CHECK(log == std::vector<std::string>({"record ask 1", "superpages 2097152"}));
+	CHECK(b.step() && log == std::vector<std::string>({"record ask 1", "superpages 2097152"}));
+	CHECK(b.take(0x1000, kShared | 0x1, 0, &b3) && log.size() == 2);
 	CHECK(vm.superpagesLeft == 0 && kext.pages.size() == 4);
-	// A slab of several the kernel has too few for: refused, plain pages, the record left open.
+	// Past the wire budget: refused, not for want of contiguous RAM, the record left open, and A's
+	// next slab plain pages.
 	vm.superpagesLeft = 1;
-	log.clear();
-	CHECK(b.take(3 * kMiB, kSharedUntracked, 0, &b4));
-	CHECK(log == std::vector<std::string>(
-	                 {"record ask 1", "superpages 4194304 refused", "pages 4194304"}));
-	CHECK(!vm.none);
-	// Past the wire budget: refused, not for want of contiguous RAM, the record left open.
 	vm.budgetSpent = true;
 	RgfxSlabs::Range a3;
 	log.clear();
-	CHECK(a.take(0x1000, kShared | 0x2, 0, &a3));
-	CHECK(log == std::vector<std::string>(
-	                 {"record ask 1", "superpages 2097152 refused", "pages 2097152"}));
+	CHECK(!b.step());
+	CHECK(log == std::vector<std::string>({"record ask 1", "superpages 2097152 refused"}));
 	CHECK(!vm.none);
+	CHECK(a.take(0x1000, kShared | 0x2, 0, &a3) && endsWith(log, {"pages 2097152"}));
 	vm.budgetSpent = false;
 	drain();
 	// Plain pages given back tell the record nothing; B's superpage given back opens it again.
@@ -1419,7 +1391,7 @@ void test_pages_source_superpage_record()
 	log.clear();
 	CHECK(a.reclaim() && vm.none);
 	CHECK(std::count(log.begin(), log.end(), "record given back 1") == 0);
-	for (RgfxSlabs::Range *r : {&b1, &b2, &b3, &b4})
+	for (RgfxSlabs::Range *r : {&b1, &b2, &b3})
 		b.give(*r);
 	log.clear();
 	CHECK(b.reclaim() && !vm.none);
@@ -1428,13 +1400,144 @@ void test_pages_source_superpage_record()
 	drain();
 }
 
+// The kernel's superpage ask on the slabs' thread alone, never on a thread that takes a slab, as a
+// drawing thread does: the kernel's search for a contiguous 2 MiB runs on the thread that asks, 140
+// to 190 ms on an 8 GiB guest once none are left, refused or not. With the slabs' thread running,
+// takes on the test's thread, of a slab of one superpage and of a larger one: every ask the kernel
+// saw came from one thread, not the test's; a take of a superpage's slab used the one held, and a
+// larger one, or one after a refusal, took plain pages at once. The kernel, the kext and the record
+// are called on both threads, so the test's fakes of them take a lock.
+struct LockedPages {
+	std::mutex lock;
+	std::vector<std::string> log;
+	PagesKext kext{16 * kMiB, &log};
+	PagesVm vm{&log};
+	std::set<std::thread::id> askers;
+
+	static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+	{
+		LockedPages *p = static_cast<LockedPages *>(c);
+		std::lock_guard<std::mutex> hold(p->lock);
+		return PagesKext::alloc(&p->kext, size, align, offset);
+	}
+	static bool pagesBlock(void *c, const void *address, uint64_t length, bool writable,
+	                       uint64_t *offset, uint64_t *size)
+	{
+		LockedPages *p = static_cast<LockedPages *>(c);
+		std::lock_guard<std::mutex> hold(p->lock);
+		return PagesKext::pagesBlock(&p->kext, address, length, writable, offset, size);
+	}
+	static void release(void *c, uint64_t offset)
+	{
+		LockedPages *p = static_cast<LockedPages *>(c);
+		std::lock_guard<std::mutex> hold(p->lock);
+		PagesKext::release(&p->kext, offset);
+	}
+	static int superpages(void *c, uint64_t size, uint8_t **bytes)
+	{
+		LockedPages *p = static_cast<LockedPages *>(c);
+		std::lock_guard<std::mutex> hold(p->lock);
+		p->askers.insert(std::this_thread::get_id());
+		return PagesVm::superpages(&p->vm, size, bytes);
+	}
+	static int pages(void *c, uint64_t size, uint8_t **bytes)
+	{
+		LockedPages *p = static_cast<LockedPages *>(c);
+		std::lock_guard<std::mutex> hold(p->lock);
+		return PagesVm::pages(&p->vm, size, bytes);
+	}
+	static void unmap(void *c, uint8_t *bytes, uint64_t size)
+	{
+		LockedPages *p = static_cast<LockedPages *>(c);
+		std::lock_guard<std::mutex> hold(p->lock);
+		PagesVm::unmap(&p->vm, bytes, size);
+	}
+	static bool record(void *c, RgfxPagesMemory::Note note)
+	{
+		LockedPages *p = static_cast<LockedPages *>(c);
+		std::lock_guard<std::mutex> hold(p->lock);
+		return PagesVm::record(&p->vm, note);
+	}
+	// Waits up to 5 s for `done`, read under the lock.
+	template <typename F> bool waitFor(F done)
+	{
+		for (int i = 0; i < 5000; i++) {
+			{
+				std::lock_guard<std::mutex> hold(lock);
+				if (done())
+					return true;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		return false;
+	}
+	size_t count(const std::string &line)
+	{
+		return static_cast<size_t>(std::count(log.begin(), log.end(), line));
+	}
+};
+
+void test_pages_source_asks_on_its_thread_alone()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
+	TestRing ring(0x10000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxRegion region(mem.data(), mem.size());
+	LockedPages p;
+	region.setBlockSource(&LockedPages::alloc, &LockedPages::release, &p);
+	region.setPagesBlockSource(&LockedPages::pagesBlock, &p);
+	p.vm.superpagesLeft = 2;
+	RgfxPagesMemory calls;
+	calls.context = &p;
+	calls.superpages = &LockedPages::superpages;
+	calls.pages = &LockedPages::pages;
+	calls.unmap = &LockedPages::unmap;
+	calls.record = &LockedPages::record;
+	RgfxRegionSlabSource regionSource(region, ser);
+	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30);
+	RgfxSlabs slabs(regionSource);
+	slabs.setFirst(&pages);
+	CHECK(slabs.start());
+	const std::string superpage = "superpages 2097152";
+
+	// The thread's superpage ahead, at its start; the first slab's take uses it.
+	CHECK(p.waitFor([&] { return pages.holdsSuperpage() && p.count(superpage) == 1; }));
+	RgfxSlabs::Range a, big, one, c;
+	CHECK(slabs.take(0x1000, kShared, 0, &a) && a.offset == 0);
+	{
+		std::lock_guard<std::mutex> hold(p.lock);
+		CHECK(p.vm.held.count(a.contents) == 1 && p.vm.plain.count(a.contents) == 0);
+	}
+	// The next, after that slab; a larger slab is plain pages at once.
+	CHECK(p.waitFor([&] { return pages.holdsSuperpage() && p.count(superpage) == 2; }));
+	CHECK(slabs.take(3 * kMiB, kShared, 0, &big));
+	CHECK(slabs.take(3 * kMiB / 2, kShared, 0, &one) && one.offset == 0);
+	{
+		std::lock_guard<std::mutex> hold(p.lock);
+		CHECK(p.count("pages 4194304") == 1 && p.vm.plain.count(big.contents) == 1);
+		CHECK(p.vm.plain.count(one.contents) == 0);
+	}
+	// None left: the thread's ask refused, which closes the record, and the next take plain pages.
+	CHECK(p.waitFor([&] { return p.count("record refused 0") == 1; }));
+	CHECK(slabs.take(0x1000, kSharedUntracked, 0, &c));
+	{
+		std::lock_guard<std::mutex> hold(p.lock);
+		CHECK(p.vm.plain.count(c.contents) == 1 && p.count("pages 2097152") == 1);
+		CHECK(p.count(superpage) == 2 && p.count(superpage + " refused") == 1);
+		CHECK(p.askers.size() == 1 && p.askers.count(std::this_thread::get_id()) == 0);
+	}
+}
+
 // Where the device took MANAGED_BUFFER_SLABS, a Managed buffer lies in its Shared class: a range
-// of the Shared buffers' slabs, the process's own superpages first, at any size, its CPU copy a
-// Shared buffer there (BUFFER_AT_OFFSET in a superpage's heap, BUFFER_OVER_PAGES over a larger
-// slab's view, BUFFER_AT_OFFSET in a region slab's heap where the kernel has no superpage), and the
-// Managed buffer a MANAGED_BUFFER_CREATE over it at an address of its own. Its range goes back
-// once the copy's destroy follows the buffer's, the copy's address given back where its create
-// picked it.
+// of the Shared buffers' slabs, the process's own pages first, at any size, its CPU copy a Shared
+// buffer there (BUFFER_AT_OFFSET in a superpage's heap, BUFFER_OVER_PAGES over a larger slab's
+// view of plain pages, BUFFER_AT_OFFSET in a region slab's heap where the kernel gives no pages),
+// and the Managed buffer a MANAGED_BUFFER_CREATE over it at an address of its own. Its range goes
+// back once the copy's destroy follows the buffer's, the copy's address given back where its
+// create picked it.
 void test_managed_buffers_over_shared_copies()
 {
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 16 * kMiB, 0xee);
@@ -1453,6 +1556,7 @@ void test_managed_buffers_over_shared_copies()
 	RgfxPagesMemory calls;
 	calls.context = &vm;
 	calls.superpages = &PagesVm::superpages;
+	calls.pages = &PagesVm::pages;
 	calls.unmap = &PagesVm::unmap;
 	RgfxRegionSlabSource regionSource(region, ser, false, true);
 	RgfxPagesSlabSource pages(region, ser, calls, 16ull << 30, false, true);
@@ -1463,8 +1567,10 @@ void test_managed_buffers_over_shared_copies()
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 
-	// A small one: a superpage's heap of the Shared class, shared with a Shared buffer.
+	// A small one: the superpage the thread took ahead, a heap of the Shared class, shared with a
+	// Shared buffer.
 	RgfxSlabs::Range m, s;
+	CHECK(slabs.step());
 	CHECK(slabs.take(0x1000, kManaged, 0, &m) && m.offset == 0 && m.size == 0x1000);
 	CHECK(log == std::vector<std::string>({"superpages 2097152"}));
 	auto heap = expectMessage<RgfxHeapOverPages>(ring, RGFX_CMD_HEAP_OVER_PAGES);
@@ -1480,10 +1586,10 @@ void test_managed_buffers_over_shared_copies()
 	CHECK(made.objId == over.obj_id && made.gpuAddress == over.gpu_address && made.ownsAddress);
 	CHECK(slabs.take(0x1000, kShared, 0, &s) && s.slab == m.slab && s.offset == 0x1000);
 
-	// A large one: superpages with no heap, its copy over the block's view.
+	// A large one: plain pages with no heap, its copy over the block's view.
 	RgfxSlabs::Range big;
 	CHECK(slabs.take(3 * kMiB, kManaged, 0, &big) && big.size == 3 * kMiB && big.offset == 0);
-	CHECK(endsWith(log, {"superpages 4194304"}) && kext.pages.size() == 2);
+	CHECK(endsWith(log, {"pages 4194304"}) && kext.pages.size() == 2);
 	CHECK(!ring.next(&h, &bytes));
 	CHECK(slabs.makeBuffer(big, 3 * kMiB, kManaged, &made));
 	auto bigCopy = expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES);
@@ -1493,10 +1599,13 @@ void test_managed_buffers_over_shared_copies()
 	CHECK(made.objId == bigOver.obj_id && bigOver.gpu_address != bigCopy.gpu_address);
 	CHECK(slabs.stats().slabs == 2 && slabs.stats().firstSlabs == 2);
 
-	// No superpage left: a region slab's heap of the Shared class, nothing of the region's own.
+	// No superpage held and no plain pages: a region slab's heap of the Shared class, nothing of
+	// the region's own.
 	RgfxSlabs::Range r;
+	vm.refusePlain = true;
 	CHECK(slabs.take(0x1000, kManaged | 0x1, 0, &r));
-	CHECK(endsWith(log, {"superpages 2097152 refused"}));
+	CHECK(endsWith(log, {"pages 2097152 refused"}));
+	vm.refusePlain = false;
 	auto regionHeap = expectMessage<RgfxHeapOverHostMemory>(ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
 	CHECK(regionHeap.options == (kShared | 0x1));
 	CHECK(slabs.makeBuffer(r, 0x1000, kManaged | 0x1, &made));
@@ -1546,7 +1655,7 @@ void rgfxSlabTests()
 	test_pages_slab_source();
 	test_pages_slab_source_plain_pages();
 	test_superpages_one_call_each();
-	test_pages_source_short_of_superpages();
 	test_pages_source_superpage_record();
+	test_pages_source_asks_on_its_thread_alone();
 	test_managed_buffers_over_shared_copies();
 }

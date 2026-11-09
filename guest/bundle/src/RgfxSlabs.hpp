@@ -10,9 +10,9 @@
  * plain blocks with each buffer a BUFFER_OVER_HOST_MEMORY over its own range of the block, its CPU
  * copy; or 2 MiB of the process's own pages (RgfxPagesSlabSource), a superpage or plain pages,
  * one heap over its guest RAM (HEAP_OVER_PAGES) with its buffers placed in it the same way, or for
- * one large Shared buffer more, the buffer a BUFFER_OVER_PAGES over them. So a create is a take from a
- * free list and one post on ring 0, and a free a give back: neither calls the kext, and the
- * region's block table holds one entry per slab.
+ * one large Shared buffer more plain pages, the buffer a BUFFER_OVER_PAGES over them. So a create
+ * is a take from a free list and one post on ring 0, and a free a give back: neither calls the
+ * kext, and the region's block table holds one entry per slab.
  *
  * What the buffers answer, as both x86-64 Macs' GPUs (AMD 5300M, Intel 630) agree (measured with
  * tools/shmem's align and zero cases): a buffer takes whole 4 KiB pages (kGranule; allocatedSize
@@ -26,9 +26,9 @@
  * MANAGED OVER A COPY. Where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS (the sources'
  * `managedOverCopy`), a Managed buffer lies in the Shared class of its cache and hazard tracking
  * modes: its range is a Shared buffer's, made as any (BUFFER_AT_OFFSET in the slab's heap, or
- * BUFFER_OVER_PAGES over a larger slab of superpages), and the Managed buffer a
+ * BUFFER_OVER_PAGES over a larger slab of plain pages), and the Managed buffer a
  * MANAGED_BUFFER_CREATE over it, its CPU copy. So a Managed buffer of any size lies where a Shared
- * one of its size does, the process's own superpages first, on every host. Its range goes back
+ * one of its size does, the process's own pages first, on every host. Its range goes back
  * once the copy's destroy follows the buffer's. Without the feature a Managed buffer has a class
  * of its own (below, the region's source).
  *
@@ -174,6 +174,10 @@ public:
 	/// Destroys the Shared buffer `copy` a Managed buffer lay over, once that buffer's destroy is
 	/// posted, its address given back where its create picked it: `then` once the destroy is.
 	virtual void dropCopy(const Made &copy, std::function<void()> then) { then(); }
+
+	/// Does a piece of the source's own work on the background thread (RgfxSlabs::run), never on
+	/// a thread that takes a slab: false where it had none to do.
+	virtual bool prepare() { return false; }
 };
 
 /// Slabs of the device region: each a block of the kext's (RgfxRegion::allocate), in Metal's
@@ -218,9 +222,10 @@ protected:
 /// (RgfxMetalDevice: mach_vm_allocate) and the tests fake.
 struct RgfxPagesMemory {
 	void *context = nullptr;
-	/// `size` bytes of 2 MiB superpages, zeroed and wired: 0 (KERN_SUCCESS), or the kernel's
+	/// `size` bytes (2 MiB, one superpage), zeroed and wired: 0 (KERN_SUCCESS), or the kernel's
 	/// refusal, KERN_NO_SPACE where no contiguous 2 MiB is free and KERN_RESOURCE_SHORTAGE past the
-	/// user wire budget.
+	/// user wire budget. Called on the slabs' background thread alone
+	/// (RgfxPagesSlabSource::prepare).
 	int (*superpages)(void *context, uint64_t size, uint8_t **bytes) = nullptr;
 	/// `size` bytes of plain pages, zero-filled, which the kext's pages block wires: 0
 	/// (KERN_SUCCESS), or the kernel's refusal. Null for none.
@@ -236,20 +241,20 @@ struct RgfxPagesMemory {
 	/// The guest's superpage record, which every process shares (the kext's,
 	/// RgfxSuperpageRecord.hpp): takes `note` and answers whether to ask the kernel for
 	/// superpages, false once it refused one until a slab of them goes back. Null for none, and
-	/// every take asks.
+	/// each prepare asks the kernel.
 	bool (*record)(void *context, Note note) = nullptr;
 };
 
-/// Slabs of the process's own pages: 2 MiB superpages, or plain pages where the kernel has no
-/// superpage to give, wired into a pages block of the kext's (RgfxRegion::acquirePages;
+/// Slabs of the process's own pages: a 2 MiB superpage, or plain pages where none is held for the
+/// take, wired into a pages block of the kext's (RgfxRegion::acquirePages;
 /// RGFX_FEATURE_PAGES_BUFFERS), so their buffers' memory is the guest's RAM, not the device
 /// region's, for the classes whose buffers lie in heaps. A slab of 2 MiB is a heap the host makes
 /// over its pages (HEAP_OVER_PAGES; RGFX_FEATURE_HEAP_OVER_PAGES): over the guest's RAM itself for
 /// a superpage, one run, and over the block's view for plain pages, many runs. Its buffers are
-/// placed there as in a region slab's heap. A larger slab holds one dedicated Shared buffer, a
-/// BUFFER_OVER_PAGES over the block's view, or a Managed buffer over such a Shared copy (MANAGED
-/// OVER A COPY); a larger Managed one of a class of its own, and a slab where the kernel has no
-/// pages to give or the kext no pages block, are the region's.
+/// placed there as in a region slab's heap. A larger slab, plain pages, holds one dedicated Shared
+/// buffer, a BUFFER_OVER_PAGES over the block's view, or a Managed buffer over such a Shared copy
+/// (MANAGED OVER A COPY); a larger Managed one of a class of its own, and a slab where the kernel
+/// has no pages to give or the kext no pages block, are the region's.
 ///
 /// Why plain pages: the kernel's superpages are physically contiguous 2 MiB, which run out within
 /// minutes of a boot (measured on an x86-64 macOS 26.7.2 guest of 8 GiB: 19 for one process at
@@ -261,10 +266,19 @@ struct RgfxPagesMemory {
 ///
 /// Why the superpage record (RgfxPagesMemory::record): once they ran out, each ask the kernel
 /// refused cost the asking thread its search for a contiguous 2 MiB, 140 to 190 ms on that guest
-/// on the Radeon 780M host, in the first slab of every process (RgfxSuperpageRecord.hpp). So a
-/// take asks the kernel only while the record says it may have one: a refused superpage
-/// (KERN_NO_SPACE) closes it for every process, a slab of superpages given back opens it, and a
-/// take it closes takes plain pages at once, as a refused one does.
+/// on the Radeon 780M host (RgfxSuperpageRecord.hpp). So the kernel is asked only while the record
+/// says it may have one: a refused superpage (KERN_NO_SPACE) closes it for every process, and a
+/// slab of superpages given back opens it.
+///
+/// Why only the background thread asks: the search runs on the thread that asks, refused or not,
+/// and an open record sends the next ask of any process into it. Measured with tailspin on an
+/// x86-64 macOS 26.7.2 guest on the Radeon 780M host: WindowServer's main thread, making a
+/// texture over a layer's image as a window moved, was in the kernel's search (cpm_allocate) in
+/// two samples 100 ms apart, and Safari's page drew no frame for 151 ms. So the slabs' thread
+/// (RgfxSlabs::run) asks the kernel for one superpage ahead (prepare), while the record is open,
+/// at its start and after each slab of this source; a take uses that superpage where it is held
+/// and asks for nothing, and takes plain pages at once where it is not. A slab of more than one
+/// superpage is plain pages. A process holds at most one superpage it does not use.
 class RgfxPagesSlabSource : public RgfxRegionSlabSource {
 public:
 	RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
@@ -280,6 +294,15 @@ public:
 	bool makeHeap(const Memory &memory, uint32_t options, Heap *out) override;
 	bool makeBuffer(const Memory &memory, const Heap &heap, uint64_t offset, uint64_t length,
 	                uint32_t options, Made *out) override;
+	/// Asks the kernel for the superpage a take uses next, where none is held and the record is
+	/// open: true where it took one.
+	bool prepare() override;
+
+	/// Gives the superpage held for a take back.
+	~RgfxPagesSlabSource() override;
+
+	/// Whether a superpage is held for the next take, for the tests.
+	bool holdsSuperpage();
 
 	/// A superpage, and the size of a slab with a heap.
 	static constexpr uint64_t kUnit = 2ull << 20;
@@ -291,6 +314,8 @@ private:
 
 	RgfxPagesMemory m_memory;
 	uint64_t m_capacity;
+	std::mutex m_heldLock;
+	uint8_t *m_held = nullptr; // the superpage prepare took for the next take; null for none
 };
 
 class RgfxSlabs {
@@ -470,6 +495,7 @@ private:
 	std::thread m_thread;
 	bool m_running = false;
 	bool m_stop = false;
+	bool m_prepare = true; // the first source's prepare is due: at the start, after each slab of it
 };
 
 #endif // RGFX_SLABS_HPP_

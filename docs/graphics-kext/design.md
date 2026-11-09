@@ -2178,15 +2178,14 @@ the host's import, and the kext's block table holds one entry per slab:
   `PagesBlock`) and makes heaps over them (`HEAP_OVER_PAGES`), a heaped slab
   of 2 MiB is the process's own memory instead: a 2 MiB superpage
   (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, tagged `VM_MEMORY_IOACCELERATOR`), one run
-  of guest RAM, or where the kernel has no superpage to give (no contiguous
-  2 MiB free, or the wire budget spent) 2 MiB of plain pages, tagged the
-  same, many runs. Either is wired into a pages block and made one
-  `HEAP_OVER_PAGES`, its buffers placed in it as in a region slab's heap: the
-  host makes the heap over the run where the guest's RAM is mapped, and over
-  plain pages' runs over the block's view, which it makes off ring 0 as a
-  `BUFFER_OVER_PAGES`'s. A larger dedicated Shared slab is superpages or plain
-  pages too, with no heap: its one buffer is a `BUFFER_OVER_PAGES` over the
-  block's view, or a Managed buffer's CPU copy. A larger Managed slab of a
+  of guest RAM, which the slabs' thread took ahead (below), or where it holds
+  none 2 MiB of plain pages, tagged the same, many runs. Either is wired into
+  a pages block and made one `HEAP_OVER_PAGES`, its buffers placed in it as in
+  a region slab's heap: the host makes the heap over the run where the guest's
+  RAM is mapped, and over plain pages' runs over the block's view, which it
+  makes off ring 0 as a `BUFFER_OVER_PAGES`'s. A larger dedicated Shared slab
+  is plain pages, with no heap: its one buffer is a `BUFFER_OVER_PAGES` over
+  the block's view, or a Managed buffer's CPU copy. A larger Managed slab of a
   class of its own (no `MANAGED_BUFFER_SLABS`) is the region's, as is a slab
   where the kernel gives no pages at all or the kext gives no pages block.
   Plain pages because superpages run out: measured on an x86-64 macOS 26.7.2
@@ -2195,44 +2194,45 @@ the host's import, and the kext's block table holds one entry per slab:
   Shared buffer then lay in the region, where the guest's stores ran at
   13 MB/s (Decided 5, "The guest maps host memory only"). A queue's upload
   chunks, the bytes `set*Bytes:` hands in, are Shared buffers of the slabs
-  too. Each superpage is one kernel call: a slab of several reserves its
-  range (no access, at a 2 MiB boundary), then gives back each piece in turn
-  and makes a superpage in its hole (`VM_FLAGS_FIXED`), and one refusal gives
-  back the superpages before it and the reservation after it, so the slab is
-  the region's. A
-  call for several superpages that runs out partway takes down past what it
-  made on macOS 26.4 and later (xnu's `vm_map_enter` deletes up to the
-  request's end after shrinking its size), a deallocation gap whose
-  `EXC_GUARD` (`DEALLOC_GAP`) is fatal in every process whose VM guard is on:
-  Apple's platform binaries and the hardened browser processes, WebKit's GPU
-  process among them (`src/RgfxSuperpages.hpp`). A slab let go
-  destroys its heap, releases its pages block (the kext answers once the host
-  let go of it, and unwires the pages), then deallocates its pages.
-- A take asks the kernel for superpages only while the guest's superpage
-  record says it may have one: the kext keeps it for every process (selector
-  12, `Superpages`, kext feature 1 << 8; `kext/src/RgfxSuperpageRecord.hpp`),
-  open at the kext's start. A superpage the kernel refuses for want of
-  contiguous RAM (`KERN_NO_SPACE`, a take of one superpage) closes it, and a
-  slab of superpages given back to the kernel opens it; while it is closed
-  every process's take, of one superpage or several, takes plain pages without
-  asking. A refused slab of several superpages leaves it as it was (the kernel
-  had fewer than it asked for, and those it made went back), as does a refusal
-  past the wire budget (`KERN_RESOURCE_SHORTAGE`). Why: once superpages ran
-  out, each refused ask cost its thread the kernel's search for a contiguous
-  2 MiB (`vm_map_enter`'s superpage path, in `cpm_allocate`, which sleeps as
-  it goes and moves pages to make a run): 140 to 190 ms on the 8 GiB 26.7.2
-  guest above, sampled with spindump, in the first slabs of every process (a
-  video decoder session's first access unit, Safari's GPU process's layer
-  drawing), which then took plain pages anyway. A
-  process's own memory of a refusal would spare only its later slabs. A
-  16 GiB 26.6.1 guest on the RTX 5080 host gave every superpage asked for at
-  once, and its record stays open. Where the kext lacks the bit, or the call
-  fails, the bundle asks the kernel at every take, as with no record; the host
-  sees the same pages blocks either way, a superpage's one run or plain pages'
-  many. On the
-  RTX 5080 a heap over a run of guest RAM took 13.4 us and a 4 KiB buffer
-  placed in it 1.93 us, where a no-copy buffer over a block's view took
-  65-75 us, an import of its own (`slab_heap_costs`, `slab_nocopy_costs`).
+  too. A superpage is asked one at a time: a call for several superpages that
+  runs out partway takes down past what it made on macOS 26.4 and later (xnu's
+  `vm_map_enter` deletes up to the request's end after shrinking its size), a
+  deallocation gap whose `EXC_GUARD` (`DEALLOC_GAP`) is fatal in every process
+  whose VM guard is on: Apple's platform binaries and the hardened browser
+  processes, WebKit's GPU process among them (`src/RgfxSuperpages.hpp`). A
+  slab let go destroys its heap, releases its pages block (the kext answers
+  once the host let go of it, and unwires the pages), then deallocates its
+  pages.
+- Only the slabs' background thread asks the kernel for a superpage, one ahead
+  of the take that uses it: at its start, and after each slab of the process's
+  own pages, where it holds none. A take of a 2 MiB slab uses the one held,
+  and takes plain pages at once where none is; no thread that takes a slab
+  asks the kernel. So a process holds at most one superpage it does not use.
+  Why: the kernel's search for a contiguous 2 MiB (`vm_map_enter`'s superpage
+  path, in `cpm_allocate`, which sleeps as it goes and moves pages to make a
+  run) runs on the thread that asks, given or refused. Sampled with tailspin
+  on the 8 GiB 26.7.2 guest above, when a take asked: WindowServer's main
+  thread, making a texture over a layer's image as a window moved, was in
+  `cpm_allocate` in two samples 100 ms apart, and Safari's page drew no frame
+  for 151 ms.
+- The thread asks the kernel only while the guest's superpage record says it
+  may have one: the kext keeps it for every process (selector 12,
+  `Superpages`, kext feature 1 << 8; `kext/src/RgfxSuperpageRecord.hpp`), open
+  at the kext's start. A superpage the kernel refuses for want of contiguous
+  RAM (`KERN_NO_SPACE`) closes it, and a slab of superpages given back to the
+  kernel opens it; while it is closed every process's thread asks the record
+  alone. A refusal past the wire budget (`KERN_RESOURCE_SHORTAGE`) leaves it
+  as it was. Why: once superpages ran out, each refused ask spent 140 to
+  190 ms in the kernel's search on the 8 GiB 26.7.2 guest above, sampled with
+  spindump, moving the guest's pages for nothing. A process's own memory of a
+  refusal would spare only its later asks. A 16 GiB 26.6.1 guest on the
+  RTX 5080 host gave every superpage asked for at once, and its record stays
+  open. Where the kext lacks the bit, or the call fails, the thread asks the
+  kernel each time, as with no record; the host sees the same pages blocks
+  either way, a superpage's one run or plain pages' many. On the RTX 5080 a
+  heap over a run of guest RAM took 13.4 us and a 4 KiB buffer placed in it
+  1.93 us, where a no-copy buffer over a block's view took 65-75 us, an import
+  of its own (`slab_heap_costs`, `slab_nocopy_costs`).
 - Where no source has memory for a new slab, the process's own empty and
   cached slabs go first, then smaller region slabs are tried down to the
   buffer's size; nil only past that. Any other block of the process's the

@@ -433,9 +433,9 @@ bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, boo
 	return true;
 }
 
-// The pages source's memory (RgfxPagesMemory): 2 MiB superpages, zeroed and wired, each one run of
-// RAM, one kernel call each, so a refusal is safe in a process whose VM guard is on
-// (RgfxSuperpages.hpp).
+// The pages source's memory (RgfxPagesMemory): one 2 MiB superpage, zeroed and wired, one run of
+// RAM, asked on the slabs' thread alone (RgfxPagesSlabSource::prepare), one kernel call, so a
+// refusal is safe in a process whose VM guard is on (RgfxSuperpages.hpp).
 int rgfxSuperpages(void *, uint64_t size, uint8_t **bytes)
 {
 	return rgfxTakeSuperpages(rgfxKernelSuperpageVm(), size, bytes);
@@ -885,16 +885,17 @@ RGFX_LOG_UNRECOGNIZED
 	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer, managedAtOffset,
 	                                                     managedOverCopy);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
-	// The slabs whose buffers lie in heaps, and large Shared buffers, are the process's own
-	// superpages, or plain pages where the kernel has no superpage left, wired into pages blocks
-	// the host makes heaps or buffers over, where the region has a pages block source (above)
-	// and the device took HEAP_OVER_PAGES; else the region's.
+	// The slabs whose buffers lie in heaps, and large Shared buffers, are the process's own pages:
+	// the superpage the slabs' thread took ahead, for a 2 MiB slab, else plain pages, wired into
+	// pages blocks the host makes heaps or buffers over, where the region has a pages block source
+	// (above) and the device took HEAP_OVER_PAGES; else the region's.
 	if (_region->hasPagesBlocks() && (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
 		RgfxPagesMemory memory;
 		memory.superpages = &rgfxSuperpages;
 		memory.pages = &rgfxPlainPages;
 		memory.unmap = &rgfxUnmapPages;
-		// The guest's superpage record, where the kext keeps one: else every take asks the kernel.
+		// The guest's superpage record, where the kext keeps one: else the slabs' thread asks the
+		// kernel at each prepare.
 		if ((_caps.kextFeatures() & kRgfxKextFeatureSuperpages) != 0) {
 			memory.context = connContext;
 			memory.record = &rgfxKextSuperpages;

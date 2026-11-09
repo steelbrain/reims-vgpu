@@ -182,8 +182,8 @@ RgfxPagesSlabSource::RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &ser
 
 bool RgfxPagesSlabSource::serves(uint32_t options, uint64_t size) const
 {
-	// One superpage for any heaped class; more, which are more than one run, only for a Shared
-	// buffer of its own, which BUFFER_OVER_PAGES makes over the view.
+	// A 2 MiB slab for any heaped class; a larger one, plain pages, only for a Shared buffer of its
+	// own, which BUFFER_OVER_PAGES makes over the view.
 	const bool shared = ((options & kStorageMask) >> kStorageShift) == kStorageShared;
 	return heaped(options) && (size == kUnit || shared);
 }
@@ -193,23 +193,53 @@ bool RgfxPagesSlabSource::heapedSlab(const Memory &memory, uint32_t options) con
 	return memory.size == kUnit && heaped(options);
 }
 
+RgfxPagesSlabSource::~RgfxPagesSlabSource()
+{
+	if (m_held != nullptr)
+		giveBack(m_held, kUnit, true);
+}
+
+bool RgfxPagesSlabSource::holdsSuperpage()
+{
+	std::lock_guard<std::mutex> hold(m_heldLock);
+	return m_held != nullptr;
+}
+
+bool RgfxPagesSlabSource::prepare()
+{
+	// One superpage ahead, on the slabs' thread alone, while the record is open: the kernel's
+	// search for a contiguous 2 MiB runs here, never on a thread that takes a slab. A refusal, for
+	// want of contiguous RAM, closes the record for every process.
+	if (holdsSuperpage() || m_memory.superpages == nullptr)
+		return false;
+	if (m_memory.record != nullptr && !m_memory.record(m_memory.context, RgfxPagesMemory::kAsk))
+		return false;
+	uint8_t *bytes = nullptr;
+	const int kr = m_memory.superpages(m_memory.context, kUnit, &bytes);
+	if (kr != KERN_SUCCESS) {
+		if (kr == KERN_NO_SPACE && m_memory.record != nullptr)
+			m_memory.record(m_memory.context, RgfxPagesMemory::kRefused);
+		return false;
+	}
+	std::lock_guard<std::mutex> hold(m_heldLock);
+	m_held = bytes;
+	return true;
+}
+
 bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 {
-	// Superpages, each one run of guest RAM, where the superpage record says the kernel may have
-	// some; where it has none to give (no contiguous 2 MiB free, or the wire budget spent), plain
-	// pages, which the kext wires as it makes the block; and where neither, the region's slab. A
-	// refused superpage, for want of contiguous RAM, closes the record for every process; not a
-	// refused slab of several, whose refusal shows only that the kernel had fewer than it asked
-	// for, and whose superpages made before it went back.
+	// The superpage prepare took ahead, one run of guest RAM, for a slab of one; else plain pages
+	// at once, which the kext wires as it makes the block (a take never asks the kernel for a
+	// superpage: prepare); and where neither, the region's slab.
 	uint8_t *bytes = nullptr;
 	if (size == 0 || size % kUnit != 0)
 		return false;
 	bool superpages = false;
-	if (m_memory.record == nullptr || m_memory.record(m_memory.context, RgfxPagesMemory::kAsk)) {
-		const int kr = m_memory.superpages(m_memory.context, size, &bytes);
-		superpages = kr == KERN_SUCCESS;
-		if (kr == KERN_NO_SPACE && size == kUnit && m_memory.record != nullptr)
-			m_memory.record(m_memory.context, RgfxPagesMemory::kRefused);
+	if (size == kUnit) {
+		std::lock_guard<std::mutex> hold(m_heldLock);
+		bytes = m_held;
+		m_held = nullptr;
+		superpages = bytes != nullptr;
 	}
 	if (!superpages && (m_memory.pages == nullptr ||
 	                    m_memory.pages(m_memory.context, size, &bytes) != KERN_SUCCESS))
@@ -261,7 +291,7 @@ bool RgfxPagesSlabSource::makeBuffer(const Memory &memory, const Heap &heap, uin
 {
 	if (heap.objId != 0)
 		return RgfxRegionSlabSource::makeBuffer(memory, heap, offset, length, options, out);
-	// A dedicated slab of more than one superpage (offset 0): a Shared buffer over the block's
+	// A dedicated slab larger than 2 MiB, plain pages (offset 0): a Shared buffer over the block's
 	// view, at an address picked for it.
 	RgfxCreated created = m_serializer.createBufferOverPages(length, options, memory.regionOffset,
 	                                                         memory.blockSize, offset);
@@ -552,6 +582,10 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		std::lock_guard<std::mutex> hold(m_lock);
 		made->serial = m_nextSerial++;
 		m_all.insert(made);
+		if (made->source == m_first) {
+			m_prepare = true; // the first source's next superpage, asked on the thread
+			wake = true;
+		}
 		takeIn(made, size, keep, &zero, &at); // a new slab holds it from its first byte
 		if (made->dirty.bytes != 0) {
 			m_dirtySlabs.insert(made);
@@ -790,8 +824,17 @@ bool RgfxSlabs::step()
 		drop(drops);
 		return true;
 	}
-	if (zeroIn == nullptr)
-		return false;
+	if (zeroIn == nullptr) {
+		RgfxSlabSource *first = nullptr;
+		{
+			std::lock_guard<std::mutex> hold(m_lock);
+			if (m_prepare && m_first != nullptr) {
+				first = m_first;
+				m_prepare = false;
+			}
+		}
+		return first != nullptr && first->prepare();
+	}
 	std::memset(zeroIn->memory.bytes + at, 0, length);
 	std::lock_guard<std::mutex> hold(m_lock);
 	zeroIn->free.add(at, length);
@@ -817,7 +860,8 @@ void RgfxSlabs::run()
 		std::unique_lock<std::mutex> hold(m_lock);
 		if (m_stop)
 			return;
-		const bool work = !m_doomed.empty() || !m_dirtySlabs.empty();
+		const bool work =
+		    !m_doomed.empty() || !m_dirtySlabs.empty() || (m_prepare && m_first != nullptr);
 		if (work)
 			continue;
 		const int64_t left = idleWait(nowMs());

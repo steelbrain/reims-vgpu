@@ -10316,6 +10316,7 @@ void test_no_copy_shadows_lie_in_slabs()
 	};
 	@autoreleasepool {
 		NSMutableArray<RgfxBuffer *> *held = [NSMutableArray array];
+		CHECK(slabs.step()); // the superpage the slabs' thread takes ahead
 		for (int i = 0; i < 8; i++) {
 			RgfxBuffer *b = noCopy(p + i * 0x1000, 0x1000, MTLResourceStorageModeShared);
 			CHECK(b != nil && [b contents] == p + i * 0x1000 && [b rgfxShadow] != nullptr &&
@@ -10332,7 +10333,9 @@ void test_no_copy_shadows_lie_in_slabs()
 			      at.offset == static_cast<uint64_t>(i) * 0x1000 && at.length == 0x1000);
 			CHECK(std::memcmp(superpage + at.offset, p + i * 0x1000, 0x1000) == 0);
 		}
-		// A Managed one's CPU copy lies in a superpage of its own class, placed in its heap.
+		// A Managed one's CPU copy lies in a superpage of its own class, placed in its heap: the
+		// next the thread took, after the first slab.
+		CHECK(slabs.step());
 		RgfxBuffer *managed = noCopy(p + 0x8000, 0x2000, MTLResourceStorageModeManaged);
 		CHECK(managed != nil && [managed rgfxShadow] != nullptr &&
 		      ![managed rgfxShadow]->writable());
