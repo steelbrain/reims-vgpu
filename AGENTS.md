@@ -10,7 +10,8 @@ drivers drive in x86-64 macOS guests:
   and their arm64e builds, a second prebuilt set that Ambrosia's config
   bundle adds to an arm64 VM's kernel collection. They are to work on every
   x86-64 macOS release from 11.0 to 26's last, and on the arm64 releases
-  Ambrosia boots, from macOS 13;
+  Ambrosia boots, from macOS 14 (arm64 macOS 11 to 13 are not supported for
+  now);
 - the option ROM (`firmware/`), the device's UEFI driver in C, which an
   x86-64 guest's firmware runs, and its driver module for Ambrosia
   (`firmware/ambrosia`), which gives an arm64 guest's firmware an early

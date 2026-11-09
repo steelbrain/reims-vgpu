@@ -295,8 +295,9 @@ Stages:
       reims-ctl adds the set to an image, since a Linux host cannot build it.
     - Arm64 guests: the same sources build for arm64e (`ARCH_NAME=arm64e`)
       into a second set, guest/prebuilt-arm64e (`make -C guest
-      prebuilt-arm64e`), for the arm64 guests from macOS 13 that Ambrosia
-      boots; Ambrosia's config bundle adds it to the guest's kernel
+      prebuilt-arm64e`), for the arm64 guests from macOS 14 that Ambrosia
+      boots (arm64 macOS 11 to 13 are not supported for now: 13.6 offers
+      the device no MSI, and the kexts have no INTx path); Ambrosia's config bundle adds it to the guest's kernel
       collection (docs/qemu.md, "arm64 guests"). An arm64 kernel collection
       has no AppleGraphicsDeviceControl and no IOAcceleratorFamily2, so the
       arm64e kext has a Graft declaration and an Info.plist of its own

@@ -982,7 +982,10 @@ library's window shut, and QMP's `screendump` shows the display:
 
 Ambrosia's done list has 10 boots of our configuration: macOS 13.6, 14.6.1,
 15.6.1, 26.6.2 and 27.0.1, each under HVF on the M3 Max and under TCG on a
-Linux member. Our configuration is the module's early console with Graft and
+Linux member. The boot check covers four of them, macOS 14.6.1, 15.6.1,
+26.6.2 and 27.0.1: arm64 macOS 11 to 13 are not supported for now (owner,
+2026-11-09), since macOS 13.6 offers the device no MSI and the kexts have no
+INTx path, and the arm64e set is placed from Darwin 23. Our configuration is the module's early console with Graft and
 our two kexts added to the kernel collection. Its bundle is built from the
 kexts' arm64e builds, and `check-boot.sh` checks one boot of it:
 
