@@ -55,10 +55,11 @@
 #              its Graft client state (GraftClient.com.steelbrain.RgfxGate) reads installed,
 #              tagged or present; /Library/GPUBundles/reims-graphics.bundle is there with the
 #              restricted flag; and its com.apple.rootless class is KernelExtensionManagement.
-#   amfi-map   AMFI admitted the bundle where it counts: WindowServer has the bundle's
-#              executable mapped (`sudo lsof` on its pid, which reads the mappings without
-#              task_for_pid, so SIP allows it), and this boot's log has no AMFI or
-#              library-validation denial naming reims-graphics.
+#   amfi-map   AMFI admitted the bundle where it counts: the WindowServer running when the
+#              check runs (its pid read then, as a WindowServer that died since the desktop came
+#              up has another) has the bundle's executable mapped (`sudo lsof` on its pid, which
+#              reads the mappings without task_for_pid, so SIP allows it), and this boot's log
+#              has no AMFI or library-validation denial naming reims-graphics.
 #   page-count the kext's count of a surface's pages (mach_vm_region over kernel_map, and
 #              inside IOKit's pageable maps by IOIteratePageableMaps) did not take the guest
 #              down: read after the Metal work, its kern.boottime is the one it had at the
@@ -170,6 +171,10 @@ BASE_SOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Prefe
   -o PubkeyAuthentication=no -o ConnectTimeout=5 -o LogLevel=ERROR)
 SOPTS=("${BASE_SOPTS[@]}" -o ControlMaster=auto -o "ControlPath=/tmp/check-boot-%C" -o ControlPersist=yes)
 PROBE_SOPTS=("${BASE_SOPTS[@]}" -o ControlMaster=no -o ControlPath=none)
+# The guest's commands run in the C locale: macOS's ssh sends the host's LANG and LC_* (SendEnv in
+# its ssh_config.d), and a locale the guest lacks (C.UTF-8 on macOS 14) has its perl print five
+# warning lines before a command's own output.
+GUEST_ENV=(env LANG=C LC_ALL=C)
 # A command in the guest, under a limit of SECONDS: prints its output, also kept in guest.log, and
 # returns its status. A login that fails (sshpass's 5, a refused password; ssh's 255) is tried
 # twice more, 5 s apart, as the lane gate retries its copies.
@@ -178,7 +183,7 @@ G() {
   shift
   for try in 1 2 3; do
     echo "\$ $*" >> "$out/guest.log"
-    timeout "$s" sshpass -p "$GUEST_PASS" ssh -n -p "$port" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" "$@" > "$out/g.out" 2>&1
+    timeout "$s" "${GUEST_ENV[@]}" sshpass -p "$GUEST_PASS" ssh -n -p "$port" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" "$@" > "$out/g.out" 2>&1
     rc=$?
     cat "$out/g.out" >> "$out/guest.log"
     [[ $rc == 5 || $rc == 255 ]] && ((try < 3)) || break
@@ -290,7 +295,7 @@ while :; do
   [[ -n $in_kernel ]] || ! grep -a -q '^ambrosia: entering the kernel' <<< "$slog_new" || in_kernel=1
   kill -0 "$qpid" 2> /dev/null || break
   if [[ -n $in_kernel ]] &&
-    timeout 10 sshpass -p "$GUEST_PASS" ssh -n -p "$port" "${PROBE_SOPTS[@]}" "$GUEST_USER@127.0.0.1" true 2> /dev/null; then
+    timeout 10 "${GUEST_ENV[@]}" sshpass -p "$GUEST_PASS" ssh -n -p "$port" "${PROBE_SOPTS[@]}" "$GUEST_USER@127.0.0.1" true 2> /dev/null; then
     ssh_s=$(since "$t0")
     break
   fi
@@ -322,7 +327,9 @@ fi
 
 if [[ -n $ssh_s ]]; then
   verdict ssh PASS "a login $ssh_s s after QEMU started (limit $limit s)"
-  G 20 'sw_vers -productVersion; sw_vers -buildVersion' > /dev/null
+  # The guest's release, from a command that answered: the login probe's success can come before
+  # sshd takes the password every time, and G's output is its last try's alone.
+  gver=$(G 20 'sw_vers -productVersion; sw_vers -buildVersion') || gver=
   boot0=$(G 20 'sysctl -n kern.boottime') || boot0=
 
   csr=$(G 30 csrutil status)
@@ -365,6 +372,7 @@ if [[ -n $ssh_s ]]; then
     sleep 5
   done
   set -- $desk none none none
+  [[ $gver =~ ^[0-9]+\.[0-9] ]] || { gver=$(G 20 'sw_vers -productVersion; sw_vers -buildVersion') || gver=; }
   desk_say="WindowServer $1, Dock $2, Finder $3" ws_pid=${1#none}
   if [[ " $desk" != *" none "* ]]; then desk_ok=1
   else desk_ok=0 desk_say="no desktop in $desktop_wait s: $desk_say"; fi
@@ -372,19 +380,23 @@ if [[ -n $ssh_s ]]; then
   # The probes, copied over the shared connection.
   G 30 'mkdir -p ~/ambrosia-check' > /dev/null
   for t in bench present_probe; do
-    timeout 60 sshpass -p "$GUEST_PASS" ssh -p "$port" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
+    timeout 60 "${GUEST_ENV[@]}" sshpass -p "$GUEST_PASS" ssh -p "$port" "${SOPTS[@]}" "$GUEST_USER@127.0.0.1" \
       "cat > ~/ambrosia-check/$t && chmod +x ~/ambrosia-check/$t" < "$tools/$t" >> "$out/guest.log" 2>&1
   done
-  if dev=$(G 40 "perl -e 'alarm 30; exec @ARGV' ~/ambrosia-check/bench -l"); then
-    dev=$(echo "$dev" | grep -v '^[0-9-]* [0-9:.]* .*RGFX' | head -5 | tr '\n' ' ' | sed 's/ *$//')
+  # bench -l's device lines; anything else it prints (the bundle's log lines, a warning) is
+  # quoted only where it lists no device.
+  if bl=$(G 40 "perl -e 'alarm 30; exec @ARGV' ~/ambrosia-check/bench -l"); then
+    dev=$(echo "$bl" | grep '^bench: device' | head -5 | tr '\n' ' ' | sed 's/ *$//')
     case $dev in
     *Apple\ Paravirtual*) dev_ok=0 dev_say="Apple's paravirtual device: $dev" ;;
-    *bench:\ device*) dev_ok=1 dev_say=$dev ;;
-    '') dev_ok=0 dev_say="no Metal device: bench -l lists none" ;;
-    *) dev_ok=0 dev_say="no Metal device: bench -l printed \"$dev\"" ;;
+    ?*) dev_ok=1 dev_say=$dev ;;
+    *)
+      other=$(echo "$bl" | grep -v '^[0-9-]* [0-9:.]* .*RGFX' | tail -3 | tr '\n' ' ' | sed 's/ *$//')
+      dev_ok=0 dev_say="no Metal device: bench -l lists none${other:+; it printed \"$other\"}"
+      ;;
     esac
   else
-    dev_ok=0 dev_say="bench -l failed: $(echo "$dev" | tail -2 | tr '\n' ' ')"
+    dev_ok=0 dev_say="bench -l failed: $(echo "$bl" | tail -2 | tr '\n' ' ')"
   fi
 
   if ((dev_ok && desk_ok)); then
@@ -423,21 +435,26 @@ if [[ -n $ssh_s ]]; then
   else inst+=("rootless class: ${bclass:-none}") iok=0; fi
   verdict bundle-install "$( ((iok)) && echo PASS || echo FAIL)" "$(IFS=';'; echo "${inst[*]}" | sed 's/;/; /g')"
 
-  # AMFI's admission: the bundle mapped in WindowServer, and no denial naming it in this boot's log.
-  if [[ -n $ws_pid ]]; then
-    mapped=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' lsof -p $ws_pid 2>/dev/null | grep -c 'GPUBundles/reims-graphics.bundle'")
+  # AMFI's admission: the bundle mapped in the WindowServer running now, and no denial naming it
+  # in this boot's log. The pid is read again here: the desktop's may have died since.
+  ws_now=$(G 20 'pgrep -x WindowServer | head -1') || ws_now=
+  ws_now=${ws_now//[^0-9]/}
+  if [[ -n $ws_now ]]; then
+    mapped=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' lsof -p $ws_now 2>/dev/null | grep -c 'GPUBundles/reims-graphics.bundle'")
     mapped=${mapped//[^0-9]/}
   else
     mapped=
   fi
+  ws_was=
+  [[ -n $ws_pid && -n $ws_now && $ws_now != "$ws_pid" ]] && ws_was=", the desktop's was $ws_pid"
   denied=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"reims-graphics\"' 2>/dev/null | grep -c -i -E 'amfi|library validation|not valid|code signature'")
   denied=${denied//[^0-9]/}
-  if [[ -z $ws_pid ]]; then
+  if [[ -z $ws_now ]]; then
     verdict amfi-map FAIL "not run: no WindowServer"
   elif [[ ${mapped:-0} -gt 0 && ${denied:-0} -eq 0 ]]; then
-    verdict amfi-map PASS "WindowServer (pid $ws_pid) maps the bundle ($mapped mappings); no AMFI denial naming it"
+    verdict amfi-map PASS "WindowServer (pid $ws_now$ws_was) maps the bundle ($mapped mappings); no AMFI denial naming it"
   else
-    verdict amfi-map FAIL "WindowServer (pid $ws_pid) maps the bundle ${mapped:-0} times; ${denied:-unread} AMFI or library-validation lines name reims-graphics"
+    verdict amfi-map FAIL "WindowServer (pid $ws_now$ws_was) maps the bundle ${mapped:-0} times; ${denied:-unread} AMFI or library-validation lines name reims-graphics"
   fi
 
   # The page count's path, after the Metal work: the guest's boot unchanged, the panic reports
@@ -511,7 +528,10 @@ fi
 
 {
   echo "check-boot: $(basename "$vm") on $( ((tcg)) && echo TCG || echo HVF), bundle $(basename "$bundle"), logs in $out"
-  [[ -n $ssh_s ]] && echo "check-boot: guest macOS $(grep -A2 -m1 '^\$ sw_vers' "$out/guest.log" | tail -2 | tr '\n' ' ' | sed 's/ $//')"
+  if [[ -n $ssh_s ]]; then
+    if [[ $gver =~ ^[0-9]+\.[0-9] ]]; then echo "check-boot: guest macOS $(echo $gver)"
+    else echo "check-boot: guest macOS unread: $(echo "$gver" | tail -1)"; fi
+  fi
   failed=()
   for n in "${names[@]}"; do
     printf 'check-boot: %-18s %s  %s\n' "$n" "$(state "$n")" "$(detail "$n")"
