@@ -63,9 +63,9 @@
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
 #include <libkern/OSAtomic.h>
-#include <libkern/OSKextLib.h>
 #include <libkern/libkern.h>
-#include <ptrauth.h>
+#include <mach/mach_vm.h>
+#include <mach/vm_region.h>
 #include <sys/proc.h>
 
 namespace {
@@ -582,58 +582,60 @@ bool rgfxSurfaceLocksStartsAt(OSObject *surface, const RgfxPageRun *runs, UInt32
 	return rgfxSurfaceRunsSame(walk);
 }
 
-// IOMemoryDescriptor::getPageCounts(resident, dirty, swapped), which counts the pages compressed
-// or paged out too (`swapped`), referenced weakly: of the release kernels checked, the symbol
-// sets of 26.6.1 (25G76) and 26.7.2 (25G332) export it in com.apple.kpi.iokit, and those of
-// 11.7.10, 11.7.11, 12.7.4, 12.7.6, 13.7.8, 14.8.9, 15.7.9 and 15.8.2 do not, nor any routine of
-// any KPI set that counts or queries a page's being compressed or paged out (each kernel's
-// __LINKINFO,__symbolsets, read 2026-11-08). The two-count form counts the resident pages alone,
-// so a page a writer that takes no lock dirtied, then compressed or paged out, would read as
-// fresh, and the host's zeros would take its place. A binder that cannot resolve the symbol
-// binds it to gOSKextUnresolved, as the kernel's linker does, or to 0: either reads as absent,
-// and then no surface is counted, so none is deferred, and every block's pages are named at its
-// ask. A non-virtual member: `memory` is its `this`.
-extern "C" IOReturn rgfxMemoryPageCounts(IOMemoryDescriptor *memory, IOByteCount *resident,
-                                         IOByteCount *dirty, IOByteCount *swapped)
-    __asm("__ZN18IOMemoryDescriptor13getPageCountsEPyS0_S0_") __attribute__((weak_import));
+// The kernel's map, exported in com.apple.kpi.unsupported, which no SDK header declares.
+extern "C" vm_map_t kernel_map;
 
-// The function is reached only through this word of data, its address bound there whole, never
-// from the code: an address relative to an instruction cannot reach 0, and OpenCore's linker
-// refuses the whole kext where it binds such a reference to 0 ("RIP-relative overflow ...
-// target=0x0", then the kext not injected, measured with its TestKextInject on the Boot KCs of
-// 11.7.11, 13.7.8 and 15.8.2). Volatile, so the compiler reads the word rather than call the
-// function directly.
-using RgfxMemoryPageCountsFn = IOReturn (*)(IOMemoryDescriptor *, IOByteCount *, IOByteCount *,
-                                            IOByteCount *);
-static RgfxMemoryPageCountsFn volatile memoryPageCounts = &rgfxMemoryPageCounts;
+namespace {
+// The most regions of a surface's mapping a count walks: more, and it is not counted.
+constexpr uint32_t kMaxCountRegions = 8;
+// Surfaces of this many bytes or more have each count's time logged, the first few of them.
+constexpr uint64_t kCountLoggedBytes = 16ull << 20;
+constexpr uint32_t kCountsLogged = 16;
+} // namespace
 
-// Whether the weak function at `symbol` was bound to a definition. A pointer to it is signed
-// where calls are authenticated (arm64e), so it is stripped before it is compared with the
-// pointer gOSKextUnresolved holds.
-static bool weakFunctionResolved(const void *symbol)
+// What a count of a surface's pages took, logged where it is the longest yet by a quarter or
+// more, or where the surface is large, for the first kCountsLogged of those.
+static void noteCountTime(uint64_t bytes, uint64_t ns, const RgfxSurfacePageCounts &counts)
 {
-#if __has_feature(ptrauth_calls)
-	symbol = ptrauth_strip(symbol, ptrauth_key_function_pointer);
-#endif
-	return symbol != nullptr && symbol != gOSKextUnresolved;
+	static uint64_t longest = 0;
+	static uint32_t largeLogged = 0;
+	uint64_t was = __atomic_load_n(&longest, __ATOMIC_RELAXED);
+	bool longer = false;
+	while (ns > was + was / 4 && !longer)
+		longer = __atomic_compare_exchange_n(&longest, &was, ns, false, __ATOMIC_RELAXED,
+		                                     __ATOMIC_RELAXED);
+	const bool large = bytes >= kCountLoggedBytes &&
+	                   __atomic_fetch_add(&largeLogged, 1, __ATOMIC_RELAXED) < kCountsLogged;
+	if (longer || large)
+		IOLog("RgfxAccelerator: counting an IOSurface's %llu KiB of pages took %llu us%s: %s, "
+		      "%llu resident, %llu compressed or paged out\n",
+		      bytes >> 10, ns / 1000, longer ? ", the longest yet" : "",
+		      counts.counted ? "counted" : "not counted", counts.counted ? counts.resident : 0,
+		      counts.counted ? counts.swapped : 0);
 }
 
+// The counts come from the regions of a mapping of the surface's memory in the kernel's own map,
+// made for the count (read-only, unique, faulting nothing in) and gone after it: mach_vm_region's
+// VM_REGION_EXTENDED_INFO walks the memory's object page by page and counts each page resident,
+// or compressed or paged out (pages_swapped_out), measured on 11.7.11 (20G1443) for an IOSurface
+// whose pages a child's allocations pushed into the compressor and on to swap: its counts equal
+// each page's disposition, resident, compressed or mixed. mach_vm_region and kernel_map are in
+// com.apple.kpi.unsupported, and kernel_task in com.apple.kpi.mach, in the symbol sets of every
+// release kernel checked (x86_64 11.7.10 to 26.7.2, arm64 13 to 26; each kernel's
+// __LINKINFO,__symbolsets): a strong import, bound by every linker, OpenCore's included. The
+// walk costs about a microsecond per 1-16 pages (measured from user space on 11.7.11: 0.13 ms
+// for 16384 resident pages, 1.3 ms for the same compressed), plus the mapping's making and
+// removal.
 RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
 {
 	RgfxSurfacePageCounts counts = {false, ~0ull, ~0ull};
-	static bool countsNoted = false, memoryNoted = false;
-	const RgfxMemoryPageCountsFn pageCounts = memoryPageCounts;
-	if (!weakFunctionResolved(reinterpret_cast<const void *>(pageCounts))) {
-		if (!__atomic_exchange_n(&countsNoted, true, __ATOMIC_RELAXED))
-			IOLog("RgfxAccelerator: this kernel counts no compressed or paged-out pages of a "
-			      "memory descriptor: no IOSurface's block is deferred\n");
-		return counts;
-	}
+	static bool memoryNoted = false, mapNoted = false;
 	// An IOBufferMemoryDescriptor allocates its memory itself, pageable or wired, from the
 	// kernel's anonymous allocators, never over a file (xnu's IOBufferMemoryDescriptor.cpp; not
 	// re-read for this change): a page of it neither resident nor compressed nor paged out was
 	// never written. A descriptor over other memory, a client's own, may be a file's, whose
-	// pages not resident hold the file's bytes, which no count shows: it is not counted.
+	// pages not resident hold the file's bytes, which no count shows: it is not counted. The
+	// walk says so too (external_pager), and a region of a pager's is not counted either.
 	IOMemoryDescriptor *memory = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
 	if (!memory)
 		return counts;
@@ -644,10 +646,42 @@ RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
 			      memory->getMetaClass()->getClassName());
 		return counts;
 	}
-	IOByteCount resident = 0, dirty = 0, swapped = 0;
-	if (pageCounts(memory, &resident, &dirty, &swapped) != kIOReturnSuccess)
+	const uint64_t began = mach_absolute_time();
+	IOMemoryMap *map =
+	    memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapUnique);
+	if (!map) {
+		if (!__atomic_exchange_n(&mapNoted, true, __ATOMIC_RELAXED))
+			IOLog("RgfxAccelerator: an IOSurface's memory could not be mapped to count its "
+			      "pages: its block, and any such, is not deferred\n");
 		return counts;
-	counts = {true, resident, swapped};
+	}
+	const uint64_t start = map->getAddress(), length = map->getLength();
+	RgfxPageRegion regions[kMaxCountRegions] = {};
+	uint32_t found = 0;
+	mach_vm_address_t at = start;
+	while (found < kMaxCountRegions && at < start + length) {
+		mach_vm_address_t address = at;
+		mach_vm_size_t size = 0;
+		vm_region_extended_info_data_t info = {};
+		mach_msg_type_number_t infoCount = VM_REGION_EXTENDED_INFO_COUNT;
+		mach_port_t object = MACH_PORT_NULL;
+		if (mach_vm_region(kernel_map, &address, &size, VM_REGION_EXTENDED_INFO,
+		                   reinterpret_cast<vm_region_info_t>(&info), &infoCount,
+		                   &object) != KERN_SUCCESS)
+			break;
+		regions[found++] = {address, size, info.pages_resident, info.pages_swapped_out,
+		                    info.external_pager != 0, info.share_mode == SM_EMPTY};
+		if (address + size <= address)
+			break;
+		at = address + size;
+	}
+	// A walk that ended short (a failed call, or more regions than kMaxCountRegions) leaves the
+	// regions short of the mapping's end, which rgfxRegionPageCounts refuses.
+	counts = rgfxRegionPageCounts(regions, found, start, length);
+	map->release();
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	noteCountTime(length, ns, counts);
 	return counts;
 }
 

@@ -580,13 +580,20 @@ Stages:
         or paged out since, counted so, and holds bytes the cache's zeros
         would lose. The kext counts only a surface whose memory is a buffer
         the kernel allocated (`IOBufferMemoryDescriptor`, anonymous memory,
-        never a client's own, which may be a file's), and only on a kernel
-        whose `IOMemoryDescriptor::getPageCounts` counts the pages compressed
-        or paged out, referenced weakly: of the release kernels checked, those
-        of 26.6.1 and 26.7.2 export it, those of 11.7.10 to 15.8.2 do not, nor
-        any routine that tells a page compressed or paged out. A surface not
-        counted is never fresh, so there every block's pages are named at its
-        ask (`guest/kext/src/RgfxAcceleratorLocks.cpp`). Found fresh, its `SURFACE_PAGES`
+        never a client's own, which may be a file's). It counts them on every
+        kernel the same way: it maps the memory read-only into the kernel's
+        own map for the count, and `mach_vm_region`'s
+        `VM_REGION_EXTENDED_INFO` walks the mapping's regions, which count
+        each page resident or compressed or paged out (`pages_swapped_out`;
+        **measured** on 11.7.11 against each page's disposition, with the
+        pages in the compressor and on swap). `mach_vm_region` and
+        `kernel_map` are strong imports from `com.apple.kpi.unsupported`,
+        which every release kernel checked exports (x86-64 11.7.10 to 26.7.2,
+        arm64 13 to 26). The regions must be the mapping exactly, none a
+        pager's: a region past it, a gap, or one with nothing to count
+        refuses the count. A surface not counted is never fresh, so its
+        block's pages are named at its ask
+        (`guest/kext/src/RgfxAcceleratorLocks.cpp`). Found fresh, its `SURFACE_PAGES`
         carries `DEFERRED` and no runs, the block keeping room for one run a
         page of the whole allocation, every plane's; the host makes the cache
         as zeros. Not fresh, or refused, the kext names the pages at once, as

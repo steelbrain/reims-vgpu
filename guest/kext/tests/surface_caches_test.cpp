@@ -318,6 +318,56 @@ void heldBytes()
 	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {true, 2, 0}, 3), "two of three: no");
 }
 
+// A surface's counts come from the regions of its mapping in the kernel's map, and count only
+// where those regions are the mapping exactly: a region past it would count pages not the
+// surface's, and a gap pages not counted, so either refuses the count (and with it a deferral),
+// never grants one.
+void regionCounts()
+{
+	constexpr uint64_t start = 0x10000000, page = 0x1000, length = 16 * page;
+	const RgfxPageRegion whole[] = {{start, length, 0, 0, false, false}};
+	RgfxSurfacePageCounts c = rgfxRegionPageCounts(whole, 1, start, length);
+	check(c.counted && c.resident == 0 && c.swapped == 0,
+	      "one region that is the mapping, nothing in it: counted, none resident or swapped");
+	check(rgfxSurfaceHoldsOnlyResident(true, 0, c, 0), "and that surface reads fresh");
+	const RgfxPageRegion split[] = {{start, 4 * page, 2, 1, false, false},
+	                                {start + 4 * page, 12 * page, 3, 4, false, false}};
+	c = rgfxRegionPageCounts(split, 2, start, length);
+	check(c.counted && c.resident == 5 && c.swapped == 5,
+	      "two regions that tile the mapping: their counts summed");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, c, 0), "with pages swapped: not fresh");
+	const RgfxPageRegion before[] = {{start - page, length + page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(before, 1, start, length).counted,
+	      "a region starting before the mapping: refused");
+	const RgfxPageRegion past[] = {{start, length + page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(past, 1, start, length).counted,
+	      "a region ending past the mapping: refused, though its counts are all zero");
+	const RgfxPageRegion pastLast[] = {{start, 4 * page, 0, 0, false, false},
+	                                   {start + 4 * page, 13 * page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(pastLast, 2, start, length).counted,
+	      "the last of two regions ending past the mapping: refused");
+	const RgfxPageRegion gap[] = {{start, 4 * page, 0, 0, false, false},
+	                              {start + 5 * page, 11 * page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(gap, 2, start, length).counted,
+	      "a gap between two regions: refused");
+	const RgfxPageRegion part[] = {{start, 4 * page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(part, 1, start, length).counted,
+	      "regions covering part of the mapping: refused");
+	const RgfxPageRegion pager[] = {{start, length, 0, 0, true, false}};
+	check(!rgfxRegionPageCounts(pager, 1, start, length).counted,
+	      "a pager's memory (a file's), whose pages not resident hold its bytes: refused");
+	const RgfxPageRegion empty[] = {{start, length, 0, 0, false, true}};
+	check(!rgfxRegionPageCounts(empty, 1, start, length).counted,
+	      "a region with nothing the walk can count (SM_EMPTY): refused");
+	check(!rgfxRegionPageCounts(whole, 0, start, length).counted, "no region: refused");
+	check(!rgfxRegionPageCounts(whole, 1, start, 0).counted, "an empty mapping: refused");
+	const RgfxPageRegion zero[] = {{start, 0, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(zero, 1, start, length).counted, "a region of no size: refused");
+	const RgfxPageRegion top[] = {{~0ull - page + 1, page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(top, 1, ~0ull - page + 1, 2 * page).counted,
+	      "a mapping that would wrap the address space: refused");
+}
+
 // On a host that answers which surfaces need a cache, a deferral refused, or a surface read not
 // fresh, has the block ask with its pages; answered in place, its entry goes.
 void ungated()
@@ -1102,6 +1152,7 @@ int main()
 	room();
 	deferral();
 	heldBytes();
+	regionCounts();
 	carriedWires();
 	ungated();
 	deferredRelease();

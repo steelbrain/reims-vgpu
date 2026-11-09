@@ -215,9 +215,10 @@ bool rgfxSurfaceLocksStartsAt(OSObject *surface, const RgfxPageRun *runs, UInt32
                               UInt64 length);
 struct RgfxSurfacePageCounts;
 // What the kernel counts of `surface`'s pages, resident and compressed or paged out
-// (RgfxSurfaceCaches.hpp): counted only where its memory is a buffer the kernel allocated and
-// the kernel counts the pages compressed or paged out. Takes no lock, so a caller may hold the
-// surface's read-only lock across it.
+// (RgfxSurfaceCaches.hpp), from the regions of a mapping of its memory in the kernel's map:
+// counted only where its memory is a buffer the kernel allocated and those regions are exactly
+// the mapping (rgfxRegionPageCounts). Takes no lock, so a caller may hold the surface's read-only
+// lock across it.
 RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface);
 // Whether `surface` reads fresh, to look at: its seed 0, its pages counted, none of them
 // compressed or paged out, none resident or as many as `listed`, the pages the ask lists of them

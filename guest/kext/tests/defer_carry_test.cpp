@@ -105,8 +105,8 @@ RgfxSurfacePageCounts at(uint64_t resident, uint64_t swapped = 0)
 	return {true, resident, swapped};
 }
 
-// Counts not taken: the kernel counts no compressed or paged-out pages, or the surface's memory is
-// not a buffer the kernel allocated.
+// Counts not taken: the surface's memory is not a buffer the kernel allocated, or the regions of
+// its mapping are not exactly it.
 constexpr RgfxSurfacePageCounts kUncounted = {false, ~0ull, ~0ull};
 
 void reads()

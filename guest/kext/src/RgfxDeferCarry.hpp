@@ -9,7 +9,7 @@
 // kRgfxCarryPagesMost of them, and the kext proves the list under its read of the surface
 // (rgfxSurfaceLocksDefer): the surface's memory holds exactly as many resident pages as listed and
 // none compressed or paged out (rgfxSurfaceHoldsOnlyResident, the fresh test's own verdict, over
-// the kernel's counts: where it counts no compressed or paged-out pages, nothing is deferred), the
+// the kernel's counts: where they cannot be taken, nothing is deferred), the
 // listed runs wire with no fault, and its counts are the same after the wire. The deferral then
 // names those pages, every other run of the surface's bytes RGFX_PAGE_RUN_ZEROS, and the host
 // fills its cache from them as a new cache's first fill. The kext holds them wired until the
@@ -138,8 +138,8 @@ enum RgfxCarryOutcome : uint32_t {
 	kRgfxCarryNone,
 	// Not deferred: the surface's seed moved, or the read-only lock failed.
 	kRgfxCarryTouched,
-	// Not deferred: the surface's pages were not counted (rgfxSurfaceLocksPageCounts): the kernel
-	// counts no compressed or paged-out pages, or its memory is not a buffer the kernel allocated.
+	// Not deferred: the surface's pages were not counted (rgfxSurfaceLocksPageCounts): its memory
+	// is not a buffer the kernel allocated, or the regions of its mapping are not exactly it.
 	kRgfxCarryUncounted,
 	// Not deferred: more pages resident than listed, or fewer, or a page compressed or paged out.
 	kRgfxCarryCounted,

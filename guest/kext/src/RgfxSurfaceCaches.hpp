@@ -534,13 +534,54 @@ inline uint64_t rgfxCacheAttached(RgfxCacheTable &t, uint64_t key, RgfxPagesNami
 
 // What the kernel counted of a surface's pages (rgfxSurfaceLocksPageCounts). `counted` only
 // where the counts cover every place its bytes can be: memory the kernel allocated anonymous,
-// so a page neither resident nor compressed nor paged out holds nothing, and a kernel that
-// counts the compressed and paged-out pages (`swapped`), not only the resident ones.
+// so a page neither resident nor compressed nor paged out holds nothing, and counts of the
+// compressed and paged-out pages (`swapped`) as well as the resident ones, over its whole
+// mapping and nothing past it (rgfxRegionPageCounts).
 struct RgfxSurfacePageCounts {
 	bool counted;
 	uint64_t resident;
 	uint64_t swapped;
 };
+
+// One region of the kernel's map, as VM_REGION_EXTENDED_INFO describes it: where it starts, its
+// size, its pages resident and its pages compressed or paged out (pages_swapped_out, which
+// counts both: measured on 11.7.11 against each page's disposition), whether its memory is a
+// pager's (`external`, a file's), and whether it has no memory to count (`empty`, SM_EMPTY: no
+// object, a submap, or physically contiguous memory).
+struct RgfxPageRegion {
+	uint64_t start;
+	uint64_t size;
+	uint64_t resident;
+	uint64_t swapped;
+	bool external;
+	bool empty;
+};
+
+// The counts of a surface mapped at [start, start + length), from the `count` regions a walk from
+// `start` found, in order. Counted only where the regions tile the mapping exactly: the first
+// starting at `start`, each the next where the previous ends, the last ending where the mapping
+// does, none a pager's or empty. A region reaching past the mapping would count pages that are
+// not the surface's, and a gap or a missing region pages that are not counted, so either refuses
+// the count, which only ever refuses a deferral, never grants one.
+inline RgfxSurfacePageCounts rgfxRegionPageCounts(const RgfxPageRegion *regions, uint32_t count,
+                                                  uint64_t start, uint64_t length)
+{
+	const RgfxSurfacePageCounts uncounted = {false, ~0ull, ~0ull};
+	if (count == 0 || length == 0 || start + length < start)
+		return uncounted;
+	RgfxSurfacePageCounts counts = {true, 0, 0};
+	uint64_t at = start;
+	for (uint32_t i = 0; i < count; i++) {
+		const RgfxPageRegion &r = regions[i];
+		if (r.start != at || r.size == 0 || r.size > start + length - at || r.external ||
+		    r.empty)
+			return uncounted;
+		counts.resident += r.resident;
+		counts.swapped += r.swapped;
+		at += r.size;
+	}
+	return at == start + length ? counts : uncounted;
+}
 
 // Whether a surface's bytes can only be in its `resident` resident pages, as the read that
 // found `seed` and `counts` saw it: under its read-only lock (`locked`), its seed 0 (no lock for
