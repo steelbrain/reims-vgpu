@@ -827,8 +827,13 @@ RGFX_LOG_UNRECOGNIZED
 	// No-copy buffers over the process's own pages, where the kext makes pages blocks and the
 	// host took the feature that maps them.
 	if ((_caps.kextFeatures() & kRgfxKextFeaturePagesBlock) != 0 &&
-	    (_caps.features() & RGFX_FEATURE_PAGES_BUFFERS) != 0)
+	    (_caps.features() & RGFX_FEATURE_PAGES_BUFFERS) != 0) {
+#if defined(__arm64__)
+		// Whole 16 KiB pages where the kext took PAGES_16K, as it rounds the blocks' ranges then.
+		_region->setPagesPage((_caps.features() & RGFX_FEATURE_PAGES_16K) != 0 ? 0x4000 : 0x1000);
+#endif
 		_region->setPagesBlockSource(&rgfxKextPagesBlock, connContext);
+	}
 
 	// The object lifecycle goes to the kext, which posts it on the control ring and hands back
 	// the replies (a pipeline's reflection).

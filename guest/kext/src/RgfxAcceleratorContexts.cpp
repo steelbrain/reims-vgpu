@@ -186,6 +186,12 @@ bool &hooked = state.hooked;
 // Whether the device uses surfaces' own pages in place (RGFX_FEATURE_SURFACE_PAGES), read from
 // FEATURES_LO at the first context's open.
 bool surfacePages = false;
+#if RGFX_GUEST_ARM64
+// Whether the kext took RGFX_FEATURE_PAGES_16K, read with surfacePages: every run of guest RAM it
+// names to the device then ends at the end of a 16 KiB page (writeRuns, pagesBlock), and the
+// length of each SURFACE_PAGES with it (postPages).
+bool pages16k = false;
+#endif
 // Whether the device keeps cached surfaces' GPU copies in its own memory
 // (RGFX_FEATURE_SURFACE_CACHE), or keeps them only of the surfaces it answers need one
 // (RGFX_FEATURE_SURFACE_CACHE_REFUSED, taken), read with it.
@@ -792,6 +798,9 @@ bool RgfxAccelerator::startContexts()
 		__atomic_store_n(&releaseLock, rlock, __ATOMIC_RELEASE);
 		const UInt32 features = readRegister(RGFX_REG_FEATURES_LO);
 		surfacePages = (features & RGFX_FEATURE_SURFACE_PAGES) != 0;
+#if RGFX_GUEST_ARM64
+		pages16k = (featureWord() & RGFX_FEATURE_PAGES_16K) != 0;
+#endif
 		// A host offers SURFACE_CACHE_REFUSED only where it offers no SURFACE_CACHE: its GPU
 		// shares the CPU's memory.
 		askCache = surfacePages && (features & RGFX_FEATURE_SURFACE_CACHE) == 0 &&
@@ -1339,6 +1348,14 @@ bool writeRuns(IODeviceMemory *region, UInt64 at, const RgfxPageRun *runs, UInt3
 	if (!map)
 		return false;
 	bcopy(runs, reinterpret_cast<void *>(map->getVirtualAddress()), bytes);
+#if RGFX_GUEST_ARM64
+	// Where the kext took PAGES_16K, the device is told of the runs in whole 16 KiB pages: the
+	// last ends at its page's end, as the length the device is told does (postPages). The caller's
+	// runs stay as the memory's segments are, which a later ask's walk compares.
+	if (pages16k)
+		rgfxRunsToPageEnd(reinterpret_cast<RgfxPageRun *>(map->getVirtualAddress()), count,
+		                  kRgfxPage16K);
+#endif
 	map->release();
 	return true;
 }
@@ -2461,6 +2478,11 @@ IOReturn RgfxAccelerator::postPages(UInt32 context, UInt64 offset, UInt64 total,
 	message.pages.block_size = total;
 	message.pages.runs_offset = runsOffset;
 	message.pages.length = length;
+#if RGFX_GUEST_ARM64
+	// Where the kext took PAGES_16K: whole 16 KiB pages, as its runs are (writeRuns).
+	if (pages16k)
+		message.pages.length = rgfxToPageEnd(length, kRgfxPage16K);
+#endif
 	message.cache.flags = flags;
 	if (layout)
 		message.layout = *layout;
@@ -2495,7 +2517,14 @@ IOReturn RgfxAccelerator::pagesBlock(RgfxAcceleratorUserClient *client, UInt32 c
 	if (!writable)
 		return kIOReturnUnsupported;
 	RgfxPagesRange range = {};
-	if (!rgfxPagesRange(address, length, kPage, &range))
+#if RGFX_GUEST_ARM64
+	// Whole 16 KiB pages where the kext took PAGES_16K, as the bundle places its buffer at the
+	// pointer's offset in such a page then.
+	const UInt64 rangePage = pages16k ? kRgfxPage16K : kPage;
+#else
+	const UInt64 rangePage = kPage;
+#endif
+	if (!rgfxPagesRange(address, length, rangePage, &range))
 		return kIOReturnBadArgument;
 	// Wired for the block's life, which resolves copy-on-write first, so a private mapping's
 	// pages are its own before the device maps them.

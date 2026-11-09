@@ -92,4 +92,30 @@ inline uint64_t rgfxPagesBlockSize(uint32_t count, uint64_t page)
 	return (bytes + page - 1) & ~(page - 1);
 }
 
+// An arm64 guest's page, 16 KiB, which its kernel gives memory in and wires whole. Where the kext
+// took RGFX_FEATURE_PAGES_16K (RgfxFeatures.hpp), every run of guest RAM it names to the device,
+// and the length of each SURFACE_PAGES, is whole such pages, as a host whose page is 16 KiB maps
+// guest RAM in no less (design.md, "Negotiated features").
+constexpr uint64_t kRgfxPage16K = 0x4000;
+
+// `length` bytes from a page's first byte, taken to the end of their last page of `page` (a power
+// of two).
+inline uint64_t rgfxToPageEnd(uint64_t length, uint64_t page)
+{
+	return (length + page - 1) & ~(page - 1);
+}
+
+// The `count` runs of a span of guest RAM, as the device is told of them in whole pages of `page`
+// (a power of two): the last run taken to the end of its page. A span whose first byte is a
+// page's then covers rgfxToPageEnd(its length) bytes. The bytes past the span's own in its last
+// page are the same allocation's, which the kernel gives and wires in whole pages, so they are no
+// other allocation's to read or write.
+inline void rgfxRunsToPageEnd(RgfxPageRun *runs, uint32_t count, uint64_t page)
+{
+	if (count == 0)
+		return;
+	RgfxPageRun &last = runs[count - 1];
+	last.length = rgfxToPageEnd(last.address + last.length, page) - last.address;
+}
+
 #endif // RGFX_PAGES_BLOCK_HPP_

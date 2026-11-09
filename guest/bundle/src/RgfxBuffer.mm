@@ -436,7 +436,13 @@ NSString *rgfxLinearTypeName(MTLTextureType type)
 	RgfxRegion::Block block = region->acquirePages(pointer, length, true);
 	if (!block.ok)
 		return nil;
-	const uint64_t offset = reinterpret_cast<uintptr_t>(pointer) & (kRgfxGuestPage - 1);
+	// The block's view starts at the page of the pointer's first byte, of the kext's page.
+#if defined(__arm64__)
+	const uint64_t page = region->pagesPage();
+#else
+	const uint64_t page = kRgfxGuestPage;
+#endif
+	const uint64_t offset = reinterpret_cast<uintptr_t>(pointer) & (page - 1);
 	const bool managed = (options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged;
 	const MTLResourceOptions onHost =
 	    managed ? (options & ~MTLResourceStorageModeMask) | MTLResourceStorageModeShared : options;

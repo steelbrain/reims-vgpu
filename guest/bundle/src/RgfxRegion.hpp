@@ -242,6 +242,14 @@ public:
 	/// Whether a pages block source is set.
 	bool hasPagesBlocks() const { return m_pagesBlock != nullptr; }
 
+#if defined(__arm64__)
+	/// The page the kext rounds a pages block's range out to, which the device's view of the block
+	/// starts at: 16 KiB where the kext took RGFX_FEATURE_PAGES_16K (its RgfxPagesBlock.hpp),
+	/// else 4 KiB. Set with the pages block source, before any block is asked.
+	void setPagesPage(uint64_t page) { m_pagesPage = page; }
+	uint64_t pagesPage() const { return m_pagesPage; }
+#endif
+
 	/// The pages block of the `length` bytes at `address` (PagesBlockFn): `ok` false without a
 	/// pages block source, or where it gives none. Its `ptr` is null: the process never maps a
 	/// pages block, which holds the device's runs alone.
@@ -292,6 +300,9 @@ private:
 	void *m_pagesContext = nullptr;
 	PagesBlockFn m_pagesBlock = nullptr; // the pages block source, where set (the kext)
 	void *m_pagesBlockContext = nullptr;
+#if defined(__arm64__)
+	uint64_t m_pagesPage = 0x1000; // pagesPage()
+#endif
 	SurfaceWritesFn m_writesNote = nullptr; // the surface write source, where set (the kext)
 	SurfaceRetireFn m_writesRetire = nullptr;
 	void *m_writesContext = nullptr;
