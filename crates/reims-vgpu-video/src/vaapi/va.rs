@@ -18,6 +18,8 @@ mod export;
 mod fence;
 mod ffi;
 mod frame;
+#[cfg(test)]
+mod gated;
 mod h264;
 mod hevc;
 mod host_memory;

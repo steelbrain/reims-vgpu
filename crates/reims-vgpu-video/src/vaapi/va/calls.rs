@@ -65,7 +65,8 @@
 //!
 //! **The process's exit.** Every call, on the call thread and on its
 //! caller's alike, runs as a step of the host's exit gate
-//! ([`Runtime::exit_step`]): once the process's exit began, the thread parks
+//! ([`Runtime::exit_step`]), as do the display's open's own calls
+//! (`Display::open`): once the process's exit began, the thread parks
 //! for good before the call, and the gate's handler, registered again as
 //! each display's driver loads (`Display::open`), waits out a call in
 //! progress before the driver's own exit-time destructors run. So no call
@@ -423,6 +424,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::core::runtime::StdRuntime;
+    use super::super::gated::GatedRuntime;
 
     use super::*;
 
@@ -611,66 +613,6 @@ mod tests {
 
     /// The child's role in [`no_call_runs_beside_a_drivers_exit_time_destructors`].
     const EXIT_CHILD: &str = "RVG_TEST_CALLS_EXIT_CHILD";
-
-    /// A runtime with an exit gate of its own, as the host's is
-    /// (`reims_vgpu_vulkan::exit_gate`, shaped as that gate is): its hook,
-    /// registered by [`Runtime::arm_exit`], closes the gate and waits out
-    /// the steps in progress, at most 2 s; a step after that is refused.
-    struct GatedRuntime;
-
-    static CLOSED: AtomicBool = AtomicBool::new(false);
-    static IN_PROGRESS: AtomicUsize = AtomicUsize::new(0);
-
-    struct InProgress;
-
-    impl Drop for InProgress {
-        fn drop(&mut self) {
-            IN_PROGRESS.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    extern "C" fn close_the_gate() {
-        CLOSED.store(true, Ordering::SeqCst);
-        for _ in 0..2000 {
-            if IN_PROGRESS.load(Ordering::SeqCst) == 0 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    impl Runtime for GatedRuntime {
-        fn spawn(&self, name: &'static str, body: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
-            StdRuntime.spawn(name, body)
-        }
-
-        fn now(&self) -> MonoTime {
-            StdRuntime.now()
-        }
-
-        fn wait_until(
-            &self,
-            cv: &crate::core::sync::Condvar,
-            rings: &mut crate::core::sync::MutexGuard<'_, crate::core::runtime::Rings>,
-            deadline: MonoTime,
-        ) -> crate::core::runtime::TimedOut {
-            StdRuntime.wait_until(cv, rings, deadline)
-        }
-
-        fn exit_step(&self) -> Option<ExitStep> {
-            IN_PROGRESS.fetch_add(1, Ordering::SeqCst);
-            if CLOSED.load(Ordering::SeqCst) {
-                IN_PROGRESS.fetch_sub(1, Ordering::SeqCst);
-                return None;
-            }
-            Some(ExitStep::of(Box::new(InProgress)))
-        }
-
-        fn arm_exit(&self) {
-            // SAFETY: a plain function that never unwinds.
-            assert_eq!(unsafe { libc::atexit(close_the_gate) }, 0);
-        }
-    }
 
     /// Set by the stand-in for a driver's exit-time destructors.
     static DESTROYED: AtomicBool = AtomicBool::new(false);

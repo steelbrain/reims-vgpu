@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use crate::core::runtime::{MonoTime, Runtime};
+use crate::core::runtime::{MonoTime, Runtime, park_for_good};
 use crate::core::sync::Mutex;
 
 use super::calls::{Calls, Late};
@@ -170,9 +170,18 @@ impl Display {
     /// ([`Display::prime`]), and checks what its video processing writes
     /// into imported memory ([`Display::import_writes`]). libva's
     /// informational messages are silenced; its errors still go to stderr.
-    /// What is made on it runs on `runtime`.
+    /// What is made on it runs on `runtime`. Once the process's exit began,
+    /// the thread parks for good before any call of libva's, as before each
+    /// call of the display's (`super::calls`, "The process's exit").
     pub fn open(path: impl AsRef<Path>, runtime: Arc<dyn Runtime>) -> Result<Self, Error> {
         let path = path.as_ref();
+        // The open's own calls of libva, `vaInitialize` and a failed one's `vaTerminate` among
+        // them, are one step of the host's exit gate, as each call the display's `Calls` makes is
+        // (`super::calls`, "The process's exit"): once the process's exit began, the thread
+        // parks here for good, and an exit that begins during them waits for them to end.
+        let Some(step) = runtime.exit_step() else {
+            park_for_good()
+        };
         super::libva::load().map_err(Error::Load)?;
         let node = OpenOptions::new()
             .read(true)
@@ -211,6 +220,7 @@ impl Display {
                 .to_string_lossy()
                 .into_owned()
         };
+        drop(step);
         let display = Self {
             inner: Arc::new(DisplayInner {
                 calls: Calls::new(raw, Arc::clone(&runtime)),
@@ -356,4 +366,50 @@ impl Display {
 /// call that waits for the GPU.
 fn held() -> Error {
     Error::Stalled("a driver call ahead of this one on the display in time".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use crate::core::runtime::StdRuntime;
+    use super::super::gated::{GatedRuntime, close_the_gate};
+
+    use super::*;
+
+    /// The child's role in [`an_open_once_the_exit_began_makes_no_call_of_libva`].
+    const OPEN_CHILD: &str = "RVG_TEST_DISPLAY_OPEN_CHILD";
+
+    /// An open begun once the process's exit closed the host's gate makes no call of libva's:
+    /// its thread parks before it loads libva, where it would otherwise fail at once, no node
+    /// being at the path. Run in a child process of its own, which closes the gate.
+    #[test]
+    fn an_open_once_the_exit_began_makes_no_call_of_libva() {
+        if std::env::var_os(OPEN_CHILD).is_some() {
+            close_the_gate();
+            let (done, opened) = mpsc::channel();
+            StdRuntime::thread("test-exit-open", move || {
+                let open = Display::open("/nonexistent/renderD128", Arc::new(GatedRuntime));
+                let _ = done.send(open.is_ok());
+            })
+            .expect("a thread");
+            let code = match opened.recv_timeout(Duration::from_millis(300)) {
+                Err(mpsc::RecvTimeoutError::Timeout) => 0,
+                _ => 3,
+            };
+            std::process::exit(code);
+        }
+        let name = "vaapi::va::display::tests::an_open_once_the_exit_began_makes_no_call_of_libva";
+        let status = std::process::Command::new(std::env::current_exe().expect("the test"))
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(OPEN_CHILD, "1")
+            .status()
+            .expect("a child");
+        assert!(
+            status.success(),
+            "the open went on past the closed gate (3): {status:?}"
+        );
+    }
 }
