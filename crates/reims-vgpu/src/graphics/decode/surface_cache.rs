@@ -864,8 +864,8 @@ pub(crate) struct SurfaceCaches<P: Platform> {
     /// The blocks of the begins answered before the fills they make ([`Caches::before_answering`]),
     /// from the answer until those fills are made: no other begin counts a use of one meanwhile.
     answering: HashSet<u64>,
-    /// Whether laid-out caches are made with their memory a dma-buf, for the host's video to
-    /// decode into ([`Caches::set_dma_buf`]).
+    /// Whether laid-out caches of two planes are made with their memory a dma-buf, for the host's
+    /// video to decode into ([`Caches::set_dma_buf`]).
     dma_buf: bool,
 }
 
@@ -2882,17 +2882,19 @@ pub(crate) struct Caches<P: Platform> {
 struct CacheMaker {
     /// Caches are made exportable, for the host's video to import ([`Caches::set_exportable`]).
     exportable: bool,
-    /// Laid-out caches are made with their memory a dma-buf ([`Caches::set_dma_buf`]).
+    /// Laid-out caches of two planes are made with their memory a dma-buf
+    /// ([`Caches::set_dma_buf`]).
     dma_buf: bool,
 }
 
 impl CacheMaker {
     /// A new cache's buffer of `length` bytes, Private: exportable where the host's video
-    /// imports caches ([`Caches::set_exportable`]) and the platform makes one; else, where
-    /// `laid_out` and the host's video decodes into caches ([`Caches::set_dma_buf`]), one whose
-    /// memory is also a dma-buf, laid as the next is, where the platform makes one; else, where
-    /// `laid_out` (the kext's ask gave the surface's layout, so the cache's copies into the pages
-    /// take its texels alone: [`SurfaceCache::texels`]), one that declares the bytes between a
+    /// imports caches ([`Caches::set_exportable`]) and the platform makes one; else, where the
+    /// surface is laid out in two planes, as the host's video's output (NV12, P010) is, and the
+    /// host's video decodes into caches ([`Caches::set_dma_buf`]), one whose memory is also a
+    /// dma-buf, laid as the next is, where the platform makes one; else, where `layout` is given
+    /// (the kext's ask gave the surface's planes, so the cache's copies into the pages take its
+    /// texels alone: [`SurfaceCache::texels`]), one that declares the bytes between a
     /// texture's rows unobserved, which a texture over the cache whose rows lie with bytes
     /// between them may hold and change in place, with its byte `aligned` on a multiple of 256
     /// bytes of its memory where given ([`aligned_byte`]), so that textures over its surface's
@@ -2905,9 +2907,10 @@ impl CacheMaker {
         self,
         device: &P::Device,
         length: u64,
-        laid_out: bool,
+        layout: Option<&[PagesPlane]>,
         aligned: Option<u64>,
     ) -> RaiseResult<NewCache<P>> {
+        let laid_out = layout.is_some();
         let mut counts = MakerCounts::default();
         let life = || Some(MemoryLife::new());
         #[cfg(unix)]
@@ -2920,7 +2923,7 @@ impl CacheMaker {
             counts.unexportable = true;
         }
         #[cfg(unix)]
-        if self.dma_buf && laid_out {
+        if self.dma_buf && layout.is_some_and(|planes| planes.len() == 2) {
             let made = device.new_dma_buf_buffer_of_length_padding_unobserved(
                 ON,
                 length,
@@ -3219,9 +3222,17 @@ impl<P: Platform> Caches<P> {
         self.state.lock().exportable = true;
     }
 
-    /// Makes each laid-out cache from now on with its memory a dma-buf where the platform makes
-    /// one, for the host's video to decode its pictures into (`graphics::vaapi`): set once, at the
-    /// device's make, before any cache, where the device's video decodes into caches.
+    /// Makes each laid-out cache of two planes from now on with its memory a dma-buf where the
+    /// platform makes one, for the host's video to decode its pictures into (`graphics::vaapi`):
+    /// set once, at the device's make, before any cache, where the device's video decodes into
+    /// caches. The video decodes only into two-plane surfaces (NV12, P010), so a cache of one
+    /// plane is made as any other laid-out cache. Made dma-bufs, one-plane caches had the
+    /// runtime make their blocks on the thread that makes them, with the kernel's compaction of
+    /// memory under it 19 to 23 times a scroll (300 to 570 ms in all), and their exports waited
+    /// 47 to 155 ms a scroll behind imports that wait for the lock of the process's GPU address
+    /// space, which a block being made holds; made as other laid-out caches, neither (**measured**
+    /// 2026-11-09, a macOS 12.7.6 guest's Safari scroll on a Radeon 780M, whose caches all have
+    /// one plane).
     pub(crate) fn set_dma_buf(&self) {
         self.state.lock().dma_buf = true;
     }
@@ -3774,13 +3785,14 @@ impl<P: Platform> Caches<P> {
         let maker = state.maker();
         drop(state);
         let aligned = layout.as_deref().and_then(aligned_byte);
-        let made = (maker.make::<P>(device, length, layout.is_some(), aligned)).and_then(|cache| {
-            let pages = match cache.made.is_some() {
-                true => pages()?,
-                false => None,
-            };
-            Ok(Made { cache, pages })
-        });
+        let made =
+            (maker.make::<P>(device, length, layout.as_deref(), aligned)).and_then(|cache| {
+                let pages = match cache.made.is_some() {
+                    true => pages()?,
+                    false => None,
+                };
+                Ok(Made { cache, pages })
+            });
         let mut made = Some(made);
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
@@ -3816,7 +3828,7 @@ impl<P: Platform> Caches<P> {
         };
         let aligned = layout.as_deref().and_then(aligned_byte);
         let mut made =
-            (length <= room).then(|| maker.make::<P>(device, length, layout.is_some(), aligned));
+            (length <= room).then(|| maker.make::<P>(device, length, layout.as_deref(), aligned));
         let mut state = self.state.lock();
         self.wait_copies(&mut state, block);
         let taken = state.make_deferred(
@@ -6796,6 +6808,83 @@ mod tests {
         assert!(
             r.dec.caches().identity(BLOCK).is_none(),
             "a deferred cache: none"
+        );
+    }
+
+    /// Where the host's video decodes into caches, only a laid-out cache of two planes, as the
+    /// video's NV12 and P010 output is, is made a dma-buf and gives the video its identity; a
+    /// laid-out cache of one plane is made as any other laid-out cache, its bytes between rows
+    /// unobserved, and gives none, as the video writes no surface of one plane
+    #[cfg(unix)]
+    #[test]
+    fn only_a_two_plane_cache_is_made_a_dma_buf_for_the_hosts_video() {
+        use super::super::surface_pages::tests::one_plane;
+        use reims_vgpu_graphics::wire::{
+            RGFX_STATUS_CACHE, RgfxSurfacePagesLayout, RgfxSurfacePlaneLayout,
+        };
+        use reims_vgpu_vulkan::core::platform::values::PagesInPlace;
+        use reims_vgpu_vulkan::core::testkit::impls::device::{
+            DMA_BUF_BUFFER, PADDING_UNOBSERVED_BUFFER,
+        };
+        // Two planes as CoreVideo lays them from 0x20: `sample` bytes a texel, the chroma
+        // plane's rows after the luma's, interleaved and half as many.
+        let two_planes = |sample: u64| {
+            let mut layout = RgfxSurfacePagesLayout {
+                plane_count: 2,
+                ..Default::default()
+            };
+            layout.planes[0] = RgfxSurfacePlaneLayout {
+                offset: 0x20,
+                bytes_per_row: 256 * sample,
+                row_bytes: 240 * sample,
+                rows: 16,
+            };
+            layout.planes[1] = RgfxSurfacePlaneLayout {
+                offset: 0x20 + 16 * 256 * sample,
+                bytes_per_row: 256 * sample,
+                row_bytes: 240 * sample,
+                rows: 8,
+            };
+            layout
+        };
+        // The buffer a laid-out cache was made as, and whether it gives its identity.
+        let made = |layout: RgfxSurfacePagesLayout| {
+            let mut r = rig(16);
+            let page = r.page;
+            r.dec.set_unified_memory(true);
+            r.dec.set_dma_buf_caches();
+            let world = Arc::clone(r.p.world());
+            world.answer_surface_pages(PagesInPlace::No("off the device's alignment".into()));
+            let mark = r.p.call_log().mark();
+            assert_eq!(
+                r.pages_asking(BLOCK, &[(1, 4)], 4 * page, Some(layout)),
+                RGFX_STATUS_CACHE
+            );
+            assert_eq!(
+                r.pages_cached(BLOCK, &[(1, 4)], 4 * page, true),
+                RGFX_STATUS_OK
+            );
+            let sels = r.p.call_log().sels_since(mark);
+            let made: Vec<&str> = (sels.iter().copied())
+                .filter(|sel| [DMA_BUF_BUFFER, PADDING_UNOBSERVED_BUFFER].contains(sel))
+                .collect();
+            assert_eq!(r.dec.caches().len(), 1);
+            (made, r.dec.caches().identity(BLOCK).is_some())
+        };
+        assert_eq!(
+            made(two_planes(1)),
+            (vec![DMA_BUF_BUFFER], true),
+            "NV12: a dma-buf, given"
+        );
+        assert_eq!(
+            made(two_planes(2)),
+            (vec![DMA_BUF_BUFFER], true),
+            "P010: a dma-buf, given"
+        );
+        assert_eq!(
+            made(one_plane(1024, 960, 16)),
+            (vec![PADDING_UNOBSERVED_BUFFER], false),
+            "one plane: as any other laid-out cache, none"
         );
     }
 
