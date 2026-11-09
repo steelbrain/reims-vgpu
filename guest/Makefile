@@ -24,8 +24,9 @@
 #   make prebuilt-check
 #       fail unless prebuilt/ and prebuilt-arm64e/ are each what their
 #       sources.toml records, the tree's sources are the ones they were built
-#       from, and graft/ is the copy its source.toml records; hashes only, on
-#       any host
+#       from, graft/ is the copy its source.toml records, and no kext leaves
+#       one of our own symbols undefined that no kext before it defines (which
+#       staging a set checks too); hashes and symbol tables only, on any host
 #   make set-check KEXTINJECT=<OpenCorePkg's TestKextInject binary>
 #               BOOT_KC=<the guest's x86_64 BootKernelExtensions.kc> [SET=prebuilt]
 #       link SET into BOOT_KC with OpenCore's linker, in user space, in

@@ -12,7 +12,8 @@ the vendored arm64e Graft build, dormant ReimsGraphics and RgfxGate for the arm6
 guests Ambrosia boots.
 No kernel-range gate, KDK, loader, shim or downloaded build input is used.
 check also verifies guest/graft against the record Graft's tools/vendor.py
-wrote beside it.
+wrote beside it. stage and check both fail a set where a kext leaves one of our
+own symbols undefined that no kext before it in the set defines.
 """
 
 import hashlib
@@ -73,6 +74,13 @@ INPUTS = (
     "guest/graft",
 )
 IGNORED = (".DS_Store", "__pycache__")
+# Our own names: a symbol with one of these in it is the set's own code, which a kext of the set
+# defines, never the kernel or Apple's kexts. A boot linker (OpenCore's for an x86-64 guest,
+# Ambrosia's for an arm64 one) resolves a kext's undefined symbols against the kernel and the
+# kexts linked before it, so one of ours that no kext before it defines leaves the kext
+# unlinkable and the guest unbootable: an arm64e ReimsGraphics that called a member compiled for
+# x86-64 alone stopped Ambrosia before the kernel ("boot failed: NoSymbol").
+OWN_NAMES = re.compile(r"ReimsGraphics|Rgfx|rgfx|RGFX|Graft|graft")
 
 
 def sha256(path):
@@ -153,6 +161,10 @@ def stage(out, work, arch="x86_64"):
         exe = kext / "Contents/MacOS" / infos[kext.name]["CFBundleExecutable"]
         if arch not in tool("lipo", "-archs", str(exe)).split():
             raise SystemExit(f"prebuilt: {kext.name} has no {arch} slice")
+    unresolved = unresolved_own(
+        [(k.name, k / "Contents/MacOS" / infos[k.name]["CFBundleExecutable"]) for k, _ in kexts], arch)
+    if unresolved:
+        raise SystemExit("\n".join(f"prebuilt: {e}" for e in unresolved))
     # Each kext after those of the set it names.
     ids = [infos[k.name]["CFBundleIdentifier"] for k, _ in kexts]
     for i, (kext, _) in enumerate(kexts):
@@ -185,6 +197,57 @@ def stage(out, work, arch="x86_64"):
         ]
     (out / MANIFEST).write_text("\n".join(lines) + "\n")
     print(f"prebuilt: {out}: {', '.join(k.name for k, _ in kexts)}")
+
+
+def macho_symbols(exe, arch):
+    """The external symbols the Mach-O at `exe` (its `arch` slice, where it is fat) leaves
+    undefined, and those it defines: two sets of names, from its LC_SYMTAB."""
+    data = Path(exe).read_bytes()
+    base = 0
+    if int.from_bytes(data[:4], "big") == 0xCAFEBABE:
+        cputype = {"x86_64": 0x01000007, "arm64e": 0x0100000C}[arch]
+        for i in range(int.from_bytes(data[4:8], "big")):
+            entry = data[8 + 20 * i: 28 + 20 * i]
+            if int.from_bytes(entry[:4], "big") == cputype:
+                base = int.from_bytes(entry[8:12], "big")
+                break
+        else:
+            raise SystemExit(f"prebuilt: {exe} has no {arch} slice")
+    if int.from_bytes(data[base:base + 4], "little") != 0xFEEDFACF:
+        raise SystemExit(f"prebuilt: {exe} is not a 64-bit Mach-O")
+    ncmds = int.from_bytes(data[base + 16:base + 20], "little")
+    at, undefined, defined = base + 32, set(), set()
+    for _ in range(ncmds):
+        cmd, size = (int.from_bytes(data[at + k:at + k + 4], "little") for k in (0, 4))
+        if cmd == 0x2:  # LC_SYMTAB
+            symoff, nsyms, stroff = (int.from_bytes(data[at + k:at + k + 4], "little")
+                                     for k in (8, 12, 16))
+            for i in range(nsyms):
+                entry = base + symoff + 16 * i
+                strx = int.from_bytes(data[entry:entry + 4], "little")
+                n_type = data[entry + 4]
+                start = base + stroff + strx
+                name = data[start:data.index(b"\0", start)].decode()
+                if n_type & 0xE0 or not n_type & 0x01:  # a debugging entry, or not external
+                    continue
+                if n_type & 0x0E == 0x00:  # N_UNDF
+                    undefined.add(name)
+                elif n_type & 0x0E == 0x0E:  # N_SECT
+                    defined.add(name)
+        at += size
+    return undefined, defined
+
+
+def unresolved_own(kexts, arch):
+    """Errors for each of our own symbols (OWN_NAMES) a kext of `kexts`, (name, executable)
+    pairs in the set's order, leaves undefined where no kext before it defines it."""
+    errors, defined = [], set()
+    for name, exe in kexts:
+        undefined, exported = macho_symbols(exe, arch)
+        errors += [f"{name} leaves {symbol} undefined, and no kext before it in the set defines it"
+                   for symbol in sorted(undefined) if OWN_NAMES.search(symbol) and symbol not in defined]
+        defined |= exported
+    return errors
 
 
 def tool(*cmd):
@@ -274,6 +337,15 @@ def check(top):
         elif sha256(top / p) != outputs[p]:
             errors.append(f"{rel}/{p}: not the file the set was built as")
     errors += [f"{rel}/{p}: not part of the built set" for p in sorted(present - outputs.keys())]
+    arm64e = top.name.endswith("arm64e")
+    kexts = []
+    for src, _ in SET_ARM64E if arm64e else SET:
+        kext = top / Path(src).name
+        if (kext / "Contents/Info.plist").is_file():
+            exe = kext / "Contents/MacOS" / plist(kext)["CFBundleExecutable"]
+            if exe.is_file():
+                kexts.append((kext.name, exe))
+    errors += unresolved_own(kexts, "arm64e" if arm64e else "x86_64")
     if not outputs:
         errors.append(f"{rel / RECORD}: records no outputs")
     for e in errors:
