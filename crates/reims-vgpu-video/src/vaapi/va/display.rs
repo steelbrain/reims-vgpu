@@ -371,6 +371,7 @@ fn held() -> Error {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -411,5 +412,70 @@ mod tests {
             status.success(),
             "the open went on past the closed gate (3): {status:?}"
         );
+    }
+
+    /// The child's role in
+    /// [`a_display_let_go_once_its_drivers_exit_time_destructors_ran_calls_nothing`].
+    const LATE_CHILD: &str = "RVG_TEST_DISPLAY_LATE_CHILD";
+
+    /// Set by the late exit handler, which has the display let go.
+    static LET_GO: AtomicBool = AtomicBool::new(false);
+    /// Set once the display's drop returned, its `vaTerminate` made.
+    static DROPPED: AtomicBool = AtomicBool::new(false);
+
+    /// An exit handler registered before the display opens, so that it runs after the exit-time
+    /// destructors its driver registered as `vaInitialize` loaded it: has the display let go,
+    /// and ends the process with 3 where the drop returned within a second.
+    extern "C" fn let_go_late() {
+        LET_GO.store(true, Ordering::SeqCst);
+        for _ in 0..1000 {
+            if DROPPED.load(Ordering::SeqCst) {
+                // SAFETY: ends the process at once, which is the point.
+                unsafe { libc::_exit(3) };
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A display let go on another thread once the process's exit ran its driver's exit-time
+    /// destructors, as a device's display was when a test process exited as the device's thread
+    /// let it go: its last `vaTerminate` then aborted in iHD's frees ("double free or corruption
+    /// (out)", "free(): invalid pointer") on the Iris Xe. With the host's gate armed as the
+    /// display opened, the gate closed before those destructors ran, and the drop parks its
+    /// thread before any call. Run in child processes of their own, which exit.
+    #[test]
+    #[ignore = "needs a VA-API GPU: run on the VA-API host"]
+    fn a_display_let_go_once_its_drivers_exit_time_destructors_ran_calls_nothing() {
+        let node = std::env::var("RVG_VAAPI_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+        if std::env::var_os(LATE_CHILD).is_some() {
+            // SAFETY: a plain function that never unwinds.
+            assert_eq!(unsafe { libc::atexit(let_go_late) }, 0);
+            let display = Display::open(&node, Arc::new(GatedRuntime)).expect("a display");
+            StdRuntime::thread("test-late-drop", move || {
+                while !LET_GO.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(display);
+                DROPPED.store(true, Ordering::SeqCst);
+            })
+            .expect("a thread");
+            std::process::exit(0);
+        }
+        let name = "vaapi::va::display::tests::\
+                    a_display_let_go_once_its_drivers_exit_time_destructors_ran_calls_nothing";
+        for _ in 0..5 {
+            let child = std::process::Command::new(std::env::current_exe().expect("the test"))
+                .args(["--exact", name, "--nocapture", "--test-threads=1", "--ignored"])
+                .env(LATE_CHILD, "1")
+                .output()
+                .expect("a child");
+            let stderr = String::from_utf8_lossy(&child.stderr);
+            assert!(
+                child.status.success(),
+                "{node}: the display's drop made its vaTerminate after the driver's exit-time \
+                 destructors (3), or the child ended otherwise: {:?}\n{stderr}",
+                child.status
+            );
+        }
     }
 }
