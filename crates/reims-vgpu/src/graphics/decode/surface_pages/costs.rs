@@ -22,28 +22,32 @@
 //! of the memfd, and `RGK_BENCH_CASES` a comma list of the cases' names to run.
 //!
 //! **A pages slab's take** (`pages_take_costs_*`, run as above with `test(/pages_take_costs/)`):
-//! what each of a process's superpage slabs costs the thread that carries its messages out, as
+//! what each of a process's 2 MiB pages slabs costs the thread that carries its messages out, as
 //! the bundle's pages slab source sends them (`RgfxPagesSlabSource`): the pages block's
-//! `SURFACE_PAGES` of its one 2 MiB run, the `HEAP_OVER_PAGES` over it and a first
-//! `BUFFER_AT_OFFSET` in the heap. The guest's next take waits for them: its `PagesBlock` call is
-//! answered after the messages before it. The RAM is fresh, as a booted guest's is where no
-//! process was yet: only each superpage's own 2 MiB are written, as the guest's zero fill writes
-//! them, just before its take, and the rest of the RAM is never touched. The superpages are taken
-//! in three orders of the RAM's 2 MiB slots: upwards, downwards and scattered. A device that takes
-//! the guest's RAM whole (the Vulkan platform on NVIDIA's driver, `os/linux/host_ram.rs`) imports
-//! it in the runtime's chunks, so this is where a take over a chunk not yet imported shows.
-//! `RGK_BENCH_TAKES` superpages an order (default 256, 512 MiB), `RGK_BENCH_RAM_MIB` the RAM
-//! (at least twice the takes'), `RGK_BENCH_TAKE_GAP_US` a pause before each take (default 0, a
-//! burst), and `RGK_BENCH_ORDERS` a comma list of the orders' names to run.
+//! `SURFACE_PAGES` of its plain pages' runs, the `HEAP_OVER_PAGES` over it, which makes the
+//! block's view (a mapping of each run) and its import where the block is more than one run, and
+//! a first `BUFFER_AT_OFFSET` in the heap. The guest's next take waits for them: its `PagesBlock`
+//! call is answered after the messages before it. The RAM is fresh, as a booted guest's is where
+//! no process was yet: only each slab's own pages are written, as the guest's zero fill writes
+//! them, just before its take, and the rest of the RAM is never touched. A slab's 512 guest pages
+//! are taken from the RAM's pages in three orders, which the kext lists as runs, a page right
+//! after the one before continuing its run: upwards (each page after the one before: one run, as
+//! a kernel with free RAM in one piece gives them), downwards (each page right below the one
+//! before: 512 runs of a page, as a kernel's free list may give them) and scattered (pages picked
+//! at random over the RAM: 512 runs). A device that takes the guest's RAM whole (the Vulkan
+//! platform on NVIDIA's driver, `os/linux/host_ram.rs`) imports it in the runtime's chunks, so
+//! this is where a take over a chunk not yet imported shows. `RGK_BENCH_TAKES` slabs an order
+//! (default 256, 512 MiB), `RGK_BENCH_RAM_MIB` the RAM (at least twice the takes'),
+//! `RGK_BENCH_TAKE_GAP_US` a pause before each take (default 0, a burst), and `RGK_BENCH_ORDERS` a
+//! comma list of the orders' names to run.
 //!
 //! **A large pages slab's take** (`large_take_costs_*`, `test(/large_take_costs/)`): what a large
-//! Shared buffer of the process's own superpages costs, as the bundle sends it: the pages block's
-//! `SURFACE_PAGES` of its superpages' runs, then a `BUFFER_OVER_PAGES` over the whole block, which
+//! Shared buffer of the process's own plain pages costs, as the bundle sends it: the pages block's
+//! `SURFACE_PAGES` of its pages' runs, then a `BUFFER_OVER_PAGES` over the whole block, which
 //! makes the block's view (a mapping of each run) and the import of it, and the buffer's destroy
-//! and the block's release. The superpages are taken in the three orders above, so a slab's runs
-//! are one run (upwards, each superpage right after the one before, which the kext lists as one),
-//! or one a superpage (downwards, scattered). `RGK_BENCH_LARGE_MIB` MiB a slab (default 64),
-//! `RGK_BENCH_LARGE_TAKES` slabs an order (default 8), and `RGK_BENCH_ORDERS` as above.
+//! and the block's release. The pages are taken in the three orders above, so a slab is one run
+//! (upwards) or one run a page (downwards, scattered). `RGK_BENCH_LARGE_MIB` MiB a slab (default
+//! 64), `RGK_BENCH_LARGE_TAKES` slabs an order (default 8), and `RGK_BENCH_ORDERS` as above.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -465,22 +469,28 @@ fn measure<P: ApiPlatform>(label: &str) {
     drop(ram);
 }
 
-/// A superpage: the guest's 2 MiB slab of a process's own pages.
-const SUPERPAGE: u64 = 2 * MIB;
+/// A pages slab with a heap: the guest's 2 MiB of a process's own plain pages.
+const SLAB: u64 = 2 * MIB;
 
-/// The orders the superpages are taken in: of the RAM's 2 MiB slots, `takes` of them.
-fn take_orders(slots: u64, takes: u64, rng: &mut XorShift) -> Vec<(&'static str, Vec<u64>)> {
-    let mut scattered: Vec<u64> = (0..slots).collect();
+/// The orders a slab's pages are taken in (module docs): of the RAM's `pages` guest pages,
+/// `takes` of them.
+fn take_orders(pages: u64, takes: u64, rng: &mut XorShift) -> Vec<(&'static str, Vec<u64>)> {
+    let mut scattered: Vec<u64> = (0..pages).collect();
     for i in 0..takes.to_usize() {
-        let j = i + (rng.next() % (slots - i.to_u64())).to_usize();
+        let j = i + (rng.next() % (pages - i.to_u64())).to_usize();
         scattered.swap(i, j);
     }
     scattered.truncate(takes.to_usize());
     vec![
         ("upwards", (0..takes).collect()),
-        ("downwards", (slots - takes..slots).rev().collect()),
+        ("downwards", (pages - takes..pages).rev().collect()),
         ("scattered", scattered),
     ]
+}
+
+/// The bytes of a pages block whose processes map one page, with room past it for `runs` runs.
+fn block_size(runs: u64) -> u64 {
+    GUEST_PAGE + (runs * size_of::<RgfxPageRun>().to_u64()).next_multiple_of(GUEST_PAGE)
 }
 
 /// Measures a pages slab's takes on `platform` in each order (module docs), printing a line per
@@ -489,19 +499,20 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
     let platform = P::process();
     let device = platform.metal_device(None).expect("a GPU device");
     let takes = env_u64("RGK_BENCH_TAKES", 256);
-    let ram_bytes = (env_u64("RGK_BENCH_RAM_MIB", 1024) * MIB).max(2 * takes * SUPERPAGE);
+    let ram_bytes = (env_u64("RGK_BENCH_RAM_MIB", 1024) * MIB).max(2 * takes * SLAB);
     let gap = Duration::from_micros(env_u64("RGK_BENCH_TAKE_GAP_US", 0));
     let only = std::env::var("RGK_BENCH_ORDERS").ok();
     let mut rng = XorShift(0x6a09_e667_f3bc_c908);
-    let orders = take_orders(ram_bytes / SUPERPAGE, takes, &mut rng);
+    let per = SLAB / GUEST_PAGE;
+    let orders = take_orders(ram_bytes / GUEST_PAGE, takes * per, &mut rng);
     eprintln!(
-        "{label}: {} MiB of fresh guest RAM, {takes} superpages an order, {} us apart",
+        "{label}: {} MiB of fresh guest RAM, {takes} slabs of plain pages an order, {} us apart",
         ram_bytes >> 20,
         gap.as_micros()
     );
-    // Each block holds its one run, a page of its own.
-    let block_size = 0x2000u64;
-    for (name, slots) in orders {
+    // Each block holds its runs past a page of its own, room for one run a page.
+    let block_size = block_size(per);
+    for (name, pages) in orders {
         if only
             .as_ref()
             .is_some_and(|o| !o.split(',').any(|n| n == name))
@@ -520,27 +531,22 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
         let mut steps: [Step; 7] = Default::default();
         let mut slow = Vec::new();
         let mut made = Vec::new();
-        for (i, &slot) in slots.iter().enumerate() {
+        let mut run_counts = std::collections::BTreeSet::new();
+        for (i, slab_pages) in pages.chunks(per.to_usize()).enumerate() {
             std::thread::sleep(gap);
             let block = BLOCK + i.to_u64() * block_size;
-            let offset = slot * SUPERPAGE;
-            // SAFETY: the superpage's bytes, in the RAM's mapping, which nothing else uses.
-            steps[0].time(|| unsafe {
-                std::ptr::write_bytes(ram.at.add(offset.to_usize()), 0, SUPERPAGE.to_usize());
-            });
-            let pages = RgfxSurfacePages {
+            steps[0].time(|| zero_pages(&ram, slab_pages));
+            let runs = page_runs(slab_pages);
+            run_counts.insert(runs.len());
+            let message = RgfxSurfacePages {
                 header: header(RGFX_CMD_SURFACE_PAGES),
                 context: 0,
-                run_count: 1,
+                run_count: u32::try_from(runs.len()).expect("a slab's runs"),
                 block_offset: block,
                 block_size,
-                runs_offset: block + 0x1000,
-                length: SUPERPAGE,
+                runs_offset: block + GUEST_PAGE,
+                length: SLAB,
             };
-            let run = [RgfxPageRun {
-                address: RAM + offset,
-                length: SUPERPAGE,
-            }];
             let heap = 0x1000 + 2 * i.to_u64();
             let heap_over = RgfxHeapOverPages {
                 header: header(RGFX_CMD_HEAP_OVER_PAGES),
@@ -548,7 +554,7 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
                 gpu_address: 0,
                 block_offset: block,
                 block_size,
-                size_bytes: SUPERPAGE,
+                size_bytes: SLAB,
                 options: 0,
                 heap_type: 1,
             };
@@ -562,7 +568,7 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
                 reserved_34: 0,
             };
             let status = steps[1]
-                .time(|| dec.surface_pages(&device, &pages, &run, RGFX_SURFACE_PAGES_PRIVATE));
+                .time(|| dec.surface_pages(&device, &message, &runs, RGFX_SURFACE_PAGES_PRIVATE));
             assert_eq!(status, RGFX_STATUS_OK, "{name}: take {i}'s SURFACE_PAGES");
             let heaped = steps[2].time(|| dec.decode(&device, heap_over.as_bytes()));
             assert_eq!(heaped.ok(), Some(Ok(())), "{name}: take {i}'s heap");
@@ -604,9 +610,10 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
             .map(|(i, d)| format!("{i}:{:.1}", d.as_secs_f64() * 1e3))
             .collect();
         eprintln!(
-            "{label}: {name:<11} takes of 5 ms or more: {} of {} (take:ms) {}",
+            "{label}: {name:<11} takes of 5 ms or more: {} of {} (take:ms) {}; runs a slab: \
+             {run_counts:?}",
             slow.len(),
-            slots.len(),
+            made.len(),
             listed.join(" ")
         );
         dec.views_of_surfaces().reset();
@@ -617,21 +624,36 @@ fn measure_takes<P: ApiPlatform>(label: &str) {
     }
 }
 
-/// The runs of the superpages at `slots` of the RAM's 2 MiB slots, in that order, as the kext
-/// lists a block's pages: a superpage right after the one before continues its run.
-fn superpage_runs(slots: &[u64]) -> Vec<RgfxPageRun> {
+/// The runs of the guest pages at `pages` of the RAM's pages, in that order, as the kext lists a
+/// block's pages: a page right after the one before continues its run.
+fn page_runs(pages: &[u64]) -> Vec<RgfxPageRun> {
     let mut runs: Vec<RgfxPageRun> = Vec::new();
-    for &slot in slots {
-        let address = RAM + slot * SUPERPAGE;
+    for &page in pages {
+        let address = RAM + page * GUEST_PAGE;
         match runs.last_mut() {
-            Some(last) if last.address + last.length == address => last.length += SUPERPAGE,
+            Some(last) if last.address + last.length == address => last.length += GUEST_PAGE,
             _ => runs.push(RgfxPageRun {
                 address,
-                length: SUPERPAGE,
+                length: GUEST_PAGE,
             }),
         }
     }
     runs
+}
+
+/// Writes zeros over the guest pages at `pages` of `ram`, as the guest's zero fill of a slab's
+/// fresh pages does.
+fn zero_pages(ram: &Ram, pages: &[u64]) {
+    for &page in pages {
+        // SAFETY: the page's bytes, in the RAM's mapping, which nothing else uses.
+        unsafe {
+            std::ptr::write_bytes(
+                ram.at.add((page * GUEST_PAGE).to_usize()),
+                0,
+                GUEST_PAGE.to_usize(),
+            );
+        }
+    }
 }
 
 /// Measures large pages slabs' takes on `platform` in each order (module docs), printing a line
@@ -641,18 +663,18 @@ fn measure_large_takes<P: ApiPlatform>(label: &str) {
     let device = platform.metal_device(None).expect("a GPU device");
     let slab = env_u64("RGK_BENCH_LARGE_MIB", 64) * MIB;
     let takes = env_u64("RGK_BENCH_LARGE_TAKES", 8);
-    let per = slab / SUPERPAGE;
+    let per = slab / GUEST_PAGE;
     let ram_bytes = (env_u64("RGK_BENCH_RAM_MIB", 1024) * MIB).max(2 * takes * slab);
     let only = std::env::var("RGK_BENCH_ORDERS").ok();
     let mut rng = XorShift(0xbb67_ae85_84ca_a73b);
-    let orders = take_orders(ram_bytes / SUPERPAGE, takes * per, &mut rng);
+    let orders = take_orders(ram_bytes / GUEST_PAGE, takes * per, &mut rng);
     eprintln!(
-        "{label}: {} MiB of fresh guest RAM, {takes} slabs of {} MiB an order",
+        "{label}: {} MiB of fresh guest RAM, {takes} slabs of {} MiB of plain pages an order",
         ram_bytes >> 20,
         slab >> 20
     );
-    let block_size = 0x4000u64;
-    for (name, slots) in orders {
+    let block_size = block_size(per);
+    for (name, pages) in orders {
         if only
             .as_ref()
             .is_some_and(|o| !o.split(',').any(|n| n == name))
@@ -669,24 +691,18 @@ fn measure_large_takes<P: ApiPlatform>(label: &str) {
         dec.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
         let mut steps: [Step; 6] = Default::default();
         let mut run_counts = Vec::new();
-        for (i, slab_slots) in slots.chunks(per.to_usize()).enumerate() {
+        for (i, slab_pages) in pages.chunks(per.to_usize()).enumerate() {
             let block = BLOCK + i.to_u64() * block_size;
-            steps[0].time(|| {
-                for &slot in slab_slots {
-                    let offset = (slot * SUPERPAGE).to_usize();
-                    // SAFETY: the superpage's bytes, in the RAM's mapping, which nothing else uses.
-                    unsafe { std::ptr::write_bytes(ram.at.add(offset), 0, SUPERPAGE.to_usize()) };
-                }
-            });
-            let runs = superpage_runs(slab_slots);
+            steps[0].time(|| zero_pages(&ram, slab_pages));
+            let runs = page_runs(slab_pages);
             run_counts.push(runs.len());
-            let pages = RgfxSurfacePages {
+            let message = RgfxSurfacePages {
                 header: header(RGFX_CMD_SURFACE_PAGES),
                 context: 0,
                 run_count: u32::try_from(runs.len()).expect("a slab's runs"),
                 block_offset: block,
                 block_size,
-                runs_offset: block + 0x1000,
+                runs_offset: block + GUEST_PAGE,
                 length: slab,
             };
             let over = RgfxBufferOverPages {
@@ -701,7 +717,7 @@ fn measure_large_takes<P: ApiPlatform>(label: &str) {
                 reserved_44: 0,
             };
             let status = steps[1]
-                .time(|| dec.surface_pages(&device, &pages, &runs, RGFX_SURFACE_PAGES_PRIVATE));
+                .time(|| dec.surface_pages(&device, &message, &runs, RGFX_SURFACE_PAGES_PRIVATE));
             assert_eq!(status, RGFX_STATUS_OK, "{name}: slab {i}'s SURFACE_PAGES");
             let made = steps[2].time(|| dec.decode(&device, over.as_bytes()));
             assert_eq!(made.ok(), Some(Ok(())), "{name}: slab {i}'s buffer");

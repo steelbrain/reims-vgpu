@@ -754,7 +754,7 @@ mod tests {
             )
         };
         assert_ne!(start, libc::MAP_FAILED);
-        // Every page touched first, as a guest's superpages are.
+        // Every page touched first, as the guest's zero fill touches a slab's pages.
         // SAFETY: the mapping above, `length` bytes.
         unsafe { std::ptr::write_bytes(start.cast::<u8>(), 0, length.to_usize()) };
         let at = start.addr().to_u64();
@@ -831,9 +831,10 @@ mod tests {
         }
         let (p50, max) = median(&mut times);
         println!("slab: placed 4 KiB buffers n=512 p50_us={p50:.2} max_us={max:.1}");
-        // Views of runs: 2 MiB runs 4 MiB apart from 4,100 MiB on (2 runs, 4 MiB; 32 runs, 64 MiB), as
-        // superpage slabs of several superpages are; 4 KiB runs 8 KiB apart from 4,300 MiB on (512
-        // runs, 2 MiB; 4,096 runs, 16 MiB), as a slab of scattered guest pages is.
+        // Views of runs: 4 KiB runs 8 KiB apart from 4,300 MiB on (512 runs, 2 MiB; 4,096 runs,
+        // 16 MiB), as a slab of the guest's plain pages is where its kernel gives them scattered,
+        // the common case; 2 MiB runs 4 MiB apart from 4,100 MiB on (2 runs, 4 MiB; 32 runs,
+        // 64 MiB), as a large slab is where they come in 2 MiB pieces.
         let view = |runs: u64, run: u64, from: u64| {
             let len = runs * run;
             // SAFETY: a fresh reservation, then each run mapped over it from the file.
