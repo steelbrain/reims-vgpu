@@ -95,6 +95,9 @@
     "__ZN22IOAVVideoTimingElement16setColorElementsEP7OSArray": {
       "library": 2
     },
+    "__ZN29IOMobileFramebufferUserClient26enqueueInIOSharedDataQueueEPyj": {
+      "library": 1
+    },
     "__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEb": {
       "library": 1,
       "candidates": [

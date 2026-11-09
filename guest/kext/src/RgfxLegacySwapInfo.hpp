@@ -6,8 +6,10 @@
 //   the completed swap's ID. The paravirtual display makes the swap's record (RgfxSwapInfoRecord)
 //   and hands it to the class's swap_info_notify_dispatch_gated, which calls the display's
 //   do_swap_info_notify_gated for each notify request the class holds.
-// - do_swap_info_notify_gated sends the request's client an async result (rgfxSwapInfoArgs): the
-//   request's tag mask, the swap's ID, and the record's values the mask asks for.
+// - do_swap_info_notify_gated sends the request's client the record's values (rgfxSwapInfoArgs): the
+//   request's tag mask, the swap's ID, and the record's values the mask asks for. The paravirtual
+//   display sends them as an async result; ReimsGraphics enqueues them in the client's shared data
+//   queue (below).
 // - set_notify_tag_mask_gated sets a request's tag mask, for the swap-info notification alone.
 //
 // The paravirtual display answers supported_frame_info kIOReturnUnsupported, and so a client never
@@ -19,11 +21,22 @@
 // SkyLight (display_present_handler) and IOMobileFramebuffer.framework (InfoKeyInitialize,
 // figure_frame_info_mask, FrameInfoNotifyFunc). ReimsGraphics answers the tags it fills
 // (rgfxFrameInfoTag): the library asks each tag's name by its index, and a client's tag mask sets
-// bit i for tag i; a result's values come in the tags' order, each one argument where the mask's
+// bit i for tag i; a record's values come in the tags' order, each one word where the mask's
 // bit 31 is clear (two, its low and then its high word, where it is set), and the library turns
 // them into a dictionary of the tags' names. Its timestamps are mach_continuous_time's, which the
 // library turns into mach_absolute_time's (kern_egest_timestamp), as the class's own
 // get_current_absolute_time reads mach_continuous_time.
+//
+// The records go through the client's shared data queue, as on an Apple display: on every release
+// the class adds a frame info request without an async reference (add_notification_gated, where
+// its finfo_support_io_shared_queue answers true, as it does on each), so an async result would
+// reach no port. supported_frame_info answers that the records come in a data queue, which
+// IOMobileFramebufferUserClient keeps (s_supported_frame_info) and makes at the client's frame
+// info port (registerNotificationPort), and which IOMobileFramebuffer.framework maps
+// (clientMemoryForType 3) and reads (FrameInfoNotifyFuncIOShq, PackAndDispatchFrameInfoNotifictionData):
+// each entry is a record's words, the same as an async result's arguments, copied into a buffer of
+// 0x100 bytes. The display enqueues each through the request's user client
+// (IOMobileFramebufferUserClient::enqueueInIOSharedDataQueue, which every release exports).
 // Header-only and free of the kernel's headers, for the native tests.
 //
 // Our own code.
@@ -52,18 +65,19 @@ struct RgfxSwapInfoRecord {
 static_assert(sizeof(RgfxSwapInfoRecord) == 0x30, "a swap-info record is 0x30 bytes");
 static_assert(offsetof(RgfxSwapInfoRecord, field_08) == 0x08, "its doublewords start at 8");
 
-// In a notify request (IOMFBNotifyRequest), the same on each release: the async reference its
-// client gave, which the result is sent to; the tag mask; and the field_08 of the last record
-// sent, which the next one's second value is taken from.
-constexpr uint32_t kRgfxNotifyRequestReference = 0x18;
+// In a notify request (IOMFBNotifyRequest), the same on each release: the user client it is for,
+// the first word of the request's arguments, which add_notification_gated stores at 0x10 and reads
+// the task of (its 0xe8, as IOMobileFramebufferUserClient's registerNotificationPort does); the tag
+// mask; and the field_08 of the last record sent, which the next one's second value is taken from.
+constexpr uint32_t kRgfxNotifyRequestClient = 0x10;
 constexpr uint32_t kRgfxNotifyRequestMask = 0x78;
 constexpr uint32_t kRgfxNotifyRequestLast = 0x80;
 
 // The notification type set_notify_tag_mask_gated takes a mask for (IOMFB_NotificationType).
 constexpr uint32_t kRgfxSwapInfoNotification = 3;
 
-// The most values an async result carries here, and the records the paravirtual display keeps
-// while the class holds them.
+// The most words a record carries here, and the records the paravirtual display keeps while the
+// class holds them.
 constexpr uint32_t kRgfxSwapInfoMaxArgs = 12;
 constexpr uint32_t kRgfxSwapInfoKept = 6;
 
@@ -80,14 +94,15 @@ inline RgfxSwapInfoRecord rgfxSwapInfoRecord(uint32_t swapId, uint64_t presented
 	return r;
 }
 
-// The async result's values for `record`, to a request whose tag mask is `mask` and whose last
+// A record's words for `record`, to a request whose tag mask is `mask` and whose last
 // record's field_08 is `*last`, as the paravirtual display's do_swap_info_notify_gated makes them:
 // the mask, the swap's ID, then for each of the record's five doublewords whose bit (0 to 4) the
 // mask sets, the doubleword, the second one being field_08 less `*last` instead. With the mask's
-// bit 31 a value is two arguments, its low and then its high word, otherwise one, as the
-// paravirtual display sends them and FrameInfoNotifyFunc reads them. A value that would start at
-// the twelfth argument is left out. `*last` becomes the record's field_08.
-// Answers the count of `args` written.
+// bit 31 a value is two words, its low and then its high word, otherwise one, as the paravirtual
+// display sends them and the library reads them (FrameInfoNotifyFunc from an async result,
+// PackAndDispatchFrameInfoNotifictionData from a queue's entry). A value that would start at the
+// twelfth word is left out. `*last` becomes the record's field_08. Answers the count of `args`
+// written.
 inline uint32_t rgfxSwapInfoArgs(uint32_t mask, uint64_t *last, const RgfxSwapInfoRecord &record,
                                  uint64_t args[kRgfxSwapInfoMaxArgs + 1])
 {
@@ -108,6 +123,17 @@ inline uint32_t rgfxSwapInfoArgs(uint32_t mask, uint64_t *last, const RgfxSwapIn
 	}
 	*last = record.field_08;
 	return n;
+}
+
+// The record do_swap_info_notify_gated enqueues for the notify request at `request`, whose tag mask
+// and last time lie at their offsets (the last becomes the record's field_08): its words, in
+// `words`, and their count (rgfxSwapInfoArgs).
+inline uint32_t rgfxFrameInfoRecord(uint8_t *request, const RgfxSwapInfoRecord &record,
+                                    uint64_t words[kRgfxSwapInfoMaxArgs + 1])
+{
+	const uint32_t mask = *reinterpret_cast<const uint32_t *>(request + kRgfxNotifyRequestMask);
+	uint64_t *last = reinterpret_cast<uint64_t *>(request + kRgfxNotifyRequestLast);
+	return rgfxSwapInfoArgs(mask, last, record, words);
 }
 
 // The frame info tags ReimsGraphics answers (supported_frame_info), by index: those it fills from

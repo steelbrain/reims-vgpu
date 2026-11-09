@@ -9,8 +9,7 @@
  * answers the present. The device's refreshes reach the class as its vblank note. Each completed
  * swap's presentation time reaches WindowServer as frame info, which the paravirtual display has
  * none of: supported_frame_info answers the tags the device fills, and a record of the swap goes to
- * each notify request as the paravirtual display sends its swap-info records
- * (RgfxLegacySwapInfo.hpp). The class's other pure methods answer what a display with no factory
+ * each notify request's client, through its shared data queue (RgfxLegacySwapInfo.hpp). The class's other pure methods answer what a display with no factory
  * configuration and no CRC answers.
  *
  * None of the class's methods a subclass overrides is forwarded to the class: what the class
@@ -44,7 +43,6 @@
 
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
-#include <IOKit/IOUserClient.h>
 #include <kern/clock.h>
 #include <libkern/libkern.h>
 
@@ -94,15 +92,12 @@ extern "C" void rgfxLegacySwapInfoNotifyDispatch(IOMobileFramebufferLegacy *self
                                                  RgfxSwapInfoRecord *record)
     __asm__("__ZN25IOMobileFramebufferLegacy31swap_info_notify_dispatch_gatedEPNS_12SwapInfoBlobE");
 
-// IOUserClient's async result, which it keeps for its subclasses: sent through a subclass of its
-// own, as the paravirtual display sends it through its user client class's. Never made.
-struct RgfxAsyncResult : IOUserClient {
-	static IOReturn send(io_user_reference_t *reference, IOReturn result, io_user_reference_t *args,
-	                     UInt32 count, IOOptionBits options)
-	{
-		return sendAsyncResult64WithOptions(reference, result, args, count, options);
-	}
-};
+// IOMobileFramebufferUserClient's enqueue of `bytes` bytes at `words` in its shared data queue,
+// which IOMobileFramebuffer.framework reads a frame info record from (RgfxLegacySwapInfo.hpp):
+// called directly, under the name every release from 14 to 27.0.1 exports, on the user client a
+// notify request is for. Answers kIOReturnSuccess, or an error where the queue holds no room.
+extern "C" IOReturn rgfxUserClientEnqueueFrameInfo(void *client, uint64_t *words, uint32_t bytes)
+    __asm__("__ZN29IOMobileFramebufferUserClient26enqueueInIOSharedDataQueueEPyj");
 
 // IOAVFamily's constructors of a timing element and of a colour element, and a timing's colour
 // elements, which the paravirtual display calls to make the elements it publishes
@@ -672,8 +667,9 @@ RgfxIOMFBWord ReimsGraphics::set_notify_tag_mask_gated(IOMFB_NotificationType ty
 
 // The frame info tags the device fills (RgfxLegacySwapInfo.hpp), one a call: the count, and tag
 // `index`'s name in `names[0]`, which IOMobileFramebuffer.framework asks for each index below the
-// count it is given at index 0. The records go as async results (`dataQueue` 0; the library reads
-// 1 as a shared data queue's, which no display here has).
+// count it is given at index 0. The records go through the client's shared data queue
+// (`dataQueue` 1, which the user client keeps and makes the queue at its frame info port by), as
+// the class adds frame info requests with no async reference (RgfxLegacySwapInfo.hpp).
 RgfxIOMFBWord ReimsGraphics::supported_frame_info(uint32_t index, uint32_t *count, char (*names)[64],
                                                   uint32_t *dataQueue)
 {
@@ -682,7 +678,7 @@ RgfxIOMFBWord ReimsGraphics::supported_frame_info(uint32_t index, uint32_t *coun
 	if (count)
 		*count = kRgfxFrameInfoTagCount;
 	if (dataQueue)
-		*dataQueue = 0;
+		*dataQueue = 1;
 	if (tag && names) {
 		strlcpy(names[0], tag, sizeof(names[0]));
 		r = kIOReturnSuccess;
@@ -714,23 +710,24 @@ RgfxIOMFBWord ReimsGraphics::set_frame_info_notification_state_gated(IOMFBNotify
 	return word(kIOReturnSuccess);
 }
 
-// A swap-info record sent to one notify request's client, as the paravirtual display sends it: an
-// async result of the values the request's tag mask asks for (rgfxSwapInfoArgs), which the
-// client may drop, answering the send's result. WindowServer learns its swaps' times from them.
+// A swap's frame info record sent to one notify request's client: the values the request's tag
+// mask asks for (rgfxFrameInfoRecord), enqueued in the shared data queue of the user client the
+// request is for, where the client's library reads them (RgfxLegacySwapInfo.hpp), answering the
+// enqueue's result: an error where the queue holds no room, or kIOReturnNotAttached where the
+// request names no client. WindowServer learns its swaps' presentation times from them.
 RgfxIOMFBWord ReimsGraphics::do_swap_info_notify_gated(IOMFBNotifyRequest *request,
                                                        const IOMobileFramebufferLegacy::SwapInfoBlob *blob)
 {
 	IOReturn r = kIOReturnBadArgument;
 	if (request && blob) {
 		uint8_t *bytes = reinterpret_cast<uint8_t *>(request);
-		const uint32_t mask = *reinterpret_cast<const uint32_t *>(bytes + kRgfxNotifyRequestMask);
-		uint64_t *last = reinterpret_cast<uint64_t *>(bytes + kRgfxNotifyRequestLast);
-		uint64_t args[kRgfxSwapInfoMaxArgs + 1];
-		const uint32_t n =
-		    rgfxSwapInfoArgs(mask, last, *reinterpret_cast<const RgfxSwapInfoRecord *>(blob), args);
-		r = RgfxAsyncResult::send(
-		    reinterpret_cast<io_user_reference_t *>(bytes + kRgfxNotifyRequestReference),
-		    kIOReturnSuccess, args, n, kIOUserNotifyOptionCanDrop);
+		void *client = *reinterpret_cast<void *const *>(bytes + kRgfxNotifyRequestClient);
+		uint64_t words[kRgfxSwapInfoMaxArgs + 1];
+		const uint32_t n = rgfxFrameInfoRecord(
+		    bytes, *reinterpret_cast<const RgfxSwapInfoRecord *>(blob), words);
+		r = client ? rgfxUserClientEnqueueFrameInfo(client, words,
+		                                            static_cast<uint32_t>(n * sizeof(words[0])))
+		           : kIOReturnNotAttached;
 	}
 	if (logged(kDoSwapInfoNotify))
 		IOLog("ReimsGraphics: do_swap_info_notify_gated(%p, %p) = 0x%x\n", request, blob, r);

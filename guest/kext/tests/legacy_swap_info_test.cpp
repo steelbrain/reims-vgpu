@@ -1,9 +1,10 @@
 // The native test of RgfxLegacySwapInfo.hpp and the swap-info columns of RgfxLegacySwapLayout.hpp:
 // each release's offsets as its AppleParavirtGPU's notify_swap_done_gated, do_swap_info_notify_gated
 // and set_notify_tag_mask_gated and its IOMobileGraphicsFamily's note_vbl_ISR, swap_submit,
-// abort_swap_gated and dropSwap_gated use them; the record the paravirtual display makes; the
-// async result's values as IOMobileFramebuffer.framework reads them; the frame info tags the device
-// answers and its presentation time; and the records kept while the class holds them.
+// abort_swap_gated and dropSwap_gated use them; the record the paravirtual display makes; its
+// words as IOMobileFramebuffer.framework reads them from the client's shared data queue; the frame
+// info tags the device answers and its presentation time; and the records kept while the class
+// holds them.
 #include "RgfxLegacySwapInfo.hpp"
 #include "RgfxLegacySwapLayout.hpp"
 
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -31,21 +33,21 @@ void check(bool ok, const char *what, const char *about)
 // What each release's kexts read and write, by byte offset: in the class, the time note_vbl_ISR
 // writes and the halfword notify_swap_done_gated tests; in a swap, the doubleword swap_submit
 // copies from its record and the word abort_swap_gated sets bit 0 of, both of which
-// notify_swap_done_gated reads, with the state word it tests; and in a notify request, the
-// async reference, tag mask and last time do_swap_info_notify_gated and set_notify_tag_mask_gated
-// use. Read from 14.6.1, 15.6.1, 26.6.2 and 27.0.1.
+// notify_swap_done_gated reads, with the state word it tests; and in a notify request, the user
+// client add_notification_gated stores, and the tag mask and last time do_swap_info_notify_gated
+// and set_notify_tag_mask_gated use. Read from 14.6.1, 15.6.1, 26.6.2 and 27.0.1.
 struct Release {
 	const char *name;
 	uint32_t classSize, vblankTime, notifyHeld;
 	uint32_t swapState, swapRecordField00, swapFlags;
-	uint32_t requestReference, requestMask, requestLast;
+	uint32_t requestClient, requestMask, requestLast;
 };
 
 constexpr Release kReleases[] = {
-    {"14", 0x18a0, 0x108, 0x189e, 0x32c, 0x2d0, 0x310, 0x18, 0x78, 0x80},
-    {"15", 0x19c0, 0x108, 0x19be, 0x32c, 0x2d0, 0x310, 0x18, 0x78, 0x80},
-    {"26", 0x1af8, 0x108, 0x1af6, 0x34c, 0x2f0, 0x330, 0x18, 0x78, 0x80},
-    {"27", 0x1dd8, 0x108, 0x1dd2, 0x3ec, 0x390, 0x3d0, 0x18, 0x78, 0x80},
+    {"14", 0x18a0, 0x108, 0x189e, 0x32c, 0x2d0, 0x310, 0x10, 0x78, 0x80},
+    {"15", 0x19c0, 0x108, 0x19be, 0x32c, 0x2d0, 0x310, 0x10, 0x78, 0x80},
+    {"26", 0x1af8, 0x108, 0x1af6, 0x34c, 0x2f0, 0x330, 0x10, 0x78, 0x80},
+    {"27", 0x1dd8, 0x108, 0x1dd2, 0x3ec, 0x390, 0x3d0, 0x10, 0x78, 0x80},
 };
 
 void layouts()
@@ -58,7 +60,7 @@ void layouts()
 		check(l->state == r.swapState, "the swap's state word", r.name);
 		check(l->swapRecordField00 == r.swapRecordField00, "the swap's copy of field_00", r.name);
 		check(l->swapFlags == r.swapFlags, "the swap's flags word", r.name);
-		check(kRgfxNotifyRequestReference == r.requestReference &&
+		check(kRgfxNotifyRequestClient == r.requestClient &&
 		          kRgfxNotifyRequestMask == r.requestMask &&
 		          kRgfxNotifyRequestLast == r.requestLast,
 		      "the notify request's offsets", r.name);
@@ -159,6 +161,75 @@ void frameInfo()
 	check(a[2] == 1440 && a[3] == 400, "Presentation_time, then Presentation_delta", "frameInfo");
 }
 
+// What IOMobileFramebuffer.framework makes of an entry of the client's shared data queue
+// (FrameInfoNotifyFuncIOShq, PackAndDispatchFrameInfoNotifictionData; read from 14.6.1's and
+// 27.0.1's): the entry's bytes copied into a buffer of 0x100 bytes; word 0 the mask, whose bit 31
+// makes a value two words, low first; word 1's low half the swap's ID; then a value for each bit
+// of the mask, in the bits' order, under the name of the tag of the bit's index.
+struct Parsed {
+	uint32_t swapId = 0;
+	std::map<std::string, uint64_t> values;
+};
+
+Parsed readEntry(const uint64_t *words, uint32_t bytes, const char *about)
+{
+	check(bytes >= 16 && bytes % 8 == 0 && bytes <= 0x100, "an entry of whole words that fits",
+	      about);
+	uint64_t buffer[0x100 / 8] = {};
+	std::memcpy(buffer, words, bytes);
+	Parsed p;
+	const uint64_t first = buffer[0];
+	const uint32_t mask = static_cast<uint32_t>(first) & 0x7fffffffu;
+	p.swapId = static_cast<uint32_t>(buffer[1]);
+	uint32_t at = 2;
+	for (uint32_t i = 0; i < 31; i++) {
+		if ((mask & (1u << i)) == 0)
+			continue;
+		uint64_t v = buffer[at++];
+		if (first & 0x80000000u)
+			v |= buffer[at++] << 32;
+		const char *tag = rgfxFrameInfoTag(i);
+		p.values[tag ? tag : "none"] = v;
+	}
+	return p;
+}
+
+// Each release's notify request, as do_swap_info_notify_gated reads it, gives the record
+// IOMobileFramebuffer.framework reads QuartzCore's two tags from: the swap's ID, its presentation
+// time and the time since the last record.
+void queueRecord()
+{
+	check(kRgfxSwapInfoMaxArgs * sizeof(uint64_t) <= 0x100, "the longest record fits the copy",
+	      "queueRecord");
+	for (const Release &r : kReleases) {
+		alignas(8) uint8_t request[0x88] = {};
+		const uint32_t mask = 0x3;
+		std::memcpy(request + r.requestMask, &mask, sizeof(mask));
+		uint64_t words[kRgfxSwapInfoMaxArgs + 1];
+		const uint64_t first = rgfxFrameInfoTime(1000, 5000, 5040);
+		const uint64_t second = rgfxFrameInfoTime(1400, 5400, 5440);
+		const uint32_t n1 = rgfxFrameInfoRecord(request, rgfxSwapInfoRecord(11, first, 7, 1), words);
+		Parsed p = readEntry(words, n1 * 8, r.name);
+		check(n1 == 4 && p.swapId == 11, "the first swap's record", r.name);
+		check(p.values.size() == 2 && p.values["Presentation_time"] == 1040 &&
+		          p.values["Presentation_delta"] == 1040,
+		      "its time, and its time since none", r.name);
+		uint64_t last = 0;
+		std::memcpy(&last, request + r.requestLast, sizeof(last));
+		check(last == 1040, "the request keeps the time sent", r.name);
+		const uint32_t n2 =
+		    rgfxFrameInfoRecord(request, rgfxSwapInfoRecord(12, second, 7, 1), words);
+		p = readEntry(words, n2 * 8, r.name);
+		check(n2 == 4 && p.swapId == 12, "the next swap's record", r.name);
+		check(p.values["Presentation_time"] == 1440 && p.values["Presentation_delta"] == 400,
+		      "Presentation_time, then Presentation_delta, in the tags' order", r.name);
+		const uint32_t n3 = rgfxFrameInfoRecord(request, rgfxSwapInfoRecord(13, 0, 7, 1), words);
+		p = readEntry(words, n3 * 8, r.name);
+		check(p.swapId == 13 && p.values["Presentation_time"] == 0,
+		      "a swap that showed nothing reads 0", r.name);
+	}
+}
+
 void kept()
 {
 	RgfxSwapInfoKept k = {};
@@ -197,9 +268,18 @@ void imports()
 	check(source.find("\"__ZN25IOMobileFramebufferLegacy31swap_info_notify_dispatch_gatedEPNS_"
 	                  "12SwapInfoBlobE\"") != std::string::npos,
 	      "the source calls the class's dispatch", "imports");
-	check(source.find("sendAsyncResult64WithOptions") != std::string::npos &&
-	          source.find("kIOUserNotifyOptionCanDrop") != std::string::npos,
-	      "the result is sent as one the client may drop", "imports");
+	check(source.find("\"__ZN29IOMobileFramebufferUserClient26enqueueInIOSharedDataQueueEPyj\"") !=
+	          std::string::npos,
+	      "the record goes in the user client's shared data queue", "imports");
+	check(source.find("*dataQueue = 1;") != std::string::npos,
+	      "supported_frame_info answers the records come in a data queue", "imports");
+	check(source.find("sendAsyncResult") == std::string::npos, "no async result", "imports");
+	const std::string graft = readFile("src/graft-arm64e.json");
+	const size_t policy =
+	    graft.find("\"__ZN29IOMobileFramebufferUserClient26enqueueInIOSharedDataQueueEPyj\": {");
+	check(policy != std::string::npos &&
+	          graft.find("\"library\": 1", policy) == graft.find("\"library\"", policy),
+	      "Graft binds the enqueue from IOMobileGraphicsFamily", "imports");
 	check(source.find("rgfxFrameInfoTag(index)") != std::string::npos,
 	      "supported_frame_info answers the tags", "imports");
 	check(source.find("rgfxFrameInfoTime(shown, absolute, mach_continuous_time())") !=
@@ -215,6 +295,7 @@ int main()
 	record();
 	args();
 	frameInfo();
+	queueRecord();
 	kept();
 	imports();
 	std::printf("legacy_swap_info_test: %d checks passed (%zu releases)\n", checks,
