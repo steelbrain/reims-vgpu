@@ -30,7 +30,9 @@ the device info (`GraphicsDevice::with_platform`, in `graphics.rs`):
 - **The entries**: one `RgfxVideoCodecCaps` for each codec and direction the arm takes: its
   profiles, its highest level, its smallest and largest coded pictures, its DPB and reference
   bounds, its output formats, and the alignment at which it reads an access unit in place.
-  Each answer is the arm's video API's own (the arms' docs).
+  Each answer is the arm's video API's own (the arms' docs), but for VA-API's largest H.264
+  size, kept under the 65,535 macroblocks its drivers decode: 4096x4096 is answered as 4096x4080
+  ([bugs.md](bugs.md), U28).
 - **The flags**: `RGFX_VIDEO_CAPS_OUTPUT_CACHED` where the kext makes device caches, of every
   surface it asks one for (`RGFX_FEATURE_SURFACE_CACHE`, a GPU of its own memory) or of those
   whose textures would not lie in place in their pages (`RGFX_FEATURE_SURFACE_CACHE_REFUSED`, a
@@ -68,8 +70,10 @@ entry's, whose PPS has a tile column narrower than `decode`'s, or whose first sl
 header names more current references than `max_references` fails its schedule, and VideoToolbox
 reports `kVTVideoDecoderMalfunctionErr` for it and every picture after it. Sent, the host would
 refuse it after it took it, and the schedule would fail only once the host's verdict came back.
-AppleGVA's H.264 decoder delivers a picture whose schedule failed, so H.264 has no such check
-([bugs.md](bugs.md), D25).
+AppleGVA's H.264 decoder delivers a picture whose schedule failed, so an H.264 decode is checked
+at its context's create (`sizeTaken`, `CreateContexts`): a coded size outside its entry's fails
+the create, and VideoToolbox decodes the stream in software. What the host refuses only from a
+picture's parameter sets or slices still reaches the guest undecoded ([bugs.md](bugs.md), D25).
 
 ## Sessions
 
@@ -103,7 +107,8 @@ command buffer of the session's process (`graphics/decode/video.rs`):
   failed, with Metal's internal error. The guest's video driver answers that as a decode error:
   an HEVC picture's schedule waits for its verdict and fails (`kVTVideoDecoderMalfunctionErr`,
   design.md, "A decode the driver cannot complete is a decode error"); an H.264 picture reaches
-  the guest as decoded, as AppleGVA's H.264 decoder reports no failure ([bugs.md](bugs.md), D25).
+  the guest as decoded, as AppleGVA's H.264 decoder reports no failure, so the driver refuses what
+  it can tell before a picture, its size, at the create ([bugs.md](bugs.md), D25).
 - **A picture the stream's random access skips** lands nothing, and its command buffer
   completes as any other.
 

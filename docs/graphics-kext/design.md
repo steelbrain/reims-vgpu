@@ -761,7 +761,12 @@ Stages:
       RTX 5080, 2026-11-07); its pipelines schedule their commands one at a
       time and keep no decode's result (read from its code). So an H.264
       schedule waits for no verdict, and an H.264 picture the host fails
-      reaches the client as decoded ([D25](../video/bugs.md)). The host
+      reaches the client as decoded ([D25](../video/bugs.md)). What the
+      driver can tell before a picture, the coded size AppleGVA gives each
+      context it asks for, it checks at the create: a size outside the
+      host's H.264 decode entry fails `CreateContexts` with kUnsupported,
+      AppleGVA fails the session's create, and VideoToolbox decodes in
+      software (`sizeTaken`, `guest/bundle/src/RgfxVideoStatus.hpp`). The host
       reports a failure as the
       picture's command buffer failing: an op it cannot carry out faults the
       buffer, and a picture it took but could not land (its planes refused,
