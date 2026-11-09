@@ -53,7 +53,9 @@
 #              presented.
 #   metal-app  present_probe, an on-screen Metal app, ran full-screen for 10 s in the user's
 #              session, as the lane gate's present phase: OK, frames presented, and at most a
-#              tenth dropped or unanswered (report.py's bar for the correctness boot).
+#              tenth dropped or unanswered (report.py's bar for the correctness boot). A probe
+#              that falls short while Setup Assistant runs fails as unread, naming it: its
+#              full-screen window covers the probe's, whose frames are then never shown.
 #   bundle-install
 #              RgfxGate installed the Metal bundle, as it records it and as the disk shows it:
 #              its Graft client state (GraftClient.com.steelbrain.RgfxGate) reads installed,
@@ -410,6 +412,15 @@ if [[ -n $ssh_s ]]; then
   fi
 
   if ((dev_ok && desk_ok)); then
+    # Setup Assistant after a login (a release's new pages) covers the session with a full-screen
+    # window, so the probe's frames are never shown: read whether it runs before the probe.
+    cover=$(G 20 "pgrep -x 'Setup Assistant' | tr '\\n' ' '; echo; echo cover-read")
+    if [[ $cover == *cover-read* ]]; then
+      cover=$(echo "$cover" | head -1) cover=${cover% }
+      cover_say=${cover:+Setup Assistant (pid ${cover// /, }) covers the session}
+    else
+      cover_say=
+    fi
     probe=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' launchctl asuser \$(id -u) sudo -u \$(id -un) perl -e 'alarm shift @ARGV; exec @ARGV' $((40 * slow)) \$HOME/ambrosia-check/present_probe -t 10" |
       grep '^present_probe:' | head -1)
     # report.py's bar for the correctness boot: frames presented, and at most a tenth lost, a
@@ -419,6 +430,8 @@ if [[ -n $ssh_s ]]; then
         my ($p, $l) = ($k{presented} // 0, ($k{dropped} // 0) + (($k{unanswered} // 0) > 3 ? $k{unanswered} - 3 : 0));
         exit !($p > 0 && $l <= 0.1 * ($p + $l))' "$probe"; then
       verdict metal-app PASS "${probe#present_probe: }"
+    elif [[ -n $cover_say ]]; then
+      verdict metal-app FAIL "unread: $cover_say; ${probe:-present_probe printed no result line}"
     else
       verdict metal-app FAIL "${probe:-present_probe printed no result line}"
     fi
