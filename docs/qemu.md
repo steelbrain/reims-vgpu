@@ -1068,17 +1068,18 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
   naming it. `page-count`: the kext's count of a surface's pages
   (`mach_vm_region` over `kernel_map`, inside IOKit's pageable maps by
   `IOIteratePageableMaps`) did not take the guest down: after the Metal work,
-  its `kern.boottime` is the login's and no panic report was written in the
-  run; its line gives the host's last count of IOSurface device caches
-  (made, deferred, carrying pages, refused) and the kext's count lines
-  (counted, not counted). Zero deferred while caches were made, no count
-  line, or no count that counted is printed under the verdict as a
-  `check-boot: finding:` line, not a failure. `no-fatal`: no `reims-vgpu:
-  fatal` line in QEMU's log or the serial log. A reading in the guest that
-  printed nothing fails its check as unread (a desktop poll that never
-  answered is no desktop), and under TCG each command in the guest, each SSH
-  login the boot waits on, and the wait for the desktop have 5 times their
-  HVF limits.
+  its `kern.bootsessionuuid` is the login's (each boot sets a new one;
+  `kern.boottime` is not compared, as macOS corrects it while its clock
+  settles) and no panic report was written in the run; its line gives the
+  host's last count of IOSurface device caches (made, deferred, carrying
+  pages, refused) and the kext's count lines (counted, not counted). Zero
+  deferred while caches were made, no count line, or no count that counted
+  is printed under the verdict as a `check-boot: finding:` line, not a
+  failure. `no-fatal`: no `reims-vgpu: fatal` line in QEMU's log or the
+  serial log. A reading in the guest that printed nothing fails its check as
+  unread (a desktop poll that never answered is no desktop), and under TCG
+  each command in the guest, each SSH login the boot waits on, and the wait
+  for the desktop have 5 times their HVF limits.
 
 **Measured** on the M3 Max under HVF on 2026-11-08, with our QEMU at
 `bc378624` built as above on the library of `61b1aac9e`, Ambrosia 0.1.0's

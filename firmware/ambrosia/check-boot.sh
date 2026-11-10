@@ -74,12 +74,14 @@
 #              has no AMFI or library-validation denial naming reims-graphics.
 #   page-count the kext's count of a surface's pages (mach_vm_region over kernel_map, and
 #              inside IOKit's pageable maps by IOIteratePageableMaps) did not take the guest
-#              down: read after the Metal work, its kern.boottime is the one it had at the
-#              login, and no panic report was written in this run. Its detail is the host's last
-#              count of IOSurface device caches (made, deferred, carrying pages, refused) and the
-#              kext's own count lines this boot (counted, not counted). Zero deferred while
-#              caches were made, no count line, or no count that counted is printed as a finding
-#              under the verdict, not a failure.
+#              down: read after the Metal work, its kern.bootsessionuuid is the one it had at
+#              the login (each boot sets a new one; kern.boottime is not compared, as macOS
+#              corrects it while its clock settles, more so under TCG), and no panic report was
+#              written in this run. Its detail is the host's last count of IOSurface device
+#              caches (made, deferred, carrying pages, refused) and the kext's own count lines
+#              this boot (counted, not counted). Zero deferred while caches were made, no count
+#              line, or no count that counted is printed as a finding under the verdict, not a
+#              failure.
 #   no-fatal   no `reims-vgpu: fatal` line in QEMU's log or the serial log.
 #
 # OUT keeps serial.log, qemu.log, screen.png (QMP's screendump of the display at the end, before
@@ -275,8 +277,8 @@ qpid=$!
 names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count no-fatal)
 # What a check reports beside its verdict, printed under it: neither a pass nor a failure.
 findings=()
-# The guest's kern.boottime at the login and after the Metal work, the panic reports written in
-# this run, and the kext's count lines this boot (page-count).
+# The guest's kern.bootsessionuuid at the login and after the Metal work, the panic reports
+# written in this run, and the kext's count lines this boot (page-count).
 boot0= boot1= panics= kc=
 # A check's verdict, PASS or FAIL, and what it found; in plain variables, for macOS's bash 3.2.
 verdict() { printf -v "st_${1//-/_}" '%s' "$2"; printf -v "dt_${1//-/_}" '%s' "$3"; }
@@ -344,7 +346,7 @@ if [[ -n $ssh_s ]]; then
   # The guest's release, from a command that answered: the login probe's success can come before
   # sshd takes the password every time, and G's output is its last try's alone.
   gver=$(G 20 'sw_vers -productVersion; sw_vers -buildVersion') || gver=
-  boot0=$(G 20 'sysctl -n kern.boottime') || boot0=
+  boot0=$(G 20 'sysctl -n kern.bootsessionuuid') || boot0=
 
   csr=$(G 30 csrutil status)
   case $csr in
@@ -503,7 +505,7 @@ if [[ -n $ssh_s ]]; then
   # The page count's path, after the Metal work: the guest's boot unchanged, the panic reports
   # written in this run (each marked where it names our kexts or the count's calls), and the
   # kext's count lines this boot. The host's counts are read from its log once QEMU has ended.
-  boot1=$(G 20 'sysctl -n kern.boottime') || boot1=
+  boot1=$(G 20 'sysctl -n kern.bootsessionuuid') || boot1=
   run_min=$(perl -e 'printf "%d\n", $ARGV[0] / 60 + 2' "$(since "$t0")")
   panics_read=1
   panics=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' sh -c 'find /Library/Logs/DiagnosticReports -maxdepth 2 -type f \\( -name \"*.panic\" -o -name \"panic-*\" \\) -mmin -$run_min | while read -r f; do if grep -q -E \"com\\.steelbrain|mach_vm_region|IOIteratePageableMaps\" \"\$f\"; then echo \"\$f (names our kexts)\"; else echo \"\$f\"; fi; done'") || panics_read=0
@@ -550,9 +552,9 @@ if [[ -n $ssh_s ]]; then
   notes=$(echo "$kc" | grep -o -E 'an IOSurface.s memory (is a [A-Za-z0-9_]+, not a buffer the kernel allocated|could not be mapped to count its pages)' | sort -u | tr '\n' ';' | sed 's/;$//; s/;/; /g')
   pc=() pok=1
   if [[ -z $boot1 ]]; then pc+=("the guest did not answer after its Metal work") pok=0
-  elif [[ -z $boot0 ]]; then pc+=("kern.boottime unread at the login, so a boot again is not told") pok=0
-  elif [[ $boot1 != "$boot0" ]]; then pc+=("the guest booted again during the run: kern.boottime was $boot0, then $boot1") pok=0
-  else pc+=("kern.boottime kept"); fi
+  elif [[ -z $boot0 ]]; then pc+=("kern.bootsessionuuid unread at the login, so a boot again is not told") pok=0
+  elif [[ $boot1 != "$boot0" ]]; then pc+=("the guest booted again during the run: kern.bootsessionuuid was $boot0, then $boot1") pok=0
+  else pc+=("kern.bootsessionuuid kept"); fi
   if ((!panics_read)); then pc+=("the panic reports unread: ${panics:-no answer}") pok=0
   elif [[ -n $panics ]]; then pc+=("panic reports written in this run: $(echo "$panics" | tr '\n' ';' | sed 's/;$//; s/;/, /g')") pok=0
   else pc+=("no panic report in this run"); fi
