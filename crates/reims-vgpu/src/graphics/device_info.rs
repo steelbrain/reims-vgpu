@@ -25,6 +25,8 @@ use reims_vgpu_vulkan::core::platform::caps::{
 };
 use reims_vgpu_vulkan::core::raise::RaiseResult;
 
+use crate::GuestArch;
+
 /// `MTLGPUFamilyMetal3`.
 const MTL_GPU_FAMILY_METAL3: i64 = 5001;
 /// `MTLGPUFamilyMetal4`.
@@ -295,7 +297,7 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 /// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |
 /// | `maxBufferLength` | the platform's, but at most three quarters of `recommendedMaxWorkingSetSize`, rounded down to 16 KiB ([`lane_max_buffer_length`]) | nothing: a choice |
 /// | `minimumLinearTextureAlignmentForPixelFormat:` and the SPI `linearTextureAlignmentBytes` and `deviceLinearTextureAlignmentBytes` | 256 bytes, or the platform's where larger ([`LANE_LINEAR_TEXTURE_ALIGNMENT`]) | nothing: a choice |
-/// | `isFramebufferReadSupported` (SPI) | no ([`lane_flags`]) | nothing: a choice |
+/// | `isFramebufferReadSupported` (SPI) | no for an x86-64 guest; the platform's for an arm64 guest ([`lane_flags`]) | nothing: a choice |
 /// | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (SPI) | no ([`lane_flags`]) | tile pipelines, their non-square dispatch and imageblocks, Apple4's and Apple5's pieces |
 ///
 /// The rows marked "a choice" are answers real Macs give, picked from those the lane can keep for
@@ -376,17 +378,32 @@ fn lane_limits(mut limits: Limits) -> Limits {
     limits
 }
 
-/// The device's `BOOL` SPI answers where the lane's differ from the platform's:
-/// - `isFramebufferReadSupported` no, as an AMD Radeon Pro 5300M answers (macOS 26.7.1; an Intel
-///   UHD 630 and an Apple M3 Max answer yes): it steers the guest's frameworks off reading their
+/// The device's `BOOL` SPI answers where the lane's differ from the platform's, for a guest of
+/// `guest`'s architecture:
+/// - `isFramebufferReadSupported`, for an x86-64 guest no, as an AMD Radeon Pro 5300M answers,
+///   where an Intel UHD 630 answers yes (macOS 26.7.1, measured again on 2026-11-09): of the two
+///   answers the x86 Macs give, the one that steers the guest's frameworks off reading their
 ///   attachments in a fragment function, which costs the Vulkan platform most (an input
-///   attachment, or the pixel interlock), onto the paths they take on an AMD Mac;
+///   attachment, or the pixel interlock), onto the paths they take on an AMD Mac. For an arm64
+///   guest the platform's, as an Apple silicon Mac's GPU answers yes (an Apple M3 Max, macOS
+///   27.0.1): CoreAnimation in an arm64 guest compiles framebuffer fetch into its generic shader
+///   by this answer, and that shader blends against the fetched destination whatever the answer,
+///   so with no it blended against NaN and drew the menu bar black in 14.6.1, 15.6.1, 26.6.2 and
+///   27.0.1 guests (Metal on the M3 Max writes the same NaN for that pipeline and its buffers).
+///   The platform answers yes where
+///   its compile layer fetches a colour attachment at all (MoltenVK, RADV, ANV and NVIDIA); a
+///   pipeline that fetches an attachment of a format the runtime does not fetch on the host's GPU
+///   (the one- and two-channel 8-bit sRGB formats on ANV and NVIDIA, and the packed 16-bit ones
+///   and `RGB9E5Float` on NVIDIA) is a gap its creator answers nil for, relayed
+///   (`reims_vgpu_vulkan::answer::relay_gap`);
 /// - `supportsTileShaders`, `supportsNonSquareTileShaders` and `supportsImageBlocks` no, as the
 ///   5300M and the UHD 630 answer: the lane carries neither tile pipelines, nor their non-square
 ///   dispatch, nor imageblocks ([`Piece::TilePipelines`], [`Piece::NonsquareTileDispatch`],
 ///   [`Piece::Imageblocks`]).
-fn lane_flags(mut flags: Flags) -> Flags {
-    flags.is_framebuffer_read_supported = false;
+fn lane_flags(mut flags: Flags, guest: GuestArch) -> Flags {
+    if guest == GuestArch::X86_64 {
+        flags.is_framebuffer_read_supported = false;
+    }
     flags.supports_tile_shaders = false;
     flags.supports_non_square_tile_shaders = false;
     flags.supports_image_blocks = false;
@@ -394,12 +411,14 @@ fn lane_flags(mut flags: Flags) -> Flags {
 }
 
 /// The device-info caps blob for `caps` and `identity`, of a device that runs `compile_threads`
-/// pipeline compiles at once: every value the guest bundle reads once at init, the host device's
-/// answers but where the lane's own differ ([`lane`]).
+/// pipeline compiles at once for a guest of `guest`'s architecture: every value the guest bundle
+/// reads once at init, the host device's answers but where the lane's own differ ([`lane`],
+/// [`lane_flags`]).
 pub fn device_info(
     caps: &DeviceCaps,
     identity: IdentityCaps,
     compile_threads: u64,
+    guest: GuestArch,
 ) -> RgfxDeviceInfo {
     let identity = lane(identity, compile_threads);
     let mut info = RgfxDeviceInfo {
@@ -501,7 +520,7 @@ pub fn device_info(
     info.sample_counts = caps.sample_counts.each_ref().map(bit);
     info.primitive_types = caps.primitive_types.each_ref().map(bit);
     info.write_rounding_modes = caps.write_rounding_modes.each_ref().map(bit);
-    let f = &lane_flags(caps.flags);
+    let f = &lane_flags(caps.flags, guest);
     // In the host `Flags` field order; the bundle reads them in this order.
     info.flags = [
         f.are_raster_order_groups_supported,
@@ -582,6 +601,7 @@ mod tests {
     use reims_vgpu_vulkan::core::platform::device::GpuDevice;
     use reims_vgpu_vulkan::core::raise::Raise;
     use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use zerocopy::IntoBytes;
 
     use super::*;
 
@@ -610,7 +630,7 @@ mod tests {
     fn mirrors_the_device_caps() {
         let p = Arc::new(FakePlatform::new());
         let caps = p.device().caps();
-        let info = device_info(&caps, p.device().identity_caps(), 4);
+        let info = device_info(&caps, p.device().identity_caps(), 4, GuestArch::X86_64);
 
         assert_eq!(info.version, RGFX_DEVICE_INFO_VERSION);
         assert_eq!(info.registry_id, caps.registry_id);
@@ -637,7 +657,7 @@ mod tests {
         let p = Arc::new(FakePlatform::new());
         let mut caps = (*p.device().caps()).clone();
         caps.families[6] = Ok(false);
-        let info = device_info(&caps, p.device().identity_caps(), 4);
+        let info = device_info(&caps, p.device().identity_caps(), 4, GuestArch::X86_64);
         assert_eq!(info.family_count, 21);
         for yes in [2001, 2002, 3001, 3002, 3003, 5001] {
             assert_eq!(family(&info, yes), Some(1), "family {yes}");
@@ -670,7 +690,12 @@ mod tests {
     #[test]
     fn every_feature_set_is_the_platforms_or_its_familys() {
         let p = Arc::new(FakePlatform::new());
-        let info = device_info(&p.device().caps(), p.device().identity_caps(), 4);
+        let info = device_info(
+            &p.device().caps(),
+            p.device().identity_caps(),
+            4,
+            GuestArch::X86_64,
+        );
         assert_eq!(info.feature_set_count as usize, FEATURE_SETS.len());
         for set in [10000, 10001, 10003, 10004, 10005] {
             assert_eq!(feature_set(&info, set), Some(1), "feature set {set}");
@@ -799,7 +824,7 @@ mod tests {
         let mut identity = p.device().identity_caps();
         identity.flags.has_unified_memory = Some(false);
         identity.flags.is_low_power = Some(true);
-        let info = device_info(&caps, identity.clone(), 4);
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64);
         assert_eq!(
             &info.name[..info.name_len as usize],
             b"NVIDIA GeForce RTX 5080 Laptop GPU"
@@ -843,8 +868,8 @@ mod tests {
     /// `maxBufferLength` is three quarters of the working set rounded down to 16 KiB where that is
     /// below the platform's answer, as the 5300M's and the M3 Max's answers are of theirs, and the
     /// platform's otherwise; the linear texture alignments are 256 bytes, or the platform's where
-    /// larger; the framebuffer read, tile shader and imageblock answers are no, whatever the
-    /// platform's, and the other SPI flags the platform's.
+    /// larger; for an x86-64 guest the framebuffer read, tile shader and imageblock answers are
+    /// no, whatever the platform's, and the other SPI flags the platform's.
     #[test]
     fn the_lanes_buffer_length_alignments_and_spi_flags() {
         // An RTX 5080 on the Vulkan platform: a terabyte against 17094934528 bytes of VRAM.
@@ -875,7 +900,7 @@ mod tests {
         identity.sizes.max_buffer_length = Some(1 << 40);
         identity.sizes.recommended_max_working_set_size = Some(17_094_934_528);
         // The fake answers 16 for both alignments, and yes for every SPI flag.
-        let info = device_info(&caps, identity.clone(), 4);
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64);
         assert_eq!(info.sizes[7], 12_821_200_896);
         // device_linear_texture_alignment_bytes first, linear_texture_alignment_bytes fourth.
         assert_eq!(info.limits[0], 256);
@@ -890,9 +915,45 @@ mod tests {
         // A platform that needs more than 256 bytes keeps its own.
         caps.limits.linear_texture_alignment_bytes = 512;
         caps.limits.device_linear_texture_alignment_bytes = 1024;
-        let info = device_info(&caps, identity, 4);
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64);
         assert_eq!(info.limits[0], 1024);
         assert_eq!(info.limits[3], 512);
+    }
+
+    /// `isFramebufferReadSupported` follows the guest: an x86-64 guest's device answers no, an
+    /// arm64 guest's the platform's (the fake's yes, a platform's no as no), and the arm64 guest's
+    /// blob differs from the x86-64 guest's in that answer's byte alone, so an x86-64 guest is
+    /// told what it was told before guests had an architecture; a config that names none serves
+    /// an x86-64 guest
+    #[test]
+    fn framebuffer_read_follows_the_guest() {
+        // is_framebuffer_read_supported, third of the flags.
+        const FRAMEBUFFER_READ: usize = 2;
+        let p = Arc::new(FakePlatform::new());
+        let mut caps = (*p.device().caps()).clone();
+        let identity = p.device().identity_caps();
+        assert!(caps.flags.is_framebuffer_read_supported);
+        let x86 = device_info(&caps, identity.clone(), 4, GuestArch::X86_64);
+        let arm64 = device_info(&caps, identity.clone(), 4, GuestArch::Arm64);
+        assert_eq!(x86.flags[FRAMEBUFFER_READ], 0);
+        assert_eq!(arm64.flags[FRAMEBUFFER_READ], 1);
+        let at = std::mem::offset_of!(RgfxDeviceInfo, flags) + FRAMEBUFFER_READ;
+        let differ: Vec<usize> = (x86.as_bytes().iter().zip(arm64.as_bytes()))
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(differ, [at]);
+        // The tile and imageblock answers stay no for both.
+        for k in [14, 17, 24] {
+            assert_eq!(arm64.flags[k], 0, "flag {k}");
+        }
+
+        caps.flags.is_framebuffer_read_supported = false;
+        let arm64 = device_info(&caps, identity, 4, GuestArch::Arm64);
+        assert_eq!(arm64.flags[FRAMEBUFFER_READ], 0);
+
+        assert_eq!(GuestArch::default(), GuestArch::X86_64);
     }
 
     /// A present no reads 0, a present yes reads 1, and a platform gap (an `Err` or `None`)
@@ -903,14 +964,17 @@ mod tests {
         let mut caps = (*p.device().caps()).clone();
         let mut identity = p.device().identity_caps();
         // The fake answers sample count 8 (index 3) with a present no.
-        assert_eq!(device_info(&caps, identity.clone(), 4).sample_counts[3], 0);
+        assert_eq!(
+            device_info(&caps, identity.clone(), 4, GuestArch::X86_64).sample_counts[3],
+            0
+        );
         // A family the platform could not answer at all (a gap) also reads 0.
         caps.families[6] = Err(Raise::foreign("device_info_test_gap"));
         identity.families[8] = None;
         identity.feature_sets[0] = None;
         identity.flags.is_low_power = None;
         identity.sizes.location = None;
-        let info = device_info(&caps, identity.clone(), 4);
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64);
         assert_eq!(family(&info, -1009), Some(0));
         assert_eq!(family(&info, 1009), Some(0));
         assert_eq!(feature_set(&info, 0), Some(0));
@@ -919,12 +983,15 @@ mod tests {
         // A present yes still reads 1.
         caps.families[6] = Ok(true);
         assert_eq!(
-            family(&device_info(&caps, identity.clone(), 4), -1009),
+            family(
+                &device_info(&caps, identity.clone(), 4, GuestArch::X86_64),
+                -1009
+            ),
             Some(1)
         );
         // 255 ASCII bytes and a two-byte character: the character does not fit, and is left out.
         caps.name = Some(format!("{}\u{e9}", "a".repeat(255)));
-        let info = device_info(&caps, identity, 4);
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64);
         assert_eq!(info.name_len, 255);
     }
 }

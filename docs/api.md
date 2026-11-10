@@ -55,9 +55,11 @@ Every struct the host fills in, and every struct the library hands out, starts w
   - a `struct_size` above the library's is accepted when every byte past the library's size is
     zero, and is `RVG_ERR_UNSUPPORTED` otherwise. A host built against a newer header then works
     with an older library as long as it leaves the new fields at zero.
-  - Every such struct is at its first version: `RvgGraphicsDeviceConfig`, `RvgGraphicsCallbacks`,
-    `RvgWindowConfig` and `RvgWindowCallbacks`. A struct that grows keeps its first version's size
-    as the least it accepts, and reads the later fields of a host built before them as zero.
+  - `RvgGraphicsCallbacks`, `RvgWindowConfig` and `RvgWindowCallbacks` are at their first
+    version. `RvgGraphicsDeviceConfig` is at its second, which added `guest_arch`: a host built
+    before it, whose `struct_size` ends before that field, serves an x86-64 guest. A struct that
+    grows keeps its first version's size as the least it accepts, and reads the later fields of a
+    host built before them as zero.
 - **A struct the library writes** (`RvgCursorGlyph`, `RvgWindowScroll`): the host reads a field
   only if `struct_size` covers it.
 - **Zero is every field's default**, and a NULL table is a table with every callback absent.
@@ -73,7 +75,7 @@ unknown status as a failure.
 | value | name | when |
 |---|---|---|
 | 0 | `RVG_OK` | |
-| 1 | `RVG_ERR_INVALID_ARGUMENT` | a NULL handle, config or out-pointer where one is needed; a `struct_size` too small; a refused memory file; a doorbell that is not open, or a second one; `read_display`'s destination missing or too short |
+| 1 | `RVG_ERR_INVALID_ARGUMENT` | a NULL handle, config or out-pointer where one is needed; a `struct_size` too small; a refused memory file; a `guest_arch` that is none of `RVG_GUEST_ARCH_*`; a doorbell that is not open, or a second one; `read_display`'s destination missing or too short |
 | 2 | `RVG_ERR_UNSUPPORTED` | a larger `struct_size` with non-zero bytes the library does not know |
 | 3 | `RVG_ERR_METAL` | the platform refused the display's texture or its draw (`rvg_graphics_device_read_display`) |
 | 4 | `RVG_ERR_GPU` | the call's GPU work ended with an error |
@@ -143,17 +145,19 @@ Objective-C.
 
 | group | items |
 |---|---|
-| constants | the status codes; the PCI facts (`RVG_GRAPHICS_PCI_VENDOR_ID` 0x1234, `_DEVICE_ID` 0x5247, `_CLASS` 0x380, `RVG_GRAPHICS_PCI_BAR_REGISTERS` 0, `RVG_GRAPHICS_REGISTERS_SIZE` 4096, `RVG_GRAPHICS_MSIX_OFFSET` 2048, `RVG_GRAPHICS_MSIX_VECTORS` 1, `RVG_GRAPHICS_PCI_BAR_REGION` 2); the doorbell (`RVG_GRAPHICS_REG_DOORBELL`, `RVG_GRAPHICS_DOORBELL_CONTROL`); `RVG_GRAPHICS_ALLOCATIONS_OFFSET`; `RVG_WINDOW_BUTTON_*`, `RVG_WINDOW_SCROLL_PHASE_*`, `RVG_WINDOW_SCROLL_MOMENTUM_*` |
+| constants | the status codes; the PCI facts (`RVG_GRAPHICS_PCI_VENDOR_ID` 0x1234, `_DEVICE_ID` 0x5247, `_CLASS` 0x380, `RVG_GRAPHICS_PCI_BAR_REGISTERS` 0, `RVG_GRAPHICS_REGISTERS_SIZE` 4096, `RVG_GRAPHICS_MSIX_OFFSET` 2048, `RVG_GRAPHICS_MSIX_VECTORS` 1, `RVG_GRAPHICS_PCI_BAR_REGION` 2); the doorbell (`RVG_GRAPHICS_REG_DOORBELL`, `RVG_GRAPHICS_DOORBELL_CONTROL`); `RVG_GRAPHICS_ALLOCATIONS_OFFSET`; `RVG_GUEST_ARCH_X86_64` 0 and `RVG_GUEST_ARCH_ARM64` 1; `RVG_WINDOW_BUTTON_*`, `RVG_WINDOW_SCROLL_PHASE_*`, `RVG_WINDOW_SCROLL_MOMENTUM_*` |
 | status | `rvg_status_message` |
-| the device | `RvgGraphicsDeviceConfig`, `RvgGraphicsCallbacks` and its function types, `RvgCursorGlyph`, `RvgDisplayCoord`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write_taking`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position` |
+| the device | `RvgGraphicsDeviceConfig`, `RvgGuestArch`, `RvgGraphicsCallbacks` and its function types, `RvgCursorGlyph`, `RvgDisplayCoord`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_graphics_device_create`, `_release`, `_region`, `_mmio_read`, `_mmio_write_taking`, `_set_doorbell`, `_reset`, `_read_display`, `_cursor_position` |
 | its window | `RvgWindowConfig`, `RvgWindowCallbacks`, `RvgWindowPointerFn`, `RvgWindowWheelFn`, `RvgWindowKeyFn`, `RvgWindowCloseFn`, `RvgWindowScrollFn`, `RvgWindowScroll`; no function of its own: `RvgGraphicsDeviceConfig.window` carries it |
 
 ### Settings and the environment
 
 Everything a host can set that shapes what the library does, beside the guest's own input:
-- **The config**: the device's callbacks, its window (its callbacks and the mode it opens at) and
-  the guest's RAM with the files behind it, which let the GPU use an IOSurface's own pages in place.
-  Zero is every field's default (section 1).
+- **The config**: the device's callbacks, its window (its callbacks and the mode it opens at),
+  the guest's RAM with the files behind it, which let the GPU use an IOSurface's own pages in place,
+  and the guest's architecture, which the device's `isFramebufferReadSupported` follows: the
+  host GPU's answer for an arm64 guest, no for an x86-64 one. Zero is every field's default
+  (section 1): an x86-64 guest.
 - **Cargo features**, for a host that builds the library: `macos-sdl` (on by default) builds
   SDL3's window into the macOS library ([development.md](development.md)). `vulkan`
   (`reims-vgpu`, `reims-vgpu-c`) changes nothing: the Vulkan platform is the API's only one, and
@@ -191,7 +195,8 @@ Rust enum; the handle is a Rust struct cbindgen emits as opaque; the configs are
   default platform (`VulkanPlatform`) or `with_platform`, so its
   forwarding is unit-tested on core's fake platform;
 - `GraphicsConfig`: `GraphicsCallbacks` (closures, `Arc<dyn Fn … + Send + Sync>`, each optional),
-  an optional `WindowConfig`, and an optional `MemoryMap` with its `MemoryFile`s;
+  an optional `WindowConfig`, an optional `MemoryMap` with its `MemoryFile`s, and the guest's
+  `GuestArch` (`X86_64`, the default, or `Arm64`);
 - `Error`: `InvalidArgument`, `Metal`, `Gpu`, `HostResources`, the C API's statuses but
   `UNSUPPORTED`, which only the C layer's struct checks give;
 - the host video types (`GraphicsVideo`, `PlanePages`, `VideoDecode`, `VideoPlane`), through which

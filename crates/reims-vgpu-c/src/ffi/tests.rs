@@ -113,6 +113,7 @@ fn a_panic_in_a_callback_of_the_first_export_ends_in_the_hook() {
             window: std::ptr::null(),
             memory_map: std::ptr::null(),
             memory_files: std::ptr::null(),
+            guest_arch: crate::graphics::RVG_GUEST_ARCH_X86_64,
         };
         // SAFETY: a live config; a NULL out-pointer, which the create refuses.
         let _ =

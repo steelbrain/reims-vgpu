@@ -145,6 +145,12 @@
 // control rings.
 #define RVG_GRAPHICS_ALLOCATIONS_OFFSET 4194304
 
+// An x86-64 guest: the default, and what a host built before `guest_arch` serves.
+#define RVG_GUEST_ARCH_X86_64 0
+
+// An arm64 guest.
+#define RVG_GUEST_ARCH_ARM64 1
+
 // The graphics device.
 typedef struct RvgGraphicsDevice RvgGraphicsDevice;
 
@@ -385,6 +391,9 @@ typedef struct {
   uint64_t offset;
 } RvgMemoryRangeFile;
 
+// The architecture of the macOS guest a graphics device serves: one of RVG_GUEST_ARCH_*.
+typedef uint32_t RvgGuestArch;
+
 // The graphics device's config.
 typedef struct {
   // sizeof(RvgGraphicsDeviceConfig) as the host was compiled.
@@ -413,6 +422,12 @@ typedef struct {
   // length in bytes, or an `offset` that is not a multiple of the host's page size; a file that
   // cannot be duplicated. A refusal logs a line saying which.
   const RvgMemoryRangeFile *memory_files;
+  // The guest's architecture, RVG_GUEST_ARCH_*, which the device's answers to the guest's Metal
+  // follow where an Apple silicon Mac's GPU and an Intel or AMD Mac's answer apart: an arm64
+  // guest's device answers `isFramebufferReadSupported` as the host's GPU can, an x86-64
+  // guest's no. Refused (RVG_ERR_INVALID_ARGUMENT): any other value. A host built before this
+  // field, whose `struct_size` ends before it, serves an x86-64 guest.
+  RvgGuestArch guest_arch;
 } RvgGraphicsDeviceConfig;
 
 #ifdef __cplusplus

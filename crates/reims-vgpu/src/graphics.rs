@@ -190,6 +190,19 @@ pub struct GraphicsConfig {
     /// view a copy of its pages in the region. The pages stay the guest's RAM while the device
     /// lives: a host that discards guest RAM (a balloon, hot-unplug) gives none.
     pub memory_map: Option<MemoryMap>,
+    /// The guest's architecture, which the device's answer of `isFramebufferReadSupported` follows
+    /// (`device_info`'s `lane_flags`).
+    pub guest_arch: GuestArch,
+}
+
+/// The architecture of the macOS guest a graphics device serves ([`GraphicsConfig::guest_arch`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GuestArch {
+    /// An x86-64 guest, whose frameworks were written against Intel and AMD Macs' GPUs.
+    #[default]
+    X86_64,
+    /// An arm64 guest, whose frameworks were written against Apple silicon's GPUs.
+    Arm64,
 }
 
 /// The bytes of the host GPU's memory deferred blocks' device caches may hold, which
@@ -275,7 +288,12 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // answers `hasUnifiedMemory` alike, from the blob.
             let unified_memory = identity.flags.has_unified_memory.unwrap_or(false);
             let meshes = device_info::makes_mesh_pipelines(&identity);
-            let mut info = device_info(&gpu_device.caps(), identity, pool.threads().to_u64());
+            let mut info = device_info(
+                &gpu_device.caps(),
+                identity,
+                pool.threads().to_u64(),
+                config.guest_arch,
+            );
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             decoder.set_unified_memory(unified_memory);
             // The platform's lease on the guest's RAM, held by the views of the surfaces' pages

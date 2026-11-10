@@ -10,7 +10,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use reims_vgpu::{GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn};
+use reims_vgpu::{GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, GuestArch};
 
 use crate::cursor::{
     RvgCursorGlyphFn, RvgCursorMoveFn, RvgCursorShowFn, RvgDisplayCoord, cursor_glyph, cursor_move,
@@ -140,6 +140,18 @@ pub struct RvgGraphicsCallbacks {
 // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
 unsafe impl HostStruct for RvgGraphicsCallbacks {}
 
+/// The architecture of the macOS guest a graphics device serves: one of RVG_GUEST_ARCH_*.
+pub type RvgGuestArch = u32;
+
+// The constants below are RvgGuestArch values, typed `u32` so that cbindgen writes them with the
+// header's other constants, ahead of its types.
+
+/// An x86-64 guest: the default, and what a host built before `guest_arch` serves.
+pub const RVG_GUEST_ARCH_X86_64: u32 = 0;
+
+/// An arm64 guest.
+pub const RVG_GUEST_ARCH_ARM64: u32 = 1;
+
 /// The graphics device's config.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -170,10 +182,19 @@ pub struct RvgGraphicsDeviceConfig {
     /// length in bytes, or an `offset` that is not a multiple of the host's page size; a file that
     /// cannot be duplicated. A refusal logs a line saying which.
     pub memory_files: *const RvgMemoryRangeFile,
+    /// The guest's architecture, RVG_GUEST_ARCH_*, which the device's answers to the guest's Metal
+    /// follow where an Apple silicon Mac's GPU and an Intel or AMD Mac's answer apart: an arm64
+    /// guest's device answers `isFramebufferReadSupported` as the host's GPU can, an x86-64
+    /// guest's no. Refused (RVG_ERR_INVALID_ARGUMENT): any other value. A host built before this
+    /// field, whose `struct_size` ends before it, serves an x86-64 guest.
+    pub guest_arch: RvgGuestArch,
 }
 
-// SAFETY: repr(C), a u32 first; pointers.
-unsafe impl HostStruct for RvgGraphicsDeviceConfig {}
+// SAFETY: repr(C), a u32 first; pointers and a u32.
+unsafe impl HostStruct for RvgGraphicsDeviceConfig {
+    /// The first version ended before `guest_arch`.
+    const V1_SIZE: usize = std::mem::offset_of!(RvgGraphicsDeviceConfig, guest_arch);
+}
 
 /// The graphics device.
 pub struct RvgGraphicsDevice {
@@ -266,6 +287,11 @@ unsafe fn create(
     if device.is_null() {
         return refuse(RVG_ERR_INVALID_ARGUMENT);
     }
+    let guest_arch = match c.guest_arch {
+        RVG_GUEST_ARCH_X86_64 => GuestArch::X86_64,
+        RVG_GUEST_ARCH_ARM64 => GuestArch::Arm64,
+        _ => return refuse(RVG_ERR_INVALID_ARGUMENT),
+    };
     // SAFETY: the config's contract: NULL or a live map, and NULL or its files.
     let memory_map = match unsafe { memory_map(c.memory_map, c.memory_files) } {
         Ok(m) => m,
@@ -291,6 +317,7 @@ unsafe fn create(
             _ => None,
         },
         memory_map,
+        guest_arch,
     };
     match GraphicsDevice::with_platform(<Plat as reims_vgpu::ApiPlatform>::process(), config) {
         Ok(d) => {

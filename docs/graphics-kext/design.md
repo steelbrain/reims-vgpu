@@ -237,6 +237,14 @@ Stages:
      no (Metal4, ray tracing, function pointers, dynamic libraries and the
      rest). One table in `crates/reims-vgpu/src/graphics/device_info.rs`
      lists each such answer with what it waits on.
+   - The guest's architecture, which the host names in the device's config
+     (`guest_arch`, from QEMU's target), decides one answer:
+     `isFramebufferReadSupported` is the host GPU's for an arm64 guest, as
+     an Apple silicon Mac answers yes, and no for an x86-64 guest, as an AMD
+     Mac answers (an Intel UHD 630 answers yes). CoreAnimation in an arm64
+     guest blends its generic shader against a destination it reads by
+     framebuffer fetch, which it compiles in by this answer: with no, the
+     menu bar drew black (2026-11-09).
 11. **Stage 2 lays the final transport.** The rings, doorbells, interrupts,
     contexts and the display path are the final ones from stage 2 on, and
     stage 3 adds commands to them. The stage 2 display scans out host memory

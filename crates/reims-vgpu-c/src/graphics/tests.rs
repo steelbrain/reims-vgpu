@@ -30,6 +30,7 @@ fn config(callbacks: &RvgGraphicsCallbacks) -> RvgGraphicsDeviceConfig {
         window: std::ptr::null(),
         memory_map: std::ptr::null(),
         memory_files: std::ptr::null(),
+        guest_arch: RVG_GUEST_ARCH_X86_64,
     }
 }
 
@@ -144,8 +145,59 @@ fn refused_graphics_configs() {
             before + 2,
             "a refusal's destroy"
         );
+        // A guest architecture the library does not know is refused, after the tables are the
+        // library's.
+        let mut c = config(&cb);
+        c.guest_arch = RVG_GUEST_ARCH_ARM64 + 1;
+        assert_eq!(
+            rvg_graphics_device_create(&c, &mut device),
+            RVG_ERR_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            DESTROYS.load(Ordering::SeqCst),
+            before + 3,
+            "a refusal's destroy"
+        );
     }
     assert!(device.is_null());
+}
+
+/// The device's answer of `isFramebufferReadSupported` in the blob the guest reads, of a device
+/// made from `c`.
+fn framebuffer_read(c: &RvgGraphicsDeviceConfig) -> u8 {
+    use reims_vgpu_graphics::wire::{RGFX_DEVICE_INFO_OFFSET, RgfxDeviceInfo};
+    // is_framebuffer_read_supported, third of the blob's flags.
+    let at = RGFX_DEVICE_INFO_OFFSET as usize + std::mem::offset_of!(RgfxDeviceInfo, flags) + 2;
+    let mut device = std::ptr::null_mut();
+    // SAFETY: a live config and out-pointer; then a live device, whose region holds the blob
+    // while it lives, released.
+    unsafe {
+        assert_eq!(rvg_graphics_device_create(c, &mut device), RVG_OK);
+        let answer = rvg_graphics_device_region(device, std::ptr::null_mut())
+            .cast::<u8>()
+            .add(at)
+            .read();
+        rvg_graphics_device_release(device);
+        answer
+    }
+}
+
+/// The guest's architecture decides the device's `isFramebufferReadSupported`: an arm64 guest's
+/// is the platform's (the fake's yes), an x86-64 guest's no; a config of the first version, whose
+/// `struct_size` ends before `guest_arch`, serves an x86-64 guest whatever lies past its size
+#[test]
+fn the_guest_s_architecture_decides_framebuffer_read() {
+    let cb = RvgGraphicsCallbacks {
+        destroy: None,
+        ..callbacks()
+    };
+    let mut c = config(&cb);
+    assert_eq!(framebuffer_read(&c), 0);
+    c.guest_arch = RVG_GUEST_ARCH_ARM64;
+    assert_eq!(framebuffer_read(&c), 1);
+    // The first version's size, with an arm64 guest past it, which the library does not read.
+    c.struct_size = std::mem::offset_of!(RvgGraphicsDeviceConfig, guest_arch) as u32;
+    assert_eq!(framebuffer_read(&c), 0);
 }
 
 static MOVES: AtomicUsize = AtomicUsize::new(0);

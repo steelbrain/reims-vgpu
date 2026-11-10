@@ -27,6 +27,7 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap()
 }
@@ -112,6 +113,7 @@ fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<Fa
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -162,6 +164,7 @@ fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let gpu = platform.metal_device(None).unwrap();
@@ -449,6 +452,28 @@ fn device_info_is_written_into_the_region_at_init() {
         assert_eq!(feature_set(set), Some(0), "feature set {set}");
     }
     assert_eq!(feature_set(10005), Some(1));
+}
+
+/// The config's guest architecture reaches the blob: an x86-64 guest's device answers
+/// `isFramebufferReadSupported` no, an arm64 guest's the platform's yes (the fake's), and the
+/// families alike for both
+#[test]
+fn the_blob_answers_framebuffer_read_by_the_guest_s_architecture() {
+    let framebuffer_read = |guest_arch: GuestArch| {
+        let config = GraphicsConfig {
+            guest_arch,
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+        let info = device_info_of(&device);
+        // is_framebuffer_read_supported, third of the flags.
+        (info.flags[2], info.family_answers)
+    };
+    let (x86, x86_families) = framebuffer_read(GuestArch::X86_64);
+    let (arm64, arm64_families) = framebuffer_read(GuestArch::Arm64);
+    assert_eq!(x86, 0);
+    assert_eq!(arm64, 1);
+    assert_eq!(x86_families, arm64_families);
 }
 
 /// An object-create message on ring 0 reaches the decoder: its handle is held
@@ -976,6 +1001,7 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1059,6 +1085,7 @@ fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1149,6 +1176,7 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1247,6 +1275,7 @@ fn a_doorbell_s_answer_allocates_nothing() {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1368,6 +1397,7 @@ fn a_landed_download_s_answer_at_its_doorbell_allocates_nothing() {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1446,6 +1476,7 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1820,6 +1851,7 @@ fn calling_back(ring: u64) -> (Arc<GraphicsDevice<FakePlatform>>, Returned) {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let device = Arc::new(device);
@@ -1978,6 +2010,7 @@ fn the_guest_s_cursor_reaches_the_host() {
         callbacks: telling(&told),
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let wait = |count: usize| {
@@ -2124,6 +2157,7 @@ fn windowed() -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
         callbacks: GraphicsCallbacks::default(),
         window: Some(WindowConfig::default()),
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -7857,6 +7891,7 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         callbacks: GraphicsCallbacks::default(),
         window: None,
         memory_map: Some(map),
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let in_place = RGFX_FEATURE_SURFACE_PAGES
@@ -9020,6 +9055,7 @@ fn surface_device(
         callbacks: GraphicsCallbacks::default(),
         window: None,
         memory_map: Some(map),
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -9749,6 +9785,7 @@ fn on_vulkan_an_identity_colour_matrix_reads_as_no_colour() {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     let (width, height, stride) = (256usize, 4usize, 1024usize);
@@ -9943,6 +9980,7 @@ fn on_vulkan_a_read_of_the_display_gives_the_scanout_s_pixels() {
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     let (width, height, stride) = (64usize, 32usize, 256usize);
@@ -10015,6 +10053,7 @@ fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
         callbacks: GraphicsCallbacks::default(),
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -10117,6 +10156,7 @@ fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
         callbacks: GraphicsCallbacks::default(),
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -10256,6 +10296,7 @@ fn one_queue_raising(
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);

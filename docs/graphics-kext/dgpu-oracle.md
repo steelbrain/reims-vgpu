@@ -291,8 +291,9 @@ Probe: `oracle_passes DEVICE features`.
 | `supportsTileShaders`, `supportsImageBlocks` (SPI) | 0, 0 | 0, 0 | 1, 1 |
 
 Our stack: memoryless textures are made (m2v). The lane answers `isFramebufferReadSupported`
-no, as AMD does *(class 2: the Vulkan platform's fetch costs most)*, and `supportsTileShaders`
-and `supportsImageBlocks` no, as both x86 GPUs do (4ee4bcaf0). **Relaxation: none.** With no
+no to an x86-64 guest, as AMD does *(class 2: the Vulkan platform's fetch costs most)*, and the
+host GPU's answer to an arm64 guest, as the M3 does (`device_info.rs`, `lane_flags`). It answers
+`supportsTileShaders` and `supportsImageBlocks` no, as both x86 GPUs do (4ee4bcaf0). **Relaxation: none.** With no
 Apple family claimed, guests should ask for none of these; a guest that makes a memoryless
 texture ends on x86 and goes on with ours.
 
