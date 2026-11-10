@@ -17,7 +17,7 @@
 
 namespace rgfxgate {
 
-static constexpr const char *kClientID = "com.steelbrain.RgfxGate";
+static constexpr const char *kClientID = "ai.aneesiqbal.RgfxGate";
 
 // mach/vm_prot.h value; only an executable mapping concerns the sandbox wall.
 static constexpr int kVmProtExecute = 0x04;

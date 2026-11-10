@@ -20,4 +20,4 @@ kern_return_t _stop(kmod_info_t *ki, void *data)
 }
 
 // The macro quotes its first argument as written, so the ID is spelled here.
-KMOD_EXPLICIT_DECL(com.steelbrain.ReimsGraphics, BUNDLE_VERSION, _start, _stop)
+KMOD_EXPLICIT_DECL(ai.aneesiqbal.ReimsGraphics, BUNDLE_VERSION, _start, _stop)

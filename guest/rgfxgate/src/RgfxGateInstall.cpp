@@ -540,7 +540,7 @@ static bool installBundle(vfs_context_t ctx) {
 }
 
 // Records the install's outcome as RgfxGate's Graft client state
-// (GraftClient.com.steelbrain.RgfxGate, "<state>: <reason>"), so a refusal is
+// (GraftClient.ai.aneesiqbal.RgfxGate, "<state>: <reason>"), so a refusal is
 // visible there and never hidden behind the install-done flag, which only says
 // the pass ended. Published on arm64, whose boots read it back; a no-op on
 // x86-64, which keeps that build byte-identical.

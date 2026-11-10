@@ -24,7 +24,7 @@ constexpr size_t kKept = 64;
 dispatch_queue_t rgfxStateReleases()
 {
 	static dispatch_queue_t queue = dispatch_queue_create(
-	    "com.steelbrain.reims-graphics.state-releases", DISPATCH_QUEUE_SERIAL);
+	    "ai.aneesiqbal.reims-graphics.state-releases", DISPATCH_QUEUE_SERIAL);
 	return queue;
 }
 

@@ -245,7 +245,7 @@ uprobes made present gaps of 378 and 521 ms.
 
 ### fbt probes in the guest's kexts
 
-`dtrace -l -P fbt -m com.steelbrain.ReimsGraphics` lists no probes. The
+`dtrace -l -P fbt -m ai.aneesiqbal.ReimsGraphics` lists no probes. The
 guest's kernel decides that, not the kext's build. **Read** from xnu's
 public source (its main branch, `bsd/dev/dtrace` and
 `libkern/c++/OSKext.cpp`, not checked against macOS 26's):
@@ -281,13 +281,13 @@ that allows dtrace, `keepsyms=1`, and `OSBundleForceDTraceInit` (true) in the
 guest/kext DTRACE=1 BUILD=build/dtrace` builds that kext; a plain `make`
 leaves the key out. Without `keepsyms=1` the kernel ignores the key for a
 Boot-collection kext, logging `Ignoring OSBundleForceDTraceInit for Boot KC
-Kext com.steelbrain.ReimsGraphics` (**read** from xnu-12377.1.9 and
+Kext ai.aneesiqbal.ReimsGraphics` (**read** from xnu-12377.1.9 and
 xnu-12377.121.6, macOS 26's sources; macOS 11's, xnu-7195, panics there
 instead). With SIP on, dtrace makes no fbt probe whatever the kext sets
 (`dtrace_fbt_probes_restricted`). Whether the three give our global
 functions their probes is not yet measured. To check, as root in the guest
 on such an image:
-- `dtrace -l -P fbt -m com.steelbrain.ReimsGraphics | wc -l` prints more
+- `dtrace -l -P fbt -m ai.aneesiqbal.ReimsGraphics | wc -l` prints more
   than 0: about 314 entry probes, and their return probes;
 - `log show --last boot --predicate 'eventMessage CONTAINS
   "OSBundleForceDTraceInit"'` prints no line.
@@ -1008,8 +1008,8 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   `config.plist` with a `Kernel` > `Add` entry for each kext, Graft first,
   `Graphics` > `DisplayNode` set to `reims-display0`, and the kexts under
   `Kexts/`. It checks each kext's `CFBundleIdentifier`
-  (`com.steelbrain.Graft`, `com.steelbrain.ReimsGraphics`,
-  `com.steelbrain.RgfxGate`) and that its executable has an arm64e slice,
+  (`com.steelbrain.Graft`, `ai.aneesiqbal.ReimsGraphics`,
+  `ai.aneesiqbal.RgfxGate`) and that its executable has an arm64e slice,
   and names every kext that is not given or fails, writing no bundle.
 - **The Ambrosia it needs.** `Graphics` > `DisplayNode` needs Ambrosia
   `8f2655b` or later (Ambrosia's `docs/configuration.md`, "Graphics >

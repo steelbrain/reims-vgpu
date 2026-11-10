@@ -266,7 +266,7 @@ Stages:
     (`__DATA,__graft`) of every imported site and of the library classes it
     derives from, with no System-collection `OSBundleLibraries`. Its
     personalities stay, each gated by an `IOPropertyMatch` requiring
-    `com.steelbrain.ReimsGraphics.graft-bound` on the device nub, and the
+    `ai.aneesiqbal.ReimsGraphics.graft-bound` on the device nub, and the
     manifest names the device (its `IOPCIPrimaryMatch`). OpenCore links that
     dormant kext in the Boot collection. Graft (`guest/graft`, a copy of
     Graft's release build) starts from its own kext start. Once the
@@ -278,7 +278,7 @@ Stages:
     constructors run through the sites (an `IOResourceMatch` would hold
     back only `start()`). On a missing symbol or a layout that
     differs, Graft declines ReimsGraphics by name in its log and in the
-    registry root's `GraftClient.com.steelbrain.ReimsGraphics`, and the
+    registry root's `GraftClient.ai.aneesiqbal.ReimsGraphics`, and the
     guest boots on. The image carries the set `make -C guest set` builds,
     in this order: Graft.kext, ReimsGraphics.kext and RgfxGate.kext.
     OpenCore injects it from Darwin 20 (macOS 11), the releases whose

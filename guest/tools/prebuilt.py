@@ -148,7 +148,7 @@ def stage(out, work, arch="x86_64"):
     # Graft's staging keeps the personalities, each gated on the device nub by the property
     # Graft sets once it has bound the kext, so none is even constructed before that.
     personalities = infos["ReimsGraphics.kext"].get("IOKitPersonalities", {})
-    gate = {"com.steelbrain.ReimsGraphics.graft-bound": True}
+    gate = {"ai.aneesiqbal.ReimsGraphics.graft-bound": True}
     if not personalities or any(p.get("IOPropertyMatch") != gate for p in personalities.values()):
         raise SystemExit("prebuilt: dormant ReimsGraphics has a personality without Graft's gate")
     dependencies = infos["ReimsGraphics.kext"].get("OSBundleLibraries", {})

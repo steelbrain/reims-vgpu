@@ -32,8 +32,8 @@ import sys
 # its bundle's name in the archive, and its CFBundleIdentifier.
 KEXTS = [
     ("GRAFT", "Graft.kext", "com.steelbrain.Graft"),
-    ("REIMS_GRAPHICS", "ReimsGraphics.kext", "com.steelbrain.ReimsGraphics"),
-    ("RGFXGATE", "RgfxGate.kext", "com.steelbrain.RgfxGate"),
+    ("REIMS_GRAPHICS", "ReimsGraphics.kext", "ai.aneesiqbal.ReimsGraphics"),
+    ("RGFXGATE", "RgfxGate.kext", "ai.aneesiqbal.RgfxGate"),
 ]
 
 # The name of display 0's node under /arm-io, the one ReimsGraphics looks for

@@ -61,20 +61,20 @@ run_info() {
 	*"enabled."*) item sip PASS "$csr" ;;
 	*) item sip FAIL "$csr" ;;
 	esac
-	local kexts; kexts=$(kmutil showloaded 2>/dev/null | grep -o -E 'com\.steelbrain\.[A-Za-z.]+' | sort -u | tr '\n' ' ')
+	local kexts; kexts=$(kmutil showloaded 2>/dev/null | grep -o -E 'ai\.aneesiqbal\.[A-Za-z.]+' | sort -u | tr '\n' ' ')
 	case $kexts in
-	*com.steelbrain.ReimsGraphics\ *) item kexts PASS "$kexts" ;;
+	*ai.aneesiqbal.ReimsGraphics\ *) item kexts PASS "$kexts" ;;
 	*) item kexts FAIL "ReimsGraphics is not loaded: $kexts" ;;
 	esac
 	# Graft says whether it bound ReimsGraphics: the registry root's
-	# GraftClient.com.steelbrain.ReimsGraphics starts with "bound" once every site and vtable
+	# GraftClient.ai.aneesiqbal.ReimsGraphics starts with "bound" once every site and vtable
 	# is written and its personalities are published, and names what it declined otherwise.
 	local bind
-	bind=$(ioreg -l -w0 -d1 2>/dev/null | grep -o -E '"GraftClient\.com\.steelbrain\.ReimsGraphics" = "[^"]{0,160}"' |
+	bind=$(ioreg -l -w0 -d1 2>/dev/null | grep -o -E '"GraftClient\.ai\.aneesiqbal\.ReimsGraphics" = "[^"]{0,160}"' |
 		sed 's/^[^=]*= //')
 	case $bind in
 	'"bound'*) item graft-bind PASS "$bind" ;;
-	*) item graft-bind FAIL "${bind:-no GraftClient.com.steelbrain.ReimsGraphics on the registry root}" ;;
+	*) item graft-bind FAIL "${bind:-no GraftClient.ai.aneesiqbal.ReimsGraphics on the registry root}" ;;
 	esac
 	local b=/Library/GPUBundles/reims-graphics.bundle
 	if codesign -v --strict "$b" 2>/dev/null; then

@@ -64,7 +64,7 @@
 #              frames are then never shown.
 #   bundle-install
 #              RgfxGate installed the Metal bundle, as it records it and as the disk shows it:
-#              its Graft client state (GraftClient.com.steelbrain.RgfxGate) reads installed,
+#              its Graft client state (GraftClient.ai.aneesiqbal.RgfxGate) reads installed,
 #              tagged or present; /Library/GPUBundles/reims-graphics.bundle is there with the
 #              restricted flag; and its com.apple.rootless class is KernelExtensionManagement.
 #   amfi-map   AMFI admitted the bundle where it counts: the WindowServer running when the
@@ -371,7 +371,7 @@ if [[ -n $ssh_s ]]; then
   fi
 
   if shown=$(G 120 kmutil showloaded); then
-    loaded=$(echo "$shown" | grep -o -E 'com\.steelbrain\.[A-Za-z.]+' | sort -u | tr '\n' ' ')
+    loaded=$(echo "$shown" | grep -o -E 'ai\.aneesiqbal\.[A-Za-z.]+' | sort -u | tr '\n' ' ')
     missing=
     for id in $(python3 -I -B "$here/tools/stage-config.py" --identifiers); do
       [[ " $loaded " == *" $id "* ]] || missing+="$id "
@@ -470,14 +470,14 @@ if [[ -n $ssh_s ]]; then
   fi
   # RgfxGate's install: the state it records, then the bundle's flags and SIP class on disk.
   bpath=/Library/GPUBundles/reims-graphics.bundle
-  gstate=$(G 30 "ioreg -l -w0 | grep -m1 -o '\"GraftClient.com.steelbrain.RgfxGate\" = \"[^\"]*\"'")
+  gstate=$(G 30 "ioreg -l -w0 | grep -m1 -o '\"GraftClient.ai.aneesiqbal.RgfxGate\" = \"[^\"]*\"'")
   gstate=${gstate#*= }
   bflags=$(G 20 "ls -ldO $bpath 2>&1 | head -1")
   bclass=$(G 20 "xattr -p com.apple.rootless $bpath 2>&1 | head -1")
   inst=() iok=1
   case $gstate in
   \"installed:* | \"tagged:* | \"present:*) inst+=("RgfxGate's state $gstate") ;;
-  '') inst+=("no GraftClient.com.steelbrain.RgfxGate state") iok=0 ;;
+  '') inst+=("no GraftClient.ai.aneesiqbal.RgfxGate state") iok=0 ;;
   *) inst+=("RgfxGate's state $gstate") iok=0 ;;
   esac
   if [[ $bflags == *restricted* ]]; then inst+=("bundle restricted")

@@ -44,7 +44,7 @@ FLAGS = -arch $(ARCH_NAME) -mmacosx-version-min=$(MIN_OS) -isysroot $(SDK) -mker
 	$(REDZONE) -Os -Wall -Wextra -Werror -Wno-unused-parameter
 CXXFLAGS = $(FLAGS) -MMD -MP -std=c++17 -fapple-kext -fno-rtti -fno-exceptions \
 	-DKERNEL -DKERNEL_PRIVATE -nostdinc -isystem $(KHEADERS) \
-	-DGRAFT_CLIENT_ID=com.steelbrain.RgfxGate -DGRAFT_CLIENT_VERSION=\"$(VERSION)\" \
+	-DGRAFT_CLIENT_ID=ai.aneesiqbal.RgfxGate -DGRAFT_CLIENT_VERSION=\"$(VERSION)\" \
 	-I$(GEN) -Isrc -I$(GRAFT)/sdk/include
 
 OBJS = $(BUILD)/obj/RgfxGate.o $(BUILD)/obj/RgfxGateHooks.o \

@@ -39,7 +39,7 @@ bundle() {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>reims-graphics</string>
-<key>CFBundleIdentifier</key><string>com.steelbrain.rgfxgate.payload-test</string>
+<key>CFBundleIdentifier</key><string>ai.aneesiqbal.rgfxgate.payload-test</string>
 </dict></plist>
 PLIST
 	codesign -s - -f "$b" 2> /dev/null
