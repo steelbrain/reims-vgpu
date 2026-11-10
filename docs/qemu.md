@@ -1054,8 +1054,13 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
   Metal device that is not Apple's paravirtual one, WindowServer's pid kept,
   and the host's log showing an IOSurface the guest presented.
   `metal-app`: `present_probe` full-screen in the user's session, under
-  `report.py`'s bar; a probe that falls short while Setup Assistant runs
-  fails as unread, naming it, as its full-screen window covers the probe's. `bundle-install`: RgfxGate's Graft client state reads
+  `report.py`'s bar; under TCG it passes on frames presented with at most 3
+  answers missing, and its drops are printed but not judged, as the emulated
+  CPU sets WindowServer's composite rate (pacing is judged under HVF only).
+  Its line also gives the host's display flips during the probe,
+  WindowServer's own present rate. A probe that falls short while Setup
+  Assistant runs fails as unread, naming it, as its full-screen window
+  covers the probe's. `bundle-install`: RgfxGate's Graft client state reads
   installed, tagged or present, and `/Library/GPUBundles/reims-graphics.bundle`
   carries the restricted flag and the `KernelExtensionManagement` rootless
   class. `amfi-map`: WindowServer maps the bundle's executable (`sudo lsof`

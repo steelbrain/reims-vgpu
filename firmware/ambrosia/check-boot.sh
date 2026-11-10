@@ -53,9 +53,14 @@
 #              presented.
 #   metal-app  present_probe, an on-screen Metal app, ran full-screen for 10 s in the user's
 #              session, as the lane gate's present phase: OK, frames presented, and at most a
-#              tenth dropped or unanswered (report.py's bar for the correctness boot). A probe
-#              that falls short while Setup Assistant runs fails as unread, naming it: its
-#              full-screen window covers the probe's, whose frames are then never shown.
+#              tenth dropped or unanswered (report.py's bar for the correctness boot). Under TCG
+#              it passes on OK, frames presented and at most 3 unanswered; its drops and rates
+#              are printed but not judged, as the emulated CPU sets the rate WindowServer
+#              composites at, and pacing is judged under HVF only. Beside the probe's line, the
+#              host's count of display flips during the probe's call, WindowServer's own present
+#              rate, to read its drops against. A probe that falls short while Setup Assistant
+#              runs fails as unread, naming it: its full-screen window covers the probe's, whose
+#              frames are then never shown.
 #   bundle-install
 #              RgfxGate installed the Metal bundle, as it records it and as the disk shows it:
 #              its Graft client state (GraftClient.com.steelbrain.RgfxGate) reads installed,
@@ -421,19 +426,28 @@ if [[ -n $ssh_s ]]; then
     else
       cover_say=
     fi
+    # The host logs each display flip; those during the probe's call are WindowServer's own
+    # presents, the rate the probe's frames can reach the display at.
+    q0=$(wc -l < "$out/qemu.log") t0=$SECONDS
     probe=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' launchctl asuser \$(id -u) sudo -u \$(id -un) perl -e 'alarm shift @ARGV; exec @ARGV' $((40 * slow)) \$HOME/ambrosia-check/present_probe -t 10" |
       grep '^present_probe:' | head -1)
+    flips=$(tail -n +"$((q0 + 1))" "$out/qemu.log" | grep -c -E 'the display shows IOSurface [1-9]') secs=$((SECONDS - t0))
+    ws_say="WindowServer: $flips display flips in the probe's ${secs} s call ($(perl -e 'printf "%.1f", $ARGV[0] / ($ARGV[1] || 1)' "$flips" "$secs")/s)"
     # report.py's bar for the correctness boot: frames presented, and at most a tenth lost, a
-    # loss being a drop or an answer still missing beyond the last 3.
+    # loss being a drop or an answer still missing beyond the last 3. Under TCG: frames
+    # presented and at most 3 answers missing; drops are not judged.
     if [[ $probe == "present_probe: OK "* ]] && perl -e '
-        my %k = map { /^(\w+)=([-0-9.]+)$/ ? ($1, $2) : () } split " ", $ARGV[0];
-        my ($p, $l) = ($k{presented} // 0, ($k{dropped} // 0) + (($k{unanswered} // 0) > 3 ? $k{unanswered} - 3 : 0));
-        exit !($p > 0 && $l <= 0.1 * ($p + $l))' "$probe"; then
-      verdict metal-app PASS "${probe#present_probe: }"
+        my ($line, $tcg) = @ARGV;
+        my %k = map { /^(\w+)=([-0-9.]+)$/ ? ($1, $2) : () } split " ", $line;
+        my ($p, $u) = ($k{presented} // 0, $k{unanswered} // 0);
+        exit !($p > 0 && $u <= 3) if $tcg;
+        my $l = ($k{dropped} // 0) + ($u > 3 ? $u - 3 : 0);
+        exit !($p > 0 && $l <= 0.1 * ($p + $l))' "$probe" "$tcg"; then
+      verdict metal-app PASS "${probe#present_probe: }; $ws_say"
     elif [[ -n $cover_say ]]; then
-      verdict metal-app FAIL "unread: $cover_say; ${probe:-present_probe printed no result line}"
+      verdict metal-app FAIL "unread: $cover_say; ${probe:-present_probe printed no result line}; $ws_say"
     else
-      verdict metal-app FAIL "${probe:-present_probe printed no result line}"
+      verdict metal-app FAIL "${probe:-present_probe printed no result line}; $ws_say"
     fi
   elif ((!dev_ok)); then
     verdict metal-app FAIL "not run: $dev_say"
