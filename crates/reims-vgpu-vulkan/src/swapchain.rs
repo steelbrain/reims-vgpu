@@ -468,6 +468,10 @@ pub struct Swapchain {
     surface: vk::SurfaceKHR,
     /// The present mode.
     mode: vk::PresentModeKHR,
+    /// The steady-state mode selected from the surface's supported modes.
+    /// Windows/NVIDIA starts with FIFO once to initialize its DXGI flip path;
+    /// a successful first present then retires it normally and uses this mode.
+    preferred_mode: vk::PresentModeKHR,
     /// The fence each image is taken with.
     fence: vk::Fence,
     /// The swapchain, once made.
@@ -670,7 +674,8 @@ impl Swapchain {
         let modes =
             unsafe { surface_api.get_physical_device_surface_present_modes(physical, surface) }
                 .map_err(|e| destroy(refused("vkGetPhysicalDeviceSurfacePresentModesKHR", e)))?;
-        let mode = present_mode(&modes);
+        let preferred_mode = present_mode(&modes);
+        let mode = crate::os::initial_present_mode(&device.raw, preferred_mode);
         // SAFETY: a valid create info, on the runtime's live device.
         let fence = unsafe { vk.create_fence(&vk::FenceCreateInfo::default(), None) }
             .map_err(|e| destroy(refused("vkCreateFence", e)))?;
@@ -688,6 +693,7 @@ impl Swapchain {
             drawables,
             surface,
             mode,
+            preferred_mode,
             fence,
             chain: None,
             retired: Vec::new(),
@@ -964,6 +970,13 @@ impl Swapchain {
         image.presented = self.presents.make();
         if let (Some(fences), Some(fence)) = (self.fences.as_mut(), fence) {
             fences.presented(image.presented, fence, presented);
+        }
+        // Initial FIFO establishes the Windows driver's flip-model path. The
+        // normal remake/retirement path keeps its frame, semaphore and image
+        // alive until their work is done; no synchronization is skipped.
+        if presented.is_ok() && self.mode != self.preferred_mode {
+            self.mode = self.preferred_mode;
+            self.stale = true;
         }
         match presented {
             Ok(suboptimal) => self.stale |= suboptimal,

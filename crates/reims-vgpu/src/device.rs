@@ -25,6 +25,9 @@
 //! resume), so no wait inside one is left for a harvest, and retired with the lease.
 
 use std::any::Any;
+#[cfg(windows)]
+use std::fs::File as OwnedFd;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
@@ -269,6 +272,7 @@ pub(crate) type GuestMemoryLease = Arc<dyn Any + Send + Sync>;
 
 /// Whether a device takes its host's dirty source: unless `REIMS_VGPU_DIRTY_PAGE_TRACKING` is `0`,
 /// read once per process.
+#[cfg(target_os = "linux")]
 fn dirty_page_tracking_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("REIMS_VGPU_DIRTY_PAGE_TRACKING").is_none_or(|v| v != "0"))
@@ -322,6 +326,12 @@ impl<P: ApiPlatform> Device<P> {
     /// ([`ApiPlatform::guest_memory`]) is taken before core's device is made, and a refusal
     /// drops it before it returns.
     pub fn with_platform(platform: Arc<P>, config: DeviceConfig) -> Result<Device<P>, Error> {
+        // This ABI source names a KVM descriptor. WHPX cannot consume it; refuse it
+        // explicitly instead of claiming that a harvest found no changed guest pages.
+        #[cfg(not(target_os = "linux"))]
+        if config.dirty_source.is_some() {
+            return Err(Error::InvalidArgument);
+        }
         entry::run(|_| {
             let metal = platform.metal_device(config.metal_registry_id);
             if let Some(metal) = &metal {
@@ -330,6 +340,9 @@ impl<P: ApiPlatform> Device<P> {
             let mut guest_memory: Option<GuestMemoryLease> = None;
             let mut dirty_log = None;
             if let Some(map) = &config.memory_map {
+                #[cfg(not(target_os = "linux"))]
+                let dirty: Option<Harvester> = None;
+                #[cfg(target_os = "linux")]
                 let dirty = (config.dirty_source.clone())
                     .filter(|_| dirty_page_tracking_on())
                     .map(|source| {

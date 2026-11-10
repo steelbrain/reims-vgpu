@@ -815,7 +815,9 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    // Linux and Windows share the Vulkan presenter contract; neither test opens
+    // an SDL window or acquires the host's input focus.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     impl FrameSink for PositionSink {
         fn presenter(
             &self,

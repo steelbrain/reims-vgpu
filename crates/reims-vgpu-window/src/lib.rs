@@ -56,7 +56,7 @@ pub mod scroll;
 
 // The SDL3 window: Linux's (`native/linux.rs`), and macOS's with the `macos-sdl` feature, behind
 // `REIMS_VGPU_WINDOW_IMPL`.
-#[cfg(any(target_os = "linux", feature = "macos-sdl"))]
+#[cfg(any(target_os = "linux", target_os = "windows", feature = "macos-sdl"))]
 mod sdl;
 
 pub use config::{

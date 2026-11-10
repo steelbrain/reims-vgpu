@@ -29,7 +29,7 @@ use reims_vgpu_core::num::{ToU64 as _, ToUsize as _};
 use reims_vgpu_core::platform::os::surface::Surface as _;
 
 use super::dma_buf::{self, Refusal, Zeros};
-use super::surface::{LinuxSurface, MemoryHolder, recorded_mut};
+use super::surface::{MemoryHolder, StandInSurface as LinuxSurface, recorded_mut};
 use super::vm;
 
 /// A surface's bytes lent to a device (module docs).
@@ -241,7 +241,7 @@ mod tests {
     use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
     use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm as _};
 
-    use super::super::surface::{LinuxSurfaces, attachment};
+    use super::super::surface::{StandInSurfaces as LinuxSurfaces, attachment};
     use super::super::vm::tests::mapped;
     use super::super::vm::{LinuxVm, allocate_aliasable};
     use super::*;

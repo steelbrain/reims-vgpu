@@ -25,8 +25,15 @@ use linux as host_os;
 #[cfg(target_os = "macos")]
 use macos as host_os;
 
+#[cfg(windows)]
+use std::fs::File as OwnedFd;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(windows)]
+mod windows;
 use std::sync::Arc;
+#[cfg(windows)]
+use windows as host_os;
 
 /// The dirty source's side on Linux: the device's log, the harvester's interface, and the
 /// per-import answers the runtime asks (`os/linux/dirty.rs`).
@@ -60,6 +67,7 @@ pub(crate) use host_os::{PAGE, mapped, writable};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::MATRIX_KEY;
 pub use surface::{PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout};
+pub(crate) use wsi::initial_present_mode;
 pub use wsi::{add_window_extensions, present_fences};
 
 #[cfg(test)]

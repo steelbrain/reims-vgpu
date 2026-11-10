@@ -40,17 +40,10 @@ impl<P: Platform> MappingTask<P> {
             platform,
         };
         let vm = task.platform.vm();
-        match vm.allocate_anywhere(size) {
+        match vm.reserve_noaccess(size) {
             Ok(a) => task.base_address = a,
             // The base is still NULL, so the drop frees nothing
             Err(_) => return None,
-        }
-        if vm
-            .protect_max(task.base_address, task.size, VmProt::NONE)
-            .is_err()
-        {
-            // The drop frees the reservation
-            return None;
         }
         Some(Arc::new(task))
     }

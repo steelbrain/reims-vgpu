@@ -39,6 +39,26 @@ use metal2vulkan_runtime as rt;
 
 use super::host_os::{WINDOW_DEVICE_EXTENSIONS, WINDOW_SURFACE_EXTENSIONS, open_loader};
 
+#[cfg(windows)]
+mod windows;
+
+/// The first swapchain's mode. Other hosts use the selected mode immediately;
+/// the Windows driver-specific initialization stays in its own OS module.
+pub(crate) fn initial_present_mode(
+    device: &rt::Device,
+    preferred: vk::PresentModeKHR,
+) -> vk::PresentModeKHR {
+    #[cfg(windows)]
+    {
+        windows::initial_present_mode(device.properties().vendor_id, preferred)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = device;
+        preferred
+    }
+}
+
 /// The device extensions that give present fences, preferred first, each with the instance
 /// extension it requires beside `VK_KHR_get_surface_capabilities2`.
 const PRESENT_FENCES: [(&CStr, &CStr); 2] = [

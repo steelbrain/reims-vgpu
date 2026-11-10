@@ -1,0 +1,3 @@
+# Portable metallib fingerprints hash the shader source bytes verbatim.
+# Preserve the exact committed bytes on Windows as well as on Unix hosts.
+*.metal -text

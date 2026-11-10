@@ -26,6 +26,10 @@
 //! **By platform.** Each platform's `ApiPlatform` is a file of its own: `platform/metal.rs`
 //! (macOS) and `platform/vulkan.rs` (feature `vulkan`).
 
+/// Windows host-file services used by descriptor-based C API imports.
+#[cfg(windows)]
+pub mod windows;
+
 use std::any::Any;
 use std::sync::{Arc, OnceLock, Weak};
 
