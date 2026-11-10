@@ -419,6 +419,10 @@ fn private_bytes(d: &VulkanDevice, b: &VulkanBuffer, len: u64) -> Vec<u8> {
 /// [`PASSES`] times the attachment), and leaves the target holding the draws.
 fn many_passes(over: Backed, width: u64) {
     let (p, d) = (platform(), dev());
+    // Until the device's in-place check answers, a target over guest pages is shadowed, and each
+    // pass's shadow grows the device's memory: settle it, so the count is of the passes alone.
+    #[cfg(target_os = "linux")]
+    crate::gpu::device::tests::settle_device_checks(&d);
     let row = 4 * width;
     let len = row * H;
     let mut upload_pages = Pages::new(slot(2 * PASSES));
