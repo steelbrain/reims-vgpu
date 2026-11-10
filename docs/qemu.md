@@ -1116,11 +1116,12 @@ are `guest/prebuilt-arm64e` (`make -C guest prebuilt-arm64e`):
 `REIMS_GRAPHICS=guest/prebuilt-arm64e/ReimsGraphics.kext` and
 `RGFXGATE=guest/prebuilt-arm64e/RgfxGate.kext`.
 
-**What a pass still needs** (2026-11-08): Graft's bind of the arm64e
+**A pass** (measured 2026-11-09 on the M3 Max under HVF, development
+`58a5bf9df`, Ambrosia `3d094f9`, jobs `m3-max-12987` and `12993`): every
+check passes on 14.6.1, 15.6.1, 26.6.2 and 27.0.1. Graft binds the arm64e
 ReimsGraphics, its display and accelerator together; the display is an
 IOMobileFramebuffer ([graphics-kext/design.md](graphics-kext/design.md),
-"Decided", item 13), whose bind waits for Graft 1.3.0's bind-time
-IOMobileFramebuffer vtable synthesis (Graft's `notes/arm64-display.md`).
+"Decided", item 13).
 
 **A TCG run** (`-t`) runs on a Linux member. What it needs:
 - **A node** with the arm64 guests: `homelab-um870-1` holds reflink copies of
