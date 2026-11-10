@@ -61,8 +61,13 @@ pub use status::RvgStatus;
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(all(target_os = "linux", not(feature = "vulkan")))]
-compile_error!("on Linux, reims-vgpu-c builds only with the `vulkan` feature (VulkanPlatform)");
+#[cfg(all(
+    any(target_os = "linux", target_os = "windows"),
+    not(feature = "vulkan")
+))]
+compile_error!(
+    "on Linux and Windows, reims-vgpu-c builds only with the `vulkan` feature (VulkanPlatform)"
+);
 
 /// The platform every handle is made on.
 #[cfg(not(any(test, feature = "vulkan")))]

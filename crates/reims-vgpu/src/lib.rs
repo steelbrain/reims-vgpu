@@ -81,7 +81,7 @@ pub use video::{
 #[cfg(target_os = "macos")]
 pub type DefaultPlatform = MetalPlatform;
 /// The platform every handle is made on by default: `VulkanPlatform` on Linux.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub type DefaultPlatform = VulkanPlatform;
 pub use reims_vgpu_window::{
     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,

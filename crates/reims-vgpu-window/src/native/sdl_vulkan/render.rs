@@ -200,6 +200,12 @@ impl Surface {
         if let Some(work) = retry
             && !state.closed
         {
+            // A frame received during acquire already set the predicate. Its
+            // notification cannot wake a wait that starts later, so consume
+            // ready work before applying the retry timer to unchanged work.
+            if let Some(ready) = state.take() {
+                return Some(ready);
+            }
             self.wake.wait_for(&mut state, RETRY);
             if state.closed {
                 return None;
@@ -353,6 +359,41 @@ mod tests {
         assert!(
             surface.state.lock().take().is_some(),
             "shown again, it is drawn"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ready_retry_tests {
+    use super::*;
+
+    /// A new guest frame arriving during image acquisition already satisfies
+    /// the render thread's predicate. A previously delivered notification must
+    /// not be replaced by a full timed retry wait.
+    #[test]
+    fn new_frame_during_acquire_retry_is_taken_without_sleep() {
+        let surface = Surface::new();
+        surface.set_target(Target(std::ptr::null_mut()));
+        surface.set_layout(Layout {
+            drawable: (1920, 1080),
+            ..Layout::default()
+        });
+        surface.set_visible(true);
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            surface.request_draw();
+            let previous = surface.next(None).unwrap();
+            // This update occurs while the caller was acquiring an image,
+            // before next(retry) can start waiting on the condition variable.
+            surface.request_draw();
+            let began = std::time::Instant::now();
+            assert!(surface.next(Some(previous)).is_some());
+            best = best.min(began.elapsed());
+        }
+        eprintln!("ready retry wait: {best:?}; retry interval: {RETRY:?}");
+        assert!(
+            best < RETRY / 2,
+            "ready work slept through the retry interval: {best:?}"
         );
     }
 }

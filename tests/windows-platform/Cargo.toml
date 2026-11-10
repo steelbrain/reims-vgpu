@@ -1,0 +1,16 @@
+[package]
+name = "reims-vgpu-windows-platform-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Exercise the production OS modules without enabling the Unix-only process
+# testkit used by the workspace's device-death integration tests.
+[workspace]
+
+[dependencies]
+reims-vgpu-core = { path = "../../crates/reims-vgpu-core" }
+log = "0.4"
+
+[lib]
+path = "contracts.rs"

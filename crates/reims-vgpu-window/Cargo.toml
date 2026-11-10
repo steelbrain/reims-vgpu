@@ -15,7 +15,7 @@ ash.workspace = true
 
 # The window on Linux (`sdl`): SDL3 for the window, its input and its Vulkan surface, and the
 # Vulkan crate's threads.
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 reims-vgpu-vulkan.workspace = true
 sdl3-sys.workspace = true
 
@@ -100,7 +100,9 @@ objc2-app-kit = { workspace = true, features = [
     "objc2-quartz-core",
 ] }
 
-[dev-dependencies]
+# The process/death testkit uses Unix APIs. Windows window tests exercise the
+# production core without enabling that unrelated Unix-only helper module.
+[target.'cfg(unix)'.dev-dependencies]
 reims-vgpu-core = { workspace = true, features = ["testkit"] }
 
 [lints]
