@@ -93,7 +93,8 @@
 #   no-fatal   no `reims-vgpu: fatal` line in QEMU's log or the serial log.
 #
 # OUT keeps serial.log, qemu.log, screen.png (QMP's screendump of the display at the end, before
-# QEMU is stopped), guest.log (what the guest's commands printed) and verdict.txt.
+# QEMU is stopped), guest.log (what the guest's commands printed, Graft's state on the registry
+# root among them) and verdict.txt.
 # Exit 0 when every check passed, 1 when one failed, 2 when the boot could not be set up.
 set -uo pipefail
 
@@ -468,6 +469,9 @@ if [[ -n $ssh_s ]]; then
   else
     verdict metal-app FAIL "not run: $desk_say"
   fi
+  # Graft's state on the registry root, kept in guest.log alone, so that a boot that fails into
+  # Graft leaves it behind: GraftState, GraftReason, GraftLog and each GraftClient.<bundle id>.
+  G 30 "ioreg -l -w0 -d1 | grep -E '\"Graft(State|Reason|Log|Client\\.[A-Za-z.]+)\" = '" > /dev/null
   # RgfxGate's install: the state it records, then the bundle's flags and SIP class on disk.
   bpath=/Library/GPUBundles/reims-graphics.bundle
   gstate=$(G 30 "ioreg -l -w0 | grep -m1 -o '\"GraftClient.ai.aneesiqbal.RgfxGate\" = \"[^\"]*\"'")
