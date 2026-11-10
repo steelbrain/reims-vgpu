@@ -82,6 +82,14 @@
 #              this boot (counted, not counted). Zero deferred while caches were made, no count
 #              line, or no count that counted is printed as a finding under the verdict, not a
 #              failure.
+#   ax-matrix  WindowServer set the display's accessibility matrix: this boot's log has no "not able
+#              to set accessibility matrix" line (ReimsGraphics' colour filter, its set_parameter).
+#   amfi-refuse
+#              AMFI refuses a signature it rejects, through RgfxGate's signature hook, with the
+#              guest up: a copy of /usr/bin/true signed ad hoc with com.apple.rootless.install, an
+#              entitlement only Apple's signatures may carry, is killed (exit 137), and 5 s later
+#              kern.bootsessionuuid is the login's. It runs last of the guest's checks, after
+#              every read of this boot's log, as a failure can take the guest down.
 #   no-fatal   no `reims-vgpu: fatal` line in QEMU's log or the serial log.
 #
 # OUT keeps serial.log, qemu.log, screen.png (QMP's screendump of the display at the end, before
@@ -274,7 +282,8 @@ qpid=$!
 
 # --- the checks ---------------------------------------------------------------------------------
 
-names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count no-fatal)
+names=(firmware console ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix
+  amfi-refuse no-fatal)
 # What a check reports beside its verdict, printed under it: neither a pass nor a failure.
 findings=()
 # The guest's kern.bootsessionuuid at the login and after the Metal work, the panic reports
@@ -515,11 +524,45 @@ if [[ -n $ssh_s ]]; then
   [[ $kc == *check-boot-read ]] && kc_read=1
   kc=$(echo "$kc" | grep -v '^check-boot-read$')
   ws_end=$(G 20 'pgrep -x WindowServer | head -1') || ws_end="unread: $(echo "$ws_end" | tail -1)"
+
+  # The accessibility matrix, read while this boot is still the last one: WindowServer logs each
+  # time it cannot set it. Then a line that says the log was read: grep's status is 1 for none.
+  ax=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"accessibility matrix\"' 2>/dev/null | grep -c 'not able to set accessibility matrix'; echo check-boot-read")
+  ax_n=$(echo "$ax" | head -1)
+  if [[ $ax != *check-boot-read || ! $ax_n =~ ^[0-9]+$ ]]; then
+    verdict ax-matrix FAIL "unread: this boot's log not read in time"
+  elif ((ax_n == 0)); then
+    verdict ax-matrix PASS "no \"not able to set accessibility matrix\" line this boot"
+  else
+    verdict ax-matrix FAIL "$ax_n \"not able to set accessibility matrix\" lines this boot"
+  fi
+
+  # AMFI's refusal, last: an ad hoc signature with an entitlement only Apple's may carry. AMFI
+  # kills the copy, and the guest keeps its boot session.
+  sig=$(G 60 "cp /usr/bin/true /tmp/check-boot-sigfail && printf '%s' '<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>com.apple.rootless.install</key><true/></dict></plist>' > /tmp/check-boot-sigfail.plist && /usr/bin/codesign -f -s - --entitlements /tmp/check-boot-sigfail.plist /tmp/check-boot-sigfail > /dev/null 2>&1; /tmp/check-boot-sigfail; echo \"check-boot-sigfail \$?\"")
+  sleep 5
+  boot2=$(G 20 'sysctl -n kern.bootsessionuuid') || boot2=
+  sig_rc=$(echo "$sig" | grep -o 'check-boot-sigfail [0-9]*' | tail -1 | grep -o '[0-9]*$')
+  if [[ -z $boot2 ]]; then
+    verdict amfi-refuse FAIL "the guest did not answer 5 s after the refused run (exit ${sig_rc:-unread})"
+  elif [[ -z $boot0 ]]; then
+    verdict amfi-refuse FAIL "kern.bootsessionuuid unread at the login, so a boot again is not told"
+  elif [[ $boot2 != "$boot0" ]]; then
+    verdict amfi-refuse FAIL "the guest booted again: kern.bootsessionuuid was $boot0, then $boot2"
+  elif [[ $sig_rc == 137 ]]; then
+    verdict amfi-refuse PASS "AMFI killed the ad hoc signed copy (exit 137); kern.bootsessionuuid kept"
+  else
+    verdict amfi-refuse FAIL "the ad hoc signed copy exited ${sig_rc:-unread}, not 137 (killed)"
+  fi
 elif [[ $(state firmware) == FAIL ]]; then
-  for n in ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count; do verdict "$n" FAIL "not run: the firmware check failed"; done
+  for n in ssh sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix amfi-refuse; do
+    verdict "$n" FAIL "not run: the firmware check failed"
+  done
 else
   verdict ssh FAIL "no SSH login in $limit s"
-  for n in sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count; do verdict "$n" FAIL "not run: no SSH login"; done
+  for n in sip boot-args kexts windowserver-metal metal-app bundle-install amfi-map page-count ax-matrix amfi-refuse; do
+    verdict "$n" FAIL "not run: no SSH login"
+  done
 fi
 # What the display shows at the end: the desktop, or the console's log and the kernel's progress.
 qmp "{\"execute\": \"screendump\", \"arguments\": {\"filename\": \"$out/screen.png\", \"format\": \"png\"}}" > /dev/null 2>&1 ||

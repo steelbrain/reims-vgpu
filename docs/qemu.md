@@ -1076,7 +1076,12 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   pages, refused) and the kext's count lines (counted, not counted). Zero
   deferred while caches were made, no count line, or no count that counted
   is printed under the verdict as a `check-boot: finding:` line, not a
-  failure. `no-fatal`: no `reims-vgpu: fatal` line in QEMU's log or the
+  failure. `ax-matrix`: the boot's log has no `not able to set accessibility
+  matrix` line from WindowServer. `amfi-refuse`: last of the guest's checks,
+  a copy of `/usr/bin/true` signed ad hoc with `com.apple.rootless.install`
+  is killed by AMFI (exit 137), its refusal passing through RgfxGate's
+  signature hook, and 5 s later `kern.bootsessionuuid` is still the
+  login's. `no-fatal`: no `reims-vgpu: fatal` line in QEMU's log or the
   serial log. A reading in the guest that printed nothing fails its check as
   unread (a desktop poll that never answered is no desktop), and under TCG
   each command in the guest, each SSH login the boot waits on, and the wait
