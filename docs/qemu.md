@@ -1000,7 +1000,7 @@ kexts' arm64e builds, and `check-boot.sh` checks one boot of it:
 make -C firmware/ambrosia config-bundle GRAFT=<Graft.kext> \
   REIMS_GRAPHICS=<ReimsGraphics.kext> RGFXGATE=<RgfxGate.kext>
 make -C firmware/ambrosia guest-tools          # on a Mac: bench and present_probe for arm64
-firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
+firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   -q <qemu-system-aarch64 with the device> ~/.local/share/reims-ctl/vms/macos-26
 ```
 
@@ -1136,7 +1136,7 @@ IOMobileFramebuffer vtable synthesis (Graft's `notes/arm64-display.md`).
   The dispatch leaves out `vendor/qemu/roms/*` and
   `vendor/qemu/tests/lcitool/libvirt-ci` (`--without-submodule`). On
   `homelab-um870-1` the job took 9 min and peaked at 12.0 GiB (`--ram 16`).
-- **Copies from the Mac**: Ambrosia's `built/ambrosia.bin` and
+- **Copies from the Mac**: Ambrosia's `target/ambrosia.bin` and
   `build/guest-tools`. The node has clang, lld, cpio and python3, so it can
   build the bundle itself.
 - **On the node's PATH**: `sshpass`, `python3`, `perl` and GNU `timeout`;

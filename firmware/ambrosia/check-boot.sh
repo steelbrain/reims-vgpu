@@ -10,7 +10,7 @@
 #            or written: the boot runs on clones of its disks made in OUT, by cp -c on APFS or
 #            cp --reflink=always on Linux, and removed at the end. Where neither works the script
 #            stops.
-#   -f FILE  Ambrosia's image, its built/ambrosia.bin
+#   -f FILE  Ambrosia's image: target/ambrosia.bin after its `make`, or a release's ambrosia.bin
 #   -q FILE  our QEMU's qemu-system-aarch64 with reims-graphics-pci (docs/qemu.md, "arm64 guests:
 #            the device on Ambrosia"); default $QEMU
 #   -t       TCG, for a Linux member, in place of HVF (docs/qemu.md, "arm64 guests: the boot
@@ -123,7 +123,7 @@ else
   machine= mem=(-m "$ram")
 fi
 
-[[ -n $firmware && -f $firmware ]] || die "no Ambrosia image: give its built/ambrosia.bin with -f"
+[[ -n $firmware && -f $firmware ]] || die "no Ambrosia image: give its target/ambrosia.bin with -f"
 [[ -n $qemu && -x $qemu ]] || die "no QEMU: give our qemu-system-aarch64 with -q, or set QEMU"
 [[ -f $bundle ]] || die "no bundle $bundle: make config-bundle, or give one with -b"
 [[ -x $tools/bench && -x $tools/present_probe ]] ||

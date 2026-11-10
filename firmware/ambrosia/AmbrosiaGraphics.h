@@ -2,7 +2,8 @@
   Ambrosia's graphics driver interface, revision 1, in C: what Ambrosia, the
   boot firmware of arm64 macOS guests on QEMU's vmapple machine, gives a
   graphics driver module, and what the module gives back. Ambrosia's
-  notes/graphics-driver.md is the interface's guide, and its
+  docs/graphics-drivers.md and docs/how-to/write-a-graphics-driver.md are the
+  interface's guides, and its
   crates/ambrosia/src/graphics.rs the types this file declares again.
 
   A module is an ELF64 aarch64 static PIE whose relocations are all
