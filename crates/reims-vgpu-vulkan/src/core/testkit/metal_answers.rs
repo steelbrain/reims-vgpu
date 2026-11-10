@@ -1,7 +1,9 @@
 //! Metal's answers, recorded from the Metal platform on an M3 Max under macOS 27.0.1 (26A434),
 //! 2026-11-07, before that platform was deleted: the tests that compared this library's answers
-//! with Metal's check against them. They are Metal's, and can never be recorded again: never
-//! rewrite them from this library's own output.
+//! with Metal's check against them. They are Metal's: never rewrite them from this library's own
+//! output. A test's file gains answers it lacks only from a recorder of its own on Metal, one that
+//! first reproduces every line the file holds (`rgbx.reads_of_rgbx_textures_are_metals.m`, beside
+//! its answers, added RGBX32Float's).
 //!
 //! A test checks its answer against Metal's under a key unique in the test ([`check`],
 //! [`check_bytes`], [`matches`], [`matches_bytes`], [`near`], [`answer`]), through the macros

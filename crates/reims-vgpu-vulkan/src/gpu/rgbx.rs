@@ -40,6 +40,7 @@ use crate::core::platform::{HostRange, Platform};
 use crate::core::raise::OnFault;
 use crate::core::raise::death::{DeathKind, DeathSite};
 use crate::core::testkit::capture::catch_death;
+use metal2vulkan::error::DriverDeviation;
 use metal2vulkan_runtime as rt;
 
 use crate::gpu::device::tests::dev;
@@ -1107,10 +1108,20 @@ fn compare(differ: &mut Vec<String>, nans: &mut usize, of: &str, ours: &[(String
 /// for the formats read as floats, `sample()` as floats and halves at random coordinates past the
 /// edges through each filter, each address mode and each border colour, and `gather()` of each
 /// component: each reads as Metal's does, bit for bit, but where the read's kernel binds a
-/// texture of a float format, whose half reads, samples and gathers the runtime announces
-/// `device-nan-encoding` for: Metal hands back a 16-bit texel's own NaN and the canonical one for
-/// a 32-bit texel's, the runtime the canonical one for a 16-bit texel's and a 32-bit texel's own.
-/// That dispatch dies, naming the kind ([`crate::answer::DIES`]), for the float formats alone
+/// texture of a float format whose half reads, samples and gathers the runtime announces
+/// `device-nan-encoding` for (Metal hands back a 16-bit texel's own NaN and the canonical one for
+/// a 32-bit texel's, the device the canonical one for a 16-bit texel's): that dispatch dies,
+/// naming the kind ([`crate::answer::DIES`]). `RGBX16Float`'s die on every device.
+/// `RGBX32Float`'s die where the device's half conversion is not Metal's; on a device whose
+/// profile takes `DriverDeviation::MetalSampler` and `DriverDeviation::MetalHalfConversion`
+/// (MoltenVK on Apple's GPU), where a `half` sample, read or gather of a 32-bit float texel is
+/// Metal's, the runtime announces nothing for them, and they read as Metal's, bit for bit.
+///
+/// `RGBX32Float`'s answers are Metal's own, from the standalone Metal program beside this test's
+/// answers (`metal_answers/rgbx.reads_of_rgbx_textures_are_metals.m`), run on the M3 Max under
+/// macOS 27.0.1 on 2026-11-10: it runs what [`Gpu::reads`] runs, as the deleted Metal platform
+/// sent it, and printed each of the answers that platform recorded on 2026-11-07 byte for byte
+/// before its `RGBX32Float` lines were added
 #[test]
 fn reads_of_rgbx_textures_are_metals() {
     let (vp, vd) = (platform(), dev());
@@ -1138,13 +1149,18 @@ fn reads_of_rgbx_textures_are_metals() {
     }
     assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
     assert_eq!(nans, 0, "half NaNs differ where nothing died");
-    let floats = ["RGBX16Float", "RGBX32Float"]
-        .map(|f| [SHARED, PRIVATE].map(|o| format!("{f} options {o:#x}")));
-    assert_eq!(
-        died,
-        floats.concat(),
-        "the reads that die of device-nan-encoding"
-    );
+    let profile = vd.raw.compile_device().profile();
+    let metal_half = profile.takes_driver_deviation(DriverDeviation::MetalSampler)
+        && profile.takes_driver_deviation(DriverDeviation::MetalHalfConversion);
+    let floats: &[&str] = if metal_half {
+        &["RGBX16Float"]
+    } else {
+        &["RGBX16Float", "RGBX32Float"]
+    };
+    let dying: Vec<String> = (floats.iter())
+        .flat_map(|f| [SHARED, PRIVATE].map(|o| format!("{f} options {o:#x}")))
+        .collect();
+    assert_eq!(died, dying, "the reads that die of device-nan-encoding");
 }
 
 /// Kernel writes into two of every three texels of a texture of each RGBX format holding random

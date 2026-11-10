@@ -2402,9 +2402,9 @@ fn attachment_state<P: crate::core::platform::Platform>(
 
 /// A colour attachment of 576 to 579, or of a bfloat format (26, 66, 116) unblended, which the
 /// runtime makes, makes the state, as Metal's does. A bfloat colour attachment that blends
-/// (blending enabled, of one and zero), which Metal's validation refuses and the runtime
-/// refuses (`Unsupported` of `Format`), dies as the state is made, naming the runtime's
-/// refusal; Metal's is not made here
+/// (blending enabled, of one and zero), which Metal's validation refuses by ending the process
+/// and the runtime refuses as a colour attachment Metal ends the process on, dies as the state
+/// is made, naming the runtime's refusal; Metal's is not made here
 #[test]
 fn pipeline_formats_the_runtime_makes_are_metals() {
     let d = dev();
@@ -2425,7 +2425,8 @@ fn pipeline_formats_the_runtime_makes_are_metals() {
         };
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
         assert!(
-            line.contains("the Vulkan runtime refused it") && line.contains("feature: Format"),
+            line.contains("the Vulkan runtime refused it")
+                && line.contains("ColorAttachment { index: 0, metal: EndsProcess }"),
             "blended {format}: {line}"
         );
     }

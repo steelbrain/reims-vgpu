@@ -413,7 +413,8 @@ pub(crate) fn new_depth_stencil_state(
 ///   on an indirect render command) or by the devices Metal was measured to refuse it on
 ///   (`Needs::MetalRefuses`: a fragment function's read of a program-scope
 ///   `thread_index_in_quadgroup`); and a colour attachment the fragment function's outputs do
-///   not fit (`InvalidDescriptor(ColorAttachment)`), measured: a blend of the second source whose
+///   not fit where Metal answers nil and an error (`InvalidDescriptor(ColorAttachment)` of
+///   `MetalAnswer::NilWithError`), measured: a blend of the second source whose
 ///   function writes no second output ("Fragment shader does not write to render target
 ///   color(0), index(1) that is required for blending"), and a `half4` output into an
 ///   `RGBA8Uint` attachment (`encode_render`'s
@@ -432,14 +433,26 @@ pub(crate) fn new_depth_stencil_state(
 ///   one with rasterization on whose vertex function returns nothing outside OpenGL mode
 ///   (`RasterizedVoidVertex`), among them; a problem the runtime adds there is the `NSError` too.
 ///
-/// An answer the runtime cannot prove ([`rt::Error::Unproven`]) dies, naming it (`unproven`), as
-/// does every other refusal.
+/// A colour attachment Metal's validation ends the process on (`ColorAttachment` of
+/// `MetalAnswer::EndsProcess`: a blended bfloat attachment, alpha to coverage over an integer
+/// attachment 0, and a case the runtime has no Metal answer for) dies. So does an answer the
+/// runtime cannot prove ([`rt::Error::Unproven`]), naming it (`unproven`), and every other
+/// refusal.
 pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
-    use metal2vulkan::error::{DescriptorError, Error as Compile, Needs, RuntimeInput};
+    use metal2vulkan::error::{
+        DescriptorError, Error as Compile, MetalAnswer, Needs, RuntimeInput,
+    };
     let code = match e {
         rt::Error::Compile(Compile::InvalidDescriptor(DescriptorError::ColorAttachment {
+            metal: MetalAnswer::NilWithError,
             ..
         })) => METAL_REFUSES,
+        // Metal's descriptor validation ends the process there (a blended bfloat attachment,
+        // alpha to coverage over an integer one), and so does a case the runtime has no Metal
+        // answer for: the send dies.
+        rt::Error::Compile(Compile::InvalidDescriptor(DescriptorError::ColorAttachment {
+            ..
+        })) => return None,
         rt::Error::Compile(Compile::InvalidInput(_) | Compile::InvalidDescriptor(_)) => 0,
         rt::Error::Invalid(i) if i.problem == rt::Problem::PointSizeTopology => 0,
         rt::Error::Unsupported(u)
@@ -466,7 +479,8 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
 /// device ("Encountered unlowered function call to air.set_cull_mode_render_command", to
 /// `air.get_thread_index_in_quadgroup.i32`), at the compute and render creators (measured: the
 /// module docs), of the render creator for a colour attachment the fragment function's
-/// outputs do not fit, and of the compute and render creators for a call through a
+/// outputs do not fit (the runtime's refusals Metal answers nil and an error), and of the
+/// compute and render creators for a call through a
 /// visible-function reference nothing linked resolves ([`pipeline_error`]).
 const METAL_REFUSES: i64 = 3;
 
