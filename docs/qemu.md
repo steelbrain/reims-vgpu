@@ -466,41 +466,6 @@ a Radeon 780M at those defaults the same guest cold-boots to its desktop, and
 Safari loads wikipedia.org and quits, with none of 5,119 dma-buf requests
 refused: 5,095 took one dma-buf, and the rest 2 to 16.
 
-### Linux hosts: the Radeon 780M's scroll and the runtime's blocks
-
-On RADV, each pooled block the runtime makes ahead is an allocation whose
-pages the kernel's amdgpu driver takes in 2 MiB pieces, and on a host whose
-free memory is fragmented the thread making it compacts memory directly. On
-the Radeon 780M the guest's rAF gaps fall on those compactions. **Measured**
-on um870 (Radeon 780M, RADV; CachyOS, Linux 7.3) with an x86-64 macOS 12.7.6
-guest, Safari scrolling a page at 60 clicks a second for 15 s, metal2vulkan
-`ef7af82fe4` (development `2b56c89db`) against `6efa9fe7b9` (`d0cad8010`):
-one block of 4 cold boots of each, interleaved, after a discarded warm-up,
-with the same kext set (`1b2ee5e33`'s) on both, so that only the library
-differs; 2026-11-10:
-- rAF gaps of 100 ms or more: 3 against 2 (longest 120 and 131 ms); of
-  50 ms or more: 30 against 17. Presents a second: 28.7 (27.0 to 29.8)
-  against 29.6 (28.8 to 30.4). Image and buffer blocks made in place: 0 and
-  0 against 1 and 1; compaction on the library's own threads: 0 against
-  1 ms; no `reims-vgpu: fatal` line on either.
-- Direct compaction on the runtime's block-making thread: 587 against 384 ms
-  a boot; the host's PSI full 134 against 83 ms.
-- Blocks made ahead a boot: about 17 of 64 MiB and 41 of 68 MiB (an image
-  pool's block is 64 MiB and a sixteenth since metal2vulkan `930e3aa49e`),
-  against about 61 of 64 MiB: about the same bytes.
-- Each of the three gaps of 100 ms or more overlaps 2 to 4 block makings of
-  20 to 45 ms of compaction each, mostly 68 MiB image-pool blocks, and no
-  wait of 50 ms or more on the driver's locks.
-
-From metal2vulkan `e19e384642` until `ef7af82fe4`, a plain block was first
-filled through an exportable allocation, which was freed before the block's
-own was made. At `acfb2e8d70` (12.7.6 and 26.7.2, four boots of each against
-four of `6efa9fe7b9` per release) the second allocation's compaction, of up
-to 164 ms, overlapped 8 of its 10 gaps of 100 ms or more: 9 against 2 on
-12.7.6, and 1 against 0 on 26.7.2. `ef7af82fe4` makes each block by its own
-allocation alone. What still separates it from `6efa9fe7b9` is open and is
-metal2vulkan's: the first arm to measure is an image pool's block at 64 MiB.
-
 ### Linux hosts: Intel GPUs without a shared last-level cache
 
 Arrow Lake-S's iGPU (`deviceID` 0x7d67, Xe-LPG; ANV of Mesa 26.2.4 on i915,
