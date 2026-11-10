@@ -37,7 +37,8 @@
 #              QEMU is stopped, and the guest's checks fail as not run.
 #   console    Ambrosia logged the module's early console.
 #   ssh        the guest took an SSH login within 90 s of QEMU's start under HVF, 300 s under TCG.
-#              Under TCG every command the checks run in the guest has 5 times its HVF limit.
+#              Under TCG every command the checks run in the guest, and each SSH login the boot
+#              waits on, has 5 times its HVF limit.
 #              A check whose reading in the guest printed nothing (its command failed or ran
 #              out of time) fails as unread: no reading passes as an empty one.
 #   sip        `csrutil status` says enabled (the lane gate's sip).
@@ -178,8 +179,10 @@ PY
 # The boot's login probe opens none (PROBE_SOPTS): a probe its timeout cuts off, as one can be
 # while a slow boot (-v) brings sshd up, could leave a master behind that later probes would wait
 # on. The first command after the login (G) opens the shared one.
+# A connection's own limit is slowed with the rest: under TCG a guest busy after its login can take
+# longer than 5 s to send sshd's banner, and longer than 10 s to finish the key exchange.
 BASE_SOPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password
-  -o PubkeyAuthentication=no -o ConnectTimeout=5 -o LogLevel=ERROR)
+  -o PubkeyAuthentication=no -o ConnectTimeout=$((5 * slow)) -o LogLevel=ERROR)
 SOPTS=("${BASE_SOPTS[@]}" -o ControlMaster=auto -o "ControlPath=/tmp/check-boot-%C" -o ControlPersist=yes)
 PROBE_SOPTS=("${BASE_SOPTS[@]}" -o ControlMaster=no -o ControlPath=none)
 # The guest's commands run in the C locale: macOS's ssh sends the host's LANG and LC_* (SendEnv in
@@ -306,7 +309,7 @@ while :; do
   [[ -n $in_kernel ]] || ! grep -a -q '^ambrosia: entering the kernel' <<< "$slog_new" || in_kernel=1
   kill -0 "$qpid" 2> /dev/null || break
   if [[ -n $in_kernel ]] &&
-    timeout 10 "${GUEST_ENV[@]}" sshpass -p "$GUEST_PASS" ssh -n -p "$port" "${PROBE_SOPTS[@]}" "$GUEST_USER@127.0.0.1" true 2> /dev/null; then
+    timeout $((10 * slow)) "${GUEST_ENV[@]}" sshpass -p "$GUEST_PASS" ssh -n -p "$port" "${PROBE_SOPTS[@]}" "$GUEST_USER@127.0.0.1" true 2> /dev/null; then
     ssh_s=$(since "$t0")
     break
   fi
