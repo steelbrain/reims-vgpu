@@ -67,6 +67,7 @@ pub(crate) use host_os::{PAGE, mapped, writable};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::MATRIX_KEY;
 pub use surface::{PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout};
+pub(crate) use wsi::initial_present_mode;
 pub use wsi::{add_window_extensions, present_fences};
 
 #[cfg(test)]

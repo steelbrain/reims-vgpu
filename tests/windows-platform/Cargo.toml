@@ -12,5 +12,7 @@ publish = false
 reims-vgpu-core = { path = "../../crates/reims-vgpu-core" }
 log = "0.4"
 
+ash = { version = "0.38", default-features = false, features = ["std"] }
+
 [lib]
 path = "contracts.rs"

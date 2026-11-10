@@ -32,3 +32,7 @@ fn owned_surface_storage_is_zeroed_and_writable() {
         assert_eq!(pointer.add(8191).read(), 0x5a);
     }
 }
+
+// Compile the production selection policy and its own vendor/mode contracts.
+#[path = "../../crates/reims-vgpu-vulkan/src/os/wsi/windows.rs"]
+mod windows_present;

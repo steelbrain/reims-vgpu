@@ -28,3 +28,7 @@ validate native-window presentation, guest boot or desktop performance.
 
 The workspace-wide Unix death/process tests and Linux/macOS regression gates
 remain separate checks before merge.
+
+The presentation stack also runs the production Windows/NVIDIA initial-mode
+policy tests. They check vendor/mode selection only; visible-window driver-path
+and swapchain-retirement validation remains a separate manual gate.
