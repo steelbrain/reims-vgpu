@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>RgfxGate</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.steelbrain.RgfxGate</string>
+	<string>ai.aneesiqbal.RgfxGate</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -23,7 +23,7 @@
 		<key>RgfxGate</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.steelbrain.RgfxGate</string>
+			<string>ai.aneesiqbal.RgfxGate</string>
 			<key>IOClass</key>
 			<string>RgfxGate</string>
 			<key>IOMatchCategory</key>
@@ -36,8 +36,8 @@
 	</dict>
 	<key>OSBundleLibraries</key>
 	<dict>
-		<key>com.steelbrain.Graft</key>
-		<string>1.0.0</string>
+		<key>ai.aneesiqbal.graft</key>
+		<string>0.1.0</string>
 		<key>com.apple.kpi.bsd</key>
 		<string>12.0.0</string>
 		<key>com.apple.kpi.iokit</key>

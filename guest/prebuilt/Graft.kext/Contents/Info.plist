@@ -2,16 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
     <key>CFBundleExecutable</key><string>Graft</string>
-    <key>CFBundleIdentifier</key><string>com.steelbrain.Graft</string>
+    <key>CFBundleIdentifier</key><string>ai.aneesiqbal.graft</string>
     <key>CFBundleName</key><string>Graft</string>
     <key>CFBundlePackageType</key><string>KEXT</string>
-    <key>CFBundleVersion</key><string>1.3.3</string>
-    <key>CFBundleShortVersionString</key><string>1.3.3</string>
-    <key>OSBundleCompatibleVersion</key><string>1.0.0</string>
+    <key>CFBundleVersion</key><string>0.1.0</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>OSBundleCompatibleVersion</key><string>0.1.0</string>
     <key>OSBundleRequired</key><string>Root</string>
     <key>IOKitPersonalities</key><dict>
         <key>Graft</key><dict>
-            <key>CFBundleIdentifier</key><string>com.steelbrain.Graft</string>
+            <key>CFBundleIdentifier</key><string>ai.aneesiqbal.graft</string>
             <key>IOClass</key><string>Graft</string>
             <key>IOMatchCategory</key><string>Graft</string>
             <key>IOProviderClass</key><string>IOResources</string>

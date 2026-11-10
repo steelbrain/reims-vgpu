@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>ReimsGraphics</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.steelbrain.ReimsGraphics</string>
+	<string>ai.aneesiqbal.ReimsGraphics</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -27,7 +27,7 @@
 		<key>ReimsGraphics</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.steelbrain.ReimsGraphics</string>
+			<string>ai.aneesiqbal.ReimsGraphics</string>
 			<key>IOClass</key>
 			<string>ReimsGraphics</string>
 			<key>IOMatchCategory</key>
@@ -38,7 +38,7 @@
 			<integer>30000</integer>
 			<key>IOPropertyMatch</key>
 			<dict>
-				<key>com.steelbrain.ReimsGraphics.graft-bound</key>
+				<key>ai.aneesiqbal.ReimsGraphics.graft-bound</key>
 				<true/>
 			</dict>
 			<key>IOProviderClass</key>
@@ -59,7 +59,7 @@
 				<string>IOAccelerator</string>
 			</dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.steelbrain.ReimsGraphics</string>
+			<string>ai.aneesiqbal.ReimsGraphics</string>
 			<key>DisplayPortCount</key>
 			<integer>1</integer>
 			<key>IOClass</key>
@@ -78,7 +78,7 @@
 			<integer>30000</integer>
 			<key>IOPropertyMatch</key>
 			<dict>
-				<key>com.steelbrain.ReimsGraphics.graft-bound</key>
+				<key>ai.aneesiqbal.ReimsGraphics.graft-bound</key>
 				<true/>
 			</dict>
 			<key>IOProviderClass</key>

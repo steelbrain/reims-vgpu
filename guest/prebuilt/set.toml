@@ -14,7 +14,7 @@ Arch = "x86_64"
 MinKernel = "20.0.0"
 MaxKernel = ""
 Comment = "Binds and routes the owned guest kexts"
-sha256 = "0a964de98b78e98b2f9add4b8424ba5914f286a0518d6a1dd418bcd731a49eb6"
+sha256 = "f3c360b67c3034bd7d404d5958997d3b08755a3c80ce188fa66de7afc3a0b4a7"
 
 [[kext]]
 BundlePath = "ReimsGraphics.kext"
@@ -24,7 +24,7 @@ Arch = "x86_64"
 MinKernel = "20.0.0"
 MaxKernel = ""
 Comment = "The reims-graphics display, accelerator and device control"
-sha256 = "62640de31b58238dd193e6ee321bb19fc942acaa3379726f863efbae90d8bd9f"
+sha256 = "1a2fd94f8995b059ab942583896a82b7c556fdc8050b37bbc81ac4ec3592f72e"
 
 [[kext]]
 BundlePath = "RgfxGate.kext"
@@ -34,4 +34,4 @@ Arch = "x86_64"
 MinKernel = "20.0.0"
 MaxKernel = ""
 Comment = "Installs the reims-graphics Metal bundle and admits it"
-sha256 = "9255d422fbb588bf750b5e1bff2756413584284308a9622897047316ffeb5b33"
+sha256 = "2a59595f08477135ad00dd128ed2e4fd7e945201338a6b36dc9846c16c35819d"
