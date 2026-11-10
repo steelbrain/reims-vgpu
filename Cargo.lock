@@ -301,6 +301,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "metal2vulkan"
 version = "0.2.0"
+source = "git+https://github.com/steelbrain/metal2vulkan?rev=a0058f220635342f22451d9a59b592de5af10068#a0058f220635342f22451d9a59b592de5af10068"
 dependencies = [
  "ash",
  "metal2vulkan-air",
@@ -311,6 +312,7 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-air"
 version = "0.2.0"
+source = "git+https://github.com/steelbrain/metal2vulkan?rev=a0058f220635342f22451d9a59b592de5af10068#a0058f220635342f22451d9a59b592de5af10068"
 dependencies = [
  "sha2 0.11.1",
 ]
@@ -318,6 +320,7 @@ dependencies = [
 [[package]]
 name = "metal2vulkan-runtime"
 version = "0.2.0"
+source = "git+https://github.com/steelbrain/metal2vulkan?rev=a0058f220635342f22451d9a59b592de5af10068#a0058f220635342f22451d9a59b592de5af10068"
 dependencies = [
  "ash",
  "libc",
