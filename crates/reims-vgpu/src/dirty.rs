@@ -30,22 +30,24 @@
 //! a logged slot's pages 4 KiB at a time, so a device whose runtime never asks costs the guest
 //! no huge pages.
 
-#[cfg(any(unix, test))]
+// KVM is a Linux service, not a Unix service. Keep its harvest machinery
+// available to tests on every host without compiling it into macOS/Windows.
+#[cfg(any(target_os = "linux", test))]
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 use std::thread;
 use std::thread::{JoinHandle, Thread};
 use std::time::Duration;
 
 use reims_vgpu_core::memory::dirty::DirtyLog;
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 use reims_vgpu_core::memory::dirty::{DirtyStamp, GRANULE, PAGE_SIZE};
 
 /// How long a flush of the vCPUs may take: the log's own wait, past which a harvest no longer
 /// spares the copy it was wanted for.
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(4);
 
 /// One memory slot of the host's KVM VM that logs dirty pages ([`DirtyHost::for_each_slot`]).
@@ -108,7 +110,7 @@ impl std::fmt::Debug for DirtySource {
 }
 
 /// KVM's two dirty-log ioctls on one slot (the VM's in the product, a fake in tests).
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) trait KvmLog: Send {
     /// `KVM_GET_DIRTY_LOG` into `bitmap`, which holds a bit for each of the slot's pages.
     fn get(&self, slot: u32, bitmap: &mut [u64]) -> bool;
@@ -189,7 +191,7 @@ fn cpu_buffers_writes() -> bool {
 }
 
 /// The scratch one harvest uses, kept for the next.
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 #[derive(Default)]
 pub(crate) struct Scratch {
     watched: Vec<Range<u64>>,
@@ -204,7 +206,7 @@ pub(crate) struct Scratch {
 }
 
 /// The `n` bits of `bitmap` from bit `at`, `n` at most 64, in the low bits of the result.
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 fn bits(bitmap: &[u64], at: u64, n: u64) -> u64 {
     let (w, s) = ((at / 64) as usize, at % 64);
     let lo = bitmap.get(w).copied().unwrap_or(0) >> s;
@@ -222,7 +224,7 @@ fn bits(bitmap: &[u64], at: u64, n: u64) -> u64 {
 }
 
 /// Sets in `bitmap` the low `n` bits of `value` from bit `at`.
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 fn set_bits(bitmap: &mut [u64], at: u64, value: u64) {
     let (w, s) = ((at / 64) as usize, at % 64);
     if let Some(x) = bitmap.get_mut(w) {
@@ -236,7 +238,7 @@ fn set_bits(bitmap: &mut [u64], at: u64, value: u64) {
 }
 
 /// One slot's part of a harvest (step 3 of the module docs).
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 fn harvest_slot(host: &dyn DirtyHost, kvm: &dyn KvmLog, s: &mut Scratch, slot: KvmSlot) {
     let base = slot.guest_physical_address;
     let end = base.saturating_add(slot.length);
@@ -331,7 +333,7 @@ fn harvest_slot(host: &dyn DirtyHost, kvm: &dyn KvmLog, s: &mut Scratch, slot: K
 }
 
 /// The log's side of a harvest: [`DirtyLog`]'s, or a test's.
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) trait HarvestLog {
     /// [`DirtyLog::begin`].
     fn begin(&self, watched: &mut Vec<Range<u64>>) -> Option<DirtyStamp>;
@@ -339,7 +341,7 @@ pub(crate) trait HarvestLog {
     fn end(&self, stamp: DirtyStamp, written: &[u64]) -> bool;
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 impl HarvestLog for DirtyLog {
     fn begin(&self, watched: &mut Vec<Range<u64>>) -> Option<DirtyStamp> {
         DirtyLog::begin(self, watched)
@@ -351,7 +353,7 @@ impl HarvestLog for DirtyLog {
 }
 
 /// One harvest of `log` (the module docs).
-#[cfg(any(unix, test))]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn harvest(
     log: &dyn HarvestLog,
     host: &dyn DirtyHost,
@@ -386,7 +388,7 @@ pub(crate) fn harvest(
 
 /// What the harvest thread and the log's hook share.
 struct Wake {
-    #[cfg(any(unix, test))]
+    #[cfg(any(target_os = "linux", test))]
     wanted: AtomicBool,
     stop: AtomicBool,
     thread: std::sync::OnceLock<Thread>,
@@ -416,8 +418,8 @@ impl Harvester {
         Harvester::with_kvm(ram, source.host, Box::new(kvm), cpu_buffers_writes())
     }
 
-    /// As [`Harvester::new`], over `kvm`, flushing the vCPUs where `flush` (tests).
-    #[cfg(any(unix, test))]
+    /// The KVM harvest over `kvm`, flushing the vCPUs where `flush` (also used by tests).
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn with_kvm(
         ram: &[Range<u64>],
         host: Arc<dyn DirtyHost>,
