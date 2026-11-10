@@ -97,7 +97,7 @@ static void check_graphics(void) {
                                NULL,
                                NULL,
                                on_graphics_cursor_move};
-    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, NULL, NULL};
+    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, NULL, NULL, RVG_GUEST_ARCH_X86_64};
     RvgGraphicsDevice *d = NULL;
     graphics_destroyed = 0;
     graphics_raised = 0;
@@ -203,7 +203,7 @@ static void check_memory_files(void) {
     cb.struct_size = sizeof cb;
     cb.ctx = &files_destroyed;
     cb.destroy = on_graphics_destroy;
-    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, &map, &file};
+    RvgGraphicsDeviceConfig c = {sizeof c, &cb, NULL, &map, &file, RVG_GUEST_ARCH_X86_64};
     files_destroyed = 0;
     RvgGraphicsDevice *d = NULL;
     CHECK_STATUS(rvg_graphics_device_create(&c, &d), RVG_OK);
