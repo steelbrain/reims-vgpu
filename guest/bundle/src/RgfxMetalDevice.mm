@@ -1312,6 +1312,16 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.valid() && _caps.flag(kRgfxFlagIsFramebufferReadSupported);
 }
 
+// Programmable blending, a fragment function reading its own colour attachments, is answered as
+// framebuffer reads are: Metal's devices give both the same answer, YES on the M3 Max and the
+// Intel UHD 630 and NO on the AMD Radeon Pro 5300M (measured with respondsToSelector: and the
+// method). So it follows the host's isFramebufferReadSupported flag, which the host gives an
+// arm64 guest from its GPU and an x86-64 guest as NO.
+- (BOOL)supportsProgrammableBlending
+{
+	return [self isFramebufferReadSupported];
+}
+
 - (BOOL)supportsTileShaders
 {
 	return _caps.valid() && _caps.flag(kRgfxFlagSupportsTileShaders);

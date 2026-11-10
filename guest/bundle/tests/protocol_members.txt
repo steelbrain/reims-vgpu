@@ -923,7 +923,7 @@ supportsPostDepthCoverage base %base-spi
 supportsPrimitiveMotionBlur implemented
 supportsPrimitiveRestartOverride base %base-spi
 supportsPrimitiveType: implemented
-supportsProgrammableBlending base %base-spi
+supportsProgrammableBlending implemented
 supportsProgrammableSamplePositions base %base-spi
 supportsPublicXR10Formats base %base-spi
 supportsPullModelInterpolation implemented
