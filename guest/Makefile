@@ -59,7 +59,7 @@ set:
 	$(MAKE) -C kext BUILD=$(WORK)/kext
 	$(MAKE) -C bundle BUILD=$(WORK)/bundle package
 	$(MAKE) -C rgfxgate BUILD=$(WORK)/rgfxgate BUNDLE_DIR=$(BUNDLE)
-	ditto graft/built/Graft.kext $(WORK)/Graft.kext
+	ditto graft/Graft.kext $(WORK)/Graft.kext
 	python3 -I -B tools/prebuilt.py stage $(OUT) $(WORK)
 
 prebuilt:
@@ -71,7 +71,7 @@ set-arm64e:
 	$(MAKE) -C kext ARCH_NAME=arm64e BUILD=$(WORK64)/kext
 	$(MAKE) -C bundle ARCH=arm64e PACKAGE_ARCHS="arm64e arm64" BUILD=$(WORK64)/bundle package
 	$(MAKE) -C rgfxgate ARCH_NAME=arm64e BUILD=$(WORK64)/rgfxgate BUNDLE_DIR=$(BUNDLE64)
-	ditto graft/built/Graft-arm64e.kext $(WORK64)/Graft-arm64e.kext
+	ditto graft/Graft-arm64e.kext $(WORK64)/Graft-arm64e.kext
 	python3 -I -B tools/prebuilt.py stage-arm64e $(OUT64) $(WORK64)
 
 prebuilt-arm64e:

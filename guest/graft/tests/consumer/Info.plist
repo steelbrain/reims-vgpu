@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleExecutable</key><string>Fixture</string>
+    <key>CFBundleIdentifier</key><string>ai.aneesiqbal.graft.test.ConsumerFixture</string>
+    <key>CFBundlePackageType</key><string>KEXT</string>
+    <key>CFBundleVersion</key><string>@VERSION@</string>
+    <key>OSBundleRequired</key><string>Root</string>
+    <key>IOKitPersonalities</key><dict>
+        <key>Fixture</key><dict>
+            <key>IOClass</key><string>Consumer</string>
+            <key>IOProviderClass</key><string>IOPCIDevice</string>
+            <key>IOPCIPrimaryMatch</key><string>0x52471234</string>
+        </dict>
+    </dict>
+    <key>OSBundleLibraries</key><dict>
+        <key>ai.aneesiqbal.graft.test.Provider</key><string>1.0.0</string>
+        <key>com.apple.kpi.libkern</key><string>8.0.0</string>
+        <key>com.apple.kpi.mach</key><string>8.0.0</string>
+    </dict>
+</dict></plist>

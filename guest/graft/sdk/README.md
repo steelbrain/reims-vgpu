@@ -1,29 +1,33 @@
 # sdk
 
-The files our kexts build with to work with Graft. An owned client compiles
+The files a kext builds with to work with Graft. An owned client compiles
 against the header and the start glue; a bound consumer replaces its final
 link with `consumer.mk`. [docs/consumers.md](../docs/consumers.md) explains
 the two kinds and how to build each; this file is the reference for the
 files here.
 
-The tools need Xcode's clang and ld, and Python 3.12 or later with only its
-standard library. Nothing is fetched. Another repository takes the SDK as
-part of a release, with `tools/vendor.py` ([tools/](../tools/README.md)).
+A consumer's build needs Xcode: its clang and ld, and `plutil`. `consumer.mk`
+compiles the SDK's tool, `graft-kext`, from its C++ sources in `tool/` before it
+first runs it. Nothing is fetched. Another repository takes the SDK as part of
+a release, with `tools/vendor.py`
+([docs/guides/taking-a-release.md](../docs/guides/taking-a-release.md)). A
+release carries Graft's whole source tree around the SDK, so these links
+resolve in that copy.
 
 | file | what it is |
 |---|---|
 | `include/graft/Graft.h` | the calls an owned client makes: `graft_client_ready`, `graft_kernel_symbol`, `graft_route_kernel`, `graft_client_log` and `graft_client_state` |
 | `include/graft/IOMobileFramebufferLegacy.h` | the stand-in parent an arm64e synthesized class derives from ([Synthesized classes](#synthesized-classes)) |
 | `Start.cpp` | an owned client's start glue: declares its kmod from `GRAFT_CLIENT_ID` and `GRAFT_CLIENT_VERSION`, calls `graft_client_initialize()` at start, and refuses to stop |
-| `consumer.mk` | the make rules that link and stage a bound consumer |
-| `consumer.py` | the three steps `consumer.mk` runs: `probe`, `reserve` and `stage` |
-| `graft_macho.py` | the Mach-O reader and editor that `consumer.py` and `prelink.py` share |
-| `prelink.py` | checks that a kernel collection OpenCore prelinked still has each staged consumer bindable |
+| `consumer.mk` | the make rules that build `graft-kext`, then link and stage a bound consumer with it |
+| `tool/` | the C++ sources of `graft-kext`, the command `consumer.mk` runs, described under [Commands](#commands) |
+| `include/graft/ManifestFormat.h` | the manifest's records and constants, which `graft-kext` writes and Graft reads, and the validator both apply ([docs/manifest.md](../docs/manifest.md)) |
 
 ## Building a bound consumer
 
 A bound consumer compiles its objects with its own rules, then includes
-`consumer.mk`, which:
+`consumer.mk`, whose one rule runs `graft-kext build` ([Commands](#commands)),
+which:
 
 1. **probes** each declared class's layout: it compiles a member-less
    subclass of every class in `src/graft.json` with the consumer's flags, and
@@ -89,7 +93,7 @@ Its `src/Info.plist` is an ordinary kext's, with `CFBundleExecutable`
 and `com.apple.iokit.IOGraphicsFamily` among its `OSBundleLibraries`. `make`
 writes `build/OurAccelerator.kext`, whose Info.plist keeps the other
 libraries and its personalities, now gated, but no IOGraphicsFamily.
-`measure/binding-probe/` has the same shape, and imports through both a
+`examples/hello-consumer/` has the same shape, and imports through both a
 pointer and a direct call.
 
 ### consumer.mk
@@ -110,23 +114,33 @@ rule would otherwise become the default. It reads these variables:
 | `CXXFLAGS` | the flags `OBJECTS` are compiled with; the probe compiles with them too |
 | `GRAFT_DECL` | optional: the declaration, `src/graft.json` unless set before the include |
 | `GRAFT_INFO_PLIST` | optional: the Info.plist, `src/Info.plist` unless set before the include |
+| `GRAFT_KEXT` | optional: the `graft-kext` the rules run, `$(BUILD)/graft/graft-kext` unless set before the include or in the environment; when it is set, `consumer.mk` builds no tool of its own |
 
 The consumer supplies the declaration and the Info.plist. A Makefile that
 builds more than one variant from one source, or a per-architecture
 Info.plist, sets `GRAFT_DECL` or `GRAFT_INFO_PLIST` before including
-`consumer.mk`. `consumer.mk`
-reads no `SDK` variable: the probe asks `xcrun` for the macOS SDK. Both
-links run `xcrun clang++` with `$(ARCH) -nostdlib -Xlinker -kext`, the
-objects and `-lcc_kext`; the second adds `-sectcreate __DATA __graft`. An
-arm64e consumer also links with `-Xlinker -no_data_const`, which keeps its
-import GOT and vtables in writable `__DATA`, where Graft writes them.
+`consumer.mk`. `consumer.mk` reads no `SDK` variable: the probe asks `xcrun`
+for the macOS SDK. The probe compiles with `$(CXXFLAGS) -Isrc`, for the one
+architecture `ARCH` names; `CXXFLAGS` may name none, but no other. Both links
+run `xcrun clang++` with `$(ARCH) -nostdlib -Xlinker -kext`, the objects and
+`-lcc_kext`; the second adds `-sectcreate __DATA __graft`. When `ARCH` names
+arm64e, both links also take `-Xlinker -no_data_const`, which keeps the
+consumer's import GOT and vtables in writable `__DATA`, where Graft writes
+them.
 
-Under `$(BUILD)/graft` the rules leave `layouts.json` (the probe's output),
-`census` (the first link), `manifest-reserve.bin` (the reservation) and
-`Unbound.kext` (the second link, with the versioned Info.plist). Staging
-refuses an existing bundle, so the rule for `$(BINARY)` removes `$(KEXT)`
-first. The layouts are probed again when `src/graft.json`, a header in
-`HEADERS`, the Makefile, `consumer.py` or `graft_macho.py` changes.
+Unless `GRAFT_KEXT` names another command, `consumer.mk` first compiles
+`graft-kext` into `$(BUILD)/graft/graft-kext`, with `xcrun clang++ -std=c++17
+-O2` and the sources in `tool/`, and compiles it again when one of them, or
+`include/graft/ManifestFormat.h`, changes. Its warnings are not errors, so a
+newer compiler does not stop the build.
+
+The rule for `$(BINARY)` runs every step again when an object, the
+declaration, the Info.plist, a header in `HEADERS` or in the SDK's
+`include/graft/`, the makefile that includes `consumer.mk`, or `graft-kext`
+changes. It leaves each step's output under `$(BUILD)/graft`:
+`layouts.json` (the probe's), `census` (the first link),
+`manifest-reserve.bin` (the reservation) and `Unbound.kext` (the second link,
+with the versioned Info.plist). It replaces `$(KEXT)`.
 
 ## graft.json
 
@@ -184,14 +198,16 @@ requires the live class to match both. Of the slots, Graft checks those
 `required` names, plus every slot a consumer class overrides. Each name in
 `required` must be in exactly one slot of the probed layout
 (`$(BUILD)/graft/layouts.json` lists them). Without `required`, every parent
-slot is checked. A shorter list is only right when it comes from a complete
-census of the virtual calls the consumer makes.
+slot is checked except the headers' `_RESERVED` placeholders, whose names say
+nothing about the method a running kernel keeps there. A shorter list is only
+right when it comes from a complete census of the virtual calls the consumer
+makes.
 
 **`consumers`**: the consumer's own classes that derive from those.
 
 | key | meaning |
 |---|---|
-| `name` | a top-level C++ class name |
+| `name` | a top-level C++ class name, unique among `consumers` and `synthesized` |
 | `header` | the header that declares it |
 | `parent` | the index of the class in `classes` it derives from |
 
@@ -256,7 +272,7 @@ The stand-in goes in `classes` like any parent, and the consumer's class in
 
 | key | meaning |
 |---|---|
-| `name` | a top-level C++ class name |
+| `name` | a top-level C++ class name, unique among `consumers` and `synthesized` |
 | `header` | the header that declares it |
 | `parent` | the index in `classes` of the stand-in it derives from |
 | `sibling` | optional: a concrete subclass of the parent, which implements the parent's pure methods, through which Graft finds a pure method's slot. Graft reads it from whichever kext of the boot collection defines it, loaded or not |
@@ -274,7 +290,7 @@ Mark the parent's pure methods `required`. Graft reads only the method from a
 selector, not its class, so a selector can be written under the consumer's
 own class, as above.
 
-From the declaration and the linked consumer, `consumer.py` records for each
+From the declaration and the linked consumer, staging records for each
 class its overrides, its compiled vtable's length and the stand-in's size:
 
 - Each declared override takes the class's own method symbol as its first
@@ -319,16 +335,12 @@ compiled vtable at least as long as the live class's, and a
 `GRAFT_IOMFB_LEGACY_RESERVE`-byte field holds the live class's fields, so the
 consumer's own fields follow them.
 
-The class's own implementations of its concrete methods serve its hardware
-subclasses. Some do no display work (`start_hardware` and `verify_swap`
-return 0), and `get_dot_pitch` reads state the class's start sets up only for
-those subclasses' provider, so it faults on a paravirtual one. A display
-overrides those its callers reach and does not call the class's. It calls none of the virtual methods the stand-in declares except
+A display calls none of the virtual methods the stand-in declares except
 `start`, `stop` and `free`: not virtually, since Graft fills its vtable in the
 live order, and not as a qualified call such as
-`IOMobileFramebufferLegacy::start_hardware()`, which under `-fapple-kext`
-loads the method from the class's vtable at the stand-in's compiled slot, a
-slot the live class gives to another method. `start`, `stop` and `free` lie in
+`IOMobileFramebufferLegacy::start_hardware()`, which under `-fapple-kext` loads
+the method from the class's vtable at the stand-in's compiled slot, a slot the
+live class gives to another method. `start`, `stop` and `free` lie in
 IOService's part of the vtable, which keeps the SDK's order, so a qualified
 call to them is right:
 
@@ -356,39 +368,71 @@ Staging checks its inputs before it creates the output bundle.
   overridden slots; the inherited slots are not sites.
 - **The Info.plist goes dormant.** Its personalities stay but gain an
   `IOPropertyMatch` gate on the device nub that Graft opens when it binds, each
-  naming the consumer's bundle identifier, and the declared libraries leave
-  `OSBundleLibraries`. Its other dependencies stay.
+  naming the consumer's bundle identifier. A personality that has its own
+  `IOPropertyMatch`, a dictionary or a list of them, keeps it, and the gate's
+  key joins the dictionary, or each one of the list. The declared libraries
+  leave `OSBundleLibraries`, and any per-architecture list such as
+  `OSBundleLibraries_x86_64`. Its other dependencies stay.
 
 ## Commands
 
-`consumer.mk` runs the three steps of `consumer.py`, and each can also be
-run by hand:
+`graft-kext` is a C++17 program that uses only the standard library. `probe`
+and `build` run Xcode's `clang++` through `xcrun`, and `build` also runs
+`plutil`, through the shell, so those two need a Mac with Xcode. `reserve`,
+`stage` and `check-prelinked` run no tool, and `check-prelinked` builds and
+runs on any host with a C++17 compiler. `consumer.mk` builds it
+([consumer.mk](#consumermk)) and runs `build`:
 
 ```
-python3 -I -B sdk/consumer.py probe DECLARATION LAYOUTS [-- COMPILER_FLAGS...]
-python3 -I -B sdk/consumer.py reserve BINARY DECLARATION LAYOUTS INFO_PLIST RESERVATION
-python3 -I -B sdk/consumer.py stage KEXT DECLARATION LAYOUTS OUTPUT
+graft-kext build --name=NAME --version=VERSION --arch=ARCH \
+    --declaration=DECLARATION --info-plist=INFO_PLIST --work=WORK --output=KEXT \
+    OBJECT... [-- COMPILER_FLAGS...]
+```
+
+`consumer.mk` passes `NAME`, `VERSION`, `ARCH`, `GRAFT_DECL`,
+`GRAFT_INFO_PLIST`, `$(BUILD)/graft` as WORK, `KEXT`, then `OBJECTS` and, after
+`--`, `$(CXXFLAGS) -Isrc`. ARCH is one argument holding every target flag, such
+as `--arch="-arch x86_64"`. `build` runs the steps of
+[Building a bound consumer](#building-a-bound-consumer) in order, the probe
+with COMPILER_FLAGS for ARCH's architecture, and writes what
+[consumer.mk](#consumermk) says it leaves. It prints nothing of its own unless it refuses; the compiler, linker and
+`plutil` print their own errors.
+
+Its steps can also be run one at a time, with the links between them run by
+hand as `consumer.mk` documents:
+
+```
+graft-kext probe DECLARATION LAYOUTS [-- COMPILER_FLAGS...]
+graft-kext reserve BINARY DECLARATION LAYOUTS INFO_PLIST RESERVATION
+graft-kext stage KEXT DECLARATION LAYOUTS OUTPUT
 ```
 
 - `probe` writes LAYOUTS, the JSON layout of every declared class. It
-  compiles in a temporary directory under `/tmp`.
+  compiles in a directory of its own under `TMPDIR`, or `/tmp` when that is
+  unset, and removes it.
 - `reserve` reads BINARY, the consumer linked without a manifest, and the
   versioned INFO_PLIST, and writes RESERVATION.
-- `stage` copies the bundle KEXT, linked with the reservation, to OUTPUT.
+- `stage` copies the bundle KEXT, linked with the reservation, to OUTPUT. It
+  stages the copy beside OUTPUT and moves it into place once it is whole, so a
+  staging that fails leaves no OUTPUT.
 
-Each step refuses an input it cannot use, or a consumer Graft could not
-bind: it prints `consumer:` and the reason, and exits 1.
+Each command refuses an input it cannot use, or a consumer Graft could not
+bind: it prints `consumer:` and the reason, and exits 1. A link or a
+`plutil -lint` that fails is refused with its command line. The declaration
+and the layouts are read as JSON and the Info.plist as an XML property list,
+and each is refused if it nests more than 64 levels deep. A malformed command
+line prints the usage and exits 2.
 
-### prelink.py
+### check-prelinked
 
 ```
-python3 -I -B sdk/prelink.py COLLECTION KEXT...
+graft-kext check-prelinked COLLECTION KEXT...
 ```
 
-COLLECTION is an x86-64 kernel collection after OpenCore prelinked our kexts
-into it, and each KEXT a staged consumer. For each consumer, `prelink.py`
-finds the fileset entry named by its bundle identifier and checks what Graft
-relies on when it binds that entry:
+COLLECTION is an x86-64 kernel collection after OpenCore prelinked Graft and the
+kexts it serves into it, and each KEXT a staged consumer. For each consumer, the
+check finds the fileset entry named by its bundle identifier and checks what
+Graft relies on when it binds that entry:
 
 - the entry's header starts its `__TEXT`, and each staged segment keeps its
   address relative to the header, since Graft adds manifest offsets to the
@@ -411,29 +455,48 @@ the segment holding the table. Chains can run past their starting page, so
 each region's chains are walked whole.
 
 It prints a line for each consumer and exits 0 when all pass. On the first
-defect it prints `prelink:` and the reason, and exits 1. It only reads the
-collection.
+defect it prints `prelink:` and the reason, and exits 1. A malformed command
+line prints the usage and exits 2. It only reads the collection.
+
+Outside a consumer's build, such as where the collection is made, compile the
+tool from the SDK with any C++17 compiler, then run it. With the SDK at
+`$GRAFT_SDK`:
+
+```sh
+c++ -std=c++17 -O2 -I"$GRAFT_SDK/include" "$GRAFT_SDK"/tool/*.cpp -o graft-kext
+./graft-kext check-prelinked COLLECTION KEXT...
+```
 
 ## Tests
 
-`make test` runs the SDK's tests with the others:
+`make test` runs the SDK's tests with the others. It first builds two
+consumers with `graft-kext build`: the fixture in `tests/consumer/`, for
+x86-64 and for arm64e, and the synthesized display in `tests/synthesized/`,
+for arm64e. The C++ tests link every source in `tool/` but its command line,
+`cli.cpp`, and read what those builds wrote.
 
-- `tests/tooling_test.py` builds an original fixture consumer with Xcode
-  (`tests/consumer_fixture.py`) and checks probing, the import census,
-  weak imports, anchors, required methods, placeholders, the renumbered
-  symbol table, the renamed markers, a short reservation, truncated Mach-O
-  files and the dormant bundle.
-- `tests/chained_fixups_test.py` links the fixture for arm64e and checks
-  that `graft_macho.py` decodes its chained fixups: each import bind by name,
-  the weak ones flagged, and every rebase inside the image.
-- `tests/arm64e_tooling_test.py` stages the fixture built for arm64e and
-  checks its version-3 manifest: signed sites carry their signing context,
-  and each provider import becomes a rebase at its placeholder.
+- `tests/staging_test.cpp` checks, on the fixture, probing, the import census,
+  weak imports, anchors, required methods, placeholders, the renumbered symbol
+  table, the renamed markers, a short reservation, truncated Mach-O files and
+  the dormant bundle. On the arm64e build it checks the chained fixups the
+  tool reads (each import bind by name, the weak ones flagged, every rebase
+  inside the image) and the version-3 manifest: signed sites carry their
+  signing context, and each provider import becomes a rebase at its
+  placeholder.
+- `tests/synth_emit_test.cpp` checks the synthesized-class and override
+  records staging writes for the display.
+- `tests/prelink_test.cpp` links the staged x86-64 fixture into synthetic
+  collections the way OpenCore does, then corrupts them, and checks that the
+  prelink check accepts the faithful one and refuses each defect, and what
+  `graft-kext check-prelinked` prints and exits with.
+- `tests/graft_kext_test.py` runs `graft-kext` as a consumer's build does, on
+  the fixture for x86-64 and arm64e, and checks only what that build sees:
+  the staged bundle, the files under the work directory, that `build` writes
+  what its steps run one at a time write, and each refusal's exit status and
+  text.
+- `tests/consumer_mk_test.py` runs `consumer.mk` under make, from a makefile
+  of another name, and checks that the staged bundle is current after a
+  build, and not after an SDK header changes or a build fails.
 - `tests/sdk_standin_test.py` compiles a subclass of the
   `IOMobileFramebufferLegacy` stand-in, and checks its reserved slots and the
   symbols its overrides produce.
-- `tests/synth_emit_test.py` builds an arm64e synthesized consumer, and checks
-  the synthesized-class and override records `consumer.py` writes for it.
-- `tests/prelink_test.py` links the staged fixture into synthetic
-  collections the way OpenCore does, then corrupts them, and checks that
-  `prelink.py` accepts the faithful one and refuses each defect.

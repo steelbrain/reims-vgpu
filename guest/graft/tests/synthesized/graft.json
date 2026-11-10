@@ -1,0 +1,38 @@
+{
+  "libraries": [{"id": "com.apple.iokit.IOMobileGraphicsFamily"}],
+  "classes": [{
+    "name": "IOMobileFramebufferLegacy",
+    "header": "graft/IOMobileFramebufferLegacy.h",
+    "library": 0
+  }],
+  "synthesized": [{
+    "name": "ReimsDisplay",
+    "header": "ReimsDisplay.h",
+    "parent": 0,
+    "sibling": "AppleParavirtDisplay",
+    "overrides": {
+      "start": {},
+      "stop": {},
+      "free": {},
+      "set_notify_tag_mask_gated": {"required": true},
+      "supported_frame_info": {
+        "required": true,
+        "selectors": ["__ZN12ReimsDisplay20supported_frame_infoEjPjPA64_c"]
+      },
+      "factory_portal": {"required": true},
+      "executeFactoryConfigurations_gated": {"required": true},
+      "set_frame_info_notification_state_gated": {"required": true},
+      "do_swap_info_notify_gated": {"required": true},
+      "notify_swap_done_gated": {"required": true},
+      "notify_crc_ready_gated": {"required": true},
+      "are_timings_enabled": {"required": true},
+      "start_hardware": {},
+      "stop_hardware_gated": {},
+      "swap_begin_gated": {},
+      "verify_swap": {},
+      "swap_layer_map": {},
+      "surface_layer_map": {},
+      "surface_layer_unmap": {}
+    }
+  }]
+}

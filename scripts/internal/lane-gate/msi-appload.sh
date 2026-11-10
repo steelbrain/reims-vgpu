@@ -8,7 +8,7 @@
 #   msi-appload.sh OUT
 # Env: PORT GUEST_USER GUEST_PASS (the guest's SSH), B (the boot's directory: launch.log), TOOLS
 # (a copy of rgk-ctx-slots' appload tools: analyze-load.py, and guest/ with ctx.sh, streams.sh,
-# serve.pl, mtlenum and www/), DUMPS (default 1: post com.steelbrain.rgfx.vastats at the end, which
+# serve.pl, mtlenum and www/), DUMPS (default 1: post ai.aneesiqbal.rgfx.vastats at the end, which
 # a bundle with the measurement-only counters answers with each process's region blocks).
 # Writes into OUT what appload.sh does (boot.log's step lines, bundle.log, kern.log, dmesg-rgfx.raw
 # and dmesg-*.txt, ctx-*.txt, reports-*.txt, ips/, launch.log), analyze-load.py's summary.txt,
@@ -64,7 +64,7 @@ done
 sleep 10
 log "contexts with every app: $(ctxcount)"
 G "bash ~/ctx/ctx.sh" > "$O/ctx-all.txt"
-[[ $DUMPS == 1 ]] && G "notifyutil -p com.steelbrain.rgfx.vastats; sleep 4; $SU notifyutil -p com.steelbrain.rgfx.vastats; sleep 4"
+[[ $DUMPS == 1 ]] && G "notifyutil -p ai.aneesiqbal.rgfx.vastats; sleep 4; $SU notifyutil -p ai.aneesiqbal.rgfx.vastats; sleep 4"
 G "$SU dmesg" > "$O/dmesg-apps.txt"
 kring
 G "$SU cat /tmp/bundle.log" > "$O/bundle-apps.log"

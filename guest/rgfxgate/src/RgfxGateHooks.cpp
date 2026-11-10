@@ -76,23 +76,26 @@ static bool vnodeUnderBundles(vnode_t vp) {
 // ops are routed: the install writes go below the MAC layer on arm64
 // (RgfxGateVnop.hpp), so there is no create/open/truncate route. Each wrapper
 // has its operation's mpo shape, as XNU's mac_policy.h declares it, and forwards
-// every argument unchanged. Each saved original is AMFI's own mpo pointer,
-// signed key IA under the operation's constant discriminator with no address
-// diversity (rgfx_amfi.h), so it is declared as a matching __ptrauth function
-// pointer and called through directly. That discriminator is the mpo type's own
-// (function-type discrimination), so each wrapper's type is checked against its
+// every argument unchanged. Graft hands back each original, AMFI's own mpo
+// pointer, as a void * holds a function pointer (discriminator 0, Graft.h), so
+// each is kept in a void * and converted to its mpo type at the call, which
+// re-signs it for that type. A typed function-pointer variable written through a
+// void ** would be authenticated with the type's discriminator and fault. AMFI
+// signs each slot with its mpo type's own discriminator (function-type
+// discrimination, rgfx_amfi.h), so each wrapper's type is checked against its
 // slot's at compile time: a wrapper of another shape reads the wrong arguments,
 // and fails the build instead.
 
 // library validation (wall B): mpo_file_check_library_validation_t, no label.
 using MpoLibVal = int(void *proc, void *fg, off_t slice_offset, uint64_t error_message,
                       size_t error_message_size);
-static MpoLibVal *__ptrauth(ptrauth_key_asia, 0, kRgfxAmfiDiscLibraryValidation) orgLibVal;
+static void *orgLibVal;
 static int wrapLibVal(void *proc, void *fg, off_t slice_offset, uint64_t error_message,
                       size_t error_message_size) {
 	if (cdhashIsOurs(fg, (uint64_t)slice_offset))
 		return 0; // our bundle is valid to load into a library-validated process
-	return orgLibVal(proc, fg, slice_offset, error_message, error_message_size);
+	return reinterpret_cast<MpoLibVal *>(orgLibVal)(proc, fg, slice_offset, error_message,
+	                                                error_message_size);
 }
 
 // file-map-executable (wall C): mpo_file_check_mmap_t, the label at arg3 (NULL
@@ -100,7 +103,7 @@ static int wrapLibVal(void *proc, void *fg, off_t slice_offset, uint64_t error_m
 // wrapper's, for the same reason.
 using MpoMmap = int(void *cred, void *fg, void *label, int prot, int flags, uint64_t file_pos,
                     int *maxprot);
-static MpoMmap *__ptrauth(ptrauth_key_asia, 0, kRgfxAmfiDiscFileCheckMmap) orgMmap;
+static void *orgMmap;
 static int wrapMmap(void *cred, void *fg, void *label, int prot, int flags, uint64_t file_pos,
                     int *maxprot) {
 	if ((prot & kVmProtExecute) && cdhashIsOurs(fg, file_pos)) {
@@ -108,7 +111,7 @@ static int wrapMmap(void *cred, void *fg, void *label, int prot, int flags, uint
 			*maxprot &= prot;
 		return 0; // the GPU process may map our driver executable
 	}
-	return orgMmap(cred, fg, label, prot, flags, file_pos, maxprot);
+	return reinterpret_cast<MpoMmap *>(orgMmap)(cred, fg, label, prot, flags, file_pos, maxprot);
 }
 
 // code-signature trust (wall B, before library validation):
@@ -123,14 +126,14 @@ using MpoVnodeCheckSignature = int(vnode_t vp, void *label, cpu_type_t cpu_type,
                                    unsigned int *cs_flags, unsigned int *signer_type, int flags,
                                    unsigned int platform, char **fatal_failure_desc,
                                    size_t *fatal_failure_desc_len);
-static MpoVnodeCheckSignature *__ptrauth(ptrauth_key_asia, 0, kRgfxAmfiDiscVnodeCheckSignature)
-    orgVSig;
+static void *orgVSig;
 static int wrapVSig(vnode_t vp, void *label, cpu_type_t cpu_type, void *cs_blob,
                     unsigned int *cs_flags, unsigned int *signer_type, int flags,
                     unsigned int platform, char **fatal_failure_desc,
                     size_t *fatal_failure_desc_len) {
-	int r = orgVSig(vp, label, cpu_type, cs_blob, cs_flags, signer_type, flags, platform,
-	                fatal_failure_desc, fatal_failure_desc_len);
+	int r = reinterpret_cast<MpoVnodeCheckSignature *>(orgVSig)(
+	    vp, label, cpu_type, cs_blob, cs_flags, signer_type, flags, platform, fatal_failure_desc,
+	    fatal_failure_desc_len);
 	if (r == 0)
 		return 0; // already trusted; leave everything to the real policies
 	const uint8_t *cd = (gCsblobGetCdhash && cs_blob) ? gCsblobGetCdhash(cs_blob) : nullptr;
@@ -166,15 +169,12 @@ bool installHooks() {
 	gCsblobGetCdhash = reinterpret_cast<t_csblob_get_cdhash>(ptrauth_sign_unauthenticated(
 	    reinterpret_cast<void *>(csblob), ptrauth_key_function_pointer, 0));
 	// The replacements go as plain function pointers: Graft strips and re-signs
-	// each for its slot. Each original's storage is the __ptrauth variable, so
-	// AMFI's signed slot value, stored there raw, is called through as is.
+	// each for its slot. Each original comes back as a void *, converted to its
+	// mpo type where its wrapper calls it.
 	const graft_route_request requests[] = {
-	    {RGFX_OP_LIBRARY_VALIDATION, reinterpret_cast<void *>(wrapLibVal),
-	     reinterpret_cast<void **>(&orgLibVal)},
-	    {RGFX_OP_FILE_CHECK_MMAP, reinterpret_cast<void *>(wrapMmap),
-	     reinterpret_cast<void **>(&orgMmap)},
-	    {RGFX_OP_VNODE_CHECK_SIGNATURE, reinterpret_cast<void *>(wrapVSig),
-	     reinterpret_cast<void **>(&orgVSig)},
+	    {RGFX_OP_LIBRARY_VALIDATION, reinterpret_cast<void *>(wrapLibVal), &orgLibVal},
+	    {RGFX_OP_FILE_CHECK_MMAP, reinterpret_cast<void *>(wrapMmap), &orgMmap},
+	    {RGFX_OP_VNODE_CHECK_SIGNATURE, reinterpret_cast<void *>(wrapVSig), &orgVSig},
 	};
 	if (!graft_route_kernel(kClientID, requests, sizeof(requests) / sizeof(requests[0])))
 		return false;

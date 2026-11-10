@@ -1,0 +1,14 @@
+{
+  "libraries": [{"id": "com.apple.iokit.IOGraphicsFamily"}],
+  "classes": [{
+    "name": "IOAccelerator",
+    "header": "IOKit/graphics/IOAccelerator.h",
+    "library": 0,
+    "required": []
+  }],
+  "consumers": [{
+    "name": "GraftHelloConsumer",
+    "header": "src/Hello.h",
+    "parent": 0
+  }]
+}

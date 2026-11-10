@@ -352,8 +352,8 @@ Three tiers:
     reims-vgpu. `make -C guest prebuilt` rewrites them from `guest/` on a Mac
     with Xcode alone, with the record of their sources, `sources.toml`, and a
     stale set fails `make -C guest prebuilt-check`, which `cargo xtask check`
-    runs. Graft itself is not built here: `guest/graft` is a copy of Graft's
-    committed build and consumer tooling, made by Graft's `tools/vendor.py`
+    runs. Graft itself is not built here: `guest/graft` is Graft's release
+    (its source tree, kexts and SDK) as its `tools/vendor.py` copies it,
     with its record, `guest/graft/source.toml`, which the same check
     verifies. A new Graft replaces the directory and its record together.
   - **The guest's arm64e kext set for that device**, in

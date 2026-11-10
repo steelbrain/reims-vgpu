@@ -1,6 +1,6 @@
 // Native test that pins the arm64 AMFI route facts (src/rgfx_amfi.h): the three
-// admission operation names and the pointer-authentication discriminators the
-// saved originals are signed with. These are measured ABI constants, uniform
+// admission operation names and the pointer-authentication discriminators AMFI
+// signs their slots with. These are measured ABI constants, uniform
 // across the five config-2 Boot KCs (Ambrosia 2026-11-08) and matched by Graft's
 // own route layer; a stray edit to either side must fail the build, so this test
 // holds the literal values and the cross-checks that tie them together. Build
@@ -13,7 +13,8 @@
 int main() {
 	// The discriminators AMFI signs each mac_policy_ops slot with (key IA, no
 	// address diversity). These are the same values Graft's Arm64Route operation
-	// table carries, so the saved original a wrapper calls authenticates.
+	// table carries, and each replacement's type must have its slot's
+	// (RgfxGateHooks.cpp's static_asserts).
 	assert(kRgfxAmfiDiscFileCheckMmap == 0x438d);
 	assert(kRgfxAmfiDiscLibraryValidation == 0x9e37);
 	assert(kRgfxAmfiDiscVnodeCheckSignature == 0xcbd2);

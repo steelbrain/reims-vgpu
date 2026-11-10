@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleExecutable</key><string>GraftGateProbe</string>
+    <key>CFBundleIdentifier</key><string>ai.aneesiqbal.ReimsGraphics</string>
+    <key>CFBundleName</key><string>GraftGateProbe</string>
+    <key>CFBundlePackageType</key><string>KEXT</string>
+    <key>CFBundleVersion</key><string>@VERSION@</string>
+    <key>OSBundleRequired</key><string>Root</string>
+    <key>IOKitPersonalities</key><dict>
+        <key>Display</key><dict>
+            <key>IOClass</key><string>GraftGateProbe</string>
+            <key>IOProviderClass</key><string>IOPCIDevice</string>
+            <key>IOPCIPrimaryMatch</key><string>0x52471234</string>
+            <key>IOMatchCategory</key><string>GraftGateProbe.Display</string>
+            <key>GraftGateCategory</key><string>Display</string>
+        </dict>
+        <key>Accelerator</key><dict>
+            <key>IOClass</key><string>GraftGateProbe</string>
+            <key>IOProviderClass</key><string>IOPCIDevice</string>
+            <key>IOPCIPrimaryMatch</key><string>0x52471234</string>
+            <key>IOMatchCategory</key><string>GraftGateProbe.Accelerator</string>
+            <key>GraftGateCategory</key><string>Accelerator</string>
+        </dict>
+        <key>Control</key><dict>
+            <key>IOClass</key><string>GraftGateProbe</string>
+            <key>IOProviderClass</key><string>IOPCIDevice</string>
+            <key>IOPCIPrimaryMatch</key><string>0x52471234</string>
+            <key>IOMatchCategory</key><string>GraftGateProbe.Control</string>
+            <key>GraftGateCategory</key><string>Control</string>
+        </dict>
+    </dict>
+    <key>OSBundleLibraries</key><dict>
+        <key>ai.aneesiqbal.graft</key><string>0.1.0</string>
+        <key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0</string>
+        <key>com.apple.kpi.bsd</key><string>8.0.0</string>
+        <key>com.apple.kpi.iokit</key><string>8.0.0</string>
+        <key>com.apple.kpi.libkern</key><string>8.0.0</string>
+        <key>com.apple.kpi.mach</key><string>8.0.0</string>
+    </dict>
+</dict></plist>

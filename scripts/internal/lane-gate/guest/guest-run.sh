@@ -67,13 +67,17 @@ run_info() {
 	*) item kexts FAIL "ReimsGraphics is not loaded: $kexts" ;;
 	esac
 	# Graft says whether it bound ReimsGraphics: the registry root's
-	# GraftClient.ai.aneesiqbal.ReimsGraphics starts with "bound" once every site and vtable
-	# is written and its personalities are published, and names what it declined otherwise.
+	# GraftClient.ai.aneesiqbal.ReimsGraphics reads "bound: imports and vtables committed;
+	# waiting for device 0x52471234 to open the gate" once every site and vtable is written, and
+	# "bound: imports and vtables committed; activation gate open on the device nub" once Graft
+	# has set the gate property on the device's nub, which lets IOKit construct and start
+	# ReimsGraphics. Only the open gate passes; any other value, a refusal naming what Graft
+	# declined among them, is printed.
 	local bind
 	bind=$(ioreg -l -w0 -d1 2>/dev/null | grep -o -E '"GraftClient\.ai\.aneesiqbal\.ReimsGraphics" = "[^"]{0,160}"' |
 		sed 's/^[^=]*= //')
 	case $bind in
-	'"bound'*) item graft-bind PASS "$bind" ;;
+	'"bound:'*'activation gate open'*) item graft-bind PASS "$bind" ;;
 	*) item graft-bind FAIL "${bind:-no GraftClient.ai.aneesiqbal.ReimsGraphics on the registry root}" ;;
 	esac
 	local b=/Library/GPUBundles/reims-graphics.bundle

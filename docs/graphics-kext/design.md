@@ -273,7 +273,13 @@ Stages:
     libraries are registered, it checks each parent class's size and vtable
     against the running library, resolves each site by name, writes the
     sites and vtables, then sets the gate property on the 1234:5247 nub and
-    registers the nub again. Until then the passive property match fails,
+    registers the nub again. The registry root's
+    `GraftClient.ai.aneesiqbal.ReimsGraphics` reads `bound: imports and
+    vtables committed; waiting for device 0x52471234 to open the gate` once
+    the sites and vtables are written while no such nub is published yet,
+    and `bound: imports and vtables committed; activation gate open on the
+    device nub` once the property is set on it, which the lane gate's
+    `graft-bind` check requires. Until then the passive property match fails,
     so IOKit does not even construct ReimsGraphics' classes, whose parent
     constructors run through the sites (an `IOResourceMatch` would hold
     back only `start()`). On a missing symbol or a layout that
@@ -295,7 +301,8 @@ Stages:
       and System-collection libraries, which OpenCore refuses.
     - Checking: `make -C guest set-check` links the set into a release's
       Boot collection with OpenCore's own linker, in user space, and checks
-      with Graft's `prelink.py` that the manifest and every site survive it.
+      with Graft's `graft-kext check-prelinked`, built from the SDK's
+      sources, that the manifest and every site survive it.
     - Shipping: the repository carries the set prebuilt in guest/prebuilt,
       with its Kernel > Add entries in `set.toml` and the record of its
       sources in `sources.toml` (`make -C guest prebuilt`;

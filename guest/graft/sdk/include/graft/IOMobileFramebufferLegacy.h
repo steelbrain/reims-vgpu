@@ -25,8 +25,8 @@
 // IOMobileFramebufferLegacy's layout: it measures the live class, writes each
 // inherited slot from the live parent and each override on the live slot of the
 // same method identity (selector), so a release that renumbers slots still lands
-// each override on the right method (notes/arm64-display.md, src/arm64e/
-// Synthesize.h). For that in-place fill the compiled vtable must already be at
+// each override on the right method (src/arm64e/Synthesize.h). For that in-place
+// fill the compiled vtable must already be at
 // least the live parent's word count, so the class reserves a run of virtual
 // slots past its real methods (GRAFT_IOMFB_VTABLE_RESERVE below). The one field
 // is field_reserve, inside which the live class's own fields lie at their real
@@ -60,18 +60,16 @@ enum IOMFBParameterName : uint32_t;
 // A 64-bit method word: see the file comment.
 typedef uint64_t graft_iomfb_word;
 
-// The reserve covers the live class's own fields. The live class is at most
-// 0x1dd8 bytes across macOS 13.6 to 27.0.1 (Ambrosia's per-release measurement)
-// and this stand-in's IOService base is 0x88, so 0x2000 clears the largest with
-// room to spare; Graft refuses the bind where a future release's live class is
-// larger still, rather than risk a field overlay.
+// The reserve covers the live class's own fields, with room to spare. Graft
+// measures the live class at bind and refuses it where it is larger than
+// IOService plus this reserve, rather than risk a field overlay.
 #define GRAFT_IOMFB_LEGACY_RESERVE 0x2000
 
 // GRAFT_IOMFB_VTABLE_RESERVE reserved virtual slots lengthen a consumer's vtable
 // so its compiled __ZTV is at least the live IOMobileFramebufferLegacy's word
-// count (at most 485 across macOS 13.6 to 27.0.1, with room for later releases).
-// Graft fills the consumer's own vtable in place at bind (file comment), so the
-// storage must already be long enough; it records the compiled vtable's length in
+// count, with room to spare. Graft fills the consumer's own vtable in place at
+// bind (file comment), so the storage must already be long enough; it records
+// the compiled vtable's length in
 // the manifest and refuses the bind by name if a live release ever exceeds it. The
 // reserved slots are never called: those within the live class's length are
 // overwritten at bind, the rest stay as compiled, and the consumer never invokes
@@ -114,7 +112,6 @@ public:
     virtual graft_iomfb_word set_notify_tag_mask_gated(IOMFB_NotificationType type,
                                                        IOMFBNotifyRequest *request,
                                                        uint32_t mask) = 0;
-    // macOS 14 and later; macOS 13's takes no fourth argument (Graft matches either).
     virtual graft_iomfb_word supported_frame_info(uint32_t index, uint32_t *count,
                                                   char (*names)[64], uint32_t *field_3) = 0;
     virtual graft_iomfb_word factory_portal(void *field_0, task *owner) = 0;
@@ -128,10 +125,8 @@ public:
     virtual graft_iomfb_word notify_crc_ready_gated(uint32_t field_0) = 0;
     virtual bool are_timings_enabled() const = 0;
 
-    // What the class implements. Its own implementations serve its hardware
-    // subclasses, so a display overrides those its callers reach and never calls
-    // the class's. These do no display work (start_hardware and verify_swap
-    // return 0):
+    // The class's other methods, which a subclass may override. A consumer calls
+    // none of them (file comment).
     virtual graft_iomfb_word start_hardware();
     virtual graft_iomfb_word stop_hardware_gated();
     virtual graft_iomfb_word swap_begin_gated();
@@ -140,10 +135,6 @@ public:
     virtual graft_iomfb_word surface_layer_map(IOMFB::AP::DisplayedData *data, uint32_t layer,
                                                IOSurface *surface);
     virtual graft_iomfb_word surface_layer_unmap(IOMFB::AP::DisplayedData *data, uint32_t layer);
-    // And these serve the display's settings. get_dot_pitch reads state the
-    // class's start sets up only for its hardware subclasses' provider, so it
-    // faults on a paravirtual one. AppleParavirtDisplay, the class's paravirtual
-    // subclass, overrides most of them.
     virtual graft_iomfb_word get_dot_pitch(uint32_t *pitch);
     virtual graft_iomfb_word set_display_device(uint32_t device);
     virtual graft_iomfb_word set_digital_out_mode(uint32_t field_0, uint32_t field_1);
@@ -160,8 +151,8 @@ public:
                                            uint32_t count);
     virtual graft_iomfb_word do_power_state_change_gated();
 
-    // What a consumer calls: a refresh of the display. Graft resolves its symbol
-    // in the live collection, as it resolves the consumer's other kernel imports.
+    // A non-virtual method a consumer may call. Graft resolves its symbol in the
+    // live collection, as it resolves the consumer's other kernel imports.
     void note_vbl_ISR(uint32_t field_0);
 
 protected:

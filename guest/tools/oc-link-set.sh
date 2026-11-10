@@ -2,12 +2,13 @@
 # Prelink the committed Graft set with OpenCore's linker, in user space, in
 # Kernel > Add order; check every kext injects and every name resolves, then
 # that each dormant consumer (a kext carrying a Graft manifest) stays
-# bindable in the prelinked collection (guest/graft/sdk/prelink.py).
+# bindable in the prelinked collection (graft-kext check-prelinked, built
+# from guest/graft/sdk/tool).
 # Outputs remain local.
 # Usage: oc-link-set.sh KEXTINJECT BOOT_KC SET OUT
 set -euo pipefail
 
-prelink=$(cd "$(dirname "$0")/../graft/sdk" && pwd)/prelink.py
+GRAFT_SDK=$(cd "$(dirname "$0")/../graft/sdk" && pwd)
 
 ki=${1:-} kc=${2:-} set=${3:-} out=${4:-}
 if [ -z "$ki" ] || [ -z "$kc" ]; then
@@ -96,8 +97,9 @@ done
 if [ "${#consumers[@]}" = 0 ]; then
 	echo "oc-link-set: no kext in the set carries a Graft manifest" >&2
 	status=1
-elif ! python3 -I -B "$prelink" "$out/run/out.bin" "${consumers[@]}"; then
-	status=1
+else
+	c++ -std=c++17 -O2 -I"$GRAFT_SDK/include" "$GRAFT_SDK"/tool/*.cpp -o "$out/graft-kext"
+	"$out/graft-kext" check-prelinked "$out/run/out.bin" "${consumers[@]}" || status=1
 fi
 
 [ "$status" = 0 ] || { echo "oc-link-set: FAILED" >&2; exit 1; }

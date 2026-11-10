@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
-// Graft's interface for its owned client. Each call takes the client's bundle
-// identifier, and Graft serves only RgfxGate's, "com.steelbrain.RgfxGate".
+// Graft's interface for its owned client. Each call takes an identifier, and
+// Graft serves only calls that pass RgfxGate's, "ai.aneesiqbal.RgfxGate",
+// whichever kext makes them.
 // Kernel and Boot-collection imports stay the boot linker's work; these
 // services act on the running kernel. docs/design.md, "Owned clients", has
 // the details.
@@ -11,8 +12,20 @@
 #include <stdbool.h>
 #endif
 
-// One function to route: the kernel symbol to route, the replacement that
-// receives its calls, and where Graft stores a callable original.
+// One function to route: what to route, the replacement that receives its calls,
+// and where Graft stores a callable original. On x86-64 `symbol` is a function in
+// the kernel's own symbol table, and the replacement and original have that
+// function's prototype. On arm64e `symbol` is instead a MAC policy operation name
+// (for example "vnode_check_signature", not a kernel symbol), and the replacement
+// and original have the operation's prototype: the mpo_*_t type from XNU's
+// security/mac_policy.h, not the mac_* dispatcher's.
+//
+// Graft writes the original as a void *. Keep it in a void * and convert it to
+// the prototype where you call it, on both architectures. Do not point
+// `original` at a typed function-pointer variable: an arm64e kext built with
+// -mkernel authenticates a call through a typed variable with a discriminator
+// derived from its type, while a function pointer held in a void * carries none,
+// so the conversion is what re-signs it.
 typedef struct graft_route_request {
     const char *symbol;
     void *replacement;
@@ -31,10 +44,11 @@ bool graft_client_ready(const char *identifier);
 // state becomes "refused", naming the symbol.
 bool graft_kernel_symbol(const char *identifier, const char *symbol, uint64_t *address);
 
-// Installs count routes, at most six, all together or none. On x86-64 the
-// routes are kernel-text trampolines and must be in place before BSD starts;
-// on arm64 the route is one atomic swap of a policy table, safe at any time, so
-// a client that matches as an IOKit driver installs after BSD. Graft publishes
+// Installs count routes, at most six, all together or none. Each request's form
+// is per-architecture (see graft_route_request). On x86-64 the routes are
+// kernel-text trampolines and must be in place before BSD starts; on arm64 the
+// route is one atomic swap of a policy table, safe at any time, so a client that
+// matches as an IOKit driver installs after BSD. Graft publishes
 // the outcome as the client's state: "routed", or "refused" naming the route
 // and the reason. It returns false and records nothing when Graft is not
 // active, or count is 0 or more than six.

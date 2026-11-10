@@ -31,7 +31,7 @@ import sys
 # Each kext of our configuration, in Kernel > Add order: the make variable that gives its path,
 # its bundle's name in the archive, and its CFBundleIdentifier.
 KEXTS = [
-    ("GRAFT", "Graft.kext", "com.steelbrain.Graft"),
+    ("GRAFT", "Graft.kext", "ai.aneesiqbal.graft"),
     ("REIMS_GRAPHICS", "ReimsGraphics.kext", "ai.aneesiqbal.ReimsGraphics"),
     ("RGFXGATE", "RgfxGate.kext", "ai.aneesiqbal.RgfxGate"),
 ]

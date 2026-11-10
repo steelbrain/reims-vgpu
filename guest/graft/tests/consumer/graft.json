@@ -1,0 +1,10 @@
+{
+  "libraries": [{"id": "ai.aneesiqbal.graft.test.Provider"}],
+  "classes": [{"name": "Parent", "header": "Fixture.h", "library": 0}],
+  "consumers": [{"name": "Consumer", "header": "Fixture.h", "parent": 0}],
+  "imports": {
+    "_parent_global": {"library": 0},
+    "_weak_present": {"library": 0},
+    "_weak_absent": {"library": 0}
+  }
+}

@@ -1008,7 +1008,7 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/target/ambrosia.bin \
   `config.plist` with a `Kernel` > `Add` entry for each kext, Graft first,
   `Graphics` > `DisplayNode` set to `reims-display0`, and the kexts under
   `Kexts/`. It checks each kext's `CFBundleIdentifier`
-  (`com.steelbrain.Graft`, `ai.aneesiqbal.ReimsGraphics`,
+  (`ai.aneesiqbal.graft`, `ai.aneesiqbal.ReimsGraphics`,
   `ai.aneesiqbal.RgfxGate`) and that its executable has an arm64e slice,
   and names every kext that is not given or fails, writing no bundle.
 - **The Ambrosia it needs.** `Graphics` > `DisplayNode` needs Ambrosia

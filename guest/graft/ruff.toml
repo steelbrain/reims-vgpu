@@ -1,0 +1,33 @@
+# Graft's Python style. `make lint` checks it; `make format` applies it.
+line-length = 100
+# Every Python file here runs on the python3 macOS ships, which may be 3.9: the
+# maintainer tools, tools/vendor.py that a consumer runs, and the tests.
+target-version = "py39"
+
+[lint]
+select = [
+    "E", "W", "F",  # pycodestyle and pyflakes
+    "I",            # import order
+    "B",            # likely bugs
+    "UP",           # syntax the target version has
+    "N",            # PEP 8 names
+    "ANN",          # type hints
+    "ARG",          # unused arguments
+    "ERA",          # commented-out code
+    "PTH",          # pathlib rather than os.path
+    "PL",           # pylint's checks
+    "RUF",          # ruff's own checks
+    "C4", "FURB", "PERF", "PIE", "RET", "RSE", "SIM",  # simpler equivalents
+]
+ignore = [
+    "PLR2004",  # binary formats are made of literal offsets, sizes and opcodes
+    "PLR09",    # too many branches, arguments or statements: a review call, not a count
+    "ANN401",   # Any is the true type of parsed JSON, plists and QMP replies
+]
+
+[lint.per-file-ignores]
+# unittest's methods and the fixtures need no annotations.
+"tests/*" = ["ANN"]
+
+[format]
+quote-style = "double"

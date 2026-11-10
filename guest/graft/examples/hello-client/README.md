@@ -1,0 +1,62 @@
+# hello-client
+
+The smallest owned client. An owned client is an ordinary kext that links
+against Graft's exported C interface (`graft/Graft.h`) and uses it at boot.
+[docs/consumers.md](../../docs/consumers.md) explains how an owned client is
+built, and [sdk/include/graft/Graft.h](../../sdk/include/graft/Graft.h)
+documents each call.
+
+## What it shows
+
+`src/HelloClient.cpp` uses the start glue `sdk/Start.cpp`, which declares the
+kmod from `GRAFT_CLIENT_ID` and calls `graft_client_initialize()` once from the
+kext's start routine. That function:
+
+- checks `graft_client_ready`, which is true only when Graft is active;
+- looks one kernel symbol up with `graft_kernel_symbol` (`_IOLog`, exported on
+  every release) and logs its address with `graft_client_log`;
+- publishes its state with `graft_client_state`.
+
+Graft serves API calls only for the one owned client `src/Policy.h` names,
+`ai.aneesiqbal.RgfxGate`. Every call passes that identifier, not this kext's own
+bundle identifier (`ai.aneesiqbal.graft.HelloClient`).
+
+This client installs no routes. Routing a kernel function, with the trampoline
+and the callable original, is shown by the test client
+[tests/kexts/core-probe](../../tests/kexts/core-probe). On x86-64 routes must be
+installed before BSD starts, so a routing client installs from its start
+routine; `graft_kernel_symbol` and the log and state calls have no such window.
+
+## Build
+
+The build needs a Mac with Xcode or its Command Line Tools, and fetches
+nothing. Graft's header and start glue are two directories up, under
+`../../sdk`.
+
+```sh
+make                      # ../../build/GraftHelloClient.kext (x86-64)
+make ARCH='-arch arm64e'  # ../../build/GraftHelloClient-arm64e.kext (arm64e)
+```
+
+`ARCH` picks the target; x86-64 is the default. Both write into the
+repository's `build/`, two directories up. The arm64e variant is suffixed,
+so both can be built without overwriting each other.
+
+## Install and expect
+
+On x86-64, add `GraftHelloClient.kext` to the OpenCore image after
+`Graft.kext`, which it depends on. On arm64e, the boot firmware places
+`GraftHelloClient-arm64e.kext` beside `Graft-arm64e.kext`. Boot with SIP on and
+no boot-args. In the guest:
+
+```sh
+ioreg -l -d 1 | grep Graft
+```
+
+shows `GraftClient.ai.aneesiqbal.RgfxGate` set to `ready: resolved _IOLog`. The
+same line, and the logged address, go to the kernel log with the prefix
+`graft:`:
+
+```sh
+log show --last boot --predicate 'process == "kernel"' | grep graft:
+```

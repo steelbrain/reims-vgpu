@@ -155,7 +155,7 @@ def stage(out, work, arch="x86_64"):
     if {"com.apple.iokit.IOGraphicsFamily", "com.apple.AppleGraphicsDeviceControl"} & set(dependencies):
         raise SystemExit("prebuilt: dormant ReimsGraphics still names System-KC dependencies")
     graft = "Graft-arm64e.kext" if arm64e else "Graft.kext"
-    if sha256(work / graft / "Contents/MacOS/Graft") != sha256(GRAFT / "built" / graft / "Contents/MacOS/Graft"):
+    if sha256(work / graft / "Contents/MacOS/Graft") != sha256(GRAFT / graft / "Contents/MacOS/Graft"):
         raise SystemExit(f"prebuilt: {graft} differs from the vendored build")
     for kext, _ in kexts:
         exe = kext / "Contents/MacOS" / infos[kext.name]["CFBundleExecutable"]

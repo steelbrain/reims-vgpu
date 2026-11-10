@@ -1,0 +1,139 @@
+# Build Graft, run every check that needs no VM, and build the release with the
+# Xcode that .xcode-version pins, on one macOS runner. A pushed tag v<version>
+# then publishes that release on GitHub (docs/guides/releasing.md).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # The GitHub-hosted image that carries Xcode 27. A new pin in .xcode-version
+    # needs an image that carries that Xcode.
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+      # make release refuses any other Xcode. The pin is what makes the kexts
+      # CI publishes the bytes a local make release with that Xcode builds.
+      # .xcode-version holds the version and the build, such as 27.2 (27B52):
+      # the runner names each Xcode by its version, and make release checks
+      # the build.
+      - name: Select the pinned Xcode
+        run: |
+          read -r version _ < .xcode-version
+          app=/Applications/Xcode_$version.app
+          if [ ! -d "$app" ]; then
+            echo "::error::this runner has no Xcode $version ($app), the Xcode .xcode-version pins"
+            exit 1
+          fi
+          sudo xcode-select -s "$app"
+          xcodebuild -version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the formatters
+        run: python -m pip install "clang-format~=21.1.0" "ruff==0.16.6"
+      - name: Build the kext
+        run: make all
+      - name: Host tests
+        # python3 is setup-python's 3.12; make test also runs every Python test
+        # under /usr/bin/python3, the Python that comes with Xcode.
+        run: |
+          /usr/bin/python3 --version
+          make test
+      - name: Kernel-flag builds
+        run: make kernel-check
+      - name: arm64e compile check
+        run: make kernel-check-arm64e
+      # The test kexts a guest boot uses (tests/kexts/README.md): the two owned
+      # clients, and gate-probe's three variants, which build through the SDK
+      # as a consumer's build does.
+      - name: Test kexts
+        run: |
+          make core-probe route-probe
+          make -C tests/kexts/gate-probe
+          make -C tests/kexts/gate-probe ARCH='-arch arm64e'
+          make -C tests/kexts/gate-probe REFUSE=1
+      - name: Examples
+        run: make examples
+      - name: Lint
+        run: make lint
+      # dist/graft-<version>/ and dist/graft-<version>.zip, built from this
+      # commit. The release job publishes the zip for a tag.
+      - name: Release
+        run: make release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    # A pushed tag v<version> publishes the zip the check job built.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    # Publishing needs only the checkout, the artifact and gh.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # The tag must be v and the Makefile's VERSION, and the release one of
+      # the tag's commit. The GitHub release is titled "Graft <version>", its
+      # notes are CHANGELOG.md's section for the version, without the blank
+      # lines around it, and the zip is attached. A release that exists
+      # already is left as it is when its zip is the one this run built, byte
+      # for byte, and the job fails when it is not: a published zip is never
+      # replaced.
+      - name: Create the tag's release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^VERSION *= *//p' Makefile)
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::the tag $TAG is not v$version, for the Makefile's VERSION"
+            exit 1
+          fi
+          release=dist/graft-$version
+          if [ "$(cat "$release/COMMIT")" != "$GITHUB_SHA" ]; then
+            echo "::error::$release is a release of $(cat "$release/COMMIT"), not of $GITHUB_SHA"
+            exit 1
+          fi
+          notes=$RUNNER_TEMP/notes.md
+          awk -v v="$version" '
+              /^## / { on = ($0 == "## " v || index($0, "## " v " ") == 1); next }
+              on' CHANGELOG.md |
+            sed -e '/./,$!d' | sed -e ':a' -e '/^\n*$/{$d;N;ba' -e '}' > "$notes"
+          if [ ! -s "$notes" ]; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            zip=graft-$version.zip
+            published=$RUNNER_TEMP/published
+            if ! gh release download "$TAG" --pattern "$zip" --dir "$published"; then
+              echo "::error::the release $TAG exists, but its $zip could not be downloaded"
+              exit 1
+            fi
+            if ! cmp -s "$published/$zip" "$release.zip"; then
+              sha256sum "$published/$zip" "$release.zip"
+              echo "::error::the release $TAG holds a $zip other than the one this run built; it is not replaced. Compare the two zips' SHA256SUMS to find the files that differ"
+              exit 1
+            fi
+            echo "the release $TAG already holds this run's $zip"
+          else
+            gh release create "$TAG" "$release.zip" --verify-tag \
+              --title "Graft $version" --notes-file "$notes"
+          fi

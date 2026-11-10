@@ -517,7 +517,7 @@ if [[ -n $ssh_s ]]; then
   boot1=$(G 20 'sysctl -n kern.bootsessionuuid') || boot1=
   run_min=$(perl -e 'printf "%d\n", $ARGV[0] / 60 + 2' "$(since "$t0")")
   panics_read=1
-  panics=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' sh -c 'find /Library/Logs/DiagnosticReports -maxdepth 2 -type f \\( -name \"*.panic\" -o -name \"panic-*\" \\) -mmin -$run_min | while read -r f; do if grep -q -E \"com\\.steelbrain|mach_vm_region|IOIteratePageableMaps\" \"\$f\"; then echo \"\$f (names our kexts)\"; else echo \"\$f\"; fi; done'") || panics_read=0
+  panics=$(G 60 "echo '$GUEST_PASS' | sudo -S -p '' sh -c 'find /Library/Logs/DiagnosticReports -maxdepth 2 -type f \\( -name \"*.panic\" -o -name \"panic-*\" \\) -mmin -$run_min | while read -r f; do if grep -q -E \"ai\\.aneesiqbal|mach_vm_region|IOIteratePageableMaps\" \"\$f\"; then echo \"\$f (names our kexts)\"; else echo \"\$f\"; fi; done'") || panics_read=0
   # The count lines, then a line that says the log was read: grep's status is 1 for no lines.
   kc=$(G 120 "log show --last boot --style compact --predicate 'eventMessage CONTAINS \"RgfxAccelerator: \"' 2>/dev/null | grep -E 'counting an IOSurface|not a buffer the kernel allocated|could not be mapped to count'; echo check-boot-read")
   kc_read=0

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
 # Graft's build rules for a consumer kext, in place of the kext's final link rule. Include
 # this file after the consumer Makefile's default target. It links the consumer twice and
-# stages it with consumer.py; README.md, beside this file, describes the steps.
+# stages it with one graft-kext build; README.md, beside this file, describes the steps.
 #
 # The consumer's Makefile defines:
 #   NAME      the kext's executable name
@@ -20,49 +20,34 @@
 # this file.
 
 GRAFT_TOOLS := $(dir $(lastword $(MAKEFILE_LIST)))
-GRAFT_PYTHON = python3 -I -B $(GRAFT_TOOLS)consumer.py
-GRAFT_SOURCES = $(GRAFT_TOOLS)consumer.py $(GRAFT_TOOLS)graft_macho.py
+# graft-kext, compiled once into the build directory from its sources beside this file.
+# Setting GRAFT_KEXT runs another build of the tool instead, to check that build against
+# this one.
+GRAFT_TOOL = $(BUILD)/graft/graft-kext
+GRAFT_KEXT ?= $(GRAFT_TOOL)
+GRAFT_TOOL_SOURCES = $(wildcard $(GRAFT_TOOLS)tool/*.cpp $(GRAFT_TOOLS)tool/*.h) \
+	$(GRAFT_TOOLS)include/graft/ManifestFormat.h
 GRAFT_DECL ?= src/graft.json
 GRAFT_INFO_PLIST ?= src/Info.plist
-GRAFT_WORK = $(BUILD)/graft
-# An arm64e consumer keeps its import GOT and vtable in writable __DATA, which
-# Graft writes after lockdown (notes/arm64-boot.md); -no_data_const folds
-# __DATA_CONST in. A fold-free x86-64 build links without it.
-ifneq (,$(findstring arm64e,$(ARCH)))
-GRAFT_LDEXTRA = -Xlinker -no_data_const
-endif
-GRAFT_LAYOUTS = $(GRAFT_WORK)/layouts.json
-GRAFT_CENSUS = $(GRAFT_WORK)/census
-GRAFT_RESERVE = $(GRAFT_WORK)/manifest-reserve.bin
-GRAFT_UNBOUND = $(GRAFT_WORK)/Unbound.kext/Contents/MacOS/$(NAME)
-GRAFT_INFO = $(GRAFT_WORK)/Unbound.kext/Contents/Info.plist
+# The makefile that includes this one, whatever its name, and the SDK's headers,
+# which the probe may compile through the consumer's own.
+GRAFT_MAKEFILE := $(firstword $(MAKEFILE_LIST))
+GRAFT_HEADERS = $(wildcard $(GRAFT_TOOLS)include/graft/*.h)
 
-# Each declared class's size and vtable slots, as the consumer's compiler lays them out.
-$(GRAFT_LAYOUTS): $(GRAFT_DECL) $(HEADERS) Makefile $(GRAFT_SOURCES)
+# The staged bundle. graft-kext probes each declared class's layout with the consumer's
+# flags, links the objects once for the census of imports and sites, reserves room for the
+# manifest, links again with the reservation as __DATA,__graft (an arm64e link also with
+# -no_data_const), and stages that link into $(KEXT), replacing it. Each step's output
+# stays under $(BUILD)/graft.
+$(BINARY): $(OBJECTS) $(GRAFT_DECL) $(GRAFT_INFO_PLIST) $(HEADERS) $(GRAFT_HEADERS) \
+		$(GRAFT_MAKEFILE) $(filter $(GRAFT_TOOL),$(GRAFT_KEXT))
+	$(GRAFT_KEXT) build --name=$(NAME) --version=$(VERSION) --arch="$(ARCH)" \
+		--declaration=$(GRAFT_DECL) --info-plist=$(GRAFT_INFO_PLIST) --work=$(BUILD)/graft \
+		--output=$(KEXT) $(OBJECTS) -- $(CXXFLAGS) -Isrc
+
+# The tool is a host program in standard C++17. Its warnings stay warnings, so that a
+# newer compiler's new ones do not stop a consumer's build.
+$(GRAFT_TOOL): $(GRAFT_TOOL_SOURCES)
 	@mkdir -p $(@D)
-	$(GRAFT_PYTHON) probe $(GRAFT_DECL) $@ -- $(CXXFLAGS) -Isrc
-
-# The first link, without a manifest, for the census of imports and sites.
-$(GRAFT_CENSUS): $(OBJECTS) Makefile
-	@mkdir -p $(@D)
-	xcrun clang++ $(ARCH) -nostdlib -Xlinker -kext $(GRAFT_LDEXTRA) $(OBJECTS) -lcc_kext -o $@
-
-$(GRAFT_INFO): $(GRAFT_INFO_PLIST) Makefile
-	@mkdir -p $(@D)
-	sed 's/@VERSION@/$(VERSION)/g' $< > $@
-	plutil -lint $@ > /dev/null
-
-# A zero-filled file the size of the manifest and its import placeholders.
-$(GRAFT_RESERVE): $(GRAFT_CENSUS) $(GRAFT_LAYOUTS) $(GRAFT_INFO) $(GRAFT_DECL) $(GRAFT_SOURCES)
-	$(GRAFT_PYTHON) reserve $(GRAFT_CENSUS) $(GRAFT_DECL) $(GRAFT_LAYOUTS) $(GRAFT_INFO) $@
-
-# The second link, with the reservation as __DATA,__graft.
-$(GRAFT_UNBOUND): $(OBJECTS) $(GRAFT_RESERVE) Makefile
-	@mkdir -p $(@D)
-	xcrun clang++ $(ARCH) -nostdlib -Xlinker -kext $(GRAFT_LDEXTRA) $(OBJECTS) -lcc_kext \
-		-Xlinker -sectcreate -Xlinker __DATA -Xlinker __graft -Xlinker $(GRAFT_RESERVE) -o $@
-
-# The staged bundle. Staging refuses an existing output, so the last one goes first.
-$(BINARY): $(GRAFT_UNBOUND) $(GRAFT_INFO) $(GRAFT_LAYOUTS) $(GRAFT_DECL) $(GRAFT_SOURCES)
-	python3 -c 'import shutil, sys; shutil.rmtree(sys.argv[1], ignore_errors=True)' "$(KEXT)"
-	$(GRAFT_PYTHON) stage $(GRAFT_WORK)/Unbound.kext $(GRAFT_DECL) $(GRAFT_LAYOUTS) $(KEXT)
+	xcrun clang++ -std=c++17 -O2 -Wall -Wextra -pedantic -I$(GRAFT_TOOLS)include \
+		$(filter %.cpp,$^) -o $@

@@ -1,0 +1,14 @@
+{
+  "libraries": [{"id": "com.apple.iokit.IOGraphicsFamily", "anchor": "GraftRefuseAbsentAnchor"}],
+  "classes": [{
+    "name": "IOAccelerator",
+    "header": "IOKit/graphics/IOAccelerator.h",
+    "library": 0,
+    "required": []
+  }],
+  "consumers": [{
+    "name": "GraftGateProbe",
+    "header": "src/Probe.h",
+    "parent": 0
+  }]
+}
