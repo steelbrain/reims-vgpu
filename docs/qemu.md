@@ -1076,8 +1076,9 @@ firmware/ambrosia/check-boot.sh -f <Ambrosia>/built/ambrosia.bin \
   `check-boot: finding:` line, not a failure. `no-fatal`: no `reims-vgpu:
   fatal` line in QEMU's log or the serial log. A reading in the guest that
   printed nothing fails its check as unread (a desktop poll that never
-  answered is no desktop), and under TCG each command in the guest, and each
-  SSH login the boot waits on, has 5 times its HVF limit.
+  answered is no desktop), and under TCG each command in the guest, each SSH
+  login the boot waits on, and the wait for the desktop have 5 times their
+  HVF limits.
 
 **Measured** on the M3 Max under HVF on 2026-11-08, with our QEMU at
 `bc378624` built as above on the library of `61b1aac9e`, Ambrosia 0.1.0's
@@ -1141,7 +1142,7 @@ IOMobileFramebuffer vtable synthesis (Graft's `notes/arm64-display.md`).
 - **RAM**: `--ram 18`. A boot with the device peaked at 11.8 GiB by `potluck
   why`, page cache included, and at 9.4 GiB of anonymous and shared memory,
   QEMU's own high-water mark 9.5 GiB.
-- **Time**: the script's limits are 300 s to SSH and 180 s more for the
+- **Time**: the script's limits are 300 s to SSH and 300 s more for the
   desktop; a boot with the module's bundle alone took 5 min 20 s.
 
 **Measured** on `homelab-um870-1` under TCG on 2026-11-08, with our QEMU at

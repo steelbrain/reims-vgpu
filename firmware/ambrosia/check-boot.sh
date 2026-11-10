@@ -37,8 +37,8 @@
 #              QEMU is stopped, and the guest's checks fail as not run.
 #   console    Ambrosia logged the module's early console.
 #   ssh        the guest took an SSH login within 90 s of QEMU's start under HVF, 300 s under TCG.
-#              Under TCG every command the checks run in the guest, and each SSH login the boot
-#              waits on, has 5 times its HVF limit.
+#              Under TCG every command the checks run in the guest, each SSH login the boot waits
+#              on, and the wait for the desktop have 5 times their HVF limits.
 #              A check whose reading in the guest printed nothing (its command failed or ran
 #              out of time) fails as unread: no reading passes as an empty one.
 #   sip        `csrutil status` says enabled (the lane gate's sip).
@@ -48,7 +48,7 @@
 #   windowserver-metal
 #              WindowServer composites with Metal on our device, as the lane gate's guest checks
 #              and boot read it: the desktop came up (WindowServer, Dock and Finder) within 60 s
-#              of SSH under HVF, 180 s under TCG, each of the three read as a pid; `bench -l`
+#              of SSH under HVF, 300 s under TCG, each of the three read as a pid; `bench -l`
 #              lists a Metal device, not Apple's paravirtual one; WindowServer kept its pid to
 #              the end; and the host's log says the display shows an IOSurface the guest
 #              presented.
@@ -113,7 +113,7 @@ GUEST_USER=${GUEST_USER:-aneesiqbal} GUEST_PASS=${GUEST_PASS:-aneesiqbal}
 
 ram=8G
 if ((tcg)); then
-  accel=(-accel tcg,thread=multi) limit=300 desktop_wait=180 slow=5
+  accel=(-accel tcg,thread=multi) limit=300 desktop_wait=300 slow=5
   machine=",memory-backend=ram,dump-guest-core=off"
   mem=(-m "$ram" -object "memory-backend-memfd,id=ram,size=$ram,share=on")
 else
