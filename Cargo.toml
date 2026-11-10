@@ -43,9 +43,9 @@ reims-vgpu-video-videotoolbox = { path = "crates/reims-vgpu-video-videotoolbox" 
 # The Vulkan platform's proof of concept (architecture D1): a Metal-shaped API on Vulkan, from
 # metal2vulkan's public repository. Both pins select one API revision so the
 # translator's descriptor values and the runtime's objects stay in agreement.
-metal2vulkan-runtime = { git = "https://github.com/steelbrain/metal2vulkan", rev = "3412d520d59a668698a13c5c46b515a954d65e0a" }
+metal2vulkan-runtime = { git = "https://github.com/steelbrain/metal2vulkan", rev = "a0058f220635342f22451d9a59b592de5af10068" }
 # Its translator, for the Metal enums and descriptor values the runtime's calls take.
-metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "3412d520d59a668698a13c5c46b515a954d65e0a" }
+metal2vulkan = { git = "https://github.com/steelbrain/metal2vulkan", rev = "a0058f220635342f22451d9a59b592de5af10068" }
 # The hashes of the Vulkan platform's metallib sources (reims-vgpu-vulkan/build.rs).
 sha2 = "0.10.9"
 # A display window's swapchain on Linux (reims-vgpu-vulkan/src/swapchain.rs), at the runtime's

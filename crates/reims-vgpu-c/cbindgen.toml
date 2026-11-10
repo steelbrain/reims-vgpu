@@ -57,9 +57,6 @@ header = """/*
 parse_deps = false
 
 [export]
-# Imported UCRT entry points are private implementation details, not Reims ABI.
-# cbindgen parses foreign declarations even inside the Windows-only module.
-exclude = ["InvalidParameter", "_get_osfhandle", "_set_thread_local_invalid_parameter_handler"]
 prefix = ""
 item_types = ["constants", "globals", "enums", "structs", "unions", "typedefs", "opaque", "functions"]
 
