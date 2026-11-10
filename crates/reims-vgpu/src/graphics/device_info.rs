@@ -222,9 +222,12 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// sampler ids `SAMPLER_STATE` answers), texture views (`TEXTURE_VIEW`), placement in an Automatic
 /// heap with the heap texture size (`HEAP_TEXTURE_SIZE_AND_ALIGN`), a pass's sample positions
 /// (after its colour records, `RGFX_PASS_FLAG_SAMPLE_POSITIONS`) with
-/// `SET_DEPTH_STORE_ACTION_OPTIONS`, and two the bundle does in the guest with no wire message:
-/// binary archives (`RgfxBinaryArchive`: no compiled code crosses) and IO queues (Metal's own IO
-/// queue and file handles over the bundle's device, `RgfxMetalDevice+IO.h`), and mesh shading
+/// `SET_DEPTH_STORE_ACTION_OPTIONS`, indirect command buffers, render and compute, with the
+/// memory barriers of a compute one's commands (`ICB_CREATE`, `ICB_WRITE` and `ICB_SLOTS`, and
+/// their executions' render and compute ops), and two the bundle does in the guest with no wire
+/// message: binary archives (`RgfxBinaryArchive`: no compiled code crosses) and IO queues
+/// (Metal's own IO queue and file handles over the bundle's device, `RgfxMetalDevice+IO.h`), and
+/// mesh shading
 /// (`MESH_RENDER_PIPELINE_CREATE` and the object and mesh stages' render ops, where the platform
 /// makes mesh pipelines: [`makes_mesh_pipelines`]). Mesh draws in an indirect command buffer are
 /// not: no mesh pipeline the bundle makes supports them, as on the x86 Macs.
@@ -236,6 +239,8 @@ const WIRED: &[Piece] = &[
     Piece::AutomaticHeaps,
     Piece::SamplePositions,
     Piece::TextureViews,
+    Piece::IndirectCommandBuffers,
+    Piece::ComputeIndirectBarriers,
     Piece::BinaryArchives,
     Piece::IoCommandQueues,
     Piece::MeshShading,
@@ -285,7 +290,7 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 ///
 /// | answer | the lane's | waits on |
 /// |---|---|---|
-/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks, and no for every one while the lane lacks a piece of Apple7's rows or of a family's before it ([`cap_apple_families`]): today no for every one, as an Intel or AMD Mac's GPU answers, though the lane carries Apple1's and Apple2's pieces | each piece in [`APPLE_PIECES`] up to Apple7's the lane lacks, from Apple3's indirect command buffers and compute indirect barriers on, then each later family's |
+/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks, and no for every one while the lane lacks a piece of Apple7's rows or of a family's before it ([`cap_apple_families`]): today no for every one, as an Intel or AMD Mac's GPU answers, though the lane carries Apple1's to Apple3's pieces | each piece in [`APPLE_PIECES`] up to Apple7's the lane lacks, from Apple4's tile pipelines and imageblocks on, then each later family's |
 /// | `supportsFamily:` of Mac1, Mac2, Common1 to Common3 and Metal3 | the platform's | nothing [`APPLE_PIECES`] lists: it lists the Apple families' pieces alone, and the pieces of Apple1 and Apple2 these rows were held to (argument encoders, automatic heaps, sample positions and IO command queues) the lane carries |
 /// | `supportsFamily:` of Metal4 | no | the `MTL4` API: its command queues and buffers, argument tables, compiler and allocators |
 /// | `supportsRaytracing`, `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur` | no | acceleration structures, their builds, and intersection function tables |
@@ -780,14 +785,17 @@ mod tests {
         }
 
         // The lane's own pieces: argument encoders, texture views, Automatic heaps, sample
-        // positions and IO queues, Apple1's and Apple2's, and binary archives, Apple3's. They
-        // fall short of Apple7, so no Apple family stands; Mac2 does.
+        // positions and IO queues, Apple1's and Apple2's, and indirect command buffers, compute
+        // indirect barriers and binary archives, Apple3's. They fall short of Apple7, so no Apple
+        // family stands; Mac2 does.
         for piece in [
             Piece::ArgumentEncoders,
             Piece::TextureViews,
             Piece::AutomaticHeaps,
             Piece::SamplePositions,
             Piece::IoCommandQueues,
+            Piece::IndirectCommandBuffers,
+            Piece::ComputeIndirectBarriers,
             Piece::BinaryArchives,
         ] {
             assert!(WIRED.contains(&piece), "{piece:?}");
