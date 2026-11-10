@@ -734,26 +734,30 @@ mod tests {
     }
 
     /// `count` fresh pages a view can be made of, each byte its page's index.
-    fn guest_pages(count: u64) -> (u64, Vec<PhysicalMemoryRange>) {
+    /// The byte-sized count makes every index representable. Allocation errors reach the
+    /// calling test, which asserts success instead of losing the fixture's failure reason.
+    fn guest_pages(count: u8) -> Result<(u64, Vec<PhysicalMemoryRange>), KernReturn> {
         let page = page_size();
-        let at = allocate_aliasable(count * page).unwrap().addr().to_u64();
+        let at = allocate_aliasable(u64::from(count) * page)?.addr().to_u64();
         for i in 0..count {
             // SAFETY: the pages were just mapped, readable and writable.
             unsafe {
                 std::ptr::write_bytes(
-                    std::ptr::with_exposed_provenance_mut::<u8>((at + i * page).to_usize()),
-                    u8::try_from(i).unwrap(),
+                    std::ptr::with_exposed_provenance_mut::<u8>(
+                        (at + u64::from(i) * page).to_usize(),
+                    ),
+                    i,
                     page.to_usize(),
                 );
             }
         }
         let ranges = (0..count)
             .map(|i| PhysicalMemoryRange {
-                physical_address: at + i * page,
+                physical_address: at + u64::from(i) * page,
                 physical_length: page,
             })
             .collect();
-        (at, ranges)
+        Ok((at, ranges))
     }
 
     /// The range `s` mapped, its first byte and length: its own memory's whole pages, or its
@@ -857,7 +861,7 @@ mod tests {
     #[test]
     fn a_hold_keeps_the_memory_past_the_last_reference() {
         let page = page_size();
-        let (at, ranges) = guest_pages(2);
+        let (at, ranges) = guest_pages(2).unwrap();
         let several = SurfaceSpec {
             alloc_size: 2 * page,
             client_address_ranges: Some(ranges),
@@ -1029,7 +1033,7 @@ mod tests {
     fn read_only_surfaces_are_counted_while_they_live() {
         use crate::gpu::writes::any_kept;
         let page = page_size();
-        let (_, ranges) = guest_pages(2);
+        let (_, ranges) = guest_pages(2).unwrap();
         let surfaces = StandInSurfaces::new();
         let over = |direction| SurfaceSpec {
             alloc_size: 2 * page,
@@ -1054,7 +1058,7 @@ mod tests {
     #[test]
     fn surfaces_over_the_guests_pages() {
         let page = page_size();
-        let (at, ranges) = guest_pages(4);
+        let (at, ranges) = guest_pages(4).unwrap();
         let surfaces = StandInSurfaces::new();
         let over = |ranges: &[PhysicalMemoryRange], alloc_size, offset, direction| SurfaceSpec {
             alloc_size,
@@ -1124,7 +1128,7 @@ mod tests {
         use reims_vgpu_core::platform::os::vm::HostVm as _;
 
         let page = page_size();
-        let (at, ranges) = guest_pages(4);
+        let (at, ranges) = guest_pages(4).unwrap();
         let spec = SurfaceSpec {
             alloc_size: page,
             offset: 0x40,
@@ -1167,7 +1171,7 @@ mod tests {
         use reims_vgpu_core::platform::os::vm::HostAddr;
 
         let page = page_size();
-        let (at, ranges) = guest_pages(3);
+        let (at, ranges) = guest_pages(3).unwrap();
         let backwards: Vec<_> = ranges.iter().rev().copied().collect();
         let surfaces = StandInSurfaces::new();
         let over = |ranges: &[PhysicalMemoryRange], alloc_size, direction| SurfaceSpec {
@@ -1216,7 +1220,7 @@ mod tests {
     #[test]
     fn a_surface_views_each_run_of_following_pages_at_once() {
         let page = page_size();
-        let (at, ranges) = guest_pages(4);
+        let (at, ranges) = guest_pages(4).unwrap();
         let backwards: Vec<_> = ranges.iter().rev().copied().collect();
         // The pages, the runs their view takes, and the guest page its second page shows.
         for (pages, runs, second) in [(&ranges, 1, 1), (&backwards, 4, 2)] {
